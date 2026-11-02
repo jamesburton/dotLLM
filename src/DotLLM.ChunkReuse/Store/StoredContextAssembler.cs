@@ -1,3 +1,4 @@
+using DotLLM.ChunkReuse.Backends;
 using DotLLM.ChunkReuse.CodeCorpus;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Models;
@@ -52,7 +53,7 @@ public sealed record StoredAssembly(ChunkedContext Context, AssemblyStats Stats,
 /// <b>Identity is the caller's responsibility.</b> The key and the hit check use the fingerprint given here, not one read from the
 /// model: with <see cref="StoredContextAssembler(string, string)"/> nothing ties the fingerprint to the <see cref="IModel"/> passed
 /// to <see cref="Assemble"/>, and a mismatched pair writes one model's K/V under another model's keys, which every later reader of
-/// those keys accepts (store poisoning). <see cref="ForModel"/> keeps the fingerprint inputs and refuses a model whose configuration
+/// those keys accepts (store poisoning). <see cref="ForModel(ModelConfig, string, string, string)"/> keeps the fingerprint inputs and refuses a model whose configuration
 /// (shape, RoPE, NoPE layers, KV layout) does not reproduce the fingerprint; it cannot see the weights, so the model id must itself
 /// be content-based (e.g. <see cref="GgufIdentity.ModelId"/>, a weights hash or a hub revision), never a file name.
 /// </para>
@@ -69,40 +70,55 @@ public sealed record StoredAssembly(ChunkedContext Context, AssemblyStats Stats,
 /// Any other store exception propagates.
 /// </para>
 /// <para>
-/// Only the CPU encoder exists, so entries are keyed with backend <see cref="Backend"/> and dtype <see cref="KvDtype.F32"/>.
+/// Entries are keyed with the backend's tag (<see cref="Backend"/>; <see cref="IChunkBackend.Tag"/>) and dtype <see cref="KvDtype.F32"/>,
+/// encoded through that backend and stamped with its tag. An entry whose <see cref="ChunkKvEntry.Backend"/> differs from
+/// <see cref="Backend"/> is rejected and replaced like any other wrong entry, so CPU and Vulkan K/V never mix (by key, and by the
+/// <c>.ckv</c> header tag). The constructor and <see cref="ForModel(ModelConfig, string, string, string)"/> without a backend mean the
+/// CPU backend (<see cref="CpuChunkBackend"/>), with the same fingerprint and keys as before the backend seam existed.
 /// The instance holds no mutable state, so concurrent calls are safe as long as each uses its own <see cref="IModel"/> (a CPU model's
 /// forward is not re-entrant); several calls may share one store root.
 /// </para>
 /// </remarks>
 public sealed class StoredContextAssembler
 {
-    /// <summary>Backend tag in the keys this assembler reads and writes (the encoder is the CPU oracle).</summary>
-    public const string Backend = "cpu";
-
     private readonly ChunkEncoder _encoder;
     private readonly (string ModelId, string Quantization)? _identity;
+    private readonly IChunkBackend? _backend; // null: the CPU backend of each model's config
 
-    /// <summary>Creates an assembler for one model identity, given as a precomputed fingerprint (see the class remarks on identity).</summary>
+    /// <summary>Creates a CPU assembler for one model identity, given as a precomputed fingerprint (see the class remarks on identity).</summary>
     /// <param name="modelFingerprint">The real model fingerprint (<see cref="ChunkFingerprint.Compute(DotLLM.Core.Models.ModelConfig, string, string, string, string, int)"/>) of every model passed to
     /// <see cref="Assemble"/>; not checked against the model.</param>
     /// <param name="tokenizerId">Tokenizer identity, part of the key (content-based, e.g. <see cref="GgufIdentity.TokenizerId"/>).</param>
     public StoredContextAssembler(string modelFingerprint, string tokenizerId)
-        : this(modelFingerprint, tokenizerId, null)
+        : this(modelFingerprint, tokenizerId, null, null)
     {
     }
 
-    private StoredContextAssembler(string modelFingerprint, string tokenizerId, (string, string)? identity)
+    /// <summary>As <see cref="StoredContextAssembler(string, string)"/>, encoding and placing through <paramref name="backend"/>.</summary>
+    /// <param name="modelFingerprint">The real model fingerprint of every model passed to <see cref="Assemble"/>, computed for this
+    /// backend (<see cref="ChunkFingerprint.Compute(DotLLM.Core.Models.ModelConfig, string, string, string, string, int)"/> with its tag); not checked.</param>
+    /// <param name="tokenizerId">Tokenizer identity, part of the key.</param>
+    /// <param name="backend">The chunk backend; its <see cref="IChunkBackend.Tag"/> is in every key and every entry.</param>
+    public StoredContextAssembler(string modelFingerprint, string tokenizerId, IChunkBackend backend)
+        : this(modelFingerprint, tokenizerId, null, backend ?? throw new ArgumentNullException(nameof(backend)))
+    {
+    }
+
+    private StoredContextAssembler(string modelFingerprint, string tokenizerId, (string, string)? identity, IChunkBackend? backend)
     {
         ArgumentException.ThrowIfNullOrEmpty(modelFingerprint);
         ArgumentNullException.ThrowIfNull(tokenizerId);
+        if (backend is not null && !FileChunkStore.IsWellFormedBackendTag(backend.Tag))
+            throw new ArgumentException($"Backend tag '{backend.Tag}' cannot be stored.", nameof(backend));
         ModelFingerprint = modelFingerprint;
         TokenizerId = tokenizerId;
         _identity = identity;
+        _backend = backend;
         _encoder = new ChunkEncoder(modelFingerprint);
     }
 
     /// <summary>
-    /// Creates an assembler from the fingerprint inputs. <see cref="Assemble"/> then recomputes the fingerprint from each model's
+    /// Creates a CPU assembler from the fingerprint inputs. <see cref="Assemble"/> then recomputes the fingerprint from each model's
     /// configuration and refuses a model that does not reproduce it, before any store read or encode.
     /// </summary>
     /// <param name="config">The model configuration.</param>
@@ -111,14 +127,32 @@ public sealed class StoredContextAssembler
     /// <param name="tokenizerId">Content-based tokenizer identity (<see cref="GgufIdentity.TokenizerId"/>).</param>
     /// <returns>The assembler.</returns>
     public static StoredContextAssembler ForModel(ModelConfig config, string modelId, string quantization, string tokenizerId)
+        => Create(config, modelId, quantization, tokenizerId, null);
+
+    /// <summary>As <see cref="ForModel(ModelConfig, string, string, string)"/>, on <paramref name="backend"/>: the fingerprint is computed
+    /// with its tag (<see cref="ChunkFingerprint.Compute(DotLLM.Core.Models.ModelConfig, string, string, string, string, int)"/>).</summary>
+    /// <param name="config">The model configuration.</param>
+    /// <param name="modelId">Content-based model identity.</param>
+    /// <param name="quantization">Weight quantization label.</param>
+    /// <param name="tokenizerId">Content-based tokenizer identity.</param>
+    /// <param name="backend">The chunk backend (for Vulkan: on the device of the models passed to <see cref="Assemble"/>).</param>
+    /// <returns>The assembler.</returns>
+    public static StoredContextAssembler ForModel(ModelConfig config, string modelId, string quantization, string tokenizerId, IChunkBackend backend)
+        => Create(config, modelId, quantization, tokenizerId, backend ?? throw new ArgumentNullException(nameof(backend)));
+
+    private static StoredContextAssembler Create(ModelConfig config, string modelId, string quantization, string tokenizerId, IChunkBackend? backend)
     {
         ArgumentNullException.ThrowIfNull(config);
         ArgumentException.ThrowIfNullOrEmpty(modelId);
         ArgumentNullException.ThrowIfNull(quantization);
         ArgumentNullException.ThrowIfNull(tokenizerId);
-        return new StoredContextAssembler(ChunkFingerprint.Compute(config, modelId, quantization, tokenizerId), tokenizerId,
-            (modelId, quantization));
+        string tag = backend?.Tag ?? ChunkBackendTags.Cpu;
+        return new StoredContextAssembler(ChunkFingerprint.Compute(config, modelId, quantization, tokenizerId, tag), tokenizerId,
+            (modelId, quantization), backend);
     }
+
+    /// <summary>Backend tag in the keys this assembler reads and writes and on the entries it encodes (<c>cpu</c> by default).</summary>
+    public string Backend => _backend?.Tag ?? ChunkBackendTags.Cpu;
 
     /// <summary>The model fingerprint every entry must carry.</summary>
     public string ModelFingerprint { get; }
@@ -139,17 +173,19 @@ public sealed class StoredContextAssembler
     /// <summary>
     /// Resolves every chunk from <paramref name="store"/> (encoding and storing misses) and, when <paramref name="destination"/> is
     /// given, appends the chunks' K/V to it at running offsets from its current length (<see cref="ChunkAssembler.Assemble(DotLLM.Core.Attention.IKvCache, IReadOnlyList{ChunkKvEntry}, string)"/>).
-    /// The chunks, the model identity and the destination (exact host F32, layer count, strides, capacity) are validated before
-    /// any store read or encode, and the destination is left unchanged whenever the call throws.
+    /// The chunks, the model identity and the destination (layer count, strides, capacity, then the backend's
+    /// <see cref="IChunkBackend.RequireCache"/>) are validated before any store read or encode, and the destination is left unchanged
+    /// whenever the call throws.
     /// </summary>
     /// <param name="chunks">Chunks in context order; none empty.</param>
-    /// <param name="model">The model with fingerprint <see cref="ModelFingerprint"/>; encodes misses (CPU <c>TransformerModel</c>).</param>
+    /// <param name="model">The model with fingerprint <see cref="ModelFingerprint"/>; encodes misses on the backend (CPU:
+    /// <c>TransformerModel</c>; Vulkan: a Vulkan model on the backend's device).</param>
     /// <param name="store">The chunk store.</param>
-    /// <param name="destination">Optional exact host-F32 cache to append to.</param>
+    /// <param name="destination">Optional cache of the backend to append to (CPU: exact host-F32 <c>SimpleKvCache</c>).</param>
     /// <param name="query">Tokens that follow the context, recorded in <see cref="StoredAssembly.Context"/>.</param>
     /// <returns>The context, the counts and the entry used for each chunk.</returns>
     /// <exception cref="ArgumentException">There are no chunks, a chunk is null or empty, the model does not match a
-    /// <see cref="ForModel"/> identity, or the chunks do not fit the destination.</exception>
+    /// <see cref="ForModel(ModelConfig, string, string, string)"/> identity, or the chunks do not fit the destination.</exception>
     /// <exception cref="NotSupportedException">The model's RoPE variant or the destination cache is not supported.</exception>
     public StoredAssembly Assemble(IReadOnlyList<Chunk> chunks, IModel model, IChunkStore store, IKvCache? destination = null,
         ReadOnlySpan<int> query = default)
@@ -167,18 +203,19 @@ public sealed class StoredContextAssembler
         ModelConfig config = model.Config;
         if (_identity is { } id)
         {
-            string actual = ChunkFingerprint.Compute(config, id.ModelId, id.Quantization, TokenizerId);
+            string actual = ChunkFingerprint.Compute(config, id.ModelId, id.Quantization, TokenizerId, Backend);
             if (!string.Equals(actual, ModelFingerprint, StringComparison.Ordinal))
                 throw new ArgumentException(
                     $"The model's configuration gives fingerprint {actual}, not this assembler's {ModelFingerprint} (another shape, RoPE or KV layout).",
                     nameof(model));
         }
-        var assembler = new ChunkAssembler(config); // refuses unsupported RoPE before any encode
+        IChunkBackend backend = _backend ?? new CpuChunkBackend(config);
+        var assembler = new ChunkAssembler(config, backend); // refuses unsupported RoPE (or a backend bound to other RoPE) before any encode
         var geometry = KvGeometry.FromConfig(config, compactSlidingWindows: false);
         int offset = 0;
         if (destination is not null)
         {
-            ValidateDestination(destination, config, geometry, context.Length);
+            ValidateDestination(destination, backend, config, geometry, context.Length);
             offset = destination.CurrentLength;
         }
 
@@ -218,7 +255,7 @@ public sealed class StoredContextAssembler
                 }
             }
 
-            ChunkKvEntry encoded = _encoder.Encode(model, ids);
+            ChunkKvEntry encoded = _encoder.Encode(model, backend, ids);
             misses++;
             encodedTokens += ids.Length;
             if (writable)
@@ -248,11 +285,11 @@ public sealed class StoredContextAssembler
     }
 
     // The checks ChunkAssembler makes before writing, done before any encode so a bad destination costs nothing.
-    private static void ValidateDestination(IKvCache destination, ModelConfig config, KvGeometry geometry, int tokens)
+    private static void ValidateDestination(IKvCache destination, IChunkBackend backend, ModelConfig config, KvGeometry geometry, int tokens)
     {
-        if (!destination.SupportsExactF32PrefixCopy || destination is not IPerLayerKvCache perLayer)
+        if (destination is not IPerLayerKvCache perLayer)
             throw new NotSupportedException(
-                $"Chunk assembly needs an exact host-F32 KV-cache; {destination.GetType().Name} stores KV lossily or off-host.");
+                $"Chunk assembly needs a KV-cache with per-layer strides; {destination.GetType().Name} has none.");
         if (perLayer.LayerCount != config.NumLayers || perLayer.LayerCount != geometry.LayerCount)
             throw new NotSupportedException(
                 $"The destination holds {perLayer.LayerCount} KV layers for a {config.NumLayers}-layer model; not supported.");
@@ -266,11 +303,13 @@ public sealed class StoredContextAssembler
             throw new ArgumentException(
                 $"The chunks need rows {destination.CurrentLength}..{destination.CurrentLength + tokens - 1} but the destination holds {destination.MaxLength}.",
                 nameof(destination));
+        backend.RequireCache(destination); // CPU: exact host-F32 SimpleKvCache; Vulkan: F32 VulkanKvCache
     }
 
-    // A hit must carry this model's fingerprint, exactly the chunk's tokens and one [n, stride(l)] K and V array per KV layer.
+    // A hit must carry this assembler's backend tag and this model's fingerprint, exactly the chunk's tokens and one [n, stride(l)] K and V array per KV layer.
     private bool Belongs(ChunkKvEntry entry, int[] tokenIds, KvGeometry geometry)
     {
+        if (!string.Equals(entry.Backend, Backend, StringComparison.Ordinal)) return false;
         if (!string.Equals(entry.ModelFingerprint, ModelFingerprint, StringComparison.Ordinal)) return false;
         if (entry.TokenIds is null || !entry.TokenIds.AsSpan().SequenceEqual(tokenIds)) return false;
         int layers = geometry.LayerCount;

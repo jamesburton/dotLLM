@@ -9,8 +9,8 @@ namespace DotLLM.ChunkReuse.Store;
 /// <see cref="IChunkStore"/> on a directory: one file per entry at <c>root/&lt;hex[0..2]&gt;/&lt;hex&gt;.ckv</c>.
 /// <para>
 /// File layout (little-endian): magic <c>CKVS</c>, int32 <see cref="FormatVersion"/>, int32 <see cref="KvDtype"/>, the 64-byte
-/// ASCII key, int32 length + UTF-8 model fingerprint, int32 token count, int32 layer count, per layer int32 K and V element
-/// counts, int64 payload byte count; then the payload: token ids (int32), K of every layer, V of every layer, each in the
+/// ASCII key, int32 length + UTF-8 model fingerprint, int32 length + ASCII backend tag (<see cref="ChunkKvEntry.Backend"/>; since
+/// format version 2), int32 token count, int32 layer count, per layer int32 K and V element counts, int64 payload byte count; then the payload: token ids (int32), K of every layer, V of every layer, each in the
 /// entry's dtype. <see cref="ChunkKvEntry"/> holds F32 rows (the CPU oracle cache's native dtype), so entries are written as
 /// <see cref="KvDtype.F32"/> without conversion; other dtypes are reserved in the header and read as misses until supported.
 /// </para>
@@ -18,19 +18,28 @@ namespace DotLLM.ChunkReuse.Store;
 /// Writes go to a unique temp file in the shard directory, are flushed to disk and then renamed over the final name, so a crash
 /// or a concurrent writer never leaves a partial <c>.ckv</c> at the final path. A crashed writer can leave its temp file behind;
 /// <see cref="SweepTempFiles"/> removes old ones. Reads memory-map the file and validate the
-/// header and the exact file length; any mismatch (truncation, trailing bytes, other version, other key) is a miss.
+/// header and the exact file length; any mismatch (truncation, trailing bytes, other version, other key, malformed backend tag)
+/// is a miss. Version-1 files (no backend tag) are misses: the backend that produced them is unknown.
+/// </para>
+/// <para>
+/// The backend tag is reported as written: the store cannot tell which backend a key was computed for, so a reader compares
+/// <see cref="ChunkKvEntry.Backend"/> with its own backend (<see cref="StoredContextAssembler"/> rejects and replaces a mismatch).
+/// CPU and Vulkan entries never mix: the backend is in the key and in the header.
 /// </para>
 /// </summary>
 public sealed class FileChunkStore : IChunkStore
 {
-    /// <summary>On-disk format version; a file with any other version is a miss.</summary>
-    public const int FormatVersion = 1;
+    /// <summary>On-disk format version (2: the header carries the backend tag); a file with any other version is a miss.</summary>
+    public const int FormatVersion = 2;
+
+    /// <summary>Longest backend tag, in bytes.</summary>
+    public const int MaxBackendTagBytes = 64;
 
     private const string Extension = ".ckv";
     private const string TempExtension = ".tmp";
     private const int MaxFingerprintBytes = 4096;
     private const int MaxLayers = 4096;
-    private const int MaxHeaderBytes = 16 + 64 + 4 + MaxFingerprintBytes + 8 + 8 * MaxLayers + 8;
+    private const int MaxHeaderBytes = 16 + 64 + 4 + MaxFingerprintBytes + 4 + MaxBackendTagBytes + 8 + 8 * MaxLayers + 8;
     private static ReadOnlySpan<byte> Magic => "CKVS"u8;
 
     private readonly string _root;
@@ -45,6 +54,33 @@ public sealed class FileChunkStore : IChunkStore
         _root = Path.GetFullPath(root);
         Directory.CreateDirectory(_root);
     }
+
+    /// <summary>Header size of an entry with this fingerprint, backend tag and layer count; the file is this plus the payload (the token
+    /// ids and the F32 K and V rows).</summary>
+    /// <param name="fingerprint">Model fingerprint.</param>
+    /// <param name="backend">Backend tag.</param>
+    /// <param name="layers">KV layer count.</param>
+    /// <returns>The header size in bytes.</returns>
+    public static long HeaderBytes(string fingerprint, string backend, int layers)
+    {
+        ArgumentNullException.ThrowIfNull(fingerprint);
+        ArgumentNullException.ThrowIfNull(backend);
+        return 16 + 64 + 4 + Encoding.UTF8.GetByteCount(fingerprint) + 4 + Encoding.UTF8.GetByteCount(backend) + 8 + 8L * layers + 8;
+    }
+
+    /// <summary>True when <paramref name="tag"/> can be stored as a backend tag: 1 to <see cref="MaxBackendTagBytes"/> lowercase
+    /// ASCII letters, digits, <c>.</c>, <c>_</c> or <c>-</c> (e.g. <c>cpu</c>, <c>vulkan</c>).</summary>
+    /// <param name="tag">Candidate.</param>
+    /// <returns>Whether it is well formed.</returns>
+    public static bool IsWellFormedBackendTag(string? tag)
+    {
+        if (tag is null || tag.Length is 0 or > MaxBackendTagBytes) return false;
+        foreach (char c in tag)
+            if (!IsTagChar(c)) return false;
+        return true;
+    }
+
+    private static bool IsTagChar(int c) => c is (>= 'a' and <= 'z') or (>= '0' and <= '9') or '.' or '_' or '-';
 
     /// <summary>The store directory.</summary>
     public string Root => _root;
@@ -182,7 +218,7 @@ public sealed class FileChunkStore : IChunkStore
                 view.ReadArray(offset, values[l], 0, values[l].Length);
                 offset += (long)values[l].Length * sizeof(float);
             }
-            entry = new ChunkKvEntry(h.Fingerprint, tokens, keys, values);
+            entry = new ChunkKvEntry(h.Fingerprint, tokens, keys, values, h.Backend);
             return true;
         }
         catch (IOException) { return false; }
@@ -303,6 +339,10 @@ public sealed class FileChunkStore : IChunkStore
         ArgumentNullException.ThrowIfNull(entry.TokenIds);
         ArgumentNullException.ThrowIfNull(entry.KeysPerLayer);
         ArgumentNullException.ThrowIfNull(entry.ValuesPerLayer);
+        ArgumentNullException.ThrowIfNull(entry.Backend);
+        if (!IsWellFormedBackendTag(entry.Backend))
+            throw new ArgumentException(
+                $"Backend tag '{entry.Backend}' is not 1 to {MaxBackendTagBytes} lowercase ASCII letters, digits, '.', '_' or '-'.", nameof(entry));
         int n = entry.TokenIds.Length;
         if (n == 0) throw new ArgumentException("An entry must have at least one token.", nameof(entry));
         int layers = entry.KeysPerLayer.Length;
@@ -325,7 +365,8 @@ public sealed class FileChunkStore : IChunkStore
             payload += ((long)entry.KeysPerLayer[l].Length + entry.ValuesPerLayer[l].Length) * sizeof(float);
 
         byte[] fp = Encoding.UTF8.GetBytes(entry.ModelFingerprint);
-        var header = new byte[16 + 64 + 4 + fp.Length + 8 + 8 * layers + 8];
+        byte[] backend = Encoding.ASCII.GetBytes(entry.Backend); // well formed (Validate): ASCII only
+        var header = new byte[HeaderBytes(entry.ModelFingerprint, entry.Backend, layers)];
         var w = new SpanWriter(header);
         w.Bytes(Magic);
         w.Int32(FormatVersion);
@@ -334,6 +375,8 @@ public sealed class FileChunkStore : IChunkStore
         w.Bytes(Encoding.ASCII.GetBytes(key.Hex));
         w.Int32(fp.Length);
         w.Bytes(fp);
+        w.Int32(backend.Length);
+        w.Bytes(backend);
         w.Int32(entry.TokenIds.Length);
         w.Int32(layers);
         for (int l = 0; l < layers; l++)
@@ -363,6 +406,10 @@ public sealed class FileChunkStore : IChunkStore
         if (!r.Bytes(64, out ReadOnlySpan<byte> hex) || !hex.SequenceEqual(Encoding.ASCII.GetBytes(key.Hex))) return false;
         if (!r.Int32(out int fpLen) || fpLen < 0 || fpLen > MaxFingerprintBytes) return false;
         if (!r.Bytes(fpLen, out ReadOnlySpan<byte> fpBytes)) return false;
+        if (!r.Int32(out int tagLen) || tagLen <= 0 || tagLen > MaxBackendTagBytes) return false;
+        if (!r.Bytes(tagLen, out ReadOnlySpan<byte> tagBytes)) return false;
+        foreach (byte b in tagBytes)
+            if (!IsTagChar(b)) return false;
         if (!r.Int32(out int tokens) || tokens <= 0) return false;
         if (!r.Int32(out int layers) || layers <= 0 || layers > MaxLayers) return false;
         var kLens = new int[layers];
@@ -377,11 +424,11 @@ public sealed class FileChunkStore : IChunkStore
         if (!r.Int64(out long payload) || payload != expected) return false;
         if (r.Position + payload != fileLength) return false; // truncated or trailing bytes
 
-        header = new Header(Encoding.UTF8.GetString(fpBytes), tokens, layers, kLens, vLens, r.Position);
+        header = new Header(Encoding.UTF8.GetString(fpBytes), Encoding.ASCII.GetString(tagBytes), tokens, layers, kLens, vLens, r.Position);
         return true;
     }
 
-    private readonly record struct Header(string Fingerprint, int TokenCount, int LayerCount, int[] KLengths, int[] VLengths, int HeaderBytes);
+    private readonly record struct Header(string Fingerprint, string Backend, int TokenCount, int LayerCount, int[] KLengths, int[] VLengths, int HeaderBytes);
 
     private ref struct SpanWriter(Span<byte> buffer)
     {

@@ -18,7 +18,7 @@ namespace DotLLM.ChunkCache;
 /// <remarks>
 /// The model id is <see cref="GgufIdentity.ModelId"/>: a SHA-256 over the header, the tensor table and the first and last
 /// 4 KiB of every tensor (or of every byte with <c>--strict-model-id</c>), never the file name, so a renamed file keeps its
-/// chunks and a re-quantised one does not. The store keys use <see cref="StoredContextAssembler.ForModel"/>, which refuses a
+/// chunks and a re-quantised one does not. The store keys use <see cref="StoredContextAssembler.ForModel(DotLLM.Core.Models.ModelConfig, string, string, string)"/>, which refuses a
 /// model whose configuration does not reproduce the fingerprint.
 /// </remarks>
 internal sealed class ModelHandle : IDisposable

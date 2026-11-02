@@ -298,7 +298,7 @@ internal static class BuildCommand
     /// </summary>
     public static long EstimateBytes(ModelHandle model, IEnumerable<int> tokenCounts)
     {
-        long header = 16 + 64 + 4 + model.Fingerprint.Length + 8 + 8L * model.Geometry.LayerCount + 8;
+        long header = FileChunkStore.HeaderBytes(model.Fingerprint, model.Assembler.Backend, model.Geometry.LayerCount);
         long total = 0;
         foreach (int n in tokenCounts) total += header + n * (model.KvBytesPerToken + sizeof(int));
         return total;

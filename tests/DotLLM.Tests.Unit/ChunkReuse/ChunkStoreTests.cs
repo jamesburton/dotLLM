@@ -355,6 +355,141 @@ public sealed class ChunkStoreTests : IDisposable
         Assert.False(store.TryGet(key, out _));
     }
 
+    // A version-1 file (no backend tag) as FileChunkStore wrote it before format version 2: tokens [3, 17], one layer, stride 1,
+    // K [1, -2], V [0.5, 4], fingerprint "fp-model-a", under GoldenV1Key. Captured from the store at dotLLM aa11975a and re-derived
+    // byte for byte from the documented v1 layout with Python struct (2026-11-02).
+    private const string GoldenV1Key = "121e11e83c5294bccd77b5be9ca1de2568a677c018039dbced6ed29896645ca4";
+    private const string GoldenV1Hex =
+        "434b5653010000000000000000000000"
+        + "31323165313165383363353239346263636437376235626539636131646532353638613637376330313830333964626365643665643239383936363435636134"
+        + "0a00000066702d6d6f64656c2d61"
+        + "0200000001000000020000000200000018000000000000000300000011000000"
+        + "0000803f000000c00000003f00008040";
+
+    [Fact]
+    public void Store_FormatV1File_IsMiss()
+    {
+        // Version-1 files carry no backend tag, so a reader cannot tell CPU from Vulkan K/V: they are misses (re-encoded by the
+        // assembler), never read as "cpu".
+        Assert.Equal(2, FileChunkStore.FormatVersion);
+        int[] tokens = [3, 17];
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, tokens);
+        Assert.Equal(GoldenV1Key, key.Hex);
+        byte[] v1 = Convert.FromHexString(GoldenV1Hex);
+        Assert.Equal(142, v1.Length);
+
+        var store = new FileChunkStore(_root);
+        string path = EntryPath(key);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllBytes(path, v1);
+        Assert.Equal([key], store.Keys()); // listed (a file under a key's name) but not readable
+        Assert.False(store.Contains(key));
+        Assert.False(store.TryGet(key, out _));
+        Assert.False(store.TryReadFingerprint(key, out _));
+
+        // Put replaces it with a version-2 entry that reads back with its tag.
+        var entry = new ChunkKvEntry(Fingerprint, tokens, [[1f, -2f]], [[0.5f, 4f]]);
+        store.Put(key, entry);
+        Assert.True(new FileChunkStore(_root).TryGet(key, out ChunkKvEntry got));
+        AssertBitExact(entry, got);
+        Assert.Equal("cpu", got.Backend);
+        Assert.Equal(2, BitConverter.ToInt32(File.ReadAllBytes(path), 4));
+    }
+
+    [Fact]
+    public void Store_HeaderBackendTag_Layout()
+    {
+        // v2 header: magic, version, dtype, reserved, 64-byte key, int32 + fingerprint, then int32 + UTF-8 backend tag; the size
+        // helper the CLI's estimate uses equals the real file size.
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, "vulkan", Dtype, Tokens);
+        var store = new FileChunkStore(_root);
+        ChunkKvEntry entry = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5) with { Backend = "vulkan" };
+        store.Put(key, entry);
+        byte[] bytes = File.ReadAllBytes(EntryPath(key));
+        int at = BackendTagOffset(Fingerprint);
+        Assert.Equal(6, BitConverter.ToInt32(bytes, at));
+        Assert.Equal("vulkan"u8.ToArray(), bytes[(at + 4)..(at + 10)]);
+        long payload = Tokens.Length * sizeof(int) + 2L * 2 * Tokens.Length * 4 * sizeof(float);
+        Assert.Equal(bytes.Length, FileChunkStore.HeaderBytes(Fingerprint, "vulkan", layers: 2) + payload);
+        Assert.Equal(FileChunkStore.HeaderBytes(Fingerprint, "cpu", 2) + 3, FileChunkStore.HeaderBytes(Fingerprint, "vulkan", 2));
+    }
+
+    [Theory]
+    [InlineData("upper")]      // "CPU": not a tag (lowercase ASCII only)
+    [InlineData("nul")]        // "c\0u"
+    [InlineData("invalid-utf8")]
+    [InlineData("len-zero")]
+    [InlineData("len-negative")]
+    [InlineData("len-longer")] // the length runs into the token count
+    [InlineData("len-huge")]
+    public void Store_HeaderBackendTampered_IsMiss(string tamper)
+    {
+        // A damaged backend tag is a miss, like any other damaged header field. A well-formed tag is reported as written (see
+        // Store_HeaderBackendTampered_WellFormedTag_IsReportedAsWritten) and the assembler rejects it when it is not its own.
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
+        var store = new FileChunkStore(_root);
+        store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5));
+        string path = EntryPath(key);
+        byte[] bytes = File.ReadAllBytes(path);
+        int at = BackendTagOffset(Fingerprint);
+        Assert.Equal(3, BitConverter.ToInt32(bytes, at));
+        Assert.Equal("cpu"u8.ToArray(), bytes[(at + 4)..(at + 7)]);
+        Assert.True(store.TryGet(key, out _)); // the untampered file is valid
+
+        switch (tamper)
+        {
+            case "upper": "CPU"u8.CopyTo(bytes.AsSpan(at + 4)); break;
+            case "nul": bytes[at + 5] = 0; break;
+            case "invalid-utf8": bytes[at + 4] = 0xFF; bytes[at + 5] = 0xFE; break;
+            case "len-zero": BitConverter.GetBytes(0).CopyTo(bytes, at); break;
+            case "len-negative": BitConverter.GetBytes(-1).CopyTo(bytes, at); break;
+            case "len-longer": BitConverter.GetBytes(4).CopyTo(bytes, at); break;
+            case "len-huge": BitConverter.GetBytes(1 << 20).CopyTo(bytes, at); break;
+            default: throw new ArgumentOutOfRangeException(nameof(tamper));
+        }
+        File.WriteAllBytes(path, bytes);
+        Assert.False(store.Contains(key));
+        Assert.False(store.TryGet(key, out _));
+        Assert.False(store.TryReadFingerprint(key, out _));
+    }
+
+    [Fact]
+    public void Store_HeaderBackendTampered_WellFormedTag_IsReportedAsWritten()
+    {
+        // The store cannot tell which backend a key was computed for, so a well-formed foreign tag reads back as written; the
+        // entry then carries that tag and StoredContextAssembler rejects it (StoredAssembly_HeaderBackendTampered_IsMissAndReencoded).
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
+        var store = new FileChunkStore(_root);
+        store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5));
+        string path = EntryPath(key);
+        byte[] bytes = File.ReadAllBytes(path);
+        "gpu"u8.CopyTo(bytes.AsSpan(BackendTagOffset(Fingerprint) + 4));
+        File.WriteAllBytes(path, bytes);
+        Assert.True(new FileChunkStore(_root).TryGet(key, out ChunkKvEntry got));
+        Assert.Equal("gpu", got.Backend);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("CPU")]
+    [InlineData("cpu ")]
+    [InlineData("vülkan")]
+    [InlineData("a-tag-that-is-much-longer-than-sixty-four-bytes-and-so-cannot-be-a-backend")]
+    public void Store_PutRejectsMalformedBackendTag(string tag)
+    {
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
+        var store = new FileChunkStore(_root);
+        Assert.Throws<ArgumentException>(() => store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5) with { Backend = tag }));
+        Assert.Throws<ArgumentNullException>(() => store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5) with { Backend = null! }));
+        Assert.False(store.Contains(key));
+        // The tags in use are accepted.
+        store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5) with { Backend = "vulkan" });
+        Assert.True(store.Contains(key));
+    }
+
+    // magic + version + dtype + reserved, key, fingerprint length + bytes: the backend tag's int32 length follows.
+    private static int BackendTagOffset(string fingerprint) => 16 + 64 + 4 + System.Text.Encoding.UTF8.GetByteCount(fingerprint);
+
     [Fact]
     public void Store_Evict_RemovesEntry_AndMissingEvictIsNoOp()
     {
@@ -574,6 +709,7 @@ public sealed class ChunkStoreTests : IDisposable
         Assert.Equal(expected.TokenIds, actual.TokenIds);
         Assert.Equal(expected.KeysPerLayer.Length, actual.KeysPerLayer.Length);
         Assert.Equal(expected.ValuesPerLayer.Length, actual.ValuesPerLayer.Length);
+        Assert.Equal(expected.Backend, actual.Backend);
         Assert.True(SameBits(expected, actual), "K/V bits differ");
     }
 }

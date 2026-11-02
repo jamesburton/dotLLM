@@ -1,6 +1,7 @@
 using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using DotLLM.ChunkReuse;
+using DotLLM.ChunkReuse.Backends;
 using DotLLM.ChunkReuse.CodeCorpus;
 using DotLLM.ChunkReuse.Store;
 using DotLLM.Core.Attention;
@@ -10,6 +11,8 @@ using DotLLM.Core.Tensors;
 using DotLLM.Engine.KvCache;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Unit.Vulkan;
+using DotLLM.Vulkan;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -582,13 +585,172 @@ public sealed class StoredAssemblyTests : IDisposable
         Assert.Empty(store.Keys());
     }
 
-    // TODO(chunk-store-backend-in-header): the .ckv header does not persist the backend tag. The backend is in the key, so a
-    // CPU entry is never a hit for a Vulkan reader, but a file cannot say which backend produced it, and ChunkKvEntry has no
-    // Backend field on this branch (ChunkKvEntry.Backend exists on feature/chunk-reuse-vulkan). Resolve when the branches meet:
-    // write the tag in the header, check it on read, and have the assembler compare it with its own backend.
-    [Fact(Skip = "TODO(chunk-store-backend-in-header): header does not persist the backend tag yet; ChunkKvEntry.Backend lives on feature/chunk-reuse-vulkan")]
-    public void TODO_StoreHeader_PersistsBackendTag()
+    // ------------------------------------------------------------------------------------------------ backend tag (Phase I Task 1, L4)
+
+    // Pinned before the backend seam was merged (dotLLM aa11975a, CPU only): the CPU fingerprint and key of the tiny model are
+    // unchanged by it, so CPU stores written before format version 2 differ only in the file format, not in their keys.
+    private const string GoldenCpuFingerprint = "b724e6231aebff3569a81501051d493e3b81fbacf26377d5ea52e5e5c9bbbf90";
+    private const string GoldenCpuKeyOfTokA = "b7ee7e3b0d140948eb5172b2611978f8853ea040fd7504b1852361a27081ac6e";
+
+    [Fact]
+    public void StoreHeader_PersistsBackendTag()
     {
+        // The .ckv header carries the backend tag: a new store instance reads back the tag the entry was written with.
+        using var tiny = TinyModel.Load(_scratch, seed: 1);
+        ChunkKvEntry cpu = new ChunkEncoder(tiny.Fingerprint).Encode(tiny.Model, TokA);
+        ChunkKvEntry vulkan = cpu with { Backend = ChunkBackendTags.Vulkan };
+        ChunkKey cpuKey = KeyOf(tiny, TokA);
+        ChunkKey vulkanKey = ChunkKey.Create(tiny.Fingerprint, Tokenizer, RopeParameters.FromConfig(tiny.Config), ChunkBackendTags.Vulkan, KvDtype.F32, TokA);
+        var store = new FileChunkStore(_root);
+        store.Put(cpuKey, cpu);
+        store.Put(vulkanKey, vulkan);
+
+        var reopened = new FileChunkStore(_root);
+        Assert.True(reopened.TryGet(vulkanKey, out ChunkKvEntry gotVulkan));
+        Assert.Equal("vulkan", gotVulkan.Backend);
+        AssertBitExact(vulkan, gotVulkan);
+        Assert.True(reopened.TryGet(cpuKey, out ChunkKvEntry gotCpu));
+        Assert.Equal("cpu", gotCpu.Backend);
+        AssertBitExact(cpu, gotCpu);
+    }
+
+    [Fact]
+    public void StoredAssembly_EntryBackendDiffers_IsRejectedAndReencoded()
+    {
+        // An entry under this assembler's key whose Backend is another backend's (same fingerprint, tokens and shape) is not a hit:
+        // it is evicted and replaced by a fresh encode stamped with this assembler's backend.
+        using var tiny = TinyModel.Load(_scratch, seed: 1);
+        ChunkKvEntry fresh = new ChunkEncoder(tiny.Fingerprint).Encode(tiny.Model, TokA);
+        ChunkKey key = KeyOf(tiny, TokA);
+        var store = new DictionaryStore();
+        store.Put(key, fresh with { Backend = ChunkBackendTags.Vulkan });
+
+        using SimpleKvCache cache = NewCache(tiny);
+        StoredAssembly r = new StoredContextAssembler(tiny.Fingerprint, Tokenizer).Assemble([Ch("a.cs", TokA)], tiny.Model, store, cache);
+        Assert.Equal(new AssemblyStats(0, 1, TokA.Length, 0), r.Stats);
+        Assert.Equal(1, r.Rejected);
+        Assert.Equal([key], store.Evicted);
+        Assert.Equal("cpu", r.Entries[0].Backend);
+        AssertBitExact(fresh, r.Entries[0]);
+        Assert.True(store.TryGet(key, out ChunkKvEntry replaced));
+        Assert.Equal("cpu", replaced.Backend);
+        Assert.Equal(TokA.Length, cache.CurrentLength);
+
+        // The replacement is a hit.
+        StoredAssembly again = new StoredContextAssembler(tiny.Fingerprint, Tokenizer).Assemble([Ch("a.cs", TokA)], tiny.Model, store);
+        Assert.Equal(new AssemblyStats(1, 0, 0, 0), again.Stats);
+        Assert.Equal(0, again.Rejected);
+    }
+
+    [Fact]
+    public void StoredAssembly_HeaderBackendTampered_IsMissAndReencoded()
+    {
+        // A .ckv whose header tag was changed to another well-formed tag reads back with that tag (the store cannot know the key's
+        // backend) and the assembler rejects it, re-encodes and rewrites the file with its own tag.
+        using var tiny = TinyModel.Load(_scratch, seed: 1);
+        var assembler = new StoredContextAssembler(tiny.Fingerprint, Tokenizer);
+        Assert.Equal(new AssemblyStats(0, 1, TokA.Length, 0), assembler.Assemble([Ch("a.cs", TokA)], tiny.Model, new FileChunkStore(_root)).Stats);
+
+        var store = new FileChunkStore(_root);
+        string path = store.PathOf(KeyOf(tiny, TokA));
+        byte[] bytes = File.ReadAllBytes(path);
+        int at = 16 + 64 + 4 + System.Text.Encoding.UTF8.GetByteCount(tiny.Fingerprint) + 4;
+        Assert.Equal("cpu"u8.ToArray(), bytes[at..(at + 3)]);
+        "gpu"u8.CopyTo(bytes.AsSpan(at));
+        File.WriteAllBytes(path, bytes);
+
+        StoredAssembly tampered = assembler.Assemble([Ch("a.cs", TokA)], tiny.Model, store);
+        Assert.Equal(new AssemblyStats(0, 1, TokA.Length, 0), tampered.Stats);
+        Assert.Equal(1, tampered.Rejected);
+        Assert.Equal("cpu"u8.ToArray(), File.ReadAllBytes(path)[at..(at + 3)]);
+        Assert.Equal(new AssemblyStats(1, 0, 0, 0), assembler.Assemble([Ch("a.cs", TokA)], tiny.Model, new FileChunkStore(_root)).Stats);
+    }
+
+    [Fact]
+    public void StoredAssembly_DefaultCtor_KeysOnCpu()
+    {
+        // The constructors and ForModel overloads without a backend mean the CPU backend; their fingerprint and keys equal the
+        // explicit CpuChunkBackend ones and the values pinned before the backend seam existed.
+        using var tiny = TinyModel.Load(_scratch, seed: 1);
+        Assert.Equal(GoldenCpuFingerprint, tiny.Fingerprint);
+        Assert.Equal(GoldenCpuFingerprint, ChunkFingerprint.Compute(tiny.Config, TinyModel.ModelIdOf(1), "F32", Tokenizer, ChunkBackendTags.Cpu));
+
+        var byFingerprint = new StoredContextAssembler(tiny.Fingerprint, Tokenizer);
+        var byForModel = StoredContextAssembler.ForModel(tiny.Config, TinyModel.ModelIdOf(1), "F32", Tokenizer);
+        var explicitCpu = new StoredContextAssembler(tiny.Fingerprint, Tokenizer, new CpuChunkBackend(tiny.Config));
+        var forModelCpu = StoredContextAssembler.ForModel(tiny.Config, TinyModel.ModelIdOf(1), "F32", Tokenizer, new CpuChunkBackend(tiny.Config));
+        ChunkKey canonical = ChunkKey.Create(GoldenCpuFingerprint, Tokenizer, RopeParameters.FromConfig(tiny.Config), "cpu", KvDtype.F32, TokA);
+        Assert.Equal(GoldenCpuKeyOfTokA, canonical.Hex);
+        foreach (StoredContextAssembler a in new[] { byFingerprint, byForModel, explicitCpu, forModelCpu })
+        {
+            Assert.Equal("cpu", a.Backend);
+            Assert.Equal(GoldenCpuFingerprint, a.ModelFingerprint);
+            Assert.Equal(canonical, a.KeyOf(tiny.Config, TokA));
+        }
+
+        // And the default assembler stores CPU-tagged entries under that key.
+        var store = new DictionaryStore();
+        byFingerprint.Assemble([Ch("a.cs", TokA)], tiny.Model, store);
+        Assert.Equal([canonical], store.Keys());
+        Assert.True(store.TryGet(canonical, out ChunkKvEntry e));
+        Assert.Equal("cpu", e.Backend);
+    }
+
+    [Fact]
+    public void StoredAssembly_OtherBackend_KeysOnItsTag_AndNeverHitsCpuEntries()
+    {
+        // CPU stand-in for the GPU test below: a backend with another tag (the CPU backend relabelled, so it runs anywhere) keys,
+        // fingerprints and stamps with its tag. A store filled by the CPU backend gives it no hits, and the reverse; neither evicts
+        // the other's entries.
+        using var tiny = TinyModel.Load(_scratch, seed: 1);
+        var other = new RetaggedBackend(new CpuChunkBackend(tiny.Config), ChunkBackendTags.Vulkan);
+        var cpu = StoredContextAssembler.ForModel(tiny.Config, TinyModel.ModelIdOf(1), "F32", Tokenizer);
+        var vk = StoredContextAssembler.ForModel(tiny.Config, TinyModel.ModelIdOf(1), "F32", Tokenizer, other);
+        Assert.Equal("vulkan", vk.Backend);
+        string vkFp = ChunkFingerprint.Compute(tiny.Config, TinyModel.ModelIdOf(1), "F32", Tokenizer, ChunkBackendTags.Vulkan);
+        Assert.Equal(vkFp, vk.ModelFingerprint);
+        Assert.NotEqual(cpu.ModelFingerprint, vk.ModelFingerprint);
+        Assert.Equal(ChunkKey.Create(vkFp, Tokenizer, RopeParameters.FromConfig(tiny.Config), "vulkan", KvDtype.F32, TokA), vk.KeyOf(tiny.Config, TokA));
+
+        int tokens = TokA.Length + TokB.Length + TokC.Length;
+        foreach (bool cpuFirst in new[] { true, false })
+        {
+            var store = new DictionaryStore();
+            StoredContextAssembler first = cpuFirst ? cpu : vk, second = cpuFirst ? vk : cpu;
+            Assert.Equal(new AssemblyStats(0, 3, tokens, 0), first.Assemble(Context3, tiny.Model, store).Stats);
+            StoredAssembly cross = second.Assemble(Context3, tiny.Model, store);
+            Assert.Equal(new AssemblyStats(0, 3, tokens, 0), cross.Stats);
+            Assert.Equal(0, cross.Rejected);
+            Assert.Empty(store.Evicted);
+            Assert.All(cross.Entries, e => Assert.Equal(second.Backend, e.Backend));
+            Assert.Equal(6, store.Keys().Count());
+            Assert.Equal(new AssemblyStats(3, 0, 0, 0), first.Assemble(Context3, tiny.Model, store).Stats);
+            Assert.Equal(new AssemblyStats(3, 0, 0, 0), second.Assemble(Context3, tiny.Model, store).Stats);
+        }
+
+        // Even with the CPU fingerprint (the fingerprint constructor), the tag alone separates the keys: no hit, no reject.
+        var sameFp = new StoredContextAssembler(cpu.ModelFingerprint, Tokenizer, other);
+        var shared = new DictionaryStore();
+        cpu.Assemble(Context3, tiny.Model, shared);
+        StoredAssembly r = sameFp.Assemble(Context3, tiny.Model, shared);
+        Assert.Equal(new AssemblyStats(0, 3, tokens, 0), r.Stats);
+        Assert.Equal(0, r.Rejected);
+        Assert.Empty(shared.Evicted);
+        Assert.True(shared.Contains(KeyOf(tiny, TokA)));
+    }
+
+    /// <summary>A backend that behaves as <paramref name="inner"/> but carries another tag (a CPU stand-in for a second backend).</summary>
+    internal sealed class RetaggedBackend(IChunkBackend inner, string tag) : IChunkBackend
+    {
+        public string Tag => tag;
+        public int ForwardDeviceId => inner.ForwardDeviceId;
+        public RopeParameters? Rope => inner.Rope;
+        public IKvCache CreateCache(int maxSeqLen) => inner.CreateCache(maxSeqLen);
+        public void RequireCache(IKvCache cache) => inner.RequireCache(cache);
+        public void WriteRows(IKvCache cache, int layer, int startPos, ReadOnlySpan<float> k, ReadOnlySpan<float> v) => inner.WriteRows(cache, layer, startPos, k, v);
+        public void ReadRows(IKvCache cache, int layer, int startPos, int count, Span<float> k, Span<float> v) => inner.ReadRows(cache, layer, startPos, count, k, v);
+        public void CopyRows(IKvCache source, int layer, int srcStart, IKvCache destination, int dstStart, int count) => inner.CopyRows(source, layer, srcStart, destination, dstStart, count);
+        public void ShiftKeys(IKvCache cache, int startPos, int count, int delta, RopeParameters rope) => inner.ShiftKeys(cache, startPos, count, delta, rope);
     }
 
     // ------------------------------------------------------------------------------------------------ helpers
@@ -625,6 +787,7 @@ public sealed class StoredAssemblyTests : IDisposable
     {
         Assert.Equal(expected.ModelFingerprint, actual.ModelFingerprint);
         Assert.Equal(expected.TokenIds, actual.TokenIds);
+        Assert.Equal(expected.Backend, actual.Backend);
         Assert.Equal(expected.KeysPerLayer.Length, actual.KeysPerLayer.Length);
         for (int l = 0; l < expected.KeysPerLayer.Length; l++)
         {
@@ -760,6 +923,79 @@ public sealed class StoredAssemblyTests : IDisposable
         {
             Model.Dispose();
             _gguf.Dispose();
+        }
+    }
+}
+
+/// <summary>
+/// GPU half of the backend tag tests (Phase I Task 1, L4): store-backed assembly on the Vulkan backend with the synthetic F32 model.
+/// CPU and Vulkan entries never mix: a store filled through one backend gives no hit to the other, by key and by the header tag.
+/// Kept small (three short chunks, one tiny model, no recompute) because the box has had device-lost resets on long submits.
+/// </summary>
+[Trait("Category", "GPU")]
+[Collection("VulkanKernels")]
+public sealed class StoredAssemblyTestsGpu : IDisposable
+{
+    private const string Tokenizer = "tok-tiny";
+    private const string ModelId = "tiny-qwen3-default-seed";
+    private static readonly int[] TokA = [3, 17, 5, 29, 11, 40];
+    private static readonly int[] TokB = [8, 22, 1, 35];
+    private static readonly int[] TokC = [12, 7, 44, 2, 19];
+    private readonly string _scratch = Path.Combine(Path.GetTempPath(), "dotllm-storedasm-gpu-" + Guid.NewGuid().ToString("N"));
+
+    public StoredAssemblyTestsGpu() => Directory.CreateDirectory(_scratch);
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_scratch, recursive: true); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    private static IReadOnlyList<Chunk> Context3 =>
+        [new("a.cs", 1, 1, (int[])TokA.Clone()), new("b.cs", 1, 1, (int[])TokB.Clone()), new("c.cs", 1, 1, (int[])TokC.Clone())];
+
+    [SkippableFact]
+    public void StoredAssembly_Vulkan_CpuEntryNeverHits()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var tiny = BackendSeamTests.TinyModel.Load(_scratch, "qwen3");
+        using VulkanDevice device = VulkanDevice.Create();
+        using IModel vkModel = VulkanTransformerModel.LoadFromGguf(device, tiny.Gguf, tiny.Config, spvDir);
+        using var vkBackend = new VulkanChunkBackend(device, spvDir, tiny.Config, ChunkModelFeatures.FromGguf(tiny.Gguf));
+        var cpu = StoredContextAssembler.ForModel(tiny.Config, ModelId, "F32", Tokenizer);
+        var vk = StoredContextAssembler.ForModel(tiny.Config, ModelId, "F32", Tokenizer, vkBackend);
+        Assert.Equal("cpu", cpu.Backend);
+        Assert.Equal("vulkan", vk.Backend);
+        int tokens = TokA.Length + TokB.Length + TokC.Length;
+
+        foreach (bool cpuFirst in new[] { true, false })
+        {
+            string root = Path.Combine(_scratch, cpuFirst ? "cpu-first" : "vulkan-first");
+            (StoredContextAssembler first, IModel firstModel) = cpuFirst ? (cpu, (IModel)tiny.Model) : (vk, vkModel);
+            (StoredContextAssembler second, IModel secondModel) = cpuFirst ? (vk, vkModel) : (cpu, (IModel)tiny.Model);
+
+            Assert.Equal(new AssemblyStats(0, 3, tokens, 0), first.Assemble(Context3, firstModel, new FileChunkStore(root)).Stats);
+            StoredAssembly cross = second.Assemble(Context3, secondModel, new FileChunkStore(root));
+            Assert.Equal(new AssemblyStats(0, 3, tokens, 0), cross.Stats);
+            Assert.Equal(0, cross.Rejected);
+            Assert.All(cross.Entries, e => Assert.Equal(second.Backend, e.Backend));
+
+            // Both sets of entries are on disk with their own header tag, and each backend now hits its own.
+            var store = new FileChunkStore(root);
+            Assert.Equal(6, store.Keys().Count());
+            foreach (StoredContextAssembler a in new[] { cpu, vk })
+            {
+                Assert.True(store.TryGet(a.KeyOf(tiny.Config, TokB), out ChunkKvEntry e));
+                Assert.Equal(a.Backend, e.Backend);
+            }
+            Assert.Equal(new AssemblyStats(3, 0, 0, 0), first.Assemble(Context3, firstModel, new FileChunkStore(root)).Stats);
+
+            // Vulkan warm assembly into a device cache (positive control on the device path).
+            using IKvCache destination = vkBackend.CreateCache(SyntheticDenseGguf.Context);
+            StoredAssembly warmVk = vk.Assemble(Context3, vkModel, new FileChunkStore(root), destination);
+            Assert.Equal(new AssemblyStats(3, 0, 0, 0), warmVk.Stats);
+            Assert.Equal(tokens, destination.CurrentLength);
         }
     }
 }

@@ -35,7 +35,7 @@ internal static class StoreAssemblyCheck
         var assembler = new ChunkAssembler(lab.Config);
         var stored = StoredContextAssembler.ForModel(lab.Config, lab.ModelId, lab.Quant, tokenizerId);
         if (stored.ModelFingerprint != lab.Fingerprint) throw new InvalidOperationException("lab and assembler fingerprints differ");
-        Console.WriteLine($"store {storeDir}; backend {StoredContextAssembler.Backend}, dtype F32, kv-output version {ChunkReuseSchema.KvOutputVersion}; "
+        Console.WriteLine($"store {storeDir}; backend {stored.Backend}, dtype F32, kv-output version {ChunkReuseSchema.KvOutputVersion}; "
             + $"threads {o.Threads}; tokenizer id {tokenizerId}");
 
         using var csv = new StreamWriter(o.OutCsv) { AutoFlush = true };
