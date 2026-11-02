@@ -209,6 +209,24 @@ internal static class RecomputeCommand
                         AddLogits("naive_vs_vk512", "", 0, 0, refLogits!, EvalTasks(vk, naive));
                     }
 
+                    // Attention-kernel control: the same k contiguous rows (k = the largest budget), recomputed as the tail [L-k, L) (a run
+                    // ending at the cache length: the ordinary flash/coopmat attention) and one row earlier [L-k-1, L-1) (inside the cache:
+                    // the per-query-position attention). Same forward shape and matmul regime; only the attention kernel differs.
+                    {
+                        int k = (int)Math.Round(L * o.Budgets.Max() / 100.0, MidpointRounding.AwayFromZero);
+                        foreach ((string arm, int first) in new[] { ("tail_ordinary", L - k), ("tail_qpos", L - k - 1) })
+                            for (int rep = 0; rep < o.Repeats; rep++)
+                            {
+                                Console.WriteLine(Step($"control {arm}: {k} rows at {first}.. rep {rep}"));
+                                using IKvCache cache = Naive();
+                                int[] sel = Enumerable.Range(first, k).ToArray();
+                                sw.Restart();
+                                SelectiveRecomputeResult r = SelectiveRecomputer.Recompute(vk.Model, vk.Backend, cache, ids, sel, RecomputeMode.SinglePass,
+                                    maxRows);
+                                Time(arm, "", o.Budgets.Max(), k, 1, rep, sw.Elapsed.TotalMilliseconds, r.ForwardCalls, r.QueryPositionAttentionLayers);
+                            }
+                    }
+
                     // Recompute arms. -----------------------------------------------------------------------------------------
                     foreach (string selName in o.Selectors)
                     {
@@ -276,7 +294,7 @@ internal static class RecomputeCommand
                     // Pair (d): the per-query-position attention vs the ordinary kernel on the same rows and forward shapes. ----------
                     if (o.Eval)
                     {
-                        int b = Math.Min(L, 2048);
+                        int b = Math.Min(Math.Min(L, 2048), maxRows); // --max-rows bounds every submit, here too
                         Console.WriteLine(Step($"pair (d): full prefill in {b}-row blocks"));
                         using IKvCache vb = vk.NewBackendCache(capacity);
                         vk.Prefill(vb, ids, 0, b);
