@@ -56,6 +56,69 @@ public sealed class TextFirstFixedChunkerTests
         Assert.Equal((1, 2), (one[0].StartLine, one[0].EndLine));
     }
 
+    [Fact]
+    public void ARestOfExactlyNTokens_IsOneChunk()
+    {
+        // 33 chars with line ends inside: with n = 33 the whole file is one chunk (not cut back to an inner line end).
+        string text = "int a = 1;\nint b = 2;\nint c = 3;\n";
+        Assert.Equal(33, text.Length);
+        var chunker = new TextFirstFixedChunker(new CharTokenizer(), 33);
+        Assert.Single(chunker.Chunk(new SourceFile("x.cs", text)));
+        IReadOnlyList<Chunk> two = new TextFirstFixedChunker(new CharTokenizer(), 32).Chunk(new SourceFile("x.cs", text));
+        Assert.Equal(new[] { 22, 33 }, two.Select(c => c.EndOffset));
+    }
+
+    [Fact]
+    public void ARestOfNPlusOneTokens_IsCutAfterN()
+    {
+        IReadOnlyList<Chunk> chunks = new TextFirstFixedChunker(new CharTokenizer(), 4).Chunk(new SourceFile("r.cs", "abcde"));
+        Assert.Equal(new[] { 4, 5 }, chunks.Select(c => c.EndOffset));
+    }
+
+    [Fact]
+    public void NonMonotoneTokenCounts_ALineEndWhosePieceIsOverTheLimit_IsNotUsed()
+    {
+        // A bare '\n' costs 3 tokens, '\n' + letter only 1: "aaa\n" (6 tokens) is longer in tokens than "aaa\nzb" (5).
+        var tok = new NewlineCostTokenizer();
+        var file = new SourceFile("n.cs", "aaa\nzbbbbbbb");
+        IReadOnlyList<Chunk> chunks = new TextFirstFixedChunker(tok, 5).Chunk(file);
+        AssertCoversFile(file, chunks);
+        Assert.All(chunks, c => Assert.InRange(c.TokenIds.Length, 1, 5));
+        Assert.All(chunks, c => Assert.Equal(Raw(tok, file.Text[c.StartOffset..c.EndOffset]), c.TokenIds));
+        Assert.Equal(6, chunks[0].EndOffset);
+    }
+
+    /// <summary>One token per char, except '\n': merged with a following letter into one token, else 3 tokens.</summary>
+    private sealed class NewlineCostTokenizer : ITokenizer
+    {
+        public int[] Encode(string text)
+        {
+            var ids = new List<int>();
+            for (int i = 0; i < text.Length; i++)
+            {
+                if (text[i] != '\n') ids.Add(text[i]);
+                else if (i + 1 < text.Length && char.IsLetter(text[i + 1])) ids.Add(0x10000 + text[++i]);
+                else ids.AddRange([0x20000, 0x20001, 0x20001]);
+            }
+            return ids.ToArray();
+        }
+
+        public string Decode(ReadOnlySpan<int> tokenIds)
+        {
+            var sb = new StringBuilder();
+            foreach (int id in tokenIds)
+                sb.Append(id switch { 0x20000 => "\n", 0x20001 => "", >= 0x10000 => "\n" + (char)(id - 0x10000), _ => ((char)id).ToString() });
+            return sb.ToString();
+        }
+
+        public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => Decode(tokenIds);
+        public string DecodeToken(int tokenId) => Decode([tokenId]);
+        public int BosTokenId => -1;
+        public int EosTokenId => -1;
+        public int VocabSize => 0x20002;
+        public int CountTokens(string text) => Encode(text).Length;
+    }
+
     [Theory]
     [InlineData(16)]
     [InlineData(40)]
