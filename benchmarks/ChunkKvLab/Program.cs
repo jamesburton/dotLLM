@@ -23,6 +23,8 @@ namespace ChunkKvLab;
 ///               [--arms ...] [--light-arms a,b --light-budgets 5,20] [--window 16] [--shard 0/1] [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
 /// ChunkKvLab store-probe --model &lt;gguf&gt; --corpus &lt;dir&gt; --store &lt;empty dir&gt; [--chunks 3] [--chunk 512]
+/// ChunkKvLab store-assembly --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --store &lt;empty dir&gt; --out &lt;csv&gt;
+///               --kept &lt;validation.csv&gt; --plans-jsonl &lt;plans&gt; [--contexts 20] [--threads 8] [--expect-hash &lt;sha256&gt;]
 /// </code>
 /// </summary>
 internal static class Program
@@ -127,6 +129,18 @@ internal static class Program
                     double.Parse(Get("max-minutes", "0"), CultureInfo.InvariantCulture), Int("threads", 0), Get("out"),
                     Int("chunk-cache-tokens", 40000), int.Parse(shard[0], CultureInfo.InvariantCulture), int.Parse(shard[1], CultureInfo.InvariantCulture)));
             }
+            case "store-assembly":
+                // Phase S Task 3: store-backed vs fresh assembly on the E4 contexts (kept mode, symbol chunks by default).
+                return StoreAssemblyCheck.Run(new E4Options(
+                    Get("model"), Get("corpus"), Get("name"), Get("chunker", "symbol"), Int("chunk", 512), opts.GetValueOrDefault("expect-hash"),
+                    Int("seed", 0), Int("count", 100),
+                    new DotLLM.ChunkReuse.CodeCorpus.TaskGeneratorOptions
+                    {
+                        ContextTokens = Int("context", 2048), ContinuationTokens = Int("continuation", 32), PrefixTokens = Int("prefix", 256),
+                        TasksPerContext = Int("per-context", 4),
+                    },
+                    Get("mode", "kept"), opts.GetValueOrDefault("kept"), opts.GetValueOrDefault("plans-jsonl"), Int("contexts", 20),
+                    [], [], [], [], 16, 0, Int("threads", 8), Get("out"), 0, 0, 1), Get("store"));
             case "tasks":
                 return TasksRunner.Run(new TasksOptions(
                     Get("model"), Get("corpus"), Get("chunker", "symbol"), Int("chunk", 512), Int("count", 100), Int("seed", 0),

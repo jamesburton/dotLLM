@@ -40,7 +40,7 @@ internal static class E4Command
     private static readonly string[] StaticArms = ["first_k", "chunk_starts", "deviation", "random"];
     private static readonly string[] TaskArms = ["query", "graph", "hybrid_query", "hybrid_dev", "oracle_def_fill"];
 
-    private sealed record Eval(double MaskNll, double ContNll, bool MaskEm, int GreedyRun, double KlCont, double Top1Cont,
+    internal sealed record Eval(double MaskNll, double ContNll, bool MaskEm, int GreedyRun, double KlCont, double Top1Cont,
         double KlMask, double Top1Mask, double EvalMs);
 
     private sealed record Computed(int Calls, double RecomputeMs, Dictionary<int, Eval> ByTask);
@@ -324,7 +324,7 @@ internal static class E4Command
     }
 
     /// <summary>The plans (contexts + tasks) this run evaluates; see the class remarks.</summary>
-    private static IReadOnlyList<CodeContextPlan> SelectPlans(E4Options o, Corpus corpus)
+    internal static IReadOnlyList<CodeContextPlan> SelectPlans(E4Options o, Corpus corpus)
     {
         var gen = new CrossFileTaskGenerator(o.Generator);
         var sw = Stopwatch.StartNew();
@@ -419,7 +419,7 @@ internal static class E4Command
     /// last token is prefilled at <c>L</c>, then [last prefix token, continuation[..^1]] gives one row per continuation token.
     /// The cache is rolled back to <c>L</c>.
     /// </summary>
-    private static float[] ForwardTask(LabModel lab, SimpleKvCache cache, int L, CodeTask task)
+    internal static float[] ForwardTask(LabModel lab, SimpleKvCache cache, int L, CodeTask task)
     {
         int[] prefix = task.PrefixTokenIds, cont = task.ContinuationTokenIds;
         try
@@ -434,7 +434,7 @@ internal static class E4Command
         }
     }
 
-    private static Eval Score(float[] rows, float[] reference, CodeTask task, int vocab, double evalMs)
+    internal static Eval Score(float[] rows, float[] reference, CodeTask task, int vocab, double evalMs)
     {
         int n = task.ContinuationTokenIds.Length, m = task.MaskTokenCount;
         double maskNll = 0, contNll = 0, klCont = 0, klMask = 0;
