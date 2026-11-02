@@ -10,6 +10,13 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// such a spelling into its control id, so a chunk holding one would get ids (and a store key) the server never computes.
 /// </summary>
 /// <remarks>
+/// <para>
+/// This is the same <i>function</i> the chat path applies to user / tool message text, not a promise that a span's ids inside
+/// a rendered prompt always equal its standalone ids. They differ for assistant-message spans containing
+/// <c>&lt;think&gt;</c> / <c>&lt;/think&gt;</c> (the template exempts the reasoning tags there, so they stay control tokens),
+/// and at span boundaries (a SentencePiece leading space, BPE merges with the template text before or after the span).
+/// Span location and hit checks on the server (Phase I Tasks 11 and 13) must compare ids, not assume equality.
+/// </para>
 /// Text without special-token spellings encodes exactly as <see cref="ITokenizer.EncodeRaw"/> (existing entries stay valid).
 /// No BOS is added. The chunk text is used as given: a caller's own U+FDD0 is dropped by the encoder, as on the chat path.
 /// </remarks>
