@@ -19,6 +19,8 @@
     <!-- The real MEAI OpenAI bridge (MIT), so pipeline tests see the body the provider actually serialises. Test-only:
          the client package itself references Microsoft.Extensions.AI.Abstractions alone. -->
     <PackageReference Include="Microsoft.Extensions.AI.OpenAI" />
+    <!-- Release-only benchmark gate (Overhead_Under5ms). -->
+    <PackageReference Include="Xunit.SkippableFact" />
   </ItemGroup>
 
   <ItemGroup>

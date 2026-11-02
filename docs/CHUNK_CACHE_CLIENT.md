@@ -48,12 +48,16 @@ harness ─► Retrying ─► ChunkAnnotatingChatClient ─► provider IChatCl
 ```
 
 - **Install** the body handler only on providers that are really dotLLM (gate on the provider kind, not on the shared
-  OpenAI-compatible builder), next to any other body-rewriting handler. Put the decorator **below** any retrying client,
-  so each retry rebuilds the same manifest. Share one `ChunkCapabilityCache` between them.
+  OpenAI-compatible builder). Put it **innermost**, closest to the wire, below any other body-rewriting handler (such as
+  CodeSharp's `DotLlmMaxTokensHandler`): either order is correct, because offsets are over decoded text and a `JsonNode`
+  round trip keeps `chunk_cache` and the texts, but innermost keeps "every other byte unchanged" true on the wire. Put
+  the decorator **below** any retrying client, so each retry rebuilds the same manifest. Share one
+  `ChunkCapabilityCache` between them.
 - **Registry.** The file-read tool registers each result it returns: `registry.Register(text, spans)` with the
   `ChunkedText` from an `IChunkSource`. Keyed by part **text**, never by tool-call id (the decorator does not see which
-  tool produced a result). Bounded LRU, 4,096 texts by default; registering a text again replaces its spans, with no
-  spans removes it. Spans are UTF-16 offsets; ranges are checked at registration. A text found with a suffix appended
+  tool produced a result). LRU, bounded by count (4,096 texts) and by size (`DefaultMaxTotalChars`, 32 Mi UTF-16 chars
+  = 64 MiB), evicting the least recently used first; a single text larger than the size budget is not kept. Registering
+  a text again replaces its spans, with no spans removes it. Spans are UTF-16 offsets; ranges are checked at registration. A text found with a suffix appended
   (a hook's additional context) still matches its registered prefix (longest wins; texts of 32+ chars).
 - **Decorator** (`ChunkAnnotatingChatClient(inner, registry, policy[, options])`): reads `TextContent.Text` and string
   `FunctionResultContent.Result`, looks each up in the registry, and with at least one hit (and capabilities, when
@@ -65,7 +69,9 @@ harness ─► Retrying ─► ChunkAnnotatingChatClient ─► provider IChatCl
     update produced after the report was read (the final chunk's update, usually), else on one extra content-free update;
     `ToChatResponse` moves it to the message, and `ChunkCacheReport.TryGet(ChatResponse, …)` looks there too.
   - `CallCompleted` fires per annotated call with the options, the handler's `ChunkManifestOutcome` (spans sent,
-    not located, hash mismatches, invalid, overlapping, over the limit, fallback) and the report: log it per call.
+    not located, hash mismatches, invalid, overlapping, over the limit, fallback) and the report: log it per call. It
+    also fires when the call throws (a strict refusal surfaces as an SDK exception) and when the caller abandons a
+    stream.
   - Stacked decorators annotate once (the outermost scope wins). Streaming re-enters the scope on every step, so a
     request made after the first update still sees it.
 - **Body handler** (`ChunkCacheBodyHandler(caps | source)`):
@@ -74,34 +80,61 @@ harness ─► Retrying ─► ChunkAnnotatingChatClient ─► provider IChatCl
     (ruling 16), and at least one surviving span. In every other case the caller's content object goes out untouched:
     same bytes, same headers.
   - **Locates** by **decoded** text: `messages[i].content` as a string is part 0 (the only v1 form on the OpenAI surface,
-    ruling 19); in an array, text parts keep their array index. A registered text is found as the whole part, as its
-    prefix, or inside it (a bridge that joined texts).
+    ruling 19); in an array, top-level `type: "text"` parts keep their array index. A registered text is found as the
+    whole part, as its prefix, or inside it (a bridge that joined texts).
+  - **Limitation (v1): Anthropic `tool_result` blocks are not located.** On `/messages`, text nested in a `tool_result`
+    block (where file reads live on that surface) is never annotated; the body goes out untouched and the spans count as
+    not located. The mapping of nested blocks to part indices is the server's converter mapping (ruling 19), not yet
+    pinned for the client. The OpenAI-compatible path (CodeSharp's, spec 12.1) is unaffected.
   - **Verifies** every span by re-hashing its text in the serialised part: a mismatch drops it (a mutated part yields no
     annotation, never a wrong one). The client does not normalise: a CRLF text misses an LF-indexed hash, which is the
     chunk source's job to avoid (spec 5.3 item 1). Spans with a lone surrogate (including a boundary inside a surrogate
-    pair) are dropped, and a part whose JSON holds a lone-surrogate escape is never decoded.
-  - **Writes** placement B: UTF-8 byte offsets, `start` / `end` omitted for a whole part, a span registered "to the end"
-    ending where the registered text ends (so an appended suffix is never inside it), document order, a span overlapping
-    an earlier one of its part dropped, at most `max_chunks_per_request`, ids cut to 256 UTF-16 chars. Options at their
-    defaults are omitted (`exact`, `prefill`, `summary`, not strict, server-default recompute). The member is spliced in
-    before the closing brace: every other byte of the body is unchanged.
-  - **Retries.** A resend of the same request message restarts from the caller's original content (kept in
-    `HttpRequestMessage.Options`), so it carries the same manifest, or none if the capability was lost meanwhile.
+    pair) are dropped, and a part whose JSON holds a lone-surrogate escape is never decoded. (A *registered* text holding
+    a lone surrogate never matches the wire either, since writers emit U+FFFD there; it is counted as not located
+    rather than invalid.)
+  - **Writes** placement B: UTF-8 byte offsets, `start` / `end` omitted for a whole part, document order, a span
+    overlapping an earlier one of its part dropped, at most `max_chunks_per_request`, ids cut to 256 UTF-16 chars. The
+    member is spliced in before the closing brace (after any trailing whitespace is skipped; a BOM is kept): every
+    other byte of the body is unchanged.
+  - **A span registered "to the end of the part" (`End = null`) ends where the registered text ends**, and is sent
+    with an explicit `end` when the wire part is longer. So a suffix appended after registration (a hook's additional
+    context) is never inside a span, and the span survives instead of breaking; the hash is verified over exactly the
+    bytes sent.
+  - **Request options at their wire defaults are omitted** from the manifest: `policy: exact`, `on_miss: prefill`,
+    `report: summary`, `strict: false`, and `recompute` when neither selector nor budget is set. The server applies the
+    same defaults (spec 5.2); this is also what makes the client's manifest byte-identical to the contract fixtures.
+  - **Retries.** A resend of the same request message still carrying this handler's rewrite restarts from the caller's
+    original content (kept in `HttpRequestMessage.Options`), so it carries the same manifest, or none if the capability
+    was lost meanwhile. If a handler above replaced the content since, that content is used instead.
     Verified with a retrying handler on either side of the body handler, a retrying chat client above the decorator,
     and the real OpenAI SDK pipeline: the AsyncLocal hand-off survives `HttpClient` and awaited retry delays (spec open
     question 1, for a plain `HttpClient` stack).
-  - **Errors.** Strict: a `chunk_*` error reaches the caller unchanged. Non-strict: a 400 / 503 with a `chunk_*` code
-    (which a conforming server never sends) invalidates the capability answer and resends once with the caller's
-    original body (`FallBackOnChunkError`, default on). Other errors pass through.
-  - **Report.** Blocking: read from the buffered JSON body, which stays readable. `text/event-stream`: the body is wrapped
-    in `SseChunkCacheScanner`, which holds only the current line and parses only `data:` lines containing
-    `"chunk_cache"` (the OpenAI final chunk, or the Anthropic `message_delta` event); nothing is buffered. Other media
-    types pass through unread.
+  - **Errors.** Strict: a `chunk_*` error reaches the caller unchanged. **Non-strict fallback:** a 400 / 503 with a
+    `chunk_*` code (which a conforming server never sends) is answered by resending the caller's original body once,
+    and the capability source is told `MarkNotCapable()`: every request answers "not capable" for the failure TTL
+    (30 s), so a server that keeps refusing costs one extra request per period, never a probe / annotate / refuse loop.
+    `FallBackOnChunkError = false` returns the refusal to the caller instead. Other errors pass through. A response is
+    disposed on every exit path (a failing or cancelled body read included).
+  - **Report.** Blocking: read from the buffered JSON body, which stays readable (bodies over `MaxReportBodyBytes`,
+    16 MiB, are not read). `text/event-stream`: the body is wrapped in `SseChunkCacheScanner`, which holds only the
+    current line and parses only `data:` lines containing `"chunk_cache"` (the OpenAI final chunk, or the Anthropic
+    `message_delta` event); nothing is buffered. It accepts `\n`, `\r\n` and bare `\r` line ends, treats a zero-byte read
+    as a read (not end of stream), examines an unterminated last line at the real end of stream, and skips (and counts)
+    lines over 1 MiB, so a report over 1 MiB is lost. Other media types pass through unread.
 - **Capabilities** (`ChunkCapabilityCache(client, successTtl = 5 min, failureTtl = 30 s, probeTimeout = 5 s)`): any
   probe failure (404, 401, 403, 5xx, transport error, timeout) is "not capable" for the failure TTL, so a flapping server
-  turns annotations off at the first failed probe and back on at the first good one. A change between two known model
-  ids probes again; one probe serves concurrent callers; a caller's cancellation cancels only its own wait.
-- **Overhead:** under 5 ms for 100 spans in a 200 KB body (median of 20, `Overhead_Under5ms`).
+  turns annotations off at the first failed probe and back on at the first good one. Answers are kept **per model id**
+  (up to 16; a main and a sub-agent model do not re-probe on every switch); a request naming no model uses the most
+  recent answer, and the first to name one adopts an answer probed without one. One probe serves concurrent callers of
+  a model, and it runs without the first caller's execution context (no chunk scope, no tracing `Activity` parent); a
+  caller's cancellation cancels only its own wait. `MarkNotCapable()` (above) suppresses annotations for the failure
+  TTL. `FixedChunkCapabilities` honours `MarkNotCapable()` for 30 s too.
+- **Overhead:** under 5 ms for 100 spans in a 200 KB body. `Overhead_Under5ms` is a benchmark (`Category=Benchmark`,
+  Release only: `dotnet test tests/DotLLM.ChunkCache.Client.Tests -c Release --filter Category=Benchmark`): the median of
+  120 interleaved (baseline, handler) pairs, 1.5-2.1 ms on the dev box. Its non-timing twin
+  `Overhead_Workload_AllSpansSent` runs in the default suite.
+- **CI.** `ci.yml` does not run this test project today. The suggested step (a maintainer change, not in this PR) is
+  `dotnet test tests/DotLLM.ChunkCache.Client.Tests -c Release --filter "Category!=Benchmark"`.
 
 ## Server calls
 

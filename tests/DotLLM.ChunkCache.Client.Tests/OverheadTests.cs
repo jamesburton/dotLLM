@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Net;
+using System.Reflection;
 using System.Text;
+using System.Text.Json.Nodes;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -13,19 +15,20 @@ namespace DotLLM.ChunkCache.Client.Tests;
 [CollectionDefinition(nameof(TimingCollection), DisableParallelization = true)]
 public sealed class TimingCollection;
 
-/// <summary>Spec 12.5: handler and decorator overhead under 5 ms.</summary>
+/// <summary>
+/// Spec 12.5: handler and decorator overhead under 5 ms for 100 spans in a 200 KB body. The timing test is a benchmark
+/// (<c>Category=Benchmark</c>, filtered out of CI like the repository's other benchmarks, and skipped outside Release);
+/// its non-timing twin keeps the same body in the default suite.
+/// </summary>
 [Collection(nameof(TimingCollection))]
 public sealed class OverheadTests(ITestOutputHelper output)
 {
-    /// <summary>
-    /// The handler and the decorator's lookup add under 5 ms for 100 spans in a 200 KB body (median of 20), measured in
-    /// steady state (40 warm-up rounds, so the JIT has tiered up, as in a long-running harness).
-    /// </summary>
-    [Fact]
-    public async Task Overhead_Under5ms()
+    private sealed record Workload(ChunkSpanRegistry Registry, List<(string Role, string Content)> Messages, byte[] Body);
+
+    private static Workload Build()
     {
         var registry = new ChunkSpanRegistry();
-        var messages = new List<(string, string)> { ("system", "You are a coding agent.") };
+        var messages = new List<(string Role, string Content)> { ("system", "You are a coding agent.") };
         var rng = new Random(7);
         for (int i = 0; i < 50; i++)
         {
@@ -38,39 +41,80 @@ public sealed class OverheadTests(ITestOutputHelper output)
             messages.Add(("tool", text));
         }
 
-        byte[] input = Pipeline.StringBody([.. messages]);
-        Assert.InRange(input.Length, 200_000, 260_000);
-        using HttpClient http = Pipeline.Client(new CaptureHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)), new ChunkCacheBodyHandler(Pipeline.Caps()));
-        using HttpClient plain = new(new CaptureHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        byte[] body = Pipeline.StringBody([.. messages]);
+        Assert.InRange(body.Length, 200_000, 260_000);
+        return new Workload(registry, messages, body);
+    }
 
-        var samples = new List<double>();
-        for (int round = 0; round < 60; round++)
+    /// <summary>What the decorator does per call: look every content text up in the registry.</summary>
+    private static List<ChunkPart> Lookup(Workload w)
+    {
+        var parts = new List<ChunkPart>();
+        foreach ((_, string content) in w.Messages)
         {
-            var sw = Stopwatch.StartNew();
-            using (HttpResponseMessage _ = await plain.SendAsync(Pipeline.Post(input))) { }
+            if (w.Registry.TryFind(content, out string? t, out IReadOnlyList<ChunkSpan> spans))
+                parts.Add(new ChunkPart(t, spans));
+        }
+
+        return parts;
+    }
+
+    /// <summary>The benchmark's body, without the clock: all 100 spans are sent, two per tool message, in order.</summary>
+    [Fact]
+    public async Task Overhead_Workload_AllSpansSent()
+    {
+        Workload w = Build();
+        var capture = CaptureHandler.Ok();
+        using HttpMessageInvoker invoker = new(new ChunkCacheBodyHandler(Pipeline.Caps()) { InnerHandler = capture });
+        using var scope = ChunkManifestScope.Begin(Lookup(w), new ChunkRequestOptions());
+        using HttpResponseMessage _ = await invoker.SendAsync(Pipeline.Post(w.Body), CancellationToken.None);
+
+        Assert.Equal(100, scope.Outcome!.SentSpans);
+        JsonArray chunks = JsonNode.Parse(Pipeline.SplicedManifest(w.Body, capture.LastBody))!["chunks"]!.AsArray();
+        Assert.Equal(100, chunks.Count);
+        Assert.Equal(Enumerable.Range(1, 50).SelectMany(i => new[] { i, i }), chunks.Select(c => (int)c!["at"]!["message"]!));
+        Assert.Equal(Enumerable.Range(0, 50).SelectMany(i => new[] { $"f{i}:a", $"f{i}:b" }), chunks.Select(c => (string)c!["id"]!));
+    }
+
+    /// <summary>
+    /// The handler alone (through <see cref="HttpMessageInvoker"/>) plus the decorator's lookups, against the same
+    /// terminal without the handler: the median of 120 interleaved (baseline, measured) pairs after 30 warm-up pairs.
+    /// Release only: a Debug build measures the JIT's unoptimised code, not the library.
+    /// </summary>
+    [SkippableFact]
+    [Trait("Category", "Benchmark")]
+    public async Task Overhead_Under5ms()
+    {
+        Skip.If(typeof(ChunkCacheBodyHandler).Assembly.GetCustomAttribute<DebuggableAttribute>()?.IsJITOptimizerDisabled == true,
+            "timing runs only in a Release build (dotnet test -c Release --filter Category=Benchmark)");
+
+        Workload w = Build();
+        HttpResponseMessage Ok(HttpRequestMessage _, byte[]? __) => new(HttpStatusCode.OK);
+        using HttpMessageInvoker plain = new(new CaptureHandler(Ok));
+        using HttpMessageInvoker handled = new(new ChunkCacheBodyHandler(Pipeline.Caps()) { InnerHandler = new CaptureHandler(Ok) });
+
+        var diffs = new List<double>();
+        var sw = new Stopwatch();
+        for (int round = 0; round < 150; round++)
+        {
+            sw.Restart();
+            using (await plain.SendAsync(Pipeline.Post(w.Body), CancellationToken.None)) { }
             double baseline = sw.Elapsed.TotalMilliseconds;
 
             sw.Restart();
-            var parts = new List<ChunkPart>();
-            foreach ((_, string content) in messages)
+            using (var scope = ChunkManifestScope.Begin(Lookup(w), new ChunkRequestOptions()))
+            using (await handled.SendAsync(Pipeline.Post(w.Body), CancellationToken.None))
             {
-                if (registry.TryFind(content, out string? t, out IReadOnlyList<ChunkSpan> spans))
-                    parts.Add(new ChunkPart(t, spans));
+                if (scope.Outcome!.SentSpans != 100) Assert.Fail("not every span was sent");
             }
 
-            using (var scope = ChunkManifestScope.Begin(parts, new ChunkRequestOptions()))
-            {
-                using HttpResponseMessage _ = await http.SendAsync(Pipeline.Post(input));
-                Assert.Equal(100, scope.Outcome!.SentSpans);
-            }
-
-            if (round >= 40) samples.Add(sw.Elapsed.TotalMilliseconds - baseline);
+            double measured = sw.Elapsed.TotalMilliseconds;
+            if (round >= 30) diffs.Add(measured - baseline);
         }
 
-        samples.Sort();
-        double median = samples[samples.Count / 2];
-        output.WriteLine($"median overhead {median:F3} ms (min {samples[0]:F3}, max {samples[^1]:F3})");
+        diffs.Sort();
+        double median = diffs[diffs.Count / 2];
+        output.WriteLine($"median overhead {median:F3} ms over {diffs.Count} pairs (p10 {diffs[diffs.Count / 10]:F3}, p90 {diffs[diffs.Count * 9 / 10]:F3})");
         Assert.True(median < 5.0, $"median overhead {median:F2} ms");
     }
-
 }

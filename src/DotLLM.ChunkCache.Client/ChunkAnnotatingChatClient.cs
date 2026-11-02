@@ -87,7 +87,10 @@ public sealed class ChunkAnnotatingChatClient : DelegatingChatClient
         _options = options ?? new ChunkAnnotatingOptions();
     }
 
-    /// <summary>Raised after every call that went out with a manifest scope (blocking: after the response; streaming: after the last update).</summary>
+    /// <summary>
+    /// Raised after every call that went out with a manifest scope (blocking: after the response; streaming: after the
+    /// last update), including a call that threw and a stream the caller abandoned.
+    /// </summary>
     public event EventHandler<ChunkCacheCallEventArgs>? CallCompleted;
 
     /// <inheritdoc />
@@ -104,10 +107,17 @@ public sealed class ChunkAnnotatingChatClient : DelegatingChatClient
             return await base.GetResponseAsync(list, options, cancellationToken).ConfigureAwait(false);
 
         using ChunkManifestScope scope = ChunkManifestScope.Begin(prepared.Parts, prepared.Options);
-        ChatResponse response = await base.GetResponseAsync(list, options, cancellationToken).ConfigureAwait(false);
-        ChunkCacheReport.Attach(response, scope.ResponseReport);
-        CallCompleted?.Invoke(this, new ChunkCacheCallEventArgs(prepared.Options, scope.Outcome, scope.ResponseReport));
-        return response;
+        try
+        {
+            ChatResponse response = await base.GetResponseAsync(list, options, cancellationToken).ConfigureAwait(false);
+            ChunkCacheReport.Attach(response, scope.ResponseReport);
+            return response;
+        }
+        finally
+        {
+            // Also when the call throws (a strict chunk_* error surfaces as an exception): the outcome still counts.
+            CallCompleted?.Invoke(this, new ChunkCacheCallEventArgs(prepared.Options, scope.Outcome, scope.ResponseReport));
+        }
     }
 
     /// <inheritdoc />
@@ -129,45 +139,51 @@ public sealed class ChunkAnnotatingChatClient : DelegatingChatClient
         using ChunkManifestScope scope = ChunkManifestScope.Begin(prepared.Parts, prepared.Options);
         bool attached = false;
         ChatResponseUpdate? last = null;
-        IAsyncEnumerator<ChatResponseUpdate> e = base.GetStreamingResponseAsync(list, options, cancellationToken).GetAsyncEnumerator(cancellationToken);
         try
         {
-            while (true)
+            IAsyncEnumerator<ChatResponseUpdate> e = base.GetStreamingResponseAsync(list, options, cancellationToken).GetAsyncEnumerator(cancellationToken);
+            try
             {
-                // An async iterator resumes on the caller's context, where the AsyncLocal is not set: re-enter the scope
-                // so a request (or a retry) made during this step still sees it.
-                ChunkManifestScope.Enter(scope);
-                if (!await e.MoveNextAsync().ConfigureAwait(false))
-                    break;
-                ChatResponseUpdate update = e.Current;
-                if (!attached && scope.ResponseReport is { } report)
+                while (true)
                 {
-                    ChunkCacheReport.Attach(update, report);
-                    attached = true;
-                }
+                    // An async iterator resumes on the caller's context, where the AsyncLocal is not set: re-enter the scope
+                    // so a request (or a retry) made during this step still sees it.
+                    ChunkManifestScope.Enter(scope);
+                    if (!await e.MoveNextAsync().ConfigureAwait(false))
+                        break;
+                    ChatResponseUpdate update = e.Current;
+                    if (!attached && scope.ResponseReport is { } report)
+                    {
+                        ChunkCacheReport.Attach(update, report);
+                        attached = true;
+                    }
 
-                last = update;
-                yield return update;
+                    last = update;
+                    yield return update;
+                }
+            }
+            finally
+            {
+                await e.DisposeAsync().ConfigureAwait(false);
+            }
+
+            if (!attached && scope.ResponseReport is { } late)
+            {
+                // The report was read after the last update was produced: carry it on one more, content-free update.
+                var carrier = new ChatResponseUpdate
+                {
+                    ResponseId = last?.ResponseId, MessageId = last?.MessageId, ConversationId = last?.ConversationId,
+                    ModelId = last?.ModelId, CreatedAt = last?.CreatedAt, Role = last?.Role,
+                };
+                ChunkCacheReport.Attach(carrier, late);
+                yield return carrier;
             }
         }
         finally
         {
-            await e.DisposeAsync().ConfigureAwait(false);
+            // Also when the stream throws or the caller abandons it (disposing the enumerator runs this).
+            CallCompleted?.Invoke(this, new ChunkCacheCallEventArgs(prepared.Options, scope.Outcome, scope.ResponseReport));
         }
-
-        if (!attached && scope.ResponseReport is { } late)
-        {
-            // The report was read after the last update was produced: carry it on one more, content-free update.
-            var carrier = new ChatResponseUpdate
-            {
-                ResponseId = last?.ResponseId, MessageId = last?.MessageId, ConversationId = last?.ConversationId,
-                ModelId = last?.ModelId, CreatedAt = last?.CreatedAt, Role = last?.Role,
-            };
-            ChunkCacheReport.Attach(carrier, late);
-            yield return carrier;
-        }
-
-        CallCompleted?.Invoke(this, new ChunkCacheCallEventArgs(prepared.Options, scope.Outcome, scope.ResponseReport));
     }
 
     private sealed record Prepared(IReadOnlyList<ChunkPart> Parts, ChunkRequestOptions Options);

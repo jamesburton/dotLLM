@@ -35,12 +35,15 @@ public interface IChunkSpanRegistry
 }
 
 /// <summary>
-/// The default <see cref="IChunkSpanRegistry"/>: a thread-safe, bounded least-recently-used map (4,096 part texts by
-/// default) from part text to spans, with prefix lookup for texts that later had a suffix appended.
+/// The default <see cref="IChunkSpanRegistry"/>: a thread-safe least-recently-used map from part text to spans, bounded
+/// both in texts (4,096 by default) and in total UTF-16 chars (32 Mi chars, 64 MiB, by default), with prefix lookup for
+/// texts that later had a suffix appended.
 /// </summary>
 /// <remarks>
 /// <list type="bullet">
 /// <item>Registering the same text again replaces its spans; registering it with no spans removes it.</item>
+/// <item>When either bound is exceeded, the least recently used texts are evicted first. A single text larger than the
+/// char budget is not kept (its spans are simply not annotated).</item>
 /// <item>Span ranges are checked against the text at registration (a programming error throws). Hashes are not: the body
 /// handler re-hashes every span against the serialised body, so a wrong hash costs that span, never a wrong annotation.</item>
 /// <item>Prefix lookup applies to texts of at least <see cref="PrefixKeyLength"/> UTF-16 chars (chunks are tens of tokens
@@ -52,20 +55,36 @@ public sealed class ChunkSpanRegistry : IChunkSpanRegistry
     /// <summary>The default capacity (plan Task 8).</summary>
     public const int DefaultCapacity = 4096;
 
+    /// <summary>The default budget of registered text, in UTF-16 chars (32 Mi chars = 64 MiB).</summary>
+    public const long DefaultMaxTotalChars = 32L * 1024 * 1024;
+
     /// <summary>Texts at least this long (UTF-16 chars) are also found as a prefix of a longer part text.</summary>
     public const int PrefixKeyLength = 32;
 
     private readonly int _capacity;
+    private readonly long _maxTotalChars;
+    private long _totalChars;
     private readonly object _gate = new();
     private readonly Dictionary<string, LinkedListNode<Entry>> _byText = new(StringComparer.Ordinal);
     private readonly Dictionary<string, List<Entry>> _byPrefix = new(StringComparer.Ordinal);
     private readonly LinkedList<Entry> _lru = new(); // most recently used first
 
-    /// <summary>Creates a registry holding at most <paramref name="capacity"/> part texts.</summary>
-    public ChunkSpanRegistry(int capacity = DefaultCapacity)
+    /// <summary>Creates a registry holding at most <paramref name="capacity"/> part texts and <paramref name="maxTotalChars"/> chars of text.</summary>
+    public ChunkSpanRegistry(int capacity = DefaultCapacity, long maxTotalChars = DefaultMaxTotalChars)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxTotalChars, 1L);
         _capacity = capacity;
+        _maxTotalChars = maxTotalChars;
+    }
+
+    /// <summary>Total UTF-16 chars of the registered texts.</summary>
+    public long TotalChars
+    {
+        get
+        {
+            lock (_gate) return _totalChars;
+        }
     }
 
     /// <summary>The number of registered part texts.</summary>
@@ -95,11 +114,12 @@ public sealed class ChunkSpanRegistry : IChunkSpanRegistry
         {
             if (_byText.TryGetValue(partText, out LinkedListNode<Entry>? existing))
                 RemoveLocked(existing);
-            if (copy.Length == 0)
+            if (copy.Length == 0 || partText.Length > _maxTotalChars)
                 return;
 
             var entry = new Entry(partText, copy);
             _byText[partText] = _lru.AddFirst(entry);
+            _totalChars += partText.Length;
             if (partText.Length >= PrefixKeyLength)
             {
                 string key = partText[..PrefixKeyLength];
@@ -108,7 +128,7 @@ public sealed class ChunkSpanRegistry : IChunkSpanRegistry
                 bucket.Add(entry);
             }
 
-            while (_byText.Count > _capacity)
+            while (_byText.Count > _capacity || _totalChars > _maxTotalChars)
                 RemoveLocked(_lru.Last!);
         }
     }
@@ -184,6 +204,7 @@ public sealed class ChunkSpanRegistry : IChunkSpanRegistry
         Entry e = node.Value;
         _lru.Remove(node);
         _byText.Remove(e.Text);
+        _totalChars -= e.Text.Length;
         if (e.Text.Length >= PrefixKeyLength)
         {
             string key = e.Text[..PrefixKeyLength];

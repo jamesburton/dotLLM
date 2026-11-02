@@ -11,24 +11,40 @@ public interface IChunkCapabilitySource
     /// The capabilities, or <see langword="null"/> when annotations must be stripped. Never throws for a server or
     /// transport failure; only the caller's own cancellation propagates.
     /// </summary>
-    /// <param name="modelId">The model the request names, when known; a change of model triggers a new probe (spec 8.3).</param>
+    /// <param name="modelId">The model the request names, when known (answers are kept per model, spec 8.3).</param>
     /// <param name="ct">The caller's cancellation.</param>
     ValueTask<ChunkCacheCapabilities?> GetAsync(string? modelId, CancellationToken ct);
 
-    /// <summary>Forgets any cached answer, so the next call probes again (e.g. after the server refused a manifest).</summary>
+    /// <summary>Forgets any cached answer, so the next call probes again.</summary>
     void Invalidate();
+
+    /// <summary>
+    /// The server refused a non-strict manifest with a <c>chunk_*</c> error although it claimed the convention: answer
+    /// "not capable" for a while (the failure period) instead of probing again, so a server that keeps refusing costs one
+    /// extra request per period, not per request. The default forgets the cached answer.
+    /// </summary>
+    void MarkNotCapable() => Invalidate();
 }
 
 /// <summary>A fixed answer, for a provider probed once when it was built (<see langword="null"/> = not capable).</summary>
+/// <remarks><see cref="MarkNotCapable"/> turns annotations off for <see cref="RejectionPeriod"/>.</remarks>
 public sealed class FixedChunkCapabilities(ChunkCacheCapabilities? capabilities) : IChunkCapabilitySource
 {
-    /// <inheritdoc />
-    public ValueTask<ChunkCacheCapabilities?> GetAsync(string? modelId, CancellationToken ct) => ValueTask.FromResult(capabilities);
+    /// <summary>How long a refusal turns annotations off.</summary>
+    public static readonly TimeSpan RejectionPeriod = TimeSpan.FromSeconds(30);
 
-    /// <summary>No-op: a fixed answer has nothing to forget.</summary>
-    public void Invalidate()
-    {
-    }
+    private long _rejectedUntil; // Environment.TickCount64
+
+    /// <inheritdoc />
+    public ValueTask<ChunkCacheCapabilities?> GetAsync(string? modelId, CancellationToken ct) =>
+        ValueTask.FromResult(Environment.TickCount64 < Volatile.Read(ref _rejectedUntil) ? null : capabilities);
+
+    /// <summary>Ends a refusal period early; the fixed answer itself has nothing to forget.</summary>
+    public void Invalidate() => Volatile.Write(ref _rejectedUntil, 0);
+
+    /// <inheritdoc />
+    public void MarkNotCapable() =>
+        Volatile.Write(ref _rejectedUntil, Environment.TickCount64 + (long)RejectionPeriod.TotalMilliseconds);
 }
 
 /// <summary>
@@ -40,10 +56,14 @@ public sealed class FixedChunkCapabilities(ChunkCacheCapabilities? capabilities)
 /// <item>A success is cached for <c>successTtl</c> (default 5 minutes), any failure (404, 401, 403, 5xx, transport error,
 /// probe timeout) for <c>failureTtl</c> (default 30 seconds), so a flapping server is neither hammered nor trusted while
 /// it fails: annotations go off at the first failed probe and come back at the first successful one.</item>
-/// <item>A request naming a different model than the last known one probes again at once; a request naming no model, or
-/// the first to name one, keeps the current answer.</item>
-/// <item>Concurrent callers share one probe. The probe has its own timeout (default 5 seconds) and is not cancelled by a
-/// caller giving up; a caller's cancellation cancels only its own wait.</item>
+/// <item>Answers are kept per model id (up to <see cref="MaxModels"/>, oldest dropped first), so two models on one
+/// server (a main and a sub-agent model) do not re-probe on every switch. A request naming no model uses the most
+/// recently used answer; the first request to name a model adopts an answer probed without one.</item>
+/// <item>After <see cref="MarkNotCapable"/> (the server refused a manifest), every call answers "not capable" for the
+/// failure TTL without probing.</item>
+/// <item>Concurrent callers of one model share one probe. The probe runs without the first caller's execution context
+/// (no chunk scope, no tracing <c>Activity</c> parent), has its own timeout (default 5 seconds) and is not cancelled
+/// by a caller giving up; a caller's cancellation cancels only its own wait.</item>
 /// </list>
 /// </remarks>
 public sealed class ChunkCapabilityCache : IChunkCapabilitySource
@@ -57,6 +77,11 @@ public sealed class ChunkCapabilityCache : IChunkCapabilitySource
     /// <summary>Default probe timeout.</summary>
     public static readonly TimeSpan DefaultProbeTimeout = TimeSpan.FromSeconds(5);
 
+    /// <summary>The most model ids answered at once.</summary>
+    public const int MaxModels = 16;
+
+    private const string NoModel = "";
+
     private readonly IChunkCacheClient _client;
     private readonly TimeSpan _successTtl;
     private readonly TimeSpan _failureTtl;
@@ -64,17 +89,18 @@ public sealed class ChunkCapabilityCache : IChunkCapabilitySource
     private readonly TimeProvider _time;
     private readonly object _gate = new();
 
+    private readonly Dictionary<string, Entry> _entries = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, TaskCompletionSource<ChunkCacheProbeResult>> _inFlight = new(StringComparer.Ordinal);
+    private string? _lastKey;
+    private long _stamp;
+    private DateTimeOffset _rejectedUntil = DateTimeOffset.MinValue;
     private ChunkCacheProbeResult? _last;
-    private string? _lastModel;
-    private DateTimeOffset _expires;
-    private TaskCompletionSource<ChunkCacheProbeResult>? _inFlight;
-    private string? _inFlightModel;
     private int _probes;
 
     /// <summary>Creates the cache.</summary>
     /// <param name="client">The control-plane client whose <see cref="IChunkCacheClient.GetCapabilitiesAsync"/> probes.</param>
     /// <param name="successTtl">How long a success is trusted (default <see cref="DefaultSuccessTtl"/>).</param>
-    /// <param name="failureTtl">How long a failure is remembered (default <see cref="DefaultFailureTtl"/>).</param>
+    /// <param name="failureTtl">How long a failure or a refusal is remembered (default <see cref="DefaultFailureTtl"/>).</param>
     /// <param name="probeTimeout">Probe timeout (default <see cref="DefaultProbeTimeout"/>; <see cref="Timeout.InfiniteTimeSpan"/> disables it).</param>
     /// <param name="timeProvider">Clock for the TTLs (default <see cref="TimeProvider.System"/>).</param>
     public ChunkCapabilityCache(IChunkCacheClient client, TimeSpan? successTtl = null, TimeSpan? failureTtl = null,
@@ -110,33 +136,62 @@ public sealed class ChunkCapabilityCache : IChunkCapabilitySource
         ct.ThrowIfCancellationRequested();
         TaskCompletionSource<ChunkCacheProbeResult> pending;
         bool start = false;
-        string? model;
+        string key;
         lock (_gate)
         {
-            model = modelId;
-            if (_last is not null && _time.GetUtcNow() < _expires && SameModel(model, _lastModel))
+            DateTimeOffset now = _time.GetUtcNow();
+            if (now < _rejectedUntil)
+                return null;
+
+            key = modelId ?? _lastKey ?? NoModel;
+            if (_entries.TryGetValue(key, out Entry? entry) && now < entry.Expires)
             {
-                _lastModel ??= model;
-                return _last.Capabilities;
+                _lastKey = key;
+                return entry.Result.Capabilities;
             }
 
-            if (_inFlight is not null && SameModel(model, _inFlightModel))
+            // The first request to name a model adopts an answer probed without one (the decorator often does not know it).
+            if (modelId is not null && !_entries.ContainsKey(modelId) && _entries.TryGetValue(NoModel, out Entry? anon) && now < anon.Expires)
             {
-                _inFlightModel ??= model;
-                pending = _inFlight;
+                _entries.Remove(NoModel);
+                _entries[modelId] = anon;
+                _lastKey = modelId;
+                return anon.Result.Capabilities;
+            }
+
+            if (_inFlight.TryGetValue(key, out TaskCompletionSource<ChunkCacheProbeResult>? running)
+                || (modelId is not null && _inFlight.TryGetValue(NoModel, out running)))
+            {
+                pending = running;
             }
             else
             {
-                pending = _inFlight = new TaskCompletionSource<ChunkCacheProbeResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-                _inFlightModel = model;
+                pending = _inFlight[key] = new TaskCompletionSource<ChunkCacheProbeResult>(TaskCreationOptions.RunContinuationsAsynchronously);
                 start = true;
             }
         }
 
         if (start)
-            _ = ProbeAsync(pending, model);
+        {
+            // The shared probe must not inherit this caller's execution context (its chunk scope, its tracing Activity).
+            if (ExecutionContext.IsFlowSuppressed())
+            {
+                _ = Task.Run(() => ProbeAsync(pending, key));
+            }
+            else
+            {
+                using (ExecutionContext.SuppressFlow())
+                    _ = Task.Run(() => ProbeAsync(pending, key));
+            }
+        }
 
         ChunkCacheProbeResult result = await pending.Task.WaitAsync(ct).ConfigureAwait(false);
+        lock (_gate)
+        {
+            if (_time.GetUtcNow() < _rejectedUntil)
+                return null;
+        }
+
         return result.Capabilities;
     }
 
@@ -144,16 +199,20 @@ public sealed class ChunkCapabilityCache : IChunkCapabilitySource
     public void Invalidate()
     {
         lock (_gate)
-            _last = null;
+        {
+            _entries.Clear();
+            _rejectedUntil = DateTimeOffset.MinValue;
+        }
     }
 
-    /// <summary>
-    /// Only a change between two known model ids is a change: a call that names no model (the decorator often does not
-    /// know it) and the request that names it describe the same server.
-    /// </summary>
-    private static bool SameModel(string? a, string? b) => a is null || b is null || string.Equals(a, b, StringComparison.Ordinal);
+    /// <inheritdoc />
+    public void MarkNotCapable()
+    {
+        lock (_gate)
+            _rejectedUntil = _time.GetUtcNow() + _failureTtl;
+    }
 
-    private async Task ProbeAsync(TaskCompletionSource<ChunkCacheProbeResult> pending, string? model)
+    private async Task ProbeAsync(TaskCompletionSource<ChunkCacheProbeResult> pending, string key)
     {
         Interlocked.Increment(ref _probes);
         ChunkCacheProbeResult result;
@@ -173,17 +232,21 @@ public sealed class ChunkCapabilityCache : IChunkCapabilitySource
 
         lock (_gate)
         {
-            if (ReferenceEquals(_inFlight, pending))
-            {
-                _inFlight = null;
-                _inFlightModel = null;
-            }
+            if (_inFlight.TryGetValue(key, out TaskCompletionSource<ChunkCacheProbeResult>? current) && ReferenceEquals(current, pending))
+                _inFlight.Remove(key);
 
             _last = result;
-            _lastModel = model ?? _lastModel;
-            _expires = _time.GetUtcNow() + (result.IsCapable ? _successTtl : _failureTtl);
+            _entries[key] = new Entry(result, _time.GetUtcNow() + (result.IsCapable ? _successTtl : _failureTtl), ++_stamp);
+            _lastKey = key;
+            while (_entries.Count > MaxModels)
+            {
+                string oldest = _entries.MinBy(kv => kv.Value.Stamp).Key;
+                _entries.Remove(oldest);
+            }
         }
 
         pending.SetResult(result);
     }
+
+    private sealed record Entry(ChunkCacheProbeResult Result, DateTimeOffset Expires, long Stamp);
 }

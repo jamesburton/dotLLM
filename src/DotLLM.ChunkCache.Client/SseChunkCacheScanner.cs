@@ -14,7 +14,11 @@ namespace DotLLM.ChunkCache.Client;
 /// whose bytes contain <c>"chunk_cache"</c> is parsed as JSON; every other event costs a byte scan.</item>
 /// <item>A line longer than <see cref="MaxLineBytes"/> is skipped, so a hostile stream cannot grow the buffer without
 /// bound. Single-line <c>data:</c> fields only (both surfaces emit one JSON object per line).</item>
-/// <item><c>\n</c> and <c>\r\n</c> line ends; a final line without a newline is examined at end of stream.</item>
+/// <item><c>\n</c>, <c>\r\n</c> and bare <c>\r</c> line ends (the SSE spec allows all three); a final line without a
+/// line end is examined at the real end of stream. A zero-byte read (a caller polling with an empty buffer, as pipeline
+/// readers with zero-byte reads do) is passed through and is not end of stream.</item>
+/// <item>A report line over <see cref="MaxLineBytes"/> is lost (counted in <see cref="SkippedLines"/>); a summary report is
+/// about 1 KB.</item>
 /// </list>
 /// </remarks>
 public sealed class SseChunkCacheScanner : Stream
@@ -32,7 +36,9 @@ public sealed class SseChunkCacheScanner : Stream
     private int _length;
     private bool _overflow;
     private bool _ended;
+    private bool _afterCr;
     private int _parsed;
+    private int _skipped;
 
     /// <summary>Wraps <paramref name="inner"/>; <paramref name="onReport"/> receives each report found (normally one).</summary>
     public SseChunkCacheScanner(Stream inner, Action<JsonObject> onReport)
@@ -45,6 +51,9 @@ public sealed class SseChunkCacheScanner : Stream
 
     /// <summary>JSON parses so far: only <c>data:</c> lines that contain <c>"chunk_cache"</c>.</summary>
     public int ParsedEvents => _parsed;
+
+    /// <summary>Lines skipped for exceeding <see cref="MaxLineBytes"/>.</summary>
+    public int SkippedLines => _skipped;
 
     /// <inheritdoc />
     public override bool CanRead => true;
@@ -72,6 +81,7 @@ public sealed class SseChunkCacheScanner : Stream
     /// <inheritdoc />
     public override int Read(Span<byte> buffer)
     {
+        if (buffer.IsEmpty) return _inner.Read(buffer); // a zero-byte read is not end of stream
         int n = _inner.Read(buffer);
         Scan(buffer[..n]);
         return n;
@@ -84,6 +94,7 @@ public sealed class SseChunkCacheScanner : Stream
     /// <inheritdoc />
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
+        if (buffer.IsEmpty) return await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
         int n = await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
         Scan(buffer.Span[..n]);
         return n;
@@ -128,12 +139,35 @@ public sealed class SseChunkCacheScanner : Stream
 
         while (!bytes.IsEmpty)
         {
-            int nl = bytes.IndexOf((byte)'\n');
-            ReadOnlySpan<byte> piece = nl < 0 ? bytes : bytes[..nl];
-            Append(piece);
-            if (nl < 0) return;
+            if (_afterCr)
+            {
+                // The \n of a \r\n pair whose \r ended the previous read: the line has already ended.
+                _afterCr = false;
+                if (bytes[0] == (byte)'\n')
+                {
+                    bytes = bytes[1..];
+                    continue;
+                }
+            }
+
+            int end = bytes.IndexOfAny((byte)'\r', (byte)'\n');
+            if (end < 0)
+            {
+                Append(bytes);
+                return;
+            }
+
+            Append(bytes[..end]);
             EndLine();
-            bytes = bytes[(nl + 1)..];
+            if (bytes[end] == (byte)'\r')
+            {
+                if (end + 1 < bytes.Length && bytes[end + 1] == (byte)'\n')
+                    end++;
+                else if (end + 1 == bytes.Length)
+                    _afterCr = true;
+            }
+
+            bytes = bytes[(end + 1)..];
         }
     }
 
@@ -158,8 +192,12 @@ public sealed class SseChunkCacheScanner : Stream
         bool skip = _overflow;
         _length = 0;
         _overflow = false;
-        if (skip) return;
-        if (!line.IsEmpty && line[^1] == (byte)'\r') line = line[..^1];
+        if (skip)
+        {
+            _skipped++;
+            return;
+        }
+
         if (!line.StartsWith(DataField)) return;
         line = line[DataField.Length..];
         if (!line.IsEmpty && line[0] == (byte)' ') line = line[1..];

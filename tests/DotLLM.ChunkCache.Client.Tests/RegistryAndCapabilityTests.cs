@@ -58,6 +58,33 @@ public sealed class RegistryAndCapabilityTests
         Assert.True(r.TryGet(d, out _));
     }
 
+    /// <summary>Review S5: a total-chars budget, evicting least recently used first; an oversized text is not kept.</summary>
+    [Fact]
+    public void Registry_CharBudget_EvictsLeastRecentlyUsed()
+    {
+        var r = new ChunkSpanRegistry(capacity: 100, maxTotalChars: 200);
+        string a = Long('a', 80), b = Long('b', 80), c = Long('c', 80);
+        r.Register(a, Whole(a));
+        r.Register(b, Whole(b));
+        Assert.True(r.TryGet(a, out _)); // b is now the least recently used
+        r.Register(c, Whole(c));          // 240 > 200: evict b
+
+        Assert.Equal(160, r.TotalChars);
+        Assert.False(r.TryGet(b, out _));
+        Assert.True(r.TryGet(a, out _));
+        Assert.True(r.TryGet(c, out _));
+
+        string huge = Long('h', 201);
+        r.Register(huge, Whole(huge));
+        Assert.False(r.TryGet(huge, out _));
+        Assert.Equal(160, r.TotalChars);  // nothing else was evicted for it
+
+        r.Register(a, []);
+        Assert.Equal(80, r.TotalChars);
+        Assert.Equal(32L * 1024 * 1024, ChunkSpanRegistry.DefaultMaxTotalChars);
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ChunkSpanRegistry(10, 0));
+    }
+
     [Fact]
     public void Registry_DefaultCapacity_Is4096()
     {

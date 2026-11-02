@@ -43,7 +43,10 @@ public sealed class ChunkCacheBodyHandler : DelegatingHandler
     /// <summary>The maximum id length on the wire (spec 5.2).</summary>
     public const int MaxIdLength = 256;
 
-    private static readonly HttpRequestOptionsKey<HttpContent> s_original = new("DotLLM.ChunkCache.Client.OriginalContent");
+    /// <summary>The largest blocking JSON body read for the report (16 MiB); a larger one passes through unread.</summary>
+    public const long MaxReportBodyBytes = 16L * 1024 * 1024;
+
+    private static readonly HttpRequestOptionsKey<Rewrite> s_rewrite = new("DotLLM.ChunkCache.Client.Rewrite");
 
     private readonly IChunkCapabilitySource _capabilities;
 
@@ -71,11 +74,14 @@ public sealed class ChunkCacheBodyHandler : DelegatingHandler
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        // A resend of a message this handler rewrote: start again from the caller's own content.
-        if (request.Options.TryGetValue(s_original, out HttpContent? original))
+        // A resend of a message this handler rewrote, still carrying the rewrite: start again from the caller's own
+        // content. If something above replaced the content since (a body rewriter re-wrapping it), that content wins.
+        HttpContent? original = request.Content;
+        if (request.Options.TryGetValue(s_rewrite, out Rewrite? previous) && previous is not null && ReferenceEquals(request.Content, previous.Rewritten))
+        {
+            original = previous.Original;
             request.Content = original;
-        else
-            original = request.Content;
+        }
 
         ChunkManifestScope? scope = ChunkManifestScope.Current;
         if (scope is null || scope.Parts.Count == 0 || original is null || request.Method != HttpMethod.Post || !IsChatPath(request.RequestUri))
@@ -108,24 +114,32 @@ public sealed class ChunkCacheBodyHandler : DelegatingHandler
                 content.Headers.TryAddWithoutValidation(h.Key, h.Value);
         }
 
-        request.Options.Set(s_original, original);
+        request.Options.Set(s_rewrite, new Rewrite(original, content));
         request.Content = content;
         scope.SetOutcome(plan.Outcome(registered, annotated: true, fellBack: false));
 
         HttpResponseMessage response = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        if (FallBackOnChunkError && !scope.Options.Strict && await IsChunkErrorAsync(response, cancellationToken).ConfigureAwait(false))
+        try
         {
-            // A conforming server never refuses a non-strict manifest; this one did. Forget its capabilities and send the
-            // caller's request as it was.
-            _capabilities.Invalidate();
-            response.Dispose();
-            request.Content = original;
-            scope.SetOutcome(plan.Outcome(registered, annotated: false, fellBack: true));
-            return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        }
+            if (FallBackOnChunkError && !scope.Options.Strict && await IsChunkErrorAsync(response, cancellationToken).ConfigureAwait(false))
+            {
+                // A conforming server never refuses a non-strict manifest; this one did. Treat it as not capable for the
+                // failure period (no probe / annotate / refuse loop) and send the caller's request as it was.
+                _capabilities.MarkNotCapable();
+                response.Dispose();
+                request.Content = original;
+                scope.SetOutcome(plan.Outcome(registered, annotated: false, fellBack: true));
+                return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            }
 
-        await AttachReportReaderAsync(response, scope, cancellationToken).ConfigureAwait(false);
-        return response;
+            await AttachReportReaderAsync(response, scope, cancellationToken).ConfigureAwait(false);
+            return response;
+        }
+        catch
+        {
+            response.Dispose(); // never leak the connection when reading the body fails or is cancelled
+            throw;
+        }
     }
 
     private async Task<HttpResponseMessage> SendPlainAsync(HttpRequestMessage request, ChunkManifestScope scope, ChunkManifestOutcome outcome,
@@ -133,9 +147,17 @@ public sealed class ChunkCacheBodyHandler : DelegatingHandler
     {
         scope.SetOutcome(outcome);
         HttpResponseMessage response = await base.SendAsync(request, ct).ConfigureAwait(false);
-        if (readReport)
+        if (!readReport) return response;
+        try
+        {
             await AttachReportReaderAsync(response, scope, ct).ConfigureAwait(false);
-        return response;
+            return response;
+        }
+        catch
+        {
+            response.Dispose();
+            throw;
+        }
     }
 
     private async ValueTask<ChunkCacheCapabilities?> GetCapabilitiesAsync(string? model, CancellationToken ct)
@@ -219,6 +241,8 @@ public sealed class ChunkCacheBodyHandler : DelegatingHandler
         if (mediaType is null || !(string.Equals(mediaType, "application/json", StringComparison.OrdinalIgnoreCase)
                                    || mediaType.EndsWith("+json", StringComparison.OrdinalIgnoreCase)))
             return;
+        if (content.Headers.ContentLength is long length && length > MaxReportBodyBytes)
+            return;
 
         byte[] bytes = await content.ReadAsByteArrayAsync(ct).ConfigureAwait(false); // buffered: still readable
         if (ChunkCacheReport.FromJson(bytes.AsSpan(StartsWithBom(bytes) ? 3 : 0)) is { } report)
@@ -226,6 +250,9 @@ public sealed class ChunkCacheBodyHandler : DelegatingHandler
     }
 
     private static bool StartsWithBom(byte[] b) => b.Length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF;
+
+    /// <summary>The caller's content and the rewritten content that replaced it (kept on the request for resends).</summary>
+    private sealed record Rewrite(HttpContent Original, HttpContent Rewritten);
 
     /// <summary>One serialised text part: its indices and its decoded text.</summary>
     private sealed record WirePart(int Message, int Part, string Text);
