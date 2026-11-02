@@ -217,10 +217,11 @@ public sealed class VulkanAssemblyTests : IDisposable
 }
 
 /// <summary>
-/// Phase G Task 3, GPU half: encode and assembly on the Vulkan backend with the synthetic F32 model. Tolerances are the synthetic-model
-/// ones (G0 README "Scope": the Q4_K floors do not apply here): within-Vulkan comparisons of the same forward shapes are bit-exact; a
-/// device RoPE shift against the host shift is within 1e-5 (Task 1 measured 6e-7); CPU vs Vulkan is within 1e-5 at layer 0 (no
-/// attention upstream) and within <see cref="CrossBackendDeepTol"/> deeper (measured ~2e-3 abs on values of magnitude ~5).
+/// Phase G Task 3, GPU half: encode and assembly on the Vulkan backend with the synthetic F32 model. The Q4_K floors of G0 do not apply
+/// here (G0 README "Scope"). Within-Vulkan comparisons of the same forward shapes are bit-exact; a device RoPE shift against the host
+/// shift is within 1e-5 (Task 1 measured 6e-7); CPU vs Vulkan is within 1e-5 at layer 0 (no attention upstream). Deeper layers use
+/// <see cref="CrossBackendDeepTol"/> = 1e-2, this task's own choice from its spike (CPU vs Vulkan measured 1.1e-3 / 1.3e-3 K / V at
+/// layer 1 and 1.6e-3 / 2.1e-3 at layer 2, abs, on values of magnitude ~5): about 5x headroom, while a wrong layer or offset is O(1).
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection("VulkanKernels")]
