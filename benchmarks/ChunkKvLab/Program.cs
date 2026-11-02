@@ -25,6 +25,10 @@ namespace ChunkKvLab;
 /// ChunkKvLab store-probe --model &lt;gguf&gt; --corpus &lt;dir&gt; --store &lt;empty dir&gt; [--chunks 3] [--chunk 512]
 /// ChunkKvLab store-assembly --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --store &lt;empty dir&gt; --out &lt;csv&gt;
 ///               --kept &lt;validation.csv&gt; --plans-jsonl &lt;plans&gt; [--contexts 20] [--threads 8] [--expect-hash &lt;sha256&gt;]
+/// ChunkKvLab e7 --model &lt;gguf&gt; --corpus &lt;dir&gt; --out &lt;csv&gt; [--seeds 0,1,2] [--edits 100] [--chunk 512]
+///               [--expect-hash-symbol &lt;sha256&gt;] [--expect-hash-fixed &lt;sha256&gt;]
+/// ChunkKvLab index-roundtrip --model &lt;gguf&gt; --corpus &lt;dir&gt; --store &lt;empty dir&gt; [--chunk 512]
+///               [--expect-hash-symbol &lt;sha256&gt;] [--expect-hash-fixed &lt;sha256&gt;]
 /// </code>
 /// </summary>
 internal static class Program
@@ -77,6 +81,14 @@ internal static class Program
             case "store-probe":
                 return StoreProbe.Run(Get("model"), Get("corpus"), Get("pattern", "*.cs"), Int("chunks", 3), Int("chunk", 512),
                     Int("threads", 0), Get("store"));
+            case "e7":
+                // Tokenizer only: incremental re-encode cost of single-method edits, symbol vs fixed chunking (ChunkIndex).
+                return E7Command.Run(new E7Options(Get("model"), Get("corpus"), Ints("seeds", "0,1,2"), Int("edits", 100), Int("chunk", 512),
+                    opts.GetValueOrDefault("expect-hash-symbol"), opts.GetValueOrDefault("expect-hash-fixed"), Get("out")));
+            case "index-roundtrip":
+                // Tokenizer only: Save->Load of real symbol and fixed ChunkIndexes over a frozen corpus.
+                return IndexRoundTrip.Run(Get("model"), Get("corpus"), Int("chunk", 512), opts.GetValueOrDefault("expect-hash-symbol"),
+                    opts.GetValueOrDefault("expect-hash-fixed"), Get("store"));
             case "corpus-info":
             {
                 // Tokenizer only (no weights are run): document/chunk counts and the chunk-id hash of a corpus directory.

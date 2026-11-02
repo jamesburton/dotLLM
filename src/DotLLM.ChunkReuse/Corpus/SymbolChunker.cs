@@ -168,8 +168,12 @@ public sealed partial class SymbolChunker : IChunker
             return lineStart;
         }
 
-        private void Add(int start, int end, int[] ids) =>
-            _out.Add(new Chunk(path, _lines.LineOf(start), _lines.LineOf(end - 1), ids) { StartOffset = start, EndOffset = end });
+        private void Add(int start, int end, int[] ids)
+        {
+            int startLine = _lines.LineOf(start);
+            int endLine = end > start ? _lines.LineOf(end - 1) : startLine; // a zero-length piece (see SliceTokens) has one line
+            _out.Add(new Chunk(path, startLine, endLine, ids) { StartOffset = start, EndOffset = end });
+        }
 
         private void Emit(int start, int end)
         {
@@ -225,9 +229,10 @@ public sealed partial class SymbolChunker : IChunker
         /// <summary>One line over the limit: slices of <see cref="Limit"/> token ids; offsets from the decoded slice lengths.</summary>
         /// <remarks>
         /// Caveat: the char offsets (and so <see cref="Chunk.StartOffset"/>/<see cref="Chunk.EndOffset"/> of the pieces) come from
-        /// decoding each slice on its own. With a byte-level BPE, a slice boundary inside a multi-byte UTF-8 character decodes to
-        /// replacement characters, so the piece offsets can be off by that character (the token ids and the coverage of the
-        /// line are unaffected). Only over-long single lines take this path.
+        /// decoding the ids up to each boundary. With a byte-level BPE, a boundary inside a multi-byte UTF-8 character decodes to
+        /// replacement characters, so a boundary offset can be off by that character (the token ids are unaffected). Offsets are
+        /// clamped to stay within the line and never go back, so the pieces always tile the line exactly; a piece can then be
+        /// zero-length. Only over-long single lines take this path.
         /// </remarks>
         private void SliceTokens(int start, int end)
         {
@@ -235,10 +240,13 @@ public sealed partial class SymbolChunker : IChunker
             int offset = start;
             for (int s = 0; s < ids.Length; s += Limit)
             {
-                int[] slice = ids.AsSpan(s, Math.Min(Limit, ids.Length - s)).ToArray();
-                int next = s + Limit >= ids.Length ? end : Math.Min(end, offset + owner._tokenizer.Decode(slice).Length);
-                Add(offset, Math.Max(offset + 1, next), slice);
-                offset = Math.Max(offset + 1, next);
+                int stop = Math.Min(s + Limit, ids.Length);
+                int[] slice = ids.AsSpan(s, stop - s).ToArray();
+                // Decode the whole prefix (not this slice alone), so replacement characters do not accumulate across slices.
+                int next = stop >= ids.Length ? end
+                    : Math.Clamp(start + owner._tokenizer.Decode(ids.AsSpan(0, stop)).Length, offset, end);
+                Add(offset, next, slice);
+                offset = next;
             }
         }
     }
