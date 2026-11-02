@@ -16,8 +16,11 @@ internal sealed unsafe class LabModel : IDisposable
 {
     private readonly GgufFile _gguf;
 
-    private LabModel(GgufFile gguf, ModelConfig config, IModel model, ITokenizer tokenizer, string fingerprint)
+    private LabModel(GgufFile gguf, ModelConfig config, IModel model, ITokenizer tokenizer, string fingerprint, string modelId, string tokenizerId, string quant)
     {
+        ModelId = modelId;
+        TokenizerId = tokenizerId;
+        Quant = quant;
         _gguf = gguf;
         Config = config;
         Model = model;
@@ -33,6 +36,15 @@ internal sealed unsafe class LabModel : IDisposable
     public IModel Model { get; }
     public ITokenizer Tokenizer { get; }
     public string Fingerprint { get; }
+
+    /// <summary>Content-based model id (<see cref="GgufIdentity.ModelId"/>), not the file name.</summary>
+    public string ModelId { get; }
+
+    /// <summary>Quantization label hashed into the fingerprint (<c>general.file_type</c>).</summary>
+    public string Quant { get; }
+
+    /// <summary>Content-based tokenizer id (<see cref="GgufIdentity.TokenizerId"/>), not the file name.</summary>
+    public string TokenizerId { get; }
     public KvGeometry Geometry { get; }
 
     /// <summary>F32 K+V bytes per token over all layers.</summary>
@@ -46,11 +58,16 @@ internal sealed unsafe class LabModel : IDisposable
         ITokenizer tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
         IModel model = ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(threads));
         string file = Path.GetFileNameWithoutExtension(path);
-        string quant = file[(file.LastIndexOf('-') + 1)..];
-        string fp = ChunkFingerprint.Compute(config, file, quant, "gguf-embedded:" + file);
+        // Content-based identities: a renamed file keeps its chunks, a re-quantized or edited file with the same name does not.
+        string modelId = GgufIdentity.ModelId(gguf, path);
+        string tokenizerId = GgufIdentity.TokenizerId(gguf.Metadata);
+        string quant = gguf.Metadata.TryGetValue("general.file_type", out var ft)
+            ? "ftype-" + Convert.ToString(ft.Value, System.Globalization.CultureInfo.InvariantCulture) : "unknown";
+        string fp = ChunkFingerprint.Compute(config, modelId, quant, tokenizerId);
         Console.WriteLine($"loaded {file} ({config.Architecture}, {config.NumLayers} layers, kv heads {config.NumKvHeads}, head dim {config.HeadDim}, "
             + $"vocab {config.VocabSize}) in {sw.Elapsed.TotalSeconds:F1} s; engine {ChunkFingerprint.EngineVersion}");
-        return new LabModel(gguf, config, model, tokenizer, fp);
+        Console.WriteLine($"model id {modelId}; tokenizer id {tokenizerId}; quant {quant}; fingerprint {fp}");
+        return new LabModel(gguf, config, model, tokenizer, fp, modelId, tokenizerId, quant);
     }
 
     public SimpleKvCache NewCache(int capacity) => new(Geometry, capacity);

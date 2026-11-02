@@ -17,7 +17,7 @@ internal static class StoreProbe
         ContextBuilder corpus = ContextBuilder.FromDirectory(corpusDir, pattern, lab.Tokenizer, chunkTokens);
         var encoder = new ChunkEncoder(lab.Fingerprint);
         var rope = RopeParameters.FromConfig(lab.Config);
-        string tokenizerId = "gguf-embedded:" + Path.GetFileNameWithoutExtension(modelPath);
+        string tokenizerId = lab.TokenizerId;
         string engine = ChunkFingerprint.EngineVersion; // build identity, logged only
         Console.WriteLine($"corpus {corpusDir}: {corpus.DocumentCount} documents, {corpus.Chunks.Count} chunks; chunk-id sha256 {corpus.ChunkIdHash}");
         Console.WriteLine($"store {storeDir}; key: backend cpu, dtype F32, kv-output version {ChunkReuseSchema.KvOutputVersion} (build {engine})");

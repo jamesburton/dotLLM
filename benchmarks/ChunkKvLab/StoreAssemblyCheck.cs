@@ -28,16 +28,17 @@ internal static class StoreAssemblyCheck
         IReadOnlyList<CodeContextPlan> plans = E4Command.SelectPlans(o, corpus);
         if (Directory.Exists(storeDir) && Directory.EnumerateFileSystemEntries(storeDir).Any())
             throw new InvalidOperationException($"store directory {storeDir} is not empty");
-        string tokenizerId = "gguf-embedded:" + Path.GetFileNameWithoutExtension(o.ModelPath);
+        string tokenizerId = lab.TokenizerId;
         var encoder = new ChunkEncoder(lab.Fingerprint);
         var assembler = new ChunkAssembler(lab.Config);
-        var stored = new StoredContextAssembler(lab.Fingerprint, tokenizerId);
+        var stored = StoredContextAssembler.ForModel(lab.Config, lab.ModelId, lab.Quant, tokenizerId);
+        if (stored.ModelFingerprint != lab.Fingerprint) throw new InvalidOperationException("lab and assembler fingerprints differ");
         Console.WriteLine($"store {storeDir}; backend {StoredContextAssembler.Backend}, dtype F32, kv-output version {ChunkReuseSchema.KvOutputVersion}; "
             + $"threads {o.Threads}; tokenizer id {tokenizerId}");
 
         using var csv = new StreamWriter(o.OutCsv) { AutoFlush = true };
-        csv.WriteLine("corpus,chunker,plan,task_id,context_tokens,chunks,fresh_ms,cold_ms,cold_hits,cold_misses,cold_encoded_tokens,warm_ms,warm_hits,"
-            + "warm_misses,cache_cold_bit_exact,cache_warm_bit_exact,fresh_mask_nll,warm_mask_nll,fresh_mask_em,warm_mask_em,fresh_cont_nll,"
+        csv.WriteLine("corpus,chunker,plan,task_id,context_tokens,chunks,fresh_ms,cold_ms,cold_hits,cold_misses,cold_repeats,cold_encoded_tokens,warm_ms,warm_hits,"
+            + "warm_misses,warm_repeats,cache_cold_bit_exact,cache_warm_bit_exact,fresh_mask_nll,warm_mask_nll,fresh_mask_em,warm_mask_em,fresh_cont_nll,"
             + "warm_cont_nll,kl_cont_warm_vs_fresh,top1_cont_warm_vs_fresh,logits_bit_exact,max_abs_logit_diff");
 
         int contexts = 0, cacheMismatches = 0, logitMismatches = 0, tasksDone = 0;
@@ -48,9 +49,9 @@ internal static class StoreAssemblyCheck
             int L = plan.ContextTokenIds.Length;
             int capacity = L + plan.Tasks.Max(t => t.PrefixTokenIds.Length + t.ContinuationTokenIds.Length) + 1;
 
+            using SimpleKvCache freshCache = lab.NewCache(capacity); // allocated outside the timing, like cold and warm
             var sw = Stopwatch.StartNew();
             var fresh = plan.Chunks.Select(c => encoder.Encode(lab.Model, c.TokenIds)).ToList();
-            using SimpleKvCache freshCache = lab.NewCache(capacity);
             assembler.Assemble(freshCache, fresh, lab.Fingerprint);
             double freshMs = sw.Elapsed.TotalMilliseconds;
             fresh.Clear(); // free the entries before the next copies
@@ -93,8 +94,8 @@ internal static class StoreAssemblyCheck
                 tasksDone++;
                 csv.WriteLine(string.Join(',', o.CorpusName, o.Chunker, p.ToString(ci), "\"" + task.Id + "\"", L.ToString(ci),
                     plan.Chunks.Count.ToString(ci), freshMs.ToString("F0", ci), coldMs.ToString("F0", ci), cold.Stats.Hits.ToString(ci),
-                    cold.Stats.Misses.ToString(ci), cold.Stats.EncodedTokens.ToString(ci), warmMs.ToString("F0", ci), warm.Stats.Hits.ToString(ci),
-                    warm.Stats.Misses.ToString(ci), coldExact ? "1" : "0", warmExact ? "1" : "0", ef.MaskNll.ToString("G9", ci),
+                    cold.Stats.Misses.ToString(ci), cold.Stats.Repeats.ToString(ci), cold.Stats.EncodedTokens.ToString(ci), warmMs.ToString("F0", ci),
+                    warm.Stats.Hits.ToString(ci), warm.Stats.Misses.ToString(ci), warm.Stats.Repeats.ToString(ci), coldExact ? "1" : "0", warmExact ? "1" : "0", ef.MaskNll.ToString("G9", ci),
                     ew.MaskNll.ToString("G9", ci), ef.MaskEm ? "1" : "0", ew.MaskEm ? "1" : "0", ef.ContNll.ToString("G9", ci),
                     ew.ContNll.ToString("G9", ci), ew.KlCont.ToString("G6", ci), ew.Top1Cont.ToString("G6", ci), same ? "1" : "0",
                     maxDiff.ToString("G6", ci)));

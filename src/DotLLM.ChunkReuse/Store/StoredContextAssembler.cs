@@ -4,24 +4,31 @@ using DotLLM.Core.Models;
 
 namespace DotLLM.ChunkReuse.Store;
 
-/// <summary>Counts of one store-backed assembly.</summary>
-/// <param name="Hits">Chunk placements served without encoding: from the store, or from an entry encoded earlier in the same call
-/// (a chunk that repeats in the context is encoded at most once).</param>
-/// <param name="Misses">Chunk placements that had to be encoded (absent, damaged, foreign or stale in the store).</param>
+/// <summary>Counts of one store-backed assembly. <c>Hits + Misses + Repeats</c> is the number of chunks.</summary>
+/// <param name="Hits">Chunks served from the store (valid entry found under the chunk's key).</param>
+/// <param name="Misses">Chunks that had to be encoded (absent, damaged, foreign, stale or rejected in the store).</param>
 /// <param name="EncodedTokens">Tokens run through the model to encode the misses.</param>
-public readonly record struct AssemblyStats(int Hits, int Misses, long EncodedTokens);
+/// <param name="Repeats">Chunks whose key already occurred earlier in the same call; they reuse that entry (neither a store read
+/// nor an encode).</param>
+public readonly record struct AssemblyStats(int Hits, int Misses, long EncodedTokens, int Repeats);
 
 /// <summary>Result of <see cref="StoredContextAssembler.Assemble"/>.</summary>
-/// <param name="Context">The token-level context: the chunks in order, then the query.</param>
-/// <param name="Stats">Hit, miss and encoded-token counts.</param>
+/// <param name="Context">The token-level context: the chunks in order, then the query. Its <see cref="ChunkedContext.ChunkStarts"/>
+/// are relative to the context; in the destination cache chunk <c>c</c> starts at row <c>DestinationOffset + ChunkStarts[c]</c>.</param>
+/// <param name="Stats">Hit, miss, repeat and encoded-token counts.</param>
 /// <param name="Entries">The entry used for each chunk, in context order (what selective recompute needs).</param>
 public sealed record StoredAssembly(ChunkedContext Context, AssemblyStats Stats, IReadOnlyList<ChunkKvEntry> Entries)
 {
-    /// <summary>Entries the store returned that did not belong to their key (wrong fingerprint, tokens or shape); evicted and replaced.</summary>
+    /// <summary>Entries the store returned that did not belong to their key (wrong fingerprint, tokens or shape); evicted and replaced
+    /// when the store allowed it.</summary>
     public int Rejected { get; init; }
 
-    /// <summary>Misses whose <see cref="IChunkStore.Put"/> threw <see cref="ChunkStoreBusyException"/>; their entries were used but not stored.</summary>
+    /// <summary>Misses whose entry could not be written: <see cref="IChunkStore.Put"/> threw <see cref="ChunkStoreBusyException"/>,
+    /// or evicting a rejected entry failed with an I/O or access error. Their fresh entries were used but not stored.</summary>
     public int StoreFailures { get; init; }
+
+    /// <summary>The destination's length before the call (0 without a destination): the row the first chunk was written at.</summary>
+    public int DestinationOffset { get; init; }
 
     /// <summary>Deconstructs into the <c>(Context, Stats)</c> pair.</summary>
     /// <param name="context">The context.</param>
@@ -42,10 +49,24 @@ public sealed record StoredAssembly(ChunkedContext Context, AssemblyStats Stats,
 /// </summary>
 /// <remarks>
 /// <para>
+/// <b>Identity is the caller's responsibility.</b> The key and the hit check use the fingerprint given here, not one read from the
+/// model: with <see cref="StoredContextAssembler(string, string)"/> nothing ties the fingerprint to the <see cref="IModel"/> passed
+/// to <see cref="Assemble"/>, and a mismatched pair writes one model's K/V under another model's keys, which every later reader of
+/// those keys accepts (store poisoning). <see cref="ForModel"/> keeps the fingerprint inputs and refuses a model whose configuration
+/// (shape, RoPE, NoPE layers, KV layout) does not reproduce the fingerprint; it cannot see the weights, so the model id must itself
+/// be content-based (e.g. <see cref="GgufIdentity.ModelId"/>, a weights hash or a hub revision), never a file name.
+/// </para>
+/// <para>
+/// Entries are isolated encodes: each chunk alone at positions <c>0..n-1</c>. They are keyed with
+/// <see cref="ChunkPositioning.Isolated"/>, so K/V computed with preceding context (a recompute output) stored under a
+/// <see cref="ChunkPositioning.Contextual"/> key never answer here.
+/// </para>
+/// <para>
 /// Store failures are misses, not errors: a damaged, truncated, foreign-key or old-format file reads as a miss (the store's own
-/// checks), and a structurally valid entry that fails the checks above is evicted and replaced. A Put that hits
-/// <see cref="ChunkStoreBusyException"/> (another reader holds a damaged file open) uses the freshly encoded entry without storing
-/// it; a later call repairs the entry. Any other store exception propagates.
+/// checks), and a structurally valid entry that fails the checks above is evicted and replaced. When the store cannot write (Put
+/// throws <see cref="ChunkStoreBusyException"/>, or evicting a rejected entry throws <see cref="IOException"/> or
+/// <see cref="UnauthorizedAccessException"/>) the freshly encoded entry is used without storing it; a later call repairs the entry.
+/// Any other store exception propagates.
 /// </para>
 /// <para>
 /// Only the CPU encoder exists, so entries are keyed with backend <see cref="Backend"/> and dtype <see cref="KvDtype.F32"/>.
@@ -59,17 +80,44 @@ public sealed class StoredContextAssembler
     public const string Backend = "cpu";
 
     private readonly ChunkEncoder _encoder;
+    private readonly (string ModelId, string Quantization)? _identity;
 
-    /// <summary>Creates an assembler for one model identity.</summary>
-    /// <param name="modelFingerprint">The real model fingerprint (<see cref="ChunkFingerprint.Compute"/>) of the model passed to <see cref="Assemble"/>.</param>
-    /// <param name="tokenizerId">Tokenizer identity, part of the key.</param>
+    /// <summary>Creates an assembler for one model identity, given as a precomputed fingerprint (see the class remarks on identity).</summary>
+    /// <param name="modelFingerprint">The real model fingerprint (<see cref="ChunkFingerprint.Compute"/>) of every model passed to
+    /// <see cref="Assemble"/>; not checked against the model.</param>
+    /// <param name="tokenizerId">Tokenizer identity, part of the key (content-based, e.g. <see cref="GgufIdentity.TokenizerId"/>).</param>
     public StoredContextAssembler(string modelFingerprint, string tokenizerId)
+        : this(modelFingerprint, tokenizerId, null)
+    {
+    }
+
+    private StoredContextAssembler(string modelFingerprint, string tokenizerId, (string, string)? identity)
     {
         ArgumentException.ThrowIfNullOrEmpty(modelFingerprint);
         ArgumentNullException.ThrowIfNull(tokenizerId);
         ModelFingerprint = modelFingerprint;
         TokenizerId = tokenizerId;
+        _identity = identity;
         _encoder = new ChunkEncoder(modelFingerprint);
+    }
+
+    /// <summary>
+    /// Creates an assembler from the fingerprint inputs. <see cref="Assemble"/> then recomputes the fingerprint from each model's
+    /// configuration and refuses a model that does not reproduce it, before any store read or encode.
+    /// </summary>
+    /// <param name="config">The model configuration.</param>
+    /// <param name="modelId">Content-based model identity (<see cref="GgufIdentity.ModelId"/>, a weights hash or a hub revision).</param>
+    /// <param name="quantization">Weight quantization label.</param>
+    /// <param name="tokenizerId">Content-based tokenizer identity (<see cref="GgufIdentity.TokenizerId"/>).</param>
+    /// <returns>The assembler.</returns>
+    public static StoredContextAssembler ForModel(ModelConfig config, string modelId, string quantization, string tokenizerId)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentException.ThrowIfNullOrEmpty(modelId);
+        ArgumentNullException.ThrowIfNull(quantization);
+        ArgumentNullException.ThrowIfNull(tokenizerId);
+        return new StoredContextAssembler(ChunkFingerprint.Compute(config, modelId, quantization, tokenizerId), tokenizerId,
+            (modelId, quantization));
     }
 
     /// <summary>The model fingerprint every entry must carry.</summary>
@@ -81,7 +129,7 @@ public sealed class StoredContextAssembler
     /// <summary>The store key of a chunk with <paramref name="tokenIds"/> for a model with <paramref name="config"/>.</summary>
     /// <param name="config">Model configuration (RoPE parameters).</param>
     /// <param name="tokenIds">The chunk's token ids.</param>
-    /// <returns>The key.</returns>
+    /// <returns>The key (<see cref="ChunkPositioning.Isolated"/>).</returns>
     public ChunkKey KeyOf(ModelConfig config, ReadOnlySpan<int> tokenIds)
     {
         ArgumentNullException.ThrowIfNull(config);
@@ -90,15 +138,18 @@ public sealed class StoredContextAssembler
 
     /// <summary>
     /// Resolves every chunk from <paramref name="store"/> (encoding and storing misses) and, when <paramref name="destination"/> is
-    /// given, appends the chunks' K/V to it at running offsets (<see cref="ChunkAssembler.Assemble"/>).
+    /// given, appends the chunks' K/V to it at running offsets from its current length (<see cref="ChunkAssembler.Assemble"/>).
+    /// The chunks, the model identity and the destination (exact host F32, layer count, strides, capacity) are validated before
+    /// any store read or encode, and the destination is left unchanged whenever the call throws.
     /// </summary>
     /// <param name="chunks">Chunks in context order; none empty.</param>
     /// <param name="model">The model with fingerprint <see cref="ModelFingerprint"/>; encodes misses (CPU <c>TransformerModel</c>).</param>
     /// <param name="store">The chunk store.</param>
-    /// <param name="destination">Optional exact host-F32 cache to assemble into; left unchanged when no chunk fits.</param>
+    /// <param name="destination">Optional exact host-F32 cache to append to.</param>
     /// <param name="query">Tokens that follow the context, recorded in <see cref="StoredAssembly.Context"/>.</param>
     /// <returns>The context, the counts and the entry used for each chunk.</returns>
-    /// <exception cref="ArgumentException">There are no chunks, a chunk is null or empty, or the chunks do not fit the destination.</exception>
+    /// <exception cref="ArgumentException">There are no chunks, a chunk is null or empty, the model does not match a
+    /// <see cref="ForModel"/> identity, or the chunks do not fit the destination.</exception>
     /// <exception cref="NotSupportedException">The model's RoPE variant or the destination cache is not supported.</exception>
     public StoredAssembly Assemble(IReadOnlyList<Chunk> chunks, IModel model, IChunkStore store, IKvCache? destination = null,
         ReadOnlySpan<int> query = default)
@@ -114,12 +165,26 @@ public sealed class StoredContextAssembler
         var context = new ChunkedContext(tokenIds, query);
 
         ModelConfig config = model.Config;
+        if (_identity is { } id)
+        {
+            string actual = ChunkFingerprint.Compute(config, id.ModelId, id.Quantization, TokenizerId);
+            if (!string.Equals(actual, ModelFingerprint, StringComparison.Ordinal))
+                throw new ArgumentException(
+                    $"The model's configuration gives fingerprint {actual}, not this assembler's {ModelFingerprint} (another shape, RoPE or KV layout).",
+                    nameof(model));
+        }
         var assembler = new ChunkAssembler(config); // refuses unsupported RoPE before any encode
         var geometry = KvGeometry.FromConfig(config, compactSlidingWindows: false);
+        int offset = 0;
+        if (destination is not null)
+        {
+            ValidateDestination(destination, config, geometry, context.Length);
+            offset = destination.CurrentLength;
+        }
 
         var resolved = new Dictionary<ChunkKey, ChunkKvEntry>();
         var entries = new ChunkKvEntry[chunks.Count];
-        int hits = 0, misses = 0, rejected = 0, storeFailures = 0;
+        int hits = 0, misses = 0, repeats = 0, rejected = 0, storeFailures = 0;
         long encodedTokens = 0;
         for (int c = 0; c < chunks.Count; c++)
         {
@@ -128,10 +193,11 @@ public sealed class StoredContextAssembler
             if (resolved.TryGetValue(key, out ChunkKvEntry? known))
             {
                 entries[c] = known;
-                hits++;
+                repeats++;
                 continue;
             }
 
+            bool writable = true;
             if (store.TryGet(key, out ChunkKvEntry stored))
             {
                 if (Belongs(stored, ids, geometry))
@@ -142,31 +208,64 @@ public sealed class StoredContextAssembler
                 }
                 // Well formed but not this key's content: drop it so Put (which keeps a valid entry) can replace it.
                 rejected++;
-                store.Evict(key);
+                try
+                {
+                    store.Evict(key);
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    writable = false; // Put would keep the wrong entry; use the fresh one, a later call retries
+                }
             }
 
             ChunkKvEntry encoded = _encoder.Encode(model, ids);
             misses++;
             encodedTokens += ids.Length;
-            try
+            if (writable)
             {
-                store.Put(key, encoded);
+                try
+                {
+                    store.Put(key, encoded);
+                }
+                catch (ChunkStoreBusyException)
+                {
+                    writable = false; // a reader holds a damaged file; use the fresh entry, a later call stores it
+                }
             }
-            catch (ChunkStoreBusyException)
-            {
-                storeFailures++; // a reader holds a damaged file; use the fresh entry, a later call stores it
-            }
+            if (!writable) storeFailures++;
             resolved[key] = entries[c] = encoded;
         }
 
         if (destination is not null)
             assembler.Assemble(destination, entries, ModelFingerprint);
 
-        return new StoredAssembly(context, new AssemblyStats(hits, misses, encodedTokens), entries)
+        return new StoredAssembly(context, new AssemblyStats(hits, misses, encodedTokens, repeats), entries)
         {
             Rejected = rejected,
             StoreFailures = storeFailures,
+            DestinationOffset = offset,
         };
+    }
+
+    // The checks ChunkAssembler makes before writing, done before any encode so a bad destination costs nothing.
+    private static void ValidateDestination(IKvCache destination, ModelConfig config, KvGeometry geometry, int tokens)
+    {
+        if (!destination.SupportsExactF32PrefixCopy || destination is not IPerLayerKvCache perLayer)
+            throw new NotSupportedException(
+                $"Chunk assembly needs an exact host-F32 KV-cache; {destination.GetType().Name} stores KV lossily or off-host.");
+        if (perLayer.LayerCount != config.NumLayers || perLayer.LayerCount != geometry.LayerCount)
+            throw new NotSupportedException(
+                $"The destination holds {perLayer.LayerCount} KV layers for a {config.NumLayers}-layer model; not supported.");
+        for (int l = 0; l < geometry.LayerCount; l++)
+        {
+            if (perLayer.KvStrideOf(l) != geometry.KvStrideOf(l))
+                throw new ArgumentException(
+                    $"Destination layer {l} KV stride {perLayer.KvStrideOf(l)} differs from the model's {geometry.KvStrideOf(l)}.", nameof(destination));
+        }
+        if ((long)destination.CurrentLength + tokens > destination.MaxLength)
+            throw new ArgumentException(
+                $"The chunks need rows {destination.CurrentLength}..{destination.CurrentLength + tokens - 1} but the destination holds {destination.MaxLength}.",
+                nameof(destination));
     }
 
     // A hit must carry this model's fingerprint, exactly the chunk's tokens and one [n, stride(l)] K and V array per KV layer.

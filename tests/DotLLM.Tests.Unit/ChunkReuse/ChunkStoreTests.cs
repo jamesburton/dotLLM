@@ -41,6 +41,7 @@ public sealed class ChunkStoreTests : IDisposable
     [InlineData("backend")]
     [InlineData("dtype")]
     [InlineData("tokens")]
+    [InlineData("positioning")]
     public void Key_DiffersWhenModelTokenizerRopeOrEngineVersionChanges(string field)
     {
         ChunkKey baseKey = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
@@ -55,6 +56,7 @@ public sealed class ChunkStoreTests : IDisposable
             "backend" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, "vulkan", Dtype, Tokens),
             "dtype" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, KvDtype.F16, Tokens),
             "tokens" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, [3, 17, 5, 29, 11, 40, 9]),
+            "positioning" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens, positioning: ChunkPositioning.Contextual),
             _ => throw new ArgumentOutOfRangeException(nameof(field)),
         };
         Assert.NotEqual(baseKey, changed);
@@ -87,6 +89,8 @@ public sealed class ChunkStoreTests : IDisposable
         Assert.Equal(a, b);
         // The default schema version is the current constant.
         Assert.Equal(a, ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens, ChunkReuseSchema.KvOutputVersion));
+        // The default positioning is Isolated.
+        Assert.Equal(a, ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens, positioning: ChunkPositioning.Isolated));
         Assert.Equal(64, a.Hex.Length);
         Assert.Matches("^[0-9a-f]{64}$", a.Hex);
     }

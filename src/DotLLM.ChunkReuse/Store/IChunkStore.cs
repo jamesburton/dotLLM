@@ -1,6 +1,14 @@
 namespace DotLLM.ChunkReuse.Store;
 
-/// <summary>Content-addressed store of encoded chunks. A damaged, foreign or mismatched entry is a miss, never a wrong hit.</summary>
+/// <summary>
+/// Content-addressed store of encoded chunks. A damaged, foreign or mismatched entry is a miss, never a wrong hit.
+/// </summary>
+/// <remarks>
+/// The store does not check how an entry was computed. Callers must put only K/V that match the key: for the default
+/// <see cref="ChunkPositioning.Isolated"/> keys, an isolated <see cref="ChunkEncoder"/> encode at positions <c>0..n-1</c> by the
+/// model the key's fingerprint names. A recompute output (K/V conditioned on preceding chunks) put under an isolated key would be
+/// accepted by every later reader.
+/// </remarks>
 public interface IChunkStore
 {
     /// <summary>Loads the entry for <paramref name="key"/>.</summary>

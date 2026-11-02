@@ -65,7 +65,8 @@ public sealed class StoredAssemblyTests : IDisposable
     {
         using var tiny = TinyModel.Load(_scratch, seed: 1);
         string fp = tiny.Fingerprint;
-        // A and E have the same length and sit side by side, so placing an entry in the wrong slot passes every shape check.
+        // A and E have the same length and sit side by side, so placing an entry in the wrong slot passes every shape check
+        // (mutant M23 in the Task 3 report).
         IReadOnlyList<Chunk> chunks = [Ch("a.cs", TokA), Ch("e.cs", TokE), Ch("b.cs", TokB), Ch("c.cs", TokC), Ch("copy-of-a.cs", TokA)];
 
         // Oracle: fresh encodes, no store.
@@ -83,7 +84,8 @@ public sealed class StoredAssemblyTests : IDisposable
         // Warm: a new store instance on the same root, so every entry comes from disk.
         using SimpleKvCache warmCache = NewCache(tiny);
         StoredAssembly warm = assembler.Assemble(chunks, tiny.Model, new FileChunkStore(_root), warmCache, Query);
-        Assert.Equal(chunks.Count, warm.Stats.Hits);
+        Assert.Equal(new AssemblyStats(Hits: 4, Misses: 0, EncodedTokens: 0, Repeats: 1), warm.Stats); // the second A is a repeat
+        Assert.Equal(new AssemblyStats(Hits: 0, Misses: 4, EncodedTokens: TokA.Length + TokE.Length + TokB.Length + TokC.Length, Repeats: 1), cold.Stats);
 
         int length = chunks.Sum(c => c.TokenIds.Length);
         Assert.Equal(length, freshCache.CurrentLength);
@@ -125,7 +127,7 @@ public sealed class StoredAssemblyTests : IDisposable
         Assert.Empty(r.Context.QueryTokenIds);
         var (context, stats) = r;
         Assert.Same(r.Context, context);
-        Assert.Equal(new AssemblyStats(0, 3, TokA.Length + TokB.Length + TokC.Length), stats);
+        Assert.Equal(new AssemblyStats(0, 3, TokA.Length + TokB.Length + TokC.Length, 0), stats);
     }
 
     // ------------------------------------------------------------------------------------------------ hit / miss counts
@@ -138,23 +140,23 @@ public sealed class StoredAssemblyTests : IDisposable
         var assembler = new StoredContextAssembler(tiny.Fingerprint, Tokenizer);
         var store = new FileChunkStore(_root);
 
-        // Cold: A, B, C are encoded once each; the second A is served from the first (no second encode).
+        // Cold: A, B, C are encoded once each; the second A is a repeat served from the first (no second encode, not a store hit).
         StoredAssembly cold = assembler.Assemble(Context4, counting, store);
         long distinct = TokA.Length + TokB.Length + TokC.Length;
-        Assert.Equal(new AssemblyStats(Hits: 1, Misses: 3, EncodedTokens: distinct), cold.Stats);
+        Assert.Equal(new AssemblyStats(Hits: 0, Misses: 3, EncodedTokens: distinct, Repeats: 1), cold.Stats);
         Assert.Equal(distinct, counting.ForwardTokens);
         Assert.Equal(3, store.Keys().Count());
 
         // Warm: nothing is encoded.
         counting.ForwardTokens = 0;
         StoredAssembly warm = assembler.Assemble(Context4, counting, new FileChunkStore(_root));
-        Assert.Equal(new AssemblyStats(Hits: 4, Misses: 0, EncodedTokens: 0), warm.Stats);
+        Assert.Equal(new AssemblyStats(Hits: 3, Misses: 0, EncodedTokens: 0, Repeats: 1), warm.Stats);
         Assert.Equal(0, counting.ForwardTokens);
 
         // Partially warm: B evicted, D new -> two misses, two encodes, the rest hits.
         store.Evict(KeyOf(tiny, TokB));
         StoredAssembly partial = assembler.Assemble([Ch("a.cs", TokA), Ch("b.cs", TokB), Ch("d.cs", TokD), Ch("c.cs", TokC)], counting, store);
-        Assert.Equal(new AssemblyStats(Hits: 2, Misses: 2, EncodedTokens: TokB.Length + TokD.Length), partial.Stats);
+        Assert.Equal(new AssemblyStats(Hits: 2, Misses: 2, EncodedTokens: TokB.Length + TokD.Length, Repeats: 0), partial.Stats);
         Assert.Equal(TokB.Length + TokD.Length, counting.ForwardTokens);
         Assert.Equal(4, store.Keys().Count());
     }
@@ -184,7 +186,7 @@ public sealed class StoredAssemblyTests : IDisposable
         // Model B over the same store: same chunk text, different fingerprint -> all misses, never A's K/V.
         var asmB = new StoredContextAssembler(b.Fingerprint, Tokenizer);
         StoredAssembly rb = asmB.Assemble(Context3, b.Model, store);
-        Assert.Equal(new AssemblyStats(0, 3, TokA.Length + TokB.Length + TokC.Length), rb.Stats);
+        Assert.Equal(new AssemblyStats(0, 3, TokA.Length + TokB.Length + TokC.Length, 0), rb.Stats);
         var encB = new ChunkEncoder(b.Fingerprint);
         for (int i = 0; i < 3; i++) AssertBitExact(encB.Encode(b.Model, Context3[i].TokenIds), rb.Entries[i]);
         Assert.Equal(6, store.Keys().Count());
@@ -215,7 +217,7 @@ public sealed class StoredAssemblyTests : IDisposable
         store.Put(stale, encoded);
 
         StoredAssembly r = new StoredContextAssembler(tiny.Fingerprint, Tokenizer).Assemble([Ch("a.cs", TokA)], tiny.Model, store);
-        Assert.Equal(new AssemblyStats(0, 1, TokA.Length), r.Stats);
+        Assert.Equal(new AssemblyStats(0, 1, TokA.Length, 0), r.Stats);
         Assert.True(store.Contains(KeyOf(tiny, TokA)));
         Assert.True(store.Contains(stale)); // left alone; not this assembler's key
     }
@@ -247,7 +249,7 @@ public sealed class StoredAssemblyTests : IDisposable
         Assert.False(store.Contains(keyB));
 
         StoredAssembly r = assembler.Assemble(Context3, tiny.Model, store);
-        Assert.Equal(new AssemblyStats(Hits: 2, Misses: 1, EncodedTokens: TokB.Length), r.Stats);
+        Assert.Equal(new AssemblyStats(Hits: 2, Misses: 1, EncodedTokens: TokB.Length, Repeats: 0), r.Stats);
         ChunkKvEntry freshB = new ChunkEncoder(tiny.Fingerprint).Encode(tiny.Model, TokB);
         AssertBitExact(freshB, r.Entries[1]);
 
@@ -287,7 +289,7 @@ public sealed class StoredAssemblyTests : IDisposable
 
         using SimpleKvCache cache = NewCache(tiny);
         StoredAssembly r = new StoredContextAssembler(tiny.Fingerprint, Tokenizer).Assemble([Ch("b.cs", TokB)], tiny.Model, store, cache);
-        Assert.Equal(new AssemblyStats(0, 1, TokB.Length), r.Stats);
+        Assert.Equal(new AssemblyStats(0, 1, TokB.Length, 0), r.Stats);
         Assert.Equal(1, r.Rejected);
         AssertBitExact(good, r.Entries[0]);
         Assert.Equal([keyB], store.Evicted);
@@ -317,7 +319,7 @@ public sealed class StoredAssemblyTests : IDisposable
         {
             using SimpleKvCache cache = NewCache(tiny);
             StoredAssembly r = assembler.Assemble(Context3, tiny.Model, store, cache);
-            Assert.Equal(new AssemblyStats(2, 1, TokB.Length), r.Stats);
+            Assert.Equal(new AssemblyStats(2, 1, TokB.Length, 0), r.Stats);
             Assert.Equal(1, r.StoreFailures);
             AssertBitExact(freshB, r.Entries[1]);
             Assert.Equal(TokA.Length + TokB.Length + TokC.Length, cache.CurrentLength);
@@ -330,7 +332,7 @@ public sealed class StoredAssemblyTests : IDisposable
         }
 
         StoredAssembly repair = assembler.Assemble(Context3, tiny.Model, store);
-        Assert.Equal(new AssemblyStats(2, 1, TokB.Length), repair.Stats);
+        Assert.Equal(new AssemblyStats(2, 1, TokB.Length, 0), repair.Stats);
         Assert.Equal(0, repair.StoreFailures);
         Assert.Equal(3, assembler.Assemble(Context3, tiny.Model, store).Stats.Hits);
     }
@@ -345,7 +347,7 @@ public sealed class StoredAssemblyTests : IDisposable
 
         var busy = new DictionaryStore { PutFailure = () => new ChunkStoreBusyException("x", new IOException("held")) };
         StoredAssembly r = new StoredContextAssembler(tiny.Fingerprint, Tokenizer).Assemble(Context4, tiny.Model, busy);
-        Assert.Equal(new AssemblyStats(1, 3, TokA.Length + TokB.Length + TokC.Length), r.Stats); // the repeat of A is still not re-encoded
+        Assert.Equal(new AssemblyStats(0, 3, TokA.Length + TokB.Length + TokC.Length, 1), r.Stats); // the repeat of A is still not re-encoded
         Assert.Equal(3, r.StoreFailures);
     }
 
@@ -379,12 +381,13 @@ public sealed class StoredAssemblyTests : IDisposable
 
                 foreach (StoredAssembly r in results)
                 {
-                    Assert.Equal(4, r.Stats.Hits + r.Stats.Misses);
+                    Assert.Equal(4, r.Stats.Hits + r.Stats.Misses + r.Stats.Repeats);
+                    Assert.Equal(1, r.Stats.Repeats);
                     for (int i = 0; i < 4; i++) AssertBitExact(fresh[i], r.Entries[i]);
                 }
                 if (round == 0) Assert.True(results.Sum(r => r.Stats.Misses) >= 3); // every chunk encoded at least once
                 if (round == 1) Assert.True(results.Sum(r => r.Stats.Misses) >= 1); // the corrupt C was re-encoded at least once
-                if (round == 2) Assert.All(results, r => Assert.Equal(4, r.Stats.Hits));
+                if (round == 2) Assert.All(results, r => Assert.Equal(3, r.Stats.Hits));
 
                 var check = new FileChunkStore(_root);
                 Assert.Equal(3, check.Keys().Count());
@@ -410,6 +413,141 @@ public sealed class StoredAssemblyTests : IDisposable
     }
 
     // ------------------------------------------------------------------------------------------------ argument checks
+
+    [Theory]
+    [InlineData("capacity", typeof(ArgumentException))]
+    [InlineData("prefilled-capacity", typeof(ArgumentException))]
+    [InlineData("not-exact", typeof(NotSupportedException))]
+    [InlineData("layers", typeof(NotSupportedException))]
+    [InlineData("stride", typeof(ArgumentException))]
+    public void Assemble_UnusableDestination_ThrowsBeforeAnyStoreReadOrEncode(string problem, Type expected)
+    {
+        // A destination that cannot take the chunks is refused up front: no store read, no encode (about 30 s per 2K context on
+        // Qwen3-4B), nothing stored, and the destination is unchanged.
+        using var tiny = TinyModel.Load(_scratch, seed: 1);
+        var counting = new CountingModel(tiny.Model);
+        var store = new DictionaryStore();
+        var geometry = KvGeometry.FromConfig(tiny.Config, compactSlidingWindows: false);
+        int total = TokA.Length + TokB.Length + TokC.Length; // 15
+        using var inner = new SimpleKvCache(geometry, problem == "capacity" ? total - 1 : SyntheticDenseGguf.Context);
+        if (problem == "prefilled-capacity")
+        {
+            // 50 rows already used: 50 + 15 > 64.
+            var filler = Enumerable.Range(0, 5).Select(_ => new ChunkEncoder(tiny.Fingerprint).Encode(tiny.Model, Enumerable.Range(0, 10).ToArray())).ToList();
+            new ChunkAssembler(tiny.Config).Assemble(inner, filler, tiny.Fingerprint);
+        }
+        int before = inner.CurrentLength;
+        IKvCache destination = problem switch
+        {
+            "not-exact" => new WrappedCache(inner, exact: false),
+            "layers" => new WrappedCache(inner, extraLayers: 1),
+            "stride" => new WrappedCache(inner, strideDelta: tiny.Config.HeadDim),
+            _ => inner,
+        };
+
+        Exception ex = Assert.ThrowsAny<Exception>(() =>
+            new StoredContextAssembler(tiny.Fingerprint, Tokenizer).Assemble(Context3, counting, store, destination));
+        Assert.IsType(expected, ex);
+        Assert.Equal(0, counting.ForwardTokens);
+        Assert.Equal(0, store.Gets);
+        Assert.Empty(store.Keys());
+        Assert.Equal(before, inner.CurrentLength);
+    }
+
+    [Fact]
+    public void Assemble_NonEmptyDestination_AppendsAtItsLength_AndReportsTheOffset()
+    {
+        // Context.ChunkStarts are relative to the context; the destination rows are DestinationOffset + ChunkStarts[c]. The K/V
+        // equal ChunkAssembler placing [D, A, B] in one call (keys re-rotated to their absolute positions).
+        using var tiny = TinyModel.Load(_scratch, seed: 1);
+        var encoder = new ChunkEncoder(tiny.Fingerprint);
+        ChunkKvEntry d = encoder.Encode(tiny.Model, TokD), a = encoder.Encode(tiny.Model, TokA), b = encoder.Encode(tiny.Model, TokB);
+        using SimpleKvCache expected = NewCache(tiny);
+        new ChunkAssembler(tiny.Config).Assemble(expected, [d, a, b], tiny.Fingerprint);
+
+        using SimpleKvCache actual = NewCache(tiny);
+        new ChunkAssembler(tiny.Config).Assemble(actual, [d], tiny.Fingerprint);
+        StoredAssembly r = new StoredContextAssembler(tiny.Fingerprint, Tokenizer)
+            .Assemble([Ch("a.cs", TokA), Ch("b.cs", TokB)], tiny.Model, new FileChunkStore(_root), actual);
+        Assert.Equal(TokD.Length, r.DestinationOffset);
+        Assert.Equal(new[] { 0, TokA.Length }, r.Context.ChunkStarts);
+        int length = TokD.Length + TokA.Length + TokB.Length;
+        Assert.Equal(length, actual.CurrentLength);
+        AssertCachesBitExact(tiny, expected, actual, length);
+
+        // Without a destination the offset is 0.
+        Assert.Equal(0, new StoredContextAssembler(tiny.Fingerprint, Tokenizer).Assemble([Ch("a.cs", TokA)], tiny.Model, new FileChunkStore(_root)).DestinationOffset);
+    }
+
+    [Fact]
+    public void Assemble_EvictFailsOnRejectedEntry_IsMissNotError()
+    {
+        // A wrong entry that cannot be evicted: the assembler still uses a fresh encode, counts a store failure and does not throw.
+        using var tiny = TinyModel.Load(_scratch, seed: 1);
+        var encoder = new ChunkEncoder(tiny.Fingerprint);
+        ChunkKvEntry good = encoder.Encode(tiny.Model, TokB);
+        ChunkKey keyB = KeyOf(tiny, TokB);
+        foreach (Func<Exception> failure in new Func<Exception>[] { () => new IOException("in use"), () => new UnauthorizedAccessException("denied") })
+        {
+            var store = new DictionaryStore { EvictFailure = failure };
+            store.Put(keyB, encoder.Encode(tiny.Model, [8, 22, 1, 36]));
+            using SimpleKvCache cache = NewCache(tiny);
+            StoredAssembly r = new StoredContextAssembler(tiny.Fingerprint, Tokenizer).Assemble([Ch("b.cs", TokB)], tiny.Model, store, cache);
+            Assert.Equal(new AssemblyStats(0, 1, TokB.Length, 0), r.Stats);
+            Assert.Equal(1, r.Rejected);
+            Assert.Equal(1, r.StoreFailures);
+            AssertBitExact(good, r.Entries[0]);
+            Assert.Equal(TokB.Length, cache.CurrentLength);
+        }
+
+        // Other exception types from Evict are not store failures and propagate.
+        var odd = new DictionaryStore { EvictFailure = () => new InvalidOperationException("bug") };
+        odd.Put(keyB, encoder.Encode(tiny.Model, [8, 22, 1, 36]));
+        Assert.Throws<InvalidOperationException>(() =>
+            new StoredContextAssembler(tiny.Fingerprint, Tokenizer).Assemble([Ch("b.cs", TokB)], tiny.Model, odd));
+    }
+
+    [Fact]
+    public void ForModel_RefusesAModelWhoseConfigDoesNotMatchTheIdentity()
+    {
+        // ForModel derives the fingerprint from (config, model id, quantization, tokenizer) and checks every model passed to
+        // Assemble against it, so a model of another shape or RoPE cannot write its K/V under this identity's keys.
+        using var qwen = TinyModel.Load(_scratch, seed: 1);
+        using var llama = TinyModel.Load(_scratch, seed: 1, arch: "llama");
+        var assembler = StoredContextAssembler.ForModel(qwen.Config, TinyModel.ModelIdOf(1), "F32", Tokenizer);
+        Assert.Equal(qwen.Fingerprint, assembler.ModelFingerprint);
+
+        var store = new DictionaryStore();
+        var counting = new CountingModel(llama.Model);
+        var ex = Assert.Throws<ArgumentException>(() => assembler.Assemble(Context3, counting, store));
+        Assert.Contains("fingerprint", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, store.Gets);
+        Assert.Equal(0, counting.ForwardTokens);
+        Assert.Empty(store.Keys());
+
+        // The matching model works and writes the same keys as the fingerprint constructor.
+        StoredAssembly ok = assembler.Assemble(Context3, qwen.Model, store);
+        Assert.Equal(3, ok.Stats.Misses);
+        Assert.True(store.Contains(KeyOf(qwen, TokA)));
+    }
+
+    [Fact]
+    public void Assemble_EntryUnderContextualPositioningKey_IsNotAHit()
+    {
+        // Store entries must be isolated encodes (positions 0..n-1, no preceding context). The positioning is part of the key, so
+        // K/V stored as Contextual (e.g. a recompute output) never answers an isolated lookup, even with identical tokens.
+        using var tiny = TinyModel.Load(_scratch, seed: 1);
+        var store = new DictionaryStore();
+        ChunkKvEntry entry = new ChunkEncoder(tiny.Fingerprint).Encode(tiny.Model, TokA);
+        ChunkKey contextual = ChunkKey.Create(tiny.Fingerprint, Tokenizer, RopeParameters.FromConfig(tiny.Config), "cpu", KvDtype.F32, TokA,
+            positioning: ChunkPositioning.Contextual);
+        Assert.NotEqual(KeyOf(tiny, TokA), contextual);
+        store.Put(contextual, entry);
+
+        StoredAssembly r = new StoredContextAssembler(tiny.Fingerprint, Tokenizer).Assemble([Ch("a.cs", TokA)], tiny.Model, store);
+        Assert.Equal(new AssemblyStats(0, 1, TokA.Length, 0), r.Stats);
+        Assert.True(store.Contains(KeyOf(tiny, TokA)));
+    }
 
     [Fact]
     public void Assemble_InvalidChunks_ThrowBeforeTouchingTheStore()
@@ -505,8 +643,11 @@ public sealed class StoredAssemblyTests : IDisposable
 
         public IEnumerable<ChunkKey> Keys() => _entries.Keys.ToList();
 
+        public Func<Exception>? EvictFailure { get; init; }
+
         public void Evict(ChunkKey key)
         {
+            if (EvictFailure is not null) throw EvictFailure();
             Evicted.Add(key);
             _entries.Remove(key);
         }
@@ -542,6 +683,27 @@ public sealed class StoredAssemblyTests : IDisposable
         public void Dispose() { }
     }
 
+    /// <summary>
+    /// Wraps a <see cref="SimpleKvCache"/> and can misreport exactness, layer count or a layer's stride, to check that the
+    /// assembler validates the destination before any store read or encode.
+    /// </summary>
+    private sealed class WrappedCache(SimpleKvCache inner, bool exact = true, int extraLayers = 0, int strideDelta = 0) : IKvCache, IPerLayerKvCache
+    {
+        public int CurrentLength => inner.CurrentLength;
+        public int MaxLength => inner.MaxLength;
+        public bool SupportsExactF32PrefixCopy => exact && inner.SupportsExactF32PrefixCopy;
+        public int LayerCount => inner.NumLayers + extraLayers;
+        public int KvStrideOf(int layerIndex) => inner.KvStrideOf(layerIndex) + (layerIndex == 0 ? strideDelta : 0);
+        public void Update(ITensor keys, ITensor values, ReadOnlySpan<int> positions, int layerIndex) => inner.Update(keys, values, positions, layerIndex);
+        public ITensor GetKeys(int layerIndex) => inner.GetKeys(layerIndex);
+        public ITensor GetValues(int layerIndex) => inner.GetValues(layerIndex);
+        public void Update(TensorRef keys, TensorRef values, ReadOnlySpan<int> positions, int layerIndex) => inner.Update(keys, values, positions, layerIndex);
+        public TensorRef GetKeysRef(int layerIndex) => inner.GetKeysRef(layerIndex);
+        public TensorRef GetValuesRef(int layerIndex) => inner.GetValuesRef(layerIndex);
+        public void Rollback(int length) => inner.Rollback(length);
+        public void Dispose() { }
+    }
+
     /// <summary>A loaded synthetic model and its fingerprint; keeps the mapped GGUF alive for the model's lifetime.</summary>
     private sealed class TinyModel : IDisposable
     {
@@ -561,15 +723,17 @@ public sealed class StoredAssemblyTests : IDisposable
 
         public string Fingerprint { get; }
 
-        public static TinyModel Load(string scratch, int seed)
+        public static TinyModel Load(string scratch, int seed, string arch = "qwen3")
         {
-            string path = Path.Combine(scratch, $"qwen3-{seed}-{Guid.NewGuid():N}.gguf");
-            File.WriteAllBytes(path, SyntheticDenseGguf.Build("qwen3", seed));
+            string path = Path.Combine(scratch, $"{arch}-{seed}-{Guid.NewGuid():N}.gguf");
+            File.WriteAllBytes(path, SyntheticDenseGguf.Build(arch, seed));
             var gguf = GgufFile.Open(path);
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-            string fp = ChunkFingerprint.Compute(config, $"tiny-qwen3-seed{seed}", "F32", Tokenizer);
+            string fp = ChunkFingerprint.Compute(config, ModelIdOf(seed, arch), "F32", Tokenizer);
             return new TinyModel(gguf, config, TransformerModel.LoadFromGguf(gguf, config, ThreadingConfig.SingleThreaded), fp);
         }
+
+        public static string ModelIdOf(int seed, string arch = "qwen3") => $"tiny-{arch}-seed{seed}";
 
         public void Dispose()
         {
