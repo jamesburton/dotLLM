@@ -258,6 +258,52 @@ public sealed class PrefixLineageTests
         var preferExact = Probe(mgr, tokens, allowApprox: true);
         Assert.Equal(16, preferExact.Cached);
         Assert.Equal(0, preferExact.Approx);
+
+        // Both siblings stay reachable: draining the trie frees every block (no orphaned approximate node).
+        mgr.TryEvict(TotalBlocks);
+        var stats = mgr.GetStats();
+        Assert.Equal(0, stats.NodeCount);
+        Assert.Equal(stats.TotalBlocks, stats.FreeBlocks);
+    }
+
+    [Fact]
+    public unsafe void CachedTokens_CountExactRowsOnly_Trie_LineagePropagatesWhenExactSiblingAppearsMidFlight()
+    {
+        // A request restores approximate blocks 2-3; while it runs, an exact request recomputes blocks 2-3 and
+        // links exact siblings. When the first request completes, the insert walk follows the exact path, so its
+        // new blocks (computed against the approximate rows) must carry the lineage from its own admission.
+        using var factory = NewFactory();
+        using var mgr = new PrefixTrieManager(factory);
+        var tokens = Seq(1, 16);
+        RunSequence(mgr, tokens, firstApproxRow: 8);
+
+        var extended = Extend(tokens, 8, 5);
+        var admission = mgr.Admit(extended, MaxSeqLen, allowApprox: true);
+        Assert.Equal(16, admission.RestoredTokens);
+        Assert.Equal(8, admission.ApproxRowsReused);
+
+        RunSequence(mgr, tokens);                       // exact siblings for blocks 2-3 appear now
+
+        int writeCount = extended.Length - admission.RestoredTokens;
+        int kvStride = NumKvHeads * HeadDim;
+        var positions = new int[writeCount];
+        for (int i = 0; i < writeCount; i++) positions[i] = admission.RestoredTokens + i;
+        float[] k = new float[writeCount * kvStride];
+        float[] v = new float[writeCount * kvStride];
+        fixed (float* kp = k)
+        fixed (float* vp = v)
+        {
+            var kRef = new DotLLM.Core.Tensors.TensorRef(writeCount, kvStride, DotLLM.Core.Tensors.DType.Float32, -1, (nint)kp);
+            var vRef = new DotLLM.Core.Tensors.TensorRef(writeCount, kvStride, DotLLM.Core.Tensors.DType.Float32, -1, (nint)vp);
+            for (int layer = 0; layer < NumLayers; layer++)
+                admission.Cache.Update(kRef, vRef, positions, layer);
+        }
+        mgr.RecordCompletion(admission.Cache, extended);
+        admission.Cache.Dispose();
+
+        var exact = Probe(mgr, extended, allowApprox: false);
+        Assert.Equal(16, exact.Cached);                // blocks 0-3 exact; blocks 4-5 are approximate
+        Assert.Equal(16, exact.Restored);
     }
 
     [Fact]
