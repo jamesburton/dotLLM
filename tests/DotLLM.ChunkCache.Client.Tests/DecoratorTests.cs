@@ -334,13 +334,39 @@ public sealed class DecoratorTests
         Assert.Equal("abc", updates.ToChatResponse().Text);
     }
 
+    /// <summary>
+    /// With a capability source that says "not capable", the decorator opens no scope at all (the inner client never sees
+    /// one, no event), independently of the body handler's own gate.
+    /// </summary>
+    [Fact]
+    public async Task NotCapableSource_NoScopeOpened()
+    {
+        string text = new('n', 80);
+        var registry = new ChunkSpanRegistry();
+        registry.Register(text, [new ChunkSpan("n", ChunkHash.Of(text))]);
+        var inner = new SteppingClient();
+        using var client = new ChunkAnnotatingChatClient(inner, registry, ExactPolicy.Instance, new ChunkAnnotatingOptions { Capabilities = new FixedChunkCapabilities(null) });
+        int events = 0;
+        client.CallCompleted += (_, _) => events++;
+
+        await foreach (ChatResponseUpdate _ in client.GetStreamingResponseAsync([new ChatMessage(ChatRole.Tool, [new FunctionResultContent("c", text)])])) { }
+        await client.GetResponseAsync([new ChatMessage(ChatRole.Tool, [new FunctionResultContent("c", text)])]);
+
+        Assert.Equal(4, inner.ScopesSeen.Count);
+        Assert.All(inner.ScopesSeen, Assert.Null);
+        Assert.Equal(0, events);
+    }
+
     /// <summary>An inner streaming client that records the scope on each step and sets the report after its last update.</summary>
     private sealed class SteppingClient : IChatClient
     {
         public List<ChunkManifestScope?> ScopesSeen { get; } = [];
 
-        public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default) =>
-            throw new NotSupportedException();
+        public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            ScopesSeen.Add(ChunkManifestScope.Current);
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "ok")));
+        }
 
         public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
