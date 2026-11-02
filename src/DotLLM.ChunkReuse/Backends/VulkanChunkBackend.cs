@@ -48,6 +48,7 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
 {
     private readonly ModelConfig _config;
     private readonly RopeShiftKvKernel _shift;
+    private readonly VulkanDevice.SubmitContext _submit;
     private readonly RopeParameters _rope;
     private readonly RopeF32Kernel.Variant _variant;
     private bool _disposed;
@@ -68,6 +69,7 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
         _rope = rope;
         _variant = ToVariant(rope.Type);
         _shift = RopeShiftKvKernel.Create(device, spvDir);
+        _submit = device.CreateSubmitContext();
     }
 
     /// <summary>The device caches are allocated on.</summary>
@@ -75,6 +77,9 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
 
     /// <inheritdoc/>
     public string Tag => ChunkBackendTags.Vulkan;
+
+    /// <inheritdoc/>
+    public int ForwardDeviceId => 0;
 
     /// <summary>The model's checked plain-RoPE parameters; <see cref="ShiftKeys"/> rotates with exactly these.</summary>
     public RopeParameters Rope => _rope;
@@ -143,6 +148,14 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
         => Checked(cache).ReadRows(layer, startPos, count, k, v);
 
     /// <inheritdoc/>
+    public void CopyRows(IKvCache source, int layer, int srcStart, IKvCache destination, int dstStart, int count)
+        => Checked(destination).CopyRowsFrom(Checked(source), layer, srcStart, dstStart, count);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// All RoPE layers are recorded into one command buffer and submitted once (each layer's K is its own buffer, so the dispatches do
+    /// not touch each other's memory; earlier row writes completed on their own fence). One submit per layer cost ~330 ms for 36 layers.
+    /// </remarks>
     public void ShiftKeys(IKvCache cache, int startPos, int count, int delta, RopeParameters rope)
     {
         VulkanKvCache c = Checked(cache);
@@ -150,13 +163,18 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
         // One source of truth: the parameters checked at construction. A caller passing anything else is a bug, not a request.
         if (rope != _rope)
             throw new ArgumentException($"RoPE parameters {rope} differ from the model's checked {_rope}.", nameof(rope));
+        if (delta == 0) return;
         int headDim = _config.HeadDim;
+        // Record every layer, then submit once. A refused argument throws before the submit, so nothing is applied (no layer is left
+        // shifted while another is not); the next Begin resets the abandoned recording.
+        _submit.Begin();
         for (int l = 0; l < c.LayerCount; l++)
         {
             if (_config.IsNoRopeLayer(l)) continue;
             int stride = c.KvStrideOf(l);
-            _shift.Shift(c, l, startPos, count, delta, stride / headDim, headDim, _rope.RopeDim, _rope.Theta, _variant);
+            _shift.Record(_submit.CommandBuffer, c, l, startPos, count, delta, stride / headDim, headDim, _rope.RopeDim, _rope.Theta, _variant);
         }
+        _submit.SubmitAndWait();
     }
 
     /// <inheritdoc/>
@@ -164,6 +182,7 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _submit.Dispose();
         _shift.Dispose();
     }
 

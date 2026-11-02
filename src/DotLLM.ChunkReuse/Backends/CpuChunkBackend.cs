@@ -26,6 +26,9 @@ public sealed class CpuChunkBackend : IChunkBackend
     public string Tag => ChunkBackendTags.Cpu;
 
     /// <inheritdoc/>
+    public int ForwardDeviceId => -1;
+
+    /// <inheritdoc/>
     public IKvCache CreateCache(int maxSeqLen)
         => new SimpleKvCache(KvGeometry.FromConfig(_config, compactSlidingWindows: false), maxSeqLen);
 
@@ -65,6 +68,17 @@ public sealed class CpuChunkBackend : IChunkBackend
         int elems = count * stride;
         c.KeysSpan(layer).Slice(startPos * stride, elems).CopyTo(k);
         c.ValuesSpan(layer).Slice(startPos * stride, elems).CopyTo(v);
+    }
+
+    /// <inheritdoc/>
+    public void CopyRows(IKvCache source, int layer, int srcStart, IKvCache destination, int dstStart, int count)
+    {
+        SimpleKvCache src = Checked(source);
+        int elems = count * src.KvStrideOf(layer);
+        var k = new float[elems];
+        var v = new float[elems];
+        ReadRows(src, layer, srcStart, count, k, v);
+        WriteRows(destination, layer, dstStart, k, v);
     }
 
     /// <inheritdoc/>

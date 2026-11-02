@@ -282,6 +282,8 @@ public sealed class BackendSeamTests : IDisposable
     {
         public int Calls { get; private set; }
         public string Tag => "positioned-test";
+        public int ForwardDeviceId => -1;
+        public void CopyRows(IKvCache source, int layer, int srcStart, IKvCache destination, int dstStart, int count) => Calls++;
         public IKvCache CreateCache(int maxSeqLen) => throw new NotSupportedException();
         public void RequireCache(IKvCache cache)
         {

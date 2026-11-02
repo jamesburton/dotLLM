@@ -55,51 +55,28 @@ public sealed class ChunkAssembler
     /// <exception cref="ArgumentException">A chunk has the wrong fingerprint or backend, is empty, has the wrong shape, or the chunks do not fit.</exception>
     public void Assemble(IKvCache destination, IReadOnlyList<ChunkKvEntry> chunks, string expectedFingerprint)
     {
-        ArgumentNullException.ThrowIfNull(destination);
         ArgumentNullException.ThrowIfNull(chunks);
-        ArgumentNullException.ThrowIfNull(expectedFingerprint);
-        _backend.RequireCache(destination);
-        if (destination is not IPerLayerKvCache perLayer)
-            throw new NotSupportedException($"Chunk assembly needs per-layer KV strides; {destination.GetType().Name} has none.");
-
-        int layers = perLayer.LayerCount;
-        if (layers != _config.NumLayers)
-            throw new NotSupportedException(
-                $"The destination holds {layers} KV layers for a {_config.NumLayers}-layer model (shared-KV layer map); not supported.");
-        int headDim = _config.HeadDim;
-        int start = destination.CurrentLength;
-        long total = start;
-        for (int c = 0; c < chunks.Count; c++)
+        (IPerLayerKvCache perLayer, int start) = Validate(destination, chunks.Count, expectedFingerprint, c =>
         {
             ChunkKvEntry chunk = chunks[c] ?? throw new ArgumentException($"Chunk {c} is null.", nameof(chunks));
-            if (!string.Equals(chunk.ModelFingerprint, expectedFingerprint, StringComparison.Ordinal))
-                throw new ArgumentException(
-                    $"Chunk {c} has model fingerprint '{chunk.ModelFingerprint}', expected '{expectedFingerprint}'.", nameof(chunks));
-            if (!string.Equals(chunk.Backend, _backend.Tag, StringComparison.Ordinal))
-                throw new ArgumentException(
-                    $"Chunk {c} was encoded by backend '{chunk.Backend}', but this assembler places through backend '{_backend.Tag}'; "
-                    + "convert it explicitly or treat it as a miss.", nameof(chunks));
-            int n = chunk.TokenIds?.Length ?? 0;
-            if (n == 0)
-                throw new ArgumentException($"Chunk {c} is empty.", nameof(chunks));
+            return (chunk.ModelFingerprint, chunk.Backend, chunk.TokenIds?.Length ?? 0);
+        });
+        int layers = perLayer.LayerCount;
+        for (int c = 0; c < chunks.Count; c++)
+        {
+            ChunkKvEntry chunk = chunks[c];
+            int n = chunk.TokenIds.Length;
             if (chunk.KeysPerLayer is null || chunk.ValuesPerLayer is null
                 || chunk.KeysPerLayer.Length != layers || chunk.ValuesPerLayer.Length != layers)
                 throw new ArgumentException($"Chunk {c} does not carry K/V for the destination's {layers} layers.", nameof(chunks));
             for (int l = 0; l < layers; l++)
             {
-                int stride = perLayer.KvStrideOf(l);
-                if (stride % headDim != 0)
-                    throw new ArgumentException($"Layer {l} KV stride {stride} is not a multiple of head dim {headDim}.", nameof(destination));
-                long expected = (long)n * stride;
+                long expected = (long)n * perLayer.KvStrideOf(l);
                 if (chunk.KeysPerLayer[l]?.Length != expected || chunk.ValuesPerLayer[l]?.Length != expected)
                     throw new ArgumentException(
-                        $"Chunk {c} layer {l}: expected {expected} K and V floats ({n} tokens x stride {stride}).", nameof(chunks));
+                        $"Chunk {c} layer {l}: expected {expected} K and V floats ({n} tokens x stride {perLayer.KvStrideOf(l)}).", nameof(chunks));
             }
-            total += n;
         }
-        if (total > destination.MaxLength)
-            throw new ArgumentException(
-                $"Chunks need positions up to {total - 1} but the destination holds {destination.MaxLength}.", nameof(chunks));
 
         int offset = start;
         foreach (ChunkKvEntry chunk in chunks)
@@ -112,5 +89,93 @@ public sealed class ChunkAssembler
                 _backend.ShiftKeys(destination, offset, n, offset, _rope);
             offset += n;
         }
+    }
+
+    /// <summary>
+    /// As <see cref="Assemble(IKvCache, IReadOnlyList{ChunkKvEntry}, string)"/>, for chunks still held in their encode caches: the rows
+    /// are copied cache to cache (<see cref="IChunkBackend.CopyRows"/>; on Vulkan device to device), then the keys are re-rotated by the
+    /// offset. Everything (fingerprint, backend tag, capacity, the source caches) is validated before anything is written.
+    /// </summary>
+    /// <param name="destination">A cache the backend accepts.</param>
+    /// <param name="chunks">Resident chunks to place, in order; they are not modified.</param>
+    /// <param name="expectedFingerprint">Fingerprint every chunk must carry (ordinal comparison).</param>
+    /// <exception cref="NotSupportedException">The backend cannot write the destination or read a source exactly, or the layer map differs.</exception>
+    /// <exception cref="ArgumentException">A chunk has the wrong fingerprint or backend, the wrong shape, or the chunks do not fit.</exception>
+    public void Assemble(IKvCache destination, IReadOnlyList<ResidentChunkKvEntry> chunks, string expectedFingerprint)
+    {
+        ArgumentNullException.ThrowIfNull(chunks);
+        (IPerLayerKvCache perLayer, int start) = Validate(destination, chunks.Count, expectedFingerprint, c =>
+        {
+            ResidentChunkKvEntry chunk = chunks[c] ?? throw new ArgumentException($"Chunk {c} is null.", nameof(chunks));
+            return (chunk.ModelFingerprint, chunk.Backend, chunk.Length);
+        });
+        int layers = perLayer.LayerCount;
+        for (int c = 0; c < chunks.Count; c++)
+        {
+            ResidentChunkKvEntry chunk = chunks[c];
+            _backend.RequireCache(chunk.Cache);
+            if (chunk.Cache is not IPerLayerKvCache src || src.LayerCount != layers)
+                throw new ArgumentException($"Chunk {c}'s cache does not hold the destination's {layers} layers.", nameof(chunks));
+            for (int l = 0; l < layers; l++)
+            {
+                if (src.KvStrideOf(l) != perLayer.KvStrideOf(l))
+                    throw new ArgumentException(
+                        $"Chunk {c} layer {l}: stride {src.KvStrideOf(l)}, destination {perLayer.KvStrideOf(l)}.", nameof(chunks));
+            }
+            if (chunk.Cache.CurrentLength < chunk.Length)
+                throw new ArgumentException($"Chunk {c}'s cache holds {chunk.Cache.CurrentLength} rows for {chunk.Length} tokens.", nameof(chunks));
+        }
+
+        int offset = start;
+        foreach (ResidentChunkKvEntry chunk in chunks)
+        {
+            int n = chunk.Length;
+            for (int l = 0; l < layers; l++)
+                _backend.CopyRows(chunk.Cache, l, 0, destination, offset, n);
+            if (offset != 0)
+                _backend.ShiftKeys(destination, offset, n, offset, _rope);
+            offset += n;
+        }
+    }
+
+    // Checks shared by both forms: the backend vets the destination; the layer map and strides; per chunk the fingerprint, the backend tag
+    // (a mismatch is a miss, never a silent cross-backend placement) and non-emptiness; the total capacity.
+    private (IPerLayerKvCache PerLayer, int Start) Validate(IKvCache destination, int count, string expectedFingerprint,
+        Func<int, (string Fingerprint, string Backend, int Tokens)> describe)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        ArgumentNullException.ThrowIfNull(expectedFingerprint);
+        _backend.RequireCache(destination);
+        if (destination is not IPerLayerKvCache perLayer)
+            throw new NotSupportedException($"Chunk assembly needs per-layer KV strides; {destination.GetType().Name} has none.");
+
+        int layers = perLayer.LayerCount;
+        if (layers != _config.NumLayers)
+            throw new NotSupportedException(
+                $"The destination holds {layers} KV layers for a {_config.NumLayers}-layer model (shared-KV layer map); not supported.");
+        int headDim = _config.HeadDim;
+        for (int l = 0; l < layers; l++)
+        {
+            if (perLayer.KvStrideOf(l) % headDim != 0)
+                throw new ArgumentException($"Layer {l} KV stride {perLayer.KvStrideOf(l)} is not a multiple of head dim {headDim}.", nameof(destination));
+        }
+        int start = destination.CurrentLength;
+        long total = start;
+        for (int c = 0; c < count; c++)
+        {
+            (string fingerprint, string backend, int n) = describe(c);
+            if (!string.Equals(fingerprint, expectedFingerprint, StringComparison.Ordinal))
+                throw new ArgumentException($"Chunk {c} has model fingerprint '{fingerprint}', expected '{expectedFingerprint}'.", "chunks");
+            if (!string.Equals(backend, _backend.Tag, StringComparison.Ordinal))
+                throw new ArgumentException(
+                    $"Chunk {c} was encoded by backend '{backend}', but this assembler places through backend '{_backend.Tag}'; "
+                    + "convert it explicitly or treat it as a miss.", "chunks");
+            if (n == 0)
+                throw new ArgumentException($"Chunk {c} is empty.", "chunks");
+            total += n;
+        }
+        if (total > destination.MaxLength)
+            throw new ArgumentException($"Chunks need positions up to {total - 1} but the destination holds {destination.MaxLength}.", "chunks");
+        return (perLayer, start);
     }
 }

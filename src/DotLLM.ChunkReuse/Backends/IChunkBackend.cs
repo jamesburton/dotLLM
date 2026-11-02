@@ -17,6 +17,9 @@ public interface IChunkBackend
     /// <summary>Backend identity stamped on entries and fingerprints (<see cref="ChunkBackendTags"/>).</summary>
     string Tag { get; }
 
+    /// <summary>The <c>deviceId</c> the backend's model forwards with (<c>IModel.Forward</c>): -1 for the CPU, 0 for Vulkan.</summary>
+    int ForwardDeviceId { get; }
+
     /// <summary>Creates an empty exact-F32 KV-cache of this backend for the backend's model.</summary>
     /// <param name="maxSeqLen">Positions the cache holds.</param>
     /// <returns>The cache.</returns>
@@ -42,6 +45,19 @@ public interface IChunkBackend
     /// <param name="k">Receives K, at least <c>count × stride</c> floats.</param>
     /// <param name="v">Receives V, at least <c>count × stride</c> floats.</param>
     void ReadRows(IKvCache cache, int layer, int startPos, int count, Span<float> k, Span<float> v);
+
+    /// <summary>
+    /// Copies <paramref name="count"/> rows of <paramref name="layer"/> from <paramref name="source"/> positions
+    /// <c>[srcStart, srcStart + count)</c> to <paramref name="destination"/> positions <c>[dstStart, dstStart + count)</c> without
+    /// changing them (K keeps the RoPE phase of its source position). Vulkan: device to device, no host hop.
+    /// </summary>
+    /// <param name="source">A cache accepted by <see cref="RequireCache"/>, holding the rows.</param>
+    /// <param name="layer">Layer index.</param>
+    /// <param name="srcStart">First source position.</param>
+    /// <param name="destination">A cache accepted by <see cref="RequireCache"/>.</param>
+    /// <param name="dstStart">First destination position.</param>
+    /// <param name="count">Rows to copy.</param>
+    void CopyRows(IKvCache source, int layer, int srcStart, IKvCache destination, int dstStart, int count);
 
     /// <summary>
     /// Re-rotates the K rows <c>[startPos, startPos + count)</c> of every RoPE layer (NoPE layers are left alone) by
