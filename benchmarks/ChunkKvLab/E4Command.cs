@@ -69,10 +69,17 @@ internal static class E4Command
         bool Has(string arm) => o.Arms.Contains(arm);
         int[] BudgetsOf(string arm) => o.LightArms.Contains(arm) ? o.LightBudgets : o.Budgets;
 
-        using var csv = new StreamWriter(o.OutCsv) { AutoFlush = true };
-        csv.WriteLine("corpus,chunker,seed,mode,plan,context_id,cluster,task_id,task_index,context_tokens,chunks,required_first,prefix_tokens,mask_tokens,"
+        const string header = "corpus,chunker,seed,mode,plan,context_id,cluster,task_id,task_index,context_tokens,chunks,required_first,prefix_tokens,mask_tokens,"
             + "arm,budget_pct,budget_tokens,graph_picks,query_edges,query_targets,query_targets_first,in_context_edges,forward_calls,score_ms,select_ms,"
-            + "recompute_ms,eval_ms,memo,mask_nll,mask_em,cont_nll,greedy_run,kl_cont,top1_cont,kl_mask,top1_mask,context_kind,related_chunks,hop1_chunks");
+            + "recompute_ms,eval_ms,memo,mask_nll,mask_em,cont_nll,greedy_run,kl_cont,top1_cont,kl_mask,top1_mask,context_kind,related_chunks,hop1_chunks";
+        // Resumable: rows go to <out>.partial one whole context at a time; <out>.partial.done records each finished context and
+        // the cumulative minutes (the time cap counts earlier runs). A finished job renames .partial to <out>.
+        Partial? resume = Partial.Open(o.OutCsv, header, RunKey(o, corpus.ChunkIdHash));
+        if (resume is null) return 0;
+        using Partial csv = resume;
+        double priorMinutes = csv.PriorMinutes;
+        if (csv.Done.Count > 0)
+            Console.WriteLine($"resuming {o.OutCsv}.partial: contexts done {string.Join(' ', csv.Done.Order())}; {priorMinutes:F1} min already spent");
 
         var encoder = new ChunkEncoder(lab.Fingerprint);
         var assembler = new ChunkAssembler(lab.Config);
@@ -82,7 +89,8 @@ internal static class E4Command
         for (int p = 0; p < plans.Count; p++)
         {
             if (p % o.Shards != o.Shard) continue;
-            if (o.MaxMinutes > 0 && total.Elapsed.TotalMinutes >= o.MaxMinutes)
+            if (csv.Done.Contains(p)) { done++; continue; }
+            if (o.MaxMinutes > 0 && priorMinutes + total.Elapsed.TotalMinutes >= o.MaxMinutes)
             {
                 Console.WriteLine($"time cap {o.MaxMinutes} min reached after {done} contexts of this shard");
                 break;
@@ -111,7 +119,7 @@ internal static class E4Command
             {
                 CodeTask t = tasks[ti];
                 var g = graphInfo[ti];
-                csv.WriteLine(string.Join(',', o.CorpusName, o.Chunker, o.Seed.ToString(ci), o.Mode, p.ToString(ci), contextId, Quote(cluster),
+                csv.Row(string.Join(',', o.CorpusName, o.Chunker, o.Seed.ToString(ci), o.Mode, p.ToString(ci), contextId, Quote(cluster),
                     Quote(t.Id), ti.ToString(ci), L.ToString(ci), plan.Chunks.Count.ToString(ci), requiredFirst ? "1" : "0",
                     t.PrefixTokenIds.Length.ToString(ci), t.MaskTokenCount.ToString(ci), arm, pct.ToString("F2", ci), budget.ToString(ci),
                     graphPicks.ToString(ci), g.Edges.ToString(ci), g.Targets.ToString(ci), g.TargetsFirst.ToString(ci), g.InContext.ToString(ci),
@@ -321,15 +329,128 @@ internal static class E4Command
                 }
 
             done++;
+            csv.CommitContext(p, priorMinutes + total.Elapsed.TotalMinutes);
             Console.WriteLine($"[{contextId} L {L} chunks {plan.Chunks.Count} tasks {tasks.Length}{(requiredFirst ? " required=chunk0" : "")}] "
                 + $"{ctxSw.Elapsed.TotalSeconds:F0} s (full {fullMs / 1000:F1} s, encode {encodeMs / 1000:F1} s, dev {devMs / 1000:F1} s, "
                 + $"query {qrMs.Sum() / 1000:F1} s, {memo.Count} distinct selections); query edges/targets "
                 + string.Join(' ', graphInfo.Select(g => $"{g.Edges}/{g.Targets}")) + $"; in-context edges {graphInfo[0].InContext}; "
                 + $"related distractors {relatedChunks}/{distractorChunks.Length} (hop 1: {hop1Chunks}); ref EM {refEval.Count(e => e.MaskEm)}/{tasks.Length}; "
-                + $"at {total.Elapsed.TotalMinutes:F1} min");
+                + $"at {priorMinutes + total.Elapsed.TotalMinutes:F1} min");
         }
-        Console.WriteLine($"e4 {o.CorpusName}/{o.Chunker}/s{o.Seed}/{o.Mode} shard {o.Shard}/{o.Shards}: {done} contexts in {total.Elapsed.TotalMinutes:F1} min -> {o.OutCsv}");
+        csv.Finish();
+        Console.WriteLine($"e4 {o.CorpusName}/{o.Chunker}/s{o.Seed}/{o.Mode} shard {o.Shard}/{o.Shards}: {done} contexts in "
+            + $"{priorMinutes + total.Elapsed.TotalMinutes:F1} min ({total.Elapsed.TotalMinutes:F1} in this run) -> {o.OutCsv}");
         return 0;
+    }
+
+    /// <summary>What must match for a .partial to be resumed: everything that changes the rows except threads and the time cap.</summary>
+    private static string RunKey(E4Options o, string corpusHash) => string.Join('|', o.CorpusName, o.Chunker, o.ChunkTokens, corpusHash, o.Seed,
+        o.Count, o.Mode, o.MaxContexts, string.Join(',', o.Budgets), string.Join(',', o.Arms), string.Join(',', o.LightArms),
+        string.Join(',', o.LightBudgets), o.Window, o.Shard, o.Shards, o.ContextKind, o.RelatedFraction.ToString(CultureInfo.InvariantCulture),
+        o.Generator.ContextTokens, o.Generator.ContinuationTokens, o.Generator.PrefixTokens, o.Generator.TasksPerContext);
+
+    /// <summary>
+    /// The resumable CSV: <c>&lt;out&gt;.partial</c> holds the rows of finished contexts only (a context's rows are appended and
+    /// flushed to disk together, then its index and the cumulative minutes go to <c>&lt;out&gt;.partial.done</c>); on reopen, rows of
+    /// contexts not in .done (a torn write) are dropped. Time spent in a context that did not finish is not counted.
+    /// </summary>
+    private sealed class Partial : IDisposable
+    {
+        private readonly string _out, _partial, _done;
+        private readonly FileStream _stream;
+        private readonly StreamWriter _writer;
+        private readonly List<string> _pending = [];
+        private bool _finished;
+
+        private Partial(string outCsv, FileStream stream, HashSet<int> done, double priorMinutes)
+        {
+            _out = outCsv;
+            _partial = outCsv + ".partial";
+            _done = _partial + ".done";
+            _stream = stream;
+            _writer = new StreamWriter(stream);
+            Done = done;
+            PriorMinutes = priorMinutes;
+        }
+
+        public HashSet<int> Done { get; }
+
+        public double PriorMinutes { get; }
+
+        /// <summary>Opens (or resumes) the partial output; null when <paramref name="outCsv"/> is already complete.</summary>
+        public static Partial? Open(string outCsv, string header, string key)
+        {
+            if (File.Exists(outCsv))
+            {
+                Console.WriteLine($"{outCsv} exists (job complete); nothing to do");
+                return null;
+            }
+            string partial = outCsv + ".partial", donePath = partial + ".done";
+            var done = new HashSet<int>();
+            double minutes = 0;
+            var keep = new List<string> { header };
+            int columns = header.Split(',').Length;
+            if (File.Exists(partial) && File.Exists(donePath))
+            {
+                string[] doneLines = File.ReadAllLines(donePath);
+                if (doneLines.Length == 0 || !string.Equals(doneLines[0], "key " + key, StringComparison.Ordinal))
+                    throw new InvalidOperationException($"{donePath} was written by a different configuration; move it and {partial} away to start over");
+                foreach (string line in doneLines.Skip(1))
+                {
+                    string[] parts = line.Split(',');
+                    if (parts.Length == 2 && int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int p)
+                        && double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out double m))
+                    {
+                        done.Add(p);
+                        minutes = Math.Max(minutes, m);
+                    }
+                }
+                foreach (string line in File.ReadLines(partial).Skip(1))
+                {
+                    string[] f = line.Split(',');
+                    if (f.Length >= columns && int.TryParse(f[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out int p) && done.Contains(p))
+                        keep.Add(line);
+                }
+            }
+            else File.WriteAllText(donePath, "key " + key + "\n");
+            File.WriteAllLines(partial, keep);
+            var stream = new FileStream(partial, FileMode.Append, FileAccess.Write, FileShare.Read);
+            return new Partial(outCsv, stream, done, minutes);
+        }
+
+        public void Row(string line) => _pending.Add(line);
+
+        public void CommitContext(int plan, double cumulativeMinutes)
+        {
+            foreach (string line in _pending) _writer.WriteLine(line);
+            _pending.Clear();
+            _writer.Flush();
+            _stream.Flush(flushToDisk: true);
+            using (var d = new FileStream(_done, FileMode.Append, FileAccess.Write, FileShare.Read))
+            using (var w = new StreamWriter(d))
+            {
+                w.WriteLine(plan.ToString(CultureInfo.InvariantCulture) + "," + cumulativeMinutes.ToString("F3", CultureInfo.InvariantCulture));
+                w.Flush();
+                d.Flush(flushToDisk: true);
+            }
+            Done.Add(plan);
+        }
+
+        /// <summary>The job is over (all contexts, or the time cap): .partial becomes the output.</summary>
+        public void Finish()
+        {
+            _writer.Flush();
+            _stream.Flush(flushToDisk: true);
+            _writer.Dispose();
+            _finished = true;
+            File.Move(_partial, _out);
+            File.Delete(_done);
+        }
+
+        public void Dispose()
+        {
+            if (!_finished) _writer.Dispose();
+        }
     }
 
     /// <summary>The plans (contexts + tasks) this run evaluates; see the class remarks.</summary>

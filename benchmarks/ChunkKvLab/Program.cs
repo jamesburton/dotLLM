@@ -22,6 +22,8 @@ namespace ChunkKvLab;
 ///               [--mode kept|unfiltered] [--kept &lt;validation.csv&gt;] [--plans-jsonl &lt;plans&gt;] [--contexts 0 (all)] [--budgets 5,10,15,20]
 ///               [--arms ...] [--light-arms a,b --light-budgets 5,20] [--window 16] [--shard 0/1] [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
 ///               [--context-kind random|related] [--related-fraction 0.5]
+///               (--chunker fixed-text: E4c text-first fixed chunks; --resume 1 continues &lt;out&gt;.partial by whole contexts)
+/// ChunkKvLab roundtrip --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --out &lt;csv&gt; [--chunkers fixed,symbol,fixed-text] [--chunk 512]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
 /// </code>
 /// </summary>
@@ -89,6 +91,10 @@ internal static class Program
                 Console.WriteLine($"corpus {Get("corpus")}: {corpus.DocumentCount} documents, {corpus.Chunks.Count} chunks; chunk-id sha256 {corpus.ChunkIdHash}");
                 return 0;
             }
+            case "roundtrip":
+                // E4c, tokenizer only: text round trip of every chunk per chunker; text-first invariants on the real tokenizer.
+                return RoundTripCommand.Run(Get("model"), Get("corpus"), Get("name"), Int("chunk", 512), Get("out"),
+                    Get("chunkers", "fixed,symbol,fixed-text").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
             case "graph-info":
                 return GraphRunner.Run(new GraphOptions(Get("model"), Get("corpus"), Get("chunker", "symbol"), Int("chunk", 512),
                     Int("repeat", 3), Int("plans", 100), Int("seed", 0), opts.GetValueOrDefault("expect-hash")));
