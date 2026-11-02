@@ -144,11 +144,10 @@ public sealed class PrefixTrieManager : IDisposable
     /// approximate (a block holding any approximate row is approximate).</param>
     public void RecordCompletion(PagedKvCache cache, ReadOnlySpan<int> fullTokens, int? firstApproxRow = null)
     {
-        if (firstApproxRow is < 0)
-            throw new ArgumentOutOfRangeException(nameof(firstApproxRow));
-
         ArgumentNullException.ThrowIfNull(cache);
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (firstApproxRow is < 0)
+            throw new ArgumentOutOfRangeException(nameof(firstApproxRow));
 
         AcquiredPrefix? acquired;
         lock (_acquiredLock)

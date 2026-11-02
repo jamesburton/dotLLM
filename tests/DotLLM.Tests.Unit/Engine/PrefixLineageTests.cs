@@ -325,6 +325,64 @@ public sealed class PrefixLineageTests
         Assert.Equal(1, cache.EntryCount);
     }
 
+    [Fact]
+    public void ApproxAllowed_PrefixCache_TieBreakPrefersMoreExactRows()
+    {
+        // Same match length (10) from both entries: 2 exact + 8 approximate vs 10 exact. The approximate entry is
+        // first in list order; the lookup must still pick the exact one.
+        using var cache = new PrefixCache(4);
+        var tokens = Seq(1, 10);
+        var approxKv = NewSimple();
+        var exactKv = NewSimple();
+        cache.Store(tokens, approxKv, firstApproxRow: 2);
+        cache.Store(tokens, exactKv);
+
+        var (entry, matched) = cache.FindMatch(tokens, allowApprox: true, out int approx);
+        Assert.Same(exactKv, entry!.KvCache);
+        Assert.Equal(10, matched);
+        Assert.Equal(0, approx);
+    }
+
+    [Theory]
+    [InlineData(null, false, 8, 8, 0)]   // all exact, seeded prefix trimmed to the cache: 16 -> 8
+    [InlineData(8, true, 4, 4, 0)]       // trim inside the exact rows: exact count trimmed too
+    [InlineData(8, true, 12, 8, 4)]      // trim inside the approximate rows
+    [InlineData(8, false, 4, 4, 0)]      // exact lookup, trim below its cap
+    public void CachedTokens_CountExactRowsOnly_Trie_SeedCapTrim(int? firstApproxRow, bool allowApprox, int maxSeqLen,
+        int expectedCached, int expectedApprox)
+    {
+        using var factory = NewFactory();
+        using var mgr = new PrefixTrieManager(factory);
+        var tokens = Seq(1, 16);
+        RunSequence(mgr, tokens, firstApproxRow: firstApproxRow);
+
+        var admission = mgr.Admit(tokens, maxSeqLen, allowApprox);
+        int cached = admission.CachedTokens, approx = admission.ApproxRowsReused, restored = admission.RestoredTokens;
+        mgr.RecordCompletion(admission.Cache, tokens.AsSpan(0, restored));
+        admission.Cache.Dispose();
+
+        Assert.Equal(expectedCached, cached);
+        Assert.Equal(expectedApprox, approx);
+        Assert.Equal(expectedCached + expectedApprox, restored);
+        Assert.True(restored <= maxSeqLen);
+    }
+
+    [Theory]
+    [InlineData(0, 0)]     // whole path approximate: nothing exact to pin
+    [InlineData(8, 8)]     // pinned up to the first approximate block
+    [InlineData(null, 16)] // all exact: pinned in full
+    public void NamedPrefix_PinsExactPathOnly(int? firstApproxRow, int expectedPinned)
+    {
+        using var factory = NewFactory();
+        using var mgr = new PrefixTrieManager(factory);
+        var tokens = Seq(1, 16);
+        RunSequence(mgr, tokens, firstApproxRow: firstApproxRow);
+
+        Assert.Equal(expectedPinned, mgr.RegisterNamedPrefix("sys", tokens));
+        if (expectedPinned > 0)
+            Assert.True(mgr.UnpinNamedPrefix("sys"));
+    }
+
     // ---------------- NoApproxRows_BehaviourUnchanged ----------------
 
     [Fact]
