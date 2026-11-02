@@ -22,8 +22,24 @@ public static class ChunkHash
     public static string Of(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
+        return OfSpan(text.AsSpan());
+    }
+
+    /// <summary>The same hash over a slice of a string (the body handler hashes spans in place).</summary>
+    internal static string OfSpan(ReadOnlySpan<char> text)
+    {
         Span<byte> digest = stackalloc byte[SHA256.HashSizeInBytes];
-        SHA256.HashData(Encoding.UTF8.GetBytes(text), digest);
+        byte[] utf8 = System.Buffers.ArrayPool<byte>.Shared.Rent(Encoding.UTF8.GetMaxByteCount(text.Length));
+        try
+        {
+            int n = Encoding.UTF8.GetBytes(text, utf8);
+            SHA256.HashData(utf8.AsSpan(0, n), digest);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(utf8);
+        }
+
         // One code path for net8.0 and net10.0 (the tests run on net10.0 only, so a TFM branch would go unexercised).
         return Prefix + Convert.ToHexString(digest).ToLowerInvariant();
     }

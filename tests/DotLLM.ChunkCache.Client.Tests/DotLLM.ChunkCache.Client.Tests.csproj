@@ -16,6 +16,9 @@
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <!-- The real MEAI OpenAI bridge (MIT), so pipeline tests see the body the provider actually serialises. Test-only:
+         the client package itself references Microsoft.Extensions.AI.Abstractions alone. -->
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" />
   </ItemGroup>
 
   <ItemGroup>
