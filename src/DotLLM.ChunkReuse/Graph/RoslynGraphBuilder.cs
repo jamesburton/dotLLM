@@ -92,7 +92,8 @@ public sealed class RoslynGraphBuilder
     /// </summary>
     /// <param name="projects">The projects; each corpus path is owned by one project only (compared with <see cref="PathComparer"/>:
     /// case-insensitive on Windows), and its tree must be in that project's compilation.</param>
-    /// <param name="chunks">The chunks; every chunk's file must be owned by one of <paramref name="projects"/>.</param>
+    /// <param name="chunks">The chunks; every chunk's file must be owned by one of <paramref name="projects"/>, spelled exactly as
+    /// the owner's key (chunk paths are matched ordinally; a different spelling throws).</param>
     /// <remarks><see cref="LastTimings"/>.Compile is zero: the compilations come built (lazily bound by Roslyn).</remarks>
     public ReferenceGraph Build(IReadOnlyList<ProjectCompilation> projects, IReadOnlyList<Chunk> chunks)
     {

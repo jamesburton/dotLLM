@@ -14,5 +14,6 @@
     <!-- Compiled only for netstandard2.0. -->
     <Compile Remove="Polyfill.cs" />
     <Compile Include="Polyfill.cs" Condition="'$(TargetFramework)' == 'netstandard2.0'" />
+    <Compile Include="..\Shared\Legacy.cs" Link="Legacy.cs" Condition="'$(TargetFramework)' == 'netstandard2.0'" />
   </ItemGroup>
 </Project>

@@ -1,6 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <!-- Not packed until the release plan (Phase S Task 9) decides the package set. -->
+    <IsPackable>false</IsPackable>
     <Description>Solution scanner for dotLLM chunk-level KV reuse (research): loads a .sln/.slnx/.csproj with Roslyn's MSBuildWorkspace and returns its C# files, skipped projects and one compilation per project. Kept out of DotLLM.ChunkReuse so the library does not carry the MSBuild workspace dependencies.</Description>
   </PropertyGroup>
 
