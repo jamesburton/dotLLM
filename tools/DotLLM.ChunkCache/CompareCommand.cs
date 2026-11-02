@@ -209,7 +209,7 @@ internal static class CompareCommand
             RecomputeDescription = strategy.Description, Contexts = contexts, Rows = rows, ElapsedMs = total.ElapsedMilliseconds,
         };
         if (ctx.Json) ctx.WriteJson(result);
-        else PrintTable(ctx.Out, result);
+        PrintTable(ctx.Text, result); // with --json the table goes to stderr
         return ExitCodes.Ok;
     }
 
