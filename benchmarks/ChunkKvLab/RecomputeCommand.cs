@@ -149,10 +149,13 @@ internal static class RecomputeCommand
                 sw.Restart();
                 var host = plan.Chunks.Select(ch => encoder.Encode(vk.Model, vk.Backend, ch.TokenIds)).ToList();
                 Time("encode_host", "", 0, L, plan.Chunks.Count, 0, sw.Elapsed.TotalMilliseconds, plan.Chunks.Count, 0);
-                Console.WriteLine(Step("encode (resident entries: forward only)"));
+                // Resident entries are the host entries uploaded once into their own caches (the same bits a resident encode holds; G1).
+                // Not EncodeResident: keeping one live cache per chunk through the model's forwards overflows the Vulkan model's
+                // DescriptorSetCache (1024 buffer tuples per kernel) at 8K symbol chunks (58 chunks x 36 layers).
+                Console.WriteLine(Step("upload host entries into resident caches"));
                 sw.Restart();
-                var resident = plan.Chunks.Select(ch => encoder.EncodeResident(vk.Model, vk.Backend, ch.TokenIds)).ToList();
-                Time("encode_resident", "", 0, L, plan.Chunks.Count, 0, sw.Elapsed.TotalMilliseconds, plan.Chunks.Count, 0);
+                var resident = host.Select(e => E1Runner.Upload(vk, e)).ToList();
+                Time("upload_resident", "", 0, L, plan.Chunks.Count, 0, sw.Elapsed.TotalMilliseconds, 0, 0);
                 try
                 {
                     for (int rep = 0; rep < o.Repeats; rep++)

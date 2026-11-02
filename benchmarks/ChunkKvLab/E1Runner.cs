@@ -280,7 +280,7 @@ internal static class E1Runner
     }
 
     // A host entry made resident: written once into its own backend cache at 0..n-1 (the same bits a resident encode would hold).
-    private static ResidentChunkKvEntry Upload(LabModel lab, ChunkKvEntry e)
+    internal static ResidentChunkKvEntry Upload(LabModel lab, ChunkKvEntry e)
     {
         IKvCache cache = lab.Backend.CreateCache(e.TokenIds.Length);
         try
