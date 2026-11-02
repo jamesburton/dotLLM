@@ -1,0 +1,3 @@
+<Project>
+  <!-- Fixture for SolutionScannerTests: stops the dotLLM repo's Directory.Build.targets (if any) from applying. -->
+</Project>

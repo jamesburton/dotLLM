@@ -8,8 +8,9 @@ using Microsoft.CodeAnalysis.Text;
 namespace DotLLM.ChunkReuse.Graph;
 
 /// <summary>
-/// Builds a <see cref="ReferenceGraph"/> with the Roslyn semantic model (one compilation over all files, BCL-only references,
-/// as <see cref="Corpus"/>): symbols are resolved, never matched by name, and anything that does not resolve to a single
+/// Builds a <see cref="ReferenceGraph"/> with the Roslyn semantic model — either one compilation over all files, BCL-only
+/// references (as <see cref="Corpus"/>), or one compilation per project (<see cref="ProjectCompilation"/>, from
+/// the solution scanner in <c>DotLLM.ChunkReuse.Solution</c>): symbols are resolved, never matched by name, and anything that does not resolve to a single
 /// symbol declared in a chunked file gives no edge.
 /// </summary>
 /// <remarks>
@@ -48,6 +49,12 @@ public sealed class RoslynGraphBuilder
         _tokenizer = tokenizer;
     }
 
+    /// <summary>
+    /// How file paths are compared where one file must not count twice: case-insensitive on Windows (where
+    /// <c>Shared/A.cs</c> and <c>shared/a.cs</c> are one file), ordinal elsewhere.
+    /// </summary>
+    public static StringComparer PathComparer { get; } = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+
     /// <summary>Time spent by the last <c>Build</c> call: compilation, symbol binding (edges in characters), and token mapping.</summary>
     public (TimeSpan Compile, TimeSpan Bind, TimeSpan Map) LastTimings { get; private set; }
 
@@ -59,7 +66,7 @@ public sealed class RoslynGraphBuilder
         CSharpCompilation compilation = corpus.Compilation;
         var trees = corpus.Files.ToDictionary(f => f.Path, f => corpus.TreeOf(f.Path), StringComparer.Ordinal);
         TimeSpan compile = sw.Elapsed;
-        return Build(compilation, trees, corpus.Chunks, compile);
+        return Build(Single(compilation, trees), corpus.Chunks, compile);
     }
 
     /// <summary>Builds the graph of <paramref name="chunks"/> of <paramref name="files"/>.</summary>
@@ -74,17 +81,50 @@ public sealed class RoslynGraphBuilder
         (CSharpCompilation compilation, Dictionary<string, SyntaxTree> trees) =
             Corpus.CreateCompilation(files.OrderBy(f => f.Path, StringComparer.Ordinal), implicitUsings);
         TimeSpan compile = sw.Elapsed;
-        return Build(compilation, trees, chunks, compile);
+        return Build(Single(compilation, trees), chunks, compile);
     }
 
-    private ReferenceGraph Build(CSharpCompilation compilation, Dictionary<string, SyntaxTree> trees, IReadOnlyList<Chunk> chunks,
+    /// <summary>
+    /// Builds the graph of <paramref name="chunks"/> from one compilation per project (for instance the solution scanner's
+    /// <c>ScanResult.Compilations</c>): each file is bound in its owning project's
+    /// compilation, with that project's parse options, defines and references, so calls into referenced projects resolve
+    /// where a single BCL-only compilation cannot. Edge definitions are the same as for the other overloads.
+    /// </summary>
+    /// <param name="projects">The projects; each corpus path is owned by one project only (compared with <see cref="PathComparer"/>:
+    /// case-insensitive on Windows), and its tree must be in that project's compilation.</param>
+    /// <param name="chunks">The chunks; every chunk's file must be owned by one of <paramref name="projects"/>.</param>
+    /// <remarks><see cref="LastTimings"/>.Compile is zero: the compilations come built (lazily bound by Roslyn).</remarks>
+    public ReferenceGraph Build(IReadOnlyList<ProjectCompilation> projects, IReadOnlyList<Chunk> chunks)
+    {
+        ArgumentNullException.ThrowIfNull(projects);
+        ArgumentNullException.ThrowIfNull(chunks);
+        var files = new Dictionary<string, (Compilation, SyntaxTree)>(PathComparer);
+        foreach (ProjectCompilation p in projects)
+        {
+            ArgumentNullException.ThrowIfNull(p);
+            foreach ((string path, SyntaxTree tree) in p.Trees)
+            {
+                if (!p.Compilation.ContainsSyntaxTree(tree))
+                    throw new ArgumentException($"The tree of '{path}' is not in project '{p.Name}''s compilation.", nameof(projects));
+                if (!files.TryAdd(path, (p.Compilation, tree)))
+                    throw new ArgumentException($"File '{path}' is owned by more than one project ('{p.Name}').", nameof(projects));
+            }
+        }
+        return Build(files, chunks, TimeSpan.Zero);
+    }
+
+    private static Dictionary<string, (Compilation, SyntaxTree)> Single(Compilation compilation, Dictionary<string, SyntaxTree> trees) =>
+        trees.ToDictionary(kv => kv.Key, kv => (compilation, kv.Value), StringComparer.Ordinal);
+
+    // files: corpus path → (owning compilation, its tree of the file).
+    private ReferenceGraph Build(Dictionary<string, (Compilation Compilation, SyntaxTree Tree)> files, IReadOnlyList<Chunk> chunks,
         TimeSpan compile)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var index = new ChunkIndex(chunks, trees);
+        var index = new ChunkIndex(chunks, files.ToDictionary(kv => kv.Key, kv => kv.Value.Tree, StringComparer.Ordinal));
         var raw = new List<(Location Use, Location Def, SymbolEdgeKind Kind)>();
-        foreach (string path in trees.Keys.Where(index.HasChunks).Order(StringComparer.Ordinal))
-            CollectFile(compilation, trees[path], index, raw);
+        foreach (string path in files.Keys.Where(index.HasChunks).Order(StringComparer.Ordinal))
+            CollectFile(files[path].Compilation, files[path].Tree, index, raw);
         TimeSpan bind = sw.Elapsed;
 
         sw.Restart();
@@ -104,7 +144,7 @@ public sealed class RoslynGraphBuilder
         return graph;
     }
 
-    private static void CollectFile(CSharpCompilation compilation, SyntaxTree tree, ChunkIndex index,
+    private static void CollectFile(Compilation compilation, SyntaxTree tree, ChunkIndex index,
         List<(Location, Location, SymbolEdgeKind)> raw)
     {
         SemanticModel model = compilation.GetSemanticModel(tree);
@@ -177,7 +217,7 @@ public sealed class RoslynGraphBuilder
         };
         Location? first = index.Ordered(Declarations(symbol)).FirstOrDefault();
         Location self = id.GetLocation();
-        if (first is not null && (first.SourceSpan != self.SourceSpan || first.SourceTree?.FilePath != self.SourceTree?.FilePath))
+        if (first is not null && (first.SourceSpan != self.SourceSpan || index.PathOf(first) != index.PathOf(self)))
             raw.Add((self, first, SymbolEdgeKind.Definition));
     }
 
@@ -235,11 +275,17 @@ public sealed class RoslynGraphBuilder
         private readonly Dictionary<string, int[]> _byFile; // chunk indices sorted by start offset
         private readonly int[]?[] _tokenStarts;
         private readonly Dictionary<string, SourceText> _texts = new(StringComparer.Ordinal);
+        // Tree file path (as Roslyn locations carry it: absolute for workspace projects) → corpus path. Locations from any
+        // compilation (a referencing project's view of another project's tree) map through the file path, not the tree object.
+        private readonly Dictionary<string, string> _corpusPath = new(PathComparer);
 
         public ChunkIndex(IReadOnlyList<Chunk> chunks, Dictionary<string, SyntaxTree> trees)
         {
             _chunks = chunks;
             _tokenStarts = new int[]?[chunks.Count];
+            foreach ((string path, SyntaxTree tree) in trees)
+                if (!_corpusPath.TryAdd(tree.FilePath, path))
+                    throw new ArgumentException($"Files '{_corpusPath[tree.FilePath]}' and '{path}' have the same tree path '{tree.FilePath}'.", nameof(trees));
             _byFile = Enumerable.Range(0, chunks.Count).GroupBy(i => chunks[i].FilePath, StringComparer.Ordinal)
                 .ToDictionary(g => g.Key, g => g.OrderBy(i => chunks[i].StartOffset).ToArray(), StringComparer.Ordinal);
             foreach (string path in _byFile.Keys)
@@ -253,17 +299,23 @@ public sealed class RoslynGraphBuilder
 
         public bool HasChunks(string path) => _byFile.ContainsKey(path);
 
-        /// <summary>Locations in chunked files, ordered by (path, start), distinct.</summary>
+        /// <summary>Corpus path of <paramref name="location"/>'s file, or null when it is not a corpus file.</summary>
+        public string? PathOf(Location location) =>
+            location.SourceTree is { } t && _corpusPath.TryGetValue(t.FilePath, out string? path) ? path : null;
+
+        /// <summary>Locations in chunked files, ordered by (corpus path, start), distinct.</summary>
         public IEnumerable<Location> Ordered(IEnumerable<Location> locations) => locations
-            .Where(l => l.SourceTree is not null && HasChunks(l.SourceTree.FilePath))
-            .DistinctBy(l => (l.SourceTree!.FilePath, l.SourceSpan.Start))
-            .OrderBy(l => l.SourceTree!.FilePath, StringComparer.Ordinal).ThenBy(l => l.SourceSpan.Start);
+            .Select(l => (Location: l, Path: PathOf(l)))
+            .Where(l => l.Path is not null && HasChunks(l.Path))
+            .DistinctBy(l => (l.Path, l.Location.SourceSpan.Start))
+            .OrderBy(l => l.Path, StringComparer.Ordinal).ThenBy(l => l.Location.SourceSpan.Start)
+            .Select(l => l.Location);
 
         /// <summary>The chunk and chunk-local token holding the first character of <paramref name="location"/>.</summary>
         public bool TryMap(Location location, ITokenizer tokenizer, out int chunk, out int token)
         {
             chunk = token = -1;
-            if (location.SourceTree is null || !_byFile.TryGetValue(location.SourceTree.FilePath, out int[]? list)) return false;
+            if (PathOf(location) is not { } path || !_byFile.TryGetValue(path, out int[]? list)) return false;
             int offset = location.SourceSpan.Start;
             int lo = 0, hi = list.Length - 1, found = -1;
             while (lo <= hi)

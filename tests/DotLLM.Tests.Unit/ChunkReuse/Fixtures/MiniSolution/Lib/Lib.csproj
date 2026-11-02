@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- Multi-targeted: scanned once (net10.0, the preferred target), the other target reported with the files only it compiles. -->
+    <TargetFrameworks>netstandard2.0;net10.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Greeter.Greet exists only with this project's symbol: a BCL-only compilation (no defines) cannot see it. -->
+    <DefineConstants>$(DefineConstants);MINI_GREETING</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Also compiled by App: one file, two projects. -->
+    <Compile Include="..\Shared\BuildInfo.cs" Link="BuildInfo.cs" />
+    <!-- Compiled only for netstandard2.0. -->
+    <Compile Remove="Polyfill.cs" />
+    <Compile Include="Polyfill.cs" Condition="'$(TargetFramework)' == 'netstandard2.0'" />
+  </ItemGroup>
+</Project>

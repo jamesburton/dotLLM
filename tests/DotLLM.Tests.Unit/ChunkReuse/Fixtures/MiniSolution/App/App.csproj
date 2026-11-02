@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Lib\Lib.csproj" />
+    <Compile Include="..\Shared\BuildInfo.cs" Link="BuildInfo.cs" />
+    <Compile Include="..\Lib\LibInfo.cs" Link="LibInfo.cs" />
+  </ItemGroup>
+</Project>

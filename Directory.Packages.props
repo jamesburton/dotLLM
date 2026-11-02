@@ -26,6 +26,10 @@
     <PackageVersion Include="Microsoft.Direct3D.DirectStorage" Version="1.3.0" />
     <!-- Roslyn syntax/semantic model for the chunk-reuse code corpus (src/DotLLM.ChunkReuse only; not the engine) -->
     <PackageVersion Include="Microsoft.CodeAnalysis.CSharp" Version="5.9.0" />
+    <!-- Solution scanner (src/DotLLM.ChunkReuse.Solution only): MSBuildWorkspace (out-of-proc BuildHost), C# workspace layer, solution file reader -->
+    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="5.9.0" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="5.9.0" />
+    <PackageVersion Include="Microsoft.VisualStudio.SolutionPersistence" Version="1.0.52" />
     <!-- Versioning -->
     <PackageVersion Include="MinVer" Version="6.0.0" />
   </ItemGroup>

@@ -15,6 +15,7 @@ namespace ChunkKvLab;
 ///               [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
 /// ChunkKvLab graph-info --model &lt;gguf&gt; --corpus &lt;dir&gt; [--chunker symbol|fixed] [--chunk 512] [--repeat 3] [--plans 100] [--seed 0]
 ///               [--expect-hash &lt;sha256&gt;]
+/// ChunkKvLab scan-info --model &lt;gguf&gt; --solution &lt;sln|slnx|csproj&gt; [--chunker symbol|fixed] [--chunk 512]
 /// ChunkKvLab e3 --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --out-dir &lt;dir&gt; [--chunker symbol|fixed] [--chunk 512]
 ///               [--seed 0] [--count 100] [--context 2048] [--contexts 0 (all)] [--kept &lt;validation.csv&gt; --plans-jsonl &lt;plans&gt;]
 ///               [--query 1] [--raw 0] [--draws 20] [--max-minutes 0] [--chunk-cache-tokens 40000] [--expect-hash &lt;sha256&gt;]
@@ -109,6 +110,8 @@ internal static class Program
             case "graph-info":
                 return GraphRunner.Run(new GraphOptions(Get("model"), Get("corpus"), Get("chunker", "symbol"), Int("chunk", 512),
                     Int("repeat", 3), Int("plans", 100), Int("seed", 0), opts.GetValueOrDefault("expect-hash")));
+            case "scan-info":
+                return ScanInfoCommand.Run(Get("model"), Get("solution"), Get("chunker", "symbol"), Int("chunk", 512));
             case "e3":
                 return E3Command.Run(new E3Options(
                     Get("model"), Get("corpus"), Get("name"), Get("chunker", "symbol"), Int("chunk", 512), opts.GetValueOrDefault("expect-hash"),

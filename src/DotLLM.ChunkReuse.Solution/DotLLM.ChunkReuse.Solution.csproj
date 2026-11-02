@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Solution scanner for dotLLM chunk-level KV reuse (research): loads a .sln/.slnx/.csproj with Roslyn's MSBuildWorkspace and returns its C# files, skipped projects and one compilation per project. Kept out of DotLLM.ChunkReuse so the library does not carry the MSBuild workspace dependencies.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DotLLM.ChunkReuse\DotLLM.ChunkReuse.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- MSBuildWorkspace (design-time builds in Roslyn's out-of-process BuildHost) + the C# workspace layer. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" />
+    <!-- Solution file reader (.sln/.slnx) used directly by SolutionScanner, not only through Workspaces.MSBuild. -->
+    <PackageReference Include="Microsoft.VisualStudio.SolutionPersistence" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
+  </ItemGroup>
+
+</Project>
