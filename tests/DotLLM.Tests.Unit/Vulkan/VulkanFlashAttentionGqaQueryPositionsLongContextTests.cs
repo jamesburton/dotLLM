@@ -8,7 +8,7 @@ using Xunit.Abstractions;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// Issue #1543: the tiled per-query-position attention (#1540) on F16 KV at long contexts (2K..32K), with the row count per submit
+/// Issue #1549: the tiled per-query-position attention (#1540) on F16 KV at long contexts (2K..32K), with the row count per submit
 /// capped at 128 (the shape the chunk-KV recompute uses). Checked against a double-precision reference on sampled (row, head) pairs
 /// and against the one-workgroup-per-row oracle (#1534, <c>DOTLLM_VULKAN_ATTN_QPOS=ref</c>) on a few rows.
 /// </summary>
@@ -50,7 +50,7 @@ public sealed class VulkanFlashAttentionGqaQueryPositionsLongContextTests
         Skip.If(kernel is null, $"the {(coopmat ? "coopmat" : "scalar")} qpos kernel is unavailable on {device.DeviceName}");
         using var oracle = AttentionQueryPositionsKernel.Create(device, spvDir, VulkanKvStorage.F16);
 
-        var rng = new Random(1543 + seqKv);
+        var rng = new Random(1549 + seqKv);
         int[] positions = MakePositions(rng, seqKv, Rows);
         float[] q = Rand(rng, Rows * H * Hd, 1f);
         float[] k = Rand(rng, seqKv * Hkv * Hd, 1.5f);
