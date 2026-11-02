@@ -47,7 +47,11 @@ public sealed class FixedSizeChunker : IChunker
             string text = _tokenizer.Decode(slice);
             int newlines = text.AsSpan().Count('\n');
             int endLine = startLine + newlines - (text.EndsWith('\n') ? 1 : 0);
-            int endOffset = Math.Min(file.Text.Length, startOffset + text.Length);
+            // Decode-based offsets can drift from the text (a character the tokenizer drops or replaces on decode, e.g. a
+            // Unicode noncharacter such as U+FDD0, or a cut inside a multi-byte character): clamp, and let the last chunk end at
+            // the end of the text, so the chunks always tile the file (ChunkIndex's contract).
+            bool last = start + MaxChunkTokens >= ids.Length;
+            int endOffset = last ? file.Text.Length : Math.Min(file.Text.Length, startOffset + text.Length);
             chunks.Add(new Chunk(file.Path, startLine, Math.Max(startLine, endLine), slice) { StartOffset = startOffset, EndOffset = endOffset });
             startOffset = endOffset;
             startLine += newlines;

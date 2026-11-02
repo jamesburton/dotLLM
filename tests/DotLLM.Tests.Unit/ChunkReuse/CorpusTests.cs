@@ -240,6 +240,36 @@ public sealed class CorpusTests : IDisposable
     // ---------------------------------------------------------------------------------------------------------------
 
     [Fact]
+    public void FixedSizeChunker_DecodeDropsACharacter_ChunksStillTileTheFile()
+    {
+        // The Qwen BPE decode drops U+FDD0 (src/DotLLM.Tokenizers/ControlTokenGuard.cs in dotLLM): the decode-based offsets fall
+        // one short, and before the fix the last chunk ended before the text did, so ChunkIndex.Update refused the file.
+        var tok = new DroppingTokenizer('﷐');
+        string text = "class A {\n  const string S = \"﷐\";\n}\n" + new string('x', 40) + "\n";
+        IReadOnlyList<Chunk> chunks = new FixedSizeChunker(tok, 16).Chunk(new SourceFile("a.cs", text));
+        Assert.True(chunks.Count > 2);
+        Assert.Equal(0, chunks[0].StartOffset);
+        for (int i = 1; i < chunks.Count; i++) Assert.Equal(chunks[i - 1].EndOffset, chunks[i].StartOffset);
+        Assert.Equal(text.Length, chunks[^1].EndOffset);
+        var index = new DotLLM.ChunkReuse.Store.ChunkIndex(ids => DotLLM.ChunkReuse.Store.ChunkKey.Create("fp", "tok", default, "cpu",
+            DotLLM.ChunkReuse.Store.KvDtype.F32, ids));
+        index.Update([new SourceFile("a.cs", text)], new FixedSizeChunker(tok, 16)); // throws on a non-tiling chunker
+    }
+
+    /// <summary><see cref="CharTokenizer"/> whose decode drops one character.</summary>
+    private sealed class DroppingTokenizer(char dropped) : ITokenizer
+    {
+        private readonly CharTokenizer _inner = new();
+        public int[] Encode(string text) => _inner.Encode(text);
+        public string Decode(ReadOnlySpan<int> tokenIds) => _inner.Decode(tokenIds).Replace(dropped.ToString(), "", StringComparison.Ordinal);
+        public string DecodeToken(int tokenId) => Decode([tokenId]);
+        public int BosTokenId => -1;
+        public int EosTokenId => -1;
+        public int VocabSize => 65536;
+        public int CountTokens(string text) => text.Length;
+    }
+
+    [Fact]
     public void FixedSizeChunker_ProducesChunksOfAtMostN_Tokens()
     {
         var tok = new CharTokenizer();
