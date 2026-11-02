@@ -1,0 +1,68 @@
+{
+  "model": "qwen3-4b",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a coding agent. Use tools to read files."
+    },
+    {
+      "role": "user",
+      "content": "Why does ChunkIndex.Update drop entries?"
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_7",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"src/Store/ChunkIndex.cs\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_7",
+      "content": [
+        {
+          "type": "text",
+          "text": "// notes (\ud83d\ude00)\n"
+        },
+        {
+          "type": "text",
+          "text": "Status \ud83d\ude00 \u2014 r\u00e9sum\u00e9 de caf\u00e9:\nfn caf\u00e9(na\u00efve: &str) -> usize {\n    // \u00e9l\u00e8ve: compte les caract\u00e8res, pas les octets\n    let r\u00e9sum\u00e9 = na\u00efve.chars().filter(|c| !c.is_whitespace()).count();\n    if r\u00e9sum\u00e9 > 64 {\n        eprintln!(\"trop long: {} \u2014 coupe \u00e0 64 \u2615\", r\u00e9sum\u00e9);\n    }\n    r\u00e9sum\u00e9.min(64)\n}\n\nfn bonjour() -> &'static str {\n    \"h\u00e9llo w\u00f6rld \u2603\"\n}\n"
+        },
+        {
+          "type": "text",
+          "text": "// notes.txt written on Windows\r\npublic int Add(int a, int b)\r\n{\r\n    // add the two operands and return the sum to the caller\r\n    var sum = checked(a + b);\r\n    return sum;\r\n}\r\n\r\npublic int Sub(int a, int b)\r\n{\r\n    var diff = checked(a - b);\r\n    return diff;\r\n}\r\n"
+        }
+      ]
+    }
+  ],
+  "chunk_cache": {
+    "v": 1,
+    "chunks": [
+      {
+        "id": "docs/notes-fr.md:1-12@0",
+        "hash": "sha256:e91fb24caf9528897929954c63772b8a1441929fb412cb8ebae3716b0cbfaab0",
+        "at": {
+          "message": 3,
+          "part": 1,
+          "start": 35,
+          "end": 374
+        }
+      },
+      {
+        "id": "src/Win/Math.cs:1-14@0",
+        "hash": "sha256:de7358cee1c1acb9b8ae8041066e0f4fcaa057142e34d68b2a7fa83f135d49e3",
+        "at": {
+          "message": 3,
+          "part": 2
+        }
+      }
+    ]
+  }
+}

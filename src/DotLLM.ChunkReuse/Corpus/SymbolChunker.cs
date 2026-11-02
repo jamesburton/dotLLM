@@ -23,7 +23,7 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// <item>A member starting mid-line after other code (e.g. several members on one line) does not split.</item>
 /// <item>A chunk over the limit is re-split greedily at the line starts of its inner statements and members (blocks belong to
 /// their statement), then at line starts, and a single line over the limit is cut into token slices of the limit (those
-/// pieces share a line).</item>
+/// pieces share a line, and are not <see cref="Chunk.WireEligible"/>).</item>
 /// </list>
 /// Partial types need nothing special (each part is chunked in its own file); nested types are containers like any type;
 /// a file with parse errors is chunked from whatever members Roslyn recovered (coverage still holds); generated code is
@@ -168,11 +168,11 @@ public sealed partial class SymbolChunker : IChunker
             return lineStart;
         }
 
-        private void Add(int start, int end, int[] ids)
+        private void Add(int start, int end, int[] ids, bool wireEligible = true)
         {
             int startLine = _lines.LineOf(start);
             int endLine = end > start ? _lines.LineOf(end - 1) : startLine; // a zero-length piece (see SliceTokens) has one line
-            _out.Add(new Chunk(path, startLine, endLine, ids) { StartOffset = start, EndOffset = end });
+            _out.Add(new Chunk(path, startLine, endLine, ids) { StartOffset = start, EndOffset = end, WireEligible = wireEligible });
         }
 
         private void Emit(int start, int end)
@@ -245,7 +245,7 @@ public sealed partial class SymbolChunker : IChunker
                 // Decode the whole prefix (not this slice alone), so replacement characters do not accumulate across slices.
                 int next = stop >= ids.Length ? end
                     : Math.Clamp(start + owner._tokenizer.Decode(ids.AsSpan(0, stop)).Length, offset, end);
-                Add(offset, next, slice);
+                Add(offset, next, slice, wireEligible: false); // a token slice: its text need not tokenise to its ids
                 offset = next;
             }
         }

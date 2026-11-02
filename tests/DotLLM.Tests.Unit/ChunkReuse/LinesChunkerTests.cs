@@ -6,11 +6,11 @@ using Xunit;
 namespace DotLLM.Tests.Unit.ChunkReuse;
 
 /// <summary>
-/// E4c: the text-first fixed-size chunker. The file text is cut first (at a line end when a whole line fits, otherwise at a
+/// <see cref="LinesChunker"/> (<c>lines-N</c>; E4c ran it as <c>fixed-text-512</c>, the same chunker): the text-first fixed-size chunker. The file text is cut first (at a line end when a whole line fits, otherwise at a
 /// character boundary that splits neither a surrogate pair — i.e. a multi-byte UTF-8 sequence — nor a CRLF), and each piece is
 /// tokenised alone, so a server that receives the piece as text reproduces exactly the ids the encoder used.
 /// </summary>
-public sealed class TextFirstFixedChunkerTests
+public sealed class LinesChunkerTests
 {
     private static int[] Raw(ITokenizer tokenizer, string text) => tokenizer.EncodeRaw(text);
 
@@ -37,18 +37,18 @@ public sealed class TextFirstFixedChunkerTests
     }
 
     [Fact]
-    public void Name_And_Limit()
+    public void LinesChunker_Name_IsLines512()
     {
-        var chunker = new TextFirstFixedChunker(new CharTokenizer());
-        Assert.Equal("fixed-text-512", chunker.Name);
+        var chunker = new LinesChunker(new CharTokenizer());
+        Assert.Equal("lines-512", chunker.Name);
         Assert.Equal(512, chunker.MaxChunkTokens);
-        Assert.Equal("fixed-text-64", new TextFirstFixedChunker(new CharTokenizer(), 64).Name);
+        Assert.Equal("lines-64", new LinesChunker(new CharTokenizer(), 64).Name);
     }
 
     [Fact]
     public void EmptyFile_NoChunks_ShortFile_OneChunk()
     {
-        var chunker = new TextFirstFixedChunker(new CharTokenizer(), 64);
+        var chunker = new LinesChunker(new CharTokenizer(), 64);
         Assert.Empty(chunker.Chunk(new SourceFile("e.cs", "")));
         IReadOnlyList<Chunk> one = chunker.Chunk(new SourceFile("s.cs", "int x;\nint y;"));
         Assert.Single(one);
@@ -62,16 +62,16 @@ public sealed class TextFirstFixedChunkerTests
         // 33 chars with line ends inside: with n = 33 the whole file is one chunk (not cut back to an inner line end).
         string text = "int a = 1;\nint b = 2;\nint c = 3;\n";
         Assert.Equal(33, text.Length);
-        var chunker = new TextFirstFixedChunker(new CharTokenizer(), 33);
+        var chunker = new LinesChunker(new CharTokenizer(), 33);
         Assert.Single(chunker.Chunk(new SourceFile("x.cs", text)));
-        IReadOnlyList<Chunk> two = new TextFirstFixedChunker(new CharTokenizer(), 32).Chunk(new SourceFile("x.cs", text));
+        IReadOnlyList<Chunk> two = new LinesChunker(new CharTokenizer(), 32).Chunk(new SourceFile("x.cs", text));
         Assert.Equal(new[] { 22, 33 }, two.Select(c => c.EndOffset));
     }
 
     [Fact]
     public void ARestOfNPlusOneTokens_IsCutAfterN()
     {
-        IReadOnlyList<Chunk> chunks = new TextFirstFixedChunker(new CharTokenizer(), 4).Chunk(new SourceFile("r.cs", "abcde"));
+        IReadOnlyList<Chunk> chunks = new LinesChunker(new CharTokenizer(), 4).Chunk(new SourceFile("r.cs", "abcde"));
         Assert.Equal(new[] { 4, 5 }, chunks.Select(c => c.EndOffset));
     }
 
@@ -81,7 +81,7 @@ public sealed class TextFirstFixedChunkerTests
         // A bare '\n' costs 3 tokens, '\n' + letter only 1: "aaa\n" (6 tokens) is longer in tokens than "aaa\nzb" (5).
         var tok = new NewlineCostTokenizer();
         var file = new SourceFile("n.cs", "aaa\nzbbbbbbb");
-        IReadOnlyList<Chunk> chunks = new TextFirstFixedChunker(tok, 5).Chunk(file);
+        IReadOnlyList<Chunk> chunks = new LinesChunker(tok, 5).Chunk(file);
         AssertCoversFile(file, chunks);
         Assert.All(chunks, c => Assert.InRange(c.TokenIds.Length, 1, 5));
         Assert.All(chunks, c => Assert.Equal(Raw(tok, file.Text[c.StartOffset..c.EndOffset]), c.TokenIds));
@@ -129,7 +129,7 @@ public sealed class TextFirstFixedChunkerTests
         var tok = new GluingTokenizer();
         var file = new SourceFile("f.cs", "namespace N;\n\npublic class C\n{\n" + Fields(30) + "    public int Sum() => field1 + field2;\n}\n");
 
-        IReadOnlyList<Chunk> chunks = new TextFirstFixedChunker(tok, n).Chunk(file);
+        IReadOnlyList<Chunk> chunks = new LinesChunker(tok, n).Chunk(file);
 
         Assert.True(chunks.Count > 1);
         AssertCoversFile(file, chunks);
@@ -149,7 +149,7 @@ public sealed class TextFirstFixedChunkerTests
         const int n = 64;
         var file = new SourceFile("g.cs", Fields(40));   // every line is 18-21 chars, so several fit in 64
 
-        IReadOnlyList<Chunk> chunks = new TextFirstFixedChunker(tok, n).Chunk(file);
+        IReadOnlyList<Chunk> chunks = new LinesChunker(tok, n).Chunk(file);
 
         AssertCoversFile(file, chunks);
         foreach (Chunk c in chunks.SkipLast(1))
@@ -166,7 +166,7 @@ public sealed class TextFirstFixedChunkerTests
         var tok = new CharTokenizer();
         // A 10-char line, then a 30-char line: with n = 20 the first piece is the first line (10 chars), not 20 chars.
         string text = "abcdefghi\n" + new string('x', 29) + "\n";
-        IReadOnlyList<Chunk> chunks = new TextFirstFixedChunker(tok, 20).Chunk(new SourceFile("p.cs", text));
+        IReadOnlyList<Chunk> chunks = new LinesChunker(tok, 20).Chunk(new SourceFile("p.cs", text));
 
         AssertCoversFile(new SourceFile("p.cs", text), chunks);
         Assert.Equal(10, chunks[0].EndOffset);
@@ -178,7 +178,7 @@ public sealed class TextFirstFixedChunkerTests
     {
         var tok = new CharTokenizer();
         string text = new string('y', 50) + "\nend\n";
-        IReadOnlyList<Chunk> chunks = new TextFirstFixedChunker(tok, 16).Chunk(new SourceFile("o.cs", text));
+        IReadOnlyList<Chunk> chunks = new LinesChunker(tok, 16).Chunk(new SourceFile("o.cs", text));
 
         AssertCoversFile(new SourceFile("o.cs", text), chunks);
         Assert.Equal(new[] { 16, 32, 48, 55 }, chunks.Select(c => c.EndOffset));   // the rest fits whole
@@ -196,7 +196,7 @@ public sealed class TextFirstFixedChunkerTests
         string text = "é€😀a😀€é\n" + string.Concat(Enumerable.Repeat("x😀é€", 6)) + "\nfin\n";
         var file = new SourceFile("u.cs", text);
 
-        IReadOnlyList<Chunk> chunks = new TextFirstFixedChunker(tok, n).Chunk(file);
+        IReadOnlyList<Chunk> chunks = new LinesChunker(tok, n).Chunk(file);
 
         AssertCoversFile(file, chunks);
         Assert.Equal(Encoding.UTF8.GetBytes(text), chunks.SelectMany(c => Encoding.UTF8.GetBytes(file.Text[c.StartOffset..c.EndOffset])).ToArray());
@@ -225,14 +225,14 @@ public sealed class TextFirstFixedChunkerTests
 
         foreach (int n in new[] { 16, 23, 30, 64 })
         {
-            IReadOnlyList<Chunk> chunks = new TextFirstFixedChunker(tok, n).Chunk(file);
+            IReadOnlyList<Chunk> chunks = new LinesChunker(tok, n).Chunk(file);
             AssertCoversFile(file, chunks);
             Assert.Contains(chunks, c => file.Text[c.StartOffset..c.EndOffset].Contains("\r\n", StringComparison.Ordinal));
             foreach (Chunk c in chunks.Skip(1)) Assert.NotEqual('\n', file.Text[c.StartOffset]);   // no cut between \r and \n
             Assert.All(chunks, c => Assert.InRange(c.TokenIds.Length, 1, n));
         }
         // A character cut that would fall between '\r' and '\n' backs off by one.
-        IReadOnlyList<Chunk> small = new TextFirstFixedChunker(tok, 5).Chunk(new SourceFile("c.cs", "aaaa\r\nb"));
+        IReadOnlyList<Chunk> small = new LinesChunker(tok, 5).Chunk(new SourceFile("c.cs", "aaaa\r\nb"));
         Assert.Equal(new[] { 4, 7 }, small.Select(c => c.EndOffset));
     }
 
@@ -240,8 +240,8 @@ public sealed class TextFirstFixedChunkerTests
     public void Deterministic()
     {
         var file = new SourceFile("d.cs", Fields(25) + "é€😀\n" + new string('q', 70) + "\n");
-        IReadOnlyList<Chunk> a = new TextFirstFixedChunker(new ByteTokenizer(), 32).Chunk(file);
-        IReadOnlyList<Chunk> b = new TextFirstFixedChunker(new ByteTokenizer(), 32).Chunk(file);
+        IReadOnlyList<Chunk> a = new LinesChunker(new ByteTokenizer(), 32).Chunk(file);
+        IReadOnlyList<Chunk> b = new LinesChunker(new ByteTokenizer(), 32).Chunk(file);
         Assert.Equal(a.Select(c => c.Id), b.Select(c => c.Id));
         Assert.Equal(a.SelectMany(c => c.TokenIds), b.SelectMany(c => c.TokenIds));
     }
@@ -250,7 +250,7 @@ public sealed class TextFirstFixedChunkerTests
     public void ACharacterLongerThanTheLimit_Throws()
     {
         // Under a byte tokenizer '😀' is 4 tokens; a 3-token limit cannot hold it without splitting it.
-        Assert.Throws<InvalidOperationException>(() => new TextFirstFixedChunker(new ByteTokenizer(), 3).Chunk(new SourceFile("t.cs", "ab😀")));
+        Assert.Throws<InvalidOperationException>(() => new LinesChunker(new ByteTokenizer(), 3).Chunk(new SourceFile("t.cs", "ab😀")));
     }
 
     [Fact]
@@ -263,7 +263,7 @@ public sealed class TextFirstFixedChunkerTests
         IReadOnlyList<Chunk> sliced = new FixedSizeChunker(tok, 4).Chunk(file);
         Assert.Contains(sliced, c => !Raw(tok, tok.Decode(c.TokenIds)).SequenceEqual(c.TokenIds));
 
-        IReadOnlyList<Chunk> textFirst = new TextFirstFixedChunker(tok, 4).Chunk(file);
+        IReadOnlyList<Chunk> textFirst = new LinesChunker(tok, 4).Chunk(file);
         Assert.All(textFirst, c => Assert.Equal(Raw(tok, tok.Decode(c.TokenIds)), c.TokenIds));
     }
 
@@ -272,7 +272,7 @@ public sealed class TextFirstFixedChunkerTests
     {
         var tok = new CharTokenizer();
         var files = new[] { new SourceFile("a.cs", Fields(10)), new SourceFile("b.cs", Fields(3)) };
-        var corpus = new Corpus(files, new TextFirstFixedChunker(tok, 64), tok);
+        var corpus = new Corpus(files, new LinesChunker(tok, 64), tok);
         var other = new Corpus(files, new FixedSizeChunker(tok, 64), tok);
         Assert.All(corpus.Chunks, c => Assert.Equal(Raw(tok, corpus.TextOf(c)), c.TokenIds));
         Assert.NotEqual(other.ChunkIdHash, corpus.ChunkIdHash);

@@ -5,7 +5,8 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// <summary>
 /// Fixed-size token chunks (the E1/E2 chunking, but per file and keeping the tail): the file is tokenised exactly once
 /// (<see cref="ITokenizer.EncodeRaw"/>, no BOS) and cut into consecutive slices of <see cref="MaxChunkTokens"/> ids; the last
-/// slice may be shorter. Chunk boundaries can fall mid-line, so two neighbouring chunks may share a line.
+/// slice may be shorter. Chunk boundaries can fall mid-line, so two neighbouring chunks may share a line. Lab-only: no chunk is
+/// <see cref="Chunk.WireEligible"/>.
 /// </summary>
 /// <remarks>
 /// Lines and character offsets come from decoding the ids before each boundary. For a byte-level BPE that round-trips
@@ -53,7 +54,8 @@ public sealed class FixedSizeChunker : IChunker
             // the last chunk end at the end of the text, so the chunks always tile the file (ChunkIndex's contract).
             bool last = start + MaxChunkTokens >= ids.Length;
             int endOffset = last ? file.Text.Length : Advance(file.Text, startOffset, text);
-            chunks.Add(new Chunk(file.Path, startLine, Math.Max(startLine, endLine), slice) { StartOffset = startOffset, EndOffset = endOffset });
+            // Id slices are never wire-eligible: a slice can end inside a multi-byte character or a BPE merge (E4c).
+            chunks.Add(new Chunk(file.Path, startLine, Math.Max(startLine, endLine), slice) { StartOffset = startOffset, EndOffset = endOffset, WireEligible = false });
             startOffset = endOffset;
             startLine += newlines;
         }

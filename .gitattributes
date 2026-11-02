@@ -1,2 +1,4 @@
 # Chat-template fixtures must stay byte-exact (LF) so reference renders match.
 tests/DotLLM.Tests.Unit/Tokenizers/ChatTemplates/Fixtures/* -text
+# chunk-cache wire contract fixtures (copied from ChunkedkvCache docs/contracts/chunk-cache-v1): byte-exact, checked against fixtures.sha256.
+tests/DotLLM.Tests.Unit/ChunkCache/Fixtures/** -text

@@ -6,13 +6,14 @@ namespace DotLLM.ChunkReuse.Store;
 /// <summary>How a chunk's boundaries were chosen.</summary>
 public enum ChunkKind
 {
-    /// <summary>Fixed-size token slices of the file (<see cref="FixedSizeChunker"/>); boundaries can fall mid-line.</summary>
+    /// <summary>Fixed-size chunks: token slices of the file (<see cref="FixedSizeChunker"/>) or text-first pieces
+    /// (<see cref="LinesChunker"/>); boundaries can fall mid-line.</summary>
     Fixed = 0,
 
     /// <summary>One member per chunk from the Roslyn syntax tree (<see cref="SymbolChunker"/>); whole lines.</summary>
     Symbol = 1,
 
-    /// <summary>Any other chunker (its name is neither <c>symbol-*</c> nor <c>fixed-*</c>).</summary>
+    /// <summary>Any other chunker (its name is not <c>symbol-*</c>, <c>fixed-*</c> or <c>lines-*</c>).</summary>
     Other = 2,
 }
 
@@ -53,6 +54,33 @@ public sealed record ChunkRef(string FilePath, int StartLine, int EndLine, int S
     /// <summary>The chunk's <see cref="ChunkKey.Hex"/>, or null when not known.</summary>
     public string? KeyHex { get; init; }
 
+    // Stored inverted so the default (eligible) is the field's default: equality and JSON both see one representation.
+    private readonly bool _notWireEligible;
+
+    /// <summary>
+    /// Whether the chunk may be sent on the wire as text (<see cref="Chunk.WireEligible"/>); default true. Serialised as
+    /// <c>wireEligible</c> only when false (see <see cref="WireEligibleJson"/>).
+    /// </summary>
+    [JsonIgnore]
+    public bool WireEligible
+    {
+        get => !_notWireEligible;
+        init => _notWireEligible = !value;
+    }
+
+    /// <summary>
+    /// JSON form of <see cref="WireEligible"/>: <c>false</c>, or null (omitted) when eligible. A nullable carrier because a
+    /// source-generated context drops initializers of <c>init</c> properties, so JSON without the field (written before
+    /// Phase I Task 5) must read as eligible through null. Use <see cref="WireEligible"/> in code.
+    /// </summary>
+    [JsonPropertyName("wireEligible")]
+    [System.ComponentModel.EditorBrowsable(System.ComponentModel.EditorBrowsableState.Never)]
+    public bool? WireEligibleJson
+    {
+        get => _notWireEligible ? false : null;
+        init => _notWireEligible = value == false;
+    }
+
     /// <summary>The key, when <see cref="KeyHex"/> is known.</summary>
     [JsonIgnore]
     public ChunkKey? Key => KeyHex is null ? null : new ChunkKey(KeyHex);
@@ -73,26 +101,28 @@ public sealed record ChunkRef(string FilePath, int StartLine, int EndLine, int S
         {
             TokenCount = chunk.TokenIds.Length,
             KeyHex = key?.Hex,
+            WireEligible = chunk.WireEligible,
         };
     }
 
     /// <summary>The kind of the chunks <paramref name="chunker"/> produces.</summary>
     /// <param name="chunker">A chunker.</param>
-    /// <returns><see cref="ChunkKind.Symbol"/> or <see cref="ChunkKind.Fixed"/> by name prefix, else <see cref="ChunkKind.Other"/>.</returns>
+    /// <returns>The kind by name prefix (see <see cref="KindOfName"/>).</returns>
     public static ChunkKind KindOf(IChunker chunker)
     {
         ArgumentNullException.ThrowIfNull(chunker);
         return KindOfName(chunker.Name);
     }
 
-    /// <summary>The kind for a chunker name (<c>symbol-*</c>, <c>fixed-*</c>, anything else is <see cref="ChunkKind.Other"/>).</summary>
+    /// <summary>The kind for a chunker name (<c>symbol-*</c>; <c>fixed-*</c> and <c>lines-*</c> are <see cref="ChunkKind.Fixed"/>;
+    /// anything else is <see cref="ChunkKind.Other"/>).</summary>
     /// <param name="chunkerName">Chunker name.</param>
     /// <returns>The kind.</returns>
     public static ChunkKind KindOfName(string chunkerName)
     {
         ArgumentNullException.ThrowIfNull(chunkerName);
         if (chunkerName.StartsWith("symbol-", StringComparison.Ordinal)) return ChunkKind.Symbol;
-        if (chunkerName.StartsWith("fixed-", StringComparison.Ordinal)) return ChunkKind.Fixed;
+        if (chunkerName.StartsWith("fixed-", StringComparison.Ordinal) || chunkerName.StartsWith("lines-", StringComparison.Ordinal)) return ChunkKind.Fixed;
         return ChunkKind.Other;
     }
 }

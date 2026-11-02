@@ -3,7 +3,9 @@ using DotLLM.Tokenizers;
 namespace DotLLM.ChunkReuse.CodeCorpus;
 
 /// <summary>
-/// Text-first fixed-size chunks (E4c; wire-eligible): the file <b>text</b> is cut into pieces of at most
+/// Text-first fixed-size chunks, <c>lines-N</c> (E4c ran this chunker as <c>fixed-text-512</c>; every chunk round-trips by
+/// construction, but <c>lines-512</c> is on the wire allow-list only from Phase I Task 19, see
+/// <see cref="WireChunking.PendingE4c"/>): the file <b>text</b> is cut into pieces of at most
 /// <see cref="MaxChunkTokens"/> tokens each, and every piece is tokenised alone (<see cref="ITokenizer.EncodeRaw"/>, no BOS).
 /// A server that receives a piece as text and tokenises it reproduces exactly the chunk's ids, which is not true of
 /// <see cref="FixedSizeChunker"/>'s id slices (BPE merges across a slice boundary, slices ending inside a multi-byte UTF-8
@@ -17,14 +19,14 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// sequence; BMP characters are whole <see cref="char"/>s) nor a "\r\n". When the rest of the file fits, it is the last chunk.
 /// Text is used as given (CRLF is kept); offsets and lines are exact.
 /// </remarks>
-public sealed class TextFirstFixedChunker : IChunker
+public sealed class LinesChunker : IChunker
 {
     private readonly ITokenizer _tokenizer;
 
     /// <summary>Creates the chunker.</summary>
     /// <param name="tokenizer">The model's tokenizer.</param>
     /// <param name="chunkTokens">Maximum tokens per chunk (default 512, as <see cref="FixedSizeChunker"/>).</param>
-    public TextFirstFixedChunker(ITokenizer tokenizer, int chunkTokens = 512)
+    public LinesChunker(ITokenizer tokenizer, int chunkTokens = 512)
     {
         ArgumentNullException.ThrowIfNull(tokenizer);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(chunkTokens);
@@ -33,7 +35,7 @@ public sealed class TextFirstFixedChunker : IChunker
     }
 
     /// <inheritdoc />
-    public string Name => $"fixed-text-{MaxChunkTokens}";
+    public string Name => $"lines-{MaxChunkTokens}";
 
     /// <inheritdoc />
     public int MaxChunkTokens { get; }

@@ -24,6 +24,14 @@ public sealed record Chunk(string FilePath, int StartLine, int EndLine, int[] To
     /// <summary>Character offset just past the chunk's last character (exclusive).</summary>
     public int EndOffset { get; init; }
 
+    /// <summary>
+    /// Whether the chunk may be sent on the wire as text: its text, tokenised alone, gives exactly <see cref="TokenIds"/> by
+    /// construction (default true). Token-id slices are not (<see cref="SymbolChunker"/>'s pieces of an over-long line, every
+    /// <see cref="FixedSizeChunker"/> chunk): a slice can end inside a multi-byte character or a BPE merge. Whether the
+    /// <i>chunker</i> is allowed on the wire is <see cref="WireChunking.IsWireChunker"/>.
+    /// </summary>
+    public bool WireEligible { get; init; } = true;
+
     /// <summary>Stable id within a chunked corpus: path, line range and start offset.</summary>
     public string Id => $"{FilePath}:{StartLine}-{EndLine}@{StartOffset}";
 }

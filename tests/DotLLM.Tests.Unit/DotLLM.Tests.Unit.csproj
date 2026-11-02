@@ -55,6 +55,8 @@
     <!-- #409: chat-template fixtures are read at runtime from the output dir. [CallerFilePath] is
          deterministic-path-mapped to "/_/..." in CI, so it cannot locate source files. -->
     <None Include="Tokenizers\ChatTemplates\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- chunk-cache wire contract v1 (ChunkedkvCache docs/contracts/chunk-cache-v1), checked against its fixtures.sha256. -->
+    <None Include="ChunkCache\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- #815: header-only dump (metadata + tensor tables) of the real Qwen3.8-Flash-Next GGUFs; the contract test reads it at runtime. -->
     <None Include="Models\Gguf\TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- #832: LittleBit spike fixture (generated offline from the paper equations). -->

@@ -26,8 +26,8 @@ namespace ChunkKvLab;
 ///               [--mode kept|unfiltered] [--kept &lt;validation.csv&gt;] [--plans-jsonl &lt;plans&gt;] [--contexts 0 (all)] [--budgets 5,10,15,20]
 ///               [--arms ...] [--light-arms a,b --light-budgets 5,20] [--window 16] [--shard 0/1] [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
 ///               [--context-kind random|related] [--related-fraction 0.5]
-///               (--chunker fixed-text: E4c text-first fixed chunks; --resume 1 continues &lt;out&gt;.partial by whole contexts)
-/// ChunkKvLab roundtrip --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --out &lt;csv&gt; [--chunkers fixed,symbol,fixed-text] [--chunk 512]
+///               (--chunker lines: E4c text-first fixed chunks, lines-512 (E4c ran it as fixed-text-512); --resume 1 continues &lt;out&gt;.partial by whole contexts)
+/// ChunkKvLab roundtrip --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --out &lt;csv&gt; [--chunkers fixed,symbol,lines] [--chunk 512]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
 /// ChunkKvLab store-probe --model &lt;gguf&gt; --corpus &lt;dir&gt; --store &lt;empty dir&gt; [--chunks 3] [--chunk 512]
 /// ChunkKvLab store-assembly --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --store &lt;empty dir&gt; --out &lt;csv&gt;
@@ -152,7 +152,7 @@ internal static class Program
             case "roundtrip":
                 // E4c, tokenizer only: text round trip of every chunk per chunker; text-first invariants on the real tokenizer.
                 return RoundTripCommand.Run(Get("model"), Get("corpus"), Get("name"), Int("chunk", 512), Get("out"),
-                    Get("chunkers", "fixed,symbol,fixed-text").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                    Get("chunkers", "fixed,symbol,lines").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
             case "graph-info":
                 return GraphRunner.Run(new GraphOptions(Get("model"), Get("corpus"), Get("chunker", "symbol"), Int("chunk", 512),
                     Int("repeat", 3), Int("plans", 100), Int("seed", 0), opts.GetValueOrDefault("expect-hash")));

@@ -134,8 +134,7 @@ internal static class Common
     public static string TextOf(SourceFile file, ChunkRef chunk) => file.Text[chunk.StartOffset..chunk.EndOffset];
 
     /// <summary>The wire hash of a chunk text: <c>sha256:</c> + hex of its UTF-8 bytes (integration spec §5.2).</summary>
-    public static string WireHash(string text) =>
-        "sha256:" + Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text)));
+    public static string WireHash(string text) => WireChunking.Hash(text);
 
     /// <summary>Bytes as a short human string.</summary>
     public static string Bytes(double bytes)

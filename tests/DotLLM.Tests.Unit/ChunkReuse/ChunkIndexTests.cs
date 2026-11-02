@@ -395,7 +395,7 @@ public sealed class ChunkIndexTests : IDisposable
         string producer = KeyA([]).Hex;
         string k1 = KeyA([1]).Hex, k2 = KeyA([2]).Hex, k3 = KeyA([3]).Hex, sha = new string('a', 64);
         string Chunk(int sl, int el, int so, int eo, int t, string k) =>
-            $$"""{"startLine":{{sl}},"endLine":{{el}},"startOffset":{{so}},"endOffset":{{eo}},"tokens":{{t}},"key":"{{k}}"}""";
+            $$"""{"startLine":{{sl}},"endLine":{{el}},"startOffset":{{so}},"endOffset":{{eo}},"tokens":{{t}},"key":"{{k}}","wireEligible":false}""";
         string c1 = defect switch
         {
             "line-zero" => Chunk(0, 1, 0, 10, 10, k1),

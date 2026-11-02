@@ -394,7 +394,7 @@ public sealed class ChunkIndex
             if (old is not null) file = file with { Path = old.Path };
 
             string hash = HashText(file.Text);
-            if (old is not null && sameChunker && old.TextHash == hash)
+            if (old is not null && sameChunker && old.TextHash == hash && !old.Legacy)
             {
                 plan.Add((path, old, old));
                 continue;
@@ -617,7 +617,8 @@ public sealed class ChunkIndex
                 Chunks = f.Chunks.Select(r => (ChunkDocument?)new ChunkDocument
                 {
                     StartLine = r.StartLine, EndLine = r.EndLine, StartOffset = r.StartOffset, EndOffset = r.EndOffset,
-                    Tokens = r.TokenCount ?? 0, Key = r.KeyHex!,
+                    // A legacy entry not yet re-chunked stays legacy on disk (so a later load still re-chunks it).
+                    Tokens = r.TokenCount ?? 0, Key = r.KeyHex!, WireEligible = f.Legacy ? null : r.WireEligible,
                 }).ToList(),
             }).ToList(),
         };
@@ -666,6 +667,9 @@ public sealed class ChunkIndex
     /// <item>A file entry whose chunks do not tile the file (offset 0 first, contiguous, non-negative lengths, ordered 1-based
     /// lines, non-negative token counts): only that file is dropped (it is re-chunked on the next <see cref="Update"/>) and
     /// the <see cref="LoadNote"/> names it.</item>
+    /// <item>A file entry written before Phase I Task 5 (chunks without <c>wireEligible</c>): whole-line <c>symbol-*</c> chunks
+    /// load as wire-eligible and the file is re-chunked on the next <see cref="Update"/> even if its text is unchanged (it was
+    /// tokenised before Task 5b); any other such entry (token slices, other chunkers) is dropped like a non-tiling one.</item>
     /// </list>
     /// I/O errors (access denied, device errors) propagate.
     /// </summary>
@@ -712,18 +716,28 @@ public sealed class ChunkIndex
                 dropped.Add($"'{norm}' ({tiling})");
                 continue;
             }
+            // Written before Phase I Task 5 (no wireEligible): whole-line symbol chunks are eligible; a file with token slices,
+            // or of another chunker, cannot be told apart from text-first pieces, so it is dropped and re-chunked. Such an entry
+            // was also tokenised before Task 5b (special-token spellings parsed), so the next update re-chunks it (Legacy).
+            bool legacy = f.Chunks!.Any(c => c!.WireEligible is null);
+            if (legacy && (kind != ChunkKind.Symbol || HasSharedLine(f.Chunks!)))
+            {
+                dropped.Add($"'{norm}' (written before wire eligibility was recorded, and not whole-line symbol chunks)");
+                continue;
+            }
             var chunks = f.Chunks!.Select(c => new ChunkRef(norm, c!.StartLine, c.EndLine, c.StartOffset, c.EndOffset, kind)
             {
                 TokenCount = c.Tokens,
                 KeyHex = c.Key,
+                WireEligible = c.WireEligible ?? true,
             }).ToList();
-            index._files[norm] = new FileEntry(norm, f.Sha256!, chunks);
+            index._files[norm] = new FileEntry(norm, f.Sha256!, chunks) { Legacy = legacy };
             foreach (ChunkRef r in chunks) index.AddRef(r.KeyHex!);
         }
         index.ChunkerName = doc.Chunker;
         if (dropped.Count > 0)
             index.LoadNote = $"dropped {dropped.Count} file entr{(dropped.Count == 1 ? "y" : "ies")} whose chunks do not tile the file "
-                + $"(re-chunked on the next update): {string.Join("; ", dropped)}";
+                + $"or predate wire eligibility (re-chunked on the next update): {string.Join("; ", dropped)}";
         return index;
     }
 
@@ -828,7 +842,22 @@ public sealed class ChunkIndex
 
     private static string HashText(string text) => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
 
-    private sealed record FileEntry(string Path, string TextHash, List<ChunkRef> Chunks);
+    /// <summary>Whether two neighbouring chunks share a line: token-id slices of one over-long line (whole-line chunks never do).</summary>
+    private static bool HasSharedLine(List<ChunkDocument?> chunks)
+    {
+        for (int i = 1; i < chunks.Count; i++)
+            if (chunks[i]!.StartLine == chunks[i - 1]!.EndLine) return true;
+        return false;
+    }
+
+    /// <param name="Path">Indexed path.</param>
+    /// <param name="TextHash">SHA-256 of the text the chunks were made from.</param>
+    /// <param name="Chunks">The chunks, in text order.</param>
+    private sealed record FileEntry(string Path, string TextHash, List<ChunkRef> Chunks)
+    {
+        /// <summary>Loaded from an index written before Phase I Task 5: re-chunked on the next update even if unchanged.</summary>
+        public bool Legacy { get; init; }
+    }
 
     internal sealed class IndexDocument
     {
@@ -853,6 +882,9 @@ public sealed class ChunkIndex
         public int EndOffset { get; set; }
         public int Tokens { get; set; }
         public string Key { get; set; } = "";
+
+        /// <summary>Null in index files written before Phase I Task 5 (see <see cref="Load"/>).</summary>
+        public bool? WireEligible { get; set; }
     }
 }
 

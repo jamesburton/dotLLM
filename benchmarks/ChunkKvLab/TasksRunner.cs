@@ -22,8 +22,8 @@ internal static class TasksRunner
     {
         "symbol" => new SymbolChunker(tokenizer, tokens),
         "fixed" => new FixedSizeChunker(tokenizer, tokens),
-        "fixed-text" => new TextFirstFixedChunker(tokenizer, tokens),
-        _ => throw new ArgumentException($"unknown chunker '{name}' (symbol|fixed|fixed-text)"),
+        "lines" => new LinesChunker(tokenizer, tokens),
+        _ => throw new ArgumentException($"unknown chunker '{name}' (symbol|fixed|lines)"),
     };
 
     /// <summary>Loads the corpus and prints its census (files, exclusions, chunks, tokens, hash, tokenizer round trip).</summary>

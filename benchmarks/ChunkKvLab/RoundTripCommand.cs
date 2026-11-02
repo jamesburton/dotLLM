@@ -7,7 +7,7 @@ namespace ChunkKvLab;
 /// <summary>
 /// E4c, tokenizer only (no weights run): how often a chunk fails the <b>text round trip</b> a wire server would do — its text,
 /// tokenised alone with <see cref="ITokenizer.EncodeRaw"/>, gives ids different from the chunk's. Per chunker (<c>fixed</c> id
-/// slices, <c>symbol</c>, <c>fixed-text</c>) and per chunk, two texts are checked: the decoded ids (what a client holding only
+/// slices, <c>symbol</c>, <c>lines</c>) and per chunk, two texts are checked: the decoded ids (what a client holding only
 /// the ids would send) and the chunk's character range of the file (what a text-first client sends). Also checks the
 /// text-first invariants on the real tokenizer (pieces concatenate to the file, every piece ≤ N, no lone surrogate) and prints
 /// each chunker's chunk-id hash (the <c>--expect-hash</c> values).
@@ -32,7 +32,7 @@ internal static class RoundTripCommand
             foreach (SourceFile f in corpus.Files)
             {
                 IReadOnlyList<Chunk> chunks = corpus.ChunksOf(f.Path);
-                if (chunker == "fixed-text")
+                if (chunker == "lines")
                 {
                     // Invariants on the real tokenizer.
                     if (!string.Equals(string.Concat(chunks.Select(corpus.TextOf)), f.Text, StringComparison.Ordinal)) { violations++; Console.WriteLine($"  VIOLATION concat {f.Path}"); }
