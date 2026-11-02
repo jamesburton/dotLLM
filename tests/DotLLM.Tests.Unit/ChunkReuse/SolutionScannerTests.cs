@@ -139,6 +139,19 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
     }
 
     [Fact]
+    public void CallResolution_ProjectCompilations_BindTheCallBclOnlyCannot()
+    {
+        ScanResult scan = _mini.Scan;
+        var authored = scan.AuthoredFiles.Select(f => f.Path).ToHashSet(StringComparer.Ordinal);
+        // One invocation in the authored files: Greeter.Greet(...) in App/Program.cs, declared in Lib/Greeter.cs.
+        Assert.Equal(new CallResolutionStats(1, 1, 1), CallResolution.Measure(scan.Compilations, authored));
+        Assert.Equal(new CallResolutionStats(1, 0, 0), CallResolution.Measure([ProjectCompilation.BclOnly(scan.AuthoredFiles)], authored));
+        // Restricted to Lib's file: no invocation; the declaring file must be among the measured ones to count as "to file".
+        Assert.Equal(new CallResolutionStats(0, 0, 0), CallResolution.Measure(scan.Compilations, new HashSet<string>(["Lib/Greeter.cs"], StringComparer.Ordinal)));
+        Assert.Equal(new CallResolutionStats(1, 1, 0), CallResolution.Measure(scan.Compilations, new HashSet<string>(["App/Program.cs"], StringComparer.Ordinal)));
+    }
+
+    [Fact]
     public void Graph_FromCompilations_RejectsAFileOwnedTwice()
     {
         ScanResult scan = _mini.Scan;
