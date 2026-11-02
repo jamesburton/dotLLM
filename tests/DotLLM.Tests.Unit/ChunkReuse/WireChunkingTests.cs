@@ -367,13 +367,23 @@ public sealed class WireChunkingTests : IDisposable
     [Fact]
     public void ChunkIndex_LegacyNonSymbolIndex_FilesDropped()
     {
+        // Dropped by chunker kind, not only for shared lines: both indexes hold one whole-file chunk (no line is shared).
         var file = new SourceFile("Calc.cs", Calc.ReplaceLineEndings("\n"));
-        string path = LegacyIndex(file, new FixedSizeChunker(new CharTokenizer(), 16), out _);
+        string path = LegacyIndex(file, new FixedSizeChunker(new CharTokenizer(), 4096), out ChunkIndex fixedIndex);
+        Assert.Single(fixedIndex.ChunksOf("Calc.cs"));
         ChunkIndex loaded = ChunkIndex.Load(path, Key);
         Assert.Empty(loaded.ChunksOf("Calc.cs"));
         Assert.Contains("Calc.cs", loaded.LoadNote, StringComparison.Ordinal);
 
-        string lines = LegacyIndex(file, new LinesChunker(new CharTokenizer(), 16), out _);
+        string lines = LegacyIndex(file, new LinesChunker(new CharTokenizer(), 4096), out ChunkIndex linesIndex);
+        Assert.Single(linesIndex.ChunksOf("Calc.cs"));
         Assert.Empty(ChunkIndex.Load(lines, Key).ChunksOf("Calc.cs"));
+
+        // Several whole-line chunks of a non-symbol chunker (cuts at line ends only) are dropped too.
+        string multi = LegacyIndex(file, new LinesChunker(new CharTokenizer(), 120), out ChunkIndex multiIndex);
+        IReadOnlyList<ChunkRef> refs = multiIndex.ChunksOf("Calc.cs");
+        Assert.True(refs.Count >= 2);
+        Assert.All(refs.Skip(1).Zip(refs), p => Assert.True(p.First.StartLine > p.Second.EndLine, "whole-line cuts"));
+        Assert.Empty(ChunkIndex.Load(multi, Key).ChunksOf("Calc.cs"));
     }
 }
