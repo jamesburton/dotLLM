@@ -724,6 +724,40 @@ precedence over the simple `PrefixCache` from Step 54. Both engine paths
   to make room is deferred to Step 59 (priority-based scheduling).
 - The trie walks linearly to find a node by block id during `Release`;
   good enough for typical depths (< 1024 blocks) but a future tweak.
+
+## Snapshot lineage: exact vs approximate rows (chunk-cache L7)
+
+Chunk-level KV reuse (#1542) will put **approximate** K/V into a sequence: rows assembled from
+position-independent chunk entries, or selectively recomputed. A prefix snapshot taken afterwards must
+never be restored by a request that did not ask for approximation, and must never be reported as
+`cached_tokens`. Both prefix stores carry the lineage; nothing in the engine creates approximate rows
+yet, so every existing caller sees unchanged behaviour (all rows exact, all defaults).
+
+- **Rule.** A snapshot is approximate from the first row whose K/V came from assembly or recompute;
+  every later row attended to it and is approximate too. Rows before it are exact.
+- **`PrefixCache` (Step 54).** `PrefixCacheEntry.FirstApproxRow` (`int?`, `null` = all exact).
+  `FindMatch(prompt)` and `FindMatch(prompt, allowApprox: false, out _)` cap the match at
+  `FirstApproxRow` (and pick the best entry by the capped length). `FindMatch(prompt, allowApprox: true,
+  out approxRowsReused)` restores the full match and reports the approximate rows separately.
+  `Store(tokens, cache, firstApproxRow)` sets the tag; on the live-reuse path it **replaces** the old tag,
+  so an exact recompute after an approximate snapshot is stored exact. A caller that restored approximate
+  rows passes the earlier of the restored entry's `FirstApproxRow` and its own first approximate row.
+- **`PrefixTrie` / `PrefixTrieManager` (Step 37).** Each node has `IsApprox`; a block holding any
+  approximate row is approximate (mid-block rows taint their block). Approximate nodes sit in the child
+  map under a salted key, so an exact and an approximate node for the same tokens coexist as siblings.
+  `Admit(prompt, maxSeqLen, allowApprox = false)`: an exact lookup never enters an approximate node; with
+  `allowApprox` the walk prefers the exact child and falls back to the approximate one.
+  `RecordCompletion(cache, tokens, firstApproxRow = null)` inserts blocks from the earlier of the first
+  approximate block restored at admission and `firstApproxRow / BlockSize` as approximate.
+  `RegisterNamedPrefix` pins exact paths only.
+- **Counting.** `PrefixAdmission.CachedTokens` (→ `cached_tokens` / `cache_n`) and `PrefixTrie.HitTokens`
+  count exact rows only. Approximate restored rows are `PrefixAdmission.ApproxRowsReused` (→
+  `chunk_cache.tokens.prefix_reused_approx`). Prefill starts at `PrefixAdmission.RestoredTokens`
+  (= `CachedTokens + ApproxRowsReused`; equal to `CachedTokens` without `allowApprox`).
+- **Limitations.** An approximate trie node is not upgraded in place when an exact recompute arrives;
+  the exact sibling is linked beside it and the approximate one ages out by LRU. Recurrent prefix
+  snapshots (`RecurrentPrefixSnapshotCache`) carry no tag: chunk reuse rejects recurrent and hybrid
+  models (`chunk_model_unsupported`).
 ### Bonsai-2 quality gate and recommended format (#973)
 
 RTX 3060 12 GB, Bonsai-2 27B PQ2_0, flash prefill (#962), v2 decode + fused quantized decode (#988).

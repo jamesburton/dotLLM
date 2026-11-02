@@ -82,10 +82,25 @@ public sealed class PrefixTrie
     /// <returns>Number of tokens covered by <paramref name="matchedBlocks"/>.
     /// Always a multiple of <see cref="BlockSize"/> (the trie reuses full blocks only).</returns>
     public int Lookup(ReadOnlySpan<int> promptTokens, List<int> matchedBlocks)
+        => Lookup(promptTokens, matchedBlocks, allowApprox: false, out _);
+
+    /// <summary>
+    /// Lineage-aware <see cref="Lookup(ReadOnlySpan{int}, List{int})"/>. An exact lookup
+    /// (<paramref name="allowApprox"/> false) never walks into an approximate block. With
+    /// <paramref name="allowApprox"/> the walk prefers the exact child at each step and falls back to an
+    /// approximate one; every block from the first approximate block on counts as approximate.
+    /// </summary>
+    /// <param name="promptTokens">Full prompt tokens for the new sequence.</param>
+    /// <param name="matchedBlocks">Receives the matched block IDs in order (refcounts bumped).</param>
+    /// <param name="allowApprox">Whether approximate blocks may be matched.</param>
+    /// <param name="exactTokens">Tokens covered by the blocks before the first approximate block
+    /// (equals the return value when no approximate block was matched). Only these count as hits.</param>
+    public int Lookup(ReadOnlySpan<int> promptTokens, List<int> matchedBlocks, bool allowApprox, out int exactTokens)
     {
         ArgumentNullException.ThrowIfNull(matchedBlocks);
         matchedBlocks.Clear();
         Interlocked.Increment(ref _lookups);
+        exactTokens = 0;
 
         if (promptTokens.Length < _blockSize)
         {
@@ -95,6 +110,7 @@ public sealed class PrefixTrie
 
         long ts = Stopwatch.GetTimestamp();
         int matched = 0;
+        int exact = -1;
         int cap = _maxPrefixDepth > 0 ? _maxPrefixDepth : int.MaxValue;
         int maxBlocks = Math.Min(promptTokens.Length / _blockSize, cap / _blockSize);
 
@@ -105,13 +121,16 @@ public sealed class PrefixTrie
             {
                 int offset = b * _blockSize;
                 ReadOnlySpan<int> chunk = promptTokens.Slice(offset, _blockSize);
-                long key = HashChunk(chunk);
 
-                if (!current.Children.TryGetValue(key, out var child) ||
-                    !child.MatchesTokens(chunk))
+                var child = FindChild(current, chunk, approx: false);
+                if (child is null && allowApprox)
                 {
-                    break;
+                    child = FindChild(current, chunk, approx: true);
+                    if (child is not null && exact < 0)
+                        exact = matched;
                 }
+                if (child is null)
+                    break;
 
                 _pool.AddRef(child.BlockId);
                 child.RefCount++;
@@ -122,7 +141,8 @@ public sealed class PrefixTrie
             }
         }
 
-        Interlocked.Add(ref _hitTokens, matched);
+        exactTokens = exact < 0 ? matched : exact;
+        Interlocked.Add(ref _hitTokens, exactTokens);
         Interlocked.Add(ref _missTokens, promptTokens.Length - matched);
         return matched;
     }
@@ -135,13 +155,24 @@ public sealed class PrefixTrie
     /// </summary>
     /// <remarks>
     /// The trie holds ONE reference per node (the "trie ref"). The owning
-    /// sequence holds its own additional reference acquired during <see cref="Lookup"/>
+    /// sequence holds its own additional reference acquired during <see cref="Lookup(ReadOnlySpan{int}, List{int})"/>
     /// (or implicitly during insertion of fresh blocks — the caller increments before
     /// calling). The trie's own reference is released only when the node is evicted.
     /// </remarks>
     public int Insert(ReadOnlySpan<int> fullTokens, int startTokenIndex, IReadOnlyList<int> newBlocks)
+        => Insert(fullTokens, startTokenIndex, newBlocks, firstApproxBlock: int.MaxValue);
+
+    /// <summary>
+    /// Lineage-aware <see cref="Insert(ReadOnlySpan{int}, int, IReadOnlyList{int})"/>: blocks at absolute
+    /// block index <paramref name="firstApproxBlock"/> and later are linked as approximate nodes, which
+    /// an exact <see cref="Lookup(ReadOnlySpan{int}, List{int}, bool, out int)"/> never matches. An
+    /// approximate node and an exact node for the same tokens coexist as siblings, so an exact recompute
+    /// after an approximate snapshot is cached exactly.
+    /// </summary>
+    public int Insert(ReadOnlySpan<int> fullTokens, int startTokenIndex, IReadOnlyList<int> newBlocks, int firstApproxBlock)
     {
         ArgumentNullException.ThrowIfNull(newBlocks);
+        ArgumentOutOfRangeException.ThrowIfNegative(firstApproxBlock);
         if (newBlocks.Count == 0) return 0;
         if (startTokenIndex < 0 || startTokenIndex > fullTokens.Length)
             throw new ArgumentOutOfRangeException(nameof(startTokenIndex));
@@ -163,8 +194,9 @@ public sealed class PrefixTrie
             {
                 int offset = b * _blockSize;
                 ReadOnlySpan<int> chunk = fullTokens.Slice(offset, _blockSize);
-                long key = HashChunk(chunk);
-                if (!current.Children.TryGetValue(key, out var child) || !child.MatchesTokens(chunk))
+                // The sequence may have restored approximate blocks: follow the same preference as Lookup.
+                var child = FindChild(current, chunk, approx: false) ?? FindChild(current, chunk, approx: true);
+                if (child is null)
                 {
                     // The caller is inserting blocks at a position whose prefix is not
                     // in the trie. The caller (PrefixTrieManager.RecordCompletion) only
@@ -184,10 +216,12 @@ public sealed class PrefixTrie
             {
                 int offset = startTokenIndex + b * _blockSize;
                 ReadOnlySpan<int> chunk = fullTokens.Slice(offset, _blockSize);
-                long key = HashChunk(chunk);
+                bool approx = prefixBlocks + b >= firstApproxBlock;
+                long key = ChildKey(chunk, approx);
                 int newBlockId = newBlocks[b];
 
-                if (current.Children.TryGetValue(key, out var existing) && existing.MatchesTokens(chunk))
+                if (current.Children.TryGetValue(key, out var existing) && existing.IsApprox == approx
+                    && existing.MatchesTokens(chunk))
                 {
                     // Already in trie — the caller's AddRef'd block is a duplicate.
                     // Release the caller's spare ref (we keep the existing trie node's
@@ -204,6 +238,7 @@ public sealed class PrefixTrie
                 {
                     LastTouchedTicks = ts,
                     RefCount = 0,
+                    IsApprox = approx,
                 };
                 node.SetTokens(chunk);
                 current.Children[key] = node;
@@ -216,7 +251,7 @@ public sealed class PrefixTrie
     }
 
     /// <summary>
-    /// Releases the reference acquired during <see cref="Lookup"/> for each block in
+    /// Releases the reference acquired during <see cref="Lookup(ReadOnlySpan{int}, List{int})"/> for each block in
     /// <paramref name="blockIds"/>. After release the caller must not touch those blocks.
     /// </summary>
     public void Release(IReadOnlyList<int> blockIds)
@@ -321,8 +356,9 @@ public sealed class PrefixTrie
             {
                 int offset = b * _blockSize;
                 ReadOnlySpan<int> chunk = tokens.Slice(offset, _blockSize);
-                long key = HashChunk(chunk);
-                if (!current.Children.TryGetValue(key, out var child) || !child.MatchesTokens(chunk))
+                // Named prefixes pin exact paths only.
+                var child = FindChild(current, chunk, approx: false);
+                if (child is null)
                     break;
                 current = child;
                 matched += _blockSize;
@@ -433,6 +469,21 @@ public sealed class PrefixTrie
     }
 
     /// <summary>
+    /// Salt that separates approximate children from exact ones in the child map, so both can exist
+    /// for the same tokens. The node's <see cref="PrefixTrieNode.IsApprox"/> flag is checked as well.
+    /// </summary>
+    private const long ApproxKeySalt = unchecked((long)0x9E3779B97F4A7C15UL);
+
+    private static long ChildKey(ReadOnlySpan<int> chunk, bool approx)
+        => approx ? HashChunk(chunk) ^ ApproxKeySalt : HashChunk(chunk);
+
+    private static PrefixTrieNode? FindChild(PrefixTrieNode parent, ReadOnlySpan<int> chunk, bool approx)
+        => parent.Children.TryGetValue(ChildKey(chunk, approx), out var child)
+           && child.IsApprox == approx && child.MatchesTokens(chunk)
+            ? child
+            : null;
+
+    /// <summary>
     /// FNV-1a 64-bit hash over a token block. The trie also stores the full token
     /// sequence per node so hash collisions are correctness-safe; the hash is purely
     /// a child-dictionary lookup key.
@@ -467,6 +518,9 @@ internal sealed class PrefixTrieNode
     /// <summary>External references (sequences) using this node's block.</summary>
     public int RefCount { get; set; }
     public long LastTouchedTicks { get; set; }
+
+    /// <summary>Snapshot lineage: the block's K/V is approximate (reuse / recompute, or computed after such a block).</summary>
+    public bool IsApprox { get; init; }
 
     private int[]? _tokens;
 

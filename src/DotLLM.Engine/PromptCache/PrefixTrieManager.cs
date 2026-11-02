@@ -75,7 +75,10 @@ public sealed class PrefixTrieManager : IDisposable
     /// </summary>
     /// <param name="promptTokens">Full prompt tokens.</param>
     /// <param name="maxSeqLen">Max sequence length to dimension the staging buffer.</param>
-    public PrefixAdmission Admit(ReadOnlySpan<int> promptTokens, int maxSeqLen)
+    /// <param name="allowApprox">Whether the request accepts approximate K/V (a request that applies chunk
+    /// reuse). Without it the seeded prefix stops at the first approximate block, so exact and plain
+    /// requests never restore approximate rows.</param>
+    public PrefixAdmission Admit(ReadOnlySpan<int> promptTokens, int maxSeqLen, bool allowApprox = false)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -88,28 +91,31 @@ public sealed class PrefixTrieManager : IDisposable
         }
 
         var matched = new List<int>(promptTokens.Length / _trie.BlockSize);
-        int cachedTokens = TryLookupWithRetry(promptTokens, matched, maxSeqLen);
+        int restoredTokens = TryLookupWithRetry(promptTokens, matched, maxSeqLen, allowApprox, out int exactTokens);
 
-        if (cachedTokens > 0)
+        if (restoredTokens > 0)
         {
-            cache.SeedSharedPrefix(matched, cachedTokens);
+            cache.SeedSharedPrefix(matched, restoredTokens);
             lock (_acquiredLock)
             {
-                _acquired[cache] = new AcquiredPrefix(matched);
+                _acquired[cache] = new AcquiredPrefix(matched, firstApproxBlock: exactTokens < restoredTokens
+                    ? exactTokens / _trie.BlockSize
+                    : int.MaxValue);
             }
-            Interlocked.Increment(ref _hits);
-        }
-        else
-        {
-            Interlocked.Increment(ref _misses);
         }
 
-        return new PrefixAdmission(cache, cachedTokens);
+        if (exactTokens > 0)
+            Interlocked.Increment(ref _hits);
+        else
+            Interlocked.Increment(ref _misses);
+
+        return new PrefixAdmission(cache, exactTokens, restoredTokens - exactTokens);
     }
 
-    private int TryLookupWithRetry(ReadOnlySpan<int> promptTokens, List<int> matched, int maxSeqLen)
+    private int TryLookupWithRetry(ReadOnlySpan<int> promptTokens, List<int> matched, int maxSeqLen,
+        bool allowApprox, out int exactTokens)
     {
-        int cachedTokens = _trie.Lookup(promptTokens, matched);
+        int cachedTokens = _trie.Lookup(promptTokens, matched, allowApprox, out exactTokens);
         int blockSize = _trie.BlockSize;
         // Cap seeded tokens to whole blocks the cache can hold.
         int maxSeededTokens = (maxSeqLen / blockSize) * blockSize;
@@ -120,6 +126,7 @@ public sealed class PrefixTrieManager : IDisposable
             _trie.Release(surplus);
             matched.RemoveRange(desiredBlocks, matched.Count - desiredBlocks);
             cachedTokens = matched.Count * blockSize;
+            exactTokens = Math.Min(exactTokens, cachedTokens);
         }
         return cachedTokens;
     }
@@ -131,8 +138,15 @@ public sealed class PrefixTrieManager : IDisposable
     /// <param name="cache">The cache returned by <see cref="Admit"/>.</param>
     /// <param name="fullTokens">All tokens covered by <paramref name="cache"/>
     /// (prompt + generated). Used as the trie key for inserts.</param>
-    public void RecordCompletion(PagedKvCache cache, ReadOnlySpan<int> fullTokens)
+    /// <param name="firstApproxRow">The first row this sequence wrote with approximate K/V (chunk assembly
+    /// or recompute), or <c>null</c> when it computed every row exactly. Approximate blocks restored at
+    /// admission are tracked here already: every block from the earlier of the two is inserted as
+    /// approximate (a block holding any approximate row is approximate).</param>
+    public void RecordCompletion(PagedKvCache cache, ReadOnlySpan<int> fullTokens, int? firstApproxRow = null)
     {
+        if (firstApproxRow is < 0)
+            throw new ArgumentOutOfRangeException(nameof(firstApproxRow));
+
         ArgumentNullException.ThrowIfNull(cache);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -163,7 +177,10 @@ public sealed class PrefixTrieManager : IDisposable
             var freshBlocks = allBlocks.GetRange(allBlocks.Count - suffixBlocks, suffixBlocks);
             for (int i = 0; i < freshBlocks.Count; i++)
                 _trie.Pool.AddRef(freshBlocks[i]);
-            _trie.Insert(fullTokens, suffixStart, freshBlocks);
+            int firstApproxBlock = Math.Min(
+                acquired?.FirstApproxBlock ?? int.MaxValue,
+                firstApproxRow is int row ? row / blockSize : int.MaxValue);
+            _trie.Insert(fullTokens, suffixStart, freshBlocks, firstApproxBlock);
         }
 
         // The cache's upcoming Dispose() will release the pool refs that Admit
@@ -235,7 +252,15 @@ public sealed class PrefixTrieManager : IDisposable
     private sealed class AcquiredPrefix
     {
         public List<int> Blocks { get; }
-        public AcquiredPrefix(List<int> blocks) => Blocks = blocks;
+
+        /// <summary>Index of the first approximate block among <see cref="Blocks"/>; <c>int.MaxValue</c> if none.</summary>
+        public int FirstApproxBlock { get; }
+
+        public AcquiredPrefix(List<int> blocks, int firstApproxBlock)
+        {
+            Blocks = blocks;
+            FirstApproxBlock = firstApproxBlock;
+        }
     }
 }
 
@@ -245,13 +270,24 @@ public sealed class PrefixAdmission
     /// <summary>The newly-minted paged KV-cache, seeded with prefix blocks where possible.</summary>
     public PagedKvCache Cache { get; }
 
-    /// <summary>Number of prompt tokens that are already covered by trie-shared blocks.</summary>
+    /// <summary>
+    /// Number of prompt tokens already covered by <b>exact</b> trie-shared blocks: the value reported as
+    /// <c>cached_tokens</c> / <c>cache_n</c>. Equals <see cref="RestoredTokens"/> unless the admission
+    /// allowed approximate blocks.
+    /// </summary>
     public int CachedTokens { get; }
 
-    internal PrefixAdmission(PagedKvCache cache, int cachedTokens)
+    /// <summary>Approximate rows restored after the exact ones (only with <c>allowApprox</c>; otherwise 0).</summary>
+    public int ApproxRowsReused { get; }
+
+    /// <summary>All rows seeded into <see cref="Cache"/>: prefill starts here.</summary>
+    public int RestoredTokens => CachedTokens + ApproxRowsReused;
+
+    internal PrefixAdmission(PagedKvCache cache, int cachedTokens, int approxRowsReused = 0)
     {
         Cache = cache;
         CachedTokens = cachedTokens;
+        ApproxRowsReused = approxRowsReused;
     }
 }
 
