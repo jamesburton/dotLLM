@@ -216,7 +216,8 @@ internal static class RecomputeCommand
                     // ending at the cache length: the ordinary flash/coopmat attention) and one row earlier [L-k-1, L-1) (inside the cache:
                     // the per-query-position attention). Same forward shape and matmul regime; only the attention kernel differs.
                     {
-                        int k = (int)Math.Round(L * o.Budgets.Max() / 100.0, MidpointRounding.AwayFromZero);
+                        // One forward each (capped by --max-rows), or the "ordinary" arm would be split into an inside-the-cache batch plus a tail.
+                        int k = Math.Min((int)Math.Round(L * o.Budgets.Max() / 100.0, MidpointRounding.AwayFromZero), maxRows);
                         foreach ((string arm, int first) in new[] { ("tail_ordinary", L - k), ("tail_qpos", L - k - 1) })
                             for (int rep = 0; rep < o.Repeats; rep++)
                             {
