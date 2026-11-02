@@ -625,6 +625,42 @@ public sealed class PipelineTests
         }
     }
 
+    /// <summary>
+    /// A registered text found inside a longer serialised part (a bridge that joined two texts, or glue in front) is
+    /// annotated at its offset; a span ending inside a surrogate pair is dropped.
+    /// </summary>
+    [Fact]
+    public async Task JoinedPart_SpanLocatedInside()
+    {
+        string text = "😀 chunk text that is long enough to be a real chunk of a file\n";
+        string joined = "glue header é\n" + text;
+        var whole = new ChunkSpan("whole", ChunkHash.Of(text));
+        var halfPair = new ChunkSpan("half", ChunkHash.Of(text[..1]), 0, 1);
+        byte[] input = Pipeline.StringBody(("user", "q"), ("tool", joined));
+
+        (byte[] sent, ChunkManifestScope scope, _) = await SendAsync(input, [new ChunkPart(text, [halfPair, whole])]);
+
+        JsonNode chunk = Assert.Single(JsonNode.Parse(Pipeline.SplicedManifest(input, sent))!["chunks"]!.AsArray())!;
+        Assert.Equal("whole", (string)chunk["id"]!);
+        Assert.Equal(Encoding.UTF8.GetByteCount("glue header é\n"), (int)chunk["at"]!["start"]!);
+        Assert.Equal(Encoding.UTF8.GetByteCount(joined), (int)chunk["at"]!["end"]!);
+        Assert.Equal(1, scope.Outcome!.Invalid);
+    }
+
+    /// <summary>Scopes nest: disposing restores the enclosing one.</summary>
+    [Fact]
+    public void Scope_NestsAndRestores()
+    {
+        Assert.Null(ChunkManifestScope.Current);
+        ChunkManifestScope outer = ChunkManifestScope.Begin([], new ChunkRequestOptions());
+        ChunkManifestScope inner = ChunkManifestScope.Begin([], new ChunkRequestOptions(Policy: "shadow"));
+        Assert.Same(inner, ChunkManifestScope.Current);
+        inner.Dispose();
+        Assert.Same(outer, ChunkManifestScope.Current);
+        outer.Dispose();
+        Assert.Null(ChunkManifestScope.Current);
+    }
+
     /// <summary>A request without a scope (no decorator above) is never parsed or changed.</summary>
     [Fact]
     public async Task NoScope_Untouched()

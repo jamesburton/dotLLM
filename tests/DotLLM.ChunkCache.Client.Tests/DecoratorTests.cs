@@ -306,6 +306,62 @@ public sealed class DecoratorTests
         Assert.Equal(3, probe.Calls);
     }
 
+    /// <summary>
+    /// Streaming: the scope is visible to the inner client on every step, not only the first (an async iterator resumes
+    /// on its caller's context, where the AsyncLocal is not set), and a report that arrives after the last update is
+    /// carried on one extra, content-free update.
+    /// </summary>
+    [Fact]
+    public async Task Streaming_ScopeOnEveryStep_LateReportCarried()
+    {
+        string text = new('s', 80);
+        var registry = new ChunkSpanRegistry();
+        registry.Register(text, [new ChunkSpan("s", ChunkHash.Of(text))]);
+        var inner = new SteppingClient();
+        using var client = new ChunkAnnotatingChatClient(inner, registry, ExactPolicy.Instance);
+
+        var updates = new List<ChatResponseUpdate>();
+        await foreach (ChatResponseUpdate u in client.GetStreamingResponseAsync([new ChatMessage(ChatRole.Tool, [new FunctionResultContent("c", text)])]))
+            updates.Add(u);
+
+        Assert.Equal(3, inner.ScopesSeen.Count);
+        Assert.All(inner.ScopesSeen, Assert.NotNull);
+        Assert.Equal(4, updates.Count);
+        Assert.True(ChunkCacheReport.TryGet(updates[^1], out JsonObject? report));
+        Assert.Equal(1, (int)report!["v"]!);
+        Assert.Equal("r1", updates[^1].ResponseId);
+        Assert.Empty(updates[^1].Contents);
+        Assert.Equal("abc", updates.ToChatResponse().Text);
+    }
+
+    /// <summary>An inner streaming client that records the scope on each step and sets the report after its last update.</summary>
+    private sealed class SteppingClient : IChatClient
+    {
+        public List<ChunkManifestScope?> ScopesSeen { get; } = [];
+
+        public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            foreach (string piece in new[] { "a", "b", "c" })
+            {
+                await Task.Yield();
+                ScopesSeen.Add(ChunkManifestScope.Current);
+                yield return new ChatResponseUpdate(ChatRole.Assistant, piece) { ResponseId = "r1", MessageId = "m1" };
+            }
+
+            ChunkManifestScope.Current?.SetReport(new JsonObject { ["v"] = 1 });
+        }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose()
+        {
+        }
+    }
+
     private sealed class FixedPolicy(ChunkRequestOptions options) : IRecomputePolicy
     {
         public ChunkRequestContext? Seen { get; private set; }

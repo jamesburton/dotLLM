@@ -413,8 +413,9 @@ public sealed class ChunkCacheBodyHandler : DelegatingHandler
                 {
                     int s16 = offset + span.Start;
                     int e16 = offset + (span.End ?? candidate.Text.Length);
-                    if (span.Start < 0 || s16 >= e16 || e16 > part.Text.Length || SplitsPair(part.Text, s16) || SplitsPair(part.Text, e16)
-                        || HasLoneSurrogate(part.Text.AsSpan(s16, e16 - s16)))
+                    // A boundary inside a surrogate pair leaves half a pair in the span text: the lone-surrogate check
+                    // catches both ends.
+                    if (span.Start < 0 || s16 >= e16 || e16 > part.Text.Length || HasLoneSurrogate(part.Text.AsSpan(s16, e16 - s16)))
                     {
                         plan._invalid++;
                         continue;
@@ -545,9 +546,6 @@ public sealed class ChunkCacheBodyHandler : DelegatingHandler
             if (char.IsHighSurrogate(id[n - 1])) n--; // never split a surrogate pair
             return id[..n];
         }
-
-        private static bool SplitsPair(string text, int index) =>
-            index > 0 && index < text.Length && char.IsHighSurrogate(text[index - 1]) && char.IsLowSurrogate(text[index]);
 
         private static bool HasLoneSurrogate(ReadOnlySpan<char> text)
         {
