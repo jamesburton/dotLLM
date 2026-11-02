@@ -653,4 +653,29 @@ public sealed class ContextSelectorTests
         Assert.Equal(Ids(fx.With("int Twice(")), Ids(ContextSelector.Select(request with { MaxNeighboursPerHop = 0 }, fx.Files, fx.Graph)));
         Assert.Throws<ArgumentOutOfRangeException>(() => ContextSelector.Select(request with { MaxNeighboursPerHop = -1 }, fx.Files, fx.Graph));
     }
+
+    [Fact]
+    public void Select_MaxNeighboursPerHop_KeepsTheHeaviest_AndDroppedNeighboursNeverReturn()
+    {
+        // S.Seed uses A once and B twice (hop 1: B is heavier, though A sorts first by path). B uses A three times and C once,
+        // so A would come back at hop 2 as the heaviest neighbour if a dropped neighbour could return.
+        (string Path, string Text)[] repo =
+        [
+            ("s/S.cs", "namespace N;\n\npublic static class S\n{\n    public static int Seed() => A.Fa() + B.Fb() + B.Fb();\n}\n"),
+            ("a/A.cs", "namespace N;\n\npublic static class A\n{\n    public static int Fa() => 1;\n}\n"),
+            ("b/B.cs", "namespace N;\n\npublic static class B\n{\n    public static int Fb() => A.Fa() + A.Fa() + A.Fa() + C.Fc();\n}\n"),
+            ("c/C.cs", "namespace N;\n\npublic static class C\n{\n    public static int Fc() => 2;\n}\n"),
+        ];
+        var tok = new CharTokenizer();
+        SourceFile[] files = repo.Select(f => new SourceFile(f.Path, f.Text)).ToArray();
+        Chunk[] chunks = files.SelectMany(new SymbolChunker(tok, 4096).Chunk).ToArray();
+        ReferenceGraph graph = new RoslynGraphBuilder(tok).Build(files, chunks);
+        var request = new SelectionRequest { Symbol = "S.Seed", Hops = 2 };
+        Assert.Equal(["a/A.cs", "b/B.cs", "c/C.cs", "s/S.cs"], Files(ContextSelector.Select(request, files, graph)));
+
+        SelectionResult capped = ContextSelector.Select(request with { MaxNeighboursPerHop = 1 }, files, graph);
+        Assert.Equal(["b/B.cs", "c/C.cs", "s/S.cs"], Files(capped));
+        Assert.Equal("b/B.cs", capped.Single(c => c.Hop == 1).Chunk.FilePath);
+        Assert.Equal("c/C.cs", capped.Single(c => c.Hop == 2).Chunk.FilePath);
+    }
 }
