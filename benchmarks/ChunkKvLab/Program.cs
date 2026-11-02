@@ -17,7 +17,7 @@ namespace ChunkKvLab;
 ///               [--expect-hash &lt;sha256&gt;]
 /// ChunkKvLab scan-info --model &lt;gguf&gt; --solution &lt;sln|slnx|csproj&gt; [--chunker symbol|fixed] [--chunk 512] [--configuration Debug|Release]
 /// ChunkKvLab select --model &lt;gguf&gt; --solution &lt;sln|slnx|csproj&gt; [--symbol X --hops 1] [--paths a,b] [--exclude a,b] [--since &lt;git ref&gt;]
-///               [--budget tokens] [--configuration Release] [--chunker symbol|fixed] [--chunk 512] [--show 15]
+///               [--since-merge-base 0|1] [--max-per-hop n] [--budget tokens] [--configuration Release] [--chunker symbol|fixed] [--chunk 512] [--show 15]
 /// ChunkKvLab e3 --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --out-dir &lt;dir&gt; [--chunker symbol|fixed] [--chunk 512]
 ///               [--seed 0] [--count 100] [--context 2048] [--contexts 0 (all)] [--kept &lt;validation.csv&gt; --plans-jsonl &lt;plans&gt;]
 ///               [--query 1] [--raw 0] [--draws 20] [--max-minutes 0] [--chunk-cache-tokens 40000] [--expect-hash &lt;sha256&gt;]
@@ -115,12 +115,15 @@ internal static class Program
             case "select":
             {
                 // Phase S Task 6 (tokenizer only): ContextSelector on a scanned solution.
-                string[] List(string key) => Get(key, "=").TrimStart('=').Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                // Comma-separated list; an absent option is an empty list.
+                string[] List(string key) =>
+                    opts.TryGetValue(key, out string? v) ? v.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) : [];
                 var request = new DotLLM.ChunkReuse.Tooling.SelectionRequest
                 {
                     Paths = List("paths"), Exclude = List("exclude"), Symbol = opts.GetValueOrDefault("symbol"), Hops = Int("hops", 1),
-                    ChangedSince = opts.GetValueOrDefault("since"),
+                    ChangedSince = opts.GetValueOrDefault("since"), ChangedSinceMergeBase = Int("since-merge-base", 0) != 0,
                     TokenBudget = opts.TryGetValue("budget", out string? budget) ? int.Parse(budget, CultureInfo.InvariantCulture) : null,
+                    MaxNeighboursPerHop = opts.TryGetValue("max-per-hop", out string? cap) ? int.Parse(cap, CultureInfo.InvariantCulture) : null,
                 };
                 return SelectCommand.Run(Get("model"), Get("solution"), Get("configuration", "Release"), Get("chunker", "symbol"), Int("chunk", 512),
                     request, Int("show", 15));

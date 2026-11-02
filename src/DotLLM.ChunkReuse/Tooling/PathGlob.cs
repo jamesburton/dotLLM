@@ -88,12 +88,17 @@ public sealed class PathGlob
         return new PathGlob(string.Join('/', segments), negated, new Regex(sb.ToString(), options));
     }
 
-    /// <summary>True when <paramref name="path"/> (relative; '\' accepted) matches. A path outside the root never matches.</summary>
+    /// <summary>
+    /// True when <paramref name="path"/> (relative; '\' accepted; <c>.</c> and empty segments dropped, as in patterns)
+    /// matches. A path outside the root never matches.
+    /// </summary>
     public bool IsMatch(string path)
     {
         ArgumentNullException.ThrowIfNull(path);
         string p = path.Replace('\\', '/');
         if (IsOutsideRoot(p)) return false;
+        if (p.Contains("//", StringComparison.Ordinal) || p.StartsWith("./", StringComparison.Ordinal) || p.Contains("/./", StringComparison.Ordinal))
+            p = string.Join('/', p.Split('/', StringSplitOptions.RemoveEmptyEntries).Where(s => s != "."));
         return _regex.IsMatch(p);
     }
 

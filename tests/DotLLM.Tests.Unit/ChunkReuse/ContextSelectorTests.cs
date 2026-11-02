@@ -63,9 +63,12 @@ public sealed class ContextSelectorTests
     {
         public List<string> Refs { get; } = [];
 
-        public IReadOnlyList<string> ChangedFiles(string gitRef)
+        public List<bool> MergeBase { get; } = [];
+
+        public IReadOnlyList<string> ChangedFiles(string gitRef, bool sinceMergeBase = false)
         {
             Refs.Add(gitRef);
+            MergeBase.Add(sinceMergeBase);
             return changed;
         }
     }
@@ -137,6 +140,11 @@ public sealed class ContextSelectorTests
     [InlineData("x/?.cs", "x/ab.cs", false)]
     [InlineData("x?y.cs", "x/y.cs", false)]
     [InlineData("src/x.cs", "src\\x.cs", true)]
+    [InlineData("src/x.cs", "./src/x.cs", true)]
+    [InlineData("src/x.cs", ".\\src\\.\\x.cs", true)]
+    [InlineData("[ab].cs", "{a,b}.cs", false)]
+    [InlineData("{a,b}.cs", "{a,b}.cs", true)]
+    [InlineData("{a,b}.cs", "a.cs", false)]
     public void PathGlob_Matches(string pattern, string path, bool expected) => Assert.Equal(expected, PathGlob.Parse(pattern).IsMatch(path));
 
     [Theory]
@@ -508,117 +516,141 @@ public sealed class ContextSelectorTests
         Assert.Equal(Ids(doc.OrderBy(c => c.Chunk.FilePath, StringComparer.Ordinal).ThenBy(c => c.Chunk.StartOffset)), Ids(doc));
         Assert.NotEqual(Ids(r), Ids(doc));
     }
-}
 
-/// <summary><see cref="GitCliInfo"/> against real temporary git repositories (needs <c>git</c> on PATH).</summary>
-public sealed class GitCliInfoTests : IDisposable
-{
-    private readonly string _dir = Path.Combine(Path.GetTempPath(), "gitcli-" + Guid.NewGuid().ToString("N"));
-    private readonly string _repo;
-
-    public GitCliInfoTests()
-    {
-        _repo = Path.Combine(_dir, "repo");
-        Directory.CreateDirectory(Path.Combine(_repo, "src", "sub"));
-        Git("init", "-q");
-        Write("src/a.cs", "class A { }\n");
-        Write("src/keep.cs", "class K { }\n");
-        Write("src/sub/sp ace ü.cs", "class U { }\n");
-        Write(".gitignore", "*.ignored.cs\n");
-        Git("add", "-A");
-        Git("commit", "-q", "-m", "one");
-        Git("tag", "v1");
-    }
-
-    public void Dispose()
-    {
-        if (!Directory.Exists(_dir)) return;
-        foreach (string f in Directory.EnumerateFiles(_dir, "*", SearchOption.AllDirectories)) File.SetAttributes(f, FileAttributes.Normal);
-        Directory.Delete(_dir, recursive: true);
-    }
-
-    private void Write(string rel, string text) => File.WriteAllText(Path.Combine(_repo, rel), text);
-
-    private void Git(params string[] args)
-    {
-        var psi = new ProcessStartInfo("git") { WorkingDirectory = _repo, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
-        foreach (string a in new[] { "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false" })
-            psi.ArgumentList.Add(a);
-        foreach (string a in args) psi.ArgumentList.Add(a);
-        using Process p = Process.Start(psi)!;
-        string err = p.StandardError.ReadToEnd();
-        p.StandardOutput.ReadToEnd();
-        p.WaitForExit();
-        Assert.True(p.ExitCode == 0, $"git {string.Join(' ', args)}: {err}");
-    }
-
-    private string Abs(string rel) => Path.GetFullPath(Path.Combine(_repo, rel));
+    // -------------------------------------------------------------------------------------------------------------
+    // Fix round (review-task6-report.md)
+    // -------------------------------------------------------------------------------------------------------------
 
     [Fact]
-    public void ChangedFiles_ModifiedAndUntracked_AsAbsolutePaths_IgnoredLeftOut()
+    public void Select_Exclude_AppliesToPathsAndChangedFiles_AndReportsExcludedChangedFiles()
     {
-        Write("src/a.cs", "class A { int x; }\n");
-        Write("src/sub/sp ace ü.cs", "class U { int y; }\n");
-        Write("src/new.cs", "class N { }\n");
-        Write("src/x.ignored.cs", "class I { }\n");
-        var git = new GitCliInfo(_repo);
-        IReadOnlyList<string> changed = git.ChangedFiles("HEAD");
-        Assert.Equal(new[] { Abs("src/a.cs"), Abs("src/new.cs"), Abs("src/sub/sp ace ü.cs") }.Order(StringComparer.Ordinal), changed.Order(StringComparer.Ordinal));
-        Assert.Equal(changed, git.ChangedFiles("v1")); // a tag
-        Assert.Equal(changed, new GitCliInfo(Path.Combine(_repo, "src", "sub")).ChangedFiles("HEAD")); // from a subdirectory: whole repository
-        Assert.DoesNotContain(Abs("src/new.cs"), new GitCliInfo(_repo) { IncludeUntracked = false }.ChangedFiles("HEAD"));
+        Fixture fx = Build();
+        SelectionResult r = ContextSelector.Select(new SelectionRequest { Paths = ["src/**"], Exclude = ["src/App/**"] }, fx.Files, fx.Graph);
+        Assert.Equal(["src/Lib/MathUtil.cs", "src/Lib/Unused.cs"], Files(r));
+
+        var git = new FakeGit(Path.Combine(Root, "src", "App", "Top.cs"), Path.Combine(Root, "src", "Lib", "Unused.cs"), Path.Combine(Root, "README.md"));
+        r = ContextSelector.Select(new SelectionRequest { ChangedSince = "main", Exclude = ["src/App/**"] }, fx.Files, fx.Graph, git, Root);
+        Assert.Equal(["src/Lib/Unused.cs"], Files(r));
+        Assert.Equal(["README.md"], r.UnmatchedChangedFiles);
+        string note = Assert.Single(r.Notes, n => n.Contains("Exclude", StringComparison.Ordinal));
+        Assert.Contains("src/App/Top.cs", note, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void ChangedFiles_CommittedChangesAndDeletes_SinceAnOlderRef()
+    public void Select_TwoPatternsMatchingOneFile_NeitherIsUnmatched()
     {
-        Write("src/a.cs", "class A { int z; }\n");
-        File.Delete(Path.Combine(_repo, "src", "keep.cs"));
-        Git("add", "-A");
-        Git("commit", "-q", "-m", "two");
-        var git = new GitCliInfo(_repo);
-        Assert.Empty(git.ChangedFiles("HEAD"));
-        Assert.Equal(new[] { Abs("src/a.cs"), Abs("src/keep.cs") }, git.ChangedFiles("HEAD~1").Order(StringComparer.Ordinal));
+        Fixture fx = Build();
+        SelectionResult r = ContextSelector.Select(new SelectionRequest { Paths = ["src/Lib/*.cs", "**/MathUtil.cs", "nothing/**"] }, fx.Files, fx.Graph);
+        Assert.Equal(["nothing/**"], r.UnmatchedPatterns);
+        // The first matching pattern is the one named in the detail.
+        Assert.All(r, c => Assert.Contains("'src/Lib/*.cs'", c.Detail, StringComparison.Ordinal));
     }
 
     [Theory]
-    [InlineData("--output=PWNED")]
-    [InlineData("--output")]
-    [InlineData("-o")]
-    [InlineData("--exec=whoami")]
-    [InlineData("-")]
-    public void ChangedFiles_OptionLikeRef_IsRejected_AndWritesNothing(string option)
+    [InlineData("sv-SE")]
+    [InlineData("tr-TR")]
+    [InlineData("en-US")]
+    public void Select_Order_IsOrdinal_UnderAnyCulture(string culture)
     {
-        string victim = Path.Combine(_repo, "PWNED");
-        var git = new GitCliInfo(_repo);
-        Assert.ThrowsAny<ArgumentException>(() => git.ChangedFiles(option));
-        Assert.False(File.Exists(victim));
-        Assert.False(File.Exists(Path.Combine(_repo, "src", "PWNED")));
-    }
+        // Ordinal: "z/B.cs" < "z/a.b.cs" < "z/a.cs" < "z/a_b.cs"; culture-aware comparers put B last and may reorder '.' and '_'.
+        (string Path, string Text)[] repo =
+        [
+            ("z/a_b.cs", "class A2 { }\n"), ("z/B.cs", "class B { }\n"), ("z/a.cs", "class A1 { }\n"), ("z/a.b.cs", "class A3 { }\n"),
+            ("z/Ä.cs", "class Ae { }\n"), ("z/b-c.cs", "class Bc { }\n"),
+        ];
+        var tok = new CharTokenizer();
+        SourceFile[] files = repo.Select(f => new SourceFile(f.Path, f.Text)).ToArray();
+        Chunk[] chunks = files.SelectMany(new SymbolChunker(tok, 4096).Chunk).ToArray();
+        ReferenceGraph graph = new RoslynGraphBuilder(tok).Build(files, chunks);
+        string[] ordinal = files.Select(f => f.Path).Order(StringComparer.Ordinal).ToArray();
 
-    [Theory]
-    [InlineData("HEAD --output=PWNED")]
-    [InlineData("HEAD;echo PWNED>PWNED")]
-    [InlineData("HEAD & echo PWNED > PWNED")]
-    [InlineData("$(touch PWNED)")]
-    [InlineData("\"HEAD\" --output=PWNED")]
-    [InlineData("no-such-branch")]
-    public void ChangedFiles_RefThatIsNotACommit_IsAGitError_AndWritesNothing(string gitRef)
-    {
-        var git = new GitCliInfo(_repo);
-        var ex = Assert.Throws<GitException>(() => git.ChangedFiles(gitRef));
-        Assert.Contains("not a commit", ex.Message, StringComparison.Ordinal);
-        Assert.False(File.Exists(Path.Combine(_repo, "PWNED")));
+        System.Globalization.CultureInfo saved = System.Globalization.CultureInfo.CurrentCulture;
+        try
+        {
+            System.Globalization.CultureInfo.CurrentCulture = new System.Globalization.CultureInfo(culture);
+            SelectionResult r = ContextSelector.Select(new SelectionRequest { Paths = ["z/**"] }, files, graph);
+            Assert.Equal(ordinal, r.Select(c => c.Chunk.FilePath).ToArray());
+            Assert.Equal(ordinal, r.InDocumentOrder().Select(c => c.Chunk.FilePath).ToArray());
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentCulture = saved;
+        }
     }
 
     [Fact]
-    public void ChangedFiles_NotARepository_IsAGitError()
+    public void Select_Symbol_PositionalRecordProperty_IsFound()
     {
-        string plain = Path.Combine(_dir, "plain");
-        Directory.CreateDirectory(plain);
-        // A git repository above the temp directory would make this test meaningless; the temp dir is not one on this box.
-        var ex = Assert.Throws<GitException>(() => new GitCliInfo(plain).ChangedFiles("HEAD"));
-        Assert.Contains("repository", ex.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Throws<DirectoryNotFoundException>(() => new GitCliInfo(Path.Combine(_dir, "missing")).ChangedFiles("HEAD"));
+        (string Path, string Text)[] repo =
+        [
+            ("r/Box.cs", "namespace N;\n\npublic sealed record Box(int Size, string Label)\n{\n    public int Twice => Size * 2;\n}\n"),
+            ("r/Use.cs", "namespace N;\n\npublic static class Use\n{\n    public static int Get(Box b) => b.Size;\n}\n"),
+        ];
+        var tok = new CharTokenizer();
+        SourceFile[] files = repo.Select(f => new SourceFile(f.Path, f.Text)).ToArray();
+        Chunk[] chunks = files.SelectMany(new SymbolChunker(tok, 4096).Chunk).ToArray();
+        ReferenceGraph graph = new RoslynGraphBuilder(tok).Build(files, chunks);
+        SelectionResult r = ContextSelector.Select(new SelectionRequest { Symbol = "Box.Size", Hops = 0 }, files, graph);
+        SymbolDefinition d = Assert.Single(r.SymbolDefinitions);
+        Assert.Equal(("N.Box.Size", "property", "r/Box.cs", 3), (d.QualifiedName, d.Kind, d.FilePath, d.Line));
+        Assert.Equal(SelectionReason.Definition, Assert.Single(r).Reason);
+        // Unsupported declaration kinds (operators, indexers, finalizers) cannot be named: their "name" is not an identifier.
+        Assert.ThrowsAny<ArgumentException>(() => ContextSelector.Select(new SelectionRequest { Symbol = "Box.this" }, files, graph));
+    }
+
+    [Fact]
+    public void Select_ChangedSinceMergeBase_IsPassedToGit_AndNamedInTheDetail()
+    {
+        Fixture fx = Build();
+        var git = new FakeGit(Path.Combine(Root, "src", "App", "Top.cs"));
+        SelectionResult r = ContextSelector.Select(new SelectionRequest { ChangedSince = "main", ChangedSinceMergeBase = true }, fx.Files, fx.Graph, git, Root);
+        Assert.Equal([true], git.MergeBase);
+        Assert.All(r, c => Assert.Contains("merge base", c.Detail, StringComparison.Ordinal));
+        ContextSelector.Select(new SelectionRequest { ChangedSince = "main" }, fx.Files, fx.Graph, git, Root);
+        Assert.Equal([true, false], git.MergeBase);
+        Assert.ThrowsAny<ArgumentException>(() => ContextSelector.Select(new SelectionRequest { Paths = ["**"], ChangedSinceMergeBase = true }, fx.Files, fx.Graph));
+    }
+
+    [SkippableFact]
+    public void Select_ChangedSince_RootReachedThroughALink_MapsResolvedPaths()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ctxsel-link-" + Guid.NewGuid().ToString("N"));
+        string real = Path.Combine(dir, "real"), link = Path.Combine(dir, "link");
+        Directory.CreateDirectory(Path.Combine(real, "src", "App"));
+        try
+        {
+            Skip.IfNot(TestLinks.TryCreateDirectoryLink(link, real), "Cannot create a directory junction or symlink here.");
+            Fixture fx = Build();
+            // An IGitInfo that reports resolved paths (as `git rev-parse --show-toplevel` does) while the root is the link.
+            var git = new FakeGit(Path.Combine(real, "src", "App", "Top.cs"), Path.Combine(link, "src", "Lib", "Unused.cs"));
+            SelectionResult r = ContextSelector.Select(new SelectionRequest { ChangedSince = "main" }, fx.Files, fx.Graph, git, link);
+            Assert.Equal(["src/App/Top.cs", "src/Lib/Unused.cs"], Files(r));
+            Assert.Empty(r.UnmatchedChangedFiles);
+        }
+        finally
+        {
+            TestLinks.DeleteTree(dir);
+        }
+    }
+
+    [Fact]
+    public void Select_MaxNeighboursPerHop_CapsEachHop_OffByDefault()
+    {
+        Fixture fx = Build();
+        var request = new SelectionRequest { Symbol = "MathUtil.Twice", Hops = 2 };
+        SelectionResult full = ContextSelector.Select(request, fx.Files, fx.Graph);
+        Assert.Equal(6, full.Count);
+        Assert.DoesNotContain(full.Notes, n => n.Contains("capped", StringComparison.Ordinal));
+
+        // Cap 1: hop 1 keeps its best neighbour (Sum: equal weight, first by path), and hop 2 walks on from Sum only.
+        SelectionResult capped = ContextSelector.Select(request with { MaxNeighboursPerHop = 1 }, fx.Files, fx.Graph);
+        Assert.Equal(3, capped.Count);
+        Assert.Equal(fx.With("int Sum(").Id, Assert.Single(capped, c => c.Hop == 1).Chunk.Id);
+        Assert.Single(capped, c => c.Hop == 2);
+        Assert.DoesNotContain(fx.With("int Add(").Id, Ids(capped.Where(c => c.Hop == 1)));
+        Assert.Contains(capped.Notes, n => n.Contains("hop 1 capped", StringComparison.Ordinal) && n.Contains("1 of 2", StringComparison.Ordinal));
+
+        Assert.Equal(Ids(fx.With("int Twice(")), Ids(ContextSelector.Select(request with { MaxNeighboursPerHop = 0 }, fx.Files, fx.Graph)));
+        Assert.Throws<ArgumentOutOfRangeException>(() => ContextSelector.Select(request with { MaxNeighboursPerHop = -1 }, fx.Files, fx.Graph));
     }
 }

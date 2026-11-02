@@ -7,10 +7,16 @@ namespace DotLLM.ChunkReuse.Tooling;
 
 /// <summary>
 /// Finds declarations by (a dotted suffix of) their qualified name, by syntax: types, delegates, methods, constructors,
-/// properties, events, fields, enum members. Files are parsed with <see cref="SymbolChunker.ParseOptions"/> (no preprocessor
-/// symbols, so a declaration inside an inactive <c>#if</c> region is not found); only files whose text contains the
-/// symbol's last name are parsed.
+/// properties (including positional record parameters), events, fields, enum members. Files are parsed with
+/// <see cref="SymbolChunker.ParseOptions"/> (no preprocessor symbols, so a declaration inside an inactive <c>#if</c> region is
+/// not found); only files whose text contains the symbol's last name are parsed.
 /// </summary>
+/// <remarks>
+/// Not supported, because their name is not an identifier a query can spell: indexers (<c>this[…]</c>), operators and
+/// conversion operators, finalizers (<c>~T</c>; the type itself is found). Identifiers written with Unicode escapes
+/// (<c>A</c>) are matched by their value but the text prefilter looks for the literal name, so such a file is skipped.
+/// Local functions and locals are not declarations here.
+/// </remarks>
 public static class SymbolLocator
 {
     /// <summary>Splits <paramref name="symbol"/> into name segments (see <see cref="SelectionRequest.Symbol"/>).</summary>
@@ -42,6 +48,9 @@ public static class SymbolLocator
         string[] segments = sb.ToString().Split('.').Select(x => x.Trim()).Select(x => x.Contains('`') ? x[..x.IndexOf('`')] : x).ToArray();
         if (segments.Length == 0 || segments.Any(x => x.Length == 0 || !SyntaxFacts.IsValidIdentifier(x.TrimStart('@'))))
             throw new ArgumentException($"Malformed symbol '{symbol}': expected Name or A.B.Name.", nameof(symbol));
+        string? keyword = segments.FirstOrDefault(x => !x.StartsWith('@') && SyntaxFacts.GetKeywordKind(x) != SyntaxKind.None);
+        if (keyword is not null)
+            throw new ArgumentException($"Symbol '{symbol}': '{keyword}' is a C# keyword. Indexers, operators and finalizers cannot be selected by name; select their type, or write @{keyword} for an identifier.", nameof(symbol));
         return segments.Select(x => x.TrimStart('@')).ToArray();
     }
 
@@ -98,6 +107,10 @@ public static class SymbolLocator
             {
                 case BaseTypeDeclarationSyntax t:
                     yield return (Qualify(t, t.Identifier.ValueText), "type", t.Identifier, Span(t));
+                    // Positional record parameters declare properties (record Box(int Size) → Box.Size).
+                    if (t is RecordDeclarationSyntax { ParameterList: { } positional })
+                        foreach (ParameterSyntax p in positional.Parameters)
+                            yield return (Qualify(p, p.Identifier.ValueText), "property", p.Identifier, Span(p));
                     break;
                 case DelegateDeclarationSyntax d:
                     yield return (Qualify(d, d.Identifier.ValueText), "delegate", d.Identifier, Span(d));

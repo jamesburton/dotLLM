@@ -19,9 +19,15 @@ namespace DotLLM.ChunkReuse.Tooling;
 /// From those (hop 0) a breadth-first walk follows reference edges of <see cref="SelectionRequest.EdgeKinds"/> in both
 /// directions for <see cref="SelectionRequest.Hops"/> hops: a chunk with an edge into the previous hop is a
 /// <see cref="SelectionReason.Caller"/>, one that the previous hop has an edge into is a <see cref="SelectionReason.Callee"/>.
-/// Edges inside one chunk are ignored. Excluded chunks are neither selected nor walked through.</item>
-/// <item><see cref="SelectionRequest.ChangedSince"/>: every chunk of each file <see cref="IGitInfo.ChangedFiles"/> reports,
-/// mapped to corpus paths against the root directory (case-insensitively on Windows).</item>
+/// Edges inside one chunk are ignored. Excluded chunks are neither selected nor walked through. With
+/// <see cref="SelectionRequest.MaxNeighboursPerHop"/> (off by default) each hop keeps only its best neighbours (weight, path,
+/// offset), continues from those, and notes how many it dropped.</item>
+/// <item><see cref="SelectionRequest.ChangedSince"/> (optionally against the merge base,
+/// <see cref="SelectionRequest.ChangedSinceMergeBase"/>): every chunk of each file <see cref="IGitInfo.ChangedFiles"/>
+/// reports, mapped to corpus paths against the root directory (case-insensitively on Windows). When a path does not map
+/// because the root was reached through a junction or symbolic link and git reported the resolved path, it is mapped against
+/// the resolved root as well. Changed files with no chunk are in <see cref="SelectionResult.UnmatchedChangedFiles"/>;
+/// changed files removed by <see cref="SelectionRequest.Exclude"/> are listed in a note.</item>
 /// </list>
 /// A chunk matched several ways appears once, with the highest-priority reason as <see cref="SelectedChunk.Reason"/> and all of
 /// them in <see cref="SelectedChunk.Reasons"/>.
@@ -29,7 +35,7 @@ namespace DotLLM.ChunkReuse.Tooling;
 /// <para>
 /// <b>Rank and trim order.</b> Candidates are ranked by <see cref="SelectedChunk.Priority"/> descending
 /// (<see cref="SelectionPriority"/>: definition 1000 &gt; definition body 900 &gt; path 800 &gt; changed 700 &gt; neighbour at hop
-/// h 600−h), then <see cref="SelectedChunk.Weight"/> descending (edges to the previous hop), then path (ordinal), then start
+/// h 600−h), then <see cref="SelectedChunk.Weight"/> descending (edges to or from the previous hop), then path (ordinal), then start
 /// offset. Under <see cref="SelectionRequest.TokenBudget"/> the selection is the longest prefix of that ranking whose tokens fit:
 /// the lowest-ranked candidates are trimmed first, and trimming is strict — once a candidate does not fit, nothing ranked
 /// below it is taken, even if smaller (so a lower priority never displaces a higher one). A budget smaller than the first
@@ -71,6 +77,9 @@ public static class ContextSelector
         ArgumentOutOfRangeException.ThrowIfNegative(request.Hops, nameof(request.Hops));
         ArgumentOutOfRangeException.ThrowIfGreaterThan(request.Hops, MaxHops, nameof(request.Hops));
         if (request.TokenBudget is int b) ArgumentOutOfRangeException.ThrowIfNegative(b, nameof(request.TokenBudget));
+        if (request.MaxNeighboursPerHop is int cap) ArgumentOutOfRangeException.ThrowIfNegative(cap, nameof(request.MaxNeighboursPerHop));
+        if (request.ChangedSinceMergeBase && request.ChangedSince is null)
+            throw new ArgumentException("ChangedSinceMergeBase needs ChangedSince.", nameof(request));
         (PathGlob Glob, string Text)[] paths = request.Paths.Select(p => (PathGlob.Parse(p), p.Trim())).ToArray();
         PathGlob[] includes = paths.Where(g => !g.Glob.Negated).Select(g => g.Glob).ToArray();
         string[] includeTexts = paths.Where(g => !g.Glob.Negated).Select(g => g.Text).ToArray();
@@ -148,21 +157,46 @@ public static class ContextSelector
         var unmatchedChanged = new List<string>();
         if (request.ChangedSince is not null)
         {
-            foreach (string abs in git!.ChangedFiles(request.ChangedSince).Distinct(StringComparer.Ordinal))
+            string since = request.ChangedSinceMergeBase
+                ? $"changed since the merge base of {request.ChangedSince} and HEAD"
+                : $"changed since {request.ChangedSince}";
+            // A root reached through a junction or symlink: git may report resolved paths, so try the resolved root too.
+            string? resolvedRoot = null;
+            var excludedChanged = new List<string>();
+            foreach (string abs in git!.ChangedFiles(request.ChangedSince, request.ChangedSinceMergeBase).Distinct(StringComparer.Ordinal))
             {
                 if (!Path.IsPathFullyQualified(abs))
                     throw new InvalidOperationException($"IGitInfo returned a relative path '{abs}'; ChangedFiles must return absolute paths.");
-                string rel = Path.GetRelativePath(root!, Path.GetFullPath(abs));
-                rel = Path.IsPathFullyQualified(rel) ? rel.Replace('\\', '/') : string.Join('/', rel.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries));
+                string absFull = Path.GetFullPath(abs);
+                string rel = RelativeCorpusPath(root!, absFull);
+                if (!chunksByFile.ContainsKey(rel))
+                {
+                    resolvedRoot ??= ResolveLinks(root!);
+                    foreach (string alt in new[] { RelativeCorpusPath(resolvedRoot, absFull), RelativeCorpusPath(resolvedRoot, ResolveLinks(absFull)) })
+                    {
+                        if (!chunksByFile.ContainsKey(alt)) continue;
+                        rel = alt;
+                        break;
+                    }
+                }
                 if (!chunksByFile.TryGetValue(rel, out List<int>? list))
                 {
                     unmatchedChanged.Add(rel);
                     continue;
                 }
-                if (Excluded(rel)) continue;
-                foreach (int c in list) Add(c, SelectionReason.Changed, SelectionReason.Changed, SelectionPriority.Changed, -1, 0, $"changed since {request.ChangedSince}");
+                if (Excluded(rel))
+                {
+                    excludedChanged.Add(rel);
+                    continue;
+                }
+                foreach (int c in list) Add(c, SelectionReason.Changed, SelectionReason.Changed, SelectionPriority.Changed, -1, 0, since);
             }
             unmatchedChanged.Sort(StringComparer.Ordinal);
+            if (excludedChanged.Count > 0)
+            {
+                excludedChanged.Sort(StringComparer.Ordinal);
+                notes.Add($"{excludedChanged.Count} changed file(s) excluded by Exclude: {string.Join(", ", excludedChanged.Take(20))}{(excludedChanged.Count > 20 ? ", …" : "")}");
+            }
         }
 
         // ---- symbol neighbourhood ----
@@ -207,7 +241,7 @@ public static class ContextSelector
                 throw new SymbolNotFoundException(request.Symbol!,
                     $"Symbol '{request.Symbol}' is declared ({where}) but the graph has no chunk covering it; build the graph over the chunks of those files.", []);
             }
-            Walk(graph, seeds, request.Hops, kinds, c => !Excluded(chunks[c].FilePath), Add);
+            Walk(graph, seeds, request.Hops, kinds, c => !Excluded(chunks[c].FilePath), request.MaxNeighboursPerHop, notes, Add);
         }
 
         // ---- rank, trim ----
@@ -249,7 +283,7 @@ public static class ContextSelector
     }
 
     private static void Walk(ReferenceGraph graph, SortedSet<int> seeds, int hops, HashSet<SymbolEdgeKind> kinds, Func<int, bool> eligible,
-        Action<int, SelectionReason, SelectionReason, int, int, int, string> add)
+        int? maxPerHop, List<string> notes, Action<int, SelectionReason, SelectionReason, int, int, int, string> add)
     {
         if (hops == 0 || kinds.Count == 0) return;
         IReadOnlyList<ChunkEdge> edges = graph.Edges;
@@ -282,6 +316,21 @@ public static class ContextSelector
                     found[u] = found.TryGetValue(u, out var w) ? (w.Caller + 1, w.Callee) : (1, 0);
                 }
             }
+            if (maxPerHop is int cap && found.Count > cap)
+            {
+                IReadOnlyList<Chunk> chunks = graph.Chunks;
+                int[] keep = found
+                    .OrderByDescending(kv => kv.Value.Caller + kv.Value.Callee)
+                    .ThenBy(kv => chunks[kv.Key].FilePath, StringComparer.Ordinal)
+                    .ThenBy(kv => chunks[kv.Key].StartOffset)
+                    .Take(cap).Select(kv => kv.Key).ToArray();
+                notes.Add($"hop {hop} capped by MaxNeighboursPerHop: kept {cap} of {found.Count} neighbours");
+                // Dropped neighbours are marked visited: they are at this distance, so they never come back at a later hop.
+                foreach (int c in found.Keys) visited.Add(c);
+                var kept = new SortedDictionary<int, (int Caller, int Callee)>();
+                foreach (int c in keep) kept[c] = found[c];
+                found = kept;
+            }
             foreach ((int c, (int caller, int callee)) in found)
             {
                 SelectionReason reason = (caller > 0 ? SelectionReason.Caller : 0) | (callee > 0 ? SelectionReason.Callee : 0);
@@ -298,6 +347,40 @@ public static class ContextSelector
             }
             frontier = found.Keys.ToArray();
         }
+    }
+
+    /// <summary>Corpus path of <paramref name="full"/> relative to <paramref name="root"/>: '/' separated, or the absolute path ('/' separated) on another volume.</summary>
+    private static string RelativeCorpusPath(string root, string full)
+    {
+        string rel = Path.GetRelativePath(root, full);
+        return Path.IsPathFullyQualified(rel)
+            ? rel.Replace('\\', '/')
+            : string.Join('/', rel.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    /// <summary>
+    /// <paramref name="path"/> with every directory link along it (junction, symbolic link) replaced by its final target.
+    /// Components that do not exist or cannot be read are kept as written. <c>subst</c> drives are not resolved.
+    /// </summary>
+    internal static string ResolveLinks(string path)
+    {
+        string full = Path.GetFullPath(path);
+        string current = Path.GetPathRoot(full) ?? "";
+        foreach (string segment in full[current.Length..].Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, segment);
+            try
+            {
+                var info = new DirectoryInfo(current);
+                if (info.Exists && info.LinkTarget is not null && info.ResolveLinkTarget(returnFinalTarget: true) is { } target)
+                    current = Path.GetFullPath(target.FullName);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Keep the component as written.
+            }
+        }
+        return current;
     }
 
     private sealed class Candidate(SelectionReason reason, int priority, int weight, string detail)

@@ -35,6 +35,21 @@ public sealed record SelectionRequest
     /// <summary>A git revision (branch, tag, SHA, <c>HEAD~3</c>); every chunk of a file that differs from it in the working tree (or is untracked) is selected.</summary>
     public string? ChangedSince { get; init; }
 
+    /// <summary>
+    /// With <see cref="ChangedSince"/>: compare against the merge base of <see cref="ChangedSince"/> and <c>HEAD</c> instead of
+    /// the revision itself (the files this branch changed since it forked, <c>git diff &lt;ref&gt;...HEAD</c>, plus uncommitted
+    /// and untracked changes), so changes made only on the other branch are not selected. Default false (two-dot: working tree
+    /// against the revision).
+    /// </summary>
+    public bool ChangedSinceMergeBase { get; init; }
+
+    /// <summary>
+    /// Optional cap on the neighbours added per hop of the <see cref="Symbol"/> walk (null: no cap, the default). When a hop
+    /// finds more, the best are kept (weight descending, then path, then offset), the walk continues from them only, and a
+    /// note records how many were dropped. Bounds the fan-out through hub types before the budget trims.
+    /// </summary>
+    public int? MaxNeighboursPerHop { get; init; }
+
     /// <summary>Maximum total tokens of the selection (null: no limit). Trimming order: see <see cref="ContextSelector"/>.</summary>
     public int? TokenBudget { get; init; }
 

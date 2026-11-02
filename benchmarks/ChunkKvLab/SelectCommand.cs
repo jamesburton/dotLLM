@@ -49,7 +49,7 @@ internal static class SelectCommand
             double selS = sw.Elapsed.TotalSeconds;
             Console.WriteLine();
             Console.WriteLine($"request: symbol={r.Symbol ?? "-"} hops={r.Hops} paths=[{string.Join(", ", r.Paths)}] exclude=[{string.Join(", ", r.Exclude)}] "
-                + $"since={r.ChangedSince ?? "-"} budget={(r.TokenBudget is int b ? b.ToString() : "none")} [{selS * 1000:F0} ms]");
+                + $"since={r.ChangedSince ?? "-"}{(r.ChangedSinceMergeBase ? " (merge base)" : "")} max-per-hop={r.MaxNeighboursPerHop?.ToString() ?? "off"} budget={(r.TokenBudget is int b ? b.ToString() : "none")} [{selS * 1000:F0} ms]");
             foreach (SymbolDefinition d in result.SymbolDefinitions)
                 Console.WriteLine($"  definition {d.QualifiedName} ({d.Kind}) {d.FilePath}:{d.Line}");
             Console.WriteLine($"  candidates {result.Count + result.Trimmed.Count} chunks / {result.CandidateTokens} tokens in "
