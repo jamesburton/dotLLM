@@ -27,6 +27,10 @@ namespace ChunkKvLab;
 /// ChunkKvLab floor --model &lt;gguf&gt; --names a,b --corpus-dirs d1,d2 --hashes h1,h2 --contexts 7,6 --kept-dir &lt;experiments/corpus&gt;
 ///               --out-dir &lt;dir&gt; [--label 2k] [--mode kept|unfiltered] [--context 2048] [--ref-block 512] [--blocks 2048,96,64,8,1]
 ///               (loads CPU and Vulkan itself; no --backend)
+/// ChunkKvLab recompute --model &lt;gguf&gt; --names a,b --corpus-dirs d1,d2 --hashes h1,h2 --contexts 7,6 --kept-dir &lt;experiments/corpus&gt;
+///               --out-dir &lt;dir&gt; [--label 2k] [--mode kept|unfiltered] [--context 2048] [--budgets 5,10,20] [--selectors chunk_starts,random]
+///               [--repeats 3] [--eval 0|1] [--cpu-contexts 0] [--max-rows 0 (no cap)] [--full-blocks 512,2048]
+///               (Vulkan; with --eval 1 and --cpu-contexts n also the CPU model; no --backend)
 /// </code>
 /// Global option on every model-loading command: <c>--backend cpu|vulkan</c> (default cpu). On vulkan the model and the chunk
 /// backend share one device and all-row logits are enabled on demand (<c>TrySetAllRowLogitsLimit</c>); the experiment runners
@@ -58,9 +62,9 @@ internal static class Program
         int[] Ints(string key, string fallback) =>
             Get(key, fallback).Split(',', StringSplitOptions.RemoveEmptyEntries).Select(s => int.Parse(s, CultureInfo.InvariantCulture)).ToArray();
 
-        if (args[0] == "floor" && opts.ContainsKey("backend"))
+        if (args[0] is "floor" or "recompute" && opts.ContainsKey("backend"))
         {
-            Console.Error.WriteLine("'floor' loads both the CPU and the Vulkan model itself; drop --backend.");
+            Console.Error.WriteLine($"'{args[0]}' loads the Vulkan (and CPU) model itself; drop --backend.");
             return 2;
         }
         string backend = Get("backend", DotLLM.ChunkReuse.Backends.ChunkBackendTags.Cpu);
@@ -173,6 +177,15 @@ internal static class Program
                     Get("model"), List("names"), List("corpus-dirs"), List("hashes"), Ints("contexts", ""), Get("kept-dir"), Get("mode", "kept"),
                     Int("context", 2048), Int("ref-block", 512), Ints("blocks", "2048,96,64,8,1"), Int("threads", 0), Get("label", "2k"),
                     Get("out-dir")));
+            }
+            case "recompute":
+            {
+                string[] List(string key, string fallback) => Get(key, fallback).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                return RecomputeCommand.Run(new RecomputeOptions(
+                    Get("model"), List("names", ""), List("corpus-dirs", ""), List("hashes", ""), Ints("contexts", ""), Get("kept-dir"),
+                    Get("mode", "kept"), Int("context", 2048), Ints("budgets", "5,10,20"), List("selectors", "chunk_starts,random"),
+                    Int("repeats", 3), Int("eval", 0) != 0, Int("cpu-contexts", 0), Int("max-rows", 0), Ints("full-blocks", "512,2048"),
+                    Int("threads", 0), Get("label", "2k"), Get("out-dir")));
             }
             case "backend-check":
                 return BackendCheck.Run(Get("model"), Int("tokens", 64), Int("threads", 0));

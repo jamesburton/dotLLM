@@ -392,7 +392,7 @@ internal static class E4Command
 
     private static string StableKey(string s) => Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(s)));
 
-    private static int RandomSeed(int seed, int plan) => unchecked(seed * 1_000_003 + plan * 7_919 + 17);
+    internal static int RandomSeed(int seed, int plan) => unchecked(seed * 1_000_003 + plan * 7_919 + 17);
 
     private static string Key(int[] selection)
     {

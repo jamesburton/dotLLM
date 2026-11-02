@@ -226,7 +226,7 @@ internal static class FloorCommand
     /// backend cache): the prefix minus its last token is prefilled at <c>L</c> in one block, then [last prefix token,
     /// continuation[..^1]] gives one logit row per continuation token. The cache is rolled back to <c>L</c>.
     /// </summary>
-    private static float[] ForwardTask(LabModel lab, IKvCache cache, int L, CodeTask task)
+    internal static float[] ForwardTask(LabModel lab, IKvCache cache, int L, CodeTask task)
     {
         int[] prefix = task.PrefixTokenIds, cont = task.ContinuationTokenIds;
         try

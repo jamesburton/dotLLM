@@ -117,6 +117,43 @@ public sealed class VulkanRecomputeTests : IDisposable
         Assert.Throws<ArgumentException>(() => SelectiveRecomputer.Recompute(tiny.Model, cpu, b, Context.Append(1).ToArray(), [0]));
     }
 
+    [Fact]
+    public void Recompute_CacheLengthMovedByForward_Throws()
+    {
+        using var tiny = BackendSeamTests.TinyModel.Load(_scratch, "qwen3");
+        var cpu = new CpuChunkBackend(tiny.Config);
+        List<ChunkKvEntry> entries = Encode(tiny.Model, cpu);
+        using IKvCache cache = Assembled(tiny.Config, cpu, entries);
+        IModel growing = AppendingModel.Wrap(tiny.Model);
+        var ex = Assert.Throws<InvalidOperationException>(() => SelectiveRecomputer.Recompute(growing, cpu, cache, entries, [3, 9]));
+        Assert.Contains("length moved", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>An <see cref="IModel"/> that, after every cached forward, also appends one row at the cache's current length (a cache
+    /// writer that does not overwrite in place, as far as the recomputer can tell).</summary>
+    private sealed class AppendingModel(IModel inner) : IModel
+    {
+        internal static IModel Wrap(IModel inner) => new AppendingModel(inner);
+
+        public ModelConfig Config => inner.Config;
+        public long ComputeMemoryBytes => inner.ComputeMemoryBytes;
+        public void Dispose() { }
+
+        public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+            => inner.Forward(tokenIds, positions, deviceId);
+
+        public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+        {
+            ITensor result = inner.Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: true);
+            if (kvCache is not null)
+            {
+                int pos = kvCache.CurrentLength;
+                using ITensor _ = inner.Forward([1], [pos], deviceId, kvCache, lastTokenLogitsOnly: true);
+            }
+            return result;
+        }
+    }
+
     internal static List<ChunkKvEntry> Encode(IModel model, IChunkBackend backend)
     {
         var encoder = new ChunkEncoder(Fingerprint);
@@ -475,9 +512,14 @@ public sealed class VulkanRecomputeTestsGpu : IDisposable
         List<ChunkKvEntry> cpuEntries = VulkanRecomputeTests.Encode(rig.Tiny.Model, rig.Cpu);
         using IKvCache host = VulkanRecomputeTests.Assembled(rig.Tiny.Config, rig.Cpu, cpuEntries);
         Assert.Throws<NotSupportedException>(() => SelectiveRecomputer.Recompute(rig.Model, rig.Backend, host, cpuEntries, [3, 9]));
-        // And the CPU backend refuses the Vulkan model (its forwards would run on the device with deviceId -1).
+        // And the CPU backend refuses the Vulkan model, also over a host cache the CPU backend itself accepts.
         using IKvCache vk2 = rig.Naive();
         Assert.Throws<NotSupportedException>(() => SelectiveRecomputer.Recompute(rig.Model, rig.Cpu, vk2, rig.Entries, [3, 9]));
+        (float[] hk, float[] hv) = VulkanRecomputeTests.Read(rig.Cpu, host, 2, L, rig.Stride);
+        var ex = Assert.Throws<NotSupportedException>(() => SelectiveRecomputer.Recompute(rig.Model, rig.Cpu, host, cpuEntries, [3, 9]));
+        Assert.Contains(nameof(VulkanTransformerModel), ex.Message, StringComparison.Ordinal);
+        Assert.Equal(hk, VulkanRecomputeTests.Read(rig.Cpu, host, 2, L, rig.Stride).K);
+        Assert.Equal(hv, VulkanRecomputeTests.Read(rig.Cpu, host, 2, L, rig.Stride).V);
     }
 
     [SkippableFact]
