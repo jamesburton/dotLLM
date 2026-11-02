@@ -52,8 +52,12 @@ internal static class RecomputeCommand
         }, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
 
         using LabModel vk = LabModel.Load(o.ModelPath, o.Threads, ChunkBackendTags.Vulkan);
+        var vtm = (DotLLM.Vulkan.VulkanTransformerModel)vk.Model;
         Console.WriteLine($"vulkan device: {vk.DeviceName}; eval {(o.Eval ? "on" : "off (timing run: all-row logits never widened)")}; "
-            + $"single-pass row cap {(o.MaxRows > 0 ? o.MaxRows.ToString(ci) : "none")}");
+            + $"single-pass row cap {(o.MaxRows > 0 ? o.MaxRows.ToString(ci) : "none")}; per-query-position attention: loaded "
+            + $"{vtm.SupportsQueryPositionAttention}, tiled loaded {vtm.SupportsTiledQueryPositionAttention}, tiled enabled "
+            + $"{vtm.TiledQueryPositionAttentionEnabled} ({DotLLM.Vulkan.VulkanTransformerModel.QueryPositionsKernelEnvVar}="
+            + $"{Environment.GetEnvironmentVariable(DotLLM.Vulkan.VulkanTransformerModel.QueryPositionsKernelEnvVar) ?? "(unset)"})");
         using LabModel? cpu = o.Eval && o.CpuContexts > 0 ? LabModel.Load(o.ModelPath, o.Threads, ChunkBackendTags.Cpu) : null;
         int vocab = vk.Config.VocabSize, layers = vk.Geometry.LayerCount;
         int maxRows = o.MaxRows > 0 ? o.MaxRows : int.MaxValue;
@@ -70,7 +74,7 @@ internal static class RecomputeCommand
             w.WriteLine(header);
             return w;
         }
-        using var timeCsv = Open("timing", "size,corpus,plan,context_id,context_tokens,chunks,eval_run,arm,selector,budget_pct,rows,runs,rep,ms,forward_calls,qpos_layers");
+        using var timeCsv = Open("timing", "size,corpus,plan,context_id,context_tokens,chunks,eval_run,arm,selector,budget_pct,rows,runs,rep,ms,forward_calls,qpos_layers,qpos_tiled_layers");
         using var kvCsv = o.Eval ? Open("kv", "size,corpus,plan,context_id,context_tokens,pair,layer,kind,n,rel_l2_mean,rel_l2_p99,rel_l2_max") : null;
         using var taskCsv = o.Eval
             ? Open("tasks", "size,corpus,plan,context_id,task_id,task_index,pair,selector,budget_pct,rows,kl_mean,kl_max,top1,ref_mask_nll,mask_nll,ref_mask_em,mask_em")
@@ -105,10 +109,16 @@ internal static class RecomputeCommand
                 string contextId = $"{o.Names[c]}/symbol/s0/{o.Mode}/p{p}";
                 string common = string.Join(',', o.Label, o.Names[c], p.ToString(ci), contextId);
                 string Step(string s) => $"[recompute {contextId} L {L} chunks {plan.Chunks.Count} +{ctxSw.Elapsed.TotalSeconds:F0} s] {s}";
-                void Time(string arm, string selector, int pct, int rows, int runs, int rep, double ms, int calls, long qpos) =>
+                // qpos_tiled_layers: tiled per-query-position layers since the previous row (each timed arm is one row).
+                long lastTiled = vtm.AttentionQueryPositionsTiledCount;
+                void Time(string arm, string selector, int pct, int rows, int runs, int rep, double ms, int calls, long qpos)
+                {
+                    long tiledNow = vtm.AttentionQueryPositionsTiledCount;
                     timeCsv.WriteLine(string.Join(',', common, L.ToString(ci), plan.Chunks.Count.ToString(ci), o.Eval ? "1" : "0", arm, selector,
                         pct.ToString(ci), rows.ToString(ci), runs.ToString(ci), rep.ToString(ci), ms.ToString("F2", ci), calls.ToString(ci),
-                        qpos.ToString(ci)));
+                        qpos.ToString(ci), (tiledNow - lastTiled).ToString(ci)));
+                    lastTiled = tiledNow;
+                }
 
                 if (!warmed)
                 {
