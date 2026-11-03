@@ -8,6 +8,8 @@ prefill is noisy; see [Caveats](#caveats)). Ratios are `dotLLM / llama.cpp`, so 
 Last consolidated against `dev` at `59e77ae2` (2026-11-01). Figures older than that are dated in their row. Items that
 could not be sourced, or that predate large changes, are listed under [Needs re-measure](#needs-re-measure).
 
+Refreshed 2026-11-02 (Flint smoke, pruned Qwen3.8-Flash-Next Coder, Flash-Next UD-IQ4_XS, tiled dense prefill; sections 2.2 and 2.6-2.9): those figures were measured on Strix Halo Vulkan that week against llama.cpp upstream master `dde879bc` (Vulkan) unless stated, on a noisy box, so only ranges are quoted.
+
 How to read the build columns: `0ae0e1976` = llama.cpp master (Vulkan `llama-server` / `llama-bench`), `b11739` =
 llama.cpp CPU (Bolt), `b9016` = llama.cpp CPU `llama-server --embeddings`, `b9041` = llama.cpp CPU/CUDA of the May-2026
 baseline, `b87ca7225` = the PrismML llama.cpp fork (CUDA; the only llama.cpp that loads PQ2_0).
@@ -20,6 +22,10 @@ baseline, `b87ca7225` = the PrismML llama.cpp fork (CUDA; the only llama.cpp tha
 | Qwen3.8-27B Q4_K_M + MTP head | Vulkan, Strix Halo | MTP K=2 / 3 / 4 | 1.00 / **1.14** / **1.20** | [2.1](#21-qwen38-27b-q4_k_m-vulkan-strix-halo-8060s) |
 | Qwen3.8-27B Q4_K_M + DFlash2 | Vulkan, Strix Halo | DFlash K=3 | 1.03 (1.01-1.06) | [2.1](#21-qwen38-27b-q4_k_m-vulkan-strix-halo-8060s) |
 | Recursive Flint Q4_1 (39.8B MoE) | Vulkan, Strix Halo | pp512 / decode @0.5K..32K | ~1.0-1.3 / 1.10-1.26 .. 1.06-1.15 | [2.2](#22-recursive-flint-q4_1-vulkan-strix-halo) |
+| Recursive Flint Q4_1 | Vulkan, Strix Halo, smoke (2026-11) | pp512 / tg64 / 128K tg64 | no llama.cpp comparison (dotLLM only) | [2.2](#22-recursive-flint-q4_1-vulkan-strix-halo) |
+| Qwen3.8-Flash-Next pruned Coder (IQ1_M dir, 58.4 GB) | Vulkan, Strix Halo | pp512 / pp2048 / tg64 / MTP K=4 | 1.14 / 1.14 / ~0.93-1.02 / 1.38-1.53x own plain (no llama.cpp MTP) | [2.7](#27-qwen38-flash-next-pruned-coder-vulkan-strix-halo) |
+| Qwen3.8-Flash-Next UD-IQ4_XS | Vulkan, Strix Halo | pp512 / pp2048 / pp8192 / decode | 0.62-0.80 / ~0.88 / ~0.98 / 0.84-1.10 | [2.8](#28-qwen38-flash-next-ud-iq4_xs-vulkan-strix-halo) |
+| Dense Qwen3-4B Q4_K_M (tiled GQA prefill, #1553) | Vulkan, Strix Halo | dotLLM pp512 / pp2048 vs llama.cpp -fa 1 -ub 1024 | ~1.2-1.4 / ~1.2-1.4 (derived from ranges, see 2.9) | [2.9](#29-dense-vulkan-prefill-after-pr-1553-tiled-gqa-flash) |
 | Recursive Flint Q4_1 | CUDA, RTX 3060 12 GB, `--n-cpu-moe` | pp512 / tg64 | 1.00-1.05 / 0.9-1.1 (parity) | [3.1](#31-recursive-flint-q4_1-on-an-rtx-3060-12-gb-cuda-moe-offload) |
 | Ternary Bonsai-2 27B PQ2_0 | CUDA, RTX 3060 | pp512 / tg128 / MTP K=3 | 1.01-1.02 / 1.05-1.06 / 1.11-1.15 (vs PrismML fork) | [3.2](#32-ternary-bonsai-2-27b-pq2_0-cuda-rtx-3060) |
 | Nemotron 3.5 Bolt 74B-A9B (AtomicChat quants) | CPU, Core Ultra 7 155H | pp512 / tg128 | 0.22-0.41 / 0.37-1.02 | [4.1](#41-nemotron-35-bolt-74b-a9b-cpu) |
@@ -91,8 +97,11 @@ rounds, warm (the first round of each engine runs slower).
 - A separate llama.cpp run on the same file (GPU.md, "host import"): pp512 1,633-1,670, tg64 73.2-73.4.
 - Accuracy at depth: per-row KL against the CPU model at 8K is 0.4-1 for every Vulkan variant, and llama.cpp CPU vs
   llama.cpp Vulkan shows the same profile (Q8_1 activation rounding amplifies a 1e-6 perturbation; [PRECISION.md](PRECISION.md) E14, #1218).
-- Not in any merged doc: later Flint figures quoted in the planning brief for this page (pp512 1,967-1,988, decode ~90,
-  128K-context tg64 31.8). They are **not** reproduced here; see [Needs re-measure](#needs-re-measure).
+- **Later dotLLM-only smoke (2026-11, Vulkan, Strix Halo)**: pp512 1,967-1,988 tok/s, tg64 90.0-90.4 tok/s,
+  128K-context tg64 31.8 tok/s, ~29 GiB peak process memory; the server and `--device auto` both work. Greedy parity
+  against CPU diverges at a near-tie after 13 tokens (the #1218 behaviour). **No llama.cpp comparison exists for
+  these figures** (likely unsupported or not tried; needs re-measure): the ratios above remain the #1161 `0ae0e1976` ones.
+  See [Needs re-measure](#needs-re-measure).
 
 ### 2.3 Nemotron 3.5 Bolt 24GB, Vulkan, Strix Halo
 
@@ -129,6 +138,76 @@ MoE verify work (#1362, #1374); not re-compared.
 Bonsai-2 27B PQ2_0 (llama.cpp master cannot load PQ2_0), the qwen4exp family (the pinned llama.cpp `3cf0325` has no
 qwen4exp MTP graph), and the Vulkan embedding encoders (no llama.cpp Vulkan embedding run exists). Their absolute numbers
 are in [SPECULATIVE.md](SPECULATIVE.md), [GPU.md](GPU.md) and [EMBEDDINGS.md](EMBEDDINGS.md).
+
+### 2.6 Notes on the 2026-11 refresh sections
+
+Sections 2.7-2.9 are copied from the week's measurements (llama.cpp `dde879bc` Vulkan, `-fa 1 -ngl 99` unless stated,
+Windows, shared noisy box; the same pp512 call drifted 278-545 tok/s within one session in 2.8). Treat every ratio as a
+range, not a point.
+
+### 2.7 Qwen3.8-Flash-Next pruned Coder, Vulkan, Strix Halo
+
+`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF`, IQ1_M directory: 256 of 512 experts kept, mixed tensor types
+(IQ3_XXS / IQ4_NL / Q2_0 / IQ4_XS / Q4_K / Q6_K / BF16), 58.4 GB in two shards.
+
+| workload | dotLLM | llama.cpp `dde879bc` | ratio (derived) |
+|---|---|---|---|
+| pp512 (tok/s) | 469 | 412 | 1.14 |
+| pp2048 | 496 | 436 | 1.14 |
+| ~8K prefill | 249-272 (p7900) | 340 +/- 101 (noisy) | not meaningful (ranges overlap) |
+| tg64 (tok/s) | 21.7-23.2 | 22.7-23.3 | ~0.93-1.02 (parity) |
+| MTP K=4 (tok/s) | 27.3 and 30.1 (1.38x and 1.53x over dotLLM plain; acceptance 78% / 83%) | no MTP for this arch | n/a |
+
+- MTP needs the #1530 fix for the expert-count mismatch. Two prompts only.
+- CPU: dotLLM oracle 1.8 tok/s plain, 3.9 with MTP, vs llama.cpp CPU 9.6-11.2 tok/s.
+- CPU greedy vs llama.cpp over 24 tokens: 1 of 3 prompts identical, the others diverge at tokens ~3 and ~12. The
+  F32-decoded control was **not run**, so the divergence is not attributed.
+- Memory ~63 GB total (58.4 GB weights including a 28.8 GB mapped n-gram shard, plus 4.7 GB scratch). GPU heap was not measured.
+
+### 2.8 Qwen3.8-Flash-Next UD-IQ4_XS, Vulkan, Strix Halo
+
+Source: `docs/perf/QWEN4EXP_VULKAN_PREFILL_PROFILE.md`, section 11. Baseline against llama.cpp `dde879bc`.
+
+| workload | dotLLM / llama.cpp |
+|---|---|
+| prefill pp512 | 0.62-0.80 (one warm outlier 1.2) |
+| pp2048 | ~0.88 |
+| pp8192 | ~0.98 |
+| plain decode | 1.05-1.10 early in the session, 0.84 in a late drifted run |
+| MTP K=3 | 1.13 (llama.cpp, one prompt) |
+| MTP K=4 | ~1.34 (directional) |
+
+The box drifted 278-545 tok/s for the same pp512 call, so the early/late split is partly contention; re-measure
+interleaved before quoting.
+
+### 2.9 Dense Vulkan prefill after PR #1553 (tiled GQA flash)
+
+The tiled GQA flash kernel is now the ordinary prefill attention; `DOTLLM_VULKAN_ATTN_PREFILL=ref` restores the old path.
+Qwen3-4B Q4_K_M, full prefill GPU time with 1024-row chunks:
+
+| context | before | after |
+|---|---|---|
+| 1.9K tokens | 1.43 s | 0.90 s |
+| 3.7K | 4.0 s | 2.0 s |
+| 7.4K | 14.7 s | 4.7 s (3.1x) |
+| 14.8K | ~71 s | 13.2 s |
+| 33K | ~305 s | 67 s |
+
+llama.cpp Vulkan `-fa 1 -ub 1024`, same model: pp512 1,650-1,815, pp2048 1,467-1,602, pp8192 1,086-1,202 tok/s; dotLLM at
+7.4K is ~1,580 tok/s of GPU time (about 1.3-1.5x the llama.cpp pp8192 range; derived by this page, indicative). The
+Summary ratio is likewise derived from the ranges (dotLLM pp512 2,240-2,357 and pp2048 1,939-2,090 below).
+
+pp512 / pp2048 tok/s, new vs old:
+
+| model | new pp512 / pp2048 | old pp512 / pp2048 |
+|---|---|---|
+| Qwen3-4B Q4_K_M | 2,240-2,357 / 1,939-2,090 | 1,893-2,019 / 1,170-1,239 |
+| Llama-3.2-3B Q8_0 | 2,132-2,205 / 1,999-2,150 | 1,933-2,003 / 1,483-1,510 |
+| Llama-3.2-1B Q8_0 | 5,701-6,063 / 5,583-6,091 | 5,235-5,368 / 4,383-4,513 |
+| Qwen2.5-0.5B Q8_0 | 14,966-15,666 / 12,814-14,020 | 12,511-13,273 / 8,764-9,727 |
+
+Not run: the hybrids (Qwen3.8-27B, Qwen3.6) take a separate hd256 path, so the section 2.1 figures are unaffected and
+unrefreshed. llama.cpp was measured only for Qwen3-4B.
 
 ## 3. RTX 3060 12 GB, CUDA
 
@@ -267,8 +346,8 @@ dotLLM's own CPU (there is no llama.cpp Vulkan embedding comparator):
 
 Gaps and stale rows, each of which a reader could mistake for a current figure:
 
-1. **Flint latest Strix figures** (pp512 1,967-1,988, decode ~90, 128K-context tg64 31.8) were supplied in the planning
-   brief but appear in no merged document; section 2.2 carries the merged #1161 range (pp512 1,588-1,994, decode 81-90).
+1. **Flint on current dev vs llama.cpp** `dde879bc`: the 2026-11 smoke (pp512 1,967-1,988, tg64 90.0-90.4, 128K tg64 31.8)
+   has no llama.cpp pair (likely unsupported or not tried); the ratios in 2.2 are from `0ae0e1976`.
 2. **llama.cpp Vulkan on Strix for small dense models** (SmolLM-135M, Llama-3.2-1B Q8_0 at 81.8 tok/s, Bielik, Qwen2.5-0.5B):
    [PERFORMANCE.md](PERFORMANCE.md) section 6.2 says "not measured". Open since the May baseline.
 3. **Embedding encoders vs llama.cpp on the current tree**: CPU (the ratio in section 6 is derived across sessions) and
@@ -282,3 +361,8 @@ Gaps and stale rows, each of which a reader could mistake for a current figure:
    to use the T5500 and the GPU lock.
 8. **Qwen3.8-27B in a quiet-box session**: the #1517 / #1520 table was taken in a slower state (-14 % for both engines);
    ratios are valid, absolutes are not records.
+9. **Pruned Flash-Next Coder** (2.7): GPU heap, an F32-decoded control for the CPU divergence, MTP on more than two prompts,
+   and ~8K prefill (llama.cpp 340 +/- 101 is too noisy to rank).
+10. **Flash-Next UD-IQ4_XS** (2.8): interleaved pp512 and decode in a quiet-box session (the box drifted 278-545 tok/s).
+11. **Tiled prefill hybrids** (2.9): Qwen3.8-27B and Qwen3.6 (hd256 path) after #1553, and llama.cpp for the models other
+    than Qwen3-4B in the new/old table.
