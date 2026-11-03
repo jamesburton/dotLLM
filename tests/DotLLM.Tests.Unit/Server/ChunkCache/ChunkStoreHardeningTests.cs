@@ -205,7 +205,7 @@ public sealed class ChunkStoreHardeningTests : IDisposable
         string root = NewRoot();
         var host = new FakeHost();
         var s = Start(root, host);
-        s.Queue.QuietPeriod = TimeSpan.FromSeconds(1);
+        s.Queue.QuietPeriod = TimeSpan.FromSeconds(4); // wide margin: a stalled runner must not fake a quiet gap
         using var stop = new CancellationTokenSource();
         var toggler = Task.Run(async () =>
         {
@@ -215,7 +215,7 @@ public sealed class ChunkStoreHardeningTests : IDisposable
                 Interlocked.Increment(ref host.Stamp);
                 await Task.Delay(150);
                 host.Busy = false;
-                await Task.Delay(300); // idle gaps shorter than the quiet period
+                await Task.Delay(300); // idle gaps far shorter than the quiet period
             }
         });
         Admitted(s, Text('g'), KeyFor(Text('g')));
@@ -235,14 +235,14 @@ public sealed class ChunkStoreHardeningTests : IDisposable
         string root = NewRoot();
         var host = new FakeHost();
         var s = Start(root, host);
-        s.Queue.QuietPeriod = TimeSpan.FromSeconds(1);
+        s.Queue.QuietPeriod = TimeSpan.FromSeconds(4); // wide margin: a stalled runner must not fake a quiet gap
         using var stop = new CancellationTokenSource();
         var bumper = Task.Run(async () =>
         {
             while (!stop.IsCancellationRequested)
             {
                 Interlocked.Increment(ref host.Stamp); // never observed as busy, only as activity
-                await Task.Delay(300);
+                await Task.Delay(200);
             }
         });
         Admitted(s, Text('q'), KeyFor(Text('q')));
