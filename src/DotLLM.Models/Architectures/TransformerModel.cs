@@ -174,7 +174,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             ? static _ => (true, true, true)
             : null;
         var weights = TransformerWeights.LoadFromGguf(gguf, config, moeBankSkipSelector: skipRoutedF32, allowNanoQuant: true,
-                                                      allowNvfp4Scales: true);
+                                                      allowNvfp4Scales: true,
+                                                      allowGlm4MoeCpu: true); // glm4moe CPU forward (#1599)
         // Route through the shared state builder so the GGUF path gets the same
         // per-attention-type RoPE tables, partial-rotary handling, and distinct
         // per-layer head-dim scratch sizing as the safetensors path (Gemma 4 needs

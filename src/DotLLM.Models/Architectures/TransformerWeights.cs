@@ -1405,15 +1405,20 @@ internal sealed class TransformerWeights : IDisposable
     /// <param name="allowNvfp4Scales">True only for the CPU backend: loads the NVFP4 <c>.scale</c> tensors of a Flint GGUF
     /// (#1578) so the CPU model applies them. Every other caller leaves it false and gets a clear
     /// <see cref="NotSupportedException"/> for a file that carries scales.</param>
+    /// <param name="allowGlm4MoeCpu">True only for the CPU <c>TransformerModel</c> (#1599): admits <c>glm4moe</c>, which only that model
+    /// can run. Every other caller (Vulkan, CUDA, hybrid hosts) leaves it false and keeps the loud refusal.</param>
     public static TransformerWeights LoadFromGguf(GgufFile gguf, ModelConfig config,
                                                     bool skipF32MoeDequant = false,
                                                     Func<int, (bool SkipGate, bool SkipUp, bool SkipDown)>? moeBankSkipSelector = null,
                                                     bool allowNanoQuant = false,
                                                     bool skipMlaF32Dequant = false,
                                                     bool skipSharedExpertF32Dequant = false,
-                                                    bool allowNvfp4Scales = false)
+                                                    bool allowNvfp4Scales = false,
+                                                    bool allowGlm4MoeCpu = false)
     {
-        ThrowIfArchitectureNeedsDedicatedLoader(config);
+        // glm4moe (#1599): only the CPU TransformerModel (allowGlm4MoeCpu) has a forward pass for it; Vulkan/CUDA keep the refusal.
+        if (!(allowGlm4MoeCpu && config.Architecture == DotLLM.Core.Configuration.Architecture.Glm4Moe))
+            ThrowIfArchitectureNeedsDedicatedLoader(config);
 
         var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
@@ -1422,7 +1427,8 @@ internal sealed class TransformerWeights : IDisposable
         // MiMo-V2 / Flint layers use). Every other caller (Vulkan, CUDA, HIP) still refuses a file that carries scales.
         bool applyNvfp4Scales = allowNvfp4Scales;
         bool groupedMoe = config.Architecture is DotLLM.Core.Configuration.Architecture.MiMoV2
-                                              or DotLLM.Core.Configuration.Architecture.Flint;
+                                              or DotLLM.Core.Configuration.Architecture.Flint
+                                              or DotLLM.Core.Configuration.Architecture.Glm4Moe;
         Nvfp4Support.RejectUnappliedScales(tensors,
             applyNvfp4Scales ? Nvfp4Support.ScalesAppliedByCpuTransformer(tensors, groupedMoe) : null,
             "The shared transformer weight loader"); // #1038
@@ -1867,10 +1873,11 @@ internal sealed class TransformerWeights : IDisposable
         // Optional FFN sub-norm (BitNet Sub-LN): RMSNorm over the gated intermediate [intermediateSize] before ffn_down.
         float[]? ffnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.ffn_sub_norm.weight", config.IntermediateSize);
 
-        // MiMo-V2 / Flint routed-MoE layer: sigmoid (+ optional selection-bias) top-k, raw GGUF quant banks kept in place
-        // (the F32 host dequant would be ~1.2 TB at MiMo's 310B scale, ~150 GB for Flint). Flint's ungated shared expert also
-        // stays raw (ForwardMoeGrouped runs it quantised). Leading dense layers fall through to the dense path below.
+        // MiMo-V2 / Flint / glm4moe routed-MoE layer: sigmoid (+ optional selection-bias) top-k, raw GGUF quant banks kept in place
+        // (the F32 host dequant would be ~1.2 TB at MiMo's 310B scale, ~150 GB for Flint). The ungated shared expert also
+        // stays raw (ForwardMoeGrouped runs it quantised). Leading dense layers (glm4moe layer 0) fall through to the dense path below.
         if (config.Architecture is DotLLM.Core.Configuration.Architecture.MiMoV2 or DotLLM.Core.Configuration.Architecture.Flint
+                                or DotLLM.Core.Configuration.Architecture.Glm4Moe
             && config.Moe is not null && config.Moe.IsMoeLayer(layerIdx)
             && tensors.ContainsKey($"{prefix}.ffn_gate_exps.weight"))
         {

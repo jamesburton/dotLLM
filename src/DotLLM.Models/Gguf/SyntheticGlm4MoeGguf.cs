@@ -95,20 +95,20 @@ public static class SyntheticGlm4MoeGguf
             w.AddUInt32($"{arch}.nextn_predict_layers", 1);
         AddTokenizer(w);
 
-        void Mat(string name, int inK, int outM)
+        void Mat(string name, int inK, int outM, float amp = 0.05f)
         {
             if (name == omitTensor) return;
             int extra = name == wrongShapeTensor ? 1 : 0;
             var f = new float[(long)(inK + extra) * outM];
-            for (int i = 0; i < f.Length; i++) f[i] = rng.NextSigned(0.05f);
+            for (int i = 0; i < f.Length; i++) f[i] = rng.NextSigned(amp);
             Add(w, name, [inK + extra, outM], f);
         }
-        void Vec(string name, int n, float center)
+        void Vec(string name, int n, float center, float amp = 0.05f)
         {
             if (name == omitTensor) return;
             int len = n + (name == wrongShapeTensor ? 1 : 0);
             var f = new float[len];
-            for (int i = 0; i < f.Length; i++) f[i] = center + rng.NextSigned(0.05f);
+            for (int i = 0; i < f.Length; i++) f[i] = center + rng.NextSigned(amp);
             Add(w, name, [len], f);
         }
         void Bank(string name, int inK, int mid)
@@ -116,7 +116,7 @@ public static class SyntheticGlm4MoeGguf
             if (name == omitTensor) return;
             int extra = name == wrongShapeTensor ? 1 : 0;
             var f = new float[(long)(inK + extra) * mid * numExperts];
-            for (int i = 0; i < f.Length; i++) f[i] = rng.NextSigned(0.05f);
+            for (int i = 0; i < f.Length; i++) f[i] = rng.NextSigned(0.4f);
             Add(w, name, [inK + extra, mid, numExperts], f);
         }
 
@@ -132,12 +132,14 @@ public static class SyntheticGlm4MoeGguf
             string p = $"blk.{l}";
             bool isNextn = l >= trunkLayers;
             Vec($"{p}.attn_norm.weight", HiddenSize, 1f);
-            Mat($"{p}.attn_q.weight", HiddenSize, nq);
-            Vec($"{p}.attn_q.bias", nq, 0f);
-            Mat($"{p}.attn_k.weight", HiddenSize, nkv);
-            Vec($"{p}.attn_k.bias", nkv, 0f);
+            // Q/K amplitudes (and the biases) are large on purpose: with +-0.05 the softmax is near-uniform and RoPE, the QKV bias and
+            // the attention path are all but invisible in the logits, so a test could not tell a wrong rotation from a right one.
+            Mat($"{p}.attn_q.weight", HiddenSize, nq, 1.0f);
+            Vec($"{p}.attn_q.bias", nq, 0f, 0.8f);
+            Mat($"{p}.attn_k.weight", HiddenSize, nkv, 1.0f);
+            Vec($"{p}.attn_k.bias", nkv, 0f, 0.8f);
             Mat($"{p}.attn_v.weight", HiddenSize, nkv);
-            Vec($"{p}.attn_v.bias", nkv, 0f);
+            Vec($"{p}.attn_v.bias", nkv, 0f, 0.3f);
             Mat($"{p}.attn_output.weight", nq, HiddenSize);
             if (withQkNorm)
             {
@@ -153,14 +155,15 @@ public static class SyntheticGlm4MoeGguf
             }
             else
             {
-                Mat($"{p}.ffn_gate_inp.weight", HiddenSize, numExperts);
-                Vec($"{p}.exp_probs_b.bias", numExperts, 0f);
+                // Router + selection bias large enough that routing is peaky, the bias flips selections, and the sigmoid scores are not all ~0.5.
+                Mat($"{p}.ffn_gate_inp.weight", HiddenSize, numExperts, 0.6f);
+                Vec($"{p}.exp_probs_b.bias", numExperts, 0f, 0.3f);
                 Bank($"{p}.ffn_gate_exps.weight", HiddenSize, MoeIntermediate);
                 Bank($"{p}.ffn_up_exps.weight", HiddenSize, MoeIntermediate);
                 Bank($"{p}.ffn_down_exps.weight", MoeIntermediate, HiddenSize);
-                Mat($"{p}.ffn_gate_shexp.weight", HiddenSize, shared);
-                Mat($"{p}.ffn_up_shexp.weight", HiddenSize, shared);
-                Mat($"{p}.ffn_down_shexp.weight", shared, HiddenSize);
+                Mat($"{p}.ffn_gate_shexp.weight", HiddenSize, shared, 0.4f);
+                Mat($"{p}.ffn_up_shexp.weight", HiddenSize, shared, 0.4f);
+                Mat($"{p}.ffn_down_shexp.weight", shared, HiddenSize, 0.4f);
             }
             if (isNextn)
             {

@@ -86,8 +86,9 @@ public static class ModelLoader
             Architecture.Qwen3HybridDense => Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             // CPU reference forward (#816): GR + GDN/QSA + 512-expert MoE + n-gram PLE.
             Architecture.Qwen4Exp => Qwen4ExpTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
-            // glm4moe (#1598): config + tensor census only; refuse instead of falling into the generic transformer loader.
-            Architecture.Glm4Moe => throw new NotSupportedException(ModelConfig.Glm4MoeUnsupportedMessage("CPU")),
+            // glm4moe (#1599): CPU forward on the shared TransformerModel (GQA + QKV bias, partial NeoX RoPE, dense layer 0, sigmoid + exp_probs_b MoE
+            // with an ungated shared expert, banks kept in the raw quant view). No NextN/MTP yet; GPU backends still refuse.
+            Architecture.Glm4Moe => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
         };
     }

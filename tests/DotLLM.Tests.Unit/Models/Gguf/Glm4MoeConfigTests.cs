@@ -266,26 +266,27 @@ public sealed class Glm4MoeConfigTests : IDisposable
     // ───────────────────────── Loud failure ─────────────────────────
 
     [Fact]
-    public void Cpu_Dispatch_Refuses_NamingTheArchitecture()
+    public void Cpu_Dispatch_Loads_And_Generic_Gpu_Loader_Still_Refuses()
     {
+        // #1599: the CPU dispatcher now builds a TransformerModel; the shared GPU weight loader keeps refusing (no allowGlm4MoeCpu).
         var (file, c) = Open();
         using (file)
         {
-            var ex = Assert.Throws<NotSupportedException>(() => ModelLoader.CreateCpuModelFromGguf(file, c));
-            Assert.Contains("glm4moe", ex.Message, StringComparison.Ordinal);
-            // The dispatcher's own arm (not just the generic loader's backstop) must be what refuses.
-            Assert.Contains("backend: CPU", ex.Message, StringComparison.Ordinal);
-            Assert.Throws<NotSupportedException>(() => TransformerModel.LoadFromGguf(file, c));
+            using var model = ModelLoader.CreateCpuModelFromGguf(file, c);
+            Assert.IsType<TransformerModel>(model);
+            Assert.Equal(c.NumLayers, model.Config.NumLayers);
             Assert.Throws<NotSupportedException>(() => TransformerWeights.LoadFromGguf(file, c));
         }
     }
 
     [Fact]
-    public void ModelLoader_LoadFromGguf_Refuses_FromPath()
+    public void ModelLoader_LoadFromGguf_Loads_FromPath()
     {
         string path = SyntheticGlm4MoeGguf.Write(Path.Combine(_dir, "p.gguf"));
-        var ex = Assert.Throws<NotSupportedException>(() => ModelLoader.LoadFromGguf(path));
-        Assert.Contains("glm4moe", ex.Message, StringComparison.Ordinal);
+        var (model, gguf, config) = ModelLoader.LoadFromGguf(path);
+        using (gguf)
+        using (model)
+            Assert.Equal(Architecture.Glm4Moe, config.Architecture);
     }
 
     [Fact]
