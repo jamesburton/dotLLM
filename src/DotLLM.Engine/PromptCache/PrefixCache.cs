@@ -122,6 +122,20 @@ public sealed class PrefixCache : IDisposable
     }
 
     /// <summary>
+    /// Narrows <paramref name="entry"/> to its first <paramref name="validRows"/> tokens, in place. Call before a request
+    /// overwrites the cache's rows from <paramref name="validRows"/> on: a request that then fails or is cancelled leaves the
+    /// entry claiming only rows that still hold the K/V of the tokens it names.
+    /// </summary>
+    internal void Narrow(PrefixCacheEntry entry, int validRows)
+    {
+        if (validRows >= entry.TokenSequence.Length)
+            return;
+        entry.TokenSequence = entry.TokenSequence.AsSpan(0, validRows).ToArray();
+        if (entry.FirstApproxRow is int first && first >= validRows)
+            entry.FirstApproxRow = null;
+    }
+
+    /// <summary>
     /// Removes all entries and disposes their KV-caches.
     /// </summary>
     public void Clear()
