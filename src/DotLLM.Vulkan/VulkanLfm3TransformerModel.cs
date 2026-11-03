@@ -1,0 +1,571 @@
+using System.Runtime.InteropServices;
+using DotLLM.Core.Attention;
+using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
+using DotLLM.Core.Models;
+using DotLLM.Core.Tensors;
+using DotLLM.Models.Architectures;
+using DotLLM.Models.Gguf;
+using DotLLM.Vulkan.Interop;
+using DotLLM.Vulkan.Kernels;
+using Architecture = DotLLM.Core.Configuration.Architecture;
+
+namespace DotLLM.Vulkan;
+
+/// <summary>
+/// Vulkan LFM3 (<c>lfm3</c>) model (issue #1562). Same layer algebra as the CPU <see cref="Lfm3TransformerModel"/>:
+/// <c>x += post_operator_norm(mixer(operator_norm(x))); x += post_ffn_norm(ffn(ffn_norm(x)))</c> with a gated short-conv
+/// (<c>L_cache = 7</c>), sliding-window GQA or global GQA mixer (QK RMS-norm, NeoX RoPE, per-head sigmoid gate) and a dense SwiGLU FFN.
+/// The recording machinery (kernel registry, scratch state, matmul / embedding recorders) is borrowed from
+/// <see cref="VulkanQwen3MoeHybridTransformerModel"/> through a layer-less host, as <see cref="VulkanLfm2MoeTransformerModel"/> does.
+/// </summary>
+/// <remarks>
+/// <para><b>RoPE.</b> Sliding layers rotate all 64 NeoX pairs with theta 1e4. Global layers rotate only the first 32 pairs, but with the
+/// frequency exponent over the FULL head dim (<c>2i/128</c>) and the pair partner at <c>i + 64</c>: the Gemma-4 partial-global convention
+/// the plain RoPE kernel already supports (<c>ropeDim = 64, freqDim = 128, neoxPairOffset = 64</c>).</para>
+/// <para><b>Weights</b> are uploaded in their GGUF quantization (Q4_0 stays packed when native kernels exist; otherwise the exact Q8_0
+/// transcode used by the LFM2 model).</para>
+/// </remarks>
+public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
+{
+    private readonly VulkanDevice _device;
+    private readonly Lfm3TransformerModel _cpu;      // keeps the GGUF mmap alive and owns the weight views
+    private readonly VulkanQwen3MoeHybridTransformerModel _host;
+    private readonly SigmoidGateMulHeadsF32Kernel _gateMul;
+    private readonly LayerDev[] _layers;
+    private readonly HybridLayerLayout _layout;
+    private readonly int[] _convOrdinal;
+    private readonly int _convLayerCount;
+    private readonly int _lCache;
+    private readonly float _localTheta, _globalTheta;
+    private readonly int _globalRotPairs;
+    private readonly VulkanLfm2ConvStateCache _defaultState;
+    private VulkanLfm2ConvStateCache? _activeState;
+    private readonly List<nint> _ownedHost;
+    private long _deviceWeightBytes;
+    private VulkanDevice.Buffer? _ffnGate, _ffnUp, _convProj, _attnGate;
+    private int _scratchCapacity;
+    private VulkanDevice.Buffer? _multiRowLogits;
+    private int _multiRowLogitsRows;
+    private int _allRowLogitsLimit;
+    private long _seenKvBufferEpoch = -1;
+
+    /// <inheritdoc/>
+    public ModelConfig Config { get; }
+
+    /// <inheritdoc/>
+    public long ComputeMemoryBytes => _host.ComputeMemoryBytes + _deviceWeightBytes + _defaultState.AllocatedBytes;
+
+    /// <summary>Number of attention layers (global + sliding): the sparse KV-cache slot count.</summary>
+    public int AttentionLayerCount => _host.AttentionLayerCount;
+
+    /// <summary>
+    /// Creates the sparse (attention-layers-only), lazily allocated KV cache this model expects. It may grow up to the context window.
+    /// </summary>
+    /// <param name="maxSeqLen">Initial logical capacity in positions (capped at the context window).</param>
+    /// <returns>The new cache.</returns>
+    public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen)
+        => _host.CreateKvCache(Math.Min(maxSeqLen, Config.MaxSequenceLength), VulkanKvStorage.F32, lazy: true,
+                               growthLimit: Config.MaxSequenceLength);
+
+    private sealed class LayerDev
+    {
+        public required VulkanDevice.Buffer OperatorNorm, FfnNorm;
+        public VulkanDevice.Buffer? PostOperatorNorm, PostFfnNorm;
+        // conv
+        public VulkanDevice.Buffer? InProj, ConvW, OutProj;
+        // attention
+        public VulkanDevice.Buffer? Q, K, V, O, QNorm, KNorm, AttnGate;
+        public int NumKvHeads;
+        public int Window;                        // 0 = global
+        public bool IsAttention;
+        // dense FFN
+        public VulkanDevice.Buffer? Gate, Up, Down;
+        public QuantizationType InProjQt, OutProjQt, QQt, KQt, VQt, OQt, AttnGateQt, GateQt, UpQt, DownQt;
+        public int GateOut;
+    }
+
+    private VulkanLfm3TransformerModel(VulkanDevice device, ModelConfig config, Lfm3TransformerModel cpu,
+        VulkanQwen3MoeHybridTransformerModel host, SigmoidGateMulHeadsF32Kernel gateMul, LayerDev[] layers, int[] convOrdinal, int convLayers,
+        float localTheta, float globalTheta, int globalRotPairs, long deviceBytes, List<nint> ownedHost)
+    {
+        _device = device;
+        Config = config;
+        _cpu = cpu;
+        _host = host;
+        _gateMul = gateMul;
+        _layers = layers;
+        _layout = config.HybridLayout!;
+        _convOrdinal = convOrdinal;
+        _convLayerCount = convLayers;
+        _lCache = config.ShortConvCacheLength;
+        _localTheta = localTheta;
+        _globalTheta = globalTheta;
+        _globalRotPairs = globalRotPairs;
+        _deviceWeightBytes = deviceBytes;
+        _ownedHost = ownedHost;
+        _defaultState = new VulkanLfm2ConvStateCache(device, convLayers, _lCache - 1, config.HiddenSize);
+    }
+
+    // ── Loading ──────────────────────────────────────────────────────────────
+
+    /// <summary>Builds the Vulkan model from an opened GGUF (which must outlive the model).</summary>
+    public static VulkanLfm3TransformerModel BuildFromGguf(VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        ArgumentNullException.ThrowIfNull(gguf);
+        ArgumentNullException.ThrowIfNull(config);
+        if (config.Architecture != Architecture.Lfm3)
+            throw new ArgumentException($"VulkanLfm3TransformerModel requires Architecture.Lfm3, got {config.Architecture}.", nameof(config));
+        if (!Lfm2ShortConvF32Kernel.IsSupportedOn(spvDir))
+            throw new FileNotFoundException($"lfm2_shortconv_f32.spv not found in {spvDir}.");
+        if (config.ShortConvCacheLength > 8)
+            throw new NotSupportedException($"lfm2_shortconv_f32 supports L_cache <= 8; the model has {config.ShortConvCacheLength}.");
+
+        var cpu = Lfm3TransformerModel.LoadFromGguf(gguf, config);
+        int hidden = config.HiddenSize, hd = config.HeadDim;
+        var owned = new List<nint>();
+        long bytes = 0;
+
+        var (embPtr, embQt) = cpu.TokenEmbed;
+        var (outPtr, outQt, outM, outK) = cpu.Output;
+        var head = VulkanQwen3MoeHybridWeights.UploadHeadOnly(device, config, cpu.OutputNormWeight, embPtr, embQt, outPtr, outQt, outM, outK);
+        bytes += head.AllocatedBytes;
+
+        // The Gemma-4 style partial rotation expresses LFM3's global layers only when every rotated pair has freq factor 1 and the
+        // tail is identity; anything else (a checkpoint with rescaled frequencies) is refused rather than rotated wrongly.
+        int rotPairs = cpu.GlobalRotatedPairs;
+        float globalTheta = config.GlobalRoPEConfig?.Theta ?? 1_000_000f, localTheta = config.RoPEConfig?.Theta ?? 10_000f;
+        for (int i = 0; i < hd / 2; i++)
+        {
+            float expected = i < rotPairs ? MathF.Pow(globalTheta, -2f * i / hd) : 0f;
+            if (MathF.Abs(cpu.InvFreqGlobal[i] - expected) > 1e-6f * MathF.Max(1f, MathF.Abs(expected)))
+                throw new NotSupportedException($"LFM3 Vulkan: rope_freqs.weight is not a 1.0-then-identity table (pair {i}); the partial NeoX rope kernel cannot express it.");
+        }
+
+        // The layer-less host sizes its MoE scratch from config.Moe; LFM3 has none, so hand it a one-expert placeholder it never uses.
+        var hostConfig = config with { Moe = new MoeConfig { NumExperts = 1, NumExpertsPerTok = 1, MoeIntermediateSize = 1 } };
+        var host = VulkanQwen3MoeHybridTransformerModel.CreateLayerlessHost(device, hostConfig, spvDir, head,
+            cpu.KvSlotForLayer, cpu.AttentionLayerCount, hd, localTheta);
+        host.Q8GateUpMmvq = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM2_Q8_GATEUP_MMVQ") != "0";
+        bool native = host.SupportsNativeQ4_0;
+        var gateMul = SigmoidGateMulHeadsF32Kernel.Create(device, spvDir);
+
+        var layers = new LayerDev[config.NumLayers];
+        var layout = config.HybridLayout!;
+        using var staging = VulkanStagingBuffer.Create(device, 64L * 1024 * 1024);
+        VulkanWeightImportPolicy.Reset();
+
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            var cl = cpu.LayerWeights[i];
+            var ld = new LayerDev
+            {
+                OperatorNorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, cl.OperatorNorm),
+                FfnNorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, cl.FfnNorm),
+                PostOperatorNorm = cl.PostOperatorNorm is null ? null : VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, cl.PostOperatorNorm),
+                PostFfnNorm = cl.PostFfnNorm is null ? null : VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, cl.PostFfnNorm),
+                Window = cl.Window ?? 0,
+            };
+            bytes += (long)(cl.OperatorNorm.Length + cl.FfnNorm.Length + (cl.PostOperatorNorm?.Length ?? 0) + (cl.PostFfnNorm?.Length ?? 0)) * sizeof(float);
+
+            if (layout.LayerKind[i] == HybridLayerKind.ShortConv)
+            {
+                ld.InProj = UploadProjection(device, staging, cl.InProj.Ptr, cl.InProj.Qt, cl.InProj.OutDim, cl.InProj.InDim, owned, native, out ld.InProjQt, ref bytes);
+                ld.OutProj = UploadProjection(device, staging, cl.OutProj.Ptr, cl.OutProj.Qt, cl.OutProj.OutDim, cl.OutProj.InDim, owned, native, out ld.OutProjQt, ref bytes);
+                // CPU keeps the taps tap-major ([L][H]); the shader wants channel-major (GGUF layout): w[c*L + k].
+                int L = config.ShortConvCacheLength;
+                var wT = cl.ConvWeightT!;
+                var w = new float[L * hidden];
+                for (int c = 0; c < hidden; c++)
+                    for (int k = 0; k < L; k++)
+                        w[c * L + k] = wT[k * hidden + c];
+                ld.ConvW = VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, w);
+                bytes += (long)w.Length * sizeof(float);
+            }
+            else
+            {
+                var a = cl.Attn!;
+                ld.IsAttention = true;
+                ld.Q = UploadProjection(device, staging, a.QWeight, a.QQuantType, a.QOutputDim, a.QInputDim, owned, native, out ld.QQt, ref bytes);
+                ld.K = UploadProjection(device, staging, a.KWeight, a.KQuantType, a.KOutputDim, a.KInputDim, owned, native, out ld.KQt, ref bytes);
+                ld.V = UploadProjection(device, staging, a.VWeight, a.VQuantType, a.VOutputDim, a.VInputDim, owned, native, out ld.VQt, ref bytes);
+                ld.O = UploadProjection(device, staging, a.OWeight, a.OQuantType, a.OOutputDim, a.OInputDim, owned, native, out ld.OQt, ref bytes);
+                ld.AttnGate = UploadProjection(device, staging, cl.AttnGate.Ptr, cl.AttnGate.Qt, cl.AttnGate.OutDim, cl.AttnGate.InDim, owned, native, out ld.AttnGateQt, ref bytes);
+                ld.QNorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, a.QNormWeight);
+                ld.KNorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, a.KNormWeight);
+                ld.NumKvHeads = a.NumKvHeads;
+                bytes += (long)(a.QNormWeight.Length + a.KNormWeight.Length) * sizeof(float);
+            }
+
+            ld.Gate = UploadProjection(device, staging, cl.DenseGate.Ptr, cl.DenseGate.Qt, cl.DenseGate.OutDim, cl.DenseGate.InDim, owned, native, out ld.GateQt, ref bytes);
+            ld.Up = UploadProjection(device, staging, cl.DenseUp.Ptr, cl.DenseUp.Qt, cl.DenseUp.OutDim, cl.DenseUp.InDim, owned, native, out ld.UpQt, ref bytes);
+            ld.Down = UploadProjection(device, staging, cl.DenseDown.Ptr, cl.DenseDown.Qt, cl.DenseDown.OutDim, cl.DenseDown.InDim, owned, native, out ld.DownQt, ref bytes);
+            ld.GateOut = cl.DenseGate.OutDim;
+            layers[i] = ld;
+        }
+
+        return new VulkanLfm3TransformerModel(device, config, cpu, host, gateMul, layers, cpu.ConvOrdinalForLayer, cpu.ConvLayerCount,
+            localTheta, globalTheta, rotPairs, bytes, owned);
+    }
+
+    private static nint AllocPages(long bytes)
+    {
+        long rounded = (bytes + 4095) & ~4095L;
+        return (nint)NativeMemory.AlignedAlloc((nuint)rounded, 4096);
+    }
+
+    /// <summary>
+    /// Uploads a projection in its source quantization. A Q4_0 source stays packed (4.5 bpw) when native kernels exist; otherwise it is
+    /// transcoded exactly to Q8_0 into a page-aligned host buffer kept alive for the model's lifetime (the upload may import it).
+    /// </summary>
+    private static VulkanDevice.Buffer UploadProjection(VulkanDevice device, VulkanStagingBuffer staging, nint src, QuantizationType qt,
+        int outDim, int inDim, List<nint> owned, bool native, out QuantizationType deviceQt, ref long bytes)
+    {
+        nint ptr = src;
+        if (qt == QuantizationType.Q4_0 && native && inDim % 32 == 0)
+        {
+            var raw = VulkanQwen3MoeHybridWeights.UploadRawQuantMatrix(device, staging, src, qt, outDim, inDim, out long rawBytes);
+            deviceQt = QuantizationType.Q4_0;
+            bytes += rawBytes;
+            return raw;
+        }
+        if (qt == QuantizationType.Q4_0)
+        {
+            if (inDim % 32 != 0) throw new NotSupportedException($"Q4_0 projection with K={inDim} is not a multiple of 32.");
+            long blocks = (long)outDim * (inDim / 32);
+            ptr = AllocPages(blocks * 34);
+            owned.Add(ptr);
+            Q4_0ToQ8_0.Transcode(src, ptr, blocks);
+            qt = QuantizationType.Q8_0;
+        }
+        var buf = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, ptr, qt, outDim, inDim, forceF32: false, out deviceQt, out long up);
+        bytes += up;
+        return buf;
+    }
+
+    // ── IModel ───────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+        => ForwardCore(tokenIds, positions, deviceId, null, null);
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+        => ForwardCore(tokenIds, positions, deviceId, kvCache, null);
+
+    /// <summary>Forward with a caller-supplied per-sequence conv state (null = model-owned default).</summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache, ISsmState? ssmState)
+        => ForwardCore(tokenIds, positions, deviceId, kvCache, ResolveState(ssmState));
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           IKvCache? kvCache, ILoraAdapter? adapter)
+    {
+        if (adapter is not null)
+            throw new NotSupportedException("VulkanLfm3TransformerModel does not support LoRA adapters.");
+        return ForwardCore(tokenIds, positions, deviceId, kvCache, null);
+    }
+
+    private VulkanLfm2ConvStateCache? ResolveState(ISsmState? s)
+    {
+        if (s is null) return null;
+        if (s is VulkanLfm2ConvStateCache c && c.NumSsmLayers == _convLayerCount &&
+            c.StateSlots == _lCache - 1 && c.HiddenSize == Config.HiddenSize && ReferenceEquals(c.Device, _device))
+        {
+            c.ThrowIfDisposed();
+            return c;
+        }
+        throw new ArgumentException($"VulkanLfm3TransformerModel requires a {nameof(VulkanLfm2ConvStateCache)} with {_convLayerCount} layers; got {s.GetType().Name}.", nameof(s));
+    }
+
+    /// <inheritdoc/>
+    public void ResetSequenceState() => _defaultState.Reset();
+
+    /// <inheritdoc/>
+    public bool RequiresPerSequenceState => true;
+
+    /// <inheritdoc/>
+    public bool SupportsThreadedSequenceState => true;
+
+    /// <inheritdoc/>
+    public IRecurrentSequenceState? CreateSequenceState()
+        => new VulkanLfm2ConvStateCache(_device, _convLayerCount, _lCache - 1, Config.HiddenSize);
+
+    /// <inheritdoc/>
+    public bool TrySetAllRowLogitsLimit(int maxSeqLen)
+    {
+        if (maxSeqLen > _allRowLogitsLimit) _allRowLogitsLimit = maxSeqLen;
+        return _allRowLogitsLimit >= maxSeqLen;
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        var results = new ITensor[requests.Count];
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            if (r.Adapter is not null)
+                throw new NotSupportedException("VulkanLfm3TransformerModel does not support LoRA adapters.");
+            if (requests.Count > 1 && r.SsmState is null)
+                throw new ArgumentException($"ForwardBatch with {requests.Count} requests requires a per-seq SsmState; request[{i}] has none.");
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.SsmState);
+        }
+        return results;
+    }
+
+    private static void Fb(nint cmd) => KernelSupport.ComputeTransferFullBarrier(cmd);
+
+    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache, VulkanLfm2ConvStateCache? state)
+    {
+        int T = tokenIds.Length;
+        if (T == 0 || T != positions.Length)
+            throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
+        for (int i = 0; i < positions.Length; i++)
+            if ((uint)positions[i] >= (uint)Config.MaxSequenceLength)
+                throw new ArgumentOutOfRangeException(nameof(positions), $"Position {positions[i]} at index {i} exceeds max sequence length {Config.MaxSequenceLength}.");
+
+        var prev = _activeState;
+        _activeState = state ?? _defaultState;
+        try
+        {
+            return Run(tokenIds, positions, deviceId, kvCache);
+        }
+        finally
+        {
+            _activeState = prev;
+        }
+    }
+
+    private ITensor Run(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+    {
+        int T = tokenIds.Length;
+        int H = Config.HiddenSize, V = Config.VocabSize;
+        float eps = Config.NormEpsilon;
+        var st = _host.Q4State;
+        var kern = _host.Q4Kernels;
+        var wts = _host.Q4Weights;
+        bool allRows = T > 1 && _allRowLogitsLimit >= T;
+
+        bool resized = _host.Q4EnsureCapacity(T);
+        resized |= EnsureScratch(T);
+        if (allRows) resized |= EnsureMultiRow(T, V);
+        if (VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch))
+            resized = true;
+
+        if (resized) { _host.Q4InvalidateCaches(); _gateMul.InvalidateDescriptorCache(); }
+        _host.Q4UploadPositions(positions);
+
+        var submit = _host.Q4Submit;
+        submit.Begin();
+        nint cmd = submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmd);
+        _host.Q4RecordEmbedding(cmd, tokenIds);
+        KernelSupport.TransferToComputeBarrier(cmd);
+
+        ulong hiddenBytes = (ulong)((long)T * H * sizeof(float));
+        for (int layer = 0; layer < _layers.Length; layer++)
+        {
+            var ld = _layers[layer];
+
+            Fb(cmd);
+            VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, st.HiddenState, st.Residual, 0, 0, hiddenBytes);
+            Fb(cmd);
+            kern.RmsNorm.Record(cmd, st.HiddenState, ld.OperatorNorm, st.NormOutput, rowCount: T, n: H, eps: eps);
+            Fb(cmd);
+
+            if (ld.IsAttention) RecordAttention(cmd, ld, layer, T, positions, kvCache);
+            else RecordConv(cmd, ld, _convOrdinal[layer], T);
+
+            if (ld.PostOperatorNorm is not null)
+            {
+                Fb(cmd);
+                kern.RmsNorm.Record(cmd, st.NormOutput, ld.PostOperatorNorm, st.NormOutput, rowCount: T, n: H, eps: eps);
+            }
+            Fb(cmd);
+            kern.Add.Record(cmd, st.Residual, st.NormOutput, st.HiddenState, T * H);
+            Fb(cmd);
+            VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, st.HiddenState, st.Residual, 0, 0, hiddenBytes);
+            Fb(cmd);
+            kern.RmsNorm.Record(cmd, st.HiddenState, ld.FfnNorm, st.NormOutput, rowCount: T, n: H, eps: eps);
+            Fb(cmd);
+
+            RecordDense(cmd, ld, T);
+
+            if (ld.PostFfnNorm is not null)
+            {
+                Fb(cmd);
+                kern.RmsNorm.Record(cmd, st.NormOutput, ld.PostFfnNorm, st.NormOutput, rowCount: T, n: H, eps: eps);
+            }
+            Fb(cmd);
+            kern.Add.Record(cmd, st.Residual, st.NormOutput, st.HiddenState, T * H);
+
+            // Windows TDR: a single submission must finish within ~2 s. A long prefill of the whole stack does not, so a multi-row
+            // forward is cut into several submissions.
+            if (T > 1 && (layer + 1) % LayersPerSubmit(T) == 0 && layer + 1 < _layers.Length)
+            {
+                Fb(cmd);
+                submit.SubmitAndWait();
+                submit.Begin();
+                cmd = submit.CommandBuffer;
+            }
+        }
+
+        // Final norm + tied LM head.
+        Fb(cmd);
+        int rows = allRows ? T : 1;
+        ulong rowBytes = (ulong)((long)rows * H * sizeof(float));
+        ulong srcOff = allRows ? 0UL : (ulong)((long)(T - 1) * H * sizeof(float));
+        VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, st.HiddenState, st.NormOutput, srcOff, 0, rowBytes);
+        KernelSupport.TransferToComputeBarrier(cmd);
+        kern.RmsNorm.Record(cmd, st.NormOutput, wts.OutputNormWeight, st.NormOutput, rowCount: rows, n: H, eps: eps);
+        Fb(cmd);
+        var logitsBuf = allRows ? _multiRowLogits! : st.Logits;
+        _host.Q4RecordMatmul(cmd, wts.OutputWeight, wts.OutputDeviceQuantType, st.NormOutput, logitsBuf,
+            wts.OutputOutputDim, wts.OutputInputDim, rows);
+        KernelSupport.ComputeToHostBarrier(cmd);
+        submit.SubmitAndWait();
+
+        var result = UnmanagedTensor.Allocate(new TensorShape(rows, V), DType.Float32, deviceId: -1);
+        _device.Download(logitsBuf, new Span<float>((void*)result.DataPointer, rows * V));
+        return result;
+    }
+
+    private static int LayersPerSubmit(int T) => T >= 4096 ? 1 : T >= 1536 ? 2 : 4;
+
+    private bool EnsureScratch(int T)
+    {
+        if (_ffnGate is not null && _scratchCapacity >= T) return false;
+        _ffnGate?.Dispose(); _ffnUp?.Dispose(); _convProj?.Dispose(); _attnGate?.Dispose();
+        int cap = 1;
+        while (cap < T) cap *= 2;
+        long f = Config.IntermediateSize;
+        _ffnGate = _device.AllocateDeviceLocal((long)cap * f * sizeof(float));
+        _ffnUp = _device.AllocateDeviceLocal((long)cap * f * sizeof(float));
+        _convProj = _device.AllocateDeviceLocal((long)cap * 3 * Config.HiddenSize * sizeof(float));
+        _attnGate = _device.AllocateDeviceLocal((long)cap * Config.NumAttentionHeads * sizeof(float));
+        _scratchCapacity = cap;
+        return true;
+    }
+
+    private bool EnsureMultiRow(int rows, int vocab)
+    {
+        if (_multiRowLogits is not null && _multiRowLogitsRows >= rows) return false;
+        _multiRowLogits?.Dispose();
+        _multiRowLogits = _device.AllocateHostReadback((long)rows * vocab * sizeof(float));
+        _multiRowLogitsRows = rows;
+        return true;
+    }
+
+    private void RecordConv(nint cmd, LayerDev ld, int ordinal, int T)
+    {
+        int H = Config.HiddenSize;
+        var st = _host.Q4State;
+        var conv = _host.Q4Kernels.Lfm2ShortConv!;
+        var state = _activeState!.GetBuffer(ordinal);
+        var proj = _convProj!;            // [T, 3*H]
+        var y = st.AttnOutput;            // [T, H]
+        _host.Q4RecordMatmul(cmd, ld.InProj!, ld.InProjQt, st.NormOutput, proj, 3 * H, H, T);
+        Fb(cmd);
+        conv.Record(cmd, state, proj, ld.ConvW!, y, _lCache, H, T);
+        Fb(cmd);
+        conv.RecordStateUpdate(cmd, state, proj, ld.ConvW!, y, _lCache, H, T);
+        Fb(cmd);
+        _host.Q4RecordMatmul(cmd, ld.OutProj!, ld.OutProjQt, y, st.NormOutput, H, H, T);
+    }
+
+    private void RecordAttention(nint cmd, LayerDev ld, int layer, int T, ReadOnlySpan<int> positions, IKvCache? kvCache)
+    {
+        var st = _host.Q4State;
+        var kern = _host.Q4Kernels;
+        int H = Config.HiddenSize;
+        int nh = Config.NumAttentionHeads, nkv = ld.NumKvHeads, hd = Config.HeadDim;
+        float eps = Config.NormEpsilon;
+        int window = ld.Window;
+
+        _host.Q4RecordMatmul(cmd, ld.Q!, ld.QQt, st.NormOutput, st.Q, nh * hd, H, T);
+        _host.Q4RecordMatmul(cmd, ld.K!, ld.KQt, st.NormOutput, st.K, nkv * hd, H, T);
+        _host.Q4RecordMatmul(cmd, ld.V!, ld.VQt, st.NormOutput, st.V, nkv * hd, H, T);
+        _host.Q4RecordMatmul(cmd, ld.AttnGate!, ld.AttnGateQt, st.NormOutput, _attnGate!, nh, H, T);
+        Fb(cmd);
+        kern.RmsNorm.Record(cmd, st.Q, ld.QNorm!, st.Q, rowCount: T * nh, n: hd, eps: eps);
+        kern.RmsNorm.Record(cmd, st.K, ld.KNorm!, st.K, rowCount: T * nkv, n: hd, eps: eps);
+        Fb(cmd);
+        if (window > 0)
+            kern.Rope.Record(cmd, st.Q, st.K, st.PositionsBuffer, seqLen: T, numHeads: nh, numKvHeads: nkv,
+                headDim: hd, ropeDim: hd, theta: _localTheta, variant: RopeF32Kernel.Variant.NeoX);
+        else
+            kern.Rope.Record(cmd, st.Q, st.K, st.PositionsBuffer, seqLen: T, numHeads: nh, numKvHeads: nkv,
+                headDim: hd, ropeDim: 2 * _globalRotPairs, theta: _globalTheta, variant: RopeF32Kernel.Variant.NeoX,
+                freqDim: hd, neoxPairOffset: hd / 2);
+
+        VulkanDevice.Buffer kSrc, vSrc;
+        int seqKv, posOff;
+        if (kvCache is VulkanNemotronHKvCache vk)
+        {
+            Fb(cmd);
+            vk.RecordUpdate(cmd, st.K, st.V, positions, T, layer, null);
+            Fb(cmd);
+            kSrc = vk.GetKeysBuffer(layer);
+            vSrc = vk.GetValuesBuffer(layer);
+            seqKv = vk.CurrentLength;
+            posOff = positions[0];
+        }
+        else
+        {
+            Fb(cmd);
+            kSrc = st.K; vSrc = st.V; seqKv = T; posOff = 0;
+        }
+
+        if (kern.SplitKvAttention is not null && T == 1 && hd <= VulkanSplitKvAttentionKernel.MaxHeadDim
+            && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, nh))
+            kern.SplitKvAttention.Record(cmd, st.Q, kSrc, vSrc, st.AttnOutput, seqQ: T, seqKv: seqKv, numHeads: nh, numKvHeads: nkv,
+                headDim: hd, positionOffset: posOff, slidingWindow: window);
+        else if (kern.FlashAttentionCoopmat is not null && T > 1 && hd <= kern.FlashAttentionCoopmat.SupportedMaxHeadDim)
+            kern.FlashAttentionCoopmat.Record(cmd, st.Q, kSrc, vSrc, st.AttnOutput, seqQ: T, seqKv: seqKv, numHeads: nh, numKvHeads: nkv,
+                headDim: hd, positionOffset: posOff, slidingWindow: window);
+        else if (kern.FlashAttention is not null && T > 1 && hd <= kern.FlashAttention.SupportedMaxHeadDim)
+            kern.FlashAttention.Record(cmd, st.Q, kSrc, vSrc, st.AttnOutput, seqQ: T, seqKv: seqKv, numHeads: nh, numKvHeads: nkv,
+                headDim: hd, positionOffset: posOff, slidingWindow: window);
+        else
+            kern.Attention.Record(cmd, st.Q, kSrc, vSrc, st.AttnOutput, seqQ: T, seqKv: seqKv, numHeads: nh, numKvHeads: nkv,
+                headDim: hd, positionOffset: posOff, slidingWindow: window);
+        Fb(cmd);
+        _gateMul.Record(cmd, st.AttnOutput, _attnGate!, T * nh * hd, hd);
+        Fb(cmd);
+        _host.Q4RecordMatmul(cmd, ld.O!, ld.OQt, st.AttnOutput, st.NormOutput, H, nh * hd, T);
+    }
+
+    private void RecordDense(nint cmd, LayerDev ld, int T)
+    {
+        var st = _host.Q4State;
+        int H = Config.HiddenSize, F = ld.GateOut;
+        _host.Q4RecordMatmul(cmd, ld.Gate!, ld.GateQt, st.NormOutput, _ffnGate!, F, H, T);
+        _host.Q4RecordMatmul(cmd, ld.Up!, ld.UpQt, st.NormOutput, _ffnUp!, F, H, T);
+        Fb(cmd);
+        _host.Q4Kernels.SwiGlu.Record(cmd, _ffnGate!, _ffnUp!, _ffnGate!, n: T * F);
+        Fb(cmd);
+        _host.Q4RecordMatmul(cmd, ld.Down!, ld.DownQt, _ffnGate!, st.NormOutput, H, F, T);
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        _defaultState.Dispose();
+        foreach (var l in _layers)
+        {
+            l.OperatorNorm.Dispose(); l.FfnNorm.Dispose(); l.PostOperatorNorm?.Dispose(); l.PostFfnNorm?.Dispose();
+            l.InProj?.Dispose(); l.ConvW?.Dispose(); l.OutProj?.Dispose();
+            l.Q?.Dispose(); l.K?.Dispose(); l.V?.Dispose(); l.O?.Dispose(); l.QNorm?.Dispose(); l.KNorm?.Dispose(); l.AttnGate?.Dispose();
+            l.Gate?.Dispose(); l.Up?.Dispose(); l.Down?.Dispose();
+        }
+        _ffnGate?.Dispose(); _ffnUp?.Dispose(); _convProj?.Dispose(); _attnGate?.Dispose(); _multiRowLogits?.Dispose();
+        _gateMul.Dispose();
+        _host.Dispose();
+        foreach (nint p in _ownedHost) NativeMemory.AlignedFree((void*)p);
+        _ownedHost.Clear();
+        _cpu.Dispose();
+    }
+}

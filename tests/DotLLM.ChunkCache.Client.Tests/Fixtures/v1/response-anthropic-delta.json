@@ -1,0 +1,52 @@
+{
+  "type": "message_delta",
+  "delta": {
+    "stop_reason": "end_turn",
+    "stop_sequence": null
+  },
+  "usage": {
+    "output_tokens": 212
+  },
+  "chunk_cache": {
+    "v": 1,
+    "policy_requested": "auto",
+    "policy_applied": "balanced",
+    "reason": "gates_passed",
+    "chunks": {
+      "annotated": 14,
+      "prefix": 3,
+      "hit": 9,
+      "miss": 1,
+      "ignored": 1
+    },
+    "tokens": {
+      "prompt": 18340,
+      "prefix_reused": 2210,
+      "prefix_reused_approx": 0,
+      "chunk_reused": 13420,
+      "chunk_recomputed": 2013,
+      "prefilled": 2710,
+      "encode_queued": 412
+    },
+    "recompute": {
+      "selector": "query_relevance",
+      "budget": 0.15,
+      "rows": 2013,
+      "forwards": 1,
+      "attn_kernel": "qpos"
+    },
+    "timings_ms": {
+      "assembly": 76,
+      "probe": 12,
+      "recompute": 1540,
+      "prefill": 410,
+      "full_prefill_estimate": 6100
+    },
+    "warnings": [
+      {
+        "code": "chunk_ignored_too_short",
+        "count": 1
+      }
+    ]
+  }
+}

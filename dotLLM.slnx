@@ -35,6 +35,7 @@
     <Project Path="samples/DotLLM.Sample.ToolCalling/DotLLM.Sample.ToolCalling.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/DotLLM.ChunkCache.Client/DotLLM.ChunkCache.Client.csproj" />
     <Project Path="src/DotLLM.ChunkReuse/DotLLM.ChunkReuse.csproj" />
     <Project Path="src/DotLLM.Cli/DotLLM.Cli.csproj" />
     <Project Path="src/DotLLM.Core/DotLLM.Core.csproj" />
@@ -53,6 +54,7 @@
     <Project Path="src/DotLLM.Vulkan/DotLLM.Vulkan.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/DotLLM.ChunkCache.Client.Tests/DotLLM.ChunkCache.Client.Tests.csproj" />
     <Project Path="tests/DotLLM.Tests.Integration/DotLLM.Tests.Integration.csproj" />
     <Project Path="tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj" />
     <Project Path="tests/DotLLM.Tray.Tests/DotLLM.Tray.Tests.csproj" />
