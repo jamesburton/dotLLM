@@ -1,7 +1,7 @@
 # dotLLM vs llama.cpp — consolidated comparisons
 
-One page for every published dotLLM-vs-llama.cpp figure, per model and backend. **Nothing here was re-measured for this
-page**: every number is copied from the document or PR named in its "Source" column, together with that source's hardware,
+One page for every published dotLLM-vs-llama.cpp figure, per model and backend. **Except for the LFM3 sections (2.6, 4.3),
+which were measured for the PRs they cite, nothing here was re-measured for this page**: every other number is copied from the document or PR named in its "Source" column, together with that source's hardware,
 build hash and method. Where a source quotes a range, the range is kept (the boxes are shared and llama.cpp's Vulkan
 prefill is noisy; see [Caveats](#caveats)). Ratios are `dotLLM / llama.cpp`, so **> 1 means dotLLM is faster**.
 
@@ -25,6 +25,9 @@ baseline, `b87ca7225` = the PrismML llama.cpp fork (CUDA; the only llama.cpp tha
 | Nemotron 3.5 Bolt 74B-A9B (AtomicChat quants) | CPU, Core Ultra 7 155H | pp512 / tg128 | 0.22-0.41 / 0.37-1.02 | [4.1](#41-nemotron-35-bolt-74b-a9b-cpu) |
 | Nemotron 3.5 Bolt 24GB + LiLiCorr | Vulkan, Strix Halo | plain / speculative | 1.02-1.04 / 0.74-0.78 | [2.3](#23-nemotron-35-bolt-24gb-vulkan-strix-halo) |
 | Qwen3.6-35B-A3B UD-Q4_K_M | Vulkan, Strix Halo | plain / MTP K=2..4 (opt-in) | 0.88 / 0.62-0.85 (superseded, see 2.4) | [2.4](#24-qwen36-35b-a3b-vulkan-strix-halo) |
+| LFM3-1.7B Q8_0 | Vulkan, Strix Halo 8060S | pp512 / pp2048 / tg128 | 0.86 / 0.72 / 0.94-0.96 | [2.6](#26-liquid-ai-lfm3-17b-q8_0-vulkan-strix-halo) |
+| LFM3-1.7B Q8_0 | Vulkan, Strix Halo | pp16384 / pp32768 / tg @32K | **0.31 / 0.21 / 0.47** (sliding layers walk the whole KV, #1572) | [2.6](#26-liquid-ai-lfm3-17b-q8_0-vulkan-strix-halo) |
+| LFM3-1.7B Q8_0 / Q4_K_M | CPU, Ryzen AI Max+ 395 (32 thr) | pp512 / tg128 | **0.41 / 0.87** (Q8_0), **0.28 / ~1.0** (Q4_K_M) | [4.3](#43-liquid-ai-lfm3-17b-cpu) |
 | Llama-3.2-1B Q4_K_M / pure Q3_K | CPU | perplexity gap | +0.032 % / +0.093 % | [5](#5-quality-parity) |
 | Embedding encoders (bge, MiniLM, nomic, ...) | CPU (32 thr) | docs/s | ~0.4-0.6 (indicative, derived) | [6](#6-embeddings) |
 
@@ -130,6 +133,32 @@ Bonsai-2 27B PQ2_0 (llama.cpp master cannot load PQ2_0), the qwen4exp family (th
 qwen4exp MTP graph), and the Vulkan embedding encoders (no llama.cpp Vulkan embedding run exists). Their absolute numbers
 are in [SPECULATIVE.md](SPECULATIVE.md), [GPU.md](GPU.md) and [EMBEDDINGS.md](EMBEDDINGS.md).
 
+### 2.6 Liquid AI LFM3-1.7B Q8_0, Vulkan, Strix Halo 8060S
+
+Source: PR #1573 / issue #1572 (measured 2026-11-03 for this section; dotLLM at `issue/1562-lfm3-vulkan` `6b836e51`). `LiquidAI/LFM3-1.7B-GGUF`
+`LFM3-1.7B-Q8_0.gguf`; llama.cpp master `dde879bc` `llama-bench` (Vulkan, defaults, `-r 3`; `-r 2` for the 16K/32K rows); dotLLM
+`dotllm bench -d vulkan -n 64|128 -r 3` (`-r 2` deep). `Strix:GPU` and `cpu-bench` held, ollama idle, llama.cpp and dotLLM run back to back
+in one session (not interleaved: the lock was held for the whole block). Ranges are stdev of the reps for llama.cpp (as `llama-bench` prints
+them) and min-max for dotLLM. LFM3 is a conv + sliding-window (256) + global-attention hybrid, so context should be cheap here.
+
+| test | dotLLM | llama.cpp | dotLLM / llama.cpp |
+|---|---|---|---|
+| pp512 | 4739-4757 | 5504 (+/- 114) | 0.86 |
+| pp2048 | 3997-4047 | 5562 (+/- 51) | 0.72 |
+| pp4096 | 3307-3323 | not measured | |
+| pp16384 | 1421-1423 | 4533 (+/- 26) | 0.31 |
+| pp32768 | 763-775 | 3719 (+/- 18) | 0.21 |
+| tg128 @ 0 | 93.3-95.6 | 98.3-99.7 | 0.94-0.96 |
+| tg64 @ 4K | 77.5-78.7 | 92.5 (+/- 1.3) | 0.84 |
+| tg64 @ 16K | 55.5-57.2 | 89.8 (+/- 0.6) | 0.62 |
+| tg64 @ 32K | 38.5-39.7 | 82.4 (+/- 0.3) | 0.47 |
+
+- The long-context rows are the weak spot: the sliding layers walk the whole KV (analysis and an unvalidated patch in #1572). llama.cpp
+  loses 16 % of its decode rate from 0 to 32K, dotLLM 59 %.
+- dotLLM's `tg @ N` rows decode after an N-token prefill (`-p N`); llama.cpp's use `-d N` (prefill the depth, then decode). Same context.
+- Quality: Q8_0 vs llama.cpp CPU on identical ids, mean KL 1.96e-3, top-1 98.24 %, PPL 25.9396 vs 25.9400 (section 5 method).
+- The Vulkan driver was lost during the follow-up validation of the #1572 patch; those rows are from before that.
+
 ## 3. RTX 3060 12 GB, CUDA
 
 ### 3.1 Recursive Flint Q4_1 on an RTX 3060 12 GB (CUDA, MoE offload)
@@ -196,6 +225,30 @@ as a time series. They must not be quoted as current.
 | 2026-05, Core Ultra 7 155H (22 thr vs llama.cpp 16 thr), b9041 | Llama-3.2-1B Q8_0 | 0.62 | 0.69 (llama.cpp CV 75 %) | [PERFORMANCE.md](PERFORMANCE.md) section 3 |
 | same | Qwen3.6-35B-A3B Q6_K_XL | 0.28 | 0.25 (memory-contended) | [PERFORMANCE.md](PERFORMANCE.md) section 3.1 |
 | same, RTX 3060 CUDA | SmolLM-135M / Llama-3.2-1B Q8_0 decode | 1.02 / 0.85 (prefill) | 0.43 / 0.60 | [PERFORMANCE.md](PERFORMANCE.md) section 3 |
+
+### 4.3 Liquid AI LFM3-1.7B, CPU
+
+Source: PR #1569 / issue #1570 (measured 2026-11-03; dotLLM `issue/1559-lfm3-cpu` `28b7f0f8`). Ryzen AI Max+ 395 (Zen 5, 16C/32T),
+`LFM3-1.7B-GGUF` Q8_0 and Q4_K_M. llama.cpp master `dde879bc` `llama-bench -dev none -t 32`; dotLLM `dotllm bench -d cpu --threads 32`.
+`cpu-bench` held; a GPU job of another session ran alongside (about 10 % total CPU load before the runs), so single-run rows are
+indicative and the disturbed reps are shown, not dropped.
+
+| quant | test | dotLLM | llama.cpp | dotLLM / llama.cpp |
+|---|---|---|---|---|
+| Q8_0 | pp512 | 165.1 (164.4-168.8, 3 reps) | 404.8 (+/- 3.3) | 0.41 |
+| Q8_0 | tg128 | 39.6 (39.5-39.8) | 45.5 (+/- 0.14) | 0.87 |
+| Q8_0, 16 thr | pp512 / tg128 | 127.2 / 35.1 | 285.5 / 48.5 | 0.45 / 0.72 |
+| Q8_0 | pp16384 / pp32768 (1 rep) | 103.9 / 66.7 | 298.6 / 260.4 | 0.35 / 0.26 |
+| Q8_0 | tg64 @ 4K / 16K / 32K | 35.7 / 28.1 / 16.7 | 39.9 / 32.2 / 22.7 | 0.89 / 0.87 / 0.74 |
+| Q4_K_M | pp512 | 293-302 | 1068 (+/- 14) | 0.28 |
+| Q4_K_M | tg128 | 73-76 in 4 of 6 reps (42 and 53 in two disturbed reps) | 72.8 (+/- 1.0) | ~1.0 |
+
+- At T=512 the forward spends 97 % of its time in the GEMMs (instrumented run), so the short-context prefill gap is the shared Q8_0 / Q4_K
+  CPU GEMM kernels (#1119), not LFM3 code. At 32K the forward is 491 s against ~200 s of GEMM time: the rest is attention on the 6 global
+  layers (#1570).
+- The architecture's context advantage shows on CPU too, but less than on Vulkan: both engines lose about half their decode rate by 32K,
+  because the 6 global layers still read 32K keys per token.
+- Decode at depth uses `-p N` for dotLLM and `-d N` for llama.cpp (see 2.6).
 
 ## 5. Quality parity
 
