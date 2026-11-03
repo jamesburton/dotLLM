@@ -1134,12 +1134,25 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
         using (new FileStream(FileChunkStore.EntryPath(root, a.Hex), FileMode.Open, FileAccess.Read, FileShare.Read))
         using (new FileStream(index, FileMode.Open, FileAccess.Read, FileShare.Read))
             r = await EvictOk(server, """{"mode":"namespace","dry_run":false}""");
-        Assert.Contains("chunk_evict_partial", Strings(r["warnings"]));
-        Assert.Equal(1, r["failed"]!["entry_files"]!.GetValue<int>());
-        Assert.Equal(1, r["failed"]!["index_files"]!.GetValue<int>());
-        Assert.True(Stored(root, a));   // held open: not deleted, reported
-        Assert.False(Stored(root, b));
-        Assert.True(Stored(root, cli)); // its index could not be deleted, so it stays referenced
+        if (OperatingSystem.IsWindows())
+        {
+            // Windows: a file held open without FileShare.Delete cannot be deleted, so the evict reports a partial delete.
+            Assert.Contains("chunk_evict_partial", Strings(r["warnings"]));
+            Assert.Equal(1, r["failed"]!["entry_files"]!.GetValue<int>());
+            Assert.Equal(1, r["failed"]!["index_files"]!.GetValue<int>());
+            Assert.True(Stored(root, a));   // held open: not deleted, reported
+            Assert.False(Stored(root, b));
+            Assert.True(Stored(root, cli)); // its index could not be deleted, so it stays referenced
+        }
+        else
+        {
+            // POSIX: unlinking an open file succeeds, so there is nothing to report (the partial path is Windows-reachable only here).
+            Assert.DoesNotContain("chunk_evict_partial", Strings(r["warnings"]));
+            Assert.Null(r["failed"]);
+            Assert.False(Stored(root, a));
+            Assert.False(Stored(root, b));
+            Assert.False(Stored(root, cli));
+        }
         Assert.Empty(LedgerKeys(root));
 
         var clean = await EvictOk(server, """{"mode":"namespace","dry_run":false}""");
