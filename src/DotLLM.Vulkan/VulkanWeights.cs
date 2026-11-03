@@ -119,6 +119,11 @@ internal sealed class VulkanWeights : IDisposable
         /// <summary>Per-expert selection bias <c>[numExperts]</c> F32 (sigmoid router only, #742).</summary>
         public VulkanDevice.Buffer? SelectionBias { get; init; }
 
+        /// <summary>Per-expert output scales <c>[numExperts]</c> F32 of the NVFP4 gate (W1) / up (W3) / down (W2) banks (<c>ffn_*_exps.scale</c>, #1579); null = none.</summary>
+        public VulkanDevice.Buffer? W1Scale { get; init; }
+        public VulkanDevice.Buffer? W3Scale { get; init; }
+        public VulkanDevice.Buffer? W2Scale { get; init; }
+
         /// <summary>Scale applied to the final top-k weights (<c>expert_weights_scale</c>), #742.</summary>
         public float WeightsScale { get; init; } = 1.0f;
 
@@ -182,6 +187,7 @@ internal sealed class VulkanWeights : IDisposable
                 for (int i = 0; i < SharedW3.Length; i++) SharedW3[i].Dispose();
             SharedExpertGate?.Dispose();
             GptOss?.Dispose();
+            W1Scale?.Dispose(); W3Scale?.Dispose(); W2Scale?.Dispose();
         }
     }
 
@@ -659,6 +665,7 @@ internal sealed class VulkanWeights : IDisposable
 
         long totalBytes = 0;
         ResetUploadCounters();
+        VulkanNvfp4Scales.SetHostSource(weights.WeightScales);   // NVFP4 per-tensor scales (#1579)
         _residencyReport = new VulkanResidencyReport();
         bool mlaAbsorbed = UseAbsorbedMla(weights, firstLayer, numLayers);
 
@@ -1366,6 +1373,9 @@ internal sealed class VulkanWeights : IDisposable
 
     /// <summary>Returns true when the matrix will be kept on device as Q4_1 blocks (20 bytes per 32 elements: fp16 d, fp16 m, 16 nibble bytes;
     /// issue #1171, Recursive Flint). Served by the Q4_0 kernel classes' Q4_1 variants (scalar GEMV/GEMM, dp4a MMVQ, coopmat GEMM).</summary>
+    private static bool KeepNvfp4OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.NVFP4 && (inputDim % QuantFormat.Nvfp4GroupSize) == 0;
+
     private static bool KeepQ4_1OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q4_1 && (inputDim % 32) == 0;
 
@@ -1506,6 +1516,7 @@ internal sealed class VulkanWeights : IDisposable
         if (KeepQ5_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q5_0;
         if (KeepQ4_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_0;
         if (KeepQ4_1OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_1;
+        if (KeepNvfp4OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.NVFP4;   // #1579
         if (KeepQ2KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q2_K;
         if (KeepQ3KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q3_K;
         if (KeepQ4KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_K;
@@ -1611,6 +1622,8 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q4_0) * outputDim;
         if (KeepQ4_1OnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q4_1) * outputDim;
+        if (KeepNvfp4OnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.NVFP4) * outputDim;
         if (KeepQ2KOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q2_K) * outputDim;
         if (KeepQ3KOnDevice(qt, inputDim, dequantToFp32))
@@ -1752,6 +1765,7 @@ internal sealed class VulkanWeights : IDisposable
                 deviceQuantType = keepQt;
                 uploadedBytes = bytes;
                 _residencyReport.Add(name, qt, deviceQuantType, packedBytes, uploadedBytes);
+                if (keepQt == QuantizationType.NVFP4) VulkanNvfp4Scales.Register(importedBuf!, srcPtr);
                 return importedBuf!;
             }
 
@@ -1762,6 +1776,7 @@ internal sealed class VulkanWeights : IDisposable
             deviceQuantType = keepQt;
             uploadedBytes = bytes;
             _residencyReport.Add(name, qt, deviceQuantType, packedBytes, uploadedBytes);
+            if (keepQt == QuantizationType.NVFP4) VulkanNvfp4Scales.Register(buf, srcPtr);
             return buf;
         }
 
@@ -2319,7 +2334,20 @@ internal sealed class VulkanWeights : IDisposable
                 ? UploadNormVec(device, vecStage, moe.SelectionBias ?? new float[numE])
                 : null,
             WeightsScale = moe.WeightsScale,
+            W1Scale = routedW1Qt == QuantizationType.NVFP4 ? UploadNvfp4ExpertScale(device, vecStage, moe.GateExpsScale, numE, "gate") : null,
+            W3Scale = routedW3Qt == QuantizationType.NVFP4 ? UploadNvfp4ExpertScale(device, vecStage, moe.UpExpsScale, numE, "up") : null,
+            W2Scale = routedW2Qt == QuantizationType.NVFP4 ? UploadNvfp4ExpertScale(device, vecStage, moe.DownExpsScale, numE, "down") : null,
         };
+    }
+
+    /// <summary>Uploads a per-expert NVFP4 output-scale vector (ones when the GGUF carries none) as a device F32 buffer.</summary>
+    private static VulkanDevice.Buffer UploadNvfp4ExpertScale(
+        VulkanDevice device, VulkanStagingBuffer vecStage, float[]? scale, int numExperts, string bank)
+    {
+        if (scale is not null && scale.Length < numExperts)
+            throw new InvalidDataException($"NVFP4 {bank} expert scale has {scale.Length} entries for {numExperts} experts.");
+        float[] v = scale ?? Enumerable.Repeat(1f, numExperts).ToArray();
+        return UploadNormVec(device, vecStage, v);
     }
 
     /// <summary>
@@ -2705,6 +2733,12 @@ internal sealed class VulkanWeights : IDisposable
         if (raw != 0 && qt == QuantizationType.MXFP4
             && rawM == expectedM && rawK == expectedK && (expectedK % 32) == 0)
             return QuantizationType.MXFP4;
+
+        // NVFP4 routed banks (#1579) stay packed (36 B / 64 elements) and are read in place by moe_indexed_matmul_nvfp4_f32, which
+        // multiplies each expert's result by its per-expert ffn_*_exps.scale.
+        if (raw != 0 && qt == QuantizationType.NVFP4
+            && rawM == expectedM && rawK == expectedK && (expectedK % QuantFormat.Nvfp4GroupSize) == 0)
+            return QuantizationType.NVFP4;
 
         // MiMo-V2 BPW2.0 (#955): IQ-family routed banks (IQ1_M gate/up, IQ2_XXS/IQ2_XS/IQ3_S down) stay packed and are read by the indexed
         // IQ MMVQ decode kernels and the grouped IQ coopmat prefill kernels (the #823 kernels, now wired into the generic MoE path).
@@ -3124,6 +3158,8 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(contractionDim, QuantizationType.Q6_K) * outputDim;
         if (qt == QuantizationType.MXFP4 && (contractionDim % 32) == 0)
             return Dequantize.RowByteSize(contractionDim, QuantizationType.MXFP4) * outputDim;
+        if (qt == QuantizationType.NVFP4 && (contractionDim % QuantFormat.Nvfp4GroupSize) == 0)
+            return Dequantize.RowByteSize(contractionDim, QuantizationType.NVFP4) * outputDim;
         if (MoeIqFormats.FromQuantizationType(qt) is { } iqf && (contractionDim % 256) == 0
             && (contractionDim % MoeIqFormats.Describe(iqf).GroupSize) == 0)
             return Dequantize.RowByteSize(contractionDim, qt) * outputDim;
