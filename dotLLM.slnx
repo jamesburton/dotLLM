@@ -35,6 +35,7 @@
     <Project Path="samples/DotLLM.Sample.ToolCalling/DotLLM.Sample.ToolCalling.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/DotLLM.ChunkReuse/DotLLM.ChunkReuse.csproj" />
     <Project Path="src/DotLLM.Cli/DotLLM.Cli.csproj" />
     <Project Path="src/DotLLM.Core/DotLLM.Core.csproj" />
     <Project Path="src/DotLLM.Cpu/DotLLM.Cpu.csproj" />
