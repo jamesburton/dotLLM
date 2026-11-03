@@ -165,7 +165,7 @@ public sealed class ChunkStoreHardeningTests : IDisposable
             Assert.True(s.WritesDisabled);
             Assert.Equal(new AdmissionResult(false, AdmissionReasons.WritesDisabled), s.Admit(Span(third), KeyFor(third), 65, Local, true, "cpu"));
             Assert.Equal(new[] { KeyFor(first).Hex }, s.LedgerForTest!.Rows.Select(r => r.KeyHex));
-            Thread.Sleep(600); // reload attempts keep failing while the file is held
+            Thread.Sleep(2600); // over two worker ticks: reload attempts run and keep failing while the file is held
             Assert.Equal(StoreProblems.LedgerUnreadable, s.Problem);
         }
         finally
