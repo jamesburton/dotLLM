@@ -1362,6 +1362,9 @@ internal sealed class TransformerWeights : IDisposable
                 + "implemented yet), issues #814 / #816 / #818",
             DotLLM.Core.Configuration.Architecture.Lfm2Moe or DotLLM.Core.Configuration.Architecture.Lfm3 =>
                 "its gated short-conv layers carry shortconv.in_proj/conv/out_proj tensors instead of attn_q/attn_k/attn_v/attn_output",
+            DotLLM.Core.Configuration.Architecture.Glm4Moe =>
+                "it has no forward pass yet (config extraction + tensor census only, issue #1598): its sigmoid + exp_probs_b MoE router, "
+                + "shared expert, QKV bias, partial NeoX RoPE and NextN block are not implemented by the dense path",
             DotLLM.Core.Configuration.Architecture.Mamba3 =>
                 "Mamba-3 has no GGUF representation at all (no upstream 'mamba3' value for "
                 + "general.architecture and no GGUF tensor-naming convention) — it is "
