@@ -45,6 +45,10 @@ public static unsafe partial class MoeSwiGluMlp
         public int Intermediate { get; init; }
         public float* Out { get; init; }
         public int Layer { get; init; }
+        /// <summary>Per-tensor output scales of the shared projections (NVFP4 <c>.scale</c>); 1 = none.</summary>
+        public float GateScale { get; init; }
+        public float UpScale { get; init; }
+        public float DownScale { get; init; }
     }
 
     private struct DecodeN1Ctx
@@ -116,7 +120,7 @@ public static unsafe partial class MoeSwiGluMlp
         ReadOnlySpan<int> bucketCursors, ReadOnlySpan<int> bucketSlots,
         ReadOnlySpan<int> uniqueExperts, int uniqueCount,
         int numExpertsPerTok, int hiddenSize, int intermediateSize, bool useGeGLU, ComputeThreadPool pool, bool packedLegacy,
-        in DecodeN1Shared shared, out bool sharedDone)
+        in DecodeN1Shared shared, float[]? gateScale, float[]? upScale, float[]? downScale, out bool sharedDone)
     {
         sharedDone = false;
         if (!DecodeN1Enabled || DiagF32Activations || uniqueCount < 1) return false;
@@ -153,7 +157,7 @@ public static unsafe partial class MoeSwiGluMlp
         int u = uniqueCount;
         // Per-expert slot (token 0 -> top-k slot) and a batch==1 guard.
         Span<int> slots = stackalloc int[u];
-        Span<float> downScale = stackalloc float[u];
+        Span<float> downRescale = stackalloc float[u];
         for (int i = 0; i < u; i++)
         {
             int e = uniqueExperts[i];
@@ -209,6 +213,19 @@ public static unsafe partial class MoeSwiGluMlp
                     SegWeights = segW, SegResults = segR, SegInput = segI, SegKind = kind,
                 };
                 pool.Dispatch((nint)(&ctx), &DecodeN1Worker);
+                // NVFP4 second-level scales: per expert for the routed banks, per tensor for the shared projections.
+                if (gateScale is not null || upScale is not null)
+                    for (int i = 0; i < u; i++)
+                    {
+                        int e = uniqueExperts[i];
+                        if (gateScale is not null) ScaleInPlace(gateOut + i * inter, inter, gateScale[e]);
+                        if (upScale is not null) ScaleInPlace(upOut + i * inter, inter, upScale[e]);
+                    }
+                if (fuseShared)
+                {
+                    ScaleInPlace(sGateOut, sInter, shared.GateScale);
+                    ScaleInPlace(sUpOut, sInter, shared.UpScale);
+                }
                 CpuStageProf.E(10, t0); t0 = CpuStageProf.T();
 
                 // ── activation + down-input quantisation (tiny, serial) ──
@@ -218,7 +235,7 @@ public static unsafe partial class MoeSwiGluMlp
                     var up = new ReadOnlySpan<float>(upOut + i * inter, inter);
                     var o = new Span<float>(siluOut + i * inter, inter);
                     if (useGeGLU) FusedOps.GeGLUTanh(g, up, o); else FusedOps.SwiGLU(g, up, o);
-                    downScale[i] = RescaleDownInputForF16Sums(siluOut + i * inter, inter);
+                    downRescale[i] = RescaleDownInputForF16Sums(siluOut + i * inter, inter);
                     QuantizeBatchForWeightQt(downQt, siluOut + i * inter, siluQ + (long)i * downPre, inter, 1);
                 }
                 if (fuseShared)
@@ -255,12 +272,10 @@ public static unsafe partial class MoeSwiGluMlp
                 pool.Dispatch((nint)(&ctxB), &DecodeN1Worker);
                 for (int i = 0; i < u; i++)
                 {
-                    if (downScale[i] != 1f)
-                    {
-                        var row = new Span<float>(scatterDownPtr + (long)slots[i] * hiddenSize, hiddenSize);
-                        TensorPrimitives.Multiply(row, downScale[i], row);
-                    }
+                    float rowScale = downScale is null ? downRescale[i] : downRescale[i] * downScale[uniqueExperts[i]];
+                    ScaleInPlace(scatterDownPtr + (long)slots[i] * hiddenSize, hiddenSize, rowScale);
                 }
+                if (fuseShared) ScaleInPlace(shared.Out, hiddenSize, shared.DownScale);
                 CpuStageProf.E(12, t0);
             }
             _decodeN1Calls++;
