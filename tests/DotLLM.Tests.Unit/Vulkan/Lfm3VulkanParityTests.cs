@@ -121,13 +121,13 @@ public sealed unsafe class Lfm3VulkanParityTests(Xunit.Abstractions.ITestOutputH
         foreach (int end in chunkEnds)
         {
             using var lastRow = Step(vkModel, tokens.AsMemory(start, end - start), positions.AsMemory(start, end - start), kv, (ISsmState)state);
-            AssertClose(cpuRows[k++], Row(lastRow, lastRow.Shape[0] - 1), 0.01, $"prefill chunk ending {end}");
+            AssertClose(cpuRows[k++], Row(lastRow, lastRow.Shape[0] - 1), 0.005, $"prefill chunk ending {end}");
             start = end;
         }
         for (int i = chunkEnds[^1]; i < last; i++)
         {
             using var row = Step(vkModel, tokens.AsMemory(i, 1), positions.AsMemory(i, 1), kv, (ISsmState)state);
-            AssertClose(cpuRows[k++], Row(row, row.Shape[0] - 1), 0.01, $"decode {i}");
+            AssertClose(cpuRows[k++], Row(row, row.Shape[0] - 1), 0.005, $"decode {i}");
         }
     }
 }
