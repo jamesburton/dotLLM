@@ -114,6 +114,13 @@ public static class VulkanModelLoader
                 return (lfm, size => lfm.CreateKvCache(size));
             }
 
+            case Architecture.Lfm3:
+            {
+                // LFM3 (#1562): gated short-conv (L_cache 7) + sliding-window / global GQA tri-hybrid, dense FFN, sandwich norms.
+                var lfm3 = VulkanLfm3TransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+                return (lfm3, size => lfm3.CreateKvCache(size));
+            }
+
             case Architecture.NemotronH:
             case Architecture.NemotronHMoe:   // #402: routed layers are detected per layer by the router tensor
             {
