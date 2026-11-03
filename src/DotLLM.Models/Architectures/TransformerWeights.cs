@@ -1607,8 +1607,10 @@ internal sealed class TransformerWeights : IDisposable
         var table = new Dictionary<nint, float>();
         foreach (var (name, desc) in tensors)
         {
+            // Routed banks carry per-expert vectors (MoeLayerWeights); shared-expert scalars are in the table too, for backends that run the
+            // shared expert as an ordinary projection (Vulkan). The CPU grouped MoE kernel takes them from MoeLayerWeights instead.
             if (desc.QuantizationType != QuantizationType.NVFP4 || !name.EndsWith(".weight", StringComparison.Ordinal)
-                || name.Contains("_exps.", StringComparison.Ordinal) || name.Contains("_shexp.", StringComparison.Ordinal))
+                || name.Contains("_exps.", StringComparison.Ordinal))
                 continue;
             if (!tensors.TryGetValue(Nvfp4Support.ScaleNameFor(name), out var scaleDesc))
                 continue;

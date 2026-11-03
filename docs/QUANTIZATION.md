@@ -115,8 +115,13 @@ Support matrix (#1579 tracks the rest): **CPU** applies the scalar scales in the
 `TransformerModel` (any architecture whose NVFP4 weights are the projections above or the
 LM head) and the per-expert/shared scales in the grouped MoE kernel (Flint, MiMo-V2;
 prefill GEMM and n=1 decode row kernel, bit-identical); an NVFP4 token embedding with a
-scale is still refused. **Vulkan and CUDA** apply scales on the Nemotron-H SSM projections
-only and refuse NVFP4 elsewhere (`#1579` stages 2 and 3). Qwen3-hybrid, qwen4exp, LFM2-MoE,
+scale is still refused. **Vulkan** (#1579) reads NVFP4 in place on the generic
+transformer (Flint verified; dense projections via the packed GEMV / coopmat GEMM with the
+per-tensor scale in the epilogue, routed banks via an indexed GEMV for decode and a grouped
+coopmat GEMM for prefill with the per-expert scale in the epilogue; no F16/F32 copy of any NVFP4
+weight; the shared-expert scalars ride the dense path). MLA, Gemma-4, per-layer-embedding and
+the hybrid-SSM architectures still refuse NVFP4 on Vulkan. **CUDA** applies scales on the
+Nemotron-H SSM projections only and refuses NVFP4 elsewhere (stage 3). Qwen3-hybrid, qwen4exp, LFM2-MoE,
 BERT and gemma-embedding loaders still refuse scaled NVFP4. Measured on
 `RecursiveSI/flint-nvfp4-gguf` (`flint-nvfp4.gguf`): wikitext-2 LF 14 KB, 512 ctx, 5 windows,
 CPU 24.36 +/- 2.94 vs llama.cpp (master dde879bc, `-dev none`) 24.26 +/- 2.91.
