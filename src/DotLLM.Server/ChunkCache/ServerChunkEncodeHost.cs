@@ -33,7 +33,7 @@ internal sealed class ServerChunkEncodeHost(ServerState state) : IChunkEncodeHos
         if (state.Model is not { } model || state.Tokenizer is not { } tokenizer)
             return null;
         int[] ids = ChunkTokenization.Encode(tokenizer, item.Text);
-        if (ids.Length == 0 || ids.Length > ChunkStoreService.MaxEncodeTokens || ids.Length > model.Config.MaxSequenceLength)
+        if (ids.Length == 0 || ids.Length > ChunkStoreService.MaxCpuEncodeTokens || ids.Length > model.Config.MaxSequenceLength)
             return null;
         if (identity.KeyOf(ids, item.Namespace) != item.Key)
             return null; // another model (or tokenizer) is served now: this item's key is not ours to fill

@@ -29,6 +29,7 @@ internal static class AdmissionReasons
     public const string RequestCap = "request_cap";
     public const string SecretContent = "secret_content";
     public const string OverBudget = "over_budget";
+    public const string TooLargeForCpu = "too_large_for_cpu";
 }
 
 /// <summary>What keeps the writer from storing (the <c>detail</c> of a <c>chunk_store_unavailable</c> warning).</summary>
@@ -92,6 +93,9 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
 {
     /// <summary>Longest chunk (tokens) encoded in the background: bounds the time a request can wait behind one encode.</summary>
     public const int MaxEncodeTokens = 2048;
+
+    /// <summary>Longest chunk (tokens) encoded in the background on the CPU backend (ruling: bounds a request's wait).</summary>
+    public const int MaxCpuEncodeTokens = 512;
 
     /// <summary>How often a stopped (budget-exhausted) writer re-checks the store size.</summary>
     public static readonly TimeSpan BudgetRecheckInterval = TimeSpan.FromSeconds(30);
@@ -325,6 +329,8 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         long perToken = Interlocked.Read(ref _bytesPerToken);
         if (perToken > 0 && Interlocked.Read(ref _headerBytes) + perToken * tokenCount > _budget)
             return Refused(AdmissionReasons.OverBudget); // could never be stored: no encode is spent on it
+        if (tokenCount > MaxCpuEncodeTokens) // the backend is CPU here (checked above); ruling: a request waits behind at most one 512-token encode
+            return Refused(AdmissionReasons.TooLargeForCpu);
 
         int seen = Sightings.See(caller.Namespace, span.Hash, span.SourcePath);
         if (seen < SightingTable.AdmitAfter && !onMissEncode)
@@ -376,6 +382,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         ArgumentNullException.ThrowIfNull(caller);
         bool onMissEncode = string.Equals(parsed.OnMiss, "encode", StringComparison.Ordinal);
         int queued = 0, skipped = 0, queuedTokens = 0, queuedKeys = 0;
+        bool tooLargeForCpu = false;
 
         // The most restrictive occurrence of each text decides (a no_store, volatile or denied occurrence refuses it).
         var deciding = new Dictionary<string, ChunkSpanRef>(StringComparer.Ordinal);
@@ -416,8 +423,15 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
                     queuedTokens = (int)Math.Min(int.MaxValue, (long)queuedTokens + s.TokenCount);
                 }
             }
-            if (result.Queued) queued++;
-            else skipped++;
+            if (result.Queued)
+            {
+                queued++;
+            }
+            else
+            {
+                skipped++;
+                tooLargeForCpu |= result.Reason == AdmissionReasons.TooLargeForCpu;
+            }
         }
         if (queued + skipped == 0)
             return plan;
@@ -428,7 +442,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         if (queued > 0)
             AddWarning(warnings, ChunkCacheCodes.EncodeQueued, queued, null);
         if (skipped > 0)
-            AddWarning(warnings, ChunkCacheCodes.EncodeSkipped, skipped, null);
+            AddWarning(warnings, ChunkCacheCodes.EncodeSkipped, skipped, tooLargeForCpu ? AdmissionReasons.TooLargeForCpu : null);
         return plan with { Warnings = warnings, EncodeQueuedTokens = queuedTokens };
     }
 

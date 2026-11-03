@@ -472,6 +472,33 @@ public sealed class ChunkStoreHardeningTests : IDisposable
         Assert.Equal(encodes, host.Encodes);
     }
 
+    /// <summary>
+    /// Ruling: on the CPU backend, chunks over <see cref="ChunkStoreService.MaxCpuEncodeTokens"/> (512) are never encoded in
+    /// the background (a request waits behind at most one 512-token encode, measured 8.35 s on Qwen3-4B Q4_K_M, 8 threads):
+    /// refused at admission, reported as <c>chunk_encode_skipped</c> with detail <c>too_large_for_cpu</c>.
+    /// </summary>
+    [Fact]
+    public void CpuChunkOverCap_RefusedAtAdmission_SkippedWithDetail()
+    {
+        string root = NewRoot();
+        var host = new FakeHost { Idle = false };
+        var s = Start(root, host);
+        string atCap = Text('p', 40), over = Text('o', 40);
+        Assert.True(s.Admit(Span(atCap), KeyFor(atCap), ChunkStoreService.MaxCpuEncodeTokens, Local, true, "cpu").Queued);
+        Assert.Equal(new AdmissionResult(false, AdmissionReasons.TooLargeForCpu),
+            s.Admit(Span(over), KeyFor(over), ChunkStoreService.MaxCpuEncodeTokens + 1, Local, true, "cpu"));
+
+        string big = Text('q', 40);
+        var plan = new ChunkCachePlan(ChunkPolicy.Exact, null, false, 1,
+            [new PlannedSpan(0, ChunkStoreService.MaxCpuEncodeTokens + 100, false) { Span = Span(big), Key = KeyFor(big) }],
+            [], null, "summary", "cpu", 2000);
+        var applied = s.ApplyTo(plan, Parsed("encode"), Local);
+        var skipped = Warning(applied, ChunkCacheCodes.EncodeSkipped);
+        Assert.Equal(1, skipped?.Count);
+        Assert.Equal(AdmissionReasons.TooLargeForCpu, skipped?.Detail);
+        Assert.Null(Warning(applied, ChunkCacheCodes.EncodeQueued));
+    }
+
     /// <summary>Nit: a PEM <c>PRIVATE KEY</c> anywhere on a BEGIN or END line (PGP blocks, a chunk holding only the end).</summary>
     [Fact]
     public void PemSniff_BeginOrEndLines_AnyPrivateKeyForm()
