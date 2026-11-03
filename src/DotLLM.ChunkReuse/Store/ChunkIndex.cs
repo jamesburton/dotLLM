@@ -141,7 +141,8 @@ public sealed record StatusReport(IReadOnlyList<FileStatus> Files, int TotalChun
 /// <b>Concurrency.</b> An instance is not thread-safe. Across processes, <see cref="Save"/> replaces the file with one
 /// rename, so a reader (<see cref="Load"/>, <see cref="OpenForRead"/>) sees either the old or the new file, never a mix.
 /// Readers share the file for read, write and delete; on Windows a rename over an open file is still refused, so Save retries
-/// for up to two seconds (a Load holds the file for milliseconds) and then throws, leaving the old file intact. Two writers
+/// for up to two seconds (a Load holds the file for milliseconds) and then throws, leaving the old file intact; on Linux and
+/// macOS the rename replaces the file under an open reader at once (the reader keeps the old file). Two writers
 /// do not merge: the last rename wins and the other's update is lost, so writers serialise on the index lock.
 /// </para>
 /// <para>
@@ -171,7 +172,8 @@ public sealed record StatusReport(IReadOnlyList<FileStatus> Files, int TotalChun
 /// <para>
 /// <b>Platforms.</b> Verified on Windows (NTFS): an exclusive handle refuses every other open, readers included, and the OS
 /// closes a killed holder's handle. On Linux and macOS .NET emulates <see cref="FileShare.None"/> with an advisory
-/// <c>flock</c>, which other .NET processes honour and the kernel releases on process exit, but this is not verified here, does
+/// <c>flock</c>, which other .NET processes honour and the kernel releases on process exit (verified on Linux by the unit tests,
+/// including a killed holder process), but it does
 /// not bind non-.NET programs, and is disabled by <c>DOTNET_SYSTEM_IO_DISABLEFILELOCKING</c>; network file systems are not
 /// supported.
 /// </para>
@@ -732,6 +734,8 @@ public sealed partial class ChunkIndex
         foreach (string file in IndexFilesUnder(storeRoot))
         {
             if (!file.EndsWith(IndexFileSuffix, StringComparison.OrdinalIgnoreCase)) continue;
+            // The platform's path rule (case-sensitive off Windows): on Linux index-a.json and index-A.json are two indexes, and
+            // skipping both would let eviction delete keys only the other one references.
             if (skip is not null && PathComparer.Equals(Path.GetFullPath(file), skip)) continue;
             IndexDocument? doc;
             try
@@ -863,7 +867,8 @@ public sealed partial class ChunkIndex
 
     /// <summary>
     /// Opens an index file for reading the way <see cref="Load"/> does: sharing read, write and delete. Keep it open briefly:
-    /// a concurrent <see cref="Save"/> waits (up to two seconds) for it to close.
+    /// on Windows a concurrent <see cref="Save"/> waits (up to two seconds) for it to close; on Linux and macOS the save's
+    /// rename replaces the file under the open stream at once, and the stream keeps reading the old file unchanged.
     /// </summary>
     /// <param name="path">Index file.</param>
     /// <returns>The stream.</returns>

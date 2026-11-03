@@ -359,6 +359,33 @@ public sealed class ChunkIndexTests : IDisposable
         Assert.Throws<InvalidDataException>(() => symIndex.EvictableOrphans(deleted, store.Root, ChunkIndex.DefaultPath(store.Root, symbol.Name)));
     }
 
+    [Fact]
+    public void ReferencedKeysUnder_ExceptPath_SkipsOnlyThatFile_UnderThePlatformsCaseRule()
+    {
+        var chunker = new FixedSizeChunker(new CharTokenizer(), chunkTokens: 4096);
+        var lower = new ChunkIndex(KeyA);
+        lower.Update([new SourceFile("A.txt", "lower\n")], chunker);
+        var upper = new ChunkIndex(KeyA);
+        upper.Update([new SourceFile("A.txt", "UPPER\n")], chunker);
+        ChunkKey lowerKey = new(lower.ChunksOf("A.txt")[0].KeyHex!), upperKey = new(upper.ChunksOf("A.txt")[0].KeyHex!);
+        string lowerPath = Path.Combine(_root, "index-case-a.json"), upperPath = Path.Combine(_root, "index-case-A.json");
+        lower.Save(lowerPath);
+        if (OperatingSystem.IsWindows())
+        {
+            // One file whatever the case: a case variant of its name is the same file and is skipped.
+            Assert.Empty(ChunkIndex.ReferencedKeysUnder(_root, exceptPath: upperPath));
+            Assert.Equal(new[] { lowerKey }, ChunkIndex.ReferencedKeysUnder(_root, exceptPath: null).ToArray());
+        }
+        else
+        {
+            // Case-sensitive names: two indexes, and skipping one must keep the other's keys (they must not be evicted).
+            upper.Save(upperPath);
+            Assert.Equal(2, Directory.GetFiles(_root, "index-case-*.json").Length);
+            Assert.Equal(new[] { upperKey }, ChunkIndex.ReferencedKeysUnder(_root, exceptPath: lowerPath).ToArray());
+            Assert.Equal(new[] { lowerKey }, ChunkIndex.ReferencedKeysUnder(_root, exceptPath: upperPath).ToArray());
+        }
+    }
+
     public static TheoryData<string> StructurallyBadIndexFiles() => new()
     {
         "version", "file-null", "path-null", "sha-bad", "chunks-null", "chunk-null", "key-bad", "duplicate-path", "chunker-null",
@@ -635,6 +662,7 @@ public sealed class ChunkIndexTests : IDisposable
 
     [Fact]
     public async Task Save_WhileAReaderHoldsTheIndex_Succeeds()
+    public async Task Save_WhileAReaderHoldsTheIndex_WindowsWaitsForIt_PosixReplacesUnderIt()
     {
         var chunker = new FixedSizeChunker(new CharTokenizer(), chunkTokens: 10);
         Directory.CreateDirectory(_root);
@@ -642,6 +670,7 @@ public sealed class ChunkIndexTests : IDisposable
         var index = new ChunkIndex(KeyA);
         index.Update([new SourceFile("A.txt", "012345678\n")], chunker);
         index.Save(path);
+        byte[] oldBytes = File.ReadAllBytes(path);
 
         index.Update([new SourceFile("A.txt", "012345678\nmore\n")], chunker);
         Task save;
@@ -664,6 +693,24 @@ public sealed class ChunkIndexTests : IDisposable
                 await save.WaitAsync(TimeSpan.FromSeconds(30));
                 Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
             }
+            save = Task.Run(() => index.Save(path));
+            if (OperatingSystem.IsWindows())
+            {
+                // Windows cannot rename over an open file: Save retries while the reader holds it.
+                await Task.Delay(150);
+                Assert.Single(ChunkIndex.Load(path, KeyA).ChunksOf("A.txt")); // a second reader still sees the old file
+            }
+            else
+            {
+                // POSIX rename(2) replaces the directory entry under the open reader: Save does not wait, a new reader sees
+                // the new file at once.
+                await save.WaitAsync(TimeSpan.FromSeconds(10));
+                Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
+            }
+            // Either way the held reader still reads the old file, unchanged (an atomic replace, never an in-place rewrite).
+            var held = new MemoryStream();
+            reader.CopyTo(held);
+            Assert.Equal(oldBytes, held.ToArray());
         }
         await save.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
@@ -683,7 +730,8 @@ public sealed class ChunkIndexTests : IDisposable
         {
             ChunkIndex.SaveRetryBudget = budget;
         }
-        if (OperatingSystem.IsWindows()) Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
+        // Windows: the old file stays intact. POSIX: the new one is in place.
+        Assert.Equal(OperatingSystem.IsWindows() ? 2 : 1, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
         Assert.Single(Directory.GetFiles(_root));
     }
 

@@ -379,15 +379,18 @@ public sealed class StoreLockTests : IDisposable
         Assert.Empty(ChunkIndex.ReferencedKeysUnder(_root));
     }
 
-    [SkippableFact]
+    [Fact]
     public void CrashedHolder_ItsLockIsFreedByTheOs()
     {
-        Skip.IfNot(OperatingSystem.IsWindows(), "Child-process lock holder uses Windows PowerShell; Linux/macOS flock semantics are not verified here.");
+        // The holder is another .NET process (PowerShell) opening the lock file with FileShare.None, as the lock helpers do:
+        // a sharing-mode lock on Windows, flock(LOCK_EX) on Linux/macOS. Either is released by the OS when the process dies.
+        // Windows PowerShell on Windows; PowerShell 7 (pwsh) elsewhere (on the GitHub ubuntu runners and in the .NET SDK images).
+        string shell = OperatingSystem.IsWindows() ? "powershell.exe" : "pwsh";
         foreach (string lockPath in new[] { StoreLockFile, ChunkIndex.IndexLockPath(_root, "fixed-10", Model, Producer, Ns) })
         {
             string script = $"$f = [System.IO.File]::Open('{lockPath.Replace("'", "''", StringComparison.Ordinal)}', 'OpenOrCreate', 'ReadWrite', 'None'); "
                 + "[Console]::Out.WriteLine('held'); [Console]::Out.Flush(); Start-Sleep -Seconds 120";
-            var psi = new ProcessStartInfo("powershell.exe")
+            var psi = new ProcessStartInfo(shell)
             {
                 RedirectStandardOutput = true,
                 UseShellExecute = false,
