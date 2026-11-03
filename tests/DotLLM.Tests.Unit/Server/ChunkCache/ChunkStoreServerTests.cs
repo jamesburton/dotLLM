@@ -98,6 +98,32 @@ public sealed class ChunkStoreServerTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Review S4: the quiet-period clock moves with every request (scheduled or direct), not with the worker's own lease, and
+    /// the busy probe sees a held gate.
+    /// </summary>
+    [Fact]
+    public async Task ActivityStamp_MovesWithRequests_NotWithTheWorkersLease()
+    {
+        foreach (bool paged in new[] { true, false })
+        {
+            await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(NewRoot()), paged: paged);
+            var state = server.State;
+            long before = state.ActivityStamp();
+            var (status, _) = await server.PostAsync("/v1/chat/completions", Body(null));
+            Assert.Equal(200, status);
+            long after = state.ActivityStamp();
+            Assert.NotEqual(before, after);
+            Assert.False(state.IsBusyForBackgroundWork());
+            using (var lease = state.TryAcquireIdleModel())
+            {
+                Assert.NotNull(lease);
+                Assert.True(state.IsBusyForBackgroundWork());
+            }
+            Assert.Equal(after, state.ActivityStamp());
+        }
+    }
+
     /// <summary>Review N6: the writer's counters and queue gauge are on <c>/metrics</c>, with fixed label sets.</summary>
     [Fact]
     public async Task WriterMetrics_Exported()
