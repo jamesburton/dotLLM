@@ -20,25 +20,11 @@ namespace DotLLM.Tests.Unit.Vulkan;
 [Trait("Category", "GPU")]
 public sealed unsafe class Lfm3VulkanParityTests(Xunit.Abstractions.ITestOutputHelper output)
 {
-    private static readonly int[] NaturalTokens =
-    [
-        207, 550, 6102, 61512, 385, 550, 67274, 6102, 61512, 385, 355, 401, 3478, 2815, 1228, 8086, 309, 24900, 14498,
-        1200, 904, 819, 267, 21021, 1762, 21, 40, 37892, 3170, 383, 278, 8086, 3587, 440, 8047, 296, 229, 585, 24, 1200,
-        969, 452, 5614, 467, 267, 37892, 3170, 296, 278, 1431, 2864, 795, 4484, 467, 14538, 29574, 540, 1228, 643, 452,
-        5312, 296, 229, 585, 25, 462, 278, 7565, 7419, 18931, 1200, 904, 819, 267, 21021, 3170, 296, 278, 8086, 3587, 31975,
-        2409, 1015, 290, 296, 229, 585, 26, 1200, 529, 229, 585, 28, 61512, 385, 28078, 267, 3170, 405, 496, 32327, 496,
-        296, 278, 13636, 496, 336, 51647, 951, 91, 15590, 496, 302, 278, 8086, 3587, 440, 7987, 53770, 3791, 449, 54618,
-        16023, 17501, 4409, 32107, 309, 55589, 12675, 81, 1200, 904, 452, 6054, 296, 278, 229, 585, 29, 24900, 43420, 302,
-        278, 13544, 42717, 2273, 1431, 32569, 34735, 1228, 643, 452, 5312, 462, 278, 3082, 399, 18931, 296, 48298, 309,
-        278, 8597, 644, 61634, 38147, 296, 4595, 1200, 904, 452, 10378, 467, 2409, 336, 3389, 1255, 309, 54618, 16023,
-        6122, 1084, 719, 1233, 1228, 1450, 1731, 895, 10823, 1228, 15649, 13186, 1228, 44863, 15328, 775, 1228, 39614,
-        586, 17413, 309, 124708, 6828, 1200, 64019, 529, 229, 585, 30, 1228, 61512, 385, 54618, 16023, 1084, 719, 1233,
-        296, 278, 1431, 43799, 1373, 4484, 467, 4409, 56756, 31043, 1200, 904, 8124, 383, 267, 229, 585, 30, 13636, 302,
-        278, 8086, 3587, 1228, 50269, 1228, 5614, 467, 267, 3170, 296, 278, 229, 585, 31, 24900, 3392, 302, 1712, 310,
-        6620, 411, 10378, 467, 7541, 381, 408, 425, 1019, 1200, 1712, 310, 6620, 411, 452, 5312, 462, 18001, 18931, 296,
-        278, 4595, 49249, 302, 28696, 370, 35236, 309, 30187, 3844, 1200, 61512, 385, 54618, 296, 1046, 6922, 296, 229,
-        585, 32, 1228, 5751
-    ];
+    /// <summary>2560 wikitext-2 token ids (LFM3 tokenizer): natural activations, and long enough that the global layers' unrotated RoPE
+    /// tail (frequencies 1e6^(-i/64) for pairs 32..63, ~1e-3 rad per position at i = 32) is observable.</summary>
+    private static int[] NaturalTokens()
+        => File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Models", "Lfm3", "Fixtures", "lfm3-wikitext-tokens.txt"))
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToArray();
 
     private static string? FindGguf() =>
         TestFixtureResolver.ResolveFile("DOTLLM_LFM3_GGUF", "LiquidAI", "LFM3-1.7B-GGUF", "LFM3-1.7B-Q8_0.gguf").Path;
@@ -82,7 +68,7 @@ public sealed unsafe class Lfm3VulkanParityTests(Xunit.Abstractions.ITestOutputH
     }
 
     private static ITensor Step(IModel model, ReadOnlyMemory<int> tokens, ReadOnlyMemory<int> positions, IKvCache kv, ISsmState state)
-        => model.ForwardBatch([new SequenceForwardRequest { TokenIds = tokens, Positions = positions, KvCache = kv, SsmState = state }], -1)[0];
+        => model.ForwardBatch([new SequenceForwardRequest { TokenIds = tokens, Positions = positions, KvCache = kv, SsmState = state, LastTokenLogitsOnly = true }], -1)[0];
 
     [SkippableFact]
     public void Vulkan_MatchesCpu_FullSequenceAndIncrementalAcrossTheSlidingWindow()
@@ -99,32 +85,49 @@ public sealed unsafe class Lfm3VulkanParityTests(Xunit.Abstractions.ITestOutputH
         var (vkModel, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, SpvDir());
         using var vk = (IDisposable)vkModel;
 
-        // The first 300 token ids of the wikitext-2 test split under the LFM3 tokenizer (natural text: broad, realistic activations).
-        int[] tokens = NaturalTokens;
+        // Natural text, 2560 tokens: crosses the 256-token sliding window ~10x and gives the global layers 2000+ positions of relative offset.
+        int[] tokens = NaturalTokens();
         int total = tokens.Length;
         var positions = Enumerable.Range(0, total).ToArray();
 
-        // CPU oracle rows (cacheless, all rows).
-        cpu.ResetSequenceState();
-        float[][] cpuRows = new float[total][];
-        using (var all = cpu.Forward(tokens, positions, -1))
-            for (int i = 0; i < total; i++) cpuRows[i] = Row(all, i);
+        int[] chunkEnds = [1000, 2000, 2500];
+        const int decodeSteps = 24;
+        int last = chunkEnds[^1] + decodeSteps;
+
+        // CPU oracle: the same schedule through the CPU KV cache + conv state (pinned equal to the cacheless forward by Lfm3CpuModelTests).
+        var cpuRows = new List<float[]>();
+        using (var ckv = new SimpleKvCache(cpu.AttentionLayerCount, config.NumKvHeads, config.HeadDim, tokens.Length + 8))
+        using (var cst = cpu.CreateSequenceState()!)
+        {
+            int cs = 0;
+            foreach (int end in chunkEnds)
+            {
+                using var r = Step(cpu, tokens.AsMemory(cs, end - cs), positions.AsMemory(cs, end - cs), ckv, (ISsmState)cst);
+                cpuRows.Add(Row(r, r.Shape[0] - 1));
+                cs = end;
+            }
+            for (int i = chunkEnds[^1]; i < last; i++)
+            {
+                using var r = Step(cpu, tokens.AsMemory(i, 1), positions.AsMemory(i, 1), ckv, (ISsmState)cst);
+                cpuRows.Add(Row(r, 0));
+            }
+        }
 
         // Vulkan: chunked prefill + single-token decode through the sparse KV cache and device conv state.
         vkModel.ResetSequenceState();
-        using var kv = kvFactory(512);
+        using var kv = kvFactory(tokens.Length + 8);
         using var state = vkModel.CreateSequenceState()!;
-        int start = 0;
-        foreach (int end in new[] { 100, 200, 280 })
+        int start = 0, k = 0;
+        foreach (int end in chunkEnds)
         {
-            using var last = Step(vkModel, tokens.AsMemory(start, end - start), positions.AsMemory(start, end - start), kv, (ISsmState)state);
-            AssertClose(cpuRows[end - 1], Row(last, last.Shape[0] - 1), 0.02, $"prefill chunk ending {end}");
+            using var lastRow = Step(vkModel, tokens.AsMemory(start, end - start), positions.AsMemory(start, end - start), kv, (ISsmState)state);
+            AssertClose(cpuRows[k++], Row(lastRow, lastRow.Shape[0] - 1), 0.01, $"prefill chunk ending {end}");
             start = end;
         }
-        for (int i = 280; i < total; i++)
+        for (int i = chunkEnds[^1]; i < last; i++)
         {
             using var row = Step(vkModel, tokens.AsMemory(i, 1), positions.AsMemory(i, 1), kv, (ISsmState)state);
-            AssertClose(cpuRows[i], Row(row, row.Shape[0] - 1), 0.02, $"decode {i}");
+            AssertClose(cpuRows[k++], Row(row, row.Shape[0] - 1), 0.01, $"decode {i}");
         }
     }
 }
