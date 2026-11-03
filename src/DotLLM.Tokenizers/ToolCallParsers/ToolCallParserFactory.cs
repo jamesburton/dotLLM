@@ -82,6 +82,8 @@ public static class ToolCallParserFactory
             Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense => new QwenXmlToolCallParser(),
             Architecture.Gemma4 => new Gemma4ToolCallParser(),
             Architecture.Lfm2Moe => new PythonicToolCallParser(),
+            // LFM3's template emits <tool_call><function=name><parameter=k>v</parameter></function></tool_call> (Qwen3-Coder XML form).
+            Architecture.Lfm3 => new QwenXmlToolCallParser(),
             Architecture.Granite or Architecture.GraniteMoe => new GraniteToolCallParser(),
             Architecture.GptOss => new HarmonyToolCallParser(),
             // SmolLM3 defaults to the XML (Hermes-compatible) format; the
