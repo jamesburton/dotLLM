@@ -352,3 +352,27 @@ decode tok/s of the run summary):
 Verdict: within the run-to-run spread (the on-arm pairs themselves differ by 4-3.5 tok/s); no win to ship. **Path proof is missing**: `DOTLLM_MTP_TRACE` was off, so these runs do not show that the ceiling ever rose; a single request
 rarely sustains 6 fully accepted K=4 rounds (histograms in section "Making MTP a default win" show 5-of-5 accepted in about a third of rounds on the best prompt), and the benefit only exists above the fixed K=4 that the controller already starts at.
 A re-test needs a trace of the chosen K per round (or a counter) on a high-acceptance long generation; until then the fixed `MtpPreferredDraftTokens = 4` stands.
+
+### 11.3 UD-Q4_K_XL verify rows against llama.cpp (#1555): parity; the #1511/#1520 structure does not apply
+
+UD-Q4_K_XL (79 GiB; dense projections, shared experts and the hyper-connection projections are Q8_0, routed gate/up Q4_K, routed down Q5_1), Vulkan, F16 K/V, context 12288, no MTP head attached, reference llama.cpp `dde879bc`
+(`llama-bench -fa 1 -p 1,2,3,5,512 -n 32 -r 5`; its `pp N` is an N-token batch forward, the same shape as an N-row verify). Locks: Strix GPU + memory (+ `gpu-lock.sh`), one process per engine, never resident together.
+
+| rows | dotLLM `fwd` ms (median, min-max, 20 reps, ctx 64) | llama.cpp ms (from tok/s) | dotLLM / llama.cpp |
+|---|---|---|---|
+| 1 | 41.6 (40.4-44.4) | 45.7 (21.87 +- 0.09 tok/s) | 0.91 |
+| 2 | 51.6 (47.7-77.5) | 51.4 (38.92 +- 0.39) | 1.00 |
+| 3 | 58.3 (55.5-61.4) | 60.7 (49.41 +- 1.12) | 0.96 |
+| 5 | 78.3 (72.3-106.9) | 77.6 (64.44 +- 2.68) | 1.01 |
+| decode | ~24 tok/s (1 row) | tg32 19.41 +- 1.93 | ~1.2 |
+| prefill | pp2048 482 (465-535), `pf` chunk 1024 | pp512 281 +- 43 (different length; llama.cpp's own spread is 15%) | not matched |
+
+Code path: `Qwen4ExpRowProbe fwd <rows> 20 64` (one command buffer for <= 16 rows; fused single-token MoE chain at 1 row, indexed multi-row MoE MMVQ at 2..8). 1K context: 5 rows 124.7 ms (115.6-341.3), 1 row 82.3 ms.
+A 5-row verify therefore costs 1.88x of a 1-row forward at ctx 64 (1.5x at 1K), matching llama.cpp's shape; there is no row-count cliff to fix on this file.
+
+**Why the #1511/#1520 structure does not apply here.** Its win is sharing one weight read across up to 16 activation columns of the SAME weight matrix. On this file (a) every dense projection is Q8_0, whose multi-column kernel was measured at the DRAM ceiling in
+#1515/#1516 (200+ GB/s through 12 columns, all structures refuted), and (b) the routed experts, the dominant verify cost, are different weights per row (10 of 512 experts per row).
+
+Split-submit stage profile at 5 rows (distorted by per-stage syncs: forward 181 ms against 78 ms unprofiled; read ratios only): `gate_up` 32.0 ms vs 10.5 ms at 1 row (3.0x), `down` 16.3 vs 6.4 (2.6x), `gdn_proj` 10.7 vs 9.9 (1.1x),
+`gdn_outproj` 5.7 vs 5.8, gated-residual stages flat. So the 1 -> 5 row growth is the MoE experts: five rows touch up to 5x as many experts; the shared dense stages are free. The remaining lever is the expert read itself (overlapping the
+5 rows' expert tiles with the dense work, or the expert-grouped path that already exists from 16 rows) - open, not attempted; the dense side has nothing left. Not measured here: MTP ratios on this file with the current build (last measured 1.33-1.38x, `docs/SPECULATIVE.md`).

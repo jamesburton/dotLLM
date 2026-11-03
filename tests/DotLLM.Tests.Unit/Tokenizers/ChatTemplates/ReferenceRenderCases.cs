@@ -31,12 +31,21 @@ internal static class ReferenceRenderCases
     /// <param name="casesFile">The render-cases JSON fixture.</param>
     /// <param name="caseName">The case to replay.</param>
     public static void AssertMatches(string templateFile, string casesFile, string caseName)
+        => AssertMatches(templateFile, casesFile, caseName, viaChatTemplate: false);
+
+    /// <summary>
+    /// As <see cref="AssertMatches(string,string,string)"/>; with <paramref name="viaChatTemplate"/> the template source is first
+    /// normalised by <see cref="JinjaChatTemplate"/> (trailing-newline trim, HF <c>{% generation %}</c> blocks rewritten to no-ops),
+    /// i.e. exactly what the server renders.
+    /// </summary>
+    public static void AssertMatches(string templateFile, string casesFile, string caseName, bool viaChatTemplate)
     {
         using var doc = JsonDocument.Parse(Fixture(casesFile));
         var c = doc.RootElement.EnumerateArray().Single(e => e.GetProperty("name").GetString() == caseName);
 
         var ctx = (Dictionary<string, object?>)Convert(c.GetProperty("context"))!;
-        var ast = new JinjaParser(new JinjaLexer(Fixture(templateFile)).Tokenize()).Parse();
+        string source = viaChatTemplate ? new JinjaChatTemplate(Fixture(templateFile), "", "").TemplateSource : Fixture(templateFile);
+        var ast = new JinjaParser(new JinjaLexer(source).Tokenize()).Parse();
         var evaluator = new JinjaEvaluator(ctx);
 
         if (c.TryGetProperty("expectedError", out var err))

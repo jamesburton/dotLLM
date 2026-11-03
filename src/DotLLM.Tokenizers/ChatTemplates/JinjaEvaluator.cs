@@ -639,6 +639,9 @@ internal sealed class JinjaEvaluator
             // (`message.content is mapping or message.content is iterable` -> tojson), and both reference
             // Jinja2 and llama.cpp render a string tool result as a quoted/escaped JSON string.
             "iterable" => value is IEnumerable,
+            // LFM3 render_value: `v is boolean` selects the "true"/"false" spelling of tool-call arguments.
+            "boolean" => value is bool,
+            "float" => value is double or float,
             "true" => value is true,
             "false" => value is false,
             "callable" => false, // we don't support callable test

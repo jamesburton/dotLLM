@@ -63,6 +63,8 @@ public static partial class GgufModelConfigExtractor
         // both keys are scalar UInt32.
         HybridLayerLayout? hybridLayout = architecture == Architecture.Lfm2Moe
             ? BuildLfm2MoeLayout(metadata, arch, numTrunkLayers)
+            : architecture == Architecture.Lfm3
+            ? BuildLfm3Layout(metadata, arch, numTrunkLayers)
             : TryExtractHybridLayout(metadata, arch, numTrunkLayers, nextnPredictLayers);
 
         int intermediateSize;
@@ -118,7 +120,11 @@ public static partial class GgufModelConfigExtractor
         // consult PerLayerSlidingWindow before the scalar pattern).
         IReadOnlyList<int?>? perLayerSlidingWindow = architecture is Architecture.Gemma3 or Architecture.GemmaEmbedding && slidingWindowSize is not null
             ? BuildGemma3PerLayerSlidingWindow(metadata, arch, numTrunkLayers, slidingWindowSize.Value)
-            : null;
+            : architecture == Architecture.Lfm3
+                ? (slidingWindowSize is { } lfmWindow
+                    ? BuildLfm3PerLayerSlidingWindow(metadata, arch, numTrunkLayers, lfmWindow)
+                    : throw new InvalidDataException("LFM3 requires lfm3.attention.sliding_window (llama.cpp load_arch_hparams throws without sliding layers)."))
+                : null;
 
         int vocabSize = ResolveVocabSize(metadata, arch);
 
@@ -133,7 +139,7 @@ public static partial class GgufModelConfigExtractor
         // GGUF linear scaling (4B+: factor 8). RoPEConfig carries the LOCAL table, GlobalRoPEConfig the
         // global one (selected per layer via IsFullAttentionLayer).
         RoPEConfig? globalRopeConfig = null;
-        if (architecture is Architecture.Gemma3 or Architecture.GemmaEmbedding && ropeConfig is { } gr)
+        if (architecture is Architecture.Gemma3 or Architecture.GemmaEmbedding or Architecture.Lfm3 && ropeConfig is { } gr)
         {
             globalRopeConfig = gr;
             float localTheta = metadata.GetFloat32OrDefault($"{arch}.rope.freq_base_swa", 10000.0f);
@@ -312,7 +318,7 @@ public static partial class GgufModelConfigExtractor
             SlidingWindowSize = slidingWindowSize,
             SlidingWindowPattern = slidingWindowPattern,
             HybridLayout = hybridLayout,
-            ShortConvCacheLength = architecture == Architecture.Lfm2Moe
+            ShortConvCacheLength = architecture is Architecture.Lfm2Moe or Architecture.Lfm3
                 ? (int)metadata.GetUInt32($"{arch}.shortconv.l_cache") : 0,
             SsmConfig = ssmConfig,
             MlaConfig = mlaConfig,
@@ -927,6 +933,41 @@ public static partial class GgufModelConfigExtractor
     }
 
     /// <summary>
+    /// LFM3 layer layout (llama.cpp <c>llama_model_lfm3</c>): like LFM2, <c>head_count_kv</c> zeros are the short-conv layers;
+    /// every layer carries the same dense SwiGLU FFN of width <c>feed_forward_length</c> (no MoE).
+    /// </summary>
+    private static HybridLayerLayout BuildLfm3Layout(GgufMetadata metadata, string arch, int numLayers)
+    {
+        string kvKey = $"{arch}.attention.head_count_kv";
+        int[] kv = metadata.GetInt32Array(kvKey);
+        if (kv.Length != numLayers)
+            throw new InvalidDataException($"'{kvKey}' array length {kv.Length} does not match block_count {numLayers}.");
+        int ffLen = (int)metadata.GetUInt32($"{arch}.feed_forward_length");
+        var kinds = new HybridLayerKind[numLayers];
+        var ff = new int[numLayers];
+        for (int i = 0; i < numLayers; i++)
+        {
+            kinds[i] = kv[i] > 0 ? HybridLayerKind.Attention : HybridLayerKind.ShortConv;
+            ff[i] = ffLen;
+        }
+        return new HybridLayerLayout { LayerKind = kinds, HeadCountKv = kv, FeedForwardLength = ff };
+    }
+
+    /// <summary>
+    /// LFM3 per-layer sliding window: <c>attention.sliding_window_pattern</c> is a per-layer bool array (true = windowed,
+    /// llama.cpp <c>is_swa_impl</c>); windowed layers get <paramref name="window"/>, global and conv layers get null.
+    /// </summary>
+    private static IReadOnlyList<int?> BuildLfm3PerLayerSlidingWindow(GgufMetadata metadata, string arch, int numLayers, int window)
+    {
+        bool[] pattern = metadata.GetBoolArray($"{arch}.attention.sliding_window_pattern");
+        if (pattern.Length != numLayers)
+            throw new InvalidDataException($"'{arch}.attention.sliding_window_pattern' length {pattern.Length} does not match block_count {numLayers}.");
+        var r = new int?[numLayers];
+        for (int i = 0; i < numLayers; i++) r[i] = pattern[i] ? window : null;
+        return r;
+    }
+
+    /// <summary>
     /// LFM2-MoE routing (llama.cpp <c>lfm2moe.cpp</c>): <c>build_moe_ffn(..., LLM_FFN_SILU, norm_w=true, expert_weights_scale,
     /// gating_func=expert_gating_func)</c> with the <c>exp_probs_b</c> selection bias; no shared expert; the first
     /// <c>leading_dense_block_count</c> layers use a dense SwiGLU of width <c>feed_forward_length</c>.
@@ -1101,6 +1142,7 @@ public static partial class GgufModelConfigExtractor
             // V3 / V3-MoE — MLA + sigmoid-gated routing + group-norm experts.
             "deepseek3" => Architecture.DeepSeekV3,
             "lfm2moe" => Architecture.Lfm2Moe,
+            "lfm3" => Architecture.Lfm3,
             "nemotron_h" => Architecture.NemotronH,
             // Nemotron-H hybrid stack + DeepSeek-V3-style MoE + optional MTP head
             // (Nemotron 3.5 Lightning). Distinct llama.cpp arch from nemotron_h.
@@ -1667,7 +1709,7 @@ public static partial class GgufModelConfigExtractor
                 or Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Qwen4Exp or Architecture.Phi
                 or Architecture.GptOss or Architecture.BitNet
                 // llama.cpp llama_model_rope_type: LFM2 / LFM2MOE are NEOX (HF layout).
-                or Architecture.Lfm2Moe
+                or Architecture.Lfm2Moe or Architecture.Lfm3
                 // llama.cpp llama_model_rope_type: gemma / gemma2 / gemma3 are NEOX, and their
                 // converter does not permute Q/K (HF rotate_half layout).
                 or Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3 or Architecture.GemmaEmbedding

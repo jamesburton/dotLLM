@@ -796,6 +796,16 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     public bool TiledQueryPositionAttentionEnabled { get; set; } = true;
     /// <summary>Environment variable: <c>ref</c> forces the reference per-query-position kernel (#1540 A/B and oracle).</summary>
     public const string QueryPositionsKernelEnvVar = "DOTLLM_VULKAN_ATTN_QPOS";
+    // GQA-grouped tiled flash kernel as the ordinary causal prefill attention (#1548); the per-head flash_cm kernel stays the oracle/fallback.
+    private VulkanFlashAttentionGqaKernel? _prefillGqaFlash;
+    /// <summary>Count of attention layers that ran the ordinary prefill attention on the GQA-grouped tiled kernel (#1548; test/diagnostic).</summary>
+    public long PrefillGqaFlashCount { get; private set; }
+    /// <summary>Whether the GQA-grouped tiled kernel serves ordinary prefill attention when loaded (default true); false forces the per-head flash kernel (A/B and oracle runs).</summary>
+    public bool PrefillGqaFlashEnabled { get; set; } = true;
+    /// <summary>Whether the GQA-grouped prefill kernel (#1548) is loaded.</summary>
+    public bool SupportsPrefillGqaFlash => _prefillGqaFlash is not null;
+    /// <summary>Environment variable: <c>ref</c> keeps ordinary prefill on the per-head flash kernel (#1548 A/B and oracle).</summary>
+    public const string PrefillGqaFlashEnvVar = "DOTLLM_VULKAN_ATTN_PREFILL";
     private VulkanQueryRelevanceProbe? _relevanceProbe;
     /// <summary>Attaches (or, with null, detaches) a query-relevance probe: while attached, every layer of a cached forward on a plain <see cref="VulkanKvCache"/> feeds it (#1531 step 4). Not thread-safe; one forward at a time.</summary>
     public void AttachQueryRelevanceProbe(VulkanQueryRelevanceProbe? probe) => _relevanceProbe = probe;
@@ -2627,6 +2637,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 model._moeScatterResidual = SimpleComputeKernel.Create(device, spvDir, "moe_weighted_scatter_residual_f32", buffers: 5, pushWords: 3);
             model._rowScaleMul = SimpleComputeKernel.Create(device, spvDir, "row_scale_mul_f32", buffers: 2, pushWords: 2);
         }
+        if (Environment.GetEnvironmentVariable(PrefillGqaFlashEnvVar) != "ref" && !IsFlashAttentionDisabled())
+            model._prefillGqaFlash = VulkanFlashAttentionGqaKernel.TryCreate(device, spvDir, VulkanKvStorage.F32);
         if (File.Exists(Path.Combine(spvDir, "attention_f32_qpos.spv")))
         {
             model._attentionQPos = AttentionQueryPositionsKernel.Create(device, spvDir);
@@ -3016,6 +3028,15 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         // Prefill (seqQ > 1): prefer the cooperative-matrix FA kernel (issue
         // #149, llama.cpp FA_COOPMAT1 analogue) over the scalar FA shader.
         // Same tiling, same mask semantics; f16-matmul numerics (see kernel).
+        if (!kvF16 && seqQ > 1 && PrefillGqaFlashEnabled && _prefillGqaFlash is { } gqa && gqa.CanDispatch(headDim, numHeads, numKvHeads))
+        {
+            PrefillGqaFlashCount++;
+            ProfNote("attn_flash_gqa", seqQ, seqKv, numHeads);
+            gqa.Record(cmdBuf, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
+                positionOffset: positionOffset, slidingWindow: slidingWindow,
+                softCap: softCap, scaleOverride: scaleOverride, maskMode: maskMode, prefixLen: prefixLen);
+            return;
+        }
         if (_flashAttentionCoopmat is not null && seqQ > 1
             && headDim <= _flashAttentionCoopmat.SupportedMaxHeadDim)
         {

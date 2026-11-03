@@ -317,6 +317,34 @@ Differences between architectures are captured entirely in ModelConfig.
 <think>`), Pythonic tool calls `<|tool_call_start|>[fn(a='x')]<|tool_call_end|>` parsed by
   `PythonicToolCallParser`. Raw `dotllm run` adds no BOS (prefix `<|startoftext|>` or use the chat/serve path).
 
+### LFM3 (`lfm3`, Liquid AI, #1558 / #1559)
+
+- **What it is**: a "tri-hybrid", **not** a state-space model. LFM3-1.7B has 24 layers: 13 gated short-convolution layers (`L_cache = 7`, state = the last 6 rows of
+  `B*X` per channel), 5 **sliding-window** GQA layers (window 256, RoPE theta 1e4) and 6 **global** GQA layers (indices 2, 6, ..., 22; RoPE theta 1e6). Only
+  the 6 global layers' KV grows with context (the sliding layers need at most 256 live rows and the conv state is constant), so long-context decode touches about a
+  quarter of the KV a plain transformer of the same depth would. hidden 2048, 16 heads / 4 KV heads, head_dim 128, dense SwiGLU FFN 7680 on every layer, tied head, 128k vocab.
+- **Layer algebra** (`Architecture.Lfm3`, CPU `Lfm3TransformerModel`; layout from the per-layer `head_count_kv` array (0 = conv) and the per-layer bool array
+  `attention.sliding_window_pattern`, surfaced as `ModelConfig.PerLayerSlidingWindow`): `x += post_operator_norm(mixer(operator_norm(x)))`, then
+  `x += post_ffn_norm(ffn(ffn_norm(x)))` (**sandwich norms**, GGUF `post_attention_norm` / `post_ffw_norm`; both optional, `use_sandwich_norm`). The attention mixer adds a **per-head
+  sigmoid gate**: `attn_out[h] *= sigmoid(attn_gate . x)` (`attn_gate`, hidden to n_heads) before `o_proj`, on top of per-head QK RMS-norm and NeoX RoPE.
+- **RoPE**: sliding layers rotate all 64 pairs with theta `rope.freq_base_swa` (1e4). Global layers use theta `rope.freq_base` (1e6) but rotate only the first 32 pairs: the
+  GGUF stores `rope_freqs.weight` (64 divisors, 1.0 for the first 32, 1e30 after), so the frequency progression of the full 128-wide head is kept and the tail is left unrotated
+  (HF writes the same thing as a zero-tail `inv_freq`). The CPU model builds cos/sin per forward from these and applies a pair-limited NeoX rotation.
+- **State**: reuses `Lfm2ConvStateCache` (per sequence via `CreateSequenceState` / `ForwardBatch`); the KV cache is the sparse hybrid cache (slots only for the 11 attention layers).
+  Sliding layers currently keep the full history in the cache and mask by window (compute is O(window) per token; memory is not yet bounded). No recurrent checkpoint/rollback yet.
+- **Final norm** is `output_norm.weight` (LFM2 files name it `token_embd_norm.weight`); the head is tied to `token_embd`.
+- **Chat / tools**: ChatML with `<|startoftext|>`, thinking via `<think>` (`enable_thinking` default true, so the generation prompt ends `<think>`), XML tool calls
+  `<tool_call>
+<function=name>
+<parameter=k>
+v
+</parameter>
+</function>
+</tool_call>` parsed by `QwenXmlToolCallParser`; image/video placeholders
+  `<|vision_start|><|image|><|vision_end|>`. GGUF `tokenizer.ggml.pre = lfm2`, `add_bos_token = false`.
+- **Parity** (vs llama.cpp `dde879bc`, `-dev none`, wikitext-2, 512-token windows, full-vocab logits): BF16 4 windows top-1 99.5%, mean KL 6.0e-4; Q8_0 16 windows top-1 97.4%,
+  mean KL 2.8e-3 (activation-quantisation floor), PPL 25.9443 vs 25.9400 (+0.017%). See `scripts/kld_compare.py` and `docs/PERPLEXITY.md`.
+
 ## GGUF → ModelConfig Mapping
 
 ```csharp

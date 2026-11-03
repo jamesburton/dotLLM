@@ -789,7 +789,8 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
 
     private unsafe void StageDownload(VulkanDevice.Buffer src, long srcOffset, long bytes, Span<float> destination)
     {
-        using var staging = _device.Allocate(bytes);
+        // Host-cached memory: the default host-visible type is write-combined (uncached) on AMD, and CPU reads from it ran at ~130 MiB/s (#1551).
+        using var staging = _device.AllocateHostReadback(bytes);
         _device.CopyBufferRangeSynchronous(src, staging, (ulong)srcOffset, 0, (ulong)bytes);
         nint mapped = _device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory ReadRows staging");
         try
