@@ -156,6 +156,25 @@ public sealed class PrefixCacheFailedRequestTests : IClassFixture<PrefixCacheFai
         Assert.Equal(1, prefix.EntryCount);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TrieAdmission_IsGivenBack_WhenRequestFailsAfterHit(bool stream)
+    {
+        using var m = new FaultModel(_tiny.Model);
+        using var trie = new PrefixTrieManager(new PagedKvCacheFactory(_tiny.Config.NumLayers, _tiny.Config.NumKvHeads, _tiny.Config.HeadDim, 4, 512));
+        var gen = new TextGenerator(m, new IdsTokenizer(TinyQwen.Vocab), prefixTrieManager: trie, prefillChunkSize: 4);
+        await Run(gen, PromptA, stream);                              // A recorded: its full blocks are in the trie
+        int nodes = trie.Trie.NodeCount;
+        Assert.True(nodes >= Shared / 4);
+
+        m.AfterPrefillForward = () => throw new InvalidOperationException("injected failure");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Run(gen, PromptB, stream));   // hits the shared blocks, then fails
+
+        // The failed request held node refs on the shared prefix blocks; they must be released, so the whole trie can be evicted.
+        Assert.Equal(nodes, trie.TryEvict(nodes));
+    }
+
     /// <summary>Forwards to the real model; after each multi-token (prefill) forward it has written, runs a fault hook.</summary>
     internal sealed class FaultModel(TransformerModel inner) : IModel
     {

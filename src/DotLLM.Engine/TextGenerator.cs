@@ -980,7 +980,11 @@ public sealed partial class TextGenerator
             ArrayPool<char>.Shared.Return(stopScratch);
             ReleaseRequestMtpState(mtpState);
             if (ownsKvCache)
+            {
+                // A request that fails before RecordCompletion must still give back its trie admission (issue #1589).
+                if (kvCache is KvCache.PagedKvCache abandoned) _prefixTrieManager?.Abandon(abandoned);
                 kvCache.Dispose();
+            }
             telemetry.RequestSpan?.Dispose();
         }
     }
@@ -1549,7 +1553,11 @@ public sealed partial class TextGenerator
             ArrayPool<char>.Shared.Return(stopScratch);
             ReleaseRequestMtpState(mtpState);
             if (ownsKvCache)
+            {
+                // A request that fails before RecordCompletion must still give back its trie admission (issue #1589).
+                if (kvCache is KvCache.PagedKvCache abandoned) _prefixTrieManager?.Abandon(abandoned);
                 kvCache.Dispose();
+            }
         }
     }
 
