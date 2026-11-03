@@ -39,13 +39,20 @@ internal sealed record ChunkCaller(bool Authenticated, string Namespace)
     /// </summary>
     public bool IsAdmin { get; init; }
 
+    /// <summary>
+    /// An admin by an <c>admin</c> key from the keys file (not merely the local user of a keyless server). Store-wide or
+    /// cross-namespace destructive operations (<c>orphans</c>, a store-wide <c>all</c>, another namespace, with
+    /// <c>dry_run: false</c>) need it (controller ruling on the Task 16 review, S2).
+    /// </summary>
+    public bool IsAdminKey { get; init; }
+
     /// <summary>An unauthenticated caller: the default namespace, no store lookups, counts only.</summary>
     public static ChunkCaller Anonymous { get; } = new(false, ChunkNamespace.Default);
 
     // Never print the namespace (spec §10): it is a digest of a credential.
     private bool PrintMembers(System.Text.StringBuilder builder)
     {
-        builder.Append(System.Globalization.CultureInfo.InvariantCulture, $"Authenticated = {Authenticated}, IsAdmin = {IsAdmin}");
+        builder.Append(System.Globalization.CultureInfo.InvariantCulture, $"Authenticated = {Authenticated}, IsAdmin = {IsAdmin}, IsAdminKey = {IsAdminKey}");
         return true;
     }
 }
@@ -67,8 +74,10 @@ internal sealed record ChunkCaller(bool Authenticated, string Namespace)
 /// IPv4-mapped one too; an unknown address, as on a Unix socket or in-memory host, is not local); the <c>Host</c> header names
 /// <c>localhost</c> or a loopback address (a DNS-rebinding page reaches loopback under its own host name); and no
 /// <c>Origin</c> header (browsers send one on cross-origin requests, and the server's CORS policy allows any origin, so a web
-/// page could otherwise read a local caller's chunk status). Behind a reverse proxy on the same host every caller is local:
-/// configure keys there.
+/// page could otherwise read a local caller's chunk status); and no forwarding header (<c>Forwarded</c>,
+/// <c>X-Forwarded-*</c>, <c>X-Real-IP</c>: a same-host proxy). A proxy that adds none of them still makes every caller
+/// look local: configure keys there. The local caller of a keyless server is admin for figures, dry runs and its own
+/// namespace, never for store-wide or cross-namespace deletes (<see cref="ChunkCaller.IsAdminKey"/>).
 /// </para>
 /// <para>
 /// <b>Inference requests</b> are never refused here (dotLLM inference stays unauthenticated); a caller that would be
@@ -102,7 +111,7 @@ internal static class ChunkCacheAuth
             if (key is not null && keys.TryMatch(key, out bool admin, out string? named))
             {
                 failure = ChunkAuthFailure.None;
-                return new ChunkCaller(true, named ?? ChunkNamespace.ForApiKey(key.Trim(' ', '\t'))) { IsAdmin = admin };
+                return new ChunkCaller(true, named ?? ChunkNamespace.ForApiKey(key.Trim(' ', '\t'))) { IsAdmin = admin, IsAdminKey = admin };
             }
             failure = ChunkAuthFailure.Unauthorized;
             return ChunkCaller.Anonymous;
@@ -110,8 +119,9 @@ internal static class ChunkCacheAuth
 
         if (IsLocal(context))
         {
-            // The single user of a keyless server is its admin (Task 14 review: only together with the CSRF gates, which the
-            // write routes have: application/json only and no cross-site request).
+            // The single user of a keyless server is its admin for figures, dry runs and its own namespace (Task 14 review,
+            // with the CSRF gates), but never for store-wide or cross-namespace deletes: those need an admin KEY (IsAdminKey;
+            // Task 16 review S2: a same-host reverse proxy makes every caller look local).
             failure = ChunkAuthFailure.None;
             return new ChunkCaller(true, ChunkNamespace.Default) { IsAdmin = true };
         }
@@ -203,6 +213,23 @@ internal static class ChunkCacheAuth
         return null;
     }
 
+    /// <summary>
+    /// Whether a request carries a forwarding header (<c>Forwarded</c>, any <c>X-Forwarded-*</c>, <c>X-Real-IP</c>): it came
+    /// through a proxy, so it is never local, whatever its connection's address (Task 16 review S2 ruling).
+    /// </summary>
+    internal static bool IsForwarded(IHeaderDictionary headers)
+    {
+        foreach (var header in headers)
+        {
+            string name = header.Key;
+            if (name.Equals("Forwarded", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("X-Real-IP", StringComparison.OrdinalIgnoreCase)
+                || name.StartsWith("X-Forwarded-", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
     /// <summary>Whether a request comes from this machine and not through a browser (see the class remarks).</summary>
     internal static bool IsLocal(HttpContext context)
     {
@@ -215,6 +242,8 @@ internal static class ChunkCacheAuth
             return false;
         if (context.Request.Headers.ContainsKey(HeaderNames.Origin))
             return false;
+        if (IsForwarded(context.Request.Headers))
+            return false; // a same-host reverse proxy: the real caller is elsewhere
         string host = context.Request.Host.Host;
         if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase))
             return true;

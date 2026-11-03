@@ -84,6 +84,25 @@ internal sealed class ChunkCacheRuntime : IDisposable
     /// <summary>Slots for concurrent <c>prewarm</c> / <c>evict</c> calls (<see cref="Endpoints.ChunkCacheEndpoint.MaxConcurrentWrites"/>).</summary>
     internal SemaphoreSlim WriteGate { get; } = new(Endpoints.ChunkCacheEndpoint.MaxConcurrentWrites, Endpoints.ChunkCacheEndpoint.MaxConcurrentWrites);
 
+    private readonly HashSet<string> _writeNamespaces = new(StringComparer.Ordinal);
+
+    /// <summary>Takes the namespace's single write slot (one prewarm / evict call per namespace at a time); false when taken.</summary>
+    /// <param name="ns">The caller's namespace.</param>
+    /// <returns>Whether the slot was free.</returns>
+    internal bool TryEnterWriteSlot(string ns)
+    {
+        lock (_writeNamespaces)
+            return _writeNamespaces.Add(ns);
+    }
+
+    /// <summary>Releases the namespace's write slot.</summary>
+    /// <param name="ns">The caller's namespace.</param>
+    internal void LeaveWriteSlot(string ns)
+    {
+        lock (_writeNamespaces)
+            _writeNamespaces.Remove(ns);
+    }
+
     /// <summary>A store injected by the host or a test; wins over <c>--chunk-store</c>.</summary>
     internal IChunkStore? StoreOverride { get; set; }
 

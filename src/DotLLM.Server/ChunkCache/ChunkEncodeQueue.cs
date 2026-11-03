@@ -120,6 +120,7 @@ internal sealed class ChunkEncodeQueue : IDisposable
     private readonly Thread _thread;
     private long _chars;
     private long _seq;
+    private ChunkEncodeItem? _current;
     private int _inFlight;
     private int _disposed;
     private int _windowEncodes;
@@ -200,6 +201,12 @@ internal sealed class ChunkEncodeQueue : IDisposable
             Monitor.PulseAll(_gate);
             return true;
         }
+    }
+
+    /// <summary>The item the worker is on (taken from the queue, not yet written or dropped), or null.</summary>
+    public ChunkEncodeItem? Current
+    {
+        get { lock (_gate) return _current; }
     }
 
     /// <summary>The sequence number of the last item queued (0 = none yet).</summary>
@@ -287,6 +294,7 @@ internal sealed class ChunkEncodeQueue : IDisposable
                     item = _items.Dequeue();
                     _chars -= item.Text.Length;
                     _inFlight++;
+                    _current = item;
                 }
                 try
                 {
@@ -297,6 +305,7 @@ internal sealed class ChunkEncodeQueue : IDisposable
                     lock (_gate)
                     {
                         _inFlight--;
+                        _current = null;
                         _queued.Remove((item.Namespace, item.Key.Hex));
                         if (_perNamespace.TryGetValue(item.Namespace, out int n))
                         {

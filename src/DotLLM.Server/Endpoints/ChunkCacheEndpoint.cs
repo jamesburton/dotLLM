@@ -55,11 +55,26 @@ public static class ChunkCacheEndpoint
     /// <summary>Largest prewarm body, bytes; larger is 413.</summary>
     public const int MaxPrewarmBodyBytes = 4 * 1024 * 1024;
 
+    /// <summary>Default of <see cref="BodyReadTimeout"/>.</summary>
+    public static readonly TimeSpan DefaultBodyReadTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// How long a POST body may take to arrive (explain, prewarm, evict); later is 408. The body is read before any slot is
+    /// taken, so a trickling body never holds one (Task 16 review S3). A constant; tests shorten it.
+    /// </summary>
+    internal static TimeSpan BodyReadTimeout { get; set; } = DefaultBodyReadTimeout;
+
+    /// <summary>Longest evict <c>path</c> glob, characters; longer is 400.</summary>
+    public const int MaxGlobChars = 1024;
+
     /// <summary>Largest evict body, bytes; larger is 413.</summary>
     public const int MaxEvictBodyBytes = 64 * 1024;
 
     /// <summary>Prewarm and evict calls that may run at once per server; more get 429.</summary>
     public const int MaxConcurrentWrites = 2;
+
+    /// <summary>The evict warning when a delete failed (a file held open): the counts are in <c>failed</c>.</summary>
+    public const string EvictPartial = "chunk_evict_partial";
 
     /// <summary>The evict modes (spec §7.2).</summary>
     private static readonly Dictionary<string, EvictMode> Modes = new(StringComparer.Ordinal)
@@ -306,6 +321,10 @@ public static class ChunkCacheEndpoint
             await WriteTooLargeAsync(context);
             return;
         }
+        // The body first (size limit and deadline), so a slow body never holds a slot.
+        var body = await ReadBodyAsync(context, MaxExplainBodyBytes, "explain");
+        if (body is null)
+            return;
 
         // Bounded: explain renders and tokenises on the request thread, outside the scheduler.
         var gate = runtime.ExplainGate;
@@ -480,7 +499,7 @@ public static class ChunkCacheEndpoint
     /// Reads the body, at most <paramref name="max"/> bytes (also without a <c>Content-Length</c>, e.g. chunked); null when
     /// it is larger.
     /// </summary>
-    private static async Task<ReadOnlyMemory<byte>?> ReadLimitedAsync(HttpContext context, int max)
+    private static async Task<ReadOnlyMemory<byte>?> ReadLimitedAsync(HttpContext context, int max, CancellationToken ct)
     {
         if (context.Request.ContentLength > max)
             return null;
@@ -488,6 +507,7 @@ public static class ChunkCacheEndpoint
         byte[] chunk = new byte[64 * 1024];
         int read;
         while ((read = await context.Request.Body.ReadAsync(chunk, cancellationToken)) > 0)
+        while ((read = await context.Request.Body.ReadAsync(chunk, ct)) > 0)
         {
             if (buffer.Length + read > max)
                 return null;
@@ -532,7 +552,8 @@ public static class ChunkCacheEndpoint
     }
 
     /// <summary>Runs a write route under the write gate (429 when full), mapping body-read failures to 413 / 400 and anything unexpected to 500.</summary>
-    private static async Task RunWriteAsync(HttpContext context, ServerState state, string route, Func<ChunkCaller, ChunkStoreService, Task> body)
+    private static async Task RunWriteAsync(HttpContext context, ServerState state, string route, int maxBody,
+        Func<ChunkCaller, ChunkStoreService, ReadOnlyMemory<byte>, Task> handler)
     {
         try
         {
@@ -543,21 +564,36 @@ public static class ChunkCacheEndpoint
             }
             if (await AdmitWriteAsync(context, state, route) is not { } admitted)
                 return;
-            var gate = state.ChunkCacheRuntime.WriteGate;
-            if (!gate.Wait(0))
+            // The body first (deadline and size limit): a trickling body never holds a slot (review S3).
+            if (await ReadBodyAsync(context, maxBody, route) is not { } body)
+                return;
+            // One write call per namespace at a time (one tenant cannot hold both slots), at most MaxConcurrentWrites in all.
+            var runtime = state.ChunkCacheRuntime;
+            if (!runtime.TryEnterWriteSlot(admitted.Caller.Namespace))
             {
-                context.Response.Headers.RetryAfter = "1";
-                await WriteAsync(context, StatusCodes.Status429TooManyRequests,
-                    ErrorResponse.RateLimit($"{route}: at most {MaxConcurrentWrites} prewarm / evict calls run at once; retry shortly", code: "chunk_control_busy"));
+                await WriteBusyAsync(context, $"{route}: one prewarm / evict call per caller at a time; retry shortly");
                 return;
             }
             try
             {
-                await body(admitted.Caller, admitted.Writer);
+                var gate = runtime.WriteGate;
+                if (!gate.Wait(0))
+                {
+                    await WriteBusyAsync(context, $"{route}: at most {MaxConcurrentWrites} prewarm / evict calls run at once; retry shortly");
+                    return;
+                }
+                try
+                {
+                    await handler(admitted.Caller, admitted.Writer, body);
+                }
+                finally
+                {
+                    gate.Release();
+                }
             }
             finally
             {
-                gate.Release();
+                runtime.LeaveWriteSlot(admitted.Caller.Namespace);
             }
         }
         catch (Microsoft.AspNetCore.Http.BadHttpRequestException ex)
@@ -574,8 +610,14 @@ public static class ChunkCacheEndpoint
         }
     }
 
+    private static Task WriteBusyAsync(HttpContext context, string message)
+    {
+        context.Response.Headers.RetryAfter = "1";
+        return WriteAsync(context, StatusCodes.Status429TooManyRequests, ErrorResponse.RateLimit(message, code: "chunk_control_busy"));
+    }
+
     private static Task PrewarmAsync(HttpContext context, ServerState state) =>
-        RunWriteAsync(context, state, "prewarm", (caller, writer) => PrewarmAdmittedAsync(context, state, caller, writer));
+        RunWriteAsync(context, state, "prewarm", MaxPrewarmBodyBytes, (caller, writer, body) => PrewarmAdmittedAsync(context, state, caller, writer, body));
 
     /// <summary>One text of a prewarm call.</summary>
     private sealed record PrewarmItem(string Text, string? SourcePath, bool SourceUnreadable)
@@ -595,16 +637,9 @@ public static class ChunkCacheEndpoint
     /// <c>source.path</c>, PEM sniff, CPU 512-token cap, budget, queue shares), without a sighting. Request thread only: no
     /// lock file, no store write.
     /// </summary>
-    private static async Task PrewarmAdmittedAsync(HttpContext context, ServerState state, ChunkCaller caller, ChunkStoreService writer)
+    private static async Task PrewarmAdmittedAsync(HttpContext context, ServerState state, ChunkCaller caller, ChunkStoreService writer, ReadOnlyMemory<byte> body)
     {
-        var body = await ReadLimitedAsync(context, MaxPrewarmBodyBytes);
-        if (body is null)
-        {
-            await WriteAsync(context, StatusCodes.Status413PayloadTooLarge,
-                ErrorResponse.InvalidRequest($"prewarm: the body is larger than {MaxPrewarmBodyBytes} bytes", code: "request_too_large"));
-            return;
-        }
-        var (items, maxTokens, error, tooMany) = ParsePrewarm(body.Value);
+        var (items, maxTokens, error, tooMany) = ParsePrewarm(body);
         if (items is null)
         {
             await WriteAsync(context, StatusCodes.Status400BadRequest,
@@ -786,7 +821,7 @@ public static class ChunkCacheEndpoint
     }
 
     private static Task EvictAsync(HttpContext context, ServerState state) =>
-        RunWriteAsync(context, state, "evict", (caller, writer) => EvictAdmittedAsync(context, caller, writer));
+        RunWriteAsync(context, state, "evict", MaxEvictBodyBytes, (caller, writer, body) => EvictAdmittedAsync(context, caller, writer, body));
 
     /// <summary>
     /// <c>POST /v1/chunk-cache/evict</c> (spec §7.2, §10): <c>{"mode"?: "orphans" | "path" | "namespace" | "all", "path"?,
@@ -795,16 +830,9 @@ public static class ChunkCacheEndpoint
     /// warning <c>chunk_namespace_ignored</c>). <c>orphans</c> is store-wide and admin-only; <c>all</c> without a namespace
     /// wipes the store for an admin and the caller's namespace for anyone else. Fails closed (503) without deleting anything.
     /// </summary>
-    private static async Task EvictAdmittedAsync(HttpContext context, ChunkCaller caller, ChunkStoreService writer)
+    private static async Task EvictAdmittedAsync(HttpContext context, ChunkCaller caller, ChunkStoreService writer, ReadOnlyMemory<byte> body)
     {
-        var body = await ReadLimitedAsync(context, MaxEvictBodyBytes);
-        if (body is null)
-        {
-            await WriteAsync(context, StatusCodes.Status413PayloadTooLarge,
-                ErrorResponse.InvalidRequest($"evict: the body is larger than {MaxEvictBodyBytes} bytes", code: "request_too_large"));
-            return;
-        }
-        var (parsed, error) = ParseEvict(body.Value);
+        var (parsed, error) = ParseEvict(body);
         if (parsed is null)
         {
             await WriteAsync(context, StatusCodes.Status400BadRequest, ErrorResponse.InvalidRequest(error!));
@@ -862,6 +890,24 @@ public static class ChunkCacheEndpoint
             target = null; // an admin's all: the whole store
         }
 
+        // Ruling (Task 16 review S2): deleting store-wide (orphans, an admin's all) or in another namespace needs an admin
+        // KEY; the local user of a keyless server may dry-run those and delete in its own namespace only.
+        if (!dryRun && (target is null || !string.Equals(target, caller.Namespace, StringComparison.Ordinal)) && !caller.IsAdminKey)
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            await context.Response.WriteAsJsonAsync(new ErrorResponse
+            {
+                Error = new ErrorDetail
+                {
+                    Message = "evict: deleting store-wide (orphans, all) or in another namespace needs an admin key from --chunk-cache-api-keys "
+                        + "(a server without keys allows dry runs of those and deletes in its own namespace only).",
+                    Type = ChunkCacheAuth.PermissionErrorType,
+                    Code = "chunk_cache_admin_key_required",
+                },
+            }, ServerJsonContext.Default.ErrorResponse, cancellationToken: context.RequestAborted);
+            return;
+        }
+
         EvictOutcome outcome;
         try
         {
@@ -886,7 +932,10 @@ public static class ChunkCacheEndpoint
                 Sightings = outcome.Sightings,
                 Queued = outcome.Queued,
             },
-            Warnings = warnings,
+            Failed = outcome.Partial
+                ? new ChunkCacheEvictFailedDto { EntryFiles = outcome.FailedEntryFiles, IndexFiles = outcome.FailedIndexFiles }
+                : null,
+            Warnings = outcome.Partial ? [.. warnings ?? [], EvictPartial] : warnings,
         }, ServerJsonContext.Default.ChunkCacheEvictDto, cancellationToken: context.RequestAborted);
     }
 
@@ -948,6 +997,8 @@ public static class ChunkCacheEndpoint
             {
                 if (string.IsNullOrWhiteSpace(glob))
                     return (null, "evict: mode path needs path (a glob relative to the tree root, e.g. src/**)");
+                if (glob.Length > MaxGlobChars)
+                    return (null, $"evict: path is longer than {MaxGlobChars} characters");
                 try
                 {
                     if (DotLLM.ChunkReuse.Tooling.PathGlob.Parse(glob).Negated)
@@ -964,6 +1015,34 @@ public static class ChunkCacheEndpoint
             }
             return ((mode, glob, ns, dryRun), null);
         }
+    }
+
+    /// <summary>
+    /// Reads a POST body within <see cref="BodyReadTimeout"/> and <paramref name="max"/> bytes, before any slot is taken.
+    /// Null when a 413 (too large) or 408 (too slow) was written.
+    /// </summary>
+    private static async Task<ReadOnlyMemory<byte>?> ReadBodyAsync(HttpContext context, int max, string route)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+        deadline.CancelAfter(BodyReadTimeout);
+        ReadOnlyMemory<byte>? body;
+        try
+        {
+            body = await ReadLimitedAsync(context, max, deadline.Token);
+        }
+        catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+        {
+            await WriteAsync(context, StatusCodes.Status408RequestTimeout, ErrorResponse.InvalidRequest(
+                $"{route}: the request body did not arrive within {BodyReadTimeout.TotalSeconds:0.#} s", code: "request_timeout"));
+            return null;
+        }
+        if (body is null)
+        {
+            await WriteAsync(context, StatusCodes.Status413PayloadTooLarge,
+                ErrorResponse.InvalidRequest($"{route}: the body is larger than {max} bytes", param: route == "explain" ? "request" : null, code: "request_too_large"));
+            return null;
+        }
+        return body;
     }
 
     /// <summary>Whether a <c>Content-Type</c> is <c>application/json</c> (parameters such as <c>charset</c> allowed).</summary>

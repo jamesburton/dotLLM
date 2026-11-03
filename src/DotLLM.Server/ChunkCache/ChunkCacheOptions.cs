@@ -42,6 +42,25 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? Stor
     public long StoreNamespaceBudgetBytes { get; init; }
 
     /// <summary>
+    /// The startup warning for a per-namespace budget that is a cap, not a reservation: when the caps of all namespaces
+    /// (the keys file's distinct namespaces, or 2 without one: the default namespace and one more writer) add up to more
+    /// than the store budget, a namespace can find the store full of the others' entries; it is then blocked
+    /// (<c>namespace_budget_blocked</c>) until space frees. Null when no warning applies.
+    /// </summary>
+    /// <returns>The warning text (no key or namespace in it), or null.</returns>
+    public string? NamespaceBudgetWarning()
+    {
+        if (StoreNamespaceBudgetBytes <= 0 || StoreBudgetBytes <= 0)
+            return null;
+        int namespaces = ApiKeys?.NamespaceCount ?? 2;
+        if ((double)StoreNamespaceBudgetBytes * namespaces <= StoreBudgetBytes)
+            return null;
+        return $"chunk-store: --chunk-store-namespace-budget is a cap, not a reservation: {namespaces} namespace(s) x {StoreNamespaceBudgetBytes} bytes "
+            + $"exceed --chunk-store-budget ({StoreBudgetBytes} bytes), so a namespace can find the store full of the others' entries and is then "
+            + "refused (namespace_budget_blocked) until space frees. Only namespaces x namespace budget <= store budget (minus CLI entries) is a real quota.";
+    }
+
+    /// <summary>
     /// With <c>--chunk-store-write</c>: takes ownership of the store before the model loads (<c>dotllm serve</c>), so a second
     /// writer fails fast; the writer started at map time uses the claim. No-op otherwise.
     /// </summary>
@@ -123,6 +142,9 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? Stor
             namespaceBudget = ServerOptions.ParseByteSize(storeNamespaceBudget, "--chunk-store-namespace-budget");
             if (namespaceBudget <= 0)
                 throw new ArgumentException("--chunk-store-namespace-budget must be above 0 bytes.", nameof(storeNamespaceBudget));
+            if (namespaceBudget >= budget)
+                throw new ArgumentException("--chunk-store-namespace-budget must be below --chunk-store-budget (it is a per-namespace cap; "
+                    + "at or above the store budget it would let one namespace fill the whole store).", nameof(storeNamespaceBudget));
         }
         string root;
         try

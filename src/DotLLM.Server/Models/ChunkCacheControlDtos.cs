@@ -241,7 +241,12 @@ public sealed record ChunkCacheEvictDto
     [JsonPropertyName("removed")]
     public required ChunkCacheEvictRemovedDto Removed { get; init; }
 
-    /// <summary>Warning codes (<c>chunk_namespace_ignored</c>); omitted when none.</summary>
+    /// <summary>Deletes that failed (a file held open): present only then, with the warning <c>chunk_evict_partial</c>.</summary>
+    [JsonPropertyName("failed")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ChunkCacheEvictFailedDto? Failed { get; init; }
+
+    /// <summary>Warning codes (<c>chunk_namespace_ignored</c>, <c>chunk_evict_partial</c>); omitted when none.</summary>
     [JsonPropertyName("warnings")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string[]? Warnings { get; init; }
@@ -265,4 +270,16 @@ public sealed record ChunkCacheEvictRemovedDto
     /// <summary>Queued encodes dropped.</summary>
     [JsonPropertyName("queued")]
     public int Queued { get; init; }
+}
+
+/// <summary><c>evict.failed</c>: files a partial evict could not delete (counts only).</summary>
+public sealed record ChunkCacheEvictFailedDto
+{
+    /// <summary>Entry files left in place (an orphans pass removes them later).</summary>
+    [JsonPropertyName("entry_files")]
+    public int EntryFiles { get; init; }
+
+    /// <summary>Index files left in place (their entries stay referenced).</summary>
+    [JsonPropertyName("index_files")]
+    public int IndexFiles { get; init; }
 }
