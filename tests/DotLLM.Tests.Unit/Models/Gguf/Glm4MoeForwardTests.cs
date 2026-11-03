@@ -74,6 +74,24 @@ public sealed class Glm4MoeForwardTests : IDisposable
         return all.ToArray();
     }
 
+    /// <summary>Prefill through a KV cache in the given chunk sizes (the serving path: one prefill call, then decode).</summary>
+    private static float[] RunChunked(GgufFile gguf, ModelConfig cfg, params int[] chunks)
+    {
+        int[] pos = Enumerable.Range(0, Ids.Length).ToArray();
+        using var model = TransformerModel.LoadFromGguf(gguf, cfg, ThreadingConfig.SingleThreaded);
+        var cache = new DotLLM.Engine.KvCache.SimpleKvCache(DotLLM.Core.Attention.KvGeometry.FromConfig(cfg), 64);
+        var all = new List<float>();
+        int at = 0;
+        foreach (int n in chunks)
+        {
+            using ITensor t = model.Forward(Ids.AsSpan(at, n), pos.AsSpan(at, n), deviceId: -1, cache);
+            all.AddRange(Copy(t));
+            at += n;
+        }
+        Assert.Equal(Ids.Length, at);
+        return all.ToArray();
+    }
+
     private static unsafe float[] Copy(ITensor t)
     {
         var f = new float[checked((int)t.Shape.ElementCount)];
@@ -130,6 +148,19 @@ public sealed class Glm4MoeForwardTests : IDisposable
         ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
         float diff = MaxAbs(Run(gguf, cfg, decode: true), Run(gguf, cfg));
         Assert.True(diff < Tolerance, $"decode vs batched {diff}");
+    }
+
+    [Theory]
+    [InlineData(new[] { 12 })]
+    [InlineData(new[] { 5, 7 })]
+    [InlineData(new[] { 1, 11 })]
+    [InlineData(new[] { 4, 4, 3, 1 })]
+    public void CachedPrefill_Equals_HuggingFace_Golden(int[] chunks)
+    {
+        using var gguf = GgufFile.Open(Write());
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        float diff = MaxAbs(RunChunked(gguf, cfg, chunks), Golden);
+        Assert.True(diff < Tolerance, $"cached prefill chunks [{string.Join(',', chunks)}] vs HF {diff}");
     }
 
     [Fact]
