@@ -26,7 +26,8 @@ public sealed class ChunkDenyList
     public static readonly IReadOnlyList<string> DefaultPatterns =
     [
         ".env*", "*.env", "*.pem", "*.key", "*.pfx", "*.p12", "id_*", "id_rsa*", "secrets.*", "appsettings*.json",
-        "credentials*", ".npmrc", ".netrc", ".pgpass", ".git/**", ".ssh/**",
+        "credentials*", ".npmrc", ".netrc", ".pgpass", "*.keystore", "*.jks", "kubeconfig*", "*.tfvars", "*.tfstate",
+        ".git/**", ".ssh/**", ".kube/**", ".docker/**",
     ];
 
     /// <summary>The default deny-list.</summary>
@@ -66,8 +67,10 @@ public sealed class ChunkDenyList
     }
 
     /// <summary>
-    /// Whether chunk text looks like a secret by content: a PEM private-key header (<c>-----BEGIN </c> ... <c>PRIVATE
-    /// KEY-----</c> on one line, e.g. RSA, EC, OPENSSH, ENCRYPTED). Certificates and public keys are not secrets.
+    /// Whether chunk text looks like a secret by content: a PEM armour line (<c>-----BEGIN </c> or <c>-----END </c>) that
+    /// says <c>PRIVATE KEY</c> anywhere on it (RSA, EC, OPENSSH, ENCRYPTED, PGP <c>PRIVATE KEY BLOCK</c>). Certificates and
+    /// public keys are not secrets. Known limit: a key body the chunker split into a chunk with neither armour line (base64
+    /// only) is not detected; harnesses set <c>no_store</c>, and the path deny-list covers key files.
     /// </summary>
     /// <param name="text">The chunk text.</param>
     /// <returns>True when it should never be stored.</returns>
@@ -75,12 +78,14 @@ public sealed class ChunkDenyList
     {
         if (string.IsNullOrEmpty(text)) return false;
         int at = 0;
-        while ((at = text.IndexOf("-----BEGIN ", at, StringComparison.Ordinal)) >= 0)
+        while ((at = text.IndexOf("-----", at, StringComparison.Ordinal)) >= 0)
         {
             int eol = text.IndexOf('\n', at);
             int end = eol < 0 ? text.Length : eol;
-            int key = text.IndexOf("PRIVATE KEY-----", at, end - at, StringComparison.Ordinal);
-            if (key >= 0) return true;
+            var line = text.AsSpan(at, end - at);
+            if ((line.StartsWith("-----BEGIN ", StringComparison.Ordinal) || line.StartsWith("-----END ", StringComparison.Ordinal))
+                && line.Contains("PRIVATE KEY", StringComparison.Ordinal))
+                return true;
             at = end;
         }
         return false;
@@ -93,29 +98,33 @@ public sealed class ChunkDenyList
     {
         if (string.IsNullOrEmpty(path)) return false;
         if (path.Contains("::", StringComparison.Ordinal)) return true; // an alternate data stream: never a plain file
-        var segments = new List<string>();
+        // Each segment has one spelling, or two when it holds a colon: the text before it ("secrets.json:stream") and the
+        // text after it (a drive-relative "C:secrets.json"). Every spelling is checked (errs towards denying).
+        var segments = new List<string[]>();
         foreach (string raw in path.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries))
         {
             if (raw is "." or "..")
             {
-                if (raw == "..") segments.Add(raw);
+                if (raw == "..") segments.Add([raw]);
                 continue;
             }
-            string seg = raw;
-            int colon = seg.IndexOf(':');
-            if (colon >= 0) seg = seg[..colon]; // "secrets.json:stream" (or a drive letter)
-            seg = seg.TrimEnd('.', ' ');        // Windows ignores trailing dots and spaces
-            if (seg.Length > 0) segments.Add(seg);
+            int colon = raw.IndexOf(':');
+            string[] spellings = colon < 0 ? [raw] : [raw[..colon], raw[(colon + 1)..]];
+            string[] kept = spellings.Select(x => x.TrimEnd('.', ' ')) // Windows ignores trailing dots and spaces
+                .Where(x => x.Length > 0).ToArray();
+            if (kept.Length > 0) segments.Add(kept);
         }
         if (segments.Count == 0) return false;
-        string name = segments[^1];
-        foreach (string p in _fileNamePatterns)
-            if (Matches(p, name)) return true;
+        foreach (string name in segments[^1])
+            foreach (string p in _fileNamePatterns)
+                if (Matches(p, name)) return true;
         for (int i = 0; i < segments.Count - 1; i++)
-            foreach (string p in _directoryPatterns)
-                if (Matches(p, segments[i])) return true;
+            foreach (string seg in segments[i])
+                foreach (string p in _directoryPatterns)
+                    if (Matches(p, seg)) return true;
         for (int i = 0; i < segments.Count; i++)
-            if (ShortNameMayBeDenied(segments[i], i == segments.Count - 1)) return true;
+            foreach (string seg in segments[i])
+                if (ShortNameMayBeDenied(seg, i == segments.Count - 1)) return true;
         return false;
     }
 
@@ -127,6 +136,23 @@ public sealed class ChunkDenyList
         if (tilde < 1 || tilde + 1 >= segment.Length || !char.IsAsciiDigit(segment[tilde + 1])) return false;
         string stem = segment[..tilde].TrimStart('.');
         if (stem.Length == 0) return false;
+        // NTFS's hashed form after four collisions ("SE1A2B~1.JSO": two characters and four hex digits): the stem says
+        // nothing, so deny when the short extension could be a denied extension.
+        if (isFileName && stem.Length == 6 && stem[2..].All(char.IsAsciiHexDigit))
+        {
+            int dot = segment.LastIndexOf('.');
+            string ext = dot > tilde ? segment[(dot + 1)..] : "";
+            if (ext.Length > 0)
+            {
+                foreach (string p in _fileNamePatterns)
+                {
+                    int pdot = p.LastIndexOf('.');
+                    string pext = pdot < 0 ? "" : p[(pdot + 1)..];
+                    if (pext.Length > 0 && pext.IndexOfAny(['*', '?']) < 0 && pext.StartsWith(ext, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+        }
         IEnumerable<string> patterns = isFileName ? _fileNamePatterns.Concat(_directoryPatterns) : _directoryPatterns;
         foreach (string p in patterns)
         {
