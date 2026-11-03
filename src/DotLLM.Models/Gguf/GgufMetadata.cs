@@ -104,6 +104,9 @@ public sealed class GgufMetadata
         }
     }
 
+    /// <summary>Gets a bool array value (e.g. <c>lfm3.attention.sliding_window_pattern</c>).</summary>
+    public bool[] GetBoolArray(string key) => GetTyped<bool[]>(key, GgufValueType.Array);
+
     /// <summary>Gets an int32 array value.</summary>
     public int[] GetInt32Array(string key) => GetTyped<int[]>(key, GgufValueType.Array);
 

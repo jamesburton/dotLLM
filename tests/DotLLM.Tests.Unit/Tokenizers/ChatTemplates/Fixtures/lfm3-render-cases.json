@@ -1,0 +1,394 @@
+[
+ {
+  "name": "user_only",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello!"
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "system_user",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "multi_turn",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think></think>A1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "multi_turn_thinking_stripped",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>hmm</think>A1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think></think>A1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "assistant_reasoning_last",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1",
+     "reasoning_content": "because"
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>because</think>A1<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "no_gen_prompt",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": false,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello!"
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>user\nHello!<|im_end|>\n"
+ },
+ {
+  "name": "thinking_off",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello!"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "expected": "<|startoftext|><|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "name": "preserve_thinking",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1",
+     "reasoning_content": "r1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "preserve_thinking": true
+  },
+  "expected": "<|startoftext|><|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>r1</think>A1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "tools",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be helpful."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>system\nBe helpful.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "tools_no_system",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "tool_roundtrip",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "metric": true
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "{\"temp\": 18}",
+     "tool_call_id": "c1"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=metric>\ntrue\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n{\"temp\": 18}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "tool_then_answer",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "sunny",
+     "tool_call_id": "c1"
+    },
+    {
+     "role": "assistant",
+     "content": "It is sunny."
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\nsunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>It is sunny.<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "image_content",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": "What is this?"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>user\n<|vision_start|><|image|><|vision_end|>What is this?<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "unicode",
+  "context": {
+   "bos_token": "<|startoftext|>",
+   "eos_token": "<|im_end|>",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Zażółć gęślą jaźń ☃ 😀"
+    }
+   ]
+  },
+  "expected": "<|startoftext|><|im_start|>user\nZażółć gęślą jaźń ☃ 😀<|im_end|>\n<|im_start|>assistant\n<think>"
+ }
+]
