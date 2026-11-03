@@ -383,6 +383,9 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
             """{"mode":"path","path":"../x","dry_run":false}""",
             """{"mode":"path","path":"!src/**","dry_run":false}""",
             """{"mode":"namespace","path":"src/**","dry_run":false}""",
+            """{"mode":"namespace","dry_run":null}""",
+            """{"mode":"namespace","dry_run":true,"dry_run":false}""",
+            "{\"mode\":\"path\",\"dry_run\":false,\"path\":\"src/" + new string('a', 1100) + "\"}",
         })
         {
             var (status, body) = await server.SendAsync(HttpMethod.Post, Evict, bad);
@@ -417,7 +420,20 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
             var dry = await EvictOk(server, """{"mode":"orphans"}""");
             Assert.Equal(1, Int(dry, "evicted"));
             Assert.True(Stored(root, orphan));
-            var real = await EvictOk(server, """{"mode":"orphans","dry_run":false}""");
+            Assert.Equal(orphanBytes, Long(dry, "freed_bytes"));
+            var (refused, refusedBody) = await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"orphans","dry_run":false}""");
+            Assert.Equal(403, refused);
+            Assert.Equal("chunk_cache_admin_key_required", JsonNode.Parse(refusedBody)!["error"]!["code"]!.GetValue<string>());
+            Assert.True(Stored(root, orphan));
+        }
+
+        await using (var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root, KeysFile(KeyAdmin + " admin"))))
+        {
+            var ledgerKey = KeyOf(server, ChunkA, "");
+            var indexed = KeyOf(server, ChunkB, "");
+            var orphan = KeyOf(server, ChunkC, "");
+            long orphanBytes = SizeOf(root, orphan);
+            var real = await EvictOk(server, """{"mode":"orphans","dry_run":false}""", Key(KeyAdmin));
             Assert.Equal(1, Int(real, "evicted"));
             Assert.Equal(orphanBytes, Long(real, "freed_bytes"));
             Assert.False(Stored(root, orphan));
@@ -549,6 +565,12 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
         var a = KeyOf(server, ChunkA, Ns(KeyA));
         var b = KeyOf(server, ChunkB, Ns(KeyB));
 
+        foreach (string claimed in new[] { "default", "", "Default" })
+        {
+            var ignored = await EvictOk(server, $$"""{"mode":"namespace","namespace":"{{claimed}}"}""", Key(KeyB));
+            Assert.Contains(ChunkCacheCodes.NamespaceIgnored, Strings(ignored["warnings"]));
+            Assert.Equal(1, Int(ignored, "evicted")); // B's own entry, never the default namespace's
+        }
         var r = await EvictOk(server, $$"""{"mode":"namespace","namespace":"{{Ns(KeyA)}}","dry_run":false}""", Key(KeyB));
         Assert.Contains(ChunkCacheCodes.NamespaceIgnored, Strings(r["warnings"]));
         Assert.True(Stored(root, a));
@@ -590,8 +612,8 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
             key = KeyOf(server, ChunkA, "");
             var orphan = PutDirect(server, root, ChunkC, "");
             File.WriteAllText(ServerLedger.DefaultPath(root), "{ not a ledger");
-            foreach (string body in new[] { """{"mode":"namespace","dry_run":false}""", """{"mode":"orphans","dry_run":false}""",
-                         """{"mode":"all","dry_run":false}""", """{"mode":"namespace"}""" })
+            foreach (string body in new[] { """{"mode":"namespace","dry_run":false}""", """{"mode":"orphans"}""",
+                         """{"mode":"all"}""", """{"mode":"namespace"}""", """{"mode":"path","path":"src/**","dry_run":false}""" })
             {
                 var (status, text) = await server.SendAsync(HttpMethod.Post, Evict, body);
                 Assert.True(status == 503, $"{body}: {status} {text}");
@@ -605,7 +627,7 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
         await using (var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root)))
         {
             Assert.True(Writer(server).WritesDisabled);
-            var (status, _) = await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"all","dry_run":false}""");
+            var (status, _) = await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"namespace","dry_run":false}""");
             Assert.Equal(503, status);
             Assert.True(Stored(root, key));
             Assert.Equal("{ not a ledger", File.ReadAllText(ServerLedger.DefaultPath(root)));
@@ -623,7 +645,7 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
         await Store(server, [], (ChunkA, null));
         var key = KeyOf(server, ChunkA, "");
         File.WriteAllText(Path.Combine(root, "index-broken.json"), "{ nope");
-        foreach (string body in new[] { """{"mode":"namespace","dry_run":false}""", """{"mode":"orphans","dry_run":false}""" })
+        foreach (string body in new[] { """{"mode":"namespace","dry_run":false}""", """{"mode":"orphans"}""" })
         {
             var (status, _) = await server.SendAsync(HttpMethod.Post, Evict, body);
             Assert.Equal(503, status);
@@ -770,6 +792,7 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
         Assert.Empty(new FileChunkStore(root).Keys());
         Assert.Empty(LedgerKeys(root));
         Assert.True(JsonNode.Parse(body)!["removed"]!["queued"]!.GetValue<int>() >= 1);
+        Assert.Equal(1, slow.Encodes); // the queued item was dropped, never encoded and then discarded
     }
 
     // ------------------------------------------------------------------------------------------------ capabilities
@@ -815,7 +838,7 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
     /// control). The flag parses on both option paths and needs <c>--chunk-store-write</c>.
     /// </summary>
     [Fact]
-    public void NamespaceBudget_PrewarmEvictsOnlyOwnRows()
+    public async Task NamespaceBudget_PrewarmEvictsOnlyOwnRows()
     {
         string Text(char ch) => new string(ch, 64) + "\n";
         long e = ChunkStoreServiceTests.FileBytes(Text('a'), 4);
@@ -839,7 +862,8 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
         foreach (bool perNamespace in new[] { true, false })
         {
             string root = NewStore();
-            using var s = StartService(root, budget: 3 * e + 10, nsBudget: perNamespace ? 3 * e + 10 : 0);
+            var host = new ChunkStoreServiceTests.FakeHost();
+            using var s = StartService(root, budget: 3 * e + 10, nsBudget: perNamespace ? 3 * e : 0, host);
             Put(s, x, Text('a'));
             Put(s, x, Text('b'));
             Put(s, x, Text('c'));
@@ -849,11 +873,58 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
             // ... while the shared LRU (the control) evicts x's oldest row for y.
             Assert.Equal(perNamespace, xOldestKept);
             Assert.Equal(!perNamespace, yStored);
+            if (!perNamespace)
+                continue;
+
+            // S1: once blocked, y's next misses are refused at admission (no encode spent and thrown away), with the detail.
+            int encodes = host.Encodes;
+            var refused = s.Admit(ChunkStoreServiceTests.Span(Text('e')), ChunkStoreServiceTests.KeyFor(Text('e'), y.Namespace), 65, y, true, "cpu");
+            Assert.Equal(new AdmissionResult(false, AdmissionReasons.NamespaceBudgetBlocked), refused);
+            var plan = s.ApplyTo(PlanOf((Text('f'), ChunkStoreServiceTests.KeyFor(Text('f'), y.Namespace))), ParsedEncode(), y);
+            Assert.Equal(AdmissionReasons.NamespaceBudgetBlocked, plan.Warnings.Single(w => w.Code == ChunkCacheCodes.EncodeSkipped).Detail);
+            Assert.True(s.Queue.WaitDrained(Drain));
+            Assert.Equal(encodes, host.Encodes);
+            // x is not blocked.
+            Assert.True(s.Admit(ChunkStoreServiceTests.Span(Text('g')), ChunkStoreServiceTests.KeyFor(Text('g'), x.Namespace), 65, x, true, "cpu").Queued);
+            Assert.True(s.Queue.WaitDrained(Drain));
+
+            // Room again (x forgotten): y is admitted and stored.
+            await s.EvictAsync(new EvictRequest(EvictMode.Namespace, x.Namespace, null, false), CancellationToken.None);
+            Put(s, y, Text('h'));
+            Assert.True(Stored(root, ChunkStoreServiceTests.KeyFor(Text('h'), y.Namespace)));
         }
+
+        // (3) S5: the per-namespace over_budget admission check: a chunk that could never fit the namespace budget is refused
+        // before any encode, although it fits the store budget.
+        {
+            string root = NewStore();
+            var host = new ChunkStoreServiceTests.FakeHost();
+            using var s = StartService(root, budget: 20 * e, nsBudget: e + 10, host);
+            Put(s, x, Text('a')); // the writer learns this model's entry size
+            int encodes = host.Encodes;
+            string big = new string('z', 200);
+            var r = s.Admit(ChunkStoreServiceTests.Span(big), ChunkStoreServiceTests.KeyFor(big, x.Namespace), big.Length, x, true, "cpu");
+            Assert.Equal(new AdmissionResult(false, AdmissionReasons.OverBudget), r);
+            Assert.True(s.Queue.WaitDrained(Drain));
+            Assert.Equal(encodes, host.Encodes);
+        }
+
+        // (4) A cap, not a reservation: a namespace budget at or above the store budget refuses startup; a sum of caps over
+        // the store budget warns (namespaces in the keys file, or 2 without one).
+        Assert.Throws<ArgumentException>(() => ChunkCacheOptions.Create(true, null, NewStore(), storeWrite: true, storeBudget: "1GiB", storeNamespaceBudget: "1GiB"));
+        Assert.Throws<ArgumentException>(() => ChunkCacheOptions.Create(true, null, NewStore(), storeWrite: true, storeBudget: "1GiB", storeNamespaceBudget: "2GiB"));
+        Assert.NotNull(ChunkCacheOptions.Create(true, null, NewStore(), storeWrite: true, storeBudget: "1GiB", storeNamespaceBudget: "600MiB").NamespaceBudgetWarning());
+        Assert.Null(ChunkCacheOptions.Create(true, null, NewStore(), storeWrite: true, storeBudget: "1GiB", storeNamespaceBudget: "500MiB").NamespaceBudgetWarning());
+        string keys = KeysFile(KeyA, KeyB, KeyAdmin, "test-key-delta-0000000000000000000000 ns=team", "test-key-echo-11111111111111111111111 ns=team");
+        var three = ChunkCacheOptions.Create(true, null, NewStore(), keys, storeWrite: true, storeBudget: "1GiB", storeNamespaceBudget: "300MiB");
+        Assert.NotNull(three.NamespaceBudgetWarning()); // 4 namespaces x 300 MiB > 1 GiB
+        Assert.Null(ChunkCacheOptions.Create(true, null, NewStore(), keys, storeWrite: true, storeBudget: "1GiB", storeNamespaceBudget: "256MiB").NamespaceBudgetWarning());
+        Assert.Null(ChunkCacheOptions.Create(true, null, NewStore(), storeWrite: true, storeBudget: "1GiB").NamespaceBudgetWarning());
 
         // Options: both paths, needs --chunk-store-write and a size.
         var parsed = ServerOptions.Parse(["m.gguf", "--chunk-cache", "--chunk-store", NewStore(), "--chunk-store-write", "--chunk-store-budget", "1GiB",
             "--chunk-store-namespace-budget", "100MiB"]).ChunkCache;
+        Assert.Null(parsed.NamespaceBudgetWarning());
         Assert.Equal(100L << 20, parsed.StoreNamespaceBudgetBytes);
         Assert.Equal(0, ServerOptions.Parse(["m.gguf", "--chunk-cache", "--chunk-store", NewStore(), "--chunk-store-write", "--chunk-store-budget", "1GiB"])
             .ChunkCache.StoreNamespaceBudgetBytes);
@@ -861,13 +932,23 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
         Assert.Throws<ArgumentException>(() => ChunkCacheOptions.Create(true, null, NewStore(), storeWrite: true, storeBudget: "1GiB", storeNamespaceBudget: "0"));
     }
 
-    private ChunkStoreService StartService(string root, long budget, long nsBudget)
+    private ChunkStoreService StartService(string root, long budget, long nsBudget) => StartService(root, budget, nsBudget, new ChunkStoreServiceTests.FakeHost());
+
+    private static ChunkCachePlan PlanOf(params (string Text, ChunkKey Key)[] spans) =>
+        new(ChunkPolicy.Exact, null, false, spans.Length,
+            spans.Select((sp, i) => new PlannedSpan(i * 100, sp.Text.Length, false) { Span = ChunkStoreServiceTests.Span(sp.Text), Key = sp.Key }).ToList(),
+            [], null, "summary", "cpu", 1000);
+
+    private static ParsedChunkRequest ParsedEncode() =>
+        new(ChunkPolicy.Exact, [], null, false, "summary", ChunkNamespace.Default, [], null) { OnMiss = "encode" };
+
+    private ChunkStoreService StartService(string root, long budget, long nsBudget, ChunkStoreServiceTests.FakeHost host)
     {
         var options = new ChunkCacheOptions(true, ChunkCacheOptions.DefaultMaxChunks, root, null, StoreWrite: true, StoreBudgetBytes: budget)
         {
             StoreNamespaceBudgetBytes = nsBudget,
         };
-        var service = ChunkStoreService.Start(options, new ChunkStoreServiceTests.FakeHost());
+        var service = ChunkStoreService.Start(options, host);
         service.Queue.QuietPeriod = TimeSpan.Zero;
         return service;
     }
@@ -878,6 +959,285 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
         Assert.True(s.Admit(ChunkStoreServiceTests.Span(text), key, text.Length, caller, true, "cpu").Queued);
         Assert.True(s.Queue.WaitDrained(Drain));
         Thread.Sleep(20); // distinct last-use times
+    }
+
+    // ------------------------------------------------------------------------------------------------ fix round (review S1-S6)
+
+    /// <summary>
+    /// S2 ruling: a request carrying a forwarding header (<c>Forwarded</c>, <c>X-Forwarded-*</c>, <c>X-Real-IP</c>) is not
+    /// local, whatever its address (a same-host reverse proxy): on a keyless server every chunk-cache route answers 403.
+    /// </summary>
+    [Fact]
+    public async Task Keyless_ForwardedHeaders_NotLocal()
+    {
+        string root = NewStore();
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
+        Assert.Equal(200, (await server.SendAsync(HttpMethod.Get, "/v1/chunk-cache", null)).Status);
+        foreach (var header in new[] { ("Forwarded", "for=203.0.113.7"), ("X-Forwarded-For", "203.0.113.7"), ("X-Forwarded-Host", "example.org"),
+                     ("X-Forwarded-Proto", "https"), ("X-Real-IP", "203.0.113.7"), ("x-forwarded-for", "10.0.0.1") })
+        {
+            Assert.Equal(403, (await server.SendAsync(HttpMethod.Get, "/v1/chunk-cache", null, header)).Status);
+            Assert.Equal(403, (await server.SendAsync(HttpMethod.Post, Prewarm, PrewarmBody((ChunkA, null)), header)).Status);
+            Assert.Equal(403, (await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"namespace","dry_run":false}""", header)).Status);
+        }
+        Assert.True(Writer(server).Queue.WaitDrained(Drain));
+        Assert.Empty(new FileChunkStore(root).Keys());
+    }
+
+    /// <summary>
+    /// S2 ruling: a keyless server grants no store-wide destructive admin. Its local caller prewarms and evicts / forgets its
+    /// own (default) namespace and may dry-run anything, but <c>orphans</c>, a store-wide <c>all</c> and another namespace
+    /// with <c>dry_run: false</c> need an admin key (403 <c>chunk_cache_admin_key_required</c>).
+    /// </summary>
+    [Fact]
+    public async Task Keyless_StoreWideDestructive_NeedsAdminKey()
+    {
+        string root = NewStore();
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
+        await Store(server, [], (ChunkA, null));
+        var own = KeyOf(server, ChunkA, "");
+        var orphan = PutDirect(server, root, ChunkC, "");
+        var other = PutDirect(server, root, ChunkB, "k-0123456789abcdef");
+        WriteNamespaceIndex(server, root, "k-0123456789abcdef", other);
+
+        foreach (string body in new[] { """{"mode":"orphans","dry_run":false}""", """{"mode":"all","dry_run":false}""",
+                     """{"mode":"namespace","namespace":"k-0123456789abcdef","dry_run":false}""",
+                     """{"mode":"path","path":"**","namespace":"k-0123456789abcdef","dry_run":false}""" })
+        {
+            var (status, text) = await server.SendAsync(HttpMethod.Post, Evict, body);
+            Assert.True(status == 403, $"{body}: {status} {text}");
+            Assert.Equal("chunk_cache_admin_key_required", JsonNode.Parse(text)!["error"]!["code"]!.GetValue<string>());
+        }
+        Assert.True(Stored(root, orphan) && Stored(root, other) && Stored(root, own));
+
+        var wideDry = await EvictOk(server, """{"mode":"all"}""");
+        Assert.Equal(3, Int(wideDry, "evicted")); // a dry run may look store-wide
+        Assert.Equal(1, Int(await EvictOk(server, """{"mode":"orphans"}"""), "evicted"));
+        var mine = await EvictOk(server, """{"mode":"namespace","dry_run":false}""");
+        Assert.Equal(1, Int(mine, "evicted"));
+        Assert.False(Stored(root, own));
+        Assert.True(Stored(root, orphan) && Stored(root, other));
+    }
+
+    /// <summary>A body that never finishes cannot hold a write slot (S3).</summary>
+    private sealed class SlowContent(string start) : HttpContent
+    {
+        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+        {
+            await stream.WriteAsync(Encoding.UTF8.GetBytes(start));
+            await stream.FlushAsync();
+            await Task.Delay(TimeSpan.FromSeconds(6));
+        }
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+    }
+
+    private async Task<int> PostSlow(ChunkCacheTestServer server, string path, string key)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, path) { Content = new SlowContent("{\"mode\":") };
+        request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+        request.Headers.TryAddWithoutValidation("X-API-Key", key);
+        try
+        {
+            using var resp = await server.Http.SendAsync(request);
+            return (int)resp.StatusCode;
+        }
+        catch (HttpRequestException)
+        {
+            return -1; // the server closed the connection on the unfinished body
+        }
+        catch (TaskCanceledException)
+        {
+            return -2;
+        }
+    }
+
+    /// <summary>
+    /// S3: the body is read, with a deadline and the size limit, before a write slot is taken: two trickling bodies from
+    /// one tenant hold no slot (another tenant's evict answers at once) and end with 408 at the deadline; explain likewise.
+    /// One tenant has at most one write call at once (429), and the server at most two (429).
+    /// </summary>
+    [Fact]
+    public async Task WriteRoutes_BodyReadBeforeTheGate_PerNamespaceAndGlobalSlots()
+    {
+        string root = NewStore();
+        const string KeyC = "test-key-charlie-5555555555aaaaaaaa";
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root, KeysFile(KeyA, KeyB, KeyC)));
+        var saved = ChunkCacheEndpoint.BodyReadTimeout;
+        ChunkCacheEndpoint.BodyReadTimeout = TimeSpan.FromSeconds(2);
+        try
+        {
+            var slow = new[] { PostSlow(server, Evict, KeyA), PostSlow(server, Prewarm, KeyA), PostSlow(server, "/v1/chunk-cache/explain", KeyA) };
+            await Task.Delay(300);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var fast = await EvictOk(server, """{"mode":"namespace"}""", Key(KeyB));
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(1.5), sw.Elapsed.ToString());
+            Assert.True(fast["dry_run"]!.GetValue<bool>());
+            Assert.Equal(0, Int(await EvictOk(server, """{"mode":"namespace"}""", Key(KeyB)), "evicted")); // a second fast call too
+            foreach (int status in await Task.WhenAll(slow))
+                Assert.True(status is 408 or -1, status.ToString());
+        }
+        finally
+        {
+            ChunkCacheEndpoint.BodyReadTimeout = saved;
+        }
+
+        // Slots: hold the store lock so two evicts wait inside their slot.
+        await Store(server, [Key(KeyA)], (ChunkA, null));
+        await Store(server, [Key(KeyB)], (ChunkA, null));
+        Writer(server).LockTimeout = TimeSpan.FromSeconds(8);
+        Task<(int Status, string Body)> a, b;
+        using (ChunkIndex.AcquireStoreLock(root, TimeSpan.FromSeconds(5)))
+        {
+            a = server.SendAsync(HttpMethod.Post, Evict, """{"mode":"namespace","dry_run":false}""", Key(KeyA));
+            await Task.Delay(500);
+            var sameTenant = await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"namespace"}""", Key(KeyA));
+            Assert.Equal(429, sameTenant.Status);
+            Assert.Equal("chunk_control_busy", JsonNode.Parse(sameTenant.Body)!["error"]!["code"]!.GetValue<string>());
+            b = server.SendAsync(HttpMethod.Post, Evict, """{"mode":"namespace","dry_run":false}""", Key(KeyB));
+            await Task.Delay(500);
+            var third = await server.SendAsync(HttpMethod.Post, Prewarm, PrewarmBody((ChunkC, null)), Key(KeyC));
+            Assert.Equal(429, third.Status);
+        }
+        Assert.Equal(200, (await a).Status);
+        Assert.Equal(200, (await b).Status);
+        Assert.Empty(LedgerKeys(root));
+        Assert.Equal(200, (await server.SendAsync(HttpMethod.Post, Prewarm, PrewarmBody((ChunkC, null)), Key(KeyC))).Status);
+    }
+
+    /// <summary>
+    /// S4: a forget that could not delete everything says so (warning <c>chunk_evict_partial</c> with counts, counts only);
+    /// a failed ledger save is a 503 whose message says sightings and queued encodes may already be dropped while no file
+    /// was deleted.
+    /// </summary>
+    [Fact]
+    public async Task Evict_PartialDelete_WarnsWithCounts_FailedSave_SaysWhatWasDropped()
+    {
+        string root = NewStore();
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
+        await Store(server, [], (ChunkA, null), (ChunkB, null));
+        var a = KeyOf(server, ChunkA, "");
+        var b = KeyOf(server, ChunkB, "");
+        var cli = PutDirect(server, root, ChunkC, "");
+        string index = WriteNamespaceIndex(server, root, "", cli);
+
+        JsonNode r;
+        using (new FileStream(FileChunkStore.EntryPath(root, a.Hex), FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (new FileStream(index, FileMode.Open, FileAccess.Read, FileShare.Read))
+            r = await EvictOk(server, """{"mode":"namespace","dry_run":false}""");
+        Assert.Contains("chunk_evict_partial", Strings(r["warnings"]));
+        Assert.Equal(1, r["failed"]!["entry_files"]!.GetValue<int>());
+        Assert.Equal(1, r["failed"]!["index_files"]!.GetValue<int>());
+        Assert.True(Stored(root, a));   // held open: not deleted, reported
+        Assert.False(Stored(root, b));
+        Assert.True(Stored(root, cli)); // its index could not be deleted, so it stays referenced
+        Assert.Empty(LedgerKeys(root));
+
+        var clean = await EvictOk(server, """{"mode":"namespace","dry_run":false}""");
+        Assert.Null(clean["failed"]);
+        Assert.Empty(Strings(clean["warnings"]));
+
+        await Store(server, [], (ChunkD, null));
+        var d = KeyOf(server, ChunkD, "");
+        Writer(server).LedgerForTest!.BeforeRename = _ => throw new IOException("disk full (test)");
+        try
+        {
+            var (status, body) = await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"namespace","dry_run":false}""");
+            Assert.Equal(503, status);
+            string message = JsonNode.Parse(body)!["error"]!["message"]!.GetValue<string>();
+            Assert.Contains("no entry or index file was deleted", message, StringComparison.Ordinal);
+            Assert.Contains("sightings and queued encodes", message, StringComparison.Ordinal);
+            Assert.True(Stored(root, d));
+        }
+        finally
+        {
+            if (Writer(server).LedgerForTest is { } l) l.BeforeRename = null;
+        }
+    }
+
+    /// <summary>
+    /// S5: an evict that starts while the background writer holds the ledger gate (mid-write, before the store lock) waits
+    /// for it and then sees the new row (and deletes it); held past the lock timeout, the evict answers 503 cleanly and the
+    /// writer completes afterwards (no deadlock).
+    /// </summary>
+    [Fact]
+    public async Task Evict_WhileWriterHoldsLedgerGate_WaitsThenSeesRow_OrTimesOutCleanly()
+    {
+        string root = NewStore();
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
+        var state = server.State;
+        state.ChunkCacheRuntime.Dispose();
+        var host = new ChunkStoreServiceTests.FakeHost();
+        var writer = state.ChunkCacheRuntime.StartWriter(state, host)!;
+        writer.Queue.QuietPeriod = TimeSpan.Zero;
+        using var entered = new SemaphoreSlim(0);
+        using var release = new SemaphoreSlim(0);
+        writer.WriteEnteredForTest = () => { entered.Release(); release.Wait(TimeSpan.FromSeconds(30)); };
+
+        Assert.Equal(1, Int(await PrewarmOk(server, PrewarmBody((ChunkA, null))), "queued"));
+        Assert.True(await entered.WaitAsync(TimeSpan.FromSeconds(10)));
+        var evict = server.SendAsync(HttpMethod.Post, Evict, """{"mode":"namespace","dry_run":false}""");
+        await Task.Delay(500);
+        Assert.False(evict.IsCompleted);
+        release.Release();
+        var (status, body) = await evict;
+        Assert.True(status == 200, body);
+        Assert.Equal(1, Int(JsonNode.Parse(body)!, "evicted"));
+        Assert.True(writer.Queue.WaitDrained(Drain));
+        Assert.Empty(new FileChunkStore(root).Keys());
+
+        writer.LockTimeout = TimeSpan.FromSeconds(1);
+        Assert.Equal(1, Int(await PrewarmOk(server, PrewarmBody((ChunkB, null))), "queued"));
+        Assert.True(await entered.WaitAsync(TimeSpan.FromSeconds(10)));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var (timedOut, _) = await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"namespace","dry_run":false}""");
+        Assert.Equal(503, timedOut);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10));
+        writer.WriteEnteredForTest = null;
+        release.Release();
+        Assert.True(writer.Queue.WaitDrained(Drain));
+        Assert.Single(new FileChunkStore(root).Keys()); // the writer finished its entry
+    }
+
+    /// <summary>
+    /// S5 / S6: the write-time fence alone keeps an in-flight encode of a forgotten namespace out of the store (nothing else
+    /// is queued); a path forget drops only the matching items (a non-matching queued item is still encoded and stored).
+    /// </summary>
+    [Fact]
+    public async Task Forget_WriteTimeFence_InFlightOnly_PathDropsMatchingItemsOnly()
+    {
+        string root = NewStore();
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
+        var state = server.State;
+        state.ChunkCacheRuntime.Dispose();
+        var slow = new ChunkStoreServiceTests.FakeHost { Block = new ManualResetEventSlim(false) };
+        var writer = state.ChunkCacheRuntime.StartWriter(state, slow)!;
+        writer.Queue.QuietPeriod = TimeSpan.Zero;
+
+        Assert.Equal(1, Int(await PrewarmOk(server, PrewarmBody((ChunkA, "src/A.cs"))), "queued"));
+        Assert.True(slow.Entered.Wait(TimeSpan.FromSeconds(10)));
+        var r = await EvictOk(server, """{"mode":"namespace","dry_run":false}""");
+        Assert.Equal(0, r["removed"]!["queued"]!.GetValue<int>()); // nothing queued: only the fence can stop it
+        slow.Block.Set();
+        Assert.True(writer.Queue.WaitDrained(Drain));
+        Assert.Empty(new FileChunkStore(root).Keys());
+
+        slow.Block.Reset();
+        slow.Entered.Reset();
+        Assert.Equal(3, Int(await PrewarmOk(server, PrewarmBody((ChunkB, "src/B.cs"), (ChunkC, "lib/C.cs"), (ChunkD, "src/D.cs"))), "queued"));
+        Assert.True(slow.Entered.Wait(TimeSpan.FromSeconds(10))); // B in flight; C and D queued
+        int before = slow.Encodes;
+        var p = await EvictOk(server, """{"mode":"path","path":"src/**","dry_run":false}""");
+        Assert.Equal(1, p["removed"]!["queued"]!.GetValue<int>()); // D
+        slow.Block.Set();
+        Assert.True(writer.Queue.WaitDrained(Drain));
+        Assert.Equal(before + 1, slow.Encodes); // C only: D was never encoded
+        Assert.Single(new FileChunkStore(root).Keys());
+        Assert.True(Stored(root, KeyOf(server, ChunkC, "")));
     }
 
     // ------------------------------------------------------------------------------------------------ privacy
