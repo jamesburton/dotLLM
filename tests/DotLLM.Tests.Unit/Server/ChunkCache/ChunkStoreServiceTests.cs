@@ -318,6 +318,21 @@ public sealed class ChunkStoreServiceTests : IDisposable
         Assert.Equal(0, once.EncodeQueuedTokens);
     }
 
+    /// <summary>The same text twice in one request is one sighting (sightings count requests, not spans).</summary>
+    [Fact]
+    public void SameTextTwiceInOneRequest_IsOneSighting()
+    {
+        string root = NewRoot();
+        var s = Start(root, new FakeHost());
+        string text = Text('t');
+        var plan = s.ApplyTo(Plan((text, false, KeyFor(text)), (text, false, KeyFor(text))), Parsed(), Local);
+        Assert.Equal(2, Warning(plan, ChunkCacheCodes.EncodeSkipped)?.Count);
+        Assert.Null(Warning(plan, ChunkCacheCodes.EncodeQueued));
+        Assert.Equal(1, s.Sightings.CountOf(ChunkNamespace.Default, ChunkAnnotationParserTests.Sha(text)));
+        var next = s.ApplyTo(Plan((text, false, KeyFor(text))), Parsed(), Local);
+        Assert.Equal(1, Warning(next, ChunkCacheCodes.EncodeQueued)?.Count);
+    }
+
     /// <summary>A full queue refuses (bounded memory); one text queued twice is one item.</summary>
     [Fact]
     public void Queue_IsBounded_AndDeduplicated()

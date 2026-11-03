@@ -313,28 +313,150 @@ public sealed class ChunkStoreServerTests : IDisposable
         }
     }
 
-    /// <summary>The probe with the scheduler's queue non-empty and the gate free is refused (the scheduler check itself).</summary>
+    /// <summary>
+    /// The probe refuses while the continuous-batch scheduler has a queued sequence even with the gate and the model lock
+    /// free (a scheduler whose loop is not running holds its sequence queued).
+    /// </summary>
     [Fact]
     public async Task IdleProbe_RefusedWhileSchedulerHasWork()
     {
         string root = NewRoot();
         await using var paged = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
-        var scheduler = paged.State.Scheduler!;
-        var modelLease = await scheduler.AcquireModelAsync();
-        Task<InferenceResponse> queued;
+        var state = paged.State;
+        var running = state.Scheduler!;
+        using var parked = new DotLLM.Engine.Scheduler.ContinuousBatchSchedulerService(state.Model!, state.Tokenizer!, state.KvCacheFactory!,
+            registerTelemetryProviders: false);
+        using var cancel = new CancellationTokenSource();
+        state.Scheduler = parked; // no run loop: what it is given stays queued
         try
         {
-            queued = scheduler.EnqueueAsync(new InferenceRequest
+            using (var idle = state.TryAcquireIdleModel())
+                Assert.NotNull(idle);
+            var queued = parked.EnqueueAsync(new InferenceRequest
             {
-                TokenIds = paged.State.Tokenizer!.Encode("hello"),
+                TokenIds = state.Tokenizer!.Encode("hello"),
                 Options = new InferenceOptions { MaxTokens = 2 },
-            });
-            Assert.Null(paged.State.TryAcquireIdleModel());
+            }, cancel.Token);
+            Assert.False(parked.Inner.IsIdle);
+            Assert.Null(state.TryAcquireIdleModel());
+            cancel.Cancel();
+            _ = queued.ContinueWith(static _ => { }, TaskScheduler.Default);
         }
         finally
         {
-            modelLease.Dispose();
+            state.Scheduler = running;
         }
-        await queued;
+    }
+
+    /// <summary>
+    /// A chunk holding a special-token spelling (<c>&lt;think&gt;</c>) is encoded by the server with
+    /// <c>ChunkTokenization.Encode</c> (ruling 21: plain text, as on the chat path), so its entry lands under the key the
+    /// CLI and the wire path compute.
+    /// </summary>
+    [Fact]
+    public async Task ServerEncode_ChunkWithThinkTag_UsesChunkTokenization()
+    {
+        string root = NewRoot();
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
+        string chunk = "/// The model writes <think> before it reasons, then </think> after it.\npublic const string Open = \"<think>\";\n";
+        string user = "Look:\n" + chunk + "Why?";
+        (string, string)[] conversation = [("user", user)];
+        var cc = new JsonObject
+        {
+            ["v"] = 1,
+            ["on_miss"] = "encode",
+            ["chunks"] = new JsonArray(ChunkCacheTestServer.Entry("t", 0, user, chunk)),
+        };
+        var (status, body) = await server.PostAsync("/v1/chat/completions", ChunkCacheTestServer.OpenAi(conversation, cc));
+        Assert.Equal(200, status);
+        Assert.Equal(1, WarningCount(Report(body), ChunkCacheCodes.EncodeQueued));
+        Assert.True(Writer(server).Queue.WaitDrained(Drain));
+
+        var identity = server.State.ChunkCacheRuntime.IdentityFor(server.State);
+        int[] ids = ChunkTokenization.Encode(server.State.Tokenizer!, chunk);
+        Assert.DoesNotContain(server.State.Tokenizer!.EncodeRaw("<think>").Single(), ids);
+        Assert.True(new FileChunkStore(root).TryGet(identity.KeyOf(ids, ChunkNamespace.Default), out var entry));
+        Assert.Equal(ids, entry.TokenIds);
+    }
+}
+
+/// <summary>
+/// Phase I Task 15, GPU step: CPU and Vulkan entries never mix. A store written by a CPU server (its sole writer) gives
+/// <c>hit: 0</c> in <c>shadow</c> on a Vulkan server for the same request (the backend is in the key), and the Vulkan
+/// server, though started with <c>--chunk-store-write</c>, stores nothing (only CPU entries are written until the
+/// per-backend schema question is settled). Tiny synthetic model, two generated tokens per request.
+/// </summary>
+[Trait("Category", "GPU")]
+[Collection(ChunkCacheServerCollection.Name)]
+public sealed class ChunkStoreServerGpuTests : IDisposable
+{
+    private static readonly string ChunkA =
+        "public static int Add(int a, int b)\n{\n    return a + b; // the sum of both operands\n}\n";
+
+    private static readonly string User = "Read this file.\n// A.cs\n" + ChunkA + "What does Add return?";
+
+    private readonly string _scratch = Path.Combine(Path.GetTempPath(), "dotllm-chunk-writer-gpu-" + Guid.NewGuid().ToString("N")[..12]);
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_scratch, recursive: true); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    private static string Body(string policy, string? onMiss = null)
+    {
+        var cc = new JsonObject
+        {
+            ["v"] = 1,
+            ["policy"] = policy,
+            ["chunks"] = new JsonArray(ChunkCacheTestServer.Entry("a", 1, User, ChunkA)),
+        };
+        if (onMiss is not null)
+            cc["on_miss"] = onMiss;
+        return ChunkCacheTestServer.OpenAi([("system", "You are terse."), ("user", User)], cc, maxTokens: 2);
+    }
+
+    [SkippableFact]
+    public async Task VulkanServer_CpuWrittenStore_NoHits()
+    {
+        DotLLM.Tests.Unit.Vulkan.VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        string model = ChunkCacheTestServer.WriteModel(Path.Combine(_scratch, "tiny.gguf"));
+        string root = Path.Combine(_scratch, "store");
+        var options = ChunkCacheOptions.Create(true, null, root, storeWrite: true, storeBudget: "256MiB");
+
+        await using (var cpu = await ChunkCacheTestServer.StartAsync(model, options))
+        {
+            var (status, _) = await cpu.PostAsync("/v1/chat/completions", Body("exact", onMiss: "encode"));
+            Assert.Equal(200, status);
+            Assert.True(cpu.State.ChunkCacheRuntime.Writer!.Queue.WaitDrained(TimeSpan.FromSeconds(60)));
+            var (_, shadow) = await cpu.PostAsync("/v1/chat/completions", Body("shadow"));
+            Assert.Equal(1, JsonNode.Parse(shadow)!["chunk_cache"]!["chunks"]!["hit"]!.GetValue<int>());
+        }
+        var keys = new FileChunkStore(root).Keys().Select(k => k.Hex).ToList();
+        Assert.Single(keys);
+        Assert.True(new FileChunkStore(root).TryGet(new ChunkKey(keys[0]), out var written));
+        Assert.Equal("cpu", written.Backend);
+        byte[] ledger = File.ReadAllBytes(ServerLedger.DefaultPath(root));
+
+        await using (var vk = await ChunkCacheTestServer.StartAsync(model, options, device: "vulkan"))
+        {
+            var identity = vk.State.ChunkCacheRuntime.IdentityFor(vk.State);
+            Assert.True(identity.Supported, identity.UnsupportedReason);
+            Assert.Equal("vulkan", identity.Backend); // really on the GPU, not a CPU fallback
+            for (int i = 0; i < 2; i++)
+            {
+                var (status, body) = await vk.PostAsync("/v1/chat/completions", Body("shadow", onMiss: "encode"));
+                Assert.Equal(200, status);
+                var report = JsonNode.Parse(body)!["chunk_cache"]!;
+                Assert.Equal(0, report["chunks"]!["hit"]!.GetValue<int>());
+                Assert.Equal(1, report["chunks"]!["miss"]!.GetValue<int>());
+                Assert.Equal(0, report["plan"]!["tokens"]!["chunk_reused"]!.GetValue<int>());
+                Assert.Contains(report["warnings"]!.AsArray(), w => w!["code"]!.GetValue<string>() == ChunkCacheCodes.EncodeSkipped);
+            }
+            Assert.True(vk.State.ChunkCacheRuntime.Writer!.Queue.WaitDrained(TimeSpan.FromSeconds(60)));
+        }
+        Assert.Equal(keys, new FileChunkStore(root).Keys().Select(k => k.Hex).ToList());
+        Assert.Equal(ledger, File.ReadAllBytes(ServerLedger.DefaultPath(root)));
     }
 }
