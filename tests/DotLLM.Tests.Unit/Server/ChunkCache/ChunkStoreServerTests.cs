@@ -147,6 +147,33 @@ public sealed class ChunkStoreServerTests : IDisposable
     }
 
     /// <summary>
+    /// Re-review nit 1 (a measurement, run on demand): the worst-case request wait on a real model is one chunk encode.
+    /// Set <c>DOTLLM_CHUNK_TIMING_GGUF</c> to a GGUF (e.g. Qwen3-4B-Instruct-2507 Q4_K_M) and optionally
+    /// <c>DOTLLM_CHUNK_TIMING_THREADS</c> (default 8); prints the CPU encode time of a 512- and a 2048-token chunk.
+    /// </summary>
+    [SkippableFact]
+    [Trait("Category", "Benchmark")]
+    public void EncodeTime_RealModel_Measured()
+    {
+        string? gguf = Environment.GetEnvironmentVariable("DOTLLM_CHUNK_TIMING_GGUF");
+        Skip.If(string.IsNullOrEmpty(gguf) || !File.Exists(gguf), "DOTLLM_CHUNK_TIMING_GGUF not set");
+        int threads = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CHUNK_TIMING_THREADS"), out int t) ? t : 8;
+        var options = new ServerOptions { Model = gguf!, ModelId = "timing", Device = "cpu", Threads = threads, UsePaged = false, ChunkCache = ChunkCacheOptions.Create(true, null) };
+        using var state = ServerStartup.LoadModel(gguf!, options);
+        var identity = state.ChunkCacheRuntime.IdentityFor(state);
+        Assert.True(identity.Supported, identity.UnsupportedReason);
+        var encoder = new ChunkEncoder(identity.Fingerprint);
+        int[] text = ChunkTokenization.Encode(state.Tokenizer!, string.Concat(Enumerable.Repeat(ChunkA, 200)));
+        encoder.Encode(state.Model!, text[..32]); // warm-up
+        foreach (int n in new[] { 512, 2048 })
+        {
+            var sw = Stopwatch.StartNew();
+            encoder.Encode(state.Model!, text[..n]);
+            _output.WriteLine($"real model encode ({Path.GetFileName(gguf)}, CPU, {threads} threads): {n} tokens {sw.Elapsed.TotalSeconds:0.00} s");
+        }
+    }
+
+    /// <summary>
     /// Review S4 (a measurement, not a guarantee): the longest a request can wait behind the worker is one chunk encode.
     /// Prints the synthetic model's encode time for ChunkA and for a 2048-token chunk.
     /// </summary>

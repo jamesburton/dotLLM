@@ -393,4 +393,101 @@ public sealed class ChunkStoreHardeningTests : IDisposable
         s.Dispose();
         Assert.False(StoreOwnerLock.IsHeldByAnother(root));
     }
+
+    // ------------------------------------------------------------------------------------------------ re-review R1, R2, nits
+
+    /// <summary>
+    /// R1: a fresh writer on a CLI-built store (CLI entries at half the budget, empty ledger) gets one entry sized at 60% of
+    /// the budget: that entry alone is dropped (<c>entry_too_large</c>), the writer is not stopped, and another tenant's
+    /// normal entry is stored next.
+    /// </summary>
+    [Fact]
+    public void FreshWriterOnCliStore_LargeEntry_DroppedNotStopped()
+    {
+        string root = NewRoot();
+        string cli = Text('c', 200), big = Text('b', 240), small = Text('s', 40);
+        var store = new FileChunkStore(root);
+        store.Put(KeyFor(cli), EntryFor(cli, 4));
+        WriteIndex(root, "cli", KeyFor(cli));
+        var host = new FakeHost();
+        var s = Start(root, host, budget: 2 * FileBytes(cli, 4));
+        Assert.True(FileBytes(big, 4) > s.BudgetBytes - FileBytes(cli, 4) && FileBytes(big, 4) < s.BudgetBytes);
+
+        Admitted(s, big, KeyFor(big));
+        Assert.True(s.Queue.WaitDrained(Drain));
+        Assert.Equal(StoreProblems.EntryTooLarge, s.Problem);
+        Assert.False(store.Contains(KeyFor(big)));
+        Assert.True(store.Contains(KeyFor(cli)));
+
+        var other = new ChunkCaller(true, "k-0123456789abcdef");
+        Assert.True(s.Admit(Span(small), KeyFor(small, other.Namespace), small.Length, other, true, "cpu").Queued);
+        Assert.True(s.Queue.WaitDrained(Drain));
+        Assert.True(store.Contains(KeyFor(small, other.Namespace)));
+        Assert.Null(s.Problem);
+    }
+
+    /// <summary>
+    /// R1 reverse case: a store full of CLI entries plus one tiny server row cannot take even a minimum-size entry after
+    /// evicting everything the server may evict: the writer stops (<c>budget_exhausted</c>) rather than encoding and
+    /// dropping every admitted miss.
+    /// </summary>
+    [Fact]
+    public void StoreFullOfCliEntries_TinyOwnRow_Stops()
+    {
+        string root = NewRoot();
+        string cli = Text('c', 400), tiny = "t\n", next = Text('n', 100);
+        var store = new FileChunkStore(root);
+        store.Put(KeyFor(cli), EntryFor(cli, 4));
+        WriteIndex(root, "cli", KeyFor(cli));
+        var s = Start(root, new FakeHost(), budget: FileBytes(cli, 4) + FileBytes(tiny, 4) + 64);
+        Admitted(s, tiny, KeyFor(tiny));
+        Assert.True(s.Queue.WaitDrained(Drain));
+        Assert.True(store.Contains(KeyFor(tiny)));
+
+        Admitted(s, next, KeyFor(next));
+        Assert.True(s.Queue.WaitDrained(Drain));
+        Assert.Equal(StoreProblems.BudgetExhausted, s.Problem);
+        Assert.True(store.Contains(KeyFor(tiny))); // nothing evicted for a write that could not happen
+    }
+
+    /// <summary>R1: once the entry size per token is known, a chunk that could never fit the budget is refused at admission (no encode).</summary>
+    [Fact]
+    public void OversizedChunk_RefusedAtAdmission_NoEncode()
+    {
+        string root = NewRoot();
+        string first = Text('f', 100);
+        var host = new FakeHost();
+        var s = Start(root, host, budget: 4 * FileBytes(first, 4));
+        Admitted(s, first, KeyFor(first));
+        Assert.True(s.Queue.WaitDrained(Drain));
+        int encodes = host.Encodes;
+        string huge = Text('h', 50);
+        var r = s.Admit(Span(huge), KeyFor(huge), 2_000, Local, true, "cpu"); // 2,000 tokens (under the 2,048 cap) at this size per token: far over
+        Assert.Equal(new AdmissionResult(false, AdmissionReasons.OverBudget), r);
+        Assert.True(s.Queue.WaitDrained(Drain));
+        Assert.Equal(encodes, host.Encodes);
+    }
+
+    /// <summary>Nit: a PEM <c>PRIVATE KEY</c> anywhere on a BEGIN or END line (PGP blocks, a chunk holding only the end).</summary>
+    [Fact]
+    public void PemSniff_BeginOrEndLines_AnyPrivateKeyForm()
+    {
+        Assert.True(ChunkDenyList.LooksLikeSecret("-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBF\n"));
+        Assert.True(ChunkDenyList.LooksLikeSecret("Zm9vYmFy\n-----END RSA PRIVATE KEY-----\n"));
+        Assert.True(ChunkDenyList.LooksLikeSecret("x\r\n-----BEGIN ENCRYPTED PRIVATE KEY-----\r\n"));
+        Assert.False(ChunkDenyList.LooksLikeSecret("-----BEGIN PGP PUBLIC KEY BLOCK-----\nmQIN\n-----END PGP PUBLIC KEY BLOCK-----\n"));
+        Assert.False(ChunkDenyList.LooksLikeSecret("// a PRIVATE KEY is never logged\n-----BEGIN CERTIFICATE-----\n"));
+    }
+
+    /// <summary>Nit: a long path's stored prefix never ends in half a surrogate pair.</summary>
+    [Fact]
+    public void StoredPath_CutsAtACharBoundary()
+    {
+        int cut = SightingTable.StoredPathChars - 17;
+        string path = new string('a', cut - 1) + "\U0001F600" + new string('b', 100);
+        string stored = SightingTable.StoredPath(path)!;
+        string prefix = stored[..stored.LastIndexOf('#')];
+        Assert.False(char.IsHighSurrogate(prefix[^1]));
+        Assert.True(stored.Length <= SightingTable.StoredPathChars);
+    }
 }

@@ -282,6 +282,21 @@ public sealed class ChunkStoreServiceTests : IDisposable
     [InlineData("APPSET~1.JSO", true)]
     [InlineData("src/PROGRA~1.CS", false)]
     [InlineData("src/environment.json", false)]
+    [InlineData("C:secrets.json", true)]
+    [InlineData("D:.env", true)]
+    [InlineData("C:id_rsa", true)]
+    [InlineData("C:Program.cs", false)]
+    [InlineData("SE1A2B~1.JSO", true)]
+    [InlineData("KE7F3A~2.PEM", true)]
+    [InlineData("PR9C1D~1.CS", false)]
+    [InlineData("android/release.keystore", true)]
+    [InlineData("store.jks", true)]
+    [InlineData("kubeconfig", true)]
+    [InlineData("home/.kube/config", true)]
+    [InlineData("home/.aws/credentials", true)]
+    [InlineData("home/.docker/config.json", true)]
+    [InlineData("infra/terraform.tfvars", true)]
+    [InlineData("infra/prod.tfstate", true)]
     [InlineData("docs/git/README.md", false)]
     [InlineData("src/.gitignore", false)]
     [InlineData("keys/readme.keys", false)]
@@ -449,8 +464,9 @@ public sealed class ChunkStoreServiceTests : IDisposable
     }
 
     /// <summary>
-    /// When the server's own entries cannot free enough (index-referenced entries fill the budget), nothing is evicted,
-    /// encoding stops, and responses with a miss warn <c>chunk_store_unavailable</c> (<c>budget_exhausted</c>).
+    /// When index-referenced entries fill the budget so that not even a minimum-size entry fits after evicting everything the
+    /// server may evict, nothing is evicted, encoding stops, and responses with a miss warn <c>chunk_store_unavailable</c>
+    /// (<c>budget_exhausted</c>).
     /// </summary>
     [Fact]
     public void CannotFree_StopsEncoding_Warns()
@@ -463,7 +479,7 @@ public sealed class ChunkStoreServiceTests : IDisposable
         store.Put(KeyFor(cli2), EntryFor(cli2, 4));
         WriteIndex(root, "cli", KeyFor(cli1), KeyFor(cli2));
         var host = new FakeHost();
-        var s = Start(root, host, budget: 2 * one + one / 2);
+        var s = Start(root, host, budget: 2 * one + 64); // room for less than a minimum-size entry: genuinely full (re-review R1)
 
         Admitted(s, mine, KeyFor(mine), true);
         Assert.True(s.Queue.WaitDrained(Drain));
