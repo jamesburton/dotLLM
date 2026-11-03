@@ -19,9 +19,15 @@ namespace DotLLM.ChunkReuse.Tooling;
 /// </remarks>
 public sealed class ChunkDenyList
 {
-    /// <summary>The default patterns (spec §10).</summary>
+    /// <summary>
+    /// The default patterns: spec §10 widened by the Task 15 review ruling (every <c>appsettings*.json</c>, key stores,
+    /// credential dot-files, <c>.ssh/</c>, <c>secrets.*</c>, <c>*.env</c>, <c>credentials*</c>).
+    /// </summary>
     public static readonly IReadOnlyList<string> DefaultPatterns =
-        [".env*", "*.pem", "*.key", "*.pfx", "id_*", "secrets.json", "appsettings.*.Development.json", ".git/**"];
+    [
+        ".env*", "*.env", "*.pem", "*.key", "*.pfx", "*.p12", "id_*", "id_rsa*", "secrets.*", "appsettings*.json",
+        "credentials*", ".npmrc", ".netrc", ".pgpass", ".git/**", ".ssh/**",
+    ];
 
     /// <summary>The default deny-list.</summary>
     public static ChunkDenyList Default { get; } = new(DefaultPatterns);
@@ -59,21 +65,77 @@ public sealed class ChunkDenyList
         _directoryPatterns = [.. dirs];
     }
 
+    /// <summary>
+    /// Whether chunk text looks like a secret by content: a PEM private-key header (<c>-----BEGIN </c> ... <c>PRIVATE
+    /// KEY-----</c> on one line, e.g. RSA, EC, OPENSSH, ENCRYPTED). Certificates and public keys are not secrets.
+    /// </summary>
+    /// <param name="text">The chunk text.</param>
+    /// <returns>True when it should never be stored.</returns>
+    public static bool LooksLikeSecret(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        int at = 0;
+        while ((at = text.IndexOf("-----BEGIN ", at, StringComparison.Ordinal)) >= 0)
+        {
+            int eol = text.IndexOf('\n', at);
+            int end = eol < 0 ? text.Length : eol;
+            int key = text.IndexOf("PRIVATE KEY-----", at, end - at, StringComparison.Ordinal);
+            if (key >= 0) return true;
+            at = end;
+        }
+        return false;
+    }
+
     /// <summary>Whether <paramref name="path"/> is denied.</summary>
     /// <param name="path">A path (relative or not, either separator).</param>
     /// <returns>True when a pattern matches; false for a null or empty path (nothing to match).</returns>
     public bool IsDenied(string? path)
     {
         if (string.IsNullOrEmpty(path)) return false;
-        string[] segments = path.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries)
-            .Where(s => s != ".").ToArray();
-        if (segments.Length == 0) return false;
+        if (path.Contains("::", StringComparison.Ordinal)) return true; // an alternate data stream: never a plain file
+        var segments = new List<string>();
+        foreach (string raw in path.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (raw is "." or "..")
+            {
+                if (raw == "..") segments.Add(raw);
+                continue;
+            }
+            string seg = raw;
+            int colon = seg.IndexOf(':');
+            if (colon >= 0) seg = seg[..colon]; // "secrets.json:stream" (or a drive letter)
+            seg = seg.TrimEnd('.', ' ');        // Windows ignores trailing dots and spaces
+            if (seg.Length > 0) segments.Add(seg);
+        }
+        if (segments.Count == 0) return false;
         string name = segments[^1];
         foreach (string p in _fileNamePatterns)
             if (Matches(p, name)) return true;
-        for (int i = 0; i < segments.Length - 1; i++)
+        for (int i = 0; i < segments.Count - 1; i++)
             foreach (string p in _directoryPatterns)
                 if (Matches(p, segments[i])) return true;
+        for (int i = 0; i < segments.Count; i++)
+            if (ShortNameMayBeDenied(segments[i], i == segments.Count - 1)) return true;
+        return false;
+    }
+
+    // An 8.3 short name ("SECRET~1.JSO"): denied when its stem and a pattern's literal start (leading '.' dropped, as the
+    // short name drops it) could be the same name. Errs towards denying.
+    private bool ShortNameMayBeDenied(string segment, bool isFileName)
+    {
+        int tilde = segment.IndexOf('~');
+        if (tilde < 1 || tilde + 1 >= segment.Length || !char.IsAsciiDigit(segment[tilde + 1])) return false;
+        string stem = segment[..tilde].TrimStart('.');
+        if (stem.Length == 0) return false;
+        IEnumerable<string> patterns = isFileName ? _fileNamePatterns.Concat(_directoryPatterns) : _directoryPatterns;
+        foreach (string p in patterns)
+        {
+            int wild = p.IndexOfAny(['*', '?']);
+            string literal = (wild < 0 ? p : p[..wild]).TrimStart('.');
+            if (literal.Length == 0) continue;
+            if (literal.StartsWith(stem, StringComparison.OrdinalIgnoreCase) || stem.StartsWith(literal, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
         return false;
     }
 
