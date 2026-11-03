@@ -829,7 +829,8 @@ public static class ServerStartup
                 tokenizer,
                 kvFactory,
                 options: schedulerOptions,
-                pagedPool: pagedFactory?.Pool);
+                pagedPool: pagedFactory?.Pool,
+                prefixCache: prefixTrieManager);
             Console.WriteLine(options.Scheduler?.EnableFairness == true
                 ? "[dotllm] Continuous-batch scheduler active (per-API-key fairness on)"
                 : vulkanScheduler
