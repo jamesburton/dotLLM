@@ -22,6 +22,13 @@ namespace DotLLM.ChunkReuse.Store;
 /// is a miss. Version-1 files (no backend tag) are misses: the backend that produced them is unknown.
 /// </para>
 /// <para>
+/// <b>Replacing a file a reader holds (platform-defined).</b> On Windows a file another handle has memory-mapped cannot be
+/// renamed over: <see cref="Put"/> keeps a valid destination as it is and otherwise throws <see cref="ChunkStoreBusyException"/>
+/// (one attempt, no retry). On Linux and macOS <c>rename(2)</c> replaces the directory entry even while the old file is open or
+/// mapped, so the replace succeeds and an existing reader keeps reading the old file unchanged; the busy case does not arise
+/// there. Readers open entries with <see cref="FileShare.Delete"/> so that eviction can delete a file a reader holds.
+/// </para>
+/// <para>
 /// The backend tag is reported as written: the store cannot tell which backend a key was computed for, so a reader compares
 /// <see cref="ChunkKvEntry.Backend"/> with its own backend (<see cref="StoredContextAssembler"/> rejects and replaces a mismatch).
 /// CPU and Vulkan entries never mix: the backend is in the key and in the header.
@@ -299,9 +306,10 @@ public sealed class FileChunkStore : IChunkStore
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
-                // On Windows the destination cannot be replaced while a reader has it mapped. If it is a valid entry (another
-                // writer stored the same key meanwhile) it is as good as ours; otherwise fail at once instead of waiting for
-                // the reader.
+                // On Windows the destination cannot be replaced while a reader has it mapped (on POSIX the rename succeeds
+                // under the reader, so this path is not reached for that reason). If it is a valid entry (another writer
+                // stored the same key meanwhile) it is as good as ours; otherwise fail at once instead of waiting for the
+                // reader.
                 if (HoldsValidEntry(key, entry.Backend)) return;
                 throw new ChunkStoreBusyException(path, e);
             }

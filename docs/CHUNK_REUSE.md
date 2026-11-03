@@ -88,9 +88,11 @@ the engine's K/V output. Two layers capture that:
 - **Reads are validated.** A read memory-maps the file and checks magic, version, dtype, key, backend tag and the exact file
   length. Truncation, trailing bytes, another version (including version 1, which had no backend tag), another key's file
   or an unsupported dtype is a **miss**, never a wrong hit. `Contains` and `TryReadFingerprint` read the header only.
-- **Busy destination** (Windows cannot replace a mapped file): if the destination is already a valid entry for the key,
-  `Put` returns; if it is invalid and still held by a reader, `Put` throws `ChunkStoreBusyException` at once and stores
-  nothing (no retry loop; a later `Put` repairs it).
+- **Busy destination (platform-defined).** On Windows a file another handle has mapped cannot be renamed over: if the
+  destination is already a valid entry for the key, `Put` returns; if it is invalid and still held by a reader, `Put`
+  throws `ChunkStoreBusyException` at once and stores nothing (no retry loop; a later `Put` repairs it). On Linux/macOS
+  `rename(2)` replaces the directory entry even while the old file is open or mapped: `Put` succeeds, the reader keeps
+  reading the old file (its inode is freed when the last handle closes), so the busy case does not arise there.
 - **Backend tag.** The store reports the tag as written; a reader compares it with its own backend. CPU and other-backend
   entries never mix: the backend is in the key and in the header.
 - `FileChunkStore.OpenExisting(root)` opens without creating the directory (read-only consumers).

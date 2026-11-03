@@ -3,7 +3,7 @@ namespace DotLLM.ChunkReuse.Store;
 /// <summary>
 /// The store is busy: <see cref="FileChunkStore.Put"/> could not replace an invalid file at the entry's path because another
 /// handle holds it (on Windows a mapped file cannot be replaced; nothing was stored, the key stays a miss and a later Put can
-/// repair it), or, as <see cref="ChunkStoreLockTimeoutException"/>, a store or index lock was held by another writer for the
+/// repair it; on Linux and macOS the rename replaces a held file, so this case does not arise there), or, as <see cref="ChunkStoreLockTimeoutException"/>, a store or index lock was held by another writer for the
 /// whole timeout. Either way nothing was written; retrying later is safe.
 /// </summary>
 /// <remarks>

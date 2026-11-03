@@ -302,10 +302,13 @@ public sealed class StoredAssemblyTests : IDisposable
     // ------------------------------------------------------------------------------------------------ busy / concurrency
 
     [Fact]
-    public void Assemble_StoreBusy_UsesFreshEntry_AndALaterCallRepairs()
+    public void Assemble_CorruptEntryHeldByReader_WindowsBusyRepairsLater_PosixRepairsAtOnce()
     {
-        // A corrupt entry is mapped by another reader, so Put cannot replace it (ChunkStoreBusyException). Assembly still
-        // succeeds with the freshly encoded entry; the key stays a miss until a later call stores it.
+        // A corrupt entry is mapped by another reader. Assembly succeeds with the freshly encoded entry on every platform; whether
+        // it can be stored now is platform-defined (FileChunkStore remarks):
+        // - Windows: Put cannot replace the mapped file (ChunkStoreBusyException), so the key stays a miss (one store failure)
+        //   until a later call stores it.
+        // - POSIX: rename replaces the file under the reader, so the entry is stored at once (no store failure).
         using var tiny = TinyModel.Load(_scratch, seed: 1);
         var store = new FileChunkStore(_root);
         var assembler = new StoredContextAssembler(tiny.Fingerprint, Tokenizer);
@@ -321,10 +324,19 @@ public sealed class StoredAssemblyTests : IDisposable
             using SimpleKvCache cache = NewCache(tiny);
             StoredAssembly r = assembler.Assemble(Context3, tiny.Model, store, cache);
             Assert.Equal(new AssemblyStats(2, 1, TokB.Length, 0), r.Stats);
-            Assert.Equal(1, r.StoreFailures);
             AssertBitExact(freshB, r.Entries[1]);
             Assert.Equal(TokA.Length + TokB.Length + TokC.Length, cache.CurrentLength);
-            Assert.False(store.Contains(KeyOf(tiny, TokB)));
+            if (OperatingSystem.IsWindows())
+            {
+                Assert.Equal(1, r.StoreFailures);
+                Assert.False(store.Contains(KeyOf(tiny, TokB)));
+            }
+            else
+            {
+                Assert.Equal(0, r.StoreFailures);
+                Assert.True(store.TryGet(KeyOf(tiny, TokB), out ChunkKvEntry storedB));
+                AssertBitExact(freshB, storedB);
+            }
         }
         finally
         {
@@ -332,10 +344,15 @@ public sealed class StoredAssemblyTests : IDisposable
             held.Dispose();
         }
 
-        StoredAssembly repair = assembler.Assemble(Context3, tiny.Model, store);
-        Assert.Equal(new AssemblyStats(2, 1, TokB.Length, 0), repair.Stats);
-        Assert.Equal(0, repair.StoreFailures);
-        Assert.Equal(3, assembler.Assemble(Context3, tiny.Model, store).Stats.Hits);
+        if (OperatingSystem.IsWindows())
+        {
+            StoredAssembly repair = assembler.Assemble(Context3, tiny.Model, store);
+            Assert.Equal(new AssemblyStats(2, 1, TokB.Length, 0), repair.Stats);
+            Assert.Equal(0, repair.StoreFailures);
+        }
+        StoredAssembly after = assembler.Assemble(Context3, tiny.Model, store);
+        Assert.Equal(new AssemblyStats(3, 0, 0, 0), after.Stats);
+        Assert.Equal(0, after.StoreFailures);
     }
 
     [Fact]

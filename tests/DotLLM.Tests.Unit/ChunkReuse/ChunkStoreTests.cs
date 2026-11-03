@@ -552,8 +552,10 @@ public sealed class ChunkStoreTests : IDisposable
     [Fact]
     public void Store_PutWhileReaderHoldsValidDestination_Succeeds()
     {
-        // Another writer stores the same key between this Put's existence check and its rename, and a reader maps that file:
-        // the rename fails, the destination is valid, so Put returns without an exception and without leaving a temp file.
+        // Another writer stores the same key between this Put's existence check and its rename, and a reader maps that file.
+        // Windows: the rename fails, the destination is valid, so Put returns without an exception. POSIX: the rename replaces
+        // the entry with identical content (the reader keeps the other writer's inode). Either way: no exception, one valid
+        // entry, no temp file.
         ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         ChunkKvEntry entry = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5);
         var store = new FileChunkStore(_root);
@@ -581,27 +583,40 @@ public sealed class ChunkStoreTests : IDisposable
     }
 
     [Fact]
-    public void Store_RepairWhileReaderHoldsCorruptFile_ThrowsBusyWithoutRetrying()
+    public void Store_RepairWhileReaderHoldsCorruptFile_WindowsThrowsBusy_PosixReplacesAndReaderKeepsOldFile()
     {
-        // A corrupt file at the destination is mapped by a reader, so it cannot be replaced. Defined behaviour: Put throws
-        // ChunkStoreBusyException after one rename attempt (no retry loop), removes its temp file and leaves the key a miss;
-        // a later Put repairs the entry.
+        // A corrupt file at the destination is mapped by a reader. The outcome is platform-defined (FileChunkStore remarks):
+        // - Windows: a mapped file cannot be renamed over, so Put throws ChunkStoreBusyException after one rename attempt (no
+        //   retry loop), removes its temp file and leaves the key a miss; a later Put repairs the entry.
+        // - POSIX: rename(2) atomically replaces the directory entry; the reader keeps the old (corrupt) inode mapped and
+        //   unchanged, and the key is repaired at once (no exception, no temp file left).
         ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         ChunkKvEntry entry = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5);
         var store = new FileChunkStore(_root);
         store.Put(key, entry);
         string path = EntryPath(key);
         using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write)) fs.SetLength(100);
+        byte[] corrupt = File.ReadAllBytes(path);
 
         int renames = 0;
         store.BeforeRenameForTest = _ => renames++;
         var (held, map) = MapForRead(path);
         try
         {
-            Assert.Throws<ChunkStoreBusyException>(() => store.Put(key, entry));
+            if (OperatingSystem.IsWindows())
+            {
+                Assert.Throws<ChunkStoreBusyException>(() => store.Put(key, entry));
+                Assert.False(store.TryGet(key, out _));
+            }
+            else
+            {
+                store.Put(key, entry); // must not throw
+                Assert.True(store.TryGet(key, out ChunkKvEntry replaced));
+                AssertBitExact(entry, replaced);
+            }
             Assert.Equal(1, renames);
-            Assert.False(store.TryGet(key, out _));
             Assert.Single(Directory.GetFiles(_root, "*", SearchOption.AllDirectories)); // temp file removed
+            Assert.Equal(corrupt, ReadMapped(map, corrupt.Length)); // the reader's view is never changed in place
         }
         finally
         {
@@ -609,6 +624,7 @@ public sealed class ChunkStoreTests : IDisposable
             held.Dispose();
         }
         store.Put(key, entry);
+        Assert.Equal(OperatingSystem.IsWindows() ? 2 : 1, renames); // POSIX: already valid, kept without a rename
         Assert.True(store.TryGet(key, out ChunkKvEntry got));
         AssertBitExact(entry, got);
     }
@@ -676,6 +692,14 @@ public sealed class ChunkStoreTests : IDisposable
         var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
         var map = MemoryMappedFile.CreateFromFile(fs, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: true);
         return (fs, map);
+    }
+
+    private static byte[] ReadMapped(MemoryMappedFile map, int length)
+    {
+        using var view = map.CreateViewAccessor(0, length, MemoryMappedFileAccess.Read);
+        var bytes = new byte[length];
+        view.ReadArray(0, bytes, 0, length);
+        return bytes;
     }
 
     private string EntryPath(ChunkKey key) => Path.Combine(_root, key.Hex[..2], key.Hex + ".ckv");
