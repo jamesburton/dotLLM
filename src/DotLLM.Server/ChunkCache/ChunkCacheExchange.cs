@@ -56,9 +56,13 @@ internal sealed class ChunkCacheExchange
     /// <param name="options">The template options exactly as rendered.</param>
     /// <param name="prompt">The rendered prompt.</param>
     /// <param name="promptIds">The prompt's ids when the caller already has <c>tokenizer.Encode(prompt)</c> (explain); null encodes here.</param>
+    /// <param name="admit">
+    /// An inference request (not <c>explain</c>): with <c>--chunk-store-write</c>, an authenticated caller's verified misses go
+    /// through encode admission (<see cref="ChunkStoreService.ApplyTo"/>) and its hits count as uses. Never blocks.
+    /// </param>
     /// <returns>The strict-mode error, or null.</returns>
     public ChunkCacheError? Prepare(ServerState state, IReadOnlyList<ChatMessage> messages, int engineMessageOffset,
-        ChatTemplateOptions options, string prompt, int[]? promptIds = null)
+        ChatTemplateOptions options, string prompt, int[]? promptIds = null, bool admit = false)
     {
         ArgumentNullException.ThrowIfNull(state);
         string backend = "cpu";
@@ -75,6 +79,11 @@ internal sealed class ChunkCacheExchange
             bool unavailable = false;
             var store = identity.Supported && Caller.Authenticated ? runtime.Store(state.Options.ChunkCache, out unavailable) : null;
             Plan = ChunkCachePipeline.Apply(Parsed, located, identity, tokenizer, prompt, ids, store, unavailable);
+            // Store side effects follow the control plane's rule (Task 14): authenticated callers only; never for explain,
+            // never for a request that fails strict, never when the configured store is unusable.
+            if (admit && Plan.Error is null && Caller.Authenticated && identity.Supported && !unavailable && store is not null
+                && runtime.Writer is { } writer)
+                Plan = writer.ApplyTo(Plan, Parsed, Caller);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {

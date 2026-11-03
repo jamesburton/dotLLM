@@ -160,7 +160,7 @@ public static class ChatCompletionEndpoint
 
         // chunk_cache: locate, verify and look up the annotated spans in the prompt exactly as rendered. Read-only: the
         // prompt, the options and the dispatch below are those of the unannotated request.
-        if (chunkCache?.Prepare(state, messages, messages.Length - engineMessages.Length, templateOptions, prompt) is { } chunkPlanError)
+        if (chunkCache?.Prepare(state, messages, messages.Length - engineMessages.Length, templateOptions, prompt, admit: true) is { } chunkPlanError)
         {
             await WriteChunkCacheErrorAsync(httpContext, chunkPlanError, keepAlive);
             return;

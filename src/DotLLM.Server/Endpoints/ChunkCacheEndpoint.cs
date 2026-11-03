@@ -57,6 +57,11 @@ public static class ChunkCacheEndpoint
             ServerLog.Info("chunk-cache: no --chunk-cache-api-keys; /v1/chunk-cache/* answers local callers only");
         }
 
+        // --chunk-store-write: become the store's sole writer now, at startup, so a second server on the same root fails
+        // before it listens (InvalidServerOptionException), and stop the worker before the model goes away.
+        if (state.ChunkCacheRuntime.StartWriter(state) is not null)
+            app.Lifetime.ApplicationStopping.Register(() => state.ChunkCacheRuntime.Dispose());
+
         app.MapGet(CapabilitiesPath, GetCapabilitiesAsync);
         app.MapPost(ExplainPath, ExplainAsync);
     }

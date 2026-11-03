@@ -2,7 +2,8 @@ namespace DotLLM.Server.ChunkCache;
 
 /// <summary>
 /// Server switches for the <c>chunk_cache</c> wire convention (<c>--chunk-cache</c>, <c>--chunk-cache-max-chunks</c>,
-/// <c>--chunk-store</c>, <c>--chunk-cache-api-keys</c>).
+/// <c>--chunk-store</c>, <c>--chunk-cache-api-keys</c>, <c>--chunk-store-write</c>, <c>--chunk-store-budget</c>,
+/// <c>--chunk-store-index-only</c>).
 /// Off by default: with <see cref="Enabled"/> false the server never parses an annotation, maps no <c>/v1/chunk-cache</c>
 /// route, and request and response bytes are what they were before the convention for any body.
 /// </summary>
@@ -17,7 +18,15 @@ namespace DotLLM.Server.ChunkCache;
 /// <c>--chunk-cache-api-keys</c>: the parsed keys file. Null: the control plane answers loopback callers only, all in the
 /// default namespace (<see cref="ChunkCacheAuth"/>).
 /// </param>
-public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? StoreRoot = null, ChunkCacheKeys? ApiKeys = null)
+/// <param name="StoreWrite">
+/// <c>--chunk-store-write</c>: the server becomes the store's sole writer (<see cref="ChunkStoreService"/>): it owns the root,
+/// keeps the server ledger and encodes admitted misses in the background (spec §5.10). Off: the store is read-only.
+/// </param>
+/// <param name="StoreBudgetBytes"><c>--chunk-store-budget</c>: the store's byte budget; required (above 0) with
+/// <see cref="StoreWrite"/>, 0 otherwise. No unlimited default.</param>
+/// <param name="StoreIndexOnly"><c>--chunk-store-index-only</c>: store only chunks an index file references (spec §10).</param>
+public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? StoreRoot = null, ChunkCacheKeys? ApiKeys = null,
+    bool StoreWrite = false, long StoreBudgetBytes = 0, bool StoreIndexOnly = false)
 {
     /// <summary>Default of <c>--chunk-cache-max-chunks</c> (advertised as <c>max_chunks_per_request</c>).</summary>
     public const int DefaultMaxChunks = 4096;
@@ -36,10 +45,15 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? Stor
     /// <param name="storeRoot"><c>--chunk-store</c>; null or blank = no store.</param>
     /// <param name="allowShortKeys"><c>--chunk-cache-allow-short-keys</c> (needs a keys file).</param>
     /// <param name="apiKeysFile"><c>--chunk-cache-api-keys</c>; null or blank = none (loopback only). Read and parsed here.</param>
+    /// <param name="storeWrite"><c>--chunk-store-write</c> (needs <c>--chunk-store</c> and <c>--chunk-store-budget</c>).</param>
+    /// <param name="storeBudget"><c>--chunk-store-budget</c>: a byte size such as <c>20GiB</c> (needs <c>--chunk-store-write</c>).</param>
+    /// <param name="storeIndexOnly"><c>--chunk-store-index-only</c> (needs <c>--chunk-store-write</c>).</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxChunks"/> is below 1 or above <see cref="AbsoluteMaxChunks"/>.</exception>
-    /// <exception cref="ArgumentException">A store or keys file is given without <c>--chunk-cache</c>, or the keys file is
-    /// unreadable or invalid (<see cref="ChunkCacheKeys.Load"/>; the message names the line, never a key).</exception>
-    public static ChunkCacheOptions Create(bool enabled, int? maxChunks, string? storeRoot = null, string? apiKeysFile = null, bool allowShortKeys = false)
+    /// <exception cref="ArgumentException">A store or keys file is given without <c>--chunk-cache</c>, the keys file is
+    /// unreadable or invalid (<see cref="ChunkCacheKeys.Load"/>; the message names the line, never a key), or a store-write
+    /// option is given without what it needs (the budget is required with <c>--chunk-store-write</c>).</exception>
+    public static ChunkCacheOptions Create(bool enabled, int? maxChunks, string? storeRoot = null, string? apiKeysFile = null, bool allowShortKeys = false,
+        bool storeWrite = false, string? storeBudget = null, bool storeIndexOnly = false)
     {
         int max = maxChunks ?? DefaultMaxChunks;
         if (max < 1 || max > AbsoluteMaxChunks)
@@ -65,11 +79,37 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? Stor
         {
             throw new ArgumentException("--chunk-cache-allow-short-keys needs --chunk-cache-api-keys.", nameof(allowShortKeys));
         }
+        bool hasBudget = !string.IsNullOrWhiteSpace(storeBudget);
+        if (!storeWrite && (hasBudget || storeIndexOnly))
+            throw new ArgumentException((hasBudget ? "--chunk-store-budget" : "--chunk-store-index-only")
+                + " needs --chunk-store-write (without it the store is read-only).", nameof(storeWrite));
         if (string.IsNullOrWhiteSpace(storeRoot))
+        {
+            if (storeWrite)
+                throw new ArgumentException("--chunk-store-write needs --chunk-store <dir> (the store the server writes).", nameof(storeRoot));
             return new ChunkCacheOptions(enabled, max, null, keys);
+        }
         if (!enabled)
             throw new ArgumentException("--chunk-store needs --chunk-cache (the store is only read for chunk_cache requests).", nameof(storeRoot));
-        // Resolved once, at startup, against the working directory of that moment (not lazily per request).
-        return new ChunkCacheOptions(enabled, max, Path.GetFullPath(storeRoot), keys);
+        long budget = 0;
+        if (storeWrite)
+        {
+            if (!hasBudget)
+                throw new ArgumentException("--chunk-store-write needs --chunk-store-budget <bytes> (e.g. 20GiB): the store has no unlimited default.", nameof(storeBudget));
+            budget = ServerOptions.ParseByteSize(storeBudget, "--chunk-store-budget");
+            if (budget <= 0)
+                throw new ArgumentException("--chunk-store-budget must be above 0 bytes.", nameof(storeBudget));
+        }
+        string root;
+        try
+        {
+            // Resolved once, at startup, against the working directory of that moment (not lazily per request).
+            root = Path.GetFullPath(storeRoot);
+        }
+        catch (Exception ex) when (ex is NotSupportedException or IOException or System.Security.SecurityException)
+        {
+            throw new ArgumentException($"--chunk-store: not a usable path ({ex.GetType().Name}).", nameof(storeRoot), ex);
+        }
+        return new ChunkCacheOptions(enabled, max, root, keys, storeWrite, budget, storeIndexOnly);
     }
 }

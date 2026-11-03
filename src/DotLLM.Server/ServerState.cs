@@ -668,6 +668,71 @@ public sealed class ServerState : IDisposable
     }
 
     /// <summary>
+    /// Non-blocking: takes the model for one out-of-band forward pass (the chunk-store writer's background encode, Phase I
+    /// Task 15) only when the server is idle: the request gate is free and nobody waits for it, no model is loading or being
+    /// activated, a model is ready, and the continuous-batch scheduler (when running) has no active or queued sequence. Then the
+    /// gate and the scheduler's model lease are held until the returned handle is disposed, so a request arriving meanwhile
+    /// waits for that one encode only. Returns null at once otherwise; never waits for a busy server.
+    /// </summary>
+    /// <returns>The lease, or null when the server is busy (or no model is loaded).</returns>
+    internal IDisposable? TryAcquireIdleModel()
+    {
+        if (!_requestGate.Wait(0))
+            return null;
+        bool held = false;
+        IDisposable? lease = null;
+        try
+        {
+            if (Volatile.Read(ref _gateWaiters) > 0 || _loading is not null || _activationGrant is { IsLive: true }
+                || !IsReady || Model is null)
+                return null;
+            if (Scheduler is { } scheduler)
+            {
+                if (!scheduler.Inner.IsIdle)
+                    return null;
+                // The run loop holds the model lock only while it steps; an idle loop does not, so this completes at once.
+                // Never wait for a step here: cancel instead (and give the lease back if it was granted in the race).
+                using var cts = new CancellationTokenSource();
+                var acquire = scheduler.AcquireModelAsync(cts.Token);
+                if (!acquire.IsCompleted)
+                {
+                    cts.Cancel();
+                    _ = acquire.ContinueWith(static t => { if (t.Status == TaskStatus.RanToCompletion) t.Result.Dispose(); },
+                        CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                    return null;
+                }
+                lease = acquire.GetAwaiter().GetResult();
+                if (!scheduler.Inner.IsIdle)
+                    return null;
+            }
+            MarkGateHeld("chunk-cache encode");
+            held = true;
+            return new IdleModelLease(this, lease);
+        }
+        finally
+        {
+            if (!held)
+            {
+                lease?.Dispose();
+                _requestGate.Release();
+            }
+        }
+    }
+
+    private sealed class IdleModelLease(ServerState state, IDisposable? schedulerLease) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            schedulerLease?.Dispose();
+            state.ReleaseGate();
+        }
+    }
+
+    /// <summary>
     /// Takes <see cref="_requestGate"/>, logging (#1021) when it is not immediately free: who holds it, then how long the wait took.
     /// An uncontended acquire logs nothing.
     /// </summary>
@@ -1437,6 +1502,8 @@ public sealed class ServerState : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
+        // The chunk-store writer first: its worker may be waiting for (or holding) the model, which is disposed below.
+        _chunkCacheRuntime?.Dispose();
         try { StopSchedulerAsync().GetAwaiter().GetResult(); }
         catch { /* shutdown best-effort */ }
         RateLimitManager?.Dispose();

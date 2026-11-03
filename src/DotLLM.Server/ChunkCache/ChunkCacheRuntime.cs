@@ -7,8 +7,35 @@ namespace DotLLM.Server.ChunkCache;
 /// Per-server chunk-cache state: the (read-only) chunk store and the identity of the loaded model, computed once per model
 /// (single flight; a failure is cached too). Thread-safe. Holds no request data.
 /// </summary>
-internal sealed class ChunkCacheRuntime
+internal sealed class ChunkCacheRuntime : IDisposable
 {
+    private ChunkStoreService? _writer;
+
+    /// <summary>The store's sole writer (<c>--chunk-store-write</c>), once <see cref="StartWriter"/> ran; else null (read-only).</summary>
+    internal ChunkStoreService? Writer => Volatile.Read(ref _writer);
+
+    /// <summary>
+    /// Starts the sole writer for <paramref name="state"/>'s options at server startup (once; later calls return the running
+    /// one). Null when <c>--chunk-store-write</c> is off.
+    /// </summary>
+    /// <param name="state">The server.</param>
+    /// <param name="host">The model the worker encodes on; null = the server's own (<see cref="ServerChunkEncodeHost"/>).</param>
+    /// <returns>The writer or null.</returns>
+    /// <exception cref="InvalidServerOptionException">Another server owns the store, or it cannot be created.</exception>
+    internal ChunkStoreService? StartWriter(ServerState state, IChunkEncodeHost? host = null)
+    {
+        var options = state.Options.ChunkCache;
+        if (!options.Enabled || !options.StoreWrite)
+            return null;
+        lock (_storeGate)
+        {
+            return _writer ??= ChunkStoreService.Start(options, host ?? new ServerChunkEncodeHost(state));
+        }
+    }
+
+    /// <summary>Stops the writer (worker and ownership).</summary>
+    public void Dispose() => Interlocked.Exchange(ref _writer, null)?.Dispose();
+
     private readonly object _storeGate = new();
     private readonly object _identityGate = new();
     private IChunkStore? _store;
