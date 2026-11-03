@@ -73,6 +73,52 @@ the engine's K/V output. Two layers capture that:
   `lines-512` waits in `PendingE4c` for its eligibility gate), the wire hash (`sha256:` + lowercase hex of the UTF-8 text) and `VerifyRoundTrip`, which re-encodes
   each chunk's text and reports the chunks whose ids differ.
 
+## On-disk store
+
+`IChunkStore` (`TryGet`, `Put`, `Contains`, `Evict`, `Keys`, `TotalBytes`) and `FileChunkStore`, one file per entry at
+`root/<hex[0..2]>/<hex>.ckv`.
+
+- **Format** (little-endian, `FileChunkStore.FormatVersion` = 2): magic `CKVS`, version, KV dtype, the 64-byte key, model
+  fingerprint, **backend tag**, token count, layer count, per-layer K and V element counts, payload size; then the token ids,
+  K of every layer, V of every layer. For Qwen3-4B (36 layers, 8 KV heads, head dim 128) F32 K+V cost 8,192 bytes per token
+  per layer: a 512-token chunk is ≈ 144 MiB.
+- **Atomic writes.** `Put` writes a unique temp file in the shard directory, flushes it, then renames it over the final
+  name; a crash or a concurrent writer never leaves a partial `.ckv` at the final path. `SweepTempFiles(olderThan)` removes
+  temp files a crashed writer left behind; `GetStats()` counts entries and temp files separately.
+- **Reads are validated.** A read memory-maps the file and checks magic, version, dtype, key, backend tag and the exact file
+  length. Truncation, trailing bytes, another version (including version 1, which had no backend tag), another key's file
+  or an unsupported dtype is a **miss**, never a wrong hit. `Contains` and `TryReadFingerprint` read the header only.
+- **Busy destination** (Windows cannot replace a mapped file): if the destination is already a valid entry for the key,
+  `Put` returns; if it is invalid and still held by a reader, `Put` throws `ChunkStoreBusyException` at once and stores
+  nothing (no retry loop; a later `Put` repairs it).
+- **Backend tag.** The store reports the tag as written; a reader compares it with its own backend. CPU and other-backend
+  entries never mix: the backend is in the key and in the header.
+- `FileChunkStore.OpenExisting(root)` opens without creating the directory (read-only consumers).
+- `FileChunkStore` takes no lock: each put is atomic on its own. Locks for writers that share a root with eviction come
+  with the chunk index (later PR).
+
+## Store-backed assembly
+
+`StoredContextAssembler.Assemble(chunks, model, store, destination?, query, @namespace)` returns
+`StoredAssembly(Context, Stats, Entries)`:
+
+- **Lookup**: each chunk under `KeyOf(config, ids, @namespace)` (isolated positioning, the assembler's backend, F32).
+- **Counts**: `AssemblyStats(Hits, Misses, EncodedTokens, Repeats)`, with `Hits + Misses + Repeats` = chunk count; a key
+  that repeats within one call reuses the first entry (no read, no encode).
+- **Hit check**: a hit must carry this fingerprint, this backend, exactly the chunk's token ids and one `[n, stride(l)]` K and
+  V array per KV layer. A well-formed entry that fails is evicted, re-encoded and replaced (`Rejected`).
+- **Store failures are misses**: a damaged, truncated, old-format or foreign entry is re-encoded and stored. If the store
+  cannot write (`ChunkStoreBusyException` on put, an I/O or access error evicting a rejected entry) the fresh entry is used
+  unstored and counted in `StoreFailures`. A store-lock timeout (`ChunkStoreLockTimeoutException`) propagates.
+- **Validation first**: chunks, model identity, namespace and destination (exact host F32, layer count, strides, capacity)
+  are checked before any store read or encode; on a throw the destination is unchanged.
+- **Non-empty destination**: chunks are appended at `CurrentLength` (`DestinationOffset`); keys are re-rotated to those
+  absolute positions.
+- **Identity contract.** `new StoredContextAssembler(fingerprint, tokenizerId)` trusts the caller: a fingerprint that does
+  not belong to the model passed to `Assemble` would store one model's K/V under another's keys (store poisoning).
+  `StoredContextAssembler.ForModel(config, modelId, quant, tokenizerId)` keeps the fingerprint inputs and refuses a model
+  whose configuration does not reproduce the fingerprint; use content-based ids (`GgufIdentity`) for `modelId`.
+- **Isolated encodes only**: entries must be `ChunkEncoder` outputs of the chunk alone at `0..n-1`.
 ## Exactness
 
 Assembly is the "naive concatenation" cache: each chunk's K/V are exact for the chunk alone, with correct positions, but
