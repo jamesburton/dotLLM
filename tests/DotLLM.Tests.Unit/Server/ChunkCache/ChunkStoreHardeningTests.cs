@@ -205,7 +205,9 @@ public sealed class ChunkStoreHardeningTests : IDisposable
         string root = NewRoot();
         var host = new FakeHost();
         var s = Start(root, host);
-        s.Queue.QuietPeriod = TimeSpan.FromSeconds(4); // wide margin: a stalled runner must not fake a quiet gap
+        // Quiet period 2.5 s against activity every 200-450 ms, observed for 4 s (longer than the quiet period, so a worker
+        // that ignores the activity encodes inside the window); a correct one fails only if the runner stalls over 2 s.
+        s.Queue.QuietPeriod = TimeSpan.FromSeconds(2.5);
         using var stop = new CancellationTokenSource();
         var toggler = Task.Run(async () =>
         {
@@ -219,7 +221,7 @@ public sealed class ChunkStoreHardeningTests : IDisposable
             }
         });
         Admitted(s, Text('g'), KeyFor(Text('g')));
-        await Task.Delay(2500);
+        await Task.Delay(4000);
         Assert.Equal(0, host.Encodes);
         stop.Cancel();
         await toggler;
@@ -235,7 +237,9 @@ public sealed class ChunkStoreHardeningTests : IDisposable
         string root = NewRoot();
         var host = new FakeHost();
         var s = Start(root, host);
-        s.Queue.QuietPeriod = TimeSpan.FromSeconds(4); // wide margin: a stalled runner must not fake a quiet gap
+        // Quiet period 2.5 s against activity every 200-450 ms, observed for 4 s (longer than the quiet period, so a worker
+        // that ignores the activity encodes inside the window); a correct one fails only if the runner stalls over 2 s.
+        s.Queue.QuietPeriod = TimeSpan.FromSeconds(2.5);
         using var stop = new CancellationTokenSource();
         var bumper = Task.Run(async () =>
         {
@@ -246,7 +250,7 @@ public sealed class ChunkStoreHardeningTests : IDisposable
             }
         });
         Admitted(s, Text('q'), KeyFor(Text('q')));
-        await Task.Delay(2000);
+        await Task.Delay(4000);
         Assert.Equal(0, host.Encodes);
         stop.Cancel();
         await bumper;
