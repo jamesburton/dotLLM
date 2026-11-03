@@ -95,4 +95,68 @@ public sealed class VulkanNvfp4MoeIndexedTests
             Assert.True(Math.Sqrt(num / den) > 0.2, $"fixture cannot tell '{name}' from correct");
         }
     }
+
+    [SkippableTheory]
+    [InlineData(7, 100, 64)]
+    [InlineData(12, 200, 256)]
+    [InlineData(16, 70, 2048)]   // Flint hidden
+    public void GroupedCoopmat_AppliesPerExpertScale(int numExperts, int m, int k)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Nvfp4), "needs wave64 coopmat");
+        var rng = new Random(0x1580 + numExperts * 7 + m + k);
+        long rowBytes = (long)(k / 64) * 36;
+        byte[] bank = new byte[(long)numExperts * m * rowBytes];
+        rng.NextBytes(bank);
+        for (long off = 0; off < bank.Length; off += 36)
+            for (int sb = 0; sb < 4; sb++) bank[off + sb] = (byte)rng.Next(0x18, 0x30);
+        float[] deq = new float[(long)numExperts * m * k];
+        unsafe { fixed (byte* p = bank) Dequantize.ToFloat32((nint)p, deq.Length, QuantizationType.NVFP4, deq); }
+
+        int[] counts = new int[numExperts];
+        for (int e = 0; e < numExperts; e++) counts[e] = e % 5 == 3 ? 0 : rng.Next(1, 40);
+        uint[] offsets = new uint[numExperts + 1];
+        for (int e = 0; e < numExperts; e++) offsets[e + 1] = offsets[e] + (uint)counts[e];
+        int rows = (int)offsets[numExperts];
+        float[] scale = new float[numExperts];
+        for (int e = 0; e < numExperts; e++) scale[e] = 0.3f + 5.7f * e / Math.Max(1, numExperts - 1);
+        float[] x = new float[rows * k];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var expected = new float[rows * m];
+        var noScale = new float[rows * m];
+        var expert0 = new float[rows * m];
+        for (int e = 0; e < numExperts; e++)
+            for (uint r = offsets[e]; r < offsets[e + 1]; r++)
+                for (int o = 0; o < m; o++)
+                {
+                    double acc = 0; long wb = ((long)e * m + o) * k;
+                    for (int j = 0; j < k; j++) acc += deq[wb + j] * x[r * k + j];
+                    expected[r * m + o] = (float)(acc * scale[e]);
+                    noScale[r * m + o] = (float)acc;
+                    expert0[r * m + o] = (float)(acc * scale[0]);
+                }
+
+        using var kernel = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Nvfp4);
+        using var bankBuf = device.Allocate(bank.Length);
+        using var xBuf = device.Allocate((long)x.Length * sizeof(float));
+        using var offBuf = device.Allocate((long)offsets.Length * sizeof(uint));
+        using var yBuf = device.Allocate((long)expected.Length * sizeof(float));
+        using var sBuf = device.Allocate((long)scale.Length * sizeof(float));
+        device.Upload(bank, bankBuf); device.Upload(x, xBuf); device.Upload(MemoryMarshal.AsBytes<uint>(offsets), offBuf); device.Upload(scale, sBuf);
+        kernel.Launch(bankBuf, xBuf, offBuf, yBuf, sBuf, applyScale: true, m, k, rows, numExperts, maxRowsPerExpert: counts.Max());
+        float[] actual = new float[expected.Length];
+        device.Download(yBuf, actual);
+
+        double num = 0, den = 0, numNo = 0, numE0 = 0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            double d = actual[i] - expected[i]; num += d * d; den += (double)expected[i] * expected[i];
+            numNo += (noScale[i] - expected[i]) * (double)(noScale[i] - expected[i]);
+            numE0 += (expert0[i] - expected[i]) * (double)(expert0[i] - expected[i]);
+        }
+        Assert.True(Math.Sqrt(num / den) < 0.01, $"grouped kernel rel err {Math.Sqrt(num / den)} (F16 operands: ~1e-3 expected)");
+        Assert.True(Math.Sqrt(numNo / den) > 0.2 && Math.Sqrt(numE0 / den) > 0.2, "fixture cannot tell a missing / expert-0 scale from correct");
+    }
 }
