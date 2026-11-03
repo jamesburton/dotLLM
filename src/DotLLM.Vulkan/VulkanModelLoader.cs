@@ -95,7 +95,11 @@ public static class VulkanModelLoader
 
         // #1038: Vulkan NVFP4 runs on the Nemotron-H path only (packed matmul + X.scale). Every other
         // architecture would widen it and drop the scale, so refuse before any upload.
-        if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
+        // #1579: the generic VulkanTransformerModel (default arm below; Flint, MiMo-V2, dense llama-style) also applies NVFP4 scales; the shared
+        // loader still refuses any scale it cannot apply.
+        if (config.Architecture is (Architecture.Qwen3MoeHybrid or Architecture.Lfm2Moe or Architecture.Qwen3HybridDense
+                                    or Architecture.Qwen4Exp or Architecture.Mamba3)
+            || config.MlaConfig is not null || config.Gemma4DualFfn || config.PerLayerEmbedding is not null)
             Nvfp4Support.RejectAny(gguf.TensorsByName, "Vulkan");
 
         switch (config.Architecture)

@@ -173,7 +173,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                                                          || config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2) && config.Moe is not null
             ? static _ => (true, true, true)
             : null;
-        var weights = TransformerWeights.LoadFromGguf(gguf, config, moeBankSkipSelector: skipRoutedF32, allowNanoQuant: true);
+        var weights = TransformerWeights.LoadFromGguf(gguf, config, moeBankSkipSelector: skipRoutedF32, allowNanoQuant: true,
+                                                      allowNvfp4Scales: true);
         // Route through the shared state builder so the GGUF path gets the same
         // per-attention-type RoPE tables, partial-rotary handling, and distinct
         // per-layer head-dim scratch sizing as the safetensors path (Gemma 4 needs
@@ -1074,7 +1075,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 packedLegacyExperts: Config.Architecture == DotLLM.Core.Configuration.Architecture.Flint,
                 sharedGateRaw: moe.SharedGateRaw, sharedGateRawQt: moe.SharedGateRawQt,
                 sharedUpRaw: moe.SharedUpRaw, sharedUpRawQt: moe.SharedUpRawQt,
-                sharedDownRaw: moe.SharedDownRaw, sharedDownRawQt: moe.SharedDownRawQt);
+                sharedDownRaw: moe.SharedDownRaw, sharedDownRawQt: moe.SharedDownRawQt,
+                gateExpsScale: moe.GateExpsScale, upExpsScale: moe.UpExpsScale, downExpsScale: moe.DownExpsScale,
+                sharedGateScale: moe.SharedGateScale, sharedUpScale: moe.SharedUpScale, sharedDownScale: moe.SharedDownScale);
         }
         finally
         {
@@ -4203,7 +4206,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Gemv(nint weights, QuantizationType qt, float* x, float* y, int m, int k)
     {
-        if (qt == QuantizationType.Q8_0)
+        if (qt == QuantizationType.NVFP4)
+            GemmNvfp4Scaled(weights, x, y, m, k, 1);
+        else if (qt == QuantizationType.Q8_0)
             MatMul.GemvQ8_0((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q5_0)
             MatMul.GemvQ5_0((byte*)weights, x, y, m, k, _threadPool);
@@ -4250,6 +4255,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     {
         if (qt == QuantizationType.LittleBit)
             GemmLittleBit(weights, b, c, m, k, n);
+        else if (qt == QuantizationType.NVFP4)
+            GemmNvfp4Scaled(weights, b, c, m, k, n);
         else if (qt == QuantizationType.Q8_0)
             MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q5_0)
@@ -4289,6 +4296,18 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // all n columns, row-parallel over the pool — bit-identical to the serial per-token
             // fallback it replaces, just not single-threaded any more (#263).
             MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, _threadPool);
+    }
+
+    /// <summary>
+    /// NVFP4 projection (#1578): the NVFP4 x Q8_0 GEMM, then the weight's per-tensor second-level scale
+    /// (<c>X.scale</c>, from <see cref="TransformerWeights.WeightScales"/>) multiplied into the output, as llama.cpp's
+    /// <c>build_lora_mm</c> does (<c>res = mul_mat(w, x) * w_s</c>). A weight without a scale entry is left unscaled.
+    /// </summary>
+    private void GemmNvfp4Scaled(nint weights, float* b, float* c, int m, int k, int n)
+    {
+        MatMul.GemmNvfp4((byte*)weights, b, c, m, k, n, _threadPool);
+        if (_weights.WeightScales is { } scales && scales.TryGetValue(weights, out float scale))
+            MoeSwiGluMlp.ScaleInPlace(c, (long)n * m, scale);
     }
 
     private DotLLM.Cpu.Kernels.Experimental.LittleBitScratch[]? _littleBitScratch;

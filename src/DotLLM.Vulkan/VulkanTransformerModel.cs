@@ -280,6 +280,12 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     private MatMulQ4_0MmvqKernel? _matmulQ4_0Mmvq;
     private MatMulQ4_0GemmCoopmatKernel? _matmulQ4_0GemmCoopmat;
     // Native Q4_1 (issue #1171, Recursive Flint): the same four kernel classes on the 20-byte block (value d * nibble + m).
+    // Native NVFP4 (#1579): 36-byte blocks of 64, read in place; scalar GEMV/GEMM and the coopmat GEMM apply the per-tensor X.scale
+    // (VulkanNvfp4Scales) to the output. Routed banks use the indexed kernel with a per-expert scale buffer.
+    private MatMulNvfp4F32Kernel? _matmulNvfp4;
+    private MatMulNvfp4GemmCoopmatKernel? _matmulNvfp4Coopmat;
+    private MoeIndexedMatmulNvfp4F32Kernel? _moeIndexedNvfp4;
+    private MoeGroupedMatmulLegacyQuantCoopmatKernel? _grpNvfp4;
     private MatMulQ4_0GemvF32Kernel? _matmulQ4_1;
     private MatMulQ4_0GemmF32Kernel? _matmulQ4_1Gemm;
     private MatMulQ4_0MmvqKernel? _matmulQ4_1Mmvq;
@@ -1840,7 +1846,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                     ? (r.Gate, r.Up, r.Down)
                     : (false, false, false),
                 skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
-            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config));
+            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config),
+                allowNvfp4Scales: true);
             return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf);
         }
         catch
@@ -1879,7 +1886,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 ? (r.Gate, r.Up, r.Down)
                 : (false, false, false),
             skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
-            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config));
+            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config),
+            allowNvfp4Scales: true);
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 
@@ -2614,6 +2622,15 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 if (model._matmulQ4_0MmqCm1 is null) model._matmulQ4_0Mmq = MatMulQ4_0MmqKernel.TryCreate(device, spvDir);
             }
             model.Q4_0PrefillQ8_1 = q40Prefill != "0";
+        }
+        if (File.Exists(Path.Combine(spvDir, "matmul_nvfp4_f32_gemv.spv")))
+        {
+            model._matmulNvfp4 = MatMulNvfp4F32Kernel.Create(device, spvDir);
+            model._matmulNvfp4Coopmat = MatMulNvfp4GemmCoopmatKernel.TryCreate(device, spvDir);
+            if (hasMoe && File.Exists(Path.Combine(spvDir, "moe_indexed_matmul_nvfp4_f32.spv")))
+                model._moeIndexedNvfp4 = MoeIndexedMatmulNvfp4F32Kernel.Create(device, spvDir);
+            if (hasMoe && MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Nvfp4))
+                model._grpNvfp4 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Nvfp4);
         }
         if (File.Exists(Path.Combine(spvDir, "matmul_q4_1_f32_gemv.spv")))
         {
@@ -5534,6 +5551,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ4_0Gemm?.InvalidateDescriptorCache();
         _matmulQ4_0Mmvq?.InvalidateDescriptorCache();
         _matmulQ4_0GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulNvfp4?.InvalidateDescriptorCache();
+        _matmulNvfp4Coopmat?.InvalidateDescriptorCache();
+        _moeIndexedNvfp4?.InvalidateDescriptorCache();
+        _grpNvfp4?.InvalidateDescriptorCache();
         _matmulQ4_1?.InvalidateDescriptorCache();
         _matmulQ4_1Gemm?.InvalidateDescriptorCache();
         _matmulQ4_1Mmvq?.InvalidateDescriptorCache();
@@ -7189,11 +7210,11 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             RecordMoeIndexedMatmul(cmdBuf,
                 moeW.W1Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
                 moeW.W1DeviceQuantType,
-                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+                m: interm, k: hidden, n: expandedRows, numExperts: numE, expertScale: moeW.W1Scale);
             RecordMoeIndexedMatmul(cmdBuf,
                 moeW.W3Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
                 moeW.W3DeviceQuantType,
-                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+                m: interm, k: hidden, n: expandedRows, numExperts: numE, expertScale: moeW.W3Scale);
             BarrierComputeToCompute(cmdBuf);
             ProfSample("moe_gateup_scalar");
             if (gptOssMoe is not null && !_gptOssDbg.NoExpertBias)
@@ -7227,7 +7248,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             RecordMoeIndexedMatmul(cmdBuf,
                 moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
                 moeW.W2DeviceQuantType,
-                m: hidden, k: interm, n: expandedRows, numExperts: numE);
+                m: hidden, k: interm, n: expandedRows, numExperts: numE, expertScale: moeW.W2Scale);
             BarrierComputeToCompute(cmdBuf);
             ProfSample("moe_down_scalar");
             if (gptOssMoe?.DownBias is { } db && !_gptOssDbg.NoExpertBias)
@@ -7370,6 +7391,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             QuantType.Q6_K => _grpQ6K is not null && (k % MoeGroupedMatmulKQuantCoopmatKernel.KGroup) == 0,
             QuantType.Q8_0 => _grpQ8_0 is not null && (k % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0,
             QuantType.MXFP4 => _grpMxfp4 is not null && (k % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0,
+            QuantType.NVFP4 => _grpNvfp4 is not null && (k % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0,
             _ => MoeIqFormats.FromQuantizationType(qt) is { } f && _grpIq.TryGetValue(f, out var gk) && (k % gk.KGroup) == 0,
         };
 
@@ -7585,7 +7607,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     }
 
     private void RecordGroupedQuantProjection(nint cmdBuf, QuantType qt, VulkanDevice.Buffer bank, VulkanDevice.Buffer packedIn,
-        VulkanDevice.Buffer packedOut, int argsOffset, int m, int k, int rows, int numE, VulkanDevice.Buffer? bias)
+        VulkanDevice.Buffer packedOut, int argsOffset, int m, int k, int rows, int numE, VulkanDevice.Buffer? bias,
+        VulkanDevice.Buffer? expertScale = null)
     {
         var offsets = _state.MoeExpertOffsets!;
         var args = _state.MoeGroupDispatchArgs!;
@@ -7599,6 +7622,12 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             case QuantType.MXFP4:
                 _grpMxfp4!.RecordIndirect(cmdBuf, bank, packedIn, offsets, packedOut, bias ?? _state.MoeTopkWeights!, false, args, argsOffset, m, k, rows, numE,
                     applyBias: bias is not null);
+                break;
+            case QuantType.NVFP4:
+                // #1579: packed bank read in place; ffn_*_exps.scale[expert] multiplies the accumulator in the epilogue.
+                _grpNvfp4!.RecordIndirect(cmdBuf, bank, packedIn, offsets, packedOut,
+                    expertScale ?? throw new InvalidOperationException("NVFP4 grouped MoE needs its per-expert scale buffer."), true, args, argsOffset, m, k, rows, numE);
+                Nvfp4MoeGroupedCount++;
                 break;
             default:
                 if (MoeIqFormats.FromQuantizationType(qt) is { } iqf && _grpIq.TryGetValue(iqf, out var iqg))
@@ -7637,9 +7666,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         KernelSupport.ComputeToIndirectAndComputeBarrier(cmdBuf);
 
         RecordGroupedQuantProjection(cmdBuf, moeW.W1DeviceQuantType, moeW.W1Bank, _state.MoeGroupedHidden!, _state.MoeGroupedGateInter!, 0,
-            interm, hidden, expandedRows, numE, bias ? g!.GateBias : null);
+            interm, hidden, expandedRows, numE, bias ? g!.GateBias : null, moeW.W1Scale);
         RecordGroupedQuantProjection(cmdBuf, moeW.W3DeviceQuantType, moeW.W3Bank, _state.MoeGroupedHidden!, _state.MoeGroupedUpInter!, 0,
-            interm, hidden, expandedRows, numE, bias ? g!.UpBias : null);
+            interm, hidden, expandedRows, numE, bias ? g!.UpBias : null, moeW.W3Scale);
         BarrierComputeToCompute(cmdBuf);
         ProfSample("moe_gateup_grouped");
 
@@ -7655,7 +7684,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         // stay far below the F16 range).
         bool downScaled = !(bias && g!.DownBias is not null) && RecordRowPow2Downscale(cmdBuf, _state.MoeSiluInter!, expandedRows, interm);
         RecordGroupedQuantProjection(cmdBuf, moeW.W2DeviceQuantType, moeW.W2Bank, _state.MoeSiluInter!, _state.MoeGroupedHidden!,
-            MoeBuildTileListKernel.ArgsStrideBytes, hidden, interm, expandedRows, numE, bias ? g!.DownBias : null);
+            MoeBuildTileListKernel.ArgsStrideBytes, hidden, interm, expandedRows, numE, bias ? g!.DownBias : null, moeW.W2Scale);
         BarrierComputeToCompute(cmdBuf);
         if (downScaled) RecordRowScaleMul(cmdBuf, _state.MoeGroupedHidden!, expandedRows, hidden);
         ProfSample("moe_down_grouped");
@@ -7696,6 +7725,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         QuantType.Q6_K => _grpQ6K!.MTiles(m),
         QuantType.Q8_0 => _grpQ8_0!.MTiles(m),
         QuantType.MXFP4 => _grpMxfp4!.MTiles(m),
+        QuantType.NVFP4 => _grpNvfp4!.MTiles(m),
         _ => _grpIq[MoeIqFormats.FromQuantizationType(qt) ?? throw new InvalidOperationException($"No grouped MoE kernel for {qt}.")].MTiles(m),
     };
 
@@ -7938,13 +7968,31 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     /// </remarks>
     private const int TiledMinRows = 32;
 
+    /// <summary>NVFP4 dense projections dispatched (test hook, #1579).</summary>
+    internal long Nvfp4MatmulCount { get; private set; }
+
+    /// <summary>NVFP4 routed-bank grouped coopmat projections dispatched (test hook, #1579).</summary>
+    internal long Nvfp4MoeGroupedCount { get; private set; }
+
+    /// <summary>NVFP4 routed-bank indexed matmuls dispatched (test hook, #1579).</summary>
+    internal long Nvfp4MoeIndexedCount { get; private set; }
+
     private void RecordMoeIndexedMatmul(
         nint cmdBuf,
         VulkanDevice.Buffer bank, VulkanDevice.Buffer x,
         VulkanDevice.Buffer indices, VulkanDevice.Buffer y,
         QuantizationType weightQt,
-        int m, int k, int n, int numExperts)
+        int m, int k, int n, int numExperts, VulkanDevice.Buffer? expertScale = null)
     {
+        if (weightQt == QuantizationType.NVFP4)
+        {
+            // #1579: packed bank read in place; the per-expert ffn_*_exps.scale is applied in the kernel epilogue.
+            if (_moeIndexedNvfp4 is null || expertScale is null)
+                throw new InvalidOperationException("NVFP4 MoE indexed matmul kernel or its per-expert scale buffer is missing.");
+            _moeIndexedNvfp4.Record(cmdBuf, bank, x, indices, y, expertScale, m: m, k: k, n: n, numExperts: numExperts);
+            Nvfp4MoeIndexedCount++;
+            return;
+        }
         if (weightQt == QuantizationType.Q8_0)
         {
             if (_moeIndexedMatmulQ8 is null)
@@ -8787,6 +8835,20 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
+        // NVFP4 (#1579): read in place by the packed kernels; the per-tensor X.scale multiplies the F32 output. Taken before the small-row
+        // and IQ F16-scratch arms below, which would otherwise expand the weight (CLAUDE.md rule 2) or drop the scale.
+        if (weightQt == QuantType.NVFP4)
+        {
+            float scale = VulkanNvfp4Scales.Get(weights);
+            if (seqLen > 1 && _matmulNvfp4Coopmat is not null)
+                _matmulNvfp4Coopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen, scale: scale);
+            else
+                (_matmulNvfp4 ?? throw new InvalidOperationException("NVFP4 matmul kernel was not created."))
+                    .Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen, scale: scale);
+            Nvfp4MatmulCount++;
+            return;
+        }
+
         // Small-row multi-column GEMVs (#996): 2..4 rows read the weights once instead of running the prefill GEMM / MMQ.
         if (seqLen > 1 && TryRecordSmallRowGemv(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen))
             return;
@@ -9825,6 +9887,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ4_0?.Dispose();
         _matmulQ4_0Mmvq?.Dispose();
         _matmulQ4_0GemmCoopmat?.Dispose();
+        _matmulNvfp4?.Dispose();
+        _matmulNvfp4Coopmat?.Dispose();
+        _moeIndexedNvfp4?.Dispose();
+        _grpNvfp4?.Dispose();
         _matmulQ4_1Gemm?.Dispose();
         _matmulQ4_1?.Dispose();
         _matmulQ4_1Mmvq?.Dispose();

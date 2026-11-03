@@ -164,9 +164,12 @@ public static unsafe partial class MatMul
     /// <param name="k">Contraction length; a multiple of 64.</param>
     /// <param name="n">Input rows (tokens).</param>
     /// <param name="pool">Thread pool; <see langword="null"/> runs serially.</param>
+    /// <param name="preQuantizedInput">Optional Q8_0 rows of <paramref name="b"/> (<c>n × k / 32</c> 34-byte blocks, as
+    /// <see cref="QuantizeF32ToQ8_0"/> writes them); when non-null the quantization step is skipped.</param>
     /// <exception cref="ArgumentException"><paramref name="k"/> is not a multiple of 64.</exception>
     [SkipLocalsInit]
-    public static void GemmNvfp4(byte* weights, float* b, float* c, int m, int k, int n, ComputeThreadPool? pool)
+    public static void GemmNvfp4(byte* weights, float* b, float* c, int m, int k, int n, ComputeThreadPool? pool,
+                                 byte* preQuantizedInput = null)
     {
         if (k % QuantFormat.Nvfp4GroupSize != 0)
             throw new ArgumentException($"NVFP4 k must be a multiple of {QuantFormat.Nvfp4GroupSize}, got {k}", nameof(k));
@@ -176,13 +179,15 @@ public static unsafe partial class MatMul
         int q8RowBytes = blockCount * Nvfp4Q8Blocks * Q8_0BlockBytes;
         int wRowBytes = blockCount * Dequantize.Nvfp4BlockBytes;
 
-        byte[] rented = ArrayPool<byte>.Shared.Rent(checked(n * q8RowBytes));
+        byte[]? rented = preQuantizedInput is null ? ArrayPool<byte>.Shared.Rent(checked(n * q8RowBytes)) : null;
         try
         {
-            fixed (byte* q8 = rented)
+            fixed (byte* q8Rented = rented)
             {
-                for (int t = 0; t < n; t++)
-                    QuantizeF32ToQ8_0(b + (long)t * k, q8 + (long)t * q8RowBytes, k);
+                byte* q8 = preQuantizedInput is null ? q8Rented : preQuantizedInput;
+                if (preQuantizedInput is null)
+                    for (int t = 0; t < n; t++)
+                        QuantizeF32ToQ8_0(b + (long)t * k, q8 + (long)t * q8RowBytes, k);
 
                 var ctx = new Nvfp4GemmCtx
                 {
@@ -197,8 +202,20 @@ public static unsafe partial class MatMul
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
         }
+    }
+
+    /// <summary>
+    /// Decode row kernel (the <c>ComputeRows</c> shape the MoE n=1 path dispatches): <paramref name="m"/> consecutive NVFP4 rows of
+    /// <paramref name="blockCount"/> blocks against one Q8_0-quantized activation. Each row is the same
+    /// <see cref="VecDotNvfp4Q8_0"/> the GEMM column uses, so the result is bit-identical to <see cref="GemmNvfp4"/>.
+    /// </summary>
+    internal static void ComputeRowsNvfp4(byte* w, byte* xQ8, float* result, int m, int blockCount)
+    {
+        long rowBytes = (long)blockCount * Dequantize.Nvfp4BlockBytes;
+        for (int r = 0; r < m; r++)
+            result[r] = VecDotNvfp4Q8_0(w + r * rowBytes, xQ8, blockCount);
     }
 
     private struct Nvfp4GemmCtx

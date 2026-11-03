@@ -105,9 +105,26 @@ NVIDIA FP4. A tensor `X.weight` stored as NVFP4 usually has a sibling `X.scale`
 (llama.cpp `build_lora_mm`: `mul_mat(w, x) * w_s`). In NVIDIA's Nemotron 3.5 Bolt
 GGUF these are about 1e-4, so a loader that drops one is off by ~4 orders of
 magnitude. `Nvfp4Support` makes every GGUF loader name the scales it applies and
-refuse the rest. Today only the Nemotron-H SSM projections (`ssm_in`, `ssm_out`) apply
-them, on CPU, Vulkan and CUDA; every other architecture refuses scaled NVFP4 weights, and
-the Vulkan and CUDA loaders refuse NVFP4 outside Nemotron-H.
+refuse the rest. Scale layouts: a per-tensor scalar `[1]` (attention q/k/v/output, dense
+FFN, shared expert, `output.scale` for an NVFP4 LM head) and a **per-expert vector `[E]`**
+for the routed banks (`ffn_{gate,up,down}_exps.scale`, weights `[in, out, E]`); expert `e`'s
+matmul result is multiplied by `scale[e]` (llama.cpp `build_lora_mm_id`), gate and up
+before the SwiGLU, down before the router weight.
+
+Support matrix (#1579 tracks the rest): **CPU** applies the scalar scales in the generic
+`TransformerModel` (any architecture whose NVFP4 weights are the projections above or the
+LM head) and the per-expert/shared scales in the grouped MoE kernel (Flint, MiMo-V2;
+prefill GEMM and n=1 decode row kernel, bit-identical); an NVFP4 token embedding with a
+scale is still refused. **Vulkan** (#1579) reads NVFP4 in place on the generic
+transformer (Flint verified; dense projections via the packed GEMV / coopmat GEMM with the
+per-tensor scale in the epilogue, routed banks via an indexed GEMV for decode and a grouped
+coopmat GEMM for prefill with the per-expert scale in the epilogue; no F16/F32 copy of any NVFP4
+weight; the shared-expert scalars ride the dense path). MLA, Gemma-4, per-layer-embedding and
+the hybrid-SSM architectures still refuse NVFP4 on Vulkan. **CUDA** applies scales on the
+Nemotron-H SSM projections only and refuses NVFP4 elsewhere (stage 3). Qwen3-hybrid, qwen4exp, LFM2-MoE,
+BERT and gemma-embedding loaders still refuse scaled NVFP4. Measured on
+`RecursiveSI/flint-nvfp4-gguf` (`flint-nvfp4.gguf`): wikitext-2 LF 14 KB, 512 ctx, 5 windows,
+CPU 24.36 +/- 2.94 vs llama.cpp (master dde879bc, `-dev none`) 24.26 +/- 2.91.
 
 The CPU vec_dot pairs NVFP4 with Q8_0 activations (two Q8_0 blocks per NVFP4 block),
 a transcription of llama.cpp's `ggml_vec_dot_nvfp4_q8_0` (scalar + AVX2). Vulkan keeps

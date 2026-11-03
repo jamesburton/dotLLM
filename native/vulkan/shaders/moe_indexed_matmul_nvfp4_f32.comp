@@ -1,0 +1,60 @@
+#version 450
+// MoE indexed expert matmul over a packed NVFP4 expert bank (Flint / any grouped-MoE model with NVFP4 experts, #1579).
+//
+//   y[n, m] = scale[indices[n]] * sum_k dequant_nvfp4(bank[indices[n], m, k]) * x[n, k]
+//
+// Weight layout [numExperts, M, K] row-major, each row stored as NVFP4 blocks (36 bytes / 64 elements, see nvfp4_decode.glsl). The
+// per-EXPERT second-level scale (ffn_*_exps.scale, [E] F32) multiplies the matmul result, as llama.cpp's build_lora_mm_id does.
+// The bank is read in place: no F16/F32 copy.
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank  { uint weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX     { float x[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufIdx   { int indices[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufY     { float y[]; };
+layout(set = 0, binding = 4, std430) readonly  buffer BufScale { float expertScale[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow;
+} pc;
+
+#include "nvfp4_decode.glsl"
+
+void main() {
+    uint m = gl_GlobalInvocationID.x;
+    uint n = gl_GlobalInvocationID.y;
+    if (m >= pc.M || n >= pc.N) return;
+
+    uint expertIdx = uint(clamp(indices[n], 0, int(pc.numExperts) - 1));
+    uint rowBlock0 = (expertIdx * pc.M + m) * pc.blocksPerRow;
+    uint xRow = n * pc.K;
+
+    float acc = 0.0;
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint base = (rowBlock0 + b) * NVFP4_BLOCK_UINTS;
+        uint dw = weight[base];
+        uint xb = xRow + b * NVFP4_GROUP_SIZE;
+        for (uint s = 0u; s < 4u; s++) {
+            float d = ue4m3_half((dw >> (8u * s)) & 0xFFu);
+            float sub = 0.0;
+            for (uint w = 0u; w < 2u; w++) {
+                uint q = weight[base + 1u + 2u * s + w];
+                for (uint t = 0u; t < 4u; t++) {
+                    uint byt = (q >> (8u * t)) & 0xFFu;
+                    uint j = 4u * w + t;
+                    sub += e2m1Doubled(byt & 0xFu) * x[xb + 16u * s + j]
+                         + e2m1Doubled(byt >> 4u) * x[xb + 16u * s + 8u + j];
+                }
+            }
+            acc += d * sub;
+        }
+    }
+    y[n * pc.M + m] = acc * expertScale[expertIdx];
+}

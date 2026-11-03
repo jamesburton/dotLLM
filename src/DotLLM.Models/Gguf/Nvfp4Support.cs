@@ -80,6 +80,36 @@ public static class Nvfp4Support
     }
 
     /// <summary>
+    /// The scale tensors the generic CPU transformer model (#1578, #1579) applies: the per-tensor scalar of every dense,
+    /// attention and LM-head projection, plus - when the architecture's MoE layers go through the grouped quantised MoE kernel
+    /// (<paramref name="groupedMoe"/>) - the per-expert vector of every routed bank and the scalar of every shared projection.
+    /// Scales of other NVFP4 weights (e.g. an NVFP4 token embedding) are not in the set, so
+    /// <see cref="RejectUnappliedScales"/> still refuses a file that carries them.
+    /// </summary>
+    /// <param name="tensors">The GGUF tensor table.</param>
+    /// <param name="groupedMoe">True when routed experts are consumed by the grouped quantised MoE kernel (Flint, MiMo-V2).</param>
+    /// <returns>Scale tensor names the CPU transformer loader consumes.</returns>
+    public static IReadOnlySet<string> ScalesAppliedByCpuTransformer(IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, bool groupedMoe)
+    {
+        ArgumentNullException.ThrowIfNull(tensors);
+        var applied = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string scale in ScalesOfNvfp4Weights(tensors))
+        {
+            string weight = scale[..^ScaleSuffix.Length] + WeightSuffix;
+            bool moeWeight = weight.Contains("_exps.", StringComparison.Ordinal) || weight.Contains("_shexp.", StringComparison.Ordinal);
+            if (IsCpuTransformerScaledWeight(weight) && (groupedMoe || !moeWeight))
+                applied.Add(scale);
+        }
+        return applied;
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex CpuTransformerScaledWeight = new(
+        @"^(output|blk\.\d+\.(attn_q|attn_k|attn_v|attn_output|ffn_gate|ffn_up|ffn_down|ffn_(gate|up|down)_(exps|shexp)))\.weight$",
+        System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    private static bool IsCpuTransformerScaledWeight(string weightName) => CpuTransformerScaledWeight.IsMatch(weightName);
+
+    /// <summary>
     /// Refuses the file when it holds any NVFP4 tensor. For backend paths with no NVFP4 support.
     /// </summary>
     /// <param name="tensors">The GGUF tensor table.</param>

@@ -1187,7 +1187,8 @@ public sealed class ServerState : IDisposable
 
         var schedulerOptions = ServerStartup.ResolveSchedulerOptions(Options);
         Scheduler = new ContinuousBatchSchedulerService(
-            Model, Tokenizer, KvCacheFactory, options: schedulerOptions, pagedPool: PagedFactory.Pool);
+            Model, Tokenizer, KvCacheFactory, options: schedulerOptions, pagedPool: PagedFactory.Pool,
+            prefixCache: PrefixTrieManager);
         StartSchedulerLoop();
     }
 

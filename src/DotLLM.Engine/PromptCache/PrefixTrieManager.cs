@@ -191,6 +191,25 @@ public sealed class PrefixTrieManager : IDisposable
     }
 
     /// <summary>
+    /// Gives back the admission of a sequence that ended without <see cref="RecordCompletion"/> (failed, cancelled): drops the
+    /// bookkeeping entry and the per-node refcounts <see cref="Admit"/> took, so the matched prefix blocks become evictable
+    /// again. Nothing is inserted into the trie. A no-op when the cache was never admitted here or was already recorded.
+    /// Call before disposing the cache.
+    /// </summary>
+    public void Abandon(PagedKvCache cache)
+    {
+        ArgumentNullException.ThrowIfNull(cache);
+        if (_disposed) return;
+        AcquiredPrefix? acquired;
+        lock (_acquiredLock)
+        {
+            _acquired.Remove(cache, out acquired);
+        }
+        if (acquired is not null)
+            _trie.ReleaseNodeRefs(acquired.Blocks);
+    }
+
+    /// <summary>
     /// Registers a named prefix from an already-completed sequence. Currently the
     /// HTTP layer calls this with a synthetic single-shot generation that pre-warmed
     /// the trie; this helper just promotes the existing trie path to "pinned".

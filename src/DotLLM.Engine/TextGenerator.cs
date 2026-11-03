@@ -29,6 +29,7 @@ public sealed partial class TextGenerator
     private readonly ITokenizer _tokenizer;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _kvCacheFactory;
     private readonly PrefixCache? _prefixCache;
+    private readonly int _prefixCacheHeadroomTokens;   // extra rows a cache bound for the prefix cache is sized with (#1591)
     private readonly PrefixTrieManager? _prefixTrieManager;
     private readonly IModel? _draftModel;
     private readonly PromptLookupOptions? _promptLookup;
@@ -238,6 +239,9 @@ public sealed partial class TextGenerator
     /// <param name="promptLookup">Enables prompt-lookup (n-gram) speculative decoding (issue #1293) with these settings: drafts are
     /// copied from earlier context and verified by <paramref name="model"/>, so greedy output is unchanged. Engages only when no
     /// draft model and no MTP round runs, decoding is effectively greedy and logprobs are not requested. Null (default) = off.</param>
+    /// <param name="prefixCacheHeadroomTokens">Extra positions a KV-cache that will be handed to <paramref name="prefixCache"/> is allocated
+    /// with, so the next (longer) turn of the same conversation still fits it and reuses its prefix instead of missing on size
+    /// (issue #1591). Device caches cannot grow in place, so this is the only slack; 0 (default) allocates exactly prompt + max tokens.</param>
     public TextGenerator(IModel model, ITokenizer tokenizer,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? kvCacheFactory = null,
                           PrefixCache? prefixCache = null,
@@ -251,8 +255,11 @@ public sealed partial class TextGenerator
                           bool mtpAdaptive = false,
                           bool recurrentPrefixCache = false,
                           RecurrentPrefixCacheOptions? recurrentPrefixCacheOptions = null,
-                          PromptLookupOptions? promptLookup = null)
+                          PromptLookupOptions? promptLookup = null,
+                          int prefixCacheHeadroomTokens = 0)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(prefixCacheHeadroomTokens);
+        _prefixCacheHeadroomTokens = prefixCacheHeadroomTokens;
         promptLookup?.Validate();
         _promptLookup = promptLookup;
         _model = model;
@@ -980,7 +987,11 @@ public sealed partial class TextGenerator
             ArrayPool<char>.Shared.Return(stopScratch);
             ReleaseRequestMtpState(mtpState);
             if (ownsKvCache)
+            {
+                // A request that fails before RecordCompletion must still give back its trie admission (issue #1589).
+                if (kvCache is KvCache.PagedKvCache abandoned) _prefixTrieManager?.Abandon(abandoned);
                 kvCache.Dispose();
+            }
             telemetry.RequestSpan?.Dispose();
         }
     }
@@ -1549,7 +1560,11 @@ public sealed partial class TextGenerator
             ArrayPool<char>.Shared.Return(stopScratch);
             ReleaseRequestMtpState(mtpState);
             if (ownsKvCache)
+            {
+                // A request that fails before RecordCompletion must still give back its trie admission (issue #1589).
+                if (kvCache is KvCache.PagedKvCache abandoned) _prefixTrieManager?.Abandon(abandoned);
                 kvCache.Dispose();
+            }
         }
     }
 
@@ -1626,6 +1641,16 @@ public sealed partial class TextGenerator
                     case KvCache.PagedKvCache pagedCache:
                         pagedCache.SetCurrentLength(matchedTokens);
                         break;
+                    // A device cache that owns its storage and keeps its rows between requests (the Vulkan single-request path, #1591).
+                    // Only rows the cache actually holds can be reused: the stored sequence ends with the last sampled token, which was
+                    // never forwarded, so a prompt that matches it all would otherwise claim a row nobody wrote. One token stays for the
+                    // prefill, which yields the first sampled token's logits.
+                    case Core.Attention.IPrefixReusableKvCache reusable when reusable.HasExclusiveStorage:
+                        matchedTokens = Math.Min(matchedTokens, Math.Min(reusable.CurrentLength, promptLen - 1));
+                        if (matchedTokens <= 0 || !reusable.CanTruncateTo(matchedTokens))
+                            goto cacheMiss;
+                        reusable.Rollback(matchedTokens);
+                        break;
                     default:
                         // Unsupported cache type for prefix reuse — fall through to allocate fresh
                         goto cacheMiss;
@@ -1636,16 +1661,23 @@ public sealed partial class TextGenerator
                 // causes silent truncation once pos >= MaxLength in the decode loop.
                 int requiredSize = promptLen + maxTokens;
                 if (entry.KvCache.MaxLength >= requiredSize)
+                {
+                    // Prefill is about to overwrite rows matchedTokens.. of this cache. Narrow the entry to the rows that
+                    // stay valid BEFORE any write, so a failed or cancelled request cannot leave it advertising a token
+                    // sequence whose tail rows now hold other tokens' K/V (issue #1589).
+                    _prefixCache.Narrow(entry, matchedTokens);
                     return (entry.KvCache, matchedTokens, false);
+                }
 
                 // Cache too small — fall through to allocate fresh
             }
             cacheMiss:
 
-            // Cache miss or incompatible — allocate with full model context for future reuse
-            int cacheSize = Math.Min(promptLen + maxTokens, _model.Config.MaxSequenceLength);
+            // Cache miss or incompatible — allocate with room for the next, longer prompt of the same conversation
+            // (a cache is only reused while it can hold the whole next request).
+            int cacheSize = Math.Min(promptLen + maxTokens + _prefixCacheHeadroomTokens, _model.Config.MaxSequenceLength);
             var kvCache = AllocateKvCache(cacheSize);
-            return (kvCache, 0, false); // ownsKvCache=false: will be transferred to prefix cache
+            return (kvCache, 0, true); // owned by the request until StoreInPrefixCache hands it to the prefix cache (issue #1589: disposed if the request fails first)
         }
 
         // No prefix cache — allocate normally, caller owns
@@ -1707,6 +1739,12 @@ public sealed partial class TextGenerator
         }
 
         if (_prefixCache == null)
+            return;
+
+        // A cache ResolveKvCache would never adopt again (a quantized host cache, a Vulkan TurboQuant / MLA / pipeline cache, a view
+        // over model-owned storage) is not worth retaining: it would sit in the entry list holding device memory until evicted.
+        if (kvCache is not (SimpleKvCache or KvCache.PagedKvCache)
+            && !(kvCache is Core.Attention.IPrefixReusableKvCache { HasExclusiveStorage: true }))
             return;
 
         // Build full token sequence: prompt + generated
