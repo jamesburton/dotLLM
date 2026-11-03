@@ -119,6 +119,9 @@ public sealed class ChunkStoreServiceTests : IDisposable
             ? ServerLedger.Load(root).Rows.Select(r => r.KeyHex).ToHashSet(StringComparer.Ordinal)
             : [];
 
+    private static string RawLedgerText(string root) =>
+        File.Exists(ServerLedger.DefaultPath(root)) ? File.ReadAllText(ServerLedger.DefaultPath(root)) : "";
+
     /// <summary>Writes a CLI-style index file under the store root that references <paramref name="keys"/>.</summary>
     internal static void WriteIndex(string root, string name, params ChunkKey[] keys)
     {
@@ -560,7 +563,8 @@ public sealed class ChunkStoreServiceTests : IDisposable
         var s = Start(root, new FakeHost(), store: hooked);
         var seenBefore = new List<bool>();
         var lockFreeAfterPut = new List<bool>();
-        hooked.BeforePut = key => seenBefore.Add(LedgerKeysOnDisk(root).Contains(key.Hex));
+        // The raw file, not ServerLedger.Load (which drops a row whose entry file is missing: exactly the state looked for).
+        hooked.BeforePut = key => seenBefore.Add(RawLedgerText(root).Contains(key.Hex, StringComparison.Ordinal));
         hooked.AfterPut = _ =>
         {
             // Another holder (another thread, as a CLI would be another process) tries the store lock right after the put.
