@@ -101,6 +101,20 @@ was made with (a growing chat session needs that on almost every turn). The Vulk
   K and V x 2 B), so 8 GiB at 128k (F32, the A/B baseline: 128 KiB, 16 GiB). A growth step is 25 % of what is held (at least
   1,024 positions), plus one layer's K and V in transit.
 
+### Prefix reuse through a device-owned cache: `IPrefixReusableKvCache` (issue #1591)
+
+Vulkan's single-request path has no paged pool, so the Step 54 `PrefixCache` retains **whole `IKvCache` objects**. A cache that implements
+`IPrefixReusableKvCache` (`VulkanKvCache`, `VulkanQuantizedKvCache`) is adoptable by a later request when it `HasExclusiveStorage` (#1025:
+rows valid only until a forward runs on a different cache otherwise), `CanTruncateTo(n)` (compact sliding-window layers refuse a cut past
+their margin) and is large enough for the next request. `TextGenerator.ResolveKvCache` then clamps the match to
+`min(common prefix, cache.CurrentLength, promptLen - 1)` and `Rollback`s. The `CurrentLength` clamp matters: the stored sequence ends with
+the last sampled token, which was never forwarded, so its row does not exist. The `promptLen - 1` clamp keeps one token to prefill.
+`StoreInPrefixCache` retains only reusable cache types (others were retained until evicted without ever matching). Device caches cannot
+grow in place, so `prefixCacheHeadroomTokens` (1,024 on Vulkan) sizes the retained allocation for the next turn. Unsafe hosts (sinks,
+recurrent state, non-exclusive storage, TurboQuant/MLA/pipeline caches) take a miss. Tests: `PrefixCacheReusableKvTests` (CPU model behind a
+delegating cache; mutants: no CurrentLength clamp, ignored exclusivity flag, ignored `CanTruncateTo`, wrong cached count, no cap, no headroom
+all fail) and `VulkanPrefixReuseTests` (greedy continuation equals a cold prefill on the real model).
+
 ### Vulkan dense-hybrid (Bonsai 2) KV: F16 storage read in place (issue #1102)
 
 `VulkanQwen3HybridDenseTransformerModel` (Bonsai 2, Qwen3.5 / 3.6 dense hybrids) keeps its KV in a lazy, growable

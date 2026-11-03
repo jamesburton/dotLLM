@@ -242,6 +242,9 @@ public sealed class PrefixCacheFailedRequestTests : IClassFixture<PrefixCacheFai
             return (gguf, config, TransformerModel.LoadFromGguf(gguf, config, ThreadingConfig.SingleThreaded));
         }
 
+        /// <summary>The head-dim-16 GGUF the fixture wrote (loadable by the server).</summary>
+        public string GgufPath => Path.Combine(_dir, "qwen3-hd16.gguf");
+
         public ModelConfig Config { get; }
 
         /// <summary>Head dim 16 (8 rotation pairs per head).</summary>
