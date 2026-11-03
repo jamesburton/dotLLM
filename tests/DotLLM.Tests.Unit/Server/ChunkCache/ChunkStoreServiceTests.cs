@@ -445,6 +445,33 @@ public sealed class ChunkStoreServiceTests : IDisposable
     }
 
     /// <summary>
+    /// When evicting every server row still would not make room for an entry, nothing is evicted (the rows and files stay)
+    /// and encoding stops: eviction never throws away entries for a write that cannot happen.
+    /// </summary>
+    [Fact]
+    public void CannotFree_EvictsNothing_KeepsOwnRows()
+    {
+        string root = NewRoot();
+        string cli = Text('c', 200), small = Text('s', 50), big = Text('b', 200);
+        var store = new FileChunkStore(root);
+        store.Put(KeyFor(cli), EntryFor(cli, 4));
+        WriteIndex(root, "cli", KeyFor(cli));
+        var host = new FakeHost();
+        var s = Start(root, host, budget: FileBytes(cli, 4) + FileBytes(small, 4) + 64);
+
+        Admitted(s, small, KeyFor(small), true);
+        Assert.True(s.Queue.WaitDrained(Drain));
+        Assert.True(store.Contains(KeyFor(small)));
+
+        Admitted(s, big, KeyFor(big), true); // needs more than the small row can free
+        Assert.True(s.Queue.WaitDrained(Drain));
+        Assert.Equal(StoreProblems.BudgetExhausted, s.Problem);
+        Assert.True(store.Contains(KeyFor(small)));
+        Assert.Contains(KeyFor(small).Hex, LedgerKeysOnDisk(root));
+        Assert.False(store.Contains(KeyFor(big)));
+    }
+
+    /// <summary>
     /// Budget eviction drops the ledger row of a key a CLI index also references but keeps its file (rule (c)); only an
     /// unreferenced row frees bytes.
     /// </summary>
