@@ -528,5 +528,16 @@ public enum Architecture
     /// RMSNorm before each residual add). Tied LM head. Not a state-space model: only the global layers' KV grows with context.
     /// See issue #1559.
     /// </summary>
-    Lfm3
+    Lfm3,
+
+    /// <summary>
+    /// Zhipu GLM-4.5 MoE (llama.cpp <c>glm4moe</c>, HF <c>Glm4MoeForCausalLM</c> / <c>model_type=glm4_moe</c>; GLM-4.5-Air 106B-A12B, the
+    /// Cerebras REAP-pruned 82B-A12B with 96 routed experts, GLM-4.5 355B-A32B). Plain GQA (96 q / 8 KV heads, head_dim 128) with
+    /// Q/K/V bias and no O bias, partial NeoX RoPE (<c>rope.dimension_count</c> 64 of 128), optional per-head Q/K RMS-norm
+    /// (<c>use_qk_norm</c>: false on Air, true on the 355B), pre-norm blocks (<c>blk.N.post_attention_norm</c> is the pre-FFN norm), sigmoid + selection-bias (<c>exp_probs_b</c>)
+    /// top-8 routing with renormalised weights, one ungated shared expert, <c>leading_dense_block_count</c> = 1 dense SwiGLU layer, and one
+    /// trailing NextN/MTP block counted in <c>block_count</c>. Distinct from GLM-4.7-Flash (<c>deepseek2</c>, MLA).
+    /// Config + tensor census only (issue #1598): no forward pass yet, loaders refuse with <see cref="DotLLM.Core.Models.ModelConfig.Glm4MoeUnsupportedMessage"/>.
+    /// </summary>
+    Glm4Moe
 }

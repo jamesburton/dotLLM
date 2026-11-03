@@ -538,6 +538,22 @@ public record ModelConfig
          + "(Q2_K / IQ1_M / IQ2_*) are not kept packed by the generic MoE path. Use --device cpu. "
          + "Tracked in https://github.com/jamesburton/dotLLM/issues/935 (CPU reference: #936).";
 
+    /// <summary>Actionable refusal for <see cref="Architecture.Glm4Moe"/> (GGUF <c>glm4moe</c>), whose forward pass is not implemented yet.</summary>
+    /// <param name="backend">Backend name shown to the user.</param>
+    /// <returns>The refusal message.</returns>
+    public static string Glm4MoeUnsupportedMessage(string backend)
+        => $"The glm4moe architecture (GGUF 'glm4moe', HF Glm4MoeForCausalLM: GLM-4.5-Air / REAP / GLM-4.5) is recognised but has no forward pass yet (backend: {backend}) - "
+         + "only config extraction and the GGUF tensor census exist (issue #1598). Loading it through a generic loader would run the wrong layer algebra "
+         + "(sigmoid + selection-bias routing, partial NeoX RoPE, QKV bias, shared expert, NextN block) and produce garbage silently, so it is refused. "
+         + "CPU forward is tracked in issue #1599, Vulkan in #1600.";
+
+    /// <summary>
+    /// Per-head Q/K RMS-norm switch carried by the HF <c>use_qk_norm</c> flag (GLM-4.5 355B: true; GLM-4.5-Air: false). <see langword="null"/> means
+    /// "not declared": GGUF metadata has no such key, the loader must discover it from the presence of <c>blk.N.attn_q_norm.weight</c>
+    /// (see <c>Glm4MoeTensorCensus</c>).
+    /// </summary>
+    public bool? UseQkNorm { get; init; }
+
     /// <summary>Actionable message for backends that cannot run <see cref="Architecture.Flint"/> yet.</summary>
     /// <param name="backend">Backend name shown to the user.</param>
     /// <returns>The refusal message.</returns>

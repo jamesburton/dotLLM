@@ -1319,6 +1319,11 @@ internal sealed class TransformerWeights : IDisposable
     /// </exception>
     internal static void ThrowIfArchitectureNeedsDedicatedLoader(ModelConfig config)
     {
+        // glm4moe (#1598): config + census only. The generic Llama-style path would load attn/ffn_gate/up/down but silently drop the
+        // exp_probs_b selection bias, the sigmoid router, the shared expert and the NextN block (and run Norm-paired RoPE): refuse.
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.Glm4Moe)
+            throw new NotSupportedException(ModelConfig.Glm4MoeUnsupportedMessage("any"));
+
         string? why = DedicatedLoaderReason(config);
         if (why is null)
             return;

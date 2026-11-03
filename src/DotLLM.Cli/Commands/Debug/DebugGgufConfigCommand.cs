@@ -50,6 +50,7 @@ internal sealed class DebugGgufConfigCommand : Command<DebugGgufConfigCommand.Se
         table.AddRow("HiddenSize", config.HiddenSize.ToString("N0"));
         table.AddRow("IntermediateSize", config.IntermediateSize.ToString("N0"));
         table.AddRow("NumLayers", config.NumLayers.ToString());
+        table.AddRow("NextnPredictLayers", config.NextnPredictLayers.ToString());
         table.AddRow("NumAttentionHeads", config.NumAttentionHeads.ToString());
         table.AddRow("NumKvHeads", config.NumKvHeads.ToString());
         table.AddRow("HeadDim", config.HeadDim.ToString());
@@ -61,6 +62,7 @@ internal sealed class DebugGgufConfigCommand : Command<DebugGgufConfigCommand.Se
         table.AddRow("NormEpsilon", config.NormEpsilon.ToString("G"));
         table.AddRow("TiedEmbeddings", config.TiedEmbeddings.ToString());
         table.AddRow("SlidingWindowSize", config.SlidingWindowSize?.ToString() ?? "(none)");
+        table.AddRow("PartialRotaryFactor", config.PartialRotaryFactor?.ToString("G") ?? "(none)");
         string chatTemplateDisplay = config.ChatTemplate is not null
             ? (config.ChatTemplate.Length > 80
                 ? string.Concat(config.ChatTemplate.AsSpan(0, 80), "...")
@@ -128,6 +130,7 @@ internal sealed class DebugGgufConfigCommand : Command<DebugGgufConfigCommand.Se
 
             ropeTable.AddRow("Theta", rope.Theta.ToString("G"));
             ropeTable.AddRow("DimensionCount", rope.DimensionCount.ToString());
+            ropeTable.AddRow("Type", rope.Type.ToString());
             ropeTable.AddRow("ScalingType", rope.ScalingType.ToString());
             ropeTable.AddRow("ScalingFactor", rope.ScalingFactor.ToString("G"));
             ropeTable.AddRow("OrigMaxSeqLen", rope.OrigMaxSeqLen.ToString());
@@ -136,6 +139,40 @@ internal sealed class DebugGgufConfigCommand : Command<DebugGgufConfigCommand.Se
             ropeTable.AddRow("BetaSlow", rope.BetaSlow.ToString("G"));
 
             AnsiConsole.Write(ropeTable);
+        }
+
+        if (config.Moe is { } moe)
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.Write(new Rule("[bold yellow]MoE Config[/]").LeftJustified());
+            AnsiConsole.WriteLine();
+
+            var moeTable = new Table().Border(TableBorder.Rounded);
+            moeTable.AddColumn("Property");
+            moeTable.AddColumn("Value");
+            moeTable.AddRow("NumExperts", moe.NumExperts.ToString());
+            moeTable.AddRow("NumExpertsPerTok", moe.NumExpertsPerTok.ToString());
+            moeTable.AddRow("MoeIntermediateSize", moe.MoeIntermediateSize.ToString());
+            moeTable.AddRow("NumSharedExperts", moe.NumSharedExperts.ToString());
+            moeTable.AddRow("SharedExpertIntermediateSize", moe.SharedExpertIntermediateSize?.ToString() ?? "(none)");
+            moeTable.AddRow("SigmoidGating", moe.SigmoidGating.ToString());
+            moeTable.AddRow("HasSelectionBias", moe.HasSelectionBias.ToString());
+            moeTable.AddRow("NormTopKProb", moe.NormTopKProb.ToString());
+            moeTable.AddRow("NormalizeExpertWeights", moe.NormalizeExpertWeights.ToString());
+            moeTable.AddRow("ExpertWeightsScale", moe.ExpertWeightsScale.ToString("G"));
+            moeTable.AddRow("MlpOnlyLayers (leading dense)", moe.MlpOnlyLayers is { Count: > 0 } d ? string.Join(",", d) : "(none)");
+            AnsiConsole.Write(moeTable);
+        }
+
+        if (config.Architecture == Core.Configuration.Architecture.Glm4Moe && config.Moe is not null)
+        {
+            var census = Glm4MoeTensorCensus.Check(config, gguf);
+            AnsiConsole.WriteLine();
+            AnsiConsole.Write(new Rule("[bold yellow]glm4moe tensor census[/]").LeftJustified());
+            AnsiConsole.MarkupLine((census.IsClean ? "[green]clean[/]: " : "[red]MISMATCH[/]: ") + census.ToString().EscapeMarkup());
+            foreach (string m in census.Missing.Take(20)) AnsiConsole.MarkupLine($"[red]missing[/] {m.EscapeMarkup()}");
+            foreach (string m in census.Unexpected.Take(20)) AnsiConsole.MarkupLine($"[yellow]unexpected[/] {m.EscapeMarkup()}");
+            foreach (string m in census.ShapeMismatches.Take(20)) AnsiConsole.MarkupLine($"[red]shape[/] {m.EscapeMarkup()}");
         }
 
         return 0;
