@@ -76,6 +76,34 @@ Differences between architectures are captured entirely in ModelConfig.
 - MlaConfig: latent_dim (e.g., 512), rope_dim (e.g., 64)
 - See [ATTENTION.md](ATTENTION.md) for MLA details
 
+### GLM-4.5 MoE (`glm4moe`: GLM-4.5-Air, Cerebras REAP-82B, GLM-4.5) - config + tensor census only (#1598), STUB
+
+Facts below were read from llama.cpp (`src/models/glm4-moe.cpp`, `src/llama-arch.cpp`, `conversion/glm.py` `Glm4MoeModel`, `llama_model_rope_type`) and
+checked against a header range-read (first 16 MB) of `bartowski/cerebras_GLM-4.5-Air-REAP-82B-A12B-GGUF` IQ4_XS (803 tensors, 47 blocks, 52 KV) and the HF
+`config.json` of `zai-org/GLM-4.5-Air` and `cerebras/GLM-4.5-Air-REAP-82B-A12B` (identical except `n_routed_experts` 128 vs 96).
+
+- **No forward pass.** `GgufModelConfigExtractor`, `HfConfigExtractor` (`Glm4MoeForCausalLM` / `model_type=glm4_moe`) and `Glm4MoeTensorCensus` exist; every loader
+  (`ModelLoader.CreateCpuModelFromGguf`, `TransformerWeights.LoadFromGguf`, `CudaModelLoader`, `VulkanModelLoader`) throws `NotSupportedException`
+  (`ModelConfig.Glm4MoeUnsupportedMessage`) instead of falling into the generic Llama-style path (which would silently drop `exp_probs_b`, the shared expert, the router
+  semantics and the NextN block). CPU forward: #1599; Vulkan: #1600. The synthetic fixture is `SyntheticGlm4MoeGguf`; `debug gguf-config` prints the config, MoE block and census.
+- **GGUF metadata** (prefix `glm4moe.`): `block_count` (= trunk + `nextn_predict_layers`, 47 for Air), `context_length`, `embedding_length`, `feed_forward_length` (dense layer, 10944),
+  `attention.head_count` 96, `attention.head_count_kv` 8 (scalar), `attention.key_length`/`value_length` 128, `attention.layer_norm_rms_epsilon`, `rope.freq_base` 1e6,
+  `rope.dimension_count` **64** (= `int(head_dim * partial_rotary_factor)`, converter default 0.5), `expert_count` 128 (REAP 96), `expert_used_count` 8, `expert_shared_count` 1,
+  `expert_feed_forward_length` 1408, `leading_dense_block_count` 1, `expert_gating_func` 2 (sigmoid; absent/NONE defaults to sigmoid in llama.cpp), `expert_weights_scale` 1.0 (= `routed_scaling_factor`),
+  `expert_weights_norm` true (= `norm_topk_prob`), `nextn_predict_layers` 1. No `rope.scaling.*`, no `expert_group_count` (n_group = 1). `tokenizer.ggml.model = gpt2`, `pre = glm4`.
+  There is NO QK-norm key: Q/K norm is discovered from `blk.N.attn_{q,k}_norm.weight` (llama.cpp: optional tensors); `ModelConfig.UseQkNorm` carries the HF `use_qk_norm` flag (null from GGUF).
+- **Tensors** (GGUF ne-order shapes; Air numbers): `token_embd.weight [4096,151552]`, `output_norm.weight`, `output.weight` (optional; tied to token_embd if absent). Per block: `attn_norm`, `attn_q.weight [4096,12288]` + `attn_q.bias`,
+  `attn_k.weight [4096,1024]` + bias, `attn_v.weight [4096,1024]` + bias, `attn_output.weight [12288,4096]` (no bias), `post_attention_norm.weight` (this is the **pre-FFN** norm = HF `post_attention_layernorm`,
+  not a sandwich post-norm). Dense layer 0: `ffn_gate/up [4096,10944]`, `ffn_down [10944,4096]`. MoE layers: `ffn_gate_inp.weight [4096,E]`, `exp_probs_b.bias [E]`, fused `ffn_{gate,up}_exps.weight [4096,1408,E]`,
+  `ffn_down_exps.weight [1408,4096,E]`, `ffn_{gate,up}_shexp.weight [4096,1408*n_shared]`, `ffn_down_shexp.weight [1408*n_shared,4096]` (no `ffn_gate_inp_shexp`: shared expert is ungated).
+- **NextN lives in the trunk file** (bartowski/unsloth conversions): block `blk.46` (= `block_count`-1) is a full attention+MoE block plus `nextn.eh_proj [8192,4096]`, `nextn.enorm`, `nextn.hnorm`, and (optional) `nextn.embed_tokens`,
+  `nextn.shared_head_head`, `nextn.shared_head_norm`. `ModelConfig.NumLayers` stays trunk-only (46) and `NextnPredictLayers` = 1. ggml-org ships the head as a separate `mtp-*.gguf` instead (trunk file then lacks block 46: not a census error).
+- **RoPE**: `LLAMA_ROPE_TYPE_NEOX` for `LLM_ARCH_GLM4_MOE` (the converter does not permute Q/K: "GLM4V_MOE uses Neox ordering already"), rotated width `n_rot = rope.dimension_count` = 64 of 128. `ModelConfig.RoPEConfig.DimensionCount` = 64 and
+  `ModelConfig.PartialRotaryFactor` = 0.5 are both set; the S1 forward pass must apply the partial rotation once (do not apply both).
+- **MoE semantics** (`build_moe_ffn`): scores = sigmoid(router logits); top-k selection on `scores + exp_probs_b`, gating weights gathered from the UNBIASED scores, renormalised by their sum when `expert_weights_norm`, times `expert_weights_scale`;
+  plus the shared expert added ungated; block output `routed + shared`. Config mapping: `SigmoidGating`, `HasSelectionBias`, `NormalizeExpertWeights`, `ExpertWeightsScale`, `NumSharedExperts`, `SharedExpertIntermediateSize` (= `moe * n_shared`, fused), `MlpOnlyLayers` = `[0..leading_dense)`.
+- GLM-4.7-Flash is a different architecture (`deepseek2`, MLA); dense `glm4` / `Glm4ForCausalLM` is not mapped.
+
 ### gpt-oss (OpenAI gpt-oss-20b / 120b)
 - GGUF arch string: `gpt-oss` (llama.cpp `LLM_ARCH_OPENAI_MOE`)
 - Norm: RMSNorm; pre-FFN norm tensor is named `post_attention_norm`

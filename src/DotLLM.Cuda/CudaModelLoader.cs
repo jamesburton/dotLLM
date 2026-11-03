@@ -129,6 +129,9 @@ public static class CudaModelLoader
             case Architecture.Qwen4Exp:
                 throw new NotSupportedException(Qwen4ExpConfig.UnsupportedMessage("CUDA"));
 
+            case Architecture.Glm4Moe:
+                throw new NotSupportedException(ModelConfig.Glm4MoeUnsupportedMessage("CUDA"));
+
             case Architecture.MiMoV2:
                 throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("CUDA"));
 

@@ -156,6 +156,9 @@ public static class VulkanModelLoader
             // MiMo-V2 (#955) falls through to `default`: the generic VulkanTransformerModel implements zero-padded-V attention, per-layer
             // KV heads / rope, sink attention and the IQ routed banks.
 
+            case Architecture.Glm4Moe:
+                throw new NotSupportedException(ModelConfig.Glm4MoeUnsupportedMessage("Vulkan"));
+
             case Architecture.Mamba3:
                 throw new NotSupportedException(
                     "Mamba-3 has no GGUF representation: no upstream 'mamba3' value for " +
