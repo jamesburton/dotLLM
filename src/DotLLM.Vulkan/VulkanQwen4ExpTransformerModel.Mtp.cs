@@ -139,7 +139,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         if (_tier is not null) throw new NotSupportedException("An MTP head cannot be attached while the routed experts are tiered: a verify window of 5 rows touches 31-33 experts per layer.");
         if (_spvDir is null) throw new InvalidOperationException("The model was not built by BuildFromGguf (no SPIR-V directory).");
         var tensors = headFile.TensorsByName;
-        var cfg = Config with { NextnPredictLayers = 1 };
+        var cfg = Qwen4ExpTensors.HeadConfig(Config, tensors);   // #1529: the head carries its own expert count
         var problems = Qwen4ExpTensors.FindProblems(tensors, cfg, includeTrunk: false, includeMtp: true);
         if (problems.Count > 0)
             throw new InvalidDataException("qwen4exp MTP head tensor table does not match the contract: " +
@@ -187,12 +187,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 {
                     AttnNormWeight = [1f], PostAttnNormWeight = [1f], Gdn = null,
                     FullAttn = LoadAttention(b, headFile, tensors, nKv, Config.HeadDim),
-                    Moe = LoadMoe(il, headFile, tensors, Config, owned, requantRoutedBanks: requant),
+                    Moe = LoadMoe(il, headFile, tensors, cfg, owned, requantRoutedBanks: requant),
                 },
             };
             // A one-layer attention core: the head's block reuses the validated QSA / MoE kernels. Its embedding table and LM head are never
             // read (the trunk's are used), so they are 1-row stand-ins that cost nothing.
-            var headCfg = Config with
+            var headCfg = cfg with
             {
                 NumLayers = 1, VocabSize = 1, NumKvHeads = nKv, NextnPredictLayers = 0,
                 HybridLayout = new HybridLayerLayout

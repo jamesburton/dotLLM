@@ -1,3 +1,4 @@
+using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Tensors;
@@ -32,7 +33,7 @@ namespace DotLLM.Vulkan;
 /// object satisfy the same API.
 /// </para>
 /// </remarks>
-public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IWindowedKvCache
+public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IPositionedHostKvCache, IWindowedKvCache
 {
     private readonly VulkanDevice _device;
     private readonly VulkanDevice.Buffer[] _keys;
@@ -694,6 +695,110 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
             {
                 System.Buffer.MemoryCopy(src, (void*)mapped, byteLen, byteLen);
             }
+        }
+        finally
+        {
+            Interop.VulkanApi.vkUnmapMemory(_device.Handle, staging.Memory);
+        }
+    }
+
+    // ── IPositionedHostKvCache: row-range host IO + device-to-device copy (chunk-level KV reuse, #1531) ──
+
+    /// <inheritdoc/>
+    public void WriteRows(int layerIndex, int startPosition, int count, ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
+    {
+        long elems = CheckRowRange(layerIndex, startPosition, count, "WriteRows");
+        if (keys.Length != elems || values.Length != elems)
+            throw new ArgumentException($"keys/values must contain exactly count × kvStride = {elems} floats; got keys={keys.Length}, values={values.Length}.");
+        long bytes = elems * _elemBytes;
+        long dstOffset = (long)startPosition * _kvStride[layerIndex] * _elemBytes;
+        StageUpload(keys, _keys[layerIndex], bytes, dstOffset);
+        StageUpload(values, _values[layerIndex], bytes, dstOffset);
+        if (startPosition + count > _currentLength)
+            _currentLength = startPosition + count;
+    }
+
+    /// <inheritdoc/>
+    public void ReadRows(int layerIndex, int startPosition, int count, Span<float> keys, Span<float> values)
+    {
+        long elems = CheckRowRange(layerIndex, startPosition, count, "ReadRows");
+        if (startPosition + count > _currentLength)
+            throw new ArgumentOutOfRangeException(nameof(count), $"rows [{startPosition}, {startPosition + count}) exceed CurrentLength {_currentLength}.");
+        if (keys.Length < elems || values.Length < elems)
+            throw new ArgumentException($"keys/values must hold at least count × kvStride = {elems} floats.");
+        long bytes = elems * _elemBytes;
+        long srcOffset = (long)startPosition * _kvStride[layerIndex] * _elemBytes;
+        StageDownload(_keys[layerIndex], srcOffset, bytes, keys[..(int)elems]);
+        StageDownload(_values[layerIndex], srcOffset, bytes, values[..(int)elems]);
+    }
+
+    /// <summary>
+    /// Device-to-device copy of <paramref name="count"/> rows of layer <paramref name="layerIndex"/> from
+    /// <paramref name="source"/> positions <c>[srcStart, srcStart+count)</c> to this cache's
+    /// <c>[dstStart, dstStart+count)</c>, with no host hop. Both caches must share the device, element format and layer stride.
+    /// Advances <see cref="CurrentLength"/> to cover the written rows. Bytes are copied verbatim, so K keeps the
+    /// RoPE phase of its source position (re-rotate afterwards if <c>dstStart != srcStart</c>).
+    /// </summary>
+    public void CopyRowsFrom(VulkanKvCache source, int layerIndex, int srcStart, int dstStart, int count)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        if (!ReferenceEquals(source._device, _device)) throw new ArgumentException("Caches must share one VulkanDevice.", nameof(source));
+        if (source._storage != _storage) throw new ArgumentException("Caches must share the element format.", nameof(source));
+        long elems = CheckRowRange(layerIndex, dstStart, count, "CopyRowsFrom");
+        source.CheckRowRange(layerIndex, srcStart, count, "CopyRowsFrom");
+        if (source._kvStride[layerIndex] != _kvStride[layerIndex]) throw new ArgumentException("Layer strides differ.", nameof(source));
+        if (srcStart + count > source._currentLength)
+            throw new ArgumentOutOfRangeException(nameof(count), $"source rows [{srcStart}, {srcStart + count}) exceed its CurrentLength {source._currentLength}.");
+        ulong bytes = (ulong)(elems * _elemBytes);
+        long rowBytes = (long)_kvStride[layerIndex] * _elemBytes;
+        _device.CopyBufferRangeSynchronous(source._keys[layerIndex], _keys[layerIndex], (ulong)(srcStart * rowBytes), (ulong)(dstStart * rowBytes), bytes);
+        _device.CopyBufferRangeSynchronous(source._values[layerIndex], _values[layerIndex], (ulong)(srcStart * rowBytes), (ulong)(dstStart * rowBytes), bytes);
+        if (dstStart + count > _currentLength)
+            _currentLength = dstStart + count;
+    }
+
+    private long CheckRowRange(int layerIndex, int startPosition, int count, string operation)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers) throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        ThrowIfWindowed(layerIndex, operation);
+        if (startPosition < 0) throw new ArgumentOutOfRangeException(nameof(startPosition));
+        if (count <= 0) throw new ArgumentOutOfRangeException(nameof(count), "count must be positive.");
+        if ((long)startPosition + count > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(count), $"rows [{startPosition}, {startPosition + count}) exceed cache MaxLength {_maxSeqLen}.");
+        return (long)count * _kvStride[layerIndex];
+    }
+
+    // Host F32 → (F32 | F16) staging → device range. One-shot staging per call: chunk placement is off the per-token hot path.
+    private unsafe void StageUpload(ReadOnlySpan<float> source, VulkanDevice.Buffer dst, long bytes, long dstOffset)
+    {
+        using var staging = _device.Allocate(bytes);
+        nint mapped = _device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory WriteRows staging");
+        try
+        {
+            if (_storage == VulkanKvStorage.F16)
+                TensorPrimitives.ConvertToHalf(source, new Span<Half>((void*)mapped, source.Length));
+            else
+                source.CopyTo(new Span<float>((void*)mapped, source.Length));
+        }
+        finally
+        {
+            Interop.VulkanApi.vkUnmapMemory(_device.Handle, staging.Memory);
+        }
+        _device.CopyBufferRangeSynchronous(staging, dst, 0, (ulong)dstOffset, (ulong)bytes);
+    }
+
+    private unsafe void StageDownload(VulkanDevice.Buffer src, long srcOffset, long bytes, Span<float> destination)
+    {
+        // Host-cached memory: the default host-visible type is write-combined (uncached) on AMD, and CPU reads from it ran at ~130 MiB/s (#1551).
+        using var staging = _device.AllocateHostReadback(bytes);
+        _device.CopyBufferRangeSynchronous(src, staging, (ulong)srcOffset, 0, (ulong)bytes);
+        nint mapped = _device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory ReadRows staging");
+        try
+        {
+            if (_storage == VulkanKvStorage.F16)
+                TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>((void*)mapped, destination.Length), destination);
+            else
+                new ReadOnlySpan<float>((void*)mapped, destination.Length).CopyTo(destination);
         }
         finally
         {

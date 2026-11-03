@@ -1,0 +1,64 @@
+#version 450
+// F16 twin of rope_shift_kv_f32.comp: K rows are stored F16 in place; the rotation is F32 in registers, one rounding at the store.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+// RoPE position-delta shift of cached K rows, in place on a KV-cache K buffer (issue #1531 step 2, chunk-level KV reuse).
+//
+// A K row is stored post-RoPE (R(p) k). Rotating it by R(delta) yields R(p + delta) k, the row the model would have written at
+// position p + delta (rotations compose; delta may be negative). Frequencies are rebuilt on the fly exactly as rope_f32.comp
+// does (1 / theta^(2 pair / freqDim), range-reduced sin/cos), so a shift equals rope_f32 applied with position == delta.
+//
+// Layout: K is [maxSeqLen, numKvHeads * headDim] row-major; rows [startRow, startRow + rowCount) are rotated, one thread per
+// rotation pair. ropeType 0 = Norm (2i, 2i+1), 1 = NeoX (i, i + neoxPairOffset). Dims >= ropeDim pass through.
+// Dispatch: ceil(rowCount * numKvHeads * ropeDim/2 / 256) groups of 256.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufK { float16_t k[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  startRow;
+    uint  rowCount;
+    uint  numKvHeads;
+    uint  headDim;
+    uint  ropeDim;
+    uint  ropeType;
+    float theta;
+    uint  freqDim;
+    uint  neoxPairOffset;
+    int   delta;
+} pc;
+
+void sincosRed(float a, out float c, out float s) {
+    float kk = floor(a * 0.15915494309189535 + 0.5);
+    float r = fma(-kk, 6.28318548202514648, a);   // float(2*pi) = 2*pi + 1.7484556e-7
+    r = fma(kk, 1.7484556e-7, r);
+    c = cos(r);
+    s = sin(r);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint halfRope = pc.ropeDim >> 1u;
+    if (halfRope == 0u || idx >= pc.rowCount * pc.numKvHeads * halfRope) return;
+
+    uint pair = idx % halfRope;
+    uint rem  = idx / halfRope;
+    uint head = rem % pc.numKvHeads;
+    uint t    = pc.startRow + rem / pc.numKvHeads;
+
+    float freq  = 1.0 / pow(pc.theta, float(2u * pair) / float(pc.freqDim));
+    float angle = float(pc.delta) * freq;
+    float c, s;
+    sincosRed(angle, c, s);
+
+    uint baseIdx = t * pc.numKvHeads * pc.headDim + head * pc.headDim;
+    uint i0, i1;
+    if (pc.ropeType == 1u) { i0 = baseIdx + pair; i1 = baseIdx + pair + pc.neoxPairOffset; }
+    else                   { i0 = baseIdx + 2u * pair; i1 = baseIdx + 2u * pair + 1u; }
+
+    float v0 = float(k[i0]);
+    float v1 = float(k[i1]);
+    k[i0] = float16_t(v0 * c - v1 * s);
+    k[i1] = float16_t(v0 * s + v1 * c);
+}

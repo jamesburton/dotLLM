@@ -1,0 +1,4 @@
+#version 450
+// Query-relevance probe (issue #1531); body: query_relevance_lse_f32.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "query_relevance_lse_f32.glsl"
