@@ -273,6 +273,8 @@ public sealed class Glm4MoeConfigTests : IDisposable
         {
             var ex = Assert.Throws<NotSupportedException>(() => ModelLoader.CreateCpuModelFromGguf(file, c));
             Assert.Contains("glm4moe", ex.Message, StringComparison.Ordinal);
+            // The dispatcher's own arm (not just the generic loader's backstop) must be what refuses.
+            Assert.Contains("backend: CPU", ex.Message, StringComparison.Ordinal);
             Assert.Throws<NotSupportedException>(() => TransformerModel.LoadFromGguf(file, c));
             Assert.Throws<NotSupportedException>(() => TransformerWeights.LoadFromGguf(file, c));
         }
