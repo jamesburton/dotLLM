@@ -594,6 +594,56 @@ public sealed class ChunkStoreServiceTests : IDisposable
     }
 
     /// <summary>
+    /// Another writer racing for the store lock from the moment of each put (spinning on the lock file, as another process
+    /// would) never observes, once it holds the lock, an entry file without its ledger row. The race is real, so this can
+    /// never fail on a correct writer; on a writer that releases the lock between put and save it wins the gap often
+    /// enough over 12 writes to fail (mutant M6).
+    /// </summary>
+    [Fact]
+    public void RacingWriter_NeverSeesAFileWithoutItsRow()
+    {
+        string root = NewRoot();
+        var hooked = new HookedStore(new FileChunkStore(root));
+        var s = Start(root, new FakeHost(), store: hooked);
+        string lockFile = Path.Combine(root, ChunkIndex.StoreLockFileName);
+        var violations = new System.Collections.Concurrent.ConcurrentBag<string>();
+        var racers = new List<Thread>();
+        hooked.AfterPut = key =>
+        {
+            var racer = new Thread(() =>
+            {
+                var sw = Stopwatch.StartNew();
+                while (sw.Elapsed < TimeSpan.FromSeconds(10))
+                {
+                    FileStream held;
+                    try { held = new FileStream(lockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+                    catch (IOException) { continue; }
+                    catch (UnauthorizedAccessException) { continue; }
+                    using (held)
+                    {
+                        if (File.Exists(new FileChunkStore(root).PathOf(key)) && !RawLedgerText(root).Contains(key.Hex, StringComparison.Ordinal))
+                            violations.Add(key.Hex);
+                    }
+                    return;
+                }
+            }) { IsBackground = true, Priority = ThreadPriority.AboveNormal };
+            racers.Add(racer);
+            racer.Start();
+        };
+
+        for (int i = 0; i < 12; i++)
+        {
+            string text = "race " + i + "\n" + Text('r');
+            Admitted(s, text, KeyFor(text), true);
+            Assert.True(s.Queue.WaitDrained(Drain));
+        }
+        foreach (var r in racers)
+            Assert.True(r.Join(TimeSpan.FromSeconds(15)));
+        Assert.Empty(violations);
+        Assert.Equal(12, LedgerKeysOnDisk(root).Count);
+    }
+
+    /// <summary>
     /// A store lock held elsewhere past the timeout is reported as <c>lock_timeout</c> (never as a plain busy store or a
     /// write failure), nothing is written, and the next write after the lock is released clears it.
     /// </summary>
