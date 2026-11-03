@@ -20,6 +20,7 @@
     <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <PackageId>DotLLM.ChunkCache.Client</PackageId>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>Copyright (c) 2026 James Burton and contributors</Copyright>
     <Description>Client for dotLLM's chunk-cache wire convention: span hashing, the /v1/chunk-cache control plane (capabilities, prewarm, evict, explain) and local index queries via the chunkcache CLI. Pure HTTP and DTOs; MIT-licensed.</Description>
     <PackageTags>llm;kv-cache;chunk-cache;dotllm;agents;openai</PackageTags>
     <!-- Unsafe code is enabled repo-wide for the engine; this package has none. -->
