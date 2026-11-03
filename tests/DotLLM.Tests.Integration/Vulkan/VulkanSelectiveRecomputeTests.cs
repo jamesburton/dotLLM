@@ -22,6 +22,14 @@ public class VulkanSelectiveRecomputeTests
     [SkippableFact]
     public void Qwen3_4B_NonContiguousSubsetRecompute_ReproducesFullPrefillRows() => RunSubsetRecompute(96, new[] { 3, 4, 5, 20, 33, 34, 70, 95 });
 
+    /// <summary>#1549: the same subset recompute on an EXPLICIT F16 cache (the model default since #1151): qpos arm, tiled kernel and scatter write all read/write halves.</summary>
+    [SkippableFact]
+    public void Qwen3_4B_NonContiguousSubsetRecompute_F16Cache() => RunSubsetRecompute(96, new[] { 3, 4, 5, 20, 33, 34, 70, 95 }, storage: VulkanKvStorage.F16);
+
+    /// <summary>The F32 oracle arm of the same recompute (explicit F32 cache): shows the F16 floor is the format's, not the recompute's.</summary>
+    [SkippableFact]
+    public void Qwen3_4B_NonContiguousSubsetRecompute_F32CacheControl() => RunSubsetRecompute(96, new[] { 3, 4, 5, 20, 33, 34, 70, 95 }, storage: VulkanKvStorage.F32);
+
     /// <summary>
     /// #1540 at 2K: 64 scattered rows (runs and singletons, including the last position) of a 2048-token prompt through the tiled
     /// per-query-position kernel. The tiled kernel must not add error beyond the #1534 oracle (the ~9e-3 mean relative L2 vs the full prefill is the forward-shape noise floor of Q4_K_M, shared by the contiguous-tail control)
@@ -36,7 +44,7 @@ public class VulkanSelectiveRecomputeTests
         RunSubsetRecompute(2048, set.ToArray(), tiledExpected: true);
     }
 
-    private void RunSubsetRecompute(int N, int[] subset, bool tiledExpected = true, double kTol = 0, double vTol = 0)
+    private void RunSubsetRecompute(int N, int[] subset, bool tiledExpected = true, double kTol = 0, double vTol = 0, VulkanKvStorage? storage = null)
     {
         Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device");
@@ -52,7 +60,9 @@ public class VulkanSelectiveRecomputeTests
         int[] pos = Enumerable.Range(0, N).ToArray();
         int layers = cfg.NumLayers;
 
-        using var reference = (VulkanKvCache)vk.CreateKvCache(N + 32);
+        VulkanKvStorage st = storage ?? vk.DefaultKvStorage;
+        _out.WriteLine($"[1549] KV storage under test: {st} (model default {vk.DefaultKvStorage})");
+        using var reference = vk.CreateKvCache(N + 32, false, st);
         using (vk.Forward(ids, pos, 0, reference)) { }
         int stride = reference.KvStride;
 
@@ -61,7 +71,7 @@ public class VulkanSelectiveRecomputeTests
         long tiledRan = 0;
         (double k, double v, double other, double[] perLayerK, long qposRuns, double meanK, double meanV) Recompute(int[] rows, bool tiled = true)
         {
-            using var c = (VulkanKvCache)vk.CreateKvCache(N + 32);
+            using var c = vk.CreateKvCache(N + 32, false, st);
             using (vk.Forward(ids, pos, 0, c)) { }
             var junk = new float[stride];
             Array.Fill(junk, 7.5f);

@@ -267,7 +267,8 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         nint cmdBuf,
         VulkanDevice.Buffer kDev, VulkanDevice.Buffer vDev,
         ReadOnlySpan<int> positions, int seqLen, int layerIndex,
-        Kernels.IVulkanKvF16Writer? f16Writer = null)
+        Kernels.IVulkanKvF16Writer? f16Writer = null,
+        VulkanDevice.Buffer? positionsDev = null)
     {
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
@@ -289,11 +290,22 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         if (_storage == VulkanKvStorage.F16)
         {
             // The F32 rows the projections produced are converted on the device; there is no copy-engine path for F16.
-            if (!contiguous || f16Writer is null)
-                throw new InvalidOperationException("An F16 KV cache is written by the convert kernel from contiguous positions only.");
-            long elemOffset = (long)(positions[0] - rowBase) * _kvStride[layerIndex], count = (long)seqLen * _kvStride[layerIndex];
-            f16Writer.RecordF32ToF16(cmdBuf, kDev, _keys[layerIndex], elemOffset, count);
-            f16Writer.RecordF32ToF16(cmdBuf, vDev, _values[layerIndex], elemOffset, count);
+            if (f16Writer is null)
+                throw new InvalidOperationException("An F16 KV cache is written by the convert kernel; pass the writer.");
+            if (!contiguous)
+            {
+                // Selective recompute (#1151): rows at arbitrary positions, one scatter dispatch per tensor (positions are a device buffer).
+                if (positionsDev is null)
+                    throw new InvalidOperationException("Writing an F16 KV cache at non-contiguous positions needs the device positions buffer.");
+                f16Writer.RecordScatterRows(cmdBuf, kDev, _keys[layerIndex], positionsDev, _kvStride[layerIndex], seqLen, rowBase);
+                f16Writer.RecordScatterRows(cmdBuf, vDev, _values[layerIndex], positionsDev, _kvStride[layerIndex], seqLen, rowBase);
+            }
+            else
+            {
+                long elemOffset = (long)(positions[0] - rowBase) * _kvStride[layerIndex], count = (long)seqLen * _kvStride[layerIndex];
+                f16Writer.RecordF32ToF16(cmdBuf, kDev, _keys[layerIndex], elemOffset, count);
+                f16Writer.RecordF32ToF16(cmdBuf, vDev, _values[layerIndex], elemOffset, count);
+            }
             if (maxPos + 1 > _currentLength) _currentLength = maxPos + 1;
             return;
         }
@@ -587,7 +599,6 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     public unsafe void IngestFromHost(int layerIndex, int length,
         ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
     {
-        RequireF32("IngestFromHost");
         if ((uint)layerIndex >= (uint)_numLayers)
             throw new ArgumentOutOfRangeException(nameof(layerIndex));
         ThrowIfWindowed(layerIndex, "IngestFromHost");
@@ -601,6 +612,13 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
             throw new ArgumentException(
                 $"keys/values must contain exactly length × kvStride = {expectedFloats} floats; "
                 + $"got keys={keys.Length}, values={values.Length}.");
+
+        if (_storage == VulkanKvStorage.F16)
+        {
+            // F16 cache (#1151): the host rows stay F32 on the wire; round to nearest-even on write (the WriteRows staging path).
+            WriteRows(layerIndex, 0, length, keys, values);
+            return;
+        }
 
         long bytes = expectedFloats * sizeof(float);
 
@@ -657,7 +675,6 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// <inheritdoc/>
     public void DownloadLayer(int layerIndex, Span<float> keys, Span<float> values)
     {
-        RequireF32("DownloadLayer");
         if ((uint)layerIndex >= (uint)_numLayers)
             throw new ArgumentOutOfRangeException(nameof(layerIndex));
         ThrowIfWindowed(layerIndex, "DownloadLayer");
@@ -665,6 +682,11 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         if (count == 0) return;
         if (keys.Length < count || values.Length < count)
             throw new ArgumentException($"keys/values must hold at least currentLength × kvStride = {count} floats.");
+        if (_storage == VulkanKvStorage.F16)
+        {
+            ReadRows(layerIndex, 0, _currentLength, keys[..count], values[..count]);   // widened to F32 on the host (#1151)
+            return;
+        }
         // Device-local K/V → host. On a dGPU this is a real VRAM read-back; on UMA the bytes never leave DRAM.
         _device.Download(_keys[layerIndex], keys[..count]);
         _device.Download(_values[layerIndex], values[..count]);
@@ -674,7 +696,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     public void UploadLayer(int layerIndex, int length, ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
         => IngestFromHost(layerIndex, length, keys, values);
 
-    // shortcut: the host-staged F32 transport (handoff, ingest) has no F16 arm yet; add one when an F16 model needs cross-device handoff.
+    // The synchronous test/diagnostic UpdateDevice moves F32 rows only; the host-staged transports (handoff, ingest) convert for F16 (#1151).
     private void RequireF32(string operation)
     {
         if (_storage != VulkanKvStorage.F32)
@@ -776,7 +798,14 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         try
         {
             if (_storage == VulkanKvStorage.F16)
-                TensorPrimitives.ConvertToHalf(source, new Span<Half>((void*)mapped, source.Length));
+            {
+                // Saturate at the F16 range exactly as the device writers do (convert_f32_to_f16_*): an infinity stored in a K/V row would poison a whole softmax row.
+                var halves = new Span<Half>((void*)mapped, source.Length);
+                TensorPrimitives.ConvertToHalf(source, halves);
+                for (int i = 0; i < halves.Length; i++)
+                    if (Half.IsInfinity(halves[i]) && !float.IsInfinity(source[i]))
+                        halves[i] = source[i] > 0 ? Half.MaxValue : Half.MinValue;
+            }
             else
                 source.CopyTo(new Span<float>((void*)mapped, source.Length));
         }

@@ -164,15 +164,100 @@ dotllm bench <bonsai> --device vulkan --kv-quant-k f32 --kv-quant-v f32   # expl
 - **Accuracy.** F16 rounds each K / V element once (relative error ≤ 2⁻¹¹). On the synthetic fixture the logits stay
   within the tolerance the Vulkan forward is held to against the CPU reference (abs 5e-3 + rel 1e-3).
 
+### Vulkan dense host: F16 KV storage (issues #1151, #1549)
+
+`VulkanTransformerModel` (Llama, Mistral, Qwen incl. Qwen3, Phi: no MLA, no sinks, no shared-KV layers, head dim <= 128) creates an
+**F16** `VulkanKvCache` by default (CLAUDE.md precision rule 1). `DOTLLM_VK_KV=f32` is the explicit A/B and oracle baseline, and
+`CreateKvCache(maxSeqLen, compactSlidingWindows, VulkanKvStorage.F32)` gives an F32 cache in-process. KV bytes per token halve
+(Qwen3-4B: 288 -> 144 KiB). Every attention dispatch reads the halves in place with F32 accumulation (no F32 copy of the history):
+
+- **Writes.** Contiguous rows: the fused RoPE + KV write twin `rope_kv_write_f32_kvf16.comp` (decode and prefill), else the
+  unfused `convert_f32_to_f16_range.comp`. Rows at arbitrary positions (selective recompute, scattered batches):
+  `convert_f32_to_f16_rows.comp` (one dispatch per tensor, positions read from the device buffer). All round to nearest-even in
+  the integer domain and saturate at +-65504 (the hardware conversion may round toward zero on AMD).
+- **Reads.** Decode: split-KV `_kvf16` twin, else the per-token twin. Prefill: GQA flash, coopmat flash, scalar flash, per-token
+  (all `_kvf16` twins). Selective recompute: `attention_f32_qpos_kvf16` and the tiled GQA qpos `_kvf16` twin. Query-relevance
+  probe: built per storage. `ForwardBatch` (fused batched decode) takes F16 caches.
+- **Rope shift.** `RopeShiftKv` has an F16 pipeline (rotation F32 in registers, one rounding at the store).
+- **Host IO.** `IPositionedHostKvCache.WriteRows/ReadRows` and the host-staged `UploadLayer/DownloadLayer` take and return **F32 host
+  rows**; an F16 cache rounds on write and widens on read, so write -> read is exact only to F16, and writing the rows just read
+  back is bit-idempotent.
+- **Architectures not switched** (still F32 until their dispatch is audited): Gemma-2/3/4 (soft-cap, hd256, shared KV), gpt-oss and
+  MiMo (sinks; Flint is already F16), MLA (DeepSeek), BitNet/Granite, and every host with its own cache (Nemotron-H, LFM2/LFM3,
+  Qwen3.5/3.6 MoE hybrids). Bonsai-2 dense-hybrid and Qwen4-Exp were already F16.
+
+**Accuracy (Qwen3-4B-Instruct Q4_K_M, Strix, wikitext-2 LF, 512-row prefill chunks through the cache, KL(F32 KV || F16 KV)).**
+
+| band | rows | KL median | p99 | max | top-1 | NLL F32 / F16 |
+|---|---:|---:|---:|---:|---:|---|
+| prefill [0, 2K) | 2,048 | 3.5e-7 | 8.2e-6 | 4.3e-5 | 100% | 2.0548 / 2.0547 |
+| prefill [2K, 8K) | 6,144 | 7.2e-7 | 1.4e-5 | 0.226 (1 row) | 99.98% | 2.4779 / 2.4778 |
+| decode @ 8K (32 steps) | 32 | 2.0e-7 | 2.5e-6 | 2.5e-6 | 100% | 1.8194 / 1.8188 |
+
+The one outlier (position 5224, token "1") is a chaotic row of the model, not an F16 defect: swapping only the F32 prefill attention
+kernel (GQA flash vs per-head coopmat, both F32 KV) moves that row's layer-17 K by 0.35 relative, the same as F16 does (0.36); the
+K/V of that position diverge from layer 16 on whatever the KV format. Median KL 4e-7 matches the issue's ~1e-6 for Q4_0-class models;
+Llama-1B-class models are the sensitive end (5e-4, #1109) and were not re-run here.
+
+**Speed and memory (same process, F32/F16 caches alternating A B B A, 3 rounds, Qwen3-4B Q4_K_M, Strix; min / median / max):**
+
+| metric | F32 KV | F16 KV |
+|---|---|---|
+| prefill 512 rows, tok/s | 1705 / 2109 / 2242 | 2063 / 2136 / 2232 |
+| decode @ ctx 512, tok/s | 58 / 60.0 / 60.7 (2 contended outliers) | 59 / 60.5 / 61 |
+| decode @ ctx 8K, tok/s | 27.0 / 27.2 / 27.3 (1 outlier) | 26.6 / 27.7 / 28.4 (1 outlier) |
+| KV bytes / token | 288 KiB | 144 KiB |
+
+Speed is a wash (the dense decode is weight-bound; the attention kernels are the same code with a different load). The win is
+memory: twice the context in the same VRAM, and the F32 prefix copy that chunk reuse needed goes away. (Cross-process CLI runs
+on this box swung 5 to 60 tok/s on identical settings from background load; only the in-process paired numbers are quoted.)
+
+**RoPE-shift error accumulation (`RopeShiftKv`, real Qwen3-4B K rows, 512 rows x 8 heads, relative head-norm error vs an f64
+rotation by the summed delta; mean / worst over rows and heads, layers 0, 18, 35):**
+
+| shifts | F32 cache | F16 cache |
+|---|---|---|
+| one, delta 1 .. 1024 | <= 2.7e-6 / 5.2e-6 | 1.8-2.8e-4 / 3.9-6.1e-4 |
+| one, delta 8192 ; 32768 | <= 2.1e-5 / 4.1e-5 ; 8.6e-5 / 1.7e-4 | <= 2.9e-4 / 7.8e-4 ; 2.9e-4 / 8.7e-4 |
+| 4096 x 2 ; x 3 ; x 4 (mean) | <= 2.1e-5 ; 3.2e-5 ; 4.3e-5 | 3.9e-4 ; 5.0e-4 ; 6.1e-4 (worst 1.4e-3 at x4) |
+
+The F16 floor is the stored rounding (~2.2e-4 mean at the first store); each re-shift adds about one more rounding in quadrature
+(up to ~0.3e-3 per shift in the worst layer). The F32 cache's own error is the float angle and grows with |delta|. Shifting an
+already shifted F16 chunk four times costs 1.4e-3 worst-case relative head norm. The test asserts
+`mean_F16 < 4.5e-4 * sqrt(1 + shifts) + mean_F32` and the matching worst-case bound.
+
+**Selective recompute on the F16 cache (#1549).** Qwen3-4B, 96 rows with 8 scattered, and 2048 rows with 64 scattered through the
+tiled kernel: the recomputed rows match the full prefill as closely as the contiguous tail control (96/8: mean K 8.6e-3, V 1.6e-2 vs
+control 8.9e-3, 1.6e-2; F32 cache 8.3e-3, 1.6e-2), rows outside the subset are byte-identical, and the qpos kernel ran once per layer.
+The floor is the activation-quantised Q4_K_M forward shape (#1534), not the KV format.
+
+Mutants (all die): scatter write treated as contiguous -> untouched/recomputed rows off by 2.7 (expected 0); F32 qpos kernels fed
+an F16 cache -> refused by the size guard; F32 split-KV kernel on an F16 cache at decode -> batched-vs-F32-oracle KL 26 (the
+batch test compares against an F32-cache oracle, because a wrong kernel is wrong identically in both F16 arms).
+
+#### For chunk-reuse and other external consumers
+
+- **Use F16 KV (or Q8_0 once #1550 lands). Do not require exact F32 prefix copies.** The F32 cache is an oracle for tests, not a
+  storage format to preserve. A chunk's K/V captured from an F16 cache is exactly what an F16 cache holds; moving it into another F16
+  cache with `CopyRowsFrom` (device to device) or `ReadRows` -> `WriteRows` (host F32 in between) is bit-exact, because the host F32
+  rows are widened halves and re-rounding a value that is already a half is the identity.
+- **Rows.** `IPositionedHostKvCache.WriteRows(layer, startPosition, count, keys, values)` / `ReadRows(...)` take host F32
+  `[count, kvStride(layer)]`. K is stored post-RoPE, so a chunk placed at a different position needs `RopeShiftKv` by the position
+  delta (device, F16 pipeline exists). `CurrentLength` becomes `max(CurrentLength, start + count)`.
+- **Tolerance guidance.** Expect KL vs an F32-KV run ~4e-7 median on Qwen3-4B Q4_K_M (5e-4 on Llama-1B Q8_0), top-1 agreement
+  >= 99.9%, a stored-row relative error ~2.2e-4 (one rounding), plus up to ~0.3e-3 per RoPE re-shift in quadrature. Do not compare a
+  reused chunk bit-for-bit with a fresh prefill: even two F32 prefill kernels differ by ~1e-2 relative on late-layer K/V of individual
+  rows (the recompute floor above). Compare with KL / top-1 / PPL, and budget the occasional chaotic row (one in 8,224 here, KL 0.23).
+- **Do not** write F32 into a Vulkan KV cache through raw buffers: only the cache's own writers know the element format.
+
 ### Vulkan quantized KV and the per-query-position attention (feasibility, issue #1550)
 
 Question: can the per-query-position attention (`attention_flash_gqa_qpos*`, #1540; used for selective recompute and chunk-KV
 reuse) read Q8_0 / Q4_0 KV in place on Vulkan? Read-only study, nothing implemented.
 
 **What the standard Qwen3 / Llama Vulkan path supports today.**
-- `VulkanTransformerModel.CreateKvCache` gives an **F32** `VulkanKvCache` (`DefaultKvStorage` is F16 only for Flint, which has
-  sinks and its own twins). The dense path has no F16 writer or `_kvf16` attention dispatch (#1151), so F16 qpos is
-  kernel-ready and tested (2K..32K, #1549) but unreachable from a dense model.
+- `VulkanTransformerModel.CreateKvCache` gives an **F16** `VulkanKvCache` for the plain dense architectures since #1151 (see
+  "Vulkan dense host: F16 KV storage" above; F32 is `DOTLLM_VK_KV=f32` only), so F16 qpos is reachable from a dense model (#1549).
 - `--kv-quant-k/-v q8_0|q4_0` selects `VulkanQuantizedKvCache` (split layout: one `float` scale per 32-element block plus
   packed quants in a separate buffer; Q8_0 = 8 uints of int8, Q4_0 = 4 uints of nibbles, adjacent pairs per byte). It is
   **not read in place**: every layer of every forward dequantizes `[0, CurrentLength)` of both K and V into one shared F32
@@ -180,7 +265,7 @@ reuse) read Q8_0 / Q4_0 KV in place on Vulkan? Read-only study, nothing implemen
   `2 x maxSeqLen x stride x 4 B` (Qwen3-4B, 32K: 256 MiB, i.e. twice an F32 cache of one layer, on top of the quantized
   store), and each forward re-dequantizes the full history of 36 layers. That is the expansion CLAUDE.md precision rule 2
   calls a defect (the Bonsai-2 Vulkan path refuses q8_0/q4_0 rather than do it).
-- The qpos dispatch arm requires `VulkanKvCache { Storage: F32 }`, and `VulkanQuantizedKvCache.RecordUpdate` accepts
+- The qpos dispatch arm takes `VulkanKvCache` in F32 or F16 (#1549), not the quantized cache, and `VulkanQuantizedKvCache.RecordUpdate` accepts
   contiguous ascending positions only. So no quantized qpos path exists; a recompute over a quantized Vulkan cache is
   refused or mis-masked.
 

@@ -53,8 +53,12 @@ public sealed class RopeKvWriteF32Kernel : IDisposable
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
-    private RopeKvWriteF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    /// <summary>Element format of the K / V cache rows this instance writes (F16: the <c>_kvf16</c> twin, issue #1151).</summary>
+    public VulkanKvStorage KvStorage { get; }
+
+    private RopeKvWriteF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, VulkanKvStorage storage)
     {
+        KvStorage = storage;
         _device = device;
         _module = module;
         _pipeline = pipeline;
@@ -63,9 +67,9 @@ public sealed class RopeKvWriteF32Kernel : IDisposable
     }
 
     /// <summary>Loads <c>rope_kv_write_f32.spv</c> from the given directory and creates the pipeline.</summary>
-    public static RopeKvWriteF32Kernel Create(VulkanDevice device, string spvDir)
+    public static RopeKvWriteF32Kernel Create(VulkanDevice device, string spvDir, VulkanKvStorage storage = VulkanKvStorage.F32)
     {
-        string path = Path.Combine(spvDir, "rope_kv_write_f32.spv");
+        string path = Path.Combine(spvDir, storage.ShaderName("rope_kv_write_f32") + ".spv");
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -88,11 +92,11 @@ public sealed class RopeKvWriteF32Kernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 6);
-        return new RopeKvWriteF32Kernel(device, module, pipeline, pool);
+        return new RopeKvWriteF32Kernel(device, module, pipeline, pool, storage);
     }
 
     /// <summary>Returns true if <c>rope_kv_write_f32.spv</c> exists under <paramref name="spvDir"/>.</summary>
-    public static bool IsAvailable(string spvDir) => File.Exists(Path.Combine(spvDir, "rope_kv_write_f32.spv"));
+    public static bool IsAvailable(string spvDir, VulkanKvStorage storage = VulkanKvStorage.F32) => File.Exists(Path.Combine(spvDir, storage.ShaderName("rope_kv_write_f32") + ".spv"));
 
     /// <summary>
     /// Creates the kernel if <c>rope_kv_write_f32.spv</c> is present, otherwise returns
@@ -100,8 +104,8 @@ public sealed class RopeKvWriteF32Kernel : IDisposable
     /// back gracefully to the unfused <see cref="RopeF32Kernel"/> + <see cref="VulkanKvCache.RecordUpdate"/>
     /// path, mirroring <c>RmsNormMatmulQ8_0FusedKernel.TryCreate</c>'s pattern for optional fusions.
     /// </summary>
-    public static RopeKvWriteF32Kernel? TryCreate(VulkanDevice device, string spvDir)
-        => IsAvailable(spvDir) ? Create(device, spvDir) : null;
+    public static RopeKvWriteF32Kernel? TryCreate(VulkanDevice device, string spvDir, VulkanKvStorage storage = VulkanKvStorage.F32)
+        => IsAvailable(spvDir, storage) ? Create(device, spvDir, storage) : null;
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
@@ -168,7 +172,7 @@ public sealed class RopeKvWriteF32Kernel : IDisposable
         if (k.Size < kBytes) throw new ArgumentException("K buffer too small.", nameof(k));
         if (v.Size < kBytes) throw new ArgumentException("V buffer too small.", nameof(v));
         if (positions.Size < posBytes) throw new ArgumentException("Positions buffer too small.", nameof(positions));
-        long cacheRowsNeededBytes = (long)(startPos + seqLen) * kvStride * sizeof(float);
+        long cacheRowsNeededBytes = (long)(startPos + seqLen) * kvStride * KvStorage.ElementBytes();
         if (kCache.Size < cacheRowsNeededBytes) throw new ArgumentException("K-cache buffer too small for startPos+seqLen rows.", nameof(kCache));
         if (vCache.Size < cacheRowsNeededBytes) throw new ArgumentException("V-cache buffer too small for startPos+seqLen rows.", nameof(vCache));
 
