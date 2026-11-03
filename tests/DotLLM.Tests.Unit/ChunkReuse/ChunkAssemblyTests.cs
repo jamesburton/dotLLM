@@ -1,4 +1,5 @@
 using DotLLM.ChunkReuse;
+using DotLLM.ChunkReuse.Backends;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -350,6 +351,19 @@ public sealed class ChunkAssemblyTests : IDisposable
         Assert.NotEqual(fp, ChunkFingerprint.Compute(otherTheta, "org/model", "F32", "tok-1"));
     }
 
+    [Fact]
+    public void ChunkFingerprint_BackendTag_CpuKeepsThePreSeamValue_OtherTagsDiffer()
+    {
+        // The CPU fingerprint is the value pinned before the backend seam existed (same golden as StoredAssemblyTests'
+        // GoldenCpuFingerprint), so the seam does not orphan CPU stores; every other tag is hashed in, so entries never mix.
+        using var tiny = TinyModel.Load(_scratch, "qwen3");
+        const string goldenCpu = "b724e6231aebff3569a81501051d493e3b81fbacf26377d5ea52e5e5c9bbbf90";
+        Assert.Equal(goldenCpu, ChunkFingerprint.Compute(tiny.Config, "tiny-qwen3-seed1", "F32", "tok-tiny"));
+        Assert.Equal(goldenCpu, ChunkFingerprint.Compute(tiny.Config, "tiny-qwen3-seed1", "F32", "tok-tiny", ChunkBackendTags.Cpu));
+        string vulkan = ChunkFingerprint.Compute(tiny.Config, "tiny-qwen3-seed1", "F32", "tok-tiny", ChunkBackendTags.Vulkan);
+        Assert.NotEqual(goldenCpu, vulkan);
+        Assert.NotEqual(vulkan, ChunkFingerprint.Compute(tiny.Config, "tiny-qwen3-seed1", "F32", "tok-tiny", "other"));
+    }
     // ---- helpers ----
 
     private static SimpleKvCache NewCache(TinyModel tiny)
