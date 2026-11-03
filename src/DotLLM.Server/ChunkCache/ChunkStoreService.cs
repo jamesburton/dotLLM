@@ -629,7 +629,8 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
 
     /// <summary>Whether a forget of the item's namespace (or of the whole store) came after the item was queued.</summary>
     private bool Forgotten(ChunkEncodeItem item) =>
-        item.Seq <= _forgetAllFence || (_forgetFences.TryGetValue(item.Namespace, out long fence) && item.Seq <= fence);
+        (_forgetAllFence > 0 && item.Seq <= _forgetAllFence)
+        || (_forgetFences.TryGetValue(item.Namespace, out long fence) && fence > 0 && item.Seq <= fence);
 
     private void WriteLocked(ChunkEncodeItem item, ChunkKvEntry entry)
     {
