@@ -297,3 +297,82 @@ double buffering of the K/V tile.
 8K old 404.5 / 410.9 vs new 447.7 / 412.9 (x1.00-1.11, one new call hit the same slow phase as the old); 2K after 8K history old 343.5 vs new 401.6 (x1.17, one pair).
 *Parity* (wikitext, 6000 tokens, 1024-row chunks, last-row logits, new vs old cm kernel): meanKL 2.2e-3, maxKL 8.7e-3, max|dlogit| 0.90, top-1 6/6 - below the 2.4e-2 summation-order floor of section 8.
 (A `qsasplits 2` control is vacuous at 1024-row chunks: the host already uses 1 split there, KL reads exactly 0.) Unit test `VulkanQwen4ExpQsaCoopmatGatherTests` (6 shapes vs the scalar gather): pass; `VulkanQwen4ExpQsa*`: 23 passed.
+
+## 11. Baseline against llama.cpp and the pp512 fixed-cost lever (#1537)
+
+Measured 2026-11-01/02 on dev `59e77ae2`, UD-IQ4_XS, F16 K/V, context 12288, Radeon 8060S. GPU lock held for every GPU run, `cpu-bench` held for the llama.cpp runs. **The box was not quiet for the whole
+session** (other agents' GPU/CPU jobs; the same pp512 call read 278 and 545 tok/s, one forward drifted 1.3 s -> 2.4 s), so dotLLM figures carry that spread and ratios are indicative.
+
+**Reference engine:** llama.cpp upstream master `dde879bc` (3195), Vulkan, built from `C:\Development\llama.cpp-q4exp` (`-DGGML_VULKAN=ON`, MSVC Release). It is the only locally buildable engine that runs `qwen4exp`, and it has an MTP
+graph for it (`--spec-type draft-mtp -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf`). The older local llama.cpp builds (b9016, `llamacpp-vulkan`, the May checkout) do not know the architecture. ds4-ROCm numbers
+(507-674 tok/s, Q2 quant, Linux ROCm) remain an unmatched published target; the local ds4 build is DeepSeek-V4 only.
+
+| metric | dotLLM (reps / range) | llama.cpp dde879bc | ratio | code path |
+|---|---|---|---|---|
+| pp512 | median 278-288 clean (240-394); 545 once warm; 356 (332-427) first session | 446 +- 2 (`llama-bench -fa 1 -ub 1024 -r 3`) | ~0.62-0.80 (1.2 on the warm outlier) | `Qwen4ExpRowProbe pf` (chunk 1024, last-row logits) |
+| pp2048 | median 440-450 (407-533) | 498 +- 1 | ~0.88 | same |
+| pp8192 | median 300 (288-340) | 306 +- 51 | ~0.98 | same |
+| plain decode | 24-25 tok/s early (39.7-42 ms), 19.4 later in the contended phase | 22.6 (`llama-bench tg64`), 23.1 (`llama-cli`) | 1.05-1.10 early | probe `specp` plain arm / `fwd 1` |
+| MTP K=3 / K=4 (vs own plain) | K=3 1.20 1.21 1.54 1.39; K=4 1.27 1.12 1.68 1.21 (4 prompts, 128 tok) | K=3 26.0 vs 23.1 plain (1.13x); K=4 21.0 (0.91x); ONE prompt, one run | ~1.13x (K=3), ~1.34x (K=4) | `specp all 128 K` / `llama-cli -md ... --spec-draft-n-max K` |
+
+Reading: prefill is at parity with llama.cpp at 8K, ~0.9x at 2K and behind at 512 (a short prompt amortises fixed per-forward cost over few rows); decode and MTP are ahead. The llama.cpp MTP comparison is a single
+prompt per K (its own run-to-run MTP variance is large; see the Qwen3.8-27B notes), so treat it as directional. The probe's greedy MTP text diverged from plain at near-ties on the short prompts and was identical at 1K context, as in `docs/SPECULATIVE.md`.
+
+### 11.1 pp512 fixed per-forward cost: REFUTED (no shippable lever)
+
+Hypothesis: at 512 rows the per-forward constants (96 half-layer submits with fence waits, the host PLE step, n-gram page-in) cost enough to explain the 0.62-0.80 ratio. In-process A/B, 512-row forward (`abfwd 512 8 0 <Prop> a b`, arms interleaved
+after a warm-up, both orders), minimum ms of 8 reps:
+
+| switch | A | B | verdict |
+|---|---|---|---|
+| `SplitAbove` 16 vs 100000 (one command buffer) | 1276 / 1272 | 1281 / 1402 (the 16 arm in pair 2) | pair 1 neutral, pair 2 single-submit ~9% faster in min and not in median: noise-bound |
+| `PleOnGpu` 1 vs 0 | 1684 / 1543 | 2826 / 2206 | already the default; the GPU PLE projection is a 30-40% win at 512 rows |
+| `NgramPrefetch` 1 vs 0 | 2290 | 2298 | neutral |
+
+A single command buffer for a 512-row forward is ~1.3 s of GPU work, uncomfortably near the driver watchdog (that is why each half layer is submitted separately above 16 rows), so even the best case is not a safe default.
+The submit gaps are ~0.1 ms x 96 = ~10 ms of a 1.0-1.8 s forward (<1%); the per-stage profile (`pf 512 prof=2`) puts the PLE host apply at ~2% and `~ple` at ~2.2%. The 2x spread of identical calls was environmental. No code change.
+What is left at 512 rows is the weight-read floor: every one of the 352+ active experts per layer is read once for few rows, which is the ceiling `--prefill-chunk-size` experiments in section 1 already showed.
+
+Tooling note for next time: a `quit` line inside a probe job file makes the probe exit before later job files are read; put `quit` in its own final job.
+
+### 11.2 MTP upward depth probe (#1335): no measured end-to-end win, not shipped
+
+Implemented on branch `issue/1335-mtp-upward-probe` (PR #1536, closed unmerged): after 6 consecutive fully accepted rounds at the top K the controller raises its ceiling one step (qwen4exp declares a limit of 7) and the cost model keeps the deeper K
+only if its measured ms/token is lower; unit-tested with five mutants killed. Motivation, fixed-K sweep (UD-IQ4_XS, real Q8_0 head, greedy 192 tok, plain and MTP in one process, contended box so ratios only): the one high-acceptance
+prompt scored 1.98x (K=4) -> 2.17x (K=6) -> 2.33x (K=7), the other three prompts lost from K=5 (0.82-1.38x).
+
+End to end (`dotllm run -d vulkan --mtp-head ... -n 384 --temp 0`, UD-IQ4_XS, `DOTLLM_MTP_UPWARD_PROBE` 1 vs 0, one fresh process per run, order code1 code0 prose1 prose0 prose0 prose1 code0 code1, GPU lock + `cpu-bench` held, box otherwise idle,
+decode tok/s of the run summary):
+
+| prompt | probe on | probe off | on / off (means) |
+|---|---|---|---|
+| code (BST + unittest) | 35.64, 31.89 | 35.07, 33.39 | 0.99 (ranges overlap) |
+| prose (router training) | 29.38, 26.30 | 26.73, 26.89 | 1.04 (ranges overlap) |
+
+Verdict: within the run-to-run spread (the on-arm pairs themselves differ by 4-3.5 tok/s); no win to ship. **Path proof is missing**: `DOTLLM_MTP_TRACE` was off, so these runs do not show that the ceiling ever rose; a single request
+rarely sustains 6 fully accepted K=4 rounds (histograms in section "Making MTP a default win" show 5-of-5 accepted in about a third of rounds on the best prompt), and the benefit only exists above the fixed K=4 that the controller already starts at.
+A re-test needs a trace of the chosen K per round (or a counter) on a high-acceptance long generation; until then the fixed `MtpPreferredDraftTokens = 4` stands.
+
+### 11.3 UD-Q4_K_XL verify rows against llama.cpp (#1555): parity; the #1511/#1520 structure does not apply
+
+UD-Q4_K_XL (79 GiB; dense projections, shared experts and the hyper-connection projections are Q8_0, routed gate/up Q4_K, routed down Q5_1), Vulkan, F16 K/V, context 12288, no MTP head attached, reference llama.cpp `dde879bc`
+(`llama-bench -fa 1 -p 1,2,3,5,512 -n 32 -r 5`; its `pp N` is an N-token batch forward, the same shape as an N-row verify). Locks: Strix GPU + memory (+ `gpu-lock.sh`), one process per engine, never resident together.
+
+| rows | dotLLM `fwd` ms (median, min-max, 20 reps, ctx 64) | llama.cpp ms (from tok/s) | dotLLM / llama.cpp |
+|---|---|---|---|
+| 1 | 41.6 (40.4-44.4) | 45.7 (21.87 +- 0.09 tok/s) | 0.91 |
+| 2 | 51.6 (47.7-77.5) | 51.4 (38.92 +- 0.39) | 1.00 |
+| 3 | 58.3 (55.5-61.4) | 60.7 (49.41 +- 1.12) | 0.96 |
+| 5 | 78.3 (72.3-106.9) | 77.6 (64.44 +- 2.68) | 1.01 |
+| decode | ~24 tok/s (1 row) | tg32 19.41 +- 1.93 | ~1.2 |
+| prefill | pp2048 482 (465-535), `pf` chunk 1024 | pp512 281 +- 43 (different length; llama.cpp's own spread is 15%) | not matched |
+
+Code path: `Qwen4ExpRowProbe fwd <rows> 20 64` (one command buffer for <= 16 rows; fused single-token MoE chain at 1 row, indexed multi-row MoE MMVQ at 2..8). 1K context: 5 rows 124.7 ms (115.6-341.3), 1 row 82.3 ms.
+A 5-row verify therefore costs 1.88x of a 1-row forward at ctx 64 (1.5x at 1K), matching llama.cpp's shape; there is no row-count cliff to fix on this file.
+
+**Why the #1511/#1520 structure does not apply here.** Its win is sharing one weight read across up to 16 activation columns of the SAME weight matrix. On this file (a) every dense projection is Q8_0, whose multi-column kernel was measured at the DRAM ceiling in
+#1515/#1516 (200+ GB/s through 12 columns, all structures refuted), and (b) the routed experts, the dominant verify cost, are different weights per row (10 of 512 experts per row).
+
+Split-submit stage profile at 5 rows (distorted by per-stage syncs: forward 181 ms against 78 ms unprofiled; read ratios only): `gate_up` 32.0 ms vs 10.5 ms at 1 row (3.0x), `down` 16.3 vs 6.4 (2.6x), `gdn_proj` 10.7 vs 9.9 (1.1x),
+`gdn_outproj` 5.7 vs 5.8, gated-residual stages flat. So the 1 -> 5 row growth is the MoE experts: five rows touch up to 5x as many experts; the shared dense stages are free. The remaining lever is the expert read itself (overlapping the
+5 rows' expert tiles with the dense work, or the expert-grouped path that already exists from 16 rows) - open, not attempted; the dense side has nothing left. Not measured here: MTP ratios on this file with the current build (last measured 1.33-1.38x, `docs/SPECULATIVE.md`).

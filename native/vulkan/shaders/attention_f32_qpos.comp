@@ -1,0 +1,5 @@
+#version 450
+// Per-query-position twin of attention_f32.comp (issue #1531): binding 4 carries the position of each query row. Body: attention_f32.glsl.
+#define ATTN_QPOS 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32.glsl"

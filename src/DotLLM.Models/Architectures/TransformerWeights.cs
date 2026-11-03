@@ -301,6 +301,8 @@ internal sealed class MoeLayerWeights
             upRaw, upQt, UpExpsMDim, UpExpsKDim,
             downRaw, downQt, DownExpsMDim, DownExpsKDim,
             SharedGateRaw, SharedGateRawQt, SharedUpRaw, SharedUpRawQt, SharedDownRaw, SharedDownRawQt);
+        m.GateExpsScale = GateExpsScale; m.UpExpsScale = UpExpsScale; m.DownExpsScale = DownExpsScale;
+        m.SharedGateScale = SharedGateScale; m.SharedUpScale = SharedUpScale; m.SharedDownScale = SharedDownScale;
         m.SigmoidGating = SigmoidGating;
         m.SelectionBias = SelectionBias;
         m.WeightsScale = WeightsScale;
@@ -397,6 +399,16 @@ internal sealed class MoeLayerWeights
 
     /// <summary>True = sigmoid router scores (DeepSeek-V3 / GLM-4.7-Flash, llama.cpp
     /// <c>LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID</c>); false = softmax. #742.</summary>
+    /// <summary>
+    /// Per-expert output scales of the routed gate/up/down banks (<c>ffn_{gate,up,down}_exps.scale</c>, NVFP4 second-level scales,
+    /// length <see cref="NumExperts"/>), or null when the bank has none. The CPU kernel multiplies expert <c>e</c>'s matmul result by
+    /// <c>scale[e]</c> (#1578). GPU backends refuse a file with scales before reaching here.
+    /// </summary>
+    public float[]? GateExpsScale, UpExpsScale, DownExpsScale;
+
+    /// <summary>Per-tensor output scales of the shared-expert gate/up/down projections (1 = none).</summary>
+    public float SharedGateScale = 1f, SharedUpScale = 1f, SharedDownScale = 1f;
+
     public bool SigmoidGating;
 
     /// <summary>Optional per-expert selection bias (<c>blk.N.exp_probs_b.bias</c>) added to the
@@ -1343,7 +1355,7 @@ internal sealed class TransformerWeights : IDisposable
                 + "attn_norm/ffn_norm/output_norm), an n-gram embedding and no dense attention projections on "
                 + "its linear-attention layers; it has dedicated models (CPU Qwen4ExpTransformerModel, Vulkan VulkanQwen4ExpTransformerModel; CUDA is not "
                 + "implemented yet), issues #814 / #816 / #818",
-            DotLLM.Core.Configuration.Architecture.Lfm2Moe =>
+            DotLLM.Core.Configuration.Architecture.Lfm2Moe or DotLLM.Core.Configuration.Architecture.Lfm3 =>
                 "its gated short-conv layers carry shortconv.in_proj/conv/out_proj tensors instead of attn_q/attn_k/attn_v/attn_output",
             DotLLM.Core.Configuration.Architecture.Mamba3 =>
                 "Mamba-3 has no GGUF representation at all (no upstream 'mamba3' value for "
@@ -1382,18 +1394,30 @@ internal sealed class TransformerWeights : IDisposable
     /// gate/up/down (the Vulkan loader keeps them packed from the raw views). The CPU MoE oracle cannot run on such weights.</param>
     /// <param name="allowNanoQuant">True only for the CPU backend: accepts a community NanoQuant GGUF (#869). Every other
     /// caller leaves it false and gets a clear <see cref="NotSupportedException"/> for such a file.</param>
+    /// <param name="allowNvfp4Scales">True only for the CPU backend: loads the NVFP4 <c>.scale</c> tensors of a Flint GGUF
+    /// (#1578) so the CPU model applies them. Every other caller leaves it false and gets a clear
+    /// <see cref="NotSupportedException"/> for a file that carries scales.</param>
     public static TransformerWeights LoadFromGguf(GgufFile gguf, ModelConfig config,
                                                     bool skipF32MoeDequant = false,
                                                     Func<int, (bool SkipGate, bool SkipUp, bool SkipDown)>? moeBankSkipSelector = null,
                                                     bool allowNanoQuant = false,
                                                     bool skipMlaF32Dequant = false,
-                                                    bool skipSharedExpertF32Dequant = false)
+                                                    bool skipSharedExpertF32Dequant = false,
+                                                    bool allowNvfp4Scales = false)
     {
         ThrowIfArchitectureNeedsDedicatedLoader(config);
 
         var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
-        Nvfp4Support.RejectUnappliedScales(tensors, consumedScales: null, "The shared transformer weight loader"); // #1038
+        // NVFP4 per-tensor / per-expert scales (#1038, #1578, #1579): only the CPU backend applies them (dense/attention/LM-head
+        // projections through TransformerModel.Gemm; routed + shared experts through the grouped MoE kernel, which only
+        // MiMo-V2 / Flint layers use). Every other caller (Vulkan, CUDA, HIP) still refuses a file that carries scales.
+        bool applyNvfp4Scales = allowNvfp4Scales;
+        bool groupedMoe = config.Architecture is DotLLM.Core.Configuration.Architecture.MiMoV2
+                                              or DotLLM.Core.Configuration.Architecture.Flint;
+        Nvfp4Support.RejectUnappliedScales(tensors,
+            applyNvfp4Scales ? Nvfp4Support.ScalesAppliedByCpuTransformer(tensors, groupedMoe) : null,
+            "The shared transformer weight loader"); // #1038
 
         // Community NanoQuant GGUF (issue #869): factorised linears, CPU + dense Qwen3 only. Every other consumer of this
         // shared loader (Vulkan, CUDA, HIP, other architectures) must fail loudly rather than die on a missing tensor.
@@ -1547,6 +1571,8 @@ internal sealed class TransformerWeights : IDisposable
             selfCond: selfCond,
             perLayerEmbedding: perLayerEmbedding);
         weights.RopeFreqFactors = ropeFreqFactors;
+        if (applyNvfp4Scales)
+            weights.WeightScales = BuildScalarWeightScales(dataBase, tensors);
 
         // EmbeddingGemma dense heads (llama.cpp gemma-embedding.cpp: both TENSOR_NOT_REQUIRED, applied after pooling).
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GemmaEmbedding
@@ -1565,6 +1591,42 @@ internal sealed class TransformerWeights : IDisposable
             };
         }
         return weights;
+    }
+
+    /// <summary>
+    /// Per-tensor output scales of the dense, attention and LM-head NVFP4 projections, keyed by the weight's data pointer
+    /// (<see cref="GgufDataBase.Of"/>, the same pointer the layer weights and <see cref="OutputWeight"/> carry). Null unless the
+    /// CPU Flint loader populated it (#1578). The model multiplies a projection's output by its entry after the matmul, as
+    /// llama.cpp's <c>build_lora_mm</c> does. Shared-expert and routed-expert scales travel with <see cref="MoeLayerWeights"/>.
+    /// </summary>
+    public Dictionary<nint, float>? WeightScales { get; private set; }
+
+    private static Dictionary<nint, float> BuildScalarWeightScales(
+        GgufDataBase dataBase, IReadOnlyDictionary<string, GgufTensorDescriptor> tensors)
+    {
+        var table = new Dictionary<nint, float>();
+        foreach (var (name, desc) in tensors)
+        {
+            if (desc.QuantizationType != QuantizationType.NVFP4 || !name.EndsWith(".weight", StringComparison.Ordinal)
+                || name.Contains("_exps.", StringComparison.Ordinal) || name.Contains("_shexp.", StringComparison.Ordinal))
+                continue;
+            if (!tensors.TryGetValue(Nvfp4Support.ScaleNameFor(name), out var scaleDesc))
+                continue;
+            float[] s = ReadScaleVector(dataBase, scaleDesc, 1);
+            table[dataBase.Of(desc)] = s[0];
+        }
+        return table;
+    }
+
+    /// <summary>Reads an NVFP4 <c>.scale</c> tensor as F32, checking it has exactly <paramref name="expected"/> elements.</summary>
+    internal static float[] ReadScaleVector(GgufDataBase dataBase, GgufTensorDescriptor desc, int expected)
+    {
+        if (desc.Shape.ElementCount != expected)
+            throw new InvalidDataException(
+                $"{desc.Name} has {desc.Shape.ElementCount} elements; expected {expected} (per-tensor scale: 1, per-expert scale: expert count).");
+        var result = new float[expected];
+        Dequantize.ToFloat32(dataBase.Of(desc), expected, desc.QuantizationType, result);
+        return result;
     }
 
     /// <summary>
@@ -2742,8 +2804,28 @@ internal sealed class TransformerWeights : IDisposable
         moeLayer.SigmoidGating = moe.SigmoidGating;
         moeLayer.SelectionBias = selectionBias;
         moeLayer.WeightsScale = moe.ExpertWeightsScale;
+
+        // NVFP4 second-level scales (#1578): a per-expert [E] vector per routed bank, a scalar per shared projection.
+        // Read whenever present; backends that cannot apply them were already refused by RejectUnappliedScales.
+        moeLayer.GateExpsScale = ReadOptionalScaleVector(dataBase, tensors, gateDesc, numExperts);
+        moeLayer.UpExpsScale = ReadOptionalScaleVector(dataBase, tensors, upDesc, numExperts);
+        moeLayer.DownExpsScale = ReadOptionalScaleVector(dataBase, tensors, downDesc, numExperts);
+        if (sharedIntermediate > 0)
+        {
+            moeLayer.SharedGateScale = ReadOptionalScaleVector(dataBase, tensors, tensors[$"{prefix}.ffn_gate_shexp.weight"], 1)?[0] ?? 1f;
+            moeLayer.SharedUpScale = ReadOptionalScaleVector(dataBase, tensors, tensors[$"{prefix}.ffn_up_shexp.weight"], 1)?[0] ?? 1f;
+            moeLayer.SharedDownScale = ReadOptionalScaleVector(dataBase, tensors, tensors[$"{prefix}.ffn_down_shexp.weight"], 1)?[0] ?? 1f;
+        }
         return moeLayer;
     }
+
+    /// <summary>The <c>X.scale</c> sibling of NVFP4 weight <paramref name="weight"/> as F32, or null when the weight is not NVFP4 or has none.</summary>
+    private static float[]? ReadOptionalScaleVector(GgufDataBase dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, GgufTensorDescriptor weight, int expected)
+        => weight.QuantizationType == QuantizationType.NVFP4
+            && tensors.TryGetValue(Nvfp4Support.ScaleNameFor(weight.Name), out var scaleDesc)
+            ? ReadScaleVector(dataBase, scaleDesc, expected)
+            : null;
 
     /// <summary>
     /// Slices a 3D fused-experts tensor and dequantizes each expert's [M, K]

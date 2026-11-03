@@ -31,6 +31,11 @@ layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0, std430) readonly  buffer BufQ   { float q[]; };    // [seq_q,  num_heads    * head_dim]
 #include "kv_load.glsl"                                       // BufK / BufV (binding 1 / 2), KV_K(i) / KV_V(i)
 layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float outp[]; }; // [seq_q,  num_heads    * head_dim]
+#if defined(ATTN_QPOS)
+// Per-query-row positions (issue #1531): row tq attends keys <= qpos[tq]; rows need not be consecutive and the KV length may exceed
+// the last query position (selective recompute inside an already-filled cache). positionOffset is ignored.
+layout(set = 0, binding = 4, std430) readonly  buffer BufQPos { int qpos[]; };    // [seq_q]
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint seqQ;
@@ -141,7 +146,11 @@ void main() {
     uint qStride  = pc.numHeads   * pc.headDim;
     uint kvStride = pc.numKvHeads * pc.headDim;
 
+#if defined(ATTN_QPOS)
+    uint posQ = uint(qpos[tq]);
+#else
     uint posQ = pc.positionOffset + tq;
+#endif
     float scale = (pc.scaleOverride > 0.0) ? pc.scaleOverride : inversesqrt(float(pc.headDim));
     float slope = (pc.useAlibi != 0u) ? alibiSlope(hq, pc.numHeads) : 0.0;
 

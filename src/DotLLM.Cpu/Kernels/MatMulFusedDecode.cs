@@ -92,6 +92,8 @@ public static unsafe partial class MatMul
     public static bool SupportsFusedDecode(QuantizationType qt) =>
         qt is QuantizationType.F32 or QuantizationType.F16 || GetComputeRowsFn(qt) != null;
 
+    private const int Nvfp4DecodeFamily = 1000;
+
     /// <summary>
     /// Row-kernel descriptor for a quantised projection used by the MoE n=1 decode path: the <c>ComputeRows</c> function (the same one
     /// <see cref="FusedDecodeGemv2"/> dispatches), the weight row stride and the block count for reduction width <paramref name="k"/>.
@@ -103,6 +105,16 @@ public static unsafe partial class MatMul
         out delegate*<byte*, byte*, float*, int, int, void> computeRows, out long weightRowBytes, out int blockCount, out int family)
     {
         computeRows = null; weightRowBytes = 0; blockCount = 0; family = 0;
+        if (qt == QuantizationType.NVFP4)
+        {
+            // 64-element blocks against Q8_0 activations (two Q8_0 blocks per NVFP4 block); its own pre-quantised-input family.
+            if (k <= 0 || k % QuantFormat.Nvfp4GroupSize != 0) return false;
+            computeRows = &ComputeRowsNvfp4;
+            blockCount = k / QuantFormat.Nvfp4GroupSize;
+            weightRowBytes = (long)blockCount * Dequantize.Nvfp4BlockBytes;
+            family = Nvfp4DecodeFamily;
+            return true;
+        }
         var fam = GetQuantFamily(qt);
         if (fam == QuantFamily.None) return false;
         var fn = GetComputeRowsFn(qt);

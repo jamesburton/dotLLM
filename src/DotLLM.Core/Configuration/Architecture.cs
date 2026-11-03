@@ -518,5 +518,15 @@ public enum Architecture
     /// with a plain biased GELU FFN on even layers and a sparse top-2-of-8 GELU MoE FFN (softmax router, no renormalisation,
     /// no gate projection) on odd layers (<c>moe_every_n_layers = 2</c>); XLM-R SentencePiece Unigram vocabulary. CPU only (issue #1400).
     /// </summary>
-    NomicBertMoe
+    NomicBertMoe,
+
+    /// <summary>
+    /// Liquid AI LFM3 (llama.cpp <c>lfm3</c>, HF <c>Lfm3ForCausalLM</c>), a "tri-hybrid": gated short-convolution layers
+    /// (<c>L_cache = 7</c>) interleaved with sliding-window (256) and global GQA layers (per-head QK RMS-norm, per-head
+    /// sigmoid output gate, NeoX RoPE: theta 1e4 on sliding layers, theta 1e6 with a zero-tail partial rotation on global
+    /// layers via <c>rope_freqs.weight</c>), a dense SwiGLU FFN on every layer and sandwich norms (post-operator and post-FFN
+    /// RMSNorm before each residual add). Tied LM head. Not a state-space model: only the global layers' KV grows with context.
+    /// See issue #1559.
+    /// </summary>
+    Lfm3
 }

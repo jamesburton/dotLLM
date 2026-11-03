@@ -87,7 +87,7 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IMtpHeadAttachable
         if (_mtp is not null) throw new InvalidOperationException("An MTP head is already attached.");
         if (_ropeCos is null || _ropeSin is null) throw new InvalidOperationException("The model was not built by LoadFromGguf.");
         var tensors = headFile.TensorsByName;
-        var cfg = Config with { NextnPredictLayers = 1 };
+        var cfg = Qwen4ExpTensors.HeadConfig(Config, tensors);   // #1529: the head carries its own expert count
         var problems = Qwen4ExpTensors.FindProblems(tensors, cfg, includeTrunk: false, includeMtp: true);
         if (problems.Count > 0)
             throw new InvalidDataException("qwen4exp MTP head tensor table does not match the contract: " +
@@ -112,7 +112,7 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IMtpHeadAttachable
         {
             AttnGr = LoadGr(headFile, tensors, hcDim, b, "hc_attn_norm.weight", "hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight"),
             FfnGr = LoadGr(headFile, tensors, hcDim, b, "hc_ffn_norm.weight", "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight"),
-            Moe = LoadMoe(il, headFile, tensors, Config, _owned),
+            Moe = LoadMoe(il, headFile, tensors, cfg, _owned),
             Qsa = LoadQsa(b, il, Config, _q4, headFile, tensors, _threadPool, null, _ropeCos, _ropeSin),
         };
         var eh = Mat(n + "eh_proj.weight");

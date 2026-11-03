@@ -188,6 +188,50 @@ public sealed class Qwen4ExpConfigTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// #1529: an expert-pruned trunk (ISTA Coder: 256 of 512) is paired with the full model's 512-expert MTP head. The head file is
+    /// checked against ITS OWN expert count; the trunk's count would reject it, and a head that is already trunk-sized is left alone.
+    /// </summary>
+    [Fact]
+    public void MtpHead_WithItsOwnExpertCount_PassesTheContractOnlyThroughHeadConfig()
+    {
+        var (file, c) = Open(mtp: true);
+        using (file)
+        {
+            int trunkExperts = c.Moe!.NumExperts;
+            int headExperts = trunkExperts * 2;
+            // The head file carries blk.{NumLayers}.* and the embedding (the real mtp-*.gguf), not the trunk blocks.
+            string headPrefix = $"blk.{c.NumLayers}.";
+            var table = file.TensorsByName.Where(kv => kv.Key.StartsWith(headPrefix, StringComparison.Ordinal) || kv.Key == "token_embd.weight")
+                .ToDictionary(kv => kv.Key, kv => kv.Value);
+            foreach (string suffix in new[] { "ffn_gate_inp.weight", "ffn_down_exps.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight" })
+            {
+                string name = Qwen4ExpTensors.Block(c.NumLayers, suffix);
+                var d = table[name];
+                var dims = d.Shape.Dimensions.ToArray();
+                dims[^1] = headExperts;
+                table[name] = d with { Shape = new DotLLM.Core.Tensors.TensorShape(dims) };
+            }
+
+            // The trunk's count rejects the head ...
+            var viaTrunk = Qwen4ExpTensors.FindProblems(table, c with { NextnPredictLayers = 1 }, includeTrunk: false, includeMtp: true);
+            Assert.Contains(viaTrunk, p => p.Contains($"'blk.{c.NumLayers}.ffn_gate_inp.weight' has shape"));
+            Assert.Contains(viaTrunk, p => p.Contains($"'blk.{c.NumLayers}.ffn_down_exps.weight' has shape"));
+            // ... the head's own count accepts it, and leaves the trunk config untouched.
+            var headCfg = Qwen4ExpTensors.HeadConfig(c, table);
+            Assert.Equal(headExperts, headCfg.Moe!.NumExperts);
+            Assert.Equal(c.Moe.NumExpertsPerTok, headCfg.Moe.NumExpertsPerTok);
+            Assert.Equal(1, headCfg.NextnPredictLayers);
+            Assert.Equal(trunkExperts, c.Moe.NumExperts);
+            Assert.Empty(Qwen4ExpTensors.FindProblems(table, headCfg, includeTrunk: false, includeMtp: true));
+
+            // A head with the trunk's own count keeps it; a head with no router tensor falls back (and is reported missing).
+            Assert.Equal(trunkExperts, Qwen4ExpTensors.HeadConfig(c, file.TensorsByName).Moe!.NumExperts);   // already trunk-sized
+            table.Remove(Qwen4ExpTensors.Block(c.NumLayers, "ffn_gate_inp.weight"));
+            Assert.Equal(trunkExperts, Qwen4ExpTensors.HeadConfig(c, table).Moe!.NumExperts);
+        }
+    }
+
     [Fact]
     public void Contract_OutputIsOptional_TiedToTokenEmbedding()
     {

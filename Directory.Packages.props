@@ -9,7 +9,11 @@
     <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.15.3" />
     <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.3" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.15.2" />
+    <!-- Chunk-cache client (MIT): the MEAI decorator base class. Pinned exact; MIT-licensed. -->
+    <PackageVersion Include="Microsoft.Extensions.AI.Abstractions" Version="10.10.0" />
     <!-- Testing -->
+    <!-- tests/DotLLM.ChunkCache.Client.Tests only: the real MEAI OpenAI bridge on the wire (MIT). -->
+    <PackageVersion Include="Microsoft.Extensions.AI.OpenAI" Version="10.10.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.0.2" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.13.0" />
