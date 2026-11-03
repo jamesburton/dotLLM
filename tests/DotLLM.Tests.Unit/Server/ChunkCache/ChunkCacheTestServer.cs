@@ -103,6 +103,8 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
         configure?.Invoke(app);
         app.MapDotLLMEndpoints(serveUi: false);
         await app.StartAsync();
+        if (state.ChunkCacheRuntime.Writer is { } writer)
+            writer.Queue.QuietPeriod = TimeSpan.Zero; // tests drain at once; the quiet period has its own tests
         state.StartSchedulerLoop(); // as ServerStartup does once the host runs (paged: the scheduler serves every request)
         return new ChunkCacheTestServer(app, state, new HttpClient { BaseAddress = new Uri(app.Urls.First()), Timeout = TimeSpan.FromMinutes(2) });
     }

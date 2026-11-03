@@ -35,7 +35,112 @@ public sealed class ChunkStoreServerTests : IDisposable
     private readonly string _scratch = Path.Combine(Path.GetTempPath(), "dotllm-chunk-writer-srv-" + Guid.NewGuid().ToString("N")[..12]);
     private readonly string _model;
 
-    public ChunkStoreServerTests() => _model = ChunkCacheTestServer.WriteModel(Path.Combine(_scratch, "tiny.gguf"));
+    private readonly Xunit.Abstractions.ITestOutputHelper _output;
+
+    public ChunkStoreServerTests(Xunit.Abstractions.ITestOutputHelper output)
+    {
+        _output = output;
+        _model = ChunkCacheTestServer.WriteModel(Path.Combine(_scratch, "tiny.gguf"));
+    }
+
+    /// <summary>
+    /// Review S2: a server shut down while the worker is inside an encode does not free the model under it (it is left
+    /// for the process exit), while a normal shutdown frees it.
+    /// </summary>
+    [Fact]
+    public async Task ServerDispose_WorkerStillEncoding_ModelNotFreed()
+    {
+        string root = NewRoot();
+        var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
+        var state = server.State;
+        state.ChunkCacheRuntime.Dispose(); // replace the real worker by a slow one
+        var slow = new ChunkStoreServiceTests.FakeHost { Block = new ManualResetEventSlim(false) };
+        var writer = state.ChunkCacheRuntime.StartWriter(state, slow)!;
+        writer.Queue.QuietPeriod = TimeSpan.Zero;
+        writer.Queue.ShutdownTimeout = TimeSpan.FromMilliseconds(200);
+        Assert.True(writer.Admit(ChunkStoreServiceTests.Span(ChunkA), ChunkStoreServiceTests.KeyFor(ChunkA), 80, new ChunkCaller(true, ""), true, "cpu").Queued);
+        Assert.True(slow.Entered.Wait(TimeSpan.FromSeconds(10)));
+        await server.DisposeAsync();
+        Assert.True(state.ModelLeftForProcessExit);
+        slow.Block.Set();
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (!writer.WorkerStopped && DateTime.UtcNow < deadline) await Task.Delay(20);
+        Assert.True(writer.WorkerStopped);
+
+        var normal = await ChunkCacheTestServer.StartAsync(_model, Writing(NewRoot()));
+        var normalState = normal.State;
+        await normal.DisposeAsync();
+        Assert.False(normalState.ModelLeftForProcessExit);
+    }
+
+    /// <summary>
+    /// Review N8: an item whose key was computed for another model (a swap between admission and encode) is dropped by
+    /// the worker's key re-check, never stored under the new model.
+    /// </summary>
+    [Fact]
+    public async Task ModelSwap_ItemWithStaleKeyDropped()
+    {
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(NewRoot()));
+        var state = server.State;
+        var (key, ids) = KeyOfChunkA(server);
+        var host = new ServerChunkEncodeHost(state);
+        var item = new ChunkEncodeItem(ChunkNamespace.Default, key, ChunkA, ids.Length, null);
+        Assert.NotNull(host.Encode(item));
+        var current = state.ChunkCacheRuntime.IdentityFor(state);
+        state.ChunkCacheRuntime.IdentityOverride = ServerModelIdentity.Create(state.Config!, "another-model-id", current.Quantization, current.TokenizerId, current.Backend);
+        try
+        {
+            Assert.Null(host.Encode(item));
+        }
+        finally
+        {
+            state.ChunkCacheRuntime.IdentityOverride = null;
+        }
+    }
+
+    /// <summary>Review N6: the writer's counters and queue gauge are on <c>/metrics</c>, with fixed label sets.</summary>
+    [Fact]
+    public async Task WriterMetrics_Exported()
+    {
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(NewRoot()));
+        static long Value(string text, string series)
+        {
+            string? line = text.Split('\n').FirstOrDefault(l => l.StartsWith(series + " ", StringComparison.Ordinal));
+            return line is null ? 0 : (long)double.Parse(line[(series.Length + 1)..], System.Globalization.CultureInfo.InvariantCulture);
+        }
+        const string Stored = "dotllm_chunk_store_writes_total{result=\"stored\"}";
+        const string SeenOnce = "dotllm_chunk_store_skips_total{reason=\"not_seen_twice\"}";
+        string before = await server.GetAsync("/metrics");
+        await server.PostAsync("/v1/chat/completions", Body(Manifest()));
+        await server.PostAsync("/v1/chat/completions", Body(Manifest()));
+        Assert.True(Writer(server).Queue.WaitDrained(Drain));
+        string after = await server.GetAsync("/metrics");
+        Assert.True(Value(after, Stored) - Value(before, Stored) >= 1, after);
+        Assert.True(Value(after, SeenOnce) - Value(before, SeenOnce) >= 1, after);
+        Assert.Contains("dotllm_chunk_store_queue_depth", after, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Review S4 (a measurement, not a guarantee): the longest a request can wait behind the worker is one chunk encode.
+    /// Prints the synthetic model's encode time for ChunkA and for a 2048-token chunk.
+    /// </summary>
+    [Fact]
+    public async Task EncodeTime_TinyModel_Measured()
+    {
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, ChunkCacheOptions.Create(true, null));
+        var identity = server.State.ChunkCacheRuntime.IdentityFor(server.State);
+        var encoder = new ChunkEncoder(identity.Fingerprint);
+        int[] small = ChunkTokenization.Encode(server.State.Tokenizer!, ChunkA);
+        int ctx = server.State.Config!.MaxSequenceLength;
+        int[] large = Enumerable.Range(0, Math.Min(2048, ctx)).Select(i => small[i % small.Length]).ToArray();
+        encoder.Encode(server.State.Model!, small); // warm-up
+        var sw = Stopwatch.StartNew();
+        encoder.Encode(server.State.Model!, small);
+        double smallMs = sw.Elapsed.TotalMilliseconds;
+        sw.Restart();
+        encoder.Encode(server.State.Model!, large);
+        _output.WriteLine($"tiny model encode: {small.Length} tokens {smallMs:0.0} ms; {large.Length} tokens {sw.Elapsed.TotalMilliseconds:0.0} ms");
+    }
 
     public void Dispose()
     {
@@ -453,6 +558,7 @@ public sealed class ChunkStoreServerGpuTests : IDisposable
                 Assert.Equal(1, report["chunks"]!["miss"]!.GetValue<int>());
                 Assert.Equal(0, report["plan"]!["tokens"]!["chunk_reused"]!.GetValue<int>());
                 Assert.Contains(report["warnings"]!.AsArray(), w => w!["code"]!.GetValue<string>() == ChunkCacheCodes.EncodeSkipped);
+                Assert.DoesNotContain(report["warnings"]!.AsArray(), w => w!["code"]!.GetValue<string>() == ChunkCacheCodes.StoreUnavailable);
             }
             Assert.True(vk.State.ChunkCacheRuntime.Writer!.Queue.WaitDrained(TimeSpan.FromSeconds(60)));
         }

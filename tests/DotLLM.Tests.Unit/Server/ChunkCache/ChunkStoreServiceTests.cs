@@ -39,13 +39,21 @@ public sealed class ChunkStoreServiceTests : IDisposable
         private int _leases;
 
         public volatile bool Idle = true;
+        public volatile bool Busy;
+        public long Stamp;
         public int Stride = 4;
         public int Encodes;
         public int EncodesOutsideLease;
+        public ManualResetEventSlim? Block;
+        public readonly ManualResetEventSlim Entered = new(false);
+
+        public long ActivityStamp() => Interlocked.Read(ref Stamp);
+
+        public bool IsBusy() => Busy || !Idle;
 
         public IDisposable? TryEnterIdle()
         {
-            if (!Idle) return null;
+            if (!Idle || Busy) return null;
             Interlocked.Increment(ref _leases);
             return new Lease(this);
         }
@@ -54,6 +62,8 @@ public sealed class ChunkStoreServiceTests : IDisposable
         {
             if (Volatile.Read(ref _leases) != 1) Interlocked.Increment(ref EncodesOutsideLease);
             Interlocked.Increment(ref Encodes);
+            Entered.Set();
+            Block?.Wait();
             return EntryFor(item.Text, Stride);
         }
 
@@ -97,6 +107,7 @@ public sealed class ChunkStoreServiceTests : IDisposable
     {
         var options = new ChunkCacheOptions(true, ChunkCacheOptions.DefaultMaxChunks, root, null, StoreWrite: true, StoreBudgetBytes: budget, StoreIndexOnly: indexOnly);
         var service = ChunkStoreService.Start(options, host, store, time);
+        service.Queue.QuietPeriod = TimeSpan.Zero; // the quiet-period tests set their own
         _services.Add(service);
         return service;
     }
@@ -249,7 +260,28 @@ public sealed class ChunkStoreServiceTests : IDisposable
     [InlineData("../outside/.env", true)]
     [InlineData("src/Program.cs", false)]
     [InlineData("src/environment.cs", false)]
-    [InlineData("src/appsettings.Development.json", false)]
+    [InlineData("src/appsettings.Development.json", true)]
+    [InlineData("appsettings.json", true)]
+    [InlineData("certs/store.p12", true)]
+    [InlineData("home/.npmrc", true)]
+    [InlineData(".netrc", true)]
+    [InlineData(".pgpass", true)]
+    [InlineData("home/.ssh/config", true)]
+    [InlineData("config/secrets.yaml", true)]
+    [InlineData("deploy/prod.env", true)]
+    [InlineData("id_rsa.pub", true)]
+    [InlineData("aws/credentials", true)]
+    [InlineData("credentials.json", true)]
+    [InlineData("secrets.json.", true)]
+    [InlineData("server.pem . ", true)]
+    [InlineData(".git.\\config", true)]
+    [InlineData("src/secrets.json::$DATA", true)]
+    [InlineData("src/Program.cs::$DATA", true)]
+    [InlineData("src/secrets.json:hidden", true)]
+    [InlineData("SECRET~1.JSO", true)]
+    [InlineData("APPSET~1.JSO", true)]
+    [InlineData("src/PROGRA~1.CS", false)]
+    [InlineData("src/environment.json", false)]
     [InlineData("docs/git/README.md", false)]
     [InlineData("src/.gitignore", false)]
     [InlineData("keys/readme.keys", false)]
@@ -347,9 +379,15 @@ public sealed class ChunkStoreServiceTests : IDisposable
         Admitted(s, same, KeyFor(same), onMissEncode: true);
         Admitted(s, same, KeyFor(same), onMissEncode: true);
         Assert.InRange(s.Queue.Pending, 1, 1);
+        // Fill the global bound from several namespaces (each holds at most its share).
         for (int i = 1; i < ChunkEncodeQueue.MaxItems; i++)
-            Admitted(s, "t" + i + "\n" + Text('q', 40), KeyFor("t" + i + "\n" + Text('q', 40)), onMissEncode: true);
-        var over = s.Admit(Span("overflow\n" + Text('q', 40)), KeyFor("overflow"), 50, Local, true, "cpu");
+        {
+            var caller = new ChunkCaller(true, "tenant-" + (i / ChunkEncodeQueue.MaxItemsPerNamespace));
+            string t = "t" + i + "\n" + Text('q', 40);
+            Assert.True(s.Admit(Span(t), KeyFor(t, caller.Namespace), 50, caller, true, "cpu").Queued);
+        }
+        var fresh = new ChunkCaller(true, "tenant-fresh");
+        var over = s.Admit(Span("overflow\n" + Text('q', 40)), KeyFor("overflow", fresh.Namespace), 50, fresh, true, "cpu");
         Assert.Equal(new AdmissionResult(false, AdmissionReasons.QueueFull), over);
     }
 
@@ -465,7 +503,7 @@ public sealed class ChunkStoreServiceTests : IDisposable
 
         Admitted(s, big, KeyFor(big), true); // needs more than the small row can free
         Assert.True(s.Queue.WaitDrained(Drain));
-        Assert.Equal(StoreProblems.BudgetExhausted, s.Problem);
+        Assert.Equal(StoreProblems.EntryTooLarge, s.Problem); // that entry alone is dropped; the writer is not stopped (S1)
         Assert.True(store.Contains(KeyFor(small)));
         Assert.Contains(KeyFor(small).Hex, LedgerKeysOnDisk(root));
         Assert.False(store.Contains(KeyFor(big)));
