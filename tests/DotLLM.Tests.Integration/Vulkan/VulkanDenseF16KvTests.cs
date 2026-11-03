@@ -178,7 +178,8 @@ public class VulkanDenseF16KvTests
         int[] pa = Enumerable.Range(0, 200).ToArray();
         using var ba = vk.CreateKvCache(512); using var bb = vk.CreateKvCache(512);
         using var sa = vk.CreateKvCache(512); using var sb = vk.CreateKvCache(512);
-        foreach (var (c, ids) in new[] { (ba, a), (bb, b), (sa, a), (sb, b) })
+        using var fa = vk.CreateKvCache(512, false, VulkanKvStorage.F32);   // F32 oracle arm: a wrong F16 kernel would be wrong the same way batched and single
+        foreach (var (c, ids) in new[] { (ba, a), (bb, b), (sa, a), (sb, b), (fa, a) })
             using (vk.Forward(ids.AsSpan(0, 200), pa, 0, c)) { }
 
         long fused0 = vk.ForwardBatchFusedCount;
@@ -195,6 +196,10 @@ public class VulkanDenseF16KvTests
             float[] ra, rb;
             using (var x = vk.Forward(new[] { a[t] }, new[] { t }, 0, sa)) ra = Copy(x);
             using (var x = vk.Forward(new[] { b[t] }, new[] { t }, 0, sb)) rb = Copy(x);
+            float[] oa;
+            using (var x = vk.Forward(new[] { a[t] }, new[] { t }, 0, fa)) oa = Copy(x);
+            double klOracle = Row(oa, 0, la, 0, l.Cfg.VocabSize, -1).kl;
+            Assert.True(klOracle < 3e-3, $"batched F16 vs F32-cache oracle KL {klOracle:E2} at step {t}");
             foreach (var (p, q) in new[] { (ra, la), (rb, lb) })
             {
                 var (kl, t1, _, _) = Row(p, 0, q, 0, l.Cfg.VocabSize, -1);
@@ -320,4 +325,51 @@ public class VulkanDenseF16KvTests
     }
 
     private static VulkanDevice src_device(VulkanTransformerModel vk) => vk.Device;
+
+    /// <summary>
+    /// Same-process paired A/B (opt-in, <c>DOTLLM_F16KV_BENCH=1</c>): F32 and F16 caches alternate (A B B A ...) so clock ramp and background load hit both
+    /// arms alike. Reports prefill tok/s (512-row chunks) and decode tok/s at depth 512 and 8K, per repetition.
+    /// </summary>
+    [SkippableFact]
+    public void Bench_F16VsF32_PairedInProcess()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_F16KV_BENCH") == "1", "set DOTLLM_F16KV_BENCH=1");
+        using var l = Load();
+        var vk = l.Vk;
+        int[] ids = CorpusIds(l.Gguf, 8192 + 128);
+        var res = new Dictionary<string, List<double>>();
+        void Add(string k, double v) { if (!res.TryGetValue(k, out var li)) res[k] = li = new(); li.Add(v); }
+        double Time(Action a) { var sw = System.Diagnostics.Stopwatch.StartNew(); a(); return sw.Elapsed.TotalSeconds; }
+        void Prefill(VulkanKvCache c, int from, int to)
+        {
+            for (int s = from; s < to; s += 512)
+            {
+                int n = Math.Min(512, to - s);
+                using (vk.Forward(ids.AsSpan(s, n), Enumerable.Range(s, n).ToArray(), 0, c)) { }
+            }
+        }
+        double Decode(VulkanKvCache c, int start, int steps)
+        {
+            return Time(() => { for (int i = 0; i < steps; i++) using (vk.Forward(ids.AsSpan(start + i, 1), new[] { start + i }, 0, c)) { } });
+        }
+        var order = new[] { VulkanKvStorage.F32, VulkanKvStorage.F16, VulkanKvStorage.F16, VulkanKvStorage.F32 };
+        // warm both arms
+        foreach (var st in new[] { VulkanKvStorage.F32, VulkanKvStorage.F16 })
+        {
+            using var w = vk.CreateKvCache(8192 + 160, false, st);
+            Prefill(w, 0, 1024); Decode(w, 1024, 16);
+        }
+        for (int round = 0; round < 3; round++)
+            foreach (var st in order)
+            {
+                using var c = vk.CreateKvCache(8192 + 160, false, st);
+                double t512 = Time(() => Prefill(c, 0, 512));
+                Add($"{st} prefill512 tok/s", 512 / t512);
+                Add($"{st} decode@512 tok/s", 64 / Decode(c, 512, 64));
+                Prefill(c, 576, 8192);
+                Add($"{st} decode@8K tok/s", 64 / Decode(c, 8192, 64));
+            }
+        foreach (var kv in res.OrderBy(k => k.Key))
+            _out.WriteLine($"[1151 bench] {kv.Key,-26} n={kv.Value.Count} min {kv.Value.Min():F1} median {kv.Value.OrderBy(x => x).ElementAt(kv.Value.Count / 2):F1} max {kv.Value.Max():F1}  all: {string.Join(" ", kv.Value.Select(x => x.ToString("F1")))}");
+    }
 }
