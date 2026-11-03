@@ -51,11 +51,12 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
     private sealed class ReusableKv(SimpleKvCache inner, bool exclusive, bool canTruncate) : IPrefixReusableKvCache, IPerLayerKvCache
     {
         public bool Disposed;
+        public bool Exclusive = exclusive;
         public int CurrentLength => inner.CurrentLength;
         public int MaxLength => inner.MaxLength;
         public int LayerCount => ((IPerLayerKvCache)inner).LayerCount;
         public int KvStrideOf(int l) => ((IPerLayerKvCache)inner).KvStrideOf(l);
-        public bool HasExclusiveStorage => exclusive;
+        public bool HasExclusiveStorage => Exclusive;
         public bool CanTruncateTo(int length) => canTruncate && inner.CanTruncateTo(length);
         public void Rollback(int length) => inner.Rollback(length);
         public void Update(ITensor k, ITensor v, ReadOnlySpan<int> p, int l) => inner.Update(k, v, p, l);
@@ -216,5 +217,17 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
         gen.Generate(Text(A), Opts());
         Assert.Equal(0, prefix.EntryCount);
         Assert.True(caches[0].Disposed);
+    }
+
+    [Fact]
+    public void StorageThatStopsBeingExclusiveAfterRetention_IsNotReused()
+    {
+        var (gen, prefix, caches) = Make();
+        using var _ = prefix;
+        gen.Generate(Text(A), Opts());
+        caches[0].Exclusive = false;                                // a forward on another cache has since overwritten the rows (#1025)
+        var warm = gen.Generate(Text(Fork(12)), Opts());
+        Assert.Equal(0, warm.Timings.CachedTokenCount);
+        Assert.Equal(Cold(Fork(12)).GeneratedTokenIds, warm.GeneratedTokenIds);
     }
 }
