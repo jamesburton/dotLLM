@@ -112,6 +112,8 @@ internal sealed class VulkanGptOssKernels : IDisposable
     private readonly SimpleComputeKernel _attnSinks;
     // F16-KV twin (issue #1171, Flint): attention_sinks_f32_kvf16 reads K / V stored as F16 in place. Null when the SPIR-V is absent.
     private readonly SimpleComputeKernel? _attnSinksKvF16;
+    // Q8_0-KV twin (Flint opt-in Q8_0 KV): attention_sinks_f32_kvq8. Null when the SPIR-V is absent.
+    private readonly SimpleComputeKernel? _attnSinksKvQ8;
     private readonly SimpleComputeKernel _swigluOai;
     private readonly SimpleComputeKernel _expertBias;
     private readonly SimpleComputeKernel _topkRaw;
@@ -124,11 +126,12 @@ internal sealed class VulkanGptOssKernels : IDisposable
 
     private VulkanGptOssKernels(SimpleComputeKernel attnSinks, SimpleComputeKernel swigluOai,
         SimpleComputeKernel expertBias, SimpleComputeKernel topkRaw, MoeIndexedMatmulMxfp4F32Kernel mxfp4,
-        SimpleComputeKernel ropeYarn, SimpleComputeKernel? attnSinksKvF16)
+        SimpleComputeKernel ropeYarn, SimpleComputeKernel? attnSinksKvF16, SimpleComputeKernel? attnSinksKvQ8)
     {
         _ropeYarn = ropeYarn;
         _attnSinks = attnSinks;
         _attnSinksKvF16 = attnSinksKvF16;
+        _attnSinksKvQ8 = attnSinksKvQ8;
         _swigluOai = swigluOai;
         _expertBias = expertBias;
         _topkRaw = topkRaw;
@@ -149,13 +152,17 @@ internal sealed class VulkanGptOssKernels : IDisposable
         var attnF16 = File.Exists(Path.Combine(spvDir, "attention_sinks_f32_kvf16.spv"))
             ? SimpleComputeKernel.Create(device, spvDir, "attention_sinks_f32_kvf16", buffers: 5, pushWords: 12)
             : null;
-        return new VulkanGptOssKernels(attn, swi, bias, topk, mx, yarn, attnF16);
+        var attnQ8 = File.Exists(Path.Combine(spvDir, "attention_sinks_f32_kvq8.spv"))
+            ? SimpleComputeKernel.Create(device, spvDir, "attention_sinks_f32_kvq8", buffers: 5, pushWords: 12)
+            : null;
+        return new VulkanGptOssKernels(attn, swi, bias, topk, mx, yarn, attnF16, attnQ8);
     }
 
     internal void InvalidateDescriptorCaches()
     {
         _attnSinks.InvalidateDescriptorCache();
         _attnSinksKvF16?.InvalidateDescriptorCache();
+        _attnSinksKvQ8?.InvalidateDescriptorCache();
         _swigluOai.InvalidateDescriptorCache();
         _expertBias.InvalidateDescriptorCache();
         _topkRaw.InvalidateDescriptorCache();
@@ -175,9 +182,12 @@ internal sealed class VulkanGptOssKernels : IDisposable
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset, int slidingWindow, float scaleOverride = 0.0f, VulkanKvStorage kvStorage = VulkanKvStorage.F32)
     {
-        var kernel = kvStorage == VulkanKvStorage.F16
-            ? _attnSinksKvF16 ?? throw new NotSupportedException("F16 KV sink attention needs attention_sinks_f32_kvf16.spv, which this build lacks.")
-            : _attnSinks;
+        var kernel = kvStorage switch
+        {
+            VulkanKvStorage.F16 => _attnSinksKvF16 ?? throw new NotSupportedException("F16 KV sink attention needs attention_sinks_f32_kvf16.spv, which this build lacks."),
+            VulkanKvStorage.Q8_0 => _attnSinksKvQ8 ?? throw new NotSupportedException("Q8_0 KV sink attention needs attention_sinks_f32_kvq8.spv, which this build lacks."),
+            _ => _attnSinks,
+        };
         if (seqQ <= 0) throw new ArgumentOutOfRangeException(nameof(seqQ));
         if (seqKv <= 0) throw new ArgumentOutOfRangeException(nameof(seqKv));
         if (numHeads % numKvHeads != 0) throw new ArgumentException("numHeads must be divisible by numKvHeads.");
@@ -261,6 +271,7 @@ internal sealed class VulkanGptOssKernels : IDisposable
     {
         _attnSinks.Dispose();
         _attnSinksKvF16?.Dispose();
+        _attnSinksKvQ8?.Dispose();
         _swigluOai.Dispose();
         _expertBias.Dispose();
         _topkRaw.Dispose();

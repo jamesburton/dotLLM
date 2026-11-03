@@ -1,0 +1,6 @@
+#version 450
+// GQA-grouped cooperative-matrix flash-attention prefill with per-head attention sinks (issue #1200), Q8_0 K / V. Body: attention_flash_gqa_cm.glsl.
+#define SINKS 1
+#define KV_Q8 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_gqa_cm.glsl"

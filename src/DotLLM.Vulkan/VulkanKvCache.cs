@@ -77,9 +77,9 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     {
         get
         {
-            if (_rows is not null) return _rows.AllocatedBytes(i => 2L * _kvStride[i] * _elemBytes);
+            if (_rows is not null) return _rows.AllocatedBytes(i => 2L * _storage.RowBytes(_kvStride[i]));
             long total = 0;
-            for (int i = 0; i < _numLayers; i++) total += 2L * _maxSeqLen * _kvStride[i] * _elemBytes;
+            for (int i = 0; i < _numLayers; i++) total += 2L * _maxSeqLen * _storage.RowBytes(_kvStride[i]);
             return total;
         }
     }
@@ -170,7 +170,9 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
                     $"Per-layer KV stride must be positive; layer {i} = {_kvStride[i]}.");
             if (storage == VulkanKvStorage.F16 && (_kvStride[i] & 1) != 0)
                 throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer), $"An F16 KV row must hold an even element count; layer {i} = {_kvStride[i]}.");
-            long bytesPerLayer = (long)(rows?.CapacityOf(i) ?? maxSeqLen) * _kvStride[i] * _elemBytes;
+            if (storage == VulkanKvStorage.Q8_0 && (_kvStride[i] & 31) != 0)
+                throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer), $"A Q8_0 KV row must be a multiple of 32 elements; layer {i} = {_kvStride[i]}.");
+            long bytesPerLayer = (long)(rows?.CapacityOf(i) ?? maxSeqLen) * storage.RowBytes(_kvStride[i]);
             _keys[i] = device.AllocateDeviceLocal(bytesPerLayer);
             _values[i] = device.AllocateDeviceLocal(bytesPerLayer);
         }
@@ -180,7 +182,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
             // K and V of the largest possible compaction stage side by side.
             long scratch = 0;
             for (int i = 0; i < _numLayers; i++)
-                scratch = Math.Max(scratch, 2L * rows.MaxKeptRows(i) * _kvStride[i] * _elemBytes);
+                scratch = Math.Max(scratch, 2L * rows.MaxKeptRows(i) * storage.RowBytes(_kvStride[i]));
             _moveScratch = device.AllocateDeviceLocal(scratch);
         }
     }
@@ -267,7 +269,8 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         nint cmdBuf,
         VulkanDevice.Buffer kDev, VulkanDevice.Buffer vDev,
         ReadOnlySpan<int> positions, int seqLen, int layerIndex,
-        Kernels.IVulkanKvF16Writer? f16Writer = null)
+        Kernels.IVulkanKvF16Writer? f16Writer = null,
+        Kernels.IVulkanKvQ8Writer? q8Writer = null)
     {
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
@@ -284,6 +287,18 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
                 throw new InvalidOperationException("A compact sliding-window KV slot is written from contiguous positions only.");
             RecordWindowMove(cmdBuf, layerIndex, positions[0], maxPos);
             rowBase = _rows.BaseOf(layerIndex);
+        }
+
+        if (_storage == VulkanKvStorage.Q8_0)
+        {
+            // Quantised on the device, one invocation per 32-element block; rows are a multiple of 32 elements, so every append is whole blocks.
+            if (!contiguous || q8Writer is null)
+                throw new InvalidOperationException("A Q8_0 KV cache is written by the quantise kernel from contiguous positions only.");
+            long elemOffset = (long)(positions[0] - rowBase) * _kvStride[layerIndex], count = (long)seqLen * _kvStride[layerIndex];
+            q8Writer.RecordF32ToQ8(cmdBuf, kDev, _keys[layerIndex], elemOffset, count);
+            q8Writer.RecordF32ToQ8(cmdBuf, vDev, _values[layerIndex], elemOffset, count);
+            if (maxPos + 1 > _currentLength) _currentLength = maxPos + 1;
+            return;
         }
 
         if (_storage == VulkanKvStorage.F16)
@@ -454,7 +469,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         for (int l = 0; l < _numLayers; l++)
         {
             if (!_rows.TryPlan(l, minPos, maxPos, _currentLength, out var m) || !m.Resize) continue;
-            long rowBytes = (long)_kvStride[l] * _elemBytes;
+            long rowBytes = _storage.RowBytes(_kvStride[l]);
             _keys[l] = Regrow(_keys[l], m, rowBytes);
             _values[l] = Regrow(_values[l], m, rowBytes);
             _rows.Commit(l, m);
@@ -485,7 +500,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
                 $"Layer {layer}'s sliding-window ring is too small for positions {minPos}..{maxPos}; call {nameof(EnsureWindowCapacity)} before recording.");
         if (m.Shift > 0 && m.Keep > 0)
         {
-            ulong rowBytes = (ulong)_kvStride[layer] * (ulong)_elemBytes;
+            ulong rowBytes = (ulong)_storage.RowBytes(_kvStride[layer]);
             ulong src = (ulong)m.Shift * rowBytes, bytes = (ulong)m.Keep * rowBytes;
             nint k = _keys[layer].Handle, v = _values[layer].Handle;
             if (m.Shift >= m.Keep)
@@ -675,6 +690,12 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         => IngestFromHost(layerIndex, length, keys, values);
 
     // shortcut: the host-staged F32 transport (handoff, ingest) has no F16 arm yet; add one when an F16 model needs cross-device handoff.
+    private void RequireNotQ8(string operation)
+    {
+        if (_storage == VulkanKvStorage.Q8_0)
+            throw new NotSupportedException($"VulkanKvCache {operation} has no Q8_0 arm (prefix snapshots, handoff and host row access need F16 or F32 KV); the Q8_0 cache is read in place by the attention kernels only.");
+    }
+
     private void RequireF32(string operation)
     {
         if (_storage != VulkanKvStorage.F32)
@@ -771,6 +792,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     // Host F32 → (F32 | F16) staging → device range. One-shot staging per call: chunk placement is off the per-token hot path.
     private unsafe void StageUpload(ReadOnlySpan<float> source, VulkanDevice.Buffer dst, long bytes, long dstOffset)
     {
+        RequireNotQ8("host row upload");
         using var staging = _device.Allocate(bytes);
         nint mapped = _device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory WriteRows staging");
         try
@@ -789,6 +811,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
 
     private unsafe void StageDownload(VulkanDevice.Buffer src, long srcOffset, long bytes, Span<float> destination)
     {
+        RequireNotQ8("host row download");
         // Host-cached memory: the default host-visible type is write-combined (uncached) on AMD, and CPU reads from it ran at ~130 MiB/s (#1551).
         using var staging = _device.AllocateHostReadback(bytes);
         _device.CopyBufferRangeSynchronous(src, staging, (ulong)srcOffset, 0, (ulong)bytes);
