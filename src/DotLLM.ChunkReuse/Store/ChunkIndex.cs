@@ -675,13 +675,61 @@ public sealed partial class ChunkIndex
         return IndexKeysUnder(storeRoot, null);
     }
 
+    /// <summary>
+    /// The index files (<c>index-*.json</c>) directly under <paramref name="storeRoot"/>, as full paths (empty when the root
+    /// does not exist). Every such file counts as an index for eviction, whatever its name form.
+    /// </summary>
+    /// <param name="storeRoot">The store directory.</param>
+    /// <returns>The paths, in ordinal order.</returns>
+    public static IReadOnlyList<string> IndexFilesUnder(string storeRoot)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(storeRoot);
+        string root = Path.GetFullPath(storeRoot);
+        if (!Directory.Exists(root)) return [];
+        return Directory.EnumerateFiles(root, IndexFilePrefix + "*" + IndexFileSuffix, SearchOption.TopDirectoryOnly)
+            .Where(f => f.EndsWith(IndexFileSuffix, StringComparison.OrdinalIgnoreCase))
+            .Order(StringComparer.Ordinal).ToList();
+    }
+
+    /// <summary>
+    /// The keys one index file references (no producer check: any index file protects its keys). A file removed meanwhile
+    /// references nothing.
+    /// </summary>
+    /// <param name="indexPath">An index file.</param>
+    /// <returns>The keys.</returns>
+    /// <exception cref="InvalidDataException">The file cannot be read or parsed (conservative: no guess).</exception>
+    public static IReadOnlySet<ChunkKey> KeysOfIndexFile(string indexPath)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(indexPath);
+        var keys = new HashSet<ChunkKey>();
+        AddKeysOf(Path.GetFullPath(indexPath), keys);
+        return keys;
+    }
+
+    /// <summary>
+    /// The keys referenced by the index files directly under <paramref name="storeRoot"/> other than
+    /// <paramref name="exceptPaths"/> (full paths, compared with <see cref="PathComparer"/>), without the server ledger: what
+    /// still protects a key once those files are deleted.
+    /// </summary>
+    /// <param name="storeRoot">The store directory.</param>
+    /// <param name="exceptPaths">Index files to leave out.</param>
+    /// <returns>The keys.</returns>
+    /// <exception cref="InvalidDataException">An index file cannot be read or parsed (conservative: no guess).</exception>
+    public static IReadOnlySet<ChunkKey> IndexReferencedKeysUnder(string storeRoot, IReadOnlyCollection<string> exceptPaths)
+    {
+        ArgumentNullException.ThrowIfNull(exceptPaths);
+        var skip = new HashSet<string>(exceptPaths.Select(Path.GetFullPath), PathComparer);
+        var keys = new HashSet<ChunkKey>();
+        foreach (string file in IndexFilesUnder(storeRoot))
+            if (!skip.Contains(file)) AddKeysOf(file, keys);
+        return keys;
+    }
+
     private static HashSet<ChunkKey> IndexKeysUnder(string storeRoot, string? exceptPath)
     {
         var keys = new HashSet<ChunkKey>();
-        string root = Path.GetFullPath(storeRoot);
-        if (!Directory.Exists(root)) return keys;
         string? skip = exceptPath is null ? null : Path.GetFullPath(exceptPath);
-        foreach (string file in Directory.EnumerateFiles(root, IndexFilePrefix + "*" + IndexFileSuffix, SearchOption.TopDirectoryOnly))
+        foreach (string file in IndexFilesUnder(storeRoot))
         {
             if (!file.EndsWith(IndexFileSuffix, StringComparison.OrdinalIgnoreCase)) continue;
             if (skip is not null && PathComparer.Equals(Path.GetFullPath(file), skip)) continue;
@@ -710,8 +758,39 @@ public sealed partial class ChunkIndex
                     keys.Add(new ChunkKey(c.Key));
                 }
             }
+            if (skip is not null && string.Equals(Path.GetFullPath(file), skip, StringComparison.OrdinalIgnoreCase)) continue;
+            AddKeysOf(file, keys);
         }
         return keys;
+    }
+
+    private static void AddKeysOf(string file, HashSet<ChunkKey> keys)
+    {
+        IndexDocument? doc;
+        try
+        {
+            using FileStream stream = OpenForRead(file);
+            doc = JsonSerializer.Deserialize(stream, ChunkIndexJsonContext.Default.IndexDocument);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return; // removed between enumeration and open
+        }
+        catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidDataException($"Index file '{file}' cannot be read ({ex.Message}); eviction cannot be decided. Repair or remove it if it is not an index of this store.", ex);
+        }
+        if (doc?.Files is null)
+            throw new InvalidDataException($"Index file '{file}' has no file list; eviction cannot be decided.");
+        foreach (FileDocument? f in doc.Files)
+        {
+            foreach (ChunkDocument? c in f?.Chunks ?? [])
+            {
+                if (c is null || !ChunkKey.IsWellFormed(c.Key))
+                    throw new InvalidDataException($"Index file '{file}' has a malformed chunk entry; eviction cannot be decided.");
+                keys.Add(new ChunkKey(c.Key));
+            }
+        }
     }
 
     /// <summary>
