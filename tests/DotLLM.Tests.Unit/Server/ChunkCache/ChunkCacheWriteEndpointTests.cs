@@ -576,6 +576,11 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
         Assert.True(Stored(root, a));
         Assert.False(Stored(root, b)); // B's own namespace
 
+        // Orphans figures are store-wide: a keyed non-admin is refused even for a dry run (Task 16 fix round, U9).
+        var orphansDry = await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"orphans"}""", Key(KeyB));
+        Assert.Equal(403, orphansDry.Status);
+        Assert.Equal("chunk_cache_admin_only", JsonNode.Parse(orphansDry.Body)!["error"]!["code"]!.GetValue<string>());
+
         Assert.Equal(400, (await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"namespace","namespace":"Bad Name","dry_run":false}""", Key(KeyAdmin))).Status);
         var admin = await EvictOk(server, $$"""{"mode":"namespace","namespace":"{{Ns(KeyA)}}","dry_run":false}""", Key(KeyAdmin));
         Assert.Empty(Strings(admin["warnings"]));
