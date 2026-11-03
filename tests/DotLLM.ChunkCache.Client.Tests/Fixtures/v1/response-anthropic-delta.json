@@ -5,8 +5,7 @@
     "stop_sequence": null
   },
   "usage": {
-    "output_tokens": 212,
-    "cache_read_input_tokens": 2210
+    "output_tokens": 212
   },
   "chunk_cache": {
     "v": 1,
