@@ -32,7 +32,11 @@ internal enum ChunkAuthFailure
 /// <param name="Namespace">The caller's store namespace.</param>
 internal sealed record ChunkCaller(bool Authenticated, string Namespace)
 {
-    /// <summary>A caller whose key is marked <c>admin</c> in the keys file (store-wide figures and operations, later tasks).</summary>
+    /// <summary>
+    /// An admin: a key marked <c>admin</c> in the keys file, or (no keys file) a local caller, the single user of the server.
+    /// Admins see store-wide capabilities figures and may evict <c>orphans</c>, act on another namespace (the evict body's
+    /// <c>namespace</c>) and wipe the whole store (<c>all</c> without a namespace) (Task 16).
+    /// </summary>
     public bool IsAdmin { get; init; }
 
     /// <summary>An unauthenticated caller: the default namespace, no store lookups, counts only.</summary>
@@ -58,7 +62,7 @@ internal sealed record ChunkCaller(bool Authenticated, string Namespace)
 /// <c>401 authentication_error</c>. The caller's namespace is the key's <c>ns=</c> name, else <see cref="ChunkNamespace.ForApiKey"/> of the key.
 /// </para>
 /// <para>
-/// <b>Without keys:</b> local callers only, all in <see cref="ChunkNamespace.Default"/>; anyone else gets
+/// <b>Without keys:</b> local callers only, all in <see cref="ChunkNamespace.Default"/> and admin (a single-user server); anyone else gets
 /// <c>403 permission_error</c>. Local means all of: the connection's remote address is a loopback address (an
 /// IPv4-mapped one too; an unknown address, as on a Unix socket or in-memory host, is not local); the <c>Host</c> header names
 /// <c>localhost</c> or a loopback address (a DNS-rebinding page reaches loopback under its own host name); and no
@@ -106,8 +110,10 @@ internal static class ChunkCacheAuth
 
         if (IsLocal(context))
         {
+            // The single user of a keyless server is its admin (Task 14 review: only together with the CSRF gates, which the
+            // write routes have: application/json only and no cross-site request).
             failure = ChunkAuthFailure.None;
-            return new ChunkCaller(true, ChunkNamespace.Default);
+            return new ChunkCaller(true, ChunkNamespace.Default) { IsAdmin = true };
         }
         failure = ChunkAuthFailure.Forbidden;
         return ChunkCaller.Anonymous;

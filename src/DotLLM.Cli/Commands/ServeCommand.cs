@@ -384,6 +384,12 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
                      "so text from ad-hoc reads is never persisted.")]
         public bool ChunkStoreIndexOnly { get; set; }
 
+        /// <summary>Per-namespace byte budget (optional; off by default).</summary>
+        [CommandOption("--chunk-store-namespace-budget")]
+        [Description("With --chunk-store-write: the most bytes of entries one namespace (API key) may hold, e.g. 2GiB. When set, budget eviction " +
+                     "takes only the writing namespace's own entries, so one tenant's prewarm never evicts another's. Off by default: one shared LRU.")]
+        public string? ChunkStoreNamespaceBudget { get; set; }
+
         /// <summary>The API keys of the chunk-cache surface (off by default: loopback callers only).</summary>
         [CommandOption("--chunk-cache-api-keys")]
         [Description("With --chunk-cache: a file of API keys (one per line: '<key>' optionally followed by 'admin' and/or 'ns=<namespace>', keys of 32+ characters, e.g. 32 random bytes base64url; '#' comments; read once at startup) that may use /v1/chunk-cache/* " +
@@ -403,7 +409,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             try { ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget, PromptCacheStep, PromptCacheStepKeep); }
             catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
             try { DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(ChunkCache, ChunkCacheMaxChunks, ChunkStore, ChunkCacheApiKeys, ChunkCacheAllowShortKeys,
-                ChunkStoreWrite, ChunkStoreBudget, ChunkStoreIndexOnly); }
+                ChunkStoreWrite, ChunkStoreBudget, ChunkStoreIndexOnly, ChunkStoreNamespaceBudget); }
             catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
             return base.Validate();
         }
@@ -657,6 +663,69 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         }
 
         var serverOptions = BuildServerOptions(settings, maxMessages);
+        var serverOptions = new ServerOptions
+        {
+            MaxMessages = maxMessages,
+            Model = settings.Model ?? "",
+            ExpectedConcurrency = settings.ExpectedConcurrency,
+            AutoPull = settings.AutoPull,
+            DecisionTemperature = settings.DecisionTemperature,
+            DecisionOrderings = Math.Clamp(settings.DecisionOrderings, 1, 2),
+            Quant = settings.Quant,
+            Device = settings.Device,
+            GpuLayers = settings.GpuLayers,
+            MoeOffload = DotLLM.Cli.Helpers.MoeOffloadCli.Build(settings.MoeValues),
+            Threads = settings.Threads,
+            DecodeThreads = settings.DecodeThreads,
+            Host = settings.Host,
+            Port = settings.Port,
+            CacheTypeK = settings.KvQuantK ?? settings.CacheTypeK,
+            CacheTypeV = settings.KvQuantV ?? settings.CacheTypeV,
+            PromptCacheEnabled = !settings.NoPromptCache,
+            PromptCacheSize = settings.PromptCacheSize,
+            Warmup = new WarmupOptions
+            {
+                Enabled = !settings.NoWarmup,
+                Iterations = settings.WarmupIterations,
+            },
+            UsePaged = !settings.NoPaged,
+            SpeculativeModel = settings.SpeculativeModel,
+            SpeculativeCandidates = settings.SpeculativeK,
+            PromptLookup = settings.PromptLookupOptions,
+            MtpEnabled = !settings.NoMtp,
+            MtpExplicit = settings.Mtp && !settings.NoMtp,
+            MtpHeadPath = settings.MtpHead,
+            DFlashPath = settings.DFlash,
+            ReasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(settings.ReasoningFormat),
+            ReasoningBudget = Math.Max(-1, settings.ReasoningBudget),
+            ReasoningBudgetMessage = settings.ReasoningBudgetMessage,
+            ReasoningAnswerReserve = Math.Max(0, settings.ReasoningAnswerReserve),
+            PrefillChunkSize = settings.PrefillChunkSize,
+            PrefixSnapshots = settings.PrefixSnapshots,
+            PrefixSnapshotHostBudgetBytes = ServerOptions.ParsePrefixSnapshotHostBudget(settings.PrefixSnapshotHostBudget),
+            PrefixSnapshotDiskDirectory = settings.PrefixSnapshotDiskDirectory,
+            PrefixSnapshotDiskBudgetBytes = ServerOptions.ParsePrefixSnapshotDiskBudget(settings.PrefixSnapshotDiskBudget),
+            PromptCacheStep = settings.PromptCacheStep,
+            PromptCacheStepKeep = settings.PromptCacheStepKeep,
+            ContextSize = settings.CtxSize is > 0 ? settings.CtxSize : null,
+            KeepAliveSeconds = settings.KeepAlive,
+            MaxResidentModels = settings.MaxResidentModels,
+            ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,
+            AllowModelAdminApi = settings.AllowModelAdmin,
+            Metrics = settings.NoMetrics ? false : settings.Metrics ? true : null,
+            AllowLoraAdminApi = settings.AllowLoraAdmin,
+            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(settings.ChunkCache, settings.ChunkCacheMaxChunks, settings.ChunkStore, settings.ChunkCacheApiKeys, settings.ChunkCacheAllowShortKeys,
+                settings.ChunkStoreWrite, settings.ChunkStoreBudget, settings.ChunkStoreIndexOnly, settings.ChunkStoreNamespaceBudget),
+            // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
+            // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,
+            // and the limiter was exercised only by unit tests constructing the config directly.
+            // Off unless a cap is given, so the default behaviour is unchanged.
+            RateLimit = BuildRateLimit(settings),
+            ModelId = "none",
+            RopeOverride = ServerOptions.BuildRopeOverride(settings.RopeScaling, settings.RopeFreqBase,
+                settings.RopeScale, settings.YarnOrigCtx, settings.YarnAttnFactor,
+                settings.YarnBetaFast, settings.YarnBetaSlow),
+        };
 
         // --chunk-store-write: own the store BEFORE the model loads, so a second writer on the same directory fails in
         // seconds rather than after loading (and holding) a whole model; the writer started later uses this claim.

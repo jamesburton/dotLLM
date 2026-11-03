@@ -30,6 +30,12 @@ internal static class AdmissionReasons
     public const string SecretContent = "secret_content";
     public const string OverBudget = "over_budget";
     public const string TooLargeForCpu = "too_large_for_cpu";
+
+    /// <summary>Prewarm: the call's <c>max_tokens</c> was reached.</summary>
+    public const string MaxTokens = "max_tokens";
+
+    /// <summary>Prewarm: the text has no tokens.</summary>
+    public const string Empty = "empty";
 }
 
 /// <summary>What keeps the writer from storing (the <c>detail</c> of a <c>chunk_store_unavailable</c> warning).</summary>
@@ -50,6 +56,57 @@ internal static class StoreProblems
 
     /// <summary>The last put or ledger save failed (disk full, I/O error); nothing half-written was kept.</summary>
     public const string WriteFailed = "write_failed";
+
+    /// <summary>Evict only: an index file cannot be read, so nothing is provably unreferenced (nothing was deleted).</summary>
+    public const string IndexUnreadable = "index_unreadable";
+}
+
+/// <summary>What <c>POST /v1/chunk-cache/evict</c> removes (spec §7.2).</summary>
+internal enum EvictMode
+{
+    /// <summary>Entry files that neither an index nor the server ledger references (store-wide).</summary>
+    Orphans,
+
+    /// <summary>Forget the entries whose ledger provenance matches a glob, in one namespace.</summary>
+    Path,
+
+    /// <summary>Forget one namespace.</summary>
+    Namespace,
+
+    /// <summary>Forget one namespace (a non-admin's own), or with no namespace the whole store (admin).</summary>
+    All,
+}
+
+/// <summary>One evict call, resolved by the endpoint (namespaces are server-assigned; a body namespace only for an admin).</summary>
+/// <param name="Mode">The mode.</param>
+/// <param name="Namespace">The namespace acted on; null only for <see cref="EvictMode.Orphans"/> and a store-wide <see cref="EvictMode.All"/>.</param>
+/// <param name="Glob">The path glob (<see cref="EvictMode.Path"/> only).</param>
+/// <param name="DryRun">Count only (the default of the route).</param>
+internal sealed record EvictRequest(EvictMode Mode, string? Namespace, string? Glob, bool DryRun)
+{
+    // Never print the namespace or the glob (spec §10).
+    private bool PrintMembers(System.Text.StringBuilder builder)
+    {
+        builder.Append(System.Globalization.CultureInfo.InvariantCulture, $"Mode = {Mode}, DryRun = {DryRun}");
+        return true;
+    }
+}
+
+/// <summary>What an evict did (or, in a dry run, would do).</summary>
+/// <param name="Evicted">Entry files deleted.</param>
+/// <param name="FreedBytes">Their bytes.</param>
+/// <param name="KeptReferenced">Entry files of forgotten keys kept because an index (or a remaining ledger row) still references them.</param>
+/// <param name="LedgerRows">Ledger rows removed.</param>
+/// <param name="IndexFiles">Index files removed (the namespace's own, Task 4b names).</param>
+/// <param name="Sightings">Sighting rows removed.</param>
+/// <param name="Queued">Queued (not yet written) encodes dropped.</param>
+internal sealed record EvictOutcome(int Evicted, long FreedBytes, int KeptReferenced, int LedgerRows, int IndexFiles, int Sightings, int Queued);
+
+/// <summary>An evict refused before it deleted anything (fail closed), with the <c>detail</c> of its 503.</summary>
+internal sealed class EvictRefusedException(string detail, string message) : Exception(message)
+{
+    /// <summary><see cref="StoreProblems"/> value (<c>ledger_unreadable</c>, <c>index_unreadable</c>, <c>lock_timeout</c>, <c>write_failed</c>).</summary>
+    public string Detail { get; } = detail;
 }
 
 /// <summary>
@@ -132,6 +189,19 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     private DateTimeOffset _lastBudgetCheck;
     private int _disposed;
 
+    // Every reader and writer of the in-memory ledger (the worker's Write and Tick, evict / forget from a request) holds this,
+    // always BEFORE the store lock (never the reverse). Request threads wait for it asynchronously.
+    private readonly SemaphoreSlim _ledgerSync = new(1, 1);
+
+    // Forget fences (under _ledgerSync): an item queued at or before its namespace's fence (or the store-wide one) is never
+    // written, so an encode in flight when its namespace was forgotten does not bring the entry back.
+    private readonly Dictionary<string, long> _forgetFences = new(StringComparer.Ordinal);
+    private long _forgetAllFence;
+
+    // Per-namespace ledger figures (entries, bytes), rebuilt under _ledgerSync after every ledger change; read lock-free.
+    private volatile IReadOnlyDictionary<string, (long Entries, long Bytes)> _namespaceFigures =
+        new Dictionary<string, (long, long)>(StringComparer.Ordinal);
+
     private ChunkStoreService(string root, long budget, bool indexOnly, FileChunkStore files, IChunkStore store,
         StoreOwnerLock owner, ServerLedger? ledger, string? problem, TimeProvider time)
     {
@@ -155,6 +225,9 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
 
     /// <summary>The byte budget.</summary>
     public long BudgetBytes => _budget;
+
+    /// <summary>The per-namespace byte budget (<c>--chunk-store-namespace-budget</c>); 0 = off (one shared LRU).</summary>
+    public long NamespaceBudgetBytes { get; private init; }
 
     /// <summary>Bytes of entry files in the store, as last counted or tracked.</summary>
     public long StoreBytes => Interlocked.Read(ref _storeBytes);
@@ -283,11 +356,16 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         }
 
         var service = new ChunkStoreService(Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)), options.StoreBudgetBytes,
-            options.StoreIndexOnly, files, store ?? files, owner, ledger, problem, time ?? TimeProvider.System);
+            options.StoreIndexOnly, files, store ?? files, owner, ledger, problem, time ?? TimeProvider.System)
+        {
+            NamespaceBudgetBytes = Math.Max(0, options.StoreNamespaceBudgetBytes),
+        };
         try
         {
             files.SweepTempFiles(TimeSpan.FromHours(1)); // a crashed writer's leftovers; never a live write (we own the store)
             service._storeBytes = files.GetStats().EntryBytes;
+            if (ledger is not null)
+                service.RefreshFigures(ledger);
             if (service._indexOnly)
                 service.RefreshIndexKeys(force: true);
             service._queue = new ChunkEncodeQueue(host, service, service.OnWorkerExit);
@@ -299,7 +377,8 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             throw;
         }
         ServerLog.Info($"chunk-store: sole writer of '{service._root}' (budget {options.StoreBudgetBytes} bytes, {service._storeBytes} used"
-            + (options.StoreIndexOnly ? ", index-only" : "") + (ledger is null ? ", writes disabled" : "") + ")");
+            + (options.StoreIndexOnly ? ", index-only" : "") + (service.NamespaceBudgetBytes > 0 ? $", {service.NamespaceBudgetBytes} bytes per namespace" : "")
+            + (ledger is null ? ", writes disabled" : "") + ")");
         return service;
     }
 
@@ -316,7 +395,35 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     /// <param name="onMissEncode"><c>on_miss: "encode"</c>: bypass the seen-twice rule only.</param>
     /// <param name="backend">The served backend tag (only CPU entries are written until the Vulkan schema question is settled).</param>
     /// <returns>The outcome.</returns>
-    public AdmissionResult Admit(ChunkSpanRef span, ChunkKey key, int tokenCount, ChunkCaller caller, bool onMissEncode, string backend)
+    public AdmissionResult Admit(ChunkSpanRef span, ChunkKey key, int tokenCount, ChunkCaller caller, bool onMissEncode, string backend) =>
+        AdmitCore(span, key, tokenCount, caller, onMissEncode, backend, prewarm: false);
+
+    /// <summary>
+    /// Admits one prewarm text (<c>POST /v1/chunk-cache/prewarm</c>, spec §7.2): every rule of <see cref="Admit"/> except the
+    /// seen-twice rule, and no sighting is recorded (a prewarm is not a request that carried the text). Request thread,
+    /// never blocking.
+    /// </summary>
+    /// <param name="span">The text as an annotation (its <c>source.path</c>, when given, is checked against the deny-list).</param>
+    /// <param name="key">Its key in the caller's namespace.</param>
+    /// <param name="tokenCount">Its token count.</param>
+    /// <param name="caller">The caller (authenticated).</param>
+    /// <param name="backend">The served backend tag.</param>
+    /// <returns>The outcome.</returns>
+    public AdmissionResult AdmitPrewarm(ChunkSpanRef span, ChunkKey key, int tokenCount, ChunkCaller caller, string backend) =>
+        AdmitCore(span, key, tokenCount, caller, onMissEncode: true, backend, prewarm: true);
+
+    /// <summary>Whether the store holds <paramref name="key"/> (a file probe; no lock). A hit also refreshes its ledger row's last use.</summary>
+    /// <param name="key">The key.</param>
+    /// <returns>Whether it is stored.</returns>
+    public bool IsStored(ChunkKey key)
+    {
+        if (!_store.Contains(key))
+            return false;
+        Touch(key);
+        return true;
+    }
+
+    private AdmissionResult AdmitCore(ChunkSpanRef span, ChunkKey key, int tokenCount, ChunkCaller caller, bool onMissEncode, string backend, bool prewarm)
     {
         ArgumentNullException.ThrowIfNull(span);
         ArgumentNullException.ThrowIfNull(caller);
@@ -327,14 +434,18 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         if (tokenCount <= 0 || tokenCount > MaxEncodeTokens)
             return Refused(AdmissionReasons.TooLong);
         long perToken = Interlocked.Read(ref _bytesPerToken);
-        if (perToken > 0 && Interlocked.Read(ref _headerBytes) + perToken * tokenCount > _budget)
+        long smallestBudget = NamespaceBudgetBytes > 0 ? Math.Min(_budget, NamespaceBudgetBytes) : _budget;
+        if (perToken > 0 && Interlocked.Read(ref _headerBytes) + perToken * tokenCount > smallestBudget)
             return Refused(AdmissionReasons.OverBudget); // could never be stored: no encode is spent on it
         if (tokenCount > MaxCpuEncodeTokens) // the backend is CPU here (checked above); ruling: a request waits behind at most one 512-token encode
             return Refused(AdmissionReasons.TooLargeForCpu);
 
-        int seen = Sightings.See(caller.Namespace, span.Hash, span.SourcePath);
-        if (seen < SightingTable.AdmitAfter && !onMissEncode)
-            return Refused(AdmissionReasons.NotSeenTwice);
+        if (!prewarm)
+        {
+            int seen = Sightings.See(caller.Namespace, span.Hash, span.SourcePath);
+            if (seen < SightingTable.AdmitAfter && !onMissEncode)
+                return Refused(AdmissionReasons.NotSeenTwice);
+        }
         if (_writesDisabled)
             return Refused(AdmissionReasons.WritesDisabled);
         if (_problem == StoreProblems.BudgetExhausted)
@@ -474,6 +585,19 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     /// <inheritdoc/>
     public void Tick()
     {
+        _ledgerSync.Wait();
+        try
+        {
+            TickLocked();
+        }
+        finally
+        {
+            _ledgerSync.Release();
+        }
+    }
+
+    private void TickLocked()
+    {
         if (_writesDisabled && Environment.TickCount64 - _lastReloadTryMs >= (long)ReloadRetryInterval.TotalMilliseconds)
             TryVerifiedReload();
         ApplyTouches();
@@ -492,8 +616,27 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     /// <inheritdoc/>
     public void Write(ChunkEncodeItem item, ChunkKvEntry entry)
     {
+        _ledgerSync.Wait();
+        try
+        {
+            WriteLocked(item, entry);
+        }
+        finally
+        {
+            _ledgerSync.Release();
+        }
+    }
+
+    /// <summary>Whether a forget of the item's namespace (or of the whole store) came after the item was queued.</summary>
+    private bool Forgotten(ChunkEncodeItem item) =>
+        item.Seq <= _forgetAllFence || (_forgetFences.TryGetValue(item.Namespace, out long fence) && item.Seq <= fence);
+
+    private void WriteLocked(ChunkEncodeItem item, ChunkKvEntry entry)
+    {
         if (_writesDisabled || _ledger is not { } ledger)
             return;
+        if (Forgotten(item))
+            return; // forgotten while it was being encoded
         ChunkKey key = item.Key;
         string path = _files.PathOf(key);
         long estimate = EntryBytes(entry);
@@ -560,6 +703,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             }
             if (!existed && File.Exists(path))
                 Interlocked.Add(ref _storeBytes, bytes);
+            RefreshFigures(ledger);
             ChunkCacheMetrics.RecordWrite("stored");
             LearnEntrySize(entry);
             if (_problem is StoreProblems.LockTimeout or StoreProblems.WriteFailed or StoreProblems.EntryTooLarge)
@@ -576,23 +720,41 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     /// </summary>
     private bool EnsureRoom(long needed, long minimumEntry, string ns, StoreLockHandle storeLock, ServerLedger ledger)
     {
-        if (StoreBytes + needed <= _budget)
+        // Per-namespace budget (--chunk-store-namespace-budget): the writing namespace's ledger bytes must stay within it.
+        long nsBudget = NamespaceBudgetBytes;
+        long nsBytes = 0;
+        bool nsOver = false;
+        if (nsBudget > 0)
+        {
+            if (needed > nsBudget)
+                return TooLarge();
+            nsBytes = ledger.InNamespace(ns).Sum(r => r.Bytes);
+            nsOver = nsBytes + needed > nsBudget;
+        }
+        if (!nsOver && StoreBytes + needed <= _budget)
             return true;
         if (needed > _budget)
             return TooLarge(); // before any store enumeration: it can never fit
         long bytes = _files.GetStats().EntryBytes; // recount under the lock: CLI writes, earlier evictions
         Interlocked.Exchange(ref _storeBytes, bytes);
-        if (bytes + needed <= _budget)
+        if (!nsOver && bytes + needed <= _budget)
             return true;
 
         IReadOnlySet<ChunkKey> indexed;
         try { indexed = ChunkIndex.IndexReferencedKeysUnder(_root); }
         catch (InvalidDataException) { return Stop("an index file cannot be read; eviction cannot be decided"); }
 
+        // Candidates: the writing namespace's own rows first, least recently used first; with a per-namespace budget ONLY
+        // its own rows (one tenant never evicts another's entries), else the others' rows after them (one shared LRU).
         var rows = ledger.LeastRecentlyUsed().ToList();
-        var ordered = rows.Where(r => string.Equals(r.Namespace, ns, StringComparison.Ordinal))
-            .Concat(rows.Where(r => !string.Equals(r.Namespace, ns, StringComparison.Ordinal)))
-            .Select(r => { var k = new ChunkKey(r.KeyHex); return (Key: k, Size: indexed.Contains(k) ? 0 : FileLength(_files.PathOf(k)) ?? 0); })
+        var own = rows.Where(r => string.Equals(r.Namespace, ns, StringComparison.Ordinal));
+        var ordered = (nsBudget > 0 ? own : own.Concat(rows.Where(r => !string.Equals(r.Namespace, ns, StringComparison.Ordinal))))
+            .Select(r =>
+            {
+                var k = new ChunkKey(r.KeyHex);
+                return (Key: k, Size: indexed.Contains(k) ? 0 : FileLength(_files.PathOf(k)) ?? 0, RowBytes: r.Bytes,
+                    Own: string.Equals(r.Namespace, ns, StringComparison.Ordinal));
+            })
             .ToList();
         long ownFreeable = ordered.Sum(v => v.Size);
         if (bytes - ownFreeable + needed > _budget)
@@ -600,20 +762,25 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             // Evicting every row the server may evict would still not make room for THIS entry. The writer stops only when
             // not even a minimum-size entry would fit then (the store is genuinely full of entries the server may not
             // evict); otherwise this entry alone is dropped, whatever its size, so no caller can stop the writer for others.
-            return bytes - ownFreeable + minimumEntry > _budget
+            // With a per-namespace budget a namespace never stops the writer for the others: its entry is dropped.
+            return nsBudget == 0 && bytes - ownFreeable + minimumEntry > _budget
                 ? Stop("the store is full of entries the server may not evict")
                 : TooLarge();
         }
 
         var victims = new List<(ChunkKey Key, long Size)>();
-        long freeable = 0;
+        long freeable = 0, nsFreed = 0;
         foreach (var v in ordered)
         {
-            if (bytes - freeable + needed <= _budget)
+            if (bytes - freeable + needed <= _budget && (nsBudget == 0 || nsBytes - nsFreed + needed <= nsBudget))
                 break;
-            victims.Add(v);
+            victims.Add((v.Key, v.Size));
             freeable += v.Size;
+            if (v.Own)
+                nsFreed += v.RowBytes;
         }
+        if (nsBudget > 0 && nsBytes - nsFreed + needed > nsBudget)
+            return TooLarge(); // cannot happen (needed <= nsBudget and every own row is a candidate); kept as a guard
 
         foreach (var (key, _) in victims)
             ledger.Remove(key);
@@ -629,6 +796,8 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
                 _problem = StoreProblems.WriteFailed;
             return false;
         }
+
+        RefreshFigures(ledger);
 
         // After the save, under the same lock: what any index or the remaining ledger still references keeps its file.
         IReadOnlySet<ChunkKey> referenced;
@@ -742,6 +911,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             ledger.Record(new ChunkKey(row.KeyHex), row.Namespace, row.SourcePath, row.Bytes, row.FirstSeen);
             ledger.Touch(new ChunkKey(row.KeyHex), row.LastUsed);
         }
+        RefreshFigures(ledger);
     }
 
     private void DisableWrites(LedgerUnreadableException ex)
@@ -769,6 +939,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             _ledger = reloaded;
         else
             ReplaceLedgerRows(reloaded);
+        RefreshFigures(_ledger);
         if (_problem == StoreProblems.LedgerUnreadable)
             _problem = null;
         _writesDisabled = false;
@@ -813,6 +984,356 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             _indexKeys = new HashSet<ChunkKey>(); // fail closed: with an unreadable index nothing is admitted as indexed
             _indexStamp = stamp;
             ServerLog.Info($"chunk-store: index references cannot be read ({ex.GetType().Name}); index-only admission refuses everything");
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------------ figures (capabilities)
+
+    /// <summary>Rebuilds the per-namespace figures from <paramref name="ledger"/> (call under <see cref="_ledgerSync"/>).</summary>
+    private void RefreshFigures(ServerLedger ledger)
+    {
+        var figures = new Dictionary<string, (long Entries, long Bytes)>(StringComparer.Ordinal);
+        foreach (var row in ledger.Rows)
+        {
+            figures.TryGetValue(row.Namespace, out var f);
+            figures[row.Namespace] = (f.Entries + 1, f.Bytes + row.Bytes);
+        }
+        _namespaceFigures = figures;
+    }
+
+    /// <summary>The ledger entries and bytes of one namespace (what a non-admin caller may see), as of the last ledger change.</summary>
+    /// <param name="ns">The namespace.</param>
+    /// <returns>Entries and bytes.</returns>
+    public (long Entries, long Bytes) NamespaceFigures(string ns) =>
+        _namespaceFigures.TryGetValue(ns, out var f) ? f : (0, 0);
+
+    /// <summary>Store-wide figures (admin only): every entry file in the store, CLI and orphans included.</summary>
+    /// <returns>Entries and bytes.</returns>
+    public (long Entries, long Bytes) StoreFigures()
+    {
+        var stats = _files.GetStats();
+        return (stats.Entries, stats.EntryBytes);
+    }
+
+    // ------------------------------------------------------------------------------------------------ evict and forget (Task 16)
+
+    /// <summary>
+    /// Evicts or forgets (spec §7.2, §10; plan Task 16). <see cref="EvictMode.Orphans"/> deletes the entry files no index and
+    /// no ledger row references. The forget modes (<see cref="EvictMode.Path"/>, <see cref="EvictMode.Namespace"/>,
+    /// <see cref="EvictMode.All"/>) remove, in the requested namespace (or the whole store): the ledger rows (by provenance
+    /// glob for <c>path</c>), for <c>namespace</c> / <c>all</c> the namespace's own index files (Task 4b names; legacy names
+    /// are never deleted), the matching sighting rows and queued encodes (an encode in flight is dropped by a fence), and the
+    /// entry files of the forgotten keys that nothing else references. A forgotten key that an index the call does not
+    /// remove (a CLI index, a legacy name) still references keeps its file and is counted in
+    /// <see cref="EvictOutcome.KeptReferenced"/> (Task 15 rule (c)): the server owns no index references, so a path forget never edits
+    /// an index. No marker is kept (a later sighting starts again).
+    /// </summary>
+    /// <remarks>
+    /// Fail closed: with writes disabled (unreadable ledger), an unreadable ledger file on disk, or an unreadable index file,
+    /// nothing is deleted (<see cref="EvictRefusedException"/>), dry runs included. Locks, in this order and all within
+    /// <see cref="LockTimeout"/>, waited for asynchronously (no sleep on a request thread): the index locks of the index
+    /// files to delete, the ledger gate, the store lock (one short scope: verify, save the ledger, delete the index files,
+    /// re-read the references, delete the entry files). A dry run takes no lock file. Nothing is logged but counts.
+    /// </remarks>
+    /// <param name="request">The resolved request.</param>
+    /// <param name="ct">Cancellation (the request's).</param>
+    /// <returns>The counts.</returns>
+    /// <exception cref="EvictRefusedException">Nothing was deleted, see <see cref="EvictRefusedException.Detail"/>.</exception>
+    /// <exception cref="ArgumentException">The glob is empty, rooted, negated or has a <c>..</c> segment.</exception>
+    public async Task<EvictOutcome> EvictAsync(EvictRequest request, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ForgetMatcher? matcher = request.Mode == EvictMode.Path ? ForgetMatcher.Create(request.Glob!) : null;
+        if (request.Mode is not EvictMode.Orphans && request.Namespace is { } named)
+            ChunkNamespace.Validate(named, nameof(request));
+        if (_writesDisabled)
+            throw LedgerRefusal();
+
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        TimeSpan timeout = LockTimeout;
+        IReadOnlyList<string> indexFiles = request.Mode is EvictMode.Namespace or EvictMode.All ? OwnIndexFiles(request.Namespace) : [];
+        var indexLocks = new List<IDisposable>();
+        bool synced = false;
+        StoreLockHandle? storeLock = null;
+        try
+        {
+            if (!request.DryRun)
+            {
+                // Lock order: index locks, then (after the ledger gate) the store lock.
+                foreach (string file in indexFiles)
+                {
+                    while (true)
+                    {
+                        try
+                        {
+                            indexLocks.Add(ChunkIndex.AcquireIndexLockFor(file, TimeSpan.Zero));
+                            break;
+                        }
+                        catch (ChunkStoreLockTimeoutException) when (clock.Elapsed < timeout)
+                        {
+                            await Task.Delay(20, ct);
+                        }
+                        catch (ChunkStoreLockTimeoutException)
+                        {
+                            throw LockRefusal(timeout);
+                        }
+                    }
+                }
+            }
+            TimeSpan left = timeout - clock.Elapsed;
+            if (left < TimeSpan.Zero || !await _ledgerSync.WaitAsync(left, ct))
+                throw LockRefusal(timeout);
+            synced = true;
+            if (_writesDisabled || _ledger is not { } ledger)
+                throw LedgerRefusal();
+            if (!request.DryRun)
+            {
+                while (true)
+                {
+                    try
+                    {
+                        storeLock = ChunkIndex.AcquireStoreLock(_root, TimeSpan.Zero);
+                        break;
+                    }
+                    catch (ChunkStoreLockTimeoutException) when (clock.Elapsed < timeout)
+                    {
+                        await Task.Delay(20, ct);
+                    }
+                    catch (ChunkStoreLockTimeoutException)
+                    {
+                        throw LockRefusal(timeout);
+                    }
+                }
+            }
+            return EvictLocked(request, matcher, indexFiles, ledger, storeLock);
+        }
+        finally
+        {
+            storeLock?.Dispose();
+            if (synced)
+                _ledgerSync.Release();
+            foreach (var l in indexLocks)
+                l.Dispose();
+        }
+    }
+
+    private static EvictRefusedException LedgerRefusal() => new(StoreProblems.LedgerUnreadable,
+        "the server ledger cannot be read; nothing was evicted (writes stay disabled until it reads back)");
+
+    private static EvictRefusedException LockRefusal(TimeSpan timeout) => new(StoreProblems.LockTimeout,
+        $"store lock timeout after {timeout.TotalSeconds:0.#} s (another writer holds the store or an index); nothing was evicted");
+
+    /// <summary>The current-name index files of <paramref name="ns"/> (every namespace when null) directly under the root.</summary>
+    private IReadOnlyList<string> OwnIndexFiles(string? ns) =>
+        ChunkIndex.IndexFilesUnder(_root)
+            .Where(f => ChunkIndex.TryParseIndexFileName(System.IO.Path.GetFileName(f), out var parts)
+                && (ns is null || string.Equals(parts.Namespace, ns, StringComparison.Ordinal)))
+            .ToList();
+
+    private EvictOutcome EvictLocked(EvictRequest request, ForgetMatcher? matcher, IReadOnlyList<string> indexFiles, ServerLedger ledger, StoreLockHandle? storeLock)
+    {
+        bool dry = request.DryRun;
+        string? ns = request.Namespace;
+
+        // Fail closed: the ledger on disk and every index file must read before anything is decided.
+        IReadOnlySet<ChunkKey> keptByIndexes, referencedBefore;
+        var removedIndexKeys = new HashSet<ChunkKey>();
+        try
+        {
+            referencedBefore = ChunkIndex.ReferencedKeysUnder(_root); // every index and the ledger file on disk
+            keptByIndexes = ChunkIndex.IndexReferencedKeysUnder(_root, indexFiles);
+            foreach (string file in indexFiles)
+                removedIndexKeys.UnionWith(ChunkIndex.KeysOfIndexFile(file));
+        }
+        catch (LedgerUnreadableException ex)
+        {
+            DisableWrites(ex);
+            throw LedgerRefusal();
+        }
+        catch (InvalidDataException)
+        {
+            ServerLog.Info("chunk-store: evict refused, an index file cannot be read; nothing was evicted");
+            throw new EvictRefusedException(StoreProblems.IndexUnreadable, "an index file in the store cannot be read; nothing was evicted");
+        }
+
+        // What goes: ledger rows, and the keys whose entry files may go.
+        List<LedgerRow> rows = request.Mode switch
+        {
+            EvictMode.Orphans => [],
+            EvictMode.Path => ledger.InNamespace(ns!).Where(r => matcher!.Matches(r.SourcePath)).ToList(),
+            _ when ns is null => ledger.Rows.ToList(),
+            _ => ledger.InNamespace(ns).ToList(),
+        };
+        var removedRowKeys = rows.Select(r => new ChunkKey(r.KeyHex)).ToHashSet();
+        IEnumerable<ChunkKey> candidates = request.Mode switch
+        {
+            EvictMode.Orphans => _files.Keys().Where(k => !referencedBefore.Contains(k)),
+            _ when request.Mode == EvictMode.All && ns is null => _files.Keys(),
+            _ => removedRowKeys.Concat(removedIndexKeys),
+        };
+        var remaining = new HashSet<ChunkKey>(keptByIndexes);
+        foreach (var row in ledger.Rows)
+        {
+            var k = new ChunkKey(row.KeyHex);
+            if (!removedRowKeys.Contains(k))
+                remaining.Add(k);
+        }
+        var victims = new List<(ChunkKey Key, long Size)>();
+        int kept = 0;
+        foreach (var key in candidates.Distinct())
+        {
+            if (FileLength(_files.PathOf(key)) is not { } size)
+                continue; // no file: nothing to delete (a row without its file)
+            if (remaining.Contains(key))
+                kept++;
+            else
+                victims.Add((key, size));
+        }
+
+        Func<string, string?, bool>? sightingMatch = request.Mode switch
+        {
+            EvictMode.Orphans => null,
+            EvictMode.Path => (rowNs, path) => string.Equals(rowNs, ns, StringComparison.Ordinal) && matcher!.Matches(path),
+            _ when ns is null => (_, _) => true,
+            _ => (rowNs, _) => string.Equals(rowNs, ns, StringComparison.Ordinal),
+        };
+        Func<ChunkEncodeItem, bool>? queueMatch = sightingMatch is null ? null : item => sightingMatch(item.Namespace, item.SourcePath);
+
+        if (dry)
+        {
+            return new EvictOutcome(victims.Count, victims.Sum(v => v.Size), kept, rows.Count, indexFiles.Count,
+                sightingMatch is null ? 0 : Sightings.Remove(sightingMatch, countOnly: true),
+                queueMatch is null || _queue is null ? 0 : _queue.Remove(queueMatch, countOnly: true));
+        }
+
+        // 1. Forget the rows (one save) and fence the queue, before any file goes.
+        int sightings = 0, queued = 0;
+        if (request.Mode != EvictMode.Orphans)
+        {
+            long fence = _queue?.LastSeq ?? 0;
+            if (ns is null)
+                _forgetAllFence = Math.Max(_forgetAllFence, fence);
+            else
+                _forgetFences[ns] = Math.Max(_forgetFences.GetValueOrDefault(ns), fence);
+            queued = queueMatch is null || _queue is null ? 0 : _queue.Remove(queueMatch);
+            sightings = Sightings.Remove(sightingMatch!);
+        }
+        if (rows.Count > 0)
+        {
+            foreach (var key in removedRowKeys)
+                ledger.Remove(key);
+            try
+            {
+                ledger.Save(storeLock!);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                ServerLog.Info($"chunk-store: evict refused, the ledger save failed ({ex.GetType().Name}); nothing was deleted");
+                RollBackAfterFailedSave(null, true, true);
+                throw new EvictRefusedException(StoreProblems.WriteFailed, "the ledger could not be saved; no entry file was deleted");
+            }
+            RefreshFigures(ledger);
+        }
+
+        // 2. The namespace's index files (their index locks are held).
+        int indexDeleted = 0;
+        foreach (string file in indexFiles)
+        {
+            try
+            {
+                File.Delete(file);
+                indexDeleted++;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                ServerLog.Info($"chunk-store: an index file could not be deleted ({ex.GetType().Name}); its entries stay referenced");
+            }
+        }
+
+        // 3. Entry files, decided again from what is on disk now (the saved ledger, the remaining indexes).
+        IReadOnlySet<ChunkKey> referenced;
+        try
+        {
+            referenced = ChunkIndex.ReferencedKeysUnder(_root);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or LedgerUnreadableException)
+        {
+            ServerLog.Info($"chunk-store: evict stopped before deleting entry files ({ex.GetType().Name})");
+            throw new EvictRefusedException(ex is LedgerUnreadableException ? StoreProblems.LedgerUnreadable : StoreProblems.IndexUnreadable,
+                "the references could not be read again; rows were forgotten but no entry file was deleted");
+        }
+        int evicted = 0;
+        long freed = 0;
+        foreach (var (key, size) in victims)
+        {
+            if (referenced.Contains(key) || ledger.Touch(key, DateTimeOffset.MinValue))
+            {
+                kept++;
+                continue;
+            }
+            try
+            {
+                _store.Evict(key);
+                evicted++;
+                freed += size;
+                ChunkCacheMetrics.RecordEviction();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                ServerLog.Info($"chunk-store: an entry file could not be deleted ({ex.GetType().Name}); an orphans pass removes it later");
+            }
+        }
+        Interlocked.Add(ref _storeBytes, -freed);
+        if (evicted > 0 && _problem == StoreProblems.BudgetExhausted)
+            _lastBudgetCheck = DateTimeOffset.MinValue; // re-check the budget at the next tick
+        ServerLog.Info($"chunk-store: evict ({request.Mode.ToString().ToLowerInvariant()}) removed {evicted} entry file(s), {rows.Count} ledger row(s), "
+            + $"{indexDeleted} index file(s), {sightings} sighting(s), {queued} queued encode(s); kept {kept} referenced");
+        return new EvictOutcome(evicted, freed, kept, rows.Count, indexDeleted, sightings, queued);
+    }
+
+    /// <summary>
+    /// Matches a forget glob against stored provenance: the ledger's (normalised) <c>sourcePath</c> and the sighting table's
+    /// capped form (<see cref="SightingTable.StoredPath"/>). A path over <see cref="SightingTable.StoredPathChars"/> characters
+    /// is held as a prefix plus a hash, so the requested path is also compared in that stored form (review: the raw path would
+    /// never match it).
+    /// </summary>
+    private sealed class ForgetMatcher
+    {
+        private readonly DotLLM.ChunkReuse.Tooling.PathGlob _glob;
+        private readonly HashSet<string> _storedForms;
+
+        private ForgetMatcher(DotLLM.ChunkReuse.Tooling.PathGlob glob, HashSet<string> storedForms)
+        {
+            _glob = glob;
+            _storedForms = storedForms;
+        }
+
+        public static ForgetMatcher Create(string glob)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(glob);
+            var parsed = DotLLM.ChunkReuse.Tooling.PathGlob.Parse(glob);
+            if (parsed.Negated)
+                throw new ArgumentException("A forget glob cannot be negated ('!').", nameof(glob));
+            var forms = new HashSet<string>(ChunkIndex.PathComparer);
+            foreach (string form in new[] { glob, glob.Trim(), Normal(glob.Trim()) })
+                if (SightingTable.StoredPath(form) is { } stored)
+                    forms.Add(stored);
+            return new ForgetMatcher(parsed, forms);
+        }
+
+        public bool Matches(string? path) =>
+            path is not null && (_glob.IsMatch(path) || _storedForms.Contains(path) || _storedForms.Contains(Normal(path)));
+
+        private static string Normal(string path)
+        {
+            try
+            {
+                return ChunkIndex.NormalizePath(path);
+            }
+            catch (ArgumentException)
+            {
+                return path.Replace('\\', '/');
+            }
         }
     }
 

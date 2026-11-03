@@ -81,6 +81,8 @@ internal sealed class ChunkCacheRuntime : IDisposable
     internal void ExitExplainBodyRead() => Interlocked.Decrement(ref _explainBodyReadsInFlight);
 
     internal void CountInferenceCallerResolution() => Interlocked.Increment(ref _inferenceCallerResolutions);
+    /// <summary>Slots for concurrent <c>prewarm</c> / <c>evict</c> calls (<see cref="Endpoints.ChunkCacheEndpoint.MaxConcurrentWrites"/>).</summary>
+    internal SemaphoreSlim WriteGate { get; } = new(Endpoints.ChunkCacheEndpoint.MaxConcurrentWrites, Endpoints.ChunkCacheEndpoint.MaxConcurrentWrites);
 
     /// <summary>A store injected by the host or a test; wins over <c>--chunk-store</c>.</summary>
     internal IChunkStore? StoreOverride { get; set; }

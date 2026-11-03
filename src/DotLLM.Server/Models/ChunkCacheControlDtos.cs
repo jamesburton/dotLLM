@@ -115,7 +115,8 @@ public sealed record ChunkCacheRopeDto
 
 /// <summary>
 /// <c>capabilities.store</c>: figures for the caller's own namespace (non-admin callers never see store-wide figures).
-/// All 0 until the server writes the store and keeps a ledger (plan Tasks 15–16).
+/// With <c>--chunk-store-write</c>: the caller namespace's ledger entries and the budget that applies to it; an admin sees
+/// store-wide figures (every entry file) and the store budget. 0 without a writer for non-admins (no ledger is kept).
 /// </summary>
 public sealed record ChunkCacheStoreDto
 {
@@ -131,7 +132,7 @@ public sealed record ChunkCacheStoreDto
     [JsonPropertyName("bytes")]
     public long Bytes { get; init; }
 
-    /// <summary>The disk budget (<c>--chunk-store-budget</c>, a later task); 0 = none.</summary>
+    /// <summary>The disk budget that applies (<c>--chunk-store-budget</c>, or <c>--chunk-store-namespace-budget</c> for a non-admin when set); 0 = none.</summary>
     [JsonPropertyName("budget_bytes")]
     public long BudgetBytes { get; init; }
 
@@ -183,4 +184,85 @@ public sealed record ChunkCacheExplainPredictedDto
     /// <summary>Predicted prefill of the whole prompt without reuse.</summary>
     [JsonPropertyName("full_prefill")]
     public double FullPrefill { get; init; }
+}
+
+/// <summary>
+/// <c>POST /v1/chunk-cache/prewarm</c> (spec §7.2): what one call queued. Counts only: no text, hash, key, namespace or path.
+/// </summary>
+public sealed record ChunkCachePrewarmDto
+{
+    /// <summary>Texts in the call.</summary>
+    [JsonPropertyName("requested")]
+    public int Requested { get; init; }
+
+    /// <summary>Texts whose entry the caller's namespace already holds.</summary>
+    [JsonPropertyName("already_stored")]
+    public int AlreadyStored { get; init; }
+
+    /// <summary>Texts queued for a background encode (or already queued).</summary>
+    [JsonPropertyName("queued")]
+    public int Queued { get; init; }
+
+    /// <summary>Their tokens (each distinct text once).</summary>
+    [JsonPropertyName("queued_tokens")]
+    public int QueuedTokens { get; init; }
+
+    /// <summary>Texts refused.</summary>
+    [JsonPropertyName("refused")]
+    public int Refused { get; init; }
+
+    /// <summary>The distinct refusal reasons (admission reasons such as <c>denied_path</c>, <c>too_large_for_cpu</c>), ordinal order.</summary>
+    [JsonPropertyName("refused_reasons")]
+    public required string[] RefusedReasons { get; init; }
+}
+
+/// <summary>
+/// <c>POST /v1/chunk-cache/evict</c> (spec §7.2): what the call removed, or with <c>dry_run</c> would remove. Counts only.
+/// </summary>
+public sealed record ChunkCacheEvictDto
+{
+    /// <summary>Entry files deleted (or that would be).</summary>
+    [JsonPropertyName("evicted")]
+    public int Evicted { get; init; }
+
+    /// <summary>Their bytes.</summary>
+    [JsonPropertyName("freed_bytes")]
+    public long FreedBytes { get; init; }
+
+    /// <summary>Entry files of forgotten keys kept because an index (or a remaining ledger row) still references them.</summary>
+    [JsonPropertyName("kept_referenced")]
+    public int KeptReferenced { get; init; }
+
+    /// <summary>Whether this was a dry run (nothing changed).</summary>
+    [JsonPropertyName("dry_run")]
+    public bool DryRun { get; init; }
+
+    /// <summary>What else the forget removed (additive to the spec's output).</summary>
+    [JsonPropertyName("removed")]
+    public required ChunkCacheEvictRemovedDto Removed { get; init; }
+
+    /// <summary>Warning codes (<c>chunk_namespace_ignored</c>); omitted when none.</summary>
+    [JsonPropertyName("warnings")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string[]? Warnings { get; init; }
+}
+
+/// <summary><c>evict.removed</c>: the non-file kinds a forget removes (or would remove).</summary>
+public sealed record ChunkCacheEvictRemovedDto
+{
+    /// <summary>Server-ledger rows.</summary>
+    [JsonPropertyName("ledger_rows")]
+    public int LedgerRows { get; init; }
+
+    /// <summary>The namespace's index files.</summary>
+    [JsonPropertyName("index_files")]
+    public int IndexFiles { get; init; }
+
+    /// <summary>Sighting rows.</summary>
+    [JsonPropertyName("sightings")]
+    public int Sightings { get; init; }
+
+    /// <summary>Queued encodes dropped.</summary>
+    [JsonPropertyName("queued")]
+    public int Queued { get; init; }
 }

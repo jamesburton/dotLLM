@@ -12,6 +12,9 @@ namespace DotLLM.Server.ChunkCache;
 /// <param name="SourcePath">The annotation's <c>source.path</c> (the ledger row's provenance), or null.</param>
 internal sealed record ChunkEncodeItem(string Namespace, ChunkKey Key, string Text, int TokenCount, string? SourcePath)
 {
+    /// <summary>The queue's sequence number (set on enqueue, from 1): a forget drops in-flight items queued at or before it.</summary>
+    public long Seq { get; init; }
+
     // Never print the text, the key or the namespace (spec 10).
     private bool PrintMembers(System.Text.StringBuilder builder)
     {
@@ -116,6 +119,7 @@ internal sealed class ChunkEncodeQueue : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Thread _thread;
     private long _chars;
+    private long _seq;
     private int _inFlight;
     private int _disposed;
     private int _windowEncodes;
@@ -189,12 +193,52 @@ internal sealed class ChunkEncodeQueue : IDisposable
                 refusal = AdmissionReasons.QueueFull;
                 return false;
             }
-            _items.Enqueue(item);
+            _items.Enqueue(item with { Seq = ++_seq });
             _queued.Add((item.Namespace, item.Key.Hex));
             _perNamespace[item.Namespace] = mine + 1;
             _chars += item.Text.Length;
             Monitor.PulseAll(_gate);
             return true;
+        }
+    }
+
+    /// <summary>The sequence number of the last item queued (0 = none yet).</summary>
+    public long LastSeq
+    {
+        get { lock (_gate) return _seq; }
+    }
+
+    /// <summary>
+    /// Drops (or, with <paramref name="countOnly"/>, counts) the queued items <paramref name="match"/> selects (forget, Task
+    /// 16). The item being encoded is not affected here: its write checks the forget fence (<see cref="LastSeq"/>).
+    /// </summary>
+    /// <param name="match">Selects an item.</param>
+    /// <param name="countOnly">Count without dropping.</param>
+    /// <returns>How many queued items matched.</returns>
+    public int Remove(Func<ChunkEncodeItem, bool> match, bool countOnly = false)
+    {
+        ArgumentNullException.ThrowIfNull(match);
+        lock (_gate)
+        {
+            var hits = _items.Where(match).ToList();
+            if (countOnly || hits.Count == 0)
+                return hits.Count;
+            var keep = _items.Where(i => !match(i)).ToList();
+            _items.Clear();
+            foreach (var i in keep)
+                _items.Enqueue(i);
+            foreach (var item in hits)
+            {
+                _chars -= item.Text.Length;
+                _queued.Remove((item.Namespace, item.Key.Hex));
+                if (_perNamespace.TryGetValue(item.Namespace, out int n))
+                {
+                    if (n <= 1) _perNamespace.Remove(item.Namespace);
+                    else _perNamespace[item.Namespace] = n - 1;
+                }
+            }
+            Monitor.PulseAll(_gate);
+            return hits.Count;
         }
     }
 

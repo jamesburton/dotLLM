@@ -6,7 +6,8 @@ namespace DotLLM.Server.ChunkCache;
 /// carry the first <c>source.path</c> seen, for forget (Task 16), capped at <see cref="StoredPathChars"/> (a longer path is
 /// kept as a prefix plus a hash). Bounded: at most <see cref="Capacity"/> rows, the least recently seen dropped first, and
 /// at most <see cref="PerNamespaceCapacity"/> per namespace (a namespace at its share drops its own least recent row, so
-/// one tenant cannot push out another's sightings). In memory only (never persisted, never logged: spec §10). Thread-safe.
+/// one tenant cannot push out another's sightings). Forget (<see cref="Remove"/>) drops rows by namespace and provenance,
+/// with no marker. In memory only (never persisted, never logged: spec §10). Thread-safe.
 /// </summary>
 internal sealed class SightingTable
 {
@@ -114,6 +115,26 @@ internal sealed class SightingTable
     {
         lock (_gate)
             return _rows.TryGetValue((ns, hash), out var node) ? node.Value.SourcePath : null;
+    }
+
+    /// <summary>
+    /// Removes (or, with <paramref name="countOnly"/>, counts) the rows <paramref name="match"/> selects: forget (Task 16).
+    /// No marker is kept: a later sighting of the same text starts again at 1.
+    /// </summary>
+    /// <param name="match">Selects a row by its namespace and stored <c>source.path</c> (null when none was given).</param>
+    /// <param name="countOnly">Count without removing (a dry run).</param>
+    /// <returns>How many rows matched.</returns>
+    public int Remove(Func<string, string?, bool> match, bool countOnly = false)
+    {
+        ArgumentNullException.ThrowIfNull(match);
+        lock (_gate)
+        {
+            var hits = _lru.Where(r => match(r.Ns, r.SourcePath)).ToList();
+            if (!countOnly)
+                foreach (var row in hits)
+                    Drop(row);
+            return hits.Count;
+        }
     }
 
     private void Drop(Row row)

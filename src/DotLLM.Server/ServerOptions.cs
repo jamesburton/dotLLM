@@ -544,6 +544,7 @@ public sealed record ServerOptions
         bool chunkStoreWrite = false;
         string? chunkStoreBudget = null;
         bool chunkStoreIndexOnly = false;
+        string? chunkStoreNamespaceBudget = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -690,6 +691,8 @@ public sealed record ServerOptions
                     chunkStoreBudget = next ?? throw new ArgumentException("--chunk-store-budget requires a byte size."); i++; break;
                 case "--chunk-store-index-only":
                     chunkStoreIndexOnly = true; break;
+                case "--chunk-store-namespace-budget":
+                    chunkStoreNamespaceBudget = next ?? throw new ArgumentException("--chunk-store-namespace-budget requires a byte size."); i++; break;
                 case "--max-messages":
                     maxMessagesCli = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 default:
@@ -768,7 +771,7 @@ public sealed record ServerOptions
             Metrics = metrics,
             AllowLoraAdminApi = allowLoraAdmin,
             ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(chunkCache, chunkCacheMaxChunks, chunkStore, chunkCacheApiKeys, chunkCacheAllowShortKeys,
-                chunkStoreWrite, chunkStoreBudget, chunkStoreIndexOnly),
+                chunkStoreWrite, chunkStoreBudget, chunkStoreIndexOnly, chunkStoreNamespaceBudget),
             MaxMessages = ResolveMaxMessages(maxMessagesCli, Environment.GetEnvironmentVariable(MaxMessagesEnvVar)),
             ModelId = modelId,
             RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,

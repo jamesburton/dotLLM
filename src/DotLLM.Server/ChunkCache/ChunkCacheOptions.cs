@@ -3,7 +3,7 @@ namespace DotLLM.Server.ChunkCache;
 /// <summary>
 /// Server switches for the <c>chunk_cache</c> wire convention (<c>--chunk-cache</c>, <c>--chunk-cache-max-chunks</c>,
 /// <c>--chunk-store</c>, <c>--chunk-cache-api-keys</c>, <c>--chunk-store-write</c>, <c>--chunk-store-budget</c>,
-/// <c>--chunk-store-index-only</c>).
+/// <c>--chunk-store-index-only</c>, <c>--chunk-store-namespace-budget</c>).
 /// Off by default: with <see cref="Enabled"/> false the server never parses an annotation, maps no <c>/v1/chunk-cache</c>
 /// route, and request and response bytes are what they were before the convention for any body.
 /// </summary>
@@ -34,6 +34,14 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? Stor
     /// <summary>Upper bound of <c>--chunk-cache-max-chunks</c>: keeps the per-request parse work bounded.</summary>
     public const int AbsoluteMaxChunks = 65536;
     /// <summary>
+    /// <c>--chunk-store-namespace-budget</c>: the most bytes of ledger entries one namespace may hold (0 = off, the default).
+    /// When set, budget eviction takes only the writing namespace's own rows, so one tenant's writes (prewarm or encode on
+    /// miss) never evict another tenant's entries; a namespace over its share evicts its own least-recently-used rows, and an
+    /// entry that cannot fit without evicting others is dropped. Off: one shared LRU (own rows first, then the others').
+    /// </summary>
+    public long StoreNamespaceBudgetBytes { get; init; }
+
+    /// <summary>
     /// With <c>--chunk-store-write</c>: takes ownership of the store before the model loads (<c>dotllm serve</c>), so a second
     /// writer fails fast; the writer started at map time uses the claim. No-op otherwise.
     /// </summary>
@@ -55,11 +63,13 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? Stor
     /// <param name="storeBudget"><c>--chunk-store-budget</c>: a byte size such as <c>20GiB</c> (needs <c>--chunk-store-write</c>).</param>
     /// <param name="storeIndexOnly"><c>--chunk-store-index-only</c> (needs <c>--chunk-store-write</c>).</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxChunks"/> is below 1 or above <see cref="AbsoluteMaxChunks"/>.</exception>
+    /// <param name="storeNamespaceBudget"><c>--chunk-store-namespace-budget</c>: a byte size (needs <c>--chunk-store-write</c>); null = off.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxChunks"/> is below 1.</exception>
     /// <exception cref="ArgumentException">A store or keys file is given without <c>--chunk-cache</c>, the keys file is
     /// unreadable or invalid (<see cref="ChunkCacheKeys.Load"/>; the message names the line, never a key), or a store-write
     /// option is given without what it needs (the budget is required with <c>--chunk-store-write</c>).</exception>
     public static ChunkCacheOptions Create(bool enabled, int? maxChunks, string? storeRoot = null, string? apiKeysFile = null, bool allowShortKeys = false,
-        bool storeWrite = false, string? storeBudget = null, bool storeIndexOnly = false)
+        bool storeWrite = false, string? storeBudget = null, bool storeIndexOnly = false, string? storeNamespaceBudget = null)
     {
         int max = maxChunks ?? DefaultMaxChunks;
         if (max < 1 || max > AbsoluteMaxChunks)
@@ -86,8 +96,9 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? Stor
             throw new ArgumentException("--chunk-cache-allow-short-keys needs --chunk-cache-api-keys.", nameof(allowShortKeys));
         }
         bool hasBudget = !string.IsNullOrWhiteSpace(storeBudget);
-        if (!storeWrite && (hasBudget || storeIndexOnly))
-            throw new ArgumentException((hasBudget ? "--chunk-store-budget" : "--chunk-store-index-only")
+        bool hasNamespaceBudget = !string.IsNullOrWhiteSpace(storeNamespaceBudget);
+        if (!storeWrite && (hasBudget || storeIndexOnly || hasNamespaceBudget))
+            throw new ArgumentException((hasBudget ? "--chunk-store-budget" : storeIndexOnly ? "--chunk-store-index-only" : "--chunk-store-namespace-budget")
                 + " needs --chunk-store-write (without it the store is read-only).", nameof(storeWrite));
         if (string.IsNullOrWhiteSpace(storeRoot))
         {
@@ -106,6 +117,13 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? Stor
             if (budget <= 0)
                 throw new ArgumentException("--chunk-store-budget must be above 0 bytes.", nameof(storeBudget));
         }
+        long namespaceBudget = 0;
+        if (hasNamespaceBudget)
+        {
+            namespaceBudget = ServerOptions.ParseByteSize(storeNamespaceBudget, "--chunk-store-namespace-budget");
+            if (namespaceBudget <= 0)
+                throw new ArgumentException("--chunk-store-namespace-budget must be above 0 bytes.", nameof(storeNamespaceBudget));
+        }
         string root;
         try
         {
@@ -116,6 +134,6 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? Stor
         {
             throw new ArgumentException($"--chunk-store: not a usable path ({ex.GetType().Name}).", nameof(storeRoot), ex);
         }
-        return new ChunkCacheOptions(enabled, max, root, keys, storeWrite, budget, storeIndexOnly);
+        return new ChunkCacheOptions(enabled, max, root, keys, storeWrite, budget, storeIndexOnly) { StoreNamespaceBudgetBytes = namespaceBudget };
     }
 }
