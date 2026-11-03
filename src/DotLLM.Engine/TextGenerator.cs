@@ -980,7 +980,11 @@ public sealed partial class TextGenerator
             ArrayPool<char>.Shared.Return(stopScratch);
             ReleaseRequestMtpState(mtpState);
             if (ownsKvCache)
+            {
+                // A request that fails before RecordCompletion must still give back its trie admission (issue #1589).
+                if (kvCache is KvCache.PagedKvCache abandoned) _prefixTrieManager?.Abandon(abandoned);
                 kvCache.Dispose();
+            }
             telemetry.RequestSpan?.Dispose();
         }
     }
@@ -1549,7 +1553,11 @@ public sealed partial class TextGenerator
             ArrayPool<char>.Shared.Return(stopScratch);
             ReleaseRequestMtpState(mtpState);
             if (ownsKvCache)
+            {
+                // A request that fails before RecordCompletion must still give back its trie admission (issue #1589).
+                if (kvCache is KvCache.PagedKvCache abandoned) _prefixTrieManager?.Abandon(abandoned);
                 kvCache.Dispose();
+            }
         }
     }
 
@@ -1636,7 +1644,13 @@ public sealed partial class TextGenerator
                 // causes silent truncation once pos >= MaxLength in the decode loop.
                 int requiredSize = promptLen + maxTokens;
                 if (entry.KvCache.MaxLength >= requiredSize)
+                {
+                    // Prefill is about to overwrite rows matchedTokens.. of this cache. Narrow the entry to the rows that
+                    // stay valid BEFORE any write, so a failed or cancelled request cannot leave it advertising a token
+                    // sequence whose tail rows now hold other tokens' K/V (issue #1589).
+                    _prefixCache.Narrow(entry, matchedTokens);
                     return (entry.KvCache, matchedTokens, false);
+                }
 
                 // Cache too small — fall through to allocate fresh
             }
@@ -1645,7 +1659,7 @@ public sealed partial class TextGenerator
             // Cache miss or incompatible — allocate with full model context for future reuse
             int cacheSize = Math.Min(promptLen + maxTokens, _model.Config.MaxSequenceLength);
             var kvCache = AllocateKvCache(cacheSize);
-            return (kvCache, 0, false); // ownsKvCache=false: will be transferred to prefix cache
+            return (kvCache, 0, true); // owned by the request until StoreInPrefixCache hands it to the prefix cache (issue #1589: disposed if the request fails first)
         }
 
         // No prefix cache — allocate normally, caller owns
