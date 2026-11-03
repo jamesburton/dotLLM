@@ -668,14 +668,6 @@ public sealed class ServerState : IDisposable
     }
 
     /// <summary>
-    /// Non-blocking: takes the model for one out-of-band forward pass (the chunk-store writer's background encode, Phase I
-    /// Task 15) only when the server is idle: the request gate is free and nobody waits for it, no model is loading or being
-    /// activated, a model is ready, and the continuous-batch scheduler (when running) has no active or queued sequence. Then the
-    /// gate and the scheduler's model lease are held until the returned handle is disposed, so a request arriving meanwhile
-    /// waits for that one encode only. Returns null at once otherwise; never waits for a busy server.
-    /// </summary>
-    /// <returns>The lease, or null when the server is busy (or no model is loaded).</returns>
-    /// <summary>
     /// Set by <see cref="Dispose"/> when the chunk-store worker was still inside an encode: the model (and the request gate)
     /// were left alive for the process exit rather than freed under a running forward.
     /// </summary>
@@ -685,7 +677,9 @@ public sealed class ServerState : IDisposable
 
     /// <summary>
     /// Changes whenever a request takes the request gate or a sequence is submitted to the scheduler (the chunk-store
-    /// worker's quiet-period clock; its own lease does not count).
+    /// worker's quiet-period clock; its own lease does not count). The server's scheduler is always a
+    /// <see cref="DotLLM.Engine.Scheduler.ContinuousBatchScheduler"/> (the <c>DisaggregatedScheduler</c> is not wired into the
+    /// server); any other inner scheduler would count gate acquisitions only, with the busy probe still seeing its work.
     /// </summary>
     internal long ActivityStamp() =>
         Interlocked.Read(ref _gateAcquisitions)
@@ -696,6 +690,14 @@ public sealed class ServerState : IDisposable
         _requestGate.CurrentCount == 0 || Volatile.Read(ref _gateWaiters) > 0 || _loading is not null
         || _activationGrant is { IsLive: true } || !IsReady || Model is null || (Scheduler is { } sch && !sch.Inner.IsIdle);
 
+    /// <summary>
+    /// Non-blocking: takes the model for one out-of-band forward pass (the chunk-store writer's background encode, Phase I
+    /// Task 15) only when the server is idle: the request gate is free and nobody waits for it, no model is loading or being
+    /// activated, a model is ready, and the continuous-batch scheduler (when running) has no active or queued sequence. Then the
+    /// gate and the scheduler's model lease are held until the returned handle is disposed, so a request arriving meanwhile
+    /// waits for that one encode only. Returns null at once otherwise; never waits for a busy server.
+    /// </summary>
+    /// <returns>The lease, or null when the server is busy (or no model is loaded).</returns>
     internal IDisposable? TryAcquireIdleModel()
     {
         if (!_requestGate.Wait(0))

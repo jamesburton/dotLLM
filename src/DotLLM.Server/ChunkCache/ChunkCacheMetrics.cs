@@ -42,7 +42,7 @@ internal static class ChunkCacheMetrics
         AdmissionReasons.NoStore, AdmissionReasons.Volatile, AdmissionReasons.DeniedPath, AdmissionReasons.SourceUnreadable,
         AdmissionReasons.Backend, AdmissionReasons.TooLong, AdmissionReasons.NotSeenTwice, AdmissionReasons.IndexOnly,
         AdmissionReasons.WritesDisabled, AdmissionReasons.BudgetExhausted, AdmissionReasons.QueueFull,
-        AdmissionReasons.NamespaceQueueShare, AdmissionReasons.RequestCap, AdmissionReasons.SecretContent,
+        AdmissionReasons.NamespaceQueueShare, AdmissionReasons.RequestCap, AdmissionReasons.SecretContent, AdmissionReasons.OverBudget,
     };
 
     /// <summary>Sets the queue-depth source (the running writer).</summary>

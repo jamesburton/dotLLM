@@ -203,12 +203,12 @@ internal sealed class ChunkEncodeQueue : IDisposable
     /// <returns>Whether the queue drained in time.</returns>
     public bool WaitDrained(TimeSpan timeout)
     {
-        var until = DateTime.UtcNow + timeout;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         lock (_gate)
         {
             while (_items.Count + _inFlight > 0)
             {
-                var left = until - DateTime.UtcNow;
+                var left = timeout - clock.Elapsed;
                 if (left <= TimeSpan.Zero || !Monitor.Wait(_gate, left))
                     return _items.Count + _inFlight == 0;
             }
@@ -221,12 +221,14 @@ internal sealed class ChunkEncodeQueue : IDisposable
         try
         {
             var ct = _cts.Token;
-            var lastTick = DateTime.MinValue;
+            var sinceTick = System.Diagnostics.Stopwatch.StartNew();
+            bool firstTick = true;
             while (!ct.IsCancellationRequested)
             {
-                if (DateTime.UtcNow - lastTick >= TickInterval)
+                if (firstTick || sinceTick.Elapsed >= TickInterval)
                 {
-                    lastTick = DateTime.UtcNow;
+                    firstTick = false;
+                    sinceTick.Restart();
                     Guard(_sink.Tick);
                 }
 
@@ -333,9 +335,9 @@ internal sealed class ChunkEncodeQueue : IDisposable
             }
 
             // Quiet so far: watch for the quiet period, restarting on any busy probe or new activity.
-            var quietUntil = DateTime.UtcNow + QuietPeriod;
+            var quietClock = System.Diagnostics.Stopwatch.StartNew(); // monotonic: a wall-clock step never shortens it
             bool quiet = true;
-            while (DateTime.UtcNow < quietUntil)
+            while (quietClock.Elapsed < QuietPeriod)
             {
                 if (ct.WaitHandle.WaitOne(IdlePollInterval))
                     return null;

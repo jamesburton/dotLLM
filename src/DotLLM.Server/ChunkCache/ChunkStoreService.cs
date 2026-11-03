@@ -28,6 +28,7 @@ internal static class AdmissionReasons
     public const string NamespaceQueueShare = "namespace_queue_share";
     public const string RequestCap = "request_cap";
     public const string SecretContent = "secret_content";
+    public const string OverBudget = "over_budget";
 }
 
 /// <summary>What keeps the writer from storing (the <c>detail</c> of a <c>chunk_store_unavailable</c> warning).</summary>
@@ -115,7 +116,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     private readonly StoreOwnerLock _owner;
     private ServerLedger? _ledger;
     private volatile bool _writesDisabled;
-    private DateTime _lastReloadTry = DateTime.UtcNow;
+    private long _lastReloadTryMs = Environment.TickCount64; // monotonic: a wall-clock step never delays the retry
     private readonly ConcurrentQueue<string> _touches = new();
     private readonly TimeProvider _time;
     private ChunkEncodeQueue? _queue;
@@ -321,6 +322,9 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             return Refused(AdmissionReasons.Backend);
         if (tokenCount <= 0 || tokenCount > MaxEncodeTokens)
             return Refused(AdmissionReasons.TooLong);
+        long perToken = Interlocked.Read(ref _bytesPerToken);
+        if (perToken > 0 && Interlocked.Read(ref _headerBytes) + perToken * tokenCount > _budget)
+            return Refused(AdmissionReasons.OverBudget); // could never be stored: no encode is spent on it
 
         int seen = Sightings.See(caller.Namespace, span.Hash, span.SourcePath);
         if (seen < SightingTable.AdmitAfter && !onMissEncode)
@@ -456,7 +460,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     /// <inheritdoc/>
     public void Tick()
     {
-        if (_writesDisabled && DateTime.UtcNow - _lastReloadTry >= ReloadRetryInterval)
+        if (_writesDisabled && Environment.TickCount64 - _lastReloadTryMs >= (long)ReloadRetryInterval.TotalMilliseconds)
             TryVerifiedReload();
         ApplyTouches();
         if (_indexOnly)
@@ -466,7 +470,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             _lastBudgetCheck = _time.GetUtcNow();
             long bytes = _files.GetStats().EntryBytes;
             Interlocked.Exchange(ref _storeBytes, bytes);
-            if (bytes < _budget)
+            if (bytes + Math.Max(1, MinimumEntryBytes()) <= _budget)
                 _problem = null; // room again (an evict, or another tool removed entries): the next miss tries
         }
     }
@@ -506,7 +510,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             }
 
             bool existed = File.Exists(path);
-            if (!existed && !EnsureRoom(estimate, item.Namespace, storeLock, ledger))
+            if (!existed && !EnsureRoom(estimate, MinimumEntryBytes(entry), item.Namespace, storeLock, ledger))
                 return;
 
             try
@@ -543,6 +547,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             if (!existed && File.Exists(path))
                 Interlocked.Add(ref _storeBytes, bytes);
             ChunkCacheMetrics.RecordWrite("stored");
+            LearnEntrySize(entry);
             if (_problem is StoreProblems.LockTimeout or StoreProblems.WriteFailed or StoreProblems.EntryTooLarge)
                 _problem = null;
         }
@@ -555,16 +560,16 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     /// server's own rows could free, is dropped alone (<see cref="StoreProblems.EntryTooLarge"/>, the writer keeps running);
     /// only a store with nothing the server may evict stops the writer (<see cref="StoreProblems.BudgetExhausted"/>).
     /// </summary>
-    private bool EnsureRoom(long needed, string ns, StoreLockHandle storeLock, ServerLedger ledger)
+    private bool EnsureRoom(long needed, long minimumEntry, string ns, StoreLockHandle storeLock, ServerLedger ledger)
     {
         if (StoreBytes + needed <= _budget)
             return true;
+        if (needed > _budget)
+            return TooLarge(); // before any store enumeration: it can never fit
         long bytes = _files.GetStats().EntryBytes; // recount under the lock: CLI writes, earlier evictions
         Interlocked.Exchange(ref _storeBytes, bytes);
         if (bytes + needed <= _budget)
             return true;
-        if (needed > _budget)
-            return TooLarge();
 
         IReadOnlySet<ChunkKey> indexed;
         try { indexed = ChunkIndex.IndexReferencedKeysUnder(_root); }
@@ -578,9 +583,12 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         long ownFreeable = ordered.Sum(v => v.Size);
         if (bytes - ownFreeable + needed > _budget)
         {
-            // Evicting every row the server may evict would still not make room: refuse this entry alone, or stop when the
-            // store holds nothing the server may evict (it is genuinely full of others' entries).
-            return ownFreeable == 0 ? Stop("the store is full of entries the server may not evict") : TooLarge();
+            // Evicting every row the server may evict would still not make room for THIS entry. The writer stops only when
+            // not even a minimum-size entry would fit then (the store is genuinely full of entries the server may not
+            // evict); otherwise this entry alone is dropped, whatever its size, so no caller can stop the writer for others.
+            return bytes - ownFreeable + minimumEntry > _budget
+                ? Stop("the store is full of entries the server may not evict")
+                : TooLarge();
         }
 
         var victims = new List<(ChunkKey Key, long Size)>();
@@ -631,6 +639,38 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             return true;
         _problem = StoreProblems.WriteFailed; // a victim was held open by a reader: transient, retried by later misses
         return false;
+    }
+
+    /// <summary>Tokens of the smallest entry the stop rule considers (the default <c>min_chunk_tokens</c>).</summary>
+    public const int MinimumEntryTokens = ChunkCacheWire.DefaultMinChunkTokens;
+
+    // Bytes per token and header bytes of the entries this model writes, learned from the last STORED entry (0 = unknown);
+    // admission uses them to refuse a chunk that could never fit, before any encode.
+    private long _bytesPerToken;
+    private long _headerBytes;
+
+    /// <summary>The size of a <see cref="MinimumEntryTokens"/>-token entry as last learned (0 until one entry was stored).</summary>
+    private long MinimumEntryBytes() => Interlocked.Read(ref _headerBytes) + MinimumEntryTokens * Interlocked.Read(ref _bytesPerToken);
+
+    /// <summary>The size of a <see cref="MinimumEntryTokens"/>-token entry shaped like <paramref name="entry"/> (same model).</summary>
+    private static long MinimumEntryBytes(ChunkKvEntry entry)
+    {
+        var (header, perToken) = SizeOf(entry);
+        return header + MinimumEntryTokens * perToken;
+    }
+
+    private static (long Header, long PerToken) SizeOf(ChunkKvEntry entry)
+    {
+        long header = FileChunkStore.HeaderBytes(entry.ModelFingerprint, entry.Backend, entry.KeysPerLayer.Length);
+        int tokens = Math.Max(1, entry.TokenIds.Length);
+        return (header, (EntryBytes(entry) - header + tokens - 1) / tokens);
+    }
+
+    private void LearnEntrySize(ChunkKvEntry entry)
+    {
+        var (header, perToken) = SizeOf(entry);
+        Interlocked.Exchange(ref _headerBytes, header);
+        Interlocked.Exchange(ref _bytesPerToken, perToken);
     }
 
     private bool TooLarge()
@@ -694,14 +734,14 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     {
         _writesDisabled = true;
         _problem = StoreProblems.LedgerUnreadable;
-        _lastReloadTry = DateTime.UtcNow;
+        _lastReloadTryMs = Environment.TickCount64;
         ServerLog.Info($"chunk-store: WRITES DISABLED until the ledger reads back ({ex.GetType().Name}). {ex.Message}");
     }
 
     /// <summary>Worker only: a disabled writer re-reads the ledger; a successful read (verified) re-enables writes.</summary>
     private void TryVerifiedReload()
     {
-        _lastReloadTry = DateTime.UtcNow;
+        _lastReloadTryMs = Environment.TickCount64;
         ServerLedger reloaded;
         try
         {

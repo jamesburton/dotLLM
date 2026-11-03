@@ -133,7 +133,10 @@ internal sealed class SightingTable
         if (path is null || path.Length <= StoredPathChars)
             return path;
         string digest = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(path)))[..16];
-        return path[..(StoredPathChars - 17)] + "#" + digest;
+        int cut = StoredPathChars - 17;
+        if (char.IsHighSurrogate(path[cut - 1]))
+            cut--; // never keep half a surrogate pair
+        return path[..cut] + "#" + digest;
     }
 
     private sealed class Row(string ns, string hash)
