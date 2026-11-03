@@ -1177,7 +1177,14 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         // 1. EMBEDDING LOOKUP — or, for a layer window that does not own the embedding, the
         // boundary residual stream saved by the preceding window.
         if (hiddenIn.IsEmpty)
+        {
             EmbeddingLookup(tokenIds, hidden, hiddenSize);
+            if (s_diagEmbedNoise != 0f)
+            {
+                var nr = new Random(1234);
+                for (long i = 0; i < (long)seqLen * hiddenSize; i++) hidden[i] *= 1f + s_diagEmbedNoise * (float)(nr.NextDouble() * 2 - 1);
+            }
+        }
         else
             hiddenIn[..(seqLen * hiddenSize)].CopyTo(new Span<float>(hidden, seqLen * hiddenSize));
 
@@ -4247,6 +4254,16 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     }
 
     /// <summary>
+    /// DIAGNOSTIC (<c>DOTLLM_DIAG_F32ACT_ALL=1</c>): every quantized dense projection runs dequantize-rows x F32 activations instead of the
+    /// quantized-activation kernels (combine with <c>DOTLLM_Q4E_DIAG_F32ACT=1</c> for the MoE banks). The F32-activation control for a
+    /// quantized-model divergence hunt (#1599): with both set the forward is bit-identical across batch shapes.
+    /// </summary>
+    private static readonly bool s_diagF32Act = Environment.GetEnvironmentVariable("DOTLLM_DIAG_F32ACT_ALL") == "1";
+
+    /// <summary>DIAGNOSTIC (<c>DOTLLM_DIAG_EMBED_NOISE=&lt;eps&gt;</c>): multiplies every embedding element by <c>1 + eps*u</c>, u in [-1,1] (fixed seed): the noise-injection floor probe (#1599).</summary>
+    private static readonly float s_diagEmbedNoise = float.TryParse(Environment.GetEnvironmentVariable("DOTLLM_DIAG_EMBED_NOISE"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var nz) ? nz : 0f;
+
+    /// <summary>
     /// Dispatches to the appropriate GEMM kernel based on quantization type.
     /// Passes <see cref="_threadPool"/> for parallel execution.
     /// </summary>
@@ -4254,7 +4271,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     private void Gemm(nint weights, QuantizationType qt, float* b, float* c,
                       int m, int k, int n, byte* preQuantizedInput = null)
     {
-        if (qt == QuantizationType.LittleBit)
+        if (s_diagF32Act && qt is not (QuantizationType.F32 or QuantizationType.F16))
+            MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, _threadPool);
+        else if (qt == QuantizationType.LittleBit)
             GemmLittleBit(weights, b, c, m, k, n);
         else if (qt == QuantizationType.NVFP4)
             GemmNvfp4Scaled(weights, b, c, m, k, n);
@@ -4428,7 +4447,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                                  int m, int k, int n, byte* preQuantizedInput,
                                  in WeightRepacking.RepackedWeight rw)
     {
-        if (!UseR4(in rw, qt))
+        if (s_diagF32Act || !UseR4(in rw, qt))
         {
             // No repacked copy, or rows too short for interleaving to pay: original path.
             Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);

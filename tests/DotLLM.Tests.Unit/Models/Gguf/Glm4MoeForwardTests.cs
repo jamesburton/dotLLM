@@ -290,6 +290,34 @@ public sealed class Glm4MoeForwardTests : IDisposable
         Assert.True(diff > MutantFloor, $"hd128 mutant '{mutant}' is invisible to the golden (max diff {diff})");
     }
 
+    /// <summary>
+    /// Causality: tokens AFTER position p must not change the logits at positions &lt;= p (#1599 follow-up). Replaces the last half of the prompt
+    /// and requires the first half's logits to be unchanged. Shown to fail when the attention mask is opened to future keys.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Later_Tokens_Do_Not_Change_Earlier_Logits(bool hd128)
+    {
+        using var gguf = GgufFile.Open(hd128 ? Write128() : Write());
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        int[] ids = hd128 ? LongIds() : Ids;
+        int keep = ids.Length / 2;
+        var changed = (int[])ids.Clone();
+        for (int i = keep; i < changed.Length; i++) changed[i] = (ids[i] + 5) % SyntheticGlm4MoeGguf.VocabSize;
+        int[] pos = Enumerable.Range(0, ids.Length).ToArray();
+        using var model = TransformerModel.LoadFromGguf(gguf, cfg, ThreadingConfig.SingleThreaded);
+        float[] a, b;
+        using (ITensor t = model.Forward(ids, pos, deviceId: -1)) a = Copy(t);
+        using (ITensor t = model.Forward(changed, pos, deviceId: -1)) b = Copy(t);
+        int v = SyntheticGlm4MoeGguf.VocabSize;
+        float early = MaxAbs(a.AsSpan(0, keep * v).ToArray(), b.AsSpan(0, keep * v).ToArray());
+        float late = MaxAbs(a.AsSpan(keep * v).ToArray(), b.AsSpan(keep * v).ToArray());
+        _out.WriteLine($"hd128={hd128}: earlier rows max diff {early}, replaced rows max diff {late}");
+        Assert.True(late > 1e-2f, $"replacing the later tokens did not change their own logits ({late}): the test cannot discriminate");
+        Assert.True(early < Tolerance, $"earlier rows changed by {early} when only later tokens changed (non-causal leak)");
+    }
+
     [SkippableFact]
     public void WriteSyntheticFixture()
     {
