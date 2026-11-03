@@ -18,6 +18,12 @@ internal sealed class ServerChunkEncodeHost(ServerState state) : IChunkEncodeHos
     public IDisposable? TryEnterIdle() => state.TryAcquireIdleModel();
 
     /// <inheritdoc/>
+    public long ActivityStamp() => state.ActivityStamp();
+
+    /// <inheritdoc/>
+    public bool IsBusy() => state.IsBusyForBackgroundWork();
+
+    /// <inheritdoc/>
     public ChunkKvEntry? Encode(ChunkEncodeItem item)
     {
         ArgumentNullException.ThrowIfNull(item);

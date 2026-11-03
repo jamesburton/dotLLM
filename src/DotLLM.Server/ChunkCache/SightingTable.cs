@@ -3,8 +3,10 @@ namespace DotLLM.Server.ChunkCache;
 /// <summary>
 /// How many requests each chunk text was seen in, per namespace (spec §5.10: a miss is queued for a background encode only
 /// once its text has been seen in at least <see cref="AdmitAfter"/> requests). Keyed by <c>(namespace, text hash)</c>; rows
-/// carry the first <c>source.path</c> seen, for forget (Task 16). Bounded: at most <see cref="Capacity"/> rows, the least
-/// recently seen dropped first. In memory only (never persisted, never logged: spec §10). Thread-safe.
+/// carry the first <c>source.path</c> seen, for forget (Task 16), capped at <see cref="StoredPathChars"/> (a longer path is
+/// kept as a prefix plus a hash). Bounded: at most <see cref="Capacity"/> rows, the least recently seen dropped first, and
+/// at most <see cref="PerNamespaceCapacity"/> per namespace (a namespace at its share drops its own least recent row, so
+/// one tenant cannot push out another's sightings). In memory only (never persisted, never logged: spec §10). Thread-safe.
 /// </summary>
 internal sealed class SightingTable
 {
@@ -14,23 +16,39 @@ internal sealed class SightingTable
     /// <summary>Sightings needed before a miss is admitted.</summary>
     public const int AdmitAfter = 2;
 
-    /// <summary>Longest <c>source.path</c> kept on a row; a longer one is not kept.</summary>
+    /// <summary>Longest <c>source.path</c> admission accepts at all; a longer one is refused as unreadable.</summary>
     public const int MaxSourcePathChars = 1024;
 
     private readonly object _gate = new();
     private readonly Dictionary<(string Ns, string Hash), LinkedListNode<Row>> _rows = [];
     private readonly LinkedList<Row> _lru = new(); // most recently seen first
+    private readonly Dictionary<string, LinkedList<Row>> _byNamespace = new(StringComparer.Ordinal); // per namespace, same order
 
     /// <summary>Creates a table.</summary>
     /// <param name="capacity">Most rows kept (at least 1).</param>
-    public SightingTable(int capacity = DefaultCapacity)
+    public SightingTable(int capacity = DefaultCapacity) : this(capacity, Math.Max(1, capacity / 4))
+    {
+    }
+
+    /// <summary>Creates a table with a per-namespace row cap.</summary>
+    /// <param name="capacity">Most rows kept.</param>
+    /// <param name="perNamespaceCapacity">Most rows one namespace may hold.</param>
+    public SightingTable(int capacity, int perNamespaceCapacity)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(perNamespaceCapacity, 1);
         Capacity = capacity;
+        PerNamespaceCapacity = Math.Min(perNamespaceCapacity, capacity);
     }
 
     /// <summary>Most rows kept.</summary>
     public int Capacity { get; }
+
+    /// <summary>Most rows one namespace may hold.</summary>
+    public int PerNamespaceCapacity { get; }
+
+    /// <summary>Longest <c>source.path</c> stored verbatim; a longer one is stored as a prefix plus a hash.</summary>
+    public const int StoredPathChars = 256;
 
     /// <summary>Rows held now.</summary>
     public int Count
@@ -50,24 +68,30 @@ internal sealed class SightingTable
     {
         ArgumentNullException.ThrowIfNull(ns);
         ArgumentNullException.ThrowIfNull(hash);
-        string? path = sourcePath is { Length: <= MaxSourcePathChars } ? sourcePath : null;
+        string? path = StoredPath(sourcePath);
         lock (_gate)
         {
             if (_rows.TryGetValue((ns, hash), out var node))
             {
+                var row = node.Value;
                 _lru.Remove(node);
                 _lru.AddFirst(node);
-                node.Value.Count = node.Value.Count == int.MaxValue ? int.MaxValue : node.Value.Count + 1;
-                node.Value.SourcePath ??= path;
-                return node.Value.Count;
+                var own = _byNamespace[ns];
+                own.Remove(row.NamespaceNode!);
+                own.AddFirst(row.NamespaceNode!);
+                row.Count = row.Count == int.MaxValue ? int.MaxValue : row.Count + 1;
+                row.SourcePath ??= path;
+                return row.Count;
             }
-            if (_rows.Count >= Capacity && _lru.Last is { } oldest)
-            {
-                _lru.RemoveLast();
-                _rows.Remove((oldest.Value.Ns, oldest.Value.Hash));
-            }
-            var row = new Row(ns, hash) { Count = 1, SourcePath = path };
-            _rows[(ns, hash)] = _lru.AddFirst(row);
+            if (!_byNamespace.TryGetValue(ns, out var mine))
+                _byNamespace[ns] = mine = new LinkedList<Row>();
+            if (mine.Count >= PerNamespaceCapacity && mine.Last is { } ownOldest)
+                Drop(ownOldest.Value);
+            else if (_rows.Count >= Capacity && _lru.Last is { } oldest)
+                Drop(oldest.Value);
+            var added = new Row(ns, hash) { Count = 1, SourcePath = path };
+            added.NamespaceNode = mine.AddFirst(added);
+            _rows[(ns, hash)] = _lru.AddFirst(added);
             return 1;
         }
     }
@@ -92,8 +116,29 @@ internal sealed class SightingTable
             return _rows.TryGetValue((ns, hash), out var node) ? node.Value.SourcePath : null;
     }
 
+    private void Drop(Row row)
+    {
+        if (!_rows.Remove((row.Ns, row.Hash), out var node))
+            return;
+        _lru.Remove(node);
+        var own = _byNamespace[row.Ns];
+        own.Remove(row.NamespaceNode!);
+        if (own.Count == 0)
+            _byNamespace.Remove(row.Ns);
+    }
+
+    /// <summary>The path as stored: verbatim up to <see cref="StoredPathChars"/>, else a prefix, '#', and 16 hex digits of its SHA-256.</summary>
+    internal static string? StoredPath(string? path)
+    {
+        if (path is null || path.Length <= StoredPathChars)
+            return path;
+        string digest = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(path)))[..16];
+        return path[..(StoredPathChars - 17)] + "#" + digest;
+    }
+
     private sealed class Row(string ns, string hash)
     {
+        public LinkedListNode<Row>? NamespaceNode { get; set; }
         public string Ns { get; } = ns;
         public string Hash { get; } = hash;
         public int Count { get; set; }

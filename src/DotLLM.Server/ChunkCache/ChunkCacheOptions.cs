@@ -33,6 +33,12 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? Stor
 
     /// <summary>Upper bound of <c>--chunk-cache-max-chunks</c>: keeps the per-request parse work bounded.</summary>
     public const int AbsoluteMaxChunks = 65536;
+    /// <summary>
+    /// With <c>--chunk-store-write</c>: takes ownership of the store before the model loads (<c>dotllm serve</c>), so a second
+    /// writer fails fast; the writer started at map time uses the claim. No-op otherwise.
+    /// </summary>
+    /// <exception cref="InvalidServerOptionException">Another server owns the store, or it cannot be created or locked.</exception>
+    public void ClaimStoreOwnership() => ChunkStoreService.ClaimOwnership(this);
 
     /// <summary>The convention switched off (the default).</summary>
     public static ChunkCacheOptions Disabled { get; } = new(false, DefaultMaxChunks);

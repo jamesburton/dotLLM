@@ -31,6 +31,17 @@ internal interface IChunkEncodeHost
     IDisposable? TryEnterIdle();
 
     /// <summary>
+    /// A number that changes whenever a request starts (the request gate is taken, a sequence is scheduled), so a request
+    /// that starts and ends between two polls still restarts the worker's quiet period.
+    /// </summary>
+    /// <returns>The stamp.</returns>
+    long ActivityStamp();
+
+    /// <summary>Non-acquiring probe: whether a request is running or waiting (or a model is loading) right now.</summary>
+    /// <returns>Whether the server is busy.</returns>
+    bool IsBusy();
+
+    /// <summary>
     /// Under the lease: tokenises <paramref name="item"/>'s text with <c>ChunkTokenization.Encode</c>, recomputes its key with
     /// the served model's identity, and encodes it in isolation (positions <c>0..n-1</c>) on the server's model and backend.
     /// </summary>
@@ -60,13 +71,18 @@ internal interface IChunkEncodeSink
 /// </summary>
 /// <remarks>
 /// <list type="bullet">
-/// <item><b>Bounded:</b> at most <see cref="MaxItems"/> items and <see cref="MaxQueuedChars"/> characters of text; an item
-/// already queued (same namespace and key) is not added twice. A full queue refuses (<c>chunk_encode_skipped</c>).</item>
-/// <item><b>Never starves inference:</b> the worker encodes one chunk only after <see cref="IChunkEncodeHost.TryEnterIdle"/>
-/// succeeds and releases the model straight after that one forward pass; while the server is busy it re-checks every
-/// <see cref="IdlePollInterval"/> on its own thread.</item>
-/// <item><b>Shutdown:</b> <see cref="Dispose"/> cancels the worker, which stops between steps (an encode in progress finishes);
-/// queued items are dropped (they are only misses).</item>
+/// <item><b>Bounded:</b> at most <see cref="MaxItems"/> items (the one being encoded included), at most
+/// <see cref="MaxItemsPerNamespace"/> of them from one namespace, and <see cref="MaxQueuedChars"/> characters of text; an item
+/// already queued (same namespace and key) is not added twice. A refusal is <c>chunk_encode_skipped</c>.</item>
+/// <item><b>Never starves inference:</b> the worker takes the model only after the server has been quiet (not busy, no new
+/// activity) for <see cref="QuietPeriod"/> (<see cref="DefaultQuietPeriod"/>, 2 s), encodes one chunk, releases the model
+/// before any disk I/O, and after <see cref="MaxEncodesPerIdleWindow"/> encodes in one quiet window waits
+/// <see cref="WindowCooldown"/>. A request that arrives during an encode waits for that one encode (at most
+/// <c>ChunkStoreService.MaxEncodeTokens</c> tokens).</item>
+/// <item><b>Shutdown:</b> <see cref="Dispose"/> cancels the worker, which stops between steps (an encode in progress cannot be
+/// interrupted: the model's forward takes no cancellation) and waits up to <see cref="ShutdownTimeout"/>. When the worker is
+/// still encoding after that, <see cref="WorkerExited"/> stays false and the owner must not free what the encode uses (the
+/// model, the store's ownership); <c>onExit</c> runs on the worker thread when it finally leaves.</item>
 /// <item>The worker thread starts with no execution context (<see cref="Thread.UnsafeStart()"/>), so it never inherits a
 /// store-lock scope of the flow that created it (lock-order check, <see cref="StoreLockHandle"/> remarks).</item>
 /// </list>
@@ -76,8 +92,14 @@ internal sealed class ChunkEncodeQueue : IDisposable
     /// <summary>Most queued items.</summary>
     public const int MaxItems = 256;
 
+    /// <summary>Most queued items of one namespace (its share of <see cref="MaxItems"/>).</summary>
+    public const int MaxItemsPerNamespace = 64;
+
     /// <summary>Most queued text, in UTF-16 chars.</summary>
     public const long MaxQueuedChars = 16L * 1024 * 1024;
+
+    /// <summary>The server must have been quiet this long before the worker takes the model.</summary>
+    public static readonly TimeSpan DefaultQuietPeriod = TimeSpan.FromSeconds(2);
 
     /// <summary>How often a busy server is re-checked for idleness.</summary>
     public static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(25);
@@ -87,24 +109,45 @@ internal sealed class ChunkEncodeQueue : IDisposable
     private readonly object _gate = new();
     private readonly Queue<ChunkEncodeItem> _items = new();
     private readonly HashSet<(string, string)> _queued = [];
+    private readonly Dictionary<string, int> _perNamespace = new(StringComparer.Ordinal);
     private readonly IChunkEncodeHost _host;
     private readonly IChunkEncodeSink _sink;
+    private readonly Action? _onExit;
     private readonly CancellationTokenSource _cts = new();
     private readonly Thread _thread;
     private long _chars;
     private int _inFlight;
     private int _disposed;
+    private int _windowEncodes;
+    private long _windowStamp = long.MinValue;
 
     /// <summary>Creates the queue and starts its worker thread.</summary>
     /// <param name="host">The model the worker encodes on.</param>
     /// <param name="sink">Where entries go.</param>
-    public ChunkEncodeQueue(IChunkEncodeHost host, IChunkEncodeSink sink)
+    /// <param name="onExit">Runs on the worker thread as it exits (after <see cref="Dispose"/>), or null.</param>
+    public ChunkEncodeQueue(IChunkEncodeHost host, IChunkEncodeSink sink, Action? onExit = null)
     {
         _host = host ?? throw new ArgumentNullException(nameof(host));
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
+        _onExit = onExit;
         _thread = new Thread(Run) { IsBackground = true, Name = "dotllm chunk-store writer", Priority = ThreadPriority.BelowNormal };
         _thread.UnsafeStart();
     }
+
+    /// <summary>Quiet period before each encode (a fixed default; tests shorten it).</summary>
+    internal TimeSpan QuietPeriod { get; set; } = DefaultQuietPeriod;
+
+    /// <summary>Most encodes in one quiet window before a cool-down.</summary>
+    internal int MaxEncodesPerIdleWindow { get; set; } = 4;
+
+    /// <summary>Cool-down after <see cref="MaxEncodesPerIdleWindow"/> encodes in one quiet window.</summary>
+    internal TimeSpan WindowCooldown { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>How long <see cref="Dispose"/> waits for the worker.</summary>
+    internal TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Whether the worker thread has exited.</summary>
+    public bool WorkerExited => !_thread.IsAlive;
 
     /// <summary>Items queued or being encoded.</summary>
     public int Pending
@@ -114,20 +157,41 @@ internal sealed class ChunkEncodeQueue : IDisposable
 
     /// <summary>Adds an item.</summary>
     /// <param name="item">The item.</param>
-    /// <returns>True when queued (or already queued); false when the queue is full or shut down.</returns>
-    public bool TryEnqueue(ChunkEncodeItem item)
+    /// <returns>True when queued (or already queued); false when refused.</returns>
+    public bool TryEnqueue(ChunkEncodeItem item) => TryEnqueue(item, out _);
+
+    /// <summary>Adds an item; <paramref name="refusal"/> says why not (<see cref="AdmissionReasons"/>).</summary>
+    /// <param name="item">The item.</param>
+    /// <param name="refusal">Null when queued; else <see cref="AdmissionReasons.QueueFull"/> or
+    /// <see cref="AdmissionReasons.NamespaceQueueShare"/>.</param>
+    /// <returns>True when queued (or already queued).</returns>
+    public bool TryEnqueue(ChunkEncodeItem item, out string? refusal)
     {
         ArgumentNullException.ThrowIfNull(item);
+        refusal = null;
         lock (_gate)
         {
             if (_disposed != 0)
+            {
+                refusal = AdmissionReasons.QueueFull;
                 return false;
+            }
             if (_queued.Contains((item.Namespace, item.Key.Hex)))
                 return true;
-            if (_items.Count + _inFlight >= MaxItems || _chars + item.Text.Length > MaxQueuedChars)
+            _perNamespace.TryGetValue(item.Namespace, out int mine);
+            if (mine >= MaxItemsPerNamespace)
+            {
+                refusal = AdmissionReasons.NamespaceQueueShare;
                 return false;
+            }
+            if (_items.Count + _inFlight >= MaxItems || _chars + item.Text.Length > MaxQueuedChars)
+            {
+                refusal = AdmissionReasons.QueueFull;
+                return false;
+            }
             _items.Enqueue(item);
             _queued.Add((item.Namespace, item.Key.Hex));
+            _perNamespace[item.Namespace] = mine + 1;
             _chars += item.Text.Length;
             Monitor.PulseAll(_gate);
             return true;
@@ -154,48 +218,62 @@ internal sealed class ChunkEncodeQueue : IDisposable
 
     private void Run()
     {
-        var ct = _cts.Token;
-        var lastTick = DateTime.MinValue;
-        while (!ct.IsCancellationRequested)
+        try
         {
-            if (DateTime.UtcNow - lastTick >= TickInterval)
+            var ct = _cts.Token;
+            var lastTick = DateTime.MinValue;
+            while (!ct.IsCancellationRequested)
             {
-                lastTick = DateTime.UtcNow;
-                Guard(_sink.Tick);
-            }
-
-            ChunkEncodeItem? item;
-            lock (_gate)
-            {
-                if (_items.Count == 0)
+                if (DateTime.UtcNow - lastTick >= TickInterval)
                 {
-                    Monitor.Wait(_gate, TickInterval);
-                    continue;
+                    lastTick = DateTime.UtcNow;
+                    Guard(_sink.Tick);
                 }
-                item = _items.Dequeue();
-                _chars -= item.Text.Length;
-                _inFlight++;
-            }
-            try
-            {
-                Process(item, ct);
-            }
-            finally
-            {
+
+                ChunkEncodeItem? item;
                 lock (_gate)
                 {
-                    _inFlight--;
-                    _queued.Remove((item.Namespace, item.Key.Hex));
-                    Monitor.PulseAll(_gate);
+                    if (_items.Count == 0)
+                    {
+                        Monitor.Wait(_gate, TickInterval);
+                        continue;
+                    }
+                    item = _items.Dequeue();
+                    _chars -= item.Text.Length;
+                    _inFlight++;
+                }
+                try
+                {
+                    Process(item, ct);
+                }
+                finally
+                {
+                    lock (_gate)
+                    {
+                        _inFlight--;
+                        _queued.Remove((item.Namespace, item.Key.Hex));
+                        if (_perNamespace.TryGetValue(item.Namespace, out int n))
+                        {
+                            if (n <= 1) _perNamespace.Remove(item.Namespace);
+                            else _perNamespace[item.Namespace] = n - 1;
+                        }
+                        Monitor.PulseAll(_gate);
+                    }
                 }
             }
+            lock (_gate)
+            {
+                _items.Clear();
+                _queued.Clear();
+                _perNamespace.Clear();
+                _chars = 0;
+                Monitor.PulseAll(_gate);
+            }
         }
-        lock (_gate)
+        finally
         {
-            _items.Clear();
-            _queued.Clear();
-            _chars = 0;
-            Monitor.PulseAll(_gate);
+            if (_onExit is { } exit)
+                Guard(exit);
         }
     }
 
@@ -206,16 +284,7 @@ internal sealed class ChunkEncodeQueue : IDisposable
         if (!wanted)
             return;
 
-        // Wait (on this thread only) until no request runs or waits, then take the model for this one encode.
-        IDisposable? lease = null;
-        while (!ct.IsCancellationRequested)
-        {
-            Guard(() => lease = _host.TryEnterIdle());
-            if (lease is not null)
-                break;
-            if (ct.WaitHandle.WaitOne(IdlePollInterval))
-                return;
-        }
+        IDisposable? lease = WaitForQuietModel(ct);
         if (lease is null)
             return;
 
@@ -226,10 +295,73 @@ internal sealed class ChunkEncodeQueue : IDisposable
         }
         finally
         {
-            lease.Dispose(); // the model is free again before any disk I/O
+            Guard(lease.Dispose); // the model is free again before any disk I/O (never throws out of the worker)
         }
         if (entry is not null && !ct.IsCancellationRequested)
             Guard(() => _sink.Write(item, entry));
+    }
+
+    /// <summary>
+    /// Waits on this thread until the server has been quiet (not busy, activity stamp unchanged) for <see cref="QuietPeriod"/>,
+    /// honouring the per-window encode cap, then takes the model. Null when cancelled.
+    /// </summary>
+    private IDisposable? WaitForQuietModel(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            long stamp = 0;
+            bool busy = true;
+            Guard(() => { stamp = _host.ActivityStamp(); busy = _host.IsBusy(); });
+            if (stamp != _windowStamp)
+            {
+                // New activity since the last encode window: a fresh window (and a fresh quiet period).
+                _windowStamp = stamp;
+                _windowEncodes = 0;
+            }
+            if (_windowEncodes >= MaxEncodesPerIdleWindow)
+            {
+                if (ct.WaitHandle.WaitOne(WindowCooldown))
+                    return null;
+                _windowEncodes = 0;
+                continue;
+            }
+            if (busy)
+            {
+                if (ct.WaitHandle.WaitOne(IdlePollInterval))
+                    return null;
+                continue;
+            }
+
+            // Quiet so far: watch for the quiet period, restarting on any busy probe or new activity.
+            var quietUntil = DateTime.UtcNow + QuietPeriod;
+            bool quiet = true;
+            while (DateTime.UtcNow < quietUntil)
+            {
+                if (ct.WaitHandle.WaitOne(IdlePollInterval))
+                    return null;
+                long now = 0;
+                bool nowBusy = true;
+                Guard(() => { now = _host.ActivityStamp(); nowBusy = _host.IsBusy(); });
+                if (nowBusy || now != stamp)
+                {
+                    quiet = false;
+                    break;
+                }
+            }
+            if (!quiet)
+                continue;
+
+            IDisposable? lease = null;
+            Guard(() => lease = _host.TryEnterIdle());
+            if (lease is not null)
+            {
+                _windowEncodes++;
+                return lease;
+            }
+            if (ct.WaitHandle.WaitOne(IdlePollInterval))
+                return null;
+        }
+        return null;
     }
 
     // The worker never dies: a failure is logged by type only (no text, key or namespace) and the item is dropped.
@@ -245,16 +377,27 @@ internal sealed class ChunkEncodeQueue : IDisposable
         }
     }
 
-    /// <summary>Stops the worker (it finishes the step it is on) and drops what is queued.</summary>
+    /// <summary>
+    /// Stops the worker (it finishes the step it is on) and drops what is queued; waits up to <see cref="ShutdownTimeout"/>.
+    /// </summary>
+    /// <returns>Whether the worker has exited (false: it is still inside an encode).</returns>
+    public bool Stop()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 0)
+        {
+            _cts.Cancel();
+            lock (_gate)
+                Monitor.PulseAll(_gate);
+        }
+        if (Thread.CurrentThread == _thread)
+            return false;
+        return _thread.Join(ShutdownTimeout);
+    }
+
+    /// <summary>Stops the worker (see <see cref="Stop"/>).</summary>
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
-            return;
-        _cts.Cancel();
-        lock (_gate)
-            Monitor.PulseAll(_gate);
-        // The token source is left to the finalizer when the worker did not stop in time: it may still read it.
-        if (Thread.CurrentThread != _thread && _thread.Join(TimeSpan.FromSeconds(30)))
-            _cts.Dispose();
+        // The token source is left to the finalizer: a worker that has not stopped may still read it.
+        Stop();
     }
 }

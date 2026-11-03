@@ -25,6 +25,9 @@ internal static class AdmissionReasons
     public const string WritesDisabled = "writes_disabled";
     public const string BudgetExhausted = "budget_exhausted";
     public const string QueueFull = "queue_full";
+    public const string NamespaceQueueShare = "namespace_queue_share";
+    public const string RequestCap = "request_cap";
+    public const string SecretContent = "secret_content";
 }
 
 /// <summary>What keeps the writer from storing (the <c>detail</c> of a <c>chunk_store_unavailable</c> warning).</summary>
@@ -38,6 +41,10 @@ internal static class StoreProblems
 
     /// <summary>The budget is reached and evicting the server's own entries cannot free enough: encoding stops.</summary>
     public const string BudgetExhausted = "budget_exhausted";
+
+    /// <summary>An encoded entry was larger than the budget, or than what the server's own entries could free: that entry
+    /// alone was dropped; the writer keeps running.</summary>
+    public const string EntryTooLarge = "entry_too_large";
 
     /// <summary>The last put or ledger save failed (disk full, I/O error); nothing half-written was kept.</summary>
     public const string WriteFailed = "write_failed";
@@ -88,6 +95,15 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     /// <summary>How often a stopped (budget-exhausted) writer re-checks the store size.</summary>
     public static readonly TimeSpan BudgetRecheckInterval = TimeSpan.FromSeconds(30);
 
+    /// <summary>Most misses one request may queue.</summary>
+    public const int MaxQueuedPerRequest = 16;
+
+    /// <summary>How often a writer stopped by an unreadable ledger tries a verified reload (tests shorten it).</summary>
+    internal TimeSpan ReloadRetryInterval { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Whether the worker has exited (after <see cref="Dispose"/>; false while an encode still runs).</summary>
+    public bool WorkerStopped => _queue?.WorkerExited ?? true;
+
     /// <summary>Most pending ledger touches (hits) kept between writes; more are dropped (they only refine the LRU order).</summary>
     public const int MaxPendingTouches = 4096;
 
@@ -97,7 +113,9 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     private readonly FileChunkStore _files;
     private readonly IChunkStore _store;
     private readonly StoreOwnerLock _owner;
-    private readonly ServerLedger? _ledger;
+    private ServerLedger? _ledger;
+    private volatile bool _writesDisabled;
+    private DateTime _lastReloadTry = DateTime.UtcNow;
     private readonly ConcurrentQueue<string> _touches = new();
     private readonly TimeProvider _time;
     private ChunkEncodeQueue? _queue;
@@ -119,9 +137,13 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         _store = store;
         _owner = owner;
         _ledger = ledger;
+        _writesDisabled = ledger is null;
         _problem = problem;
         _time = time;
     }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, StoreOwnerLock> s_claims =
+        new(ChunkIndex.PathComparer);
 
     /// <summary>The store root (absolute).</summary>
     public string Root => _root;
@@ -135,8 +157,11 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     /// <summary>Why the writer cannot store right now (<see cref="StoreProblems"/>), or null.</summary>
     public string? Problem => _problem;
 
-    /// <summary>Whether writes are disabled for the server's lifetime (unreadable ledger).</summary>
-    public bool WritesDisabled => _ledger is null;
+    /// <summary>
+    /// Whether writes are disabled because the ledger cannot be read (at startup or after a failed save): no admission, no
+    /// encode, no write, the file is never written. Cleared only by a verified reload (<see cref="ReloadRetryInterval"/>).
+    /// </summary>
+    public bool WritesDisabled => _writesDisabled;
 
     /// <summary>The sightings (per namespace and text hash).</summary>
     public SightingTable Sightings { get; } = new();
@@ -147,11 +172,66 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     /// <summary>How long the worker waits for the store lock per write (tests shorten it).</summary>
     internal TimeSpan LockTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
-    /// <summary>The in-memory ledger (tests: its save hook simulates a crash or a full disk mid-save); null when writes are disabled.</summary>
+    /// <summary>The in-memory ledger (tests: its save hook simulates a crash or a full disk mid-save); null until one was read.</summary>
     internal ServerLedger? LedgerForTest => _ledger;
 
     /// <summary>The worker's queue.</summary>
     internal ChunkEncodeQueue Queue => _queue!;
+
+    /// <summary>
+    /// Takes ownership of the store root <b>before</b> the model loads (<c>dotllm serve</c>), so a second writer fails in
+    /// seconds instead of after loading a model; <see cref="Start"/> then uses the claim. No-op without
+    /// <c>--chunk-store-write</c>.
+    /// </summary>
+    /// <param name="options">The chunk-cache options.</param>
+    /// <exception cref="InvalidServerOptionException">Another server owns the store, or the root cannot be created or locked.</exception>
+    public static void ClaimOwnership(ChunkCacheOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (!options.Enabled || !options.StoreWrite || options.StoreRoot is not { } root)
+            return;
+        var owner = AcquireOwner(root);
+        if (!s_claims.TryAdd(Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)), owner))
+        {
+            owner.Dispose();
+            throw Owned(root);
+        }
+    }
+
+    private static InvalidServerOptionException Owned(string root) => new(
+        $"--chunk-store-write: the chunk store '{root}' is already owned by another dotllm server ({StoreOwnerLock.FileName} is held). "
+        + "One server writes a store: stop the other server, or give this one another directory (or no --chunk-store-write).");
+
+    private static StoreOwnerLock AcquireOwner(string root)
+    {
+        try
+        {
+            return StoreOwnerLock.TryAcquire(root) ?? throw Owned(root);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            throw new InvalidServerOptionException($"--chunk-store-write: the chunk store '{root}' cannot be created or locked ({ex.GetType().Name}: {ex.Message}).");
+        }
+    }
+
+    /// <summary>
+    /// Loads the ledger, retrying briefly when it cannot be read (a scanner or backup holding the file is a sharing
+    /// violation, not corruption). Still unreadable after the retries: <see cref="LedgerUnreadableException"/>.
+    /// </summary>
+    private static ServerLedger LoadLedgerWithRetry(string root)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return ServerLedger.Load(root);
+            }
+            catch (LedgerUnreadableException) when (attempt < 4)
+            {
+                Thread.Sleep(100);
+            }
+        }
+    }
 
     /// <summary>
     /// Starts the writer for <paramref name="options"/> (<c>--chunk-store-write</c>): takes ownership of the root (created if
@@ -170,26 +250,25 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         if (!options.StoreWrite || options.StoreRoot is null || options.StoreBudgetBytes <= 0)
             throw new ArgumentException("The chunk-store writer needs --chunk-store, --chunk-store-write and a budget.", nameof(options));
         string root = options.StoreRoot;
-        StoreOwnerLock owner;
+        StoreOwnerLock owner = s_claims.TryRemove(Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)), out var claimed) && claimed.IsHeld
+            ? claimed
+            : AcquireOwner(root);
         FileChunkStore files;
         try
         {
-            owner = StoreOwnerLock.TryAcquire(root)
-                ?? throw new InvalidServerOptionException(
-                    $"--chunk-store-write: the chunk store '{root}' is already owned by another dotllm server ({StoreOwnerLock.FileName} is held). "
-                    + "One server writes a store: stop the other server, or give this one another directory (or no --chunk-store-write).");
             files = new FileChunkStore(root);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {
-            throw new InvalidServerOptionException($"--chunk-store-write: the chunk store '{root}' cannot be created or locked ({ex.GetType().Name}: {ex.Message}).");
+            owner.Dispose();
+            throw new InvalidServerOptionException($"--chunk-store-write: the chunk store '{root}' cannot be created ({ex.GetType().Name}: {ex.Message}).");
         }
 
         ServerLedger? ledger = null;
         string? problem = null;
         try
         {
-            ledger = ServerLedger.Load(root);
+            ledger = LoadLedgerWithRetry(root);
         }
         catch (LedgerUnreadableException ex)
         {
@@ -206,7 +285,8 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             service._storeBytes = files.GetStats().EntryBytes;
             if (service._indexOnly)
                 service.RefreshIndexKeys(force: true);
-            service._queue = new ChunkEncodeQueue(host, service);
+            service._queue = new ChunkEncodeQueue(host, service, service.OnWorkerExit);
+            ChunkCacheMetrics.SetQueueDepthProvider(() => service._queue?.Pending ?? 0);
         }
         catch
         {
@@ -235,14 +315,8 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     {
         ArgumentNullException.ThrowIfNull(span);
         ArgumentNullException.ThrowIfNull(caller);
-        if (span.NoStore)
-            return Refused(AdmissionReasons.NoStore);
-        if (span.Volatile)
-            return Refused(AdmissionReasons.Volatile);
-        if (span.SourceUnreadable || span.SourcePath is { Length: > SightingTable.MaxSourcePathChars })
-            return Refused(AdmissionReasons.SourceUnreadable);
-        if (DenyList.IsDenied(span.SourcePath))
-            return Refused(AdmissionReasons.DeniedPath);
+        if (PrivacyRefusal(span) is { } privacy)
+            return Refused(privacy);
         if (!string.Equals(backend, ChunkBackendTags.Cpu, StringComparison.Ordinal))
             return Refused(AdmissionReasons.Backend);
         if (tokenCount <= 0 || tokenCount > MaxEncodeTokens)
@@ -251,18 +325,36 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         int seen = Sightings.See(caller.Namespace, span.Hash, span.SourcePath);
         if (seen < SightingTable.AdmitAfter && !onMissEncode)
             return Refused(AdmissionReasons.NotSeenTwice);
-        if (_ledger is null)
+        if (_writesDisabled)
             return Refused(AdmissionReasons.WritesDisabled);
         if (_problem == StoreProblems.BudgetExhausted)
             return Refused(AdmissionReasons.BudgetExhausted);
         if (_indexOnly && !_indexKeys.Contains(key))
             return Refused(AdmissionReasons.IndexOnly);
-        if (_queue is null || !_queue.TryEnqueue(new ChunkEncodeItem(caller.Namespace, key, span.Text, tokenCount, span.SourcePath)))
+        if (_queue is null)
             return Refused(AdmissionReasons.QueueFull);
+        if (!_queue.TryEnqueue(new ChunkEncodeItem(caller.Namespace, key, span.Text, tokenCount, span.SourcePath), out string? refusal))
+            return Refused(refusal ?? AdmissionReasons.QueueFull);
         return new AdmissionResult(true, null);
 
-        static AdmissionResult Refused(string reason) => new(false, reason);
+        static AdmissionResult Refused(string reason)
+        {
+            ChunkCacheMetrics.RecordSkip(reason);
+            return new(false, reason);
+        }
     }
+
+    /// <summary>
+    /// The privacy refusal of one occurrence (no sighting is recorded for it): <c>no_store</c>, volatile, an unreadable or
+    /// over-long <c>source</c>, a deny-listed path, or secret-looking text (a PEM private key). Null when none applies.
+    /// </summary>
+    private string? PrivacyRefusal(ChunkSpanRef span) =>
+        span.NoStore ? AdmissionReasons.NoStore
+        : span.Volatile ? AdmissionReasons.Volatile
+        : span.SourceUnreadable || span.SourcePath is { Length: > SightingTable.MaxSourcePathChars } ? AdmissionReasons.SourceUnreadable
+        : DenyList.IsDenied(span.SourcePath) ? AdmissionReasons.DeniedPath
+        : ChunkDenyList.LooksLikeSecret(span.Text) ? AdmissionReasons.SecretContent
+        : null;
 
     /// <summary>
     /// Runs admission for every verified miss of <paramref name="plan"/> (once per distinct text), notes the hits as uses of
@@ -279,11 +371,22 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         ArgumentNullException.ThrowIfNull(parsed);
         ArgumentNullException.ThrowIfNull(caller);
         bool onMissEncode = string.Equals(parsed.OnMiss, "encode", StringComparison.Ordinal);
-        int queued = 0, skipped = 0, queuedTokens = 0;
+        int queued = 0, skipped = 0, queuedTokens = 0, queuedKeys = 0;
+
+        // The most restrictive occurrence of each text decides (a no_store, volatile or denied occurrence refuses it).
+        var deciding = new Dictionary<string, ChunkSpanRef>(StringComparer.Ordinal);
+        foreach (var s in plan.Spans)
+        {
+            if (s.Hit || s.Key is not { } k || s.Span is not { } sp)
+                continue;
+            if (!deciding.TryGetValue(k.Hex, out var current) || (PrivacyRefusal(current) is null && PrivacyRefusal(sp) is not null))
+                deciding[k.Hex] = sp;
+        }
+
         var decided = new Dictionary<string, AdmissionResult>(StringComparer.Ordinal);
         foreach (var s in plan.Spans)
         {
-            if (s.Key is not { } key || s.Span is not { } span)
+            if (s.Key is not { } key || s.Span is null)
                 continue;
             if (s.Hit)
             {
@@ -292,10 +395,22 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             }
             if (!decided.TryGetValue(key.Hex, out var result))
             {
-                result = Admit(span, key, s.TokenCount, caller, onMissEncode, plan.Backend);
+                var span = deciding[key.Hex];
+                if (queuedKeys >= MaxQueuedPerRequest && PrivacyRefusal(span) is null)
+                {
+                    ChunkCacheMetrics.RecordSkip(AdmissionReasons.RequestCap);
+                    result = new AdmissionResult(false, AdmissionReasons.RequestCap);
+                }
+                else
+                {
+                    result = Admit(span, key, s.TokenCount, caller, onMissEncode, plan.Backend);
+                }
                 decided[key.Hex] = result;
                 if (result.Queued)
+                {
+                    queuedKeys++;
                     queuedTokens = (int)Math.Min(int.MaxValue, (long)queuedTokens + s.TokenCount);
+                }
             }
             if (result.Queued) queued++;
             else skipped++;
@@ -324,7 +439,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
 
     private void Touch(ChunkKey key)
     {
-        if (_ledger is null || Interlocked.Increment(ref _pendingTouches) > MaxPendingTouches)
+        if (_writesDisabled || Interlocked.Increment(ref _pendingTouches) > MaxPendingTouches)
         {
             Interlocked.Decrement(ref _pendingTouches);
             return;
@@ -336,11 +451,13 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
 
     /// <inheritdoc/>
     public bool ShouldEncode(ChunkEncodeItem item) =>
-        _ledger is not null && _problem != StoreProblems.BudgetExhausted && !_store.Contains(item.Key);
+        !_writesDisabled && _ledger is not null && _problem != StoreProblems.BudgetExhausted && !_store.Contains(item.Key);
 
     /// <inheritdoc/>
     public void Tick()
     {
+        if (_writesDisabled && DateTime.UtcNow - _lastReloadTry >= ReloadRetryInterval)
+            TryVerifiedReload();
         ApplyTouches();
         if (_indexOnly)
             RefreshIndexKeys(force: false);
@@ -357,7 +474,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     /// <inheritdoc/>
     public void Write(ChunkEncodeItem item, ChunkKvEntry entry)
     {
-        if (_ledger is not { } ledger)
+        if (_writesDisabled || _ledger is not { } ledger)
             return;
         ChunkKey key = item.Key;
         string path = _files.PathOf(key);
@@ -389,7 +506,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             }
 
             bool existed = File.Exists(path);
-            if (!existed && !EnsureRoom(estimate, storeLock, ledger))
+            if (!existed && !EnsureRoom(estimate, item.Namespace, storeLock, ledger))
                 return;
 
             try
@@ -401,10 +518,12 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
                 // Disk full, a busy entry, an I/O error: the put wrote nothing loadable (temp file + rename), no row is recorded.
                 _problem = ex is ChunkStoreLockTimeoutException ? StoreProblems.LockTimeout : StoreProblems.WriteFailed;
                 ServerLog.Info($"chunk-store: entry not stored ({ex.GetType().Name})");
+                ChunkCacheMetrics.RecordWrite("failed");
                 return;
             }
 
             long bytes = FileLength(path) ?? estimate;
+            bool hadRow = ledger.Touch(key, DateTimeOffset.MinValue); // probe only: never moves a row's last use back
             try
             {
                 ledger.Record(key, item.Namespace, SafeSourcePath(item.SourcePath), bytes, _time.GetUtcNow());
@@ -415,24 +534,28 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
                 // The row is not on disk: put memory back to what disk says, and drop the file just written unless an index
                 // references its key (it would be an orphan; the next request can admit it again).
                 ServerLog.Info($"chunk-store: ledger save failed ({ex.GetType().Name}); the entry was removed again");
-                RollBackAfterFailedSave(key, existed);
+                RollBackAfterFailedSave(key, existed, hadRow);
                 if (_problem != StoreProblems.LedgerUnreadable)
                     _problem = StoreProblems.WriteFailed;
+                ChunkCacheMetrics.RecordWrite("failed");
                 return;
             }
             if (!existed && File.Exists(path))
                 Interlocked.Add(ref _storeBytes, bytes);
-            if (_problem is StoreProblems.LockTimeout or StoreProblems.WriteFailed)
+            ChunkCacheMetrics.RecordWrite("stored");
+            if (_problem is StoreProblems.LockTimeout or StoreProblems.WriteFailed or StoreProblems.EntryTooLarge)
                 _problem = null;
         }
     }
 
     /// <summary>
-    /// Frees room for <paramref name="needed"/> bytes by budget eviction (store lock held): least-recently-used ledger rows
-    /// go first; a row's file is deleted only when no index references its key. Evicts nothing when the server's own
-    /// entries cannot free enough; then the writer stops (<see cref="StoreProblems.BudgetExhausted"/>).
+    /// Frees room for <paramref name="needed"/> bytes by budget eviction (store lock held). The writing namespace's own
+    /// ledger rows go first, then the others', each least recently used first; a row's file is deleted only when no index
+    /// references its key. Nothing is evicted when that cannot make room: an entry larger than the budget, or than what the
+    /// server's own rows could free, is dropped alone (<see cref="StoreProblems.EntryTooLarge"/>, the writer keeps running);
+    /// only a store with nothing the server may evict stops the writer (<see cref="StoreProblems.BudgetExhausted"/>).
     /// </summary>
-    private bool EnsureRoom(long needed, StoreLockHandle storeLock, ServerLedger ledger)
+    private bool EnsureRoom(long needed, string ns, StoreLockHandle storeLock, ServerLedger ledger)
     {
         if (StoreBytes + needed <= _budget)
             return true;
@@ -440,24 +563,35 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         Interlocked.Exchange(ref _storeBytes, bytes);
         if (bytes + needed <= _budget)
             return true;
+        if (needed > _budget)
+            return TooLarge();
 
         IReadOnlySet<ChunkKey> indexed;
         try { indexed = ChunkIndex.IndexReferencedKeysUnder(_root); }
         catch (InvalidDataException) { return Stop("an index file cannot be read; eviction cannot be decided"); }
 
+        var rows = ledger.LeastRecentlyUsed().ToList();
+        var ordered = rows.Where(r => string.Equals(r.Namespace, ns, StringComparison.Ordinal))
+            .Concat(rows.Where(r => !string.Equals(r.Namespace, ns, StringComparison.Ordinal)))
+            .Select(r => { var k = new ChunkKey(r.KeyHex); return (Key: k, Size: indexed.Contains(k) ? 0 : FileLength(_files.PathOf(k)) ?? 0); })
+            .ToList();
+        long ownFreeable = ordered.Sum(v => v.Size);
+        if (bytes - ownFreeable + needed > _budget)
+        {
+            // Evicting every row the server may evict would still not make room: refuse this entry alone, or stop when the
+            // store holds nothing the server may evict (it is genuinely full of others' entries).
+            return ownFreeable == 0 ? Stop("the store is full of entries the server may not evict") : TooLarge();
+        }
+
         var victims = new List<(ChunkKey Key, long Size)>();
         long freeable = 0;
-        foreach (var row in ledger.LeastRecentlyUsed())
+        foreach (var v in ordered)
         {
             if (bytes - freeable + needed <= _budget)
                 break;
-            var key = new ChunkKey(row.KeyHex);
-            long size = indexed.Contains(key) ? 0 : FileLength(_files.PathOf(key)) ?? 0;
-            victims.Add((key, size));
-            freeable += size;
+            victims.Add(v);
+            freeable += v.Size;
         }
-        if (bytes - freeable + needed > _budget)
-            return Stop("the server's own entries cannot free enough");
 
         foreach (var (key, _) in victims)
             ledger.Remove(key);
@@ -468,7 +602,7 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             ServerLog.Info($"chunk-store: ledger save failed during eviction ({ex.GetType().Name})");
-            RollBackAfterFailedSave(null, true);
+            RollBackAfterFailedSave(null, true, true);
             if (_problem != StoreProblems.LedgerUnreadable)
                 _problem = StoreProblems.WriteFailed;
             return false;
@@ -486,13 +620,25 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
             {
                 _store.Evict(key);
                 Interlocked.Add(ref _storeBytes, -size);
+                ChunkCacheMetrics.RecordEviction();
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 // Held open by a reader: the file stays (an orphan now, removable by an orphans pass).
             }
         }
-        return StoreBytes + needed <= _budget || Stop("eviction freed less than expected");
+        if (StoreBytes + needed <= _budget)
+            return true;
+        _problem = StoreProblems.WriteFailed; // a victim was held open by a reader: transient, retried by later misses
+        return false;
+    }
+
+    private bool TooLarge()
+    {
+        _problem = StoreProblems.EntryTooLarge;
+        ChunkCacheMetrics.RecordWrite("too_large");
+        ServerLog.Info("chunk-store: an encoded entry is larger than the budget allows (or than the server's own entries could free); that entry was dropped");
+        return false;
     }
 
     private bool Stop(string why)
@@ -503,17 +649,19 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         return false;
     }
 
-    // Keep the in-memory ledger equal to the file after a failed save; the file was never replaced.
-    private void RollBackAfterFailedSave(ChunkKey? written, bool existed)
+    // Keep the in-memory ledger equal to the file after a failed save; the file was never replaced. When the file cannot be
+    // read back (after brief retries), writes stop until a verified reload: never save over a possibly corrupt ledger.
+    private void RollBackAfterFailedSave(ChunkKey? written, bool existed, bool hadRow)
     {
         try
         {
-            var reloaded = ServerLedger.Load(_root);
-            ReplaceLedgerRows(reloaded);
+            ReplaceLedgerRows(LoadLedgerWithRetry(_root));
         }
-        catch (LedgerUnreadableException)
+        catch (LedgerUnreadableException ex)
         {
-            _problem = StoreProblems.LedgerUnreadable; // should not happen (we wrote it); never save over it
+            if (written is { } unsaved && !hadRow)
+                _ledger?.Remove(unsaved); // the row that never reached the file
+            DisableWrites(ex);
         }
         if (written is { } key && !existed)
         {
@@ -542,9 +690,40 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         }
     }
 
+    private void DisableWrites(LedgerUnreadableException ex)
+    {
+        _writesDisabled = true;
+        _problem = StoreProblems.LedgerUnreadable;
+        _lastReloadTry = DateTime.UtcNow;
+        ServerLog.Info($"chunk-store: WRITES DISABLED until the ledger reads back ({ex.GetType().Name}). {ex.Message}");
+    }
+
+    /// <summary>Worker only: a disabled writer re-reads the ledger; a successful read (verified) re-enables writes.</summary>
+    private void TryVerifiedReload()
+    {
+        _lastReloadTry = DateTime.UtcNow;
+        ServerLedger reloaded;
+        try
+        {
+            reloaded = ServerLedger.Load(_root);
+        }
+        catch (LedgerUnreadableException)
+        {
+            return; // still unreadable: stay disabled, the file stays untouched
+        }
+        if (_ledger is null)
+            _ledger = reloaded;
+        else
+            ReplaceLedgerRows(reloaded);
+        if (_problem == StoreProblems.LedgerUnreadable)
+            _problem = null;
+        _writesDisabled = false;
+        ServerLog.Info("chunk-store: the ledger reads back again; writes resumed");
+    }
+
     private void ApplyTouches()
     {
-        if (_ledger is not { } ledger)
+        if (_writesDisabled || _ledger is not { } ledger)
             return;
         var now = _time.GetUtcNow();
         while (_touches.TryDequeue(out string? hex))
@@ -618,12 +797,26 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         }
     }
 
-    /// <summary>Stops the worker and releases ownership of the store.</summary>
+    /// <summary>
+    /// Stops the worker and releases ownership of the store. When the worker is still inside an encode after the queue's
+    /// shutdown timeout, ownership is kept until the worker exits (it is released from the worker thread then), so no other
+    /// writer can start on the store while this one may still write; callers check <see cref="WorkerStopped"/> before freeing
+    /// the model.
+    /// </summary>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
-        _queue?.Dispose();
-        _owner.Dispose();
+        bool stopped = _queue?.Stop() ?? true;
+        if (stopped)
+            _owner.Dispose();
+        else
+            ServerLog.Info("chunk-store: shutdown while a background encode still runs; the store stays owned until it ends");
+    }
+
+    private void OnWorkerExit()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+            _owner.Dispose();
     }
 }

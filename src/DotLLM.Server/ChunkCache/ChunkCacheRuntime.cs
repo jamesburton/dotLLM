@@ -33,8 +33,20 @@ internal sealed class ChunkCacheRuntime : IDisposable
         }
     }
 
-    /// <summary>Stops the writer (worker and ownership).</summary>
-    public void Dispose() => Interlocked.Exchange(ref _writer, null)?.Dispose();
+    private ChunkStoreService? _retired;
+
+    /// <summary>Whether a stopped writer's worker is still inside an encode (the model must not be freed under it).</summary>
+    internal bool WriterStillRunning => Volatile.Read(ref _retired) is { WorkerStopped: false };
+
+    /// <summary>Stops the writer (worker and ownership; see <see cref="ChunkStoreService.Dispose"/>).</summary>
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _writer, null) is { } writer)
+        {
+            writer.Dispose();
+            Volatile.Write(ref _retired, writer);
+        }
+    }
 
     private readonly object _storeGate = new();
     private readonly object _identityGate = new();

@@ -658,6 +658,18 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         var serverOptions = BuildServerOptions(settings, maxMessages);
 
+        // --chunk-store-write: own the store BEFORE the model loads, so a second writer on the same directory fails in
+        // seconds rather than after loading (and holding) a whole model; the writer started later uses this claim.
+        try
+        {
+            serverOptions.ChunkCache.ClaimStoreOwnership();
+        }
+        catch (InvalidServerOptionException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+            return 1;
+        }
+
         ServerState? state = null;
 
         if (!string.IsNullOrEmpty(settings.Model))
