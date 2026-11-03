@@ -55,11 +55,12 @@ public static class SyntheticGlm4MoeGguf
     /// <param name="withNextn">Append one NextN/MTP block (counted in <c>block_count</c>, <c>nextn_predict_layers</c> = 1), as the bartowski/unsloth files do.</param>
     /// <param name="withQkNorm">Emit per-head <c>attn_q_norm</c>/<c>attn_k_norm</c> (GLM-4.5 355B); Air has none.</param>
     /// <param name="seed">Xorshift PRNG seed.</param>
+    /// <param name="headDim">Per-head width (default 16; 128 reproduces the real Air head geometry, rope = headDim / 2).</param>
     /// <param name="omitTensor">Tensor name to leave out (census mismatch tests).</param>
     /// <param name="wrongShapeTensor">Tensor name to emit with an extra trailing element (census shape-mismatch tests).</param>
     /// <returns>The GGUF bytes.</returns>
     public static byte[] Build(int numExperts = DefaultExperts, int trunkLayers = DefaultTrunkLayers, bool withNextn = true,
-                               bool withQkNorm = false, uint seed = 0xA1B2C3u, string? omitTensor = null, string? wrongShapeTensor = null)
+                               bool withQkNorm = false, uint seed = 0xA1B2C3u, string? omitTensor = null, string? wrongShapeTensor = null, int headDim = HeadDim)
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(trunkLayers, LeadingDense);
         ArgumentOutOfRangeException.ThrowIfLessThan(numExperts, ExpertsUsed);
@@ -73,7 +74,7 @@ public static class SyntheticGlm4MoeGguf
         w.AddString("general.name", "synthetic-glm4moe-tiny");
         w.AddUInt32("general.alignment", 32);
         w.AddUInt32($"{arch}.block_count", (uint)(trunkLayers + nextn));
-        w.AddUInt32($"{arch}.context_length", ContextLength);
+        w.AddUInt32($"{arch}.context_length", headDim == HeadDim ? (uint)ContextLength : 512u);
         w.AddUInt32($"{arch}.embedding_length", HiddenSize);
         w.AddUInt32($"{arch}.feed_forward_length", DenseIntermediate);
         w.AddUInt32($"{arch}.attention.head_count", NumAttentionHeads);
@@ -81,9 +82,9 @@ public static class SyntheticGlm4MoeGguf
         w.AddFloat32($"{arch}.rope.freq_base", 1000000.0f);
         w.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-5f);
         w.AddUInt32($"{arch}.expert_used_count", ExpertsUsed);
-        w.AddUInt32($"{arch}.attention.key_length", HeadDim);
-        w.AddUInt32($"{arch}.attention.value_length", HeadDim);
-        w.AddUInt32($"{arch}.rope.dimension_count", RopeDim);
+        w.AddUInt32($"{arch}.attention.key_length", (uint)headDim);
+        w.AddUInt32($"{arch}.attention.value_length", (uint)headDim);
+        w.AddUInt32($"{arch}.rope.dimension_count", (uint)(headDim / 2));
         w.AddUInt32($"{arch}.expert_count", (uint)numExperts);
         w.AddUInt32($"{arch}.expert_feed_forward_length", MoeIntermediate);
         w.AddUInt32($"{arch}.expert_shared_count", SharedExperts);
@@ -120,7 +121,8 @@ public static class SyntheticGlm4MoeGguf
             Add(w, name, [inK + extra, mid, numExperts], f);
         }
 
-        int nq = NumAttentionHeads * HeadDim, nkv = NumKvHeads * HeadDim;
+        int nq = NumAttentionHeads * headDim, nkv = NumKvHeads * headDim;
+        float qkAmp = headDim == HeadDim ? 1.0f : MathF.Sqrt((float)HeadDim / headDim);   // keep attention logits at the same scale
         int shared = MoeIntermediate * SharedExperts;
 
         Mat("token_embd.weight", HiddenSize, VocabSize);
@@ -134,17 +136,17 @@ public static class SyntheticGlm4MoeGguf
             Vec($"{p}.attn_norm.weight", HiddenSize, 1f);
             // Q/K amplitudes (and the biases) are large on purpose: with +-0.05 the softmax is near-uniform and RoPE, the QKV bias and
             // the attention path are all but invisible in the logits, so a test could not tell a wrong rotation from a right one.
-            Mat($"{p}.attn_q.weight", HiddenSize, nq, 1.0f);
+            Mat($"{p}.attn_q.weight", HiddenSize, nq, qkAmp);
             Vec($"{p}.attn_q.bias", nq, 0f, 0.8f);
-            Mat($"{p}.attn_k.weight", HiddenSize, nkv, 1.0f);
+            Mat($"{p}.attn_k.weight", HiddenSize, nkv, qkAmp);
             Vec($"{p}.attn_k.bias", nkv, 0f, 0.8f);
             Mat($"{p}.attn_v.weight", HiddenSize, nkv);
             Vec($"{p}.attn_v.bias", nkv, 0f, 0.3f);
             Mat($"{p}.attn_output.weight", nq, HiddenSize);
             if (withQkNorm)
             {
-                Vec($"{p}.attn_q_norm.weight", HeadDim, 1f);
-                Vec($"{p}.attn_k_norm.weight", HeadDim, 1f);
+                Vec($"{p}.attn_q_norm.weight", headDim, 1f);
+                Vec($"{p}.attn_k_norm.weight", headDim, 1f);
             }
             Vec($"{p}.post_attention_norm.weight", HiddenSize, 1f);
             if (!isNextn && l < LeadingDense)

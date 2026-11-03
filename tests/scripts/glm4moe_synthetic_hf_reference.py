@@ -1,6 +1,6 @@
 """HF transformers oracle for the synthetic glm4moe GGUF (issue #1599).
 
-Usage:  python glm4moe_synthetic_hf_reference.py <synthetic.gguf> [ids.txt]
+Usage:  python glm4moe_synthetic_hf_reference.py <synthetic.gguf> [ids.txt [ours.f32]]
 
 Loads the F32 tensors of the GGUF written by SyntheticGlm4MoeGguf into a Glm4MoeForCausalLM (F32, eager attention), runs the
 12-token prompt in one forward pass and prints the sha256 of the GGUF plus the base64 of the [seq, vocab] F32 logits, ready to
@@ -111,6 +111,9 @@ def main() -> None:
 
     with torch.no_grad():
         logits = model(torch.tensor([ids])).logits[0].float().numpy()
+    if len(sys.argv) > 3:   # optional: compare against dotLLM logits dumped as raw little-endian f32 [seq, vocab]
+        ours = np.fromfile(sys.argv[3], dtype="<f4").reshape(logits.shape)
+        print("max|ours-hf|", float(np.abs(ours - logits).max()), "per-row", np.abs(ours - logits).max(axis=1).round(6).tolist()[:16], "...")
     print("sha256", hashlib.sha256(open(path, "rb").read()).hexdigest())
     print("shape", logits.shape, "absmax", float(np.abs(logits).max()), "std", float(logits.std()))
     print("b64", base64.b64encode(logits.astype("<f4").tobytes()).decode())

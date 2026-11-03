@@ -229,6 +229,67 @@ public sealed class Glm4MoeForwardTests : IDisposable
         Assert.True(diff > MutantFloor, $"mutant '{mutant}' is invisible to the golden (max diff {diff})");
     }
 
+    // ---- real head geometry (head_dim 128, rope 64, q width 768 > hidden 32) over 300 positions ----
+
+    /// <summary>Rows of the 300-token run that <see cref="Golden128"/> holds.</summary>
+    private static readonly int[] Rows128 = [0, 1, 2, 63, 64, 127, 128, 200, 255, 256, 257, 298, 299];
+
+    private string Write128()
+    {
+        string p = Path.Combine(_scratch, "hd128.gguf");
+        File.WriteAllBytes(p, SyntheticGlm4MoeGguf.Build(withNextn: false, headDim: 128));
+        return p;
+    }
+
+    private static float[] Rows(float[] all, int[] rows)
+    {
+        int v = SyntheticGlm4MoeGguf.VocabSize;
+        var o = new float[rows.Length * v];
+        for (int i = 0; i < rows.Length; i++) Array.Copy(all, rows[i] * v, o, i * v, v);
+        return o;
+    }
+
+    [Fact]
+    public void Hd128_Fixture_Bytes_Match_The_Golden_Pin()
+    {
+        string hex = Convert.ToHexString(SHA256.HashData(SyntheticGlm4MoeGguf.Build(withNextn: false, headDim: 128))).ToLowerInvariant();
+        Assert.True(hex == Fixture128Sha256, $"hd128 fixture changed (sha256 {hex}); regenerate Golden128 (see the class remarks).");
+    }
+
+    [Fact]
+    public void Hd128_LongSequence_Matches_HuggingFace_Golden()
+    {
+        using var gguf = GgufFile.Open(Write128());
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        Assert.Equal(128, cfg.HeadDim);
+        Assert.Equal(64, cfg.RoPEConfig!.Value.DimensionCount);
+        int[] ids = LongIds();
+        using var model = TransformerModel.LoadFromGguf(gguf, cfg, ThreadingConfig.SingleThreaded);
+        using ITensor t = model.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), deviceId: -1);
+        float diff = MaxAbs(Rows(Copy(t), Rows128), Golden128);
+        _out.WriteLine($"hd128 x 300 positions: max |dotLLM - HF| = {diff}");
+        Assert.True(diff < Tolerance, $"hd128 max |dotLLM - HF| = {diff}");
+    }
+
+    [Theory]
+    [InlineData("rope-all-dims")]
+    [InlineData("rope-norm-pairing")]
+    public void Hd128_Rope_Mutants_Move_Logits(string mutant)
+    {
+        using var gguf = GgufFile.Open(Write128());
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var rope = cfg.RoPEConfig!.Value;
+        ModelConfig m = mutant == "rope-all-dims"
+            ? cfg with { RoPEConfig = rope with { DimensionCount = cfg.HeadDim } }
+            : cfg with { RoPEConfig = rope with { Type = RoPEType.Norm } };
+        int[] ids = LongIds();
+        using var model = TransformerModel.LoadFromGguf(gguf, m, ThreadingConfig.SingleThreaded);
+        using ITensor t = model.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), deviceId: -1);
+        float diff = MaxAbs(Rows(Copy(t), Rows128), Golden128);
+        _out.WriteLine($"hd128 mutant {mutant}: max diff {diff}");
+        Assert.True(diff > MutantFloor, $"hd128 mutant '{mutant}' is invisible to the golden (max diff {diff})");
+    }
+
     [SkippableFact]
     public void WriteSyntheticFixture()
     {
@@ -237,6 +298,21 @@ public sealed class Glm4MoeForwardTests : IDisposable
         Directory.CreateDirectory(dir!);
         File.WriteAllBytes(Path.Combine(dir!, "synthetic.gguf"), SyntheticGlm4MoeGguf.Build(withNextn: false));
         File.WriteAllText(Path.Combine(dir!, "ids.txt"), string.Join(' ', Ids));
+
+        // Real head geometry (head_dim 128, rope 64) over a long sequence: dotLLM logits for the HF comparison.
+        {
+            File.WriteAllBytes(Path.Combine(dir!, "hd128.gguf"), SyntheticGlm4MoeGguf.Build(withNextn: false, headDim: 128));
+            var longIds = LongIds();
+            File.WriteAllText(Path.Combine(dir!, "ids300.txt"), string.Join(' ', longIds));
+            using var g128 = GgufFile.Open(Path.Combine(dir!, "hd128.gguf"));
+            ModelConfig c128 = GgufModelConfigExtractor.Extract(g128.Metadata);
+            using var m128 = TransformerModel.LoadFromGguf(g128, c128, ThreadingConfig.SingleThreaded);
+            using ITensor t128 = m128.Forward(longIds, Enumerable.Range(0, longIds.Length).ToArray(), deviceId: -1);
+            float[] f128 = Copy(t128);
+            var b128 = new byte[f128.Length * 4];
+            Buffer.BlockCopy(f128, 0, b128, 0, b128.Length);
+            File.WriteAllBytes(Path.Combine(dir!, "ours-hd128.f32"), b128);
+        }
 
         // Bisection aid: dotLLM logits after the first N trunk layers (compare with the HF model truncated to N layers).
         using var gguf = GgufFile.Open(Path.Combine(dir!, "synthetic.gguf"));
@@ -249,6 +325,28 @@ public sealed class Glm4MoeForwardTests : IDisposable
             File.WriteAllBytes(Path.Combine(dir!, $"ours-{n}layers.f32"), bytes);
         }
     }
+
+    /// <summary>300 deterministic tokens (vocab 16) for the long-sequence, real-head-geometry probe.</summary>
+    internal static int[] LongIds()
+    {
+        var r = new Random(12345);
+        return Enumerable.Range(0, 300).Select(_ => r.Next(SyntheticGlm4MoeGguf.VocabSize)).ToArray();
+    }
+
+    private const string Fixture128Sha256 = "5ffb6dc197725a780cf3870dffeca58b4496bd7b487cfe714bb959a7b68d2cb8";
+
+    /// <summary>HF F32 logits for rows <see cref="Rows128"/> of <see cref="LongIds"/> on <c>Build(withNextn: false, headDim: 128)</c>.</summary>
+    private static readonly float[] Golden128 = DecodeGolden(
+        "YjljvkqjgL5NLpA8IhuuPlqzAT6fAJO9oAU0vZxG0D2h2ga+HsJtPrI2sb1wK6C9YUrfPOWQbr6nk1k9vuu2PmQ5Y75Io4C+Oy6QPB8brj5WswE+ngCTvZUF" +
+        "NL2bRtA9ntoGvhnCbT6vNrG9ZyugvYBK3zzjkG6+qZNZPb/rtj4g7oW9NKREvgIAAr7mMl8+/rZvvbr+KL5idR29v9c+Prqgjjx5rjU8czENvsJXyjxemxE+" +
+        "MjRpvuZrfr0DXKc++KsBviHkUr6cvXG+UiqKPg1KNT1jkQW+OvzKPL3/zD2/6Ta+/j09PR3OXb2Qc4k9ugTGPC8Ue75Z/Ig5yvfrPsDXfL488h6+IdzDvqdk" +
+        "GrxyRj0+ns3DvfnEG77IvyQ9RgeIvTDOIT4Gqk67hJRuuTtN8T3TeTi+Etc5vpcb9T7kZRa+Kg5XvuqipL5tnQI8F0Lxu6cOvL1A9Ms7umIrvdbSDL56zuI8" +
+        "/Z/ovIbz2LvZCVq76ELDvvswBr7iIfg+0xUdvg5MSr6nkLW+LWKjPSQxUz4zLu+92aqTvSqftL0UBDK+zK+NPeHxS71fp2u8jcVwPR/2nb5l3Ni9L+ABP9if" +
+        "gb7Xw2W+RZvFvrDGlT2BVSU+8Smyvcu62L2NZZK8DpXwvLi//T1+7cA8VcJrvZUYCD5nRJK+eLA4vr3jyz4je3i+LmwJvtk8o77lZ/A9VtSCPkq6qb0ECP+9" +
+        "SWRfPRLz8rv0I8M91plWvCUvHb3PTFk+bZryvVEGor1GEKM+51Yuvte4yb0aL8W+hebgPR35kD6UPwy+LODKvWNr4b2uSOy96A2yPGazy7wCsT685pEIPotH" +
+        "gb5uHsS96MHVPqSNZr5pJC++TAHqviLX+D1y01E+N+lXvRRuvb0Zfoi9Uy6QvHIUkT0CCR49OMYovblrJz5ijX2+VQNXvQN+lj7XQn++n8Zfvs4txr7Tm5w9" +
+        "lmUoPhHKq71HGNi9AzrhvAnnFL07dto9kTnSPEDrZL210xA+q8OQvvRjNr6WxM4+X75bvt/+qL2d+NC+8uWdPdOenz4+X4u96gIKvtwsPL2FeJm9+XDaPCaE" +
+        "ST14a5i890YlPmO4H75bbga+DIWuPg==");
 
     private const string FixtureSha256 = "ed5975b2415b79872375e1d9fef64ca91af22bc2b83266ef0c69e69b23409d4f";
 
