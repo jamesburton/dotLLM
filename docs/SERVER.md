@@ -61,7 +61,7 @@ name concepts this server has no equivalent for, and a client that always sends 
 get a 400. Genuinely unknown fields are tolerated too (STJ source-gen skips unmapped members) —
 declaring these makes the intent explicit and guards against a future strict-DTO pass.
 
-**`chunk_cache`** (chunk-level K/V reuse convention, fork-only): with `dotllm serve --chunk-cache` (off by default;
+**`chunk_cache`** (chunk-level K/V reuse convention): with `dotllm serve --chunk-cache` (off by default;
 `--chunk-cache-max-chunks`, default 4096, caps annotations per request) the annotations are parsed and validated; using
 them for reuse arrives with the next server tasks, so today the flag changes no response. With the flag off it is
 ignored like any unknown field, so an annotated body behaves byte for byte like the plain one. On this surface a span
