@@ -162,7 +162,7 @@ No end-to-end KL/perplexity was run.
 ## Verdict
 
 - **At n = 1 (decode) the K3 planar in-place kernel wins: 2.0-2.6x over production, 63-90 GB/s = 60-90% of the read roofline (production sits at about 30-35%)**; it is neutral at n = 4 and
-  loses 12% at n = 16 (it re-decodes the codes per token). It is wired **default-off** behind `DOTLLM_PQ2_PLANAR=1` for the n = 1 GEMV (`MatMul.PQ2Planar.cs`); follow-up #1620 covers end-to-end validation and token blocking.
+  loses 12% at n = 16 (it re-decodes the codes per token). It was wired **default-off** behind `DOTLLM_PQ2_PLANAR=1` for the n = 1 GEMV (`MatMul.PQ2Planar.cs`); follow-up #1620 added end-to-end validation and token blocking, and made it the default (see "Quiet-machine re-run and the default flip" below; off switch `DOTLLM_PQ2_PLANAR=0`).
 - **The kernel from the issue as the NeuroSymbolicAI team wrote it loses badly on Bonsai-2 shapes**: the packed LUT version is 0.13x (decode) down to 0.03x (n=16), the int8-unpacked version
   0.56x down to 0.18x. Our own bitmask masked add/sub (K2) is 1.2-1.5x at decode but 0.4-0.57x at n >= 4. No ternary "masked add/sub" variant beats production at n >= 4.
 - **Does the win shrink or grow with matrix size?** The reference's headline figure is a K x 4096 down-projection (128 KB of int8 weights, L2 resident). On this box its throughput is about 9.4 GB/s of int8 weights
@@ -203,7 +203,81 @@ re-unpacks per call), neutral from 16 up, and never loses within noise (the prod
 Perplexity cannot see the decode GEMV itself (prefill scores via GEMM), so this run routes prefill through the same planar activation grid and per-token op order (the blocked kernel is bit-identical per token to the n = 1 GEMV, tested) to measure the grid.
 Order-noise floor: production itself differs from the float tier by up to 0.0112 PPL per window (0.1 %), and in 2 of 6 windows production is further from the float tier than planar is, so planar's +-0.0141 sits at that floor.
 **Greedy text identity** (`dotllm run -t 0 -n 48`, 5 prompts: capital, poem, physics, code, reasoning): planar and planar-everywhere equal production on 4 of 5; on the code prompt all of planar / float differ from production at the same character (`n-1` vs `n - 1`), and **planar equals the float-activation tier there**, i.e. production's Q8_0 grid is the outlier on that near-tie.
-**Verdict:** the e2e decode win is real (about 1.45x median pair, up to 2.85x, in a contended session; about 1.5x in the quiet pairs) and quality is inside the floor. Proposal (not applied here): default-on with `DOTLLM_PQ2_PLANAR=0` as the off-switch, `NMAX` 4 to 16, after a quiet-machine decode re-run. The scalar activation prep (O(k) per call) is the next lever.
+**Verdict:** the e2e decode win is real (about 1.45x median pair, up to 2.85x, in a contended session; about 1.5x in the quiet pairs) and quality is inside the floor. Proposal at the time: default-on with `DOTLLM_PQ2_PLANAR=0` as the off-switch, `NMAX` 4 to 16, after a quiet-machine decode re-run (done below; applied with `NMAX` 16). The scalar activation prep (O(k) per call) is the next lever.
+
+## Quiet-machine re-run and the default flip (#1620, 2026-11-04)
+
+Same model and harness, plus a second PQ2_0 model (`BoldingBuilds/Ternary-Bonsai-2-27B-Abliterated-v2-PQ2_0-MTP-GGUF`, same architecture, different weights), and a third, smaller one (Bonsai-2 2B, below).
+`cpu-bench` + `memory` + `gpu` locks held; 60 s CPU-idle sample and a process list before and after every batch. **The box never went below 5 % busy**: its floor was 5.2-6.9 % from non-agent processes
+(Docker `com.docker.sailor` about 0.4 core, a human-opened Task Manager about 0.2 core), so each pre-check retried 5 times and then ran with that floor recorded. A sibling agent's build overlapped the first n = 512 run (post-check 13 % busy,
+per-rep spread 13.9-18.3 tok/s), so n = 512 and n = 256 were re-run afterwards (below). In-process alternation, both orders, warm-up rep dropped, 24 measured reps per order for decode and n <= 64 (12 per mode per order), 12 per order for n >= 128.
+Ratio = median planar / median production; "orders" = the same ratio inside the planar-first and the prod-first process; `planar_calls` per rep proves which path ran (decode: 12833 per 32-token rep in planar reps, 0 in production reps;
+prefill: 400 blocked-GEMM calls plus about 402 for the single timed decode token).
+**Null controls:** rows where n > NMAX run production prefill in both modes (only the single decode token differs), so they measure the harness noise.
+
+| arm | planar min / med / max | production min / med / max | **ratio** | pair ratio min / med / max | orders (planar-first / prod-first) |
+|---|---|---|---|---|---|
+| decode n = 1 (`-p 32 -n 32`), tok/s | 7.56 / 8.32 / 8.65 | 5.37 / 5.55 / 6.00 | **1.498** | 1.37 / 1.50 / 1.58 | 1.484 / 1.510 |
+| prefill n = 2 | 10.39 / 13.21 / 13.75 | 5.85 / 7.17 / 8.06 | **1.840** | 1.47 / 1.81 / 2.22 | 1.852 / 1.819 |
+| prefill n = 4 | 12.45 / 16.54 / 17.32 | 10.54 / 13.38 / 14.33 | **1.235** | 0.97 / 1.24 / 1.46 | 1.213 / 1.236 |
+| prefill n = 8, NMAX 16 | 16.84 / 18.86 / 19.79 | 14.24 / 16.78 / 18.06 | **1.124** | 1.01 / 1.11 / 1.33 | 1.124 / 1.120 |
+| prefill n = 16, NMAX 16 | 18.27 / 19.21 / 20.07 | 16.73 / 18.12 / 19.20 | **1.060** | 0.98 / 1.05 / 1.16 | 1.096 / 1.031 |
+| prefill n = 32, NMAX 64 | 19.38 / 20.01 / 20.67 | 18.03 / 19.13 / 19.99 | **1.046** | 1.00 / 1.04 / 1.13 | 1.075 / 1.027 |
+| prefill n = 64, NMAX 64 | 18.89 / 19.74 / 20.79 | 18.76 / 19.31 / 19.78 | **1.022** | 0.97 / 1.02 / 1.09 | 1.042 / 0.992 |
+| prefill n = 128, NMAX unbounded | 19.54 / 20.28 / 20.93 | 19.44 / 19.93 / 20.59 | **1.018** | 0.95 / 1.02 / 1.08 | 1.046 / 0.989 |
+| prefill n = 256, NMAX unbounded (clean re-run) | 18.63 / 19.09 / 19.69 | 18.35 / 18.66 / 19.00 | **1.023** | 0.98 / 1.03 / 1.07 | 1.064 / 0.989 |
+| prefill n = 512, NMAX unbounded (clean re-run) | 17.80 / 18.55 / 19.64 | 17.95 / 18.45 / 19.38 | **1.005** | 0.99 / 1.01 / 1.03 | 1.027 / 0.996 |
+| (n = 512, first run, overlapped by a sibling's build: discarded) | 13.86 / 16.64 / 18.32 | 14.20 / 16.73 / 18.30 | 0.995 | 0.81 / 0.99 / 1.20 | 1.021 / 0.990 |
+| *null* n = 8, NMAX 4 | 16.14 / 16.92 / 17.84 | 15.78 / 16.96 / 17.87 | 0.997 | 0.96 / 1.00 / 1.09 | 1.005 / 0.999 |
+| *null* n = 16, NMAX 4 | 17.96 / 18.53 / 20.16 | 17.71 / 18.73 / 19.59 | 0.990 | 0.94 / 1.00 / 1.06 | 1.003 / 0.988 |
+| *null* n = 32, NMAX 16 | 19.42 / 19.73 / 20.20 | 19.09 / 19.69 / 20.57 | 1.003 | 0.97 / 1.00 / 1.04 | 1.001 / 1.003 |
+| *null* n = 64, NMAX 16 | 19.09 / 19.60 / 20.32 | 19.38 / 19.61 / 20.13 | 0.999 | 0.97 / 1.00 / 1.05 | 0.998 / 1.002 |
+| *null* n = 128, NMAX 64 | 19.14 / 19.90 / 20.66 | 18.87 / 19.84 / 20.58 | 1.003 | 0.98 / 1.01 / 1.02 | 1.008 / 1.001 |
+| second model: decode n = 1 | 6.56 / 8.23 / 8.49 | 4.93 / 5.60 / 6.07 | **1.469** | 1.29 / 1.45 / 1.60 | 1.436 / 1.487 |
+| second model: prefill n = 4 | 13.16 / 16.16 / 16.92 | 10.21 / 12.92 / 13.73 | **1.250** | 1.04 / 1.24 / 1.51 | 1.234 / 1.246 |
+| second model: prefill n = 16 | 18.37 / 19.46 / 20.49 | 16.90 / 18.20 / 19.30 | **1.069** | 0.98 / 1.07 / 1.18 | 1.113 / 1.021 |
+
+Null-control medians land at 0.990-1.003 and their single pairs reach 0.94, so a single pair below 0.97 is harness noise; the gate is the median ratio and each order's ratio. The planar-first process reads about 2-4 % higher than the prod-first one at mid n
+(an order effect, which is why both orders are run); every planar arm's two-order mean is >= 1.0 and the lowest single-order ratio is 0.989.
+Decode is a clean **1.50x** (Bonsai-2) and **1.47x** (second model), with no pair below 1.29x. That matches the earlier quiet separate-process pairs (about 1.5x); the contended run's 0.63x minimum was contention.
+
+**Quality** (wikitext-2 LF, ctx 512, 6 windows, `NMAX` unbounded so prefill runs the planar kernel too; this is the worst case, since the shipped cut of 16 leaves ctx-512 prefill on production):
+
+| model | production PPL | planar PPL | max per-window delta | floor (production vs float-activation tier, per window) |
+|---|---|---|---|---|
+| Bonsai-2 27B | 8.4537 | 8.4528 | 0.0136 (window 5, -0.13 %) | 0.0112 per window; 0.0141 for planar vs float (both measured above) |
+| second model | 8.7588 | 8.7623 | 0.0151 (window 4, +0.18 %) | production vs float up to 0.0083 per window; planar vs float up to 0.0149; float PPL 8.7574 |
+
+On the second model planar moves PPL by +0.0035 overall (+0.04 %; production is +0.0014 from its float reference, planar +0.0049), and its per-window distance from the float reference (0.0149) is about 1.8x production's (0.0083), with mixed signs (3 windows closer than production, 3 further).
+On Bonsai-2 planar was the closer of the two (8.4528 vs float 8.4541, production 8.4537). Both are below the earlier 0.0141 floor in aggregate. The per-window maximum on the second model exceeds it by 0.001, the one marginal number in this run: a different grid
+of the same precision, not a systematic loss, but recorded rather than rounded away.
+
+Greedy text identity (`run -t 0 -n 48`, the same 5 prompts; production, planar with NMAX 4, planar with NMAX 64 (covers each whole prompt), float activations): 4 of 5 byte-identical in all four modes. On the code prompt, all three non-production modes produce
+`fibonacci(n-1)` where production produces `fibonacci(n - 1)`: planar equals the float-activation reference and production's Q8_0 grid is the outlier, the same as in the contended run.
+
+**Third model, smaller shapes: `prism-ml/Ternary-Bonsai-2-2B-gguf` `PQ2_0` (517 MB, fetched into the HF cache for this check).** Same harness, 24 (decode) or 48 (prefill) reps per order, NMAX unbounded on the prefill arms:
+
+| 2B arm | planar median | production median | **ratio** | orders |
+|---|---|---|---|---|
+| decode n = 1 (`-p 32 -n 64`), tok/s | 99.2 | 74.4 | **1.333** (pairs 1.17-1.56) | 1.320 / 1.324 |
+| prefill n = 2 | 82.9 | 68.9 | **1.203** | 1.277 / 1.138 |
+| prefill n = 4 | 131.6 | 130.7 | 1.007 | 1.023 / 1.032 |
+| prefill n = 8 | 179.0 | 178.4 | 1.003 | 1.033 / 0.981 |
+| prefill n = 16 | 214.6 | 212.0 | 1.012 (a 24-rep run: 0.988, orders 0.940 / 0.968) | 1.031 / 1.015 |
+| prefill n = 32 | 232.1 | 240.9 | **0.964** | 0.965 / 0.964 |
+| prefill n = 64 | 237.0 | 249.4 | **0.950** | 0.957 / 0.934 |
+| prefill n = 128 | 234.3 | 251.2 | **0.933** | 0.925 / 0.924 |
+| *null* n = 16 / n = 128, NMAX 4 | | | 1.008 / 1.007 | |
+
+The 2B's small-n prefill runs take 10-80 ms, so per-rep spread is wide (pairs 0.6-2.2); the medians over 96 reps and the null controls (1.007-1.008) are the signal. On these smaller matrices (hidden 2048) the blocked planar kernel stops paying above n = 16 and loses 4-7 % at n >= 32,
+while on the 27B shapes it never loses. The likely cause is the scalar O(n*k) planar activation prep (#1629), which weighs more against a smaller m*k*n matmul; vectorising it is the precondition for raising the cut.
+
+**Decision: default ON, `NMAX` = 16, off switch `DOTLLM_PQ2_PLANAR=0`.** Thresholds applied: median ratio >= 0.97 for every n on every model at the shipped cut (lowest: 1.003, 2B n = 8; above the cut the production kernel runs, so ratio 1 by construction); PPL change inside the per-model noise floor; greedy identity no worse than production vs the float reference.
+Why 16 and not unbounded or 4: unbounded fails the gate on the 2B (0.93x at n = 128). 4 gives up 1.12x / 1.06x at n = 8 / 16 on the 27B. 16 also covers the default prompt-lookup verify (8 drafts = 9 rows).
+That matters because since #1386 the production GEMM is bit-identical per token to the decode GEMV (`GemmPQ2_0_SmallN_BitIdenticalToDecodeGemv_PerToken`, so a verify row scores exactly like decode). With planar decode this now holds for n <= NMAX only:
+batches above 16 (long prefill chunks, verify with >= 16 drafts) run on the Q8_0 grid while decode runs on the planar grid. Both grids are inside the precision floor (above), so this costs determinism on near-ties for those large verify batches, not quality.
+The test now asserts identity up to the cut, with explicit n = 16 / 17 cases. The perplexity rows above used NMAX unbounded so the prefill exercised the planar grid. With the shipped cut, ctx-512 perplexity runs production prefill and equals production.
+`DOTLLM_PQ2_W2A8=0` (the unquantized-activation reference tier) also turns planar off, so that switch keeps its meaning. `DOTLLM_PQ2_PLANAR_NMAX=n` overrides the cut (1 = decode GEMV only). Planar needs AVX2; without it the W2A8 / float tiers run unchanged.
 
 # Reproducing the adapter-kernel claim ("25,126 tok/s at rank 32")
 

@@ -742,6 +742,8 @@ Mean KL ~1e-4 is two orders below the activation-precision floor recorded above 
 Q8 activation numerics are accepted and the default cut is now unbounded (`DOTLLM_PQ2_SMALLN_MAX=1` restores the float tier). W2A8 is faster at
 every measured n (2.1-2.6x), so there is no crossover to cut at. Single-session, one model; windows are few (sd of PPL ~1.9), but the paired
 per-token KL does not depend on that.
+Since #1620 the planar PQ2_0 kernel is the default on AVX2 for decode and n <= 16 (`DOTLLM_PQ2_PLANAR_NMAX`) and runs ahead of this tier there;
+`DOTLLM_PQ2_PLANAR=0` restores this tier for every n, and `DOTLLM_PQ2_W2A8=0` still selects the float tier everywhere (see docs/TERNARY_ADAPTER.md).
 
 ### CPU Q8_K activation quantizer: PPL and greedy sanity check (issue #1340, 2026-10-31)
 

@@ -236,8 +236,9 @@ public sealed unsafe class W2A8SseTierTests
             for (int i = 0; i < n * k; i++) b[i] = rng.NextSingle() * 2f - 1f;
             for (int t = 0; t < n; t++) MatMul.QuantizeF32ToQ8_0(b + t * k, bQ8 + t * blocks * Q8BlockBytes, k);
 
-            if (n == 1) MatMul.GemvPQ2_0(weights, b, c, m, k, null);
-            else MatMul.GemmPQ2_0W2A8ForTest(weights, b, c, m, k, n);
+            // The W2A8 tier directly: since #1620 the public GemvPQ2_0 dispatches to the planar kernel by default (different activation grid);
+            // GemmPQ2_0W2A8 at n = 1 is bit-identical to the W2A8 decode GEMV (#1367).
+            MatMul.GemmPQ2_0W2A8ForTest(weights, b, c, m, k, n);
 
             for (int r = 0; r < m; r++)
             {
