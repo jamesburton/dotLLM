@@ -35,6 +35,14 @@ HookContext:
   CurrentStep: int
 ```
 
+### In-place residual modification (`IResidualModifier`)
+
+`IInferenceHook` (and `HookResult.Replace(float[])`) allocates per call and is not currently wired into the CPU
+forward. For allocation-free `PostLayer` interventions (e.g. ternary steering adapters, see
+[TERNARY_ADAPTER.md](TERNARY_ADAPTER.md)) the CPU `TransformerModel` exposes `ResidualModifier`
+(`DotLLM.Core.Diagnostics.IResidualModifier`): after each layer it gets the `[tokens x hidden]` residual span to
+mutate in place. Null by default; unset cost is one branch per layer.
+
 ### Zero-Cost When Disabled
 
 Hooks disabled by default. Implementation:

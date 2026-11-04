@@ -120,6 +120,13 @@ public static unsafe partial class MatMul
         if (k % PQ2_0GroupSize != 0)
             throw new ArgumentException($"k must be a multiple of {PQ2_0GroupSize}, got {k}", nameof(k));
 
+        if (PQ2_0Planar)
+        {
+            // Opt-in (#1616, DOTLLM_PQ2_PLANAR=1, default off): packed bytes in place, planar int8 activations.
+            GemvPQ2_0Planar(weights, x, result, m, k, threadPool);
+            return;
+        }
+
         if (PQ2_0UseW2A8)
         {
             GemvPQ2_0W2A8(weights, x, result, m, k, threadPool);
