@@ -40,7 +40,8 @@ public static class GpuOffloadPlanner
     public static bool SupportsPartialOffload(Architecture architecture) => architecture switch
     {
         Architecture.NemotronH or Architecture.NemotronHMoe
-            or Architecture.Qwen3MoeHybrid or Architecture.Qwen4Exp or Architecture.Mamba3 or Architecture.Lfm2Moe => false,
+            or Architecture.Qwen3MoeHybrid or Architecture.Qwen4Exp or Architecture.Mamba3 or Architecture.Lfm2Moe or Architecture.Lfm3
+            or Architecture.Glm4Moe => false,
         _ => true,
     };
 

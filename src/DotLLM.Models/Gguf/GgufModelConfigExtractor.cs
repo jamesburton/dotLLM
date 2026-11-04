@@ -53,6 +53,8 @@ public static partial class GgufModelConfigExtractor
         // deepseek2 (GLM-4.7-Flash, DeepSeek-V3/R1 conversions) ships it too (#742).
         int nextnPredictLayers = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Qwen4Exp
                 or Architecture.NemotronHMoe or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
+                // glm4moe (#1598): block_count = trunk + nextn_predict_layers; the trailing block carries blk.N.nextn.* tensors in the trunk file.
+                or Architecture.Glm4Moe
             ? (int)metadata.GetUInt32OrDefault($"{arch}.nextn_predict_layers", 0)
             : 0;
         int numTrunkLayers = numLayers - nextnPredictLayers;
@@ -63,6 +65,8 @@ public static partial class GgufModelConfigExtractor
         // both keys are scalar UInt32.
         HybridLayerLayout? hybridLayout = architecture == Architecture.Lfm2Moe
             ? BuildLfm2MoeLayout(metadata, arch, numTrunkLayers)
+            : architecture == Architecture.Lfm3
+            ? BuildLfm3Layout(metadata, arch, numTrunkLayers)
             : TryExtractHybridLayout(metadata, arch, numTrunkLayers, nextnPredictLayers);
 
         int intermediateSize;
@@ -118,7 +122,11 @@ public static partial class GgufModelConfigExtractor
         // consult PerLayerSlidingWindow before the scalar pattern).
         IReadOnlyList<int?>? perLayerSlidingWindow = architecture is Architecture.Gemma3 or Architecture.GemmaEmbedding && slidingWindowSize is not null
             ? BuildGemma3PerLayerSlidingWindow(metadata, arch, numTrunkLayers, slidingWindowSize.Value)
-            : null;
+            : architecture == Architecture.Lfm3
+                ? (slidingWindowSize is { } lfmWindow
+                    ? BuildLfm3PerLayerSlidingWindow(metadata, arch, numTrunkLayers, lfmWindow)
+                    : throw new InvalidDataException("LFM3 requires lfm3.attention.sliding_window (llama.cpp load_arch_hparams throws without sliding layers)."))
+                : null;
 
         int vocabSize = ResolveVocabSize(metadata, arch);
 
@@ -133,7 +141,7 @@ public static partial class GgufModelConfigExtractor
         // GGUF linear scaling (4B+: factor 8). RoPEConfig carries the LOCAL table, GlobalRoPEConfig the
         // global one (selected per layer via IsFullAttentionLayer).
         RoPEConfig? globalRopeConfig = null;
-        if (architecture is Architecture.Gemma3 or Architecture.GemmaEmbedding && ropeConfig is { } gr)
+        if (architecture is Architecture.Gemma3 or Architecture.GemmaEmbedding or Architecture.Lfm3 && ropeConfig is { } gr)
         {
             globalRopeConfig = gr;
             float localTheta = metadata.GetFloat32OrDefault($"{arch}.rope.freq_base_swa", 10000.0f);
@@ -240,6 +248,10 @@ public static partial class GgufModelConfigExtractor
         {
             moeConfig = ExtractGraniteMoeConfig(metadata, arch, intermediateSize);
         }
+        else if (architecture == Architecture.Glm4Moe)
+        {
+            moeConfig = ExtractGlm4MoeConfig(metadata, arch, intermediateSize);
+        }
 
         // Granite scalars (llama.cpp granite.cpp / granite-moe.cpp; conversion/granite.py writes the HF
         // *_multiplier / logits_scaling values under these keys). 0 / absent = off for embedding, residual and
@@ -301,6 +313,9 @@ public static partial class GgufModelConfigExtractor
                 : isGemma3 ? ResolveGemma3QueryPreAttnScalar(numTrunkLayers, hiddenSize, numAttentionHeads, headDim)
                 : null,
             RoPEConfig = ropeConfig,
+            // glm4moe: the rotated slice is rope.dimension_count (64) of the 128-wide head, i.e. partial_rotary_factor 0.5.
+            PartialRotaryFactor = architecture == Architecture.Glm4Moe && ropeConfig is { } glmRope && headDim > 0 && glmRope.DimensionCount < headDim
+                ? (float)glmRope.DimensionCount / headDim : null,
             NoRopeLayers = noRopeLayers,
             QkNormWholeProjection = architecture == Architecture.Olmo2
                 || string.Equals(archString, "olmoe", StringComparison.OrdinalIgnoreCase),
@@ -312,7 +327,7 @@ public static partial class GgufModelConfigExtractor
             SlidingWindowSize = slidingWindowSize,
             SlidingWindowPattern = slidingWindowPattern,
             HybridLayout = hybridLayout,
-            ShortConvCacheLength = architecture == Architecture.Lfm2Moe
+            ShortConvCacheLength = architecture is Architecture.Lfm2Moe or Architecture.Lfm3
                 ? (int)metadata.GetUInt32($"{arch}.shortconv.l_cache") : 0,
             SsmConfig = ssmConfig,
             MlaConfig = mlaConfig,
@@ -927,6 +942,41 @@ public static partial class GgufModelConfigExtractor
     }
 
     /// <summary>
+    /// LFM3 layer layout (llama.cpp <c>llama_model_lfm3</c>): like LFM2, <c>head_count_kv</c> zeros are the short-conv layers;
+    /// every layer carries the same dense SwiGLU FFN of width <c>feed_forward_length</c> (no MoE).
+    /// </summary>
+    private static HybridLayerLayout BuildLfm3Layout(GgufMetadata metadata, string arch, int numLayers)
+    {
+        string kvKey = $"{arch}.attention.head_count_kv";
+        int[] kv = metadata.GetInt32Array(kvKey);
+        if (kv.Length != numLayers)
+            throw new InvalidDataException($"'{kvKey}' array length {kv.Length} does not match block_count {numLayers}.");
+        int ffLen = (int)metadata.GetUInt32($"{arch}.feed_forward_length");
+        var kinds = new HybridLayerKind[numLayers];
+        var ff = new int[numLayers];
+        for (int i = 0; i < numLayers; i++)
+        {
+            kinds[i] = kv[i] > 0 ? HybridLayerKind.Attention : HybridLayerKind.ShortConv;
+            ff[i] = ffLen;
+        }
+        return new HybridLayerLayout { LayerKind = kinds, HeadCountKv = kv, FeedForwardLength = ff };
+    }
+
+    /// <summary>
+    /// LFM3 per-layer sliding window: <c>attention.sliding_window_pattern</c> is a per-layer bool array (true = windowed,
+    /// llama.cpp <c>is_swa_impl</c>); windowed layers get <paramref name="window"/>, global and conv layers get null.
+    /// </summary>
+    private static IReadOnlyList<int?> BuildLfm3PerLayerSlidingWindow(GgufMetadata metadata, string arch, int numLayers, int window)
+    {
+        bool[] pattern = metadata.GetBoolArray($"{arch}.attention.sliding_window_pattern");
+        if (pattern.Length != numLayers)
+            throw new InvalidDataException($"'{arch}.attention.sliding_window_pattern' length {pattern.Length} does not match block_count {numLayers}.");
+        var r = new int?[numLayers];
+        for (int i = 0; i < numLayers; i++) r[i] = pattern[i] ? window : null;
+        return r;
+    }
+
+    /// <summary>
     /// LFM2-MoE routing (llama.cpp <c>lfm2moe.cpp</c>): <c>build_moe_ffn(..., LLM_FFN_SILU, norm_w=true, expert_weights_scale,
     /// gating_func=expert_gating_func)</c> with the <c>exp_probs_b</c> selection bias; no shared expert; the first
     /// <c>leading_dense_block_count</c> layers use a dense SwiGLU of width <c>feed_forward_length</c>.
@@ -1065,6 +1115,58 @@ public static partial class GgufModelConfigExtractor
         return max > 0 ? max : fallback;
     }
 
+    /// <summary>
+    /// GLM-4.5 MoE routing (llama.cpp <c>glm4-moe.cpp</c>): <c>build_moe_ffn(..., LLM_FFN_SILU, expert_weights_norm, expert_weights_scale,
+    /// expert_gating_func)</c> with the <c>exp_probs_b</c> selection bias, plus an ungated shared expert (<c>expert_shared_count</c> copies of
+    /// <c>expert_feed_forward_length</c> fused into one SwiGLU of width <c>moe * shared</c>, tensors <c>ffn_{gate,up,down}_shexp</c>); the first
+    /// <c>leading_dense_block_count</c> layers use a dense SwiGLU of width <c>feed_forward_length</c>. llama.cpp defaults an absent/NONE gating
+    /// function to sigmoid for this arch; <c>expert_weights_norm</c> and <c>expert_weights_scale</c> are optional there (norm false, scale 1).
+    /// </summary>
+    private static MoeConfig ExtractGlm4MoeConfig(GgufMetadata metadata, string arch, int denseIntermediate)
+    {
+        // Required (llama.cpp asserts n_expert > 0 and n_expert_used > 0 for GLM4_MOE).
+        int expertCount = (int)metadata.GetUInt32($"{arch}.expert_count");
+        int expertUsed = (int)metadata.GetUInt32($"{arch}.expert_used_count");
+        if (expertCount <= 0 || expertUsed <= 0 || expertUsed > expertCount)
+            throw new InvalidDataException(
+                $"{arch}: expert_count={expertCount}, expert_used_count={expertUsed} is invalid (need 0 < used <= count).");
+        int expertShared = (int)metadata.GetUInt32($"{arch}.expert_shared_count");
+        int moeIntermediate = (int)metadata.GetUInt32OrDefault($"{arch}.expert_feed_forward_length", 0);
+        if (moeIntermediate <= 0)
+            moeIntermediate = denseIntermediate / expertUsed; // llama.cpp: n_ff_exp ? n_ff_exp : n_ff / n_expert_used
+        int leadingDense = (int)metadata.GetUInt32OrDefault($"{arch}.leading_dense_block_count", 0);
+        uint gating = metadata.GetUInt32OrDefault($"{arch}.expert_gating_func", 0);
+        if (gating == 0) gating = 2; // llama.cpp: NONE -> SIGMOID for GLM4_MOE
+        if (gating != 1 && gating != 2)
+            throw new InvalidDataException($"{arch}.expert_gating_func={gating} is not supported (only 1=softmax, 2=sigmoid).");
+        bool sigmoid = gating == 2;
+        bool weightsNorm = metadata.GetBoolOrDefault($"{arch}.expert_weights_norm", false);
+        float scale = metadata.GetFloat32OrDefault($"{arch}.expert_weights_scale", 1.0f);
+        if (scale == 0f) scale = 1.0f;
+        int[]? mlpOnly = null;
+        if (leadingDense > 0)
+        {
+            mlpOnly = new int[leadingDense];
+            for (int i = 0; i < leadingDense; i++) mlpOnly[i] = i;
+        }
+        return new MoeConfig
+        {
+            NumExperts = expertCount,
+            NumExpertsPerTok = expertUsed,
+            MoeIntermediateSize = moeIntermediate,
+            NormTopKProb = !sigmoid && weightsNorm,
+            SigmoidGating = sigmoid,
+            HasSelectionBias = sigmoid,            // blk.N.exp_probs_b.bias (required by llama.cpp on every MoE block)
+            NormalizeExpertWeights = sigmoid && weightsNorm,
+            ExpertWeightsScale = scale,
+            SharedExpertIntermediateSize = expertShared > 0 ? moeIntermediate * expertShared : null,
+            NumSharedExperts = expertShared,
+            HasSharedExpertGate = false,           // glm4-moe.cpp: ffn_{up,gate,down}_shexp only, no ffn_gate_inp_shexp
+            DecoderSparseStep = 1,
+            MlpOnlyLayers = mlpOnly,
+        };
+    }
+
     private static Architecture ParseArchitecture(string archString)
     {
         return archString.ToLowerInvariant() switch
@@ -1100,7 +1202,10 @@ public static partial class GgufModelConfigExtractor
             "deepseek2" => Architecture.DeepSeekV2,
             // V3 / V3-MoE — MLA + sigmoid-gated routing + group-norm experts.
             "deepseek3" => Architecture.DeepSeekV3,
+            // Zhipu GLM-4.5 MoE (Air / REAP / 355B): plain GQA + sigmoid-bias MoE, NOT the MLA deepseek2 GLM-4.7-Flash (#1598).
+            "glm4moe" => Architecture.Glm4Moe,
             "lfm2moe" => Architecture.Lfm2Moe,
+            "lfm3" => Architecture.Lfm3,
             "nemotron_h" => Architecture.NemotronH,
             // Nemotron-H hybrid stack + DeepSeek-V3-style MoE + optional MTP head
             // (Nemotron 3.5 Lightning). Distinct llama.cpp arch from nemotron_h.
@@ -1667,7 +1772,10 @@ public static partial class GgufModelConfigExtractor
                 or Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Qwen4Exp or Architecture.Phi
                 or Architecture.GptOss or Architecture.BitNet
                 // llama.cpp llama_model_rope_type: LFM2 / LFM2MOE are NEOX (HF layout).
-                or Architecture.Lfm2Moe
+                or Architecture.Lfm2Moe or Architecture.Lfm3
+                // llama.cpp llama_model_rope_type: LLM_ARCH_GLM4_MOE is LLAMA_ROPE_TYPE_NEOX (the converter's
+                // Glm4MoeModel does not permute Q/K: "GLM4V_MOE uses Neox ordering already"); n_rot = rope.dimension_count = 64 of 128.
+                or Architecture.Glm4Moe
                 // llama.cpp llama_model_rope_type: gemma / gemma2 / gemma3 are NEOX, and their
                 // converter does not permute Q/K (HF rotate_half layout).
                 or Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3 or Architecture.GemmaEmbedding

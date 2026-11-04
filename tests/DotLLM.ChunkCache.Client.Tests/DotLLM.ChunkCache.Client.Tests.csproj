@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- A separate suite, like DotLLM.Tray.Tests: the client is MIT and must not see any engine assembly, so this
+         project references the client only (no DotLLM.* engine, server or backend). Runs on net10.0; the
+         library's net8.0 build is compile-verified by the solution build. -->
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DotLLM.ChunkCache.Client\DotLLM.ChunkCache.Client.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <!-- The real MEAI OpenAI bridge (MIT), so pipeline tests see the body the provider actually serialises. Test-only:
+         the client package itself references Microsoft.Extensions.AI.Abstractions alone. -->
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" />
+    <!-- Release-only benchmark gate (Overhead_Under5ms). -->
+    <PackageReference Include="Xunit.SkippableFact" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Golden wire-contract fixtures, byte-exact copies of the contract set (see Fixtures/v1/fixtures.sha256 and
+         ContractFixtureTests). The csproj is linked so Package_HasNoDotLlmEngineReference can read it. -->
+    <None Include="Fixtures\v1\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\src\DotLLM.ChunkCache.Client\DotLLM.ChunkCache.Client.csproj" Link="ClientProject\DotLLM.ChunkCache.Client.csproj" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

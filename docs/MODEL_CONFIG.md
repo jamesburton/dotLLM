@@ -76,6 +76,41 @@ Differences between architectures are captured entirely in ModelConfig.
 - MlaConfig: latent_dim (e.g., 512), rope_dim (e.g., 64)
 - See [ATTENTION.md](ATTENTION.md) for MLA details
 
+### GLM-4.5 MoE (`glm4moe`: GLM-4.5-Air, Cerebras REAP-82B, GLM-4.5) - CPU forward (#1599); GPU backends refuse (#1600)
+
+Facts below were read from llama.cpp (`src/models/glm4-moe.cpp`, `src/llama-arch.cpp`, `conversion/glm.py` `Glm4MoeModel`, `llama_model_rope_type`) and
+checked against a header range-read (first 16 MB) of `bartowski/cerebras_GLM-4.5-Air-REAP-82B-A12B-GGUF` IQ4_XS (803 tensors, 47 blocks, 52 KV) and the HF
+`config.json` of `zai-org/GLM-4.5-Air` and `cerebras/GLM-4.5-Air-REAP-82B-A12B` (identical except `n_routed_experts` 128 vs 96).
+
+- **CPU forward (#1599)** runs on the shared `TransformerModel` (no new model class): `ModelLoader.CreateCpuModelFromGguf` -> `TransformerModel.LoadFromGguf`, which passes
+  `allowGlm4MoeCpu: true` to `TransformerWeights.LoadFromGguf`. Layers `>= leading_dense_block_count` take the MiMo-V2/Flint MoE arm (`LoadDeepSeekMoeLayer` with `skipF32Dequant`:
+  routed banks, shared expert and the router stay in the raw quant view, never widened) and run `ForwardMoeGrouped`; layer 0 is the plain dense SwiGLU. The trunk is `block_count -
+  nextn_predict_layers` layers; the NextN block (`blk.46.*`) is neither loaded nor run (no MTP). RoPE is `RoPE.Execute` with `ropeDim` = `RoPEConfig.DimensionCount` (64) and NeoX pairing,
+  applied once (`PartialRotaryFactor` is only consulted by the Gemma-4 global-layer path). Q/K norm is loaded iff `attn_{q,k}_norm.weight` exists. `packedLegacyExperts` is on for
+  glm4moe (IQ4_NL / Q5_1 banks use the packed x Q8 dot, as llama.cpp does). Vulkan/CUDA/hybrid hosts still refuse (`Glm4MoeUnsupportedMessage`).
+- **Validation recipe**: `tests/scripts/glm4moe_synthetic_hf_reference.py` loads the `SyntheticGlm4MoeGguf` tensors into HF `Glm4MoeForCausalLM` (F32, eager; use a STOCK torch wheel - a locally built
+  torch 2.14 gave run-to-run different MoE logits with multithreaded CPU kernels) and prints the golden pasted into `Glm4MoeForwardTests`. On real files: `llama-perplexity -dev none --kl-divergence-base`
+  + `dotllm perplexity --tokens-file` **without `--bos`** (GLM adds no BOS: the kld ids start at `
+`, and `--bos` replaces each window's first token with `[gMASK]`, giving PPL 2264 instead of 11.8)
+  + `scripts/kld_compare.py` with `DOTLLM_PPL_LOGITS_DUMP`.
+- **GGUF metadata** (prefix `glm4moe.`): `block_count` (= trunk + `nextn_predict_layers`, 47 for Air), `context_length`, `embedding_length`, `feed_forward_length` (dense layer, 10944),
+  `attention.head_count` 96, `attention.head_count_kv` 8 (scalar), `attention.key_length`/`value_length` 128, `attention.layer_norm_rms_epsilon`, `rope.freq_base` 1e6,
+  `rope.dimension_count` **64** (= `int(head_dim * partial_rotary_factor)`, converter default 0.5), `expert_count` 128 (REAP 96), `expert_used_count` 8, `expert_shared_count` 1,
+  `expert_feed_forward_length` 1408, `leading_dense_block_count` 1, `expert_gating_func` 2 (sigmoid; absent/NONE defaults to sigmoid in llama.cpp), `expert_weights_scale` 1.0 (= `routed_scaling_factor`),
+  `expert_weights_norm` true (= `norm_topk_prob`), `nextn_predict_layers` 1. No `rope.scaling.*`, no `expert_group_count` (n_group = 1). `tokenizer.ggml.model = gpt2`, `pre = glm4`.
+  There is NO QK-norm key: Q/K norm is discovered from `blk.N.attn_{q,k}_norm.weight` (llama.cpp: optional tensors); `ModelConfig.UseQkNorm` carries the HF `use_qk_norm` flag (null from GGUF).
+- **Tensors** (GGUF ne-order shapes; Air numbers): `token_embd.weight [4096,151552]`, `output_norm.weight`, `output.weight` (optional; tied to token_embd if absent). Per block: `attn_norm`, `attn_q.weight [4096,12288]` + `attn_q.bias`,
+  `attn_k.weight [4096,1024]` + bias, `attn_v.weight [4096,1024]` + bias, `attn_output.weight [12288,4096]` (no bias), `post_attention_norm.weight` (this is the **pre-FFN** norm = HF `post_attention_layernorm`,
+  not a sandwich post-norm). Dense layer 0: `ffn_gate/up [4096,10944]`, `ffn_down [10944,4096]`. MoE layers: `ffn_gate_inp.weight [4096,E]`, `exp_probs_b.bias [E]`, fused `ffn_{gate,up}_exps.weight [4096,1408,E]`,
+  `ffn_down_exps.weight [1408,4096,E]`, `ffn_{gate,up}_shexp.weight [4096,1408*n_shared]`, `ffn_down_shexp.weight [1408*n_shared,4096]` (no `ffn_gate_inp_shexp`: shared expert is ungated).
+- **NextN lives in the trunk file** (bartowski/unsloth conversions): block `blk.46` (= `block_count`-1) is a full attention+MoE block plus `nextn.eh_proj [8192,4096]`, `nextn.enorm`, `nextn.hnorm`, and (optional) `nextn.embed_tokens`,
+  `nextn.shared_head_head`, `nextn.shared_head_norm`. `ModelConfig.NumLayers` stays trunk-only (46) and `NextnPredictLayers` = 1. ggml-org ships the head as a separate `mtp-*.gguf` instead (trunk file then lacks block 46: not a census error).
+- **RoPE**: `LLAMA_ROPE_TYPE_NEOX` for `LLM_ARCH_GLM4_MOE` (the converter does not permute Q/K: "GLM4V_MOE uses Neox ordering already"), rotated width `n_rot = rope.dimension_count` = 64 of 128. `ModelConfig.RoPEConfig.DimensionCount` = 64 and
+  `ModelConfig.PartialRotaryFactor` = 0.5 are both set; the S1 forward pass must apply the partial rotation once (do not apply both).
+- **MoE semantics** (`build_moe_ffn`): scores = sigmoid(router logits); top-k selection on `scores + exp_probs_b`, gating weights gathered from the UNBIASED scores, renormalised by their sum when `expert_weights_norm`, times `expert_weights_scale`;
+  plus the shared expert added ungated; block output `routed + shared`. Config mapping: `SigmoidGating`, `HasSelectionBias`, `NormalizeExpertWeights`, `ExpertWeightsScale`, `NumSharedExperts`, `SharedExpertIntermediateSize` (= `moe * n_shared`, fused), `MlpOnlyLayers` = `[0..leading_dense)`.
+- GLM-4.7-Flash is a different architecture (`deepseek2`, MLA); dense `glm4` / `Glm4ForCausalLM` is not mapped.
+
 ### gpt-oss (OpenAI gpt-oss-20b / 120b)
 - GGUF arch string: `gpt-oss` (llama.cpp `LLM_ARCH_OPENAI_MOE`)
 - Norm: RMSNorm; pre-FFN norm tensor is named `post_attention_norm`
@@ -316,6 +351,34 @@ Differences between architectures are captured entirely in ModelConfig.
 - **Chat / tools**: always-thinking ChatML (`...assistant
 <think>`), Pythonic tool calls `<|tool_call_start|>[fn(a='x')]<|tool_call_end|>` parsed by
   `PythonicToolCallParser`. Raw `dotllm run` adds no BOS (prefix `<|startoftext|>` or use the chat/serve path).
+
+### LFM3 (`lfm3`, Liquid AI, #1558 / #1559)
+
+- **What it is**: a "tri-hybrid", **not** a state-space model. LFM3-1.7B has 24 layers: 13 gated short-convolution layers (`L_cache = 7`, state = the last 6 rows of
+  `B*X` per channel), 5 **sliding-window** GQA layers (window 256, RoPE theta 1e4) and 6 **global** GQA layers (indices 2, 6, ..., 22; RoPE theta 1e6). Only
+  the 6 global layers' KV grows with context (the sliding layers need at most 256 live rows and the conv state is constant), so long-context decode touches about a
+  quarter of the KV a plain transformer of the same depth would. hidden 2048, 16 heads / 4 KV heads, head_dim 128, dense SwiGLU FFN 7680 on every layer, tied head, 128k vocab.
+- **Layer algebra** (`Architecture.Lfm3`, CPU `Lfm3TransformerModel`; layout from the per-layer `head_count_kv` array (0 = conv) and the per-layer bool array
+  `attention.sliding_window_pattern`, surfaced as `ModelConfig.PerLayerSlidingWindow`): `x += post_operator_norm(mixer(operator_norm(x)))`, then
+  `x += post_ffn_norm(ffn(ffn_norm(x)))` (**sandwich norms**, GGUF `post_attention_norm` / `post_ffw_norm`; both optional, `use_sandwich_norm`). The attention mixer adds a **per-head
+  sigmoid gate**: `attn_out[h] *= sigmoid(attn_gate . x)` (`attn_gate`, hidden to n_heads) before `o_proj`, on top of per-head QK RMS-norm and NeoX RoPE.
+- **RoPE**: sliding layers rotate all 64 pairs with theta `rope.freq_base_swa` (1e4). Global layers use theta `rope.freq_base` (1e6) but rotate only the first 32 pairs: the
+  GGUF stores `rope_freqs.weight` (64 divisors, 1.0 for the first 32, 1e30 after), so the frequency progression of the full 128-wide head is kept and the tail is left unrotated
+  (HF writes the same thing as a zero-tail `inv_freq`). The CPU model builds cos/sin per forward from these and applies a pair-limited NeoX rotation.
+- **State**: reuses `Lfm2ConvStateCache` (per sequence via `CreateSequenceState` / `ForwardBatch`); the KV cache is the sparse hybrid cache (slots only for the 11 attention layers).
+  Sliding layers currently keep the full history in the cache and mask by window (compute is O(window) per token; memory is not yet bounded). No recurrent checkpoint/rollback yet.
+- **Final norm** is `output_norm.weight` (LFM2 files name it `token_embd_norm.weight`); the head is tied to `token_embd`.
+- **Chat / tools**: ChatML with `<|startoftext|>`, thinking via `<think>` (`enable_thinking` default true, so the generation prompt ends `<think>`), XML tool calls
+  `<tool_call>
+<function=name>
+<parameter=k>
+v
+</parameter>
+</function>
+</tool_call>` parsed by `QwenXmlToolCallParser`; image/video placeholders
+  `<|vision_start|><|image|><|vision_end|>`. GGUF `tokenizer.ggml.pre = lfm2`, `add_bos_token = false`.
+- **Parity** (vs llama.cpp `dde879bc`, `-dev none`, wikitext-2, 512-token windows, full-vocab logits): BF16 4 windows top-1 99.5%, mean KL 6.0e-4; Q8_0 16 windows top-1 97.4%,
+  mean KL 2.8e-3 (activation-quantisation floor), PPL 25.9443 vs 25.9400 (+0.017%). See `scripts/kld_compare.py` and `docs/PERPLEXITY.md`.
 
 ## GGUF → ModelConfig Mapping
 

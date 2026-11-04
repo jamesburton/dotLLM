@@ -13,6 +13,8 @@ public enum MoeGroupedLegacyQuant
     Q5_0,
     /// <summary>MXFP4, 17-byte blocks (u8 E8M0 scale, 16 bytes of packed nibbles) - gpt-oss expert banks (#789). Supports a per-expert bias epilogue.</summary>
     Mxfp4,
+    /// <summary>NVFP4, 36-byte blocks of 64 elements (4 UE4M3 sub-block scales + 32 nibble bytes), read in place; per-expert output scale epilogue (#1579).</summary>
+    Nvfp4,
 }
 
 /// <summary>
@@ -60,6 +62,7 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
         MoeGroupedLegacyQuant.Q5_1 => "moe_grouped_matmul_q5_1_coopmat_m64.spv",
         MoeGroupedLegacyQuant.Mxfp4 => "moe_grouped_matmul_mxfp4_coopmat_m64.spv",
         MoeGroupedLegacyQuant.Q5_0 => "moe_grouped_matmul_q5_0_coopmat_m64.spv",
+        MoeGroupedLegacyQuant.Nvfp4 => "moe_grouped_matmul_nvfp4_coopmat_m64.spv",
         _ => "moe_grouped_matmul_q8_0_coopmat_m64.spv",
     };
 
@@ -73,6 +76,7 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
         MoeGroupedLegacyQuant.Q5_1 => 24,
         MoeGroupedLegacyQuant.Mxfp4 => 17,
         MoeGroupedLegacyQuant.Q5_0 => 22,
+        MoeGroupedLegacyQuant.Nvfp4 => 36,
         _ => 34,
     };
 
@@ -131,7 +135,7 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
         if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (k <= 0 || (k % KGroup) != 0) throw new ArgumentException($"k must be a positive multiple of {KGroup}, got {k}", nameof(k));
-        rowBytes = (long)(k / 32) * BlockBytesOf(_quant);
+        rowBytes = _quant == MoeGroupedLegacyQuant.Nvfp4 ? (long)(k / 64) * BlockBytesOf(_quant) : (long)(k / 32) * BlockBytesOf(_quant);
         if (bank.Size < (long)numExperts * m * rowBytes) throw new ArgumentException("bank buffer too small.", nameof(bank));
         if (packedInput.Size < (long)rows * k * sizeof(float)) throw new ArgumentException("packedInput buffer too small.", nameof(packedInput));
         if (output.Size < (long)rows * m * sizeof(float)) throw new ArgumentException("output buffer too small.", nameof(output));
@@ -180,6 +184,7 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
         {
             MoeGroupedLegacyQuant.Q5_1 => (uint)(rowBytes / 4),
             MoeGroupedLegacyQuant.Q5_0 => (uint)(rowBytes / 2),   // 22-byte blocks read as uint16
+            MoeGroupedLegacyQuant.Nvfp4 => (uint)(rowBytes / 4),  // 36-byte blocks are word aligned
             _ => (uint)rowBytes,
         };   // Q8_0 / MXFP4 blocks are not word aligned: byte stride
         Span<uint> pc = stackalloc uint[8] { (uint)m, (uint)k, (uint)rows, (uint)numExperts, (uint)(k / 32), rowStride, tileList, applyBias ? 2u : applyScale ? 1u : 0u };

@@ -518,5 +518,26 @@ public enum Architecture
     /// with a plain biased GELU FFN on even layers and a sparse top-2-of-8 GELU MoE FFN (softmax router, no renormalisation,
     /// no gate projection) on odd layers (<c>moe_every_n_layers = 2</c>); XLM-R SentencePiece Unigram vocabulary. CPU only (issue #1400).
     /// </summary>
-    NomicBertMoe
+    NomicBertMoe,
+
+    /// <summary>
+    /// Liquid AI LFM3 (llama.cpp <c>lfm3</c>, HF <c>Lfm3ForCausalLM</c>), a "tri-hybrid": gated short-convolution layers
+    /// (<c>L_cache = 7</c>) interleaved with sliding-window (256) and global GQA layers (per-head QK RMS-norm, per-head
+    /// sigmoid output gate, NeoX RoPE: theta 1e4 on sliding layers, theta 1e6 with a zero-tail partial rotation on global
+    /// layers via <c>rope_freqs.weight</c>), a dense SwiGLU FFN on every layer and sandwich norms (post-operator and post-FFN
+    /// RMSNorm before each residual add). Tied LM head. Not a state-space model: only the global layers' KV grows with context.
+    /// See issue #1559.
+    /// </summary>
+    Lfm3,
+
+    /// <summary>
+    /// Zhipu GLM-4.5 MoE (llama.cpp <c>glm4moe</c>, HF <c>Glm4MoeForCausalLM</c> / <c>model_type=glm4_moe</c>; GLM-4.5-Air 106B-A12B, the
+    /// Cerebras REAP-pruned 82B-A12B with 96 routed experts, GLM-4.5 355B-A32B). Plain GQA (96 q / 8 KV heads, head_dim 128) with
+    /// Q/K/V bias and no O bias, partial NeoX RoPE (<c>rope.dimension_count</c> 64 of 128), optional per-head Q/K RMS-norm
+    /// (<c>use_qk_norm</c>: false on Air, true on the 355B), pre-norm blocks (<c>blk.N.post_attention_norm</c> is the pre-FFN norm), sigmoid + selection-bias (<c>exp_probs_b</c>)
+    /// top-8 routing with renormalised weights, one ungated shared expert, <c>leading_dense_block_count</c> = 1 dense SwiGLU layer, and one
+    /// trailing NextN/MTP block counted in <c>block_count</c>. Distinct from GLM-4.7-Flash (<c>deepseek2</c>, MLA).
+    /// Config + tensor census only (issue #1598): no forward pass yet, loaders refuse with <see cref="DotLLM.Core.Models.ModelConfig.Glm4MoeUnsupportedMessage"/>.
+    /// </summary>
+    Glm4Moe
 }

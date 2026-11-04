@@ -1,0 +1,29 @@
+#version 450
+// In-place per-head sigmoid-gated multiply: attnOut[t, h, d] *= sigmoid(gate[t, h]).
+//
+// LFM3 attention (llama.cpp lfm3.cpp build_attn_block, HF Lfm3Attention): gate = sigmoid(attn_gate . x) has ONE value per
+// (token, head) and is broadcast over head_dim, unlike the Qwen3.5 full-attention gate (sigmoid_gate_mul_f32.comp) which has a
+// value per element. Pointwise, no reduction; one thread per attnOut element.
+//
+// Dispatch:
+//   local_size_x = 256
+//   groupCount.x = ceil(n_total / 256)   (n_total = seqLen * numHeads * headDim)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufOut  { float attnOut[]; };   // RW  [seqLen, numHeads * headDim]
+layout(set = 0, binding = 1, std430) readonly buffer BufGate { float gate[];    };   // R   [seqLen, numHeads]
+
+layout(push_constant) uniform PushConstants {
+    int n_total;
+    int head_dim;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (int(i) >= pc.n_total) return;
+
+    float g   = gate[i / uint(pc.head_dim)];
+    float sig = 1.0 / (1.0 + exp(-g));
+    attnOut[i] = attnOut[i] * sig;
+}

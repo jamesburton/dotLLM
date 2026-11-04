@@ -240,9 +240,29 @@ public static class HfConfigExtractor
         // gate via ModelConfig.IsNoRopeLayer.
         IReadOnlyList<int>? noRopeLayers = ExtractNoRopeLayers(root);
 
+        // GLM-4.5 MoE: partial rotary. llama.cpp's converter writes rope.dimension_count = int(head_dim * partial_rotary_factor) (default 0.5).
+        // transformers >= 5 moves partial_rotary_factor / rope_theta under `rope_parameters`; accept both spellings.
+        int ropeDims = headDim;
+        float? partialRotaryFactor = null;
+        if (architecture == Architecture.Glm4Moe)
+        {
+            float prf = GetFloatOrDefault(root, "partial_rotary_factor", float.NaN);
+            if (float.IsNaN(prf) && root.TryGetProperty("rope_parameters", out var rp) && rp.ValueKind == JsonValueKind.Object)
+            {
+                prf = GetFloatOrDefault(rp, "partial_rotary_factor", float.NaN);
+                if (!root.TryGetProperty("rope_theta", out _))
+                    ropeTheta = GetFloatOrDefault(rp, "rope_theta", ropeTheta);
+            }
+            if (float.IsNaN(prf)) prf = 0.5f;
+            if (prf <= 0f || prf > 1f)
+                throw new InvalidDataException($"HF config.json partial_rotary_factor={prf} must be in (0, 1].");
+            ropeDims = (int)(headDim * prf);
+            if (ropeDims < headDim) partialRotaryFactor = (float)ropeDims / headDim;
+        }
+
         var ropeConfig = new RoPEConfig(
             Theta: ropeTheta,
-            DimensionCount: headDim,
+            DimensionCount: ropeDims,
             Type: ropeType,
             ScalingType: ropeScalingType,
             ScalingFactor: ropeScalingFactor,
@@ -270,6 +290,10 @@ public static class HfConfigExtractor
             HiddenSize = hiddenSize,
             IntermediateSize = intermediateSize,
             NumLayers = numLayers,
+            // GGUF counts the NextN block inside block_count and ModelConfig.NumLayers is trunk-only; HF's num_hidden_layers is already trunk-only.
+            NextnPredictLayers = architecture == Architecture.Glm4Moe ? GetInt32OrDefault(root, "num_nextn_predict_layers", 0) : 0,
+            UseQkNorm = architecture == Architecture.Glm4Moe ? GetBoolOrDefault(root, "use_qk_norm", false) : null,
+            PartialRotaryFactor = partialRotaryFactor,
             NumAttentionHeads = numAttentionHeads,
             NumKvHeads = numKvHeads,
             HeadDim = headDim,
@@ -516,6 +540,7 @@ public static class HfConfigExtractor
         JsonElement root, int defaultIntermediateSize, int numLayers, Architecture architecture)
     {
         bool isDeepSeek = architecture is Architecture.DeepSeekV2 or Architecture.DeepSeekV3;
+        bool isGlm4Moe = architecture == Architecture.Glm4Moe;
 
         int numExperts = GetInt32OrDefault(root, "num_local_experts", 0);
         if (numExperts <= 0)
@@ -560,7 +585,15 @@ public static class HfConfigExtractor
         int? sharedExpertIntermediate;
         int numSharedExperts = 1;
         bool hasSharedGate;
-        if (isDeepSeek)
+        if (isGlm4Moe)
+        {
+            // GGUF convention (matches GgufModelConfigExtractor.ExtractGlm4MoeConfig): fused width moe * n_shared, count n_shared, ungated.
+            int nShared = GetInt32OrDefault(root, "n_shared_experts", 0);
+            sharedExpertIntermediate = nShared > 0 ? moeIntermediateSize * nShared : null;
+            numSharedExperts = nShared;
+            hasSharedGate = false;
+        }
+        else if (isDeepSeek)
         {
             int nShared = GetInt32OrDefault(root, "n_shared_experts", 0);
             if (nShared > 0)
@@ -597,7 +630,7 @@ public static class HfConfigExtractor
         // DeepSeek uses first_k_dense_replace: layers [0..K) are dense MLP,
         // [K..num_layers) are MoE. We fold this into the mlp_only_layers list
         // so IsMoeLayer() resolves correctly without a DeepSeek-specific branch.
-        if (isDeepSeek)
+        if (isDeepSeek || isGlm4Moe)
         {
             int firstKDense = GetInt32OrDefault(root, "first_k_dense_replace", 0);
             if (firstKDense > 0 && numLayers > 0)
@@ -620,7 +653,12 @@ public static class HfConfigExtractor
             NumExperts = numExperts,
             NumExpertsPerTok = numExpertsPerTok,
             MoeIntermediateSize = moeIntermediateSize,
-            NormTopKProb = normTopKProb,
+            // glm4moe is sigmoid-routed: normalisation lives in NormalizeExpertWeights (GGUF expert_weights_norm), exactly like the GGUF arm.
+            NormTopKProb = !isGlm4Moe && normTopKProb,
+            SigmoidGating = isGlm4Moe,
+            HasSelectionBias = isGlm4Moe,      // e_score_correction_bias
+            NormalizeExpertWeights = isGlm4Moe && normTopKProb,
+            ExpertWeightsScale = isGlm4Moe && GetFloatOrDefault(root, "routed_scaling_factor", 1.0f) is var rsf && rsf != 0f ? rsf : 1.0f,
             SharedExpertIntermediateSize = sharedExpertIntermediate,
             NumSharedExperts = numSharedExperts,
             HasSharedExpertGate = hasSharedGate,
@@ -667,6 +705,10 @@ public static class HfConfigExtractor
 
         return (archName?.ToLowerInvariant(), modelType?.ToLowerInvariant()) switch
         {
+            // Zhipu GLM-4.5 MoE — `Glm4MoeForCausalLM` / `model_type=glm4_moe` (#1598). Checked first so no substring arm below can
+            // shadow it; the dense `Glm4ForCausalLM` / `glm4` is NOT matched and stays unsupported.
+            (var a, _) when a is not null && a.Contains("glm4moe") => Architecture.Glm4Moe,
+            (_, "glm4_moe") => Architecture.Glm4Moe,
             // DeepSeek-V3 must be checked before V2 and before any Llama/Mistral
             // fallback — architectures[0] = 'DeepseekV3ForCausalLM'.
             (var a, _) when a is not null && a.Contains("deepseekv3") => Architecture.DeepSeekV3,

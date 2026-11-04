@@ -280,6 +280,12 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     private MatMulQ4_0MmvqKernel? _matmulQ4_0Mmvq;
     private MatMulQ4_0GemmCoopmatKernel? _matmulQ4_0GemmCoopmat;
     // Native Q4_1 (issue #1171, Recursive Flint): the same four kernel classes on the 20-byte block (value d * nibble + m).
+    // Native NVFP4 (#1579): 36-byte blocks of 64, read in place; scalar GEMV/GEMM and the coopmat GEMM apply the per-tensor X.scale
+    // (VulkanNvfp4Scales) to the output. Routed banks use the indexed kernel with a per-expert scale buffer.
+    private MatMulNvfp4F32Kernel? _matmulNvfp4;
+    private MatMulNvfp4GemmCoopmatKernel? _matmulNvfp4Coopmat;
+    private MoeIndexedMatmulNvfp4F32Kernel? _moeIndexedNvfp4;
+    private MoeGroupedMatmulLegacyQuantCoopmatKernel? _grpNvfp4;
     private MatMulQ4_0GemvF32Kernel? _matmulQ4_1;
     private MatMulQ4_0GemmF32Kernel? _matmulQ4_1Gemm;
     private MatMulQ4_0MmvqKernel? _matmulQ4_1Mmvq;
@@ -1038,6 +1044,15 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     private VulkanKvQ8WriteKernel? _kvQ8Writer;   // Flint Q8_0 KV (opt-in): writer + the attention twins
     private VulkanSplitKvAttentionKernel? _splitKvAttentionKvQ8;
     private VulkanFlashAttentionGqaKernel? _sinkFlashKvQ8;
+    private RopeKvWriteF32Kernel? _ropeKvWriteKvF16;   // fused RoPE + F16 KV write (dense hosts, #1151); null when the SPIR-V is missing
+    // Dense F16 KV (#1151): F16-KV twins of the non-sink attention kernels (per-token, scalar flash, coopmat flash, GQA flash, per-query-position
+    // reference and tiled). Created together with the writer when DefaultKvStorage is F16 on a non-sink architecture; null otherwise.
+    private AttentionF32Kernel? _attentionKvF16;
+    private VulkanFlashAttentionF32Kernel? _flashAttentionKvF16;
+    private VulkanFlashAttentionCoopmatKernel? _flashAttentionCoopmatKvF16;
+    private VulkanFlashAttentionGqaKernel? _prefillGqaFlashKvF16;
+    private AttentionQueryPositionsKernel? _attentionQPosKvF16;
+    private VulkanFlashAttentionGqaKernel? _attentionQPosTiledKvF16;
     // F16-operand guard for the grouped coopmat MoE down projection (#1171): per-row power-of-two downscale of the input and the matching
     // multiply on the output (llama.cpp build_amax_src1_f16; the CPU MoeSwiGluMlp rescale). Null when the SPIR-V is absent.
     private SimpleComputeKernel? _rowPow2Downscale;
@@ -1300,11 +1315,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     }
 
     /// <summary>
-    /// KV storage <see cref="CreateKvCache(int)"/> allocates: F16 for Flint (#1171; CLAUDE.md rule 1, <c>DOTLLM_VK_KV=f32</c> is the A/B
-    /// baseline), F32 for every other architecture until their attention dispatch reads F16 in place (#1151).
+    /// KV storage <see cref="CreateKvCache(int)"/> allocates: F16 for Flint (#1171) and for the plain dense architectures whose every attention
+    /// dispatch reads F16 in place (#1151; CLAUDE.md precision rule 1), F32 for every other architecture. <c>DOTLLM_VK_KV=f32</c> is the explicit A/B
+    /// and oracle baseline for both.
     /// </summary>
     public VulkanKvStorage DefaultKvStorage =>
-        KvStorageOverride ?? (Config.Architecture == DotLLM.Core.Configuration.Architecture.Flint ? VulkanKvStorageExtensions.ParseOptions(null, null, allowQ8: true) : VulkanKvStorage.F32);
+        KvStorageOverride ?? (Config.Architecture == DotLLM.Core.Configuration.Architecture.Flint
+            ? VulkanKvStorageExtensions.ParseOptions(null, null, allowQ8: true)   // Flint alone accepts the opt-in Q8_0 KV
+            : IsDenseF16KvEligible ? VulkanKvStorageExtensions.ParseOptions(null, null) : VulkanKvStorage.F32);
 
     /// <summary>
     /// Diagnostic / test hook: storage the next <see cref="CreateKvCache(int)"/> allocates, in place of <see cref="DefaultKvStorage"/>'s env resolution. Set it AFTER load
@@ -1312,8 +1330,50 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     /// </summary>
     public VulkanKvStorage? KvStorageOverride { get; set; }
 
+    /// <summary>
+    /// True for the plain dense GQA decoders (Llama, Mistral, Qwen, Phi): no MLA, no attention sinks, no shared-KV layers, no distinct V head dim,
+    /// head dim within the F16 attention twins' bound. Every other architecture keeps F32 KV until its dispatch is audited (#1151 follow-ups).
+    /// </summary>
+    internal bool IsDenseF16KvEligible =>
+        Config.Architecture is DotLLM.Core.Configuration.Architecture.Llama or DotLLM.Core.Configuration.Architecture.Mistral
+            or DotLLM.Core.Configuration.Architecture.Qwen or DotLLM.Core.Configuration.Architecture.Phi
+        && Config.MlaConfig is null && Config.NumSharedKvLayers == 0 && !Config.HasDistinctValueHeadDim
+        && Config.AttentionValueScale is null && Config.HeadDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim;
+
+    /// <summary>
+    /// Creates the F16-KV writer and the F16-KV twin of every non-sink attention kernel the dense dispatch can pick (#1151), so an F16
+    /// <see cref="VulkanKvCache"/> is read in place by decode (split-KV or per-token), prefill (GQA flash, coopmat, scalar flash, per-token)
+    /// and the per-query-position arms. A twin that cannot be built (missing SPIR-V, no coopmat) leaves its field null and the dispatch
+    /// takes the next arm, exactly as the F32 chain does.
+    /// </summary>
+    private void InitDenseKvF16Kernels(string spvDir)
+    {
+        InitKvF16Kernels(spvDir, gqaSplit: false);   // writer + split-KV decode twin
+        _attentionKvF16 = AttentionF32Kernel.Create(_device, spvDir, VulkanKvStorage.F16);
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_FUSED_ROPE_KV_F16") != "0")
+        {
+            try { _ropeKvWriteKvF16 = RopeKvWriteF32Kernel.TryCreate(_device, spvDir, VulkanKvStorage.F16); }
+            catch (VulkanException) { _ropeKvWriteKvF16 = null; }   // no 16-bit storage on this device: the unfused rope + convert pair serves
+        }
+        if (!IsFlashAttentionDisabled())
+        {
+            _flashAttentionKvF16 = VulkanFlashAttentionF32Kernel.TryCreate(_device, spvDir, FlashAttentionWideVariant.None,
+                includeHd512: false, kvStorage: VulkanKvStorage.F16);   // head dim <= 128 by IsDenseF16KvEligible
+            if (!IsCoopmatAttentionDisabled())
+                _flashAttentionCoopmatKvF16 = VulkanFlashAttentionCoopmatKernel.TryCreate(_device, spvDir, VulkanKvStorage.F16);
+            if (Environment.GetEnvironmentVariable(PrefillGqaFlashEnvVar) != "ref")
+                _prefillGqaFlashKvF16 = VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, VulkanKvStorage.F16);
+        }
+        if (_attentionQPos is not null && File.Exists(Path.Combine(spvDir, VulkanKvStorage.F16.ShaderName("attention_f32_qpos") + ".spv")))
+        {
+            _attentionQPosKvF16 = AttentionQueryPositionsKernel.Create(_device, spvDir, VulkanKvStorage.F16);
+            if (_attentionQPosTiled is not null)
+                _attentionQPosTiledKvF16 = VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, VulkanKvStorage.F16, queryPositions: true);
+        }
+    }
+
     /// <summary>The F16-KV writer and attention twins. Every Flint layer has sinks, so these three kernels cover every attention dispatch.</summary>
-    private void InitKvF16Kernels(string spvDir)
+    private void InitKvF16Kernels(string spvDir, bool gqaSplit = true)
     {
         _kvF16Writer = VulkanKvF16WriteKernel.Create(_device, spvDir);
         if (!IsSplitDecodeDisabled())
@@ -1322,7 +1382,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
 
             // #1200: the GQA-grouped split pass reads each K / V row once for the 8 query heads of a group (the per-head pass reads it
             // 8 times); at 32K the full layers' decode attention dominated the step. DOTLLM_VULKAN_SPLITKV_GQA=0 restores the per-head pass.
-            _splitKvAttentionKvF16?.EnableGqaByDefault();
+            if (gqaSplit) _splitKvAttentionKvF16?.EnableGqaByDefault();   // the dense host keeps the F32 chain's per-head pass until the grouped pass is measured there
         }
         if (_smallRowAttn is not null)
             _smallRowAttnKvF16 = VulkanSplitKvRowsAttentionKernel.TryCreate(_device, spvDir, VulkanKvStorage.F16);
@@ -1470,10 +1530,23 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     /// <param name="compactSlidingWindows">Keep only the recent rows of sliding-window layers.</param>
     /// <returns>The cache.</returns>
     public VulkanKvCache CreateKvCache(int maxSeqLen, bool compactSlidingWindows)
+        => CreateKvCache(maxSeqLen, compactSlidingWindows, DefaultKvStorage);
+
+    /// <summary>
+    /// As <see cref="CreateKvCache(int, bool)"/> with an explicit element format. <see cref="VulkanKvStorage.F32"/> is always available (the A/B
+    /// baseline and oracle); <see cref="VulkanKvStorage.F16"/> needs this model's F16-KV attention kernels (<see cref="DefaultKvStorage"/> is F16).
+    /// </summary>
+    /// <param name="maxSeqLen">Positions the cache holds.</param>
+    /// <param name="compactSlidingWindows">Keep only the recent rows of sliding-window layers.</param>
+    /// <param name="storage">Element format of the cached rows.</param>
+    /// <returns>The cache.</returns>
+    public VulkanKvCache CreateKvCache(int maxSeqLen, bool compactSlidingWindows, VulkanKvStorage storage)
     {
+        if (storage == VulkanKvStorage.F16 && DefaultKvStorage != VulkanKvStorage.F16)
+            throw new NotSupportedException($"{Config.Architecture} has no F16-KV attention kernels on this Vulkan model (DOTLLM_VK_KV=f32, or an architecture without the audit, #1151).");
         if (compactSlidingWindows && !SupportsCompactSlidingKv)
             throw new NotSupportedException($"{Config.Architecture} on this Vulkan model reads cached rows by absolute position; it cannot take a compact sliding-window cache.");
-        return new(_device, KvGeometry.FromConfig(Config, compactSlidingWindows), maxSeqLen, DefaultKvStorage);
+        return new(_device, KvGeometry.FromConfig(Config, compactSlidingWindows), maxSeqLen, storage);
     }
 
     /// <inheritdoc/>
@@ -1798,7 +1871,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                     ? (r.Gate, r.Up, r.Down)
                     : (false, false, false),
                 skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
-            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config));
+            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config),
+                allowNvfp4Scales: true);
             return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf);
         }
         catch
@@ -1837,7 +1911,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 ? (r.Gate, r.Up, r.Down)
                 : (false, false, false),
             skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
-            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config));
+            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config),
+            allowNvfp4Scales: true);
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 
@@ -2573,6 +2648,15 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             }
             model.Q4_0PrefillQ8_1 = q40Prefill != "0";
         }
+        if (File.Exists(Path.Combine(spvDir, "matmul_nvfp4_f32_gemv.spv")))
+        {
+            model._matmulNvfp4 = MatMulNvfp4F32Kernel.Create(device, spvDir);
+            model._matmulNvfp4Coopmat = MatMulNvfp4GemmCoopmatKernel.TryCreate(device, spvDir);
+            if (hasMoe && File.Exists(Path.Combine(spvDir, "moe_indexed_matmul_nvfp4_f32.spv")))
+                model._moeIndexedNvfp4 = MoeIndexedMatmulNvfp4F32Kernel.Create(device, spvDir);
+            if (hasMoe && MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Nvfp4))
+                model._grpNvfp4 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Nvfp4);
+        }
         if (File.Exists(Path.Combine(spvDir, "matmul_q4_1_f32_gemv.spv")))
         {
             model._matmulQ4_1 = MatMulQ4_0GemvF32Kernel.Create(device, spvDir, QuantType.Q4_1);
@@ -2670,6 +2754,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             if (Environment.GetEnvironmentVariable(QueryPositionsKernelEnvVar) != "ref" && !IsFlashAttentionDisabled())
                 model._attentionQPosTiled = VulkanFlashAttentionGqaKernel.TryCreate(device, spvDir, VulkanKvStorage.F32, queryPositions: true);
         }
+        if (model.IsDenseF16KvEligible && model.DefaultKvStorage == VulkanKvStorage.F16)
+            model.InitDenseKvF16Kernels(spvDir);
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
             model.InitGptOss(spvDir);
         if (config.Architecture is DotLLM.Core.Configuration.Architecture.MiMoV2 or DotLLM.Core.Configuration.Architecture.Flint)
@@ -2967,11 +3053,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     {
         AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "Vulkan");
 
-        // F16 KV (#1171): only the sink kernels below have F16-KV twins here; every Flint layer carries sinks, and Forward refuses an F16
-        // cache on a model that did not create the twins. Anything else would misread the halves as floats.
+        // F16 / Q8_0 KV: the sink kernels (Flint, #1171) and the dense non-sink chain (#1151, F16 only) have KV twins; anything without one would
+        // misread the stored rows as floats, so it refuses instead.
         bool kvF16 = _fwdKvStorage == VulkanKvStorage.F16, kvQ8 = _fwdKvStorage == VulkanKvStorage.Q8_0;
-        if ((kvF16 || kvQ8) && (sinks is null || _gptOss is null || _gptOssDbg.NoSinks))
-            throw new NotSupportedException("F16 / Q8_0 KV is wired only for sink attention (Flint); this layer has no sinks.");
+        bool sinkLayer = sinks is not null && _gptOss is not null && !_gptOssDbg.NoSinks;
+        if (kvQ8 && !sinkLayer)
+            throw new NotSupportedException("Q8_0 KV is wired only for sink attention (Flint); this layer has no sinks.");
+        if (kvF16 && !sinkLayer && _attentionKvF16 is null)
+            throw new NotSupportedException("F16 KV is wired only for sink attention (Flint) and the dense Llama/Mistral/Qwen/Phi chain; this layer has neither.");
         var smallRowAttn = kvQ8 ? null : kvF16 ? _smallRowAttnKvF16 : _smallRowAttn;
         var splitKvSink = kvQ8 ? _splitKvAttentionKvQ8 : kvF16 ? _splitKvAttentionKvF16 : _splitKvAttention;
 
@@ -3037,11 +3126,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         // shipping heuristic, means seqKv >= 17 on any model with <= 128 heads,
         // i.e. nearly every decode step (issue #331). Only seqKv <= 16 falls
         // through to the per-token kernel (bit-identical to before).
-        if (_splitKvAttention is not null && seqQ == 1
+        var coopmatAttn = kvF16 ? _flashAttentionCoopmatKvF16 : _flashAttentionCoopmat;
+        var flashAttn = kvF16 ? _flashAttentionKvF16 : _flashAttention;
+        if (splitKvSink is not null && seqQ == 1
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
         {
-            _splitKvAttention.Record(cmdBuf, q, k, v, output,
+            splitKvSink.Record(cmdBuf, q, k, v, output,
                 seqQ: seqQ, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: slidingWindow,
@@ -3053,7 +3144,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         // Prefill (seqQ > 1): prefer the cooperative-matrix FA kernel (issue
         // #149, llama.cpp FA_COOPMAT1 analogue) over the scalar FA shader.
         // Same tiling, same mask semantics; f16-matmul numerics (see kernel).
-        if (!kvF16 && seqQ > 1 && PrefillGqaFlashEnabled && _prefillGqaFlash is { } gqa && gqa.CanDispatch(headDim, numHeads, numKvHeads))
+        if (seqQ > 1 && PrefillGqaFlashEnabled && (kvF16 ? _prefillGqaFlashKvF16 : _prefillGqaFlash) is { } gqa && gqa.CanDispatch(headDim, numHeads, numKvHeads))
         {
             PrefillGqaFlashCount++;
             ProfNote("attn_flash_gqa", seqQ, seqKv, numHeads);
@@ -3062,11 +3153,11 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 softCap: softCap, scaleOverride: scaleOverride, maskMode: maskMode, prefixLen: prefixLen);
             return;
         }
-        if (_flashAttentionCoopmat is not null && seqQ > 1
-            && headDim <= _flashAttentionCoopmat.SupportedMaxHeadDim)
+        if (coopmatAttn is not null && seqQ > 1
+            && headDim <= coopmatAttn.SupportedMaxHeadDim)
         {
             ProfNote("attn_flash_cm", seqQ, seqKv, numHeads);
-            _flashAttentionCoopmat.Record(cmdBuf, q, k, v, output,
+            coopmatAttn.Record(cmdBuf, q, k, v, output,
                 seqQ: seqQ, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: slidingWindow,
@@ -3074,10 +3165,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 maskMode: maskMode, prefixLen: prefixLen);
             return;
         }
-        if (_flashAttention is not null && seqQ > 1 && headDim <= _flashAttention.SupportedMaxHeadDim)
+        if (flashAttn is not null && seqQ > 1 && headDim <= flashAttn.SupportedMaxHeadDim)
         {
             ProfNote("attn_flash", seqQ, seqKv, numHeads);
-            _flashAttention.Record(cmdBuf, q, k, v, output,
+            flashAttn.Record(cmdBuf, q, k, v, output,
                 seqQ: seqQ, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: slidingWindow,
@@ -3086,7 +3177,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             return;
         }
         if (seqQ > 1) ProfNote("attn_naive", seqQ, seqKv, numHeads);
-        _attention.Record(cmdBuf, q, k, v, output,
+        (kvF16 ? _attentionKvF16! : _attention).Record(cmdBuf, q, k, v, output,
             seqQ: seqQ, seqKv: seqKv,
             numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
             positionOffset: positionOffset, slidingWindow: slidingWindow,
@@ -3731,7 +3822,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             // need growing first; the batched KV scatter writes absolute rows, so it takes the per-seq path.
             bool simple = !modelHasMlaOrMoe
                        && r.Adapter is null
-                       && r.KvCache is VulkanKvCache { Storage: VulkanKvStorage.F32, HasCompactWindows: false };
+                       && r.KvCache is VulkanKvCache { HasCompactWindows: false } bc
+                       && (bc.Storage == VulkanKvStorage.F32 || (bc.Storage == VulkanKvStorage.F16 && _kvF16Writer is { SupportsScatter: true } && _attentionKvF16 is not null));
             (simple ? simpleIdx : complexIdx).Add(i);
         }
 
@@ -3756,9 +3848,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             return results;
         }
 
+        ForwardBatchFusedCount++;
         ForwardBatchSimple(requests, simpleIdx, deviceId, results);
         return results;
     }
+
+    /// <summary>Count of <see cref="ForwardBatch"/> calls that took the fused batched path (test hook: proves a cache format is batchable, #1151).</summary>
+    public long ForwardBatchFusedCount { get; private set; }
 
     /// <summary>
     /// Inner batched dispatch for the subset of <paramref name="requests"/>
@@ -3946,7 +4042,17 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 // tracker, but keep the declaration in case it ever does).
                 _device.ActiveHazards?.OnTransfer(_state.K.Handle, vkCache.GetKeysBuffer(layer).Handle);
                 _device.ActiveHazards?.OnTransfer(_state.V.Handle, vkCache.GetValuesBuffer(layer).Handle);
-                if (contiguous)
+                if (vkCache.Storage == VulkanKvStorage.F16)
+                {
+                    // F16 cache (#1151): the packed batch rows are converted at their positions by compute dispatches (a COMPUTE barrier
+                    // orders them against the batched RoPE before and the attention after); no copy-engine path exists for F16.
+                    BarrierComputeToCompute(cmdBuf);
+                    int kvStrideB = vkCache.KvStrideOf(layer);
+                    _kvF16Writer!.RecordScatterRows(cmdBuf, _state.K, vkCache.GetKeysBuffer(layer), _state.PositionsBuffer, kvStrideB, nS, 0, seqOff);
+                    _kvF16Writer.RecordScatterRows(cmdBuf, _state.V, vkCache.GetValuesBuffer(layer), _state.PositionsBuffer, kvStrideB, nS, 0, seqOff);
+                    BarrierComputeToCompute(cmdBuf);
+                }
+                else if (contiguous)
                 {
                     var kRegion = new VkBufferCopy
                     {
@@ -4012,6 +4118,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 int layerSlidingWindow = GetLayerSlidingWindow(layer);
                 float attnScaleOverride = GetAttentionScaleOverride();
                 float attnSoftCap = Config.AttnLogitSoftcap ?? 0.0f;
+                _fwdKvStorage = vkCache.Storage;
                 RecordAttention(cmdBuf, perSeqQ, vkCache.GetKeysBuffer(layer), vkCache.GetValuesBuffer(layer),
                     perSeqAttn,
                     seqQ: nS, seqKv: seqKv,
@@ -4180,9 +4287,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         if (seqLen == 0) throw new ArgumentException("tokenIds must be non-empty.", nameof(tokenIds));
 
         _fwdKvStorage = kvCache is VulkanKvCache { Storage: var kvs and (VulkanKvStorage.F16 or VulkanKvStorage.Q8_0) } ? kvs : VulkanKvStorage.F32;
-        if (_fwdKvStorage == VulkanKvStorage.F16 && (_kvF16Writer is null || _gptOss is null))
+        if (_fwdKvStorage == VulkanKvStorage.F16 && (_kvF16Writer is null || (_gptOss is null && _attentionKvF16 is null)))
             throw new NotSupportedException(
-                "An F16 VulkanKvCache needs the F16-KV attention kernels, which only sink-attention models (Flint) create; use CreateKvCache.");
+                "An F16 VulkanKvCache needs the F16-KV attention kernels, which only sink-attention models (Flint) and the dense Llama/Mistral/Qwen/Phi "
+                + "hosts create (DOTLLM_VK_KV=f32 turns them off); use CreateKvCache.");
         if (_fwdKvStorage == VulkanKvStorage.Q8_0 && (_kvQ8Writer is null || _gptOss is null || _splitKvAttentionKvQ8 is null || _sinkFlashKvQ8 is null))
             throw new NotSupportedException(
                 "A Q8_0 VulkanKvCache needs the Q8_0-KV writer, split-KV and coopmat sink-flash kernels (Flint, DOTLLM_VK_KV=q8_0 at model creation; the _kvq8 SPIR-V and coopmat are required); use CreateKvCache.");
@@ -4511,18 +4619,20 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             // existing unfused sequences).
             // SmolLM3 NoPE layers skip RoPE entirely (ModelConfig.NoRopeLayers); the fused shader always rotates.
             bool noRopeLayer = Config.IsNoRopeLayer(_firstLayer + layer);
-            bool useFusedRopeKv = _ropeKvWrite is not null
+            var fusedRope = kvCache is VulkanKvCache { Storage: VulkanKvStorage.F16 } ? _ropeKvWriteKvF16 : _ropeKvWrite;
+            bool useFusedRopeKv = fusedRope is not null
                 && _gptOss is null   // gpt-oss: YaRN table + mscale live in RecordRopeQk, not the fused shader
                 && _ropeInvFreq is null
                 && !noRopeLayer
-                && kvCache is VulkanKvCache { Storage: VulkanKvStorage.F32, HasCompactWindows: false }
+                && kvCache is VulkanKvCache { HasCompactWindows: false } fusedCache
+                && fusedCache.Storage == fusedRope.KvStorage
                 && IsContiguousAscending(positions);
 
             if (useFusedRopeKv)
             {
                 var vkCache = (VulkanKvCache)kvCache!;
                 int kvStride = vkCache.KvStrideOf(layer);
-                _ropeKvWrite!.Record(cmdBuf,
+                fusedRope!.Record(cmdBuf,
                     _state.Q, _state.K, _state.V, _state.PositionsBuffer,
                     vkCache.GetKeysBuffer(layer), vkCache.GetValuesBuffer(layer),
                     startPos: positions[0], kvStride: kvStride,
@@ -4554,7 +4664,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                     // RoPE writes K; attention (via the cache buffers) reads K.
                     // Barrier the RoPE → KV copy, then the KV copy → attention. (The F32 copy path adds its own COMPUTE→TRANSFER barrier.)
                     BarrierComputeToCompute(cmdBuf);
-                    vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer, _kvF16Writer, _kvQ8Writer);
+                    vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer, _kvF16Writer, _state.PositionsBuffer, _kvQ8Writer);
                     // F32 rows are copied (transfer); F16 rows are converted by a compute dispatch.
                     if (vkCache.Storage is VulkanKvStorage.F16 or VulkanKvStorage.Q8_0) BarrierComputeToCompute(cmdBuf);
                     else BarrierTransferToCompute(cmdBuf);
@@ -4624,14 +4734,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             DpStamp(cmdBuf, DpCatKv);
             if (_embedSegLens is not null)
                 RecordPackedEmbedAttention(cmdBuf, numHeads, numKvHeads, headDim, attnScaleOverride);
-            else if (kvCache is VulkanKvCache { Storage: VulkanKvStorage.F32, HasCompactWindows: false }
-                && _attentionQPos is not null && lw.AttnSinks is null
+            else if (kvCache is VulkanKvCache { HasCompactWindows: false } qposCache
+                && (qposCache.Storage == VulkanKvStorage.F16 ? _attentionQPosKvF16 : _attentionQPos) is not null && lw.AttnSinks is null
                 && (!IsContiguousAscending(positions) || seqKv != positionOffset + seqLen))
             {
                 // Selective recompute (#1531): query rows at arbitrary positions (non-contiguous, or a run inside an already-filled
                 // cache). The flash / coopmat kernels derive each row's position as positionOffset + row and assert a tight span.
                 AttentionQueryPositionsCount++;
-                if (TiledQueryPositionAttentionEnabled && _attentionQPosTiled is { } tiled && tiled.CanDispatch(headDim, numHeads, numKvHeads))
+                if (TiledQueryPositionAttentionEnabled && (qposCache.Storage == VulkanKvStorage.F16 ? _attentionQPosTiledKvF16 : _attentionQPosTiled) is { } tiled && tiled.CanDispatch(headDim, numHeads, numKvHeads))
                 {
                     ProfNote("attn_qpos_tiled", seqLen, seqKv, numHeads);
                     AttentionQueryPositionsTiledCount++;
@@ -4642,7 +4752,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 else
                 {
                 ProfNote("attn_qpos", seqLen, seqKv, numHeads);
-                _attentionQPos.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput, _state.PositionsBuffer,
+                (qposCache.Storage == VulkanKvStorage.F16 ? _attentionQPosKvF16! : _attentionQPos!).Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput, _state.PositionsBuffer,
                     seqQ: seqLen, seqKv: seqKv, numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                     slidingWindow: layerSlidingWindow, softCap: attnSoftCap, scaleOverride: attnScaleOverride);
                 }
@@ -5471,6 +5581,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ4_0Gemm?.InvalidateDescriptorCache();
         _matmulQ4_0Mmvq?.InvalidateDescriptorCache();
         _matmulQ4_0GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulNvfp4?.InvalidateDescriptorCache();
+        _matmulNvfp4Coopmat?.InvalidateDescriptorCache();
+        _moeIndexedNvfp4?.InvalidateDescriptorCache();
+        _grpNvfp4?.InvalidateDescriptorCache();
         _matmulQ4_1?.InvalidateDescriptorCache();
         _matmulQ4_1Gemm?.InvalidateDescriptorCache();
         _matmulQ4_1Mmvq?.InvalidateDescriptorCache();
@@ -5580,6 +5694,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _attention.InvalidateDescriptorCache();
         _attentionQPos?.InvalidateDescriptorCache();
         _attentionQPosTiled?.InvalidateDescriptorCache();
+        _attentionKvF16?.InvalidateDescriptorCache();
+        _ropeKvWriteKvF16?.InvalidateDescriptorCache();
+        _flashAttentionKvF16?.InvalidateDescriptorCache();
+        _flashAttentionCoopmatKvF16?.InvalidateDescriptorCache();
+        _prefillGqaFlashKvF16?.InvalidateDescriptorCache();
+        _attentionQPosKvF16?.InvalidateDescriptorCache();
+        _attentionQPosTiledKvF16?.InvalidateDescriptorCache();
         _flashAttention?.InvalidateDescriptorCache();
         _flashAttentionCoopmat?.InvalidateDescriptorCache();
         _splitKvAttention?.InvalidateDescriptorCache();
@@ -7122,11 +7243,11 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             RecordMoeIndexedMatmul(cmdBuf,
                 moeW.W1Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
                 moeW.W1DeviceQuantType,
-                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+                m: interm, k: hidden, n: expandedRows, numExperts: numE, expertScale: moeW.W1Scale);
             RecordMoeIndexedMatmul(cmdBuf,
                 moeW.W3Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
                 moeW.W3DeviceQuantType,
-                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+                m: interm, k: hidden, n: expandedRows, numExperts: numE, expertScale: moeW.W3Scale);
             BarrierComputeToCompute(cmdBuf);
             ProfSample("moe_gateup_scalar");
             if (gptOssMoe is not null && !_gptOssDbg.NoExpertBias)
@@ -7160,7 +7281,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             RecordMoeIndexedMatmul(cmdBuf,
                 moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
                 moeW.W2DeviceQuantType,
-                m: hidden, k: interm, n: expandedRows, numExperts: numE);
+                m: hidden, k: interm, n: expandedRows, numExperts: numE, expertScale: moeW.W2Scale);
             BarrierComputeToCompute(cmdBuf);
             ProfSample("moe_down_scalar");
             if (gptOssMoe?.DownBias is { } db && !_gptOssDbg.NoExpertBias)
@@ -7303,6 +7424,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             QuantType.Q6_K => _grpQ6K is not null && (k % MoeGroupedMatmulKQuantCoopmatKernel.KGroup) == 0,
             QuantType.Q8_0 => _grpQ8_0 is not null && (k % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0,
             QuantType.MXFP4 => _grpMxfp4 is not null && (k % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0,
+            QuantType.NVFP4 => _grpNvfp4 is not null && (k % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0,
             _ => MoeIqFormats.FromQuantizationType(qt) is { } f && _grpIq.TryGetValue(f, out var gk) && (k % gk.KGroup) == 0,
         };
 
@@ -7518,7 +7640,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     }
 
     private void RecordGroupedQuantProjection(nint cmdBuf, QuantType qt, VulkanDevice.Buffer bank, VulkanDevice.Buffer packedIn,
-        VulkanDevice.Buffer packedOut, int argsOffset, int m, int k, int rows, int numE, VulkanDevice.Buffer? bias)
+        VulkanDevice.Buffer packedOut, int argsOffset, int m, int k, int rows, int numE, VulkanDevice.Buffer? bias,
+        VulkanDevice.Buffer? expertScale = null)
     {
         var offsets = _state.MoeExpertOffsets!;
         var args = _state.MoeGroupDispatchArgs!;
@@ -7532,6 +7655,12 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             case QuantType.MXFP4:
                 _grpMxfp4!.RecordIndirect(cmdBuf, bank, packedIn, offsets, packedOut, bias ?? _state.MoeTopkWeights!, false, args, argsOffset, m, k, rows, numE,
                     applyBias: bias is not null);
+                break;
+            case QuantType.NVFP4:
+                // #1579: packed bank read in place; ffn_*_exps.scale[expert] multiplies the accumulator in the epilogue.
+                _grpNvfp4!.RecordIndirect(cmdBuf, bank, packedIn, offsets, packedOut,
+                    expertScale ?? throw new InvalidOperationException("NVFP4 grouped MoE needs its per-expert scale buffer."), true, args, argsOffset, m, k, rows, numE);
+                Nvfp4MoeGroupedCount++;
                 break;
             default:
                 if (MoeIqFormats.FromQuantizationType(qt) is { } iqf && _grpIq.TryGetValue(iqf, out var iqg))
@@ -7570,9 +7699,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         KernelSupport.ComputeToIndirectAndComputeBarrier(cmdBuf);
 
         RecordGroupedQuantProjection(cmdBuf, moeW.W1DeviceQuantType, moeW.W1Bank, _state.MoeGroupedHidden!, _state.MoeGroupedGateInter!, 0,
-            interm, hidden, expandedRows, numE, bias ? g!.GateBias : null);
+            interm, hidden, expandedRows, numE, bias ? g!.GateBias : null, moeW.W1Scale);
         RecordGroupedQuantProjection(cmdBuf, moeW.W3DeviceQuantType, moeW.W3Bank, _state.MoeGroupedHidden!, _state.MoeGroupedUpInter!, 0,
-            interm, hidden, expandedRows, numE, bias ? g!.UpBias : null);
+            interm, hidden, expandedRows, numE, bias ? g!.UpBias : null, moeW.W3Scale);
         BarrierComputeToCompute(cmdBuf);
         ProfSample("moe_gateup_grouped");
 
@@ -7588,7 +7717,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         // stay far below the F16 range).
         bool downScaled = !(bias && g!.DownBias is not null) && RecordRowPow2Downscale(cmdBuf, _state.MoeSiluInter!, expandedRows, interm);
         RecordGroupedQuantProjection(cmdBuf, moeW.W2DeviceQuantType, moeW.W2Bank, _state.MoeSiluInter!, _state.MoeGroupedHidden!,
-            MoeBuildTileListKernel.ArgsStrideBytes, hidden, interm, expandedRows, numE, bias ? g!.DownBias : null);
+            MoeBuildTileListKernel.ArgsStrideBytes, hidden, interm, expandedRows, numE, bias ? g!.DownBias : null, moeW.W2Scale);
         BarrierComputeToCompute(cmdBuf);
         if (downScaled) RecordRowScaleMul(cmdBuf, _state.MoeGroupedHidden!, expandedRows, hidden);
         ProfSample("moe_down_grouped");
@@ -7629,6 +7758,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         QuantType.Q6_K => _grpQ6K!.MTiles(m),
         QuantType.Q8_0 => _grpQ8_0!.MTiles(m),
         QuantType.MXFP4 => _grpMxfp4!.MTiles(m),
+        QuantType.NVFP4 => _grpNvfp4!.MTiles(m),
         _ => _grpIq[MoeIqFormats.FromQuantizationType(qt) ?? throw new InvalidOperationException($"No grouped MoE kernel for {qt}.")].MTiles(m),
     };
 
@@ -7871,13 +8001,31 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     /// </remarks>
     private const int TiledMinRows = 32;
 
+    /// <summary>NVFP4 dense projections dispatched (test hook, #1579).</summary>
+    internal long Nvfp4MatmulCount { get; private set; }
+
+    /// <summary>NVFP4 routed-bank grouped coopmat projections dispatched (test hook, #1579).</summary>
+    internal long Nvfp4MoeGroupedCount { get; private set; }
+
+    /// <summary>NVFP4 routed-bank indexed matmuls dispatched (test hook, #1579).</summary>
+    internal long Nvfp4MoeIndexedCount { get; private set; }
+
     private void RecordMoeIndexedMatmul(
         nint cmdBuf,
         VulkanDevice.Buffer bank, VulkanDevice.Buffer x,
         VulkanDevice.Buffer indices, VulkanDevice.Buffer y,
         QuantizationType weightQt,
-        int m, int k, int n, int numExperts)
+        int m, int k, int n, int numExperts, VulkanDevice.Buffer? expertScale = null)
     {
+        if (weightQt == QuantizationType.NVFP4)
+        {
+            // #1579: packed bank read in place; the per-expert ffn_*_exps.scale is applied in the kernel epilogue.
+            if (_moeIndexedNvfp4 is null || expertScale is null)
+                throw new InvalidOperationException("NVFP4 MoE indexed matmul kernel or its per-expert scale buffer is missing.");
+            _moeIndexedNvfp4.Record(cmdBuf, bank, x, indices, y, expertScale, m: m, k: k, n: n, numExperts: numExperts);
+            Nvfp4MoeIndexedCount++;
+            return;
+        }
         if (weightQt == QuantizationType.Q8_0)
         {
             if (_moeIndexedMatmulQ8 is null)
@@ -8720,6 +8868,20 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
+        // NVFP4 (#1579): read in place by the packed kernels; the per-tensor X.scale multiplies the F32 output. Taken before the small-row
+        // and IQ F16-scratch arms below, which would otherwise expand the weight (CLAUDE.md rule 2) or drop the scale.
+        if (weightQt == QuantType.NVFP4)
+        {
+            float scale = VulkanNvfp4Scales.Get(weights);
+            if (seqLen > 1 && _matmulNvfp4Coopmat is not null)
+                _matmulNvfp4Coopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen, scale: scale);
+            else
+                (_matmulNvfp4 ?? throw new InvalidOperationException("NVFP4 matmul kernel was not created."))
+                    .Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen, scale: scale);
+            Nvfp4MatmulCount++;
+            return;
+        }
+
         // Small-row multi-column GEMVs (#996): 2..4 rows read the weights once instead of running the prefill GEMM / MMQ.
         if (seqLen > 1 && TryRecordSmallRowGemv(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen))
             return;
@@ -9694,6 +9856,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _attention.Dispose();
         _attentionQPos?.Dispose();
         _attentionQPosTiled?.Dispose();
+        _attentionKvF16?.Dispose();
+        _ropeKvWriteKvF16?.Dispose();
+        _flashAttentionKvF16?.Dispose();
+        _flashAttentionCoopmatKvF16?.Dispose();
+        _prefillGqaFlashKvF16?.Dispose();
+        _attentionQPosKvF16?.Dispose();
+        _attentionQPosTiledKvF16?.Dispose();
         _gptOss?.Dispose();
         _ropeYarnInvFreq?.Dispose();
         _rope.Dispose();
@@ -9751,6 +9920,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ4_0?.Dispose();
         _matmulQ4_0Mmvq?.Dispose();
         _matmulQ4_0GemmCoopmat?.Dispose();
+        _matmulNvfp4?.Dispose();
+        _matmulNvfp4Coopmat?.Dispose();
+        _moeIndexedNvfp4?.Dispose();
+        _grpNvfp4?.Dispose();
         _matmulQ4_1Gemm?.Dispose();
         _matmulQ4_1?.Dispose();
         _matmulQ4_1Mmvq?.Dispose();

@@ -24,7 +24,7 @@ namespace DotLLM.Vulkan;
 /// <para><b>Mixed K/V types.</b> Keys and values can use different quantization (e.g. K=Q8_0,
 /// V=Q4_0 for the K8V4 configuration). Separate kernel instances handle each.</para>
 /// </remarks>
-public sealed class VulkanQuantizedKvCache : IKvCache, IPerLayerKvCache, IDisposable
+public sealed class VulkanQuantizedKvCache : IPrefixReusableKvCache, IPerLayerKvCache, IDisposable
 {
     private const int BlockSize = 32;
 
@@ -256,6 +256,9 @@ public sealed class VulkanQuantizedKvCache : IKvCache, IPerLayerKvCache, IDispos
         if ((uint)length > (uint)_currentLength) throw new ArgumentOutOfRangeException(nameof(length));
         _currentLength = length;
     }
+
+    /// <inheritdoc/>
+    public bool CanTruncateTo(int length) => true;   // full-history rows, each quantized independently at write time
 
     /// <summary>Resets the visible length (new sequence).</summary>
     public void Reset() => _currentLength = 0;

@@ -811,6 +811,31 @@ prefills only the roughly 8k tokens it adds, at 57-74 s. Before, the cached pref
 stretched to 115-144 s. With MTP on (window 51,200 on this card) the first three turns reuse the same way
 (0 / 7,818 / 17,032 cached) and decode at 21-25 tokens/s.
 
+### Prompt / prefix cache on dense Vulkan and CPU (#1591)
+
+`cached_tokens` was 0 for every request on both backends, for different reasons.
+
+- **CPU (bug).** The server printed "paged KV-cache with cross-request prefix cache" and "continuous-batch scheduler active", but the
+  `ContinuousBatchScheduler` was constructed without the `PrefixTrieManager` (`ServerStartup` and `ServerState.RebuildSchedulerLocked` never
+  passed it). Requests ran through the scheduler, so the trie was never consulted (`/v1/prompt-cache` showed `lookups: 0`). Now wired.
+  Qwen2.5-0.5B Q8_0 CPU, three chats sharing 624 whole 16-token blocks of a 637-token prompt: prefill 1318 ms, then 54 and 66 ms,
+  `cached_tokens` 0, 624, 624. `ServerPrefixCacheWiringTests` fails without the wiring.
+- **Vulkan (missing).** Single-request mode keeps no paged pool, and the engine's `PrefixCache` was disabled for Vulkan. It is now on
+  (`--no-prompt-cache` turns it off): the cache a request filled stays resident, and the next request adopts the one sharing the longest
+  prompt prefix, rolls it back to that length and prefills only the suffix. Entries are limited to 2 (`min(--prompt-cache-size, 2)`;
+  each is a whole device KV allocation sized prompt + max tokens + 1,024 positions of headroom so the next turn still fits).
+  Recurrent/hybrid models keep their own snapshot cache. Measured (Strix Halo Vulkan, temp 0, same-session, 3 prompts sharing ~600 tokens):
+
+  | model | prefill cold | prefill cached | cached_tokens |
+  |---|---|---|---|
+  | Qwen2.5-0.5B Q8_0 (637 tok) | 57-136 ms (noisy) | 15.2 ms | 627 |
+  | Llama-3.2-3B Q8_0 (643 tok) | 313-352 ms | 33-36 ms | 633 |
+  | Qwen3-4B-2507 Q4_K_M (616 tok) | 355 ms (first) | 30-33 ms | 606 |
+
+  `cached_tokens` counts exactly the rows reused (one prompt token is always recomputed for its logits). Not covered: multi-slot beyond 2,
+  concurrent requests (single-request mode), paged/trie sharing on Vulkan, CUDA device caches (`IPrefixReusableKvCache` is not yet
+  implemented there), quantized-KV Vulkan models other than `VulkanQuantizedKvCache`.
+
 ### Continuing sessions on Vulkan (#1100)
 
 Two things kept a long Bonsai-2 session off the Vulkan backend:

@@ -1,0 +1,61 @@
+{
+  "model": "qwen3-4b",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a coding agent. Use tools to read files."
+    },
+    {
+      "role": "user",
+      "content": "Why does ChunkIndex.Update drop entries?"
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_7",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"src/Store/ChunkIndex.cs\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_7",
+      "content": [
+        {
+          "type": "text",
+          "text": "// src/Store/ChunkIndex.cs (lines 365-412)\n"
+        },
+        {
+          "type": "text",
+          "text": "public IndexDiff Update(IReadOnlyList<ChunkRef> current, string sourcePath)\n{\n    ArgumentNullException.ThrowIfNull(current);\n    var diff = new IndexDiff(sourcePath);\n    var seen = new HashSet<string>(StringComparer.Ordinal);\n    foreach (var chunk in current)\n    {\n        if (!seen.Add(chunk.TextHash))\n        {\n            diff.Duplicates.Add(chunk);\n            continue;\n        }\n        if (_byHash.TryGetValue(chunk.TextHash, out var existing))\n        {\n            existing.Touch(chunk.StartOffset, chunk.EndOffset);\n            diff.Unchanged.Add(existing);\n        }\n        else\n        {\n            _byHash[chunk.TextHash] = chunk;\n            diff.Added.Add(chunk);\n        }\n    }\n    foreach (var stale in _bySource[sourcePath].Where(c => !seen.Contains(c.TextHash)).ToList())\n    {\n        _byHash.Remove(stale.TextHash);\n        diff.Removed.Add(stale);\n    }\n    return diff;\n}\n",
+          "chunk": {
+            "v": 1,
+            "id": "src/Store/ChunkIndex.cs:365-412@14211",
+            "hash": "sha256:64b3e8cdfb77df6c86f0b4a395e873f1ae9e8ded82b7ad703bd5eec86e94e466",
+            "chunker": "symbol-512"
+          }
+        },
+        {
+          "type": "text",
+          "text": "// src/Store/ChunkRef.cs (lines 1-40)\n"
+        },
+        {
+          "type": "text",
+          "text": "namespace Store;\n\n/// <summary>A reference to one chunk of one source file; the text itself lives in the file.</summary>\npublic sealed record ChunkRef(\n    string Id,\n    string Path,\n    int StartLine,\n    int EndLine,\n    int StartOffset,\n    int EndOffset,\n    string TextHash,\n    int TokenCount)\n{\n    public bool Overlaps(ChunkRef other) =>\n        Path == other.Path && StartOffset < other.EndOffset && other.StartOffset < EndOffset;\n\n    public string ToLabel() => $\"{Path}:{StartLine}-{EndLine}@{StartOffset}\";\n}\n// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+          "chunk": {
+            "v": 1,
+            "id": "src/Store/ChunkRef.cs:1-40@0",
+            "hash": "sha256:70c3d08bf8c50db81e4e849004b3f5ad0e30f91269e6e45bed0e1f374d8a8eb1",
+            "chunker": "symbol-512"
+          }
+        }
+      ]
+    }
+  ]
+}

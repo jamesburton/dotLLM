@@ -441,6 +441,12 @@ public static class ServerStartup
         SpeculativeDraftValidator.Validate(draftConfig, draftPath, target);
     }
 
+    /// <summary>Most device KV caches the Vulkan prefix cache retains (each is a whole allocation sized prompt + max tokens + headroom).</summary>
+    internal const int VulkanPrefixCacheMaxEntries = 2;
+
+    /// <summary>Extra rows a retained Vulkan KV cache is allocated with, so the next turn of the conversation still fits it.</summary>
+    internal const int VulkanPrefixCacheHeadroomTokens = 1024;
+
     private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
     {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
@@ -694,9 +700,12 @@ public static class ServerStartup
                 kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed, kvConfig.TurboQuantUseQjl);
         }
 
-        PrefixCache? prefixCache = options.PromptCacheEnabled && vulkanKvFactory is null
-            ? new PrefixCache(options.PromptCacheSize)
-            : null;
+        // Vulkan (single-request path): the cache a request filled stays resident and a later request adopts its longest common prefix
+        // (#1591). Each entry holds a whole device KV allocation, so keep few; the headroom lets the next turn of a conversation fit it.
+        PrefixCache? prefixCache = !options.PromptCacheEnabled ? null
+            : vulkanKvFactory is null ? new PrefixCache(options.PromptCacheSize)
+            : new PrefixCache(Math.Min(options.PromptCacheSize, VulkanPrefixCacheMaxEntries));
+        int prefixCacheHeadroom = vulkanKvFactory is not null && prefixCache is not null ? VulkanPrefixCacheHeadroomTokens : 0;
 
         // Load speculative draft model if configured
         IModel? draftModel = null;
@@ -751,6 +760,7 @@ public static class ServerStartup
             mtpEnabled: options.MtpEnabled, mtpAdaptive: true, recurrentPrefixCache: options.PromptCacheEnabled,
             promptLookup: options.PromptLookup,
             prefixTrieManager: prefixTrieManager,
+            prefixCacheHeadroomTokens: prefixCacheHeadroom,
             prefillChunkSize: options.PrefillChunkSize,
             recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions());
         if (options.PrefillChunkSize > 0)
@@ -829,7 +839,8 @@ public static class ServerStartup
                 tokenizer,
                 kvFactory,
                 options: schedulerOptions,
-                pagedPool: pagedFactory?.Pool);
+                pagedPool: pagedFactory?.Pool,
+                prefixCache: prefixTrieManager);
             Console.WriteLine(options.Scheduler?.EnableFairness == true
                 ? "[dotllm] Continuous-batch scheduler active (per-API-key fairness on)"
                 : vulkanScheduler

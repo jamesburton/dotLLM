@@ -95,7 +95,11 @@ public static class VulkanModelLoader
 
         // #1038: Vulkan NVFP4 runs on the Nemotron-H path only (packed matmul + X.scale). Every other
         // architecture would widen it and drop the scale, so refuse before any upload.
-        if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
+        // #1579: the generic VulkanTransformerModel (default arm below; Flint, MiMo-V2, dense llama-style) also applies NVFP4 scales; the shared
+        // loader still refuses any scale it cannot apply.
+        if (config.Architecture is (Architecture.Qwen3MoeHybrid or Architecture.Lfm2Moe or Architecture.Qwen3HybridDense
+                                    or Architecture.Qwen4Exp or Architecture.Mamba3)
+            || config.MlaConfig is not null || config.Gemma4DualFfn || config.PerLayerEmbedding is not null)
             Nvfp4Support.RejectAny(gguf.TensorsByName, "Vulkan");
 
         switch (config.Architecture)
@@ -112,6 +116,13 @@ public static class VulkanModelLoader
                 // LFM2.5-24B-A2B (#1015): gated short-conv + GQA hybrid, dense-then-MoE FFN; Q4_0 weights are served as exact Q8_0.
                 var lfm = VulkanLfm2MoeTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
                 return (lfm, size => lfm.CreateKvCache(size));
+            }
+
+            case Architecture.Lfm3:
+            {
+                // LFM3 (#1562): gated short-conv (L_cache 7) + sliding-window / global GQA tri-hybrid, dense FFN, sandwich norms.
+                var lfm3 = VulkanLfm3TransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+                return (lfm3, size => lfm3.CreateKvCache(size));
             }
 
             case Architecture.NemotronH:
@@ -144,6 +155,9 @@ public static class VulkanModelLoader
 
             // MiMo-V2 (#955) falls through to `default`: the generic VulkanTransformerModel implements zero-padded-V attention, per-layer
             // KV heads / rope, sink attention and the IQ routed banks.
+
+            case Architecture.Glm4Moe:
+                throw new NotSupportedException(ModelConfig.Glm4MoeUnsupportedMessage("Vulkan"));
 
             case Architecture.Mamba3:
                 throw new NotSupportedException(

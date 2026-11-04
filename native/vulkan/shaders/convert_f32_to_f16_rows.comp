@@ -1,0 +1,37 @@
+#version 450
+// F32 -> F16 row scatter for the dense Vulkan F16 KV cache (issue #1151): rows land at arbitrary cache positions.
+//
+// Row srcRow0 + t of src (kvStride F32 elements) becomes F16 row (positions[srcRow0 + t] - rowBase) of dst. Two consecutive elements share one 32-bit word of the
+// uint-backed destination, so no 16-bit-storage feature is needed and no two invocations write the same word (kvStride is even).
+// The contiguous case keeps convert_f32_to_f16_range.comp; this shader exists for selective recompute (non-contiguous positions).
+// Rounding and saturation match convert_f32_to_f16_range.comp exactly (round-to-nearest-even in the integer domain, clamp to +-65504).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufSrc { float src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufDst { uint  dst[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufPos { int   positions[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint wordsPerRow;   // kvStride / 2
+    uint rows;          // query rows to convert
+    int  rowBase;       // first position held by the destination slot (0 unless the slot is a compact window)
+    uint srcRow0;       // first source row (and first positions[] entry) this dispatch converts: a sequence's offset in a packed batch
+} pc;
+
+float roundToHalfRne(float x) {
+    uint b = floatBitsToUint(x);
+    b += 0xFFFu + ((b >> 13u) & 1u);
+    return uintBitsToFloat(b & 0xFFFFE000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.rows * pc.wordsPerRow) return;
+    uint t = i / pc.wordsPerRow;
+    uint w = i % pc.wordsPerRow;
+    uint e = (pc.srcRow0 + t) * (2u * pc.wordsPerRow) + 2u * w;
+    vec2 v = clamp(vec2(src[e], src[e + 1u]), vec2(-65504.0), vec2(65504.0));
+    uint row = uint(positions[pc.srcRow0 + t] - pc.rowBase);
+    dst[row * pc.wordsPerRow + w] = packHalf2x16(vec2(roundToHalfRne(v.x), roundToHalfRne(v.y)));
+}

@@ -81,9 +81,14 @@ public static class ModelLoader
             Architecture.Qwen3MoeHybrid => Qwen3MoeHybridTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             // LFM2.5-24B-A2B (#1015): gated short-conv + GQA hybrid with dense-then-MoE FFN.
             Architecture.Lfm2Moe => Lfm2MoeTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            // LFM3 (#1559): conv + sliding/global attention tri-hybrid, dense FFN, sandwich norms.
+            Architecture.Lfm3 => Lfm3TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.Qwen3HybridDense => Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             // CPU reference forward (#816): GR + GDN/QSA + 512-expert MoE + n-gram PLE.
             Architecture.Qwen4Exp => Qwen4ExpTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            // glm4moe (#1599): CPU forward on the shared TransformerModel (GQA + QKV bias, partial NeoX RoPE, dense layer 0, sigmoid + exp_probs_b MoE
+            // with an ungated shared expert, banks kept in the raw quant view). No NextN/MTP yet; GPU backends still refuse.
+            Architecture.Glm4Moe => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
         };
     }
