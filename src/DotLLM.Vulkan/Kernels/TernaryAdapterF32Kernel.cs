@@ -1,15 +1,7 @@
+using DotLLM.Models.Adapters.Ternary;
 using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Vulkan.Kernels;
-
-/// <summary>Storage type of the per-row ternary scales on the device (compute is always F32).</summary>
-public enum TernaryScaleStorage
-{
-    /// <summary>F32 scales, matching the merged CPU package format (default).</summary>
-    F32 = 0,
-    /// <summary>F16 scales, two per <c>uint</c>; converted exactly to F32 in the shader.</summary>
-    F16 = 1,
-}
 
 /// <summary>
 /// In-place ternary residual adapter (#1618) for one layer's circuits: <c>h' = h + sum_c dq_c * W_up_c * relu(W_down_c * x8)</c>
@@ -49,7 +41,7 @@ public sealed class TernaryAdapterF32Kernel : IDisposable
     }
 
     /// <summary>Words (<c>uint</c>) per packed mask row for width <paramref name="d"/>: <c>ceil(d/64) * 4</c> (plus/minus x lo/hi per 64 columns).</summary>
-    public static int WordsPerRow(int d) => (d + 63) / 64 * 4;
+    public static int WordsPerRow(int d) => TernaryDevicePack.WordsPerRow(d);
 
     private (ComputePipeline pipe, DescriptorSetCache cache) Variant(int d, TernaryScaleStorage scales)
     {

@@ -142,3 +142,36 @@ Same-session measurements on this box (cpu-bench held; reference built from `151
 So the claim **reproduces and is exceeded** on this machine (70k vs 25k per s for the benchmark's down-projection "token"; 32k per s for the whole adapter), but it measures a single down-projection, and it was obtained
 with the int8-unpacked matrix (4x the memory of the 2-bit package). dotLLM's packed-mask down-projection is 2.4x faster than the reference's unpacked one at the same shape. The full adapter is about 20% slower than the reference's
 `TernaryExpert.Forward` in dotLLM's current form (its up-projection, 4096 x rank masked add/sub, is the cost; the reference's own number excludes the activation quantization and the residual add): a follow-up optimisation, not a correctness issue.
+
+---
+
+# GPU kernels (#1618)
+
+The adapter step also runs on the GPU, in place on the device-resident F32 residual (no host round trip; the Vulkan forward holds the
+residual in `_state.HiddenState` as F32, so the CPU numerics carry over unchanged).
+
+- **Vulkan** (`native/vulkan/shaders/ternary_adapter_residual_f32.comp`, `TernaryAdapterF32Kernel`, `VulkanTernaryResidualModifier`):
+  one workgroup per token row (decode n=1 is one workgroup, prefill rows are independent workgroups). Stages: absmax int8 quantize ->
+  down projections (64-lane group per rank row, integer masked add/sub on the packed plus/minus bitmasks, read in place) ->
+  per-circuit ReLU / max / gate / int8 requantize -> up projections (one thread owns 32 columns) + residual add. Several adapters at one
+  layer run in one pass (rank-concatenated, registration order, summed rank <= 256, D <= 6144).
+  **Bit-exact vs the CPU kernel**: integer sums are exact, float ops are single IEEE ops in the CPU's order (`precise` forbids FMA
+  contraction). One trap found: `spirv-opt -O` rewrites `m / 127.0` into `m * (1/127)` (not correctly rounded, 1 ULP off in ~15% of
+  shapes); the divisor is therefore supplied at runtime (push constant) and the three divisions go through a candidate+exact-residual
+  `divRN`.
+- **Hook seam**: `IVulkanResidualModifier` (DotLLM.Vulkan) is the device twin of `IResidualModifier`. `VulkanTransformerModel.ResidualModifier`
+  is null by default (one branch per layer); when set, the model records the modifier after layer L (after Gemma-4 output scaling, before
+  the inter-layer barrier) and `ForwardBatch` routes every sequence through the per-sequence core. **Only the dense `VulkanTransformerModel`
+  host has the seam**; the hybrid/MoE/Mamba hosts do not (follow-up).
+- **Scale dtype**: F32 by default; `TernaryScaleStorage.F16` is a pipeline specialization constant (two halves per word, exact widening).
+  `TernaryDevicePack` (Models) defines the packed bytes for both GPU backends.
+- **CUDA** (`native/kernels/ternary_adapter_residual_f32.cu`, `CudaTernaryResidualModifier`): same algorithm and bytes, explicit
+  `__fmul_rn/__fadd_rn/__fdiv_rn`. **Build-verified only**: there is no nvcc on the Strix box (the C# builds; the `.cu` was only syntax-checked with
+  clang against stubs), the `.ptx` is not checked in, it has not run on an NVIDIA GPU and is not wired into `CudaTransformerModel`.
+- **Latency** (Strix Halo gfx1151, GPU timestamps, D=4096, gate open, residual rows F32): rank 1 and 2 about 5.2-5.9 us per dispatch (1 or 8 rows),
+  rank 32 about 32 us (1 or 8 rows; was 65 us before the up-projection owned 32 columns per thread). The down projection at rank 32 is the remaining
+  cost (8 rounds of 64-lane reductions); a decode layer of a 4096-wide model is hundreds of microseconds.
+- **Tests**: `tests/DotLLM.Tests.Unit/Vulkan/Ternary/` (category GPU, needs the Strix:GPU lock): bit-exact vs `TernaryResidualHook` on the 3 sample adapters
+  (alone and stacked), 70+ synthetic shapes (D 1..4099 off the 32/64/256 grid, rank 1..64, alpha 0/<0/other, threshold gating, multi-row), rank concatenation (and order),
+  the 256 cap, per-layer packs, zero/tiny rows, F16 scales; end to end on a synthetic Llama and SmolLM-135M Q8_0 (KL vs CPU at the backend noise floor,
+  detached logits bit-identical to before).

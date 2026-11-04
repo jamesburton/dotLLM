@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using DotLLM.Models.Adapters.Ternary;
 using DotLLM.Vulkan.Kernels;
 
@@ -44,7 +43,7 @@ public sealed class VulkanTernaryResidualModifier : IVulkanResidualModifier, IDi
     /// Builds the device packs for <paramref name="packages"/> (registration order). All packages must share one D;
     /// the summed rank per layer is capped at <see cref="TernaryAdapterF32Kernel.MaxRank"/>.
     /// </summary>
-    public static unsafe VulkanTernaryResidualModifier Create(VulkanDevice device, string spvDir,
+    public static VulkanTernaryResidualModifier Create(VulkanDevice device, string spvDir,
         IReadOnlyList<NsAdapterPackage> packages, TernaryScaleStorage scaleStorage = TernaryScaleStorage.F32)
     {
         ArgumentNullException.ThrowIfNull(packages);
@@ -76,87 +75,25 @@ public sealed class VulkanTernaryResidualModifier : IVulkanResidualModifier, IDi
         return self;
     }
 
-    private static unsafe LayerPack BuildPack(VulkanDevice device, List<NsAdapterPackage> list, int d, int total, TernaryScaleStorage storage)
+    private static LayerPack BuildPack(VulkanDevice device, List<NsAdapterPackage> list, int d, int total, TernaryScaleStorage storage)
     {
-        int wprU = TernaryAdapterF32Kernel.WordsPerRow(d);
-        long maskBytes = 2L * total * wprU * sizeof(uint);
-        int upBase = (total + 1) & ~1;
-        int upStride = (d + 1) & ~1;
-        long scaleElems = upBase + (long)list.Count * upStride;
-        long scaleBytes = storage == TernaryScaleStorage.F16 ? scaleElems * 2 : scaleElems * 4;
-        scaleBytes = (scaleBytes + 3) & ~3L;
-        long metaBytes = (long)list.Count * 4 * sizeof(uint);
-
-        void* maskMem = NativeMemory.AllocZeroed((nuint)maskBytes);
-        void* scaleMem = NativeMemory.AllocZeroed((nuint)scaleBytes);
-        void* metaMem = NativeMemory.AllocZeroed((nuint)metaBytes);
+        var pk = TernaryDevicePack.Build(list, d, storage);
+        VulkanDevice.Buffer? bm = null, bs = null, bt = null;
         try
         {
-            uint* masks = (uint*)maskMem;
-            uint* meta = (uint*)metaMem;
-            uint* upRows = masks + (long)total * wprU;
-            int off = 0;
-            for (int c = 0; c < list.Count; c++)
+            bm = device.AllocateDeviceLocal(pk.Masks.Length);
+            bs = device.AllocateDeviceLocal(pk.Scales.Length);
+            bt = device.AllocateDeviceLocal(pk.Meta.Length);
+            device.Upload(pk.Masks, bm);
+            device.Upload(pk.Scales, bs);
+            device.Upload(pk.Meta, bt);
+            return new LayerPack
             {
-                var pkg = list[c];
-                int rank = pkg.Manifest.Rank;
-                meta[c * 4 + 0] = (uint)rank;
-                meta[c * 4 + 1] = (uint)off;
-                meta[c * 4 + 2] = BitConverter.SingleToUInt32Bits(pkg.Manifest.Alpha);
-                meta[c * 4 + 3] = BitConverter.SingleToUInt32Bits(pkg.Manifest.ActivationThreshold);
-                for (int j = 0; j < rank; j++)
-                {
-                    PutScale(scaleMem, storage, off + j, pkg.Down.Scales[j]);
-                    uint* row = masks + (long)(off + j) * wprU;
-                    for (int col = 0; col < d; col++)
-                    {
-                        sbyte w = pkg.Down[j, col];
-                        if (w != 0) SetBit(row, col, w < 0);
-                    }
-                }
-                for (int r = 0; r < d; r++)
-                {
-                    PutScale(scaleMem, storage, upBase + c * upStride + r, pkg.Up.Scales[r]);
-                    for (int j = 0; j < rank; j++)
-                    {
-                        sbyte w = pkg.Up[r, j];
-                        if (w != 0) SetBit(upRows + (long)(off + j) * wprU, r, w < 0);   // UpT row j = column j of W_up
-                    }
-                }
-                off += rank;
-            }
-
-            VulkanDevice.Buffer? bm = null, bs = null, bt = null;
-            try
-            {
-                bm = device.AllocateDeviceLocal(maskBytes);
-                bs = device.AllocateDeviceLocal(scaleBytes);
-                bt = device.AllocateDeviceLocal(metaBytes);
-                device.Upload(new ReadOnlySpan<byte>(maskMem, (int)maskBytes), bm);
-                device.Upload(new ReadOnlySpan<byte>(scaleMem, (int)scaleBytes), bs);
-                device.Upload(new ReadOnlySpan<byte>(metaMem, (int)metaBytes), bt);
-                return new LayerPack
-                {
-                    Masks = bm, Scales = bs, Meta = bt, NCirc = list.Count, TotalRank = total,
-                    UpScaleBase = upBase, UpScaleStride = upStride,
-                };
-            }
-            catch { bm?.Dispose(); bs?.Dispose(); bt?.Dispose(); throw; }
+                Masks = bm, Scales = bs, Meta = bt, NCirc = pk.Circuits, TotalRank = pk.TotalRank,
+                UpScaleBase = pk.UpScaleBase, UpScaleStride = pk.UpScaleStride,
+            };
         }
-        finally { NativeMemory.Free(maskMem); NativeMemory.Free(scaleMem); NativeMemory.Free(metaMem); }
-    }
-
-    private static unsafe void SetBit(uint* row, int col, bool minus)
-    {
-        // block of 64 columns = [plusLo, plusHi, minusLo, minusHi]
-        int word = (col >> 6) * 4 + ((col >> 5) & 1) + (minus ? 2 : 0);
-        row[word] |= 1u << (col & 31);
-    }
-
-    private static unsafe void PutScale(void* mem, TernaryScaleStorage storage, long idx, float v)
-    {
-        if (storage == TernaryScaleStorage.F16) ((Half*)mem)[idx] = (Half)v;
-        else ((float*)mem)[idx] = v;
+        catch { bm?.Dispose(); bs?.Dispose(); bt?.Dispose(); throw; }
     }
 
     /// <inheritdoc/>
