@@ -298,6 +298,119 @@ internal static unsafe class TernaryMaskedProbeKernels
         }
     }
 
+    // ------------------------------------------------------------------ NeuroSymbolicAI reference kernels (faithful ports) ----
+
+    private static readonly sbyte[] s_refUnpackTable = BuildRefUnpackTable();
+
+    private static sbyte[] BuildRefUnpackTable()
+    {
+        var table = new sbyte[256 * 4];
+        for (int b = 0; b < 256; b++)
+            for (int i = 0; i < 4; i++)
+                table[b * 4 + i] = ((b >> (2 * i)) & 3) switch { 1 => (sbyte)1, 3 => (sbyte)(-1), _ => (sbyte)0 };
+        return table;
+    }
+
+    /// <summary>
+    /// PQ2_0 rows -> the reference's BitNet packing (codes 00=0, 01=+1, 11=-1; 4 consecutive columns per byte, ascending bits),
+    /// group headers dropped, per-group scales NOT carried (the reference format has one scale per row), so this is a
+    /// throughput stand-in: PQ2_0 field c -> {0: 11 (-1), 1: 00 (0), 2: 01 (+1), 3: 00}.
+    /// </summary>
+    public static void RepackToReferencePacked(byte* pq2, byte* dst, long rows, int k)
+    {
+        int groups = k / 128;
+        byte[] lut = new byte[256];
+        for (int b = 0; b < 256; b++)
+        {
+            int o = 0;
+            for (int f = 0; f < 4; f++) o |= ((((b >> (2 * f)) & 3)) switch { 0 => 3, 2 => 1, _ => 0 }) << (2 * f);
+            lut[b] = (byte)o;
+        }
+        for (long r = 0; r < rows; r++)
+            for (int g = 0; g < groups; g++)
+                for (int i = 0; i < 32; i++)
+                    dst[(r * groups + g) * 32 + i] = lut[pq2[(r * groups + g) * 34 + 2 + i]];
+    }
+
+    /// <summary>Reference-layout packed rows -> int8 rows (the reference's <c>PackedTernaryTensor.Unpack()</c>).</summary>
+    public static void UnpackReference(byte* packed, sbyte* dst, long rows, int k)
+    {
+        int bpr = k / 4;
+        for (long r = 0; r < rows; r++)
+            for (int c = 0; c < k; c++)
+                dst[r * k + c] = s_refUnpackTable[((packed[r * bpr + (c >> 2)]) * 4) + (c & 3)];
+    }
+
+    /// <summary>
+    /// Faithful port of <c>Ternary.Core.SimdTernaryKernel.Forward</c> (packed weights, L1 unpack table, zero-word skip,
+    /// <c>Vector256.Widen</c> multiply, long row sum, scale 1.0), restricted to rows [start, start+count).
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void RefSimdPackedRows(byte* packed, sbyte* x, float* output, int start, int count, int cols)
+    {
+        int bytesPerRow = (cols + 3) / 4;
+        sbyte* weightsBuffer = stackalloc sbyte[32];
+        for (int r = start; r < start + count; r++)
+        {
+            long rowSum = 0;
+            byte* packedRow = packed + (long)r * bytesPerRow;
+            int col = 0, byteIndex = 0;
+            int limit = cols - 31;
+            while (col < limit)
+            {
+                ulong packed8 = Unsafe.ReadUnaligned<ulong>(packedRow + byteIndex);
+                if (packed8 == 0) { col += 32; byteIndex += 8; continue; }
+                for (int i = 0; i < 8; i++)
+                {
+                    int tableOffset = packedRow[byteIndex + i] * 4;
+                    weightsBuffer[i * 4 + 0] = s_refUnpackTable[tableOffset + 0];
+                    weightsBuffer[i * 4 + 1] = s_refUnpackTable[tableOffset + 1];
+                    weightsBuffer[i * 4 + 2] = s_refUnpackTable[tableOffset + 2];
+                    weightsBuffer[i * 4 + 3] = s_refUnpackTable[tableOffset + 3];
+                }
+                var wVec = Vector256.Load(weightsBuffer);
+                var xVec = Vector256.Load(x + col);
+                var (wLower, wUpper) = Vector256.Widen(wVec);
+                var (xLower, xUpper) = Vector256.Widen(xVec);
+                var prodLower = wLower * xLower;
+                var prodUpper = wUpper * xUpper;
+                var (p0, p1) = Vector256.Widen(prodLower);
+                var (p2, p3) = Vector256.Widen(prodUpper);
+                rowSum += Vector256.Sum(p0) + Vector256.Sum(p1) + Vector256.Sum(p2) + Vector256.Sum(p3);
+                col += 32; byteIndex += 8;
+            }
+            output[r] = rowSum * 1.0f;
+        }
+    }
+
+    /// <summary>Faithful port of <c>UnpackedTernaryMatrix.Forward</c> (int8 weights, 4x the memory of packed), rows [start, start+count).</summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void RefUnpackedRows(sbyte* weights, sbyte* x, float* output, int start, int count, int cols)
+    {
+        for (int r = start; r < start + count; r++)
+        {
+            long rowSum = 0;
+            int col = 0, limit = cols - 31;
+            sbyte* wr = weights + (long)r * cols;
+            while (col < limit)
+            {
+                var wVec = Vector256.Load(wr + col);
+                var xVec = Vector256.Load(x + col);
+                var (wLower, wUpper) = Vector256.Widen(wVec);
+                var (xLower, xUpper) = Vector256.Widen(xVec);
+                var prodLower = wLower * xLower;
+                var prodUpper = wUpper * xUpper;
+                var (p0, p1) = Vector256.Widen(prodLower);
+                var (p2, p3) = Vector256.Widen(prodUpper);
+                rowSum += Vector256.Sum(p0) + Vector256.Sum(p1) + Vector256.Sum(p2) + Vector256.Sum(p3);
+                col += 32;
+            }
+            output[r] = rowSum * 1.0f;
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float HSum(Vector256<float> v)
     {

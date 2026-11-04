@@ -240,6 +240,18 @@ public static unsafe class TernaryAdapterKernel
         return Avx2.CompareEqual(Avx2.And(sh, s_bitSel), s_bitSel);
     }
 
+    /// <summary>Benchmark/test helper: down-projection only (<paramref name="rank"/> rows) as <c>(float)sum * scale</c>.</summary>
+    internal static void DownRows(sbyte* x8, int d, ulong* down, int rank, float* scale, float* outF, TernaryKernelIsa isa = TernaryKernelIsa.Auto)
+    {
+        int wpr = WordsPerRow(d), padded = PaddedCols(d);
+        bool avx = isa != TernaryKernelIsa.Scalar && Avx2.IsSupported;
+        for (int j = 0; j < rank; j++)
+        {
+            ulong* w = down + (long)j * wpr;
+            outF[j] = (float)(avx ? DownRowAvx2(x8, padded, w) : DownRowScalar(x8, d, w)) * scale[j];
+        }
+    }
+
     private static int DownRowScalar(sbyte* x8, int d, ulong* w)
     {
         int sum = 0;
