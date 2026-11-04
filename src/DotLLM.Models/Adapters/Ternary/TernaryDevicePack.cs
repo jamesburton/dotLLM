@@ -10,7 +10,7 @@ public enum TernaryScaleStorage
 }
 
 /// <summary>
-/// One layer's ternary circuits packed for the GPU backends (#1618), shared by Vulkan and CUDA so both read the same bytes.
+/// One layer's ternary circuits packed for the GPU backends (#1618), shared by the GPU backends so they read the same bytes.
 /// Circuits are concatenated in registration order (the rank-concatenation of the CPU composer).
 /// </summary>
 /// <remarks>
