@@ -1323,6 +1323,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     internal bool IsDenseF16KvEligible =>
         Config.Architecture is DotLLM.Core.Configuration.Architecture.Llama or DotLLM.Core.Configuration.Architecture.Mistral
             or DotLLM.Core.Configuration.Architecture.Qwen or DotLLM.Core.Configuration.Architecture.Phi
+            or DotLLM.Core.Configuration.Architecture.Glm4Moe   // #1600: plain GQA hd128 + partial NeoX RoPE; the F16 twins take ropeDim
         && Config.MlaConfig is null && Config.NumSharedKvLayers == 0 && !Config.HasDistinctValueHeadDim
         && Config.AttentionValueScale is null && Config.HeadDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim;
 
@@ -1847,7 +1848,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                     : (false, false, false),
                 skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
             skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config),
-                allowNvfp4Scales: true);
+                allowNvfp4Scales: true, allowGlm4MoeCpu: true);
             return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf);
         }
         catch
@@ -1887,7 +1888,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 : (false, false, false),
             skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
             skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config),
-            allowNvfp4Scales: true);
+            allowNvfp4Scales: true, allowGlm4MoeCpu: true);
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 
@@ -3384,7 +3385,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         // are reached via VulkanModelLoader.CreateFromGguf. Reporting them as "not supported
         // on the Vulkan backend yet" is simply untrue and sends the caller down a dead end
         // (issue #324).
-        TransformerWeights.ThrowIfArchitectureNeedsDedicatedLoader(config);
+        // glm4moe (#1600): the single-device model (allowGptOss) runs it; the pipeline / hybrid hosts keep the refusal.
+        if (!(allowGptOss && config.Architecture == DotLLM.Core.Configuration.Architecture.Glm4Moe))
+            TransformerWeights.ThrowIfArchitectureNeedsDedicatedLoader(config);
 
         // MiMo-V2 (#936): V head_dim != QK head_dim, SWA ring + sinks, packed low-bit expert banks - none of it exists in the Vulkan
         // attention/KV/MoE paths. Loading through the dense model would run and be silently wrong.

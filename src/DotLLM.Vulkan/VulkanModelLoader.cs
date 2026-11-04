@@ -156,8 +156,8 @@ public static class VulkanModelLoader
             // MiMo-V2 (#955) falls through to `default`: the generic VulkanTransformerModel implements zero-padded-V attention, per-layer
             // KV heads / rope, sink attention and the IQ routed banks.
 
-            case Architecture.Glm4Moe:
-                throw new NotSupportedException(ModelConfig.Glm4MoeUnsupportedMessage("Vulkan"));
+            // glm4moe (GLM-4.5-Air / REAP, #1600) falls through to `default`: the generic VulkanTransformerModel runs GQA + QKV bias, partial NeoX
+            // RoPE, dense layer 0 and the sigmoid + exp_probs_b MoE with packed banks and an ungated packed shared expert.
 
             case Architecture.Mamba3:
                 throw new NotSupportedException(
