@@ -91,6 +91,15 @@ public sealed record AnthropicMessagesRequest
     public string? ReasoningFormat { get; init; }
 
     /// <summary>
+    /// dotLLM extension: the <c>chunk_cache</c> annotation manifest (<c>docs/CHUNK_CACHE.md</c>), kept raw. Read only
+    /// with <c>--chunk-cache</c> on; otherwise ignored like any unknown field. Inline <c>chunk</c> annotations stay in
+    /// <see cref="AnthropicMessageDto.Content"/>.
+    /// </summary>
+    [JsonPropertyName("chunk_cache")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? ChunkCache { get; init; }
+
+    /// <summary>
     /// <c>true</c> when the request enabled extended thinking, <c>false</c> when it disabled it, null when
     /// it said nothing (the template default applies).
     /// </summary>

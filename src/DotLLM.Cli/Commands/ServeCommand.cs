@@ -338,10 +338,23 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("Most --prompt-cache-step checkpoints kept, deepest first (default 8).")]
         public int? PromptCacheStepKeep { get; set; }
 
+        /// <summary>Turns on the <c>chunk_cache</c> wire convention (off by default; docs/CHUNK_CACHE.md).</summary>
+        [CommandOption("--chunk-cache")]
+        [Description("Parse and validate chunk_cache annotations on /v1/chat/completions and /v1/messages (chunk-level K/V reuse convention, docs/CHUNK_CACHE.md); " +
+                     "reuse arrives with the next server tasks, so today no response changes. Off by default: annotations are ignored like any unknown field.")]
+        public bool ChunkCache { get; set; }
+
+        /// <summary>Most chunk annotations accepted per request.</summary>
+        [CommandOption("--chunk-cache-max-chunks")]
+        [Description("Most chunk annotations read per request (default 4096, at least 1); the rest are dropped with chunk_too_many without being read.")]
+        public int? ChunkCacheMaxChunks { get; set; }
+
         /// <inheritdoc/>
         public override ValidationResult Validate()
         {
             try { ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget, PromptCacheStep, PromptCacheStepKeep); }
+            catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
+            try { DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(ChunkCache, ChunkCacheMaxChunks); }
             catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
             return base.Validate();
         }
@@ -559,6 +572,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             AllowModelAdminApi = settings.AllowModelAdmin,
             Metrics = settings.NoMetrics ? false : settings.Metrics ? true : null,
             AllowLoraAdminApi = settings.AllowLoraAdmin,
+            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(settings.ChunkCache, settings.ChunkCacheMaxChunks),
             TernaryAdapterPaths = settings.TernaryAdapterPaths is { Length: > 0 } ? settings.TernaryAdapterPaths : null,
             // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
             // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,

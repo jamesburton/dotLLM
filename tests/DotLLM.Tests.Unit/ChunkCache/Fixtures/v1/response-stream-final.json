@@ -1,0 +1,61 @@
+{
+  "id": "chatcmpl-0002",
+  "object": "chat.completion.chunk",
+  "created": 1793577601,
+  "model": "qwen3-4b",
+  "choices": [
+    {
+      "index": 0,
+      "delta": {},
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 3000,
+    "completion_tokens": 58,
+    "total_tokens": 3058,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "timings": {
+    "cache_n": 0,
+    "chunk_n": 0,
+    "chunk_recomputed_n": 0
+  },
+  "chunk_cache": {
+    "v": 1,
+    "policy_requested": "exact",
+    "policy_applied": "exact",
+    "reason": null,
+    "chunks": {
+      "annotated": 3,
+      "prefix": 0,
+      "hit": 1,
+      "miss": 1,
+      "ignored": 1
+    },
+    "tokens": {
+      "prompt": 3000,
+      "prefix_reused": 0,
+      "prefix_reused_approx": 0,
+      "chunk_reused": 0,
+      "chunk_recomputed": 0,
+      "prefilled": 3000,
+      "encode_queued": 412
+    },
+    "timings_ms": {
+      "assembly": 0,
+      "probe": 0,
+      "recompute": 0,
+      "prefill": 1310,
+      "full_prefill_estimate": 1310
+    },
+    "warnings": [
+      {
+        "code": "chunk_ignored_too_short",
+        "count": 1
+      }
+    ]
+  }
+}
