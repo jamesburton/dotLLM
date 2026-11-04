@@ -91,7 +91,7 @@ public sealed partial class ContinuousBatchSchedulerServiceTests
 
         Task streaming = CompletionEndpoint.WriteCompletionStreamAsync(
             ctx,
-            ServerState.SchedulerStream(fix.Service, ctx, request.TokenIds, request.Options),
+            ServerState.SchedulerStream(NewServerState(fix), fix.Service, ctx, request.TokenIds, request.Options),
             ServerState.WithoutGate,
             "cmpl-1", "m", includeUsageChunk: true, CancellationToken.None);
 

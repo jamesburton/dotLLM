@@ -272,6 +272,8 @@ Lists every **resident** model — the active one plus any stashed-but-loaded mo
 ```
 `expires_in_seconds` is omitted when the model's keep-alive is negative (pinned, never auto-unloads).
 
+**Idle means no request in flight (#1606).** The keep-alive clock counts from the moment the *last* request finished, and the idle sweep never unloads the active model while any request is generating, on any path (gated direct-generator requests, and continuous-batch scheduler requests, streaming or not, which hold no gate). A single generation longer than `--keep-alive` is therefore safe; the model unloads `--keep-alive` seconds after it ends.
+
 Each loaded model also carries llama.cpp's `meta` object (#1289) under llama.cpp's field names, plus `n_ctx` (the
 window one request gets after the memory fit or `--ctx-size`) and `ftype` (dominant storage type and bits per weight
 measured from the tensor directory, not `general.file_type`):
