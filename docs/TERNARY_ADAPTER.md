@@ -43,7 +43,7 @@ dotLLM rejects (`InvalidDataException`): not a zip, missing entries, entries lar
 tensor dimensions that disagree with `Rank x D` / `D x Rank`, non-positive rank/D, negative layer, non-finite alpha/threshold, missing or mismatching checksums.
 `ValidateFor(hidden, layers)` additionally rejects a D or layer that does not fit the model. `ToGgufMetadata()` returns the reference's key set
 (`neuro_symbolic.{domain,target_model,layer,target_layer,input_dimension,rank,alpha,activation_threshold,description,created_at,down_checksum,up_checksum}`);
-reading adapters *from* GGUF is not implemented (#1619).
+reading adapters back from GGUF is described in [GGUF form](#gguf-form-1619).
 
 Files written by dotLLM load in the reference loader (checked) and the reference's sample adapters are test fixtures.
 
@@ -58,14 +58,61 @@ Files written by dotLLM load in the reference loader (checked) and the reference
 - **Several adapters** (also at the same layer) are evaluated in one pass sharing one int8 quantization of the row, in registration order, deltas summed like the
   reference's delta buffer. This is the rank-concatenation idea of `LoraComposer`, but `LoraComposer` composes F32 `ILoraAdapter` weights into one concatenated matrix pair and
   cannot express per-adapter ReLU/int8 requantization or per-row scales, so the ternary composition lives in the hook. Summed rank per layer is capped at 256.
-- **Scales are F32 metadata** (CLAUDE.md #1107): `downScale[rank]` + `upScale[D]` floats per adapter (about 16 KB at D=4096). Weights are never expanded; the masks are the packed weights.
-- CLI: `dotllm run ... --ternary-adapter a.nsadapter [--ternary-adapter b.nsadapter]` (CPU backend). x86 AVX2 + scalar paths; other ISAs use the scalar path (NEON is a follow-up).
+- **Scales are metadata** (CLAUDE.md #1107): `downScale[rank]` + `upScale[D]` per adapter (about 16 KB F32 at D=4096). Weights are never expanded; the masks are the packed weights.
+  Default is **F16** (binary16, 8 KB, RNE at load; per-circuit automatic F32 fallback when any non-zero |scale| is outside 6.1e-5..65504). `DOTLLM_TERNARY_SCALES=f32` or `TernaryResidualHook.ScaleFormat = TernaryScaleFormat.F32` forces the exact reference F32 scales: see [F16 scales](#f16-per-row-scales-1620).
+- CLI: `dotllm run ... --ternary-adapter a.nsadapter [--ternary-adapter b.gguf]` and `dotllm serve ... --ternary-adapter ...` (CPU backend; each path is a ZIP package or an adapter GGUF, detected by magic; repeatable). x86 AVX2 + scalar paths; other ISAs use the scalar path (NEON is a follow-up).
 
 ## Tests
 
 `TernaryAdapterTests`: golden SHA-256 of the real reference's outputs (7 adapters x 4 rows, both ISAs: the 3 sample adapters, 2 reference-written synthetic packages, 2 regenerated deterministically),
 an independent managed port of the reference pipeline over 252 shape/alpha/ISA combinations (bit-identical), multi-adapter order, alpha/threshold gating, format round trip and
 rejection cases, engine wiring. The goldens come from building `Ternary.Core` + `Expert.Model` from the reference commit and running `TernaryExpert` on the same inputs.
+
+## GGUF form (#1619)
+
+`NsAdapterGguf` (DotLLM.Models) writes and reads the same circuits as the ZIP package inside a GGUF container, bit-identically (package -> GGUF -> package keeps every code,
+scale, manifest field, the float bits of alpha/threshold and the timestamp offset; GGUF -> ZIP is accepted by the reference loader).
+
+| what | where |
+|---|---|
+| adapter count | `nsadapter.count` (uint32; absent = 1), at most 256 |
+| metadata of adapter 0 | the reference's `neuro_symbolic.*` key set, string values, verbatim (`ToGgufMetadata()`; checksums are recomputed from the data) |
+| metadata of adapter i >= 1 | `neuro_symbolic.<i>.*` (same suffixes) |
+| exact floats | `nsadapter.<i>.alpha`, `nsadapter.<i>.activation_threshold` (GGUF float32); preferred on read, because the reference's `G7` strings do not round-trip every binary32 |
+| packed codes | tensors `nsadapter.<i>.down` (rank x D) and `nsadapter.<i>.up` (D x rank): the package's BitNet 2-bit bytes verbatim (`rows * ceil(cols/4)`, zero padded to a multiple of 4) as a **1-D `I32` tensor** |
+| per-row scales | tensors `nsadapter.<i>.down_scale` (rank) and `nsadapter.<i>.up_scale` (D), 1-D `F32` |
+| standalone file | `general.architecture = "nsadapter"`; the same keys and tensors may instead be appended to a model GGUF |
+
+**Why a raw `I32` blob and not an existing 2-bit type.** dotLLM's GGUF reader only accepts ids in its `QuantizationType` enum (no `I8`/`U8`). The 2-bit types that exist (`I2_S`, `PQ2_0`,
+`TQ2_0`) use different code maps (`I2_S`: 0/1/2 = -1/0/+1) and block layouts, so mapping onto one would be a conversion, not the reference's bytes, and could not be checksum-verified against
+the package. `I32` is the only 4-byte integer type present and carries the packed bytes untouched (no new ggml type is introduced); shapes come from the `rank` / `input_dimension` metadata.
+Validation matches the ZIP loader plus: tensor type and exact element count, zero padding, SHA-256 of both code tensors against the metadata, `rank`/`D` bounds before any allocation.
+
+Wiring: `TernaryResidualHook.Load(paths)` accepts either format (magic `GGUF` or ZIP), so `dotllm run` and the new repeatable `dotllm serve --ternary-adapter` use both. `ServerOptions.TernaryAdapterPaths`
+attaches the hook to every model the server loads (CPU transformer only; an explicit or auto GPU device is not used when adapters are requested, and a non-attachable model is an error, never a silent skip).
+**Not done:** `InferenceOptions` per-request enable/disable. The residual hook sees `[tokens x D]` rows with no request identity and the scheduler batches requests, so a per-request switch
+needs a per-row mask through `IResidualModifier` (filed as a follow-up); the adapters currently apply to every request of the server.
+
+## F16 per-row scales (#1620)
+
+Question: are F16 (or bf16) scales sufficient? Method: round the package scales RNE (F32 -> binary16 / bfloat16 -> F32 exact), keep weights exact and accumulation F32, and compare the adapter output delta against F32 scales
+(`TernaryScalePrecisionTests`, managed port of the reference circuit; 30 residual rows per case, D = 4096, outlier channels). The noise floor is the adapter's own int8 requantisation (delta of the shipped circuit vs the same circuit with an unquantised bottleneck).
+
+| scale distribution (median, sigma 0.3) | rank | int8 floor (relL2) | F16 relL2 | bf16 relL2 | F16 q_j flips | bf16 q_j flips | F16 / bf16 out-int8 flips |
+|---|---|---|---|---|---|---|---|
+| 0.02 | 8 / 32 / 128 | 3.2e-3 / 4.9e-3 / 6.8e-3 | 6.5e-4 / 2.0e-3 / 1.9e-3 | 3.7e-3 / 4.8e-3 / 5.7e-3 | 0.42 / 0.52 / 0.37 % | 2.5 / 4.3 / 2.8 % | 0.8-2.6 % / 5.8-10.3 % |
+| 0.002 | 8 / 32 / 128 | 3.4e-3 / 5.6e-3 / 8.4e-3 | 9.1e-4 / 1.9e-3 / 2.3e-3 | 3.5e-3 / 4.9e-3 / 6.0e-3 | 0.3-0.4 % | 2.5-2.7 % | 0.5-1.6 % / 3.4-7.6 % |
+| 1.0 | 8 / 32 / 128 | 3.3e-3 / 5.5e-3 / 6.8e-3 | 4.9e-4 / 1.7e-3 / 2.2e-3 | 2.4e-3 / 5.2e-3 / 5.5e-3 | 0.4-0.6 % | 0.8-3.9 % | 1.1-3.2 % / 5.2-10.4 % |
+| 40 | 8 / 32 / 128 | 3.1e-3 / 5.1e-3 / 7.6e-3 | 1.9e-3 / 2.0e-3 / 2.3e-3 | 3.6e-3 / 4.4e-3 / 6.2e-3 | 0.4-0.8 % | 3.2-3.3 % | 1.1-3.3 % / 5.4-11.4 % |
+
+("q_j flips": share of the int8-requantised bottleneck values that differ by one level; "out-int8 flips": share of output elements whose absmax-int8 value differs; a flip is +-1 of 127.)
+Reference sample adapters (`bracket-parity`, `csharp14-syntax-attractor`, `modulo97-counter`) have only unit scales (1.0), so every format is exact for them (relL2 = 0). The reference's own scale rule is absmean (`PackedTernaryTensor.SetRow`), i.e. the mean |w| of the float row, typically 1e-3 .. a few.
+End to end on the tiny synthetic llama (D = 64, adapter at layer 1, 24 positions): the adapter itself moves the logits by KL 2.6-3.5 nats (top-1 agrees 1/24, 0/24); switching its scales F32 -> F16 moves them by **KL 4.7e-6 / 6.1e-8** (top-1 24/24), F32 -> bf16 by 1.7e-5 / 2.4e-5.
+Range: F16 has a normal range [6.1035156e-5, 65504]; at scales around 1e-6 it is subnormal (relL2 2.2e-2, 22 % of q_j flip) and above 65504 it overflows to infinity, bf16 (F32 exponent) does neither.
+
+**Verdict.** *F16 is sufficient inside its normal range*: it adds at most 0.1-0.7x the adapter's own int8 requantisation noise, 0.3-0.8 % one-level flips, and an end-to-end KL six to eight orders below the adapter's effect. *bf16 is not worth it*:
+2.5-4 % of the bottleneck values flip and its error is about equal to the int8 floor (it only buys range, which one F32 fallback also buys). *F16 is the default* (user sign-off on the F32 scale storage, #1620): it halves the scale metadata and matches F32 within the adapter's own int8 noise; the F32 fallback keeps out-of-range adapters exact, and `DOTLLM_TERNARY_SCALES=f32` / `ScaleFormat = F32` restores bit-for-bit reference scales (the reference goldens use scales that are exactly representable in F16, so they hold in both modes). Scales are read as F32 from the package and rounded RNE to IEEE binary16 once at load; a circuit whose non-zero |scale| is outside
+[`MinF16Scale`, `MaxF16Scale`] = [2^-14, 65504] silently stays F32 (`ScaleFormatAt(i)` reports what was chosen). Kernels widen F16 -> F32 exactly, so an F16 hook is bit-identical to an F32 hook built from RNE-rounded scales (tested on both ISAs, odd D, zero scales, mixed formats).
 
 ---
 
@@ -123,6 +170,40 @@ No end-to-end KL/perplexity was run.
   does not improve with size; the K3 in-place kernel is the opposite (bandwidth-limited at DRAM sizes, 11.5 GB/s single-thread, 63-90 GB/s with 16 threads). Cache residency does not rescue the reference approach on large matrices.
 - Caveats: microkernel numbers on UMA; earlier notes record decode GEMV microkernel wins vanishing end-to-end when the path was already bandwidth-bound, but here production is demonstrably compute-bound at about a third of the roofline,
   so a real gain is plausible yet unproven end-to-end. No PMU counters on Windows without admin: cache/register behaviour is inferred from op counts (K3: 1 load + 3 shifts + 4 ands + 4 vpdpbusd + 4 cvt/fma per 128 elements, no 5 KB unpack round-trip through L1).
+
+# End-to-end validation of the planar PQ2_0 kernel on Bonsai-2 27B (#1620)
+
+Model `prism-ml/Ternary-Bonsai-2-27B-gguf` `PQ2_0` (7.2 GB), CPU (Zen 5, 16 threads), `cpu-bench` held. Harness: `dotllm bench` with `DOTLLM_BENCH_ALT_PLANAR=planar-first|prod-first`
+(toggles `MatMul.PQ2_0PlanarEnabled` per rep **inside one process**, both orders, per-rep `planar_calls` counter proves which path ran: 9625 planar GEMVs per 24-token decode rep, 0 in production reps).
+**The box was heavily contended by other agents during the decode runs** (production decode swings 1.2-5.6 tok/s), so quote ranges and adjacent-pair ratios, not single means.
+
+**Decode (n = 1), `DOTLLM_PQ2_PLANAR=1`:** in-process alternation, 12 reps per order, warm-up rep dropped: planar 2.39 / 5.18 / 6.30 tok/s (min/median/max, n = 12), production 1.20 / 3.30 / 4.64 (n = 12);
+adjacent planar/production pair ratio min / median / max = **0.63 / 1.45 / 2.85** (22 pairs). Separate-process pairs in quieter windows (3 reps x 6 process pairs, both orders, `-p 32 -n 32`): production 5.2-5.4 tok/s, planar 7.4-8.4 (about 1.5x); the worst planar-first process saw 1.7-2.2.
+That is below the microbench's 2.0-2.6x on the GEMV, as expected (attention, norms, the GDN layers, `lm_head` sampling and the scalar planar activation prep are unchanged); a quiet-machine number needs a re-run.
+
+**Small-n (`DOTLLM_PQ2_PLANAR_NMAX=100000`, token-blocked kernel `MatMul.PQ2PlanarBlocked.cs`, prefill tok/s, median of >= 5 reps x both orders, ratio planar / production):**
+
+| n (prompt tokens) | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|---|---|---|---|
+| planar min / med / max | 7.4 / 8.6 / 10.9 | 6.0 / 8.3 / 9.1 | 10.3 / 11.8 / 13.2 | 9.9 / 11.6 / 12.7 | 11.4 / 12.8 / 16.4 | 13.9 / 14.1 / 14.4 | 15.5 / 17.0 / 17.9 | 14.1 / 14.4 / 15.7 | 13.5 / 14.1 / 17.0 |
+| production min / med / max | 3.8 / 5.0 / 5.7 | 5.1 / 6.1 / 7.6 | 8.8 / 9.5 / 11.8 | 9.1 / 11.0 / 11.4 | 10.6 / 11.5 / 14.9 | 12.9 / 13.3 / 14.0 | 13.9 / 16.9 / 18.1 | 12.6 / 14.2 / 15.2 | 12.6 / 13.5 / 17.0 |
+| **median ratio** | **1.72** | **1.35** | **1.24** | 1.05 | 1.12 | 1.06 | 1.01 | 1.01 | 1.04 |
+
+Token blocking fixes the n >= 4 loss of the unblocked planar kernel: the weight group is decoded once per block of 4 tokens, so the blocked kernel is a clear win at n = 2..8 (the speculative-verify / MTP / short-prompt range; production's n = 2 forward costs roughly twice its n = 1 forward because it
+re-unpacks per call), neutral from 16 up, and never loses within noise (the production kernel is compute-bound there). Default `DOTLLM_PQ2_PLANAR_NMAX = 4` (planar blocked for 2 <= n <= 4 only, production above); the table supports 16 if the default is flipped.
+
+**Quality (same model, wikitext-2 LF corpus, ctx 512, 6 windows = 1530 scored tokens, `--per-window`, default BOS):**
+
+| | PPL | max abs per-window delta vs float-activation tier | max per-window delta vs production |
+|---|---|---|---|
+| production (W2A8, Q8_0 activations) | 8.4537 | 0.0112 | - |
+| planar (blocked kernel, `NMAX=100000` so prefill exercises it) | 8.4528 | 0.0141 | 0.0136 (window 5: 10.7177 -> 10.7041, -0.13 %) |
+| float activations (`DOTLLM_PQ2_W2A8=0`, no activation quantization; the reference) | 8.4541 | - | - |
+
+Perplexity cannot see the decode GEMV itself (prefill scores via GEMM), so this run routes prefill through the same planar activation grid and per-token op order (the blocked kernel is bit-identical per token to the n = 1 GEMV, tested) to measure the grid.
+Order-noise floor: production itself differs from the float tier by up to 0.0112 PPL per window (0.1 %), and in 2 of 6 windows production is further from the float tier than planar is, so planar's +-0.0141 sits at that floor.
+**Greedy text identity** (`dotllm run -t 0 -n 48`, 5 prompts: capital, poem, physics, code, reasoning): planar and planar-everywhere equal production on 4 of 5; on the code prompt all of planar / float differ from production at the same character (`n-1` vs `n - 1`), and **planar equals the float-activation tier there**, i.e. production's Q8_0 grid is the outlier on that near-tie.
+**Verdict:** the e2e decode win is real (about 1.45x median pair, up to 2.85x, in a contended session; about 1.5x in the quiet pairs) and quality is inside the floor. Proposal (not applied here): default-on with `DOTLLM_PQ2_PLANAR=0` as the off-switch, `NMAX` 4 to 16, after a quiet-machine decode re-run. The scalar activation prep (O(k) per call) is the next lever.
 
 # Reproducing the adapter-kernel claim ("25,126 tok/s at rank 32")
 

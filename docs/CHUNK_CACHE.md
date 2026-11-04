@@ -3,7 +3,107 @@
 Server-side notes for the `chunk_cache` wire convention (chunk-level K/V reuse for agent harnesses). The convention, its
 fields and its error codes are specified outside this repo (ChunkedkvCache, spec `2026-11-02-chunk-cache-integration.md`,
 wire contract `docs/contracts/chunk-cache-v1/`). This page records what the dotLLM server does; it grows with each server
-task. Nothing here is behind a flag yet: there is no `--chunk-cache` option today.
+task. Everything the convention adds sits behind `dotllm serve --chunk-cache` (off by default); with the flag off, every
+request and response is what it was before the convention, for any body.
+
+## Switches
+
+| flag | default | meaning |
+|---|---|---|
+| `--chunk-cache` | off | parse and validate `chunk_cache` annotations on `/v1/chat/completions` and `/v1/messages` (reuse arrives with the next server tasks; today no response changes). Off: the annotations are never read; the body behaves exactly as without them (pinned over HTTP by `ChunkCacheFlagHttpTests`) |
+| `--chunk-cache-max-chunks <n>` | 4096 | most annotations read per request (≥ 1; no upper bound, so `int.MaxValue` disables the cap); the rest are counted from the array length and dropped with `chunk_too_many` without being read |
+
+Both exist on `dotllm serve` and on `ServerOptions.Parse` (`ServerOptions.ChunkCache`).
+
+## Request parsing (`ChunkAnnotationParser`)
+
+The parser reads the request and nothing else: no store, no tokenizer, no reuse. It turns the annotations into
+`ParsedChunkRequest` (accepted spans, warnings with counts, the strict-mode error, the request options), or returns null
+when the flag is off or the request carries no annotation. **It is not yet called by the endpoints**: the next server
+task applies the parse (strict 400s, the `chunk_cache` response object); until then the flag changes no response.
+**Packaging:** this step does not ship alone: the parser, span location and `exact` / `shadow` execution (plan Tasks 10,
+11 and 13) go upstream as one PR, so the flag does something when it is merged. The parser and its records are
+`internal` until then.
+
+### Where a span can be
+
+| surface | placement | addresses |
+|---|---|---|
+| OpenAI `/v1/chat/completions` | manifest `chunk_cache.chunks[]`, `at: {message, part: 0[, start, end]}` | a message's **string** `content`. Array content stays the binding 400 with the flag on (general array support is a separate issue). A `chunk` field on a message object is an unknown field, ignored |
+| Anthropic `/v1/messages` | inline `chunk` on a `text` block, or on a text block inside a `tool_result`'s content array | that block's text |
+| Anthropic | manifest, `at: {message, part[, start, end]}` | a top-level `text` block, string message content (`part: 0`), or a `tool_result` with **string** content. A `tool_result` with array content, `tool_use`, `thinking`: not a text part (`chunk_span_invalid`); its inner blocks are reachable inline only |
+
+`message` / `part` index the request's own `messages` and `content` arrays (the Anthropic top-level `system` is not
+addressable). `start` / `end` are UTF-8 byte offsets into the decoded text, end exclusive; omitted means the whole part.
+
+Each accepted span also carries `EngineSpan(EngineMessage, StartChar, EndChar)`: where it lies in the converter's
+`ChatMessage` list (before `ProfileSystemPrompt.Apply` may prepend a profile system message), in UTF-16 chars. On
+Anthropic the converter records these positions itself while it joins (`AnthropicTextOrigins`), so they follow its rules
+exactly: text blocks joined with one `'\n'` (written only once text has accumulated), a `tool_result` ending the turn and
+becoming its own `tool` message, the text after it starting a new message at offset 0, a `tool_result` content array
+joined with `'\n'`. The parser then checks that the engine message holds the span text at that position.
+
+### Validation, in order (one defect per annotation; contract rulings 23–35 and the Task 10 review amendments)
+
+1. Request level. Structural defects (ruling 23) are `chunk_annotation_malformed`: `chunk_cache` not an object or `chunks`
+   not an array (nothing accepted); a wrong JSON type for `v`, `strict`, `policy`, `namespace`, `report`, `on_miss`,
+   `min_chunk_tokens` (or a negative value) or `query`; a string System.Text.Json cannot decode; an unknown `report` or
+   `on_miss` value, or a `query.message` that is not the index of a request message (ruling 34; the default applies).
+   `v` other than 1 →
+   `chunk_version_unsupported` (nothing accepted); an unknown `policy` name → `chunk_policy_unavailable` (`exact`
+   applies, spans kept); a `namespace` other than the caller's → `chunk_namespace_ignored` (spans kept). Inline and
+   manifest placements together →
+   `chunk_manifest_conflict`, served unannotated (an options-only `chunk_cache` next to inline annotations is not a
+   conflict). More than `--chunk-cache-max-chunks` annotations → `chunk_too_many`: the first *n* in document order are
+   read, the rest are counted from the array length and never read.
+2. Per annotation, in this order (ruling 33):
+   1. **structure** → `chunk_annotation_malformed`: not an object; inline without `v`; `v` not a number; `id` or `hash`
+      missing or not a string; `chunker` / `positioning` / `stability` not strings; `no_store` not a boolean; `at` not
+      `{message, part[, start, end]}` with integers; any string that cannot be decoded (a lone-surrogate escape);
+   2. **version** → `chunk_version_unsupported`: `v` ≠ 1, or `positioning` other than `isolated`;
+   3. **id** → `chunk_span_invalid`: not 1–256 characters (Unicode scalar values);
+   4. **eligibility** → `chunk_not_wire_eligible`: a `chunker` outside the wire-eligible list (`symbol-512` today); the
+      span is dropped (rulings 26, 35: a warning, 400 when strict) and reserves no range;
+   5. **range / boundary** → `chunk_span_invalid`: message or part out of range, a non-text part, an empty or
+      out-of-range byte range, an offset inside a multi-byte character;
+   6. **overlap** → `chunk_span_invalid`: overlaps an earlier span of the same part (the later one is dropped; a span
+      that then fails its hash still holds its range);
+   7. **hash**, last → `chunk_hash_mismatch`: not `"sha256:"` + lowercase hex of the span's UTF-8 bytes (decoded JSON
+      text, no normalisation: CRLF stays CRLF);
+   8. a span the engine message does not hold at the mapped position → `chunk_span_invalid` (defect kind
+      `not_carried`; a converter/mapping bug guard).
+3. Non-strict: one warning per code with the number of annotations (or requests) it covers; a dropped span is plain
+   text. `strict: true`: `Error` is the first defect in document order (amended ruling 4: request-level first, then
+   inline annotations in (message, part) order, then manifest entries in array order): `400 invalid_request_error` with
+   the code (`chunk_store_unavailable` alone is `503 api_error`; nothing is 422). Only `chunk_ignored_too_short`,
+   `chunk_encode_skipped` and `chunk_encode_queued` are never errors.
+
+**Lone surrogates (ruling 17).** In-process callers only: a string with a lone surrogate hashes as UTF-8 with U+FFFD.
+Over HTTP it cannot happen: System.Text.Json parses a lone-surrogate escape but refuses to return it as a string, so
+message text with one fails before the parser (as it always did), and an annotation field with one is
+`chunk_annotation_malformed`, never an exception.
+
+**Cost bounds.** The parser never throws on body content and does bounded work: the manifest is cut at its array length
+before any entry is read; each annotated part is encoded to UTF-8 once per request, with a byte-to-char checkpoint table
+(one per 1,024 chars); overlapping spans are rejected before hashing, so the bytes hashed per request never exceed the
+request's own text (4,096 whole-part spans on a 4 MiB part hash once: `CostBound_*` tests). An unannotated Anthropic
+request is detected by a pre-scan and never converted twice.
+
+**`report: per_chunk`** is accepted from any caller here; restricting it to an authenticated caller in its own
+namespace (§10) is the authentication task's job.
+
+Request options: `policy` (`exact` default; `balanced` / `fast` / `auto` parse to their own values and are degraded
+later), `strict`, `report` (`summary` default), `min_chunk_tokens` (32), `on_miss` (`prefill`), `query` (`{text}` or
+`{message}`; default: the last engine message with role `user`, so Anthropic tool results never count as the query).
+**Namespace.** The store namespace is always server-assigned: the parser takes the caller's namespace as a
+**required** argument (the API key's namespace once authentication exists; until then callers pass the default, `""`).
+A body `chunk_cache.namespace` equal to the caller's own is accepted silently; another name is
+ignored with `chunk_namespace_ignored` (strict: `400 invalid_request_error` with that code), and the spans stay (a non-string is `chunk_annotation_malformed`). The
+namespace's format is validated where it is assigned (the authentication step), not here.
+
+The contract's request fixtures are copied byte for byte under `tests/DotLLM.Tests.Unit/ChunkCache/Fixtures/v1/`
+(checked against `fixtures.sha256`); `ChunkAnnotationParserTests` checks every one against `expected.json`, in the
+contract's message model and translated to the Anthropic surface.
 
 ## Pinned server behaviour (before the convention)
 
