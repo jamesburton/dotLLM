@@ -190,7 +190,7 @@ That is below the microbench's 2.0-2.6x on the GEMV, as expected (attention, nor
 | production min / med / max | 3.8 / 5.0 / 5.7 | 5.1 / 6.1 / 7.6 | 8.8 / 9.5 / 11.8 | 9.1 / 11.0 / 11.4 | 10.6 / 11.5 / 14.9 | 12.9 / 13.3 / 14.0 | 13.9 / 16.9 / 18.1 | 12.6 / 14.2 / 15.2 | 12.6 / 13.5 / 17.0 |
 | **median ratio** | **1.72** | **1.35** | **1.24** | 1.05 | 1.12 | 1.06 | 1.01 | 1.01 | 1.04 |
 
-Token blocking fixes the n >= 4 loss of the unblocked planar kernel: the weight group is decoded once per block of 4 tokens, so the blocked kernel is a clear win at n = 2..8 (the speculative-verify / MTP / short-prompt range; production's n = 2 forward costs about 1.9x its n = 1 forward because it
+Token blocking fixes the n >= 4 loss of the unblocked planar kernel: the weight group is decoded once per block of 4 tokens, so the blocked kernel is a clear win at n = 2..8 (the speculative-verify / MTP / short-prompt range; production's n = 2 forward costs roughly twice its n = 1 forward because it
 re-unpacks per call), neutral from 16 up, and never loses within noise (the production kernel is compute-bound there). Default `DOTLLM_PQ2_PLANAR_NMAX = 4` (planar blocked for 2 <= n <= 4 only, production above); the table supports 16 if the default is flipped.
 
 **Quality (same model, wikitext-2 LF corpus, ctx 512, 6 windows = 1530 scored tokens, `--per-window`, default BOS):**
@@ -202,7 +202,7 @@ re-unpacks per call), neutral from 16 up, and never loses within noise (the prod
 | float activations (`DOTLLM_PQ2_W2A8=0`, no activation quantization; the reference) | 8.4541 | - | - |
 
 Perplexity cannot see the decode GEMV itself (prefill scores via GEMM), so this run routes prefill through the same planar activation grid and per-token op order (the blocked kernel is bit-identical per token to the n = 1 GEMV, tested) to measure the grid.
-Order-noise floor: production itself differs from the float tier by up to 0.0112 PPL per window (0.1 %), and 3 of 6 windows move by more than the planar-vs-float distance, so planar's +-0.0141 sits at that floor.
+Order-noise floor: production itself differs from the float tier by up to 0.0112 PPL per window (0.1 %), and in 2 of 6 windows production is further from the float tier than planar is, so planar's +-0.0141 sits at that floor.
 **Greedy text identity** (`dotllm run -t 0 -n 48`, 5 prompts: capital, poem, physics, code, reasoning): planar and planar-everywhere equal production on 4 of 5; on the code prompt all of planar / float differ from production at the same character (`n-1` vs `n - 1`), and **planar equals the float-activation tier there**, i.e. production's Q8_0 grid is the outlier on that near-tie.
 **Verdict:** the e2e decode win is real (about 1.45x median pair, up to 2.85x, in a contended session; about 1.5x in the quiet pairs) and quality is inside the floor. Proposal (not applied here): default-on with `DOTLLM_PQ2_PLANAR=0` as the off-switch, `NMAX` 4 to 16, after a quiet-machine decode re-run. The scalar activation prep (O(k) per call) is the next lever.
 
