@@ -172,6 +172,40 @@ No end-to-end KL/perplexity was run.
 - Caveats: microkernel numbers on UMA; earlier notes record decode GEMV microkernel wins vanishing end-to-end when the path was already bandwidth-bound, but here production is demonstrably compute-bound at about a third of the roofline,
   so a real gain is plausible yet unproven end-to-end. No PMU counters on Windows without admin: cache/register behaviour is inferred from op counts (K3: 1 load + 3 shifts + 4 ands + 4 vpdpbusd + 4 cvt/fma per 128 elements, no 5 KB unpack round-trip through L1).
 
+# End-to-end validation of the planar PQ2_0 kernel on Bonsai-2 27B (#1620)
+
+Model `prism-ml/Ternary-Bonsai-2-27B-gguf` `PQ2_0` (7.2 GB), CPU (Zen 5, 16 threads), `cpu-bench` held. Harness: `dotllm bench` with `DOTLLM_BENCH_ALT_PLANAR=planar-first|prod-first`
+(toggles `MatMul.PQ2_0PlanarEnabled` per rep **inside one process**, both orders, per-rep `planar_calls` counter proves which path ran: 9625 planar GEMVs per 24-token decode rep, 0 in production reps).
+**The box was heavily contended by other agents during the decode runs** (production decode swings 1.2-5.6 tok/s), so quote ranges and adjacent-pair ratios, not single means.
+
+**Decode (n = 1), `DOTLLM_PQ2_PLANAR=1`:** in-process alternation, 12 reps per order, warm-up rep dropped: planar 2.39 / 5.18 / 6.30 tok/s (min/median/max, n = 12), production 1.20 / 3.30 / 4.64 (n = 12);
+adjacent planar/production pair ratio min / median / max = **0.63 / 1.45 / 2.85** (22 pairs). Separate-process pairs in quieter windows (3 reps x 6 process pairs, both orders, `-p 32 -n 32`): production 5.2-5.4 tok/s, planar 7.4-8.4 (about 1.5x); the worst planar-first process saw 1.7-2.2.
+That is below the microbench's 2.0-2.6x on the GEMV, as expected (attention, norms, the GDN layers, `lm_head` sampling and the scalar planar activation prep are unchanged); a quiet-machine number needs a re-run.
+
+**Small-n (`DOTLLM_PQ2_PLANAR_NMAX=100000`, token-blocked kernel `MatMul.PQ2PlanarBlocked.cs`, prefill tok/s, median of >= 5 reps x both orders, ratio planar / production):**
+
+| n (prompt tokens) | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|---|---|---|---|
+| planar min / med / max | 7.4 / 8.6 / 10.9 | 6.0 / 8.3 / 9.1 | 10.3 / 11.8 / 13.2 | 9.9 / 11.6 / 12.7 | 11.4 / 12.8 / 16.4 | 13.9 / 14.1 / 14.4 | 15.5 / 17.0 / 17.9 | 14.1 / 14.4 / 15.7 | 13.5 / 14.1 / 17.0 |
+| production min / med / max | 3.8 / 5.0 / 5.7 | 5.1 / 6.1 / 7.6 | 8.8 / 9.5 / 11.8 | 9.1 / 11.0 / 11.4 | 10.6 / 11.5 / 14.9 | 12.9 / 13.3 / 14.0 | 13.9 / 16.9 / 18.1 | 12.6 / 14.2 / 15.2 | 12.6 / 13.5 / 17.0 |
+| **median ratio** | **1.72** | **1.35** | **1.24** | 1.05 | 1.12 | 1.06 | 1.01 | 1.01 | 1.04 |
+
+Token blocking fixes the n >= 4 loss of the unblocked planar kernel: the weight group is decoded once per block of 4 tokens, so the blocked kernel is a clear win at n = 2..8 (the speculative-verify / MTP / short-prompt range; production's n = 2 forward costs about 1.9x its n = 1 forward because it
+re-unpacks per call), neutral from 16 up, and never loses within noise (the production kernel is compute-bound there). Default `DOTLLM_PQ2_PLANAR_NMAX = 4` (planar blocked for 2 <= n <= 4 only, production above); the table supports 16 if the default is flipped.
+
+**Quality (same model, wikitext-2 LF corpus, ctx 512, 6 windows = 1530 scored tokens, `--per-window`, default BOS):**
+
+| | PPL | max abs per-window delta vs float-activation tier | max per-window delta vs production |
+|---|---|---|---|
+| production (W2A8, Q8_0 activations) | 8.4537 | 0.0112 | - |
+| planar (blocked kernel, `NMAX=100000` so prefill exercises it) | 8.4528 | 0.0141 | 0.0136 (window 5: 10.7177 -> 10.7041, -0.13 %) |
+| float activations (`DOTLLM_PQ2_W2A8=0`, no activation quantization; the reference) | 8.4541 | - | - |
+
+Perplexity cannot see the decode GEMV itself (prefill scores via GEMM), so this run routes prefill through the same planar activation grid and per-token op order (the blocked kernel is bit-identical per token to the n = 1 GEMV, tested) to measure the grid.
+Order-noise floor: production itself differs from the float tier by up to 0.0112 PPL per window (0.1 %), and 3 of 6 windows move by more than the planar-vs-float distance, so planar's +-0.0141 sits at that floor.
+**Greedy text identity** (`dotllm run -t 0 -n 48`, 5 prompts: capital, poem, physics, code, reasoning): planar and planar-everywhere equal production on 4 of 5; on the code prompt all of planar / float differ from production at the same character (`n-1` vs `n - 1`), and **planar equals the float-activation tier there**, i.e. production's Q8_0 grid is the outlier on that near-tie.
+**Verdict:** the e2e decode win is real (about 1.45x median pair, up to 2.85x, in a contended session; about 1.5x in the quiet pairs) and quality is inside the floor. Proposal (not applied here): default-on with `DOTLLM_PQ2_PLANAR=0` as the off-switch, `NMAX` 4 to 16, after a quiet-machine decode re-run. The scalar activation prep (O(k) per call) is the next lever.
+
 # Reproducing the adapter-kernel claim ("25,126 tok/s at rank 32")
 
 The reference's `Ternary.Benchmark` "Experiment 1" times ONE `UnpackedTernaryMatrix.Forward`: a single int8 down-projection of K rows over D = 4096 (int8 activations in, K floats out). A "token" there is that one
