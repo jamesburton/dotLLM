@@ -42,7 +42,8 @@ public class DotLLMCompileCudaPtx : Task
         @"unsupported Microsoft Visual Studio version|STL1002|_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH|"
         + @"unsupported OS|targets unsupported|unsupported GNU version|unsupported clang version|"
         + @"Cannot find compiler|cl\.exe.*not (found|recognized)|Unsupported gpu architecture|"
-        + @"host_config\.h|yvals_core\.h|Microsoft Visual Studio\\[^\r\n]*\\include\\",
+        + @"host_config\.h|yvals_core\.h|Microsoft Visual Studio\\[^\r\n]*\\include\\|traditional preprocessor|"
+        + @"libcu\+\+ requires|CCCL requires",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private sealed class Toolkit
@@ -433,6 +434,9 @@ public class DotLLMCompileCudaPtx : Task
                 var args = new StringBuilder();
                 args.Append("-ptx -arch=").Append(arch).Append(' ').Append(flags);
                 if (a.Overrides) args.Append(" -allow-unsupported-compiler ").Append(StlOverride);
+                // CUDA 13's CCCL (pulled in by cooperative_groups.h) hard-errors on MSVC's traditional
+                // preprocessor; measured on CUDA 13.3 + MSVC 14.44 for every -std=c++17 kernel (#1635).
+                if (IsWindows && a.Toolkit.Version.Major >= 13) args.Append(" -Xcompiler /Zc:preprocessor");
                 if (a.Host != null && a.Host.BinDir != null) args.Append(" -ccbin \"").Append(a.Host.BinDir).Append('"');
                 args.Append(" -o \"").Append(outPtx).Append("\" \"").Append(cu).Append('"');
                 string output;
