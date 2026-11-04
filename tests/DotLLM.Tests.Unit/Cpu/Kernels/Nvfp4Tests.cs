@@ -154,7 +154,8 @@ public sealed unsafe class Nvfp4Tests
             {
                 float s = MatMul.VecDotNvfp4Q8_0Scalar(pw, pq, blocks);
                 float a = MatMul.VecDotNvfp4Q8_0Avx2(pw, pq, blocks);
-                Assert.True(Math.Abs(s - a) <= 1e-5f * Math.Max(1f, Math.Abs(s)), $"blocks {blocks}: scalar {s} vs avx2 {a}");
+                // #1587: the AVX2 dot sums the integer sub-blocks exactly and runs the scalar float recurrence, so it is bit-identical.
+                Assert.True(BitConverter.SingleToUInt32Bits(s) == BitConverter.SingleToUInt32Bits(a), $"blocks {blocks}: scalar {s} vs avx2 {a}");
             }
         }
     }
@@ -212,6 +213,64 @@ public sealed unsafe class Nvfp4Tests
                     float expected = MatMul.VecDotNvfp4Q8_0(pw + row * (k / 64) * 36, pq, k / 64);
                     Assert.Equal(expected, c[t * m + row]);
                 }
+        }
+    }
+
+    /// <summary>
+    /// #1587: the eight-row multi-column kernel (and the decode row kernel) are bit-identical to the scalar transcription for every
+    /// row count (8-row groups plus tails) and token count (below, at and above the 64-token chunk), serial and pooled. Rows and
+    /// tokens are random with extreme-magnitude activations so the unsigned-bias correction (-12·Sum q) is exercised on both signs.
+    /// </summary>
+    [Theory]
+    [InlineData(8, 64, 1, false)]
+    [InlineData(70, 192, 1, false)]
+    [InlineData(70, 192, 5, true)]
+    [InlineData(37, 320, 64, false)]
+    [InlineData(72, 256, 65, true)]
+    [InlineData(130, 128, 131, true)]
+    public void GemmNvfp4_BitIdenticalToScalar(int m, int k, int n, bool pooled)
+    {
+        var rng = new Random(m * 1009 + k * 7 + n);
+        byte[] w = RandomBlocks(rng, m * (k / 64));
+        float[] b = RandomVector(rng, n * k);
+        for (int i = 0; i < b.Length; i += 37) b[i] = (i % 2 == 0 ? 1 : -1) * 90f; // saturating |q8| = 127 values, both signs
+        float[] c = new float[n * m];
+
+        using ComputeThreadPool? pool = pooled ? new ComputeThreadPool(3) : null;
+        fixed (byte* pw = w)
+        fixed (float* pb = b, pc = c)
+            MatMul.GemmNvfp4(pw, pb, pc, m, k, n, pool);
+
+        for (int t = 0; t < n; t++)
+        {
+            byte[] q8 = Quantize(b.AsSpan(t * k, k).ToArray());
+            fixed (byte* pw = w, pq = q8)
+                for (int row = 0; row < m; row++)
+                {
+                    float expected = MatMul.VecDotNvfp4Q8_0Scalar(pw + row * (k / 64) * 36, pq, k / 64);
+                    Assert.True(BitConverter.SingleToUInt32Bits(expected) == BitConverter.SingleToUInt32Bits(c[t * m + row]),
+                        $"m{m} k{k} n{n} t{t} row{row}: scalar {expected} vs gemm {c[t * m + row]}");
+                }
+        }
+    }
+
+    [Theory]
+    [InlineData(8, 64)]
+    [InlineData(45, 192)]
+    [InlineData(64, 2048)]
+    public void ComputeRowsNvfp4_DecodeRows_BitIdenticalToScalar(int m, int k)
+    {
+        var rng = new Random(m + k);
+        byte[] w = RandomBlocks(rng, m * (k / 64));
+        byte[] q8 = Quantize(RandomVector(rng, k));
+        float[] r = new float[m];
+        fixed (byte* pw = w, pq = q8)
+        fixed (float* pr = r)
+        {
+            MatMul.ComputeRowsNvfp4(pw, pq, pr, m, k / 64);
+            for (int row = 0; row < m; row++)
+                Assert.Equal(BitConverter.SingleToUInt32Bits(MatMul.VecDotNvfp4Q8_0Scalar(pw + row * (k / 64) * 36, pq, k / 64)),
+                    BitConverter.SingleToUInt32Bits(r[row]));
         }
     }
 

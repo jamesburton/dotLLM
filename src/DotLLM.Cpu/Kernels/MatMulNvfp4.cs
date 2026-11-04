@@ -91,7 +91,7 @@ public static unsafe partial class MatMul
         Vector128<sbyte> table = Vector128.Create((sbyte)0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
         Vector128<byte> m4 = Vector128.Create((byte)0x0F);
         Vector256<short> ones = Vector256.Create((short)1);
-        Vector256<float> acc = Vector256<float>.Zero;
+        float sumf = 0;
 
         for (int ib = 0; ib < blockCount; ib++)
         {
@@ -109,20 +109,19 @@ public static unsafe partial class MatMul
             Vector256<int> p23 = Avx2.MultiplyAddAdjacent(
                 Avx2.MultiplyAddAdjacent(Avx2.Abs(w23), Avx2.Sign(q23, w23)), ones);
 
+            // Sub-block integer sums (exact, any order), then the scalar float recurrence: bit-exact with
+            // VecDotNvfp4Q8_0Scalar and with the eight-row kernel (#1587).
+            Vector256<int> h = Avx2.HorizontalAdd(p01, p23);
+            h = Avx2.HorizontalAdd(h, h); // [sb0, sb2, sb0, sb2 | sb1, sb3, sb1, sb3]
             float dy0 = HalfToSingle((byte*)y0);
             float dy1 = HalfToSingle((byte*)y1);
-            Vector256<float> s01 = Vector256.Create(
-                Vector128.Create(Dequantize.Ue4m3ToFloatHalf(x[0]) * dy0),
-                Vector128.Create(Dequantize.Ue4m3ToFloatHalf(x[1]) * dy0));
-            Vector256<float> s23 = Vector256.Create(
-                Vector128.Create(Dequantize.Ue4m3ToFloatHalf(x[2]) * dy1),
-                Vector128.Create(Dequantize.Ue4m3ToFloatHalf(x[3]) * dy1));
-
-            acc = Fma.MultiplyAdd(s01, Avx.ConvertToVector256Single(p01), acc);
-            acc = Fma.MultiplyAdd(s23, Avx.ConvertToVector256Single(p23), acc);
+            sumf += dy0 * Dequantize.Ue4m3ToFloatHalf(x[0]) * (float)h.GetElement(0);
+            sumf += dy0 * Dequantize.Ue4m3ToFloatHalf(x[1]) * (float)h.GetElement(4);
+            sumf += dy1 * Dequantize.Ue4m3ToFloatHalf(x[2]) * (float)h.GetElement(1);
+            sumf += dy1 * Dequantize.Ue4m3ToFloatHalf(x[3]) * (float)h.GetElement(5);
         }
 
-        return HorizontalSumAvx2Float(acc);
+        return sumf;
     }
 
     /// <summary>
@@ -189,15 +188,43 @@ public static unsafe partial class MatMul
                     for (int t = 0; t < n; t++)
                         QuantizeF32ToQ8_0(b + (long)t * k, q8 + (long)t * q8RowBytes, k);
 
-                var ctx = new Nvfp4GemmCtx
+                int* corr = null;
+                float* dy = null;
+                byte[]? prepRented = null;
+                if (Nvfp4Rows8Enabled)
                 {
-                    Weights = weights, InputQ8 = q8, C = c, M = m, N = n, BlockCount = blockCount,
-                    TileM = ComputeTileM(wRowBytes), WRowBytes = wRowBytes, Q8RowBytes = q8RowBytes,
-                };
-                if (pool is null || pool.ThreadCount <= 1 || m < ParallelMinRows)
-                    Nvfp4GemmRows(ref ctx, 0, m);
-                else
-                    pool.Dispatch((nint)(&ctx), &Nvfp4GemmWorker);
+                    long prepBytes = (long)n * blockCount * (4 * sizeof(int) + 2 * sizeof(float));
+                    prepRented = ArrayPool<byte>.Shared.Rent(checked((int)prepBytes + 64));
+                }
+                try
+                {
+                    fixed (byte* prep = prepRented)
+                    {
+                        if (prepRented is not null)
+                        {
+                            corr = (int*)(((nint)prep + 63) & ~(nint)63);
+                            dy = (float*)(corr + (long)n * 4 * blockCount);
+                            PrepNvfp4Activations(q8, q8RowBytes, n, blockCount, dy, corr);
+                        }
+
+                        int threads = pool is null ? 1 : pool.ThreadCount;
+                        var ctx = new Nvfp4GemmCtx
+                        {
+                            Weights = weights, InputQ8 = q8, C = c, M = m, N = n, BlockCount = blockCount,
+                            TileM = Math.Max(8, ComputeTileM(wRowBytes) & ~7), WRowBytes = wRowBytes, Q8RowBytes = q8RowBytes,
+                            Dy = dy, Corr = corr,
+                            ClaimRows = Math.Clamp((((m + 2 * threads - 1) / (2 * threads)) + 7) & ~7, 8, 64),
+                        };
+                        if (pool is null || pool.ThreadCount <= 1 || m < ParallelMinRows)
+                            Nvfp4GemmRows(ref ctx, 0, m);
+                        else
+                            pool.Dispatch((nint)(&ctx), &Nvfp4GemmWorker);
+                    }
+                }
+                finally
+                {
+                    if (prepRented is not null) ArrayPool<byte>.Shared.Return(prepRented);
+                }
             }
         }
         finally
@@ -211,11 +238,36 @@ public static unsafe partial class MatMul
     /// <paramref name="blockCount"/> blocks against one Q8_0-quantized activation. Each row is the same
     /// <see cref="VecDotNvfp4Q8_0"/> the GEMM column uses, so the result is bit-identical to <see cref="GemmNvfp4"/>.
     /// </summary>
+    [SkipLocalsInit]
     internal static void ComputeRowsNvfp4(byte* w, byte* xQ8, float* result, int m, int blockCount)
     {
-        long rowBytes = (long)blockCount * Dequantize.Nvfp4BlockBytes;
-        for (int r = 0; r < m; r++)
-            result[r] = VecDotNvfp4Q8_0(w + r * rowBytes, xQ8, blockCount);
+        if (!Nvfp4Rows8Enabled || m < 8)
+        {
+            long rowBytes = (long)blockCount * Dequantize.Nvfp4BlockBytes;
+            for (int r = 0; r < m; r++)
+                result[r] = VecDotNvfp4Q8_0(w + r * rowBytes, xQ8, blockCount);
+            return;
+        }
+
+        // One token: its dy / -12·sum(q) side data is tiny (24 bytes per NVFP4 block), recomputed per claim.
+        long bytes = (long)blockCount * (4 * sizeof(int) + 2 * sizeof(float));
+        byte[]? rented = bytes > 8192 ? ArrayPool<byte>.Shared.Rent((int)bytes) : null;
+        try
+        {
+            fixed (byte* heap = rented)
+            {
+                byte* stackBuf = stackalloc byte[8192];
+                byte* buf = rented is null ? stackBuf : heap;
+                int* corr = (int*)buf;
+                float* dy = (float*)(corr + 4 * blockCount);
+                PrepNvfp4Activations(xQ8, 2 * blockCount * Q8_0BlockBytes, 1, blockCount, dy, corr);
+                ComputeRowsNvfp4Multi(w, xQ8, 2 * blockCount * Q8_0BlockBytes, dy, corr, result, m, m, 1, blockCount);
+            }
+        }
+        finally
+        {
+            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     private struct Nvfp4GemmCtx
@@ -223,37 +275,33 @@ public static unsafe partial class MatMul
         public byte* Weights;
         public byte* InputQ8;
         public float* C;
-        public int M, N, BlockCount, TileM, WRowBytes, Q8RowBytes;
+        public float* Dy;
+        public int* Corr;
+        public int M, N, BlockCount, TileM, WRowBytes, Q8RowBytes, ClaimRows;
+        public long Next; // next unclaimed row (dynamic scheduling)
     }
 
     private static void Nvfp4GemmWorker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var ctx = ref Unsafe.AsRef<Nvfp4GemmCtx>((void*)ctxPtr);
-        PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
-        if (count == 0) return;
-        Nvfp4GemmRows(ref ctx, start, count);
+        // Dynamic claims, 8-row aligned: prefill runs on every core, E-cores included, and a static slice waits for the slowest.
+        while (true)
+        {
+            long s = Interlocked.Add(ref ctx.Next, ctx.ClaimRows) - ctx.ClaimRows;
+            if (s >= ctx.M) break;
+            Nvfp4GemmRows(ref ctx, (int)s, Math.Min(ctx.M - (int)s, ctx.ClaimRows));
+        }
     }
 
     /// <summary>Rows <c>[rowStart, rowStart + rowCount)</c> of <see cref="GemmNvfp4"/>, tiled.</summary>
     private static void Nvfp4GemmRows(ref Nvfp4GemmCtx ctx, int rowStart, int rowCount)
     {
-        bool avx2 = Nvfp4Avx2;
         int end = rowStart + rowCount;
         for (int tile = rowStart; tile < end; tile += ctx.TileM)
         {
-            int tileEnd = Math.Min(tile + ctx.TileM, end);
-            for (int t = 0; t < ctx.N; t++)
-            {
-                byte* xq = ctx.InputQ8 + (long)t * ctx.Q8RowBytes;
-                float* cRow = ctx.C + (long)t * ctx.M;
-                for (int row = tile; row < tileEnd; row++)
-                {
-                    byte* wRow = ctx.Weights + (long)row * ctx.WRowBytes;
-                    cRow[row] = avx2
-                        ? VecDotNvfp4Q8_0Avx2(wRow, xq, ctx.BlockCount)
-                        : VecDotNvfp4Q8_0Scalar(wRow, xq, ctx.BlockCount);
-                }
-            }
+            int tileRows = Math.Min(ctx.TileM, end - tile);
+            ComputeRowsNvfp4Multi(ctx.Weights + (long)tile * ctx.WRowBytes, ctx.InputQ8, ctx.Q8RowBytes, ctx.Dy, ctx.Corr,
+                ctx.C + tile, ctx.M, tileRows, ctx.N, ctx.BlockCount);
         }
     }
 }
