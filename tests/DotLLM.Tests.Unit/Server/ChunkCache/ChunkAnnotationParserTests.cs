@@ -290,19 +290,20 @@ public sealed class ChunkAnnotationParserTests
     }
 
     /// <summary>
-    /// More than 1024 chars with a surrogate pair straddling char 1024 (the checkpoint step) and a span after it: the
-    /// byte-to-char table must not split the pair, so the later span still maps to the right text.
+    /// A surrogate pair straddling char 1024 (the checkpoint step) must not be split by the byte-to-char table: a split
+    /// would count each half as a 3-byte lone surrogate (6 bytes, not 4) and skew every later checkpoint by 2 bytes, so a
+    /// span past char 2048 would map to the wrong chars. The span is the last 10 chars of a 2600-char text.
     /// </summary>
     [Fact]
     public void SurrogatePairStraddlingCheckpoint_LaterSpanAccepted()
     {
-        string text = new string('a', 1023) + "😀" + "tail" + new string('z', 100);
-        int start = Utf8(new string('a', 1023) + "😀");
-        int end = start + 4;
-        var parsed = ChunkAnnotationParser.Parse(OpenAi(OpenAiManifest(text, start, end, Sha("tail"))), On, Ns)!;
+        string prefix = new string('a', 1023) + "😀" + new string('z', 1500);
+        string text = prefix + "0123456789";
+        int start = Utf8(prefix);
+        var parsed = ChunkAnnotationParser.Parse(OpenAi(OpenAiManifest(text, start, start + 10, Sha("0123456789"))), On, Ns)!;
         Assert.Single(parsed.Spans);
-        Assert.Equal("tail", parsed.Spans[0].Text);
-        Assert.Equal(1025, parsed.Spans[0].Engine.StartChar);
+        Assert.Equal("0123456789", parsed.Spans[0].Text);
+        Assert.Equal(prefix.Length, parsed.Spans[0].Engine.StartChar);
     }
 
     // ------------------------------------------------------------------------------------------ ids, counts, chunkers
