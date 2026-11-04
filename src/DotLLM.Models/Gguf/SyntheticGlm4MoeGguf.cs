@@ -56,12 +56,19 @@ public static class SyntheticGlm4MoeGguf
     /// <param name="withQkNorm">Emit per-head <c>attn_q_norm</c>/<c>attn_k_norm</c> (GLM-4.5 355B); Air has none.</param>
     /// <param name="seed">Xorshift PRNG seed.</param>
     /// <param name="headDim">Per-head width (default 16; 128 reproduces the real Air head geometry, rope = headDim / 2).</param>
+    /// <param name="q8Weights">Store every matrix / expert bank as Q8_0 (widths 64 / 32; for GPU loaders that keep banks packed).</param>
+    /// <param name="q8AsF32">As <paramref name="q8Weights"/> but write the dequantised values as F32 (exact-weight oracle).</param>
     /// <param name="omitTensor">Tensor name to leave out (census mismatch tests).</param>
     /// <param name="wrongShapeTensor">Tensor name to emit with an extra trailing element (census shape-mismatch tests).</param>
     /// <returns>The GGUF bytes.</returns>
     public static byte[] Build(int numExperts = DefaultExperts, int trunkLayers = DefaultTrunkLayers, bool withNextn = true,
-                               bool withQkNorm = false, uint seed = 0xA1B2C3u, string? omitTensor = null, string? wrongShapeTensor = null, int headDim = HeadDim)
+                               bool withQkNorm = false, uint seed = 0xA1B2C3u, string? omitTensor = null, string? wrongShapeTensor = null, int headDim = HeadDim,
+                               bool q8Weights = false, bool q8AsF32 = false)
     {
+        // q8Weights (#1600): every matrix and expert bank is stored Q8_0 (the Vulkan loader only keeps packed banks resident, F32 banks are refused), which
+        // needs every reduction length to be a multiple of 32: the FFN widths become 64 (dense) / 32 (per expert, 64 fused shared).
+        q8Weights |= q8AsF32;
+        int denseInter = q8Weights ? 64 : DenseIntermediate, moeInter = q8Weights ? 32 : MoeIntermediate;
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(trunkLayers, LeadingDense);
         ArgumentOutOfRangeException.ThrowIfLessThan(numExperts, ExpertsUsed);
         var w = new GgufWriter();
@@ -76,7 +83,7 @@ public static class SyntheticGlm4MoeGguf
         w.AddUInt32($"{arch}.block_count", (uint)(trunkLayers + nextn));
         w.AddUInt32($"{arch}.context_length", headDim == HeadDim ? (uint)ContextLength : 512u);
         w.AddUInt32($"{arch}.embedding_length", HiddenSize);
-        w.AddUInt32($"{arch}.feed_forward_length", DenseIntermediate);
+        w.AddUInt32($"{arch}.feed_forward_length", (uint)denseInter);
         w.AddUInt32($"{arch}.attention.head_count", NumAttentionHeads);
         w.AddUInt32($"{arch}.attention.head_count_kv", NumKvHeads);
         w.AddFloat32($"{arch}.rope.freq_base", 1000000.0f);
@@ -86,7 +93,7 @@ public static class SyntheticGlm4MoeGguf
         w.AddUInt32($"{arch}.attention.value_length", (uint)headDim);
         w.AddUInt32($"{arch}.rope.dimension_count", (uint)(headDim / 2));
         w.AddUInt32($"{arch}.expert_count", (uint)numExperts);
-        w.AddUInt32($"{arch}.expert_feed_forward_length", MoeIntermediate);
+        w.AddUInt32($"{arch}.expert_feed_forward_length", (uint)moeInter);
         w.AddUInt32($"{arch}.expert_shared_count", SharedExperts);
         w.AddUInt32($"{arch}.leading_dense_block_count", LeadingDense);
         w.AddUInt32($"{arch}.expert_gating_func", 2);            // sigmoid
@@ -102,7 +109,7 @@ public static class SyntheticGlm4MoeGguf
             int extra = name == wrongShapeTensor ? 1 : 0;
             var f = new float[(long)(inK + extra) * outM];
             for (int i = 0; i < f.Length; i++) f[i] = rng.NextSigned(amp);
-            Add(w, name, [inK + extra, outM], f);
+            AddW(w, name, [inK + extra, outM], f, q8Weights, q8AsF32);
         }
         void Vec(string name, int n, float center, float amp = 0.05f)
         {
@@ -118,12 +125,12 @@ public static class SyntheticGlm4MoeGguf
             int extra = name == wrongShapeTensor ? 1 : 0;
             var f = new float[(long)(inK + extra) * mid * numExperts];
             for (int i = 0; i < f.Length; i++) f[i] = rng.NextSigned(0.4f);
-            Add(w, name, [inK + extra, mid, numExperts], f);
+            AddW(w, name, [inK + extra, mid, numExperts], f, q8Weights, q8AsF32);
         }
 
         int nq = NumAttentionHeads * headDim, nkv = NumKvHeads * headDim;
         float qkAmp = headDim == HeadDim ? 1.0f : MathF.Sqrt((float)HeadDim / headDim);   // keep attention logits at the same scale
-        int shared = MoeIntermediate * SharedExperts;
+        int shared = moeInter * SharedExperts;
 
         Mat("token_embd.weight", HiddenSize, VocabSize);
         Vec("output_norm.weight", HiddenSize, 1f);
@@ -151,18 +158,18 @@ public static class SyntheticGlm4MoeGguf
             Vec($"{p}.post_attention_norm.weight", HiddenSize, 1f);
             if (!isNextn && l < LeadingDense)
             {
-                Mat($"{p}.ffn_gate.weight", HiddenSize, DenseIntermediate);
-                Mat($"{p}.ffn_up.weight", HiddenSize, DenseIntermediate);
-                Mat($"{p}.ffn_down.weight", DenseIntermediate, HiddenSize);
+                Mat($"{p}.ffn_gate.weight", HiddenSize, denseInter);
+                Mat($"{p}.ffn_up.weight", HiddenSize, denseInter);
+                Mat($"{p}.ffn_down.weight", denseInter, HiddenSize);
             }
             else
             {
                 // Router + selection bias large enough that routing is peaky, the bias flips selections, and the sigmoid scores are not all ~0.5.
                 Mat($"{p}.ffn_gate_inp.weight", HiddenSize, numExperts, 0.6f);
                 Vec($"{p}.exp_probs_b.bias", numExperts, 0f, 0.3f);
-                Bank($"{p}.ffn_gate_exps.weight", HiddenSize, MoeIntermediate);
-                Bank($"{p}.ffn_up_exps.weight", HiddenSize, MoeIntermediate);
-                Bank($"{p}.ffn_down_exps.weight", MoeIntermediate, HiddenSize);
+                Bank($"{p}.ffn_gate_exps.weight", HiddenSize, moeInter);
+                Bank($"{p}.ffn_up_exps.weight", HiddenSize, moeInter);
+                Bank($"{p}.ffn_down_exps.weight", moeInter, HiddenSize);
                 Mat($"{p}.ffn_gate_shexp.weight", HiddenSize, shared, 0.4f);
                 Mat($"{p}.ffn_up_shexp.weight", HiddenSize, shared, 0.4f);
                 Mat($"{p}.ffn_down_shexp.weight", shared, HiddenSize, 0.4f);
@@ -192,6 +199,34 @@ public static class SyntheticGlm4MoeGguf
     {
         File.WriteAllBytes(path, Build(numExperts, trunkLayers, withNextn, withQkNorm));
         return path;
+    }
+
+    private static void AddW(GgufWriter w, string name, int[] dims, float[] values, bool q8, bool asF32)
+    {
+        if (!q8) { Add(w, name, dims, values); return; }
+        if (dims[0] % 32 != 0) throw new ArgumentException($"{name}: Q8_0 needs a reduction length multiple of 32, got {dims[0]}.");
+        var bytes = new byte[values.Length / 32 * 34];
+        for (int b = 0; b < values.Length / 32; b++)
+        {
+            float amax = 0;
+            for (int i = 0; i < 32; i++) amax = MathF.Max(amax, MathF.Abs(values[b * 32 + i]));
+            float d = amax / 127f, inv = d != 0 ? 1f / d : 0f;
+            BitConverter.TryWriteBytes(bytes.AsSpan(b * 34, 2), (Half)d);
+            for (int i = 0; i < 32; i++) bytes[b * 34 + 2 + i] = (byte)(sbyte)MathF.Round(values[b * 32 + i] * inv);
+        }
+        if (asF32)
+        {
+            // The same quantised values widened to F32: the exact-weight oracle for the Q8_0 file (activation precision is the only difference).
+            var deq = new float[values.Length];
+            for (int b = 0; b < values.Length / 32; b++)
+            {
+                float d = (float)BitConverter.ToHalf(bytes, b * 34);
+                for (int i = 0; i < 32; i++) deq[b * 32 + i] = d * (sbyte)bytes[b * 34 + 2 + i];
+            }
+            Add(w, name, dims, deq);
+            return;
+        }
+        w.AddTensor(name, dims, (uint)QuantizationType.Q8_0, bytes);
     }
 
     private static void Add(GgufWriter w, string name, int[] dims, float[] values)
