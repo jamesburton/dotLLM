@@ -600,8 +600,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
 
         // Ternary residual adapter(s) (#1616): CPU TransformerModel only; attached as the model's residual modifier.
-        var ternaryInner = new List<DotLLM.Models.Adapters.Ternary.TernaryResidualAdapter>();
-        DotLLM.Models.Adapters.Ternary.TernaryResidualAdapter? ternaryComposite = null;
+        DotLLM.Models.Adapters.Ternary.TernaryResidualHook? ternaryHook = null;
         DotLLM.Models.Architectures.TransformerModel? ternaryHost = null;
         if (settings.TernaryAdapterPaths.Length > 0)
         {
@@ -615,19 +614,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
             try
             {
-                foreach (string p in settings.TernaryAdapterPaths)
-                    ternaryInner.Add(DotLLM.Models.Adapters.Ternary.NsAdapterFile.Open(p));
-                var active = ternaryInner.Count == 1
-                    ? ternaryInner[0]
-                    : (ternaryComposite = DotLLM.Models.Adapters.Ternary.TernaryAdapterComposer.Compose(ternaryInner));
-                active.ValidateFor(config.HiddenSize, config.NumLayers);
-                ternaryHost.ResidualModifier = active;
+                ternaryHook = DotLLM.Models.Adapters.Ternary.TernaryResidualHook.Load(settings.TernaryAdapterPaths);
+                ternaryHook.ValidateFor(config.HiddenSize, config.NumLayers);
+                ternaryHost.ResidualModifier = ternaryHook;
             }
             catch (Exception ex) when (ex is InvalidDataException or InvalidOperationException or NotSupportedException or IOException)
             {
                 Console.Error.WriteLine($"--ternary-adapter: {ex.Message}");
-                ternaryComposite?.Dispose();
-                foreach (var t in ternaryInner) t.Dispose();
+                ternaryHook?.Dispose();
                 foreach (var inner in innerAdapters) inner.Dispose();
                 model.Dispose(); gguf?.Dispose(); safetensorsSource?.Dispose();
                 return 1;
@@ -1139,8 +1133,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         finally
         {
             if (ternaryHost is not null) ternaryHost.ResidualModifier = null;
-            ternaryComposite?.Dispose();
-            foreach (var t in ternaryInner) t.Dispose();
+            ternaryHook?.Dispose();
             // Dispose in reverse dependency order: composite first, then each inner adapter.
             compositeAdapter?.Dispose();
             foreach (var inner in innerAdapters)
