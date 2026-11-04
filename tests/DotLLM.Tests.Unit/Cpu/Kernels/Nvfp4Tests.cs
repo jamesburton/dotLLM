@@ -154,7 +154,8 @@ public sealed unsafe class Nvfp4Tests
             {
                 float s = MatMul.VecDotNvfp4Q8_0Scalar(pw, pq, blocks);
                 float a = MatMul.VecDotNvfp4Q8_0Avx2(pw, pq, blocks);
-                Assert.True(Math.Abs(s - a) <= 1e-5f * Math.Max(1f, Math.Abs(s)), $"blocks {blocks}: scalar {s} vs avx2 {a}");
+                // #1587: the AVX2 dot sums the integer sub-blocks exactly and runs the scalar float recurrence, so it is bit-identical.
+                Assert.True(BitConverter.SingleToUInt32Bits(s) == BitConverter.SingleToUInt32Bits(a), $"blocks {blocks}: scalar {s} vs avx2 {a}");
             }
         }
     }
@@ -213,6 +214,163 @@ public sealed unsafe class Nvfp4Tests
                     Assert.Equal(expected, c[t * m + row]);
                 }
         }
+    }
+
+    /// <summary>
+    /// #1587: the eight-row multi-column kernel (and the decode row kernel) are bit-identical to the scalar transcription for every
+    /// row count (8-row groups plus tails) and token count (below, at and above the 64-token chunk), serial and pooled. Rows and
+    /// tokens are random with extreme-magnitude activations so the unsigned-bias correction (-12·Sum q) is exercised on both signs.
+    /// </summary>
+    [Theory]
+    [InlineData(8, 64, 1, false)]
+    [InlineData(70, 192, 1, false)]
+    [InlineData(70, 192, 5, true)]
+    [InlineData(37, 320, 64, false)]
+    [InlineData(72, 256, 65, true)]
+    [InlineData(130, 128, 131, true)]
+    [InlineData(520, 2048, 70, true)]
+    public void GemmNvfp4_BitIdenticalToScalar(int m, int k, int n, bool pooled)
+    {
+        var rng = new Random(m * 1009 + k * 7 + n);
+        byte[] w = RandomBlocks(rng, m * (k / 64));
+        float[] b = RandomVector(rng, n * k);
+        for (int i = 0; i < b.Length; i += 37) b[i] = (i % 2 == 0 ? 1 : -1) * 90f; // saturating |q8| = 127 values, both signs
+        float[] c = new float[n * m];
+
+        using ComputeThreadPool? pool = pooled ? new ComputeThreadPool(3) : null;
+        fixed (byte* pw = w)
+        fixed (float* pb = b, pc = c)
+            MatMul.GemmNvfp4(pw, pb, pc, m, k, n, pool);
+
+        for (int t = 0; t < n; t++)
+        {
+            byte[] q8 = Quantize(b.AsSpan(t * k, k).ToArray());
+            fixed (byte* pw = w, pq = q8)
+                for (int row = 0; row < m; row++)
+                {
+                    float expected = MatMul.VecDotNvfp4Q8_0Scalar(pw + row * (k / 64) * 36, pq, k / 64);
+                    Assert.True(BitConverter.SingleToUInt32Bits(expected) == BitConverter.SingleToUInt32Bits(c[t * m + row]),
+                        $"m{m} k{k} n{n} t{t} row{row}: scalar {expected} vs gemm {c[t * m + row]}");
+                }
+        }
+    }
+
+    [Theory]
+    [InlineData(8, 64)]
+    [InlineData(45, 192)]
+    [InlineData(64, 2048)]
+    public void ComputeRowsNvfp4_DecodeRows_BitIdenticalToScalar(int m, int k)
+    {
+        var rng = new Random(m + k);
+        byte[] w = RandomBlocks(rng, m * (k / 64));
+        byte[] q8 = Quantize(RandomVector(rng, k));
+        float[] r = new float[m];
+        fixed (byte* pw = w, pq = q8)
+        fixed (float* pr = r)
+        {
+            MatMul.ComputeRowsNvfp4(pw, pq, pr, m, k / 64);
+            for (int row = 0; row < m; row++)
+                Assert.Equal(BitConverter.SingleToUInt32Bits(MatMul.VecDotNvfp4Q8_0Scalar(pw + row * (k / 64) * 36, pq, k / 64)),
+                    BitConverter.SingleToUInt32Bits(r[row]));
+        }
+    }
+
+    // ──────────────────── legacy summation order (DOTLLM_CPU_NVFP4_LEGACY_ORDER, #1587) ────────────────────
+
+    /// <summary>
+    /// Independent managed model of the pre-#1587 AVX2 kernel: eight float lanes (lane <c>l</c> = four consecutive elements of one
+    /// sub-block), <c>acc[l] = fma(ue4m3 · dy, (float)Σ kvalue·q, acc[l])</c> per Q8_0 half-block in order, then the
+    /// <c>(l0+l4 + l1+l5) + (l2+l6 + l3+l7)</c> horizontal sum. Written from the format, not from the kernel.
+    /// </summary>
+    private static float LegacyLaneModel(byte[] w, int wOff, byte[] q8, int blocks)
+    {
+        Span<float> acc = stackalloc float[8];
+        for (int ib = 0; ib < blocks; ib++)
+        {
+            int xb = wOff + ib * 36;
+            for (int h = 0; h < 2; h++)
+            {
+                int yb = (2 * ib + h) * 34;
+                float dy = (float)BitConverter.ToHalf(q8, yb);
+                for (int l = 0; l < 8; l++)
+                {
+                    int sb = 2 * h + l / 4;
+                    int p = 0;
+                    for (int e = 0; e < 4; e++)
+                    {
+                        int j = 4 * (l % 4) + e;                       // element within the sub-block
+                        byte qv = j < 8 ? w[xb + 4 + 8 * sb + j] : w[xb + 4 + 8 * sb + j - 8];
+                        int kv = KValues[j < 8 ? qv & 0xF : qv >> 4];
+                        p += kv * (sbyte)q8[yb + 2 + (sb % 2) * 16 + j];
+                    }
+                    float s = Dequantize.Ue4m3ToFloatHalf(w[xb + sb]) * dy;
+                    acc[l] = MathF.FusedMultiplyAdd(s, (float)p, acc[l]);
+                }
+            }
+        }
+        return (acc[0] + acc[4] + (acc[1] + acc[5])) + (acc[2] + acc[6] + (acc[3] + acc[7]));
+    }
+
+    private static bool Avx2Fma => System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported;
+
+    [SkippableTheory]
+    [InlineData(19, 2048, 3, false)]
+    [InlineData(37, 1024, 70, true)]
+    public void GemmNvfp4_LegacyOrder_ReproducesOldLaneFmaBits(int m, int k, int n, bool pooled)
+    {
+        Skip.IfNot(Avx2Fma);
+        var rng = new Random(m * 17 + k + n);
+        byte[] w = RandomBlocks(rng, m * (k / 64));
+        float[] b = RandomVector(rng, n * k);
+        float[] c = new float[n * m];
+        using ComputeThreadPool? pool = pooled ? new ComputeThreadPool(3) : null;
+        fixed (byte* pw = w)
+        fixed (float* pb = b, pc = c)
+            MatMul.GemmNvfp4(pw, pb, pc, m, k, n, pool, null, legacyOrder: true);
+
+        for (int t = 0; t < n; t++)
+        {
+            byte[] q8 = Quantize(b.AsSpan(t * k, k).ToArray());
+            for (int row = 0; row < m; row++)
+            {
+                float expected = LegacyLaneModel(w, row * (k / 64) * 36, q8, k / 64);
+                Assert.True(BitConverter.SingleToUInt32Bits(expected) == BitConverter.SingleToUInt32Bits(c[t * m + row]),
+                    $"t{t} row{row}: legacy model {expected} vs gemm {c[t * m + row]}");
+            }
+        }
+    }
+
+    [SkippableFact]
+    public void GemmNvfp4_LegacyOrder_DiffersFromDefaultOrder_AndDefaultIsScalarOrder()
+    {
+        Skip.IfNot(Avx2Fma);
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_CPU_NVFP4_LEGACY_ORDER") == "1", "legacy order forced for the whole process");
+        const int m = 64, k = 2048, n = 16;
+        var rng = new Random(1587);
+        byte[] w = RandomBlocks(rng, m * (k / 64));
+        float[] b = RandomVector(rng, n * k);
+        float[] legacy = new float[n * m], current = new float[n * m], dflt = new float[n * m];
+        fixed (byte* pw = w)
+        fixed (float* pb = b, pl = legacy, pn = current, pd = dflt)
+        {
+            MatMul.GemmNvfp4(pw, pb, pl, m, k, n, null, null, legacyOrder: true);
+            MatMul.GemmNvfp4(pw, pb, pn, m, k, n, null, null, legacyOrder: false);
+            MatMul.GemmNvfp4(pw, pb, pd, m, k, n, null);
+        }
+
+        int differing = 0;
+        for (int i = 0; i < legacy.Length; i++)
+        {
+            Assert.Equal(BitConverter.SingleToUInt32Bits(current[i]), BitConverter.SingleToUInt32Bits(dflt[i])); // default == new order
+            if (BitConverter.SingleToUInt32Bits(legacy[i]) != BitConverter.SingleToUInt32Bits(current[i])) differing++;
+        }
+
+        // A no-op toggle would give 0; real-magnitude data at k = 2048 makes the two float orders disagree in many cells.
+        Assert.True(differing >= legacy.Length / 10, $"legacy and default orders differ in only {differing}/{legacy.Length} cells");
+        // The default is the scalar order (checked cell by cell above for 'current'; spot-check the scalar transcription too).
+        byte[] q8 = Quantize(b.AsSpan(0, k).ToArray());
+        fixed (byte* pw = w, pq = q8)
+            Assert.Equal(BitConverter.SingleToUInt32Bits(MatMul.VecDotNvfp4Q8_0Scalar(pw, pq, k / 64)), BitConverter.SingleToUInt32Bits(current[0]));
     }
 
     [Fact]
