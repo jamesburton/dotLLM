@@ -101,7 +101,7 @@ Decode (n = 1), per-call median over 8 reps, weights-only GB/s; stream-read roof
 
 | shape (m x k) | threads | prod | K2 256 | K2 512 | K3 planar | roofline |
 |---|---|---|---|---|---|---|
-| 17408x5120 (ffn gate/up) | 16 | 0.658 ms 36 GB/s | 1.02x... see raw: 0.98x | 1.21x | **2.16x** (77.7 GB/s) | 105 GB/s |
+| 17408x5120 (ffn gate/up) | 16 | 0.658 ms 36 GB/s | 0.98x | 1.21x | **2.16x** (77.7 GB/s) | 105 GB/s |
 | 5120x17408 (ffn down) | 16 | 0.807 ms 29 GB/s | 1.18x | 1.46x | **2.33x** (68 GB/s) | 113 GB/s |
 | 248320x5120 (lm_head) | 16 | 9.58 ms 35 GB/s | 1.06x | 1.47x | **2.56x** (90 GB/s) | 99 GB/s |
 | same three | 1 | 4.2 / 3.9 / 4.3 GB/s | 1.02 / 1.06 / 1.03x | 1.30 / 1.31 / 1.28x | **2.73 / 2.76 / 2.69x** | 34-37 GB/s |
