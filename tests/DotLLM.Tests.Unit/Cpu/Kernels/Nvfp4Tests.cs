@@ -130,21 +130,21 @@ public sealed unsafe class Nvfp4Tests
     [SkippableFact]
     public void VecDotAvx2_MatchesLlamaCppVecDot_RealBoltBlocks()
     {
-        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported);
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Avx2 && DotLLM.Cpu.CpuFeatures.Fma);
         AssertDot(OracleRealDotBits, OracleRealBlocks, OracleRealQ8, avx2: true);
     }
 
     [SkippableFact]
     public void VecDotAvx2_MatchesLlamaCppVecDot_EdgeScaleBlocks()
     {
-        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported);
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Avx2 && DotLLM.Cpu.CpuFeatures.Fma);
         AssertDot(OracleCraftedDotBits, OracleCraftedBlocks, OracleCraftedQ8, avx2: true);
     }
 
     [SkippableFact]
     public void VecDotAvx2_MatchesScalar_RandomRows()
     {
-        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported);
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Avx2 && DotLLM.Cpu.CpuFeatures.Fma);
         var rng = new Random(1038);
         foreach (int blocks in new[] { 1, 2, 3, 64, 128 })
         {
@@ -311,7 +311,7 @@ public sealed unsafe class Nvfp4Tests
         return (acc[0] + acc[4] + (acc[1] + acc[5])) + (acc[2] + acc[6] + (acc[3] + acc[7]));
     }
 
-    private static bool Avx2Fma => System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported;
+    private static bool Avx2Fma => DotLLM.Cpu.CpuFeatures.Avx2 && DotLLM.Cpu.CpuFeatures.Fma;
 
     [SkippableTheory]
     [InlineData(19, 2048, 3, false)]

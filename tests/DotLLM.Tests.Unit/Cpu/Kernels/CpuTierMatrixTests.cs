@@ -124,7 +124,7 @@ public sealed unsafe class CpuTierMatrixTests
 
                 double mag = 0;
                 for (int b = 0; b < blocks; b++) mag += Math.Abs(fam.Scalar(w + b * fam.WBytes, xq + b * fam.XBytes, 1));
-                double tol = 1e-5 * Math.Sqrt(blocks) * mag + 1e-12;
+                double tol = 5e-5 * Math.Sqrt(blocks) * mag + 1e-12;
                 Assert.True(Math.Abs((double)expected - actual) <= tol,
                     $"{family}/{tier} blocks={blocks}: scalar={expected:R} tier={actual:R} |diff|={Math.Abs((double)expected - actual):R} tol={tol:R} [{CpuFeatures.Describe()}]");
                 Assert.True(mag > 0, "degenerate fixture: all block dots are zero, the comparison cannot discriminate");

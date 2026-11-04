@@ -39,7 +39,7 @@ public sealed unsafe class W2A8SseTierTests
     [InlineData(5120)]
     public void UnpackPQ2_0RowI8_Sse_MatchesScalar_ByteExact(int k)
     {
-        Skip.IfNot(Sse2.IsSupported, "needs SSE2");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Sse2, "needs SSE2");
         var rng = new Random(477_000 + k);
         int groups = k / 128;
         byte* row = RandomPQ2_0Row(rng, groups);
@@ -54,7 +54,7 @@ public sealed unsafe class W2A8SseTierTests
             AssertBytesEqual(expected, actual, k);
             for (int g = 0; g < groups; g++) Assert.Equal(gsExpected[g], gsActual[g]);
 
-            if (Avx2.IsSupported)
+            if (DotLLM.Cpu.CpuFeatures.Avx2)
             {
                 // The pre-existing AVX2 unpack must agree with the same scalar reference.
                 MatMul.UnpackPQ2_0RowI8Avx2(row, actual, gsActual, k);
@@ -75,7 +75,7 @@ public sealed unsafe class W2A8SseTierTests
     [InlineData(6912)]
     public void UnpackI2SRowI8_Sse_MatchesScalar_ByteExact(int k)
     {
-        Skip.IfNot(Sse2.IsSupported, "needs SSE2");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Sse2, "needs SSE2");
         var rng = new Random(477_100 + k);
         int bytes = k / 4;
         byte* row = (byte*)NativeMemory.Alloc((nuint)bytes);
@@ -88,7 +88,7 @@ public sealed unsafe class W2A8SseTierTests
             MatMul.UnpackRowI8Sse(row, actual, k);
             AssertBytesEqual(expected, actual, k);
 
-            if (Avx2.IsSupported)
+            if (DotLLM.Cpu.CpuFeatures.Avx2)
             {
                 MatMul.UnpackRowI8Avx2(row, actual, k);
                 AssertBytesEqual(expected, actual, k);
@@ -107,7 +107,7 @@ public sealed unsafe class W2A8SseTierTests
     [InlineData(136)]   // Bonsai-27B ffn (17408)
     public void VecDotPQ2_0Q8_Sse_MatchesExactReference(int groups)
     {
-        Skip.IfNot(Ssse3.IsSupported, "needs SSSE3");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Ssse3, "needs SSSE3");
         var rng = new Random(477_200 + groups);
         int k = groups * 128;
         int blocks = k / Q8Block;
@@ -124,7 +124,7 @@ public sealed unsafe class W2A8SseTierTests
             float sse = MatMul.VecDotPQ2_0Q8Sse(w, gs, xQ8, xs, blocks);
             AssertTight(exact, mag, sse, "SSE vs exact");
 
-            if (Avx2.IsSupported)
+            if (DotLLM.Cpu.CpuFeatures.Avx2)
             {
                 float avx2 = MatMul.VecDotPQ2_0Q8Avx2(w, gs, xQ8, xs, blocks);
                 AssertTight(exact, mag, avx2, "AVX2 vs exact");
@@ -142,7 +142,7 @@ public sealed unsafe class W2A8SseTierTests
     [InlineData(216)]   // BitNet-2B ffn (6912)
     public void VecDotI2SQ8_Sse_MatchesExactReference(int blocks)
     {
-        Skip.IfNot(Ssse3.IsSupported, "needs SSSE3");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Ssse3, "needs SSSE3");
         var rng = new Random(477_300 + blocks);
         int k = blocks * Q8Block;
 
@@ -155,7 +155,7 @@ public sealed unsafe class W2A8SseTierTests
             float sse = MatMul.VecDotI2SQ8Sse(w, xQ8, xs, blocks);
             AssertTight(exact, mag, sse, "SSE vs exact");
 
-            if (Avx2.IsSupported)
+            if (DotLLM.Cpu.CpuFeatures.Avx2)
             {
                 float avx2 = MatMul.VecDotI2SQ8Avx2(w, xQ8, xs, blocks);
                 AssertTight(exact, mag, avx2, "AVX2 vs exact");
@@ -172,7 +172,7 @@ public sealed unsafe class W2A8SseTierTests
     [SkippableFact]
     public void VecDotPQ2_0Q8_Sse_ExtremeOperands_Exact()
     {
-        Skip.IfNot(Ssse3.IsSupported, "needs SSSE3");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Ssse3, "needs SSSE3");
         const int groups = 2;
         const int k = groups * 128;
         const int blocks = k / Q8Block;
@@ -213,7 +213,7 @@ public sealed unsafe class W2A8SseTierTests
     [InlineData(9, 256, 4)]
     public void PQ2_0_Dispatch_MatchesExactW2A8Reference(int m, int k, int n)
     {
-        Skip.IfNot(Ssse3.IsSupported, "needs SSSE3");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Ssse3, "needs SSSE3");
         Skip.If(Environment.GetEnvironmentVariable("DOTLLM_PQ2_W2A8") is "0" or "false" or "off",
             "W2A8 disabled by DOTLLM_PQ2_W2A8");
         var rng = new Random(477_400 + m * 31 + k + n);
@@ -265,7 +265,7 @@ public sealed unsafe class W2A8SseTierTests
     [InlineData(9, 384, 5)]     // exercises the 4x4 tile + remainders on AVX2, per-cell on SSE
     public void I2S_Dispatch_MatchesExactW2A8Reference(int m, int k, int n)
     {
-        Skip.IfNot(Ssse3.IsSupported, "needs SSSE3");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Ssse3, "needs SSSE3");
         Skip.If(Environment.GetEnvironmentVariable("DOTLLM_I2S_W2A8") is "0" or "false" or "off",
             "W2A8 disabled by DOTLLM_I2S_W2A8");
         var rng = new Random(477_500 + m * 31 + k + n);
@@ -318,7 +318,7 @@ public sealed unsafe class W2A8SseTierTests
     [InlineData("i2s", 101, 256, 6)]   // 4x4 tile + token remainder on AVX2; per-cell on SSE
     public void Pooled_MatchesSingleThreaded_BitExact(string format, int m, int k, int n)
     {
-        Skip.IfNot(Ssse3.IsSupported, "needs SSSE3");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Ssse3, "needs SSSE3");
         var rng = new Random(477_600 + m + k + n);
         bool pq2 = format == "pq2";
         long wBytes = pq2 ? (long)m * (k / 128) * 34 : (long)m * k / 4 + 4;

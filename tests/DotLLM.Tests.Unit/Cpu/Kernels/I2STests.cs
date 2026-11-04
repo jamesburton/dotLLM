@@ -211,7 +211,7 @@ public sealed unsafe class I2STests
 
             // Mirror MatMul's own gate: SSSE3 support (issue #477 added a 128-bit tier) AND the
             // DOTLLM_I2S_W2A8 override.
-            bool w2a8Active = System.Runtime.Intrinsics.X86.Ssse3.IsSupported
+            bool w2a8Active = DotLLM.Cpu.CpuFeatures.Ssse3
                 && Environment.GetEnvironmentVariable("DOTLLM_I2S_W2A8") is not ("0" or "false" or "off");
 
             if (w2a8Active)

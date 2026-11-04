@@ -34,7 +34,7 @@ public sealed unsafe class LegacyQuantDotTests
     private readonly ITestOutputHelper _output;
     public LegacyQuantDotTests(ITestOutputHelper output) => _output = output;
 
-    private static bool SseTierDispatched => Ssse3.IsSupported && !Avx2.IsSupported;
+    private static bool SseTierDispatched => DotLLM.Cpu.CpuFeatures.Ssse3 && !DotLLM.Cpu.CpuFeatures.Avx2;
 
     public static TheoryData<QuantizationType> Formats
     {
@@ -108,9 +108,9 @@ public sealed unsafe class LegacyQuantDotTests
                 Assert.True(Math.Abs(exact) < (1 << 24), $"oracle {exact} outside exact-float range");
 
                 Assert.Equal((float)exact, MatMul.VecDotLegacyQuantScalar(qt, row, x, blockCount));
-                if (Ssse3.IsSupported)
+                if (DotLLM.Cpu.CpuFeatures.Ssse3)
                     Assert.Equal((float)exact, SseDot(qt, row, x, blockCount));
-                if (Avx2.IsSupported)
+                if (DotLLM.Cpu.CpuFeatures.Avx2)
                     Assert.Equal((float)exact, Avx2Dot(qt, row, x, blockCount));
             }
 
@@ -133,7 +133,7 @@ public sealed unsafe class LegacyQuantDotTests
     [MemberData(nameof(FormatsAndBlockCounts))]
     public void Sse128Tier_BitExactWithScalar(QuantizationType qt, int blockCount)
     {
-        Skip.IfNot(Ssse3.IsSupported, "needs SSSE3");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Ssse3, "needs SSSE3");
         var rng = new Random(4900 + (int)qt * 31 + blockCount);
         int blockBytes = BlockBytes(qt);
         byte* w = (byte*)NativeMemory.Alloc((nuint)(blockCount * blockBytes));
@@ -154,7 +154,7 @@ public sealed unsafe class LegacyQuantDotTests
             AssertBitEqual(MatMul.VecDotLegacyQuantScalar(qt, w, xq, blockCount),
                 SseDot(qt, w, xq, blockCount), $"{qt} quantized bc={blockCount}");
 
-            if (Avx2.IsSupported)
+            if (DotLLM.Cpu.CpuFeatures.Avx2)
             {
                 float s = SseDot(qt, w, xq, blockCount);
                 float a = Avx2Dot(qt, w, xq, blockCount);
@@ -173,7 +173,7 @@ public sealed unsafe class LegacyQuantDotTests
     [MemberData(nameof(FormatsAndBlockCounts))]
     public void Sse128Tier_4Rows_BitExactWithScalarPerRow(QuantizationType qt, int blockCount)
     {
-        Skip.IfNot(Ssse3.IsSupported, "needs SSSE3");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Ssse3, "needs SSSE3");
         var rng = new Random(4910 + (int)qt * 31 + blockCount);
         int rowBytes = blockCount * BlockBytes(qt);
         byte* w = (byte*)NativeMemory.Alloc((nuint)(4 * rowBytes));
@@ -203,7 +203,7 @@ public sealed unsafe class LegacyQuantDotTests
     [MemberData(nameof(FormatsAndBlockCounts))]
     public void Avx2Tier_4Rows_BitExactWithScalarPerRow(QuantizationType qt, int blockCount)
     {
-        Skip.IfNot(Avx2.IsSupported, "needs AVX2");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Avx2, "needs AVX2");
         var rng = new Random(4915 + (int)qt * 31 + blockCount);
         int rowBytes = blockCount * BlockBytes(qt);
         byte* w = (byte*)NativeMemory.Alloc((nuint)(4 * rowBytes));
@@ -219,7 +219,7 @@ public sealed unsafe class LegacyQuantDotTests
                 AssertBitEqual(MatMul.VecDotLegacyQuantScalar(qt, w + r * rowBytes, x, blockCount), res[r],
                     $"{qt} AVX2 4-rows r={r} bc={blockCount}");
 
-            if (Ssse3.IsSupported)
+            if (DotLLM.Cpu.CpuFeatures.Ssse3)
             {
                 float* sseRes = stackalloc float[4];
                 MatMul.VecDotLegacyQuantSse_4Rows(qt, w, rowBytes, x, blockCount, sseRes);
@@ -237,7 +237,7 @@ public sealed unsafe class LegacyQuantDotTests
     [MemberData(nameof(FormatsAndBlockCounts))]
     public void Avx2Tier_8Rows_BitExactWithScalarPerRow(QuantizationType qt, int blockCount)
     {
-        Skip.IfNot(Avx2.IsSupported, "needs AVX2");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Avx2, "needs AVX2");
         Skip.IfNot(qt is QuantizationType.Q4_0 or QuantizationType.Q4_1, "8-row kernel covers Q4_0/Q4_1");
         var rng = new Random(81159 + (int)qt * 31 + blockCount);
         int rowBytes = blockCount * BlockBytes(qt);
@@ -269,7 +269,7 @@ public sealed unsafe class LegacyQuantDotTests
     [InlineData(QuantizationType.Q4_1, 24, 16, 9)]
     public void Q4Multi_BitExactWithScalarPerColumn(QuantizationType qt, int m, int blockCount, int n)
     {
-        Skip.IfNot(Avx2.IsSupported, "needs AVX2");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Avx2, "needs AVX2");
         var rng = new Random(91159 + (int)qt * 7 + m + n);
         int rowBytes = blockCount * BlockBytes(qt), xRowBytes = blockCount * Q81Bytes;
         byte* w = (byte*)NativeMemory.Alloc((nuint)(m * rowBytes));
@@ -338,7 +338,7 @@ public sealed unsafe class LegacyQuantDotTests
     [InlineData(QuantizationType.IQ4_NL, 13, 5)]
     public void Dispatch_MatchesScalarPerRow(QuantizationType qt, int m, int blockCount)
     {
-        _output.WriteLine($"ISA: SSSE3={Ssse3.IsSupported} AVX={Avx.IsSupported} AVX2={Avx2.IsSupported} " +
+        _output.WriteLine($"ISA: SSSE3={DotLLM.Cpu.CpuFeatures.Ssse3} AVX={Avx.IsSupported} AVX2={DotLLM.Cpu.CpuFeatures.Avx2} " +
                           $"-> SSE tier dispatched: {SseTierDispatched}");
         var rng = new Random(4930 + (int)qt * 131 + m);
         int k = blockCount * 32, rowBytes = blockCount * BlockBytes(qt), xRowBytes = blockCount * Q81Bytes;
@@ -455,7 +455,7 @@ public sealed unsafe class LegacyQuantDotTests
 
             // And the policy helper: n == 1 must take the packed path; n > 1 the dequant one, except Q4_0/Q4_1 on AVX2, whose
             // exact multi-column kernel is packed at every n (#1159).
-            bool packedAtAnyN = MatMul.Q4PackedAllColumns && Avx2.IsSupported
+            bool packedAtAnyN = MatMul.Q4PackedAllColumns && DotLLM.Cpu.CpuFeatures.Avx2
                 && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1;
             Assert.True(MatMul.UsesPackedLegacyDot(qt, 1));
             Assert.Equal(packedAtAnyN, MatMul.UsesPackedLegacyDot(qt, 2));

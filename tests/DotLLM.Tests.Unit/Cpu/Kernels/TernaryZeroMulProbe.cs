@@ -100,7 +100,7 @@ public sealed unsafe class TernaryZeroMulProbe
     public void K2_And_K3_MatchTheirOracles(int k, int m, int n)
     {
         // The probe kernels are AVX2-only experiments (not production code); the production planar kernel has its own all-ISA test below.
-        Skip.IfNot(Avx2.IsSupported, "probe kernels need AVX2");
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Avx2, "probe kernels need AVX2");
         var rng = new Random(1616 + k);
         byte[] w = RandomPq2Rows(rng, m, k);
         var x = new float[n * k];
@@ -134,7 +134,7 @@ public sealed unsafe class TernaryZeroMulProbe
                     }
                 }
             }
-            if (Avx512Vbmi.IsSupported && Avx512BW.IsSupported)
+            if (Avx512Vbmi.IsSupported && DotLLM.Cpu.CpuFeatures.Avx512Bw)
             {
                 TernaryMaskedProbeKernels.K2Rows512(bp, xqp, xsp, c2w, m, 0, m, k, n);
                 TernaryMaskedProbeKernels.K2Rows256(bp, xqp, xsp, c2, m, 0, m, k, n, false);
@@ -182,7 +182,9 @@ public sealed unsafe class TernaryZeroMulProbe
         Assert.True(Err(cSc) < 0.02, $"scalar planar rel-RMS error {Err(cSc)}");
         for (int r = 0; r < m; r++) Assert.InRange(Math.Abs(cSc[r] - cPl[r]), 0, 2e-4 * (1 + Math.Abs(cSc[r])));   // AVX2 vs scalar: float-rounding only
         Assert.True(Err(cPl) < 0.02, $"planar rel-RMS error {Err(cPl)}");
-        Assert.True(Err(cPl) < 3 * Err(cProd) + 1e-4, $"planar {Err(cPl)} vs production {Err(cProd)}");
+        // Only meaningful where production also quantizes activations to int8 (the SIMD tiers): the scalar production GEMV keeps F32 activations (#1623).
+        if (DotLLM.Cpu.CpuFeatures.Avx2)
+            Assert.True(Err(cPl) < 3 * Err(cProd) + 1e-4, $"planar {Err(cPl)} vs production {Err(cProd)}");
         // Perturbation proof the planar path really ran: a different quantization grid cannot be bit-identical to Q8_0.
         Assert.NotEqual(cProd, cPl);
     }
@@ -289,7 +291,7 @@ public sealed unsafe class TernaryZeroMulProbe
     private static IEnumerable<bool> VnniModes()
     {
         yield return false;
-        if (AvxVnni.IsSupported) yield return true;
+        if (DotLLM.Cpu.CpuFeatures.AvxVnni) yield return true;
     }
 
     // ------------------------------------------------------------------ timing harness (opt-in) ----
@@ -343,7 +345,7 @@ public sealed unsafe class TernaryZeroMulProbe
         int threads = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_TERNARY_PROBE_THREADS"), out int th) ? th : Environment.ProcessorCount / 2;
         int reps = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_TERNARY_PROBE_REPS"), out int rp) ? rp : 8;
         using var pool = new ComputeThreadPool(threads);
-        _out.WriteLine($"ISA: Avx2={Avx2.IsSupported} AvxVnni={AvxVnni.IsSupported} Avx512BW={Avx512BW.IsSupported} Vbmi={Avx512Vbmi.IsSupported}; pool threads={pool.ThreadCount}; reps={reps}");
+        _out.WriteLine($"ISA: Avx2={DotLLM.Cpu.CpuFeatures.Avx2} AvxVnni={DotLLM.Cpu.CpuFeatures.AvxVnni} Avx512BW={DotLLM.Cpu.CpuFeatures.Avx512Bw} Vbmi={Avx512Vbmi.IsSupported}; pool threads={pool.ThreadCount}; reps={reps}");
 
         var groupsByShape = gguf.Tensors.Where(t => t.QuantizationType == QuantizationType.PQ2_0 && t.Shape.Rank == 2)
             .GroupBy(t => (m: t.Shape[1], k: t.Shape[0])).OrderByDescending(g => g.Count() * (long)g.Key.m * g.Key.k).ToList();
@@ -407,8 +409,8 @@ public sealed unsafe class TernaryZeroMulProbe
                     TernaryMaskedProbeKernels.RepackToBitmask34(wsrc, bp, m, k, out _);
                     TernaryMaskedProbeKernels.PrepQ8Contiguous(xp, 1, k, xqp, xsp);
                     TernaryMaskedProbeKernels.PrepPlanar(xp, 1, k, pqp, psp, pcp);
-                    TernaryMaskedProbeKernels.K2Rows256(bp, xqp, xsp, c2, m, 0, m, k, 1, AvxVnni.IsSupported);
-                    TernaryMaskedProbeKernels.K3Rows(wsrc, pqp, psp, pcp, c3, m, 0, m, k, 1, AvxVnni.IsSupported);
+                    TernaryMaskedProbeKernels.K2Rows256(bp, xqp, xsp, c2, m, 0, m, k, 1, DotLLM.Cpu.CpuFeatures.AvxVnni);
+                    TernaryMaskedProbeKernels.K3Rows(wsrc, pqp, psp, pcp, c3, m, 0, m, k, 1, DotLLM.Cpu.CpuFeatures.AvxVnni);
                 }
                 double rms = Math.Sqrt(truth.Sum(v => v * v) / m);
                 double E(float[] c) => Math.Sqrt(Enumerable.Range(0, m).Sum(i => Math.Pow(c[i] - truth[i], 2)) / m) / rms;
@@ -470,8 +472,8 @@ public sealed unsafe class TernaryZeroMulProbe
             TernaryMaskedProbeKernels.PrepQ8Contiguous(x, n, k, xq, xs);
             TernaryMaskedProbeKernels.PrepPlanar(x, n, k, pq, ps, pc);
             ComputeThreadPool? pl = threads == 1 ? null : pool;
-            bool vnni = AvxVnni.IsSupported;
-            bool has512 = Avx512Vbmi.IsSupported && Avx512BW.IsSupported;
+            bool vnni = DotLLM.Cpu.CpuFeatures.AvxVnni;
+            bool has512 = Avx512Vbmi.IsSupported && DotLLM.Cpu.CpuFeatures.Avx512Bw;
 
             // kernels: id -> action over rotation slot r
             var names = new List<string> { "prod GemmPQ2_0 (unpack+sign dot)", "K2 mask add/sub 256", "K3 planar-offset 256" };
