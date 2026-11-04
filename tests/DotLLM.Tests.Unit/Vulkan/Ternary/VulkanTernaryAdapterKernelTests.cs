@@ -89,6 +89,10 @@ public sealed class VulkanTernaryAdapterKernelTests
     internal static void AssertBitEqual(float[] expected, float[] actual, string ctx)
     {
         Assert.Equal(expected.Length, actual.Length);
+        if (Environment.GetEnvironmentVariable("DOTLLM_TERNARY_DIFFDUMP") == "1")
+            for (int i = 0; i < expected.Length; i++)
+                if (BitConverter.SingleToInt32Bits(expected[i]) != BitConverter.SingleToInt32Bits(actual[i]))
+                    Console.Error.WriteLine($"DIFF {ctx} i={i} cpu={expected[i]:R} gpu={actual[i]:R} ulps={BitConverter.SingleToInt32Bits(expected[i]) - BitConverter.SingleToInt32Bits(actual[i])}");
         for (int i = 0; i < expected.Length; i++)
             if (BitConverter.SingleToInt32Bits(expected[i]) != BitConverter.SingleToInt32Bits(actual[i]))
                 Assert.Fail($"{ctx}: element {i}: cpu {expected[i]:R} gpu {actual[i]:R}");

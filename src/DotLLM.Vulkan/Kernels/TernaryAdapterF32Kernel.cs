@@ -93,7 +93,7 @@ public sealed class TernaryAdapterF32Kernel : IDisposable
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, pipe.Layout, 0, 1, set, 0, 0);
         Span<uint> pc = stackalloc uint[8]
         {
-            (uint)d, (uint)nRows, (uint)nCirc, (uint)totalRank, (uint)WordsPerRow(d), (uint)upScaleBase, (uint)upScaleStride, 0u,
+            (uint)d, (uint)nRows, (uint)nCirc, (uint)totalRank, (uint)WordsPerRow(d), (uint)upScaleBase, (uint)upScaleStride, 127u,
         };
         fixed (uint* p = pc)
             VulkanApi.vkCmdPushConstants(cmdBuf, pipe.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)p);

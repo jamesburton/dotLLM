@@ -46,7 +46,7 @@ layout(push_constant) uniform PC {
     uint wprU;           // uints per mask row = ceil(d/64) * 4
     uint upScaleBase;    // scale-element index of circuit 0's upScale
     uint upScaleStride;  // scale elements between circuits' upScale arrays
-    uint pad0;
+    uint q127;           // 127, supplied at runtime so the compiler cannot rewrite m/127 as m*(1/127)
 } pc;
 
 // x8 with a +1 pad per 64-column block: the down projection has 64 lanes reading column (b*64 + i) for b = lane,
@@ -163,7 +163,7 @@ void main() {
                     precise float v = rj[off + j] * qsc;
                     qv[off + j] = clamp(int(roundEven(v)), -128, 127);
                 }
-                precise float dqf = divRN(m, 127.0) * alpha;
+                precise float dqf = divRN(m, float(pc.q127)) * alpha;
                 dq = dqf;
                 open = 1;
             }
