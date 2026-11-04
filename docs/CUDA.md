@@ -587,7 +587,40 @@ and 13.3; MSVC 14.29, 14.44 and 14.51)** — `ternary_adapter_residual_f32.cu`:
 | 12.4 | 14.51 | both overrides | ✗ MSVC `type_traits` static assertions (overrides cannot rescue 12.x on VS 2026) |
 | 12.1 | 14.44 | — | ✗ unsupported Visual Studio version |
 
-PIN_EVIDENCE_PLACEHOLDER
+CUDA 13.x on MSVC also needs `-Xcompiler /Zc:preprocessor` for every `-std=c++17` /
+`cooperative_groups` kernel (`attention_f32`, `gated_delta_net_scan`, the split/hd256 flash kernels).
+Without it, CCCL stops with "MSVC/cl.exe with traditional preprocessor is used". The task adds the flag for
+CUDA ≥ 13 automatically.
+
+**Pinning, tested on all 81 kernels** (2026-11-04): each kernel was compiled with CUDA 13.3 + MSVC 14.44
+(`.version 9.3`) and its header rewritten to `.version 8.4`.
+- ptxas from CUDA **12.4**, a genuinely older toolchain and the same check an older driver's JIT makes,
+  assembled **81/81**. 13.3's ptxas agreed on all 81.
+- The RTX 3060 (driver 621.01) loaded **81/81** with `cuModuleLoadData`, and all 309 entry points resolved.
+- Both controls are sensitive:
+  - The unpinned 9.3 files are rejected by 12.4's ptxas (81/81).
+  - Rewriting to `.version 6.0`, below sm_75's minimum ISA, is rejected by ptxas (81/81) and by the driver
+    (81/81, `CUDA_ERROR_INVALID_PTX` 218).
+  - A `.version 9.9` header fails to load with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (222).
+
+  So both tools enforce the declared version.
+
+**MSBuild modes, tested end to end on framework** (new untracked `ternary_adapter_residual_f32.cu`, no PTX;
+session `CUDA_PATH` = 13.1):
+
+| run | resolved to | PTX |
+|---|---|---|
+| default | CUDA 13.1 (`CUDA_PATH`) + MSVC 14.44 | 9.1 → pinned 8.7, ptxas-validated |
+| `compile` + `strict` | walked past 13.1/13.3/13.0 (all above 8.7) to CUDA 12.4 | native 8.4 |
+| toolkit 13.1 + `DotLLMMsvcBinDir`=14.51 (the original failure) | escalated to the override flags, warned | 9.1 → pinned 8.7 |
+| toolkit 13.3 + `native` | 13.3 | 9.3 kept, warned |
+| toolkit 13.3 + `strict`, `auto` | nothing ≤ 8.7 | last resort: 9.3 written with "DO NOT COMMIT" warning |
+| `committed` | no nvcc | warning: kernel unavailable |
+| unmodified `rmsnorm.cu` touched newer than its PTX | skipped (git: unmodified) | committed PTX untouched, `git status` clean |
+| modified `gated_delta_net_scan.cu` (C++17), default | CUDA 13.1 + 14.44 + `/Zc:preprocessor` | 9.1 → pinned 8.7 |
+
+Every run exited 0. Each new PTX reached `bin/ptx` in the same build, and all of them loaded on the
+RTX 3060.
 
 Related: the target's per-kernel `Arch` metadata mirrors `build_ptx.bat`'s `ARCH_86` list for the
 same reason. A kernel using `mma.sync`/`cp.async` compiled at the `compute_75` default produces
