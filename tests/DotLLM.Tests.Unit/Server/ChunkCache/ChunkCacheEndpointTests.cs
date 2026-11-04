@@ -596,6 +596,17 @@ public sealed class ChunkCacheEndpointTests : IDisposable
 
     /// <summary>Ruling 52: <c>store</c> is always an object; <c>configured: false</c> without <c>--chunk-store</c>, absent with one.</summary>
     [Fact]
+    public async Task Capabilities_ListLines512()
+    {
+        // Phase I Task 19: the wire accepts both text-first chunkers; nothing is auto-validated (quality is Phase I5's gate).
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, On());
+        var (_, body) = await server.SendAsync(HttpMethod.Get, "/v1/chunk-cache", null);
+        var got = JsonNode.Parse(body)!.AsObject();
+        Assert.Equal(["lines-512", "symbol-512"], got["wire_chunkers"]!.AsArray().Select(n => n!.GetValue<string>()));
+        Assert.Empty(got["auto_validated"]!.AsArray());
+    }
+
+    [Fact]
     public async Task Capabilities_StoreConfiguredFalse_WithoutStore()
     {
         await using (var none = await ChunkCacheTestServer.StartAsync(_model, On()))

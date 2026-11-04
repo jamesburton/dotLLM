@@ -113,12 +113,13 @@ public sealed class WireChunkingTests
     // ------------------------------------------------------------------------------------------------ allow-list, kind
 
     [Fact]
-    public void Lines512_IsPendingNotEligible()
+    public void Lines512_IsWireEligible()
     {
-        Assert.Equal(["symbol-512"], WireChunking.Eligible.Order());
-        Assert.Equal(["lines-512"], WireChunking.PendingE4c.Order());
+        // Phase I Task 19: lines-512 moved from the pending set to the allow-list (correctness granted by E4c; quality is I5's).
+        Assert.Equal(["lines-512", "symbol-512"], WireChunking.Eligible.Order(StringComparer.Ordinal));
         Assert.True(WireChunking.IsWireChunker("symbol-512"));
-        Assert.False(WireChunking.IsWireChunker("lines-512"));
+        Assert.True(WireChunking.IsWireChunker("lines-512"));
+        Assert.Equal(WireChunking.Eligible.Order(StringComparer.Ordinal), DotLLM.Server.ChunkCache.ChunkCacheWire.WireChunkers.Order(StringComparer.Ordinal)); // the server's copy
         Assert.False(WireChunking.IsWireChunker("fixed-512"));
         Assert.False(WireChunking.IsWireChunker("symbol-256"));
         Assert.Equal("lines-512", new LinesChunker(new CharTokenizer()).Name);

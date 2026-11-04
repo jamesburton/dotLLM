@@ -12,15 +12,13 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// </summary>
 public static class WireChunking
 {
-    /// <summary>Chunker names allowed on the wire: <c>symbol-512</c>.</summary>
-    public static IReadOnlySet<string> Eligible { get; } = FrozenSet.Create(StringComparer.Ordinal, "symbol-512");
-
     /// <summary>
-    /// Chunker names whose wire eligibility is granted on correctness (E4c: <c>lines-512</c> round-trips by construction) but
-    /// that join <see cref="Eligible"/> only in Phase I Task 19, after the chunk tokenisation matches the chat path (Task 5b).
-    /// Not wire chunkers until then.
+    /// Chunker names allowed on the wire: <c>symbol-512</c> and <c>lines-512</c>. <c>lines-512</c> joined in Phase I Task 19 on
+    /// correctness (E4c: it round-trips by construction; both chunkers now cut only at token-stable edges, see
+    /// <see cref="ChunkBoundary"/>); its <b>quality</b> is not validated (the capabilities' <c>auto_validated</c> stays empty,
+    /// Phase I5's gate).
     /// </summary>
-    public static IReadOnlySet<string> PendingE4c { get; } = FrozenSet.Create(StringComparer.Ordinal, "lines-512");
+    public static IReadOnlySet<string> Eligible { get; } = FrozenSet.Create(StringComparer.Ordinal, "symbol-512", "lines-512");
 
     /// <summary>Whether chunks of the chunker named <paramref name="chunkerName"/> may be sent on the wire.</summary>
     /// <param name="chunkerName"><see cref="IChunker.Name"/>.</param>

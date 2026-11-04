@@ -44,7 +44,7 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
         string store = NewDir("usage-store");
         Assert.Equal(2, Cli(["build", "--store", store, "--directory", _fx.TreeTemplate]).Code); // no --model
         Assert.Equal(2, Cli(["build", "--model", _fx.ModelA, "--store", store]).Code); // no source
-        Assert.Equal(2, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", _fx.TreeTemplate, "--chunker", "lines"]).Code);
+        Assert.Equal(2, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", _fx.TreeTemplate, "--chunker", "nonesuch"]).Code);
         Assert.Equal(2, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", _fx.TreeTemplate, "--max-chunks", "-1"]).Code);
         Assert.Equal(2, Cli(["build", "--model", _fx.ModelA, "--store", store, "--solution", "x.sln", "--directory", _fx.TreeTemplate]).Code);
         Assert.Equal(2, Cli(["select", "--model", _fx.ModelA, "--directory", _fx.TreeTemplate]).Code); // no criterion
@@ -385,6 +385,20 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
         Assert.Equal(entries - orphans.Count, fs.GetStats().Entries);
         Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
         Assert.Equal(0, Json(Cli(["evict", "--store", store, "--json"])).GetProperty("evicted").GetInt32());
+    }
+
+    [Fact]
+    public void CliChunkerEnum_IncludesLines()
+    {
+        // Phase I Task 19: lines-512 is a wire chunker, so the CLI can build and query it (symbol|fixed|lines).
+        string tree = NewTree();
+        string store = NewDir("lines-store");
+        foreach (string verb in new[] { "build", "select", "status" })
+            Assert.Contains("symbol|fixed|lines", Cli([verb, "--help"]).Out, StringComparison.Ordinal);
+        Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--chunker", "lines"]).Code);
+        Assert.Contains(Directory.GetFiles(store, "index-*.json"), f => Path.GetFileName(f).StartsWith("index-lines-64.", StringComparison.Ordinal));
+        Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--chunker", "lines", "--no-scan", "--strict"]).Code);
+        Assert.Equal(0, Cli(["select", "--model", _fx.ModelA, "--directory", tree, "--chunk-tokens", "64", "--chunker", "lines", "--path", "**/*.cs"]).Code);
     }
 
     [Fact]
