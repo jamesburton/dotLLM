@@ -47,12 +47,20 @@ public sealed unsafe class TernaryResidualHook : IResidualModifier, IDisposable
     }
 
     /// <summary>
-    /// How the per-row scales of adapters registered AFTER this is set are held in memory. <see cref="TernaryScaleFormat.F32"/> (default) is
-    /// bit-identical to the reference. <see cref="TernaryScaleFormat.F16"/> halves the scale metadata (RNE rounding at load; measured sufficient in
+    /// How the per-row scales of adapters registered AFTER this is set are held in memory. <see cref="TernaryScaleFormat.F16"/> (default, #1620 sign-off)
+    /// halves the scale metadata (RNE rounding at load; measured sufficient in
     /// docs/TERNARY_ADAPTER.md) but only for circuits whose every non-zero |scale| lies in the F16 normal range
     /// [<see cref="MinF16Scale"/>, <see cref="MaxF16Scale"/>]; any other circuit silently stays F32 (see <see cref="ScaleFormatAt"/>).
     /// </summary>
-    public TernaryScaleFormat ScaleFormat { get; set; } = TernaryScaleFormat.F32;
+    public TernaryScaleFormat ScaleFormat { get; set; } = DefaultScaleFormat;
+
+    /// <summary>
+    /// Initial <see cref="ScaleFormat"/> of new hooks: <see cref="TernaryScaleFormat.F16"/> (range-guarded, per-circuit F32 fallback), unless
+    /// <c>DOTLLM_TERNARY_SCALES=f32</c> forces exact reference F32 scales.
+    /// </summary>
+    public static TernaryScaleFormat DefaultScaleFormat { get; } =
+        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_TERNARY_SCALES"), "f32", StringComparison.OrdinalIgnoreCase)
+            ? TernaryScaleFormat.F32 : TernaryScaleFormat.F16;
 
     /// <summary>Smallest |scale| held in F16 (smallest normal binary16, 2^-14); below it F16 is subnormal and loses precision.</summary>
     public const float MinF16Scale = 6.103515625e-5f;
