@@ -67,6 +67,7 @@
     <None Include="Cpu\Kernels\NanoQuantData\oracle_p*.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- #816: HF-generated Qwen4-Exp reference fixtures (generators in Models\Qwen4Exp\Reference; CI has no torch). -->
     <None Include="Models\Qwen4Exp\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Adapters\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- #1562: 2560 wikitext-2 token ids under the LFM3 tokenizer (natural text, long enough to see the global layers' partial-rotary tail). -->
     <None Include="Models\Lfm3\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

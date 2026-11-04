@@ -421,6 +421,10 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         public bool AllowModelAdmin { get; set; }
 
         /// <summary>Enables the LoRA admin write endpoints (off by default).</summary>
+        [CommandOption("--ternary-adapter")]
+        [Description("Ternary residual adapter (.nsadapter or adapter GGUF, docs/TERNARY_ADAPTER.md) applied to every request; CPU transformer models only; repeatable to compose.")]
+        public string[] TernaryAdapterPaths { get; set; } = Array.Empty<string>();
+
         [CommandOption("--allow-lora-admin")]
         [Description("Enable the LoRA admin API: POST /v1/lora/load and DELETE /v1/lora/{name}. Off by default.")]
         public bool AllowLoraAdmin { get; set; }
@@ -569,6 +573,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             Metrics = settings.NoMetrics ? false : settings.Metrics ? true : null,
             AllowLoraAdminApi = settings.AllowLoraAdmin,
             ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(settings.ChunkCache, settings.ChunkCacheMaxChunks),
+            TernaryAdapterPaths = settings.TernaryAdapterPaths is { Length: > 0 } ? settings.TernaryAdapterPaths : null,
             // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
             // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,
             // and the limiter was exercised only by unit tests constructing the config directly.
