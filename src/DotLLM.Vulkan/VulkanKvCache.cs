@@ -157,7 +157,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         _maxSeqLen = maxSeqLen;
         _kvStride = (int[])kvStridePerLayer.Clone();
         _storage = storage;
-        _elemBytes = storage.ElementBytes();
+        _elemBytes = storage == VulkanKvStorage.Q8_0 ? 0 : storage.ElementBytes();   // Q8_0 rows are sized by RowBytes; the host-staged element paths refuse Q8_0
         _rows = rows;
 
         _keys = new VulkanDevice.Buffer[_numLayers];

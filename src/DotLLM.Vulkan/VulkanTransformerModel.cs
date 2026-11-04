@@ -1269,9 +1269,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         }
         _gptOss = VulkanGptOssKernels.Create(_device, spvDir);
         _attnCompact = SimpleComputeKernel.Create(_device, spvDir, "attn_compact_scale_f32", buffers: 2, pushWords: 4);
-        if (DefaultKvStorage == VulkanKvStorage.F16)
+        // Q8_0 (opt-in) also builds the F16 twins, so a probe / test can run both formats in one process (KvStorageOverride); the F16 set is small.
+        if (DefaultKvStorage is VulkanKvStorage.F16 or VulkanKvStorage.Q8_0)
             InitKvF16Kernels(spvDir);
-        else if (DefaultKvStorage == VulkanKvStorage.Q8_0)
+        if (DefaultKvStorage == VulkanKvStorage.Q8_0)
             InitKvQ8Kernels(spvDir);
 
         // Flint has per-head q/k RMSNorm (the #1148 F16-Q default holds). MiMo-V2 stays on the reference sink kernel: no parity fixture yet.
@@ -1292,9 +1293,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     {
         if (Environment.GetEnvironmentVariable(SinkFlashEnvVar) == "0" || IsFlashAttentionDisabled()) return;
         _sinkFlash = VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, VulkanKvStorage.F32, sinks: true, splitQ: splitQ);
-        if (DefaultKvStorage == VulkanKvStorage.F16)
+        if (DefaultKvStorage is VulkanKvStorage.F16 or VulkanKvStorage.Q8_0)
             _sinkFlashKvF16 = VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, VulkanKvStorage.F16, sinks: true, splitQ: splitQ);
-        else if (DefaultKvStorage == VulkanKvStorage.Q8_0)
+        if (DefaultKvStorage == VulkanKvStorage.Q8_0)
             _sinkFlashKvQ8 = VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, VulkanKvStorage.Q8_0, sinks: true, splitQ: splitQ);
     }
 
@@ -1303,7 +1304,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     /// baseline), F32 for every other architecture until their attention dispatch reads F16 in place (#1151).
     /// </summary>
     public VulkanKvStorage DefaultKvStorage =>
-        Config.Architecture == DotLLM.Core.Configuration.Architecture.Flint ? VulkanKvStorageExtensions.ParseOptions(null, null, allowQ8: true) : VulkanKvStorage.F32;
+        KvStorageOverride ?? (Config.Architecture == DotLLM.Core.Configuration.Architecture.Flint ? VulkanKvStorageExtensions.ParseOptions(null, null, allowQ8: true) : VulkanKvStorage.F32);
+
+    /// <summary>
+    /// Diagnostic / test hook: storage the next <see cref="CreateKvCache(int)"/> allocates, in place of <see cref="DefaultKvStorage"/>'s env resolution. Set it AFTER load
+    /// (kernels were built for the env-resolved set: a model loaded with <c>DOTLLM_VK_KV=q8_0</c> holds the F32, F16 and Q8_0 twins, so all three can be A/B'd in one process).
+    /// </summary>
+    public VulkanKvStorage? KvStorageOverride { get; set; }
 
     /// <summary>The F16-KV writer and attention twins. Every Flint layer has sinks, so these three kernels cover every attention dispatch.</summary>
     private void InitKvF16Kernels(string spvDir)
