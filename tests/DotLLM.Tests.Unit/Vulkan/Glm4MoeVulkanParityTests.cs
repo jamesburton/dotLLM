@@ -102,4 +102,43 @@ public sealed class Glm4MoeVulkanParityTests : IDisposable
         Console.WriteLine($"glm4moe vk-vs-cpu max diff {d} (logit scale {scale}) chunks [{string.Join(',', chunks)}] experts {experts} hd {headDim}");
         Assert.True(d < Tol, $"max |vulkan - cpu| = {d} (chunks [{string.Join(',', chunks)}], experts {experts}, hd {headDim})");
     }
+
+    /// <summary>The unmutated Vulkan-vs-CPU distance is activation-quantisation noise (~0.013 at logit scale 0.45); a mutant must clear this by a wide margin.</summary>
+    private const float MutantFloor = 0.05f;
+
+    [SkippableTheory]
+    [InlineData("rope-all-dims")]        // rotate all dims instead of the leading half
+    [InlineData("rope-norm-pairing")]    // interleaved (Norm) pairs instead of NeoX halves
+    [InlineData("softmax-gating")]       // softmax instead of sigmoid scoring
+    [InlineData("no-norm-topk")]         // skip the sum renormalisation of the selected weights
+    [InlineData("no-shared-expert")]     // routed experts only
+    [InlineData("topk-minus-one")]
+    [InlineData("topk-plus-one")]
+    [InlineData("weights-scale-2")]
+    [InlineData("no-selection-bias")]    // exp_probs_b ignored
+    public void Mutant_Moves_Vulkan_Logits(string mutant)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var gguf = GgufFile.Open(Write(6, nextn: true, headDim: 16));
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var rope = cfg.RoPEConfig!.Value;
+        ModelConfig m = mutant switch
+        {
+            "rope-all-dims" => cfg with { RoPEConfig = rope with { DimensionCount = cfg.HeadDim } },
+            "rope-norm-pairing" => cfg with { RoPEConfig = rope with { Type = RoPEType.Norm } },
+            "softmax-gating" => cfg with { Moe = cfg.Moe! with { SigmoidGating = false } },
+            "no-norm-topk" => cfg with { Moe = cfg.Moe! with { NormalizeExpertWeights = false } },
+            "no-shared-expert" => cfg with { Moe = cfg.Moe! with { SharedExpertIntermediateSize = null, NumSharedExperts = 0 } },
+            "topk-minus-one" => cfg with { Moe = cfg.Moe! with { NumExpertsPerTok = cfg.Moe!.NumExpertsPerTok - 1 } },
+            "topk-plus-one" => cfg with { Moe = cfg.Moe! with { NumExpertsPerTok = cfg.Moe!.NumExpertsPerTok + 1 } },
+            "weights-scale-2" => cfg with { Moe = cfg.Moe! with { ExpertWeightsScale = 2f } },
+            _ => cfg with { Moe = cfg.Moe! with { HasSelectionBias = false } },
+        };
+        float[] cpu = Cpu(gguf, cfg);
+        float[] vk = Vk(gguf, m, spvDir, [12]);
+        int v = SyntheticGlm4MoeGguf.VocabSize;
+        float d = MaxAbs(cpu.AsSpan((Ids.Length - 1) * v, v).ToArray(), vk);
+        Console.WriteLine($"glm4moe vulkan mutant {mutant}: max diff vs unmutated CPU {d}");
+        Assert.True(d > MutantFloor, $"mutant '{mutant}' is invisible to the Vulkan-vs-CPU gate (max diff {d})");
+    }
 }

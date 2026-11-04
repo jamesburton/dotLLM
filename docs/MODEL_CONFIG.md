@@ -76,7 +76,7 @@ Differences between architectures are captured entirely in ModelConfig.
 - MlaConfig: latent_dim (e.g., 512), rope_dim (e.g., 64)
 - See [ATTENTION.md](ATTENTION.md) for MLA details
 
-### GLM-4.5 MoE (`glm4moe`: GLM-4.5-Air, Cerebras REAP-82B, GLM-4.5) - CPU forward (#1599); GPU backends refuse (#1600)
+### GLM-4.5 MoE (`glm4moe`: GLM-4.5-Air, Cerebras REAP-82B, GLM-4.5) - CPU forward (#1599), Vulkan forward (#1600); CUDA refuses
 
 Facts below were read from llama.cpp (`src/models/glm4-moe.cpp`, `src/llama-arch.cpp`, `conversion/glm.py` `Glm4MoeModel`, `llama_model_rope_type`) and
 checked against a header range-read (first 16 MB) of `bartowski/cerebras_GLM-4.5-Air-REAP-82B-A12B-GGUF` IQ4_XS (803 tensors, 47 blocks, 52 KV) and the HF
@@ -87,7 +87,15 @@ checked against a header range-read (first 16 MB) of `bartowski/cerebras_GLM-4.5
   routed banks, shared expert and the router stay in the raw quant view, never widened) and run `ForwardMoeGrouped`; layer 0 is the plain dense SwiGLU. The trunk is `block_count -
   nextn_predict_layers` layers; the NextN block (`blk.46.*`) is neither loaded nor run (no MTP). RoPE is `RoPE.Execute` with `ropeDim` = `RoPEConfig.DimensionCount` (64) and NeoX pairing,
   applied once (`PartialRotaryFactor` is only consulted by the Gemma-4 global-layer path). Q/K norm is loaded iff `attn_{q,k}_norm.weight` exists. `packedLegacyExperts` is on for
-  glm4moe (IQ4_NL / Q5_1 banks use the packed x Q8 dot, as llama.cpp does). Vulkan/CUDA/hybrid hosts still refuse (`Glm4MoeUnsupportedMessage`).
+  glm4moe (IQ4_NL / Q5_1 banks use the packed x Q8 dot, as llama.cpp does). CUDA and the Vulkan pipeline / hybrid hosts still refuse (`Glm4MoeUnsupportedMessage`).
+- **Vulkan forward (#1600)** runs on the generic `VulkanModelLoader` default arm (`VulkanTransformerModel`, single device; no new model class): `LoadFromGguf` passes `allowGlm4MoeCpu: true` to the shared
+  weight loader, so the routed banks, the shared expert and the dense layer 0 stay raw GGUF views and are uploaded packed. Nothing is widened: REAP-82B IQ4_XS (attn_q IQ4_XS, attn_k/shared Q8_0, attn_v/o and shared gate/up Q5_K,
+  routed gate/up IQ4_XS, routed down IQ4_NL, dense L0 down IQ4_NL, shared down Q5_1 on 24 layers / Q8_0 on 21, output Q6_K) reports `ExpandedTensorCount == 0` and 42.9 GiB on the device. Three gaps were filled for it:
+  (1) the generic IQ-bank gate demanded K % 256 for every IQ format, which pushed the IQ4_NL down bank (K = 1408 = 22 x 64) to F32 (7x the bytes, device OOM at layer ~19);
+  the legacy 32-element-block formats (IQ4_NL / Q4_0 / Q4_1) now need K % 64 (`VulkanWeights.MoeIqKGranule`; the grouped coopmat stages two blocks per round, the indexed MMVQ needs K % 32);
+  (2) dense Q5_1 (`matmul_q5_1_f32_gemv` / `_gemm`, plain F32-in kernels) for the shared-expert down projection; (3) the IQ4_XS token table (151552 x 4096, 314 MiB packed) is gathered on the host
+  (`TokenEmbeddingOnHost`: rows are dequantised from the mmap into the host-visible staging buffer, a few KB per token) instead of being widened to a 2.3 GiB F32 device copy. KV is F16 (`IsDenseF16KvEligible`).
+  The fused single-token MoE decode layer (`TryRecordMoeLayerDecodeFused`) is still Flint-only. MTP/NextN is not run.
 - **Validation recipe**: `tests/scripts/glm4moe_synthetic_hf_reference.py` loads the `SyntheticGlm4MoeGguf` tensors into HF `Glm4MoeForCausalLM` (F32, eager; use a STOCK torch wheel - a locally built
   torch 2.14 gave run-to-run different MoE logits with multithreaded CPU kernels) and prints the golden pasted into `Glm4MoeForwardTests`. On real files: `llama-perplexity -dev none --kl-divergence-base`
   + `dotllm perplexity --tokens-file` **without `--bos`** (GLM adds no BOS: the kld ids start at `
