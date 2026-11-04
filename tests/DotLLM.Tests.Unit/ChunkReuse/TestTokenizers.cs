@@ -147,8 +147,8 @@ internal sealed class EndMarkerTokenizer : ITokenizer
     public int CountTokens(string text) => text.Length + 1;
 }
 
-/// <summary>One token per char except that a '\n' directly followed by 'x' is one token (a merge across a line end).</summary>
-internal sealed class NewlineXTokenizer : ITokenizer
+/// <summary>One token per char except that a '\n' directly followed by <c>letter</c> ('x') is one token (a merge across a line end).</summary>
+internal sealed class NewlineXTokenizer(char letter = 'x') : ITokenizer
 {
     private const int Merged = 100_000;
 
@@ -157,7 +157,7 @@ internal sealed class NewlineXTokenizer : ITokenizer
         var ids = new List<int>();
         for (int i = 0; i < text.Length; i++)
         {
-            if (text[i] == '\n' && i + 1 < text.Length && text[i + 1] == 'x') { ids.Add(Merged); i++; }
+            if (text[i] == '\n' && i + 1 < text.Length && text[i + 1] == letter) { ids.Add(Merged); i++; }
             else ids.Add(text[i]);
         }
         return ids.ToArray();
@@ -166,7 +166,7 @@ internal sealed class NewlineXTokenizer : ITokenizer
     public string Decode(ReadOnlySpan<int> tokenIds)
     {
         var sb = new StringBuilder();
-        foreach (int id in tokenIds) sb.Append(id == Merged ? "\nx" : ((char)id).ToString());
+        foreach (int id in tokenIds) sb.Append(id == Merged ? "\n" + letter : ((char)id).ToString());
         return sb.ToString();
     }
 

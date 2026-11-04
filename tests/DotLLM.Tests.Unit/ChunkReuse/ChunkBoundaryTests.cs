@@ -159,6 +159,18 @@ public sealed class ChunkBoundaryTests
     }
 
     [Fact]
+    public void SymbolChunker_WhenNoLaterEdgeFits_MovesTheEdgeEarlier()
+    {
+        // The class line starts with 'c' (a "\nc" merge). The statements before it fill the limit, so neither moving the edge
+        // later nor joining the class line to them fits: the edge moves to an earlier line start.
+        var tok = new NewlineXTokenizer('c');
+        var file = new SourceFile("t.cs", string.Concat(Enumerable.Range(1, 5).Select(i => $"var v{i} = {i};\n")) + "class Z { }\n");
+        IReadOnlyList<Chunk> chunks = new SymbolChunker(tok, 62).Chunk(file);
+        AssertEdgesStable(tok, file, chunks, 62);
+        Assert.True(chunks[0].EndOffset < 60, "the edge moved into the statements");
+    }
+
+    [Fact]
     public void SymbolChunker_MovedEdge_NeverBreaksTheLimit()
     {
         var tok = new NewlineRunTokenizer();
