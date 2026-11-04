@@ -242,6 +242,7 @@ internal static class ChunkAnnotationParser
         int minChunkTokens = ChunkCacheWire.DefaultMinChunkTokens;
         string onMiss = "prefill";
         string? query = null;
+        double? recomputeBudget = null;
         bool dropAll = false;
         JsonElement manifest = default;
         int manifestLength = 0;
@@ -319,6 +320,21 @@ internal static class ChunkAnnotationParser
                     acc.Request(ChunkCacheCodes.AnnotationMalformed, "chunk_cache.on_miss must be \"prefill\" or \"encode\"");
             }
 
+            // Ruling 50: recompute.budget (0.0-1.0) overrides the shadow plan's budget; selector and max_tokens are read by
+            // applied reuse (Phase I5) only. A wrong type or a value out of range is malformed; the default applies.
+            if (Present(cc, "recompute", out var rc))
+            {
+                if (rc.ValueKind != JsonValueKind.Object)
+                    acc.Request(ChunkCacheCodes.AnnotationMalformed, "chunk_cache.recompute must be an object");
+                else if (Present(rc, "budget", out var rb))
+                {
+                    if (rb.ValueKind == JsonValueKind.Number && rb.TryGetDouble(out double b) && double.IsFinite(b) && b is >= 0.0 and <= 1.0)
+                        recomputeBudget = b;
+                    else
+                        acc.Request(ChunkCacheCodes.AnnotationMalformed, "chunk_cache.recompute.budget must be a number from 0 to 1");
+                }
+            }
+
             if (Present(cc, "query", out var q) && !TryQuery(q, messages, out query))
                 acc.Request(ChunkCacheCodes.AnnotationMalformed, "chunk_cache.query must be {text: string} or {message: index of a request message}");
 
@@ -380,6 +396,7 @@ internal static class ChunkAnnotationParser
             Annotated = (int)Math.Min(int.MaxValue, annotated),
             MinChunkTokens = minChunkTokens,
             OnMiss = onMiss,
+            RecomputeBudget = recomputeBudget,
             Defects = acc.Defects,
         };
     }
@@ -510,10 +527,17 @@ internal static class ChunkAnnotationParser
         var key = (message, part, inner);
         if (!state.Taken.TryGetValue(key, out var ranges))
             state.Taken[key] = ranges = [];
-        foreach (var (rs, re) in ranges)
-            if (s < re && rs < e)
-                return acc.Drop(index, ChunkCacheCodes.SpanInvalid, "overlap", $"byte range [{s}, {e}) overlaps an earlier span");
-        ranges.Add((s, e));
+        // Held ranges never overlap each other, so they are kept sorted by start and only the two neighbours of the new
+        // range can overlap it: O(log n) per span instead of a scan of every earlier range.
+        int lo = 0, hi = ranges.Count;
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >>> 1;
+            if (ranges[mid].Start < s) lo = mid + 1; else hi = mid;
+        }
+        if ((lo > 0 && s < ranges[lo - 1].End) || (lo < ranges.Count && ranges[lo].Start < e))
+            return acc.Drop(index, ChunkCacheCodes.SpanInvalid, "overlap", $"byte range [{s}, {e}) overlaps an earlier span");
+        ranges.Insert(lo, (s, e));
 
         // 6. Hash, last: only spans that passed every cheap check are hashed, and accepted ranges never overlap.
         HashComputations++;

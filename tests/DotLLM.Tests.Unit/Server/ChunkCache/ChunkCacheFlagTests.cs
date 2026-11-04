@@ -21,7 +21,7 @@ public sealed class ContractFixtureTests
     /// SHA-256 of <c>fixtures.sha256</c> itself, so a fixture edited together with its list entry still fails here.
     /// Changing it means the contract changed: re-copy the whole set from the contract folder.
     /// </summary>
-    private const string ListSha256 = "6c1cef3241f7aad0194ce6110c0d935e31b0ef467244326efebe4e1a7b8e0c0a";
+    private const string ListSha256 = "b93229171a5179e488a96d2d2605b5a5cce641e24ee7816a1adf22a50b61511c";
 
     [Fact]
     public void FixtureList_IsTheContractList() =>
@@ -79,6 +79,38 @@ public sealed class ChunkCacheOptionsTests
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             ServerOptions.Parse(["--model", "m.gguf", "--chunk-cache-max-chunks", max.ToString(System.Globalization.CultureInfo.InvariantCulture)]));
         Assert.False(new ServeCommand.Settings { ChunkCacheMaxChunks = max }.Validate().Successful);
+    }
+
+    /// <summary>#1632: <c>--chunk-cache-max-chunks</c> has an upper bound too, so the per-request work stays bounded.</summary>
+    [Fact]
+    public void MaxChunks_AboveTheCap_Rejected()
+    {
+        int over = ChunkCacheOptions.AbsoluteMaxChunks + 1;
+        Assert.Equal(ChunkCacheOptions.AbsoluteMaxChunks, ChunkCacheOptions.Create(true, ChunkCacheOptions.AbsoluteMaxChunks).MaxChunks);
+        Assert.Throws<ArgumentOutOfRangeException>(() => ChunkCacheOptions.Create(true, over));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            ServerOptions.Parse(["--model", "m.gguf", "--chunk-cache-max-chunks", over.ToString(System.Globalization.CultureInfo.InvariantCulture)]));
+        Assert.False(new ServeCommand.Settings { ChunkCacheMaxChunks = over }.Validate().Successful);
+        Assert.True(new ServeCommand.Settings { ChunkCache = true, ChunkCacheMaxChunks = ChunkCacheOptions.AbsoluteMaxChunks }.Validate().Successful);
+    }
+
+    /// <summary><c>--chunk-store</c> (Task 13, read-only lookups) on both option paths; blank means none.</summary>
+    [Fact]
+    public void ChunkStore_ParsedOnBothPaths()
+    {
+        Assert.Null(ChunkCacheOptions.Disabled.StoreRoot);
+        // Resolved to a full path at parse time (not lazily against a later working directory).
+        Assert.Equal(new ChunkCacheOptions(true, 4096, Path.GetFullPath("s")), ServerOptions.Parse(["--model", "m.gguf", "--chunk-cache", "--chunk-store", "s"]).ChunkCache);
+        Assert.Null(ChunkCacheOptions.Create(true, null, "  ").StoreRoot);
+        Assert.Throws<ArgumentException>(() => ServerOptions.Parse(["--model", "m.gguf", "--chunk-cache", "--chunk-store"]));
+        // A store without the flag is a configuration error, not silently ignored.
+        Assert.Throws<ArgumentException>(() => ServerOptions.Parse(["--model", "m.gguf", "--chunk-store", "s"]));
+        Assert.False(new ServeCommand.Settings { ChunkStore = "s" }.Validate().Successful);
+        Assert.True(new ServeCommand.Settings { ChunkStore = "s", ChunkCache = true }.Validate().Successful);
+        var names = typeof(ServeCommand.Settings).GetProperties()
+            .Select(p => p.GetCustomAttribute<CommandOptionAttribute>())
+            .Where(a => a is not null).SelectMany(a => a!.LongNames).ToHashSet(StringComparer.Ordinal);
+        Assert.Contains("chunk-store", names);
     }
 
     [Fact]

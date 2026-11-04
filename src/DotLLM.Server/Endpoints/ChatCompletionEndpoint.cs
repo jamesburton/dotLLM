@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using DotLLM.Engine;
+using DotLLM.Server.ChunkCache;
 using DotLLM.Server.Models;
 using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
@@ -53,6 +54,17 @@ public static class ChatCompletionEndpoint
             return;
         }
 
+        // chunk_cache (docs/CHUNK_CACHE.md): with --chunk-cache on and an annotated body only; otherwise null and nothing
+        // below changes. The namespace is server-assigned (the default until authentication exists).
+        var chunkCache = state.Options.ChunkCache.Enabled
+            ? ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, ChunkCacheWire.DefaultNamespace))
+            : null;
+        if (chunkCache?.Parsed.Error is { } chunkParseError)
+        {
+            await WriteChunkCacheErrorAsync(httpContext, chunkParseError, keepAlive);
+            return;
+        }
+
         // n is implemented for the non-streaming path only (#460). Streaming would need per-choice
         // index on every delta and an n-way interleave of the SSE stream; rather than silently
         // returning one choice -- the defect this closes -- say so.
@@ -93,7 +105,8 @@ public static class ChatCompletionEndpoint
         }
 
         // Convert DTOs to engine types
-        var messages = ProfileSystemPrompt.Apply(state.ActiveProfile?.System, RequestConverter.ToMessages(request.Messages).ToArray());
+        var engineMessages = RequestConverter.ToMessages(request.Messages);
+        var messages = ProfileSystemPrompt.Apply(state.ActiveProfile?.System, engineMessages.ToArray());
         var tools = RequestConverter.ToTools(request.Tools);
         var toolChoice = RequestConverter.ParseToolChoice(request.ToolChoice);
 
@@ -154,6 +167,14 @@ public static class ChatCompletionEndpoint
         var effectiveToolParser = ToolChoiceBinder.Apply(
             toolChoice, tools, state.ToolCallParser, ref options, out bool forcedToolCall);
 
+        // chunk_cache: locate, verify and look up the annotated spans in the prompt exactly as rendered. Read-only: the
+        // prompt, the options and the dispatch below are those of the unannotated request.
+        if (chunkCache?.Prepare(state, messages, messages.Length - engineMessages.Length, templateOptions, prompt) is { } chunkPlanError)
+        {
+            await WriteChunkCacheErrorAsync(httpContext, chunkPlanError, keepAlive);
+            return;
+        }
+
         // Diffusion routing: when the loaded model is a masked text-diffusion model, generation runs
         // through DiffusionTextGenerator (canvas denoising) instead of the autoregressive TextGenerator.
         // AR models leave DiffusionGenerator null and fall through to the unchanged path below.
@@ -183,11 +204,17 @@ public static class ChatCompletionEndpoint
 
         if (request.Stream)
             await HandleStreamingAsync(request, state, httpContext, prompt, options,
-                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, forcedToolCall, keepAlive);
+                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, forcedToolCall, keepAlive, chunkCache);
         else
             await HandleNonStreamingAsync(request, state, httpContext, prompt, options,
-                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct);
+                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, chunkCache);
     }
+
+    /// <summary>A strict <c>chunk_cache</c> error: 400 <c>invalid_request_error</c> or 503 <c>api_error</c>, with its code.</summary>
+    private static Task WriteChunkCacheErrorAsync(HttpContext ctx, ChunkCacheError error, SseKeepAlive? keepAlive) =>
+        WriteErrorAsync(ctx, error.Status, error.Status == 400
+            ? ErrorResponse.InvalidRequest(error.Message, param: "chunk_cache", code: error.Code)
+            : ErrorResponse.Internal(error.Message, code: error.Code), keepAlive);
 
     private static async Task HandleNonStreamingAsync(
         ChatCompletionRequest request,
@@ -200,7 +227,8 @@ public static class ChatCompletionEndpoint
         IToolCallParser? toolParser,
         DotLLM.Core.Lora.ILoraAdapter? adapter,
         ReasoningPlan plan,
-        CancellationToken ct)
+        CancellationToken ct,
+        ChunkCacheExchange? chunkCache = null)
     {
         int choiceCount = request.ChoiceCount;
         var results = new InferenceResponse[choiceCount];
@@ -261,7 +289,8 @@ public static class ChatCompletionEndpoint
             Choices = choices,
             Usage = usage,
             // #1345: llama.cpp-shaped fields beside usage. One request's timings only; n > 1 runs n generations.
-            Timings = choiceCount == 1 ? TimingsDto.From(results[0].Timings) : null,
+            Timings = choiceCount == 1 ? WithChunkTimings(TimingsDto.From(results[0].Timings), chunkCache) : null,
+            ChunkCache = chunkCache?.Finish(results[0].PromptTokenCount, results[0].Timings),
         };
 
         // Report actuals to the rate-limit lease so unused token budget is refunded. Every choice
@@ -401,7 +430,8 @@ public static class ChatCompletionEndpoint
         ReasoningPlan plan,
         CancellationToken ct,
         bool forcedToolCall,
-        SseKeepAlive? keepAlive)
+        SseKeepAlive? keepAlive,
+        ChunkCacheExchange? chunkCache = null)
     {
         // (#1266) Same routing as the non-streaming path: on the scheduler, with no gate or model lease.
         if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
@@ -411,7 +441,7 @@ public static class ChatCompletionEndpoint
                 ServerState.SchedulerStream(state, scheduler, httpContext, state.Tokenizer!.Encode(prompt), options),
                 ServerState.WithoutGate,
                 requestId, modelId, tools, toolParser, plan, ct, forcedToolCall,
-                keepAlive, state.DescribeWait, state.KeepAliveInterval);
+                keepAlive, state.DescribeWait, state.KeepAliveInterval, chunkCache);
         }
 
         // (#1023) The generator is resolved under the gate (re-activating the admitted model if a queued swap replaced it), so the
@@ -422,7 +452,7 @@ public static class ChatCompletionEndpoint
             innerCt => current!.GenerateStreamingTokensAsync(prompt, options, innerCt, adapter),
             (work, gateCt) => state.ExecuteAsync(modelId, generator => { current = generator; return work(); }, gateCt),
             requestId, modelId, tools, toolParser, plan, ct, forcedToolCall,
-            keepAlive, state.DescribeWait, state.KeepAliveInterval);
+            keepAlive, state.DescribeWait, state.KeepAliveInterval, chunkCache);
     }
 
     /// <summary>
@@ -443,7 +473,8 @@ public static class ChatCompletionEndpoint
         bool forcedToolCall = false,
         SseKeepAlive? keepAlive = null,
         Func<string>? waitReason = null,
-        TimeSpan? keepAliveInterval = null)
+        TimeSpan? keepAliveInterval = null,
+        ChunkCacheExchange? chunkCache = null)
     {
         // (#1023 review) Stop the activation-phase keep-alive BEFORE touching headers: it commits them itself, and setting them while it
         // writes threw "headers are read-only". The gate-phase keep-alive below starts afresh.
@@ -675,7 +706,9 @@ public static class ChatCompletionEndpoint
             // chunk as well produced two usage-bearing chunks when requested and one when not
             // — the conformance rows openai/usage.stream{,.unrequested} caught both.
             // Timings stays: it is our own extension and no OpenAI client looks for it.
-            Timings = timings.HasValue ? TimingsDto.From(timings.Value) : null,
+            Timings = timings.HasValue ? WithChunkTimings(TimingsDto.From(timings.Value), chunkCache) : null,
+            // chunk_cache: the report rides on this finish-reason chunk, beside timings (not on the usage-only chunk below).
+            ChunkCache = chunkCache?.Finish(promptTokens, timings),
         };
         await WriteSseChunk(httpContext, finalChunk, ct);
 
@@ -689,6 +722,10 @@ public static class ChatCompletionEndpoint
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
         await httpContext.Response.Body.FlushAsync(ct);
     }
+
+    /// <summary>The timings of an annotated <c>--chunk-cache</c> request carry <c>chunk_n</c> / <c>chunk_recomputed_n</c>; others are unchanged.</summary>
+    private static TimingsDto WithChunkTimings(TimingsDto timings, ChunkCacheExchange? chunkCache) =>
+        chunkCache is null ? timings : ChunkCacheExchange.WithChunkTimings(timings)!;
 
     /// <summary>
     /// Builds OpenAI's final usage chunk (#450): <c>usage</c> populated, <c>choices</c> empty.

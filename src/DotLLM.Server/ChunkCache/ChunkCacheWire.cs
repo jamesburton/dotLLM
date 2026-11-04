@@ -127,6 +127,12 @@ internal sealed record ParsedChunkRequest(
     /// <summary><c>on_miss</c>: <c>prefill</c> (default) or <c>encode</c>.</summary>
     public string OnMiss { get; init; } = "prefill";
 
+    /// <summary>
+    /// <c>recompute.budget</c> (0.0–1.0) when the request gave one: the shadow plan's budget (ruling 50); null = the
+    /// server default.
+    /// </summary>
+    public double? RecomputeBudget { get; init; }
+
     /// <summary>Every dropped annotation with its cause, in document order.</summary>
     public IReadOnlyList<ChunkDefect> Defects { get; init; } = [];
 

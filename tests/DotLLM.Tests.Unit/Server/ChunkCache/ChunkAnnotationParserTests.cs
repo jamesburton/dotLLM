@@ -580,6 +580,26 @@ public sealed class ChunkAnnotationParserTests
         Assert.Equal(["2:overlap"], p.Defects.Select(d => $"{d.Index}:{d.Kind}"));
     }
 
+    /// <summary>
+    /// #1632: the overlap check does not depend on the order spans arrive in. Spans handed in descending, interleaved
+    /// order are accepted when disjoint; one that overlaps any accepted neighbour, however far apart in the array, is
+    /// dropped.
+    /// </summary>
+    [Fact]
+    public void Overlap_OutOfOrderSpans_MatchesTheLinearRule()
+    {
+        string content = new string('x', 40);
+        string Chunk(string id, int s, int e) =>
+            $$$"""{"id":"{{{id}}}","hash":"{{{Sha(content[s..e])}}}","at":{"message":0,"part":0,"start":{{{s}}},"end":{{{e}}}}}""";
+        // Accepted: 30-34, 10-14, 20-24, 0-4. Dropped: 12-22 (overlaps two), 33-38 (tail of 30-34), 17-22 (only its right neighbour 20-24); adjacent ones kept.
+        var spans = new[] { ("a", 30, 34), ("b", 10, 14), ("c", 20, 24), ("d", 0, 4), ("e", 12, 22), ("f", 33, 38), ("g", 4, 5), ("h", 34, 36), ("i", 9, 10), ("j", 17, 22) };
+        var p = ChunkAnnotationParser.Parse(OpenAi($$$"""
+            {"messages":[{"role":"user","content":"{{{content}}}"}],"chunk_cache":{"chunks":[{{{string.Join(",", spans.Select(x => Chunk(x.Item1, x.Item2, x.Item3)))}}}]}}
+            """), On, Ns)!;
+        Assert.Equal(["a", "b", "c", "d", "g", "h", "i"], p.Spans.Select(x => x.Id));
+        Assert.Equal(["4:overlap", "5:overlap", "9:overlap"], p.Defects.Select(d => $"{d.Index}:{d.Kind}"));
+    }
+
     /// <summary>Ruling 4: the strict error is the first defect in document order, not the most common one.</summary>
     [Fact]
     public void Strict_FirstDefectInDocumentOrderWins()

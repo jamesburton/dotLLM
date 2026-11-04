@@ -41,6 +41,13 @@
     <ProjectReference Include="..\DotLLM.Cuda\DotLLM.Cuda.csproj" />
     <ProjectReference Include="..\DotLLM.HuggingFace\DotLLM.HuggingFace.csproj" />
     <ProjectReference Include="..\DotLLM.Telemetry\DotLLM.Telemetry.csproj" />
+    <!-- chunk_cache (docs/CHUNK_CACHE.md): store keys (ChunkKey, ChunkFingerprint, GgufIdentity), chunk tokenisation, store lookups. -->
+    <ProjectReference Include="..\DotLLM.ChunkReuse\DotLLM.ChunkReuse.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Provisional per-backend cost model for the shadow plan (ChunkCostModel). -->
+    <EmbeddedResource Include="ChunkCache\chunk-cost-model.json" LogicalName="DotLLM.Server.ChunkCache.chunk-cost-model.json" />
   </ItemGroup>
 
 
