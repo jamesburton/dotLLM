@@ -307,9 +307,15 @@ public sealed class VulkanTernaryAdapterKernelTests
             foreach (int rank in new[] { 1, 2, 32 })
                 foreach (int n in new[] { 1, 8 })
                 {
-                    var pkg = Synth(rank, d, 99 + (ulong)rank, 1f, 0f, layer: 0);
-                    using var m = Make(dev, spv, [pkg]);
                     var rows = Rows(n, d, 4242);
+                    NsAdapterPackage pkg;
+                    for (ulong seed = 99 + (ulong)rank; ; seed += 1000)
+                    {
+                        pkg = Synth(rank, d, seed, 1f, 0f, layer: 0);
+                        // the gate must be open on every row, else the timing is the early-out path
+                        if (Enumerable.Range(0, n).All(r => MaxRelu(pkg, rows.AsSpan(r * d, d).ToArray()) > 1e-6f)) break;
+                    }
+                    using var m = Make(dev, spv, [pkg]);
                     using var buf = dev.Allocate((long)n * d * sizeof(float));
                     dev.Upload(rows, buf);
                     double Time(int reps)

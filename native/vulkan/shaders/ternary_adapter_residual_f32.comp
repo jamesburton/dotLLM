@@ -177,25 +177,42 @@ void main() {
     for (uint c = 0u; c < pc.nCirc; c++) any |= openv[c];
     if (any == 0) return;   // every circuit closed: delta == 0, row unchanged (workgroup-uniform)
 
-    // ---- stage D: up projections + residual add, one output column per thread ----
+    // ---- stage D: up projections + residual add; one thread owns 32 consecutive output columns (one mask word) ----
+    // Each (circuit, rank row) costs the thread two word loads for 32 columns, instead of two loads per column.
     uint upRows = pc.totalRank * pc.wprU;   // UpT rows start after the Down rows
-    for (uint col = tid; col < d; col += WG) {
-        uint blk = (col >> 6) * 4u + ((col >> 5) & 1u);
-        uint bit = col & 31u;
-        precise float tot = 0.0;
+    uint w32 = tid;                          // mask word index in columns/32 units
+    uint colBase = w32 * 32u;
+    if (colBase < d) {
+        uint blk = (w32 >> 1) * 4u + (w32 & 1u);
+        precise float tot[32];
+        for (int i = 0; i < 32; i++) tot[i] = 0.0;
         for (uint c = 0u; c < pc.nCirc; c++) {
             if (openv[c] == 0) continue;
             uint rank = meta[c * 4u], off = meta[c * 4u + 1u];
-            int acc = 0;
+            int acc[32];
+            for (int i = 0; i < 32; i++) acc[i] = 0;
             for (uint j = 0u; j < rank; j++) {
                 uint rw = upRows + (off + j) * pc.wprU + blk;
-                acc += (int((masks[rw] >> bit) & 1u) - int((masks[rw + 2u] >> bit) & 1u)) * qv[off + j];
+                uint pw = masks[rw], mw = masks[rw + 2u];
+                int q = qv[off + j];
+                for (int i = 0; i < 32; i++)
+                    acc[i] += (int((pw >> i) & 1u) - int((mw >> i) & 1u)) * q;
             }
-            precise float u = float(acc) * scaleAt(pc.upScaleBase + c * pc.upScaleStride + col);
-            precise float dl = u * dqv[c];
-            tot = tot + dl;
+            float dq = dqv[c];
+            uint sbase = pc.upScaleBase + c * pc.upScaleStride + colBase;
+            for (int i = 0; i < 32; i++) {
+                if (colBase + uint(i) < d) {
+                    precise float u = float(acc[i]) * scaleAt(sbase + uint(i));
+                    precise float dl = u * dq;
+                    tot[i] = tot[i] + dl;
+                }
+            }
         }
-        precise float outv = h[rowBase + col] + tot;
-        h[rowBase + col] = outv;
+        for (int i = 0; i < 32; i++) {
+            if (colBase + uint(i) < d) {
+                precise float outv = h[rowBase + colBase + uint(i)] + tot[i];
+                h[rowBase + colBase + uint(i)] = outv;
+            }
+        }
     }
 }
