@@ -76,16 +76,23 @@ Differences between architectures are captured entirely in ModelConfig.
 - MlaConfig: latent_dim (e.g., 512), rope_dim (e.g., 64)
 - See [ATTENTION.md](ATTENTION.md) for MLA details
 
-### GLM-4.5 MoE (`glm4moe`: GLM-4.5-Air, Cerebras REAP-82B, GLM-4.5) - config + tensor census only (#1598), STUB
+### GLM-4.5 MoE (`glm4moe`: GLM-4.5-Air, Cerebras REAP-82B, GLM-4.5) - CPU forward (#1599); GPU backends refuse (#1600)
 
 Facts below were read from llama.cpp (`src/models/glm4-moe.cpp`, `src/llama-arch.cpp`, `conversion/glm.py` `Glm4MoeModel`, `llama_model_rope_type`) and
 checked against a header range-read (first 16 MB) of `bartowski/cerebras_GLM-4.5-Air-REAP-82B-A12B-GGUF` IQ4_XS (803 tensors, 47 blocks, 52 KV) and the HF
 `config.json` of `zai-org/GLM-4.5-Air` and `cerebras/GLM-4.5-Air-REAP-82B-A12B` (identical except `n_routed_experts` 128 vs 96).
 
-- **No forward pass.** `GgufModelConfigExtractor`, `HfConfigExtractor` (`Glm4MoeForCausalLM` / `model_type=glm4_moe`) and `Glm4MoeTensorCensus` exist; every loader
-  (`ModelLoader.CreateCpuModelFromGguf`, `TransformerWeights.LoadFromGguf`, `CudaModelLoader`, `VulkanModelLoader`) throws `NotSupportedException`
-  (`ModelConfig.Glm4MoeUnsupportedMessage`) instead of falling into the generic Llama-style path (which would silently drop `exp_probs_b`, the shared expert, the router
-  semantics and the NextN block). CPU forward: #1599; Vulkan: #1600. The synthetic fixture is `SyntheticGlm4MoeGguf`; `debug gguf-config` prints the config, MoE block and census.
+- **CPU forward (#1599)** runs on the shared `TransformerModel` (no new model class): `ModelLoader.CreateCpuModelFromGguf` -> `TransformerModel.LoadFromGguf`, which passes
+  `allowGlm4MoeCpu: true` to `TransformerWeights.LoadFromGguf`. Layers `>= leading_dense_block_count` take the MiMo-V2/Flint MoE arm (`LoadDeepSeekMoeLayer` with `skipF32Dequant`:
+  routed banks, shared expert and the router stay in the raw quant view, never widened) and run `ForwardMoeGrouped`; layer 0 is the plain dense SwiGLU. The trunk is `block_count -
+  nextn_predict_layers` layers; the NextN block (`blk.46.*`) is neither loaded nor run (no MTP). RoPE is `RoPE.Execute` with `ropeDim` = `RoPEConfig.DimensionCount` (64) and NeoX pairing,
+  applied once (`PartialRotaryFactor` is only consulted by the Gemma-4 global-layer path). Q/K norm is loaded iff `attn_{q,k}_norm.weight` exists. `packedLegacyExperts` is on for
+  glm4moe (IQ4_NL / Q5_1 banks use the packed x Q8 dot, as llama.cpp does). Vulkan/CUDA/hybrid hosts still refuse (`Glm4MoeUnsupportedMessage`).
+- **Validation recipe**: `tests/scripts/glm4moe_synthetic_hf_reference.py` loads the `SyntheticGlm4MoeGguf` tensors into HF `Glm4MoeForCausalLM` (F32, eager; use a STOCK torch wheel - a locally built
+  torch 2.14 gave run-to-run different MoE logits with multithreaded CPU kernels) and prints the golden pasted into `Glm4MoeForwardTests`. On real files: `llama-perplexity -dev none --kl-divergence-base`
+  + `dotllm perplexity --tokens-file` **without `--bos`** (GLM adds no BOS: the kld ids start at `
+`, and `--bos` replaces each window's first token with `[gMASK]`, giving PPL 2264 instead of 11.8)
+  + `scripts/kld_compare.py` with `DOTLLM_PPL_LOGITS_DUMP`.
 - **GGUF metadata** (prefix `glm4moe.`): `block_count` (= trunk + `nextn_predict_layers`, 47 for Air), `context_length`, `embedding_length`, `feed_forward_length` (dense layer, 10944),
   `attention.head_count` 96, `attention.head_count_kv` 8 (scalar), `attention.key_length`/`value_length` 128, `attention.layer_norm_rms_epsilon`, `rope.freq_base` 1e6,
   `rope.dimension_count` **64** (= `int(head_dim * partial_rotary_factor)`, converter default 0.5), `expert_count` 128 (REAP 96), `expert_used_count` 8, `expert_shared_count` 1,
