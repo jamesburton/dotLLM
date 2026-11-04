@@ -305,6 +305,10 @@ public sealed unsafe class TernaryAdapterTests : IDisposable
         Assert.Equal(3, comp.RankAt(1));
         Assert.Equal(4, comp.RankAt(2));
 
+        // Many input rows: with ReLU a single row can leave any one rank row at exactly zero contribution, which let an
+        // offset mutant (row += r - 1) survive; across 24 rows every rank row contributes somewhere.
+        for (int rep = 0; rep < 24; rep++)
+        {
         var x = RandomX(rng, d);
         // Layer 0: both adapters -> concatenated reference with per-row alpha (B scaled by weight 0.5).
         var cd = sa[0].Down.Concat(sb[0].Down).ToArray();
@@ -334,6 +338,7 @@ public sealed unsafe class TernaryAdapterTests : IDisposable
         var g2 = (float[])x1.Clone(); comp.ModifyResidual(g2, 2, 1);
         var e2 = Reference(x1, d, 4, sb[1].Down, sb[1].UpT, Enumerable.Repeat(0.5f, 4).ToArray(), true);
         AssertBitEqual(e2, g2, "layer 2 == B*0.5 alone");
+        }
 
         Assert.Throws<NotSupportedException>(() => TernaryAdapterComposer.Compose([a, b], null, maxRank: 11));
     }
