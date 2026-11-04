@@ -4,8 +4,8 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 
 /// <summary>
 /// Text-first fixed-size chunks, <c>lines-N</c> (E4c ran this chunker as <c>fixed-text-512</c>; every chunk round-trips by
-/// construction, but <c>lines-512</c> is on the wire allow-list only from Phase I Task 19, see
-/// <see cref="WireChunking.PendingE4c"/>): the file <b>text</b> is cut into pieces of at most
+/// construction; <c>lines-512</c> is on the wire allow-list from Phase I Task 19, see
+/// <see cref="WireChunking.Eligible"/>): the file <b>text</b> is cut into pieces of at most
 /// <see cref="MaxChunkTokens"/> tokens each, and every piece is tokenised alone (<see cref="ChunkTokenization.Encode"/>, no BOS; every size probe too, so a
 /// piece whose special-token spellings encode as several plain tokens never exceeds the limit).
 /// A server that receives a piece as text and tokenises it reproduces exactly the chunk's ids, which is not true of
@@ -18,7 +18,10 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// bound holds even where token count is not monotone in length). The cut is the last line end ('\n') inside that piece when
 /// there is one; otherwise that character boundary, moved back so that it splits neither a surrogate pair (a 4-byte UTF-8
 /// sequence; BMP characters are whole <see cref="char"/>s) nor a "\r\n". When the rest of the file fits, it is the last chunk.
-/// Text is used as given (CRLF is kept); offsets and lines are exact.
+/// Cuts are <b>token-stable</b> (<see cref="ChunkBoundary"/>, Phase I Task 19): a cut is taken only where the tokenisation of
+/// the text joined across it equals the concatenation of the two sides' tokenisations, backing off to the previous stable line
+/// end, then to a stable character cut; only when none is in reach is the greedy cut used (its edge may merge). Text is used
+/// as given (CRLF is kept); offsets and lines are exact.
 /// </remarks>
 public sealed class LinesChunker : IChunker
 {
@@ -86,7 +89,42 @@ public sealed class LinesChunker : IChunker
             throw new InvalidOperationException(
                 $"The character at offset {start} tokenises to more than {n} tokens on its own; it cannot be chunked without splitting it.");
 
-        // Prefer the last line end inside the piece (the furthest one that fits when token count is not monotone).
+        // Prefer the last line end inside the piece (the furthest one that fits when token count is not monotone) whose edge is
+        // token-stable (ChunkBoundary): a line end followed by another newline would merge with it when the chunks are shown
+        // back to back, so it is skipped for the previous line end.
+        for (int i = lo - 1; i >= start; i--)
+        {
+            if (text[i] != '\n') continue;
+            if (!ChunkBoundary.IsStableAt(_tokenizer, text, i + 1)) continue;
+            if (i + 1 == lo) return (lo, loIds);
+            int[] ids = ChunkTokenization.Encode(_tokenizer, text[start..(i + 1)]);
+            if (ids.Length <= n) return (i + 1, ids);
+        }
+
+        // No stable line end fits: the furthest stable character cut (at most MaxCharCutProbes tried), never inside a
+        // surrogate pair or between '\r' and '\n'.
+        int probes = 0;
+        for (int end = lo; end > start && probes < MaxCharCutProbes; end--)
+        {
+            if (SplitsPair(text, end) || (text[end - 1] == '\r' && end < text.Length && text[end] == '\n')) continue;
+            probes++;
+            if (!ChunkBoundary.IsStableAt(_tokenizer, text, end)) continue;
+            if (end == lo) return (lo, loIds);
+            int[] ids = ChunkTokenization.Encode(_tokenizer, text[start..end]);
+            if (ids.Length <= n) return (end, ids);
+        }
+
+        // No stable edge in reach (a run that merges across every cut): the pre-Task-19 greedy cut, whose edge may merge when
+        // shown back to back (the server then reports chunk_template_altered). Coverage and the size limit still hold.
+        return GreedyCut(text, start, lo, loIds);
+    }
+
+    /// <summary>Character cuts tried (stable or not) before giving up on a stable edge.</summary>
+    private const int MaxCharCutProbes = 256;
+
+    private (int End, int[] Ids) GreedyCut(string text, int start, int lo, int[] loIds)
+    {
+        int n = MaxChunkTokens;
         for (int i = lo - 1; i >= start; i--)
         {
             if (text[i] != '\n') continue;
