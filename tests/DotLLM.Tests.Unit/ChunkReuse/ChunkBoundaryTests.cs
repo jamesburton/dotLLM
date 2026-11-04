@@ -117,8 +117,9 @@ public sealed class ChunkBoundaryTests
     [InlineData(20)]
     public void LinesChunker_NoStableLineEnd_FallsBackToAStableCharacterCut(int n)
     {
-        // Every line starts with 'x', so every line end merges with its successor ("\nx"): the cut must be a character cut.
-        var tok = new NewlineXTokenizer();
+        // Every line starts with 'x', so every line end merges with its successor ("\nx", which costs 2 tokens where a lone
+        // "\n" costs 1, so the furthest fitting cut can fall right after a line end): the cut must be a stable character cut.
+        var tok = new NewlineXTokenizer('x', 2);
         var file = new SourceFile("f.cs", string.Concat(Enumerable.Range(0, 20).Select(i => "xline" + i + "\n")));
         AssertEdgesStable(tok, file, new LinesChunker(tok, n).Chunk(file), n);
     }
