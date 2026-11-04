@@ -480,6 +480,12 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         _host.Q4RecordMatmul(cmd, ld.OutProj!, ld.OutProjQt, y, st.NormOutput, H, H, T);
     }
 
+    /// <summary>A/B switch (<c>DOTLLM_VK_LFM3_SLIDING_OPT=0</c>): restores the pre-#1572 behaviour (full-range split-KV, per-head flash) for sliding layers.</summary>
+    internal static readonly bool SlidingOptDisabled = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM3_SLIDING_OPT") == "0";
+
+    /// <summary>Counters proving which sliding-layer path ran (decodes with a clipped KV range; prefills on the GQA flash kernel).</summary>
+    internal static long SlidingClippedDecodes, SlidingFlashPrefills;
+
     /// <summary>
     /// First KV position a sliding-window layer still reads after a forward of <paramref name="tokens"/> rows starting at absolute
     /// position <paramref name="positionOffset"/>: the LAST row (position <c>pos = positionOffset + tokens - 1</c>) attends
@@ -534,8 +540,10 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         // Windowed layers only need the last `window` keys: decode clips the split-KV range to them (kvStart), and the GQA flash
         // kernel skips whole KV tiles before each workgroup's window start. The per-head coopmat / scalar flash kernels mask but
         // still walk every tile, so a 32K prefill of the 5 sliding layers would cost as much as the 6 global ones.
-        int kvStart = SlidingKvStart(posOff, T, window);
-        var gqaFlash = T > 1 && window > 0 ? _slidingFlash : null;
+        int kvStart = SlidingOptDisabled ? 0 : SlidingKvStart(posOff, T, window);
+        var gqaFlash = !SlidingOptDisabled && T > 1 && window > 0 ? _slidingFlash : null;
+        if (kvStart > 0) SlidingClippedDecodes++;
+        if (gqaFlash is not null) SlidingFlashPrefills++;
         if (kern.SplitKvAttention is not null && T == 1 && hd <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv - kvStart, nh))
             kern.SplitKvAttention.Record(cmd, st.Q, kSrc, vSrc, st.AttnOutput, seqQ: T, seqKv: seqKv, numHeads: nh, numKvHeads: nkv,
