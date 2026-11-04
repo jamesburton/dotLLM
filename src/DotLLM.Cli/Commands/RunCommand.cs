@@ -368,6 +368,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [CommandOption("--lora")]
         [Description("Path to a PEFT LoRA adapter dir; repeatable to stack adapters, optional weight 'path=0.7'. Omit for base.")]
         public string[] LoraPaths { get; set; } = Array.Empty<string>();
+
+        /// <summary>
+        /// Ternary steering adapter package(s) (<c>.nsadapter</c>, docs/TERNARY_ADAPTER.md), CPU backend only.
+        /// Repeatable — two or more are rank-concatenated into one pass.
+        /// </summary>
+        [CommandOption("--ternary-adapter")]
+        [Description("Path to a ternary residual adapter (.nsadapter), CPU only; repeatable to compose. Omit for base.")]
+        public string[] TernaryAdapterPaths { get; set; } = Array.Empty<string>();
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -588,6 +596,41 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 // Multiple adapters: compose into a single rank-concatenated adapter.
                 compositeAdapter = LoraComposer.Compose(stack, config);
                 loraAdapter = compositeAdapter;
+            }
+        }
+
+        // Ternary residual adapter(s) (#1616): CPU TransformerModel only; attached as the model's residual modifier.
+        var ternaryInner = new List<DotLLM.Models.Adapters.Ternary.TernaryResidualAdapter>();
+        DotLLM.Models.Adapters.Ternary.TernaryResidualAdapter? ternaryComposite = null;
+        DotLLM.Models.Architectures.TransformerModel? ternaryHost = null;
+        if (settings.TernaryAdapterPaths.Length > 0)
+        {
+            ternaryHost = model as DotLLM.Models.Architectures.TransformerModel;
+            if (ternaryHost is null)
+            {
+                Console.Error.WriteLine("--ternary-adapter is only supported on the CPU transformer backend (use --device cpu).");
+                foreach (var inner in innerAdapters) inner.Dispose();
+                model.Dispose(); gguf?.Dispose(); safetensorsSource?.Dispose();
+                return 1;
+            }
+            try
+            {
+                foreach (string p in settings.TernaryAdapterPaths)
+                    ternaryInner.Add(DotLLM.Models.Adapters.Ternary.NsAdapterFile.Open(p));
+                var active = ternaryInner.Count == 1
+                    ? ternaryInner[0]
+                    : (ternaryComposite = DotLLM.Models.Adapters.Ternary.TernaryAdapterComposer.Compose(ternaryInner));
+                active.ValidateFor(config.HiddenSize, config.NumLayers);
+                ternaryHost.ResidualModifier = active;
+            }
+            catch (Exception ex) when (ex is InvalidDataException or InvalidOperationException or NotSupportedException or IOException)
+            {
+                Console.Error.WriteLine($"--ternary-adapter: {ex.Message}");
+                ternaryComposite?.Dispose();
+                foreach (var t in ternaryInner) t.Dispose();
+                foreach (var inner in innerAdapters) inner.Dispose();
+                model.Dispose(); gguf?.Dispose(); safetensorsSource?.Dispose();
+                return 1;
             }
         }
 
@@ -1095,6 +1138,9 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
         finally
         {
+            if (ternaryHost is not null) ternaryHost.ResidualModifier = null;
+            ternaryComposite?.Dispose();
+            foreach (var t in ternaryInner) t.Dispose();
             // Dispose in reverse dependency order: composite first, then each inner adapter.
             compositeAdapter?.Dispose();
             foreach (var inner in innerAdapters)
