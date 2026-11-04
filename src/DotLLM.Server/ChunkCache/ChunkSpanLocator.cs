@@ -62,8 +62,14 @@ internal static class ChunkSpanLocator
     /// <summary>Most sentinel renders per request (the real prompt is rendered by the caller, not here).</summary>
     internal const int MaxSentinelRenders = 4;
 
+    private const char Open = '';
+    private const char Close = '';
+    private const string Probe = "\"\\\n";
+    private const char Marker = ControlTokenGuard.Marker;
 
     private static readonly LocatedSpans None = new([], []);
+
+    private enum State : byte { Candidate, Located, Altered, Invalid }
 
     /// <summary>Locates <paramref name="spans"/> in <paramref name="rendered"/>.</summary>
     /// <param name="template">The template that rendered the prompt.</param>
@@ -93,7 +99,285 @@ internal static class ChunkSpanLocator
         if (n == 0)
             return None;
 
-        // Stub (test-first commit): nothing is located yet; every span is reported as template-altered.
-        return new LocatedSpans([], [new ChunkWarning(ChunkCacheCodes.TemplateAltered, n)]);
+        var state = new State[n];
+        var msgOf = new int[n];
+        var startR = new int[n];
+        var endR = new int[n];
+
+        // 1. Each span must sit in its engine message where the parser said (offset by the profile prompt), and must not
+        //    carry a caller U+FDD0. Overlaps inside one message (impossible from the parser) keep the earlier input.
+        var byMessage = new Dictionary<int, List<int>>();
+        for (int k = 0; k < n; k++)
+        {
+            var span = spans[k];
+            int m = span.Engine.EngineMessage + engineMessageOffset;
+            string? content = m >= 0 && m < messages.Count ? messages[m].Content : null;
+            if (content is null || span.Engine.StartChar < 0 || span.Engine.StartChar >= span.Engine.EndChar
+                || span.Engine.EndChar > content.Length
+                || !content.AsSpan(span.Engine.StartChar, span.Engine.EndChar - span.Engine.StartChar).SequenceEqual(span.Text))
+            {
+                state[k] = State.Invalid;
+                continue;
+            }
+            if (span.Text.Contains(Marker))
+            {
+                state[k] = State.Altered;
+                continue;
+            }
+            msgOf[k] = m;
+            if (!byMessage.TryGetValue(m, out var list))
+                byMessage[m] = list = [];
+            list.Add(k);
+        }
+        foreach (var list in byMessage.Values)
+        {
+            list.Sort((a, b) => spans[a].Engine.StartChar != spans[b].Engine.StartChar
+                ? spans[a].Engine.StartChar.CompareTo(spans[b].Engine.StartChar)
+                : a.CompareTo(b));
+            int end = -1, kept = -1;
+            foreach (int k in list)
+            {
+                if (spans[k].Engine.StartChar < end)
+                {
+                    state[Math.Max(k, kept)] = State.Invalid; // the later one in input order
+                    if (k < kept)
+                    {
+                        kept = k;
+                        end = spans[k].Engine.EndChar;
+                    }
+                    continue;
+                }
+                kept = k;
+                end = spans[k].Engine.EndChar;
+            }
+            list.RemoveAll(k => state[k] != State.Candidate);
+        }
+
+        // 2. Sentinel renders.
+        string prefix = Open + nonce + ":";
+        var pos = new int[n];
+        for (int pass = 0; pass < MaxSentinelRenders; pass++)
+        {
+            if (Array.IndexOf(state, State.Candidate) < 0)
+                break;
+
+            string s;
+            try
+            {
+                s = template.Apply(WithSentinels(messages, spans, byMessage, state, prefix), options);
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                break; // every span still being tried is altered (below)
+            }
+
+            // Find every sentinel: once, intact. Others broke (escaped, dropped, duplicated): altered.
+            Array.Fill(pos, -1);
+            FindSentinels(s, prefix, state, pos);
+            bool anyBroken = false;
+            for (int k = 0; k < n; k++)
+            {
+                if (state[k] == State.Candidate && pos[k] < 0)
+                {
+                    state[k] = State.Altered;
+                    anyBroken = true;
+                }
+            }
+
+            var order = new List<int>();
+            for (int k = 0; k < n; k++)
+                if (state[k] == State.Candidate)
+                    order.Add(k);
+            if (order.Count == 0)
+                continue;
+            order.Sort((a, b) => pos[a].CompareTo(pos[b]));
+
+            // The render with the span texts substituted back, and each span's range in it.
+            var aS = new int[n];
+            var bS = new int[n];
+            string substituted = Substitute(s, spans, order, pos, prefix, aS, bS);
+
+            var proven = new bool[n];
+            bool equal = Walk(rendered, substituted, order, aS, bS, startR, endR, proven);
+            var unproven = new List<int>();
+            foreach (int k in order)
+            {
+                if (equal || proven[k])
+                    state[k] = State.Located;
+                else
+                    unproven.Add(k);
+            }
+
+            // A broken sentinel explains the difference; otherwise blame the spans at its two ends.
+            if (!anyBroken && unproven.Count > 0)
+            {
+                state[unproven[0]] = State.Altered;
+                state[unproven[^1]] = State.Altered;
+            }
+        }
+
+        // 3. Result.
+        var located = new List<LocatedSpan>();
+        int altered = 0, invalid = 0;
+        for (int k = 0; k < n; k++)
+        {
+            switch (state[k])
+            {
+                case State.Located:
+                    located.Add(new LocatedSpan(spans[k], startR[k], endR[k]));
+                    break;
+                case State.Invalid:
+                    invalid++;
+                    break;
+                default:
+                    altered++; // Altered, or still a candidate after the last render
+                    break;
+            }
+        }
+        var warnings = new List<ChunkWarning>();
+        if (altered > 0)
+            warnings.Add(new ChunkWarning(ChunkCacheCodes.TemplateAltered, altered));
+        if (invalid > 0)
+            warnings.Add(new ChunkWarning(ChunkCacheCodes.SpanInvalid, invalid));
+        return new LocatedSpans(located, warnings);
+    }
+
+    private static string Sentinel(string prefix, int k) =>
+        prefix + k.ToString(CultureInfo.InvariantCulture) + Probe + Close;
+
+    /// <summary>The messages with every candidate span replaced by its sentinel (other messages are the same objects).</summary>
+    private static ChatMessage[] WithSentinels(IReadOnlyList<ChatMessage> messages, IReadOnlyList<ChunkSpanRef> spans,
+        Dictionary<int, List<int>> byMessage, State[] state, string prefix)
+    {
+        var copy = new ChatMessage[messages.Count];
+        for (int m = 0; m < copy.Length; m++)
+            copy[m] = messages[m];
+        foreach (var (m, list) in byMessage)
+        {
+            string content = messages[m].Content;
+            StringBuilder? sb = null;
+            int at = 0;
+            foreach (int k in list)
+            {
+                if (state[k] != State.Candidate)
+                    continue;
+                sb ??= new StringBuilder(content.Length + 64);
+                sb.Append(content, at, spans[k].Engine.StartChar - at).Append(Sentinel(prefix, k));
+                at = spans[k].Engine.EndChar;
+            }
+            if (sb is not null)
+                copy[m] = messages[m] with { Content = sb.Append(content, at, content.Length - at).ToString() };
+        }
+        return copy;
+    }
+
+    /// <summary>Records each candidate's sentinel position in <paramref name="s"/>; a sentinel seen twice is -2 (broken).</summary>
+    private static void FindSentinels(string s, string prefix, State[] state, int[] pos)
+    {
+        int i = 0;
+        while ((i = s.IndexOf(Open, i)) >= 0)
+        {
+            if (!s.AsSpan(i).StartsWith(prefix, StringComparison.Ordinal))
+            {
+                i++;
+                continue;
+            }
+            int d = i + prefix.Length, k = 0, digits = 0;
+            while (d < s.Length && s[d] is >= '0' and <= '9' && digits < 9)
+            {
+                k = k * 10 + (s[d] - '0');
+                d++;
+                digits++;
+            }
+            if (digits == 0 || k < 0 || k >= state.Length || state[k] != State.Candidate
+                || !s.AsSpan(d).StartsWith(Probe + Close, StringComparison.Ordinal))
+            {
+                i++;
+                continue;
+            }
+            pos[k] = pos[k] == -1 ? i : -2;
+            i = d + Probe.Length + 1;
+        }
+        for (int k = 0; k < pos.Length; k++)
+            if (pos[k] == -2)
+                pos[k] = -1;
+    }
+
+    /// <summary>The sentinel render with each span text in place of its sentinel; <paramref name="aS"/> / <paramref name="bS"/>
+    /// receive each span's range in the result.</summary>
+    private static string Substitute(string s, IReadOnlyList<ChunkSpanRef> spans, List<int> order, int[] pos, string prefix,
+        int[] aS, int[] bS)
+    {
+        var sb = new StringBuilder(s.Length);
+        int at = 0;
+        foreach (int k in order)
+        {
+            sb.Append(s, at, pos[k] - at);
+            Debug.Assert(!spans[k].Text.Contains(Marker), "a span with U+FDD0 must be ignored before Walk (its proof relies on it)");
+            aS[k] = sb.Length;
+            sb.Append(spans[k].Text);
+            bS[k] = sb.Length;
+            at = pos[k] + Sentinel(prefix, k).Length;
+        }
+        return sb.Append(s, at, s.Length - at).ToString();
+    }
+
+    /// <summary>
+    /// Compares the real prompt <paramref name="r"/> with the substituted render <paramref name="t"/>, U+FDD0 skipped on
+    /// both sides, from the start and then from the end. A span whose every char is matched in one walk is proven, with
+    /// its range in <paramref name="r"/>. Returns whether the two are equal.
+    /// </summary>
+    private static bool Walk(string r, string t, List<int> order, int[] aS, int[] bS, int[] startR, int[] endR, bool[] proven)
+    {
+        // From the start. CORRECTNESS DEPENDS ON span texts carrying no U+FDD0 (spans with one are ignored before any
+        // render): every span char of t is then matched, never skipped, so the first and last span chars are always
+        // visited at aS and bS - 1, and a span is proven only when all its chars matched. Markers in r are skipped
+        // before a match, so a recorded start is never a marker.
+        int i = 0, j = 0, ps = 0, pe = 0;
+        while (true)
+        {
+            while (i < r.Length && r[i] == Marker)
+                i++;
+            while (j < t.Length && t[j] == Marker)
+                j++;
+            if (i == r.Length || j == t.Length || r[i] != t[j])
+                break;
+            if (ps < order.Count && aS[order[ps]] == j)
+                startR[order[ps++]] = i;
+            if (pe < order.Count && bS[order[pe]] - 1 == j)
+            {
+                endR[order[pe]] = i + 1;
+                proven[order[pe++]] = true;
+            }
+            i++;
+            j++;
+        }
+        if (i == r.Length && j == t.Length)
+            return true;
+
+        // From the end, never into what the first walk matched.
+        int iLow = i, jLow = j;
+        i = r.Length - 1;
+        j = t.Length - 1;
+        int qs = order.Count - 1, qe = order.Count - 1;
+        while (true)
+        {
+            while (i >= iLow && r[i] == Marker)
+                i--;
+            while (j >= jLow && t[j] == Marker)
+                j--;
+            if (i < iLow || j < jLow || r[i] != t[j])
+                break;
+            if (qe >= 0 && bS[order[qe]] - 1 == j)
+                endR[order[qe--]] = i + 1;
+            if (qs >= 0 && aS[order[qs]] == j)
+            {
+                startR[order[qs]] = i;
+                proven[order[qs--]] = true;
+            }
+            i--;
+            j--;
+        }
+        return false;
     }
 }
