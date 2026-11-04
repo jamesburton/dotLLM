@@ -93,12 +93,14 @@ public sealed unsafe class TernaryZeroMulProbe
         return o;
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(128, 8, 1)]
     [InlineData(512, 7, 3)]
     [InlineData(1280, 33, 4)]
     public void K2_And_K3_MatchTheirOracles(int k, int m, int n)
     {
+        // The probe kernels are AVX2-only experiments (not production code); the production planar kernel has its own all-ISA test below.
+        Skip.IfNot(Avx2.IsSupported, "probe kernels need AVX2");
         var rng = new Random(1616 + k);
         byte[] w = RandomPq2Rows(rng, m, k);
         var x = new float[n * k];
@@ -167,8 +169,18 @@ public sealed unsafe class TernaryZeroMulProbe
             MatMul.GemvPQ2_0(wp, xp, a, m, k, null);
             MatMul.GemvPQ2_0Planar(wp, xp, b, m, k, null);
         }
+        // Portable fallback (what runs when AVX2 is disabled): same activations/grid, scalar accumulation.
+        var cSc = new float[m];
+        var pq = new sbyte[k]; var ps = new float[k / 32]; var pc = new float[k / 128];
+        fixed (byte* wp = w) fixed (float* xp = x) fixed (float* o = cSc) fixed (sbyte* pqp = pq) fixed (float* psp = ps) fixed (float* pcp = pc)
+        {
+            MatMul.PreparePlanarActivations(xp, k, pqp, psp, pcp);
+            MatMul.PQ2PlanarRowsScalar(wp, pqp, psp, pcp, o, 0, m, k);
+        }
         double rms = Math.Sqrt(truth.Sum(v => v * v) / m);
         double Err(float[] c) => Math.Sqrt(Enumerable.Range(0, m).Sum(i => Math.Pow(c[i] - truth[i], 2)) / m) / rms;
+        Assert.True(Err(cSc) < 0.02, $"scalar planar rel-RMS error {Err(cSc)}");
+        for (int r = 0; r < m; r++) Assert.InRange(Math.Abs(cSc[r] - cPl[r]), 0, 2e-4 * (1 + Math.Abs(cSc[r])));   // AVX2 vs scalar: float-rounding only
         Assert.True(Err(cPl) < 0.02, $"planar rel-RMS error {Err(cPl)}");
         Assert.True(Err(cPl) < 3 * Err(cProd) + 1e-4, $"planar {Err(cPl)} vs production {Err(cProd)}");
         // Perturbation proof the planar path really ran: a different quantization grid cannot be bit-identical to Q8_0.

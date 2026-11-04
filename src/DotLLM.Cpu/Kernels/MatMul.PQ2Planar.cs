@@ -95,9 +95,48 @@ public static unsafe partial class MatMul
     }
 
     /// <summary>Rows [start, start+count) of the planar dot. See the class summary.</summary>
+    internal static void PQ2PlanarRows(byte* w, sbyte* xq, float* xs, float* xc, float* result, int start, int count, int k)
+    {
+        if (Avx2.IsSupported) PQ2PlanarRowsAvx2(w, xq, xs, xc, result, start, count, k);
+        else PQ2PlanarRowsScalar(w, xq, xs, xc, result, start, count, k);
+    }
+
+    /// <summary>
+    /// Portable fallback (used when AVX2 is unavailable or disabled): exact integer per-plane sums, float combine in the
+    /// same group order as the AVX2 path but with scalar accumulation, so results agree to float rounding, not bitwise.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void PQ2PlanarRowsScalar(byte* w, sbyte* xq, float* xs, float* xc, float* result, int start, int count, int k)
+    {
+        int groups = k / PQ2_0GroupSize;
+        for (int r = start; r < start + count; r++)
+        {
+            byte* row = w + (long)r * groups * PQ2_0GroupBytes;
+            float acc = 0f, corr = 0f;
+            for (int g = 0; g < groups; g++)
+            {
+                byte* gp = row + g * PQ2_0GroupBytes;
+                float gs = HalfToSingle(gp);
+                byte* codes = gp + 2;
+                sbyte* xg = xq + g * PQ2_0GroupSize;
+                float gacc = 0f;
+                for (int i = 0; i < 4; i++)
+                {
+                    int isum = 0;
+                    for (int b = 0; b < 32; b++)
+                        isum += ((codes[b] >> (2 * i)) & 3) * xg[i * 32 + b];
+                    gacc += isum * xs[g * 4 + i];
+                }
+                acc += gacc * gs;
+                corr += gs * xc[g];
+            }
+            result[r] = acc - corr;
+        }
+    }
+
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    internal static void PQ2PlanarRows(byte* w, sbyte* xq, float* xs, float* xc, float* result, int start, int count, int k)
+    internal static void PQ2PlanarRowsAvx2(byte* w, sbyte* xq, float* xs, float* xc, float* result, int start, int count, int k)
     {
         int groups = k / PQ2_0GroupSize;
         bool vnni = AvxVnni.IsSupported;
