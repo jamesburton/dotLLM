@@ -1190,6 +1190,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     // window-local (0..NumLayers-1), but the FULL-length CPU-side per-layer lookups (cpuWeights.Layers
     // and Config.PerLayerSlidingWindow) are offset by _firstLayer at read time. Set by BuildModel.
     private int _firstLayer;
+
+    /// <summary>
+    /// Optional device-side in-place modifier of the residual stream after each layer (<c>HookPoint.PostLayer</c>), e.g. a
+    /// <see cref="VulkanTernaryResidualModifier"/> (#1618). Null (the default) costs one branch per layer. Single-threaded per
+    /// model instance, like the LoRA adapter. Honoured by the per-sequence <c>Forward</c> core; <see cref="ForwardBatch"/> routes
+    /// every sequence through it while a modifier is attached. Not honoured by the other Vulkan model hosts (hybrid/MoE).
+    /// </summary>
+    public IVulkanResidualModifier? ResidualModifier { get; set; }
     // VRAM-trim flags for pipeline stages (both false on a normal single-device model). Set by BuildModel.
     // _headless: non-last stage — the final-norm/LM-head weights are 64-byte stubs and Forward returns a
     // dummy logits tensor right after the layer loop (the caller reads DownloadHiddenState instead).
@@ -3785,7 +3793,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             || Config.IsGemma4DensePle
             || Config.HasDistinctValueHeadDim
             || Config.AttentionValueScale is not null
-            || Config.DiffusionConfig is not null;
+            || Config.DiffusionConfig is not null
+            || ResidualModifier is not null;   // #1618: the per-sequence core is the one with the PostLayer hook
         for (int layer = 0; layer < Config.NumLayers && !modelHasMlaOrMoe; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
@@ -4442,6 +4451,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         ProfSample("embed");
         DpStamp(cmdBuf, DpCatEmbed);
 
+        var residualModifier = ResidualModifier;
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {
             // Decode record/execute overlap (issue #143): after the first few
@@ -5069,6 +5079,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 }
             }
 
+            // Device-side PostLayer residual modifier (#1618), e.g. a ternary steering adapter. In place on the
+            // post-layer HiddenState; null (the default) costs this one branch per layer.
+            if (residualModifier is not null && residualModifier.AppliesTo(_firstLayer + layer))
+            {
+                BarrierComputeToCompute(cmdBuf);
+                residualModifier.Record(cmdBuf, _state.HiddenState, _firstLayer + layer, seqLen, hiddenSize);
+            }
+
             // COMPUTE→COMPUTE between layers — next iteration's first op is
             // the attention RMSNorm, which reads the freshly-rotated
             // HiddenState written by the add.
@@ -5551,6 +5569,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
 
     private void InvalidateKernelCaches()
     {
+        ResidualModifier?.InvalidateDescriptorCache();
         _matmul.InvalidateDescriptorCache();
         _matmulQ8.InvalidateDescriptorCache();
         _matmulQ8Gemm.InvalidateDescriptorCache();
