@@ -45,6 +45,8 @@
       <FmadFlag></FmadFlag>
       <CxxStdFlag></CxxStdFlag>
       <Arch>$(CudaArch)</Arch>
+      <!-- WarnAndContinue makes a failing nvcc a warning instead of a build error (see Optional kernels below). -->
+      <ContinueOnError>false</ContinueOnError>
     </CudaKernel>
     <!-- Kernels using CUDA Cooperative Groups (grid.sync()) need libcu++ (cccl), which requires
          at least C++17 — nvcc's default dialect for this MSVC toolchain is lower, failing with
@@ -68,6 +70,13 @@
          arch does not reduce portability for the rest of the PTX tree. -->
     <CudaKernel Update="$(CudaKernelDir)\pq2_0_mmq_mma.cu;$(CudaKernelDir)\attention_flash_mma.cu;$(CudaKernelDir)\attention_flash_mma_decode_gqa_split.cu;$(CudaKernelDir)\attention_flash_mma_decode_gqa_split_kvq.cu;$(CudaKernelDir)\attention_flash_mma_prefill_hd256.cu;$(CudaKernelDir)\attention_flash_mma_prefill_hd256_kvq.cu">
       <Arch>compute_86</Arch>
+    </CudaKernel>
+    <!-- Optional kernels (#1625): a failing nvcc (e.g. CUDA 13.1 with a host compiler it does not support,
+         VS 2026) only WARNS; the committed native/ptx/<name>.ptx (built with CUDA 12.8, .version 8.7) is
+         used if present, otherwise the C# wrapper reports the kernel unavailable and its tests skip. Uses
+         explicit __fmul_rn/__fadd_rn/__fdiv_rn, so it needs no -fmad flag. -->
+    <CudaKernel Update="$(CudaKernelDir)\ternary_adapter_residual_f32.cu">
+      <ContinueOnError>WarnAndContinue</ContinueOnError>
     </CudaKernel>
     <!-- Element-wise kernels: safe for fast_math (no expf/rsqrtf/sinf/cosf accumulation) -->
     <CudaKernel Update="$(CudaKernelDir)\add.cu;$(CudaKernelDir)\add_f32.cu;$(CudaKernelDir)\swiglu.cu;$(CudaKernelDir)\swiglu_f32.cu;$(CudaKernelDir)\convert.cu;$(CudaKernelDir)\bias_add.cu;$(CudaKernelDir)\bias_add_f32.cu;$(CudaKernelDir)\embedding.cu;$(CudaKernelDir)\embedding_f32out.cu;$(CudaKernelDir)\dequant.cu;$(CudaKernelDir)\quant_kv.cu">
@@ -119,6 +128,7 @@
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="Compiling %(CudaKernel.Filename).cu to PTX" />
     <Exec Condition="'$(_NvccExitCode)' == '0'"
           Command="nvcc -ptx -arch=%(CudaKernel.Arch) $(CudaAllowUnsupportedCompiler) %(CudaKernel.FastMathFlag) %(CudaKernel.FmadFlag) %(CudaKernel.CxxStdFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          ContinueOnError="%(CudaKernel.ContinueOnError)"
           StandardOutputImportance="low" />
   </Target>
 
