@@ -228,6 +228,7 @@ public sealed unsafe class Nvfp4Tests
     [InlineData(37, 320, 64, false)]
     [InlineData(72, 256, 65, true)]
     [InlineData(130, 128, 131, true)]
+    [InlineData(520, 2048, 70, true)]
     public void GemmNvfp4_BitIdenticalToScalar(int m, int k, int n, bool pooled)
     {
         var rng = new Random(m * 1009 + k * 7 + n);

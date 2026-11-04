@@ -127,7 +127,18 @@ BERT and gemma-embedding loaders still refuse scaled NVFP4. Measured on
 CPU 24.36 +/- 2.94 vs llama.cpp (master dde879bc, `-dev none`) 24.26 +/- 2.91.
 
 The CPU vec_dot pairs NVFP4 with Q8_0 activations (two Q8_0 blocks per NVFP4 block),
-a transcription of llama.cpp's `ggml_vec_dot_nvfp4_q8_0` (scalar + AVX2). Vulkan keeps
+a transcription of llama.cpp's `ggml_vec_dot_nvfp4_q8_0` (scalar + AVX2). Since #1587 every CPU path
+(scalar, single-row AVX2, the eight-row multi-column prefill/decode kernel `ComputeRowsNvfp4Avx2_8Rows`) is
+**bit-identical**: exact int32 sub-block sums, then the scalar float recurrence `sumf += (dy*d)*sumi` in
+sub-block order. The eight-row kernel (rows one per lane, 64-token chunks, kvalues shifted to `u = kv + 12`
+for `vpdpbusd` with `-12*Sum(q)` folded into the accumulator start) unpacks each weight block once for all
+tokens: 12.2 -> 3.5-4.0 ms at m=4096 k=2048 n=256 on Zen 5 (Q4_1: 2.7-3.1 ms), a token's result no longer
+depends on the batch. `DOTLLM_CPU_NVFP4_ROWS8=0` restores the row-at-a-time path. Note this changed the
+float summation order versus the pre-#1587 AVX2 (8-lane FMA partials, which mirrored llama.cpp's x86 order),
+which moved Flint wikitext perplexity on a 4-window (2048-token) CPU run from 25.39 to 26.23 and on a
+2-window run from 23.30 to 24.84 (same weights, same Q8_0 activations; only the float accumulation order
+differs, and the new kernel is bit-equal to the scalar transcription that the llama.cpp oracle tests pin).
+Treat that as the rounding-order sensitivity floor of this 256-expert top-6 model when comparing engines (#1584). Vulkan keeps
 the blocks packed and dequantizes in the shader against FP32 activations
 (`matmul_nvfp4_f32_gemv/gemm`, shared `nvfp4_decode.glsl`), applying `X.scale` to the output.
 CUDA (`native/kernels/nvfp4.cu`) decodes with a dp4a GEMV (`nvfp4_gemv_q8`, #1061): the token
