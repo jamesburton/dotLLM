@@ -79,7 +79,7 @@ public sealed unsafe class TernaryResidualHook : IResidualModifier, IDisposable
     /// <summary>Convenience: loads each package path and registers it (in order).</summary>
     public static TernaryResidualHook Load(IEnumerable<string> paths)
     {
-        var pkgs = paths.Select(NsAdapterPackage.Load).ToList();
+        var pkgs = paths.SelectMany(NsAdapterGguf.LoadAny).ToList();   // .nsadapter ZIPs and adapter GGUFs (#1619), detected by magic
         if (pkgs.Count == 0) throw new ArgumentException("no adapter paths given");
         var hook = new TernaryResidualHook(pkgs[0].Manifest.InputDimension);
         try { foreach (var p in pkgs) hook.Add(p); }
@@ -212,11 +212,15 @@ public sealed unsafe class TernaryResidualHook : IResidualModifier, IDisposable
         _f = (float*)AllocZero((long)(maxRank + maxCount) * 4);
     }
 
+    /// <summary>Finalizer: a hook attached to a long-lived model (the server) is owned by that model and reclaimed with it.</summary>
+    ~TernaryResidualHook() => Dispose();
+
     /// <inheritdoc/>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        GC.SuppressFinalize(this);
         foreach (var (_, c) in _circuits)
         {
             NativeMemory.AlignedFree(c.Down); NativeMemory.AlignedFree(c.UpT);

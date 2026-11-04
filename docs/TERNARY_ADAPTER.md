@@ -43,7 +43,7 @@ dotLLM rejects (`InvalidDataException`): not a zip, missing entries, entries lar
 tensor dimensions that disagree with `Rank x D` / `D x Rank`, non-positive rank/D, negative layer, non-finite alpha/threshold, missing or mismatching checksums.
 `ValidateFor(hidden, layers)` additionally rejects a D or layer that does not fit the model. `ToGgufMetadata()` returns the reference's key set
 (`neuro_symbolic.{domain,target_model,layer,target_layer,input_dimension,rank,alpha,activation_threshold,description,created_at,down_checksum,up_checksum}`);
-reading adapters *from* GGUF is not implemented (#1619).
+reading adapters back from GGUF is described in [GGUF form](#gguf-form-1619).
 
 Files written by dotLLM load in the reference loader (checked) and the reference's sample adapters are test fixtures.
 
@@ -58,14 +58,62 @@ Files written by dotLLM load in the reference loader (checked) and the reference
 - **Several adapters** (also at the same layer) are evaluated in one pass sharing one int8 quantization of the row, in registration order, deltas summed like the
   reference's delta buffer. This is the rank-concatenation idea of `LoraComposer`, but `LoraComposer` composes F32 `ILoraAdapter` weights into one concatenated matrix pair and
   cannot express per-adapter ReLU/int8 requantization or per-row scales, so the ternary composition lives in the hook. Summed rank per layer is capped at 256.
-- **Scales are F32 metadata** (CLAUDE.md #1107): `downScale[rank]` + `upScale[D]` floats per adapter (about 16 KB at D=4096). Weights are never expanded; the masks are the packed weights.
-- CLI: `dotllm run ... --ternary-adapter a.nsadapter [--ternary-adapter b.nsadapter]` (CPU backend). x86 AVX2 + scalar paths; other ISAs use the scalar path (NEON is a follow-up).
+- **Scales are metadata** (CLAUDE.md #1107): `downScale[rank]` + `upScale[D]` per adapter (about 16 KB F32 at D=4096). Weights are never expanded; the masks are the packed weights.
+  Default is F32, bit-identical to the reference. `TernaryResidualHook.ScaleFormat = TernaryScaleFormat.F16` stores them as binary16 (8 KB): see [F16 scales](#f16-per-row-scales-1620).
+- CLI: `dotllm run ... --ternary-adapter a.nsadapter [--ternary-adapter b.gguf]` and `dotllm serve ... --ternary-adapter ...` (CPU backend; each path is a ZIP package or an adapter GGUF, detected by magic; repeatable). x86 AVX2 + scalar paths; other ISAs use the scalar path (NEON is a follow-up).
 
 ## Tests
 
 `TernaryAdapterTests`: golden SHA-256 of the real reference's outputs (7 adapters x 4 rows, both ISAs: the 3 sample adapters, 2 reference-written synthetic packages, 2 regenerated deterministically),
 an independent managed port of the reference pipeline over 252 shape/alpha/ISA combinations (bit-identical), multi-adapter order, alpha/threshold gating, format round trip and
 rejection cases, engine wiring. The goldens come from building `Ternary.Core` + `Expert.Model` from the reference commit and running `TernaryExpert` on the same inputs.
+
+## GGUF form (#1619)
+
+`NsAdapterGguf` (DotLLM.Models) writes and reads the same circuits as the ZIP package inside a GGUF container, bit-identically (package -> GGUF -> package keeps every code,
+scale, manifest field, the float bits of alpha/threshold and the timestamp offset; GGUF -> ZIP is accepted by the reference loader).
+
+| what | where |
+|---|---|
+| adapter count | `nsadapter.count` (uint32; absent = 1), at most 256 |
+| metadata of adapter 0 | the reference's `neuro_symbolic.*` key set, string values, verbatim (`ToGgufMetadata()`; checksums are recomputed from the data) |
+| metadata of adapter i >= 1 | `neuro_symbolic.<i>.*` (same suffixes) |
+| exact floats | `nsadapter.<i>.alpha`, `nsadapter.<i>.activation_threshold` (GGUF float32); preferred on read, because the reference's `G7` strings do not round-trip every binary32 |
+| packed codes | tensors `nsadapter.<i>.down` (rank x D) and `nsadapter.<i>.up` (D x rank): the package's BitNet 2-bit bytes verbatim (`rows * ceil(cols/4)`, zero padded to a multiple of 4) as a **1-D `I32` tensor** |
+| per-row scales | tensors `nsadapter.<i>.down_scale` (rank) and `nsadapter.<i>.up_scale` (D), 1-D `F32` |
+| standalone file | `general.architecture = "nsadapter"`; the same keys and tensors may instead be appended to a model GGUF |
+
+**Why a raw `I32` blob and not an existing 2-bit type.** dotLLM's GGUF reader only accepts ids in its `QuantizationType` enum (no `I8`/`U8`). The 2-bit types that exist (`I2_S`, `PQ2_0`,
+`TQ2_0`) use different code maps (`I2_S`: 0/1/2 = -1/0/+1) and block layouts, so mapping onto one would be a conversion, not the reference's bytes, and could not be checksum-verified against
+the package. `I32` is the only 4-byte integer type present and carries the packed bytes untouched (no new ggml type is introduced); shapes come from the `rank` / `input_dimension` metadata.
+Validation matches the ZIP loader plus: tensor type and exact element count, zero padding, SHA-256 of both code tensors against the metadata, `rank`/`D` bounds before any allocation.
+
+Wiring: `TernaryResidualHook.Load(paths)` accepts either format (magic `GGUF` or ZIP), so `dotllm run` and the new repeatable `dotllm serve --ternary-adapter` use both. `ServerOptions.TernaryAdapterPaths`
+attaches the hook to every model the server loads (CPU transformer only; an explicit or auto GPU device is not used when adapters are requested, and a non-attachable model is an error, never a silent skip).
+**Not done:** `InferenceOptions` per-request enable/disable. The residual hook sees `[tokens x D]` rows with no request identity and the scheduler batches requests, so a per-request switch
+needs a per-row mask through `IResidualModifier` (filed as a follow-up); the adapters currently apply to every request of the server.
+
+## F16 per-row scales (#1620)
+
+Question: are F16 (or bf16) scales sufficient? Method: round the package scales RNE (F32 -> binary16 / bfloat16 -> F32 exact), keep weights exact and accumulation F32, and compare the adapter output delta against F32 scales
+(`TernaryScalePrecisionTests`, managed port of the reference circuit; 30 residual rows per case, D = 4096, outlier channels). The noise floor is the adapter's own int8 requantisation (delta of the shipped circuit vs the same circuit with an unquantised bottleneck).
+
+| scale distribution (median, sigma 0.3) | rank | int8 floor (relL2) | F16 relL2 | bf16 relL2 | F16 q_j flips | bf16 q_j flips | F16 / bf16 out-int8 flips |
+|---|---|---|---|---|---|---|---|
+| 0.02 | 8 / 32 / 128 | 3.2e-3 / 4.9e-3 / 6.8e-3 | 6.5e-4 / 2.0e-3 / 1.9e-3 | 3.7e-3 / 4.8e-3 / 5.7e-3 | 0.42 / 0.52 / 0.37 % | 2.5 / 4.3 / 2.8 % | 0.8-2.6 % / 5.8-10.3 % |
+| 0.002 | 8 / 32 / 128 | 3.4e-3 / 5.6e-3 / 8.4e-3 | 9.1e-4 / 1.9e-3 / 2.3e-3 | 3.5e-3 / 4.9e-3 / 6.0e-3 | 0.3-0.4 % | 2.5-2.7 % | 0.5-1.6 % / 3.4-7.6 % |
+| 1.0 | 8 / 32 / 128 | 3.3e-3 / 5.5e-3 / 6.8e-3 | 4.9e-4 / 1.7e-3 / 2.2e-3 | 2.4e-3 / 5.2e-3 / 5.5e-3 | 0.4-0.6 % | 0.8-3.9 % | 1.1-3.2 % / 5.2-10.4 % |
+| 40 | 8 / 32 / 128 | 3.1e-3 / 5.1e-3 / 7.6e-3 | 1.9e-3 / 2.0e-3 / 2.3e-3 | 3.6e-3 / 4.4e-3 / 6.2e-3 | 0.4-0.8 % | 3.2-3.3 % | 1.1-3.3 % / 5.4-11.4 % |
+
+("q_j flips": share of the int8-requantised bottleneck values that differ by one level; "out-int8 flips": share of output elements whose absmax-int8 value differs; a flip is +-1 of 127.)
+Reference sample adapters (`bracket-parity`, `csharp14-syntax-attractor`, `modulo97-counter`) have only unit scales (1.0), so every format is exact for them (relL2 = 0). The reference's own scale rule is absmean (`PackedTernaryTensor.SetRow`), i.e. the mean |w| of the float row, typically 1e-3 .. a few.
+End to end on the tiny synthetic llama (D = 64, adapter at layer 1, 24 positions): the adapter itself moves the logits by KL 2.6-3.5 nats (top-1 agrees 1/24, 0/24); switching its scales F32 -> F16 moves them by **KL 4.7e-6 / 6.1e-8** (top-1 24/24), F32 -> bf16 by 1.7e-5 / 2.4e-5.
+Range: F16 has a normal range [6.1035156e-5, 65504]; at scales around 1e-6 it is subnormal (relL2 2.2e-2, 22 % of q_j flip) and above 65504 it overflows to infinity, bf16 (F32 exponent) does neither.
+
+**Verdict.** *F16 is sufficient inside its normal range*: it adds at most 0.1-0.7x the adapter's own int8 requantisation noise, 0.3-0.8 % one-level flips, and an end-to-end KL six to eight orders below the adapter's effect. *bf16 is not worth it*:
+2.5-4 % of the bottleneck values flip and its error is about equal to the int8 floor (it only buys range, which one F32 fallback also buys). *Keep F32 as the default*: F16 saves 8 KB per adapter at D = 4096 (the masks, 2 bits per weight for down and up, are 16 KB at rank 8 and 512 KB at rank 256), the adapter is not memory-bound,
+and F32 keeps the bit-for-bit reference goldens. F16 is implemented as an **opt-in** in-memory format (`TernaryResidualHook.ScaleFormat = TernaryScaleFormat.F16`): scales are read as F32 from the package and rounded RNE to IEEE binary16 once at load; a circuit whose non-zero |scale| is outside
+[`MinF16Scale`, `MaxF16Scale`] = [2^-14, 65504] silently stays F32 (`ScaleFormatAt(i)` reports what was chosen). Kernels widen F16 -> F32 exactly, so an F16 hook is bit-identical to an F32 hook built from RNE-rounded scales (tested on both ISAs, odd D, zero scales, mixed formats).
 
 ---
 
