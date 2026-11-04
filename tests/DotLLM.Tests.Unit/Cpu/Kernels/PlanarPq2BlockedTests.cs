@@ -56,13 +56,16 @@ public sealed unsafe class PlanarPq2BlockedTests
         var rng = new Random(1620 + n);
         byte[] w = RandomPq2Rows(rng, m, k);
         float[] x = Acts(rng, n, k);
-        var blocked = new float[n * m]; var single = new float[n * m];
+        const float Canary = 12345.5f;
+        var blocked = new float[(n + 4) * m]; var single = new float[n * m];   // 4 canary rows past the n real ones: a block that over-runs the remainder writes there
+        Array.Fill(blocked, Canary);
         fixed (byte* wp = w) fixed (float* xp = x) fixed (float* cb = blocked) fixed (float* cs = single)
         {
             MatMul.GemmPQ2_0PlanarBlocked(wp, xp, cb, m, k, n, null);
             for (int t = 0; t < n; t++) MatMul.GemvPQ2_0Planar(wp, xp + t * k, cs + t * m, m, k, null);
         }
-        for (int i = 0; i < blocked.Length; i++)
+        for (int i = n * m; i < blocked.Length; i++) Assert.True(blocked[i] == Canary, $"blocked kernel wrote past token n-1 (element {i})");
+        for (int i = 0; i < single.Length; i++)
             Assert.True(BitConverter.SingleToInt32Bits(blocked[i]) == BitConverter.SingleToInt32Bits(single[i]),
                 $"token {i / m} row {i % m}: blocked {blocked[i]:R} != single {single[i]:R}");
     }
