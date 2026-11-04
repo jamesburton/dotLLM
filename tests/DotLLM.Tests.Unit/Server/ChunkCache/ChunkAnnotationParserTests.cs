@@ -274,6 +274,37 @@ public sealed class ChunkAnnotationParserTests
         Assert.Equal([$"{ChunkCacheCodes.HashMismatch}x1"], Codes(parsed));
     }
 
+    /// <summary>A span that starts on a UTF-8 boundary but ends inside a multibyte character is rejected (the end is checked too).</summary>
+    [Fact]
+    public void SpanEndingMidCharacter_Rejected()
+    {
+        // "aé": bytes 'a'=0, 'é'=1..2. [0,2) starts on a boundary and ends between the two bytes of é.
+        var bad = ChunkAnnotationParser.Parse(OpenAi(OpenAiManifest("aé", 0, 2, Sha("a"))), On, Ns)!;
+        Assert.Empty(bad.Spans);
+        Assert.Equal([$"{ChunkCacheCodes.SpanInvalid}x1"], Codes(bad));
+        Assert.Equal("multibyte_boundary", bad.Defects.Single().Kind);
+
+        // Control: the same shape ending on the boundary after é is accepted.
+        var ok = ChunkAnnotationParser.Parse(OpenAi(OpenAiManifest("aé", 0, 3, Sha("aé"))), On, Ns)!;
+        Assert.Single(ok.Spans);
+    }
+
+    /// <summary>
+    /// More than 1024 chars with a surrogate pair straddling char 1024 (the checkpoint step) and a span after it: the
+    /// byte-to-char table must not split the pair, so the later span still maps to the right text.
+    /// </summary>
+    [Fact]
+    public void SurrogatePairStraddlingCheckpoint_LaterSpanAccepted()
+    {
+        string text = new string('a', 1023) + "😀" + "tail" + new string('z', 100);
+        int start = Utf8(new string('a', 1023) + "😀");
+        int end = start + 4;
+        var parsed = ChunkAnnotationParser.Parse(OpenAi(OpenAiManifest(text, start, end, Sha("tail"))), On, Ns)!;
+        Assert.Single(parsed.Spans);
+        Assert.Equal("tail", parsed.Spans[0].Text);
+        Assert.Equal(1025, parsed.Spans[0].Engine.StartChar);
+    }
+
     // ------------------------------------------------------------------------------------------ ids, counts, chunkers
 
     [Fact]
