@@ -585,7 +585,7 @@ public sealed class ServerPinHttpTests : IAsyncLifetime
         Assert.Contains("unsupported content block type 'chunk_ref'", doc.RootElement.GetProperty("error").GetProperty("message").GetString(), StringComparison.Ordinal);
     }
 
-    private sealed class NonComputingModel(int maxSeq) : IModel
+    internal sealed class NonComputingModel(int maxSeq) : IModel
     {
         public ModelConfig Config { get; } = new()
         {

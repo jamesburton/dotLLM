@@ -299,6 +299,12 @@ public sealed record ServerOptions
     public bool AllowLoraAdminApi { get; init; }
 
     /// <summary>
+    /// The <c>chunk_cache</c> wire convention (<c>--chunk-cache</c>, <c>--chunk-cache-max-chunks</c>; docs/CHUNK_CACHE.md).
+    /// Off by default: annotations are then never read, and every body behaves as it did before the convention.
+    /// </summary>
+    public DotLLM.Server.ChunkCache.ChunkCacheOptions ChunkCache { get; init; } = DotLLM.Server.ChunkCache.ChunkCacheOptions.Disabled;
+
+    /// <summary>
     /// Whether the model-administration write endpoints introduced in #454 are enabled:
     /// <c>POST /v1/models/unload</c>, <c>POST /v1/models/pull</c> (+ its cancel route),
     /// <c>POST /v1/models/enable</c>, <c>POST /v1/models/disable</c> and
@@ -460,6 +466,8 @@ public sealed record ServerOptions
         int? maxMessagesCli = null;
         int promptCacheStep = 0;
         int? promptCacheStepKeep = null;
+        bool chunkCache = false;
+        int? chunkCacheMaxChunks = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -582,6 +590,10 @@ public sealed record ServerOptions
                     allowModelAdmin = true; break;
                 case "--allow-lora-admin":
                     allowLoraAdmin = true; break;
+                case "--chunk-cache":
+                    chunkCache = true; break;
+                case "--chunk-cache-max-chunks":
+                    chunkCacheMaxChunks = int.Parse(next ?? throw new ArgumentException("--chunk-cache-max-chunks requires a count."), System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 case "--max-messages":
                     maxMessagesCli = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 default:
@@ -656,6 +668,7 @@ public sealed record ServerOptions
             AllowModelAdminApi = allowModelAdmin,
             Metrics = metrics,
             AllowLoraAdminApi = allowLoraAdmin,
+            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(chunkCache, chunkCacheMaxChunks),
             MaxMessages = ResolveMaxMessages(maxMessagesCli, Environment.GetEnvironmentVariable(MaxMessagesEnvVar)),
             ModelId = modelId,
             RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,
