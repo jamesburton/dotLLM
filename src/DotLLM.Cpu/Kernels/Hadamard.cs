@@ -153,8 +153,8 @@ public static class Hadamard
         {
             // Strides narrower than one vector cannot be expressed as whole-vector loads of the two
             // halves, so they run scalar; every wider stride is vectorized below.
-            int vectorStride = Vector256.IsHardwareAccelerated ? Vector256<float>.Count
-                             : Vector128.IsHardwareAccelerated ? Vector128<float>.Count
+            int vectorStride = CpuFeatures.Vector256Accelerated ? Vector256<float>.Count
+                             : CpuFeatures.Vector128Accelerated ? Vector128<float>.Count
                              : n;
 
             for (int len = 1; len < vectorStride && len < n; len <<= 1)
@@ -171,7 +171,7 @@ public static class Hadamard
                 }
             }
 
-            if (Vector256.IsHardwareAccelerated)
+            if (CpuFeatures.Vector256Accelerated)
             {
                 for (int len = vectorStride; len < n; len <<= 1)
                 {
@@ -187,7 +187,7 @@ public static class Hadamard
                     }
                 }
             }
-            else if (Vector128.IsHardwareAccelerated)
+            else if (CpuFeatures.Vector128Accelerated)
             {
                 for (int len = vectorStride; len < n; len <<= 1)
                 {

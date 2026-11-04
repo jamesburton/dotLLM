@@ -221,7 +221,7 @@ public static unsafe partial class MatMul
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<int> DotU8S8Avx2(Vector256<byte> q, Vector256<sbyte> q8v, Vector256<short> ones)
-        => AvxVnni.IsSupported
+        => CpuFeatures.AvxVnni
             ? AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, q, q8v)
             : Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8v), ones);
 
@@ -390,7 +390,7 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotLegacyQuantRow(QuantizationType qt, byte* w, byte* q8, int blockCount)
     {
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             return qt switch
             {
                 QuantizationType.Q4_0 => VecDotQ4_0Q8_1Avx2(w, q8, blockCount),
@@ -398,7 +398,7 @@ public static unsafe partial class MatMul
                 QuantizationType.Q5_1 => VecDotQ5_1Q8_1Avx2(w, q8, blockCount),
                 _ => VecDotIQ4_NLQ8_1Avx2(w, q8, blockCount)
             };
-        if (Ssse3.IsSupported)
+        if (CpuFeatures.Ssse3)
             return qt switch
             {
                 QuantizationType.Q4_0 => VecDotQ4_0Q8_1Sse(w, q8, blockCount),
@@ -433,7 +433,7 @@ public static unsafe partial class MatMul
     {
         nint rowBytes = (nint)blockCount * LegacyBlockBytes(qt);
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             int row = 0;
             if (qt is QuantizationType.Q4_0 or QuantizationType.Q4_1 && rowBytes <= int.MaxValue / 8)
@@ -450,7 +450,7 @@ public static unsafe partial class MatMul
             return;
         }
 
-        if (Ssse3.IsSupported)
+        if (CpuFeatures.Ssse3)
         {
             ComputeRowsLegacyQuantSse(qt, weights, xQ8, result, m, blockCount);
             return;
@@ -500,7 +500,7 @@ public static unsafe partial class MatMul
             return;
         }
 
-        if (Q4FloorProbe && Avx2.IsSupported)
+        if (Q4FloorProbe && CpuFeatures.Avx2)
         {
             // Diagnostic (#1584): the single-row AVX2 dot (8 float lane partials, hsum) per column - same exact integer block sums,
             // a different float accumulation order from the eight-row kernel. Measures the rounding-order floor of a perplexity.
@@ -520,7 +520,7 @@ public static unsafe partial class MatMul
                 }
             return;
         }
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             nint q4RowBytes = (nint)blockCount * LegacyBlockBytes(qt);
             if (qt is QuantizationType.Q4_0 or QuantizationType.Q4_1 && q4RowBytes <= int.MaxValue / 8)
@@ -555,7 +555,7 @@ public static unsafe partial class MatMul
             ComputeRowsLegacyMultiAvx2(qt, weights, xQ8, q8RowBytes, c, mTotal, m, n, blockCount);
             return;
         }
-        if (Ssse3.IsSupported)
+        if (CpuFeatures.Ssse3)
         {
             ComputeRowsLegacyMultiSse(qt, weights, xQ8, q8RowBytes, c, mTotal, m, n, blockCount);
             return;
@@ -587,7 +587,7 @@ public static unsafe partial class MatMul
                 return UnpackNibblesAvx2(wb + 4);
             case QuantizationType.Q5_1:
                 signSrc = default;
-                return Avx2.Or(UnpackNibblesAvx2(wb + 8), ExtractQ5HighBits(Unsafe.ReadUnaligned<uint>(wb + 4)));
+                return Avx2.Or(UnpackNibblesAvx2(wb + 8), ExtractQ5HighBitsAvx2(Unsafe.ReadUnaligned<uint>(wb + 4)));
             default:
                 signSrc = Avx2.Shuffle(lut, UnpackNibblesAvx2(wb + 2).AsSByte());
                 return Avx2.Abs(signSrc);
@@ -690,7 +690,7 @@ public static unsafe partial class MatMul
     /// <summary>True when <paramref name="qt"/> takes the packed path for any column count (see <see cref="Q4PackedAllColumns"/>).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool PackedAtAnyN(QuantizationType qt)
-        => Q4PackedAllColumns && Avx2.IsSupported && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1;
+        => Q4PackedAllColumns && CpuFeatures.Avx2 && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1;
 
     /// <summary>
     /// True when a GEMM of <paramref name="n"/> columns in <paramref name="qt"/> will take the

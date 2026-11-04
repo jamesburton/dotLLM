@@ -324,7 +324,7 @@ public static unsafe class FusedOps
         int blockCount = dim / Q8_0GroupSize;
         float* normBuf = stackalloc float[Q8_0GroupSize];
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             fixed (float* wPtr = weight)
             {
@@ -440,7 +440,7 @@ public static unsafe class FusedOps
         int blockCount = dim / Q8_1GroupSize;
         float* normBuf = stackalloc float[Q8_1GroupSize];
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             fixed (float* wPtr = weight)
             {
@@ -576,7 +576,7 @@ public static unsafe class FusedOps
         int blockCount = dim / Q8_K_GroupSize;
         float* normBuf = stackalloc float[Q8_K_GroupSize];
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             fixed (float* wPtr = weight)
             {

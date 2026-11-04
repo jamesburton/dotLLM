@@ -56,8 +56,6 @@ internal static class TransformerWeightsSafetensorsLoader
             if (config.Architecture != DotLLM.Core.Configuration.Architecture.Qwen || config.Moe is not null)
                 throw new NotSupportedException(
                     $"LittleBit factorized linears are only supported for dense Qwen3, got Architecture.{config.Architecture}.");
-            if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
-                throw new PlatformNotSupportedException("LittleBit factorized linears require AVX2.");
         }
 
         var owned = new List<nint>();

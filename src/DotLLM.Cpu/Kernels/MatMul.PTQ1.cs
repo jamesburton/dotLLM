@@ -390,7 +390,7 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void UnpackPTQ1_0GroupI8(byte* qs, sbyte* outp)
     {
-        if (Vector128.IsHardwareAccelerated)
+        if (CpuFeatures.Vector128Accelerated)
         {
             var mask = Vector128.Create((ushort)0xFF);
             var (lo, hi) = Vector128.Widen(Vector128.Load(qs));

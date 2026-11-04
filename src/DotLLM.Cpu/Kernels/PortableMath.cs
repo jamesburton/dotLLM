@@ -36,7 +36,7 @@ internal static class PortableMath
     /// </summary>
     internal static void Exp(ReadOnlySpan<float> x, Span<float> destination)
     {
-        if (Vector128.IsHardwareAccelerated && x.Length >= Vector128<float>.Count)
+        if (CpuFeatures.Vector128Accelerated && x.Length >= Vector128<float>.Count)
         {
             TensorPrimitives.Exp(x, destination);
             return;

@@ -102,7 +102,7 @@ public static unsafe partial class MatMul
     {
         string? env = Environment.GetEnvironmentVariable("DOTLLM_PQ2_W2A8");
         if (env is "0" or "false" or "off") return false;
-        return Ssse3.IsSupported;
+        return CpuFeatures.Ssse3;
     }
 
     /// <summary>
@@ -509,7 +509,7 @@ public static unsafe partial class MatMul
                 {
                     UnpackPQ2_0RowI8(weights + (long)r * rowBytes, wI8, groupScales, k);   // unpack ONCE per row
                     int t = 0;
-                    if (Avx2.IsSupported)
+                    if (CpuFeatures.Avx2)
                     {
                         // 4 tokens per pass: the weight vector (|w|, w) is loaded once per block and 4 independent accumulators
                         // break the single FMA dependency chain of the per-token dot (#1367).
@@ -561,7 +561,7 @@ public static unsafe partial class MatMul
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float VecDotPQ2_0Q8(sbyte* wI8, float* groupScales, byte* xQ8, float* xScales, int blockCount)
-        => Avx2.IsSupported
+        => CpuFeatures.Avx2
             ? VecDotPQ2_0Q8Avx2(wI8, groupScales, xQ8, xScales, blockCount)
             : VecDotPQ2_0Q8Sse(wI8, groupScales, xQ8, xScales, blockCount);
 
@@ -578,7 +578,7 @@ public static unsafe partial class MatMul
     {
         const int blocksPerGroup = PQ2_0GroupSize / Q8_0GroupSize;
         Vector256<float> a0 = Vector256<float>.Zero, a1 = a0, a2 = a0, a3 = a0;
-        bool useVnni = AvxVnni.IsSupported;
+        bool useVnni = CpuFeatures.AvxVnni;
         Vector256<short> ones = Vector256.Create((short)1);
         byte* x0 = xQ8, x1 = xQ8 + xStrideBytes, x2 = xQ8 + 2L * xStrideBytes, x3 = xQ8 + 3L * xStrideBytes;
         float* s0 = xScales, s1 = xScales + sStride, s2 = xScales + 2L * sStride, s3 = xScales + 3L * sStride;
@@ -608,7 +608,7 @@ public static unsafe partial class MatMul
                 i2 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW, q2), ones);
                 i3 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW, q3), ones);
             }
-            if (Fma.IsSupported)
+            if (CpuFeatures.Fma)
             {
                 a0 = Fma.MultiplyAdd(Vector256.Create(s0[block] * g), Avx.ConvertToVector256Single(i0), a0);
                 a1 = Fma.MultiplyAdd(Vector256.Create(s1[block] * g), Avx.ConvertToVector256Single(i1), a1);
@@ -637,7 +637,7 @@ public static unsafe partial class MatMul
         const int blocksPerGroup = PQ2_0GroupSize / Q8_0GroupSize; // 128 / 32 = 4
 
         Vector256<float> acc = Vector256<float>.Zero;
-        bool useVnni = AvxVnni.IsSupported;
+        bool useVnni = CpuFeatures.AvxVnni;
         Vector256<short> ones = Vector256.Create((short)1);
 
         for (int block = 0; block < blockCount; block++)
@@ -674,7 +674,7 @@ public static unsafe partial class MatMul
             // int32 block sum → float, scale by combined (activation-block · weight-group) scale, accumulate.
             Vector256<float> fsum = Avx.ConvertToVector256Single(isum);
             Vector256<float> bscale = Vector256.Create(dCombined);
-            if (Fma.IsSupported)
+            if (CpuFeatures.Fma)
                 acc = Fma.MultiplyAdd(bscale, fsum, acc);
             else
                 acc += fsum * bscale;
@@ -702,7 +702,7 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void UnpackPQ2_0RowI8(byte* rowPtr, sbyte* dest, float* groupScales, int k)
     {
-        if (Sse2.IsSupported)
+        if (CpuFeatures.Sse2)
             UnpackPQ2_0RowI8Sse(rowPtr, dest, groupScales, k);
         else
             UnpackPQ2_0RowI8Scalar(rowPtr, dest, groupScales, k);

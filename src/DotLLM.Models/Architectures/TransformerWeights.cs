@@ -1445,8 +1445,6 @@ internal sealed class TransformerWeights : IDisposable
             if (config.Architecture != DotLLM.Core.Configuration.Architecture.Qwen || config.Moe is not null || config.MlaConfig is not null)
                 throw new NotSupportedException(
                     $"NanoQuant factorised linears are only supported for dense Qwen3, got Architecture.{config.Architecture}.");
-            if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
-                throw new PlatformNotSupportedException("NanoQuant factorised linears require AVX2.");
             DotLLM.Models.Quantization.NanoQuantLoader.ValidateMetadata(gguf.Metadata);
         }
 

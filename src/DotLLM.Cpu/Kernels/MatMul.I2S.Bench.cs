@@ -63,7 +63,7 @@ public static unsafe partial class MatMul
 
     /// <summary>
     /// Test-only forwarder to the private <see cref="UnpackRowI8"/> (which internally dispatches
-    /// AVX2 vs scalar based on <c>Avx2.IsSupported</c> — on this box that's always the AVX2
+    /// AVX2 vs scalar based on <c>CpuFeatures.Avx2</c> — on this box that's always the AVX2
     /// path). Used by <c>I2SUnpackVectorizedMatchesScalarTests</c> to compare against a hand-rolled
     /// scalar reference of the same documented bit layout, so a subtly-wrong SIMD shuffle/lane
     /// order is caught even though the scalar branch inside <see cref="UnpackRowI8"/> itself is
@@ -85,7 +85,7 @@ public static unsafe partial class MatMul
         Vector256<byte> acc = Vector256<byte>.Zero;
         long i = 0;
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             long vecEnd = totalBytes - (totalBytes % 32);
             for (; i < vecEnd; i += 32)

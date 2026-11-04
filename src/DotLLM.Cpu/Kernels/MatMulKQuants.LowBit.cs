@@ -242,7 +242,7 @@ public static unsafe partial class MatMul
                 }
             }
 
-            acc = Fma.IsSupported
+            acc = CpuFeatures.Fma
                 ? Fma.MultiplyAdd(Vector256.Create(d2 * d8), Avx.ConvertToVector256Single(sumi), acc)
                 : Avx.Add(acc, Avx.Multiply(Vector256.Create(d2 * d8), Avx.ConvertToVector256Single(sumi)));
 
@@ -326,7 +326,7 @@ public static unsafe partial class MatMul
                 }
             }
 
-            acc = Fma.IsSupported
+            acc = CpuFeatures.Fma
                 ? Fma.MultiplyAdd(Vector256.Create(d3 * d8), Avx.ConvertToVector256Single(sumi), acc)
                 : Avx.Add(acc, Avx.Multiply(Vector256.Create(d3 * d8), Avx.ConvertToVector256Single(sumi)));
 
@@ -345,7 +345,7 @@ public static unsafe partial class MatMul
     internal static void ComputeRowsQ2_K(byte* weights, byte* xQ8K, float* result, int m, int superBlockCount)
     {
         int rowBytes = superBlockCount * Q2_K_BlockBytes;
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             for (int row = 0; row < m; row++)
                 result[row] = VecDotQ2_K_Q8_KAvx2(weights + (long)row * rowBytes, xQ8K, superBlockCount);
@@ -363,7 +363,7 @@ public static unsafe partial class MatMul
     internal static void ComputeRowsQ3_K(byte* weights, byte* xQ8K, float* result, int m, int superBlockCount)
     {
         int rowBytes = superBlockCount * Q3_K_BlockBytes;
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             for (int row = 0; row < m; row++)
                 result[row] = VecDotQ3_K_Q8_KAvx2(weights + (long)row * rowBytes, xQ8K, superBlockCount);
