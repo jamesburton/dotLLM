@@ -34,6 +34,13 @@ public unsafe struct TernaryCircuit
     public float* DownScale;
     /// <summary>Per-row F32 scale of W_up (length d, padded to a multiple of 8 with zeros) - metadata from the package.</summary>
     public float* UpScale;
+    /// <summary>
+    /// When non-null the scales are stored as IEEE binary16 bit patterns (<c>DownScaleH</c>: Rank entries, <c>UpScaleH</c>: d padded to 8 with zeros) and
+    /// <see cref="DownScale"/>/<see cref="UpScale"/> are not read. F16 -> F32 widening is exact; the F32 -> F16 rounding (RNE) happens once at load.
+    /// </summary>
+    public ushort* DownScaleH;
+    /// <summary>See <see cref="DownScaleH"/>.</summary>
+    public ushort* UpScaleH;
     /// <summary>Manifest <c>Alpha</c>: multiplier on the residual delta; <c>Alpha &lt;= 0</c> disables the circuit (reference gate semantics).</summary>
     public float Alpha;
     /// <summary>Manifest <c>ActivationThreshold</c>: the circuit contributes only when the largest ReLU'd down-projection value exceeds it.</summary>
@@ -124,7 +131,7 @@ public static unsafe class TernaryAdapterKernel
             {
                 ulong* w = ci.Down + (long)j * wpr;
                 int sum = isa == TernaryKernelIsa.Avx2 ? DownRowAvx2(x8, padded, w) : DownRowScalar(x8, d, w);
-                float val = (float)sum * ci.DownScale[j];
+                float val = (float)sum * (ci.DownScaleH is null ? ci.DownScale[j] : HalfBits(ci.DownScaleH[j]));
                 val = Math.Max(0.0f, val);
                 r[j] = val;
                 if (val > maxAbs) maxAbs = val;
@@ -174,7 +181,7 @@ public static unsafe class TernaryAdapterKernel
                         acc = Avx2.Add(acc, Avx2.And(hv, pm));
                         acc = Avx2.Subtract(acc, Avx2.And(hv, mm));
                     }
-                    Vector256<float> u = Avx.Multiply(Avx.ConvertToVector256Single(acc), Avx.LoadVector256(ci.UpScale + c0));
+                    Vector256<float> u = Avx.Multiply(Avx.ConvertToVector256Single(acc), ci.UpScaleH is null ? Avx.LoadVector256(ci.UpScale + c0) : LoadHalf8(ci.UpScaleH + c0));
                     Vector256<float> delta = Avx.Multiply(u, Vector256.Create(dqf[c]));
                     total = Avx.Add(total, delta);
                     o += rank;
@@ -200,7 +207,7 @@ public static unsafe class TernaryAdapterKernel
                             if (((rowp[0] >> (col & 63)) & 1UL) != 0) acc += q8[o + j];
                             if (((rowp[1] >> (col & 63)) & 1UL) != 0) acc -= q8[o + j];
                         }
-                        float u = (float)acc * ci.UpScale[col];
+                        float u = (float)acc * (ci.UpScaleH is null ? ci.UpScale[col] : HalfBits(ci.UpScaleH[col]));
                         tmp[l] = tmp[l] + u * dqf[c];
                     }
                     o += rank;
@@ -209,6 +216,13 @@ public static unsafe class TernaryAdapterKernel
             for (int l = 0; l < valid; l++) row[c0 + l] = row[c0 + l] + tmp[l];
         }
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float HalfBits(ushort bits) => (float)BitConverter.UInt16BitsToHalf(bits);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<float> LoadHalf8(ushort* p) =>
+        Vector256.Create(HalfBits(p[0]), HalfBits(p[1]), HalfBits(p[2]), HalfBits(p[3]), HalfBits(p[4]), HalfBits(p[5]), HalfBits(p[6]), HalfBits(p[7]));
 
     /// <summary>Σ(plus·x) − Σ(minus·x) over one packed row, AVX2 (maddubs against ones; exact int32).</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
