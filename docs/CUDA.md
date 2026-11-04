@@ -504,48 +504,90 @@ for cu_file in "$(dirname "$0")"/kernels/*.cu; do
 done
 ```
 
-### The csproj also regenerates PTX — and it does not pin the toolkit
+### Building on newer CUDA SDKs (#1635)
 
-`native/build_ptx.bat` is not the only thing that writes `native/ptx/*.ptx`.
-`src/DotLLM.Cuda/DotLLM.Cuda.csproj` has a `CompileCudaPtx` target that runs
-`BeforeTargets="BeforeBuild"` with `Inputs`/`Outputs` over `.cu` → `.ptx`, so **a plain
-`dotnet build` silently regenerates every `.ptx` whose `.cu` is newer.** It resolves `nvcc` by
-running `nvcc --version` **from `PATH`**, and the host compiler from `VCToolsInstallDir` or, when
-that is unset, `vswhere -latest`.
+**The baseline is CUDA 12.8, which emits PTX ISA `.version 8.7`.** Every committed `native/ptx/*.ptx`
+declares 8.7. A driver rejects PTX whose `.version` is newer than it supports
+(`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) and JIT-compiles older PTX forward, so the ISA version, not the
+`-arch`, sets the minimum driver. CUDA 13.0 emits 9.0, 13.1 emits 9.1 and 13.3 emits 9.3.
 
-On a box with more than one CUDA toolkit installed that is a trap:
+**A machine with a newer SDK or Visual Studio must still build.** `CompileCudaPtx`
+(`native/msbuild/CudaPtx.targets` + `CudaPtxTask.cs`, imported by `DotLLM.Cuda.csproj`) does this in
+the default mode:
 
-- PTX whose ISA version exceeds the driver's is rejected outright with
-  `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. CUDA 12.8 emits `.version 8.7`, which is what every
-  committed `.ptx` in this tree declares; CUDA 13.1 emits `.version 9.1`, which no pre-13.1
-  driver will load.
-- The wrong PTX compiles, commits and reviews exactly like the right PTX. It only fails on
-  someone else's older driver.
-- `build_ptx.bat` guards against this (it takes `nvcc` from `%CUDA_PATH%` and asserts
-  `DOTLLM_PTX_EXPECT_VERSION`, default `8.7`, per file at the moment of generation). **The
-  MSBuild target has no such guard** — it takes whatever `PATH` hands it.
-- This mechanism has now regressed **three times**: #124, #318, and again on 2026-09-23.
+1. **Committed PTX first.** A kernel is compiled only when its `.ptx` is missing, or its `.cu` is newer
+   *and* git reports it as modified or untracked. A checkout that only bumps a `.cu`'s mtime no longer
+   regenerates committed PTX with whatever toolkit is installed. That mtime-only rule is how
+   #124 and #318 happened, and it is now gone.
+2. **Toolkit order:** `DotLLMCudaToolkitPath` (if set, the only candidate), then the baseline
+   (`CUDA_PATH_V12_8` / `...\CUDA\v12.8` / `/usr/local/cuda-12.8`), then `CUDA_PATH`, `CUDA_HOME`,
+   `nvcc` on `PATH`, then every other installed toolkit, newest first.
+3. **Host compiler (Windows):** `DotLLMMsvcBinDir` if set. Otherwise the newest MSVC toolset **below
+   14.50**, then the newest 14.5x. (vswhere covers all instances; `-latest` was the old bug.) CUDA
+   12.x, 13.0 and 13.1 reject VS 2026's MSVC 14.5x.
+4. **Escalation, only on a host-compiler failure:** retry with `-allow-unsupported-compiler
+   -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`. That gets past the "unsupported Microsoft Visual Studio
+   version" check and the STL1002 "expected CUDA 13.2 or newer" assertion, and it logs a warning.
+   A failure that is not a toolchain-version problem (a real kernel error) stops the ladder and is reported.
+5. **ISA version contract** (`DotLLMPtxVersionPolicy`):
+   - `pin` (default): PTX above 8.7 has its `.version` rewritten to 8.7, with a `// dotLLM: .version pinned
+     from X` comment. It is accepted only if that toolkit's `ptxas` assembles it at 8.7. `ptxas` rejects
+     any feature the declared version lacks, so a passing file is valid 8.7 PTX. If that fails, the next
+     toolkit is tried.
+   - `native`: keep the toolkit's version. The PTX loads only on a driver that supports it.
+   - `strict`: reject anything above 8.7 and try the next toolkit.
+6. **Never fail in `auto`.** Every failure becomes a warning. The existing PTX is kept, or the kernel is
+   left unavailable (loaders treat optional kernels as absent). As a last resort, a missing PTX is
+   written at its native version with a "do not commit" warning. A PTX file that did not exist at
+   project load is added to `Content`, so it reaches `bin/ptx` in the same build. Deleting a `.ptx` to
+   force a rebuild is safe now.
 
-**The fix is to pin both resolutions before building**, so the MSBuild path compiles with the
-same toolkit `build_ptx.bat` would:
+| knob (MSBuild property / env var) | values |
+|---|---|
+| `DotLLMCudaBuildMode` / `DOTLLM_CUDA_BUILD_MODE` | `auto` (default) · `committed` (never run nvcc) · `compile` (every failure is an error; use when regenerating PTX) · `skip` |
+| `DotLLMCudaToolkitPath` / `DOTLLM_CUDA_TOOLKIT_PATH` | toolkit root; disables discovery |
+| `DotLLMMsvcBinDir` / `DOTLLM_MSVC_BIN_DIR` | `...\VC\Tools\MSVC\<ver>\bin\Hostx64\x64` |
+| `DotLLMPtxVersionPolicy` / `DOTLLM_PTX_VERSION_POLICY` | `pin` (default) · `native` · `strict` |
+| `DotLLMCudaForceAll` | `true` treats every kernel as stale |
+| `DotLLMPtxBaselineVersion`, `DotLLMCudaBaselineVersion` | `8.7`, `12.8` (also honours `DOTLLM_PTX_EXPECT_VERSION`) |
+| `DOTLLM_NVCC_ALLOW_UNSUPPORTED_COMPILER=1` | legacy: always pass the override flags |
+
+**To build exactly like the baseline**, install CUDA 12.8 side by side with
+`scripts/setup-cuda-baseline.ps1`. It runs dry by default and prints the plan and the exact elevated
+command; `-Apply` does the install. It installs only `nvcc_12.8` and `cudart_12.8` (cudart pulls in
+`thrust_12.8`, which carries the CCCL/libcu++ headers that `cooperative_groups` needs). It installs no
+driver, no Nsight and no VS integration, and it restores the machine `CUDA_PATH` that the NVIDIA
+installer repoints. With `-InstallMsvcToolset` it also adds MSVC v14.44 to the newest VS instance.
+The build then picks the baseline up through `CUDA_PATH_V12_8` with no further configuration.
+`build_ptx.bat` also prefers `CUDA_PATH_V12_8` (or `DOTLLM_CUDA_TOOLKIT_PATH`) over `CUDA_PATH`, and it
+still asserts 8.7 per file. A toolkit unpacked somewhere non-standard, like T5500's `E:\CUDA_v12.8.1`, is
+not discovered. Point `CUDA_PATH_V12_8` or `DOTLLM_CUDA_TOOLKIT_PATH` at it.
+
+To commit a new kernel's PTX:
 
 ```bat
-set "CUDA_PATH=<the pinned toolkit>"
-set "PATH=%CUDA_PATH%\bin;%PATH%"
-set "VCToolsInstallDir=<...>\VC\Tools\MSVC\<ver>\"
-dotnet build
+dotnet build src/DotLLM.Cuda -p:DotLLMCudaBuildMode=compile -p:DotLLMPtxVersionPolicy=strict
+grep -m1 "^.version" native/ptx/*.ptx | sort -u -k2   &:: every file must say 8.7
 ```
 
-After any build that may have regenerated PTX, check the tree before committing:
+`strict` accepts only a toolkit that natively emits 8.7 or lower, i.e. ≤ 12.8. Pinned PTX from a newer
+toolkit is valid and loads, but strict keeps the committed tree byte-reproducible with the baseline.
 
-```bash
-grep -m1 '^.version' native/ptx/*.ptx | sort -u -k2   # every file must say 8.7
-```
+**Measured on framework (RTX 3060, driver 621.01 / CUDA 13.5 UMD; CUDA 12.1, 12.2, 12.4, 13.0, 13.1
+and 13.3; MSVC 14.29, 14.44 and 14.51)** — `ternary_adapter_residual_f32.cu`:
 
-**Do not delete a `.ptx` to force a rebuild.** MSBuild evaluates the `<Content Include="..\..\native\ptx\*.ptx">`
-glob at *project load*, so a file that does not exist when the build starts is not in the item
-list — `CompileCudaPtx` regenerates it, but nothing copies it to the output directory in that
-same build, and the kernel is missing at runtime. Touch the `.cu`, or rebuild twice.
+| nvcc | MSVC | flags | result |
+|---|---|---|---|
+| 13.1 | 14.51 (VS 2026) | — | ✗ unsupported Visual Studio version |
+| 13.1 | 14.51 | `-allow-unsupported-compiler` | ✗ STL1002 "expected CUDA 13.2 or newer" |
+| 13.1 | 14.51 | + `-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` | ✓ `.version 9.1` |
+| 13.1 / 13.0 | 14.44 | — | ✓ `.version 9.1` / `9.0` |
+| 13.3 | 14.51 or 14.44 | — | ✓ `.version 9.3` |
+| 12.4 | 14.44 | — | ✓ `.version 8.4` |
+| 12.4 | 14.51 | both overrides | ✗ MSVC `type_traits` static assertions (overrides cannot rescue 12.x on VS 2026) |
+| 12.1 | 14.44 | — | ✗ unsupported Visual Studio version |
+
+PIN_EVIDENCE_PLACEHOLDER
 
 Related: the target's per-kernel `Arch` metadata mirrors `build_ptx.bat`'s `ARCH_86` list for the
 same reason. A kernel using `mma.sync`/`cp.async` compiled at the `compute_75` default produces
@@ -781,7 +823,7 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
 
 ### Build Requirements (kernel compilation only)
 
-- **CUDA Toolkit 12.x+**: provides `nvcc` compiler. Only needed to recompile `.cu` → `.ptx` files. Pre-compiled PTX files can be distributed without requiring the toolkit on end-user machines.
+- **CUDA Toolkit 12.x+** (baseline 12.8; newer works, see "Building on newer CUDA SDKs"): provides `nvcc`. Only needed to recompile `.cu` → `.ptx` files. Pre-compiled PTX files can be distributed without requiring the toolkit on end-user machines.
 - **No CMake, no C/C++ compiler, no build system** beyond `nvcc`.
 
 ---

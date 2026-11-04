@@ -491,7 +491,7 @@ public class DotLLMCompileCudaPtx : Task
 
                 if (a.Overrides && !AllowUnsupportedCompiler)
                     Log.LogWarning("dotLLM CUDA: " + name + ".cu needed -allow-unsupported-compiler " + StlOverride + " with " + a
-                        + ". No supported host compiler was found for this toolkit; install the MSVC v14.44 (VS 2022) toolset. " + SetupHint);
+                        + ". This toolkit does not support the available host compiler; an MSVC toolset below 14.50 (e.g. v14.44, VS 2022) avoids the overrides. " + SetupHint);
                 _good = a;
                 WriteIfChanged(target, text);
                 Log.LogMessage(MessageImportance.High, "dotLLM CUDA:   " + name + ".ptx <- " + a);
