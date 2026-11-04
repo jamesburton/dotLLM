@@ -315,7 +315,7 @@ public sealed unsafe class TernaryScalePrecisionTests : IDisposable
     }
 
     [Fact]
-    public void F16Storage_ZeroScaleRows_AreKept_AndDefaultIsF32()
+    public void F16Storage_ZeroScaleRows_AreKept_AndDefaultIsF16()
     {
         var p = Synth(4, 64, 21, 0.1, 0.2);
         p.Up.Scales[5] = 0f; p.Down.Scales[1] = 0f;
@@ -328,7 +328,14 @@ public sealed unsafe class TernaryScalePrecisionTests : IDisposable
             Assert.Equal(TernaryScaleFormat.F32, d[0]);
         }
         using var hook = new TernaryResidualHook(64);
-        Assert.Equal(TernaryScaleFormat.F32, hook.ScaleFormat);   // default: bit-identical to the reference
+        // Default is F16 (range-guarded) unless DOTLLM_TERNARY_SCALES=f32 forces the reference-exact F32 scales.
+        bool forced = string.Equals(Environment.GetEnvironmentVariable("DOTLLM_TERNARY_SCALES"), "f32", StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(forced ? TernaryScaleFormat.F32 : TernaryScaleFormat.F16, hook.ScaleFormat);
+        Assert.Equal(hook.ScaleFormat, TernaryResidualHook.DefaultScaleFormat);
+        // A default hook really stores F16 for in-range scales and F32 for out-of-range ones.
+        hook.Add(Synth(4, 64, 22, 0.1, 0.2)); hook.Add(Synth(4, 64, 23, 1e-6, 0.2));
+        Assert.Equal(forced ? TernaryScaleFormat.F32 : TernaryScaleFormat.F16, hook.ScaleFormatAt(0));
+        Assert.Equal(TernaryScaleFormat.F32, hook.ScaleFormatAt(1));
     }
 
     // ---------------------------------------------------------------------------------------------- end to end on a tiny model ----

@@ -59,7 +59,7 @@ Files written by dotLLM load in the reference loader (checked) and the reference
   reference's delta buffer. This is the rank-concatenation idea of `LoraComposer`, but `LoraComposer` composes F32 `ILoraAdapter` weights into one concatenated matrix pair and
   cannot express per-adapter ReLU/int8 requantization or per-row scales, so the ternary composition lives in the hook. Summed rank per layer is capped at 256.
 - **Scales are metadata** (CLAUDE.md #1107): `downScale[rank]` + `upScale[D]` per adapter (about 16 KB F32 at D=4096). Weights are never expanded; the masks are the packed weights.
-  Default is F32, bit-identical to the reference. `TernaryResidualHook.ScaleFormat = TernaryScaleFormat.F16` stores them as binary16 (8 KB): see [F16 scales](#f16-per-row-scales-1620).
+  Default is **F16** (binary16, 8 KB, RNE at load; per-circuit automatic F32 fallback when any non-zero |scale| is outside 6.1e-5..65504). `DOTLLM_TERNARY_SCALES=f32` or `TernaryResidualHook.ScaleFormat = TernaryScaleFormat.F32` forces the exact reference F32 scales: see [F16 scales](#f16-per-row-scales-1620).
 - CLI: `dotllm run ... --ternary-adapter a.nsadapter [--ternary-adapter b.gguf]` and `dotllm serve ... --ternary-adapter ...` (CPU backend; each path is a ZIP package or an adapter GGUF, detected by magic; repeatable). x86 AVX2 + scalar paths; other ISAs use the scalar path (NEON is a follow-up).
 
 ## Tests
@@ -111,8 +111,7 @@ End to end on the tiny synthetic llama (D = 64, adapter at layer 1, 24 positions
 Range: F16 has a normal range [6.1035156e-5, 65504]; at scales around 1e-6 it is subnormal (relL2 2.2e-2, 22 % of q_j flip) and above 65504 it overflows to infinity, bf16 (F32 exponent) does neither.
 
 **Verdict.** *F16 is sufficient inside its normal range*: it adds at most 0.1-0.7x the adapter's own int8 requantisation noise, 0.3-0.8 % one-level flips, and an end-to-end KL six to eight orders below the adapter's effect. *bf16 is not worth it*:
-2.5-4 % of the bottleneck values flip and its error is about equal to the int8 floor (it only buys range, which one F32 fallback also buys). *Keep F32 as the default*: F16 saves 8 KB per adapter at D = 4096 (the masks, 2 bits per weight for down and up, are 16 KB at rank 8 and 512 KB at rank 256), the adapter is not memory-bound,
-and F32 keeps the bit-for-bit reference goldens. F16 is implemented as an **opt-in** in-memory format (`TernaryResidualHook.ScaleFormat = TernaryScaleFormat.F16`): scales are read as F32 from the package and rounded RNE to IEEE binary16 once at load; a circuit whose non-zero |scale| is outside
+2.5-4 % of the bottleneck values flip and its error is about equal to the int8 floor (it only buys range, which one F32 fallback also buys). *F16 is the default* (user sign-off on the F32 scale storage, #1620): it halves the scale metadata and matches F32 within the adapter's own int8 noise; the F32 fallback keeps out-of-range adapters exact, and `DOTLLM_TERNARY_SCALES=f32` / `ScaleFormat = F32` restores bit-for-bit reference scales (the reference goldens use scales that are exactly representable in F16, so they hold in both modes). Scales are read as F32 from the package and rounded RNE to IEEE binary16 once at load; a circuit whose non-zero |scale| is outside
 [`MinF16Scale`, `MaxF16Scale`] = [2^-14, 65504] silently stays F32 (`ScaleFormatAt(i)` reports what was chosen). Kernels widen F16 -> F32 exactly, so an F16 hook is bit-identical to an F32 hook built from RNE-rounded scales (tested on both ISAs, odd D, zero scales, mixed formats).
 
 ---
