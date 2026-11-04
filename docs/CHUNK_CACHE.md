@@ -67,7 +67,7 @@ joined with `'\n'`. The parser then checks that the engine message holds the spa
       `{message, part[, start, end]}` with integers; any string that cannot be decoded (a lone-surrogate escape);
    2. **version** → `chunk_version_unsupported`: `v` ≠ 1, or `positioning` other than `isolated`;
    3. **id** → `chunk_span_invalid`: not 1–256 characters (Unicode scalar values);
-   4. **eligibility** → `chunk_not_wire_eligible`: a `chunker` outside the wire-eligible list (`symbol-512` today); the
+   4. **eligibility** → `chunk_not_wire_eligible`: a `chunker` outside the wire-eligible list (`symbol-512` and `lines-512`); the
       span is dropped (rulings 26, 35: a warning, 400 when strict) and reserves no range;
    5. **range / boundary** → `chunk_span_invalid`: message or part out of range, a non-text part, an empty or
       out-of-range byte range, an offset inside a multi-byte character;
@@ -163,6 +163,28 @@ including any BOS text the template writes) for each located span, and warnings 
   SentencePiece leading space; live reasoning tags in assistant turns). Execution (below) checks the span's token ids
   against the whole-prompt tokenisation over the located range before counting a span as reusable.
 
+#### Chunk edges and joining (token stability)
+
+A span counts only if its own ids occur in the whole-prompt ids at its position, so what a harness puts **next to** a chunk
+decides whether it is reusable:
+
+- **Back to back is safe.** `symbol-512` and `lines-512` accept an edge only where
+  `Encode(left + right) == Encode(left) ++ Encode(right)` (`ChunkBoundary`, with `ChunkTokenization.Encode`): an edge that
+  would merge (a chunk's last newline with the blank line starting the next, `"\n" + "\n"` becoming one `"\n\n"` token) moves
+  to a stable edge (symbol: over the blank lines to the previous chunk; lines: back to the previous line end). Census on the
+  three frozen corpora (Qwen3-4B tokenizer): `symbol-512` had 5,910 of 6,684 edges unstable (88 %), now 0; `lines-512` had
+  0 of 2,542 and still 0 (`experiments/corpus.md`). If no stable edge is in reach, the greedy cut stays and that edge can
+  still merge (not seen on the corpora).
+- **A newline join is not safe.** Every chunk ends in a newline (both chunkers cut after line ends), and a newline
+  followed by an inserted `"\n"` merges. The Anthropic converter joins text blocks of one message with `"\n"`, so inline
+  chunk blocks that end in a newline are all `chunk_template_altered` (e2e A6: 3 of 3). The same holds for any glue that
+  starts with a newline. Client rules: send the chunks of an Anthropic request as a **manifest over one string message**
+  (e2e A6m works), or put glue that does not start with a newline between chunks and end a header with a non-whitespace
+  character (a `// path` line, e2e A3g). Census of chunks ending in a newline: 99.6 % (`symbol-512`) and 99.7 %
+  (`lines-512`) of the left-hand chunks merge under a newline join. The chunkers do not try to avoid a trailing newline:
+  every chunk is whole lines, and the alternative (ending before the newline) only moves the merge to the start of the
+  next chunk.
+
 ## Execution: `exact` and `shadow` (`ChunkCachePipeline`, `ChunkCacheReport`)
 
 Only `exact` (the default) and `shadow` run. **Both generate exactly what the unannotated request generates**: the prompt
@@ -187,7 +209,8 @@ request reports `cached_tokens` > 0, and a verified chunk wholly inside that res
   2. fewer than `min_chunk_tokens` (default 32) ids: `chunk_ignored_too_short` (warning only);
   3. **token check**: the span counts only if those ids occur in the whole-prompt ids exactly where its characters are.
      A span the check finds different is `chunk_template_altered` (strict: 400): a span glued to the text before it where
-     the tokenizer merges across the edge, a SentencePiece leading-space piece on the span itself, a Qwen3 assistant span
+     the tokenizer merges across the edge (in particular a chunk ending in a newline followed by the Anthropic `"\n"` join of
+     inline text blocks: see "Chunk edges and joining" above), a SentencePiece leading-space piece on the span itself, a Qwen3 assistant span
      holding a live `<think>` (`Span_TokenIdsDifferAtBoundary_NotCountedReusable`, `AssistantSpanWithThinkTag_VerifiedByIds`).
      How: with a token boundary known at the end of the previous verified span, the glue up to the next span is encoded
      alone and compared with the prompt's ids; a tokenizer that adds a leading piece to every encode (SentencePiece's
@@ -302,7 +325,7 @@ The contract's `capabilities.json` shape (`Capabilities_MatchesFixtureShape`), p
 
 ```json
 {"versions": [1], "policies": ["exact", "shadow", "balanced", "fast", "auto"],
- "selectors": ["chunk_starts"], "wire_chunkers": ["symbol-512"], "auto_validated": [],
+ "selectors": ["chunk_starts"], "wire_chunkers": ["lines-512", "symbol-512"], "auto_validated": [],
  "model": {"id": "<GgufIdentity.ModelId>", "supported": true, "reason": null, "id_kind": "sampled",
            "tokenizer_id": "<GgufIdentity.TokenizerId>", "producer": "<64 hex: keyOf([]) in the caller's namespace>",
            "quantization": "ftype-15", "backend": "cpu", "kv_dtype": "f32",
@@ -320,7 +343,8 @@ The contract's `capabilities.json` shape (`Capabilities_MatchesFixtureShape`), p
   store-wide figures); they are all 0 until the server keeps a ledger of what it wrote (the sole-writer task), and
   `budget_bytes` is 0 until a budget exists. Without `--chunk-store` it carries `"configured": false`; with one,
   `configured` is absent (`Capabilities_StoreConfiguredFalse_WithoutStore`).
-- `wire_chunkers` is the server's wire-eligible list (`symbol-512`; `lines-512` joins in a later task).
+- `wire_chunkers` is the server's wire-eligible list (`lines-512`, `symbol-512`; sorted). `lines-512` is eligible on correctness
+  (its text round-trips by construction); its reuse **quality** is not validated, so `auto_validated` stays `[]` (Phase I5's gate).
 
 ### `POST /v1/chunk-cache/explain`
 
