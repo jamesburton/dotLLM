@@ -224,11 +224,11 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     internal static void ComputeRowsNvfp4Multi(byte* weights, byte* xQ8, int q8RowBytes, float* dy, int* corr,
-        float* c, int mTotal, int m, int n, int blockCount)
+        float* c, int mTotal, int m, int n, int blockCount, bool legacyOrder = false)
     {
         long rowBytes = (long)blockCount * Dequantize.Nvfp4BlockBytes;
         int row = 0;
-        if (Nvfp4Rows8Enabled && rowBytes <= int.MaxValue / 8)
+        if (!legacyOrder && Nvfp4Rows8Enabled && rowBytes <= int.MaxValue / 8)
         {
             for (; row + 7 < m; row += 8)
                 ComputeRowsNvfp4Avx2_8Rows(weights + row * rowBytes, (int)rowBytes, xQ8, q8RowBytes, dy, corr,
@@ -236,6 +236,6 @@ public static unsafe partial class MatMul
         }
         for (; row < m; row++)
             for (int t = 0; t < n; t++)
-                c[(long)t * mTotal + row] = VecDotNvfp4Q8_0(weights + row * rowBytes, xQ8 + (long)t * q8RowBytes, blockCount);
+                c[(long)t * mTotal + row] = VecDotNvfp4Q8_0(weights + row * rowBytes, xQ8 + (long)t * q8RowBytes, blockCount, legacyOrder);
     }
 }
