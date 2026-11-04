@@ -214,7 +214,7 @@ public static class ChatCompletionEndpoint
             var inFlight = new Task<InferenceResponse>[choiceCount];
             for (int i = 0; i < choiceCount; i++)
             {
-                inFlight[i] = scheduler.EnqueueAsync(new InferenceRequest
+                inFlight[i] = state.EnqueueTrackedAsync(scheduler, new InferenceRequest
                 {
                     TokenIds = promptIds,
                     Options = SeedForChoice(options, i),
@@ -408,7 +408,7 @@ public static class ChatCompletionEndpoint
         {
             return WriteChatStreamAsync(
                 request, httpContext,
-                ServerState.SchedulerStream(scheduler, httpContext, state.Tokenizer!.Encode(prompt), options),
+                ServerState.SchedulerStream(state, scheduler, httpContext, state.Tokenizer!.Encode(prompt), options),
                 ServerState.WithoutGate,
                 requestId, modelId, tools, toolParser, plan, ct, forcedToolCall,
                 keepAlive, state.DescribeWait, state.KeepAliveInterval);

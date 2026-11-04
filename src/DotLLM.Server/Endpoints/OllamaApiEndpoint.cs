@@ -448,7 +448,7 @@ public static class OllamaApiEndpoint
             InferenceResponse? result = null;
             if (state.Scheduler is { } scheduler)
             {
-                result = await scheduler.EnqueueAsync(new InferenceRequest
+                result = await state.EnqueueTrackedAsync(scheduler, new InferenceRequest
                 {
                     TokenIds = state.Tokenizer.Encode(finalPrompt),
                     Options = options,
@@ -507,7 +507,7 @@ public static class OllamaApiEndpoint
 
         // (#1266) Same routing as the non-streaming path: on the scheduler, with no gate or model lease.
         if (state.Scheduler is { } streamScheduler)
-            await StreamAsync(ServerState.SchedulerStream(streamScheduler, c, state.Tokenizer.Encode(finalPrompt), options)(ct));
+            await StreamAsync(ServerState.SchedulerStream(state, streamScheduler, c, state.Tokenizer.Encode(finalPrompt), options)(ct));
         else
             await state.ExecuteAsync(modelId, g => StreamAsync(g.GenerateStreamingTokensAsync(finalPrompt, options, ct)), ct);
 

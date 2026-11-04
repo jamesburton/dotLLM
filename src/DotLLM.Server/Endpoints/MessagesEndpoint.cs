@@ -184,7 +184,7 @@ public static class MessagesEndpoint
         if (state.Scheduler is { } scheduler)
         {
             int[] promptIds = state.Tokenizer!.Encode(prompt);
-            result = await scheduler.EnqueueAsync(
+            result = await state.EnqueueTrackedAsync(scheduler,
                 new InferenceRequest { TokenIds = promptIds, Options = options }, ct);
         }
         else
@@ -293,7 +293,7 @@ public static class MessagesEndpoint
         {
             await WriteMessageStreamAsync(
                 httpContext,
-                ServerState.SchedulerStream(scheduler, httpContext, state.Tokenizer!.Encode(prompt), options),
+                ServerState.SchedulerStream(state, scheduler, httpContext, state.Tokenizer!.Encode(prompt), options),
                 ServerState.WithoutGate,
                 toolCallParser,
                 request.StopSequences,

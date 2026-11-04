@@ -764,3 +764,43 @@ Greedy decode is **not** preserved. 8 short prompts, 96 tokens, `-t 0`, CPU: Q4_
 6/8 (first divergence after 23-92 words). This is expected for any change to activation rounding and is not a
 quality signal; compare perplexity, not text, across the change. Note `dotllm run` defaults to `--device auto`
 (Vulkan on this box): pass `-d cpu` or a CPU A/B silently measures the GPU.
+
+## Flint Q4_1 vs llama.cpp (+2.5%): float-order and activation-quantisation floors (issue #1584, 2026-11-04)
+
+`flint-int4-q4_1.gguf`, wikitext-2 LF first 46 KB, 512 ctx, CPU: dotLLM 26.19 +/- 1.57 vs llama.cpp
+25.55 +/- 1.52 over 19 windows (the issue's figures). No Flint-capable llama.cpp is installed on this box
+(`llama-b11739` and the older builds report `unknown model architecture: 'flint'`; the issue's `dde879bc`
+build is gone), so the controlled arms below are dotLLM-only, on the **first 4 windows (2048 tokens, 1020
+scored)** where dotLLM Q4_1 scores 24.4590. The question each arm answers is "how far does this change
+alone move a perplexity on this model", i.e. what size of gap can NOT be called a bug yet.
+
+| arm (all `-d cpu`, deterministic run to run) | PPL | vs 24.4590 |
+|---|---|---|
+| default: eight-row Q4_1 x Q8_1 kernel | 24.4590 | - |
+| single-row AVX2 dot per column (8 float lane partials, hsum) `DOTLLM_CPU_Q4_FLOOR_PROBE=1` | 24.4044 | -0.22% |
+| same, block range split in 2 independently summed halves (`=2`) | 24.5653 | +0.44% |
+| same, in 3 chunks (`=3`) | 24.7528 | +1.20% |
+| dense/attention/shared/lm_head on F32 activations (dequantise path, `DOTLLM_CPU_Q4_PACKED_PREFILL=0`; routed experts stay packed x Q8_1) | 25.1938 | +3.0% |
+
+* **Float accumulation order floor (Q4_1): 24.40-24.75, range 1.4%, std ~0.6%** at 4 windows, with the
+  exact same integer block sums. Independent per window, so the order noise on the 19-window figure is
+  roughly sqrt(4/19) of that (~0.3% std): a 2.5% engine gap is NOT explained by accumulation order of the
+  Q4_1 dot.
+* **Activation quantisation is a 3% lever** on this model, and it raises perplexity when removed from the
+  dense path: Q8_1 activations 24.46, F32 activations 25.19. Whatever llama.cpp does with its Q8_1
+  activations at the dense/attention/shared-expert/lm_head projections (it quantises all of them) is the
+  remaining un-pinned candidate, together with its F16 KV cache (dotLLM's perplexity run is cacheless,
+  exact F32 K/V) and its router/softmax details. Closing this needs a Flint-capable llama.cpp build on
+  the box: **#1584 stays open for that measurement**; nothing in dotLLM's Q4_1 path was found wrong.
+* The same-data NVFP4 controls (see docs/QUANTIZATION.md, #1587) show the order floor is model/format
+  dependent and larger there: 4-window NVFP4 Q8_0 dot, same integer sums, five float orders:
+  25.39 (pre-#1587 lane-FMA), 25.97 (3 chunks), 26.20 (2 chunks), 26.20 (5 chunks), 26.23 (sequential
+  scalar): range 3.3%, std ~0.35. The pre-#1587 lane order was the low outlier, and is the order that
+  happened to agree with llama.cpp's 25.56 on 19 windows, so the issue's "NVFP4 agrees within 0.6%"
+  is a coincidence of one order, not evidence the NVFP4 path is closer than Q4_1.
+* Speed side-finding: the F32-activation dense path took 27 s for the 4 windows against 48 s for the
+  packed Q8_1 path on this Zen 5 box (single measurements, other sessions running); the "packed 8-row
+  kernel is 4.4x the dequantise path" figure was measured on a 155H, so the prefill crossover needs a
+  Strix re-measure.
+
+Reproduce: `DOTLLM_CPU_Q4_FLOOR_PROBE=1|2|3` (diagnostic, default off, `MatMulLegacyQuants.cs`).
