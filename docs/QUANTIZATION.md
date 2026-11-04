@@ -133,7 +133,8 @@ a transcription of llama.cpp's `ggml_vec_dot_nvfp4_q8_0` (scalar + AVX2). Since 
 sub-block order. The eight-row kernel (rows one per lane, 64-token chunks, kvalues shifted to `u = kv + 12`
 for `vpdpbusd` with `-12*Sum(q)` folded into the accumulator start) unpacks each weight block once for all
 tokens: 12.2 -> 3.5-4.0 ms at m=4096 k=2048 n=256 on Zen 5 (Q4_1: 2.7-3.1 ms), a token's result no longer
-depends on the batch. `DOTLLM_CPU_NVFP4_ROWS8=0` restores the row-at-a-time path. Note this changed the
+depends on the batch. `DOTLLM_CPU_NVFP4_ROWS8=0` restores the row-at-a-time path (same numerics).
+**`DOTLLM_CPU_NVFP4_LEGACY_ORDER=1`** (read once) restores the pre-#1587 float summation order (8 lane partials with FMA, summed horizontally; row-at-a-time, single- and multi-row, decode included) so perplexity figures measured before #1587 reproduce (Flint 4 windows: 25.39 legacy vs 26.23 default). The shift is summation order only (five float orders over identical integer sums span 25.39-26.23, docs/PERPLEXITY.md); the new order was accepted as the default for the speed-up. Note this changed the
 float summation order versus the pre-#1587 AVX2 (8-lane FMA partials, which mirrored llama.cpp's x86 order),
 which moved Flint wikitext perplexity on a 4-window (2048-token) CPU run from 25.39 to 26.23 and on a
 2-window run from 23.30 to 24.84 (same weights, same Q8_0 activations; only the float accumulation order
