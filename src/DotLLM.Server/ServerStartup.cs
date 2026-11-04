@@ -206,6 +206,7 @@ public static class ServerStartup
         var autoPlan = DeviceSelector.Plan(spec, ModelResolver.FileLength(resolvedPath), Endpoints.DeviceEndpoint.Describe());
         foreach (string device in autoPlan.Candidates)
         {
+            if (options.TernaryAdapterPaths is { Count: > 0 } && device != "cpu") continue;   // ternary adapters are CPU-only (#1619): never load a GPU model they cannot attach to
             try
             {
                 Console.WriteLine($"[dotllm] --device auto: trying {device}");
@@ -447,6 +448,36 @@ public static class ServerStartup
     /// <summary>Extra rows a retained Vulkan KV cache is allocated with, so the next turn of the conversation still fits it.</summary>
     internal const int VulkanPrefixCacheHeadroomTokens = 1024;
 
+    /// <summary>
+    /// Attaches <see cref="ServerOptions.TernaryAdapterPaths"/> to a CPU <see cref="TransformerModel"/> as its residual modifier (#1619). The hook is
+    /// owned by the model (its finalizer reclaims the masks). Any other model kind, or an adapter that does not fit the model, fails the load.
+    /// </summary>
+    internal static void AttachTernaryAdapters(IModel model, ModelConfig config, GgufFile gguf, ServerOptions options)
+    {
+        if (options.TernaryAdapterPaths is not { Count: > 0 } paths) return;
+        if (model is not TransformerModel host)
+        {
+            model.Dispose();
+            gguf.Dispose();
+            throw new InvalidServerOptionException("--ternary-adapter is only supported on the CPU transformer backend (use --device cpu).");
+        }
+        DotLLM.Models.Adapters.Ternary.TernaryResidualHook? hook = null;
+        try
+        {
+            hook = DotLLM.Models.Adapters.Ternary.TernaryResidualHook.Load(paths);
+            hook.ValidateFor(config.HiddenSize, config.NumLayers);
+            host.ResidualModifier = hook;
+            Console.WriteLine($"[dotllm] Ternary adapters attached: {hook.CircuitCount} circuit(s) from {paths.Count} file(s).");
+        }
+        catch (Exception ex) when (ex is InvalidDataException or InvalidOperationException or NotSupportedException or IOException or ArgumentException)
+        {
+            hook?.Dispose();
+            model.Dispose();
+            gguf.Dispose();
+            throw new InvalidServerOptionException($"--ternary-adapter: {ex.Message}");
+        }
+    }
+
     private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
     {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
@@ -478,6 +509,8 @@ public static class ServerStartup
             options.MoeOffload);
         // Only the Vulkan models' KV factory is wired here (CUDA/hybrid models keep their own per-request caches).
         Func<int, IKvCache>? vulkanKvFactory = DeviceSpec.Parse(options.Device).Kind == DeviceKind.Vulkan ? deviceKvFactory : null;
+
+        AttachTernaryAdapters(model, config, gguf, options);
 
         // Create chat template. The declared template is untrusted input from the GGUF's
         // tokenizer.chat_template metadata — a parse failure (unsupported Jinja construct,

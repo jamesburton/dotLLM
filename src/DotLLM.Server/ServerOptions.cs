@@ -299,6 +299,14 @@ public sealed record ServerOptions
     public bool AllowLoraAdminApi { get; init; }
 
     /// <summary>
+    /// Ternary residual adapter files (<c>.nsadapter</c> or adapter GGUF, docs/TERNARY_ADAPTER.md) attached to every model this server loads
+    /// (<c>--ternary-adapter</c>, repeatable). CPU transformer models only: loading on any other backend/architecture fails with
+    /// <see cref="InvalidServerOptionException"/>. The adapters apply to ALL requests (the residual hook has no request identity, so there
+    /// is no per-request switch). Null or empty = none.
+    /// </summary>
+    public IReadOnlyList<string>? TernaryAdapterPaths { get; init; }
+
+    /// <summary>
     /// Whether the model-administration write endpoints introduced in #454 are enabled:
     /// <c>POST /v1/models/unload</c>, <c>POST /v1/models/pull</c> (+ its cancel route),
     /// <c>POST /v1/models/enable</c>, <c>POST /v1/models/disable</c> and

@@ -4,6 +4,15 @@ using DotLLM.Cpu.Kernels;
 
 namespace DotLLM.Models.Adapters.Ternary;
 
+/// <summary>In-memory storage of the per-row scales of a ternary adapter (#1620, #1107).</summary>
+public enum TernaryScaleFormat
+{
+    /// <summary>IEEE binary32, exactly as in the package (bit-identical to the reference).</summary>
+    F32 = 0,
+    /// <summary>IEEE binary16, rounded to nearest even at load; used only when every non-zero |scale| is in the F16 normal range.</summary>
+    F16 = 1,
+}
+
 /// <summary>
 /// Loads and injects ternary residual adapters (<see cref="NsAdapterPackage"/>) after transformer layers
 /// (<see cref="HookPoint.PostLayer"/>). Implemented on <see cref="IResidualModifier"/> rather than
@@ -37,13 +46,40 @@ public sealed unsafe class TernaryResidualHook : IResidualModifier, IDisposable
         Rebuild();
     }
 
+    /// <summary>
+    /// How the per-row scales of adapters registered AFTER this is set are held in memory. <see cref="TernaryScaleFormat.F32"/> (default) is
+    /// bit-identical to the reference. <see cref="TernaryScaleFormat.F16"/> halves the scale metadata (RNE rounding at load; measured sufficient in
+    /// docs/TERNARY_ADAPTER.md) but only for circuits whose every non-zero |scale| lies in the F16 normal range
+    /// [<see cref="MinF16Scale"/>, <see cref="MaxF16Scale"/>]; any other circuit silently stays F32 (see <see cref="ScaleFormatAt"/>).
+    /// </summary>
+    public TernaryScaleFormat ScaleFormat { get; set; } = TernaryScaleFormat.F32;
+
+    /// <summary>Smallest |scale| held in F16 (smallest normal binary16, 2^-14); below it F16 is subnormal and loses precision.</summary>
+    public const float MinF16Scale = 6.103515625e-5f;
+    /// <summary>Largest |scale| held in F16 (65504); above it F16 overflows.</summary>
+    public const float MaxF16Scale = 65504f;
+
+    /// <summary>The scale format actually used by circuit <paramref name="index"/> (registration order).</summary>
+    public TernaryScaleFormat ScaleFormatAt(int index) => _circuits[index].circuit.DownScaleH is null ? TernaryScaleFormat.F32 : TernaryScaleFormat.F16;
+
+    private static bool F16Representable(float[] a)
+    {
+        foreach (float s in a)
+        {
+            float m = Math.Abs(s);
+            if (m == 0f) continue;
+            if (!(m >= MinF16Scale && m <= MaxF16Scale)) return false;   // also rejects NaN/Inf
+        }
+        return true;
+    }
+
     /// <summary>ISA override (tests); default widest available.</summary>
     public TernaryKernelIsa Isa { get; set; }
 
     /// <summary>Convenience: loads each package path and registers it (in order).</summary>
     public static TernaryResidualHook Load(IEnumerable<string> paths)
     {
-        var pkgs = paths.Select(NsAdapterPackage.Load).ToList();
+        var pkgs = paths.SelectMany(NsAdapterGguf.LoadAny).ToList();   // .nsadapter ZIPs and adapter GGUFs (#1619), detected by magic
         if (pkgs.Count == 0) throw new ArgumentException("no adapter paths given");
         var hook = new TernaryResidualHook(pkgs[0].Manifest.InputDimension);
         try { foreach (var p in pkgs) hook.Add(p); }
@@ -91,6 +127,15 @@ public sealed unsafe class TernaryResidualHook : IResidualModifier, IDisposable
                 sbyte w = pkg.Up[dRow, j];
                 if (w != 0) ci.UpT[(long)j * wpr + (dRow >> 6) * 2 + (w < 0 ? 1 : 0)] |= 1UL << (dRow & 63);
             }
+        }
+        if (ScaleFormat == TernaryScaleFormat.F16 && F16Representable(pkg.Down.Scales) && F16Representable(pkg.Up.Scales))
+        {
+            ci.DownScaleH = (ushort*)AllocZero((long)rank * 2);
+            ci.UpScaleH = (ushort*)AllocZero((long)((_d + 7) & ~7) * 2);
+            for (int j = 0; j < rank; j++) ci.DownScaleH[j] = BitConverter.HalfToUInt16Bits((Half)pkg.Down.Scales[j]);
+            for (int r = 0; r < _d; r++) ci.UpScaleH[r] = BitConverter.HalfToUInt16Bits((Half)pkg.Up.Scales[r]);
+            NativeMemory.AlignedFree(ci.DownScale); NativeMemory.AlignedFree(ci.UpScale);
+            ci.DownScale = null; ci.UpScale = null;
         }
         _circuits.Add((layer, ci));
         Rebuild();
@@ -167,15 +212,20 @@ public sealed unsafe class TernaryResidualHook : IResidualModifier, IDisposable
         _f = (float*)AllocZero((long)(maxRank + maxCount) * 4);
     }
 
+    /// <summary>Finalizer: a hook attached to a long-lived model (the server) is owned by that model and reclaimed with it.</summary>
+    ~TernaryResidualHook() => Dispose();
+
     /// <inheritdoc/>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        GC.SuppressFinalize(this);
         foreach (var (_, c) in _circuits)
         {
             NativeMemory.AlignedFree(c.Down); NativeMemory.AlignedFree(c.UpT);
             NativeMemory.AlignedFree(c.DownScale); NativeMemory.AlignedFree(c.UpScale);
+            NativeMemory.AlignedFree(c.DownScaleH); NativeMemory.AlignedFree(c.UpScaleH);
         }
         _circuits.Clear();
         if (_circuitMem != 0) NativeMemory.Free((void*)_circuitMem);

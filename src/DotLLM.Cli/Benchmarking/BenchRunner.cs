@@ -69,8 +69,19 @@ public static class BenchRunner
 
         int totalReps = warmupReps + reps;
         var all = new List<BenchRep>(totalReps);
+        // #1620: DOTLLM_BENCH_ALT_PLANAR=planar-first|prod-first alternates the planar PQ2_0 decode GEMV per rep inside ONE process
+        // (same-session paired A/B, immune to process-start and page-cache noise); each rep reports its mode and planar-call delta on stderr.
+        string? alt = Environment.GetEnvironmentVariable("DOTLLM_BENCH_ALT_PLANAR");
+        bool altOn = alt is "planar-first" or "prod-first";
         for (int rep = 0; rep < totalReps; rep++)
+        {
+            if (altOn) DotLLM.Cpu.Kernels.MatMul.PQ2_0PlanarEnabled = ((rep & 1) == 0) == (alt == "planar-first");
+            long calls0 = DotLLM.Cpu.Kernels.MatMul.PQ2_0PlanarCalls;
             all.Add(RunOneRep(model, kvCacheFactory, promptTokens, decodeTokens, depth, cacheSize));
+            if (altOn)
+                Console.Error.WriteLine($"ALT rep={rep} mode={(DotLLM.Cpu.Kernels.MatMul.PQ2_0PlanarEnabled ? "planar" : "prod")} " +
+                    $"decode_tok_s={all[^1].DecodeTokS:F2} prefill_tok_s={all[^1].PrefillTokS:F2} planar_calls={DotLLM.Cpu.Kernels.MatMul.PQ2_0PlanarCalls - calls0}");
+        }
 
         return new BenchResult
         {

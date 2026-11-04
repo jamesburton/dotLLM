@@ -18,8 +18,20 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class MatMul
 {
     /// <summary>True when the opt-in planar PQ2_0 decode GEMV is enabled (<c>DOTLLM_PQ2_PLANAR=1</c>) and AVX2 is available.</summary>
-    internal static readonly bool PQ2_0Planar =
+    private static bool s_pq2Planar =
         Environment.GetEnvironmentVariable("DOTLLM_PQ2_PLANAR") is "1" or "true" or "on" && Avx2.IsSupported;
+    private static long s_planarCalls;
+
+    internal static bool PQ2_0Planar => s_pq2Planar;
+
+    /// <summary>
+    /// Runtime toggle for the planar PQ2_0 decode GEMV (initial value from <c>DOTLLM_PQ2_PLANAR</c>). Exists so a single process can
+    /// alternate production/planar reps (same-session paired A/B, #1620); setting it true is ignored without AVX2.
+    /// </summary>
+    public static bool PQ2_0PlanarEnabled { get => s_pq2Planar; set => s_pq2Planar = value && Avx2.IsSupported; }
+
+    /// <summary>Number of planar GEMV calls made so far (proof that the path ran).</summary>
+    public static long PQ2_0PlanarCalls => Interlocked.Read(ref s_planarCalls);
 
     private struct GemvPQ2PlanarCtx
     {
@@ -30,6 +42,7 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static void GemvPQ2_0Planar(byte* weights, float* x, float* result, int m, int k, ComputeThreadPool? threadPool)
     {
+        Interlocked.Increment(ref s_planarCalls);
         int groups = k / PQ2_0GroupSize;
         sbyte[] qBuf = ArrayPool<sbyte>.Shared.Rent(k);
         float[] sBuf = ArrayPool<float>.Shared.Rent(groups * 4);
