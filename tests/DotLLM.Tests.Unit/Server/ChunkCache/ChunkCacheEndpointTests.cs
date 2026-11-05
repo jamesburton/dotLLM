@@ -308,10 +308,10 @@ public sealed class ChunkCacheEndpointTests : IDisposable
     /// <summary>
     /// Two keys share a store but not entries: a chunk stored in A's namespace is a hit for A and a miss for B, in
     /// explain and in shadow plan counts; B naming A's namespace in the body is ignored (<c>chunk_namespace_ignored</c>).
-    /// (Evict arrives with plan Task 16; its namespace rule is tested there.)
+    /// (No evict route exists yet: it arrives with plan Task 16, and its namespace rule is tested there.)
     /// </summary>
     [Fact]
-    public async Task TwoKeys_CannotSeeOrEvictEachOthersEntries()
+    public async Task TwoKeys_CannotSeeEachOthersEntries()
     {
         string root = NewStore();
         await using var server = await ChunkCacheTestServer.StartAsync(_model, On(root, KeysFile(KeyA, KeyB)));
@@ -666,6 +666,127 @@ public sealed class ChunkCacheEndpointTests : IDisposable
         }
         Assert.Equal(200, (await server.SendAsync(HttpMethod.Post, "/v1/chunk-cache/explain", body)).Status);
         Assert.Equal(ChunkCacheEndpoint.MaxConcurrentExplains, gate.CurrentCount); // every path released its slot
+    }
+
+    /// <summary>
+    /// A body that trickles in (above Kestrel's minimum data rate, so only our own deadline can stop it) never holds an
+    /// explain slot: with <c>MaxConcurrentExplains</c> such bodies being read by the server at once, other explain calls still
+    /// get 200, and each slow body gets 408 once <c>ExplainBodyReadTimeout</c> passes. The server-side in-flight count proves
+    /// the stalled bodies really reached the handler (the assertion cannot pass because the client never connected).
+    /// </summary>
+    [Fact]
+    public async Task Explain_SlowBody_DoesNotHoldASlot_408()
+    {
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, On());
+        var runtime = server.State.ChunkCacheRuntime;
+        runtime.ExplainBodyReadTimeout = TimeSpan.FromSeconds(8);
+        var uri = new Uri(server.App.Urls.First());
+        string body = ExplainBody(Manifest("exact"));
+        using var stop = new CancellationTokenSource();
+        var slow = new List<(System.Net.Sockets.TcpClient Client, System.Net.Sockets.NetworkStream Stream, Task Trickle)>();
+        try
+        {
+            for (int i = 0; i < ChunkCacheEndpoint.MaxConcurrentExplains; i++)
+            {
+                var client = new System.Net.Sockets.TcpClient();
+                await client.ConnectAsync(uri.Host, uri.Port);
+                var stream = client.GetStream();
+                byte[] head = Encoding.ASCII.GetBytes(
+                    $"POST {ChunkCacheEndpoint.ExplainPath} HTTP/1.1\r\nHost: {uri.Host}:{uri.Port}\r\nContent-Type: application/json\r\n"
+                    + $"Content-Length: {ChunkCacheEndpoint.MaxExplainBodyBytes}\r\n\r\n{{");
+                await stream.WriteAsync(head);
+                await stream.FlushAsync();
+                // ~1.3 KB/s: well above Kestrel's 240 B/s minimum, far below what 4 MiB needs in any reasonable time.
+                var trickle = Task.Run(async () =>
+                {
+                    byte[] spaces = Encoding.ASCII.GetBytes(new string(' ', 256));
+                    try
+                    {
+                        while (!stop.IsCancellationRequested)
+                        {
+                            await stream.WriteAsync(spaces, stop.Token);
+                            await Task.Delay(200, stop.Token);
+                        }
+                    }
+                    catch (Exception ex) when (ex is OperationCanceledException or IOException or ObjectDisposedException)
+                    {
+                        // The server closed the connection after its 408, or the test ended.
+                    }
+                });
+                slow.Add((client, stream, trickle));
+            }
+
+            // The server is reading both bodies right now.
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            while (runtime.ExplainBodyReadsInFlight < ChunkCacheEndpoint.MaxConcurrentExplains && DateTime.UtcNow < deadline)
+                await Task.Delay(20);
+            Assert.Equal(ChunkCacheEndpoint.MaxConcurrentExplains, runtime.ExplainBodyReadsInFlight);
+
+            // Every other caller is still served: nothing waits on the slow bodies.
+            for (int i = 0; i < ChunkCacheEndpoint.MaxConcurrentExplains + 1; i++)
+            {
+                var (status, text) = await server.SendAsync(HttpMethod.Post, ChunkCacheEndpoint.ExplainPath, body);
+                Assert.True(status == 200, $"explain {i} while two bodies trickle: {status} {text}");
+            }
+            // ...while the stall was still going on (the calls above did not just outlast it).
+            Assert.Equal(ChunkCacheEndpoint.MaxConcurrentExplains, runtime.ExplainBodyReadsInFlight);
+            Assert.Equal(ChunkCacheEndpoint.MaxConcurrentExplains, runtime.ExplainGate.CurrentCount);
+
+            // Each slow body gets 408 at the deadline.
+            foreach (var (_, stream, _) in slow)
+            {
+                using var readTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                var buffer = new byte[256];
+                var received = new StringBuilder();
+                while (!received.ToString().Contains("\r\n", StringComparison.Ordinal))
+                {
+                    int n = await stream.ReadAsync(buffer, readTimeout.Token);
+                    if (n == 0)
+                        break;
+                    received.Append(Encoding.ASCII.GetString(buffer, 0, n));
+                }
+                Assert.StartsWith("HTTP/1.1 408", received.ToString(), StringComparison.Ordinal);
+            }
+            deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            while (runtime.ExplainBodyReadsInFlight > 0 && DateTime.UtcNow < deadline)
+                await Task.Delay(20);
+            Assert.Equal(0, runtime.ExplainBodyReadsInFlight);
+            Assert.Equal(ChunkCacheEndpoint.MaxConcurrentExplains, runtime.ExplainGate.CurrentCount);
+        }
+        finally
+        {
+            stop.Cancel();
+            foreach (var (client, _, trickle) in slow)
+            {
+                client.Dispose();
+                await trickle;
+            }
+        }
+    }
+
+    /// <summary>
+    /// With the flag on, an inference request with no chunk annotation never resolves a chunk-cache caller (no key lookup,
+    /// no SHA-256 of the presented Bearer value), on either surface; an annotated one resolves exactly once.
+    /// </summary>
+    [Fact]
+    public async Task UnannotatedInference_ResolvesNoCaller()
+    {
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, On(keysFile: KeysFile(KeyA)));
+        var runtime = server.State.ChunkCacheRuntime;
+        var bearer = Bearer("an-unlisted-bearer-value-0123456789abcdef");
+
+        Assert.Equal(200, (await server.SendAsync(HttpMethod.Post, "/v1/chat/completions", ChatBody(null), bearer)).Status);
+        Assert.Equal(200, (await server.SendAsync(HttpMethod.Post, "/v1/messages", ChunkCacheTestServer.Anthropic(Conversation, null), bearer)).Status);
+        Assert.Equal(200, (await server.SendAsync(HttpMethod.Post, "/v1/chat/completions", ChatBody(null), Key(KeyA))).Status);
+        Assert.Equal(0, runtime.InferenceCallerResolutions);
+
+        // The counter is live: an annotated request on each surface resolves once.
+        var optionsOnly = new JsonObject { ["v"] = 1 };
+        Assert.Equal(200, (await server.SendAsync(HttpMethod.Post, "/v1/chat/completions", ChatBody(optionsOnly), bearer)).Status);
+        Assert.Equal(1, runtime.InferenceCallerResolutions);
+        Assert.Equal(200, (await server.SendAsync(HttpMethod.Post, "/v1/messages",
+            ChunkCacheTestServer.Anthropic(Conversation, (JsonObject)optionsOnly.DeepClone()), bearer)).Status);
+        Assert.Equal(2, runtime.InferenceCallerResolutions);
     }
 
     /// <summary>The exchange's two namespace sources (the parse and the caller) must agree.</summary>

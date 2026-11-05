@@ -49,6 +49,7 @@ public static class MessagesEndpoint
     /// <summary>Parses the request's annotations in the caller's namespace (flag on only).</summary>
     private static ChunkCacheExchange? BeginChunkCache(AnthropicMessagesRequest request, ServerState state, HttpContext httpContext)
     {
+        state.ChunkCacheRuntime.CountInferenceCallerResolution();
         var caller = ChunkCacheAuth.ForInference(httpContext, state.Options.ChunkCache);
         return ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, caller.Namespace), caller);
     }

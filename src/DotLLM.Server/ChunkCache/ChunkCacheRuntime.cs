@@ -19,6 +19,30 @@ internal sealed class ChunkCacheRuntime
     /// <summary>Slots for concurrent <c>explain</c> calls (<see cref="Endpoints.ChunkCacheEndpoint.MaxConcurrentExplains"/>).</summary>
     internal SemaphoreSlim ExplainGate { get; } = new(Endpoints.ChunkCacheEndpoint.MaxConcurrentExplains, Endpoints.ChunkCacheEndpoint.MaxConcurrentExplains);
 
+    /// <summary>
+    /// How long an <c>explain</c> body may take to arrive (<see cref="Endpoints.ChunkCacheEndpoint.ExplainBodyReadTimeoutSeconds"/>);
+    /// a slower body is <c>408</c>. Settable for tests.
+    /// </summary>
+    internal TimeSpan ExplainBodyReadTimeout { get; set; } = TimeSpan.FromSeconds(Endpoints.ChunkCacheEndpoint.ExplainBodyReadTimeoutSeconds);
+
+    private int _explainBodyReadsInFlight;
+    private int _inferenceCallerResolutions;
+
+    /// <summary><c>explain</c> bodies being read right now (test observability: proves the server sees a stalled body).</summary>
+    internal int ExplainBodyReadsInFlight => Volatile.Read(ref _explainBodyReadsInFlight);
+
+    /// <summary>
+    /// Inference requests whose chunk-cache caller was resolved (the key looked up and hashed). Only annotated requests
+    /// pay that; the counter lets a test prove an unannotated one does not.
+    /// </summary>
+    internal int InferenceCallerResolutions => Volatile.Read(ref _inferenceCallerResolutions);
+
+    internal void EnterExplainBodyRead() => Interlocked.Increment(ref _explainBodyReadsInFlight);
+
+    internal void ExitExplainBodyRead() => Interlocked.Decrement(ref _explainBodyReadsInFlight);
+
+    internal void CountInferenceCallerResolution() => Interlocked.Increment(ref _inferenceCallerResolutions);
+
     /// <summary>A store injected by the host or a test; wins over <c>--chunk-store</c>.</summary>
     internal IChunkStore? StoreOverride { get; set; }
 

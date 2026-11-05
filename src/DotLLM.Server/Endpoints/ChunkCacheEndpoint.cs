@@ -31,6 +31,12 @@ public static class ChunkCacheEndpoint
     /// <summary>Largest explain body, bytes; larger is 413.</summary>
     public const int MaxExplainBodyBytes = 4 * 1024 * 1024;
 
+    /// <summary>
+    /// Seconds an explain body may take to arrive; slower is 408. The body is read before an explain slot is taken, so a
+    /// slow sender never holds one.
+    /// </summary>
+    public const int ExplainBodyReadTimeoutSeconds = 10;
+
     /// <summary>Maps the routes when the server runs with <c>--chunk-cache</c>; otherwise maps nothing.</summary>
     /// <param name="app">The web application (its services hold the <see cref="ServerState"/>).</param>
     public static void Map(WebApplication app)
@@ -218,7 +224,16 @@ public static class ChunkCacheEndpoint
             await WriteTooLargeAsync(context);
             return;
         }
-        var body = await ReadLimitedAsync(context);
+        ReadOnlyMemory<byte>? body;
+        state.ChunkCacheRuntime.EnterExplainBodyRead();
+        try
+        {
+            body = await ReadLimitedAsync(context);
+        }
+        finally
+        {
+            state.ChunkCacheRuntime.ExitExplainBodyRead();
+        }
         if (body is null)
         {
             await WriteTooLargeAsync(context);
