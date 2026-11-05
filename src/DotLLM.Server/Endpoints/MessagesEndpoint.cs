@@ -46,6 +46,13 @@ public static class MessagesEndpoint
         app.MapPost("/v1/messages/count_tokens", HandleCountTokensAsync);
     }
 
+    /// <summary>Parses the request's annotations in the caller's namespace (flag on only).</summary>
+    private static ChunkCacheExchange? BeginChunkCache(AnthropicMessagesRequest request, ServerState state, HttpContext httpContext)
+    {
+        var caller = ChunkCacheAuth.ForInference(httpContext, state.Options.ChunkCache);
+        return ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, caller.Namespace), caller);
+    }
+
     private static async Task HandleAsync(
         AnthropicMessagesRequest request,
         ServerState state,
@@ -98,12 +105,13 @@ public static class MessagesEndpoint
         }
 
         // chunk_cache (docs/CHUNK_CACHE.md): with --chunk-cache on and an annotated body only; otherwise null and nothing
-        // below changes. The namespace is server-assigned (the default until authentication exists).
+        // below changes. The namespace is server-assigned (ChunkCacheAuth: the caller's API key's namespace, or the default for
+        // a local caller); an unauthenticated caller is served normally but its chunks are never looked up.
         ChunkCacheExchange? chunkCache;
         try
         {
             chunkCache = state.Options.ChunkCache.Enabled
-                ? ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, ChunkCacheWire.DefaultNamespace))
+                ? BeginChunkCache(request, state, httpContext)
                 : null;
         }
         catch (InvalidOperationException)

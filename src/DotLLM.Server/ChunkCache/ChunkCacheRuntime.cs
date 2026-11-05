@@ -16,6 +16,9 @@ internal sealed class ChunkCacheRuntime
     private object? _identityKey;
     private ServerModelIdentity? _identity;
 
+    /// <summary>Slots for concurrent <c>explain</c> calls (<see cref="Endpoints.ChunkCacheEndpoint.MaxConcurrentExplains"/>).</summary>
+    internal SemaphoreSlim ExplainGate { get; } = new(Endpoints.ChunkCacheEndpoint.MaxConcurrentExplains, Endpoints.ChunkCacheEndpoint.MaxConcurrentExplains);
+
     /// <summary>A store injected by the host or a test; wins over <c>--chunk-store</c>.</summary>
     internal IChunkStore? StoreOverride { get; set; }
 

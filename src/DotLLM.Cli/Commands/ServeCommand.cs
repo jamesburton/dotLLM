@@ -356,12 +356,25 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
                      "and plan shadow reuse. Read-only: the server never writes or creates it; a missing directory is reported as chunk_store_unavailable.")]
         public string? ChunkStore { get; set; }
 
+        /// <summary>The API keys of the chunk-cache surface (off by default: loopback callers only).</summary>
+        [CommandOption("--chunk-cache-api-keys")]
+        [Description("With --chunk-cache: a file of API keys (one per line, '<key> [admin] [ns=<namespace>]', keys of 32+ characters, e.g. 32 random bytes base64url; '#' comments; read once at startup) that may use /v1/chunk-cache/* " +
+                     "(X-API-Key or Authorization: Bearer); each key gets its own store namespace. Without it only loopback callers may. " +
+                     "Security-sensitive: see docs/CHUNK_CACHE.md. Inference endpoints stay unauthenticated either way.")]
+        public string? ChunkCacheApiKeys { get; set; }
+
+        /// <summary>Accept keys shorter than 32 characters (with a warning).</summary>
+        [CommandOption("--chunk-cache-allow-short-keys")]
+        [Description("With --chunk-cache-api-keys: accept keys shorter than 32 characters (each logged as a warning). Off by default: such a key " +
+                     "refuses startup, because namespaces derived from keys appear in the store's file names and can be checked offline.")]
+        public bool ChunkCacheAllowShortKeys { get; set; }
+
         /// <inheritdoc/>
         public override ValidationResult Validate()
         {
             try { ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget, PromptCacheStep, PromptCacheStepKeep); }
             catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
-            try { DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(ChunkCache, ChunkCacheMaxChunks, ChunkStore); }
+            try { DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(ChunkCache, ChunkCacheMaxChunks, ChunkStore, ChunkCacheApiKeys, ChunkCacheAllowShortKeys); }
             catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
             return base.Validate();
         }
@@ -579,7 +592,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             AllowModelAdminApi = settings.AllowModelAdmin,
             Metrics = settings.NoMetrics ? false : settings.Metrics ? true : null,
             AllowLoraAdminApi = settings.AllowLoraAdmin,
-            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(settings.ChunkCache, settings.ChunkCacheMaxChunks, settings.ChunkStore),
+            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(settings.ChunkCache, settings.ChunkCacheMaxChunks, settings.ChunkStore, settings.ChunkCacheApiKeys, settings.ChunkCacheAllowShortKeys),
             TernaryAdapterPaths = settings.TernaryAdapterPaths is { Length: > 0 } ? settings.TernaryAdapterPaths : null,
             // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
             // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,
