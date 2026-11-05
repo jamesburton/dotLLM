@@ -273,6 +273,11 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     private MatMulQ5KGemmCoopmatKernel? _matmulQ5KGemmCoopmat;
     // Same for Q5_0 (issue #592).
     private MatMulQ5_0GemmCoopmatKernel? _matmulQ5_0GemmCoopmat;
+    // Dense Q5_1 (#1600): F32-in GEMV (decode) + tiled GEMM (prefill). GLM-4.5-Air's shared-expert down is Q5_1 on 24 layers; no MMVQ/coopmat yet (follow-up).
+    private MatMulQ5_1GemvF32Kernel? _matmulQ5_1Gemv;
+    private MatMulQ5_1GemmF32Kernel? _matmulQ5_1GemmF32;
+    /// <summary>Dense projections that ran on the packed Q5_1 kernels (#1600; test / proof hook).</summary>
+    internal long Q5_1DenseDispatchCount { get; private set; }
     // Native Q4_0 (issue #1018): scalar F32-in GEMV / GEMM fallbacks, dp4a MMVQ decode (needs the shared Q8_1 activation scratch) and the
     // 128x128x4 coopmat prefill GEMM. All created post-construction; a null optional kernel just selects the next fallback.
     private MatMulQ4_0GemvF32Kernel? _matmulQ4_0;
@@ -1185,6 +1190,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     // window-local (0..NumLayers-1), but the FULL-length CPU-side per-layer lookups (cpuWeights.Layers
     // and Config.PerLayerSlidingWindow) are offset by _firstLayer at read time. Set by BuildModel.
     private int _firstLayer;
+
+    /// <summary>
+    /// Optional device-side in-place modifier of the residual stream after each layer (<c>HookPoint.PostLayer</c>), e.g. a
+    /// <see cref="VulkanTernaryResidualModifier"/> (#1618). Null (the default) costs one branch per layer. Single-threaded per
+    /// model instance, like the LoRA adapter. Honoured by the per-sequence <c>Forward</c> core; <see cref="ForwardBatch"/> routes
+    /// every sequence through it while a modifier is attached. Not honoured by the other Vulkan model hosts (hybrid/MoE).
+    /// </summary>
+    public IVulkanResidualModifier? ResidualModifier { get; set; }
     // VRAM-trim flags for pipeline stages (both false on a normal single-device model). Set by BuildModel.
     // _headless: non-last stage — the final-norm/LM-head weights are 64-byte stubs and Forward returns a
     // dummy logits tensor right after the layer loop (the caller reads DownloadHiddenState instead).
@@ -1323,6 +1336,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     internal bool IsDenseF16KvEligible =>
         Config.Architecture is DotLLM.Core.Configuration.Architecture.Llama or DotLLM.Core.Configuration.Architecture.Mistral
             or DotLLM.Core.Configuration.Architecture.Qwen or DotLLM.Core.Configuration.Architecture.Phi
+            or DotLLM.Core.Configuration.Architecture.Glm4Moe   // #1600: plain GQA hd128 + partial NeoX RoPE; the F16 twins take ropeDim
         && Config.MlaConfig is null && Config.NumSharedKvLayers == 0 && !Config.HasDistinctValueHeadDim
         && Config.AttentionValueScale is null && Config.HeadDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim;
 
@@ -1847,7 +1861,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                     : (false, false, false),
                 skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
             skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config),
-                allowNvfp4Scales: true);
+                allowNvfp4Scales: true, allowGlm4MoeCpu: true);
             return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf);
         }
         catch
@@ -1887,7 +1901,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 : (false, false, false),
             skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
             skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config),
-            allowNvfp4Scales: true);
+            allowNvfp4Scales: true, allowGlm4MoeCpu: true);
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 
@@ -1985,7 +1999,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers, firstLayer: firstLayer,
             skipTokenEmbed: skipTokenEmbed, skipOutputHead: headless, spvDir: spvDir,
             valuePad: config.HasDistinctValueHeadDim ? (config.HeadDim, config.GetValueHeadDim()) : null,
-            tokenEmbedOnHost: gguf is not null && EmbedOnHostEligible(cpuWeights));
+            tokenEmbedOnHost: gguf is not null && EmbedOnHostEligible(cpuWeights, config));
 
         // MoE detection: any layer with non-null Moe in CPU weights. We
         // don't gate on config.Moe because Mixtral/Qwen-MoE configs may
@@ -2605,6 +2619,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         if (Environment.GetEnvironmentVariable(DisableQ5KCoopmatEnvVar) != "1"
             && MatMulQ5KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulQ5KGemmCoopmat = MatMulQ5KGemmCoopmatKernel.Create(device, spvDir);
+        model._matmulQ5_1Gemv = MatMulQ5_1GemvF32Kernel.Create(device, spvDir);
+        model._matmulQ5_1GemmF32 = MatMulQ5_1GemmF32Kernel.Create(device, spvDir);
         if (Environment.GetEnvironmentVariable(DisableQ5_0CoopmatEnvVar) != "1"
             && MatMulQ5_0GemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulQ5_0GemmCoopmat = MatMulQ5_0GemmCoopmatKernel.Create(device, spvDir);
@@ -3384,7 +3400,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         // are reached via VulkanModelLoader.CreateFromGguf. Reporting them as "not supported
         // on the Vulkan backend yet" is simply untrue and sends the caller down a dead end
         // (issue #324).
-        TransformerWeights.ThrowIfArchitectureNeedsDedicatedLoader(config);
+        // glm4moe (#1600): the single-device model (allowGptOss) runs it; the pipeline / hybrid hosts keep the refusal.
+        if (!(allowGptOss && config.Architecture == DotLLM.Core.Configuration.Architecture.Glm4Moe))
+            TransformerWeights.ThrowIfArchitectureNeedsDedicatedLoader(config);
 
         // MiMo-V2 (#936): V head_dim != QK head_dim, SWA ring + sinks, packed low-bit expert banks - none of it exists in the Vulkan
         // attention/KV/MoE paths. Loading through the dense model would run and be silently wrong.
@@ -3775,7 +3793,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             || Config.IsGemma4DensePle
             || Config.HasDistinctValueHeadDim
             || Config.AttentionValueScale is not null
-            || Config.DiffusionConfig is not null;
+            || Config.DiffusionConfig is not null
+            || ResidualModifier is not null;   // #1618: the per-sequence core is the one with the PostLayer hook
         for (int layer = 0; layer < Config.NumLayers && !modelHasMlaOrMoe; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
@@ -4432,6 +4451,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         ProfSample("embed");
         DpStamp(cmdBuf, DpCatEmbed);
 
+        var residualModifier = ResidualModifier;
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {
             // Decode record/execute overlap (issue #143): after the first few
@@ -5059,6 +5079,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 }
             }
 
+            // Device-side PostLayer residual modifier (#1618), e.g. a ternary steering adapter. In place on the
+            // post-layer HiddenState; null (the default) costs this one branch per layer.
+            if (residualModifier is not null && residualModifier.AppliesTo(_firstLayer + layer))
+            {
+                BarrierComputeToCompute(cmdBuf);
+                residualModifier.Record(cmdBuf, _state.HiddenState, _firstLayer + layer, seqLen, hiddenSize);
+            }
+
             // COMPUTE→COMPUTE between layers — next iteration's first op is
             // the attention RMSNorm, which reads the freshly-rotated
             // HiddenState written by the add.
@@ -5541,6 +5569,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
 
     private void InvalidateKernelCaches()
     {
+        ResidualModifier?.InvalidateDescriptorCache();
         _matmul.InvalidateDescriptorCache();
         _matmulQ8.InvalidateDescriptorCache();
         _matmulQ8Gemm.InvalidateDescriptorCache();
@@ -5631,6 +5660,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ2KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ5KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ5_0GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ5_1Gemv?.InvalidateDescriptorCache();
+        _matmulQ5_1GemmF32?.InvalidateDescriptorCache();
         _matmulQ3KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulIq4XsGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ6KMmq?.InvalidateDescriptorCache();
@@ -8946,6 +8977,22 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 ProfNote("q5_0_f32gemm", outputDim, inputDim, seqLen);
             }
         }
+        else if (weightQt == QuantType.Q5_1)
+        {
+            // Q5_1 (#1600): 24-byte word-aligned blocks, value d * q + m; inputDim % 32 == 0 is enforced by VulkanWeights.KeepQ5_1OnDevice.
+            // Decode on the F32-in GEMV, prefill on the tiled F32-in GEMM (no MMVQ / coopmat variant yet).
+            Q5_1DenseDispatchCount++;
+            if (seqLen == 1)
+            {
+                _matmulQ5_1Gemv!.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                ProfNote("q5_1_f32gemv", outputDim, inputDim, seqLen);
+            }
+            else
+            {
+                _matmulQ5_1GemmF32!.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q5_1_f32gemm", outputDim, inputDim, seqLen);
+            }
+        }
         else if (weightQt == QuantType.Q4_0)
         {
             // Native Q4_0 (#1018): 18-byte blocks (fp16 scale + 16 nibble bytes), value d * (nibble - 8); inputDim % 32 == 0 is enforced by
@@ -9643,6 +9690,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     /// Whether an F32 token table is large enough to leave in the host mapping (#1161; Flint's is 1.2 GB): the forward gathers its
     /// rows on the host instead (a few KB per token). <c>DOTLLM_VK_EMBED_HOST=0</c> uploads it as before, <c>1</c> forces it for any F32 table.
     /// </summary>
+    private static bool EmbedOnHostEligible(TransformerWeights w, ModelConfig config)
+        // glm4moe (#1600): a packed (non-Q8_0) table is gathered on the host instead of being widened to a 2.3 GiB F32 device copy.
+        => config.Architecture == DotLLM.Core.Configuration.Architecture.Glm4Moe && w.TokenEmbedWeight != 0
+            && w.TokenEmbedQuantType != QuantizationType.F32 && w.TokenEmbedQuantType != QuantizationType.Q8_0
+            && Environment.GetEnvironmentVariable("DOTLLM_VK_EMBED_HOST") != "0"
+        || EmbedOnHostEligible(w);
+
     private static bool EmbedOnHostEligible(TransformerWeights w)
         => w.TokenEmbedQuantType == QuantizationType.F32 && w.TokenEmbedWeight != 0
         && Environment.GetEnvironmentVariable("DOTLLM_VK_EMBED_HOST") switch
@@ -9653,6 +9707,33 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         };
 
     private VulkanDevice.Buffer? _embedStaging;
+
+    /// <summary>
+    /// Host gather of a PACKED token table (#1600: glm4moe's IQ4_XS table, 314 MiB packed vs 2.3 GiB widened): each requested row is decoded
+    /// from the mmap'd blocks into a pooled scratch (seqLen x hidden floats on the host, a few KB per token) and copied to the host-visible
+    /// staging buffer. The table itself never gets a device copy, so there is no F32 expansion of it anywhere.
+    /// </summary>
+    private void UploadQuantizedEmbeddingRows(TransformerWeights w, ReadOnlySpan<int> tokenIds, int hidden)
+    {
+        long rowSrcBytes = Dequantize.RowByteSize(hidden, w.TokenEmbedQuantType);
+        var scratch = System.Buffers.ArrayPool<float>.Shared.Rent(tokenIds.Length * hidden);
+        try
+        {
+            for (int t = 0; t < tokenIds.Length; t++)
+            {
+                int id = tokenIds[t];
+                if ((uint)id >= (uint)Config.VocabSize)
+                    throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token id {id} is out of range");
+                Dequantize.ToFloat32(w.TokenEmbedWeight + (nint)(id * rowSrcBytes), hidden, w.TokenEmbedQuantType,
+                    scratch.AsSpan(t * hidden, hidden));
+            }
+            _device.Upload(MemoryMarshal.AsBytes(scratch.AsSpan(0, tokenIds.Length * hidden)), _embedStaging!);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(scratch);
+        }
+    }
 
     private void RecordEmbeddingGather(nint cmdBuf, ReadOnlySpan<int> tokenIds)
     {
@@ -9669,7 +9750,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 _embedStaging?.Dispose();
                 _embedStaging = _device.Allocate(Math.Max(need, 64L * rowBytesHost));
             }
-            _device.UploadRows(_embedStaging, _cpuWeights.TokenEmbedWeight, rowBytesHost, Config.VocabSize, tokenIds);
+            if (_cpuWeights.TokenEmbedQuantType == QuantizationType.F32)
+                _device.UploadRows(_embedStaging, _cpuWeights.TokenEmbedWeight, rowBytesHost, Config.VocabSize, tokenIds);
+            else
+                UploadQuantizedEmbeddingRows(_cpuWeights, tokenIds, hiddenSize);
             _device.ActiveHazards?.OnTransfer(_embedStaging.Handle, _state.HiddenState.Handle);
             VulkanApi.vkCmdCopyBuffer(cmdBuf, _embedStaging.Handle, _state.HiddenState.Handle, 1,
                 new VkBufferCopy { srcOffset = 0, dstOffset = 0, size = (ulong)need });
@@ -9907,6 +9991,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ2KGemmCoopmat?.Dispose();
         _matmulQ5KGemmCoopmat?.Dispose();
         _matmulQ5_0GemmCoopmat?.Dispose();
+        _matmulQ5_1Gemv?.Dispose();
+        _matmulQ5_1GemmF32?.Dispose();
         _matmulQ3KGemmCoopmat?.Dispose();
         _matmulIq4XsGemmCoopmat?.Dispose();
         _matmulQ6KMmq?.Dispose();

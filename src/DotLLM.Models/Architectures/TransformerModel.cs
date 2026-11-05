@@ -128,6 +128,20 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// <summary>Diagnostic: invoked with the residual stream right AFTER the embedding lookup (layer = -1), so a harness can capture or replace the embedding (e.g. inject a Vulkan embedding). NOT a production path.</summary>
     internal Gemma4LayerOverrideFn? Gemma4PostEmbeddingHook { get; set; }
 
+    /// <summary>
+    /// Optional in-place modifier of the residual stream after each layer (<c>HookPoint.PostLayer</c>), e.g. a
+    /// ternary steering adapter (#1616). Null (the default) costs one predictable branch per layer and nothing
+    /// else. Single-threaded per model instance, like the LoRA adapter. When set, <see cref="ForwardBatch"/>
+    /// uses the per-sequence core so the modifier sees each sequence's own rows.
+    /// </summary>
+    public DotLLM.Core.Diagnostics.IResidualModifier? ResidualModifier { get; set; }
+
+    private unsafe void ApplyResidualModifier(DotLLM.Core.Diagnostics.IResidualModifier modifier, int layer, float* hidden, int seqLen)
+    {
+        if (modifier.AppliesTo(layer))
+            modifier.ModifyResidual(new Span<float>(hidden, seqLen * Config.HiddenSize), layer, seqLen);
+    }
+
     private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
                        object? mmapAnchor, int ropeDim, RoPEType ropeType,
                        ComputeThreadPool? threadPool, bool ownsPool, RoPEType globalRopeType = RoPEType.Norm)
@@ -1374,8 +1388,13 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
 
         // Layer-window bound: layerCount < 0 means "the whole trunk" (every pre-existing caller).
         int endLayer = layerCount < 0 ? numLayers : Math.Min(firstLayer + layerCount, numLayers);
+        var residualModifier = ResidualModifier;
         for (int layer = firstLayer; layer < endLayer; layer++)
         {
+            // PostLayer residual modifier for the PREVIOUS layer (several branches below `continue`, so
+            // applying at the top of the next iteration covers all of them).
+            if (residualModifier is not null && layer > firstLayer)
+                ApplyResidualModifier(residualModifier, layer - 1, hidden, seqLen);
             ref readonly var lw = ref _weights.Layers[layer];
             var rl = repackedLayers?[layer];
 
@@ -2250,6 +2269,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             NativeMemory.AlignedFree(g3nStreamsBacking);
             NativeMemory.Free(g3nStreams);
         }
+
+        if (residualModifier is not null && endLayer > firstLayer)
+            ApplyResidualModifier(residualModifier, endLayer - 1, hidden, seqLen);
 
         // Window mode: hand back the residual stream leaving the last executed layer and stop short
         // of the final norm — the caller either feeds it to the next window or, after the last
@@ -3432,7 +3454,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         // sequence takes the per-seq core. The diagnostic post-embedding hook is
         // settable at runtime, so it is checked per call. LoRA adapters are
         // per-sequence, so each request is judged individually.
-        bool modelHasComplexLayer = !_canUsePackedBatch || Gemma4PostEmbeddingHook is not null;
+        bool modelHasComplexLayer = !_canUsePackedBatch || Gemma4PostEmbeddingHook is not null || ResidualModifier is not null;
         Span<int> simpleIdxs = requests.Count <= 256
             ? stackalloc int[requests.Count]
             : new int[requests.Count];

@@ -177,7 +177,8 @@ public sealed class CudaPQ2_0GemvDp4aTests
                 {
                     for (int c = 0; c < columns; c++)
                     {
-                        MatMul.GemvPQ2_0(w, px + (long)c * k, py, n, k, threadPool: null);
+                        // W2A8 tier directly (Q8_0 grid, same as dp4a): the public GemvPQ2_0 dispatches to the planar kernel by default since #1620.
+                        MatMul.GemmPQ2_0W2A8ForTest(w, px + (long)c * k, py, n, k, 1);
                         for (int r = 0; r < n; r++) cpuY[c * n + r] = row[r];
                     }
                 }

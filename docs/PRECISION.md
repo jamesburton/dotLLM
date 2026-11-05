@@ -134,6 +134,7 @@ LM head. Its GPU side follows the RTX 3060 column.
 | **Logits** | F32 for sampled/scored rows only (#1137) | same | same | same | same (+486 MiB per 512-row window today) | same | same | — |
 | **Embeddings** | GGUF quant type, one row dequantized per token | same | same | same, CPU-side lookup | same; no load-time F16 table (#1135) | packed, not F32 (#919) | packed | — |
 | **Activations / scratch** | F16 or BF16 (not measured, #1138); fuse norm → Q8 at decode | same | **BF16** (no F16C) | hand-off to the 3060 in F16/BF16 (6 KB/token on 3B) | F16 (dense path already); hybrid F32 → F16 (#1138) | F16 (#1138; ffn-down F16 tile measured 13.5 → 23.5 TF) | F16 | E1 |
+| **Ternary adapter per-row scales** (metadata, #1620) | **F16 default** (RNE at load; per-circuit F32 fallback outside 6.1e-5..65504; `DOTLLM_TERNARY_SCALES=f32` forces F32) | same | same | same | CPU adapter only | CPU adapter only | CPU adapter only | E15 |
 | **Weights that must be 16-bit** | BF16 shift-widen kernel (#1118) | BF16 (`VDPBF16PS` on the preview track) | **BF16, not F16** | BF16 | F16 | F16 | F16 | E1 |
 
 ### 4.2 Notes per operation class
@@ -507,6 +508,12 @@ pair agrees within 0.03 nats per bin) plus median KL; keep the mean-KL gate for 
 activations cost Flint quality (exact was 0.1 nats better over 128 agent rows, level on wikitext) is open.
 
 ---
+
+### E15 - ternary adapter per-row scales, F32 vs F16 vs bf16 (#1620; user sign-off on F32 scale storage)
+
+Adapter delta with scales rounded RNE, weights exact, accumulation F32; D = 4096, 30 outlier-heavy residual rows per case; floor = the adapter's own int8 requantisation (relL2 vs an unquantised bottleneck, 3.1e-3..8.4e-3).
+F16 relL2 0.5e-3..2.3e-3 (0.1-0.7x the floor), 0.3-0.8 % of requantised bottleneck values flip by one level; bf16 relL2 2.4e-3..6.2e-3 (about 1x the floor), 2.5-6 % flip. Tiny llama end to end: F32 -> F16 scales KL 6e-8..4.7e-6, bf16 1.7e-5..2.4e-5, against an adapter effect of 2.6-3.5 nats (top-1 24/24).
+F16 range hazard: scales near 1e-6 are subnormal (relL2 2.2e-2) and above 65504 overflow, hence the automatic per-circuit F32 fallback. Reference sample adapters have unit scales (exact in every format). Tests: `TernaryScalePrecisionTests`; details and tables in `docs/TERNARY_ADAPTER.md`.
 
 ## 6. Decision table: CLAUDE.md rule → evidence
 

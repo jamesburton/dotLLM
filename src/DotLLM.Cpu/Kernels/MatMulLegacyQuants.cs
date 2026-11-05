@@ -500,6 +500,26 @@ public static unsafe partial class MatMul
             return;
         }
 
+        if (Q4FloorProbe && Avx2.IsSupported)
+        {
+            // Diagnostic (#1584): the single-row AVX2 dot (8 float lane partials, hsum) per column - same exact integer block sums,
+            // a different float accumulation order from the eight-row kernel. Measures the rounding-order floor of a perplexity.
+            nint rb = (nint)blockCount * LegacyBlockBytes(qt);
+            for (int t = 0; t < n; t++)
+                for (int row = 0; row < m; row++)
+                {
+                    byte* wr = weights + row * rb; byte* xr = xQ8 + (long)t * q8RowBytes;
+                    int bb = LegacyBlockBytes(qt);
+                    float r = 0;
+                    // Mode 1: one pass. Mode 2/3: the block range split into 2/3 independently summed chunks (more float orders).
+                    int chunks = Q4FloorProbeMode == 2 ? 2 : Q4FloorProbeMode == 3 ? 3 : 1;
+                    int per = (blockCount + chunks - 1) / chunks;
+                    for (int b0 = 0; b0 < blockCount; b0 += per)
+                        r += VecDotLegacyAvx2(qt, wr + b0 * bb, xr + b0 * Q8_1BlockBytes, Math.Min(per, blockCount - b0));
+                    c[(long)t * mTotal + row] = r;
+                }
+            return;
+        }
         if (Avx2.IsSupported)
         {
             nint q4RowBytes = (nint)blockCount * LegacyBlockBytes(qt);
@@ -547,6 +567,10 @@ public static unsafe partial class MatMul
                 c[(long)t * mTotal + row] =
                     VecDotLegacyQuantScalar(qt, weights + row * rowBytes, xQ8 + (long)t * q8RowBytes, blockCount);
     }
+
+    /// <summary>Diagnostic (<c>DOTLLM_CPU_Q4_FLOOR_PROBE=1</c>, #1584): route packed legacy GEMMs through the single-row AVX2 dot to measure float-order sensitivity.</summary>
+    internal static int Q4FloorProbeMode { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CPU_Q4_FLOOR_PROBE"), out int pm) ? pm : 0;
+    internal static bool Q4FloorProbe => Q4FloorProbeMode > 0;
 
     /// <summary>The unsigned PMADDUBSW operand for one block, plus the sign source IQ4_NL needs.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -1,0 +1,218 @@
+#version 450
+// Ternary residual adapter (.nsadapter), in place on the F32 residual stream (#1618).
+//
+// Reproduces the CPU reference (src/DotLLM.Cpu/Kernels/TernaryAdapterKernel.cs, bit for bit) for ONE layer's circuits:
+//
+//   x8   = absmax_int8(h)                         scale 127/max|h|, round-half-even, clamp [-128,127]
+//   d_j  = float(sum_c Wdown[j,c] * x8[c]) * downScale[j]
+//   r_j  = max(0, d_j);  m = max_j r_j (per circuit);  open = (alpha > 0) && m > max(threshold, 1e-6)
+//   q_j  = clamp(round_half_even(r_j * (127/m)), -128, 127)
+//   u_d  = float(sum_j Wup[d,j] * q_j) * upScale[d]
+//   h'_d = h_d + (0 + u1_d*dq1 + u2_d*dq2 + ...),   dq = (m/127) * alpha          (circuits in registration order)
+//
+// Weights are the packed plus/minus bitmasks (2 bits per weight), read in place; no expansion. Integer accumulation is exact
+// and order independent. The float ops are single IEEE ops in the reference's order: `precise` forbids FMA contraction, and
+// the three divisions go through divRN (candidate + exact fma residual) because Vulkan allows 2.5 ULP on plain division.
+//
+// One workgroup per token row (decode n=1 is one workgroup; prefill rows are independent workgroups). The row is read once
+// (absmax + quantize) before any write to it, so the update is in place.
+//
+// Layout (all uint storage buffers):
+//   binding 0  h       float[nRows * d]   residual, read+write
+//   binding 1  masks   uint []            totalRank Down rows then totalRank UpT rows; each row = (ceil(d/64)) blocks of
+//                                          [plusLo, plusHi, minusLo, minusHi] (the CPU ulong[plus,minus] layout, little endian)
+//   binding 2  scales  uint []            downScale[totalRank] then, per circuit, upScale[upStride]; F32 bits, or two F16 per
+//                                          uint when SCALE_F16 (spec constant 0)
+//   binding 3  meta    uint []            per circuit: rank, rankOffset, alpha bits, threshold bits
+//
+// Dispatch: groupCount = (nRows, 1, 1), local size 256.
+
+#define WG 256
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint SCALE_F16 = 0u;
+layout(constant_id = 1) const uint D_PAD = 4096u;      // d rounded up to a multiple of 64 (sizes the shared int8 row)
+
+layout(set = 0, binding = 0, std430) buffer BufH { float h[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BufMasks { uint masks[]; };
+layout(set = 0, binding = 2, std430) readonly buffer BufScales { uint scales[]; };
+layout(set = 0, binding = 3, std430) readonly buffer BufMeta { uint meta[]; };
+
+layout(push_constant) uniform PC {
+    uint d;
+    uint nRows;
+    uint nCirc;
+    uint totalRank;
+    uint wprU;           // uints per mask row = ceil(d/64) * 4
+    uint upScaleBase;    // scale-element index of circuit 0's upScale
+    uint upScaleStride;  // scale elements between circuits' upScale arrays
+    uint q127;           // 127, supplied at runtime so the compiler cannot rewrite m/127 as m*(1/127)
+} pc;
+
+// x8 with a +1 pad per 64-column block: the down projection has 64 lanes reading column (b*64 + i) for b = lane,
+// which would otherwise be a 64-word stride (all one bank).
+shared int x8[D_PAD + D_PAD / 64];
+shared int partial[WG];
+shared float rj[WG];
+shared int qv[WG];
+shared float dqv[WG];     // per circuit dequant factor
+shared int openv[WG];     // per circuit 0/1
+shared float redF[WG];
+shared float shScale;     // 127 / maxAbs(h) (0 when the row is ~0)
+
+float scaleAt(uint idx) {
+    if (SCALE_F16 != 0u) {
+        vec2 p = unpackHalf2x16(scales[idx >> 1]);
+        return ((idx & 1u) == 0u) ? p.x : p.y;
+    }
+    return uintBitsToFloat(scales[idx]);
+}
+
+// Correctly rounded a / b for positive finite a, b: the hardware quotient is within a few ULP, so test the neighbours with
+// the exact residual a - c*b (fma is exact there) and keep the nearest.
+float divRN(float a, float b) {
+    float q = a / b;
+    int qi = floatBitsToInt(q);
+    float best = q;
+    float bestR = abs(fma(-q, b, a));
+    for (int k = -2; k <= 2; k++) {
+        if (k == 0) continue;
+        float c = intBitsToFloat(qi + k);
+        float r = abs(fma(-c, b, a));
+        if (r < bestR) { bestR = r; best = c; }
+    }
+    return best;
+}
+
+int xi(uint c) { return int(c + (c >> 6)); }
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (t >= pc.nRows) return;
+    uint d = pc.d;
+    uint rowBase = t * d;
+
+    // ---- stage A: absmax -> int8 row ----
+    float mx = 0.0;
+    for (uint i = tid; i < d; i += WG) mx = max(mx, abs(h[rowBase + i]));
+    redF[tid] = mx;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) redF[tid] = max(redF[tid], redF[tid + s]);
+        barrier();
+    }
+    if (tid == 0u) shScale = (redF[0] > 1e-6) ? divRN(127.0, redF[0]) : 0.0;
+    barrier();
+    float qsx = shScale;
+    for (uint i = tid; i < d; i += WG) {
+        precise float v = h[rowBase + i] * qsx;
+        int q = int(roundEven(v));
+        x8[xi(i)] = clamp(q, -128, 127);
+    }
+    barrier();
+
+    // ---- stage B: down projections, one 64-lane group per (circuit,row) pair, 4 pairs at a time ----
+    uint grp = tid >> 6;
+    uint lane = tid & 63u;
+    uint blocks = (d + 63u) >> 6;
+    uint rounds = (pc.totalRank + 3u) >> 2;
+    for (uint rd = 0u; rd < rounds; rd++) {
+        uint j = rd * 4u + grp;
+        int sum = 0;
+        if (j < pc.totalRank) {
+            uint rowW = j * pc.wprU;
+            for (uint b = lane; b < blocks; b += 64u) {
+                uint wb = rowW + b * 4u;
+                uint pl = masks[wb], ph = masks[wb + 1u], ml = masks[wb + 2u], mh = masks[wb + 3u];
+                int xb = int(b * 65u);
+                for (int i = 0; i < 32; i++) {
+                    int xl = x8[xb + i];
+                    int xh = x8[xb + 32 + i];
+                    sum += (int((pl >> i) & 1u) - int((ml >> i) & 1u)) * xl;
+                    sum += (int((ph >> i) & 1u) - int((mh >> i) & 1u)) * xh;
+                }
+            }
+        }
+        partial[tid] = sum;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1) {
+            if (lane < s) partial[tid] += partial[tid + s];
+            barrier();
+        }
+        if (lane == 0u && j < pc.totalRank) {
+            precise float v = float(partial[tid]) * scaleAt(j);
+            rj[j] = max(0.0, v);
+        }
+        barrier();
+    }
+
+    // ---- stage C: per circuit max / gate / requantize (one thread per circuit; rank <= 256 total) ----
+    if (tid < pc.nCirc) {
+        uint rank = meta[tid * 4u], off = meta[tid * 4u + 1u];
+        float alpha = uintBitsToFloat(meta[tid * 4u + 2u]);
+        float thr = uintBitsToFloat(meta[tid * 4u + 3u]);
+        int open = 0;
+        float dq = 0.0;
+        if (alpha > 0.0) {
+            float m = 0.0;
+            for (uint j = 0u; j < rank; j++) m = max(m, rj[off + j]);
+            if (m > max(thr, 1e-6)) {
+                float qsc = divRN(127.0, m);
+                for (uint j = 0u; j < rank; j++) {
+                    precise float v = rj[off + j] * qsc;
+                    qv[off + j] = clamp(int(roundEven(v)), -128, 127);
+                }
+                precise float dqf = divRN(m, float(pc.q127)) * alpha;
+                dq = dqf;
+                open = 1;
+            }
+        }
+        openv[tid] = open;
+        dqv[tid] = dq;
+    }
+    barrier();
+
+    int any = 0;
+    for (uint c = 0u; c < pc.nCirc; c++) any |= openv[c];
+    if (any == 0) return;   // every circuit closed: delta == 0, row unchanged (workgroup-uniform)
+
+    // ---- stage D: up projections + residual add; one thread owns 32 consecutive output columns (one mask word) ----
+    // Each (circuit, rank row) costs the thread two word loads for 32 columns, instead of two loads per column.
+    uint upRows = pc.totalRank * pc.wprU;   // UpT rows start after the Down rows
+    uint w32 = tid;                          // mask word index in columns/32 units
+    uint colBase = w32 * 32u;
+    if (colBase < d) {
+        uint blk = (w32 >> 1) * 4u + (w32 & 1u);
+        precise float tot[32];
+        for (int i = 0; i < 32; i++) tot[i] = 0.0;
+        for (uint c = 0u; c < pc.nCirc; c++) {
+            if (openv[c] == 0) continue;
+            uint rank = meta[c * 4u], off = meta[c * 4u + 1u];
+            int acc[32];
+            for (int i = 0; i < 32; i++) acc[i] = 0;
+            for (uint j = 0u; j < rank; j++) {
+                uint rw = upRows + (off + j) * pc.wprU + blk;
+                uint pw = masks[rw], mw = masks[rw + 2u];
+                int q = qv[off + j];
+                for (int i = 0; i < 32; i++)
+                    acc[i] += (int((pw >> i) & 1u) - int((mw >> i) & 1u)) * q;
+            }
+            float dq = dqv[c];
+            uint sbase = pc.upScaleBase + c * pc.upScaleStride + colBase;
+            for (int i = 0; i < 32; i++) {
+                if (colBase + uint(i) < d) {
+                    precise float u = float(acc[i]) * scaleAt(sbase + uint(i));
+                    precise float dl = u * dq;
+                    tot[i] = tot[i] + dl;
+                }
+            }
+        }
+        for (int i = 0; i < 32; i++) {
+            if (colBase + uint(i) < d) {
+                precise float outv = h[rowBase + colBase + uint(i)] + tot[i];
+                h[rowBase + colBase + uint(i)] = outv;
+            }
+        }
+    }
+}

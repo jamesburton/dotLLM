@@ -1,0 +1,74 @@
+{
+  "id": "chatcmpl-0003",
+  "object": "chat.completion",
+  "created": 1793577602,
+  "model": "qwen3-4b",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Same answer as the unannotated request."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 4210,
+    "completion_tokens": 40,
+    "total_tokens": 4250,
+    "prompt_tokens_details": {
+      "cached_tokens": 1800
+    }
+  },
+  "timings": {
+    "cache_n": 1800,
+    "chunk_n": 0,
+    "chunk_recomputed_n": 0
+  },
+  "chunk_cache": {
+    "v": 1,
+    "policy_requested": "shadow",
+    "policy_applied": "exact",
+    "reason": null,
+    "chunks": {
+      "annotated": 2,
+      "prefix": 1,
+      "hit": 1,
+      "miss": 0,
+      "ignored": 0
+    },
+    "tokens": {
+      "prompt": 4210,
+      "prefix_reused": 1800,
+      "prefix_reused_approx": 0,
+      "chunk_reused": 0,
+      "chunk_recomputed": 0,
+      "prefilled": 2410,
+      "encode_queued": 0
+    },
+    "plan": {
+      "selector": "chunk_starts",
+      "budget": 0.05,
+      "tokens": {
+        "prompt": 4210,
+        "prefix_reused": 1800,
+        "prefix_reused_approx": 0,
+        "chunk_reused": 1620,
+        "chunk_recomputed": 81,
+        "prefilled": 790,
+        "encode_queued": 0
+      },
+      "predicted_ttft_ms": 410,
+      "full_prefill_estimate_ms": 1500
+    },
+    "timings_ms": {
+      "assembly": 0,
+      "probe": 0,
+      "recompute": 0,
+      "prefill": 640,
+      "full_prefill_estimate": 1500
+    },
+    "warnings": []
+  }
+}

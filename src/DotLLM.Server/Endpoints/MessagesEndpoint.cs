@@ -3,6 +3,7 @@ using System.Text.Json;
 using DotLLM.Core.Configuration;
 using DotLLM.Engine;
 using DotLLM.Engine.Constraints;
+using DotLLM.Server.ChunkCache;
 using DotLLM.Server.Models;
 using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
@@ -96,13 +97,35 @@ public static class MessagesEndpoint
             return;
         }
 
+        // chunk_cache (docs/CHUNK_CACHE.md): with --chunk-cache on and an annotated body only; otherwise null and nothing
+        // below changes. The namespace is server-assigned (the default until authentication exists).
+        ChunkCacheExchange? chunkCache;
+        try
+        {
+            chunkCache = state.Options.ChunkCache.Enabled
+                ? ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, ChunkCacheWire.DefaultNamespace))
+                : null;
+        }
+        catch (InvalidOperationException)
+        {
+            // The parser converts the messages first: a text value JsonElement.GetString refuses (a lone-surrogate escape).
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", UndecodableTextError);
+            return;
+        }
+        if (chunkCache?.Parsed.Error is { } chunkParseError)
+        {
+            await WriteErrorAsync(httpContext, chunkParseError.Status, chunkParseError.Type, chunkParseError.Message, chunkParseError.Code);
+            return;
+        }
+
         var ct = httpContext.RequestAborted;
         var messageId = AnthropicConverter.GenerateMessageId();
         // Echo the model that actually served the request, not the requested alias — after
         // EnsureActiveAsync, Options.ModelId is the active model's key.
         var modelId = state.Options.ModelId;
 
-        string? prompt = BuildPrompt(request, state, out var tools, out bool constrained, out string? templateError, out string? generationPromptSuffix);
+        string? prompt = BuildPrompt(request, state, out var tools, out bool constrained, out string? templateError, out string? generationPromptSuffix,
+            out var rendered);
         if (prompt is null)
         {
             await WriteErrorAsync(httpContext, 400, "invalid_request_error", templateError!);
@@ -144,12 +167,19 @@ public static class MessagesEndpoint
         var effectiveParser = ApplyToolChoice(
             toolChoice, tools, state.ToolCallParser, ref options, out bool forcedToolCall);
 
+        // chunk_cache: locate, verify and look up the annotated spans in the prompt exactly as rendered (read-only).
+        if (chunkCache?.Prepare(state, rendered.Messages, rendered.EngineMessageOffset, rendered.Options, prompt) is { } chunkPlanError)
+        {
+            await WriteErrorAsync(httpContext, chunkPlanError.Status, chunkPlanError.Type, chunkPlanError.Message, chunkPlanError.Code);
+            return;
+        }
+
         if (request.Stream)
             await HandleStreamingAsync(request, state, httpContext, prompt, options,
-                messageId, modelId, effectiveParser, forcedToolCall, promptTokenCount, plan, ct, tools);
+                messageId, modelId, effectiveParser, forcedToolCall, promptTokenCount, plan, ct, tools, chunkCache);
         else
             await HandleNonStreamingAsync(request, state, httpContext, prompt, options,
-                messageId, modelId, effectiveParser, plan, ct, tools);
+                messageId, modelId, effectiveParser, plan, ct, tools, chunkCache);
     }
 
     /// <summary>
@@ -174,7 +204,8 @@ public static class MessagesEndpoint
         IToolCallParser? toolCallParser,
         ReasoningPlan plan,
         CancellationToken ct,
-        ToolDefinition[]? tools = null)
+        ToolDefinition[]? tools = null,
+        ChunkCacheExchange? chunkCache = null)
     {
         InferenceResponse? result = null;
 
@@ -184,7 +215,7 @@ public static class MessagesEndpoint
         if (state.Scheduler is { } scheduler)
         {
             int[] promptIds = state.Tokenizer!.Encode(prompt);
-            result = await scheduler.EnqueueAsync(
+            result = await state.EnqueueTrackedAsync(scheduler,
                 new InferenceRequest { TokenIds = promptIds, Options = options }, ct);
         }
         else
@@ -262,6 +293,7 @@ public static class MessagesEndpoint
                 InputTokens = result.PromptTokenCount,
                 OutputTokens = result.GeneratedTokenCount,
             },
+            ChunkCache = chunkCache?.Finish(result.PromptTokenCount, result.Timings),
         };
 
         // Report actuals to the rate-limit lease so unused token budget is refunded. No-op when
@@ -286,18 +318,19 @@ public static class MessagesEndpoint
         int promptTokenCount,
         ReasoningPlan plan,
         CancellationToken ct,
-        ToolDefinition[]? tools = null)
+        ToolDefinition[]? tools = null,
+        ChunkCacheExchange? chunkCache = null)
     {
         // (#1266) Same routing as the non-streaming path: on the scheduler, with no gate or model lease.
         if (state.Scheduler is { } scheduler)
         {
             await WriteMessageStreamAsync(
                 httpContext,
-                ServerState.SchedulerStream(scheduler, httpContext, state.Tokenizer!.Encode(prompt), options),
+                ServerState.SchedulerStream(state, scheduler, httpContext, state.Tokenizer!.Encode(prompt), options),
                 ServerState.WithoutGate,
                 toolCallParser,
                 request.StopSequences,
-                messageId, modelId, promptTokenCount, ct, forcedToolCall, plan, tools, state.KeepAliveInterval);
+                messageId, modelId, promptTokenCount, ct, forcedToolCall, plan, tools, state.KeepAliveInterval, chunkCache);
             return;
         }
 
@@ -312,7 +345,7 @@ public static class MessagesEndpoint
                 state.DescribeWait, state.KeepAliveInterval),
             toolCallParser,
             request.StopSequences,
-            messageId, modelId, promptTokenCount, ct, forcedToolCall, plan, tools, state.KeepAliveInterval);
+            messageId, modelId, promptTokenCount, ct, forcedToolCall, plan, tools, state.KeepAliveInterval, chunkCache);
     }
 
     /// <summary>
@@ -342,7 +375,8 @@ public static class MessagesEndpoint
         bool forcedToolCall = false,
         ReasoningPlan? plan = null,
         IReadOnlyList<ToolDefinition>? tools = null,
-        TimeSpan? keepAliveInterval = null)
+        TimeSpan? keepAliveInterval = null,
+        ChunkCacheExchange? chunkCache = null)
     {
         // (#1023 review) Stop the activation-phase keep-alive before touching headers (it commits them itself).
         await SseKeepAlive.StopForAsync(httpContext);
@@ -417,6 +451,7 @@ public static class MessagesEndpoint
         var sb = new StringBuilder();
         FinishReason finishReason = FinishReason.Length;
         int completionTokens = 0;
+        InferenceTimings? timings = null; // read only for the chunk_cache report
 
         // Tool-call markup must not ALSO go out as text_delta: the same payload would be
         // reported twice — once as text, once as the tool_use block emitted below — and an SDK's
@@ -485,7 +520,10 @@ public static class MessagesEndpoint
                     }
 
                     if (token.FinishReason.HasValue)
+                    {
                         finishReason = token.FinishReason.Value;
+                        timings = token.Timings;
+                    }
                     if (token.GeneratedTokenCount is int generated)
                         completionTokens = generated;
                 }
@@ -591,6 +629,7 @@ public static class MessagesEndpoint
             {
                 Delta = new AnthropicMessageDeltaBody { StopReason = stopReason, StopSequence = stopSequence },
                 Usage = new AnthropicUsageDto { InputTokens = promptTokenCount, OutputTokens = completionTokens },
+                ChunkCache = chunkCache?.Finish(promptTokenCount, timings),
             },
             ServerJsonContext.Default.AnthropicMessageDeltaEvent, ct);
 
@@ -698,6 +737,10 @@ public static class MessagesEndpoint
     private static readonly string[] SupportedContentBlockTypes =
         ["text", "tool_use", "tool_result", "thinking", "redacted_thinking"];
 
+    /// <summary>The 400 message for message text that cannot be decoded as a string (a lone UTF-16 surrogate escape).</summary>
+    internal const string UndecodableTextError =
+        "a string value in messages or tools cannot be decoded (for example a lone UTF-16 surrogate escape)";
+
     /// <summary>
     /// Builds the prompt for an Anthropic request: message flattening, tool definitions and the
     /// chat template. Shared by <c>/v1/messages</c> and <c>/v1/messages/count_tokens</c> so the
@@ -705,10 +748,27 @@ public static class MessagesEndpoint
     /// </summary>
     private static string? BuildPrompt(
         AnthropicMessagesRequest request, ServerState state, out ToolDefinition[]? tools,
-        out bool constrained, out string? error, out string? generationPromptSuffix, bool wantSuffix = true)
+        out bool constrained, out string? error, out string? generationPromptSuffix,
+        out (ChatMessage[] Messages, int EngineMessageOffset, ChatTemplateOptions Options) rendered, bool wantSuffix = true)
     {
-        var messages = ProfileSystemPrompt.Apply(state.ActiveProfile?.System, AnthropicConverter.ToMessages(request));
-        tools = AnthropicConverter.ToTools(request.Tools);
+        ChatMessage[] engineMessages;
+        try
+        {
+            engineMessages = AnthropicConverter.ToMessages(request);
+            tools = AnthropicConverter.ToTools(request.Tools);
+        }
+        catch (InvalidOperationException)
+        {
+            // JsonElement.GetString refuses a string it cannot decode to valid UTF-16 (a lone-surrogate escape is valid
+            // JSON): a client error, as on the OpenAI surface where model binding rejects it.
+            tools = null;
+            constrained = false;
+            error = UndecodableTextError;
+            generationPromptSuffix = null;
+            rendered = default;
+            return null;
+        }
+        var messages = ProfileSystemPrompt.Apply(state.ActiveProfile?.System, engineMessages);
 
         // A forced tool_choice constrains decoding from the first token, which cannot coexist with an
         // open reasoning block: such requests default thinking off unless the client enabled it (#767).
@@ -718,6 +778,8 @@ public static class MessagesEndpoint
         var options = ReasoningSupport.BuildTemplateOptions(
             tools, request.ThinkingEnabled, reasoningEffort: null, request.ChatTemplateKwargs, constrained);
         generationPromptSuffix = null;
+        // What was rendered, for the chunk_cache locator (Task 11): the messages, the profile offset (ruling 31), the options.
+        rendered = (messages, messages.Length - engineMessages.Length, options);
         if (!ReasoningSupport.TryApply(state.ChatTemplate!, messages, options, out string prompt, out error, out _))
             return null;
 
@@ -771,7 +833,7 @@ public static class MessagesEndpoint
             return;
         }
 
-        string? prompt = BuildPrompt(request, state, out _, out _, out string? templateError, out _, wantSuffix: false);
+        string? prompt = BuildPrompt(request, state, out _, out _, out string? templateError, out _, out _, wantSuffix: false);
         if (prompt is null)
         {
             await WriteErrorAsync(httpContext, 400, "invalid_request_error", templateError!);
@@ -859,10 +921,15 @@ public static class MessagesEndpoint
     /// HTTP status. Every failure path on this surface goes through here: an Anthropic SDK client
     /// parses this envelope and would throw on the OpenAI surface's <c>{"error":"..."}</c> shape.
     /// </summary>
+    /// <param name="ctx">The request.</param>
+    /// <param name="statusCode">HTTP status.</param>
+    /// <param name="errorType">Anthropic error type.</param>
+    /// <param name="message">Error message.</param>
+    /// <param name="code">A machine-readable code (strict <c>chunk_cache</c> errors, ruling 29); omitted when null.</param>
     internal static async Task WriteErrorAsync(
-        HttpContext ctx, int statusCode, string errorType, string message)
+        HttpContext ctx, int statusCode, string errorType, string message, string? code = null)
     {
-        var error = new AnthropicErrorResponse { Error = new AnthropicErrorBody { Type = errorType, Message = message } };
+        var error = new AnthropicErrorResponse { Error = new AnthropicErrorBody { Type = errorType, Message = message, Code = code } };
         await SseKeepAlive.StopForAsync(ctx);
         if (ctx.Response.HasStarted)
         {

@@ -700,13 +700,14 @@ internal sealed class VulkanWeights : IDisposable
             LastTokenEmbedDequantPath = "skipped";
             tokenEmbed = device.AllocateDeviceLocal(64);
         }
-        else if (tokenEmbedOnHost && weights.TokenEmbedQuantType == QuantizationType.F32)
+        else if (tokenEmbedOnHost)
         {
             // #1161: an F32 table (Flint: 1.2 GB) stays in the mmap; the forward gathers its rows on the host (TokenEmbeddingOnHost).
             LastTokenEmbedDequantPath = "host-gather";
             tokenEmbed = device.AllocateDeviceLocal(64);
             hostEmbed = true;
-            _residencyReport.Add("token_embd.weight", weights.TokenEmbedQuantType, QuantizationType.F32, 0, 0);
+            // Host-gathered: the table stays in the mapping, nothing is uploaded and nothing is widened on the device (device type == source type).
+            _residencyReport.Add("token_embd.weight", weights.TokenEmbedQuantType, weights.TokenEmbedQuantType, 0, 0);
         }
         else
         {
@@ -1364,6 +1365,14 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepQ5_0OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q5_0 && (inputDim % 32) == 0;
 
+    /// <summary>
+    /// True when the matrix is kept on device as Q5_1 blocks (24 B / 32 elements: fp16 d, fp16 m, qh, 16 nibble bytes; value d * q + m),
+    /// read in place by <c>MatMulQ5_1GemvF32Kernel</c> / <c>MatMulQ5_1GemmF32Kernel</c> (#1600: GLM-4.5-Air's shared-expert down projection is
+    /// Q5_1 on 24 of 46 layers, K = 1408; it used to widen to F32).
+    /// </summary>
+    private static bool KeepQ5_1OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.Q5_1 && (inputDim % 32) == 0;
+
     /// <summary>Returns true when the matrix will be kept on device as Q4_0 blocks (18 bytes per 32 elements: fp16 scale +
     /// 16 packed nibble bytes; issue #1018). Consumed by <c>MatMulQ4_0GemvF32Kernel</c> / <c>MatMulQ4_0GemmF32Kernel</c> (always created,
     /// the scalar fallbacks), the dp4a MMVQ decode kernel and the coopmat prefill GEMM. <c>DOTLLM_VK_Q4_0_NATIVE=0</c> restores the old
@@ -1514,6 +1523,7 @@ internal sealed class VulkanWeights : IDisposable
     {
         if (KeepQ8OnDevice(srcQt, dequantToFp32)) return QuantizationType.Q8_0;
         if (KeepQ5_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q5_0;
+        if (KeepQ5_1OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q5_1;
         if (KeepQ4_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_0;
         if (KeepQ4_1OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_1;
         if (KeepNvfp4OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.NVFP4;   // #1579
@@ -1618,6 +1628,8 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
         if (KeepQ5_0OnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q5_0) * outputDim;
+        if (KeepQ5_1OnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q5_1) * outputDim;
         if (KeepQ4_0OnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q4_0) * outputDim;
         if (KeepQ4_1OnDevice(qt, inputDim, dequantToFp32))
@@ -2745,7 +2757,8 @@ internal sealed class VulkanWeights : IDisposable
         // The MMVQ kernels need integer-dot-product; without it the bank would widen to F32 (loud: ValidateRoutedBankF32Source).
         if (raw != 0 && device.HasIntegerDotProduct && rawM == expectedM && rawK == expectedK
             && MoeIqFormats.FromQuantizationType(qt) is { } iqFormat
-            && (expectedK % MoeIqFormats.Describe(iqFormat).GroupSize) == 0 && (expectedK % 256) == 0)
+            && (expectedK % MoeIqFormats.Describe(iqFormat).GroupSize) == 0
+            && (expectedK % MoeIqKGranule(iqFormat)) == 0)
             return qt;
 
         // Strategy C path: keep routed F16 expert banks raw only when the
@@ -2761,6 +2774,14 @@ internal sealed class VulkanWeights : IDisposable
 
         return QuantizationType.F32;
     }
+
+    /// <summary>
+    /// Contraction-dim granule the IQ-family routed-bank kernels need: 256 for the super-block formats, 64 for the 32-element legacy blocks
+    /// (IQ4_NL / Q4_0 / Q4_1: the indexed MMVQ reads whole 32-element blocks and the grouped coopmat shader stages two blocks per round).
+    /// glm4moe's down bank has K = 1408 = 22 x 64 = 5.5 x 256, so a blanket 256 rule widened its IQ4_NL down bank to F32 (#1600).
+    /// </summary>
+    internal static int MoeIqKGranule(MoeIqQuant format)
+        => MoeIqFormats.Describe(format).GroupSize == QuantFormat.LegacyGroupSize ? 64 : 256;
 
     /// <summary>
     /// Preflight check for whether <c>TransformerWeights.LoadFromGguf(gguf, config,
@@ -3160,7 +3181,7 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(contractionDim, QuantizationType.MXFP4) * outputDim;
         if (qt == QuantizationType.NVFP4 && (contractionDim % QuantFormat.Nvfp4GroupSize) == 0)
             return Dequantize.RowByteSize(contractionDim, QuantizationType.NVFP4) * outputDim;
-        if (MoeIqFormats.FromQuantizationType(qt) is { } iqf && (contractionDim % 256) == 0
+        if (MoeIqFormats.FromQuantizationType(qt) is { } iqf && (contractionDim % MoeIqKGranule(iqf)) == 0
             && (contractionDim % MoeIqFormats.Describe(iqf).GroupSize) == 0)
             return Dequantize.RowByteSize(contractionDim, qt) * outputDim;
         if (MoeOverlayKeepsF16(qt, contractionDim))

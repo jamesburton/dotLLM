@@ -120,6 +120,13 @@ public static unsafe partial class MatMul
         if (k % PQ2_0GroupSize != 0)
             throw new ArgumentException($"k must be a multiple of {PQ2_0GroupSize}, got {k}", nameof(k));
 
+        if (PQ2_0Planar)
+        {
+            // Default on with AVX2 (#1616/#1620; DOTLLM_PQ2_PLANAR=0 or DOTLLM_PQ2_W2A8=0 turns it off): packed bytes in place, planar int8 activations.
+            GemvPQ2_0Planar(weights, x, result, m, k, threadPool);
+            return;
+        }
+
         if (PQ2_0UseW2A8)
         {
             GemvPQ2_0W2A8(weights, x, result, m, k, threadPool);
@@ -236,6 +243,14 @@ public static unsafe partial class MatMul
 
         if (k % PQ2_0GroupSize != 0)
             throw new ArgumentException($"k must be a multiple of {PQ2_0GroupSize}, got {k}", nameof(k));
+
+        if (PQ2_0Planar && n <= PQ2_0PlanarMaxN)
+        {
+            // Default (#1620, planar on and n <= DOTLLM_PQ2_PLANAR_NMAX, 16 by default): token-blocked planar kernel, per token bit-identical
+            // to the planar decode GEMV, see MatMul.PQ2PlanarBlocked.cs. Above the cut the W2A8 tier below runs (Q8_0 grid).
+            GemmPQ2_0PlanarBlocked(weights, b, c, m, k, n, threadPool);
+            return;
+        }
 
         // Small-n (speculative-verify and prefill, 2..PQ2_0SmallNMax rows): the scalar float tier below unpacks every weight row with a
         // per-element scalar loop and dots in f32 - ~1.1 s for a 2-row Bonsai-2 forward vs 0.25 s for the W2A8 decode GEMV (#1367).

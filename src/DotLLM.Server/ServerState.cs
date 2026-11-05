@@ -34,6 +34,53 @@ public sealed class ServerState : IDisposable
 {
     private readonly SemaphoreSlim _requestGate = new(1, 1);
 
+    /// <summary>Requests currently generating on the active model, on ANY path (gated or scheduler); see <see cref="BeginRequest"/> (#1606).</summary>
+    private int _inFlight;
+
+    /// <summary>Clock for the keep-alive bookkeeping (last-used stamps, expiry); settable so tests need not sleep (#1606).</summary>
+    internal TimeProvider Clock { get; set; } = TimeProvider.System;
+
+    private DateTimeOffset Now => Clock.GetUtcNow();
+
+    /// <summary>Requests currently in flight (generating), for tests and diagnostics (#1606).</summary>
+    internal int InFlightRequests => Volatile.Read(ref _inFlight);
+
+    /// <summary>
+    /// Marks a request as generating on the active model until the returned scope is disposed (#1606). While any scope is open the
+    /// idle sweep never unloads the active model, and disposing stamps <see cref="LastUsedUtc"/>, so keep-alive counts from the moment
+    /// the LAST request finished, not from when it started. Every generation path takes one: the gated ones inside
+    /// <c>ExecuteAsync</c>/<c>ExecuteOnModelAsync</c>, and the continuous-batch scheduler ones (which hold no gate) explicitly.
+    /// Dispose in a <c>finally</c> / <c>using</c>; it is idempotent.
+    /// </summary>
+    internal InFlightScope BeginRequest()
+    {
+        Interlocked.Increment(ref _inFlight);
+        return new InFlightScope(this);
+    }
+
+    /// <summary>
+    /// <see cref="ContinuousBatchSchedulerService.EnqueueAsync"/> held in flight (#1606): the scheduler paths take neither the request
+    /// gate nor the model lease, so this scope is all that keeps the idle sweep from unloading the model under the generation.
+    /// </summary>
+    internal async Task<InferenceResponse> EnqueueTrackedAsync(ContinuousBatchSchedulerService scheduler, InferenceRequest request, CancellationToken ct)
+    {
+        using var scope = BeginRequest();
+        return await scheduler.EnqueueAsync(request, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Handle returned by <see cref="BeginRequest"/>.</summary>
+    internal sealed class InFlightScope(ServerState owner) : IDisposable
+    {
+        private ServerState? _owner = owner;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _owner, null) is not { } o) return;
+            o.LastUsedUtc = o.Now;                  // stamp BEFORE the decrement: the sweep must never see 0 in flight with a stale stamp
+            Interlocked.Decrement(ref o._inFlight);
+        }
+    }
+
     private EmbeddingBatcher? _embeddings;
 
     /// <summary>Dynamic batcher shared by <c>/v1/embeddings</c> and <c>/api/embed</c> (#1405).</summary>
@@ -88,6 +135,15 @@ public sealed class ServerState : IDisposable
 
     /// <summary>Interval between SSE keep-alive comments for a waiting streaming request (#1023); settable for tests.</summary>
     internal TimeSpan KeepAliveInterval { get; set; } = Endpoints.SseKeepAlive.DefaultInterval;
+
+    /// <summary>
+    /// Chunk-cache state (store, model identity) for <c>--chunk-cache</c> requests. Created on first use, so a server with the
+    /// flag off never constructs it (nor touches the store types of <c>DotLLM.ChunkReuse</c> through it).
+    /// </summary>
+    internal ChunkCache.ChunkCacheRuntime ChunkCacheRuntime =>
+        LazyInitializer.EnsureInitialized(ref _chunkCacheRuntime, static () => new ChunkCache.ChunkCacheRuntime());
+
+    private ChunkCache.ChunkCacheRuntime? _chunkCacheRuntime;
 
     /// <summary>The loader an activation uses (<see cref="ServerStartup.LoadModel"/>); settable so tests can observe the state at load time.</summary>
     internal Func<string, ServerOptions, ServerState> ModelLoader { get; set; } = ServerStartup.LoadModel;
@@ -199,11 +255,12 @@ public sealed class ServerState : IDisposable
     /// </summary>
     /// <param name="scheduler">The running scheduler.</param>
     /// <param name="httpContext">The request, for the API key the rate limiter resolved (per-key fairness).</param>
+    /// <param name="state">The server state, whose in-flight count the stream holds while enumerated (#1606).</param>
     /// <param name="promptIds">The encoded prompt.</param>
     /// <param name="options">The resolved inference options.</param>
     /// <returns>A token source, started by the endpoint's stream writer.</returns>
     internal static Func<CancellationToken, IAsyncEnumerable<GenerationToken>> SchedulerStream(
-        ContinuousBatchSchedulerService scheduler, HttpContext httpContext, int[] promptIds, InferenceOptions options)
+        ServerState state, ContinuousBatchSchedulerService scheduler, HttpContext httpContext, int[] promptIds, InferenceOptions options)
     {
         var request = new InferenceRequest
         {
@@ -211,7 +268,16 @@ public sealed class ServerState : IDisposable
             Options = options,
             ApiKey = httpContext.Items.TryGetValue(RateLimitMiddleware.ApiKeyItemKey, out var k) ? k as string : null,
         };
-        return ct => scheduler.StreamAsync(request, ct);
+        return ct => TrackedAsync(state, scheduler.StreamAsync(request, ct), ct);
+    }
+
+    /// <summary>Holds an in-flight scope (#1606) for as long as the scheduler stream is being enumerated, released on completion, error, cancel or abandon.</summary>
+    private static async IAsyncEnumerable<GenerationToken> TrackedAsync(
+        ServerState state, IAsyncEnumerable<GenerationToken> inner, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+    {
+        using var scope = state.BeginRequest();
+        await foreach (var token in inner.WithCancellation(ct).ConfigureAwait(false))
+            yield return token;
     }
 
     /// <summary>The <c>execute</c> step for a <see cref="SchedulerStream"/>: runs the work directly, with no gate or lease.</summary>
@@ -372,6 +438,7 @@ public sealed class ServerState : IDisposable
             using var lease = Scheduler is { } scheduler
                 ? await scheduler.AcquireModelAsync(ct)
                 : null;
+            using var inFlight = BeginRequest();   // (#1606)
             await work();
         }
         finally { ReleaseGate(); }
@@ -406,6 +473,7 @@ public sealed class ServerState : IDisposable
             using var lease = Scheduler is { } scheduler
                 ? await scheduler.AcquireModelAsync(ct)
                 : null;
+            using var inFlight = BeginRequest();   // (#1606)
             await work(generator);
         }
         finally { ReleaseGate(); }
@@ -466,6 +534,7 @@ public sealed class ServerState : IDisposable
                     throw new ModelUnavailableException(admittedModelId, error ?? "no model is loaded");
             }
             using var lease = Scheduler is { } scheduler ? await scheduler.AcquireModelAsync(ct) : null;
+            using var inFlight = BeginRequest();   // (#1606)
             await work();
         }
         finally { ReleaseGate(); }
@@ -629,7 +698,7 @@ public sealed class ServerState : IDisposable
 
             await loadAction();
             IsReady = true;
-            LastUsedUtc = DateTimeOffset.UtcNow;
+            LastUsedUtc = Now;
             ServerLog.Info($"model loaded: {Options.ModelId} in {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(start))}");
 
             Residency.EnforceBudget(EstimatedBytes);
@@ -881,7 +950,7 @@ public sealed class ServerState : IDisposable
     /// </summary>
     public IReadOnlyList<ResidentModelInfo> ListResidentModels()
     {
-        var now = DateTimeOffset.UtcNow;
+        var now = Now;
         var result = new List<ResidentModelInfo>();
         if (IsReady && Model is not null)
         {
@@ -910,7 +979,7 @@ public sealed class ServerState : IDisposable
     /// </summary>
     public async Task SweepIdleAsync()
     {
-        Residency.SweepExpired(DateTimeOffset.UtcNow);
+        Residency.SweepExpired(Now);
 
         if (!IsReady || Model is null) return;
         if (!IsActiveExpired()) return;
@@ -1031,7 +1100,7 @@ public sealed class ServerState : IDisposable
 
     private void Touch(double? keepAliveOverride)
     {
-        LastUsedUtc = DateTimeOffset.UtcNow;
+        LastUsedUtc = Now;
         if (keepAliveOverride.HasValue)
             KeepAliveSecondsOverride = keepAliveOverride;
     }
@@ -1040,7 +1109,8 @@ public sealed class ServerState : IDisposable
     {
         double effective = KeepAliveSecondsOverride ?? Residency.DefaultKeepAliveSeconds;
         if (effective < 0) return false; // never expire
-        return (DateTimeOffset.UtcNow - LastUsedUtc).TotalSeconds >= effective;
+        if (Volatile.Read(ref _inFlight) > 0) return false;   // (#1606) a request is generating on it: idle means NO request in flight
+        return (Now - LastUsedUtc).TotalSeconds >= effective;
     }
 
     private static long SafeFileLength(string path) => ServerStartup.SafeFileLength(path);
@@ -1133,7 +1203,7 @@ public sealed class ServerState : IDisposable
         EstimatedBytes = snapshot.EstimatedBytes;
         KeepAliveSecondsOverride = keepAliveOverride ?? snapshot.KeepAliveSecondsOverride;
         IsReady = true;
-        LastUsedUtc = DateTimeOffset.UtcNow;
+        LastUsedUtc = Now;
 
         RebuildSchedulerLocked();
     }
@@ -1168,7 +1238,7 @@ public sealed class ServerState : IDisposable
         EstimatedBytes = estimatedBytes;
         KeepAliveSecondsOverride = keepAliveOverride;
         IsReady = true;
-        LastUsedUtc = DateTimeOffset.UtcNow;
+        LastUsedUtc = Now;
 
         if (loaded.LoraRegistry is not null && !ReferenceEquals(loaded.LoraRegistry, LoraRegistry))
             loaded.LoraRegistry.Dispose();

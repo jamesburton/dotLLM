@@ -269,6 +269,15 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("keep_alive")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public double? KeepAlive { get; init; }
+
+    /// <summary>
+    /// The <c>chunk_cache</c> annotation manifest (chunk-level K/V reuse convention, <c>docs/CHUNK_CACHE.md</c>), kept
+    /// raw. Read only with <c>--chunk-cache</c> on (<c>ChunkAnnotationParser</c>); otherwise ignored like any unknown
+    /// field, so a body with or without it behaves the same.
+    /// </summary>
+    [JsonPropertyName("chunk_cache")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? ChunkCache { get; init; }
 }
 
 /// <summary>
