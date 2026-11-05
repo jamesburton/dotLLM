@@ -1,0 +1,74 @@
+<Project>
+  <!--
+    CUDA .cu -> .ptx compilation for DotLLM.Cuda (issue #1635).
+
+    Goal: the build NEVER fails just because the machine's CUDA SDK or Visual Studio is newer
+    than the repo baseline (CUDA 12.8, PTX ISA .version 8.7). See docs/CUDA.md,
+    "Building on newer CUDA SDKs".
+
+    Knobs (MSBuild property, or the env var in brackets):
+      DotLLMCudaBuildMode      auto (default) | committed | compile | skip      [DOTLLM_CUDA_BUILD_MODE]
+        auto      - use committed PTX; compile only kernels whose .cu is new/modified (per git) or
+                    whose .ptx is missing. Every failure is a WARNING; the build never fails here.
+        committed - never run nvcc; warn about kernels with no PTX.
+        compile   - compile every stale kernel; failures are ERRORS (use when regenerating PTX).
+        skip      - do nothing.
+      DotLLMCudaToolkitPath    CUDA toolkit root to use, skipping discovery          [DOTLLM_CUDA_TOOLKIT_PATH]
+      DotLLMMsvcBinDir         dir holding a host cl.exe (...\bin\Hostx64\x64)        [DOTLLM_MSVC_BIN_DIR]
+      DotLLMPtxVersionPolicy   pin (default) | native | strict                        [DOTLLM_PTX_VERSION_POLICY]
+        pin    - PTX above the baseline ISA has its .version pinned to the baseline and is accepted
+                 only if that toolkit's ptxas assembles it at the pinned version.
+        native - keep the toolkit's own .version (loads only on drivers that support it) + warning.
+        strict - reject anything above the baseline.
+      DotLLMCudaBaselineVersion  12.8      DotLLMPtxBaselineVersion  8.7
+      DotLLMCudaForceAll       true = treat every kernel as stale (with mode=compile: regenerate the tree)
+  -->
+  <PropertyGroup>
+    <DotLLMCudaBuildMode Condition="'$(DotLLMCudaBuildMode)' == ''">$(DOTLLM_CUDA_BUILD_MODE)</DotLLMCudaBuildMode>
+    <DotLLMCudaBuildMode Condition="'$(DotLLMCudaBuildMode)' == ''">auto</DotLLMCudaBuildMode>
+    <DotLLMCudaToolkitPath Condition="'$(DotLLMCudaToolkitPath)' == ''">$(DOTLLM_CUDA_TOOLKIT_PATH)</DotLLMCudaToolkitPath>
+    <DotLLMMsvcBinDir Condition="'$(DotLLMMsvcBinDir)' == ''">$(DOTLLM_MSVC_BIN_DIR)</DotLLMMsvcBinDir>
+    <DotLLMPtxVersionPolicy Condition="'$(DotLLMPtxVersionPolicy)' == ''">$(DOTLLM_PTX_VERSION_POLICY)</DotLLMPtxVersionPolicy>
+    <DotLLMPtxVersionPolicy Condition="'$(DotLLMPtxVersionPolicy)' == ''">pin</DotLLMPtxVersionPolicy>
+    <DotLLMCudaBaselineVersion Condition="'$(DotLLMCudaBaselineVersion)' == ''">12.8</DotLLMCudaBaselineVersion>
+    <DotLLMPtxBaselineVersion Condition="'$(DotLLMPtxBaselineVersion)' == ''">$(DOTLLM_PTX_EXPECT_VERSION)</DotLLMPtxBaselineVersion>
+    <DotLLMPtxBaselineVersion Condition="'$(DotLLMPtxBaselineVersion)' == ''">8.7</DotLLMPtxBaselineVersion>
+    <DotLLMCudaForceAll Condition="'$(DotLLMCudaForceAll)' == ''">false</DotLLMCudaForceAll>
+    <!-- Legacy opt-in kept working: always pass -allow-unsupported-compiler. -->
+    <_DotLLMAllowUnsupported>false</_DotLLMAllowUnsupported>
+    <_DotLLMAllowUnsupported Condition="'$(DOTLLM_NVCC_ALLOW_UNSUPPORTED_COMPILER)' == '1'">true</_DotLLMAllowUnsupported>
+  </PropertyGroup>
+
+  <UsingTask TaskName="DotLLMCompileCudaPtx" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <Task>
+      <Code Type="Class" Language="cs" Source="$(MSBuildThisFileDirectory)CudaPtxTask.cs" />
+    </Task>
+  </UsingTask>
+
+  <Target Name="CompileCudaPtx" BeforeTargets="BeforeBuild" Condition="'$(DotLLMCudaBuildMode)' != 'skip'">
+    <DotLLMCompileCudaPtx Kernels="@(CudaKernel)"
+                          PtxOutputDir="$(PtxOutputDir)"
+                          RepoRoot="$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)', '..', '..'))"
+                          Mode="$(DotLLMCudaBuildMode)"
+                          ToolkitPath="$(DotLLMCudaToolkitPath)"
+                          MsvcBinDir="$(DotLLMMsvcBinDir)"
+                          VersionPolicy="$(DotLLMPtxVersionPolicy)"
+                          BaselineCudaVersion="$(DotLLMCudaBaselineVersion)"
+                          BaselinePtxVersion="$(DotLLMPtxBaselineVersion)"
+                          ForceAll="$(DotLLMCudaForceAll)"
+                          AllowUnsupportedCompiler="$(_DotLLMAllowUnsupported)"
+                          ContinueOnError="$([MSBuild]::ValueOrDefault('$(_DotLLMCudaContinueOnError)', 'WarnAndContinue'))">
+      <Output TaskParameter="NewPtxFiles" ItemName="_DotLLMNewPtx" />
+    </DotLLMCompileCudaPtx>
+    <!-- The <Content Include="native\ptx\*.ptx"> glob is evaluated at project load, so a PTX file
+         that did not exist then would be compiled but never copied to bin\ptx. Add it here. -->
+    <ItemGroup>
+      <Content Include="@(_DotLLMNewPtx)" Link="ptx\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
+
+  <PropertyGroup Condition="'$(DotLLMCudaBuildMode)' == 'compile'">
+    <_DotLLMCudaContinueOnError>false</_DotLLMCudaContinueOnError>
+  </PropertyGroup>
+</Project>
