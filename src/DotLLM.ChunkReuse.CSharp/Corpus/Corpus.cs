@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -66,18 +68,30 @@ public sealed class Corpus
     /// Loads every <paramref name="pattern"/> file under <paramref name="directory"/>, skipping build output (<c>bin</c>,
     /// <c>obj</c>, <c>.git</c>, <c>.vs</c>, <c>node_modules</c>), test and benchmark projects (a directory named <c>test</c>,
     /// <c>tests</c>, <c>*.Tests</c>, <c>*.Test</c>, <c>*Tests</c>, <c>benchmarks</c> or <c>*.Benchmarks</c>) and generated
-    /// code (<see cref="SymbolChunker.IsGenerated"/>). Text is read as UTF-8 with CRLF → LF.
+    /// code (<see cref="SymbolChunker.IsGenerated"/>). Directory names match case-insensitively. Text is read as UTF-8 with
+    /// CRLF → LF.
     /// </summary>
+    /// <remarks>
+    /// Links are not followed: a symlink, junction or other reparse point (file or directory) is skipped, so nothing outside
+    /// <paramref name="directory"/> is loaded. Directories the process cannot open are skipped; a file that cannot be read is
+    /// excluded as <c>unreadable</c>.
+    /// </remarks>
     public static Corpus FromDirectory(string directory, IChunker chunker, ITokenizer tokenizer, string pattern = "*.cs",
         bool implicitUsings = true)
     {
         var files = new List<SourceFile>();
         var excluded = new List<ExcludedFile>();
-        foreach (string full in Directory.EnumerateFiles(directory, pattern, SearchOption.AllDirectories))
+        var options = new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            AttributesToSkip = FileAttributes.ReparsePoint,
+            IgnoreInaccessible = true,
+        };
+        foreach (string full in Directory.EnumerateFiles(directory, pattern, options))
         {
             string rel = Path.GetRelativePath(directory, full).Replace('\\', '/');
             string[] dirs = rel.Split('/')[..^1];
-            if (dirs.Any(d => d is "bin" or "obj" or ".git" or ".vs" or "node_modules"))
+            if (dirs.Any(IsBuildOutputDirectory))
             {
                 excluded.Add(new ExcludedFile(rel, "build-output"));
                 continue;
@@ -87,7 +101,17 @@ public sealed class Corpus
                 excluded.Add(new ExcludedFile(rel, "test"));
                 continue;
             }
-            var file = new SourceFile(rel, File.ReadAllText(full).Replace("\r\n", "\n", StringComparison.Ordinal));
+            string raw;
+            try
+            {
+                raw = File.ReadAllText(full);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                excluded.Add(new ExcludedFile(rel, "unreadable"));
+                continue;
+            }
+            var file = new SourceFile(rel, raw.Replace("\r\n", "\n", StringComparison.Ordinal));
             if (SymbolChunker.IsGenerated(file))
             {
                 excluded.Add(new ExcludedFile(rel, "generated"));
@@ -98,12 +122,19 @@ public sealed class Corpus
         return new Corpus(files, chunker, tokenizer, implicitUsings, excluded.OrderBy(e => e.Path, StringComparer.Ordinal));
     }
 
+    private static bool IsBuildOutputDirectory(string name) =>
+        name.ToLowerInvariant() is "bin" or "obj" or ".git" or ".vs" or "node_modules";
+
+    /// <summary>
+    /// <c>test</c>, <c>tests</c>, <c>benchmarks</c>, <c>*.Tests</c>, <c>*.Test</c>, <c>*.Benchmarks</c> (any case), or a
+    /// PascalCase <c>*Tests</c> name such as <c>UnitTests</c> — a capital <c>T</c>, so <c>Contests</c> is not a test project.
+    /// </summary>
     private static bool IsTestDirectory(string name)
     {
         string d = name.ToLowerInvariant();
         return d is "test" or "tests" or "benchmarks" || d.EndsWith(".tests", StringComparison.Ordinal)
-            || d.EndsWith(".test", StringComparison.Ordinal) || d.EndsWith("tests", StringComparison.Ordinal)
-            || d.EndsWith(".benchmarks", StringComparison.Ordinal);
+            || d.EndsWith(".test", StringComparison.Ordinal) || d.EndsWith(".benchmarks", StringComparison.Ordinal)
+            || name.EndsWith("Tests", StringComparison.Ordinal);
     }
 
     /// <summary>The corpus files in ordinal path order.</summary>
@@ -151,11 +182,28 @@ public sealed class Corpus
         {
             using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             sha.AppendData(Encoding.UTF8.GetBytes(Chunker.Name + "\0"));
-            foreach (Chunk c in _chunks)
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(4096);
+            try
             {
-                sha.AppendData(Encoding.UTF8.GetBytes(c.FilePath + "\0"));
-                sha.AppendData(BitConverter.GetBytes(c.TokenIds.Length));
-                sha.AppendData(MemoryMarshal.AsBytes(c.TokenIds.AsSpan()));
+                foreach (Chunk c in _chunks)
+                {
+                    sha.AppendData(Encoding.UTF8.GetBytes(c.FilePath + "\0"));
+                    int bytes = (c.TokenIds.Length + 1) * sizeof(int);
+                    if (buffer.Length < bytes)
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                        buffer = ArrayPool<byte>.Shared.Rent(bytes);
+                    }
+                    // Count, then ids: explicit little-endian int32, independent of the host byte order.
+                    BinaryPrimitives.WriteInt32LittleEndian(buffer, c.TokenIds.Length);
+                    for (int i = 0; i < c.TokenIds.Length; i++)
+                        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan((i + 1) * sizeof(int)), c.TokenIds[i]);
+                    sha.AppendData(buffer, 0, bytes);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
             }
             return Convert.ToHexStringLower(sha.GetHashAndReset());
         }
@@ -182,8 +230,22 @@ public sealed class Corpus
     {
         var trees = new Dictionary<string, SyntaxTree>(StringComparer.Ordinal);
         foreach (SourceFile f in files)
-            if (!trees.TryAdd(f.Path, CSharpSyntaxTree.ParseText(f.Text, SymbolChunker.ParseOptions, f.Path)))
+        {
+            SyntaxTree tree;
+            if (RoslynParsing.TooDeep(f.Text, out int depth))
+            {
+                // Too deep to parse (or to bind later on an ordinary thread): an empty tree, so none of its symbols resolve.
+                System.Diagnostics.Trace.TraceWarning(
+                    $"{f.Path}: bracket nesting {depth} exceeds {RoslynParsing.MaxNestingDepth}; left out of the compilation.");
+                tree = CSharpSyntaxTree.ParseText("", SymbolChunker.ParseOptions, f.Path);
+            }
+            else
+            {
+                tree = RoslynParsing.Parse(f.Text, f.Path);
+            }
+            if (!trees.TryAdd(f.Path, tree))
                 throw new ArgumentException($"Duplicate file path '{f.Path}'.", nameof(files));
+        }
         IEnumerable<SyntaxTree> all = trees.Values;
         if (implicitUsings)
             all = all.Append(CSharpSyntaxTree.ParseText(SdkImplicitUsings, SymbolChunker.ParseOptions, "<implicit-usings>"));
