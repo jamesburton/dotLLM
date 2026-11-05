@@ -76,24 +76,64 @@ public sealed class ChunkCacheExactNeutralityTests : IDisposable
     private static string PathOf(string surface) => surface == "openai" ? "/v1/chat/completions" : "/v1/messages";
 
     /// <summary>
-    /// #1632: an annotated Anthropic text block holding a lone surrogate. Over HTTP the decoder yields U+FFFD (the
-    /// converter's InvalidOperationException only occurs for requests built in-process, see
-    /// <c>Anthropic_Unannotated_SkipsTheConversion</c>), so the request is served and never becomes a server error; the
-    /// annotations that no longer match are ignored with <c>chunk_span_invalid</c>, not an exception.
+    /// #1632 review: an Anthropic text block holding a lone-surrogate ESCAPE (<c>\ud800</c> as six characters on the wire,
+    /// valid JSON that <c>JsonElement.GetString</c> refuses) is a 400 <c>invalid_request_error</c>, never a 500, whether the
+    /// flag is on with the block annotated, on without annotations, or off (the converter path every request takes), on
+    /// <c>/v1/messages</c> (blocking and streaming) and <c>/v1/messages/count_tokens</c>. The body is a raw JSON string: a
+    /// lone surrogate in a C# string would be sent as U+FFFD by the UTF-8 encoder and test nothing.
+    /// </summary>
+    [Theory]
+    [InlineData("annotated", false)]
+    [InlineData("annotated", true)]
+    [InlineData("unannotated", false)]
+    [InlineData("unannotated", true)]
+    [InlineData("off", false)]
+    [InlineData("off", true)]
+    public async Task Anthropic_LoneSurrogateEscapeInTextBlock_Is400(string arm, bool stream)
+    {
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, arm == "off" ? ChunkCacheOptions.Disabled : On());
+        // The annotated span is message 0, part 0, bytes [0, 10): "abcdefghij", ahead of the lone surrogate.
+        string manifest = arm == "unannotated" ? "" : ",\"chunk_cache\":{\"v\":1,\"policy\":\"exact\",\"chunks\":[{\"id\":\"a\",\"hash\":\""
+            + ChunkAnnotationParserTests.Sha("abcdefghij") + "\",\"at\":{\"message\":0,\"part\":0,\"start\":0,\"end\":10}}]}";
+        string body = "{\"max_tokens\":4" + (stream ? ",\"stream\":true" : "")
+            + ",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"abcdefghij\\ud800 and more text\"}]}]"
+            + manifest + "}";
+        Assert.Contains("\\ud800", body, StringComparison.Ordinal); // the escape itself goes over the wire
+
+        var response = await server.PostAsync("/v1/messages", body);
+        Assert.Equal(400, response.Status);
+        var error = JsonNode.Parse(response.Body)!;
+        Assert.Equal("error", error["type"]!.GetValue<string>());
+        Assert.Equal("invalid_request_error", error["error"]!["type"]!.GetValue<string>());
+
+        var count = await server.PostAsync("/v1/messages/count_tokens", body);
+        Assert.Equal(400, count.Status);
+        Assert.Equal("invalid_request_error", JsonNode.Parse(count.Body)!["error"]!["type"]!.GetValue<string>());
+    }
+
+    /// <summary>
+    /// A parser-level defect under <c>strict</c> on <c>/v1/messages</c> (a manifest hash that does not match the span) is the
+    /// 400 with <c>error.code = chunk_hash_mismatch</c>, before rendering; without strict the request is served (the span is
+    /// ignored with the warning).
     /// </summary>
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task Anthropic_LoneSurrogateInAnnotatedTextBlock_IsNeverAServerError(bool stream)
+    public async Task Anthropic_StrictParserError_HashMismatch_Is400WithCode(bool stream)
     {
         await using var server = await ChunkCacheTestServer.StartAsync(_model, On());
-        string streamField = stream ? ",\"stream\":true" : "";
-        string body = "{\"max_tokens\":4" + streamField + ",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"x\ud800y\"}]}],"
-            + "\"chunk_cache\":" + Manifest("exact").ToJsonString() + "}";
-        var response = await server.PostAsync("/v1/messages", body);
-        Assert.True(response.Status is 200 or 400, response.Body);
-        if (!stream && response.Status == 200)
-            Assert.Contains(ChunkCacheCodes.SpanInvalid, response.Body, StringComparison.Ordinal);
+        var cc = Manifest("exact", """{"strict":true}""");
+        cc["chunks"]![0]!["hash"] = ChunkAnnotationParserTests.Sha("not the span text");
+        var strict = await server.PostAsync("/v1/messages", Body("anthropic", cc, stream));
+        Assert.Equal(400, strict.Status);
+        var error = JsonNode.Parse(strict.Body)!["error"]!;
+        Assert.Equal("invalid_request_error", error["type"]!.GetValue<string>());
+        Assert.Equal(ChunkCacheCodes.HashMismatch, error["code"]!.GetValue<string>());
+
+        cc.Remove("strict");
+        var lenient = await server.PostAsync("/v1/messages", Body("anthropic", cc, stream: false));
+        Assert.Equal(200, lenient.Status);
+        Assert.Contains(ChunkCacheCodes.HashMismatch, lenient.Body, StringComparison.Ordinal);
     }
 
     /// <summary>The body without the chunk-cache additions (<c>chunk_cache</c>, <c>chunk_n</c>, <c>chunk_recomputed_n</c>), normalized.</summary>
