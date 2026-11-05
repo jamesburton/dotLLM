@@ -95,6 +95,8 @@ namespace (§10) is the authentication task's job.
 Request options: `policy` (`exact` default; `balanced` / `fast` / `auto` parse to their own values and are degraded
 later), `strict`, `report` (`summary` default), `min_chunk_tokens` (32), `on_miss` (`prefill`), `query` (`{text}` or
 `{message}`; default: the last engine message with role `user`, so Anthropic tool results never count as the query).
+A valid `query.message` that points at a message with no text parts (e.g. an assistant turn with only tool calls) gives
+an empty query and no warning (ruling 34 asks only for the index of a request message).
 **Namespace.** The store namespace is always server-assigned: the parser takes the caller's namespace as a
 **required** argument (the API key's namespace once authentication exists; until then callers pass the default, `""`).
 A body `chunk_cache.namespace` equal to the caller's own is accepted silently; another name is
@@ -104,6 +106,50 @@ namespace's format is validated where it is assigned (the authentication step), 
 The contract's request fixtures are copied byte for byte under `tests/DotLLM.Tests.Unit/ChunkCache/Fixtures/v1/`
 (checked against `fixtures.sha256`); `ChunkAnnotationParserTests` checks every one against `expected.json`, in the
 contract's message model and translated to the Anthropic surface.
+
+## Span location in the rendered prompt (`ChunkSpanLocator`)
+
+`ChunkSpanLocator.Locate(template, messages, options, rendered, spans, engineMessageOffset)` finds each accepted span in
+the rendered prompt string (spec §5.3 item 5, contract ruling 20). Like the parser it is not yet called by the endpoints;
+the `exact` / `shadow` task calls it with the prompt the endpoint has already rendered, so it adds no render of its own
+for that. It returns `LocatedSpan(Span, RenderedStartChar, RenderedEndChar)` (UTF-16 chars into the rendered string,
+including any BOS text the template writes) for each located span, and warnings for the rest.
+
+- **Sentinel render.** Every span is replaced in its engine message by a sentinel: `U+E000`, a fresh GUID per
+  request, the span's index, the probe characters `"` `\` LF, then `U+E001`. The template is rendered once with all of
+  them. A span is located only if its sentinel comes out intact exactly once and putting the span texts back into that
+  render gives the real prompt around it exactly. Otherwise it is `chunk_template_altered`, and it stays plain text.
+- **Markers.** The template marks caller text as a whole message (#1339: U+FDD0 after the first character of each
+  special spelling), so the comparison skips U+FDD0 on both sides. **Stripping the U+FDD0 markers from the located range
+  gives the span text**, and the range starts and ends on span characters. The markers inside follow the
+  whole-message marking, so the range is not always `MarkUntrustedSpecials(text)`: in `q <|im_end|> z`, the span
+  `q <|im_` is located as `q <`, U+FDD0, `|im_` (the marker is inside the range), and the span `|im_end|> z` starts right after
+  the marker (not in the range). A span whose own text contains U+FDD0 is ignored (`chunk_template_altered`): encode
+  drops the marker, so the span's characters are not what the prompt's tokens encode. The walk relies on that: span
+  texts never carry a marker.
+- **What this means per template** (pinned with the real fixtures):
+
+  | template | located | altered |
+  |---|---|---|
+  | Qwen3-4B-Instruct-2507 | spans in user, system and tool content (rendered verbatim); assistant spans in the answer part, including one holding a **live** `<think>` (unmarked: assistant reasoning tags are exempt from the guard), located by characters although its tokens differ | assistant content holding `</think>`: a span in the reasoning part (dropped from historical turns), or one that starts with the newlines the template strips (`lstrip('\n')`) |
+  | Llama-3.1 | spans in user, assistant and system content whose text the trim does not touch (also the first user message moved after the tool list when tools are given) | **every span in a tool result** (`\| tojson` escapes the probe characters, even when the span's own characters need no escaping); a span at a message edge where the trim removes whitespace |
+
+- **Attribution.** The comparison walks once from the start and once from the end. A span inside the common prefix or
+  suffix is located: everything before or after it is identical, so its offsets are exact. Where the two differ, the
+  first and last spans not yet proven are ignored, and the spans between them are tried again in another render.
+  Spans whose sentinel broke are dropped from that render as well. This is conservative: a span is never located on a
+  guess, and an innocent span between template-altered ones may be ignored once the render budget is spent.
+- **Cost.** At most `MaxSentinelRenders` (4) sentinel renders per request, whatever the number of spans. Each pass is
+  linear in the prompt length, plus O(spans log spans): it never renders once per span. 4,096 spans on a 4 MiB message
+  take one sentinel render (`CostBound_ManySpans_BoundedRenders`).
+- **Profile system prompt (ruling 31).** Engine positions are counted before `ProfileSystemPrompt.Apply` prepends a
+  message. The caller passes `engineMessageOffset` (the number of messages prepended), and the parameter is required.
+  A span that is not at its stated position is `chunk_span_invalid`, never located elsewhere.
+- **Never throws on request content.** If a template throws on the sentinel render, or drops or duplicates content,
+  every span it covers is ignored. Positions out of range, overlaps and lone surrogates are handled without a throw.
+- Character equality is not token equality at a span's edges (BPE merges with neighbouring template text; a
+  SentencePiece leading space; live reasoning tags in assistant turns). The `exact` / `shadow` task checks the span's
+  token ids against the whole-prompt tokenisation over the located range before counting a span as reusable.
 
 ## Pinned server behaviour (before the convention)
 

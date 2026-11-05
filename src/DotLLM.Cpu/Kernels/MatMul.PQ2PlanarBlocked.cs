@@ -11,7 +11,7 @@ namespace DotLLM.Cpu.Kernels;
 /// <see cref="GemvPQ2_0Planar"/> but each weight group is decoded (load + 3 shifts + 4 ands) ONCE per block of up to
 /// <see cref="PlanarTokenBlock"/> tokens and dotted against each token's planar activations, so the decode cost (which is
 /// what made the unblocked planar kernel lose at n &gt;= 16: it re-decoded the codes per token) amortizes over the block.
-/// Opt-in: only reachable when the planar toggle is on and <c>2 &lt;= n &lt;= PQ2_0PlanarMaxN</c> (<c>DOTLLM_PQ2_PLANAR_NMAX</c>, default 4).
+/// Reachable when the planar toggle is on (default since #1620) and <c>2 &lt;= n &lt;= PQ2_0PlanarMaxN</c> (<c>DOTLLM_PQ2_PLANAR_NMAX</c>, default 16).
 /// Same numerics per token as <see cref="GemvPQ2_0Planar"/> (identical per-token op order), so n=1 and blocked agree bitwise.
 /// </summary>
 public static unsafe partial class MatMul
@@ -19,9 +19,20 @@ public static unsafe partial class MatMul
     /// <summary>Tokens per register block (4 accumulators).</summary>
     internal const int PlanarTokenBlock = 4;
 
-    /// <summary>Largest n routed to the blocked planar GEMM when the planar toggle is on (<c>DOTLLM_PQ2_PLANAR_NMAX</c>; 1 = decode GEMV only, the default is 4).</summary>
-    internal static int PQ2_0PlanarMaxN { get; set; } =
-        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_PQ2_PLANAR_NMAX"), out int v) ? v : 4;
+    /// <summary>Default <see cref="PQ2_0PlanarMaxN"/> (#1620, measured in docs/TERNARY_ADAPTER.md).</summary>
+    internal const int PQ2_0PlanarDefaultMaxN = 16;
+
+    /// <summary>
+    /// Largest n routed to the blocked planar GEMM when the planar toggle is on (<c>DOTLLM_PQ2_PLANAR_NMAX</c>; 1 = decode GEMV only; default
+    /// <see cref="PQ2_0PlanarDefaultMaxN"/>). 16 is the largest cut that never lost to production on the three PQ2_0 models measured: Bonsai-2 27B gains at
+    /// every n, but on Bonsai-2 2B (smaller matrices, so the scalar O(n*k) planar activation prep weighs more) the blocked kernel drops to 0.96x at n = 32
+    /// and 0.93x at n = 128. It also covers the default prompt-lookup verify (8 drafts = 9 rows), so those verify rows stay bit-identical per token to
+    /// the planar decode GEMV (the #1367 invariant). Batches above the cut run the W2A8 tier (Q8_0 activation grid).
+    /// </summary>
+    internal static int PQ2_0PlanarMaxN { get; set; } = ResolvePlanarMaxN(Environment.GetEnvironmentVariable("DOTLLM_PQ2_PLANAR_NMAX"));
+
+    /// <summary><c>DOTLLM_PQ2_PLANAR_NMAX</c> parse (pure, for tests): an integer, else <see cref="PQ2_0PlanarDefaultMaxN"/>.</summary>
+    internal static int ResolvePlanarMaxN(string? env) => int.TryParse(env, out int v) ? v : PQ2_0PlanarDefaultMaxN;
 
     private struct GemmPQ2PlanarCtx
     {
