@@ -241,7 +241,7 @@ public sealed unsafe class PQ2_0Tests
     /// random per-row-per-group scale set (unlike I2_S's single per-tensor scale), directly
     /// exercising the group-scale-folding this issue adds to <c>VecDotPQ2_0Q8</c>.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData(1, 128)]     // single row, single group
     [InlineData(3, 384)]     // odd row count, 3 groups (12 Q8_0 blocks)
     [InlineData(5, 640)]     // odd row count, 5 groups (odd relative to any 4-wide unrolling)
@@ -249,6 +249,7 @@ public sealed unsafe class PQ2_0Tests
     [InlineData(4, 5120)]    // real Bonsai-27B attention hidden dim (40 groups)
     public void GemvPQ2_0_W2A8_MatchesFloatReference_WithinQuantTolerance(int m, int k)
     {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Ssse3.IsSupported, "W2A8 PQ2_0 requires SSSE3.");
         var rng = new Random(2026 + m * 1000 + k);
         sbyte[] ternary = new sbyte[m * k];
         for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
@@ -263,9 +264,11 @@ public sealed unsafe class PQ2_0Tests
         try
         {
             float[] y = new float[m];
+            // The W2A8 tier directly (n = 1 is bit-identical to its decode GEMV, #1367): since #1620 the public GemvPQ2_0 dispatches to the
+            // planar kernel by default, which has its own F64-oracle coverage (PlanarPq2BlockedTests, TernaryZeroMulProbe).
             fixed (float* xp = x)
             fixed (float* yp = y)
-                MatMul.GemvPQ2_0(w, xp, yp, m, k, null);
+                MatMul.GemmPQ2_0W2A8ForTest(w, xp, yp, m, k, 1);
 
             for (int r = 0; r < m; r++)
             {
@@ -346,6 +349,8 @@ public sealed unsafe class PQ2_0Tests
     [InlineData(5, 640, 5)]
     [InlineData(6, 256, 8)]
     [InlineData(11, 512, 9)]
+    [InlineData(5, 384, 16)]   // the default planar cut (#1620): last n that runs the blocked planar kernel
+    [InlineData(5, 384, 17)]   // first n above it
     [InlineData(4, 256, 33)]   // formerly above the n=32 cut (float tier); W2A8 and bit-identical since #1386
     [InlineData(4, 256, 70)]
     [InlineData(3, 384, 131)]
@@ -376,7 +381,10 @@ public sealed unsafe class PQ2_0Tests
                     MatMul.GemmPQ2_0(w, bp + (long)t * k, sp, m, k, 1, null);
                     for (int r = 0; r < m; r++)
                     {
-                        if (n <= MatMul.PQ2_0SmallNMax)
+                        // #1620: with the planar default, the GEMM matches the (planar) decode GEMV only up to the blocked-planar cut; above it the
+                        // W2A8 tier runs on the Q8_0 grid. With planar off (DOTLLM_PQ2_PLANAR=0 / no AVX2) the #1386 rule applies to every n.
+                        bool sameGrid = MatMul.PQ2_0PlanarEnabled ? n <= MatMul.PQ2_0PlanarMaxN : n <= MatMul.PQ2_0SmallNMax;
+                        if (sameGrid)
                             Assert.Equal(BitConverter.SingleToInt32Bits(single[r]), BitConverter.SingleToInt32Bits(c[t * m + r]));
                         float acc = 0f;
                         for (int col = 0; col < k; col++)

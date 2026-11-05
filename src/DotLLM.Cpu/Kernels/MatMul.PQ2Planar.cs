@@ -7,8 +7,8 @@ using DotLLM.Cpu.Threading;
 namespace DotLLM.Cpu.Kernels;
 
 /// <summary>
-/// PQ2_0 decode GEMV on the packed bytes IN PLACE with planar int8 activations (#1616, opt-in <c>DOTLLM_PQ2_PLANAR=1</c>,
-/// default OFF; see docs/TERNARY_ADAPTER.md for the measurements). No row unpack/interleave: activations are re-laid out
+/// PQ2_0 decode GEMV on the packed bytes IN PLACE with planar int8 activations (#1616; default ON with AVX2 since #1620,
+/// off switch <c>DOTLLM_PQ2_PLANAR=0</c>; see docs/TERNARY_ADAPTER.md for the measurements). No row unpack/interleave: activations are re-laid out
 /// per 128-group into 4 planes (plane i = x[4b+i], b=0..31) quantized to int8 with a per-plane scale, so
 /// <c>t_i = (byte &gt;&gt; 2i) &amp; 3</c> lines up with plane i directly and
 /// <c>sum((t-1)*q) = dpbusd(t, q) - sum(q)</c>; <c>sum_i s_i*sum(q_i)</c> is precomputed per group from the activations.
@@ -17,9 +17,28 @@ namespace DotLLM.Cpu.Kernels;
 /// </summary>
 public static unsafe partial class MatMul
 {
-    /// <summary>True when the opt-in planar PQ2_0 decode GEMV is enabled (<c>DOTLLM_PQ2_PLANAR=1</c>) and AVX2 is available.</summary>
-    internal static readonly bool PQ2_0Planar =
-        Environment.GetEnvironmentVariable("DOTLLM_PQ2_PLANAR") is "1" or "true" or "on" && CpuFeatures.Avx2;
+    /// <summary>
+    /// True when the planar PQ2_0 kernels are enabled: on by default with AVX2 (#1620), off with <c>DOTLLM_PQ2_PLANAR=0</c>, and off when
+    /// <c>DOTLLM_PQ2_W2A8=0</c> asks for the unquantized-activation float tier (planar also quantizes activations, so it must not shadow that switch).
+    /// </summary>
+    private static bool s_pq2Planar =
+        ResolvePlanarDefault(Environment.GetEnvironmentVariable("DOTLLM_PQ2_PLANAR"), Environment.GetEnvironmentVariable("DOTLLM_PQ2_W2A8")) && CpuFeatures.Avx2;
+
+    /// <summary>Planar default from the two env switches (pure, for tests): on unless <paramref name="planar"/> or <paramref name="w2a8"/> is 0/false/off.</summary>
+    internal static bool ResolvePlanarDefault(string? planar, string? w2a8) =>
+        planar is not ("0" or "false" or "off") && w2a8 is not ("0" or "false" or "off");
+    private static long s_planarCalls;
+
+    internal static bool PQ2_0Planar => s_pq2Planar;
+
+    /// <summary>
+    /// Runtime toggle for the planar PQ2_0 kernels (initial value: on unless <c>DOTLLM_PQ2_PLANAR=0</c> or <c>DOTLLM_PQ2_W2A8=0</c>). Exists so a single process can
+    /// alternate production/planar reps (same-session paired A/B, #1620); setting it true is ignored without AVX2.
+    /// </summary>
+    public static bool PQ2_0PlanarEnabled { get => s_pq2Planar; set => s_pq2Planar = value && CpuFeatures.Avx2; }
+
+    /// <summary>Number of planar GEMV calls made so far (proof that the path ran).</summary>
+    public static long PQ2_0PlanarCalls => Interlocked.Read(ref s_planarCalls);
 
     private struct GemvPQ2PlanarCtx
     {
@@ -30,6 +49,7 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static void GemvPQ2_0Planar(byte* weights, float* x, float* result, int m, int k, ComputeThreadPool? threadPool)
     {
+        Interlocked.Increment(ref s_planarCalls);
         int groups = k / PQ2_0GroupSize;
         sbyte[] qBuf = ArrayPool<sbyte>.Shared.Rent(k);
         float[] sBuf = ArrayPool<float>.Shared.Rent(groups * 4);

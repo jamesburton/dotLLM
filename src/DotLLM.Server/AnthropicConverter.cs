@@ -26,7 +26,13 @@ public static class AnthropicConverter
     /// <c>tool_result</c> blocks become separate <c>tool</c>-role messages keyed by <c>tool_use_id</c>.</item>
     /// </list>
     /// </remarks>
-    public static ChatMessage[] ToMessages(AnthropicMessagesRequest request)
+    public static ChatMessage[] ToMessages(AnthropicMessagesRequest request) => ToMessages(request, origins: null);
+
+    /// <summary>
+    /// <see cref="ToMessages(AnthropicMessagesRequest)"/>, also recording where each wire text lands in the output
+    /// (chunk-cache span mapping). With <paramref name="origins"/> null it is exactly the public overload.
+    /// </summary>
+    internal static ChatMessage[] ToMessages(AnthropicMessagesRequest request, AnthropicTextOrigins? origins)
     {
         var result = new List<ChatMessage>(request.Messages.Length + 1);
 
@@ -34,18 +40,19 @@ public static class AnthropicConverter
         if (!string.IsNullOrEmpty(systemText))
             result.Add(new ChatMessage { Role = "system", Content = systemText });
 
-        foreach (var msg in request.Messages)
-            AppendMessage(result, msg);
+        for (int m = 0; m < request.Messages.Length; m++)
+            AppendMessage(result, request.Messages[m], m, origins);
 
         return result.ToArray();
     }
 
-    private static void AppendMessage(List<ChatMessage> target, AnthropicMessageDto msg)
+    private static void AppendMessage(List<ChatMessage> target, AnthropicMessageDto msg, int wireIndex, AnthropicTextOrigins? origins)
     {
         var content = msg.Content;
 
         if (content.ValueKind == JsonValueKind.String)
         {
+            origins?.Add(wireIndex, 0, -1, target.Count, 0);
             target.Add(new ChatMessage { Role = msg.Role, Content = content.GetString() ?? "" });
             return;
         }
@@ -60,8 +67,10 @@ public static class AnthropicConverter
         var reasoningBuilder = new StringBuilder();
         List<ToolCall>? toolCalls = null;
 
+        int blockIndex = -1;
         foreach (var block in content.EnumerateArray())
         {
+            blockIndex++;
             if (block.ValueKind != JsonValueKind.Object)
                 continue;
 
@@ -72,6 +81,8 @@ public static class AnthropicConverter
                     if (block.TryGetProperty("text", out var txt) && txt.ValueKind == JsonValueKind.String)
                     {
                         if (textBuilder.Length > 0) textBuilder.Append('\n');
+                        // The pending text is flushed as the next message, so its index is target.Count now.
+                        origins?.Add(wireIndex, blockIndex, -1, target.Count, textBuilder.Length);
                         textBuilder.Append(txt.GetString());
                     }
                     break;
@@ -101,7 +112,7 @@ public static class AnthropicConverter
                     target.Add(new ChatMessage
                     {
                         Role = "tool",
-                        Content = ExtractToolResultContent(block),
+                        Content = ExtractToolResultContent(block, origins, wireIndex, blockIndex, target.Count),
                         ToolCallId = trId,
                     });
                     break;
@@ -130,14 +141,18 @@ public static class AnthropicConverter
         toolCalls = null;
     }
 
-    private static string ExtractToolResultContent(JsonElement block)
+    private static string ExtractToolResultContent(
+        JsonElement block, AnthropicTextOrigins? origins, int wireIndex, int blockIndex, int engineIndex)
     {
         if (!block.TryGetProperty("content", out var c))
             return "";
         if (c.ValueKind == JsonValueKind.String)
+        {
+            origins?.Add(wireIndex, blockIndex, -1, engineIndex, 0);
             return c.GetString() ?? "";
+        }
         if (c.ValueKind == JsonValueKind.Array)
-            return ConcatTextBlocks(c);
+            return ConcatTextBlocks(c, origins, wireIndex, blockIndex, engineIndex);
         return "";
     }
 
@@ -157,15 +172,19 @@ public static class AnthropicConverter
         return null;
     }
 
-    private static string ConcatTextBlocks(JsonElement array)
+    private static string ConcatTextBlocks(
+        JsonElement array, AnthropicTextOrigins? origins = null, int wireIndex = -1, int blockIndex = -1, int engineIndex = -1)
     {
         var sb = new StringBuilder();
+        int inner = -1;
         foreach (var item in array.EnumerateArray())
         {
+            inner++;
             if (item.ValueKind == JsonValueKind.Object &&
                 item.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String)
             {
                 if (sb.Length > 0) sb.Append('\n');
+                origins?.Add(wireIndex, blockIndex, inner, engineIndex, sb.Length);
                 sb.Append(t.GetString());
             }
         }
@@ -311,4 +330,26 @@ public static class AnthropicConverter
 
     /// <summary>Generates an Anthropic-style tool-use block id (<c>toolu_...</c>).</summary>
     public static string GenerateToolUseId() => $"toolu_{Guid.NewGuid():N}";
+}
+
+/// <summary>
+/// Where each Anthropic wire text lands in <see cref="AnthropicConverter.ToMessages(AnthropicMessagesRequest)"/>'s
+/// output: (wire message, content block, inner block of a <c>tool_result</c> content array or -1) to (engine message,
+/// char offset of the text's first char in that message's content). The converter records it while it joins, so the
+/// <c>'\n'</c> joins and the <c>tool_result</c> split cannot drift from the chunk-cache span mapping.
+/// </summary>
+internal sealed class AnthropicTextOrigins
+{
+    private readonly Dictionary<(int Message, int Block, int Inner), (int EngineMessage, int Offset)> _map = [];
+
+    internal void Add(int message, int block, int inner, int engineMessage, int offset) =>
+        _map[(message, block, inner)] = (engineMessage, offset);
+
+    /// <summary>The engine position of a wire text; false when the converter did not carry it as text.</summary>
+    internal bool TryGet(int message, int block, int inner, out int engineMessage, out int offset)
+    {
+        bool found = _map.TryGetValue((message, block, inner), out var v);
+        (engineMessage, offset) = v;
+        return found;
+    }
 }

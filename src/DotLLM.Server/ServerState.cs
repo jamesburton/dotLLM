@@ -136,6 +136,15 @@ public sealed class ServerState : IDisposable
     /// <summary>Interval between SSE keep-alive comments for a waiting streaming request (#1023); settable for tests.</summary>
     internal TimeSpan KeepAliveInterval { get; set; } = Endpoints.SseKeepAlive.DefaultInterval;
 
+    /// <summary>
+    /// Chunk-cache state (store, model identity) for <c>--chunk-cache</c> requests. Created on first use, so a server with the
+    /// flag off never constructs it (nor touches the store types of <c>DotLLM.ChunkReuse</c> through it).
+    /// </summary>
+    internal ChunkCache.ChunkCacheRuntime ChunkCacheRuntime =>
+        LazyInitializer.EnsureInitialized(ref _chunkCacheRuntime, static () => new ChunkCache.ChunkCacheRuntime());
+
+    private ChunkCache.ChunkCacheRuntime? _chunkCacheRuntime;
+
     /// <summary>The loader an activation uses (<see cref="ServerStartup.LoadModel"/>); settable so tests can observe the state at load time.</summary>
     internal Func<string, ServerOptions, ServerState> ModelLoader { get; set; } = ServerStartup.LoadModel;
 

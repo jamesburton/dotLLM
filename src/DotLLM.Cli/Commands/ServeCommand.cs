@@ -338,10 +338,30 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("Most --prompt-cache-step checkpoints kept, deepest first (default 8).")]
         public int? PromptCacheStepKeep { get; set; }
 
+        /// <summary>Turns on the <c>chunk_cache</c> wire convention (off by default; docs/CHUNK_CACHE.md).</summary>
+        [CommandOption("--chunk-cache")]
+        [Description("Honour chunk_cache annotations on /v1/chat/completions and /v1/messages (chunk-level K/V reuse convention, docs/CHUNK_CACHE.md): " +
+                     "policies exact (default) and shadow, whose output is identical to the unannotated request; responses gain a chunk_cache report. " +
+                     "Off by default: annotations are ignored like any unknown field and responses are unchanged.")]
+        public bool ChunkCache { get; set; }
+
+        /// <summary>Most chunk annotations accepted per request.</summary>
+        [CommandOption("--chunk-cache-max-chunks")]
+        [Description("Most chunk annotations read per request (default 4096, at least 1); the rest are dropped with chunk_too_many without being read.")]
+        public int? ChunkCacheMaxChunks { get; set; }
+
+        /// <summary>The chunk store the server looks chunks up in (read-only for now).</summary>
+        [CommandOption("--chunk-store")]
+        [Description("With --chunk-cache: the chunk store (e.g. built by chunkcache build) the server looks annotated chunks up in, to count hits " +
+                     "and plan shadow reuse. Read-only: the server never writes or creates it; a missing directory is reported as chunk_store_unavailable.")]
+        public string? ChunkStore { get; set; }
+
         /// <inheritdoc/>
         public override ValidationResult Validate()
         {
             try { ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget, PromptCacheStep, PromptCacheStepKeep); }
+            catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
+            try { DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(ChunkCache, ChunkCacheMaxChunks, ChunkStore); }
             catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
             return base.Validate();
         }
@@ -408,6 +428,10 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         public bool AllowModelAdmin { get; set; }
 
         /// <summary>Enables the LoRA admin write endpoints (off by default).</summary>
+        [CommandOption("--ternary-adapter")]
+        [Description("Ternary residual adapter (.nsadapter or adapter GGUF, docs/TERNARY_ADAPTER.md) applied to every request; CPU transformer models only; repeatable to compose.")]
+        public string[] TernaryAdapterPaths { get; set; } = Array.Empty<string>();
+
         [CommandOption("--allow-lora-admin")]
         [Description("Enable the LoRA admin API: POST /v1/lora/load and DELETE /v1/lora/{name}. Off by default.")]
         public bool AllowLoraAdmin { get; set; }
@@ -555,6 +579,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             AllowModelAdminApi = settings.AllowModelAdmin,
             Metrics = settings.NoMetrics ? false : settings.Metrics ? true : null,
             AllowLoraAdminApi = settings.AllowLoraAdmin,
+            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(settings.ChunkCache, settings.ChunkCacheMaxChunks, settings.ChunkStore),
+            TernaryAdapterPaths = settings.TernaryAdapterPaths is { Length: > 0 } ? settings.TernaryAdapterPaths : null,
             // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
             // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,
             // and the limiter was exercised only by unit tests constructing the config directly.

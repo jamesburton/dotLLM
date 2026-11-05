@@ -299,6 +299,20 @@ public sealed record ServerOptions
     public bool AllowLoraAdminApi { get; init; }
 
     /// <summary>
+    /// The <c>chunk_cache</c> wire convention (<c>--chunk-cache</c>, <c>--chunk-cache-max-chunks</c>, <c>--chunk-store</c>; docs/CHUNK_CACHE.md).
+    /// Off by default: annotations are then never read, and every body behaves as it did before the convention.
+    /// </summary>
+    public DotLLM.Server.ChunkCache.ChunkCacheOptions ChunkCache { get; init; } = DotLLM.Server.ChunkCache.ChunkCacheOptions.Disabled;
+
+    /// <summary>
+    /// Ternary residual adapter files (<c>.nsadapter</c> or adapter GGUF, docs/TERNARY_ADAPTER.md) attached to every model this server loads
+    /// (<c>--ternary-adapter</c>, repeatable). CPU transformer models only: loading on any other backend/architecture fails with
+    /// <see cref="InvalidServerOptionException"/>. The adapters apply to ALL requests (the residual hook has no request identity, so there
+    /// is no per-request switch). Null or empty = none.
+    /// </summary>
+    public IReadOnlyList<string>? TernaryAdapterPaths { get; init; }
+
+    /// <summary>
     /// Whether the model-administration write endpoints introduced in #454 are enabled:
     /// <c>POST /v1/models/unload</c>, <c>POST /v1/models/pull</c> (+ its cancel route),
     /// <c>POST /v1/models/enable</c>, <c>POST /v1/models/disable</c> and
@@ -460,6 +474,9 @@ public sealed record ServerOptions
         int? maxMessagesCli = null;
         int promptCacheStep = 0;
         int? promptCacheStepKeep = null;
+        bool chunkCache = false;
+        int? chunkCacheMaxChunks = null;
+        string? chunkStore = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -582,6 +599,12 @@ public sealed record ServerOptions
                     allowModelAdmin = true; break;
                 case "--allow-lora-admin":
                     allowLoraAdmin = true; break;
+                case "--chunk-cache":
+                    chunkCache = true; break;
+                case "--chunk-cache-max-chunks":
+                    chunkCacheMaxChunks = int.Parse(next ?? throw new ArgumentException("--chunk-cache-max-chunks requires a count."), System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--chunk-store":
+                    chunkStore = next ?? throw new ArgumentException("--chunk-store requires a directory."); i++; break;
                 case "--max-messages":
                     maxMessagesCli = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 default:
@@ -656,6 +679,7 @@ public sealed record ServerOptions
             AllowModelAdminApi = allowModelAdmin,
             Metrics = metrics,
             AllowLoraAdminApi = allowLoraAdmin,
+            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(chunkCache, chunkCacheMaxChunks, chunkStore),
             MaxMessages = ResolveMaxMessages(maxMessagesCli, Environment.GetEnvironmentVariable(MaxMessagesEnvVar)),
             ModelId = modelId,
             RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,

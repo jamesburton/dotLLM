@@ -38,8 +38,18 @@ REM moment of generation. Override only when deliberately re-baselining the whol
 REM tree onto a new toolkit.
 if not defined DOTLLM_PTX_EXPECT_VERSION set "DOTLLM_PTX_EXPECT_VERSION=8.7"
 
+REM Prefer the baseline toolkit when it is installed side by side (#1635): the CUDA
+REM installer repoints CUDA_PATH at whichever version was installed LAST, which is how
+REM #124/#318 happened. DOTLLM_CUDA_TOOLKIT_PATH overrides; scripts\setup-cuda-baseline.ps1
+REM installs the baseline next to a newer toolkit.
+if defined DOTLLM_CUDA_TOOLKIT_PATH (
+    set "CUDA_PATH=%DOTLLM_CUDA_TOOLKIT_PATH%"
+) else (
+    if defined CUDA_PATH_V12_8 set "CUDA_PATH=%CUDA_PATH_V12_8%"
+)
+
 if not defined CUDA_PATH (
-    echo CUDA_PATH is not set. Install a CUDA toolkit and ensure CUDA_PATH points at it.
+    echo CUDA_PATH is not set. Install a CUDA toolkit ^(scripts\setup-cuda-baseline.ps1^) and ensure CUDA_PATH points at it.
     exit /b 1
 )
 set "NVCC=%CUDA_PATH%\bin\nvcc.exe"
