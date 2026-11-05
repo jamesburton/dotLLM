@@ -34,7 +34,7 @@ public class ChunkStoreBusyException : IOException
 }
 
 /// <summary>
-/// A store lock (<c>ChunkIndex.AcquireStoreLock</c>) or an index lock (<c>ChunkIndex.AcquireIndexLock</c>)
+/// A store lock (<see cref="ChunkIndex.AcquireStoreLock"/>) or an index lock (<see cref="ChunkIndex.AcquireIndexLock(string, string, string, string, string, TimeSpan)"/>)
 /// was held by another writer (another process, or another handle in this one) for the whole timeout. Nothing was written.
 /// </summary>
 public sealed class ChunkStoreLockTimeoutException : ChunkStoreBusyException

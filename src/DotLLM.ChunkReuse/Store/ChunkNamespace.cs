@@ -21,7 +21,7 @@ public static class ChunkNamespace
 
     /// <summary>
     /// The one reserved name, <c>default</c>: it stands for <see cref="Default"/> in index file names
-    /// (<c>ChunkIndex.DefaultPath</c>), so no namespace may be called that (else the
+    /// (<see cref="ChunkIndex.DefaultPath(string, string, string, string, string)"/>), so no namespace may be called that (else the
     /// default namespace and a namespace named <c>default</c> would share, and clobber, one index file).
     /// </summary>
     public const string ReservedDefaultName = "default";
