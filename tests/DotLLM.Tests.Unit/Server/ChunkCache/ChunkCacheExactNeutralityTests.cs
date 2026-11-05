@@ -15,7 +15,7 @@ namespace DotLLM.Tests.Unit.Server.ChunkCache;
 /// <summary>
 /// <c>exact</c> / <c>shadow</c> over real HTTP on the synthetic model (Phase I Task 13; Review Focus "exact neutrality on a
 /// warm slot"): an annotated <c>exact</c> or <c>shadow</c> request generates exactly what the unannotated request generates,
-/// with the same <c>cached_tokens</c>, blocking and streaming, on both prompt-cache paths; with the flag off an annotated
+/// with the same <c>cached_tokens</c>, blocking and streaming, on both prompt-cache paths (single-slot and the default paged scheduler with its prefix trie); with the flag off an annotated
 /// body is answered byte for byte like the plain one (volatile ids, timestamps and timings blanked); the report sits on the
 /// blocking response, the finish-reason chunk and the Anthropic <c>message_delta</c>; <c>/metrics</c> counts it.
 /// </summary>
@@ -228,12 +228,10 @@ public sealed class ChunkCacheExactNeutralityTests : IDisposable
     [Theory]
     [InlineData("openai", false, "paged")]
     [InlineData("openai", true, "paged")]
-    [InlineData("openai", false, "trie")]
-    [InlineData("openai", true, "trie")]
     [InlineData("openai", false, "single")]
     [InlineData("openai", true, "single")]
     [InlineData("anthropic", false, "paged")]
-    [InlineData("anthropic", true, "trie")]
+    [InlineData("anthropic", true, "paged")]
     [InlineData("anthropic", false, "single")]
     public async Task Exact_IsBitIdenticalToUnannotated(string surface, bool stream, string path)
     {
@@ -266,20 +264,18 @@ public sealed class ChunkCacheExactNeutralityTests : IDisposable
                 cached = CachedTokens(surface, a.Body);
                 Assert.Equal(CachedTokens(surface, p.Body), cached);
             }
-            if (turn == 1 && path != "paged")
+            if (turn == 1) // both paths reuse the exact prefix across requests (the paged scheduler holds the trie since #1596)
                 Assert.True(cached > 0, "the warm turn must reuse the exact prefix");
         }
     }
 
     /// <summary>
-    /// The three prompt-cache configurations: <c>single</c> (single-slot prefix cache, generator path), <c>paged</c> (the
-    /// default: paged KV + scheduler, which <c>ServerStartup</c> runs without the prefix trie, so there is no cross-request
-    /// prefix reuse: <c>cached_tokens</c> 0 both ways) and <c>trie</c> (paged + scheduler with the trie wired in).
+    /// The two prompt-cache configurations: <c>single</c> (single-slot prefix cache, generator path) and <c>paged</c> (the
+    /// default: paged KV + scheduler, which <c>ServerStartup</c> gives the cross-request prefix trie since #1596).
     /// </summary>
     private Task<ChunkCacheTestServer> Start(string path, string? store = null) => path switch
     {
         "single" => ChunkCacheTestServer.StartAsync(_model, On(store), paged: false),
-        "trie" => ChunkCacheTestServer.StartAsync(_model, On(store), paged: true, schedulerTrie: true),
         _ => ChunkCacheTestServer.StartAsync(_model, On(store), paged: true),
     };
 
@@ -317,8 +313,6 @@ public sealed class ChunkCacheExactNeutralityTests : IDisposable
     [Theory]
     [InlineData(false, "paged")]
     [InlineData(true, "paged")]
-    [InlineData(false, "trie")]
-    [InlineData(true, "trie")]
     [InlineData(false, "single")]
     [InlineData(true, "single")]
     public async Task Exact_AfterShadow_SameSlot_Identical(bool stream, string path)
@@ -334,8 +328,7 @@ public sealed class ChunkCacheExactNeutralityTests : IDisposable
         var reference = await plain.PostAsync("/v1/chat/completions", Body("openai", null, stream));
         Assert.Equal(WithoutChunkFields(reference.Body), WithoutChunkFields(exact.Body));
         Assert.Equal(CachedTokens("openai", reference.Body), CachedTokens("openai", exact.Body));
-        if (path != "paged") // the default scheduler path has no cross-request prefix reuse (cached_tokens 0 both ways)
-            Assert.True(CachedTokens("openai", exact.Body) > 0);
+        Assert.True(CachedTokens("openai", exact.Body) > 0, "the warm request must reuse the exact prefix");
     }
 
     /// <summary>

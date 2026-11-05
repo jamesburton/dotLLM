@@ -57,15 +57,9 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
     /// <summary>Loads <paramref name="modelPath"/> and starts a server on a free loopback port.</summary>
     /// <param name="modelPath">The synthetic GGUF.</param>
     /// <param name="chunkCache">The chunk-cache options (flag on or off, store).</param>
-    /// <param name="paged">True: the default paged KV with the scheduler; false: the single-slot prefix cache.</param>
-    /// <param name="schedulerTrie">
-    /// Paged only: give the scheduler the cross-request prefix trie. <c>ServerStartup</c> builds the trie
-    /// (<c>ServerState.PrefixTrieManager</c>) but does not pass it to the scheduler, so the default serving path has no
-    /// cross-request prefix reuse at all; this wires it the way the engine supports (<c>ContinuousBatchSchedulerService</c>'s
-    /// <c>prefixCache</c>), so warm-slot neutrality can be checked on the trie + scheduler path too.
-    /// </param>
-    public static async Task<ChunkCacheTestServer> StartAsync(string modelPath, ChunkCacheOptions chunkCache, bool paged = true,
-        bool schedulerTrie = false)
+    /// <param name="paged">True: the default paged KV with the scheduler, which <c>ServerStartup</c> gives the cross-request
+    /// prefix trie (#1596); false: the single-slot prefix cache.</param>
+    public static async Task<ChunkCacheTestServer> StartAsync(string modelPath, ChunkCacheOptions chunkCache, bool paged = true)
     {
         var options = new ServerOptions
         {
@@ -78,14 +72,6 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
             Metrics = true,
         };
         var state = ServerStartup.LoadModel(modelPath, options);
-        if (schedulerTrie)
-        {
-            Assert.True(paged && state.Scheduler is not null && state.PrefixTrieManager is not null && state.PagedFactory is not null);
-            state.Scheduler!.Dispose();
-            state.Scheduler = new DotLLM.Engine.Scheduler.ContinuousBatchSchedulerService(state.Model!, state.Tokenizer!, state.KvCacheFactory!,
-                ServerStartup.ResolveSchedulerOptions(state.Options), state.PagedFactory!.Pool, state.PrefixTrieManager,
-                registerTelemetryProviders: false);
-        }
         var builder = WebApplication.CreateSlimBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Services.AddDotLLM(state);

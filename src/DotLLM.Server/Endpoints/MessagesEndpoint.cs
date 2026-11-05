@@ -99,9 +99,19 @@ public static class MessagesEndpoint
 
         // chunk_cache (docs/CHUNK_CACHE.md): with --chunk-cache on and an annotated body only; otherwise null and nothing
         // below changes. The namespace is server-assigned (the default until authentication exists).
-        var chunkCache = state.Options.ChunkCache.Enabled
-            ? ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, ChunkCacheWire.DefaultNamespace))
-            : null;
+        ChunkCacheExchange? chunkCache;
+        try
+        {
+            chunkCache = state.Options.ChunkCache.Enabled
+                ? ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, ChunkCacheWire.DefaultNamespace))
+                : null;
+        }
+        catch (InvalidOperationException)
+        {
+            // The parser converts the messages first: a text value JsonElement.GetString refuses (a lone-surrogate escape).
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", UndecodableTextError);
+            return;
+        }
         if (chunkCache?.Parsed.Error is { } chunkParseError)
         {
             await WriteErrorAsync(httpContext, chunkParseError.Status, chunkParseError.Type, chunkParseError.Message, chunkParseError.Code);
@@ -727,6 +737,10 @@ public static class MessagesEndpoint
     private static readonly string[] SupportedContentBlockTypes =
         ["text", "tool_use", "tool_result", "thinking", "redacted_thinking"];
 
+    /// <summary>The 400 message for message text that cannot be decoded as a string (a lone UTF-16 surrogate escape).</summary>
+    internal const string UndecodableTextError =
+        "a string value in messages or tools cannot be decoded (for example a lone UTF-16 surrogate escape)";
+
     /// <summary>
     /// Builds the prompt for an Anthropic request: message flattening, tool definitions and the
     /// chat template. Shared by <c>/v1/messages</c> and <c>/v1/messages/count_tokens</c> so the
@@ -737,9 +751,24 @@ public static class MessagesEndpoint
         out bool constrained, out string? error, out string? generationPromptSuffix,
         out (ChatMessage[] Messages, int EngineMessageOffset, ChatTemplateOptions Options) rendered, bool wantSuffix = true)
     {
-        var engineMessages = AnthropicConverter.ToMessages(request);
+        ChatMessage[] engineMessages;
+        try
+        {
+            engineMessages = AnthropicConverter.ToMessages(request);
+            tools = AnthropicConverter.ToTools(request.Tools);
+        }
+        catch (InvalidOperationException)
+        {
+            // JsonElement.GetString refuses a string it cannot decode to valid UTF-16 (a lone-surrogate escape is valid
+            // JSON): a client error, as on the OpenAI surface where model binding rejects it.
+            tools = null;
+            constrained = false;
+            error = UndecodableTextError;
+            generationPromptSuffix = null;
+            rendered = default;
+            return null;
+        }
         var messages = ProfileSystemPrompt.Apply(state.ActiveProfile?.System, engineMessages);
-        tools = AnthropicConverter.ToTools(request.Tools);
 
         // A forced tool_choice constrains decoding from the first token, which cannot coexist with an
         // open reasoning block: such requests default thinking off unless the client enabled it (#767).

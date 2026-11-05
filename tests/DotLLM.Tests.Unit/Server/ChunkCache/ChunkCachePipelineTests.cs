@@ -214,6 +214,18 @@ public sealed class ChunkCachePipelineTests : IClassFixture<ChunkCachePipelineTe
         Assert.Equal(cached, warm.Tokens.PrefixReused);
         Assert.Equal(n2, warm.Plan!.Tokens.ChunkReused);
 
+        // A restored prefix that ends INSIDE a chunk: the chunk straddles the boundary, so it is not "prefix" (only a chunk
+        // wholly inside the prefix is). Inside chunk 1 (a miss): chunk 0 is prefix, chunk 1 still a miss. Inside chunk 2 (a
+        // hit): chunks 0 and 1 are prefix, chunk 2 a hit whose plan reuses only the rows beyond the prefix.
+        var inMiss = Report(plan, plan.Spans[1].TokenStart + 1);
+        AssertPartition(inMiss);
+        Assert.Equal(new ChunkCacheChunksDto { Annotated = 4, Prefix = 1, Hit = 1, Miss = 2, Ignored = 0 }, inMiss.Chunks);
+        int inside = plan.Spans[2].TokenStart + 1;
+        var inHit = Report(plan, inside);
+        AssertPartition(inHit);
+        Assert.Equal(new ChunkCacheChunksDto { Annotated = 4, Prefix = 2, Hit = 1, Miss = 1, Ignored = 0 }, inHit.Chunks);
+        Assert.Equal(n2 - 1, inHit.Plan!.Tokens.ChunkReused);
+
         // exact counts the same hits (ruling 5) and plans nothing.
         var exact = Apply(Body(Conversation(User), "exact", AllChunks()), store).Plan;
         Assert.False(exact.Shadow);
@@ -681,6 +693,39 @@ public sealed class ChunkCachePipelineTests : IClassFixture<ChunkCachePipelineTe
         // And the other way round: a locator defect on span 0 wins over nothing later.
         var first = located with { Located = [located.Located[1]], Codes = [ChunkCacheCodes.SpanInvalid, null] };
         Assert.Equal(ChunkCacheCodes.SpanInvalid, ChunkCachePipeline.Apply(parsed, first, _fx.Identity, tok, prompt, tok.Encode(prompt), null, false).Error!.Code);
+    }
+
+    /// <summary>
+    /// Ruling 4 with the REAL locator (not a hand-built <see cref="LocatedSpans"/>): a span the locator rejects is the strict
+    /// error. <c>chunk_template_altered</c>: a span whose text carries a U+FDD0 marker (dropped at encode, so the text is not
+    /// what the prompt encodes). <c>chunk_span_invalid</c>: a span whose engine message no longer holds its text where the
+    /// parser placed it. Without strict, both are warnings and the request is served.
+    /// </summary>
+    [Fact]
+    public void Strict_LocatorDefects_FromTheRealLocator_AreTheError()
+    {
+        // chunk_template_altered from the locator.
+        string marked = "public int Marked => 1; // a line of code long enough ﷐ for a chunk\n";
+        string user = "Files:\n" + marked + "Question?";
+        var altered = Apply(Body(Conversation(user), "exact", [(1, marked)], """{"strict":true}""")).Plan;
+        Assert.Equal(ChunkCacheCodes.TemplateAltered, altered.Error?.Code);
+        Assert.Equal(400, altered.Error!.Status);
+        Assert.Null(Apply(Body(Conversation(user), "exact", [(1, marked)])).Plan.Error);
+
+        // chunk_span_invalid from the locator: the rendered messages no longer hold the span where the parser put it.
+        string body = Body(Conversation(User), "exact", [(1, Chunks[1])], """{"strict":true}""");
+        var request = JsonSerializer.Deserialize(body, ServerJsonContext.Default.ChatCompletionRequest)!;
+        var parsed = ChunkAnnotationParser.Parse(request, new ChunkCacheOptions(true, 4096), ChunkNamespace.Default)!;
+        Assert.Null(parsed.Error);
+        var messages = RequestConverter.ToMessages(request.Messages!);
+        messages[1] = messages[1] with { Content = messages[1].Content!.Replace(Chunks[1], Chunks[1].ToUpperInvariant(), StringComparison.Ordinal) };
+        var options = ReasoningSupport.BuildTemplateOptions(null, null, null, null, false);
+        Assert.True(ReasoningSupport.TryApply(_fx.Template, messages, options, out string prompt, out _, out _));
+        var located = ChunkSpanLocator.Locate(_fx.Template, messages, options, prompt, parsed.Spans, 0);
+        Assert.Equal(new string?[] { ChunkCacheCodes.SpanInvalid }, located.Codes);
+        var plan = ChunkCachePipeline.Apply(parsed, located, _fx.Identity, _fx.Tok, prompt, _fx.Tok.Encode(prompt), null, false);
+        Assert.Equal(ChunkCacheCodes.SpanInvalid, plan.Error?.Code);
+        Assert.Equal(400, plan.Error!.Status);
     }
 
     /// <summary>Review S1: a failing identity computation is an unsupported model (warning, strict 400), never a throw, and is computed once per model.</summary>
