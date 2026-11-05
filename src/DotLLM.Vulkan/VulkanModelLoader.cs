@@ -159,6 +159,9 @@ public static class VulkanModelLoader
             // glm4moe (GLM-4.5-Air / REAP, #1600) falls through to `default`: the generic VulkanTransformerModel runs GQA + QKV bias, partial NeoX
             // RoPE, dense layer 0 and the sigmoid + exp_probs_b MoE with packed banks and an ungated packed shared expert.
 
+            case Architecture.Ricursive:
+                throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("Vulkan"));
+
             case Architecture.Mamba3:
                 throw new NotSupportedException(
                     "Mamba-3 has no GGUF representation: no upstream 'mamba3' value for " +

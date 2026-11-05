@@ -47,6 +47,35 @@ public sealed record ChunkCacheReportDto
     /// <summary>Warning codes with counts, in order of first occurrence.</summary>
     [JsonPropertyName("warnings")]
     public required ChunkCacheWarningDto[] Warnings { get; init; }
+
+    /// <summary>
+    /// With <c>report: "per_chunk"</c> from an authenticated caller only (spec §10: per-chunk status is a membership
+    /// probe): each read annotation's status, in document order. Omitted otherwise (the summary).
+    /// </summary>
+    [JsonPropertyName("per_chunk")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ChunkCacheChunkStatusDto[]? PerChunk { get; init; }
+}
+
+/// <summary>
+/// One annotation's status (the report's <c>per_chunk</c> and <c>explain</c>'s <c>chunks</c>; spec §7.2): the caller's own
+/// <c>id</c>, <c>prefix</c> / <c>hit</c> / <c>miss</c> / <c>ignored</c>, and for <c>ignored</c> the §5.8 code why.
+/// </summary>
+public sealed record ChunkCacheChunkStatusDto
+{
+    /// <summary>The annotation's <c>id</c>; null when it could not be read (a malformed annotation).</summary>
+    [JsonPropertyName("id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public string? Id { get; init; }
+
+    /// <summary><c>prefix</c>, <c>hit</c>, <c>miss</c> or <c>ignored</c>.</summary>
+    [JsonPropertyName("status")]
+    public required string Status { get; init; }
+
+    /// <summary>For <c>ignored</c>: the §5.8 code that dropped it; null (written) when none applies and for the other statuses (ruling 55).</summary>
+    [JsonPropertyName("why")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public string? Why { get; init; }
 }
 
 /// <summary>Chunk counts of a <see cref="ChunkCacheReportDto"/>.</summary>

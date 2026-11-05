@@ -531,7 +531,7 @@ public sealed class ChunkCachePipelineTests : IClassFixture<ChunkCachePipelineTe
             CurrentGguf = _fx.Gguf,
         };
         var request = JsonSerializer.Deserialize(Body(Conversation(User), "shadow", AllChunks()), ServerJsonContext.Default.ChatCompletionRequest)!;
-        var exchange = ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, ChunkNamespace.Default))!;
+        var exchange = ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, ChunkNamespace.Default), new ChunkCaller(true, ChunkNamespace.Default))!;
         var messages = RequestConverter.ToMessages(request.Messages!);
         var options = ReasoningSupport.BuildTemplateOptions(null, null, null, null, false);
         Assert.True(ReasoningSupport.TryApply(_fx.Template, messages, options, out string prompt, out _, out _));
@@ -747,7 +747,7 @@ public sealed class ChunkCachePipelineTests : IClassFixture<ChunkCachePipelineTe
         {
             var request = JsonSerializer.Deserialize(Body(Conversation(User), "shadow", AllChunks(), strict ? """{"strict":true}""" : ""),
                 ServerJsonContext.Default.ChatCompletionRequest)!;
-            var exchange = ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, ChunkNamespace.Default))!;
+            var exchange = ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, ChunkNamespace.Default), new ChunkCaller(true, ChunkNamespace.Default))!;
             var messages = RequestConverter.ToMessages(request.Messages!);
             var options = ReasoningSupport.BuildTemplateOptions(null, null, null, null, false);
             Assert.True(ReasoningSupport.TryApply(_fx.Template, messages, options, out string prompt, out _, out _));

@@ -10,6 +10,32 @@ namespace DotLLM.Server.ChunkCache;
 /// <param name="Hit">Whether the store holds an entry under the chunk's key.</param>
 internal readonly record struct PlannedSpan(int TokenStart, int TokenCount, bool Hit);
 
+/// <summary>
+/// One read annotation's outcome, for per-chunk status (an authenticated caller's <c>report: "per_chunk"</c> and
+/// <c>explain</c>): <c>hit</c> / <c>miss</c> for a verified chunk (whether it lay inside the restored prefix is decided
+/// once that is known), else <c>ignored</c> with the §5.8 code that dropped it (null when nothing more specific applies).
+/// </summary>
+/// <param name="Index">The annotation's position in document order.</param>
+/// <param name="Id">Its <c>id</c> (the caller's own label), when read.</param>
+/// <param name="Status"><c>hit</c>, <c>miss</c> or <c>ignored</c>.</param>
+/// <param name="Code">Why it was ignored.</param>
+/// <param name="TokenStart">Verified chunks: index of the first id in the prompt's ids; else -1.</param>
+/// <param name="TokenCount">Verified chunks: id count; else 0.</param>
+internal readonly record struct SpanStatus(int Index, string? Id, string Status, string? Code, int TokenStart, int TokenCount)
+{
+    /// <summary>Status of a verified chunk the store holds.</summary>
+    public const string Hit = "hit";
+
+    /// <summary>Status of a verified chunk the store does not hold.</summary>
+    public const string Miss = "miss";
+
+    /// <summary>Status of an annotation treated as plain text.</summary>
+    public const string Ignored = "ignored";
+
+    /// <summary>Status of a verified chunk wholly inside the restored exact prefix.</summary>
+    public const string Prefix = "prefix";
+}
+
 /// <summary>What <see cref="ChunkCachePipeline.Apply"/> decided for one request, before generation.</summary>
 /// <param name="Requested">The requested policy.</param>
 /// <param name="Reason">Why the applied policy (always exact) differs from the requested one, or null.</param>
@@ -25,7 +51,11 @@ internal readonly record struct PlannedSpan(int TokenStart, int TokenCount, bool
 internal sealed record ChunkCachePlan(
     ChunkPolicy Requested, string? Reason, bool Shadow, int Annotated, IReadOnlyList<PlannedSpan> Spans,
     IReadOnlyList<ChunkWarning> Warnings, ChunkCacheError? Error, string Report, string Backend, int PromptTokens,
-    double Budget = ChunkCacheReport.DefaultPlanBudget);
+    double Budget = ChunkCacheReport.DefaultPlanBudget)
+{
+    /// <summary>Every read annotation's outcome, in document order (see <see cref="SpanStatus"/>).</summary>
+    public IReadOnlyList<SpanStatus> Statuses { get; init; } = [];
+}
 
 /// <summary>
 /// Runs <c>exact</c> / <c>shadow</c> for one annotated request (spec §5.5, §5.9; Phase I Task 13). Nothing here changes
@@ -103,9 +133,12 @@ internal static class ChunkCachePipeline
         string backend = identity.Supported ? identity.Backend : "cpu";
         double budget = parsed.RecomputeBudget ?? ChunkCacheReport.DefaultPlanBudget;
 
+        var outcomes = new SpanStatus?[parsed.Spans.Count];
         if (!identity.Supported)
         {
             // Every policy degrades to exact; every annotation is plain text (ruling 41: reason only when not exact).
+            for (int i = 0; i < outcomes.Length; i++)
+                outcomes[i] = Ignored(parsed.Spans[i], ChunkCacheCodes.ModelUnsupported);
             warnings.Add(ChunkCacheCodes.ModelUnsupported, 1);
             requestErrors.Add(ChunkCacheCodes.ModelUnsupported);
             if (parsed.Requested != ChunkPolicy.Exact)
@@ -131,11 +164,17 @@ internal static class ChunkCachePipeline
                 foreach (var w in located.Warnings)
                     warnings.Add(w.Code, w.Count);
                 for (int i = 0; i < located.Codes.Count; i++)
-                    if (located.Codes[i] is { } code && !ChunkCacheCodes.IsWarningOnly(code))
+                {
+                    if (located.Codes[i] is not { } code)
+                        continue;
+                    if (i < outcomes.Length)
+                        outcomes[i] = Ignored(parsed.Spans[i], code);
+                    if (!ChunkCacheCodes.IsWarningOnly(code))
                         spanErrors.Add((i, code));
+                }
 
                 PlanSpans(parsed, located, identity, tokenizer, prompt, promptIds, store, storeUnavailable, spans, warnings,
-                    spanErrors, docIndex, out bool lookedUp);
+                    spanErrors, docIndex, outcomes, out bool lookedUp);
                 if (storeUnavailable && lookedUp)
                 {
                     warnings.Add(ChunkCacheCodes.StoreUnavailable, 1);
@@ -155,13 +194,34 @@ internal static class ChunkCachePipeline
         }
 
         return new ChunkCachePlan(parsed.Requested, reason, shadow, parsed.Annotated, spans, warnings.ToList(), error,
-            parsed.Report, backend, promptIds.Count, budget);
+            parsed.Report, backend, promptIds.Count, budget)
+        {
+            Statuses = StatusesOf(parsed, outcomes),
+        };
     }
+
+    /// <summary>Every read annotation's outcome in document order: the accepted spans' and the parser's dropped ones.</summary>
+    /// <param name="parsed">The parse.</param>
+    /// <param name="outcomes">Per accepted span (index into <c>parsed.Spans</c>), its outcome; null = ignored, no code.</param>
+    /// <returns>The statuses.</returns>
+    internal static IReadOnlyList<SpanStatus> StatusesOf(ParsedChunkRequest parsed, IReadOnlyList<SpanStatus?> outcomes)
+    {
+        var all = new List<SpanStatus>(parsed.Spans.Count + parsed.Defects.Count);
+        for (int i = 0; i < parsed.Spans.Count; i++)
+            all.Add(i < outcomes.Count && outcomes[i] is { } o ? o : Ignored(parsed.Spans[i], null));
+        foreach (var d in parsed.Defects)
+            all.Add(new SpanStatus(d.Index, d.Id, SpanStatus.Ignored, d.Code, -1, 0));
+        all.Sort((a, b) => a.Index.CompareTo(b.Index));
+        return all;
+    }
+
+    private static SpanStatus Ignored(ChunkSpanRef span, string? code) =>
+        new(span.Index, span.Id, SpanStatus.Ignored, code, -1, 0);
 
     private static void PlanSpans(ParsedChunkRequest parsed, LocatedSpans located, ServerModelIdentity identity,
         ITokenizer tokenizer, string prompt, IReadOnlyList<int> promptIds, IChunkStore? store, bool storeUnavailable,
         List<PlannedSpan> spans, WarningList warnings, List<(int Doc, string Code)> spanErrors,
-        Dictionary<ChunkSpanRef, int> docIndex, out bool lookedUp)
+        Dictionary<ChunkSpanRef, int> docIndex, SpanStatus?[] outcomes, out bool lookedUp)
     {
         lookedUp = false;
         var order = located.Located
@@ -170,7 +230,17 @@ internal static class ChunkCachePipeline
             .ToList();
         int malformedRanges = located.Located.Count - order.Count;
         if (malformedRanges > 0)
+        {
             warnings.Add(ChunkCacheCodes.VerificationSkipped, malformedRanges); // a locator bug: never counted, never an error
+            foreach (var l in located.Located.Except(order))
+                Set(l.Span, Ignored(l.Span, ChunkCacheCodes.VerificationSkipped));
+        }
+
+        void Set(ChunkSpanRef span, SpanStatus status)
+        {
+            if (docIndex.TryGetValue(span, out int d) && d < outcomes.Length)
+                outcomes[d] = status;
+        }
 
         var checker = new TokenChecker(tokenizer, prompt, promptIds);
         int planned = 0;
@@ -179,6 +249,7 @@ internal static class ChunkCachePipeline
             if (planned++ >= MaxPlannedSpans)
             {
                 warnings.Add(ChunkCacheCodes.VerificationSkipped, 1);
+                Set(l.Span, Ignored(l.Span, ChunkCacheCodes.VerificationSkipped));
                 continue;
             }
 
@@ -186,6 +257,7 @@ internal static class ChunkCachePipeline
             if (ids.Length == 0 || ids.Length < parsed.MinChunkTokens)
             {
                 warnings.Add(ChunkCacheCodes.IgnoredTooShort, 1);
+                Set(l.Span, Ignored(l.Span, ChunkCacheCodes.IgnoredTooShort));
                 continue;
             }
 
@@ -193,11 +265,13 @@ internal static class ChunkCachePipeline
             if (outcome == Outcome.Skipped)
             {
                 warnings.Add(ChunkCacheCodes.VerificationSkipped, 1);
+                Set(l.Span, Ignored(l.Span, ChunkCacheCodes.VerificationSkipped));
                 continue;
             }
             if (outcome == Outcome.Altered)
             {
                 warnings.Add(ChunkCacheCodes.TemplateAltered, 1);
+                Set(l.Span, Ignored(l.Span, ChunkCacheCodes.TemplateAltered));
                 spanErrors.Add((docIndex.TryGetValue(l.Span, out int d) ? d : int.MaxValue, ChunkCacheCodes.TemplateAltered));
                 continue;
             }
@@ -210,6 +284,7 @@ internal static class ChunkCachePipeline
                     hit = Contains(store, identity, ids, parsed.Namespace);
             }
             spans.Add(new PlannedSpan(start, ids.Length, hit));
+            Set(l.Span, new SpanStatus(l.Span.Index, l.Span.Id, hit ? SpanStatus.Hit : SpanStatus.Miss, null, start, ids.Length));
         }
     }
 

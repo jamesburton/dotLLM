@@ -132,6 +132,9 @@ public static class CudaModelLoader
             case Architecture.Glm4Moe:
                 throw new NotSupportedException(ModelConfig.Glm4MoeUnsupportedMessage("CUDA"));
 
+            case Architecture.Ricursive:
+                throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("CUDA"));
+
             case Architecture.MiMoV2:
                 throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("CUDA"));
 

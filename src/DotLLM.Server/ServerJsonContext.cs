@@ -76,6 +76,9 @@ namespace DotLLM.Server;
 [JsonSerializable(typeof(AnthropicMessageDeltaEvent))]
 [JsonSerializable(typeof(AnthropicMessageStopEvent))]
 [JsonSerializable(typeof(AnthropicPingEvent))]
+// chunk-cache control plane (docs/CHUNK_CACHE.md), mapped only with --chunk-cache.
+[JsonSerializable(typeof(ChunkCacheCapabilitiesDto))]
+[JsonSerializable(typeof(ChunkCacheExplainDto))]
 [JsonSourceGenerationOptions(
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]

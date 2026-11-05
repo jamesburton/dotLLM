@@ -37,6 +37,7 @@
   <Folder Name="/src/">
     <Project Path="src/DotLLM.ChunkCache.Client/DotLLM.ChunkCache.Client.csproj" />
     <Project Path="src/DotLLM.ChunkReuse/DotLLM.ChunkReuse.csproj" />
+    <Project Path="src/DotLLM.ChunkReuse.CSharp/DotLLM.ChunkReuse.CSharp.csproj" />
     <Project Path="src/DotLLM.Cli/DotLLM.Cli.csproj" />
     <Project Path="src/DotLLM.Core/DotLLM.Core.csproj" />
     <Project Path="src/DotLLM.Cpu/DotLLM.Cpu.csproj" />

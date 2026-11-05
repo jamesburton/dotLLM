@@ -1324,6 +1324,11 @@ internal sealed class TransformerWeights : IDisposable
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.Glm4Moe)
             throw new NotSupportedException(ModelConfig.Glm4MoeUnsupportedMessage("any"));
 
+        // ricursive (#1643): config + census only. The generic path would load attn_q/k/v/output and the FFN but silently drop the value
+        // residual, the separate attn_gate, the sandwich post-norms, the NoPE full layers and the SwiGLU clamp: refuse.
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.Ricursive)
+            throw new NotSupportedException(DotLLM.Core.Models.RicursiveConfig.UnsupportedMessage("any"));
+
         string? why = DedicatedLoaderReason(config);
         if (why is null)
             return;
@@ -1365,6 +1370,9 @@ internal sealed class TransformerWeights : IDisposable
             DotLLM.Core.Configuration.Architecture.Glm4Moe =>
                 "it has no forward pass yet (config extraction + tensor census only, issue #1598): its sigmoid + exp_probs_b MoE router, "
                 + "shared expert, QKV bias, partial NeoX RoPE and NextN block are not implemented by the dense path",
+            DotLLM.Core.Configuration.Architecture.Ricursive =>
+                "it has no forward pass yet (config + tensor census + tokenizer only, issue #1643): its value residual, separate sigmoid "
+                + "output gate, sandwich norms, NoPE full-attention layers and SwiGLU clamp are not implemented by the dense path",
             DotLLM.Core.Configuration.Architecture.Mamba3 =>
                 "Mamba-3 has no GGUF representation at all (no upstream 'mamba3' value for "
                 + "general.architecture and no GGUF tensor-naming convention) — it is "
