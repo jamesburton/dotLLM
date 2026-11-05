@@ -65,6 +65,12 @@ public static class GgufAddBosResolver
             _ => true,
         };
 
+        // Ripple (ricursive, #1643) is trained without BOS: its HF tokenizer.json has post_processor null and never prepends
+        // <|endoftext|>. The AtomicChat GGUF carries no add_bos_token key at all, so the default must be false for this
+        // architecture whatever pre-type a future conversion declares (today "dbrx", which is already false).
+        if (metadata.GetStringOrDefault("general.architecture") == "ricursive")
+            addBos = false;
+
         // An explicit key wins over the pre-type default — this is what makes SmolLM
         // (pre = "smollm", add_bos_token = false) differ from Llama-3.2 (pre = "llama-bpe",
         // no key). Both are tokenizer.ggml.model = "gpt2".

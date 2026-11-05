@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Not packed until the release wiring PR decides the package set. -->
+    <IsPackable>false</IsPackable>
+    <Description>C# support for dotLLM chunk-level KV reuse: the Roslyn symbol chunker, the code corpus, the reference graph and the context-selection tools. Kept out of DotLLM.ChunkReuse so the core library (and DotLLM.Server) carry no Roslyn dependency.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DotLLM.ChunkReuse\DotLLM.ChunkReuse.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Roslyn syntax for the symbol chunker and corpus; semantic model for the reference graph. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
+  </ItemGroup>
+
+</Project>

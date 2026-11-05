@@ -317,6 +317,13 @@ public record ModelConfig
     public Qwen4ExpConfig? Qwen4Exp { get; init; }
 
     /// <summary>
+    /// Ripple (<c>ricursive</c>) gated-attention / value-residual / FFN-clamp / embedding-scale switches. Non-null iff
+    /// <see cref="Architecture"/> is <see cref="DotLLM.Core.Configuration.Architecture.Ricursive"/>; null for every other architecture.
+    /// See <see cref="RicursiveConfig"/>.
+    /// </summary>
+    public RicursiveConfig? Ricursive { get; init; }
+
+    /// <summary>
     /// Optional per-attention-type RoPE override for the FULL-attention layers
     /// (Gemma 4 / DiffusionGemma). When non-null, every layer flagged as a
     /// full-attention layer by <see cref="IsFullAttentionLayer(int)"/> applies
