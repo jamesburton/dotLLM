@@ -62,9 +62,11 @@ get a 400. Genuinely unknown fields are tolerated too (STJ source-gen skips unma
 declaring these makes the intent explicit and guards against a future strict-DTO pass.
 
 **`chunk_cache`** (chunk-level K/V reuse convention): with `dotllm serve --chunk-cache` (off by default;
-`--chunk-cache-max-chunks`, default 4096, caps annotations per request) the annotations are parsed and validated; using
-them for reuse arrives with the next server tasks, so today the flag changes no response. With the flag off it is
-ignored like any unknown field, so an annotated body behaves byte for byte like the plain one. On this surface a span
+`--chunk-cache-max-chunks`, default 4096, caps annotations per request; `--chunk-store <dir>` names a read-only store) the
+annotations are validated and run under `exact` (default) or `shadow`: the output is identical to the unannotated
+request, and the response gains a `chunk_cache` report (blocking response; the finish-reason chunk when streaming) and
+`timings.chunk_n` / `chunk_recomputed_n` (0). `balanced` / `fast` / `auto` are served `exact` with a reason. With the
+flag off it is ignored like any unknown field, so an annotated body behaves byte for byte like the plain one. On this surface a span
 addresses a message's string `content` through the manifest; array `content` stays a 400. See
 [CHUNK_CACHE.md](CHUNK_CACHE.md).
 
@@ -151,8 +153,9 @@ accepted and ignored, and `x-api-key` is accepted — dotLLM performs no
 authentication (see [Security](#security)).
 
 With `--chunk-cache` (off by default) a top-level `chunk_cache` manifest and an inline `chunk` on `text` blocks are
-parsed and validated (chunk-level K/V reuse convention, [CHUNK_CACHE.md](CHUNK_CACHE.md)); reuse arrives with the next
-server tasks, so today the flag changes no response. With the flag off both are ignored as before.
+honoured under `exact` / `shadow` (chunk-level K/V reuse convention, [CHUNK_CACHE.md](CHUNK_CACHE.md)): the output is
+identical to the unannotated request; the blocking response and the streaming `message_delta` gain a `chunk_cache`
+report; a strict-mode error carries its code as `error.code`. With the flag off both are ignored as before.
 
 Full reference: **[ANTHROPIC_API.md](ANTHROPIC_API.md)**.
 
@@ -1207,8 +1210,9 @@ Prompt caching is **enabled by default** in both `chat` and `serve` commands.
 | `--prompt-cache-size` | 1 (chat) / 4 (serve) | Maximum number of cached sessions (LRU eviction) |
 | `--prompt-cache-step` | 0 (off) | Hybrid recurrent models: checkpoint the recurrent state every N prefill tokens, so a prompt that diverges mid-history resumes from the nearest one ([KV_CACHE.md](KV_CACHE.md#mid-history-resume-step-checkpoints-1286), #1286) |
 | `--prompt-cache-step-keep` | 8 | Most `--prompt-cache-step` checkpoints kept (deepest first) |
-| `--chunk-cache` | off | Parse and validate `chunk_cache` annotations on `/v1/chat/completions` and `/v1/messages` (chunk-level K/V reuse convention; reuse arrives with the next server tasks, so today no response changes). Off: annotations are ignored like any unknown field ([CHUNK_CACHE.md](CHUNK_CACHE.md)) |
-| `--chunk-cache-max-chunks` | 4096 | Most chunk annotations read per request (≥ 1, no upper bound); the rest are dropped with `chunk_too_many` without being read |
+| `--chunk-cache` | off | Honour `chunk_cache` annotations on `/v1/chat/completions` and `/v1/messages` (chunk-level K/V reuse convention): `exact` (default) and `shadow`, output identical to the unannotated request, plus a `chunk_cache` report and `/metrics` counters (`dotllm_chunk_cache_chunks_total`, `dotllm_chunk_cache_tokens_total`). Off: annotations are ignored like any unknown field ([CHUNK_CACHE.md](CHUNK_CACHE.md)) |
+| `--chunk-cache-max-chunks` | 4096 | Most chunk annotations read per request (1 to 65536); the rest are dropped with `chunk_too_many` without being read |
+| `--chunk-store` | none | With `--chunk-cache` (rejected without it): a chunk store (e.g. from `chunkcache build`) to look annotated chunks up in. Read-only (never written or created); a relative path is resolved at startup; a missing directory is reported as `chunk_store_unavailable` |
 
 ### API
 

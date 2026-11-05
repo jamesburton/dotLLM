@@ -7,10 +7,18 @@ namespace DotLLM.Server.ChunkCache;
 /// </summary>
 /// <param name="Enabled">True when <c>--chunk-cache</c> was given.</param>
 /// <param name="MaxChunks">Most annotations accepted per request; more is <c>chunk_too_many</c>.</param>
-public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks)
+/// <param name="StoreRoot">
+/// <c>--chunk-store</c>: the chunk store the server looks chunks up in (read-only here: <c>exact</c> counts hits, <c>shadow</c>
+/// plans with them). Null: no store, every located chunk is a miss. A configured root that does not exist is
+/// <c>chunk_store_unavailable</c>; the server never creates it.
+/// </param>
+public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? StoreRoot = null)
 {
     /// <summary>Default of <c>--chunk-cache-max-chunks</c> (advertised as <c>max_chunks_per_request</c>).</summary>
     public const int DefaultMaxChunks = 4096;
+
+    /// <summary>Upper bound of <c>--chunk-cache-max-chunks</c>: keeps the per-request parse work bounded.</summary>
+    public const int AbsoluteMaxChunks = 65536;
 
     /// <summary>The convention switched off (the default).</summary>
     public static ChunkCacheOptions Disabled { get; } = new(false, DefaultMaxChunks);
@@ -20,12 +28,19 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks)
     /// </summary>
     /// <param name="enabled"><c>--chunk-cache</c>.</param>
     /// <param name="maxChunks"><c>--chunk-cache-max-chunks</c>; null = <see cref="DefaultMaxChunks"/>.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxChunks"/> is below 1.</exception>
-    public static ChunkCacheOptions Create(bool enabled, int? maxChunks)
+    /// <param name="storeRoot"><c>--chunk-store</c>; null or blank = no store.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxChunks"/> is below 1 or above <see cref="AbsoluteMaxChunks"/>.</exception>
+    /// <exception cref="ArgumentException">A store is given without <c>--chunk-cache</c>.</exception>
+    public static ChunkCacheOptions Create(bool enabled, int? maxChunks, string? storeRoot = null)
     {
         int max = maxChunks ?? DefaultMaxChunks;
-        if (max < 1)
-            throw new ArgumentOutOfRangeException(nameof(maxChunks), max, "--chunk-cache-max-chunks must be at least 1.");
-        return new ChunkCacheOptions(enabled, max);
+        if (max < 1 || max > AbsoluteMaxChunks)
+            throw new ArgumentOutOfRangeException(nameof(maxChunks), max, $"--chunk-cache-max-chunks must be between 1 and {AbsoluteMaxChunks}.");
+        if (string.IsNullOrWhiteSpace(storeRoot))
+            return new ChunkCacheOptions(enabled, max);
+        if (!enabled)
+            throw new ArgumentException("--chunk-store needs --chunk-cache (the store is only read for chunk_cache requests).", nameof(storeRoot));
+        // Resolved once, at startup, against the working directory of that moment (not lazily per request).
+        return new ChunkCacheOptions(enabled, max, Path.GetFullPath(storeRoot));
     }
 }

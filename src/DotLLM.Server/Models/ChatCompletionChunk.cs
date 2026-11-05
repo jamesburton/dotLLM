@@ -30,6 +30,10 @@ public sealed record ChatCompletionChunk
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public TimingsDto? Timings { get; init; }
 
+    /// <summary>The <c>chunk_cache</c> report, on the finish-reason chunk only (docs/CHUNK_CACHE.md); only with <c>--chunk-cache</c> on and an annotated request.</summary>
+    [JsonPropertyName("chunk_cache")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ChunkCacheReportDto? ChunkCache { get; init; }
 }
 
 /// <summary>
@@ -117,6 +121,19 @@ public sealed record TimingsDto
     /// <summary>Decode tokens per second.</summary>
     [JsonPropertyName("predicted_per_second")]
     public double PredictedPerSecond { get; init; }
+
+    /// <summary>
+    /// Prompt rows taken from stored chunks (approximate reuse; <c>chunk_cache</c> <c>tokens.chunk_reused</c>). Written only on
+    /// a <c>--chunk-cache</c> annotated request; 0 in v1, where reuse is never applied.
+    /// </summary>
+    [JsonPropertyName("chunk_n")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ChunkN { get; init; }
+
+    /// <summary>Reused chunk rows that were recomputed (a subset of <see cref="ChunkN"/>); same presence rule, 0 in v1.</summary>
+    [JsonPropertyName("chunk_recomputed_n")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ChunkRecomputedN { get; init; }
 
     /// <summary>Maps engine measurements to the timing extension (dotLLM names plus the llama.cpp-shaped ones).</summary>
     public static TimingsDto From(DotLLM.Engine.InferenceTimings timings) => new()

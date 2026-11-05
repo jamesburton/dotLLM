@@ -19,7 +19,14 @@ internal sealed record LocatedSpan(ChunkSpanRef Span, int RenderedStartChar, int
 /// <param name="Located">The spans found in the rendered prompt, in input order.</param>
 /// <param name="Warnings">Why the others were ignored: <c>chunk_template_altered</c> (the template changed or moved the
 /// span's text), or <c>chunk_span_invalid</c> (the span is not where its engine position says: a caller bug).</param>
-internal sealed record LocatedSpans(IReadOnlyList<LocatedSpan> Located, IReadOnlyList<ChunkWarning> Warnings);
+internal sealed record LocatedSpans(IReadOnlyList<LocatedSpan> Located, IReadOnlyList<ChunkWarning> Warnings)
+{
+    /// <summary>
+    /// Per input span (same order as the <c>spans</c> argument): null when located, else its warning code. Lets the caller
+    /// pick the strict-mode error in document order (ruling 4). Empty when there were no spans.
+    /// </summary>
+    public IReadOnlyList<string?> Codes { get; init; } = [];
+}
 
 /// <summary>
 /// Locates accepted chunk spans in the rendered chat prompt (spec §5.3 item 5; contract ruling 20). The template is
@@ -218,6 +225,7 @@ internal static class ChunkSpanLocator
 
         // 3. Result.
         var located = new List<LocatedSpan>();
+        var codes = new string?[n];
         int altered = 0, invalid = 0;
         for (int k = 0; k < n; k++)
         {
@@ -228,9 +236,11 @@ internal static class ChunkSpanLocator
                     break;
                 case State.Invalid:
                     invalid++;
+                    codes[k] = ChunkCacheCodes.SpanInvalid;
                     break;
                 default:
                     altered++; // Altered, or still a candidate after the last render
+                    codes[k] = ChunkCacheCodes.TemplateAltered;
                     break;
             }
         }
@@ -239,7 +249,7 @@ internal static class ChunkSpanLocator
             warnings.Add(new ChunkWarning(ChunkCacheCodes.TemplateAltered, altered));
         if (invalid > 0)
             warnings.Add(new ChunkWarning(ChunkCacheCodes.SpanInvalid, invalid));
-        return new LocatedSpans(located, warnings);
+        return new LocatedSpans(located, warnings) { Codes = codes };
     }
 
     private static string Sentinel(string prefix, int k) =>

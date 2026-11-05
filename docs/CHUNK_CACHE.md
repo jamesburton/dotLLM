@@ -10,17 +10,18 @@ request and response is what it was before the convention, for any body.
 
 | flag | default | meaning |
 |---|---|---|
-| `--chunk-cache` | off | parse and validate `chunk_cache` annotations on `/v1/chat/completions` and `/v1/messages` (reuse arrives with the next server tasks; today no response changes). Off: the annotations are never read; the body behaves exactly as without them (pinned over HTTP by `ChunkCacheFlagHttpTests`) |
-| `--chunk-cache-max-chunks <n>` | 4096 | most annotations read per request (≥ 1; no upper bound, so `int.MaxValue` disables the cap); the rest are counted from the array length and dropped with `chunk_too_many` without being read |
+| `--chunk-cache` | off | honour `chunk_cache` annotations on `/v1/chat/completions` and `/v1/messages`: policies `exact` (default) and `shadow`, whose output is identical to the unannotated request, plus a `chunk_cache` report in the response (below). Off: the annotations are never read; the body behaves exactly as without them (pinned over HTTP by `ChunkCacheFlagHttpTests` and `FlagOff_AnnotatedBodies_AnsweredLikePlain_EverySurface`, blocking and streaming, both surfaces) |
+| `--chunk-cache-max-chunks <n>` | 4096 | most annotations read per request (1 to 65536, so the per-request parse work stays bounded); the rest are counted from the array length and dropped with `chunk_too_many` without being read |
+| `--chunk-store <dir>` | none | the chunk store (e.g. built by `chunkcache build` from the same GGUF, without `--strict-model-id`) the server looks annotated chunks up in. **Read-only**: the server never writes, encodes into or creates it (the sole-writer encode path, its budget and admission rules come with a later task). Needs `--chunk-cache` (rejected without it); a relative path is resolved at startup. No store: every verified chunk is a miss, no warning. A configured root that does not exist: misses plus `chunk_store_unavailable` (strict: 503) |
 
-Both exist on `dotllm serve` and on `ServerOptions.Parse` (`ServerOptions.ChunkCache`).
+All three exist on `dotllm serve` and on `ServerOptions.Parse` (`ServerOptions.ChunkCache`).
 
 ## Request parsing (`ChunkAnnotationParser`)
 
 The parser reads the request and nothing else: no store, no tokenizer, no reuse. It turns the annotations into
 `ParsedChunkRequest` (accepted spans, warnings with counts, the strict-mode error, the request options), or returns null
-when the flag is off or the request carries no annotation. **It is not yet called by the endpoints**: the next server
-task applies the parse (strict 400s, the `chunk_cache` response object); until then the flag changes no response.
+when the flag is off or the request carries no annotation. Both chat endpoints call it right after request validation;
+a strict-mode defect is returned there (see "Execution" below for the error shapes).
 **Packaging:** this step does not ship alone: the parser, span location and `exact` / `shadow` execution (plan Tasks 10,
 11 and 13) go upstream as one PR, so the flag does something when it is merged. The parser and its records are
 `internal` until then.
@@ -78,10 +79,13 @@ joined with `'\n'`. The parser then checks that the engine message holds the spa
    the code (`chunk_store_unavailable` alone is `503 api_error`; nothing is 422). Only `chunk_ignored_too_short`,
    `chunk_encode_skipped` and `chunk_encode_queued` are never errors.
 
-**Lone surrogates (ruling 17).** In-process callers only: a string with a lone surrogate hashes as UTF-8 with U+FFFD.
-Over HTTP it cannot happen: System.Text.Json parses a lone-surrogate escape but refuses to return it as a string, so
-message text with one fails before the parser (as it always did), and an annotation field with one is
-`chunk_annotation_malformed`, never an exception.
+**Lone surrogates (ruling 17).** A string that holds a lone surrogate (in-process callers) hashes as UTF-8 with U+FFFD.
+Over HTTP a lone-surrogate *escape* (`"\ud800"`, valid JSON) is a client error, flag on or off: System.Text.Json parses
+it but refuses to return it as a string. OpenAI message text fails at model binding (400). Anthropic message text is a
+raw `JsonElement` that the converter reads later; `/v1/messages` and `/v1/messages/count_tokens` catch that refusal
+(around the `chunk_cache` parse, which converts the messages first, and in prompt building) and answer
+`400 invalid_request_error` (`Anthropic_LoneSurrogateEscapeInTextBlock_Is400`: annotated, unannotated, flag off; before
+the fix all three were a 500). An annotation field with one is `chunk_annotation_malformed`, never an exception.
 
 **Cost bounds.** The parser never throws on body content and does bounded work: the manifest is cut at its array length
 before any entry is read; each annotated part is encoded to UTF-8 once per request, with a byte-to-char checkpoint table
@@ -102,6 +106,10 @@ an empty query and no warning (ruling 34 asks only for the index of a request me
 A body `chunk_cache.namespace` equal to the caller's own is accepted silently; another name is
 ignored with `chunk_namespace_ignored` (strict: `400 invalid_request_error` with that code), and the spans stay (a non-string is `chunk_annotation_malformed`). The
 namespace's format is validated where it is assigned (the authentication step), not here.
+**Until authentication exists, every caller shares the default namespace**, and the report's `hit` / `miss` counts (and
+the `/metrics` counters) answer a store lookup for any text the caller annotates. So any caller can probe whether a known
+text (another caller's file, a document) is in the store: annotate it and read `hit`. Treat the store's contents as
+visible to everyone who can reach the server; per-caller namespaces (from the API key) close this with authentication.
 
 The contract's request fixtures are copied byte for byte under `tests/DotLLM.Tests.Unit/ChunkCache/Fixtures/v1/`
 (checked against `fixtures.sha256`); `ChunkAnnotationParserTests` checks every one against `expected.json`, in the
@@ -110,9 +118,8 @@ contract's message model and translated to the Anthropic surface.
 ## Span location in the rendered prompt (`ChunkSpanLocator`)
 
 `ChunkSpanLocator.Locate(template, messages, options, rendered, spans, engineMessageOffset)` finds each accepted span in
-the rendered prompt string (spec §5.3 item 5, contract ruling 20). Like the parser it is not yet called by the endpoints;
-the `exact` / `shadow` task calls it with the prompt the endpoint has already rendered, so it adds no render of its own
-for that. It returns `LocatedSpan(Span, RenderedStartChar, RenderedEndChar)` (UTF-16 chars into the rendered string,
+the rendered prompt string (spec §5.3 item 5, contract ruling 20). The endpoints call it (through
+`ChunkCacheExchange.Prepare`) with the prompt they have already rendered, so it adds no render of its own for that. It returns `LocatedSpan(Span, RenderedStartChar, RenderedEndChar)` (UTF-16 chars into the rendered string,
 including any BOS text the template writes) for each located span, and warnings for the rest.
 
 - **Sentinel render.** Every span is replaced in its engine message by a sentinel: `U+E000`, a fresh GUID per
@@ -148,8 +155,131 @@ including any BOS text the template writes) for each located span, and warnings 
 - **Never throws on request content.** If a template throws on the sentinel render, or drops or duplicates content,
   every span it covers is ignored. Positions out of range, overlaps and lone surrogates are handled without a throw.
 - Character equality is not token equality at a span's edges (BPE merges with neighbouring template text; a
-  SentencePiece leading space; live reasoning tags in assistant turns). The `exact` / `shadow` task checks the span's
-  token ids against the whole-prompt tokenisation over the located range before counting a span as reusable.
+  SentencePiece leading space; live reasoning tags in assistant turns). Execution (below) checks the span's token ids
+  against the whole-prompt tokenisation over the located range before counting a span as reusable.
+
+## Execution: `exact` and `shadow` (`ChunkCachePipeline`, `ChunkCacheReport`)
+
+Only `exact` (the default) and `shadow` run. **Both generate exactly what the unannotated request generates**: the prompt
+is rendered and tokenised as a plain request (spec §5.3 item 7), the same dispatch runs (scheduler or generator), and the
+prompt cache is looked up with exact lineage only (Task 12: a snapshot's approximate rows are never restored, so
+`cached_tokens` / `timings.cache_n` keep meaning exact prefix reuse). The annotations only produce counts, and under
+`shadow` a plan. Pinned over HTTP on a synthetic model, blocking and streaming, on three prompt-cache configurations
+(single-slot prefix cache; the default paged KV + scheduler; paged + scheduler with the prefix trie wired in):
+`Exact_IsBitIdenticalToUnannotated`, `Exact_AfterShadow_SameSlot_Identical`, `CachedTokens_UnchangedByAnnotations`,
+`Exact_WithApproxSnapshotOnSlot_RestoresExactRowsOnly`. Note: `ServerStartup` builds the prefix trie but does not pass it
+to the scheduler, so the default paged path has no cross-request prefix reuse at all (`cached_tokens` 0, annotated or
+not); the tests wire it in to check warm-slot neutrality on the trie path too.
+
+- **Policies.** `balanced`, `fast` and `auto` parse and are served `exact` with `reason: "chunk_policy_unavailable"`
+  and that warning once (rulings 42; strict: 400) until applied reuse ships. On a model or backend that cannot assemble
+  chunks (recurrent or hybrid layers, a diffusion model, a backend other than CPU or Vulkan, a RoPE variant the
+  re-rotation does not reproduce, or a model whose identity cannot be computed) every annotation is ignored with
+  `chunk_model_unsupported` (strict: 400); `reason` carries it when the requested policy was not `exact` (ruling 41).
+  Diffusion models get no report.
+- **Per located span**, in prompt order, at most `MaxPlannedSpans` (1,024) per request:
+  1. ids = `ChunkTokenization.Encode(text)` (`EncodeRaw(MarkUntrustedSpecials(text))`, ruling 21);
+  2. fewer than `min_chunk_tokens` (default 32) ids: `chunk_ignored_too_short` (warning only);
+  3. **token check**: the span counts only if those ids occur in the whole-prompt ids exactly where its characters are.
+     A span the check finds different is `chunk_template_altered` (strict: 400): a span glued to the text before it where
+     the tokenizer merges across the edge, a SentencePiece leading-space piece on the span itself, a Qwen3 assistant span
+     holding a live `<think>` (`Span_TokenIdsDifferAtBoundary_NotCountedReusable`, `AssistantSpanWithThinkTag_VerifiedByIds`).
+     How: with a token boundary known at the end of the previous verified span, the glue up to the next span is encoded
+     alone and compared with the prompt's ids; a tokenizer that adds a leading piece to every encode (SentencePiece's
+     dummy space prefix) is handled by accepting the glue when everything after its first piece matches within two ids
+     of the boundary (`SentencePieceLeadingSpace_ManyValidSpans_AllVerified_StrictOk`: 150 spans, no prefix encode after
+     the first). Otherwise the prefix up to the span is encoded (as the prompt) and must be a prefix of the prompt's ids,
+     which proves or disproves a token boundary at the span start. Prefix encodes are capped at 4 × the prompt length
+     (+64 Ki chars). A span the check cannot place once that cap is spent, and every span past `MaxPlannedSpans`, is
+     ignored with **`chunk_verification_skipped`** (ruling 49: a warning only, never a strict error; never reported as
+     altered);
+  4. store lookup (`IChunkStore.Contains`, which reads at most the first 8 KiB of an entry: its header) under
+     `ChunkKey` of the server's identity (below), `isolated` positioning and the caller's namespace (server-assigned; the
+     default namespace until authentication exists). A store failure is a miss.
+- **Cost before generation.** All of this runs on the request thread before the scheduler queue or model gate, under
+  `exact` too (ruling 5 counts hits): up to 4 sentinel renders (locator), one extra whole-prompt encode, the glue and
+  span encodes (linear in the prompt), prefix encodes up to the cap above, and at most 1,024 store header reads
+  (`ManySpans_CappedAtMaxPlannedSpans_RestSkipped`). Concurrent annotated requests therefore compete with inference for
+  CPU; the prompt itself is already bounded by the context-length check.
+- **Identity.** `ServerModelIdentity`: content model id (`GgufIdentity.ModelId`, sampled), tokenizer id
+  (`GgufIdentity.TokenizerId`), quantisation label (`GgufIdentity.QuantizationLabel`, the helper the CLI's label must
+  use too), backend tag (`cpu` / `vulkan`; a Vulkan model with layers left on the CPU is still `vulkan`) and stored K/V
+  type F32, folded into the same fingerprint (`ChunkFingerprint.Compute`) the `chunkcache` CLI uses. A CLI-built entry is
+  a hit here and nothing else is (`ShadowKey_ChunkWithThinkTag_HitsStoreEntryFromCli`; `ServerIdentity_EqualsCliModelHandle`
+  pins model id, tokenizer id, label, fingerprint and producer against the CLI's own model handle). Computed once per
+  loaded model under a lock; a failure (unreadable or malformed GGUF) is cached as unsupported, never a 500.
+- **Where the server and a store silently disagree (always misses, never false hits).** The key covers every input that
+  changes K/V, so these give `miss` for every chunk with no warning:
+  - a store built with `chunkcache --strict-model-id` (full-file hash; the server always uses the sampled id);
+  - a server started with `--rope-*` overrides or another context configuration that changes the RoPE fields of the
+    fingerprint;
+  - a CPU-built store served on Vulkan, or the reverse (the backend tag is in the key and the entry header);
+  - a quantisation label of `unknown` on one side only.
+  To diagnose, compare the fingerprint inputs. The capabilities endpoint (next task) must expose them: `model.id`
+  (`GgufIdentity.ModelId`, and whether it is sampled or full), `model.tokenizer_id`, the quantisation label, the backend
+  tag, the K/V dtype (F32), `model.producer` (the producer hash, the key of the empty sequence in the caller's namespace,
+  which folds in the model fingerprint, RoPE parameters, schema version, backend, dtype and namespace) and the RoPE
+  parameters (`rope_dim`, `theta`, pairing) that enter the key.
+- **Strict mode.** Parser defects are returned before rendering. After it, the error is the first of the request-level
+  defects (`chunk_model_unsupported`, `chunk_policy_unavailable`, `chunk_store_unavailable`), else the span-level defect
+  of the span first in document order (ruling 4; locator and token-check defects alike). Warning-only codes
+  (`chunk_ignored_too_short`, `chunk_verification_skipped`) never become an error. OpenAI: the usual error body with
+  `code` (and `param: "chunk_cache"`); 400 `invalid_request_error`, or 503 `api_error` for `chunk_store_unavailable`.
+  Anthropic: the usual envelope with `error.code` (ruling 29; omitted on every other error).
+- **Never throws on request content.** An unexpected failure while planning ignores every annotation (the request is
+  served as plain) and logs only the exception type; reports and logs never carry chunk text, hashes or namespaces.
+
+### The response `chunk_cache` object (spec §5.9; contract rulings 5–10, 46–50)
+
+Written on annotated requests only (flag on), unless the request asked for `report: "none"` (`per_chunk` gives the
+summary for now: per-chunk reports need authentication, ruling 45). Where: the blocking response (both surfaces), the
+OpenAI streaming **finish-reason chunk**, the one that carries `timings` (ruling 47; dotLLM emits `usage` on a separate
+trailing `include_usage` chunk, which stays SDK-shaped), and the Anthropic `message_delta` event beside `usage` (whose
+fields are unchanged: no `cache_read_input_tokens`, rulings 40 and 46). Shapes match the contract fixtures
+(`Report_PartitionHolds`):
+
+> **Contract change (v1, ruling 46).** Ruling 9 originally had the Anthropic `message_delta` usage carry
+> `cache_read_input_tokens` (= `prefix_reused`). Ruling 40 (an annotated request's `usage` must equal the unannotated
+> one's, and dotLLM's Anthropic usage never carried the field) prevailed; ruling 46 amended ruling 9 and removed the field
+> from `response-anthropic-delta.json` in the contract folder itself (ChunkedkvCache `cdda32e`). Our copy of that
+> fixture, its `fixtures.sha256` line and the pinned list hash are a re-copy of the amended contract set (the client
+> tests on `dev` carry the same list hash since `b0728217`), not a local edit. `check.py` still accepts the field when
+> present, provided it equals `tokens.prefix_reused`.
+
+- `chunks`: `annotated = prefix + hit + miss + ignored`. `prefix`: a verified chunk wholly inside the exact prefix the
+  prompt cache restored. `hit` / `miss`: the store lookup, under `exact` too (ruling 5). `ignored`: everything else
+  (dropped by the parser, altered, too short, skipped by the verification budget, unsupported model).
+- `tokens`: nothing is applied in v1, so `prompt = prefix_reused + prefilled`, `prefix_reused` = `cached_tokens`
+  (exact rows), `prefix_reused_approx`, `chunk_reused`, `chunk_recomputed`, `encode_queued` are 0. `timings` gains
+  `chunk_n` and `chunk_recomputed_n`, present (0) on annotated requests only.
+- `shadow` adds `plan` (ruling 7) with its own partition: hits outside the prefix become `chunk_reused`, the first
+  ⌈budget × n⌉ rows of each are `chunk_recomputed` (`selector: "chunk_starts"`; `budget` 0.05 by default, or the
+  request's `chunk_cache.recompute.budget`, a number from 0 to 1, ruling 50; any other value is
+  `chunk_annotation_malformed` and the default applies), `predicted_ttft_ms` = assembly + recompute (µs per recomputed
+  row × visible key) + prefill of the rest, and `full_prefill_estimate_ms` as below. The constants are provisional
+  (`ChunkCache/chunk-cost-model.json`, embedded, with sources: Vulkan 16 µs per row × key from G2, CPU from E1); they
+  are a prediction, calibrated later.
+- `timings_ms`: `assembly`, `probe`, `recompute` 0; `prefill` measured; `full_prefill_estimate` is an **estimate** of the
+  unannotated request's prefill of the non-prefix rows (ruling 48): at this request's own measured prefill rate (v1
+  applies no chunk reuse, so that is the unannotated rate and the estimate equals `prefill`), or at the backend's
+  default rate when nothing was measured. A policy that applies reuse must never use its own measured rate here.
+- `warnings`: parser, locator and execution warnings merged per code with counts, in order of first occurrence
+  (ruling 38).
+
+### `/metrics`
+
+`dotllm_chunk_cache_chunks_total{status}` (`prefix`, `hit`, `miss`, `ignored`) and
+`dotllm_chunk_cache_tokens_total{kind}` (each key of `tokens`), counted for every annotated request (also with
+`report: "none"`). Labels carry no namespace, text or hash.
+
+### Packaging and dependencies
+
+`DotLLM.Server` references `DotLLM.ChunkReuse`, which brings `Microsoft.CodeAnalysis.CSharp` (Roslyn, for the symbol
+chunker) and `DotLLM.Vulkan` into the dependency graph of the server package and of the `dotllm` CLI. With the flag off
+the server never constructs the chunk-cache runtime (it is created on first use), so the store and key code is not
+reached; whether the CLR loads the `DotLLM.ChunkReuse` assembly at all with the flag off has not been measured. The
+opt-in AOT publish of `dotllm` (docs/AOT.md) has not been re-verified with this reference. Before upstreaming, the key,
+store, tokenisation and identity types are candidates for a small assembly without Roslyn or Vulkan.
 
 ## Pinned server behaviour (before the convention)
 

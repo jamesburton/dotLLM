@@ -69,10 +69,16 @@ internal static class ChunkCacheCodes
     public const string EncodeQueued = "chunk_encode_queued";
 
     /// <summary>
+    /// The server's token-verification budget ran out before this span could be checked (ruling 49): the span is ignored,
+    /// never a strict-mode error.
+    /// </summary>
+    public const string VerificationSkipped = "chunk_verification_skipped";
+
+    /// <summary>
     /// True for codes that never become a strict-mode error (spec §5.8 "warnings only").
     /// </summary>
     public static bool IsWarningOnly(string code) =>
-        code is IgnoredTooShort or EncodeSkipped or EncodeQueued;
+        code is IgnoredTooShort or EncodeSkipped or EncodeQueued or VerificationSkipped;
 
     /// <summary>
     /// The strict-mode error for a code: <c>503 api_error</c> for <see cref="StoreUnavailable"/>, else

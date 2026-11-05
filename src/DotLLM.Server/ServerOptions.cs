@@ -299,7 +299,7 @@ public sealed record ServerOptions
     public bool AllowLoraAdminApi { get; init; }
 
     /// <summary>
-    /// The <c>chunk_cache</c> wire convention (<c>--chunk-cache</c>, <c>--chunk-cache-max-chunks</c>; docs/CHUNK_CACHE.md).
+    /// The <c>chunk_cache</c> wire convention (<c>--chunk-cache</c>, <c>--chunk-cache-max-chunks</c>, <c>--chunk-store</c>; docs/CHUNK_CACHE.md).
     /// Off by default: annotations are then never read, and every body behaves as it did before the convention.
     /// </summary>
     public DotLLM.Server.ChunkCache.ChunkCacheOptions ChunkCache { get; init; } = DotLLM.Server.ChunkCache.ChunkCacheOptions.Disabled;
@@ -476,6 +476,7 @@ public sealed record ServerOptions
         int? promptCacheStepKeep = null;
         bool chunkCache = false;
         int? chunkCacheMaxChunks = null;
+        string? chunkStore = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -602,6 +603,8 @@ public sealed record ServerOptions
                     chunkCache = true; break;
                 case "--chunk-cache-max-chunks":
                     chunkCacheMaxChunks = int.Parse(next ?? throw new ArgumentException("--chunk-cache-max-chunks requires a count."), System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--chunk-store":
+                    chunkStore = next ?? throw new ArgumentException("--chunk-store requires a directory."); i++; break;
                 case "--max-messages":
                     maxMessagesCli = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 default:
@@ -676,7 +679,7 @@ public sealed record ServerOptions
             AllowModelAdminApi = allowModelAdmin,
             Metrics = metrics,
             AllowLoraAdminApi = allowLoraAdmin,
-            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(chunkCache, chunkCacheMaxChunks),
+            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(chunkCache, chunkCacheMaxChunks, chunkStore),
             MaxMessages = ResolveMaxMessages(maxMessagesCli, Environment.GetEnvironmentVariable(MaxMessagesEnvVar)),
             ModelId = modelId,
             RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,
