@@ -146,6 +146,7 @@ Name mapping: dots become underscores, a unit suffix is appended unless the name
 | `dotllm_engine_request_queue_depth`, `dotllm_engine_kvcache_utilization` | gauge | none (`-1` = provider not wired) |
 | `dotllm_server_ready`, `dotllm_model_info{model=...}` | gauge | none / `model` |
 | `dotllm_moe_*` | counter / gauge | none |
+| `dotllm_chunk_cache_chunks_total`, `dotllm_chunk_cache_tokens_total` | counter | `status` / `kind` (only with `--chunk-cache`, annotated requests; [CHUNK_CACHE.md](CHUNK_CACHE.md)) |
 
 Both generation paths record the per-request series: `TextGenerator` through `TelemetryRecorder` and the
 continuous-batch scheduler at request completion (`EngineTelemetry.RecordCompletion`).

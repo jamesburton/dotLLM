@@ -91,6 +91,15 @@ public sealed record AnthropicMessagesRequest
     public string? ReasoningFormat { get; init; }
 
     /// <summary>
+    /// dotLLM extension: the <c>chunk_cache</c> annotation manifest (<c>docs/CHUNK_CACHE.md</c>), kept raw. Read only
+    /// with <c>--chunk-cache</c> on; otherwise ignored like any unknown field. Inline <c>chunk</c> annotations stay in
+    /// <see cref="AnthropicMessageDto.Content"/>.
+    /// </summary>
+    [JsonPropertyName("chunk_cache")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? ChunkCache { get; init; }
+
+    /// <summary>
     /// <c>true</c> when the request enabled extended thinking, <c>false</c> when it disabled it, null when
     /// it said nothing (the template default applies).
     /// </summary>
@@ -181,6 +190,11 @@ public sealed record AnthropicMessageResponse
 
     [JsonPropertyName("usage")]
     public required AnthropicUsageDto Usage { get; init; }
+
+    /// <summary>The <c>chunk_cache</c> report (docs/CHUNK_CACHE.md); only with <c>--chunk-cache</c> on and an annotated request.</summary>
+    [JsonPropertyName("chunk_cache")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ChunkCacheReportDto? ChunkCache { get; init; }
 }
 
 /// <summary>
@@ -253,6 +267,11 @@ public sealed record AnthropicErrorBody
 
     [JsonPropertyName("message")]
     public required string Message { get; init; }
+
+    /// <summary>A machine-readable code (an extension field, ruling 29: <c>chunk_*</c> strict errors); absent otherwise.</summary>
+    [JsonPropertyName("code")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Code { get; init; }
 }
 
 // --- Streaming events -------------------------------------------------------
@@ -344,6 +363,11 @@ public sealed record AnthropicMessageDeltaEvent
 
     [JsonPropertyName("usage")]
     public required AnthropicUsageDto Usage { get; init; }
+
+    /// <summary>The <c>chunk_cache</c> report (docs/CHUNK_CACHE.md); only with <c>--chunk-cache</c> on and an annotated request.</summary>
+    [JsonPropertyName("chunk_cache")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ChunkCacheReportDto? ChunkCache { get; init; }
 }
 
 /// <summary>Delta body of a <c>message_delta</c> event.</summary>

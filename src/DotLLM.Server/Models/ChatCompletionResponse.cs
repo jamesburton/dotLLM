@@ -29,6 +29,11 @@ public sealed record ChatCompletionResponse
     [JsonPropertyName("timings")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public TimingsDto? Timings { get; init; }
+
+    /// <summary>The <c>chunk_cache</c> report (docs/CHUNK_CACHE.md); only with <c>--chunk-cache</c> on and an annotated request.</summary>
+    [JsonPropertyName("chunk_cache")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ChunkCacheReportDto? ChunkCache { get; init; }
 }
 
 /// <summary>

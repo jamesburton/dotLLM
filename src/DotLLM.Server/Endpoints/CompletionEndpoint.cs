@@ -92,7 +92,7 @@ public static class CompletionEndpoint
         {
             // (#1266) Same routing as the non-streaming path: on the scheduler, with no gate or model lease.
             await WriteCompletionStreamAsync(httpContext,
-                ServerState.SchedulerStream(scheduler, httpContext, state.Tokenizer!.Encode(request.Prompt), options),
+                ServerState.SchedulerStream(state, scheduler, httpContext, state.Tokenizer!.Encode(request.Prompt), options),
                 ServerState.WithoutGate,
                 requestId, modelId, request.WantsUsageChunk, ct, state.KeepAliveInterval);
         }
@@ -138,7 +138,7 @@ public static class CompletionEndpoint
                     ? k as string
                     : null,
             };
-            result = await scheduler.EnqueueAsync(inferenceRequest, ct);
+            result = await state.EnqueueTrackedAsync(scheduler, inferenceRequest, ct);
         }
         else
         {

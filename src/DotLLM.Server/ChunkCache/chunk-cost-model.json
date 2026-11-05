@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "note": "Provisional defaults for the chunk_cache shadow plan, measured on Qwen3-4B (F32 K/V) on one AMD Strix Halo box. Calibrated per model and kernel later; a prediction, never a promise.",
+  "backends": {
+    "vulkan": {
+      "us_per_row_key": 16.0,
+      "assembly_ms_per_ktokens": 14.3,
+      "prefill_tokens_per_sec": 1400.0,
+      "source": "G2 (ATTN_QPOS selective recompute: 13-19 us per recomputed row x visible key, whole forward); G1 (device-copy assembly ~70,000 tok/s; full prefill ~10x the CPU)"
+    },
+    "cpu": {
+      "us_per_row_key": 0.9,
+      "assembly_ms_per_ktokens": 111.0,
+      "prefill_tokens_per_sec": 140.0,
+      "source": "E1 (CPU chunk encode / prefill ~140 tok/s, host assembly ~9,000 tok/s); per row-key cost derived from one ~7 ms row forward at ~8K visible keys"
+    }
+  }
+}

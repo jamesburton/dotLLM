@@ -1,0 +1,59 @@
+{
+  "id": "chatcmpl-0001",
+  "object": "chat.completion",
+  "created": 1793577600,
+  "model": "qwen3-4b",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "The loop drops entries whose hash is not in `seen`."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 4210,
+    "completion_tokens": 96,
+    "total_tokens": 4306,
+    "prompt_tokens_details": {
+      "cached_tokens": 1800
+    }
+  },
+  "timings": {
+    "cache_n": 1800,
+    "chunk_n": 0,
+    "chunk_recomputed_n": 0
+  },
+  "chunk_cache": {
+    "v": 1,
+    "policy_requested": "exact",
+    "policy_applied": "exact",
+    "reason": null,
+    "chunks": {
+      "annotated": 2,
+      "prefix": 1,
+      "hit": 0,
+      "miss": 1,
+      "ignored": 0
+    },
+    "tokens": {
+      "prompt": 4210,
+      "prefix_reused": 1800,
+      "prefix_reused_approx": 0,
+      "chunk_reused": 0,
+      "chunk_recomputed": 0,
+      "prefilled": 2410,
+      "encode_queued": 0
+    },
+    "timings_ms": {
+      "assembly": 0,
+      "probe": 0,
+      "recompute": 0,
+      "prefill": 640,
+      "full_prefill_estimate": 1500
+    },
+    "warnings": []
+  }
+}

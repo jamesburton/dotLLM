@@ -221,7 +221,7 @@ public static class SystemOneEndpoint
                 Options = options,
                 ApiKey = httpContext.Items.TryGetValue(RateLimitMiddleware.ApiKeyItemKey, out var k) ? k as string : null,
             };
-            return await scheduler.EnqueueAsync(inferenceRequest, ct);
+            return await state.EnqueueTrackedAsync(scheduler, inferenceRequest, ct);
         }
 
         InferenceResponse? result = null;

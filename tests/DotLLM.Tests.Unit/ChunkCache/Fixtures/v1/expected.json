@@ -1,0 +1,119 @@
+{
+  "_comment": "Maps each request fixture to the parse result a conforming server must produce with --chunk-cache on: non-strict warnings (code, count), the strict-mode error (status, type, code), the ids of the spans that stay annotated, and the defective spans (index into the annotations in document order, inline first then manifest) with the defect kind. Hits, misses and token counts depend on server state and are not pinned here. For overlapping spans the LATER span in manifest order is the one dropped.",
+  "convention": 1,
+  "requests": {
+    "inline.json": {
+      "warnings": [],
+      "strict_error": null,
+      "accepted_ids": [
+        "src/Store/ChunkIndex.cs:365-412@14211",
+        "src/Store/ChunkRef.cs:1-40@0"
+      ]
+    },
+    "manifest.json": {
+      "warnings": [],
+      "strict_error": null,
+      "accepted_ids": [
+        "src/Store/ChunkIndex.cs:365-412@14211",
+        "src/Store/ChunkRef.cs:1-40@0"
+      ]
+    },
+    "conflict.json": {
+      "warnings": [
+        {
+          "code": "chunk_manifest_conflict",
+          "count": 1
+        }
+      ],
+      "strict_error": {
+        "status": 400,
+        "type": "invalid_request_error",
+        "code": "chunk_manifest_conflict"
+      },
+      "accepted_ids": []
+    },
+    "nonascii-crlf.json": {
+      "warnings": [],
+      "strict_error": null,
+      "accepted_ids": [
+        "docs/notes-fr.md:1-12@0",
+        "src/Win/Math.cs:1-14@0"
+      ],
+      "raw_contains": [
+        "\\u00e9",
+        "\\ud83d\\ude00",
+        "\\r\\n"
+      ],
+      "utf16_discriminating_chunks": [
+        0
+      ],
+      "lf_variant": {
+        "chunk": 1,
+        "lf_hash": "sha256:eb4614e1b9a8f6e0607f8553bf2fc988a37f1dc5c765e9fda0d924469661264c"
+      }
+    },
+    "bad-span.json": {
+      "warnings": [
+        {
+          "code": "chunk_span_invalid",
+          "count": 4
+        }
+      ],
+      "strict_error": {
+        "status": 400,
+        "type": "invalid_request_error",
+        "code": "chunk_span_invalid"
+      },
+      "accepted_ids": [
+        "src/Store/ChunkRef.cs:1-40@0"
+      ],
+      "defects": [
+        {
+          "chunk": 1,
+          "kind": "overlap"
+        },
+        {
+          "chunk": 2,
+          "kind": "multibyte_boundary"
+        },
+        {
+          "chunk": 3,
+          "kind": "part_out_of_range"
+        },
+        {
+          "chunk": 4,
+          "kind": "non_text"
+        }
+      ]
+    },
+    "hash-mismatch.json": {
+      "warnings": [
+        {
+          "code": "chunk_hash_mismatch",
+          "count": 1
+        }
+      ],
+      "strict_error": {
+        "status": 400,
+        "type": "invalid_request_error",
+        "code": "chunk_hash_mismatch"
+      },
+      "accepted_ids": [
+        "src/Store/ChunkIndex.cs:365-412@14211"
+      ],
+      "defects": [
+        {
+          "chunk": 1,
+          "kind": "hash_mismatch"
+        }
+      ]
+    }
+  },
+  "responses": [
+    "response-blocking.json",
+    "response-stream-final.json",
+    "response-anthropic-delta.json",
+    "response-shadow.json"
+  ],
+  "capabilities": "capabilities.json"
+}
