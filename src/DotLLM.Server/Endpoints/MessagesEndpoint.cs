@@ -54,8 +54,7 @@ public static class MessagesEndpoint
     {
         if (!ChunkAnnotationParser.HasAnnotation(request))
             return null;
-        state.ChunkCacheRuntime.CountInferenceCallerResolution();
-        var caller = ChunkCacheAuth.ForInference(httpContext, state.Options.ChunkCache);
+        var caller = ChunkCacheAuth.ForInference(httpContext, state);
         return ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, caller.Namespace), caller);
     }
 

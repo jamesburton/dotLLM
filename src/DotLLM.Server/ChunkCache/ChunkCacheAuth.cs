@@ -115,9 +115,15 @@ internal static class ChunkCacheAuth
 
     /// <summary>The caller of an annotated inference request: never refused, <see cref="ChunkCaller.Anonymous"/> when the control plane would refuse it.</summary>
     /// <param name="context">The request.</param>
-    /// <param name="options">The server's chunk-cache options.</param>
+    /// <param name="state">The server state (its chunk-cache options; the resolution is counted on its runtime).</param>
     /// <returns>The caller.</returns>
-    public static ChunkCaller ForInference(HttpContext context, ChunkCacheOptions options) => Resolve(context, options, out _);
+    /// <remarks>Call only for an annotated request: this looks the key up and hashes it.</remarks>
+    public static ChunkCaller ForInference(HttpContext context, ServerState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        state.ChunkCacheRuntime.CountInferenceCallerResolution();
+        return Resolve(context, state.Options.ChunkCache, out _);
+    }
 
     /// <summary>Writes the 401 or 403 for <paramref name="failure"/> (OpenAI-shaped envelope, as the other endpoints).</summary>
     /// <param name="context">The request.</param>
