@@ -166,7 +166,9 @@ public sealed unsafe class TernaryZeroMulProbe
                 double s = 0; for (int i = 0; i < k; i++) s += (double)tmp[i] * x[i];
                 truth[r] = s;
             }
-            MatMul.GemvPQ2_0(wp, xp, a, m, k, null);
+            // The Q8_0 W2A8 tier (GemvPQ2_0 itself dispatches to planar by default since #1620); without SSSE3 the dispatcher's float tier.
+            if (global::System.Runtime.Intrinsics.X86.Ssse3.IsSupported) MatMul.GemmPQ2_0W2A8ForTest(wp, xp, a, m, k, 1);
+            else MatMul.GemvPQ2_0(wp, xp, a, m, k, null);
             MatMul.GemvPQ2_0Planar(wp, xp, b, m, k, null);
         }
         // Portable fallback (what runs when AVX2 is disabled): same activations/grid, scalar accumulation.
