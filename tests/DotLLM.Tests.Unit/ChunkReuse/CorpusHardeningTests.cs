@@ -65,8 +65,10 @@ public sealed class CorpusHardeningTests : IDisposable
     }
 
     /// <summary>
-    /// Nesting that is not brackets (a chain of prefix operators) passes the bracket cap but still recurses in Roslyn's parser:
-    /// the dedicated large-stack thread is what keeps it alive. The intact method still gets its own chunk (Roslyn ran).
+    /// Nesting that is not brackets (a chain of prefix operators) passes the bracket cap but still recurses in Roslyn's parser.
+    /// Roslyn guards this path itself (on a default-size thread it gives up with an insufficient-stack error and the
+    /// compilation loses type <c>C</c> — measured by running this test with the parse thread's stack size set to the default);
+    /// on the large-stack thread the parse completes. The intact method still gets its own chunk (Roslyn ran).
     /// </summary>
     [Fact]
     public void SymbolChunker_DeepUnaryChain_UnderTheBracketCap_ParsedOnTheLargeStack()
@@ -81,7 +83,7 @@ public sealed class CorpusHardeningTests : IDisposable
         Assert.NotNull(compilation.GetTypeByMetadataName("C"));
     }
 
-    /// <summary>Deep enough to overflow a default thread stack in Roslyn's parser (measured: see the PR).</summary>
+    /// <summary>Deep enough that Roslyn gives up on a default-size thread stack.</summary>
     internal const int DeepUnaryDepth = 50_000;
 
     // ---------------------------------------------------------------------------------------------------------------
