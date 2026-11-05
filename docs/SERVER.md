@@ -67,7 +67,11 @@ annotations are validated and run under `exact` (default) or `shadow`: the outpu
 request, and the response gains a `chunk_cache` report (blocking response; the finish-reason chunk when streaming) and
 `timings.chunk_n` / `chunk_recomputed_n` (0). `balanced` / `fast` / `auto` are served `exact` with a reason. With the
 flag off it is ignored like any unknown field, so an annotated body behaves byte for byte like the plain one. On this surface a span
-addresses a message's string `content` through the manifest; array `content` stays a 400. See
+addresses a message's string `content` through the manifest; array `content` stays a 400. Store lookups use the caller's
+server-assigned namespace (its `--chunk-cache-api-keys` key, or the default for a local caller); a caller the chunk-cache
+control plane would refuse is still served, but with no store lookups, and `report: "per_chunk"` adds per-chunk status
+only for an authenticated caller ([Chunk-cache authentication](#chunk-cache-authentication-opt-in)). The control plane,
+`GET /v1/chunk-cache` (capabilities) and `POST /v1/chunk-cache/explain` (dry run), exists only with the flag. See
 [CHUNK_CACHE.md](CHUNK_CACHE.md).
 
 Also accepted (not shown above): `top_k`, `min_p`, `repetition_penalty` — see [SAMPLING.md](SAMPLING.md)
@@ -1213,6 +1217,8 @@ Prompt caching is **enabled by default** in both `chat` and `serve` commands.
 | `--chunk-cache` | off | Honour `chunk_cache` annotations on `/v1/chat/completions` and `/v1/messages` (chunk-level K/V reuse convention): `exact` (default) and `shadow`, output identical to the unannotated request, plus a `chunk_cache` report and `/metrics` counters (`dotllm_chunk_cache_chunks_total`, `dotllm_chunk_cache_tokens_total`). Off: annotations are ignored like any unknown field ([CHUNK_CACHE.md](CHUNK_CACHE.md)) |
 | `--chunk-cache-max-chunks` | 4096 | Most chunk annotations read per request (1 to 65536); the rest are dropped with `chunk_too_many` without being read |
 | `--chunk-store` | none | With `--chunk-cache` (rejected without it): a chunk store (e.g. from `chunkcache build`) to look annotated chunks up in. Read-only (never written or created); a relative path is resolved at startup; a missing directory is reported as `chunk_store_unavailable` |
+| `--chunk-cache-allow-short-keys` | off | With `--chunk-cache-api-keys`: accept keys shorter than 32 characters (a startup warning each) instead of refusing to start |
+| `--chunk-cache-api-keys` | none | With `--chunk-cache` (rejected without it): a file of API keys for the chunk-cache surface (`GET /v1/chunk-cache`, `POST /v1/chunk-cache/explain`), one per line (`<key> [admin] [ns=<namespace>]`, `#` comments), keys of at least 32 characters. Each key gets its own store namespace unless `ns=` names one. Read once at startup (revoke = restart). Without it only local callers may use that surface. **Security-sensitive** opt-in: see [Security](#chunk-cache-authentication-opt-in) and [CHUNK_CACHE.md](CHUNK_CACHE.md#authentication-and-namespaces) |
 
 ### API
 
@@ -1368,7 +1374,9 @@ SSE endpoints start the response on their first flush, and headers cannot be add
 
 ### What gets metered
 
-**Everything under `/v1/` is metered unless it is explicitly exempt.** The exemptions are
+**Everything under `/v1/` is metered unless it is explicitly exempt** (`/v1/chunk-cache/*` is deliberately metered when
+rate limiting is on: its prewarm queues GPU and disk work, spec §10; buckets are keyed by the presented key string, so a
+random key per request gets a fresh bucket, which on that surface only reaches the cheap 401). The exemptions are
 `/v1/models`, `/v1/lora`, `/v1/prompt-cache`, `/v1/cache`, `/v1/config`, `/v1/tokenize` and
 `/v1/detokenize` (matched on segment boundaries, so `/v1/models/{id}` is covered by
 `/v1/models`). One known inexactness: `POST /v1/prompt-cache/{id}` *does* prefill through the
@@ -1429,6 +1437,31 @@ The server binds to `localhost` by default. To expose externally, pass `--host 0
 ### Authentication
 
 No built-in auth. For network-exposed deployments, configure your reverse proxy to require `Authorization: Bearer <key>` headers.
+
+### Chunk-cache authentication (opt-in)
+
+The one exception, and only for the chunk-cache control plane (`GET /v1/chunk-cache`, `POST /v1/chunk-cache/explain`;
+both exist only with `--chunk-cache`): a per-chunk store answer is a membership probe on cached source text, so that
+surface authenticates even though nothing else does. **Security-sensitive; off unless `--chunk-cache` is given.**
+
+- `--chunk-cache-api-keys <file>`: the request must carry a listed key in `X-API-Key` or `Authorization: Bearer`
+  (else `401 authentication_error`). Keys must be 32+ characters (generate them: 32 random bytes, base64url) unless
+  `--chunk-cache-allow-short-keys`; they are compared in constant time; each key's store namespace is derived from it
+  or named with `ns=`. Keys, their digests and namespaces never appear in responses or logs (namespaces do appear in
+  the store's file names). The file is read once: revoking a key needs a restart.
+- Control-plane POSTs must be `application/json` (else 415) and `Sec-Fetch-Site: cross-site` is refused (403), so a web
+  page cannot drive the surface. Explain is capped at 2 concurrent calls (429), 4 MiB bodies (413) and a 10 s body read, taken before a slot (408).
+- Namespace isolation covers the chunk store only: the prompt (prefix) cache, `cached_tokens` and `/metrics` are shared
+  by every caller, as they always were.
+- Without a keys file: local callers only (loopback remote address, a `localhost` / loopback `Host`, no `Origin`
+  header), else `403 permission_error`. The `Origin` and `Host` checks stop a web page (the CORS policy allows any origin,
+  and DNS rebinding reaches loopback under a foreign host name) from reading a local caller's chunk status. **"Local"
+  still admits every process on the machine (an SSRF-able service too), and behind a reverse proxy on the same host
+  every caller looks local: configure keys in both cases.**
+- Inference endpoints stay unauthenticated either way; an annotated inference request from a caller the control plane
+  would refuse is served normally, but its chunks are never looked up in the store and it gets counts only.
+
+Details, the key file format and the namespace derivation's limits: [CHUNK_CACHE.md](CHUNK_CACHE.md#authentication-and-namespaces).
 
 ### CORS
 

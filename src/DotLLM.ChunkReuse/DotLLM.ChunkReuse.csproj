@@ -17,6 +17,7 @@
   <ItemGroup>
     <!-- FileChunkStore.BeforeRenameForTest: lets tests hold the destination open between write and rename. -->
     <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
+    <InternalsVisibleTo Include="DotLLM.ChunkReuse.CSharp" />
   </ItemGroup>
 
 </Project>

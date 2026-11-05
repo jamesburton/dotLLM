@@ -89,8 +89,17 @@ public static class ModelLoader
             // glm4moe (#1599): CPU forward on the shared TransformerModel (GQA + QKV bias, partial NeoX RoPE, dense layer 0, sigmoid + exp_probs_b MoE
             // with an ungated shared expert, banks kept in the raw quant view). No NextN/MTP yet; GPU backends still refuse.
             Architecture.Glm4Moe => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            // ricursive (#1643): census first (a wrong or mixed value-residual name / unknown tensor fails as invalid data), then refuse:
+            // there is no forward pass yet (CPU #1644).
+            Architecture.Ricursive => RefuseRicursive(gguf, config),
             _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
         };
+    }
+
+    private static IModel RefuseRicursive(GgufFile gguf, ModelConfig config)
+    {
+        RicursiveTensorCensus.Check(config, gguf).ThrowIfNotClean("This GGUF");
+        throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("CPU"));
     }
 
     /// <summary>
@@ -189,6 +198,7 @@ public static class ModelLoader
                     => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded, i2sCache),
                 Architecture.Mamba3
                     => Mamba3TransformerModel.LoadFromSafetensors(source, config),
+                Architecture.Ricursive => throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("CPU (safetensors)")),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
                     + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, Granite, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, Gemma3n, DiffusionGemma, BitNet, Mamba3."),

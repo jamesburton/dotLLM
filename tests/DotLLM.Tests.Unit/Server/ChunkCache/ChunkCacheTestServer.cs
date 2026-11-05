@@ -5,6 +5,7 @@ using DotLLM.Server.ChunkCache;
 using DotLLM.Tests.Unit.ChunkReuse;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Server.ChunkCache;
@@ -59,7 +60,10 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
     /// <param name="chunkCache">The chunk-cache options (flag on or off, store).</param>
     /// <param name="paged">True: the default paged KV with the scheduler, which <c>ServerStartup</c> gives the cross-request
     /// prefix trie (#1596); false: the single-slot prefix cache.</param>
-    public static async Task<ChunkCacheTestServer> StartAsync(string modelPath, ChunkCacheOptions chunkCache, bool paged = true)
+    /// <param name="configure">Runs on the app before the endpoints are mapped (test middleware: a remote address, the rate limiter).</param>
+    /// <param name="logs">Receives the host's <c>ILogger</c> output (every level).</param>
+    public static async Task<ChunkCacheTestServer> StartAsync(string modelPath, ChunkCacheOptions chunkCache, bool paged = true,
+        Action<WebApplication>? configure = null, Microsoft.Extensions.Logging.ILoggerProvider? logs = null)
     {
         var options = new ServerOptions
         {
@@ -75,7 +79,13 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
         var builder = WebApplication.CreateSlimBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Services.AddDotLLM(state);
+        if (logs is not null)
+        {
+            builder.Logging.AddProvider(logs);
+            builder.Logging.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Trace);
+        }
         var app = builder.Build();
+        configure?.Invoke(app);
         app.MapDotLLMEndpoints(serveUi: false);
         await app.StartAsync();
         state.StartSchedulerLoop(); // as ServerStartup does once the host runs (paged: the scheduler serves every request)
@@ -91,6 +101,19 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
     }
 
     public async Task<string> GetAsync(string path) => await Http.GetStringAsync(path);
+
+    /// <summary>Sends a request with extra headers (e.g. <c>X-API-Key</c>); <paramref name="body"/> null sends none.</summary>
+    public async Task<(int Status, string Body)> SendAsync(HttpMethod method, string path, string? body, params (string Name, string Value)[] headers)
+    {
+        using var request = new HttpRequestMessage(method, path);
+        if (body is not null)
+            request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+        request.Headers.Add("anthropic-version", "2023-06-01");
+        foreach (var (name, value) in headers)
+            request.Headers.TryAddWithoutValidation(name, value);
+        using var resp = await Http.SendAsync(request);
+        return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync());
+    }
 
     public async ValueTask DisposeAsync()
     {

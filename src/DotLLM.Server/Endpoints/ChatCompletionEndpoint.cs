@@ -55,9 +55,10 @@ public static class ChatCompletionEndpoint
         }
 
         // chunk_cache (docs/CHUNK_CACHE.md): with --chunk-cache on and an annotated body only; otherwise null and nothing
-        // below changes. The namespace is server-assigned (the default until authentication exists).
+        // below changes. The namespace is server-assigned (ChunkCacheAuth: the caller's API key's namespace, or the default for
+        // a local caller); an unauthenticated caller is served normally but its chunks are never looked up.
         var chunkCache = state.Options.ChunkCache.Enabled
-            ? ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, ChunkCacheWire.DefaultNamespace))
+            ? BeginChunkCache(request, state, httpContext)
             : null;
         if (chunkCache?.Parsed.Error is { } chunkParseError)
         {
@@ -104,26 +105,12 @@ public static class ChatCompletionEndpoint
             return;
         }
 
-        // Convert DTOs to engine types
-        var engineMessages = RequestConverter.ToMessages(request.Messages);
-        var messages = ProfileSystemPrompt.Apply(state.ActiveProfile?.System, engineMessages.ToArray());
-        var tools = RequestConverter.ToTools(request.Tools);
-        var toolChoice = RequestConverter.ParseToolChoice(request.ToolChoice);
-
-        // (#767) Reasoning switches go into the template render. Whether decoding will be constrained
-        // (response_format / grammar / forced tool_choice) is decided BEFORE rendering: a constraint cannot
-        // coexist with an open <think> block, so such requests default thinking off.
-        var parsedResponseFormat = RequestConverter.ParseResponseFormat(request.ResponseFormat);
-        bool constrained = parsedResponseFormat is not (null or DotLLM.Core.Configuration.ResponseFormat.Text)
-            || ReasoningSupport.ToolChoiceConstrains(toolChoice, tools, state.ToolCallParser);
-        var templateOptions = ReasoningSupport.BuildTemplateOptions(
-            tools, request.EnableThinking, request.ReasoningEffort, request.ChatTemplateKwargs, constrained);
-        if (!ReasoningSupport.TryApply(state.ChatTemplate, messages, templateOptions,
-                out string prompt, out string? templateError, out string? templateParam))
+        if (!TryRender(request, state, out var rendered, out string? templateError, out string? templateParam))
         {
             await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(templateError!, param: templateParam), keepAlive);
             return;
         }
+        var (engineMessages, messages, tools, toolChoice, constrained, templateOptions, prompt) = rendered;
         var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError, state.ChatTemplate);
         if (planError is not null)
         {
@@ -208,6 +195,57 @@ public static class ChatCompletionEndpoint
         else
             await HandleNonStreamingAsync(request, state, httpContext, prompt, options,
                 requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, chunkCache);
+    }
+
+    /// <summary>A chat request rendered for the model: what generation and the chunk cache both work from.</summary>
+    /// <param name="EngineMessages">The converter's messages (before a profile system prompt).</param>
+    /// <param name="Messages">The messages exactly as rendered (profile system prompt prepended when active).</param>
+    /// <param name="Tools">The request's tools.</param>
+    /// <param name="ToolChoice">The parsed <c>tool_choice</c>.</param>
+    /// <param name="Constrained">Whether decoding will be constrained (decided before the render, #767).</param>
+    /// <param name="TemplateOptions">The template options of the render.</param>
+    /// <param name="Prompt">The rendered prompt.</param>
+    internal sealed record RenderedChat(ChatMessage[] EngineMessages, ChatMessage[] Messages, ToolDefinition[]? Tools,
+        DotLLM.Core.Configuration.ToolChoice ToolChoice, bool Constrained, ChatTemplateOptions TemplateOptions, string Prompt);
+
+    /// <summary>
+    /// Converts and renders a chat request exactly as <c>/v1/chat/completions</c> does (shared with
+    /// <c>POST /v1/chunk-cache/explain</c>, so explain sees the prompt generation would see).
+    /// </summary>
+    /// <returns>False with the template error (400) when the template refuses the request.</returns>
+    internal static bool TryRender(ChatCompletionRequest request, ServerState state, out RenderedChat rendered,
+        out string? templateError, out string? templateParam)
+    {
+        // Convert DTOs to engine types
+        var engineMessages = RequestConverter.ToMessages(request.Messages);
+        var messages = ProfileSystemPrompt.Apply(state.ActiveProfile?.System, engineMessages.ToArray());
+        var tools = RequestConverter.ToTools(request.Tools);
+        var toolChoice = RequestConverter.ParseToolChoice(request.ToolChoice);
+
+        // (#767) Reasoning switches go into the template render. Whether decoding will be constrained
+        // (response_format / grammar / forced tool_choice) is decided BEFORE rendering: a constraint cannot
+        // coexist with an open <think> block, so such requests default thinking off.
+        var parsedResponseFormat = RequestConverter.ParseResponseFormat(request.ResponseFormat);
+        bool constrained = parsedResponseFormat is not (null or DotLLM.Core.Configuration.ResponseFormat.Text)
+            || ReasoningSupport.ToolChoiceConstrains(toolChoice, tools, state.ToolCallParser);
+        var templateOptions = ReasoningSupport.BuildTemplateOptions(
+            tools, request.EnableThinking, request.ReasoningEffort, request.ChatTemplateKwargs, constrained);
+        bool ok = ReasoningSupport.TryApply(state.ChatTemplate!, messages, templateOptions,
+            out string prompt, out templateError, out templateParam);
+        rendered = new RenderedChat(engineMessages, messages, tools, toolChoice, constrained, templateOptions, prompt);
+        return ok;
+    }
+
+    /// <summary>
+    /// Parses the request's annotations in the caller's namespace (flag on only). The caller is resolved (key lookup, SHA-256
+    /// of the presented key) only once an annotation is found: an unannotated request pays nothing.
+    /// </summary>
+    private static ChunkCacheExchange? BeginChunkCache(ChatCompletionRequest request, ServerState state, HttpContext httpContext)
+    {
+        if (!ChunkAnnotationParser.HasAnnotation(request))
+            return null;
+        var caller = ChunkCacheAuth.ForInference(httpContext, state);
+        return ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, caller.Namespace), caller);
     }
 
     /// <summary>A strict <c>chunk_cache</c> error: 400 <c>invalid_request_error</c> or 503 <c>api_error</c>, with its code.</summary>

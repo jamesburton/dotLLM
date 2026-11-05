@@ -13,8 +13,10 @@ request and response is what it was before the convention, for any body.
 | `--chunk-cache` | off | honour `chunk_cache` annotations on `/v1/chat/completions` and `/v1/messages`: policies `exact` (default) and `shadow`, whose output is identical to the unannotated request, plus a `chunk_cache` report in the response (below). Off: the annotations are never read; the body behaves exactly as without them (pinned over HTTP by `ChunkCacheFlagHttpTests` and `FlagOff_AnnotatedBodies_AnsweredLikePlain_EverySurface`, blocking and streaming, both surfaces) |
 | `--chunk-cache-max-chunks <n>` | 4096 | most annotations read per request (1 to 65536, so the per-request parse work stays bounded); the rest are counted from the array length and dropped with `chunk_too_many` without being read |
 | `--chunk-store <dir>` | none | the chunk store (e.g. built by `chunkcache build` from the same GGUF, without `--strict-model-id`) the server looks annotated chunks up in. **Read-only**: the server never writes, encodes into or creates it (the sole-writer encode path, its budget and admission rules come with a later task). Needs `--chunk-cache` (rejected without it); a relative path is resolved at startup. No store: every verified chunk is a miss, no warning. A configured root that does not exist: misses plus `chunk_store_unavailable` (strict: 503) |
+| `--chunk-cache-api-keys <file>` | none | the API keys of the chunk-cache surface (below, [Authentication and namespaces](#authentication-and-namespaces)): `<key> [admin] [ns=<namespace>]` per line, keys of at least 32 characters; each key is its own store namespace unless `ns=` names one. Needs `--chunk-cache`. Unset: the control plane answers local callers only, all in the default namespace. Read once at startup (revoking a key = restart). **Security-sensitive** |
+| `--chunk-cache-allow-short-keys` | off | accept keys shorter than 32 characters, each with a startup warning (otherwise they refuse startup). Needs `--chunk-cache-api-keys` |
 
-All three exist on `dotllm serve` and on `ServerOptions.Parse` (`ServerOptions.ChunkCache`).
+All five exist on `dotllm serve` and on `ServerOptions.Parse` (`ServerOptions.ChunkCache`).
 
 ## Request parsing (`ChunkAnnotationParser`)
 
@@ -93,8 +95,8 @@ before any entry is read; each annotated part is encoded to UTF-8 once per reque
 request's own text (4,096 whole-part spans on a 4 MiB part hash once: `CostBound_*` tests). An unannotated Anthropic
 request is detected by a pre-scan and never converted twice.
 
-**`report: per_chunk`** is accepted from any caller here; restricting it to an authenticated caller in its own
-namespace (§10) is the authentication task's job.
+**`report: per_chunk`** is accepted from any caller by the parser; the response carries per-chunk status only for an
+authenticated caller, in its own namespace (see [Authentication and namespaces](#authentication-and-namespaces)).
 
 Request options: `policy` (`exact` default; `balanced` / `fast` / `auto` parse to their own values and are degraded
 later), `strict`, `report` (`summary` default), `min_chunk_tokens` (32), `on_miss` (`prefill`), `query` (`{text}` or
@@ -102,7 +104,8 @@ later), `strict`, `report` (`summary` default), `min_chunk_tokens` (32), `on_mis
 A valid `query.message` that points at a message with no text parts (e.g. an assistant turn with only tool calls) gives
 an empty query and no warning (ruling 34 asks only for the index of a request message).
 **Namespace.** The store namespace is always server-assigned: the parser takes the caller's namespace as a
-**required** argument (the API key's namespace once authentication exists; until then callers pass the default, `""`).
+**required** argument, from `ChunkCacheAuth` (the API key's namespace, or the default `""` for a local caller or an
+unauthenticated one).
 A body `chunk_cache.namespace` equal to the caller's own is accepted silently; another name is
 ignored with `chunk_namespace_ignored` (strict: `400 invalid_request_error` with that code), and the spans stay (a non-string is `chunk_annotation_malformed`). The
 namespace's format is validated where it is assigned (the authentication step), not here.
@@ -164,12 +167,12 @@ Only `exact` (the default) and `shadow` run. **Both generate exactly what the un
 is rendered and tokenised as a plain request (spec §5.3 item 7), the same dispatch runs (scheduler or generator), and the
 prompt cache is looked up with exact lineage only (Task 12: a snapshot's approximate rows are never restored, so
 `cached_tokens` / `timings.cache_n` keep meaning exact prefix reuse). The annotations only produce counts, and under
-`shadow` a plan. Pinned over HTTP on a synthetic model, blocking and streaming, on three prompt-cache configurations
-(single-slot prefix cache; the default paged KV + scheduler; paged + scheduler with the prefix trie wired in):
+`shadow` a plan. Pinned over HTTP on a synthetic model, blocking and streaming, on both prompt-cache configurations
+(single-slot prefix cache; the default paged KV + scheduler, which holds the cross-request prefix trie since #1596):
 `Exact_IsBitIdenticalToUnannotated`, `Exact_AfterShadow_SameSlot_Identical`, `CachedTokens_UnchangedByAnnotations`,
-`Exact_WithApproxSnapshotOnSlot_RestoresExactRowsOnly`. Note: `ServerStartup` builds the prefix trie but does not pass it
-to the scheduler, so the default paged path has no cross-request prefix reuse at all (`cached_tokens` 0, annotated or
-not); the tests wire it in to check warm-slot neutrality on the trie path too.
+`Exact_WithApproxSnapshotOnSlot_RestoresExactRowsOnly`. Both paths reuse exact prefixes across requests, so a warm
+request reports `cached_tokens` > 0, and a verified chunk wholly inside that restored prefix is reported `prefix`, not
+`hit` (a test that wants a `hit` must make its prompt diverge before the chunk).
 
 - **Policies.** `balanced`, `fast` and `auto` parse and are served `exact` with `reason: "chunk_policy_unavailable"`
   and that warning once (rulings 42; strict: 400) until applied reuse ships. On a model or backend that cannot assemble
@@ -194,8 +197,9 @@ not); the tests wire it in to check warm-slot neutrality on the trie path too.
      ignored with **`chunk_verification_skipped`** (ruling 49: a warning only, never a strict error; never reported as
      altered);
   4. store lookup (`IChunkStore.Contains`, which reads at most the first 8 KiB of an entry: its header) under
-     `ChunkKey` of the server's identity (below), `isolated` positioning and the caller's namespace (server-assigned; the
-     default namespace until authentication exists). A store failure is a miss.
+     `ChunkKey` of the server's identity (below), `isolated` positioning and the caller's namespace (server-assigned by
+     `ChunkCacheAuth`). An unauthenticated caller's chunks are never looked up (each is a miss, no warning: the store is a
+     membership oracle). A store failure is a miss.
 - **Cost before generation.** All of this runs on the request thread before the scheduler queue or model gate, under
   `exact` too (ruling 5 counts hits): up to 4 sentinel renders (locator), one extra whole-prompt encode, the glue and
   span encodes (linear in the prompt), prefix encodes up to the cap above, and at most 1,024 store header reads
@@ -215,11 +219,11 @@ not); the tests wire it in to check warm-slot neutrality on the trie path too.
     fingerprint;
   - a CPU-built store served on Vulkan, or the reverse (the backend tag is in the key and the entry header);
   - a quantisation label of `unknown` on one side only.
-  To diagnose, compare the fingerprint inputs. The capabilities endpoint (next task) must expose them: `model.id`
-  (`GgufIdentity.ModelId`, and whether it is sampled or full), `model.tokenizer_id`, the quantisation label, the backend
-  tag, the K/V dtype (F32), `model.producer` (the producer hash, the key of the empty sequence in the caller's namespace,
-  which folds in the model fingerprint, RoPE parameters, schema version, backend, dtype and namespace) and the RoPE
-  parameters (`rope_dim`, `theta`, pairing) that enter the key.
+  To diagnose, compare the fingerprint inputs, which `GET /v1/chunk-cache` exposes (below): `model.id`
+  (`GgufIdentity.ModelId`) with `model.id_kind` (`sampled`), `model.tokenizer_id`, `model.quantization`, `model.backend`,
+  `model.kv_dtype`, `model.producer` (the producer hash, the key of the empty sequence in the caller's namespace, which
+  folds in the model fingerprint, RoPE parameters, schema version, backend, dtype and namespace) and `model.rope`
+  (`dim`, `theta`, `type`).
 - **Strict mode.** Parser defects are returned before rendering. After it, the error is the first of the request-level
   defects (`chunk_model_unsupported`, `chunk_policy_unavailable`, `chunk_store_unavailable`), else the span-level defect
   of the span first in document order (ruling 4; locator and token-check defects alike). Warning-only codes
@@ -231,8 +235,10 @@ not); the tests wire it in to check warm-slot neutrality on the trie path too.
 
 ### The response `chunk_cache` object (spec §5.9; contract rulings 5–10, 46–50)
 
-Written on annotated requests only (flag on), unless the request asked for `report: "none"` (`per_chunk` gives the
-summary for now: per-chunk reports need authentication, ruling 45). Where: the blocking response (both surfaces), the
+Written on annotated requests only (flag on), unless the request asked for `report: "none"`. With `report:
+"per_chunk"` from an authenticated caller the object also carries `per_chunk`: one `{id, status, why}` per annotation the
+server read, in document order (`status` `prefix` / `hit` / `miss` / `ignored`; `why` is the §5.8 code that dropped an
+`ignored` one, else null, ruling 55). Any other caller gets the summary (spec §10, ruling 45). Where: the blocking response (both surfaces), the
 OpenAI streaming **finish-reason chunk**, the one that carries `timings` (ruling 47; dotLLM emits `usage` on a separate
 trailing `include_usage` chunk, which stays SDK-shaped), and the Anthropic `message_delta` event beside `usage` (whose
 fields are unchanged: no `cache_read_input_tokens`, rulings 40 and 46). Shapes match the contract fixtures
@@ -271,6 +277,158 @@ fields are unchanged: no `cache_read_input_tokens`, rulings 40 and 46). Shapes m
 `dotllm_chunk_cache_chunks_total{status}` (`prefix`, `hit`, `miss`, `ignored`) and
 `dotllm_chunk_cache_tokens_total{kind}` (each key of `tokens`), counted for every annotated request (also with
 `report: "none"`). Labels carry no namespace, text or hash.
+
+## Control plane: capabilities and explain (spec §5.9, §7.2)
+
+Both routes are **mapped only with `--chunk-cache`**: with the flag off they do not exist (the usual bare 404 for any
+method, pinned by `FlagOff_404`). Both authenticate (below). Neither writes the store, generates, or counts in `/metrics`.
+
+**Rate limiting** applies to them only when it is configured (`--rate-limit-*`; off by default): `/v1/` paths are
+metered unless exempted, and these are deliberately not exempt. The limiter's buckets are keyed by the raw presented key
+string (pre-existing): a client sending a fresh random key per request gets a fresh bucket each time, but with keys
+configured such a request only reaches the cheap 401 path. Explain bounds itself whatever the limiter does (below).
+
+**CSRF hardening** (in place before prewarm / evict add side effects): a request with `Sec-Fetch-Site: cross-site` is
+`403 permission_error` on both routes whatever the key, and a control-plane POST must be `Content-Type:
+application/json` (parameters such as `charset` allowed), else `415`. That forces a browser to preflight, which the
+`Origin` rule then refuses (`ControlPlane_RequiresJson_RefusesCrossSite`).
+
+### `GET /v1/chunk-cache`
+
+The contract's `capabilities.json` shape (`Capabilities_MatchesFixtureShape`), plus the chunk-key identity in `model`
+(ruling 51: clients ignore unknown keys):
+
+```json
+{"versions": [1], "policies": ["exact", "shadow", "balanced", "fast", "auto"],
+ "selectors": ["chunk_starts"], "wire_chunkers": ["symbol-512"], "auto_validated": [],
+ "model": {"id": "<GgufIdentity.ModelId>", "supported": true, "reason": null, "id_kind": "sampled",
+           "tokenizer_id": "<GgufIdentity.TokenizerId>", "producer": "<64 hex: keyOf([]) in the caller's namespace>",
+           "quantization": "ftype-15", "backend": "cpu", "kv_dtype": "f32",
+           "rope": {"dim": 128, "theta": 1000000, "type": "neox"}},
+ "store": {"entries": 0, "bytes": 0, "budget_bytes": 0, "dtype": "f32"}, "max_chunks_per_request": 4096}
+```
+
+- `model.id` is the content model id, not the served model name. On an unsupported model or backend: `id` null,
+  `supported: false`, `reason: "chunk_model_unsupported"`, and no identity fields.
+- `model.producer` is per caller: the key of no tokens in the caller's namespace. A server-backed `chunkcache` finds its
+  index from `model.id` and `model.producer`: `index-<chunker>.<ModelTag(model.id)>.<producer[..8]>.<ns-or-default>.json`.
+  The namespace itself is never in a response; the CLI derives it from its own key (`ChunkNamespace.ForApiKey`), or
+  is told the `ns=` name by its operator, or uses `default`.
+- `store` is always an object (ruling 52). Its figures are the caller's own namespace's (non-admin callers never see
+  store-wide figures); they are all 0 until the server keeps a ledger of what it wrote (the sole-writer task), and
+  `budget_bytes` is 0 until a budget exists. Without `--chunk-store` it carries `"configured": false`; with one,
+  `configured` is absent (`Capabilities_StoreConfiguredFalse_WithoutStore`).
+- `wire_chunkers` is the server's wire-eligible list (`symbol-512`; `lines-512` joins in a later task).
+
+### `POST /v1/chunk-cache/explain`
+
+A dry run of the request's annotations. Body: `{"request": <a /v1/chat/completions body>}` (contract ruling 15) and
+nothing else: any other top-level field, a non-object `request`, a body that is not JSON, or a `request` the chat endpoint
+could not bind (e.g. array `content`) is `400 invalid_request_error` (`Explain_HashListBody_Rejected`). There is no hash
+lookup: the text must be sent. The request is validated, parsed in the caller's namespace (a body `namespace` other than
+the caller's is ignored with `chunk_namespace_ignored`), rendered by the chat endpoint's own render (`TryRender`),
+tokenised once (that one encode serves the context-length check and the plan), then located, token-checked and looked up
+exactly as an inference request. A strict request's defect is returned with the same status and error as
+`/v1/chat/completions` would return. The model named in the body is not loaded: explain uses the model being served.
+
+**Bounds** (explain renders and tokenises on the request thread, outside the scheduler): at most
+`MaxConcurrentExplains` (2) per server at once, the next gets `429 rate_limit_error` (`chunk_explain_busy`,
+`Retry-After: 1`); a body over `MaxExplainBodyBytes` (4 MiB) is `413`, with or without a `Content-Length` (a truncated
+body is 400, never 500) (`Explain_ConcurrencyCapped_429_BodyLimited_413`). The body is read before a slot is taken,
+within `ExplainBodyReadTimeoutSeconds` (10 s); a slower body is `408` and its connection closed, so a sender trickling a
+large body at Kestrel's minimum data rate (~240 B/s) never holds a slot (`Explain_SlowBody_DoesNotHoldASlot_408`).
+
+```json
+{"policy_would_apply": "exact", "reason": null,
+ "chunks": [{"id": "a", "status": "hit", "why": null}, {"id": "b", "status": "miss", "why": null},
+            {"id": "c", "status": "ignored", "why": "chunk_hash_mismatch"}],
+ "counts": {"annotated": 3, "prefix": 0, "hit": 1, "miss": 1, "ignored": 1},
+ "predicted_ms": {"reuse": 12.0, "full_prefill": 40.0}, "warnings": ["chunk_hash_mismatch"]}
+```
+
+- `chunks` (per-annotation status, ruling 55: `why` a §5.8 code or null) is returned to an authenticated caller only,
+  for its own namespace; `counts` always. Every caller the control plane admits is authenticated, so in practice `chunks`
+  is always present here; the builder still enforces it (`Explain_PerChunkOnlyForOwnNamespace`).
+- Explain does not probe the prompt cache, so nothing is `prefix`.
+- `predicted_ms` is the shadow plan's prediction whatever the requested policy: `reuse` = assembly + recompute (the
+  request's `recompute.budget`, else 0.05) + prefill of the rest; `full_prefill` = the whole prompt at the backend's
+  default rate (`chunk-cost-model.json`). `warnings` lists the codes (counts are in the inference report only).
+- OpenAI surface only in v1 (the CLI's `select --server` sends OpenAI string-content messages, ruling 19).
+
+### Authentication and namespaces
+
+dotLLM has no authentication anywhere else (`docs/SERVER.md` § Security). This is opt-in, covers the chunk-cache surface
+only, and is **security-sensitive**: a per-chunk store answer tells the caller whether some text was cached, i.e. a
+membership probe on source code (spec §10).
+
+- **`--chunk-cache-api-keys <file>`**: UTF-8, one key per line: `<key> [admin] [ns=<namespace>]` (fields separated by
+  spaces or tabs, each at most once, in any order after the key). Blank lines are skipped, and so is **every line whose
+  first non-blank character is `#`**: a key can therefore never start with `#` (a line meant as such a key is silently a
+  comment; the recipe below never produces one). Each line is trimmed. A key is printable ASCII without spaces. Any
+  other character (non-ASCII, a control character, a no-break space) refuses the file at startup with the line number,
+  never the key; so do a repeated key, an unknown or repeated field, an invalid `ns=` and a file with no key. An
+  unusable path is a clean startup error, not a stack trace.
+- **Keys must be at least 32 characters** (startup refuses a shorter one, naming its line) unless
+  `--chunk-cache-allow-short-keys` is given, which accepts them with a warning per line. Length is not entropy: generate
+  keys, e.g. 32 random bytes as base64url (43 characters):
+
+  ```sh
+  openssl rand 32 | basenc --base64url | tr -d '=\n'          # or: openssl rand -hex 32
+  ```
+  ```powershell
+  [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).TrimEnd('=').Replace('+','-').Replace('/','_')
+  ```
+- **`admin`**: store-wide figures and operations, from the store tasks (it grants nothing yet).
+- **`ns=<namespace>`**: the key uses that namespace (`ChunkNamespace.IsValid`, not empty, never `default`) instead of
+  the one derived from it. Two keys may name the same namespace on purpose (a team; a rotated key keeping the old
+  key's entries). A named namespace is not derived from the key, so the store's file names say nothing about the key
+  (`KeysFile_NsField_MapsKeyToNamedNamespace`).
+- **With keys**: the request must carry a listed key in `X-API-Key` (exactly one value; a blank one is no key, with no
+  fall-back to `Bearer`) or `Authorization: Bearer`. Matching is constant-time
+  (`CryptographicOperations.FixedTimeEquals` over the digests of every key, no early exit). Otherwise
+  `401 authentication_error` (`WWW-Authenticate: Bearer`). A loopback caller needs a key too.
+- **Without keys**: local callers only, in the default namespace, else `403 permission_error`. Local means all of: the
+  connection's remote address is loopback (IPv4-mapped too; an unknown address, as on a Unix socket, is not local); the
+  `Host` header is `localhost` or a loopback address (any port); and there is no `Origin` header. The last two stop a
+  web page in the user's browser: the server's CORS policy allows any origin, and DNS rebinding reaches loopback under a
+  foreign host name. "Local" still admits **every process on the machine**, including a service that can be made to
+  fetch URLs for someone else (SSRF), and behind a reverse proxy on the same host every caller is local: configure keys
+  in both cases.
+- **Rotation and revocation**: the keys file is read once at startup and never reloaded. **Revoking a key means
+  editing the file and restarting the server.** A replacement key gets a new, empty derived namespace and strands the
+  old key's entries (nothing maps one to the other; they age out with the store's eviction) unless both lines carry the
+  same `ns=`, which is the rotation path.
+- **Namespaces** are server-assigned, never caller-chosen: the key's `ns=`, else `ChunkNamespace.ForApiKey(key)` (`k-` +
+  the first 16 hex of SHA-256 of the key), or `ChunkNamespace.Default`. They are hashed into every chunk key, so one
+  key's **store** entries are never hits for another (`TwoKeys_CannotSeeEachOthersEntries`). They never appear
+  in a response or a log line, nor do keys or key digests (`NamespaceNeverInResponseBodiesOrLogs` checks every body and
+  the console and `ILogger` output). They **do** appear on disk: in store file names (`index-*.<ns>.json`) and, later,
+  the server ledger. Treat the store root like the repository (spec §10).
+- **Isolation stops at the store.** The prompt (prefix) cache is shared by all callers and knows nothing about
+  namespaces: `prefix` status, `chunks.prefix`, `usage.cached_tokens` / `timings.cache_n` and time to first token show
+  whether *anyone* recently sent the same prompt prefix. That exposure predates the convention (`cached_tokens` is
+  unauthenticated) and nothing here adds to it, but a multi-tenant deployment does not get full isolation; a
+  per-namespace prompt cache is an open item. Likewise `/metrics` is unauthenticated and its
+  `dotllm_chunk_cache_*_total` counters are server-wide (no namespace labels): they show aggregate hit volume of every
+  caller.
+- **Raw keys in memory**: the keys file's keys are kept as SHA-256 digests only, but a presented key string lives on in
+  the rate limiter's per-key buckets (for the process lifetime, when rate limiting is on), in `HttpContext.Items` and on
+  the inference request (scheduler fairness). None of these is logged.
+- **Inference** stays unauthenticated: an annotated request is never refused here. A caller the control plane would
+  refuse is served normally, but its chunks are never looked up in the store (all misses, no warning) and
+  `report: "per_chunk"` gives it the summary (`ReportPerChunk_UnauthenticatedGetsSummary`). The same rule will gate store
+  writes (prewarm, background encode).
+- **Stack traces**: the server runs `UseDeveloperExceptionPage()` unconditionally (pre-existing). The chunk-cache handlers
+  catch their own failures (explain answers 500 `api_error` with a fixed message, capabilities degrades to an
+  unsupported model), so no stack trace leaves them; other endpoints may still return one.
+- **Known limit: the derived namespace is unsalted.** `ForApiKey` is a plain SHA-256 prefix, so anyone who can read the
+  store root can test guessed keys offline at GPU speed (on the order of 10^10 guesses per second); the 64-bit
+  truncation does not slow that down, and besides the `k-<16 hex>` in index file names, the producer tag in those names
+  and the ledger rows can also confirm a guess. Long random keys (the 32-character minimum, the recipe above) or `ns=`
+  names avoid it. The alternative is `HMAC-SHA256(server secret, key)` with the secret outside the store root: offline
+  guessing would need the secret, but changing or losing the secret (or the derivation) re-keys every derived namespace
+  (a key-scheme bump, `chunk-key/v5`) and orphans every stored entry, and a server-backed CLI could no longer derive its
+  own namespace from its key. Left to the maintainer; v1 ships the unsalted form.
 
 ### Packaging and dependencies
 

@@ -93,6 +93,8 @@ public static class ToolCallParserFactory
             // (Hermes-compatible). Route to HermesToolCallParser regardless of
             // what the GGUF metadata declares (the template is substituted).
             Architecture.BitNet => new HermesToolCallParser(),
+            // Ripple (ricursive, #1643): ChatML + Hermes <tool_call> with one {"name": ..., "arguments": {...}} object per tag.
+            Architecture.Ricursive => new HermesToolCallParser(),
             _ => new GenericToolCallParser()
         };
     }
