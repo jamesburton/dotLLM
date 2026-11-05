@@ -79,10 +79,13 @@ joined with `'\n'`. The parser then checks that the engine message holds the spa
    the code (`chunk_store_unavailable` alone is `503 api_error`; nothing is 422). Only `chunk_ignored_too_short`,
    `chunk_encode_skipped` and `chunk_encode_queued` are never errors.
 
-**Lone surrogates (ruling 17).** In-process callers only: a string with a lone surrogate hashes as UTF-8 with U+FFFD.
-Over HTTP it cannot happen: System.Text.Json parses a lone-surrogate escape but refuses to return it as a string, so
-message text with one fails before the parser (as it always did), and an annotation field with one is
-`chunk_annotation_malformed`, never an exception.
+**Lone surrogates (ruling 17).** A string that holds a lone surrogate (in-process callers) hashes as UTF-8 with U+FFFD.
+Over HTTP a lone-surrogate *escape* (`"\ud800"`, valid JSON) is a client error, flag on or off: System.Text.Json parses
+it but refuses to return it as a string. OpenAI message text fails at model binding (400). Anthropic message text is a
+raw `JsonElement` that the converter reads later; `/v1/messages` and `/v1/messages/count_tokens` catch that refusal
+(around the `chunk_cache` parse, which converts the messages first, and in prompt building) and answer
+`400 invalid_request_error` (`Anthropic_LoneSurrogateEscapeInTextBlock_Is400`: annotated, unannotated, flag off; before
+the fix all three were a 500). An annotation field with one is `chunk_annotation_malformed`, never an exception.
 
 **Cost bounds.** The parser never throws on body content and does bounded work: the manifest is cut at its array length
 before any entry is read; each annotated part is encoded to UTF-8 once per request, with a byte-to-char checkpoint table
@@ -103,6 +106,10 @@ an empty query and no warning (ruling 34 asks only for the index of a request me
 A body `chunk_cache.namespace` equal to the caller's own is accepted silently; another name is
 ignored with `chunk_namespace_ignored` (strict: `400 invalid_request_error` with that code), and the spans stay (a non-string is `chunk_annotation_malformed`). The
 namespace's format is validated where it is assigned (the authentication step), not here.
+**Until authentication exists, every caller shares the default namespace**, and the report's `hit` / `miss` counts (and
+the `/metrics` counters) answer a store lookup for any text the caller annotates. So any caller can probe whether a known
+text (another caller's file, a document) is in the store: annotate it and read `hit`. Treat the store's contents as
+visible to everyone who can reach the server; per-caller namespaces (from the API key) close this with authentication.
 
 The contract's request fixtures are copied byte for byte under `tests/DotLLM.Tests.Unit/ChunkCache/Fixtures/v1/`
 (checked against `fixtures.sha256`); `ChunkAnnotationParserTests` checks every one against `expected.json`, in the
@@ -230,6 +237,14 @@ OpenAI streaming **finish-reason chunk**, the one that carries `timings` (ruling
 trailing `include_usage` chunk, which stays SDK-shaped), and the Anthropic `message_delta` event beside `usage` (whose
 fields are unchanged: no `cache_read_input_tokens`, rulings 40 and 46). Shapes match the contract fixtures
 (`Report_PartitionHolds`):
+
+> **Contract change (v1, ruling 46).** Ruling 9 originally had the Anthropic `message_delta` usage carry
+> `cache_read_input_tokens` (= `prefix_reused`). Ruling 40 (an annotated request's `usage` must equal the unannotated
+> one's, and dotLLM's Anthropic usage never carried the field) prevailed; ruling 46 amended ruling 9 and removed the field
+> from `response-anthropic-delta.json` in the contract folder itself (ChunkedkvCache `cdda32e`). Our copy of that
+> fixture, its `fixtures.sha256` line and the pinned list hash are a re-copy of the amended contract set (the client
+> tests on `dev` carry the same list hash since `b0728217`), not a local edit. `check.py` still accepts the field when
+> present, provided it equals `tokens.prefix_reused`.
 
 - `chunks`: `annotated = prefix + hit + miss + ignored`. `prefix`: a verified chunk wholly inside the exact prefix the
   prompt cache restored. `hit` / `miss`: the store lookup, under `exact` too (ruling 5). `ignored`: everything else
