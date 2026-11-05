@@ -104,12 +104,28 @@ jobs:
       # The SSE-only tiers (e.g. KQuantSseTierTests) are gated on `Ssse3 && !Avx2`, so on AVX2 runners they
       # never execute. Re-run the CPU kernel tests with the wide ISAs disabled so those tiers are exercised
       # (found via a Westmere box with no AVX, #602).
-      - name: CPU kernel tests (AVX/AVX2/AVX-512 disabled)
+      #
+      # The filter is the whole CPU-side unit suite (not just DotLLM.Tests.Unit.Cpu): the Flint/LittleBit model tests that need a
+      # specific tier live under Models and were never exercised without AVX2 (#1623). Vulkan tests are excluded (no device here).
+      - name: CPU tests (AVX/AVX2/AVX-512 disabled)
         env:
           DOTNET_EnableAVX: "0"
           DOTNET_EnableAVX2: "0"
           DOTNET_EnableAVX512F: "0"
-        run: dotnet test tests/DotLLM.Tests.Unit/ -c Release --no-build --filter "FullyQualifiedName~DotLLM.Tests.Unit.Cpu&Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
+        run: dotnet test tests/DotLLM.Tests.Unit/ -c Release --no-build --filter "FullyQualifiedName!~DotLLM.Tests.Unit.Vulkan&Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
+
+      # DOTLLM_CPU_ISA (src/DotLLM.Cpu/CpuFeatures.cs, docs/CPU_FEATURE_GATING.md) caps the highest tier dotLLM dispatches to, on a
+      # runner that has everything: scalar = no SIMD intrinsics at all, v128 = SSSE3/SSE4.1 only, avx2 = no AVX-512.
+      # Complements the DOTNET_Enable* leg above, which changes what the runtime reports rather than what dotLLM chooses.
+      - name: CPU tests (DOTLLM_CPU_ISA tier caps)
+        run: |
+          fail=0
+          for isa in scalar v128 avx2; do
+            echo "::group::DOTLLM_CPU_ISA=$isa"
+            DOTLLM_CPU_ISA=$isa dotnet test tests/DotLLM.Tests.Unit/ -c Release --no-build --filter "FullyQualifiedName!~DotLLM.Tests.Unit.Vulkan&Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m || fail=1
+            echo "::endgroup::"
+          done
+          exit $fail
 
   integration-tests:
     name: Integration Tests
