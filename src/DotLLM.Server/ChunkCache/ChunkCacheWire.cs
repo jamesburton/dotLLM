@@ -13,11 +13,10 @@ internal static class ChunkCacheWire
     public const int DefaultMinChunkTokens = 32;
 
     /// <summary>
-    /// The single-user namespace (<c>ChunkNamespace.Default</c> in <c>DotLLM.ChunkReuse</c>, copied until the server
-    /// references it). The caller's namespace is server-assigned: until authentication exists (a later task), every
-    /// caller gets this one.
+    /// The single-user namespace (<c>ChunkNamespace.Default</c> in <c>DotLLM.ChunkReuse</c>). The caller's namespace is
+    /// server-assigned by <see cref="ChunkCacheAuth"/>: an API key's namespace, or this one.
     /// </summary>
-    public const string DefaultNamespace = "";
+    public const string DefaultNamespace = DotLLM.ChunkReuse.Store.ChunkNamespace.Default;
 
     /// <summary>Prefix of every <c>hash</c>: <c>"sha256:"</c> + 64 lowercase hex digits.</summary>
     public const string HashPrefix = "sha256:";
@@ -78,6 +77,12 @@ internal sealed record ChunkSpanRef(
     int Message, int Part, int StartByte, int EndByte, string Id, string Hash, string? Chunker, bool Volatile,
     bool NoStore, string Text, EngineSpan Engine, int InnerPart = -1)
 {
+    /// <summary>
+    /// The annotation's position in document order (inline first, then manifest: the numbering of
+    /// <see cref="ChunkDefect.Index"/>); -1 when not set. Orders per-chunk status.
+    /// </summary>
+    public int Index { get; init; } = -1;
+
     // Never print the span text or its hash (spec 10: chunk content stays out of logs).
     private bool PrintMembers(System.Text.StringBuilder builder)
     {
@@ -97,7 +102,11 @@ internal sealed record ChunkWarning(string Code, int Count);
 /// <c>hash_mismatch</c>, <c>id_invalid</c>, <c>malformed</c>, <c>version</c>, <c>positioning</c>,
 /// <c>not_wire_eligible</c>, <c>too_many</c>, <c>not_carried</c>).
 /// </summary>
-internal sealed record ChunkDefect(int Index, string Code, string Kind);
+internal sealed record ChunkDefect(int Index, string Code, string Kind)
+{
+    /// <summary>The annotation's <c>id</c> when it was read before the defect (the caller's own label), else null.</summary>
+    public string? Id { get; init; }
+}
 
 /// <summary>A strict-mode error: the HTTP status, the error type and the §5.8 code.</summary>
 internal sealed record ChunkCacheError(int Status, string Type, string Code, string Message);

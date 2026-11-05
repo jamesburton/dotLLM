@@ -34,6 +34,7 @@ public static class EndpointExtensions
         SettingsEndpoint.Map(app);
         DeviceEndpoint.Map(app);
         MetricsEndpoint.Map(app);
+        ChunkCacheEndpoint.Map(app); // only with --chunk-cache; maps nothing otherwise
 
         if (serveUi)
             WebUIEndpoint.Map(app);

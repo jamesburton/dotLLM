@@ -176,6 +176,14 @@ public sealed class RateLimitMiddleware
     /// harmless) rather than a silent hole in the limiter.
     /// </para>
     /// <para>
+    /// <b>Chunk cache.</b> <c>/v1/chunk-cache</c> and everything under it (capabilities, explain, and the
+    /// later prewarm / evict) are deliberately <i>not</i> exempt: prewarm queues GPU work and disk
+    /// writes, explain tokenises and renders, so they carry the inference limits (spec §10) when
+    /// rate limiting is configured. Do not add them to the list above. The bucket is the raw presented
+    /// key string (any key, valid or not), so these limits do not stop a client that varies its key;
+    /// explain bounds its own concurrency and body size for that reason.
+    /// </para>
+    /// <para>
     /// Non-<c>/v1/</c> paths — health probes, <c>/props</c>, the chat UI and its assets — are
     /// never metered.
     /// </para>

@@ -104,6 +104,22 @@ internal static class ChunkAnnotationParser
         return ParseCore(wire, engine, request.ChunkCache, options, ns);
     }
 
+    /// <summary>
+    /// Whether an OpenAI request carries any chunk annotation (a non-null <c>chunk_cache</c>; inline annotations cannot occur
+    /// on this surface). Allocation-free: callers check it before resolving the caller, so an unannotated request never
+    /// pays for a key lookup or hash.
+    /// </summary>
+    /// <param name="request">The bound request.</param>
+    /// <returns>False when <see cref="Parse(ChatCompletionRequest, ChunkCacheOptions, string)"/> would return null for want of an annotation.</returns>
+    public static bool HasAnnotation(ChatCompletionRequest request) => !IsAbsent(request.ChunkCache);
+
+    /// <summary>Whether an Anthropic request carries any chunk annotation (<c>chunk_cache</c> or an inline <c>chunk</c>). Allocation-free.</summary>
+    /// <param name="request">The bound request.</param>
+    /// <returns>False when <see cref="Parse(AnthropicMessagesRequest, ChunkCacheOptions, string)"/> would return null for want of an annotation.</returns>
+    public static bool HasAnnotation(AnthropicMessagesRequest request) =>
+        !IsAbsent(request.ChunkCache)
+        || (request.Messages is { } messages && Array.IndexOf(messages, null) < 0 && HasInlineChunk(messages));
+
     private static bool HasInlineChunk(AnthropicMessageDto[] messages)
     {
         foreach (var msg in messages)
@@ -477,7 +493,7 @@ internal static class ChunkAnnotationParser
             || (Present(ch, "positioning", out var pos) && !TryString(pos, out positioning))
             || (Present(ch, "stability", out var stab) && !TryString(stab, out stability))
             || (Present(ch, "no_store", out var nsEl) && nsEl.ValueKind is not (JsonValueKind.True or JsonValueKind.False)))
-            return acc.Drop(index, ChunkCacheCodes.AnnotationMalformed, "malformed", "chunk.chunker / positioning / stability must be strings, no_store a boolean");
+            return acc.Drop(index, id, ChunkCacheCodes.AnnotationMalformed, "malformed", "chunk.chunker / positioning / stability must be strings, no_store a boolean");
 
         int message = a.Message, part = a.Part, inner = a.Inner;
         WirePart? target = a.Target;
@@ -487,40 +503,40 @@ internal static class ChunkAnnotationParser
             if (!Present(ch, "at", out var at) || at.ValueKind != JsonValueKind.Object
                 || !TryInt(at, "message", required: true, out int? mi) || !TryInt(at, "part", required: true, out int? pi)
                 || !TryInt(at, "start", required: false, out start) || !TryInt(at, "end", required: false, out end))
-                return acc.Drop(index, ChunkCacheCodes.AnnotationMalformed, "malformed", "at must be {message, part[, start, end]} with integer values");
+                return acc.Drop(index, id, ChunkCacheCodes.AnnotationMalformed, "malformed", "at must be {message, part[, start, end]} with integer values");
             message = mi!.Value;
             part = pi!.Value;
         }
 
         // 2. Version.
         if (hasV && !(v.TryGetInt32(out int vi) && vi == ChunkCacheWire.Version))
-            return acc.Drop(index, ChunkCacheCodes.VersionUnsupported, "version", "chunk.v must be 1");
+            return acc.Drop(index, id, ChunkCacheCodes.VersionUnsupported, "version", "chunk.v must be 1");
         if (positioning is not null && positioning != "isolated")
-            return acc.Drop(index, ChunkCacheCodes.VersionUnsupported, "positioning", "v1 accepts only positioning \"isolated\"");
+            return acc.Drop(index, id, ChunkCacheCodes.VersionUnsupported, "positioning", "v1 accepts only positioning \"isolated\"");
 
         // 3. Id, and the chunker it names.
         if (id is not { Length: > 0 } || CountRunes(id) > ChunkCacheWire.MaxIdLength)
-            return acc.Drop(index, ChunkCacheCodes.SpanInvalid, "id_invalid", $"id must be a string of 1..{ChunkCacheWire.MaxIdLength} characters");
+            return acc.Drop(index, id, ChunkCacheCodes.SpanInvalid, "id_invalid", $"id must be a string of 1..{ChunkCacheWire.MaxIdLength} characters");
         if (chunker is not null && !ChunkCacheWire.WireChunkers.Contains(chunker))
-            return acc.Drop(index, ChunkCacheCodes.NotWireEligible, "not_wire_eligible", $"chunker {Echo(ck)} is not wire-eligible (text-first)");
+            return acc.Drop(index, id, ChunkCacheCodes.NotWireEligible, "not_wire_eligible", $"chunker {Echo(ck)} is not wire-eligible (text-first)");
 
         // 4. Range and boundary. The part is encoded once per request, whatever the number of annotations on it.
         if (!a.Inline)
         {
             if (message < 0 || message >= messages.Count || part < 0 || part >= messages[message].Parts.Count)
-                return acc.Drop(index, ChunkCacheCodes.SpanInvalid, "part_out_of_range", $"at {{message {message}, part {part}}} is out of range");
+                return acc.Drop(index, id, ChunkCacheCodes.SpanInvalid, "part_out_of_range", $"at {{message {message}, part {part}}} is out of range");
             target = messages[message].Parts[part];
         }
         if (target is not { IsText: true, Text: { } text })
-            return acc.Drop(index, ChunkCacheCodes.SpanInvalid, "non_text", "a chunk span must lie in a text part");
+            return acc.Drop(index, id, ChunkCacheCodes.SpanInvalid, "non_text", "a chunk span must lie in a text part");
 
         var partText = state.Of(target);
         byte[] bytes = partText.Bytes;
         int s = start ?? 0, e = end ?? bytes.Length;
         if (!(0 <= s && s < e && e <= bytes.Length))
-            return acc.Drop(index, ChunkCacheCodes.SpanInvalid, "range_invalid", $"byte range [{s}, {e}) is empty or outside the part's {bytes.Length} bytes");
+            return acc.Drop(index, id, ChunkCacheCodes.SpanInvalid, "range_invalid", $"byte range [{s}, {e}) is empty or outside the part's {bytes.Length} bytes");
         if (!OnBoundary(bytes, s) || !OnBoundary(bytes, e))
-            return acc.Drop(index, ChunkCacheCodes.SpanInvalid, "multibyte_boundary", $"byte range [{s}, {e}) is not on UTF-8 character boundaries");
+            return acc.Drop(index, id, ChunkCacheCodes.SpanInvalid, "multibyte_boundary", $"byte range [{s}, {e}) is not on UTF-8 character boundaries");
 
         // 5. Overlap: the later span (document order) is dropped (ruling 1). A span that then fails its hash still holds
         //    its range, as in the contract's reference parse.
@@ -536,14 +552,14 @@ internal static class ChunkAnnotationParser
             if (ranges[mid].Start < s) lo = mid + 1; else hi = mid;
         }
         if ((lo > 0 && s < ranges[lo - 1].End) || (lo < ranges.Count && ranges[lo].Start < e))
-            return acc.Drop(index, ChunkCacheCodes.SpanInvalid, "overlap", $"byte range [{s}, {e}) overlaps an earlier span");
+            return acc.Drop(index, id, ChunkCacheCodes.SpanInvalid, "overlap", $"byte range [{s}, {e}) overlaps an earlier span");
         ranges.Insert(lo, (s, e));
 
         // 6. Hash, last: only spans that passed every cheap check are hashed, and accepted ranges never overlap.
         HashComputations++;
         string hash = ChunkCacheWire.HashPrefix + Convert.ToHexStringLower(SHA256.HashData(bytes.AsSpan(s, e - s)));
         if (!string.Equals(claimedHash, hash, StringComparison.Ordinal))
-            return acc.Drop(index, ChunkCacheCodes.HashMismatch, "hash_mismatch", "hash does not match the received text");
+            return acc.Drop(index, id, ChunkCacheCodes.HashMismatch, "hash_mismatch", "hash does not match the received text");
 
         int startChar = partText.CharOffset(s);
         int endChar = partText.CharOffset(e);
@@ -551,15 +567,15 @@ internal static class ChunkAnnotationParser
 
         // Defence in depth: the engine message must hold the span text where the mapping says.
         if (target.EngineMessage < 0 || target.EngineMessage >= engine.Count)
-            return acc.Drop(index, ChunkCacheCodes.SpanInvalid, "not_carried", "the part is not carried into the prompt as text");
+            return acc.Drop(index, id, ChunkCacheCodes.SpanInvalid, "not_carried", "the part is not carried into the prompt as text");
         var engineSpan = new EngineSpan(target.EngineMessage, target.EngineOffset + startChar, target.EngineOffset + endChar);
         string engineContent = engine[engineSpan.EngineMessage].Content ?? "";
         if (engineSpan.StartChar < 0 || engineSpan.EndChar > engineContent.Length
             || !engineContent.AsSpan(engineSpan.StartChar, engineSpan.EndChar - engineSpan.StartChar).SequenceEqual(spanText))
-            return acc.Drop(index, ChunkCacheCodes.SpanInvalid, "not_carried", "the span is not where the converter put the part's text");
+            return acc.Drop(index, id, ChunkCacheCodes.SpanInvalid, "not_carried", "the span is not where the converter put the part's text");
 
         bool noStore = Present(ch, "no_store", out var nsv) && nsv.ValueKind == JsonValueKind.True;
-        return new ChunkSpanRef(message, part, s, e, id, hash, chunker, stability == "volatile", noStore, spanText, engineSpan, inner);
+        return new ChunkSpanRef(message, part, s, e, id, hash, chunker, stability == "volatile", noStore, spanText, engineSpan, inner) { Index = index };
     }
 
     /// <summary>A property that is present and not JSON <c>null</c> (null means "use the default").</summary>
@@ -665,9 +681,11 @@ internal static class ChunkAnnotationParser
 
         public void Request(string code, string message, int count = 1) => Add(code, message, count);
 
-        public ChunkSpanRef? Drop(int index, string code, string kind, string message)
+        public ChunkSpanRef? Drop(int index, string code, string kind, string message) => Drop(index, null, code, kind, message);
+
+        public ChunkSpanRef? Drop(int index, string? id, string code, string kind, string message)
         {
-            _defects.Add(new ChunkDefect(index, code, kind));
+            _defects.Add(new ChunkDefect(index, code, kind) { Id = id });
             Add(code, $"chunk {index}: {message}", 1);
             return null;
         }
