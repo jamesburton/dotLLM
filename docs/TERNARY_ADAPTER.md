@@ -320,7 +320,10 @@ residual in `_state.HiddenState` as F32, so the CPU numerics carry over unchange
   host has the seam**; the hybrid/MoE/Mamba hosts do not (follow-up).
 - **Scale dtype**: F32 by default; `TernaryScaleStorage.F16` is a pipeline specialization constant (two halves per word, exact widening).
   `TernaryDevicePack` (Models) defines the packed bytes for both GPU backends.
-- **CUDA**: not part of this change; tracked separately in #1625 (kernel, modifier and NVIDIA validation).
+- **CUDA** (#1625; `native/kernels/ternary_adapter_residual_f32.cu`, `CudaTernaryResidualModifier`): same algorithm and bytes, explicit
+  `__fmul_rn/__fadd_rn/__fdiv_rn`. Bit-exact vs the CPU hook on an RTX 3060 (`CudaTernaryAdapterKernelTests`; a `__fdiv_rn` to `rcp.rn` mutant is killed).
+  The committed `native/ptx/ternary_adapter_residual_f32.ptx` was built with CUDA 12.8 (`.version 8.7`, `DotLLMCudaBuildMode=compile`,
+  `DotLLMPtxVersionPolicy=strict`; see docs/CUDA.md "Building on newer CUDA SDKs"). Not yet wired into `CudaTransformerModel`.
 - **Latency** (Strix Halo gfx1151, GPU timestamps, D=4096, gate open, residual rows F32): rank 1 and 2 about 5.2-5.9 us per dispatch (1 or 8 rows),
   rank 32 about 32 us (1 or 8 rows; was 65 us before the up-projection owned 32 columns per thread). The down projection at rank 32 is the remaining
   cost (8 rounds of 64-lane reductions); a decode layer of a 4096-wide model is hundreds of microseconds.
