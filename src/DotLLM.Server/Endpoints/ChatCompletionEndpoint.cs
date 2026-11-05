@@ -236,9 +236,14 @@ public static class ChatCompletionEndpoint
         return ok;
     }
 
-    /// <summary>Parses the request's annotations in the caller's namespace (flag on only).</summary>
+    /// <summary>
+    /// Parses the request's annotations in the caller's namespace (flag on only). The caller is resolved (key lookup, SHA-256
+    /// of the presented key) only once an annotation is found: an unannotated request pays nothing.
+    /// </summary>
     private static ChunkCacheExchange? BeginChunkCache(ChatCompletionRequest request, ServerState state, HttpContext httpContext)
     {
+        if (!ChunkAnnotationParser.HasAnnotation(request))
+            return null;
         state.ChunkCacheRuntime.CountInferenceCallerResolution();
         var caller = ChunkCacheAuth.ForInference(httpContext, state.Options.ChunkCache);
         return ChunkCacheExchange.Begin(ChunkAnnotationParser.Parse(request, state.Options.ChunkCache, caller.Namespace), caller);

@@ -1450,7 +1450,7 @@ surface authenticates even though nothing else does. **Security-sensitive; off u
   or named with `ns=`. Keys, their digests and namespaces never appear in responses or logs (namespaces do appear in
   the store's file names). The file is read once: revoking a key needs a restart.
 - Control-plane POSTs must be `application/json` (else 415) and `Sec-Fetch-Site: cross-site` is refused (403), so a web
-  page cannot drive the surface. Explain is capped at 2 concurrent calls (429) and 4 MiB bodies (413).
+  page cannot drive the surface. Explain is capped at 2 concurrent calls (429), 4 MiB bodies (413) and a 10 s body read, taken before a slot (408).
 - Namespace isolation covers the chunk store only: the prompt (prefix) cache, `cached_tokens` and `/metrics` are shared
   by every caller, as they always were.
 - Without a keys file: local callers only (loopback remote address, a `localhost` / loopback `Host`, no `Origin`

@@ -167,12 +167,12 @@ Only `exact` (the default) and `shadow` run. **Both generate exactly what the un
 is rendered and tokenised as a plain request (spec §5.3 item 7), the same dispatch runs (scheduler or generator), and the
 prompt cache is looked up with exact lineage only (Task 12: a snapshot's approximate rows are never restored, so
 `cached_tokens` / `timings.cache_n` keep meaning exact prefix reuse). The annotations only produce counts, and under
-`shadow` a plan. Pinned over HTTP on a synthetic model, blocking and streaming, on three prompt-cache configurations
-(single-slot prefix cache; the default paged KV + scheduler; paged + scheduler with the prefix trie wired in):
+`shadow` a plan. Pinned over HTTP on a synthetic model, blocking and streaming, on both prompt-cache configurations
+(single-slot prefix cache; the default paged KV + scheduler, which holds the cross-request prefix trie since #1596):
 `Exact_IsBitIdenticalToUnannotated`, `Exact_AfterShadow_SameSlot_Identical`, `CachedTokens_UnchangedByAnnotations`,
-`Exact_WithApproxSnapshotOnSlot_RestoresExactRowsOnly`. Note: `ServerStartup` builds the prefix trie but does not pass it
-to the scheduler, so the default paged path has no cross-request prefix reuse at all (`cached_tokens` 0, annotated or
-not); the tests wire it in to check warm-slot neutrality on the trie path too.
+`Exact_WithApproxSnapshotOnSlot_RestoresExactRowsOnly`. Both paths reuse exact prefixes across requests, so a warm
+request reports `cached_tokens` > 0, and a verified chunk wholly inside that restored prefix is reported `prefix`, not
+`hit` (a test that wants a `hit` must make its prompt diverge before the chunk).
 
 - **Policies.** `balanced`, `fast` and `auto` parse and are served `exact` with `reason: "chunk_policy_unavailable"`
   and that warning once (rulings 42; strict: 400) until applied reuse ships. On a model or backend that cannot assemble
@@ -334,7 +334,9 @@ exactly as an inference request. A strict request's defect is returned with the 
 **Bounds** (explain renders and tokenises on the request thread, outside the scheduler): at most
 `MaxConcurrentExplains` (2) per server at once, the next gets `429 rate_limit_error` (`chunk_explain_busy`,
 `Retry-After: 1`); a body over `MaxExplainBodyBytes` (4 MiB) is `413`, with or without a `Content-Length` (a truncated
-body is 400, never 500) (`Explain_ConcurrencyCapped_429_BodyLimited_413`).
+body is 400, never 500) (`Explain_ConcurrencyCapped_429_BodyLimited_413`). The body is read before a slot is taken,
+within `ExplainBodyReadTimeoutSeconds` (10 s); a slower body is `408` and its connection closed, so a sender trickling a
+large body at Kestrel's minimum data rate (~240 B/s) never holds a slot (`Explain_SlowBody_DoesNotHoldASlot_408`).
 
 ```json
 {"policy_would_apply": "exact", "reason": null,
@@ -398,7 +400,7 @@ membership probe on source code (spec §10).
   same `ns=`, which is the rotation path.
 - **Namespaces** are server-assigned, never caller-chosen: the key's `ns=`, else `ChunkNamespace.ForApiKey(key)` (`k-` +
   the first 16 hex of SHA-256 of the key), or `ChunkNamespace.Default`. They are hashed into every chunk key, so one
-  key's **store** entries are never hits for another (`TwoKeys_CannotSeeOrEvictEachOthersEntries`). They never appear
+  key's **store** entries are never hits for another (`TwoKeys_CannotSeeEachOthersEntries`). They never appear
   in a response or a log line, nor do keys or key digests (`NamespaceNeverInResponseBodiesOrLogs` checks every body and
   the console and `ILogger` output). They **do** appear on disk: in store file names (`index-*.<ns>.json`) and, later,
   the server ledger. Treat the store root like the repository (spec §10).

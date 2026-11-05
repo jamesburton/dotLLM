@@ -104,6 +104,22 @@ internal static class ChunkAnnotationParser
         return ParseCore(wire, engine, request.ChunkCache, options, ns);
     }
 
+    /// <summary>
+    /// Whether an OpenAI request carries any chunk annotation (a non-null <c>chunk_cache</c>; inline annotations cannot occur
+    /// on this surface). Allocation-free: callers check it before resolving the caller, so an unannotated request never
+    /// pays for a key lookup or hash.
+    /// </summary>
+    /// <param name="request">The bound request.</param>
+    /// <returns>False when <see cref="Parse(ChatCompletionRequest, ChunkCacheOptions, string)"/> would return null for want of an annotation.</returns>
+    public static bool HasAnnotation(ChatCompletionRequest request) => !IsAbsent(request.ChunkCache);
+
+    /// <summary>Whether an Anthropic request carries any chunk annotation (<c>chunk_cache</c> or an inline <c>chunk</c>). Allocation-free.</summary>
+    /// <param name="request">The bound request.</param>
+    /// <returns>False when <see cref="Parse(AnthropicMessagesRequest, ChunkCacheOptions, string)"/> would return null for want of an annotation.</returns>
+    public static bool HasAnnotation(AnthropicMessagesRequest request) =>
+        !IsAbsent(request.ChunkCache)
+        || (request.Messages is { } messages && Array.IndexOf(messages, null) < 0 && HasInlineChunk(messages));
+
     private static bool HasInlineChunk(AnthropicMessageDto[] messages)
     {
         foreach (var msg in messages)

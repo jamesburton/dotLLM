@@ -11,7 +11,7 @@ namespace DotLLM.Server.Endpoints;
 /// <c>POST /v1/chunk-cache/explain</c> (a dry run of a request's annotations). Mapped only with <c>--chunk-cache</c>: with
 /// the flag off the routes do not exist (404, exactly as before the convention). Every call is authenticated by
 /// <see cref="ChunkCacheAuth"/> (401 / 403) and, when rate limiting is configured, metered like inference (<c>/v1/</c> paths are metered
-/// unless exempted, and these are not). Explain also bounds its own concurrency (429) and body size (413), and both routes refuse cross-site browser requests; explain reads only <c>application/json</c> (415).
+/// unless exempted, and these are not). Explain also bounds its own concurrency (429), body size (413) and body read time (408; read before a concurrency slot is taken), and both routes refuse cross-site browser requests; explain reads only <c>application/json</c> (415).
 /// </summary>
 /// <remarks>
 /// Nothing here writes the store, generates, or counts in <c>/metrics</c>; responses and logs never carry a namespace, a key
@@ -197,8 +197,45 @@ public static class ChunkCacheEndpoint
             return;
         }
 
+        // The body first, bounded in size and time, and before a slot: a slow sender (Kestrel's minimum data rate is only
+        // ~240 B/s, i.e. hours for 4 MiB) must never hold one of the few explain slots for everyone else.
+        if (context.Request.ContentLength > MaxExplainBodyBytes)
+        {
+            await WriteTooLargeAsync(context);
+            return;
+        }
+        var runtime = state.ChunkCacheRuntime;
+        ReadOnlyMemory<byte>? body;
+        using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted))
+        {
+            deadline.CancelAfter(runtime.ExplainBodyReadTimeout);
+            runtime.EnterExplainBodyRead();
+            try
+            {
+                body = await ReadLimitedAsync(context, deadline.Token);
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested && !context.RequestAborted.IsCancellationRequested)
+            {
+                // The rest of the body is never read: close the connection rather than drain it.
+                context.Response.Headers.Connection = "close";
+                await WriteAsync(context, StatusCodes.Status408RequestTimeout, ErrorResponse.InvalidRequest(
+                    $"explain: the request body did not arrive within {(int)runtime.ExplainBodyReadTimeout.TotalSeconds} s",
+                    param: "request", code: "request_timeout"));
+                return;
+            }
+            finally
+            {
+                runtime.ExitExplainBodyRead();
+            }
+        }
+        if (body is null)
+        {
+            await WriteTooLargeAsync(context);
+            return;
+        }
+
         // Bounded: explain renders and tokenises on the request thread, outside the scheduler.
-        var gate = state.ChunkCacheRuntime.ExplainGate;
+        var gate = runtime.ExplainGate;
         if (!gate.Wait(0))
         {
             context.Response.Headers.RetryAfter = "1";
@@ -208,7 +245,7 @@ public static class ChunkCacheEndpoint
         }
         try
         {
-            await ExplainAdmittedAsync(context, state, caller);
+            await ExplainAdmittedAsync(context, state, caller, body.Value);
         }
         finally
         {
@@ -216,31 +253,10 @@ public static class ChunkCacheEndpoint
         }
     }
 
-    private static async Task ExplainAdmittedAsync(HttpContext context, ServerState state, ChunkCaller caller)
+    private static async Task ExplainAdmittedAsync(HttpContext context, ServerState state, ChunkCaller caller, ReadOnlyMemory<byte> body)
     {
         var options = state.Options.ChunkCache;
-        if (context.Request.ContentLength > MaxExplainBodyBytes)
-        {
-            await WriteTooLargeAsync(context);
-            return;
-        }
-        ReadOnlyMemory<byte>? body;
-        state.ChunkCacheRuntime.EnterExplainBodyRead();
-        try
-        {
-            body = await ReadLimitedAsync(context);
-        }
-        finally
-        {
-            state.ChunkCacheRuntime.ExitExplainBodyRead();
-        }
-        if (body is null)
-        {
-            await WriteTooLargeAsync(context);
-            return;
-        }
-
-        var (request, bodyError) = ParseBody(body.Value);
+        var (request, bodyError) = ParseBody(body);
         if (request is null)
         {
             await WriteAsync(context, StatusCodes.Status400BadRequest, ErrorResponse.InvalidRequest(bodyError!, param: "request"));
@@ -372,14 +388,14 @@ public static class ChunkCacheEndpoint
 
     /// <summary>
     /// Reads the body, at most <see cref="MaxExplainBodyBytes"/> (also without a <c>Content-Length</c>, e.g. chunked);
-    /// null when it is larger.
+    /// null when it is larger. <paramref name="cancellationToken"/> carries the read deadline.
     /// </summary>
-    private static async Task<ReadOnlyMemory<byte>?> ReadLimitedAsync(HttpContext context)
+    private static async Task<ReadOnlyMemory<byte>?> ReadLimitedAsync(HttpContext context, CancellationToken cancellationToken)
     {
         var buffer = new MemoryStream();
         byte[] chunk = new byte[64 * 1024];
         int read;
-        while ((read = await context.Request.Body.ReadAsync(chunk, context.RequestAborted)) > 0)
+        while ((read = await context.Request.Body.ReadAsync(chunk, cancellationToken)) > 0)
         {
             if (buffer.Length + read > MaxExplainBodyBytes)
                 return null;
