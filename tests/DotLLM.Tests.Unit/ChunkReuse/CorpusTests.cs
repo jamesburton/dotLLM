@@ -436,10 +436,32 @@ public sealed class CorpusTests : IDisposable
 
     internal static string Text(Chunk c) => new CharTokenizer().Decode(c.TokenIds);
 
-    private static void AssertCoversWithoutOverlap(string text, IReadOnlyList<Chunk> chunks)
+    /// <summary>
+    /// The chunks' <see cref="Chunk.StartOffset"/>/<see cref="Chunk.EndOffset"/> are UTF-16 offsets into <paramref name="text"/>
+    /// that tile it exactly, and (for wire-eligible chunks, whose text tokenises to their ids) each offset slice is the chunk's
+    /// decoded text.
+    /// </summary>
+    internal static void AssertOffsetsTile(string text, IReadOnlyList<Chunk> chunks)
+    {
+        Assert.NotEmpty(chunks);
+        Assert.Equal(0, chunks[0].StartOffset);
+        Assert.Equal(text.Length, chunks[^1].EndOffset);
+        for (int i = 0; i < chunks.Count; i++)
+        {
+            Chunk c = chunks[i];
+            Assert.InRange(c.StartOffset, 0, c.EndOffset);
+            Assert.InRange(c.EndOffset, c.StartOffset, text.Length);
+            if (i > 0) Assert.Equal(chunks[i - 1].EndOffset, c.StartOffset);
+            if (c.WireEligible) Assert.Equal(Text(c), text[c.StartOffset..c.EndOffset]);
+        }
+        Assert.Equal(text, string.Concat(chunks.Select(c => text[c.StartOffset..c.EndOffset])));
+    }
+
+    internal static void AssertCoversWithoutOverlap(string text, IReadOnlyList<Chunk> chunks)
     {
         Assert.NotEmpty(chunks);
         Assert.Equal(text, string.Concat(chunks.Select(Text)));
+        AssertOffsetsTile(text, chunks);
         Assert.Equal(1, chunks[0].StartLine);
         int lastLine = text.Length == 0 ? 0 : 1 + text[..^1].Count(ch => ch == '\n');
         Assert.Equal(lastLine, chunks[^1].EndLine);

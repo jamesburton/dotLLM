@@ -1,0 +1,411 @@
+[
+ {
+  "name": "plain",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello!"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "system",
+  "context": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "no_generation_prompt",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello."
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "expected": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n"
+ },
+ {
+  "name": "multi_turn_reasoning",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "Simple sum."
+    },
+    {
+     "role": "user",
+     "content": "And 3+3?"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\nSimple sum.\n</think>\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "multi_turn_reasoning_clear_thinking",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "Simple sum."
+    },
+    {
+     "role": "user",
+     "content": "And 3+3?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "clear_thinking": true
+  },
+  "expected": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "reasoning_already_inline",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nr\n</think>\nanswer",
+     "reasoning_content": "r"
+    },
+    {
+     "role": "user",
+     "content": "again"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\nanswer<|im_end|>\n<|im_start|>user\nagain<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "tools_with_system",
+  "context": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are an agent."
+    },
+    {
+     "role": "user",
+     "content": "Where am I?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "execute_bash",
+      "description": "Run a shell command.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string",
+         "description": "The command."
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file (UTF-8, ünïcode ☃ ok).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\nYou are an agent.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"execute_bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command.\"}}, \"required\": [\"command\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a file (UTF-8, ünïcode ☃ ok).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nFor each function call, return exactly one valid JSON object with function name and arguments inside XML tool-call tags. The arguments field must be a JSON object, not a string, and strings must use valid JSON escaping:\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call><|im_end|>\n<|im_start|>user\nWhere am I?<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "tools_without_system",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "List files"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "execute_bash",
+      "description": "Run a shell command.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string",
+         "description": "The command."
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file (UTF-8, ünïcode ☃ ok).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"execute_bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command.\"}}, \"required\": [\"command\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a file (UTF-8, ünïcode ☃ ok).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nFor each function call, return exactly one valid JSON object with function name and arguments inside XML tool-call tags. The arguments field must be a JSON object, not a string, and strings must use valid JSON escaping:\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call><|im_end|>\n<|im_start|>user\nList files<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "parallel_tool_calls_and_results",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "pwd and read a.txt"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two calls.",
+     "tool_calls": [
+      {
+       "id": "call_0",
+       "type": "function",
+       "function": {
+        "name": "execute_bash",
+        "arguments": {
+         "command": "pwd"
+        }
+       }
+      },
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": {
+         "path": "a.txt",
+         "limit": 10
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "/home/u",
+     "tool_call_id": "call_0"
+    },
+    {
+     "role": "tool",
+     "content": "hello",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "execute_bash",
+      "description": "Run a shell command.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string",
+         "description": "The command."
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file (UTF-8, ünïcode ☃ ok).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"execute_bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command.\"}}, \"required\": [\"command\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a file (UTF-8, ünïcode ☃ ok).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nFor each function call, return exactly one valid JSON object with function name and arguments inside XML tool-call tags. The arguments field must be a JSON object, not a string, and strings must use valid JSON escaping:\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call><|im_end|>\n<|im_start|>user\npwd and read a.txt<|im_end|>\n<|im_start|>assistant\n<think>\nTwo calls.\n</think>\n\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.txt\", \"limit\": 10}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n/home/u\n</tool_response>\n<tool_response>\nhello\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "content_plus_call_then_answer",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "Running it.",
+     "tool_calls": [
+      {
+       "id": "call_0",
+       "type": "function",
+       "function": {
+        "name": "execute_bash",
+        "arguments": {
+         "command": "ls -la"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "total 0",
+     "tool_call_id": "call_0"
+    },
+    {
+     "role": "assistant",
+     "content": "Empty dir."
+    }
+   ],
+   "add_generation_prompt": false,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "execute_bash",
+      "description": "Run a shell command.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string",
+         "description": "The command."
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"execute_bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command.\"}}, \"required\": [\"command\"]}}}\n</tools>\n\nFor each function call, return exactly one valid JSON object with function name and arguments inside XML tool-call tags. The arguments field must be a JSON object, not a string, and strings must use valid JSON escaping:\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call><|im_end|>\n<|im_start|>user\ngo<|im_end|>\n<|im_start|>assistant\nRunning it.\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"ls -la\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\ntotal 0\n</tool_response><|im_end|>\n<|im_start|>assistant\nEmpty dir.<|im_end|>\n"
+ },
+ {
+  "name": "system_mid_conversation",
+  "context": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "first"
+    },
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b"
+    },
+    {
+     "role": "system",
+     "content": "second"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>system\nfirst<|im_end|>\n<|im_start|>user\na<|im_end|>\n<|im_start|>assistant\nb<|im_end|>\n<|im_start|>system\nsecond<|im_end|>\n<|im_start|>user\nc<|im_end|>\n<|im_start|>assistant\n"
+ }
+]
