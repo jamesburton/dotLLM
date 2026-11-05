@@ -38,6 +38,10 @@ public static partial class GgufModelConfigExtractor
         if (architecture is Architecture.MiMoV2 or Architecture.Flint)
             return BuildMiMoV2Config(metadata, arch, architecture);
 
+        // Ripple (#1643): dense sandwich-norm blocks, gated attention, value residual, SWA/NoPE hybrid from a per-layer bool pattern.
+        if (architecture == Architecture.Ricursive)
+            return BuildRicursiveConfig(metadata, arch);
+
         int hiddenSize = (int)metadata.GetUInt32($"{arch}.embedding_length");
         int numLayers = (int)metadata.GetUInt32($"{arch}.block_count");
         int numAttentionHeads = (int)metadata.GetUInt32($"{arch}.attention.head_count");
@@ -1204,6 +1208,8 @@ public static partial class GgufModelConfigExtractor
             "deepseek3" => Architecture.DeepSeekV3,
             // Zhipu GLM-4.5 MoE (Air / REAP / 355B): plain GQA + sigmoid-bias MoE, NOT the MLA deepseek2 GLM-4.7-Flash (#1598).
             "glm4moe" => Architecture.Glm4Moe,
+            // ricursiveAI Ripple-65B (#1643): community llama.cpp ports + PR #31692.
+            "ricursive" => Architecture.Ricursive,
             "lfm2moe" => Architecture.Lfm2Moe,
             "lfm3" => Architecture.Lfm3,
             "nemotron_h" => Architecture.NemotronH,
