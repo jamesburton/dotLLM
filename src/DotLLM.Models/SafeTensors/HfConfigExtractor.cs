@@ -28,7 +28,7 @@ namespace DotLLM.Models.SafeTensors;
 /// Llama vs Mistral vs Phi3 vs Qwen2 when <c>model_type</c> alone is ambiguous.
 /// </para>
 /// </remarks>
-public static class HfConfigExtractor
+public static partial class HfConfigExtractor
 {
     /// <summary>
     /// Parses a HF <c>config.json</c> payload (raw string) into a
@@ -54,6 +54,10 @@ public static class HfConfigExtractor
             throw new InvalidDataException("HF config.json root must be a JSON object.");
 
         Architecture architecture = ResolveArchitecture(root);
+
+        // Ripple (#1643): dedicated builder (hybrid layer_types, gated attention, value residual, FFN clamp, embed_scale null = folded).
+        if (architecture == Architecture.Ricursive)
+            return ExtractRicursive(root);
 
         // Gemma 3 multimodal checkpoints wrap the text-tower config under a
         // `text_config` sub-object (the top level carries vision_config / model_type
@@ -707,6 +711,9 @@ public static class HfConfigExtractor
         {
             // Zhipu GLM-4.5 MoE — `Glm4MoeForCausalLM` / `model_type=glm4_moe` (#1598). Checked first so no substring arm below can
             // shadow it; the dense `Glm4ForCausalLM` / `glm4` is NOT matched and stays unsupported.
+            // ricursiveAI Ripple — `RicursiveForCausalLM` / `model_type=ricursive` (custom_code, #1643).
+            (var a, _) when a is not null && a.Contains("ricursive") => Architecture.Ricursive,
+            (_, "ricursive") => Architecture.Ricursive,
             (var a, _) when a is not null && a.Contains("glm4moe") => Architecture.Glm4Moe,
             (_, "glm4_moe") => Architecture.Glm4Moe,
             // DeepSeek-V3 must be checked before V2 and before any Llama/Mistral

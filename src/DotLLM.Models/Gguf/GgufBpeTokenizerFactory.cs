@@ -64,14 +64,27 @@ public static class GgufBpeTokenizerFactory
             }
         }
 
+        // Ripple (ricursive, #1643): HF eos_token_id = [<|im_end|> 100265, <|endoftext|> 100257]. The GGUFs declare eos = <|im_end|> (and
+        // AtomicChat eot = the same id), so <|endoftext|> would never stop generation; llama.cpp's vocab loader marks both texts EOG.
+        string archName = metadata.GetStringOrDefault("general.architecture", "");
+        if (archName == "ricursive")
+        {
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                if (tokens[i] is "<|im_end|>" or "<|endoftext|>")
+                    AddEog(i);
+            }
+        }
+
         tokenizer.ExtraEndOfGenerationTokenIds = extra.ToArray();
 
         // Gemma 1 / CodeGemma / Gemma 2 are untrained-without-BOS: every consumer that calls
         // Encode() on a plain prompt (run, bench, server completions) would otherwise feed a
         // BOS-less stream and get garbage (Gemma 4 included: #784). Scoped to those architectures on purpose — the other
         // SPM/BPE models keep the historical BOS-agnostic Encode (their chat templates carry BOS).
-        string arch = metadata.GetStringOrDefault("general.architecture", "");
-        if (arch is "gemma" or "gemma2" or "gemma3" or "gemma4" or "gemma-embedding")
+        string arch = archName;
+        // Ripple (#1643): resolved explicitly so a plain Encode() can never prepend BOS (the resolver forces false without a key).
+        if (arch is "gemma" or "gemma2" or "gemma3" or "gemma4" or "gemma-embedding" or "ricursive")
             tokenizer.AddBosToken = GgufAddBosResolver.Resolve(metadata);
         // EmbeddingGemma frames every text as <bos> ... <eos> (sentence-transformers tokenizer template; llama.cpp add_eos_token).
         if (arch == "gemma-embedding")

@@ -119,6 +119,57 @@ checked against a header range-read (first 16 MB) of `bartowski/cerebras_GLM-4.5
   plus the shared expert added ungated; block output `routed + shared`. Config mapping: `SigmoidGating`, `HasSelectionBias`, `NormalizeExpertWeights`, `ExpertWeightsScale`, `NumSharedExperts`, `SharedExpertIntermediateSize` (= `moe * n_shared`, fused), `MlpOnlyLayers` = `[0..leading_dense)`.
 - GLM-4.7-Flash is a different architecture (`deepseek2`, MLA); dense `glm4` / `Glm4ForCausalLM` is not mapped.
 
+### Ripple (`ricursive`: ricursiveAI Ripple-65B-Preview) - config + census + tokenizer + template only (#1643), STUB
+
+Facts below come from the vendor `modeling_ricursive.py` / `configuration_ricursive.py` / `config.json`, both community llama.cpp ports
+(AtomicChat `ricursive-port.patch`, prometheusAIR `llama.cpp-ricursive.patch`), llama.cpp PR #31692 (head `8a5f7b0`), and header-only range reads
+(first 10 MiB, no weights) of the AtomicChat Q4_K_M and prometheusAIR Q6_K GGUFs (1203 tensors = 3 + 80 x 15 each). Tracker #1642.
+
+- **No forward pass.** `GgufModelConfigExtractor` (`BuildRicursiveConfig`), `HfConfigExtractor` (`RicursiveForCausalLM` / `model_type=ricursive`),
+  `RicursiveTensorCensus` and `SyntheticRicursiveGguf` (tiny GGUF + tiny HF directory) exist. `ModelLoader.CreateCpuModelFromGguf` runs the census
+  (invalid data on an unknown / mixed tensor table) and then refuses; `TransformerWeights` (central guard), `ModelLoader.LoadFromSafetensors`,
+  `CudaModelLoader` and `VulkanModelLoader` refuse with `RicursiveConfig.UnsupportedMessage`. CPU forward: #1644; Vulkan: #1645.
+  `debug gguf-config --header-only` prints the config and census of a header-only range read (`GgufHeaderOnly`).
+- **Block** (per layer `l`): `a = RMSNorm_in(h)`; `q = Wq a`, `k = Wk a`, `v = Wv lerp(x0, a, sigmoid(lambda_l))` with `x0` the **scaled** token
+  embedding (not normed, the same for every layer); per-head Q/K RMSNorm, then NeoX RoPE on sliding layers only (full layers are NoPE);
+  SDPA scale `1/sqrt(head_dim)`; `o = attn * sigmoid(F32(Wg a))` elementwise **before** `Wo`; `h += RMSNorm_post_attn(Wo o)`;
+  `f = RMSNorm_pre_ffn(h)`; `h += RMSNorm_post_ffn(Wdown(silu(min(Wgate f, c)) * clamp(Wup f, -c, c)))`. Plain RMSNorm `w * x / rms` (no `1 + w`).
+  Untied LM head, no soft-caps, no biases, no MoE.
+- **ModelConfig mapping**: `PerLayerSlidingWindow` (window on sliding layers, null on full) + `SlidingWindowSize` (1024 keys **including** the current
+  token: HF masks `key >= query - (window - 1)`), `NoRopeLayers` = the full layers (derived from the pattern; no separate key), `RoPEConfig`
+  (NeoX, `DimensionCount` = head_dim), `EmbeddingScale`, `UseQkNorm = true`. `ModelConfig.Ricursive` (`RicursiveConfig`) carries
+  `UseGatedAttention` / `UseValueResidual` (HF flags; **null from GGUF**, where the census decides from tensor presence, all layers or none),
+  `GateFullPrecision`, per-layer `FfnClamp` (0 = none) + `FfnClampDeclared`, `EmbeddingScaleFolded`. Compact SWA KV geometry
+  (`KvGeometry.FromConfig(config, compactSlidingWindows: true)`) windows exactly the sliding slots (64 x 1024 rows fixed + 16 growing full layers);
+  the S1 model must report `SupportsCompactSlidingKv`.
+- **GGUF metadata** (prefix `ricursive.`): `block_count` 80, `context_length` 2097152, `embedding_length` 5120, `feed_forward_length` 40960,
+  `attention.head_count` 80, `attention.head_count_kv` 8, `attention.key_length` = `value_length` 128, `attention.layer_norm_rms_epsilon` 1e-6,
+  `rope.freq_base` 10000 (no `freq_base_swa` in either file; honoured if present), `rope.dimension_count` 128 (must equal head_dim),
+  `attention.sliding_window` 1024 (**required**, as in PR #31692), `attention.sliding_window_pattern` **bool[80]** (true = sliding + RoPE; absent =
+  every 5th layer full; length must equal `block_count`; at least one sliding layer), optional `attention.rope_pattern` (PR #31692; must equal the
+  sliding pattern), `embedding_scale` 71.554176 (absent = folded; a declared 0 is rejected), `swiglu_clamp` 20.0 (F32 scalar in both published files;
+  PR #31692's current converter writes a per-layer array - both accepted; absent or 0 = no clamp; negative / non-finite rejected).
+  AtomicChat adds `ricursive.vocab_size`; prometheusAIR does not (vocab falls back to the token array length).
+- **Tensors** (GGUF ne-order): `token_embd [5120,100352]`, `output_norm`, `output [5120,100352]` (optional, tied fallback). Per block: `attn_norm`,
+  `attn_q [5120,10240]`, `attn_k [5120,1024]`, `attn_v [5120,1024]`, `attn_output [10240,5120]`, `attn_q_norm [128]`, `attn_k_norm [128]`,
+  `attn_gate [5120,10240]` (separate full-width gate, not packed into Q; arch-scoped - unrelated to the qwen35 GDN `attn_gate`), the value-residual
+  logit `[1]` F32 named **`attn_vres_lambda`** (AtomicChat, PR #31692) **or `attn_value_res`** (prometheusAIR) - one spelling per file, chosen by
+  layer 0, the other spelling anywhere is reported as unexpected - then `post_attention_norm`, `ffn_norm` (= pre-FFN norm), `ffn_gate`, `ffn_up`,
+  `ffn_down`, `post_ffw_norm`. HF names: `model.layers.N.{input_layernorm, self_attn.{q,k,v,o,g}_proj, self_attn.{q,k}_norm, self_attn.value_res_lambda
+  (no .weight), post_attention_layernorm, pre_feedforward_layernorm, post_feedforward_layernorm, mlp.{gate,up,down}_proj}`.
+- **HF config** (`configuration_ricursive.py` defaults): `layer_types` (`sliding_attention` / `full_attention`; default full iff `i % 5 == 4`;
+  a stored `hybrid_layer_pattern` that disagrees is rejected), `sliding_window` 1024, `use_gated_attention` true, `gate_full_precision` true,
+  `use_valres` **false** (the instruct config sets true), `ffn_clamp_threshold` null (reference: `if clamp_threshold:`), `embed_scale` null (folded).
+- **Tokenizer**: `gpt2` + `pre = dbrx` (the llama3 / cl100k regex; HF uses the equivalent `(?i:'s|...)`), 100352 tokens (100278..100351 are
+  `[PADn]` rows), 100000 merges. bos = unk = `<|endoftext|>` 100257, eos = eot = `<|im_end|>` 100265, pad 100277. **No BOS**: HF `post_processor` is null;
+  `GgufAddBosResolver` forces false for `general.architecture = ricursive` unless an explicit key says otherwise. `GgufBpeTokenizerFactory` adds
+  `<|endoftext|>` (and `<|im_end|>`) to the EOG set by text, matching HF `eos_token_id = [100265, 100257]`.
+- **Chat template**: the embedded `tokenizer.chat_template` is byte-identical to the vendor `chat_template.jinja` in both GGUFs (`tokenizer_config.json`
+  carries a bare ChatML stub - do not use it). ChatML; tools in the system turn as one JSON object per line inside `<tools>`; assistant calls as
+  `\n<tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>`; tool results merged into one **user** turn of `<tool_response>` blocks; prior
+  `reasoning_content` re-inserted as `<think>\n...\n</think>\n` unless `clear_thinking`; the generation prompt does not open `<think>` (the model
+  opens it itself). Parsers: `XmlToolCallParser` (template-detected, wraps Hermes) / `HermesToolCallParser` (arch fallback), `ReasoningSplitter`.
+
 ### gpt-oss (OpenAI gpt-oss-20b / 120b)
 - GGUF arch string: `gpt-oss` (llama.cpp `LLM_ARCH_OPENAI_MOE`)
 - Norm: RMSNorm; pre-FFN norm tensor is named `post_attention_norm`

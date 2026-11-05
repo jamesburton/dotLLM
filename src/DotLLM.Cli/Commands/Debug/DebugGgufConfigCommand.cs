@@ -17,6 +17,10 @@ internal sealed class DebugGgufConfigCommand : Command<DebugGgufConfigCommand.Se
         [CommandArgument(0, "<file>")]
         [Description("Path to a GGUF file or HuggingFace repo ID (e.g., Qwen/Qwen3-0.6B-GGUF).")]
         public string FilePath { get; set; } = string.Empty;
+
+        [CommandOption("--header-only")]
+        [Description("Parse only the metadata and tensor table (works on a header-only range read of a remote file; never maps weights).")]
+        public bool HeaderOnly { get; set; }
     }
 
     public override int Execute(CommandContext context, Settings settings)
@@ -25,12 +29,27 @@ internal sealed class DebugGgufConfigCommand : Command<DebugGgufConfigCommand.Se
         if (resolvedPath is null)
             return 1;
 
-        using var gguf = GgufFile.Open(resolvedPath);
+        GgufFile? gguf = null;
+        GgufMetadata metadata;
+        IReadOnlyList<(string Name, int[] Dims)> tensorTable;
+        if (settings.HeaderOnly)
+        {
+            var (md, tensors) = GgufHeaderOnly.Read(resolvedPath);
+            metadata = md;
+            tensorTable = tensors.Select(t => (t.Name, t.Shape.Dimensions)).ToList();
+        }
+        else
+        {
+            gguf = GgufFile.Open(resolvedPath);
+            metadata = gguf.Metadata;
+            tensorTable = gguf.Tensors.Select(t => (t.Name, t.Shape.Dimensions)).ToList();
+        }
+        using var ggufLifetime = gguf;
 
         Core.Models.ModelConfig config;
         try
         {
-            config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            config = GgufModelConfigExtractor.Extract(metadata);
         }
         catch (Exception ex)
         {
@@ -63,6 +82,12 @@ internal sealed class DebugGgufConfigCommand : Command<DebugGgufConfigCommand.Se
         table.AddRow("TiedEmbeddings", config.TiedEmbeddings.ToString());
         table.AddRow("SlidingWindowSize", config.SlidingWindowSize?.ToString() ?? "(none)");
         table.AddRow("PartialRotaryFactor", config.PartialRotaryFactor?.ToString("G") ?? "(none)");
+        table.AddRow("EmbeddingScale", config.EmbeddingScale?.ToString("G") ?? "(none)");
+        table.AddRow("UseQkNorm", config.UseQkNorm?.ToString() ?? "(undeclared)");
+        if (config.PerLayerSlidingWindow is { } plsw)
+            table.AddRow("Layer pattern (S=window, F=full)", string.Concat(plsw.Select(w => w is null ? 'F' : 'S')));
+        if (config.NoRopeLayers is { Count: > 0 } nope)
+            table.AddRow("NoRopeLayers", string.Join(",", nope));
         string chatTemplateDisplay = config.ChatTemplate is not null
             ? (config.ChatTemplate.Length > 80
                 ? string.Concat(config.ChatTemplate.AsSpan(0, 80), "...")
@@ -164,9 +189,33 @@ internal sealed class DebugGgufConfigCommand : Command<DebugGgufConfigCommand.Se
             AnsiConsole.Write(moeTable);
         }
 
+        if (config.Ricursive is { } rc)
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.Write(new Rule("[bold yellow]ricursive (Ripple) config[/]").LeftJustified());
+            var rt = new Table().Border(TableBorder.Rounded);
+            rt.AddColumn("Property");
+            rt.AddColumn("Value");
+            rt.AddRow("UseGatedAttention", rc.UseGatedAttention?.ToString() ?? "(from tensors)");
+            rt.AddRow("GateFullPrecision", rc.GateFullPrecision.ToString());
+            rt.AddRow("UseValueResidual", rc.UseValueResidual?.ToString() ?? "(from tensors)");
+            rt.AddRow("FfnClamp", rc.FfnClampDeclared
+                ? (rc.FfnClamp.Distinct().Count() == 1 ? rc.FfnClamp[0].ToString("G") : string.Join(",", rc.FfnClamp))
+                : "(key absent: no clamp)");
+            rt.AddRow("EmbeddingScaleFolded", rc.EmbeddingScaleFolded.ToString());
+            AnsiConsole.Write(rt);
+
+            var census = RicursiveTensorCensus.Check(config, tensorTable);
+            AnsiConsole.Write(new Rule("[bold yellow]ricursive tensor census[/]").LeftJustified());
+            AnsiConsole.MarkupLine((census.IsClean ? "[green]clean[/]: " : "[red]MISMATCH[/]: ") + census.ToString().EscapeMarkup());
+            foreach (string m in census.Missing.Take(20)) AnsiConsole.MarkupLine($"[red]missing[/] {m.EscapeMarkup()}");
+            foreach (string m in census.Unexpected.Take(20)) AnsiConsole.MarkupLine($"[yellow]unexpected[/] {m.EscapeMarkup()}");
+            foreach (string m in census.ShapeMismatches.Take(20)) AnsiConsole.MarkupLine($"[red]shape[/] {m.EscapeMarkup()}");
+        }
+
         if (config.Architecture == Core.Configuration.Architecture.Glm4Moe && config.Moe is not null)
         {
-            var census = Glm4MoeTensorCensus.Check(config, gguf);
+            var census = Glm4MoeTensorCensus.Check(config, tensorTable);
             AnsiConsole.WriteLine();
             AnsiConsole.Write(new Rule("[bold yellow]glm4moe tensor census[/]").LeftJustified());
             AnsiConsole.MarkupLine((census.IsClean ? "[green]clean[/]: " : "[red]MISMATCH[/]: ") + census.ToString().EscapeMarkup());

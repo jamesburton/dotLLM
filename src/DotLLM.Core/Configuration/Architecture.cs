@@ -539,5 +539,17 @@ public enum Architecture
     /// trailing NextN/MTP block counted in <c>block_count</c>. Distinct from GLM-4.7-Flash (<c>deepseek2</c>, MLA).
     /// Config + tensor census only (issue #1598): no forward pass yet, loaders refuse with <see cref="DotLLM.Core.Models.ModelConfig.Glm4MoeUnsupportedMessage"/>.
     /// </summary>
-    Glm4Moe
+    Glm4Moe,
+
+    /// <summary>
+    /// ricursiveAI Ripple (llama.cpp <c>ricursive</c>, HF <c>RicursiveForCausalLM</c> / <c>model_type=ricursive</c>; Ripple-65B-Preview):
+    /// a dense, Gemma-3n-like transformer with four RMSNorms per block (sandwich / "PeriNorm"), per-head Q/K RMS-norm, a separate
+    /// elementwise sigmoid output gate (<c>attn_gate</c> = HF <c>g_proj</c>, sigmoid in F32) applied before <c>o_proj</c>, a per-layer value
+    /// residual (the V input is <c>lerp(x0, normed, sigmoid(lambda_l))</c> with <c>x0</c> the scaled token embeddings), a hybrid of
+    /// sliding-window (NeoX RoPE) and full-attention NoPE layers (every 5th layer), a SwiGLU with clamped pre-activations and
+    /// embeddings scaled by <c>sqrt(hidden)</c>. No MoE, no biases, no soft-caps. Extra parameters live in
+    /// <see cref="DotLLM.Core.Models.ModelConfig.Ricursive"/>. Config + loader + tokenizer only (issue #1643): no forward pass yet,
+    /// loaders refuse with <see cref="DotLLM.Core.Models.RicursiveConfig.UnsupportedMessage"/>.
+    /// </summary>
+    Ricursive
 }
