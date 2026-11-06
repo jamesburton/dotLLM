@@ -169,6 +169,10 @@ public sealed class ChunkCacheEndpointTests : IDisposable
         Assert.Equal("f32", model["kv_dtype"]!.GetValue<string>());
         Assert.Equal(identity.Rope.RopeDim, model["rope"]!["dim"]!.GetValue<int>());
         Assert.Equal(identity.Rope.Theta, model["rope"]!["theta"]!.GetValue<float>());
+
+        // The CLI finds its index from these two fields (Task 4b naming).
+        string index = ChunkIndex.DefaultPath(_scratch, "symbol-512", model["id"]!.GetValue<string>(), model["producer"]!.GetValue<string>(), ChunkNamespace.Default);
+        Assert.EndsWith($".{model["producer"]!.GetValue<string>()[..8]}.default.json", index, StringComparison.Ordinal);
     }
 
     /// <summary>With the flag off neither route exists: the same bare 404 as any unmapped path, for every method.</summary>
