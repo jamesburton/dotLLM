@@ -39,8 +39,16 @@ highest tier and never raises what the CPU lacks: `avx2` turns the AVX-512 flags
 turns every SIMD flag off (kernels run their plain C# loops). An unrecognised value is ignored (no cap) and reported through
 `CpuFeatures.InvalidCapValue`/`Describe()`, so a typo cannot silently pin a slower tier.
 
-`DOTNET_EnableAVX=0`, `DOTNET_EnableAVX2=0`, `DOTNET_EnableAVX512F=0`, `DOTNET_EnableAVXVNNI=0` ... keep working: they change what `IsSupported`
-reports and every flag is derived from it. The difference: `DOTNET_Enable*` changes what the runtime reports (so also what BCL code such
+`DOTNET_EnableAVX=0`, `DOTNET_EnableAVX2=0`, `DOTNET_EnableAVX512=0`, `DOTNET_EnableAVXVNNI=0` keep working: they change what `IsSupported`
+reports and every flag is derived from it. **On .NET 10 these knobs are ISA groups** (measured on 10.0.11, Zen 5):
+
+| knob | effect |
+|---|---|
+| `DOTNET_EnableAVX2=0` | clears AVX2 **and FMA** (and AVX-512); AVX stays on |
+| `DOTNET_EnableAVX512=0` | clears AVX-512 F/BW/VL and `Vector512`; AVX2/FMA/AVX-VNNI stay on |
+| `DOTNET_EnableAVX512F=0` | **ignored** (AVX-512 stays on) |
+| `DOTNET_EnableFMA=0` | **ignored** (FMA stays on), so AVX2-without-FMA is unreachable on .NET 10 |
+| `DOTNET_EnableAVXVNNI=0` | clears AVX-VNNI only | The difference: `DOTNET_Enable*` changes what the runtime reports (so also what BCL code such
 as `TensorPrimitives` and `Vector256` do), `DOTLLM_CPU_ISA` changes only what dotLLM's own kernels pick. CI runs both: the
 `DOTNET_Enable*` leg (as before, now the whole CPU-side unit suite instead of only `DotLLM.Tests.Unit.Cpu`) and a `DOTLLM_CPU_ISA` leg for
 `scalar`, `v128` and `avx2`.
@@ -113,10 +121,17 @@ Q4_1 arithmetic and disagrees with the packed decode dot by ~0.77 on the synthet
 (`ComputeRowsQ4MultiAvx2_8Rows`), not a wrong answer; those two tests now skip with a reason below AVX2. Extending the packed path to the SSE
 tier is a performance item (see the issues listed in the PR).
 
+A gate that *predicts BCL behaviour* is not an ISA dispatch and must not be capped. `PortableMath.Exp` asks whether
+`TensorPrimitives.Exp` will vectorize (else it falls back to the C runtime's `expf`, which differs across OSes). Routed through the capped
+`Vector128Accelerated`, `DOTLLM_CPU_ISA=scalar` swapped in the double-evaluated exp although the BCL had not changed, and Q8 activation
+quantization digitized the ulp into a 0.027 miss on the quantized Flint llama.cpp golden (wide ISAs off + scalar cap). It now reads
+`CpuFeatures.RuntimeVector128Accelerated`, the uncapped flag that exists only for this.
+
 A test that asserts which tier the *dispatcher* picked must compute that from `CpuFeatures`, not from raw `IsSupported`: under
 `DOTLLM_CPU_ISA=scalar` the runtime still reports SSSE3, so five `SseTierDispatched` predicates (K-quant, low-bit K-quant, Q5_0, Q8_0, F16)
 expected bit-exact SSE output from a dispatcher that correctly ran scalar. Calling a tier-named leaf directly on the raw hardware flag
 (as `CpuTierMatrixTests` does) is fine: that tests the leaf, not the dispatch.
 
-The single-feature variants `DOTNET_EnableAVX512F=0`, `DOTNET_EnableAVXVNNI=0`, `DOTNET_EnableFMA=0` changed nothing on the Zen 5 test box
-(identical pass counts to the default run), i.e. no kernel in the suite was reachable through an AVX-512-without-X or VNNI-without-FMA gap there.
+The single-feature variants `DOTNET_EnableAVX512F=0` and `DOTNET_EnableFMA=0` gave pass counts identical to the default run because .NET 10
+**ignores** both (table above), not because they exercised a lower tier. The AVX2-without-AVX-512 tier is reached with
+`DOTNET_EnableAVX512=0` or `DOTLLM_CPU_ISA=avx2`; AVX2-without-FMA cannot be reached on .NET 10 at all.

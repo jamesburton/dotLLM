@@ -111,7 +111,9 @@ jobs:
         env:
           DOTNET_EnableAVX: "0"
           DOTNET_EnableAVX2: "0"
-          DOTNET_EnableAVX512F: "0"
+          # .NET 10 groups AVX-512 F/BW/CD/DQ/VL under one knob; DOTNET_EnableAVX512F alone is ignored there (#1623, measured on 10.0.11).
+          # EnableAVX=0 already implies it - this is explicit, not load-bearing.
+          DOTNET_EnableAVX512: "0"
         run: dotnet test tests/DotLLM.Tests.Unit/ -c Release --no-build --filter "FullyQualifiedName!~DotLLM.Tests.Unit.Vulkan&Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
 
       # DOTLLM_CPU_ISA (src/DotLLM.Cpu/CpuFeatures.cs, docs/CPU_FEATURE_GATING.md) caps the highest tier dotLLM dispatches to, on a

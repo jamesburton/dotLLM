@@ -35,8 +35,9 @@ public enum CpuIsaTier
 /// <para><b>Override.</b> <c>DOTLLM_CPU_ISA=scalar|v128|avx2|avx512</c> (case-insensitive; empty, <c>auto</c> or <c>best</c> =
 /// no cap) is read once at startup and caps the highest tier: <c>v128</c> turns every AVX/FMA/VNNI/AVX-512 flag off,
 /// <c>avx2</c> turns the AVX-512 flags off, <c>scalar</c> turns every flag off. The cap never raises what the CPU lacks.
-/// <c>DOTNET_EnableAVX=0</c>, <c>DOTNET_EnableAVX2=0</c>, <c>DOTNET_EnableAVX512F=0</c>, <c>DOTNET_EnableAVXVNNI=0</c> etc. keep working
-/// because they change what <c>IsSupported</c> reports and every flag here is derived from it.</para>
+/// <c>DOTNET_EnableAVX=0</c>, <c>DOTNET_EnableAVX2=0</c>, <c>DOTNET_EnableAVX512=0</c>, <c>DOTNET_EnableAVXVNNI=0</c> keep working
+/// because they change what <c>IsSupported</c> reports and every flag here is derived from it. On .NET 10 the knobs are ISA
+/// groups: <c>DOTNET_EnableAVX2=0</c> also clears FMA, and <c>DOTNET_EnableAVX512F=0</c> / <c>DOTNET_EnableFMA=0</c> are ignored.</para>
 ///
 /// <para><b>Cost.</b> Plain <c>static readonly bool</c> fields in a <c>beforefieldinit</c> class (no static constructor), so the JIT folds
 /// them to constants exactly as it does <c>X.IsSupported</c> once the class is initialised (tier-1 / OSR / full-opt methods alike).
