@@ -100,7 +100,10 @@ public sealed unsafe class PlanarPq2BlockedTests
         double rms = Math.Sqrt(truth.Sum(v => v * v) / truth.Length);
         double Err(float[] c) => Math.Sqrt(Enumerable.Range(0, c.Length).Sum(i => Math.Pow(c[i] - truth[i], 2)) / c.Length) / rms;
         Assert.True(Err(blocked) < 0.02, $"blocked rel-RMS {Err(blocked)}");
-        Assert.True(Err(blocked) < 3 * Err(prod) + 1e-4, $"blocked {Err(blocked)} vs production {Err(prod)}");
+        // The relative bound compares two Q8_0-activation grids. Below SSSE3 (DOTLLM_CPU_ISA=scalar, #1623) the non-planar production
+        // path is the float W2A16 tier (MatMul.ResolvePQ2_0UseW2A8 = CpuFeatures.Ssse3), which is ~exact, so only the absolute bound applies.
+        if (DotLLM.Cpu.CpuFeatures.Ssse3)
+            Assert.True(Err(blocked) < 3 * Err(prod) + 1e-4, $"blocked {Err(blocked)} vs production {Err(prod)}");
     }
 
     [Fact]

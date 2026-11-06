@@ -30,7 +30,7 @@ public sealed unsafe class KQuantSseTierTests
 
     public enum Fmt { Q4_K, Q5_K, Q6_K }
 
-    private static bool SseTierDispatched => Ssse3.IsSupported && !Avx2.IsSupported;
+    private static bool SseTierDispatched => DotLLM.Cpu.CpuFeatures.Ssse3 && !DotLLM.Cpu.CpuFeatures.Avx2; // the dispatcher's own condition (#1623)
 
     private static int BlockBytes(Fmt f) => f switch { Fmt.Q4_K => 144, Fmt.Q5_K => 176, _ => 210 };
 
