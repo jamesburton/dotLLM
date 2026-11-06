@@ -91,7 +91,7 @@ The AVX-512 paths were checked for the "F checked, BW/VL used" inconsistency: th
 | K-quant fast tiled (Q4_K/Q5_K/Q6_K) | `MatMulQ4KFast.cs:34,141`, `MatMulQ5KFast.cs:76`, `MatMulQ6KFast.cs:118` | `Avx2`+`Sse41` | reference kernels | A |
 | NVFP4 / MXFP4 | `MatMulNvfp4.cs:195`, `.Rows8.cs:75,89`, `MatMulMxfp4.cs:202,207` | `Avx2Fma`, `Ssse3` | scalar | A |
 | I2_S / PQ2_0 / PTQ1 / W2A8 | `MatMul.I2S.cs:164,197,765`, `MatMul.PQ2S.cs:105,512,564`, `MatMul.W2A8Sse.cs` via those | `Avx2`, `AvxVnni`, `Ssse3`, `Vector128Accelerated` | scalar | A |
-| PQ2_0 planar (opt-in) | `MatMul.PQ2Planar.cs:22,100` | `Avx2`, `AvxVnni`, `Fma` | `PQ2PlanarRowsScalar` | A (C fixed upstream) |
+| PQ2_0 planar (default-on since #1638, n <= `PQ2_0PlanarMaxN`) | `MatMul.PQ2Planar.cs:22,100` | `Avx2`, `AvxVnni`, `Fma` | `PQ2PlanarRowsScalar` | A (C fixed upstream) |
 | F16 GEMM/GEMV | `MatMul.F16Tile.cs:32`, `MatMul.F16Sse.cs:102` | `Fma`; `Sse3` without AVX2 | scalar | A |
 | Dequantize Q4_0..Q8_0 / K-quants | `Dequantize.cs:273,477`, `DequantizeKQuants.cs:109,394,522` | `Avx2` | scalar | A |
 | KV quantize/dequantize | `KvQuantize.cs:56,125,252` | `Avx2` | scalar | A |
@@ -112,6 +112,11 @@ GEMM for n > 1 is still dequantise-then-F32-GEMM (`MatMulLegacyQuants.cs:693`, `
 Q4_1 arithmetic and disagrees with the packed decode dot by ~0.77 on the synthetic Flint model. That is #1159's AVX2-only multi-column kernel
 (`ComputeRowsQ4MultiAvx2_8Rows`), not a wrong answer; those two tests now skip with a reason below AVX2. Extending the packed path to the SSE
 tier is a performance item (see the issues listed in the PR).
+
+A test that asserts which tier the *dispatcher* picked must compute that from `CpuFeatures`, not from raw `IsSupported`: under
+`DOTLLM_CPU_ISA=scalar` the runtime still reports SSSE3, so five `SseTierDispatched` predicates (K-quant, low-bit K-quant, Q5_0, Q8_0, F16)
+expected bit-exact SSE output from a dispatcher that correctly ran scalar. Calling a tier-named leaf directly on the raw hardware flag
+(as `CpuTierMatrixTests` does) is fine: that tests the leaf, not the dispatch.
 
 The single-feature variants `DOTNET_EnableAVX512F=0`, `DOTNET_EnableAVXVNNI=0`, `DOTNET_EnableFMA=0` changed nothing on the Zen 5 test box
 (identical pass counts to the default run), i.e. no kernel in the suite was reachable through an AVX-512-without-X or VNNI-without-FMA gap there.
