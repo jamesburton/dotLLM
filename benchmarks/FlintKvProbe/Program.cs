@@ -16,7 +16,7 @@ bool decodeMode = args.Length > 0 && args[0] == "decode", needleMode = args.Leng
 if (decodeMode || needleMode) args = args[1..];
 if (args.Length < 5) { Console.WriteLine("usage: FlintKvProbe <gguf> <corpus.txt> <ctxTokens> <evalRows> <arms>"); return 1; }
 string gguf = args[0], corpus = args[1];
-int ctx = int.Parse(args[2]), evalRows = int.Parse(args[3]);
+int ctx = int.Parse(args[2]), evalRows = decodeMode || needleMode ? 0 : int.Parse(args[3]);   // the needle slot holds a depth list
 string[] arms = args[4].Split(',');
 
 using var file = GgufFile.Open(gguf);
@@ -111,7 +111,9 @@ if (needleMode)
         needle.CopyTo(prompt, at);
         Array.Copy(ids, at, prompt, at + needle.Length, hayLen - at);
         suffix.CopyTo(prompt, ctx - suffix.Length);
-        foreach (string arm in arms)
+        // Arm order alternates per prompt, so neither format always runs first (clock ramp / thermal).
+        var order = (Array.IndexOf(depths, depth) * seeds + sd) % 2 == 0 ? arms : arms.Reverse().ToArray();
+        foreach (string arm in order)
         {
             model.KvStorageOverride = ArmStorage(arm);
             using var cache = model.CreateKvCache(ctx + 32);
