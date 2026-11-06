@@ -7,8 +7,10 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// <summary>
 /// Guards Roslyn against hostile nesting. Roslyn's parser recurses per nesting level, and a deep enough file (about 2000
 /// nested parentheses on a default 1–1.5 MB thread) overflows the stack, which no <c>catch</c> can stop: the process dies.
-/// Two defences: files nested deeper than <see cref="MaxNestingDepth"/> are not parsed at all (callers fall back), and the
-/// parse that does run uses a dedicated thread with a <see cref="ParseThreadStackBytes"/> stack.
+/// Three defences: files nested deeper than <see cref="MaxNestingDepth"/> brackets are not parsed at all (callers fall back); a
+/// parsed tree deeper than <see cref="MaxSyntaxDepth"/> is not bound; and the parse and the binding that do run use a dedicated
+/// thread with a <see cref="ParseThreadStackBytes"/> stack. Callers that bind (the graph builder) must use the second and third.
+/// The first defence alone is a PARSE guard: it does not make binding safe.
 /// </summary>
 internal static class RoslynParsing
 {
@@ -16,8 +18,8 @@ internal static class RoslynParsing
     public const int ParseThreadStackBytes = 256 * 1024 * 1024;
 
     /// <summary>
-    /// Deepest bracket nesting (<c>( [ {</c>) a file may have and still be parsed. Hand-written code stays far below it; the
-    /// limit is low enough that later Roslyn stages (binding a compilation's trees on an ordinary thread) are safe too.
+    /// Deepest bracket nesting (<c>( [ {</c>) a file may have and still be parsed. Hand-written code stays far below it. This
+    /// guards the PARSE only: nesting that uses no brackets is not counted, see <see cref="MaxSyntaxDepth"/>.
     /// </summary>
     public const int MaxNestingDepth = 512;
 
@@ -39,6 +41,31 @@ internal static class RoslynParsing
             {
                 if (depth > 0) depth--;
             }
+        }
+        return max;
+    }
+
+    /// <summary>
+    /// Deepest syntax-tree depth a file may have and still be bound. The bracket cap does not see nesting that uses no brackets
+    /// (generic angles, '.' chains, ternaries, unary operators, 'else if' chains), and Roslyn's binder recurses per level. Hand-written
+    /// code stays far below this; a 1000-term sum is about 1000 deep.
+    /// </summary>
+    public const int MaxSyntaxDepth = 2048;
+
+    /// <summary>
+    /// Depth of the deepest node under <paramref name="root"/> (a lone node is 1), computed without recursion so a hostile tree
+    /// cannot overflow the stack while it is measured. Parse the tree first (on the large-stack thread).
+    /// </summary>
+    public static int SyntaxDepth(SyntaxNode root)
+    {
+        var stack = new Stack<(SyntaxNode Node, int Depth)>();
+        stack.Push((root, 1));
+        int max = 0;
+        while (stack.Count > 0)
+        {
+            (SyntaxNode node, int depth) = stack.Pop();
+            if (depth > max) max = depth;
+            foreach (SyntaxNode child in node.ChildNodes()) stack.Push((child, depth + 1));
         }
         return max;
     }

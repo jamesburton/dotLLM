@@ -124,8 +124,34 @@ public sealed class RoslynGraphBuilder
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var index = new ChunkIndex(chunks, files.ToDictionary(kv => kv.Key, kv => kv.Value.Tree, StringComparer.Ordinal));
         var raw = new List<(Location Use, Location Def, SymbolEdgeKind Kind)>();
-        foreach (string path in files.Keys.Where(index.HasChunks).Order(StringComparer.Ordinal))
-            CollectFile(files[path].Compilation, files[path].Tree, index, raw);
+        // Binding recurses per nesting level of the source and a stack overflow cannot be caught: bind on the large-stack thread,
+        // skip a file whose tree is deeper than the cap (the bracket cap does not see generic-angle, '.', ternary or unary nesting),
+        // and treat Roslyn's own InsufficientExecutionStackException as "this file contributes no edge".
+        RoslynParsing.RunWithLargeStack(() =>
+        {
+            foreach (string path in files.Keys.Where(index.HasChunks).Order(StringComparer.Ordinal))
+            {
+                SyntaxTree tree = files[path].Tree;
+                int depth = RoslynParsing.SyntaxDepth(tree.GetRoot());
+                if (depth > RoslynParsing.MaxSyntaxDepth)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"{path}: syntax depth {depth} exceeds {RoslynParsing.MaxSyntaxDepth}; no edges from this file.");
+                    continue;
+                }
+                var fileRaw = new List<(Location, Location, SymbolEdgeKind)>();
+                try
+                {
+                    CollectFile(files[path].Compilation, tree, index, fileRaw);
+                }
+                catch (InsufficientExecutionStackException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"{path}: too deeply nested for Roslyn to bind; no edges from this file.");
+                    continue;
+                }
+                raw.AddRange(fileRaw);
+            }
+            return 0;
+        });
         TimeSpan bind = sw.Elapsed;
 
         sw.Restart();
@@ -189,12 +215,15 @@ public sealed class RoslynGraphBuilder
         {
             // Attribute names bind to the constructor: a call of it, and a use of the attribute type.
             bool invoked = IsInvokedName(name) || name.Parent is AttributeSyntax || name.Parent?.Parent is AttributeSyntax;
+            // Defensive: a constructor symbol only binds to attribute names, which count as invoked above, so this is believed
+            // unreachable (probed with ~95 name forms in the #1665 review). It is not covered by a test.
             if (method.MethodKind == MethodKind.Constructor && !invoked) return;
             AddTo(raw, index, use, Declarations(method), invoked ? SymbolEdgeKind.Call : SymbolEdgeKind.Use);
             if (method.MethodKind == MethodKind.Constructor) AddTo(raw, index, use, Declarations(method.ContainingType), SymbolEdgeKind.Use);
             return;
         }
         if (symbol is not (INamedTypeSymbol or IFieldSymbol or IPropertySymbol or IEventSymbol)) return;
+        // Defensive, believed unreachable: unresolved names bind to a null symbol and error types have no source locations.
         if (symbol is INamedTypeSymbol { TypeKind: TypeKind.Error }) return;
         AddTo(raw, index, use, Declarations(symbol), SymbolEdgeKind.Use);
 

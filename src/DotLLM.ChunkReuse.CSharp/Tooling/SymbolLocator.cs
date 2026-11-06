@@ -71,8 +71,19 @@ public static class SymbolLocator
             if (!file.Text.Contains(name, StringComparison.OrdinalIgnoreCase)) continue;
             // Roslyn's parser recurses with the nesting depth and a stack overflow cannot be caught: a file nested deeper than the
             // cap (the corpus and the symbol chunker apply the same rule) is skipped, and the rest are parsed on the large-stack thread.
-            if (RoslynParsing.TooDeep(file.Text, out _)) continue;
+            if (RoslynParsing.TooDeep(file.Text, out int bracketDepth))
+            {
+                System.Diagnostics.Trace.TraceWarning($"{file.Path}: bracket nesting {bracketDepth} exceeds {RoslynParsing.MaxNestingDepth}; not searched.");
+                continue;
+            }
             SyntaxTree tree = RoslynParsing.Parse(file.Text, file.Path);
+            // Nesting without brackets (generic angles, '.' chains, ternaries, unary operators) passes the bracket cap: measure the tree.
+            int syntaxDepth = RoslynParsing.SyntaxDepth(tree.GetRoot());
+            if (syntaxDepth > RoslynParsing.MaxSyntaxDepth)
+            {
+                System.Diagnostics.Trace.TraceWarning($"{file.Path}: syntax depth {syntaxDepth} exceeds {RoslynParsing.MaxSyntaxDepth}; not searched.");
+                continue;
+            }
             foreach ((string[] qualified, string kind, SyntaxToken id, TextSpan span) in Declarations(tree.GetRoot()))
             {
                 if (!qualified[^1].Equals(name, StringComparison.OrdinalIgnoreCase)) continue;
