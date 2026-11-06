@@ -105,7 +105,7 @@ public sealed class PathGlob
     /// <summary>True for a rooted path or one that starts with a <c>..</c> segment.</summary>
     internal static bool IsOutsideRoot(string slashPath) =>
         slashPath.StartsWith('/') || (slashPath.Length >= 2 && slashPath[1] == ':') || Path.IsPathRooted(slashPath)
-        || slashPath == ".." || slashPath.StartsWith("../", StringComparison.Ordinal);
+        || slashPath.Split('/').Contains("..", StringComparer.Ordinal); // a '..' segment anywhere: a/../../x must not match '**'
 
     /// <inheritdoc/>
     public override string ToString() => (Negated ? "!" : "") + Pattern;

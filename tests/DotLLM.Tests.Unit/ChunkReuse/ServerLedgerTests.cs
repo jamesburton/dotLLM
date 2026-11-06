@@ -512,6 +512,25 @@ public sealed class ServerLedgerTests : IDisposable
     }
 
     [Fact]
+    public void Ledger_EntryPathIsADirectory_RowKeptAndReportedUndetermined()
+    {
+        var store = new FileChunkStore(_root);
+        ChunkKey key = Key(TenantA, 5);
+        Put(store, key);
+        ServerLedger ledger = ServerLedger.Load(_root);
+        ledger.Record(key, TenantA, null, 1, T0);
+        SaveLocked(ledger);
+        string entry = store.PathOf(key);
+        File.Delete(entry);
+        Directory.CreateDirectory(entry); // a directory where the entry file belongs: not "not found", so the row is not dropped
+
+        ServerLedger back = ServerLedger.Load(_root);
+
+        Assert.Equal((0, 1), (back.DroppedOnLoad, back.UndeterminedOnLoad));
+        Assert.Contains(key.Hex, back.Rows.Select(r => r.KeyHex));
+    }
+
+    [Fact]
     public void Ledger_SaveFailure_IsNotMaskedByTempCleanup()
     {
         new FileChunkStore(_root);

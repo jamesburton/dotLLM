@@ -85,6 +85,19 @@ public sealed class StoreRegistry
     /// </summary>
     public const string BadCopyPrefix = ".bad-";
 
+    /// <summary>
+    /// The first free path for a bad copy of <paramref name="registryPath"/>: the UTC-stamped name, then the same name with <c>~1</c>,
+    /// <c>~2</c>, ... appended. The counter is appended to the stamped name, never cut out of the full path (a directory can
+    /// contain '~', e.g. a Windows 8.3 short name such as <c>PROGRA~1</c>).
+    /// </summary>
+    internal static string BadCopyPath(string registryPath, DateTime utc, Func<string, bool> exists)
+    {
+        string stamped = registryPath + BadCopyPrefix + utc.ToString("yyyyMMdd'T'HHmmssfff'Z'", System.Globalization.CultureInfo.InvariantCulture);
+        string bad = stamped;
+        for (int n = 1; exists(bad); n++) bad = stamped + "~" + n;
+        return bad;
+    }
+
     private static readonly StringComparer FileComparer = ChunkIndex.PathComparer;
     private static readonly string[] V1ToolFields = ["model_fingerprint", "model_path", "source_kind", "source_path", "configuration", "root"];
 
@@ -220,7 +233,14 @@ public sealed class StoreRegistry
 
     /// <summary>How long <see cref="Load"/> retries a read refused by a sharing violation or access denied (an AV scanner, an
     /// indexer, a writer's rename in progress) before treating the registry as unreadable.</summary>
-    internal static TimeSpan ReadRetryBudget { get; set; } = TimeSpan.FromSeconds(2);
+    internal static TimeSpan ReadRetryBudget
+    {
+        get => s_readRetryBudget.Value ?? TimeSpan.FromSeconds(2);
+        set => s_readRetryBudget.Value = value;
+    }
+
+    // Per async flow (a test shortens it for itself only; a process-wide value raced between parallel test classes).
+    private static readonly AsyncLocal<TimeSpan?> s_readRetryBudget = new();
 
     private static byte[] ReadWithRetry(string path)
     {
@@ -391,8 +411,7 @@ public sealed class StoreRegistry
         Directory.CreateDirectory(_root);
         if (_unreadableBytes is not null)
         {
-            string bad = path + BadCopyPrefix + DateTime.UtcNow.ToString("yyyyMMdd'T'HHmmssfff'Z'", System.Globalization.CultureInfo.InvariantCulture);
-            for (int n = 1; File.Exists(bad); n++) bad = bad.Split('~')[0] + "~" + n;
+            string bad = BadCopyPath(path, DateTime.UtcNow, File.Exists);
             File.WriteAllBytes(bad, _unreadableBytes);
             _unreadableBytes = null;
         }
