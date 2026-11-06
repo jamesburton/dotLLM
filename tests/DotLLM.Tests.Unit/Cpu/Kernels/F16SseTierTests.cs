@@ -23,7 +23,7 @@ public sealed unsafe class F16SseTierTests
     private readonly ITestOutputHelper _output;
     public F16SseTierTests(ITestOutputHelper output) => _output = output;
 
-    private static bool SseTierDispatched => Sse3.IsSupported && !Avx2.IsSupported;
+    private static bool SseTierDispatched => DotLLM.Cpu.CpuFeatures.Sse3 && !DotLLM.Cpu.CpuFeatures.Avx2; // MatMul.F16Sse's own condition (#1623)
 
     [SkippableTheory]
     [InlineData(1)]

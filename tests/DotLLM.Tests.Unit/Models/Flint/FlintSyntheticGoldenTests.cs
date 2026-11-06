@@ -160,14 +160,24 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
     }
 
     /// <summary>
+    /// The Q4_1 packed-at-every-batch-size GEMM (#1159) exists on the AVX2 tier only; pre-AVX2 tiers keep dequantise-then-GEMM for
+    /// prefill, so prefill disagrees with llama.cpp's Q4_1 arithmetic and with the packed decode dot by design (#1623).
+    /// Skip, not fail, where the tier under test cannot take that path.
+    /// </summary>
+    private static void SkipUnlessQ4PackedGemm()
+        => Skip.IfNot(DotLLM.Cpu.CpuFeatures.Avx2 && DotLLM.Cpu.Kernels.MatMul.Q4PackedAllColumns,
+            "Q4_1 packed prefill needs the AVX2 tier (and DOTLLM_CPU_Q4_PACKED_PREFILL != 0); on lower tiers it dequantises. " + IsaInfo());
+
+    /// <summary>
     /// Attention and dense FFN in Q4_1 (the official file's layout). Since #1159 dotLLM's batched Q4_1 GEMM is the packed x Q8_1 dot
     /// at every token count (bit-identical to its decode kernel), so prefill now runs llama.cpp's own arithmetic: it must match
     /// llama.cpp on the SAME Q4_1 bytes. Before #1159 prefill multiplied the dequantised weights by F32 activations, which matched
     /// llama.cpp only on the weights requantised to F32 and disagreed with dotLLM's own decode.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void DenseQ4_1_Prefill_Matches_LlamaCpp_Q4_1_Golden()
     {
+        SkipUnlessQ4PackedGemm();
         using var gguf = GgufFile.Open(Write(DenseQ4_1, "denseq"));
         ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
         float[] ours = Run(gguf, cfg);
@@ -180,9 +190,10 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
     /// Decode runs the dense Q4_1 projections on the same packed kernel as prefill (#1159), so the two paths agree to the
     /// attention-path tolerance. Before #1159 prefill used F32 activations and decode Q8_1, and they differed by ~0.8 in the logits.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void DenseQ4_1_Decode_Equals_Prefill()
     {
+        SkipUnlessQ4PackedGemm();
         using var gguf = GgufFile.Open(Write(DenseQ4_1, "denseq"));
         ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
         float diff = MaxAbs(Run(gguf, cfg, decode: true), Run(gguf, cfg));

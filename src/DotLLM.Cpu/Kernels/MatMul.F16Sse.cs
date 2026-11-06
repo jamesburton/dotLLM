@@ -99,6 +99,6 @@ public static unsafe partial class MatMul
     private static bool F16SseTier
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => !Avx2.IsSupported && Sse3.IsSupported;
+        get => !CpuFeatures.Avx2 && CpuFeatures.Sse3;
     }
 }

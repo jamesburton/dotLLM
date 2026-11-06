@@ -22,7 +22,7 @@ public static unsafe partial class MatMul
     /// <c>DOTLLM_PQ2_W2A8=0</c> asks for the unquantized-activation float tier (planar also quantizes activations, so it must not shadow that switch).
     /// </summary>
     private static bool s_pq2Planar =
-        ResolvePlanarDefault(Environment.GetEnvironmentVariable("DOTLLM_PQ2_PLANAR"), Environment.GetEnvironmentVariable("DOTLLM_PQ2_W2A8")) && Avx2.IsSupported;
+        ResolvePlanarDefault(Environment.GetEnvironmentVariable("DOTLLM_PQ2_PLANAR"), Environment.GetEnvironmentVariable("DOTLLM_PQ2_W2A8")) && CpuFeatures.Avx2;
 
     /// <summary>Planar default from the two env switches (pure, for tests): on unless <paramref name="planar"/> or <paramref name="w2a8"/> is 0/false/off.</summary>
     internal static bool ResolvePlanarDefault(string? planar, string? w2a8) =>
@@ -35,7 +35,7 @@ public static unsafe partial class MatMul
     /// Runtime toggle for the planar PQ2_0 kernels (initial value: on unless <c>DOTLLM_PQ2_PLANAR=0</c> or <c>DOTLLM_PQ2_W2A8=0</c>). Exists so a single process can
     /// alternate production/planar reps (same-session paired A/B, #1620); setting it true is ignored without AVX2.
     /// </summary>
-    public static bool PQ2_0PlanarEnabled { get => s_pq2Planar; set => s_pq2Planar = value && Avx2.IsSupported; }
+    public static bool PQ2_0PlanarEnabled { get => s_pq2Planar; set => s_pq2Planar = value && CpuFeatures.Avx2; }
 
     /// <summary>Number of planar GEMV calls made so far (proof that the path ran).</summary>
     public static long PQ2_0PlanarCalls => Interlocked.Read(ref s_planarCalls);
@@ -117,7 +117,7 @@ public static unsafe partial class MatMul
     /// <summary>Rows [start, start+count) of the planar dot. See the class summary.</summary>
     internal static void PQ2PlanarRows(byte* w, sbyte* xq, float* xs, float* xc, float* result, int start, int count, int k)
     {
-        if (Avx2.IsSupported) PQ2PlanarRowsAvx2(w, xq, xs, xc, result, start, count, k);
+        if (CpuFeatures.Avx2) PQ2PlanarRowsAvx2(w, xq, xs, xc, result, start, count, k);
         else PQ2PlanarRowsScalar(w, xq, xs, xc, result, start, count, k);
     }
 
@@ -159,7 +159,7 @@ public static unsafe partial class MatMul
     internal static void PQ2PlanarRowsAvx2(byte* w, sbyte* xq, float* xs, float* xc, float* result, int start, int count, int k)
     {
         int groups = k / PQ2_0GroupSize;
-        bool vnni = AvxVnni.IsSupported;
+        bool vnni = CpuFeatures.AvxVnni;
         Vector256<byte> mask3 = Vector256.Create((byte)3);
         Vector256<short> ones16 = Vector256.Create((short)1);
         for (int r = start; r < start + count; r++)
@@ -193,13 +193,13 @@ public static unsafe partial class MatMul
                     i3 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(t3, Unsafe.ReadUnaligned<Vector256<sbyte>>(xg + 96)), ones16);
                 }
                 Vector256<float> gacc = Avx.Multiply(Avx.ConvertToVector256Single(i0), Vector256.Create(xs[g * 4]));
-                gacc = Fma.IsSupported ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i1), Vector256.Create(xs[g * 4 + 1]), gacc)
+                gacc = CpuFeatures.Fma ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i1), Vector256.Create(xs[g * 4 + 1]), gacc)
                                        : gacc + Avx.ConvertToVector256Single(i1) * Vector256.Create(xs[g * 4 + 1]);
-                gacc = Fma.IsSupported ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i2), Vector256.Create(xs[g * 4 + 2]), gacc)
+                gacc = CpuFeatures.Fma ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i2), Vector256.Create(xs[g * 4 + 2]), gacc)
                                        : gacc + Avx.ConvertToVector256Single(i2) * Vector256.Create(xs[g * 4 + 2]);
-                gacc = Fma.IsSupported ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i3), Vector256.Create(xs[g * 4 + 3]), gacc)
+                gacc = CpuFeatures.Fma ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i3), Vector256.Create(xs[g * 4 + 3]), gacc)
                                        : gacc + Avx.ConvertToVector256Single(i3) * Vector256.Create(xs[g * 4 + 3]);
-                acc = Fma.IsSupported ? Fma.MultiplyAdd(gacc, Vector256.Create(gs), acc) : acc + gacc * Vector256.Create(gs);
+                acc = CpuFeatures.Fma ? Fma.MultiplyAdd(gacc, Vector256.Create(gs), acc) : acc + gacc * Vector256.Create(gs);
                 corr += gs * xc[g];
             }
             result[r] = HorizontalSumAvx2Float(acc) - corr;

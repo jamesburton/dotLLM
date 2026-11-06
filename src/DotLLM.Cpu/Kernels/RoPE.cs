@@ -374,7 +374,7 @@ public static class RoPE
         int halfDim = headDim / 2;
         int i = 0;
 
-        if (Avx2.IsSupported && halfDim >= 4)
+        if (CpuFeatures.Avx2 && halfDim >= 4)
         {
             ref float vecRef = ref MemoryMarshal.GetReference(vec);
             ref float cosRef = ref Unsafe.AsRef(in MemoryMarshal.GetReference(cos));
@@ -403,7 +403,7 @@ public static class RoPE
                 // Rotation: even' = even*cos - odd*sin = -(odd*sin) + even*cos
                 //           odd'  = even*sin + odd*cos
                 Vector128<float> newEven, newOdd;
-                if (Fma.IsSupported)
+                if (CpuFeatures.Fma)
                 {
                     // MultiplyAddNegated(a, b, c) = -(a*b) + c = c - a*b
                     // even' = -(odd * sin) + (even * cos)
@@ -465,7 +465,7 @@ public static class RoPE
         int halfDim = headDim / 2;
         int i = 0;
 
-        if (Avx2.IsSupported && halfDim >= 8)
+        if (CpuFeatures.Avx2 && halfDim >= 8)
         {
             ref float vecRef = ref MemoryMarshal.GetReference(vec);
             ref float cosRef = ref Unsafe.AsRef(in MemoryMarshal.GetReference(cos));
@@ -481,7 +481,7 @@ public static class RoPE
                 var sinVec = Vector256.LoadUnsafe(ref Unsafe.Add(ref sinRef, i));
 
                 Vector256<float> newEven, newOdd;
-                if (Fma.IsSupported)
+                if (CpuFeatures.Fma)
                 {
                     newEven = Fma.MultiplyAddNegated(odd, sinVec, even * cosVec);
                     newOdd  = Fma.MultiplyAdd(even, sinVec, odd * cosVec);

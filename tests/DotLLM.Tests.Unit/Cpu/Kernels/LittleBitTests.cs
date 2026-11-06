@@ -65,7 +65,6 @@ public sealed unsafe class LittleBitTests(ITestOutputHelper output)
     [InlineData(0)] [InlineData(1)] [InlineData(2)]
     public void Fixture_ReferenceAndKernels_MatchNumpyFloat64(int caseIdx)
     {
-        if (!Avx2.IsSupported) return;   // kernels are AVX2-only (spike); reference is covered by the other cases
         string path = Path.Combine(AppContext.BaseDirectory, "Cpu", "Kernels", "LittleBitData", "littlebit_fixture.json");
         using var doc = JsonDocument.Parse(File.ReadAllText(path));
         var c = doc.RootElement.GetProperty("cases")[caseIdx];
@@ -81,8 +80,8 @@ public sealed unsafe class LittleBitTests(ITestOutputHelper output)
             for (int i = 0; i < y.Length; i++) Assert.Equal(y[i], scalar[i], 1e-9 * (1 + Math.Abs(y[i])));
             Assert.True(MaxRel(y, Run(layer, x, null, LittleBitKernel.Avx2Float)) < 1e-5);
             Assert.True(MaxRel(y, Run(layer, x, pool, LittleBitKernel.Avx2Float)) < 1e-5);
-            if (LittleBitLayer.VnniSupported)
-                Assert.True(MaxRel(y, Run(layer, x, pool, LittleBitKernel.VnniInt8)) < 0.05);
+            // VnniInt8 runs the exact scalar integer loop where AVX-VNNI is absent (#1623), so this is unconditional.
+            Assert.True(MaxRel(y, Run(layer, x, pool, LittleBitKernel.VnniInt8)) < 0.05);
         }
     }
 
@@ -95,7 +94,6 @@ public sealed unsafe class LittleBitTests(ITestOutputHelper output)
     [InlineData(1, 5, 1, 2)]
     public void RandomShapes_Kernels_MatchScalarAndDenseF32Control(int dOut, int dIn, int r, int npaths)
     {
-        if (!Avx2.IsSupported) return;
         var rng = new Random(dOut * 31 + dIn);
         using var layer = new LittleBitLayer(Enumerable.Range(0, npaths).Select(_ => LittleBitPath.Random(dOut, dIn, r, rng)).ToArray());
         var dense = LittleBitReference.DecodeDense(layer);
@@ -109,7 +107,7 @@ public sealed unsafe class LittleBitTests(ITestOutputHelper output)
             Assert.True(MaxRel(refY, LittleBitReference.DenseGemv(dense, dOut, dIn, x)) < 1e-4);
             Assert.True(MaxRel(refY, Run(layer, x, null, LittleBitKernel.Avx2Float)) < 1e-4);
             Assert.True(MaxRel(refY, Run(layer, x, pool, LittleBitKernel.Avx2Float)) < 1e-4);
-            if (LittleBitLayer.VnniSupported)
+            // VnniInt8 runs the exact scalar integer loop where AVX-VNNI is absent (#1623), so this is unconditional.
             {
                 var yi = Run(layer, x, pool, LittleBitKernel.VnniInt8);
                 // not bit-comparable: two int8 activation quantizations (x' and t). Bound the extra error.

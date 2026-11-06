@@ -274,8 +274,8 @@ public sealed unsafe class LittleBitLayer : IDisposable
         return (float*)t;
     }
 
-    /// <summary>True when <see cref="LittleBitKernel.VnniInt8"/> can run on this CPU.</summary>
-    public static bool VnniSupported => AvxVnni.IsSupported && Avx2.IsSupported;
+    /// <summary>True when <see cref="LittleBitKernel.VnniInt8"/> runs on the AVX-VNNI instruction (otherwise it runs the exact scalar integer loop).</summary>
+    public static bool VnniSupported => CpuFeatures.AvxVnni;
 
     // ───────────────────────────── dispatch ─────────────────────────────
 
@@ -308,8 +308,8 @@ public sealed unsafe class LittleBitLayer : IDisposable
     public void Gemv(float* x, float* y, LittleBitScratch scratch, ComputeThreadPool? pool,
                      LittleBitKernel kernel = LittleBitKernel.Avx2Float)
     {
-        if (!Avx2.IsSupported) throw new PlatformNotSupportedException("AVX2 required");
-        if (kernel == LittleBitKernel.VnniInt8 && !VnniSupported) throw new PlatformNotSupportedException("AVX-VNNI required");
+        // No ISA precondition (#1620): the 8-row sign-dots fall back to scalar loops (SignedDot8FScalar / SignedDot8IScalar)
+        // when AVX2 / AVX-VNNI are absent or capped. The integer path is exact either way; the float path agrees to float order.
 
         Ctx ctx = default;
         ctx.PathCount = Paths.Length;
@@ -431,12 +431,12 @@ public sealed unsafe class LittleBitLayer : IDisposable
             byte* rows = p->V + (long)j0 * (p->DInPad / 8);
             if (ctx->Kernel == LittleBitKernel.Avx2Float)
             {
-                SignedDot8F(rows, p->DInPad / 8, valid, p->Xs, p->DInPad, fout);
+                SignedDot8FDispatch(rows, p->DInPad / 8, valid, p->Xs, p->DInPad, fout);
                 for (int k = 0; k < valid; k++) p->T[j0 + k] = fout[k] * p->L[j0 + k];
             }
             else
             {
-                SignedDot8I(rows, p->DInPad / 8, valid, p->Xq, p->DInPad, iout);
+                SignedDot8IDispatch(rows, p->DInPad / 8, valid, p->Xq, p->DInPad, iout);
                 float sc = p->XScale;
                 for (int k = 0; k < valid; k++)
                     p->T[j0 + k] = (float)(p->XSum - 2 * (iout[k] / 255)) * sc * p->L[j0 + k];
@@ -462,12 +462,12 @@ public sealed unsafe class LittleBitLayer : IDisposable
                 byte* rows = p->U + (long)o0 * (p->RPad / 8);
                 if (ctx->Kernel == LittleBitKernel.Avx2Float)
                 {
-                    SignedDot8F(rows, p->RPad / 8, valid, p->T, p->RPad, fout);
+                    SignedDot8FDispatch(rows, p->RPad / 8, valid, p->T, p->RPad, fout);
                     for (int k = 0; k < valid; k++) acc[k] += fout[k] * p->H[o0 + k];
                 }
                 else
                 {
-                    SignedDot8I(rows, p->RPad / 8, valid, p->Tq, p->RPad, iout);
+                    SignedDot8IDispatch(rows, p->RPad / 8, valid, p->Tq, p->RPad, iout);
                     float sc = p->TScale;
                     for (int k = 0; k < valid; k++)
                         acc[k] += (float)(p->TSum - 2 * (iout[k] / 255)) * sc * p->H[o0 + k];
@@ -509,13 +509,57 @@ public sealed unsafe class LittleBitLayer : IDisposable
         sum = s;
     }
 
+    /// <summary>AVX2 <see cref="SignedDot8FAvx2"/> when available, else <see cref="SignedDot8FScalar"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void SignedDot8FDispatch(byte* bits, int stride, int valid, float* v, int n, float* out8)
+    {
+        if (CpuFeatures.Avx2) SignedDot8FAvx2(bits, stride, valid, v, n, out8);
+        else SignedDot8FScalar(bits, stride, valid, v, n, out8);
+    }
+
+    /// <summary>AVX-VNNI <see cref="SignedDot8IVnni"/> when available, else <see cref="SignedDot8IScalar"/> (identical integers).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void SignedDot8IDispatch(byte* bits, int stride, int valid, sbyte* a, int n, int* out8)
+    {
+        if (CpuFeatures.Avx2 && CpuFeatures.AvxVnni) SignedDot8IVnni(bits, stride, valid, a, n, out8);
+        else SignedDot8IScalar(bits, stride, valid, a, n, out8);
+    }
+
+    /// <summary>Scalar <see cref="SignedDot8FAvx2"/>: float sums in index order per row (SIMD sums 8 lanes then reduces: same value to float order).</summary>
+    [SkipLocalsInit]
+    internal static void SignedDot8FScalar(byte* bits, int stride, int valid, float* v, int n, float* out8)
+    {
+        for (int k = 0; k < 8; k++)
+        {
+            byte* row = bits + (long)Math.Min(k, valid - 1) * stride;
+            float acc = 0f;
+            for (int i = 0; i < n; i++)
+                acc += ((row[i >> 3] >> (i & 7)) & 1) != 0 ? -v[i] : v[i];
+            out8[k] = acc;
+        }
+    }
+
+    /// <summary>Scalar <see cref="SignedDot8IVnni"/>: out[k] = 255 * sum of a[i] over set bits (exact integers).</summary>
+    [SkipLocalsInit]
+    internal static void SignedDot8IScalar(byte* bits, int stride, int valid, sbyte* a, int n, int* out8)
+    {
+        for (int k = 0; k < 8; k++)
+        {
+            byte* row = bits + (long)Math.Min(k, valid - 1) * stride;
+            int acc = 0;
+            for (int i = 0; i < n; i++)
+                if (((row[i >> 3] >> (i & 7)) & 1) != 0) acc += a[i];
+            out8[k] = 255 * acc;
+        }
+    }
+
     /// <summary>
     /// out[k] = sum_{i&lt;n} sign(bit(row k, i)) * v[i] for up to 8 bit-rows (rows beyond <paramref name="valid"/>
     /// alias the last valid row and are ignored). n must be a multiple of 32.
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    internal static void SignedDot8F(byte* bits, int stride, int valid, float* v, int n, float* out8)
+    internal static void SignedDot8FAvx2(byte* bits, int stride, int valid, float* v, int n, float* out8)
     {
         byte* b0 = bits;
         byte* b1 = bits + (long)Math.Min(1, valid - 1) * stride;
@@ -556,7 +600,7 @@ public sealed unsafe class LittleBitLayer : IDisposable
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    internal static void SignedDot8I(byte* bits, int stride, int valid, sbyte* a, int n, int* out8)
+    internal static void SignedDot8IVnni(byte* bits, int stride, int valid, sbyte* a, int n, int* out8)
     {
         byte* b0 = bits;
         byte* b1 = bits + (long)Math.Min(1, valid - 1) * stride;

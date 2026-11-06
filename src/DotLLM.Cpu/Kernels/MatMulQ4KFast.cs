@@ -31,7 +31,7 @@ public static unsafe partial class MatMul
     internal static volatile bool ForceDisableFastKQuant;
 
     /// <summary>True when the hoisted/4-token K-quant kernels may run (AVX2 + SSE4.1 and not force-disabled).</summary>
-    internal static bool FastKQuantIsa => !ForceDisableFastKQuant && Avx2.IsSupported && Sse41.IsSupported;
+    internal static bool FastKQuantIsa => !ForceDisableFastKQuant && CpuFeatures.Avx2 && CpuFeatures.Sse41;
 
     /// <summary>
     /// 4 rows x 1 token. <paramref name="w0"/> is the first row's first super-block, rows are
@@ -121,7 +121,7 @@ public static unsafe partial class MatMul
         Vector256<sbyte> q8Hi = Unsafe.ReadUnaligned<Vector256<sbyte>>(q8 + 32);
         Vector256<short> pLo = Avx2.MultiplyAddAdjacent(lo, q8Lo);
         Vector256<short> pHi = Avx2.MultiplyAddAdjacent(hi, q8Hi);
-        if (AvxVnni.IsSupported)
+        if (CpuFeatures.AvxVnni)
         {
             sumi = AvxVnni.MultiplyWideningAndAdd(sumi, pLo, scLo);
             return AvxVnni.MultiplyWideningAndAdd(sumi, pHi, scHi);
@@ -131,14 +131,14 @@ public static unsafe partial class MatMul
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<float> Q4KFma(float scale, Vector256<int> sumi, Vector256<float> acc)
-        => Fma.IsSupported
+        => CpuFeatures.Fma
             ? Fma.MultiplyAdd(Vector256.Create(scale), Avx.ConvertToVector256Single(sumi), acc)
             : Avx.Add(acc, Avx.Multiply(Vector256.Create(scale), Avx.ConvertToVector256Single(sumi)));
 
     [SkipLocalsInit]
     private static float Q4KRowTok1(byte* w, byte* q8k, int superBlockCount, int wStride)
     {
-        if (!Avx2.IsSupported || !Sse41.IsSupported)
+        if (!CpuFeatures.Avx2 || !CpuFeatures.Sse41)
             return VecDotQ4_K_Q8_KPortable(w, q8k, superBlockCount, wStride);
 
         Vector256<float> acc = Vector256<float>.Zero;

@@ -80,7 +80,7 @@ public static unsafe partial class MatMul
     private static Vector256<int> Q6KAccum(Vector256<int> sumi, Vector256<byte> q6u, byte* q8, Vector256<short> sv)
     {
         Vector256<short> prod = Avx2.MultiplyAddAdjacent(q6u, Unsafe.ReadUnaligned<Vector256<sbyte>>(q8));
-        return AvxVnni.IsSupported
+        return CpuFeatures.AvxVnni
             ? AvxVnni.MultiplyWideningAndAdd(sumi, prod, sv)
             : Avx2.Add(sumi, Avx2.MultiplyAddAdjacent(prod, sv));
     }
@@ -115,7 +115,7 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     private static float Q6KRowTok1(byte* w, byte* q8k, int superBlockCount, int wStride)
     {
-        if (!Avx2.IsSupported)
+        if (!CpuFeatures.Avx2)
             return VecDotQ6_K_Q8_KPortable(w, q8k, superBlockCount, wStride);
 
         Vector256<float> acc = Vector256<float>.Zero;

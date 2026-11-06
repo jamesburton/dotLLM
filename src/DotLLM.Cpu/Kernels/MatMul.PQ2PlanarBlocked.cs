@@ -81,7 +81,7 @@ public static unsafe partial class MatMul
 
     internal static void PQ2PlanarBlockRows(byte* w, sbyte* xq, float* xs, float* xc, float* c, int m, int start, int count, int k, int n)
     {
-        if (Avx2.IsSupported) { PQ2PlanarBlockRowsAvx2(w, xq, xs, xc, c, m, start, count, k, n); return; }
+        if (CpuFeatures.Avx2) { PQ2PlanarBlockRowsAvx2(w, xq, xs, xc, c, m, start, count, k, n); return; }
         int groups = k / PQ2_0GroupSize;
         for (int t = 0; t < n; t++)
             PQ2PlanarRowsScalar(w, xq + (long)t * k, xs + (long)t * groups * 4, xc + (long)t * groups, c + (long)t * m, start, count, k);
@@ -108,13 +108,13 @@ public static unsafe partial class MatMul
             i3 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(t3, Unsafe.ReadUnaligned<Vector256<sbyte>>(xg + 96)), ones16);
         }
         Vector256<float> gacc = Avx.Multiply(Avx.ConvertToVector256Single(i0), Vector256.Create(xsg[0]));
-        gacc = Fma.IsSupported ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i1), Vector256.Create(xsg[1]), gacc)
+        gacc = CpuFeatures.Fma ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i1), Vector256.Create(xsg[1]), gacc)
                                : gacc + Avx.ConvertToVector256Single(i1) * Vector256.Create(xsg[1]);
-        gacc = Fma.IsSupported ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i2), Vector256.Create(xsg[2]), gacc)
+        gacc = CpuFeatures.Fma ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i2), Vector256.Create(xsg[2]), gacc)
                                : gacc + Avx.ConvertToVector256Single(i2) * Vector256.Create(xsg[2]);
-        gacc = Fma.IsSupported ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i3), Vector256.Create(xsg[3]), gacc)
+        gacc = CpuFeatures.Fma ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(i3), Vector256.Create(xsg[3]), gacc)
                                : gacc + Avx.ConvertToVector256Single(i3) * Vector256.Create(xsg[3]);
-        return Fma.IsSupported ? Fma.MultiplyAdd(gacc, Vector256.Create(gs), acc) : acc + gacc * Vector256.Create(gs);
+        return CpuFeatures.Fma ? Fma.MultiplyAdd(gacc, Vector256.Create(gs), acc) : acc + gacc * Vector256.Create(gs);
     }
 
     [SkipLocalsInit]
@@ -122,7 +122,7 @@ public static unsafe partial class MatMul
     internal static void PQ2PlanarBlockRowsAvx2(byte* w, sbyte* xq, float* xs, float* xc, float* c, int m, int start, int count, int k, int n)
     {
         int groups = k / PQ2_0GroupSize;
-        bool vnni = AvxVnni.IsSupported;
+        bool vnni = CpuFeatures.AvxVnni;
         Vector256<byte> mask3 = Vector256.Create((byte)3);
         long qStride = k, sStride = (long)groups * 4, cStride = groups;
         for (int r = start; r < start + count; r++)

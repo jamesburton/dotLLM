@@ -106,7 +106,7 @@ public static unsafe partial class Dequantize
                 $"Q6_K element count must be a multiple of {KQuantGroupSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             DequantizeQ6_KAvx2(src, elementCount, dest);
         else
             DequantizeQ6_KScalar(src, elementCount, dest);
@@ -391,7 +391,7 @@ public static unsafe partial class Dequantize
                 $"Q4_K element count must be a multiple of {KQuantGroupSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             DequantizeQ4_KAvx2(src, elementCount, dest);
         else
             DequantizeQ4_KScalar(src, elementCount, dest);
@@ -519,7 +519,7 @@ public static unsafe partial class Dequantize
                 $"Q5_K element count must be a multiple of {KQuantGroupSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             DequantizeQ5_KAvx2(src, elementCount, dest);
         else
             DequantizeQ5_KScalar(src, elementCount, dest);

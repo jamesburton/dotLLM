@@ -112,7 +112,8 @@ public static unsafe class TernaryAdapterKernel
     public static void ApplyRow(float* row, int d, TernaryCircuit* circuits, int count, sbyte* x8, sbyte* q8, float* dqf,
         TernaryKernelIsa isa = TernaryKernelIsa.Auto)
     {
-        if (isa == TernaryKernelIsa.Auto) isa = Avx2.IsSupported ? TernaryKernelIsa.Avx2 : TernaryKernelIsa.Scalar;
+        if (isa == TernaryKernelIsa.Auto || (isa == TernaryKernelIsa.Avx2 && !CpuFeatures.Avx2))   // an unavailable request degrades, never throws (#1623)
+            isa = CpuFeatures.Avx2 ? TernaryKernelIsa.Avx2 : TernaryKernelIsa.Scalar;
         QuantizeAbsMaxInt8(row, d, x8);
         int wpr = WordsPerRow(d);
         int padded = PaddedCols(d);
@@ -258,7 +259,7 @@ public static unsafe class TernaryAdapterKernel
     internal static void DownRows(sbyte* x8, int d, ulong* down, int rank, float* scale, float* outF, TernaryKernelIsa isa = TernaryKernelIsa.Auto)
     {
         int wpr = WordsPerRow(d), padded = PaddedCols(d);
-        bool avx = isa != TernaryKernelIsa.Scalar && Avx2.IsSupported;
+        bool avx = isa != TernaryKernelIsa.Scalar && CpuFeatures.Avx2;
         for (int j = 0; j < rank; j++)
         {
             ulong* w = down + (long)j * wpr;

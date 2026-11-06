@@ -100,7 +100,10 @@ public sealed unsafe class PlanarPq2BlockedTests
         double rms = Math.Sqrt(truth.Sum(v => v * v) / truth.Length);
         double Err(float[] c) => Math.Sqrt(Enumerable.Range(0, c.Length).Sum(i => Math.Pow(c[i] - truth[i], 2)) / c.Length) / rms;
         Assert.True(Err(blocked) < 0.02, $"blocked rel-RMS {Err(blocked)}");
-        Assert.True(Err(blocked) < 3 * Err(prod) + 1e-4, $"blocked {Err(blocked)} vs production {Err(prod)}");
+        // The relative bound compares two Q8_0-activation grids. Below SSSE3 (DOTLLM_CPU_ISA=scalar, #1623) the non-planar production
+        // path is the float W2A16 tier (MatMul.ResolvePQ2_0UseW2A8 = CpuFeatures.Ssse3), which is ~exact, so only the absolute bound applies.
+        if (DotLLM.Cpu.CpuFeatures.Ssse3)
+            Assert.True(Err(blocked) < 3 * Err(prod) + 1e-4, $"blocked {Err(blocked)} vs production {Err(prod)}");
     }
 
     [Fact]
@@ -121,7 +124,7 @@ public sealed unsafe class PlanarPq2BlockedTests
                     MatMul.PQ2_0PlanarMaxN = 4;
                     MatMul.PQ2_0PlanarEnabled = false;
                     MatMul.GemmPQ2_0(wp, xp, co, m, k, n, null);
-                    if (!global::System.Runtime.Intrinsics.X86.Avx2.IsSupported) continue;   // toggle ignored without AVX2 (scalar CI leg)
+                    if (!DotLLM.Cpu.CpuFeatures.Avx2) continue;   // toggle ignored below the AVX2 tier (CpuFeatures, so DOTLLM_CPU_ISA caps count too; #1623)
                     MatMul.PQ2_0PlanarEnabled = true;
                     long calls0 = MatMul.PQ2_0PlanarCalls;
                     MatMul.GemmPQ2_0(wp, xp, cn, m, k, n, null);

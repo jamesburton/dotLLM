@@ -73,7 +73,7 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     private static float Q5KRowTok1(byte* w, byte* q8k, int superBlockCount, int wStride)
     {
-        if (!Avx2.IsSupported || !Sse41.IsSupported)
+        if (!CpuFeatures.Avx2 || !CpuFeatures.Sse41)
             return VecDotQ5_K_Q8_KPortable(w, q8k, superBlockCount, wStride);
 
         Vector256<float> acc = Vector256<float>.Zero;
