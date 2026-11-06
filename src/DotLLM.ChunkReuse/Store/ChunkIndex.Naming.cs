@@ -216,7 +216,14 @@ public sealed partial class ChunkIndex
     /// <summary>
     /// Test hook: runs inside <see cref="MigrateLegacyIndex"/> under the store lock, after the rename, before the registry save.
     /// </summary>
-    internal static Action? AfterMigrationRename { get; set; }
+    internal static Action? AfterMigrationRename
+    {
+        get => s_afterMigrationRename.Value;
+        set => s_afterMigrationRename.Value = value;
+    }
+
+    // Per async flow, so a hook one test sets never runs inside another test's migration on a parallel thread.
+    private static readonly AsyncLocal<Action?> s_afterMigrationRename = new();
 
     /// <summary>
     /// Migrates an older index of this chunker, model, producer and namespace to

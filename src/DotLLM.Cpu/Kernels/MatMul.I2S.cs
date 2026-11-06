@@ -161,7 +161,7 @@ public static unsafe partial class MatMul
         if (env is "0" or "false" or "off") return false;
         // Issue #477: SSSE3 suffices — pre-AVX2 hardware (e.g. Westmere) runs the 128-bit tier in
         // MatMul.W2A8Sse.cs. The 4x4 GEMM tile below stays AVX2-only.
-        return Ssse3.IsSupported;
+        return CpuFeatures.Ssse3;
     }
 
     // ─────────────────────────── 4x4 register-blocked GEMM tile (issue #232) ───────────────────────────
@@ -194,7 +194,7 @@ public static unsafe partial class MatMul
     {
         string? env = Environment.GetEnvironmentVariable("DOTLLM_I2S_TILE");
         if (env is "0" or "false" or "off") return false;
-        return Avx2.IsSupported;
+        return CpuFeatures.Avx2;
     }
 
     /// <summary>
@@ -762,7 +762,7 @@ public static unsafe partial class MatMul
     {
         // The tile is AVX2-only; on the 128-bit tier (issue #477) an explicit tiled=true request
         // (benchmarks/tests) degrades to the bit-exact per-cell form.
-        if (tiled && Avx2.IsSupported)
+        if (tiled && CpuFeatures.Avx2)
         {
             GemmI2_SW2A8RowsTiled(weights, bQ8, bScales, c, m, startRow, rowCount, k, n, scale);
             return;
@@ -889,7 +889,7 @@ public static unsafe partial class MatMul
             isum = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW.AsByte(), adjQ), ones);
 
         Vector256<float> fsum = Avx.ConvertToVector256Single(isum);
-        return Fma.IsSupported ? Fma.MultiplyAdd(bscale, fsum, acc) : acc + fsum * bscale;
+        return CpuFeatures.Fma ? Fma.MultiplyAdd(bscale, fsum, acc) : acc + fsum * bscale;
     }
 
     /// <summary>
@@ -914,7 +914,7 @@ public static unsafe partial class MatMul
         Vector256<float> a30 = Vector256<float>.Zero, a31 = Vector256<float>.Zero,
                          a32 = Vector256<float>.Zero, a33 = Vector256<float>.Zero;
 
-        bool useVnni = AvxVnni.IsSupported;
+        bool useVnni = CpuFeatures.AvxVnni;
         Vector256<short> ones = Vector256.Create((short)1);
 
         sbyte* w0 = w;
@@ -1004,7 +1004,7 @@ public static unsafe partial class MatMul
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float VecDotI2SQ8(sbyte* wI8, byte* xQ8, float* xScales, int blockCount)
-        => Avx2.IsSupported
+        => CpuFeatures.Avx2
             ? VecDotI2SQ8Avx2(wI8, xQ8, xScales, blockCount)
             : VecDotI2SQ8Sse(wI8, xQ8, xScales, blockCount);
 
@@ -1014,7 +1014,7 @@ public static unsafe partial class MatMul
     internal static float VecDotI2SQ8Avx2(sbyte* wI8, byte* xQ8, float* xScales, int blockCount)
     {
         Vector256<float> acc = Vector256<float>.Zero;
-        bool useVnni = AvxVnni.IsSupported;
+        bool useVnni = CpuFeatures.AvxVnni;
         Vector256<short> ones = Vector256.Create((short)1);
 
         for (int block = 0; block < blockCount; block++)
@@ -1047,7 +1047,7 @@ public static unsafe partial class MatMul
             // int32 block sum → float, scale by activation block scale, accumulate.
             Vector256<float> fsum = Avx.ConvertToVector256Single(isum);
             Vector256<float> bscale = Vector256.Create(dx);
-            if (Fma.IsSupported)
+            if (CpuFeatures.Fma)
                 acc = Fma.MultiplyAdd(bscale, fsum, acc);
             else
                 acc += fsum * bscale;
@@ -1062,7 +1062,7 @@ public static unsafe partial class MatMul
     /// at bit offsets {6,4,2,0}; code value maps via <c>(code - 1)</c>.
     ///
     /// <para><b>Not AVX2-vectorized (issue #128):</b> this path is only reached when
-    /// <see cref="I2SUseW2A8"/> is <c>false</c> (i.e. <see cref="Avx2.IsSupported"/> is already
+    /// <see cref="I2SUseW2A8"/> is <c>false</c> (i.e. <see cref="CpuFeatures.Avx2"/> is already
     /// <c>false</c> on the running box, per <see cref="GemvI2_SCore"/> / <see cref="GemmI2_SCore"/>),
     /// so an <c>Avx2</c>-gated fast path here would be dead code on every machine that reaches it.
     /// The hot GEMV-decode path (<see cref="UnpackRowI8"/>, used by the W2A8 SIMD tier) is the one
@@ -1096,7 +1096,7 @@ public static unsafe partial class MatMul
     ///
     /// <para><b>Issue #128 (GEMV-decode unpack vectorization).</b> This is the row-unpack used by
     /// the W2A8 SIMD tier (<see cref="GemvI2_SW2A8Rows"/>/<see cref="GemmI2_SW2A8Rows"/>), which is
-    /// only reachable when <see cref="Avx2.IsSupported"/> is <c>true</c> — so the fast path below is
+    /// only reachable when <see cref="CpuFeatures.Avx2"/> is <c>true</c> — so the fast path below is
     /// always live whenever this method runs. Profiling on real BitNet-shaped rows
     /// (m=6912,k=2560 and m=2560,k=6912, Strix Halo / Zen 5 AVX2+AVX-VNNI) showed unpack at 80–84%
     /// of total <c>GemvI2_S</c> wall time for the GEMV/decode path (unamortized — a fresh unpack per
@@ -1118,9 +1118,9 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void UnpackRowI8(byte* rowPtr, sbyte* dest, int k)
     {
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             UnpackRowI8Avx2(rowPtr, dest, k);
-        else if (Sse2.IsSupported)
+        else if (CpuFeatures.Sse2)
             UnpackRowI8Sse(rowPtr, dest, k);
         else
             UnpackRowI8Scalar(rowPtr, dest, k);

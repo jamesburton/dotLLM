@@ -29,7 +29,7 @@ public sealed unsafe class Q8_0SseTierTests
     private readonly ITestOutputHelper _output;
     public Q8_0SseTierTests(ITestOutputHelper output) => _output = output;
 
-    private static bool SseTierDispatched => Ssse3.IsSupported && !Avx2.IsSupported;
+    private static bool SseTierDispatched => DotLLM.Cpu.CpuFeatures.Ssse3 && !DotLLM.Cpu.CpuFeatures.Avx2; // the dispatcher's own condition (#1623)
 
     // ──────────────────── Half → Single ────────────────────
 

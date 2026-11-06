@@ -27,7 +27,7 @@ public static unsafe partial class MatMul
     /// <param name="ldc">Output stride between tokens.</param>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    internal static void Q8_0Rows4Tokens4(byte* groupBase, int blockCount, byte* xq, int xRowBytes, float* results, int ldc)
+    internal static void Q8_0Rows4Tokens4Avx2(byte* groupBase, int blockCount, byte* xq, int xRowBytes, float* results, int ldc)
     {
         nint rowStride = (nint)blockCount * Q8_0BlockBytes;
         Vector256<float>* acc = stackalloc Vector256<float>[16];

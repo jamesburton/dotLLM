@@ -110,7 +110,7 @@ public static unsafe partial class MatMul
                 sumi = Avx2.Add(sumi, Avx2.MultiplyAddAdjacent(prod, Vector256.Create((short)IQ4XsSubScale(qk, ib))));
             }
 
-            acc = Fma.IsSupported
+            acc = CpuFeatures.Fma
                 ? Fma.MultiplyAdd(Vector256.Create(dd), Avx.ConvertToVector256Single(sumi), acc)
                 : Avx.Add(acc, Avx.Multiply(Vector256.Create(dd), Avx.ConvertToVector256Single(sumi)));
 
@@ -169,7 +169,7 @@ public static unsafe partial class MatMul
     /// <summary>Best non-AVX2 IQ4_XS dot (SSSE3, else scalar).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotIQ4_XS_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
-        Ssse3.IsSupported ? VecDotIQ4_XS_Q8_KSse(qk, q8k, superBlockCount) : VecDotIQ4_XS_Q8_KScalar(qk, q8k, superBlockCount);
+        CpuFeatures.Ssse3 ? VecDotIQ4_XS_Q8_KSse(qk, q8k, superBlockCount) : VecDotIQ4_XS_Q8_KScalar(qk, q8k, superBlockCount);
 
     /// <summary>Row-major IQ4_XS × Q8_K: one dot per output row.</summary>
     [SkipLocalsInit]
@@ -177,7 +177,7 @@ public static unsafe partial class MatMul
     internal static void ComputeRowsIQ4_XS(byte* weights, byte* xQ8K, float* result, int m, int superBlockCount)
     {
         int rowBytes = superBlockCount * IQ4_XS_BlockBytes;
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             for (int row = 0; row < m; row++)
                 result[row] = VecDotIQ4_XS_Q8_KAvx2(weights + (long)row * rowBytes, xQ8K, superBlockCount);
@@ -283,7 +283,7 @@ public static unsafe partial class MatMul
         {
             byte* w = weights + (long)row * rowBytes;
             int t = 0;
-            if (Avx2.IsSupported)
+            if (CpuFeatures.Avx2)
             {
                 for (; t + 4 <= n; t += 4)
                 {
@@ -295,7 +295,7 @@ public static unsafe partial class MatMul
                 }
             }
             for (; t < n; t++)
-                c[(long)t * m + row] = Avx2.IsSupported
+                c[(long)t * m + row] = CpuFeatures.Avx2
                     ? VecDotIQ4_XS_Q8_KAvx2(w, inputQ8 + (long)t * q8RowBytes, superBlockCount)
                     : VecDotIQ4_XS_Q8_KPortable(w, inputQ8 + (long)t * q8RowBytes, superBlockCount);
         }

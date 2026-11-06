@@ -27,7 +27,7 @@ public static class CategoricalSampler
     /// </remarks>
     public static int ArgMax(ReadOnlySpan<float> values)
     {
-        if (Vector256.IsHardwareAccelerated)
+        if (DotLLM.Cpu.CpuFeatures.Vector256Accelerated)
             return TensorPrimitives.IndexOfMax(values);
 
         int bestIdx = 0;

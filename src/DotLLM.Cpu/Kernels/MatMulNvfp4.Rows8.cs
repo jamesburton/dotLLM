@@ -72,7 +72,7 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int SumSbytes16(byte* p)
     {
-        if (Sse2.IsSupported && Ssse3.IsSupported)
+        if (CpuFeatures.Sse2 && CpuFeatures.Ssse3)
         {
             Vector128<short> pairs = Ssse3.MultiplyAddAdjacent(Vector128.Create((byte)1), Sse2.LoadVector128((sbyte*)p));
             Vector128<int> quads = Sse2.MultiplyAddAdjacent(pairs, Vector128.Create((short)1));
@@ -86,7 +86,7 @@ public static unsafe partial class MatMul
     }
 
     /// <summary>Whether the 8-row NVFP4 kernel can run (AVX2 gather/permutes; VNNI optional).</summary>
-    private static bool Nvfp4Rows8 => Avx2.IsSupported && Fma.IsSupported && Environment.GetEnvironmentVariable("DOTLLM_CPU_NVFP4_ROWS8") != "0";
+    private static bool Nvfp4Rows8 => CpuFeatures.Avx2 && CpuFeatures.Fma && Environment.GetEnvironmentVariable("DOTLLM_CPU_NVFP4_ROWS8") != "0";
 
     private static readonly bool Nvfp4Rows8Enabled = Nvfp4Rows8;
 

@@ -53,7 +53,7 @@ public static unsafe partial class KvQuantize
                 $"elementCount must be a multiple of {BlockSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             Q8_0ToF32Avx2(src, dest, elementCount);
         else
             Q8_0ToF32Scalar(src, dest, elementCount);
@@ -122,7 +122,7 @@ public static unsafe partial class KvQuantize
                 $"elementCount must be a multiple of {BlockSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             F32ToQ4_0Avx2(src, dest, elementCount);
         else
             F32ToQ4_0Scalar(src, dest, elementCount);
@@ -249,7 +249,7 @@ public static unsafe partial class KvQuantize
                 $"elementCount must be a multiple of {BlockSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             Q4_0ToF32Avx2(src, dest, elementCount);
         else
             Q4_0ToF32Scalar(src, dest, elementCount);

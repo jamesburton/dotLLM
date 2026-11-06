@@ -454,7 +454,7 @@ public static unsafe partial class MatMul
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotIq_Q8_KPortable<T>(byte* qk, byte* q8k, int superBlockCount) where T : struct, IIqFormat =>
-        Ssse3.IsSupported ? VecDotIq_Q8_KSse<T>(qk, q8k, superBlockCount) : VecDotIq_Q8_KScalar<T>(qk, q8k, superBlockCount);
+        CpuFeatures.Ssse3 ? VecDotIq_Q8_KSse<T>(qk, q8k, superBlockCount) : VecDotIq_Q8_KScalar<T>(qk, q8k, superBlockCount);
 
     // ──────────────────── Rows / GEMV / GEMM drivers ────────────────────
 
@@ -464,7 +464,7 @@ public static unsafe partial class MatMul
         where T : struct, IIqFormat
     {
         int rowBytes = superBlockCount * T.BlockBytes;
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             for (int row = 0; row < m; row++)
                 result[row] = VecDotIq_Q8_KAvx2<T>(weights + (long)row * rowBytes, xQ8K, superBlockCount);
         else
@@ -483,7 +483,7 @@ public static unsafe partial class MatMul
         {
             byte* w = weights + (long)row * rowBytes;
             int t = 0;
-            if (Avx2.IsSupported)
+            if (CpuFeatures.Avx2)
             {
                 for (; t + 4 <= n; t += 4)
                 {
@@ -495,7 +495,7 @@ public static unsafe partial class MatMul
                 }
             }
             for (; t < n; t++)
-                c[(long)t * m + row] = Avx2.IsSupported
+                c[(long)t * m + row] = CpuFeatures.Avx2
                     ? VecDotIq_Q8_KAvx2<T>(w, inputQ8 + (long)t * q8RowBytes, superBlockCount)
                     : VecDotIq_Q8_KPortable<T>(w, inputQ8 + (long)t * q8RowBytes, superBlockCount);
         }

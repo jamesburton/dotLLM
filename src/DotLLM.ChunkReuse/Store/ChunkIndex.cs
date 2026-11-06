@@ -323,6 +323,9 @@ public sealed partial class ChunkIndex
     /// </summary>
     private static readonly AsyncLocal<StoreLockHandle[]?> s_flowStoreLocks = new();
 
+    /// <summary>Test hook: how many store-lock handles (held or released) this flow still tracks; released ones are pruned on the next acquire.</summary>
+    internal static int FlowStoreLocksTracked => (s_flowStoreLocks.Value ?? []).Length;
+
     /// <summary>
     /// Takes the store-wide writer lock: an exclusively opened (<see cref="FileShare.None"/>) <see cref="StoreLockFileName"/> in
     /// the store root, released on dispose or when the process dies. Hold it for <b>short scopes only</b> (integration spec L3):
@@ -425,7 +428,14 @@ public sealed partial class ChunkIndex
     }
 
     /// <summary>Test hook: runs inside <see cref="EvictStoreWideOrphans"/>, under the store lock, before the first delete.</summary>
-    internal static Action<IReadOnlyList<ChunkKey>>? BeforeOrphanDeletes { get; set; }
+    private static readonly AsyncLocal<Action<IReadOnlyList<ChunkKey>>?> s_beforeOrphanDeletes = new();
+
+    /// <remarks>Per async flow, so a hook one test sets never runs inside another test's eviction on a parallel thread.</remarks>
+    internal static Action<IReadOnlyList<ChunkKey>>? BeforeOrphanDeletes
+    {
+        get => s_beforeOrphanDeletes.Value;
+        set => s_beforeOrphanDeletes.Value = value;
+    }
 
     /// <summary>
     /// One eviction pass: takes the store lock, computes <see cref="StoreWideOrphans"/> and evicts them, all inside the one lock
@@ -662,7 +672,7 @@ public sealed partial class ChunkIndex
         foreach (string file in Directory.EnumerateFiles(root, IndexFilePrefix + "*" + IndexFileSuffix, SearchOption.TopDirectoryOnly))
         {
             if (!file.EndsWith(IndexFileSuffix, StringComparison.OrdinalIgnoreCase)) continue;
-            if (skip is not null && string.Equals(Path.GetFullPath(file), skip, StringComparison.OrdinalIgnoreCase)) continue;
+            if (skip is not null && PathComparer.Equals(Path.GetFullPath(file), skip)) continue;
             IndexDocument? doc;
             try
             {
@@ -811,7 +821,9 @@ public sealed partial class ChunkIndex
         }
         finally
         {
-            if (File.Exists(temp)) File.Delete(temp);
+            // Best effort: a cleanup failure must not replace the save's own exception (a leftover temp is swept by a later save).
+            try { if (File.Exists(temp)) File.Delete(temp); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }
     }
 
@@ -915,7 +927,14 @@ public sealed partial class ChunkIndex
     }
 
     /// <summary>How long <see cref="Save"/> keeps retrying the final rename while a reader holds the destination.</summary>
-    internal static TimeSpan SaveRetryBudget { get; set; } = TimeSpan.FromSeconds(2);
+    internal static TimeSpan SaveRetryBudget
+    {
+        get => s_saveRetryBudget.Value ?? TimeSpan.FromSeconds(2);
+        set => s_saveRetryBudget.Value = value;
+    }
+
+    // Per async flow (a test shortens it for itself only; a process-wide value raced between parallel test classes).
+    private static readonly AsyncLocal<TimeSpan?> s_saveRetryBudget = new();
 
     private const int ErrorAccessDenied = unchecked((int)0x80070005);
     private const int ErrorSharingViolation = unchecked((int)0x80070020);

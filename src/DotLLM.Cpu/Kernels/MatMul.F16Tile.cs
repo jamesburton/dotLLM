@@ -29,7 +29,7 @@ public static unsafe partial class MatMul
     internal static bool F16FmaTier
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => Avx.IsSupported && Fma.IsSupported && !s_f16FmaOff;
+        get => CpuFeatures.Fma && !s_f16FmaOff;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

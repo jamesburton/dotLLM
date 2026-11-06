@@ -51,7 +51,7 @@ public static unsafe partial class MatMul
     internal static bool IsQ8_0VnniSupported
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => AvxVnni.IsSupported;
+        get => CpuFeatures.Avx2FmaVnni;
     }
 
     /// <summary>

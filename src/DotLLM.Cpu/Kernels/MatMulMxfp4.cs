@@ -199,12 +199,12 @@ public static unsafe partial class MatMul
         // narrow this local to int.
         long rowBytes = (long)blockCount * Mxfp4BlockBytes;
 
-        if (Avx2.IsSupported && Ssse3.IsSupported)
+        if (CpuFeatures.Avx2 && CpuFeatures.Ssse3)
         {
             for (int row = 0; row < m; row++)
                 result[row] = VecDotMxfp4F32Avx2(weights + row * rowBytes, x, blockCount);
         }
-        else if (Ssse3.IsSupported)
+        else if (CpuFeatures.Ssse3)
         {
             // SSE-only CPUs (e.g. Westmere Xeons, #602): same pshufb unpack, 128-bit float accumulate.
             for (int row = 0; row < m; row++)
