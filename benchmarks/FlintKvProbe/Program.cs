@@ -22,9 +22,11 @@ string[] arms = args[4].Split(',');
 using var file = GgufFile.Open(gguf);
 var cfg = GgufModelConfigExtractor.Extract(file.Metadata);
 var tok = GgufTokenizerFactory.Load(file.Metadata);
-int[] ids = tok.Encode(File.ReadAllText(corpus)).Take(ctx + 1 + 512).ToArray();
+// KVPROBE_OFFSET (tokens, default 0) moves the window through the corpus, so a KL repeat scores different text rather than re-running the same bits.
+int offset = int.TryParse(Environment.GetEnvironmentVariable("KVPROBE_OFFSET"), out int off) ? off : 0;
+int[] ids = tok.Encode(File.ReadAllText(corpus)).Skip(offset).Take(ctx + 1 + 512).ToArray();
 if (ids.Length < ctx + 1) { Console.WriteLine($"corpus has only {ids.Length} tokens, need {ctx + 1}"); return 1; }
-Console.WriteLine($"[kvprobe] corpus {ids.Length} tokens; ctx {ctx}, scored rows {evalRows} at depth {ctx - evalRows}..{ctx}");
+Console.WriteLine($"[kvprobe] corpus {ids.Length} tokens from offset {offset}; ctx {ctx}, scored rows {evalRows} at depth {ctx - evalRows}..{ctx}");
 
 var sw = Stopwatch.StartNew();
 using var model = VulkanTransformerModel.LoadFromGguf(file, cfg);
