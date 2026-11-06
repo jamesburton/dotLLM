@@ -149,7 +149,8 @@ public sealed unsafe class Lfm3VulkanParityTests(Xunit.Abstractions.ITestOutputH
         var (vkModel, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, SpvDir());
         using var vk = (IDisposable)vkModel;
         var lfm3 = (VulkanLfm3TransformerModel)vkModel;
-        int[] tokens = NaturalTokens();
+        // 2557 rows: not divisible by the slice count, so the remainder-distribution (extra rows) is exercised.
+        int[] tokens = NaturalTokens().Take(2557).ToArray();
         var positions = Enumerable.Range(0, tokens.Length).ToArray();
 
         float[] Run(VulkanPrefillSubmitBudget budget)
