@@ -124,7 +124,7 @@ public sealed unsafe class PlanarPq2BlockedTests
                     MatMul.PQ2_0PlanarMaxN = 4;
                     MatMul.PQ2_0PlanarEnabled = false;
                     MatMul.GemmPQ2_0(wp, xp, co, m, k, n, null);
-                    if (!global::System.Runtime.Intrinsics.X86.Avx2.IsSupported) continue;   // toggle ignored without AVX2 (scalar CI leg)
+                    if (!DotLLM.Cpu.CpuFeatures.Avx2) continue;   // toggle ignored below the AVX2 tier (CpuFeatures, so DOTLLM_CPU_ISA caps count too; #1623)
                     MatMul.PQ2_0PlanarEnabled = true;
                     long calls0 = MatMul.PQ2_0PlanarCalls;
                     MatMul.GemmPQ2_0(wp, xp, cn, m, k, n, null);

@@ -43,7 +43,7 @@ public sealed class PlanarPq2DefaultWiringTests
     [Fact]
     public void ProcessDefault_FollowsResolvers()
     {
-        bool expected = global::System.Runtime.Intrinsics.X86.Avx2.IsSupported && MatMul.ResolvePlanarDefault(
+        bool expected = DotLLM.Cpu.CpuFeatures.Avx2 && MatMul.ResolvePlanarDefault(
             Environment.GetEnvironmentVariable("DOTLLM_PQ2_PLANAR"), Environment.GetEnvironmentVariable("DOTLLM_PQ2_W2A8"));
         Assert.Equal(expected, MatMul.PQ2_0PlanarEnabled);
         Assert.Equal(MatMul.ResolvePlanarMaxN(Environment.GetEnvironmentVariable("DOTLLM_PQ2_PLANAR_NMAX")), MatMul.PQ2_0PlanarMaxN);
