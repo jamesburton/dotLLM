@@ -76,6 +76,13 @@ public static class CpuFeatures
     /// <summary>Portable <c>Vector128</c> is hardware accelerated and the cap allows 128-bit code.</summary>
     public static readonly bool Vector128Accelerated = Cap >= CpuIsaTier.Vector128 && Vector128.IsHardwareAccelerated;
 
+    /// <summary>
+    /// Whether the RUNTIME accelerates <c>Vector128</c>, ignoring <see cref="Cap"/>. Only for predicting what BCL code such as
+    /// <c>TensorPrimitives</c> will do (the cap does not change the BCL); never for choosing one of dotLLM's own kernels.
+    /// <c>PortableMath.Exp</c> uses it to know whether <c>TensorPrimitives.Exp</c> vectorizes or falls back to the C runtime's <c>expf</c>.
+    /// </summary>
+    public static readonly bool RuntimeVector128Accelerated = Vector128.IsHardwareAccelerated;
+
     // ── 256-bit ────────────────────────────────────────────────────────────
 
     /// <summary>AVX and AVX2 (the integer 256-bit tier). Does NOT imply <see cref="Fma"/>.</summary>

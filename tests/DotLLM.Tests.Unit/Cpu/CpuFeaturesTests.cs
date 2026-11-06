@@ -63,6 +63,27 @@ public sealed class CpuFeaturesTests
     }
 
     /// <summary>
+    /// <c>PortableMath.Exp</c> predicts what the BCL does, so the <c>DOTLLM_CPU_ISA</c> cap must not change it: on a runtime that
+    /// accelerates <c>Vector128</c> a long span is exactly <c>TensorPrimitives.Exp</c> under every cap. Gating it on the capped
+    /// <see cref="CpuFeatures.Vector128Accelerated"/> swapped in the double-evaluated exp under <c>scalar</c>, which differs by an ulp on
+    /// some of these inputs and moved the quantized Flint golden by 0.027 (all wide ISAs off + scalar cap).
+    /// </summary>
+    [SkippableFact]
+    public void PortableMathExp_LongSpans_AreTensorPrimitivesExp_UnderEveryCap()
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.Vector128.IsHardwareAccelerated, "runtime does not accelerate Vector128: both sides take expf");
+        var x = new float[4099];
+        for (int i = 0; i < x.Length; i++) x[i] = -20f + 40f * i / x.Length + 1e-3f * (i % 7);
+        var want = new float[x.Length];
+        var got = new float[x.Length];
+        System.Numerics.Tensors.TensorPrimitives.Exp(x, want);
+        DotLLM.Cpu.Kernels.PortableMath.Exp(x, got);
+        for (int i = 0; i < x.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(want[i]) == BitConverter.SingleToInt32Bits(got[i]),
+                $"exp({x[i]:R}): TensorPrimitives {want[i]:R} vs PortableMath {got[i]:R} [{CpuFeatures.Describe()}]");
+    }
+
+    /// <summary>
     /// When the process was started with <c>DOTLLM_CPU_ISA</c> (the CI tier legs), the cap is in force: every flag above the cap is off.
     /// Without the variable the cap is "none" and this asserts only that the parse agrees, so it passes on every configuration.
     /// </summary>

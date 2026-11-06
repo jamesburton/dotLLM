@@ -33,10 +33,12 @@ internal static class PortableMath
     /// ulp. An attention row of 1..3 keys (the first tokens of a prompt) hit exactly that fallback, and the ulp was digitized
     /// into a different int8 by the next quantized GEMM: <c>FlintSyntheticGoldenTests.Quantized_Forward_Matches_LlamaCpp_Golden</c>
     /// failed at 0.0199 on Linux CI and passed on Windows. Short spans take the double-evaluated <see cref="Exp(float)"/>.
+    /// The test is the RUNTIME's acceleration, not the <c>DOTLLM_CPU_ISA</c> cap (#1623): it predicts what the BCL does, and the cap
+    /// does not change the BCL. Gating it on the cap swapped the vectorized exp for the double one under <c>DOTLLM_CPU_ISA=scalar</c>.
     /// </summary>
     internal static void Exp(ReadOnlySpan<float> x, Span<float> destination)
     {
-        if (CpuFeatures.Vector128Accelerated && x.Length >= Vector128<float>.Count)
+        if (CpuFeatures.RuntimeVector128Accelerated && x.Length >= Vector128<float>.Count)
         {
             TensorPrimitives.Exp(x, destination);
             return;
