@@ -16,8 +16,10 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// (coopmat tolerance).</para>
 /// <para>Controls: every case also asserts the Q8 output differs from the attention over the UNQUANTISED rows (so a kernel that ignored the
 /// quantisation, or read stale F32, cannot pass), and that this difference is small (the Q8 error budget).</para>
-/// <para>Mutants (run by hand): scale read from the wrong word, <c>blk * 9</c> replaced by <c>blk * 8</c>, the data byte offset off by one word, a K
-/// scale used for V, and a writer that rounds half away from zero each fail the affected cases.</para>
+/// <para>Mutants (applied to the .spv in bin, 2026-11-05, all killed): kv_load.glsl K <c>blk * 9</c> -> <c>blk * 8</c> (3 cases fail) and V read with
+/// the K scale (3); writer ignores <c>dstBlockOffset</c> (1) and truncates instead of roundEven (3); coopmat flash data word off by one (3) and V
+/// with the K scale (3); GQA v2 split pass K scale from the wrong word (3), V with the K scale (3), V second word skipped (3). The GQA cases run the
+/// v2 pass (its own Q8 loader) and the per-query-head case runs kv_load.glsl, so each loader has its own killing case.</para>
 /// </remarks>
 [Trait("Category", "GPU")]
 [Collection("VulkanKernels")]
