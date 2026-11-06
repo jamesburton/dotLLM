@@ -211,6 +211,26 @@ public sealed partial class GitCliInfo : IGitInfo
 
     private static string Printable(string s) => new(s.Select(c => char.IsControl(c) ? '?' : c).ToArray());
 
+    /// <summary>Most characters read from git's stdout or stderr; more kills git and throws <see cref="GitException"/> (a hostile or huge repository must not fill memory).</summary>
+    internal int MaxOutputChars { get; init; } = 64 * 1024 * 1024;
+
+    private static async Task<string> ReadCapped(StreamReader reader, Process process, int maxChars, string verb)
+    {
+        var sb = new StringBuilder();
+        var buffer = new char[8192];
+        int n;
+        while ((n = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0)
+        {
+            if (sb.Length + n > maxChars)
+            {
+                try { process.Kill(entireProcessTree: true); } catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception) { }
+                throw new GitException($"git {verb} printed more than {maxChars} characters; stopped.");
+            }
+            sb.Append(buffer, 0, n);
+        }
+        return sb.ToString();
+    }
+
     private (int Code, string Output, string Error) Run(string directory, params string[] args)
     {
         var psi = new ProcessStartInfo(_git)
@@ -233,15 +253,16 @@ public sealed partial class GitCliInfo : IGitInfo
         {
             process = Process.Start(psi) ?? throw new GitException($"Could not start '{_git}'.");
         }
-        catch (System.ComponentModel.Win32Exception ex)
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or DirectoryNotFoundException or InvalidOperationException
+                                        or PlatformNotSupportedException)
         {
-            throw new GitException($"Could not start '{_git}' (is git installed and on PATH?): {ex.Message}", ex);
+            throw new GitException($"Could not start '{_git}' in {directory} (is git installed and on PATH?): {ex.Message}", ex);
         }
         using (process)
         {
             process.StandardInput.Close();
-            Task<string> stdout = process.StandardOutput.ReadToEndAsync();
-            Task<string> stderr = process.StandardError.ReadToEndAsync();
+            Task<string> stdout = ReadCapped(process.StandardOutput, process, MaxOutputChars, args[0]);
+            Task<string> stderr = ReadCapped(process.StandardError, process, MaxOutputChars, args[0]);
             if (!process.WaitForExit(_timeout))
             {
                 try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
