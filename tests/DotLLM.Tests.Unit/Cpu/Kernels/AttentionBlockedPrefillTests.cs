@@ -66,6 +66,47 @@ public sealed unsafe class AttentionBlockedPrefillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// In-process timing of the two kernels on the LFM3 shape at depth (run with <c>DOTLLM_ATTN_BENCH=1</c>): a 1024-token chunk whose
+    /// KV ends at 16K and at 32K, all cores, interleaved old/new x 3. Prints ms per call; indicative only on a contended box.
+    /// </summary>
+    [SkippableFact]
+    [Trait("Category", "Benchmark")]
+    public void Blocked_Timing_Lfm3Shape()
+    {
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_ATTN_BENCH") != "1", "set DOTLLM_ATTN_BENCH=1");
+        const int numHeads = 16, numKvHeads = 4, headDim = 128, seqQ = 1024;
+        using var pool = new ComputeThreadPool(Environment.ProcessorCount);
+        foreach (int seqKv in new[] { 16384, 32768 })
+        {
+            int positionOffset = seqKv - seqQ;
+            float[] q = Random(seqQ * numHeads * headDim, 1), k = Random(seqKv * numKvHeads * headDim, 2), v = Random(seqKv * numKvHeads * headDim, 3);
+            float* outP = (float*)NativeMemory.AlignedAlloc((nuint)(q.Length * sizeof(float)), 64);
+            try
+            {
+                fixed (float* qp = q, kp = k, vp = v)
+                {
+                    for (int rep = 0; rep < 3; rep++)
+                    {
+                        foreach (bool blocked in new[] { false, true })
+                        {
+                            Attention.BlockedPrefillEnabled = blocked;
+                            var sw = System.Diagnostics.Stopwatch.StartNew();
+                            Attention.Execute(qp, kp, vp, outP, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, pool);
+                            sw.Stop();
+                            Console.WriteLine($"[attn-bench] seqKv={seqKv} seqQ={seqQ} {(blocked ? "blocked" : "per-row ")} {sw.Elapsed.TotalMilliseconds:F0} ms");
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                Attention.BlockedPrefillEnabled = true;
+                NativeMemory.AlignedFree(outP);
+            }
+        }
+    }
+
     [Fact]
     public void Blocked_DoesNotRun_ForSlidingWindowOrShortRows()
     {

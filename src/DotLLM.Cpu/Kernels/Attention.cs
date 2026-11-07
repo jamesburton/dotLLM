@@ -528,7 +528,8 @@ public static class Attention
     /// </summary>
     public const string BlockedPrefillEnvVar = "DOTLLM_CPU_ATTN_BLOCKED";
 
-    private static readonly bool BlockedPrefillDisabled = Environment.GetEnvironmentVariable(BlockedPrefillEnvVar) == "0";
+    /// <summary>Runtime switch (tests, in-process A/B); initialised from <see cref="BlockedPrefillEnvVar"/>.</summary>
+    internal static bool BlockedPrefillEnabled = Environment.GetEnvironmentVariable(BlockedPrefillEnvVar) != "0";
 
     /// <summary>Query tokens per work item; with GQA 16/4 that is 128 (token, head) rows sharing one K/V block.</summary>
     internal const int BlockedRowsPerItem = 32;
@@ -543,7 +544,7 @@ public static class Attention
     /// </summary>
     internal static unsafe bool BlockedPrefillApplies(int seqQ, int seqKv, int positionOffset, float* alibiSlopes, int? slidingWindowSize,
                                                       float softCap, AttentionMaskMode maskMode, float[]? sinks)
-        => !BlockedPrefillDisabled && seqQ > 1 && alibiSlopes is null && (slidingWindowSize ?? 0) <= 0 && softCap == 0f
+        => BlockedPrefillEnabled && seqQ > 1 && alibiSlopes is null && (slidingWindowSize ?? 0) <= 0 && softCap == 0f
            && maskMode == AttentionMaskMode.Causal && sinks is null
            && Math.Min(seqKv, positionOffset + seqQ) > OneShotMaxKeys;
 
