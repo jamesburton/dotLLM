@@ -1,0 +1,6 @@
+#version 450
+// Q8_0-KV twin of attention_f32_splitkv_gqa_v2.comp (issue #1161): K / V read as Q8_0 blocks (kv_load.glsl).
+// Body: attention_f32_splitkv_gqa_v2.glsl.
+#define KV_Q8 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32_splitkv_gqa_v2.glsl"

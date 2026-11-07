@@ -1,0 +1,6 @@
+#version 450
+// Q8_0-KV twin of attention_f32_splitkv.comp (issue #1102): the same kernel reading K / V stored as Q8_0 (36-byte blocks,
+// see kv_load.glsl). Body: attention_f32_splitkv.glsl.
+#define KV_Q8 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32_splitkv.glsl"

@@ -250,6 +250,24 @@ batch test compares against an F32-cache oracle, because a wrong kernel is wrong
   rows (the recompute floor above). Compare with KL / top-1 / PPL, and budget the occasional chaotic row (one in 8,224 here, KL 0.23).
 - **Do not** write F32 into a Vulkan KV cache through raw buffers: only the cache's own writers know the element format.
 
+### Flint Q8_0 KV on Vulkan (opt-in, issue #1605)
+
+`DOTLLM_VK_KV=q8_0` (Flint only) stores K / V as 36-byte blocks (`[float scale][32 x int8]`, 1.125 B/element) written by
+`convert_f32_to_q8_0_kv_range` and **read in place** by the `_kvq8` twins of the split-KV decode (per-head pass via `kv_load.glsl`, GQA v2
+pass with its own loader), the reference sink kernel and the coopmat sink-flash prefill. No history dequant scratch. No small-row (2..4)
+twin, no host row IO, prefix snapshots or handoff (they refuse Q8_0). It stays opt-in; F16 is the Flint default.
+
+- **Bytes:** K+V per token per layer 1,152 B vs F16 2,048 B (0.5625x); 14 full layers grow at 15.75 KiB/token vs 28 KiB. Caches measured:
+  8K 180 vs 320 MiB, 128K 2,073 vs 3,686 MiB.
+- **Speed:** NOT faster. Decode equal to F16 at 2K, slower at depth (128K median 20.2 vs 26.0 tok/s); prefill equal at 8K.
+- **Quality (8K, 512 scored rows at depth 7.7K, three corpus windows, F32 KV reference):** KL mean q8_0 0.068 / 0.076 / 0.054 vs F16
+  0.019 / 0.034 / 0.013 (2.3-4.3x the F16 floor; medians 3.8-4.9x); top-1 93.6-94.5% vs 95.1-97.5%; NLL within the run-to-run spread of
+  F16 (no PPL loss). Needle recall 6/6 at 8K and 3/3 at 32K for both formats.
+- **128K:** the q8_0 needle prefill arm coincided with a hard system lock-up (unexpected shutdown, no TDR event) on 2026-11-06; the F16 arm
+  of the same run passed. Not retried. Earlier 128K q8_0 decode sweeps and a PPL run completed, so the cause is unconfirmed.
+- **Proof the path ran:** halving the writer's stored scale moves q8_0 NLL 2.34 -> 9.53 while F16 stays bit-identical (2.3242); zeroing
+  the GQA v2 decode kernel's K scale turns a q8_0 needle HIT into a MISS with F16 unchanged.
+
 ### Vulkan quantized KV and the per-query-position attention (feasibility, issue #1550)
 
 Question: can the per-query-position attention (`attention_flash_gqa_qpos*`, #1540; used for selective recompute and chunk-KV
