@@ -113,11 +113,16 @@ public sealed class GraphBuilderHostileInputTests
     /// <summary>Shapes that passed the previous 2048 cap and overflowed a caller's ordinary stack in <c>GetDiagnostics()</c>.</summary>
     public static TheoryData<string, string> CallerStackShapes() => new()
     {
-        { "nested lambdas x1500", Wrap("System.Func<int, object> f = " + string.Concat(Enumerable.Repeat("v => ", 1500)) + "1;") },
-        { "ternary chain x1100", Wrap("int y = " + string.Concat(Enumerable.Repeat("b ? 1 : ", 1100)) + "0;") },
-        { "nested switch expressions x400", Wrap("var y = " + string.Concat(Enumerable.Repeat("x switch { _ => ", 400)) + "1" + new string('}', 400) + ";") },
-        { "nested lambdas x2000", Wrap("System.Func<int, object> f = " + string.Concat(Enumerable.Repeat("v => ", 2000)) + "1;") },
+        // Each shape has a call at its core ("Lib.Add"): binding that call binds every level above it.
+        { "nested lambdas x1500", Wrap("System.Func<int, object> f = " + string.Concat(Enumerable.Repeat("v => ", 1500)) + "Lib.Add(1, 2);") },
+        { "ternary chain x1100", Wrap("int y = " + string.Concat(Enumerable.Repeat("b ? 1 : ", 1100)) + "Lib.Add(1, 2);") },
+        { "nested switch expressions x400", Wrap("var y = " + string.Concat(Enumerable.Repeat("x switch { _ => ", 400)) + "Lib.Add(1, 2)" + new string('}', 400) + ";") },
+        { "nested lambdas x2000", Wrap("System.Func<int, object> f = " + string.Concat(Enumerable.Repeat("v => ", 2000)) + "Lib.Add(1, 2);") },
     };
+
+    /// <summary>Deeper than <see cref="RoslynParsing.MaxSyntaxDepth"/>: not even the large stack is trusted with it.</summary>
+    private static string BeyondTheLargeStackCap() =>
+        Wrap("System.Func<int, object> f = " + string.Concat(Enumerable.Repeat("v => ", 3000)) + "Lib.Add(1, 2);");
 
     /// <summary>The 1 MiB default of a Windows thread: what an ordinary caller binds on (the runtime may give more, never less).</summary>
     private static void OnOrdinaryStack(Action work)
@@ -175,6 +180,26 @@ public sealed class GraphBuilderHostileInputTests
 
         Assert.Contains(sites, s => s.Path == "ok.cs" && s.Method is not null && s.Method.Contains("Add"));
         Assert.True(shape.Length > 0);
+    }
+
+    [Fact]
+    public void CallResolutionSites_TreeBeyondTheLargeStackCap_IsSkipped_NotBound()
+    {
+        var ok = new SourceFile("ok.cs", Ok);
+        var hostile = new SourceFile("hostile.cs", BeyondTheLargeStackCap());
+        var trees = new Dictionary<string, Microsoft.CodeAnalysis.SyntaxTree>(StringComparer.Ordinal)
+        {
+            [ok.Path] = RoslynParsing.Parse(ok.Text, ok.Path),
+            [hostile.Path] = RoslynParsing.Parse(hostile.Text, hostile.Path),
+        };
+        Assert.True(RoslynParsing.SyntaxDepth(trees[hostile.Path].GetRoot()) > RoslynParsing.MaxSyntaxDepth, "control: the tree is beyond the cap");
+        var compilation = Microsoft.CodeAnalysis.CSharp.CSharpCompilation.Create("p", trees.Values, Bcl(),
+            new Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions(Microsoft.CodeAnalysis.OutputKind.DynamicallyLinkedLibrary));
+
+        IReadOnlyList<CallSite> sites = CallResolution.Sites([new ProjectCompilation("p", compilation, trees)]);
+
+        Assert.DoesNotContain(sites, s => s.Path == "hostile.cs");
+        Assert.Contains(sites, s => s.Path == "ok.cs");
     }
 
     [Fact]
