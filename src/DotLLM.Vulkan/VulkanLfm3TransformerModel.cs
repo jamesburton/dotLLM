@@ -389,12 +389,12 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         // Progressive slicing: each slice is sized at its own KV depth with the rates the previous slices refitted, so the shallow
         // start runs in long slices and only the deep tail is cut short (the uniform sizing of #1649 was ~25 % slower at 28K).
         ITensor? last = null;
-        int start = 0;
+        int start = 0, previous = 0;
         while (start < rows)
         {
             int remaining = rows - start;
             int len = start == 0 ? first
-                : _submitBudget.NextSliceRows(remaining, kvStart0 + start, ParamsPerLayer, Config.NumAttentionHeads, Config.HeadDim);
+                : _submitBudget.NextSliceRows(remaining, kvStart0 + start, ParamsPerLayer, Config.NumAttentionHeads, Config.HeadDim, previous);
             len = Math.Clamp(len, 1, remaining);
             // Every slice must stay on the last-row-logits path (a slice short enough for all-row logits would download them all).
             if (len <= _allRowLogitsLimit) len = Math.Min(remaining, _allRowLogitsLimit + 1);
@@ -402,6 +402,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
             last?.Dispose();
             last = Run(tokenIds.Slice(start, len), positions.Slice(start, len), deviceId, kvCache);
             start += len;
+            previous = len;
         }
         return last;
     }
@@ -489,7 +490,8 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
             {
                 Fb(cmd);
                 submit.SubmitAndWait();
-                _submitBudget.Observe(openDense, openAttn, System.Diagnostics.Stopwatch.GetElapsedTime(openStart).TotalSeconds);
+                _submitBudget.Observe(openDense, openAttn, System.Diagnostics.Stopwatch.GetElapsedTime(openStart).TotalSeconds,
+                    attentionMeanKv: Math.Max(1.0, kvEndObs - ((T - 1) / 2.0)));
                 openDense = openAttn = 0;
                 openStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 submit.Begin();
