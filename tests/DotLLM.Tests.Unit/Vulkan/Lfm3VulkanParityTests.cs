@@ -115,6 +115,7 @@ public sealed unsafe class Lfm3VulkanParityTests(Xunit.Abstractions.ITestOutputH
 
         // Vulkan: chunked prefill + single-token decode through the sparse KV cache and device conv state.
         long clipped0 = VulkanLfm3TransformerModel.SlidingClippedDecodes, flash0 = VulkanLfm3TransformerModel.SlidingFlashPrefills;
+        long global0 = VulkanLfm3TransformerModel.GlobalFlashPrefills;
         vkModel.ResetSequenceState();
         using var kv = kvFactory(tokens.Length + 8);
         using var state = vkModel.CreateSequenceState()!;
@@ -136,6 +137,9 @@ public sealed unsafe class Lfm3VulkanParityTests(Xunit.Abstractions.ITestOutputH
             Assert.True(VulkanLfm3TransformerModel.SlidingClippedDecodes > clipped0, "no sliding-layer decode used a clipped KV range");
             Assert.True(VulkanLfm3TransformerModel.SlidingFlashPrefills > flash0, "no sliding-layer prefill used the GQA flash kernel");
         }
+        // #1572 remainder: the global layers' prefill must have run on the GQA-grouped kernel too (the per-head coopmat kernel is the fallback).
+        if (!VulkanLfm3TransformerModel.GlobalGqaDisabled)
+            Assert.True(VulkanLfm3TransformerModel.GlobalFlashPrefills > global0, "no global-layer prefill used the GQA flash kernel");
     }
 
     /// <summary>
