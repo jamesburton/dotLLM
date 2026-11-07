@@ -180,8 +180,13 @@ public sealed unsafe class Lfm3VulkanParityTests(Xunit.Abstractions.ITestOutputH
         var whole = Run(new VulkanPrefillSubmitBudget(1000));
         Assert.Equal(before, lfm3.RowSliceForwardsForTest);
         var sliced = Run(new VulkanPrefillSubmitBudget(0.02));
-        Assert.True(lfm3.RowSliceForwardsForTest - before >= 4, "budget did not force row slicing");
-        AssertClose(whole, sliced, 1e-4, "row-sliced vs single-forward prefill");
+        int slices = lfm3.RowSliceForwardsForTest - before;
+        Assert.True(slices >= 4, "budget did not force row slicing");
+        output.WriteLine($"row slices: {slices}");
+        // Slices are not bit-identical to one forward (GEMM row-count variants); the drift grows with the slice count. #1666's uniform
+        // slicing measured KL 2.5e-5; the progressive, depth-scaled slicing of #1572 at this forced budget cuts many more slices and
+        // measured 1.0e-4. The #1666 mutants (wrong positions / dropped remainder / wrong slice start) sat at KL 7-15.
+        AssertClose(whole, sliced, 5e-4, $"row-sliced ({slices} slices) vs single-forward prefill");
         int aw = Array.IndexOf(whole, whole.Max()), asl = Array.IndexOf(sliced, sliced.Max());
         Assert.Equal(aw, asl);
     }
