@@ -2834,6 +2834,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     /// <summary>Prefill projections that ran on the dp4a MMQ (#1149; test hook).</summary>
     internal long MmqPrefillDispatchCount { get; private set; }
 
+    /// <summary>Whether this device has the f16 coopmat prefill GEMM for <paramref name="qt"/> at input width <paramref name="inputDim"/> (#1149; test hook).</summary>
+    internal bool HasCoopmatPrefillFor(QuantizationType qt, int inputDim) => _kernels.HasCoopmatPrefill(qt, inputDim);
+
     /// <summary>
     /// The prefill GEMM path <see cref="RecordMatmul"/> takes for a <paramref name="qt"/> weight of input width <paramref name="inputDim"/> at
     /// <paramref name="seqLen"/> rows once the small-row GEMVs and the int8-coopmat arm have declined (#1149; test hook mirroring the dispatch).

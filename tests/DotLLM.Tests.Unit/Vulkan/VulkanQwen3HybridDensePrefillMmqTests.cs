@@ -96,7 +96,7 @@ public sealed class VulkanQwen3HybridDensePrefillMmqTests
         return w;
     }
 
-    private sealed record VkRun(float[] Logits, long MmqDispatches, DensePrefillGemmPath Q4K, DensePrefillGemmPath Iq4NlPath, bool IntegerDot);
+    private sealed record VkRun(float[] Logits, long MmqDispatches, DensePrefillGemmPath Q4K, DensePrefillGemmPath Iq4NlPath, bool IntegerDot, bool Q4KCoopmat);
 
     private static VkRun RunVulkan(string path, ModelConfig config, int[] ids, string spvDir)
     {
@@ -108,7 +108,8 @@ public sealed class VulkanQwen3HybridDensePrefillMmqTests
         return new VkRun(row, model.MmqPrefillDispatchCount,
             model.PrefillGemmPathFor(QuantizationType.Q4_K, config.HiddenSize, ids.Length),
             model.PrefillGemmPathFor(QuantizationType.IQ4_NL, config.HiddenSize, ids.Length),
-            device.HasIntegerDotProduct);
+            device.HasIntegerDotProduct,
+            model.HasCoopmatPrefillFor(QuantizationType.Q4_K, config.HiddenSize));
     }
 
     private static float[] RunCpu(string path, ModelConfig config, int[] ids)
@@ -160,14 +161,16 @@ public sealed class VulkanQwen3HybridDensePrefillMmqTests
     }
 
     /// <summary>
-    /// Above the crossover (160 rows) the K-quants return to the coopmat GEMM where the device has one, while IQ4_NL (no coopmat GEMM)
-    /// stays on the MMQ: the selection is the dense host's table, not "MMQ everywhere".
+    /// Above the crossover (160 rows) the K-quants return to the coopmat GEMM where the device has one (Q4_K_M: zero MMQ dispatches on
+    /// such a device), while IQ4_NL (no coopmat GEMM) stays on the MMQ: the selection is the dense host's table, not "MMQ everywhere".
     /// </summary>
-    [SkippableFact]
-    public void Prefill160_KQuantsCoopmatWhereAvailable_Iq4NlStaysMmq()
+    [SkippableTheory]
+    [InlineData(Q4KM)]
+    [InlineData(Iq4Nl)]
+    public void Prefill160_KQuantsCoopmatWhereAvailable_Iq4NlStaysMmq(string which)
     {
-        string? path = FindGguf(Iq4Nl);
-        Skip.If(path is null, "Tev1-4B IQ4_NL requant not found.");
+        string? path = FindGguf(which);
+        Skip.If(path is null, $"Tev1-4B {which} GGUF not found.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
         ModelConfig config;
@@ -178,14 +181,18 @@ public sealed class VulkanQwen3HybridDensePrefillMmqTests
         VkRun run = WithEnv(VulkanQwen3MoeHybridKernels.HybridPrefillMmqEnvVar, null, () => RunVulkan(path!, config, ids, spvDir));
         Skip.If(!run.IntegerDot, "device has no integer dot products: no MMQ to test.");
         float[] cpu = RunCpu(path!, config, ids);
-        _out.WriteLine($"iq4_nl n={ids.Length}: mmq dispatches={run.MmqDispatches}; KL(cpu||vk)={Kl(cpu, run.Logits):E3}; paths q4_k={run.Q4K} iq4_nl={run.Iq4NlPath}");
+        _out.WriteLine($"{which} n={ids.Length}: mmq dispatches={run.MmqDispatches}; KL(cpu||vk)={Kl(cpu, run.Logits):E3}; " +
+                       $"paths q4_k={run.Q4K} iq4_nl={run.Iq4NlPath}; q4_k coopmat on device={run.Q4KCoopmat}");
 
-        Assert.Equal(DensePrefillGemmPath.Mmq, run.Iq4NlPath);
-        Assert.True(run.MmqDispatches > 0, "IQ4_NL projections did not take the MMQ above the K-quant crossover");
         Assert.Equal(Argmax(cpu), Argmax(run.Logits));
-        // Q4_K at this row count: coopmat if the device has the kernel, else still MMQ (never the scalar GEMM while an MMQ exists).
-        Assert.NotEqual(DensePrefillGemmPath.Scalar, run.Q4K);
-        if (run.Q4K == DensePrefillGemmPath.Coopmat)
-            Assert.True(VulkanDensePrefillGemmPolicy.CoopmatWins(QuantizationType.Q4_K, ids.Length));
+        Assert.Equal(DensePrefillGemmPath.Mmq, run.Iq4NlPath);
+        // Q4_K at this row count: coopmat where the device has the kernel, else still MMQ (never the scalar GEMM while an MMQ exists).
+        Assert.Equal(run.Q4KCoopmat ? DensePrefillGemmPath.Coopmat : DensePrefillGemmPath.Mmq, run.Q4K);
+        if (which == Iq4Nl)
+            Assert.True(run.MmqDispatches > 0, "IQ4_NL projections did not take the MMQ above the K-quant crossover");
+        else if (run.Q4KCoopmat)
+            Assert.Equal(0, run.MmqDispatches);   // every K-quant projection is back on coopmat above the crossover
+        else
+            Assert.True(run.MmqDispatches > 0, "no coopmat on this device: the K-quants must take the MMQ, not the scalar GEMM");
     }
 }
