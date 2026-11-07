@@ -344,19 +344,35 @@ public sealed class StoreRegistryTests : IDisposable
     }
 
     [Fact]
-    public async Task Registry_TransientReadError_IsRetried_PersistentOneBlocksOnlyThatSave()
+    public void Registry_TransientReadError_IsRetried_PersistentOneBlocksOnlyThatSave()
     {
         // Review N3: a sharing violation while loading (AV scanner, indexer) must not make the registry "never overwrite" for
         // good: the load retries briefly, and a later load reads it again.
+        // The competing handle is released from inside the retry loop, not by a timer on the thread pool: a busy runner starts a
+        // pool task seconds late, and the load then ran out of its budget first (CI flake). Starving the pool proves no timing is left.
+        using IDisposable starve = ThreadPoolStarver.Starve();
         var store = new FileChunkStore(_root);
         Build(store, ModelA, ChunkNamespace.Default, new SourceFile("A.txt", "a\n"));
         StoreRegistry.Update(_root, Wait, r => r.Upsert(r.Entries.Single() with { Backend = "cpu" }));
         string path = StoreRegistry.DefaultPath(_root);
 
         var holder = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None);
-        var release = Task.Run(async () => { await Task.Delay(300); holder.Dispose(); });
-        StoreRegistry transient = StoreRegistry.Load(_root);
-        await release;
+        int refused = 0;
+        TimeSpan savedBudget = StoreRegistry.ReadRetryBudget;
+        StoreRegistry.ReadRetryBudget = TimeSpan.FromMinutes(1); // the retry is released by the hook; the clock must not decide
+        StoreRegistry.AfterRefusedRead = () => { refused++; holder.Dispose(); };
+        StoreRegistry transient;
+        try
+        {
+            transient = StoreRegistry.Load(_root);
+        }
+        finally
+        {
+            StoreRegistry.AfterRefusedRead = null;
+            StoreRegistry.ReadRetryBudget = savedBudget;
+            holder.Dispose();
+        }
+        Assert.True(refused >= 1, "control: the first read was refused, so the load really retried");
         Assert.False(transient.Rebuilt);
         Assert.Equal("cpu", Assert.Single(transient.Entries).Backend);
 
