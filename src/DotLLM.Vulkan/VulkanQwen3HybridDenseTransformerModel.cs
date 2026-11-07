@@ -396,7 +396,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
         var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir, config.HeadDim);
         // #1226: Q8_1 activation scratch for the int8-coopmat prefill GEMMs (RDNA3/3.5 only).
-        state.Cm1ScratchEnabled = kernels.QuantizeQ8_1RowsCm1 is not null;
+        state.Cm1ScratchEnabled = kernels.QuantizeQ8_1RowsCm1 is not null || kernels.QuantizeQ8_1RowsMmq is not null;   // #1226 / #1149 share the Q8_1 rows scratch
         // Issue #1101: --rope-scaling yarn. Every RoPE call site goes through kernels.RecordRopeNeoX, which uses this when attached.
         if (attentionLayerCount > 0)
             kernels.AttachYarnRope(VulkanDenseYarnRope.TryCreate(device, spvDir, config, ropeDim));
@@ -2831,6 +2831,45 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             && xq.Size >= QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) ? k : null;
     }
 
+    /// <summary>Prefill projections that ran on the dp4a MMQ (#1149; test hook).</summary>
+    internal long MmqPrefillDispatchCount { get; private set; }
+
+    /// <summary>
+    /// The prefill GEMM path <see cref="RecordMatmul"/> takes for a <paramref name="qt"/> weight of input width <paramref name="inputDim"/> at
+    /// <paramref name="seqLen"/> rows once the small-row GEMVs and the int8-coopmat arm have declined (#1149; test hook mirroring the dispatch).
+    /// </summary>
+    internal DensePrefillGemmPath PrefillGemmPathFor(QuantizationType qt, int inputDim, int seqLen)
+    {
+        int align = _kernels.MmqPrefillAlignment(qt);
+        bool hasMmq = align > 0 && (inputDim % align) == 0 && _state.Cm1Xq is { } xq
+            && xq.Size >= QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim);
+        // Q8_0 stays coopmat-first on this host (#1150 open: the F32-accumulate coopmat measured 1.10-1.25x the MMQ).
+        bool hasCoopmat = _kernels.HasCoopmatPrefill(qt, inputDim);
+        if (qt == QuantizationType.Q8_0 && hasCoopmat) return DensePrefillGemmPath.Coopmat;
+        return VulkanDensePrefillGemmPolicy.Select(qt, seqLen, hasCoopmat, hasMmq);
+    }
+
+    /// <summary>
+    /// #1149: the dense host's dp4a MMQ prefill for the dense projections: quantize the activation rows to Q8_1, then the integer-dot GEMM on
+    /// the packed weights. Taken when <see cref="VulkanDensePrefillGemmPolicy"/> picks MMQ for this (format, row count) given the kernels this
+    /// device has; false (nothing recorded) otherwise, so the caller falls through to the coopmat / scalar arms.
+    /// </summary>
+    private bool TryRecordMmqPrefill(
+        nint cmdBuf, VulkanDevice.Buffer weights, QuantizationType weightQt,
+        VulkanDevice.Buffer input, VulkanDevice.Buffer output, int outputDim, int inputDim, int seqLen)
+    {
+        if (_kernels.QuantizeQ8_1RowsMmq is not { } quantize) return false;
+        if (PrefillGemmPathFor(weightQt, inputDim, seqLen) != DensePrefillGemmPath.Mmq) return false;
+        // The rows scratch is shared: order this quantize after any GEMM still reading it (gate and up are recorded back to back).
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        quantize.Record(cmdBuf, input, _state.Cm1Xq!, _state.Cm1Xds!, seqLen, inputDim);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _kernels.RecordMmqPrefill(cmdBuf, weightQt, weights, _state.Cm1Xq!, _state.Cm1Xds!, output, m: outputDim, k: inputDim, n: seqLen);
+        MmqPrefillDispatchCount++;
+        ProfNote($"matmul_{weightQt.ToString().ToLowerInvariant()}_mmq", outputDim, inputDim, seqLen);
+        return true;
+    }
+
     /// <summary>
     /// Dispatches the GEMV (<paramref name="seqLen"/> == 1) or GEMM variant for the
     /// weight's on-device quantization. Same policy table as
@@ -2842,12 +2881,13 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
-        if (_prof is not null) ProfNoteMatmul(weightQt, outputDim, inputDim, seqLen);
-
         // 2..8-row verify batches (MTP, #1185): the multi-column GEMVs read each weight once for all rows; the coopmat GEMM tile below
         // costs ~4.5 single-row forwards even at 2 rows on Strix (Qwen3.8-27B Q4_K_M: 105 ms at 1 row, 480 ms at 2..8).
         if (seqLen > 1 && TryRecordSmallRowMatmul(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen))
+        {
+            if (_prof is not null) ProfNoteMatmul(weightQt, outputDim, inputDim, seqLen);
             return;
+        }
 
         // #1226: int8-coopmat MMQ (RDNA3/3.5) for Q8_0 / Q4_K: quantize the activations to Q8_1, then int8 WMMA on the packed weights.
         // The barrier in front orders the quantize after any earlier GEMM still reading the shared scratch (gate and up are recorded
@@ -2858,8 +2898,17 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             _kernels.QuantizeQ8_1RowsCm1!.Record(cmdBuf, input, _state.Cm1Xq!, _state.Cm1Xds!, seqLen, inputDim);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             cm1.Record(cmdBuf, weights, _state.Cm1Xq!, _state.Cm1Xds!, output, m: outputDim, k: inputDim, n: seqLen);
+            ProfNote($"matmul_{weightQt.ToString().ToLowerInvariant()}_mmq_cm1", outputDim, inputDim, seqLen);
             return;
         }
+
+        // #1149: the dense host's dp4a MMQ for K-quants / IQ4_XS below their coopmat crossover and for IQ4_NL always (no coopmat GEMM), and
+        // for every format the device cannot run on coopmat (Arc: K-quants were on the scalar F32 GEMM, Tev1-4B Q4_K_M prefill 3.7 tok/s).
+        // Notes its own census entry: the generic ProfNoteMatmul below would name the GEMM this arm replaced.
+        if (seqLen > 1 && TryRecordMmqPrefill(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen))
+            return;
+
+        if (_prof is not null) ProfNoteMatmul(weightQt, outputDim, inputDim, seqLen);
 
         // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
         if (seqLen > 1 && _iqF16Prefill is not null

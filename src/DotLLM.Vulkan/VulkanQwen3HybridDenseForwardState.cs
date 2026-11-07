@@ -72,12 +72,15 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
     public VulkanDevice.Buffer FfnUp { get; private set; } = null!;          // [seqLen, intermediate]
     public VulkanDevice.Buffer FfnSilu { get; private set; } = null!;        // [seqLen, intermediate]
 
-    /// <summary>Q8_1 int8 activations for the int8-coopmat GEMM (#1226), <c>[seqLen, widest GEMM input]</c>; null unless enabled.</summary>
+    /// <summary>
+    /// Q8_1 int8 activation rows for the int8-coopmat GEMM (#1226) and the dp4a MMQ prefill (#1149), <c>[seqLen, widest GEMM input]</c>;
+    /// null unless enabled. One scratch: both consumers read the same row-wise Q8_1 layout and no two GEMMs on it overlap in the stream.
+    /// </summary>
     public VulkanDevice.Buffer? Cm1Xq { get; private set; }
     /// <summary>Q8_1 per-32-block (d, d*sum) for <see cref="Cm1Xq"/>.</summary>
     public VulkanDevice.Buffer? Cm1Xds { get; private set; }
 
-    /// <summary>Whether <see cref="Cm1Xq"/> / <see cref="Cm1Xds"/> are allocated (set once by the model when an int8-coopmat GEMM exists).</summary>
+    /// <summary>Whether <see cref="Cm1Xq"/> / <see cref="Cm1Xds"/> are allocated (set once by the model when an int8-coopmat GEMM or a prefill MMQ exists).</summary>
     public bool Cm1ScratchEnabled
     {
         get => _cm1;
