@@ -32,6 +32,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
     private readonly Lfm3TransformerModel _cpu;      // keeps the GGUF mmap alive and owns the weight views
     private readonly VulkanQwen3MoeHybridTransformerModel _host;
     private readonly SigmoidGateMulHeadsF32Kernel _gateMul;
+    private readonly VulkanFlashAttentionGqaKernel? _slidingFlash;   // GQA flash prefill with window-start tile skipping; null = per-head fallback
     private readonly LayerDev[] _layers;
     private readonly HybridLayerLayout _layout;
     private readonly int[] _convOrdinal;
@@ -86,7 +87,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
     }
 
     private VulkanLfm3TransformerModel(VulkanDevice device, ModelConfig config, Lfm3TransformerModel cpu,
-        VulkanQwen3MoeHybridTransformerModel host, SigmoidGateMulHeadsF32Kernel gateMul, LayerDev[] layers, int[] convOrdinal, int convLayers,
+        VulkanQwen3MoeHybridTransformerModel host, SigmoidGateMulHeadsF32Kernel gateMul, VulkanFlashAttentionGqaKernel? slidingFlash, LayerDev[] layers, int[] convOrdinal, int convLayers,
         float localTheta, float globalTheta, int globalRotPairs, long deviceBytes, List<nint> ownedHost)
     {
         _device = device;
@@ -94,6 +95,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         _cpu = cpu;
         _host = host;
         _gateMul = gateMul;
+        _slidingFlash = slidingFlash;
         _layers = layers;
         _layout = config.HybridLayout!;
         _convOrdinal = convOrdinal;
@@ -150,6 +152,8 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         host.Q8GateUpMmvq = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM2_Q8_GATEUP_MMVQ") != "0";
         bool native = host.SupportsNativeQ4_0;
         var gateMul = SigmoidGateMulHeadsF32Kernel.Create(device, spvDir);
+        var slidingFlash = VulkanTransformerModel.IsFlashAttentionDisabled() ? null
+            : VulkanFlashAttentionGqaKernel.TryCreate(device, spvDir, VulkanKvStorage.F32, allowCoopmat: !VulkanTransformerModel.IsCoopmatAttentionDisabled());
 
         var layers = new LayerDev[config.NumLayers];
         var layout = config.HybridLayout!;
@@ -205,7 +209,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
             layers[i] = ld;
         }
 
-        return new VulkanLfm3TransformerModel(device, config, cpu, host, gateMul, layers, cpu.ConvOrdinalForLayer, cpu.ConvLayerCount,
+        return new VulkanLfm3TransformerModel(device, config, cpu, host, gateMul, slidingFlash, layers, cpu.ConvOrdinalForLayer, cpu.ConvLayerCount,
             localTheta, globalTheta, rotPairs, bytes, owned);
     }
 
@@ -413,7 +417,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         if (VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch))
             resized = true;
 
-        if (resized) { _host.Q4InvalidateCaches(); _gateMul.InvalidateDescriptorCache(); }
+        if (resized) { _host.Q4InvalidateCaches(); _gateMul.InvalidateDescriptorCache(); _slidingFlash?.InvalidateDescriptorCache(); }
         _host.Q4UploadPositions(positions);
 
         var submit = _host.Q4Submit;
@@ -542,6 +546,20 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         _host.Q4RecordMatmul(cmd, ld.OutProj!, ld.OutProjQt, y, st.NormOutput, H, H, T);
     }
 
+    /// <summary>A/B switch (<c>DOTLLM_VK_LFM3_SLIDING_OPT=0</c>): restores the pre-#1572 behaviour (full-range split-KV, per-head flash) for sliding layers.</summary>
+    internal static readonly bool SlidingOptDisabled = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM3_SLIDING_OPT") == "0";
+
+    /// <summary>Counters proving which sliding-layer path ran (decodes with a clipped KV range; prefills on the GQA flash kernel).</summary>
+    internal static long SlidingClippedDecodes, SlidingFlashPrefills;
+
+    /// <summary>
+    /// First KV position a sliding-window layer still reads after a forward of <paramref name="tokens"/> rows starting at absolute
+    /// position <paramref name="positionOffset"/>: the LAST row (position <c>pos = positionOffset + tokens - 1</c>) attends
+    /// <c>[pos - window + 1, pos]</c>. Used to clip the single-row split-KV pass; 0 for global layers or while the context still fits.
+    /// </summary>
+    internal static int SlidingKvStart(int positionOffset, int tokens, int window)
+        => window > 0 ? Math.Max(0, positionOffset + tokens - window) : 0;
+
     private void RecordAttention(nint cmd, LayerDev ld, int layer, int T, ReadOnlySpan<int> positions, IKvCache? kvCache)
     {
         var st = _host.Q4State;
@@ -585,9 +603,19 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
             kSrc = st.K; vSrc = st.V; seqKv = T; posOff = 0;
         }
 
+        // Windowed layers only need the last `window` keys: decode clips the split-KV range to them (kvStart), and the GQA flash
+        // kernel skips whole KV tiles before each workgroup's window start. The per-head coopmat / scalar flash kernels mask but
+        // still walk every tile, so a 32K prefill of the 5 sliding layers would cost as much as the 6 global ones.
+        int kvStart = SlidingOptDisabled ? 0 : SlidingKvStart(posOff, T, window);
+        var gqaFlash = !SlidingOptDisabled && T > 1 && window > 0 ? _slidingFlash : null;
+        if (kvStart > 0) SlidingClippedDecodes++;
+        if (gqaFlash is not null) SlidingFlashPrefills++;
         if (kern.SplitKvAttention is not null && T == 1 && hd <= VulkanSplitKvAttentionKernel.MaxHeadDim
-            && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, nh))
+            && VulkanSplitKvAttentionKernel.WouldSplit(seqKv - kvStart, nh))
             kern.SplitKvAttention.Record(cmd, st.Q, kSrc, vSrc, st.AttnOutput, seqQ: T, seqKv: seqKv, numHeads: nh, numKvHeads: nkv,
+                headDim: hd, positionOffset: posOff, slidingWindow: window, kvStart: kvStart);
+        else if (gqaFlash is not null && gqaFlash.CanDispatch(hd, nh, nkv))
+            gqaFlash.Record(cmd, st.Q, kSrc, vSrc, st.AttnOutput, seqQ: T, seqKv: seqKv, numHeads: nh, numKvHeads: nkv,
                 headDim: hd, positionOffset: posOff, slidingWindow: window);
         else if (kern.FlashAttentionCoopmat is not null && T > 1 && hd <= kern.FlashAttentionCoopmat.SupportedMaxHeadDim)
             kern.FlashAttentionCoopmat.Record(cmd, st.Q, kSrc, vSrc, st.AttnOutput, seqQ: T, seqKv: seqKv, numHeads: nh, numKvHeads: nkv,
@@ -629,6 +657,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         }
         _ffnGate?.Dispose(); _ffnUp?.Dispose(); _convProj?.Dispose(); _attnGate?.Dispose(); _multiRowLogits?.Dispose();
         _gateMul.Dispose();
+        _slidingFlash?.Dispose();
         _host.Dispose();
         foreach (nint p in _ownedHost) NativeMemory.AlignedFree((void*)p);
         _ownedHost.Clear();

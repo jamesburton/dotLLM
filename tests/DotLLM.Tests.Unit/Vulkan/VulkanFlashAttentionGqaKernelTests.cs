@@ -84,6 +84,30 @@ public sealed class VulkanFlashAttentionGqaKernelTests
         => RunParity(impl, 61, 333, 24, 4, 256, 272, qScale: 12f, splitQ: true);
 
     /// <summary>
+    /// #1572: LFM3's sliding layers (16 query / 8 KV heads, head_dim 128, window 256) on the GQA flash kernel without sinks. The cases straddle
+    /// the window so a tile-skip offset error is observable: fresh prefill shorter than the window, exactly one window, a chunk that starts
+    /// inside the window, one that starts exactly at it, and chunks far past it (many skipped tiles).
+    /// </summary>
+    /// <param name="impl">The implementation.</param>
+    /// <param name="seqQ">Query rows.</param>
+    /// <param name="positionOffset">Absolute position of the first query row.</param>
+    [SkippableTheory]
+    [InlineData(Impl.Scalar, 40, 0)]       // pos < window: nothing skipped
+    [InlineData(Impl.Scalar, 256, 0)]      // exactly one window of rows
+    [InlineData(Impl.Scalar, 70, 200)]     // chunk starts inside the window, ends past it
+    [InlineData(Impl.Scalar, 33, 256)]     // chunk starts exactly at the window
+    [InlineData(Impl.Scalar, 50, 1999)]    // deep, ragged
+    [InlineData(Impl.Scalar, 130, 3000)]   // deep, many skipped tiles
+    [InlineData(Impl.Coopmat, 40, 0)]
+    [InlineData(Impl.Coopmat, 256, 0)]
+    [InlineData(Impl.Coopmat, 70, 200)]
+    [InlineData(Impl.Coopmat, 33, 256)]
+    [InlineData(Impl.Coopmat, 50, 1999)]
+    [InlineData(Impl.Coopmat, 130, 3000)]
+    public void PrefillWindowed_Lfm3Shape_MatchesCpuReference(Impl impl, int seqQ, int positionOffset)
+        => RunParity(impl, seqQ, positionOffset + seqQ, 16, 8, 128, positionOffset, qScale: 1f, window: 256);
+
+    /// <summary>
     /// Issue #1200: the attention-sink twins against the scalar CPU reference with sinks, on Flint's shape (32 query / 4 KV heads,
     /// head_dim 128) for a sliding layer (window 513 &lt; the KV span) and a full (NoPE) layer at depth, gpt-oss's (64 / 8, head_dim 64,
     /// window 128), and a fresh windowed prefill. Sinks are drawn in [-8, 8] so they move the output even against 1.5K keys (checked).

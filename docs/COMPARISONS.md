@@ -32,7 +32,7 @@ baseline, `b87ca7225` = the PrismML llama.cpp fork (CUDA; the only llama.cpp tha
 | Nemotron 3.5 Bolt 24GB + LiLiCorr | Vulkan, Strix Halo | plain / speculative | 1.02-1.04 / 0.74-0.78 | [2.3](#23-nemotron-35-bolt-24gb-vulkan-strix-halo) |
 | Qwen3.6-35B-A3B UD-Q4_K_M | Vulkan, Strix Halo | plain / MTP K=2..4 (opt-in) | 0.88 / 0.62-0.85 (superseded, see 2.4) | [2.4](#24-qwen36-35b-a3b-vulkan-strix-halo) |
 | LFM3-1.7B Q8_0 | Vulkan, Strix Halo 8060S | pp512 / pp2048 / tg128 | 0.86 / 0.72 / 0.94-0.96 | [2.10](#210-liquid-ai-lfm3-17b-q8_0-vulkan-strix-halo) |
-| LFM3-1.7B Q8_0 | Vulkan, Strix Halo | pp16384 / pp32768 / tg @32K | **0.31 / 0.21 / 0.47** (sliding layers walk the whole KV (unvalidated patch), #1572) | [2.10](#210-liquid-ai-lfm3-17b-q8_0-vulkan-strix-halo) |
+| LFM3-1.7B Q8_0 | Vulkan, Strix Halo | pp16384 / pp32768 / tg @32K | before #1572: **0.31 / 0.21 / 0.47**; after the sliding-window fix and #1666 (contended session, 2.10): ~0.5-0.63 / ~0.46-0.48 / ~1.1 | [2.10](#210-liquid-ai-lfm3-17b-q8_0-vulkan-strix-halo) |
 | LFM3-1.7B Q8_0 / Q4_K_M | CPU, Ryzen AI Max+ 395 (32 thr) | pp512 / tg128 | **0.41 / 0.87** (Q8_0), **0.28 / ~1.0** (Q4_K_M) | [4.3](#43-liquid-ai-lfm3-17b-cpu) |
 | Llama-3.2-1B Q4_K_M / pure Q3_K | CPU | perplexity gap | +0.032 % / +0.093 % | [5](#5-quality-parity) |
 | Embedding encoders (bge, MiniLM, nomic, ...) | CPU (32 thr) | docs/s | ~0.4-0.6 (indicative, derived) | [6](#6-embeddings) |
@@ -232,11 +232,26 @@ them) and min-max for dotLLM. LFM3 is a conv + sliding-window (256) + global-att
 | tg64 @ 16K | 55.5-57.2 | 89.8 (+/- 0.6) | 0.62 |
 | tg64 @ 32K | 38.5-39.7 | 82.4 (+/- 0.3) | 0.47 |
 
-- The long-context rows are the weak spot (pp16384 and beyond, tg @4K and beyond): **sliding layers walk the whole KV (unvalidated patch)**; analysis and the saved patch are in #1572, and the patch has not yet been run on the GPU. llama.cpp
+- The 2026-11-03 table above is the unpatched baseline: sliding layers walked the whole KV there (fixed, see the update below). llama.cpp
   loses 16 % of its decode rate from 0 to 32K, dotLLM 59 %.
 - dotLLM's `tg @ N` rows decode after an N-token prefill (`-p N`); llama.cpp's use `-d N` (prefill the depth, then decode). Same context.
-- Quality: Q8_0 vs llama.cpp CPU on identical ids, mean KL 1.96e-3, top-1 98.24 %, PPL 25.9396 vs 25.9400 (section 5 method).
-- The Vulkan driver was lost during the follow-up validation of the #1572 patch; those rows are from before that.
+- **Update 2026-11-07 (issue #1572, patched: windowed layers clip the single-row split-KV range and prefill on the GQA flash kernel, plus #1666 row-sliced long-prefill attention).** dotLLM at branch `issue/1572-lfm3-sliding-kvstart` (dev `3abab54f` + the #1572 patch), llama.cpp `dde879bc` (`llama-bench`, Vulkan, `-r 2`), same session, `Strix:GPU` held, one run after the other, **box contended** (about 78 % CPU from other users' python jobs for the whole block, so llama.cpp's own tg varies 81.8 +/- 4.6 at depth 0 against 98-100 on 2026-11-03 and its pp512 is 4622 against 5504). Same-session ratios only; dotLLM ranges are min-max of the reps (3 reps to 8K, 2 beyond, 1 at 48K/64K).
+
+| test (Q8_0) | dotLLM patched | llama.cpp (same session) | ratio |
+|---|---|---|---|
+| pp512 | 4887 (1 run, `-r 3` best) | 4622 (+/- 29) | ~1.06 |
+| pp2048 | 4380 | 4284 (+/- 88) | ~1.02 |
+| pp16384 | 1570-1948 (two sessions of runs) | 3074 (+/- 89) | 0.51-0.63 |
+| pp32768 | 1080-1123 | 2342 (+/- 27) | 0.46-0.48 |
+| tg64 @ 4K | 85.0-85.9 | 72.8 (+/- 8.6) | ~1.2 (noisy) |
+| tg64 @ 16K | 61-71 (tg varies run to run with the contention) | 60.7 (+/- 10.4) | ~1.0-1.2 (noisy) |
+| tg64 @ 32K | 57.2-57.6 | 50.3 (+/- 4.5) | ~1.1 (noisy) |
+
+  Against the 2026-11-03 numbers (same dotLLM prefill path, unpatched, 763-775 at 32K and tg 38.5-39.7 at 32K) the patch is about 1.45x at pp32768 and 1.45-1.5x at tg @32K. Paired same-session A/B of the patch switch (`DOTLLM_VK_LFM3_SLIDING_OPT=0` restores the old path), pp16384, order 0,1,0,1: old 1082-1206 tok/s, patched 1570-1797. The prefill gap to llama.cpp that remains at 16K+ is in the 6 global-attention layers (O(n^2), per-head flash at head_dim 128) and the rest of the layer stack; not addressed here.
+- **Long-prefill ladder, patched (dotLLM only, `-n 64`)**: pp 28672 1261-1268 (the length that lost the device before #1666), 32768 1080-1123, 49152 814 (1 rep, tg 32.8), 65536 522 (1 rep, tg 28.5). No device loss, no TDR, up to 64K. A 96K+ run was not done. Q4_K_M: pp512 4006, pp2048 3576, pp16384 1220-1365, pp28672 997-1029 (llama.cpp Q4_K_M same session: 3419 / 3127 / 2554 / 2196, so Q4_K_M is 1.17x / 1.14x at short context and 0.48x / 0.47x at 16K / 28K). BF16 runs but the BF16 prefill path is slow (pp512 128 tok/s); only pp512 measured.
+
+- Quality: Q8_0 vs llama.cpp CPU on identical ids, mean KL 1.96e-3, top-1 98.24 %, PPL 25.9396 vs 25.9400 (section 5 method). After the #1572 patch (wikitext-2 LF, llama.cpp CPU `-dev none` oracle via `--kl-divergence-base`, `--tokens-file` WITHOUT `--bos` since LFM3 does not add BOS): Q8_0 ctx 2048 x 6 windows mean KL 1.68e-3 / top-1 98.26 % (patch off: 1.68e-3 / 98.27 %), ctx 8192 x 2 windows 1.29e-3 / 98.25 % (patch off 1.29e-3 / 98.28 %); Q4_K_M ctx 2048 x 6 windows 5.7e-3 / top-1 96.6 %.
+- The unpatched path lost the Vulkan device at -p 28672 (one-layer attention submit ~2.5 s); fixed by #1666.
 
 
 ## 3. RTX 3060 12 GB, CUDA
