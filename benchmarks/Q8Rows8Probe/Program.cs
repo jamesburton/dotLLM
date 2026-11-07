@@ -12,6 +12,14 @@ using DotLLM.Cpu.Threading;
 
 unsafe
 {
+    if (ArgStr("--parity", "") is { Length: > 0 } ggufPath)
+    {
+        // Real-tensor parity: old kernel, new kernel and an exact double-precision reference over the model's own weights
+        // (random activations, Q8_0-quantized where the kernel takes Q8_0). Reports each kernel's error against exact.
+        Parity(ggufPath, Arg("--tensors", 6), Arg("--n", 8));
+        return;
+    }
+
     int threads = Arg("--threads", Math.Min(16, Environment.ProcessorCount));
     int reps = Arg("--reps", 7);
     int[] ns = ArgList("--n", "64,1");
@@ -109,6 +117,87 @@ unsafe
 }
 
 static unsafe T* Alloc<T>(long count) where T : unmanaged => (T*)NativeMemory.AlignedAlloc((nuint)(count * sizeof(T)), 64);
+
+static unsafe void Parity(string ggufPath, int maxTensors, int n)
+{
+    using var gguf = DotLLM.Models.Gguf.GgufFile.Open(ggufPath);
+    using var pool = new ComputeThreadPool(8);
+    var rng = new Random(7);
+    int done = 0;
+    Console.WriteLine($"{"tensor",-34} {"type",-5} {"m x k",-14} {"rmsRel(old)",12} {"rmsRel(new)",12} {"maxRel(old)",12} {"maxRel(new)",12} {"maxRel(old-new)",16}");
+    foreach (var t in gguf.Tensors)
+    {
+        if (t.Shape.Rank != 2 || !t.Name.EndsWith(".weight", StringComparison.Ordinal) || t.Name.Contains("embd", StringComparison.Ordinal)) continue;
+        if (t.QuantizationType is not (QuantizationType.Q8_0 or QuantizationType.BF16)) continue;
+        if (done++ >= maxTensors) break;
+        int k = t.Shape[0], m = t.Shape[1];
+        if (k % 32 != 0) continue;
+        byte* w = (byte*)gguf.TensorDataPointer(in t);
+        float* b = Alloc<float>((long)n * k);
+        for (long i = 0; i < (long)n * k; i++) b[i] = (rng.NextSingle() * 2f - 1f) * 1.5f;
+        float* cOld = Alloc<float>((long)n * m);
+        float* cNew = Alloc<float>((long)n * m);
+        double[] exact = new double[(long)n * m];
+        double[] mag = new double[(long)n * m];
+
+        if (t.QuantizationType == QuantizationType.Q8_0)
+        {
+            int blockCount = k / 32, rowBytes = blockCount * 34;
+            byte* xq = Alloc<byte>((long)n * rowBytes);
+            for (int tt = 0; tt < n; tt++) MatMul.QuantizeF32ToQ8_0(b + (long)tt * k, xq + (long)tt * rowBytes, k);
+            var rw = WeightRepacking.RepackR4((nint)w, QuantizationType.Q8_0, m, k);
+            MatMul.Q8_0Rows8Enabled = false;
+            MatMul.GemmR4TiledQ8_0((byte*)rw.Ptr, xq, cOld, rw.FullGroupCount, rw.TailRows, blockCount, m, n, pool);
+            MatMul.Q8_0Rows8Enabled = true;
+            MatMul.GemmR4TiledQ8_0((byte*)rw.Ptr, xq, cNew, rw.FullGroupCount, rw.TailRows, blockCount, m, n, pool);
+            for (int tt = 0; tt < n; tt++)
+                for (int r = 0; r < m; r++)
+                {
+                    double s = 0, a = 0;
+                    for (int bl = 0; bl < blockCount; bl++)
+                    {
+                        byte* wb = w + (long)r * rowBytes + bl * 34; byte* xb = xq + (long)tt * rowBytes + bl * 34;
+                        double dw = (float)*(Half*)wb, dx = (float)*(Half*)xb; long sumi = 0;
+                        for (int i = 0; i < 32; i++) sumi += (sbyte)wb[2 + i] * (sbyte)xb[2 + i];
+                        s += dw * dx * sumi; a += Math.Abs(dw * dx * sumi);
+                    }
+                    exact[(long)tt * m + r] = s; mag[(long)tt * m + r] = a;
+                }
+            NativeMemory.AlignedFree(xq);
+        }
+        else
+        {
+            ushort* wb = (ushort*)w;
+            MatMul.Bf16KernelEnabled = false;
+            MatMul.GemmBf16((nint)w, b, cOld, m, k, n, pool);
+            MatMul.Bf16KernelEnabled = true;
+            MatMul.GemmBf16((nint)w, b, cNew, m, k, n, pool);
+            for (int tt = 0; tt < n; tt++)
+                for (int r = 0; r < m; r++)
+                {
+                    double s = 0, a = 0;
+                    for (int i = 0; i < k; i++)
+                    {
+                        double p = (double)BitConverter.Int32BitsToSingle(wb[(long)r * k + i] << 16) * b[(long)tt * k + i];
+                        s += p; a += Math.Abs(p);
+                    }
+                    exact[(long)tt * m + r] = s; mag[(long)tt * m + r] = a;
+                }
+        }
+
+        double so = 0, sn = 0, mo = 0, mn = 0, md = 0; long cnt = 0;
+        for (long i = 0; i < (long)n * m; i++)
+        {
+            double sc = Math.Max(mag[i], 1e-30);
+            double eo = Math.Abs(cOld[i] - exact[i]) / sc, en = Math.Abs(cNew[i] - exact[i]) / sc, ed = Math.Abs(cOld[i] - cNew[i]) / sc;
+            so += eo * eo; sn += en * en; mo = Math.Max(mo, eo); mn = Math.Max(mn, en); md = Math.Max(md, ed); cnt++;
+            if (!float.IsFinite(cNew[i])) { Console.WriteLine($"NON-FINITE at {i} in {t.Name}"); break; }
+        }
+        Console.WriteLine($"{t.Name,-34} {t.QuantizationType,-5} {m + "x" + k,-14} {Math.Sqrt(so / cnt),12:E2} {Math.Sqrt(sn / cnt),12:E2} {mo,12:E2} {mn,12:E2} {md,16:E2}");
+        NativeMemory.AlignedFree(b); NativeMemory.AlignedFree(cOld); NativeMemory.AlignedFree(cNew);
+    }
+    Console.WriteLine("(errors are |kernel - exact double| / sum|terms| per output; rms and max over n x m outputs)");
+}
 
 static bool Has(string name) => Environment.GetCommandLineArgs().Contains(name);
 static string ArgStr(string name, string def)
