@@ -114,6 +114,7 @@ public sealed unsafe class Lfm3VulkanParityTests(Xunit.Abstractions.ITestOutputH
         }
 
         // Vulkan: chunked prefill + single-token decode through the sparse KV cache and device conv state.
+        long clipped0 = VulkanLfm3TransformerModel.SlidingClippedDecodes, flash0 = VulkanLfm3TransformerModel.SlidingFlashPrefills;
         vkModel.ResetSequenceState();
         using var kv = kvFactory(tokens.Length + 8);
         using var state = vkModel.CreateSequenceState()!;
@@ -128,6 +129,12 @@ public sealed unsafe class Lfm3VulkanParityTests(Xunit.Abstractions.ITestOutputH
         {
             using var row = Step(vkModel, tokens.AsMemory(i, 1), positions.AsMemory(i, 1), kv, (ISsmState)state);
             AssertClose(cpuRows[k++], Row(row, row.Shape[0] - 1), 0.005, $"decode {i}");
+        }
+        // #1572 path proof: a parity pass is vacuous for the sliding-window fix unless the clipped decode range and the GQA flash prefill actually ran.
+        if (!VulkanLfm3TransformerModel.SlidingOptDisabled)
+        {
+            Assert.True(VulkanLfm3TransformerModel.SlidingClippedDecodes > clipped0, "no sliding-layer decode used a clipped KV range");
+            Assert.True(VulkanLfm3TransformerModel.SlidingFlashPrefills > flash0, "no sliding-layer prefill used the GQA flash kernel");
         }
     }
 
