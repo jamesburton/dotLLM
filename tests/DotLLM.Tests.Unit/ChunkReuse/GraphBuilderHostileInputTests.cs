@@ -68,6 +68,23 @@ public sealed class GraphBuilderHostileInputTests
         Assert.Contains(matches, m => m.FilePath == "ok.cs");
     }
 
+    /// <summary>The corpus' own compilation is bound as a whole by anything that asks for its diagnostics or symbols.</summary>
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public void CorpusCompilation_HostileNesting_LeavesTheFileOut_AndBindsTheRest(string shape, string text)
+    {
+        var tok = new CharTokenizer();
+        var corpus = new Corpus([new SourceFile("ok.cs", Ok), new SourceFile("hostile.cs", text)], new SymbolChunker(tok, 4096), tok);
+
+        // Force binding of every tree in the compilation: an unguarded hostile tree overflows the stack here.
+        var diagnostics = corpus.Compilation.GetDiagnostics();
+
+        Assert.DoesNotContain(diagnostics, d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error && d.Location.SourceTree?.FilePath == "ok.cs");
+        Assert.Empty(corpus.TreeOf("hostile.cs").GetRoot().DescendantNodes()); // replaced by an empty tree: none of its symbols resolve
+        Assert.NotEmpty(corpus.TreeOf("ok.cs").GetRoot().DescendantNodes());
+        Assert.True(shape.Length > 0);
+    }
+
     /// <summary>The projects overload takes compilations built elsewhere (a solution scan): the corpus' own guard has not run on them.</summary>
     [Theory]
     [MemberData(nameof(Shapes))]
