@@ -242,6 +242,16 @@ public sealed class StoreRegistry
     // Per async flow (a test shortens it for itself only; a process-wide value raced between parallel test classes).
     private static readonly AsyncLocal<TimeSpan?> s_readRetryBudget = new();
 
+    /// <summary>Test seam, per async flow: runs after each refused read of <see cref="Load"/>, before the retry. A test releases the
+    /// competing handle from here, so the retry is deterministic instead of depending on a timer firing in time.</summary>
+    internal static Action? AfterRefusedRead
+    {
+        get => s_afterRefusedRead.Value;
+        set => s_afterRefusedRead.Value = value;
+    }
+
+    private static readonly AsyncLocal<Action?> s_afterRefusedRead = new();
+
     private static byte[] ReadWithRetry(string path)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -253,6 +263,7 @@ public sealed class StoreRegistry
             }
             catch (Exception ex) when ((ex is IOException and not FileNotFoundException and not DirectoryNotFoundException) || ex is UnauthorizedAccessException)
             {
+                AfterRefusedRead?.Invoke();
                 if (sw.Elapsed >= ReadRetryBudget) throw;
                 Thread.Sleep(20);
             }

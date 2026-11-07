@@ -79,7 +79,22 @@ public sealed class CorpusHardeningTests : IDisposable
         Assert.Contains(chunks, c => Text(c).Contains("int Shallow()", StringComparison.Ordinal)
                                      && !Text(c).Contains("bool M()", StringComparison.Ordinal));
 
+        // The compilation is another matter: a tree this deep is measured after the parse and left out (an empty tree), because
+        // binding anything that reaches into it would recurse per level. Its type is not in the compilation.
         var (compilation, _) = Corpus.CreateCompilation([new SourceFile("unary.cs", text)], implicitUsings: false);
+        Assert.Null(compilation.GetTypeByMetadataName("C"));
+    }
+
+    [Fact]
+    public void CreateCompilation_ModeratelyDeepUnaryChain_StaysInTheCompilation()
+    {
+        // Control for the test above: well under RoslynParsing.MaxCompilationSyntaxDepth the file keeps its symbols.
+        string text = "class C\n{\n    bool M() => " + new string('!', 200) + "true;\n}\n";
+        Assert.Contains('\n', text); // control: the escape reached the string as a newline
+        Assert.True(RoslynParsing.SyntaxDepth(RoslynParsing.Parse(text, "u.cs").GetRoot()) < RoslynParsing.MaxCompilationSyntaxDepth);
+
+        var (compilation, _) = Corpus.CreateCompilation([new SourceFile("u.cs", text)], implicitUsings: false);
+
         Assert.NotNull(compilation.GetTypeByMetadataName("C"));
     }
 

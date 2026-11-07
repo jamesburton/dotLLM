@@ -647,11 +647,23 @@ public sealed class ChunkIndexTests : IDisposable
         Task save;
         using (FileStream reader = ChunkIndex.OpenForRead(path)) // the share mode Load uses
         {
-            save = Task.Run(() => index.Save(path)); // waits while the reader holds the file
-            await Task.Delay(150);
-            // Windows: the rename waits for the reader, so a second reader still sees the old file (1 chunk). POSIX: rename(2)
-            // replaces the entry under the open reader at once, so a second reader sees the new file (2 chunks).
-            Assert.Equal(OperatingSystem.IsWindows() ? 1 : 2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
+            save = Task.Run(() => index.Save(path)); // Windows: waits while the reader holds the file
+            if (OperatingSystem.IsWindows())
+            {
+                // The rename waits for the reader, so for as long as it is held a second reader sees the old file (1 chunk). This
+                // holds however late the save starts, so a short delay cannot make it flaky.
+                await Task.Delay(150);
+                Assert.False(save.IsCompleted);
+                Assert.Single(ChunkIndex.Load(path, KeyA).ChunksOf("A.txt"));
+            }
+            else
+            {
+                // POSIX: rename(2) replaces the entry under the open reader at once, so once the save has run a second reader sees
+                // the new file (2 chunks). Wait for the save itself, not for a timer: a busy runner starts a pool task seconds late
+                // and a fixed delay then looked at the file before the save had run (CI flake).
+                await save.WaitAsync(TimeSpan.FromSeconds(30));
+                Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
+            }
         }
         await save.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);

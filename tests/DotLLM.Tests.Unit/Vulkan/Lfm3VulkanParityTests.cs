@@ -130,4 +130,48 @@ public sealed unsafe class Lfm3VulkanParityTests(Xunit.Abstractions.ITestOutputH
             AssertClose(cpuRows[k++], Row(row, row.Shape[0] - 1), 0.005, $"decode {i}");
         }
     }
+
+    /// <summary>
+    /// #1649: a prefill cut into query-row slices (budget forced tiny so it happens at 2560 rows) must match the same prefill run as
+    /// one forward, across the 256-token sliding window and the global layers. Also asserts slicing really happened, so a gate that
+    /// silently stops slicing cannot pass this as "unchunked equals unchunked".
+    /// </summary>
+    [SkippableFact]
+    public void RowSlicedPrefill_MatchesSingleForward()
+    {
+        string? path = FindGguf();
+        Skip.If(path is null, "LFM3 GGUF not found: set DOTLLM_LFM3_GGUF or fetch LiquidAI/LFM3-1.7B-GGUF.");
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device available on this host.");
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        var (vkModel, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, SpvDir());
+        using var vk = (IDisposable)vkModel;
+        var lfm3 = (VulkanLfm3TransformerModel)vkModel;
+        // 2557 rows: not divisible by the slice count, so the remainder-distribution (extra rows) is exercised.
+        int[] tokens = NaturalTokens().Take(2557).ToArray();
+        var positions = Enumerable.Range(0, tokens.Length).ToArray();
+
+        float[] Run(VulkanPrefillSubmitBudget budget)
+        {
+            lfm3.SubmitBudgetForTest = budget;
+            lfm3.ResetSequenceState();
+            using var kv = kvFactory(tokens.Length + 8);
+            using var state = lfm3.CreateSequenceState()!;
+            using var r = Step(lfm3, tokens, positions, kv, (ISsmState)state);
+            var row = Row(r, r.Shape[0] - 1);
+            using var d = Step(lfm3, tokens.AsMemory(0, 1), positions.AsMemory(tokens.Length - 1, 1), kv, (ISsmState)state);
+            return row;
+        }
+
+        int before = lfm3.RowSliceForwardsForTest;
+        var whole = Run(new VulkanPrefillSubmitBudget(1000));
+        Assert.Equal(before, lfm3.RowSliceForwardsForTest);
+        var sliced = Run(new VulkanPrefillSubmitBudget(0.02));
+        Assert.True(lfm3.RowSliceForwardsForTest - before >= 4, "budget did not force row slicing");
+        AssertClose(whole, sliced, 1e-4, "row-sliced vs single-forward prefill");
+        int aw = Array.IndexOf(whole, whole.Max()), asl = Array.IndexOf(sliced, sliced.Max());
+        Assert.Equal(aw, asl);
+    }
 }
