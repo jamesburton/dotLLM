@@ -49,13 +49,7 @@ public sealed class ReasoningAnthropicTests
             ctx, _ => Tokens(pieces), (work, _) => work(), parser, null,
             "msg_t", "m", promptTokenCount: 3, CancellationToken.None, forcedToolCall: false, plan);
 
-        var frames = new List<Frame>();
-        foreach (string block in Encoding.UTF8.GetString(body.ToArray()).Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
-        {
-            var lines = block.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-            frames.Add(new Frame(lines[0]["event: ".Length..], JsonDocument.Parse(lines[1]["data: ".Length..]).RootElement.Clone()));
-        }
-        return [.. frames];
+        return [.. SseTestReader.NamedJson(Encoding.UTF8.GetString(body.ToArray())).Select(f => new Frame(f.Event, f.Data))];
     }
 
     // ---------------------------------------------------------------- request side

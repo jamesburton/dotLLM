@@ -5,6 +5,7 @@ using DotLLM.Engine;
 using DotLLM.Server;
 using DotLLM.Server.Endpoints;
 using DotLLM.Server.Models;
+using DotLLM.Tests.Unit.Server;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ToolCallParsers;
 using Microsoft.AspNetCore.Http;
@@ -97,23 +98,58 @@ public class GraniteToolCallParserTests
         }
     }
 
-    private static async Task<(string Content, JsonElement? Calls, string? Finish)> StreamAsync(string[] pieces, ToolDefinition[] tools)
+    /// <summary>The first token arrives late, as after a long prefill: the endpoint's keep-alive (#1025) fires meanwhile.</summary>
+    private static async IAsyncEnumerable<GenerationToken> SlowFirstToken(string[] pieces, Task firstTokenGate)
+    {
+        await firstTokenGate;
+        await foreach (var t in Script(pieces)) yield return t;
+    }
+
+    /// <summary>A response body that signals once an SSE comment line (<c>: waiting for ...</c>) has been written to it.</summary>
+    private sealed class CommentSignallingStream : MemoryStream
+    {
+        private readonly Lock _gate = new();
+        public TaskCompletionSource FirstComment { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // On a subclass MemoryStream.Write(ReadOnlySpan) routes through Stream.Write(span) -> Write(byte[], int, int), so the
+        // array overload is the one place that writes and checks; the span overload must only defer to base.
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            lock (_gate)
+            {
+                base.Write(buffer, offset, count);
+                if (!FirstComment.Task.IsCompleted && Encoding.UTF8.GetString(ToArray()).Contains("\n: waiting for ", StringComparison.Ordinal))
+                    FirstComment.TrySetResult();
+            }
+        }
+
+        public override void Write(ReadOnlySpan<byte> buffer) { lock (_gate) base.Write(buffer); }
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) { Write(buffer, offset, count); return Task.CompletedTask; }
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default) { Write(buffer.Span); return ValueTask.CompletedTask; }
+        public string Text { get { lock (_gate) return Encoding.UTF8.GetString(ToArray()); } }
+    }
+
+    /// <param name="afterAKeepAlive">When true the first token is held until the endpoint has written a prefill keep-alive comment
+    /// (interval 1 ms), so the SSE body deterministically carries <c>: waiting for prompt processing (0s)</c> before the first delta.</param>
+    private static async Task<(string Content, JsonElement? Calls, string? Finish, string Raw)> StreamAsync(
+        string[] pieces, ToolDefinition[] tools, bool afterAKeepAlive = false)
     {
         var ctx = new DefaultHttpContext();
-        var body = new MemoryStream();
+        var body = new CommentSignallingStream();
         ctx.Response.Body = body;
         await ChatCompletionEndpoint.WriteChatStreamAsync(
-            new ChatCompletionRequest { Messages = [], Stream = true }, ctx, _ => Script(pieces), (work, _) => work(),
-            "req", "m", tools, new GraniteToolCallParser(), ReasoningPlan.Disabled, CancellationToken.None);
+            new ChatCompletionRequest { Messages = [], Stream = true }, ctx,
+            _ => afterAKeepAlive ? SlowFirstToken(pieces, body.FirstComment.Task) : Script(pieces), (work, _) => work(),
+            "req", "m", tools, new GraniteToolCallParser(), ReasoningPlan.Disabled, CancellationToken.None,
+            keepAliveInterval: afterAKeepAlive ? TimeSpan.FromMilliseconds(1) : null);
 
+        string raw = body.Text;
         var content = new StringBuilder();
         JsonElement? calls = null;
         string? finish = null;
-        foreach (string block in Encoding.UTF8.GetString(body.ToArray()).Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
+        foreach (var frame in SseTestReader.Json(raw))
         {
-            string data = block["data: ".Length..];
-            if (data == "[DONE]") continue;
-            foreach (var choice in JsonDocument.Parse(data).RootElement.GetProperty("choices").EnumerateArray())
+            foreach (var choice in frame.GetProperty("choices").EnumerateArray())
             {
                 var d = choice.GetProperty("delta");
                 if (d.TryGetProperty("content", out var c)) content.Append(c.GetString());
@@ -121,14 +157,14 @@ public class GraniteToolCallParserTests
                 if (choice.TryGetProperty("finish_reason", out var fr) && fr.ValueKind == JsonValueKind.String) finish = fr.GetString();
             }
         }
-        return (content.ToString(), calls, finish);
+        return (content.ToString(), calls, finish, raw);
     }
 
     [Fact]
     public async Task Streaming_MarkerAndJson_DoNotLeakIntoContent_CallArrivesInFinalChunk()
     {
         string[] pieces = ["<|tool_call|>", "[{\"name\": ", "\"get_weather\", ", "\"arguments\": {\"city\": ", "\"Paris\"}}]"];
-        var (content, calls, finish) = await StreamAsync(pieces, Tools);
+        var (content, calls, finish, _) = await StreamAsync(pieces, Tools);
 
         Assert.DoesNotContain("<|tool_call", content, StringComparison.Ordinal);
         Assert.Equal("", content);
@@ -203,9 +239,65 @@ public class GraniteToolCallParserTests
     public async Task RealOutput_Streamed_NoMarkerOrJsonInContent_CallsInFinalChunk(string fixture)
     {
         var tools = fixture.EndsWith("typed", StringComparison.Ordinal) ? Alarm : Tools;
-        var (content, calls, finish) = await StreamAsync(Tokens(Raw(fixture)), tools);
+        var (content, calls, finish, _) = await StreamAsync(Tokens(Raw(fixture)), tools);
         Assert.Equal("", content);
         Assert.Equal("tool_calls", finish);
         Assert.Equal(fixture.EndsWith("parallel", StringComparison.Ordinal) ? 2 : 1, calls!.Value.GetArrayLength());
+    }
+
+    /// <summary>
+    /// #1498: the flaky CI failure (<c>JsonReaderException: 'i' is an invalid start of a value</c>) was the endpoint's prefill
+    /// keep-alive comment <c>: waiting for prompt processing (10s)</c> (#1025), written when the first token is more than one
+    /// interval late (a stalled runner), read by a test SSE reader that sliced <c>"data: ".Length</c> off every block. Here the
+    /// comment is forced deterministically (1 ms interval, first token gated on the comment having been written) and the
+    /// stream must still read as a clean tool call.
+    /// </summary>
+    [Theory]
+    [InlineData("granite-toolcall")]
+    [InlineData("granite-toolcall-typed")]
+    [InlineData("granite-toolcall-parallel")]
+    public async Task RealOutput_Streamed_AfterAPrefillKeepAliveComment_StillReadsAsACleanToolCall(string fixture)
+    {
+        var tools = fixture.EndsWith("typed", StringComparison.Ordinal) ? Alarm : Tools;
+        var (content, calls, finish, raw) = await StreamAsync(Tokens(Raw(fixture)), tools, afterAKeepAlive: true);
+
+        // The arm is live only if the keep-alive really went out (control-arm sensitivity).
+        Assert.True(SseTestReader.HasComment(raw), "no keep-alive comment in the body: " + raw);
+        Assert.Contains("\n: waiting for prompt processing (", raw, StringComparison.Ordinal);
+        Assert.Equal("", content);
+        Assert.Equal("tool_calls", finish);
+        Assert.Equal(fixture.EndsWith("parallel", StringComparison.Ordinal) ? 2 : 1, calls!.Value.GetArrayLength());
+    }
+
+    /// <summary>
+    /// #1498 control arm: the suspected cause was a chunk-boundary bug. Every single split point of every fixture (the marker
+    /// token kept whole, then the JSON cut once at each character), plus one-character-per-token streaming, must read as the
+    /// same clean call set. This ran green against the unfixed reader too: the boundary hypothesis is discharged, not just untested.
+    /// </summary>
+    [Theory]
+    [InlineData("granite-toolcall")]
+    [InlineData("granite-toolcall-typed")]
+    [InlineData("granite-toolcall-parallel")]
+    public async Task RealOutput_Streamed_EverySplitPoint_ReadsAsTheSameCalls(string fixture)
+    {
+        var tools = fixture.EndsWith("typed", StringComparison.Ordinal) ? Alarm : Tools;
+        string raw = Raw(fixture);
+        string rest = raw["<|tool_call|>".Length..];
+        int expected = fixture.EndsWith("parallel", StringComparison.Ordinal) ? 2 : 1;
+
+        async Task CheckAsync(string[] pieces, string arm)
+        {
+            var (content, calls, finish, _) = await StreamAsync(pieces, tools);
+            Assert.True(content.Length == 0, $"{arm}: content leaked: {content}");
+            Assert.True(finish == "tool_calls", $"{arm}: finish {finish}");
+            Assert.True(calls is not null && calls.Value.GetArrayLength() == expected, $"{arm}: calls {calls?.GetArrayLength()}");
+        }
+
+        for (int cut = 1; cut < rest.Length; cut++)
+            await CheckAsync(["<|tool_call|>", rest[..cut], rest[cut..]], $"cut@{cut}");
+        await CheckAsync(["<|tool_call|>", .. rest.Select(ch => ch.ToString())], "per-char");
+        await CheckAsync([raw], "whole");
+        // Marker split across tokens, as a tokenizer without the special token would do.
+        await CheckAsync(["<|tool", "_call|>", rest], "split-marker");
     }
 }
