@@ -244,6 +244,13 @@ public sealed class Glm4MoeVulkanRealFileTests
         for (int i = 0; i < greedyLen; i++) if (greedy[true][i] != greedy[false][i]) { firstDiv = i; break; }
         _out.WriteLine($"fused vs unfused: KL@512 {klVk512}; KL@2048 {klVk2k}; greedy identity {greedyAgree}/{greedyLen} (first divergence {(firstDiv < 0 ? "none" : firstDiv.ToString())})");
 
+        // Gates on the Vulkan-only part first (also what the mutant runs use: DOTLLM_GLM4MOE_SKIP_CPU=1 stops here).
+        // Fused vs unfused is a schedule change over the same kernels: it must sit far below the CPU-vs-Vulkan floor (S1/S2: ~0.03 mean).
+        Assert.True(klVk512.Mean < 1e-3 && klVk2k.Mean < 1e-3, $"fused vs unfused KL too large: {klVk512} / {klVk2k}");
+        Assert.True(klVk512.Top1Agree >= steps - 1 && klVk2k.Top1Agree >= steps - 1, "fused vs unfused argmax disagreement beyond one near-tie step");
+        Assert.True(greedyAgree >= greedyLen * 9 / 10, $"fused vs unfused greedy identity {greedyAgree}/{greedyLen}");
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_GLM4MOE_SKIP_CPU") == "1", "Vulkan-only gates passed; CPU reference skipped on request");
+
         // ---- CPU reference (Vulkan model released above) ----
         var cpu = new Dictionary<int, List<float[]>>();
         int[] cpuGreedy = [];
@@ -288,10 +295,6 @@ public sealed class Glm4MoeVulkanRealFileTests
         _out.WriteLine($"KL(cpu||fused)@2048 {fusedCpu2k}; KL(cpu||unfused)@2048 {plainCpu2k}");
         _out.WriteLine($"greedy identity vs CPU: fused {gFusedCpu}/{greedyLen}, unfused {gPlainCpu}/{greedyLen}");
 
-        // Gates. Fused vs unfused is a schedule change over the same kernels: it must sit far below the CPU-vs-Vulkan floor (S1/S2: ~0.03 mean).
-        Assert.True(klVk512.Mean < 1e-3 && klVk2k.Mean < 1e-3, $"fused vs unfused KL too large: {klVk512} / {klVk2k}");
-        Assert.True(klVk512.Top1Agree >= steps - 1 && klVk2k.Top1Agree >= steps - 1, "fused vs unfused argmax disagreement beyond one near-tie step");
-        Assert.True(greedyAgree >= greedyLen * 9 / 10, $"fused vs unfused greedy identity {greedyAgree}/{greedyLen}");
         // Fused is no further from the CPU engine than the unfused chain is (both at the activation-precision floor).
         Assert.True(fusedCpu512.Mean < plainCpu512.Mean + 0.01 && fusedCpu2k.Mean < plainCpu2k.Mean + 0.01, "fused chain drifted from the CPU engine beyond the unfused chain");
         Assert.True(fusedCpu512.Mean < 0.1 && fusedCpu2k.Mean < 0.1, "fused chain vs CPU above the floor class");
