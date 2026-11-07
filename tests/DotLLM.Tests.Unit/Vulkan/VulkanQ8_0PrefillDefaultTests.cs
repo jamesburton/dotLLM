@@ -54,6 +54,7 @@ public sealed unsafe class VulkanQ8_0PrefillDefaultTests(ITestOutputHelper outpu
         var (vkModel, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, SpvDir());
         using var vk = (IDisposable)vkModel;
         var dense = Assert.IsType<VulkanTransformerModel>(vkModel);
+        Assert.True(dense.TrySetAllRowLogitsLimit(Window), "the Vulkan host cannot return every row's logits for the window");
         output.WriteLine($"device {device.DeviceName} vendor 0x{device.VendorId:X} subgroup {device.SubgroupSize}; Q8_0CoopmatIsDeviceDefault={dense.Q8_0CoopmatIsDeviceDefault}; min tokens {VulkanTransformerModel.Q8_0CoopmatPreferSeqLen}");
 
         Run RunVulkan(VulkanTransformerModel.Q8_0PrefillKernel mode)
@@ -61,11 +62,13 @@ public sealed unsafe class VulkanQ8_0PrefillDefaultTests(ITestOutputHelper outpu
             dense.Q8_0Prefill = mode;
             long cm0 = dense.Q8_0PrefillCoopmatDispatchCount, mmq0 = dense.Q8_0PrefillMmqDispatchCount;
             vkModel.ResetSequenceState();
-            using var kv = kvFactory(Window + GreedySteps + 8);
-            using var r = Step(dense, tokens, positions, kv);
+            using var full = dense.Forward(tokens, positions, deviceId: -1);   // every row's logits (the cacheless forward)
             long cm = dense.Q8_0PrefillCoopmatDispatchCount - cm0, mmq = dense.Q8_0PrefillMmqDispatchCount - mmq0;
-            var logits = AllRows(r, vocab);
-            var greedy = Greedy(dense, kv, logits, Window, vocab);
+            var logits = AllRows(full, vocab, Window);
+            vkModel.ResetSequenceState();
+            using var kv = kvFactory(Window + GreedySteps + 8);
+            using var last = Step(dense, tokens, positions, kv, lastOnly: true);
+            var greedy = Greedy(dense, kv, LastRow(last, vocab), Window, vocab);
             return new Run(logits, greedy, cm, mmq);
         }
 
@@ -76,7 +79,7 @@ public sealed unsafe class VulkanQ8_0PrefillDefaultTests(ITestOutputHelper outpu
         output.WriteLine($"dispatches (coopmat/mmq) over a {Window}-row prefill: mmq arm {mmqRun.CoopmatDispatches}/{mmqRun.MmqDispatches}, coopmat arm {cmRun.CoopmatDispatches}/{cmRun.MmqDispatches}, auto {autoRun.CoopmatDispatches}/{autoRun.MmqDispatches}");
         Assert.True(mmqRun.MmqDispatches > 0 && mmqRun.CoopmatDispatches == 0, "forced MMQ arm did not run only MMQ");
         Assert.True(cmRun.CoopmatDispatches > 0 && cmRun.MmqDispatches == 0, "forced coopmat arm did not run only the coopmat GEMM");
-        Assert.Equal(config.NumLayers * 7, cmRun.CoopmatDispatches);   // q, k, v, o, gate, up, down per layer (the Q8_0 lm_head goes through its own path)
+        Assert.True(cmRun.CoopmatDispatches >= config.NumLayers * 7, "fewer coopmat dispatches than q, k, v, o, gate, up, down per layer");   // +1 when the Q8_0 lm_head scores every row
         if (dense.Q8_0CoopmatIsDeviceDefault)
         {
             Assert.True(autoRun.CoopmatDispatches == cmRun.CoopmatDispatches && autoRun.MmqDispatches == 0,
@@ -93,11 +96,12 @@ public sealed unsafe class VulkanQ8_0PrefillDefaultTests(ITestOutputHelper outpu
         // CPU oracle (W8A8 projections) on the same window + greedy continuation.
         using var cpuModel = ModelLoader.CreateCpuModelFromGguf(gguf, config);
         float[] cpuLogits; int[] cpuGreedy;
+        using (var full = cpuModel.Forward(tokens, positions, deviceId: -1))
+            cpuLogits = AllRows(full, vocab, Window);
         using (var ckv = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, Window + GreedySteps + 8))
         {
-            using var r = Step(cpuModel, tokens, positions, ckv);
-            cpuLogits = AllRows(r, vocab);
-            cpuGreedy = Greedy(cpuModel, ckv, cpuLogits, Window, vocab);
+            using var last = Step(cpuModel, tokens, positions, ckv, lastOnly: true);
+            cpuGreedy = Greedy(cpuModel, ckv, LastRow(last, vocab), Window, vocab);
         }
 
         // Optional true-F32 reference: the same weights dequantised to F32 by gguf-py, F32 activations on the CPU.
@@ -109,7 +113,7 @@ public sealed unsafe class VulkanQ8_0PrefillDefaultTests(ITestOutputHelper outpu
             var c32 = GgufModelConfigExtractor.Extract(g32.Metadata);
             using var m32 = ModelLoader.CreateCpuModelFromGguf(g32, c32);
             using var r = m32.Forward(tokens, positions, deviceId: -1);
-            f32Logits = AllRows(r, vocab);
+            f32Logits = AllRows(r, vocab, Window);
         }
 
         Report("KL(cpu||mmq)", cpuLogits, mmqRun.Logits, vocab);
@@ -187,18 +191,24 @@ public sealed unsafe class VulkanQ8_0PrefillDefaultTests(ITestOutputHelper outpu
     private static ITensor Step(IModel model, ReadOnlyMemory<int> tokens, ReadOnlyMemory<int> positions, IKvCache kv, bool lastOnly = false)
         => model.ForwardBatch([new SequenceForwardRequest { TokenIds = tokens, Positions = positions, KvCache = kv, LastTokenLogitsOnly = lastOnly }], -1)[0];
 
-    private static float[] AllRows(ITensor t, int vocab)
+    private static float[] AllRows(ITensor t, int vocab, int expectedRows)
     {
-        int rows = t.Shape[0];
+        Assert.Equal(expectedRows, t.Shape[0]);
         Assert.Equal(vocab, t.Shape[1]);
-        return new ReadOnlySpan<float>((float*)t.DataPointer, rows * vocab).ToArray();
+        return new ReadOnlySpan<float>((float*)t.DataPointer, expectedRows * vocab).ToArray();
+    }
+
+    private static float[] LastRow(ITensor t, int vocab)
+    {
+        Assert.Equal(vocab, t.Shape[1]);
+        return new ReadOnlySpan<float>((float*)t.DataPointer + (long)(t.Shape[0] - 1) * vocab, vocab).ToArray();
     }
 
     /// <summary>Greedy continuation through the KV cache (1-row forwards: identical kernels on both arms, so only the prefill differs).</summary>
-    private static int[] Greedy(IModel model, IKvCache kv, float[] prefillLogits, int start, int vocab)
+    private static int[] Greedy(IModel model, IKvCache kv, float[] lastPrefillRow, int start, int vocab)
     {
         var outIds = new int[GreedySteps];
-        int next = Argmax(prefillLogits.AsSpan((start - 1) * vocab, vocab));
+        int next = Argmax(lastPrefillRow);
         for (int s = 0; s < GreedySteps; s++)
         {
             outIds[s] = next;
