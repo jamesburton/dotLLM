@@ -231,6 +231,18 @@ public sealed partial class GitCliInfo : IGitInfo
         return sb.ToString();
     }
 
+    /// <summary>Waits for both reader tasks and returns the first failure (null when both succeeded); never leaves one unobserved.</summary>
+    internal static Exception? Observe(Task<string> stdout, Task<string> stderr)
+    {
+        Exception? first = null;
+        foreach (Task<string> reader in new[] { stdout, stderr })
+        {
+            try { reader.GetAwaiter().GetResult(); }
+            catch (Exception ex) { first ??= ex; }
+        }
+        return first;
+    }
+
     private (int Code, string Output, string Error) Run(string directory, params string[] args)
     {
         var psi = new ProcessStartInfo(_git)
@@ -266,10 +278,14 @@ public sealed partial class GitCliInfo : IGitInfo
             if (!process.WaitForExit(_timeout))
             {
                 try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+                Observe(stdout, stderr);
                 throw new GitException($"git {args[0]} timed out after {_timeout.TotalSeconds:F0} s in {directory}.");
             }
             process.WaitForExit();
-            return (process.ExitCode, stdout.GetAwaiter().GetResult(), stderr.GetAwaiter().GetResult());
+            // Both readers are always observed: if one threw (output over the cap), the other must not be left faulted and unobserved.
+            Exception? failure = Observe(stdout, stderr);
+            if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+            return (process.ExitCode, stdout.Result, stderr.Result);
         }
     }
 }

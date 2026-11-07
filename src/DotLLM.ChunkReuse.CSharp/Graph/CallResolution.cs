@@ -66,10 +66,14 @@ public static class CallResolution
         ArgumentNullException.ThrowIfNull(projects);
         // Roslyn's binder recurses per nesting level: bind on the large-stack thread (the caller's stack may be ordinary), and
         // leave out a file nested deeper than the cap that thread makes safe.
-        return CodeCorpus.RoslynParsing.RunWithLargeStack(() => SitesCore(projects, paths));
+        return CodeCorpus.RoslynParsing.RunWithLargeStack(() => SitesCore(projects, paths, CodeCorpus.RoslynParsing.DefaultFileBudget));
     }
 
-    private static IReadOnlyList<CallSite> SitesCore(IReadOnlyList<ProjectCompilation> projects, IReadOnlySet<string>? paths)
+    /// <summary><see cref="Sites"/> with a per-file binding budget (tests).</summary>
+    internal static IReadOnlyList<CallSite> SitesWithin(IReadOnlyList<ProjectCompilation> projects, TimeSpan fileBudget) =>
+        CodeCorpus.RoslynParsing.RunWithLargeStack(() => SitesCore(projects, null, fileBudget));
+
+    private static IReadOnlyList<CallSite> SitesCore(IReadOnlyList<ProjectCompilation> projects, IReadOnlySet<string>? paths, TimeSpan fileBudget)
     {
         var corpusPath = new Dictionary<string, string>(RoslynGraphBuilder.PathComparer);
         foreach (ProjectCompilation p in projects)
@@ -89,14 +93,19 @@ public static class CallResolution
                     continue;
                 }
                 SemanticModel model = p.Compilation.GetSemanticModel(tree);
+                using var budget = new CancellationTokenSource(fileBudget);
+                var treeSites = new List<CallSite>();
+                try
+                {
                 foreach (InvocationExpressionSyntax inv in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
                 {
-                    SymbolInfo info = model.GetSymbolInfo(inv);
+                    budget.Token.ThrowIfCancellationRequested();
+                    SymbolInfo info = model.GetSymbolInfo(inv, budget.Token);
                     if (inv.Expression is IdentifierNameSyntax { Identifier.ValueText: "nameof" } && info.Symbol is null) continue;
                     int at = inv.SpanStart, length = inv.Span.Length;
                     if (info.Symbol is not IMethodSymbol method)
                     {
-                        sites.Add(new CallSite(path, at, length, CallTargetKind.Unresolved, null, null, -1));
+                        treeSites.Add(new CallSite(path, at, length, CallTargetKind.Unresolved, null, null, -1));
                         continue;
                     }
                     IMethodSymbol m = (method.ReducedFrom ?? method).OriginalDefinition;
@@ -106,10 +115,17 @@ public static class CallResolution
                         .OrderBy(d => d.Path, StringComparer.Ordinal).ThenBy(d => d.Offset)
                         .Select(d => ((string, int)?)d).FirstOrDefault();
                     string display = m.ToDisplayString();
-                    sites.Add(def is { } d
+                    treeSites.Add(def is { } d
                         ? new CallSite(path, at, length, CallTargetKind.File, display, d.Item1, d.Item2)
                         : new CallSite(path, at, length, CallTargetKind.Elsewhere, display, null, -1));
                 }
+                }
+                catch (OperationCanceledException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"{path}: binding exceeded {fileBudget.TotalSeconds:F0} s; no call sites measured.");
+                    continue;
+                }
+                sites.AddRange(treeSites);
             }
         }
         sites.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path) is var c && c != 0 ? c : a.Offset != b.Offset ? a.Offset.CompareTo(b.Offset) : a.Length.CompareTo(b.Length));

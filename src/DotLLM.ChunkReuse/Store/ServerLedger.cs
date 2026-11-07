@@ -338,7 +338,7 @@ public sealed class ServerLedger
             }).ToList(),
         };
         string full = System.IO.Path.Combine(_root, FileName);
-        Directory.CreateDirectory(_root);
+        StorePaths.CreateStoreDirectory(_root);
         ChunkIndex.SweepStaleTemps(_root, FileName);
         string temp = full + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try

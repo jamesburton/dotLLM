@@ -213,10 +213,11 @@ public sealed class IndexReviewFixTests : IDisposable
     }
 
     [Fact]
-    public void IndexSave_CleanupOfTheTempFileNeverMasksTheSaveFailure()
+    public void IndexSave_DestinationIsADirectory_ThrowsTheSavesOwnException_AndLeavesNoTempFile()
     {
-        // The temp-file delete in Save's finally is guarded (IOException / UnauthorizedAccessException are swallowed). Observable
-        // part: when the destination cannot be replaced (a directory sits at the index path), the exception is the save's own.
+        // Smoke test only: it does NOT detect removal of the guard around the temp-file delete in Save's finally (no test can make
+        // that delete fail; mutant D1 is documented as untestable). It pins the observable part: when the destination cannot be
+        // replaced (a directory sits at the index path), the exception is the save's own and no temp file is left behind.
         Directory.CreateDirectory(_root);
         string path = Path.Combine(_root, "index-blocked.0123456789ab.0123abcd.default.json");
         Directory.CreateDirectory(path);

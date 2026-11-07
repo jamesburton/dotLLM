@@ -226,7 +226,8 @@ public sealed class Corpus
     /// is not a corpus file and is not in the map).
     /// </summary>
     internal static (CSharpCompilation Compilation, Dictionary<string, SyntaxTree> Trees) CreateCompilation(
-        IEnumerable<SourceFile> files, bool implicitUsings, int maxSyntaxDepth = RoslynParsing.MaxCompilationSyntaxDepth)
+        IEnumerable<SourceFile> files, bool implicitUsings, int maxSyntaxDepth = RoslynParsing.MaxCompilationSyntaxDepth,
+        TimeSpan? fileBudget = null)
     {
         var trees = new Dictionary<string, SyntaxTree>(StringComparer.Ordinal);
         foreach (SourceFile f in files)
@@ -239,9 +240,19 @@ public sealed class Corpus
                     $"{f.Path}: bracket nesting {depth} exceeds {RoslynParsing.MaxNestingDepth}; left out of the compilation.");
                 tree = CSharpSyntaxTree.ParseText("", SymbolChunker.ParseOptions, f.Path);
             }
+            else if (RoslynParsing.TooLarge(f.Text, out int length))
+            {
+                System.Diagnostics.Trace.TraceWarning(
+                    $"{f.Path}: {length} characters exceeds {RoslynParsing.MaxFileChars}; left out of the compilation.");
+                tree = CSharpSyntaxTree.ParseText("", SymbolChunker.ParseOptions, f.Path);
+            }
+            else if (TryParse(f, fileBudget) is not { } parsed)
+            {
+                tree = CSharpSyntaxTree.ParseText("", SymbolChunker.ParseOptions, f.Path);
+            }
             else
             {
-                tree = RoslynParsing.Parse(f.Text, f.Path);
+                tree = parsed;
                 // Nesting without brackets (generic angles, '.' chains, ternaries, unary operators) passes the bracket cap and then
                 // overflows Roslyn's binder: measure the parsed tree and leave such a file out too.
                 int syntaxDepth = RoslynParsing.SyntaxDepth(tree.GetRoot());
@@ -264,6 +275,20 @@ public sealed class Corpus
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, allowUnsafe: true,
                 nullableContextOptions: NullableContextOptions.Enable, concurrentBuild: false));
         return (compilation, trees);
+    }
+
+    /// <summary>Parses a file within its budget; null (with a warning) when it overruns it.</summary>
+    private static SyntaxTree? TryParse(SourceFile f, TimeSpan? fileBudget)
+    {
+        try
+        {
+            return RoslynParsing.Parse(f.Text, f.Path, fileBudget);
+        }
+        catch (TimeoutException ex)
+        {
+            System.Diagnostics.Trace.TraceWarning($"{f.Path}: {ex.Message} Left out of the compilation.");
+            return null;
+        }
     }
 
     /// <summary>The syntax tree of <paramref name="path"/> in <see cref="Compilation"/>.</summary>

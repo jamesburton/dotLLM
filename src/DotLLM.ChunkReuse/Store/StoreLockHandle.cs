@@ -31,7 +31,7 @@ public sealed class StoreLockHandle : IDisposable
 
     /// <summary>
     /// Throws unless this handle is held and is the lock of <paramref name="storeRoot"/> (compared with
-    /// <see cref="ChunkIndex.PathComparer"/> after full-path normalisation).
+    /// <see cref="ChunkIndex.PathComparer"/> by real path: a symbolic link, junction or short name of the root is the same root).
     /// </summary>
     /// <param name="storeRoot">The store root a write is about to change.</param>
     /// <exception cref="InvalidOperationException">The handle was disposed, or belongs to another store root.</exception>
@@ -39,7 +39,7 @@ public sealed class StoreLockHandle : IDisposable
     {
         ArgumentException.ThrowIfNullOrEmpty(storeRoot);
         if (!IsHeld) throw new InvalidOperationException($"The store lock of '{StoreRoot}' was already released; take it again for this write.");
-        string root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(storeRoot));
+        string root = StorePaths.CanonicalRoot(storeRoot);
         if (!ChunkIndex.PathComparer.Equals(root, StoreRoot))
             throw new InvalidOperationException($"The store lock held is for '{StoreRoot}', not for '{root}'.");
     }
