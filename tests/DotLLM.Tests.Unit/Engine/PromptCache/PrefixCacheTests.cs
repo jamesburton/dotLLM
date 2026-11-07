@@ -174,4 +174,125 @@ public sealed class PrefixCacheTests
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => { new PrefixCache(0); });
     }
+
+    // ── agent-aware policy (issue #1654) ──
+
+    private static int[] Seq(int from, int count) => [.. Enumerable.Range(from, count)];
+
+    /// <summary>A 100-token conversation with a 10-token "system prompt" at the front that a side request shares.</summary>
+    private static readonly int[] Conversation = Seq(1, 100);
+    private static readonly int[] SideRequest = [.. Seq(1, 10), .. Seq(500, 20)];
+
+    [Theory]
+    [InlineData(PrefixCachePolicy.Lru, 10)]
+    [InlineData(PrefixCachePolicy.Agent, 0)]
+    public void Agent_ProtectsAnUnexpiredConversation_FromAShallowHitByAnotherConversation(PrefixCachePolicy policy, int expectedMatch)
+    {
+        // A hit truncates the entry's live KV to the match and the request overwrites the rest. Under LRU a 30-token side request
+        // that shares the 10-token system prompt destroys the 100-token conversation for 10 tokens of saving.
+        using var cache = new PrefixCache(4, policy);
+        cache.Store(Conversation, CreateCache());
+
+        var (entry, matched) = cache.FindMatch(SideRequest);
+
+        Assert.Equal(expectedMatch, matched);
+        Assert.Equal(expectedMatch == 0, entry is null);
+        Assert.Equal(policy == PrefixCachePolicy.Agent ? 1 : 0, cache.ProtectedMisses);
+        // The conversation's own next turn still hits the whole entry either way.
+        Assert.Equal(100, cache.FindMatch([.. Conversation, .. Seq(900, 5)]).MatchedTokens);
+    }
+
+    [Fact]
+    public void Agent_AllowsTheShallowHit_OnceTheConversationHasExpired()
+    {
+        // Expiry: the conversation's own length (100) of other prompt tokens read since its last use. Three 30-token side
+        // requests (90) are not enough; the fourth (120) is.
+        using var cache = new PrefixCache(4, PrefixCachePolicy.Agent);
+        cache.Store(Conversation, CreateCache());
+
+        for (int i = 0; i < 3; i++)
+            Assert.Equal(0, cache.FindMatch(SideRequest).MatchedTokens);
+        Assert.Equal(10, cache.FindMatch(SideRequest).MatchedTokens);
+        Assert.Equal(3, cache.ProtectedMisses);
+    }
+
+    [Fact]
+    public void Agent_TreatsARequestSharingEverythingBeforeTheLastUserMessage_AsTheSameConversation()
+    {
+        // The entry's save point is the start of its last user message (token 60). A retry or edit of that message shares 60
+        // tokens: the same conversation, so it may resume (destructively) from there; a request sharing less may not.
+        using var cache = new PrefixCache(4, PrefixCachePolicy.Agent);
+        cache.Store(Conversation, CreateCache(), savePoint: 60);
+
+        Assert.Equal(60, cache.FindMatch([.. Seq(1, 60), .. Seq(700, 10)]).MatchedTokens);
+        cache.Store(Conversation, CreateCache(), savePoint: 60);   // (restore the entry for the second probe)
+        Assert.Equal(0, cache.FindMatch([.. Seq(1, 59), .. Seq(700, 10)]).MatchedTokens);
+    }
+
+    [Fact]
+    public void Agent_WithoutASavePoint_HalfTheEntryStandsInForIt()
+    {
+        using var cache = new PrefixCache(4, PrefixCachePolicy.Agent);
+        cache.Store(Conversation, CreateCache());
+
+        Assert.Equal(0, cache.FindMatch([.. Seq(1, 49), .. Seq(700, 10)]).MatchedTokens);
+        Assert.Equal(50, cache.FindMatch([.. Seq(1, 50), .. Seq(700, 10)]).MatchedTokens);
+    }
+
+    [Fact]
+    public void Agent_FallsBackToTheNextBestUnprotectedEntry()
+    {
+        // The side request shares 10 tokens with the protected conversation and 15 with an earlier side request's entry.
+        using var cache = new PrefixCache(4, PrefixCachePolicy.Agent);
+        cache.Store(Conversation, CreateCache());
+        int[] earlierSide = [.. Seq(1, 10), .. Seq(500, 5), .. Seq(800, 10)];
+        cache.Store(earlierSide, CreateCache());
+
+        var (entry, matched) = cache.FindMatch(SideRequest);
+
+        Assert.Equal(15, matched);
+        Assert.Same(earlierSide, entry!.TokenSequence);
+    }
+
+    [Theory]
+    [InlineData(PrefixCachePolicy.Lru)]
+    [InlineData(PrefixCachePolicy.Agent)]
+    public void Eviction_Agent_DropsTheExpiredShortEntry_Lru_DropsTheLongConversation(PrefixCachePolicy policy)
+    {
+        // Capacity 2. The conversation (100) is hit at clock 100; a 10-token side entry is stored at clock 100; then an unrelated
+        // 20-token lookup moves the clock to 120. The side entry is 2x its own length old, the conversation 20%.
+        using var cache = new PrefixCache(2, policy);
+        cache.Store(Conversation, CreateCache());
+        Assert.Equal(100, cache.FindMatch(Conversation).MatchedTokens);
+        int[] side = Seq(500, 10);
+        cache.Store(side, CreateCache());
+        Assert.Equal(0, cache.FindMatch(Seq(900, 20)).MatchedTokens);
+
+        cache.Store(Seq(900, 20), CreateCache());   // third entry: one must go
+
+        Assert.Equal(2, cache.EntryCount);
+        if (policy == PrefixCachePolicy.Agent)
+        {
+            Assert.Equal(100, cache.FindMatch(Conversation).MatchedTokens);
+            Assert.Equal(0, cache.FindMatch(side).MatchedTokens);
+        }
+        else
+        {
+            Assert.Equal(0, cache.FindMatch(Conversation).MatchedTokens);
+            Assert.Equal(10, cache.FindMatch(side).MatchedTokens);
+        }
+    }
+
+    [Fact]
+    public void TokenClock_CountsEveryLookup_HitOrMiss()
+    {
+        using var cache = new PrefixCache(4, PrefixCachePolicy.Agent);
+        cache.Store(Conversation, CreateCache());
+        cache.FindMatch(Conversation);
+        cache.FindMatch(Seq(900, 7));
+
+        Assert.Equal(107, cache.TokenClock);
+        Assert.Equal(1, cache.Hits);
+        Assert.Equal(1, cache.Misses);
+    }
 }

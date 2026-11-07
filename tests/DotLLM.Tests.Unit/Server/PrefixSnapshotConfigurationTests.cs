@@ -26,6 +26,26 @@ public sealed class PrefixSnapshotConfigurationTests
     }
 
     [Fact]
+    public void PromptCachePolicy_DefaultsToLru_AndReachesEveryEngineOption()
+    {
+        var lru = ServerOptions.Parse(["--model", "m.gguf"]);
+        Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Lru, lru.PromptCachePolicy);
+        Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Lru, lru.GetPrefixSnapshotOptions().Policy);
+
+        var agent = ServerOptions.Parse(["--model", "m.gguf", "--prompt-cache-policy", "Agent"]);
+        Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent, agent.PromptCachePolicy);
+        Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent, agent.GetPrefixSnapshotOptions().Policy);
+        Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent,
+            ServerOptions.BuildPrefixSnapshotOptions(null, null, policy: DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent).Policy);
+    }
+
+    [Theory]
+    [InlineData("fifo")]
+    [InlineData("1")]
+    public void PromptCachePolicy_RejectsUnknownValues(string value)
+        => Assert.ThrowsAny<ArgumentException>(() => ServerOptions.Parse(["--model", "m.gguf", "--prompt-cache-policy", value]));
+
+    [Fact]
     public void DefaultSnapshotOptions_PreserveOneEntryAndNoHostTier()
     {
         var engine = new ServerOptions { Model = "m.gguf" }.GetPrefixSnapshotOptions();

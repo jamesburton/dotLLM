@@ -172,6 +172,9 @@ public static class MessagesEndpoint
         options = plan.WithThinkingBudget(options, thinkingBudget, state.Options.ReasoningBudgetMessage);
         // (#1093) Same hint as the OpenAI surface; every dispatch below carries these options.
         options = options with { GenerationPromptSuffix = generationPromptSuffix };
+        // (#1654) The conversation's save point (start of the last user message), for the agent-aware prefix policy.
+        if (state.Options.PromptCachePolicy == DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent)
+            options = options with { SavePointPrefix = ReasoningSupport.SavePointPrefix(state.ChatTemplate!, rendered.Messages, rendered.Options, prompt) };
 
         // tool_choice was parsed and then dropped on the floor (#449): the prompt was built with
         // the tools but nothing constrained or suppressed the model, so `{"type":"tool"}` was

@@ -21,6 +21,13 @@ public sealed record ContinuousBatchSchedulerOptions
     public int RecurrentPrefixCacheEntries { get; init; } = 0;
 
     /// <summary>
+    /// Which recurrent prefix entry goes when the cache is over <see cref="RecurrentPrefixCacheEntries"/> (issue #1654):
+    /// <see cref="PromptCache.PrefixCachePolicy.Lru"/> the least recently used; <see cref="PromptCache.PrefixCachePolicy.Agent"/>
+    /// the entry oldest relative to its own length in tokens (<see cref="PromptCache.PrefixRetention"/>).
+    /// </summary>
+    public PromptCache.PrefixCachePolicy RecurrentPrefixPolicy { get; init; } = PromptCache.PrefixCachePolicy.Lru;
+
+    /// <summary>
     /// Maximum number of prompt tokens admitted (across all newly-admitted sequences) in
     /// a single scheduler iteration. Bounds the worst-case prefill latency before a decode
     /// iteration is allowed to run. Set to 0 to disable the bound.

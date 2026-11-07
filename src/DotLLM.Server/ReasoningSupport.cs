@@ -241,6 +241,40 @@ internal static class ReasoningSupport
         }
     }
 
+    /// <summary>
+    /// The prompt text up to the start of the last user message's content, its role header included (issue #1654), when the
+    /// last message is a user message with an earlier one before it; otherwise <see langword="null"/> (also when the render
+    /// throws or the result is not a strict prefix of <paramref name="prompt"/>). The engine uses it as the conversation's save
+    /// point (<see cref="Core.Configuration.InferenceOptions.SavePointPrefix"/>).
+    /// </summary>
+    /// <remarks>
+    /// Rendering the messages without the last one is not a prefix of the full render on every template: Qwen3's renders an
+    /// assistant turn with its thinking block only when it is the last turn. So the full conversation is rendered once more with
+    /// the last user message's content replaced by a marker, and the prompt is cut where the marker lands; everything before it
+    /// is rendered identically in both.
+    /// </remarks>
+    internal static string? SavePointPrefix(
+        IChatTemplate template, IReadOnlyList<ChatMessage> messages, ChatTemplateOptions options, string prompt)
+    {
+        const string marker = "\u0001dotllm-save-point\u0001";
+        if (messages.Count < 2 || !string.Equals(messages[^1].Role, "user", StringComparison.OrdinalIgnoreCase))
+            return null;
+        try
+        {
+            var marked = messages.ToArray();
+            marked[^1] = marked[^1] with { Content = marker };
+            string rendered = template.Apply(marked, options);
+            int at = rendered.IndexOf(marker, StringComparison.Ordinal);
+            if (at <= 0) return null;
+            string head = rendered[..at];
+            return prompt.Length > head.Length && prompt.StartsWith(head, StringComparison.Ordinal) ? head : null;
+        }
+        catch (JinjaException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Whether tool_choice will install a decoding constraint (mirrors <c>ToolChoiceBinder.Apply</c>).</summary>
     internal static bool ToolChoiceConstrains(
         ToolChoice toolChoice, ToolDefinition[]? tools, IToolCallParser? modelParser)

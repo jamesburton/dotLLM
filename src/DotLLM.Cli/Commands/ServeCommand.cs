@@ -131,6 +131,12 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(4)]
         public int PromptCacheSize { get; set; } = 4;
 
+        /// <summary>Prefix-cache retention policy (issue #1654).</summary>
+        [CommandOption("--prompt-cache-policy")]
+        [Description("Prefix-cache retention policy: lru (default) or agent (a conversation survives about its own length of other prompt tokens, " +
+                     "side requests run without truncating it, recurrent models checkpoint at the last user message and after the reply). Env DOTLLM_PREFIX_POLICY.")]
+        public string? PromptCachePolicy { get; set; }
+
         /// <summary>Disable warm-up (enabled by default).</summary>
         [CommandOption("--no-warmup")]
         [Description("Disable warm-up passes at startup. When enabled (default), dummy inference runs trigger JIT compilation.")]
@@ -561,6 +567,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             CacheTypeV = settings.KvQuantV ?? settings.CacheTypeV,
             PromptCacheEnabled = !settings.NoPromptCache,
             PromptCacheSize = settings.PromptCacheSize,
+            PromptCachePolicy = ServerOptions.ParsePromptCachePolicy(settings.PromptCachePolicy),
             Warmup = new WarmupOptions
             {
                 Enabled = !settings.NoWarmup,

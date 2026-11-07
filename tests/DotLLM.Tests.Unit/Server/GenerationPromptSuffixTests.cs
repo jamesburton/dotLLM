@@ -27,6 +27,50 @@ public class GenerationPromptSuffixTests
         return ReasoningSupport.GenerationPromptSuffix(template, Messages, options, prompt);
     }
 
+    // ── save point (issue #1654): the prompt up to the start of the last user message ──
+
+    [Fact]
+    public void SavePointPrefix_IsTheRenderOfEveryMessageButTheLastUser_AndAPrefixOfThePrompt()
+    {
+        var template = new JinjaChatTemplate(Fixture("qwen3-4b-instruct-2507-chat-template.jinja"), "<|endoftext|>", "<|im_end|>");
+        var options = ReasoningSupport.BuildTemplateOptions(null, null, null, null, constrained: false);
+        ChatMessage[] messages =
+        [
+            new ChatMessage { Role = "system", Content = "You are terse." },
+            new ChatMessage { Role = "user", Content = "Hello" },
+            new ChatMessage { Role = "assistant", Content = "Hi." },
+            new ChatMessage { Role = "user", Content = "Second question" },
+        ];
+        Assert.True(ReasoningSupport.TryApply(template, messages, options, out string prompt, out _, out _));
+
+        string? savePoint = ReasoningSupport.SavePointPrefix(template, messages, options, prompt);
+
+        Assert.NotNull(savePoint);
+        Assert.StartsWith(savePoint, prompt, StringComparison.Ordinal);
+        Assert.Contains("Hi.", savePoint, StringComparison.Ordinal);
+        Assert.EndsWith("<|im_start|>user\n", savePoint, StringComparison.Ordinal);
+        Assert.DoesNotContain("Second question", savePoint, StringComparison.Ordinal);
+        Assert.StartsWith("Second question", prompt[savePoint.Length..], StringComparison.Ordinal);
+        // A head render (every message but the last) is NOT a prefix on this template: the assistant turn gains a thinking block
+        // when it is last. That is why the save point is derived from a marked full render instead.
+        string head = template.Apply(messages.Take(3).ToArray(), options with { AddGenerationPrompt = false });
+        Assert.False(prompt.StartsWith(head, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void SavePointPrefix_IsNull_ForASingleMessage_OrWhenTheLastMessageIsNotTheUser()
+    {
+        var template = new JinjaChatTemplate(Fixture("qwen3-4b-instruct-2507-chat-template.jinja"), "<|endoftext|>", "<|im_end|>");
+        var options = ReasoningSupport.BuildTemplateOptions(null, null, null, null, constrained: false);
+        ChatMessage[] single = [new ChatMessage { Role = "user", Content = "Hello" }];
+        ChatMessage[] assistantLast = [.. Messages, new ChatMessage { Role = "assistant", Content = "Partial" }];
+
+        Assert.True(ReasoningSupport.TryApply(template, single, options, out string p1, out _, out _));
+        Assert.Null(ReasoningSupport.SavePointPrefix(template, single, options, p1));
+        Assert.True(ReasoningSupport.TryApply(template, assistantLast, options with { AddGenerationPrompt = false }, out string p2, out _, out _));
+        Assert.Null(ReasoningSupport.SavePointPrefix(template, assistantLast, options, p2));
+    }
+
     [Fact]
     public void Suffix_ForQwen35Template_IsTheAssistantHeaderAndThinkOpener()
     {

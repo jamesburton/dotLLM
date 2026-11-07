@@ -1211,7 +1211,8 @@ Prompt caching is **enabled by default** in both `chat` and `serve` commands.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--no-prompt-cache` | `false` | Disable prompt caching |
-| `--prompt-cache-size` | 1 (chat) / 4 (serve) | Maximum number of cached sessions (LRU eviction) |
+| `--prompt-cache-size` | 1 (chat) / 4 (serve) | Maximum number of cached sessions |
+| `--prompt-cache-policy` | `lru` | `lru` or `agent` (env `DOTLLM_PREFIX_POLICY`): agent-aware retention for every prefix cache: own-length eviction, protected conversations, save-point and end-of-reply recurrent checkpoints ([KV_CACHE.md](KV_CACHE.md#agent-aware-prefix-policy-1654), #1654). `/v1/prompt-cache` reports `policy`, `live.protected_misses`, `recurrent.protectedMisses` |
 | `--prompt-cache-step` | 0 (off) | Hybrid recurrent models: checkpoint the recurrent state every N prefill tokens, so a prompt that diverges mid-history resumes from the nearest one ([KV_CACHE.md](KV_CACHE.md#mid-history-resume-step-checkpoints-1286), #1286) |
 | `--prompt-cache-step-keep` | 8 | Most `--prompt-cache-step` checkpoints kept (deepest first) |
 | `--chunk-cache` | off | Honour `chunk_cache` annotations on `/v1/chat/completions` and `/v1/messages` (chunk-level K/V reuse convention): `exact` (default) and `shadow`, output identical to the unannotated request, plus a `chunk_cache` report and `/metrics` counters (`dotllm_chunk_cache_chunks_total`, `dotllm_chunk_cache_tokens_total`). Off: annotations are ignored like any unknown field ([CHUNK_CACHE.md](CHUNK_CACHE.md)) |

@@ -35,6 +35,27 @@ public sealed class PrefixTrieTests
         return blocks;
     }
 
+    [Theory]
+    [InlineData(PrefixCachePolicy.Lru)]
+    [InlineData(PrefixCachePolicy.Agent)]
+    public void Eviction_Agent_ReclaimsTheShortPathFirst_Lru_TheOlderLeaf(PrefixCachePolicy policy)
+    {
+        // Issue #1654. A 16-token conversation (4 blocks) is inserted, then a 4-token side request (1 block). Both leaves have
+        // zero refs. An unrelated 8-token lookup advances the clock. LRU evicts the conversation's tail (touched first); the
+        // agent policy evicts the side request's block: 8 tokens is 2x its length but half the conversation's.
+        using var pool = CreatePool();
+        var trie = new PrefixTrie(pool, policy: policy);
+        int[] conversation = MakePrompt(1, 16), side = MakePrompt(2, 4);
+        var conversationBlocks = AllocateAndInsert(trie, pool, conversation);
+        var sideBlocks = AllocateAndInsert(trie, pool, side);
+        trie.Lookup(MakePrompt(3, 8), new List<int>());
+
+        int evicted = trie.EvictOneLru();
+
+        Assert.Equal(policy == PrefixCachePolicy.Agent ? sideBlocks[0] : conversationBlocks[^1], evicted);
+        Assert.Equal(8, trie.TokenClock);
+    }
+
     [Fact]
     public void Lookup_EmptyTrie_ReturnsZero()
     {

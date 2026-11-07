@@ -14,14 +14,29 @@ internal sealed class RecurrentPrefixSnapshotCache : IDisposable
     private readonly List<Entry> _entries = [];
     private readonly RecurrentPrefixDiskStore? _disk;
     private string _identity;
-    private long _clock, _hits, _vramHits, _hostHits, _diskHits, _misses, _evictions, _restoreFailures;
-    private sealed class Entry(int[] tokens, IRecurrentPrefixSnapshot snapshot, long use)
+    private long _clock, _tokenClock, _hits, _vramHits, _hostHits, _diskHits, _misses, _evictions, _restoreFailures;
+    private sealed class Entry(int[] tokens, IRecurrentPrefixSnapshot snapshot, long use, long useClock)
     {
         public int[] Tokens = tokens;
         public IRecurrentPrefixSnapshot? Snapshot = snapshot;
         public RecurrentPrefixDiskStore.FileEntry? Disk;
         public long RawBytes => Snapshot?.ByteCount ?? Disk!.RawBytes;
         public long Use = use;
+        /// <summary>The token clock at the entry's last capture or hit (<see cref="PrefixRetention"/>, #1654).</summary>
+        public long LastUseClock = useClock;
+    }
+
+    /// <summary>
+    /// The entry to give up when a tier is over capacity: the LRU, or under <see cref="PrefixCachePolicy.Agent"/> the one
+    /// oldest relative to its own length (#1654). Null when <paramref name="candidates"/> is empty.
+    /// </summary>
+    private Entry? Victim(IEnumerable<Entry> candidates)
+    {
+        var list = candidates as IReadOnlyList<Entry> ?? candidates.ToList();
+        if (list.Count == 0) return null;
+        return list[PrefixRetention.SelectVictim(list,
+            _options.Policy == PrefixCachePolicy.Agent ? e => e.LastUseClock : e => e.Use,
+            e => e.Tokens.Length, _tokenClock, _options.Policy)];
     }
 
     public RecurrentPrefixSnapshotCache(IRecurrentPrefixSnapshotProvider provider, RecurrentPrefixCacheOptions options)
@@ -53,6 +68,7 @@ internal sealed class RecurrentPrefixSnapshotCache : IDisposable
                 DiskTransport = _disk is null ? null : "file-stream",
                 Hits = _hits, VramHits = _vramHits, HostHits = _hostHits, Misses = _misses,
                 Evictions = _evictions, RestoreFailures = _restoreFailures,
+                Policy = _options.Policy.ToString(),
             };
         }
     }
@@ -64,6 +80,7 @@ internal sealed class RecurrentPrefixSnapshotCache : IDisposable
         lock (_gate)
         {
             CheckIdentity(); tier = null; milliseconds = 0;
+            _tokenClock += tokens.Length;   // every prompt looked up advances the own-length clock, hit or miss (#1654)
             var entry = _entries.Where(e => e.Tokens.Length < tokens.Length && tokens.AsSpan(0, e.Tokens.Length).SequenceEqual(e.Tokens))
                 .OrderByDescending(e => e.Tokens.Length).FirstOrDefault();
             if (!PrepareRequest(kv, entry) || entry is null || !_entries.Contains(entry)) { _misses++; return 0; }
@@ -74,7 +91,7 @@ internal sealed class RecurrentPrefixSnapshotCache : IDisposable
                 if (diskHit) LoadDiskEntry(entry, kv);
                 _provider.RestorePrefixSnapshot(entry.Snapshot!, kv);
                 milliseconds = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
-                entry.Use = ++_clock; _hits++;
+                entry.Use = ++_clock; entry.LastUseClock = _tokenClock; _hits++;
                 if (diskHit) { _diskHits++; tier = "disk"; }
                 else if (entry.Snapshot!.Storage == RecurrentPrefixSnapshotStorage.Host) { _hostHits++; tier = "host"; }
                 else { _vramHits++; tier = "vram"; }
@@ -112,8 +129,8 @@ internal sealed class RecurrentPrefixSnapshotCache : IDisposable
                 var superseded = _entries.Where(e => e.Tokens.Length <= length
                     && tokens.AsSpan(0, e.Tokens.Length).SequenceEqual(e.Tokens)).MaxBy(e => e.Tokens.Length);
                 if (superseded is not null) Remove(superseded, eviction: false);
-                // Capacity is global across tiers. Reclaim the true LRU before temporary transport allocations.
-                while (_entries.Count >= _options.MaxEntries) Remove(_entries.MinBy(e => e.Use)!, eviction: true);
+                // Capacity is global across tiers. Reclaim the policy's victim before temporary transport allocations.
+                while (_entries.Count >= _options.MaxEntries) Remove(Victim(_entries)!, eviction: true);
                 if (_provider.SupportsPrefixSnapshotStorage(RecurrentPrefixSnapshotStorage.Device))
                 {
                     snapshot = TryDeviceCapture();
@@ -143,8 +160,8 @@ internal sealed class RecurrentPrefixSnapshotCache : IDisposable
                     throw new InvalidOperationException("Provider returned an incompatible prefix snapshot.");
                 var prefix = tokens.AsSpan(0, length).ToArray();
                 foreach (var duplicate in _entries.Where(e => e.Tokens.AsSpan().SequenceEqual(prefix)).ToArray()) Remove(duplicate, eviction: false);
-                while (_entries.Count >= _options.MaxEntries) Remove(_entries.MinBy(e => e.Use)!, eviction: true);
-                _entries.Add(new Entry(prefix, snapshot, ++_clock)); snapshot = null;
+                while (_entries.Count >= _options.MaxEntries) Remove(Victim(_entries)!, eviction: true);
+                _entries.Add(new Entry(prefix, snapshot, ++_clock, _tokenClock)); snapshot = null;
                 return true;
 
                 IRecurrentPrefixSnapshot? TryDeviceCapture()
@@ -192,7 +209,7 @@ internal sealed class RecurrentPrefixSnapshotCache : IDisposable
         if (bytes > _options.HostBudgetBytes || !_provider.SupportsPrefixSnapshotStorage(RecurrentPrefixSnapshotStorage.Host)) return false;
         while (HostBytes > _options.HostBudgetBytes - bytes)
         {
-            var oldest = _entries.Where(e => !ReferenceEquals(e, except) && e.Snapshot?.Storage == RecurrentPrefixSnapshotStorage.Host).MinBy(e => e.Use);
+            var oldest = Victim(_entries.Where(e => !ReferenceEquals(e, except) && e.Snapshot?.Storage == RecurrentPrefixSnapshotStorage.Host));
             if (oldest is null) return false;
             if (Spill(oldest, protectedDisk ?? except)) continue;
             if (except is not null && oldest.Use > except.Use && except.Disk is null) return false;
@@ -210,7 +227,7 @@ internal sealed class RecurrentPrefixSnapshotCache : IDisposable
             long fileBytes = checked(payloadBytes + RecurrentPrefixDiskStore.HeaderBytes);
             while (_disk.Bytes > _options.DiskBudgetBytes - fileBytes)
             {
-                var oldest = _entries.Where(e => e.Disk is not null && !ReferenceEquals(e, protect)).MinBy(e => e.Use);
+                var oldest = Victim(_entries.Where(e => e.Disk is not null && !ReferenceEquals(e, protect)));
                 if (oldest is null) return false;
                 Remove(oldest, eviction: true);
             }

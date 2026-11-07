@@ -44,6 +44,15 @@ public sealed record PromptCacheStatsResponse
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public DotLLM.Engine.PromptCache.RecurrentPrefixCacheStatistics? Recurrent { get; init; }
 
+    /// <summary>The live-KV prefix cache (attention models without a paged trie: Vulkan, CUDA, <c>--no-paged</c>), when present (#1654).</summary>
+    [JsonPropertyName("live")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public LivePrefixCacheStats? Live { get; init; }
+
+    /// <summary>Retention policy in force for every prefix cache of this server (#1654): <c>lru</c> or <c>agent</c>.</summary>
+    [JsonPropertyName("policy")]
+    public string Policy { get; init; } = "lru";
+
     [JsonPropertyName("enabled")]
     public required bool Enabled { get; init; }
 
@@ -76,4 +85,25 @@ public sealed record PromptCacheStatsResponse
 
     [JsonPropertyName("total_blocks")]
     public required int TotalBlocks { get; init; }
+}
+
+/// <summary>Live-KV prefix cache counters (<see cref="DotLLM.Engine.PromptCache.PrefixCache"/>), for GET /v1/prompt-cache (#1654).</summary>
+public sealed record LivePrefixCacheStats
+{
+    [JsonPropertyName("entries")]
+    public required int Entries { get; init; }
+
+    [JsonPropertyName("hits")]
+    public required long Hits { get; init; }
+
+    [JsonPropertyName("misses")]
+    public required long Misses { get; init; }
+
+    /// <summary>Lookups the agent-aware policy made miss to keep another conversation's unexpired entry.</summary>
+    [JsonPropertyName("protected_misses")]
+    public required long ProtectedMisses { get; init; }
+
+    /// <summary>Prompt tokens looked up so far: the clock the own-length rule is measured on.</summary>
+    [JsonPropertyName("token_clock")]
+    public required long TokenClock { get; init; }
 }

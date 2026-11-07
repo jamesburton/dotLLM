@@ -18,7 +18,7 @@ public static class PromptCacheEndpoint
     public static void Map(WebApplication app)
     {
         app.MapGet("/v1/prompt-cache", (ServerState state) =>
-            Results.Ok(BuildStats(state.PrefixTrieManager, state.Generator?.RecurrentPrefixStatistics)));
+            Results.Ok(BuildStats(state.PrefixTrieManager, state.Generator?.RecurrentPrefixStatistics, state.PrefixCache, state.Options.PromptCachePolicy)));
 
         app.MapGet("/v1/prompt-cache/{id}", (string id, ServerState state) =>
         {
@@ -112,10 +112,16 @@ public static class PromptCacheEndpoint
         });
     }
 
-    internal static PromptCacheStatsResponse BuildStats(PrefixTrieManager? manager, RecurrentPrefixCacheStatistics? recurrent)
+    internal static PromptCacheStatsResponse BuildStats(PrefixTrieManager? manager, RecurrentPrefixCacheStatistics? recurrent,
+        PrefixCache? live = null, PrefixCachePolicy policy = PrefixCachePolicy.Lru)
     {
+        var liveStats = live is null ? null : new LivePrefixCacheStats
+        {
+            Entries = live.EntryCount, Hits = live.Hits, Misses = live.Misses, ProtectedMisses = live.ProtectedMisses, TokenClock = live.TokenClock,
+        };
+        string policyName = policy.ToString().ToLowerInvariant();
         if (manager is null)
-            return EmptyStats() with { Enabled = recurrent?.Enabled == true, Recurrent = recurrent };
+            return EmptyStats() with { Enabled = recurrent?.Enabled == true || live is not null, Recurrent = recurrent, Live = liveStats, Policy = policyName };
         var stats = manager.GetStats();
         return new PromptCacheStatsResponse
         {
@@ -123,7 +129,7 @@ public static class PromptCacheEndpoint
             BlockSize = stats.BlockSize, Nodes = stats.NodeCount, HitTokens = stats.HitTokens,
             MissTokens = stats.MissTokens, Lookups = stats.Lookups, Hits = stats.Hits, Misses = stats.Misses,
             EvictionRefusals = stats.EvictionRefusals, FreeBlocks = stats.FreeBlocks, TotalBlocks = stats.TotalBlocks,
-            Recurrent = recurrent,
+            Recurrent = recurrent, Live = liveStats, Policy = policyName,
         };
     }
 

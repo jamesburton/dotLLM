@@ -686,6 +686,182 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         Assert.Equal(96, timings!.Value.CachedTokenCount);
     }
 
+    // ── agent-aware policy (issue #1654) ──
+
+    private static DotLLM.Engine.PromptCache.RecurrentPrefixCacheOptions WithPolicy(DotLLM.Engine.PromptCache.PrefixCachePolicy policy)
+        => new() { Policy = policy };
+
+    private static InferenceResponse CheckWith(TextGenerator cached, TextGenerator plain, HistoryModel model, int[] prompt, InferenceOptions opts)
+    {
+        string text = string.Join(",", prompt);
+        var want = plain.Generate(text, opts with { GenerationPromptSuffix = null, SavePointPrefix = null });
+        model.Calls.Clear();
+        var got = cached.Generate(text, opts);
+        Assert.Equal(want.GeneratedTokenIds, got.GeneratedTokenIds);
+        Assert.Empty(model.KvLengthMismatches);
+        return got;
+    }
+
+    /// <summary>A 200-token agent conversation and a 50-token side request that shares its first 20 tokens (a system prompt).</summary>
+    private static readonly int[] Conversation = Run(1000, 200);
+    private static readonly int[] SideRequest = [.. Run(1000, 20), .. Run(5000, 30)];
+
+    [Theory]
+    [InlineData(DotLLM.Engine.PromptCache.PrefixCachePolicy.Lru, 20)]
+    [InlineData(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent, 199)]
+    public void Agent_ASideRequest_RunsCold_AndTheConversationsNextTurnStillHits(DotLLM.Engine.PromptCache.PrefixCachePolicy policy, int expectedNextTurnCached)
+    {
+        // Under LRU the side request misses and REPLACES the single slot with a snapshot at the 20 shared tokens, so the
+        // conversation's next turn reuses 20 tokens and re-prefills 180. Under the agent policy the side request runs cold and
+        // the slot keeps the conversation (its own length, 200, of other tokens has not been read), so the next turn reuses 199.
+        var (cached, plain, model) = Build(snapshots: WithPolicy(policy));
+        Check(cached, plain, model, Conversation);
+
+        var side = Check(cached, plain, model, SideRequest);
+        var next = Check(cached, plain, model, [.. Conversation, .. Run(3000, 10)]);
+
+        Assert.Equal(0, side.Timings.CachedTokenCount);
+        Assert.Equal(expectedNextTurnCached, next.Timings.CachedTokenCount);
+        Assert.Equal(policy == DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent ? 1 : 0, cached.RecurrentPrefixStatistics.ProtectedMisses);
+        Assert.Equal(policy.ToString(), cached.RecurrentPrefixStatistics.Policy);
+    }
+
+    [Fact]
+    public void Agent_SideTraffic_TakesTheSlot_OnceTheConversationsOwnLengthHasBeenRead()
+    {
+        // 60-token side requests: after three (180 tokens read since the conversation's last use) it is still protected; the
+        // fourth (240 >= 200) finds it expired and takes the slot, as under LRU.
+        var (cached, plain, model) = Build(snapshots: WithPolicy(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent));
+        Check(cached, plain, model, Conversation);
+        int[] side = [.. Run(1000, 20), .. Run(5000, 40)];
+
+        for (int i = 0; i < 4; i++) Check(cached, plain, model, side);
+        var next = Check(cached, plain, model, [.. Conversation, .. Run(3000, 10)]);
+
+        Assert.Equal(3, cached.RecurrentPrefixStatistics.ProtectedMisses);
+        Assert.Equal(20, next.Timings.CachedTokenCount);   // the side request's snapshot at the shared system prompt
+    }
+
+    [Theory]
+    [InlineData(DotLLM.Engine.PromptCache.PrefixCachePolicy.Lru, 0)]
+    [InlineData(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent, 150)]
+    public void SavePoint_ABranchOfTheSameConversation_ResumesAtTheLastUserMessage(DotLLM.Engine.PromptCache.PrefixCachePolicy policy, int expectedCached)
+    {
+        // The server passes the prompt up to the last user message (H). The agent policy checkpoints there, so a retry, an edited
+        // message or a side request over the same history (H + U' + G) resumes at H instead of re-prefilling it; without the policy
+        // the only checkpoint sits before G and the branch misses.
+        var (cached, plain, model) = Build(snapshots: WithPolicy(policy));
+        int[] h = Run(1000, 150);
+        var opts = HintedOpts with { SavePointPrefix = string.Join(",", h) };
+        CheckWith(cached, plain, model, [.. h, .. Run(2000, 40), .. G], opts);
+
+        var branch = CheckWith(cached, plain, model, [.. h, .. Run(3000, 40), .. G], opts);
+
+        Assert.Equal(expectedCached, branch.Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public void SavePoint_DoesNotMakeAnUnrelatedRequest_TheSameConversation()
+    {
+        // A request sharing less than the save point is another conversation: protected as before.
+        var (cached, plain, model) = Build(snapshots: WithPolicy(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent));
+        int[] h = Run(1000, 150);
+        var opts = HintedOpts with { SavePointPrefix = string.Join(",", h) };
+        CheckWith(cached, plain, model, [.. h, .. Run(2000, 40), .. G], opts);
+
+        var other = CheckWith(cached, plain, model, [.. Run(1000, 100), .. Run(4000, 40), .. G], HintedOpts);
+
+        Assert.Equal(0, other.Timings.CachedTokenCount);
+        Assert.Equal(1, cached.RecurrentPrefixStatistics.ProtectedMisses);
+    }
+
+    [Theory]
+    [InlineData(DotLLM.Engine.PromptCache.PrefixCachePolicy.Lru, 199)]
+    [InlineData(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent, 219)]
+    public void EndOfReply_TheNextTurnResumesAfterTheReply_NotBeforeIt(DotLLM.Engine.PromptCache.PrefixCachePolicy policy, int expectedCached)
+    {
+        // A 20-token reply: 19 of its tokens were forwarded (the last sampled one never is), so the KV holds 219 rows. The next
+        // turn repeats the reply; the agent policy's end-of-reply checkpoint lets it resume at 219 instead of the prompt-end
+        // boundary at 199, saving the reply's prefill.
+        var (cached, plain, model) = Build(snapshots: WithPolicy(policy));
+        var opts = Opts with { MaxTokens = 20 };
+        var turn1 = CheckWith(cached, plain, model, Conversation, opts);
+        Assert.Equal(20, turn1.GeneratedTokenIds.Length);
+
+        var turn2 = CheckWith(cached, plain, model, [.. Conversation, .. turn1.GeneratedTokenIds, .. Run(3000, 10)], opts);
+
+        Assert.Equal(expectedCached, turn2.Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public void EndOfReply_IsNotCheckpointed_ForAShortReply()
+    {
+        var (cached, plain, model) = Build(snapshots: WithPolicy(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent));
+        var turn1 = CheckWith(cached, plain, model, Conversation, Opts);   // 4 tokens: below RecurrentPrefixMinTokens
+
+        Assert.Equal(0, cached.RecurrentPrefixStatistics.StepCheckpoints);
+        var turn2 = CheckWith(cached, plain, model, [.. Conversation, .. turn1.GeneratedTokenIds, .. Run(3000, 10)], Opts);
+        Assert.Equal(199, turn2.Timings.CachedTokenCount);
+    }
+
+    [Theory]
+    [InlineData(DotLLM.Engine.PromptCache.PrefixCachePolicy.Lru, 0)]
+    [InlineData(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent, 99)]
+    public void MultiSlot_Agent_EvictsTheShortStaleEntry_Lru_TheLongConversation(DotLLM.Engine.PromptCache.PrefixCachePolicy policy, int expectedCached)
+    {
+        // Two slots: a 100-token conversation (captured at clock 100), a 25-token request (clock 125), then another 25-token
+        // request (clock 150) that needs a slot. LRU evicts the conversation; the agent policy evicts the 25-token entry, which
+        // is more than its own length old, and the conversation's next turn hits.
+        var (cached, plain, model) = Build(snapshots: new() { MaxEntries = 2, HostBudgetBytes = 100000, Policy = policy });
+        int[] a = Run(1000, 100);
+        Check(cached, plain, model, a);
+        Check(cached, plain, model, Run(2000, 25));
+        Check(cached, plain, model, Run(3000, 25));
+
+        var next = Check(cached, plain, model, [.. a, .. Run(1500, 10)]);
+
+        Assert.Equal(expectedCached, next.Timings.CachedTokenCount);
+        Assert.Equal(policy.ToString(), cached.RecurrentPrefixStatistics.Policy);
+        cached.ClearRecurrentPrefixCache();
+    }
+
+    [Fact]
+    public void FromSavePointPrefix_AcceptsOnlyAnExactTokenPrefix_LeavingATokenToRun()
+    {
+        var tok = new CsvTokenizer();
+        int[] prompt = [2, 3, 4, 5, 6];
+        Assert.Equal(3, RecurrentSnapshotBoundary.FromSavePointPrefix(prompt, tok, "2,3,4", minTokens: 1));
+        Assert.Equal(-1, RecurrentSnapshotBoundary.FromSavePointPrefix(prompt, tok, "2,3,4", minTokens: 4));
+        Assert.Equal(-1, RecurrentSnapshotBoundary.FromSavePointPrefix(prompt, tok, "2,3,4,5,6", minTokens: 1));   // nothing left to run
+        Assert.Equal(-1, RecurrentSnapshotBoundary.FromSavePointPrefix(prompt, tok, "2,9", minTokens: 1));
+        Assert.Equal(-1, RecurrentSnapshotBoundary.FromSavePointPrefix(prompt, tok, null, minTokens: 1));
+    }
+
+    [Fact]
+    public void Telemetry_CountsLookups_ByResultAndTier()
+    {
+        // #1505 / #1654: one lookup per request, tagged miss / protected / hit and by tier.
+        var counts = new System.Collections.Concurrent.ConcurrentDictionary<string, long>();
+        using var listener = new System.Diagnostics.Metrics.MeterListener();
+        listener.InstrumentPublished = (inst, l) => { if (inst.Name == "dotllm.engine.prefix_cache.lookups") l.EnableMeasurementEvents(inst); };
+        listener.SetMeasurementEventCallback<long>((inst, value, tags, _) =>
+        {
+            string? result = null, tier = null;
+            foreach (var t in tags) { if (t.Key == "result") result = t.Value?.ToString(); else if (t.Key == "tier") tier = t.Value?.ToString(); }
+            counts.AddOrUpdate($"{result}/{tier}", value, (_, v) => v + value);
+        });
+        listener.Start();
+        var (cached, plain, model) = Build(snapshots: WithPolicy(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent));
+
+        Check(cached, plain, model, Conversation);                              // miss
+        Check(cached, plain, model, SideRequest);                               // protected
+        Check(cached, plain, model, [.. Conversation, .. Run(3000, 10)]);      // hit, vram
+
+        Assert.True(counts.GetValueOrDefault("miss/none") >= 1, string.Join(" ", counts));
+        Assert.True(counts.GetValueOrDefault("protected/none") >= 1, string.Join(" ", counts));
+        Assert.True(counts.GetValueOrDefault("hit/vram") >= 1, string.Join(" ", counts));
+    }
+
     // ── fakes ──
 
     /// <summary>A KV whose storage another cache's forwards overwrite, like the CUDA hybrid's model-owned handle.</summary>
