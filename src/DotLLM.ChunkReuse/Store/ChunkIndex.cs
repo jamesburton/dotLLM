@@ -346,8 +346,9 @@ public sealed partial class ChunkIndex
     {
         ArgumentException.ThrowIfNullOrEmpty(storeRoot);
         ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
-        string root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(storeRoot));
-        Directory.CreateDirectory(root);
+        string spelled = Path.TrimEndingDirectorySeparator(Path.GetFullPath(storeRoot));
+        StorePaths.CreateStoreDirectory(spelled);
+        string root = StorePaths.CanonicalRoot(spelled); // the real path: a link, junction or short name of the root is the same root
         FileStream stream = OpenLockFile(Path.Combine(root, StoreLockFileName), timeout);
         var handle = new StoreLockHandle(root, stream);
         StoreLockHandle[] live = (s_flowStoreLocks.Value ?? []).Where(h => h.IsHeld).ToArray();
@@ -382,22 +383,33 @@ public sealed partial class ChunkIndex
     private static IDisposable AcquireIndexLockAt(string lockPath, TimeSpan timeout)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
-        string root = Path.GetDirectoryName(lockPath)!;
-        if ((s_flowStoreLocks.Value ?? []).Any(h => h.IsHeld && PathComparer.Equals(h.StoreRoot, root)))
+        string spelled = Path.GetDirectoryName(lockPath)!;
+        if (FlowHoldsStoreLock(spelled))
             throw new InvalidOperationException($"Lock order violation: the index lock '{lockPath}' was requested while this flow holds "
                 + "the store lock of the same store. Take index locks before the store lock (and release the store lock first).");
-        Directory.CreateDirectory(root);
+        StorePaths.CreateStoreDirectory(spelled);
         return new IndexLockHandle(OpenLockFile(lockPath, timeout));
+    }
+
+    /// <summary>Whether the current flow holds the store lock of <paramref name="storeRoot"/> (compared by real path).</summary>
+    internal static bool FlowHoldsStoreLock(string storeRoot)
+    {
+        StoreLockHandle[] held = (s_flowStoreLocks.Value ?? []).Where(h => h.IsHeld).ToArray();
+        if (held.Length == 0) return false;
+        string root = StorePaths.CanonicalRoot(storeRoot);
+        return held.Any(h => PathComparer.Equals(h.StoreRoot, root));
     }
 
     /// <summary>The lock file of an index file: its <c>.json</c> extension replaced by <see cref="IndexLockSuffix"/>.</summary>
     private static string LockPathOf(string indexPath) => Path.ChangeExtension(indexPath, IndexLockSuffix);
 
     /// <summary>
-    /// Opens <paramref name="path"/> exclusively, retrying every 20 ms until <paramref name="timeout"/>, on a sharing violation
-    /// and on access denied (a read-only attribute, an ACL being fixed, or a file pending delete on Windows). The file is created
-    /// if missing and never deleted: an existing lock file is not a held lock, only an open handle is (the OS closes a crashed
-    /// holder's handle). Deleting a lock file would break the lock on POSIX (a new file at the same path is another inode).
+    /// Opens <paramref name="path"/> exclusively, retrying every 20 ms until <paramref name="timeout"/> while another handle holds
+    /// it (a sharing violation). Access denied is NOT "busy": a read-only lock file or an unwritable store is a configuration
+    /// error and surfaces at once as <see cref="UnauthorizedAccessException"/> instead of looking like a lock timeout (lock files
+    /// are never deleted, so there is no pending-delete case to wait out). The file is created if missing, owner-only on POSIX,
+    /// and never deleted: an existing lock file is not a held lock, only an open handle is (the OS closes a crashed holder's
+    /// handle). Deleting a lock file would break the lock on POSIX (a new file at the same path is another inode).
     /// </summary>
     private static FileStream OpenLockFile(string path, TimeSpan timeout)
     {
@@ -406,9 +418,9 @@ public sealed partial class ChunkIndex
         {
             try
             {
-                return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                return StorePaths.OpenExclusive(path);
             }
-            catch (Exception ex) when ((ex is IOException and not FileNotFoundException and not DirectoryNotFoundException) || ex is UnauthorizedAccessException)
+            catch (IOException ex) when (StorePaths.IsSharingViolation(ex))
             {
                 if (sw.Elapsed >= timeout) throw new ChunkStoreLockTimeoutException(path, timeout, ex);
                 Thread.Sleep(20);
@@ -807,7 +819,7 @@ public sealed partial class ChunkIndex
         };
         string full = Path.GetFullPath(path);
         string dir = Path.GetDirectoryName(full)!;
-        Directory.CreateDirectory(dir);
+        StorePaths.CreateStoreDirectory(dir);
         SweepStaleTemps(dir, Path.GetFileName(full));
         string temp = full + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try

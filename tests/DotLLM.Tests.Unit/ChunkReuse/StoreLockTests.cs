@@ -328,18 +328,20 @@ public sealed class StoreLockTests : IDisposable
     }
 
     [Fact]
-    public async Task LockFile_AccessDenied_IsRetriedWithinTheTimeout_ThenBusy()
+    public void LockFile_AccessDenied_FailsAtOnce_AndWorksAgainOnceWritable()
     {
-        // Review N5: an access-denied open (read-only attribute here; an ACL change or a delete-pending file on Windows) is
-        // waited out like a sharing violation, and a timeout is the busy exception, not UnauthorizedAccessException.
+        // Issue #1664 (replaces review N5, which waited access-denied out as "busy"): a read-only lock file is a configuration
+        // error. It must surface at once as UnauthorizedAccessException, not look like a lock timeout; lock files are never
+        // deleted, so there is no pending-delete case to wait for. Once the file is writable again the lock works.
         using (ChunkIndex.AcquireStoreLock(_root, Short)) { } // create the file
         File.SetAttributes(StoreLockFile, FileAttributes.ReadOnly);
         try
         {
-            Assert.Throws<ChunkStoreLockTimeoutException>(() => ChunkIndex.AcquireStoreLock(_root, Short).Dispose());
-            var clear = Task.Run(async () => { await Task.Delay(200); File.SetAttributes(StoreLockFile, FileAttributes.Normal); });
+            var sw = Stopwatch.StartNew();
+            Assert.Throws<UnauthorizedAccessException>(() => ChunkIndex.AcquireStoreLock(_root, TimeSpan.FromSeconds(10)).Dispose());
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"took {sw.Elapsed}");
+            File.SetAttributes(StoreLockFile, FileAttributes.Normal);
             using (ChunkIndex.AcquireStoreLock(_root, TimeSpan.FromSeconds(10))) { }
-            await clear;
         }
         finally
         {

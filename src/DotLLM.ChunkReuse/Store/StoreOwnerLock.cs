@@ -35,7 +35,10 @@ public sealed class StoreOwnerLock : IDisposable
     public bool IsHeld => Volatile.Read(ref _disposed) == 0;
 
     /// <summary>
-    /// Tries once to take ownership of <paramref name="storeRoot"/> (created if missing). Never waits.
+    /// Tries to take ownership of <paramref name="storeRoot"/> (created if missing, owner-only on POSIX). Never waits for a real
+    /// owner: it retries only for a short grace (300 ms) so that a probe cannot make it fail. A writer holds the returned lock for
+    /// its WHOLE write run (the server for its lifetime, the offline CLI for its build): that is what excludes the server, not a
+    /// check followed by writes.
     /// </summary>
     /// <param name="storeRoot">The store directory.</param>
     /// <returns>The held lock, or null when another holder (process, or handle in this process) owns the store.</returns>
@@ -44,23 +47,37 @@ public sealed class StoreOwnerLock : IDisposable
     public static StoreOwnerLock? TryAcquire(string storeRoot)
     {
         ArgumentException.ThrowIfNullOrEmpty(storeRoot);
-        string root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(storeRoot));
-        Directory.CreateDirectory(root);
+        string spelled = Path.TrimEndingDirectorySeparator(Path.GetFullPath(storeRoot));
+        StorePaths.CreateStoreDirectory(spelled);
+        string root = StorePaths.CanonicalRoot(spelled);
         string path = Path.Combine(root, FileName);
-        try
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
         {
-            return new StoreOwnerLock(root, new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
-        }
-        catch (IOException ex) when (IsSharingViolation(ex))
-        {
-            return null;
+            try
+            {
+                return new StoreOwnerLock(root, StorePaths.OpenExclusive(path));
+            }
+            catch (IOException ex) when (IsSharingViolation(ex))
+            {
+                // A probe (IsHeldByAnother) holds the file for an instant; a real owner holds it for its lifetime. A short grace
+                // keeps a probe from making a starting server refuse, and costs a genuine second server a fraction of a second.
+                AfterBusyAttempt?.Invoke();
+                if (sw.Elapsed >= BusyGrace) return null;
+                Thread.Sleep(10);
+            }
         }
     }
+
+    /// <summary>How long <see cref="TryAcquire"/> keeps trying while the file is busy before it reports another owner.</summary>
+    private static readonly TimeSpan BusyGrace = TimeSpan.FromMilliseconds(300);
 
     /// <summary>
     /// Whether another holder owns <paramref name="storeRoot"/> right now (probes by opening the lock file exclusively and
     /// closing it at once). A missing store root or lock file is not owned. A probe failure other than a sharing violation is
-    /// reported as owned (fail closed: a writer must not assume it is alone).
+    /// reported as owned (fail closed: a writer must not assume it is alone). <b>Advisory only</b>: the answer can be stale the
+    /// moment it is returned (check-then-act). A writer must not use it as its guard: take <see cref="TryAcquire"/> and hold it
+    /// for the whole write run; use this for diagnostics (a status line, a clearer error message).
     /// </summary>
     /// <param name="storeRoot">The store directory.</param>
     /// <returns>True when owned by another holder (or undeterminable).</returns>
@@ -83,10 +100,16 @@ public sealed class StoreOwnerLock : IDisposable
         }
     }
 
-    // ERROR_SHARING_VIOLATION (32) / ERROR_LOCK_VIOLATION (33) on Windows; EWOULDBLOCK from the flock emulation elsewhere.
-    private static bool IsSharingViolation(IOException ex) =>
-        ex is not (FileNotFoundException or DirectoryNotFoundException or PathTooLongException)
-        && (!OperatingSystem.IsWindows() || (ex.HResult & 0xFFFF) is 32 or 33);
+    internal static bool IsSharingViolation(IOException ex) => StorePaths.IsSharingViolation(ex);
+
+    /// <summary>Test seam, per async flow: runs after each busy attempt of <see cref="TryAcquire"/>.</summary>
+    internal static Action? AfterBusyAttempt
+    {
+        get => s_afterBusyAttempt.Value;
+        set => s_afterBusyAttempt.Value = value;
+    }
+
+    private static readonly AsyncLocal<Action?> s_afterBusyAttempt = new();
 
     /// <summary>Releases ownership (idempotent).</summary>
     public void Dispose()

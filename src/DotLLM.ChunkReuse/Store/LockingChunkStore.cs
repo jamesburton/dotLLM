@@ -9,7 +9,8 @@ namespace DotLLM.ChunkReuse.Store;
 /// </summary>
 /// <remarks>
 /// Do not use it inside a scope that already holds the store lock in the same flow: the store lock is not re-entrant, so the
-/// write would wait for itself and fail with <see cref="ChunkStoreLockTimeoutException"/>. A lock timeout is not swallowed by
+/// write would wait for itself. It is detected at once and throws <see cref="InvalidOperationException"/> (nothing is written),
+/// instead of waiting out the lock timeout; use the inner store inside such a scope. A lock timeout is not swallowed by
 /// <see cref="StoredContextAssembler"/> (unlike a busy entry): it propagates, so a writer stops after one timeout instead of
 /// waiting it once per chunk.
 /// </remarks>
@@ -27,10 +28,19 @@ public sealed class LockingChunkStore(IChunkStore inner, string storeRoot, TimeS
 
     /// <inheritdoc/>
     /// <exception cref="ChunkStoreLockTimeoutException">The store lock was not obtained within the timeout; nothing was written.</exception>
+    /// <exception cref="InvalidOperationException">The calling flow already holds this store's lock.</exception>
     public void Put(ChunkKey key, ChunkKvEntry entry)
     {
+        ThrowIfFlowHoldsTheLock();
         using IDisposable held = ChunkIndex.AcquireStoreLock(_root, _timeout);
         _inner.Put(key, entry);
+    }
+
+    private void ThrowIfFlowHoldsTheLock()
+    {
+        if (ChunkIndex.FlowHoldsStoreLock(_root))
+            throw new InvalidOperationException($"The store lock of '{_root}' is already held by this flow: the store lock is not re-entrant, "
+                + "so a LockingChunkStore here would wait for itself. Write through the inner store inside the lock scope.");
     }
 
     /// <inheritdoc/>
@@ -44,8 +54,10 @@ public sealed class LockingChunkStore(IChunkStore inner, string storeRoot, TimeS
 
     /// <inheritdoc/>
     /// <exception cref="ChunkStoreLockTimeoutException">The store lock was not obtained within the timeout; nothing was deleted.</exception>
+    /// <exception cref="InvalidOperationException">The calling flow already holds this store's lock.</exception>
     public void Evict(ChunkKey key)
     {
+        ThrowIfFlowHoldsTheLock();
         using IDisposable held = ChunkIndex.AcquireStoreLock(_root, _timeout);
         _inner.Evict(key);
     }

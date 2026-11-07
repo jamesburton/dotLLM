@@ -408,7 +408,7 @@ public sealed class StoreRegistry
             throw new InvalidDataException(v > 0
                 ? $"Store registry '{path}' has format version {v}, newer than this build's {FormatVersion}; it is not overwritten. Use a newer tool."
                 : $"Store registry '{path}' could not be read; it is not overwritten. Check its permissions.");
-        Directory.CreateDirectory(_root);
+        StorePaths.CreateStoreDirectory(_root);
         if (_unreadableBytes is not null)
         {
             string bad = BadCopyPath(path, DateTime.UtcNow, File.Exists);

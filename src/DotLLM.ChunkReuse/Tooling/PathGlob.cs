@@ -102,7 +102,7 @@ public sealed class PathGlob
         return _regex.IsMatch(p);
     }
 
-    /// <summary>True for a rooted path or one that starts with a <c>..</c> segment.</summary>
+    /// <summary>True for a rooted path or one with a <c>..</c> segment anywhere.</summary>
     internal static bool IsOutsideRoot(string slashPath) =>
         slashPath.StartsWith('/') || (slashPath.Length >= 2 && slashPath[1] == ':') || Path.IsPathRooted(slashPath)
         || slashPath.Split('/').Contains("..", StringComparer.Ordinal); // a '..' segment anywhere: a/../../x must not match '**'

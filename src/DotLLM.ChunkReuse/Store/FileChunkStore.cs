@@ -71,7 +71,7 @@ public sealed class FileChunkStore : IChunkStore
             throw new PlatformNotSupportedException("FileChunkStore writes raw little-endian rows; big-endian hosts are not supported.");
         _root = Path.GetFullPath(root);
         if (createRoot)
-            Directory.CreateDirectory(_root);
+            StorePaths.CreateStoreDirectory(_root);
         else if (!Directory.Exists(_root))
             throw new DirectoryNotFoundException($"Chunk store root not found: {_root}");
     }
