@@ -382,18 +382,23 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
             || kvCache is not VulkanNemotronHKvCache)
             return null;
         int kvEnd = VulkanNemotronHKvCache.PositionsEnd(positions);
-        int per = _submitBudget.RowsPerForward(rows, kvEnd, ParamsPerLayer, Config.NumAttentionHeads, Config.HeadDim);
-        if (per >= rows) return null;
-        int slices = (rows + per - 1) / per;
-        int baseLen = rows / slices, extra = rows % slices;
-        if (baseLen <= _allRowLogitsLimit) return null;
+        int kvStart0 = kvEnd - rows;
+        int first = _submitBudget.NextSliceRows(rows, kvStart0, ParamsPerLayer, Config.NumAttentionHeads, Config.HeadDim);
+        if (first >= rows || first <= _allRowLogitsLimit) return null;
 
-        RowSliceForwardsForTest += slices;
+        // Progressive slicing: each slice is sized at its own KV depth with the rates the previous slices refitted, so the shallow
+        // start runs in long slices and only the deep tail is cut short (the uniform sizing of #1649 was ~25 % slower at 28K).
         ITensor? last = null;
         int start = 0;
-        for (int s = 0; s < slices; s++)
+        while (start < rows)
         {
-            int len = baseLen + (s < extra ? 1 : 0);
+            int remaining = rows - start;
+            int len = start == 0 ? first
+                : _submitBudget.NextSliceRows(remaining, kvStart0 + start, ParamsPerLayer, Config.NumAttentionHeads, Config.HeadDim);
+            len = Math.Clamp(len, 1, remaining);
+            // Every slice must stay on the last-row-logits path (a slice short enough for all-row logits would download them all).
+            if (len <= _allRowLogitsLimit) len = Math.Min(remaining, _allRowLogitsLimit + 1);
+            RowSliceForwardsForTest++;
             last?.Dispose();
             last = Run(tokenIds.Slice(start, len), positions.Slice(start, len), deviceId, kvCache);
             start += len;

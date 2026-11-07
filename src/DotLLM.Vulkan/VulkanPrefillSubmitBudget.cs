@@ -180,6 +180,38 @@ internal sealed class VulkanPrefillSubmitBudget
     }
 
     /// <summary>
+    /// Rows of the next slice of a prefill whose remaining <paramref name="remainingRows"/> rows start at KV length
+    /// <paramref name="kvStart"/>: the largest multiple of <see cref="MinRowsPerForward"/> whose one attention layer, costed at the
+    /// slice's own KV end (<c>kvStart + rows</c>), fits the budget; all remaining rows when they do. Unlike <see cref="RowsPerForward"/>
+    /// (one size for every slice, costed at the forward's final depth) this lets the shallow early slices be long and only the deep
+    /// tail short, and a caller that calls it per slice gets the rates as refitted by the slices already run (issue #1572: the uniform
+    /// sizing made a 28K prefill 25 % slower than an unsliced 24K one).
+    /// </summary>
+    /// <param name="remainingRows">Rows not yet run.</param>
+    /// <param name="kvStart">KV length before the slice.</param>
+    /// <param name="paramsPerLayer">Weight elements of one layer.</param>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="headDim">Head dimension.</param>
+    /// <returns>Rows for the next slice (1 .. <paramref name="remainingRows"/>).</returns>
+    public int NextSliceRows(int remainingRows, int kvStart, double paramsPerLayer, int numHeads, int headDim)
+    {
+        if (remainingRows <= MinRowsPerForward || LayerSeconds(remainingRows) <= BudgetSeconds) return remainingRows;
+        int best = MinRowsPerForward;
+        for (int r = 2 * MinRowsPerForward; r < remainingRows; r += MinRowsPerForward)
+        {
+            if (LayerSeconds(r) > BudgetSeconds) break;
+            best = r;
+        }
+        // A short tail would pay the fixed per-forward cost for little work: fold it into this slice when the estimate still fits.
+        int tail = remainingRows - best;
+        if (tail > 0 && tail < MinRowsPerForward && LayerSeconds(remainingRows) <= 1.25 * BudgetSeconds) return remainingRows;
+        return best;
+
+        double LayerSeconds(int r)
+            => EstimateSeconds(DenseGflops(paramsPerLayer, EffectiveRows(r)), AttentionGflops(EffectiveRows(r), kvStart + r, numHeads, headDim));
+    }
+
+    /// <summary>
     /// Feeds back one submission's measured wall time and refits both rates (least squares with forgetting, anchored by the priors).
     /// Non-positive or non-finite input is ignored.
     /// </summary>

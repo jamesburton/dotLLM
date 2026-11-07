@@ -98,6 +98,39 @@ public sealed class VulkanPrefillSubmitBudgetTests
             budget.RowsPerForward(1024, 10_000_000, BonsaiParamsPerLayer, Heads, HeadDim));
     }
 
+    /// <summary>
+    /// #1572: progressive slicing sizes each slice at its own KV depth. From KV 0 a 32K prefill's first slice is far longer than the
+    /// uniform <see cref="VulkanPrefillSubmitBudget.RowsPerForward"/> size (costed at the final depth), every slice fits the budget at
+    /// its own end, slices shrink as the depth grows, and a short tail is folded into the previous slice.
+    /// </summary>
+    [Fact]
+    public void NextSliceRows_IsLongWhenShallow_ShrinksWithDepth_AndFoldsAShortTail()
+    {
+        var budget = Calibrated(StrixDense, StrixAttention);
+        const int rows = 32_768;
+        int uniform = budget.RowsPerForward(rows, rows, BonsaiParamsPerLayer, Heads, HeadDim);
+        int first = budget.NextSliceRows(rows, 0, BonsaiParamsPerLayer, Heads, HeadDim);
+        Assert.True(first > 2 * uniform, $"first slice {first} should be well above the uniform size {uniform}");
+
+        int start = 0, prev = int.MaxValue, slices = 0;
+        while (start < rows)
+        {
+            int len = budget.NextSliceRows(rows - start, start, BonsaiParamsPerLayer, Heads, HeadDim);
+            Assert.InRange(len, 1, rows - start);
+            Assert.True(LayerSeconds(budget, Math.Max(len, VulkanPrefillSubmitBudget.MinEffectiveRows), start + len) <= 1.25 * budget.BudgetSeconds,
+                $"slice at {start} of {len} rows exceeds the budget");
+            if (start + len < rows) Assert.True(len <= prev, "slices must not grow with depth");
+            prev = len; start += len; slices++;
+        }
+        Assert.True(slices < (rows + uniform - 1) / uniform, "progressive slicing must need fewer slices than the uniform size");
+
+        // Tail folding: 64 + 10 rows at a depth where 64 rows fit and 74 still fit 1.25x: one slice, not 64 + 10.
+        var tiny = new VulkanPrefillSubmitBudget(LayerSeconds(budget, 128, 86_000) * 1.0);
+        tiny = Calibrated(StrixDense, StrixAttention, tiny.BudgetSeconds);
+        int folded = tiny.NextSliceRows(VulkanPrefillSubmitBudget.MinRowsPerForward + 10, 86_000, BonsaiParamsPerLayer, Heads, HeadDim);
+        Assert.Equal(VulkanPrefillSubmitBudget.MinRowsPerForward + 10, folded);
+    }
+
     [Fact]
     public void BonsaiAt128k_EverySubmissionFitsTheBudget()
     {
@@ -191,11 +224,11 @@ public sealed class VulkanPrefillSubmitBudgetTests
     }
 
     /// <summary>A budget fitted to exact rates from many varied submissions.</summary>
-    private static VulkanPrefillSubmitBudget Calibrated(double dense, double attention)
+    private static VulkanPrefillSubmitBudget Calibrated(double dense, double attention, double budgetSeconds = VulkanPrefillSubmitBudget.DefaultBudgetSeconds)
     {
         // Work drawn afresh for every observation: with forgetting, only the last ~10 submissions count, and each kind of work
         // must vary within them for its rate to be determined.
-        var budget = new VulkanPrefillSubmitBudget();
+        var budget = new VulkanPrefillSubmitBudget(budgetSeconds);
         var rng = new Random(42);
         for (int i = 0; i < 60; i++)
         {
