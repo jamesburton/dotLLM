@@ -3006,6 +3006,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         => SmallRowGemvEnabled && seqLen >= 2 && MatMulQ8_0MmvqMultiKernel.Accepts(seqLen, 32) && _kernels.MatMulQ8MmvqMulti is not null
            && _kernels.QuantizeQ8_1RowsActivations is not null;
 
+    /// <summary>The device-resident weights (test hook: on-device quant types per projection).</summary>
+    internal VulkanQwen3MoeHybridWeights Weights => _weights;
+
+    /// <summary>#921: projections that ran on the packed legacy-quant arms (Q4_1 / Q5_0 / Q5_1); test / proof hook.</summary>
+    internal long LegacyQuantDispatchCount { get; private set; }
+
+    /// <summary>#921: legacy-quant decode GEMVs that took the dp4a MMVQ (Q8_1 activations) rather than the F32-in GEMV; test / proof hook.</summary>
+    internal long LegacyQuantMmvqDispatchCount { get; private set; }
+
     private void RecordMatmul(
         nint cmdBuf,
         VulkanDevice.Buffer weights, QuantizationType weightQt,
@@ -3058,8 +3067,12 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 // against the shared Q8_1 row, else the F32-in GEMV; prefill on the 128x128x4 coopmat GEMM, else the tiled F32 GEMM.
                 if (_kernels.MatMulQ4_1Gemv is null || _kernels.MatMulQ4_1Gemm is null)
                     throw new InvalidOperationException("Q4_1 weights are device-resident but the Q4_1 kernels were not created.");
+                LegacyQuantDispatchCount++;
                 if (seqLen == 1 && _kernels.MatMulQ4_1Mmvq is not null && (xqReady || TryPrepareQ8Activations(cmdBuf, input, inputDim)))
+                {
+                    LegacyQuantMmvqDispatchCount++;
                     _kernels.MatMulQ4_1Mmvq.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output, m: outputDim, k: inputDim);
+                }
                 else if (seqLen == 1)
                     _kernels.MatMulQ4_1Gemv.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (_kernels.MatMulQ4_1GemmCoopmat is not null)
@@ -3072,6 +3085,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 // prefill where the device has it (the tiled F32 GEMM is 4-33x slower even at p=16, #592), else that tiled GEMM.
                 if (_kernels.MatMulQ5_0Gemv is null || _kernels.MatMulQ5_0Gemm is null)
                     throw new InvalidOperationException("Q5_0 weights are device-resident but the Q5_0 kernels were not created.");
+                LegacyQuantDispatchCount++;
                 if (seqLen == 1)
                     _kernels.MatMulQ5_0Gemv.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (_kernels.MatMulQ5_0GemmCoopmat is not null)
@@ -3084,6 +3098,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 // dp4a MMVQ / int8-coopmat MMQ of #1613 land on the dense host first and can be wired here once both are on dev.
                 if (_kernels.MatMulQ5_1Gemv is null || _kernels.MatMulQ5_1Gemm is null)
                     throw new InvalidOperationException("Q5_1 weights are device-resident but the Q5_1 kernels were not created.");
+                LegacyQuantDispatchCount++;
                 if (seqLen == 1)
                     _kernels.MatMulQ5_1Gemv.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else

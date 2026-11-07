@@ -2848,6 +2848,15 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             && xq.Size >= QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) ? k : null;
     }
 
+    /// <summary>The device-resident weights (test hook: on-device quant types per projection).</summary>
+    internal VulkanQwen3HybridDenseWeights Weights => _weights;
+
+    /// <summary>#921: projections that ran on the packed legacy-quant arms (Q4_1 / Q5_0 / Q5_1); test / proof hook.</summary>
+    internal long LegacyQuantDispatchCount { get; private set; }
+
+    /// <summary>#921: legacy-quant decode GEMVs that took the dp4a MMVQ (Q8_1 activations) rather than the F32-in GEMV; test / proof hook.</summary>
+    internal long LegacyQuantMmvqDispatchCount { get; private set; }
+
     /// <summary>
     /// Dispatches the GEMV (<paramref name="seqLen"/> == 1) or GEMM variant for the
     /// weight's on-device quantization. Same policy table as
@@ -2914,8 +2923,12 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             case QuantizationType.Q4_1:
                 if (_kernels.MatMulQ4_1Gemv is null || _kernels.MatMulQ4_1Gemm is null)
                     throw new InvalidOperationException("Q4_1 weights are device-resident but the Q4_1 kernels were not created.");
+                LegacyQuantDispatchCount++;
                 if (seqLen == 1 && _kernels.MatMulQ4_1Mmvq is { } q41Mmvq && TryQuantizeDecodeRowQ8_1(cmdBuf, input, inputDim))
+                {
+                    LegacyQuantMmvqDispatchCount++;
                     q41Mmvq.Record(cmdBuf, weights, _state.Cm1Xq!, _state.Cm1Xds!, output, m: outputDim, k: inputDim);
+                }
                 else if (seqLen == 1)
                     _kernels.MatMulQ4_1Gemv.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (_kernels.MatMulQ4_1GemmCoopmat is not null)
@@ -2926,6 +2939,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             case QuantizationType.Q5_0:
                 if (_kernels.MatMulQ5_0Gemv is null || _kernels.MatMulQ5_0Gemm is null)
                     throw new InvalidOperationException("Q5_0 weights are device-resident but the Q5_0 kernels were not created.");
+                LegacyQuantDispatchCount++;
                 if (seqLen == 1)
                     _kernels.MatMulQ5_0Gemv.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (_kernels.MatMulQ5_0GemmCoopmat is not null)
@@ -2936,6 +2950,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             case QuantizationType.Q5_1:
                 if (_kernels.MatMulQ5_1Gemv is null || _kernels.MatMulQ5_1Gemm is null)
                     throw new InvalidOperationException("Q5_1 weights are device-resident but the Q5_1 kernels were not created.");
+                LegacyQuantDispatchCount++;
                 if (seqLen == 1)
                     _kernels.MatMulQ5_1Gemv.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else
