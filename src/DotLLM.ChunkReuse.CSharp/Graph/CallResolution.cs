@@ -99,7 +99,8 @@ public static class CallResolution
                 SemanticModel model = p.Compilation.GetSemanticModel(tree);
                 corpusToken.ThrowIfCancellationRequested();
                 using var budget = CancellationTokenSource.CreateLinkedTokenSource(corpusToken);
-                budget.CancelAfter(fileBudget);
+                if (fileBudget == TimeSpan.Zero) budget.Cancel(); // CancelAfter(Zero) fires on a timer, not at once
+                else budget.CancelAfter(fileBudget);
                 var treeSites = new List<CallSite>();
                 try
                 {

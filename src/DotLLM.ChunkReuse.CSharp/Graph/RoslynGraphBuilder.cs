@@ -142,7 +142,8 @@ public sealed class RoslynGraphBuilder
                 // One file's binding may take minutes on a hostile shape: cancel it at the budget (Roslyn honours the token).
                 corpusToken.ThrowIfCancellationRequested();
                 using var budget = CancellationTokenSource.CreateLinkedTokenSource(corpusToken);
-                budget.CancelAfter(FileBudget);
+                if (FileBudget == TimeSpan.Zero) budget.Cancel(); // CancelAfter(Zero) fires on a timer, not at once
+                else budget.CancelAfter(FileBudget);
                 try
                 {
                     CollectFile(files[path].Compilation, tree, index, fileRaw, budget.Token);
