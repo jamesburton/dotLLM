@@ -130,8 +130,19 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     internal bool UsesGqa2(int numHeads, int numKvHeads, int headDim)
         => PreferGqa2 && _gqa2Pipeline is not null && UsesGqa(numHeads, numKvHeads, headDim) && headDim <= Gqa2MaxHeadDim && (headDim & 7) == 0;
 
-    /// <summary>Largest query-head group (numHeads / numKvHeads) the GQA-grouped pass serves.</summary>
+    /// <summary>
+    /// Largest query-head sub-group one grouped workgroup serves (the shaders' <c>MAX_GROUP</c>). A wider group (glm4moe: 96 / 8 = 12,
+    /// issue #1612) is served in <see cref="GqaSubGroups"/> balanced sub-groups, each reading the KV head's rows once: ceil(G / 8)
+    /// reads of every cached byte per decoded token instead of G.
+    /// </summary>
     public const int GqaMaxGroup = 8;
+
+    /// <summary>Workgroups per (KV head, split) in the grouped passes: <c>ceil(group / GqaMaxGroup)</c>.</summary>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="numKvHeads">KV heads (divides <paramref name="numHeads"/>).</param>
+    /// <returns>The sub-group count (at least 1).</returns>
+    public static int GqaSubGroups(int numHeads, int numKvHeads)
+        => numKvHeads <= 0 ? 1 : Math.Max(1, (numHeads / numKvHeads + GqaMaxGroup - 1) / GqaMaxGroup);
 
     /// <summary>Largest head_dim the GQA-grouped pass serves (one thread per column of a 256-thread workgroup).</summary>
     public const int GqaMaxHeadDim = 256;
@@ -381,17 +392,17 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     {
         if (_gqaPipeline is null || !PreferGqa || numKvHeads <= 0 || numHeads % numKvHeads != 0) return false;
         int group = numHeads / numKvHeads;
-        return group >= 2 && group <= GqaMaxGroup && headDim <= GqaMaxHeadDim && (headDim & 1) == 0;   // element pairs
+        return group >= 2 && headDim <= GqaMaxHeadDim && (headDim & 1) == 0;   // element pairs; any group >= 2 (sub-grouped above GqaMaxGroup)
     }
 
     /// <summary>
-    /// Splits per KV head for the GQA-grouped pass: the same occupancy target and per-split floor as
-    /// <see cref="ComputeSplits"/>, counted in KV-head workgroups.
+    /// Splits per (KV head, sub-group) unit for the GQA-grouped pass: the same occupancy target and per-split floor as
+    /// <see cref="ComputeSplits"/>, counted in unit workgroups (<c>numKvHeads * GqaSubGroups</c>).
     /// </summary>
     /// <param name="seqKv">KV positions the splits cover.</param>
-    /// <param name="numKvHeads">KV heads.</param>
+    /// <param name="units">KV heads times <see cref="GqaSubGroups"/> (equal to the KV heads for groups of at most 8).</param>
     /// <returns>The split count (at least 1).</returns>
-    public static int ComputeGqaSplits(int seqKv, int numKvHeads) => ComputeSplits(seqKv, numKvHeads);
+    public static int ComputeGqaSplits(int seqKv, int units) => ComputeSplits(seqKv, units);
 
     /// <summary>
     /// Splits per KV head for the v2 grouped pass: the same occupancy target, but at least <see cref="Gqa2MinKvPerSplit"/> positions per
@@ -399,11 +410,11 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     /// at 8K 63 -> 66, 32K unchanged since the occupancy cap binds there).
     /// </summary>
     /// <param name="seqKv">KV positions the splits cover.</param>
-    /// <param name="numKvHeads">KV heads.</param>
+    /// <param name="units">KV heads times <see cref="GqaSubGroups"/> (equal to the KV heads for groups of at most 8).</param>
     /// <returns>The split count (at least 1).</returns>
-    public static int ComputeGqa2Splits(int seqKv, int numKvHeads)
-        => seqKv <= 0 || numKvHeads <= 0 ? 1
-            : Math.Max(1, Math.Min(Math.Max(1, TargetWorkgroups / numKvHeads), (seqKv + Gqa2MinKvPerSplit - 1) / Gqa2MinKvPerSplit));
+    public static int ComputeGqa2Splits(int seqKv, int units)
+        => seqKv <= 0 || units <= 0 ? 1
+            : Math.Max(1, Math.Min(Math.Max(1, TargetWorkgroups / units), (seqKv + Gqa2MinKvPerSplit - 1) / Gqa2MinKvPerSplit));
 
     /// <summary>Position floor per split of the v2 grouped pass (measured: 64 beat 16, 128 and 256 on Flint / Strix).</summary>
     public const int Gqa2MinKvPerSplit = 64;
@@ -491,8 +502,10 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         if (sinks is not null && sinks.Size < (long)numHeads * sizeof(float)) throw new ArgumentException("Sinks buffer too small.", nameof(sinks));
         bool gqa = UsesGqa(numHeads, numKvHeads, headDim);
         bool gqa2 = gqa && UsesGqa2(numHeads, numKvHeads, headDim);
-        int numSplits = gqa2 ? ComputeGqa2Splits(seqKv - kvStart, numKvHeads)
-            : gqa ? ComputeGqaSplits(seqKv - kvStart, numKvHeads) : ComputeSplits(seqKv - kvStart, numHeads);
+        // Grouped passes run one workgroup per (KV head, sub-group, split); the shaders derive the same sub-grouping from the push constants.
+        int gqaUnits = numKvHeads * GqaSubGroups(numHeads, numKvHeads);
+        int numSplits = gqa2 ? ComputeGqa2Splits(seqKv - kvStart, gqaUnits)
+            : gqa ? ComputeGqaSplits(seqKv - kvStart, gqaUnits) : ComputeSplits(seqKv - kvStart, numHeads);
 
         EnsureScratch(numHeads);
 
@@ -536,7 +549,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
             VulkanApi.vkCmdPushConstants(
                 cmdBuf, splitPipeline.Layout, VkShaderStageFlags.Compute, 0, SplitPushConstantBytes, (nint)pcPtr);
         }
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)((gqa ? numKvHeads : numHeads) * numSplits), 1, 1);
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)((gqa ? gqaUnits : numHeads) * numSplits), 1, 1);
         if (gqa) GqaDispatches++;
 
         // Split writes partOut/partMS → merge reads them. Under the hazard

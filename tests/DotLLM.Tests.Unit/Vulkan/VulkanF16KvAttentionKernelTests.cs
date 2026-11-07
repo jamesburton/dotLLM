@@ -53,7 +53,9 @@ public sealed class VulkanF16KvAttentionKernelTests
     [InlineData(4100, 24, 4, 256, 4099, true)]
     [InlineData(20000, 24, 4, 256, 19999, true)] // 313 positions per split: three 128-row tiles, so the cross-tile rescale runs
     [InlineData(301, 6, 2, 64, 300, true)]
-    [InlineData(333, 32, 4, 128, 332, true)]    // the largest group the grouped pass serves (8)
+    [InlineData(333, 32, 4, 128, 332, true)]    // the largest group one grouped workgroup serves (8)
+    [InlineData(8200, 96, 8, 128, 8199, true)]  // #1612 glm4moe: group 12 = two 6-head sub-groups per KV head
+    [InlineData(1000, 18, 2, 64, 999, true)]    // group 9 = sub-groups of 5 + 4 (ragged second sub-group)
     public void SplitKv_Decode_ReadsF16InPlace(int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset, bool gqa)
     {
         Assert.True(VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads));
