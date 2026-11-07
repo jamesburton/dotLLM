@@ -502,6 +502,65 @@ stays at 1e-6 and gives KL 0.02. On wikitext the per-row KL does not grow with d
 0.07-0.08 from 1K to 8K, median 0.003-0.005 throughout). Gate long context on NLL / perplexity (and median KL), not on mean per-row KL.
 At short context the F4 gate holds (KL mean 1.69e-3, top-1 99.4 % over 507 steps).
 
+### Vulkan: dense Q8_0 prefill GEMM selection (#1150)
+
+Two GEMMs serve a dense Q8_0 projection above the small-row GEMV range (`VulkanTransformerModel.RecordMatmul`): the dp4a MMQ on
+Q8_1-quantised activations (weights exact, activations rounded to int8 per 32) and the F16-operand / F32-accumulate 128x128 blocked
+coopmat tile (`matmul_q8_0_gemm_coopmat_128x128x4`; `d*q` and the activation each rounded to F16, dequantised inside the tile load,
+no expanded copy). #1109 measured the coopmat 1.25 / 1.20 / 1.10x the MMQ at pp512 / 2K / 8K on the 8060S but could not say which
+path was closer to the truth: the two differ by KL 3.2e-4 and the CPU oracle itself runs W8A8.
+
+The F32 reference arm (`VulkanQ8_0PrefillF32ReferenceTests`) dequantises the real layer-0 tensors of Llama-3.2-1B Q8_0 and
+LFM3-1.7B Q8_0 exactly, multiplies real activations (token embeddings of natural text through the layer-0 RMSNorm; the SwiGLU product
+for `ffn_down`) in F64, and measures both kernels against it, with a RED arm: the same coopmat tile with a `float16_t` accumulator
+(`matmul_q8_0_gemm_coopmat_128x128x4_f16acc_control`, built from the template's `GEMM_ACC_T` hook; never selected in production).
+Relative RMS error against the reference, 100 real rows:
+
+| tensor (layer 0) | M | K | dp4a MMQ | coopmat F32-acc | F16-acc control | CPU W8A8 |
+|---|---:|---:|---:|---:|---:|---:|
+| Llama-1B `attn_q` | 2048 | 2048 | 1.67e-3 | **7.8e-5** | 3.93e-3 | 1.67e-3 |
+| Llama-1B `attn_k` | 512 | 2048 | 2.13e-3 | **1.01e-4** | 3.95e-3 | 2.13e-3 |
+| Llama-1B `attn_v` | 512 | 2048 | 9.74e-3 | **2.71e-4** | 4.59e-3 | 9.75e-3 |
+| Llama-1B `attn_output` | 2048 | 2048 | 8.22e-3 | **2.92e-4** | 4.78e-3 | 8.22e-3 |
+| Llama-1B `ffn_gate` / `ffn_up` | 8192 | 2048 | 7.82e-3 / 8.42e-3 | **2.80e-4 / 2.87e-4** | 4.63e-3 / 4.64e-3 | 7.82e-3 / 8.43e-3 |
+| Llama-1B `ffn_down` (SwiGLU input) | 2048 | 8192 | 8.15e-3 | **2.38e-4** | 8.37e-3 | 8.15e-3 |
+| LFM3 `shortconv.in_proj` / `out_proj` | 6144 / 2048 | 2048 | 3.95e-3 / 5.50e-3 | **2.10e-4 / 2.93e-4** | 4.40e-3 / 4.62e-3 | 3.95e-3 / 5.51e-3 |
+| LFM3 `ffn_gate` / `ffn_up` | 7680 | 2048 | 4.09e-3 / 5.29e-3 | **2.19e-4 / 2.74e-4** | 4.46e-3 / 4.66e-3 | 4.10e-3 / 5.29e-3 |
+| LFM3 `ffn_down` | 2048 | 7680 | 4.95e-3 | **1.41e-4** | 6.98e-3 | 4.95e-3 |
+
+The coopmat is 15-36x closer to the reference than the MMQ on every tensor, the W8A8 CPU oracle sits where the MMQ does (same
+activation rounding), and the F16-accumulate control fails the gate on every tensor (above the 2e-3 bound, and at K = 8192 worse than
+the MMQ). At model level on a 512-token wikitext window (`VulkanQ8_0PrefillDefaultTests`, Llama-3.2-1B Q8_0, every row's logits;
+the F32 arm is an F32-decoded copy of the file made with `scripts/make_f32_decoded_gguf.py`, run through the CPU F32 forward):
+
+| pair | median KL | p99 | max | top-1 agreement |
+|---|---:|---:|---:|---:|
+| F32 ref vs **coopmat** | **9.2e-7** | 7.6e-6 | 1.7e-5 | **99.61 %** |
+| F32 ref vs MMQ | 3.85e-4 | 2.6e-3 | 5.1e-3 | 98.63 % |
+| F32 ref vs CPU oracle (W8A8) | 3.74e-4 | 4.2e-3 | 1.05e-2 | 99.41 % |
+| CPU oracle vs coopmat | 3.70e-4 | 4.1e-3 | 1.1e-2 | 99.41 % |
+| CPU oracle vs MMQ | 6.22e-4 | 4.0e-3 | 5.7e-3 | 98.44 % |
+| MMQ vs coopmat | 3.87e-4 | 2.6e-3 | 5.0e-3 | 98.63 % |
+
+So the 3.2e-4 KL gap #1109 saw between the two Vulkan paths is the MMQ's distance from the truth, not the coopmat's: with F32
+activations in the GEMMs the dense Vulkan forward reproduces the F32 model to KL 1e-6. Greedy continuation (32 steps through the KV
+cache after the 512-token prefill) is identical on all three arms (32/32 tokens).
+
+**Default (dense host):** `Auto` resolves to the coopmat GEMM on an AMD device that loaded the wave64 blocked tile
+(`Q8_0CoopmatIsDeviceDefault`), from `DOTLLM_VULKAN_Q8_0_COOPMAT_MIN_TOKENS` rows (default 128, the K-quant threshold; 17..127 rows stay
+on MMQ until measured). Every other device keeps MMQ: Arc has no cooperative matrix and its MMQ is 34x the scalar GEMM; NVIDIA wave32
+loads only the 16x16 legacy coopmat, unmeasured. The shared-quantize groups and the residual-fused MMQ follow the same gate, so a
+coopmat run records zero MMQ dispatches (`Q8_0PrefillCoopmatDispatchCount` / `Q8_0PrefillMmqDispatchCount` are the path proof).
+`DOTLLM_VULKAN_Q8_0_PREFILL=mmq` restores the old default everywhere, `=coopmat` forces the GEMM on any device that has it, and
+`DOTLLM_VULKAN_DISABLE_MMQ=1` still disables every MMQ format at load. The hybrid hosts (Qwen3.5/3.6, LFM2/LFM3, Nemotron-H) already
+ran Q8_0 prefill on this coopmat GEMM; the dense host was the holdout.
+
+Indicative A/B (Llama-3.2-1B Q8_0, 8060S, build-contended box, two interleaved mmq/auto pairs per size, `-r 3` medians; not a
+benchmark): pp512 MMQ 5,580 / 5,422 vs coopmat 6,825 / 7,034 tok/s (**1.22-1.30x**); pp2048 MMQ 5,048 / 5,005 vs coopmat
+5,435 / 5,437 tok/s (**1.08x**); decode unchanged (135-137 vs 135-137 tok/s at 512). Replay:
+`dotllm bench <Llama-3.2-1B-Instruct-Q8_0.gguf> -d vulkan -p 512 -n 16 -r 3 --json` and `-p 2048`, once with
+`DOTLLM_VULKAN_Q8_0_PREFILL=mmq` and once without.
+
 ## Hybrid CPU/GPU Inference
 
 When a model doesn't fully fit in VRAM, hybrid mode runs part of the model on GPU and the rest on CPU. The `--gpu-layers N` option specifies how many transformer layers execute on GPU (bottom layers), with the remainder on CPU (top layers). The embedding lookup runs on GPU, while the final RMSNorm and LM head run on CPU. This matches llama.cpp's `--n-gpu-layers` convention.
