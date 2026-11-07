@@ -69,7 +69,8 @@ unsafe
                 wb = Alloc<ushort>((long)m * k);
                 for (long i = 0; i < (long)m * k; i++) wb[i] = (ushort)(BitConverter.SingleToInt32Bits(wf[i]) >> 16);
                 arms.Add(("BF16 old (dequant-rows)", () => MatMul.GemmDequantRows((byte*)wb, QuantizationType.BF16, b, c, m, k, n, pool)));
-                arms.Add(("BF16 new 256 (AVX2/FMA)", () => { MatMul.Bf16Avx512Enabled = false; MatMul.GemmBf16((nint)wb, b, c, m, k, n, pool); }));
+                arms.Add(("BF16 new 256 tile (AVX2/FMA)", () => { MatMul.Bf16Avx512Enabled = false; MatMul.Bf16FmaScratch = false; MatMul.GemmBf16((nint)wb, b, c, m, k, n, pool); }));
+                arms.Add(("BF16 new 256 scratch (AVX2/FMA)", () => { MatMul.Bf16Avx512Enabled = false; MatMul.Bf16FmaScratch = true; MatMul.GemmBf16((nint)wb, b, c, m, k, n, pool); }));
                 if (CpuFeatures.Avx512F)
                     arms.Add(("BF16 new 512 (AVX-512F opt-in)", () => { MatMul.Bf16Avx512Enabled = true; MatMul.GemmBf16((nint)wb, b, c, m, k, n, pool); }));
             }
@@ -89,7 +90,7 @@ unsafe
                     times[i].Add(sw.Elapsed.TotalSeconds);
                 }
             }
-            MatMul.Q8_0Rows8Enabled = true; MatMul.Bf16Avx512Enabled = false;
+            MatMul.Q8_0Rows8Enabled = true; MatMul.Bf16Avx512Enabled = false; MatMul.Bf16FmaScratch = false;
 
             Console.WriteLine($"\n== {m}x{k} n={n} threads={threads} (GFLOP/s: min-time | median; ms median) ==");
             for (int i = 0; i < arms.Count; i++)

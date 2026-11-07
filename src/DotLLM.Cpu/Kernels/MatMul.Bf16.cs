@@ -156,6 +156,71 @@ public static unsafe partial class MatMul
         y[0] = s0; y[1] = s1; y[2] = s2; y[3] = s3;
     }
 
+    /// <summary>4 rows x 2 tokens widened in registers (no scratch); per output the arithmetic of <see cref="DotBf16Fma"/>.</summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Tile4x2Bf16Fma(ushort* w, float* x0, float* x1, float* c0, float* c1, int k)
+    {
+        ushort* w0 = w, w1 = w + k, w2 = w + 2L * k, w3 = w + 3L * k;
+        Vector256<float> a00 = default, a01 = default, a10 = default, a11 = default;
+        Vector256<float> a20 = default, a21 = default, a30 = default, a31 = default;
+        int i = 0;
+        for (; i + 7 < k; i += 8)
+        {
+            Vector256<float> xa = Avx.LoadVector256(x0 + i);
+            Vector256<float> xb = Avx.LoadVector256(x1 + i);
+            Vector256<float> v = WidenBf16x8Avx2(w0 + i);
+            a00 = Fma.MultiplyAdd(v, xa, a00); a01 = Fma.MultiplyAdd(v, xb, a01);
+            v = WidenBf16x8Avx2(w1 + i);
+            a10 = Fma.MultiplyAdd(v, xa, a10); a11 = Fma.MultiplyAdd(v, xb, a11);
+            v = WidenBf16x8Avx2(w2 + i);
+            a20 = Fma.MultiplyAdd(v, xa, a20); a21 = Fma.MultiplyAdd(v, xb, a21);
+            v = WidenBf16x8Avx2(w3 + i);
+            a30 = Fma.MultiplyAdd(v, xa, a30); a31 = Fma.MultiplyAdd(v, xb, a31);
+        }
+        float s00 = HSum256(a00), s01 = HSum256(a01), s10 = HSum256(a10), s11 = HSum256(a11);
+        float s20 = HSum256(a20), s21 = HSum256(a21), s30 = HSum256(a30), s31 = HSum256(a31);
+        for (; i < k; i++)
+        {
+            float xa = x0[i], xb = x1[i];
+            float f0 = Bf16ToSingle(w0[i]), f1 = Bf16ToSingle(w1[i]), f2 = Bf16ToSingle(w2[i]), f3 = Bf16ToSingle(w3[i]);
+            s00 += f0 * xa; s01 += f0 * xb; s10 += f1 * xa; s11 += f1 * xb;
+            s20 += f2 * xa; s21 += f2 * xb; s30 += f3 * xa; s31 += f3 * xb;
+        }
+        c0[0] = s00; c0[1] = s10; c0[2] = s20; c0[3] = s30;
+        c1[0] = s01; c1[1] = s11; c1[2] = s21; c1[3] = s31;
+    }
+
+    /// <summary>
+    /// A/B switch between the two bit-identical AVX2/FMA GEMM forms: the register tile (default) and the F16-style four-row F32
+    /// scratch (<c>DOTLLM_CPU_BF16_SCRATCH=1</c>). Settable for in-process A/B.
+    /// </summary>
+    public static bool Bf16FmaScratch { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_CPU_BF16_SCRATCH") == "1";
+
+    /// <summary>BF16 GEMM over <paramref name="tileRows"/> rows on the AVX2/FMA tier, widened in registers (no scratch).</summary>
+    [SkipLocalsInit]
+    internal static void GemmBf16RowsFmaTile(ushort* tileW, int tileRows, float* b, float* c, int cStride, int k, int n)
+    {
+        for (int r0 = 0; r0 < tileRows; r0 += 4)
+        {
+            int rr = Math.Min(4, tileRows - r0);
+            ushort* w = tileW + (long)r0 * k;
+            int t = 0;
+            if (rr == 4)
+            {
+                for (; t + 1 < n; t += 2)
+                    Tile4x2Bf16Fma(w, b + (long)t * k, b + (long)(t + 1) * k,
+                        c + (long)t * cStride + r0, c + (long)(t + 1) * cStride + r0, k);
+            }
+            for (; t < n; t++)
+            {
+                float* x = b + (long)t * k;
+                float* o = c + (long)t * cStride + r0;
+                for (int j = 0; j < rr; j++) o[j] = DotBf16Fma(w + (long)j * k, x, k);
+            }
+        }
+    }
+
     /// <summary>
     /// BF16 GEMM over <paramref name="tileRows"/> rows on the AVX2/FMA tier: four rows widened into <paramref name="scratch"/>
     /// (<c>4·k</c> floats) once, then the 4x2 FMA tile of the F16 path over all tokens. Bit-identical to <see cref="DotBf16Fma"/> per output.
@@ -374,7 +439,8 @@ public static unsafe partial class MatMul
         }
         if (Bf16FmaTier)
         {
-            GemmBf16RowsFma(tileW, tileRows, b, c, cStride, k, n, scratch);
+            if (Bf16FmaScratch) GemmBf16RowsFma(tileW, tileRows, b, c, cStride, k, n, scratch);
+            else GemmBf16RowsFmaTile(tileW, tileRows, b, c, cStride, k, n);
             return;
         }
         for (int t = 0; t < n; t++)

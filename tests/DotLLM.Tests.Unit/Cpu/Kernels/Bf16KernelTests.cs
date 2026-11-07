@@ -58,6 +58,34 @@ public sealed unsafe class Bf16KernelTests
         finally { NativeMemory.Free(w); NativeMemory.Free(x); }
     }
 
+    /// <summary>Both AVX2/FMA GEMM forms (register tile and four-row scratch), with odd row and token remainders, against the 8-lane oracle.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Lengths))]
+    public void FmaTier_GemmForms_BitExactWithLaneReference(int k)
+    {
+        Skip.IfNot(DotLLM.Cpu.CpuFeatures.Avx2Fma, "needs AVX2+FMA");
+        var rng = new Random(7118 + k);
+        const int n = 3, m = 7;
+        ushort* w = (ushort*)NativeMemory.Alloc((nuint)(m * k * sizeof(ushort)));
+        float* b = (float*)NativeMemory.Alloc((nuint)(n * k * sizeof(float)));
+        float* c = (float*)NativeMemory.Alloc((nuint)(n * m * sizeof(float)));
+        float* scratch = (float*)NativeMemory.Alloc((nuint)(MatMul.GemmBf16ScratchFloats(k) * sizeof(float)));
+        try
+        {
+            FillBf16(rng, w, (long)m * k, 1f); FillF32(rng, b, (long)n * k, 2f);
+            MatMul.GemmBf16RowsFmaTile(w, m, b, c, m, k, n);
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                    AssertBitEqual(MatMul.DotBf16LaneReferenceScalar(w + r * k, b + t * k, k, 8, fma: true), c[t * m + r], $"tile r={r} t={t} k={k}");
+            new Span<float>(c, n * m).Fill(float.NaN);
+            MatMul.GemmBf16RowsFma(w, m, b, c, m, k, n, scratch);
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                    AssertBitEqual(MatMul.DotBf16LaneReferenceScalar(w + r * k, b + t * k, k, 8, fma: true), c[t * m + r], $"scratch r={r} t={t} k={k}");
+        }
+        finally { NativeMemory.Free(w); NativeMemory.Free(b); NativeMemory.Free(c); NativeMemory.Free(scratch); }
+    }
+
     [SkippableTheory]
     [MemberData(nameof(Lengths))]
     public void Avx512Tier_Dot_Rows4_And_Tile_BitExactWithLaneReference(int k)
