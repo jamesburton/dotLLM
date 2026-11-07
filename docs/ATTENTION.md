@@ -482,8 +482,13 @@ The dense hybrid host (`VulkanQwen3HybridDenseTransformerModel`, Bonsai 2) can s
   cached byte per decoded token. The grouped pass runs one workgroup per (KV head, split). Each K element feeds G dot
   products (one subgroup per position) and each V element feeds G register accumulators (thread per column). Each query
   head keeps its own online softmax, handled by one subgroup. The partial layout per (query head, split) and the merge pass
-  are unchanged. It serves 2 ≤ G ≤ 8 and head_dim ≤ 256. The dense hybrid host opts in
-  (`VulkanQwen3MoeHybridKernels.EnableGqaDecode`); `DOTLLM_VULKAN_SPLITKV_GQA=1` / `0` forces it on or off on any host.
+  are unchanged. It serves any G ≥ 2 and head_dim ≤ 256: one workgroup holds at most `MAX_GROUP` = 8 query heads, and a wider
+  group is served in ceil(G / 8) balanced sub-groups (issue #1612: glm4moe's 12 -> 6 + 6, 9 -> 5 + 4), one workgroup per
+  (KV head, sub-group, split), so the KV rows are read ceil(G / 8) times per decoded token instead of G. The sub-grouping is
+  derived in-shader from the push constants (both the v1 and v2 bodies), and the host counts `numKvHeads * GqaSubGroups` units
+  for the split heuristic and the dispatch. The dense hybrid host opts in (`VulkanQwen3MoeHybridKernels.EnableGqaDecode`), the
+  dense F16 host for glm4moe only (`InitDenseKvF16Kernels`; Llama / Qwen / Mistral / Phi stay on the per-head pass until measured);
+  `DOTLLM_VULKAN_SPLITKV_GQA=1` / `0` forces it on or off on any host.
   `VulkanSplitKvAttentionKernelTests` (ALiBi, soft-cap, sliding window, bidirectional, masked tails) and the F16 tests run
   both passes. `VulkanSplitKvDecodeBench` (`DOTLLM_SPLITKV_DECODE_AB=1`) times all four arms at the Bonsai shape.
 - **Measured** (`VulkanSplitKvDecodeBench`, one layer's decode attention, Bonsai shape 24 / 4 / 256, minimum of 9 interleaved
