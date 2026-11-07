@@ -55,7 +55,14 @@ public sealed unsafe class VulkanQ8_0PrefillDefaultTests(ITestOutputHelper outpu
         using var vk = (IDisposable)vkModel;
         var dense = Assert.IsType<VulkanTransformerModel>(vkModel);
         Assert.True(dense.TrySetAllRowLogitsLimit(Window), "the Vulkan host cannot return every row's logits for the window");
-        output.WriteLine($"device {device.DeviceName} vendor 0x{device.VendorId:X} subgroup {device.SubgroupSize}; Q8_0CoopmatIsDeviceDefault={dense.Q8_0CoopmatIsDeviceDefault}; min tokens {VulkanTransformerModel.Q8_0CoopmatPreferSeqLen}");
+        // The expected default is derived from the DEVICE, not from the model's own gate property: a test that reads the gate it is
+        // checking follows any mutation of it (the first version of this test passed with the gate hard-wired to MMQ).
+        bool expectCoopmat = device.VendorId == 0x1002 && device.HasCooperativeMatrix && device.SubgroupSize == 64
+            && DotLLM.Vulkan.Kernels.Q8_0GemmCoopmatVariant.Blocked128x128x4.IsSupportedOn(device, SpvDir())
+            && Environment.GetEnvironmentVariable(VulkanTransformerModel.Q8_0PrefillEnvVar) is null;
+        output.WriteLine($"device {device.DeviceName} vendor 0x{device.VendorId:X} subgroup {device.SubgroupSize}; expect coopmat default={expectCoopmat}; model says {dense.Q8_0CoopmatIsDeviceDefault}; min tokens {VulkanTransformerModel.Q8_0CoopmatPreferSeqLen}");
+        Assert.Equal(expectCoopmat, dense.Q8_0CoopmatIsDeviceDefault);
+        Assert.True(Window >= VulkanTransformerModel.Q8_0CoopmatPreferSeqLen, "the window must be above the coopmat threshold for Auto to engage");
 
         Run RunVulkan(VulkanTransformerModel.Q8_0PrefillKernel mode)
         {
@@ -80,7 +87,7 @@ public sealed unsafe class VulkanQ8_0PrefillDefaultTests(ITestOutputHelper outpu
         Assert.True(mmqRun.MmqDispatches > 0 && mmqRun.CoopmatDispatches == 0, "forced MMQ arm did not run only MMQ");
         Assert.True(cmRun.CoopmatDispatches > 0 && cmRun.MmqDispatches == 0, "forced coopmat arm did not run only the coopmat GEMM");
         Assert.True(cmRun.CoopmatDispatches >= config.NumLayers * 7, "fewer coopmat dispatches than q, k, v, o, gate, up, down per layer");   // +1 when the Q8_0 lm_head scores every row
-        if (dense.Q8_0CoopmatIsDeviceDefault)
+        if (expectCoopmat)
         {
             Assert.True(autoRun.CoopmatDispatches == cmRun.CoopmatDispatches && autoRun.MmqDispatches == 0,
                 $"Auto on a qualifying device must take the coopmat path for every Q8_0 projection: got {autoRun.CoopmatDispatches}/{autoRun.MmqDispatches}");
@@ -145,6 +152,21 @@ public sealed unsafe class VulkanQ8_0PrefillDefaultTests(ITestOutputHelper outpu
         Assert.True(ab.Median <= 2e-3, $"median KL(mmq||coopmat) {ab.Median:E3} is above the inter-path floor");
         Assert.True(ab.Top1 >= 0.97, $"top-1 agreement mmq vs coopmat {ab.Top1:P2} < 97%");
     }
+
+    /// <summary>The startup override spelling (<see cref="VulkanTransformerModel.Q8_0PrefillEnvVar"/>); anything unrecognised is Auto. CPU-only.</summary>
+    [Theory]
+    [InlineData(null, VulkanTransformerModel.Q8_0PrefillKernel.Auto)]
+    [InlineData("auto", VulkanTransformerModel.Q8_0PrefillKernel.Auto)]
+    [InlineData("", VulkanTransformerModel.Q8_0PrefillKernel.Auto)]
+    [InlineData("nonsense", VulkanTransformerModel.Q8_0PrefillKernel.Auto)]
+    [InlineData("mmq", VulkanTransformerModel.Q8_0PrefillKernel.Mmq)]
+    [InlineData(" MMQ ", VulkanTransformerModel.Q8_0PrefillKernel.Mmq)]
+    [InlineData("0", VulkanTransformerModel.Q8_0PrefillKernel.Mmq)]
+    [InlineData("coopmat", VulkanTransformerModel.Q8_0PrefillKernel.Coopmat)]
+    [InlineData("cm", VulkanTransformerModel.Q8_0PrefillKernel.Coopmat)]
+    [InlineData("1", VulkanTransformerModel.Q8_0PrefillKernel.Coopmat)]
+    public void Q8_0PrefillEnv_Parses(string? value, VulkanTransformerModel.Q8_0PrefillKernel expected)
+        => Assert.Equal(expected, VulkanTransformerModel.ParseQ8_0PrefillEnv(value));
 
     private sealed record KlStats(double Median, double P99, double Max, double Top1);
 
