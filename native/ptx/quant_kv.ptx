@@ -134,7 +134,7 @@ $L__BB0_2:
 
 	add.s64 	%rd24, %rd1, %rd3;
 	mov.f32 	%f30, 0f42FE0000;
-	div.approx.ftz.f32 	%f29, %f55, %f30;
+	div.rn.ftz.f32 	%f29, %f55, %f30;
 	// begin inline asm
 	{  cvt.rn.f16.f32 %rs9, %f29;}
 
@@ -166,50 +166,50 @@ $L__BB0_7:
 	bra.uni 	$L__BB0_8;
 
 $L__BB0_4:
-	rcp.approx.ftz.f32 	%f4, %f29;
+	rcp.rn.ftz.f32 	%f4, %f29;
 	add.s64 	%rd29, %rd24, 4;
 	mov.u32 	%r40, 0;
 
 $L__BB0_5:
 	.pragma "nounroll";
 	ld.local.v4.f32 	{%f31, %f32, %f33, %f34}, [%rd30];
-	mul.ftz.f32 	%f39, %f4, %f31;
+	mul.rn.ftz.f32 	%f39, %f31, %f4;
 	cvt.rni.ftz.s32.f32 	%r14, %f39;
 	min.s32 	%r15, %r14, 127;
 	max.s32 	%r16, %r15, -127;
 	st.global.u8 	[%rd29+-2], %r16;
-	mul.ftz.f32 	%f40, %f4, %f32;
+	mul.rn.ftz.f32 	%f40, %f32, %f4;
 	cvt.rni.ftz.s32.f32 	%r17, %f40;
 	min.s32 	%r18, %r17, 127;
 	max.s32 	%r19, %r18, -127;
 	st.global.u8 	[%rd29+-1], %r19;
-	mul.ftz.f32 	%f41, %f4, %f33;
+	mul.rn.ftz.f32 	%f41, %f33, %f4;
 	cvt.rni.ftz.s32.f32 	%r20, %f41;
 	min.s32 	%r21, %r20, 127;
 	max.s32 	%r22, %r21, -127;
 	st.global.u8 	[%rd29], %r22;
-	mul.ftz.f32 	%f42, %f4, %f34;
+	mul.rn.ftz.f32 	%f42, %f34, %f4;
 	cvt.rni.ftz.s32.f32 	%r23, %f42;
 	min.s32 	%r24, %r23, 127;
 	max.s32 	%r25, %r24, -127;
 	st.global.u8 	[%rd29+1], %r25;
 	ld.local.v4.f32 	{%f43, %f44, %f45, %f46}, [%rd30+16];
-	mul.ftz.f32 	%f51, %f4, %f43;
+	mul.rn.ftz.f32 	%f51, %f43, %f4;
 	cvt.rni.ftz.s32.f32 	%r26, %f51;
 	min.s32 	%r27, %r26, 127;
 	max.s32 	%r28, %r27, -127;
 	st.global.u8 	[%rd29+2], %r28;
-	mul.ftz.f32 	%f52, %f4, %f44;
+	mul.rn.ftz.f32 	%f52, %f44, %f4;
 	cvt.rni.ftz.s32.f32 	%r29, %f52;
 	min.s32 	%r30, %r29, 127;
 	max.s32 	%r31, %r30, -127;
 	st.global.u8 	[%rd29+3], %r31;
-	mul.ftz.f32 	%f53, %f4, %f45;
+	mul.rn.ftz.f32 	%f53, %f45, %f4;
 	cvt.rni.ftz.s32.f32 	%r32, %f53;
 	min.s32 	%r33, %r32, 127;
 	max.s32 	%r34, %r33, -127;
 	st.global.u8 	[%rd29+4], %r34;
-	mul.ftz.f32 	%f54, %f4, %f46;
+	mul.rn.ftz.f32 	%f54, %f46, %f4;
 	cvt.rni.ftz.s32.f32 	%r35, %f54;
 	min.s32 	%r36, %r35, 127;
 	max.s32 	%r37, %r36, -127;
@@ -348,7 +348,7 @@ $L__BB1_2:
 
 	add.s64 	%rd24, %rd1, %rd3;
 	mov.f32 	%f30, 0f40E00000;
-	div.approx.ftz.f32 	%f29, %f79, %f30;
+	div.rn.ftz.f32 	%f29, %f79, %f30;
 	// begin inline asm
 	{  cvt.rn.f16.f32 %rs9, %f29;}
 
@@ -380,19 +380,19 @@ $L__BB1_7:
 	bra.uni 	$L__BB1_8;
 
 $L__BB1_4:
-	rcp.approx.ftz.f32 	%f4, %f29;
+	rcp.rn.ftz.f32 	%f4, %f29;
 	add.s64 	%rd30, %rd24, 4;
 	mov.u32 	%r96, 0;
 
 $L__BB1_5:
 	.pragma "nounroll";
 	ld.local.v4.f32 	{%f31, %f32, %f33, %f34}, [%rd29];
-	mul.ftz.f32 	%f39, %f4, %f31;
+	mul.rn.ftz.f32 	%f39, %f31, %f4;
 	cvt.rni.ftz.s32.f32 	%r14, %f39;
 	add.s32 	%r15, %r14, 8;
 	min.s32 	%r16, %r15, 15;
 	max.s32 	%r17, %r16, 0;
-	mul.ftz.f32 	%f40, %f4, %f32;
+	mul.rn.ftz.f32 	%f40, %f32, %f4;
 	cvt.rni.ftz.s32.f32 	%r18, %f40;
 	add.s32 	%r19, %r18, 8;
 	min.s32 	%r20, %r19, 15;
@@ -400,12 +400,12 @@ $L__BB1_5:
 	shl.b32 	%r22, %r21, 4;
 	or.b32  	%r23, %r22, %r17;
 	st.global.u8 	[%rd30+-2], %r23;
-	mul.ftz.f32 	%f41, %f4, %f33;
+	mul.rn.ftz.f32 	%f41, %f33, %f4;
 	cvt.rni.ftz.s32.f32 	%r24, %f41;
 	add.s32 	%r25, %r24, 8;
 	min.s32 	%r26, %r25, 15;
 	max.s32 	%r27, %r26, 0;
-	mul.ftz.f32 	%f42, %f4, %f34;
+	mul.rn.ftz.f32 	%f42, %f34, %f4;
 	cvt.rni.ftz.s32.f32 	%r28, %f42;
 	add.s32 	%r29, %r28, 8;
 	min.s32 	%r30, %r29, 15;
@@ -414,12 +414,12 @@ $L__BB1_5:
 	or.b32  	%r33, %r32, %r27;
 	st.global.u8 	[%rd30+-1], %r33;
 	ld.local.v4.f32 	{%f43, %f44, %f45, %f46}, [%rd29+16];
-	mul.ftz.f32 	%f51, %f4, %f43;
+	mul.rn.ftz.f32 	%f51, %f43, %f4;
 	cvt.rni.ftz.s32.f32 	%r34, %f51;
 	add.s32 	%r35, %r34, 8;
 	min.s32 	%r36, %r35, 15;
 	max.s32 	%r37, %r36, 0;
-	mul.ftz.f32 	%f52, %f4, %f44;
+	mul.rn.ftz.f32 	%f52, %f44, %f4;
 	cvt.rni.ftz.s32.f32 	%r38, %f52;
 	add.s32 	%r39, %r38, 8;
 	min.s32 	%r40, %r39, 15;
@@ -427,12 +427,12 @@ $L__BB1_5:
 	shl.b32 	%r42, %r41, 4;
 	or.b32  	%r43, %r42, %r37;
 	st.global.u8 	[%rd30], %r43;
-	mul.ftz.f32 	%f53, %f4, %f45;
+	mul.rn.ftz.f32 	%f53, %f45, %f4;
 	cvt.rni.ftz.s32.f32 	%r44, %f53;
 	add.s32 	%r45, %r44, 8;
 	min.s32 	%r46, %r45, 15;
 	max.s32 	%r47, %r46, 0;
-	mul.ftz.f32 	%f54, %f4, %f46;
+	mul.rn.ftz.f32 	%f54, %f46, %f4;
 	cvt.rni.ftz.s32.f32 	%r48, %f54;
 	add.s32 	%r49, %r48, 8;
 	min.s32 	%r50, %r49, 15;
@@ -441,12 +441,12 @@ $L__BB1_5:
 	or.b32  	%r53, %r52, %r47;
 	st.global.u8 	[%rd30+1], %r53;
 	ld.local.v4.f32 	{%f55, %f56, %f57, %f58}, [%rd29+32];
-	mul.ftz.f32 	%f63, %f4, %f55;
+	mul.rn.ftz.f32 	%f63, %f55, %f4;
 	cvt.rni.ftz.s32.f32 	%r54, %f63;
 	add.s32 	%r55, %r54, 8;
 	min.s32 	%r56, %r55, 15;
 	max.s32 	%r57, %r56, 0;
-	mul.ftz.f32 	%f64, %f4, %f56;
+	mul.rn.ftz.f32 	%f64, %f56, %f4;
 	cvt.rni.ftz.s32.f32 	%r58, %f64;
 	add.s32 	%r59, %r58, 8;
 	min.s32 	%r60, %r59, 15;
@@ -454,12 +454,12 @@ $L__BB1_5:
 	shl.b32 	%r62, %r61, 4;
 	or.b32  	%r63, %r62, %r57;
 	st.global.u8 	[%rd30+2], %r63;
-	mul.ftz.f32 	%f65, %f4, %f57;
+	mul.rn.ftz.f32 	%f65, %f57, %f4;
 	cvt.rni.ftz.s32.f32 	%r64, %f65;
 	add.s32 	%r65, %r64, 8;
 	min.s32 	%r66, %r65, 15;
 	max.s32 	%r67, %r66, 0;
-	mul.ftz.f32 	%f66, %f4, %f58;
+	mul.rn.ftz.f32 	%f66, %f58, %f4;
 	cvt.rni.ftz.s32.f32 	%r68, %f66;
 	add.s32 	%r69, %r68, 8;
 	min.s32 	%r70, %r69, 15;
@@ -468,12 +468,12 @@ $L__BB1_5:
 	or.b32  	%r73, %r72, %r67;
 	st.global.u8 	[%rd30+3], %r73;
 	ld.local.v4.f32 	{%f67, %f68, %f69, %f70}, [%rd29+48];
-	mul.ftz.f32 	%f75, %f4, %f67;
+	mul.rn.ftz.f32 	%f75, %f67, %f4;
 	cvt.rni.ftz.s32.f32 	%r74, %f75;
 	add.s32 	%r75, %r74, 8;
 	min.s32 	%r76, %r75, 15;
 	max.s32 	%r77, %r76, 0;
-	mul.ftz.f32 	%f76, %f4, %f68;
+	mul.rn.ftz.f32 	%f76, %f68, %f4;
 	cvt.rni.ftz.s32.f32 	%r78, %f76;
 	add.s32 	%r79, %r78, 8;
 	min.s32 	%r80, %r79, 15;
@@ -481,12 +481,12 @@ $L__BB1_5:
 	shl.b32 	%r82, %r81, 4;
 	or.b32  	%r83, %r82, %r77;
 	st.global.u8 	[%rd30+4], %r83;
-	mul.ftz.f32 	%f77, %f4, %f69;
+	mul.rn.ftz.f32 	%f77, %f69, %f4;
 	cvt.rni.ftz.s32.f32 	%r84, %f77;
 	add.s32 	%r85, %r84, 8;
 	min.s32 	%r86, %r85, 15;
 	max.s32 	%r87, %r86, 0;
-	mul.ftz.f32 	%f78, %f4, %f70;
+	mul.rn.ftz.f32 	%f78, %f70, %f4;
 	cvt.rni.ftz.s32.f32 	%r88, %f78;
 	add.s32 	%r89, %r88, 8;
 	min.s32 	%r90, %r89, 15;
@@ -647,7 +647,7 @@ $L__BB2_3:
 
 	add.s64 	%rd31, %rd1, %rd5;
 	mov.f32 	%f30, 0f42FE0000;
-	div.approx.ftz.f32 	%f29, %f55, %f30;
+	div.rn.ftz.f32 	%f29, %f55, %f30;
 	// begin inline asm
 	{  cvt.rn.f16.f32 %rs9, %f29;}
 
@@ -683,7 +683,7 @@ $L__BB2_8:
 	bra.uni 	$L__BB2_9;
 
 $L__BB2_5:
-	rcp.approx.ftz.f32 	%f4, %f29;
+	rcp.rn.ftz.f32 	%f4, %f29;
 	mul.lo.s64 	%rd32, %rd3, 34;
 	mul.lo.s64 	%rd33, %rd4, 34;
 	add.s64 	%rd34, %rd33, %rd32;
@@ -694,43 +694,43 @@ $L__BB2_5:
 $L__BB2_6:
 	.pragma "nounroll";
 	ld.local.v4.f32 	{%f31, %f32, %f33, %f34}, [%rd43];
-	mul.ftz.f32 	%f39, %f4, %f31;
+	mul.rn.ftz.f32 	%f39, %f31, %f4;
 	cvt.rni.ftz.s32.f32 	%r22, %f39;
 	min.s32 	%r23, %r22, 127;
 	max.s32 	%r24, %r23, -127;
 	st.global.u8 	[%rd42+-2], %r24;
-	mul.ftz.f32 	%f40, %f4, %f32;
+	mul.rn.ftz.f32 	%f40, %f32, %f4;
 	cvt.rni.ftz.s32.f32 	%r25, %f40;
 	min.s32 	%r26, %r25, 127;
 	max.s32 	%r27, %r26, -127;
 	st.global.u8 	[%rd42+-1], %r27;
-	mul.ftz.f32 	%f41, %f4, %f33;
+	mul.rn.ftz.f32 	%f41, %f33, %f4;
 	cvt.rni.ftz.s32.f32 	%r28, %f41;
 	min.s32 	%r29, %r28, 127;
 	max.s32 	%r30, %r29, -127;
 	st.global.u8 	[%rd42], %r30;
-	mul.ftz.f32 	%f42, %f4, %f34;
+	mul.rn.ftz.f32 	%f42, %f34, %f4;
 	cvt.rni.ftz.s32.f32 	%r31, %f42;
 	min.s32 	%r32, %r31, 127;
 	max.s32 	%r33, %r32, -127;
 	st.global.u8 	[%rd42+1], %r33;
 	ld.local.v4.f32 	{%f43, %f44, %f45, %f46}, [%rd43+16];
-	mul.ftz.f32 	%f51, %f4, %f43;
+	mul.rn.ftz.f32 	%f51, %f43, %f4;
 	cvt.rni.ftz.s32.f32 	%r34, %f51;
 	min.s32 	%r35, %r34, 127;
 	max.s32 	%r36, %r35, -127;
 	st.global.u8 	[%rd42+2], %r36;
-	mul.ftz.f32 	%f52, %f4, %f44;
+	mul.rn.ftz.f32 	%f52, %f44, %f4;
 	cvt.rni.ftz.s32.f32 	%r37, %f52;
 	min.s32 	%r38, %r37, 127;
 	max.s32 	%r39, %r38, -127;
 	st.global.u8 	[%rd42+3], %r39;
-	mul.ftz.f32 	%f53, %f4, %f45;
+	mul.rn.ftz.f32 	%f53, %f45, %f4;
 	cvt.rni.ftz.s32.f32 	%r40, %f53;
 	min.s32 	%r41, %r40, 127;
 	max.s32 	%r42, %r41, -127;
 	st.global.u8 	[%rd42+4], %r42;
-	mul.ftz.f32 	%f54, %f4, %f46;
+	mul.rn.ftz.f32 	%f54, %f46, %f4;
 	cvt.rni.ftz.s32.f32 	%r43, %f54;
 	min.s32 	%r44, %r43, 127;
 	max.s32 	%r45, %r44, -127;
@@ -888,7 +888,7 @@ $L__BB3_3:
 
 	add.s64 	%rd31, %rd1, %rd5;
 	mov.f32 	%f30, 0f40E00000;
-	div.approx.ftz.f32 	%f29, %f79, %f30;
+	div.rn.ftz.f32 	%f29, %f79, %f30;
 	// begin inline asm
 	{  cvt.rn.f16.f32 %rs9, %f29;}
 
@@ -924,7 +924,7 @@ $L__BB3_8:
 	bra.uni 	$L__BB3_9;
 
 $L__BB3_5:
-	rcp.approx.ftz.f32 	%f4, %f29;
+	rcp.rn.ftz.f32 	%f4, %f29;
 	mul.lo.s64 	%rd32, %rd3, 18;
 	mul.lo.s64 	%rd33, %rd4, 18;
 	add.s64 	%rd34, %rd33, %rd32;
@@ -935,12 +935,12 @@ $L__BB3_5:
 $L__BB3_6:
 	.pragma "nounroll";
 	ld.local.v4.f32 	{%f31, %f32, %f33, %f34}, [%rd42];
-	mul.ftz.f32 	%f39, %f4, %f31;
+	mul.rn.ftz.f32 	%f39, %f31, %f4;
 	cvt.rni.ftz.s32.f32 	%r22, %f39;
 	add.s32 	%r23, %r22, 8;
 	min.s32 	%r24, %r23, 15;
 	max.s32 	%r25, %r24, 0;
-	mul.ftz.f32 	%f40, %f4, %f32;
+	mul.rn.ftz.f32 	%f40, %f32, %f4;
 	cvt.rni.ftz.s32.f32 	%r26, %f40;
 	add.s32 	%r27, %r26, 8;
 	min.s32 	%r28, %r27, 15;
@@ -948,12 +948,12 @@ $L__BB3_6:
 	shl.b32 	%r30, %r29, 4;
 	or.b32  	%r31, %r30, %r25;
 	st.global.u8 	[%rd43+-2], %r31;
-	mul.ftz.f32 	%f41, %f4, %f33;
+	mul.rn.ftz.f32 	%f41, %f33, %f4;
 	cvt.rni.ftz.s32.f32 	%r32, %f41;
 	add.s32 	%r33, %r32, 8;
 	min.s32 	%r34, %r33, 15;
 	max.s32 	%r35, %r34, 0;
-	mul.ftz.f32 	%f42, %f4, %f34;
+	mul.rn.ftz.f32 	%f42, %f34, %f4;
 	cvt.rni.ftz.s32.f32 	%r36, %f42;
 	add.s32 	%r37, %r36, 8;
 	min.s32 	%r38, %r37, 15;
@@ -962,12 +962,12 @@ $L__BB3_6:
 	or.b32  	%r41, %r40, %r35;
 	st.global.u8 	[%rd43+-1], %r41;
 	ld.local.v4.f32 	{%f43, %f44, %f45, %f46}, [%rd42+16];
-	mul.ftz.f32 	%f51, %f4, %f43;
+	mul.rn.ftz.f32 	%f51, %f43, %f4;
 	cvt.rni.ftz.s32.f32 	%r42, %f51;
 	add.s32 	%r43, %r42, 8;
 	min.s32 	%r44, %r43, 15;
 	max.s32 	%r45, %r44, 0;
-	mul.ftz.f32 	%f52, %f4, %f44;
+	mul.rn.ftz.f32 	%f52, %f44, %f4;
 	cvt.rni.ftz.s32.f32 	%r46, %f52;
 	add.s32 	%r47, %r46, 8;
 	min.s32 	%r48, %r47, 15;
@@ -975,12 +975,12 @@ $L__BB3_6:
 	shl.b32 	%r50, %r49, 4;
 	or.b32  	%r51, %r50, %r45;
 	st.global.u8 	[%rd43], %r51;
-	mul.ftz.f32 	%f53, %f4, %f45;
+	mul.rn.ftz.f32 	%f53, %f45, %f4;
 	cvt.rni.ftz.s32.f32 	%r52, %f53;
 	add.s32 	%r53, %r52, 8;
 	min.s32 	%r54, %r53, 15;
 	max.s32 	%r55, %r54, 0;
-	mul.ftz.f32 	%f54, %f4, %f46;
+	mul.rn.ftz.f32 	%f54, %f46, %f4;
 	cvt.rni.ftz.s32.f32 	%r56, %f54;
 	add.s32 	%r57, %r56, 8;
 	min.s32 	%r58, %r57, 15;
@@ -989,12 +989,12 @@ $L__BB3_6:
 	or.b32  	%r61, %r60, %r55;
 	st.global.u8 	[%rd43+1], %r61;
 	ld.local.v4.f32 	{%f55, %f56, %f57, %f58}, [%rd42+32];
-	mul.ftz.f32 	%f63, %f4, %f55;
+	mul.rn.ftz.f32 	%f63, %f55, %f4;
 	cvt.rni.ftz.s32.f32 	%r62, %f63;
 	add.s32 	%r63, %r62, 8;
 	min.s32 	%r64, %r63, 15;
 	max.s32 	%r65, %r64, 0;
-	mul.ftz.f32 	%f64, %f4, %f56;
+	mul.rn.ftz.f32 	%f64, %f56, %f4;
 	cvt.rni.ftz.s32.f32 	%r66, %f64;
 	add.s32 	%r67, %r66, 8;
 	min.s32 	%r68, %r67, 15;
@@ -1002,12 +1002,12 @@ $L__BB3_6:
 	shl.b32 	%r70, %r69, 4;
 	or.b32  	%r71, %r70, %r65;
 	st.global.u8 	[%rd43+2], %r71;
-	mul.ftz.f32 	%f65, %f4, %f57;
+	mul.rn.ftz.f32 	%f65, %f57, %f4;
 	cvt.rni.ftz.s32.f32 	%r72, %f65;
 	add.s32 	%r73, %r72, 8;
 	min.s32 	%r74, %r73, 15;
 	max.s32 	%r75, %r74, 0;
-	mul.ftz.f32 	%f66, %f4, %f58;
+	mul.rn.ftz.f32 	%f66, %f58, %f4;
 	cvt.rni.ftz.s32.f32 	%r76, %f66;
 	add.s32 	%r77, %r76, 8;
 	min.s32 	%r78, %r77, 15;
@@ -1016,12 +1016,12 @@ $L__BB3_6:
 	or.b32  	%r81, %r80, %r75;
 	st.global.u8 	[%rd43+3], %r81;
 	ld.local.v4.f32 	{%f67, %f68, %f69, %f70}, [%rd42+48];
-	mul.ftz.f32 	%f75, %f4, %f67;
+	mul.rn.ftz.f32 	%f75, %f67, %f4;
 	cvt.rni.ftz.s32.f32 	%r82, %f75;
 	add.s32 	%r83, %r82, 8;
 	min.s32 	%r84, %r83, 15;
 	max.s32 	%r85, %r84, 0;
-	mul.ftz.f32 	%f76, %f4, %f68;
+	mul.rn.ftz.f32 	%f76, %f68, %f4;
 	cvt.rni.ftz.s32.f32 	%r86, %f76;
 	add.s32 	%r87, %r86, 8;
 	min.s32 	%r88, %r87, 15;
@@ -1029,12 +1029,12 @@ $L__BB3_6:
 	shl.b32 	%r90, %r89, 4;
 	or.b32  	%r91, %r90, %r85;
 	st.global.u8 	[%rd43+4], %r91;
-	mul.ftz.f32 	%f77, %f4, %f69;
+	mul.rn.ftz.f32 	%f77, %f69, %f4;
 	cvt.rni.ftz.s32.f32 	%r92, %f77;
 	add.s32 	%r93, %r92, 8;
 	min.s32 	%r94, %r93, 15;
 	max.s32 	%r95, %r94, 0;
-	mul.ftz.f32 	%f78, %f4, %f70;
+	mul.rn.ftz.f32 	%f78, %f70, %f4;
 	cvt.rni.ftz.s32.f32 	%r96, %f78;
 	add.s32 	%r97, %r96, 8;
 	min.s32 	%r98, %r97, 15;

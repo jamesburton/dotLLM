@@ -238,8 +238,9 @@ public sealed unsafe class CudaKQuantRows4Tests
         {
             float a = 0f;
             for (int j = 0; j < 32; j++) a = MathF.Max(a, MathF.Abs((float)x[c * 32 + j]));
-            float inv = a > 0f ? 127.0f / a : 0f;
-            float dx = (float)(Half)(a / 127.0f);
+            float dxf = a / 127.0f;                       // #1499 contract: d = a/127, inv = 1/d (both IEEE)
+            float inv = a > 0f ? 1.0f / dxf : 0f;
+            float dx = (float)(Half)dxf;
             for (int j = 0; j < 32; j++)
             {
                 int q = Math.Clamp((int)MathF.Round((float)x[c * 32 + j] * inv, MidpointRounding.ToEven), -127, 127);

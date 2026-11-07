@@ -20,8 +20,12 @@
 // Launch: blockDim = (32, 8, 1) = 256 threads. Each warp owns one chunk; one
 // warp-stride pass covers num_chunks chunks. gridDim = ceil(num_chunks / 8).
 //
-// Numerics: bit-near-identical to the legacy in-kernel Stage 1 — same rounding
-// (__float2int_rn), clamp to [-127, 127], inv_scale = 127 / max|x|, dx = max|x| / 127.
+// Numerics (#1499): the CPU/Vulkan Q8_1 rounding contract of #1340 - d = max|x| / 127 (IEEE,
+// __fdiv_rn), id = 1 / d (IEEE, __frcp_rn), q = round-half-even(x * id) (__float2int_rn of an
+// unfused __fmul_rn product), clamp to [-127, 127], dx = half(d). The in-kernel Stage 1 copies in
+// quantized_gemv_mmq.cu carry the identical lines. The old form multiplied by inv_scale = 127 / max|x|
+// while storing dx = max|x| / 127 - two independently rounded quantities - so a lane within an ULP
+// of a k + 0.5 boundary could land on the other side of the tie vs the CPU reference.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -55,8 +59,9 @@ extern "C" __global__ void __launch_bounds__(QX_THREADS) quantize_x_to_q8_1(
         a = fmaxf(a, other);
     }
 
-    float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-    int qi = __float2int_rn(v * inv_scale);
+    float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+    float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+    int qi = __float2int_rn(__fmul_rn(v, inv_scale));
     qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
     xq[idx] = (int8_t)qi;
 
@@ -69,7 +74,7 @@ extern "C" __global__ void __launch_bounds__(QX_THREADS) quantize_x_to_q8_1(
 
     if (lane == 0)
     {
-        dx[chunk] = __float2half(a / 127.0f);
+        dx[chunk] = __float2half(d_x);
         sx2[chunk * 2 + 0] = __float2half((float)s);
     }
     if (lane == 16)
@@ -117,8 +122,9 @@ extern "C" __global__ void __launch_bounds__(QX_THREADS) quantize_x_to_q8_1_batc
         a = fmaxf(a, other);
     }
 
-    float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-    int qi = __float2int_rn(v * inv_scale);
+    float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+    float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+    int qi = __float2int_rn(__fmul_rn(v, inv_scale));
     qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
     xq_row[idx] = (int8_t)qi;
 
@@ -129,7 +135,7 @@ extern "C" __global__ void __launch_bounds__(QX_THREADS) quantize_x_to_q8_1_batc
 
     if (lane == 0)
     {
-        dx_row[chunk] = __float2half(a / 127.0f);
+        dx_row[chunk] = __float2half(d_x);
         sx2_row[chunk * 2 + 0] = __float2half((float)s);
     }
     if (lane == 16)

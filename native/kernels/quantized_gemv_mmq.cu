@@ -239,8 +239,9 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q4_k_mmq(
             a = fmaxf(a, other);
         }
 
-        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-        int qi = __float2int_rn(v * inv_scale);
+        float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+        float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+        int qi = __float2int_rn(__fmul_rn(v, inv_scale));
         qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
         s_xq[c * 32 + lane] = (int8_t)qi;
 
@@ -251,7 +252,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q4_k_mmq(
 
         if (lane == 0)
         {
-            s_dx[c] = __float2half(a / 127.0f);
+            s_dx[c] = __float2half(d_x);
             s_sx[c] = __float2half((float)s);
         }
     }
@@ -446,8 +447,9 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q2_k_mmq(
             a = fmaxf(a, other);
         }
 
-        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-        int qi = __float2int_rn(v * inv_scale);
+        float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+        float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+        int qi = __float2int_rn(__fmul_rn(v, inv_scale));
         qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
         s_xq[c * 32 + lane] = (int8_t)qi;
 
@@ -458,7 +460,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q2_k_mmq(
 
         if (lane == 0)
         {
-            s_dx[c] = __float2half(a / 127.0f);
+            s_dx[c] = __float2half(d_x);
             s_sx2[c * 2 + 0] = __float2half((float)s);
         }
         if (lane == 16)
@@ -621,8 +623,9 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q5_k_mmq(
             a = fmaxf(a, other);
         }
 
-        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-        int qi = __float2int_rn(v * inv_scale);
+        float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+        float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+        int qi = __float2int_rn(__fmul_rn(v, inv_scale));
         qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
         s_xq[c * 32 + lane] = (int8_t)qi;
 
@@ -633,7 +636,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q5_k_mmq(
 
         if (lane == 0)
         {
-            s_dx[c] = __float2half(a / 127.0f);
+            s_dx[c] = __float2half(d_x);
             s_sx[c] = __float2half((float)s);
         }
     }
@@ -804,8 +807,9 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q6_k_mmq(
             a = fmaxf(a, other);
         }
 
-        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-        int qi = __float2int_rn(v * inv_scale);
+        float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+        float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+        int qi = __float2int_rn(__fmul_rn(v, inv_scale));
         qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
         s_xq[c * 32 + lane] = (int8_t)qi;
 
@@ -817,7 +821,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q6_k_mmq(
 
         if (lane == 0)
         {
-            s_dx[c] = __float2half(a / 127.0f);
+            s_dx[c] = __float2half(d_x);
             s_sx2[c * 2 + 0] = __float2half((float)s);
         }
         if (lane == 16)
@@ -1126,8 +1130,9 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
             a = fmaxf(a, other);
         }
 
-        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-        int qi = __float2int_rn(v * inv_scale);
+        float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+        float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+        int qi = __float2int_rn(__fmul_rn(v, inv_scale));
         qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
         s_xq[c * 32 + lane] = (int8_t)qi;
 
@@ -1138,7 +1143,7 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
 
         if (lane == 0)
         {
-            s_dx[c] = __float2half(a / 127.0f);
+            s_dx[c] = __float2half(d_x);
             s_sx[c] = __float2half((float)s);
         }
     }
@@ -1278,15 +1283,16 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, offset));
-        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-        int qi = __float2int_rn(v * inv_scale);
+        float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+        float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+        int qi = __float2int_rn(__fmul_rn(v, inv_scale));
         qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
         s_xq[c * 32 + lane] = (int8_t)qi;
         int s = qi;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             s += __shfl_xor_sync(0xFFFFFFFF, s, offset);
-        if (lane == 0) { s_dx[c] = __float2half(a / 127.0f); s_sx[c] = __float2half((float)s); }
+        if (lane == 0) { s_dx[c] = __float2half(d_x); s_sx[c] = __float2half((float)s); }
     }
     __syncthreads();
 
@@ -1434,15 +1440,16 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, offset));
-        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-        int qi = __float2int_rn(v * inv_scale);
+        float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+        float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+        int qi = __float2int_rn(__fmul_rn(v, inv_scale));
         qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
         s_xq[c * 32 + lane] = (int8_t)qi;
         int s = qi;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             s += __shfl_xor_sync(0xFFFFFFFF, s, offset);
-        if (lane == 0) { s_dx[c] = __float2half(a / 127.0f); s_sx[c] = __float2half((float)s); }
+        if (lane == 0) { s_dx[c] = __float2half(d_x); s_sx[c] = __float2half((float)s); }
     }
     __syncthreads();
 
@@ -1573,8 +1580,9 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
             a = fmaxf(a, other);
         }
 
-        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-        int qi = __float2int_rn(v * inv_scale);
+        float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+        float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+        int qi = __float2int_rn(__fmul_rn(v, inv_scale));
         qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
         s_xq[c * 32 + lane] = (int8_t)qi;
 
@@ -1586,7 +1594,7 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
 
         if (lane == 0)
         {
-            s_dx[c] = __float2half(a / 127.0f);
+            s_dx[c] = __float2half(d_x);
             s_sx2[c * 2 + 0] = __float2half((float)s);
         }
         if (lane == 16)
@@ -1722,8 +1730,9 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
             a = fmaxf(a, other);
         }
 
-        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-        int qi = __float2int_rn(v * inv_scale);
+        float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+        float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+        int qi = __float2int_rn(__fmul_rn(v, inv_scale));
         qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
         s_xq[c * 32 + lane] = (int8_t)qi;
 
@@ -1734,7 +1743,7 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
 
         if (lane == 0)
         {
-            s_dx[c] = __float2half(a / 127.0f);
+            s_dx[c] = __float2half(d_x);
             s_sx[c] = __float2half((float)s);
         }
     }
@@ -1876,8 +1885,9 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
             a = fmaxf(a, other);
         }
 
-        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
-        int qi = __float2int_rn(v * inv_scale);
+        float d_x = __fdiv_rn(a, 127.0f);                       // #1499: d = amax/127 (IEEE) ...
+        float inv_scale = (a > 0.0f) ? __frcp_rn(d_x) : 0.0f;    //        id = 1/d (IEEE), q = rne(v*id): the CPU/Vulkan Q8_1 contract
+        int qi = __float2int_rn(__fmul_rn(v, inv_scale));
         qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
         s_xq[c * 32 + lane] = (int8_t)qi;
 
@@ -1889,7 +1899,7 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
 
         if (lane == 0)
         {
-            s_dx[c] = __float2half(a / 127.0f);
+            s_dx[c] = __float2half(d_x);
             s_sx2[c * 2 + 0] = __float2half((float)s);
         }
         if (lane == 16)
