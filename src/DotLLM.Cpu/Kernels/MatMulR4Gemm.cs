@@ -207,10 +207,39 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static void GemmR4TiledQ8_0(byte* repackedWeights, float* b, byte* inputQ, float* c,
         int fullGroups, int tailRows, int blockCount, int m, int k, int n, ComputeThreadPool? pool)
-        => GemmR4Tiled(repackedWeights, b, inputQ, c, fullGroups, tailRows, blockCount, m, k, n,
+    {
+        if (Q8_0Rows8Tier)
+        {
+            // Eight-row transposed VNNI GEMM over the zero-copy R4 view (#1119, #1156): the groups and tail rows are the
+            // original consecutive row-major rows, so the row-major kernel covers them all.
+            if (inputQ != null)
+            {
+                GemmQ8_0Rows8Vnni(repackedWeights, inputQ, c, m, n, blockCount, pool);
+                return;
+            }
+            int inputRowBytes = blockCount * Q8_0BlockBytes;
+            byte[] rented = ArrayPool<byte>.Shared.Rent(n * inputRowBytes);
+            try
+            {
+                fixed (byte* scratch = rented)
+                {
+                    for (int t = 0; t < n; t++)
+                        QuantizeF32ToQ8_0(b + (long)t * k, scratch + (long)t * inputRowBytes, k);
+                    GemmQ8_0Rows8Vnni(repackedWeights, scratch, c, m, n, blockCount, pool);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+            return;
+        }
+
+        GemmR4Tiled(repackedWeights, b, inputQ, c, fullGroups, tailRows, blockCount, m, k, n,
             Q8_0BlockBytes, blockCount * Q8_0BlockBytes,
             &ComputeRowsQ8_0Interleaved, &QuantizeF32ToQ8_0, pool,
             CpuFeatures.Avx2 ? &Q8_0Rows4Tokens4Avx2 : null);
+    }
 
     /// <inheritdoc cref="GemmR4Tiled"/>
     [SkipLocalsInit]

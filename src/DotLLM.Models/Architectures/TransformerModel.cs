@@ -4262,6 +4262,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             MatMul.GemvF32((float*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.F16)
             MatMul.GemvF16(weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.BF16)
+            // Shift-widen BF16 kernel, weights read as BF16 in place (#1118); DOTLLM_CPU_BF16_KERNEL=0 restores dequant-rows.
+            MatMul.GemvBf16(weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.I2_S)
             MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.PQ2_0)
@@ -4323,6 +4326,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             MatMul.GemmF32((float*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.F16)
             MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
+        else if (qt == QuantizationType.BF16)
+            // Shift-widen BF16 kernel, weights read as BF16 in place (#1118); DOTLLM_CPU_BF16_KERNEL=0 restores dequant-rows.
+            MatMul.GemmBf16(weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.I2_S)
             MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.PQ2_0)
