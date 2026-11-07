@@ -596,7 +596,7 @@ PRs #1103, #1122, #1125, #1126.
 | Q5 | Vulkan qwen4exp | QSA KV F32 default; indexer keys F32 | 48 vs 24 KiB/token (12 → 6 GiB @262k) | open | #1145 |
 | Q6 | Vulkan qwen4exp | activation scratch F32 @1024 planned rows | 3,753 MiB | open | #1138 |
 | Q7 | Vulkan qwen4exp | MTP head routed bank re-quantised Q8_0 → Q4_K/Q5_1 | smaller than file (lossy, not an expansion) | noted only | — |
-| H1 | Vulkan hybrid | IQ4_NL / K-quant prefill on scalar F32 GEMMs (not an expansion; the missing MMQ/coopmat path) | Tev1 63 tok/s Strix, 3.7 tok/s Arc | open | #1149 |
+| H1 | Vulkan hybrid | IQ4_NL / K-quant prefill on scalar F32 GEMMs (not an expansion; the missing MMQ/coopmat path) | Tev1 63 tok/s Strix, 3.7 tok/s Arc | hybrid-dense host now selects from the dense host's table (`VulkanDensePrefillGemmPolicy`): dp4a MMQ on Q8_1 rows for IQ4_NL and for K-quants below the coopmat crossover / without coopmat; weights stay packed | #1149 |
 | L2 | Vulkan LFM2 MoE | F32 KV (`VulkanNemotronHKvCache` F32 path) | per token | open; not measured | #1151 |
 
 **Vulkan embedding encoders (added after this study, compliant with rules 1 and 2).** `VulkanBertEncoderModel` / `VulkanGemmaEmbeddingModel` read F16, Q8_0 and F32 weights in place (no expansion, #1473), store every activation as F16 with F32 accumulators in registers (#1474; the first version of #741 held F32 scratch, halved since), and keep EmbeddingGemma's residual stream in BF16 because it reaches |x| ~ 1.3e5-1.6e5 in layers 22-23 (above the F16 ceiling of 65,504; the forward throws on a non-finite post-norm input rather than return garbage). Evidence and parity gates: [EMBEDDINGS.md](EMBEDDINGS.md) section 5.
