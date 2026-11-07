@@ -3434,18 +3434,28 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
     }
 }
 
-// ── K-quant MMVQ "rows4" decode GEMVs, pre-quantized activations (#1298) ─────────────────────
+// ── K-quant / IQ4 MMVQ "rows4" GEMVs, pre-quantized activations, 1..8 columns (#1298, #1316, #1375) ──
 //
 // One WARP per output row, 4 rows per 128-thread block (grid = ceil(n/4)); no __syncthreads and no
-// shared memory — the row reduction is a pure warp-shuffle. Each superblock is covered by 16
-// consecutive lanes (a warp walks 2 superblocks per step), so a row with k=1536 (6 superblocks) keeps
-// all 32 lanes busy for 3 steps. The MMVQ-large kernels instead give a whole 128-thread block to one
-// row and use only superblocks*{4,16} units: at k=1536 that is 24 (Q4_K) of 128 threads — the 128 GB/s
-// gate/up and 65 GB/s 1536x1536 projections in #1298.
+// shared memory — the row reduction is a pure warp-shuffle. Each superblock (256 elements) is covered
+// by 16 consecutive lanes (a warp walks 2 superblocks per step), so a row with k=1536 (6 superblocks)
+// keeps all 32 lanes busy for 3 steps. The MMVQ-large kernels instead give a whole 128-thread block to
+// one row and use only superblocks*{4,8,16} units: at k=1536 that is 24 (Q4_K) of 128 threads — the
+// 128 GB/s gate/up and 65 GB/s 1536x1536 projections in #1298.
 //
-// Quantized blocks are read in place; Q8_1 activations come from the shared pre-quantise scratch.
+// Every kernel in this section is one template body instantiated for NCOLS = 1..8 activation columns:
+//   weight  : n rows of k quantized elements, read in place (never widened, CLAUDE.md Precision rule 2)
+//   xq/dx/sx2: NCOLS columns in the quantize_x_to_q8_1(_batched) layout — column c is xq + c*k (int8),
+//              dx + c*(k/32) (half), sx2 + c*(k/16) (half); for NCOLS = 1 this IS the single-row layout
+//   y       : [NCOLS, n] half, y[c*n + row]
+// The weight words a lane decodes are reused for every column, so a 2..8-row verify / draft forward
+// reads the matrix once instead of once per row, and the F16-dequant + cuBLAS small-S path (#1375,
+// PRECISION.md GX1) is not needed for these types. NCOLS is a compile-time constant: the per-column
+// accumulators stay in registers and the column loop fully unrolls.
+//
 // Accumulation: int32 dp4a per sub-block, F32 across sub-blocks and in the reduction, FP16 on the
-// final store only (CLAUDE.md Precision rule 1).
+// final store only (CLAUDE.md Precision rule 1). All row/column offsets are size_t (CUDA `long` is
+// 32-bit on Windows).
 
 // Reads N consecutive 32-bit words starting at an arbitrary (>= 2-byte aligned) address using aligned
 // loads + funnel shifts. Never reads past the last needed byte when the address is word aligned.
@@ -3464,14 +3474,28 @@ __device__ __forceinline__ void ld_words_unaligned(const uint8_t* p, uint32_t (&
         out[i] = __funnelshift_r(w[i], w[i + 1], sh);
 }
 
-extern "C" __global__ void __launch_bounds__(128) quantized_gemv_q4_k_mmvq_rows4_preq(
-    const uint8_t* __restrict__ weight,
-    const int8_t*  __restrict__ xq_in,
-    const half*    __restrict__ dx_in,
-    const half*    __restrict__ sx2_in,
-    half* __restrict__ y,
-    const int n,
-    const int k)
+// Warp-reduces acc[0..NCOLS) and stores y[c*n + row] from lane 0.
+template <int NCOLS>
+__device__ __forceinline__ void rows4_store(float (&acc)[NCOLS], half* __restrict__ y, const int n, const int row, const int lane)
+{
+    #pragma unroll
+    for (int c = 0; c < NCOLS; c++)
+    {
+        float v = acc[c];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0)
+            y[(size_t)c * n + row] = __float2half(v);
+    }
+}
+
+// Q4_K: 144-byte blocks (d dmin scales[12] qs[128]). Slot t (16 per superblock): pair = t>>2 picks the 32-byte
+// qs group (lo nibbles -> sub-block 2p, hi -> 2p+1), sub = t&3 picks its 8 bytes.
+template <int NCOLS>
+__device__ __forceinline__ void rows4_q4_k_body(
+    const uint8_t* __restrict__ weight, const int8_t* __restrict__ xq_in, const half* __restrict__ dx_in,
+    const half* __restrict__ sx2_in, half* __restrict__ y, const int n, const int k)
 {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -3479,6 +3503,7 @@ extern "C" __global__ void __launch_bounds__(128) quantized_gemv_q4_k_mmvq_rows4
     if (row >= n) return;                       // warp-uniform: no block-level barrier below
 
     const int nsb = k >> 8;
+    const int nch = k >> 5;
     const uint8_t* w_row = weight + (size_t)row * nsb * 144;
 
     const int t = lane & 15;                    // slot inside the superblock
@@ -3487,7 +3512,10 @@ extern "C" __global__ void __launch_bounds__(128) quantized_gemv_q4_k_mmvq_rows4
     const int sbE = pair * 2, sbO = sbE + 1;
     const float first = (sub == 0) ? 1.0f : 0.0f;   // the min term is added once per sub-block, by sub==0
 
-    float acc = 0.0f;
+    float acc[NCOLS];
+    #pragma unroll
+    for (int c = 0; c < NCOLS; c++) acc[c] = 0.0f;
+
     for (int sb = lane >> 4; sb < nsb; sb += 2)
     {
         const uint8_t* block = w_row + (size_t)sb * 144;
@@ -3512,42 +3540,44 @@ extern "C" __global__ void __launch_bounds__(128) quantized_gemv_q4_k_mmvq_rows4
 
         const uint32_t* q = reinterpret_cast<const uint32_t*>(block + 16 + pair * 32 + sub * 8);
         const uint32_t q0 = q[0], q1 = q[1];
+        const int qE0 = (int)(q0 & 0x0F0F0F0Fu), qE1 = (int)(q1 & 0x0F0F0F0Fu);
+        const int qO0 = (int)((q0 >> 4) & 0x0F0F0F0Fu), qO1 = (int)((q1 >> 4) & 0x0F0F0F0Fu);
 
         const int chE = sb * 8 + sbE, chO = chE + 1;
-        const int* xe = reinterpret_cast<const int*>(xq_in + (size_t)chE * 32) + sub * 2;
-        const int* xo = reinterpret_cast<const int*>(xq_in + (size_t)chO * 32) + sub * 2;
 
-        int dotE = __dp4a((int)(q0 & 0x0F0F0F0Fu), xe[0], 0);
-        dotE = __dp4a((int)(q1 & 0x0F0F0F0Fu), xe[1], dotE);
-        int dotO = __dp4a((int)((q0 >> 4) & 0x0F0F0F0Fu), xo[0], 0);
-        dotO = __dp4a((int)((q1 >> 4) & 0x0F0F0F0Fu), xo[1], dotO);
+        #pragma unroll
+        for (int c = 0; c < NCOLS; c++)
+        {
+            const int8_t* xqc  = xq_in  + (size_t)c * k;
+            const half*   dxc  = dx_in  + (size_t)c * nch;
+            const half*   sx2c = sx2_in + (size_t)c * nch * 2;
+            const int* xe = reinterpret_cast<const int*>(xqc + (size_t)chE * 32) + sub * 2;
+            const int* xo = reinterpret_cast<const int*>(xqc + (size_t)chO * 32) + sub * 2;
 
-        const float dxE = __half2float(dx_in[chE]);
-        const float dxO = __half2float(dx_in[chO]);
-        const float sxE = __half2float(sx2_in[chE * 2]) + __half2float(sx2_in[chE * 2 + 1]);
-        const float sxO = __half2float(sx2_in[chO * 2]) + __half2float(sx2_in[chO * 2 + 1]);
+            int dotE = __dp4a(qE0, xe[0], 0);
+            dotE = __dp4a(qE1, xe[1], dotE);
+            int dotO = __dp4a(qO0, xo[0], 0);
+            dotO = __dp4a(qO1, xo[1], dotO);
 
-        acc += d * (dxE * (float)scE * (float)dotE + dxO * (float)scO * (float)dotO)
-             - first * dmin * (dxE * (float)mE * sxE + dxO * (float)mO * sxO);
+            const float dxE = __half2float(dxc[chE]);
+            const float dxO = __half2float(dxc[chO]);
+            const float sxE = __half2float(sx2c[chE * 2]) + __half2float(sx2c[chE * 2 + 1]);
+            const float sxO = __half2float(sx2c[chO * 2]) + __half2float(sx2c[chO * 2 + 1]);
+
+            acc[c] += d * (dxE * (float)scE * (float)dotE + dxO * (float)scO * (float)dotO)
+                    - first * dmin * (dxE * (float)mE * sxE + dxO * (float)mO * sxO);
+        }
     }
 
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
-    if (lane == 0)
-        y[row] = __float2half(acc);
+    rows4_store<NCOLS>(acc, y, n, row, lane);
 }
 
-// Q6_K: 210-byte blocks (ql[128] qh[64] scales[16] d) — only 2-byte aligned for odd superblocks, so the
-// 16-byte weight slices are read through ld_words_unaligned.
-extern "C" __global__ void __launch_bounds__(128) quantized_gemv_q6_k_mmvq_rows4_preq(
-    const uint8_t* __restrict__ weight,
-    const int8_t*  __restrict__ xq_in,
-    const half*    __restrict__ dx_in,
-    const half*    __restrict__ sx2_in,
-    half* __restrict__ y,
-    const int n,
-    const int k)
+// Q5_K: 176-byte blocks (d dmin scales[12] qh[32] qs[128]). Same slot decomposition as Q4_K; the 5th bit of
+// element l in sub-block j is bit j of qh[l] (llama.cpp dequantize_row_q5_K: u1 = 1 << 2p, u2 = 2 << 2p).
+template <int NCOLS>
+__device__ __forceinline__ void rows4_q5_k_body(
+    const uint8_t* __restrict__ weight, const int8_t* __restrict__ xq_in, const half* __restrict__ dx_in,
+    const half* __restrict__ sx2_in, half* __restrict__ y, const int n, const int k)
 {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -3555,6 +3585,93 @@ extern "C" __global__ void __launch_bounds__(128) quantized_gemv_q6_k_mmvq_rows4
     if (row >= n) return;
 
     const int nsb = k >> 8;
+    const int nch = k >> 5;
+    const uint8_t* w_row = weight + (size_t)row * nsb * 176;
+
+    const int t = lane & 15;
+    const int pair = t >> 2;
+    const int sub = t & 3;
+    const int sbE = pair * 2, sbO = sbE + 1;
+    const float first = (sub == 0) ? 1.0f : 0.0f;
+
+    float acc[NCOLS];
+    #pragma unroll
+    for (int c = 0; c < NCOLS; c++) acc[c] = 0.0f;
+
+    for (int sb = lane >> 4; sb < nsb; sb += 2)
+    {
+        const uint8_t* block = w_row + (size_t)sb * 176;
+        const uint32_t dd = *reinterpret_cast<const uint32_t*>(block);
+        const float d    = __half2float(__ushort_as_half((unsigned short)(dd & 0xFFFF)));
+        const float dmin = __half2float(__ushort_as_half((unsigned short)(dd >> 16)));
+        const uint8_t* sc_raw = block + 4;
+
+        int scE, mE, scO, mO;
+        if (pair < 2)
+        {
+            scE = sc_raw[sbE] & 0x3F;  mE = sc_raw[sbE + 4] & 0x3F;
+            scO = sc_raw[sbO] & 0x3F;  mO = sc_raw[sbO + 4] & 0x3F;
+        }
+        else
+        {
+            scE = (sc_raw[sbE + 4] & 0x0F) | ((sc_raw[sbE - 4] >> 6) << 4);
+            mE  = (sc_raw[sbE + 4] >> 4)   | ((sc_raw[sbE]     >> 6) << 4);
+            scO = (sc_raw[sbO + 4] & 0x0F) | ((sc_raw[sbO - 4] >> 6) << 4);
+            mO  = (sc_raw[sbO + 4] >> 4)   | ((sc_raw[sbO]     >> 6) << 4);
+        }
+
+        // qs words of this lane's 8 elements (l = sub*8 .. sub*8+7 of the pair) and the matching qh words.
+        const uint32_t* q  = reinterpret_cast<const uint32_t*>(block + 48 + pair * 32 + sub * 8);
+        const uint32_t* qh = reinterpret_cast<const uint32_t*>(block + 16 + sub * 8);
+        const uint32_t q0 = q[0], q1 = q[1], h0 = qh[0], h1 = qh[1];
+        const int qE0 = (int)((q0 & 0x0F0F0F0Fu) | (((h0 >> sbE) & 0x01010101u) << 4));
+        const int qE1 = (int)((q1 & 0x0F0F0F0Fu) | (((h1 >> sbE) & 0x01010101u) << 4));
+        const int qO0 = (int)(((q0 >> 4) & 0x0F0F0F0Fu) | (((h0 >> sbO) & 0x01010101u) << 4));
+        const int qO1 = (int)(((q1 >> 4) & 0x0F0F0F0Fu) | (((h1 >> sbO) & 0x01010101u) << 4));
+
+        const int chE = sb * 8 + sbE, chO = chE + 1;
+
+        #pragma unroll
+        for (int c = 0; c < NCOLS; c++)
+        {
+            const int8_t* xqc  = xq_in  + (size_t)c * k;
+            const half*   dxc  = dx_in  + (size_t)c * nch;
+            const half*   sx2c = sx2_in + (size_t)c * nch * 2;
+            const int* xe = reinterpret_cast<const int*>(xqc + (size_t)chE * 32) + sub * 2;
+            const int* xo = reinterpret_cast<const int*>(xqc + (size_t)chO * 32) + sub * 2;
+
+            int dotE = __dp4a(qE0, xe[0], 0);
+            dotE = __dp4a(qE1, xe[1], dotE);
+            int dotO = __dp4a(qO0, xo[0], 0);
+            dotO = __dp4a(qO1, xo[1], dotO);
+
+            const float dxE = __half2float(dxc[chE]);
+            const float dxO = __half2float(dxc[chO]);
+            const float sxE = __half2float(sx2c[chE * 2]) + __half2float(sx2c[chE * 2 + 1]);
+            const float sxO = __half2float(sx2c[chO * 2]) + __half2float(sx2c[chO * 2 + 1]);
+
+            acc[c] += d * (dxE * (float)scE * (float)dotE + dxO * (float)scO * (float)dotO)
+                    - first * dmin * (dxE * (float)mE * sxE + dxO * (float)mO * sxO);
+        }
+    }
+
+    rows4_store<NCOLS>(acc, y, n, row, lane);
+}
+
+// Q6_K: 210-byte blocks (ql[128] qh[64] scales[16] d) — only 2-byte aligned for odd superblocks, so the
+// 16-byte weight slices are read through ld_words_unaligned.
+template <int NCOLS>
+__device__ __forceinline__ void rows4_q6_k_body(
+    const uint8_t* __restrict__ weight, const int8_t* __restrict__ xq_in, const half* __restrict__ dx_in,
+    const half* __restrict__ sx2_in, half* __restrict__ y, const int n, const int k)
+{
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + warp;
+    if (row >= n) return;
+
+    const int nsb = k >> 8;
+    const int nch = k >> 5;
     const uint8_t* w_row = weight + (size_t)row * nsb * 210;
 
     // Same slot decomposition as quantized_gemv_q6_k_mmvq_large_preq: 16 quants (one scale) per lane.
@@ -3567,7 +3684,10 @@ extern "C" __global__ void __launch_bounds__(128) quantized_gemv_q6_k_mmvq_rows4
     const int ql_shift = (q_quad & 2) << 1;
     const int qh_shift = q_quad << 1;
 
-    float acc = 0.0f;
+    float acc[NCOLS];
+    #pragma unroll
+    for (int c = 0; c < NCOLS; c++) acc[c] = 0.0f;
+
     for (int sb = lane >> 4; sb < nsb; sb += 2)
     {
         const uint8_t* block = w_row + (size_t)sb * 210;
@@ -3575,28 +3695,284 @@ extern "C" __global__ void __launch_bounds__(128) quantized_gemv_q6_k_mmvq_rows4
         ld_words_unaligned<4>(block + ql_off, ql);
         ld_words_unaligned<4>(block + qh_off, qh);
 
-        const int chunk = sb * 8 + half_idx * 4 + q_quad;
-        const int* xi = reinterpret_cast<const int*>(xq_in + (size_t)chunk * 32 + isc * 16);
-
-        int dot = 0;
+        int wq[4];
         #pragma unroll
         for (int j = 0; j < 4; j++)
         {
             const uint32_t lo4 = (ql[j] >> ql_shift) & 0x0F0F0F0Fu;
             const uint32_t hi2 = ((qh[j] >> qh_shift) & 0x03030303u) << 4;
-            dot = __dp4a((int)(lo4 | hi2), xi[j], dot);
+            wq[j] = (int)(lo4 | hi2);
         }
 
+        const int chunk = sb * 8 + half_idx * 4 + q_quad;
         const float d  = __half2float(*reinterpret_cast<const half*>(block + 208));
         const int sc   = (int)reinterpret_cast<const int8_t*>(block + 192)[half_idx * 8 + q_quad * 2 + isc];
-        const float dx = __half2float(dx_in[chunk]);
-        const float sx = __half2float(sx2_in[chunk * 2 + isc]);
-        acc += dx * d * (float)sc * ((float)dot - 32.0f * sx);
+
+        #pragma unroll
+        for (int c = 0; c < NCOLS; c++)
+        {
+            const int8_t* xqc  = xq_in  + (size_t)c * k;
+            const half*   dxc  = dx_in  + (size_t)c * nch;
+            const half*   sx2c = sx2_in + (size_t)c * nch * 2;
+            const int* xi = reinterpret_cast<const int*>(xqc + (size_t)chunk * 32 + isc * 16);
+
+            int dot = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                dot = __dp4a(wq[j], xi[j], dot);
+
+            const float dx = __half2float(dxc[chunk]);
+            const float sx = __half2float(sx2c[chunk * 2 + isc]);
+            acc[c] += dx * d * (float)sc * ((float)dot - 32.0f * sx);
+        }
     }
 
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
-    if (lane == 0)
-        y[row] = __float2half(acc);
+    rows4_store<NCOLS>(acc, y, n, row, lane);
 }
+
+// Q2_K: 84-byte blocks (scales[16] qs[64] d dmin); 16 sub-blocks of 16 elements, one per lane. Sub-block s
+// (llama.cpp dequantize_row_q2_K) lives in the 16 contiguous bytes qs + 32*(s>>3) + 16*(s&1) at shift
+// 2*((s>>1)&3); scale = scales[s] & 0xF, min = scales[s] >> 4. 16 elements are half a Q8_1 chunk, so the
+// min term uses the half-chunk sum sx2[2*chunk + (s&1)].
+template <int NCOLS>
+__device__ __forceinline__ void rows4_q2_k_body(
+    const uint8_t* __restrict__ weight, const int8_t* __restrict__ xq_in, const half* __restrict__ dx_in,
+    const half* __restrict__ sx2_in, half* __restrict__ y, const int n, const int k)
+{
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + warp;
+    if (row >= n) return;
+
+    const int nsb = k >> 8;
+    const int nch = k >> 5;
+    const uint8_t* w_row = weight + (size_t)row * nsb * 84;
+
+    const int s = lane & 15;                    // sub-block inside the superblock
+    const int qs_off = 16 + 32 * (s >> 3) + 16 * (s & 1);
+    const int sh = ((s >> 1) & 3) << 1;
+    const int isc = s & 1;
+
+    float acc[NCOLS];
+    #pragma unroll
+    for (int c = 0; c < NCOLS; c++) acc[c] = 0.0f;
+
+    for (int sb = lane >> 4; sb < nsb; sb += 2)
+    {
+        const uint8_t* block = w_row + (size_t)sb * 84;
+        const uint32_t dd = *reinterpret_cast<const uint32_t*>(block + 80);
+        const float d    = __half2float(__ushort_as_half((unsigned short)(dd & 0xFFFF)));
+        const float dmin = __half2float(__ushort_as_half((unsigned short)(dd >> 16)));
+        const int scale_byte = block[s];
+        const int sc = scale_byte & 0x0F;
+        const int dm = scale_byte >> 4;
+
+        const uint32_t* q = reinterpret_cast<const uint32_t*>(block + qs_off);
+        int wq[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            wq[j] = (int)((q[j] >> sh) & 0x03030303u);
+
+        const int chunk = sb * 8 + (s >> 1);
+
+        #pragma unroll
+        for (int c = 0; c < NCOLS; c++)
+        {
+            const int8_t* xqc  = xq_in  + (size_t)c * k;
+            const half*   dxc  = dx_in  + (size_t)c * nch;
+            const half*   sx2c = sx2_in + (size_t)c * nch * 2;
+            const int* xi = reinterpret_cast<const int*>(xqc + (size_t)chunk * 32 + isc * 16);
+
+            int dot = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                dot = __dp4a(wq[j], xi[j], dot);
+
+            const float dx = __half2float(dxc[chunk]);
+            const float sx = __half2float(sx2c[chunk * 2 + isc]);
+            acc[c] += dx * (d * (float)sc * (float)dot - dmin * (float)dm * sx);
+        }
+    }
+
+    rows4_store<NCOLS>(acc, y, n, row, lane);
+}
+
+// IQ4_NL codebook as four little-endian words (kvalues_iq4nl_mmq[4i..4i+3]) for register-resident lookup.
+__device__ __constant__ uint32_t kvalues_iq4nl_mmq_words[4] = {
+    0xBFAD9881u,    // -127, -104, -83, -65
+    0xF6EADDCFu,    //  -49,  -35, -22, -10
+    0x26190D01u,    //    1,   13,  25,  38
+    0x71594535u,    //   53,   69,  89, 113
+};
+
+// Maps four 4-bit codes (one per byte, upper nibble clear) through the 16-entry IQ4_NL codebook with two
+// byte permutes and a blend on code bit 3 — no per-element constant-memory gather (the MMVQ-large kernels'
+// kvalues_iq4nl_mmq[...] indexing serialises across the warp).
+__device__ __forceinline__ int iq4nl_lut4(const uint32_t codes, const uint32_t t0, const uint32_t t1,
+                                          const uint32_t t2, const uint32_t t3)
+{
+    // prmt selectors are four contiguous nibbles (bits 3:0 pick result byte 0, 7:4 byte 1, ...), so pack the low
+    // three bits of each code byte: t = b0|b1<<4 in byte 0 and b2|b3<<4 in byte 2, then gather bytes 0 and 2.
+    const uint32_t b3 = codes & 0x07070707u;
+    const uint32_t t = b3 | (b3 >> 4);
+    const uint32_t sel = __byte_perm(t, 0u, 0x4420u);
+    const uint32_t lo = __byte_perm(t0, t1, sel);           // entries 0..7
+    const uint32_t hi = __byte_perm(t2, t3, sel);           // entries 8..15
+    const uint32_t m = ((codes >> 3) & 0x01010101u) * 0xFFu; // 0xFF where bit 3 of the code is set
+    return (int)((hi & m) | (lo & ~m));
+}
+
+// IQ4_XS: 136-byte blocks (d scales_h scales_l[4] qs[128]); 8 sub-blocks of 32 elements, 16 qs bytes each
+// (lo nibble -> element j, hi nibble -> element 16+j). Slot t: ib = t>>1 sub-block, h = t&1 its 8-byte half.
+template <int NCOLS>
+__device__ __forceinline__ void rows4_iq4_xs_body(
+    const uint8_t* __restrict__ weight, const int8_t* __restrict__ xq_in, const half* __restrict__ dx_in,
+    const half* __restrict__ sx2_in, half* __restrict__ y, const int n, const int k)
+{
+    (void)sx2_in;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + warp;
+    if (row >= n) return;
+
+    const int nsb = k >> 8;
+    const int nch = k >> 5;
+    const uint8_t* w_row = weight + (size_t)row * nsb * 136;
+
+    const int t = lane & 15;
+    const int ib = t >> 1;
+    const int h = t & 1;
+    const uint32_t t0 = kvalues_iq4nl_mmq_words[0], t1 = kvalues_iq4nl_mmq_words[1];
+    const uint32_t t2 = kvalues_iq4nl_mmq_words[2], t3 = kvalues_iq4nl_mmq_words[3];
+
+    float acc[NCOLS];
+    #pragma unroll
+    for (int c = 0; c < NCOLS; c++) acc[c] = 0.0f;
+
+    for (int sb = lane >> 4; sb < nsb; sb += 2)
+    {
+        const uint8_t* block = w_row + (size_t)sb * 136;
+        const uint32_t* hdr = reinterpret_cast<const uint32_t*>(block);
+        const uint32_t w0 = hdr[0], w1 = hdr[1];          // d | scales_h << 16 ; scales_l[0..3]
+        const float d = __half2float(__ushort_as_half((unsigned short)(w0 & 0xFFFF)));
+        const int scales_h = (int)(w0 >> 16);
+        const int low  = (int)((w1 >> (8 * (ib >> 1))) >> (4 * (ib & 1))) & 0x0F;
+        const int high = (scales_h >> (2 * ib)) & 0x03;
+        const int ls = low | (high << 4);
+        const float dl = d * (float)(ls - 32);
+
+        const uint32_t* q = reinterpret_cast<const uint32_t*>(block + 8 + ib * 16 + h * 8);
+        const uint32_t q0 = q[0], q1 = q[1];
+        const int wlo0 = iq4nl_lut4(q0 & 0x0F0F0F0Fu, t0, t1, t2, t3);
+        const int wlo1 = iq4nl_lut4(q1 & 0x0F0F0F0Fu, t0, t1, t2, t3);
+        const int whi0 = iq4nl_lut4((q0 >> 4) & 0x0F0F0F0Fu, t0, t1, t2, t3);
+        const int whi1 = iq4nl_lut4((q1 >> 4) & 0x0F0F0F0Fu, t0, t1, t2, t3);
+
+        const int chunk = sb * 8 + ib;
+
+        #pragma unroll
+        for (int c = 0; c < NCOLS; c++)
+        {
+            const int8_t* xqc = xq_in + (size_t)c * k;
+            const half*   dxc = dx_in + (size_t)c * nch;
+            const int* xlo = reinterpret_cast<const int*>(xqc + (size_t)chunk * 32 + h * 8);
+            const int* xhi = reinterpret_cast<const int*>(xqc + (size_t)chunk * 32 + 16 + h * 8);
+
+            int dot = __dp4a(wlo0, xlo[0], 0);
+            dot = __dp4a(wlo1, xlo[1], dot);
+            dot = __dp4a(whi0, xhi[0], dot);
+            dot = __dp4a(whi1, xhi[1], dot);
+
+            const float dx = __half2float(dxc[chunk]);
+            acc[c] += dl * dx * (float)dot;
+        }
+    }
+
+    rows4_store<NCOLS>(acc, y, n, row, lane);
+}
+
+// IQ4_NL: 18-byte blocks (d qs[16]) of 32 elements; 8 consecutive blocks (144 B) form the 256-element
+// "superblock" the slot decomposition walks (requires k % 256 == 0, see the dispatcher). Blocks are only
+// 2-byte aligned, so the 8 qs bytes are read as four 16-bit loads.
+template <int NCOLS>
+__device__ __forceinline__ void rows4_iq4_nl_body(
+    const uint8_t* __restrict__ weight, const int8_t* __restrict__ xq_in, const half* __restrict__ dx_in,
+    const half* __restrict__ sx2_in, half* __restrict__ y, const int n, const int k)
+{
+    (void)sx2_in;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + warp;
+    if (row >= n) return;
+
+    const int nsb = k >> 8;
+    const int nch = k >> 5;
+    const uint8_t* w_row = weight + (size_t)row * nsb * 144;
+
+    const int t = lane & 15;
+    const int ib = t >> 1;
+    const int h = t & 1;
+    const uint32_t t0 = kvalues_iq4nl_mmq_words[0], t1 = kvalues_iq4nl_mmq_words[1];
+    const uint32_t t2 = kvalues_iq4nl_mmq_words[2], t3 = kvalues_iq4nl_mmq_words[3];
+
+    float acc[NCOLS];
+    #pragma unroll
+    for (int c = 0; c < NCOLS; c++) acc[c] = 0.0f;
+
+    for (int sb = lane >> 4; sb < nsb; sb += 2)
+    {
+        const uint8_t* block = w_row + (size_t)sb * 144 + ib * 18;
+        const uint16_t* p16 = reinterpret_cast<const uint16_t*>(block);
+        const float d = __half2float(__ushort_as_half((unsigned short)p16[0]));
+        const uint16_t* qp = p16 + 1 + h * 4;
+        const uint32_t q0 = (uint32_t)qp[0] | ((uint32_t)qp[1] << 16);
+        const uint32_t q1 = (uint32_t)qp[2] | ((uint32_t)qp[3] << 16);
+        const int wlo0 = iq4nl_lut4(q0 & 0x0F0F0F0Fu, t0, t1, t2, t3);
+        const int wlo1 = iq4nl_lut4(q1 & 0x0F0F0F0Fu, t0, t1, t2, t3);
+        const int whi0 = iq4nl_lut4((q0 >> 4) & 0x0F0F0F0Fu, t0, t1, t2, t3);
+        const int whi1 = iq4nl_lut4((q1 >> 4) & 0x0F0F0F0Fu, t0, t1, t2, t3);
+
+        const int chunk = sb * 8 + ib;
+
+        #pragma unroll
+        for (int c = 0; c < NCOLS; c++)
+        {
+            const int8_t* xqc = xq_in + (size_t)c * k;
+            const half*   dxc = dx_in + (size_t)c * nch;
+            const int* xlo = reinterpret_cast<const int*>(xqc + (size_t)chunk * 32 + h * 8);
+            const int* xhi = reinterpret_cast<const int*>(xqc + (size_t)chunk * 32 + 16 + h * 8);
+
+            int dot = __dp4a(wlo0, xlo[0], 0);
+            dot = __dp4a(wlo1, xlo[1], dot);
+            dot = __dp4a(whi0, xhi[0], dot);
+            dot = __dp4a(whi1, xhi[1], dot);
+
+            const float dx = __half2float(dxc[chunk]);
+            acc[c] += d * dx * (float)dot;
+        }
+    }
+
+    rows4_store<NCOLS>(acc, y, n, row, lane);
+}
+
+// Entry points: quantized_gemv_<qt>_mmvq_rows4_preq (one column, the decode GEMV) and _c2.._c8 (2..8 columns,
+// the small-S verify / draft projections). The C# side (CudaKernels.LaunchQuantizedGemvMmq /
+// LaunchQuantizedGemvMmvqRows4Multi) picks the instantiation by column count.
+#define ROWS4_PARAMS \
+    const uint8_t* __restrict__ weight, const int8_t* __restrict__ xq_in, const half* __restrict__ dx_in, \
+    const half* __restrict__ sx2_in, half* __restrict__ y, const int n, const int k
+#define ROWS4_ENTRY_C(QT, NC) \
+    extern "C" __global__ void __launch_bounds__(128) quantized_gemv_##QT##_mmvq_rows4_preq_c##NC(ROWS4_PARAMS) \
+    { rows4_##QT##_body<NC>(weight, xq_in, dx_in, sx2_in, y, n, k); }
+#define ROWS4_ENTRIES(QT) \
+    extern "C" __global__ void __launch_bounds__(128) quantized_gemv_##QT##_mmvq_rows4_preq(ROWS4_PARAMS) \
+    { rows4_##QT##_body<1>(weight, xq_in, dx_in, sx2_in, y, n, k); } \
+    ROWS4_ENTRY_C(QT, 2) ROWS4_ENTRY_C(QT, 3) ROWS4_ENTRY_C(QT, 4) ROWS4_ENTRY_C(QT, 5) \
+    ROWS4_ENTRY_C(QT, 6) ROWS4_ENTRY_C(QT, 7) ROWS4_ENTRY_C(QT, 8)
+
+ROWS4_ENTRIES(q4_k)
+ROWS4_ENTRIES(q5_k)
+ROWS4_ENTRIES(q6_k)
+ROWS4_ENTRIES(q2_k)
+ROWS4_ENTRIES(iq4_xs)
+ROWS4_ENTRIES(iq4_nl)

@@ -585,7 +585,7 @@ PRs #1103, #1122, #1125, #1126.
 | G8 | CUDA | Gemma F32 KV round-trip + activation scratch | `2·kvLen·kvStride·4` | open | #1134 |
 | G9 | CUDA | split-KV partials F32 | ≈0.8 MB | sign-off pending | #1144 |
 | G10 | CUDA | recurrent state F32 | O(1) per sequence | sign-off pending | #1144 |
-| GX1 | CUDA | prefill dequant → F16 scratch → cuBLAS | L1B 33.5 MB, 70B 470 MB + 2 B/weight traffic | hybrid PQ2_0 **fixed** (#1222: int8-mma W2A8 MMQ default on sm_80+); dense open | #1132 (hybrid PQ2_0), #1135 (dense) |
+| GX1 | CUDA | prefill dequant → F16 scratch → cuBLAS | L1B 33.5 MB, 70B 470 MB + 2 B/weight traffic | hybrid PQ2_0 **fixed** (#1222: int8-mma W2A8 MMQ default on sm_80+); dense 2..8-row projections (verify / draft / short prefill) over Q2_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ4_NL **fixed** (#1316/#1375: rows4 `_c2..c8` dp4a GEMVs read the blocks in place; `DOTLLM_CUDA_KQUANT_SMALL_S_MAX=0` restores the scratch); dense `seqLen > 8` open | #1132 (hybrid PQ2_0), #1135 (dense) |
 | GX2 | CUDA | LM head > 8 rows → whole-head F16 | B2 2.54 GB | **fixed on dev** (#1099, PR #1125): 2,425 → 170 MiB | — |
 | GX2b | CUDA | multi-row LM head for non-PQ2_0 heads: tiled F16 dequant | ≤ max(layer scratch, 64 MiB) per tile | open (bounded, admitted) | #1136 |
 | GX3 | CUDA | quantized-KV full-history F16 scratch | stride 1024 @32k: 128 MB | hybrid **fixed on dev** (#1094, PR #1103); dense `CudaQuantizedKvCache`/TurboQuant open | #1139 |

@@ -4353,6 +4353,15 @@ public sealed unsafe class CudaTransformerModel : IModel
                 // Q4_1 prefill (Flint, #1172): in-place GEMM over the blocks, no dequant scratch (rule 2).
                 _kernels.LaunchQuantizedGemmQ4_1F16(quantWeight, input, output, outputDim, inputDim, seqLen, s);
             }
+            else if (CanUseKQuantRows4Multi(quantWeight, qt, inputDim, seqLen))
+            {
+                // Small-S K-quant / IQ4 projection (#1316/#1375): the 2..8 verify / draft rows share one read of the
+                // quantized blocks through the rows4 _c{S} GEMV, with the activations pre-quantised to Q8_1 once per
+                // projection. Replaces the whole-matrix F16 dequant + HGEMM below for these types (rule 2).
+                _kernels.LaunchQuantizeXToQ8_1Batched(input, _state.KQuantMultiScratch, inputDim, seqLen, s);
+                _kernels.LaunchQuantizedGemvMmvqRows4Multi(quantWeight, qt, _state.KQuantMultiScratch,
+                    output, outputDim, inputDim, seqLen, s);
+            }
             else // Fallback: dequant into scratch, then cuBLAS HGEMM
             {
                 nint w = fp16Weight;
@@ -4422,6 +4431,20 @@ public sealed unsafe class CudaTransformerModel : IModel
             CudaGemm.GemvF16(_cublas.Handle, w, input, output, outputDim, inputDim, s);
         }
     }
+
+    /// <summary>
+    /// Whether a <paramref name="seqLen"/>-row projection over quantized <paramref name="qt"/> weights takes the rows4
+    /// multi-column GEMV (#1316/#1375): the policy range (<see cref="CudaSmallSGemvDispatch.CoversKQuant"/>), the
+    /// <c>_c{seqLen}</c> kernel loaded, <c>inputDim % 256 == 0</c> and within the pre-Q8_1 scratch capacity, and the batched
+    /// activation quantiser available. Everything else keeps the dequant + HGEMM prefill path.
+    /// </summary>
+    private bool CanUseKQuantRows4Multi(nint quantWeight, QuantizationType qt, int inputDim, int seqLen)
+        => quantWeight != 0
+           && CudaSmallSGemvDispatch.CoversKQuant(seqLen)
+           && _kernels.HasMmvqRows4Multi(qt, seqLen)
+           && _kernels.HasPreQ8_1 && _kernels.HasQuantizeXToQ8_1Batched
+           && (inputDim & 255) == 0 && inputDim <= _state.PreQ8_1ScratchK
+           && !CudaKernels.ForceDirectGemv;
 
     /// <summary>
     /// Applies the LoRA delta for one (layer, proj) site on device:
