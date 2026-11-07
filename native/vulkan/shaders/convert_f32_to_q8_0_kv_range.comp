@@ -1,0 +1,39 @@
+#version 450
+// F32 -> Q8_0 KV range convert (Flint Q8_0 KV cache, kv_load.glsl layout).
+//
+// One invocation per 32-element block: dst block = [float scale][32 x int8] (36 bytes = 9 words). scale = amax / 127, q = roundEven(x / scale)
+// (ggml's quantize_row_q8_0 rule with an F32 scale, so the stored bytes are driver independent and equal the C# reference quantiser the parity
+// tests use). An all-zero block stores scale 0 and zero quants.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufSrc { float src[]; };   // starts at element 0; nBlocks * 32 elements
+layout(set = 0, binding = 1, std430) writeonly buffer BufDst { uint  dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint dstBlockOffset;   // first destination block
+    uint nBlocks;
+} pc;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.nBlocks) return;
+    float v[32];
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; i++) {
+        v[i] = src[b * 32u + i];
+        amax = max(amax, abs(v[i]));
+    }
+    float d = amax / 127.0;
+    float id = d != 0.0 ? 1.0 / d : 0.0;
+    uint o = (pc.dstBlockOffset + b) * 9u;
+    dst[o] = floatBitsToUint(d);
+    for (uint w = 0u; w < 8u; w++) {
+        uint packed = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            int q = clamp(int(roundEven(v[w * 4u + j] * id)), -127, 127);
+            packed |= (uint(q) & 0xFFu) << (8u * j);
+        }
+        dst[o + 1u + w] = packed;
+    }
+}
