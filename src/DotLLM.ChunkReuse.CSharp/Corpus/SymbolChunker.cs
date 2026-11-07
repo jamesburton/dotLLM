@@ -97,13 +97,30 @@ public sealed partial class SymbolChunker : IChunker
             _warning($"{file.Path}: bracket nesting {depth} exceeds {RoslynParsing.MaxNestingDepth}; not parsed, chunked by lines.");
             return new Splitter(this, file.Path, text, root: null).Run();
         }
-        // Parse and split on a large-stack thread: Roslyn recurses per nesting level (see RoslynParsing).
-        return RoslynParsing.RunWithLargeStack(() =>
+        if (RoslynParsing.TooLarge(text, out int length))
         {
-            CompilationUnitSyntax root = CSharpSyntaxTree.ParseText(text, ParseOptions, file.Path).GetCompilationUnitRoot();
-            return new Splitter(this, file.Path, text, root).Run();
-        });
+            _warning($"{file.Path}: {length} characters exceeds {RoslynParsing.MaxFileChars}; not parsed, chunked by lines.");
+            return new Splitter(this, file.Path, text, root: null).Run();
+        }
+        // Parse and split on a large-stack thread: Roslyn recurses per nesting level (see RoslynParsing). A parse that overruns the
+        // file budget is cancelled and the file is chunked by lines like a too-deep one.
+        try
+        {
+            return RoslynParsing.RunWithLargeStack(ct =>
+            {
+                CompilationUnitSyntax root = CSharpSyntaxTree.ParseText(text, ParseOptions, file.Path, cancellationToken: ct).GetCompilationUnitRoot(ct);
+                return new Splitter(this, file.Path, text, root).Run();
+            }, FileBudget);
+        }
+        catch (TimeoutException ex)
+        {
+            _warning($"{file.Path}: {ex.Message} Not parsed, chunked by lines.");
+            return new Splitter(this, file.Path, text, root: null).Run();
+        }
     }
+
+    /// <summary>Time one file may take to parse before it is chunked by lines (see <see cref="RoslynParsing.DefaultFileBudget"/>).</summary>
+    internal TimeSpan FileBudget { get; init; } = RoslynParsing.DefaultFileBudget;
 
     /// <summary>Splits one file; a null <paramref name="root"/> (a file too deep to parse) packs whole lines, then token slices.</summary>
     private sealed class Splitter(SymbolChunker owner, string path, string text, CompilationUnitSyntax? root)

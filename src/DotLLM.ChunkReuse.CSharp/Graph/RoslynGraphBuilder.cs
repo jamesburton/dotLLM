@@ -139,13 +139,20 @@ public sealed class RoslynGraphBuilder
                     continue;
                 }
                 var fileRaw = new List<(Location, Location, SymbolEdgeKind)>();
+                // One file's binding may take minutes on a hostile shape: cancel it at the budget (Roslyn honours the token).
+                using var budget = new CancellationTokenSource(FileBudget);
                 try
                 {
-                    CollectFile(files[path].Compilation, tree, index, fileRaw);
+                    CollectFile(files[path].Compilation, tree, index, fileRaw, budget.Token);
                 }
                 catch (InsufficientExecutionStackException)
                 {
                     System.Diagnostics.Trace.TraceWarning($"{path}: too deeply nested for Roslyn to bind; no edges from this file.");
+                    continue;
+                }
+                catch (OperationCanceledException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"{path}: binding exceeded {FileBudget.TotalSeconds:F0} s; no edges from this file.");
                     continue;
                 }
                 raw.AddRange(fileRaw);
@@ -171,42 +178,46 @@ public sealed class RoslynGraphBuilder
         return graph;
     }
 
+    /// <summary>Time one file may take to bind before it contributes no edge (see <see cref="RoslynParsing.DefaultFileBudget"/>).</summary>
+    internal TimeSpan FileBudget { get; init; } = RoslynParsing.DefaultFileBudget;
+
     private static void CollectFile(Compilation compilation, SyntaxTree tree, ChunkIndex index,
-        List<(Location, Location, SymbolEdgeKind)> raw)
+        List<(Location, Location, SymbolEdgeKind)> raw, CancellationToken ct)
     {
         SemanticModel model = compilation.GetSemanticModel(tree);
         SyntaxNode root = tree.GetRoot();
         foreach (SyntaxNode node in root.DescendantNodes())
         {
+            ct.ThrowIfCancellationRequested();
             switch (node)
             {
                 case UsingDirectiveSyntax u:
-                    AddImport(model, u, index, raw);
+                    AddImport(model, u, index, raw, ct);
                     break;
                 case SimpleNameSyntax name when !name.Ancestors().Any(a => a is UsingDirectiveSyntax):
-                    AddReference(model, name, index, raw);
+                    AddReference(model, name, index, raw, ct);
                     break;
                 case MemberDeclarationSyntax decl:
-                    AddDefinition(model, decl, index, raw);
+                    AddDefinition(model, decl, index, raw, ct);
                     break;
             }
         }
     }
 
-    private static void AddImport(SemanticModel model, UsingDirectiveSyntax u, ChunkIndex index, List<(Location, Location, SymbolEdgeKind)> raw)
+    private static void AddImport(SemanticModel model, UsingDirectiveSyntax u, ChunkIndex index, List<(Location, Location, SymbolEdgeKind)> raw, CancellationToken ct)
     {
         if (u.NamespaceOrType is not { } target) return;
-        ISymbol? symbol = model.GetSymbolInfo(target).Symbol;
+        ISymbol? symbol = model.GetSymbolInfo(target, ct).Symbol;
         if (symbol is IAliasSymbol alias) symbol = alias.Target;
         if (symbol is not (INamespaceSymbol or INamedTypeSymbol)) return;
         Location? first = index.Ordered(Declarations(symbol)).FirstOrDefault();
         if (first is not null) raw.Add((target.GetLocation(), first, SymbolEdgeKind.Import));
     }
 
-    private static void AddReference(SemanticModel model, SimpleNameSyntax name, ChunkIndex index, List<(Location, Location, SymbolEdgeKind)> raw)
+    private static void AddReference(SemanticModel model, SimpleNameSyntax name, ChunkIndex index, List<(Location, Location, SymbolEdgeKind)> raw, CancellationToken ct)
     {
         if (name is IdentifierNameSyntax { IsVar: true }) return;
-        ISymbol? symbol = model.GetSymbolInfo(name).Symbol;
+        ISymbol? symbol = model.GetSymbolInfo(name, ct).Symbol;
         if (symbol is IAliasSymbol alias) symbol = alias.Target;
         if (symbol is null) return;
         Location use = name.Identifier.GetLocation();
@@ -229,15 +240,15 @@ public sealed class RoslynGraphBuilder
 
         // A created type's name also calls its constructor when that is declared in source.
         if (symbol is INamedTypeSymbol && CreationOf(name) is { } creation
-            && model.GetSymbolInfo(creation).Symbol is IMethodSymbol { MethodKind: MethodKind.Constructor } ctor)
+            && model.GetSymbolInfo(creation, ct).Symbol is IMethodSymbol { MethodKind: MethodKind.Constructor } ctor)
             AddTo(raw, index, use, Declarations(ctor), SymbolEdgeKind.Call);
     }
 
     private static void AddDefinition(SemanticModel model, MemberDeclarationSyntax decl, ChunkIndex index,
-        List<(Location, Location, SymbolEdgeKind)> raw)
+        List<(Location, Location, SymbolEdgeKind)> raw, CancellationToken ct)
     {
         if (decl is not (BaseTypeDeclarationSyntax or MethodDeclarationSyntax or PropertyDeclarationSyntax)) return;
-        if (model.GetDeclaredSymbol(decl) is not { } symbol) return;
+        if (model.GetDeclaredSymbol(decl, ct) is not { } symbol) return;
         SyntaxToken id = decl switch
         {
             BaseTypeDeclarationSyntax t => t.Identifier,
