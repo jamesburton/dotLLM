@@ -218,8 +218,10 @@ public sealed class VulkanMatMulQ5_1FastKernelTests(ITestOutputHelper output)
                 double acc = 0, minTerm = 0, highTerm = 0;
                 for (int blk = 0; blk < k / 32; blk++)
                 {
-                    double dx = (double)(Half)xds[(t * (k / 32) + blk) * 2];
-                    double sx = (double)(Half)xds[(t * (k / 32) + blk) * 2 + 1];
+                    // The MMQs round (d_x, s_x) to fp16 at staging (block_q8_1, the CPU / llama.cpp contract); the MMVQ, like the Q4_0 / Q4_1
+                    // MMVQs it is generated with, multiplies by the quantizer's F32 pair.
+                    double dx = kind == "mmvq" ? xds[(t * (k / 32) + blk) * 2] : (double)(Half)xds[(t * (k / 32) + blk) * 2];
+                    double sx = kind == "mmvq" ? xds[(t * (k / 32) + blk) * 2 + 1] : (double)(Half)xds[(t * (k / 32) + blk) * 2 + 1];
                     int o = (int)(r * rowBytes + blk * BlockBytes);
                     uint qh = BitConverter.ToUInt32(wq, o + 4);
                     int dot = 0, dotHigh = 0;
@@ -247,7 +249,9 @@ public sealed class VulkanMatMulQ5_1FastKernelTests(ITestOutputHelper output)
         output.WriteLine($"q5_1 {kind} {tag} n={n} m={m} k={k}: max|ref-gpu|={worst:E3} max|cpu-gpu|={worstCpu:E3} (rel {worstCpu / scale:E2}) max|ref|={scale:E3} "
             + $"no-min gap={noMinGap:E3} no-5th-bit gap={noHighGap:E3}");
         Assert.True(worst <= 2e-5 * scale + 1e-5, $"max |ref - gpu| = {worst:E3} against max |ref| {scale:E3}");
-        Assert.True(worstCpu <= 2e-5 * scale + 1e-5, $"max |cpu - gpu| = {worstCpu:E3} against max |ref| {scale:E3}");
+        // MMVQ vs CPU differs by the fp16 rounding of (d_x, s_x) on the CPU side: ~2^-11 of the min-term sum (observed 3.3e-3 rel on the
+        // real GLM tensor whose min terms are ~30x the result); the MMQs share the CPU's rounding and match it to 1e-5.
+        Assert.True(worstCpu <= (kind == "mmvq" ? 1e-2 : 2e-5) * scale + 1e-5, $"max |cpu - gpu| = {worstCpu:E3} against max |ref| {scale:E3}");
         Assert.True(noMinGap > 0.05 * scale, $"the min term is too small to be checked here ({noMinGap:E3})");
         Assert.True(noHighGap > 0.05 * scale, $"the 5th-bit term is too small to be checked here ({noHighGap:E3})");
     }
