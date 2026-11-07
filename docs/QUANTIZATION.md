@@ -347,12 +347,12 @@ architecture's loader will route to it:
 | `VulkanWeights` (dense) | — (the table above) |
 | `VulkanNemotronHWeights` | I2_S, PQ2_0 (Q5_0 stays packed since #568). nemotron_h_moe routed expert banks: Q8_0 and Q5_1 as stored, Q5_0 repacked to Q5_1; any other expert quant is refused with a `NotSupportedException` (#402, #407) |
 | `VulkanMamba3Weights` | Q5_0, I2_S, PQ2_0 |
-| `VulkanQwen3MoeHybridWeights` | Q5_0, Q2_K, Q3_K, IQ4_NL, IQ4_XS, IQ1_S, I2_S |
-| `VulkanQwen3HybridDenseWeights` | everything but PQ2_0 (it handles only the packed token embed) |
+| `VulkanQwen3MoeHybridWeights` | I2_S, NVFP4 only. Q2_K / Q3_K / IQ4_NL / IQ4_XS / IQ1_S packed since #627; Q4_0 / Q4_1 / Q5_0 / Q5_1 since #921 (`DOTLLM_VK_HYBRID_LEGACY_PACKED=0` restores the F32 widening for A/B; Q4_0 also honours `DOTLLM_VK_Q4_0_NATIVE=0`) |
+| `VulkanQwen3HybridDenseWeights` | same as `VulkanQwen3MoeHybridWeights` (it uploads through that class's `UploadProjectionMatrix`; its own code handles only the packed token embed). Both hybrid hosts' `RecordMatmul` carry an arm per kept format — `VulkanHybridKeepPackedDispatchTests` fails the build of a keep arm without its dispatch arms |
 
-Widening a hybrid loader is mechanical — add the missing `Keep*OnDevice` arms — but it is a code
-change, not a documentation one, so check the loader for the architecture you are running before
-assuming a format stays packed.
+Widening a hybrid loader is mechanical — add the missing `Keep*OnDevice` arms AND the `RecordMatmul`
+arm in both hybrid hosts (the loader is shared) — but it is a code change, not a documentation one,
+so check the loader for the architecture you are running before assuming a format stays packed.
 
 Q5_1 is also supported as a routed-MoE `down` bank (`moe_indexed_matmul_q5_1_{f32,mmvq}.comp`), and Q5_0 `down` banks are repacked
 bit-exactly to Q5_1 at upload. The dense Q5_1 kernels (#1600) are the plain F32-in pair (decode GEMV, 16x16-tiled prefill GEMM): they exist so a
