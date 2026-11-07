@@ -3878,7 +3878,11 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// their extra ops (Granite residual / attention / logit scalars) and Gemma residual stream overflows FP16.
     /// </summary>
     internal static bool UsesF32DenseForward(ModelConfig config)
-        => IsGemmaDenseFamily(config) || config.Architecture is Architecture.Granite or Architecture.Olmo2
+        => IsGemmaDenseFamily(config)
+           // Dense Granite whose only scalar is the attention multiplier (TwIL-8B / Granite-4.2: embedding, residual and
+           // logit scalars are 1) runs the generic FP16 loop with the score scale folded into RoPE (CudaWeights).
+           || (config.Architecture == Architecture.Granite && !config.GraniteScalarsFoldIntoRope)
+           || config.Architecture == Architecture.Olmo2
            // SmolLM3 NoPE layers (skipped RoPE) are only implemented in this forward.
            || config.Architecture == Architecture.SmolLM3;
 
