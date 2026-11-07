@@ -3801,7 +3801,11 @@ __device__ __constant__ uint32_t kvalues_iq4nl_mmq_words[4] = {
 __device__ __forceinline__ int iq4nl_lut4(const uint32_t codes, const uint32_t t0, const uint32_t t1,
                                           const uint32_t t2, const uint32_t t3)
 {
-    const uint32_t sel = codes & 0x07070707u;
+    // prmt selectors are four contiguous nibbles (bits 3:0 pick result byte 0, 7:4 byte 1, ...), so pack the low
+    // three bits of each code byte: t = b0|b1<<4 in byte 0 and b2|b3<<4 in byte 2, then gather bytes 0 and 2.
+    const uint32_t b3 = codes & 0x07070707u;
+    const uint32_t t = b3 | (b3 >> 4);
+    const uint32_t sel = __byte_perm(t, 0u, 0x4420u);
     const uint32_t lo = __byte_perm(t0, t1, sel);           // entries 0..7
     const uint32_t hi = __byte_perm(t2, t3, sel);           // entries 8..15
     const uint32_t m = ((codes >> 3) & 0x01010101u) * 0xFFu; // 0xFF where bit 3 of the code is set
