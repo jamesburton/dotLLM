@@ -305,6 +305,23 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     private MatMulQ3KGemmCoopmatKernel? _matmulQ3KGemmCoopmat;
     // Same for IQ4_XS (issue #600).
     private MatMulIq4XsGemmCoopmatKernel? _matmulIq4XsGemmCoopmat;
+    // Native dense IQ1_S / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S coopmat GEMMs (#1677): decode in the tile load, no F16 scratch (VX4).
+    // Null off wave64 / coopmat devices or under DOTLLM_VULKAN_DISABLE_IQ_COOPMAT=1, in which case prefill falls back to _iqF16Prefill.
+    private MatMulIqGemmCoopmatKernel? _matmulIq1SCoopmat, _matmulIq2XsCoopmat, _matmulIq2SCoopmat, _matmulIq3XxsCoopmat, _matmulIq3SCoopmat;
+
+    /// <summary>The native coopmat prefill GEMM for <paramref name="qt"/> (#1677), or null when that format has none on this device.</summary>
+    private MatMulIqGemmCoopmatKernel? NativeIqCoopmat(QuantType qt) => qt switch
+    {
+        QuantType.IQ1_S => _matmulIq1SCoopmat,
+        QuantType.IQ2_XS => _matmulIq2XsCoopmat,
+        QuantType.IQ2_S => _matmulIq2SCoopmat,
+        QuantType.IQ3_XXS => _matmulIq3XxsCoopmat,
+        QuantType.IQ3_S => _matmulIq3SCoopmat,
+        _ => null,
+    };
+
+    /// <summary>Bytes of the IQ F16 prefill scratch allocated so far (#621); 0 when every IQ prefill ran natively (#1677). Read by tests.</summary>
+    internal long F16PrefillScratchBytes => _iqF16Prefill?.ScratchBytes ?? 0;
     private readonly MatMulQ6KMmqKernel? _matmulQ6KMmq;
     // Small-row (2..4 rows: speculative verify / scheduler batched decode) multi-column GEMVs (#996). Weights read once for N activation rows,
     // per-column accumulation order == the 1-row coalesced GEMV, instead of the MMQ / tiled GEMM tuned for prefill. Null when the SPIR-V or the
@@ -2694,6 +2711,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         if (Environment.GetEnvironmentVariable(DisableIq4XsCoopmatEnvVar) != "1"
             && MatMulIq4XsGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulIq4XsGemmCoopmat = MatMulIq4XsGemmCoopmatKernel.Create(device, spvDir);
+        // #1677: native dense IQ prefill GEMMs on the shared codebooks (TryCreate gates on coopmat + wave64 + the SPIR-V + the env opt-out).
+        if (MatMulIqGemmCoopmatKernel.IsSupportedOn(device, spvDir, QuantType.IQ1_S))
+            model._matmulIq1SCoopmat = MatMulIqGemmCoopmatKernel.TryCreate(device, spvDir, QuantType.IQ1_S, iq1: model._moeIq1Codebooks ??= Iq1Codebooks.Create(device));
+        model._matmulIq2XsCoopmat = MatMulIqGemmCoopmatKernel.TryCreate(device, spvDir, QuantType.IQ2_XS, iq2: model._iq2Codebooks);
+        model._matmulIq2SCoopmat = MatMulIqGemmCoopmatKernel.TryCreate(device, spvDir, QuantType.IQ2_S, iq2: model._iq2Codebooks);
+        model._matmulIq3XxsCoopmat = MatMulIqGemmCoopmatKernel.TryCreate(device, spvDir, QuantType.IQ3_XXS, iq3: model._iq3Codebooks);
+        model._matmulIq3SCoopmat = MatMulIqGemmCoopmatKernel.TryCreate(device, spvDir, QuantType.IQ3_S, iq3: model._iq3Codebooks);
         if (hasMoe && config.Gemma4DualFfn && Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED") != "0"
             && MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q4_K)
             && device.SubgroupSize == 64
@@ -5694,6 +5718,11 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ5_1GemmF32?.InvalidateDescriptorCache();
         _matmulQ3KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulIq4XsGemmCoopmat?.InvalidateDescriptorCache();
+        _matmulIq1SCoopmat?.InvalidateDescriptorCache();
+        _matmulIq2XsCoopmat?.InvalidateDescriptorCache();
+        _matmulIq2SCoopmat?.InvalidateDescriptorCache();
+        _matmulIq3XxsCoopmat?.InvalidateDescriptorCache();
+        _matmulIq3SCoopmat?.InvalidateDescriptorCache();
         _matmulQ6KMmq?.InvalidateDescriptorCache();
         _smallRowQ6K?.InvalidateDescriptorCache();
         _smallRowQ6KR2?.InvalidateDescriptorCache();
@@ -8917,6 +8946,16 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         if (seqLen > 1 && TryRecordSmallRowGemv(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen))
             return;
 
+        // #1677: dense IQ1_S / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S prefill decodes the sub-blocks inside the coopmat tile load: no F16 copy of
+        // the weight exists (PRECISION.md VX4). Any seqLen > 1 (the alternatives are the F16 scratch at >= 32 tokens and the scalar F32 GEMM
+        // below it); the 2..16-row multi-column GEMVs above keep precedence.
+        if (seqLen > 1 && (inputDim % MatMulIqGemmCoopmatKernel.GroupSize) == 0 && NativeIqCoopmat(weightQt) is { } iqCoopmat)
+        {
+            iqCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+            ProfNote("iq_coopmat", outputDim, inputDim, seqLen);
+            return;
+        }
+
         // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
         if (seqLen > 1 && _iqF16Prefill is not null
             && _iqF16Prefill.TryRecord(cmdBuf, weightQt, weights, input, output, outputDim, inputDim, seqLen))
@@ -10028,6 +10067,11 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ5_1GemmF32?.Dispose();
         _matmulQ3KGemmCoopmat?.Dispose();
         _matmulIq4XsGemmCoopmat?.Dispose();
+        _matmulIq1SCoopmat?.Dispose();
+        _matmulIq2XsCoopmat?.Dispose();
+        _matmulIq2SCoopmat?.Dispose();
+        _matmulIq3XxsCoopmat?.Dispose();
+        _matmulIq3SCoopmat?.Dispose();
         _matmulQ6KMmq?.Dispose();
         _smallRowQ6K?.Dispose();
         _smallRowQ6KR2?.Dispose();
