@@ -49,13 +49,15 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
     /// <see cref="QuantizationType.Q4_1"/> (20 B blocks, issue #1171: same kernel shape, value <c>d * nibble + m</c>).</summary>
     public QuantizationType Quant { get; private init; } = QuantizationType.Q4_0;
 
-    private int BlockBytes => Quant == QuantizationType.Q4_1 ? QuantFormat.Q4_1BlockBytes : QuantFormat.Q4_0BlockBytes;
+    private int BlockBytes => Quant switch { QuantizationType.Q4_1 => QuantFormat.Q4_1BlockBytes, QuantizationType.Q5_1 => QuantFormat.Q5_1BlockBytes, _ => QuantFormat.Q4_0BlockBytes };
 
+    // Q5_1 (#1613): matmul_q5_1_mmvq_v2[_residual] from the same generator (24-byte blocks, 5-bit codes, value d * code + m).
     private static string ShaderFor(string q4_0Name, QuantizationType quant) => quant switch
     {
         QuantizationType.Q4_0 => q4_0Name,
         QuantizationType.Q4_1 => q4_0Name.Replace("q4_0", "q4_1", StringComparison.Ordinal),
-        _ => throw new ArgumentOutOfRangeException(nameof(quant), quant, "Only Q4_0 and Q4_1 are served by this kernel."),
+        QuantizationType.Q5_1 => q4_0Name.Replace("q4_0", "q5_1", StringComparison.Ordinal),
+        _ => throw new ArgumentOutOfRangeException(nameof(quant), quant, "Only Q4_0, Q4_1 and Q5_1 are served by this kernel."),
     };
 
     private MatMulQ4_0MmvqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
@@ -79,7 +81,7 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
         if (!device.HasIntegerDotProduct)
             return null;
 
-        bool wantV2 = quant == QuantizationType.Q4_1 || (v2 ?? V2Default);
+        bool wantV2 = quant is QuantizationType.Q4_1 or QuantizationType.Q5_1 || (v2 ?? V2Default);
         string path = Path.Combine(spvDir, ShaderFor(wantV2 ? "matmul_q4_0_mmvq_v2.spv" : "matmul_q4_0_mmvq.spv", quant));
         if (!File.Exists(path))
             return null;

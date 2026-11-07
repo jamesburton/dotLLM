@@ -1,0 +1,83 @@
+#version 450
+// Q5_1 batched GEMM on the shared 128x128 blocked coopmat template (issue #1613; template: matmul_q4_1_f32_gemm_coopmat_128x128x4.comp).
+//
+//   C[N, M] = B[N, K] @ W_q5_1[M, K]^T,  W dequantised on the fly.
+//
+// Weight layout (block_q5_1): 24-byte blocks of 32 elements -- fp16 scale `d` at [0..1], fp16 min `m` at [2..3], uint32 `qh` (the 5th
+// bit of every element) at [4..7], qs[16] at [8..23], two nibbles per byte:
+//   element j      (0..15) = (qs[j] & 0xF) | ((qh >>  j      ) & 1) << 4
+//   element j + 16 (0..15) = (qs[j] >> 4)  | ((qh >> (j + 16)) & 1) << 4
+//   value = d * code + m
+// A BK=32 K-chunk is exactly one block; with two lanes per weight row lane 0 stages the low nibbles (columns 0..15) and lane 1 the high
+// nibbles (columns 16..31) of the SAME 16 qs bytes. 24-byte blocks are word aligned: six raw words are exactly the block.
+//
+// PRECISION: d * code + m is folded into the F16 A operand, ~2^-11 relative error -- inherent to F16 operands.
+
+#define BM  128
+#define BN  128
+#define WM  64
+#define WN  64
+#define NSG 4
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // Q5_1 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { vec4 b4[]; };      // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim (number of weight rows)
+    uint K;             // contraction dim (must be a multiple of 32)
+    uint N;             // batch size (number of input rows)
+    uint blocksPerRow;  // = K / 32
+    uint rowUints;      // per-row uint stride
+} pc;
+
+#include "gemm_coopmat_blocked_decl.glsl"
+
+const uint BLOCK_BYTES = 24u;   // 2 (fp16 d) + 2 (fp16 m) + 4 (qh) + 16 (qs)
+
+const uint A_LANES_PER_ROW = BLOCK_SIZE / BM;        // 2 threads cooperate on one weight row
+const uint A_COLS_PER_THR  = BK / A_LANES_PER_ROW;   // 16 codes per thread
+
+void gemmStageA(uint ch) {
+    uint rowLocal  = g_tid / A_LANES_PER_ROW;
+    uint laneOfRow = g_tid % A_LANES_PER_ROW;
+    uint mGlobal   = g_mBase + rowLocal;
+    uint sBase     = rowLocal * STRIDE + laneOfRow * A_COLS_PER_THR;
+
+    if (mGlobal >= pc.M) {
+        for (uint j = 0u; j < A_COLS_PER_THR; j++) sharedA[sBase + j] = float16_t(0.0);
+        return;
+    }
+
+    uint blockBase = mGlobal * (pc.blocksPerRow * BLOCK_BYTES) + ch * BLOCK_BYTES;
+    uint wi = blockBase >> 2u;
+    vec2 dm = unpackHalf2x16(weight[wi]);
+    uint qh = weight[wi + 1u];
+    uint qs[4];
+    [[unroll]] for (uint m = 0u; m < 4u; m++) qs[m] = weight[wi + 2u + m];
+
+    uint qhSh = laneOfRow * 16u;
+    uint nibSh = laneOfRow * 4u;
+    [[unroll]] for (uint m = 0u; m < 4u; m++) {
+        [[unroll]] for (uint jb = 0u; jb < 4u; jb++) {
+            uint j = m * 4u + jb;
+            uint nib = (qs[m] >> (jb * 8u + nibSh)) & 0xFu;
+            uint h5 = (qh >> (j + qhSh)) & 1u;
+            sharedA[sBase + j] = float16_t(dm.x * float(nib | (h5 << 4u)) + dm.y);
+        }
+    }
+}
+
+#define GEMM_M          pc.M
+#define GEMM_K          pc.K
+#define GEMM_CHUNKS     pc.blocksPerRow
+#define GEMM_ROW_BASE   0u
+#define GEMM_ROW_LIMIT  pc.N
+#define GEMM_B_BUF      b4
+#define GEMM_B_VEC4
+#define GEMM_C_BUF      c
+
+#include "gemm_coopmat_blocked_main.glsl"

@@ -1,0 +1,6 @@
+#version 450
+// Q5_1 weights x Q8_1 activations on int8 cooperative matrices (issue #1613); see mmq_cm1_main.glsl.
+// Default 64 x 64 x 4 tile (GLM-4.5-Air's shared-expert down: m = 4096, k = 1408, pp512).
+#extension GL_GOOGLE_include_directive : require
+#define MMQ_Q5_1 1
+#include "mmq_cm1_main.glsl"
