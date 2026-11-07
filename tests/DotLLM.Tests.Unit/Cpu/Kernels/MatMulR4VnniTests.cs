@@ -149,11 +149,11 @@ public sealed unsafe class MatMulR4VnniTests
     }
 
     /// <summary>
-    /// Pins the dispatch choice. <c>ComputeRowsQ8_0Interleaved</c> deliberately prefers the AVX2
-    /// kernel over the wider VNNI one, which measured 1.7-1.9x slower — so the selected tier must
-    /// be bit-identical to <c>VecDotQ8_0Avx2_4RowsR4</c>. A difference of even one ULP means the
-    /// dispatch changed, which given the measurements would be a performance regression rather
-    /// than a correctness one, and would otherwise go unnoticed.
+    /// Pins the dispatch choice. On the eight-row AVX-VNNI tier (#1119, <c>MatMul.Q8_0Rows8Tier</c>) the selected kernel is
+    /// bit-identical to the scalar dot, which the older kernels are not. Below that tier <c>ComputeRowsQ8_0Interleaved</c>
+    /// deliberately prefers the AVX2 kernel over the wider VNNI one, which measured 1.7-1.9x slower — so the selected tier must
+    /// be bit-identical to <c>VecDotQ8_0Avx2_4RowsR4</c>. A difference of even one ULP means the dispatch changed, which given
+    /// the measurements would be a performance regression rather than a correctness one, and would otherwise go unnoticed.
     /// </summary>
     [Theory]
     [MemberData(nameof(DiscriminatingBlockCounts))]
@@ -170,7 +170,7 @@ public sealed unsafe class MatMulR4VnniTests
             QuantizeRandomInput(new Random(100), xQ8, k);
 
             float[] viaDispatch = new float[4];
-            float[] viaAvx2 = new float[4];
+            float[] expected = new float[4];
 
             using var rw = WeightRepacking.RepackR4((nint)weights, QuantizationType.Q8_0, 4, k);
 
@@ -178,11 +178,19 @@ public sealed unsafe class MatMulR4VnniTests
                 MatMul.ComputeRowsQ8_0Interleaved((byte*)rw.Ptr, xQ8, res,
                     rw.FullGroupCount, rw.TailRows, blockCount);
 
-            fixed (float* res = viaAvx2)
-                MatMul.VecDotQ8_0Avx2_4RowsR4((byte*)rw.Ptr, xQ8, blockCount, res);
+            if (MatMul.Q8_0Rows8Tier)
+            {
+                for (int r = 0; r < 4; r++)
+                    expected[r] = MatMul.VecDotQ8_0Scalar((byte*)rw.Ptr + (long)r * blockCount * Q8_0BlockBytes, xQ8, blockCount);
+            }
+            else
+            {
+                fixed (float* res = expected)
+                    MatMul.VecDotQ8_0Avx2_4RowsR4((byte*)rw.Ptr, xQ8, blockCount, res);
+            }
 
             for (int r = 0; r < 4; r++)
-                Assert.Equal(viaAvx2[r], viaDispatch[r]);
+                Assert.Equal(expected[r], viaDispatch[r]);
         }
         finally
         {
