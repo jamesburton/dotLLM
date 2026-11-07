@@ -1,0 +1,123 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_EXT_control_flow_attributes    : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED IQ3_XXS MMVQ decode GEMV, V2 (issue #1678; V1 = moe_indexed_matmul_iq3_xxs_mmvq.comp, issue #823). Same integer dp4a math as V1
+// (sign * iq3xxs grid int8 x Q8_1 activation, db = d * (0.5 + (aux32 >> 28)) * 0.5 per 32-element sub-block), restructured like the IQ2_XXS V2
+// shader (#991): a lane owns a whole 32-element sub-block (all four 8-element pairs) of one of FOUR blocks per step, so the wave issues ~4x fewer
+// load instructions per weight byte than V1 (lane = (sub-block, pair)). The ksigns byte is index | (parity(index) << 7) by construction, so the
+// sign is applied as a multiply-and-mask over the packed grid word (grid magnitudes 4..62: no inter-byte borrow) and the ksigns table is not
+// read. The float accumulation order over a row differs from V1.
+//
+//   y[n, m] = sum_k dequant_iq3_xxs(bank[indices[n], m, k]) * x[n, k]
+//
+// IQ3_XXS super-block (98 bytes / 256 elements, 2-byte aligned):
+//   [0,1] fp16 d | [2..65] qs[64] (8-bit grid indices: g1, g2 per pair, 4 pairs per sub-block) | [66..97] aux32[8] (per sub-block: bits 0..27 =
+//   four 7-bit ksigns indices, bits 28..31 = scale).
+// NOT bit-exact vs a float-in reference (x is int8-quantized). Dispatch: 2D grid - x = m, y = n. Bindings: 0 bank, 1 xq (uvec4 view), 2 xds,
+// 3 indices, 4 y, 5 iq3xxs grid (256 x 4 int8 magnitudes, one uint each), 6 ksigns (unused).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };      // IQ3_XXS blob [numExperts, M, K/256 x 98 B]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uvec4 xq4[]; };       // [xRows * K/16]
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };       // [xRows * K/32]
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };   // [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };         // [N * M]
+layout(set = 0, binding = 5, std430) readonly  buffer BufGrid { uint  grid[]; };      // iq3xxs grid: 256 x 4 bytes
+// binding 6 (ksigns) is part of the pipeline layout but unused here.
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow;  // K / 256
+    uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
+} pc;
+
+const uint BLOCK_BYTES = 98u;
+
+uint load16(uint p) { return (bank[p >> 2u] >> ((p & 2u) << 3u)) & 0xFFFFu; }   // 2-byte aligned
+
+// 4 bytes at a 2-byte-aligned offset. When p % 4 == 2 the second word extends 2 bytes past the span: for aux32[7] (bytes 94..97, the block's
+// last) that is the next block's first bytes or, in the very last block of a bank, 2 bytes past it. Bank allocations are word-granular and the
+// extra bytes are discarded by the shift (same contract as the IQ2_XXS / IQ2_XS V2 load8).
+uint load32(uint p) {
+    uint pw = p >> 2u;
+    uint w0 = bank[pw];
+    if ((p & 2u) != 0u) return (w0 >> 16u) | (bank[pw + 1u] << 16u);
+    return w0;
+}
+
+// 8 bytes (a0, a1) at a 2-byte-aligned offset; the qs of sub-block 7 end at byte 65 and the block continues, so the span never leaves the block.
+void load8(uint p, out uint a0, out uint a1) {
+    uint pw = p >> 2u;
+    uint w0 = bank[pw];
+    uint w1 = bank[pw + 1u];
+    if ((p & 2u) != 0u) {
+        uint w2 = bank[pw + 2u];
+        a0 = (w0 >> 16u) | (w1 << 16u);
+        a1 = (w1 >> 16u) | (w2 << 16u);
+    } else {
+        a0 = w0;
+        a1 = w1;
+    }
+}
+
+// Negate grid byte j where sign bit j (of the 4-bit `s4`) is set: byte-wise two's complement via XOR 0xFF + 1 (magnitudes >= 4: no borrow).
+uint signed4(uint g, uint s4) {
+    uint msk = (s4 * 0x00204081u) & 0x01010101u;
+    return (g ^ (msk * 0xFFu)) + msk;
+}
+
+uint signByte(uint idx7) { return idx7 | ((bitCount(idx7) & 1u) << 7u); }
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint bq = lane >> 3u;                 // block within a 4-block step
+    uint ib = lane & 7u;                  // sub-block 0..7 (32 elements = 4 pairs of 8)
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * BLOCK_BYTES;
+    uint xRow        = n / pc.xDiv;
+    uint xq4RowBase  = xRow * (pc.K >> 4u);
+    uint xdsRowBase  = xRow * (pc.K >> 5u);
+    float acc = 0.0;
+
+    for (uint chunk = 0u; chunk < pc.blocksPerRow; chunk += 16u) {
+        [[unroll]] for (uint s = 0u; s < 4u; s++) {
+            uint blkRaw = chunk + s * 4u + bq;
+            if (blkRaw >= pc.blocksPerRow) continue;
+            uint base = rowByteBase + blkRaw * BLOCK_BYTES;
+            uint xi = xq4RowBase + blkRaw * 16u + ib * 2u;
+            uvec4 xa = xq4[xi], xb = xq4[xi + 1u];
+            uint xv[8] = uint[8](xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
+            float dX = xds[xdsRowBase + blkRaw * 8u + ib].x;
+
+            float d = unpackHalf2x16(load16(base)).x;
+            uint a0, a1;
+            load8(base + 2u + 8u * ib, a0, a1);           // 4 pairs x (g1, g2)
+            uint aux = load32(base + 66u + 4u * ib);
+            float db = d * (0.5 + float(aux >> 28u)) * 0.5;
+
+            int dot = 0;
+            [[unroll]] for (uint l = 0u; l < 4u; l++) {
+                uint q2 = (((l < 2u) ? a0 : a1) >> (16u * (l & 1u))) & 0xFFFFu;
+                uint signs = signByte((aux >> (7u * l)) & 0x7Fu);
+                dot = dotPacked4x8AccSatEXT(int(signed4(grid[q2 & 0xFFu], signs & 0xFu)), int(xv[2u * l]), dot);
+                dot = dotPacked4x8AccSatEXT(int(signed4(grid[q2 >> 8u],   signs >> 4u)),  int(xv[2u * l + 1u]), dot);
+            }
+            acc += db * (dX * float(dot));
+        }
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[n * pc.M + m] = total;
+}

@@ -1,3 +1,5 @@
+using DotLLM.Core.Attention;
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Gguf;
@@ -132,6 +134,167 @@ public sealed class Glm4MoeVulkanRealFileTests
         Assert.True(model.Q5_1DenseDispatchCount > q51Before, "the packed Q5_1 shared-down kernels never ran");
         Assert.True(klChunk < 0.02, $"4-row chunk diverges from 1-row steps: KL {klChunk}");
         Assert.True(klWhole < 0.02, $"20-row prefill diverges from 1-row steps: KL {klWhole}");
+    }
+
+    private static float[] LastRow(ITensor t, int vocab)
+    {
+        float[] all = Copy(t);
+        return all.Length == vocab ? all : all.AsSpan(all.Length - vocab, vocab).ToArray();
+    }
+
+    private static int[] CorpusIds(GgufFile gguf, int need)
+    {
+        string corpus = Environment.GetEnvironmentVariable("DOTLLM_GLM4MOE_CORPUS")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotllm", "test-cache", "corpora", "wikitext-2-raw", "wiki.test.lf.raw");
+        Skip.If(!File.Exists(corpus), $"corpus not found: {corpus} (set DOTLLM_GLM4MOE_CORPUS)");
+        string text = File.ReadAllText(corpus);
+        var tk = DotLLM.Models.Gguf.GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int[] ids = tk.Encode(text.Substring(0, Math.Min(text.Length, need * 6)));
+        Assert.True(ids.Length >= need, $"corpus gave {ids.Length} tokens, need {need}");
+        return ids.AsSpan(0, need).ToArray();
+    }
+
+    private sealed record KlStats(double Mean, double Median, double Max, int Top1Agree, int Steps)
+    {
+        public static KlStats Of(IReadOnlyList<float[]> p, IReadOnlyList<float[]> q)
+        {
+            var kls = new double[p.Count];
+            int agree = 0;
+            for (int i = 0; i < p.Count; i++) { kls[i] = Kl(p[i], q[i]); if (Argmax(p[i]) == Argmax(q[i])) agree++; }
+            var sorted = kls.OrderBy(x => x).ToArray();
+            return new(kls.Average(), sorted[sorted.Length / 2], sorted[^1], agree, p.Count);
+        }
+        public override string ToString() => $"mean {Mean:E3} median {Median:E3} max {Max:E3} top1 {Top1Agree}/{Steps}";
+    }
+
+    /// <summary>
+    /// #1614: the fused single-token MoE decode chain on the real file. Teacher-forced decode steps after a 512- and a 2048-token wikitext prefix,
+    /// plus 48 greedy tokens at 512, with the chain ON and OFF in one model load (same kernels, different schedule: the two must agree far inside
+    /// the CPU-vs-Vulkan floor), then the dotLLM CPU engine on the same schedule in the same process after the Vulkan model is released.
+    /// Every 1-row step of every MoE layer must have taken the fused chain (counter asserted).
+    /// </summary>
+    [SkippableFact]
+    public void RealFile_FusedDecode_Kl_And_Greedy_Vs_Unfused_And_Cpu()
+    {
+        string? path = Environment.GetEnvironmentVariable("DOTLLM_GLM4MOE_GGUF");
+        Skip.If(string.IsNullOrEmpty(path) || !File.Exists(path), "DOTLLM_GLM4MOE_GGUF not set");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        const int ctxA = 512, ctxB = 2048, steps = 32, greedyLen = 48, chunk = 512;
+        int cpuStepsB = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_GLM4MOE_CPU_STEPS_2K"), out int s2) ? s2 : steps;
+
+        using var gguf = GgufFile.Open(path!);
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        int vocab = cfg.VocabSize;
+        int[] ids = CorpusIds(gguf, ctxB + steps + 1);
+        int moeLayers = cfg.NumLayers - (cfg.Moe?.MlpOnlyLayers?.Count ?? 0);
+
+        // ---- Vulkan: fused on / off, one load ----
+        var vk = new Dictionary<(bool fused, int ctx), List<float[]>>();
+        var greedy = new Dictionary<bool, int[]>();
+        var fusedLayerSteps = new Dictionary<bool, long>();
+        bool saved = VulkanTransformerModel.MoeDecodeFusedEnabled;
+        try
+        {
+            using var device = VulkanDevice.Create();
+            using var model = VulkanTransformerModel.LoadFromGguf(device, gguf, cfg, spvDir);
+            _out.WriteLine("post-load: " + device.MemorySnapshot());
+            foreach (bool fused in new[] { true, false })
+            {
+                VulkanTransformerModel.MoeDecodeFusedEnabled = fused;
+                long c0 = model.GenericMoeDecodeFusedCount;
+                foreach (int ctx in new[] { ctxA, ctxB })
+                {
+                    using var cache = model.CreateKvCache(ctxB + steps + greedyLen + 8);
+                    for (int at = 0; at < ctx; at += chunk) Step(model, cache, ids.AsSpan(at, Math.Min(chunk, ctx - at)), at);
+                    var rows = new List<float[]>();
+                    for (int i = 0; i < steps; i++)
+                    {
+                        int[] pos = [ctx + i];
+                        using ITensor t = model.Forward(ids.AsSpan(ctx + i, 1), pos, deviceId: -1, cache);
+                        rows.Add(LastRow(t, vocab));
+                    }
+                    vk[(fused, ctx)] = rows;
+                    if (ctx == ctxA)
+                    {
+                        var gen = new List<int>();
+                        int next = Argmax(rows[^1]);
+                        for (int i = 0; i < greedyLen; i++)
+                        {
+                            gen.Add(next);
+                            int[] pos = [ctx + steps + i];
+                            using ITensor t = model.Forward([next], pos, deviceId: -1, cache);
+                            next = Argmax(LastRow(t, vocab));
+                        }
+                        greedy[fused] = gen.ToArray();
+                    }
+                }
+                fusedLayerSteps[fused] = model.GenericMoeDecodeFusedCount - c0;
+            }
+        }
+        finally { VulkanTransformerModel.MoeDecodeFusedEnabled = saved; }
+        // Every one-row forward of every MoE layer took the fused chain in the ON arm ((2 * steps + greedyLen) forwards), none in the OFF arm.
+        _out.WriteLine($"fused layer-steps: on {fusedLayerSteps[true]} (expected {(long)moeLayers * (2 * steps + greedyLen)}), off {fusedLayerSteps[false]}");
+        Assert.Equal((long)moeLayers * (2 * steps + greedyLen), fusedLayerSteps[true]);
+        Assert.Equal(0L, fusedLayerSteps[false]);
+
+        var klVk512 = KlStats.Of(vk[(true, ctxA)], vk[(false, ctxA)]);
+        var klVk2k = KlStats.Of(vk[(true, ctxB)], vk[(false, ctxB)]);
+        int greedyAgree = greedy[true].Zip(greedy[false]).Count(p => p.First == p.Second);
+        int firstDiv = -1;
+        for (int i = 0; i < greedyLen; i++) if (greedy[true][i] != greedy[false][i]) { firstDiv = i; break; }
+        _out.WriteLine($"fused vs unfused: KL@512 {klVk512}; KL@2048 {klVk2k}; greedy identity {greedyAgree}/{greedyLen} (first divergence {(firstDiv < 0 ? "none" : firstDiv.ToString())})");
+
+        // ---- CPU reference (Vulkan model released above) ----
+        var cpu = new Dictionary<int, List<float[]>>();
+        int[] cpuGreedy = [];
+        {
+            using var model = DotLLM.Models.Architectures.TransformerModel.LoadFromGguf(gguf, cfg, ThreadingConfig.Auto);
+            foreach (int ctx in new[] { ctxA, ctxB })
+            {
+                int n = ctx == ctxA ? steps : cpuStepsB;
+                using var cache = new DotLLM.Engine.KvCache.SimpleKvCache(KvGeometry.FromConfig(cfg), ctxB + steps + greedyLen + 8);
+                for (int at = 0; at < ctx; at += chunk)
+                {
+                    int len = Math.Min(chunk, ctx - at);
+                    using ITensor t = model.Forward(ids.AsSpan(at, len), Enumerable.Range(at, len).ToArray(), deviceId: -1, cache, lastTokenLogitsOnly: true);
+                }
+                var rows = new List<float[]>();
+                for (int i = 0; i < n; i++)
+                {
+                    using ITensor t = model.Forward(ids.AsSpan(ctx + i, 1), [ctx + i], deviceId: -1, cache, lastTokenLogitsOnly: true);
+                    rows.Add(LastRow(t, vocab));
+                }
+                cpu[ctx] = rows;
+                if (ctx == ctxA)
+                {
+                    var gen = new List<int>();
+                    int next = Argmax(rows[^1]);
+                    for (int i = 0; i < greedyLen; i++)
+                    {
+                        gen.Add(next);
+                        using ITensor t = model.Forward([next], [ctx + steps + i], deviceId: -1, cache, lastTokenLogitsOnly: true);
+                        next = Argmax(LastRow(t, vocab));
+                    }
+                    cpuGreedy = gen.ToArray();
+                }
+            }
+        }
+        var fusedCpu512 = KlStats.Of(cpu[ctxA], vk[(true, ctxA)]);
+        var plainCpu512 = KlStats.Of(cpu[ctxA], vk[(false, ctxA)]);
+        var fusedCpu2k = KlStats.Of(cpu[ctxB], vk[(true, ctxB)].Take(cpuStepsB).ToList());
+        var plainCpu2k = KlStats.Of(cpu[ctxB], vk[(false, ctxB)].Take(cpuStepsB).ToList());
+        int gFusedCpu = greedy[true].Zip(cpuGreedy!).Count(p => p.First == p.Second), gPlainCpu = greedy[false].Zip(cpuGreedy!).Count(p => p.First == p.Second);
+        _out.WriteLine($"KL(cpu||fused)@512 {fusedCpu512}; KL(cpu||unfused)@512 {plainCpu512}");
+        _out.WriteLine($"KL(cpu||fused)@2048 {fusedCpu2k}; KL(cpu||unfused)@2048 {plainCpu2k}");
+        _out.WriteLine($"greedy identity vs CPU: fused {gFusedCpu}/{greedyLen}, unfused {gPlainCpu}/{greedyLen}");
+
+        // Gates. Fused vs unfused is a schedule change over the same kernels: it must sit far below the CPU-vs-Vulkan floor (S1/S2: ~0.03 mean).
+        Assert.True(klVk512.Mean < 1e-3 && klVk2k.Mean < 1e-3, $"fused vs unfused KL too large: {klVk512} / {klVk2k}");
+        Assert.True(klVk512.Top1Agree >= steps - 1 && klVk2k.Top1Agree >= steps - 1, "fused vs unfused argmax disagreement beyond one near-tie step");
+        Assert.True(greedyAgree >= greedyLen * 9 / 10, $"fused vs unfused greedy identity {greedyAgree}/{greedyLen}");
+        // Fused is no further from the CPU engine than the unfused chain is (both at the activation-precision floor).
+        Assert.True(fusedCpu512.Mean < plainCpu512.Mean + 0.01 && fusedCpu2k.Mean < plainCpu2k.Mean + 0.01, "fused chain drifted from the CPU engine beyond the unfused chain");
+        Assert.True(fusedCpu512.Mean < 0.1 && fusedCpu2k.Mean < 0.1, "fused chain vs CPU above the floor class");
     }
 
     private void DumpResidency(VulkanResidencyReport rep)

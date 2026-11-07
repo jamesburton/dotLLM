@@ -108,11 +108,13 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     private bool _disposed;
 
     /// <summary>
-    /// Formats that have a V2 shader (issue #991): same integer dp4a math as V1, but each lane owns a whole 32-element sub-block of one of four
-    /// blocks per step, so a wave issues ~5x fewer load instructions per weight byte (V1 was issue/latency bound at ~70-110 GB/s on gfx1151).
-    /// The float summation order over a row differs from V1 (rounding-level).
+    /// Formats that have a V2 shader (issue #991; #1678 added IQ3_S / IQ4_XS / IQ4_NL / IQ2_S / IQ3_XXS): same integer dp4a math as V1, but each
+    /// lane owns a whole 32-element sub-block of one of four blocks per step (IQ4_NL: a whole 32-element block, 32 consecutive blocks per wave),
+    /// so a wave issues ~4-5x fewer load instructions per weight byte (V1 was issue/latency bound at ~70-110 GB/s on gfx1151).
+    /// The float summation order over a row differs from V1 (rounding-level). Q2_0 keeps V1.
     /// </summary>
-    internal static bool HasV2(MoeIqQuant quant) => quant is MoeIqQuant.IQ1_M or MoeIqQuant.IQ2_XXS or MoeIqQuant.IQ2_XS or MoeIqQuant.Q4_0 or MoeIqQuant.Q4_1;
+    internal static bool HasV2(MoeIqQuant quant) => quant is MoeIqQuant.IQ1_M or MoeIqQuant.IQ2_XXS or MoeIqQuant.IQ2_XS or MoeIqQuant.Q4_0 or MoeIqQuant.Q4_1
+        or MoeIqQuant.IQ3_S or MoeIqQuant.IQ4_XS or MoeIqQuant.IQ4_NL or MoeIqQuant.IQ2_S or MoeIqQuant.IQ3_XXS;
 
     /// <summary>Default for new kernels; <c>DOTLLM_VK_MOE_IQ_V2=0</c> selects the V1 shaders (A/B and bisection).</summary>
     internal static bool V2Default { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_IQ_V2") != "0";

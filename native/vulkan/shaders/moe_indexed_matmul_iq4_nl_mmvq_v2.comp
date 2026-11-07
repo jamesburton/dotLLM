@@ -1,0 +1,108 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_EXT_control_flow_attributes    : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED IQ4_NL MMVQ decode GEMV, V2 (issue #1678; V1 = moe_indexed_matmul_iq4_nl_mmvq.comp, issue #823). Same integer dp4a math as V1
+// (codebook int8 x Q8_1 activation, w = d * kvalues[q], no min term), laid out like the Q4_0 V2 shader (#1018; IQ4_NL has the Q4_0 block with a
+// codebook instead of a linear decode): a lane owns a whole 32-element block (18 bytes = 5 aligned word loads), a wave covers 32 consecutive
+// blocks, U blocks per lane are in flight before any is consumed. V1 spent 4 lanes per block (~6 loads for 4 weight bytes per lane); this
+// issues 5 weight-word + 2 uvec4 activation + 1 scale load for 16 weight bytes. The float accumulation order over a row differs from V1.
+//
+//   y[n, m] = sum_k dequant_iq4_nl(bank[indices[n], m, k]) * x[n, k]
+//
+// IQ4_NL block (18 bytes, 2-byte aligned): [0,1] fp16 d | [2..17] qs[16]; byte j: low nibble = element j, high nibble = element j + 16.
+// NOT bit-exact vs a float-in reference (x is int8-quantized). K % 32 == 0. Dispatch: 2D grid - x = m, y = n.
+// Bindings: 0 bank, 1 xq (uvec4 view), 2 xds, 3 indices, 4 y.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  weight[]; };    // IQ4_NL blob [numExperts, M, K/32 x 18 B]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uvec4 xq4[]; };      // [xRows * K/16]
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };      // [xRows * K/32]
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };  // [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };        // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow;  // K / 32
+    uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
+} pc;
+
+const uint BLOCK_BYTES = 18u;
+const uint U = 2u;   // blocks per lane in flight
+
+const int KV[16] = int[16](
+    -127, -104, -83, -65, -49, -35, -22, -10,
+       1,   13,  25,  38,  53,  69,  89, 113
+);
+
+// Four codebook int8 values from the nibbles at bit offsets s0..s3 of `cur`, packed for dp4a.
+uint packCB(uint cur, uint s0, uint s1, uint s2, uint s3) {
+    return (uint(KV[(cur >> s0) & 0xFu]) & 0xFFu)
+         | ((uint(KV[(cur >> s1) & 0xFu]) & 0xFFu) << 8u)
+         | ((uint(KV[(cur >> s2) & 0xFu]) & 0xFFu) << 16u)
+         | ((uint(KV[(cur >> s3) & 0xFu]) & 0xFFu) << 24u);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return;
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * BLOCK_BYTES;
+    uint xRow = n / pc.xDiv;
+    uint xq4RowBase = xRow * (pc.K >> 4u);
+    uint xdsRowBase = xRow * (pc.K >> 5u);
+    uint lane = gl_LocalInvocationID.x;
+    float acc = 0.0;
+
+    for (uint chunk = 0u; chunk < pc.blocksPerRow; chunk += 32u * U) {
+        uint  vq[U][5];
+        uvec4 xa[U], xb[U];
+        float ds[U];
+        bool  ok[U];
+        [[unroll]] for (uint s = 0u; s < U; s++) {
+            uint blk = chunk + s * 32u + lane;
+            ok[s] = blk < pc.blocksPerRow;
+            uint b = ok[s] ? blk : (pc.blocksPerRow - 1u);   // clamp so the loads stay unconditional (hoistable); masked out below
+            uint p = rowByteBase + b * BLOCK_BYTES;
+            uint pw = p >> 2u;
+            [[unroll]] for (uint i = 0u; i < 5u; i++) vq[s][i] = weight[pw + i];
+            xa[s] = xq4[xq4RowBase + b * 2u];
+            xb[s] = xq4[xq4RowBase + b * 2u + 1u];
+            ds[s] = xds[xdsRowBase + b].x;
+        }
+        [[unroll]] for (uint s = 0u; s < U; s++) {
+            uint blk = chunk + s * 32u + lane;
+            uint b = ok[s] ? blk : (pc.blocksPerRow - 1u);
+            bool hi = (((rowByteBase + b * BLOCK_BYTES) & 2u) != 0u);
+            // qs word w = block bytes [2 + 4w, 6 + 4w): funnel of two stream words when the block starts word aligned, one stream word otherwise.
+            uint q0 = hi ? vq[s][1] : ((vq[s][0] >> 16u) | (vq[s][1] << 16u));
+            uint q1 = hi ? vq[s][2] : ((vq[s][1] >> 16u) | (vq[s][2] << 16u));
+            uint q2 = hi ? vq[s][3] : ((vq[s][2] >> 16u) | (vq[s][3] << 16u));
+            uint q3 = hi ? vq[s][4] : ((vq[s][3] >> 16u) | (vq[s][4] << 16u));
+            int dot = 0;
+            dot = dotPacked4x8AccSatEXT(int(packCB(q0, 0u, 8u, 16u, 24u)), int(xa[s].x), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(q1, 0u, 8u, 16u, 24u)), int(xa[s].y), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(q2, 0u, 8u, 16u, 24u)), int(xa[s].z), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(q3, 0u, 8u, 16u, 24u)), int(xa[s].w), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(q0, 4u, 12u, 20u, 28u)), int(xb[s].x), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(q1, 4u, 12u, 20u, 28u)), int(xb[s].y), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(q2, 4u, 12u, 20u, 28u)), int(xb[s].z), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(q3, 4u, 12u, 20u, 28u)), int(xb[s].w), dot);
+            // d: bytes 0..1 of the block = the high half of stream word 0 when the block starts 2 bytes into it, else its low half.
+            float d = unpackHalf2x16(hi ? (vq[s][0] >> 16u) : (vq[s][0] & 0xFFFFu)).x;
+            float contrib = d * (ds[s] * float(dot));
+            acc += ok[s] ? contrib : 0.0;
+        }
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[n * pc.M + m] = total;
+}
