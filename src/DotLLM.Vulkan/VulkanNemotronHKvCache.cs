@@ -17,6 +17,14 @@ public enum VulkanKvStorage
     /// (Bonsai 2) host selects. Any other kernel would misread the bytes: a model must route every layer to one of those.
     /// </summary>
     F16 = 1,
+
+    /// <summary>
+    /// Q8_0, 36-byte blocks of 32 elements (<c>[float scale][32 x int8]</c>, 1.125 bytes per element), written by
+    /// <c>convert_f32_to_q8_0_kv_range</c> and read in place (dequantised in the load) by the <c>_kvq8</c> twins of the split-KV decode
+    /// attention and the coopmat sink flash prefill. Only Flint's sink-attention route creates those twins; opt-in
+    /// (<see cref="VulkanKvStorageExtensions.EnvVar"/> = <c>q8_0</c>). Rows must be a multiple of 32 elements.
+    /// </summary>
+    Q8_0 = 2,
 }
 
 /// <summary>Per-format facts the attention kernels and the KV cache share (issue #1102).</summary>
@@ -32,6 +40,20 @@ public static class VulkanKvStorageExtensions
         _ => throw new ArgumentOutOfRangeException(nameof(storage)),
     };
 
+    /// <summary>Elements per Q8_0 KV block.</summary>
+    public const int Q8BlockElements = 32;
+
+    /// <summary>Bytes per Q8_0 KV block: a 4-byte F32 scale plus 32 int8 (see <c>kv_load.glsl</c>).</summary>
+    public const int Q8BlockBytes = 36;
+
+    /// <summary>Bytes of one cached row of <paramref name="stride"/> elements in this format (Q8_0 needs a multiple of 32).</summary>
+    /// <param name="storage">The storage format.</param>
+    /// <param name="stride">Elements per row.</param>
+    /// <returns>Row bytes.</returns>
+    public static long RowBytes(this VulkanKvStorage storage, long stride) => storage == VulkanKvStorage.Q8_0
+        ? (stride % Q8BlockElements == 0 ? stride / Q8BlockElements * Q8BlockBytes : throw new ArgumentException($"A Q8_0 KV row must be a multiple of {Q8BlockElements} elements; got {stride}.", nameof(stride)))
+        : stride * storage.ElementBytes();
+
     /// <summary>
     /// The SPIR-V name of the attention shader <paramref name="f32ShaderName"/> (no extension) compiled for this KV format: the name
     /// itself for F32, <c>{name}_kvf16</c> for F16 (the wrapper that includes the same body with <c>KV_F16</c> defined).
@@ -43,6 +65,7 @@ public static class VulkanKvStorageExtensions
     {
         VulkanKvStorage.F32 => f32ShaderName,
         VulkanKvStorage.F16 => f32ShaderName + "_kvf16",
+        VulkanKvStorage.Q8_0 => f32ShaderName + "_kvq8",
         _ => throw new ArgumentOutOfRangeException(nameof(storage)),
     };
 
@@ -53,15 +76,16 @@ public static class VulkanKvStorageExtensions
     /// </summary>
     /// <param name="key">The key-side value as given, or null.</param>
     /// <param name="value">The value-side value as given, or null.</param>
+    /// <param name="allowQ8">Accept <c>q8_0</c> (Flint's opt-in Q8_0 KV; every other host refuses it).</param>
     /// <returns>The storage both sides resolve to.</returns>
     /// <exception cref="NotSupportedException">A value is not f32 / f16, or the two sides disagree.</exception>
-    public static VulkanKvStorage ParseOptions(string? key, string? value)
+    public static VulkanKvStorage ParseOptions(string? key, string? value, bool allowQ8 = false)
     {
-        VulkanKvStorage? k = ParseOne(key), v = ParseOne(value);
+        VulkanKvStorage? k = ParseOne(key, allowQ8), v = ParseOne(value, allowQ8);
         if (k is not null && v is not null && k != v)
             throw new NotSupportedException(
                 $"The Vulkan KV cache stores K and V in one format; got K {key} and V {value}. Pass the same value for both.");
-        return k ?? v ?? ParseOne(Environment.GetEnvironmentVariable(EnvVar)) ?? VulkanKvStorage.F16;
+        return k ?? v ?? ParseOne(Environment.GetEnvironmentVariable(EnvVar), allowQ8) ?? VulkanKvStorage.F16;
     }
 
     /// <summary>
@@ -70,7 +94,7 @@ public static class VulkanKvStorageExtensions
     /// </summary>
     public const string EnvVar = "DOTLLM_VK_KV";
 
-    private static VulkanKvStorage? ParseOne(string? raw)
+    private static VulkanKvStorage? ParseOne(string? raw, bool allowQ8)
     {
         string? s = raw?.Trim().ToLowerInvariant();
         return s switch
@@ -78,6 +102,7 @@ public static class VulkanKvStorageExtensions
             null or "" => null,
             "f32" or "fp32" => VulkanKvStorage.F32,
             "f16" or "fp16" => VulkanKvStorage.F16,
+            "q8_0" or "q8" when allowQ8 => VulkanKvStorage.Q8_0,
             _ => throw new NotSupportedException(
                 $"KV storage '{raw}' is not available on Vulkan for this model; use f16 (half the KV of the f32 default)."),
         };
