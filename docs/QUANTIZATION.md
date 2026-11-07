@@ -484,8 +484,8 @@ I-quants encode weight values via a small codebook lookup rather than linear qua
 The Vulkan IQ2 family kernels store the codebook tables as readonly SSBOs uploaded once per model load (3 grids + ksigns ≈ 14 KB on device, shared by all 6 IQ2 matmul kernels via `Iq2Codebooks`). Per-element decode is `db * grid[gridIdx*8+j] * sign_j`; per-pair scale uses the same `db = d * (0.5 + sub_scale) * 0.25` arithmetic as the CPU oracle. IQ2_XXS / IQ2_XS resolve `sign_j` via the 128-entry `ksigns_iq2xs` lookup; IQ2_S stores the 8-bit sign mask directly per pair.
 | Format | Block | bpw | CPU dequant | CPU MatMul | CUDA dequant | CUDA GEMV | Notes |
 |---|---|---|---|---|---|---|---|
-| IQ4_NL | 32 | 4.5 | ✓ | dequant-fallback | ✓ (`dequant_iq4_nl_{f16,f32}`) | ✓ (`quantized_gemv_iq4_nl`) | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
-| IQ4_XS | 256 | 4.25 | ✓ | dequant-fallback | ✓ | ✓ | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
+| IQ4_NL | 32 | 4.5 | ✓ | dequant-fallback | ✓ (`dequant_iq4_nl_{f16,f32}`) | ✓ (`quantized_gemv_iq4_nl`) | Plus MMQ-preq + MMVQ-large + MoE-grouped; rows4 decode + 2..8-column rows4 (`_mmvq_rows4_preq[_c2..8]`, #1316/#1375, k % 256 == 0). |
+| IQ4_XS | 256 | 4.25 | ✓ | dequant-fallback | ✓ | ✓ | Plus MMQ-preq + MMVQ-large + MoE-grouped; rows4 decode + 2..8-column rows4 (#1316/#1375). |
 | IQ2_XXS | 256 | 2.0625 | ✓ | dequant-fallback | ✓ (`dequant_iq2_xxs_{f16,f32}`) | ✓ (`quantized_gemv_iq2_xxs`) | 256-entry codebook + 4×7-bit sign indices per 32-elem sub-block + shared 4-bit scale. |
 | IQ2_XS | 256 | 2.3125 | ✓ | dequant-fallback | ✓ | ✓ | 512-entry codebook; 7-bit sign indices in upper bits of `qs[uint16]`. |
 | IQ2_S | 256 | 2.5625 | ✓ | dequant-fallback | ✓ | ✓ | 1024-entry codebook; high index bits in `qh`. **Also stores `MOSTLY_IQ2_M` file-type tensors** (Qwen3.6-A3B-IQ2_M ~11.5 GB GGUFs). |
