@@ -105,7 +105,7 @@ public static partial class HfConfigExtractor
 
         float normEps = GetFloatOrDefault(root, "rms_norm_eps",
             GetFloatOrDefault(root, "layer_norm_eps", 1e-5f));
-        float ropeTheta = GetFloatOrDefault(root, "rope_theta", 10000.0f);
+        float ropeTheta = ResolveRopeTheta(root, 10000.0f);
         bool tieEmbeddings = GetBoolOrDefault(root, "tie_word_embeddings", DefaultTieForArch(architecture));
 
         int? slidingWindow = GetInt32NullableIfPositive(root, "sliding_window");
@@ -356,7 +356,7 @@ public static partial class HfConfigExtractor
     private static (RoPEScalingType Type, float Factor, int OrigMax, float BetaFast, float BetaSlow, float AttnFactor)
         ExtractDenseRopeScaling(JsonElement root)
     {
-        if (!root.TryGetProperty("rope_scaling", out var rs) || rs.ValueKind != JsonValueKind.Object)
+        if (!TryGetRopeScalingNode(root, out var rs))
             return (RoPEScalingType.None, 1.0f, 0, 32.0f, 1.0f, 1.0f);
 
         // HF rope_scaling sometimes uses `rope_type`, sometimes `type`.
@@ -405,6 +405,34 @@ public static partial class HfConfigExtractor
             attnFactor = afv;
 
         return (scalingType, factor, origMax, betaFast, betaSlow, attnFactor);
+    }
+
+    /// <summary>
+    /// Locates the RoPE scaling object: the legacy top-level <c>rope_scaling</c>, else the transformers-5.x
+    /// <c>rope_parameters</c> block (which carries <c>rope_type</c>, <c>factor</c>, ... directly; <c>rope_type=default</c> maps to no scaling).
+    /// </summary>
+    internal static bool TryGetRopeScalingNode(JsonElement root, out JsonElement node)
+    {
+        if (root.TryGetProperty("rope_scaling", out node) && node.ValueKind == JsonValueKind.Object)
+            return true;
+        if (root.TryGetProperty("rope_parameters", out node) && node.ValueKind == JsonValueKind.Object)
+            return true;
+        node = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Resolves the RoPE base frequency: legacy top-level <c>rope_theta</c> wins, else the transformers-5.x
+    /// <c>rope_parameters.rope_theta</c>, else <paramref name="fallback"/>. Before this the nested form silently fell back to 1e4
+    /// (TwIL-8B / Granite 4.2 ships 1e7 there), which loads without error and produces wrong text.
+    /// </summary>
+    internal static float ResolveRopeTheta(JsonElement root, float fallback)
+    {
+        if (root.TryGetProperty("rope_theta", out var top) && top.ValueKind == JsonValueKind.Number && top.TryGetSingle(out float tv))
+            return tv;
+        if (root.TryGetProperty("rope_parameters", out var rp) && rp.ValueKind == JsonValueKind.Object)
+            return GetFloatOrDefault(rp, "rope_theta", fallback);
+        return fallback;
     }
 
     /// <summary>
@@ -461,7 +489,7 @@ public static partial class HfConfigExtractor
             qLora = qLoraVal;
         }
 
-        float ropeTheta = GetFloatOrDefault(root, "rope_theta", 10000.0f);
+        float ropeTheta = ResolveRopeTheta(root, 10000.0f);
 
         // Optional rope_scaling (YaRN) — surface but do not yet apply.
         float? scalingFactor = null;
@@ -470,7 +498,7 @@ public static partial class HfConfigExtractor
         int? scalingOriginalMax = null;
         float betaFast = 32.0f;
         float betaSlow = 1.0f;
-        if (root.TryGetProperty("rope_scaling", out var rs) && rs.ValueKind == JsonValueKind.Object)
+        if (TryGetRopeScalingNode(root, out var rs))
         {
             if (rs.TryGetProperty("factor", out var f)
                 && f.ValueKind == JsonValueKind.Number
