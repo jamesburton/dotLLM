@@ -824,7 +824,7 @@ public sealed partial class ChunkIndex
         string temp = full + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (FileStream stream = StorePaths.CreateNewFile(temp))
             {
                 JsonSerializer.Serialize(stream, doc, ChunkIndexJsonContext.Default.IndexDocument);
                 stream.Flush(flushToDisk: true);

@@ -440,7 +440,7 @@ public sealed class StoreRegistry
         string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (FileStream stream = StorePaths.CreateNewFile(temp))
             {
                 JsonSerializer.Serialize(stream, doc, StoreRegistryJsonContext.Default.RegistryDocument);
                 stream.Flush(flushToDisk: true);

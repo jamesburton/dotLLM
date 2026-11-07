@@ -127,7 +127,7 @@ public sealed class RoslynGraphBuilder
         // Binding recurses per nesting level of the source and a stack overflow cannot be caught: bind on the large-stack thread,
         // skip a file whose tree is deeper than the cap (the bracket cap does not see generic-angle, '.', ternary or unary nesting),
         // and treat Roslyn's own InsufficientExecutionStackException as "this file contributes no edge".
-        RoslynParsing.RunWithLargeStack(() =>
+        RoslynParsing.RunWithLargeStack(corpusToken =>
         {
             foreach (string path in files.Keys.Where(index.HasChunks).Order(StringComparer.Ordinal))
             {
@@ -140,7 +140,9 @@ public sealed class RoslynGraphBuilder
                 }
                 var fileRaw = new List<(Location, Location, SymbolEdgeKind)>();
                 // One file's binding may take minutes on a hostile shape: cancel it at the budget (Roslyn honours the token).
-                using var budget = new CancellationTokenSource(FileBudget);
+                corpusToken.ThrowIfCancellationRequested();
+                using var budget = CancellationTokenSource.CreateLinkedTokenSource(corpusToken);
+                budget.CancelAfter(FileBudget);
                 try
                 {
                     CollectFile(files[path].Compilation, tree, index, fileRaw, budget.Token);
@@ -150,7 +152,7 @@ public sealed class RoslynGraphBuilder
                     System.Diagnostics.Trace.TraceWarning($"{path}: too deeply nested for Roslyn to bind; no edges from this file.");
                     continue;
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException) when (!corpusToken.IsCancellationRequested)
                 {
                     System.Diagnostics.Trace.TraceWarning($"{path}: binding exceeded {FileBudget.TotalSeconds:F0} s; no edges from this file.");
                     continue;
@@ -158,7 +160,7 @@ public sealed class RoslynGraphBuilder
                 raw.AddRange(fileRaw);
             }
             return 0;
-        });
+        }, CorpusBudget, Grace);
         TimeSpan bind = sw.Elapsed;
 
         sw.Restart();
@@ -177,6 +179,12 @@ public sealed class RoslynGraphBuilder
         LastTimings = (compile, bind, sw.Elapsed);
         return graph;
     }
+
+    /// <summary>Time the whole corpus may take to bind; over it <see cref="TimeoutException"/> (see <see cref="RoslynParsing.DefaultCorpusBudget"/>).</summary>
+    internal TimeSpan CorpusBudget { get; init; } = RoslynParsing.DefaultCorpusBudget;
+
+    /// <summary>How long a binder that ignores cancellation is waited for after <see cref="CorpusBudget"/> (default <see cref="RoslynParsing.CancelGrace"/>).</summary>
+    internal TimeSpan? Grace { get; init; }
 
     /// <summary>Time one file may take to bind before it contributes no edge (see <see cref="RoslynParsing.DefaultFileBudget"/>).</summary>
     internal TimeSpan FileBudget { get; init; } = RoslynParsing.DefaultFileBudget;

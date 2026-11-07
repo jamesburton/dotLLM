@@ -343,7 +343,7 @@ public sealed class ServerLedger
         string temp = full + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (FileStream stream = StorePaths.CreateNewFile(temp))
             {
                 JsonSerializer.Serialize(stream, doc, ServerLedgerJsonContext.Default.LedgerDocument);
                 stream.Flush(flushToDisk: true);

@@ -22,11 +22,27 @@ internal static class StorePaths
     /// <summary>Mode of a lock file created by the store (owner read/write).</summary>
     public const UnixFileMode PrivateFileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
 
-    /// <summary>Creates <paramref name="path"/> (and missing parents) owner-only on POSIX; an existing directory is left as it is.</summary>
+    /// <summary>
+    /// Creates <paramref name="path"/> owner-only on POSIX; an existing directory is left as it is. Missing PARENTS are created with the
+    /// default mode: they are not the store's (a shared parent must stay traversable for the operator's other users).
+    /// </summary>
     public static void CreateStoreDirectory(string path)
     {
-        if (OperatingSystem.IsWindows()) Directory.CreateDirectory(path);
-        else Directory.CreateDirectory(path, PrivateDirectoryMode);
+        if (OperatingSystem.IsWindows() || Directory.Exists(path)) { Directory.CreateDirectory(path); return; }
+        string? parent = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)));
+        if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
+        Directory.CreateDirectory(path, PrivateDirectoryMode);
+    }
+
+    /// <summary>
+    /// Creates a new file (it must not exist) for exclusive writing, owner read/write only on POSIX: the temp files that become
+    /// chunk, index, ledger and registry files, so a store under a group-readable root does not leak its contents through them.
+    /// </summary>
+    public static FileStream CreateNewFile(string path, int bufferSize = 4096)
+    {
+        var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None, BufferSize = bufferSize };
+        if (!OperatingSystem.IsWindows()) options.UnixCreateMode = PrivateFileMode;
+        return new FileStream(path, options);
     }
 
     /// <summary>Opens (creating owner-only on POSIX) <paramref name="path"/> exclusively: no other handle may be open on it.</summary>
@@ -54,7 +70,12 @@ internal static class StorePaths
     /// so two spellings of one directory compare equal. Components that do not exist yet are kept as written. Windows 8.3 short
     /// names are expanded by <see cref="Path.GetFullPath(string)"/>.
     /// </summary>
-    public static string CanonicalRoot(string path) => Resolve(Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)), 0);
+    public static string CanonicalRoot(string path)
+    {
+        // A ".." after a link means the link target's parent, so dots are applied while walking (never lexically beforehand).
+        string absolute = Path.IsPathRooted(path) ? path : Path.Combine(Environment.CurrentDirectory, path);
+        return Path.TrimEndingDirectorySeparator(Path.GetFullPath(Resolve(absolute, 0)));
+    }
 
     private static string Resolve(string full, int depth)
     {
@@ -63,12 +84,18 @@ internal static class StorePaths
         string current = root;
         foreach (string part in full[root.Length..].Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries))
         {
+            if (part == ".") continue;
+            if (part == "..")
+            {
+                current = Path.GetDirectoryName(current) is { Length: > 0 } up ? up : root;
+                continue;
+            }
             current = Path.Combine(current, part);
             string? target;
             try { target = new DirectoryInfo(current).LinkTarget; }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { target = null; }
             if (target is not null)
-                current = Resolve(Path.TrimEndingDirectorySeparator(Path.GetFullPath(target, Path.GetDirectoryName(current) ?? root)), depth + 1);
+                current = Resolve(Path.IsPathRooted(target) ? target : Path.Combine(Path.GetDirectoryName(current) ?? root, target), depth + 1);
         }
         return current;
     }
