@@ -718,10 +718,16 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         Check(cached, plain, model, Conversation);
 
         var side = Check(cached, plain, model, SideRequest);
-        var next = Check(cached, plain, model, [.. Conversation, .. Run(3000, 10)]);
+        int[] turn2 = [.. Conversation, .. Run(3000, 30)];   // 30: a turn shorter than RecurrentPrefixMinTokens never moves the snapshot
+        var next = Check(cached, plain, model, turn2);
+        // The protected request must not become "the previous prompt" either: the conversation's turn after next still finds
+        // its snapshot moved to the end of turn 2 (229), as if the side request had never happened. Under LRU the side request
+        // is the previous prompt, turn 2 shares only 20 tokens with it, and the snapshot stays at 20.
+        var afterNext = Check(cached, plain, model, [.. turn2, .. Run(4000, 10)]);
 
         Assert.Equal(0, side.Timings.CachedTokenCount);
         Assert.Equal(expectedNextTurnCached, next.Timings.CachedTokenCount);
+        Assert.Equal(policy == DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent ? turn2.Length - 1 : 20, afterNext.Timings.CachedTokenCount);
         Assert.Equal(policy == DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent ? 1 : 0, cached.RecurrentPrefixStatistics.ProtectedMisses);
         Assert.Equal(policy.ToString(), cached.RecurrentPrefixStatistics.Policy);
     }

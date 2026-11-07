@@ -57,6 +57,25 @@ public sealed class PrefixTrieTests
     }
 
     [Fact]
+    public void Eviction_Agent_AHitRefreshesTheLeafsClock()
+    {
+        // Same shape, but the side request is looked up (and released) after the unrelated lookup: its leaf is now fresh (age 0)
+        // while the conversation's tail is 12 tokens over 16 (0.75), so the conversation's tail goes.
+        using var pool = CreatePool();
+        var trie = new PrefixTrie(pool, policy: PrefixCachePolicy.Agent);
+        int[] conversation = MakePrompt(1, 16), side = MakePrompt(2, 4);
+        var conversationBlocks = AllocateAndInsert(trie, pool, conversation);
+        AllocateAndInsert(trie, pool, side);
+        trie.Lookup(MakePrompt(3, 8), new List<int>());
+        var matched = new List<int>();
+        Assert.Equal(4, trie.Lookup(side, matched));
+        trie.Release(matched);
+
+        Assert.Equal(conversationBlocks[^1], trie.EvictOneLru());
+        Assert.Equal(12, trie.TokenClock);   // 8 unrelated + the 4-token side lookup
+    }
+
+    [Fact]
     public void Lookup_EmptyTrie_ReturnsZero()
     {
         using var pool = CreatePool();

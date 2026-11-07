@@ -79,13 +79,21 @@ public sealed class AgentPrefixPolicyReplayTests
 
     private sealed record Step(string Name, string Thread, string System, string User);
 
+    /// <summary>
+    /// A tool result an agent turn carries (about 300 tokens): the asymmetry the own-length rule is built on is a conversation that
+    /// is LONG relative to the side traffic between its turns. Without it a 240-token conversation facing 480 tokens of side
+    /// requests has, by the rule, expired, and both policies evict it (measured: M3 reused 5 under LRU, 125 under agent).
+    /// </summary>
+    private static string ToolResult(int turn) => "\n```\n" + string.Join("\n", Enumerable.Range(0, 36).Select(i =>
+        $"[{turn}:{i:D2}] PrefixCacheEntry id={turn * 100 + i} length={1000 + i * 37} lastUse={i * 211} savePoint={(i % 3 == 0 ? -1 : i * 19)} tier=live")) + "\n```";
+
     /// <summary>The session: main turns interleaved with a subagent (2 turns) and 3 unrelated requests after turns 2 and 4.</summary>
     private static IEnumerable<Step> Session()
     {
         int sub = 0, other = 0;
         for (int m = 0; m < MainTurns.Length; m++)
         {
-            yield return new($"M{m + 1}", "main", ProjectInstructions, MainTurns[m]);
+            yield return new($"M{m + 1}", "main", ProjectInstructions, MainTurns[m] + ToolResult(m + 1));
             if (m is 1 or 3)
             {
                 for (int t = 0; t < 2; t++) yield return new($"S{sub + 1}{(char)('a' + t)}", $"sub{sub}", ProjectInstructions, Subagents[sub][t]);
@@ -168,11 +176,12 @@ public sealed class AgentPrefixPolicyReplayTests
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         using var lruCache = new PrefixCache(4, PrefixCachePolicy.Lru);
-        var lruGen = new TextGenerator(model, tokenizer, prefixCache: lruCache);
+        // Headroom as the Vulkan live path gives (#1591): without it a cache sized to prompt + max_tokens never holds the next turn.
+        var lruGen = new TextGenerator(model, tokenizer, prefixCache: lruCache, prefixCacheHeadroomTokens: 2048);
         var lru = Replay((p, o) => lruGen.Generate(p, o), tokenizer, savePoints: false);
         double lruSeconds = sw.Elapsed.TotalSeconds; sw.Restart();
         using var agentCache = new PrefixCache(4, PrefixCachePolicy.Agent);
-        var agentGen = new TextGenerator(model, tokenizer, prefixCache: agentCache);
+        var agentGen = new TextGenerator(model, tokenizer, prefixCache: agentCache, prefixCacheHeadroomTokens: 2048);
         var agent = Replay((p, o) => agentGen.Generate(p, o), tokenizer, savePoints: true);
         double agentSeconds = sw.Elapsed.TotalSeconds;
 
