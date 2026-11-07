@@ -397,43 +397,43 @@ public static unsafe partial class MatMul
     /// <summary>Best non-AVX2 Q2_K dot (SSSE3, else scalar).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ2_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
-        Ssse3.IsSupported ? VecDotQ2_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ2_K_Q8_KScalar(qk, q8k, superBlockCount);
+        CpuFeatures.Ssse3 ? VecDotQ2_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ2_K_Q8_KScalar(qk, q8k, superBlockCount);
 
     /// <summary>Best non-AVX2 Q3_K dot (SSSE3, else scalar).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ3_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
-        Ssse3.IsSupported ? VecDotQ3_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ3_K_Q8_KScalar(qk, q8k, superBlockCount);
+        CpuFeatures.Ssse3 ? VecDotQ3_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ3_K_Q8_KScalar(qk, q8k, superBlockCount);
 
     /// <summary>Best non-AVX2 Q4_K dot (SSSE3, else scalar).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ4_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
-        Ssse3.IsSupported ? VecDotQ4_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ4_K_Q8_KScalar(qk, q8k, superBlockCount);
+        CpuFeatures.Ssse3 ? VecDotQ4_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ4_K_Q8_KScalar(qk, q8k, superBlockCount);
 
     /// <inheritdoc cref="VecDotQ4_K_Q8_KSse(byte*, byte*, int, int)"/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ4_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount, int wStride) =>
-        Ssse3.IsSupported ? VecDotQ4_K_Q8_KSse(qk, q8k, superBlockCount, wStride)
+        CpuFeatures.Ssse3 ? VecDotQ4_K_Q8_KSse(qk, q8k, superBlockCount, wStride)
                           : VecDotQ4_K_Q8_KScalar(qk, q8k, superBlockCount, wStride);
 
     /// <summary>Best non-AVX2 Q5_K dot (SSSE3, else scalar).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ5_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
-        Ssse3.IsSupported ? VecDotQ5_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ5_K_Q8_KScalar(qk, q8k, superBlockCount);
+        CpuFeatures.Ssse3 ? VecDotQ5_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ5_K_Q8_KScalar(qk, q8k, superBlockCount);
 
     /// <inheritdoc cref="VecDotQ5_K_Q8_KSse(byte*, byte*, int, int)"/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ5_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount, int wStride) =>
-        Ssse3.IsSupported ? VecDotQ5_K_Q8_KSse(qk, q8k, superBlockCount, wStride)
+        CpuFeatures.Ssse3 ? VecDotQ5_K_Q8_KSse(qk, q8k, superBlockCount, wStride)
                           : VecDotQ5_K_Q8_KScalar(qk, q8k, superBlockCount, wStride);
 
     /// <summary>Best non-AVX2 Q6_K dot (SSSE3, else scalar).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ6_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
-        Ssse3.IsSupported ? VecDotQ6_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ6_K_Q8_KScalar(qk, q8k, superBlockCount);
+        CpuFeatures.Ssse3 ? VecDotQ6_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ6_K_Q8_KScalar(qk, q8k, superBlockCount);
 
     /// <inheritdoc cref="VecDotQ6_K_Q8_KSse(byte*, byte*, int, int)"/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ6_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount, int wStride) =>
-        Ssse3.IsSupported ? VecDotQ6_K_Q8_KSse(qk, q8k, superBlockCount, wStride)
+        CpuFeatures.Ssse3 ? VecDotQ6_K_Q8_KSse(qk, q8k, superBlockCount, wStride)
                           : VecDotQ6_K_Q8_KScalar(qk, q8k, superBlockCount, wStride);
 }

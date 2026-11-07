@@ -138,7 +138,7 @@ public static unsafe partial class MatMul
             // abs/sign + dual-madd AVX2/AVX-512 emulation. See MatMulVnni.cs.
             ComputeRowsVnni(weightsQ8, xQ8, result, m, blockCount);
         }
-        else if (Avx512BW.IsSupported)
+        else if (CpuFeatures.Avx512Bw)
         {
             int row = 0;
             // Process 4 rows at a time for cache efficiency.
@@ -156,7 +156,7 @@ public static unsafe partial class MatMul
                 result[row] = VecDotQ8_0Avx512(weightsQ8 + (long)row * rowBytes, xQ8, blockCount);
             }
         }
-        else if (Avx2.IsSupported)
+        else if (CpuFeatures.Avx2)
         {
             int row = 0;
             // Process 4 rows at a time for cache efficiency.
@@ -174,7 +174,7 @@ public static unsafe partial class MatMul
                 result[row] = VecDotQ8_0Avx2(weightsQ8 + (long)row * rowBytes, xQ8, blockCount);
             }
         }
-        else if (Ssse3.IsSupported)
+        else if (CpuFeatures.Ssse3)
         {
             // 128-bit tier for pre-AVX2 hardware (Westmere, #477); bit-exact with scalar.
             ComputeRowsQ8_0Sse(weightsQ8, xQ8, result, m, blockCount);
@@ -295,7 +295,7 @@ public static unsafe partial class MatMul
         Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
         Vector256<short> prod = Avx2.MultiplyAddAdjacent(absX.AsByte(), Avx2.Sign(vw, vx));
         Vector256<float> isum = Avx.ConvertToVector256Single(Avx2.MultiplyAddAdjacent(prod, ones));
-        return Fma.IsSupported
+        return CpuFeatures.Fma
             ? Fma.MultiplyAdd(Vector256.Create(scale), isum, acc)
             : acc + isum * Vector256.Create(scale);
     }
@@ -412,7 +412,7 @@ public static unsafe partial class MatMul
 
         // AVX2 is deliberately preferred over the wider tiers here — see the measurements on
         // VecDotQ8_0Vnni_4RowsR4, which is 1.7-1.9x SLOWER than this kernel on AVX-512 hardware.
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             for (int g = 0; g < fullGroups; g++)
             {
@@ -420,7 +420,7 @@ public static unsafe partial class MatMul
                 VecDotQ8_0Avx2_4RowsR4(groupBase, xQ8, blockCount, result + g * 4);
             }
         }
-        else if (Ssse3.IsSupported)
+        else if (CpuFeatures.Ssse3)
         {
             for (int g = 0; g < fullGroups; g++)
             {
@@ -663,7 +663,7 @@ public static unsafe partial class MatMul
                 Vector256<int> isum = Avx2.MultiplyAddAdjacent(prod, ones);
                 Vector256<float> fsum = Avx.ConvertToVector256Single(isum);
                 Vector256<float> scale = Vector256.Create(dx * dw);
-                if (Fma.IsSupported)
+                if (CpuFeatures.Fma)
                     acc0 = Fma.MultiplyAdd(scale, fsum, acc0);
                 else
                     acc0 += fsum * scale;
@@ -679,7 +679,7 @@ public static unsafe partial class MatMul
                 Vector256<int> isum = Avx2.MultiplyAddAdjacent(prod, ones);
                 Vector256<float> fsum = Avx.ConvertToVector256Single(isum);
                 Vector256<float> scale = Vector256.Create(dx * dw);
-                if (Fma.IsSupported)
+                if (CpuFeatures.Fma)
                     acc1 = Fma.MultiplyAdd(scale, fsum, acc1);
                 else
                     acc1 += fsum * scale;
@@ -695,7 +695,7 @@ public static unsafe partial class MatMul
                 Vector256<int> isum = Avx2.MultiplyAddAdjacent(prod, ones);
                 Vector256<float> fsum = Avx.ConvertToVector256Single(isum);
                 Vector256<float> scale = Vector256.Create(dx * dw);
-                if (Fma.IsSupported)
+                if (CpuFeatures.Fma)
                     acc2 = Fma.MultiplyAdd(scale, fsum, acc2);
                 else
                     acc2 += fsum * scale;
@@ -711,7 +711,7 @@ public static unsafe partial class MatMul
                 Vector256<int> isum = Avx2.MultiplyAddAdjacent(prod, ones);
                 Vector256<float> fsum = Avx.ConvertToVector256Single(isum);
                 Vector256<float> scale = Vector256.Create(dx * dw);
-                if (Fma.IsSupported)
+                if (CpuFeatures.Fma)
                     acc3 = Fma.MultiplyAdd(scale, fsum, acc3);
                 else
                     acc3 += fsum * scale;
@@ -911,12 +911,12 @@ public static unsafe partial class MatMul
     /// <b>Requires AVX-512F in addition to AVX-VNNI.</b> Despite the name, the block-pair
     /// accumulator is a <see cref="Vector512{T}"/> fed by <c>Avx512F.ConvertToVector512Single</c>
     /// and <c>Avx512F.FusedMultiplyAdd</c> (see <c>ProcessVnniDualBlock</c>), so an
-    /// <c>AvxVnni.IsSupported</c>-only guard is <em>not</em> sufficient: on AVX-VNNI-without-AVX-512
+    /// <c>CpuFeatures.AvxVnni</c>-only guard is <em>not</em> sufficient: on AVX-VNNI-without-AVX-512
     /// hardware (Meteor Lake, Alder/Raptor Lake) this throws
     /// <c>PlatformNotSupportedException</c> as soon as <paramref name="blockCount"/> reaches 2 —
     /// at <c>blockCount == 1</c> the paired loop never runs and the fault is not reached, which is
     /// exactly what made a mis-guarded call site look like a partial failure. Guard on
-    /// <c>Avx512BW.IsSupported &amp;&amp; AvxVnni.IsSupported</c>. For the AVX-VNNI-only 4-row path
+    /// <c>CpuFeatures.Avx512Bw &amp;&amp; CpuFeatures.AvxVnni</c>. For the AVX-VNNI-only 4-row path
     /// use <see cref="VecDotQ8_0VnniZp_4Rows"/>, which is what <see cref="ComputeRowsVnni"/>
     /// dispatches to.
     /// </para>
@@ -1047,9 +1047,9 @@ public static unsafe partial class MatMul
                 $"elementCount must be a multiple of {Q8_0GroupSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx512BW.IsSupported)
+        if (CpuFeatures.Avx512Bw)
             QuantizeF32ToQ8_0Avx512(src, dest, elementCount);
-        else if (Avx2.IsSupported)
+        else if (CpuFeatures.Avx2)
             QuantizeF32ToQ8_0Avx2(src, dest, elementCount);
         else
             QuantizeF32ToQ8_0Scalar(src, dest, elementCount);
@@ -1240,7 +1240,7 @@ public static unsafe partial class MatMul
                 $"elementCount must be a multiple of {Q8_1GroupSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             QuantizeF32ToQ8_1Avx2(src, dest, elementCount);
         else
             QuantizeF32ToQ8_1Scalar(src, dest, elementCount);
@@ -1734,7 +1734,7 @@ public static unsafe partial class MatMul
                 Vector256<sbyte> absX0 = Avx2.Sign(vx0, vx0);
                 Vector256<short> prod0 = Avx2.MultiplyAddAdjacent(absX0.AsByte(), adjW0);
                 Vector256<int> isum0 = Avx2.MultiplyAddAdjacent(prod0, ones);
-                a0 = Fma.IsSupported
+                a0 = CpuFeatures.Fma
                     ? Fma.MultiplyAdd(Vector256.Create(dx0 * dw), Avx.ConvertToVector256Single(isum0), a0)
                     : a0 + Avx.ConvertToVector256Single(isum0) * Vector256.Create(dx0 * dw);
 
@@ -1746,7 +1746,7 @@ public static unsafe partial class MatMul
                 Vector256<sbyte> absX1 = Avx2.Sign(vx1, vx1);
                 Vector256<short> prod1 = Avx2.MultiplyAddAdjacent(absX1.AsByte(), adjW1);
                 Vector256<int> isum1 = Avx2.MultiplyAddAdjacent(prod1, ones);
-                a1 = Fma.IsSupported
+                a1 = CpuFeatures.Fma
                     ? Fma.MultiplyAdd(Vector256.Create(dx1 * dw), Avx.ConvertToVector256Single(isum1), a1)
                     : a1 + Avx.ConvertToVector256Single(isum1) * Vector256.Create(dx1 * dw);
 
@@ -1758,7 +1758,7 @@ public static unsafe partial class MatMul
                 Vector256<sbyte> absX2 = Avx2.Sign(vx2, vx2);
                 Vector256<short> prod2 = Avx2.MultiplyAddAdjacent(absX2.AsByte(), adjW2);
                 Vector256<int> isum2 = Avx2.MultiplyAddAdjacent(prod2, ones);
-                a2 = Fma.IsSupported
+                a2 = CpuFeatures.Fma
                     ? Fma.MultiplyAdd(Vector256.Create(dx2 * dw), Avx.ConvertToVector256Single(isum2), a2)
                     : a2 + Avx.ConvertToVector256Single(isum2) * Vector256.Create(dx2 * dw);
             }
@@ -2017,7 +2017,7 @@ public static unsafe partial class MatMul
             int baseRow = g * 4;
             int t = 0;
 
-            if (Avx512BW.IsSupported)
+            if (CpuFeatures.Avx512Bw)
             {
                 // AVX-512: 4×6 tiles
                 int nFull6 = (n / 6) * 6;
@@ -2051,7 +2051,7 @@ public static unsafe partial class MatMul
                         blockCount, c + (long)t * m + baseRow);
                 }
             }
-            else if (Avx2.IsSupported)
+            else if (CpuFeatures.Avx2)
             {
                 // AVX2: 4×3 tiles
                 int nFull3 = (n / 3) * 3;
@@ -2105,7 +2105,7 @@ public static unsafe partial class MatMul
                 byte* xQ8 = inputQ8 + (long)t * q8RowBytes;
                 for (int r = 0; r < tailRows; r++)
                 {
-                    c[(long)t * m + baseRow + r] = Avx2.IsSupported
+                    c[(long)t * m + baseRow + r] = CpuFeatures.Avx2
                         ? VecDotQ8_0Avx2(tailBase + (long)r * rowBytes, xQ8, blockCount)
                         : VecDotQ8_0Scalar(tailBase + (long)r * rowBytes, xQ8, blockCount);
                 }
@@ -2171,7 +2171,7 @@ public static unsafe partial class MatMul
                 int baseRow = g * 4;
                 int t = 0;
 
-                if (Avx512BW.IsSupported)
+                if (CpuFeatures.Avx512Bw)
                 {
                     int nFull6 = (ctx.N / 6) * 6;
                     for (; t < nFull6; t += 6)
@@ -2202,7 +2202,7 @@ public static unsafe partial class MatMul
                             ctx.BlockCount, ctx.C + (long)t * ctx.M + baseRow);
                     }
                 }
-                else if (Avx2.IsSupported)
+                else if (CpuFeatures.Avx2)
                 {
                     int nFull3 = (ctx.N / 3) * 3;
                     for (; t < nFull3; t += 3)
@@ -2251,7 +2251,7 @@ public static unsafe partial class MatMul
                     byte* xQ8 = ctx.InputQ8 + (long)t * q8RowBytes;
                     for (int r = 0; r < ctx.TailRows; r++)
                     {
-                        ctx.C[(long)t * ctx.M + baseRow + r] = Avx2.IsSupported
+                        ctx.C[(long)t * ctx.M + baseRow + r] = CpuFeatures.Avx2
                             ? VecDotQ8_0Avx2(tailBase + (long)r * rowBytes, xQ8, ctx.BlockCount)
                             : VecDotQ8_0Scalar(tailBase + (long)r * rowBytes, xQ8, ctx.BlockCount);
                     }
@@ -2372,9 +2372,9 @@ public static unsafe partial class MatMul
         for (int g = startGroup; g < endGroup; g++)
         {
             byte* groupBase = ctx.RepackedWeights + (long)g * groupBytes;
-            if (Avx2.IsSupported)
+            if (CpuFeatures.Avx2)
                 VecDotQ8_0Avx2_4RowsR4(groupBase, ctx.XQ, ctx.BlockCount, ctx.Result + g * 4);
-            else if (Ssse3.IsSupported)
+            else if (CpuFeatures.Ssse3)
                 VecDotQ8_0Sse_4RowsR4(groupBase, ctx.XQ, ctx.BlockCount, ctx.Result + g * 4);
             else
                 for (int r = 0; r < 4; r++)

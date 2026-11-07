@@ -67,7 +67,7 @@ public sealed record StoredAssembly(ChunkedContext Context, AssemblyStats Stats,
 /// checks), and a structurally valid entry that fails the checks above is evicted and replaced. When the store cannot write (Put
 /// throws <see cref="ChunkStoreBusyException"/>, or evicting a rejected entry throws <see cref="IOException"/> or
 /// <see cref="UnauthorizedAccessException"/>) the freshly encoded entry is used without storing it; a later call repairs the entry.
-/// A store-lock timeout (<see cref="ChunkStoreLockTimeoutException"/>, e.g. from <c>LockingChunkStore</c>) is not a busy
+/// A store-lock timeout (<see cref="ChunkStoreLockTimeoutException"/>, e.g. from <see cref="LockingChunkStore"/>) is not a busy
 /// entry: it propagates, so the caller stops at once (CLI <c>store_busy</c>, server <c>chunk_store_unavailable</c>) instead of
 /// encoding every remaining chunk and waiting the timeout for each. Any other store exception propagates.
 /// </para>

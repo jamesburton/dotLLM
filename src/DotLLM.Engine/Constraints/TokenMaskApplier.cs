@@ -17,7 +17,7 @@ internal static class TokenMaskApplier
     /// </summary>
     public static void Apply(Span<float> logits, TokenMask mask)
     {
-        if (Avx2.IsSupported)
+        if (DotLLM.Cpu.CpuFeatures.Avx2)
             ApplyAvx2(logits, mask);
         else
             ApplyScalar(logits, mask);

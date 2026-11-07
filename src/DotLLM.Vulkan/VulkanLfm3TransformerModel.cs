@@ -335,12 +335,70 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         _activeState = state ?? _defaultState;
         try
         {
-            return Run(tokenIds, positions, deviceId, kvCache);
+            return ForwardInRowSlices(tokenIds, positions, deviceId, kvCache) ?? Run(tokenIds, positions, deviceId, kvCache);
         }
         finally
         {
             _activeState = prev;
         }
+    }
+
+    /// <summary>Per-submission GPU-time budget; its rates are refitted from every multi-row submission (issue #1649).</summary>
+    private VulkanPrefillSubmitBudget _submitBudget = VulkanPrefillSubmitBudget.FromEnvironment();
+
+    /// <summary>Test hook: replaces the submission budget (a tiny one forces row slicing at small prompts).</summary>
+    internal VulkanPrefillSubmitBudget SubmitBudgetForTest { get => _submitBudget; set => _submitBudget = value; }
+
+    /// <summary><c>DOTLLM_VK_LFM3_ATTN_CHUNK=0</c> disables query-row slicing of long prefills (A/B and bisection).</summary>
+    private static readonly bool RowSlicingEnabled = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM3_ATTN_CHUNK") != "0";
+
+    /// <summary>Test hook: row-slice forwards <see cref="ForwardInRowSlices"/> ran.</summary>
+    internal int RowSliceForwardsForTest { get; private set; }
+
+    /// <summary>Weight elements of one layer, for the dense cost estimate: the FFN plus an attention-sized mixer.</summary>
+    private double ParamsPerLayer
+        => (3.0 * Config.HiddenSize * _layers[0].GateOut) + (4.0 * Config.HiddenSize * Config.HiddenSize);
+
+    /// <summary>Attention GFLOPs of one layer: the causal cost, with the KV span capped at the sliding window.</summary>
+    private double AttentionGflopsOf(int window, int rows, int kvEnd)
+    {
+        double g = VulkanPrefillSubmitBudget.AttentionGflops(VulkanPrefillSubmitBudget.EffectiveRows(rows), kvEnd,
+            Config.NumAttentionHeads, Config.HeadDim);
+        if (window <= 0) return g;
+        double meanKv = Math.Max(1.0, kvEnd - ((rows - 1) / 2.0));
+        return g * Math.Min(window, meanKv) / meanKv;
+    }
+
+    /// <summary>
+    /// Splits a long prefill whose single attention layer would exceed the submission budget at this KV depth into query-row slices
+    /// run as consecutive forwards (issue #1649): KV and conv state carry over exactly as between engine tiles, so no single
+    /// one-layer submission outlives the GPU watchdog (28672 rows lost the device at ~2.5 s per submit).
+    /// </summary>
+    /// <returns>The last slice's logits, or null when no split is needed or possible.</returns>
+    private ITensor? ForwardInRowSlices(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+    {
+        int rows = tokenIds.Length;
+        if (!RowSlicingEnabled || rows <= VulkanPrefillSubmitBudget.MinRowsPerForward * 2 || rows <= _allRowLogitsLimit
+            || kvCache is not VulkanNemotronHKvCache)
+            return null;
+        int kvEnd = VulkanNemotronHKvCache.PositionsEnd(positions);
+        int per = _submitBudget.RowsPerForward(rows, kvEnd, ParamsPerLayer, Config.NumAttentionHeads, Config.HeadDim);
+        if (per >= rows) return null;
+        int slices = (rows + per - 1) / per;
+        int baseLen = rows / slices, extra = rows % slices;
+        if (baseLen <= _allRowLogitsLimit) return null;
+
+        RowSliceForwardsForTest += slices;
+        ITensor? last = null;
+        int start = 0;
+        for (int s = 0; s < slices; s++)
+        {
+            int len = baseLen + (s < extra ? 1 : 0);
+            last?.Dispose();
+            last = Run(tokenIds.Slice(start, len), positions.Slice(start, len), deviceId, kvCache);
+            start += len;
+        }
+        return last;
     }
 
     private ITensor Run(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
@@ -370,6 +428,9 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         KernelSupport.TransferToComputeBarrier(cmd);
 
         ulong hiddenBytes = (ulong)((long)T * H * sizeof(float));
+        int kvEndObs = VulkanNemotronHKvCache.PositionsEnd(positions);
+        double openDense = 0, openAttn = 0;
+        long openStart = System.Diagnostics.Stopwatch.GetTimestamp();
         for (int layer = 0; layer < _layers.Length; layer++)
         {
             var ld = _layers[layer];
@@ -408,10 +469,15 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
 
             // Windows TDR: a single submission must finish within ~2 s. A long prefill of the whole stack does not, so a multi-row
             // forward is cut into several submissions.
+            openDense += VulkanPrefillSubmitBudget.DenseGflops(ParamsPerLayer, VulkanPrefillSubmitBudget.EffectiveRows(T));
+            if (ld.IsAttention) openAttn += AttentionGflopsOf(ld.Window, T, kvEndObs);
             if (T > 1 && (layer + 1) % LayersPerSubmit(T) == 0 && layer + 1 < _layers.Length)
             {
                 Fb(cmd);
                 submit.SubmitAndWait();
+                _submitBudget.Observe(openDense, openAttn, System.Diagnostics.Stopwatch.GetElapsedTime(openStart).TotalSeconds);
+                openDense = openAttn = 0;
+                openStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 submit.Begin();
                 cmd = submit.CommandBuffer;
             }

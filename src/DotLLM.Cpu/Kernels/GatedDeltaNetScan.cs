@@ -163,7 +163,7 @@ public static class GatedDeltaNetScan
         if (readOnlyState && recordStates)
             throw new ArgumentException("A read-only scan cannot record whole-state row snapshots.", nameof(rowSnapshots));
 
-        if (!recordStates && !ForceScalar && dState % 8 == 0 && Vector256.IsHardwareAccelerated)
+        if (!recordStates && !ForceScalar && dState % 8 == 0 && CpuFeatures.Vector256Accelerated)
         {
             ExecuteSimd(state, q, k, v, g, beta, output, nVHead, nKHead, dState, seqLen, snapshotRows, stateSource,
                         deltaRecord, readOnlyState, pool);
@@ -469,7 +469,7 @@ public static class GatedDeltaNetScan
     private static void ReplayRow(ReadOnlySpan<float> src, Span<float> dst, ReadOnlySpan<float> d, float ki, float g)
     {
         int col = 0, n = dst.Length;
-        if (Vector256.IsHardwareAccelerated)
+        if (CpuFeatures.Vector256Accelerated)
         {
             var gv = Vector256.Create(g);
             var kv = Vector256.Create(ki);

@@ -204,7 +204,7 @@ public static unsafe partial class MatMul
     /// <summary><paramref name="acc"/> plus <see cref="DotU8S8Avx2"/> (fused into one <c>vpdpbusd</c> with AVX-VNNI).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<int> DotAccU8S8Avx2(Vector256<int> acc, Vector256<byte> q, Vector256<sbyte> q8v, Vector256<short> ones)
-        => AvxVnni.IsSupported
+        => CpuFeatures.AvxVnni
             ? AvxVnni.MultiplyWideningAndAdd(acc, q, q8v)
             : Avx2.Add(acc, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8v), ones));
 

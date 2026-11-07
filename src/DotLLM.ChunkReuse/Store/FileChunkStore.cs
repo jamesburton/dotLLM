@@ -35,9 +35,9 @@ namespace DotLLM.ChunkReuse.Store;
 /// </para>
 /// <para>
 /// <b>Locking.</b> This class takes no lock: each put is atomic on its own. Writers sharing a store root with an eviction
-/// pass must put under the store lock (<c>ChunkIndex.AcquireStoreLock</c>), one short scope per batch: wrap the store
-/// in <c>LockingChunkStore</c>, or hold the lock around the batch (and its ledger save) yourself. See the
-/// <c>ChunkIndex</c> remarks for the lock model.
+/// pass must put under the store lock (<see cref="ChunkIndex.AcquireStoreLock"/>), one short scope per batch: wrap the store
+/// in <see cref="LockingChunkStore"/>, or hold the lock around the batch (and its ledger save) yourself. See the
+/// <see cref="ChunkIndex"/> remarks for the lock model.
 /// </para>
 /// </summary>
 public sealed class FileChunkStore : IChunkStore

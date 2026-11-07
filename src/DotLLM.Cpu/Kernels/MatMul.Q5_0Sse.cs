@@ -14,7 +14,7 @@ namespace DotLLM.Cpu.Kernels;
 ///
 /// <para><b>Block dot.</b> The 16 <c>qs</c> bytes give elements 0–15 (low nibbles) and 16–31
 /// (high nibbles); bit <c>j</c> of <c>qh</c> is bit 4 of element <c>j</c>, spread with PSHUFB +
-/// bit-mask compare exactly like the AVX2 <see cref="ExtractQ5HighBits"/>. The weight value is
+/// bit-mask compare exactly like the AVX2 <see cref="ExtractQ5HighBitsAvx2"/>. The weight value is
 /// the <em>unsigned</em> 0..31 (the −16 is applied through the Q8_1 block sum <c>s</c>), so it is
 /// PMADDUBSW's unsigned operand directly — no sign trick. A pair sum is at most
 /// <c>2·31·128 = 7936</c>, so nothing saturates for any activation byte, including −128: unlike
@@ -192,8 +192,8 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ5_0Q8_1Row(byte* w, byte* xQ8, int blockCount)
     {
-        if (Avx2.IsSupported) return VecDotQ5_0Q8_1Avx2(w, xQ8, blockCount);
-        if (Ssse3.IsSupported) return VecDotQ5_0Q8_1Sse(w, xQ8, blockCount);
+        if (CpuFeatures.Avx2) return VecDotQ5_0Q8_1Avx2(w, xQ8, blockCount);
+        if (CpuFeatures.Ssse3) return VecDotQ5_0Q8_1Sse(w, xQ8, blockCount);
         return VecDotQ5_0Q8_1Scalar(w, xQ8, blockCount);
     }
 
@@ -201,9 +201,9 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void VecDotQ5_0Q8_1Group4R4(byte* groupBase, byte* xQ8, int blockCount, float* results)
     {
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             VecDotQ5_0Q8_1Avx2_4RowsR4(groupBase, xQ8, blockCount, results);
-        else if (Ssse3.IsSupported)
+        else if (CpuFeatures.Ssse3)
             VecDotQ5_0Q8_1Sse_4RowsR4(groupBase, xQ8, blockCount, results);
         else
             for (int r = 0; r < 4; r++)

@@ -56,7 +56,6 @@ public sealed unsafe class NanoQuantTests(ITestOutputHelper output)
     [Fact]
     public void Avx2Kernel_MatchesNumpyFloat64_OnRealCrop()
     {
-        if (!Avx2.IsSupported) return;
         var f = LoadCrop();
         using var layer = Build(f);
         Assert.Equal(2, layer.SalientCount);
@@ -70,7 +69,6 @@ public sealed unsafe class NanoQuantTests(ITestOutputHelper output)
     [Fact]
     public void SalientPath_IsActive_AndAddsRawX()
     {
-        if (!Avx2.IsSupported) return;
         var f = LoadCrop();
         // Same layer without the salient path must differ by exactly sum_s w[o,s] * x[idx[s]].
         using var with = Build(f);
@@ -91,7 +89,6 @@ public sealed unsafe class NanoQuantTests(ITestOutputHelper output)
     [Fact]
     public void VnniKernel_TracksReference_WithinInt8Tolerance()
     {
-        if (!LittleBitLayer.VnniSupported) return;
         var f = LoadCrop();
         using var layer = Build(f);
         using var sc = layer.CreateScratch();
@@ -108,7 +105,6 @@ public sealed unsafe class NanoQuantTests(ITestOutputHelper output)
     [InlineData(5, 31, 32, 1)]
     public void RandomLayers_KernelMatchesReference_NonMultipleOf32(int dOut, int dIn, int r, int k)
     {
-        if (!Avx2.IsSupported) return;
         var rng = new Random(1234 + dOut);
         int uw = (r + 31) / 32, vw = (dIn + 31) / 32;
         var u = new int[dOut * uw]; var v = new int[r * vw];
@@ -177,7 +173,6 @@ public sealed unsafe class NanoQuantTests(ITestOutputHelper output)
     {
         string? path = RealGguf();
         if (path is null) { output.WriteLine("SKIP: NanoQuant GGUF absent (set DOTLLM_NANOQUANT_GGUF)."); return; }
-        if (!Avx2.IsSupported) return;
         using var doc = LoadJson("nanoquant_full_expect.json");
         using var file = GgufFile.Open(path);
         using var pool = new ComputeThreadPool(4);

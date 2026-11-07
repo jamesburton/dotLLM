@@ -25,7 +25,7 @@ public sealed unsafe class MatMulR4VnniTests
     private const int Q8_0GroupSize = 32;
 
     /// <summary>True when the hardware can execute <c>VecDotQ8_0Vnni_4RowsR4</c> at all.</summary>
-    private static bool VnniAvailable => Avx512BW.IsSupported && AvxVnni.IsSupported;
+    private static bool VnniAvailable => DotLLM.Cpu.CpuFeatures.Avx512Bw && DotLLM.Cpu.CpuFeatures.AvxVnni;
 
     // Explicit initializer rather than a collection expression: MA0005 misfires on
     // `=> [...]` targeting TheoryData<T> and fails the build as "Use Array.Empty<T>()".
@@ -159,7 +159,7 @@ public sealed unsafe class MatMulR4VnniTests
     [MemberData(nameof(DiscriminatingBlockCounts))]
     public void ComputeRowsQ8_0Interleaved_DispatchPrefersAvx2Tier(int blockCount)
     {
-        if (!Avx2.IsSupported) return;
+        if (!DotLLM.Cpu.CpuFeatures.Avx2) return;
 
         int k = blockCount * Q8_0GroupSize;
 

@@ -85,7 +85,6 @@ public sealed unsafe class LittleBitPackedFormatTests
                 Assert.Equal(y[i], scalar[i], 1e-9 * (1 + Math.Abs(y[i])));
                 Assert.True(Math.Abs(y[i] - ybf[i]) / scale < 0.05);   // bf16 pipeline drift, loose by design
             }
-            if (!Avx2.IsSupported) return;
             var (dIn, r) = layer.ScratchDims;
             using var sc = new LittleBitScratch(dIn, r);
             var got = new float[layer.DOut];

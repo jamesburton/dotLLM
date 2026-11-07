@@ -43,7 +43,7 @@ public static unsafe partial class MatMul
                 $"elementCount must be a multiple of {Q8_K_GroupSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             QuantizeF32ToQ8_KAvx2(src, dest, elementCount);
         else
             QuantizeF32ToQ8_KScalar(src, dest, elementCount);
@@ -434,7 +434,7 @@ public static unsafe partial class MatMul
             }
 
             // One float conversion per super-block
-            acc = Fma.IsSupported
+            acc = CpuFeatures.Fma
                 ? Fma.MultiplyAdd(Vector256.Create(d4 * d8), Avx.ConvertToVector256Single(sumi), acc)
                 : Avx.Add(acc, Avx.Multiply(Vector256.Create(d4 * d8), Avx.ConvertToVector256Single(sumi)));
 
@@ -519,7 +519,7 @@ public static unsafe partial class MatMul
             }
 
             // One float conversion per super-block
-            acc = Fma.IsSupported
+            acc = CpuFeatures.Fma
                 ? Fma.MultiplyAdd(Vector256.Create(d6 * d8), Avx.ConvertToVector256Single(sumi), acc)
                 : Avx.Add(acc, Avx.Multiply(Vector256.Create(d6 * d8), Avx.ConvertToVector256Single(sumi)));
 
@@ -600,7 +600,7 @@ public static unsafe partial class MatMul
             }
 
             // One float conversion per super-block
-            acc = Fma.IsSupported
+            acc = CpuFeatures.Fma
                 ? Fma.MultiplyAdd(Vector256.Create(d5 * d8), Avx.ConvertToVector256Single(sumi), acc)
                 : Avx.Add(acc, Avx.Multiply(Vector256.Create(d5 * d8), Avx.ConvertToVector256Single(sumi)));
 
@@ -650,7 +650,7 @@ public static unsafe partial class MatMul
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, int wStride, float* results)
     {
-        if (!Avx2.IsSupported)
+        if (!CpuFeatures.Avx2)
         {
             results[0] = VecDotQ4_K_Q8_KPortable(w0, q8k, superBlockCount, wStride);
             results[1] = VecDotQ4_K_Q8_KPortable(w1, q8k, superBlockCount, wStride);
@@ -754,7 +754,7 @@ public static unsafe partial class MatMul
             }
 
             // 4 float conversions per super-block (one per row)
-            if (Fma.IsSupported)
+            if (CpuFeatures.Fma)
             {
                 acc0 = Fma.MultiplyAdd(Vector256.Create(d4_0 * d8), Avx.ConvertToVector256Single(sumi0), acc0);
                 acc1 = Fma.MultiplyAdd(Vector256.Create(d4_1 * d8), Avx.ConvertToVector256Single(sumi1), acc1);
@@ -816,7 +816,7 @@ public static unsafe partial class MatMul
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, int wStride, float* results)
     {
-        if (!Avx2.IsSupported)
+        if (!CpuFeatures.Avx2)
         {
             results[0] = VecDotQ5_K_Q8_KPortable(w0, q8k, superBlockCount, wStride);
             results[1] = VecDotQ5_K_Q8_KPortable(w1, q8k, superBlockCount, wStride);
@@ -944,7 +944,7 @@ public static unsafe partial class MatMul
                 }
             }
 
-            if (Fma.IsSupported)
+            if (CpuFeatures.Fma)
             {
                 acc0 = Fma.MultiplyAdd(Vector256.Create(d5_0 * d8), Avx.ConvertToVector256Single(sumi0), acc0);
                 acc1 = Fma.MultiplyAdd(Vector256.Create(d5_1 * d8), Avx.ConvertToVector256Single(sumi1), acc1);
@@ -1006,7 +1006,7 @@ public static unsafe partial class MatMul
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, int wStride, float* results)
     {
-        if (!Avx2.IsSupported)
+        if (!CpuFeatures.Avx2)
         {
             results[0] = VecDotQ6_K_Q8_KPortable(w0, q8k, superBlockCount, wStride);
             results[1] = VecDotQ6_K_Q8_KPortable(w1, q8k, superBlockCount, wStride);
@@ -1116,7 +1116,7 @@ public static unsafe partial class MatMul
                 }
             }
 
-            if (Fma.IsSupported)
+            if (CpuFeatures.Fma)
             {
                 acc0 = Fma.MultiplyAdd(Vector256.Create(d6_0 * d8), Avx.ConvertToVector256Single(sumi0), acc0);
                 acc1 = Fma.MultiplyAdd(Vector256.Create(d6_1 * d8), Avx.ConvertToVector256Single(sumi1), acc1);
@@ -1160,7 +1160,7 @@ public static unsafe partial class MatMul
                 weights + (long)(row + 3) * rowBytes,
                 xQ8K, superBlockCount, result + row);
         }
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             for (; row < m; row++)
                 result[row] = VecDotQ4_K_Q8_KAvx2(weights + (long)row * rowBytes, xQ8K, superBlockCount);
@@ -1188,7 +1188,7 @@ public static unsafe partial class MatMul
                 weights + (long)(row + 3) * rowBytes,
                 xQ8K, superBlockCount, result + row);
         }
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             for (; row < m; row++)
                 result[row] = VecDotQ5_K_Q8_KAvx2(weights + (long)row * rowBytes, xQ8K, superBlockCount);
@@ -1216,7 +1216,7 @@ public static unsafe partial class MatMul
                 weights + (long)(row + 3) * rowBytes,
                 xQ8K, superBlockCount, result + row);
         }
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             for (; row < m; row++)
                 result[row] = VecDotQ6_K_Q8_KAvx2(weights + (long)row * rowBytes, xQ8K, superBlockCount);
@@ -1260,7 +1260,7 @@ public static unsafe partial class MatMul
             int rowBytes = superBlockCount * Q4_K_BlockBytes;
             byte* tailBase = repackedWeights + (long)fullGroups * groupBytes;
             for (int r = 0; r < tailRows; r++)
-                result[fullGroups * 4 + r] = Avx2.IsSupported
+                result[fullGroups * 4 + r] = CpuFeatures.Avx2
                     ? VecDotQ4_K_Q8_KAvx2(tailBase + (long)r * rowBytes, xQ8K, superBlockCount)
                     : VecDotQ4_K_Q8_KPortable(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
         }
@@ -1293,7 +1293,7 @@ public static unsafe partial class MatMul
             int rowBytes = superBlockCount * Q5_K_BlockBytes;
             byte* tailBase = repackedWeights + (long)fullGroups * groupBytes;
             for (int r = 0; r < tailRows; r++)
-                result[fullGroups * 4 + r] = Avx2.IsSupported
+                result[fullGroups * 4 + r] = CpuFeatures.Avx2
                     ? VecDotQ5_K_Q8_KAvx2(tailBase + (long)r * rowBytes, xQ8K, superBlockCount)
                     : VecDotQ5_K_Q8_KPortable(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
         }
@@ -1326,7 +1326,7 @@ public static unsafe partial class MatMul
             int rowBytes = superBlockCount * Q6_K_BlockBytes;
             byte* tailBase = repackedWeights + (long)fullGroups * groupBytes;
             for (int r = 0; r < tailRows; r++)
-                result[fullGroups * 4 + r] = Avx2.IsSupported
+                result[fullGroups * 4 + r] = CpuFeatures.Avx2
                     ? VecDotQ6_K_Q8_KAvx2(tailBase + (long)r * rowBytes, xQ8K, superBlockCount)
                     : VecDotQ6_K_Q8_KPortable(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
         }
@@ -1906,7 +1906,7 @@ public static unsafe partial class MatMul
             int tailEnd = Math.Min(end, ctx.M) - ctx.FullGroups * 4;
             byte* tailBase = ctx.RepackedWeights + (long)ctx.FullGroups * groupBytes;
             for (int r = tailStart; r < tailEnd; r++)
-                ctx.Result[ctx.FullGroups * 4 + r] = Avx2.IsSupported
+                ctx.Result[ctx.FullGroups * 4 + r] = CpuFeatures.Avx2
                     ? vecDotAvx2(tailBase + (long)r * rowBytes, ctx.XQ, ctx.BlockCount)
                     : vecDotScalar(tailBase + (long)r * rowBytes, ctx.XQ, ctx.BlockCount);
         }

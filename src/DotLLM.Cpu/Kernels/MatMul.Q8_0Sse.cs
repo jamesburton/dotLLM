@@ -72,7 +72,7 @@ public static unsafe partial class MatMul
     /// <param name="bits">The Half's bit pattern.</param>
     /// <returns>The value as Single.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static float HalfToSingle(ushort bits) => Sse2.IsSupported
+    internal static float HalfToSingle(ushort bits) => CpuFeatures.Sse2
         ? HalfToSingleSse2(Vector128.CreateScalarUnsafe((int)bits)).ToScalar()
         : (float)BitConverter.UInt16BitsToHalf(bits);
 
@@ -195,8 +195,8 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ8_0Row(byte* w, byte* xQ8, int blockCount)
     {
-        if (Avx2.IsSupported) return VecDotQ8_0Avx2(w, xQ8, blockCount);
-        if (Ssse3.IsSupported) return VecDotQ8_0Sse(w, xQ8, blockCount);
+        if (CpuFeatures.Avx2) return VecDotQ8_0Avx2(w, xQ8, blockCount);
+        if (CpuFeatures.Ssse3) return VecDotQ8_0Sse(w, xQ8, blockCount);
         return VecDotQ8_0Scalar(w, xQ8, blockCount);
     }
 }

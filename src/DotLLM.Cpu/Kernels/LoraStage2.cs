@@ -62,10 +62,11 @@ public static unsafe class LoraStage2
 {
     /// <summary>
     /// Returns <c>true</c> when the current CPU supports the AVX-512 fast
-    /// path used by <see cref="ApplyF32_R16"/>. Callers must fall back to
-    /// the generic per-token GEMV path otherwise.
+    /// path used by <see cref="ApplyF32_R16"/>. <see cref="ApplyF32_R16"/> itself now
+    /// falls back to a scalar loop, but the generic per-token GEMV path is faster than that
+    /// scalar loop, so callers still prefer it when this is <c>false</c>.
     /// </summary>
-    public static bool IsAvx512FastPathSupported => Avx512F.IsSupported;
+    public static bool IsAvx512FastPathSupported => CpuFeatures.Avx512F;
 
 
     /// <summary>
@@ -238,16 +239,43 @@ public static unsafe class LoraStage2
     /// <param name="seqLen">Token count.</param>
     /// <param name="outputDim">Up-projection output dimension.</param>
     /// <param name="scale">LoRA scaling factor (<c>alpha / rank</c>).</param>
-    [SkipLocalsInit]
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void ApplyF32_R16(
         float* aTransposed, float* tmp, float* y,
         int seqLen, int outputDim, float scale)
     {
+        // Dispatcher (#1623): AVX-512F fast path when present, otherwise the scalar loop. It used to throw
+        // PlatformNotSupportedException and rely on every caller testing IsAvx512FastPathSupported first.
+        if (CpuFeatures.Avx512F) ApplyF32_R16Avx512(aTransposed, tmp, y, seqLen, outputDim, scale);
+        else ApplyF32_R16Scalar(aTransposed, tmp, y, seqLen, outputDim, scale);
+    }
+
+    /// <summary>Scalar <see cref="ApplyF32_R16"/>: same read-modify-write contract, 16-term dot per output element.</summary>
+    [SkipLocalsInit]
+    internal static void ApplyF32_R16Scalar(
+        float* aTransposed, float* tmp, float* y,
+        int seqLen, int outputDim, float scale)
+    {
+        for (int t = 0; t < seqLen; t++)
+        {
+            float* tmpRow = tmp + (long)t * 16;
+            float* yRow = y + (long)t * outputDim;
+            for (int o = 0; o < outputDim; o++)
+            {
+                float s = 0f;
+                for (int r = 0; r < 16; r++) s += tmpRow[r] * aTransposed[(long)r * outputDim + o];
+                yRow[o] += scale * s;
+            }
+        }
+    }
+
+    /// <summary>AVX-512F body of <see cref="ApplyF32_R16"/>. Callers go through the dispatcher.</summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void ApplyF32_R16Avx512(
+        float* aTransposed, float* tmp, float* y,
+        int seqLen, int outputDim, float scale)
+    {
         const int rank = 16;
-        if (!Avx512F.IsSupported)
-            throw new PlatformNotSupportedException(
-                "LoraStage2.ApplyF32_R16 requires AVX-512F. Callers must check IsAvx512FastPathSupported first.");
 
         Vector512<float> scaleVec = Vector512.Create(scale);
 

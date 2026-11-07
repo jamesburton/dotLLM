@@ -162,10 +162,10 @@ public static class FastMath
         ref float src = ref MemoryMarshal.GetReference(input);
         ref float dst = ref MemoryMarshal.GetReference(output);
 
-        if (Avx512F.IsSupported)
+        if (CpuFeatures.Avx512F)
             return ExpSumAndStoreAvx512(ref src, ref dst, length, offset);
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
             return ExpSumAndStoreAvx2(ref src, ref dst, length, offset);
 
         return ExpSumAndStoreScalar(ref src, ref dst, length, offset);
@@ -267,7 +267,7 @@ public static class FastMath
             var shifted = Avx.Add(x, offsetVec);
             shifted = Avx.Max(shifted, minVec);
             Vector256<float> y;
-            if (Fma.IsSupported)
+            if (CpuFeatures.Fma)
                 y = Fma.MultiplyAdd(shifted, c0Vec, c1Vec);
             else
                 y = Avx.Add(Avx.Multiply(shifted, c0Vec), c1Vec);

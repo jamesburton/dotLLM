@@ -192,7 +192,7 @@ public static unsafe partial class MatMul
     }
 
     /// <summary>Whether the AVX2 NVFP4 dot can run on this CPU.</summary>
-    private static bool Nvfp4Avx2 => Avx2.IsSupported && Fma.IsSupported;
+    private static bool Nvfp4Avx2 => CpuFeatures.Avx2 && CpuFeatures.Fma;
 
     /// <summary>NVFP4 × Q8_0 row dot, dispatched to AVX2 or the scalar transcription.</summary>
     /// <param name="w">One NVFP4 row.</param>

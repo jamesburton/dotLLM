@@ -344,7 +344,7 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
                 nameof(headDim));
 
         long qBytes = (long)seqQ * numHeads * headDim * sizeof(float);
-        long kvBytes = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
+        long kvBytes = (long)seqKv * KvStorage.RowBytes((long)numKvHeads * headDim);
         if (q.Size < qBytes) throw new ArgumentException("Q buffer too small.", nameof(q));
         if (k.Size < kvBytes) throw new ArgumentException("K buffer too small.", nameof(k));
         if (v.Size < kvBytes) throw new ArgumentException("V buffer too small.", nameof(v));

@@ -270,7 +270,7 @@ public static unsafe partial class Dequantize
                 $"Q8_0 element count must be a multiple of {Q8_0GroupSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             DequantizeQ8_0Avx2(src, elementCount, dest);
         }
@@ -474,7 +474,7 @@ public static unsafe partial class Dequantize
                 $"Q5_0 element count must be a multiple of {Q5_0GroupSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             DequantizeQ5_0Avx2(src, elementCount, dest);
         }
@@ -720,7 +720,7 @@ public static unsafe partial class Dequantize
     /// <summary>
     /// AVX2-accelerated Q5_0 dequantization. Processes one 32-element block per iteration:
     /// unpacks low/high nibbles into a 256-bit vector, ORs in the 5th bit from <c>qh</c> via
-    /// <see cref="MatMul.ExtractQ5HighBits"/>, subtracts 16 to recover the signed value, then
+    /// <see cref="MatMul.ExtractQ5HighBitsAvx2"/>, subtracts 16 to recover the signed value, then
     /// widens sbyte→short→int→float and multiplies by the broadcast scale.
     /// </summary>
     [SkipLocalsInit]
@@ -755,7 +755,7 @@ public static unsafe partial class Dequantize
                 // Combine halves, OR in the 5th bit (0x10 per set bit), subtract 16 to center.
                 Vector256<byte> q5vals = Avx2.Or(
                     Vector256.Create(lo128, hi128),
-                    MatMul.ExtractQ5HighBits(qh));
+                    MatMul.ExtractQ5HighBitsAvx2(qh));
                 Vector256<sbyte> centered = Avx2.Subtract(q5vals.AsSByte(), sixteen);
 
                 // Widen sbyte → short → int and convert to float × scale.

@@ -36,7 +36,7 @@ public sealed unsafe class LowBitKQuantDotTests
 
     public enum Fmt { Q2_K, Q3_K }
 
-    private static bool SseTierDispatched => Ssse3.IsSupported && !Avx2.IsSupported;
+    private static bool SseTierDispatched => DotLLM.Cpu.CpuFeatures.Ssse3 && !DotLLM.Cpu.CpuFeatures.Avx2; // the dispatcher's own condition (#1623)
 
     private static int BlockBytes(Fmt f) => f == Fmt.Q2_K ? 84 : 110;
 
