@@ -35,6 +35,12 @@ public sealed class GraniteGpuParityTests
     {
         yield return new object[] { "granite-3L-gqa", new SyntheticGraniteConfig() };
         yield return new object[] { "granite-tied-hd64", new SyntheticGraniteConfig { Hidden = 256, Heads = 4, KvHeads = 4, Tied = true, Layers = 2 } };
+        // TwIL-8B / Granite-4.2 shape of scalars: embedding, residual and logit scalars are 1 and only attention.scale is
+        // set, to 1/head_dim (64 here) rather than 1/sqrt(head_dim). CUDA serves it on the generic FP16 loop with the score
+        // scale folded into the RoPE multiplier (ModelConfig.GraniteScalarsFoldIntoRope); dropping the fold scores with
+        // 1/sqrt(64) = 0.125 instead of 0.0156 and diverges from the CPU oracle.
+        yield return new object[] { "granite-identity-scalars-attn-1-over-hd", new SyntheticGraniteConfig
+            { Hidden = 256, Heads = 4, KvHeads = 2, Layers = 3, EmbeddingScale = 1f, ResidualScale = 1f, LogitScale = 1f, AttentionScale = 1f / 64, QkWeightScale = 1f } };
     }
 
     /// <summary>
@@ -202,13 +208,20 @@ public sealed class GraniteGpuParityTests
             {
                 Assert.Equal(Architecture.Granite, config.Architecture);
                 double worst = 0;
-                const double abs = 0.05;   // FP16 weights + FP16 logits head + FP16 KV store
+                // FP16 weights + FP16 logits head + FP16 KV store. The identity-scalar fixture runs the generic FP16 activation
+                // loop (the others run the FP32 dense forward), so its random-weight logits carry FP16 residual rounding; the FP32 forward deviates from the CPU by the same ~0.24 on this fixture (measured), so the bar is the fixture, not the path. The scale-sensitivity gate below is what discriminates.
+                double abs = name.StartsWith("granite-identity", StringComparison.Ordinal) ? 0.30 : 0.05;
 
                 using (var cache = model.CreateKvCache(maxSeqLen: Tokens.Length + 1))
                 {
                     using (ITensor l = model.Forward(Tokens.AsSpan(0, PrefillLen).ToArray(),
                                Enumerable.Range(0, PrefillLen).ToArray(), -1, cache))
-                        Compare($"{name} prefill", cpuA[PrefillLen - 1], Last(l, vocab), abs, ref worst);
+                    {
+                        float[] gpuLast = Last(l, vocab);
+                        Compare($"{name} prefill", cpuA[PrefillLen - 1], gpuLast, abs, ref worst);
+                        if (name.StartsWith("granite-identity", StringComparison.Ordinal))
+                            AssertCloserToTrueScaleThanDefaultScale(cfg, gpuLast, cpuA[PrefillLen - 1]);
+                    }
                     for (int t = PrefillLen; t < Tokens.Length; t++)
                     {
                         using ITensor l = model.Forward([Tokens[t]], [t], -1, cache);
@@ -244,6 +257,28 @@ public sealed class GraniteGpuParityTests
         {
             try { File.Delete(path); } catch { /* best-effort */ }
         }
+    }
+
+    /// <summary>
+    /// Sensitivity gate for the identity-scalar fixture: the same weights with <c>attention.scale</c> omitted (the kernels' default
+    /// 1/sqrt(head_dim), i.e. exactly what dropping the RoPE fold would compute) must sit FAR from the GPU result, while the true-scale
+    /// CPU oracle sits close. Without this the tolerance alone could hide a missing fold (the fixture's attention is only mildly sharp).
+    /// </summary>
+    private static void AssertCloserToTrueScaleThanDefaultScale(SyntheticGraniteConfig cfg, float[] gpu, float[] cpuTrue)
+    {
+        string path = WriteFixture(cfg with { AttentionScale = 0f });
+        try
+        {
+            float[][] wrong = CpuRows(path, Tokens.AsSpan(0, PrefillLen).ToArray(), out _);
+            double dTrue = 0, dWrong = 0;
+            for (int i = 0; i < gpu.Length; i++)
+            {
+                dTrue = Math.Max(dTrue, Math.Abs(gpu[i] - cpuTrue[i]));
+                dWrong = Math.Max(dWrong, Math.Abs(gpu[i] - wrong[PrefillLen - 1][i]));
+            }
+            Assert.True(dWrong > 4 * dTrue, $"fixture not sensitive to the attention scale: |gpu-cpuTrue|={dTrue:E3}, |gpu-cpuDefaultScale|={dWrong:E3}");
+        }
+        finally { try { File.Delete(path); } catch { /* best-effort */ } }
     }
 
     /// <summary>
