@@ -15,9 +15,13 @@
 // It writes the same un-normalized partials, per (query head, split), as attention_f32_splitkv.glsl, so the same merge pass
 // (attention_f32_splitkv_merge.comp) finishes the row. Masking (causal / bidirectional / hybrid), sliding window, ALiBi,
 // soft-cap, scale override and kvStart follow attention_f32_splitkv.glsl. Push constants are identical; the dispatch is
-// numKvHeads * numSplits workgroups.
+// numKvHeads * subGroups * numSplits workgroups.
 //
-// Bounds: G <= MAX_GROUP, head_dim <= MAX_HEAD_DIM (= WG_SIZE). LDS: 8 KiB Q + 4 KiB scores.
+// Groups wider than MAX_GROUP (issue #1612: glm4moe has 12 query heads per KV head) are served in ceil(G / MAX_GROUP) balanced
+// sub-groups (12 -> 6 + 6, 9 -> 5 + 4), one workgroup per (KV head, sub-group, split): the KV rows are read once per sub-group,
+// ceil(G / MAX_GROUP) times per decoded token instead of G.
+//
+// Bounds: head_dim <= MAX_HEAD_DIM (= WG_SIZE). LDS: 8 KiB Q + 4 KiB scores.
 
 #define TILE_KV      128
 #define MAX_HEAD_DIM 256
@@ -82,12 +86,20 @@ shared float corr[MAX_GROUP];
 
 void main() {
     uint blockId = gl_WorkGroupID.x;
-    if (blockId >= pc.numKvHeads * pc.numSplits) return;
 
-    uint hkv     = blockId / pc.numSplits;
-    uint splitId = blockId - hkv * pc.numSplits;
-    uint G       = pc.numHeads / pc.numKvHeads;
-    uint hq0     = hkv * G;
+    // A KV head's G query heads are served in nSubG balanced sub-groups of at most MAX_GROUP heads (see the header); this
+    // workgroup serves heads hq0 .. hq0 + G - 1 of KV head hkv, where G is now the sub-group's size.
+    uint Gfull   = pc.numHeads / pc.numKvHeads;
+    uint nSubG   = (Gfull + uint(MAX_GROUP) - 1u) / uint(MAX_GROUP);
+    uint Gsub    = (Gfull + nSubG - 1u) / nSubG;
+    if (blockId >= pc.numKvHeads * nSubG * pc.numSplits) return;
+
+    uint unit    = blockId / pc.numSplits;
+    uint splitId = blockId - unit * pc.numSplits;
+    uint hkv     = unit / nSubG;
+    uint sub     = unit - hkv * nSubG;
+    uint hq0     = hkv * Gfull + sub * Gsub;
+    uint G       = min(Gsub, Gfull - sub * Gsub);
     uint tid     = gl_LocalInvocationID.x;
     uint kvStride = pc.numKvHeads * pc.headDim;
     uint posQ    = pc.positionOffset;

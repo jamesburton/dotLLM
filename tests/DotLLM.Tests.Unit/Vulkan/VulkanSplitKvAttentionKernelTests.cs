@@ -95,6 +95,46 @@ public class VulkanSplitKvAttentionKernelTests
     }
 
     [SkippableFact]
+    public void Decode_Glm4MoeShape_Gqa12_SubGrouped_HeadDim128()
+    {
+        // Issue #1612: GLM-4.5-Air (96 query heads over 8 KV heads, head_dim 128): a 12-head group is wider than MAX_GROUP = 8, so the
+        // grouped passes serve it as two 6-head sub-groups per KV head (16 units, S = 16 at this depth; the per-head pass takes S = 2).
+        // A sub-group indexing bug (hq0 ignoring the sub-group, swapped unit decomposition) shows up in heads 6..11 of every KV head.
+        RunOne(seqKv: 8200, numHeads: 96, numKvHeads: 8, headDim: 128, positionOffset: 8199);
+    }
+
+    [SkippableFact]
+    public void Decode_Gqa16_TwoFullSubGroups()
+    {
+        // Group 16 = two full 8-head sub-groups over 2 KV heads (the Qwen3.5/3.6 MoE full-attention shape).
+        RunOne(seqKv: 3000, numHeads: 32, numKvHeads: 2, headDim: 128, positionOffset: 2999);
+    }
+
+    [SkippableFact]
+    public void Decode_Gqa9_UnbalancedSubGroups()
+    {
+        // Group 9 over 2 KV heads = sub-groups of 5 + 4: the second sub-group's head count is the remainder, so a pass that assumes a
+        // full sub-group reads a query head of the next KV head (or past the last) and writes its partial over a neighbour's row.
+        RunOne(seqKv: 1000, numHeads: 18, numKvHeads: 2, headDim: 64, positionOffset: 999);
+    }
+
+    [SkippableFact]
+    public void Decode_Gqa12_Alibi_AbsoluteHeadIndex()
+    {
+        // ALiBi slopes index the ABSOLUTE query head: a sub-grouped pass that used the head's index within its sub-group would give the
+        // second sub-group the first one's slopes. 24 / 2 at head_dim 64 (slope spread over 24 heads).
+        RunOne(seqKv: 900, numHeads: 24, numKvHeads: 2, headDim: 64, positionOffset: 899, useAlibi: true);
+    }
+
+    [SkippableFact]
+    public void Decode_Gqa12_SlidingWindow_MaskedTail()
+    {
+        // Sub-grouped with a sliding window and the query before the end (positions 601.. masked), so every sub-group sees the same
+        // fully-masked and partly-masked splits.
+        RunOne(seqKv: 1200, numHeads: 48, numKvHeads: 4, headDim: 128, positionOffset: 600, slidingWindow: 257);
+    }
+
+    [SkippableFact]
     public void Decode_FlintShape_SlidingWindow_HeadDim96()
     {
         // Sliding window with a head_dim below 128 (v2: lanes 12..15 of each position idle).

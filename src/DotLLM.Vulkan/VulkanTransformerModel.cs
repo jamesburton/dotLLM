@@ -1362,7 +1362,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     /// </summary>
     private void InitDenseKvF16Kernels(string spvDir)
     {
-        InitKvF16Kernels(spvDir, gqaSplit: false);   // writer + split-KV decode twin
+        // Writer + split-KV decode twin. The GQA-grouped split pass (one KV read per (KV head, sub-group) instead of one per query head) is
+        // on for glm4moe (#1612: 96 / 8 heads, `attn_split` was 70 % of a decode step at 8K); the other dense architectures keep the
+        // per-head pass until the grouped pass is measured on them. DOTLLM_VULKAN_SPLITKV_GQA=1 / 0 overrides on any host.
+        InitKvF16Kernels(spvDir, gqaSplit: Config.Architecture == DotLLM.Core.Configuration.Architecture.Glm4Moe);
         _attentionKvF16 = AttentionF32Kernel.Create(_device, spvDir, VulkanKvStorage.F16);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_FUSED_ROPE_KV_F16") != "0")
         {

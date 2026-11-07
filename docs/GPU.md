@@ -473,7 +473,8 @@ What moved the numbers (each step bit-identical or gated against the CPU model o
   all of a tile's loads in flight, and the KV heads interleaved across consecutive workgroups. A cache row holds every KV head's
   columns; ordering workgroups one head's slice of many rows at a time ran at ~90 GB/s, neighbouring slices of the same rows at
   ~190-200 GB/s. The same interleave measured nothing on the flash prefill (its tiles are reused by 64 query rows). At least 64
-  positions per split (`ComputeGqa2Splits`).
+  positions per split (`ComputeGqa2Splits`). Groups wider than 8 query heads per KV head are served as ceil(G / 8) sub-groups
+  per KV head (#1612, glm4moe 96 / 8: two 6-head sub-groups, two KV reads per token instead of twelve); see ATTENTION.md.
 - **Grouped Q4_1 MoE v2** (`moe_grouped_q4_1_{gateup,down}_v2`): a permutation instead of the topK broadcast + grouped copy, gate
   and up in one pass with SwiGLU on the accumulators, 64-row work items so an expert's weights are read once per 64 rows, two Q4_1
   blocks per staging round, and the down pass writing straight to the (token, slot) rows with the power-of-two row scale in its
