@@ -226,7 +226,7 @@ public sealed class Corpus
     /// is not a corpus file and is not in the map).
     /// </summary>
     internal static (CSharpCompilation Compilation, Dictionary<string, SyntaxTree> Trees) CreateCompilation(
-        IEnumerable<SourceFile> files, bool implicitUsings)
+        IEnumerable<SourceFile> files, bool implicitUsings, int maxSyntaxDepth = RoslynParsing.MaxCompilationSyntaxDepth)
     {
         var trees = new Dictionary<string, SyntaxTree>(StringComparer.Ordinal);
         foreach (SourceFile f in files)
@@ -234,7 +234,7 @@ public sealed class Corpus
             SyntaxTree tree;
             if (RoslynParsing.TooDeep(f.Text, out int depth))
             {
-                // Too deep to parse (or to bind later on an ordinary thread): an empty tree, so none of its symbols resolve.
+                // Too deep to parse: an empty tree, so none of its symbols resolve.
                 System.Diagnostics.Trace.TraceWarning(
                     $"{f.Path}: bracket nesting {depth} exceeds {RoslynParsing.MaxNestingDepth}; left out of the compilation.");
                 tree = CSharpSyntaxTree.ParseText("", SymbolChunker.ParseOptions, f.Path);
@@ -242,6 +242,17 @@ public sealed class Corpus
             else
             {
                 tree = RoslynParsing.Parse(f.Text, f.Path);
+                // Nesting without brackets (generic angles, '.' chains, ternaries, unary operators) passes the bracket cap and then
+                // overflows Roslyn's binder: measure the parsed tree and leave such a file out too.
+                int syntaxDepth = RoslynParsing.SyntaxDepth(tree.GetRoot());
+                // A compilation handed to callers is bound on THEIR stack, so the default cap is the low one; the graph builder
+                // binds its private compilation on the large-stack thread and passes the high one.
+                if (syntaxDepth > maxSyntaxDepth)
+                {
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"{f.Path}: syntax depth {syntaxDepth} exceeds {maxSyntaxDepth}; left out of the compilation.");
+                    tree = CSharpSyntaxTree.ParseText("", SymbolChunker.ParseOptions, f.Path);
+                }
             }
             if (!trees.TryAdd(f.Path, tree))
                 throw new ArgumentException($"Duplicate file path '{f.Path}'.", nameof(files));
