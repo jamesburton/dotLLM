@@ -128,6 +128,7 @@ internal static class RoslynParsing
         T result = default!;
         ExceptionDispatchInfo? error = null;
         using var cts = new CancellationTokenSource();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         if (timeout == TimeSpan.Zero) cts.Cancel();
         else if (timeout != Timeout.InfiniteTimeSpan) cts.CancelAfter(timeout);
         var thread = new Thread(() =>
@@ -146,7 +147,7 @@ internal static class RoslynParsing
             throw new TimeoutException($"Roslyn work did not stop {(grace ?? CancelGrace).TotalSeconds:F0} s after its {timeout.TotalSeconds:F0} s budget; the thread was abandoned.");
         }
         // Roslyn's parser polls the token only now and then, so work can finish after its budget ran out: that is an overrun too.
-        if (timeout != Timeout.InfiniteTimeSpan && cts.IsCancellationRequested && (error is null || error.SourceException is OperationCanceledException))
+        if (timeout != Timeout.InfiniteTimeSpan && (clock.Elapsed > timeout || cts.IsCancellationRequested) && (error is null || error.SourceException is OperationCanceledException))
             throw new TimeoutException($"Roslyn work exceeded its {timeout.TotalSeconds:F0} s budget.");
         error?.Throw();
         return result;

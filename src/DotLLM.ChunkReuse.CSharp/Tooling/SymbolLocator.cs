@@ -59,7 +59,11 @@ public static class SymbolLocator
     /// suggestions: qualified names of declarations whose last name equals the query's ignoring case but that do not match.
     /// Both ordered by path, then offset.
     /// </summary>
-    public static (IReadOnlyList<SymbolDefinition> Matches, IReadOnlyList<string> Suggestions) Find(IReadOnlyList<SourceFile> files, string[] segments)
+    public static (IReadOnlyList<SymbolDefinition> Matches, IReadOnlyList<string> Suggestions) Find(IReadOnlyList<SourceFile> files, string[] segments) =>
+        Find(files, segments, fileBudget: null);
+
+    /// <summary><see cref="Find(IReadOnlyList{SourceFile}, string[])"/> with a per-file parse budget (tests); null is the default budget.</summary>
+    internal static (IReadOnlyList<SymbolDefinition> Matches, IReadOnlyList<string> Suggestions) Find(IReadOnlyList<SourceFile> files, string[] segments, TimeSpan? fileBudget)
     {
         ArgumentNullException.ThrowIfNull(files);
         ArgumentNullException.ThrowIfNull(segments);
@@ -84,7 +88,7 @@ public static class SymbolLocator
             SyntaxTree tree;
             try
             {
-                tree = RoslynParsing.Parse(file.Text, file.Path);
+                tree = RoslynParsing.Parse(file.Text, file.Path, fileBudget);
             }
             catch (TimeoutException ex)
             {

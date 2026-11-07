@@ -52,6 +52,14 @@ public sealed class RoslynBudgetTests
     }
 
     [Fact]
+    public void RunWithLargeStack_WorkThatFinishesAfterTheBudgetButWithinTheGrace_StillCountsAsAnOverrun()
+    {
+        // Roslyn's parser polls the token only now and then: a result that arrives late is not accepted.
+        Assert.Throws<TimeoutException>(() => RoslynParsing.RunWithLargeStack(_ => { Thread.Sleep(300); return 1; },
+            TimeSpan.FromMilliseconds(50), grace: TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
     public void RunWithLargeStack_WorkWithinTheTimeout_ReturnsItsResult_AndRethrowsItsOwnExceptions()
     {
         Assert.Equal(7, RoslynParsing.RunWithLargeStack(_ => 7, TimeSpan.FromSeconds(30)));
@@ -108,6 +116,17 @@ public sealed class RoslynBudgetTests
     }
 
     // ---- time budget
+
+    [Fact]
+    public void SymbolLocatorFind_ParseOverTheBudget_SkipsTheFile_NoThrow()
+    {
+        var files = new[] { new SourceFile("a.cs", "class Target { }\n") };
+        Assert.NotEmpty(SymbolLocator.Find(files, ["Target"]).Matches); // control: the default budget finds it
+
+        (IReadOnlyList<SymbolDefinition> matches, _) = SymbolLocator.Find(files, ["Target"], TimeSpan.Zero);
+
+        Assert.Empty(matches);
+    }
 
     [Fact]
     public void SymbolChunker_ParseOverTheBudget_FallsBackToLines()
