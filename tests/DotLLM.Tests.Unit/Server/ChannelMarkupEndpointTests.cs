@@ -217,11 +217,8 @@ public sealed class ChannelMarkupEndpointTests
         var c = new StringBuilder();
         JsonElement? calls = null;
         string? finish = null;
-        foreach (string block in Encoding.UTF8.GetString(body.ToArray()).Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
+        foreach (var f in SseTestReader.Json(Encoding.UTF8.GetString(body.ToArray())))
         {
-            string data = block["data: ".Length..];
-            if (data == "[DONE]") continue;
-            var f = JsonDocument.Parse(data).RootElement.Clone();
             frames.Add(f);
             foreach (var choice in f.GetProperty("choices").EnumerateArray())
             {
@@ -339,13 +336,7 @@ public sealed class ChannelMarkupEndpointTests
             ctx, _ => Tokens(pieces), (work, _) => work(), parser, null,
             "msg_t", "m", promptTokenCount: 3, CancellationToken.None, forcedToolCall: false, plan,
             tools: parser is null ? null : Tools);
-        var frames = new List<(string, JsonElement)>();
-        foreach (string block in Encoding.UTF8.GetString(body.ToArray()).Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
-        {
-            var lines = block.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-            frames.Add((lines[0]["event: ".Length..], JsonDocument.Parse(lines[1]["data: ".Length..]).RootElement.Clone()));
-        }
-        return frames;
+        return SseTestReader.NamedJson(Encoding.UTF8.GetString(body.ToArray())).ToList();
     }
 
     [Fact]
