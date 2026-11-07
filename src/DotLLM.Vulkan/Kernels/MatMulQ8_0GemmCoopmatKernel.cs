@@ -73,6 +73,16 @@ public readonly record struct Q8_0GemmCoopmatVariant(
             RequiresNativeSubgroupSize: 64);
 
     /// <summary>
+    /// RED-arm control for the #1150 F32-reference gate: <see cref="Blocked128x128x4"/> with a <b>float16_t</b> coopmat
+    /// accumulator (converted to F32 at the store). Deliberately wrong, never returned by <see cref="SelectFor"/> and not
+    /// enumerated by <see cref="AvailableOn"/>; <c>VulkanQ8_0PrefillF32ReferenceTests</c> loads it explicitly and requires it
+    /// to FAIL the accuracy gate the shipped F32-accumulate kernel passes.
+    /// </summary>
+    public static Q8_0GemmCoopmatVariant F16AccumulateControl =>
+        new("matmul_q8_0_gemm_coopmat_128x128x4_f16acc_control.spv", 0, TileM: 128, TileN: 128,
+            RequiresNativeSubgroupSize: 64);
+
+    /// <summary>
     /// 32-thread workgroup pinned to wave32 via <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c>.
     /// </summary>
     /// <remarks>
@@ -197,6 +207,9 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
     private readonly int _tileN;
     private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, blocksPerRow, rowUints
 
+    /// <summary>The shader variant this instance loaded (the orchestrator's #1150 default gate keys on it).</summary>
+    public Q8_0GemmCoopmatVariant Variant { get; private init; }
+
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
@@ -268,7 +281,7 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        var kernel = new MatMulQ8_0GemmCoopmatKernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
+        var kernel = new MatMulQ8_0GemmCoopmatKernel(device, module, pipeline, pool, variant.TileM, variant.TileN) { Variant = variant };
         if (variant.SpvFileName == Q8_0GemmCoopmatVariant.Blocked128x128x4.SpvFileName)
         {
             kernel._splitK = CoopmatSplitK.TryCreate(device, spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_splitk.spv",
