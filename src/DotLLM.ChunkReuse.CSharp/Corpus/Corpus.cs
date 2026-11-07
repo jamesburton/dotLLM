@@ -226,7 +226,7 @@ public sealed class Corpus
     /// is not a corpus file and is not in the map).
     /// </summary>
     internal static (CSharpCompilation Compilation, Dictionary<string, SyntaxTree> Trees) CreateCompilation(
-        IEnumerable<SourceFile> files, bool implicitUsings)
+        IEnumerable<SourceFile> files, bool implicitUsings, int maxSyntaxDepth = RoslynParsing.MaxCompilationSyntaxDepth)
     {
         var trees = new Dictionary<string, SyntaxTree>(StringComparer.Ordinal);
         foreach (SourceFile f in files)
@@ -245,10 +245,12 @@ public sealed class Corpus
                 // Nesting without brackets (generic angles, '.' chains, ternaries, unary operators) passes the bracket cap and then
                 // overflows Roslyn's binder: measure the parsed tree and leave such a file out too.
                 int syntaxDepth = RoslynParsing.SyntaxDepth(tree.GetRoot());
-                if (syntaxDepth > RoslynParsing.MaxSyntaxDepth)
+                // A compilation handed to callers is bound on THEIR stack, so the default cap is the low one; the graph builder
+                // binds its private compilation on the large-stack thread and passes the high one.
+                if (syntaxDepth > maxSyntaxDepth)
                 {
                     System.Diagnostics.Trace.TraceWarning(
-                        $"{f.Path}: syntax depth {syntaxDepth} exceeds {RoslynParsing.MaxSyntaxDepth}; left out of the compilation.");
+                        $"{f.Path}: syntax depth {syntaxDepth} exceeds {maxSyntaxDepth}; left out of the compilation.");
                     tree = CSharpSyntaxTree.ParseText("", SymbolChunker.ParseOptions, f.Path);
                 }
             }

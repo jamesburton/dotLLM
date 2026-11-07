@@ -64,6 +64,13 @@ public static class CallResolution
     public static IReadOnlyList<CallSite> Sites(IReadOnlyList<ProjectCompilation> projects, IReadOnlySet<string>? paths = null)
     {
         ArgumentNullException.ThrowIfNull(projects);
+        // Roslyn's binder recurses per nesting level: bind on the large-stack thread (the caller's stack may be ordinary), and
+        // leave out a file nested deeper than the cap that thread makes safe.
+        return CodeCorpus.RoslynParsing.RunWithLargeStack(() => SitesCore(projects, paths));
+    }
+
+    private static IReadOnlyList<CallSite> SitesCore(IReadOnlyList<ProjectCompilation> projects, IReadOnlySet<string>? paths)
+    {
         var corpusPath = new Dictionary<string, string>(RoslynGraphBuilder.PathComparer);
         foreach (ProjectCompilation p in projects)
             foreach ((string path, SyntaxTree tree) in p.Trees)
@@ -75,6 +82,12 @@ public static class CallResolution
             foreach ((string path, SyntaxTree tree) in p.Trees)
             {
                 if (paths is not null && !paths.Contains(path)) continue;
+                int depth = CodeCorpus.RoslynParsing.SyntaxDepth(tree.GetRoot());
+                if (depth > CodeCorpus.RoslynParsing.MaxSyntaxDepth)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"{path}: syntax depth {depth} exceeds {CodeCorpus.RoslynParsing.MaxSyntaxDepth}; no call sites measured.");
+                    continue;
+                }
                 SemanticModel model = p.Compilation.GetSemanticModel(tree);
                 foreach (InvocationExpressionSyntax inv in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
                 {

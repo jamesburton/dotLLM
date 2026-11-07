@@ -91,7 +91,8 @@ public sealed class GraphBuilderHostileInputTests
     public void BuildFromProjects_HostileNesting_DoesNotCrash_AndTheOtherFilesStillGetTheirEdges(string shape, string text)
     {
         var ok = new SourceFile("ok.cs", Ok);
-        var hostile = new SourceFile("hostile.cs", text);
+        // The hostile file also refers to a symbol of the ordinary file: leaving it unbound must not throw.
+        var hostile = new SourceFile("hostile.cs", text + "\nclass Ref { int Q() => Lib.Add(1, 2); }\n");
         var trees = new Dictionary<string, Microsoft.CodeAnalysis.SyntaxTree>(StringComparer.Ordinal)
         {
             [ok.Path] = RoslynParsing.Parse(ok.Text, ok.Path),
@@ -107,6 +108,73 @@ public sealed class GraphBuilderHostileInputTests
 
         Assert.Contains(graph.QueryEdges(ok.Path, 0, ok.Text.Length), e => e.Kind == SymbolEdgeKind.Call);
         Assert.Empty(graph.QueryEdges(hostile.Path, 0, text.Length));
+    }
+
+    /// <summary>Shapes that passed the previous 2048 cap and overflowed a caller's ordinary stack in <c>GetDiagnostics()</c>.</summary>
+    public static TheoryData<string, string> CallerStackShapes() => new()
+    {
+        { "nested lambdas x1500", Wrap("System.Func<int, object> f = " + string.Concat(Enumerable.Repeat("v => ", 1500)) + "1;") },
+        { "ternary chain x1100", Wrap("int y = " + string.Concat(Enumerable.Repeat("b ? 1 : ", 1100)) + "0;") },
+        { "nested switch expressions x400", Wrap("var y = " + string.Concat(Enumerable.Repeat("x switch { _ => ", 400)) + "1" + new string('}', 400) + ";") },
+        { "nested lambdas x2000", Wrap("System.Func<int, object> f = " + string.Concat(Enumerable.Repeat("v => ", 2000)) + "1;") },
+    };
+
+    /// <summary>The 1 MiB default of a Windows thread: what an ordinary caller binds on (the runtime may give more, never less).</summary>
+    private static void OnOrdinaryStack(Action work)
+    {
+        Exception? error = null;
+        var t = new Thread(() => { try { work(); } catch (Exception ex) { error = ex; } }, 1024 * 1024);
+        t.Start();
+        t.Join();
+        if (error is not null) throw new Xunit.Sdk.XunitException("work failed: " + error);
+    }
+
+    [Theory]
+    [MemberData(nameof(CallerStackShapes))]
+    public void CorpusCompilation_BoundOnAnOrdinaryStack_DoesNotOverflow(string shape, string text)
+    {
+        var tok = new CharTokenizer();
+        var corpus = new Corpus([new SourceFile("ok.cs", Ok), new SourceFile("hostile.cs", text)], new SymbolChunker(tok, 4096), tok);
+        Assert.False(RoslynParsing.TooDeep(text, out _), shape + ": the bracket guard must not be what stops this input");
+
+        OnOrdinaryStack(() => _ = corpus.Compilation.GetDiagnostics());
+
+        Assert.Empty(corpus.TreeOf("hostile.cs").GetRoot().DescendantNodes());
+    }
+
+    [Theory]
+    [MemberData(nameof(CallerStackShapes))]
+    public void BclOnlyProjectCompilation_BoundOnAnOrdinaryStack_DoesNotOverflow(string shape, string text)
+    {
+        ProjectCompilation p = ProjectCompilation.BclOnly([new SourceFile("ok.cs", Ok), new SourceFile("hostile.cs", text)]);
+
+        OnOrdinaryStack(() => _ = p.Compilation.GetDiagnostics());
+
+        Assert.Empty(p.Trees["hostile.cs"].GetRoot().DescendantNodes());
+        Assert.True(shape.Length > 0);
+    }
+
+    [Theory]
+    [MemberData(nameof(CallerStackShapes))]
+    public void CallResolutionSites_CalledOnAnOrdinaryStack_DoesNotOverflow_AndStillMeasuresTheOtherFiles(string shape, string text)
+    {
+        // Trees parsed as given (a solution scan): no corpus guard has run on them.
+        var ok = new SourceFile("ok.cs", Ok);
+        var hostile = new SourceFile("hostile.cs", text + "\nclass Ref { int Q() => Lib.Add(1, 2); }\n");
+        var trees = new Dictionary<string, Microsoft.CodeAnalysis.SyntaxTree>(StringComparer.Ordinal)
+        {
+            [ok.Path] = RoslynParsing.Parse(ok.Text, ok.Path),
+            [hostile.Path] = RoslynParsing.Parse(hostile.Text, hostile.Path),
+        };
+        var compilation = Microsoft.CodeAnalysis.CSharp.CSharpCompilation.Create("p", trees.Values, Bcl(),
+            new Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions(Microsoft.CodeAnalysis.OutputKind.DynamicallyLinkedLibrary));
+        var project = new ProjectCompilation("p", compilation, trees);
+        IReadOnlyList<CallSite> sites = [];
+
+        OnOrdinaryStack(() => sites = CallResolution.Sites([project]));
+
+        Assert.Contains(sites, s => s.Path == "ok.cs" && s.Method is not null && s.Method.Contains("Add"));
+        Assert.True(shape.Length > 0);
     }
 
     [Fact]

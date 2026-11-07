@@ -88,10 +88,10 @@ public sealed class CorpusHardeningTests : IDisposable
     [Fact]
     public void CreateCompilation_ModeratelyDeepUnaryChain_StaysInTheCompilation()
     {
-        // Control for the test above: well under RoslynParsing.MaxSyntaxDepth the file keeps its symbols.
-        string text = "class C\n{\n    bool M() => " + new string('!', 500) + "true;\n}\n";
+        // Control for the test above: well under RoslynParsing.MaxCompilationSyntaxDepth the file keeps its symbols.
+        string text = "class C\n{\n    bool M() => " + new string('!', 200) + "true;\n}\n";
         Assert.Contains('\n', text); // control: the escape reached the string as a newline
-        Assert.True(RoslynParsing.SyntaxDepth(RoslynParsing.Parse(text, "u.cs").GetRoot()) < RoslynParsing.MaxSyntaxDepth);
+        Assert.True(RoslynParsing.SyntaxDepth(RoslynParsing.Parse(text, "u.cs").GetRoot()) < RoslynParsing.MaxCompilationSyntaxDepth);
 
         var (compilation, _) = Corpus.CreateCompilation([new SourceFile("u.cs", text)], implicitUsings: false);
 

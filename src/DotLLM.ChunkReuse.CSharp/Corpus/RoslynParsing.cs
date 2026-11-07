@@ -53,6 +53,14 @@ internal static class RoslynParsing
     public const int MaxSyntaxDepth = 2048;
 
     /// <summary>
+    /// Deepest syntax-tree depth a file may have and still go into a PUBLIC compilation (<see cref="Corpus.Compilation"/>,
+    /// <c>ProjectCompilation.BclOnly</c>). Callers bind those on their own, ordinary stack (about 1 MiB), where Roslyn's
+    /// binder overflowed between 400 and 600 levels (nested lambdas, nested switch expressions), so the cap sits well under that.
+    /// <see cref="MaxSyntaxDepth"/> is only safe where this library controls the stack (<see cref="RunWithLargeStack{T}"/>).
+    /// </summary>
+    public const int MaxCompilationSyntaxDepth = 256;
+
+    /// <summary>
     /// Depth of the deepest node under <paramref name="root"/> (a lone node is 1), computed without recursion so a hostile tree
     /// cannot overflow the stack while it is measured. Parse the tree first (on the large-stack thread).
     /// </summary>

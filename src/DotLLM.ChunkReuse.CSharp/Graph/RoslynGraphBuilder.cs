@@ -79,7 +79,7 @@ public sealed class RoslynGraphBuilder
         ArgumentNullException.ThrowIfNull(chunks);
         var sw = System.Diagnostics.Stopwatch.StartNew();
         (CSharpCompilation compilation, Dictionary<string, SyntaxTree> trees) =
-            Corpus.CreateCompilation(files.OrderBy(f => f.Path, StringComparer.Ordinal), implicitUsings);
+            Corpus.CreateCompilation(files.OrderBy(f => f.Path, StringComparer.Ordinal), implicitUsings, RoslynParsing.MaxSyntaxDepth);
         TimeSpan compile = sw.Elapsed;
         return Build(Single(compilation, trees), chunks, compile);
     }
