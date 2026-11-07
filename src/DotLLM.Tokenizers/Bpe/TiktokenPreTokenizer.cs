@@ -164,7 +164,7 @@ internal static class TiktokenPreTokenizer
     internal static Regex[] GetRegexes(string? preType) => preType switch
     {
         // llama.cpp: GPT2 / MPT / OLMO / JAIS / TRILLION / GRANITE_DOCLING share one block (OLMoE ships "olmo").
-        null or "" or "default" or "gpt2" or "olmo" => Gpt2Pipeline,
+        null or "" or "default" or "gpt2" or "olmo" or "granite-docling" => Gpt2Pipeline,
         // llama.cpp routes all of these through LLAMA_VOCAB_PRE_TYPE_LLAMA3
         // (llama-vocab.cpp, the "llama3" case block).
         "llama3" or "llama-v3" or "llama-bpe" or "falcon3" or "falcon-h1"

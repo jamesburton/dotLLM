@@ -481,6 +481,18 @@ public class BpeTokenizerTests
     }
 
     [Fact]
+    public void GraniteDocling_UsesGpt2Block_DigitRunsStayWhole()
+    {
+        // #1667: TwIL-8B / Granite 4.2 GGUFs declare tokenizer.ggml.pre = "granite-docling"; llama.cpp routes it through the
+        // GPT-2 block (` ?\p{N}+`: a digit run is ONE segment, unlike llama3's \p{N}{1,3} or qwen2's \p{N}).
+        var regexes = TiktokenPreTokenizer.GetRegexes("granite-docling");
+        Assert.NotNull(regexes);
+        Assert.Equal(TiktokenPreTokenizer.GetRegexes("gpt2"), regexes);
+        var matches = regexes![0].Matches("x 1234567 y");
+        Assert.Equal(new[] { "x", " 1234567", " y" }, matches.Select(m => m.Value).ToArray());
+    }
+
+    [Fact]
     public void TiktokenPreTokenizer_AbsentDefaultsUnknownThrows()
     {
         // #373: this replaces TiktokenPreTokenizer_ReturnsNullForUnknownType, which
