@@ -1,9 +1,16 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "q8_1_exact_div.glsl"
 // KV-cache quantization: FP32 → Q8_0 (split layout: float scale + packed int8).
 //
 // Reads contiguous FP32 elements and writes per-32-element block:
 //   scales[blockIdx] = float (max_abs / 127)
 //   quants[blockIdx*8 + 0..7] = uint (4 packed int8 per uint, little-endian)
+//
+// Rounding contract (#1500, == CPU MatMul.QuantizeF32ToQ8_0 / the #1340 Q8_1 contract): d = amax / 127 (IEEE),
+// id = 1 / d (IEEE), q = roundHalfToEven(x * id) clamped to [-127, 127]. A plain `amax / 127.0` lowers to a
+// multiply by an approximate reciprocal on RDNA and GLSL round() leaves ties implementation-defined, so the
+// exact helpers and roundEven are required for bit-identical blocks across backends.
 //
 // Dispatch: ceil(totalBlocks / 256) workgroups × 1 × 1.
 // Each thread processes one block; early-exits for out-of-range blocks.
@@ -35,18 +42,18 @@ void main() {
         amax = max(amax, abs(src[srcBase + i]));
     }
 
-    float scale = amax / 127.0;
-    float invScale = (scale != 0.0) ? (1.0 / scale) : 0.0;
+    float scale = q81DivBy127(amax);
+    float invScale = (scale != 0.0) ? q81Recip(scale) : 0.0;
     scales[dstBlock] = scale;
 
     // Pass 2: quantize to int8, pack 4 per uint.
     uint qBase = dstBlock * 8u;
     for (uint g = 0u; g < QK / 4u; g++) {
         uint e = srcBase + g * 4u;
-        int q0 = clamp(int(round(src[e + 0u] * invScale)), -128, 127);
-        int q1 = clamp(int(round(src[e + 1u] * invScale)), -128, 127);
-        int q2 = clamp(int(round(src[e + 2u] * invScale)), -128, 127);
-        int q3 = clamp(int(round(src[e + 3u] * invScale)), -128, 127);
+        int q0 = clamp(int(roundEven(src[e + 0u] * invScale)), -127, 127);
+        int q1 = clamp(int(roundEven(src[e + 1u] * invScale)), -127, 127);
+        int q2 = clamp(int(roundEven(src[e + 2u] * invScale)), -127, 127);
+        int q3 = clamp(int(roundEven(src[e + 3u] * invScale)), -127, 127);
         uint packed = (uint(q0) & 0xFFu)
                     | ((uint(q1) & 0xFFu) << 8u)
                     | ((uint(q2) & 0xFFu) << 16u)

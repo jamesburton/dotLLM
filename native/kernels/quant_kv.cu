@@ -13,6 +13,10 @@
 //                                     until the FP16 window fills, the kernel
 //                                     no-ops. This keeps the graph topology
 //                                     constant across decode steps.
+//
+//  Rounding contract (#1499, == CPU MatMul.QuantizeF32ToQ8_0 / KvQuantize.F32ToQ4_0): d = amax / 127 (or / 7),
+//  IEEE; inv = 1 / d, IEEE; q = round-half-even(x * inv). This file is compiled with --use_fast_math, under which
+//  plain `/` is an approximate division, so the scale and reciprocal MUST use __fdiv_rn / __frcp_rn.
 // ─────────────────────────────────────────────────────────────────────
 
 #include <cuda_fp16.h>
@@ -48,7 +52,7 @@ extern "C" __global__ void __launch_bounds__(256) quant_f16_to_q8_0(
     }
 
     // Compute scale and write
-    float d = max_abs / 127.0f;
+    float d = __fdiv_rn(max_abs, 127.0f);   // IEEE even under --use_fast_math (#1499 contract)
     *reinterpret_cast<half*>(out) = __float2half(d);
 
     int8_t* qs = reinterpret_cast<int8_t*>(out + 2);
@@ -60,11 +64,11 @@ extern "C" __global__ void __launch_bounds__(256) quant_f16_to_q8_0(
     }
     else
     {
-        float inv_d = 1.0f / d;
+        float inv_d = __frcp_rn(d);
         #pragma unroll 8
         for (int j = 0; j < Q8_0_BLOCK_SIZE; j++)
         {
-            int v = __float2int_rn(vals[j] * inv_d);
+            int v = __float2int_rn(__fmul_rn(vals[j], inv_d));
             qs[j] = (int8_t)max(-127, min(127, v));
         }
     }
@@ -97,7 +101,7 @@ extern "C" __global__ void __launch_bounds__(256) quant_f16_to_q4_0(
         if (a > max_abs) max_abs = a;
     }
 
-    float d = max_abs / 7.0f;
+    float d = __fdiv_rn(max_abs, 7.0f);     // IEEE even under --use_fast_math (#1499 contract)
     *reinterpret_cast<half*>(out) = __float2half(d);
 
     uint8_t* qs = out + 2;
@@ -109,12 +113,12 @@ extern "C" __global__ void __launch_bounds__(256) quant_f16_to_q4_0(
     }
     else
     {
-        float inv_d = 1.0f / d;
+        float inv_d = __frcp_rn(d);
         #pragma unroll 8
         for (int j = 0; j < 16; j++)
         {
-            int lo = max(0, min(15, __float2int_rn(vals[2 * j] * inv_d) + 8));
-            int hi = max(0, min(15, __float2int_rn(vals[2 * j + 1] * inv_d) + 8));
+            int lo = max(0, min(15, __float2int_rn(__fmul_rn(vals[2 * j], inv_d)) + 8));
+            int hi = max(0, min(15, __float2int_rn(__fmul_rn(vals[2 * j + 1], inv_d)) + 8));
             qs[j] = (uint8_t)((hi << 4) | lo);
         }
     }
@@ -171,7 +175,7 @@ extern "C" __global__ void quant_f16_to_q8_0_dyn(
         if (a > max_abs) max_abs = a;
     }
 
-    float d = max_abs / 127.0f;
+    float d = __fdiv_rn(max_abs, 127.0f);   // IEEE even under --use_fast_math (#1499 contract)
     *reinterpret_cast<half*>(out) = __float2half(d);
 
     int8_t* qs = reinterpret_cast<int8_t*>(out + 2);
@@ -183,11 +187,11 @@ extern "C" __global__ void quant_f16_to_q8_0_dyn(
     }
     else
     {
-        float inv_d = 1.0f / d;
+        float inv_d = __frcp_rn(d);
         #pragma unroll 8
         for (int j = 0; j < Q8_0_BLOCK_SIZE; j++)
         {
-            int v = __float2int_rn(vals[j] * inv_d);
+            int v = __float2int_rn(__fmul_rn(vals[j], inv_d));
             qs[j] = (int8_t)max(-127, min(127, v));
         }
     }
@@ -226,7 +230,7 @@ extern "C" __global__ void quant_f16_to_q4_0_dyn(
         if (a > max_abs) max_abs = a;
     }
 
-    float d = max_abs / 7.0f;
+    float d = __fdiv_rn(max_abs, 7.0f);     // IEEE even under --use_fast_math (#1499 contract)
     *reinterpret_cast<half*>(out) = __float2half(d);
 
     uint8_t* qs = out + 2;
@@ -238,12 +242,12 @@ extern "C" __global__ void quant_f16_to_q4_0_dyn(
     }
     else
     {
-        float inv_d = 1.0f / d;
+        float inv_d = __frcp_rn(d);
         #pragma unroll 8
         for (int j = 0; j < 16; j++)
         {
-            int lo = max(0, min(15, __float2int_rn(vals[2 * j] * inv_d) + 8));
-            int hi = max(0, min(15, __float2int_rn(vals[2 * j + 1] * inv_d) + 8));
+            int lo = max(0, min(15, __float2int_rn(__fmul_rn(vals[2 * j], inv_d)) + 8));
+            int hi = max(0, min(15, __float2int_rn(__fmul_rn(vals[2 * j + 1], inv_d)) + 8));
             qs[j] = (uint8_t)((hi << 4) | lo);
         }
     }

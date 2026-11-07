@@ -515,6 +515,22 @@ Adapter delta with scales rounded RNE, weights exact, accumulation F32; D = 4096
 F16 relL2 0.5e-3..2.3e-3 (0.1-0.7x the floor), 0.3-0.8 % of requantised bottleneck values flip by one level; bf16 relL2 2.4e-3..6.2e-3 (about 1x the floor), 2.5-6 % flip. Tiny llama end to end: F32 -> F16 scales KL 6e-8..4.7e-6, bf16 1.7e-5..2.4e-5, against an adapter effect of 2.6-3.5 nats (top-1 24/24).
 F16 range hazard: scales near 1e-6 are subnormal (relL2 2.2e-2) and above 65504 overflow, hence the automatic per-circuit F32 fallback. Reference sample adapters have unit scales (exact in every format). Tests: `TernaryScalePrecisionTests`; details and tables in `docs/TERNARY_ADAPTER.md`.
 
+### E16 - one block-quantizer rounding contract on every backend (#1340, #1499, #1500)
+
+Contract for every Q8_0 / Q8_1 / Q4_0 block quantizer (activations and KV): `d = amax / qmax` (IEEE), `id = 1 / d` (IEEE),
+`q = roundHalfToEven(x * id)`, clamp to `[-qmax, qmax]`; stored scale `half(d)` (GGUF layouts) or `d` (Vulkan split KV layout).
+CPU scalar/AVX2/AVX-512 are the reference; Vulkan uses `q8_1_exact_div.glsl` / `q4_0_exact_div.glsl` + `roundEven` (a GLSL
+`a / 127.0` is lowered to `a * rcp(127)` on RDNA, `round()` ties are implementation-defined); CUDA uses `__fdiv_rn` / `__frcp_rn`
+/ `__fmul_rn` / `__float2int_rn` (the pre-#1499 kernels multiplied by `127 / amax` while storing `amax / 127`, two independently
+rounded values; `quant_kv.cu` is built with `--use_fast_math`, under which a plain `/` is `div.approx`). A one-ULP difference in
+`d` or `id` is digitised into a whole-integer lane flip, which moves every output row of the next projection and, for KV, every later
+token. Corpus (`ActivationQuantizerCorpus`): exact ties (power-of-two `d`), degenerate blocks, 6000 generic blocks on and +-1 ULP
+around every `k + 0.5` boundary. gfx1151, old `kv_quantize_q8_0_f32` / `convert_f32_to_q8_0_kv_range`: 15684 lanes + 275 scales
+differ from the CPU over 6070 blocks; old `kv_quantize_q4_0_f32`: 35716 lanes + 3251 scales over 6082; after the fix 0 / 0.
+Guards: `QuantizerConventionSensitivityTests` (CPU, corpus sensitivity to each wrong convention), `KvQuantizerTieTests` (Vulkan),
+`CudaQuantizerTieTests` (CUDA, Half corpus), `ActivationQuantizerTieTests` (Vulkan Q8_1, #1340). `i2_s_gemv.cu`'s per-tensor
+`quantize_f16_to_i8_absmax` is a different (per-token, W2A8) contract with its own oracle and is deliberately unchanged.
+
 ## 6. Decision table: CLAUDE.md rule → evidence
 
 | CLAUDE.md rule (Precision & Expansion) | evidence | verdict |
