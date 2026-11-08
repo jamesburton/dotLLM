@@ -101,8 +101,8 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
                 try
                 {
                     model = isGemmaEmb
-                        ? DotLLM.Vulkan.VulkanGemmaEmbeddingModel.LoadFromGguf(DotLLM.Vulkan.VulkanModelLoader.SharedDevice, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir())
-                        : DotLLM.Vulkan.VulkanBertEncoderModel.LoadFromGguf(DotLLM.Vulkan.VulkanModelLoader.SharedDevice, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir());
+                        ? DotLLM.Vulkan.VulkanGemmaEmbeddingModel.LoadFromGguf(DeviceModelLoader.VulkanDeviceFor(deviceSpec), gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir())
+                        : DotLLM.Vulkan.VulkanBertEncoderModel.LoadFromGguf(DeviceModelLoader.VulkanDeviceFor(deviceSpec), gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir());
                 }
                 catch (NotSupportedException ex)
                 {

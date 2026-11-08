@@ -368,6 +368,12 @@ public static unsafe partial class MoeSwiGluMlp
                 }
             }
 
+            // Routing tap (#1706): off = one static read + null check per layer call.
+            var routingSink = MoeRoutingProbe.Sink;
+            if (routingSink is not null)
+                routingSink.Record(MoeRoutingProbe.Layer, seqLen, numExpertsPerTok,
+                    assignExpert.Slice(0, totalAssignments), assignWeight.Slice(0, totalAssignments));
+
             // ── 3) Exclusive prefix sum → bucket offsets ──────────────────────
             int running = 0;
             for (int e = 0; e <= numExperts; e++)

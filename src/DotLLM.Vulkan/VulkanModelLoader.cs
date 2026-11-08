@@ -29,6 +29,32 @@ public static class VulkanModelLoader
     /// </summary>
     public static VulkanDevice SharedDevice => SharedDeviceLazy.Value;
 
+    private static readonly Dictionary<int, VulkanDevice> IndexedDevices = new();
+    private static readonly object IndexedLock = new();
+
+    /// <summary>
+    /// The process-wide device for physical device <paramref name="index"/> (<c>vkEnumeratePhysicalDevices</c> order, #1704): one
+    /// <see cref="VulkanDevice"/> per index, created on first use and never disposed (same lifetime rule as <see cref="SharedDevice"/>).
+    /// When the index is the one <see cref="SharedDevice"/> already is (or would be), that instance is returned, so <c>vulkan</c> and
+    /// <c>vulkan:N</c> naming the same GPU never create two logical devices.
+    /// </summary>
+    /// <param name="index">Zero-based physical device index.</param>
+    /// <exception cref="Interop.VulkanException">The index is out of range for this machine.</exception>
+    public static VulkanDevice GetDevice(int index)
+    {
+        if (index < 0) throw new ArgumentOutOfRangeException(nameof(index));
+        lock (IndexedLock)
+        {
+            if (IndexedDevices.TryGetValue(index, out var d)) return d;
+            if (SharedDeviceLazy.IsValueCreated && SharedDeviceLazy.Value.PhysicalDeviceIndex == index)
+                return IndexedDevices[index] = SharedDeviceLazy.Value;
+            foreach (var info in VulkanDevice.EnumeratePhysicalDevices())
+                if (info.IsDefault && info.Index == index)
+                    return IndexedDevices[index] = SharedDevice;   // the default GPU: share with plain "vulkan"
+            return IndexedDevices[index] = VulkanDevice.Create(index);   // throws a clear out-of-range error
+        }
+    }
+
     /// <summary>
     /// Resolves the SPIR-V blob directory: <c>spv/</c> beside the running assembly (the MSBuild
     /// content-copy layout), falling back to the in-repo <c>native/vulkan/spv</c> for <c>dotnet run</c>
@@ -63,6 +89,14 @@ public static class VulkanModelLoader
     public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateSharedFromGguf(
         GgufFile gguf, ModelConfig config, int nCpuMoeLayers = -1)
         => CreateFromGguf(SharedDevice, gguf, config, ResolveSpvDir(), nCpuMoeLayers);
+
+    /// <summary>
+    /// <see cref="CreateFromGguf"/> on physical device <paramref name="physicalIndex"/> (<see cref="GetDevice"/>), or on
+    /// <see cref="SharedDevice"/> when null.
+    /// </summary>
+    public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateOnDeviceFromGguf(
+        GgufFile gguf, ModelConfig config, int? physicalIndex, int nCpuMoeLayers = -1)
+        => CreateFromGguf(physicalIndex is int i ? GetDevice(i) : SharedDevice, gguf, config, ResolveSpvDir(), nCpuMoeLayers);
 
     /// <summary>
     /// Creates the architecture-appropriate Vulkan model for <paramref name="gguf"/>.

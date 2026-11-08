@@ -205,7 +205,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
 
         // One shared resolution (#790): auto -> CUDA / Vulkan / CPU with a visible line (and a warning on CPU); an explicit GPU that
         // cannot be honoured is an error, never a CPU measurement.
-        if (!DeviceCli.TryResolveForTool(settings.Device, ggufPath, settings.Json, out string backend, out int gpuId))
+        if (!DeviceCli.TryResolveForTool(settings.Device, ggufPath, settings.Json, out string backend, out int gpuId, out int? vulkanIndex))
             return 1;
 
         if (!DotLLM.Cli.Helpers.KvStorageCli.TryBuild(null, null, settings.KvQuantK, settings.KvQuantV, 0, out var kvRequest, out var kvFlagError))
@@ -290,7 +290,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
 
                 case "vulkan":
                 {
-                    vulkanDevice = DotLLM.Vulkan.VulkanDevice.Create();
+                    vulkanDevice = vulkanIndex is int vki ? DotLLM.Vulkan.VulkanDevice.Create(vki) : DotLLM.Vulkan.VulkanDevice.Create();
                     if (HostResidencyProbe.Enabled)
                         HostResidencyProbe.Report("after-device", 0, 0, vulkanDevice.MemoryProbeSnapshot());
                     // THE shared per-architecture Vulkan dispatch (#259).

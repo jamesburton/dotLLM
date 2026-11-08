@@ -129,7 +129,7 @@ const modalLoadBtn = $('#modal-load-btn');
 const modalMtpSection = $('#modal-mtp-section');
 const modalMtpEnabled = $('#modal-mtp-enabled');
 const modalDeviceHint = $('#modal-device-hint');
-const modalDeviceGpuLabel = $('#modal-device-gpu-label');
+const modalDeviceSelect = $('#modal-device-select');
 const modalSpeculativeSection = $('#modal-speculative-section');
 const modalSpeculativeSelect = $('#modal-speculative-select');
 const modalSpeculativeInfo = $('#modal-speculative-info');
@@ -1034,40 +1034,31 @@ function resetToolsJson() {
 let modalModels = [];      // flat list from /v1/models/available
 let modalInspect = null;   // inspect result for selected model
 let modalSelectedFullPath = null;
-let modalGpuDevice = null;      // device string to send for "GPU" (e.g. "vulkan", "gpu:0"); null when no GPU is servable
+let modalDeviceChoices = [];    // DeviceSelect.buildChoices(...) for the dropdown
 let modalDeviceTouched = false; // the user picked a device by hand: never override it
 
-/** Picks the GPU device string for the GPU radio from a /v1/devices payload (recommended first, else any servable non-CPU device). */
-function pickGpuDevice(devices) {
-    if (!devices) return null;
-    if (devices.recommended_device && devices.recommended_device !== 'cpu') return devices.recommended_device;
-    for (const b of devices.backends || []) {
-        if (b.name === 'cpu' || !b.servable) continue;
-        const d = (b.devices || []).find(x => x.device_string);
-        if (d) return d.device_string;
-    }
-    return null;
-}
-
+/** Rebuilds the device dropdown from a /v1/devices payload (#1704): CPU + every servable CUDA/Vulkan device; keeps a hand-picked choice. */
 function applyModalDevices(devices) {
-    modalGpuDevice = pickGpuDevice(devices);
-    const gpuRadio = document.querySelector('input[name="modal-device"][value="gpu"]');
-    const cpuRadio = document.querySelector('input[name="modal-device"][value="cpu"]');
     if (!devices) {
         modalDeviceHint.textContent = 'Detecting devices...';
-        gpuRadio.disabled = false;
-        modalDeviceGpuLabel.textContent = 'GPU';
-        return;
-    }
-    gpuRadio.disabled = !modalGpuDevice;
-    if (modalGpuDevice) {
-        modalDeviceGpuLabel.textContent = `GPU (${modalGpuDevice})`;
-        modalDeviceHint.textContent = 'GPU is selected by default because a servable GPU was found. CPU is universal but several times slower. An explicit GPU load that fails reports an error; it never falls back to the CPU silently.';
-        if (!modalDeviceTouched) gpuRadio.checked = true;
+        modalDeviceChoices = [{ value: 'cpu', label: 'CPU', kind: 'cpu', supportsLayers: false, isDefault: false }];
     } else {
-        modalDeviceGpuLabel.textContent = 'GPU (none detected)';
-        modalDeviceHint.textContent = 'No servable GPU (CUDA or Vulkan) was detected, so the CPU is used.';
-        cpuRadio.checked = true;
+        modalDeviceChoices = DeviceSelect.buildChoices(devices);
+    }
+    const current = modalDeviceSelect.value;
+    modalDeviceSelect.innerHTML = '';
+    for (const c of modalDeviceChoices) {
+        const o = document.createElement('option');
+        o.value = c.value;
+        o.textContent = c.label;
+        modalDeviceSelect.appendChild(o);
+    }
+    modalDeviceSelect.value = DeviceSelect.resolveSelection(modalDeviceChoices, current, modalDeviceTouched, devices);
+    if (devices) {
+        const gpus = modalDeviceChoices.filter(c => c.kind !== 'cpu').length;
+        modalDeviceHint.textContent = gpus === 0
+            ? 'No servable GPU (CUDA or Vulkan) was detected, so the CPU is used.'
+            : 'Pick any device, e.g. the Vulkan iGPU when the CUDA GPU is full. The best GPU is preselected. An explicit GPU load that fails reports an error; it never falls back to the CPU silently. Memory is free/total where the driver reports it, else total.';
     }
     updateGpuVisibility();
 }
@@ -1096,8 +1087,7 @@ function openModelModal() {
     modalCacheV.value = 'auto';
     // (#757) Device defaults to the best servable GPU, CPU only when none is servable (resolved asynchronously).
     modalDeviceTouched = false;
-    modalGpuDevice = null;
-    document.querySelector('input[name="modal-device"][value="cpu"]').checked = true;
+    modalDeviceSelect.value = 'cpu';
     applyModalDevices(null);
     refreshModalDevices();
     modelModalOverlay.classList.remove('hidden');
@@ -1245,12 +1235,14 @@ async function onModalModelChange() {
     refreshModalDevices(modalInspect?.file_size_bytes);
 }
 
+/** The device string to send: "cpu", "gpu:N" (CUDA) or "vulkan:N". */
 function getModalDevice() {
-    return document.querySelector('input[name="modal-device"]:checked')?.value || 'cpu';
+    return modalDeviceSelect.value || 'cpu';
 }
 
 function updateGpuVisibility() {
-    if (getModalDevice() === 'gpu') {
+    // Partial layer offload exists for CUDA only; Vulkan is whole-model-resident (the server ignores --gpu-layers there).
+    if (DeviceSelect.supportsLayerOffload(getModalDevice())) {
         modalGpuSection.classList.remove('hidden');
         updateGpuLayersDisplay();
     } else {
@@ -1295,9 +1287,8 @@ async function handleModalLoad() {
     const repo = opt?.dataset.repo;
     const filename = opt?.dataset.filename;
     const quant = extractQuantFromPath(filename);
-    const deviceChoice = getModalDevice();
-    const isGpu = deviceChoice === 'gpu' && !!modalGpuDevice;
-    const device = isGpu ? modalGpuDevice : 'cpu';
+    const device = getModalDevice();
+    const isGpu = DeviceSelect.supportsLayerOffload(device);   // gpu_layers is a CUDA-only knob
     // "All" is a sentinel (-1), not the slider's number: the server resolves it against the layer count the loader sees.
     // Also covers a failed inspect, where the slider still shows its HTML default.
     const sliderLayers = parseInt(modalGpuLayers.value);
@@ -2153,10 +2144,8 @@ modelModalOverlay.addEventListener('click', (e) => {
 modalLoadBtn.addEventListener('click', handleModalLoad);
 modalModelSelect.addEventListener('change', onModalModelChange);
 
-// Device radio toggle → show/hide GPU section
-document.querySelectorAll('input[name="modal-device"]').forEach(radio => {
-    radio.addEventListener('change', () => { modalDeviceTouched = true; updateGpuVisibility(); });
-});
+// Device dropdown change → show/hide GPU section
+modalDeviceSelect.addEventListener('change', () => { modalDeviceTouched = true; updateGpuVisibility(); });
 
 // GPU layers slider live update
 modalGpuLayers.addEventListener('input', updateGpuLayersDisplay);
