@@ -4,7 +4,7 @@ namespace DotLLM.Cpu;
 /// Zero-cost-when-off tap on the CPU MoE router (<c>dotllm perplexity --dump-routing</c>, #1706).
 /// </summary>
 /// <remarks>
-/// <para>Off state is <see cref="Sink"/> == <see langword="null"/>: <c>MoeSwiGluMlp.Route</c> pays one static
+/// <para>Off state is <see cref="Sink"/> == <see langword="null"/>: <c>MoeSwiGluMlp.Route</c> (F32 / grouped experts) and <c>MoeQuantSwiGluMlp.Execute</c> (stacked GGUF expert banks, the path every llama.cpp-format MoE takes) pay one static
 /// read and a null check per call (per layer, not per token), and the layer loop pays the same to publish
 /// <see cref="Layer"/>. No allocation, no event, no delegate.</para>
 /// <para>The sink sees the router's FINAL decision per (token, slot): the selected expert id and the gate weight the

@@ -15,7 +15,7 @@ namespace DotLLM.Engine.Evaluation;
 /// descending router score. Weights are the final gate weights (after softmax, optional top-k renormalisation and scale).
 /// Only layers that ran an MoE FFN appear (dense layers of a mixed model are absent).</para>
 /// <para>Armed per document via <see cref="MoeRoutingProbe"/>; a layer that does not report exactly <c>N</c> positions
-/// (an MoE path that bypasses the shared router, e.g. gpt-oss quantised experts) is an error, never a silent gap.</para>
+/// (an MoE path that bypasses both router implementations, e.g. Gemma 4 or a non-TransformerModel architecture) is an error, never a silent gap.</para>
 /// </remarks>
 public sealed class RoutingDump : IDocumentObserver, MoeRoutingProbe.ISink, IDisposable
 {
