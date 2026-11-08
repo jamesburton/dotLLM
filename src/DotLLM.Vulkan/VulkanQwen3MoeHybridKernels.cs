@@ -973,6 +973,11 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             kernels.MatMulQ5_1Gemv = MatMulQ5_1GemvF32Kernel.Create(device, spvDir);
             kernels.MatMulQ5_1Gemm = MatMulQ5_1GemmF32Kernel.Create(device, spvDir);
         }
+        // #921: the hybrid-dense host quantises its decode row for the Q4_0 / Q4_1 MMVQs into the cm1 rows scratch, which only exists with the
+        // (opt-in) int8-coopmat GEMMs. Create the rows quantizer whenever a legacy MMVQ exists so that host gets the dp4a decode arm by default;
+        // the MoE-hybrid host has its own quantizer (QuantizeQ8_1RowsActivations) and ignores this one.
+        if (kernels.QuantizeQ8_1RowsCm1 is null && (kernels.MatMulQ4_0Mmvq is not null || kernels.MatMulQ4_1Mmvq is not null))
+            kernels.QuantizeQ8_1RowsCm1 = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir);
         return kernels;
     }
 

@@ -42,10 +42,12 @@ public sealed class VulkanHybridLegacyQuantForwardTests(ITestOutputHelper output
     private const int NumExpertsPerTok = 2;
     private const int DenseIntermediate = 96;   // multiple of 32: the dense down projection contracts along it
 
-    // Both backends read identical quantised bytes, so the only divergence is kernel arithmetic (the dp4a arms round activations to
-    // Q8_1 per 32-block). 2e-2 abs + 2e-2 rel holds with margin; a mis-decoded block layout is off by O(1) on logits of O(0.1..1).
-    private const float AbsTol = 2e-2f;
-    private const float RelTol = 2e-2f;
+    // Both backends read identical quantised bytes, so the divergence is kernel arithmetic: the CPU's packed x Q8_1 prefill and the Vulkan
+    // dp4a decode round activations to Q8_1 per 32-block, the coopmat prefill holds the dequantised weight in F16. Measured on Strix
+    // (seed-fixed): hybrid-dense <= 2.6e-2 abs, MoE-hybrid <= 7.6e-2 at 4 rows (Q4_0; the others <= 1.8e-2) (the top-2-of-4 routing amplifies a logit nudge into an
+    // expert flip). A mis-decoded block layout is off by O(1) on logits of O(1) (the Q5_0-on-Q5_1 mutant: max diff 0.6-1.2).
+    private const float DenseAbsTol = 3e-2f, DenseRelTol = 3e-2f;
+    private const float MoeAbsTol = 1e-1f, MoeRelTol = 5e-2f;
 
     public static IEnumerable<object[]> Cases()
     {
@@ -89,11 +91,11 @@ public sealed class VulkanHybridLegacyQuantForwardTests(ITestOutputHelper output
             mmvq = model.LegacyQuantMmvqDispatchCount;
         }
 
-        Compare(cpu, vk, $"moe-hybrid {qt} seqLen={seqLen}");
+        Compare(cpu, vk, $"moe-hybrid {qt} seqLen={seqLen}", MoeAbsTol, MoeRelTol);
         // (2) 2 layers x (GDN qkv/gate/alpha/beta/out = 5 | attn q/k/v/o = 4) + lm_head: at least 10 legacy-quant dispatches per forward.
         Assert.True(dispatches >= 10, $"legacy-quant arm ran {dispatches} times; expected >= 10");
-        if (seqLen == 1 && qt == QuantizationType.Q4_1 && hasDp4a)
-            Assert.True(mmvq > 0, "the Q4_1 decode went to the F32-in GEMV, not the dp4a MMVQ");
+        if (seqLen == 1 && qt is QuantizationType.Q4_1 or QuantizationType.Q4_0 && hasDp4a)
+            Assert.True(mmvq > 0, $"the {qt} decode went to the F32-in GEMV, not the dp4a MMVQ");
         output.WriteLine($"moe-hybrid {qt} seqLen={seqLen}: legacy dispatches {dispatches}, mmvq {mmvq}");
     }
 
@@ -133,15 +135,15 @@ public sealed class VulkanHybridLegacyQuantForwardTests(ITestOutputHelper output
             mmvq = model.LegacyQuantMmvqDispatchCount;
         }
 
-        Compare(cpu, vk, $"hybrid-dense {qt} seqLen={seqLen}");
+        Compare(cpu, vk, $"hybrid-dense {qt} seqLen={seqLen}", DenseAbsTol, DenseRelTol);
         // 2 layers x (5 or 4 mixer projections + 3 FFN) + lm_head >= 16.
         Assert.True(dispatches >= 16, $"legacy-quant arm ran {dispatches} times; expected >= 16");
-        if (seqLen == 1 && qt == QuantizationType.Q4_1 && hasDp4a)
-            Assert.True(mmvq > 0, "the Q4_1 decode went to the F32-in GEMV, not the dp4a MMVQ");
+        if (seqLen == 1 && qt is QuantizationType.Q4_1 or QuantizationType.Q4_0 && hasDp4a)
+            Assert.True(mmvq > 0, $"the {qt} decode went to the F32-in GEMV, not the dp4a MMVQ");
         output.WriteLine($"hybrid-dense {qt} seqLen={seqLen}: legacy dispatches {dispatches}, mmvq {mmvq}");
     }
 
-    private void Compare(float[] cpu, float[] vk, string tag)
+    private void Compare(float[] cpu, float[] vk, string tag, float absTol, float relTol)
     {
         Assert.Equal(cpu.Length, vk.Length);
         double worst = 0, scale = 0;
@@ -155,7 +157,7 @@ public sealed class VulkanHybridLegacyQuantForwardTests(ITestOutputHelper output
         for (int i = 0; i < cpu.Length; i++)
         {
             float diff = MathF.Abs(cpu[i] - vk[i]);
-            float bar = AbsTol + RelTol * MathF.Abs(cpu[i]);
+            float bar = absTol + relTol * MathF.Abs(cpu[i]);
             Assert.True(diff <= bar, $"{tag} col={i % VocabSize}: cpu={cpu[i]:F6} vk={vk[i]:F6} |diff|={diff:E3} > {bar:E3}");
         }
         double var = 0, mean = vk.Average();

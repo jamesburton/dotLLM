@@ -3009,7 +3009,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <summary>The device-resident weights (test hook: on-device quant types per projection).</summary>
     internal VulkanQwen3MoeHybridWeights Weights => _weights;
 
-    /// <summary>#921: projections that ran on the packed legacy-quant arms (Q4_1 / Q5_0 / Q5_1); test / proof hook.</summary>
+    /// <summary>#921: projections that ran on the packed legacy-quant arms (Q4_0 / Q4_1 / Q5_0 / Q5_1); test / proof hook.</summary>
     internal long LegacyQuantDispatchCount { get; private set; }
 
     /// <summary>#921: legacy-quant decode GEMVs that took the dp4a MMVQ (Q8_1 activations) rather than the F32-in GEMV; test / proof hook.</summary>
@@ -3051,8 +3051,12 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 break;
             case QuantizationType.Q4_0:
                 // Keep packed weights on devices without wave64 cooperative matrices.
+                LegacyQuantDispatchCount++;
                 if (seqLen == 1 && _kernels.MatMulQ4_0Mmvq is not null && (xqReady || TryPrepareQ8Activations(cmdBuf, input, inputDim)))
+                {
+                    LegacyQuantMmvqDispatchCount++;
                     _kernels.MatMulQ4_0Mmvq.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output, m: outputDim, k: inputDim);
+                }
                 else if (seqLen == 1 && _kernels.MatMulQ4_0Gemv is not null)
                     _kernels.MatMulQ4_0Gemv.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);   // #921: no dp4a -> F32-in GEMV
                 else if (_kernels.MatMulQ4_0GemmCoopmat is not null)
