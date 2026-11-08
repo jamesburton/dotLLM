@@ -854,8 +854,15 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
         using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
         {
             var r = Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--json"]);
-            Assert.Equal(1, r.Code);
-            Assert.Equal(1, JsonDocument.Parse(r.Out).RootElement.GetProperty("store_failures").GetInt32());
+            if (OperatingSystem.IsWindows())
+            {
+                Assert.Equal(1, r.Code);
+                Assert.Equal(1, JsonDocument.Parse(r.Out).RootElement.GetProperty("store_failures").GetInt32());
+            }
+            else
+            {
+                Assert.Equal(0, r.Code); // POSIX renames over a file another handle has open: no failure to report
+            }
         }
         Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64"]).Code); // repaired
         Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
