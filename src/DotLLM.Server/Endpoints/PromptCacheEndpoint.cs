@@ -135,6 +135,7 @@ public static class PromptCacheEndpoint
 
     private static PromptCacheStatsResponse EmptyStats() => new()
     {
+        Policy = "lru",
         Enabled = false,
         BlockSize = 0,
         Nodes = 0,

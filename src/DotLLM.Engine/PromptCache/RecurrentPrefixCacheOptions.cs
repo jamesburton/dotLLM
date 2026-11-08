@@ -76,8 +76,8 @@ public sealed record RecurrentPrefixCacheStatistics
     public int StepCheckpoints { get; init; }
     /// <summary>Bytes held by the retained step checkpoints.</summary>
     public long StepCheckpointBytes { get; init; }
-    /// <summary>The retention policy in force (issue #1654).</summary>
-    public string Policy { get; init; } = nameof(PrefixCachePolicy.Lru);
+    /// <summary>The retention policy in force (issue #1654); null when the producer did not say (serialized DTO: no initializer).</summary>
+    public string? Policy { get; init; }
     /// <summary>
     /// Requests that would have replaced or truncated an unexpired entry of another conversation and ran cold instead
     /// (<see cref="PrefixCachePolicy.Agent"/>, issue #1654). Counted among <see cref="Misses"/> too.

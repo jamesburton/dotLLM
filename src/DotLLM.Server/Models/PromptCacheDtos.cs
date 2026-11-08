@@ -51,7 +51,7 @@ public sealed record PromptCacheStatsResponse
 
     /// <summary>Retention policy in force for every prefix cache of this server (#1654): <c>lru</c> or <c>agent</c>.</summary>
     [JsonPropertyName("policy")]
-    public string Policy { get; init; } = "lru";
+    public required string Policy { get; init; }   // no initializer: source-gen drops them (CLAUDE.md JSON DTO rules)
 
     [JsonPropertyName("enabled")]
     public required bool Enabled { get; init; }

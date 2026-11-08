@@ -60,6 +60,7 @@ public sealed class PromptCacheEndpointTests
     {
         var resp = new PromptCacheStatsResponse
         {
+            Policy = "lru",
             Enabled = true,
             BlockSize = 16,
             Nodes = 4,
