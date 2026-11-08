@@ -125,7 +125,7 @@ public sealed partial class ChunkCacheCliTests
         string tree = NewTree();
         string store = NewDir("store");
         using ModelHandle model = OpenModel(_fx.ModelA);
-        var fake = PrewarmingServer(model, "served-model");
+        var fake = PrewarmingServer(model, "served-model", skewed: true);
 
         JsonElement r = Json(CliRaw(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--server", FakeUrl, "--encode", "--json"], http: fake));
         Assert.Equal("prewarm", r.GetProperty("mode").GetString());
@@ -157,8 +157,11 @@ public sealed partial class ChunkCacheCliTests
         // The CLI wrote no entry and no ledger; the server's own answer is what it reports as queued.
         Assert.Empty(Directory.EnumerateFiles(store, "*.ckv", SearchOption.AllDirectories));
         Assert.False(File.Exists(ServerLedger.DefaultPath(store)));
-        Assert.Equal(sent.Sum(s => ChunkTokenization.Encode(model.Tokenizer, s.Text).Length), r.GetProperty("encode_queued_tokens").GetInt64());
-        Assert.Equal(sent.Count, r.GetProperty("prewarm").GetProperty("queued").GetInt32());
+        // encode_queued_tokens is what the SERVER queued (it already held one text: 7 tokens fewer than sent), not what we planned.
+        long sentTokens = sent.Sum(s => ChunkTokenization.Encode(model.Tokenizer, s.Text).Length);
+        Assert.Equal(sentTokens - 7, r.GetProperty("encode_queued_tokens").GetInt64());
+        Assert.Equal(sent.Count - 1, r.GetProperty("prewarm").GetProperty("queued").GetInt32());
+        Assert.Equal(1, r.GetProperty("prewarm").GetProperty("already_stored").GetInt32());
 
         // --offline is the other writer, not a second way to call the server.
         Assert.Equal(2, CliRaw(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--server", FakeUrl, "--offline"], http: fake).Code);
@@ -180,6 +183,24 @@ public sealed partial class ChunkCacheCliTests
         }
         Assert.Equal(before, Directory.EnumerateFileSystemEntries(store, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal).ToArray());
         Assert.Equal(2, CliRaw(["evict", "--server", FakeUrl, "--offline", "--store", store]).Code); // both is no choice either
+    }
+
+    [Fact]
+    public void Evict_Server_SendsTheResolvedModeAndDryRun()
+    {
+        using ModelHandle model = OpenModel(_fx.ModelA);
+        var fake = PrewarmingServer(model, model.ModelId);
+        Assert.Equal(0, CliRaw(["evict", "--server", FakeUrl], http: fake).Code);
+        Assert.Equal(0, CliRaw(["evict", "--server", FakeUrl, "--apply", "--mode", "path", "--path", "src/**"], http: fake).Code);
+        Assert.Equal(0, CliRaw(["evict", "--server", FakeUrl, "--mode", "namespace", "--namespace", "team-a"], http: fake).Code);
+        JsonObject[] bodies = fake.Requests.Where(q => q is { Method: "POST", Path: "/v1/chunk-cache/evict" }).Select(q => JsonNode.Parse(q.Body)!.AsObject()).ToArray();
+        Assert.Equal(3, bodies.Length);
+        // The default is a dry run of the orphans (nothing is deleted unless --apply says so)...
+        Assert.Equal("orphans", bodies[0]["mode"]!.GetValue<string>());
+        Assert.True(bodies[0]["dry_run"]!.GetValue<bool>());
+        // ...and --apply with a glob goes out as dry_run false.
+        Assert.Equal(("path", "src/**", false), (bodies[1]["mode"]!.GetValue<string>(), bodies[1]["path"]!.GetValue<string>(), bodies[1]["dry_run"]!.GetValue<bool>()));
+        Assert.Equal(("namespace", "team-a", true), (bodies[2]["mode"]!.GetValue<string>(), bodies[2]["namespace"]!.GetValue<string>(), bodies[2]["dry_run"]!.GetValue<bool>()));
     }
 
     [Fact]
@@ -678,13 +699,16 @@ public sealed partial class ChunkCacheCliTests
     }
 
     /// <summary>A server with the capabilities of <paramref name="model"/> (as <paramref name="modelId"/>) that accepts prewarm texts.</summary>
-    private FakeServer PrewarmingServer(ModelHandle model, string modelId) => new(s =>
+    private FakeServer PrewarmingServer(ModelHandle model, string modelId, bool skewed = false) => new(s =>
     {
         if (s is { Method: "GET", Path: "/v1/chunk-cache" }) return (HttpStatusCode.OK, CapsJson(modelId, model.Producer));
         if (s is { Method: "POST", Path: "/v1/chunk-cache/prewarm" })
         {
             JsonArray texts = JsonNode.Parse(s.Body)!["texts"]!.AsArray();
             long tokens = texts.Sum(t => ChunkTokenization.Encode(model.Tokenizer, t!["text"]!.GetValue<string>()).Length);
+            // skewed: the server already holds one text and so queues one less (and fewer tokens) than were sent.
+            if (skewed)
+                return (HttpStatusCode.OK, $$"""{"requested":{{texts.Count}},"already_stored":1,"queued":{{texts.Count - 1}},"queued_tokens":{{tokens - 7}},"refused":0,"refused_reasons":[]}""");
             return (HttpStatusCode.OK, $$"""{"requested":{{texts.Count}},"already_stored":0,"queued":{{texts.Count}},"queued_tokens":{{tokens}},"refused":0,"refused_reasons":[]}""");
         }
         if (s is { Method: "POST", Path: "/v1/chunk-cache/evict" })
