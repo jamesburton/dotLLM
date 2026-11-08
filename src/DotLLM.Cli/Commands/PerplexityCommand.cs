@@ -8,6 +8,7 @@ using DotLLM.Engine;
 using DotLLM.Engine.Evaluation;
 using DotLLM.Engine.KvCache;
 using DotLLM.Models;
+using DotLLM.Models.Architectures;
 using DotLLM.Models.Evaluation;
 using DotLLM.Models.Gguf;
 using Spectre.Console;
@@ -105,6 +106,27 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [Description("Prepend BOS to the stream and substitute it at each window start. Defaults to the model's own setting, derived from the vocab exactly as llama.cpp derives it; pass --bos true/false only to override that.")]
         public bool? Bos { get; set; }
 
+        [CommandOption("--docs-file")]
+        [Description("Per-document eval (#1706): a JSONL file with one JSON list of token ids per line. Each document is scored teacher-forced as an independent sequence (the first token is context only and is not scored) with the model's full context limit; --corpus, --mode and the window options are ignored. Writes per-document NLL JSONL to --docs-out (default stdout; all other output goes to stderr). See docs/PERPLEXITY.md.")]
+        public string? DocsFile { get; set; }
+
+        [CommandOption("--docs-out")]
+        [Description("Where --docs-file writes its per-document JSONL (default: stdout).")]
+        public string? DocsOut { get; set; }
+
+        [CommandOption("--max-doc-tokens")]
+        [Description("--docs-file only: truncate every document's sequence (BOS included) to this many tokens. 0 = never truncate; a document longer than the context limit is then an error.")]
+        [DefaultValue(0)]
+        public int MaxDocTokens { get; set; }
+
+        [CommandOption("--ref-logprobs")]
+        [Description("--docs-file only: reference model log-probs JSONL (one object per document, same order; format 'full' or 'topk', see docs/PERPLEXITY.md). Adds kl_sum / kl_mean = KL(reference || model) per document.")]
+        public string? RefLogProbs { get; set; }
+
+        [CommandOption("--dump-routing")]
+        [Description("--docs-file only, MoE models on the CPU transformer: write the router's per-document, per-layer, per-position top-k expert ids and gate weights to this JSONL path. A dense model is an error.")]
+        public string? DumpRouting { get; set; }
+
         [CommandOption("--quant")]
         [Description("Quantization to select when resolving a HuggingFace repo ID.")]
         public string? Quant { get; set; }
@@ -169,7 +191,35 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         // --tokens-file supplies the token stream directly, so it replaces --corpus rather than
         // supplementing it. Requiring both would defeat the flag's purpose: scoring a reference
         // implementation's exact ids to separate a tokenizer difference from a scoring one.
-        if (settings.TokensFile is not null)
+        bool docsMode = settings.DocsFile is not null;
+        if (!docsMode && (settings.DocsOut is not null || settings.RefLogProbs is not null
+                          || settings.DumpRouting is not null || settings.MaxDocTokens != 0))
+        {
+            AnsiConsole.MarkupLine("[red]--docs-out / --max-doc-tokens / --ref-logprobs / --dump-routing need --docs-file.[/]");
+            return 1;
+        }
+        if (docsMode)
+        {
+            // stdout carries the JSONL when --docs-out is absent, so every decoration goes to stderr.
+            if (settings.DocsOut is null)
+                AnsiConsole.Console = AnsiConsole.Create(new AnsiConsoleSettings { Out = new AnsiConsoleOutput(Console.Error) });
+            if (!File.Exists(settings.DocsFile))
+            {
+                AnsiConsole.MarkupLine($"[red]Docs file not found: {Markup.Escape(settings.DocsFile!)}[/]");
+                return 1;
+            }
+            if (settings.RefLogProbs is not null && !File.Exists(settings.RefLogProbs))
+            {
+                AnsiConsole.MarkupLine($"[red]Reference log-probs file not found: {Markup.Escape(settings.RefLogProbs)}[/]");
+                return 1;
+            }
+            if (settings.Cycle || settings.FirstLayer > 0)
+            {
+                AnsiConsole.MarkupLine("[red]--docs-file does not support --cycle / --first-layer.[/]");
+                return 1;
+            }
+        }
+        else if (settings.TokensFile is not null)
         {
             if (!File.Exists(settings.TokensFile))
             {
@@ -180,7 +230,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         }
         else if (string.IsNullOrWhiteSpace(settings.Corpus))
         {
-            AnsiConsole.MarkupLine("[red]--corpus is required (or --tokens-file).[/]");
+            AnsiConsole.MarkupLine("[red]--corpus is required (or --tokens-file, or --docs-file).[/]");
             return 1;
         }
         else if (!File.Exists(settings.Corpus))
@@ -194,7 +244,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         // Warned before the model loads so it is the first thing on screen, and repeated in the
         // results table below because the table is what gets pasted into an issue.
         long corpusCarriageReturns = 0;
-        if (settings.TokensFile is null)
+        if (settings.TokensFile is null && !docsMode)
         {
             corpusCarriageReturns = CorpusLineEndings.CountCarriageReturns(settings.Corpus);
             string? lineEndingWarning =
@@ -216,9 +266,9 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             ? settings.Model : null;
         if (hfDir is not null)
         {
-            if (settings.TokensFile is null)
+            if (settings.TokensFile is null && !docsMode)
             {
-                AnsiConsole.MarkupLine("[red]A safetensors model directory requires --tokens-file (pre-tokenized ids).[/]");
+                AnsiConsole.MarkupLine("[red]A safetensors model directory requires --tokens-file or --docs-file (pre-tokenized ids).[/]");
                 return 1;
             }
             if (!string.Equals(settings.Device, "cpu", StringComparison.OrdinalIgnoreCase))
@@ -426,15 +476,15 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             ? settings.UnscoredPrefix
             : Math.Min(effectiveContext - 1, Math.Max(1, effectiveContext / 2 + 1));
 
-        List<int> tokens = LoadCorpusTokens(settings, tokenizer!, addBos);
+        List<int> tokens = docsMode ? [] : LoadCorpusTokens(settings, tokenizer!, addBos);
 
-        if (tokens.Count < 2)
+        if (!docsMode && tokens.Count < 2)
         {
             AnsiConsole.MarkupLine($"[red]Corpus tokenized to {tokens.Count} tokens; at least 2 are required.[/]");
             return 1;
         }
 
-        if (settings.DumpTokens is not null)
+        if (!docsMode && settings.DumpTokens is not null)
             File.WriteAllText(settings.DumpTokens, string.Join(' ', tokens));
 
         IKvCache? kvCache = null;
@@ -447,8 +497,10 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         // than raising. See BackendPerplexityModel.Probe.
         // A model that returns the last row only by default may widen on request (#564): a whole
         // scoring window (+1 for a prepended BOS) is the longest batch this run will submit.
-        model.TrySetAllRowLogitsLimit(effectiveContext + 1);
-        bool returnsAllRows = BackendPerplexityModel.Probe(model, forwardDeviceId, effectiveContext + 1);
+        // --docs-file scores whole documents up to the model's own context limit, not --context.
+        int allRowsLimit = docsMode ? config.MaxSequenceLength : effectiveContext + 1;
+        model.TrySetAllRowLogitsLimit(allRowsLimit);
+        bool returnsAllRows = BackendPerplexityModel.Probe(model, forwardDeviceId, allRowsLimit);
         if (kvKeyDType is not null)
         {
             var geom = KvGeometry.FromConfig(config, model.SupportsCompactSlidingKv);
@@ -469,6 +521,20 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         AnsiConsole.MarkupLine(
             $"[grey]device: {Markup.Escape(deviceLabel)}  all-rows logits: {returnsAllRows} "
             + $"({(returnsAllRows ? "single-pass O(n)" : "growing-prefix O(n^2)")})  kv-cache: {kvCacheLabel}[/]");
+        if (docsMode)
+        {
+            // BOS is explicit here: ids are scored exactly as supplied unless --bos true prepends one. (Unlike corpus mode,
+            // the model's own add-BOS setting is NOT consulted: the caller's ids may already carry a BOS.)
+            if (settings.Bos == true && tokenizer is null)
+            {
+                AnsiConsole.MarkupLine("[red]--bos true needs a tokenizer; this model has none.[/]");
+                return 1;
+            }
+            int? docsBos = settings.Bos == true ? tokenizer!.BosTokenId : null;
+            bool routingOnCpu = model is TransformerModel && placement.GpuLayers <= 0 && placement.Backend == "cpu";
+            return RunDocuments(settings, perplexityModel, config, docsBos, routingOnCpu, deviceLabel);
+        }
+
         int bosTokenId = addBos ? tokenizer!.BosTokenId : -1;
         var options = new PerplexityOptions(
             mode, effectiveContext, effectiveStride, settings.MaxTokens, effectivePrefix, bosTokenId);
@@ -731,6 +797,64 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 : null,
             kvCacheLabel: "none (layer-window engine)");
         return 0;
+    }
+
+    /// <summary>
+    /// <c>--docs-file</c>: per-document teacher-forced NLL (and optionally KL against a reference, and the MoE routing).
+    /// </summary>
+    private static int RunDocuments(
+        Settings settings, BackendPerplexityModel model, ModelConfig config, int? bosTokenId, bool routingOnCpu, string deviceLabel)
+    {
+        if (settings.DumpRouting is not null)
+        {
+            if (config.Moe is null)
+            {
+                AnsiConsole.MarkupLine("[red]--dump-routing needs a mixture-of-experts model; this model is dense.[/]");
+                return 1;
+            }
+            if (!routingOnCpu)
+            {
+                AnsiConsole.MarkupLine("[red]--dump-routing is supported on the CPU transformer only (--device cpu, a plain TransformerModel architecture such as OLMoE / Mixtral / Qwen-MoE).[/]");
+                return 1;
+            }
+        }
+
+        var sw = Stopwatch.StartNew();
+        var utf8 = new System.Text.UTF8Encoding(false);
+        TextWriter docsOut = settings.DocsOut is null
+            ? new StreamWriter(Console.OpenStandardOutput(), utf8)
+            : new StreamWriter(settings.DocsOut, append: false, utf8);
+        RefLogProbsReader? refs = settings.RefLogProbs is null ? null : new RefLogProbsReader(settings.RefLogProbs);
+        StreamWriter? routingWriter = settings.DumpRouting is null
+            ? null : new StreamWriter(settings.DumpRouting, append: false, utf8);
+        RoutingDump? routing = routingWriter is null ? null : new RoutingDump(routingWriter);
+        try
+        {
+            List<DocResult> results = DocumentEvaluator.Run(
+                model, DocumentJsonl.ReadDocuments(settings.DocsFile!),
+                new DocumentEvalOptions(bosTokenId, settings.MaxDocTokens), docsOut, refs, routing);
+            sw.Stop();
+
+            long scored = results.Sum(r => (long)r.Score.TokensScored);
+            double nll = results.Sum(r => r.Score.NllSum);
+            AnsiConsole.MarkupLine(
+                $"[grey]docs: {results.Count}  scored tokens: {scored:N0}  pooled mean NLL: {(scored > 0 ? nll / scored : double.NaN):F6} nats  "
+                + $"device: {Markup.Escape(deviceLabel)}  elapsed: {sw.Elapsed.TotalSeconds:F2} s[/]");
+            return 0;
+        }
+        catch (Exception ex) when (ex is ArgumentException or FormatException or InvalidOperationException)
+        {
+            docsOut.Flush();
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+            return 1;
+        }
+        finally
+        {
+            routing?.Dispose();
+            routingWriter?.Dispose();
+            refs?.Dispose();
+            docsOut.Dispose();
+        }
     }
 
     /// <summary>

@@ -1396,6 +1396,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // applying at the top of the next iteration covers all of them).
             if (residualModifier is not null && layer > firstLayer)
                 ApplyResidualModifier(residualModifier, layer - 1, hidden, seqLen);
+            if (DotLLM.Cpu.MoeRoutingProbe.Sink is not null) DotLLM.Cpu.MoeRoutingProbe.Layer = layer;   // #1706 routing tap
             ref readonly var lw = ref _weights.Layers[layer];
             var rl = repackedLayers?[layer];
 

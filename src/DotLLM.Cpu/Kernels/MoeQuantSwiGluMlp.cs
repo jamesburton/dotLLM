@@ -193,6 +193,9 @@ public static unsafe class MoeQuantSwiGluMlp
                         }
                     }
 
+                    // Routing tap (#1706): off = one static read + null check per token.
+                    MoeRoutingProbe.Sink?.Record(MoeRoutingProbe.Layer, 1, numExpertsPerTok, topkIdx, topkVal);
+
                     // ── 3) Per-expert quantized SwiGLU MLP ───────────────
                     var acc = accBuf.AsSpan(0, hiddenSize);
                     acc.Clear();
