@@ -625,7 +625,7 @@ PRs #1103, #1122, #1125, #1126.
 | VX1 | Vulkan | token embedding → F32 for every type but Q8_0 | Qwen3.8-27B 4.85 GiB vs 682 MiB (Q4_K); Bolt 2 GiB vs 544 MiB (Q8_0) | **fixed for Nemotron-H and qwen35 dense** (#1174: Q8_0 / Q4_K / Q6_K / PQ2_0 gathered packed); dense `VulkanWeights` K-quants and `VulkanQwen3MoeHybrid` open | #919 |
 | VX2 | Vulkan | matrices outside `DeviceQuantTypeFor` → F32 | `m·k·4` | open | #921, #627 |
 | VX3 | Vulkan | quantized-KV / TurboQuant F32 full-history scratch | `2·maxSeq·stride·4` | open | #1139 (hybrid: #1112) |
-| VX4 | Vulkan | IQ1/2/3 (+ fallback NVFP4) prefill F16 scratch | L3B 50.3 MB + 4 B/weight traffic | open | #1146 (#1064, #1069) |
+| VX4 | Vulkan | IQ1/2/3 (+ fallback NVFP4) prefill F16 scratch | L3B 50.3 MB + 4 B/weight traffic | **fixed for the dense and Nemotron-H hosts** (#1677: IQ1_S / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S decode inside the 128x128 coopmat tile, scratch never allocated; IQ2_XXS #1069, NVFP4 #1064); hybrid hosts open (#1149) | #1146 (#1064, #1069, #1677) |
 | VX5 | Vulkan | shared-expert / expert-bank F32 fallbacks; legacy MLA F32 | up to ≈265 GB if they fall through | open | #1140 |
 | F374 | Vulkan | 16-bit storage / `shaderFloat16` / `shaderInt8` never enabled | — | **fixed on dev** (972d5c53, PR #1122) | #374 |
 | Q1 | Vulkan qwen4exp | shared experts widened to F16 | +0.34 GiB | open | #1145 |
