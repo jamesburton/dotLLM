@@ -28,6 +28,7 @@
     <ProjectReference Include="..\..\src\DotLLM.Cli\DotLLM.Cli.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse\DotLLM.ChunkReuse.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.CSharp\DotLLM.ChunkReuse.CSharp.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.Vulkan\DotLLM.ChunkReuse.Vulkan.csproj" />
   </ItemGroup>
 
   <ItemGroup>

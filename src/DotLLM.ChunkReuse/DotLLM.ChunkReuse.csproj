@@ -3,7 +3,7 @@
   <PropertyGroup>
     <!-- Not packed yet: becomes a package when DotLLM.Server references it (chunk-cache execution PR). -->
     <IsPackable>false</IsPackable>
-    <Description>Chunk-level KV reuse for dotLLM — encode a token chunk's per-layer K/V in isolation, then assemble cached chunks into a KV-cache at new offsets with RoPE re-rotation of the keys; chunk keys, text-first chunkers and the on-disk chunk store. No Roslyn and no Vulkan dependency.</Description>
+    <Description>Chunk-level KV reuse for dotLLM — encode a token chunk's per-layer K/V in isolation, then assemble cached chunks into a KV-cache at new offsets with RoPE re-rotation of the keys; chunk keys, text-first chunkers and the on-disk chunk store. No Roslyn and no Vulkan dependency (see DotLLM.ChunkReuse.CSharp and DotLLM.ChunkReuse.Vulkan).</Description>
   </PropertyGroup>
 
   <ItemGroup>
@@ -18,6 +18,8 @@
     <!-- FileChunkStore.BeforeRenameForTest: lets tests hold the destination open between write and rename. -->
     <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
     <InternalsVisibleTo Include="DotLLM.ChunkReuse.CSharp" />
+    <!-- VulkanChunkBackend reads CpuChunkBackend.RowCount. -->
+    <InternalsVisibleTo Include="DotLLM.ChunkReuse.Vulkan" />
   </ItemGroup>
 
 </Project>
