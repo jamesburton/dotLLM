@@ -50,6 +50,7 @@ public class QuantFormatTests
     // ternary / 2-bit 128-code groups
     [InlineData(QuantizationType.I2_S, 128 / 4, 128)]               // 4 codes/byte; f32 scale at TENSOR tail, not in-block
     [InlineData(QuantizationType.PQ2_0, 2 + 128 / 4, 128)]          // f16 scale in-block + 4 codes/byte
+    [InlineData(QuantizationType.TERN_B64_F16, 2 + 64 / 4, 64)]     // f16 scale in-block + 4 trits/byte, 64-column blocks (#1706)
     public void Info_MatchesLlamaCppBlockLayout(QuantizationType type, int expectedBlockBytes, int expectedGroupSize)
     {
         var info = QuantFormat.TryGetInfo(type);

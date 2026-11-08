@@ -189,7 +189,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
             : null;
         var weights = TransformerWeights.LoadFromGguf(gguf, config, moeBankSkipSelector: skipRoutedF32, allowNanoQuant: true,
                                                       allowNvfp4Scales: true,
-                                                      allowGlm4MoeCpu: true); // glm4moe CPU forward (#1599)
+                                                      allowGlm4MoeCpu: true, // glm4moe CPU forward (#1599)
+                                                      overlay: gguf.Overlay); // --tensor-overlay (#1706); null = unchanged load
         // Route through the shared state builder so the GGUF path gets the same
         // per-attention-type RoPE tables, partial-rotary handling, and distinct
         // per-layer head-dim scratch sizing as the safetensors path (Gemma 4 needs
@@ -225,12 +226,12 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     /// </summary>
     internal static TransformerModel LoadFromSafetensors(
         ISafetensorsTensorSource file, ModelConfig config, ThreadingConfig threading,
-        BitNetI2SCacheContext? i2sCache)
+        BitNetI2SCacheContext? i2sCache, TensorOverlay? overlay = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
 
-        var weights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache, allowFactorized: true);
+        var weights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache, allowFactorized: true, overlay: overlay);
         return BuildFromPrebuiltWeightsInternal(weights, config, threading, anchorSource: file);
     }
 
@@ -1977,7 +1978,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                         softmaxAfterTopK: moe.SoftmaxAfterTopK,
                         useSwiGluOai: moe.UseSwiGluOai,
                         pool: _threadPool,
-                        normTopKProb: moe.NormTopKProb);
+                        normTopKProb: moe.NormTopKProb,
+                        overlay: moe.ExpertOverlay);
                 }
                 // DeepSeek-V3 / GLM-4.7-Flash routing (sigmoid + selection bias + scale, #742) and
                 // any MoE layer whose routed experts were left in the raw GGUF quant view (the F32
@@ -4268,6 +4270,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
             MatMul.GemvBf16(weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.I2_S)
             MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.TERN_B64_F16)
+            TernB64F16.GemvQ8((byte*)weights, x, y, m, k, _threadPool);   // overlay ternary (#1706): packed blocks, int8 activations
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemvPQ2_0((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.PTQ1_0)
@@ -4332,6 +4336,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
             MatMul.GemmBf16(weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.I2_S)
             MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
+        else if (qt == QuantizationType.TERN_B64_F16)
+            TernB64F16.GemmQ8((byte*)weights, b, c, m, k, n, _threadPool);   // overlay ternary (#1706)
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.PTQ1_0)

@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -378,6 +379,13 @@ internal sealed class MoeLayerWeights
     /// <c>MoeQuantSwiGluMlp</c> (gpt-oss). False = classic F32 W1/W2/W3 path.</summary>
     public bool UseQuantExperts;
 
+    /// <summary>
+    /// Per-(expert, projection) format overrides from <c>--tensor-overlay</c> (#1706); null when no overlay touches this layer. Consumed by the
+    /// quantized-expert CPU path only (<see cref="UseQuantExperts"/>); other consumers never see it because the overlay is applied only by the
+    /// CPU <c>TransformerModel</c> loader.
+    /// </summary>
+    public DotLLM.Cpu.Kernels.ExpertOverlayTable? ExpertOverlay;
+
     /// <summary>Optional router bias [NumExperts] (gpt-oss <c>ffn_gate_inp.bias</c>).</summary>
     public float[]? RouterBias;
 
@@ -751,6 +759,23 @@ internal readonly struct TransformerLayerWeights
     /// architecture.
     /// </summary>
     public readonly float[]? PostFfnNormWeight;
+
+    /// <summary>
+    /// Copy of this layer with one dense FFN projection (0 gate, 1 up, 2 down) replaced by an overlay tensor (#1706). The struct is
+    /// <c>readonly</c> because production loaders build it once; the overlay is applied before the weights are shared, on a private copy.
+    /// </summary>
+    internal TransformerLayerWeights WithDenseFfnOverride(int proj, nint ptr, QuantizationType qt)
+    {
+        var c = this;
+        switch (proj)
+        {
+            case 0: Unsafe.AsRef(in c.GateWeight) = ptr; Unsafe.AsRef(in c.GateQuantType) = qt; break;
+            case 1: Unsafe.AsRef(in c.UpWeight) = ptr; Unsafe.AsRef(in c.UpQuantType) = qt; break;
+            case 2: Unsafe.AsRef(in c.DownWeight) = ptr; Unsafe.AsRef(in c.DownQuantType) = qt; break;
+            default: throw new ArgumentOutOfRangeException(nameof(proj));
+        }
+        return c;
+    }
 
     /// <summary>SwiGLU gate projection.</summary>
     public readonly nint GateWeight;
@@ -1413,6 +1438,8 @@ internal sealed class TransformerWeights : IDisposable
     /// <param name="allowNvfp4Scales">True only for the CPU backend: loads the NVFP4 <c>.scale</c> tensors of a Flint GGUF
     /// (#1578) so the CPU model applies them. Every other caller leaves it false and gets a clear
     /// <see cref="NotSupportedException"/> for a file that carries scales.</param>
+    /// <param name="overlay">Tensor overlay (#1706, <c>--tensor-overlay</c>) to apply to the FFN projections; only the CPU <c>TransformerModel</c> loader passes one
+    /// (every other caller ignores overlays, which the CLI then reports as "not applied"). Null = the unchanged pre-overlay load.</param>
     /// <param name="allowGlm4MoeCpu">True only for the CPU <c>TransformerModel</c> (#1599): admits <c>glm4moe</c>, which only that model
     /// can run. Every other caller (Vulkan, CUDA, hybrid hosts) leaves it false and keeps the loud refusal.</param>
     public static TransformerWeights LoadFromGguf(GgufFile gguf, ModelConfig config,
@@ -1422,7 +1449,8 @@ internal sealed class TransformerWeights : IDisposable
                                                     bool skipMlaF32Dequant = false,
                                                     bool skipSharedExpertF32Dequant = false,
                                                     bool allowNvfp4Scales = false,
-                                                    bool allowGlm4MoeCpu = false)
+                                                    bool allowGlm4MoeCpu = false,
+                                                    TensorOverlay? overlay = null)
     {
         // glm4moe (#1599): only the CPU TransformerModel (allowGlm4MoeCpu) has a forward pass for it; Vulkan/CUDA keep the refusal.
         if (!(allowGlm4MoeCpu && config.Architecture == DotLLM.Core.Configuration.Architecture.Glm4Moe))
@@ -1483,6 +1511,8 @@ internal sealed class TransformerWeights : IDisposable
                     ? LoadGemma4Layer(i, dataBase, tensors, config, owned)
                     : LoadLayer(i, dataBase, tensors, config, nanoQuant ? gguf : null, owned);
         }
+
+        overlay?.ApplyToLayers(layers, config);
 
         // Output norm
         var outNormDesc = tensors["output_norm.weight"];

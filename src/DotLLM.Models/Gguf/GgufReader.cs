@@ -180,8 +180,9 @@ public static class GgufReader
     /// <param name="reader">A <see cref="BinaryReader"/> positioned after the metadata section.</param>
     /// <param name="header">The previously parsed header (provides version and tensor count).</param>
     /// <returns>List of tensor descriptors.</returns>
+    /// <param name="allowI8Container">True only for a tensor-overlay GGUF (<c>general.architecture = dotllm-overlay</c>, #1706): accepts raw I8 tensors that carry packed bytes.</param>
     /// <exception cref="NotSupportedException">Unrecognized quantization type.</exception>
-    public static List<GgufTensorDescriptor> ReadTensorInfos(BinaryReader reader, GgufHeader header)
+    public static List<GgufTensorDescriptor> ReadTensorInfos(BinaryReader reader, GgufHeader header, bool allowI8Container = false)
     {
         var tensors = new List<GgufTensorDescriptor>((int)Math.Min(header.TensorCount, int.MaxValue));
 
@@ -201,7 +202,9 @@ public static class GgufReader
             }
 
             uint rawType = reader.ReadUInt32();
-            QuantizationType quantType = MapGgufTensorType(rawType, name);
+            QuantizationType quantType = rawType == (uint)QuantizationType.I8 && !allowI8Container
+                ? throw new NotSupportedException($"Tensor '{name}' has unrecognized quantization type: {rawType}.")
+                : MapGgufTensorType(rawType, name);
             ulong offset = reader.ReadUInt64();
 
             tensors.Add(new GgufTensorDescriptor(name, new TensorShape(dims), quantType, offset));

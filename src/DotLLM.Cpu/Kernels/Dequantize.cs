@@ -87,6 +87,7 @@ public static unsafe partial class Dequantize
         QuantizationType.F16 => elementCount * 2,
         QuantizationType.BF16 => elementCount * 2,
         QuantizationType.I32 => elementCount * 4,
+        QuantizationType.I8 => elementCount,
         QuantizationType.Q4_0 => elementCount / Q8_0GroupSize * Q4_0BlockBytes,
         QuantizationType.Q4_1 => elementCount / Q8_0GroupSize * Q4_1BlockBytes,
         QuantizationType.Q8_0 => elementCount / Q8_0GroupSize * Q8_0BlockBytes,
@@ -111,6 +112,7 @@ public static unsafe partial class Dequantize
         QuantizationType.MXFP4 => elementCount / Mxfp4GroupSize * Mxfp4BlockBytes,
         QuantizationType.NVFP4 => elementCount / Nvfp4GroupSize * Nvfp4BlockBytes,
         QuantizationType.Q2_0 => elementCount / QuantFormat.Q2_0GroupSize * QuantFormat.Q2_0BlockBytes,
+        QuantizationType.TERN_B64_F16 => elementCount / QuantFormat.TernB64GroupSize * QuantFormat.TernB64F16BlockBytes,
         // PQ2_0: scale is per-group (interleaved), so row stride includes it — contrast I2_S.
         QuantizationType.PQ2_0 => elementCount / PQ2_0GroupSize * PQ2_0GroupBytes,
         // PTQ1_0: as PQ2_0, a per-group in-block scale — but 28 bytes per 128, scale last.
@@ -214,6 +216,9 @@ public static unsafe partial class Dequantize
                 break;
             case QuantizationType.NVFP4:
                 DequantizeNvfp4(src, elementCount, dest);
+                break;
+            case QuantizationType.TERN_B64_F16:
+                TernB64F16.Dequantize((byte*)src, elementCount, dest);
                 break;
             case QuantizationType.PQ2_0:
                 DequantizePQ2_0(src, elementCount, dest);

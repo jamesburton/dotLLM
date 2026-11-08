@@ -47,6 +47,14 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [Description("Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF).")]
         public string Model { get; set; } = string.Empty;
 
+        [CommandOption(Helpers.TensorOverlayCli.Option)]
+        [Description(Helpers.TensorOverlayCli.Help)]
+        public string? TensorOverlay { get; set; }
+
+        [CommandOption(Helpers.TensorOverlayCli.SkipHashOption)]
+        [Description(Helpers.TensorOverlayCli.SkipHashHelp)]
+        public bool OverlaySkipBaseHash { get; set; }
+
         [CommandOption("--corpus|-f")]
         [Description("Path to a UTF-8 text corpus (e.g. wiki.test.raw).")]
         public string Corpus { get; set; } = string.Empty;
@@ -275,6 +283,32 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             return 1;
 
         using GgufFile? gguf = hfDir is null ? GgufFile.Open(resolvedPath) : null;
+        TensorOverlay? hfOverlay = null;
+        using var hfOverlayOwner = new DisposeHolder(() => hfOverlay?.Dispose());
+        if (settings.TensorOverlay is not null)
+        {
+            if (gguf is null)
+            {
+                // HF safetensors base: there is no single file to hash, so the base-hash check is skipped with a note.
+                try
+                {
+                    hfOverlay = TensorOverlay.Open(settings.TensorOverlay, baseModelPath: null, verifyBaseHash: !settings.OverlaySkipBaseHash);
+                    foreach (string note in hfOverlay.Notes) AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(note)}[/]");
+                }
+                catch (Exception ex) when (ex is InvalidDataException or IOException or NotSupportedException)
+                {
+                    AnsiConsole.MarkupLine($"[red]{Markup.Escape(Helpers.TensorOverlayCli.Option + ": " + ex.Message)}[/]");
+                    return 1;
+                }
+            }
+            else if (Helpers.TensorOverlayCli.TryAttach(gguf, resolvedPath, settings.TensorOverlay, settings.OverlaySkipBaseHash) is { } overlayError)
+            {
+                AnsiConsole.MarkupLine($"[red]{Markup.Escape(overlayError)}[/]");
+                return 1;
+            }
+            if (gguf is not null)
+                AnsiConsole.MarkupLine($"[dim]{Markup.Escape(Helpers.TensorOverlayCli.Summary(gguf, settings.OverlaySkipBaseHash))}[/]");
+        }
         ModelConfig config;
         var tokenizer = hfDir is null ? GgufBpeTokenizerFactory.Load(gguf!.Metadata) : null;
         IDisposable? safetensorsSource = null;
@@ -303,7 +337,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 return 1;
             }
 
-            var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, new ThreadingConfig(settings.Threads));
+            var (m, src, cfg) = ModelLoader.LoadFromSafetensorsWithOverlay(hfDir, new ThreadingConfig(settings.Threads), hfOverlay);
             model = m; config = cfg; safetensorsSource = src as IDisposable;
             ownedDevice = safetensorsSource;
             addBos = settings.Bos ?? false;
@@ -436,6 +470,13 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 break;
             }
         }
+        }
+
+        if ((hfOverlay is not null ? Helpers.TensorOverlayCli.TryVerifyApplied(hfOverlay) : Helpers.TensorOverlayCli.TryVerifyApplied(gguf)) is { } overlayNotApplied)
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(overlayNotApplied)}[/]");
+            model.Dispose();
+            return 1;
         }
 
         int effectiveContext = Math.Min(settings.Context, config.MaxSequenceLength);
@@ -1010,4 +1051,10 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 return false;
         }
     }
+}
+
+/// <summary>Runs an action on dispose (keeps an overlay opened for a safetensors base alive for the whole command).</summary>
+internal sealed class DisposeHolder(Action onDispose) : IDisposable
+{
+    public void Dispose() => onDispose();
 }
