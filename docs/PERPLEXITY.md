@@ -806,3 +806,75 @@ alone move a perplexity on this model", i.e. what size of gap can NOT be called 
   Strix re-measure.
 
 Reproduce: `DOTLLM_CPU_Q4_FLOOR_PROBE=1|2|3` (diagnostic, default off, `MatMulLegacyQuants.cs`).
+
+## Per-document NLL, KL and MoE routing: `--docs-file` (issue #1706 S2)
+
+For research use (e.g. partially converted models compared document by document) the command can score a file of
+**pre-tokenized documents** instead of a corpus. `--corpus`, `--mode` and the window options are ignored.
+
+```
+dotllm perplexity model.gguf --docs-file docs.jsonl [--docs-out out.jsonl] [--bos true] [--max-doc-tokens N]
+                  [--ref-logprobs ref.jsonl] [--dump-routing routing.jsonl] [--device cpu] [--threads N]
+```
+
+**Input** `docs.jsonl`: one JSON array of non-negative integer token ids per line (`[1, 5, 9]`). Blank lines are ignored and
+do not consume an index: document `i` is the i-th non-blank line, 0-based. A malformed line is an error naming the line.
+
+**Semantics.** Every document is an independent sequence from position 0, scored **teacher-forced** in one forward pass with the
+model's own context limit (`MaxSequenceLength`, not `--context`). Row `i` predicts sequence token `i + 1`, so **the first token of
+each document is context only and is not scored**: a document of `n` tokens scores `n - 1` targets (`n_tokens_scored`).
+A sequence longer than the context limit is an explicit error naming the document, unless `--max-doc-tokens N` truncates every
+sequence to its first `N` tokens (BOS included). A token id outside the vocabulary is an error.
+
+**BOS is explicit and off by default.** Unlike corpus mode, the model's own add-BOS setting is **not** consulted: the ids are scored
+exactly as supplied, because the caller's tokenizer may already have put a BOS in them. `--bos true` prepends the model's BOS to every
+document; it then counts toward the context limit and `--max-doc-tokens`, is the unscored first token, and every document token
+becomes a target. The reference file must have been produced with the same choice (position counts must match; a mismatch is an error).
+
+**Output** (`--docs-out`, default stdout; with stdout output every other message goes to stderr, so stdout is pure JSONL), one line per document:
+
+```
+{"doc":0,"n_tokens":8,"n_tokens_scored":7,"nll_sum":127.2285...,"nll_mean":18.1755...}
+```
+
+`nll_sum` is in **nats** (natural log), `nll_mean = nll_sum / n_tokens_scored`, or `null` when nothing was scored (documents of fewer
+than 2 tokens). With a reference, `kl_sum`, `kl_mean` and `kl_mode` are added. `n_tokens` is the length fed to the model (after BOS and truncation).
+
+**Precision and determinism.** Logits are widened to double; `log-sum-exp = max + log(sum exp(x - max))` (max-shifted, so no overflow at
+logits of ~1000) is accumulated in double, and per-position terms are summed sequentially in position order in double. Nothing in the
+scoring depends on a thread count: same logits give a bit-equal result, and on CPU the logits themselves are bit-identical across thread
+counts (checked on SmolLM-135M Q8_0, 1 vs 4 threads: byte-identical output, `DocsFileRealModelTests`). On a last-row-only backend the
+same targets are scored with one growing-prefix forward each (O(n^2)).
+
+### `--ref-logprobs` format (KL(teacher || model))
+
+One JSON object per line, **one per document, in docs-file order**; `doc` must equal the index. Position `j` (0-based, `n_tokens_scored`
+of them) is the reference model's distribution that predicts sequence token `j + 1`, i.e. exactly the rows this command scores.
+Values are natural-log **probabilities** (log-softmax output, not raw logits). `null` stands for `-inf` (probability 0).
+
+```
+full  (exact):   {"doc":0,"format":"full","logprobs":[[v0,v1,...,vV-1], ...one row per position...]}
+top-K + tail:    {"doc":0,"format":"topk","ids":[[i0..iK-1], ...],"logprobs":[[l0..lK-1], ...],"tail_logprob":[t, ...]}
+```
+
+`full` rows must cover the model's whole vocabulary (same length as the model's; a mismatch is an error) and gives the exact
+`KL = sum_v p_v (log p_v - log q_v)` in double (`kl_mode: "full"`). `topk` lists the teacher's K highest-probability ids per position
+(distinct) with their log-probs; `tail_logprob` is the log of the teacher mass outside those ids (optional: when absent it is
+`log(1 - sum p)`, `-inf` below 1e-12). The reported `kl_mode: "topk_tail_lb"` is the exact sum over the K ids plus `T log(T / Q)` for the
+lumped tail (`T` teacher tail mass, `Q` model mass outside the same ids). By the log-sum inequality it is a **lower bound** on the full KL,
+equal when the teacher's tail is distributed like the model's, and it tightens as K grows. A full-vocabulary line is ~vocab x positions
+numbers (a 50k vocab x 4k positions is ~2 GB of text and is parsed in memory): use `topk` for long documents.
+
+### `--dump-routing` (MoE)
+
+`--dump-routing routing.jsonl` writes, per document, the router's final decision for every MoE layer and **every input position**
+(including the last, whose logits are unscored): `{"doc":0,"n_tokens":N,"top_k":K,"layers":[{"layer":L,"experts":[[e0..eK-1] x N],
+"weights":[[w0..wK-1] x N]}, ...]}`. Slot order is descending router score; `weights` are the gate weights the expert outputs are multiplied by
+(after softmax, the optional top-k renormalisation and scale: OLMoE keeps the raw softmax values, so a row sums to < 1; Mixtral-style
+renormalises to 1). Only layers that ran an MoE FFN appear. A dense model, a non-CPU device, or an architecture that does not go through the shared
+CPU `TransformerModel` router is an error, never an empty file; a layer that reports the wrong number of positions is an error too.
+
+The capture is `DotLLM.Cpu.MoeRoutingProbe`: a static `ISink` (null = off). Off cost is one static read and null check per router call
+(`MoeSwiGluMlp.Route`, per layer) or per token (`MoeQuantSwiGluMlp.Execute`, the stacked-GGUF-bank path every llama.cpp-format MoE uses), plus one
+null-checked static store of the layer index per layer in `TransformerModel`'s layer loop. Measured on the cached `OLMoE-1B-7B-0924-Instruct-Q4_K_M`:
+16 MoE layers, top-8, as above (CPU only; Gemma 4 MoE has its own router and is not covered).
