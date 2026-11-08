@@ -273,11 +273,24 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     private MatMulQ5KGemmCoopmatKernel? _matmulQ5KGemmCoopmat;
     // Same for Q5_0 (issue #592).
     private MatMulQ5_0GemmCoopmatKernel? _matmulQ5_0GemmCoopmat;
-    // Dense Q5_1 (#1600): F32-in GEMV (decode) + tiled GEMM (prefill). GLM-4.5-Air's shared-expert down is Q5_1 on 24 layers; no MMVQ/coopmat yet (follow-up).
+    // Dense Q5_1 (#1600): F32-in GEMV (decode) + tiled GEMM (prefill), the always-present correctness pair. GLM-4.5-Air's shared-expert
+    // down is Q5_1 on 24 layers. #1613 adds the fast arms: dp4a MMVQ decode (shared Q8_1 row), int8-coopmat MMQ (AMD) or dp4a MMQ prefill
+    // on Q8_1 rows, and the 128x128x4 F16 coopmat GEMM as the prefill fallback where no MMQ exists.
     private MatMulQ5_1GemvF32Kernel? _matmulQ5_1Gemv;
     private MatMulQ5_1GemmF32Kernel? _matmulQ5_1GemmF32;
+    private MatMulQ4_0MmvqKernel? _matmulQ5_1Mmvq;
+    private MatMulMmqCm1Kernel? _matmulQ5_1MmqCm1;
+    private MatMulQ4_1MmqKernel? _matmulQ5_1Mmq;
+    private MatMulQ4_0GemmCoopmatKernel? _matmulQ5_1GemmCoopmat;
     /// <summary>Dense projections that ran on the packed Q5_1 kernels (#1600; test / proof hook).</summary>
     internal long Q5_1DenseDispatchCount { get; private set; }
+    /// <summary>Dense Q5_1 projections that ran on the #1613 fast arms (MMVQ decode, MMQ / coopmat prefill) rather than the F32-in pair; test / proof hook.</summary>
+    internal long Q5_1FastDispatchCount { get; private set; }
+    /// <summary><c>DOTLLM_VK_Q5_1_FAST=0</c> keeps dense Q5_1 on the #1600 F32-in GEMV / GEMM (A/B against the #1613 MMVQ / MMQ / coopmat arms).</summary>
+    public const string Q5_1FastEnvVar = "DOTLLM_VK_Q5_1_FAST";
+    /// <summary>Runtime switch for the #1613 Q5_1 fast arms (default from <see cref="Q5_1FastEnvVar"/>); off = the #1600 F32-in pair. The
+    /// kernels stay created, so a test can A/B both paths on one loaded model.</summary>
+    internal bool Q5_1FastEnabled { get; set; } = Environment.GetEnvironmentVariable(Q5_1FastEnvVar) != "0";
     // Native Q4_0 (issue #1018): scalar F32-in GEMV / GEMM fallbacks, dp4a MMVQ decode (needs the shared Q8_1 activation scratch) and the
     // 128x128x4 coopmat prefill GEMM. All created post-construction; a null optional kernel just selects the next fallback.
     private MatMulQ4_0GemvF32Kernel? _matmulQ4_0;
@@ -2649,6 +2662,19 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             model._matmulQ5KGemmCoopmat = MatMulQ5KGemmCoopmatKernel.Create(device, spvDir);
         model._matmulQ5_1Gemv = MatMulQ5_1GemvF32Kernel.Create(device, spvDir);
         model._matmulQ5_1GemmF32 = MatMulQ5_1GemmF32Kernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(Q5_1FastEnvVar) != "0")
+        {
+            // #1613: Q8_1-activation arms share the Q4_1 kernel classes (same lane layout on the 24-byte block); the F16 coopmat GEMM is the
+            // prefill fallback on devices with cooperative matrices but no int8 MMQ (NVIDIA: dp4a MMQ; Arc: neither cm1 nor wave64 -> F32 GEMM).
+            model._matmulQ5_1Mmvq = MatMulQ4_0MmvqKernel.TryCreate(device, spvDir, quant: QuantType.Q5_1);
+            if (model._quantizeQ8_1Rows is not null)
+            {
+                model._matmulQ5_1MmqCm1 = MatMulMmqCm1Kernel.TryCreate(device, spvDir, QuantType.Q5_1);
+                if (model._matmulQ5_1MmqCm1 is null) model._matmulQ5_1Mmq = MatMulQ4_1MmqKernel.TryCreate(device, spvDir, QuantType.Q5_1);
+            }
+            if (MatMulQ4_0GemmCoopmatKernel.IsSupportedOn(device, spvDir, QuantType.Q5_1))
+                model._matmulQ5_1GemmCoopmat = MatMulQ4_0GemmCoopmatKernel.Create(device, spvDir, QuantType.Q5_1);
+        }
         if (Environment.GetEnvironmentVariable(DisableQ5_0CoopmatEnvVar) != "1"
             && MatMulQ5_0GemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulQ5_0GemmCoopmat = MatMulQ5_0GemmCoopmatKernel.Create(device, spvDir);
@@ -5752,6 +5778,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ5_0GemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ5_1Gemv?.InvalidateDescriptorCache();
         _matmulQ5_1GemmF32?.InvalidateDescriptorCache();
+        _matmulQ5_1Mmvq?.InvalidateDescriptorCache(); _matmulQ5_1MmqCm1?.InvalidateDescriptorCache(); _matmulQ5_1Mmq?.InvalidateDescriptorCache(); _matmulQ5_1GemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ3KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulIq4XsGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ6KMmq?.InvalidateDescriptorCache();
@@ -8482,6 +8509,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         // #1161: the legacy 4-bit MMVQs read the same Q8_1 scratch (Flint's q / k / v and shared-expert gate / up now share one quantize).
         QuantType.Q4_0 => _matmulQ4_0Mmvq is not null && (inputDim % MatMulQ4_0MmvqKernel.Q4_0GroupSize) == 0,
         QuantType.Q4_1 => _matmulQ4_1Mmvq is not null && (inputDim % MatMulQ4_0MmvqKernel.Q4_0GroupSize) == 0,
+        QuantType.Q5_1 => Q5_1FastEnabled && _matmulQ5_1Mmvq is not null && (inputDim % MatMulQ4_0MmvqKernel.Q4_0GroupSize) == 0,   // #1613
         _ => false,
     };
 
@@ -8576,6 +8604,11 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             case QuantType.Q4_1:
                 _matmulQ4_1Mmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
                 break;
+            case QuantType.Q5_1:
+                _matmulQ5_1Mmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                Q5_1DenseDispatchCount++; Q5_1FastDispatchCount++;
+                ProfNote("q5_1_mmvq", outputDim, inputDim, 1);
+                break;
             case QuantType.IQ1_S:
                 _matmulIq1SMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
                 break;
@@ -8636,6 +8669,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             : _matmulQ4_1Mmq is not null && (inputDim % MatMulQ4_1MmqKernel.Q4_1GroupSize) == 0),
         QuantType.Q4_0 => Q4_0PrefillQ8_1 && (_matmulQ4_0MmqCm1 is { } cm0 ? cm0.SupportsK(inputDim)
             : _matmulQ4_0Mmq is not null && (inputDim % MatMulQ4_0MmqKernel.Q4_0GroupSize) == 0),
+        QuantType.Q5_1 => Q5_1FastEnabled && (_matmulQ5_1MmqCm1 is { } cm51 ? cm51.SupportsK(inputDim)
+            : _matmulQ5_1Mmq is not null && (inputDim % MatMulQ4_1MmqKernel.Q4_1GroupSize) == 0),   // #1613
         _ => false,
     };
 
@@ -8687,6 +8722,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 break;
             case QuantType.Q4_0:
                 RecordQ4_0MmqPreQuantized(cmdBuf, weights, output, outputDim, inputDim, seqLen);
+                break;
+            case QuantType.Q5_1:
+                RecordQ5_1MmqPreQuantized(cmdBuf, weights, output, outputDim, inputDim, seqLen);
                 break;
             default:
                 throw new InvalidOperationException($"No prefill MMQ kernel for {qt}.");
@@ -8890,6 +8928,38 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         return true;
     }
 
+    /// <summary>The Q5_1 prefill on Q8_1 activations (#1613); see <see cref="TryRecordQ4_1Mmq"/>.</summary>
+    private bool TryRecordQ5_1Mmq(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer input, VulkanDevice.Buffer output,
+        int outputDim, int inputDim, int seqLen)
+    {
+        if (!HasMmqPrefillKernel(QuantType.Q5_1, inputDim) || _quantizeQ8_1Rows is null
+            || _state.Q8_1XqRows is not { } xq || _state.Q8_1XdsRows is not { } xds || !_state.Q8_1RowsFit(seqLen, inputDim))
+            return false;
+        BarrierComputeToCompute(cmdBuf);
+        _quantizeQ8_1Rows.Record(cmdBuf, input, xq, xds, n: seqLen, k: inputDim);
+        BarrierComputeToCompute(cmdBuf);
+        RecordQ5_1MmqPreQuantized(cmdBuf, weights, output, outputDim, inputDim, seqLen);
+        return true;
+    }
+
+    /// <summary>The Q5_1 MMQ (#1613) on the already quantised rows scratch.</summary>
+    private void RecordQ5_1MmqPreQuantized(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer output, int outputDim, int inputDim, int seqLen)
+    {
+        var xq = _state.Q8_1XqRows!;
+        var xds = _state.Q8_1XdsRows!;
+        if (_matmulQ5_1MmqCm1 is { } cm1)
+        {
+            cm1.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+            ProfNote("q5_1_mmq_cm1", outputDim, inputDim, seqLen);
+        }
+        else
+        {
+            _matmulQ5_1Mmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+            ProfNote("q5_1_mmq", outputDim, inputDim, seqLen);
+        }
+        Q5_1FastDispatchCount++;
+    }
+
     /// <summary>The Q4_0 MMQ (#1447) on the already quantised rows scratch.</summary>
     private void RecordQ4_0MmqPreQuantized(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer output, int outputDim, int inputDim, int seqLen)
     {
@@ -9081,13 +9151,36 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         }
         else if (weightQt == QuantType.Q5_1)
         {
-            // Q5_1 (#1600): 24-byte word-aligned blocks, value d * q + m; inputDim % 32 == 0 is enforced by VulkanWeights.KeepQ5_1OnDevice.
-            // Decode on the F32-in GEMV, prefill on the tiled F32-in GEMM (no MMVQ / coopmat variant yet).
+            // Q5_1 (#1600 / #1613): 24-byte word-aligned blocks, value d * q + m; inputDim % 32 == 0 is enforced by VulkanWeights.KeepQ5_1OnDevice.
+            // Decode: dp4a MMVQ on the shared Q8_1 row, else the F32-in GEMV. Prefill: int8-coopmat / dp4a MMQ on Q8_1 rows, else the F16
+            // coopmat GEMM, else the tiled F32-in GEMM. Reaching the trailing generic-F32 `else` instead would reinterpret packed blocks as floats.
             Q5_1DenseDispatchCount++;
-            if (seqLen == 1)
+            if (seqLen > 1 && Q5_1FastEnabled && TryRecordQ5_1Mmq(cmdBuf, weights, input, output, outputDim, inputDim, seqLen))
+            {
+                // recorded
+            }
+            else if (seqLen == 1 && Q5_1FastEnabled && _matmulQ5_1Mmvq is not null && _quantizeQ8_1 is not null
+                && _state.Q8_1Xq is not null && _state.Q8_1Xds is not null
+                && (inputDim % QuantizeQ8_1Kernel.GroupSize) == 0
+                && QuantizeQ8_1Kernel.PackedBytes(inputDim) <= _state.Q8_1Xq.Size
+                && QuantizeQ8_1Kernel.ScaleBytes(inputDim) <= _state.Q8_1Xds.Size)
+            {
+                _quantizeQ8_1.Record(cmdBuf, input, _state.Q8_1Xq, _state.Q8_1Xds, inputDim);
+                BarrierComputeToCompute(cmdBuf);
+                _matmulQ5_1Mmvq.Record(cmdBuf, weights, _state.Q8_1Xq, _state.Q8_1Xds, output, m: outputDim, k: inputDim);
+                Q5_1FastDispatchCount++;
+                ProfNote("q5_1_mmvq", outputDim, inputDim, seqLen);
+            }
+            else if (seqLen == 1)
             {
                 _matmulQ5_1Gemv!.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 ProfNote("q5_1_f32gemv", outputDim, inputDim, seqLen);
+            }
+            else if (Q5_1FastEnabled && _matmulQ5_1GemmCoopmat is not null)
+            {
+                _matmulQ5_1GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                Q5_1FastDispatchCount++;
+                ProfNote("q5_1_coopmat", outputDim, inputDim, seqLen);
             }
             else
             {
@@ -10095,6 +10188,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ5_0GemmCoopmat?.Dispose();
         _matmulQ5_1Gemv?.Dispose();
         _matmulQ5_1GemmF32?.Dispose();
+        _matmulQ5_1Mmvq?.Dispose(); _matmulQ5_1MmqCm1?.Dispose(); _matmulQ5_1Mmq?.Dispose(); _matmulQ5_1GemmCoopmat?.Dispose();
         _matmulQ3KGemmCoopmat?.Dispose();
         _matmulIq4XsGemmCoopmat?.Dispose();
         _matmulQ6KMmq?.Dispose();

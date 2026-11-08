@@ -325,7 +325,7 @@ The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with
 | PTQ1_0 | ✓ | ✓ (untiled) | — | PrismML dense base-3 trits, 28 B / 128 (1.75 bpw), scale last; CPU + Vulkan only, CUDA refuses at load (#1280) |
 | Q4_0 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (`MatMulQ4_0GemmCoopmatKernel`, wave64) | #1018 |
 | Q4_1 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (same classes, `quant: Q4_1`, wave64) | #1171 (Recursive Flint's official file) |
-| Q5_1 | ✓ (F32-in GEMV, `matmul_q5_1_f32_gemv`) | ✓ (F32-in tiled GEMM, `matmul_q5_1_f32_gemm`) | — | #1600 (GLM-4.5-Air's shared-expert `down` is Q5_1 on 24 of 46 layers); no MMVQ / coopmat variant yet |
+| Q5_1 | ✓ (+ dp4a MMVQ `matmul_q5_1_mmvq_v2`) | ✓ (int8-coopmat `matmul_q5_1_mmq_cm1` on AMD, dp4a `matmul_q5_1_mmq` elsewhere, F32-in tiled GEMM fallback) | ✓ (`matmul_q5_1_f32_gemm_coopmat_128x128x4`, same classes as Q4_1, wave64) | #1600 F32-in pair, #1613 fast arms (GLM-4.5-Air's shared-expert `down` is Q5_1 on 24 of 46 layers); `DOTLLM_VK_Q5_1_FAST=0` keeps the F32-in pair |
 
 Routed MoE banks of Q4_0 / Q4_1 (and the IQ family) are read in place by `MoeIndexedMatmulIqMmvqKernel` (decode, any row count when
 no grouped kernel exists) and `MoeGroupedMatmulIqCoopmatKernel` (prefill, wave64 coopmat).
@@ -355,8 +355,10 @@ arm in both hybrid hosts (the loader is shared) — but it is a code change, not
 so check the loader for the architecture you are running before assuming a format stays packed.
 
 Q5_1 is also supported as a routed-MoE `down` bank (`moe_indexed_matmul_q5_1_{f32,mmvq}.comp`), and Q5_0 `down` banks are repacked
-bit-exactly to Q5_1 at upload. The dense Q5_1 kernels (#1600) are the plain F32-in pair (decode GEMV, 16x16-tiled prefill GEMM): they exist so a
-Q5_1 projection stays packed, not because they are fast.
+bit-exactly to Q5_1 at upload. The dense Q5_1 kernels are the #1600 F32-in pair (decode GEMV, 16x16-tiled prefill GEMM; the always-present
+correctness arm) plus the #1613 fast arms: dp4a MMVQ at decode on the shared Q8_1 row, int8-coopmat (AMD) or dp4a MMQ at prefill on Q8_1 rows,
+and the 128x128x4 F16 coopmat GEMM where cooperative matrices exist but no MMQ does. The Q8_1-activation arms are not bit-identical to the
+F32-in pair (activation rounding, the Q4_1 / Q4_0 contract of #1235 / #1447).
 
 Ordering rationale, for why the family filled in as it did: K-quant Q4/5/6 came first because they
 cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most
