@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- References Broken (which fails to load): Broken's failure names Broken, and this project must still be scanned. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Broken\Broken.csproj" />
+  </ItemGroup>
+</Project>

@@ -28,6 +28,8 @@
     <ProjectReference Include="..\..\src\DotLLM.Cli\DotLLM.Cli.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse\DotLLM.ChunkReuse.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.CSharp\DotLLM.ChunkReuse.CSharp.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.Solution\DotLLM.ChunkReuse.Solution.csproj" />
+    <ProjectReference Include="..\..\tools\DotLLM.ChunkCache\DotLLM.ChunkCache.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -55,6 +57,11 @@
     <None Include="Tokenizers\ChatTemplates\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- chunk_cache wire-contract fixtures: byte-exact copies of ChunkedkvCache docs/contracts/chunk-cache-v1 (ContractFixtureTests). -->
     <None Include="ChunkCache\Fixtures\v1\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- SolutionScannerTests: a small solution read with MSBuildWorkspace from a temp copy. Its sources are data, never compiled
+         into this project (Compile Remove); its own Directory.Build.props/Directory.Packages.props stop the repo's from applying. -->
+    <Compile Remove="ChunkReuse\Fixtures\MiniSolution\**" />
+    <None Remove="ChunkReuse\Fixtures\MiniSolution\**" />
+    <None Include="ChunkReuse\Fixtures\MiniSolution\**\*" Exclude="ChunkReuse\Fixtures\MiniSolution\**\bin\**;ChunkReuse\Fixtures\MiniSolution\**\obj\**" CopyToOutputDirectory="PreserveNewest" />
     <!-- #815: header-only dump (metadata + tensor tables) of the real Qwen3.8-Flash-Next GGUFs; the contract test reads it at runtime. -->
     <None Include="Models\Gguf\TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- #832: LittleBit spike fixture (generated offline from the paper equations). -->
