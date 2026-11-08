@@ -7388,8 +7388,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _mmvqGroupScratch[0] = new(moeW.SharedW1![0], moeW.SharedW1DeviceQuantType, _state.MoeSharedGate!, sharedI);
         _mmvqGroupScratch[1] = new(moeW.SharedW3![0], moeW.SharedW3DeviceQuantType, _state.MoeSharedUp!, sharedI);
         var sharedGateUp = _mmvqGroupScratch.AsSpan(0, 2);
-        if (!CanShareMmvqQuant(hidden, 1, sharedGateUp)
-            || QuantizeQ8_1Kernel.PackedBytes(sharedI) > _state.Q8_1Xq!.Size || QuantizeQ8_1Kernel.ScaleBytes(sharedI) > _state.Q8_1Xds!.Size)
+        if (QuantizeQ8_1Kernel.PackedBytes(sharedI) > _state.Q8_1Xq!.Size || QuantizeQ8_1Kernel.ScaleBytes(sharedI) > _state.Q8_1Xds!.Size)
+            return false;
+        // Shared gate / up: read the shared Q8_1 quantisation when both have an MMVQ decode kernel; otherwise (arm c: K-quant shared experts on
+        // AMD, where the dense K-quant MMVQ is off by policy, #574/#576, so REAP's Q5_K shared gate/up take the coalesced F32-in GEMV) record them
+        // through RecordMatmul on the F32 normalised row. A mix (one MMVQ, one not) would make RecordMatmul re-quantise into the shared scratch
+        // under the group's reads (#949), so it is refused.
+        bool sharedGateUpShared = CanShareMmvqQuant(hidden, 1, sharedGateUp);
+        if (!sharedGateUpShared && (HasMmvqDecodeKernel(moeW.SharedW1DeviceQuantType, hidden) || HasMmvqDecodeKernel(moeW.SharedW3DeviceQuantType, hidden)))
             return false;
         // Shared down: the MMVQ GEMV over the fused activation's Q8_1 output when the type has one, else RecordMatmul over its F32 output (arm b).
         bool sharedDownMmvq = HasMmvqDecodeKernel(moeW.SharedW2DeviceQuantType, sharedI);
@@ -7402,7 +7408,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
 
         // 2. Router logits; shared gate / up; (arm a) the row broadcast to its topK slots.
         RecordMatmul(cmdBuf, moeW.Gate, moeW.GateDeviceQuantType, _state.NormOutput, _state.MoeRouterLogits!, outputDim: numE, inputDim: hidden, seqLen: 1);
-        RecordMmvqGroupGemvs(cmdBuf, hidden, sharedGateUp);
+        if (sharedGateUpShared)
+            RecordMmvqGroupGemvs(cmdBuf, hidden, sharedGateUp);
+        else
+        {
+            RecordMatmul(cmdBuf, moeW.SharedW1![0], moeW.SharedW1DeviceQuantType, _state.NormOutput, _state.MoeSharedGate!, outputDim: sharedI, inputDim: hidden, seqLen: 1);
+            RecordMatmul(cmdBuf, moeW.SharedW3![0], moeW.SharedW3DeviceQuantType, _state.NormOutput, _state.MoeSharedUp!, outputDim: sharedI, inputDim: hidden, seqLen: 1);
+        }
         if (!xDiv)
             _moeBroadcast!.Record(cmdBuf, _state.NormOutput, _state.MoeExpandedInput!, seqLen: 1, topK: topK, hidden: hidden);
         BarrierComputeToCompute(cmdBuf);
