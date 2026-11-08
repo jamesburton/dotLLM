@@ -551,7 +551,8 @@ public sealed partial class ChunkCacheCliTests
         {
             var r = CliRaw(["evict", "--offline", "--store", store, .. old, "--model", _fx.ModelA, "--json"]);
             Assert.Equal(2, r.Code);
-            Assert.Contains("--mode all", r.Err, StringComparison.Ordinal); // the message names the new spelling
+            Assert.Contains("is now", r.Err, StringComparison.Ordinal); // the message says it was renamed...
+            Assert.Contains("--mode all", r.Err, StringComparison.Ordinal); // ...and names the new spelling
             Assert.Equal("usage", JsonDocument.Parse(r.Out).RootElement.GetProperty("error").GetProperty("code").GetString());
         }
         var unknown = CliRaw(["evict", "--offline", "--store", store, "--mode", "frobnicate"]);
@@ -577,6 +578,13 @@ public sealed partial class ChunkCacheCliTests
         Assert.Equal("symbol-512", r.GetProperty("chunker").GetString());
         Assert.True(r.GetProperty("chunks").GetInt32() >= 1);
         Assert.Equal(0, r.GetProperty("wire_ineligible_chunks").GetInt32()); // the chunk ids and the wire encode agree
+
+        // And the chunk with the spelled-out tag is SENT: a per-chunk eligibility with a bare EncodeRaw would drop it silently.
+        var fake = PrewarmingServer(model, model.ModelId);
+        JsonElement queued = Json(CliRaw(["build", "--model", _fx.ModelSpecials, "--store", NewDir("store"), "--directory", tree, "--server", FakeUrl, "--json"], http: fake));
+        string[] texts = fake.Requests.Where(q => q.Method == "POST").SelectMany(q => JsonNode.Parse(q.Body)!["texts"]!.AsArray()).Select(t => t!["text"]!.GetValue<string>()).ToArray();
+        Assert.Contains(texts, t => t.Contains("<think>", StringComparison.Ordinal));
+        Assert.Equal(0, queued.GetProperty("prewarm").GetProperty("skipped_ineligible").GetInt32());
     }
 
     [Fact]
