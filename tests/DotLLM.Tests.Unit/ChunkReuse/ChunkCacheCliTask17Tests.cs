@@ -500,6 +500,76 @@ public sealed partial class ChunkCacheCliTests
         Assert.DoesNotContain("X-Evil", bad.Out + bad.Err, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The API key is sent to the server the operator named, and to nobody else: a redirect (a compromised or misconfigured server, a
+    /// captive portal) must not carry <c>X-API-Key</c> to another origin. Real sockets (the default handler follows redirects and
+    /// keeps custom headers), real wire bytes: the second listener records what it receives.
+    /// </summary>
+    [Fact]
+    public void ApiKey_IsNotForwardedByARedirect_ToAnotherServer()
+    {
+        const string key = "ck-secret-redirect-0123456789abcdefABCDEF";
+        using var target = new Listener(_ => (200, "{}"));
+        using var origin = new Listener(_ => (302, null, target.Url + "v1/chunk-cache"));
+        string texts = Path.Combine(NewDir("in"), "t.json");
+        File.WriteAllText(texts, """[{"id": "a", "text": "class A { }"}]""");
+
+        var r = CliRaw(["prewarm", "--server", origin.Url, "--texts", texts, "--json"], env: n => n == ApiKeyVar ? key : null);
+
+        Assert.True(origin.Seen.Count >= 1, "control: the origin was reached");
+        Assert.All(origin.Seen, h => Assert.Equal(key, h)); // control: the origin received the key
+        Assert.DoesNotContain(target.Seen, h => h is not null); // the redirect target never saw the key
+        Assert.DoesNotContain(key, r.Out + r.Err, StringComparison.Ordinal);
+    }
+
+    /// <summary>A loopback HTTP server that answers every request and records the <c>X-API-Key</c> header it received (null: none).</summary>
+    private sealed class Listener : IDisposable
+    {
+        private readonly HttpListener _l = new();
+        private readonly Task _loop;
+        public List<string?> Seen { get; } = [];
+        public string Url { get; }
+
+        public Listener(Func<HttpListenerRequest, (int Status, string? Body)> answer)
+            : this(r => { var a = answer(r); return (a.Status, a.Body, null); }) { }
+
+        public Listener(Func<HttpListenerRequest, (int Status, string? Body, string? Location)> answer)
+        {
+            int port;
+            using (var probe = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0))
+            {
+                probe.Start();
+                port = ((IPEndPoint)probe.LocalEndpoint).Port;
+            }
+            Url = $"http://127.0.0.1:{port}/";
+            _l.Prefixes.Add(Url);
+            _l.Start();
+            _loop = Task.Run(async () =>
+            {
+                while (_l.IsListening)
+                {
+                    HttpListenerContext c;
+                    try { c = await _l.GetContextAsync().ConfigureAwait(false); }
+                    catch (Exception ex) when (ex is HttpListenerException or ObjectDisposedException or InvalidOperationException) { return; }
+                    lock (Seen) Seen.Add(c.Request.Headers["X-API-Key"]);
+                    var (status, body, location) = answer(c.Request);
+                    c.Response.StatusCode = status;
+                    if (location is not null) c.Response.RedirectLocation = location;
+                    byte[] bytes = Encoding.UTF8.GetBytes(body ?? "");
+                    c.Response.ContentType = "application/json";
+                    c.Response.OutputStream.Write(bytes);
+                    c.Response.Close();
+                }
+            });
+        }
+
+        public void Dispose()
+        {
+            _l.Close();
+            try { _loop.Wait(TimeSpan.FromSeconds(2)); } catch (AggregateException) { }
+        }
+    }
+
     [Fact]
     public void ServerBacked_IndexNamedByServerModelAndProducer()
     {

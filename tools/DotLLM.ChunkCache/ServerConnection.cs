@@ -61,7 +61,11 @@ internal sealed class ServerConnection : IDisposable
         if (b.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)) b = b[..^3];
         if (key is not null && uri.Scheme == "http" && !uri.IsLoopback)
             ctx.Info($"warning: {ApiKeyVariable} is sent over plain http to {uri.Host}; use https unless the network is trusted.");
-        HttpClient http = ctx.HttpHandler is { } h ? new HttpClient(h, disposeHandler: false) : new HttpClient();
+        // No redirects: the default handler follows them and keeps custom headers, so a redirect would carry X-API-Key to another
+        // origin. A chunk-cache server does not redirect; a 3xx is reported as the failure it is.
+        HttpClient http = ctx.HttpHandler is { } h
+            ? new HttpClient(h, disposeHandler: false)
+            : new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }, disposeHandler: true);
         http.Timeout = TimeSpan.FromMinutes(10);
         var client = new ChunkCacheHttpClient(http, new Uri(b + "/"), key);
         return new ServerConnection(http, client, b, b + "/v1/chunk-cache", key);
