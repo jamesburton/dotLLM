@@ -30,7 +30,7 @@ namespace DotLLM.Models.Architectures;
 /// MoE routing — and the corresponding per-model quant dispatch gaining a <c>PQ2_0</c> arm
 /// (Bonsai's ternary quant type; see <c>MatMul.PQ2S.cs</c>).
 /// </summary>
-public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
+public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, DotLLM.Core.Diagnostics.IResidualModifierHost
 {
     private readonly GgufFile? _gguf; // kept alive; null when built from prebuilt weights
     private readonly Qwen3HybridDenseLayerWeights[] _layers;
@@ -62,6 +62,19 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
     internal RoPERotation RopeForTest => _rope;
 
     private readonly Qwen3HybridDenseForwardState _state;
+
+    /// <summary>
+    /// Optional in-place modifier of the residual stream after each layer (<c>HookPoint.PostLayer</c>), e.g. a ternary residual
+    /// adapter (#1711). Null costs one branch per layer. Applied after every layer, GDN and full-attention alike, in every forward
+    /// (decode, prefill, chunked prefill, batch, verify). Single-threaded per model instance.
+    /// </summary>
+    public DotLLM.Core.Diagnostics.IResidualModifier? ResidualModifier { get; set; }
+
+    private unsafe void ApplyResidualModifier(DotLLM.Core.Diagnostics.IResidualModifier modifier, int layer, float* hidden, int seqLen)
+    {
+        if (modifier.AppliesTo(layer))
+            modifier.ModifyResidual(new Span<float>(hidden, seqLen * Config.HiddenSize), layer, seqLen);
+    }
 
     // PrismML Hadamard fold (prism.hadamard.*) — null for every checkpoint outside the Bonsai 2
     // family, and every rotation site below is a no-op when it is null.
@@ -504,6 +517,11 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         initialHidden.CopyTo(new Span<float>(hidden, seqLen * hiddenSize));
 
         var kinds = _layout.LayerKind;
+        // The tail's layer indices are LOCAL (the config is a re-sliced view), so a global-index modifier cannot be applied here.
+        if (ResidualModifier is not null)
+            throw new NotSupportedException(
+                "A residual modifier (ternary adapter) is not supported on the CPU tail of a GPU/CPU partial-offload split: " +
+                "its layer indices are slice-local. Run the whole model on one device.");
         for (int layer = 0; layer < _layers.Length; layer++)
         {
             var lw = _layers[layer];
@@ -1081,6 +1099,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
             TensorDump.Dump2D("token_embd", hidden, seqLen, hiddenSize);
 
         var kinds = _layout.LayerKind;
+        var residualModifier = ResidualModifier;
         // DFlash (#1175): the drafter conditions on these layers' inputs; only the rows its context ring can hold are kept.
         DFlash.DFlashMtpState? dflashTaps = _dflash is not null ? mtpState as DFlash.DFlashMtpState : null;
         int tapFirst = dflashTaps is null ? 0 : Math.Max(0, seqLen - dflashTaps.RingCapacity);
@@ -1145,6 +1164,9 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
                     new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                     new Span<float>(hidden + t * hiddenSize, hiddenSize));
             }
+            // PostLayer residual modifier (#1711): same convention as TransformerModel (after layer L's output, GDN and attention layers alike).
+            if (residualModifier is not null)
+                ApplyResidualModifier(residualModifier, layer, hidden, seqLen);
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.l_out", hidden, seqLen, hiddenSize);
         }

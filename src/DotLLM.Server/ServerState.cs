@@ -222,6 +222,9 @@ public sealed class ServerState : IDisposable
     /// <summary>Currently loaded model.</summary>
     public IModel? Model { get; set; }
 
+    /// <summary>Owner of the ternary residual adapters attached to <see cref="Model"/> (#1711), or null.</summary>
+    public IDisposable? TernaryAdapters { get; set; }
+
     /// <summary>Tokenizer for the loaded model.</summary>
     public ITokenizer? Tokenizer { get; set; }
 
@@ -1298,6 +1301,8 @@ public sealed class ServerState : IDisposable
         CudaPagedFactory?.Dispose();
         DraftModel?.Dispose();
         DraftGguf?.Dispose();
+        TernaryAdapters?.Dispose();   // detach + free adapter buffers BEFORE the model (a Vulkan modifier's buffers live on the model's device)
+        TernaryAdapters = null;
         Model?.Dispose();
         CurrentGguf?.Dispose();
 
