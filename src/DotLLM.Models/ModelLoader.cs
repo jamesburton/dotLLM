@@ -161,6 +161,18 @@ public static class ModelLoader
     /// </exception>
     public static (IModel Model, ISafetensorsTensorSource Safetensors, ModelConfig Config) LoadFromSafetensors(
         string safetensorsPath, ThreadingConfig? threading = null)
+        => LoadFromSafetensorsWithOverlay(safetensorsPath, threading, overlay: null);
+
+    /// <summary>
+    /// As <c>LoadFromSafetensors</c>, applying <paramref name="overlay"/> (<c>--tensor-overlay</c>, #1706) to the FFN
+    /// projections. The caller must call <see cref="TensorOverlay.VerifyAllApplied"/> afterwards and keep the overlay alive as long as the model.
+    /// </summary>
+    /// <param name="safetensorsPath">As the overload without an overlay.</param>
+    /// <param name="threading">Threading configuration.</param>
+    /// <param name="overlay">Overlay to apply (null = none).</param>
+    /// <returns>The loaded model, safetensors source, and model configuration.</returns>
+    public static (IModel Model, ISafetensorsTensorSource Safetensors, ModelConfig Config) LoadFromSafetensorsWithOverlay(
+        string safetensorsPath, ThreadingConfig? threading, TensorOverlay? overlay)
     {
         ArgumentNullException.ThrowIfNull(safetensorsPath);
 
@@ -195,7 +207,7 @@ public static class ModelLoader
                     // which consumes this IModel + ModelConfig.DiffusionConfig (populated
                     // by DiffusionGemmaConfigExtractor). The model exposes the hybrid-mask
                     // canvas Forward (PR-3) the generator drives, so no wrapper is needed.
-                    => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded, i2sCache),
+                    => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded, i2sCache, overlay),
                 Architecture.Mamba3
                     => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 Architecture.Ricursive => throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("CPU (safetensors)")),

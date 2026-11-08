@@ -226,12 +226,12 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// </summary>
     internal static TransformerModel LoadFromSafetensors(
         ISafetensorsTensorSource file, ModelConfig config, ThreadingConfig threading,
-        BitNetI2SCacheContext? i2sCache)
+        BitNetI2SCacheContext? i2sCache, TensorOverlay? overlay = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
 
-        var weights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache, allowFactorized: true);
+        var weights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache, allowFactorized: true, overlay: overlay);
         return BuildFromPrebuiltWeightsInternal(weights, config, threading, anchorSource: file);
     }
 

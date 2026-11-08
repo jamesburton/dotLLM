@@ -48,6 +48,13 @@ internal static class TensorOverlayCli
         catch (NotSupportedException ex) { return ex.Message; }
     }
 
+    /// <summary>Overload for an overlay held directly (safetensors base).</summary>
+    public static string? TryVerifyApplied(TensorOverlay overlay)
+    {
+        try { overlay.VerifyAllApplied(); return null; }
+        catch (NotSupportedException ex) { return ex.Message; }
+    }
+
     /// <summary>One-line summary for the console.</summary>
     public static string Summary(GgufFile gguf, bool skippedHash)
         => $"tensor overlay: {gguf.Overlay!.Count} tensor(s) from {gguf.Overlay.Path}" + (skippedHash ? " (base hash NOT verified)" : "");

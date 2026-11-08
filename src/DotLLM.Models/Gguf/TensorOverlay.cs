@@ -234,7 +234,7 @@ public sealed partial class TensorOverlay : IDisposable
                 if (moe is null)
                     throw new InvalidDataException($"{what} names an expert, but layer {layer} of the base model is a dense FFN layer.");
                 if (!moe.UseQuantExperts)
-                    throw new NotSupportedException($"{what}: layer {layer}'s experts are not in the quantized-expert layout this overlay path supports (stacked ffn_*_exps banks).");
+                    AdoptF32ExpertBanks(moe, config, what, layer);
                 if (expert >= moe.NumExperts)
                     throw new InvalidDataException($"{what} names expert {expert}, but the layer has {moe.NumExperts} experts.");
                 int expIn = proj == 2 ? moe.IntermediateSize : moe.HiddenSize;
@@ -256,6 +256,32 @@ public sealed partial class TensorOverlay : IDisposable
             }
             _applied.Add(t.Name);
         }
+    }
+
+    /// <summary>
+    /// A safetensors-loaded MoE layer (HF checkpoints: per-expert F32 matrices <c>W1</c> = gate, <c>W3</c> = up, <c>W2</c> = down) joins the same code path as
+    /// the GGUF stacked banks: every expert gets an F32 entry in the side table (pointing at its existing matrix, no copy) and the layer runs
+    /// <c>MoeQuantSwiGluMlp</c> with plain-SwiGLU / Mixtral gating, exactly what <c>MoeSwiGluMlp</c> computes for it. Overlay entries then replace individual
+    /// (expert, projection) cells.
+    /// </summary>
+    private static void AdoptF32ExpertBanks(MoeLayerWeights moe, ModelConfig config, string what, int layer)
+    {
+        if (moe.W1.Length != moe.NumExperts || moe.W1[0] == 0 || moe.W2.Length != moe.NumExperts || moe.W3.Length != moe.NumExperts)
+            throw new NotSupportedException($"{what}: layer {layer}'s experts are not in a layout the overlay path supports (stacked ffn_*_exps banks or per-expert F32 matrices).");
+        if (moe.HasSharedExpert || moe.SigmoidGating || moe.WeightsScale != 1.0f || moe.SelectionBias is not null || moe.GateBias is not null
+            || config.ActivationFunction != ActivationFunction.SiLU)
+            throw new NotSupportedException($"{what}: layer {layer} has shared experts, sigmoid/biased routing or a non-SiLU activation, which the overlay path does not support yet.");
+        var table = moe.ExpertOverlay ?? new ExpertOverlayTable(moe.NumExperts);
+        for (int e = 0; e < moe.NumExperts; e++)
+        {
+            table.Set(0, e, moe.W1[e], QuantizationType.F32);
+            table.Set(1, e, moe.W3[e], QuantizationType.F32);
+            table.Set(2, e, moe.W2[e], QuantizationType.F32);
+        }
+        moe.ExpertOverlay = table;
+        moe.UseQuantExperts = true;
+        moe.SoftmaxAfterTopK = false;
+        moe.UseSwiGluOai = false;
     }
 
     private static void CheckShape(string what, int gotIn, int gotOut, int expIn, int expOut)
