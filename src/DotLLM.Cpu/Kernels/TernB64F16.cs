@@ -309,7 +309,7 @@ public static unsafe class TernB64F16
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int Dot32(sbyte* a, sbyte* b)
     {
-        if (Avx2.IsSupported)
+        if (CpuFeatures.Avx2)
         {
             var a0 = Avx2.ConvertToVector256Int16(a);
             var a1 = Avx2.ConvertToVector256Int16(a + 16);

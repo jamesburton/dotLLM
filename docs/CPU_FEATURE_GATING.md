@@ -100,6 +100,7 @@ The AVX-512 paths were checked for the "F checked, BW/VL used" inconsistency: th
 | K-quant fast tiled (Q4_K/Q5_K/Q6_K) | `MatMulQ4KFast.cs:34,141`, `MatMulQ5KFast.cs:76`, `MatMulQ6KFast.cs:118` | `Avx2`+`Sse41` | reference kernels | A |
 | NVFP4 / MXFP4 | `MatMulNvfp4.cs:195`, `.Rows8.cs:75,89`, `MatMulMxfp4.cs:202,207` | `Avx2Fma`, `Ssse3` | scalar | A |
 | I2_S / PQ2_0 / PTQ1 / W2A8 | `MatMul.I2S.cs:164,197,765`, `MatMul.PQ2S.cs:105,512,564`, `MatMul.W2A8Sse.cs` via those | `Avx2`, `AvxVnni`, `Ssse3`, `Vector128Accelerated` | scalar | A |
+| TERN_B64_F16 int8-activation dot (overlay ternary, #1706) | `Kernels/TernB64F16.cs` `Dot32` (called from `DotRow`) | `Avx2` (`Vector256` widen + `MultiplyAddAdjacent`) | scalar int loop in `Dot32` | A |
 | PQ2_0 planar (default-on since #1638, n <= `PQ2_0PlanarMaxN`) | `MatMul.PQ2Planar.cs:22,100` | `Avx2`, `AvxVnni`, `Fma` | `PQ2PlanarRowsScalar` | A (C fixed upstream) |
 | F16 GEMM/GEMV | `MatMul.F16Tile.cs:32`, `MatMul.F16Sse.cs:102` | `Fma`; `Sse3` without AVX2 | scalar | A |
 | BF16 GEMM/GEMV (`MatMul.Bf16.cs`, #1118) | `Bf16Rows`, `GemmBf16Rows` | `Bf16Avx512Tier` (`Avx512F`, opt-in `DOTLLM_CPU_BF16_512=1`) > `Bf16FmaTier` (`Avx2Fma`) > `Bf16V128Tier` (`Vector128Accelerated`) | `DotBf16Scalar`; `DOTLLM_CPU_BF16_KERNEL=0` = dequant-rows | A |
