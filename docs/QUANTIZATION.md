@@ -178,6 +178,47 @@ fast paths never noticed the distinction). dotLLM's ragged-K support (CPU: `MatM
 in `native/kernels/`) is a scalar, correctness-first fallback reached only when `k % 128 != 0` — the
 aligned SIMD/uint4 fast paths are untouched.
 
+### TERN_B64_F16 (ternary, 2.25 bits/weight, dotLLM-private type 243, issue #1706)
+
+Per-64-column FP16-scaled ternary weights, used by tensor overlays (below). Not a ggml type: the id 243 exists only in dotLLM overlay GGUFs.
+It is **not** `PQ2_0` (128-weight groups, scale first, codes 0->-1) and **not** upstream `Q2_0` (same 18 B/64 geometry, but codes 0..3 = -1,0,+1,+2).
+
+```
+tensor  : row-major [out, in] (GGUF dims [in, out]); in % 64 == 0
+block   : 64 consecutive input columns of ONE row, 18 bytes
+          [0..1]  fp16 scale, little-endian IEEE
+          [2..17] 16 bytes of 2-bit trits; byte k holds columns 4k..4k+3, column 4k+i in bits 2i..2i+1 (LSB first)
+trit    : 00 = 0, 01 = +1, 10 = -1, 11 = INVALID (rejected at load)
+weight  : w[row, 64*b + j] = trit * scale[row, b]        (a zero block has scale 0)
+order   : blocks ascending within a row, rows ascending
+```
+
+CPU kernels (`DotLLM.Cpu.Kernels.TernB64F16`): the weights are read packed, never expanded into a stored copy (one row is unpacked to int8 in a per-thread
+scratch). `GemmQ8`/`GemvQ8` is the production kernel (activations through the house Q8_0 quantizer, `int32` dot per 32 activations, folded with the 64-column
+scale); `GemmF32Act` is the scalar F32-activation reference (the KL oracle; `DOTLLM_TERN_F32ACT=1` runs a whole model on it). Against the OracleWrittenTernary
+real-tensor vectors the F32 kernel agrees to ~1e-6 of rms(y) and the int8 kernel to 0.5% rms / ~3% max of rms(y). `Dequantize` exists as a test oracle
+only. Vulkan reuses the same layout and overlay contract (S3 of #1706).
+
+## Tensor overlays (`--tensor-overlay`, issue #1706)
+
+An overlay is a small GGUF that replaces **only the named FFN projections** of a base model, so any subset of `(layer, expert, projection)` can run in another
+format (typically `TERN_B64_F16`) while everything else keeps its original precision. Available on `run`, `perplexity` and `serve`
+(`--tensor-overlay overlay.gguf`, plus `--overlay-skip-base-hash`); CPU backend, plain transformer / stacked-expert MoE GGUF models (OLMoE, Mixtral-style,
+dense Llama family) in this release.
+
+| rule | detail |
+|---|---|
+| names | `blk.{L}.ffn_{gate,up,down}.{E}.weight` (routed expert E), `blk.{L}.ffn_{gate,up,down}.weight` (dense FFN). Anything else is an error. |
+| shapes | GGUF dims `[in, out]`, equal to the base projection (gate/up `[hidden, ffn]`, down `[ffn, hidden]`). Mismatch is an error. |
+| dtype | per-tensor GGUF type. `TERN_B64_F16` is validated at open (in % 64 == 0, no `0b11` code); other types (F16, F32, Q8_0...) are accepted wherever the CPU GEMV supports them. |
+| base binding | metadata `dotllm.overlay.base_sha256` = lowercase hex SHA-256 of the base file (first shard of a split set). Missing or mismatched is an error. The digest is cached per (path, length, mtime) in `~/.dotllm/hash-cache` (`DOTLLM_HASH_CACHE_DIR`); `--overlay-skip-base-hash` disables the check (a 4 GB base hashes in seconds, a 50 GB one in minutes on first use). |
+| never ignored | unknown name, wrong layer/expert, dense name on a MoE layer (or vice versa), a loader that did not consume the overlay (GPU backends, other architectures) are all hard errors (`TensorOverlay.VerifyAllApplied`). |
+
+How it is applied (the contract Vulkan reuses): `TensorOverlay.Open/Attach` validates and attaches to the base `GgufFile`; the CPU `TransformerModel` loader then
+swaps a dense projection's pointer/format, or fills a per-layer `ExpertOverlayTable` (per-expert, per-projection address + format) beside the untouched stacked
+`ffn_*_exps` banks. `MoeQuantSwiGluMlp` consults the table per selected expert and per projection (token routing, top-k and `norm_topk_prob` are unchanged);
+with no overlay the table is null and the code path is the pre-existing one. Overlay tensors are read in place from the overlay's mmap, never copied.
+
 ### NanoQuant (community GGUF, sub-1-bit factorised; issue #866)
 
 Not a block quant: a linear is a **composite** of tensors, `W ~ diag(post) U diag(mid) V diag(pre)` with U, V in {+-1}.
