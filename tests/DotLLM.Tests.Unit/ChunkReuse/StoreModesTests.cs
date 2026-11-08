@@ -48,7 +48,7 @@ public sealed class StoreModesTests : IDisposable
 
     [SkippableFact]
     [UnsupportedOSPlatform("windows")]
-    public void ExistingGroupReadableRoot_LedgerAndRegistryFilesAreOwnerOnly()
+    public void ExistingGroupReadableRoot_IndexLedgerAndRegistryFilesAreOwnerOnly()
     {
         Skip.If(OperatingSystem.IsWindows(), "POSIX modes");
         string root = Path.Combine(_scratch, "store");
@@ -58,6 +58,7 @@ public sealed class StoreModesTests : IDisposable
 
         ServerLedger.Load(root).Save(held);
         StoreRegistry.Load(root).Save(held);
+        new ChunkIndex(ids => ChunkKey.Create("fp-a", "tok", Rope, "cpu", KvDtype.F32, ids)).Save(Path.Combine(root, "index-fixed-10.json"));
 
         string[] saved = Directory.EnumerateFiles(root).Where(f => !f.EndsWith(".lock", StringComparison.Ordinal)).ToArray();
         Assert.NotEmpty(saved);
