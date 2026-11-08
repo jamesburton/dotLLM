@@ -39,7 +39,9 @@ public sealed class GraniteVulkanReferenceTests
     /// noise through three projections per layer, amplified by <c>LogitScale</c> at the end. The sibling MMVQ gate
     /// (<see cref="VulkanTransformerModelGenericMoeMmvqDecodeTests"/>) bounds the same arm at 5% of the logit max-abs + 0.02; the Granite fixture's
     /// scalars (<c>LogitScale</c>=5, <c>EmbeddingScale</c>=3) make the rows larger, so the same relative form is used. Measured on gfx1151 (#1674):
-    /// 3.6e-2 absolute on a row of max-abs ~1 (the deliberately wrong kernels of the #1674 mutant run land at 0.4 .. 2+, see the PR).
+    /// MMVQ vs F32 arm 3.0e-2 on a row of max-abs 1.56 (bound 9.8e-2); the deliberately wrong MMVQ arms of the #1674 mutant run landed at 1.46 .. 1.90
+    /// (dropped activation block, wrong expert bank, swapped SwiGLU operands), i.e. 15x the bound, while the old exact-reference bound (0.03) failed
+    /// the CORRECT arm at 3.6e-2.
     /// </summary>
     private const double MmvqRelativeTolerance = 0.05, MmvqAbsoluteTolerance = 0.02;
 
