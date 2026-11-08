@@ -55,8 +55,8 @@ internal sealed class ModelHandle : IDisposable
     /// <summary>The model's tokenizer.</summary>
     public ITokenizer Tokenizer { get; }
 
-    /// <summary>Content-based model id.</summary>
-    public string ModelId { get; }
+    /// <summary>Content-based model id (a server-backed run adopts the server's, see <see cref="AdoptServerIdentity"/>).</summary>
+    public string ModelId { get; private set; }
 
     /// <summary>Content-based tokenizer id.</summary>
     public string TokenizerId { get; }
@@ -113,6 +113,22 @@ internal sealed class ModelHandle : IDisposable
             gguf.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// A server-backed run reads and writes the index of the server's own identity: the file name carries the server's
+    /// <c>model.id</c> and the first 8 digits of its <c>model.producer</c>. The producer must be the one this GGUF computes (same
+    /// weights, tokenizer, RoPE, backend and dtype): the index's chunk keys come from this handle, so an index under another
+    /// producer's name would name keys the server never stores.
+    /// </summary>
+    public void AdoptServerIdentity(ServerIdentity server, string serverUrl)
+    {
+        if (string.IsNullOrEmpty(server.Producer) || string.IsNullOrEmpty(server.ModelId))
+            throw new InvalidOperationException($"{serverUrl} reported no model identity (model.id / model.producer); is its model supported for chunk reuse?");
+        if (!string.Equals(server.Producer, Producer, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"The server's chunk-key producer ({Short(server.Producer)}) is not this model file's ({Short(Producer)}): "
+                + "another GGUF, quantisation, tokenizer, backend or K/V dtype. Use the GGUF the server serves (the keys of an index built here would never hit).");
+        ModelId = server.ModelId;
     }
 
     /// <summary>A new exact host-F32 cache for <paramref name="capacity"/> positions.</summary>

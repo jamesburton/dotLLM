@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using DotLLM.ChunkCache.Client;
 using DotLLM.ChunkReuse.CodeCorpus;
 using DotLLM.ChunkReuse.Graph;
 using DotLLM.ChunkReuse.Store;
@@ -61,6 +62,16 @@ internal sealed record BuildResult
     public double ScanMs { get; init; }
     public double IndexMs { get; init; }
     public IReadOnlyList<PlannedChunk>? WouldEncode { get; init; }
+
+    /// <summary>How missing chunks were handled: <c>prewarm</c> (queued on the server), <c>local</c> (<c>--offline</c>: encoded here),
+    /// <c>index_only</c> or <c>dry_run</c> (nothing encoded).</summary>
+    public string? Mode { get; init; }
+
+    /// <summary>The server of a server-backed run (no user info).</summary>
+    public string? Server { get; init; }
+
+    /// <summary>The server's answers to the prewarm requests, summed.</summary>
+    public PrewarmJson? Prewarm { get; init; }
 }
 
 /// <summary>
@@ -88,13 +99,31 @@ internal static class BuildCommand
             ["reroot"] = OptionKind.Flag,
             ["lock-timeout"] = OptionKind.Single,
             ["show"] = OptionKind.Single,
+            ["server"] = OptionKind.Single,
+            ["offline"] = OptionKind.Flag,
+            ["lab"] = OptionKind.Flag,
+            ["encode"] = OptionKind.Flag,
+            ["index-only"] = OptionKind.Flag,
+            ["max-encode-tokens"] = OptionKind.Single,
         });
 
     public const string Help = """
-        chunkcache build --model M.gguf --store DIR (--solution X.sln|.slnx|.csproj | --directory D) [options]
+        chunkcache build --model M.gguf --store DIR (--solution X.sln|.slnx|.csproj | --directory D) (--server URL | --offline | --index-only) [options]
 
-          Scans the source, chunks it, updates the store's index for this model and chunker, and encodes (CPU) every indexed
-          chunk the store lacks. A rerun re-chunks only changed files and encodes only what is missing.
+          Scans the source (files on the secrets deny-list are never read past the scan: .env*, *.pem, *.key, *.pfx, id_*,
+          secrets.json, appsettings.*.Development.json, .git/**), chunks it with a wire-eligible chunker, updates the store's
+          index and encodes every indexed chunk the store lacks. A rerun re-chunks only changed files and encodes only what is
+          missing. The tokenizer and the chunk keys come from --model (the GGUF the server serves).
+
+          --server URL                the server owns the model identity and every K/V write: the index is named by its model.id and
+                                      model.producer, and the chunks are queued through POST /v1/chunk-cache/prewarm (text only;
+                                      the CLI never writes entries or the ledger). The API key is read from CHUNKCACHE_API_KEY only.
+          --offline                   no server: encode on this CPU into --store, holding the store's owner lock for the WHOLE run
+                                      (refused, exit 1, while a server or another offline writer owns the store)
+          --index-only                update the index only (--encode is the default and is accepted for clarity)
+          --max-encode-tokens N       queue/encode at most N tokens of missing chunks (--max-chunks counts chunks)
+          --lab                       allow a chunker that is not wire-eligible (only symbol-512 is); every chunk then counts as
+                                      wire-ineligible
 
           --chunker symbol|fixed      chunker (default symbol)       --chunk-tokens N   max tokens per chunk (default 512)
           --configuration C           MSBuild configuration for --solution (default Release)
@@ -112,6 +141,15 @@ internal static class BuildCommand
           --json                      result as JSON on stdout (chunkcache_build schema plus extras)
         """;
 
+    /// <summary>Test hook, per async flow: runs once the offline writer holds the store owner lock, before anything is read or written.</summary>
+    internal static Action? TestHookAfterOwnerLock
+    {
+        get => s_afterOwnerLock.Value;
+        set => s_afterOwnerLock.Value = value;
+    }
+
+    private static readonly AsyncLocal<Action?> s_afterOwnerLock = new();
+
     /// <summary>Test hook: runs after the index is saved (index lock held, store lock not), before the registry save and the
     /// publication check.</summary>
     internal static Action? TestHookAfterIndexSave { get; set; }
@@ -119,19 +157,48 @@ internal static class BuildCommand
     /// <summary>Test hook: runs after the publication check, with no lock held, before the first encode.</summary>
     internal static Action? TestHookBeforeEncode { get; set; }
 
+    /// <summary>How the missing chunks are handled.</summary>
+    private enum EncodeMode
+    {
+        /// <summary>Nothing is encoded (<c>--index-only</c>, <c>--dry-run</c>).</summary>
+        None,
+
+        /// <summary>Queued on the server (<c>--server</c>): text through <c>prewarm</c>, never an entry write.</summary>
+        Prewarm,
+
+        /// <summary>Encoded here (<c>--offline</c>), holding the store owner lock for the whole run.</summary>
+        Local,
+    }
+
     public static int Run(CliContext ctx, CliArgs args)
     {
         var total = Stopwatch.StartNew();
         string storeRoot = ctx.FullPath(args.Required("store"));
         SourceSpec spec = SourceTree.SpecFrom(ctx, args) ?? throw new UsageException("build: give --solution or --directory.");
-        Common.CheckChunkerName(args, args.Value("chunker") ?? "symbol");
-        bool dryRun = args.Flag("dry-run"), strict = args.Flag("strict");
+        string chunkerName = Common.ChunkerName(args);
+        bool dryRun = args.Flag("dry-run"), strict = args.Flag("strict"), lab = args.Flag("lab");
         int? maxChunks = args.IntOrNull("max-chunks", 0);
+        int? maxEncodeTokens = args.IntOrNull("max-encode-tokens", 0);
         int show = args.Int("show", 50, 0);
         TimeSpan lockTimeout = args.Seconds("lock-timeout", Common.DefaultLockTimeout);
         _ = args.IntOrNull("chunk-tokens", 1, 1 << 20);
 
+        string? serverUrl = args.Value("server");
+        bool offline = args.Flag("offline"), indexOnly = args.Flag("index-only");
+        if (args.Flag("encode") && indexOnly) throw new UsageException("build: --encode and --index-only contradict each other.");
+        if (offline && serverUrl is not null) throw new UsageException("build: give --server (the server encodes) or --offline (this machine encodes), not both.");
+        EncodeMode mode = indexOnly || dryRun ? EncodeMode.None
+            : serverUrl is not null ? EncodeMode.Prewarm
+            : offline ? EncodeMode.Local
+            : throw new UsageException("build: say who encodes: --server URL (queue the chunks on the server), --offline (encode into --store here) or --index-only (update the index only).");
+        if (!lab && !WireChunking.IsWireChunker(chunkerName))
+            throw new UsageException($"build: chunker '{chunkerName}' is not wire-eligible (the wire carries {string.Join(", ", WireChunking.Eligible)} only); "
+                + "pass --lab for a research build of a store that never leaves this machine.");
+
+        // Read-only preparation first (a bad --model or an unreachable server leaves the store untouched).
         using ModelHandle model = Common.OpenModel(ctx, args);
+        using ServerConnection? server = Common.ConnectServer(ctx, args, model);
+
         IChunker chunker = Common.Chunker(args, model.Tokenizer);
         SelectionRequest? selection = Common.HasSelection(args) ? Common.Selection(args, chunker) : null;
         if (selection is null && (args.List("exclude").Count > 0 || args.Value("budget") is not null || args.Value("max-per-hop") is not null))
@@ -144,19 +211,28 @@ internal static class BuildCommand
         foreach (SkippedEntry s in tree.Skipped)
             ctx.Info($"{(s.FailsStrict ? "warning" : "note")}: skipped {s.Project} ({s.Reason}): {FirstLine(s.Message)}");
         var skipped = tree.Skipped.Select(s => new SkippedJson(s.Project, s.Reason, s.Message, s.FailsStrict)).ToList();
+        string modeName = dryRun ? "dry_run" : mode switch { EncodeMode.Prewarm => "prewarm", EncodeMode.Local => "local", _ => "index_only" };
 
         if (strict && tree.FailsStrict)
         {
             var failed = new BuildResult
             {
-                Files = tree.Files.Count, DeniedFiles = tree.Excluded.Count, SkippedProjects = skipped, StrictFailed = true, DryRun = dryRun,
+                Files = tree.Files.Count, DeniedFiles = tree.Denied.Count, SkippedProjects = skipped, StrictFailed = true, DryRun = dryRun,
                 Store = storeRoot, Root = tree.Root, Chunker = chunker.Name, ModelId = model.ModelId, Fingerprint = model.Fingerprint,
-                ElapsedMs = total.ElapsedMilliseconds, ScanMs = scanMs,
+                ElapsedMs = total.ElapsedMilliseconds, ScanMs = scanMs, Mode = modeName, Server = server?.BaseUrl,
             };
             Emit(ctx, failed, show);
             ctx.Info($"strict: {tree.Skipped.Count(s => s.FailsStrict)} skipped project(s) or excluded file(s); nothing was written.");
             return ExitCodes.StrictFailure;
         }
+
+        // Wire eligibility of every chunk of the tree: allow-listed chunker AND not a token-id slice AND the text tokenised alone
+        // (ChunkTokenization.Encode) gives the chunk's ids. One file at a time: only counts are kept.
+        sw.Restart();
+        int wireIneligible = 0;
+        foreach (SourceFile f in tree.Files)
+            wireIneligible += WireEligibility.CountIneligible(chunker.Name, chunker.Chunk(f), c => f.Text[c.StartOffset..c.EndOffset], model.Tokenizer);
+        ctx.Info($"wire eligibility: {wireIneligible} chunk(s) cannot travel on the wire [{sw.Elapsed.TotalSeconds:F1} s]");
 
         // The selection (chunking, Roslyn graph) depends only on the tree, not on the index: compute it before taking the lock.
         HashSet<string>? selectedIds = null;
@@ -171,6 +247,11 @@ internal static class BuildCommand
             foreach (string n in sel.Notes) ctx.Info($"  note: {n}");
             foreach (string u in sel.UnmatchedPatterns) ctx.Info($"  unmatched pattern: {u}");
         }
+
+        // The offline writer owns the store for its WHOLE run: taken before the first write (the scan and --strict above write nothing)
+        // and released at the end. (StoreOwnerLock.IsHeldByAnother would be a check followed by writes: advisory only, issue #1664.)
+        using StoreOwnerLock? owner = mode == EncodeMode.Local ? Common.AcquireOwner(ctx, storeRoot) : null;
+        if (owner is not null) TestHookAfterOwnerLock?.Invoke();
 
         // Lock model (integration spec L3; ChunkIndex remarks): the index lock is held from the index load to the publication
         // check; the store lock only for the registry save plus that check, and then per put. A dry run writes nothing, takes no
@@ -261,6 +342,7 @@ internal static class BuildCommand
             + (selectedIds is null ? "" : $", {missing.Count} of them selected") + $" [{indexMs / 1000:F1} s]");
         int selectedCount = missing.Count;
         if (maxChunks is int cap && missing.Count > cap) missing = missing.Take(cap).ToList();
+        if (maxEncodeTokens is int tokenCap) missing = WithinTokenBudget(missing, tokenCap);
         long toEncodeTokens = missing.Sum(r => (long)(r.TokenCount ?? 0));
         long estimated = EstimateBytes(model, missing.Select(r => r.TokenCount ?? 0));
         long estimatedFull = EstimateBytes(model, distinct.Select(r => r.TokenCount ?? 0));
@@ -269,13 +351,13 @@ internal static class BuildCommand
 
         var result = new BuildResult
         {
-            Files = tree.Files.Count, Chunks = all.Count, Tokens = tokens, DeniedFiles = tree.Excluded.Count,
-            Added = diff.Added.Count, Removed = diff.Removed.Count, Unchanged = diff.Unchanged.Count, EncodeQueuedTokens = toEncodeTokens,
+            Files = tree.Files.Count, Chunks = all.Count, Tokens = tokens, DeniedFiles = tree.Denied.Count, WireIneligibleChunks = wireIneligible,
+            Added = diff.Added.Count, Removed = diff.Removed.Count, Unchanged = diff.Unchanged.Count, EncodeQueuedTokens = mode == EncodeMode.None ? 0 : toEncodeTokens,
             SkippedProjects = skipped, DryRun = dryRun, Store = storeRoot, Root = tree.Root, IndexPath = indexPath, Chunker = chunker.Name,
             ModelId = model.ModelId, Fingerprint = model.Fingerprint, IndexLoadNote = index.LoadNote, DistinctKeys = distinct.Count,
             DistinctTokens = distinctTokens, AlreadyStored = alreadyStored, SelectedForEncoding = selectedCount, ToEncodeChunks = missing.Count,
             EstimatedBytes = estimated, EstimatedFullStoreBytes = estimatedFull, BytesPerTokenPerLayer = model.KvBytesPerTokenPerLayer,
-            Layers = model.Geometry.LayerCount, ScanMs = scanMs, IndexMs = indexMs,
+            Layers = model.Geometry.LayerCount, ScanMs = scanMs, IndexMs = indexMs, Mode = modeName, Server = server?.BaseUrl,
         };
 
         if (dryRun)
@@ -289,11 +371,32 @@ internal static class BuildCommand
             return ExitCodes.Ok;
         }
 
-        // Encode: one file at a time (re-chunked to recover the token ids), one chunk at a time.
         var files = tree.Files.ToDictionary(f => f.Path, ChunkIndex.PathComparer);
+        if (mode == EncodeMode.None)
+        {
+            result = result with { MissingAfter = status.MissingChunks, MissingTokensAfter = status.MissingTokens, ElapsedMs = total.ElapsedMilliseconds };
+            Emit(ctx, result, show);
+            return ExitCodes.Ok;
+        }
+
+        if (mode == EncodeMode.Prewarm)
+        {
+            // The server encodes: text only (never a hash, never K/V), each text with its path so the server's deny-list also applies.
+            TestHookBeforeEncode?.Invoke();
+            PrewarmJson sent = Prewarm(ctx, server!, chunker, model, files, missing);
+            result = result with
+            {
+                EncodeQueuedTokens = sent.QueuedTokens, Prewarm = sent, MissingAfter = status.MissingChunks, MissingTokensAfter = status.MissingTokens,
+                ElapsedMs = total.ElapsedMilliseconds,
+            };
+            Emit(ctx, result, show);
+            return ExitCodes.Ok;
+        }
+
+        // Encode here (--offline): one file at a time (re-chunked to recover the token ids), one chunk at a time.
         var lockedStore = new LockingChunkStore(layout.Existing, storeRoot, lockTimeout); // each put takes the store lock briefly
         TestHookBeforeEncode?.Invoke();
-        int encoded = 0, hits = 0, failures = 0, ineligible = 0, done = 0;
+        int encoded = 0, hits = 0, failures = 0, done = 0;
         long encodedTokens = 0, doneTokens = 0;
         var encodeSw = Stopwatch.StartNew();
         var progress = Stopwatch.StartNew();
@@ -305,7 +408,6 @@ internal static class BuildCommand
             {
                 if (!byId.TryGetValue(r.Id, out Chunk? chunk))
                     throw new InvalidOperationException($"Chunk {r.Id} is in the index but the chunker no longer produces it; the file changed during the build?");
-                if (!ChunkTokenization.Encode(model.Tokenizer, Common.TextOf(file, r)).AsSpan().SequenceEqual(chunk.TokenIds)) ineligible++;
                 if (chunk.TokenIds.Length == 0) continue;
                 var assembly = model.Assembler.Assemble([chunk], model.Model, lockedStore);
                 encoded += assembly.Stats.Misses;
@@ -328,7 +430,7 @@ internal static class BuildCommand
         StoreStats stats = layout.Stats;
         result = result with
         {
-            WireIneligibleChunks = ineligible, EncodedChunks = encoded, EncodedTokens = encodedTokens, StoreHits = hits, StoreFailures = failures,
+            EncodedChunks = encoded, EncodedTokens = encodedTokens, StoreHits = hits, StoreFailures = failures,
             EncodeMs = encodeMs, TokensPerSecond = encodedTokens / Math.Max(encodeMs / 1000, 1e-9), MissingAfter = after.MissingChunks,
             MissingTokensAfter = after.MissingTokens, StoreEntries = stats.Entries, StoreBytes = stats.EntryBytes, ElapsedMs = total.ElapsedMilliseconds,
         };
@@ -339,6 +441,49 @@ internal static class BuildCommand
             return ExitCodes.Error;
         }
         return ExitCodes.Ok;
+    }
+
+    /// <summary>The longest prefix of <paramref name="missing"/> whose token counts sum to at most <paramref name="budget"/>.</summary>
+    internal static List<ChunkRef> WithinTokenBudget(List<ChunkRef> missing, int budget)
+    {
+        var kept = new List<ChunkRef>();
+        long sum = 0;
+        foreach (ChunkRef r in missing)
+        {
+            sum += r.TokenCount ?? 0;
+            if (sum > budget) break;
+            kept.Add(r);
+        }
+        return kept;
+    }
+
+    // Queues the wire-eligible chunks of `missing` on the server, in batches. Every text is the chunk's text exactly as the
+    // wire hash is taken over it (LF as scanned). Nothing else is sent: no hash, no K/V, no token ids.
+    private static PrewarmJson Prewarm(CliContext ctx, ServerConnection server, IChunker chunker, ModelHandle model,
+        Dictionary<string, SourceFile> files, List<ChunkRef> missing)
+    {
+        var sender = new PrewarmSender(server);
+        foreach (IGrouping<string, ChunkRef> group in missing.GroupBy(r => r.FilePath, ChunkIndex.PathComparer))
+        {
+            SourceFile file = files[group.Key];
+            Dictionary<string, Chunk> byId = chunker.Chunk(file).ToDictionary(c => c.Id, StringComparer.Ordinal);
+            foreach (ChunkRef r in group)
+            {
+                if (!byId.TryGetValue(r.Id, out Chunk? chunk))
+                    throw new InvalidOperationException($"Chunk {r.Id} is in the index but the chunker no longer produces it; the file changed during the build?");
+                string text = file.Text[chunk.StartOffset..chunk.EndOffset];
+                if (chunk.TokenIds.Length == 0 || !WireEligibility.IsEligible(chunker.Name, chunk, text, model.Tokenizer))
+                {
+                    sender.SkipIneligible();
+                    continue;
+                }
+                sender.Add(new PrewarmText { Id = chunk.Id, Text = text, Source = new PrewarmSource { Path = chunk.FilePath } });
+            }
+        }
+        PrewarmJson sent = sender.Finish();
+        ctx.Info($"prewarm: {sent.Requests} request(s) to {server.BaseUrl}: requested {sent.Requested}, already stored {sent.AlreadyStored}, queued {sent.Queued} ({sent.QueuedTokens} tokens), refused {sent.Refused}"
+            + (sent.SkippedIneligible > 0 ? $"; {sent.SkippedIneligible} wire-ineligible chunk(s) not sent" : ""));
+        return sent;
     }
 
     /// <summary>
@@ -378,6 +523,18 @@ internal static class BuildCommand
             foreach (PlannedChunk c in (r.WouldEncode ?? []).Take(show))
                 o.WriteLine($"    {c.Path}:{c.StartLine}-{c.EndLine}  {c.Tokens} tokens  {c.Key[..12]}");
             if ((r.WouldEncode?.Count ?? 0) > show) o.WriteLine($"    ... {r.WouldEncode!.Count - show} more (--show N)");
+            return;
+        }
+        if (r.Prewarm is { } pw)
+        {
+            o.WriteLine($"  prewarm via {r.Server}: requested {pw.Requested}, already stored {pw.AlreadyStored}, queued {pw.Queued} ({pw.QueuedTokens} tokens), refused {pw.Refused}"
+                + (pw.SkippedIneligible > 0 ? $"; {pw.SkippedIneligible} wire-ineligible not sent" : ""));
+            o.WriteLine($"  wire-ineligible chunks in the tree: {r.WireIneligibleChunks}; denied files: {r.DeniedFiles}");
+            return;
+        }
+        if (r.Mode == "index_only")
+        {
+            o.WriteLine($"  index only (nothing encoded); wire-ineligible {r.WireIneligibleChunks}, denied files {r.DeniedFiles}; still missing {r.MissingAfter} chunks ({r.MissingTokensAfter} tokens)");
             return;
         }
         o.WriteLine($"  encoded: {r.EncodedChunks} chunks, {r.EncodedTokens} tokens in {r.EncodeMs / 1000:F1} s ({r.TokensPerSecond:F0} tokens/s, cpu); "

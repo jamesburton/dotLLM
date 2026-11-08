@@ -3,6 +3,7 @@ using DotLLM.ChunkReuse.CodeCorpus;
 using DotLLM.ChunkReuse.Graph;
 using DotLLM.ChunkReuse.SolutionScan;
 using DotLLM.ChunkReuse.Store;
+using DotLLM.ChunkReuse.Tooling;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.ChunkCache;
@@ -31,8 +32,9 @@ internal sealed class SourceTree
     private readonly IReadOnlyList<ProjectCompilation>? _compilations;
 
     private SourceTree(SourceSpec spec, IReadOnlyList<SourceFile> files, string root, IReadOnlyList<string> excluded,
-        IReadOnlyList<SkippedEntry> skipped, IReadOnlyList<ProjectCompilation>? compilations, string summary)
+        IReadOnlyList<SkippedEntry> skipped, IReadOnlyList<ProjectCompilation>? compilations, string summary, IReadOnlyList<string> denied)
     {
+        Denied = denied;
         Spec = spec;
         Files = files;
         Root = root;
@@ -53,6 +55,12 @@ internal sealed class SourceTree
 
     /// <summary>Files left out because they are on another volume than the root (no relative form).</summary>
     public IReadOnlyList<string> Excluded { get; }
+
+    /// <summary>
+    /// Index paths the secrets deny-list (<see cref="ChunkDenyList.Default"/>) removed: never chunked, indexed, encoded or sent
+    /// (<c>build</c> counts them as <c>denied_files</c>). Their text is not read past the scan.
+    /// </summary>
+    public IReadOnlyList<string> Denied { get; }
 
     /// <summary>Skipped projects, unattributed load failures and excluded files.</summary>
     public IReadOnlyList<SkippedEntry> Skipped { get; }
@@ -86,15 +94,17 @@ internal sealed class SourceTree
         {
             if (!Directory.Exists(spec.Path)) throw new DirectoryNotFoundException($"Directory not found: {spec.Path}");
             Corpus corpus = Corpus.FromDirectory(spec.Path, new NoChunks(), tokenizer);
-            (IReadOnlyList<SourceFile> files, string root, IReadOnlyList<string> excluded) = ChunkIndex.RelativizeScan(corpus.Files, spec.Path);
+            (IReadOnlyList<SourceFile> allFiles, string root, IReadOnlyList<string> excluded) = ChunkIndex.RelativizeScan(corpus.Files, spec.Path);
+            (IReadOnlyList<SourceFile> files, IReadOnlyList<string> denied) = ApplyDenyList(allFiles);
             var skipped = excluded.Select(e => new SkippedEntry(e, "other-volume", "on another volume than the root; not indexed", true)).ToList();
-            string summary = $"directory {spec.Path}: {files.Count} files ({string.Join(", ", corpus.Excluded.GroupBy(e => e.Reason).Select(g => $"{g.Count()} {g.Key}").DefaultIfEmpty("none"))} left out by the directory rules) [{sw.Elapsed.TotalSeconds:F1} s]";
-            return new SourceTree(spec, files, root, excluded, skipped, null, summary);
+            string summary = $"directory {spec.Path}: {files.Count} files ({denied.Count} denied by the secrets deny-list, {string.Join(", ", corpus.Excluded.GroupBy(e => e.Reason).Select(g => $"{g.Count()} {g.Key}").DefaultIfEmpty("none"))} left out by the directory rules) [{sw.Elapsed.TotalSeconds:F1} s]";
+            return new SourceTree(spec, files, root, excluded, skipped, null, summary, denied);
         }
 
         if (!File.Exists(spec.Path)) throw new FileNotFoundException($"Solution or project not found: {spec.Path}", spec.Path);
         ScanResult scan = SolutionScanner.LoadAsync(spec.Path, new SolutionScanOptions(spec.Configuration ?? "Release")).GetAwaiter().GetResult();
-        (IReadOnlyList<SourceFile> sfiles, string sroot, IReadOnlyList<string> sexcluded) = ChunkIndex.RelativizeScan(scan.AuthoredFiles, scan.RootDirectory);
+        (IReadOnlyList<SourceFile> sallFiles, string sroot, IReadOnlyList<string> sexcluded) = ChunkIndex.RelativizeScan(scan.AuthoredFiles, scan.RootDirectory);
+        (IReadOnlyList<SourceFile> sfiles, IReadOnlyList<string> sdenied) = ApplyDenyList(sallFiles);
         var entries = new List<SkippedEntry>();
         foreach (SkippedProject p in scan.Skipped)
             entries.Add(new SkippedEntry(p.ProjectPath, p.Reason, p.Message, p.Reason != SkippedProject.ExtraTargetFramework));
@@ -105,8 +115,21 @@ internal sealed class SourceTree
             entries.Add(new SkippedEntry(e, "other-volume", "on another volume than the root; not indexed", true));
         IReadOnlyList<ProjectCompilation> compilations = Rekey(scan.Compilations, scan.RootDirectory, sroot);
         string ssummary = $"solution {spec.Path} (Configuration={spec.Configuration}): {scan.Projects.Count} projects, {scan.Skipped.Count} skipped, "
-            + $"{scan.Files.Count} files ({scan.Generated.Count} generated), {sfiles.Count} authored files indexed; root {sroot} [{sw.Elapsed.TotalSeconds:F1} s]";
-        return new SourceTree(spec, sfiles, sroot, sexcluded, entries, compilations, ssummary);
+            + $"{scan.Files.Count} files ({scan.Generated.Count} generated), {sfiles.Count} authored files indexed ({sdenied.Count} denied by the secrets deny-list); root {sroot} [{sw.Elapsed.TotalSeconds:F1} s]";
+        return new SourceTree(spec, sfiles, sroot, sexcluded, entries, compilations, ssummary, sdenied);
+    }
+
+    /// <summary>Splits <paramref name="files"/> into the allowed ones and the denied index paths (<see cref="ChunkDenyList.Default"/>).</summary>
+    internal static (IReadOnlyList<SourceFile> Allowed, IReadOnlyList<string> Denied) ApplyDenyList(IReadOnlyList<SourceFile> files)
+    {
+        var allowed = new List<SourceFile>(files.Count);
+        var denied = new List<string>();
+        foreach (SourceFile f in files)
+        {
+            if (ChunkDenyList.Default.IsDenied(f.Path)) denied.Add(f.Path);
+            else allowed.Add(f);
+        }
+        return (allowed, denied);
     }
 
     /// <summary>

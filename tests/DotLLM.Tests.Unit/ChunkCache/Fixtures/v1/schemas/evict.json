@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chunkcache_evict output (integration spec 7.2)",
+  "type": "object",
+  "required": ["evicted", "freed_bytes", "kept_referenced", "dry_run"],
+  "properties": {
+    "evicted": {"type": "integer"},
+    "freed_bytes": {"type": "integer"},
+    "kept_referenced": {"type": "integer"},
+    "dry_run": {"type": "boolean"}
+  }
+}

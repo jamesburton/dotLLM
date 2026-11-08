@@ -14,7 +14,7 @@ namespace DotLLM.Tests.Unit.ChunkReuse;
 /// oracles are independent of the CLI: the store's files, the index files on disk, the library's own
 /// <see cref="ChunkIndex.Status"/>, and the model geometry for the size estimate.
 /// </summary>
-public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixture>
+public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixture>
 {
     private const int ChunkTokens = 64;
     private readonly Fixture _fx;
@@ -34,7 +34,7 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.Equal(2, Cli([]).Code);
         Assert.Equal(0, Cli(["--help"]).Code);
         Assert.Equal(2, Cli(["frobnicate"]).Code);
-        foreach (string verb in new[] { "build", "select", "status", "evict", "compare" })
+        foreach (string verb in new[] { "build", "select", "status", "evict", "prewarm", "explain" })
         {
             var help = Cli([verb, "--help"]);
             Assert.Equal(0, help.Code);
@@ -83,7 +83,8 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.Equal(distinct, r.GetProperty("encoded_chunks").GetInt32());
         Assert.Equal(0, r.GetProperty("missing_after").GetInt32());
         Assert.Equal(r.GetProperty("distinct_tokens").GetInt64(), r.GetProperty("encoded_tokens").GetInt64());
-        Assert.Equal(0, r.GetProperty("wire_ineligible_chunks").GetInt32()); // byte-level tokens re-encode exactly
+        // symbol-64 is a lab chunker (only symbol-512 is on the wire): every one of its chunks counts as wire-ineligible.
+        Assert.Equal(r.GetProperty("chunks").GetInt32(), r.GetProperty("wire_ineligible_chunks").GetInt32());
 
         // Independent oracle: the index file on disk, loaded by the library, against the store's files.
         var store2 = new FileChunkStore(store);
@@ -485,12 +486,12 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         int ab = new FileChunkStore(store).GetStats().Entries;
         Assert.Equal(2 * a, ab); // same chunks, other model: other keys
 
-        JsonElement dry = Json(Cli(["evict", "--store", store, "--all-for-model", "--model", _fx.ModelA, "--json"]));
+        JsonElement dry = Json(Cli(["evict", "--store", store, "--mode", "all", "--model", _fx.ModelA, "--json"]));
         Assert.Equal(a, dry.GetProperty("evicted").GetInt32());
         Assert.Equal(ab, new FileChunkStore(store).GetStats().Entries);
         Assert.Single(dry.GetProperty("dropped_indexes").EnumerateArray());
 
-        Assert.Equal(0, Cli(["evict", "--store", store, "--all-for-model", "--model", _fx.ModelA, "--apply"]).Code);
+        Assert.Equal(0, Cli(["evict", "--store", store, "--mode", "all", "--model", _fx.ModelA, "--apply"]).Code);
         Assert.Equal(ab - a, new FileChunkStore(store).GetStats().Entries);
         Assert.Single(Directory.GetFiles(store, "index-*.json"));
         Assert.Equal(0, Cli(["status", "--model", _fx.ModelB, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
@@ -530,14 +531,14 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
     }
 
     [Fact]
-    public void Lock_EvictAfterIndexPublished_KeepsReReferencedKeys_AndDoesNotWaitForTheBuild()
+    public void Lock_EvictDuringOfflineBuild_IsRefusedByTheOwnerLock_AndKeepsEveryKey()
     {
         string tree = NewTree();
         string store = NewDir("store");
         (HashSet<string> orphans, string revert) = MakeOrphan(tree, store);
-        // Revert the edit: the next build references the orphaned key again and skips encoding it (the store has it). Under
-        // L3 the build no longer holds the store lock, so an eviction pass may run right after its index save: it reads the
-        // published index and must keep the key; it is not blocked (0, not busy).
+        // Revert the edit: the next build references the orphaned key again and skips encoding it (the store has it). The build
+        // holds no store lock here (L3), but an offline build owns the store for its WHOLE run (Task 17): an offline eviction pass
+        // right after its index save is refused at once (exit 1, store_owned), not blocked, and every key stays.
         File.WriteAllText(Path.Combine(tree, "src", "Calc.cs"), revert);
         int? evictCode = null;
         string? indexLockHeld = null;
@@ -556,7 +557,7 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         {
             BuildCommand.TestHookAfterIndexSave = null;
         }
-        Assert.Equal(0, evictCode); // not blocked by the build
+        Assert.Equal(1, evictCode); // refused by the owner lock, not blocked by the build
         Assert.Equal(nameof(ChunkStoreLockTimeoutException), indexLockHeld);
         Assert.All(orphans, o => Assert.True(new FileChunkStore(store).Contains(new ChunkKey(o))));
         Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
@@ -789,7 +790,7 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
             File.WriteAllText(victim, "keep me");
             File.WriteAllText(config, original.Replace($"\"{indexName}\"", $"\"{evil}\"", StringComparison.Ordinal));
             Assert.Contains(evil, File.ReadAllText(config), StringComparison.Ordinal);
-            var r = Cli(["evict", "--store", store, "--all-for-model", "--model", _fx.ModelA, "--apply"]);
+            var r = Cli(["evict", "--store", store, "--mode", "all", "--model", _fx.ModelA, "--apply"]);
             Assert.Equal(1, r.Code);
             Assert.True(File.Exists(victim), $"'{evil}' deleted a file outside the store");
             Assert.Equal(entries, new FileChunkStore(store).GetStats().Entries); // nothing deleted
@@ -835,9 +836,6 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.Equal(1, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64"]).Code);
         Assert.Equal(1, Cli(["select", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--path", "src/Calc.cs"]).Code);
         Assert.Equal(1, Cli(["evict", "--store", store]).Code);
-        string task = Path.Combine(parent, "t.json");
-        File.WriteAllText(task, """{"select": {"paths": ["src/Calc.cs"]}, "query": "x"}""");
-        Assert.Equal(1, Cli(["compare", "--task", task, "--model", _fx.ModelA, "--store", store, "--directory", tree]).Code);
         Assert.False(Directory.Exists(store));
     }
 
@@ -887,11 +885,36 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         foreach (string n in names) Assert.True(e.TryGetProperty(n, out _), $"missing JSON property '{n}' in {e}");
     }
 
+    /// <summary>
+    /// Runs the CLI as the Phase S tests did: a local build/evict now has to say who writes, so this adds <c>--offline</c> to a
+    /// <c>build</c> (unless it is a dry run, index-only or server-backed) and to an <c>evict</c>, and <c>--lab</c> to a
+    /// <c>build</c> of a chunker that is not wire-eligible (<c>--chunk-tokens</c> other than 512, or <c>--chunker fixed</c>).
+    /// The new Task 17 tests call <see cref="CliRaw"/> and spell their flags out.
+    /// </summary>
     private (int Code, string Out, string Err) Cli(string[] args, string? cwd = null)
+    {
+        if (args.Length > 0 && !args.Contains("--help") && !args.Contains("--server"))
+        {
+            var withFlags = args.ToList();
+            if (args[0] == "evict" && !args.Contains("--offline")) withFlags.Add("--offline");
+            if (args[0] == "build")
+            {
+                if (!args.Contains("--offline") && !args.Contains("--index-only") && !args.Contains("--dry-run")) withFlags.Add("--offline");
+                int tokens = Array.IndexOf(args, "--chunk-tokens");
+                int kind = Array.IndexOf(args, "--chunker");
+                bool offWire = (tokens >= 0 && tokens + 1 < args.Length && args[tokens + 1] != "512") || (kind >= 0 && kind + 1 < args.Length && args[kind + 1] == "fixed");
+                if (offWire && !args.Contains("--lab")) withFlags.Add("--lab");
+            }
+            args = withFlags.ToArray();
+        }
+        return CliRaw(args, cwd);
+    }
+
+    private (int Code, string Out, string Err) CliRaw(string[] args, string? cwd = null, HttpMessageHandler? http = null, Func<string, string?>? env = null)
     {
         var o = new StringWriter();
         var e = new StringWriter();
-        int code = ChunkCacheCli.Run(args, o, e, cwd ?? _fx.Scratch);
+        int code = ChunkCacheCli.Run(args, o, e, cwd ?? _fx.Scratch, http, env ?? (_ => null));
         _log.WriteLine($"> chunkcache {string.Join(' ', args)}  => {code}");
         if (e.ToString().Length > 0) _log.WriteLine(e.ToString());
         return (code, o.ToString(), e.ToString());
@@ -968,6 +991,9 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
 
         public string ModelB => Path.Combine(Scratch, "tiny-b.gguf");
 
+        /// <summary>Like <see cref="ModelA"/> (same seed) but declaring the Qwen3 control tokens (type 3), <c>&lt;think&gt;</c> among them.</summary>
+        public string ModelSpecials => Path.Combine(Scratch, "tiny-s.gguf");
+
         public string TreeTemplate => Path.Combine(Scratch, "template");
 
         public SolutionScannerTests.MiniSolution Mini { get; } = new();
@@ -977,6 +1003,7 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
             Directory.CreateDirectory(Scratch);
             File.WriteAllBytes(ModelA, SyntheticDenseGguf.Build("qwen3", seed: 7, byteLevelVocab: true));
             File.WriteAllBytes(ModelB, SyntheticDenseGguf.Build("qwen3", seed: 8, byteLevelVocab: true));
+            File.WriteAllBytes(ModelSpecials, SyntheticDenseGguf.Build("qwen3", seed: 7, byteLevelVocab: true, specials: DotLLM.Tests.Unit.Server.ChunkCache.ChunkCacheTestServer.Specials));
             WriteTree(TreeTemplate);
             await Mini.InitializeAsync();
         }

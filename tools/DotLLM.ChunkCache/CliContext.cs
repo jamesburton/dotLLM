@@ -32,6 +32,22 @@ internal sealed class CliContext(TextWriter output, TextWriter error, string wor
     /// <summary>Whether <c>--json</c> was given.</summary>
     public bool Json { get; set; }
 
+    /// <summary>The HTTP handler of server calls (null: the default socket handler); tests serve contract fixtures through it.</summary>
+    public HttpMessageHandler? HttpHandler { get; init; }
+
+    /// <summary>Reads an environment variable (the API key is read here, nowhere else); tests inject their own.</summary>
+    public Func<string, string?> GetEnv { get; init; } = Environment.GetEnvironmentVariable;
+
+    /// <summary>
+    /// The text with the API key (if one is set) replaced by <c>***</c>. Every message the CLI prints (stderr and the JSON error
+    /// object) goes through this, so a server that echoes the key back in an error body cannot leak it into logs.
+    /// </summary>
+    public string Redact(string text)
+    {
+        string? key = GetEnv(ServerConnection.ApiKeyVariable);
+        return string.IsNullOrEmpty(key) || string.IsNullOrEmpty(text) ? text : text.Replace(key, "***", StringComparison.Ordinal);
+    }
+
     /// <summary>Human-readable result text: stdout normally, stderr under <c>--json</c> (stdout carries only the JSON).</summary>
     public TextWriter Text => Json ? Err : Out;
 
@@ -39,8 +55,8 @@ internal sealed class CliContext(TextWriter output, TextWriter error, string wor
     public string FullPath(string path) => Path.GetFullPath(Path.IsPathFullyQualified(path) ? path : Path.Combine(WorkingDirectory, path));
 
     /// <summary>Progress or a warning line (stderr).</summary>
-    public void Info(string line) => Err.WriteLine(line);
+    public void Info(string line) => Err.WriteLine(Redact(line));
 
     /// <summary>Writes <paramref name="result"/> as the JSON document on stdout.</summary>
-    public void WriteJson<T>(T result) => Out.WriteLine(JsonSerializer.Serialize(result, JsonOptions));
+    public void WriteJson<T>(T result) => Out.WriteLine(Redact(JsonSerializer.Serialize(result, JsonOptions)));
 }

@@ -36,6 +36,9 @@ internal sealed record StatusResult
     public string? Root { get; init; }
     public string? Chunker { get; init; }
     public LedgerJson? Ledger { get; init; }
+
+    /// <summary>The server of a server-backed run (its figures fill <c>store_bytes</c>, <c>entries</c> and <c>budget_bytes</c>).</summary>
+    public string? Server { get; init; }
 }
 
 /// <summary>
@@ -56,7 +59,7 @@ internal static class StatusCommand
         });
 
     public const string Help = """
-        chunkcache status --model M.gguf --store DIR [options]
+        chunkcache status --model M.gguf --store DIR [--server URL] [options]
 
           Lists the chunks of the store's index (this model, this chunker) that are missing from the store, by file and line
           range, and, after rescanning the tree the index records (or --solution/--directory), the stale, new and deleted files.
@@ -64,6 +67,8 @@ internal static class StatusCommand
           --no-scan          check the store against the index only (edits since the last build are not seen)
           --strict           exit 3 when not up to date (CI)
           --list-missing     include every missing chunk in the JSON (text output always lists up to --show, default 40)
+          --server URL       the server's own store figures (entries, bytes, budget_bytes) and index name; the API key is read
+                             from CHUNKCACHE_API_KEY only
           --chunker symbol|fixed --chunk-tokens N --configuration C --json
         """;
 
@@ -77,6 +82,7 @@ internal static class StatusCommand
         if (!Directory.Exists(storeRoot)) throw new DirectoryNotFoundException($"Store not found: {storeRoot}");
 
         using ModelHandle model = Common.OpenModel(ctx, args);
+        using ServerConnection? server = Common.ConnectServer(ctx, args, model);
         IChunker chunker = Common.Chunker(chunkerName, args, model.Tokenizer);
         StoreLayout layout = StoreLayout.Open(storeRoot, create: false);
         string indexPath = layout.ReadPath(chunker.Name, model);
@@ -101,9 +107,13 @@ internal static class StatusCommand
         string[] Of(FileState s) => report.Files.Where(f => f.State == s).Select(f => f.Path).ToArray();
         var result = new StatusResult
         {
+            Server = server?.BaseUrl,
             TotalChunks = report.TotalChunks, MissingChunks = report.MissingChunks, MissingTokens = report.MissingTokens, UpToDate = report.IsUpToDate,
             StaleFiles = Of(FileState.Stale), NewFiles = Of(FileState.New), DeletedFiles = Of(FileState.Deleted),
-            Missing = args.Flag("list-missing") || !ctx.Json ? missing : null, StoreBytes = stats.EntryBytes, Entries = stats.Entries,
+            Missing = args.Flag("list-missing") || !ctx.Json ? missing : null,
+            // Server-backed: the server's own figures for the caller's namespace (and its disk budget, which only it knows).
+            StoreBytes = server?.Identity?.Bytes ?? stats.EntryBytes, Entries = (int)(server?.Identity?.Entries ?? stats.Entries),
+            BudgetBytes = server?.Identity?.BudgetBytes,
             TempFiles = stats.TempFiles, TempBytes = stats.TempBytes, Scanned = tree is not null, IndexPath = indexPath, IndexLoadNote = index.LoadNote,
             Root = record?.Root, Chunker = chunker.Name, Ledger = ledger,
         };

@@ -11,6 +11,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\DotLLM.ChunkCache.Client\DotLLM.ChunkCache.Client.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse\DotLLM.ChunkReuse.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.CSharp\DotLLM.ChunkReuse.CSharp.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.Solution\DotLLM.ChunkReuse.Solution.csproj" />

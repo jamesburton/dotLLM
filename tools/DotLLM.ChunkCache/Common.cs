@@ -20,6 +20,8 @@ internal static class Common
         ["threads"] = OptionKind.Single,
         ["json"] = OptionKind.Flag,
         ["help"] = OptionKind.Flag,
+        ["server"] = OptionKind.Single,
+        ["offline"] = OptionKind.Flag,
     };
 
     /// <summary>Source options (<c>--solution</c> or <c>--directory</c>).</summary>
@@ -65,6 +67,46 @@ internal static class Common
     /// <summary>Opens the model of <c>--model</c>.</summary>
     public static ModelHandle OpenModel(CliContext ctx, CliArgs args) =>
         ModelHandle.Open(ctx, args.Required("model"), args.Flag("strict-model-id"), Threads(args));
+
+    /// <summary>The name the chunker of <c>--chunker</c> and <c>--chunk-tokens</c> will have (<c>symbol-512</c>), before any model is opened.</summary>
+    public static string ChunkerName(CliArgs args) =>
+        $"{CheckChunkerName(args, args.Value("chunker") ?? "symbol")}-{args.Int("chunk-tokens", 512, 1, 1 << 20)}";
+
+    /// <summary>
+    /// Connects to <c>--server</c> when given: reads the server's model identity and makes <paramref name="model"/> name its
+    /// index by it. Null without <c>--server</c>.
+    /// </summary>
+    public static ServerConnection? ConnectServer(CliContext ctx, CliArgs args, ModelHandle model)
+    {
+        string? url = args.Value("server");
+        if (url is null) return null;
+        ServerConnection conn = ServerConnection.Open(ctx, url);
+        try
+        {
+            ServerIdentity identity = conn.GetIdentityAsync().GetAwaiter().GetResult();
+            model.AdoptServerIdentity(identity, conn.BaseUrl);
+            conn.Identity = identity;
+            ctx.Info($"server {conn.BaseUrl}: model {ModelHandle.Short(identity.ModelId!)}, producer {ModelHandle.Short(identity.Producer!)}");
+            return conn;
+        }
+        catch
+        {
+            conn.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Takes the store's owner lock for the whole run of an offline writer; null from the library (a server or another offline
+    /// writer owns the store) is <see cref="StoreOwnedException"/>. Waits only for the library's short grace, never for a real owner.
+    /// </summary>
+    public static StoreOwnerLock AcquireOwner(CliContext ctx, string storeRoot)
+    {
+        ctx.Info("taking the store's owner lock (sole writer) for this run ...");
+        return StoreOwnerLock.TryAcquire(storeRoot)
+            ?? throw new StoreOwnedException($"Store {storeRoot} is owned by a running server or another offline writer; an offline run does not write beside it. "
+                + "Stop the owner, or queue the work through the server with --server.");
+    }
 
     /// <summary>The chunker of <c>--chunker</c> (<c>symbol</c> default, or <c>fixed</c>) and <c>--chunk-tokens</c> (512).</summary>
     public static IChunker Chunker(CliArgs args, ITokenizer tokenizer) => Chunker(args.Value("chunker") ?? "symbol", args, tokenizer);
@@ -156,3 +198,6 @@ internal static class Common
         return u == 0 ? $"{bytes:0} {units[u]}" : $"{bytes:0.##} {units[u]}";
     }
 }
+
+/// <summary>The store is owned by another writer (a server, or another offline CLI run): exit 1, code <c>store_owned</c>.</summary>
+internal sealed class StoreOwnedException(string message) : Exception(message);
