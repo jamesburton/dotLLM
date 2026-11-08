@@ -165,6 +165,12 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
         Assert.Equal(new[] { "X(net10.0)", "X(net10.0-windows)", "X(net9.0)", "X(net8.0)", "X(netcoreapp3.1)", "X(netstandard2.0)", "X(net48)" }, preferredFirst);
         Assert.Equal("net10.0", SolutionScanner.TargetFrameworkPreference.FromName("Lib(net10.0)"));
         Assert.Null(SolutionScanner.TargetFrameworkPreference.FromName("Lib"));
+        Assert.Null(SolutionScanner.TargetFrameworkPreference.FromName("(net10.0)")); // no project name before the parenthesis: not a framework suffix
+        // Equal rank: the smaller name is preferred, in either argument order (a deterministic pick).
+        Assert.True(SolutionScanner.TargetFrameworkPreference.CompareNames("A(net10.0)", "B(net10.0)") > 0);
+        Assert.True(SolutionScanner.TargetFrameworkPreference.CompareNames("B(net10.0)", "A(net10.0)") < 0);
+        // Platform-neutral beats a platform-specific build of the same framework before the name is looked at (ordinally "A..." is smaller).
+        Assert.True(SolutionScanner.TargetFrameworkPreference.CompareNames("B(net10.0)", "A(net10.0-windows)") > 0);
     }
 
     [Fact]

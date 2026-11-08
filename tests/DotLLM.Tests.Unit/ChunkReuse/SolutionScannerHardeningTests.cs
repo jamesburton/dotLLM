@@ -25,22 +25,93 @@ public sealed class SolutionScannerHardeningTests : IDisposable
     }
 
     [Fact]
+    public async Task Scan_FileCompiledByANestedProject_BelongsToTheDeepestProject_WhateverTheOrder()
+    {
+        // The outer project's default globs take the inner project's files too. The inner project's directory holds the file, so it owns
+        // it. Projects are visited in ordinal path order: Outer1 before its inner project, and Inner2 before its outer one.
+        const string noGlobCollision = "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework>"
+            + "<EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><ItemGroup><Compile Include=\"**/*.cs\" Exclude=\"**/obj/**\" /></ItemGroup></Project>";
+        string[] projects =
+        [
+            WriteAt("A", "A.csproj", noGlobCollision, ("OuterA.cs", "class OuterA { }\n")),
+            WriteAt("A/Z", "Z.csproj", noGlobCollision, ("InnerZ.cs", "class InnerZ { }\n")),
+            WriteAt("B/A", "Inner.csproj", noGlobCollision, ("InnerA.cs", "class InnerA { }\n")),
+            WriteAt("B", "B.csproj", noGlobCollision, ("OuterB.cs", "class OuterB { }\n")),
+        ];
+        foreach (string p in projects) await DotnetAsync(Path.GetDirectoryName(p)!, "restore", p);
+        string slnx = Path.Combine(_root, "S.slnx");
+        File.WriteAllText(slnx, "<Solution><Project Path=\"A/A.csproj\" /><Project Path=\"A/Z/Z.csproj\" /><Project Path=\"B/A/Inner.csproj\" /><Project Path=\"B/B.csproj\" /></Solution>");
+
+        ScanResult scan = await SolutionScanner.LoadAsync(slnx);
+
+        string[] Files(string project) => scan.Projects.Single(p => p.ProjectPath == project).Files.Where(f => !f.Contains("/obj/", StringComparison.Ordinal)).ToArray();
+        Assert.Equal(new[] { "A/OuterA.cs" }, Files("A/A.csproj"));
+        Assert.Equal(new[] { "A/Z/InnerZ.cs" }, Files("A/Z/Z.csproj"));
+        Assert.Equal(new[] { "B/A/InnerA.cs" }, Files("B/A/Inner.csproj"));
+        Assert.Equal(new[] { "B/OuterB.cs" }, Files("B/B.csproj"));
+    }
+
+    [Fact]
+    public async Task Scan_SingleProject_ReferencedProjectIsScannedAsSourceEvenWhenItWasBuilt()
+    {
+        // A built referenced project has an output assembly; the scanner must still load it as a project (its files are wanted), not as metadata.
+        WriteAt("Lib", "Lib.csproj", Plain, ("L.cs", "namespace Lib { public class L { public static int V => 1; } }\n"));
+        string app = WriteAt("App", "App.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+            + "<ItemGroup><ProjectReference Include=\"..\\Lib\\Lib.csproj\" /></ItemGroup></Project>", ("A.cs", "class A { int M() => Lib.L.V; }\n"));
+        await DotnetAsync(Path.GetDirectoryName(app)!, "build", app);
+
+        ScanResult scan = await SolutionScanner.LoadAsync(app);
+
+        Assert.Equal(new[] { "App.csproj", "Lib/Lib.csproj" }, scan.Projects.Select(p => p.ProjectPath.Replace("../", "", StringComparison.Ordinal)).Order(StringComparer.Ordinal));
+        Assert.Contains(scan.Files, f => f.Path.EndsWith("L.cs", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Scan_ProjectFileThePathLoaderRejects_IsSkippedWithTheLoadersMessage()
+    {
+        // The workspace throws (rather than recording a diagnostic) for a file whose extension names no language: the exception text is the reason.
+        string path = WriteAt("P", "Thing.txt", "<Project />");
+
+        ScanResult scan = await SolutionScanner.LoadAsync(path);
+
+        Assert.Empty(scan.Projects);
+        SkippedProject skipped = Assert.Single(scan.Skipped);
+        Assert.Equal("Thing.txt", skipped.ProjectPath);
+        Assert.Contains("not associated with a language", skipped.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Options_DefaultTimeout_IsTheCorpusBudget() =>
         Assert.Equal(RoslynParsing.DefaultCorpusBudget, new SolutionScanOptions().Timeout);
 
-    private const string Plain ="<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>";
+    private const string Plain = "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>";
 
     /// <summary>Writes <c>P/P.csproj</c> (the given text) and the files under <c>P</c>, restores it; returns the project path.</summary>
     private async Task<string> WriteProjectAsync(string project, params (string Name, string Text)[] files)
     {
-        string dir = Path.Combine(_root, "P");
+        string csproj = WriteAt("P", "P.csproj", project, files);
+        await DotnetAsync(Path.GetDirectoryName(csproj)!, "restore", csproj);
+        return csproj;
+    }
+
+    /// <summary>Writes <paramref name="projectName"/> and <paramref name="files"/> under <paramref name="relDir"/> of the temp root; returns the project path.</summary>
+    private string WriteAt(string relDir, string projectName, string project, params (string Name, string Text)[] files)
+    {
+        string dir = Path.Combine(_root, relDir);
         Directory.CreateDirectory(dir);
         foreach ((string name, string text) in files)
             File.WriteAllText(Path.Combine(dir, name), text);
-        string csproj = Path.Combine(dir, "P.csproj");
+        string csproj = Path.Combine(dir, projectName);
         File.WriteAllText(csproj, project);
-        var psi = new ProcessStartInfo("dotnet") { WorkingDirectory = dir, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
-        foreach (string a in new[] { "restore", csproj, "--nologo", "-v", "q" }) psi.ArgumentList.Add(a);
+        return csproj;
+    }
+
+    private static async Task DotnetAsync(string workingDirectory, params string[] args)
+    {
+        var psi = new ProcessStartInfo("dotnet") { WorkingDirectory = workingDirectory, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        foreach (string a in args) psi.ArgumentList.Add(a);
+        foreach (string a in new[] { "--nologo", "-v", "q" }) psi.ArgumentList.Add(a);
         using Process p = Process.Start(psi)!;
         Task<string> stdout = p.StandardOutput.ReadToEndAsync(), stderr = p.StandardError.ReadToEndAsync();
         using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(3));
@@ -52,8 +123,7 @@ public sealed class SolutionScannerHardeningTests : IDisposable
             throw;
         }
         string output = await stdout + await stderr;
-        Assert.True(p.ExitCode == 0, $"dotnet restore exited {p.ExitCode}: {output}");
-        return csproj;
+        Assert.True(p.ExitCode == 0, $"dotnet {string.Join(' ', args)} exited {p.ExitCode}: {output}");
     }
 
     private static string Nested(string name, int depth) =>
@@ -158,6 +228,49 @@ public sealed class SolutionScannerHardeningTests : IDisposable
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SolutionScanner.LoadAsync(entry, cts.Token));
 
         Assert.True(clock.Elapsed < TimeSpan.FromSeconds(20), $"cancelled after 2 s, returned after {clock.Elapsed}");
+    }
+
+    /// <summary>
+    /// Compiles a source generator whose <c>Initialize</c> sleeps for <paramref name="seconds"/> and returns the DLL path. Generators
+    /// named by a project's <c>Analyzer</c> items are loaded and run in THIS process when the project's compilation is made.
+    /// </summary>
+    private string BuildSleepingGenerator(int seconds)
+    {
+        string source = "using Microsoft.CodeAnalysis; [Generator] public sealed class SleepGen : IIncrementalGenerator { "
+            + "public void Initialize(IncrementalGeneratorInitializationContext context) { System.Threading.Thread.Sleep(" + seconds.ToString(CultureInfo.InvariantCulture) + "000); } }";
+        string[] platform = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator);
+        var compilation = Microsoft.CodeAnalysis.CSharp.CSharpCompilation.Create("SleepGen",
+            [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(source)],
+            platform.Select(p => (MetadataReference)MetadataReference.CreateFromFile(p)),
+            new Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+        Directory.CreateDirectory(_root);
+        string dll = Path.Combine(_root, "SleepGen.dll");
+        var emitted = compilation.Emit(dll);
+        Assert.True(emitted.Success, string.Join("\n", emitted.Diagnostics));
+        return dll;
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Scan_CancelledWhileASourceGeneratorRuns_ReturnsAtOnce(bool solution)
+    {
+        // The design-time build is quick; the hold-up is the compilation, which runs the project's source generators.
+        string project = "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+            + "<ItemGroup><Analyzer Include=\"" + BuildSleepingGenerator(25) + "\" /></ItemGroup></Project>";
+        string csproj = await WriteProjectAsync(project, ("A.cs", "class A { }\n"));
+        string entry = csproj;
+        if (solution)
+        {
+            entry = Path.Combine(_root, "S.slnx");
+            File.WriteAllText(entry, "<Solution><Project Path=\"P/P.csproj\" /></Solution>");
+        }
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var clock = Stopwatch.StartNew();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SolutionScanner.LoadAsync(entry, cts.Token));
+
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(15), $"cancelled after 3 s, returned after {clock.Elapsed}");
     }
 
     [Theory]
