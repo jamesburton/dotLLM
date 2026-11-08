@@ -58,6 +58,31 @@ public class GenerationPromptSuffixTests
     }
 
     [Fact]
+    public void SavePointPrefix_ForAToolResultLast_IsTheStartOfThatToolResult()
+    {
+        // Agent loops (Claude Code via /v1/messages, OpenAI tool loops via /v1/chat/completions) end with a tool message, not a
+        // user one; both endpoints share this helper. PR #1698 review: a user-only rule left them without a save point.
+        var template = new JinjaChatTemplate(Fixture("qwen3-4b-instruct-2507-chat-template.jinja"), "<|endoftext|>", "<|im_end|>");
+        var options = ReasoningSupport.BuildTemplateOptions(null, null, null, null, constrained: false);
+        ChatMessage[] messages =
+        [
+            new ChatMessage { Role = "system", Content = "You are terse." },
+            new ChatMessage { Role = "user", Content = "Read the file." },
+            new ChatMessage { Role = "assistant", Content = "", ToolCalls = [new ToolCall("call_1", "read", "{\"path\":\"a.cs\"}")] },
+            new ChatMessage { Role = "tool", Content = "namespace A; class B {}", ToolCallId = "call_1" },
+        ];
+        Assert.True(ReasoningSupport.TryApply(template, messages, options, out string prompt, out _, out _));
+
+        string? savePoint = ReasoningSupport.SavePointPrefix(template, messages, options, prompt);
+
+        Assert.NotNull(savePoint);
+        Assert.StartsWith(savePoint, prompt, StringComparison.Ordinal);
+        Assert.Contains("Read the file.", savePoint, StringComparison.Ordinal);
+        Assert.DoesNotContain("namespace A", savePoint, StringComparison.Ordinal);
+        Assert.StartsWith("namespace A; class B {}", prompt[savePoint.Length..], StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void SavePointPrefix_IsNull_ForASingleMessage_OrWhenTheLastMessageIsNotTheUser()
     {
         var template = new JinjaChatTemplate(Fixture("qwen3-4b-instruct-2507-chat-template.jinja"), "<|endoftext|>", "<|im_end|>");

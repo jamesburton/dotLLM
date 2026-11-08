@@ -1065,8 +1065,10 @@ One rule, applied by every cache through `PrefixRetention` (`src/DotLLM.Engine/P
   equal-sized peers (a classifier's questions) still churn exactly as under LRU. Applied to `PrefixCache` and the single
   recurrent slot; the tiered and trie caches never destroy an entry on a hit, so they only need the eviction rule.
 - **Save point = conversation identity.** The server passes `InferenceOptions.SavePointPrefix`: the prompt up to the start of
-  the last user message's content (derived from a marked re-render, because on Qwen3 templates a head render is not a prefix
-  of the full one). A later request that shares everything before that message is the **same conversation** (a retry, an
+  the last *non-assistant* message's content, a user message or the tool result an agent loop ends with (derived from a marked
+  re-render, because on Qwen3 templates a head render is not a prefix of the full one). With a system prompt and one user
+  message the save point is the end of the system prompt, so any request with the same system prompt may destroy a one-turn
+  entry: by design, a one-turn entry is cheap to rebuild and the shared prefix is what both want. A later request that shares everything before that message is the **same conversation** (a retry, an
   edited or compacted last message, or a side request over the same history) and may resume destructively; one that shares
   less is another conversation and is protected. Without the hint (raw completions), sharing at least half of the entry stands
   in. The single slot also **checkpoints the recurrent state at the save point** (a step checkpoint: state bytes only, KV
