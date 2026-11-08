@@ -252,6 +252,7 @@ them) and min-max for dotLLM. LFM3 is a conv + sliding-window (256) + global-att
 
 - Quality: Q8_0 vs llama.cpp CPU on identical ids, mean KL 1.96e-3, top-1 98.24 %, PPL 25.9396 vs 25.9400 (section 5 method). After the #1572 patch (wikitext-2 LF, llama.cpp CPU `-dev none` oracle via `--kl-divergence-base`, `--tokens-file` WITHOUT `--bos` since LFM3 does not add BOS): Q8_0 ctx 2048 x 6 windows mean KL 1.68e-3 / top-1 98.26 % (patch off: 1.68e-3 / 98.27 %), ctx 8192 x 2 windows 1.29e-3 / 98.25 % (patch off 1.29e-3 / 98.28 %); Q4_K_M ctx 2048 x 6 windows 5.7e-3 / top-1 96.6 %.
 - The unpatched path lost the Vulkan device at -p 28672 (one-layer attention submit ~2.5 s); fixed by #1666.
+- **Update 2026-11-07, global-attention layers (PR #1687, issue #1572 remainder; dotLLM-only, INDICATIVE: box under heavy build load from ~10 sibling agents, no llama.cpp arm, single runs).** Global layers prefill on the GQA-grouped coopmat flash kernel (`DOTLLM_VK_LFM3_GLOBAL_GQA=0` restores the per-head kernel), and long prefills are sliced progressively (each slice sized at its own KV depth, 2x growth cap, attention cost scaled by depth beyond the fitted depth). GPU-timestamp stage profile at pp16384 (`DOTLLM_VULKAN_MOE_STAGE_PROFILE=1 DOTLLM_VK_STAGE_TS=1`): global attention 4966 ms of 8317 ms (60 %) with the per-head kernel vs 1044 ms of 4323 ms (24 %) with the GQA kernel; FFN (2221 ms, 51 %) is now the largest stage. Interleaved A/B pp16384 `-n 16` (old, new, old, new; second pair quoted): old 1657, new 2435 pp tok/s. Ladder (new, `-n 8|1`): pp28672 2554-3157, pp65536 1542-1804 (the #1672 ladder had 1261-1268 and 522); longest one-layer submit at 64K ~0.8 s (per-slice GPU totals), no device loss. Re-measure against llama.cpp in a quiet window (replay commands in PR #1687); tg rows not re-measured.
 
 
 ## 3. RTX 3060 12 GB, CUDA
@@ -344,6 +345,7 @@ indicative and the disturbed reps are shown, not dropped.
 - The architecture's context advantage shows on CPU too, but less than on Vulkan: both engines lose about half their decode rate by 32K,
   because the 6 global layers still read 32K keys per token.
 - Decode at depth uses `-p N` for dotLLM and `-d N` for llama.cpp (see 2.10).
+- **Update 2026-11-07 (PR #1687, issue #1570; INDICATIVE, box at ~84 % CPU from sibling builds).** Causal prefill attention over a long KV is blocked as KV head x 32-token row block x key tile (`Attention.ExecuteBlockedCausal`, bit-identical to the per-row kernel; `DOTLLM_CPU_ATTN_BLOCKED=0` restores it). In-process kernel timing, LFM3 shape, a 1024-token chunk, 32 threads: KV end 16384 per-row 2148-5185 ms vs blocked 509-774 ms; KV end 32768 per-row 5421-7953 ms vs blocked 1147-1462 ms (4-7x). Whole-forward pp8192 under that load: 129 vs 124 tok/s (noise; attention is a small share at 8K). The pp16384 / pp32768 and tg rows above are NOT re-measured; replay commands in PR #1687.
 
 ## 5. Quality parity
 

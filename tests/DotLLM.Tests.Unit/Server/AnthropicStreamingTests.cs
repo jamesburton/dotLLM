@@ -63,17 +63,7 @@ public sealed class AnthropicStreamingTests
     }
 
     private static SseFrame[] ParseSse(string raw)
-    {
-        var frames = new List<SseFrame>();
-        foreach (var block in raw.Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
-        {
-            var lines = block.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-            string name = lines[0]["event: ".Length..];
-            string data = lines[1]["data: ".Length..];
-            frames.Add(new SseFrame(name, JsonDocument.Parse(data).RootElement.Clone()));
-        }
-        return [.. frames];
-    }
+        => [.. SseTestReader.NamedJson(raw).Select(f => new SseFrame(f.Event, f.Data))];
 
     // --- Text-only stream ---------------------------------------------------
 

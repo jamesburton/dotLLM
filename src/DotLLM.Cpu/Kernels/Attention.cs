@@ -433,6 +433,12 @@ public static class Attention
             return;
         }
 
+        if (BlockedPrefillApplies(seqQ, seqKv, positionOffset, alibiSlopes, slidingWindowSize, softCap, maskMode, sinks))
+        {
+            ExecuteBlockedCausal(q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, scale, pool);
+            return;
+        }
+
         fixed (float* sinksPtr = sinks)
         {
             var ctx = new AttentionCtx
@@ -514,6 +520,194 @@ public static class Attention
         }
     }
 
+
+    // ──────────────────── Blocked causal prefill over long KV (#1570) ────────────────────
+
+    /// <summary>
+    /// Environment variable: <c>0</c> disables <see cref="ExecuteBlockedCausal"/> (the head-parallel per-row path runs instead; A/B).
+    /// </summary>
+    public const string BlockedPrefillEnvVar = "DOTLLM_CPU_ATTN_BLOCKED";
+
+    /// <summary>Runtime switch (tests, in-process A/B); initialised from <see cref="BlockedPrefillEnvVar"/>.</summary>
+    internal static bool BlockedPrefillEnabled = Environment.GetEnvironmentVariable(BlockedPrefillEnvVar) != "0";
+
+    /// <summary>Query tokens per work item; with GQA 16/4 that is 128 (token, head) rows sharing one K/V block.</summary>
+    internal const int BlockedRowsPerItem = 32;
+
+    /// <summary>Number of times <see cref="ExecuteBlockedCausal"/> ran (test and profiling hook).</summary>
+    public static long BlockedPrefillCount;
+
+    /// <summary>
+    /// Whether the blocked kernel serves a call: plain causal GQA attention (no ALiBi, soft-cap, sinks, mask variant or sliding
+    /// window) with at least one query row long enough to take the tiled online-softmax path. Shorter rows are one-shot in either
+    /// kernel, and windowed layers never exceed their window, so the per-row path is left untouched there.
+    /// </summary>
+    internal static unsafe bool BlockedPrefillApplies(int seqQ, int seqKv, int positionOffset, float* alibiSlopes, int? slidingWindowSize,
+                                                      float softCap, AttentionMaskMode maskMode, float[]? sinks)
+        => BlockedPrefillEnabled && seqQ > 1 && alibiSlopes is null && (slidingWindowSize ?? 0) <= 0 && softCap == 0f
+           && maskMode == AttentionMaskMode.Causal && sinks is null
+           && Math.Min(seqKv, positionOffset + seqQ) > OneShotMaxKeys;
+
+    private unsafe struct BlockedCausalCtx
+    {
+        public float* Q, K, V, Output;
+        public int SeqQ, SeqKv, NumHeads, NumKvHeads, HeadDim, GroupSize, QStride, KvStride, TileSize, PositionOffset, RowsPerItem, ItemsPerKvHead;
+        public float Scale;
+        /// <summary>Next work item (dynamic scheduling: late row blocks see more keys than early ones).</summary>
+        public int Next;
+    }
+
+    /// <summary>
+    /// Causal GQA prefill attention blocked as <c>(KV head) x (query-row block) x (key tile)</c> (issue #1570). A work item is one KV
+    /// head and <see cref="BlockedRowsPerItem"/> consecutive query tokens: all <c>groupSize</c> query heads of those tokens walk the
+    /// same key tiles, so one K/V tile (hd128: 2 x 128 KiB at the 256-key tile) is read from L2 by every row of the item instead of
+    /// being streamed from memory once per (head, row) as the per-row kernel does over a 32K history.
+    /// <para>
+    /// The arithmetic of every row is exactly that of the per-row kernel: rows whose visible length fits the one-shot bound take
+    /// <see cref="OneShotRow"/>; longer rows run <see cref="TiledRow"/>'s online softmax with the same tile size, the same tiles
+    /// (anchored at key 0, which is every causal row's visible start) and the same primitives in the same order, so the output is
+    /// bit-identical to the head-parallel path and the KV-length invariance of #525 is kept. Only the schedule differs: items are
+    /// handed out dynamically from the heaviest (last) row block, which also uses every thread where the per-head partition idled
+    /// <c>threads - numHeads</c> of them.
+    /// </para>
+    /// </summary>
+    [SkipLocalsInit]
+    internal static unsafe void ExecuteBlockedCausal(float* q, float* k, float* v, float* output,
+                                                     int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+                                                     int positionOffset, float scale, ComputeThreadPool pool)
+    {
+        int rowsPerItem = Math.Min(BlockedRowsPerItem, seqQ);
+        var ctx = new BlockedCausalCtx
+        {
+            Q = q, K = k, V = v, Output = output,
+            SeqQ = seqQ, SeqKv = seqKv, NumHeads = numHeads, NumKvHeads = numKvHeads, HeadDim = headDim,
+            GroupSize = numHeads / numKvHeads, QStride = numHeads * headDim, KvStride = numKvHeads * headDim,
+            TileSize = ComputeTileSize(headDim), PositionOffset = positionOffset, Scale = scale,
+            RowsPerItem = rowsPerItem, ItemsPerKvHead = (seqQ + rowsPerItem - 1) / rowsPerItem, Next = 0,
+        };
+        Interlocked.Increment(ref BlockedPrefillCount);
+        pool.Dispatch((nint)(&ctx), &BlockedCausalWorker);
+    }
+
+    [SkipLocalsInit]
+    private static unsafe void BlockedCausalWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<BlockedCausalCtx>((void*)ctxPtr);
+        int items = ctx.NumKvHeads * ctx.ItemsPerKvHead;
+        var qSpan = new ReadOnlySpan<float>(ctx.Q, ctx.SeqQ * ctx.QStride);
+        var kSpan = new ReadOnlySpan<float>(ctx.K, ctx.SeqKv * ctx.KvStride);
+        var vSpan = new ReadOnlySpan<float>(ctx.V, ctx.SeqKv * ctx.KvStride);
+        var outSpan = new Span<float>(ctx.Output, ctx.SeqQ * ctx.QStride);
+        Span<float> scratch = stackalloc float[OneShotMaxKeys];
+        Span<float> maxSoFar = stackalloc float[BlockedRowsPerItem * 64];   // (token, head) rows of one item; groupSize <= 64
+        Span<float> sumExp = stackalloc float[BlockedRowsPerItem * 64];
+        int G = ctx.GroupSize;
+        if (G > 64) throw new NotSupportedException("Blocked attention supports at most 64 query heads per KV head.");
+
+        while (true)
+        {
+            int item = Interlocked.Increment(ref ctx.Next) - 1;
+            if (item >= items) break;
+            // Heaviest first: the last row block of each KV head sees the longest causal range.
+            int kvHead = item % ctx.NumKvHeads;
+            int block = ctx.ItemsPerKvHead - 1 - item / ctx.NumKvHeads;
+            int t0 = block * ctx.RowsPerItem;
+            int t1 = Math.Min(ctx.SeqQ, t0 + ctx.RowsPerItem);
+            BlockedCausalItem(ref ctx, qSpan, kSpan, vSpan, outSpan, scratch, maxSoFar, sumExp, kvHead, t0, t1);
+        }
+    }
+
+    /// <summary>One work item: KV head <paramref name="kvHead"/>, query tokens <c>[t0, t1)</c>, all of its query heads.</summary>
+    private static void BlockedCausalItem(ref BlockedCausalCtx ctx, ReadOnlySpan<float> q, ReadOnlySpan<float> k, ReadOnlySpan<float> v,
+                                          Span<float> output, Span<float> scratch, Span<float> maxSoFar, Span<float> sumExp,
+                                          int kvHead, int t0, int t1)
+    {
+        int G = ctx.GroupSize, hd = ctx.HeadDim, qStride = ctx.QStride, kvStride = ctx.KvStride, tileSize = ctx.TileSize;
+        float scale = ctx.Scale;
+        int firstHead = kvHead * G;
+
+        // Rows short enough for the one-shot form run it exactly as the per-row kernel does; the rest start the online softmax.
+        int tiledFrom = t1;
+        for (int t = t0; t < t1; t++)
+        {
+            int qPos = ctx.PositionOffset + t;
+            int visibleEnd = Math.Min(ctx.SeqKv, qPos + 1);
+            if (visibleEnd <= 0) { for (int g = 0; g < G; g++) output.Slice(t * qStride + (firstHead + g) * hd, hd).Clear(); continue; }
+            if (visibleEnd > OneShotMaxKeys) { tiledFrom = t; break; }
+            for (int g = 0; g < G; g++)
+            {
+                int h = firstHead + g;
+                var outRow = output.Slice(t * qStride + h * hd, hd);
+                outRow.Clear();
+                OneShotRow(k, v, q.Slice(t * qStride + h * hd, hd), outRow, scratch.Slice(0, visibleEnd),
+                           qPos, 0, hd, scale, kvStride, kvHead, 0f, 0f, false, float.NegativeInfinity);
+            }
+        }
+        if (tiledFrom >= t1) return;
+
+        int rows = (t1 - tiledFrom) * G;
+        for (int r = 0; r < rows; r++)
+        {
+            maxSoFar[r] = float.NegativeInfinity;
+            sumExp[r] = 0f;
+            int t = tiledFrom + r / G, h = firstHead + r % G;
+            output.Slice(t * qStride + h * hd, hd).Clear();
+        }
+
+        // Key tiles anchored at 0 (= every causal row's visible start), the per-row kernel's tile grid.
+        int blockEnd = Math.Min(ctx.SeqKv, ctx.PositionOffset + t1);
+        var tileScores = scratch.Slice(0, tileSize);
+        for (int tileBase = 0; tileBase < blockEnd; tileBase += tileSize)
+        {
+            for (int r = 0; r < rows; r++)
+            {
+                int t = tiledFrom + r / G, h = firstHead + r % G;
+                int qPos = ctx.PositionOffset + t;
+                int visibleEnd = Math.Min(ctx.SeqKv, qPos + 1);
+                int tileLen = Math.Min(tileSize, visibleEnd - tileBase);
+                if (tileLen <= 0) continue;   // this row's causal range ended before the tile: TiledRow would have no such tile
+                var qRow = q.Slice(t * qStride + h * hd, hd);
+                var outRow = output.Slice(t * qStride + h * hd, hd);
+                var scores = tileScores.Slice(0, tileLen);
+
+                for (int j = 0; j < tileLen; j++)
+                {
+                    var kRow = k.Slice((tileBase + j) * kvStride + kvHead * hd, hd);
+                    // TiledRow subtracts `0f * (qPos - key)` here (ALiBi slope 0): x - (+0.0) is x for every x, so dropping it is exact.
+                    scores[j] = TensorPrimitives.Dot(qRow, kRow) * scale;
+                }
+
+                float tileMax = TensorPrimitives.Max(scores);
+                float newMax = MathF.Max(maxSoFar[r], tileMax);
+                float correction = FastMath.FastExp(maxSoFar[r] - newMax);
+                if (correction < 1f)
+                {
+                    sumExp[r] *= correction;
+                    TensorPrimitives.Multiply(outRow, correction, outRow);
+                }
+                sumExp[r] += FastMath.ExpSumAndStore(scores, scores, -newMax);
+
+                for (int j = 0; j < tileLen; j++)
+                {
+                    float w = scores[j];
+                    if (w == 0f) continue;
+                    var vRow = v.Slice((tileBase + j) * kvStride + kvHead * hd, hd);
+                    TensorPrimitives.MultiplyAdd(vRow, w, outRow, outRow);
+                }
+                maxSoFar[r] = newMax;
+            }
+        }
+
+        for (int r = 0; r < rows; r++)
+        {
+            if (sumExp[r] > 0f)
+            {
+                int t = tiledFrom + r / G, h = firstHead + r % G;
+                var outRow = output.Slice(t * qStride + h * hd, hd);
+                TensorPrimitives.Multiply(outRow, 1f / sumExp[r], outRow);
+            }
+        }
+    }
 
     // ──────────────────── Bidirectional encoder attention (#1402) ────────────────────
 

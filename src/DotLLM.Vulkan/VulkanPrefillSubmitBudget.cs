@@ -47,6 +47,9 @@ internal sealed class VulkanPrefillSubmitBudget
     /// <summary>Smallest row slice <see cref="RowsPerForward"/> produces.</summary>
     internal const int MinRowsPerForward = 64;
 
+    /// <summary>Largest ratio between consecutive progressive slices (<see cref="NextSliceRows"/>).</summary>
+    internal const int MaxSliceGrowth = 2;
+
     /// <summary>
     /// Scale of the prior pseudo-observations, GFLOP: small next to one prefill submission's work (hundreds to thousands of GFLOP),
     /// so observed work outweighs the prior within a submission or two, while a kind of work seen only in trace amounts stays near
@@ -59,6 +62,21 @@ internal sealed class VulkanPrefillSubmitBudget
     private const double Forget = 0.9;
 
     private double _sDD, _sDA, _sAA, _sDT, _sAT;
+    private double _sA, _sAK;   // forgetting-weighted attention work and work x mean KV depth: the depth the attention rate was fitted at
+
+    /// <summary>
+    /// Mean KV depth (work-weighted, with forgetting) of the attention submissions the current attention rate was fitted on; 0 until an
+    /// observation carried a depth. Attention costs per GFLOP more as the history outgrows the caches (Strix, GQA flash, hd128:
+    /// 0.51 / 0.75 / 1.18 / 1.19 x 1e-8 s per FLOP at mean KV ~9K / 21K / 39K / 53K), so an estimate for a deeper slice than the fit
+    /// saw scales the attention term by the depth ratio (<see cref="DepthFactor"/>); past the saturation this is conservative.
+    /// </summary>
+    public double FittedAttentionMeanKv => _sA > 0 ? _sAK / _sA : 0;
+
+    /// <summary>Attention-cost multiplier for a slice whose mean KV depth is <paramref name="meanKv"/>: at least 1, the ratio to the fitted depth.</summary>
+    /// <param name="meanKv">Mean KV depth of the slice being costed.</param>
+    /// <returns>Multiplier (>= 1).</returns>
+    public double DepthFactor(double meanKv)
+        => FittedAttentionMeanKv > 0 && meanKv > FittedAttentionMeanKv ? meanKv / FittedAttentionMeanKv : 1.0;
 
     /// <summary>Creates a budget.</summary>
     /// <param name="budgetSeconds">Target GPU time per submission.</param>
@@ -180,13 +198,54 @@ internal sealed class VulkanPrefillSubmitBudget
     }
 
     /// <summary>
+    /// Rows of the next slice of a prefill whose remaining <paramref name="remainingRows"/> rows start at KV length
+    /// <paramref name="kvStart"/>: the largest multiple of <see cref="MinRowsPerForward"/> whose one attention layer, costed at the
+    /// slice's own KV end (<c>kvStart + rows</c>), fits the budget; all remaining rows when they do. Unlike <see cref="RowsPerForward"/>
+    /// (one size for every slice, costed at the forward's final depth) this lets the shallow early slices be long and only the deep
+    /// tail short, and a caller that calls it per slice gets the rates as refitted by the slices already run (issue #1572: the uniform
+    /// sizing made a 28K prefill 25 % slower than an unsliced 24K one).
+    /// </summary>
+    /// <param name="remainingRows">Rows not yet run.</param>
+    /// <param name="kvStart">KV length before the slice.</param>
+    /// <param name="paramsPerLayer">Weight elements of one layer.</param>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="headDim">Head dimension.</param>
+    /// <param name="previousRows">Rows of the slice just run (0 for the first): the next slice is capped at <see cref="MaxSliceGrowth"/>
+    /// times it, so the attention rate is refitted on a deeper slice before the sizing extrapolates far past what it was fitted on
+    /// (rates learnt from two shallow slices sized a 24576-row third slice whose one-layer submits ran ~1.4 s on Strix).</param>
+    /// <returns>Rows for the next slice (1 .. <paramref name="remainingRows"/>).</returns>
+    public int NextSliceRows(int remainingRows, int kvStart, double paramsPerLayer, int numHeads, int headDim, int previousRows = 0)
+    {
+        int cap = previousRows > 0 ? Math.Max(MinRowsPerForward, (MaxSliceGrowth * previousRows / MinRowsPerForward) * MinRowsPerForward) : int.MaxValue;
+        if (remainingRows <= MinRowsPerForward || (remainingRows <= cap && LayerSeconds(remainingRows) <= BudgetSeconds)) return remainingRows;
+        int best = MinRowsPerForward;
+        for (int r = 2 * MinRowsPerForward; r < remainingRows && r <= cap; r += MinRowsPerForward)
+        {
+            if (LayerSeconds(r) > BudgetSeconds) break;
+            best = r;
+        }
+        // A short tail would pay the fixed per-forward cost for little work: fold it into this slice when the estimate still fits.
+        int tail = remainingRows - best;
+        if (tail > 0 && tail < MinRowsPerForward && remainingRows <= cap && LayerSeconds(remainingRows) <= 1.25 * BudgetSeconds) return remainingRows;
+        return best;
+
+        double LayerSeconds(int r)
+        {
+            int er = EffectiveRows(r);
+            double meanKv = Math.Max(1.0, kvStart + r - ((er - 1) / 2.0));
+            return EstimateSeconds(DenseGflops(paramsPerLayer, er), AttentionGflops(er, kvStart + r, numHeads, headDim) * DepthFactor(meanKv));
+        }
+    }
+
+    /// <summary>
     /// Feeds back one submission's measured wall time and refits both rates (least squares with forgetting, anchored by the priors).
     /// Non-positive or non-finite input is ignored.
     /// </summary>
     /// <param name="denseGflops">Dense work the submission held.</param>
     /// <param name="attentionGflops">Attention work the submission held.</param>
     /// <param name="seconds">Measured wall time of the submission.</param>
-    public void Observe(double denseGflops, double attentionGflops, double seconds)
+    /// <param name="attentionMeanKv">Mean KV depth of the attention work (0 = unknown; then the depth is not tracked).</param>
+    public void Observe(double denseGflops, double attentionGflops, double seconds, double attentionMeanKv = 0)
     {
         if (!(seconds > 0) || !double.IsFinite(seconds) || !(denseGflops >= 0) || !(attentionGflops >= 0)
             || denseGflops + attentionGflops <= 0)
@@ -199,6 +258,11 @@ internal sealed class VulkanPrefillSubmitBudget
         _sAT = (_sAT * Forget) + (attentionGflops * seconds);
         Observations++;
         if (seconds > LongestObservedSeconds) LongestObservedSeconds = seconds;
+        if (attentionGflops > 0 && attentionMeanKv > 0)
+        {
+            _sA = (_sA * Forget) + attentionGflops;
+            _sAK = (_sAK * Forget) + (attentionGflops * attentionMeanKv);
+        }
 
         // The priors as two fixed pseudo-observations: (PriorGflops, 0) and (0, PriorGflops) at the prior rates.
         double p2 = PriorGflops * PriorGflops;

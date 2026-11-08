@@ -35,6 +35,46 @@ public sealed class PrefixTrieTests
         return blocks;
     }
 
+    [Theory]
+    [InlineData(PrefixCachePolicy.Lru)]
+    [InlineData(PrefixCachePolicy.Agent)]
+    public void Eviction_Agent_ReclaimsTheShortPathFirst_Lru_TheOlderLeaf(PrefixCachePolicy policy)
+    {
+        // Issue #1654. A 16-token conversation (4 blocks) is inserted, then a 4-token side request (1 block). Both leaves have
+        // zero refs. An unrelated 8-token lookup advances the clock. LRU evicts the conversation's tail (touched first); the
+        // agent policy evicts the side request's block: 8 tokens is 2x its length but half the conversation's.
+        using var pool = CreatePool();
+        var trie = new PrefixTrie(pool, policy: policy);
+        int[] conversation = MakePrompt(1, 16), side = MakePrompt(2, 4);
+        var conversationBlocks = AllocateAndInsert(trie, pool, conversation);
+        var sideBlocks = AllocateAndInsert(trie, pool, side);
+        trie.Lookup(MakePrompt(3, 8), new List<int>());
+
+        int evicted = trie.EvictOneLru();
+
+        Assert.Equal(policy == PrefixCachePolicy.Agent ? sideBlocks[0] : conversationBlocks[^1], evicted);
+        Assert.Equal(8, trie.TokenClock);
+    }
+
+    [Fact]
+    public void Eviction_Agent_AHitRefreshesTheLeafsClock()
+    {
+        // Same shape, but the side request is looked up (and released) after the unrelated lookup: its leaf is now fresh (age 0)
+        // while the conversation's tail is 12 tokens over 16 (0.75), so the conversation's tail goes.
+        using var pool = CreatePool();
+        var trie = new PrefixTrie(pool, policy: PrefixCachePolicy.Agent);
+        int[] conversation = MakePrompt(1, 16), side = MakePrompt(2, 4);
+        var conversationBlocks = AllocateAndInsert(trie, pool, conversation);
+        AllocateAndInsert(trie, pool, side);
+        trie.Lookup(MakePrompt(3, 8), new List<int>());
+        var matched = new List<int>();
+        Assert.Equal(4, trie.Lookup(side, matched));
+        trie.Release(matched);
+
+        Assert.Equal(conversationBlocks[^1], trie.EvictOneLru());
+        Assert.Equal(12, trie.TokenClock);   // 8 unrelated + the 4-token side lookup
+    }
+
     [Fact]
     public void Lookup_EmptyTrie_ReturnsZero()
     {

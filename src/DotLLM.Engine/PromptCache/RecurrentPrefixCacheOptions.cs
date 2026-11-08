@@ -26,6 +26,15 @@ public sealed record RecurrentPrefixCacheOptions
 
     /// <summary>Byte cap over the retained step checkpoints. 0 (default) leaves <see cref="MaxStepCheckpoints"/> as the only bound.</summary>
     public long StepBudgetBytes { get; init; }
+
+    /// <summary>
+    /// Retention policy (issue #1654). <see cref="PrefixCachePolicy.Lru"/> keeps the pre-#1654 behaviour. With
+    /// <see cref="PrefixCachePolicy.Agent"/>: the single slot keeps its conversation while unexpired (a request outside it runs
+    /// cold rather than replacing or truncating it), checkpoints the recurrent state at the conversation's save point
+    /// (<see cref="Core.Configuration.InferenceOptions.SavePointPrefix"/>) and at the end of each request's reply so the next turn
+    /// skips the reply too; the multi-slot tiers evict the entry oldest relative to its own length instead of the LRU.
+    /// </summary>
+    public PrefixCachePolicy Policy { get; init; } = PrefixCachePolicy.Lru;
 }
 
 /// <summary>Recurrent prefix cache occupancy and lifetime counters.</summary>
@@ -67,4 +76,11 @@ public sealed record RecurrentPrefixCacheStatistics
     public int StepCheckpoints { get; init; }
     /// <summary>Bytes held by the retained step checkpoints.</summary>
     public long StepCheckpointBytes { get; init; }
+    /// <summary>The retention policy in force (issue #1654); null when the producer did not say (serialized DTO: no initializer).</summary>
+    public string? Policy { get; init; }
+    /// <summary>
+    /// Requests that would have replaced or truncated an unexpired entry of another conversation and ran cold instead
+    /// (<see cref="PrefixCachePolicy.Agent"/>, issue #1654). Counted among <see cref="Misses"/> too.
+    /// </summary>
+    public long ProtectedMisses { get; init; }
 }

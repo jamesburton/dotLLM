@@ -58,13 +58,15 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
     /// <see cref="QuantizationType.Q4_1"/> (20 B blocks, issue #1171: same kernel shape, value <c>d * nibble + m</c>).</summary>
     public QuantizationType Quant { get; private init; } = QuantizationType.Q4_0;
 
-    private int BlockBytes => Quant == QuantizationType.Q4_1 ? QuantFormat.Q4_1BlockBytes : QuantFormat.Q4_0BlockBytes;
+    private int BlockBytes => Quant switch { QuantizationType.Q4_1 => QuantFormat.Q4_1BlockBytes, QuantizationType.Q5_1 => QuantFormat.Q5_1BlockBytes, _ => QuantFormat.Q4_0BlockBytes };
 
+    // Q5_1 (#1613): matmul_q5_1_f32_gemm_coopmat_128x128x4 (24-byte blocks, value d * code + m); no 64x64 twin ships for it.
     private static string ShaderFor(string q4_0Name, QuantizationType quant) => quant switch
     {
         QuantizationType.Q4_0 => q4_0Name,
         QuantizationType.Q4_1 => q4_0Name.Replace("q4_0", "q4_1", StringComparison.Ordinal),
-        _ => throw new ArgumentOutOfRangeException(nameof(quant), quant, "Only Q4_0 and Q4_1 are served by this kernel."),
+        QuantizationType.Q5_1 => q4_0Name.Replace("q4_0", "q5_1", StringComparison.Ordinal),
+        _ => throw new ArgumentOutOfRangeException(nameof(quant), quant, "Only Q4_0, Q4_1 and Q5_1 are served by this kernel."),
     };
 
     private MatMulQ4_0GemmCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)

@@ -23,10 +23,11 @@ public sealed class Glm4MoeVulkanParityTests : IDisposable
     public Glm4MoeVulkanParityTests() => Directory.CreateDirectory(_scratch);
     public void Dispose() { try { Directory.Delete(_scratch, true); } catch { } }
 
-    private string Write(int experts, bool nextn, int headDim, bool asF32 = false)
+    private string Write(int experts, bool nextn, int headDim, bool asF32 = false, int sharedExperts = SyntheticGlm4MoeGguf.SharedExperts)
     {
-        string p = Path.Combine(_scratch, $"m{experts}_{headDim}_{nextn}_{asF32}.gguf");
-        File.WriteAllBytes(p, SyntheticGlm4MoeGguf.Build(numExperts: experts, withNextn: nextn, headDim: headDim, q8Weights: true, q8AsF32: asF32));
+        string p = Path.Combine(_scratch, $"m{experts}_{headDim}_{nextn}_{asF32}_s{sharedExperts}.gguf");
+        File.WriteAllBytes(p, SyntheticGlm4MoeGguf.Build(numExperts: experts, withNextn: nextn, headDim: headDim, q8Weights: true, q8AsF32: asF32,
+            sharedExperts: sharedExperts));
         return p;
     }
 
@@ -101,6 +102,54 @@ public sealed class Glm4MoeVulkanParityTests : IDisposable
         float scale = cpu.Max(MathF.Abs);
         Console.WriteLine($"glm4moe vk-vs-cpu max diff {d} (logit scale {scale}) chunks [{string.Join(',', chunks)}] experts {experts} hd {headDim}");
         Assert.True(d < Tol, $"max |vulkan - cpu| = {d} (chunks [{string.Join(',', chunks)}], experts {experts}, hd {headDim})");
+    }
+
+    private static float[] VkDecode(GgufFile gguf, ModelConfig cfg, string spvDir, bool fused, out long fusedLayers)
+    {
+        bool saved = VulkanTransformerModel.MoeDecodeFusedEnabled;
+        VulkanTransformerModel.MoeDecodeFusedEnabled = fused;
+        try
+        {
+            using var device = VulkanDevice.Create();
+            using var model = VulkanTransformerModel.LoadFromGguf(device, gguf, cfg, spvDir);
+            using var cache = model.CreateKvCache(64);
+            var all = new List<float>();
+            for (int i = 0; i < Ids.Length; i++)
+            {
+                using ITensor t = model.Forward(Ids.AsSpan(i, 1), [i], deviceId: -1, cache);
+                all.AddRange(Copy(t));
+            }
+            fusedLayers = model.GenericMoeDecodeFusedCount;
+            return all.ToArray();
+        }
+        finally { VulkanTransformerModel.MoeDecodeFusedEnabled = saved; }
+    }
+
+    /// <summary>
+    /// #1614: the fused single-token MoE decode chain on glm4moe (one shared expert, like GLM-4.5-Air). Every 1-row step of every MoE layer must
+    /// take the fused chain (the counter is asserted, so a silent fall-back to <c>RecordMoeLayer</c> fails), its logits must match the CPU
+    /// reference within the parity tolerance, and the fused and unfused chains must agree with each other far inside that tolerance (same
+    /// kernels, different schedule: the only admissible difference is the shared-expert quantiser variant and summation order).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(8, 16)]
+    [InlineData(6, 128)]   // pruned expert count + Air head geometry
+    public void DecodeFused_Matches_Cpu_And_Unfused(int experts, int headDim)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var gguf = GgufFile.Open(Write(experts, nextn: true, headDim: headDim, sharedExperts: 1));
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        Assert.Equal(1, cfg.Moe!.NumSharedExperts);
+        float[] cpu = Cpu(gguf, cfg);
+        float[] fused = VkDecode(gguf, cfg, spvDir, fused: true, out long fusedLayers);
+        float[] plain = VkDecode(gguf, cfg, spvDir, fused: false, out long plainLayers);
+        int moeLayers = SyntheticGlm4MoeGguf.DefaultTrunkLayers - SyntheticGlm4MoeGguf.LeadingDense;
+        Assert.Equal(moeLayers * Ids.Length, fusedLayers);
+        Assert.Equal(0, plainLayers);
+        float dCpu = MaxAbs(cpu, fused), dPlain = MaxAbs(plain, fused), dPlainCpu = MaxAbs(cpu, plain);
+        Console.WriteLine($"glm4moe fused decode: fused layers {fusedLayers}; max |fused - cpu| {dCpu}, |unfused - cpu| {dPlainCpu}, |fused - unfused| {dPlain} (logit scale {cpu.Max(MathF.Abs)})");
+        Assert.True(dCpu < Tol, $"fused decode vs CPU {dCpu}");
+        Assert.True(dPlain < Tol / 10, $"fused vs unfused decode differ by {dPlain}; the chains should share kernels and only differ in schedule");
     }
 
     /// <summary>

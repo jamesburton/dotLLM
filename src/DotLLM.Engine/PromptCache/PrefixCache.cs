@@ -4,27 +4,56 @@ using DotLLM.Core.Attention;
 namespace DotLLM.Engine.PromptCache;
 
 /// <summary>
-/// LRU cache of prefix-matched KV-cache sessions for multi-turn conversations.
+/// Cache of prefix-matched KV-cache sessions for multi-turn conversations.
 /// Stores live KV-cache instances with their associated token sequences.
 /// On each generation call, finds the longest matching prefix to skip redundant prefill.
 /// </summary>
+/// <remarks>
+/// A hit hands the entry's live KV to the request, which truncates it to the match and overwrites the rows past it, so a hit
+/// on part of an entry destroys the rest. Under <see cref="PrefixCachePolicy.Lru"/> that is always allowed and a full cache
+/// evicts its least recently used entry. Under <see cref="PrefixCachePolicy.Agent"/> (#1654) an entry is protected from
+/// partial hits by requests outside its conversation until about its own length of other prompt tokens has been read, and
+/// eviction picks the entry oldest relative to its own length (<see cref="PrefixRetention"/>).
+/// </remarks>
 public sealed class PrefixCache : IDisposable
 {
     private readonly int _maxEntries;
     private readonly List<PrefixCacheEntry> _entries;
+    private readonly PrefixCachePolicy _policy;
+    private long _clock, _hits, _misses, _protectedMisses;
     private bool _disposed;
 
     /// <summary>Number of cached entries.</summary>
     public int EntryCount => _entries.Count;
 
+    /// <summary>The retention policy in force.</summary>
+    public PrefixCachePolicy Policy => _policy;
+
+    /// <summary>Lookups that found a reusable entry.</summary>
+    public long Hits => _hits;
+
+    /// <summary>Lookups that found no reusable entry.</summary>
+    public long Misses => _misses;
+
+    /// <summary>
+    /// Lookups that would have hit, destroying an unexpired entry of another conversation, and were made to miss by
+    /// <see cref="PrefixCachePolicy.Agent"/>. The protected entry stays for its own conversation's next turn.
+    /// </summary>
+    public long ProtectedMisses => _protectedMisses;
+
+    /// <summary>Prompt tokens this cache has been asked about: the token clock the own-length rule is measured on.</summary>
+    public long TokenClock => _clock;
+
     /// <summary>
     /// Creates a new prefix cache with the given maximum number of entries.
     /// </summary>
-    /// <param name="maxEntries">Maximum cached sessions. When full, LRU entry is evicted.</param>
-    public PrefixCache(int maxEntries = 4)
+    /// <param name="maxEntries">Maximum cached sessions. When full, an entry is evicted per <paramref name="policy"/>.</param>
+    /// <param name="policy">The retention policy (default <see cref="PrefixCachePolicy.Lru"/>, the pre-#1654 behaviour).</param>
+    public PrefixCache(int maxEntries = 4, PrefixCachePolicy policy = PrefixCachePolicy.Lru)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxEntries, 1);
         _maxEntries = maxEntries;
+        _policy = policy;
         _entries = new List<PrefixCacheEntry>(maxEntries);
     }
 
@@ -43,29 +72,49 @@ public sealed class PrefixCache : IDisposable
     /// reported in <paramref name="approxRowsReused"/>; <c>cached_tokens</c> counts only
     /// <c>MatchedTokens - approxRowsReused</c>.
     /// </summary>
+    /// <remarks>
+    /// Advances the token clock by the prompt's length. Under <see cref="PrefixCachePolicy.Agent"/> an entry that the prompt
+    /// would truncate, that belongs to another conversation and that has not expired is skipped
+    /// (<see cref="PrefixRetention.Protects"/>); the next-best entry, or a miss, is returned instead (#1654).
+    /// </remarks>
     internal (PrefixCacheEntry? Entry, int MatchedTokens) FindMatch(
         ReadOnlySpan<int> promptTokenIds, bool allowApprox, out int approxRowsReused)
     {
+        _clock += promptTokenIds.Length;
         PrefixCacheEntry? bestEntry = null;
         int bestMatch = 0;
+        bool protectedSome = false;
         approxRowsReused = 0;
 
         for (int i = 0; i < _entries.Count; i++)
         {
-            int match = _entries[i].GetPrefixMatchLength(promptTokenIds, allowApprox);
+            var entry = _entries[i];
+            int match = entry.GetPrefixMatchLength(promptTokenIds, allowApprox);
             // Longest match wins; on a tie, the entry with more exact rows (as the trie prefers exact children).
             if (match > bestMatch || (match == bestMatch && bestEntry is not null
-                && _entries[i].ApproxRowsIn(match) < bestEntry.ApproxRowsIn(bestMatch)))
+                && entry.ApproxRowsIn(match) < bestEntry.ApproxRowsIn(bestMatch)))
             {
+                if (PrefixRetention.Protects(_policy, _clock, entry.LastUseClock, entry.TokenSequence.Length, match, entry.SavePoint))
+                {
+                    protectedSome = true;
+                    continue;
+                }
                 bestMatch = match;
-                bestEntry = _entries[i];
+                bestEntry = entry;
             }
         }
 
         if (bestEntry != null)
         {
             bestEntry.LastAccessTicks = Stopwatch.GetTimestamp();
+            bestEntry.LastUseClock = _clock;
             approxRowsReused = bestEntry.ApproxRowsIn(bestMatch);
+            _hits++;
+        }
+        else
+        {
+            _misses++;
+            if (protectedSome) _protectedMisses++;
         }
 
         return (bestEntry, bestMatch);
@@ -83,7 +132,9 @@ public sealed class PrefixCache : IDisposable
     /// approximate rows (<c>allowApprox</c>) must pass the restored entry's first approximate row (or
     /// the first row it assembled itself, whichever is lower): every row after it attended to
     /// approximate K/V.</param>
-    internal void Store(int[] tokenSequence, IKvCache kvCache, int? firstApproxRow = null)
+    /// <param name="savePoint">The start of the request's last user message within <paramref name="tokenSequence"/>, or -1:
+    /// the boundary below which a later request still counts as the same conversation (#1654).</param>
+    internal void Store(int[] tokenSequence, IKvCache kvCache, int? firstApproxRow = null, int savePoint = -1)
     {
         if (firstApproxRow is < 0)
             throw new ArgumentOutOfRangeException(nameof(firstApproxRow));
@@ -97,28 +148,23 @@ public sealed class PrefixCache : IDisposable
                 _entries[i].TokenSequence = tokenSequence;
                 _entries[i].FirstApproxRow = firstApproxRow;
                 _entries[i].LastAccessTicks = Stopwatch.GetTimestamp();
+                _entries[i].LastUseClock = _clock;
+                _entries[i].SavePoint = savePoint;
                 return;
             }
         }
 
-        // Evict LRU if at capacity
+        // Evict if at capacity: LRU, or the entry oldest relative to its own length (#1654).
         if (_entries.Count >= _maxEntries)
         {
-            int lruIdx = 0;
-            long lruTicks = _entries[0].LastAccessTicks;
-            for (int i = 1; i < _entries.Count; i++)
-            {
-                if (_entries[i].LastAccessTicks < lruTicks)
-                {
-                    lruTicks = _entries[i].LastAccessTicks;
-                    lruIdx = i;
-                }
-            }
-            _entries[lruIdx].Dispose();
-            _entries.RemoveAt(lruIdx);
+            int victim = _policy == PrefixCachePolicy.Agent
+                ? PrefixRetention.SelectVictim(_entries, e => e.LastUseClock, e => e.TokenSequence.Length, _clock, _policy)
+                : PrefixRetention.SelectVictim(_entries, e => e.LastAccessTicks, e => e.TokenSequence.Length, _clock, _policy);
+            _entries[victim].Dispose();
+            _entries.RemoveAt(victim);
         }
 
-        _entries.Add(new PrefixCacheEntry(tokenSequence, kvCache, firstApproxRow));
+        _entries.Add(new PrefixCacheEntry(tokenSequence, kvCache, firstApproxRow) { LastUseClock = _clock, SavePoint = savePoint });
     }
 
     /// <summary>

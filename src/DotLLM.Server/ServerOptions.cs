@@ -64,6 +64,30 @@ public sealed record ServerOptions
     /// <summary>Maximum number of cached sessions for prompt caching.</summary>
     public int PromptCacheSize { get; init; } = 4;
 
+    /// <summary>
+    /// Prefix-cache retention policy (issue #1654): <see cref="PrefixCachePolicy.Lru"/> (default) or
+    /// <see cref="PrefixCachePolicy.Agent"/> (own-length eviction, protected conversations, save-point and end-of-reply
+    /// checkpoints). Applies to every prefix cache the server builds: the live-KV cache, the paged trie, the recurrent snapshot
+    /// tiers and the scheduler's recurrent entries. CLI <c>--prompt-cache-policy</c>; environment <c>DOTLLM_PREFIX_POLICY</c>.
+    /// </summary>
+    public PrefixCachePolicy PromptCachePolicy { get; init; } = PrefixCachePolicy.Lru;
+
+    /// <summary>Environment variable that selects <see cref="PromptCachePolicy"/> when the CLI does not.</summary>
+    public const string PromptCachePolicyEnvVar = "DOTLLM_PREFIX_POLICY";
+
+    /// <summary>Parses <c>lru</c> / <c>agent</c> (case-insensitive); null or empty falls back to the environment, then to LRU.</summary>
+    public static PrefixCachePolicy ParsePromptCachePolicy(string? value)
+    {
+        value = string.IsNullOrWhiteSpace(value) ? Environment.GetEnvironmentVariable(PromptCachePolicyEnvVar) : value;
+        if (string.IsNullOrWhiteSpace(value)) return PrefixCachePolicy.Lru;
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "lru" => PrefixCachePolicy.Lru,
+            "agent" => PrefixCachePolicy.Agent,
+            _ => throw new ArgumentException($"--prompt-cache-policy: unknown value '{value}'. Expected: lru, agent."),
+        };
+    }
+
     /// <summary>Maximum recurrent prefix snapshots. Null preserves the single-slot default.</summary>
     public int? PrefixSnapshots { get; init; }
 
@@ -104,15 +128,17 @@ public sealed record ServerOptions
         }
         return new() { MaxEntries = count, HostBudgetBytes = PrefixSnapshotHostBudgetBytes,
             DiskDirectory = directory, DiskBudgetBytes = PrefixSnapshotDiskBudgetBytes,
-            StepTokens = PromptCacheStep, MaxStepCheckpoints = PromptCacheStepKeep ?? new RecurrentPrefixCacheOptions().MaxStepCheckpoints };
+            StepTokens = PromptCacheStep, MaxStepCheckpoints = PromptCacheStepKeep ?? new RecurrentPrefixCacheOptions().MaxStepCheckpoints,
+            Policy = PromptCachePolicy };
     }
 
     /// <summary>Resolves CLI count and human-readable host byte budget before loading a model.</summary>
     public static RecurrentPrefixCacheOptions BuildPrefixSnapshotOptions(int? count, string? hostBudget,
-        string? diskDirectory = null, string? diskBudget = null, int step = 0, int? stepKeep = null)
+        string? diskDirectory = null, string? diskBudget = null, int step = 0, int? stepKeep = null,
+        PrefixCachePolicy policy = PrefixCachePolicy.Lru)
         => new ServerOptions { Model = "", PrefixSnapshots = count, PrefixSnapshotHostBudgetBytes = ParsePrefixSnapshotHostBudget(hostBudget),
             PrefixSnapshotDiskDirectory = diskDirectory, PrefixSnapshotDiskBudgetBytes = ParsePrefixSnapshotDiskBudget(diskBudget),
-            PromptCacheStep = step, PromptCacheStepKeep = stepKeep }
+            PromptCacheStep = step, PromptCacheStepKeep = stepKeep, PromptCachePolicy = policy }
             .GetPrefixSnapshotOptions();
 
     /// <summary>Parses nonnegative bytes or decimal/binary units, for example 8000000, 8GB or 8GiB.</summary>
@@ -440,6 +466,7 @@ public sealed record ServerOptions
         string? cacheTypeV = null;
         bool promptCacheEnabled = true;
         int promptCacheSize = 4;
+        string? promptCachePolicy = null;
         int? prefixSnapshots = null;
         string? prefixSnapshotHostBudget = null;
         string? prefixSnapshotDiskDirectory = null, prefixSnapshotDiskBudget = null;
@@ -529,6 +556,8 @@ public sealed record ServerOptions
                     promptCacheEnabled = false; break;
                 case "--prompt-cache-size":
                     promptCacheSize = int.Parse(next!); i++; break;
+                case "--prompt-cache-policy":
+                    promptCachePolicy = next ?? throw new ArgumentException("--prompt-cache-policy requires lru or agent."); i++; break;
                 case "--no-paged":
                     usePaged = false; break;
                 case "--warmup":
@@ -655,6 +684,7 @@ public sealed record ServerOptions
             StartupCacheTypeV = cacheTypeV,
             PromptCacheEnabled = promptCacheEnabled,
             PromptCacheSize = promptCacheSize,
+            PromptCachePolicy = ParsePromptCachePolicy(promptCachePolicy),
             PrefixSnapshots = snapshotOptions.MaxEntries,
             PrefixSnapshotHostBudgetBytes = snapshotOptions.HostBudgetBytes,
             PrefixSnapshotDiskDirectory = snapshotOptions.DiskDirectory,

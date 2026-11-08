@@ -61,6 +61,9 @@ public sealed record SyntheticGraniteConfig
     public float NormEps { get; init; } = 1e-5f;
     /// <summary>PRNG seed.</summary>
     public uint Seed { get; init; } = 0x6A41u;
+    /// <summary>Uniform half-range of the Q and K projection weights. The default (0.5) gives near-uniform attention, which hides a wrong
+    /// score scale; raise it (e.g. 2) for a fixture whose softmax is sharp enough to be sensitive to the attention multiplier.</summary>
+    public float QkWeightScale { get; init; } = 0.5f;
 
     /// <summary>True for the MoE variant.</summary>
     public bool IsMoe => Arch is "granitemoe" or "olmoe" or "qwen2moe";
@@ -161,8 +164,8 @@ public static class SyntheticGraniteGguf
             layers[l] = new Layer
             {
                 AttnNorm = Norm(cfg.Hidden),
-                Q = Mat((long)qDim * cfg.Hidden, 0.5f),
-                K = Mat((long)kvDim * cfg.Hidden, 0.5f),
+                Q = Mat((long)qDim * cfg.Hidden, cfg.QkWeightScale),
+                K = Mat((long)kvDim * cfg.Hidden, cfg.QkWeightScale),
                 V = Mat((long)kvDim * cfg.Hidden, 0.5f),
                 O = Mat((long)cfg.Hidden * qDim, 0.4f),
                 FfnNorm = Norm(cfg.Hidden),

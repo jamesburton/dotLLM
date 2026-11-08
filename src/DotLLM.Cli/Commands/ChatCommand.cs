@@ -250,6 +250,11 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [DefaultValue(1)]
         public int PromptCacheSize { get; set; } = 1;
 
+        /// <summary>Prefix-cache retention policy (issue #1654).</summary>
+        [CommandOption("--prompt-cache-policy")]
+        [Description("Prefix-cache retention policy: lru (default) or agent (see dotllm serve). Env DOTLLM_PREFIX_POLICY.")]
+        public string? PromptCachePolicy { get; set; }
+
         /// <summary>Draft model for speculative decoding.</summary>
         [CommandOption("--speculative-model|--draft-model")]
         [Description("Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model.")]
@@ -690,8 +695,9 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
 
         // Prefix reuse is CPU-KV only: serve does no cross-request prefix reuse on Vulkan, and chat must not either (#790).
+        var promptCachePolicy = DotLLM.Server.ServerOptions.ParsePromptCachePolicy(settings.PromptCachePolicy);
         PrefixCache? prefixCache = !settings.NoPromptCache && vulkanKv is null
-            ? new PrefixCache(settings.PromptCacheSize)
+            ? new PrefixCache(settings.PromptCacheSize, promptCachePolicy)
             : null;
 
         // Load speculative draft model if requested (mirrors `dotllm run` wiring).
@@ -733,7 +739,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
             mtpEnabled: !settings.NoMtp, mtpAdaptive: true, recurrentPrefixCache: !settings.NoPromptCache,
             prefillChunkSize: settings.PrefillChunkSize,
-            recurrentPrefixCacheOptions: DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(settings.PrefixSnapshots, settings.PrefixSnapshotHostBudget, settings.PrefixSnapshotDiskDirectory, settings.PrefixSnapshotDiskBudget, settings.PromptCacheStep, settings.PromptCacheStepKeep),
+            recurrentPrefixCacheOptions: DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(settings.PrefixSnapshots, settings.PrefixSnapshotHostBudget, settings.PrefixSnapshotDiskDirectory, settings.PrefixSnapshotDiskBudget, settings.PromptCacheStep, settings.PromptCacheStepKeep, promptCachePolicy),
             promptLookup: settings.PromptLookupOptions);
 
         if (generator.RecurrentStepCheckpointBytes > 0)

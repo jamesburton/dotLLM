@@ -708,7 +708,7 @@ public static class ServerStartup
                 config.NumLayers, config.NumKvHeads, config.HeadDim, elementType: blockType);
             kvFactory = (cfg, size) => pagedFactory.Create(size);
             // Cross-request prefix cache (Step 37). Enabled in tandem with paged.
-            prefixTrieManager = new PrefixTrieManager(pagedFactory);
+            prefixTrieManager = new PrefixTrieManager(pagedFactory, new PrefixCacheConfig { EvictionPolicy = options.PromptCachePolicy });
             Console.WriteLine($"[dotllm] Using paged KV-cache ({blockType} blocks) with cross-request prefix cache");
         }
         else if (options.UsePaged && kvConfig.IsQuantized)
@@ -736,9 +736,11 @@ public static class ServerStartup
         // Vulkan (single-request path): the cache a request filled stays resident and a later request adopts its longest common prefix
         // (#1591). Each entry holds a whole device KV allocation, so keep few; the headroom lets the next turn of a conversation fit it.
         PrefixCache? prefixCache = !options.PromptCacheEnabled ? null
-            : vulkanKvFactory is null ? new PrefixCache(options.PromptCacheSize)
-            : new PrefixCache(Math.Min(options.PromptCacheSize, VulkanPrefixCacheMaxEntries));
+            : vulkanKvFactory is null ? new PrefixCache(options.PromptCacheSize, options.PromptCachePolicy)
+            : new PrefixCache(Math.Min(options.PromptCacheSize, VulkanPrefixCacheMaxEntries), options.PromptCachePolicy);
         int prefixCacheHeadroom = vulkanKvFactory is not null && prefixCache is not null ? VulkanPrefixCacheHeadroomTokens : 0;
+        if (options.PromptCacheEnabled && options.PromptCachePolicy == PrefixCachePolicy.Agent)
+            Console.WriteLine("[dotllm] Prompt-cache policy: agent (own-length eviction, protected conversations, save-point and end-of-reply checkpoints; #1654)");
 
         // Load speculative draft model if configured
         IModel? draftModel = null;
@@ -866,6 +868,8 @@ public static class ServerStartup
                     RecurrentPrefixCacheEntries = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_SCHED_RECURRENT_PREFIX"), out int rp) && rp >= 0 ? rp : 4,
                 };
             }
+            if (options.PromptCachePolicy != PrefixCachePolicy.Lru)
+                schedulerOptions = (schedulerOptions ?? new ContinuousBatchSchedulerOptions()) with { RecurrentPrefixPolicy = options.PromptCachePolicy };
 
             scheduler = new ContinuousBatchSchedulerService(
                 model,

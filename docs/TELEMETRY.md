@@ -26,6 +26,7 @@ All instruments live on `Meter("DotLLM.Engine")` and are tagged by
 | Instrument | Type | Unit | Description |
 |------------|------|------|-------------|
 | `dotllm.engine.tokens.prefill` | Counter&lt;long&gt; | `tokens` | Prompt tokens processed during prefill (excludes prefix-cache hits) |
+| `dotllm.engine.prefix_cache.lookups` | Counter&lt;long&gt; | `{lookup}` | One per request on the single-request path, tagged `model`, `result` (`hit`, `miss`, `protected`: the agent-aware policy made it miss to keep another conversation's entry) and `tier` (`vram`, `host`, `disk`, `trie`, `live`, `none`) (#1505, #1654) |
 | `dotllm.engine.tokens.decode` | Counter&lt;long&gt; | `tokens` | Tokens generated during decode |
 | `dotllm.engine.tokens_per_second.prefill` | Histogram&lt;double&gt; | `tokens/s` | Prefill throughput per request |
 | `dotllm.engine.tokens_per_second.decode` | Histogram&lt;double&gt; | `tokens/s` | Decode throughput per request |
@@ -140,6 +141,7 @@ Name mapping: dots become underscores, a unit suffix is appended unless the name
 |--------|------|--------|
 | `dotllm_engine_tokens_prefill_total`, `dotllm_engine_tokens_decode_total`, `dotllm_engine_tokens_cached_total` | counter | `model` |
 | `dotllm_engine_requests_total` | counter | `model`, `finish_reason` |
+| `dotllm_engine_prefix_cache_lookups_total` | counter | `model`, `result`, `tier` |
 | `dotllm_engine_request_duration_ms` | histogram | `model` |
 | `dotllm_engine_tokens_per_second_prefill`, `..._decode` | histogram | `model` |
 | `dotllm_engine_time_to_first_token_ms` | histogram | `model` (TextGenerator path only) |
@@ -151,8 +153,9 @@ Name mapping: dots become underscores, a unit suffix is appended unless the name
 Both generation paths record the per-request series: `TextGenerator` through `TelemetryRecorder` and the
 continuous-batch scheduler at request completion (`EngineTelemetry.RecordCompletion`).
 
-Not yet exposed (no instrument exists): prefix-cache hit/miss by tier, snapshot bytes per tier, MTP drafted/accepted
-counters, device memory used/free.
+Prefix-cache hit/miss by tier is exposed as `dotllm_engine_prefix_cache_lookups_total` (labels `model`, `result`, `tier`;
+single-request path only, the scheduler's admissions are not yet counted). Not yet exposed (no instrument exists): snapshot
+bytes per tier, MTP drafted/accepted counters, device memory used/free.
 
 ## Diagnostics versus telemetry
 

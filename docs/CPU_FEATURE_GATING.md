@@ -58,7 +58,7 @@ as `TensorPrimitives` and `Vector256` do), `DOTLLM_CPU_ISA` changes only what do
 | Test | Guards |
 |---|---|
 | `Cpu/CpuFeaturesTests` | cap parsing, flag lattice (`Avx512Bw` => `Avx512F` => `Avx2`, nothing above the hardware), the cap when the env var is set |
-| `Cpu/Kernels/CpuTierMatrixTests` | every tier the host can run (Q8_0 Sse/Avx2/Avx512/Vnni; Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL and Q2_K..Q6_K Sse/Avx2; the Q8_0/Q8_1/Q8_K quantizers; LittleBit sign-dots; `LoraStage2`) against the scalar oracle; the Q8_0 `ComputeRows` dispatcher under the tier in force |
+| `Cpu/Kernels/CpuTierMatrixTests` | every tier the host can run (Q8_0 Sse/Avx2/Avx512/Vnni; Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL and Q2_K..Q6_K Sse/Avx2; the Q8_0/Q8_1/Q8_K quantizers; LittleBit sign-dots; `LoraStage2`) against the scalar oracle; the Q8_0 `ComputeRows` dispatcher under the tier in force. The dot bound is `ulp(1) * sqrt(K) * sum|w_i x_i|` over the dequantized operands (never relative to the result, which can cancel), the fixture seed is a fixed hash of the family name (not `string.GetHashCode`, which is per-process random), and a tier above the `DOTLLM_CPU_ISA` cap is skipped rather than compared (#1692). `DOTLLM_TIER_SWEEP_SEEDS=N` sweeps N seeds per case and prints the worst `|diff|/bound` |
 | `Cpu/CpuGatingConventionTests` | (1) no raw `IsSupported` outside `CpuFeatures`, (2) a non-private method that calls ISA intrinsics guards or names its tier, (3) a non-private caller of a tier-named kernel consults `CpuFeatures` (or a predicate built on it) |
 
 The scan is a regex + brace-matching heuristic over `src/` (no Roslyn): cheap, reports `file:line`, and errs towards reporting. It cannot
@@ -90,7 +90,8 @@ The AVX-512 paths were checked for the "F checked, BW/VL used" inconsistency: th
 
 | Family | Dispatcher (file:line) | Tier flags | Fallback | Class |
 |---|---|---|---|---|
-| Q8_0 x Q8_0 GEMV | `MatMul.cs:135-188` | `Avx2FmaVnni` > `Avx512Bw` > `Avx2` > `Ssse3` | scalar (`:184`) | A (D fixed) |
+| Q8_0 x Q8_0 GEMV | `MatMul.cs:135-188` | `Q8_0Rows8Tier` (`AvxVnni`, eight-row transposed, bit-exact with scalar, #1119) > `Avx2FmaVnni` > `Avx512Bw` > `Avx2` > `Ssse3` | scalar (`:184`) | A (D fixed) |
+| Q8_0 eight-row GEMM/GEMV (`MatMul.Q8_0Rows8.cs`) | `MatMul.cs` `ComputeRows`, `ComputeGemmTiled`, pooled `GemmQ8_0`, `ComputeRowsQ8_0Interleaved` + R4 worker; `MatMulR4Gemm.cs` `GemmR4TiledQ8_0` | `Q8_0Rows8Tier` = `CpuFeatures.AvxVnni && Q8_0Rows8Enabled` (`DOTLLM_CPU_Q8_ROWS8=0` off) | the previous kernels above | A |
 | Q8_0 R4 / outer-product GEMM | `MatMul.cs:415,423,2020,2054,2174,2205,2375` | `Avx512Bw`, `Avx2`, `Ssse3` | scalar | A |
 | Q8_0/Q8_1/Q8_K activation quantizers | `MatMul.cs:1050-1052,1243`, `MatMulKQuants.cs:46` | `Avx512Bw`, `Avx2` | scalar | A |
 | Legacy Q4_0/Q4_1/Q5_1/IQ4_NL dots | `MatMulLegacyQuants.cs:393,401,436,453,523,558` | `Avx2`, `Ssse3` | scalar | A |
@@ -101,6 +102,7 @@ The AVX-512 paths were checked for the "F checked, BW/VL used" inconsistency: th
 | I2_S / PQ2_0 / PTQ1 / W2A8 | `MatMul.I2S.cs:164,197,765`, `MatMul.PQ2S.cs:105,512,564`, `MatMul.W2A8Sse.cs` via those | `Avx2`, `AvxVnni`, `Ssse3`, `Vector128Accelerated` | scalar | A |
 | PQ2_0 planar (default-on since #1638, n <= `PQ2_0PlanarMaxN`) | `MatMul.PQ2Planar.cs:22,100` | `Avx2`, `AvxVnni`, `Fma` | `PQ2PlanarRowsScalar` | A (C fixed upstream) |
 | F16 GEMM/GEMV | `MatMul.F16Tile.cs:32`, `MatMul.F16Sse.cs:102` | `Fma`; `Sse3` without AVX2 | scalar | A |
+| BF16 GEMM/GEMV (`MatMul.Bf16.cs`, #1118) | `Bf16Rows`, `GemmBf16Rows` | `Bf16Avx512Tier` (`Avx512F`, opt-in `DOTLLM_CPU_BF16_512=1`) > `Bf16FmaTier` (`Avx2Fma`) > `Bf16V128Tier` (`Vector128Accelerated`) | `DotBf16Scalar`; `DOTLLM_CPU_BF16_KERNEL=0` = dequant-rows | A |
 | Dequantize Q4_0..Q8_0 / K-quants | `Dequantize.cs:273,477`, `DequantizeKQuants.cs:109,394,522` | `Avx2` | scalar | A |
 | KV quantize/dequantize | `KvQuantize.cs:56,125,252` | `Avx2` | scalar | A |
 | FusedOps (RMSNorm+quantize ...) | `FusedOps.cs:327,443,579` | `Avx2` | scalar | A |

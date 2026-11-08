@@ -10,7 +10,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <summary>
 /// Q8_0 decode GEMV on the dp4a MMVQ-large kernel (<c>quantized_gemv_q8_0_mmvq_large_preq</c>, #1297).
 /// The oracle is a scalar CPU model of the kernel's contract, NOT the legacy kernel: it requantises x exactly as
-/// <c>quantize_x_to_q8_1</c> does (127/absmax, round-to-nearest-even, clamp +-127, FP16 scale) and takes an exact
+/// <c>quantize_x_to_q8_1</c> does (d = absmax/127, id = 1/d, round-to-nearest-even, clamp +-127, FP16 scale; the #1499 contract) and takes an exact
 /// integer dot per 32-block times the FP16 block scales. A 1-3% tolerance against the legacy kernel can hide an
 /// indexing bug; this one cannot (only F32 add-order and the final FP16 rounding are left). Weights get a different
 /// FP16 scale and random int8 payload per block, x has outlier chunks, and shapes are deliberately not tile-friendly
@@ -187,13 +187,14 @@ public sealed unsafe class CudaQ8_0MmvqTests
         {
             float a = 0f;
             for (int j = 0; j < 32; j++) a = MathF.Max(a, MathF.Abs((float)x[c * 32 + j]));
-            float inv = a > 0f ? 127.0f / a : 0f;
+            float dxf = a / 127.0f;                       // #1499 contract: d = a/127, inv = 1/d (both IEEE)
+            float inv = a > 0f ? 1.0f / dxf : 0f;
             for (int j = 0; j < 32; j++)
             {
                 int q = (int)MathF.Round((float)x[c * 32 + j] * inv, MidpointRounding.ToEven);
                 xq[c * 32 + j] = (sbyte)Math.Clamp(q, -127, 127);
             }
-            dx[c] = (float)(Half)(a / 127.0f);
+            dx[c] = (float)(Half)dxf;
         }
         float[] y = new float[n];
         for (int r = 0; r < n; r++)

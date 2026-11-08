@@ -201,6 +201,37 @@ public static class CudaSmallSGemvDispatch
             : CudaKernels.Pq2_0MmqTileColumnsWide;
     }
 
+    /// <summary>
+    /// Environment variable capping the K-quant / IQ4 multi-column range (issues #1316/#1375): projections of
+    /// <c>2 &lt;= seqLen &lt;= </c><see cref="KQuantMaxColumns"/> over Q2_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ4_NL weights take the
+    /// rows4 <c>_c{S}</c> GEMV (weights read in place once for all columns) instead of the F16-dequant + cuBLAS
+    /// prefill fallback (a #1107 rule-2 expansion). Default and ceiling <see cref="CudaKernels.KQuantRows4MaxColumns"/>;
+    /// <c>0</c> or <c>1</c> restores the dequant path for every <c>seqLen &gt; 1</c>.
+    /// </summary>
+    public const string KQuantMaxColumnsEnvVar = "DOTLLM_CUDA_KQUANT_SMALL_S_MAX";
+
+    private static readonly int KQuantMaxColumnsFromEnv = ReadKQuantMaxColumns();
+
+    /// <summary>Effective K-quant multi-column range (<see cref="KQuantMaxColumnsEnvVar"/>): <c>0</c> or <c>1</c> means off.</summary>
+    public static int KQuantMaxColumns => KQuantMaxColumnsOverride ?? KQuantMaxColumnsFromEnv;
+
+    /// <summary>In-process override of <see cref="KQuantMaxColumns"/> (tests/benches only; read per projection).</summary>
+    internal static int? KQuantMaxColumnsOverride { get; set; }
+
+    /// <summary>
+    /// Whether a K-quant / IQ4 projection over <paramref name="seqLen"/> token rows should take the rows4 multi-column
+    /// GEMV (given that the kernel is loaded and the shape rule holds): <c>2 &lt;= seqLen &lt;= </c><see cref="KQuantMaxColumns"/>.
+    /// <c>seqLen == 1</c> is the decode path (<c>CudaKernels.LaunchQuantizedGemvMmq</c>), not this policy.
+    /// </summary>
+    /// <param name="seqLen">Token rows in the projection.</param>
+    public static bool CoversKQuant(int seqLen) => seqLen >= 2 && seqLen <= KQuantMaxColumns;
+
+    private static int ReadKQuantMaxColumns()
+        => int.TryParse(Environment.GetEnvironmentVariable(KQuantMaxColumnsEnvVar),
+               NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v >= 0
+           ? Math.Min(v, CudaKernels.KQuantRows4MaxColumns)
+           : CudaKernels.KQuantRows4MaxColumns;
+
     private static int ReadMmqTile()
         => int.TryParse(Environment.GetEnvironmentVariable(MmqTileEnvVar),
                NumberStyles.Integer, CultureInfo.InvariantCulture, out int v)

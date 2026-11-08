@@ -34,4 +34,11 @@ public sealed record PrefixCacheConfig
     /// that lives in Step 59 (advanced scheduling).
     /// </remarks>
     public bool EvictionEnabled { get; init; } = true;
+
+    /// <summary>
+    /// Which zero-refcount leaf eviction reclaims first (#1654): <see cref="PrefixCachePolicy.Lru"/> the least recently
+    /// touched; <see cref="PrefixCachePolicy.Agent"/> the leaf whose path is oldest relative to its own length in tokens, so a
+    /// long conversation's tail outlives short side requests that arrived after it (<see cref="PrefixRetention"/>).
+    /// </summary>
+    public PrefixCachePolicy EvictionPolicy { get; init; } = PrefixCachePolicy.Lru;
 }

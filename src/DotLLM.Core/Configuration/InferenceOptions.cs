@@ -160,4 +160,15 @@ public record InferenceOptions
     /// when it re-renders the generation prompt differently (issue #1093). Null keeps the previous snapshot placement.
     /// </summary>
     public string? GenerationPromptSuffix { get; init; }
+
+    /// <summary>
+    /// The prompt text up to the start of the request's last non-assistant message's content (a user message, or the tool result
+    /// an agent loop ends with), its role header included (the chat template's render of everything before it), or
+    /// <see langword="null"/> when unknown. The prefix caches use it as the conversation's
+    /// save point (issue #1654): a recurrent model checkpoints its state there, so a retry, an edited or compacted last message,
+    /// or a side request over the same history resumes from it instead of re-prefilling the conversation; and under the
+    /// agent-aware policy a later request that shares everything before that message counts as the same conversation and may
+    /// reuse the entry. Only honoured when its tokens are exactly a prefix of the prompt's.
+    /// </summary>
+    public string? SavePointPrefix { get; init; }
 }

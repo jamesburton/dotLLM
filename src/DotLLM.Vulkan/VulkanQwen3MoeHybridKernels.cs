@@ -1,4 +1,5 @@
-﻿﻿using DotLLM.Vulkan.Kernels;
+﻿﻿using DotLLM.Core.Configuration;
+using DotLLM.Vulkan.Kernels;
 
 namespace DotLLM.Vulkan;
 
@@ -31,6 +32,72 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQ5KGemmCoopmatKernel? MatMulQ5KGemmCoopmat { get; private set; }
     public MatMulQ6KGemmCoopmatKernel? MatMulQ6KGemmCoopmat { get; private set; }
     public MatMulIq4XsGemmCoopmatKernel? MatMulIq4XsGemmCoopmat { get; private set; }
+
+    // #1149: the dense host's dp4a MMQ prefill GEMMs (Q8_1 activation rows, int32 accumulate) for the dense projections of the hybrid
+    // hosts. Null without integer dot products, with DOTLLM_VULKAN_DISABLE_MMQ=1 (the dense host's switch), with
+    // DOTLLM_VK_HYBRID_PREFILL_MMQ=0 (A/B: the pre-#1149 dispatch), or when the SPIR-V is absent. The row quantizer is non-null exactly
+    // when at least one of them is. Selection between these, the coopmat GEMMs and the scalar GEMMs is VulkanDensePrefillGemmPolicy's.
+    /// <summary>Row-wise Q8_1 activation quantizer feeding the dp4a MMQ prefill GEMMs (#1149).</summary>
+    public QuantizeQ8_1RowsKernel? QuantizeQ8_1RowsMmq { get; private set; }
+    public MatMulQ8_0MmqKernel? MatMulQ8Mmq { get; private set; }
+    public MatMulQ2KMmqKernel? MatMulQ2KMmq { get; private set; }
+    public MatMulQ3KMmqKernel? MatMulQ3KMmq { get; private set; }
+    public MatMulQ4KMmqKernel? MatMulQ4KMmq { get; private set; }
+    public MatMulQ5KMmqKernel? MatMulQ5KMmq { get; private set; }
+    public MatMulQ6KMmqKernel? MatMulQ6KMmq { get; private set; }
+    public MatMulIq4XsMmqKernel? MatMulIq4XsMmq { get; private set; }
+    public MatMulIq4NlMmqKernel? MatMulIq4NlMmq { get; private set; }
+
+    /// <summary>Opt-out of the hybrid hosts' dp4a MMQ prefill (#1149): <c>0</c> restores the coopmat-or-scalar dispatch for A/B.</summary>
+    public const string HybridPrefillMmqEnvVar = "DOTLLM_VK_HYBRID_PREFILL_MMQ";
+
+    /// <summary>
+    /// The dp4a MMQ prefill GEMM's block alignment for <paramref name="qt"/> (elements of the input width), or 0 when the bundle has no
+    /// MMQ for it. Covers the formats the hybrid loaders keep packed that the dense host serves on MMQ.
+    /// </summary>
+    public int MmqPrefillAlignment(DotLLM.Core.Configuration.QuantizationType qt) => qt switch
+    {
+        DotLLM.Core.Configuration.QuantizationType.Q8_0 when MatMulQ8Mmq is not null => MatMulQ8_0MmqKernel.Q8_0GroupSize,
+        DotLLM.Core.Configuration.QuantizationType.Q2_K when MatMulQ2KMmq is not null => MatMulQ2KMmqKernel.Q2KGroupSize,
+        DotLLM.Core.Configuration.QuantizationType.Q3_K when MatMulQ3KMmq is not null => MatMulQ3KMmqKernel.Q3KGroupSize,
+        DotLLM.Core.Configuration.QuantizationType.Q4_K when MatMulQ4KMmq is not null => MatMulQ4KMmqKernel.Q4KGroupSize,
+        DotLLM.Core.Configuration.QuantizationType.Q5_K when MatMulQ5KMmq is not null => MatMulQ5KMmqKernel.Q5KGroupSize,
+        DotLLM.Core.Configuration.QuantizationType.Q6_K when MatMulQ6KMmq is not null => MatMulQ6KMmqKernel.Q6KGroupSize,
+        DotLLM.Core.Configuration.QuantizationType.IQ4_XS when MatMulIq4XsMmq is not null => MatMulIq4XsMmqKernel.Iq4XsGroupSize,
+        DotLLM.Core.Configuration.QuantizationType.IQ4_NL when MatMulIq4NlMmq is not null => MatMulIq4NlMmqKernel.Iq4NlGroupSize,
+        _ => 0,
+    };
+
+    /// <summary>Records the dp4a MMQ prefill GEMM for <paramref name="qt"/> on already quantized Q8_1 rows; the caller checked <see cref="MmqPrefillAlignment"/>.</summary>
+    public void RecordMmqPrefill(nint cmdBuf, DotLLM.Core.Configuration.QuantizationType qt,
+        VulkanDevice.Buffer weights, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds, VulkanDevice.Buffer output, int m, int k, int n)
+    {
+        switch (qt)
+        {
+            case DotLLM.Core.Configuration.QuantizationType.Q8_0: MatMulQ8Mmq!.Record(cmdBuf, weights, xq, xds, output, m: m, k: k, n: n); break;
+            case DotLLM.Core.Configuration.QuantizationType.Q2_K: MatMulQ2KMmq!.Record(cmdBuf, weights, xq, xds, output, m: m, k: k, n: n); break;
+            case DotLLM.Core.Configuration.QuantizationType.Q3_K: MatMulQ3KMmq!.Record(cmdBuf, weights, xq, xds, output, m: m, k: k, n: n); break;
+            case DotLLM.Core.Configuration.QuantizationType.Q4_K: MatMulQ4KMmq!.Record(cmdBuf, weights, xq, xds, output, m: m, k: k, n: n); break;
+            case DotLLM.Core.Configuration.QuantizationType.Q5_K: MatMulQ5KMmq!.Record(cmdBuf, weights, xq, xds, output, m: m, k: k, n: n); break;
+            case DotLLM.Core.Configuration.QuantizationType.Q6_K: MatMulQ6KMmq!.Record(cmdBuf, weights, xq, xds, output, m: m, k: k, n: n); break;
+            case DotLLM.Core.Configuration.QuantizationType.IQ4_XS: MatMulIq4XsMmq!.Record(cmdBuf, weights, xq, xds, output, m: m, k: k, n: n); break;
+            case DotLLM.Core.Configuration.QuantizationType.IQ4_NL: MatMulIq4NlMmq!.Record(cmdBuf, weights, xq, xds, output, m: m, k: k, n: n); break;
+            default: throw new InvalidOperationException($"No hybrid prefill MMQ kernel for {qt}; check MmqPrefillAlignment first.");
+        }
+    }
+
+    /// <summary>True when the bundle has a coopmat prefill GEMM for <paramref name="qt"/> (all of them need the input width % 256 == 0 except Q8_0).</summary>
+    public bool HasCoopmatPrefill(DotLLM.Core.Configuration.QuantizationType qt, int inputDim) => qt switch
+    {
+        DotLLM.Core.Configuration.QuantizationType.Q8_0 => MatMulQ8GemmCoopmat is not null,
+        DotLLM.Core.Configuration.QuantizationType.Q2_K => MatMulQ2KGemmCoopmat is not null && (inputDim % 256) == 0,
+        DotLLM.Core.Configuration.QuantizationType.Q3_K => MatMulQ3KGemmCoopmat is not null && (inputDim % 256) == 0,
+        DotLLM.Core.Configuration.QuantizationType.Q4_K => MatMulQ4KGemmCoopmat is not null && (inputDim % 256) == 0,
+        DotLLM.Core.Configuration.QuantizationType.Q5_K => MatMulQ5KGemmCoopmat is not null && (inputDim % 256) == 0,
+        DotLLM.Core.Configuration.QuantizationType.Q6_K => MatMulQ6KGemmCoopmat is not null && (inputDim % 256) == 0,
+        DotLLM.Core.Configuration.QuantizationType.IQ4_XS => MatMulIq4XsGemmCoopmat is not null && (inputDim % 256) == 0,
+        _ => false,
+    };
     // Grouped-by-expert prefill path for resident Q4_K gate/up + Q5_K down banks (issue #637). All null/absent together unless every piece loads.
     public MoeExpertOffsetsKernel? MoeExpertOffsets { get; private set; }
     public MoeBuildTileListKernel? MoeBuildTileList { get; private set; }
@@ -170,6 +237,29 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQ4_0GemmCoopmatKernel? MatMulQ4_0GemmCoopmat { get; private set; }
     /// <summary>Portable packed Q4_0 GEMM fallback when cooperative matrices are unavailable.</summary>
     public MatMulQ4_0GemmF32Kernel? MatMulQ4_0Gemm { get; private set; }
+    /// <summary>Dense native Q4_0 F32-in decode GEMV (#921): the decode arm on devices without integer dot product (no <see cref="MatMulQ4_0Mmvq"/>).</summary>
+    public MatMulQ4_0GemvF32Kernel? MatMulQ4_0Gemv { get; private set; }
+    // #921: the legacy-quant projection kernels the dense host (VulkanTransformerModel) already runs, so VulkanQwen3MoeHybridWeights can keep
+    // Q4_1 / Q5_0 / Q5_1 projections packed instead of widening them to F32. Null only when the SPIR-V is missing (older spv cache) or, for
+    // the dp4a / coopmat forms, when the device lacks the feature; the F32-in GEMV + tiled GEMM pair is the always-present correctness arm.
+    /// <summary>Dense Q4_1 F32-in decode GEMV (#921).</summary>
+    public MatMulQ4_0GemvF32Kernel? MatMulQ4_1Gemv { get; private set; }
+    /// <summary>Dense Q4_1 tiled F32-in prefill GEMM (#921).</summary>
+    public MatMulQ4_0GemmF32Kernel? MatMulQ4_1Gemm { get; private set; }
+    /// <summary>Dense Q4_1 dp4a MMVQ decode GEMV on Q8_1 activations (#921); null without integer dot product.</summary>
+    public MatMulQ4_0MmvqKernel? MatMulQ4_1Mmvq { get; private set; }
+    /// <summary>Dense Q4_1 128x128x4 coopmat prefill GEMM (#921); null without cooperative matrices / wave64.</summary>
+    public MatMulQ4_0GemmCoopmatKernel? MatMulQ4_1GemmCoopmat { get; private set; }
+    /// <summary>Dense Q5_0 F32-in decode GEMV (#921).</summary>
+    public MatMulQ5_0GemvF32Kernel? MatMulQ5_0Gemv { get; private set; }
+    /// <summary>Dense Q5_0 tiled F32-in prefill GEMM (#921).</summary>
+    public MatMulQ5_0GemmF32Kernel? MatMulQ5_0Gemm { get; private set; }
+    /// <summary>Dense Q5_0 128x128x4 coopmat prefill GEMM (#921); null without cooperative matrices / wave64.</summary>
+    public MatMulQ5_0GemmCoopmatKernel? MatMulQ5_0GemmCoopmat { get; private set; }
+    /// <summary>Dense Q5_1 F32-in decode GEMV (#921; the #1600 kernel).</summary>
+    public MatMulQ5_1GemvF32Kernel? MatMulQ5_1Gemv { get; private set; }
+    /// <summary>Dense Q5_1 tiled F32-in prefill GEMM (#921; the #1600 kernel).</summary>
+    public MatMulQ5_1GemmF32Kernel? MatMulQ5_1Gemm { get; private set; }
     /// <summary>Grouped coopmat Q5_1 prefill kernel (16-row tiles).</summary>
     public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ5_1 { get; private set; }
     /// <summary>Grouped coopmat Q8_0 prefill kernel (16-row tiles).</summary>
@@ -794,6 +884,23 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             kernels.MatMulQ6KGemmCoopmat = MatMulQ6KGemmCoopmatKernel.Create(device, spvDir);
         if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableIq4XsCoopmatEnvVar) != "1" && MatMulIq4XsGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             kernels.MatMulIq4XsGemmCoopmat = MatMulIq4XsGemmCoopmatKernel.Create(device, spvDir);
+        // #1149: the dense host's dp4a MMQ prefill GEMMs (same creation gate as VulkanTransformerModel: integer dot + DOTLLM_VULKAN_DISABLE_MMQ).
+        if (Environment.GetEnvironmentVariable(HybridPrefillMmqEnvVar) != "0" && !VulkanTransformerModel.IsMmqDisabled() && device.HasIntegerDotProduct
+            && QuantizeQ8_1RowsKernel.TryCreate(device, spvDir) is { } mmqRows)
+        {
+            kernels.MatMulQ8Mmq = MatMulQ8_0MmqKernel.TryCreate(device, spvDir);
+            kernels.MatMulQ2KMmq = MatMulQ2KMmqKernel.TryCreate(device, spvDir);
+            kernels.MatMulQ3KMmq = MatMulQ3KMmqKernel.TryCreate(device, spvDir);
+            kernels.MatMulQ4KMmq = MatMulQ4KMmqKernel.TryCreate(device, spvDir);
+            kernels.MatMulQ5KMmq = MatMulQ5KMmqKernel.TryCreate(device, spvDir);
+            kernels.MatMulQ6KMmq = MatMulQ6KMmqKernel.TryCreate(device, spvDir);
+            kernels.MatMulIq4XsMmq = MatMulIq4XsMmqKernel.TryCreate(device, spvDir);
+            kernels.MatMulIq4NlMmq = MatMulIq4NlMmqKernel.TryCreate(device, spvDir);
+            bool any = kernels.MatMulQ8Mmq is not null || kernels.MatMulQ2KMmq is not null || kernels.MatMulQ3KMmq is not null
+                || kernels.MatMulQ4KMmq is not null || kernels.MatMulQ5KMmq is not null || kernels.MatMulQ6KMmq is not null
+                || kernels.MatMulIq4XsMmq is not null || kernels.MatMulIq4NlMmq is not null;
+            if (any) kernels.QuantizeQ8_1RowsMmq = mmqRows; else mmqRows.Dispose();
+        }
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED") != "0"
             && MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q4_K)
             && MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q5_K))
@@ -918,6 +1025,42 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
                 if (MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, f, iq3Codebooks, iq2Codebooks, kernels.Iq1CodebooksOwned) is { } mk)
                     kernels._iqMmvq[f] = mk;
         }
+        // #921: legacy-quant projection kernels (the dense host's set) so VulkanQwen3MoeHybridWeights keeps Q4_0 / Q4_1 / Q5_0 / Q5_1 packed.
+        // Created outside the MoE-MMVQ opt-out above: the loader's keep-packed decision does not consult that switch, so the F32-in arms must exist
+        // whenever the SPIR-V does. Q4_0 keeps its DOTLLM_VK_Q4_0_NATIVE=0 opt-out (the loader widens under it, so no kernel is needed then).
+        if (VulkanQwen3MoeMoeUpload.Q4_0NativeEnabled && File.Exists(Path.Combine(spvDir, "matmul_q4_0_f32_gemv.spv")))
+        {
+            kernels.MatMulQ4_0Gemv = MatMulQ4_0GemvF32Kernel.Create(device, spvDir);
+            kernels.MatMulQ4_0Gemm ??= File.Exists(Path.Combine(spvDir, "matmul_q4_0_f32_gemm.spv")) ? MatMulQ4_0GemmF32Kernel.Create(device, spvDir) : null;
+            kernels.MatMulQ4_0Mmvq ??= MatMulQ4_0MmvqKernel.TryCreate(device, spvDir);
+            if (kernels.MatMulQ4_0GemmCoopmat is null && MatMulQ4_0GemmCoopmatKernel.IsSupportedOn(device, spvDir))
+                kernels.MatMulQ4_0GemmCoopmat = MatMulQ4_0GemmCoopmatKernel.Create(device, spvDir);
+        }
+        if (File.Exists(Path.Combine(spvDir, "matmul_q4_1_f32_gemv.spv")) && File.Exists(Path.Combine(spvDir, "matmul_q4_1_f32_gemm.spv")))
+        {
+            kernels.MatMulQ4_1Gemv = MatMulQ4_0GemvF32Kernel.Create(device, spvDir, QuantizationType.Q4_1);
+            kernels.MatMulQ4_1Gemm = MatMulQ4_0GemmF32Kernel.Create(device, spvDir, QuantizationType.Q4_1);
+            kernels.MatMulQ4_1Mmvq = MatMulQ4_0MmvqKernel.TryCreate(device, spvDir, quant: QuantizationType.Q4_1);
+            if (MatMulQ4_0GemmCoopmatKernel.IsSupportedOn(device, spvDir, QuantizationType.Q4_1))
+                kernels.MatMulQ4_1GemmCoopmat = MatMulQ4_0GemmCoopmatKernel.Create(device, spvDir, QuantizationType.Q4_1);
+        }
+        if (File.Exists(Path.Combine(spvDir, "matmul_q5_0_f32_gemv.spv")) && File.Exists(Path.Combine(spvDir, "matmul_q5_0_f32_gemm.spv")))
+        {
+            kernels.MatMulQ5_0Gemv = MatMulQ5_0GemvF32Kernel.Create(device, spvDir);
+            kernels.MatMulQ5_0Gemm = MatMulQ5_0GemmF32Kernel.Create(device, spvDir);
+            if (MatMulQ5_0GemmCoopmatKernel.IsSupportedOn(device, spvDir))
+                kernels.MatMulQ5_0GemmCoopmat = MatMulQ5_0GemmCoopmatKernel.Create(device, spvDir);
+        }
+        if (File.Exists(Path.Combine(spvDir, "matmul_q5_1_f32_gemv.spv")) && File.Exists(Path.Combine(spvDir, "matmul_q5_1_f32_gemm.spv")))
+        {
+            kernels.MatMulQ5_1Gemv = MatMulQ5_1GemvF32Kernel.Create(device, spvDir);
+            kernels.MatMulQ5_1Gemm = MatMulQ5_1GemmF32Kernel.Create(device, spvDir);
+        }
+        // #921: the hybrid-dense host quantises its decode row for the Q4_0 / Q4_1 MMVQs into the cm1 rows scratch, which only exists with the
+        // (opt-in) int8-coopmat GEMMs. Create the rows quantizer whenever a legacy MMVQ exists so that host gets the dp4a decode arm by default;
+        // the MoE-hybrid host has its own quantizer (QuantizeQ8_1RowsActivations) and ignores this one.
+        if (kernels.QuantizeQ8_1RowsCm1 is null && (kernels.MatMulQ4_0Mmvq is not null || kernels.MatMulQ4_1Mmvq is not null))
+            kernels.QuantizeQ8_1RowsCm1 = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir);
         return kernels;
     }
 
@@ -933,6 +1076,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ3KGemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ4KGemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ8MmqCm1?.InvalidateDescriptorCache(); MatMulQ4KMmqCm1?.InvalidateDescriptorCache(); QuantizeQ8_1RowsCm1?.InvalidateDescriptorCache();
+        QuantizeQ8_1RowsMmq?.InvalidateDescriptorCache(); MatMulQ8Mmq?.InvalidateDescriptorCache(); MatMulQ2KMmq?.InvalidateDescriptorCache();
+        MatMulQ3KMmq?.InvalidateDescriptorCache(); MatMulQ4KMmq?.InvalidateDescriptorCache(); MatMulQ5KMmq?.InvalidateDescriptorCache();
+        MatMulQ6KMmq?.InvalidateDescriptorCache(); MatMulIq4XsMmq?.InvalidateDescriptorCache(); MatMulIq4NlMmq?.InvalidateDescriptorCache();
         MatMulQ5KGemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ6KGemmCoopmat?.InvalidateDescriptorCache();
         MatMulIq4XsGemmCoopmat?.InvalidateDescriptorCache();
@@ -1055,6 +1201,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ4_0Mmvq?.InvalidateDescriptorCache();
         MatMulQ4_0GemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ4_0Gemm?.InvalidateDescriptorCache();
+        MatMulQ4_0Gemv?.InvalidateDescriptorCache();
+        MatMulQ4_1Gemv?.InvalidateDescriptorCache(); MatMulQ4_1Gemm?.InvalidateDescriptorCache(); MatMulQ4_1Mmvq?.InvalidateDescriptorCache(); MatMulQ4_1GemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ5_0Gemv?.InvalidateDescriptorCache(); MatMulQ5_0Gemm?.InvalidateDescriptorCache(); MatMulQ5_0GemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ5_1Gemv?.InvalidateDescriptorCache(); MatMulQ5_1Gemm?.InvalidateDescriptorCache();
         MoeGroupedQ5_1?.InvalidateDescriptorCache();
         MoeGroupedQ8_0?.InvalidateDescriptorCache();
         foreach (var wk in _q8Wide.Values) wk.InvalidateDescriptorCache();
@@ -1066,6 +1216,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     {
         YarnRope?.Dispose();
         MatMulQ4_0Gemm?.Dispose();
+        MatMulQ4_0Gemv?.Dispose();
+        MatMulQ4_1Gemv?.Dispose(); MatMulQ4_1Gemm?.Dispose(); MatMulQ4_1Mmvq?.Dispose(); MatMulQ4_1GemmCoopmat?.Dispose();
+        MatMulQ5_0Gemv?.Dispose(); MatMulQ5_0Gemm?.Dispose(); MatMulQ5_0GemmCoopmat?.Dispose();
+        MatMulQ5_1Gemv?.Dispose(); MatMulQ5_1Gemm?.Dispose();
         foreach (var gk in _iqGrouped.Values) gk.Dispose();
         foreach (var gk in _iqGroupedVariants.Values) gk.Dispose();
         foreach (var wk in _q8Wide.Values) wk.Dispose();
@@ -1167,6 +1321,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ3KGemmCoopmat?.Dispose();
         MatMulQ4KGemmCoopmat?.Dispose();
         MatMulQ8MmqCm1?.Dispose(); MatMulQ4KMmqCm1?.Dispose(); QuantizeQ8_1RowsCm1?.Dispose();
+        QuantizeQ8_1RowsMmq?.Dispose(); MatMulQ8Mmq?.Dispose(); MatMulQ2KMmq?.Dispose(); MatMulQ3KMmq?.Dispose(); MatMulQ4KMmq?.Dispose();
+        MatMulQ5KMmq?.Dispose(); MatMulQ6KMmq?.Dispose(); MatMulIq4XsMmq?.Dispose(); MatMulIq4NlMmq?.Dispose();
         MatMulQ5KGemmCoopmat?.Dispose();
         MatMulQ6KGemmCoopmat?.Dispose();
         MatMulIq4XsGemmCoopmat?.Dispose();

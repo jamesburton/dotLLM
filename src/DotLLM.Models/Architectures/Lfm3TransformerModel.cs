@@ -567,6 +567,7 @@ public sealed unsafe class Lfm3TransformerModel : IModel
             case QuantizationType.Q6_K: MatMul.GemmQ6_K((byte*)w, b, c, m, k, n, _threadPool, null); return;
             case QuantizationType.F32: MatMul.GemmF32((float*)w, b, c, m, k, n, _threadPool); return;
             case QuantizationType.F16: MatMul.GemmF16(w, b, c, m, k, n, _threadPool); return;
+            case QuantizationType.BF16: MatMul.GemmBf16(w, b, c, m, k, n, _threadPool); return;   // shift-widen, in place (#1118)
             case QuantizationType.Q4_0:
             case QuantizationType.Q4_1:
             case QuantizationType.Q5_1:

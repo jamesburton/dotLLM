@@ -92,11 +92,9 @@ public class GlmSmolLm3RealOutputTests
 
         var content = new StringBuilder();
         JsonElement? calls = null;
-        foreach (string block in Encoding.UTF8.GetString(body.ToArray()).Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
+        foreach (var frame in Server.SseTestReader.Json(Encoding.UTF8.GetString(body.ToArray())))
         {
-            string data = block["data: ".Length..];
-            if (data == "[DONE]") continue;
-            foreach (var choice in JsonDocument.Parse(data).RootElement.GetProperty("choices").EnumerateArray())
+            foreach (var choice in frame.GetProperty("choices").EnumerateArray())
             {
                 var d = choice.GetProperty("delta");
                 if (d.TryGetProperty("content", out var c)) content.Append(c.GetString());

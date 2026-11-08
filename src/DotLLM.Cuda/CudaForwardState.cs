@@ -109,6 +109,16 @@ internal sealed class CudaForwardState : IDisposable
     // scratch, with k = PreQ8_1ScratchK (the largest GEMV input dim across call sites).
     public nint PreQ8_1BatchedScratch;
 
+    // Small-S (2..CudaKernels.KQuantRows4MaxColumns rows) batched pre-Q8_1 scratch for the rows4 multi-column K-quant /
+    // IQ4 GEMVs (#1316/#1375): KQuantRows4MaxColumns rows of PreQ8_1ScratchBytes(PreQ8_1ScratchK) in the
+    // quantize_x_to_q8_1_batched section layout. Fixed-size (~1.2 * 8 * K bytes, 165 KB at K = 17408) and allocated
+    // on first use so a model that never runs a 2..8-row forward pays nothing.
+    private nint _kquantMultiScratch;
+
+    /// <summary>Batched pre-Q8_1 scratch for the rows4 multi-column GEMVs, allocated on first use (#1316/#1375).</summary>
+    public nint KQuantMultiScratch => _kquantMultiScratch != 0 ? _kquantMultiScratch
+        : _kquantMultiScratch = AllocDeviceAnyCapture((long)CudaKernels.KQuantRows4MaxColumns * PreQ8_1ScratchBytes(PreQ8_1ScratchK));
+
     // Small device buffers for H2D copy of token IDs and positions
     public nint TokenIdsDevice; // [maxSeqLen] int32
     public nint PositionsDevice;// [maxSeqLen] int32
@@ -319,6 +329,7 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref QkvPacked);
         FreeIfNonZero(ref GateUpPacked);
         FreeIfNonZero(ref PreQ8_1Scratch);
+        FreeIfNonZero(ref _kquantMultiScratch);
         PreQ8_1ScratchK = 0;
         FreeIfNonZero(ref A8Input);
         FreeIfNonZero(ref A8InvScale);

@@ -17,7 +17,9 @@ namespace DotLLM.Tests.Unit.Server;
 public sealed class OllamaApiEndpointTests : IAsyncLifetime
 {
     private static readonly string[] EnvVars = ["DOTLLM_MODELS_DIR", "DOTLLM_PROFILES_DIR", "OLLAMA_MODELS", "HF_HUB_CACHE"];
-    private readonly string _root = Path.Combine(Path.GetTempPath(), "dotllm-720-" + Guid.NewGuid().ToString("N"));
+    // "f16" is deliberate: a GUID root contains f16/f32 ~1.2% of the time, and the quant label used to be regexed out of the
+    // FULL path, so the flake of #1395 is now the deterministic case this fixture always exercises.
+    private readonly string _root = Path.Combine(Path.GetTempPath(), "dotllm-720-f16-" + Guid.NewGuid().ToString("N"));
     private readonly Dictionary<string, string?> _saved = new();
     private WebApplication? _app;
     private ServerState? _state;
@@ -215,6 +217,22 @@ public sealed class OllamaApiEndpointTests : IAsyncLifetime
     }
 
     // ───────────────────────────── pure helpers ─────────────────────────────
+
+    [Theory]
+    [InlineData(@"C:\Users\x\AppData\Local\Temp\dotllm-720-3f16a0c9\hub\models--acme--tiny-GGUF\snapshots\c0ffee\tiny-Q4_K_M.gguf", "Q4_K_M")]
+    [InlineData("/tmp/dotllm-720-00f32bd1/hub/models--acme--tiny-GGUF/snapshots/c0ffee/tiny-Q4_K_M.gguf", "Q4_K_M")]
+    [InlineData(@"D:\models-bf16\llama-3.2-IQ4_XS.gguf", "IQ4_XS")]
+    [InlineData("acme/tiny-GGUF:Q4_K_M", "Q4_K_M")]                 // an unresolved profile reference: the repo:tag tail
+    [InlineData("hf.co/acme/f16-GGUF:q8_0", "Q8_0")]                 // the tag follows the repo: the last token wins
+    [InlineData("tiny-Q4_K_M-00001-of-00002.gguf", "Q4_K_M")]
+    [InlineData(@"D:\f16\model.gguf", null)]                          // only the directory says f16: unknown, not F16
+    [InlineData("llama-3.2-f16.gguf", "F16")]
+    public void QuantOf_ReadsTheLastSegmentOnly_NotTheDirectories(string text, string? expected)
+    {
+        // #1395: QuantOf used to match the first quant-looking token anywhere in the path, so a temp root or store
+        // directory containing f16/f32 relabelled every file under it.
+        Assert.Equal(expected, OllamaApiEndpoint.QuantOf(text));
+    }
 
     [Theory]
     [InlineData("\"5m\"", 300.0)]

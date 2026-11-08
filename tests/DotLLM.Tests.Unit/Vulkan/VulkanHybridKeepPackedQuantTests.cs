@@ -8,8 +8,9 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// <summary>
 /// The hybrid (Qwen3.5 / Qwen3-MoE-hybrid) weight loader widened any quantization missing from its keep-packed list to F32 at load.
 /// Q2_K, Q3_K, IQ4_XS, IQ1_S and IQ4_NL were missing although the models' dispatch tables serve them packed (issue #627): a
-/// requantised Tev1-4B IQ4_XS streamed ~17 GB per decoded token (6 tok/s) and needed ~7x the device memory. This pins that the
-/// upload size of each such type is its packed size, and that an unsupported type still takes the F32 fallback.
+/// requantised Tev1-4B IQ4_XS streamed ~17 GB per decoded token (6 tok/s) and needed ~7x the device memory. #921 closed the same
+/// gap for the legacy 32-element-block quants (Q4_0 / Q4_1 / Q5_0 / Q5_1) the dense loader had kept packed for months. This pins
+/// that the upload size of each such type is its packed size, and that a type with no hybrid kernel still takes the F32 fallback.
 /// </summary>
 public sealed class VulkanHybridKeepPackedQuantTests
 {
@@ -22,6 +23,10 @@ public sealed class VulkanHybridKeepPackedQuantTests
     [InlineData(QuantizationType.Q5_K)]
     [InlineData(QuantizationType.Q6_K)]
     [InlineData(QuantizationType.Q8_0)]
+    [InlineData(QuantizationType.Q4_0)]
+    [InlineData(QuantizationType.Q4_1)]
+    [InlineData(QuantizationType.Q5_0)]
+    [InlineData(QuantizationType.Q5_1)]
     [InlineData(QuantizationType.IQ1_S)]
     [InlineData(QuantizationType.IQ2_XXS)]
     [InlineData(QuantizationType.IQ2_XS)]
@@ -37,14 +42,31 @@ public sealed class VulkanHybridKeepPackedQuantTests
         Assert.True(packed < (long)M * K * sizeof(float) / 3, $"{qt} should be well under a third of the F32 size");
     }
 
+    /// <summary>Formats the hybrid hosts have no kernel for (I2_S / NVFP4 dense projections are dense-host only) still widen.</summary>
     [Theory]
-    [InlineData(QuantizationType.Q4_0)]
-    [InlineData(QuantizationType.Q5_1)]
+    [InlineData(QuantizationType.I2_S)]
+    [InlineData(QuantizationType.NVFP4)]
     public void UnsupportedQuantizations_StillFallBackToF32(QuantizationType qt)
         => Assert.Equal((long)M * K * sizeof(float), VulkanQwen3MoeHybridWeights.ProjectionUploadBytes(M, K, qt));
 
+    /// <summary>#921 A/B switch: with the legacy keep-packed arms off, the four legacy quants widen exactly as before #921.</summary>
+    [Theory]
+    [InlineData(QuantizationType.Q4_0)]
+    [InlineData(QuantizationType.Q4_1)]
+    [InlineData(QuantizationType.Q5_0)]
+    [InlineData(QuantizationType.Q5_1)]
+    public void LegacyQuants_WidenWhenTheSwitchIsOff(QuantizationType qt)
+    {
+        Assert.Equal((long)M * K * sizeof(float), VulkanQwen3MoeHybridWeights.ProjectionUploadBytes(M, K, qt, legacyPacked: false));
+        Assert.Equal(Dequantize.RowByteSize(K, qt) * M, VulkanQwen3MoeHybridWeights.ProjectionUploadBytes(M, K, qt, legacyPacked: true));
+    }
+
     [Fact]
     public void NonMultipleOfTheBlockSize_FallsBackToF32()
-        => Assert.Equal((long)M * 2000 * sizeof(float),
+    {
+        Assert.Equal((long)M * 2000 * sizeof(float),
             VulkanQwen3MoeHybridWeights.ProjectionUploadBytes(M, 2000, QuantizationType.IQ4_XS));   // 2000 % 256 != 0
+        Assert.Equal((long)M * 40 * sizeof(float),
+            VulkanQwen3MoeHybridWeights.ProjectionUploadBytes(M, 40, QuantizationType.Q5_1));   // 40 % 32 != 0
+    }
 }

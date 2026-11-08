@@ -178,16 +178,69 @@ Q4_1_EDITS = [
 
 
 def render_q4_1(spec, u):
+    return render_variant(spec, u, Q4_1_EDITS, 'Q4_1')
+
+
+# Q5_1 rewrite (issue #1613): the 24-byte block (fp16 d, fp16 m, uint32 qh, 16 qs bytes) is word aligned, so six plain word loads; the 5th
+# bit of element j (bit j of qh; j + 16 for the high nibbles) is spread into bit 4 of each int8 lane with the Q5_0 MMQ's multiply trick
+# (((qh >> 4w) & 0xF) * 0x02040810 & 0x10101010), so the dp4a sees unsigned 0..31 codes:
+#    block = d * d_x * dot(code, xq) + m * s      (llama.cpp's vec_dot_q5_1_q8_1 form).
+Q5_1_EDITS = [
+    ('(issue #1018) - edit the generator', '(issues #1018, #1613) - edit the generator'),
+    (' Q4_0 MMVQ decode GEMV, V2: a lane owns a whole 32-element block (18 bytes = 5 aligned word loads)',
+     ' Q5_1 MMVQ decode GEMV, V2: a lane owns a whole 32-element block (24 bytes = 6 aligned word loads)'),
+    ('See the generator for the math (nibble dot minus 8 * Q8_1 block sum).',
+     'See the generator for the math (d * 5-bit code dot + m * Q8_1 block sum).'),
+    ('// Q4_0 block (18 bytes, 2-byte aligned): [0,1] fp16 d | [2..17] qs[16]; byte j: low nibble = element j, high nibble = element j + 16.',
+     '// Q5_1 block (24 bytes, word aligned): [0,1] fp16 d | [2,3] fp16 m | [4..7] qh | [8..23] qs[16]; element j = (qs[j] & 0xF) | qh bit j << 4,\n'
+     '// element j + 16 = (qs[j] >> 4) | qh bit (j + 16) << 4.'),
+    ('const uint BLOCK_BYTES = 18u;', 'const uint BLOCK_BYTES = 24u;'),
+    ('        uint  vq[U][5];', '        uint  vq[U][6];'),
+    ('            [[unroll]] for (uint i = 0u; i < 5u; i++) vq[s][i] = weight[pw + i];',
+     '            [[unroll]] for (uint i = 0u; i < 6u; i++) vq[s][i] = weight[pw + i];'),
+    ('''            bool hi = (((rowByteBase + b * BLOCK_BYTES) & 2u) != 0u);
+            // qs word m = block bytes [2 + 4m, 6 + 4m): funnel of two stream words when the block starts word aligned, one stream word otherwise.
+            uint q0 = hi ? vq[s][1] : ((vq[s][0] >> 16u) | (vq[s][1] << 16u));
+            uint q1 = hi ? vq[s][2] : ((vq[s][1] >> 16u) | (vq[s][2] << 16u));
+            uint q2 = hi ? vq[s][3] : ((vq[s][2] >> 16u) | (vq[s][3] << 16u));
+            uint q3 = hi ? vq[s][4] : ((vq[s][3] >> 16u) | (vq[s][4] << 16u));
+''', '''            uint qh = vq[s][1];
+            uint q0 = vq[s][2], q1 = vq[s][3], q2 = vq[s][4], q3 = vq[s][5];
+'''),
+    ('int(q0 & 0x0F0F0F0Fu)', 'int((q0 & 0x0F0F0F0Fu) | (((qh       ) & 0xFu) * 0x02040810u & 0x10101010u))'),
+    ('int(q1 & 0x0F0F0F0Fu)', 'int((q1 & 0x0F0F0F0Fu) | (((qh >>  4u) & 0xFu) * 0x02040810u & 0x10101010u))'),
+    ('int(q2 & 0x0F0F0F0Fu)', 'int((q2 & 0x0F0F0F0Fu) | (((qh >>  8u) & 0xFu) * 0x02040810u & 0x10101010u))'),
+    ('int(q3 & 0x0F0F0F0Fu)', 'int((q3 & 0x0F0F0F0Fu) | (((qh >> 12u) & 0xFu) * 0x02040810u & 0x10101010u))'),
+    ('int((q0 >> 4u) & 0x0F0F0F0Fu)', 'int(((q0 >> 4u) & 0x0F0F0F0Fu) | (((qh >> 16u) & 0xFu) * 0x02040810u & 0x10101010u))'),
+    ('int((q1 >> 4u) & 0x0F0F0F0Fu)', 'int(((q1 >> 4u) & 0x0F0F0F0Fu) | (((qh >> 20u) & 0xFu) * 0x02040810u & 0x10101010u))'),
+    ('int((q2 >> 4u) & 0x0F0F0F0Fu)', 'int(((q2 >> 4u) & 0x0F0F0F0Fu) | (((qh >> 24u) & 0xFu) * 0x02040810u & 0x10101010u))'),
+    ('int((q3 >> 4u) & 0x0F0F0F0Fu)', 'int(((q3 >> 4u) & 0x0F0F0F0Fu) | (((qh >> 28u) & 0xFu) * 0x02040810u & 0x10101010u))'),
+    ('''            // d: bytes 0..1 of the block = the high half of stream word 0 when the block starts 2 bytes into it, else its low half.
+            float d = unpackHalf2x16(hi ? (vq[s][0] >> 16u) : (vq[s][0] & 0xFFFFu)).x;
+            float contrib = d * (ds[s].x * float(dot) - 8.0 * ds[s].y);
+''', '''            vec2 dm = unpackHalf2x16(vq[s][0]);
+            float contrib = dm.x * ds[s].x * float(dot) + dm.y * ds[s].y;
+'''),
+    ('// Q4_0 blob', '// Q5_1 blob'),
+    ('K/32 x 18 B]', 'K/32 x 24 B]'),
+]
+
+
+def render_q5_1(spec, u):
+    return render_variant(spec, u, Q5_1_EDITS, 'Q5_1')
+
+
+def render_variant(spec, u, edits, label):
     text = render(spec, u)
     hit = False
-    for old, new in Q4_1_EDITS:
+    for old, new in edits:
         if old in text:
             text = text.replace(old, new)
             hit = True
     assert hit
-    for old, _ in Q4_1_EDITS:
+    for old, _ in edits:
         assert old not in text, old
-    assert 'Q4_0' not in text and '18 B' not in text, 'unconverted Q4_0 text left in the Q4_1 shader'
+    assert 'Q4_0' not in text and '18 B' not in text, 'unconverted Q4_0 text left in the ' + label + ' shader'
     return text
 
 
@@ -199,7 +252,10 @@ def render(spec, u):
 def main():
     u = int(os.environ.get('Q4_0_V2_U', '2'))
     for spec in (DENSE, DENSE_RESIDUAL, MOE):
-        for name, text in ((spec['name'], render(spec, u)), (spec['name'].replace('q4_0', 'q4_1'), render_q4_1(spec, u))):
+        variants = [(spec['name'], render(spec, u)), (spec['name'].replace('q4_0', 'q4_1'), render_q4_1(spec, u))]
+        if spec is not MOE:   # the indexed Q5_1 bank already has moe_indexed_matmul_q5_1_mmvq.comp (#849)
+            variants.append((spec['name'].replace('q4_0', 'q5_1'), render_q5_1(spec, u)))
+        for name, text in variants:
             path = os.path.join(SHADERS, name + '.comp')
             with open(path, 'w', encoding='utf-8', newline='\n') as f:
                 f.write(text)
