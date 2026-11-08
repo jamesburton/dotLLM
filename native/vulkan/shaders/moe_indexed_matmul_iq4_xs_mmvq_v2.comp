@@ -34,7 +34,7 @@ layout(push_constant) uniform PushConstants {
     uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
 } pc;
 
-const uint BLOCK_BYTES = 136u;
+const uint IQ4_XS_BLOCK_BYTES = 136u;
 
 const int KV[16] = int[16](
     -127, -104, -83, -65, -49, -35, -22, -10,
@@ -59,7 +59,7 @@ void main() {
     uint lane = gl_LocalInvocationID.x;
     uint bq = lane >> 3u;                 // block within a 4-block step
     uint ib = lane & 7u;                  // sub-block 0..7 (32 elements = 4 qs words)
-    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * BLOCK_BYTES;
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * IQ4_XS_BLOCK_BYTES;
     uint xRow        = n / pc.xDiv;
     uint xq4RowBase  = xRow * (pc.K >> 4u);
     uint xdsRowBase  = xRow * (pc.K >> 5u);
@@ -69,7 +69,7 @@ void main() {
         [[unroll]] for (uint s = 0u; s < 4u; s++) {
             uint blkRaw = chunk + s * 4u + bq;
             if (blkRaw >= pc.blocksPerRow) continue;
-            uint bw = (rowByteBase + blkRaw * BLOCK_BYTES) >> 2u;   // block is 8-byte aligned
+            uint bw = (rowByteBase + blkRaw * IQ4_XS_BLOCK_BYTES) >> 2u;   // block is 8-byte aligned
             uint h0 = bank[bw];          // d | scales_h
             uint h1 = bank[bw + 1u];     // scales_l[4]
             uint qw = bw + 2u + ib * 4u;

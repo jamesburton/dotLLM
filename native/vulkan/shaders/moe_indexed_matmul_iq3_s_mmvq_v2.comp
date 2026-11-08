@@ -36,7 +36,7 @@ layout(push_constant) uniform PushConstants {
     uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
 } pc;
 
-const uint BLOCK_BYTES = 110u;
+const uint IQ3_S_BLOCK_BYTES = 110u;
 
 uint loadByte(uint p) { return (bank[p >> 2u] >> ((p & 3u) << 3u)) & 0xFFu; }
 uint load16(uint p)   { return (bank[p >> 2u] >> ((p & 2u) << 3u)) & 0xFFFFu; }   // 2-byte aligned
@@ -82,7 +82,7 @@ void main() {
     uint lane = gl_LocalInvocationID.x;
     uint bq = lane >> 3u;                 // block within a 4-block step
     uint ib = lane & 7u;                  // sub-block 0..7 (32 elements = 4 pairs of 8)
-    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * BLOCK_BYTES;
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * IQ3_S_BLOCK_BYTES;
     uint xRow        = n / pc.xDiv;
     uint xq4RowBase  = xRow * (pc.K >> 4u);
     uint xdsRowBase  = xRow * (pc.K >> 5u);
@@ -92,7 +92,7 @@ void main() {
         [[unroll]] for (uint s = 0u; s < 4u; s++) {
             uint blkRaw = chunk + s * 4u + bq;
             if (blkRaw >= pc.blocksPerRow) continue;
-            uint base = rowByteBase + blkRaw * BLOCK_BYTES;
+            uint base = rowByteBase + blkRaw * IQ3_S_BLOCK_BYTES;
             uint xi = xq4RowBase + blkRaw * 16u + ib * 2u;
             uvec4 xa = xq4[xi], xb = xq4[xi + 1u];
             uint xv[8] = uint[8](xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);

@@ -32,7 +32,7 @@ layout(push_constant) uniform PushConstants {
     uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
 } pc;
 
-const uint BLOCK_BYTES = 18u;
+const uint IQ4_NL_BLOCK_BYTES = 18u;
 const uint U = 2u;   // blocks per lane in flight
 
 const int KV[16] = int[16](
@@ -54,7 +54,7 @@ void main() {
     if (m >= pc.M || n >= pc.N) return;
     uint expert = uint(indices[n]);
     if (expert >= pc.numExperts) return;
-    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * BLOCK_BYTES;
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * IQ4_NL_BLOCK_BYTES;
     uint xRow = n / pc.xDiv;
     uint xq4RowBase = xRow * (pc.K >> 4u);
     uint xdsRowBase = xRow * (pc.K >> 5u);
@@ -70,7 +70,7 @@ void main() {
             uint blk = chunk + s * 32u + lane;
             ok[s] = blk < pc.blocksPerRow;
             uint b = ok[s] ? blk : (pc.blocksPerRow - 1u);   // clamp so the loads stay unconditional (hoistable); masked out below
-            uint p = rowByteBase + b * BLOCK_BYTES;
+            uint p = rowByteBase + b * IQ4_NL_BLOCK_BYTES;
             uint pw = p >> 2u;
             [[unroll]] for (uint i = 0u; i < 5u; i++) vq[s][i] = weight[pw + i];
             xa[s] = xq4[xq4RowBase + b * 2u];
@@ -80,7 +80,7 @@ void main() {
         [[unroll]] for (uint s = 0u; s < U; s++) {
             uint blk = chunk + s * 32u + lane;
             uint b = ok[s] ? blk : (pc.blocksPerRow - 1u);
-            bool hi = (((rowByteBase + b * BLOCK_BYTES) & 2u) != 0u);
+            bool hi = (((rowByteBase + b * IQ4_NL_BLOCK_BYTES) & 2u) != 0u);
             // qs word w = block bytes [2 + 4w, 6 + 4w): funnel of two stream words when the block starts word aligned, one stream word otherwise.
             uint q0 = hi ? vq[s][1] : ((vq[s][0] >> 16u) | (vq[s][1] << 16u));
             uint q1 = hi ? vq[s][2] : ((vq[s][1] >> 16u) | (vq[s][2] << 16u));
