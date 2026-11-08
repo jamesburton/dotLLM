@@ -32,7 +32,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
     private readonly Lfm3TransformerModel _cpu;      // keeps the GGUF mmap alive and owns the weight views
     private readonly VulkanQwen3MoeHybridTransformerModel _host;
     private readonly SigmoidGateMulHeadsF32Kernel _gateMul;
-    private readonly VulkanFlashAttentionGqaKernel? _slidingFlash;   // GQA flash prefill with window-start tile skipping; null = per-head fallback
+    private readonly VulkanFlashAttentionGqaKernel? _gqaFlash;   // GQA flash prefill with window-start tile skipping; null = per-head fallback
     private readonly LayerDev[] _layers;
     private readonly HybridLayerLayout _layout;
     private readonly int[] _convOrdinal;
@@ -87,7 +87,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
     }
 
     private VulkanLfm3TransformerModel(VulkanDevice device, ModelConfig config, Lfm3TransformerModel cpu,
-        VulkanQwen3MoeHybridTransformerModel host, SigmoidGateMulHeadsF32Kernel gateMul, VulkanFlashAttentionGqaKernel? slidingFlash, LayerDev[] layers, int[] convOrdinal, int convLayers,
+        VulkanQwen3MoeHybridTransformerModel host, SigmoidGateMulHeadsF32Kernel gateMul, VulkanFlashAttentionGqaKernel? gqaFlash, LayerDev[] layers, int[] convOrdinal, int convLayers,
         float localTheta, float globalTheta, int globalRotPairs, long deviceBytes, List<nint> ownedHost)
     {
         _device = device;
@@ -95,7 +95,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         _cpu = cpu;
         _host = host;
         _gateMul = gateMul;
-        _slidingFlash = slidingFlash;
+        _gqaFlash = gqaFlash;
         _layers = layers;
         _layout = config.HybridLayout!;
         _convOrdinal = convOrdinal;
@@ -382,21 +382,27 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
             || kvCache is not VulkanNemotronHKvCache)
             return null;
         int kvEnd = VulkanNemotronHKvCache.PositionsEnd(positions);
-        int per = _submitBudget.RowsPerForward(rows, kvEnd, ParamsPerLayer, Config.NumAttentionHeads, Config.HeadDim);
-        if (per >= rows) return null;
-        int slices = (rows + per - 1) / per;
-        int baseLen = rows / slices, extra = rows % slices;
-        if (baseLen <= _allRowLogitsLimit) return null;
+        int kvStart0 = kvEnd - rows;
+        int first = _submitBudget.NextSliceRows(rows, kvStart0, ParamsPerLayer, Config.NumAttentionHeads, Config.HeadDim);
+        if (first >= rows || first <= _allRowLogitsLimit) return null;
 
-        RowSliceForwardsForTest += slices;
+        // Progressive slicing: each slice is sized at its own KV depth with the rates the previous slices refitted, so the shallow
+        // start runs in long slices and only the deep tail is cut short (the uniform sizing of #1649 was ~25 % slower at 28K).
         ITensor? last = null;
-        int start = 0;
-        for (int s = 0; s < slices; s++)
+        int start = 0, previous = 0;
+        while (start < rows)
         {
-            int len = baseLen + (s < extra ? 1 : 0);
+            int remaining = rows - start;
+            int len = start == 0 ? first
+                : _submitBudget.NextSliceRows(remaining, kvStart0 + start, ParamsPerLayer, Config.NumAttentionHeads, Config.HeadDim, previous);
+            len = Math.Clamp(len, 1, remaining);
+            // Every slice must stay on the last-row-logits path (a slice short enough for all-row logits would download them all).
+            if (len <= _allRowLogitsLimit) len = Math.Min(remaining, _allRowLogitsLimit + 1);
+            RowSliceForwardsForTest++;
             last?.Dispose();
             last = Run(tokenIds.Slice(start, len), positions.Slice(start, len), deviceId, kvCache);
             start += len;
+            previous = len;
         }
         return last;
     }
@@ -417,15 +423,20 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         if (VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch))
             resized = true;
 
-        if (resized) { _host.Q4InvalidateCaches(); _gateMul.InvalidateDescriptorCache(); _slidingFlash?.InvalidateDescriptorCache(); }
+        if (resized) { _host.Q4InvalidateCaches(); _gateMul.InvalidateDescriptorCache(); _gqaFlash?.InvalidateDescriptorCache(); }
         _host.Q4UploadPositions(positions);
 
         var submit = _host.Q4Submit;
         submit.Begin();
         nint cmd = submit.CommandBuffer;
+        // GPU-timestamp stage profile (#885 tooling; DOTLLM_VULKAN_MOE_STAGE_PROFILE=1 DOTLLM_VK_STAGE_TS=1): stamps inside the real
+        // command buffers, no extra submits. The split-submit mode is not supported here (it would re-begin the buffer under `cmd`).
+        bool prof = StageProfiling;
+        if (prof) _host.Q4StageBegin();
         KernelSupport.HostToComputeBarrier(cmd);
         _host.Q4RecordEmbedding(cmd, tokenIds);
         KernelSupport.TransferToComputeBarrier(cmd);
+        if (prof) _host.Q4Stage("embed");
 
         ulong hiddenBytes = (ulong)((long)T * H * sizeof(float));
         int kvEndObs = VulkanNemotronHKvCache.PositionsEnd(positions);
@@ -440,9 +451,10 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
             Fb(cmd);
             kern.RmsNorm.Record(cmd, st.HiddenState, ld.OperatorNorm, st.NormOutput, rowCount: T, n: H, eps: eps);
             Fb(cmd);
+            if (prof) _host.Q4Stage("norm+resid");
 
-            if (ld.IsAttention) RecordAttention(cmd, ld, layer, T, positions, kvCache);
-            else RecordConv(cmd, ld, _convOrdinal[layer], T);
+            if (ld.IsAttention) RecordAttention(cmd, ld, layer, T, positions, kvCache, prof);
+            else { RecordConv(cmd, ld, _convOrdinal[layer], T); if (prof) _host.Q4Stage("conv"); }
 
             if (ld.PostOperatorNorm is not null)
             {
@@ -456,8 +468,10 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
             Fb(cmd);
             kern.RmsNorm.Record(cmd, st.HiddenState, ld.FfnNorm, st.NormOutput, rowCount: T, n: H, eps: eps);
             Fb(cmd);
+            if (prof) _host.Q4Stage("norm+resid");
 
             RecordDense(cmd, ld, T);
+            if (prof) _host.Q4Stage("ffn");
 
             if (ld.PostFfnNorm is not null)
             {
@@ -466,6 +480,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
             }
             Fb(cmd);
             kern.Add.Record(cmd, st.Residual, st.NormOutput, st.HiddenState, T * H);
+            if (prof) _host.Q4Stage("norm+resid");
 
             // Windows TDR: a single submission must finish within ~2 s. A long prefill of the whole stack does not, so a multi-row
             // forward is cut into several submissions.
@@ -475,11 +490,13 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
             {
                 Fb(cmd);
                 submit.SubmitAndWait();
-                _submitBudget.Observe(openDense, openAttn, System.Diagnostics.Stopwatch.GetElapsedTime(openStart).TotalSeconds);
+                _submitBudget.Observe(openDense, openAttn, System.Diagnostics.Stopwatch.GetElapsedTime(openStart).TotalSeconds,
+                    attentionMeanKv: Math.Max(1.0, kvEndObs - ((T - 1) / 2.0)));
                 openDense = openAttn = 0;
                 openStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 submit.Begin();
                 cmd = submit.CommandBuffer;
+                if (prof) _host.Q4Stage("~resubmit");   // absorbs the host round trip so it is not charged to the next stage
             }
         }
 
@@ -495,12 +512,36 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         var logitsBuf = allRows ? _multiRowLogits! : st.Logits;
         _host.Q4RecordMatmul(cmd, wts.OutputWeight, wts.OutputDeviceQuantType, st.NormOutput, logitsBuf,
             wts.OutputOutputDim, wts.OutputInputDim, rows);
+        if (prof) _host.Q4Stage("head");
         KernelSupport.ComputeToHostBarrier(cmd);
         submit.SubmitAndWait();
+        if (prof) ReportStages(T);
 
         var result = UnmanagedTensor.Allocate(new TensorShape(rows, V), DType.Float32, deviceId: -1);
         _device.Download(logitsBuf, new Span<float>((void*)result.DataPointer, rows * V));
         return result;
+    }
+
+    /// <summary>Stage profiling is on only in GPU-timestamp mode (the split-submit mode would re-begin the command buffer under us).</summary>
+    private bool StageProfiling => _host.Q4StageProfiling && VulkanQwen3MoeHybridTransformerModel.StageTimestamps;
+
+    private readonly Dictionary<string, double> _stageMs = new();
+    private int _stageForwards;
+
+    /// <summary>Prints the per-stage GPU ms of this forward (prefill) or of the last 32 forwards (decode), largest first.</summary>
+    private void ReportStages(int T)
+    {
+        foreach (var kv in _host.TakeStageTimes()) _stageMs[kv.Key] = _stageMs.GetValueOrDefault(kv.Key) + kv.Value;
+        _stageForwards++;
+        if (T > 1 || _stageForwards % 32 == 0)
+        {
+            int div = T > 1 ? 1 : 32;
+            double total = _stageMs.Values.Sum();
+            Console.Error.WriteLine($"[lfm3-stage] T={T} avg over {div} forward(s), total {total / div:F1} ms: " + string.Join("  ",
+                _stageMs.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}={kv.Value / div:F2}ms")));
+            _stageMs.Clear();
+            _stageForwards = 0;
+        }
     }
 
     private static int LayersPerSubmit(int T) => T >= 4096 ? 1 : T >= 1536 ? 2 : 4;
@@ -549,8 +590,11 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
     /// <summary>A/B switch (<c>DOTLLM_VK_LFM3_SLIDING_OPT=0</c>): restores the pre-#1572 behaviour (full-range split-KV, per-head flash) for sliding layers.</summary>
     internal static readonly bool SlidingOptDisabled = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM3_SLIDING_OPT") == "0";
 
-    /// <summary>Counters proving which sliding-layer path ran (decodes with a clipped KV range; prefills on the GQA flash kernel).</summary>
-    internal static long SlidingClippedDecodes, SlidingFlashPrefills;
+    /// <summary>A/B switch (<c>DOTLLM_VK_LFM3_GLOBAL_GQA=0</c>): global-attention prefills go back to the per-head coopmat flash kernel.</summary>
+    internal static readonly bool GlobalGqaDisabled = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM3_GLOBAL_GQA") == "0";
+
+    /// <summary>Counters proving which attention path ran (sliding decodes with a clipped KV range; sliding / global prefills on the GQA flash kernel).</summary>
+    internal static long SlidingClippedDecodes, SlidingFlashPrefills, GlobalFlashPrefills;
 
     /// <summary>
     /// First KV position a sliding-window layer still reads after a forward of <paramref name="tokens"/> rows starting at absolute
@@ -560,7 +604,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
     internal static int SlidingKvStart(int positionOffset, int tokens, int window)
         => window > 0 ? Math.Max(0, positionOffset + tokens - window) : 0;
 
-    private void RecordAttention(nint cmd, LayerDev ld, int layer, int T, ReadOnlySpan<int> positions, IKvCache? kvCache)
+    private void RecordAttention(nint cmd, LayerDev ld, int layer, int T, ReadOnlySpan<int> positions, IKvCache? kvCache, bool prof = false)
     {
         var st = _host.Q4State;
         var kern = _host.Q4Kernels;
@@ -585,6 +629,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
                 headDim: hd, ropeDim: 2 * _globalRotPairs, theta: _globalTheta, variant: RopeF32Kernel.Variant.NeoX,
                 freqDim: hd, neoxPairOffset: hd / 2);
 
+        if (prof) _host.Q4Stage("attn_proj");
         VulkanDevice.Buffer kSrc, vSrc;
         int seqKv, posOff;
         if (kvCache is VulkanNemotronHKvCache vk)
@@ -602,14 +647,17 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
             Fb(cmd);
             kSrc = st.K; vSrc = st.V; seqKv = T; posOff = 0;
         }
+        if (prof) _host.Q4Stage("attn_kvwrite");
 
         // Windowed layers only need the last `window` keys: decode clips the split-KV range to them (kvStart), and the GQA flash
         // kernel skips whole KV tiles before each workgroup's window start. The per-head coopmat / scalar flash kernels mask but
         // still walk every tile, so a 32K prefill of the 5 sliding layers would cost as much as the 6 global ones.
+        // Global layers (#1572 remainder): the per-head coopmat kernel re-reads every K/V tile once per query head (4x for 16/4 GQA)
+        // and pays ~19 barriers per 32-key tile; the GQA-grouped kernel reads each tile once per KV head with Q and O in registers.
         int kvStart = SlidingOptDisabled ? 0 : SlidingKvStart(posOff, T, window);
-        var gqaFlash = !SlidingOptDisabled && T > 1 && window > 0 ? _slidingFlash : null;
+        var gqaFlash = T > 1 && (window > 0 ? !SlidingOptDisabled : !GlobalGqaDisabled) ? _gqaFlash : null;
         if (kvStart > 0) SlidingClippedDecodes++;
-        if (gqaFlash is not null) SlidingFlashPrefills++;
+        if (gqaFlash is not null) { if (window > 0) SlidingFlashPrefills++; else GlobalFlashPrefills++; }
         if (kern.SplitKvAttention is not null && T == 1 && hd <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv - kvStart, nh))
             kern.SplitKvAttention.Record(cmd, st.Q, kSrc, vSrc, st.AttnOutput, seqQ: T, seqKv: seqKv, numHeads: nh, numKvHeads: nkv,
@@ -626,10 +674,12 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         else
             kern.Attention.Record(cmd, st.Q, kSrc, vSrc, st.AttnOutput, seqQ: T, seqKv: seqKv, numHeads: nh, numKvHeads: nkv,
                 headDim: hd, positionOffset: posOff, slidingWindow: window);
+        if (prof) _host.Q4Stage(window > 0 ? "attn_core_sliding" : "attn_core_global");
         Fb(cmd);
         _gateMul.Record(cmd, st.AttnOutput, _attnGate!, T * nh * hd, hd);
         Fb(cmd);
         _host.Q4RecordMatmul(cmd, ld.O!, ld.OQt, st.AttnOutput, st.NormOutput, H, nh * hd, T);
+        if (prof) _host.Q4Stage("attn_out");
     }
 
     private void RecordDense(nint cmd, LayerDev ld, int T)
@@ -657,7 +707,7 @@ public sealed unsafe partial class VulkanLfm3TransformerModel : IModel
         }
         _ffnGate?.Dispose(); _ffnUp?.Dispose(); _convProj?.Dispose(); _attnGate?.Dispose(); _multiRowLogits?.Dispose();
         _gateMul.Dispose();
-        _slidingFlash?.Dispose();
+        _gqaFlash?.Dispose();
         _host.Dispose();
         foreach (nint p in _ownedHost) NativeMemory.AlignedFree((void*)p);
         _ownedHost.Clear();
