@@ -417,6 +417,16 @@ public sealed class BackendSeamTestsGpu : IDisposable
             StringComparison.Ordinal);
         Assert.Equal(0, f16.CurrentLength);
 
+        // A compact sliding-window cache addresses rows by window slot, not by absolute position: refused (F32 storage, so only the
+        // window check can refuse it). The control: the same config without compact windows is accepted.
+        ModelConfig windowed = tiny.Config with { SlidingWindowSize = 4 };
+        using var compact = new VulkanKvCache(device, KvGeometry.FromConfig(windowed, compactSlidingWindows: true),
+            SyntheticDenseGguf.Context, VulkanKvStorage.F32);
+        Assert.True(compact.HasCompactWindows, "control: the geometry really is compact");
+        Assert.Contains("sliding-window", Assert.Throws<NotSupportedException>(() => VulkanChunkBackend.CheckCacheSupported(compact)).Message,
+            StringComparison.Ordinal);
+        VulkanChunkBackend.CheckCacheSupported(cache); // control: the plain F32 cache passes
+
         ChunkKvEntry b = new ChunkEncoder(Fingerprint).Encode(tiny.Model, ChunkB);
         using var vkAsm = (VulkanKvCache)backend.CreateCache(SyntheticDenseGguf.Context);
         assembler.Assemble(vkAsm, [b with { Backend = ChunkBackendTags.Vulkan }, vkA], Fingerprint);
