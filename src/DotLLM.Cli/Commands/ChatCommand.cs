@@ -586,7 +586,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         var deviceLabel = model is DotLLM.Cuda.CudaTransformerModel
             ? DotLLM.Cuda.CudaDevice.GetDevice(DeviceCli.CudaOrdinal(deviceOutcome.Resolved)).ToString()
             : vulkanKv is not null
-                ? $"vulkan {DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}"
+                ? $"vulkan {DeviceCli.DeviceLabel(deviceOutcome.Resolved)}"
                 : $"{threadingInfo.EffectiveThreadCount} threads";
         var toolsLabel = tools is { Length: > 0 } ? $" | {tools.Length} tool(s)" : "";
         var segments = $"{config!.Architecture} {config.NumLayers}L/{config.HiddenSize}H | {quantLabel} | {deviceLabel} | {samplingLabel}{toolsLabel}";

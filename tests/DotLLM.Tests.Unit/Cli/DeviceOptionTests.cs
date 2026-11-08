@@ -38,7 +38,8 @@ public sealed class DeviceOptionTests
     [InlineData("cuda", true)]
     [InlineData("gpu:1", true)]
     [InlineData("cpu", true)]
-    [InlineData("vulkan:3", false)]
+    [InlineData("vulkan:3", true)]
+    [InlineData("vulkan:x", false)]
     [InlineData("metal", false)]
     public void Validate_MatchesTheSharedParser(string device, bool valid) =>
         Assert.Equal(valid, DeviceCli.Validate(device) is null);

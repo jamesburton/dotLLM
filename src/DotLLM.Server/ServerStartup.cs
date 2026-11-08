@@ -165,7 +165,7 @@ public static class ServerStartup
     /// </summary>
     public static ServerState LoadModel(string resolvedPath, ServerOptions options)
     {
-        // One parser for every entry point (#790): "cuda", a typo or "vulkan:1" must never silently mean the CPU.
+        // One parser for every entry point (#790): "cuda", a typo or "vulkan:x" must never silently mean the CPU.
         if (!DeviceSpec.TryParse(options.Device, out var spec, out string? deviceError))
             throw new ArgumentException(deviceError);
 
@@ -270,7 +270,7 @@ public static class ServerStartup
             }
             try
             {
-                var (vkModel, _) = DeviceModelLoader.LoadExact(gguf, config, "vulkan", null, new ThreadingConfig(options.Threads, options.DecodeThreads),
+                var (vkModel, _) = DeviceModelLoader.LoadExact(gguf, config, spec.Kind == DeviceKind.Vulkan ? spec.Canonical : "vulkan", null, new ThreadingConfig(options.Threads, options.DecodeThreads),
                     m => Console.WriteLine($"[dotllm] {m}; embeddings only"), m => Console.WriteLine($"[dotllm] WARNING: {m}"));
                 model = vkModel;
             }

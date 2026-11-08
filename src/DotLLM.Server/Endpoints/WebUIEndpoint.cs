@@ -17,6 +17,7 @@ public static class WebUIEndpoint
 
         PreloadFile(assembly, "index.html", "text/html; charset=utf-8");
         PreloadFile(assembly, "app.js", "text/javascript; charset=utf-8");
+        PreloadFile(assembly, "device-select.js", "text/javascript; charset=utf-8");
         PreloadFile(assembly, "app.css", "text/css; charset=utf-8");
     }
 
@@ -35,6 +36,7 @@ public static class WebUIEndpoint
     {
         app.MapGet("/", (HttpContext ctx) => ServeFile(ctx, "index.html"));
         app.MapGet("/app.js", (HttpContext ctx) => ServeFile(ctx, "app.js"));
+        app.MapGet("/device-select.js", (HttpContext ctx) => ServeFile(ctx, "device-select.js"));
         app.MapGet("/app.css", (HttpContext ctx) => ServeFile(ctx, "app.css"));
     }
 

@@ -664,10 +664,10 @@ answer ends early.
 `dotllm serve` defaults to `--device auto`: for each model it tries **CUDA** (when a GPU is present and the model file fits in 85% of its memory),
 then **Vulkan** (when a device and the shader blobs exist), then the **CPU**, and a load that fails on one device falls through to the next with a log
 line. The server keeps `auto` as its configured device, so each on-demand load chooses again for its own size; the device actually used is
-`ResolvedDevice` (what `GET /api/ps` reports as `size_vram`). Pass `cpu`, `gpu:N` or `vulkan` to force one. `dotllm stop --server` and
+`ResolvedDevice` (what `GET /api/ps` reports as `size_vram`). Pass `cpu`, `gpu:N`, `vulkan` (the default Vulkan GPU) or `vulkan:N` (a specific physical device, #1704) to force one. `dotllm stop --server` and
 `POST /v1/admin/shutdown` stop a running server gracefully (`--allow-model-admin`).
 
-**No silent CPU (#790).** One parser (`DeviceSpec`: `auto`, `cpu`, `vulkan`, `gpu[:N]`/`cuda[:N]`) and one load dispatch (`DeviceModelLoader`) back
+**No silent CPU (#790).** One parser (`DeviceSpec`: `auto`, `cpu`, `vulkan[:N]`, `gpu[:N]`/`cuda[:N]`) and one load dispatch (`DeviceModelLoader`) back
 `serve`, `run`, `chat` and `bench`. An unknown value is rejected with the accepted list. An explicit GPU that cannot be honoured (no such device,
 SPIR-V missing, load failure) fails with what/why/model-vs-device-memory and the `--device cpu` opt-in - the server does not start on the CPU.
 `auto` ending on the CPU always sets `device_fallback_warning` in `/props` (no GPU servable, or the GPU load failed and why) and prints it at startup.
@@ -1097,9 +1097,25 @@ decode inside a request whose measured rounds lose, and re-probes a losing arm w
 Load Model modal uses it: for such models the draft-model picker is hidden and replaced with "MTP: built into this model - enabled automatically"
 plus an opt-out checkbox; for models without a head the picker is offered as an optional **external draft (speculative) model** (unselected by default).
 
-The modal also defaults the compute device to the best servable GPU (`GET /v1/devices` -> `recommended_device`, same ordering as `--device auto`;
-optionally `?model_bytes=N`), and to CPU only when no GPU is servable. An explicit GPU device that fails to load returns an error - there is no
-silent CPU fallback (only `--device auto` falls back, with a prominent `device_fallback_warning` in `/props`).
+The modal's **Compute Device** is a dropdown listing CPU plus every servable device from `GET /v1/devices` (#1704): each CUDA device (`gpu:N`) and
+each Vulkan physical device (`vulkan:N`), with the device name and memory (free/total where reported - CUDA via NVML; Vulkan shows the device-local
+heap size only, since Vulkan has no device-wide free figure without a logical device). It is preselected to `recommended_device` (same ordering as
+`--device auto`; optionally `?model_bytes=N`), or CPU when no GPU is servable. A device the user picks by hand is never overridden by a later refresh
+(re-sizing for the chosen model). This is how to load on the Vulkan iGPU when the CUDA GPU's memory is full. The GPU-offloading slider is shown for CUDA
+devices only: Vulkan has no partial offload and the modal sends no `gpu_layers` for it. An explicit GPU device that fails to load returns an error -
+there is no silent CPU fallback (only `--device auto` falls back, with a prominent `device_fallback_warning` in `/props`).
+
+`GET /v1/devices` lists every Vulkan physical device as `{index, name, device_string: "vulkan:N", total_memory_bytes}`; the one plain `vulkan`
+selects (the process default: discrete over integrated, or `DOTLLM_VULKAN_DEVICE_INDEX`) carries `is_default: true`. The device list is probed once per
+process and cached (the probe takes the Vulkan lifecycle lock).
+
+**Models on different devices.** The server keeps one active model plus a stash bounded by `--max-resident-models` / `--resident-memory-budget`
+(see Multi-Model Residency). With the default of 1, loading any model evicts the previous one regardless of device, so a CUDA model and a Vulkan
+model are not co-resident. With a larger budget, a Vulkan model and a CUDA model can both stay resident (they live on different devices), and a
+swap is a field swap. Limits: device-local eviction (evict only models on the target device until the incoming weights fit) is implemented for CUDA
+ordinals only, and the budget is a file-size sum, not a per-device figure, so two models on different devices count against one budget; and the
+active-model slot is single, so requests are served by one model at a time. Serving two models concurrently on two devices would need a redesign of
+the single active-model slot and is not part of #1704.
 
 ## Model Keep-Alive / Idle-Unload / Multi-Model Residency (#369)
 
@@ -1184,8 +1200,9 @@ When `tools` are provided in the request:
 ## Vulkan device (`--device vulkan`)
 
 `dotllm serve --device vulkan` (and `dotllm run --device vulkan`) load the model through
-`VulkanModelLoader.CreateSharedFromGguf`, the same per-architecture dispatch `bench`/`perplexity` use, on a
-process-wide Vulkan device. Requests run one at a time through `TextGenerator` with the model's own device-resident
+`VulkanModelLoader.CreateOnDeviceFromGguf`, the same per-architecture dispatch `bench`/`perplexity` use, on a
+process-wide Vulkan device (one per physical device: `--device vulkan:N` picks device N in `vkEnumeratePhysicalDevices` order, see
+`GET /v1/devices`; an index that does not exist is an error naming the valid range, never a fallback; `vulkan` is the default device). Requests run one at a time through `TextGenerator` with the model's own device-resident
 KV-cache: no `ForwardBatch` scheduler, no paged/quantized KV, no cross-request prefix cache yet. Before this,
 `--device vulkan` silently fell back to the CPU (the string does not start with `gpu`); `chat` now rejects it
 explicitly. Measured on Strix Halo with Tev1-4B Q4_K_M (108-token decision prompt, 1 answer token):

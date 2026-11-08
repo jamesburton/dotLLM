@@ -307,16 +307,9 @@
                     <div>
                         <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">Compute Device</label>
                         <p id="modal-device-hint" class="text-[10px] text-zinc-600 mb-1.5">Detecting devices...</p>
-                        <div class="flex items-center gap-4">
-                            <label class="flex items-center gap-1.5 text-xs text-zinc-400 cursor-pointer">
-                                <input type="radio" name="modal-device" value="cpu" class="accent-cyan-500">
-                                <span>CPU</span>
-                            </label>
-                            <label class="flex items-center gap-1.5 text-xs text-zinc-400 cursor-pointer">
-                                <input type="radio" name="modal-device" value="gpu" class="accent-cyan-500">
-                                <span id="modal-device-gpu-label">GPU</span>
-                            </label>
-                        </div>
+                        <select id="modal-device-select" class="w-full bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-xs text-zinc-300">
+                            <option value="cpu">CPU</option>
+                        </select>
                     </div>
 
                     <!-- GPU offloading (shown when GPU selected) -->
@@ -392,6 +385,7 @@
         </div>
     </div>
 
+    <script src="/device-select.js"></script>
     <script src="/app.js"></script>
 </body>
 </html>
