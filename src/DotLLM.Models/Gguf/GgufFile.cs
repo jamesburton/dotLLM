@@ -287,12 +287,27 @@ public sealed class GgufFile : IDisposable
         return new GgufFile(first.Header, first.Metadata, tensors.AsReadOnly(), tensorsByName, shardByTensor, shards);
     }
 
+    /// <summary>
+    /// The tensor overlay attached to this (base) file (#1706, <c>--tensor-overlay</c>), or null. Only the CPU <c>TransformerModel</c> loader
+    /// consumes it; callers must check <see cref="TensorOverlay.VerifyAllApplied"/> after loading so an overlay a loader ignored is an error.
+    /// </summary>
+    public TensorOverlay? Overlay { get; private set; }
+
+    /// <summary>Attaches <paramref name="overlay"/>; this file takes ownership and disposes it with itself.</summary>
+    public void AttachOverlay(TensorOverlay overlay)
+    {
+        ArgumentNullException.ThrowIfNull(overlay);
+        if (Overlay is not null) throw new InvalidOperationException("A tensor overlay is already attached.");
+        Overlay = overlay;
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
         if (_disposed)
             return;
         _disposed = true;
+        Overlay?.Dispose();
 
         foreach (var shard in _shards)
             shard.Dispose();

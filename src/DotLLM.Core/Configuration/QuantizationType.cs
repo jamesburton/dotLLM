@@ -192,6 +192,16 @@ public enum QuantizationType
     Q2_0 = 242,
 
     /// <summary>
+    /// <c>TERN_B64_F16</c> (issue #1706): ternary weights with one FP16 scale per 64 input columns. Row-major <c>[out, in]</c>, <c>in % 64 == 0</c>;
+    /// block = 2-byte little-endian IEEE FP16 scale + 16 bytes of 2-bit trits (18 B / 64 weights = 2.25 bpw). Trit code <c>00 = 0</c>,
+    /// <c>01 = +1</c>, <c>10 = -1</c>, <c>11 = INVALID</c> (rejected at load); byte <c>k</c> holds columns <c>4k..4k+3</c>, column <c>4k+i</c> in
+    /// bits <c>2i..2i+1</c> (least significant first); <c>w = trit * scale</c>. Distinct from <see cref="Q2_0"/> (same 18 B/64 geometry but codes
+    /// 0..3 = -1,0,+1,+2) and from <see cref="PQ2_0"/> (128-weight groups). Not a ggml type: id 243 is dotLLM-private, used by overlay GGUFs
+    /// (<c>--tensor-overlay</c>); see <c>docs/QUANTIZATION.md</c>.
+    /// </summary>
+    TERN_B64_F16 = 243,
+
+    /// <summary>
     /// LittleBit factorized linear (issue #864): not a GGUF type. The weight "pointer" is a handle into
     /// <c>FactorizedWeights</c> naming a sign-factor composite (<c>diag(u1) U diag(l) V diag(v2)</c>, primary plus
     /// residual path), CPU only. Id 100 is outside the GGUF range.

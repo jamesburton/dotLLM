@@ -7,6 +7,43 @@ using DotLLM.Cpu.Threading;
 namespace DotLLM.Cpu.Kernels;
 
 /// <summary>
+/// Per-(expert, projection) format overrides for <see cref="MoeQuantSwiGluMlp"/> (issue #1706, <c>--tensor-overlay</c>): a side table next to the
+/// stacked original-format banks. Entry <c>[e]</c> of a projection is 0 when expert <c>e</c> keeps the bank's format, else the address of
+/// that expert's standalone <c>[out, in]</c> tensor (mmap'd overlay GGUF, never copied) and its <see cref="QuantizationType"/>
+/// (<see cref="QuantizationType.TERN_B64_F16"/>, or any type <c>GemvQuant</c> accepts). Projections are independent, so one expert may have a
+/// ternary gate and an original-format up/down.
+/// </summary>
+public sealed class ExpertOverlayTable
+{
+    /// <summary>Addresses per expert for gate / up / down (0 = original bank).</summary>
+    public readonly nint[] Gate, Up, Down;
+    /// <summary>Formats per expert for gate / up / down (valid where the address is non-zero).</summary>
+    public readonly QuantizationType[] GateQt, UpQt, DownQt;
+
+    /// <summary>Creates an empty table for <paramref name="numExperts"/> experts.</summary>
+    public ExpertOverlayTable(int numExperts)
+    {
+        Gate = new nint[numExperts]; Up = new nint[numExperts]; Down = new nint[numExperts];
+        GateQt = new QuantizationType[numExperts]; UpQt = new QuantizationType[numExperts]; DownQt = new QuantizationType[numExperts];
+    }
+
+    /// <summary>Number of experts the table covers.</summary>
+    public int NumExperts => Gate.Length;
+
+    /// <summary>Sets one override. <paramref name="proj"/>: 0 = gate, 1 = up, 2 = down.</summary>
+    public void Set(int proj, int expert, nint ptr, QuantizationType qt)
+    {
+        switch (proj)
+        {
+            case 0: Gate[expert] = ptr; GateQt[expert] = qt; break;
+            case 1: Up[expert] = ptr; UpQt[expert] = qt; break;
+            case 2: Down[expert] = ptr; DownQt[expert] = qt; break;
+            default: throw new ArgumentOutOfRangeException(nameof(proj));
+        }
+    }
+}
+
+/// <summary>
 /// Quantized-expert dense-routing top-k MoE FFN kernel (gpt-oss convention).
 /// Unlike <see cref="MoeSwiGluMlp"/> (which consumes per-expert F32 pointer
 /// banks), this kernel reads the routed-expert weights directly from the
@@ -67,6 +104,7 @@ public static unsafe class MoeQuantSwiGluMlp
     /// <param name="useSwiGluOai">True = clamped swiglu_oai activation; false = plain SwiGLU.</param>
     /// <param name="pool">Optional thread pool for row-parallel expert GEMVs.</param>
     /// <param name="normTopKProb">Mixtral gating only: renormalise the selected top-k probabilities to sum to 1 (default). False = keep the raw softmax-over-all-experts probabilities (OLMoE, Qwen1.5-MoE).</param>
+    /// <param name="overlay">Optional per-(expert, projection) format side table (#1706). Null = every expert reads the stacked banks (the pre-overlay path, unchanged).</param>
     [SkipLocalsInit]
     public static void Execute(
         float* hidden, float* output, int seqLen,
@@ -78,7 +116,8 @@ public static unsafe class MoeQuantSwiGluMlp
         int numExperts, int numExpertsPerTok,
         int hiddenSize, int intermediateSize,
         bool softmaxAfterTopK, bool useSwiGluOai,
-        ComputeThreadPool? pool, bool normTopKProb = true)
+        ComputeThreadPool? pool, bool normTopKProb = true,
+        ExpertOverlayTable? overlay = null)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
@@ -163,10 +202,18 @@ public static unsafe class MoeQuantSwiGluMlp
                         int e = topkIdx[slot];
                         float w = topkVal[slot];
 
-                        GemvQuant(gateExpsBase + (nint)(e * gateExpertBytes), gateQt,
-                                  xPtr, gatePtr, intermediateSize, hiddenSize, pool);
-                        GemvQuant(upExpsBase + (nint)(e * upExpertBytes), upQt,
-                                  xPtr, upPtr, intermediateSize, hiddenSize, pool);
+                        nint gW = gateExpsBase + (nint)(e * gateExpertBytes), uW = upExpsBase + (nint)(e * upExpertBytes),
+                             dW = downExpsBase + (nint)(e * downExpertBytes);
+                        QuantizationType gQ = gateQt, uQ = upQt, dQ = downQt;
+                        if (overlay is not null)
+                        {
+                            if (overlay.Gate[e] != 0) { gW = overlay.Gate[e]; gQ = overlay.GateQt[e]; }
+                            if (overlay.Up[e] != 0) { uW = overlay.Up[e]; uQ = overlay.UpQt[e]; }
+                            if (overlay.Down[e] != 0) { dW = overlay.Down[e]; dQ = overlay.DownQt[e]; }
+                        }
+
+                        GemvQuant(gW, gQ, xPtr, gatePtr, intermediateSize, hiddenSize, pool);
+                        GemvQuant(uW, uQ, xPtr, upPtr, intermediateSize, hiddenSize, pool);
 
                         var gateSpan = gateBuf.AsSpan(0, intermediateSize);
                         var upSpan = upBuf.AsSpan(0, intermediateSize);
@@ -182,8 +229,7 @@ public static unsafe class MoeQuantSwiGluMlp
                         else
                             FusedOps.SwiGLU(gateSpan, upSpan, gateSpan);
 
-                        GemvQuant(downExpsBase + (nint)(e * downExpertBytes), downQt,
-                                  gatePtr, downPtr, hiddenSize, intermediateSize, pool);
+                        GemvQuant(dW, dQ, gatePtr, downPtr, hiddenSize, intermediateSize, pool);
 
                         var downSpan = downBuf.AsSpan(0, hiddenSize);
                         if (!downBias.IsEmpty)
@@ -238,6 +284,9 @@ public static unsafe class MoeQuantSwiGluMlp
     {
         switch (qt)
         {
+            case QuantizationType.TERN_B64_F16:
+                TernB64F16.GemvQ8((byte*)weights, x, y, m, k, pool);
+                break;
             case QuantizationType.MXFP4:
                 MatMul.GemvMxfp4((byte*)weights, x, y, m, k, pool);
                 break;

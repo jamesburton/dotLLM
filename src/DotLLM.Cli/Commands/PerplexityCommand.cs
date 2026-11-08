@@ -46,6 +46,14 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [Description("Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF).")]
         public string Model { get; set; } = string.Empty;
 
+        [CommandOption(Helpers.TensorOverlayCli.Option)]
+        [Description(Helpers.TensorOverlayCli.Help)]
+        public string? TensorOverlay { get; set; }
+
+        [CommandOption(Helpers.TensorOverlayCli.SkipHashOption)]
+        [Description(Helpers.TensorOverlayCli.SkipHashHelp)]
+        public bool OverlaySkipBaseHash { get; set; }
+
         [CommandOption("--corpus|-f")]
         [Description("Path to a UTF-8 text corpus (e.g. wiki.test.raw).")]
         public string Corpus { get; set; } = string.Empty;
@@ -225,6 +233,20 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             return 1;
 
         using GgufFile? gguf = hfDir is null ? GgufFile.Open(resolvedPath) : null;
+        if (settings.TensorOverlay is not null)
+        {
+            if (gguf is null)
+            {
+                AnsiConsole.MarkupLine($"[red]{Helpers.TensorOverlayCli.Option} needs a GGUF base model (not a safetensors directory).[/]");
+                return 1;
+            }
+            if (Helpers.TensorOverlayCli.TryAttach(gguf, resolvedPath, settings.TensorOverlay, settings.OverlaySkipBaseHash) is { } overlayError)
+            {
+                AnsiConsole.MarkupLine($"[red]{Markup.Escape(overlayError)}[/]");
+                return 1;
+            }
+            AnsiConsole.MarkupLine($"[dim]{Markup.Escape(Helpers.TensorOverlayCli.Summary(gguf, settings.OverlaySkipBaseHash))}[/]");
+        }
         ModelConfig config;
         var tokenizer = hfDir is null ? GgufBpeTokenizerFactory.Load(gguf!.Metadata) : null;
         IDisposable? safetensorsSource = null;
@@ -386,6 +408,13 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 break;
             }
         }
+        }
+
+        if (Helpers.TensorOverlayCli.TryVerifyApplied(gguf) is { } overlayNotApplied)
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(overlayNotApplied)}[/]");
+            model.Dispose();
+            return 1;
         }
 
         int effectiveContext = Math.Min(settings.Context, config.MaxSequenceLength);

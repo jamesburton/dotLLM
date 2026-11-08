@@ -376,6 +376,16 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [CommandOption("--ternary-adapter")]
         [Description("Path to a ternary residual adapter (.nsadapter), CPU only; repeatable to compose. Omit for base.")]
         public string[] TernaryAdapterPaths { get; set; } = Array.Empty<string>();
+
+        /// <summary>Tensor overlay GGUF (issue #1706).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.TensorOverlayCli.Option)]
+        [Description(DotLLM.Cli.Helpers.TensorOverlayCli.Help)]
+        public string? TensorOverlay { get; set; }
+
+        /// <summary>Skip the overlay base-hash check (issue #1706).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.TensorOverlayCli.SkipHashOption)]
+        [Description(DotLLM.Cli.Helpers.TensorOverlayCli.SkipHashHelp)]
+        public bool OverlaySkipBaseHash { get; set; }
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -462,6 +472,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
 
             gguf = GgufFile.Open(resolvedPath);
+            if (DotLLM.Cli.Helpers.TensorOverlayCli.TryAttach(gguf, resolvedPath, settings.TensorOverlay, settings.OverlaySkipBaseHash) is { } overlayError)
+                throw new DotLLM.Server.DeviceUnavailableException(overlayError);
             config = GgufModelConfigExtractor.Extract(gguf.Metadata);
             config = GgufModelConfigExtractor.ApplyRoPEOverride(config, BuildRoPEOverride(settings));
             tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
@@ -474,6 +486,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
                 resolvedPath, MoeOffloadCli.Build(settings.MoeValues));
             model = loaded.Model;
+            if (DotLLM.Cli.Helpers.TensorOverlayCli.TryVerifyApplied(gguf) is { } notApplied)
+            {
+                model.Dispose();
+                throw new DotLLM.Server.DeviceUnavailableException(notApplied);
+            }
             vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
             if (settings.DFlash is not null)
             {

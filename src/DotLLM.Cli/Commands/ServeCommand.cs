@@ -451,6 +451,17 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("Ternary residual adapter (.nsadapter or adapter GGUF, docs/TERNARY_ADAPTER.md) applied to every request; CPU transformer models only; repeatable to compose.")]
         public string[] TernaryAdapterPaths { get; set; } = Array.Empty<string>();
 
+        /// <summary>Tensor overlay GGUF (issue #1706).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.TensorOverlayCli.Option)]
+        [Description(DotLLM.Cli.Helpers.TensorOverlayCli.Help)]
+        public string? TensorOverlay { get; set; }
+
+        /// <summary>Skip the overlay base-hash check (issue #1706).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.TensorOverlayCli.SkipHashOption)]
+        [Description(DotLLM.Cli.Helpers.TensorOverlayCli.SkipHashHelp)]
+        public bool OverlaySkipBaseHash { get; set; }
+
+
         [CommandOption("--allow-lora-admin")]
         [Description("Enable the LoRA admin API: POST /v1/lora/load and DELETE /v1/lora/{name}. Off by default.")]
         public bool AllowLoraAdmin { get; set; }
@@ -601,6 +612,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             AllowLoraAdminApi = settings.AllowLoraAdmin,
             ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(settings.ChunkCache, settings.ChunkCacheMaxChunks, settings.ChunkStore, settings.ChunkCacheApiKeys, settings.ChunkCacheAllowShortKeys),
             TernaryAdapterPaths = settings.TernaryAdapterPaths is { Length: > 0 } ? settings.TernaryAdapterPaths : null,
+            TensorOverlayPath = settings.TensorOverlay,
+            OverlaySkipBaseHash = settings.OverlaySkipBaseHash,
             // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
             // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,
             // and the limiter was exercised only by unit tests constructing the config directly.

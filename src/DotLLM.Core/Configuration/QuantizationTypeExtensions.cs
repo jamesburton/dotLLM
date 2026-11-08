@@ -53,6 +53,8 @@ public static class QuantizationTypeExtensions
         QuantizationType.NVFP4 => elementCount / 64 * 36,
         // Upstream ggml Q2_0: fp16 d + qs[16] = 18 bytes / 64 elements (2.25 bpw).
         QuantizationType.Q2_0 => elementCount / 64 * 18,
+        // TERN_B64_F16: scale(Half, 2 bytes) + trits[16] = 18 bytes / 64 elements (2.25 bpw).
+        QuantizationType.TERN_B64_F16 => elementCount / 64 * 18,
         // PQ2_0: scale(Half, 2 bytes) + codes[32](uint8, 4 codes/byte) = 34 bytes / 128
         // elements (2.125 bpw) — one scale PER GROUP, not per tensor (contrast I2_S above).
         QuantizationType.PQ2_0 => elementCount / 128 * 34,

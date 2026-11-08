@@ -95,6 +95,10 @@ public static class QuantFormat
     /// strides use these 32 bytes only.
     /// </summary>
     public const int I2_SBlockBytes = 32;
+    /// <summary>Elements per block of <see cref="QuantizationType.TERN_B64_F16"/> (one FP16 scale per 64 input columns).</summary>
+    public const int TernB64GroupSize = 64;
+    /// <summary>TERN_B64_F16: scale(f16) + 16 packed trit bytes (4 trits/byte, LSB first) = 18 bytes per 64 weights.</summary>
+    public const int TernB64F16BlockBytes = 18;
     /// <summary>PQ2_0: scale(f16) + 32 packed code bytes; scale is per-group, in-block.</summary>
     public const int PQ2_0BlockBytes = 34;
     /// <summary>
@@ -162,6 +166,7 @@ public static class QuantFormat
         QuantizationType.I2_S => new Info(type, I2_SBlockBytes, TernaryGroupSize, HasMin: false),
         QuantizationType.PQ2_0 => new Info(type, PQ2_0BlockBytes, TernaryGroupSize, HasMin: false),
         QuantizationType.PTQ1_0 => new Info(type, PTQ1_0BlockBytes, TernaryGroupSize, HasMin: false),
+        QuantizationType.TERN_B64_F16 => new Info(type, TernB64F16BlockBytes, TernB64GroupSize, HasMin: false),
         _ => null,
     };
 
@@ -180,5 +185,6 @@ public static class QuantFormat
         QuantizationType.IQ2_S, QuantizationType.IQ3_XXS, QuantizationType.IQ3_S,
         QuantizationType.IQ4_XS,
         QuantizationType.I2_S, QuantizationType.PQ2_0, QuantizationType.PTQ1_0,
+        QuantizationType.TERN_B64_F16,
     ];
 }

@@ -482,6 +482,19 @@ public static class ServerStartup
     {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
         var gguf = GgufFile.Open(resolvedPath);
+        if (options.TensorOverlayPath is { } overlayPath)
+        {
+            try
+            {
+                var ov = TensorOverlay.Attach(gguf, resolvedPath, overlayPath, verifyBaseHash: !options.OverlaySkipBaseHash);
+                Console.WriteLine($"[dotllm] Tensor overlay '{overlayPath}': {ov.Count} tensor(s)" + (options.OverlaySkipBaseHash ? " (base hash NOT verified)." : "."));
+            }
+            catch (Exception ex) when (ex is InvalidDataException or IOException or NotSupportedException)
+            {
+                gguf.Dispose();
+                throw new InvalidServerOptionException($"--tensor-overlay: {ex.Message}");
+            }
+        }
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         config = GgufModelConfigExtractor.ApplyRoPEOverride(config, options.RopeOverride);
         bool isEncoder = config.Architecture is Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe;
@@ -511,6 +524,17 @@ public static class ServerStartup
         Func<int, IKvCache>? vulkanKvFactory = DeviceSpec.Parse(options.Device).Kind == DeviceKind.Vulkan ? deviceKvFactory : null;
 
         AttachTernaryAdapters(model, config, gguf, options);
+
+        if (gguf.Overlay is { } appliedOverlay)
+        {
+            try { appliedOverlay.VerifyAllApplied(); }
+            catch (NotSupportedException ex)
+            {
+                model.Dispose();
+                gguf.Dispose();
+                throw new InvalidServerOptionException(ex.Message);
+            }
+        }
 
         // Create chat template. The declared template is untrusted input from the GGUF's
         // tokenizer.chat_template metadata — a parse failure (unsupported Jinja construct,
