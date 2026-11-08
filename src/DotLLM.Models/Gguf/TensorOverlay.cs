@@ -30,6 +30,9 @@ namespace DotLLM.Models.Gguf;
 /// </remarks>
 public sealed partial class TensorOverlay : IDisposable
 {
+    /// <summary><c>general.architecture</c> of an overlay GGUF; only such files may carry raw I8 container tensors.</summary>
+    public const string OverlayArchitecture = "dotllm-overlay";
+
     /// <summary>Metadata key holding the SHA-256 (lowercase hex) of the base model file.</summary>
     public const string BaseSha256Key = "dotllm.overlay.base_sha256";
 

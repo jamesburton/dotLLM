@@ -203,15 +203,17 @@ only. Vulkan reuses the same layout and overlay contract (S3 of #1706).
 
 An overlay is a small GGUF that replaces **only the named FFN projections** of a base model, so any subset of `(layer, expert, projection)` can run in another
 format (typically `TERN_B64_F16`) while everything else keeps its original precision. Available on `run`, `perplexity` and `serve`
-(`--tensor-overlay overlay.gguf`, plus `--overlay-skip-base-hash`); CPU backend, plain transformer / stacked-expert MoE GGUF models (OLMoE, Mixtral-style,
-dense Llama family) in this release.
+(`--tensor-overlay overlay.gguf`, plus `--overlay-skip-base-hash`); CPU backend, plain transformer / stacked-expert MoE GGUF models and HF safetensors
+bases (OLMoE, Mixtral-style, dense Llama family) in this release. On a safetensors MoE base each layer's per-expert F32 matrices join the same side table
+(no copy), so the layer runs `MoeQuantSwiGluMlp`.
 
 | rule | detail |
 |---|---|
 | names | `blk.{L}.ffn_{gate,up,down}.{E}.weight` (routed expert E), `blk.{L}.ffn_{gate,up,down}.weight` (dense FFN). Anything else is an error. |
 | shapes | GGUF dims `[in, out]`, equal to the base projection (gate/up `[hidden, ffn]`, down `[ffn, hidden]`). Mismatch is an error. |
 | dtype | per-tensor GGUF type. `TERN_B64_F16` is validated at open (in % 64 == 0, no `0b11` code); other types (F16, F32, Q8_0...) are accepted wherever the CPU GEMV supports them. |
-| base binding | metadata `dotllm.overlay.base_sha256` = lowercase hex SHA-256 of the base file (first shard of a split set). Missing or mismatched is an error. The digest is cached per (path, length, mtime) in `~/.dotllm/hash-cache` (`DOTLLM_HASH_CACHE_DIR`); `--overlay-skip-base-hash` disables the check (a 4 GB base hashes in seconds, a 50 GB one in minutes on first use). |
+| I8 container | python `gguf` can only write I8, so a tensor may be stored as raw **unsigned** bytes in an `I8` tensor of GGUF dims `[in/64*18, out]` with `dotllm.overlay.dtype.{name} = "TERN_B64_F16"` and `dotllm.overlay.shape.{name} = [out, in]` metadata. Accepted only when `general.architecture = dotllm-overlay` (a model GGUF with an I8 tensor is still rejected). Byte count must equal `out*(in/64)*18`. A native type-243 tensor of shape `[in, out]` is equivalent. |
+| base binding | metadata `dotllm.overlay.base_sha256` = lowercase hex SHA-256 of the base file (first shard of a split set). Missing or mismatched is an error; the literal value `UNSPECIFIED` skips the check with a logged warning. A safetensors-directory base has no single file to hash: the check is skipped with a note. The digest is cached per (path, length, mtime) in `~/.dotllm/hash-cache` (`DOTLLM_HASH_CACHE_DIR`); `--overlay-skip-base-hash` disables the check (a 4 GB base hashes in seconds, a 50 GB one in minutes on first use). |
 | never ignored | unknown name, wrong layer/expert, dense name on a MoE layer (or vice versa), a loader that did not consume the overlay (GPU backends, other architectures) are all hard errors (`TensorOverlay.VerifyAllApplied`). |
 
 How it is applied (the contract Vulkan reuses): `TensorOverlay.Open/Attach` validates and attaches to the base `GgufFile`; the CPU `TransformerModel` loader then

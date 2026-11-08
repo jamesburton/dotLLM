@@ -418,7 +418,9 @@ public sealed class GgufFile : IDisposable
         {
             header = GgufReader.ReadHeader(reader);
             rawMetadata = GgufReader.ReadMetadata(reader, header);
-            tensors = GgufReader.ReadTensorInfos(reader, header);
+            tensors = GgufReader.ReadTensorInfos(reader, header,
+                allowI8Container: rawMetadata.TryGetValue("general.architecture", out var archValue) && archValue.Value is string archName
+                                  && string.Equals(archName, TensorOverlay.OverlayArchitecture, StringComparison.Ordinal));
             streamPositionAfterInfos = fs.Position;
             fileLength = fs.Length;
         }
