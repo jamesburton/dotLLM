@@ -40,8 +40,25 @@ public sealed partial class TensorOverlay : IDisposable
     private static partial Regex NameRegex();
 
     private readonly HashSet<string> _applied = new(StringComparer.Ordinal);
+    private readonly List<Entry> _entries = [];
+    private readonly List<string> _notes = [];
+
+    /// <summary>One overlay tensor in LOGICAL terms (the container may carry packed bytes as I8 with the real dtype/shape in metadata).</summary>
+    private sealed record Entry(string Name, int In, int Out, QuantizationType Qt, nint Ptr);
+
+    /// <summary>Metadata key prefix of the logical dtype of an I8-container tensor (dotllm.overlay.dtype.{tensor}).</summary>
+    public const string DtypeKeyPrefix = "dotllm.overlay.dtype.";
+
+    /// <summary>Metadata key prefix of the logical [out, in] shape of an I8-container tensor (dotllm.overlay.shape.{tensor}).</summary>
+    public const string ShapeKeyPrefix = "dotllm.overlay.shape.";
+
+    /// <summary>Base-hash value meaning "not recorded": the check is skipped with a note, not an error.</summary>
+    public const string UnspecifiedHash = "UNSPECIFIED";
 
     private TensorOverlay(GgufFile file, string path) { File = file; Path = path; }
+
+    /// <summary>Warnings and decisions made while opening (e.g. a skipped base-hash check); callers print them.</summary>
+    public IReadOnlyList<string> Notes => _notes;
 
     /// <summary>The opened overlay GGUF (owned).</summary>
     public GgufFile File { get; }
@@ -50,7 +67,7 @@ public sealed partial class TensorOverlay : IDisposable
     public string Path { get; }
 
     /// <summary>Number of tensors in the overlay.</summary>
-    public int Count => File.Tensors.Count;
+    public int Count => _entries.Count;
 
     /// <summary>Number of overlay tensors a loader has consumed.</summary>
     public int AppliedCount => _applied.Count;
@@ -82,7 +99,7 @@ public sealed partial class TensorOverlay : IDisposable
     /// <param name="verifyBaseHash">False = skip the base-hash check entirely (explicit opt-out; documented trade-off for multi-GB bases).</param>
     /// <returns>The overlay (caller owns; normally handed to <see cref="GgufFile.AttachOverlay"/>).</returns>
     /// <exception cref="InvalidDataException">Unknown tensor name, malformed ternary tensor, missing/mismatched base hash.</exception>
-    public static TensorOverlay Open(string overlayPath, string baseModelPath, bool verifyBaseHash = true)
+    public static TensorOverlay Open(string overlayPath, string? baseModelPath, bool verifyBaseHash = true)
     {
         var file = GgufFile.Open(overlayPath);
         try
@@ -104,7 +121,7 @@ public sealed partial class TensorOverlay : IDisposable
     /// Opens <paramref name="overlayPath"/>, validates it against <paramref name="baseModelPath"/> and attaches it to <paramref name="baseFile"/>
     /// (which then owns it). The shared entry point of every CLI/server surface.
     /// </summary>
-    public static TensorOverlay Attach(GgufFile baseFile, string baseModelPath, string overlayPath, bool verifyBaseHash = true)
+    public static TensorOverlay Attach(GgufFile baseFile, string? baseModelPath, string overlayPath, bool verifyBaseHash = true)
     {
         var ov = Open(overlayPath, baseModelPath, verifyBaseHash);
         baseFile.AttachOverlay(ov);
@@ -123,28 +140,71 @@ public sealed partial class TensorOverlay : IDisposable
                 + string.Join(", ", bad.Take(5)) + (bad.Count > 5 ? ", ..." : "") + ". Unknown tensors are never ignored.");
     }
 
+    private static long[]? ReadLongs(GgufMetadata md, string key)
+    {
+        if (!md.TryGetValue(key, out var v) || v.Value is string || v.Value is not System.Collections.IEnumerable e) return null;
+        var l = new List<long>();
+        foreach (object? o in e) l.Add(Convert.ToInt64(o, System.Globalization.CultureInfo.InvariantCulture));
+        return l.ToArray();
+    }
+
     private unsafe void ValidateTensors()
     {
         foreach (var t in File.Tensors)
         {
-            if (t.Shape.Rank != 2)
-                throw new InvalidDataException($"Tensor overlay '{Path}': '{t.Name}' must be rank 2 ([in, out]), got {t.Shape}.");
-            if (t.QuantizationType == QuantizationType.TERN_B64_F16)
+            QuantizationType qt; int inDim, outDim;
+            string dtypeKey = DtypeKeyPrefix + t.Name;
+            if (File.Metadata.TryGetValue(dtypeKey, out var dv))
             {
-                int k = t.Shape[0], m = t.Shape[1];
-                if (k % TernB64F16.GroupSize != 0)
-                    throw new InvalidDataException($"Tensor overlay '{Path}': TERN_B64_F16 tensor '{t.Name}' has in-dimension {k}, not a multiple of {TernB64F16.GroupSize}.");
-                TernB64F16.Validate(t.Name, (byte*)File.TensorDataPointer(t), m, k);
+                // I8 container: python gguf can only write I8, so a packed format travels as raw bytes with its logical dtype/shape in metadata.
+                string dtype = (dv.Value as string) ?? "";
+                if (!Enum.TryParse(dtype, ignoreCase: false, out qt) || !Enum.IsDefined(qt) || qt is QuantizationType.I8 or QuantizationType.LittleBit)
+                    throw new InvalidDataException($"Tensor overlay '{Path}': '{t.Name}' declares unknown/unsupported dtype '{dtype}' in {dtypeKey}.");
+                var shape = ReadLongs(File.Metadata, ShapeKeyPrefix + t.Name);
+                if (shape is not { Length: 2 } || shape[0] <= 0 || shape[1] <= 0 || shape[0] > int.MaxValue || shape[1] > int.MaxValue)
+                    throw new InvalidDataException($"Tensor overlay '{Path}': '{t.Name}' needs {ShapeKeyPrefix}{t.Name} = [out, in] (got {(shape is null ? "none" : "[" + string.Join(", ", shape) + "]")}).");
+                outDim = (int)shape[0]; inDim = (int)shape[1];
+                if (t.QuantizationType != QuantizationType.I8 && t.QuantizationType != qt)
+                    throw new InvalidDataException($"Tensor overlay '{Path}': '{t.Name}' is stored as {t.QuantizationType} but declares logical dtype {dtype}; only an I8 container or the native type is accepted.");
             }
+            else
+            {
+                if (t.Shape.Rank != 2)
+                    throw new InvalidDataException($"Tensor overlay '{Path}': '{t.Name}' must be rank 2 ([in, out]), got {t.Shape}.");
+                qt = t.QuantizationType; inDim = t.Shape[0]; outDim = t.Shape[1];
+            }
+
+            if (qt == QuantizationType.TERN_B64_F16 && inDim % TernB64F16.GroupSize != 0)
+                throw new InvalidDataException($"Tensor overlay '{Path}': TERN_B64_F16 tensor '{t.Name}' has in-dimension {inDim}, not a multiple of {TernB64F16.GroupSize}.");
+            long physical = t.QuantizationType.ComputeByteCount(t.Shape.ElementCount);
+            long expected = qt.ComputeByteCount((long)inDim * outDim);
+            if (physical != expected)
+                throw new InvalidDataException(
+                    $"Tensor overlay '{Path}': '{t.Name}' holds {physical} bytes but {qt} [out={outDim}, in={inDim}] needs {expected}.");
+
+            nint ptr = File.TensorDataPointer(t);
+            if (qt == QuantizationType.TERN_B64_F16)
+                TernB64F16.Validate(t.Name, (byte*)ptr, outDim, inDim);
+            _entries.Add(new Entry(t.Name, inDim, outDim, qt, ptr));
         }
     }
 
-    private void VerifyBaseHash(string baseModelPath)
+    private void VerifyBaseHash(string? baseModelPath)
     {
         if (!File.Metadata.TryGetValue(BaseSha256Key, out var v) || v.Value is not string expected || expected.Length == 0)
             throw new InvalidDataException(
                 $"Tensor overlay '{Path}' has no '{BaseSha256Key}' metadata, so it cannot be tied to a base model. Re-export it with the base hash, "
                 + "or pass --overlay-skip-base-hash to run it unchecked.");
+        if (string.Equals(expected.Trim(), UnspecifiedHash, StringComparison.Ordinal))
+        {
+            _notes.Add($"WARNING: tensor overlay '{Path}' has {BaseSha256Key} = {UnspecifiedHash}; the base model was NOT verified.");
+            return;
+        }
+        if (baseModelPath is null)
+        {
+            _notes.Add($"tensor overlay '{Path}': base is not a single GGUF file, so {BaseSha256Key} cannot be checked (skipped).");
+            return;
+        }
         string actual = BaseHash.Compute(baseModelPath);
         if (!string.Equals(expected.Trim(), actual, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException(
@@ -159,7 +219,7 @@ public sealed partial class TensorOverlay : IDisposable
     internal void ApplyToLayers(TransformerLayerWeights[] layers, ModelConfig config)
     {
         // Collect per-layer tables first so a failure leaves the model untouched.
-        foreach (var t in File.Tensors)
+        foreach (var t in _entries)
         {
             TryParseName(t.Name, out int layer, out int proj, out int expert);
             string what = $"Tensor overlay '{Path}': '{t.Name}'";
@@ -167,7 +227,7 @@ public sealed partial class TensorOverlay : IDisposable
                 throw new InvalidDataException($"{what} names layer {layer}, but the model has {layers.Length} layers.");
 
             ref readonly var lw = ref layers[layer];
-            nint ptr = File.TensorDataPointer(t);
+            nint ptr = t.Ptr;
             if (expert >= 0)
             {
                 var moe = lw.Moe;
@@ -179,9 +239,9 @@ public sealed partial class TensorOverlay : IDisposable
                     throw new InvalidDataException($"{what} names expert {expert}, but the layer has {moe.NumExperts} experts.");
                 int expIn = proj == 2 ? moe.IntermediateSize : moe.HiddenSize;
                 int expOut = proj == 2 ? moe.HiddenSize : moe.IntermediateSize;
-                CheckShape(what, t.Shape[0], t.Shape[1], expIn, expOut);
+                CheckShape(what, t.In, t.Out, expIn, expOut);
                 moe.ExpertOverlay ??= new ExpertOverlayTable(moe.NumExperts);
-                moe.ExpertOverlay.Set(proj, expert, ptr, t.QuantizationType);
+                moe.ExpertOverlay.Set(proj, expert, ptr, t.Qt);
             }
             else
             {
@@ -191,8 +251,8 @@ public sealed partial class TensorOverlay : IDisposable
                     throw new InvalidDataException($"{what}: layer {layer} of the base model has no dense FFN projections.");
                 int inDim = proj switch { 0 => lw.GateInputDim, 1 => lw.UpInputDim, _ => lw.DownInputDim };
                 int outDim = proj switch { 0 => lw.GateOutputDim, 1 => lw.UpOutputDim, _ => lw.DownOutputDim };
-                CheckShape(what, t.Shape[0], t.Shape[1], inDim, outDim);
-                layers[layer] = lw.WithDenseFfnOverride(proj, ptr, t.QuantizationType);
+                CheckShape(what, t.In, t.Out, inDim, outDim);
+                layers[layer] = lw.WithDenseFfnOverride(proj, ptr, t.Qt);
             }
             _applied.Add(t.Name);
         }

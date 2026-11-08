@@ -487,6 +487,7 @@ public static class ServerStartup
             try
             {
                 var ov = TensorOverlay.Attach(gguf, resolvedPath, overlayPath, verifyBaseHash: !options.OverlaySkipBaseHash);
+                foreach (string note in ov.Notes) Console.WriteLine($"[dotllm] {note}");
                 Console.WriteLine($"[dotllm] Tensor overlay '{overlayPath}': {ov.Count} tensor(s)" + (options.OverlaySkipBaseHash ? " (base hash NOT verified)." : "."));
             }
             catch (Exception ex) when (ex is InvalidDataException or IOException or NotSupportedException)

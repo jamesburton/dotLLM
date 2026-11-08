@@ -50,6 +50,13 @@ public enum QuantizationType
     Q6_K = 14,
 
     /// <summary>
+    /// Raw 8-bit container (ggml GGML_TYPE_I8 = 24), 1 byte per element. Used only by tensor overlays (#1706) that carry a packed format's bytes as
+    /// an I8 tensor of shape [bytes_per_row, out] with the logical dtype/shape in metadata (what the python gguf writer can emit). Bytes are
+    /// UNSIGNED payload, not int8 values. The matmul kernels do not accept it.
+    /// </summary>
+    I8 = 24,
+
+    /// <summary>
     /// 32-bit signed integer tensor (ggml <c>GGML_TYPE_I32</c> = 26). Not a weight-quantization
     /// format: it carries index lists and bit-packed payloads (e.g. the community NanoQuant GGUF stores
     /// its <c>nq_u</c>/<c>nq_v</c> sign words and <c>nq_salient_idx</c> as I32). 4 bytes per element,

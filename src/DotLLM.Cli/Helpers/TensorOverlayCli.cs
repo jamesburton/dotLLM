@@ -31,7 +31,8 @@ internal static class TensorOverlayCli
         if (overlayPath is null) return null;
         try
         {
-            TensorOverlay.Attach(gguf, baseModelPath, overlayPath, verifyBaseHash: !skipBaseHash);
+            var ov = TensorOverlay.Attach(gguf, baseModelPath, overlayPath, verifyBaseHash: !skipBaseHash);
+            foreach (string note in ov.Notes) Console.Error.WriteLine(note);
             return null;
         }
         catch (Exception ex) when (ex is InvalidDataException or IOException or NotSupportedException)

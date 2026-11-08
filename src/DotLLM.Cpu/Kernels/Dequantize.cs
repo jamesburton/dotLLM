@@ -87,6 +87,7 @@ public static unsafe partial class Dequantize
         QuantizationType.F16 => elementCount * 2,
         QuantizationType.BF16 => elementCount * 2,
         QuantizationType.I32 => elementCount * 4,
+        QuantizationType.I8 => elementCount,
         QuantizationType.Q4_0 => elementCount / Q8_0GroupSize * Q4_0BlockBytes,
         QuantizationType.Q4_1 => elementCount / Q8_0GroupSize * Q4_1BlockBytes,
         QuantizationType.Q8_0 => elementCount / Q8_0GroupSize * Q8_0BlockBytes,
