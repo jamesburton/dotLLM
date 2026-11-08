@@ -7463,26 +7463,31 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         }
     }
 
-    private static readonly bool MoeDecodeFusedEnabled = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_DECODE_FUSED") != "0";
+    /// <summary><c>DOTLLM_VK_MOE_DECODE_FUSED=0</c> disables <see cref="TryRecordMoeLayerDecodeFused"/> (A/B, bisection; settable for tests).</summary>
+    internal static bool MoeDecodeFusedEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_DECODE_FUSED") != "0";
 
     /// <summary>
-    /// One-token MoE layer with an ungated shared expert (Flint, DeepSeek-style) on the indexed MMVQ kernels, scheduled so the shared expert
-    /// rides in the routed path's barrier intervals and its result, the routed combine and the FFN residual add land in one final dispatch
-    /// (#1161). Returns false (nothing recorded) when the layer does not qualify; on true, <c>AddScratch</c> holds
-    /// <c>Residual + routed + shared</c> and the caller skips its residual add.
+    /// One-token MoE layer with an ungated shared expert (Flint, GLM-4.5-Air / glm4moe, DeepSeek-style) on the indexed MMVQ kernels, scheduled
+    /// so the shared expert rides in the routed path's barrier intervals and its result, the routed combine and the FFN residual add land in one
+    /// final dispatch (#1161; generalised past Flint in #1614). Returns false (nothing recorded) when the layer does not qualify; on true,
+    /// <c>AddScratch</c> holds <c>Residual + routed + shared</c> and the caller skips its residual add.
     /// </summary>
     /// <remarks>
-    /// The routed gate / up and the shared gate / up read the same Q8_1 quantisation of the normalised row (one row, so the dense and
-    /// per-row quantize layouts coincide); the per-op math is unchanged. 20 dispatches / ~16 barriers per layer become 13 / 7.
-    /// <c>DOTLLM_VK_MOE_DECODE_FUSED=0</c> disables.
+    /// <para>The routed gate / up and the shared gate / up read the same Q8_1 quantisation of the normalised row (one row, so the dense and
+    /// per-row quantize layouts coincide); the per-op math is unchanged. 20 dispatches / ~16 barriers per layer become 13 / 7.</para>
+    /// <para>Two arms added for glm4moe (#1614): (a) a routed gate / up bank without an xDiv shader (Q8_0) gets the row broadcast + quantised into
+    /// the routed scratch inside the router / top-k epochs (2 extra dispatches, no extra barrier); (b) a shared down projection without an MMVQ
+    /// decode kernel (REAP's Q5_1 <c>ffn_down_shexp</c> on 24 of 46 layers) runs through <see cref="RecordMatmul"/> on the F32 SwiGLU output
+    /// the fused activation kernel writes anyway. Both keep the single combine dispatch.</para>
+    /// <para><c>DOTLLM_VK_MOE_DECODE_FUSED=0</c> disables.</para>
     /// </remarks>
     private bool TryRecordMoeLayerDecodeFused(nint cmdBuf, VulkanWeights.MoeLayerBuffers moeW, in VulkanWeights.LayerBuffers lw, int seqLen, float eps)
     {
         int hidden = moeW.HiddenSize, interm = moeW.IntermediateSize, numE = moeW.NumExperts, topK = moeW.NumExpertsPerTok;
         int sharedI = moeW.SharedIntermediateSize;
-        // shortcut: Flint only - DeepSeek-style models (GLM-4.7-Flash, DeepSeek-V2) meet the same shape but have no real-model check here yet;
-        // drop the architecture test once one passes.
-        if (Config.Architecture != DotLLM.Core.Configuration.Architecture.Flint) return false;
+        // Architectures with a real-model parity check on this chain: Flint (#1161) and glm4moe (#1614, REAP-82B IQ4_XS). DeepSeek-V2 /
+        // GLM-4.7-Flash meet the same shape; add them here once one passes (`Glm4MoeVulkanParityTests.DecodeFused_*` is the template).
+        if (Config.Architecture is not (DotLLM.Core.Configuration.Architecture.Flint or DotLLM.Core.Configuration.Architecture.Glm4Moe)) return false;
         if (!MoeDecodeFusedEnabled || seqLen != 1 || moeW.GptOss is not null || moeW.NumSharedExperts != 1 || moeW.SharedExpertGate is not null
             || _currentLora is not null || _residualScale != 1.0f || lw.PostFfnNormWeight is not null || lw.Gemma4 is not null
             || moeW.GateDeviceQuantType != QuantType.F32)
@@ -7491,14 +7496,25 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             || !GenericMoeFuseEnabled || _gmSwiGluQuant is null || (interm % 32) != 0 || (sharedI % 32) != 0)
             return false;
         if (CanUseGroupedF16Moe(moeW, hidden, interm) || CanUseGroupedQuantMoe(moeW, seqLen, hidden, interm)
-            || !CanUseGenericMoeMmvq(moeW, seqLen, hidden, interm, out bool xDiv) || !xDiv)
+            || !CanUseGenericMoeMmvq(moeW, seqLen, hidden, interm, out bool xDiv))
+            return false;
+        // Q8_0 gate / up banks have no xDiv shader: the row is broadcast to its topK slots and quantised into the routed scratch (arm a).
+        if (!xDiv && (_moeBroadcast is null || _quantizeQ8_1Rows is null || _state.MoeExpandedInput is null))
             return false;
         _mmvqGroupScratch[0] = new(moeW.SharedW1![0], moeW.SharedW1DeviceQuantType, _state.MoeSharedGate!, sharedI);
         _mmvqGroupScratch[1] = new(moeW.SharedW3![0], moeW.SharedW3DeviceQuantType, _state.MoeSharedUp!, sharedI);
         var sharedGateUp = _mmvqGroupScratch.AsSpan(0, 2);
-        if (!CanShareMmvqQuant(hidden, 1, sharedGateUp) || !HasMmvqDecodeKernel(moeW.SharedW2DeviceQuantType, sharedI)
-            || QuantizeQ8_1Kernel.PackedBytes(sharedI) > _state.Q8_1Xq!.Size || QuantizeQ8_1Kernel.ScaleBytes(sharedI) > _state.Q8_1Xds!.Size)
+        if (QuantizeQ8_1Kernel.PackedBytes(sharedI) > _state.Q8_1Xq!.Size || QuantizeQ8_1Kernel.ScaleBytes(sharedI) > _state.Q8_1Xds!.Size)
             return false;
+        // Shared gate / up: read the shared Q8_1 quantisation when both have an MMVQ decode kernel; otherwise (arm c: K-quant shared experts on
+        // AMD, where the dense K-quant MMVQ is off by policy, #574/#576, so REAP's Q5_K shared gate/up take the coalesced F32-in GEMV) record them
+        // through RecordMatmul on the F32 normalised row. A mix (one MMVQ, one not) would make RecordMatmul re-quantise into the shared scratch
+        // under the group's reads (#949), so it is refused.
+        bool sharedGateUpShared = CanShareMmvqQuant(hidden, 1, sharedGateUp);
+        if (!sharedGateUpShared && (HasMmvqDecodeKernel(moeW.SharedW1DeviceQuantType, hidden) || HasMmvqDecodeKernel(moeW.SharedW3DeviceQuantType, hidden)))
+            return false;
+        // Shared down: the MMVQ GEMV over the fused activation's Q8_1 output when the type has one, else RecordMatmul over its F32 output (arm b).
+        bool sharedDownMmvq = HasMmvqDecodeKernel(moeW.SharedW2DeviceQuantType, sharedI);
         var xq = _state.Q8_1Xq!;
         var xds = _state.Q8_1Xds!;
 
@@ -7506,35 +7522,57 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _rmsnormQuantQ8Fused.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput, xq, xds, hidden, eps);
         BarrierComputeToCompute(cmdBuf);
 
-        // 2. Router logits; shared gate / up.
+        // 2. Router logits; shared gate / up; (arm a) the row broadcast to its topK slots.
         RecordMatmul(cmdBuf, moeW.Gate, moeW.GateDeviceQuantType, _state.NormOutput, _state.MoeRouterLogits!, outputDim: numE, inputDim: hidden, seqLen: 1);
-        RecordMmvqGroupGemvs(cmdBuf, hidden, sharedGateUp);
+        if (sharedGateUpShared)
+            RecordMmvqGroupGemvs(cmdBuf, hidden, sharedGateUp);
+        else
+        {
+            RecordMatmul(cmdBuf, moeW.SharedW1![0], moeW.SharedW1DeviceQuantType, _state.NormOutput, _state.MoeSharedGate!, outputDim: sharedI, inputDim: hidden, seqLen: 1);
+            RecordMatmul(cmdBuf, moeW.SharedW3![0], moeW.SharedW3DeviceQuantType, _state.NormOutput, _state.MoeSharedUp!, outputDim: sharedI, inputDim: hidden, seqLen: 1);
+        }
+        if (!xDiv)
+            _moeBroadcast!.Record(cmdBuf, _state.NormOutput, _state.MoeExpandedInput!, seqLen: 1, topK: topK, hidden: hidden);
         BarrierComputeToCompute(cmdBuf);
 
-        // 3. Top-k.
+        // 3. Top-k; (arm a) quantise the broadcast rows into the routed scratch.
         if (moeW.SigmoidGating)
             _moeTopkSigmoid!.Record(cmdBuf, _state.MoeRouterLogits!, moeW.SelectionBias!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
                 seqLen: 1, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb, weightsScale: moeW.WeightsScale);
         else
             _moeTopkSoftmax!.Record(cmdBuf, _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
                 seqLen: 1, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        if (!xDiv)
+            _quantizeQ8_1Rows!.Record(cmdBuf, _state.MoeExpandedInput!, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!, n: topK, k: hidden);
         BarrierComputeToCompute(cmdBuf);
         ProfSample("moe_router_topk");
         DpStamp(cmdBuf, DpCatMoeRoute);
 
-        // 4. Routed gate / up: the single row broadcast to its slots, read from the shared quantisation.
-        RecordGenericMoeMmvqProjection(cmdBuf, moeW.W1DeviceQuantType, moeW.W1Bank, _state.MoeGateInter!, null, interm, hidden, topK, numE, topK, xq, xds);
-        RecordGenericMoeMmvqProjection(cmdBuf, moeW.W3DeviceQuantType, moeW.W3Bank, _state.MoeUpInter!, null, interm, hidden, topK, numE, topK, xq, xds);
+        // 4. Routed gate / up: the single row broadcast to its slots, read from the shared quantisation (xDiv) or the routed scratch (arm a).
+        if (xDiv)
+        {
+            RecordGenericMoeMmvqProjection(cmdBuf, moeW.W1DeviceQuantType, moeW.W1Bank, _state.MoeGateInter!, null, interm, hidden, topK, numE, topK, xq, xds);
+            RecordGenericMoeMmvqProjection(cmdBuf, moeW.W3DeviceQuantType, moeW.W3Bank, _state.MoeUpInter!, null, interm, hidden, topK, numE, topK, xq, xds);
+        }
+        else
+        {
+            RecordGenericMoeMmvqProjection(cmdBuf, moeW.W1DeviceQuantType, moeW.W1Bank, _state.MoeGateInter!, null, interm, hidden, topK, numE, 1);
+            RecordGenericMoeMmvqProjection(cmdBuf, moeW.W3DeviceQuantType, moeW.W3Bank, _state.MoeUpInter!, null, interm, hidden, topK, numE, 1);
+        }
         BarrierComputeToCompute(cmdBuf);
 
-        // 5. Routed SwiGLU into the routed Q8_1 scratch; shared SwiGLU into the dense one (all of its readers finished above).
+        // 5. Routed SwiGLU into the routed Q8_1 scratch (its gate / up reads finished above); shared SwiGLU into the dense one.
         _gmSwiGluQuant.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!, topK * interm, false);
         _swigluQuantQ8Fused.Record(cmdBuf, _state.MoeSharedGate!, _state.MoeSharedUp!, _state.MoeSharedSilu!, xq, xds, sharedI);
         BarrierComputeToCompute(cmdBuf);
 
-        // 6. Routed down; shared down.
+        // 6. Routed down; shared down (MMVQ over the Q8_1 scratch, or arm b: RecordMatmul over the F32 SwiGLU output).
         RecordGenericMoeMmvqProjection(cmdBuf, moeW.W2DeviceQuantType, moeW.W2Bank, _state.MoeDownRows!, null, hidden, interm, topK, numE, 1);
-        RecordMmvqGemvPreQuantized(cmdBuf, moeW.SharedW2![0], moeW.SharedW2DeviceQuantType, _state.MoeSharedSumA!, hidden, sharedI);
+        if (sharedDownMmvq)
+            RecordMmvqGemvPreQuantized(cmdBuf, moeW.SharedW2![0], moeW.SharedW2DeviceQuantType, _state.MoeSharedSumA!, hidden, sharedI);
+        else
+            RecordMatmul(cmdBuf, moeW.SharedW2![0], moeW.SharedW2DeviceQuantType, _state.MoeSharedSilu!, _state.MoeSharedSumA!,
+                outputDim: hidden, inputDim: sharedI, seqLen: 1);
         BarrierComputeToCompute(cmdBuf);
 
         // 7. AddScratch = Residual + (routed combine + shared).

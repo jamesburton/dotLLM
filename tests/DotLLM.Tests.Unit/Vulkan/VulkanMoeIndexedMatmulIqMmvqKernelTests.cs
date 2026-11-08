@@ -165,6 +165,33 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     [InlineData(QuantizationType.Q4_1, 512, true)]      // Flint down: 16 blocks
     [InlineData(QuantizationType.Q4_1, 2048, true)]     // Flint gate/up: exactly one U=2 chunk
     [InlineData(QuantizationType.Q4_1, 2080, true)]     // chunk + 1-block tail
+    // #1678: the remaining IQ bank formats. glm4moe REAP: IQ4_XS gate/up K = hidden 4096 (exactly one 16-block chunk), IQ4_NL down K = 1408
+    // (44 blocks: a partial U=2 chunk, 20 masked lanes in the second step).
+    [InlineData(QuantizationType.IQ4_XS, 256, true)]
+    [InlineData(QuantizationType.IQ4_XS, 1280, true)]   // partial 4-block step
+    [InlineData(QuantizationType.IQ4_XS, 4096, true)]
+    [InlineData(QuantizationType.IQ4_XS, 4608, true)]   // chunk + 2-block tail
+    [InlineData(QuantizationType.IQ4_XS, 4608, false)]
+    [InlineData(QuantizationType.IQ4_NL, 32, true)]     // one block, 31 masked lanes
+    [InlineData(QuantizationType.IQ4_NL, 1408, true)]
+    [InlineData(QuantizationType.IQ4_NL, 2048, true)]   // exactly one U=2 chunk
+    [InlineData(QuantizationType.IQ4_NL, 2080, true)]   // chunk + 1-block tail
+    [InlineData(QuantizationType.IQ4_NL, 1408, false)]
+    [InlineData(QuantizationType.IQ3_S, 256, true)]
+    [InlineData(QuantizationType.IQ3_S, 1280, true)]
+    [InlineData(QuantizationType.IQ3_S, 4096, true)]
+    [InlineData(QuantizationType.IQ3_S, 4608, true)]
+    [InlineData(QuantizationType.IQ3_S, 4608, false)]
+    [InlineData(QuantizationType.IQ2_S, 256, true)]
+    [InlineData(QuantizationType.IQ2_S, 1280, true)]
+    [InlineData(QuantizationType.IQ2_S, 4096, true)]
+    [InlineData(QuantizationType.IQ2_S, 4608, true)]
+    [InlineData(QuantizationType.IQ2_S, 4608, false)]
+    [InlineData(QuantizationType.IQ3_XXS, 256, true)]
+    [InlineData(QuantizationType.IQ3_XXS, 1280, true)]
+    [InlineData(QuantizationType.IQ3_XXS, 4096, true)]
+    [InlineData(QuantizationType.IQ3_XXS, 4608, true)]
+    [InlineData(QuantizationType.IQ3_XXS, 4608, false)]
     public void BroadcastActivation_V1AndV2_MatchSameTierCpuOracle(QuantizationType qt, int k, bool v2)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -173,10 +200,11 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
 
         using var quant = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir)
             ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
+        using var codebooks3 = Iq3Codebooks.Create(device);
         using var codebooks2 = Iq2Codebooks.Create(device);
         using var codebooks1 = Iq1Codebooks.Create(device);
         var iq = MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(qt)!.Value;
-        using var kernel = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, iq, null, codebooks2, codebooks1, v2: v2)
+        using var kernel = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, iq, codebooks3, codebooks2, codebooks1, v2: v2)
             ?? throw new Xunit.Sdk.XunitException(MoeIndexedMatmulIqMmvqKernel.ShaderName(iq, v2) + ".spv missing or unsupported.");
         Assert.Equal(v2, kernel.IsV2);
 
@@ -245,7 +273,7 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
         return bytes;
     }
 
-    private static float[] Launch(
+    internal static float[] Launch(
         VulkanDevice device, QuantizeQ8_1RowsKernel quant, MoeIndexedMatmulIqMmvqKernel kernel,
         byte[] bank, float[] x, int[] indices, int m, int k, int n, int numExperts,
         out sbyte[] xqBytes, out float[] xdsPairs)
@@ -279,7 +307,7 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     }
 
     /// <summary>CPU dequant of the expert row dotted (double) with the kernel's own Q8_1 activations (xq * d_x).</summary>
-    private static unsafe float[] CpuOracle(
+    internal static unsafe float[] CpuOracle(
         byte[] bank, QuantizationType qt, sbyte[] xq, float[] xds, int[] indices,
         int m, int k, int n, int numExperts, long rowBytes)
     {

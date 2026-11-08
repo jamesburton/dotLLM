@@ -95,7 +95,12 @@ checked against a header range-read (first 16 MB) of `bartowski/cerebras_GLM-4.5
   the legacy 32-element-block formats (IQ4_NL / Q4_0 / Q4_1) now need K % 64 (`VulkanWeights.MoeIqKGranule`; the grouped coopmat stages two blocks per round, the indexed MMVQ needs K % 32);
   (2) dense Q5_1 (`matmul_q5_1_f32_gemv` / `_gemm`, plain F32-in kernels) for the shared-expert down projection; (3) the IQ4_XS token table (151552 x 4096, 314 MiB packed) is gathered on the host
   (`TokenEmbeddingOnHost`: rows are dequantised from the mmap into the host-visible staging buffer, a few KB per token) instead of being widened to a 2.3 GiB F32 device copy. KV is F16 (`IsDenseF16KvEligible`).
-  The fused single-token MoE decode layer (`TryRecordMoeLayerDecodeFused`) is still Flint-only. MTP/NextN is not run.
+  The fused single-token MoE decode layer (`TryRecordMoeLayerDecodeFused`: rmsnorm+quantize -> router / shared gate+up -> top-k -> routed gate/up ->
+  fused SwiGLU+quantize -> routed down / shared down -> one combine+residual dispatch; 13 dispatches / 7 barriers per MoE layer instead of ~20 / 16) runs on
+  glm4moe since #1614 (`DOTLLM_VK_MOE_DECODE_FUSED=0` disables). Two arms were added for it: Q8_0 gate/up banks (no xDiv shader) get the row broadcast +
+  quantised into the routed scratch inside the router / top-k epochs, and a shared down projection without an MMVQ kernel (REAP's Q5_1 `ffn_down_shexp`
+  on 24 of 46 layers) runs `RecordMatmul` (the plain F32-in Q5_1 GEMV) over the F32 SwiGLU output the fused activation kernel writes anyway.
+  MTP/NextN is not run.
 - **Validation recipe**: `tests/scripts/glm4moe_synthetic_hf_reference.py` loads the `SyntheticGlm4MoeGguf` tensors into HF `Glm4MoeForCausalLM` (F32, eager; use a STOCK torch wheel - a locally built
   torch 2.14 gave run-to-run different MoE logits with multithreaded CPU kernels) and prints the golden pasted into `Glm4MoeForwardTests`. On real files: `llama-perplexity -dev none --kl-divergence-base`
   + `dotllm perplexity --tokens-file` **without `--bos`** (GLM adds no BOS: the kld ids start at `
