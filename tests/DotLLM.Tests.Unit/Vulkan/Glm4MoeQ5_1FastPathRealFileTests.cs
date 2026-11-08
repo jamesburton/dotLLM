@@ -78,6 +78,24 @@ public sealed class Glm4MoeQ5_1FastPathRealFileTests(ITestOutputHelper output)
             return (last, Copy(d), model.Q5_1FastDispatchCount - f0, model.Q5_1DenseDispatchCount - t0);
         }
 
+        // ONE indicative A/B (the box is build-contended; the lead replays it in a quiet window): pp512 then 8 decode steps, slow/fast/slow/fast.
+        double Time(bool fast, int rows)
+        {
+            model.Q5_1FastEnabled = fast;
+            int[] p512 = Enumerable.Range(0, rows).Select(i => ids[i % ids.Length]).ToArray();
+            int[] pos512 = Enumerable.Range(0, rows).ToArray();
+            using var cache = model.CreateKvCache(rows + 16);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            using (ITensor p = model.Forward(p512, pos512, deviceId: -1, cache)) { }
+            double pp = sw.Elapsed.TotalMilliseconds;
+            sw.Restart();
+            for (int s = 0; s < 8; s++) using (ITensor d = model.Forward([ids[s]], [rows + s], deviceId: -1, cache)) { }
+            double tg = sw.Elapsed.TotalMilliseconds / 8;
+            output.WriteLine($"indicative fast={fast}: pp{rows} {pp:F0} ms ({rows * 1000 / pp:F0} tok/s), decode {tg:F1} ms/token");
+            return pp;
+        }
+        foreach (bool f in new[] { false, true, false, true }) Time(f, 512);
+
         var slow = Run(fast: false);
         var quick = Run(fast: true);
         var slow2 = Run(fast: false);   // the F32-in pair is deterministic: a repeat pins the noise floor of this comparison at 0
