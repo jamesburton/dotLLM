@@ -10,6 +10,7 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 /// int8-activation production kernel). The expected values come from an INDEPENDENT decoder written straight from the spec (<see cref="SpecDecode"/>),
 /// never from the code under test, so a self-consistent pack/unpack pair cannot hide a layout error.
 /// </summary>
+[Collection("TernKernelSerial")]
 public sealed unsafe class TernB64F16Tests
 {
     // ───────────────────────── spec-derived oracle (independent of TernB64F16) ─────────────────────────

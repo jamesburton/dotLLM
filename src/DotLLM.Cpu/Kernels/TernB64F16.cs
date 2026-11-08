@@ -33,7 +33,7 @@ public static unsafe class TernB64F16
     private const int ParallelMinRows = 64;
 
     /// <summary>True when <c>DOTLLM_TERN_F32ACT=1</c>: dense/expert ternary projections run the F32-activation scalar reference kernel (oracle mode).</summary>
-    public static readonly bool UseF32ActivationReference = Environment.GetEnvironmentVariable("DOTLLM_TERN_F32ACT") == "1";
+    public static bool UseF32ActivationReference { get; internal set; } = Environment.GetEnvironmentVariable("DOTLLM_TERN_F32ACT") == "1";
 
     /// <summary>byte -> four trits as packed sbytes (code 3 decodes to 0); LUT for the row unpack.</summary>
     private static readonly uint[] s_unpack = BuildUnpackTable();
