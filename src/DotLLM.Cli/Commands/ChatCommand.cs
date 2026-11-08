@@ -44,6 +44,11 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                      "A single trailing newline is stripped. Mutually exclusive with --system.")]
         public string? SystemPromptFile { get; set; }
 
+        /// <summary>Ternary residual adapter package(s) (#1711).</summary>
+        [CommandOption("--ternary-adapter")]
+        [Description("Path to a ternary residual adapter (.nsadapter or adapter GGUF); repeatable to compose. CPU and Vulkan models with a residual hook only; others are refused. Omit for base.")]
+        public string[] TernaryAdapterPaths { get; set; } = Array.Empty<string>();
+
         /// <summary>Maximum tokens per response.</summary>
         [CommandOption("--max-tokens|-n")]
         [Description("Maximum number of tokens to generate per response.")]
@@ -484,6 +489,23 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         // Resolved device line + (for auto on the CPU) the prominent warning, printed after the spinner so it stays visible.
         DeviceCli.Report(deviceOutcome, json: false);
 
+        // Ternary residual adapter(s) (#1711): the shared attach path; a model without a hook is a hard error, never a silent base run.
+        DotLLM.Server.TernaryAdapterAttach.Handle? ternaryHandle = null;
+        if (settings.TernaryAdapterPaths.Length > 0)
+        {
+            try
+            {
+                ternaryHandle = DotLLM.Server.TernaryAdapterAttach.Attach(model!, config!, settings.TernaryAdapterPaths);
+                AnsiConsole.MarkupLine($"[grey]Ternary adapters attached ({ternaryHandle.Where}): {ternaryHandle.CircuitCount} circuit(s).[/]");
+            }
+            catch (Exception ex) when (ex is InvalidDataException or InvalidOperationException or NotSupportedException or IOException or ArgumentException)
+            {
+                Console.Error.WriteLine(ex.Message.StartsWith("--ternary-adapter", StringComparison.Ordinal) ? ex.Message : $"--ternary-adapter: {ex.Message}");
+                model?.Dispose(); gguf?.Dispose(); safetensorsSource?.Dispose();
+                return 1;
+            }
+        }
+
         // Display VRAM warning after spinner completes (so it stays visible)
         string? vramWarning = (model as DotLLM.Cuda.CudaTransformerModel)?.VramWarning
                            ?? (model as DotLLM.Cuda.HybridTransformerModel)?.VramWarning;
@@ -758,6 +780,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             cudaPagedFactory?.Dispose();
             draftModel?.Dispose();
             draftGguf?.Dispose();
+            ternaryHandle?.Dispose();
             model?.Dispose();
             gguf?.Dispose();
             safetensorsSource?.Dispose();
