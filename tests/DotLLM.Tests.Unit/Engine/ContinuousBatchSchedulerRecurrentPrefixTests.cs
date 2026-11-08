@@ -7,6 +7,7 @@ using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
+using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Scheduler;
 using DotLLM.Tokenizers;
 using Xunit;
@@ -96,6 +97,32 @@ public sealed class ContinuousBatchSchedulerRecurrentPrefixTests
         Assert.Equal(t2.Length - G.Length, turn3.Timings.CachedTokenCount);
         Assert.Equal(1, scheduler.RecurrentPrefixEntryCount);
         await AssertMatchesColdRun(t3, turn3, Kvf, HintedOpts);
+    }
+
+    [Theory]
+    [InlineData(PrefixCachePolicy.Lru)]
+    [InlineData(PrefixCachePolicy.Agent)]
+    public async Task OverCapacity_Agent_EvictsTheShortStaleEntry_Lru_TheLongConversation(PrefixCachePolicy policy)
+    {
+        // Issue #1654. Two entries fit. A 200-token conversation, then a 40-token side request, then another unrelated 40-token
+        // request: one entry must go. LRU drops the conversation (used first); the agent policy drops the side request, which is
+        // more than its own length old (80 tokens read since) while the conversation is 40% old. The conversation's next turn
+        // then hits (agent) or re-prefills (LRU).
+        using var model = new ThreadedHistoryModel();
+        using var scheduler = new ContinuousBatchScheduler(model, new CsvTokenizer(), Kvf,
+            new ContinuousBatchSchedulerOptions { RecurrentPrefixCacheEntries = 2, RecurrentPrefixPolicy = policy });
+        int[] conversation = [.. Run(1000, 200), .. G];
+        int[] side = [.. Run(5000, 40), .. G];
+        int[] other = [.. Run(7000, 40), .. G];
+
+        await RunOne(scheduler, conversation, HintedOpts);
+        await RunOne(scheduler, side, HintedOpts);
+        await RunOne(scheduler, other, HintedOpts);
+        Assert.Equal(2, scheduler.RecurrentPrefixEntryCount);
+        var nextTurn = await RunOne(scheduler, [.. Run(1000, 200), .. Run(1500, 20), .. G], HintedOpts);
+
+        Assert.Equal(policy == PrefixCachePolicy.Agent ? 200 : 0, nextTurn.Timings.CachedTokenCount);
+        await AssertMatchesColdRun([.. Run(1000, 200), .. Run(1500, 20), .. G], nextTurn, Kvf, HintedOpts);
     }
 
     [Fact]

@@ -128,12 +128,15 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     /// <summary>Shortest shared prefix worth a snapshot; matches <c>TextGenerator.RecurrentPrefixMinTokens</c>.</summary>
     public const int RecurrentPrefixMinTokens = 16;
 
-    private sealed class RecurrentPrefixEntry(int[] tokens, IDisposable snapshot) : IDisposable
+    private sealed class RecurrentPrefixEntry(int[] tokens, IDisposable snapshot, long useClock) : IDisposable
     {
         public int[] Tokens { get; } = tokens;
         public IDisposable Snapshot { get; } = snapshot;
+        /// <summary>The scheduler's token clock at the entry's capture or last hit (<see cref="PrefixRetention"/>, #1654).</summary>
+        public long LastUseClock { get; set; } = useClock;
         public void Dispose() => Snapshot.Dispose();
     }
+    private long _recurrentPrefixTokenClock;   // prompt tokens admitted through ResolveRecurrentPrefix: the own-length clock (#1654)
     private readonly List<SequenceForwardRequest> _prefillBatch = new();
     private int[] _prefillPositions = Array.Empty<int>();
 
@@ -1041,6 +1044,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     {
         int promptLen = promptIds.Length;
         var kv = seq.KvCache!;
+        _recurrentPrefixTokenClock += promptLen;
         RecurrentPrefixEntry? best = LongestRecurrentPrefix(promptIds, int.MaxValue);
 
         // Issue #1093: a KV smaller than the request (a factory that handed out less than asked) grows to exactly the request
@@ -1076,6 +1080,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             seq.RecurrentStateDirty = false;   // fully overwritten by the snapshot
             _recurrentPrefixes.Remove(best);
             _recurrentPrefixes.Insert(0, best);   // MRU
+            best.LastUseClock = _recurrentPrefixTokenClock;
             start = best.Tokens.Length;
 
             // Without a hint a hit keeps its snapshot. With one, a hit that continues the conversation moves it forward.
@@ -1110,7 +1115,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         var snapshot = _model.SnapshotSequencePrefix(seq.KvCache!, seq.RecurrentState, boundary);
         if (snapshot is not null)
         {
-            _recurrentPrefixes.Insert(0, new RecurrentPrefixEntry(promptIds.AsSpan(0, boundary).ToArray(), snapshot));
+            _recurrentPrefixes.Insert(0, new RecurrentPrefixEntry(promptIds.AsSpan(0, boundary).ToArray(), snapshot, _recurrentPrefixTokenClock));
 
             // A hit that moved its snapshot forward supersedes the entry it extended (the conversation's next turn hits the
             // longer one), so release it rather than let one conversation fill the cache with nested copies of its own history.
@@ -1121,10 +1126,16 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 best.Dispose();
             }
 
+            // The list is MRU-ordered, so the LRU is last; the agent-aware policy picks the entry oldest relative to its own
+            // length instead, so a long conversation outlives the short side requests that followed it (#1654).
             while (_recurrentPrefixes.Count > _options.RecurrentPrefixCacheEntries)
             {
-                _recurrentPrefixes[^1].Dispose();
-                _recurrentPrefixes.RemoveAt(_recurrentPrefixes.Count - 1);
+                int victim = _options.RecurrentPrefixPolicy == PrefixCachePolicy.Agent
+                    ? PrefixRetention.SelectVictim(_recurrentPrefixes, e => e.LastUseClock, e => e.Tokens.Length,
+                        _recurrentPrefixTokenClock, PrefixCachePolicy.Agent)
+                    : _recurrentPrefixes.Count - 1;
+                _recurrentPrefixes[victim].Dispose();
+                _recurrentPrefixes.RemoveAt(victim);
             }
         }
         return start;   // the rows past it are in the KV; the caller continues from its length

@@ -60,6 +60,7 @@ public sealed class PromptCacheEndpointTests
     {
         var resp = new PromptCacheStatsResponse
         {
+            Policy = "lru",
             Enabled = true,
             BlockSize = 16,
             Nodes = 4,
@@ -103,6 +104,38 @@ public sealed class PromptCacheEndpointTests
 
         Assert.NotNull(req);
         Assert.Equal("sys-main", req!.PrefixId);
+    }
+
+    [Fact]
+    public void Stats_ReportThePolicy_AndTheLiveCache_WithItsProtectedMisses()
+    {
+        // Issue #1654: a server without a paged trie (Vulkan, CUDA, --no-paged) still reports its live-KV prefix cache.
+        using var live = new PrefixCache(4, PrefixCachePolicy.Agent);
+        live.Store([.. Enumerable.Range(1, 100)], new SimpleKvCache(2, 2, 4, 256));
+        live.FindMatch([.. Enumerable.Range(1, 10), 900, 901]);   // protected: a 12-token side request on a 100-token conversation
+
+        var stats = DotLLM.Server.Endpoints.PromptCacheEndpoint.BuildStats(null, null, live, PrefixCachePolicy.Agent);
+        string json = JsonSerializer.Serialize(stats, ServerJsonContext.Default.PromptCacheStatsResponse);
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.True(stats.Enabled);
+        Assert.Equal("agent", doc.RootElement.GetProperty("policy").GetString());
+        var liveJson = doc.RootElement.GetProperty("live");
+        Assert.Equal(1, liveJson.GetProperty("entries").GetInt32());
+        Assert.Equal(1, liveJson.GetProperty("misses").GetInt64());
+        Assert.Equal(1, liveJson.GetProperty("protected_misses").GetInt64());
+        Assert.Equal(12, liveJson.GetProperty("token_clock").GetInt64());
+    }
+
+    [Fact]
+    public void Stats_WithoutALiveCache_OmitTheLiveSection_AndDefaultToLru()
+    {
+        var stats = DotLLM.Server.Endpoints.PromptCacheEndpoint.BuildStats(null, null);
+        string json = JsonSerializer.Serialize(stats, ServerJsonContext.Default.PromptCacheStatsResponse);
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.False(doc.RootElement.TryGetProperty("live", out _));
+        Assert.Equal("lru", doc.RootElement.GetProperty("policy").GetString());
     }
 
     [Fact]

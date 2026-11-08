@@ -28,6 +28,7 @@ public sealed class PrefixTrie
     private readonly KvBlockPool _pool;
     private readonly int _blockSize;
     private readonly int _maxPrefixDepth;
+    private readonly PrefixCachePolicy _policy;
     private readonly PrefixTrieNode _root;
     private readonly Dictionary<string, PrefixTrieNode> _namedPrefixes = new(StringComparer.Ordinal);
     private readonly object _lock = new();
@@ -36,6 +37,7 @@ public sealed class PrefixTrie
     private long _hitTokens;
     private long _missTokens;
     private long _lookups;
+    private long _tokenClock;   // prompt tokens looked up so far: the own-length rule's clock (#1654), guarded by _lock
 
     /// <summary>The KV block pool this trie hands out shared blocks from.</summary>
     public KvBlockPool Pool => _pool;
@@ -58,16 +60,26 @@ public sealed class PrefixTrie
     /// <summary>Total lookups performed.</summary>
     public long Lookups => Interlocked.Read(ref _lookups);
 
+    /// <summary>The eviction policy (#1654).</summary>
+    public PrefixCachePolicy Policy => _policy;
+
+    /// <summary>Prompt tokens looked up so far: the clock the own-length rule is measured on (#1654).</summary>
+    public long TokenClock { get { lock (_lock) return _tokenClock; } }
+
     /// <summary>
     /// Creates a new prefix trie over the given block pool.
     /// </summary>
-    public PrefixTrie(KvBlockPool pool, int maxPrefixDepth = 0)
+    /// <param name="pool">The block pool.</param>
+    /// <param name="maxPrefixDepth">Maximum prefix depth in tokens; 0 = unbounded.</param>
+    /// <param name="policy">Which zero-refcount leaf <see cref="EvictOneLru"/> reclaims first (<see cref="PrefixCacheConfig.EvictionPolicy"/>).</param>
+    public PrefixTrie(KvBlockPool pool, int maxPrefixDepth = 0, PrefixCachePolicy policy = PrefixCachePolicy.Lru)
     {
         ArgumentNullException.ThrowIfNull(pool);
         if (maxPrefixDepth < 0) throw new ArgumentOutOfRangeException(nameof(maxPrefixDepth));
         _pool = pool;
         _blockSize = pool.BlockSize;
         _maxPrefixDepth = maxPrefixDepth;
+        _policy = policy;
         _root = new PrefixTrieNode(blockId: -1, parent: null);
     }
 
@@ -116,6 +128,8 @@ public sealed class PrefixTrie
 
         lock (_lock)
         {
+            // Every prompt looked up advances the clock, hit or miss: the own-length rule counts "other prompt tokens read" (#1654).
+            _tokenClock += promptTokens.Length;
             PrefixTrieNode current = _root;
             for (int b = 0; b < maxBlocks; b++)
             {
@@ -135,6 +149,7 @@ public sealed class PrefixTrie
                 _pool.AddRef(child.BlockId);
                 child.RefCount++;
                 child.LastTouchedTicks = ts;
+                child.LastUseClock = _tokenClock;
                 matchedBlocks.Add(child.BlockId);
                 matched += _blockSize;
                 current = child;
@@ -228,6 +243,7 @@ public sealed class PrefixTrie
                     // block and ref) and continue walking the trie.
                     _pool.Release(newBlockId);
                     existing.LastTouchedTicks = ts;
+                    existing.LastUseClock = _tokenClock;
                     current = existing;
                     continue;
                 }
@@ -237,6 +253,7 @@ public sealed class PrefixTrie
                 var node = new PrefixTrieNode(newBlockId, current)
                 {
                     LastTouchedTicks = ts,
+                    LastUseClock = _tokenClock,
                     RefCount = 0,
                     IsApprox = approx,
                 };
@@ -380,7 +397,10 @@ public sealed class PrefixTrie
     }
 
     /// <summary>
-    /// Evicts a single zero-refcount LRU leaf and returns its block to the pool.
+    /// Evicts a single zero-refcount leaf and returns its block to the pool: the least recently touched under
+    /// <see cref="PrefixCachePolicy.Lru"/>; under <see cref="PrefixCachePolicy.Agent"/> the leaf whose path is oldest relative
+    /// to its own length (<see cref="PrefixRetention.Age"/>: tokens looked up since the leaf was last used, over the tokens on
+    /// its path), so a long conversation's tail outlives shorter paths touched after it (#1654).
     /// </summary>
     /// <returns>The evicted block id, or -1 if no zero-refcount leaf was available.</returns>
     public int EvictOneLru()
@@ -388,7 +408,10 @@ public sealed class PrefixTrie
         lock (_lock)
         {
             PrefixTrieNode? victim = null;
-            FindLruZeroRefLeaf(_root, ref victim);
+            if (_policy == PrefixCachePolicy.Agent)
+                FindOldestByOwnLengthZeroRefLeaf(_root, _tokenClock, _blockSize, ref victim);
+            else
+                FindLruZeroRefLeaf(_root, ref victim);
             if (victim is null) return -1;
 
             int blockId = victim.BlockId;
@@ -434,6 +457,21 @@ public sealed class PrefixTrie
         }
         foreach (var (_, child) in node.Children)
             FindLruZeroRefLeaf(child, ref best);
+    }
+
+    private static void FindOldestByOwnLengthZeroRefLeaf(PrefixTrieNode node, long clock, int blockSize, ref PrefixTrieNode? best)
+    {
+        if (node.Children.Count == 0 && node.BlockId >= 0 && node.RefCount == 0)
+        {
+            if (best is null) { best = node; return; }
+            double age = PrefixRetention.Age(clock, node.LastUseClock, node.Depth * blockSize);
+            double bestAge = PrefixRetention.Age(clock, best.LastUseClock, best.Depth * blockSize);
+            if (age > bestAge || age == bestAge && node.LastTouchedTicks < best.LastTouchedTicks)
+                best = node;
+            return;
+        }
+        foreach (var (_, child) in node.Children)
+            FindOldestByOwnLengthZeroRefLeaf(child, clock, blockSize, ref best);
     }
 
     private void UnlinkNode(PrefixTrieNode node)
@@ -521,6 +559,20 @@ internal sealed class PrefixTrieNode
     /// <summary>External references (sequences) using this node's block.</summary>
     public int RefCount { get; set; }
     public long LastTouchedTicks { get; set; }
+
+    /// <summary>The trie's token clock when this node was last inserted or matched (#1654).</summary>
+    public long LastUseClock { get; set; }
+
+    /// <summary>Blocks from the root to this node inclusive: the length of the path it ends, in blocks.</summary>
+    public int Depth
+    {
+        get
+        {
+            int depth = 0;
+            for (var cur = this; cur is not null && cur.BlockId >= 0; cur = cur.Parent) depth++;
+            return depth;
+        }
+    }
 
     /// <summary>Snapshot lineage: the block's K/V is approximate (reuse / recompute, or computed after such a block).</summary>
     public bool IsApprox { get; init; }
