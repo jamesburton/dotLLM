@@ -408,4 +408,78 @@ public sealed class TensorOverlayTests : IDisposable
         var ex = Assert.Throws<NotSupportedException>(() => gguf.Overlay!.VerifyAllApplied());
         Assert.Contains("not applied", ex.Message);
     }
+
+    // ───────────────────────── I8 container (python gguf writer) + hash convention ─────────────────────────
+
+    private string WriteI8Overlay(string baseSha, string name, int inDim, int outDim, byte[] packed, bool declareDtype = true, string dtype = "TERN_B64_F16", int? declaredIn = null,
+                                  IEnumerable<OvTensor>? more = null)
+    {
+        // Shape as the python writer stores it: GGUF dims [in/64*18, out] (reversed [out, in/64*18]), I8 bytes; logical dtype + [out, in] in metadata.
+        var w = new GgufWriter();
+        w.AddString("general.architecture", "dotllm-overlay");
+        w.AddString(TensorOverlay.BaseSha256Key, baseSha);
+        if (declareDtype)
+        {
+            w.AddString(TensorOverlay.DtypeKeyPrefix + name, dtype);
+            w.AddInt32Array(TensorOverlay.ShapeKeyPrefix + name, [outDim, declaredIn ?? inDim]);
+        }
+        w.AddTensor(name, [inDim / 64 * 18, outDim], (uint)QuantizationType.I8, packed);
+        foreach (var o in more ?? [])
+        {
+            w.AddString(TensorOverlay.DtypeKeyPrefix + o.Name, "TERN_B64_F16");
+            w.AddInt32Array(TensorOverlay.ShapeKeyPrefix + o.Name, [o.Out, o.In]);
+            w.AddTensor(o.Name, [o.In / 64 * 18, o.Out], (uint)QuantizationType.I8, o.Data);
+        }
+        string path = Path.Combine(_dir, $"i8-{Guid.NewGuid():N}.gguf");
+        File.WriteAllBytes(path, w.Build());
+        return path;
+    }
+
+    [Fact]
+    public void I8Container_WithMetadata_IsEquivalentToNativeTernType_BitExact()
+    {
+        var cfg = MoeCfg();
+        var (basePath, wts) = WriteBase(cfg);
+        int per = cfg.FeedForward * cfg.Hidden;
+        // every expert's up projection of layer 1 (so routing certainly hits them), the first one carried in the I8 container's primary slot
+        var ts = Enumerable.Range(0, cfg.Experts).Select(e => TernPair($"blk.1.ffn_up.{e}.weight", Slice(wts.Layers[1].UpExps!, e, per), cfg.Hidden, cfg.FeedForward).Tern).ToList();
+        var t = ts[0];
+        string sha = Sha256Hex(basePath);
+        var native = Logits(basePath, WriteOverlay(sha, ts), true);
+        var viaI8 = Logits(basePath, WriteI8Overlay(sha, t.Name, t.In, t.Out, t.Data, more: ts.Skip(1)), true);
+        Assert.Equal(native, viaI8);
+        Assert.NotEqual(Logits(basePath, null), viaI8);   // and the overlay really changed something
+    }
+
+    [Fact]
+    public void I8Container_ByteCountShapeAndDtypeErrors()
+    {
+        var cfg = MoeCfg();
+        var (basePath, _) = WriteBase(cfg);
+        string sha = Sha256Hex(basePath);
+        var good = ZeroTern("blk.0.ffn_gate.0.weight", 128, 128);
+        // missing metadata => the I8 bytes would be read as a plain [in/64*18, out] I8 tensor: a shape error at apply time, never silently accepted
+        Assert.Throws<InvalidDataException>(() => Logits(basePath, WriteI8Overlay(sha, good.Name, 128, 128, good.Data, declareDtype: false)));
+        // byte count != out*(in/64)*18 (declared [out,in] larger than the bytes)
+        var ex = Assert.Throws<InvalidDataException>(() => TensorOverlay.Open(WriteI8Overlay(sha, good.Name, 128, 128, good.Data, declaredIn: 192), basePath, false));
+        Assert.Contains("bytes", ex.Message);
+        // unknown dtype string
+        Assert.Throws<InvalidDataException>(() => TensorOverlay.Open(WriteI8Overlay(sha, good.Name, 128, 128, good.Data, dtype: "TERN_B65"), basePath, false));
+        // invalid trit code inside an I8 container is rejected like a native tensor
+        var bad = (byte[])good.Data.Clone(); bad[18 * 3 + 2 + 5] = 0x0C;
+        Assert.Contains("0b11", Assert.Throws<InvalidDataException>(() => TensorOverlay.Open(WriteI8Overlay(sha, good.Name, 128, 128, bad), basePath, false)).Message);
+    }
+
+    [Fact]
+    public void UnspecifiedBaseHash_IsAWarningNotAnError_OtherMismatchStillFails()
+    {
+        var (basePath, _) = WriteBase(MoeCfg());
+        var t = ZeroTern("blk.0.ffn_gate.0.weight", 128, 128);
+        using (var ov = TensorOverlay.Open(WriteOverlay("UNSPECIFIED", [t]), basePath))
+            Assert.Contains(ov.Notes, n => n.Contains("UNSPECIFIED", StringComparison.Ordinal) && n.Contains("NOT verified", StringComparison.Ordinal));
+        Assert.Throws<InvalidDataException>(() => TensorOverlay.Open(WriteOverlay("unspecified-ish", [t]), basePath));
+        // base that is not a single GGUF file (e.g. an HF directory): hash skipped with a note
+        using var ov2 = TensorOverlay.Open(WriteOverlay(new string('0', 64), [t]), baseModelPath: null);
+        Assert.Contains(ov2.Notes, n => n.Contains("cannot be checked", StringComparison.Ordinal));
+    }
 }
