@@ -56,7 +56,7 @@ namespace DotLLM.Vulkan;
 /// matching the CUDA return convention.
 /// </para>
 /// </remarks>
-public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
+public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IVulkanResidualModifierHost
 {
     private readonly VulkanDevice _device;
     private readonly VulkanWeights _weights;
@@ -1231,6 +1231,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     /// every sequence through it while a modifier is attached. Not honoured by the other Vulkan model hosts (hybrid/MoE).
     /// </summary>
     public IVulkanResidualModifier? ResidualModifier { get; set; }
+
+    VulkanDevice IVulkanResidualModifierHost.ResidualDevice => _device;
     // VRAM-trim flags for pipeline stages (both false on a normal single-device model). Set by BuildModel.
     // _headless: non-last stage — the final-norm/LM-head weights are 64-byte stubs and Forward returns a
     // dummy logits tensor right after the layer loop (the caller reads DownloadHiddenState instead).

@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- Ordinal name order picks netstandard2.0; the scanner's preference picks netstandard2.1 (higher version). -->
+    <TargetFrameworks>netstandard2.0;netstandard2.1</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+</Project>

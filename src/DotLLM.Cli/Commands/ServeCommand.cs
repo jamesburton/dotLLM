@@ -448,7 +448,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Enables the LoRA admin write endpoints (off by default).</summary>
         [CommandOption("--ternary-adapter")]
-        [Description("Ternary residual adapter (.nsadapter or adapter GGUF, docs/TERNARY_ADAPTER.md) applied to every request; CPU transformer models only; repeatable to compose.")]
+        [Description("Ternary residual adapter (.nsadapter or adapter GGUF, docs/TERNARY_ADAPTER.md) applied to every request; CPU and Vulkan models with a residual hook (see docs/TERNARY_ADAPTER.md), any other model fails the load; repeatable to compose.")]
         public string[] TernaryAdapterPaths { get; set; } = Array.Empty<string>();
 
         /// <summary>Tensor overlay GGUF (issue #1706).</summary>

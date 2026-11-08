@@ -19,7 +19,7 @@ namespace DotLLM.Models.Architectures;
 /// Transformer forward pass: embedding lookup → N × transformer blocks → final norm → LM head → logits.
 /// Operates entirely on the CPU using pre-allocated scratch buffers for zero-allocation inference.
 /// </summary>
-public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
+public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Core.Diagnostics.IResidualModifierHost
 {
     /// <summary>Q8_0 block: 2 bytes (Half scale) + 32 bytes (sbyte values).</summary>
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;

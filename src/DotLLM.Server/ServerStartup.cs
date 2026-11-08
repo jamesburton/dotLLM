@@ -206,7 +206,7 @@ public static class ServerStartup
         var autoPlan = DeviceSelector.Plan(spec, ModelResolver.FileLength(resolvedPath), Endpoints.DeviceEndpoint.Describe());
         foreach (string device in autoPlan.Candidates)
         {
-            if (options.TernaryAdapterPaths is { Count: > 0 } && device != "cpu") continue;   // ternary adapters are CPU-only (#1619): never load a GPU model they cannot attach to
+            if (options.TernaryAdapterPaths is { Count: > 0 } && TernaryAdapterAttach.BackendHasNoHook(device)) continue;   // no CUDA model has the residual hook (#1711): never load a GPU model the adapters cannot attach to
             try
             {
                 Console.WriteLine($"[dotllm] --device auto: trying {device}");
@@ -222,7 +222,9 @@ public static class ServerStartup
                 }
                 return loaded;
             }
-            catch (Exception ex) when (device != "cpu" && ex is not InvalidServerOptionException)
+            // With adapters requested, a GPU model that has no residual hook (or whose geometry the adapters do not fit) surfaces as an
+            // InvalidServerOptionException: fall through to the next device instead of aborting auto (the CPU attach then decides).
+            catch (Exception ex) when (device != "cpu" && (ex is not InvalidServerOptionException || options.TernaryAdapterPaths is { Count: > 0 }))
             {
                 last = ex;
                 gpuFailures.Add($"{device}: {ex.Message}");
@@ -449,32 +451,25 @@ public static class ServerStartup
     internal const int VulkanPrefixCacheHeadroomTokens = 1024;
 
     /// <summary>
-    /// Attaches <see cref="ServerOptions.TernaryAdapterPaths"/> to a CPU <see cref="TransformerModel"/> as its residual modifier (#1619). The hook is
-    /// owned by the model (its finalizer reclaims the masks). Any other model kind, or an adapter that does not fit the model, fails the load.
+    /// Attaches <see cref="ServerOptions.TernaryAdapterPaths"/> to the loaded model through <see cref="TernaryAdapterAttach"/> (#1619, #1711): CPU
+    /// models with a residual hook get a <c>TernaryResidualHook</c>, Vulkan models with one a device-resident modifier. A model without a hook, or
+    /// an adapter that does not fit, fails the load (the model and GGUF are disposed): never a silent skip. Returns the handle that owns the
+    /// attachment (null when no adapters were requested); <see cref="ServerState"/> disposes it with the model.
     /// </summary>
-    internal static void AttachTernaryAdapters(IModel model, ModelConfig config, GgufFile gguf, ServerOptions options)
+    internal static IDisposable? AttachTernaryAdapters(IModel model, ModelConfig config, GgufFile gguf, ServerOptions options)
     {
-        if (options.TernaryAdapterPaths is not { Count: > 0 } paths) return;
-        if (model is not TransformerModel host)
-        {
-            model.Dispose();
-            gguf.Dispose();
-            throw new InvalidServerOptionException("--ternary-adapter is only supported on the CPU transformer backend (use --device cpu).");
-        }
-        DotLLM.Models.Adapters.Ternary.TernaryResidualHook? hook = null;
+        if (options.TernaryAdapterPaths is not { Count: > 0 } paths) return null;
         try
         {
-            hook = DotLLM.Models.Adapters.Ternary.TernaryResidualHook.Load(paths);
-            hook.ValidateFor(config.HiddenSize, config.NumLayers);
-            host.ResidualModifier = hook;
-            Console.WriteLine($"[dotllm] Ternary adapters attached: {hook.CircuitCount} circuit(s) from {paths.Count} file(s).");
+            var handle = TernaryAdapterAttach.Attach(model, config, paths);
+            Console.WriteLine($"[dotllm] Ternary adapters attached ({handle.Where}): {handle.CircuitCount} circuit(s) from {paths.Count} file(s).");
+            return handle;
         }
         catch (Exception ex) when (ex is InvalidDataException or InvalidOperationException or NotSupportedException or IOException or ArgumentException)
         {
-            hook?.Dispose();
             model.Dispose();
             gguf.Dispose();
-            throw new InvalidServerOptionException($"--ternary-adapter: {ex.Message}");
+            throw new InvalidServerOptionException(ex.Message.StartsWith("--ternary-adapter", StringComparison.Ordinal) ? ex.Message : $"--ternary-adapter: {ex.Message}");
         }
     }
 
@@ -524,7 +519,7 @@ public static class ServerStartup
         // Only the Vulkan models' KV factory is wired here (CUDA/hybrid models keep their own per-request caches).
         Func<int, IKvCache>? vulkanKvFactory = DeviceSpec.Parse(options.Device).Kind == DeviceKind.Vulkan ? deviceKvFactory : null;
 
-        AttachTernaryAdapters(model, config, gguf, options);
+        var ternaryAdapters = AttachTernaryAdapters(model, config, gguf, options);
 
         if (gguf.Overlay is { } appliedOverlay)
         {
@@ -915,6 +910,7 @@ public static class ServerStartup
         return new ServerState
         {
             Options = options,
+            TernaryAdapters = ternaryAdapters,
             Config = config,
             ToolCallParser = toolCallParser,
             KvCacheConfig = kvConfig,
