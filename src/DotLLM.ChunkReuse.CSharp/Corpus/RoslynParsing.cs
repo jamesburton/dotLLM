@@ -106,6 +106,13 @@ internal static class RoslynParsing
     /// </summary>
     public static readonly TimeSpan DefaultFileBudget = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// Time a whole corpus may spend binding (graph build, call resolution) on top of the per-file <see cref="DefaultFileBudget"/>:
+    /// a corpus of many slow files, or a binder path that never polls its token, cannot hold the caller for longer. Over it the
+    /// call throws <see cref="TimeoutException"/> (partial edges would silently change the graph).
+    /// </summary>
+    public static readonly TimeSpan DefaultCorpusBudget = TimeSpan.FromMinutes(10);
+
     /// <summary>How long after cancellation a runner still waits for the work to stop before it abandons the thread.</summary>
     public static readonly TimeSpan CancelGrace = TimeSpan.FromSeconds(10);
 

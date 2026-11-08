@@ -294,7 +294,7 @@ public sealed class FileChunkStore : IChunkStore
         if (HoldsValidEntry(key, entry.Backend)) return;
 
         string dir = Path.GetDirectoryName(path)!;
-        Directory.CreateDirectory(dir);
+        StorePaths.CreateStoreDirectory(dir);
         string temp = Path.Combine(dir, $"{key.Hex}.{Guid.NewGuid():N}{TempExtension}");
         try
         {
@@ -447,7 +447,7 @@ public sealed class FileChunkStore : IChunkStore
         }
         w.Int64(payload);
 
-        using var fs = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16);
+        using FileStream fs = StorePaths.CreateNewFile(path, 1 << 16);
         fs.SetLength(header.Length + payload);
         fs.Write(header);
         fs.Write(MemoryMarshal.AsBytes(entry.TokenIds.AsSpan()));

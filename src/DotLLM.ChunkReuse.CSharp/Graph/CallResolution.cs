@@ -66,14 +66,18 @@ public static class CallResolution
         ArgumentNullException.ThrowIfNull(projects);
         // Roslyn's binder recurses per nesting level: bind on the large-stack thread (the caller's stack may be ordinary), and
         // leave out a file nested deeper than the cap that thread makes safe.
-        return CodeCorpus.RoslynParsing.RunWithLargeStack(() => SitesCore(projects, paths, CodeCorpus.RoslynParsing.DefaultFileBudget));
+        return CodeCorpus.RoslynParsing.RunWithLargeStack(ct => SitesCore(projects, paths, CodeCorpus.RoslynParsing.DefaultFileBudget, ct),
+            CodeCorpus.RoslynParsing.DefaultCorpusBudget);
     }
 
-    /// <summary><see cref="Sites"/> with a per-file binding budget (tests).</summary>
-    internal static IReadOnlyList<CallSite> SitesWithin(IReadOnlyList<ProjectCompilation> projects, TimeSpan fileBudget) =>
-        CodeCorpus.RoslynParsing.RunWithLargeStack(() => SitesCore(projects, null, fileBudget));
+    /// <summary><see cref="Sites"/> with a per-file and a whole-corpus binding budget (tests).</summary>
+    internal static IReadOnlyList<CallSite> SitesWithin(IReadOnlyList<ProjectCompilation> projects, TimeSpan fileBudget, TimeSpan? corpusBudget = null,
+        TimeSpan? grace = null) =>
+        CodeCorpus.RoslynParsing.RunWithLargeStack(ct => SitesCore(projects, null, fileBudget, ct),
+            corpusBudget ?? CodeCorpus.RoslynParsing.DefaultCorpusBudget, grace);
 
-    private static IReadOnlyList<CallSite> SitesCore(IReadOnlyList<ProjectCompilation> projects, IReadOnlySet<string>? paths, TimeSpan fileBudget)
+    private static IReadOnlyList<CallSite> SitesCore(IReadOnlyList<ProjectCompilation> projects, IReadOnlySet<string>? paths, TimeSpan fileBudget,
+        CancellationToken corpusToken)
     {
         var corpusPath = new Dictionary<string, string>(RoslynGraphBuilder.PathComparer);
         foreach (ProjectCompilation p in projects)
@@ -93,7 +97,10 @@ public static class CallResolution
                     continue;
                 }
                 SemanticModel model = p.Compilation.GetSemanticModel(tree);
-                using var budget = new CancellationTokenSource(fileBudget);
+                corpusToken.ThrowIfCancellationRequested();
+                using var budget = CancellationTokenSource.CreateLinkedTokenSource(corpusToken);
+                if (fileBudget == TimeSpan.Zero) budget.Cancel(); // CancelAfter(Zero) fires on a timer, not at once
+                else budget.CancelAfter(fileBudget);
                 var treeSites = new List<CallSite>();
                 try
                 {
@@ -120,7 +127,7 @@ public static class CallResolution
                         : new CallSite(path, at, length, CallTargetKind.Elsewhere, display, null, -1));
                 }
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException) when (!corpusToken.IsCancellationRequested)
                 {
                     System.Diagnostics.Trace.TraceWarning($"{path}: binding exceeded {fileBudget.TotalSeconds:F0} s; no call sites measured.");
                     continue;
