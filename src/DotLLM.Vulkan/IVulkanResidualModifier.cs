@@ -21,3 +21,16 @@ public interface IVulkanResidualModifier
     /// <summary>Drops cached descriptor sets; the model calls this when its scratch buffers were re-allocated.</summary>
     void InvalidateDescriptorCache();
 }
+
+/// <summary>
+/// A Vulkan model whose forward pass records an <see cref="IVulkanResidualModifier"/> after every layer (#1711). Entry points attach
+/// ternary residual adapters through this seam; a Vulkan model without it must be refused with a specific error.
+/// </summary>
+public interface IVulkanResidualModifierHost
+{
+    /// <summary>The attached device-side modifier, or <see langword="null"/>.</summary>
+    IVulkanResidualModifier? ResidualModifier { get; set; }
+
+    /// <summary>The device the model's residual stream lives on (adapter buffers must be created on it).</summary>
+    VulkanDevice ResidualDevice { get; }
+}

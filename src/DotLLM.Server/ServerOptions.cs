@@ -338,6 +338,12 @@ public sealed record ServerOptions
     /// </summary>
     public IReadOnlyList<string>? TernaryAdapterPaths { get; init; }
 
+    /// <summary>Tensor overlay GGUF (<c>--tensor-overlay</c>, issue #1706): replaces named FFN projections (e.g. with TERN_B64_F16). CPU transformer / MoE-GGUF only.</summary>
+    public string? TensorOverlayPath { get; init; }
+
+    /// <summary>True = do not verify the overlay's <c>dotllm.overlay.base_sha256</c> against the base file (<c>--overlay-skip-base-hash</c>).</summary>
+    public bool OverlaySkipBaseHash { get; init; }
+
     /// <summary>
     /// Whether the model-administration write endpoints introduced in #454 are enabled:
     /// <c>POST /v1/models/unload</c>, <c>POST /v1/models/pull</c> (+ its cancel route),
@@ -499,6 +505,8 @@ public sealed record ServerOptions
         bool? metrics = null;
         bool allowLoraAdmin = false;
         int? maxMessagesCli = null;
+        string? tensorOverlay = null;
+        bool overlaySkipBaseHash = false;
         int promptCacheStep = 0;
         int? promptCacheStepKeep = null;
         bool chunkCache = false;
@@ -640,6 +648,10 @@ public sealed record ServerOptions
                     chunkCacheApiKeys = next ?? throw new ArgumentException("--chunk-cache-api-keys requires a file."); i++; break;
                 case "--chunk-cache-allow-short-keys":
                     chunkCacheAllowShortKeys = true; break;
+                case "--tensor-overlay":
+                    tensorOverlay = next ?? throw new ArgumentException("--tensor-overlay requires a path."); i++; break;
+                case "--overlay-skip-base-hash":
+                    overlaySkipBaseHash = true; break;
                 case "--max-messages":
                     maxMessagesCli = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 default:
@@ -674,6 +686,8 @@ public sealed record ServerOptions
             ContextSize = ctxSize,
             MoeOffload = DotLLM.Core.Moe.MoeOffloadOptions.FromCli(new DotLLM.Core.Moe.MoeCliValues(moeOffloadMode, moeCacheMib,
                 moeCachePolicy, moeCold, moeCpuThreads, cpuMoe, nCpuMoe, moeCalibrate, ctxSize)),
+            TensorOverlayPath = tensorOverlay,
+            OverlaySkipBaseHash = overlaySkipBaseHash,
             Threads = threads,
             DecodeThreads = decodeThreads,
             Host = host,

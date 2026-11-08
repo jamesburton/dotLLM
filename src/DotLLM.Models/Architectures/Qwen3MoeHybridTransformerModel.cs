@@ -22,7 +22,7 @@ namespace DotLLM.Models.Architectures;
 /// Full-attention layers occur every <see cref="GatedDeltaNetConfig.FullAttnInterval"/> steps
 /// (1-indexed), e.g. layers 4, 8, 12, … 40 for interval=4.
 /// </summary>
-public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
+public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotLLM.Core.Diagnostics.IResidualModifierHost
 {
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
     private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
@@ -919,6 +919,19 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
         };
     }
 
+    /// <summary>
+    /// Optional in-place modifier of the residual stream after each layer (<c>HookPoint.PostLayer</c>), e.g. a ternary residual adapter (#1711).
+    /// Same convention as <see cref="TransformerModel"/>: applied after every layer, GDN and attention alike, in every forward. Null costs one
+    /// branch per layer. Single-threaded per model instance.
+    /// </summary>
+    public DotLLM.Core.Diagnostics.IResidualModifier? ResidualModifier { get; set; }
+
+    private void ApplyResidualModifier(DotLLM.Core.Diagnostics.IResidualModifier modifier, int layer, float* hidden, int seqLen)
+    {
+        if (modifier.AppliesTo(layer))
+            modifier.ModifyResidual(new Span<float>(hidden, seqLen * Config.HiddenSize), layer, seqLen);
+    }
+
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
         => Forward(tokenIds, positions, deviceId, kvCache: null, gdnState: null);
@@ -1242,6 +1255,7 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
         }
 
         var kinds = _layout.LayerKind;
+        var residualModifier = ResidualModifier;
         int endLayer = firstLayer + layerCount;
         for (int layer = firstLayer; layer < endLayer; layer++)
         {
@@ -1307,6 +1321,9 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
                     new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                     new Span<float>(hidden + t * hiddenSize, hiddenSize));
             }
+            // PostLayer residual modifier (#1711): after layer L's output (absolute layer index, also inside a layer window).
+            if (residualModifier is not null)
+                ApplyResidualModifier(residualModifier, layer, hidden, seqLen);
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.l_out", hidden, seqLen, hiddenSize);
             if (DotLLM.Cpu.ActivationRangeProbe.On)

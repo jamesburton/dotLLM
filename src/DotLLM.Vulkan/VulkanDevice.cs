@@ -472,6 +472,65 @@ public sealed class VulkanDevice : IDisposable
         }
     }
 
+    /// <summary>One Vulkan physical device as listed by <see cref="EnumeratePhysicalDevices"/>.</summary>
+    /// <param name="Index"><c>vkEnumeratePhysicalDevices</c> index (what <see cref="Create(int)"/> takes).</param>
+    /// <param name="Name">Driver-reported device name.</param>
+    /// <param name="VendorId">PCI vendor id.</param>
+    /// <param name="DeviceType">Vulkan <c>VkPhysicalDeviceType</c> value (1 integrated, 2 discrete, ...).</param>
+    /// <param name="DeviceLocalHeapBytes">Size of the largest device-local heap (0 when none is reported). This is the heap size, not free memory.</param>
+    /// <param name="IsDefault">True for the device a plain <see cref="Create()"/> (scoring plus the env overrides) would pick.</param>
+    public readonly record struct PhysicalDeviceInfo(int Index, string Name, uint VendorId, int DeviceType, long DeviceLocalHeapBytes, bool IsDefault);
+
+    /// <summary>
+    /// Lists every Vulkan physical device without creating a logical device (one short-lived instance, under the lifecycle write lock like
+    /// <see cref="PhysicalDeviceCount"/>). Empty when Vulkan is unavailable. Callers cache the result; do not call per request.
+    /// </summary>
+    public static PhysicalDeviceInfo[] EnumeratePhysicalDevices()
+    {
+        if (!IsAvailable()) return [];
+        try { return ProbePhysicalDevices(); }
+        catch { return []; }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static unsafe PhysicalDeviceInfo[] ProbePhysicalDevices()
+    {
+        VulkanLibraryResolver.Register();
+        s_lifecycleLock.EnterWriteLock();
+        try
+        {
+            nint inst = CreateInstance();
+            if (inst == 0) return [];
+            try
+            {
+                uint count = 0;
+                if (VulkanApi.vkEnumeratePhysicalDevices(inst, ref count, null) < 0 || count == 0) return [];
+                var devices = new nint[count];
+                if (VulkanApi.vkEnumeratePhysicalDevices(inst, ref count, devices) < 0) return [];
+
+                // The default is whatever SelectPhysicalDevice picks for Create(): one rule, not a copy of it.
+                int defaultIndex = -1;
+                try { defaultIndex = Array.IndexOf(devices, SelectPhysicalDevice(inst, null, out _, out _, out _, out _)); }
+                catch { /* no default: none is marked */ }
+
+                var result = new PhysicalDeviceInfo[count];
+                for (int i = 0; i < devices.Length; i++)
+                {
+                    VulkanApi.vkGetPhysicalDeviceProperties(devices[i], out var props);
+                    VulkanApi.vkGetPhysicalDeviceMemoryProperties(devices[i], out var mem);
+                    ulong* heaps = (ulong*)mem.memoryHeaps;
+                    ulong best = 0;
+                    for (uint h = 0; h < mem.memoryHeapCount && h < 16; h++)
+                        if ((heaps[h * 2 + 1] & 1u) != 0 && heaps[h * 2] > best) best = heaps[h * 2];   // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+                    result[i] = new PhysicalDeviceInfo(i, ReadDeviceName(props), props.vendorID, props.deviceType, (long)best, i == defaultIndex);
+                }
+                return result;
+            }
+            finally { VulkanApi.vkDestroyInstance(inst, 0); }
+        }
+        finally { s_lifecycleLock.ExitWriteLock(); }
+    }
+
     /// <summary>
     /// Creates a Vulkan device bound to the first suitable GPU.
     /// Selection order: discrete GPU (preferring AMD/NVIDIA over Intel) → integrated → first available.
@@ -638,7 +697,7 @@ public sealed class VulkanDevice : IDisposable
     /// <c>vkEnumeratePhysicalDevices</c> index this device was created on (what <see cref="Create(int)"/> takes), or -1 when unknown. A second device
     /// bound to the same GPU - e.g. the MTP-head headroom canary (#820) - must use the same index, or it would probe a different adapter.
     /// </summary>
-    internal int PhysicalDeviceIndex { get; private set; } = -1;
+    public int PhysicalDeviceIndex { get; private set; } = -1;
 
     private static int IndexOfPhysicalDevice(nint instance, nint physical)
     {

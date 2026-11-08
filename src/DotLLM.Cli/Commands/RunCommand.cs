@@ -370,12 +370,22 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         public string[] LoraPaths { get; set; } = Array.Empty<string>();
 
         /// <summary>
-        /// Ternary steering adapter package(s) (<c>.nsadapter</c>, docs/TERNARY_ADAPTER.md), CPU backend only.
+        /// Ternary steering adapter package(s) (<c>.nsadapter</c>, docs/TERNARY_ADAPTER.md); models without a residual hook are refused.
         /// Repeatable — two or more are rank-concatenated into one pass.
         /// </summary>
         [CommandOption("--ternary-adapter")]
-        [Description("Path to a ternary residual adapter (.nsadapter), CPU only; repeatable to compose. Omit for base.")]
+        [Description("Path to a ternary residual adapter (.nsadapter or adapter GGUF); repeatable to compose. CPU and Vulkan models with a residual hook only; others are refused. Omit for base.")]
         public string[] TernaryAdapterPaths { get; set; } = Array.Empty<string>();
+
+        /// <summary>Tensor overlay GGUF (issue #1706).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.TensorOverlayCli.Option)]
+        [Description(DotLLM.Cli.Helpers.TensorOverlayCli.Help)]
+        public string? TensorOverlay { get; set; }
+
+        /// <summary>Skip the overlay base-hash check (issue #1706).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.TensorOverlayCli.SkipHashOption)]
+        [Description(DotLLM.Cli.Helpers.TensorOverlayCli.SkipHashHelp)]
+        public bool OverlaySkipBaseHash { get; set; }
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -462,6 +472,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
 
             gguf = GgufFile.Open(resolvedPath);
+            if (DotLLM.Cli.Helpers.TensorOverlayCli.TryAttach(gguf, resolvedPath, settings.TensorOverlay, settings.OverlaySkipBaseHash) is { } overlayError)
+                throw new DotLLM.Server.DeviceUnavailableException(overlayError);
             config = GgufModelConfigExtractor.Extract(gguf.Metadata);
             config = GgufModelConfigExtractor.ApplyRoPEOverride(config, BuildRoPEOverride(settings));
             tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
@@ -474,6 +486,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
                 resolvedPath, MoeOffloadCli.Build(settings.MoeValues));
             model = loaded.Model;
+            if (DotLLM.Cli.Helpers.TensorOverlayCli.TryVerifyApplied(gguf) is { } notApplied)
+            {
+                model.Dispose();
+                throw new DotLLM.Server.DeviceUnavailableException(notApplied);
+            }
             vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
             if (settings.DFlash is not null)
             {
@@ -599,29 +616,18 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
         }
 
-        // Ternary residual adapter(s) (#1616): CPU TransformerModel only; attached as the model's residual modifier.
-        DotLLM.Models.Adapters.Ternary.TernaryResidualHook? ternaryHook = null;
-        DotLLM.Models.Architectures.TransformerModel? ternaryHost = null;
+        // Ternary residual adapter(s) (#1616, #1711): attached through the shared TernaryAdapterAttach (CPU hook or Vulkan device modifier);
+        // a model without a hook is a hard error, never a silent base-model run.
+        DotLLM.Server.TernaryAdapterAttach.Handle? ternaryHandle = null;
         if (settings.TernaryAdapterPaths.Length > 0)
         {
-            ternaryHost = model as DotLLM.Models.Architectures.TransformerModel;
-            if (ternaryHost is null)
-            {
-                Console.Error.WriteLine("--ternary-adapter is only supported on the CPU transformer backend (use --device cpu).");
-                foreach (var inner in innerAdapters) inner.Dispose();
-                model.Dispose(); gguf?.Dispose(); safetensorsSource?.Dispose();
-                return 1;
-            }
             try
             {
-                ternaryHook = DotLLM.Models.Adapters.Ternary.TernaryResidualHook.Load(settings.TernaryAdapterPaths);
-                ternaryHook.ValidateFor(config.HiddenSize, config.NumLayers);
-                ternaryHost.ResidualModifier = ternaryHook;
+                ternaryHandle = DotLLM.Server.TernaryAdapterAttach.Attach(model, config, settings.TernaryAdapterPaths);
             }
-            catch (Exception ex) when (ex is InvalidDataException or InvalidOperationException or NotSupportedException or IOException)
+            catch (Exception ex) when (ex is InvalidDataException or InvalidOperationException or NotSupportedException or IOException or ArgumentException)
             {
-                Console.Error.WriteLine($"--ternary-adapter: {ex.Message}");
-                ternaryHook?.Dispose();
+                Console.Error.WriteLine(ex.Message.StartsWith("--ternary-adapter", StringComparison.Ordinal) ? ex.Message : $"--ternary-adapter: {ex.Message}");
                 foreach (var inner in innerAdapters) inner.Dispose();
                 model.Dispose(); gguf?.Dispose(); safetensorsSource?.Dispose();
                 return 1;
@@ -726,7 +732,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 DotLLM.Cuda.CudaTransformerModel => DotLLM.Cuda.CudaDevice.GetDevice(DeviceCli.CudaOrdinal(deviceOutcome.Resolved)).ToString(),
                 DotLLM.Cuda.HybridTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
                 DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
-                _ when vulkanKv is not null => $"vulkan {DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}",
+                _ when vulkanKv is not null => $"vulkan {DeviceCli.DeviceLabel(deviceOutcome.Resolved)}",
                 _ => $"{threadingInfo.EffectiveThreadCount} threads"
             };
             var segments = $"{config.Architecture} {config.NumLayers}L/{config.HiddenSize}H | {quantLabel} | {deviceLabel} | {samplingLabel}";
@@ -1132,8 +1138,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
         finally
         {
-            if (ternaryHost is not null) ternaryHost.ResidualModifier = null;
-            ternaryHook?.Dispose();
+            ternaryHandle?.Dispose();
             // Dispose in reverse dependency order: composite first, then each inner adapter.
             compositeAdapter?.Dispose();
             foreach (var inner in innerAdapters)

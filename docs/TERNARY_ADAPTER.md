@@ -89,7 +89,7 @@ the package. `I32` is the only 4-byte integer type present and carries the packe
 Validation matches the ZIP loader plus: tensor type and exact element count, zero padding, SHA-256 of both code tensors against the metadata, `rank`/`D` bounds before any allocation.
 
 Wiring: `TernaryResidualHook.Load(paths)` accepts either format (magic `GGUF` or ZIP), so `dotllm run` and the new repeatable `dotllm serve --ternary-adapter` use both. `ServerOptions.TernaryAdapterPaths`
-attaches the hook to every model the server loads (CPU transformer only; an explicit or auto GPU device is not used when adapters are requested, and a non-attachable model is an error, never a silent skip).
+attaches the hook to every model the server loads through the shared `TernaryAdapterAttach` (#1711; see the support table below): a model class without a hook is a hard `InvalidServerOptionException` (server) / non-zero exit (`run`, `chat`), never a silent skip. `--device auto` skips CUDA candidates when adapters are requested and falls through to the next device when a candidate cannot take them.
 **Not done:** `InferenceOptions` per-request enable/disable. The residual hook sees `[tokens x D]` rows with no request identity and the scheduler batches requests, so a per-request switch
 needs a per-row mask through `IResidualModifier` (filed as a follow-up); the adapters currently apply to every request of the server.
 
@@ -316,8 +316,8 @@ residual in `_state.HiddenState` as F32, so the CPU numerics carry over unchange
   `divRN`.
 - **Hook seam**: `IVulkanResidualModifier` (DotLLM.Vulkan) is the device twin of `IResidualModifier`. `VulkanTransformerModel.ResidualModifier`
   is null by default (one branch per layer); when set, the model records the modifier after layer L (after Gemma-4 output scaling, before
-  the inter-layer barrier) and `ForwardBatch` routes every sequence through the per-sequence core. **Only the dense `VulkanTransformerModel`
-  host has the seam**; the hybrid/MoE/Mamba hosts do not (follow-up).
+  the inter-layer barrier) and `ForwardBatch` routes every sequence through the per-sequence core. `VulkanQwen3HybridDenseTransformerModel` has the same seam since #1711
+  (single-sequence forward and the fused batch forward; see the table below); the other hosts do not.
 - **Scale dtype**: F32 by default; `TernaryScaleStorage.F16` is a pipeline specialization constant (two halves per word, exact widening).
   `TernaryDevicePack` (Models) defines the packed bytes for both GPU backends.
 - **CUDA** (#1625; `native/kernels/ternary_adapter_residual_f32.cu`, `CudaTernaryResidualModifier`): same algorithm and bytes, explicit
@@ -331,3 +331,29 @@ residual in `_state.HiddenState` as F32, so the CPU numerics carry over unchange
   (alone and stacked), 70+ synthetic shapes (D 1..4099 off the 32/64/256 grid, rank 1..64, alpha 0/<0/other, threshold gating, multi-row), rank concatenation (and order),
   the 256 cap, per-layer packs, zero/tiny rows, F16 scales; end to end on a synthetic Llama and SmolLM-135M Q8_0 (KL vs CPU at the backend noise floor,
   detached logits bit-identical to before).
+
+
+---
+
+# Support table: model class x backend (#1711)
+
+The hook is `IResidualModifier` (CPU, `IResidualModifierHost`) or `IVulkanResidualModifier` (Vulkan, `IVulkanResidualModifierHost`) applied after layer L's
+output for every layer (GDN and attention alike, final layer included), in every forward shape. Entry points (`dotllm run`, `chat`, `serve`) attach through
+`DotLLM.Server.TernaryAdapterAttach`; a model class not marked "wired" is refused with `--ternary-adapter: no residual-modifier hook on <class> (...)`.
+
+| Model class (architectures) | CPU | Vulkan | CUDA |
+|---|---|---|---|
+| `TransformerModel` / `VulkanTransformerModel` / `CudaTransformerModel` (llama, mistral, phi, qwen, gemma, deepseek ... dense/MoE/MLA) | wired | wired | not wired (modifier kernel exists; `CudaTernaryResidualModifier` is not called by any model) |
+| `Qwen3HybridDense*` (Bonsai-2 2B/27B, Qwen3.5/3.6 dense) | wired (#1711) | wired (#1711) | not wired |
+| `Qwen3MoeHybrid*` (qwen35moe) | wired (#1711) | not wired: several submit/host-round-trip paths (fused decode, per-layer, resident experts) each need the record | not wired |
+| `NemotronH*`, `Mamba3*`, `Lfm2Moe*`, `Lfm3*`, `Qwen4Exp*` | not wired | not wired | not wired |
+| Encoders (`Bert*`, `GemmaEmbedding`), pipeline/hybrid CPU+GPU split models | not applicable / refused | refused | refused |
+
+Notes: the CPU tail of a GPU/CPU partial-offload `Qwen3HybridDense` split throws if a modifier is set (its layer indices are slice-local). Vulkan-only caveat for
+all rows: the adapter kernel requires D <= 6144. Follow-up issues track the "not wired" cells.
+
+Evidence (#1711): Bonsai-2 2B PQ2_0 with `csharp14-bonsai2b.nsadapter` (D=2048, layer 12, rank 2) at `--temp 0`: base text is a C# class with an auto-property; with the adapter
+the text collapses to a repetitive "the property is not a property ..." on CPU, and Vulkan produces the byte-identical adapter text and the byte-identical base text.
+Tests: `Adapters/TernaryAdapterHybridCpuTests` (layer convention proved by overwrite equivalence with a layer-1-only model), `Adapters/TernaryAdapterAttachTests` (hard refusal),
+`Vulkan/Ternary/VulkanTernaryAdapterHybridTests` (steering delta agrees with the CPU hybrid; fused batch; detach bit-exact).
+

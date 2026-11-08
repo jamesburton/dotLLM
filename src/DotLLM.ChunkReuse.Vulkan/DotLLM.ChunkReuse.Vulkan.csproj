@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Not packed until the release wiring PR decides the package set. -->
+    <IsPackable>false</IsPackable>
+    <Description>Vulkan backend for dotLLM chunk-level KV reuse: VulkanKvCache positioned row IO and the device RoPE delta shift (#1531). Kept out of DotLLM.ChunkReuse so the core library carries no Vulkan dependency.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DotLLM.ChunkReuse\DotLLM.ChunkReuse.csproj" />
+    <ProjectReference Include="..\DotLLM.Vulkan\DotLLM.Vulkan.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
+    <!-- Fork only (research/deferred code, never upstream as is). -->
+    <InternalsVisibleTo Include="DotLLM.ChunkReuse.Research" />
+  </ItemGroup>
+
+</Project>

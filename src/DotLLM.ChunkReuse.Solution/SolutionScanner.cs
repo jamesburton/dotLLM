@@ -111,7 +111,17 @@ public sealed record ScanResult(IReadOnlyList<SourceFile> Files, IReadOnlyList<S
 /// <summary>Options of <see cref="SolutionScanner.LoadAsync(string, SolutionScanOptions, CancellationToken)"/>.</summary>
 /// <param name="Configuration">MSBuild <c>Configuration</c> the projects are evaluated with (sets <c>DEBUG</c>/<c>RELEASE</c>
 /// and any configuration-specific items). Default <c>Debug</c>, MSBuild's own default; <c>Release</c> scans what ships.</param>
-public sealed record SolutionScanOptions(string Configuration = "Debug");
+public sealed record SolutionScanOptions(string Configuration = "Debug")
+{
+    /// <summary>
+    /// How long the whole load may take (design-time builds, reading, compilations). Default
+    /// <c>RoslynParsing.DefaultCorpusBudget</c> (10 minutes); <see cref="System.Threading.Timeout.InfiniteTimeSpan"/> for none.
+    /// Over it <see cref="SolutionScanner.LoadAsync(string, SolutionScanOptions, CancellationToken)"/> throws <see cref="TimeoutException"/>.
+    /// Like the caller's token it ends the CALL: a build step that does not stop (a project target that sleeps) keeps running until the
+    /// workspace, disposed on the way out, takes its build host down.
+    /// </summary>
+    public TimeSpan Timeout { get; init; } = RoslynParsing.DefaultCorpusBudget;
+}
 
 /// <summary>Generated-code detection for scanned files, by path and syntax (not by raw text).</summary>
 public static class GeneratedFiles
@@ -193,6 +203,17 @@ public static class GeneratedFiles
 /// Document texts are replaced by their CRLF → LF form before the compilations are made, so syntax-tree offsets equal
 /// <see cref="SourceFile"/> offsets (and chunk offsets).
 /// </para>
+/// <para>
+/// <b>Trust.</b> Loading a solution EXECUTES it. A design-time build evaluates and runs the projects' MSBuild: imported
+/// <c>Directory.Build.props</c>/<c>.targets</c>, custom targets and tasks (<c>Exec</c>, inline tasks), SDK resolvers (a
+/// <c>global.json</c> <c>msbuild-sdks</c> entry fetches and runs an SDK package) all run as the current user in the build host;
+/// and <c>Analyzer</c> references (analyzers, source generators) are loaded INTO THE CALLING PROCESS when a compilation is made.
+/// Scan only solutions you would build. What the scanner bounds is the input it reads, not that code: files that are not
+/// <c>.cs</c> are never read, a file past the corpus limits (<c>RoslynParsing.MaxNestingDepth</c> brackets,
+/// <c>RoslynParsing.MaxFileChars</c> characters) is never parsed (its tree is empty, with a warning on its project), and the
+/// whole load ends at the token or <see cref="SolutionScanOptions.Timeout"/>. Files outside the root (linked or <c>../</c>) are
+/// returned as such, by design.
+/// </para>
 /// </remarks>
 public static class SolutionScanner
 {
@@ -210,6 +231,40 @@ public static class SolutionScanner
         ArgumentException.ThrowIfNullOrWhiteSpace(options.Configuration);
         ArgumentException.ThrowIfNullOrWhiteSpace(slnOrProjectPath);
         cancellationToken.ThrowIfCancellationRequested();
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        limit.CancelAfter(options.Timeout); // throws for a negative value other than Timeout.Infinite
+        try
+        {
+            return await LoadCoreAsync(slnOrProjectPath, options, limit.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (limit.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Loading '{slnOrProjectPath}' took longer than {options.Timeout}.");
+        }
+    }
+
+    /// <summary>
+    /// Waits for <paramref name="work"/> (a call into the workspace, which does not stop on its token while a design-time build step
+    /// runs) no longer than <paramref name="cancellationToken"/> allows. An abandoned call fails or ends later, once the workspace is
+    /// disposed; its failure is observed here so it never surfaces as an unobserved task exception (defensive: no scenario was found
+    /// in which the abandoned call faults, so that line is not covered by a test).
+    /// </summary>
+    private static async Task<T> Bounded<T>(Task<T> work, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await work.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!work.IsCompleted)
+        {
+            _ = work.ContinueWith(static t => _ = t.Exception, CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            throw;
+        }
+    }
+
+    private static async Task<ScanResult> LoadCoreAsync(string slnOrProjectPath, SolutionScanOptions options, CancellationToken cancellationToken)
+    {
         var canonical = new PathCanonicalizer();
         string full = canonical.Of(Path.GetFullPath(slnOrProjectPath));
         if (!File.Exists(full)) throw new FileNotFoundException("Solution or project file not found.", full);
@@ -229,14 +284,14 @@ public static class SolutionScanner
         if (isSolution)
         {
             expected = (await ListSolutionProjectsAsync(full, cancellationToken).ConfigureAwait(false)).Select(canonical.Of).ToList();
-            solution = await workspace.OpenSolutionAsync(full, progress: null, cancellationToken).ConfigureAwait(false);
+            solution = await Bounded(workspace.OpenSolutionAsync(full, progress: null, cancellationToken), cancellationToken).ConfigureAwait(false);
         }
         else
         {
             expected = [full];
             try
             {
-                Project project = await workspace.OpenProjectAsync(full, progress: null, cancellationToken).ConfigureAwait(false);
+                Project project = await Bounded(workspace.OpenProjectAsync(full, progress: null, cancellationToken), cancellationToken).ConfigureAwait(false);
                 solution = project.Solution;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -296,11 +351,31 @@ public static class SolutionScanner
             primary.Add((path, first, projects.Skip(1).ToList(), own.Select(Format).Concat(unattributedFailures).ToList()));
         }
 
+        // A project chooses its own Compile items, so what it lists is input, not trusted: a document that is not a .cs file is dropped
+        // BEFORE it is read (a Compile item naming a key or a config file would otherwise come back as "source"), and one too deeply
+        // nested or too long for Roslyn is blanked in the workspace BEFORE anything parses it (a parse that recurses past the stack
+        // ends the process; no catch stops it). Same limits as the corpus (RoslynParsing); the file stays in the result with its text.
+        var diagnosticsOf = primary.ToDictionary(x => x.Project.Id, x => x.Diagnostics);
+        var blank = new Dictionary<string, string>(PathComparer); // canonical file -> why its tree is empty
+        var dropped = new HashSet<string>(PathComparer);
+        foreach (Project project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
+        {
+            foreach (Document doc in project.Documents.Where(d => d.FilePath is not null))
+            {
+                if (Path.GetExtension(doc.FilePath!).Equals(".cs", StringComparison.OrdinalIgnoreCase)) continue;
+                solution = solution.RemoveDocument(doc.Id);
+                string docPath = canonical.Of(doc.FilePath!);
+                if (diagnosticsOf.TryGetValue(project.Id, out List<string>? list))
+                    list.Add($"Warning: {Rel(docPath)}: not a C# file (Compile item); not read, not scanned.");
+                if (dropped.Add(docPath)) System.Diagnostics.Trace.TraceWarning($"{docPath}: Compile item that is not a .cs file; not read.");
+            }
+        }
+
         // LF texts (every C# document, so a file compiled by several projects reads the same everywhere).
         var texts = new Dictionary<string, string>(PathComparer);
         foreach (Project project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
         {
-            foreach (Document doc in project.Documents.Where(d => d.FilePath is not null))
+            foreach (Document doc in solution.GetProject(project.Id)!.Documents.Where(d => d.FilePath is not null))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 string docPath = canonical.Of(doc.FilePath!);
@@ -309,8 +384,17 @@ public static class SolutionScanner
                     SourceText text = await doc.GetTextAsync(cancellationToken).ConfigureAwait(false);
                     lf = text.ToString().Replace("\r\n", "\n", StringComparison.Ordinal);
                     texts[docPath] = lf;
+                    if (RoslynParsing.TooDeep(lf, out int depth))
+                        blank[docPath] = $"bracket nesting {depth} exceeds {RoslynParsing.MaxNestingDepth}; left out of the compilation (empty tree).";
+                    else if (RoslynParsing.TooLarge(lf, out int length))
+                        blank[docPath] = $"{length} characters exceeds {RoslynParsing.MaxFileChars}; left out of the compilation (empty tree).";
+                    if (blank.TryGetValue(docPath, out string? why))
+                        System.Diagnostics.Trace.TraceWarning($"{docPath}: {why}");
                 }
-                solution = solution.WithDocumentText(doc.Id, SourceText.From(lf, System.Text.Encoding.UTF8));
+                // A text LOADER, not WithDocumentText: that parses the document's ORIGINAL text first to re-parse the new one
+                // incrementally, which is the very parse (of a file that would overflow the stack) the blanking is there to avoid.
+                var replacement = TextAndVersion.Create(SourceText.From(blank.ContainsKey(docPath) ? "" : lf, System.Text.Encoding.UTF8), VersionStamp.Create(), docPath);
+                solution = solution.WithDocumentTextLoader(doc.Id, TextLoader.From(replacement), PreservationMode.PreserveValue);
             }
         }
 
@@ -337,7 +421,7 @@ public static class SolutionScanner
         foreach ((string path, Project p, List<Project> extras, List<string> projectDiagnostics) in primary)
         {
             Project project = solution.GetProject(p.Id)!;
-            Compilation compilation = (await project.GetCompilationAsync(cancellationToken).ConfigureAwait(false))!;
+            Compilation compilation = (await Bounded(project.GetCompilationAsync(cancellationToken), cancellationToken).ConfigureAwait(false))!;
             if (compilation.GetSpecialType(SpecialType.System_Object).TypeKind == TypeKind.Error)
                 projectDiagnostics.Add("Warning: no core library reference (System.Object does not resolve): project not restored, or its references did not resolve.");
             var trees = new Dictionary<string, SyntaxTree>(StringComparer.Ordinal);
@@ -348,6 +432,7 @@ public static class SolutionScanner
                 string rel = Rel(file);
                 SyntaxTree tree = (await doc.GetSyntaxTreeAsync(cancellationToken).ConfigureAwait(false))!;
                 files.Add(new SourceFile(rel, texts[file]));
+                if (blank.TryGetValue(file, out string? blankWhy)) projectDiagnostics.Add($"Warning: {rel}: {blankWhy}");
                 if (GeneratedFiles.IsGenerated(rel, tree)) generated.Add(rel);
                 trees[rel] = tree;
             }

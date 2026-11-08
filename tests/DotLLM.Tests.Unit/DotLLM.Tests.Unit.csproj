@@ -30,6 +30,7 @@
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.CSharp\DotLLM.ChunkReuse.CSharp.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.Solution\DotLLM.ChunkReuse.Solution.csproj" />
     <ProjectReference Include="..\..\tools\DotLLM.ChunkCache\DotLLM.ChunkCache.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.Vulkan\DotLLM.ChunkReuse.Vulkan.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -78,6 +79,11 @@
     <None Include="Adapters\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- #1562: 2560 wikitext-2 token ids under the LFM3 tokenizer (natural text, long enough to see the global layers' partial-rotary tail). -->
     <None Include="Models\Lfm3\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- SolutionScannerTests: a small solution read with MSBuildWorkspace from a temp copy. Its sources are data, never compiled
+         into this project (Compile Remove); its own Directory.Build.props/Directory.Packages.props stop the repo's from applying. -->
+    <Compile Remove="ChunkReuse\Fixtures\MiniSolution\**" />
+    <None Remove="ChunkReuse\Fixtures\MiniSolution\**" />
+    <None Include="ChunkReuse\Fixtures\MiniSolution\**\*" Exclude="ChunkReuse\Fixtures\MiniSolution\**\bin\**;ChunkReuse\Fixtures\MiniSolution\**\obj\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

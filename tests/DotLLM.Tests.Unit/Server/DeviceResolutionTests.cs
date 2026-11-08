@@ -55,7 +55,6 @@ public sealed class DeviceResolutionTests
     [InlineData("", DeviceKind.Auto, 0, "auto")]
     [InlineData("cpu", DeviceKind.Cpu, 0, "cpu")]
     [InlineData("vulkan", DeviceKind.Vulkan, 0, "vulkan")]
-    [InlineData("Vulkan:0", DeviceKind.Vulkan, 0, "vulkan")]
     [InlineData("gpu", DeviceKind.Cuda, 0, "gpu:0")]
     [InlineData("GPU:1", DeviceKind.Cuda, 1, "gpu:1")]
     [InlineData("cuda", DeviceKind.Cuda, 0, "gpu:0")]
@@ -68,12 +67,39 @@ public sealed class DeviceResolutionTests
     }
 
     [Theory]
+    [InlineData("Vulkan:0", 0, "vulkan:0")]
+    [InlineData("vulkan:1", 1, "vulkan:1")]
+    [InlineData("vulkan:12", 12, "vulkan:12")]
+    public void Parser_AcceptsVulkanIndex_AndKeepsItInTheCanonicalString(string input, int index, string canonical)
+    {
+        // #1704. Plain "vulkan" is the process-default device, not index 0, so vulkan:0 must stay distinguishable from it.
+        Assert.True(DeviceSpec.TryParse(input, out var spec, out var error), error);
+        Assert.Equal(DeviceKind.Vulkan, spec.Kind);
+        Assert.Equal(index, spec.VulkanIndex);
+        Assert.Equal(canonical, spec.Canonical);
+        Assert.True(spec.IsGpu);
+    }
+
+    [Fact]
+    public void PlainVulkan_HasNoIndex_SoItMeansTheDefaultDevice()
+    {
+        var spec = DeviceSpec.Parse("vulkan");
+        Assert.Null(spec.VulkanIndex);
+        Assert.Equal("vulkan", spec.Canonical);
+        Assert.Null(new DeviceSpec(DeviceKind.Cuda, 1).VulkanIndex);   // a CUDA ordinal is never a Vulkan index
+    }
+
+    [Theory]
     [InlineData("foo")]
     [InlineData("vulkn")]
     [InlineData("cuda:x")]
     [InlineData("cuda:-1")]
     [InlineData("gpu:")]
-    [InlineData("vulkan:1")]
+    [InlineData("vulkan:")]
+    [InlineData("vulkan:-1")]
+    [InlineData("vulkan:x")]
+    [InlineData("vulkan:1.5")]
+    [InlineData("vulkan:+1")]
     [InlineData("cpu:0")]
     [InlineData("auto:1")]
     [InlineData("hip")]
@@ -273,5 +299,86 @@ public sealed class DeviceResolutionTests
                     Assert.Equal(10, ServerStartup.ResolveGpuLayers(null, c, 10));
             }
         }
+    }
+
+    // ---- Vulkan device index (#1704) ---------------------------------------------------------------------------
+
+    private static BackendInfoDto TwoVulkan() => new()
+    {
+        Name = "vulkan", Available = true, DeviceCount = 2, Servable = true,
+        Devices =
+        [
+            new DeviceInfoDto { Index = 0, Name = "NVIDIA eGPU", DeviceString = "vulkan:0", TotalMemoryBytes = 12 * GiB },
+            new DeviceInfoDto { Index = 1, Name = "Radeon iGPU", DeviceString = "vulkan:1", TotalMemoryBytes = 64 * GiB, IsDefault = true },
+        ],
+    };
+
+    [Fact]
+    public void ExplicitVulkanIndex_IsPlannedOnThatExactDevice()
+    {
+        var plan = DeviceSelector.Plan(DeviceSpec.Parse("vulkan:1"), GiB, Devices(Cpu(), NoCuda(), TwoVulkan()));
+        Assert.Null(plan.Error);
+        Assert.Equal(["vulkan:1"], plan.Candidates);
+        plan = DeviceSelector.Plan(DeviceSpec.Parse("vulkan:0"), GiB, Devices(Cpu(), NoCuda(), TwoVulkan()));
+        Assert.Equal(["vulkan:0"], plan.Candidates);   // not collapsed to plain "vulkan" (= the default, which is device 1 here)
+    }
+
+    [Fact]
+    public void PlainVulkan_StaysPlain_SoItKeepsTheDefaultDeviceBehaviour() =>
+        Assert.Equal(["vulkan"], DeviceSelector.Plan(DeviceSpec.Parse("vulkan"), GiB, Devices(Cpu(), NoCuda(), TwoVulkan())).Candidates);
+
+    [Theory]
+    [InlineData("vulkan:2")]
+    [InlineData("vulkan:9")]
+    public void OutOfRangeVulkanIndex_IsAClearError_NeverAFallback(string requested)
+    {
+        var plan = DeviceSelector.Plan(DeviceSpec.Parse(requested), GiB, Devices(Cpu(), NoCuda(), TwoVulkan()));
+        Assert.Empty(plan.Candidates);
+        Assert.Contains("does not exist", plan.Error);
+        Assert.Contains("2 Vulkan device(s)", plan.Error);
+        Assert.Contains("vulkan:0..vulkan:1", plan.Error);
+        var ex = Assert.Throws<DeviceUnavailableException>(() => DeviceModelLoader.LoadWith(null!, null!, requested, null, default, GiB, "m",
+            _ => { }, _ => { }, Devices(Cpu(), NoCuda(), TwoVulkan()), (d, _) => throw new InvalidOperationException("must not load")));
+        Assert.Contains("--device cpu", ex.Message);
+    }
+
+    [Fact]
+    public void LoadOnVulkanIndex_RoutesThatIndexToTheLoader_AndReportsIt()
+    {
+        // The discriminating routing test: a loader that dropped the index would be handed "vulkan" (or vulkan:0) here.
+        var tried = new List<string>();
+        var result = DeviceModelLoader.LoadWith(null!, null!, "vulkan:1", null, default, GiB, "m", _ => { }, _ => { },
+            Devices(Cpu(), NoCuda(), TwoVulkan()), (d, _) => { tried.Add(d); return FakeModel(); });
+        Assert.Equal(["vulkan:1"], tried);
+        Assert.Equal("vulkan:1", result.ResolvedDevice);
+        Assert.True(result.IsVulkan);
+    }
+
+    [Fact]
+    public void AutoPrefersTheDefaultVulkanDevice_NotJustTheFirst()
+    {
+        Assert.Equal("vulkan:1", DeviceSelector.Candidates(GiB, Devices(Cpu(), NoCuda(), TwoVulkan()))[0]);
+        Assert.Equal("gpu:0", DeviceSelector.Candidates(GiB, Devices(Cpu(), Cuda(), TwoVulkan()))[0]);   // CUDA still first
+    }
+
+    [Fact]
+    public void DescribeVulkan_ListsEveryPhysicalDevice_WithIndexNameMemoryAndDefault()
+    {
+        var info = DotLLM.Server.Endpoints.DeviceEndpoint.DescribeVulkan(
+        [
+            new DotLLM.Vulkan.VulkanDevice.PhysicalDeviceInfo(0, "NVIDIA RTX", 0x10DE, 2, 12L * GiB, false),
+            new DotLLM.Vulkan.VulkanDevice.PhysicalDeviceInfo(1, "AMD Radeon 8060S", 0x1002, 1, 64L * GiB, true),
+            new DotLLM.Vulkan.VulkanDevice.PhysicalDeviceInfo(2, "llvmpipe", 0x10005, 4, 0, false),
+        ], shaders: true);
+        Assert.True(info.Servable);
+        Assert.Equal(3, info.DeviceCount);
+        Assert.Equal(["vulkan:0", "vulkan:1", "vulkan:2"], info.Devices.Select(d => d.DeviceString));
+        Assert.Equal(["NVIDIA RTX", "AMD Radeon 8060S", "llvmpipe"], info.Devices.Select(d => d.Name));
+        Assert.Equal([12L * GiB, 64L * GiB, (long?)null], info.Devices.Select(d => d.TotalMemoryBytes));   // 0 is "unknown", not a figure
+        Assert.Equal([null, true, null], info.Devices.Select(d => d.IsDefault));
+        // Without the shader blobs the devices exist but are not offered as load targets.
+        var noShaders = DotLLM.Server.Endpoints.DeviceEndpoint.DescribeVulkan([new DotLLM.Vulkan.VulkanDevice.PhysicalDeviceInfo(0, "x", 0, 1, GiB, true)], shaders: false);
+        Assert.False(noShaders.Servable);
+        Assert.Empty(noShaders.Devices);
     }
 }

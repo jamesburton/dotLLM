@@ -71,7 +71,7 @@ internal static class DeviceCli
             if (!DeviceSpec.TryParse(resolved, out var s, out _)) return null;
             return s.Kind switch
             {
-                DeviceKind.Vulkan => DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName,
+                DeviceKind.Vulkan => DeviceModelLoader.VulkanDeviceFor(s).DeviceName,
                 DeviceKind.Cuda => DotLLM.Cuda.CudaDevice.GetDevice(s.Ordinal).Name,
                 _ => null,
             };
@@ -106,8 +106,12 @@ internal static class DeviceCli
     /// <param name="backend">Resolved backend: <c>cpu</c>, <c>cuda</c> or <c>vulkan</c>.</param>
     /// <param name="ordinal">CUDA ordinal (0 otherwise).</param>
     public static bool TryResolveForTool(string device, string modelPath, bool json, out string backend, out int ordinal)
+        => TryResolveForTool(device, modelPath, json, out backend, out ordinal, out _);
+
+    /// <summary>Same, also reporting the Vulkan physical-device index for <c>vulkan:N</c> (null = the process default device, #1704).</summary>
+    public static bool TryResolveForTool(string device, string modelPath, bool json, out string backend, out int ordinal, out int? vulkanIndex)
     {
-        backend = "cpu"; ordinal = 0;
+        backend = "cpu"; ordinal = 0; vulkanIndex = null;
         if (!DeviceSpec.TryParse(device, out var spec, out string? error)) { PrintError(error!, json); return false; }
         long bytes = ModelResolver.FileLength(modelPath);
         var plan = DeviceSelector.Plan(spec, bytes, DotLLM.Server.Endpoints.DeviceEndpoint.Describe(), fullOffload: false);   // tools take --gpu-layers; the loader judges fit
@@ -120,6 +124,7 @@ internal static class DeviceCli
         DeviceSpec.TryParse(resolved, out var rs, out _);
         backend = rs.Kind switch { DeviceKind.Cuda => "cuda", DeviceKind.Vulkan => "vulkan", _ => "cpu" };
         ordinal = rs.Ordinal;
+        vulkanIndex = spec.Kind == DeviceKind.Auto && rs.Kind == DeviceKind.Vulkan ? null : rs.VulkanIndex;
         if (spec.Kind == DeviceKind.Auto || plan.CpuWarning is not null)
             Report(new Outcome(device, resolved, plan.CpuWarning, [], DeviceLabel(resolved)), json);
         return true;

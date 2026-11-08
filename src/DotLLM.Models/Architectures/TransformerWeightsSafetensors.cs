@@ -1,3 +1,4 @@
+using DotLLM.Models.Gguf;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -40,7 +41,7 @@ internal static class TransformerWeightsSafetensorsLoader
     /// </summary>
     public static TransformerWeights Load(
         ISafetensorsTensorSource file, ModelConfig config, BitNetI2SCacheContext? i2sCache = null,
-        bool allowFactorized = false)
+        bool allowFactorized = false, TensorOverlay? overlay = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
@@ -163,6 +164,7 @@ internal static class TransformerWeightsSafetensorsLoader
                 };
             }
 
+            overlay?.ApplyToLayers(layers, config);   // --tensor-overlay (#1706); null = unchanged load
             return TransformerWeights.CreateFromSafetensors(
                 tokenEmbedWeight: embPtr, tokenEmbedQt: embQt,
                 vocabSize: config.VocabSize, hiddenSize: config.HiddenSize,

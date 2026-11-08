@@ -47,7 +47,7 @@ namespace DotLLM.Vulkan;
 /// so <c>MtpSpeculativeDecoder</c> drives this model with no backend-specific branch of its own.
 /// </para>
 /// </remarks>
-public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, IContextLimitable
+public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, IContextLimitable, IVulkanResidualModifierHost
 {
     private readonly VulkanDevice _device;
     private readonly bool _ownsDevice;
@@ -207,11 +207,22 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     }
 
     /// <summary>Drops every kernel's handle-keyed descriptor cache (after any buffer they may name was re-created or freed).</summary>
+    /// <summary>
+    /// Optional device-side in-place modifier of the residual stream after each layer (<c>HookPoint.PostLayer</c>), e.g. a
+    /// <see cref="VulkanTernaryResidualModifier"/> (#1711). Applied after every layer (GDN and full-attention) in the single-sequence
+    /// forward and the fused batch forward (rows are independent, so the stacked rows are modified in one dispatch). Null costs one
+    /// branch per layer. Single-threaded per model instance.
+    /// </summary>
+    public IVulkanResidualModifier? ResidualModifier { get; set; }
+
+    VulkanDevice IVulkanResidualModifierHost.ResidualDevice => _device;
+
     private void InvalidateDescriptorCaches()
     {
         // A pool reset would free descriptor sets the drafter's recorded-but-unsubmitted commands still use (#1193).
         _dflashGpu?.Flush();
         _kernels.InvalidateAll();
+        ResidualModifier?.InvalidateDescriptorCache();
         _hadamard?.InvalidateDescriptorCache();
         _embedGather?.InvalidateDescriptorCache();
         _iqF16Prefill?.InvalidateDescriptorCache();
@@ -633,6 +644,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         //      there is no host round-trip between token mixing and the FFN, so
         //      both sublayers record into the same command buffer. ─────────────
         long hiddenRowBytes = (long)hiddenSize * sizeof(float);
+        var residualModifier = ResidualModifier;
         for (int layer = 0; layer < kinds.Length; layer++)
         {
             ref readonly var layerBuf = ref _weights.Layers[layer];
@@ -715,6 +727,12 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             KernelSupport.ComputeToTransferBarrier(cmdBuf);
             RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState,
                 0, 0, (ulong)((long)seqLen * hiddenRowBytes));
+            if (residualModifier is not null && residualModifier.AppliesTo(layer))
+            {
+                // PostLayer residual modifier (#1711): in place on the device HiddenState, after the final copy has landed.
+                KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+                residualModifier.Record(cmdBuf, _state.HiddenState, layer, seqLen, hiddenSize);
+            }
             KernelSupport.ComputeToHostBarrier(cmdBuf);
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.Resid);
             if (schedule.SubmitAfter(layer))
@@ -1484,6 +1502,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         if (!fuse) { _submit.SubmitAndWait(); open = false; }
 
         // ── 2. Layers ─────────────────────────────────────────────────────────
+        var residualModifier = ResidualModifier;
         for (int layer = 0; layer < kinds.Length; layer++)
         {
             ref readonly var layerBuf = ref _weights.Layers[layer];
@@ -1603,6 +1622,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             _kernels.Add.Record(cmdBuf, _state.Residual, batchNorm, _state.AddScratch, sumN * hiddenSize);
             KernelSupport.ComputeToTransferBarrier(cmdBuf);
             RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState, 0, 0, (ulong)((long)sumN * hiddenRowBytes));
+            if (residualModifier is not null && residualModifier.AppliesTo(layer))
+            {
+                KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+                residualModifier.Record(cmdBuf, _state.HiddenState, layer, sumN, hiddenSize);
+            }
             KernelSupport.ComputeToHostBarrier(cmdBuf);
             if (schedule.SubmitAfter(layer))
             {
