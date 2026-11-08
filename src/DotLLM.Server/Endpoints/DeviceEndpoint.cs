@@ -18,9 +18,8 @@ namespace DotLLM.Server.Endpoints;
 /// fabricated zero.
 /// </para>
 /// <para>
-/// <b>Vulkan is reported as available-but-not-servable.</b> <c>ServerStartup.LoadModel</c>
-/// dispatches to the CPU loader or the CUDA loader only — there is no Vulkan branch — so a tray
-/// must not offer a Vulkan device as a load target.
+/// <b>Every Vulkan physical device is listed</b> (#1704) as <c>vulkan:N</c>; the one plain
+/// <c>vulkan</c> selects carries <c>is_default</c>.
 /// </para>
 /// </remarks>
 public static class DeviceEndpoint
@@ -130,18 +129,28 @@ public static class DeviceEndpoint
 
     private static BackendInfoDto DescribeVulkan()
     {
-        int count = 0;
-        try { count = DotLLM.Vulkan.VulkanDevice.PhysicalDeviceCount(); }
-        catch { count = 0; }
+        DotLLM.Vulkan.VulkanDevice.PhysicalDeviceInfo[] infos = [];
+        try { infos = DotLLM.Vulkan.VulkanDevice.EnumeratePhysicalDevices(); }
+        catch { infos = []; }
 
         // Servable needs the SPIR-V blobs as well as a device: the loader reads them from spv/ beside the binary (#712).
         bool shaders = false;
-        if (count > 0)
+        if (infos.Length > 0)
         {
             try { DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir(); shaders = true; }
             catch { shaders = false; }
         }
+        return DescribeVulkan(infos, shaders);
+    }
 
+    /// <summary>
+    /// Builds the Vulkan backend entry from an enumerated device list: one entry per physical device, selectable as <c>vulkan:N</c>
+    /// (#1704). Memory is the device-local heap size (total only): Vulkan has no device-wide free figure obtainable without a logical
+    /// device, and a fabricated one would mislead the fit check.
+    /// </summary>
+    internal static BackendInfoDto DescribeVulkan(DotLLM.Vulkan.VulkanDevice.PhysicalDeviceInfo[] infos, bool shaders)
+    {
+        int count = infos.Length;
         return new BackendInfoDto
         {
             Name = "vulkan",
@@ -151,9 +160,16 @@ public static class DeviceEndpoint
             Note = count == 0
                 ? "No Vulkan loader / no Vulkan-capable device detected."
                 : shaders ? null : "Vulkan devices are present, but the SPIR-V shader blobs (spv/ beside the binary) were not found.",
-            // The shared Vulkan device is selected by the plain string "vulkan" (--device vulkan / POST /v1/models/load).
+            // Every physical device is selectable as vulkan:N; plain "vulkan" is the one flagged is_default.
             Devices = count > 0 && shaders
-                ? [new DeviceInfoDto { Index = 0, Name = count == 1 ? "Vulkan GPU" : $"Vulkan GPU (first of {count})", DeviceString = "vulkan" }]
+                ? infos.Select(d => new DeviceInfoDto
+                {
+                    Index = d.Index,
+                    Name = d.Name,
+                    DeviceString = $"vulkan:{d.Index}",
+                    TotalMemoryBytes = d.DeviceLocalHeapBytes > 0 ? d.DeviceLocalHeapBytes : null,
+                    IsDefault = d.IsDefault ? true : null,
+                }).ToArray()
                 : [],
         };
     }
