@@ -3031,6 +3031,63 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     internal static bool IsMmqDisabled() =>
         Environment.GetEnvironmentVariable(DisableMmqEnvVar) == "1";
 
+    /// <summary>Which GEMM serves a dense Q8_0 projection above the small-row GEMV range (#1150).</summary>
+    public enum Q8_0PrefillKernel
+    {
+        /// <summary>Per-device default: the F32-accumulate coopmat tile on AMD wave64 devices from <see cref="Q8_0CoopmatPreferSeqLen"/> rows, dp4a MMQ elsewhere.</summary>
+        Auto,
+        /// <summary>Always the dp4a MMQ on Q8_1-quantised activations (the pre-#1150 default everywhere).</summary>
+        Mmq,
+        /// <summary>Always the F16-operand / F32-accumulate coopmat GEMM (<see cref="MatMulQ8_0GemmCoopmatKernel"/>).</summary>
+        Coopmat,
+    }
+
+    /// <summary>Startup override for <see cref="Q8_0Prefill"/>: <c>auto</c> (default), <c>mmq</c> or <c>coopmat</c>.</summary>
+    public const string Q8_0PrefillEnvVar = "DOTLLM_VULKAN_Q8_0_PREFILL";
+
+    /// <summary>Row count from which <see cref="Q8_0PrefillKernel.Auto"/> prefers the coopmat GEMM on a qualifying device (<c>DOTLLM_VULKAN_Q8_0_COOPMAT_MIN_TOKENS</c>, default 128 like the K-quants).</summary>
+    public static int Q8_0CoopmatPreferSeqLen { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_Q8_0_COOPMAT_MIN_TOKENS"), out int q8t) && q8t >= 2 ? q8t : 128;
+
+    /// <summary>
+    /// Dense Q8_0 prefill GEMM selection (#1150). On gfx1151 the F16-operand / F32-accumulate blocked coopmat GEMM is
+    /// 1.10-1.25x the dp4a MMQ at pp512-8192 (#1109 E12) and, against an F32 reference on the real tensors, 4-8x closer
+    /// (MMQ rounds the activations to int8 per 32; the coopmat rounds both operands to F16: <c>VulkanQ8_0PrefillF32ReferenceTests</c>).
+    /// Auto resolves to coopmat only on an AMD device that loaded the wave64 128x128 blocked tile; every other device keeps MMQ
+    /// (Arc: MMQ is 34x the scalar GEMM; NVIDIA wave32 has only the 16x16 legacy coopmat, unmeasured). Settable for in-process A/B.
+    /// </summary>
+    public Q8_0PrefillKernel Q8_0Prefill { get; set; } = ParseQ8_0PrefillEnv(Environment.GetEnvironmentVariable(Q8_0PrefillEnvVar));
+
+    internal static Q8_0PrefillKernel ParseQ8_0PrefillEnv(string? value) => value?.Trim().ToLowerInvariant() switch
+    {
+        "mmq" or "0" => Q8_0PrefillKernel.Mmq,
+        "coopmat" or "cm" or "1" => Q8_0PrefillKernel.Coopmat,
+        _ => Q8_0PrefillKernel.Auto,
+    };
+
+    /// <summary>True when this device's <see cref="Q8_0PrefillKernel.Auto"/> resolves to the coopmat GEMM (AMD, blocked wave64 tile loaded).</summary>
+    public bool Q8_0CoopmatIsDeviceDefault =>
+        _matmulQ8GemmCoopmat is { } cm && _device.VendorId == AmdVendorId
+        && cm.Variant.SpvFileName == Q8_0GemmCoopmatVariant.Blocked128x128x4.SpvFileName;
+
+    /// <summary>The #1150 gate: coopmat for this Q8_0 projection at <paramref name="seqLen"/> rows instead of the dp4a MMQ.</summary>
+    private bool PreferQ8_0Coopmat(int seqLen)
+    {
+        if (seqLen <= 1 || _matmulQ8GemmCoopmat is null) return false;
+        return Q8_0Prefill switch
+        {
+            Q8_0PrefillKernel.Coopmat => true,
+            Q8_0PrefillKernel.Mmq => false,
+            _ => Q8_0CoopmatIsDeviceDefault && seqLen >= Q8_0CoopmatPreferSeqLen,
+        };
+    }
+
+    /// <summary>Dense Q8_0 projections (seqLen &gt; 1) recorded on the F32-accumulate coopmat GEMM (path proof for #1150; test/diagnostic).</summary>
+    public long Q8_0PrefillCoopmatDispatchCount { get; private set; }
+
+    /// <summary>Dense Q8_0 projections (seqLen &gt; 1) recorded on the dp4a MMQ, shared-quantize and residual-fused forms included (test/diagnostic).</summary>
+    public long Q8_0PrefillMmqDispatchCount { get; private set; }
+
     /// <summary>
     /// Opt-IN gate for the IQ2_XXS dp4a MMQ prefill kernel (issue #344). It is OFF by
     /// default: on the gfx1151 iGPU the AMD driver miscompiles this grid-codebook shader
@@ -8553,6 +8610,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             if (p.WeightQt == QuantType.Q5_K && PreferQ5KCoopmat(seqLen)) return false;
             if (p.WeightQt == QuantType.Q3_K && PreferQ3KCoopmat(seqLen)) return false;
             if (p.WeightQt == QuantType.IQ4_XS && PreferIq4XsCoopmat(seqLen)) return false;
+            if (p.WeightQt == QuantType.Q8_0 && PreferQ8_0Coopmat(seqLen)) return false;   // #1150: the coopmat reads F32 activations
             if (!HasMmqPrefillKernel(p.WeightQt, inputDim)) return false;
         }
         return true;
@@ -8597,6 +8655,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         {
             case QuantType.Q8_0:
                 _matmulQ8Mmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+                Q8_0PrefillMmqDispatchCount++;
                 ProfNote("q8_0_mmq", outputDim, inputDim, seqLen);
                 break;
             case QuantType.Q2_K:
@@ -8736,7 +8795,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         if (_matmulQ8MmqResidual is null || _quantizeQ8_1Rows is null
             || _state.Q8_1XqRows is null || _state.Q8_1XdsRows is null
             || (inputDim % QuantizeQ8_1RowsKernel.GroupSize) != 0
-            || !_state.Q8_1RowsFit(seqLen, inputDim))
+            || !_state.Q8_1RowsFit(seqLen, inputDim)
+            || PreferQ8_0Coopmat(seqLen))   // #1150: the residual-fused form is MMQ; fall back to coopmat GEMM + add
         {
             return false;
         }
@@ -8746,6 +8806,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         BarrierComputeToCompute(cmdBuf);
         _matmulQ8MmqResidual.Record(cmdBuf, weights, _state.Q8_1XqRows, _state.Q8_1XdsRows, residual, output,
             m: outputDim, k: inputDim, n: seqLen);
+        Q8_0PrefillMmqDispatchCount++;
         return true;
     }
 
@@ -8954,27 +9015,32 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             else if (_matmulQ8Mmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
                 && (inputDim % QuantizeQ8_1RowsKernel.GroupSize) == 0
-                && _state.Q8_1RowsFit(seqLen, inputDim))
+                && _state.Q8_1RowsFit(seqLen, inputDim)
+                && !PreferQ8_0Coopmat(seqLen))
             {
                 // dp4a MMQ prefill path (issue #50): quantize the F32 activation
                 // B-matrix to Q8_1 row-wise, then run the integer-dot GEMM. The
                 // compute-bound seqLen>1 analogue of the MMVQ decode GEMV; the
                 // integer-dot inner loop replaces the per-element dequant FMA of
                 // the FP GEMM. Falls through to coopmat / scalar when the path
-                // isn't wired or the activation scratch can't hold [N, K].
+                // isn't wired or the activation scratch can't hold [N, K], and
+                // yields to the coopmat GEMM where PreferQ8_0Coopmat says so (#1150).
                 _quantizeQ8_1Rows.Record(cmdBuf, input, _state.Q8_1XqRows, _state.Q8_1XdsRows,
                     n: seqLen, k: inputDim);
                 BarrierComputeToCompute(cmdBuf);
                 _matmulQ8Mmq.Record(cmdBuf, weights, _state.Q8_1XqRows, _state.Q8_1XdsRows, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                Q8_0PrefillMmqDispatchCount++;
                 ProfNote("q8_0_mmq", outputDim, inputDim, seqLen);
             }
             else if (_matmulQ8GemmCoopmat is not null)
             {
-                // Prefill path on coopmat-capable devices — ~3.8× over scalar
-                // at Llama-3 prefill shapes. See MatMulQ8_0GemmCoopmatKernel.
+                // F16-operand / F32-accumulate blocked coopmat GEMM: the gfx1151 default above
+                // Q8_0CoopmatPreferSeqLen rows (#1150: 1.10-1.25x the MMQ and closer to an F32
+                // reference), and the fallback everywhere the MMQ path isn't wired.
                 _matmulQ8GemmCoopmat.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                Q8_0PrefillCoopmatDispatchCount++;
                 ProfNote("q8_0_coopmat", outputDim, inputDim, seqLen);
             }
             else

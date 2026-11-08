@@ -122,7 +122,7 @@ LM head. Its GPU side follows the RTX 3060 column.
 | operation | 155H | Zen 5 | Xeon SSE4.2 | Xeon+3060 (CPU side) | RTX 3060 | Strix 8060S | Arc | evidence |
 |---|---|---|---|---|---|---|---|---|
 | **Weight GEMV (decode)** | int8 activations (Q8_0/Q8_1/Q8_K), AVX2 maddubs; VNNI optional | int8 activations, AVX2 maddubs; AVX-512BW only multithreaded (+5–10%) | int8 activations, SSSE3 (**only** viable tier) | keep the GGUF's quant format, W4A8/W8A8; prefer Q4_K/Q4_0 over Q8_0 | quantized weights × Q8_1 activations, dp4a (done) | **int8 MMVQ** (Q4_0 1.6×, Q8_0 parity vs F32-in; KL 1–3e-4) | **int8 MMVQ** (1.3–1.7× vs F32-in) | E1, E4, E12 |
-| **Weight GEMM (prefill)** | Q4_K int8 tile; **Q8_0/Q4_0 need the Q4_K-style int8 microkernel (#1119)** | same; Q8_0 int8 today 0.6× of F32 | Q8_0 int8 R4 (1.4–1.6× F32); Q4_0 no gain | prefill on the 3060 where possible; else Q8_0 int8 | **int8-mma MMQ, Q8_1 activations, no weight expansion** (#1132 hybrid, #1135 dense) | f16 coopmat with in-tile dequant, **F32 acc**; Q8_0: coopmat 1.10–1.25× over dp4a MMQ (#1150); hybrid IQ4_NL/K-quants still scalar F32 (#1149) | **DP4a MMQ (34× the scalar F32 GEMM)**; hybrid host gap #1149 | E2, E3, E11, E12 |
+| **Weight GEMM (prefill)** | Q4_K int8 tile; **Q8_0/Q4_0 need the Q4_K-style int8 microkernel (#1119)** | same; Q8_0 int8 today 0.6× of F32 | Q8_0 int8 R4 (1.4–1.6× F32); Q4_0 no gain | prefill on the 3060 where possible; else Q8_0 int8 | **int8-mma MMQ, Q8_1 activations, no weight expansion** (#1132 hybrid, #1135 dense) | f16 coopmat with in-tile dequant, **F32 acc**; Q8_0: **coopmat default (#1150)**: 1.08–1.30× over dp4a MMQ and KL 9e-7 vs F32 where MMQ is 3.9e-4 (E12b); hybrid IQ4_NL/K-quants still scalar F32 (#1149) | **DP4a MMQ (34× the scalar F32 GEMM)**; hybrid host gap #1149 | E2, E3, E11, E12 |
 | **FP GEMM accumulator** | F32 (no F16 ALU) | F32 / int32 | F32 / int32 | F32 / int32 | F16 within ≤ 256 K, **F32 across** (fused, K2); plain `COMPUTE_16F` rejected for Bonsai | **F32** (F16-acc no faster, KL 1.6e-3; K2v) | int32 | E2, E11 |
 | **Attention QKᵀ** | int8 QKᵀ over q8_0 K (+10–25%) | int8 QKᵀ (+20–35%) | **int8 QKᵀ (~1.9×)** | int8 QKᵀ over q8_0 (after #970, #1120) | F32 S default; F16 S with exact pre-scale is safe (1.2e-4 at 100k) for ≤ 5% | F32 S; **Q as plain F16, no hi/lo split** (1.67×, #1148, needs sign-off); F16 S rejected (Tev1 tail KL 1.47) | F32 (F16 variants 0.66×) | E7, E8, E9 |
 | **Attention P·V** | F32 acc | F32 acc | F32 acc | F32 acc | **F32 across tiles (K1)**; F16 within a tile allowed, no gain | **F32 across tiles (K1)**; within-tile F16 0.94× → F32; decode P·V F32 (K6) | F32 (F16 0.61×) | E7, E9, E10 |
@@ -412,8 +412,31 @@ F32-acc reference: 230.3 / 222.4 / 207.4 tok/s. Same 1,136-row protocol as E2: S
 | 1B Q8_0, Arc | F32-in GEMV decode | 0 | 2.6e-4 / 1.8e-3 | 1.01 | **0.76** |
 | 3B Q4_0, Arc | F32-in GEMV decode | 0 | 1.5e-4 / 1.3e-3 | 1.01 | 0.60 (1 rep) |
 
-No F32-weight reference exists on Vulkan, so the MMQ vs coopmat comparison is path against path (KL 3.2e-4 apart);
-which is closer to F32 truth is #1150.
+E12 had no F32-weight reference, so the MMQ vs coopmat comparison was path against path (KL 3.2e-4 apart). E12b resolves it.
+
+#### E12b — Vulkan dense Q8_0 prefill against an F32 reference (#1150, Strix)
+
+Kernel level (`VulkanQ8_0PrefillF32ReferenceTests`): the real layer-0 Q8_0 tensors of Llama-3.2-1B and LFM3-1.7B, 100 rows of
+real activations (token embeddings of natural text through the layer-0 RMSNorm; the SwiGLU product for `ffn_down`), reference =
+exact `d*q` × F32 activation accumulated in F64. Relative RMS error: dp4a MMQ 1.7e-3–9.7e-3, **F32-acc coopmat 7.8e-5–2.9e-4**
+(15–36× closer on every tensor), the CPU W8A8 oracle identical to the MMQ, and a `float16_t`-accumulator control
+(`matmul_q8_0_gemm_coopmat_128x128x4_f16acc_control`) at 3.9e-3–8.4e-3, i.e. rejected. Full table in
+[GPU.md](GPU.md#vulkan-dense-q8_0-prefill-gemm-selection-1150).
+
+Model level (`VulkanQ8_0PrefillDefaultTests`, Llama-3.2-1B Q8_0, 512 wikitext rows, F32 arm = `make_f32_decoded_gguf.py` copy on
+the CPU F32 forward):
+
+| arm vs F32 reference | median KL | p99 | max | top-1 |
+|---|---:|---:|---:|---:|
+| coopmat F32-acc (new default) | **9.2e-7** | 7.6e-6 | 1.7e-5 | **99.61 %** |
+| dp4a MMQ (old default) | 3.85e-4 | 2.6e-3 | 5.1e-3 | 98.63 % |
+| CPU oracle (W8A8) | 3.74e-4 | 4.2e-3 | 1.05e-2 | 99.41 % |
+
+Greedy text identical on all arms for 32/32 steps. Speed (indicative, contended): 1.22–1.30× at pp512, 1.08× at pp2048, decode
+unchanged. Decision: the dense host's Q8_0 prefill GEMM is the F32-acc coopmat on AMD wave64 devices from 128 rows
+(`DOTLLM_VULKAN_Q8_0_PREFILL=mmq` reverts); every other device keeps MMQ. The mutants that validated the gate: a `float16_t`
+accumulator (rejected on every tensor), a ragged-tile scatter that drops `warp_c` (relRMS 1.0–1.1), and the device gate hard-wired
+to MMQ (caught by the dispatch counters once the test derived its expectation from the device rather than from the gate).
 
 ### E13 — Activation range at GPU F16 / Q8_1 storage sites (#1191)
 
@@ -541,7 +564,7 @@ Guards: `QuantizerConventionSensitivityTests` (CPU, corpus sensitivity to each w
 | 1. Accumulate F32 by default for norms, softmax/attention sums, long-KV attention | **PV across tiles proven on CUDA and Vulkan** (K1: 8.8e-4 at 100k CUDA, 2.8e-3 and 73.6% of rows > 1e-3 at 128k Strix); **decode P·V proven** (K6, E10); softmax stats in F16 accurate at today's split sizes but no faster (E10); norms: no F16 ALU on CPU (K3, K4) | **confirmed** for long-range sums; softmax/norm kept F32 because narrowing buys nothing |
 | 1. … recurrent-state updates, split-reduction combines | not measured | open → #1144 |
 | 1. Compute-bound GEMM: F16 accumulation where faster and KL-parity passes; promote every 64–256 for long K | RTX 3060: plain F16-acc 1.11–1.20× faster but fails on Bonsai (median 1.16e-4, 0.6% top-1 flips, grows 3.7× with K); **promote every 256: 6.3e-6** (E2). **Strix: F16-acc is not faster (1.00–1.01×)** and fails (1.6e-3, 65.8% of rows > 1e-3; Q4_0 max 0.106) (E11, E12). Arc: no F16 path is faster (0.60–0.68×) | **3060: yes, with promotion** (fused, #1132). **Strix, Arc: no** — F32 accumulation |
-| 1. Integer dot products accumulate int32 | CPU W8A8/W4A8 KL 1–2e-4 at per-32 scales (E4); CUDA W2A8 5.1e-5, better than F16-acc (E2); Vulkan MMVQ 1–3e-4 vs F32-in, 1.3–1.7× (Arc), 1.6× (Strix Q4_0); Arc MMQ prefill 34× (E12) | confirmed; per-32 activation scales preferred over per-256; Strix Q8_0 prefill prefers the F32-acc coopmat (#1150) |
+| 1. Integer dot products accumulate int32 | CPU W8A8/W4A8 KL 1–2e-4 at per-32 scales (E4); CUDA W2A8 5.1e-5, better than F16-acc (E2); Vulkan MMVQ 1–3e-4 vs F32-in, 1.3–1.7× (Arc), 1.6× (Strix Q4_0); Arc MMQ prefill 34× (E12) | confirmed; per-32 activation scales preferred over per-256; Strix Q8_0 prefill is the F32-acc coopmat (#1150, E12b) |
 | 1. Stored F32 partials (split-K, split-KV) need sign-off | not measured | open → #1144 |
 | (not a rule; a kernel extra) Q hi/lo split in Vulkan GQA prefill | dropping it: KL ≤ 1.5e-7 median, 1.67× attention, 1.46× a 128k tile (E9) | turn off by default → #1148 (user sign-off) |
 | 1. Model-declared FP32 state is evidence, not exemption | engines unanimous `[lit]`; no dotLLM measurement | open → #1144 |
@@ -624,7 +647,7 @@ New issues filed by this study: #1134–#1146 (inventory), #1148–#1151 (Vulkan
 |---|---|
 | #1148 | Drop the Q hi/lo split in the GQA coopmat prefill by default (KL at the noise floor, 1.46× a 128k tile; needs user sign-off) |
 | #1149 | Hybrid host: IQ4_NL / K-quant prefill on scalar F32 GEMMs; use MMQ / coopmat |
-| #1150 | Strix Q8_0 dense prefill: dp4a MMQ default is 1.10–1.25× slower than the F32-acc coopmat; needs an F32 reference arm |
+| #1150 | Strix Q8_0 dense prefill: dp4a MMQ default is 1.10–1.25× slower than the F32-acc coopmat; **F32 reference arm built (E12b), coopmat is the dense-host default on AMD wave64 devices** (`DOTLLM_VULKAN_Q8_0_PREFILL=mmq` reverts) |
 | #1151 | F16 KV for the dense Vulkan host (F32 today) |
 
 ---
@@ -639,8 +662,9 @@ New issues filed by this study: #1134–#1146 (inventory), #1148–#1151 (Vulkan
 | F16 RoPE tables at ≥ 32k | CPU table bytes | #1142 |
 | Vulkan F16 accumulation promoted every 256 K | the AMD Windows driver crashes compiling it; moot on Strix (F16-acc no faster) | — |
 | Vulkan hybrid KV in q8_0 / K8V4 / q4_0 | Strix/Arc long-context KV choice | #1112 |
-| Vulkan iu8 WMMA prefill vs f16 WMMA (bytes only on RDNA 3.5) | Strix Q8_0 prefill choice | #1150 |
-| Vulkan path accuracy against an F32-weight reference | MMQ vs coopmat differ by 3.2e-4; which is closer is unknown | #1150 |
+| Vulkan iu8 WMMA prefill vs f16 WMMA (bytes only on RDNA 3.5) | Strix Q8_0 prefill choice: the dense int8-coopmat (cm1) Q8_0 kernel exists but is opt-in and was not re-measured against the F32-acc coopmat | #1150 (remainder), #1226 |
+| ~~Vulkan path accuracy against an F32-weight reference~~ measured (E12b): on real Llama-3.2-1B / LFM3-1.7B Q8_0 tensors the F32-acc coopmat is 4–8× closer to the F64 reference than the dp4a MMQ; the F16-accumulate control is rejected | — | #1150 |
+| Same F32-reference check for Q4_K / Q5_K / Q6_K dense prefill (MMQ below 128 rows, coopmat above) | the #1150 recipe (`VulkanQ8_0PrefillF32ReferenceTests`) applies unchanged; not run | #1150 (criterion 3) |
 | LFM2 MoE Vulkan F32 KV narrowed to F16 | not on Strix | #1151 |
 | ~~Fused int8-mma / promoted-F16 PQ2_0 GEMM speed (and the dp4a vs mma rate)~~ measured (#1222): Bonsai-2 pp512 157 → ~600 tok/s on the 3060 (fork 590); PPL 10.6182 vs 10.6179 (dequant + cuBLAS) | — | #1132 |
 | CUDA KV formats on a Llama-class model (CPU covered Llama) | KV policy beyond Bonsai | #1133 |
