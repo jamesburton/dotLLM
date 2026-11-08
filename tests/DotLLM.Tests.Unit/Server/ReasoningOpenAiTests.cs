@@ -274,14 +274,7 @@ public sealed class ReasoningOpenAiTests
             ParseRequest(requestJson), ctx, _ => Tokens(pieces), (work, _) => work(),
             "chatcmpl-test", "m", parser is null ? null : Tools, parser, plan, CancellationToken.None);
 
-        var frames = new List<JsonElement>();
-        foreach (string block in Encoding.UTF8.GetString(body.ToArray()).Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
-        {
-            string data = block["data: ".Length..];
-            if (data == "[DONE]") continue;
-            frames.Add(JsonDocument.Parse(data).RootElement.Clone());
-        }
-        return frames;
+        return SseTestReader.Json(Encoding.UTF8.GetString(body.ToArray())).ToList();
     }
 
     private static (string Reasoning, string Content) Collect(List<JsonElement> frames)

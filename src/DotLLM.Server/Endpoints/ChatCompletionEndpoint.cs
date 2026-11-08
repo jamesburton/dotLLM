@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using DotLLM.Engine;
+using DotLLM.Engine.PromptCache;
 using DotLLM.Server.ChunkCache;
 using DotLLM.Server.Models;
 using DotLLM.Server.RateLimiting;
@@ -145,6 +146,9 @@ public static class ChatCompletionEndpoint
         options = options with
         {
             GenerationPromptSuffix = ReasoningSupport.GenerationPromptSuffix(state.ChatTemplate, messages, templateOptions, prompt),
+            // (#1654) And where its last user message starts: the conversation's save point for the agent-aware prefix policy.
+            SavePointPrefix = state.Options.PromptCachePolicy == PrefixCachePolicy.Agent
+                ? ReasoningSupport.SavePointPrefix(state.ChatTemplate, messages, templateOptions, prompt) : null,
         };
 
         // #456: tool_choice was parsed at the top of this method and then DISCARDED — the local

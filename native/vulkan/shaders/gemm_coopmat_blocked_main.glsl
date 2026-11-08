@@ -58,9 +58,16 @@ void main() {
     uint warp_r = warp_i % SG_ROWS;
     uint warp_c = warp_i / SG_ROWS;
 
-    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums[CMS_PER_ROW * CMS_PER_COL];
+    // Accumulator element type. float (the shipped default) on every production shader; a variant may define
+    // GEMM_ACC_T float16_t to build a RED-arm control (#1150: the F16-accumulate Q8_0 GEMM the F32-reference gate must
+    // reject). GEMM_ACC_STORE(x) converts the accumulator to the float the store paths expect.
+#ifndef GEMM_ACC_T
+#define GEMM_ACC_T float
+#define GEMM_ACC_STORE(x) (x)
+#endif
+    coopmat<GEMM_ACC_T, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums[CMS_PER_ROW * CMS_PER_COL];
     [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++)
-        sums[i] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+        sums[i] = coopmat<GEMM_ACC_T, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
 
     uint chunks = GEMM_CHUNKS;
     uint chBegin = 0u;
@@ -145,7 +152,7 @@ void main() {
     // A single per-tensor scale applied to the F32 accumulator AFTER the K loop — which is
     // why such formats can stage the A operand losslessly (I2_S: raw ternary {-1,0,+1}).
     {
-        float epiScale = GEMM_EPILOGUE_SCALE;
+        GEMM_ACC_T epiScale = GEMM_ACC_T(GEMM_EPILOGUE_SCALE);
         [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++)
             sums[i] = sums[i] * epiScale;
     }
@@ -171,7 +178,7 @@ void main() {
                              cSlab + (GEMM_ROW_BASE + dc + cm_col * TN) * GEMM_M + dr + cm_row * TM,
                              GEMM_M, gl_CooperativeMatrixLayoutColumnMajor);
 #else
-                coopMatStore(sums[cm_col * CMS_PER_ROW + cm_row], GEMM_C_BUF,
+                coopMatStore(GEMM_ACC_STORE(sums[cm_col * CMS_PER_ROW + cm_row]), GEMM_C_BUF,
                              cSlab + (GEMM_ROW_BASE + dc + cm_col * TN) * GEMM_M + dr + cm_row * TM,
                              GEMM_M, gl_CooperativeMatrixLayoutColumnMajor);
 #endif
@@ -180,7 +187,7 @@ void main() {
     } else {
         [[unroll]] for (uint cm_row = 0u; cm_row < CMS_PER_ROW; cm_row++) {
             [[unroll]] for (uint cm_col = 0u; cm_col < CMS_PER_COL; cm_col++) {
-                coopMatStore(sums[cm_col * CMS_PER_ROW + cm_row], storeStage,
+                coopMatStore(GEMM_ACC_STORE(sums[cm_col * CMS_PER_ROW + cm_row]), storeStage,
                              warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
                 barrier();
                 memoryBarrierShared();

@@ -58,16 +58,19 @@ public static class SyntheticGlm4MoeGguf
     /// <param name="headDim">Per-head width (default 16; 128 reproduces the real Air head geometry, rope = headDim / 2).</param>
     /// <param name="q8Weights">Store every matrix / expert bank as Q8_0 (widths 64 / 32; for GPU loaders that keep banks packed).</param>
     /// <param name="q8AsF32">As <paramref name="q8Weights"/> but write the dequantised values as F32 (exact-weight oracle).</param>
+    /// <param name="sharedExperts"><c>expert_shared_count</c> (default <see cref="SharedExperts"/>; 1 reproduces GLM-4.5-Air and qualifies the
+    /// Vulkan fused single-token MoE decode chain, #1614).</param>
     /// <param name="omitTensor">Tensor name to leave out (census mismatch tests).</param>
     /// <param name="wrongShapeTensor">Tensor name to emit with an extra trailing element (census shape-mismatch tests).</param>
     /// <returns>The GGUF bytes.</returns>
     public static byte[] Build(int numExperts = DefaultExperts, int trunkLayers = DefaultTrunkLayers, bool withNextn = true,
                                bool withQkNorm = false, uint seed = 0xA1B2C3u, string? omitTensor = null, string? wrongShapeTensor = null, int headDim = HeadDim,
-                               bool q8Weights = false, bool q8AsF32 = false)
+                               bool q8Weights = false, bool q8AsF32 = false, int sharedExperts = SharedExperts)
     {
         // q8Weights (#1600): every matrix and expert bank is stored Q8_0 (the Vulkan loader only keeps packed banks resident, F32 banks are refused), which
         // needs every reduction length to be a multiple of 32: the FFN widths become 64 (dense) / 32 (per expert, 64 fused shared).
         q8Weights |= q8AsF32;
+        ArgumentOutOfRangeException.ThrowIfLessThan(sharedExperts, 1);
         int denseInter = q8Weights ? 64 : DenseIntermediate, moeInter = q8Weights ? 32 : MoeIntermediate;
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(trunkLayers, LeadingDense);
         ArgumentOutOfRangeException.ThrowIfLessThan(numExperts, ExpertsUsed);
@@ -94,7 +97,7 @@ public static class SyntheticGlm4MoeGguf
         w.AddUInt32($"{arch}.rope.dimension_count", (uint)(headDim / 2));
         w.AddUInt32($"{arch}.expert_count", (uint)numExperts);
         w.AddUInt32($"{arch}.expert_feed_forward_length", (uint)moeInter);
-        w.AddUInt32($"{arch}.expert_shared_count", SharedExperts);
+        w.AddUInt32($"{arch}.expert_shared_count", (uint)sharedExperts);
         w.AddUInt32($"{arch}.leading_dense_block_count", LeadingDense);
         w.AddUInt32($"{arch}.expert_gating_func", 2);            // sigmoid
         w.AddFloat32($"{arch}.expert_weights_scale", 1.0f);
@@ -130,7 +133,7 @@ public static class SyntheticGlm4MoeGguf
 
         int nq = NumAttentionHeads * headDim, nkv = NumKvHeads * headDim;
         float qkAmp = headDim == HeadDim ? 1.0f : MathF.Sqrt((float)HeadDim / headDim);   // keep attention logits at the same scale
-        int shared = moeInter * SharedExperts;
+        int shared = moeInter * sharedExperts;
 
         Mat("token_embd.weight", HiddenSize, VocabSize);
         Vec("output_norm.weight", HiddenSize, 1f);

@@ -1,0 +1,103 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_EXT_control_flow_attributes    : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED IQ4_XS MMVQ decode GEMV, V2 (issue #1678; V1 = moe_indexed_matmul_iq4_xs_mmvq.comp, issue #823). Same integer dp4a math as V1
+// (codebook int8 x Q8_1 activation, dl = d * (ls - 32) per 32-element sub-block), restructured like the IQ2_XXS / IQ2_XS V2 shaders (#991):
+// a lane owns a whole 32-element sub-block (all four 4-byte qs words) of one of FOUR blocks per step instead of one qs word of one block, so the
+// wave issues ~4x fewer load instructions per weight byte (V1: ~9 loads for 4 weight bytes per lane per block; this: 6 weight-word + 2 uvec4
+// activation + 1 scale load for 16 weight bytes). The float accumulation order over a row differs from V1 (per-lane sum over steps, then one
+// subgroupAdd); the per-sub-block integer dot is exact in both.
+//
+//   y[n, m] = sum_k dequant_iq4_xs(bank[indices[n], m, k]) * x[n, k]
+//
+// IQ4_XS super-block (136 bytes / 256 elements, 8-byte aligned): [0,1] fp16 d | [2,3] scales_h | [4..7] scales_l[4] | [8..135] qs[128].
+// Sub-block ib (32 elements) = qs words 4ib..4ib+3; word w: low nibbles = elements 4w..4w+3, high nibbles = elements 16+4w..16+4w+3.
+// NOT bit-exact vs a float-in reference (x is int8-quantized). Dispatch: 2D grid - x = m, y = n. Bindings: 0 bank, 1 xq (uvec4 view), 2 xds,
+// 3 indices, 4 y.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };      // IQ4_XS blob [numExperts, M, K/256 x 136 B]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uvec4 xq4[]; };       // [xRows * K/16]
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };       // [xRows * K/32]
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };   // [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };         // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow;  // K / 256
+    uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
+} pc;
+
+const uint IQ4_XS_BLOCK_BYTES = 136u;
+
+const int KV[16] = int[16](
+    -127, -104, -83, -65, -49, -35, -22, -10,
+       1,   13,  25,  38,  53,  69,  89, 113
+);
+
+// Four codebook int8 values from the nibbles at bit offsets s0..s3 of `cur`, packed for dp4a.
+uint packCB(uint cur, uint s0, uint s1, uint s2, uint s3) {
+    return (uint(KV[(cur >> s0) & 0xFu]) & 0xFFu)
+         | ((uint(KV[(cur >> s1) & 0xFu]) & 0xFFu) << 8u)
+         | ((uint(KV[(cur >> s2) & 0xFu]) & 0xFFu) << 16u)
+         | ((uint(KV[(cur >> s3) & 0xFu]) & 0xFFu) << 24u);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint bq = lane >> 3u;                 // block within a 4-block step
+    uint ib = lane & 7u;                  // sub-block 0..7 (32 elements = 4 qs words)
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * IQ4_XS_BLOCK_BYTES;
+    uint xRow        = n / pc.xDiv;
+    uint xq4RowBase  = xRow * (pc.K >> 4u);
+    uint xdsRowBase  = xRow * (pc.K >> 5u);
+    float acc = 0.0;
+
+    for (uint chunk = 0u; chunk < pc.blocksPerRow; chunk += 16u) {
+        [[unroll]] for (uint s = 0u; s < 4u; s++) {
+            uint blkRaw = chunk + s * 4u + bq;
+            if (blkRaw >= pc.blocksPerRow) continue;
+            uint bw = (rowByteBase + blkRaw * IQ4_XS_BLOCK_BYTES) >> 2u;   // block is 8-byte aligned
+            uint h0 = bank[bw];          // d | scales_h
+            uint h1 = bank[bw + 1u];     // scales_l[4]
+            uint qw = bw + 2u + ib * 4u;
+            uint c0 = bank[qw], c1 = bank[qw + 1u], c2 = bank[qw + 2u], c3 = bank[qw + 3u];
+            uint xi = xq4RowBase + blkRaw * 16u + ib * 2u;
+            uvec4 xa = xq4[xi], xb = xq4[xi + 1u];
+            float dX = xds[xdsRowBase + blkRaw * 8u + ib].x;
+
+            float d = unpackHalf2x16(h0 & 0xFFFFu).x;
+            uint scalesH = h0 >> 16u;
+            uint low  = ((h1 >> (8u * (ib >> 1u))) >> (4u * (ib & 1u))) & 0xFu;
+            uint high = (scalesH >> (2u * ib)) & 0x3u;
+            float dl = d * float(int(low | (high << 4u)) - 32);
+
+            int dot = 0;
+            dot = dotPacked4x8AccSatEXT(int(packCB(c0, 0u, 8u, 16u, 24u)), int(xa.x), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(c1, 0u, 8u, 16u, 24u)), int(xa.y), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(c2, 0u, 8u, 16u, 24u)), int(xa.z), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(c3, 0u, 8u, 16u, 24u)), int(xa.w), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(c0, 4u, 12u, 20u, 28u)), int(xb.x), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(c1, 4u, 12u, 20u, 28u)), int(xb.y), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(c2, 4u, 12u, 20u, 28u)), int(xb.z), dot);
+            dot = dotPacked4x8AccSatEXT(int(packCB(c3, 4u, 12u, 20u, 28u)), int(xb.w), dot);
+            acc += dl * (dX * float(dot));
+        }
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[n * pc.M + m] = total;
+}

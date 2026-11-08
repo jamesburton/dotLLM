@@ -159,8 +159,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly nint _quantizedGemvIQ4_NLMmvqLargePreqFunc;
     private readonly nint _quantizedGemvIQ4_XSMmvqLargePreqFunc;
     private readonly nint _quantizedGemvQ8_0MmvqLargePreqFunc;
-    private readonly nint _quantizedGemvQ4_KMmvqRows4PreqFunc;
-    private readonly nint _quantizedGemvQ6_KMmvqRows4PreqFunc;
+    // Warp-per-row "rows4" GEMVs (#1298/#1316/#1375): [Rows4TypeIndex(qt), columns] -> quantized_gemv_<qt>_mmvq_rows4_preq
+    // (columns == 1) or _c{columns} (2..KQuantRows4MaxColumns). 0 where the PTX lacks the symbol.
+    private readonly nint[,] _rows4PreqFuncs = new nint[Rows4TypeCount, KQuantRows4MaxColumns + 1];
     // Batched-M dp4a MMQ prefill kernel (issue #349) — DESIGNED to amortize weight reads
     // across MMQ_BATCH_M_TILE(2) prefill tokens per block via L1/L2 cache reuse (see
     // native/kernels/quantized_gemv_mmq.cu for the kernel body), but measured 2x-51x
@@ -812,8 +813,15 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _quantizedGemvIQ4_NLMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmvq_large_preq");
             _quantizedGemvIQ4_XSMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_xs_mmvq_large_preq");
             _quantizedGemvQ8_0MmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q8_0_mmvq_large_preq");
-            _quantizedGemvQ4_KMmvqRows4PreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_rows4_preq");
-            _quantizedGemvQ6_KMmvqRows4PreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_rows4_preq");
+            // rows4 (#1298) and its 2..8-column instantiations (#1316/#1375); TryGetFunction so an older PTX still loads.
+            foreach (QuantizationType rqt in Rows4Types)
+            {
+                int ti = Rows4TypeIndex(rqt);
+                string stem = $"quantized_gemv_{rqt.ToString().ToLowerInvariant()}_mmvq_rows4_preq";
+                _rows4PreqFuncs[ti, 1] = _quantizedGemvMmqModule.TryGetFunction(stem);
+                for (int c = 2; c <= KQuantRows4MaxColumns; c++)
+                    _rows4PreqFuncs[ti, c] = _quantizedGemvMmqModule.TryGetFunction($"{stem}_c{c}");
+            }
             // Batched-M prefill kernel (issue #349) — TryGetFunction so a stale PTX
             // without the new symbol still loads; HasMmqBatchedQ4K reports false.
             _quantizedGemvQ4_KMmqBatchedFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmq_batched");
@@ -5950,6 +5958,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// Override: <c>DOTLLM_DISABLE_PREQ8_1=1</c>.</summary>
     public bool HasPreQ8_1 => _quantizeXToQ8_1Func != 0 && !DisablePreQ8_1;
 
+    /// <summary>True when the batched (multi-row) Q8_1 activation quantiser is loaded (feeds the rows4 multi-column GEMVs, #1316/#1375).</summary>
+    public bool HasQuantizeXToQ8_1Batched => _quantizeXToQ8_1BatchedFunc != 0;
+
     /// <summary>
     /// True when the batched-M dp4a MMQ Q4_K prefill kernel AND its batched input-quantization
     /// companion are both loaded (issue #349 proof of concept — Q4_K only). Gates the prefill
@@ -5975,26 +5986,95 @@ public sealed unsafe partial class CudaKernels : IDisposable
     public static string KQuantGemvMode { get; set; } =
         (Environment.GetEnvironmentVariable("DOTLLM_KQUANT_GEMV") ?? "auto").ToLowerInvariant();
 
-    /// <summary>True when the warp-per-row (4 rows / block) pre-Q8_1 kernel is loaded for <paramref name="qt"/> (#1298).</summary>
-    public bool HasMmvqRows4Preq(QuantizationType qt) => qt switch
+    /// <summary>Largest column count the rows4 multi-column GEMVs are instantiated for (<c>_c2.._c8</c>; #1316/#1375).</summary>
+    public const int KQuantRows4MaxColumns = 8;
+
+    /// <summary>Quant types with a rows4 kernel family (decode + 2..8 columns), in <see cref="Rows4TypeIndex"/> order.</summary>
+    public static readonly QuantizationType[] Rows4Types =
     {
-        QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqRows4PreqFunc != 0,
-        QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqRows4PreqFunc != 0,
-        _ => false,
+        QuantizationType.Q4_K, QuantizationType.Q5_K, QuantizationType.Q6_K, QuantizationType.Q2_K,
+        QuantizationType.IQ4_XS, QuantizationType.IQ4_NL,
     };
 
+    private const int Rows4TypeCount = 6;
+
+    /// <summary>Row of <see cref="_rows4PreqFuncs"/> for <paramref name="qt"/>, or -1 when no rows4 family exists for it.</summary>
+    private static int Rows4TypeIndex(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q4_K => 0,
+        QuantizationType.Q5_K => 1,
+        QuantizationType.Q6_K => 2,
+        QuantizationType.Q2_K => 3,
+        QuantizationType.IQ4_XS => 4,
+        QuantizationType.IQ4_NL => 5,
+        _ => -1,
+    };
+
+    /// <summary>True when the warp-per-row (4 rows / block) pre-Q8_1 decode kernel is loaded for <paramref name="qt"/> (#1298/#1316).</summary>
+    public bool HasMmvqRows4Preq(QuantizationType qt) => HasMmvqRows4Multi(qt, 1);
+
     /// <summary>
-    /// Per-shape kernel rule for the K-quant decode GEMV (#1298). Each entry cites its measurement in docs/CUDA.md.
+    /// True when the rows4 kernel instantiated for exactly <paramref name="columns"/> activation columns is loaded for
+    /// <paramref name="qt"/> (#1316/#1375). <c>columns</c> outside 1..<see cref="KQuantRows4MaxColumns"/> is false.
+    /// </summary>
+    public bool HasMmvqRows4Multi(QuantizationType qt, int columns)
+    {
+        int ti = Rows4TypeIndex(qt);
+        return ti >= 0 && (uint)(columns - 1) < KQuantRows4MaxColumns && _rows4PreqFuncs[ti, columns] != 0;
+    }
+
+    /// <summary>
+    /// Shape rule shared by every rows4 launch: the kernels walk 256-element superblocks (IQ4_NL: groups of 8 blocks),
+    /// 16 lanes each, so <c>k</c> must be a multiple of 256; <see cref="MmvqLargeKThreshold"/> keeps the small-k decode
+    /// shapes on the MMQ-4-rows kernel whose in-kernel quantisation amortises better there (#1298).
+    /// </summary>
+    public static bool Rows4ShapeOk(int k) => k >= MmvqLargeKThreshold && (k & 255) == 0;
+
+    /// <summary>
+    /// Per-shape kernel rule for the K-quant / IQ4 decode GEMV (#1298, #1316). Each entry cites its measurement in docs/CUDA.md.
     /// </summary>
     private bool UseKQuantRows4(QuantizationType qt, int n, int k)
     {
-        if (!HasMmvqRows4Preq(qt) || k < MmvqLargeKThreshold || (k & 255) != 0) return false;
+        if (!HasMmvqRows4Preq(qt) || !Rows4ShapeOk(k)) return false;
         return KQuantGemvMode switch
         {
             "large" => false,
             "rows4" => true,
             _ => true,
         };
+    }
+
+    /// <summary>
+    /// Multi-column rows4 GEMV (#1316/#1375): <c>y[c, n] = W[n, k] x_c</c> for <paramref name="columns"/> activation
+    /// columns in one launch, the quantized blocks read in place once for all columns (no F16 dequant scratch, no
+    /// cuBLAS). <paramref name="batchedScratch"/> holds <see cref="LaunchQuantizeXToQ8_1Batched"/>'s output for
+    /// <c>m = columns</c> rows of length <paramref name="k"/>; <paramref name="y"/> is <c>[columns, n]</c> FP16.
+    /// Gate with <see cref="HasMmvqRows4Multi"/> and <see cref="Rows4ShapeOk"/> (relaxed to <c>k % 256 == 0</c> is fine
+    /// for the multi-column use: there is no MMQ-4-rows twin to prefer at small k).
+    /// </summary>
+    public void LaunchQuantizedGemvMmvqRows4Multi(nint quantWeight, QuantizationType qt, nint batchedScratch,
+                                                   nint y, int n, int k, int columns, nint stream)
+    {
+        if ((uint)(columns - 1) >= KQuantRows4MaxColumns)
+            throw new ArgumentOutOfRangeException(nameof(columns), columns,
+                $"rows4 multi-column GEMV supports 1..{KQuantRows4MaxColumns} columns.");
+        if ((k & 255) != 0)
+            throw new ArgumentException($"k must be a multiple of 256 (got {k}).", nameof(k));
+        int ti = Rows4TypeIndex(qt);
+        if (ti < 0 || _rows4PreqFuncs[ti, columns] == 0)
+            throw new InvalidOperationException(
+                $"quantized_gemv_{qt.ToString().ToLowerInvariant()}_mmvq_rows4_preq{(columns == 1 ? "" : $"_c{columns}")} not loaded (stale quantized_gemv_mmq.ptx?).");
+
+        int chunks = k >> 5;
+        // Batched layout (quantize_x_to_q8_1_batched): xq[m,k] | dx[m,k/32] | sx2[m,k/16], sections concatenated.
+        nint wA = quantWeight, xqA = batchedScratch,
+             dxA = batchedScratch + (nint)((long)columns * k),
+             sx2A = dxA + (nint)((long)columns * chunks * 2), yA = y;
+        int nA = n, kA = k;
+        void** args = stackalloc void*[] { &wA, &xqA, &dxA, &sx2A, &yA, &nA, &kA };
+        CudaDriverApi.cuLaunchKernel(_rows4PreqFuncs[ti, columns],
+                (uint)((n + 3) / 4), 1, 1, 128, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>Test/benchmark hook to force the legacy Q2_K GEMV kernel even when MMQ is loaded.</summary>
@@ -6250,7 +6330,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
             int nR = n, kR = k;
             void** argsR = stackalloc void*[] { &wR, &xqR, &dxR, &sx2R, &yR, &nR, &kR };
             // 128 = launch_bounds of the rows4 kernels (4 warps, one row each).
-            CudaDriverApi.cuLaunchKernel(qt == QuantizationType.Q4_K ? _quantizedGemvQ4_KMmvqRows4PreqFunc : _quantizedGemvQ6_KMmvqRows4PreqFunc,
+            CudaDriverApi.cuLaunchKernel(_rows4PreqFuncs[Rows4TypeIndex(qt), 1],
                     (uint)((n + 3) / 4), 1, 1, 128, 1, 1,
                     0, stream, (nint)argsR, 0).ThrowOnError();
             return;

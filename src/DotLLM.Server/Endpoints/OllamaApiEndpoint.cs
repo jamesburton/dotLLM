@@ -202,7 +202,25 @@ public static class OllamaApiEndpoint
         return result;
     }
 
-    private static string? QuantOf(string? text) => text is null ? null : QuantRx.Match(text) is { Success: true } q ? q.Value.ToUpperInvariant() : null;
+    /// <summary>
+    /// The quantization label in a model path or reference, read from its LAST segment only (the file name, or the
+    /// <c>repo:tag</c> tail of a reference), taking the last quant-looking token in it. Directory names are not consulted:
+    /// a store under <c>…/models-f16/</c>, or a temp root whose GUID happens to contain <c>f16</c>/<c>f32</c>, must not
+    /// relabel a <c>Q4_K_M</c> file (#1395).
+    /// </summary>
+    internal static string? QuantOf(string? text)
+    {
+        if (text is null) return null;
+        // Both separators on every OS: a profile's From may be a Windows path read on Linux or vice versa.
+        ReadOnlySpan<char> s = text.AsSpan().TrimEnd('/').TrimEnd('\\');
+        int cut = s.LastIndexOfAny('/', '\\');
+        string tail = cut >= 0 ? s[(cut + 1)..].ToString() : text;
+        // The LAST quant-looking token of the tail wins: a tag follows its repo ("f16-GGUF:q8_0" is Q8_0), a quant
+        // suffix follows its stem.
+        string? quant = null;
+        foreach (Match q in QuantRx.Matches(tail)) quant = q.Value.ToUpperInvariant();
+        return quant;
+    }
 
     private static string Digest(string path, long size)
     {

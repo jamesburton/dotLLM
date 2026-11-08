@@ -1,9 +1,12 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "q8_1_exact_div.glsl"
 // F32 -> Q8_0 KV range convert (Flint Q8_0 KV cache, kv_load.glsl layout).
 //
 // One invocation per 32-element block: dst block = [float scale][32 x int8] (36 bytes = 9 words). scale = amax / 127, q = roundEven(x / scale)
 // (ggml's quantize_row_q8_0 rule with an F32 scale, so the stored bytes are driver independent and equal the C# reference quantiser the parity
-// tests use). An all-zero block stores scale 0 and zero quants.
+// tests use). An all-zero block stores scale 0 and zero quants. The scale and its reciprocal go through the IEEE-exact helpers (#1500): a
+// plain `amax / 127.0` is lowered to a multiply by an approximate reciprocal on RDNA and lands one ULP off the CPU value in ~4% of blocks.
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -24,8 +27,8 @@ void main() {
         v[i] = src[b * 32u + i];
         amax = max(amax, abs(v[i]));
     }
-    float d = amax / 127.0;
-    float id = d != 0.0 ? 1.0 / d : 0.0;
+    float d = q81DivBy127(amax);
+    float id = d != 0.0 ? q81Recip(d) : 0.0;
     uint o = (pc.dstBlockOffset + b) * 9u;
     dst[o] = floatBitsToUint(d);
     for (uint w = 0u; w < 8u; w++) {

@@ -1038,6 +1038,63 @@ Measured on CPU (Bonsai-2 2B PQ2_0; `HybridMidHistoryResumeProbe`, `DOTLLM_HYBRI
   not the seconds.
 - **Size.** One checkpoint is 19.3 MiB (F32 GDN + conv state); the six steps held cost 115.6 MiB.
 
+## Agent-aware prefix policy (#1654)
+
+Agent harnesses (Claude Code, Codex) interleave one long conversation with many short requests: subagents that repeat the
+project instructions, title or summary side requests over the same history, and unrelated quick calls. Every prefix cache
+above was LRU, and a hit on the live-KV `PrefixCache` or the single recurrent slot *truncates or replaces* the entry it hits.
+So a 3k-token subagent that shared only the system prompt destroyed a 100k-token conversation for 2k tokens of saving,
+and the conversation's next turn re-prefilled everything. Idea from the halogen-flash review (`.docs/HALOGEN_FLASH_REVIEW.md`
+T6; ideas only, its engine is closed). Opt-in: `--prompt-cache-policy agent` (`DOTLLM_PREFIX_POLICY=agent`); default `lru`
+keeps the pre-#1654 behaviour exactly. The policy decides only what is *reused*, never what is computed: output is unchanged.
+
+One rule, applied by every cache through `PrefixRetention` (`src/DotLLM.Engine/PromptCache/PrefixCachePolicy.cs`):
+
+- **Token clock.** Each cache counts the prompt tokens it has been asked about (hit or miss). An entry's *age* is the tokens
+  read since its last use divided by its own length. At age >= 1 it has **expired**: about its own length of other prompt
+  tokens has been read since it was last used.
+- **Own-length eviction.** When a cache is over capacity it gives up the entry with the largest age (LRU breaks ties), not the
+  least recently used. A 100k conversation used a moment ago (age 0.09 after 9k of side traffic) outlives a 3k side request
+  stored after it (age 2). Applied to: `PrefixCache` (live KV: Vulkan, CUDA, `--no-paged`), `PrefixTrie` zero-ref leaf eviction
+  (paged CPU; a leaf's length is its path in tokens, so long conversations shorten from the tail last),
+  `RecurrentPrefixSnapshotCache` (`--prefix-snapshots` tiers, all four removal sites) and the scheduler's recurrent entries.
+- **Protected conversations.** A request that would *destroy* an entry (shares only part of it: a hit would truncate the rows
+  past the share, a miss would replace the slot) and is **not the same conversation** runs cold, on its own KV, without a
+  snapshot and without touching the entry, while the entry is unexpired. Counted as `protected_misses` (`/v1/prompt-cache`,
+  `dotllm.engine.prefix_cache.lookups{result="protected"}`). Once the entry has expired the request takes over as before, so
+  equal-sized peers (a classifier's questions) still churn exactly as under LRU. Applied to `PrefixCache` and the single
+  recurrent slot; the tiered and trie caches never destroy an entry on a hit, so they only need the eviction rule.
+- **Save point = conversation identity.** The server passes `InferenceOptions.SavePointPrefix`: the prompt up to the start of
+  the last *non-assistant* message's content, a user message or the tool result an agent loop ends with (derived from a marked
+  re-render, because on Qwen3 templates a head render is not a prefix of the full one). With a system prompt and one user
+  message the save point is the end of the system prompt, so any request with the same system prompt may destroy a one-turn
+  entry: by design, a one-turn entry is cheap to rebuild and the shared prefix is what both want. A later request that shares everything before that message is the **same conversation** (a retry, an
+  edited or compacted last message, or a side request over the same history) and may resume destructively; one that shares
+  less is another conversation and is protected. Without the hint (raw completions), sharing at least half of the entry stands
+  in. The single slot also **checkpoints the recurrent state at the save point** (a step checkpoint: state bytes only, KV
+  shared), so the same-conversation branch resumes there instead of re-prefilling the history (halogen's SNAP3).
+- **End-of-reply checkpoint.** After a request on the slot's KV finishes, the single slot checkpoints the state at the end of
+  the reply (the rows the KV holds: prompt + every forwarded generated token, at least `RecurrentPrefixMinTokens` past the
+  boundary). The next turn repeats the reply, so it resumes after it rather than before it. Skipped when the entry keeps a
+  resumable MTP head (a resume past the head's mark would decode plain) and when the client's re-tokenisation of the reply
+  diverges (the prompt-end boundary is still there, so that case costs nothing extra). Both checkpoints share the step budget
+  (`--prompt-cache-step-keep`, default 8) and need no `--prompt-cache-step`.
+- **Not implemented, deliberately.** Cached last logits for an exact repeat (halogen caches them so a retry costs zero
+  prefill): one row of F32 logits per entry is FP32 storage (`docs/PRECISION.md` rule 1), an F16 copy could flip greedy near
+  ties, and the saving is one decode-step forward per exact repeat. The exact-repeat path re-runs the last prompt token as
+  before. A "lead" entry for the tiered cache (a second capture at the shared system-prompt boundary) is also left for a
+  follow-up: it is a KV copy per capture there.
+
+What to expect (synthetic session in `AgentPrefixPolicyReplayTests`: 6 main turns, two 2-turn subagents sharing the project
+instructions, 6 unrelated requests; token counts, so contention-proof): under LRU the main conversation's first turn after
+each side block reuses only the shared system prompt; under the agent policy it reuses the whole previous turn, and the
+subagents' second turns pay for it on the single slot (they re-prefill their own first turn, since the slot is held). The
+tiered cache (`--prefix-snapshots N`) is where both win. Numbers are in PR for #1654.
+
+Where it meets the chunk cache (#1542, `DotLLM.ChunkReuse`): untouched. Chunk reuse decides which rows can be *assembled*
+(lineage, `FirstApproxRow`); this policy decides which whole entries are *kept* and which requests may truncate them. An
+assembled entry carries its lineage through `PrefixCache.Store` unchanged.
+
 ## Disk spill below the host tier (#1034)
 
 Use all three limits to retain more conversations than fit in pinned memory:

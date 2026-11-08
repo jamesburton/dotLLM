@@ -19,8 +19,15 @@ internal static class MimoIqBench
         using var device = VulkanDevice.Create();
         using var iq1 = Iq1Codebooks.Create(device);
         using var iq2 = Iq2Codebooks.Create(device);
-        const int E = 256, N = 8, Iters = 46;
-        var shapes = new (MoeIqQuant Q, int M, int K)[] { (MoeIqQuant.IQ1_M, 2048, 4096), (MoeIqQuant.IQ2_XXS, 4096, 2048), (MoeIqQuant.IQ2_XS, 4096, 2048) };
+        using var iq3 = Iq3Codebooks.Create(device);
+        const int N = 8, Iters = 46;
+        // SHAPES=glm (#1678): the glm4moe REAP banks (96 experts, top-8): IQ4_XS gate/up M 1408 K 4096, IQ4_NL down M 4096 K 1408, plus the other
+        // V2 formats at MiMo-class down shapes (no cached model carries them).
+        bool glm = Environment.GetEnvironmentVariable("SHAPES") == "glm";
+        int E = glm ? 96 : 256;
+        var shapes = glm
+            ? new (MoeIqQuant Q, int M, int K)[] { (MoeIqQuant.IQ4_XS, 1408, 4096), (MoeIqQuant.IQ4_NL, 4096, 1408), (MoeIqQuant.IQ3_S, 4096, 2048), (MoeIqQuant.IQ2_S, 4096, 2048), (MoeIqQuant.IQ3_XXS, 4096, 2048) }
+            : new (MoeIqQuant Q, int M, int K)[] { (MoeIqQuant.IQ1_M, 2048, 4096), (MoeIqQuant.IQ2_XXS, 4096, 2048), (MoeIqQuant.IQ2_XS, 4096, 2048) };
         if (exp is not null) shapes = shapes[..1];
         if (Environment.GetEnvironmentVariable("TOKENSIM") == "1") { TokenSim(device, spv, iq1, iq2, reps, nBanks); return; }
         foreach (var (q, m, k) in shapes)
@@ -58,8 +65,8 @@ internal static class MimoIqBench
                 var idx = new int[N]; for (int i = 0; i < N; i++) idx[i] = rnd.Next(E);
                 device.Upload(MemoryMarshal.AsBytes<int>(idx), idxBufs[it]);
             }
-            using var k1 = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spv, q, null, iq2, iq1, v2: false)!;
-            using var k2 = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spv, q, null, iq2, iq1, v2: true)!;
+            using var k1 = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spv, q, iq3, iq2, iq1, v2: false)!;
+            using var k2 = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spv, q, iq3, iq2, iq1, v2: true)!;
             Console.WriteLine($"{q} M={m} K={k} n={N}: v2 shader active = {k2.IsV2}");
             double best1 = double.MaxValue, best2 = double.MaxValue;
             for (int rep = 0; rep < reps; rep++)

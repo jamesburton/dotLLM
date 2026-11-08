@@ -26,6 +26,12 @@ internal sealed class PrefixCacheEntry : IDisposable
     /// </summary>
     public int? FirstApproxRow { get; set; }
 
+    /// <summary>The cache's token clock when the entry was last stored or hit (<see cref="PrefixRetention"/>, #1654).</summary>
+    public long LastUseClock { get; set; }
+
+    /// <summary>The start of the last user message of the request that stored the entry, or -1 (#1654).</summary>
+    public int SavePoint { get; set; } = -1;
+
     public PrefixCacheEntry(int[] tokenSequence, IKvCache kvCache, int? firstApproxRow = null)
     {
         TokenSequence = tokenSequence;

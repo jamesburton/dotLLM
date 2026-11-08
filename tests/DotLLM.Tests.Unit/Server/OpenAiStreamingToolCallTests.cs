@@ -56,11 +56,9 @@ public sealed class OpenAiStreamingToolCallTests
         // Reassemble tool_calls the way an OpenAI client does: deltas merge by index, arguments concatenate (#1342).
         var assembled = new SortedDictionary<int, (string? Id, string? Name, StringBuilder Args)>();
         string? finish = null;
-        foreach (string block in raw.Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
+        foreach (var frame in SseTestReader.Json(raw))
         {
-            string data = block["data: ".Length..];
-            if (data == "[DONE]") continue;
-            var choices = JsonDocument.Parse(data).RootElement.GetProperty("choices");
+            var choices = frame.GetProperty("choices");
             if (choices.GetArrayLength() == 0) continue;
             var choice = choices[0];
             if (choice.GetProperty("delta").TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String)

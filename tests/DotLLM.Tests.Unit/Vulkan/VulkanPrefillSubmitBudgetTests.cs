@@ -98,6 +98,69 @@ public sealed class VulkanPrefillSubmitBudgetTests
             budget.RowsPerForward(1024, 10_000_000, BonsaiParamsPerLayer, Heads, HeadDim));
     }
 
+    /// <summary>
+    /// #1572: progressive slicing sizes each slice at its own KV depth. From KV 0 a 32K prefill's first slice is far longer than the
+    /// uniform <see cref="VulkanPrefillSubmitBudget.RowsPerForward"/> size (costed at the final depth), every slice fits the budget at
+    /// its own end, slices shrink as the depth grows, and a short tail is folded into the previous slice.
+    /// </summary>
+    [Fact]
+    public void NextSliceRows_IsLongWhenShallow_ShrinksWithDepth_AndFoldsAShortTail()
+    {
+        var budget = Calibrated(StrixDense, StrixAttention);
+        const int rows = 32_768;
+        int uniform = budget.RowsPerForward(rows, rows, BonsaiParamsPerLayer, Heads, HeadDim);
+        int first = budget.NextSliceRows(rows, 0, BonsaiParamsPerLayer, Heads, HeadDim);
+        Assert.True(first > 2 * uniform, $"first slice {first} should be well above the uniform size {uniform}");
+
+        int start = 0, prev = 0, slices = 0;
+        while (start < rows)
+        {
+            int len = budget.NextSliceRows(rows - start, start, BonsaiParamsPerLayer, Heads, HeadDim, prev);
+            Assert.InRange(len, 1, rows - start);
+            Assert.True(LayerSeconds(budget, Math.Max(len, VulkanPrefillSubmitBudget.MinEffectiveRows), start + len) <= 1.25 * budget.BudgetSeconds,
+                $"slice at {start} of {len} rows exceeds the budget");
+            if (prev > 0) Assert.True(len <= VulkanPrefillSubmitBudget.MaxSliceGrowth * prev, $"slice {len} grew more than {VulkanPrefillSubmitBudget.MaxSliceGrowth}x over {prev}");
+            prev = len; start += len; slices++;
+        }
+        Assert.True(slices < (rows + uniform - 1) / uniform, "progressive slicing must need fewer slices than the uniform size");
+
+        // Growth cap: with rates fitted on shallow slices, a 1024-row slice is followed by at most a 2048-row one even where the
+        // estimate would allow far more (the 24576-row slice that ran ~1.4 s submits on Strix).
+        int capped = budget.NextSliceRows(rows, 4096, BonsaiParamsPerLayer, Heads, HeadDim, previousRows: 1024);
+        Assert.Equal(2048, capped);
+
+        // Tail folding: 64 + 10 rows at a depth where 64 rows fit and 74 still fit 1.25x: one slice, not 64 + 10.
+        var tiny = new VulkanPrefillSubmitBudget(LayerSeconds(budget, 128, 86_000) * 1.0);
+        tiny = Calibrated(StrixDense, StrixAttention, tiny.BudgetSeconds);
+        int folded = tiny.NextSliceRows(VulkanPrefillSubmitBudget.MinRowsPerForward + 10, 86_000, BonsaiParamsPerLayer, Heads, HeadDim);
+        Assert.Equal(VulkanPrefillSubmitBudget.MinRowsPerForward + 10, folded);
+    }
+
+    /// <summary>
+    /// #1572: the attention rate is fitted at a depth; a slice costed deeper than that scales its attention term by the depth ratio, so
+    /// the same budget yields fewer rows than a depth-blind estimate would (the 18176-row slice that ran 1.39 s submits on Strix after
+    /// a 16768-row slice at half the depth measured 0.45 s).
+    /// </summary>
+    [Fact]
+    public void NextSliceRows_ScalesAttentionByDepth_BeyondTheFittedDepth()
+    {
+        var blind = Calibrated(StrixDense, StrixAttention);
+        var depthAware = Calibrated(StrixDense, StrixAttention, meanKv: 20_000);
+        Assert.Equal(0, blind.FittedAttentionMeanKv);
+        Assert.InRange(depthAware.FittedAttentionMeanKv, 19_999, 20_001);
+        Assert.Equal(1.0, depthAware.DepthFactor(10_000));
+        Assert.Equal(2.0, depthAware.DepthFactor(40_000), 6);
+
+        const int rows = 65_536;
+        int shallow = depthAware.NextSliceRows(rows, 0, BonsaiParamsPerLayer, Heads, HeadDim);
+        int shallowBlind = blind.NextSliceRows(rows, 0, BonsaiParamsPerLayer, Heads, HeadDim);
+        int deep = depthAware.NextSliceRows(rows, 40_000, BonsaiParamsPerLayer, Heads, HeadDim);
+        int deepBlind = blind.NextSliceRows(rows, 40_000, BonsaiParamsPerLayer, Heads, HeadDim);
+        Assert.True(deep < deepBlind, $"deep slice {deep} should be smaller than the depth-blind {deepBlind}");
+        Assert.True(deep < shallow, "a deep slice must be shorter than a shallow one");
+        Assert.True(shallow <= shallowBlind, "the depth factor never makes a slice longer");
+    }
+
     [Fact]
     public void BonsaiAt128k_EverySubmissionFitsTheBudget()
     {
@@ -191,17 +254,17 @@ public sealed class VulkanPrefillSubmitBudgetTests
     }
 
     /// <summary>A budget fitted to exact rates from many varied submissions.</summary>
-    private static VulkanPrefillSubmitBudget Calibrated(double dense, double attention)
+    private static VulkanPrefillSubmitBudget Calibrated(double dense, double attention, double budgetSeconds = VulkanPrefillSubmitBudget.DefaultBudgetSeconds, double meanKv = 0)
     {
         // Work drawn afresh for every observation: with forgetting, only the last ~10 submissions count, and each kind of work
         // must vary within them for its rate to be determined.
-        var budget = new VulkanPrefillSubmitBudget();
+        var budget = new VulkanPrefillSubmitBudget(budgetSeconds);
         var rng = new Random(42);
         for (int i = 0; i < 60; i++)
         {
             double d = 1000 + (rng.NextDouble() * 4000);
             double a = 500 + (rng.NextDouble() * 2500);
-            budget.Observe(d, a, (d * dense) + (a * attention));
+            budget.Observe(d, a, (d * dense) + (a * attention), meanKv);
         }
 
         Assert.Equal(dense, budget.DenseSecondsPerGflop, dense * 0.05);

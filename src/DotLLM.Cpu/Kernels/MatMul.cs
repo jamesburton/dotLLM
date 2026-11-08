@@ -132,7 +132,13 @@ public static unsafe partial class MatMul
     {
         int rowBytes = blockCount * Q8_0BlockBytes;
 
-        if (IsQ8_0VnniSupported)
+        if (Q8_0Rows8Tier)
+        {
+            // Eight rows per pass, one row per lane, bit-exact with the scalar dot (#1119). Decode and prefill share this
+            // recurrence on the AVX-VNNI tier, so a row's output does not depend on batch size (#530).
+            ComputeRowsQ8_0Vnni_8Rows(weightsQ8, xQ8, result, m, blockCount);
+        }
+        else if (IsQ8_0VnniSupported)
         {
             // VNNI vpdpbusd fused integer dot: 1 instruction / 32-lane block vs the
             // abs/sign + dual-madd AVX2/AVX-512 emulation. See MatMulVnni.cs.
@@ -410,6 +416,14 @@ public static unsafe partial class MatMul
     {
         int groupBytes = 4 * blockCount * Q8_0BlockBytes;
 
+        if (Q8_0Rows8Tier)
+        {
+            // The R4 "layout" is a zero-copy view over the row-major rows (#1156): groups and tail rows are consecutive rows at
+            // the same stride, so the eight-row kernel runs over all of them as one row-major range (#1119).
+            ComputeRowsQ8_0Vnni_8Rows(repackedWeights, xQ8, result, fullGroups * 4 + tailRows, blockCount);
+            return;
+        }
+
         // AVX2 is deliberately preferred over the wider tiers here — see the measurements on
         // VecDotQ8_0Vnni_4RowsR4, which is 1.7-1.9x SLOWER than this kernel on AVX-512 hardware.
         if (CpuFeatures.Avx2)
@@ -472,6 +486,13 @@ public static unsafe partial class MatMul
     internal static void GemmR4TiledQ8_0(byte* repackedWeights, byte* inputQ8, float* c,
         int fullGroups, int tailRows, int blockCount, int m, int n)
     {
+        if (Q8_0Rows8Tier)
+        {
+            // Zero-copy R4 view (#1156): the groups and tail are consecutive row-major rows (#1119).
+            GemmQ8_0Rows8Vnni(repackedWeights, inputQ8, c, fullGroups * 4 + tailRows, n, blockCount, pool: null);
+            return;
+        }
+
         int q8RowBytes = blockCount * Q8_0BlockBytes;
         int groupBytes = 4 * q8RowBytes;
         // Same L2 budget as the row-major path, expressed in groups rather than rows.
@@ -1382,6 +1403,12 @@ public static unsafe partial class MatMul
     private static void ComputeGemmTiled(byte* weightsQ8, byte* inputQ8, float* c,
                                          int m, int n, int blockCount)
     {
+        if (Q8_0Rows8Tier)
+        {
+            GemmQ8_0Rows8Vnni(weightsQ8, inputQ8, c, m, n, blockCount, pool: null);
+            return;
+        }
+
         int q8RowBytes = blockCount * Q8_0BlockBytes;
         int tileM = ComputeTileM(q8RowBytes);
 
@@ -2366,6 +2393,13 @@ public static unsafe partial class MatMul
         int rowBytes = ctx.BlockCount * Q8_0BlockBytes;
         int end = start + count;
 
+        if (Q8_0Rows8Tier)
+        {
+            // Zero-copy R4 view: this thread's rows are consecutive row-major rows (#1119).
+            ComputeRowsQ8_0Vnni_8Rows(ctx.RepackedWeights + (long)start * rowBytes, ctx.XQ, ctx.Result + start, count, ctx.BlockCount);
+            return;
+        }
+
         // Process full groups in [start, end)
         int startGroup = start / 4;
         int endGroup = Math.Min(end / 4, ctx.FullGroups);
@@ -2683,6 +2717,26 @@ public static unsafe partial class MatMul
 
         int blockCount2 = k / Q8_0GroupSize;
         int q8RowBytes = blockCount2 * Q8_0BlockBytes;
+
+        if (Q8_0Rows8Tier)
+        {
+            // Eight-row transposed VNNI GEMM (#1119): dynamic 64-row claims over the pool, bit-exact with the scalar dot.
+            if (preQuantizedInput != null)
+            {
+                GemmQ8_0Rows8Vnni(weightsQ8, preQuantizedInput, c, m, n, blockCount2, pool);
+                return;
+            }
+            byte[] rentedQ = ArrayPool<byte>.Shared.Rent(n * q8RowBytes);
+            fixed (byte* xq = rentedQ)
+            {
+                for (int t = 0; t < n; t++)
+                    QuantizeF32ToQ8_0(b + t * k, xq + t * q8RowBytes, k);
+                GemmQ8_0Rows8Vnni(weightsQ8, xq, c, m, n, blockCount2, pool);
+            }
+            ArrayPool<byte>.Shared.Return(rentedQ);
+            return;
+        }
+
         int tileM = ComputeTileM(q8RowBytes);
         int totalTiles = (m + tileM - 1) / tileM;
 

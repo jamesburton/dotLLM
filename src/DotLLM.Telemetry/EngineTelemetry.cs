@@ -82,6 +82,16 @@ public static class EngineTelemetry
         description: "Prompt tokens reused from the prefix cache.");
 
     /// <summary>
+    /// Counter — prefix-cache lookups, one per request, tagged by <c>model</c>, <c>result</c> (<c>hit</c>, <c>miss</c>,
+    /// <c>protected</c>: the agent-aware policy made the request miss to keep another conversation's entry) and <c>tier</c>
+    /// (<c>vram</c>, <c>host</c>, <c>disk</c> for recurrent snapshots; <c>trie</c>, <c>live</c> for attention KV; <c>none</c>
+    /// on a miss). Issues #1505 and #1654.
+    /// </summary>
+    public static readonly Counter<long> PrefixCacheLookups = Meter.CreateCounter<long>(
+        "dotllm.engine.prefix_cache.lookups", unit: "{lookup}",
+        description: "Prefix-cache lookups by result (hit, miss, protected) and tier.");
+
+    /// <summary>
     /// Records every per-request counter and histogram for one finished request. Each instrument is guarded by its own
     /// <c>Enabled</c> check, so with no listener this is a handful of branches and no allocation.
     /// </summary>

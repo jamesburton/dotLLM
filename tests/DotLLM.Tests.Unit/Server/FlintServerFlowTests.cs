@@ -180,11 +180,9 @@ public sealed class FlintServerFlowTests
         var c = new StringBuilder();
         JsonElement? calls = null;
         string? finish = null;
-        foreach (string block in Encoding.UTF8.GetString(body.ToArray()).Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
+        foreach (var frame in SseTestReader.Json(Encoding.UTF8.GetString(body.ToArray())))
         {
-            string data = block["data: ".Length..];
-            if (data == "[DONE]") continue;
-            foreach (var choice in JsonDocument.Parse(data).RootElement.Clone().GetProperty("choices").EnumerateArray())
+            foreach (var choice in frame.GetProperty("choices").EnumerateArray())
             {
                 var d = choice.GetProperty("delta");
                 if (d.TryGetProperty("reasoning_content", out var rc)) r.Append(rc.GetString());

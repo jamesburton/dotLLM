@@ -1,0 +1,126 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_EXT_control_flow_attributes    : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED IQ3_S MMVQ decode GEMV, V2 (issue #1678; V1 = moe_indexed_matmul_iq3_s_mmvq.comp, issue #823). Same integer dp4a math as V1
+// (sign * iq3s grid int8 x Q8_1 activation, db = d * (1 + 2 * sub) per 32-element sub-block), restructured like the IQ2_XS V2 shader (#991): a lane
+// owns a whole 32-element sub-block (all four 8-element pairs) of one of FOUR blocks per step, so the wave issues ~4x fewer load instructions per
+// weight byte than V1 (lane = (sub-block, pair), ~9 loads for ~3.4 weight bytes). Sign application is a multiply-and-mask over the packed grid
+// word (grid magnitudes are 1..15: no inter-byte borrow) instead of a per-byte loop. The float accumulation order over a row differs from V1.
+//
+//   y[n, m] = sum_k dequant_iq3_s(bank[indices[n], m, k]) * x[n, k]
+//
+// IQ3_S super-block (110 bytes / 256 elements, 2-byte aligned):
+//   [0,1] fp16 d | [2..65] qs[64] | [66..73] qh[8] | [74..105] signs[32] | [106..109] scales[4] (db = d*(1+2*sub))
+// Sub-block ib: qs bytes 8ib..8ib+7 (pair l: low index bytes 2l, 2l+1), qh byte ib (bits 8 of the pair indices), signs bytes 4ib+l (8 sign bits
+// per pair: bits 0..3 first grid entry, 4..7 second), scale nibble ib of scales[ib/2].
+// NOT bit-exact vs a float-in reference (x is int8-quantized). Dispatch: 2D grid - x = m, y = n. Bindings: 0 bank, 1 xq (uvec4 view), 2 xds,
+// 3 indices, 4 y, 5 iq3s grid (512 x 4 int8 magnitudes, one uint each).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };      // IQ3_S blob [numExperts, M, K/256 x 110 B]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uvec4 xq4[]; };       // [xRows * K/16]
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };       // [xRows * K/32]
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };   // [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };         // [N * M]
+layout(set = 0, binding = 5, std430) readonly  buffer BufGrid { uint  iq3sGrid[]; };  // 512 x uint32 (4 grid bytes each)
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow;  // K / 256
+    uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
+} pc;
+
+const uint IQ3_S_BLOCK_BYTES = 110u;
+
+uint loadByte(uint p) { return (bank[p >> 2u] >> ((p & 3u) << 3u)) & 0xFFu; }
+uint load16(uint p)   { return (bank[p >> 2u] >> ((p & 2u) << 3u)) & 0xFFFFu; }   // 2-byte aligned
+
+// 4 bytes at a 2-byte-aligned offset. When p % 4 == 2 the second word can extend 2 bytes past the requested span; every such span here ends
+// inside its block (the signs of sub-block 7 end at byte 105, the scales follow), so no read leaves the bank.
+uint load32(uint p) {
+    uint pw = p >> 2u;
+    uint w0 = bank[pw];
+    if ((p & 2u) != 0u) return (w0 >> 16u) | (bank[pw + 1u] << 16u);
+    return w0;
+}
+
+// 8 bytes (a0, a1) at a 2-byte-aligned offset; the third word is read only when needed (p % 4 == 2). The qs of sub-block 7 end at byte 65 and
+// the block continues to 109, so the span never leaves the block.
+void load8(uint p, out uint a0, out uint a1) {
+    uint pw = p >> 2u;
+    uint w0 = bank[pw];
+    uint w1 = bank[pw + 1u];
+    if ((p & 2u) != 0u) {
+        uint w2 = bank[pw + 2u];
+        a0 = (w0 >> 16u) | (w1 << 16u);
+        a1 = (w1 >> 16u) | (w2 << 16u);
+    } else {
+        a0 = w0;
+        a1 = w1;
+    }
+}
+
+// Negate grid byte j where sign bit j (of the 4-bit `s4`) is set: byte-wise two's complement via XOR 0xFF + 1 (magnitudes <= 15: no borrow).
+uint signed4(uint g, uint s4) {
+    uint msk = (s4 * 0x00204081u) & 0x01010101u;
+    return (g ^ (msk * 0xFFu)) + msk;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint bq = lane >> 3u;                 // block within a 4-block step
+    uint ib = lane & 7u;                  // sub-block 0..7 (32 elements = 4 pairs of 8)
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * IQ3_S_BLOCK_BYTES;
+    uint xRow        = n / pc.xDiv;
+    uint xq4RowBase  = xRow * (pc.K >> 4u);
+    uint xdsRowBase  = xRow * (pc.K >> 5u);
+    float acc = 0.0;
+
+    for (uint chunk = 0u; chunk < pc.blocksPerRow; chunk += 16u) {
+        [[unroll]] for (uint s = 0u; s < 4u; s++) {
+            uint blkRaw = chunk + s * 4u + bq;
+            if (blkRaw >= pc.blocksPerRow) continue;
+            uint base = rowByteBase + blkRaw * IQ3_S_BLOCK_BYTES;
+            uint xi = xq4RowBase + blkRaw * 16u + ib * 2u;
+            uvec4 xa = xq4[xi], xb = xq4[xi + 1u];
+            uint xv[8] = uint[8](xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
+            float dX = xds[xdsRowBase + blkRaw * 8u + ib].x;
+
+            float d = unpackHalf2x16(load16(base)).x;
+            uint a0, a1;
+            load8(base + 2u + 8u * ib, a0, a1);                 // 4 pairs x 2 low index bytes
+            uint qhB = loadByte(base + 66u + ib);               // bit 8 of each pair's two indices
+            uint sw  = load32(base + 74u + 4u * ib);            // 4 pairs x 8 sign bits
+            uint scaleByte = loadByte(base + 106u + (ib >> 1u));
+            uint sub = ((ib & 1u) == 0u) ? (scaleByte & 0xFu) : (scaleByte >> 4u);
+            float db = d * float(1u + 2u * sub);
+
+            int dot = 0;
+            [[unroll]] for (uint l = 0u; l < 4u; l++) {
+                uint q2  = (((l < 2u) ? a0 : a1) >> (16u * (l & 1u))) & 0xFFFFu;
+                uint g1  = (q2 & 0xFFu) | ((qhB << (8u - 2u * l)) & 0x100u);
+                uint g2  = (q2 >> 8u)   | ((qhB << (7u - 2u * l)) & 0x100u);
+                uint signs = (sw >> (8u * l)) & 0xFFu;
+                dot = dotPacked4x8AccSatEXT(int(signed4(iq3sGrid[g1], signs & 0xFu)), int(xv[2u * l]), dot);
+                dot = dotPacked4x8AccSatEXT(int(signed4(iq3sGrid[g2], signs >> 4u)),  int(xv[2u * l + 1u]), dot);
+            }
+            acc += db * (dX * float(dot));
+        }
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[n * pc.M + m] = total;
+}

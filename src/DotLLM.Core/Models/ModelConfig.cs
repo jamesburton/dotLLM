@@ -143,6 +143,28 @@ public record ModelConfig
     public bool HasGraniteScalars => ResidualScale.HasValue || LogitScale.HasValue || AttentionScale.HasValue;
 
     /// <summary>
+    /// True for a dense Granite model whose only non-trivial scalar is the attention multiplier (embedding, residual
+    /// and logit scalars are all 1, e.g. TwIL-8B / Granite-4.2: <c>attention.scale</c> = 1/head_dim). Such a model is a
+    /// plain Llama-style dense transformer except for the score scale, so a backend whose generic layer loop has a fixed
+    /// <c>1/sqrt(head_dim)</c> score scale can run it by folding <see cref="GraniteAttentionRopeMscale"/> into the RoPE
+    /// cos/sin multiplier (Q and K each scaled by it, scores by its square). Requires full-width RoPE (the multiplier
+    /// would not reach an unrotated tail). Any other Granite scalar value returns false.
+    /// </summary>
+    public bool GraniteScalarsFoldIntoRope =>
+        Architecture == Architecture.Granite
+        && AttentionScale.HasValue
+        && (EmbeddingScale ?? 1f) == 1f && (ResidualScale ?? 1f) == 1f && (LogitScale ?? 1f) == 1f
+        && HeadDim > 0
+        && (RoPEConfig is not { } rc || rc.DimensionCount == 0 || rc.DimensionCount == HeadDim);
+
+    /// <summary>
+    /// RoPE cos/sin multiplier m such that scaling Q and K by m turns a fixed <c>1/sqrt(head_dim)</c> score scale into
+    /// <see cref="AttentionScoreScale"/>: <c>m^2 = AttentionScoreScale * sqrt(head_dim)</c>. Only meaningful when
+    /// <see cref="GraniteScalarsFoldIntoRope"/> is true.
+    /// </summary>
+    public float GraniteAttentionRopeMscale => MathF.Sqrt(AttentionScoreScale(HeadDim) * MathF.Sqrt(HeadDim));
+
+    /// <summary>
     /// The attention score multiplier for a layer whose per-head dim is <paramref name="headDim"/>:
     /// <see cref="AttentionScale"/> if set, else <c>1/sqrt(<see cref="QueryPreAttnScalar"/>)</c> if set,
     /// else <c>1/sqrt(headDim)</c>. Single source of truth for every backend's score scale.

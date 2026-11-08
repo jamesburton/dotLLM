@@ -64,7 +64,7 @@ public sealed class PrefixTrieManager : IDisposable
         ArgumentNullException.ThrowIfNull(factory);
         _factory = factory;
         _config = config ?? new PrefixCacheConfig();
-        _trie = new PrefixTrie(factory.Pool, _config.MaxPrefixDepth);
+        _trie = new PrefixTrie(factory.Pool, _config.MaxPrefixDepth, _config.EvictionPolicy);
     }
 
     /// <summary>

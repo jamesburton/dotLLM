@@ -325,7 +325,7 @@ The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with
 | PTQ1_0 | ✓ | ✓ (untiled) | — | PrismML dense base-3 trits, 28 B / 128 (1.75 bpw), scale last; CPU + Vulkan only, CUDA refuses at load (#1280) |
 | Q4_0 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (`MatMulQ4_0GemmCoopmatKernel`, wave64) | #1018 |
 | Q4_1 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (same classes, `quant: Q4_1`, wave64) | #1171 (Recursive Flint's official file) |
-| Q5_1 | ✓ (F32-in GEMV, `matmul_q5_1_f32_gemv`) | ✓ (F32-in tiled GEMM, `matmul_q5_1_f32_gemm`) | — | #1600 (GLM-4.5-Air's shared-expert `down` is Q5_1 on 24 of 46 layers); no MMVQ / coopmat variant yet |
+| Q5_1 | ✓ (+ dp4a MMVQ `matmul_q5_1_mmvq_v2`) | ✓ (int8-coopmat `matmul_q5_1_mmq_cm1` on AMD, dp4a `matmul_q5_1_mmq` elsewhere, F32-in tiled GEMM fallback) | ✓ (`matmul_q5_1_f32_gemm_coopmat_128x128x4`, same classes as Q4_1, wave64) | #1600 F32-in pair, #1613 fast arms (GLM-4.5-Air's shared-expert `down` is Q5_1 on 24 of 46 layers); `DOTLLM_VK_Q5_1_FAST=0` keeps the F32-in pair |
 
 Routed MoE banks of Q4_0 / Q4_1 (and the IQ family) are read in place by `MoeIndexedMatmulIqMmvqKernel` (decode, any row count when
 no grouped kernel exists) and `MoeGroupedMatmulIqCoopmatKernel` (prefill, wave64 coopmat).
@@ -347,16 +347,18 @@ architecture's loader will route to it:
 | `VulkanWeights` (dense) | — (the table above) |
 | `VulkanNemotronHWeights` | I2_S, PQ2_0 (Q5_0 stays packed since #568). nemotron_h_moe routed expert banks: Q8_0 and Q5_1 as stored, Q5_0 repacked to Q5_1; any other expert quant is refused with a `NotSupportedException` (#402, #407) |
 | `VulkanMamba3Weights` | Q5_0, I2_S, PQ2_0 |
-| `VulkanQwen3MoeHybridWeights` | Q5_0, Q2_K, Q3_K, IQ4_NL, IQ4_XS, IQ1_S, I2_S |
-| `VulkanQwen3HybridDenseWeights` | everything but PQ2_0 (it handles only the packed token embed) |
+| `VulkanQwen3MoeHybridWeights` | I2_S, NVFP4 only. Q2_K / Q3_K / IQ4_NL / IQ4_XS / IQ1_S packed since #627; Q4_0 / Q4_1 / Q5_0 / Q5_1 since #921 (`DOTLLM_VK_HYBRID_LEGACY_PACKED=0` restores the F32 widening for A/B; Q4_0 also honours `DOTLLM_VK_Q4_0_NATIVE=0`) |
+| `VulkanQwen3HybridDenseWeights` | same as `VulkanQwen3MoeHybridWeights` (it uploads through that class's `UploadProjectionMatrix`; its own code handles only the packed token embed). Both hybrid hosts' `RecordMatmul` carry an arm per kept format — `VulkanHybridKeepPackedDispatchTests` fails the build of a keep arm without its dispatch arms |
 
-Widening a hybrid loader is mechanical — add the missing `Keep*OnDevice` arms — but it is a code
-change, not a documentation one, so check the loader for the architecture you are running before
-assuming a format stays packed.
+Widening a hybrid loader is mechanical — add the missing `Keep*OnDevice` arms AND the `RecordMatmul`
+arm in both hybrid hosts (the loader is shared) — but it is a code change, not a documentation one,
+so check the loader for the architecture you are running before assuming a format stays packed.
 
 Q5_1 is also supported as a routed-MoE `down` bank (`moe_indexed_matmul_q5_1_{f32,mmvq}.comp`), and Q5_0 `down` banks are repacked
-bit-exactly to Q5_1 at upload. The dense Q5_1 kernels (#1600) are the plain F32-in pair (decode GEMV, 16x16-tiled prefill GEMM): they exist so a
-Q5_1 projection stays packed, not because they are fast.
+bit-exactly to Q5_1 at upload. The dense Q5_1 kernels are the #1600 F32-in pair (decode GEMV, 16x16-tiled prefill GEMM; the always-present
+correctness arm) plus the #1613 fast arms: dp4a MMVQ at decode on the shared Q8_1 row, int8-coopmat (AMD) or dp4a MMQ at prefill on Q8_1 rows,
+and the 128x128x4 F16 coopmat GEMM where cooperative matrices exist but no MMQ does. The Q8_1-activation arms are not bit-identical to the
+F32-in pair (activation rounding, the Q4_1 / Q4_0 contract of #1235 / #1447).
 
 Ordering rationale, for why the family filled in as it did: K-quant Q4/5/6 came first because they
 cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most
@@ -467,7 +469,7 @@ The Q6_K MoE kernel completes the original Phase 10 follow-up gap noted in `Vulk
 
 **Resident routed-expert banks (Vulkan), current set (#849):** Q4_K, Q5_K, Q6_K, Q5_1 and Q8_0, resolved per bank (`VulkanQwen3MoeMoeUpload.BankStaysPacked`, shared with the qwen4exp pre-load residency estimate). Any other bank quant still widens to F32. Q5_1 / Q8_0 banks (UD-Q4_K_XL down projections) have the scalar F32-in indexed kernel, an indexed MMVQ (dp4a) decode arm and a grouped coopmat prefill arm (16-row tiles; K % 64). The K-quant fast paths need K % 256, the legacy arms only K % 32 (MMVQ) / K % 64 (grouped), so a 640-wide expert (qwen4exp) takes the fast arms with a Q5_1/Q8_0 down bank. Constraint: the legacy grouped kernel is 16-row only, so a layer with a legacy-quant down bank runs its Q4_K gate/up grouped GEMM on the 16-row kernel instead of the 32-row row-pair form. The fused single-token Qwen3.6 decode layer still requires a Q5_K/Q6_K down bank.
 
-**IQ-family resident banks (#823):** IQ3_S, IQ4_XS, IQ4_NL, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and upstream-ggml Q2_0 also stay packed (K % block: 256 for the super-block types, 32 for IQ4_NL, 64 for Q2_0; the generic-host upload gate is K % 256 for the super-block types and K % 64 for the 32-element legacy blocks IQ4_NL / Q4_0 / Q4_1 - `VulkanWeights.MoeIqKGranule`, #1600: glm4moe's down bank has K = 1408; integer-dot-product required, `DOTLLM_VK_IQ_RESIDENT=0` widens them to F32 again). Decode uses `MoeIndexedMatmulIqMmvqKernel` (`moe_indexed_matmul_iq*_mmvq.comp`, GENERATED from the dense `matmul_iq*_mmvq.comp` by `native/vulkan/gen_moe_indexed_iq.py`; Q2_0 hand-written) for any row count the grouped path does not take; prefill >= 16 tokens uses `MoeGroupedMatmulIqCoopmatKernel` (`moe_grouped_matmul_<fmt>_coopmat_m64.comp`, GENERATED by `native/vulkan/gen_moe_grouped_iq.py`; 16-row tiles, native wave64 + cooperative matrix only, `DOTLLM_VK_MOE_IQ_GROUPED=0` leaves IQ banks on MMVQ). There is NO scalar F32-in indexed kernel for these formats, which is why residency requires dp4a. IQ1_M (ggml id 29) exists as a CPU-dequantised format only (banks widen to F32). qwen4exp's BF16 gated-residual projections (ISTA files) upload as F16 when exactly representable so they get the cooperative-matrix prefill GEMM instead of the tiled F32 one (`VulkanQwen4ExpGrWeights`, `DOTLLM_VK_Q4E_BF16_AS_F16=0` keeps BF16). Upstream ggml `Q2_0` shares GGUF id 42 with PQ2_0: `GgufReader.ReclassifyUpstreamQ2_0` decides from the on-disk tensor extent and re-labels such tensors with the internal `QuantizationType.Q2_0` (242).
+**IQ-family resident banks (#823):** IQ3_S, IQ4_XS, IQ4_NL, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and upstream-ggml Q2_0 also stay packed (K % block: 256 for the super-block types, 32 for IQ4_NL, 64 for Q2_0; the generic-host upload gate is K % 256 for the super-block types and K % 64 for the 32-element legacy blocks IQ4_NL / Q4_0 / Q4_1 - `VulkanWeights.MoeIqKGranule`, #1600: glm4moe's down bank has K = 1408; integer-dot-product required, `DOTLLM_VK_IQ_RESIDENT=0` widens them to F32 again). Decode uses `MoeIndexedMatmulIqMmvqKernel` (`moe_indexed_matmul_iq*_mmvq.comp`, GENERATED from the dense `matmul_iq*_mmvq.comp` by `native/vulkan/gen_moe_indexed_iq.py`; Q2_0 hand-written) for any row count the grouped path does not take; prefill >= 16 tokens uses `MoeGroupedMatmulIqCoopmatKernel` (`moe_grouped_matmul_<fmt>_coopmat_m64.comp`, GENERATED by `native/vulkan/gen_moe_grouped_iq.py`; 16-row tiles, native wave64 + cooperative matrix only, `DOTLLM_VK_MOE_IQ_GROUPED=0` leaves IQ banks on MMVQ). There is NO scalar F32-in indexed kernel for these formats, which is why residency requires dp4a. IQ1_M (ggml id 29) banks are resident too since #993 (`moe_indexed_matmul_iq1_m_mmvq[_v2]` + grouped m64). **V2 indexed MMVQ lane layout** (`*_mmvq_v2.comp`, default; `DOTLLM_VK_MOE_IQ_V2=0` selects V1): a lane owns a whole 32-element sub-block of one of four blocks per step (IQ4_NL: a whole block, 32 consecutive blocks per wave) instead of one 8-element group, so a wave issues ~4-5x fewer load instructions per weight byte; same integer dp4a math, different float summation order. #991 shipped IQ1_M / IQ2_XXS / IQ2_XS (1.6-1.9x per kernel on MiMo); #1678 added IQ3_S / IQ4_XS / IQ4_NL / IQ2_S / IQ3_XXS (hand-written, not generated). Only Q2_0 remains V1. qwen4exp's BF16 gated-residual projections (ISTA files) upload as F16 when exactly representable so they get the cooperative-matrix prefill GEMM instead of the tiled F32 one (`VulkanQwen4ExpGrWeights`, `DOTLLM_VK_Q4E_BF16_AS_F16=0` keeps BF16). Upstream ggml `Q2_0` shares GGUF id 42 with PQ2_0: `GgufReader.ReclassifyUpstreamQ2_0` decides from the on-disk tensor extent and re-labels such tensors with the internal `QuantizationType.Q2_0` (242).
 
 ## IQ-family (importance-quant) Coverage
 
@@ -484,14 +486,26 @@ I-quants encode weight values via a small codebook lookup rather than linear qua
 The Vulkan IQ2 family kernels store the codebook tables as readonly SSBOs uploaded once per model load (3 grids + ksigns ≈ 14 KB on device, shared by all 6 IQ2 matmul kernels via `Iq2Codebooks`). Per-element decode is `db * grid[gridIdx*8+j] * sign_j`; per-pair scale uses the same `db = d * (0.5 + sub_scale) * 0.25` arithmetic as the CPU oracle. IQ2_XXS / IQ2_XS resolve `sign_j` via the 128-entry `ksigns_iq2xs` lookup; IQ2_S stores the 8-bit sign mask directly per pair.
 | Format | Block | bpw | CPU dequant | CPU MatMul | CUDA dequant | CUDA GEMV | Notes |
 |---|---|---|---|---|---|---|---|
-| IQ4_NL | 32 | 4.5 | ✓ | dequant-fallback | ✓ (`dequant_iq4_nl_{f16,f32}`) | ✓ (`quantized_gemv_iq4_nl`) | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
-| IQ4_XS | 256 | 4.25 | ✓ | dequant-fallback | ✓ | ✓ | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
+| IQ4_NL | 32 | 4.5 | ✓ | dequant-fallback | ✓ (`dequant_iq4_nl_{f16,f32}`) | ✓ (`quantized_gemv_iq4_nl`) | Plus MMQ-preq + MMVQ-large + MoE-grouped; rows4 decode + 2..8-column rows4 (`_mmvq_rows4_preq[_c2..8]`, #1316/#1375, k % 256 == 0). |
+| IQ4_XS | 256 | 4.25 | ✓ | dequant-fallback | ✓ | ✓ | Plus MMQ-preq + MMVQ-large + MoE-grouped; rows4 decode + 2..8-column rows4 (#1316/#1375). |
 | IQ2_XXS | 256 | 2.0625 | ✓ | dequant-fallback | ✓ (`dequant_iq2_xxs_{f16,f32}`) | ✓ (`quantized_gemv_iq2_xxs`) | 256-entry codebook + 4×7-bit sign indices per 32-elem sub-block + shared 4-bit scale. |
 | IQ2_XS | 256 | 2.3125 | ✓ | dequant-fallback | ✓ | ✓ | 512-entry codebook; 7-bit sign indices in upper bits of `qs[uint16]`. |
 | IQ2_S | 256 | 2.5625 | ✓ | dequant-fallback | ✓ | ✓ | 1024-entry codebook; high index bits in `qh`. **Also stores `MOSTLY_IQ2_M` file-type tensors** (Qwen3.6-A3B-IQ2_M ~11.5 GB GGUFs). |
 | IQ1_S | 256 | ~1.5625 | ✓ | dequant-fallback | — | — | **Vulkan-only on GPU.** 2048-entry codebook of 8 ternary {-1, 0, +1} values packed into each uint64. Per-sub-block 3-bit scale + sign-of-delta in `qh[uint16]`. Smallest GGUF quant. |
 | IQ3_XXS | 256 | 3.0625 | ✓ | dequant-fallback | — | — | **Vulkan-only on GPU.** 256-entry codebook (4 unsigned int8 grid points per row); 4-bit per-32-element sub-block scale + 4×7-bit sign indices packed into a uint32 (`scales_and_signs[8]`); signs resolved via the shared 128-entry `ksigns_iq2xs` table. 98 B / super-block. |
 | IQ3_S | 256 | 3.4375 | ✓ | dequant-fallback | — | — | **Vulkan-only on GPU.** 512-entry codebook (4 unsigned int8 grid points per row); 9-bit grid indices split low 8 bits in `qs` + high 1 bit in `qh`; 32-byte `signs[]` stores the 8-bit sign mask per pair directly (no ksigns indirection). Paired sub-blocks share a 4-bit scale byte. 110 B / super-block. |
+
+**Dense IQ prefill on Vulkan (#1677):** IQ1_S, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S have native blocked coopmat GEMMs
+(`matmul_iq*_gemm_coopmat_128x128x4.comp`, GENERATED by `native/vulkan/gen_iq_gemm_coopmat.py` from the IQ2_XXS wrapper of #1069;
+`MatMulIqGemmCoopmatKernel`, one class for the five formats). The 128x128, BK=32, four-wave64-subgroup tile decodes each 32-element
+sub-block (codebook grid + signs + sub-scale) straight into the F16 A operand, so the dense host (`VulkanTransformerModel`) and the
+Nemotron-H host no longer dequantise these weights into the F16 scratch of `IqF16PrefillMatmul` (#621, PRECISION.md VX4) and no longer
+run the scalar F32 GEMM for 5..31 tokens: every `seqLen > 1` not taken by the 2..16-row multi-column GEMVs goes to the native kernel
+(K % 256 == 0, native wave64 + cooperative matrix). The staged operand is the same expression, in the same order, as
+`iq*_dequant_f16.comp`, so the result equals the F16 scratch path up to F32 accumulation order (unit test bound 1e-4 of max|y|).
+`DOTLLM_VULKAN_DISABLE_IQ_COOPMAT=1` restores the F16 scratch path (A/B arm). IQ2_XXS keeps its own kernel (#1069), IQ4_XS its own
+(#601); the hybrid hosts (`VulkanQwen3HybridDense*`, `VulkanQwen3MoeHybrid*`) still take the F16 scratch (#1149 routes them through the
+dense kernels).
 
 **IQ1_S, IQ3_XXS, and IQ3_S** are supported on CPU and Vulkan (dequant + GEMV + GEMM); the CUDA backend treats them as CPU-only fallbacks. **IQ1_M** remains out of scope. MMQ-preq / MMVQ-large / MoE-grouped variants for the IQ2 / IQ3 families are deferred; CUDA prefill falls back to dequant→cuBLAS via the `dequant_iq2_*_f32` kernels.
 

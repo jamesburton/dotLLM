@@ -701,7 +701,18 @@ internal sealed class CudaWeights : IDisposable
     /// The allocation is appended to <paramref name="allocs"/> (the #383 ledger), so it is
     /// released both by the mid-load failure unwind and by <see cref="Dispose"/>.
     /// </remarks>
-    private static unsafe (nint InvFreqDevice, float Mscale) UploadDenseYarnInvFreq(
+    private static (nint InvFreqDevice, float Mscale) UploadDenseYarnInvFreq(
+        ModelConfig config, float[]? ropeFreqFactors, List<nint> allocs)
+    {
+        var (invFreq, mscale) = UploadDenseYarnInvFreqCore(config, ropeFreqFactors, allocs);
+        // Granite with only an attention multiplier: the generic attention kernels hard-code 1/sqrt(head_dim), so the
+        // multiplier rides on the RoPE cos/sin scale (applied to Q and K in every RoPE call site; scores x mscale^2).
+        if (config.GraniteScalarsFoldIntoRope)
+            mscale *= config.GraniteAttentionRopeMscale;
+        return (invFreq, mscale);
+    }
+
+    private static unsafe (nint InvFreqDevice, float Mscale) UploadDenseYarnInvFreqCore(
         ModelConfig config, float[]? ropeFreqFactors, List<nint> allocs)
     {
         // Mistral-3 / Ministral-3 attention temperature (#743) scales Q after RoPE per position; no CUDA

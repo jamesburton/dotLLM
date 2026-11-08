@@ -16,7 +16,11 @@
 //   - P.V uses the same lane -> column mapping with 16 position slots per pass, and every thread keeps G x 8 accumulators; the
 //     slots are reduced once per split (shuffles within the wave, LDS across waves).
 //
-// Bounds: G <= MAX_GROUP, headDim <= MAX_HEAD_DIM and a multiple of 8, wave64 (the host gates all three).
+// Groups wider than MAX_GROUP (issue #1612: glm4moe has 12 query heads per KV head) are served in ceil(G / MAX_GROUP) balanced
+// sub-groups (12 -> 6 + 6, 9 -> 5 + 4), one workgroup per (KV head, sub-group, split): the KV rows are read once per sub-group,
+// ceil(G / MAX_GROUP) times per decoded token instead of G. The dispatch is numKvHeads * subGroups * numSplits workgroups.
+//
+// Bounds: headDim <= MAX_HEAD_DIM and a multiple of 8, wave64 (the host gates both).
 // LDS: 4 KiB Q (reused by the final reduce) + TILE_KV * 32 B scores.
 
 #define TILE_KV      128
@@ -119,14 +123,24 @@ shared float corr[MAX_GROUP];
 
 void main() {
     uint blockId = gl_WorkGroupID.x;
-    if (blockId >= pc.numKvHeads * pc.numSplits) return;
 
-    // KV heads interleave across consecutive workgroups: a cache row holds every KV head's columns, so co-resident workgroups
-    // read neighbouring slices of the same rows. Split-major order (one head's slice of many rows) measured 90 vs 200 GB/s on Strix.
-    uint splitId  = blockId / pc.numKvHeads;
-    uint hkv      = blockId - splitId * pc.numKvHeads;
-    uint G        = pc.numHeads / pc.numKvHeads;
-    uint hq0      = hkv * G;
+    // A KV head's G query heads are served in nSubG balanced sub-groups of at most MAX_GROUP heads (see the header); this
+    // workgroup serves heads hq0 .. hq0 + G - 1 of KV head hkv, where G is now the sub-group's size.
+    uint Gfull    = pc.numHeads / pc.numKvHeads;
+    uint nSubG    = (Gfull + uint(MAX_GROUP) - 1u) / uint(MAX_GROUP);
+    uint Gsub     = (Gfull + nSubG - 1u) / nSubG;
+    uint units    = pc.numKvHeads * nSubG;
+    if (blockId >= units * pc.numSplits) return;
+
+    // (KV head, sub-group) units interleave across consecutive workgroups: a cache row holds every KV head's columns, so
+    // co-resident workgroups read neighbouring slices of the same rows. Split-major order (one head's slice of many rows)
+    // measured 90 vs 200 GB/s on Strix.
+    uint splitId  = blockId / units;
+    uint unit     = blockId - splitId * units;
+    uint hkv      = unit / nSubG;
+    uint sub      = unit - hkv * nSubG;
+    uint hq0      = hkv * Gfull + sub * Gsub;
+    uint G        = min(Gsub, Gfull - sub * Gsub);
     uint tid      = gl_LocalInvocationID.x;
     uint hd       = pc.headDim;
     uint hd4      = hd >> 2u;

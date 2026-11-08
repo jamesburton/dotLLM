@@ -58,4 +58,27 @@ public static class RecurrentSnapshotBoundary
     /// <returns><paramref name="suffixBoundary"/> when the prompt continues the previous one, else <see langword="null"/>.</returns>
     public static int? ForContinuation(int? suffixBoundary, int shared, int? previousSuffixBoundary)
         => previousSuffixBoundary is int previous && shared >= previous ? suffixBoundary : null;
+
+    /// <summary>
+    /// The conversation's save point (issue #1654): the token count of <paramref name="prefix"/>, the prompt text up to the
+    /// start of the last user message (<see cref="Core.Configuration.InferenceOptions.SavePointPrefix"/>), when its tokens
+    /// are exactly a prefix of <paramref name="promptIds"/> and at least <paramref name="minTokens"/> long, leaving at least
+    /// one prompt token after it.
+    /// </summary>
+    /// <param name="promptIds">The request's prompt tokens.</param>
+    /// <param name="tokenizer">The tokenizer that produced <paramref name="promptIds"/>.</param>
+    /// <param name="prefix">The save point's text, or null.</param>
+    /// <param name="minTokens">The shortest save point worth keeping.</param>
+    /// <returns>The save point position, or -1.</returns>
+    public static int FromSavePointPrefix(ReadOnlySpan<int> promptIds, ITokenizer tokenizer, string? prefix, int minTokens)
+    {
+        ArgumentNullException.ThrowIfNull(tokenizer);
+        if (string.IsNullOrEmpty(prefix)) return -1;
+        // Encode, not EncodeRaw: the prefix starts the prompt, so it carries the same BOS the prompt's own encoding did.
+        int[] ids = tokenizer.Encode(prefix);
+        int position = ids.Length;
+        if (position < minTokens || position >= promptIds.Length || !promptIds[..position].SequenceEqual(ids))
+            return -1;
+        return position;
+    }
 }
