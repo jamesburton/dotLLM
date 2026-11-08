@@ -398,7 +398,14 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
             using Process p = Process.Start(psi)!;
             Task<string> stdout = p.StandardOutput.ReadToEndAsync(), stderr = p.StandardError.ReadToEndAsync();
             using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(3));
-            await p.WaitForExitAsync(timeout.Token);
+            try { await p.WaitForExitAsync(timeout.Token); }
+            catch (OperationCanceledException)
+            {
+                // Do not leave dotnet running, nor its output readers unobserved.
+                p.Kill(entireProcessTree: true);
+                await Task.WhenAll(stdout, stderr);
+                throw;
+            }
             if (p.ExitCode != 0)
                 throw new InvalidOperationException($"dotnet {string.Join(' ', args)} exited {p.ExitCode}: {await stdout}\n{await stderr}");
         }

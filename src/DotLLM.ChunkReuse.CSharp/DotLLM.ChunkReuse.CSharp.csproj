@@ -17,6 +17,8 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
+    <!-- The solution scanner applies the corpus limits (RoslynParsing) to the files an MSBuild project lists. -->
+    <InternalsVisibleTo Include="DotLLM.ChunkReuse.Solution" />
   </ItemGroup>
 
 </Project>
