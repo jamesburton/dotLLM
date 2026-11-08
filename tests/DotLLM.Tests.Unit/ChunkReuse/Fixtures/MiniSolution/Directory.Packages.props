@@ -1,0 +1,6 @@
+<Project>
+  <!-- Fixture for SolutionScannerTests: no central package management (the fixture has no package references). -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>
