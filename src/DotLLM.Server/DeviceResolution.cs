@@ -17,7 +17,7 @@ public enum DeviceKind
     Cpu,
     /// <summary><c>gpu[:N]</c> / <c>cuda[:N]</c>.</summary>
     Cuda,
-    /// <summary><c>vulkan</c>.</summary>
+    /// <summary><c>vulkan</c> (the default GPU) or <c>vulkan:N</c> (physical device N, #1704).</summary>
     Vulkan,
 }
 
@@ -26,11 +26,13 @@ public enum DeviceKind
 /// <c>cuda</c>, <c>auto</c> and any typo silently meant the CPU.
 /// </summary>
 /// <param name="Kind">Backend family.</param>
-/// <param name="Ordinal">CUDA device ordinal; 0 for everything else.</param>
-public readonly record struct DeviceSpec(DeviceKind Kind, int Ordinal)
+/// <param name="Ordinal">CUDA device ordinal, or the Vulkan physical-device index when <paramref name="ExplicitIndex"/>; 0 otherwise.</param>
+/// <param name="ExplicitIndex">Vulkan only: the value named an index (<c>vulkan:N</c>). Plain <c>vulkan</c> is the process default device
+/// (scoring plus <c>DOTLLM_VULKAN_DEVICE_INDEX</c>), which is not necessarily index 0 on a multi-GPU box.</param>
+public readonly record struct DeviceSpec(DeviceKind Kind, int Ordinal, bool ExplicitIndex = false)
 {
     /// <summary>Human-readable list of accepted values, used in every validation error.</summary>
-    public const string Accepted = "auto, cpu, vulkan, gpu, gpu:N, cuda, cuda:N";
+    public const string Accepted = "auto, cpu, vulkan, vulkan:N, gpu, gpu:N, cuda, cuda:N";
 
     /// <summary>Parses a <c>--device</c> value (case-insensitive; <c>gpu</c> is an alias of <c>cuda</c>).</summary>
     public static bool TryParse(string? value, out DeviceSpec spec, out string? error)
@@ -54,9 +56,9 @@ public readonly record struct DeviceSpec(DeviceKind Kind, int Ordinal)
                 if (int.TryParse(tail, out int n) && n >= 0) { spec = new(DeviceKind.Cuda, n); return true; }
                 break;
             case "vulkan":
-                if (tail is null || tail == "0") { spec = new(DeviceKind.Vulkan, 0); return true; }
-                error = $"Unknown --device '{value}': only the first Vulkan device can be selected ('vulkan'). Expected one of: {Accepted}.";
-                return false;
+                if (tail is null) { spec = new(DeviceKind.Vulkan, 0); return true; }
+                if (int.TryParse(tail, System.Globalization.NumberStyles.None, null, out int vi)) { spec = new(DeviceKind.Vulkan, vi, true); return true; }
+                break;
         }
         error = $"Unknown --device '{value}'. Expected one of: {Accepted}.";
         return false;
@@ -66,14 +68,17 @@ public readonly record struct DeviceSpec(DeviceKind Kind, int Ordinal)
     public static DeviceSpec Parse(string? value) =>
         TryParse(value, out var s, out string? err) ? s : throw new ArgumentException(err, nameof(value));
 
-    /// <summary>The device string loaders understand: <c>auto</c>, <c>cpu</c>, <c>gpu:N</c>, <c>vulkan</c>.</summary>
+    /// <summary>The device string loaders understand: <c>auto</c>, <c>cpu</c>, <c>gpu:N</c>, <c>vulkan</c>, <c>vulkan:N</c>.</summary>
     public string Canonical => Kind switch
     {
         DeviceKind.Auto => "auto",
         DeviceKind.Cpu => "cpu",
         DeviceKind.Cuda => $"gpu:{Ordinal}",
-        _ => "vulkan",
+        _ => ExplicitIndex ? $"vulkan:{Ordinal}" : "vulkan",
     };
+
+    /// <summary>The Vulkan physical-device index to load on, or null for the process default device (plain <c>vulkan</c>).</summary>
+    public int? VulkanIndex => Kind == DeviceKind.Vulkan && ExplicitIndex ? Ordinal : null;
 
     /// <summary>True for CUDA and Vulkan.</summary>
     public bool IsGpu => Kind is DeviceKind.Cuda or DeviceKind.Vulkan;
@@ -101,7 +106,7 @@ public sealed record DevicePlan(DeviceSpec Spec, IReadOnlyList<string> Candidate
 public sealed record DeviceLoadResult(IModel Model, Func<int, IKvCache>? KvCacheFactory, string ResolvedDevice, string? Warning)
 {
     /// <summary>True when <see cref="ResolvedDevice"/> is the Vulkan backend.</summary>
-    public bool IsVulkan => ResolvedDevice == "vulkan";
+    public bool IsVulkan => ResolvedDevice.StartsWith("vulkan", StringComparison.Ordinal);
 }
 
 /// <summary>
@@ -135,15 +140,17 @@ public static class DeviceModelLoader
         // BERT encoders (bge / e5 / gte / MiniLM / mxbai, F16 weights) have a dedicated Vulkan implementation (#741).
         if (spec.Kind == DeviceKind.Vulkan && config.Architecture is Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe)
         {
-            log($"Vulkan inference ({DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}), {config.Architecture} encoder");
+            var vkDev = VulkanDeviceFor(spec);
+            log($"Vulkan inference ({vkDev.DeviceName}), {config.Architecture} encoder");
             return (DotLLM.Vulkan.VulkanBertEncoderModel.LoadFromGguf(
-                DotLLM.Vulkan.VulkanModelLoader.SharedDevice, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()), null);
+                vkDev, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()), null);
         }
         if (spec.Kind == DeviceKind.Vulkan && config.Architecture is Architecture.GemmaEmbedding)
         {
-            log($"Vulkan inference ({DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}), {config.Architecture} encoder");
+            var vkDev = VulkanDeviceFor(spec);
+            log($"Vulkan inference ({vkDev.DeviceName}), {config.Architecture} encoder");
             return (DotLLM.Vulkan.VulkanGemmaEmbeddingModel.LoadFromGguf(
-                DotLLM.Vulkan.VulkanModelLoader.SharedDevice, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()), null);
+                vkDev, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()), null);
         }
         if ((config.BidirectionalAttention || config.Architecture is Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe) && spec.Kind != DeviceKind.Cpu)
             throw new NotSupportedException(
@@ -153,8 +160,9 @@ public static class DeviceModelLoader
         {
             if (requestedGpuLayers is > 0)
                 warn("--gpu-layers is ignored on vulkan: the whole model is device-resident (there is no partial offload).");
-            log($"Vulkan inference ({DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName})");
-            var (m, kv) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
+            var vkDev = VulkanDeviceFor(spec);
+            log($"Vulkan inference ({vkDev.DeviceName})");
+            var (m, kv) = DotLLM.Vulkan.VulkanModelLoader.CreateOnDeviceFromGguf(gguf, config, spec.VulkanIndex);
             return (m, kv);
         }
 
@@ -170,6 +178,10 @@ public static class DeviceModelLoader
         return DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(gguf, config, gpuLayers, spec.Ordinal, threading, warn,
             (moeOffload ?? MoeOffloadOptions.WithEnvironmentFallback(null)) is var moe ? moe with { Log = moe.Log ?? log } : null);
     }
+
+    /// <summary>The Vulkan device a spec names: physical index N for <c>vulkan:N</c>, else the process default (#1704).</summary>
+    public static DotLLM.Vulkan.VulkanDevice VulkanDeviceFor(DeviceSpec spec) =>
+        spec.VulkanIndex is int i ? DotLLM.Vulkan.VulkanModelLoader.GetDevice(i) : DotLLM.Vulkan.VulkanModelLoader.SharedDevice;
 
     /// <summary>
     /// Resolves <paramref name="requestedDevice"/> and loads. <c>auto</c> tries CUDA, then Vulkan, then CPU and warns whenever it ends on

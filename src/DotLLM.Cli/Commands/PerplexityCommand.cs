@@ -274,7 +274,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         addBos = settings.Bos ?? GgufAddBosResolver.Resolve(gguf.Metadata);
 
         // One shared parser/resolution (#790): unknown value -> error, explicit GPU that cannot be honoured -> error (never CPU), auto -> best device.
-        if (!Helpers.DeviceCli.TryResolveForTool(settings.Device, resolvedPath, json: false, out string backend, out int gpuId))
+        if (!Helpers.DeviceCli.TryResolveForTool(settings.Device, resolvedPath, json: false, out string backend, out int gpuId, out int? vulkanIndex))
             return 1;
 
         // Layer placement is resolved before anything is loaded, because it decides WHICH loader
@@ -363,7 +363,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
 
             case "vulkan":
             {
-                var vkDevice = DotLLM.Vulkan.VulkanDevice.Create();
+                var vkDevice = vulkanIndex is int vki ? DotLLM.Vulkan.VulkanDevice.Create(vki) : DotLLM.Vulkan.VulkanDevice.Create();
                 ownedDevice = vkDevice;
                 // Shared per-architecture Vulkan dispatch — see the CPU/CUDA branches (#259).
                 (model, _) = DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(

@@ -172,9 +172,7 @@ public sealed record BackendInfoDto
     public int DeviceCount { get; init; }
 
     /// <summary>
-    /// Whether <c>POST /v1/models/load</c> can actually place a model on this backend. The server's
-    /// load path dispatches to CPU or CUDA only, so Vulkan reports <c>available</c> but not
-    /// <c>servable</c>.
+    /// Whether <c>POST /v1/models/load</c> can actually place a model on this backend (Vulkan needs the SPIR-V blobs beside the binary).
     /// </summary>
     [JsonPropertyName("servable")]
     public bool Servable { get; init; }
@@ -217,6 +215,14 @@ public sealed record DeviceInfoDto
     [JsonPropertyName("free_memory_bytes")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public long? FreeMemoryBytes { get; init; }
+
+    /// <summary>
+    /// Vulkan only: true on the device plain <c>vulkan</c> selects (the process default); absent otherwise. Nullable rather than a
+    /// <c>bool</c> with an initializer, per the source-generation rule in CLAUDE.md.
+    /// </summary>
+    [JsonPropertyName("is_default")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? IsDefault { get; init; }
 
     /// <summary>CUDA compute capability ("8.6"), CUDA only.</summary>
     [JsonPropertyName("compute_capability")]

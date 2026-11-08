@@ -726,7 +726,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 DotLLM.Cuda.CudaTransformerModel => DotLLM.Cuda.CudaDevice.GetDevice(DeviceCli.CudaOrdinal(deviceOutcome.Resolved)).ToString(),
                 DotLLM.Cuda.HybridTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
                 DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
-                _ when vulkanKv is not null => $"vulkan {DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}",
+                _ when vulkanKv is not null => $"vulkan {DeviceCli.DeviceLabel(deviceOutcome.Resolved)}",
                 _ => $"{threadingInfo.EffectiveThreadCount} threads"
             };
             var segments = $"{config.Architecture} {config.NumLayers}L/{config.HiddenSize}H | {quantLabel} | {deviceLabel} | {samplingLabel}";

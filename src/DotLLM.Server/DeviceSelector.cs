@@ -30,8 +30,9 @@ public static class DeviceSelector
                     .OrderByDescending(d => d.FreeMemoryBytes ?? d.TotalMemoryBytes ?? 0).FirstOrDefault();
                 if (best is not null) order.Insert(0, best.DeviceString!);   // CUDA first
             }
-            else if (backend.Name == "vulkan" && backend.Devices is { Length: > 0 } vk && vk[0].DeviceString is { } v)
-                order.Add(v);
+            else if (backend.Name == "vulkan" && backend.Devices is { Length: > 0 } vk
+                     && (vk.FirstOrDefault(d => d.IsDefault == true) ?? vk[0]).DeviceString is { } v)
+                order.Add(v);   // the process-default Vulkan GPU (#1704), the one plain "vulkan" would use
         }
         order.Add("cpu");
         return order;
@@ -109,7 +110,12 @@ public static class DeviceSelector
             {
                 var vk = backends.FirstOrDefault(b => b.Name == "vulkan");
                 if (vk is { Servable: true } && vk.Devices is { Length: > 0 })
-                    return new DevicePlan(spec, ["vulkan"], null, null);
+                {
+                    if (!spec.ExplicitIndex) return new DevicePlan(spec, ["vulkan"], null, null);
+                    if (vk.Devices.Any(d => d.Index == spec.Ordinal)) return new DevicePlan(spec, [spec.Canonical], null, null);
+                    return new DevicePlan(spec, [], $"Vulkan device {spec.Ordinal} does not exist (this machine has {vk.Devices.Length} Vulkan device(s): "
+                        + $"vulkan:0..vulkan:{vk.Devices.Length - 1})" + AlternativeHint(backends, except: "vulkan"), null);
+                }
                 string why = "Vulkan is not usable on this machine" + (vk?.Note is { } n ? $" ({n})" : "");
                 return new DevicePlan(spec, [], why + AlternativeHint(backends, except: "vulkan"), null);
             }
