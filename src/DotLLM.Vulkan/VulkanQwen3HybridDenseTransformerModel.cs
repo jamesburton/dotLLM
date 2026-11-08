@@ -2815,6 +2815,23 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     // ── Matmul dispatch ──────────────────────────────────────────────────────
 
     /// <summary>
+    /// Quantises the single decode row <paramref name="input"/> to Q8_1 into the cm1 rows scratch (#921: the Q4_0 / Q4_1 dp4a MMVQs read the
+    /// <see cref="QuantizeQ8_1Kernel"/> layout, which the rows kernel produces for n = 1) and records the barrier that makes it readable.
+    /// False (nothing recorded) when the quantizer or scratch is absent or too small, or K is not a whole number of blocks.
+    /// </summary>
+    private bool TryQuantizeDecodeRowQ8_1(nint cmdBuf, VulkanDevice.Buffer input, int k)
+    {
+        if (_kernels.QuantizeQ8_1RowsCm1 is not { } quant || _state.Cm1Xq is not { } xq || _state.Cm1Xds is not { } xds || (k & 31) != 0
+            || xq.Size < QuantizeQ8_1RowsKernel.PackedBytes(1, k) || xds.Size < QuantizeQ8_1RowsKernel.ScaleBytes(1, k))
+            return false;
+        // The scratch is shared with the cm1 prefill GEMMs: order this quantize after any GEMM still reading it.
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        quant.Record(cmdBuf, input, xq, xds, 1, k);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        return true;
+    }
+
+    /// <summary>
     /// The int8-coopmat GEMM (#1226) for a <paramref name="qt"/> weight of input width <paramref name="inputDim"/> over
     /// <paramref name="seqLen"/> rows (0 = skip the scratch-size check), or null.
     /// </summary>
@@ -2830,6 +2847,15 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         return k is not null && _state.Cm1Xq is { } xq && k.SupportsK(inputDim)
             && xq.Size >= QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) ? k : null;
     }
+
+    /// <summary>The device-resident weights (test hook: on-device quant types per projection).</summary>
+    internal VulkanQwen3HybridDenseWeights Weights => _weights;
+
+    /// <summary>#921: projections that ran on the packed legacy-quant arms (Q4_0 / Q4_1 / Q5_0 / Q5_1); test / proof hook.</summary>
+    internal long LegacyQuantDispatchCount { get; private set; }
+
+    /// <summary>#921: legacy-quant decode GEMVs that took the dp4a MMVQ (Q8_1 activations) rather than the F32-in GEMV; test / proof hook.</summary>
+    internal long LegacyQuantMmvqDispatchCount { get; private set; }
 
     /// <summary>
     /// Dispatches the GEMV (<paramref name="seqLen"/> == 1) or GEMM variant for the
@@ -2877,6 +2903,62 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
                     _kernels.MatMulQ8GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ8Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
+            // #921: the legacy 32-element-block quants VulkanQwen3MoeHybridWeights now keeps packed (shared with the MoE-hybrid host, whose
+            // RecordMatmul carries the same four arms). Decode: Q4_0 / Q4_1 take the dp4a MMVQ against a Q8_1 row quantised into the cm1
+            // scratch (same layout for n = 1), else every format runs its F32-in GEMV. Prefill: coopmat GEMM where the device has it, else
+            // the tiled F32 GEMM. A keep-packed arm in the loader without an arm here would reach `default` and reinterpret the blocks as F32.
+            case QuantizationType.Q4_0:
+                LegacyQuantDispatchCount++;
+                if (seqLen == 1 && _kernels.MatMulQ4_0Mmvq is { } q40Mmvq && TryQuantizeDecodeRowQ8_1(cmdBuf, input, inputDim))
+                {
+                    LegacyQuantMmvqDispatchCount++;
+                    q40Mmvq.Record(cmdBuf, weights, _state.Cm1Xq!, _state.Cm1Xds!, output, m: outputDim, k: inputDim);
+                }
+                else if (seqLen == 1)
+                    (_kernels.MatMulQ4_0Gemv ?? throw new InvalidOperationException("Q4_0 weights are device-resident but the Q4_0 GEMV kernel was not created."))
+                        .Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ4_0GemmCoopmat is not null)
+                    _kernels.MatMulQ4_0GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                else
+                    (_kernels.MatMulQ4_0Gemm ?? throw new InvalidOperationException("Q4_0 weights are device-resident but the Q4_0 GEMM kernel was not created."))
+                        .Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
+            case QuantizationType.Q4_1:
+                if (_kernels.MatMulQ4_1Gemv is null || _kernels.MatMulQ4_1Gemm is null)
+                    throw new InvalidOperationException("Q4_1 weights are device-resident but the Q4_1 kernels were not created.");
+                LegacyQuantDispatchCount++;
+                if (seqLen == 1 && _kernels.MatMulQ4_1Mmvq is { } q41Mmvq && TryQuantizeDecodeRowQ8_1(cmdBuf, input, inputDim))
+                {
+                    LegacyQuantMmvqDispatchCount++;
+                    q41Mmvq.Record(cmdBuf, weights, _state.Cm1Xq!, _state.Cm1Xds!, output, m: outputDim, k: inputDim);
+                }
+                else if (seqLen == 1)
+                    _kernels.MatMulQ4_1Gemv.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ4_1GemmCoopmat is not null)
+                    _kernels.MatMulQ4_1GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                else
+                    _kernels.MatMulQ4_1Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
+            case QuantizationType.Q5_0:
+                if (_kernels.MatMulQ5_0Gemv is null || _kernels.MatMulQ5_0Gemm is null)
+                    throw new InvalidOperationException("Q5_0 weights are device-resident but the Q5_0 kernels were not created.");
+                LegacyQuantDispatchCount++;
+                if (seqLen == 1)
+                    _kernels.MatMulQ5_0Gemv.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ5_0GemmCoopmat is not null)
+                    _kernels.MatMulQ5_0GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                else
+                    _kernels.MatMulQ5_0Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
+            case QuantizationType.Q5_1:
+                if (_kernels.MatMulQ5_1Gemv is null || _kernels.MatMulQ5_1Gemm is null)
+                    throw new InvalidOperationException("Q5_1 weights are device-resident but the Q5_1 kernels were not created.");
+                LegacyQuantDispatchCount++;
+                if (seqLen == 1)
+                    _kernels.MatMulQ5_1Gemv.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else
+                    _kernels.MatMulQ5_1Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q2_K:
                 if (seqLen == 1)

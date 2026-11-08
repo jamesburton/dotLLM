@@ -384,6 +384,23 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     private static bool KeepF16(QuantizationType qt, int k) => qt == QuantizationType.F16 && (k & 1) == 0;
     private static bool KeepBf16(QuantizationType qt, int k) => qt == QuantizationType.BF16 && (k & 1) == 0;
 
+    // Legacy 32-element-block quants (#921 / #1140 / KERNEL_INSIGHTS_REUSE M1): the dense loader (VulkanWeights.DeviceQuantTypeFor) has kept
+    // Q5_0 since #568, Q4_0 since #1018, Q4_1 since #1171 and Q5_1 since #1600, but this table never grew the arms, so a hybrid file with a
+    // legacy-quant projection (Q5_1 shared-expert downs, Q4_0 ollama-style files, Q5_0/Q4_1 outputs) was widened to F32 at load - 4x the
+    // bytes of Q8_0-class storage, 5.3-7x of a 4/5-bit block, on every such tensor. Rule 2 (CLAUDE.md): quantized weights run quantized.
+    // Both hybrid hosts' RecordMatmul tables carry a dispatch arm for each of these four (VulkanQwen3MoeHybridTransformerModel and
+    // VulkanQwen3HybridDenseTransformerModel; VulkanHybridKeepPackedDispatchTests pins the pairing), on the kernels the dense host already
+    // runs: Q5_0 F32-in GEMV / tiled GEMM / coopmat GEMM, Q5_1 F32-in GEMV / tiled GEMM, Q4_0 and Q4_1 F32-in GEMV / dp4a MMVQ / coopmat
+    // GEMM / tiled GEMM. Q4_0 honours the same DOTLLM_VK_Q4_0_NATIVE=0 opt-out as the dense loader.
+    private static bool KeepQ5_0(QuantizationType qt, int k, bool legacy) => legacy && qt == QuantizationType.Q5_0 && (k % 32) == 0;
+    private static bool KeepQ5_1(QuantizationType qt, int k, bool legacy) => legacy && qt == QuantizationType.Q5_1 && (k % 32) == 0;
+    private static bool KeepQ4_0(QuantizationType qt, int k, bool legacy) => legacy && qt == QuantizationType.Q4_0 && (k % 32) == 0 && VulkanQwen3MoeMoeUpload.Q4_0NativeEnabled;
+    private static bool KeepQ4_1(QuantizationType qt, int k, bool legacy) => legacy && qt == QuantizationType.Q4_1 && (k % 32) == 0;
+
+    /// <summary>A/B switch for #921: <c>DOTLLM_VK_HYBRID_LEGACY_PACKED=0</c> restores the pre-#921 widening of Q4_0 / Q4_1 / Q5_0 / Q5_1
+    /// hybrid projections to F32 (resident-bytes and greedy-identity comparisons). Read once at startup; tests may set it.</summary>
+    internal static bool LegacyPackedEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_HYBRID_LEGACY_PACKED") != "0";
+
     // PQ2_0 (PrismML Bonsai ternary) packs 128 weights per group into 34 bytes: an f16 group
     // scale plus 2.125 bits per weight. Widening it to F32 is a ~15x expansion — for Bonsai 2 27B
     // that is ~108 GB of device-local memory against a 93 GiB budget, which is how the load used
@@ -401,16 +418,30 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     // being tested. That is exactly how PQ2_0 broke.
     private static bool KeepPTQ1_0(QuantizationType qt, int k) => qt == QuantizationType.PTQ1_0 && (k % 128) == 0;
 
-    private static bool KeepNative(QuantizationType qt, int k)
+    private static bool KeepNative(QuantizationType qt, int k, bool? legacyPacked = null)
         => KeepQ8(qt, k) || KeepQ4K(qt, k) || KeepQ5K(qt, k) || KeepQ6K(qt, k)
         || KeepQ2K(qt, k) || KeepQ3K(qt, k) || KeepIq4Xs(qt, k) || KeepIq1S(qt, k) || KeepIq4Nl(qt, k)
         || KeepIq2Xxs(qt, k) || KeepIq2Xs(qt, k) || KeepIq2S(qt, k)
         || KeepIq3Xxs(qt, k) || KeepIq3S(qt, k)
+        || KeepQ5_0(qt, k, legacyPacked ?? LegacyPackedEnabled) || KeepQ5_1(qt, k, legacyPacked ?? LegacyPackedEnabled)
+        || KeepQ4_0(qt, k, legacyPacked ?? LegacyPackedEnabled) || KeepQ4_1(qt, k, legacyPacked ?? LegacyPackedEnabled)
         || KeepF16(qt, k) || KeepBf16(qt, k) || KeepPQ2_0(qt, k) || KeepPTQ1_0(qt, k);
 
-    private static QuantizationType DeviceQuantTypeFor(QuantizationType qt, int k)
+    /// <summary>
+    /// The on-device storage type this loader gives a <paramref name="qt"/> projection whose contraction axis is <paramref name="k"/>:
+    /// the source type when it is kept packed, <see cref="QuantizationType.F32"/> when it is widened at upload. Internal for the
+    /// loader/dispatch pairing test (every kept type must have a <c>RecordMatmul</c> arm in BOTH hybrid hosts).
+    /// </summary>
+    internal static QuantizationType DeviceQuantTypeForProjection(QuantizationType qt, int k) => DeviceQuantTypeFor(qt, k);
+
+    private static QuantizationType DeviceQuantTypeFor(QuantizationType qt, int k, bool? legacyPacked = null)
     {
+        bool legacy = legacyPacked ?? LegacyPackedEnabled;
         if (KeepQ8(qt, k)) return QuantizationType.Q8_0;
+        if (KeepQ5_0(qt, k, legacy)) return QuantizationType.Q5_0;
+        if (KeepQ5_1(qt, k, legacy)) return QuantizationType.Q5_1;
+        if (KeepQ4_0(qt, k, legacy)) return QuantizationType.Q4_0;
+        if (KeepQ4_1(qt, k, legacy)) return QuantizationType.Q4_1;
         if (KeepQ4K(qt, k)) return QuantizationType.Q4_K;
         if (KeepQ5K(qt, k)) return QuantizationType.Q5_K;
         if (KeepQ6K(qt, k)) return QuantizationType.Q6_K;
@@ -432,10 +463,15 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     }
 
     internal static long ProjectionUploadBytes(int outputDim, int inputDim, QuantizationType qt)
+        => ProjectionUploadBytes(outputDim, inputDim, qt, legacyPacked: null);
+
+    /// <summary>As <see cref="ProjectionUploadBytes(int, int, QuantizationType)"/> with the #921 legacy keep-packed switch forced
+    /// (tests: the pre-#921 widened size without touching the process-wide <see cref="LegacyPackedEnabled"/>).</summary>
+    internal static long ProjectionUploadBytes(int outputDim, int inputDim, QuantizationType qt, bool? legacyPacked)
     {
-        if (KeepNative(qt, inputDim))
+        if (KeepNative(qt, inputDim, legacyPacked))
         {
-            QuantizationType keep = DeviceQuantTypeFor(qt, inputDim);
+            QuantizationType keep = DeviceQuantTypeFor(qt, inputDim, legacyPacked);
             return Dequantize.RowByteSize(inputDim, keep) * outputDim;
         }
         return (long)outputDim * inputDim * sizeof(float);
