@@ -58,7 +58,7 @@ as `TensorPrimitives` and `Vector256` do), `DOTLLM_CPU_ISA` changes only what do
 | Test | Guards |
 |---|---|
 | `Cpu/CpuFeaturesTests` | cap parsing, flag lattice (`Avx512Bw` => `Avx512F` => `Avx2`, nothing above the hardware), the cap when the env var is set |
-| `Cpu/Kernels/CpuTierMatrixTests` | every tier the host can run (Q8_0 Sse/Avx2/Avx512/Vnni; Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL and Q2_K..Q6_K Sse/Avx2; the Q8_0/Q8_1/Q8_K quantizers; LittleBit sign-dots; `LoraStage2`) against the scalar oracle; the Q8_0 `ComputeRows` dispatcher under the tier in force |
+| `Cpu/Kernels/CpuTierMatrixTests` | every tier the host can run (Q8_0 Sse/Avx2/Avx512/Vnni; Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL and Q2_K..Q6_K Sse/Avx2; the Q8_0/Q8_1/Q8_K quantizers; LittleBit sign-dots; `LoraStage2`) against the scalar oracle; the Q8_0 `ComputeRows` dispatcher under the tier in force. The dot bound is `ulp(1) * sqrt(K) * sum|w_i x_i|` over the dequantized operands (never relative to the result, which can cancel), the fixture seed is a fixed hash of the family name (not `string.GetHashCode`, which is per-process random), and a tier above the `DOTLLM_CPU_ISA` cap is skipped rather than compared (#1692). `DOTLLM_TIER_SWEEP_SEEDS=N` sweeps N seeds per case and prints the worst `|diff|/bound` |
 | `Cpu/CpuGatingConventionTests` | (1) no raw `IsSupported` outside `CpuFeatures`, (2) a non-private method that calls ISA intrinsics guards or names its tier, (3) a non-private caller of a tier-named kernel consults `CpuFeatures` (or a predicate built on it) |
 
 The scan is a regex + brace-matching heuristic over `src/` (no Roslyn): cheap, reports `file:line`, and errs towards reporting. It cannot
