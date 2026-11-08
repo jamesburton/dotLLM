@@ -174,7 +174,7 @@ public sealed class VulkanHybridLegacyQuantForwardTests(ITestOutputHelper output
     }
 
     /// <summary>Random 2-layer hybrid weights (layer 0 GDN, layer 1 full attention) with every projection in one legacy quant.</summary>
-    private sealed unsafe class LegacyQuantFixture : IDisposable
+    internal sealed unsafe class LegacyQuantFixture : IDisposable
     {
         private readonly List<nint> _allocs = new();
         private QuantizationType _qt;
