@@ -53,7 +53,7 @@ layout(push_constant) uniform PushConstants {
 
 #include "gemm_coopmat_blocked_decl.glsl"
 
-const uint BLOCK_BYTES = __BLOCK_BYTES__u;
+const uint __FMT___BLOCK_BYTES = __BLOCK_BYTES__u;
 
 const uint A_LANES_PER_ROW = BLOCK_SIZE / BM;        // 2 threads cooperate on one weight row
 const uint A_COLS_PER_THR  = BK / A_LANES_PER_ROW;   // 16 = two 8-element pairs
@@ -89,7 +89,7 @@ void gemmStageA(uint ch) {
         return;
     }
 
-    uint base = (mGlobal * pc.blocksPerRow + (ch >> 3u)) * BLOCK_BYTES;
+    uint base = (mGlobal * pc.blocksPerRow + (ch >> 3u)) * __FMT___BLOCK_BYTES;
     uint ib32 = ch & 7u;
     float d   = readHalf(base);
 __STAGE__
