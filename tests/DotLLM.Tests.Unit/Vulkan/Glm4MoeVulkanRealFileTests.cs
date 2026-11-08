@@ -245,10 +245,12 @@ public sealed class Glm4MoeVulkanRealFileTests
         _out.WriteLine($"fused vs unfused: KL@512 {klVk512}; KL@2048 {klVk2k}; greedy identity {greedyAgree}/{greedyLen} (first divergence {(firstDiv < 0 ? "none" : firstDiv.ToString())})");
 
         // Gates on the Vulkan-only part first (also what the mutant runs use: DOTLLM_GLM4MOE_SKIP_CPU=1 stops here).
-        // Fused vs unfused is a schedule change over the same kernels: it must sit far below the CPU-vs-Vulkan floor (S1/S2: ~0.03 mean).
-        Assert.True(klVk512.Mean < 1e-3 && klVk2k.Mean < 1e-3, $"fused vs unfused KL too large: {klVk512} / {klVk2k}");
-        Assert.True(klVk512.Top1Agree >= steps - 1 && klVk2k.Top1Agree >= steps - 1, "fused vs unfused argmax disagreement beyond one near-tie step");
-        Assert.True(greedyAgree >= greedyLen * 9 / 10, $"fused vs unfused greedy identity {greedyAgree}/{greedyLen}");
+        // Fused vs unfused is a schedule change over the same math (the quantiser / norm / combine kernels differ, so 1-ULP drift digitises on
+        // this 4-bit file): it must sit at the reordering floor measured for V1-vs-V2 kernels (decodekl: mean 1.5e-3, median 2e-4, top-1 98.7%),
+        // far below the CPU-vs-Vulkan floor (S1/S2: ~0.03 mean) and two orders below a wrong activation row / expert (A4b mutant: mean 0.54).
+        Assert.True(klVk512.Mean < 5e-3 && klVk2k.Mean < 5e-3, $"fused vs unfused KL too large: {klVk512} / {klVk2k}");
+        Assert.True(klVk512.Top1Agree >= steps - 3 && klVk2k.Top1Agree >= steps - 3, "fused vs unfused argmax disagreement beyond near-tie steps");
+        Assert.True(greedyAgree >= greedyLen * 4 / 5, $"fused vs unfused greedy identity {greedyAgree}/{greedyLen}");
         Skip.If(Environment.GetEnvironmentVariable("DOTLLM_GLM4MOE_SKIP_CPU") == "1", "Vulkan-only gates passed; CPU reference skipped on request");
 
         // ---- CPU reference (Vulkan model released above) ----
