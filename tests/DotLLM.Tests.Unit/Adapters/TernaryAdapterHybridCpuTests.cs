@@ -214,4 +214,40 @@ public sealed unsafe class TernaryAdapterHybridCpuTests
         }
         finally { foreach (var o in outs) o.Dispose(); }
     }
+
+    // ------------------------------------------------------------------ MoE hybrid (qwen35moe) ----
+
+    [Fact]
+    public void MoeHybrid_AdapterChangesLogits_DetachAndAlphaZeroBitExact_AndRunsAfterEveryLayer()
+    {
+        using var fx = Fixture.Build(1717, Qt);
+        int d = fx.MoeConfig.HiddenSize;
+        using var m = Qwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights(
+            fx.MoeConfig, fx.MoeLayers, fx.OutputNormWeight, fx.TokenEmbedPtr, QuantizationType.F32, fx.OutputWeightPtr, Qt, Vocab, d);
+        float[] Go()
+        {
+            m.ResetSequenceState();
+            using var kv = new SimpleKvCache(m.AttentionLayerCount, KvHeads, HeadDim, MaxSeq);
+            using ITensor t = m.Forward(Ids, Enumerable.Range(0, Ids.Length).ToArray(), -1, kv);
+            return new ReadOnlySpan<float>((float*)t.DataPointer, (int)t.Shape.ElementCount).ToArray();
+        }
+        float[] baseline = Go();
+        var rec = new Recorder();
+        m.ResidualModifier = rec;
+        _ = Go();
+        Assert.Equal(new[] { (0, Ids.Length), (1, Ids.Length) }, rec.Calls.ToArray());
+        foreach (int layer in new[] { 0, 1 })
+        {
+            using var hook = new TernaryResidualHook(d);
+            hook.Add(Adapter(d, layer, 3f));
+            m.ResidualModifier = hook;
+            Assert.True(MaxDiff(baseline, Go()) > 1e-3, $"layer {layer}: no steering on the MoE hybrid");
+            using var zero = new TernaryResidualHook(d);
+            zero.Add(Adapter(d, layer, 0f));
+            m.ResidualModifier = zero;
+            AssertBits(baseline, Go(), $"layer {layer}: alpha=0");
+            m.ResidualModifier = null;
+            AssertBits(baseline, Go(), $"layer {layer}: detached");
+        }
+    }
 }
