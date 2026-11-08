@@ -24,7 +24,11 @@ public sealed class SolutionScannerHardeningTests : IDisposable
         catch (UnauthorizedAccessException) { }
     }
 
-    private const string Plain = "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>";
+    [Fact]
+    public void Options_DefaultTimeout_IsTheCorpusBudget() =>
+        Assert.Equal(RoslynParsing.DefaultCorpusBudget, new SolutionScanOptions().Timeout);
+
+    private const string Plain ="<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>";
 
     /// <summary>Writes <c>P/P.csproj</c> (the given text) and the files under <c>P</c>, restores it; returns the project path.</summary>
     private async Task<string> WriteProjectAsync(string project, params (string Name, string Text)[] files)
@@ -105,14 +109,17 @@ public sealed class SolutionScannerHardeningTests : IDisposable
         string secretOutside = Path.Combine(_root, "outside", "secret.txt");
         Directory.CreateDirectory(Path.GetDirectoryName(secretOutside)!);
         File.WriteAllText(secretOutside, "TOP-SECRET-OUTSIDE");
-        string project = "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
-            + "<ItemGroup><Compile Include=\"notes.txt\" /><Compile Include=\"" + secretOutside + "\" /></ItemGroup></Project>";
-        string csproj = await WriteProjectAsync(project, ("A.cs", "class A { }\n"), ("notes.txt", "TOP-SECRET-INSIDE"));
+        // Default globbing is off: on Windows `**/*.cs` would also match Upper.CS and list it twice.
+        string project = "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup>"
+            + "<ItemGroup><Compile Include=\"A.cs\" /><Compile Include=\"notes.txt\" /><Compile Include=\"" + secretOutside + "\" /><Compile Include=\"Upper.CS\" /></ItemGroup></Project>";
+        string csproj = await WriteProjectAsync(project, ("A.cs", "class A { }\n"), ("notes.txt", "TOP-SECRET-INSIDE"), ("Upper.CS", "class Upper { }\n"));
 
         ScanResult scan = await SolutionScanner.LoadAsync(csproj);
 
         ScannedProject p = Assert.Single(scan.Projects);
         Assert.Contains(scan.Files, f => f.Path == "A.cs");
+        Assert.Contains(scan.Files, f => f.Path == "Upper.CS"); // the extension test ignores case
+        Assert.NotNull(p.Compilation.Compilation.GetTypeByMetadataName("Upper"));
         Assert.DoesNotContain(scan.Files, f => f.Text.Contains("TOP-SECRET", StringComparison.Ordinal));
         Assert.DoesNotContain(scan.Files, f => !f.Path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain(p.Compilation.Compilation.SyntaxTrees, t => t.GetText().ToString().Contains("TOP-SECRET", StringComparison.Ordinal));
@@ -128,27 +135,41 @@ public sealed class SolutionScannerHardeningTests : IDisposable
         + "<Exec Condition=\"'$(OS)' != 'Windows_NT'\" Command=\"sleep " + seconds.ToString(CultureInfo.InvariantCulture) + "\" />"
         + "</Target></Project>";
 
-    [Fact]
-    public async Task Scan_CancelledDuringTheDesignTimeBuild_ReturnsAtOnce()
+    /// <summary>The project, or a solution file listing it (the two entry points wait on different workspace calls).</summary>
+    private async Task<string> HangingEntryAsync(bool solution, int seconds)
+    {
+        string csproj = await WriteProjectAsync(Hanging(seconds), ("A.cs", "class A { }\n"));
+        if (!solution) return csproj;
+        string slnx = Path.Combine(_root, "S.slnx");
+        File.WriteAllText(slnx, "<Solution><Project Path=\"P/P.csproj\" /></Solution>");
+        return slnx;
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Scan_CancelledDuringTheDesignTimeBuild_ReturnsAtOnce(bool solution)
     {
         // The design-time build runs for 40 s. The caller's token fires after 2 s: the call must end then, not when the build does.
-        string csproj = await WriteProjectAsync(Hanging(40), ("A.cs", "class A { }\n"));
+        string entry = await HangingEntryAsync(solution, 40);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
         var clock = Stopwatch.StartNew();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SolutionScanner.LoadAsync(csproj, cts.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SolutionScanner.LoadAsync(entry, cts.Token));
 
         Assert.True(clock.Elapsed < TimeSpan.FromSeconds(20), $"cancelled after 2 s, returned after {clock.Elapsed}");
     }
 
-    [Fact]
-    public async Task Scan_OptionTimeout_EndsAHungDesignTimeBuildWithATimeoutException()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Scan_OptionTimeout_EndsAHungDesignTimeBuildWithATimeoutException(bool solution)
     {
-        string csproj = await WriteProjectAsync(Hanging(40), ("A.cs", "class A { }\n"));
+        string entry = await HangingEntryAsync(solution, 40);
         var clock = Stopwatch.StartNew();
 
         await Assert.ThrowsAsync<TimeoutException>(() =>
-            SolutionScanner.LoadAsync(csproj, new SolutionScanOptions { Timeout = TimeSpan.FromSeconds(2) }));
+            SolutionScanner.LoadAsync(entry, new SolutionScanOptions { Timeout = TimeSpan.FromSeconds(2) }));
 
         Assert.True(clock.Elapsed < TimeSpan.FromSeconds(20), $"timeout 2 s, returned after {clock.Elapsed}");
     }
