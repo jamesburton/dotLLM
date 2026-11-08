@@ -3047,34 +3047,34 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
 
     internal const string DisableQ4KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q4K_COOPMAT";
 
-    /// <summary>Prefill length from which the blocked coopmat Q4_K GEMM replaces dp4a MMQ (to be tuned by A/B).</summary>
-    internal static readonly int Q4KCoopmatPreferSeqLen =
-        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_Q4K_COOPMAT_MIN_TOKENS"), out int t) ? t : 128;
+    /// <summary>Prefill length from which the blocked coopmat K-quant GEMM replaces dp4a MMQ; lives in <see cref="VulkanDensePrefillGemmPolicy"/> (#1149).</summary>
+    internal static int Q4KCoopmatPreferSeqLen => VulkanDensePrefillGemmPolicy.KQuantCoopmatMinTokens;
 
     internal const string DisableQ6KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q6K_COOPMAT";
 
     internal const string DisableQ2KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q2K_COOPMAT";
 
-    private bool PreferQ2KCoopmat(int seqLen) => _matmulQ2KGemmCoopmat is not null && seqLen > 1; // wins from 4 tokens (#596)
+    // The crossovers below are the shared table in VulkanDensePrefillGemmPolicy (#1149): the hybrid-dense host selects from the same one.
+    private bool PreferQ2KCoopmat(int seqLen) => _matmulQ2KGemmCoopmat is not null && VulkanDensePrefillGemmPolicy.CoopmatWins(QuantType.Q2_K, seqLen); // wins from 4 tokens (#596)
     internal const string DisableQ5KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q5K_COOPMAT";
 
     internal const string DisableQ5_0CoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q5_0_COOPMAT";
 
-    private bool PreferQ5_0Coopmat(int seqLen) => _matmulQ5_0GemmCoopmat is not null && seqLen > 1; // the tiled F32 GEMM is 4-33x slower even at p=16 (#592)
+    private bool PreferQ5_0Coopmat(int seqLen) => _matmulQ5_0GemmCoopmat is not null && VulkanDensePrefillGemmPolicy.CoopmatWins(QuantType.Q5_0, seqLen); // the tiled F32 GEMM is 4-33x slower even at p=16 (#592)
 
     internal const string DisableQ3KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q3K_COOPMAT";
 
     internal const string DisableIq4XsCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_IQ4XS_COOPMAT";
 
-    private bool PreferIq4XsCoopmat(int seqLen) => _matmulIq4XsGemmCoopmat is not null && seqLen >= Math.Max(Q4KCoopmatPreferSeqLen, 256); // MMQ wins <=128 for IQ4_XS (#600)
+    private bool PreferIq4XsCoopmat(int seqLen) => _matmulIq4XsGemmCoopmat is not null && VulkanDensePrefillGemmPolicy.CoopmatWins(QuantType.IQ4_XS, seqLen); // MMQ wins <=128 for IQ4_XS (#600)
 
-    private bool PreferQ3KCoopmat(int seqLen) => _matmulQ3KGemmCoopmat is not null && seqLen >= Q4KCoopmatPreferSeqLen;
+    private bool PreferQ3KCoopmat(int seqLen) => _matmulQ3KGemmCoopmat is not null && VulkanDensePrefillGemmPolicy.CoopmatWins(QuantType.Q3_K, seqLen);
 
-    private bool PreferQ5KCoopmat(int seqLen) => _matmulQ5KGemmCoopmat is not null && seqLen >= Q4KCoopmatPreferSeqLen;
+    private bool PreferQ5KCoopmat(int seqLen) => _matmulQ5KGemmCoopmat is not null && VulkanDensePrefillGemmPolicy.CoopmatWins(QuantType.Q5_K, seqLen);
 
-    private bool PreferQ6KCoopmat(int seqLen) => _matmulQ6KGemmCoopmat is not null && seqLen >= Q4KCoopmatPreferSeqLen;
+    private bool PreferQ6KCoopmat(int seqLen) => _matmulQ6KGemmCoopmat is not null && VulkanDensePrefillGemmPolicy.CoopmatWins(QuantType.Q6_K, seqLen);
 
-    private bool PreferQ4KCoopmat(int seqLen) => _matmulQ4KGemmCoopmat is not null && seqLen >= Q4KCoopmatPreferSeqLen;
+    private bool PreferQ4KCoopmat(int seqLen) => _matmulQ4KGemmCoopmat is not null && VulkanDensePrefillGemmPolicy.CoopmatWins(QuantType.Q4_K, seqLen);
 
     internal const string DisableMmqEnvVar = "DOTLLM_VULKAN_DISABLE_MMQ";
 

@@ -293,6 +293,35 @@ The baseline GPU attention kernel (the first CUDA implementation, still the fall
 
 See [ATTENTION.md](ATTENTION.md) for mechanism details. Flash attention (tiled, O(N) memory) is implemented on CUDA (`native/kernels/attention_flash_mma*.cu`) and Vulkan (see the next section and the Flint section).
 
+### Vulkan dense-prefill GEMM selection: one table for the dense and hybrid-dense hosts (#1149)
+
+`VulkanDensePrefillGemmPolicy` holds the prefill (`seqLen > 1`) kernel crossovers the dense host
+(`VulkanTransformerModel`) measured, and `VulkanQwen3HybridDenseTransformerModel.RecordMatmul` now selects
+from the same table instead of its own "coopmat if present, else the scalar F32 GEMM" rule. Before #1149 the
+hybrid host had no dp4a MMQ at all: IQ4_NL prefill ran on the scalar GEMM on every device (Tev1-4B IQ4_NL
+63 tok/s on the 8060S) and every K-quant did so on devices without wave64 cooperative matrices (Arc:
+Tev1-4B Q4_K_M 3.7 tok/s).
+
+| format | rows `n` | kernel |
+|---|---|---|
+| Q3_K / Q4_K / Q5_K / Q6_K | `n < 128` (`DOTLLM_VULKAN_Q4K_COOPMAT_MIN_TOKENS`) | dp4a MMQ on Q8_1 rows |
+| Q3_K / Q4_K / Q5_K / Q6_K | `n >= 128` | f16 coopmat GEMM (F32 activations) |
+| IQ4_XS | `n < 256` / `n >= 256` | MMQ / coopmat (#600) |
+| Q2_K | any | coopmat (#596); MMQ only without coopmat |
+| IQ4_NL | any | MMQ (no coopmat GEMM exists) |
+| Q8_0 | any | hybrid host: coopmat first (#1150 open); dense host: MMQ first |
+| any | device without integer dot | coopmat where it exists, else the scalar GEMM |
+
+Order inside the hybrid host's `RecordMatmul`: small-row multi-column GEMVs (2..16 rows) → int8-coopmat
+MMQ (`DOTLLM_VK_MMQ_CM1_DENSE=1`, opt-in) → **this table's MMQ arm** → IQ1/2/3 F16-scratch arm → the
+per-format switch (coopmat / scalar). The MMQ kernels are created under the dense host's gate
+(`device.HasIntegerDotProduct`, `DOTLLM_VULKAN_DISABLE_MMQ`) plus `DOTLLM_VK_HYBRID_PREFILL_MMQ=0` as the
+A/B opt-out that restores the pre-#1149 dispatch. The Q8_1 activation rows reuse the int8-coopmat scratch
+(`Cm1Xq`/`Cm1Xds`, sized for the widest GEMM input), so the extra device memory is
+`seqLen * maxK * (1 + 8/32)` bytes and no weight is widened: the loader's keep-packed arms are unchanged.
+Census names: `matmul_<fmt>_mmq` (this arm), `matmul_<fmt>_mmq_cm1` (int8 coopmat), `matmul_<fmt>_gemm`
+(coopmat or scalar, as before). Test hooks: `MmqPrefillDispatchCount`, `PrefillGemmPathFor(qt, k, n)`.
+
 ### Vulkan split-KV (Flash-Decoding) decode attention — default ON
 
 The Vulkan backend routes **decode** attention (`seqQ == 1`) through
