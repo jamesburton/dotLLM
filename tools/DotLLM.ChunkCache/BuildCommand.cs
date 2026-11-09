@@ -89,58 +89,6 @@ internal sealed record BuildResult
 /// </remarks>
 internal static class BuildCommand
 {
-    public static readonly IReadOnlyDictionary<string, OptionKind> Spec = Common.Merge(Common.ModelOptions, Common.SourceOptions, Common.ChunkerOptions,
-        Common.SelectionOptions, new Dictionary<string, OptionKind>
-        {
-            ["store"] = OptionKind.Single,
-            ["strict"] = OptionKind.Flag,
-            ["dry-run"] = OptionKind.Flag,
-            ["max-chunks"] = OptionKind.Single,
-            ["reroot"] = OptionKind.Flag,
-            ["lock-timeout"] = OptionKind.Single,
-            ["show"] = OptionKind.Single,
-            ["server"] = OptionKind.Single,
-            ["offline"] = OptionKind.Flag,
-            ["lab"] = OptionKind.Flag,
-            ["encode"] = OptionKind.Flag,
-            ["index-only"] = OptionKind.Flag,
-            ["max-encode-tokens"] = OptionKind.Single,
-        });
-
-    public const string Help = """
-        chunkcache build --model M.gguf --store DIR (--solution X.sln|.slnx|.csproj | --directory D) (--server URL | --offline | --index-only) [options]
-
-          Scans the source (files on the secrets deny-list are never read past the scan: .env*, *.pem, *.key, *.pfx, id_*,
-          secrets.json, appsettings.*.Development.json, .git/**), chunks it with a wire-eligible chunker, updates the store's
-          index and encodes every indexed chunk the store lacks. A rerun re-chunks only changed files and encodes only what is
-          missing. The tokenizer and the chunk keys come from --model (the GGUF the server serves).
-
-          --server URL                the server owns the model identity and every K/V write: the index is named by its model.id and
-                                      model.producer, and the chunks are queued through POST /v1/chunk-cache/prewarm (text only;
-                                      the CLI never writes entries or the ledger). The API key is read from CHUNKCACHE_API_KEY only.
-          --offline                   no server: encode on this CPU into --store, holding the store's owner lock for the WHOLE run
-                                      (refused, exit 1, while a server or another offline writer owns the store)
-          --index-only                update the index only (--encode is the default and is accepted for clarity)
-          --max-encode-tokens N       queue/encode at most N tokens of missing chunks (--max-chunks counts chunks)
-          --lab                       allow a chunker that is not wire-eligible (only symbol-512 is); every chunk then counts as
-                                      wire-ineligible
-
-          --chunker symbol|fixed      chunker (default symbol)       --chunk-tokens N   max tokens per chunk (default 512)
-          --configuration C           MSBuild configuration for --solution (default Release)
-          --path G --symbol S --hops H --since REF [--merge-base] --exclude G --budget T --max-per-hop N
-                                      encode only the chunks this selection picks (the whole tree is still indexed);
-                                      list options repeat (--path a --path b) and their values may not contain commas
-          --max-chunks N              encode at most N missing chunks (path order)
-          --dry-run                   list what would be encoded and the estimated store size; write nothing
-          --strict                    exit 3, before writing anything, if a project was skipped, a load failure was not
-                                      attributed, or a file is on another volume than the root
-          --strict-model-id           identify the model by a hash of every byte (default: header + tensor head/tail samples)
-          --reroot                    accept a different tree root than the index recorded (re-paths every file)
-          --lock-timeout S            seconds to wait for the index lock and for each store-lock scope (default 30)
-          --threads N                 CPU threads (default min(8, cores))       --show N   dry-run lines to print (50)
-          --json                      result as JSON on stdout (chunkcache_build schema plus extras)
-        """;
-
     /// <summary>Test hook, per async flow: runs once the offline writer holds the store owner lock, before anything is read or written.</summary>
     internal static Action? TestHookAfterOwnerLock
     {

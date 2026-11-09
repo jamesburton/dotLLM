@@ -26,21 +26,6 @@ internal static class ExplainCommand
 {
     private const long MaxRequestFileBytes = 4L * 1024 * 1024; // the endpoint refuses larger bodies
 
-    public static readonly IReadOnlyDictionary<string, OptionKind> Spec = Common.Merge(Common.ModelOptions, new Dictionary<string, OptionKind>
-    {
-        ["request"] = OptionKind.Single,
-        ["show"] = OptionKind.Single,
-    });
-
-    public const string Help = """
-        chunkcache explain --server URL --request FILE.json [--json]
-
-          What would the server do with this chat request's chunk_cache annotations? Posts {"request": <FILE>} to
-          POST /v1/chunk-cache/explain and prints policy_would_apply, reason, per-chunk status (prefix | hit | miss | ignored, with
-          the reason for an ignored one: only for an authenticated caller's own namespace), predicted times and warnings.
-          The API key is read from CHUNKCACHE_API_KEY only. --show N chunk lines in text mode (default 40).
-        """;
-
     public static int Run(CliContext ctx, CliArgs args)
     {
         string serverUrl = args.Value("server") ?? throw new UsageException("explain: --server URL is required.");

@@ -14,37 +14,50 @@ internal static class ChunkCacheCli
     public const string Usage = """
         chunkcache: chunk-level KV reuse for .NET solutions and source trees (dotLLM research tool; CPU encoder)
 
-        usage: chunkcache <verb> [options]        chunkcache <verb> --help
+        usage: chunkcache <verb> [options]        chunkcache <verb> --help        chunkcache --help
 
-          build     scan a solution/directory, update the store's index, encode and store missing chunks
+          build     scan a solution/directory, update the store's index, encode and store (or queue on a server) the missing chunks
           select    choose chunks for a context: paths/globs, a symbol's neighbourhood, git changes; under a token budget
           status    which chunks are missing or stale (by file and line range), and store statistics
+          list      read-only inventory of one or more stores: entries and sizes, owner-lock state, each index's model and chunk counts
           evict     --server: ask the server to evict (orphans | path | namespace | all; dry run unless --apply);
                     --offline: list or delete orphans (or, with --mode all --model, one model's entries) holding the store's owner lock
           prewarm   --server: queue chunk texts (a selection or a --texts file) for the server to encode (text only)
           explain   --server: a dry run of the chunk_cache plan for a request file (POST /v1/chunk-cache/explain)
 
-        The server owns the model identity and every K/V write: build/prewarm/evict go through --server URL; --offline is the
-        escape hatch for a store no server owns. The API key is read from the CHUNKCACHE_API_KEY environment variable only.
+        Every verb's --help lists all of its options (value form, default, whether repeatable, environment variable), its exit codes,
+        its --json fields and examples. The server owns the model identity and every K/V write: build/prewarm/evict go through
+        --server URL; --offline is the escape hatch for a store no server owns.
 
-        exit codes: 0 ok; 1 error (I/O, busy store lock, model load, symbol not found, unreadable index);
-                    2 usage (unknown verb/option, missing or bad value); 3 strict failure (build --strict: skipped
-                    projects/load failures/excluded files; status --strict: not up to date or ledger unreadable)
+        global option: --verbose (any verb) adds the stack trace of an error to the message on stderr.
+        environment:   CHUNKCACHE_API_KEY is the API key for --server. It is read from the environment only (there is no key option).
+        output:        --json prints the result as one JSON document on stdout (snake_case names of the chunkcache_* MCP tool schemas);
+                       progress and warnings go to stderr. A failure prints {"error": {"code", "message", "exit_code"}} instead.
+
+        exit codes:
+          0  ok
+          1  error (I/O, busy store lock, store owned by a server or another writer, model load, symbol not found, unreadable index
+             or ledger, server error or unreachable server)
+          2  usage (unknown verb/option, missing or bad value)
+          3  strict failure (build --strict: skipped projects/load failures/excluded files; status --strict: not up to date or
+             ledger unreadable)
 
         Store layout: <store>/<2 hex>/<key>.ckv entries (F32 K/V), one index-<chunker>.<model12>.<p8>.default.json per chunker, model and producer (p8: 8 hex of the producer identity) (older index names are migrated by the next build),
         and chunkcache.json (the store registry: each index's model, tree root and source). build holds index-<chunker>.<model12>.<p8>.default.lock while it updates its index and <store>/.chunkstore.lock only briefly (registry save, each put); evict --apply holds .chunkstore.lock for its pass.
-        --json prints the result as one JSON document on stdout (snake_case names of the chunkcache_* MCP tool schemas);
-        progress and warnings go to stderr.
         """;
 
-    private static readonly Dictionary<string, (IReadOnlyDictionary<string, OptionKind> Spec, string Help, Func<CliContext, CliArgs, int> Run)> Verbs = new(StringComparer.Ordinal)
+    /// <summary>The verbs: option registry and help (<see cref="VerbDef"/>); the parser and <c>--help</c> both read it.</summary>
+    internal static IReadOnlyDictionary<string, VerbDef> Verbs => VerbDefs.All;
+
+    private static readonly Dictionary<string, Func<CliContext, CliArgs, int>> Runners = new(StringComparer.Ordinal)
     {
-        ["build"] = (BuildCommand.Spec, BuildCommand.Help, BuildCommand.Run),
-        ["select"] = (SelectCommand.Spec, SelectCommand.Help, SelectCommand.Run),
-        ["status"] = (StatusCommand.Spec, StatusCommand.Help, StatusCommand.Run),
-        ["evict"] = (EvictCommand.Spec, EvictCommand.Help, EvictCommand.Run),
-        ["prewarm"] = (PrewarmCommand.Spec, PrewarmCommand.Help, PrewarmCommand.Run),
-        ["explain"] = (ExplainCommand.Spec, ExplainCommand.Help, ExplainCommand.Run),
+        ["build"] = BuildCommand.Run,
+        ["select"] = SelectCommand.Run,
+        ["status"] = StatusCommand.Run,
+        ["evict"] = EvictCommand.Run,
+        ["prewarm"] = PrewarmCommand.Run,
+        ["explain"] = ExplainCommand.Run,
+        ["list"] = ListCommand.Run,
     };
 
     /// <summary>Runs one command line.</summary>
@@ -88,7 +101,7 @@ internal static class ChunkCacheCli
             output.WriteLine(Usage);
             return ExitCodes.Ok;
         }
-        if (!Verbs.TryGetValue(args[0], out var verb)) return Fail(ExitCodes.Usage, "usage", $"usage error: unknown verb '{args[0]}'.", extra: Usage);
+        if (!Verbs.TryGetValue(args[0], out VerbDef? verb) || !Runners.TryGetValue(args[0], out Func<CliContext, CliArgs, int>? run)) return Fail(ExitCodes.Usage, "usage", $"usage error: unknown verb '{args[0]}'.", extra: Usage);
         try
         {
             CliArgs parsed = CliArgs.Parse(args[0], args.Skip(1), verb.Spec);
@@ -98,11 +111,11 @@ internal static class ChunkCacheCli
                 return ExitCodes.Ok;
             }
             ctx.Json = parsed.Flag("json");
-            return verb.Run(ctx, parsed);
+            return run(ctx, parsed);
         }
         catch (UsageException ex)
         {
-            return Fail(ExitCodes.Usage, "usage", $"usage error: {ex.Message}", ex, verb.Help);
+            return Fail(ExitCodes.Usage, "usage", $"usage error: {ex.Message}", ex, verb.UsageHint);
         }
         catch (StrictFailureException ex)
         {

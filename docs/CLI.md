@@ -17,6 +17,7 @@ equivalent, device selection, KV-cache sizing, and the environment variables the
 - [Device selection](#device-selection)
 - [KV-cache sizing](#kv-cache-sizing)
 - [Commands](#commands): [model](#dotllm-model) - [list](#dotllm-list) - [run](#dotllm-run) - [chat](#dotllm-chat) - [serve](#dotllm-serve) - [ps](#dotllm-ps) - [stop](#dotllm-stop) - [bench](#dotllm-bench) - [perplexity](#dotllm-perplexity) - [embed](#dotllm-embed) - [debug](#dotllm-debug-debug-builds-only)
+- [Companion tool: chunkcache](#companion-tool-chunkcache)
 - [Environment variables](#environment-variables)
 
 ## Commands at a glance
@@ -721,6 +722,14 @@ printf 'one\ntwo\n' | dotllm embed Qwen/Qwen3-Embedding-0.6B-GGUF --device vulka
 Registered only in Debug builds of the CLI (they are absent from release packages): `debug gguf-header <file>`, `debug gguf-metadata <file>`, `debug gguf-tensors <file>`,
 `debug gguf-config <file>` (the ModelConfig derived from the metadata), `debug forward-pass <file> --prompt ...` (one forward pass with logit diagnostics),
 `debug tokenize <file> --text ...` (tokenize and verify the round trip) and `debug embed-lookup <file> --token-id N`. Run `dotllm debug <name> --help` in a Debug build for their options.
+
+## Companion tool: chunkcache
+
+`chunkcache` (project `tools/DotLLM.ChunkCache`, not packed) builds and inspects the chunk-level KV store that `dotllm serve --chunk-cache --chunk-store DIR` reads. Verbs:
+`build`, `select`, `status`, `list`, `evict`, `prewarm`, `explain`. It has its own parser and its own `--help` (`chunkcache <verb> --help` lists every option with its
+default, units and environment variable, the exit codes, the `--json` fields and examples), and uses the exit codes `0` ok, `1` runtime error,
+`2` usage error, `3` strict failure. The reference, with option tables generated from the same registry as `--help` and a guard test, is
+[CHUNK_CACHE_CLI.md](CHUNK_CACHE_CLI.md); its only environment variable is `CHUNKCACHE_API_KEY` (the key for `--server`, read from the environment only).
 
 ## Environment variables
 
