@@ -21,7 +21,9 @@ internal static class DeviceCli
     /// <summary>The <c>--device</c> option help shared by <c>run</c>, <c>chat</c> and <c>bench</c>.</summary>
     public const string OptionHelp =
         "Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - with a warning if it ends on the CPU), " +
-        "'cpu', 'vulkan', 'gpu'/'cuda', 'gpu:1'/'cuda:1'. An explicit GPU that cannot be honoured is an error, never a silent CPU run.";
+        "'cpu', 'vulkan' (the default Vulkan GPU), 'vulkan:N' (Vulkan physical device N), 'gpu'/'cuda' (CUDA device 0), " +
+        "'gpu:N'/'cuda:N' (CUDA ordinal N). Case-insensitive. An explicit GPU that cannot be honoured is an error, never a silent CPU run. " +
+        "Env: DOTLLM_VULKAN_DEVICE_INDEX picks the Vulkan device behind plain 'vulkan'.";
 
     /// <summary>Returns a user-facing error for an unrecognised <c>--device</c> value, else null.</summary>
     public static string? Validate(string? device) =>

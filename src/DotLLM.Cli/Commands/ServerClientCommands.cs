@@ -10,7 +10,7 @@ namespace DotLLM.Cli.Commands;
 internal class ServerClientSettings : CommandSettings
 {
     [CommandOption("--url")]
-    [Description("Server base URL (default: $DOTLLM_URL or http://localhost:8080).")]
+    [Description("Base URL of the running dotllm server. Default: the DOTLLM_URL environment variable, else http://localhost:8080 (the default of dotllm serve --port).")]
     public string? Url { get; set; }
 
     internal string BaseUrl => (Url ?? Environment.GetEnvironmentVariable("DOTLLM_URL") ?? "http://localhost:8080").TrimEnd('/');

@@ -42,7 +42,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         public string? PromptFile { get; set; }
 
         [CommandOption("--max-tokens|-n")]
-        [Description("Maximum number of tokens to generate.")]
+        [Description("Maximum number of tokens to generate (default 128). Also sizes the KV cache for this run: prompt tokens + this value, capped at the model's context length.")]
         [DefaultValue(128)]
         public int MaxTokens { get; set; } = 128;
 
@@ -266,23 +266,23 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
         /// <summary>Use paged KV-cache (block-based allocation).</summary>
         [CommandOption("--paged")]
-        [Description("Use paged KV-cache with block-based allocation instead of pre-allocated simple cache.")]
+        [Description(DotLLM.Cli.Helpers.KvStorageCli.PagedHelp)]
         [DefaultValue(false)]
         public bool Paged { get; set; }
 
         /// <summary>KV-cache key quantization type.</summary>
         [CommandOption("--cache-type-k")]
-        [Description("KV-cache key type: f32/f16, q8_0, q4_0. Synonym of --kv-quant-k. With --paged and neither K nor V given, Q8_0 blocks are used; pass f16 for both to keep F16.")]
+        [Description(DotLLM.Cli.Helpers.KvStorageCli.CacheTypeKHelp)]
         public string? CacheTypeK { get; set; }
 
         /// <summary>KV-cache value quantization type.</summary>
         [CommandOption("--cache-type-v")]
-        [Description("KV-cache value type: f32/f16, q8_0, q4_0. Synonym of --kv-quant-v.")]
+        [Description(DotLLM.Cli.Helpers.KvStorageCli.CacheTypeVHelp)]
         public string? CacheTypeV { get; set; }
 
         /// <summary>Mixed-precision window size for KV-cache quantization.</summary>
         [CommandOption("--cache-window")]
-        [Description("Mixed-precision window: recent N tokens in full precision (0 = all quantized). Only used when --cache-type-k or --cache-type-v is set.")]
+        [Description(DotLLM.Cli.Helpers.KvStorageCli.CacheWindowHelp)]
         [DefaultValue(0)]
         public int CacheWindow { get; set; }
 
