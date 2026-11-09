@@ -1,6 +1,7 @@
 # Vulkan paged KV-cache with in-place paged attention — design
 
-**Epic:** #1724. **Slices:** #1725 (S1) to #1730 (S6), section 6.
+**Epic:** #1724. **Slices:** #1725 (S1) to #1730 (S6) and #1733 (S7), section 6.
+**Owner decisions (2026-11-09) are folded in; see section 8 (RESOLVED / provisional).** First hosts are the Qwen3.5/3.6 hybrids (Bonsai-2 style), not the dense host.
 **Status:** design only (2026-11-09). No code, no measurements in this document: every number is either read
 from the repository (with the file) or labelled *unmeasured*.
 **Scope rule:** docs only. Nothing here was built or run; a benchmark was using the GPU while this was written.
@@ -14,9 +15,10 @@ from the repository (with the file) or labelled *unmeasured*.
 | D3 | Kernel change is **address-only** (`row -> physRow`). Arithmetic and reduction order untouched, so the oracle is **bit-exact** against the contiguous F16 cache. | 3.7, 4 |
 | D4 | **No gather/expansion fallback.** A host or cache type without an in-place paged kernel is refused with a named reason and keeps its own cache. | 3.8 |
 | D5 | Block size `B = 64` tokens by default (power of two, specialization constant), chosen by a decode sweep in S3. | 3.2 |
-| D6 | v1 element type is **F16** (the Vulkan dense default). Q8_0 uses the Flint 36-byte interleaved layout, later (S6). F32 only as a test oracle. | 3.6 |
+| D6 | v1 element type is **F16** (default, owner decision; the Vulkan default since #1151/#1102). Q8_0 is opt-in, uses the Flint 36-byte interleaved layout, later (S7). F32 only as a test oracle. | 3.6 |
 | D7 | The pool grows by **realloc with stable block ids** at forward boundaries (the #1100 contract), capped per slab by the device allocation limit. No chunked multi-binding in v1. | 3.1 |
 | D8 | Scheduler admission and the prefix trie move onto a backend-neutral allocator interface (S1), which also closes the same gap for CUDA. | 3.9 |
+| D9 | **First hosts: the Qwen3.5/3.6 hybrids** (`VulkanQwen3HybridDenseTransformerModel`, hd256, G = 6, F16 KV). Pool/cache, decode and prefill kernels target their attention layers first; trie hits on hybrids only at block boundaries that also have a recurrent checkpoint (#1286). Dense host, other hybrids, Q8_0 and sliding windows follow. | 3.5, 6 |
 
 "Parity with CUDA" is **not** the target. It is a floor that is too low (section 1).
 
@@ -58,16 +60,25 @@ Built from the dispatch in `VulkanTransformerModel.cs` (~3225-3350) and the narr
 
 | Kernel family | Used for | Shaders (F16 twin) | Paged twin needed | Cost drivers |
 |---|---|---|---|---|
-| Split-KV GQA v2 partial + merge | decode, `WouldSplit` (seqKv >= 17) | `attention_f32_splitkv_gqa_v2_kvf16`, `_kvq8`; merge reads no KV | partial: yes. merge: **unchanged** | 16 lanes/position, 8 columns/lane, TILE_KV 128, 4 KiB Q LDS + 4 KiB scores; hd <= 128 |
+| Split-KV GQA v2 partial + merge | decode, `WouldSplit` (seqKv >= 17) | `attention_f32_splitkv_gqa_v2_kvf16`, `_kvq8`; merge reads no KV | partial: yes (dense host: S6; hybrid hd256 uses the v1 GQA pass: S3). merge: **unchanged** | 16 lanes/position, 8 columns/lane, TILE_KV 128, 4 KiB Q LDS + 4 KiB scores; hd <= 128 |
 | Split-KV per-head (non-GQA) | decode, `G == 1` or fallback | `attention_f32_splitkv_kvf16` | yes | `kv_load.glsl` element loads |
 | Split-KV rows (small-row 2..4) | MTP/spec verify (MiMo, gpt-oss) | `attention_f32_splitkv_rows_kvf16` | yes | window-clipped span |
-| Sink variants (Flint, gpt-oss) | decode and prefill with sinks | `attention_sinks_f32_kvf16/_kvq8`, `attention_flash_gqa_cm_sinks_*` | S3 (decode), S6 (windowed models) | 256-row base alignment for bit-identity (#1176) |
-| GQA coopmat flash hd128/hd256 | prefill, G >= 2 | `attention_flash_gqa_cm_kvf16{,_hd128}` | yes (S4) | BC 32, K/V tile 32 x 264 f16 + scores + P = 30.5 KiB LDS of 32 KiB |
+| Sink variants (Flint, gpt-oss) | decode and prefill with sinks | `attention_sinks_f32_kvf16/_kvq8`, `attention_flash_gqa_cm_sinks_*` | S3 (decode), S7 (windowed models) | 256-row base alignment for bit-identity (#1176) |
+| GQA coopmat flash hd128/hd256 | prefill, G >= 2 | `attention_flash_gqa_cm_kvf16{,_hd128}` | yes (S4 for hd256; hd128 in S6) | BC 32, K/V tile 32 x 264 f16 + scores + P = 30.5 KiB LDS of 32 KiB |
 | GQA flash scalar | prefill fallback | `attention_flash_gqa_kvf16` | yes (S4) | |
-| Coopmat hd64 | prefill, seqKv >= 640, hd <= 64 | `attention_flash_f32_coopmat_f16act_hd64` family | yes (S4) | **21,504 B LDS, 341 B headroom to stay at 3 workgroups/WGP** |
+| Coopmat hd64 | prefill, seqKv >= 640, hd <= 64 | `attention_flash_f32_coopmat_f16act_hd64` family | yes (S6) | **21,504 B LDS, 341 B headroom to stay at 3 workgroups/WGP** |
 | Flash / coopmat / naive per-token | prefill fallbacks, short seqKv | `attention_flash_f32_kvf16`, `attention_f32_kvf16` | naive: yes (S3, doubles as the slow in-place prefill); others only if reachable | |
 | qpos (per-query-position) | selective recompute, chunk reuse | `attention_f32_qpos_kvf16`, `attention_flash_gqa_cm_qpos_kvf16` | yes (S4) | |
 | Not in v1 | MLA (`attention_mla_*`, own latent cache), QSA (`qsa_attention_*f16kv`), dflash, TurboQuant | | **refused** (section 3.8) | |
+
+**v1 scope after the owner decision (D9).** The first host is the Qwen3.5/3.6 dense hybrid, which reaches only a subset
+of the table: decode through the split-KV GQA pass at hd256 (it calls `SplitKvAttention.Record` for `seqLen == 1` when
+`WouldSplit`, `headDim <= 512`; the v2 pass is limited to hd <= 128), small-row split-KV for MTP verify, prefill through
+`EnsureGqaFlash` (GQA coopmat hd256 / scalar GQA flash / hd256 br flash) and the per-token fallbacks. **S3 and S4 cover
+exactly that subset.** The v2 decode pass, the hd128 and hd64 coopmat variants and the sink kernels belong to the dense
+host and later slices (S6, S7). The hybrid's writes are contiguous `convert_f32_to_f16_range` calls; its prefix snapshots
+currently copy the KV rows and clone the GDN state (`SequencePrefixSnapshot`), which the paged pool replaces with
+refcounted blocks plus the GDN clone.
 
 The KV **write** side also needs twins: the fused RoPE + KV write (`rope_kv_write_f32_kvf16`), the range converter
 (`convert_f32_to_f16_range`) and the row-scatter converter (`convert_f32_to_f16_rows`, which already takes positions from
@@ -229,7 +240,7 @@ happens at most once per `B` tokens per sequence, never per token.
 **Layer groups.** A block id is shared by all layers of a group. Layers with different needs must not share a table:
 Flint has 14 full layers and 35 windowed layers; releasing a block that the windowed layers no longer need would
 corrupt the full layers. So the cache has *KV groups*: `(rowStride, windowed|full)`. v1 has one group (uniform
-full-attention models). S6 adds the windowed group: its own table (hence its own arena region), its own block ids from
+full-attention models). S7 adds the windowed group: its own table (hence its own arena region), its own block ids from
 the same pool or a second pool, and **block release**: a block wholly below `pos - W + 1` is released (refcount drop) and
 its table entry set to block 0. Existing kernels already compute `kvStart = max(0, pos - W + 1)` and skip earlier tiles
 (split-KV `kvStart`, flash window-start tile skip), so they never read the hole entries. This replaces the compact ring
@@ -237,12 +248,26 @@ its table entry set to block 0. Existing kernels already compute `kvStart = max(
 released windowed blocks is not possible and the trie must treat a windowed-group prefix as match-able only while its
 blocks are alive (mirrors `CanTruncateTo`).
 
-**Hybrid (GDN / Mamba / Nemotron-H / Qwen3.5 / LFM2).** KV exists only on attention layers: `KvGeometry.SlotOfLayer`
-gives the slot, and the pool allocates slabs for attention slots only (as `VulkanNemotronHKvCache` already does).
-Recurrent state (`VulkanGdnStateCache`, SSM, conv state) stays per-sequence fixed-size and is **not paged**. A trie hit on
-a hybrid is valid only where the recurrent state at that block boundary is also available: this reuses the recurrent
-prefix snapshots and step checkpoints (#1286, `RecurrentPrefixCacheEntries`). So hybrids page their KV (memory and
-concurrency win) but trie-hit only at checkpointed boundaries. This is S6 and depends on S5.
+**Hybrid (Qwen3.5/3.6 first; then Qwen3MoeHybrid / Nemotron-H / LFM2). First-class, not an extension (D9).** KV exists
+only on attention layers: `KvGeometry.SlotOfLayer` gives the slot, and the pool allocates slabs for attention slots only
+(as `VulkanNemotronHKvCache` already does; Bonsai-2: 16 attention layers, 64 KiB/token F16). Recurrent state
+(`VulkanGdnStateCache`, SSM, conv state) stays per-sequence fixed-size and is **not paged**, but its lifetime is tied to
+the paged cache's: a sequence owns one table slot and one GDN slot, released together on completion, failure or
+cancellation. Consequences:
+
+- **Trie hit rule.** A block-trie match is usable only at a block boundary for which the recurrent state is also
+  available (a checkpoint from the #1286 step checkpoints / `RecurrentPrefixCacheEntries`). KV blocks up to the boundary
+  are shared by refcount; the GDN state is restored from the checkpoint (`Clone`). A deeper KV match with no checkpoint
+  is a miss at that depth; the lookup falls back to the deepest boundary that has one. S1 gives the trie an optional
+  boundary-validity predicate for this; with no predicate (dense models) behaviour is unchanged.
+- **Snapshots.** Today `SequencePrefixSnapshot` copies the KV prefix (`SnapshotPrefix`) and clones GDN state. With paged
+  blocks the KV half becomes refcounts (no copy, no transient bytes); only the GDN clone (tens of MB on a 4B hybrid)
+  remains, so checkpointing every K-th block is much cheaper than today.
+- **Rollback / MTP.** KV rollback is length-only; GDN state cannot roll back, so speculative/MTP verify keeps using its
+  existing state checkpoint (unchanged), and the paged cache must not free blocks a checkpointed prefix still references.
+- **Failure mode to test.** Restoring KV blocks without the matching GDN state produces plausible but wrong text; the S5
+  identity test has a mutant for exactly that.
+- **Memory.** Concurrency on a hybrid is bounded by GDN slots as well as KV blocks; admission checks both.
 
 **Other cache types stay as they are in v1:** MLA latent cache, Qwen4-Exp QSA gather caches, dflash ring, pipeline
 (two-device) caches.
@@ -253,7 +278,7 @@ concurrency win) but trie-hit only at checkpointed boundaries. This is S6 and de
 |---|---|---|
 | F16 | **yes** | The Vulkan dense default since #1151. Every kernel in 2.1 has an F16 twin; the paged twin changes only the row index. Bytes/token Qwen3-4B 144 KiB. |
 | F32 | oracle only | Allowed as a reference/baseline per CLAUDE.md rule 1, used through the *existing contiguous* F32 cache, not a paged F32 pool. No new F32 hot-path store. |
-| Q8_0 | S6 | Must use the Flint interleaved layout (`kv_load.glsl` `KV_Q8`: 36-byte blocks `[float scale][32 x int8]`, rows a multiple of 32). A paged row is `stride/32 * 36` bytes, so `KV_K(physRow * stride + col)` works unchanged. Must **not** use `VulkanQuantizedKvCache`'s split scale/quant layout, which dequantizes the full history into an F32 scratch (the defect described in KV_CACHE.md "feasibility, #1550"). Twins exist today only for split-KV decode, sink kernels and the sink coopmat prefill; the generic GQA flash/coopmat/qpos paths have none, so S6 includes writing them. |
+| Q8_0 (opt-in) | S7 | Must use the Flint interleaved layout (`kv_load.glsl` `KV_Q8`: 36-byte blocks `[float scale][32 x int8]`, rows a multiple of 32). A paged row is `stride/32 * 36` bytes, so `KV_K(physRow * stride + col)` works unchanged. Must **not** use `VulkanQuantizedKvCache`'s split scale/quant layout, which dequantizes the full history into an F32 scratch (the defect described in KV_CACHE.md "feasibility, #1550"). Twins exist today only for split-KV decode, sink kernels and the sink coopmat prefill; the generic GQA flash/coopmat/qpos paths have none, so S7 includes writing them. |
 | Q4_0 | later | Blocked on the #1550 nibble-order check. |
 | TurboQuant | **refused** | `VulkanTurboQuantKvCache` dequantizes into a shared F32 scratch; paged TurboQuant needs an in-place decode-and-attend kernel first. |
 
@@ -304,7 +329,7 @@ classifies it as a defect to remove, not a cost to budget. Therefore:
 1. Paged mode is only enabled for a (host, cache type, kernel path) combination for which **every** attention dispatch it
    can reach has an in-place paged twin. The admission check lives in one function
    (`VulkanPagedKvSupport.Check(model, kvType, config)`) that returns `ok` or a named reason (`"MLA latent cache"`,
-   `"attention sinks on a full-history group (S6)"`, `"Q8_0 twin for qpos missing"`, ...).
+   `"attention sinks on a full-history group (S7)"`, `"Q8_0 twin for qpos missing"`, ...).
 2. A refused combination uses the model's own contiguous cache and **logs the reason** (never the current silent text).
 3. The in-place per-token prefill kernel (S3) is slow but correct and bounded; it is not an "expansion fallback" because
    it allocates nothing. If a shape has no in-place twin at all, the request is refused at admission, not served via a
@@ -319,14 +344,14 @@ classifies it as a defect to remove, not a cost to budget. Therefore:
   blocks, bytes per block, allocate, addref, release) and `IBlockSeededKvCache` (`SeedSharedBlocks`,
   `SnapshotFullBlocks`, ids). `CudaKvBlockPool` / `CudaPagedKvCache` already have the methods, so S1 also removes CUDA's
   "not wired to the scheduler" gap (a separate CUDA issue consumes it).
-- **Admission by bytes (S5).** Today the Vulkan scheduler (opt-in, hybrids only) bounds concurrency at
+- **Admission by bytes (S5).** Today the Vulkan scheduler (opt-in, hybrids only, which is why the hybrid host goes first) bounds concurrency at
   `MaxActiveSequences = 8` ("no byte-budget admission without a paged pool"). With the pool, admission is
   `FreeBlocks >= blocksNeeded(prompt) + ReserveBlocksPerSequence`, with eviction of zero-ref trie leaves first (the
   existing `TryEvict` logic), then queue. An idle sequence holds no device bytes beyond its table slot.
-- **Dense-host `ForwardBatch`.** `ForwardBatchSimple` currently peels off caches that are not `VulkanKvCache`, and copies
+- **Dense-host `ForwardBatch` (S6; the hybrid host already runs sequences through its per-sequence `ForwardBatch` and the opt-in Vulkan scheduler).** `ForwardBatchSimple` currently peels off caches that are not `VulkanKvCache`, and copies
   each sequence's K/V slice into its own cache. For paged caches it scatter-writes straight from the batched K/V buffers
   through the table, removing the per-sequence slice copy. Attention stays per-sequence. `SupportsThreadedSequenceState`
-  is not set on the dense host today; S5 audits whether the shared scratch needs per-sequence state or whether the
+  is not set on the dense host today; S6 audits whether the shared scratch needs per-sequence state or whether the
   existing model gate suffices.
 - **Trie vs `PrefixCache` (#1591).** On the paged path the block trie supersedes the whole-cache `PrefixCache`
   (the engine already gives the trie precedence). The #1591 path remains for non-paged Vulkan. `cached_tokens` becomes
@@ -341,14 +366,13 @@ classifies it as a defect to remove, not a cost to budget. Therefore:
   corresponding `RunCommand` / `ChatCommand` branches (which today print other "not supported" warnings).
 - `--paged` / `UsePaged` semantics: serve's `UsePaged` defaults to true, so it cannot distinguish "user asked" from
   "default". Introduce a tri-state (Auto / On / Off): `--no-paged` = Off (always wins); `--paged` = On (error or warning
-  with the named reason if unsupported, not silent); neither = Auto. **Auto on Vulkan stays contiguous until the S5
-  default-flip gate passes**, then becomes paged when `Check` says ok. `DOTLLM_VK_PAGED=1|0` overrides for A/B and
+  with the named reason if unsupported, not silent); neither = Auto. **Auto on Vulkan stays contiguous until S5 passes and an RTX 3060 run is done (RESOLVED, OQ1)**, then becomes paged when `Check` says ok. `DOTLLM_VK_PAGED=1|0` overrides for A/B and
   rollback.
 - Startup logs (replace the current line):
   - `[dotllm] Using Vulkan paged KV-cache (f16 blocks of 64 tokens, pool 6.0 GiB (41,984 blocks), in-place attention, max 4 sequences)`
   - `[dotllm] Paged KV-cache not used on Vulkan for <architecture>: <named reason>; using the model's own KV-cache.`
 - `--cache-type-k/-v`: unset or `f16` -> F16 blocks; `f32` -> contiguous F32 cache (the oracle), with a note; `q8_0` ->
-  S6 (refused with reason before); others -> refused with reason.
+  S7 (refused with reason before); others -> refused with reason.
 - `--kv-pool` sizing flags (name and default are OQ3).
 
 ### 3.11 Failure modes to design against
@@ -401,7 +425,7 @@ a bound that scales with sqrt(seqKv), not a fixed one.
 Record in each PR which mutants were applied and which died. Commit before applying mutants (a `git checkout --` wipes the
 implementation).
 
-**4.5 End to end.** Greedy text identity, paged vs contiguous F16, on Qwen3-4B Q4_K_M and Llama-3.2-1B at ctx 512 and 8K,
+**4.5 End to end.** Greedy text identity, paged vs contiguous F16, on Bonsai-2 (S3-S5, MTP verify included) and, from S6, Qwen3-4B Q4_K_M and Llama-3.2-1B, at ctx 512 and 8K,
 256 tokens x several prompts, both A/B orders, plus logits equality on the first N steps (perplexity cannot see
 decode-path changes). Under the scheduler (S5) the oracle is the **contiguous cache under the same `ForwardBatch`
 schedule**, not a solo run: batched GEMM and GEMV rows are not bit-identical. Prefix reuse: `cached_tokens` exact and a
@@ -437,18 +461,19 @@ leg is optional but listed.
 
 | Slice | Issue | Scope | Depends on | Effort | Risk |
 |---|---|---|---|---|---|
-| S1 | #1725 | Backend-neutral `IKvBlockAllocator` / `IBlockSeededKvCache`; trie, manager and scheduler off the CPU concrete types. CPU-testable. Also unblocks CUDA's scheduler gap. | none | M, 3-4 d | low-medium |
-| S2 | #1726 | `VulkanKvBlockPool` (slabs, budget, growth, canary), table arena + in-cmdbuf updates, `VulkanPagedKvCache`, write twins, CoW, rollback, row IO; device-limit probe. No attention. | none (S1 optional) | L, 1-1.5 w | medium |
-| S3 | #1727 | Paged decode twins (split-KV GQA v2, per-head, rows, sinks) + per-token twin (slow in-place prefill); dense-host single-sequence wiring; `DOTLLM_VK_PAGED` opt-in; block-size sweep. | S2 | L, 1-1.5 w | high (VGPR cliff) |
-| S4 | #1728 | Paged prefill twins (GQA coopmat hd128/hd256, hd64, scalar GQA flash, qpos). | S2; S3 first recommended | L-XL, 1.5-2 w | highest (LDS cliff) |
-| S5 | #1729 | Dense-host `ForwardBatch` with paged caches, byte-budget admission, Vulkan trie, `/v1/prompt-cache`, tri-state paged mode, default-flip gate incl. dGPU run. | S1, S3, S4 | L, 1-1.5 w | medium |
-| S6 | #1730 | Q8_0 blocks (interleaved layout) + twins, sliding-window layer groups with block release, hybrid hosts (attention slots, trie at recurrent checkpoints). Split into issues when started. | S3, S4 (S5 for hybrids) | XL | high |
+| S1 | #1725 | Backend-neutral `IKvBlockAllocator` / `IBlockSeededKvCache`; trie, manager and scheduler off the CPU concrete types; trie boundary-validity predicate (hybrid checkpoints). CPU-testable. Also unblocks CUDA's scheduler gap. | none | M, 3-4 d | low-medium |
+| S2 | #1726 | `VulkanKvBlockPool` (slabs for attention slots, budget, growth, canary), table arena + in-cmdbuf updates, `VulkanPagedKvCache`, write twins, CoW, rollback, snapshots by refcount, row IO, GDN-slot pairing; device-limit probe. No attention. | none (S1 optional) | L, 1.5 w | medium |
+| S3 | #1727 | Hybrid-host decode twins (split-KV GQA hd256, small-row, per-token = slow in-place prefill); `VulkanQwen3HybridDenseTransformerModel` wiring; `DOTLLM_VK_PAGED` opt-in; block-size sweep. | S2 | L, 1-1.5 w | high (VGPR cliff) |
+| S4 | #1728 | Hybrid-host prefill twins (GQA coopmat hd256, scalar GQA flash, hd256 br flash, qpos if reached); chunked prefill through paged caches. | S2; S3 first recommended | L-XL, 1.5-2 w | highest (LDS cliff, hd256 at 30.5 of 32 KiB) |
+| S5 | #1729 | Hybrid-host scheduler with paged caches + GDN slots, byte-budget admission, Vulkan block trie with recurrent-checkpoint hits (#1286), `/v1/prompt-cache`, tri-state paged mode, **default flip after S5 + RTX 3060 run**, `DOTLLM_VK_PAGED=0` rollback. | S1, S3, S4 | XL, 2 w | high (KV/recurrent consistency) |
+| S6 | #1730 | Dense host (split-KV v2, hd128/hd64 coopmat, `ForwardBatch` scatter-write) and other hybrid hosts (Qwen3MoeHybrid, Nemotron-H, LFM2). | S3, S4, S5 | L-XL, 2 w | high (hd64 LDS cliff) |
+| S7 | #1733 | Q8_0 blocks (opt-in, interleaved layout) + twins; sliding-window layer groups with block release; sink twins. Split into issues when started. | S3, S4 (S6 for windowed dense) | XL | high |
 
-Merge order: S1 and S2 in parallel, then S3, S4 (parallelizable after the ABI is frozen in S2 and the block size is fixed in
-S3), then S5, then S6 items. S3 alone is usable (decode in place, slow in-place prefill) behind the opt-in switch, so each
-slice leaves `dev` green and the default unchanged until S5.
+Merge order: S1 and S2 in parallel, then S3 and S4 (parallelizable after the ABI is frozen in S2 and the block size is fixed
+in S3), then S5 (default flip for the hybrid host), then S6, then S7. S3 alone is usable (hybrid decode in place, slow
+in-place prefill) behind the opt-in switch, so each slice leaves `dev` green and the default unchanged until S5.
 
-Totals: roughly 6-8 engineer-weeks for S1-S5 (default-on for the dense F16 host), S6 open-ended.
+Totals: roughly 8-10 engineer-weeks for S1-S5 (default-on for the Qwen3.5/3.6 hybrids; the recurrent-checkpoint work in S5 and the hd256 kernels in S4 are the added cost versus a dense-first plan), about 2 more for S6, S7 open-ended.
 
 ## 7. Risks
 
@@ -462,24 +487,32 @@ Totals: roughly 6-8 engineer-weeks for S1-S5 (default-on for the dense F16 host)
 7. **Default flip** changes `serve` behaviour for every Vulkan user: gated, env rollback.
 8. **Bit-exact claim** holds only while kernels stay address-only; any later partition change needs its own oracle.
 
-## 8. Open questions for James
+## 8. Decisions and open questions
 
-1. **OQ1 default-flip policy.** Should Vulkan `serve` default to paged (Auto) as soon as S5 passes the gates, or stay
-   opt-in for one release? Recommendation: flip after S5 + RTX 3060 run, with `DOTLLM_VK_PAGED=0` rollback.
-2. **OQ2 default block type.** CPU paged defaults to Q8_0 (#1284) but on Vulkan Q8_0 measured slower and lower quality
-   than F16 (#1605). Recommendation: F16 on Vulkan; Q8_0 opt-in in S6. Agree?
-3. **OQ3 pool sizing.** Default pool budget and flag name (`--kv-pool-gib`? fraction of post-load headroom?) and the
+**RESOLVED (owner, 2026-11-09):**
+
+1. **OQ1 default-flip policy: RESOLVED.** Flip Vulkan `serve` to paged (Auto) after S5 **and** an RTX 3060 run, with
+   `DOTLLM_VK_PAGED=0` as the rollback.
+2. **OQ2 default block type: RESOLVED.** F16 is the default; Q8_0 is opt-in (S7).
+3. **OQ4 scope of v1 hosts: RESOLVED.** The Qwen3.5/3.6 hybrids (Bonsai-2 style) come **first**, not the dense host. The
+   slices were re-cut: S2 builds the pool for attention slots, S3/S4 target the hybrid's hd256 kernels, S5 owns the hybrid
+   scheduler and trie with recurrent checkpoints (#1286); the dense host and other hybrids are S6; Q8_0 and sliding
+   windows are S7.
+4. **OQ5 CUDA follow-up: RESOLVED (approved).** S1 unblocks CUDA's scheduler/trie wiring and #1270, and the CUDA gather
+   default (a rule 2 violation) should be removed; the coordinator opens that issue separately.
+
+**Provisional, awaiting James (recommendations only):**
+
+5. **OQ3 pool sizing (provisional, awaiting James).** Flag name (`--kv-pool-gib`? fraction of post-load headroom?) and
    initial size. Recommendation: initial = min(one window, 32K tokens) x 2 sequences, grow to 40 % of canary-admitted
-   headroom, cap by slab limit.
-4. **OQ4 scope of v1 hosts.** Dense F16 host only (Llama/Mistral/Qwen/Phi), with sliding-window, hybrids and Q8_0 in S6?
-   Or should the Qwen3.5/3.6 hybrids (Bonsai-2) come first because they are the main local models?
-5. **OQ5 CUDA.** S1 unblocks CUDA's scheduler/trie wiring and #1270. Should a CUDA follow-up be opened now, and should the
-   CUDA gather default also be removed to meet rule 2 (it currently violates it)?
-6. **OQ6 discrete-GPU access.** The Framework RTX 3060 is the only dGPU Vulkan box and is flaky/contended. Acceptable to
-   gate default-on on it, or is there a better window or a Kaggle-style alternative for the Vulkan leg?
-7. **OQ7 split rounding.** Allow a later, separately measured change that rounds split boundaries to multiples of `B`
-   (faster, changes reduction order, drops bit-exactness for that kernel)?
-8. **OQ8 Arc.** Is an Intel Arc run required for sign-off, or best-effort?
+   headroom, cap by slab limit. On the hybrids the GDN slots also bound concurrency.
+6. **OQ6 discrete-GPU access (provisional, awaiting James).** The Framework RTX 3060 is the only dGPU Vulkan box, is
+   flaky/contended, and is now a hard gate for the default flip. Recommendation: schedule a dedicated window before S5
+   completes; no better alternative identified.
+7. **OQ7 split rounding (provisional, awaiting James).** Allow a later, separately measured change that rounds split
+   boundaries to multiples of `B` (faster, changes reduction order, drops bit-exactness for that kernel).
+   Recommendation: not in v1; revisit after S3 numbers.
+8. **OQ8 Arc (provisional, awaiting James).** Recommendation: best-effort, not a sign-off gate.
 
 ## 9. References
 
