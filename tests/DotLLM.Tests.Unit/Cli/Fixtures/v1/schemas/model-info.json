@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dotllm model info --json (version 1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "repo", "downloads", "likes", "tags", "gguf_files"],
+  "properties": {
+    "version": {"type": "integer", "enum": [1]},
+    "repo": {"type": "string"},
+    "author": {"type": "string"},
+    "downloads": {"type": "integer"},
+    "likes": {"type": "integer"},
+    "pipeline": {"type": "string"},
+    "tags": {"type": "array", "items": {"type": "string"}},
+    "local_path": {"type": "string"},
+    "gguf_files": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["filename", "size_bytes", "quant", "local"],
+      "properties": {"filename": {"type": "string"}, "size_bytes": {"type": "integer"}, "quant": {"type": "string"}, "local": {"type": "boolean"}}}}
+  }
+}

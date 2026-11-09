@@ -3,6 +3,7 @@ namespace DotLLM.Cli.Commands;
 /// <summary>JSON output DTO for <c>dotllm list --json</c> / <c>dotllm model list --json</c>.</summary>
 internal sealed record ModelListJsonResult
 {
+    public required int Version { get; init; }
     public required ModelListJsonModel[] Models { get; init; }
     public required ModelListJsonProfile[] Profiles { get; init; }
 }

@@ -175,7 +175,7 @@ Also available as the top-level [`dotllm list`](#dotllm-list).
 <!-- BEGIN options:model list -->
 | Option | Default | Env | Description |
 |---|---|---|---|
-| `--json` | off |  | Print one JSON object {"models": array, "profiles": array} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout. |
+| `--json` | off |  | Print one JSON object {"version": 1, "models": array, "profiles": array} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout. |
 | `--paths` | off |  | Add a Path column (full file path) to the model table. Always present in --json output. |
 <!-- END options:model list -->
 
@@ -185,6 +185,7 @@ Also available as the top-level [`dotllm list`](#dotllm-list).
 | Option | Default | Env | Description |
 |---|---|---|---|
 | `<repo-id>` |  |  | HuggingFace repository ID (e.g. 'TheBloke/Llama-2-7B-GGUF'). |
+| `--json` | off |  | Print one JSON object {"version": 1, repo, author, downloads, likes, pipeline, tags, local_path, gguf_files: array} instead of tables (file: filename, size_bytes, quant, local). A failure (unknown repo, no network) prints {"error": {code, message, exit_code}} on stdout and exits 1. Nothing else is written to stdout. |
 <!-- END options:model info -->
 
 #### dotllm model delete
@@ -290,7 +291,7 @@ dotllm list --json           # {"models":[{repo,filename,quant,size_bytes,path,d
 <!-- BEGIN options:list -->
 | Option | Default | Env | Description |
 |---|---|---|---|
-| `--json` | off |  | Print one JSON object {"models": array, "profiles": array} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout. |
+| `--json` | off |  | Print one JSON object {"version": 1, "models": array, "profiles": array} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout. |
 | `--paths` | off |  | Add a Path column (full file path) to the model table. Always present in --json output. |
 <!-- END options:list -->
 
@@ -589,6 +590,7 @@ dotllm ps --url http://gpu-box:8080
 <!-- BEGIN options:ps -->
 | Option | Default | Env | Description |
 |---|---|---|---|
+| `--json` | off |  | Print one JSON object {"version": 1, "url", "models": array, "device_warning"} instead of a table (model: id, active, device, size_bytes, idle_seconds, expires_in_seconds). A failure prints {"error": {code, message, exit_code}} on stdout. Nothing else is written to stdout. |
 | `--url` `<text>` | unset | `DOTLLM_URL` | Base URL of the running dotllm server. Default: the DOTLLM_URL environment variable, else http://localhost:8080 (the default of dotllm serve --port). |
 <!-- END options:ps -->
 

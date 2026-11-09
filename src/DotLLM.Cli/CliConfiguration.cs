@@ -3,6 +3,7 @@ using DotLLM.Cli.Commands;
 #if DEBUG
 using DotLLM.Cli.Commands.Debug;
 #endif
+using Spectre.Console;
 using Spectre.Console.Cli;
 
 namespace DotLLM.Cli;
@@ -13,6 +14,22 @@ namespace DotLLM.Cli;
 /// </summary>
 internal static class CliConfiguration
 {
+    /// <summary>Exit code of a usage error (unknown command or option, missing argument). Shared exit-code table: 0 ok, 1 runtime error, 2 usage, 3 strict/check failure.</summary>
+    internal const int UsageExitCode = 2;
+
+    /// <summary>
+    /// Prints the same text as Spectre's default handler but returns the documented exit codes: 2 for a command-line usage error,
+    /// 1 for any other failure (Spectre's own default is a code that cannot be told apart).
+    /// </summary>
+    private static int HandleException(Exception ex, ITypeResolver? resolver)
+    {
+        if (ex is CommandRuntimeException { Pretty: { } pretty })
+            AnsiConsole.Write(pretty);
+        else
+            AnsiConsole.WriteException(ex, ExceptionFormats.ShortenEverything);
+        return ex is CommandRuntimeException ? UsageExitCode : 1;   // parse errors and missing arguments are both CommandRuntimeException
+    }
+
     /// <summary>Registers every command, branch, description and example.</summary>
     public static void Configure(IConfigurator config)
     {
@@ -24,6 +41,8 @@ internal static class CliConfiguration
         // exception (type, message, stack) with DOTLLM_DEBUG_ERRORS=1.
         if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_DEBUG_ERRORS"), "1", StringComparison.Ordinal))
             config.PropagateExceptions();
+        else
+            config.SetExceptionHandler(HandleException);
         // The assembly informational version (0.3.0-dev.N+sha), not a literal: a harness must be able to
         // tell which build it is talking to (#774).
         config.SetApplicationVersion(DotLLM.Core.BuildInfo.Version);
@@ -54,7 +73,8 @@ internal static class CliConfiguration
 
             model.AddCommand<ModelInfoCommand>("info")
                 .WithDescription("Show details (files, sizes, quantizations) for a Hugging Face model repository, and which are already local.")
-                .WithExample("model", "info", "TheBloke/Llama-2-7B-GGUF");
+                .WithExample("model", "info", "TheBloke/Llama-2-7B-GGUF")
+                .WithExample("model", "info", "TheBloke/Llama-2-7B-GGUF", "--json");
 
             model.AddCommand<ModelDeleteCommand>("delete")
                 .WithAlias("rm")
@@ -120,7 +140,8 @@ internal static class CliConfiguration
         config.AddCommand<PsCommand>("ps")
             .WithDescription("List the models a running dotllm server has loaded: active flag, device, size, idle time and auto-unload countdown. Server URL: --url, else $DOTLLM_URL, else http://localhost:8080. For models on disk use 'dotllm list'.")
             .WithExample("ps")
-            .WithExample("ps", "--url", "http://localhost:8080");
+            .WithExample("ps", "--url", "http://localhost:8080")
+            .WithExample("ps", "--json");
 
         config.AddCommand<StopCommand>("stop")
             .WithDescription("Unload one model, all models (--all) or the whole server (--server) of a running server. Needs the server to be started with --allow-model-admin.")
