@@ -10,6 +10,8 @@ could not be sourced, or that predate large changes, are listed under [Needs re-
 
 Refreshed 2026-11-02 (Flint smoke, pruned Qwen3.8-Flash-Next Coder, Flash-Next UD-IQ4_XS, tiled dense prefill; sections 2.2 and 2.6-2.9): those figures were measured on Strix Halo Vulkan that week against llama.cpp upstream master `dde879bc` (Vulkan) unless stated, on a noisy box, so only ranges are quoted.
 
+Refreshed 2026-11-09 ([section 2.11](#211-bench-round-2026-11-09-twil-8b-lfm3-pr-replays), [4.4](#44-twil-8b-q4_k_m-cpu-thread-sweep)): TwIL-8B Vulkan and CPU, LFM3-1.7B deep prefill after #1687, and replays of the throughput claims of #1687 / #1688 / #1693 / #1694 / #1717, all against dotLLM `dev` `157dc8ee` and llama.cpp `74ade5274` (TwIL) / `dde879bc` (LFM3), interleaved, ranges over 2-3 rounds. The box was **not idle** in that window (persistent ~16-22 % CPU baseline from two spinning `sshd` sessions, `dwm` and Docker, plus intermittent build/test bursts from other sessions); each block was gated and re-run on bursts and its contention is recorded in its raw log, which is kept locally (not in the repo).
+
 How to read the build columns: `0ae0e1976` = llama.cpp master (Vulkan `llama-server` / `llama-bench`), `b11739` =
 llama.cpp CPU (Bolt), `b9016` = llama.cpp CPU `llama-server --embeddings`, `b9041` = llama.cpp CPU/CUDA of the May-2026
 baseline, `b87ca7225` = the PrismML llama.cpp fork (CUDA; the only llama.cpp that loads PQ2_0).
@@ -33,6 +35,10 @@ baseline, `b87ca7225` = the PrismML llama.cpp fork (CUDA; the only llama.cpp tha
 | Qwen3.6-35B-A3B UD-Q4_K_M | Vulkan, Strix Halo | plain / MTP K=2..4 (opt-in) | 0.88 / 0.62-0.85 (superseded, see 2.4) | [2.4](#24-qwen36-35b-a3b-vulkan-strix-halo) |
 | LFM3-1.7B Q8_0 | Vulkan, Strix Halo 8060S | pp512 / pp2048 / tg128 | 0.86 / 0.72 / 0.94-0.96 | [2.10](#210-liquid-ai-lfm3-17b-q8_0-vulkan-strix-halo) |
 | LFM3-1.7B Q8_0 | Vulkan, Strix Halo | pp16384 / pp32768 / tg @32K | before #1572: **0.31 / 0.21 / 0.47**; after the sliding-window fix and #1666 (contended session, 2.10): ~0.5-0.63 / ~0.46-0.48 / ~1.1 | [2.10](#210-liquid-ai-lfm3-17b-q8_0-vulkan-strix-halo) |
+| LFM3-1.7B Q8_0 | Vulkan, Strix Halo, **2026-11-09 re-measure after #1687** | pp16384 / pp32768 / tg64 @16K | **0.89 / 0.91 / 0.80** (supersedes the two rows above for the deep rows) | [2.11](#211-bench-round-2026-11-09-twil-8b-lfm3-pr-replays) |
+| TwIL-8B Q4_K_M-balanced (Granite dense) | Vulkan, Strix Halo, 2026-11-09 | pp512 / pp4096 / pp16384 | **1.13 / 1.40 / 1.75** | [2.11](#211-bench-round-2026-11-09-twil-8b-lfm3-pr-replays) |
+| TwIL-8B Q4_K_M-balanced | Vulkan, Strix Halo, 2026-11-09 | tg64 @ 0 / 4K / 16K / 32K | 0.87 / 0.71 / 0.51 / 0.41 | [2.11](#211-bench-round-2026-11-09-twil-8b-lfm3-pr-replays) |
+| TwIL-8B Q4_K_M-balanced | CPU, Ryzen AI Max+ 395, 8-32 threads, 2026-11-09 | pp512 / tg64 | 0.45-0.58 / 0.47-0.87 (best tg at 24 threads; 32 threads collapses) | [4.4](#44-twil-8b-q4_k_m-cpu-thread-sweep) |
 | LFM3-1.7B Q8_0 / Q4_K_M | CPU, Ryzen AI Max+ 395 (32 thr) | pp512 / tg128 | **0.41 / 0.87** (Q8_0), **0.28 / ~1.0** (Q4_K_M) | [4.3](#43-liquid-ai-lfm3-17b-cpu) |
 | Llama-3.2-1B Q4_K_M / pure Q3_K | CPU | perplexity gap | +0.032 % / +0.093 % | [5](#5-quality-parity) |
 | Embedding encoders (bge, MiniLM, nomic, ...) | CPU (32 thr) | docs/s | ~0.4-0.6 (indicative, derived) | [6](#6-embeddings) |
@@ -255,6 +261,61 @@ them) and min-max for dotLLM. LFM3 is a conv + sliding-window (256) + global-att
 - **Update 2026-11-07, global-attention layers (PR #1687, issue #1572 remainder; dotLLM-only, INDICATIVE: box under heavy build load from ~10 sibling agents, no llama.cpp arm, single runs).** Global layers prefill on the GQA-grouped coopmat flash kernel (`DOTLLM_VK_LFM3_GLOBAL_GQA=0` restores the per-head kernel), and long prefills are sliced progressively (each slice sized at its own KV depth, 2x growth cap, attention cost scaled by depth beyond the fitted depth). GPU-timestamp stage profile at pp16384 (`DOTLLM_VULKAN_MOE_STAGE_PROFILE=1 DOTLLM_VK_STAGE_TS=1`): global attention 4966 ms of 8317 ms (60 %) with the per-head kernel vs 1044 ms of 4323 ms (24 %) with the GQA kernel; FFN (2221 ms, 51 %) is now the largest stage. Interleaved A/B pp16384 `-n 16` (old, new, old, new; second pair quoted): old 1657, new 2435 pp tok/s. Ladder (new, `-n 8|1`): pp28672 2554-3157, pp65536 1542-1804 (the #1672 ladder had 1261-1268 and 522); longest one-layer submit at 64K ~0.8 s (per-slice GPU totals), no device loss. Re-measure against llama.cpp in a quiet window (replay commands in PR #1687); tg rows not re-measured.
 
 
+### 2.11 Bench round 2026-11-09: TwIL-8B, LFM3 and PR replays, Strix Halo Vulkan
+
+Source: bench round of 2026-11-09 (issues #1669 / #1675 / #1718, PRs #1687 #1688 #1693 #1694 #1717). dotLLM `dev` `157dc8ee`
+(Release, `DotLLM.Cli bench`), llama.cpp Vulkan `llama-bench` build `74ade5274 (9672)` for TwIL and `dde879bc` for LFM3 (the 9672 build
+does not load LFM3). Strix Halo 8060S (gfx1151), 512 MB BIOS VRAM split, `Strix:GPU` held, arms interleaved per round (each cell is a
+range over rounds of the within-round median; `n` = rounds). Box contention: see the 2026-11-09 note at the top of this page.
+Models: `webAI-Official/TwIL-8B` `TwIL-8B-Q4_K_M-balanced.gguf` (5.35 GB), `LiquidAI/LFM3-1.7B-GGUF` `LFM3-1.7B-Q8_0.gguf`.
+
+**TwIL-8B Q4_K_M-balanced** (`llama-bench -ngl 99 -fa 1 -p 512 -n 64 -d D -r 2` vs `bench -d vulkan -p 512 -n 64 -r 2 --warmup 1 --depth-list ...`):
+
+| test | dotLLM | llama.cpp | dotLLM / llama.cpp |
+|---|---|---|---|
+| pp512 | 845-912 (n=3) | 761-778 (n=3) | 1.13 |
+| pp4096 (`-p 4096`) | 867 (n=1) | 619 (n=1) | 1.40 |
+| pp16384 | 579 (n=1) | 330 (n=1) | 1.75 |
+| tg64 @ 0 (ctx 512) | 33.0-33.2 (n=3) | 38.06-38.09 (n=3) | 0.87 |
+| tg64 @ 4K | 23.7-23.8 (n=3) | 33.5-33.7 (n=3) | 0.71 |
+| tg64 @ 16K | 12.9-13.0 (n=2) | 25.3-25.6 (n=2) | 0.51 |
+| tg64 @ 32K | 7.91 (n=2) | 19.2-19.3 (n=2) | 0.41 |
+
+- dotLLM `bench` measures pp512 at depth 0 and then feeds the depth untimed before decode; llama.cpp's `pp512 @ dN` is prefill on top of
+  an existing context, so only the standalone `-p 4096` / `-p 16384` rows are prefill comparisons at length.
+- Against the byte model (205 GB/s, F16 KV 160 KiB/token; tg ceilings 38.3 / 34.0 / 25.5 / 19.1 at 0 / 4K / 16K / 32K) llama.cpp
+  sits at ~99 % of the ceiling and dotLLM at 86 / 70 / 51 / 41 %: dotLLM's decode attention at depth, not bytes, is the gap.
+- q8_0 KV (`DOTLLM_VK_KV=q8_0 --kv-quant-k q8_0 --kv-quant-v q8_0`) changes nothing measurable (tg 33.1 / 23.6 / 12.6 / 7.21 vs F16 33.05 / 23.65 /
+  12.8 / 7.23, n=2). It was not verified that the quantised cache is selected on this architecture.
+- A `--depth-list 16384,32768` run hit `VK_ERROR_DEVICE_LOST` three times, always while another session's tests/builds held 33-38 %
+  average CPU; it completed in the three runs with the quieter box. Not reproduced quiet.
+- Earlier figures (S0, #1673: pp 771-780 vs 609-612, tg 29.0-29.2 vs 29.6-34.4) were taken in a contended session; both engines
+  are faster here.
+
+**LFM3-1.7B Q8_0 vs llama.cpp `dde879bc`** (after #1687; `llama-bench -ngl 99 -fa 1 -p N -n 0` / `-d 16384 -n 64`, vs `bench -p N -n 16 -r 2 --warmup 0` / `--depth 16384`):
+
+| test | dotLLM | llama.cpp | dotLLM / llama.cpp | dotLLM, `DOTLLM_VK_LFM3_GLOBAL_GQA=0` |
+|---|---|---|---|---|
+| pp16384 | 3724-3830 (n=2) | 4131-4319 (n=2) | 0.89 | 1873-1912 |
+| pp32768 | 2958-2959 (n=2) | 3197-3294 (n=2) | 0.91 | 1131-1139 |
+| tg64 @ 16K (depth-fed) | 70.9-71.2 (n=2) | 88.7 (n=2) | 0.80 | 71.3 |
+
+These supersede the 2026-11-07 contended rows of 2.10 (0.51-0.63 / 0.46-0.48 at pp16384 / pp32768). **Open anomaly:** decode right after a
+single `-p 16384` / `-p 32768` prefill measured 40.3-40.9 / 23.8-25.3 tok/s with the #1687 path versus 54.9-56.7 / 56.2-56.4 with it off
+(and 71 tok/s at the same depth when the depth is fed instead), in both rounds.
+
+**Replays of PR-body throughput claims** (two rounds each, old = the PR's own off switch on the same build):
+
+| PR | workload | old | new | speedup | PR claim |
+|---|---|---|---|---|---|
+| #1693 | Llama-3.2-1B Q8_0 pp512 (`bench -p 512 -n 16 -r 3`) | 5675-5678 | 7117-7191 | 1.26x | 1.22-1.30x |
+| #1694 | Llama-3.2-3B i1-IQ2_XS pp512 | 1158-1213 | 2253-2291 | 1.92x | 2.09-2.14x |
+| #1687 | LFM3 Q8_0 pp16384 / pp32768 | 1873-1912 / 1131-1139 | 3724-3830 / 2958 | 2.00x / 2.61x | 1.47x (pp16384) |
+| #1688 | Llama-3.2-3B Q8_0 CPU pp256, 16 threads | 96.2-96.7 | 297-310 | 3.15x | 3-4x |
+| #1717 | OLMoE Q4_K_M base decode (overlay arm not run) | 164-165 tok/s | | | 160 tok/s base (matches) |
+
+Decode of #1693, #1694 and #1688 is unchanged, as claimed (133 / 87 / 22 tok/s).
+
 ## 3. RTX 3060 12 GB, CUDA
 
 ### 3.1 Recursive Flint Q4_1 on an RTX 3060 12 GB (CUDA, MoE offload)
@@ -347,6 +408,23 @@ indicative and the disturbed reps are shown, not dropped.
 - Decode at depth uses `-p N` for dotLLM and `-d N` for llama.cpp (see 2.10).
 - **Update 2026-11-07 (PR #1687, issue #1570; INDICATIVE, box at ~84 % CPU from sibling builds).** Causal prefill attention over a long KV is blocked as KV head x 32-token row block x key tile (`Attention.ExecuteBlockedCausal`, bit-identical to the per-row kernel; `DOTLLM_CPU_ATTN_BLOCKED=0` restores it). In-process kernel timing, LFM3 shape, a 1024-token chunk, 32 threads: KV end 16384 per-row 2148-5185 ms vs blocked 509-774 ms; KV end 32768 per-row 5421-7953 ms vs blocked 1147-1462 ms (4-7x). Whole-forward pp8192 under that load: 129 vs 124 tok/s (noise; attention is a small share at 8K). The pp16384 / pp32768 and tg rows above are NOT re-measured; replay commands in PR #1687.
 
+### 4.4 TwIL-8B Q4_K_M CPU thread sweep
+
+Source: bench round 2026-11-09, issue #1675 (dotLLM `dev` `157dc8ee`; llama.cpp `74ade5274` `llama-bench -dev none -t N -p 512 -n 64 -r 2`; dotLLM
+`bench -d cpu -p 512 -n 64 -r 2 --threads N`, default `--decode-threads`). Ryzen AI Max+ 395 (16C/32T, SMT on), `cpu-bench` held,
+2 rounds interleaved, ranges over rounds. Cells marked * had one round with other-process load above the acceptance bar.
+
+| threads | dotLLM pp512 | llama.cpp pp512 | ratio | dotLLM tg64 | llama.cpp tg64 | ratio |
+|---|---|---|---|---|---|---|
+| 8 | 55-57 | 96.9-98.0* | 0.58 | 10.6-10.7 | 16.3-16.4* | 0.65 |
+| 12 | 54-61 | 122-124 | 0.47 | 11.9-12.1 | 17.7-17.8 | 0.68 |
+| 16 | 62-64 | 136-145 | 0.45 | 13.6-13.7 | 17.7-17.9 | 0.77 |
+| 24 | 79.5-80.5 | 165-168 | 0.48 | 15.4-15.5 | 17.4-18.0 | 0.87 |
+| 32 | 73-83* | 164-169 | 0.47 | 5.0-8.9* | 14.5-15.3 | 0.47 |
+
+dotLLM CPU prefill is 0.45-0.58x at every thread count, and decode peaks at 24 threads and collapses at 32 (the S0 finding of 4.5-6 tok/s
+stands). llama.cpp's own decode also drops at 32 threads (14.9). Not run: a `--decode-threads` sweep.
+
 ## 5. Quality parity
 
 Throughput is meaningless if the output differs, so the perplexity comparisons are summarised here; the protocol
@@ -437,3 +515,9 @@ Gaps and stale rows, each of which a reader could mistake for a current figure:
 10. **Flash-Next UD-IQ4_XS** (2.8): interleaved pp512 and decode in a quiet-box session (the box drifted 278-545 tok/s).
 11. **Tiled prefill hybrids** (2.9): Qwen3.8-27B and Qwen3.6 (hd256 path) after #1553, and llama.cpp for the models other
     than Qwen3-4B in the new/old table.
+12. **TwIL-8B** (2.11, 4.4): depth 65536, a third round for 16K/32K and long prefill, `--decode-threads` sweep, a perturbation-verified
+    q8_0 KV arm with KL, and a quiet-box repeat of the device-lost at depth 32768 (not reproduced quiet).
+13. **#1717 overlay decode** (OLMoE `sel32.gguf`, ~4x slower than base per the PR): the overlay file was not available locally, so only
+    the base figure was replayed. **#1699 Tev1-4B IQ4_NL**, **#1685/#1701/#1691 GLM-4.5-Air REAP-82B** and the CUDA PRs (#1689 etc.) were
+    not replayed in the 2026-11-09 round.
+14. **LFM3 decode after a long sliced prefill** (2.11): 24-41 tok/s vs 71 at the same depth when depth-fed; cause not investigated.
