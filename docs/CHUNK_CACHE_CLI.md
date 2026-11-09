@@ -309,8 +309,8 @@ provenance lives in the server's ledger). `--offline --mode all --model M.gguf` 
 Safety for an applying offline pass:
 
 - `--store` is resolved through links and junctions first (the real root is printed on stderr) and every lock and deletion uses the real root.
-- A directory that does not look like a chunk store (no store lock, owner lock, registry, server ledger, `index-*.json` or two-hex-digit entry directory) is
-  refused with exit 2 before anything is read or deleted, so a parent directory or an unrelated folder is never swept.
+- A directory that does not look like a chunk store is refused with exit 2 before anything is read or deleted, so a parent directory or an unrelated folder is never swept.
+  A store has one strong mark (the store lock, owner lock, registry or server-ledger file) or both weak marks (an `index-*.json` and a two-hex-digit entry directory); one weak mark alone is not enough.
 - The pass holds the store's owner lock throughout; an unreadable index or ledger blocks it; index files named by a bad registry row are refused.
 - `kept_referenced` after `--apply` is what the store holds afterwards.
 

@@ -293,6 +293,51 @@ public sealed partial class ChunkCacheCliTests
         Assert.All(orphans, o => Assert.True(fs.Contains(new ChunkKey(o))));
     }
 
+    /// <summary>
+    /// A directory that merely contains something shaped like one store file (an <c>index-*.json</c>, or a two-digit hex folder) is not a
+    /// store: it takes a lock/registry/ledger mark, or BOTH weak marks (reviewer note on #1719). A parent of a store, or a folder that
+    /// happens to hold <c>index-a.json</c>, must never be swept.
+    /// </summary>
+    [Fact]
+    public void LooksLikeStore_NeedsAStrongMark_OrBothWeakMarks()
+    {
+        string weakIndex = NewDir("weak-index");
+        File.WriteAllText(Path.Combine(weakIndex, "index-something.json"), "{}");
+        string weakShard = NewDir("weak-shard");
+        Directory.CreateDirectory(Path.Combine(weakShard, "ab"));
+        string both = NewDir("both-weak");
+        File.WriteAllText(Path.Combine(both, "index-something.json"), "{}");
+        Directory.CreateDirectory(Path.Combine(both, "ab"));
+        string empty = NewDir("empty");
+
+        Assert.False(StoreLayout.LooksLikeStore(weakIndex));
+        Assert.False(StoreLayout.LooksLikeStore(weakShard));
+        Assert.False(StoreLayout.LooksLikeStore(empty));
+        Assert.True(StoreLayout.LooksLikeStore(both));
+        foreach (string strong in new[] { ".chunkstore.lock", ".chunkstore.owner.lock", "chunkcache.json", "ledger-server.json" })
+        {
+            string dir = NewDir("strong-" + strong.TrimStart('.'));
+            File.WriteAllText(Path.Combine(dir, strong), "");
+            Assert.True(StoreLayout.LooksLikeStore(dir), strong);
+        }
+    }
+
+    /// <summary>The destructive verb applies the rule: a parent dir holding only an index-shaped file is refused and untouched.</summary>
+    [Fact]
+    public void EvictApply_DirectoryWithOnlyAnIndexShapedFile_IsRefused_NothingDeleted()
+    {
+        string dir = NewDir("lookalike");
+        string file = Path.Combine(dir, "index-fixed.aaaaaaaaaaaa.bbbbbbbb.default.json");
+        File.WriteAllText(file, "{}");
+
+        var r = CliRaw(["evict", "--offline", "--store", dir, "--apply", "--json"]);
+
+        Assert.Equal(2, r.Code);
+        Assert.Contains("does not look like a chunk store", r.Out, StringComparison.Ordinal);
+        Assert.True(File.Exists(file));
+        Assert.Equal([file], Directory.EnumerateFileSystemEntries(dir).ToArray()); // not even a lock file was created
+    }
+
     /// <summary>A link or junction in <c>--store</c> is resolved first: the pass runs against the real store and says so.</summary>
     [SkippableFact]
     public void EvictApply_StoreThroughALink_RunsAgainstTheRealRoot()
