@@ -203,6 +203,27 @@ public sealed class StoreHardeningTests : IDisposable
         Assert.Equal(shared, File.GetUnixFileMode(Root)); // an operator's choice for an existing store is not overridden
     }
 
+    /// <summary>
+    /// The probe canonicalises the root like <see cref="StoreOwnerLock.TryAcquire"/>: a <c>..</c> after a link means the link target's parent,
+    /// not the link's own parent (lexical collapse). Held through one spelling, it must read as held through the other (review note on #1738).
+    /// </summary>
+    [SkippableFact]
+    public void IsHeldByAnother_DotDotAfterALink_ProbesTheRealStore()
+    {
+        string deep = Path.Combine(_scratch, "real", "deep");
+        Directory.CreateDirectory(deep);
+        string store = Path.Combine(_scratch, "real", "store");
+        string link = Path.Combine(_scratch, "lnk");
+        Skip.If(!TryCreateDirectoryLink(link, deep), "cannot create a directory link here");
+        string viaLink = link + Path.DirectorySeparatorChar + ".." + Path.DirectorySeparatorChar + "store";
+
+        using StoreOwnerLock? owner = StoreOwnerLock.TryAcquire(store);
+
+        Assert.NotNull(owner);
+        Assert.True(StoreOwnerLock.IsHeldByAnother(store), "control: the plain spelling sees the owner");
+        Assert.True(StoreOwnerLock.IsHeldByAnother(viaLink), "the same store spelled through link/.. is the same store");
+    }
+
     // ------------------------------------------------------------------------------------------------ owner lock
 
     [Fact]

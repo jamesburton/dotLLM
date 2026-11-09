@@ -290,4 +290,33 @@ public sealed partial class ChunkCacheCliTests
         var json = CliRaw(["list", "--store", store, "--json"]);
         JsonDocument.Parse(json.Out).Dispose();
     }
+
+    /// <summary>
+    /// A mistyped <c>--store</c> (a directory that is not a chunk store) must not read as a healthy empty store: the result says no store
+    /// marks were found (<c>store_marks</c> false, and a warning on stderr), while a real store reports <c>store_marks</c> true. Exit stays 0:
+    /// <c>list</c> is an inventory and a directory is not an error. Review note on #1738.
+    /// </summary>
+    [Fact]
+    public void List_DirectoryWithNoStoreMarks_SaysSo_ARealStoreDoesNot()
+    {
+        string tree = NewTree();
+        string real = NewDir("real-store");
+        BuildStore(real, tree, _fx.ModelA);
+        string typo = NewDir("not-a-store");
+        File.WriteAllText(Path.Combine(typo, "notes.txt"), "hello");
+        string[] before = Directory.EnumerateFileSystemEntries(typo, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal).ToArray();
+
+        var run = CliRaw(["list", "--store", typo, "--store", real, "--json"]);
+
+        Assert.Equal(0, run.Code);
+        Assert.Empty(SchemaErrors("list", run.Out));
+        JsonElement[] stores = JsonDocument.Parse(run.Out).RootElement.GetProperty("stores").EnumerateArray().ToArray();
+        Assert.False(stores[0].GetProperty("store_marks").GetBoolean());
+        Assert.True(stores[1].GetProperty("store_marks").GetBoolean()); // control: a real store is recognised
+        Assert.Contains("no chunk-store marks", run.Err, StringComparison.Ordinal);
+        Assert.Contains(typo, run.Err, StringComparison.Ordinal);
+        Assert.Equal(before, Directory.EnumerateFileSystemEntries(typo, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal).ToArray()); // nothing created
+        // The text form carries the warning too.
+        Assert.Contains("no chunk-store marks", CliRaw(["list", "--store", typo]).Out + CliRaw(["list", "--store", typo]).Err, StringComparison.Ordinal);
+    }
 }

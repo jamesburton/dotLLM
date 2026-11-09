@@ -76,6 +76,12 @@ internal sealed record ListStoreJson
     /// <summary>Their bytes.</summary>
     public long TempBytes { get; init; }
 
+    /// <summary>
+    /// Whether the directory carries the marks of a chunk store (<see cref="StoreLayout.LooksLikeStore"/>). False for a mistyped
+    /// <c>--store</c>: the inventory of such a directory is empty, which is not a healthy empty store.
+    /// </summary>
+    public bool StoreMarks { get; init; } = true;
+
     /// <summary><c>held</c> (another holder owns the store, or the lock file cannot be probed) or <c>free</c>. Advisory: one probe, stale at once.</summary>
     public string OwnerLock { get; init; } = "free";
 
@@ -131,6 +137,8 @@ internal static class ListCommand
             server = new ListServerJson(connection.BaseUrl, identity.ModelId, identity.Producer, identity.TokenizerId, identity.Entries, identity.Bytes, identity.BudgetBytes);
         }
 
+        foreach (ListStoreJson s in stores.Where(s => !s.StoreMarks))
+            ctx.Info($"warning: {s.Path} has no chunk-store marks (no store lock, owner lock, registry, ledger, or index plus entry directory): is --store right? Its inventory is empty.");
         var result = new ListResult { Stores = stores, Server = server };
         if (ctx.Json)
         {
@@ -162,7 +170,7 @@ internal static class ListCommand
         }
         return new ListStoreJson
         {
-            Path = layout.Root, Entries = stats.Entries, EntryBytes = stats.EntryBytes, TempFiles = stats.TempFiles, TempBytes = stats.TempBytes,
+            Path = layout.Root, StoreMarks = StoreLayout.LooksLikeStore(layout.Root), Entries = stats.Entries, EntryBytes = stats.EntryBytes, TempFiles = stats.TempFiles, TempBytes = stats.TempBytes,
             OwnerLock = held ? "held" : "free", Ledger = StatusCommand.ReadLedger(layout.Root), RegistryNote = layout.Registry.LoadNote,
             InvalidRegistryRows = invalid.Count > 0 ? invalid : null, Indexes = indexes,
         };

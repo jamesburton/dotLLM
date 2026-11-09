@@ -8,13 +8,14 @@
     "stores": {"type": "array", "items": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "entries", "entry_bytes", "temp_files", "temp_bytes", "owner_lock", "ledger", "indexes"],
+      "required": ["path", "store_marks", "entries", "entry_bytes", "temp_files", "temp_bytes", "owner_lock", "ledger", "indexes"],
       "properties": {
         "path": {"type": "string"},
         "entries": {"type": "integer"},
         "entry_bytes": {"type": "integer"},
         "temp_files": {"type": "integer"},
         "temp_bytes": {"type": "integer"},
+        "store_marks": {"type": "boolean"},
         "owner_lock": {"type": "string", "enum": ["held", "free"]},
         "ledger": {"type": "object", "additionalProperties": false, "required": ["state"], "properties": {
           "state": {"type": "string", "enum": ["absent", "ok", "unreadable"]},
