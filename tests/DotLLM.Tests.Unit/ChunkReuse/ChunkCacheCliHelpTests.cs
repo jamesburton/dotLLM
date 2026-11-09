@@ -51,11 +51,13 @@ public sealed class ChunkCacheCliHelpTests
                 if (o.Name == "server" && o.Env != "CHUNKCACHE_API_KEY") problems.Add($"{at}: does not name the CHUNKCACHE_API_KEY environment variable");
                 if (!help.Contains("  " + o.Header + "\n", StringComparison.Ordinal) && !help.Contains("  " + o.Header + "\r\n", StringComparison.Ordinal))
                     problems.Add($"{at}: --help does not print its entry");
-                if (!help.Contains(o.Help.Trim().Split(' ')[0], StringComparison.Ordinal)) problems.Add($"{at}: --help does not print its text");
+                if (!Squash(help).Contains(Squash(o.Description), StringComparison.Ordinal)) problems.Add($"{at}: --help does not print its text, values, repeatability, default and environment clauses");
             }
         }
         return problems;
     }
+
+    private static string Squash(string s) => Rx(@"\s+").Replace(s, " ");
 
     [Fact]
     public void EveryRegisteredOption_OfEveryVerb_HasHelpTextDefaultAndValueForm_AndEveryVerbAnExample()

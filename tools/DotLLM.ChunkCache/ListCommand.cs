@@ -33,7 +33,7 @@ internal sealed record ListIndexJson
     /// <summary>Last build, UTC (ISO 8601).</summary>
     public string? UpdatedUtc { get; init; }
 
-    /// <summary><c>ok</c>, <c>missing</c> (a registry row whose file is gone) or <c>unreadable</c>.</summary>
+    /// <summary><c>ok</c>, <c>missing</c> (the file vanished between the registry read, which drops rows of files that are gone, and the index read) or <c>unreadable</c>.</summary>
     public string State { get; init; } = "ok";
 
     /// <summary>Why the file is unreadable.</summary>

@@ -218,7 +218,7 @@ public sealed partial class ChunkCacheCliTests
     }
 
     [Fact]
-    public void List_ReportsAnUnreadableAndAMissingIndexFile_AsStatesNotErrors()
+    public void List_ReportsAnUnreadableIndexFile_AsAStateNotAnError_AndDropsAGoneOne()
     {
         string tree = NewTree();
         string store = NewDir("store");
@@ -231,10 +231,13 @@ public sealed partial class ChunkCacheCliTests
         Assert.False(string.IsNullOrEmpty(bad.GetProperty("error").GetString()));
 
         File.Delete(index);
-        // The registry still lists it; the file is gone (the registry reconciles against the disk, so it may drop the row: either is reported, never thrown).
+        // The registry drops a row whose index file is gone when it loads, so the index leaves the list and the note says why (nothing is written back).
         var gone = CliRaw(["list", "--store", store, "--json"]);
         Assert.Equal(0, gone.Code);
         Assert.Empty(SchemaErrors("list", gone.Out));
+        JsonElement none = OnlyStore(JsonDocument.Parse(gone.Out).RootElement);
+        Assert.Equal(0, none.GetProperty("indexes").GetArrayLength());
+        Assert.Contains("whose index file is gone", none.GetProperty("registry_note").GetString(), StringComparison.Ordinal);
         File.WriteAllText(index, good);
         Assert.Equal("ok", Assert.Single(OnlyStore(Json(CliRaw(["list", "--store", store, "--json"]))).GetProperty("indexes").EnumerateArray()).GetProperty("state").GetString());
     }
