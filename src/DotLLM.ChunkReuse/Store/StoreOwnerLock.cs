@@ -84,7 +84,9 @@ public sealed class StoreOwnerLock : IDisposable
     public static bool IsHeldByAnother(string storeRoot)
     {
         ArgumentException.ThrowIfNullOrEmpty(storeRoot);
-        string path = Path.Combine(Path.GetFullPath(storeRoot), FileName);
+        // The same real root as TryAcquire (links and junctions resolved, ".." applied after them), so a spelling through "link/.." probes the
+        // store the owner holds and not a lexically collapsed neighbour.
+        string path = Path.Combine(StorePaths.CanonicalRoot(storeRoot), FileName);
         try
         {
             using var probe = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);

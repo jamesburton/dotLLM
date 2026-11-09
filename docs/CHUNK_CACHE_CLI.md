@@ -245,7 +245,7 @@ store holds. It needs no model: indexes are read from their files, so the counts
 server's own figures (model id, producer, entries, bytes, budget) from `GET /v1/chunk-cache`.
 
 `list` never takes the owner lock or the store lock, never writes the registry, the ledger or an index (a missing or corrupt registry is rebuilt in memory and reported as
-`registry_note`, not saved), and never creates a directory: a `--store` that does not exist is exit 1. The owner-lock state is **advisory**: it is one probe (the lock file opened
+`registry_note`, not saved), and never creates a directory: a `--store` that does not exist is exit 1. A directory that exists but has none of a store's marks (store lock, owner lock, registry, ledger, or an index plus an entry directory) is reported with `store_marks: false` and a warning on stderr, so a mistyped `--store` does not pass for a healthy empty store (exit stays 0). The owner-lock state is **advisory**: it is one probe (the lock file opened
 exclusively and closed at once), it can be stale the moment it is printed, and a lock file that cannot be probed counts as held. A writer never relies on it; it holds the
 lock itself for its whole run.
 
@@ -284,7 +284,7 @@ store /data/store: 4312 entries, 1.82 GiB; owner lock: free (advisory: one probe
 {
   "stores": [
     {
-      "path": "/data/store",
+      "path": "/data/store", "store_marks": true,
       "entries": 4312, "entry_bytes": 1954000000, "temp_files": 0, "temp_bytes": 0,
       "owner_lock": "free",
       "ledger": { "state": "absent" },
