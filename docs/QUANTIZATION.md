@@ -197,7 +197,7 @@ CPU kernels (`DotLLM.Cpu.Kernels.TernB64F16`): the weights are read packed, neve
 scratch). `GemmQ8`/`GemvQ8` is the production kernel (activations through the house Q8_0 quantizer, `int32` dot per 32 activations, folded with the 64-column
 scale); `GemmF32Act` is the scalar F32-activation reference (the KL oracle; `DOTLLM_TERN_F32ACT=1` runs a whole model on it). Against the OracleWrittenTernary
 real-tensor vectors the F32 kernel agrees to ~1e-6 of rms(y) and the int8 kernel to 0.5% rms / ~3% max of rms(y). `Dequantize` exists as a test oracle
-only. Vulkan reuses the same layout and overlay contract (S3 of #1706).
+only on the CPU; the Vulkan kernel (S3 of #1706) reads the same layout, see "Vulkan" under Tensor overlays.
 
 ## Tensor overlays (`--tensor-overlay`, issue #1706)
 
@@ -220,6 +220,26 @@ How it is applied (the contract Vulkan reuses): `TensorOverlay.Open/Attach` vali
 swaps a dense projection's pointer/format, or fills a per-layer `ExpertOverlayTable` (per-expert, per-projection address + format) beside the untouched stacked
 `ffn_*_exps` banks. `MoeQuantSwiGluMlp` consults the table per selected expert and per projection (token routing, top-k and `norm_topk_prob` are unchanged);
 with no overlay the table is null and the code path is the pre-existing one. Overlay tensors are read in place from the overlay's mmap, never copied.
+
+### Vulkan overlay support (#1706 S3)
+
+`--tensor-overlay` also runs on `--device vulkan` for GGUF bases of plain-SwiGLU dense and routed-MoE models (Llama, Mistral, Qwen, Mixtral, OLMoE / Qwen-MoE; no
+shared-expert or sigmoid-routing variants, no pipeline windows) and **`TERN_B64_F16` tensors only**; any other overlay dtype, architecture or backend (CUDA) is
+still the loud "not applied / not supported" error. A safetensors directory base is CPU-only (`perplexity` refuses it on `--device vulkan`).
+
+- **Storage:** packed, 18 B per 64 weights (2.25 bpw), never widened. Dense FFN overrides ride the normal upload (`DeviceQuantType = TERN_B64_F16`, zero-copy
+  import when the platform allows). Routed experts: per layer and projection one bank of the overlaid experts' tensors back to back plus an `int32[numExperts]`
+  slot table (`VulkanTernOverlay`); the original bank still holds the replaced experts' original weights (unread for those cells).
+- **Kernel:** `matmul_tern_b64_mmvq.comp`, dense and indexed in one shader (wave-size independent: shared-memory reduction). Activations go through the house
+  Q8_1 row quantizer; one int32 dot per 16 columns, folded with the fp16 block scale and the per-32 activation scale (`acc += scale * d_x * dot`), the same
+  contract as `TernB64F16.GemmQ8` (the CPU quantizer rounds the activation scale to fp16, so the two are KL-level, not bit-identical). Grid = one 32-lane
+  workgroup per (output row, activation row): decode and prefill use the same kernel; weight rows are re-read per activation row (cache-resident), so prefill is
+  not coalesced into a tiled GEMM yet.
+- **Mixed formats in one layer:** a layer with ternary experts takes the existing generic indexed path for every expert (original formats, unchanged), then a
+  ternary pass rewrites the (token, slot) cells whose expert is ternary for that projection (`slotOf[expert] >= 0`). Routing, top-k and `norm_topk_prob` are
+  untouched. Such a layer does not use the grouped-coopmat / fused-MMVQ arms (their intermediates cannot be overwritten), so overlay layers decode slower than
+  untouched ones.
+- **Reference:** the F32-activation oracle is the CPU `TernB64F16.GemmF32Act` (`DOTLLM_TERN_F32ACT=1`); there is no F32-activation Vulkan variant.
 
 ### NanoQuant (community GGUF, sub-1-bit factorised; issue #866)
 
