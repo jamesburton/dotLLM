@@ -126,6 +126,15 @@ internal static class EvictCommand
         TimeSpan lockTimeout = args.Seconds("lock-timeout", Common.DefaultLockTimeout);
         int show = args.Int("show", 20, 0);
         if (!Directory.Exists(storeRoot)) throw new DirectoryNotFoundException($"Store not found: {storeRoot}");
+        // Links and junctions in --store are resolved first: the locks, the sweep and every deletion below use the REAL root, and a
+        // directory that is not a chunk store (a parent of one, an unrelated folder) is refused before anything is touched.
+        string realRoot = StorePaths.CanonicalRoot(storeRoot);
+        if (!string.Equals(realRoot, Path.TrimEndingDirectorySeparator(storeRoot), StringComparison.Ordinal))
+            ctx.Info($"note: --store resolves to {realRoot}");
+        storeRoot = realRoot;
+        if (!StoreLayout.LooksLikeStore(storeRoot))
+            throw new UsageException($"evict: {storeRoot} does not look like a chunk store (no store lock, registry, index, ledger or entry shard directory); "
+                + "check --store. Nothing was read or deleted.");
 
         // An applying run owns the store for its WHOLE pass (a check followed by deletes would race a server starting in between).
         using ModelHandle? model = allForModel ? Common.OpenModel(ctx, args) : null;
@@ -200,6 +209,9 @@ internal static class EvictCommand
             Mode = model is null ? "orphans" : "all", Keys = victims.Select(k => k.Hex).ToList(), DroppedIndexes = dropIndexes,
             TempFilesRemoved = tempRemoved, StoreEntriesAfter = apply ? store.Keys().Count() : all.Count,
         };
+        // After an applying pass the figure is what the store holds now (not what was predicted before deleting), so a pass that
+        // could not remove everything does not report entries as evicted-and-kept at once.
+        if (apply) result = result with { KeptReferenced = result.StoreEntriesAfter - unreadable };
         if (ctx.Json)
         {
             ctx.WriteJson(result);

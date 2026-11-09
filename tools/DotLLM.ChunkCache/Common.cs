@@ -105,7 +105,9 @@ internal static class Common
         ctx.Info("taking the store's owner lock (sole writer) for this run ...");
         return StoreOwnerLock.TryAcquire(storeRoot)
             ?? throw new StoreOwnedException($"Store {storeRoot} is owned by a running server or another offline writer; an offline run does not write beside it. "
-                + "Stop the owner, or queue the work through the server with --server.");
+                + "Stop the owner, or queue the work through the server with --server. The ownership is held by an open file handle that the OS "
+                + "releases when its process exits, so there is no stale lock to delete: if no server is running, look for a leftover "
+                + "chunkcache or dotllm process (or a probe holding the file) and end it, then retry.");
     }
 
     /// <summary>The chunker of <c>--chunker</c> (<c>symbol</c> default, or <c>fixed</c>) and <c>--chunk-tokens</c> (512).</summary>

@@ -105,9 +105,25 @@ internal sealed class StoreLayout
     public static StoreLayout Open(string root, bool create)
     {
         string full = Path.GetFullPath(root);
-        if (create) Directory.CreateDirectory(full);
-        else if (!Directory.Exists(full)) return new StoreLayout(full, StoreRegistry.Load(full), null);
-        return new StoreLayout(full, StoreRegistry.Load(full), new FileChunkStore(full));
+        if (!create && !Directory.Exists(full)) return new StoreLayout(full, StoreRegistry.Load(full), null);
+        // The store creates its own root owner-only on POSIX (StorePaths, #1676/#1703): never a plain Directory.CreateDirectory here.
+        var files = new FileChunkStore(full);
+        return new StoreLayout(full, StoreRegistry.Load(full), files);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="root"/> carries a mark of a chunk store: one of the lock, owner-lock, registry or server-ledger files,
+    /// an <c>index-*.json</c>, or an entry shard directory (two lower-case hex digits). A destructive verb refuses a directory
+    /// without any, so a wrong <c>--store</c> (a parent directory, an unrelated folder) is never swept.
+    /// </summary>
+    public static bool LooksLikeStore(string root)
+    {
+        if (!Directory.Exists(root)) return false;
+        foreach (string marker in new[] { ChunkIndex.StoreLockFileName, StoreOwnerLock.FileName, ConfigFileName, ServerLedger.FileName })
+            if (File.Exists(Path.Combine(root, marker))) return true;
+        if (Directory.EnumerateFiles(root, "index-*.json").Any()) return true;
+        return Directory.EnumerateDirectories(root).Select(Path.GetFileName)
+            .Any(n => n is { Length: 2 } && n.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f'));
     }
 
     /// <summary>The (current-form) index file of <paramref name="chunker"/> for the model <paramref name="model"/>.</summary>

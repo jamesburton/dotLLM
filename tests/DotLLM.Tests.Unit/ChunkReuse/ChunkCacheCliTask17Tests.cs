@@ -266,6 +266,86 @@ public sealed partial class ChunkCacheCliTests
         Assert.All(orphans, o => Assert.False(fs.Contains(new ChunkKey(o))));
     }
 
+    /// <summary>A wrong <c>--store</c> (the parent of a store, an unrelated folder) is refused before anything is read or deleted (review of #1719).</summary>
+    [Fact]
+    public void EvictApply_RootThatIsNotAStore_IsRefused_NothingTouched()
+    {
+        string tree = NewTree();
+        string parent = NewDir("parent");
+        string store = Path.Combine(parent, "store");
+        Directory.CreateDirectory(store);
+        (HashSet<string> orphans, _) = MakeOrphan(tree, store);
+        var fs = new FileChunkStore(store);
+        string[] before = Directory.EnumerateFiles(parent, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal).ToArray();
+        Assert.True(StoreLayout.LooksLikeStore(store)); // control: the real store is recognised
+
+        foreach (string mode in new[] { "orphans", "all" })
+        {
+            var r = CliRaw(["evict", "--offline", "--mode", mode, "--model", _fx.ModelA, "--store", parent, "--apply", "--json"]);
+            Assert.Equal(2, r.Code);
+            Assert.Contains("does not look like a chunk store", r.Out, StringComparison.Ordinal);
+        }
+
+        Assert.Equal(before, Directory.EnumerateFiles(parent, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal).ToArray()); // not even a lock file
+        Assert.All(orphans, o => Assert.True(fs.Contains(new ChunkKey(o))));
+    }
+
+    /// <summary>A link or junction in <c>--store</c> is resolved first: the pass runs against the real store and says so.</summary>
+    [SkippableFact]
+    public void EvictApply_StoreThroughALink_RunsAgainstTheRealRoot()
+    {
+        string tree = NewTree();
+        string store = NewDir("store");
+        (HashSet<string> orphans, _) = MakeOrphan(tree, store);
+        string link = Path.Combine(NewDir("links"), "viaLink");
+        bool linked;
+        try { Directory.CreateSymbolicLink(link, store); linked = Directory.Exists(link); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException) { linked = false; }
+        Skip.If(!linked, "cannot create a directory symlink here");
+
+        var r = CliRaw(["evict", "--offline", "--store", link, "--apply", "--json"]);
+
+        Assert.Equal(0, r.Code);
+        Assert.Contains("resolves to", r.Err, StringComparison.Ordinal);
+        Assert.Equal(orphans.Count, JsonDocument.Parse(r.Out).RootElement.GetProperty("evicted").GetInt32());
+        Assert.All(orphans, o => Assert.False(new FileChunkStore(store).Contains(new ChunkKey(o))));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(Path.GetDirectoryName(link)!).Where(p => p != link)); // nothing else created beside the link
+    }
+
+    /// <summary>After an applying pass <c>kept_referenced</c> is what the store holds now, not the figure predicted before deleting.</summary>
+    [Fact]
+    public void EvictApply_KeptReferenced_IsMeasuredAfterTheDeletes()
+    {
+        string tree = NewTree();
+        string store = NewDir("store");
+        (HashSet<string> orphans, _) = MakeOrphan(tree, store);
+        int entries = new FileChunkStore(store).GetStats().Entries;
+        string orphan = orphans.First();
+        // Hold the first orphan's file open so its delete cannot complete where the OS forbids that (Windows): the figure must follow the store.
+        using var open = new FileStream(new FileChunkStore(store).PathOf(new ChunkKey(orphan)), FileMode.Open, FileAccess.Read, FileShare.Read);
+
+        var r = CliRaw(["evict", "--offline", "--store", store, "--apply", "--json"]);
+
+        int after = new FileChunkStore(store).GetStats().Entries;
+        if (r.Code == 0)
+            Assert.Equal(after, JsonDocument.Parse(r.Out).RootElement.GetProperty("kept_referenced").GetInt32());
+        else
+            Assert.Equal(1, r.Code); // a refused delete is an error, never a success with a wrong figure
+        Assert.True(after >= entries - orphans.Count);
+    }
+
+    /// <summary>A store created by a writer verb is owner-only on POSIX like every other store directory (#1676/#1703).</summary>
+    [SkippableFact]
+    public void StoreLayout_CreatingARoot_IsOwnerOnly()
+    {
+        Skip.If(OperatingSystem.IsWindows(), "POSIX modes; a new directory inherits its parent's ACL on Windows");
+        string root = Path.Combine(NewDir("fresh"), "a-new-store");
+
+        StoreLayout.Open(root, create: true);
+
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(root));
+    }
+
     [Fact]
     public void Cli_NeverWritesLedger()
     {
