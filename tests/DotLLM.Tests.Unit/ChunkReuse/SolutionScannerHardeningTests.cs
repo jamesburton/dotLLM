@@ -197,22 +197,65 @@ public sealed class SolutionScannerHardeningTests : IDisposable
         Assert.Contains(p.Diagnostics, d => d.Contains("secret.txt", StringComparison.Ordinal));
     }
 
-    /// <summary>A project whose design-time build runs a command for <paramref name="seconds"/> before the compile targets.</summary>
-    private static string Hanging(int seconds) =>
+    /// <summary>
+    /// A project whose design-time build runs a command before the compile targets. The command writes the file
+    /// <paramref name="started"/>, then waits for as long as the file <paramref name="hold"/> exists. The test creates the hold
+    /// file, so the build cannot finish until the test deletes it (or the temp directory goes): there is no duration to outrun.
+    /// The command polls every 100 ms.
+    /// </summary>
+    private static string HeldUntilFileRemoved(string hold, string started, string ended) =>
         "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
         + "<Target Name=\"Hang\" BeforeTargets=\"CoreCompile;ResolveAssemblyReferences\">"
-        + "<Exec Condition=\"'$(OS)' == 'Windows_NT'\" Command=\"ping -n " + (seconds + 1).ToString(CultureInfo.InvariantCulture) + " 127.0.0.1 &gt; nul\" />"
-        + "<Exec Condition=\"'$(OS)' != 'Windows_NT'\" Command=\"sleep " + seconds.ToString(CultureInfo.InvariantCulture) + "\" />"
+        + "<Exec Condition=\"'$(OS)' == 'Windows_NT'\" Command=\"powershell -NoProfile -NonInteractive -Command &quot;Set-Content -LiteralPath '" + started + "' -Value 1; while (Test-Path -LiteralPath '" + hold + "') { Start-Sleep -Milliseconds 100 }; Set-Content -LiteralPath '" + ended + "' -Value 1&quot;\" />"
+        + "<Exec Condition=\"'$(OS)' != 'Windows_NT'\" Command=\"echo 1 &gt; '" + started + "'; while [ -e '" + hold + "' ]; do sleep 0.1; done; echo 1 &gt; '" + ended + "'\" />"
         + "</Target></Project>";
 
-    /// <summary>The project, or a solution file listing it (the two entry points wait on different workspace calls).</summary>
-    private async Task<string> HangingEntryAsync(bool solution, int seconds)
+    /// <summary>
+    /// The project, or a solution file listing it (the two entry points wait on different workspace calls), with a design-time build
+    /// that is held until <see cref="HeldBuild.Release"/> is called.
+    /// </summary>
+    private async Task<HeldBuild> HeldEntryAsync(bool solution)
     {
-        string csproj = await WriteProjectAsync(Hanging(seconds), ("A.cs", "class A { }\n"));
-        if (!solution) return csproj;
-        string slnx = Path.Combine(_root, "S.slnx");
-        File.WriteAllText(slnx, "<Solution><Project Path=\"P/P.csproj\" /></Solution>");
-        return slnx;
+        string hold = Path.Combine(_root, "hold.flag"), started = Path.Combine(_root, "started.flag"), ended = Path.Combine(_root, "ended.flag");
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(hold, "held");
+        string csproj = await WriteProjectAsync(HeldUntilFileRemoved(hold, started, ended), ("A.cs", "class A { }\n"));
+        string entry = csproj;
+        if (solution)
+        {
+            entry = Path.Combine(_root, "S.slnx");
+            File.WriteAllText(entry, "<Solution><Project Path=\"P/P.csproj\" /></Solution>");
+        }
+        return new HeldBuild(entry, hold, started, ended);
+    }
+
+    private sealed record HeldBuild(string Entry, string HoldFile, string StartedFile, string EndedFile)
+    {
+        /// <summary>True once the held design-time build command is running.</summary>
+        public bool HasStarted => File.Exists(StartedFile);
+
+        /// <summary>True once the held command has run to its end (only after <see cref="Release"/>).</summary>
+        public bool HasEnded => File.Exists(EndedFile);
+
+        /// <summary>Waits until the build command runs; fails the test when it never does (an empty project would then prove nothing).</summary>
+        public async Task WaitForStartAsync()
+        {
+            using var limit = new CancellationTokenSource(HangGuard.Limit);
+            try
+            {
+                while (!HasStarted) await Task.Delay(50, limit.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                Assert.Fail("the held design-time build never started");
+            }
+        }
+
+        public void Release()
+        {
+            try { File.Delete(HoldFile); }
+            catch (IOException) { /* the directory is being removed: the build stops either way */ }
+        }
     }
 
     [Theory]
@@ -220,14 +263,26 @@ public sealed class SolutionScannerHardeningTests : IDisposable
     [InlineData(true)]
     public async Task Scan_CancelledDuringTheDesignTimeBuild_ReturnsAtOnce(bool solution)
     {
-        // The design-time build runs for 40 s. The caller's token fires after 2 s: the call must end then, not when the build does.
-        string entry = await HangingEntryAsync(solution, 40);
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-        var clock = Stopwatch.StartNew();
+        // The design-time build is held until the test releases it. The test cancels the token once the build command is running:
+        // the call can only end through the token, while the build is still held. (No clock: a call that waits for the build
+        // never returns, and HangGuard fails the test then.)
+        HeldBuild build = await HeldEntryAsync(solution);
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            Task<Exception?> call = Record.ExceptionAsync(() => SolutionScanner.LoadAsync(build.Entry, cts.Token));
+            await build.WaitForStartAsync();
+            await cts.CancelAsync();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SolutionScanner.LoadAsync(entry, cts.Token));
+            Exception? thrown = await HangGuard.ReturnsAsync(call, "LoadAsync");
 
-        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(20), $"cancelled after 2 s, returned after {clock.Elapsed}");
+            Assert.IsAssignableFrom<OperationCanceledException>(thrown);
+            Assert.False(build.HasEnded, "the call returned while the design-time build was still held, so it ended before the build did");
+        }
+        finally
+        {
+            build.Release();
+        }
     }
 
     /// <summary>
@@ -278,12 +333,20 @@ public sealed class SolutionScannerHardeningTests : IDisposable
     [InlineData(true)]
     public async Task Scan_OptionTimeout_EndsAHungDesignTimeBuildWithATimeoutException(bool solution)
     {
-        string entry = await HangingEntryAsync(solution, 40);
-        var clock = Stopwatch.StartNew();
+        // The design-time build is held until the test releases it, so the call can only end through the option timeout. No clock
+        // bound on how late it ends: a call that ignores the timeout waits for the held build and never returns (HangGuard).
+        HeldBuild build = await HeldEntryAsync(solution);
+        try
+        {
+            Exception? thrown = await HangGuard.ReturnsAsync(Record.ExceptionAsync(() =>
+                SolutionScanner.LoadAsync(build.Entry, new SolutionScanOptions { Timeout = TimeSpan.FromSeconds(2) })), "LoadAsync");
 
-        await Assert.ThrowsAsync<TimeoutException>(() =>
-            SolutionScanner.LoadAsync(entry, new SolutionScanOptions { Timeout = TimeSpan.FromSeconds(2) }));
-
-        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(20), $"timeout 2 s, returned after {clock.Elapsed}");
+            Assert.IsType<TimeoutException>(thrown);
+            Assert.False(build.HasEnded, "the call returned while the design-time build was still held, so it ended before the build did");
+        }
+        finally
+        {
+            build.Release();
+        }
     }
 }
