@@ -17,6 +17,7 @@ equivalent, device selection, KV-cache sizing, and the environment variables the
 - [Device selection](#device-selection)
 - [KV-cache sizing](#kv-cache-sizing)
 - [Commands](#commands): [model](#dotllm-model) - [list](#dotllm-list) - [run](#dotllm-run) - [chat](#dotllm-chat) - [serve](#dotllm-serve) - [ps](#dotllm-ps) - [stop](#dotllm-stop) - [bench](#dotllm-bench) - [perplexity](#dotllm-perplexity) - [embed](#dotllm-embed) - [debug](#dotllm-debug-debug-builds-only)
+- [JSON output and exit codes](#json-output-and-exit-codes)
 - [Companion tool: chunkcache](#companion-tool-chunkcache)
 - [Environment variables](#environment-variables)
 
@@ -181,6 +182,13 @@ Also available as the top-level [`dotllm list`](#dotllm-list).
 
 #### dotllm model info
 
+Details of a Hugging Face repository (needs network) and which of its GGUF files are already local. `--json`: [JSON output](#json-output-and-exit-codes).
+
+```text
+dotllm model info TheBloke/Llama-2-7B-GGUF
+dotllm model info TheBloke/Llama-2-7B-GGUF --json
+```
+
 <!-- BEGIN options:model info -->
 | Option | Default | Env | Description |
 |---|---|---|---|
@@ -285,7 +293,7 @@ size, last-write time) and then the model profiles. For the models a **running s
 ```text
 dotllm list
 dotllm list --paths          # add the full file path column
-dotllm list --json           # {"models":[{repo,filename,quant,size_bytes,path,downloaded_at}], "profiles":[{name,from,device}]}
+dotllm list --json           # {"version":1,"models":[{repo,filename,quant,size_bytes,path,downloaded_at}],"profiles":[{name,from,device}]}
 ```
 
 <!-- BEGIN options:list -->
@@ -585,6 +593,7 @@ Lists the models resident in a **running server** (queried over HTTP): which is 
 ```text
 dotllm ps
 dotllm ps --url http://gpu-box:8080
+dotllm ps --json            # {"version":1,"url","models":[{id,active,device,size_bytes,idle_seconds,expires_in_seconds}],"device_warning"}
 ```
 
 <!-- BEGIN options:ps -->
@@ -724,6 +733,39 @@ printf 'one\ntwo\n' | dotllm embed Qwen/Qwen3-Embedding-0.6B-GGUF --device vulka
 Registered only in Debug builds of the CLI (they are absent from release packages): `debug gguf-header <file>`, `debug gguf-metadata <file>`, `debug gguf-tensors <file>`,
 `debug gguf-config <file>` (the ModelConfig derived from the metadata), `debug forward-pass <file> --prompt ...` (one forward pass with logit diagnostics),
 `debug tokenize <file> --text ...` (tokenize and verify the round trip) and `debug embed-lookup <file> --token-id N`. Run `dotllm debug <name> --help` in a Debug build for their options.
+
+## JSON output and exit codes
+
+**`--json`** is available on `dotllm list` / `model list`, `model info` and `ps` (and, with their own shapes, `run` and `bench`). The conventions, shared with
+[chunkcache](CHUNK_CACHE_CLI.md):
+
+- One JSON object on **stdout** and nothing else; progress and diagnostics go to stderr. Keys are `snake_case`.
+- Every object of `list`, `model info` and `ps` carries a top-level integer `version` (currently `1`). Within a version fields are only ever
+  added, and optional fields are **omitted** when they have no value (never `null`). A breaking change bumps `version`.
+- A failing `--json` command prints `{"error": {"code": "error", "message": "...", "exit_code": 1}}` on stdout and exits with that code.
+- The schemas are checked in as test fixtures, `tests/DotLLM.Tests.Unit/Cli/Fixtures/v1/schemas/` (`model-list.json`, `model-info.json`,
+  `ps.json`, `error.json`); `CliJsonTests` validates real command output against them.
+
+`list --json` / `model list --json` (`model-list.json`): `version`; `models`: array of `repo`, `filename`, `quant` (parsed from the file name, `-` when none),
+`size_bytes`, `path`, `downloaded_at` (ISO 8601 last-write time); `profiles`: array of `name`, optional `from`, optional `device`.
+
+`model info --json` (`model-info.json`): `version`, `repo`, optional `author`, `downloads`, `likes`, optional `pipeline`, `tags` (array of strings), optional `local_path`
+(directory of the already-downloaded files of that repo), `gguf_files`: array of `filename`, `size_bytes`, `quant`, `local` (boolean), sorted by file name.
+
+`ps --json` (`ps.json`): `version`, `url` (the server queried), `models`: array of `id`, `active`, optional `device` (only for the active model; `requested -> resolved`
+when they differ), `size_bytes`, optional `idle_seconds`, optional `expires_in_seconds` (absent = never unloads), and an optional `device_warning` (the server's
+CPU-fallback warning). Exactly the models the table shows: the "none" placeholder and unloaded entries are excluded. An empty server is `"models": []` with exit 0.
+
+**Exit codes** (the same table as chunkcache; a test, `CliJsonTests.ExitCodes_UsageErrorsAreTwo_HelpIsZero`, pins 0, 1 and 2):
+
+| Code | Meaning |
+|---|---|
+| `0` | Success (including `--help`, and an empty `list`/`ps`). |
+| `1` | Runtime error: no server answering for `ps`/`stop`, Hugging Face unreachable or repo unknown for `model info`, a model that fails to load, an I/O failure. |
+| `2` | Usage error: unknown command or option, missing or invalid argument. |
+| `3` | Strict / check failure. Used by `chunkcache` (`--strict`); no `dotllm` command returns it today. |
+
+Before #1721 usage errors exited with a Spectre-specific code that was not distinguishable from other failures; scripts that tested for it should test for `2`.
 
 ## Companion tool: chunkcache
 

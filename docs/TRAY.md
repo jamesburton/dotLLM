@@ -118,6 +118,37 @@ request to GitHub until the user turns it on.
 from it. A dev build (`0.3.0-dev.N`) is itself a prerelease, so it follows the dev channel automatically; a stable build
 ignores `-dev` releases unless `include_prereleases` is on.
 
+## Server flags the tray passes (#1721)
+
+Verified against `ServerLaunchSpecBuilder.BuildArguments` (`src/DotLLM.Tray.Core/Hosting/ServerLaunch.cs`) and
+`TraySettings.ToLaunchOptions` (`src/DotLLM.Tray.Core/Config/TraySettings.cs`). When the tray *spawns* a server it runs
+`dotllm serve` with exactly this command line, one argument per list entry (never a joined string):
+
+```text
+dotllm serve [<startup_model>] --host <host> --port <port> --allow-model-admin --no-browser
+             [--device <device>] [--gpu-layers <n>] [--cache-type-k <t>] [--cache-type-v <t>]
+```
+
+| Flag | Source | Emitted |
+|---|---|---|
+| positional `<model>` | `tray.json` `startup_model` | only when set (otherwise the server starts bare) |
+| `--host` | `host` (default `localhost`) | always |
+| `--port` | `port` (default `8080`) | always |
+| `--allow-model-admin` | none (not configurable) | always, so the tray's own write routes are not 403 |
+| `--no-browser` | none (not configurable) | always, the tray owns "open the Web UI" |
+| `--device` | `device` | only when set |
+| `--gpu-layers` | `gpu_layers` | only when set |
+| `--cache-type-k`, `--cache-type-v` | `cache_type_k`, `cache_type_v` | only when set |
+
+Nothing else is passed. In particular the tray does **not** pass `--ctx-size`, `--keep-alive`, `--max-resident-models`,
+`--resident-memory-budget`, `--chunk-cache`, `--api-key`, `--prompt-cache-*` or any sampling/repeat-guard flag: every other `serve` option
+runs at its default for a tray-started server. `ServerLaunchOptions` has fields for `--keep-alive`, `--max-resident-models`,
+`--resident-memory-budget` and verbatim `ExtraArguments`, and the builder renders them, but **`TraySettings.ToLaunchOptions` never sets them**,
+so there is currently no way to reach them from `tray.json`; the keep-alive, resident-count and budget values are changed live through
+`PUT /v1/settings` instead (see the tiers below). An *attached* server (one already running) keeps whatever flags its owner gave it.
+
+The meaning, default and valid values of each flag are in [CLI.md](CLI.md) (`dotllm serve`).
+
 ## The three tiers of setting
 
 Conflating these would be the most misleading thing the UI could do, so the Settings dialog

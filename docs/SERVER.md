@@ -1117,6 +1117,37 @@ ordinals only, and the budget is a file-size sum, not a per-device figure, so tw
 active-model slot is single, so requests are served by one model at a time. Serving two models concurrently on two devices would need a redesign of
 the single active-model slot and is not part of #1704.
 
+## `serve` flags, request fields and web UI settings (#1721)
+
+One flag is often reachable three ways: at startup (`dotllm serve ...`), per model load (`POST /v1/models/load`) or per request, and from
+the web UI (`/`). This table maps them, verified against `ServeCommand.cs`, `ModelLoadRequest` / `ChatCompletionRequest` /
+`SettingsUpdateRequest`, the `/v1/config` endpoint and `wwwroot/app.js` + `index.html`. **none** means the surface does not exist today, not
+that it is undocumented. Flag semantics, defaults and units are in [CLI.md](CLI.md); which of these the Windows tray passes is in
+[TRAY.md](TRAY.md#server-flags-the-tray-passes-1721).
+
+| Concern | `dotllm serve` flag | Request / endpoint field | Web UI setting |
+|---|---|---|---|
+| Device | `--device`, `-d` | `device` on `POST /v1/models/load` | Load dialog: device picker |
+| GPU layers (CUDA partial offload) | `--gpu-layers` | `gpu_layers` on `POST /v1/models/load` | Load dialog: GPU layers slider (GPU devices) |
+| KV cache type K / V | `--cache-type-k`, `--cache-type-v` (aliases `--kv-quant-k/-v`) | `cache_type_k`, `cache_type_v` on `POST /v1/models/load` | Load dialog: K cache / V cache (`auto` sends nothing) |
+| Context window / KV sizing | `--ctx-size`, `-c` | none on load or per request (the fitted window is reported by `GET /props` as `max_sequence_length`) | none |
+| CPU threads / decode threads | `--threads`, `--decode-threads` | `threads`, `decode_threads` on `POST /v1/models/load` | Load dialog: threads, decode threads |
+| Draft model / draft length | `--speculative-model` (`--draft-model`), `--speculative-k` (`--draft-tokens`) | `speculative_model`, `speculative_k` on `POST /v1/models/load` | Load dialog: speculative model and K |
+| MTP self-speculation | `--mtp`, `--no-mtp` | `mtp` on `POST /v1/models/load` | Load dialog: MTP toggle |
+| RoPE / YaRN overrides | `--rope-scaling`, `--rope-freq-base`, `--rope-scale`, `--yarn-*` | the same names, snake_case, on `POST /v1/models/load` | none |
+| Keep-alive (idle unload) | `--keep-alive` | `keep_alive` (seconds) on `POST /v1/models/load` and on chat/completion requests; server default live via `PUT /v1/settings` `keep_alive_seconds` | none in the web UI (the tray's Settings dialog edits the live default) |
+| Max resident models / residency byte budget | `--max-resident-models`, `--resident-memory-budget` | `max_resident_models`, `resident_memory_budget_bytes` via `PUT /v1/settings` | none in the web UI (tray Settings dialog) |
+| Thinking budget | `--reasoning-budget` (`--thinking-budget`) | `thinking_budget_tokens` (alias `reasoning_budget_tokens`) per request | Settings panel: Thinking budget; chat bar: budget |
+| Thinking on/off, effort | none (the model's chat template decides) | `enable_thinking`, `reasoning_effort` per request | Settings panel: Thinking, Reasoning effort; chat bar |
+| Sampling defaults (temperature, top_p, top_k, min_p, repetition_penalty, max_tokens, seed) | none | per request; server-wide defaults via `GET`/`POST /v1/config` | Settings panel sliders and inputs (they start from `/v1/config` and send explicit values) |
+| Repeat guard (#1291) | `--repeat-guard` (default 256; 0 disables) | none | none |
+| Chunk cache | `--chunk-cache`, `--chunk-store`, `--chunk-cache-max-chunks`, `--chunk-cache-api-keys`, `--chunk-cache-allow-short-keys` | top-level `chunk_cache` manifest in the request body (read only with `--chunk-cache` on) | none |
+| `timings`, `ignore_eos`, `min_tokens` (#1345) | none | per request (see above) | none (timings are displayed from the response) |
+
+Notes. The load dialog sends only what the user changed from the default, so an absent field means "the serve flag, else the built-in default".
+A per-load value overrides the startup flag for that load only. A model profile (`dotllm model create`) can pin `device` and `keep_alive` for
+the model it names.
+
 ## Model Keep-Alive / Idle-Unload / Multi-Model Residency (#369)
 
 Ollama-parity daemon lifecycle: idle models unload automatically, and — when configured — more than
