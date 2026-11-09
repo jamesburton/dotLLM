@@ -363,7 +363,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>The API keys of the chunk-cache surface (off by default: loopback callers only).</summary>
         [CommandOption("--chunk-cache-api-keys")]
-        [Description("With --chunk-cache: a file of API keys (one per line, '<key> [admin] [ns=<namespace>]', keys of 32+ characters, e.g. 32 random bytes base64url; '#' comments; read once at startup) that may use /v1/chunk-cache/* " +
+        [Description("With --chunk-cache: a file of API keys (one per line: '<key>' optionally followed by 'admin' and/or 'ns=<namespace>', keys of 32+ characters, e.g. 32 random bytes base64url; '#' comments; read once at startup) that may use /v1/chunk-cache/* " +
                      "(X-API-Key or Authorization: Bearer); each key gets its own store namespace. Without it only loopback callers may. " +
                      "Security-sensitive: see docs/CHUNK_CACHE.md. Inference endpoints stay unauthenticated either way.")]
         public string? ChunkCacheApiKeys { get; set; }

@@ -19,7 +19,8 @@ internal sealed record CliParam(
         get
         {
             if (IsArgument) return Required ? $"`<{Name}>`" : $"`[{Name}]`";
-            string s = $"`--{Name}`" + (Short.Length > 0 ? $", `-{Short}`" : "");
+            string s = string.Join(", ", Name.Split(',').Select(n => $"`--{n}`")
+                .Concat(Short.Length == 0 ? Enumerable.Empty<string>() : Short.Split(',').Select(n => $"`-{n}`")));
             return IsFlag || TypeLabel.Length == 0 ? s : s + $" `<{TypeLabel}>`";
         }
     }
@@ -46,7 +47,8 @@ internal static class CliCommandModel
     /// <summary>Every command and branch in registration order (depth first).</summary>
     public static IReadOnlyList<CliCommand> All => s_all.Value;
 
-    private static IReadOnlyList<CliCommand> Build()
+    /// <summary>Runs the real command tree with <paramref name="args"/> against a wide, colourless, captured console.</summary>
+    public static (int ExitCode, string Output) Run(params string[] args)
     {
         var sw = new StringWriter();
         var console = AnsiConsole.Create(new AnsiConsoleSettings
@@ -64,11 +66,17 @@ internal static class CliCommandModel
             CliConfiguration.Configure(c);
             c.ConfigureConsole(console);
         });
-        int rc = app.Run(["cli", "xmldoc"]);
-        if (rc != 0)
-            throw new InvalidOperationException($"'cli xmldoc' exited {rc} (ValidateExamples failure?): {sw}");
+        int rc = app.Run(args);
+        return (rc, sw.ToString());
+    }
 
-        var doc = XDocument.Parse(sw.ToString());
+    private static IReadOnlyList<CliCommand> Build()
+    {
+        var (rc, xml) = Run("cli", "xmldoc");
+        if (rc != 0)
+            throw new InvalidOperationException($"'cli xmldoc' exited {rc} (ValidateExamples failure?): {xml}");
+
+        var doc = XDocument.Parse(xml);
         var list = new List<CliCommand>();
         foreach (var top in doc.Root!.Elements("Command"))
             Walk(top, "", list);
@@ -96,7 +104,10 @@ internal static class CliCommandModel
     {
         bool isArg = p.Name.LocalName == "Argument";
         string desc = Collapse(p.Element("Description")?.Value);
-        string clr = ((string?)p.Attribute("ClrType") ?? "").Replace("System.", "");
+        string clr = (string?)p.Attribute("ClrType") ?? "";
+        int nl = clr.IndexOf("Nullable`1[[", StringComparison.Ordinal);
+        if (nl >= 0) clr = clr[(nl + "Nullable`1[[".Length)..clr.IndexOf(',', nl)];
+        clr = clr.Replace("System.", "");
         string kind = (string?)p.Attribute("Kind") ?? "scalar";
         bool required = string.Equals((string?)p.Attribute("Required"), "true", StringComparison.OrdinalIgnoreCase);
         bool isFlag = !isArg && (kind == "flag" || clr is "Boolean");
@@ -133,7 +144,7 @@ internal static class CliCommandModel
             else
             {
                 var o = pr.GetCustomAttribute<CommandOptionAttribute>();
-                if (o is not null && o.LongNames.Contains(name, StringComparer.Ordinal)) { prop = pr; break; }
+                if (o is not null && o.LongNames.Contains(name.Split(',')[0], StringComparer.Ordinal)) { prop = pr; break; }
             }
         }
         if (prop is null || isArg) return "";

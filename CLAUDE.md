@@ -276,6 +276,7 @@ store** (#1279) — every model, whether pulled by the CLI or by a test, has one
 | LoRA adapters | [docs/LORA.md](docs/LORA.md) | Adapter loading, multi-adapter serving |
 | Diagnostics & interpretability | [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | Hooks, logit lens, SAE |
 | Telemetry & observability | [docs/TELEMETRY.md](docs/TELEMETRY.md) | Metrics, request tracing |
+| CLI reference | [docs/CLI.md](docs/CLI.md) | Any `dotllm` command/option, `--help` text, device spec, KV sizing flags, env vars (tables are generated; `CliHelpTests` guards them) |
 | Server & API | [docs/SERVER.md](docs/SERVER.md) | Endpoints, rate limiting, warm-up |
 | Anthropic Messages API | [docs/ANTHROPIC_API.md](docs/ANTHROPIC_API.md) | `/v1/messages`, content blocks, streaming events, mapping |
 | Windows system tray | [docs/TRAY.md](docs/TRAY.md) | Tray app, server lifecycle/ownership, autostart, packaging, updates |

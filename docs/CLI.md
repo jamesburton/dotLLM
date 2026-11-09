@@ -143,6 +143,11 @@ dotllm model search "qwen 7b" --sort likes
 ```
 
 <!-- BEGIN options:model search -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<query>` |  |  | Search query (e.g. 'llama', 'mistral 7b'). |
+| `--limit` `<int>` | 20 |  | Maximum number of results. |
+| `--sort` `<text>` | `downloads` |  | Sort field: downloads, likes, lastModified. |
 <!-- END options:model search -->
 
 #### dotllm model pull
@@ -155,6 +160,11 @@ dotllm model pull TheBloke/Llama-2-7B-GGUF --file llama-2-7b.Q4_K_M.gguf
 Free disk space is checked before the download; see [SERVER.md](SERVER.md#model-names-the-hub-cache-and-pulling-714).
 
 <!-- BEGIN options:model pull -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<repo-id>` |  |  | HuggingFace repository ID (e.g. 'TheBloke/Llama-2-7B-GGUF'). |
+| `--dir`, `-d` `<text>` | unset |  | Destination directory. Defaults to ~/.dotllm/models/. |
+| `--file`, `-f` `<text>` | unset |  | Specific GGUF filename to download. If omitted, lists available files for selection. |
 <!-- END options:model pull -->
 
 #### dotllm model list
@@ -162,11 +172,18 @@ Free disk space is checked before the download; see [SERVER.md](SERVER.md#model-
 Also available as the top-level [`dotllm list`](#dotllm-list).
 
 <!-- BEGIN options:model list -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `--json` | off |  | Print one JSON object {"models": [...], "profiles": [...]} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout. |
+| `--paths` | off |  | Add a Path column (full file path) to the model table. Always present in --json output. |
 <!-- END options:model list -->
 
 #### dotllm model info
 
 <!-- BEGIN options:model info -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<repo-id>` |  |  | HuggingFace repository ID (e.g. 'TheBloke/Llama-2-7B-GGUF'). |
 <!-- END options:model info -->
 
 #### dotllm model delete
@@ -177,6 +194,11 @@ dotllm model rm QuantFactory/SmolLM-135M-GGUF --quant Q8_0 --yes
 ```
 
 <!-- BEGIN options:model delete -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<model>` |  |  | HuggingFace repo ID (e.g. 'Qwen/Qwen2.5-0.5B-Instruct-GGUF') or filename pattern. |
+| `--quant`, `-q` `<text>` | unset |  | Quantization filter (e.g. Q4_K_M, Q8_0). Narrows match when repo has multiple files. |
+| `--yes`, `-y` | off |  | Skip confirmation prompt. |
 <!-- END options:model delete -->
 
 #### dotllm model add
@@ -186,6 +208,10 @@ dotllm model add C:\models\my-finetune.gguf --name my-finetune     # then: dotll
 ```
 
 <!-- BEGIN options:model add -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<source>` |  |  | A path to a .gguf file, or an http(s) URL of one. |
+| `--name`, `-n` `<text>` | unset |  | Name to register it under (default: the file name without extension). Listed as 'local/<name>'. |
 <!-- END options:model add -->
 
 #### dotllm model create
@@ -198,16 +224,41 @@ dotllm model create fast --from terse --device vulkan --keep-alive 600
 Creating an existing name overwrites it. A chain of profiles (`fast` -> `terse` -> a GGUF) is merged base-first; loops and chains deeper than 8 are refused.
 
 <!-- BEGIN options:model create -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<name>` |  |  | Name of the new model (letters, digits, . _ - and an optional ':tag'). Requests for this name load the base model with these defaults. |
+| `--description` `<text>` | unset |  | Free-text note shown by 'dotllm model show'. |
+| `--device`, `-d` `<text>` | unset |  | Device this model loads on: auto, cpu, vulkan, vulkan:N, gpu[:N] / cuda[:N]. Unset = the server's --device. See docs/CLI.md#device-selection. |
+| `--from`, `-f` `<text>` | unset |  | Base model: a .gguf path, 'owner/repo[:quant]', a local model name, or another profile. |
+| `--gpu-layers` `<int>` | unset |  | Transformer layers to offload to the GPU (CUDA partial offload). Omit for the device default (all on a GPU device); ignored on vulkan, which is whole-model resident. |
+| `--keep-alive` `<number>` | unset |  | Seconds to keep the model loaded after its last request (0 = unload after each request, negative = never). |
+| `--max-tokens` `<int>` | unset |  | Default maximum generated tokens per request when the request sets none. |
+| `--min-p` `<number>` | unset |  | Default min-P threshold for requests that omit it. 0 = disabled. |
+| `--repeat-penalty` `<number>` | unset |  | Default repetition penalty for requests that omit it. 1.0 = disabled. |
+| `--seed` `<int>` | unset |  | Default sampling seed (integer) for reproducible output. Omit for non-deterministic. |
+| `--stop` `<text>` | unset |  | Stop sequence (repeatable). |
+| `--system` `<text>` | unset |  | System prompt prepended when a chat request has none. |
+| `--system-file` `<text>` | unset |  | Read the system prompt from a file (instead of --system). |
+| `--temperature` `<number>` | unset |  | Default sampling temperature for requests that omit it. 0 = greedy. |
+| `--top-k` `<int>` | unset |  | Default top-K for requests that omit it. 0 = disabled. |
+| `--top-p` `<number>` | unset |  | Default top-P (nucleus) threshold, 0..1, for requests that omit it. |
 <!-- END options:model create -->
 
 #### dotllm model show
 
 <!-- BEGIN options:model show -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<model>` |  |  | A profile name, 'owner/repo[:quant]', or a local model name. |
 <!-- END options:model show -->
 
 #### dotllm model cp
 
 <!-- BEGIN options:model cp -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<source>` |  |  | A profile to copy, or a model reference to alias. |
+| `<destination>` |  |  | The new profile name. |
 <!-- END options:model cp -->
 
 #### dotllm model import-ollama
@@ -218,6 +269,10 @@ dotllm model import-ollama llama3.2:3b --force
 ```
 
 <!-- BEGIN options:model import-ollama -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `[model]` |  |  | One ollama model (e.g. 'llama3.2:3b'). Omit to import every model in the store. |
+| `--force` | off |  | Overwrite an existing profile of the same name. |
 <!-- END options:model import-ollama -->
 
 ### dotllm list
@@ -232,6 +287,10 @@ dotllm list --json           # {"models":[{repo,filename,quant,size_bytes,path,d
 ```
 
 <!-- BEGIN options:list -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `--json` | off |  | Print one JSON object {"models": [...], "profiles": [...]} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout. |
+| `--paths` | off |  | Add a Path column (full file path) to the model table. Always present in --json output. |
 <!-- END options:list -->
 
 ### dotllm run
@@ -255,6 +314,78 @@ Option groups: sampling (`--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-*`
 (`--rope-*`, `--yarn-*`), CPU threading (`--threads`, `--decode-threads`, `--numa-pin`, `--pcore-only`), device and KV (above), adapters (`--lora`, `--ternary-adapter`, `--tensor-overlay`), MoE offload.
 
 <!-- BEGIN options:run -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<model>` |  |  | Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF). |
+| `--cache-type-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache KEY storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-k where that exists (give only one; conflicting values are an error). Unset: the backend default - F32 in the contiguous CPU cache (run/chat), F16 in GPU caches, Q8_0 blocks in the paged CPU cache (pass f16 for BOTH K and V to keep F16 there). On the CUDA hybrid-dense model (Bonsai-2, Qwen3.5/3.6) f32 means 'not given' (DOTLLM_HYBRID_KV applies) and quantized KV needs numKvHeads*headDim % 32 == 0. 'run' and 'bench' warn when the model/backend cannot honour a format. Sizing: docs/CLI.md#kv-cache-sizing. |
+| `--cache-type-v` `<text>` | unset |  | KV-cache VALUE storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-v where that exists. K and V may differ (e.g. -k q8_0 -v q4_0). See --cache-type-k. |
+| `--cache-window` `<int>` | 0 |  | Mixed-precision window: the most recent N tokens stay in full precision, older tokens are quantized on eviction (0 = quantize everything). Only used when --cache-type-k/-v is q8_0 or q4_0; ignored by the hybrid-dense models, which store the whole KV in one format. |
+| `--cpu-moe` | off | `DOTLLM_CPU_MOE` | Keep every MoE layer's routed experts on the CPU (llama.cpp --cpu-moe). CUDA nemotron_h_moe: never cached, always computed on the CPU; other CUDA MoE models (e.g. Flint): computed on the CPU from the mmap'd file; Vulkan Qwen3MoeHybrid (bench): as --n-cpu-moe with every layer. Env fallback: DOTLLM_CPU_MOE=1. |
+| `--ctx-size`, `--ctx` `<int>` | unset | `DOTLLM_MOE_CTX` | Context window in tokens (llama.cpp -c). For nemotron_h_moe it caps the model's context and is what the MoE expert-offload VRAM budget reserves KV cache for (default: the model's maximum context, e.g. 262144 for Nemotron 3.5 Bolt). Lower it to leave more VRAM for the expert cache. Env fallback: DOTLLM_MOE_CTX. |
+| `--decode-threads` `<int>` | 0 |  | Number of threads for decode. 0 = auto (caps at memory channel count). |
+| `--device`, `-d` `<text>` | `auto` | `DOTLLM_VULKAN_DEVICE_INDEX` | Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - with a warning if it ends on the CPU), 'cpu', 'vulkan' (the default Vulkan GPU), 'vulkan:N' (Vulkan physical device N), 'gpu'/'cuda' (CUDA device 0), 'gpu:N'/'cuda:N' (CUDA ordinal N). Case-insensitive. An explicit GPU that cannot be honoured is an error, never a silent CPU run. Env: DOTLLM_VULKAN_DEVICE_INDEX picks the Vulkan device behind plain 'vulkan'. |
+| `--dflash` `<text>` | unset |  | Path of a DFlash / DFlash2 drafter GGUF (arch 'dflash', e.g. z-lab/Qwen3.8-27B-DFlash2-GGUF). It takes the MTP slot: drafts are verified by the MTP speculative decoder, greedy output is identical to plain decode. qwen35 targets on CPU, CUDA or Vulkan (drafter on the CPU). Overrides an embedded MTP head. |
+| `--dry-allowed-length` `<int>` | 2 |  | Minimum matched n-gram length before DRY starts penalizing. |
+| `--dry-base` `<number>` | 1.75 |  | DRY exponential base for the match-length penalty curve. |
+| `--dry-multiplier` `<number>` | 0 |  | DRY (Don't Repeat Yourself) repetition penalty multiplier. 0 = disabled (default). |
+| `--dry-penalty-last-n` `<int>` | 0 |  | Number of recent tokens considered for DRY matching. 0 = full history. |
+| `--dry-sequence-breaker` `<text>` | unset |  | Token string that resets DRY n-gram matching, repeatable. Default: newline, ':', '"', '*'. |
+| `--frequency-penalty` `<number>` | 0 |  | OpenAI-style frequency penalty: subtracted proportionally to occurrence count. 0 = disabled. |
+| `--gpu-layers` `<int>` | unset |  | Number of transformer layers to offload to GPU (CUDA). 0 = CPU only. Omit for default (all layers on a GPU device, 0 with --device cpu). Ignored on vulkan (whole model is device-resident). |
+| `--grammar` `<text>` | unset |  | GBNF grammar string or file path (prefixed with @) for grammar response format. |
+| `--json` | off |  | Output result as a single JSON object (suppresses all formatted output). |
+| `--kv-quant-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache key storage: f16, q8_0, q4_0. Synonym of --cache-type-k. For the CUDA hybrid-dense model (Bonsai-2 / qwen35) overrides DOTLLM_HYBRID_KV; quantized KV needs numKvHeads*headDim % 32 == 0. |
+| `--kv-quant-v` `<text>` | unset |  | KV-cache value storage: f16, q8_0, q4_0. Synonym of --cache-type-v. See --kv-quant-k. |
+| `--logit-bias`, `-l` `<text>` | unset |  | Per-token additive logit bias 'token_id=bias', repeatable (e.g. '-l 15043=-100'). |
+| `--lookup-draft` `<int>` | 8 |  | Maximum drafts per prompt-lookup round. Default 8. |
+| `--lookup-ngram` `<int>` | 6 |  | Longest context suffix (tokens) prompt lookup matches; shorter matches down to 2 tokens are used when it does not recur. Default 6. |
+| `--lora` `<text>` | unset |  | Path to a PEFT LoRA adapter dir; repeatable to stack adapters, optional weight 'path=0.7'. Omit for base. |
+| `--max-tokens`, `-n` `<int>` | 128 |  | Maximum number of tokens to generate (default 128). Also sizes the KV cache for this run: prompt tokens + this value, capped at the model's context length. |
+| `--min-p` `<number>` | 0 |  | Min-P sampling threshold. 0 = disabled. |
+| `--moe-cache-mib` `<text>` | unset | `DOTLLM_MOE_CACHE_MIB` | VRAM expert-cache size in MiB when experts are offloaded; default 'auto' = the measured free-VRAM budget. Larger values are clamped to the budget. Env fallback: DOTLLM_MOE_CACHE_MIB. |
+| `--moe-cache-policy` `<text>` | unset | `DOTLLM_MOE_CACHE_POLICY` | Expert-cache replacement policy: 'slru' (default), 'lru' or 'lfu'. Env fallback: DOTLLM_MOE_CACHE_POLICY. |
+| `--moe-calibrate` | off | `DOTLLM_MOE_CALIBRATE` | Re-run the MoE offload cost calibration (PCIe bandwidth, sync latency, CPU time per expert) instead of reading the cached record in %LOCALAPPDATA%/dotllm/moe-calibration.json. Env fallback: DOTLLM_MOE_CALIBRATE=1. |
+| `--moe-cold` `<text>` | unset | `DOTLLM_MOE_COLD` | Where offloaded experts that are not in the VRAM cache run: 'auto' (default: per expert, CPU or copy-to-GPU by a cost model calibrated at load), 'copy' (copy every miss into the cache), 'cpu' (compute every uncached expert on the CPU; an expert enters the cache only when its recent use beats the weakest cached one). Env fallback: DOTLLM_MOE_COLD. |
+| `--moe-cpu-threads` `<int>` | unset | `DOTLLM_MOE_CPU_THREADS` | Worker threads for MoE experts computed on the CPU (one expert per worker); default physical cores - 1. Env fallback: DOTLLM_MOE_CPU_THREADS. |
+| `--moe-offload` `<text>` | unset | `DOTLLM_MOE_OFFLOAD` | Routed-MoE expert placement on CUDA (nemotron_h_moe): 'auto' (default: keep experts in VRAM when the model fits, else offload them to a host store with a VRAM expert cache), 'off' (refuse a model that does not fit), 'on' (always offload). Env fallback: DOTLLM_MOE_OFFLOAD. |
+| `--mtp-head` `<text>` | unset |  | Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). Default: auto-detected in the model's directory and the one above it (a head that does not fit the device is declined with a warning). Ignored for models whose GGUF embeds the head. |
+| `--n-cpu-moe` `<int>` | unset | `DOTLLM_N_CPU_MOE` | Keep the routed experts of the first N layers (by layer index, llama.cpp --n-cpu-moe) on the CPU. CUDA nemotron_h_moe: never cached, always computed on the CPU; other CUDA MoE models: computed on the CPU from the mmap'd file (#1187); Vulkan Qwen3MoeHybrid: CPU expert compute for those layers (#370). Env fallback: DOTLLM_N_CPU_MOE. |
+| `--no-mtp` | off |  | Disable Multi-Token Prediction (MTP) self-speculative decoding. When enabled (default), MTP auto-engages whenever the loaded GGUF carries an MTP head (nextn.* tensors); an adaptive gate measures it against plain decode and falls back when it loses. Greedy output is identical to plain decode; sampled output is distributed identically (exact speculative sampling). No effect on GGUFs without an MTP head. Mutually exclusive with --speculative-model (an explicit draft model takes priority). |
+| `--numa-pin` | off |  | Pin workers to NUMA-local cores on multi-socket systems. |
+| `--overlay-skip-base-hash` | off |  | Do not verify the overlay's dotllm.overlay.base_sha256 against the base model file (hashing a multi-GB base takes seconds; the digest is cached). |
+| `--paged` | off |  | Use the paged KV cache (fixed-size blocks allocated on demand, ref-counted for prefix sharing) instead of the contiguous cache sized up-front to prompt + --max-tokens. Opt-in here; 'serve' is paged by default (--no-paged to turn off). Needs a uniform per-layer KV width (Gemma-4 / MiMo-V2 use the contiguous cache). |
+| `--pattern` `<text>` | unset |  | Regex pattern for regex response format. Entire output must match. |
+| `--pcore-only` | off |  | Pin workers to P-cores only (Intel hybrid architectures). |
+| `--prefill-chunk-size`, `--ubatch-size` `<int>` | 0 |  | Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). |
+| `--presence-penalty` `<number>` | 0 |  | OpenAI-style presence penalty: subtracted once for any token already seen. 0 = disabled. |
+| `--prompt`, `-p` `<text>` | unset |  | Input prompt for generation. Required unless --prompt-file is given. |
+| `--prompt-file` `<text>` | unset |  | Read the prompt from a file instead of --prompt. A single trailing newline is stripped. Mutually exclusive with --prompt. |
+| `--prompt-lookup`, `--lookup` | off |  | Prompt-lookup speculative decoding: drafts are copied from earlier prompt/output text where the last tokens recur, and verified by the model (greedy output is identical to plain decode). Needs no draft model; pays off on code edits and other self-repeating output. Greedy requests only; a draft model or an MTP head takes priority. |
+| `--quant`, `-q` `<text>` | unset |  | Quantization filter when multiple GGUF files exist (e.g., Q4_K_M, Q8_0). |
+| `--repeat-last-n` `<int>` | 0 |  | Number of recent tokens for repetition penalty lookback. 0 = full history. |
+| `--repeat-penalty` `<number>` | 1 |  | Repetition penalty factor. 1.0 = disabled. |
+| `--response-format` `<text>` | `text` |  | Constrain model output format: 'text' (default), 'json_object', 'json_schema', 'regex', or 'grammar'. |
+| `--rope-freq-base` `<number>` | unset |  | RoPE base frequency (theta) override. Overrides the GGUF-derived value. |
+| `--rope-scale` `<number>` | unset |  | RoPE scaling factor override (linear/YaRN/NTK). Overrides the GGUF-derived value. |
+| `--rope-scaling` `<text>` | unset |  | RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic'. Overrides the GGUF-derived value. |
+| `--schema` `<text>` | unset |  | JSON Schema string or file path (prefixed with @) for json_schema response format. |
+| `--seed`, `-s` `<int>` | unset |  | Random seed for reproducible sampling. Omit for non-deterministic. |
+| `--speculative-k`, `--draft-tokens` `<int>` | 3 |  | Number of draft tokens per speculative step (K). Default 3. Also used as K for --no-mtp/MTP self-speculative decoding. |
+| `--speculative-model`, `--draft-model` `<text>` | unset |  | Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model. |
+| `--temp`, `-t` `<number>` | 0 |  | Sampling temperature. 0 = greedy (default). |
+| `--tensor-overlay` `<text>` | unset |  | Overlay GGUF replacing named FFN tensors (blk.L.ffn_{gate,up,down}[.E].weight), e.g. with TERN_B64_F16 ternary experts. Unknown names, shape mismatches and a base-hash mismatch are errors. CPU backend, plain transformer / MoE-GGUF models only. |
+| `--ternary-adapter` `<text>` | unset |  | Path to a ternary residual adapter (.nsadapter or adapter GGUF); repeatable to compose. CPU and Vulkan models with a residual hook only; others are refused. Omit for base. |
+| `--threads` `<int>` | 0 |  | Number of CPU threads for inference. 0 = auto/all cores (default), 1 = single-threaded. |
+| `--tool-choice` `<text>` | `auto` |  | Tool selection: 'auto' (default), 'none', 'required' (constrain output to a valid tool call), or a function name. |
+| `--tools` `<text>` | unset |  | Tool definitions: JSON array string or file path (prefixed with @). When provided, the prompt is formatted via the model's chat template with tool definitions. |
+| `--top-k` `<int>` | 0 |  | Top-K sampling. 0 = disabled. |
+| `--top-nsigma`, `--top-n-sigma` `<number>` | -1 |  | Top-nσ sampling threshold. Negative = disabled (default). |
+| `--top-p` `<number>` | 1 |  | Top-P (nucleus) sampling threshold. |
+| `--verbose` | off |  | Print extra diagnostics after the run (e.g. the MoE expert-offload summary: cache size, hit rate, H2D MB/token, copy wait). |
+| `--yarn-attn-factor` `<number>` | unset |  | YaRN attention factor override. |
+| `--yarn-beta-fast` `<number>` | unset |  | YaRN beta-fast parameter override. |
+| `--yarn-beta-slow` `<number>` | unset |  | YaRN beta-slow parameter override. |
+| `--yarn-orig-ctx` `<int>` | unset |  | YaRN original context length override. |
 <!-- END options:run -->
 
 ### dotllm chat
@@ -275,6 +406,65 @@ dotllm chat Qwen/Qwen3-0.6B-GGUF --tools @tools.json --tool-choice auto
 ```
 
 <!-- BEGIN options:chat -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<model>` |  |  | Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF). |
+| `--cache-type-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache KEY storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-k where that exists (give only one; conflicting values are an error). Unset: the backend default - F32 in the contiguous CPU cache (run/chat), F16 in GPU caches, Q8_0 blocks in the paged CPU cache (pass f16 for BOTH K and V to keep F16 there). On the CUDA hybrid-dense model (Bonsai-2, Qwen3.5/3.6) f32 means 'not given' (DOTLLM_HYBRID_KV applies) and quantized KV needs numKvHeads*headDim % 32 == 0. 'run' and 'bench' warn when the model/backend cannot honour a format. Sizing: docs/CLI.md#kv-cache-sizing. |
+| `--cache-type-v` `<text>` | unset |  | KV-cache VALUE storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-v where that exists. K and V may differ (e.g. -k q8_0 -v q4_0). See --cache-type-k. |
+| `--cache-window` `<int>` | 0 |  | Mixed-precision window: the most recent N tokens stay in full precision, older tokens are quantized on eviction (0 = quantize everything). Only used when --cache-type-k/-v is q8_0 or q4_0; ignored by the hybrid-dense models, which store the whole KV in one format. |
+| `--cpu-moe` | off | `DOTLLM_CPU_MOE` | Keep every MoE layer's routed experts on the CPU (llama.cpp --cpu-moe). CUDA nemotron_h_moe: never cached, always computed on the CPU; other CUDA MoE models (e.g. Flint): computed on the CPU from the mmap'd file; Vulkan Qwen3MoeHybrid (bench): as --n-cpu-moe with every layer. Env fallback: DOTLLM_CPU_MOE=1. |
+| `--ctx-size`, `--ctx` `<int>` | unset | `DOTLLM_MOE_CTX` | Context window in tokens (llama.cpp -c). For nemotron_h_moe it caps the model's context and is what the MoE expert-offload VRAM budget reserves KV cache for (default: the model's maximum context, e.g. 262144 for Nemotron 3.5 Bolt). Lower it to leave more VRAM for the expert cache. Env fallback: DOTLLM_MOE_CTX. |
+| `--decode-threads` `<int>` | 0 |  | Number of threads for decode. 0 = auto (caps at memory channel count). |
+| `--device`, `-d` `<text>` | `auto` | `DOTLLM_VULKAN_DEVICE_INDEX` | Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - with a warning if it ends on the CPU), 'cpu', 'vulkan' (the default Vulkan GPU), 'vulkan:N' (Vulkan physical device N), 'gpu'/'cuda' (CUDA device 0), 'gpu:N'/'cuda:N' (CUDA ordinal N). Case-insensitive. An explicit GPU that cannot be honoured is an error, never a silent CPU run. Env: DOTLLM_VULKAN_DEVICE_INDEX picks the Vulkan device behind plain 'vulkan'. |
+| `--dflash` `<text>` | unset |  | Path of a DFlash / DFlash2 drafter GGUF (arch 'dflash', e.g. z-lab/Qwen3.8-27B-DFlash2-GGUF). It takes the MTP slot: drafts are verified by the MTP speculative decoder, greedy output is identical to plain decode. qwen35 targets on CPU, CUDA or Vulkan (drafter on the CPU). Overrides an embedded MTP head. |
+| `--gpu-layers` `<int>` | unset |  | Number of transformer layers to offload to GPU (CUDA). 0 = CPU only. Omit for default (all layers on a GPU device, 0 with --device cpu). Ignored on vulkan (whole model is device-resident). |
+| `--grammar` `<text>` | unset |  | GBNF grammar string or file path (prefixed with @) for grammar response format. |
+| `--lookup-draft` `<int>` | 8 |  | Maximum drafts per prompt-lookup round. Default 8. |
+| `--lookup-ngram` `<int>` | 6 |  | Longest context suffix (tokens) prompt lookup matches; shorter matches down to 2 tokens are used when it does not recur. Default 6. |
+| `--max-tokens`, `-n` `<int>` | 512 |  | Maximum number of tokens to generate per response. |
+| `--min-p` `<number>` | 0 |  | Min-P sampling threshold. 0 = disabled. |
+| `--moe-cache-mib` `<text>` | unset | `DOTLLM_MOE_CACHE_MIB` | VRAM expert-cache size in MiB when experts are offloaded; default 'auto' = the measured free-VRAM budget. Larger values are clamped to the budget. Env fallback: DOTLLM_MOE_CACHE_MIB. |
+| `--moe-cache-policy` `<text>` | unset | `DOTLLM_MOE_CACHE_POLICY` | Expert-cache replacement policy: 'slru' (default), 'lru' or 'lfu'. Env fallback: DOTLLM_MOE_CACHE_POLICY. |
+| `--moe-calibrate` | off | `DOTLLM_MOE_CALIBRATE` | Re-run the MoE offload cost calibration (PCIe bandwidth, sync latency, CPU time per expert) instead of reading the cached record in %LOCALAPPDATA%/dotllm/moe-calibration.json. Env fallback: DOTLLM_MOE_CALIBRATE=1. |
+| `--moe-cold` `<text>` | unset | `DOTLLM_MOE_COLD` | Where offloaded experts that are not in the VRAM cache run: 'auto' (default: per expert, CPU or copy-to-GPU by a cost model calibrated at load), 'copy' (copy every miss into the cache), 'cpu' (compute every uncached expert on the CPU; an expert enters the cache only when its recent use beats the weakest cached one). Env fallback: DOTLLM_MOE_COLD. |
+| `--moe-cpu-threads` `<int>` | unset | `DOTLLM_MOE_CPU_THREADS` | Worker threads for MoE experts computed on the CPU (one expert per worker); default physical cores - 1. Env fallback: DOTLLM_MOE_CPU_THREADS. |
+| `--moe-offload` `<text>` | unset | `DOTLLM_MOE_OFFLOAD` | Routed-MoE expert placement on CUDA (nemotron_h_moe): 'auto' (default: keep experts in VRAM when the model fits, else offload them to a host store with a VRAM expert cache), 'off' (refuse a model that does not fit), 'on' (always offload). Env fallback: DOTLLM_MOE_OFFLOAD. |
+| `--mtp-head` `<text>` | unset |  | Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). Default: auto-detected next to the model; a head that does not fit the device is declined with a warning. |
+| `--n-cpu-moe` `<int>` | unset | `DOTLLM_N_CPU_MOE` | Keep the routed experts of the first N layers (by layer index, llama.cpp --n-cpu-moe) on the CPU. CUDA nemotron_h_moe: never cached, always computed on the CPU; other CUDA MoE models: computed on the CPU from the mmap'd file (#1187); Vulkan Qwen3MoeHybrid: CPU expert compute for those layers (#370). Env fallback: DOTLLM_N_CPU_MOE. |
+| `--no-mtp` | off |  | Disable Multi-Token Prediction (MTP) self-speculative decoding (on by default when the model carries an MTP head; an adaptive gate falls back to plain decode when it loses). |
+| `--no-prompt-cache` | off |  | Disable prompt caching (KV state reuse across turns). On by default; cleared by /clear. |
+| `--numa-pin` | off |  | Pin workers to NUMA-local cores on multi-socket systems. |
+| `--paged` | off |  | Use the paged KV cache (fixed-size blocks allocated on demand, ref-counted for prefix sharing) instead of the contiguous cache sized up-front to prompt + --max-tokens. Opt-in here; 'serve' is paged by default (--no-paged to turn off). Needs a uniform per-layer KV width (Gemma-4 / MiMo-V2 use the contiguous cache). |
+| `--pattern` `<text>` | unset |  | Regex pattern for regex response format. Entire output must match. |
+| `--pcore-only` | off |  | Pin workers to P-cores only (Intel hybrid architectures). |
+| `--prefill-chunk-size`, `--ubatch-size` `<int>` | 0 |  | Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). |
+| `--prefix-snapshot-disk-budget` `<text>` | unset |  | Snapshot spill budget, such as 32GiB; requires a disk directory. Default 0 disables disk retention. |
+| `--prefix-snapshot-disk-dir` `<text>` | unset |  | Directory for recurrent prefix spill files; requires a positive disk budget. |
+| `--prefix-snapshot-host-budget` `<text>` | unset |  | Page-locked host snapshot budget, such as 8GiB. Default 0 disables host retention. |
+| `--prefix-snapshots` `<int>` | unset |  | Maximum recurrent prefix snapshots (default 1). |
+| `--prompt-cache-policy` `<text>` | unset | `DOTLLM_PREFIX_POLICY` | Prefix-cache retention policy: lru (default) or agent (a conversation survives about its own length of other prompt tokens; side requests run without truncating it; recurrent models checkpoint at the last user message and after the reply). Env DOTLLM_PREFIX_POLICY. |
+| `--prompt-cache-size` `<int>` | 1 |  | Maximum number of cached sessions kept for prompt caching. Default 1 (one conversation). |
+| `--prompt-cache-step` `<int>` | 0 |  | Recurrent-state checkpoint every N prefill tokens, so a prompt that diverges mid-history (a trimmed tool result) resumes from the nearest one. Default 0 (off). |
+| `--prompt-cache-step-keep` `<int>` | unset |  | Most --prompt-cache-step checkpoints kept, deepest first (default 8). |
+| `--prompt-lookup`, `--lookup` | off |  | Prompt-lookup speculative decoding: drafts are copied from earlier prompt/output text where the last tokens recur, and verified by the model (greedy output is identical to plain decode). Needs no draft model; pays off on code edits and other self-repeating output. Greedy requests only; a draft model or an MTP head takes priority. |
+| `--quant`, `-q` `<text>` | unset |  | Quantization filter when multiple GGUF files exist (e.g., Q4_K_M, Q8_0). |
+| `--repeat-last-n` `<int>` | 0 |  | Number of recent tokens for repetition penalty lookback. 0 = full history. |
+| `--repeat-penalty` `<number>` | 1 |  | Repetition penalty factor. 1.0 = disabled. |
+| `--response-format` `<text>` | `text` |  | Constrain model output format: 'text' (default), 'json_object', 'json_schema', 'regex', or 'grammar'. |
+| `--schema` `<text>` | unset |  | JSON Schema string or file path (prefixed with @) for json_schema response format. |
+| `--seed` `<int>` | unset |  | Random seed for reproducible sampling. Omit for non-deterministic. |
+| `--speculative-k`, `--draft-tokens` `<int>` | 3 |  | Number of draft tokens per speculative step (K). Default 3. |
+| `--speculative-model`, `--draft-model` `<text>` | unset |  | Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model. |
+| `--system`, `-s` `<text>` | unset |  | System prompt for the conversation. |
+| `--system-file` `<text>` | unset |  | Read the system prompt from a file instead of --system. A single trailing newline is stripped. Mutually exclusive with --system. |
+| `--temp`, `-t` `<number>` | 0 |  | Sampling temperature. 0 = greedy (default). |
+| `--ternary-adapter` `<text>` | unset |  | Path to a ternary residual adapter (.nsadapter or adapter GGUF); repeatable to compose. CPU and Vulkan models with a residual hook only; others are refused. Omit for base. |
+| `--threads` `<int>` | 0 |  | Number of CPU threads for inference. 0 = auto/all cores (default). |
+| `--tool-choice` `<text>` | `auto` |  | Tool choice: 'auto' (default), 'none', 'required', or a function name. |
+| `--tools` `<text>` | unset |  | Tool definitions: JSON array string or file path (prefixed with @). Each tool: {"name": "...", "description": "...", "parameters": {...}}. |
+| `--top-k` `<int>` | 0 |  | Top-K sampling. 0 = disabled. |
+| `--top-p` `<number>` | 1 |  | Top-P (nucleus) sampling threshold. |
+| `--verbose`, `-v` | off |  | Show debug info: finish reason, raw text before stop-sequence stripping, tool call detection details. |
 <!-- END options:chat -->
 
 ### dotllm serve
@@ -301,6 +491,88 @@ Notes on interplay:
 - **Observability:** `/metrics` is on for loopback binds only unless `--metrics`; OpenTelemetry export is configured with `OTEL_EXPORTER_OTLP_ENDPOINT`; per-request timing lines can be turned off with `DOTLLM_LOG_TIMINGS=0`.
 
 <!-- BEGIN options:serve -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `[model]` |  |  | Path to a GGUF file or HuggingFace repo ID. Omit to start without a model (load from UI). |
+| `--allow-lora-admin` | off |  | Enable the LoRA admin API: POST /v1/lora/load and DELETE /v1/lora/{name}. Off by default. |
+| `--allow-model-admin` | off |  | Enable the model-administration API (#454): POST /v1/models/unload, /pull, /enable, /disable and PUT /v1/settings. Off by default. |
+| `--auto-pull` | off |  | Download a missing Hugging Face model when a request names one (e.g. model "owner/repo:Q4_K_M"), like 'ollama run' does. Off by default: remote clients should not be able to start multi-gigabyte downloads. |
+| `--cache-type-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache KEY storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-k where that exists (give only one; conflicting values are an error). Unset: the backend default - F32 in the contiguous CPU cache (run/chat), F16 in GPU caches, Q8_0 blocks in the paged CPU cache (pass f16 for BOTH K and V to keep F16 there). On the CUDA hybrid-dense model (Bonsai-2, Qwen3.5/3.6) f32 means 'not given' (DOTLLM_HYBRID_KV applies) and quantized KV needs numKvHeads*headDim % 32 == 0. 'run' and 'bench' warn when the model/backend cannot honour a format. Sizing: docs/CLI.md#kv-cache-sizing. |
+| `--cache-type-v` `<text>` | unset |  | KV-cache VALUE storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-v where that exists. K and V may differ (e.g. -k q8_0 -v q4_0). See --cache-type-k. |
+| `--chunk-cache` | off |  | Honour chunk_cache annotations on /v1/chat/completions and /v1/messages (chunk-level K/V reuse convention, docs/CHUNK_CACHE.md): policies exact (default) and shadow, whose output is identical to the unannotated request; responses gain a chunk_cache report. Off by default: annotations are ignored like any unknown field and responses are unchanged. |
+| `--chunk-cache-allow-short-keys` | off |  | With --chunk-cache-api-keys: accept keys shorter than 32 characters (each logged as a warning). Off by default: such a key refuses startup, because namespaces derived from keys appear in the store's file names and can be checked offline. |
+| `--chunk-cache-api-keys` `<text>` | unset |  | With --chunk-cache: a file of API keys (one per line, '<key> [admin] [ns=<namespace>]', keys of 32+ characters, e.g. 32 random bytes base64url; '#' comments; read once at startup) that may use /v1/chunk-cache/* (X-API-Key or Authorization: Bearer); each key gets its own store namespace. Without it only loopback callers may. Security-sensitive: see docs/CHUNK_CACHE.md. Inference endpoints stay unauthenticated either way. |
+| `--chunk-cache-max-chunks` `<int>` | unset |  | Most chunk annotations read per request (default 4096, at least 1); the rest are dropped with chunk_too_many without being read. |
+| `--chunk-store` `<text>` | unset |  | With --chunk-cache: the chunk store (e.g. built by chunkcache build) the server looks annotated chunks up in, to count hits and plan shadow reuse. Read-only: the server never writes or creates it; a missing directory is reported as chunk_store_unavailable. |
+| `--cpu-moe` | off | `DOTLLM_CPU_MOE` | Keep every MoE layer's routed experts on the CPU (llama.cpp --cpu-moe). CUDA nemotron_h_moe: never cached, always computed on the CPU; other CUDA MoE models (e.g. Flint): computed on the CPU from the mmap'd file; Vulkan Qwen3MoeHybrid (bench): as --n-cpu-moe with every layer. Env fallback: DOTLLM_CPU_MOE=1. |
+| `--ctx-size`, `-c` `<int>` | unset |  | Served context window in tokens (llama.cpp -c). Default: the CUDA hybrid model (Bonsai, Qwen3.5/3.6 dense) fits it to free VRAM at load and reports it in /props as max_sequence_length; other models keep the checkpoint's window. A value overrides the fit (capped at the checkpoint's window); past the fit, requests are refused with an out-of-memory error instead of spilling into system RAM. |
+| `--decision-orderings` `<int>` | 1 |  | Option orderings averaged per noul/choice question on POST /v1/systemone: 1 (default) or 2 (forward + reversed, logits averaged; reversal flipped 2.2% of Tev1-4B choice answers and averaging lifted choice accuracy 98.2 -> 98.9%, at twice the forward passes). |
+| `--decision-temperature` `<number>` | 0 |  | Logit temperature for POST /v1/systemone probabilities (softmax(logits / T)). 0 or 1 (default) = the model's raw restricted softmax. Tev1-4B is slightly under-confident: T=0.58 cut held-out NLL 0.0546 -> 0.0428 on a 480-item labelled set (scripts/decision-calibration.py); fit your own on your task before relying on it. |
+| `--decode-threads` `<int>` | 0 |  | CPU threads for the decode phase. 0 = auto (capped at the memory-channel count, since decode is bandwidth-bound). |
+| `--device`, `-d` `<text>` | `auto` | `DOTLLM_VULKAN_DEVICE_INDEX` | Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - with a warning if it ends on the CPU), 'cpu', 'vulkan' (the default Vulkan GPU), 'vulkan:N' (Vulkan physical device N), 'gpu'/'cuda' (CUDA device 0), 'gpu:N'/'cuda:N' (CUDA ordinal N). Case-insensitive. An explicit GPU that cannot be honoured is an error, never a silent CPU run. Env: DOTLLM_VULKAN_DEVICE_INDEX picks the Vulkan device behind plain 'vulkan'. A model profile's device overrides it for that model. |
+| `--dflash` `<text>` | unset |  | Path of a DFlash / DFlash2 drafter GGUF (arch 'dflash'). It takes the MTP slot; qwen35 targets on CPU, CUDA or Vulkan (drafter on the CPU). |
+| `--expected-concurrency` `<int>` | 0 | `DOTLLM_VK_SCHEDULER` | Expected number of concurrently decoding requests. At 5 or more, Vulkan hybrid models serve through the continuous-batch scheduler (measured +73% aggregate decode throughput at 8 concurrent on Tev1-4B; parity at 4 or fewer). At 5 or more, default-on MTP is dropped for the model. 0 (default) keeps the serial per-request path. DOTLLM_VK_SCHEDULER=0\|1 overrides. |
+| `--gpu-layers` `<int>` | unset |  | CUDA partial offload: number of transformer layers kept on the GPU, the rest run on the CPU. Omit for all layers on a GPU device (0 with --device cpu). Ignored on vulkan, where the whole model is device-resident. |
+| `--host` `<text>` | `localhost` |  | Address to bind (default localhost = loopback only). Use 0.0.0.0 to serve the network - the inference endpoints are unauthenticated, so pair that with a firewall or reverse proxy. /metrics is on by default for loopback binds only. |
+| `--keep-alive` `<number>` | 300 |  | Idle-unload timeout in seconds (ollama parity). Default 300 (5 min); 0 = unload after every request; negative = never unload. A model profile's keep_alive overrides it for that model. |
+| `--kv-quant-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache key storage: f16, q8_0, q4_0. Synonym of --cache-type-k. For the CUDA hybrid-dense model (Bonsai-2 / qwen35) overrides DOTLLM_HYBRID_KV; quantized KV needs numKvHeads*headDim % 32 == 0. |
+| `--kv-quant-v` `<text>` | unset |  | KV-cache value storage: f16, q8_0, q4_0. Synonym of --cache-type-v. See --kv-quant-k. |
+| `--lookup-draft` `<int>` | 8 |  | Maximum drafts per prompt-lookup round. Default 8. |
+| `--lookup-ngram` `<int>` | 6 |  | Longest context suffix (tokens) prompt lookup matches; shorter matches down to 2 tokens are used when it does not recur. Default 6. |
+| `--max-messages` `<int>` | unset | `DOTLLM_MAX_MESSAGES` | Maximum messages accepted per chat request on /v1/chat/completions and /v1/messages. Default 8192; 0 = unlimited. Falls back to the DOTLLM_MAX_MESSAGES environment variable; the flag wins. The prompt-length-vs-context check still applies. |
+| `--max-resident-models` `<int>` | 1 |  | Maximum number of models kept loaded at once, counting the active one. Default 1 = classic single-model hot-swap (loading another model unloads the current one). Above 1, earlier models stay resident (instant switching) and, when a load would exceed the count or --resident-memory-budget, the least recently used ones are evicted first. |
+| `--metrics` | off |  | Serve Prometheus metrics at GET /metrics on any bind. Default: on for loopback binds only. |
+| `--moe-cache-mib` `<text>` | unset | `DOTLLM_MOE_CACHE_MIB` | VRAM expert-cache size in MiB when experts are offloaded; default 'auto' = the measured free-VRAM budget. Larger values are clamped to the budget. Env fallback: DOTLLM_MOE_CACHE_MIB. |
+| `--moe-cache-policy` `<text>` | unset | `DOTLLM_MOE_CACHE_POLICY` | Expert-cache replacement policy: 'slru' (default), 'lru' or 'lfu'. Env fallback: DOTLLM_MOE_CACHE_POLICY. |
+| `--moe-calibrate` | off | `DOTLLM_MOE_CALIBRATE` | Re-run the MoE offload cost calibration (PCIe bandwidth, sync latency, CPU time per expert) instead of reading the cached record in %LOCALAPPDATA%/dotllm/moe-calibration.json. Env fallback: DOTLLM_MOE_CALIBRATE=1. |
+| `--moe-cold` `<text>` | unset | `DOTLLM_MOE_COLD` | Where offloaded experts that are not in the VRAM cache run: 'auto' (default: per expert, CPU or copy-to-GPU by a cost model calibrated at load), 'copy' (copy every miss into the cache), 'cpu' (compute every uncached expert on the CPU; an expert enters the cache only when its recent use beats the weakest cached one). Env fallback: DOTLLM_MOE_COLD. |
+| `--moe-cpu-threads` `<int>` | unset | `DOTLLM_MOE_CPU_THREADS` | Worker threads for MoE experts computed on the CPU (one expert per worker); default physical cores - 1. Env fallback: DOTLLM_MOE_CPU_THREADS. |
+| `--moe-offload` `<text>` | unset | `DOTLLM_MOE_OFFLOAD` | Routed-MoE expert placement on CUDA (nemotron_h_moe): 'auto' (default: keep experts in VRAM when the model fits, else offload them to a host store with a VRAM expert cache), 'off' (refuse a model that does not fit), 'on' (always offload). Env fallback: DOTLLM_MOE_OFFLOAD. |
+| `--mtp` | off |  | Multi-Token Prediction (MTP) self-speculative decoding is ON by default for serve when the loaded GGUF carries an embedded MTP head (nextn.* tensors) and no --speculative-model is given and --expected-concurrency is below 5 (adaptive: it backs off when drafts stop paying). --mtp is accepted for back-compat and only changes the startup log; it does not override those rules. Use --no-mtp to opt out. Tradeoff: while MTP is active the continuous-batch scheduler is off for this model. |
+| `--mtp-head` `<text>` | unset |  | Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). Default: auto-detected in the model's directory and the one above it (a head that does not fit the device is declined with a startup message and serving continues without it). |
+| `--n-cpu-moe` `<int>` | unset | `DOTLLM_N_CPU_MOE` | Keep the routed experts of the first N layers (by layer index, llama.cpp --n-cpu-moe) on the CPU. CUDA nemotron_h_moe: never cached, always computed on the CPU; other CUDA MoE models: computed on the CPU from the mmap'd file (#1187); Vulkan Qwen3MoeHybrid: CPU expert compute for those layers (#370). Env fallback: DOTLLM_N_CPU_MOE. |
+| `--no-browser` | off |  | Don't auto-open the browser. |
+| `--no-metrics` | off |  | Do not serve GET /metrics. |
+| `--no-mtp` | off |  | Disable the default-on MTP self-speculative decoding for models with an embedded MTP head (keeps the continuous-batch scheduler available for concurrent clients). |
+| `--no-paged` | off |  | Disable the paged KV cache and use contiguous per-request caches instead. Default (paged): fixed-size blocks allocated on demand with prefix sharing, so memory tracks live tokens. Models without a uniform per-layer KV width always use the contiguous cache. |
+| `--no-prompt-cache` | off |  | Disable prompt caching (KV state reuse across turns/requests). On by default. |
+| `--no-ui` | off |  | Disable the built-in web chat UI. Only serve API endpoints. |
+| `--no-warmup` | off |  | Disable warm-up passes at startup. When enabled (default), dummy inference runs trigger JIT compilation. |
+| `--overlay-skip-base-hash` | off |  | Do not verify the overlay's dotllm.overlay.base_sha256 against the base model file (hashing a multi-GB base takes seconds; the digest is cached). |
+| `--port`, `-p` `<int>` | 8080 |  | TCP port to listen on (default 8080). 'dotllm ps' / 'stop' use the same default. |
+| `--prefill-chunk-size`, `--ubatch-size` `<int>` | 0 |  | Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). With the continuous-batch scheduler this caps prefill tokens admitted per step instead. |
+| `--prefix-snapshot-disk-budget` `<text>` | unset |  | Snapshot spill budget, such as 32GiB; requires a disk directory. Default 0 disables disk retention. |
+| `--prefix-snapshot-disk-dir` `<text>` | unset |  | Directory for recurrent prefix spill files; requires a positive disk budget. |
+| `--prefix-snapshot-host-budget` `<text>` | unset |  | Page-locked host snapshot budget, such as 8GiB. Default 0 disables host retention. |
+| `--prefix-snapshots` `<int>` | unset |  | Maximum recurrent prefix snapshots (default 1). Use with --prefix-snapshot-host-budget for alternating sessions. |
+| `--prompt-cache-policy` `<text>` | unset | `DOTLLM_PREFIX_POLICY` | Prefix-cache retention policy: lru (default) or agent (a conversation survives about its own length of other prompt tokens, side requests run without truncating it, recurrent models checkpoint at the last user message and after the reply). Env DOTLLM_PREFIX_POLICY. |
+| `--prompt-cache-size` `<int>` | 4 |  | Maximum number of cached sessions (prompt prefixes) kept for reuse. Default 4. |
+| `--prompt-cache-step` `<int>` | 0 |  | Recurrent-state checkpoint every N prefill tokens, so a prompt that diverges mid-history (a trimmed tool result) resumes from the nearest one. Default 0 (off). |
+| `--prompt-cache-step-keep` `<int>` | unset |  | Most --prompt-cache-step checkpoints kept, deepest first (default 8). |
+| `--prompt-lookup`, `--lookup` | off |  | Prompt-lookup speculative decoding: drafts are copied from earlier prompt/output text where the last tokens recur, and verified by the model (greedy output is identical to plain decode). Needs no draft model; pays off on code edits and other self-repeating output. Greedy requests only; a draft model or an MTP head takes priority. |
+| `--quant`, `-q` `<text>` | unset |  | Quantization filter when multiple GGUF files exist (e.g., Q4_K_M, Q8_0). |
+| `--rate-limit-concurrency` `<int>` | 0 |  | Rate limit: max concurrent in-flight requests per API key. 0 = unlimited. |
+| `--rate-limit-rpm` `<int>` | 0 |  | Rate limit: max requests per minute per API key. 0 = unlimited. Setting any --rate-limit-* option enables rate limiting (off by default). |
+| `--rate-limit-tpm` `<int>` | 0 |  | Rate limit: max tokens per minute per API key (prompt + completion). 0 = unlimited. |
+| `--reasoning-answer-reserve` `<int>` | 8192 |  | With a thinking budget, max_tokens is raised to at least budget + this so the answer is not truncated (default 8192; 0 = llama.cpp: the budget counts inside max_tokens). The context window still caps it. |
+| `--reasoning-budget-message` `<text>` | unset |  | Text forced before the end-of-thinking tag when the thinking budget runs out (default none). |
+| `--reasoning-budget`, `--thinking-budget` `<int>` | -1 |  | Thinking token budget (llama.cpp semantics): -1 unlimited (default), 0 end thinking immediately, N at most N thinking tokens, then --reasoning-budget-message and the close tag are forced and the answer continues. Requests override with thinking_budget_tokens (Anthropic: thinking.budget_tokens). |
+| `--reasoning-format` `<text>` | `auto` |  | How thinking output is separated from the answer: auto (default; split into reasoning_content + content when the chat template opens a <think> block or the model emits one), deepseek (as auto, and <think> blocks are recognised anywhere in the output), none (raw output in content, </think> included). Requests may override with reasoning_format. |
+| `--repeat-guard` `<int>` | 256 |  | End a request (finish_reason=length) after this many identical tokens in a row; catches a sampler pinned on one token under memory pressure, which otherwise looks like a hang. Default 256; 0 disables. |
+| `--resident-memory-budget` `<int>` | 0 |  | Total byte budget (an integer number of BYTES, e.g. 17179869184 for 16 GiB) across all resident models. Default 0 = unlimited, so only --max-resident-models bounds residency. |
+| `--rope-freq-base` `<number>` | unset |  | RoPE base frequency (theta) override. Overrides the GGUF-derived value. |
+| `--rope-scale` `<number>` | unset |  | RoPE scaling factor override (linear/YaRN/NTK). Overrides the GGUF-derived value. |
+| `--rope-scaling` `<text>` | unset |  | RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic'. Overrides the GGUF-derived value. |
+| `--speculative-k`, `--draft-tokens` `<int>` | 3 |  | Number of draft tokens per speculative step (K). Default 3. Also used as K for MTP. |
+| `--speculative-model`, `--draft-model` `<text>` | unset |  | Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model. |
+| `--tensor-overlay` `<text>` | unset |  | Overlay GGUF replacing named FFN tensors (blk.L.ffn_{gate,up,down}[.E].weight), e.g. with TERN_B64_F16 ternary experts. Unknown names, shape mismatches and a base-hash mismatch are errors. CPU backend, plain transformer / MoE-GGUF models only. |
+| `--ternary-adapter` `<text>` | unset |  | Ternary residual adapter (.nsadapter or adapter GGUF, docs/TERNARY_ADAPTER.md) applied to every request; CPU and Vulkan models with a residual hook (see docs/TERNARY_ADAPTER.md), any other model fails the load; repeatable to compose. |
+| `--threads` `<int>` | 0 |  | CPU threads for inference. 0 = auto (all cores); 1 = single-threaded. |
+| `--warmup-iterations` `<int>` | 3 |  | Number of warm-up iterations (default: 3). More iterations improve JIT optimization via Dynamic PGO. |
+| `--yarn-attn-factor` `<number>` | unset |  | YaRN attention factor override. |
+| `--yarn-beta-fast` `<number>` | unset |  | YaRN beta-fast parameter override. |
+| `--yarn-beta-slow` `<number>` | unset |  | YaRN beta-slow parameter override. |
+| `--yarn-orig-ctx` `<int>` | unset |  | YaRN original context length override. |
 <!-- END options:serve -->
 
 ### dotllm ps
@@ -314,6 +586,9 @@ dotllm ps --url http://gpu-box:8080
 ```
 
 <!-- BEGIN options:ps -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `--url` `<text>` | unset | `DOTLLM_URL` | Base URL of the running dotllm server. Default: the DOTLLM_URL environment variable, else http://localhost:8080 (the default of dotllm serve --port). |
 <!-- END options:ps -->
 
 ### dotllm stop
@@ -321,6 +596,12 @@ dotllm ps --url http://gpu-box:8080
 Unloads one model (`dotllm stop llama3.2:3b`, names as shown by `ps`), every model (`--all`), or asks the whole server to shut down gracefully (`--server`). The server must have been started with `--allow-model-admin`.
 
 <!-- BEGIN options:stop -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `[model]` |  |  | Model to unload (as shown by 'dotllm ps'). Omit with --all to unload everything. |
+| `--all` | off |  | Unload every resident model. |
+| `--server` | off |  | Stop the whole server process gracefully (POST /v1/admin/shutdown). |
+| `--url` `<text>` | unset | `DOTLLM_URL` | Base URL of the running dotllm server. Default: the DOTLLM_URL environment variable, else http://localhost:8080 (the default of dotllm serve --port). |
 <!-- END options:stop -->
 
 ### dotllm bench
@@ -335,6 +616,32 @@ dotllm bench QuantFactory/SmolLM-135M-GGUF --device vulkan --depth-list 512,2048
 ```
 
 <!-- BEGIN options:bench -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<model>` |  |  | Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF). |
+| `--cpu-moe` | off | `DOTLLM_CPU_MOE` | Keep every MoE layer's routed experts on the CPU (llama.cpp --cpu-moe). CUDA nemotron_h_moe: never cached, always computed on the CPU; other CUDA MoE models (e.g. Flint): computed on the CPU from the mmap'd file; Vulkan Qwen3MoeHybrid (bench): as --n-cpu-moe with every layer. Env fallback: DOTLLM_CPU_MOE=1. |
+| `--ctx-size`, `--ctx` `<int>` | unset | `DOTLLM_MOE_CTX` | Context window in tokens (llama.cpp -c). For nemotron_h_moe it caps the model's context and is what the MoE expert-offload VRAM budget reserves KV cache for (default: the model's maximum context, e.g. 262144 for Nemotron 3.5 Bolt). Lower it to leave more VRAM for the expert cache. Env fallback: DOTLLM_MOE_CTX. |
+| `--decode-threads` `<int>` | 0 |  | Number of threads for decode. 0 = auto (caps at memory channel count). |
+| `--depth` `<int>` | 0 |  | Extra synthetic context tokens fed (untimed) after prefill, before the timed decode. Decode runs at context depth p + depth. |
+| `--depth-list` `<text>` | unset |  | Comma-separated context depths for multi-point sweep (e.g., 512,2048,8192). Measures decode at each checkpoint in one process without reloading the model. Mutually exclusive with --depth. |
+| `--device`, `-d` `<text>` | `auto` | `DOTLLM_VULKAN_DEVICE_INDEX` | Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - with a warning if it ends on the CPU), 'cpu', 'vulkan' (the default Vulkan GPU), 'vulkan:N' (Vulkan physical device N), 'gpu'/'cuda' (CUDA device 0), 'gpu:N'/'cuda:N' (CUDA ordinal N). Case-insensitive. An explicit GPU that cannot be honoured is an error, never a silent CPU run. Env: DOTLLM_VULKAN_DEVICE_INDEX picks the Vulkan device behind plain 'vulkan'. |
+| `--gen-tokens`, `-n` `<int>` | 128 |  | Greedy decode steps to time per repetition. |
+| `--json` | off |  | Output result as a single JSON object (suppresses all formatted output). |
+| `--kv-quant-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache key storage: f16, q8_0, q4_0. Synonym of --cache-type-k. For the CUDA hybrid-dense model (Bonsai-2 / qwen35) overrides DOTLLM_HYBRID_KV; quantized KV needs numKvHeads*headDim % 32 == 0. |
+| `--kv-quant-v` `<text>` | unset |  | KV-cache value storage: f16, q8_0, q4_0. Synonym of --cache-type-v. See --kv-quant-k. |
+| `--moe-cache-mib` `<text>` | unset | `DOTLLM_MOE_CACHE_MIB` | VRAM expert-cache size in MiB when experts are offloaded; default 'auto' = the measured free-VRAM budget. Larger values are clamped to the budget. Env fallback: DOTLLM_MOE_CACHE_MIB. |
+| `--moe-cache-policy` `<text>` | unset | `DOTLLM_MOE_CACHE_POLICY` | Expert-cache replacement policy: 'slru' (default), 'lru' or 'lfu'. Env fallback: DOTLLM_MOE_CACHE_POLICY. |
+| `--moe-calibrate` | off | `DOTLLM_MOE_CALIBRATE` | Re-run the MoE offload cost calibration (PCIe bandwidth, sync latency, CPU time per expert) instead of reading the cached record in %LOCALAPPDATA%/dotllm/moe-calibration.json. Env fallback: DOTLLM_MOE_CALIBRATE=1. |
+| `--moe-cold` `<text>` | unset | `DOTLLM_MOE_COLD` | Where offloaded experts that are not in the VRAM cache run: 'auto' (default: per expert, CPU or copy-to-GPU by a cost model calibrated at load), 'copy' (copy every miss into the cache), 'cpu' (compute every uncached expert on the CPU; an expert enters the cache only when its recent use beats the weakest cached one). Env fallback: DOTLLM_MOE_COLD. |
+| `--moe-cpu-threads` `<int>` | unset | `DOTLLM_MOE_CPU_THREADS` | Worker threads for MoE experts computed on the CPU (one expert per worker); default physical cores - 1. Env fallback: DOTLLM_MOE_CPU_THREADS. |
+| `--moe-offload` `<text>` | unset | `DOTLLM_MOE_OFFLOAD` | Routed-MoE expert placement on CUDA (nemotron_h_moe): 'auto' (default: keep experts in VRAM when the model fits, else offload them to a host store with a VRAM expert cache), 'off' (refuse a model that does not fit), 'on' (always offload). Env fallback: DOTLLM_MOE_OFFLOAD. |
+| `--n-cpu-moe` `<int>` | unset | `DOTLLM_N_CPU_MOE` | MoE CPU/GPU expert offload (llama.cpp --n-cpu-moe equivalent): put the routed experts of the first N layers on the CPU, trading throughput for device memory. Vulkan Qwen3MoeHybrid (#370): CPU expert compute for those layers. CUDA nemotron_h_moe (#1071): those layers' experts are never cached and always computed on the CPU. Unset = none (env fallback DOTLLM_N_CPU_MOE). No-op on the cpu backend. |
+| `--prompt-tokens`, `-p` `<int>` | 512 |  | Synthetic prompt length in tokens (tiled from the seed prompt). |
+| `--quant`, `-q` `<text>` | unset |  | Quantization filter when multiple GGUF files exist (e.g., Q4_K_M, Q8_0). |
+| `--reps`, `-r` `<int>` | 5 |  | Measured repetitions (one extra warm-up rep runs first and is discarded). |
+| `--seed-prompt` `<text>` | `The quick brown fox jumps over the lazy dog. ` |  | Seed text tiled to synthesize the prompt. |
+| `--threads` `<int>` | 0 |  | Number of CPU threads for inference. 0 = auto/all cores (default). |
+| `--warmup` `<int>` | -1 |  | Number of warm-up repetitions to discard per checkpoint (default: 1). Use 0 to skip warm-up entirely. |
 <!-- END options:bench -->
 
 ### dotllm perplexity
@@ -350,6 +657,39 @@ dotllm perplexity QuantFactory/SmolLM-135M-GGUF --docs-file docs.jsonl --docs-ou
 ```
 
 <!-- BEGIN options:perplexity -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<model>` |  |  | Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF). |
+| `--bos` | off |  | Prepend BOS to the stream and substitute it at each window start. Defaults to the model's own setting, derived from the vocab exactly as llama.cpp derives it; pass --bos true/false only to override that. |
+| `--context`, `-c` `<int>` | 512 |  | Context window in tokens. Clamped to the model's maximum sequence length. |
+| `--corpus`, `-f` `<text>` | unset |  | Path to a UTF-8 text corpus (e.g. wiki.test.raw). |
+| `--cycle` | off |  | Layer cycling: slide a --gpu-layers-wide GPU window across the whole trunk within one corpus pass, checkpointing boundary activations, so every layer is GPU-executed even when the model does not fit on the device. |
+| `--device`, `-d` `<text>` | `cpu` |  | Compute device: 'cpu' (default here, so perplexity numbers stay comparable across machines), 'auto', 'vulkan', 'vulkan:N', 'gpu'/'cuda', 'gpu:N'/'cuda:N'. An explicit GPU that cannot be honoured is an error, never a silent CPU run. |
+| `--docs-file` `<text>` | unset |  | Per-document eval (#1706): a JSONL file with one JSON list of token ids per line. Each document is scored teacher-forced as an independent sequence (the first token is context only and is not scored) with the model's full context limit; --corpus, --mode and the window options are ignored. Writes per-document NLL JSONL to --docs-out (default stdout; all other output goes to stderr). See docs/PERPLEXITY.md. |
+| `--docs-out` `<text>` | unset |  | Where --docs-file writes its per-document JSONL (default: stdout). |
+| `--dump-routing` `<text>` | unset |  | --docs-file only, MoE models on the CPU transformer: write the router's per-document, per-layer, per-position top-k expert ids and gate weights to this JSONL path. A dense model is an error. |
+| `--dump-tokens` `<text>` | unset |  | Write the tokenized corpus ids to this path, whitespace-separated, then continue. Diagnostic. |
+| `--first-layer` `<int>` | 0 |  | First global layer index of the GPU window, so the offloaded block is an arbitrary contiguous range rather than a prefix. Requires --gpu-layers; incompatible with --cycle. |
+| `--gpu-layers` `<int>` | unset |  | Number of transformer layers to offload to GPU. 0 = CPU only. Omit for default (0 with --device cpu, all with a GPU device). |
+| `--kv-cache` `<text>` | `none` |  | KV-cache storage used while scoring: 'none' (default: cacheless forward pass, exact K/V baseline), 'f32' (FP32 cache), 'q8_0' or 'q4_0' (quantized cache; bytes/element 1.0625 / 0.5625). With a cache the forward pass reads K/V back from it, so perplexity measures the quality cost of that KV storage. Compare against the 'none' run on the same corpus. |
+| `--kv-window` `<int>` | 0 |  | Full-precision window for a quantized --kv-cache: the most recent N tokens stay in FP32 and older ones are quantized on eviction. 0 (default) = quantize every token immediately. Only applies when --kv-cache is q8_0 or q4_0. |
+| `--max-doc-tokens` `<int>` | 0 |  | --docs-file only: truncate every document's sequence (BOS included) to this many tokens. 0 = never truncate; a document longer than the context limit is then an error. |
+| `--max-tokens`, `-n` `<int>` | 0 |  | Cap on corpus tokens consumed. 0 = unbounded. |
+| `--mode` `<text>` | `sliding-window` |  | Scoring mode: sliding-window (default, llama.cpp-comparable) or teacher-forced. |
+| `--normalize-line-endings` | off |  | Collapse CRLF to LF while reading --corpus, as MSVC text mode does. OFF by default. Use ONLY when the reference figure came from a Windows llama.cpp build reading the same CRLF file; llama.cpp on Linux keeps the CRs, so normalizing there creates a mismatch. Preferred fix is an LF corpus (see docs/PERPLEXITY.md, issue #506). |
+| `--overlay-skip-base-hash` | off |  | Do not verify the overlay's dotllm.overlay.base_sha256 against the base model file (hashing a multi-GB base takes seconds; the digest is cached). |
+| `--per-window` | off |  | Print each window's perplexity. Use to localize a disagreement with another implementation to specific corpus content. |
+| `--quant` `<text>` | unset |  | Quantization to select when resolving a HuggingFace repo ID. |
+| `--ref-logprobs` `<text>` | unset |  | --docs-file only: reference model log-probs JSONL (one object per document, same order; format 'full' or 'topk', see docs/PERPLEXITY.md). Adds kl_sum / kl_mean = KL(reference \|\| model) per document. |
+| `--rope-scale` `<number>` | unset |  | RoPE scaling factor override (linear/YaRN/NTK). |
+| `--rope-scaling` `<text>` | unset |  | RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic' (as on run/serve; issue #1101 measures YaRN's short-context cost). |
+| `--stride` `<int>` | 0 |  | Tokens advanced between window starts. 0 selects the context length (non-overlapping chunks, llama.cpp's default). |
+| `--tensor-overlay` `<text>` | unset |  | Overlay GGUF replacing named FFN tensors (blk.L.ffn_{gate,up,down}[.E].weight), e.g. with TERN_B64_F16 ternary experts. Unknown names, shape mismatches and a base-hash mismatch are errors. CPU backend, plain transformer / MoE-GGUF models only. |
+| `--threads` `<int>` | 0 |  | Compute threads. 0 = auto. |
+| `--tokens-file` `<text>` | unset |  | Read pre-tokenized whitespace-separated ids instead of tokenizing --corpus. Isolates scoring from tokenization when comparing against another implementation. |
+| `--unscored-prefix` `<int>` | -1 |  | Leading tokens of each window used as context only. -1 selects context/2 (llama.cpp's default). |
+| `--yarn-attn-factor` `<number>` | unset |  | YaRN attention factor override. |
+| `--yarn-orig-ctx` `<int>` | unset |  | YaRN original context length override. |
 <!-- END options:perplexity -->
 
 ### dotllm embed
@@ -363,6 +703,17 @@ printf 'one\ntwo\n' | dotllm embed Qwen/Qwen3-Embedding-0.6B-GGUF --device vulka
 ```
 
 <!-- BEGIN options:embed -->
+| Option | Default | Env | Description |
+|---|---|---|---|
+| `<model>` |  |  | Path to a GGUF file or HuggingFace repo ID. |
+| `[text]` |  |  | Text(s) to embed. When omitted, one input per line is read from stdin. |
+| `--add-eos` | off |  | Force (true) or suppress (false) appending the EOS token. Default: appended for last-token pooling on decoder embedders (Qwen3-Embedding). |
+| `--device`, `-d` `<text>` | `cpu` |  | Compute device: 'cpu' (default, so vectors are comparable across machines) or 'vulkan' / 'vulkan:N' (decoder embedders such as Qwen3-Embedding and BERT encoders with F16 weights, #741; nomic-bert, nomic-bert-moe and gemma-embedding run on vulkan too). An explicit GPU that cannot be honoured is an error, never a silent CPU run. |
+| `--dimensions` `<int>` | unset |  | Truncate to the leading N components (Matryoshka), then renormalise. |
+| `--no-normalize` | off |  | Return un-normalised vectors. |
+| `--pooling` `<text>` | unset |  | Pooling override: last, mean or cls. Default: the model's declared pooling. |
+| `--quant`, `-q` `<text>` | unset |  | Quantization to select when <model> is a HuggingFace repo. |
+| `--threads` `<int>` | 0 |  | CPU threads (0 = auto). |
 <!-- END options:embed -->
 
 ### dotllm debug (Debug builds only)

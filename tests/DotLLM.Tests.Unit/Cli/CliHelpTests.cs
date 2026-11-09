@@ -35,6 +35,23 @@ public sealed class CliHelpTests
     }
 
     [Fact]
+    public void EveryCommand_HelpRenders_WithoutMarkupErrors()
+    {
+        // Spectre feeds descriptions through its markup parser, so an unescaped "[:quant]" or "[...]" in an option text
+        // breaks --help for that command ("Could not find color or style"). xmldoc prints the raw text and cannot see it.
+        var failures = new List<string>();
+        foreach (var path in new[] { "" }.Concat(CliCommandModel.All.Select(c => c.Path)))
+        {
+            string[] args = [.. path.Split(' ', StringSplitOptions.RemoveEmptyEntries), "--help"];
+            var (rc, output) = CliCommandModel.Run(args);
+            if (rc != 0 || output.Contains("Error:", StringComparison.Ordinal))
+                failures.Add($"'dotllm {path} --help' (exit {rc}): {output.Split('
+').FirstOrDefault(l => l.Contains("Error", StringComparison.Ordinal))}");
+        }
+        Assert.True(failures.Count == 0, string.Join("; ", failures));
+    }
+
+    [Fact]
     public void TopLevelList_ExistsAndSharesModelListOptions()
     {
         var top = CliCommandModel.All.Single(c => c.Path == "list");
@@ -91,7 +108,10 @@ public sealed class CliHelpTests
             {
                 if (f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}") || f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}")) continue;
                 foreach (Match m in lit.Matches(File.ReadAllText(f)))
-                    if (!Regex.IsMatch(doc, $@"\b{m.Groups[1].Value}\b")) undocumented.Add(m.Groups[1].Value);
+                {
+                    string name = m.Value.Trim('"');
+                    if (!Regex.IsMatch(doc, $@"\b{name}\b", RegexOptions.None, TimeSpan.FromSeconds(5))) undocumented.Add(name);
+                }
             }
         }
         Assert.True(undocumented.Count == 0,

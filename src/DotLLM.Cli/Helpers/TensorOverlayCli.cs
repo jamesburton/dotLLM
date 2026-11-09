@@ -16,7 +16,7 @@ internal static class TensorOverlayCli
 
     /// <summary>Help text of <see cref="Option"/>.</summary>
     public const string Help =
-        "Overlay GGUF replacing named FFN tensors (blk.L.ffn_{gate,up,down}[.E].weight), e.g. with TERN_B64_F16 ternary experts. "
+        "Overlay GGUF replacing named FFN tensors (blk.L.ffn_{gate,up,down}.weight, or blk.L.ffn_{gate,up,down}.E.weight for expert E), e.g. with TERN_B64_F16 ternary experts. "
         + "Unknown names, shape mismatches and a base-hash mismatch are errors. CPU backend, plain transformer / MoE-GGUF models only.";
 
     /// <summary>Help text of <see cref="SkipHashOption"/>.</summary>

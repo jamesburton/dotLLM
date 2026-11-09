@@ -16,7 +16,7 @@ internal sealed partial class ModelListCommand : Command<ModelListCommand.Settin
     public sealed class Settings : CommandSettings
     {
         [CommandOption("--json")]
-        [Description("Print one JSON object {\"models\": [...], \"profiles\": [...]} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout.")]
+        [Description("Print one JSON object {\"models\": array, \"profiles\": array} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout.")]
         [DefaultValue(false)]
         public bool Json { get; set; }
 

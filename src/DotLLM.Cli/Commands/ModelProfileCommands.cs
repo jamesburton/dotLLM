@@ -16,7 +16,7 @@ internal sealed class ModelCreateCommand : Command<ModelCreateCommand.Settings>
         public string Name { get; set; } = string.Empty;
 
         [CommandOption("--from|-f")]
-        [Description("Base model: a .gguf path, 'owner/repo[:quant]', a local model name, or another profile.")]
+        [Description("Base model: a .gguf path, 'owner/repo' or 'owner/repo:quant', a local model name, or another profile.")]
         public string From { get; set; } = string.Empty;
 
         [CommandOption("--system")]
@@ -54,7 +54,7 @@ internal sealed class ModelCreateCommand : Command<ModelCreateCommand.Settings>
         public string[]? Stop { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Device this model loads on: auto, cpu, vulkan, vulkan:N, gpu[:N] / cuda[:N]. Unset = the server's --device. See docs/CLI.md#device-selection.")]
+        [Description("Device this model loads on: auto, cpu, vulkan, vulkan:N, gpu, gpu:N, cuda, cuda:N. Unset = the server's --device. See docs/CLI.md#device-selection.")]
         public string? Device { get; set; }
 
         [CommandOption("--gpu-layers")]
@@ -137,7 +137,7 @@ internal sealed class ModelShowCommand : Command<ModelShowCommand.Settings>
     public sealed class Settings : CommandSettings
     {
         [CommandArgument(0, "<model>")]
-        [Description("A profile name, 'owner/repo[:quant]', or a local model name.")]
+        [Description("A profile name, 'owner/repo', 'owner/repo:quant', or a local model name.")]
         public string Model { get; set; } = string.Empty;
     }
 

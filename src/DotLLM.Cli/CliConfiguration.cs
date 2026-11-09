@@ -91,7 +91,7 @@ internal static class CliConfiguration
             .WithExample("list", "--json");
 
         config.AddCommand<RunCommand>("run")
-            .WithDescription("One-shot text generation on a GGUF model (greedy unless --temp > 0), with a performance summary. <model> is a path, owner/repo[:quant], a local name, a profile or an ollama tag; missing models are downloaded.")
+            .WithDescription("One-shot text generation on a GGUF model (greedy unless --temp > 0), with a performance summary. <model> is a path, owner/repo or owner/repo:quant, a local name, a profile or an ollama tag; missing models are downloaded.")
             .WithExample("run", "QuantFactory/SmolLM-135M-GGUF", "--prompt", "The capital of France is", "--max-tokens", "64")
             .WithExample("run", "QuantFactory/SmolLM-135M-GGUF", "-p", "Hello", "--device", "vulkan:0", "--json")
             .WithExample("run", "QuantFactory/SmolLM-135M-GGUF", "-p", "Hello", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0");

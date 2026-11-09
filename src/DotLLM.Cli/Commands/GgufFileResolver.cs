@@ -66,7 +66,7 @@ internal static class GgufFileResolver
         AnsiConsole.MarkupLine($"[red]Model not found locally:[/] {fileArg.EscapeMarkup()}");
         AnsiConsole.MarkupLine(reference.IsRepo
             ? $"[grey]Download it with:[/] dotllm model pull {fileArg.EscapeMarkup()}"
-            : "[grey]Pass a .gguf path, an 'owner/repo[:quant]' Hugging Face reference, or the name of a model from 'dotllm model list'.[/]");
+            : "[grey]Pass a .gguf path, an 'owner/repo' or 'owner/repo:quant' Hugging Face reference, or the name of a model from 'dotllm model list'.[/]");
         return null;
     }
 
