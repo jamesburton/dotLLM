@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chunkcache_build output (integration spec 7.2)",
+  "type": "object",
+  "required": ["files", "chunks", "tokens", "wire_ineligible_chunks", "denied_files", "added", "removed", "unchanged", "encode_queued_tokens", "skipped_projects", "elapsed_ms"],
+  "properties": {
+    "files": {"type": "integer"},
+    "chunks": {"type": "integer"},
+    "tokens": {"type": "integer"},
+    "wire_ineligible_chunks": {"type": "integer"},
+    "denied_files": {"type": "integer"},
+    "added": {"type": "integer"},
+    "removed": {"type": "integer"},
+    "unchanged": {"type": "integer"},
+    "encode_queued_tokens": {"type": "integer"},
+    "skipped_projects": {"type": "array", "items": {"type": "object", "required": ["project", "reason"], "properties": {"project": {"type": "string"}, "reason": {"type": "string"}}}},
+    "elapsed_ms": {"type": "integer"}
+  }
+}

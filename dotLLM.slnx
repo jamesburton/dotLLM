@@ -56,6 +56,9 @@
     <Project Path="src/DotLLM.Tray.Core/DotLLM.Tray.Core.csproj" />
     <Project Path="src/DotLLM.Vulkan/DotLLM.Vulkan.csproj" />
   </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/DotLLM.ChunkCache/DotLLM.ChunkCache.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/DotLLM.ChunkCache.Client.Tests/DotLLM.ChunkCache.Client.Tests.csproj" />
     <Project Path="tests/DotLLM.Tests.Integration/DotLLM.Tests.Integration.csproj" />

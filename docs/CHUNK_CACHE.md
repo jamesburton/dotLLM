@@ -6,6 +6,8 @@ wire contract `docs/contracts/chunk-cache-v1/`). This page records what the dotL
 task. Everything the convention adds sits behind `dotllm serve --chunk-cache` (off by default); with the flag off, every
 request and response is what it was before the convention, for any body.
 
+The `chunkcache` command-line tool that builds, selects, inspects and evicts the store is documented in [CHUNK_CACHE_CLI.md](CHUNK_CACHE_CLI.md).
+
 ## Switches
 
 | flag | default | meaning |
