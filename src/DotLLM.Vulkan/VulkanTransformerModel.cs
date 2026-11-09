@@ -279,6 +279,15 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     private MatMulQ5_1GemvF32Kernel? _matmulQ5_1Gemv;
     private MatMulQ5_1GemmF32Kernel? _matmulQ5_1GemmF32;
     private MatMulQ4_0MmvqKernel? _matmulQ5_1Mmvq;
+    // --tensor-overlay TERN_B64_F16 (#1706 S3): dense/indexed packed-ternary MMVQ and the per-layer expert banks. Null without an overlay.
+    private MatMulTernB64Kernel? _matmulTern;
+    private VulkanTernOverlay? _ternOverlay;
+    /// <summary>Ternary overlay expert tensors resident on this model (0 without an overlay; diagnostics / tests).</summary>
+    internal int TernExpertTensorCount => _ternOverlay?.ExpertTensorCount ?? 0;
+    /// <summary>Dispatches of the packed-ternary dense matmul since load (tests prove the path ran by this count).</summary>
+    internal int TernDenseDispatchCount { get; private set; }
+    /// <summary>Dispatches of the packed-ternary indexed (routed-expert) matmul since load.</summary>
+    internal int TernIndexedDispatchCount { get; private set; }
     private MatMulMmqCm1Kernel? _matmulQ5_1MmqCm1;
     private MatMulQ4_1MmqKernel? _matmulQ5_1Mmq;
     private MatMulQ4_0GemmCoopmatKernel? _matmulQ5_1GemmCoopmat;
@@ -2022,8 +2031,21 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     private static VulkanTransformerModel BuildModel(
         VulkanDevice device, bool ownsDevice, ModelConfig config,
         TransformerWeights cpuWeights, string spvDir, GgufFile? gguf, int firstLayer = 0,
-        bool skipTokenEmbed = false, bool headless = false)
+        bool skipTokenEmbed = false, bool headless = false, TensorOverlay? overlayOverride = null)
     {
+        // --tensor-overlay (#1706 S3): dense-FFN entries are swapped into the CPU layer structs BEFORE the upload (so they stay packed through
+        // VulkanWeights); routed-expert entries are uploaded packed after it (VulkanTernOverlay). Unsupported shapes of model fail loudly.
+        var overlay = overlayOverride ?? gguf?.Overlay;
+        if (overlay is not null)
+        {
+            VulkanTernOverlay.ValidateArchitecture(config);
+            if (firstLayer != 0 || skipTokenEmbed || headless)
+                throw new NotSupportedException("--tensor-overlay is not supported on a pipeline-stage (layer-window) Vulkan model.");
+            if (!device.HasIntegerDotProduct || IsMmvqDisabled())
+                throw new NotSupportedException("--tensor-overlay (TERN_B64_F16) needs the integer-dot-product (dp4a) path: the device lacks it or DOTLLM_VULKAN_DISABLE_MMVQ is set.");
+            overlay.ApplyDenseToLayers(cpuWeights.Layers);
+        }
+
         // The VRAM-trim flags are pipeline-stage roles: a non-first stage never gathers embeddings
         // (skipTokenEmbed) and a non-last stage never runs the final norm + LM head (headless). Both
         // are exercised only through the causal ForwardFromHidden pipeline — the diffusion paths
@@ -2833,6 +2855,24 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
             model.InitMiMoV2(spvDir);
         if (config.PerLayerEmbedding is not null && config.IsGemma4DensePle)
             model.InitGemma4Ple(spvDir);
+        if (overlay is not null)
+        {
+            try
+            {
+                model._matmulTern = MatMulTernB64Kernel.TryCreate(device, spvDir)
+                    ?? throw new NotSupportedException("matmul_tern_b64_mmvq.spv is missing (rebuild DotLLM.Vulkan) or the device lacks integer dot product.");
+                if (model._quantizeQ8_1Rows is null || model._state.Q8_1XqRows is null)
+                    throw new NotSupportedException("--tensor-overlay needs the multi-row Q8_1 activation quantizer (dp4a path); it is not available on this device/configuration.");
+                model._ternOverlay = VulkanTernOverlay.Create(device, overlay, cpuWeights);
+                if (model._ternOverlay is not null && model._state.MoeQ8_1Xq is null)
+                    throw new NotSupportedException("--tensor-overlay on routed experts needs the MoE Q8_1 activation scratch (dp4a path); it is not available.");
+            }
+            catch
+            {
+                model.Dispose();
+                throw;
+            }
+        }
         return model;
     }
 
@@ -5722,6 +5762,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         _matmulQ4_0Gemm?.InvalidateDescriptorCache();
         _matmulQ4_0Mmvq?.InvalidateDescriptorCache();
         _matmulQ4_0GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulTern?.InvalidateDescriptorCache();
         _matmulNvfp4?.InvalidateDescriptorCache();
         _matmulNvfp4Coopmat?.InvalidateDescriptorCache();
         _moeIndexedNvfp4?.InvalidateDescriptorCache();
@@ -7295,8 +7336,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         // Decode-sized rows on packed K-quant / Q8_0 / MXFP4 banks take the indexed dp4a MMVQ arm (#912). When the gate/up kernels read the
         // activation through xDiv (everything but Q8_0) the single quantize of the normed rows runs here, beside the router matmul, and the
         // topK broadcast copy below is skipped.
+        // --tensor-overlay (#1706 S3): a layer with ternary expert tensors runs the existing generic indexed (scalar) path for the original-format
+        // experts, then the packed-ternary pass overwrites the (token, slot) cells whose expert is ternary. The grouped / fused-MMVQ arms keep their
+        // intermediates in grouped or fused layouts the overwrite cannot reach, so they are not taken for such a layer.
+        VulkanTernMoeLayer? tern = null;
+        bool ternLayer = _ternOverlay is not null && _ternOverlay.TryGetLayer(layer + _firstLayer, out tern);
         bool mmvqXDiv = false;
-        bool mmvqArm = !CanUseGroupedF16Moe(moeW, hidden, interm) && !CanUseGroupedQuantMoe(moeW, seqLen, hidden, interm)
+        bool mmvqArm = !ternLayer && !CanUseGroupedF16Moe(moeW, hidden, interm) && !CanUseGroupedQuantMoe(moeW, seqLen, hidden, interm)
             && CanUseGenericMoeMmvq(moeW, seqLen, hidden, interm, out mmvqXDiv);
         if (mmvqArm && mmvqXDiv)
             _quantizeQ8_1Rows!.Record(cmdBuf, _state.NormOutput, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!, n: seqLen, k: hidden);
@@ -7353,7 +7399,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         //    vkCmdCopyBuffer regions the previous implementation issued —
         //    same math, no transfer↔compute stage transition, dispatch
         //    count drops from O(seqLen·topK) to 1 per MoE layer.
-        bool q41v2 = !mmvqArm && CanUseGroupedQ4_1V2(moeW, seqLen, hidden, interm);
+        bool q41v2 = !ternLayer && !mmvqArm && CanUseGroupedQ4_1V2(moeW, seqLen, hidden, interm);
         if (!(mmvqArm && mmvqXDiv) && !q41v2)
         {
             _moeBroadcast!.Record(cmdBuf,
@@ -7363,7 +7409,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
             ProfSample("moe_broadcast");
         }
 
-        if (CanUseGroupedF16Moe(moeW, hidden, interm))
+        if (!ternLayer && CanUseGroupedF16Moe(moeW, hidden, interm))
         {
             RecordMoeGroupedF16Layer(cmdBuf, moeW, expandedRows, hidden, interm, numE);
         }
@@ -7378,7 +7424,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
             GroupedMoeQ4_1V2DispatchCount++;
             RecordGroupedQ4_1V2Experts(cmdBuf, moeW, hidden, interm, numE, topK, expandedRows);
         }
-        else if (CanUseGroupedQuantMoe(moeW, seqLen, hidden, interm))
+        else if (!ternLayer && CanUseGroupedQuantMoe(moeW, seqLen, hidden, interm))
         {
             GroupedMoeDispatchCount++;
             if (moeW.W1DeviceQuantType == QuantType.MXFP4) GroupedMoeMxfp4DispatchCount++;
@@ -7397,6 +7443,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 moeW.W3Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
                 moeW.W3DeviceQuantType,
                 m: interm, k: hidden, n: expandedRows, numExperts: numE, expertScale: moeW.W3Scale);
+            if (ternLayer)
+                RecordTernExpertPass(cmdBuf, tern!, _state.NormOutput, seqLen, topK, expandedRows, hidden, interm, numE, xDiv: topK, projs: 0b011);
             BarrierComputeToCompute(cmdBuf);
             ProfSample("moe_gateup_scalar");
             if (gptOssMoe is not null && !_gptOssDbg.NoExpertBias)
@@ -7431,6 +7479,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
                 moeW.W2DeviceQuantType,
                 m: hidden, k: interm, n: expandedRows, numExperts: numE, expertScale: moeW.W2Scale);
+            if (ternLayer)
+                RecordTernExpertPass(cmdBuf, tern!, _state.MoeSiluInter!, expandedRows, topK, expandedRows, interm, hidden, numE, xDiv: 1, projs: 0b100);
             BarrierComputeToCompute(cmdBuf);
             ProfSample("moe_down_scalar");
             if (gptOssMoe?.DownBias is { } db && !_gptOssDbg.NoExpertBias)
@@ -7462,6 +7512,32 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         if (moeW.NumSharedExperts > 0)
         {
             RecordMoeSharedExperts(cmdBuf, moeW, lw.FfnNormWeight, seqLen, hidden, eps);
+        }
+    }
+
+    /// <summary>
+    /// Packed-ternary overwrite pass for one MoE layer (#1706 S3). Quantizes <paramref name="input"/> (<paramref name="inputRows"/> rows of
+    /// <paramref name="k"/>) to Q8_1 into the MoE scratch, then for each projection in <paramref name="projs"/> (bit 0 gate, 1 up, 2 down) that has
+    /// ternary experts runs the indexed kernel, which rewrites only the (token, slot) cells whose expert is ternary for that projection (the
+    /// original-format kernel already wrote every other cell). <paramref name="xDiv"/> maps an expanded row to its activation row.
+    /// Barriers: the base kernels' writes are ordered before the overwrite (WAW), and the quantize before the matmuls (RAW).
+    /// </summary>
+    private void RecordTernExpertPass(nint cmdBuf, VulkanTernMoeLayer tern, VulkanDevice.Buffer input, int inputRows, int topK, int expandedRows,
+        int k, int m, int numE, int xDiv, int projs)
+    {
+        bool any = false;
+        for (int p = 0; p < 3; p++) any |= (projs & (1 << p)) != 0 && tern.Bank[p] is not null;
+        if (!any) return;
+        BarrierComputeToCompute(cmdBuf);
+        _quantizeQ8_1Rows!.Record(cmdBuf, input, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!, n: inputRows, k: k);
+        BarrierComputeToCompute(cmdBuf);
+        for (int p = 0; p < 3; p++)
+        {
+            if ((projs & (1 << p)) == 0 || tern.Bank[p] is not { } bank) continue;
+            var y = p == 0 ? _state.MoeGateInter! : p == 1 ? _state.MoeUpInter! : _state.MoeDownRows!;
+            _matmulTern!.RecordIndexed(cmdBuf, bank, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!, _state.MoeTopkIndices!, tern.Slot[p]!, y,
+                m: m, k: k, n: expandedRows, numExperts: numE, xDiv: xDiv);
+            TernIndexedDispatchCount++;
         }
     }
 
@@ -9096,12 +9172,38 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         }
     }
 
+    /// <summary>
+    /// Dense TERN_B64_F16 matmul: quantize the F32 activation rows to Q8_1 (multi-row house quantizer), then the packed-ternary dp4a kernel.
+    /// A barrier first orders the shared rows scratch against any earlier reader (several projections quantize into it back to back).
+    /// </summary>
+    private void RecordTernDenseMatmul(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer input, VulkanDevice.Buffer output,
+        int outputDim, int inputDim, int seqLen)
+    {
+        if (_matmulTern is null || _quantizeQ8_1Rows is null || !_state.Q8_1RowsFit(seqLen, inputDim) || (inputDim % MatMulTernB64Kernel.GroupSize) != 0)
+            throw new NotSupportedException(
+                $"TERN_B64_F16 projection [{outputDim} x {inputDim}], {seqLen} rows: the packed-ternary kernel or its Q8_1 activation scratch is unavailable.");
+        BarrierComputeToCompute(cmdBuf);
+        _quantizeQ8_1Rows.Record(cmdBuf, input, _state.Q8_1XqRows!, _state.Q8_1XdsRows!, n: seqLen, k: inputDim);
+        BarrierComputeToCompute(cmdBuf);
+        _matmulTern.Record(cmdBuf, weights, _state.Q8_1XqRows!, _state.Q8_1XdsRows!, output, m: outputDim, k: inputDim, n: seqLen);
+        TernDenseDispatchCount++;
+        ProfNote("tern_b64_mmvq", outputDim, inputDim, seqLen);
+    }
+
     private void RecordMatmul(
         nint cmdBuf,
         VulkanDevice.Buffer weights, QuantType weightQt,
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
+        // TERN_B64_F16 overlay tensor (#1706 S3): packed-ternary dp4a matmul on the house Q8_1 row quantisation. Taken first: every other arm
+        // below would reinterpret or widen the packed blocks (a ternary tensor is never expanded).
+        if (weightQt == QuantType.TERN_B64_F16)
+        {
+            RecordTernDenseMatmul(cmdBuf, weights, input, output, outputDim, inputDim, seqLen);
+            return;
+        }
+
         // NVFP4 (#1579): read in place by the packed kernels; the per-tensor X.scale multiplies the F32 output. Taken before the small-row
         // and IQ F16-scratch arms below, which would otherwise expand the weight (CLAUDE.md rule 2) or drop the scale.
         if (weightQt == QuantType.NVFP4)
@@ -10245,6 +10347,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         _matmulQ4_0?.Dispose();
         _matmulQ4_0Mmvq?.Dispose();
         _matmulQ4_0GemmCoopmat?.Dispose();
+        _matmulTern?.Dispose();
+        _ternOverlay?.Dispose();
         _matmulNvfp4?.Dispose();
         _matmulNvfp4Coopmat?.Dispose();
         _moeIndexedNvfp4?.Dispose();
