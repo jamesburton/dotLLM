@@ -281,7 +281,10 @@ public sealed partial class ChunkCacheCliTests
 
         foreach (string mode in new[] { "orphans", "all" })
         {
-            var r = CliRaw(["evict", "--offline", "--mode", mode, "--model", _fx.ModelA, "--store", parent, "--apply", "--json"]);
+            string[] args = mode == "all"
+                ? ["evict", "--offline", "--mode", mode, "--model", _fx.ModelA, "--store", parent, "--apply", "--json"]
+                : ["evict", "--offline", "--mode", mode, "--store", parent, "--apply", "--json"];
+            var r = CliRaw(args);
             Assert.Equal(2, r.Code);
             Assert.Contains("does not look like a chunk store", r.Out, StringComparison.Ordinal);
         }
@@ -309,7 +312,7 @@ public sealed partial class ChunkCacheCliTests
         Assert.Contains("resolves to", r.Err, StringComparison.Ordinal);
         Assert.Equal(orphans.Count, JsonDocument.Parse(r.Out).RootElement.GetProperty("evicted").GetInt32());
         Assert.All(orphans, o => Assert.False(new FileChunkStore(store).Contains(new ChunkKey(o))));
-        Assert.Empty(Directory.EnumerateFileSystemEntries(Path.GetDirectoryName(link)!).Where(p => p != link)); // nothing else created beside the link
+        Assert.Equal([link], Directory.EnumerateFileSystemEntries(Path.GetDirectoryName(link)!).ToArray()); // nothing else created beside the link
     }
 
     /// <summary>After an applying pass <c>kept_referenced</c> is what the store holds now, not the figure predicted before deleting.</summary>
@@ -336,6 +339,7 @@ public sealed partial class ChunkCacheCliTests
 
     /// <summary>A store created by a writer verb is owner-only on POSIX like every other store directory (#1676/#1703).</summary>
     [SkippableFact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
     public void StoreLayout_CreatingARoot_IsOwnerOnly()
     {
         Skip.If(OperatingSystem.IsWindows(), "POSIX modes; a new directory inherits its parent's ACL on Windows");

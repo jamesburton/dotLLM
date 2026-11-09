@@ -18,8 +18,8 @@
     <!-- FileChunkStore.BeforeRenameForTest: lets tests hold the destination open between write and rename. -->
     <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
     <InternalsVisibleTo Include="DotLLM.ChunkReuse.CSharp" />
-    <!-- The chunkcache CLI resolves a --store root through StorePaths.CanonicalRoot before a destructive pass. -->
-    <InternalsVisibleTo Include="DotLLM.ChunkCache" />
+    <!-- The chunkcache CLI resolves its store root option through StorePaths.CanonicalRoot before a destructive pass. -->
+    <InternalsVisibleTo Include="chunkcache" />
     <!-- VulkanChunkBackend reads CpuChunkBackend.RowCount. -->
     <InternalsVisibleTo Include="DotLLM.ChunkReuse.Vulkan" />
   </ItemGroup>
