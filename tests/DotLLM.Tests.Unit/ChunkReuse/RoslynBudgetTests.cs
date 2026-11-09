@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using DotLLM.ChunkReuse;
 using DotLLM.ChunkReuse.CodeCorpus;
 using DotLLM.ChunkReuse.Graph;
@@ -26,29 +25,57 @@ public sealed class RoslynBudgetTests
     // ---- RunWithLargeStack
 
     [Fact]
-    public void RunWithLargeStack_CooperativeWorkOverTheTimeout_ThrowsTimeoutException_Promptly()
+    public async Task RunWithLargeStack_CooperativeWorkOverTheTimeout_ThrowsTimeoutException_Promptly()
     {
-        var sw = Stopwatch.StartNew();
+        // No clock: the work parks on the token and can only end because the timeout cancelled it. The grace is an hour, so a
+        // call that returned through the grace path (waiting for a thread that never stops) would not return at all.
+        using var sawCancellation = new ManualResetEventSlim();
+        using var threadEnded = new ManualResetEventSlim();
 
-        Assert.Throws<TimeoutException>(() => RoslynParsing.RunWithLargeStack<int>(ct =>
+        Exception? thrown = await HangGuard.ReturnsAsync(Task.Run(() => Record.Exception(() => RoslynParsing.RunWithLargeStack<int>(ct =>
         {
-            while (true) { ct.ThrowIfCancellationRequested(); Thread.Sleep(1); }
-        }, TimeSpan.FromMilliseconds(100)));
+            try
+            {
+                ct.WaitHandle.WaitOne();
+                sawCancellation.Set();
+                ct.ThrowIfCancellationRequested();
+                return 0;
+            }
+            finally { threadEnded.Set(); }
+        }, TimeSpan.FromMilliseconds(100), grace: TimeSpan.FromHours(1)))), nameof(RoslynParsing.RunWithLargeStack));
 
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(8), "took " + sw.Elapsed);
+        TimeoutException timeout = Assert.IsType<TimeoutException>(thrown);
+        Assert.Contains("exceeded", timeout.Message, StringComparison.Ordinal); // the budget path, not the abandoned-thread path
+        Assert.True(sawCancellation.IsSet, "the work was cancelled through its token");
+        Assert.True(threadEnded.IsSet, "the work thread was joined, not abandoned");
     }
 
     [Fact]
-    public void RunWithLargeStack_WorkThatIgnoresTheToken_IsAbandonedAfterTheGrace()
+    public async Task RunWithLargeStack_WorkThatIgnoresTheToken_IsAbandonedAfterTheGrace()
     {
+        // No clock: the work stays blocked on `release` until the test lets it go, so the call can only return by abandoning it.
+        using var started = new ManualResetEventSlim();
         using var release = new ManualResetEventSlim();
-        var sw = Stopwatch.StartNew();
+        using var workFinished = new ManualResetEventSlim();
+        try
+        {
+            Exception? thrown = await HangGuard.ReturnsAsync(Task.Run(() => Record.Exception(() => RoslynParsing.RunWithLargeStack<int>(_ =>
+            {
+                started.Set();
+                release.Wait();
+                workFinished.Set();
+                return 1;
+            }, TimeSpan.FromMilliseconds(50), grace: TimeSpan.FromMilliseconds(100)))), nameof(RoslynParsing.RunWithLargeStack));
 
-        Assert.Throws<TimeoutException>(() => RoslynParsing.RunWithLargeStack<int>(_ => { release.Wait(); return 1; },
-            TimeSpan.FromMilliseconds(50), grace: TimeSpan.FromMilliseconds(100)));
-
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(8), "took " + sw.Elapsed);
-        release.Set(); // lets the abandoned thread finish
+            TimeoutException timeout = Assert.IsType<TimeoutException>(thrown);
+            Assert.Contains("abandoned", timeout.Message, StringComparison.Ordinal);
+            Assert.False(workFinished.IsSet, "the call returned while the work was still blocked, so it did not wait for it");
+            started.Wait(); // the abandoned thread is the work thread: it did start
+        }
+        finally
+        {
+            release.Set(); // lets the abandoned thread finish
+        }
     }
 
     [Fact]
