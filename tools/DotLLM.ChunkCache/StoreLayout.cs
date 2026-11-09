@@ -112,18 +112,20 @@ internal sealed class StoreLayout
     }
 
     /// <summary>
-    /// Whether <paramref name="root"/> carries a mark of a chunk store: one of the lock, owner-lock, registry or server-ledger files,
-    /// an <c>index-*.json</c>, or an entry shard directory (two lower-case hex digits). A destructive verb refuses a directory
-    /// without any, so a wrong <c>--store</c> (a parent directory, an unrelated folder) is never swept.
+    /// Whether <paramref name="root"/> carries the marks of a chunk store: one STRONG mark (the store lock, owner lock, registry or
+    /// server-ledger file, which only a store writes) or BOTH weak marks (an <c>index-*.json</c> and an entry shard directory of two
+    /// lower-case hex digits). A single weak mark is not enough: a parent of a store or an unrelated folder can hold an index-shaped
+    /// file or a two-digit folder. A destructive verb refuses a directory without the marks, so a wrong store option is never swept.
     /// </summary>
     public static bool LooksLikeStore(string root)
     {
         if (!Directory.Exists(root)) return false;
         foreach (string marker in new[] { ChunkIndex.StoreLockFileName, StoreOwnerLock.FileName, ConfigFileName, ServerLedger.FileName })
             if (File.Exists(Path.Combine(root, marker))) return true;
-        if (Directory.EnumerateFiles(root, "index-*.json").Any()) return true;
-        return Directory.EnumerateDirectories(root).Select(Path.GetFileName)
+        bool index = Directory.EnumerateFiles(root, "index-*.json").Any();
+        bool shard = Directory.EnumerateDirectories(root).Select(Path.GetFileName)
             .Any(n => n is { Length: 2 } && n.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f'));
+        return index && shard;
     }
 
     /// <summary>The (current-form) index file of <paramref name="chunker"/> for the model <paramref name="model"/>.</summary>
