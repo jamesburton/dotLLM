@@ -1446,3 +1446,13 @@ Flint Q4_1, RTX 3060, `--n-cpu-moe 34`, tg64 at depth 512: 20-22 -> 26-27 tok/s 
 same peak VRAM; logits bit-identical to eager (`CudaFlintCpuMoeTests.MoeDecodeGraph_BitIdenticalToEager`: resident,
 mixed and all-CPU placements on the synthetic Flint with a NoPE layer, sinks and a 4-token window); real-file parity
 (`CudaFlintCpuMoeRealProbe`) 158/160 top-1, KL mean 2.1e-3, unchanged.
+
+## Running CUDA tests under ZLUDA on AMD (opt-in functional smoke, #1663)
+
+Measured 2026-11-09 on a Strix Halo iGPU (gfx1151, Windows, Adrenalin `amdhip64_7.dll`), ZLUDA v7-preview.20. **Functional smoke only, not a parity gate.**
+
+- Unzip the ZLUDA release into a scratch folder (never System32 or the repo) and put that folder on `PATH` for the test process only: `export PATH="<zluda dir>:$PATH" ZLUDA_CC=8.6`. `ZLUDA_CC=8.6` matches our sm_86 modules (default is 8.5). The device name ends ` [ZLUDA]`.
+- Confirm tests did not skip: a skipped run exits 0. Without ZLUDA on `PATH` the narrow filter `CudaI2SGemv|CudaArgMaxF32|CudaDeviceTests` skips all 34; with it, all 34 pass.
+- Run `DotLLM.Tests.Unit.Cuda` in batches (about 20 min total; use `--blame-hang-timeout`). Result: 908 passed, 309 failed, 140 skipped. About 262 failures are `cublasCreate` -> `CUBLAS_STATUS_NOT_SUPPORTED` (no rocBLAS on `HIP_PATH`), 40 are the hd256 flash-prefill kernels (`invalid value`, probably the >64 KB dynamic shared-memory opt-in; RDNA LDS is 64 KB), the rest are a register-count assertion, one K-quant tolerance miss and a temp-file collision.
+- What it proves: our PTX compiles and launches, integer/dequant/dp4a/MMQ/ternary/I2S/SSM/MoE kernels pass (some bit-exact by test design). What it cannot prove: NVIDIA bit-parity (f16 `mma.sync` is a software fallback, approximate intrinsics differ), >64 KB shared-memory kernels, cuBLAS paths, occupancy/register claims, or any performance. A failure on ZLUDA is not proof of a dotLLM bug.
+- The real RTX 3060 (`framework`) and Kaggle T4 remain the parity gate. ZLUDA is a single-maintainer project.
