@@ -1509,6 +1509,14 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepIq3SOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.IQ3_S && (inputDim % 256) == 0;
 
+    /// <summary>
+    /// True when the matrix is kept on device as raw TERN_B64_F16 blocks (18 B / 64 weights, <c>--tensor-overlay</c>, #1706), read in place by
+    /// <c>matmul_tern_b64_mmvq</c>. A ternary tensor is never widened: if the contraction axis is not a multiple of 64 the overlay loader has already
+    /// rejected it, and an F32 fallback would be a CLAUDE.md rule-2 violation, so there is no fallback (<see cref="DeviceQuantTypeFor"/> throws).
+    /// </summary>
+    private static bool KeepTernOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => qt == QuantizationType.TERN_B64_F16 && (inputDim % QuantFormat.TernB64GroupSize) == 0 && !dequantToFp32;
+
     /// <summary>Returns the on-device storage quant type for a projection. Every
     /// <see cref="QuantizationType"/> is kept in its packed source form <em>except</em>
     /// Q5_1 (and Q4_0 under <c>DOTLLM_VK_Q4_0_NATIVE=0</c>), which has no Vulkan projection kernel and so returns
@@ -1521,6 +1529,11 @@ internal sealed class VulkanWeights : IDisposable
     private static QuantizationType DeviceQuantTypeFor(
         QuantizationType srcQt, int inputDim, bool dequantToFp32)
     {
+        if (srcQt == QuantizationType.TERN_B64_F16)
+            return KeepTernOnDevice(srcQt, inputDim, dequantToFp32)
+                ? QuantizationType.TERN_B64_F16
+                : throw new NotSupportedException(
+                    $"TERN_B64_F16 tensor (K={inputDim}) cannot be kept packed on the Vulkan device here (needs K % 64 == 0 and no forced F32 expansion); widening a ternary overlay tensor is not supported.");
         if (KeepQ8OnDevice(srcQt, dequantToFp32)) return QuantizationType.Q8_0;
         if (KeepQ5_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q5_0;
         if (KeepQ5_1OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q5_1;
@@ -1624,6 +1637,8 @@ internal sealed class VulkanWeights : IDisposable
     private static long UploadBytes(int outputDim, int inputDim, QuantizationType qt, bool dequantToFp32)
     {
         long elems = (long)outputDim * inputDim;
+        if (KeepTernOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.TERN_B64_F16) * outputDim;
         if (KeepQ8OnDevice(qt, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
         if (KeepQ5_0OnDevice(qt, inputDim, dequantToFp32))

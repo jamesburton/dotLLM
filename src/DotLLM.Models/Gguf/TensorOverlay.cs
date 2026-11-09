@@ -261,6 +261,56 @@ public sealed partial class TensorOverlay : IDisposable
         }
     }
 
+    /// <summary>One overlay tensor in logical terms, for GPU backends that upload the packed bytes themselves (#1706 S3).</summary>
+    /// <param name="Name">Tensor name.</param>
+    /// <param name="Layer">Layer index.</param>
+    /// <param name="Proj">0 gate, 1 up, 2 down.</param>
+    /// <param name="Expert">Expert index, or -1 for a dense FFN tensor.</param>
+    /// <param name="In">Contraction length.</param>
+    /// <param name="Out">Output rows.</param>
+    /// <param name="Qt">Storage format.</param>
+    /// <param name="Ptr">Address inside the overlay's mmap (valid while the overlay is open).</param>
+    internal readonly record struct GpuEntry(string Name, int Layer, int Proj, int Expert, int In, int Out, QuantizationType Qt, nint Ptr);
+
+    /// <summary>The overlay's tensors in logical terms (see <see cref="GpuEntry"/>).</summary>
+    internal IEnumerable<GpuEntry> GpuEntries()
+    {
+        foreach (var t in _entries)
+        {
+            TryParseName(t.Name, out int layer, out int proj, out int expert);
+            yield return new GpuEntry(t.Name, layer, proj, expert, t.In, t.Out, t.Qt, t.Ptr);
+        }
+    }
+
+    /// <summary>Marks an overlay tensor consumed by a backend that handled it outside <see cref="ApplyToLayers"/> (the Vulkan expert upload).</summary>
+    internal void MarkApplied(string name) => _applied.Add(name);
+
+    /// <summary>
+    /// Applies only the DENSE-FFN entries to the loaded layers (pointer/format swap, shape-checked; the Vulkan loader then uploads the swapped
+    /// projection packed). Expert entries are left for the backend's own per-expert upload and are marked applied there.
+    /// </summary>
+    internal void ApplyDenseToLayers(TransformerLayerWeights[] layers)
+    {
+        foreach (var t in _entries)
+        {
+            TryParseName(t.Name, out int layer, out int proj, out int expert);
+            if (expert >= 0) continue;
+            string what = $"Tensor overlay '{Path}': '{t.Name}'";
+            if (layer >= layers.Length)
+                throw new InvalidDataException($"{what} names layer {layer}, but the model has {layers.Length} layers.");
+            ref readonly var lw = ref layers[layer];
+            if (lw.Moe is not null)
+                throw new InvalidDataException($"{what} is a dense-FFN name, but layer {layer} of the base model is a MoE layer (use blk.{layer}.ffn_{ProjectionNames[proj]}.{{E}}.weight).");
+            if (lw.GateWeight == 0)
+                throw new InvalidDataException($"{what}: layer {layer} of the base model has no dense FFN projections.");
+            int inDim = proj switch { 0 => lw.GateInputDim, 1 => lw.UpInputDim, _ => lw.DownInputDim };
+            int outDim = proj switch { 0 => lw.GateOutputDim, 1 => lw.UpOutputDim, _ => lw.DownOutputDim };
+            CheckShape(what, t.In, t.Out, inDim, outDim);
+            layers[layer] = lw.WithDenseFfnOverride(proj, t.Ptr, t.Qt);
+            _applied.Add(t.Name);
+        }
+    }
+
     /// <summary>
     /// A safetensors-loaded MoE layer (HF checkpoints: per-expert F32 matrices <c>W1</c> = gate, <c>W3</c> = up, <c>W2</c> = down) joins the same code path as
     /// the GGUF stacked banks: every expert gets an F32 entry in the side table (pointing at its existing matrix, no copy) and the layer runs
@@ -304,7 +354,8 @@ public sealed partial class TensorOverlay : IDisposable
         if (_applied.Count == Count) return;
         throw new NotSupportedException(
             $"--tensor-overlay '{Path}': {Count - _applied.Count} of {Count} overlay tensors were not applied. Overlays are supported on the CPU "
-            + "backend for plain transformer / MoE-GGUF models only in this release (Vulkan follows); use --device cpu.");
+            + "backend (plain transformer / MoE) and on Vulkan for dense-FFN and plain-SwiGLU MoE GGUF models (TERN_B64_F16 tensors only); "
+            + "use --device cpu or --device vulkan with a supported architecture.");
     }
 
     /// <inheritdoc/>

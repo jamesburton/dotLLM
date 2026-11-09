@@ -1,0 +1,99 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_EXT_control_flow_attributes    : require
+// TERN_B64_F16 (issue #1706, --tensor-overlay) MMVQ matmul, dense and MoE-indexed in one shader. Weights stay PACKED on the device and are
+// never widened: row-major [out, in]; block = 64 input columns = fp16 scale (2 B) + 16 B of 2-bit trits (18 B / 64 weights).
+// Trit code 00 = 0, 01 = +1, 10 = -1, 11 = invalid (rejected at load; decodes as 0 here). Byte j of the 16 trit bytes holds columns 4j..4j+3, LSB first;
+// w = trit * scale. The activation is the house Q8_1 row quantisation (per-32 int8 + fp32 scale d_x), so one int32 dot per 16 columns folds with
+// the 64-column weight scale exactly like the CPU TernB64F16.GemmQ8: acc += scale * d_x * dot. NOT bit-exact vs a float-in reference.
+//
+// Work split: one workgroup (32 invocations) per output cell (m, n). An invocation owns one 16-column group (word m of block b): 4 per block.
+// Reduction is a shared-memory tree, so no subgroup size is assumed.
+//
+// mode 0 (dense):   weight row m, activation row n, y[n*M + m].
+// mode 1 (indexed): e = indices[n]; slot = slotOf[e]; slot < 0 = this expert is NOT ternary for this projection: the cell is left untouched
+//                   (the original-format indexed kernel already wrote it). Else weight row slot*M + m, activation row n / xDiv, y[n*M + m].
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW    { uint  weight[]; };    // TERN_B64_F16 blob (dense: [M rows]; indexed: [numSlots * M rows])
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uvec4 xq4[]; };       // [rows * K/16] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };       // [rows * K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };   // [N] expert id per row (mode 1)
+layout(set = 0, binding = 4, std430) readonly  buffer BufSlot { int   slotOf[]; };    // [numExperts] ternary slot or -1 (mode 1)
+layout(set = 0, binding = 5, std430) writeonly buffer BufY    { float y[]; };         // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow;  // K / 64
+    uint xDiv;          // mode 1: activation row = n / xDiv
+    uint mode;          // 0 dense, 1 indexed
+    uint pad;
+} pc;
+
+const uint TERN_BLOCK_BYTES = 18u;
+
+shared float red[32];
+
+// 4 packed trits (one byte) -> 4 int8 lanes in {-1, 0, +1}.
+int tritsToI8x4(uint b) {
+    uint t = (b & 0x03u) | ((b & 0x0Cu) << 6u) | ((b & 0x30u) << 12u) | ((b & 0xC0u) << 18u);   // field i -> byte i
+    uint p = t & 0x01010101u;            // code bit 0  (+1 when code = 01)
+    uint n = (t >> 1u) & 0x01010101u;    // code bit 1  (-1 when code = 10)
+    return int(((p | 0x80808080u) - n) ^ 0x80808080u);   // byte-wise p - n without cross-byte borrow; code 11 -> 0
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+
+    uint wRow = m;
+    uint xRow = n;
+    if (pc.mode == 1u) {
+        int e = indices[n];
+        if (e < 0 || uint(e) >= pc.numExperts) return;
+        int slot = slotOf[e];
+        if (slot < 0) return;
+        wRow = uint(slot) * pc.M + m;
+        xRow = n / pc.xDiv;
+    }
+
+    uint rowByteBase = wRow * pc.blocksPerRow * TERN_BLOCK_BYTES;
+    uint xq4Base = xRow * (pc.K >> 4u);
+    uint xdsBase = xRow * (pc.K >> 5u);
+    uint lane = gl_LocalInvocationID.x;
+    uint groups = pc.blocksPerRow * 4u;   // 16-column groups per row
+    float acc = 0.0;
+
+    for (uint g = lane; g < groups; g += 32u) {
+        uint b = g >> 2u;
+        uint wi = g & 3u;                                   // word index within the block's 16 trit bytes
+        uint p = rowByteBase + b * TERN_BLOCK_BYTES;        // block start byte (even)
+        uint hiScale = (p & 2u) << 3u;                      // 0 or 16: halfword position inside the stream word
+        float scale = unpackHalf2x16((weight[p >> 2u] >> hiScale) & 0xFFFFu).x;
+        uint q = p + 2u + 4u * wi;                          // trit word byte offset (even)
+        uint lo = weight[q >> 2u];
+        uint word = ((q & 2u) != 0u) ? ((lo >> 16u) | (weight[(q >> 2u) + 1u] << 16u)) : lo;
+        uvec4 xa = xq4[xq4Base + b * 4u + wi];
+        vec2 ds = xds[xdsBase + b * 2u + (wi >> 1u)];
+        int dot = 0;
+        dot = dotPacked4x8AccSatEXT(tritsToI8x4( word         & 0xFFu), int(xa.x), dot);
+        dot = dotPacked4x8AccSatEXT(tritsToI8x4((word >>  8u) & 0xFFu), int(xa.y), dot);
+        dot = dotPacked4x8AccSatEXT(tritsToI8x4((word >> 16u) & 0xFFu), int(xa.z), dot);
+        dot = dotPacked4x8AccSatEXT(tritsToI8x4((word >> 24u) & 0xFFu), int(xa.w), dot);
+        acc += scale * ds.x * float(dot);
+    }
+
+    red[lane] = acc;
+    barrier();
+    [[unroll]] for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) red[lane] += red[lane + s];
+        barrier();
+    }
+    if (lane == 0u)
+        y[n * pc.M + m] = red[0];
+}
