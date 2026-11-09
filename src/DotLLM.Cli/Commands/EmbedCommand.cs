@@ -50,7 +50,7 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
         public bool NoNormalize { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default) or 'vulkan' (decoder embedders such as Qwen3-Embedding and BERT encoders with F16 weights, #741; nomic-bert, nomic-bert-moe and gemma-embedding run on vulkan too). An explicit GPU that cannot be honoured is an error, never a silent CPU run.")]
+        [Description("Compute device: 'cpu' (default, so vectors are comparable across machines) or 'vulkan' / 'vulkan:N' (decoder embedders such as Qwen3-Embedding and BERT encoders with F16 weights, #741; nomic-bert, nomic-bert-moe and gemma-embedding run on vulkan too). An explicit GPU that cannot be honoured is an error, never a silent CPU run.")]
         [DefaultValue("cpu")]
         public string Device { get; set; } = "cpu";
 

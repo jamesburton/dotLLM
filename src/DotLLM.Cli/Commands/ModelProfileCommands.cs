@@ -16,7 +16,7 @@ internal sealed class ModelCreateCommand : Command<ModelCreateCommand.Settings>
         public string Name { get; set; } = string.Empty;
 
         [CommandOption("--from|-f")]
-        [Description("Base model: a .gguf path, 'owner/repo[:quant]', a local model name, or another profile.")]
+        [Description("Base model: a .gguf path, 'owner/repo' or 'owner/repo:quant', a local model name, or another profile.")]
         public string From { get; set; } = string.Empty;
 
         [CommandOption("--system")]
@@ -27,29 +27,47 @@ internal sealed class ModelCreateCommand : Command<ModelCreateCommand.Settings>
         [Description("Read the system prompt from a file (instead of --system).")]
         public string? SystemFile { get; set; }
 
-        [CommandOption("--temperature")] public float? Temperature { get; set; }
-        [CommandOption("--top-p")] public float? TopP { get; set; }
-        [CommandOption("--top-k")] public int? TopK { get; set; }
-        [CommandOption("--min-p")] public float? MinP { get; set; }
-        [CommandOption("--repeat-penalty")] public float? RepeatPenalty { get; set; }
-        [CommandOption("--max-tokens")] public int? MaxTokens { get; set; }
-        [CommandOption("--seed")] public int? Seed { get; set; }
+        [CommandOption("--temperature")]
+        [Description("Default sampling temperature for requests that omit it. 0 = greedy.")]
+        public float? Temperature { get; set; }
+        [CommandOption("--top-p")]
+        [Description("Default top-P (nucleus) threshold, 0..1, for requests that omit it.")]
+        public float? TopP { get; set; }
+        [CommandOption("--top-k")]
+        [Description("Default top-K for requests that omit it. 0 = disabled.")]
+        public int? TopK { get; set; }
+        [CommandOption("--min-p")]
+        [Description("Default min-P threshold for requests that omit it. 0 = disabled.")]
+        public float? MinP { get; set; }
+        [CommandOption("--repeat-penalty")]
+        [Description("Default repetition penalty for requests that omit it. 1.0 = disabled.")]
+        public float? RepeatPenalty { get; set; }
+        [CommandOption("--max-tokens")]
+        [Description("Default maximum generated tokens per request when the request sets none.")]
+        public int? MaxTokens { get; set; }
+        [CommandOption("--seed")]
+        [Description("Default sampling seed (integer) for reproducible output. Omit for non-deterministic.")]
+        public int? Seed { get; set; }
 
         [CommandOption("--stop")]
         [Description("Stop sequence (repeatable).")]
         public string[]? Stop { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Device this model loads on: auto, cpu, vulkan, gpu[:N] / cuda[:N].")]
+        [Description("Device this model loads on: auto, cpu, vulkan, vulkan:N, gpu, gpu:N, cuda, cuda:N. Unset = the server's --device. See docs/CLI.md#device-selection.")]
         public string? Device { get; set; }
 
-        [CommandOption("--gpu-layers")] public int? GpuLayers { get; set; }
+        [CommandOption("--gpu-layers")]
+        [Description("Transformer layers to offload to the GPU (CUDA partial offload). Omit for the device default (all on a GPU device); ignored on vulkan, which is whole-model resident.")]
+        public int? GpuLayers { get; set; }
 
         [CommandOption("--keep-alive")]
         [Description("Seconds to keep the model loaded after its last request (0 = unload after each request, negative = never).")]
         public double? KeepAlive { get; set; }
 
-        [CommandOption("--description")] public string? Description { get; set; }
+        [CommandOption("--description")]
+        [Description("Free-text note shown by 'dotllm model show'.")]
+        public string? Description { get; set; }
     }
 
     public override int Execute(CommandContext context, Settings s)
@@ -119,7 +137,7 @@ internal sealed class ModelShowCommand : Command<ModelShowCommand.Settings>
     public sealed class Settings : CommandSettings
     {
         [CommandArgument(0, "<model>")]
-        [Description("A profile name, 'owner/repo[:quant]', or a local model name.")]
+        [Description("A profile name, 'owner/repo', 'owner/repo:quant', or a local model name.")]
         public string Model { get; set; } = string.Empty;
     }
 

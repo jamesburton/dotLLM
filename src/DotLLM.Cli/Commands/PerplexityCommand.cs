@@ -132,7 +132,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         public string? Quant { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default here, so perplexity numbers stay comparable across machines), 'auto', 'vulkan', 'gpu'/'cuda', 'gpu:1'/'cuda:1'. An explicit GPU that cannot be honoured is an error, never a silent CPU run.")]
+        [Description("Compute device: 'cpu' (default here, so perplexity numbers stay comparable across machines), 'auto', 'vulkan', 'vulkan:N', 'gpu'/'cuda', 'gpu:N'/'cuda:N'. An explicit GPU that cannot be honoured is an error, never a silent CPU run.")]
         [DefaultValue("cpu")]
         public string Device { get; set; } = "cpu";
 
@@ -158,12 +158,12 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         public float? YarnAttnFactor { get; set; }
 
         [CommandOption("--kv-cache")]
-        [Description("KV-cache storage format for perplexity scoring: 'none' (cacheless, exact K/V baseline — the default), 'f32' (FP32 cache), 'q8_0', 'q4_0'. When set, the forward pass reads K/V from the cache, so perplexity reflects the quantization quality of KV storage.")]
+        [Description("KV-cache storage used while scoring: 'none' (default: cacheless forward pass, exact K/V baseline), 'f32' (FP32 cache), 'q8_0' or 'q4_0' (quantized cache; bytes/element 1.0625 / 0.5625). With a cache the forward pass reads K/V back from it, so perplexity measures the quality cost of that KV storage. Compare against the 'none' run on the same corpus.")]
         [DefaultValue("none")]
         public string KvCache { get; set; } = "none";
 
         [CommandOption("--kv-window")]
-        [Description("Full-precision window size for quantized KV cache (recent tokens kept in FP32 before quantize-on-evict). 0 = quantize all tokens immediately. Only applies when --kv-cache is q8_0 or q4_0.")]
+        [Description("Full-precision window for a quantized --kv-cache: the most recent N tokens stay in FP32 and older ones are quantized on eviction. 0 (default) = quantize every token immediately. Only applies when --kv-cache is q8_0 or q4_0.")]
         [DefaultValue(0)]
         public int KvWindow { get; set; }
 

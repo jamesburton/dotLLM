@@ -223,41 +223,41 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>KV-cache key quantization type.</summary>
         [CommandOption("--cache-type-k")]
-        [Description("KV-cache key type: f32, f16, q8_0, q4_0. With --paged and neither K nor V given, Q8_0 blocks are used; pass f16 for both to keep F16.")]
+        [Description(DotLLM.Cli.Helpers.KvStorageCli.CacheTypeKHelp)]
         public string? CacheTypeK { get; set; }
 
         /// <summary>KV-cache value quantization type.</summary>
         [CommandOption("--cache-type-v")]
-        [Description("KV-cache value type: f32, f16, q8_0, q4_0.")]
+        [Description(DotLLM.Cli.Helpers.KvStorageCli.CacheTypeVHelp)]
         public string? CacheTypeV { get; set; }
 
         /// <summary>Mixed-precision window size for KV-cache quantization.</summary>
         [CommandOption("--cache-window")]
-        [Description("Mixed-precision window: recent N tokens in full precision (0 = all quantized). Only used when --cache-type-k or --cache-type-v is set.")]
+        [Description(DotLLM.Cli.Helpers.KvStorageCli.CacheWindowHelp)]
         [DefaultValue(0)]
         public int CacheWindow { get; set; }
 
         /// <summary>Use paged KV-cache (block-based allocation).</summary>
         [CommandOption("--paged")]
-        [Description("Use paged KV-cache with block-based allocation instead of pre-allocated simple cache.")]
+        [Description(DotLLM.Cli.Helpers.KvStorageCli.PagedHelp)]
         [DefaultValue(false)]
         public bool Paged { get; set; }
 
         /// <summary>Disable prompt caching (enabled by default).</summary>
         [CommandOption("--no-prompt-cache")]
-        [Description("Disable prompt caching. When enabled (default), KV-cache state is reused across turns.")]
+        [Description("Disable prompt caching (KV state reuse across turns). On by default; cleared by /clear.")]
         [DefaultValue(false)]
         public bool NoPromptCache { get; set; }
 
         /// <summary>Maximum number of cached sessions for prompt caching.</summary>
         [CommandOption("--prompt-cache-size")]
-        [Description("Maximum number of cached sessions for prompt caching.")]
+        [Description("Maximum number of cached sessions kept for prompt caching. Default 1 (one conversation).")]
         [DefaultValue(1)]
         public int PromptCacheSize { get; set; } = 1;
 
         /// <summary>Prefix-cache retention policy (issue #1654).</summary>
         [CommandOption("--prompt-cache-policy")]
-        [Description("Prefix-cache retention policy: lru (default) or agent (see dotllm serve). Env DOTLLM_PREFIX_POLICY.")]
+        [Description("Prefix-cache retention policy: lru (default) or agent (a conversation survives about its own length of other prompt tokens; side requests run without truncating it; recurrent models checkpoint at the last user message and after the reply). Env DOTLLM_PREFIX_POLICY.")]
         public string? PromptCachePolicy { get; set; }
 
         /// <summary>Draft model for speculative decoding.</summary>

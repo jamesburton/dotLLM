@@ -21,25 +21,25 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Port to listen on.</summary>
         [CommandOption("--port|-p")]
-        [Description("Port to listen on.")]
+        [Description("TCP port to listen on (default 8080). 'dotllm ps' / 'stop' use the same default.")]
         [DefaultValue(8080)]
         public int Port { get; set; } = 8080;
 
         /// <summary>Host to bind to.</summary>
         [CommandOption("--host")]
-        [Description("Host address to bind to.")]
+        [Description("Address to bind (default localhost = loopback only). Use 0.0.0.0 to serve the network - the inference endpoints are unauthenticated, so pair that with a firewall or reverse proxy. /metrics is on by default for loopback binds only.")]
         [DefaultValue("localhost")]
         public string Host { get; set; } = "localhost";
 
         /// <summary>Compute device.</summary>
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - a failed GPU load falls back), 'cpu', 'gpu', 'gpu:0', 'gpu:1' (CUDA), or 'vulkan'.")]
+        [Description(DotLLM.Cli.Helpers.DeviceCli.OptionHelp + " A model profile's device overrides it for that model.")]
         [DefaultValue("auto")]
         public string Device { get; set; } = "auto";
 
         /// <summary>Number of GPU layers for hybrid offloading.</summary>
         [CommandOption("--gpu-layers")]
-        [Description("Number of transformer layers to offload to GPU.")]
+        [Description("CUDA partial offload: number of transformer layers kept on the GPU, the rest run on the CPU. Omit for all layers on a GPU device (0 with --device cpu). Ignored on vulkan, where the whole model is device-resident.")]
         public int? GpuLayers { get; set; }
 
         /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
@@ -93,13 +93,13 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>CPU thread count.</summary>
         [CommandOption("--threads")]
-        [Description("Number of CPU threads for inference. 0 = auto.")]
+        [Description("CPU threads for inference. 0 = auto (all cores); 1 = single-threaded.")]
         [DefaultValue(0)]
         public int Threads { get; set; }
 
         /// <summary>Decode thread count.</summary>
         [CommandOption("--decode-threads")]
-        [Description("Number of threads for decode. 0 = auto.")]
+        [Description("CPU threads for the decode phase. 0 = auto (capped at the memory-channel count, since decode is bandwidth-bound).")]
         [DefaultValue(0)]
         public int DecodeThreads { get; set; }
 
@@ -110,24 +110,23 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>KV-cache key quantization type.</summary>
         [CommandOption("--cache-type-k")]
-        [Description("KV-cache key type: f32, f16, q8_0, q4_0. Synonym of --kv-quant-k. Unset (with --cache-type-v unset): paged CPU KV uses Q8_0 blocks (half the memory of f16); pass f16 for both to keep F16. " +
-                     "For the CUDA hybrid-dense model f32 means 'not given' (DOTLLM_HYBRID_KV applies); use f16 to force unquantized.")]
+        [Description(DotLLM.Cli.Helpers.KvStorageCli.CacheTypeKHelp)]
         public string? CacheTypeK { get; set; }
 
         /// <summary>KV-cache value quantization type.</summary>
         [CommandOption("--cache-type-v")]
-        [Description("KV-cache value type: f32, f16, q8_0, q4_0. Synonym of --kv-quant-v.")]
+        [Description(DotLLM.Cli.Helpers.KvStorageCli.CacheTypeVHelp)]
         public string? CacheTypeV { get; set; }
 
         /// <summary>Disable prompt caching (enabled by default).</summary>
         [CommandOption("--no-prompt-cache")]
-        [Description("Disable prompt caching. When enabled (default), KV-cache state is reused across turns.")]
+        [Description("Disable prompt caching (KV state reuse across turns/requests). On by default.")]
         [DefaultValue(false)]
         public bool NoPromptCache { get; set; }
 
         /// <summary>Maximum number of cached sessions for prompt caching.</summary>
         [CommandOption("--prompt-cache-size")]
-        [Description("Maximum number of cached sessions for prompt caching.")]
+        [Description("Maximum number of cached sessions (prompt prefixes) kept for reuse. Default 4.")]
         [DefaultValue(4)]
         public int PromptCacheSize { get; set; } = 4;
 
@@ -163,7 +162,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Disable paged KV-cache (enabled by default for serve).</summary>
         [CommandOption("--no-paged")]
-        [Description("Disable paged KV-cache. When enabled (default), uses block-based allocation for memory efficiency.")]
+        [Description("Disable the paged KV cache and use contiguous per-request caches instead. Default (paged): fixed-size blocks allocated on demand with prefix sharing, so memory tracks live tokens. Models without a uniform per-layer KV width always use the contiguous cache.")]
         [DefaultValue(false)]
         public bool NoPaged { get; set; }
 
@@ -364,7 +363,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>The API keys of the chunk-cache surface (off by default: loopback callers only).</summary>
         [CommandOption("--chunk-cache-api-keys")]
-        [Description("With --chunk-cache: a file of API keys (one per line, '<key> [admin] [ns=<namespace>]', keys of 32+ characters, e.g. 32 random bytes base64url; '#' comments; read once at startup) that may use /v1/chunk-cache/* " +
+        [Description("With --chunk-cache: a file of API keys (one per line: '<key>' optionally followed by 'admin' and/or 'ns=<namespace>', keys of 32+ characters, e.g. 32 random bytes base64url; '#' comments; read once at startup) that may use /v1/chunk-cache/* " +
                      "(X-API-Key or Authorization: Bearer); each key gets its own store namespace. Without it only loopback callers may. " +
                      "Security-sensitive: see docs/CHUNK_CACHE.md. Inference endpoints stay unauthenticated either way.")]
         public string? ChunkCacheApiKeys { get; set; }
@@ -415,19 +414,19 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Idle-unload duration in seconds (#369, ollama parity).</summary>
         [CommandOption("--keep-alive")]
-        [Description("Idle-unload duration in seconds (ollama parity; default 300 = 5 min). 0 = unload after each request. Negative = never unload.")]
+        [Description("Idle-unload timeout in seconds (ollama parity). Default 300 (5 min); 0 = unload after every request; negative = never unload. A model profile's keep_alive overrides it for that model.")]
         [DefaultValue(300.0)]
         public double KeepAlive { get; set; } = 300;
 
         /// <summary>Maximum number of models resident at once (#369).</summary>
         [CommandOption("--max-resident-models")]
-        [Description("Maximum number of models resident at once, counting the active one (default 1 = classic single-model hot-swap). Set > 1 to hold multiple models concurrently.")]
+        [Description("Maximum number of models kept loaded at once, counting the active one. Default 1 = classic single-model hot-swap (loading another model unloads the current one). Above 1, earlier models stay resident (instant switching) and, when a load would exceed the count or --resident-memory-budget, the least recently used ones are evicted first.")]
         [DefaultValue(1)]
         public int MaxResidentModels { get; set; } = 1;
 
         /// <summary>Total byte budget across all resident models (#369).</summary>
         [CommandOption("--resident-memory-budget")]
-        [Description("Total byte budget across all resident models. 0 (default) = unlimited, only --max-resident-models bounds residency.")]
+        [Description("Total byte budget (an integer number of BYTES, e.g. 17179869184 for 16 GiB) across all resident models. Default 0 = unlimited, so only --max-resident-models bounds residency.")]
         [DefaultValue(0L)]
         public long ResidentMemoryBudgetBytes { get; set; }
 

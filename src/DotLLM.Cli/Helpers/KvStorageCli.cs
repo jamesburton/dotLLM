@@ -61,6 +61,29 @@ internal sealed record KvStorageRequest(
 /// <summary>Flag parsing, the warn/reject matrix and apply/summary glue shared by run, bench and serve.</summary>
 internal static class KvStorageCli
 {
+    /// <summary>Help for <c>--cache-type-k</c> on run/chat/serve.</summary>
+    public const string CacheTypeKHelp =
+        "KV-cache KEY storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-k where that exists " +
+        "(give only one; conflicting values are an error). Unset: the backend default - F32 in the contiguous CPU cache (run/chat), F16 in GPU caches, " +
+        "Q8_0 blocks in the paged CPU cache (pass f16 for BOTH K and V to keep F16 there). On the CUDA hybrid-dense model (Bonsai-2, Qwen3.5/3.6) " +
+        "f32 means 'not given' (DOTLLM_HYBRID_KV applies) and quantized KV needs numKvHeads*headDim % 32 == 0. 'run' and 'bench' warn when the " +
+        "model/backend cannot honour a format. Sizing: docs/CLI.md#kv-cache-sizing.";
+
+    /// <summary>Help for <c>--cache-type-v</c> on run/chat/serve.</summary>
+    public const string CacheTypeVHelp =
+        "KV-cache VALUE storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-v where that exists. " +
+        "K and V may differ (e.g. -k q8_0 -v q4_0). See --cache-type-k.";
+
+    /// <summary>Help for <c>--cache-window</c>.</summary>
+    public const string CacheWindowHelp =
+        "Mixed-precision window: the most recent N tokens stay in full precision, older tokens are quantized on eviction (0 = quantize everything). " +
+        "Only used when --cache-type-k/-v is q8_0 or q4_0; ignored by the hybrid-dense models, which store the whole KV in one format.";
+
+    /// <summary>Help for <c>--paged</c> on run/chat.</summary>
+    public const string PagedHelp =
+        "Use the paged KV cache (fixed-size blocks allocated on demand, ref-counted for prefix sharing) instead of the contiguous cache " +
+        "sized up-front to prompt + --max-tokens. Opt-in here; 'serve' is paged by default (--no-paged to turn off). Needs a uniform per-layer KV width " +
+        "(Gemma-4 / MiMo-V2 use the contiguous cache).";
     /// <summary>
     /// Builds a request from the raw option strings. <c>--kv-quant-*</c> and <c>--cache-type-*</c> are
     /// synonyms; giving both with different values is an error.

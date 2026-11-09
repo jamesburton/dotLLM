@@ -154,12 +154,13 @@ When built from source, replace `dotllm <subcommand>` in the [Usage](#usage) exa
 
 ## Usage
 
-The `dotllm` CLI has these commands:
+The `dotllm` CLI has these commands. **Every command, option, default, environment variable, device spec (`vulkan:N`, `gpu:N`) and the KV-cache sizing guide is in [docs/CLI.md](docs/CLI.md)**; `dotllm <command> --help` prints the same per command:
 
 - **`dotllm model`** — pull, add, list, search, inspect and delete GGUF models; create and manage named model profiles; import ollama models
 - **`dotllm run`** — single-shot text generation with a performance summary
 - **`dotllm chat`** — interactive multi-turn REPL with chat template formatting
 - **`dotllm serve`** — OpenAI-compatible HTTP API (plus Anthropic- and ollama-compatible routes) with a built-in web chat UI
+- **`dotllm list`** — what is on disk (models and profiles; alias of `model list`; `--json`, `--paths`)
 - **`dotllm ps`** / **`dotllm stop`** — list / unload the models of a running server
 - **`dotllm bench`** / **`dotllm perplexity`** — throughput and quality measurement
 
@@ -190,7 +191,7 @@ dotllm model pull QuantFactory/SmolLM-135M-GGUF
 # and needs an interactive terminal to choose one, so scripts/CI must pass it.
 dotllm model pull TheBloke/Llama-2-7B-GGUF --file llama-2-7b.Q4_K_M.gguf
 
-# List everything available locally
+# List everything available locally (same as: dotllm list)
 dotllm model list
 
 # Show architecture, quantizations, and tokenizer info for a repo
@@ -214,7 +215,7 @@ dotllm model show terse            # merged settings and where the base model re
 dotllm model cp terse terse-hot    # copy a profile, or alias a model under a new name
 ```
 
-Profiles live in `~/.dotllm/profiles/` (`DOTLLM_PROFILES_DIR` overrides). A profile's name is a model id for the server (`"model": "terse"`), which applies its system prompt and defaults to requests that omit them. `dotllm run|chat` resolve a profile to its base model but do not yet apply its system prompt or sampling. `model create` options: `--from`/`-f`, `--system`, `--system-file`, `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--max-tokens`, `--seed`, `--stop` (repeatable), `--device`/`-d`, `--gpu-layers`, `--keep-alive`, `--description`, `--force`.
+Profiles live in `~/.dotllm/profiles/` (`DOTLLM_PROFILES_DIR` overrides). A profile's name is a model id for the server (`"model": "terse"`), which applies its system prompt and defaults to requests that omit them. `dotllm run|chat` resolve a profile to its base model but do not yet apply its system prompt or sampling. `model create` options are listed in [docs/CLI.md](docs/CLI.md#dotllm-model-create) (`--from`/`-f`, `--system`, `--system-file`, sampling defaults, `--stop`, `--device`/`-d`, `--gpu-layers`, `--keep-alive`, `--description`).
 
 #### Use your ollama models
 
