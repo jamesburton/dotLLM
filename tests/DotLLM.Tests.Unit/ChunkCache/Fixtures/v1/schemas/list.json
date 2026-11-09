@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chunkcache list output (read-only inventory of one or more stores; CLI extra, not an MCP tool)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["stores"],
+  "properties": {
+    "stores": {"type": "array", "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "entries", "entry_bytes", "temp_files", "temp_bytes", "owner_lock", "ledger", "indexes"],
+      "properties": {
+        "path": {"type": "string"},
+        "entries": {"type": "integer"},
+        "entry_bytes": {"type": "integer"},
+        "temp_files": {"type": "integer"},
+        "temp_bytes": {"type": "integer"},
+        "owner_lock": {"type": "string", "enum": ["held", "free"]},
+        "ledger": {"type": "object", "additionalProperties": false, "required": ["state"], "properties": {
+          "state": {"type": "string", "enum": ["absent", "ok", "unreadable"]},
+          "rows": {"type": "integer"},
+          "rows_without_entry": {"type": "integer"},
+          "rows_undetermined": {"type": "integer"},
+          "error": {"type": "string"}}},
+        "registry_note": {"type": "string"},
+        "invalid_registry_rows": {"type": "array", "items": {"type": "string"}},
+        "indexes": {"type": "array", "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["file", "chunker", "model_id", "producer", "state", "files", "chunks", "tokens", "distinct_keys", "stored_keys", "missing_keys"],
+          "properties": {
+            "file": {"type": "string"},
+            "chunker": {"type": "string"},
+            "model_id": {"type": "string"},
+            "producer": {"type": "string"},
+            "model_path": {"type": "string"},
+            "source_kind": {"type": "string"},
+            "source_path": {"type": "string"},
+            "root": {"type": "string"},
+            "updated_utc": {"type": "string"},
+            "state": {"type": "string", "enum": ["ok", "missing", "unreadable"]},
+            "error": {"type": "string"},
+            "files": {"type": "integer"},
+            "chunks": {"type": "integer"},
+            "tokens": {"type": "integer"},
+            "distinct_keys": {"type": "integer"},
+            "stored_keys": {"type": "integer"},
+            "missing_keys": {"type": "integer"}}}}}}},
+    "server": {"type": "object", "additionalProperties": false, "required": ["url"], "properties": {
+      "url": {"type": "string"},
+      "model_id": {"type": "string"},
+      "producer": {"type": "string"},
+      "tokenizer_id": {"type": "string"},
+      "entries": {"type": "integer"},
+      "bytes": {"type": "integer"},
+      "budget_bytes": {"type": "integer"}}}
+  }
+}

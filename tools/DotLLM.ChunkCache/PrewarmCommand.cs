@@ -79,26 +79,6 @@ internal static class PrewarmCommand
 {
     private const long MaxTextsFileBytes = 64L * 1024 * 1024;
 
-    public static readonly IReadOnlyDictionary<string, OptionKind> Spec = Common.Merge(Common.ModelOptions, Common.SourceOptions, Common.ChunkerOptions,
-        Common.SelectionOptions, new Dictionary<string, OptionKind>
-        {
-            ["texts"] = OptionKind.Single,
-            ["max-tokens"] = OptionKind.Single,
-            ["store"] = OptionKind.Single,
-        });
-
-    public const string Help = """
-        chunkcache prewarm --server URL (--texts FILE | --model M.gguf (--solution X | --directory D) [selection]) [--max-tokens N] [--json]
-
-          Queues chunk TEXT on the server for an isolated encode (POST /v1/chunk-cache/prewarm); the server decides what to store
-          (idle-only, budget, admission) and answers requested / already_stored / queued / queued_tokens / refused / refused_reasons.
-          --texts FILE    a JSON array of {"id": "...", "text": "...", "source": {"path": "rel/path.cs"}?}; a source.path on the
-                          secrets deny-list (.env*, *.pem, *.key, *.pfx, id_*, secrets.json, appsettings.*.Development.json,
-                          .git/**), an absolute path or one with '..' is refused here, before anything is sent
-          selection       --path G --symbol S --hops H --since REF --exclude G --budget T: the chunks `select` would pick
-          The API key is read from CHUNKCACHE_API_KEY only.
-        """;
-
     public static int Run(CliContext ctx, CliArgs args)
     {
         string serverUrl = args.Value("server") ?? throw new UsageException("prewarm: --server URL is required (the server encodes and stores; the CLI never writes entries).");

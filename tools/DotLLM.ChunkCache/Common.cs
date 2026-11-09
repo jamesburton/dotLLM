@@ -12,55 +12,6 @@ internal static class Common
     /// <summary>Default lock wait.</summary>
     public static readonly TimeSpan DefaultLockTimeout = TimeSpan.FromSeconds(30);
 
-    /// <summary>Options every model-using verb takes.</summary>
-    public static readonly IReadOnlyDictionary<string, OptionKind> ModelOptions = new Dictionary<string, OptionKind>
-    {
-        ["model"] = OptionKind.Single,
-        ["strict-model-id"] = OptionKind.Flag,
-        ["threads"] = OptionKind.Single,
-        ["json"] = OptionKind.Flag,
-        ["help"] = OptionKind.Flag,
-        ["server"] = OptionKind.Single,
-        ["offline"] = OptionKind.Flag,
-    };
-
-    /// <summary>Source options (<c>--solution</c> or <c>--directory</c>).</summary>
-    public static readonly IReadOnlyDictionary<string, OptionKind> SourceOptions = new Dictionary<string, OptionKind>
-    {
-        ["solution"] = OptionKind.Single,
-        ["directory"] = OptionKind.Single,
-        ["configuration"] = OptionKind.Single,
-    };
-
-    /// <summary>Chunker options.</summary>
-    public static readonly IReadOnlyDictionary<string, OptionKind> ChunkerOptions = new Dictionary<string, OptionKind>
-    {
-        ["chunker"] = OptionKind.Single,
-        ["chunk-tokens"] = OptionKind.Single,
-    };
-
-    /// <summary><see cref="ContextSelector"/> options.</summary>
-    public static readonly IReadOnlyDictionary<string, OptionKind> SelectionOptions = new Dictionary<string, OptionKind>
-    {
-        ["path"] = OptionKind.List,
-        ["exclude"] = OptionKind.List,
-        ["symbol"] = OptionKind.Single,
-        ["hops"] = OptionKind.Single,
-        ["since"] = OptionKind.Single,
-        ["merge-base"] = OptionKind.Flag,
-        ["budget"] = OptionKind.Single,
-        ["max-per-hop"] = OptionKind.Single,
-    };
-
-    /// <summary>Merges option tables.</summary>
-    public static IReadOnlyDictionary<string, OptionKind> Merge(params IReadOnlyDictionary<string, OptionKind>[] tables)
-    {
-        var all = new Dictionary<string, OptionKind>(StringComparer.Ordinal);
-        foreach (var t in tables)
-            foreach (var kv in t) all[kv.Key] = kv.Value;
-        return all;
-    }
-
     /// <summary>CPU threads for forwards: <c>--threads</c>, default min(8, processors).</summary>
     public static int Threads(CliArgs args) => args.Int("threads", Math.Min(8, Environment.ProcessorCount), 1, 1024);
 

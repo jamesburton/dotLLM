@@ -48,30 +48,6 @@ internal sealed record StatusResult
 /// </summary>
 internal static class StatusCommand
 {
-    public static readonly IReadOnlyDictionary<string, OptionKind> Spec = Common.Merge(Common.ModelOptions, Common.SourceOptions, Common.ChunkerOptions,
-        new Dictionary<string, OptionKind>
-        {
-            ["store"] = OptionKind.Single,
-            ["no-scan"] = OptionKind.Flag,
-            ["strict"] = OptionKind.Flag,
-            ["list-missing"] = OptionKind.Flag,
-            ["show"] = OptionKind.Single,
-        });
-
-    public const string Help = """
-        chunkcache status --model M.gguf --store DIR [--server URL] [options]
-
-          Lists the chunks of the store's index (this model, this chunker) that are missing from the store, by file and line
-          range, and, after rescanning the tree the index records (or --solution/--directory), the stale, new and deleted files.
-
-          --no-scan          check the store against the index only (edits since the last build are not seen)
-          --strict           exit 3 when not up to date (CI)
-          --list-missing     include every missing chunk in the JSON (text output always lists up to --show, default 40)
-          --server URL       the server's own store figures (entries, bytes, budget_bytes) and index name; the API key is read
-                             from CHUNKCACHE_API_KEY only
-          --chunker symbol|fixed --chunk-tokens N --configuration C --json
-        """;
-
     public static int Run(CliContext ctx, CliArgs args)
     {
         string storeRoot = ctx.FullPath(args.Required("store"));
@@ -153,7 +129,7 @@ internal static class StatusCommand
     }
 
     /// <summary>Reads the ledger for reporting only: an unreadable ledger is a state here, not an error (status is read-only).</summary>
-    private static LedgerJson ReadLedger(string storeRoot)
+    internal static LedgerJson ReadLedger(string storeRoot)
     {
         try
         {

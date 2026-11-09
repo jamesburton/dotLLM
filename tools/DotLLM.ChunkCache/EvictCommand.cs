@@ -34,34 +34,6 @@ internal sealed record EvictResult
 /// </summary>
 internal static class EvictCommand
 {
-    public static readonly IReadOnlyDictionary<string, OptionKind> Spec = Common.Merge(Common.ModelOptions, new Dictionary<string, OptionKind>
-    {
-        ["store"] = OptionKind.Single,
-        ["apply"] = OptionKind.Flag,
-        ["mode"] = OptionKind.Single,
-        ["path"] = OptionKind.Single,
-        ["namespace"] = OptionKind.Single,
-        ["all-for-model"] = OptionKind.Flag, // the old CLI mode: rejected with a hint to --mode all
-        ["lock-timeout"] = OptionKind.Single,
-        ["show"] = OptionKind.Single,
-    });
-
-    public const string Help = """
-        chunkcache evict (--server URL | --offline --store DIR) [--mode orphans|path|namespace|all] [--apply] [options]
-
-          Default: a dry run. --mode orphans (default): entries no index and not the server ledger reference. --mode path --path G:
-          forget a repo (entries first seen under the glob, their index references and sightings). --mode namespace [--namespace N]
-          and --mode all: wipe a namespace / the store (across namespaces only for an admin key).
-          --server URL    the server evicts (POST /v1/chunk-cache/evict); the API key is read from CHUNKCACHE_API_KEY only
-          --offline       no server owns --store: orphans (and --mode all --model M.gguf: that model's entries and indexes) are
-                          listed, and with --apply deleted while holding the store's owner lock for the whole pass (exit 1, store_owned,
-                          while a server or another offline writer owns it). An unreadable index or ledger blocks eviction (exit 1).
-          --apply         really evict (--lock-timeout S for the short store-lock scopes, default 30)
-          --strict-model-id  identify --model by a full hash (must match how it was built)
-          --json --show N (keys to print, default 20)
-        The old --all-for-model is --mode all --model M.gguf --offline.
-        """;
-
     /// <summary>Test hook, per async flow: runs inside an applying offline pass (owner lock and store lock held), before any deletion.</summary>
     internal static Action? TestHookInsideApply
     {

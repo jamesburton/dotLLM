@@ -48,33 +48,6 @@ internal sealed record SelectResult
 /// </summary>
 internal static class SelectCommand
 {
-    public static readonly IReadOnlyDictionary<string, OptionKind> Spec = Common.Merge(Common.ModelOptions, Common.SourceOptions, Common.ChunkerOptions,
-        Common.SelectionOptions, new Dictionary<string, OptionKind>
-        {
-            ["store"] = OptionKind.Single,
-            ["include-text"] = OptionKind.Flag,
-            ["order"] = OptionKind.Single,
-            ["show"] = OptionKind.Single,
-        });
-
-    public const string Help = """
-        chunkcache select --model M.gguf (--store DIR | --solution X | --directory D) [criteria] [options]
-
-          Chooses chunks for a context (the union of the criteria), ranked definition > body > path > changed > neighbour,
-          trimmed strictly to --budget. Tokenizer only. With --store, the source defaults to the one the store's index records
-          and each chunk says whether it is stored.
-
-          --path G                    a glob (repeat for more; '!' negates)   --exclude G   drop matching files everywhere (repeatable)
-          --symbol S --hops H         a symbol's definition and its callers/callees within H hops (default 1)
-          --max-per-hop N             keep only the N heaviest neighbours per hop
-          --since REF [--merge-base]  files changed since REF (or since the merge base of REF and HEAD), plus untracked
-          --budget T                  token budget
-          --order document|rank       output order (default document)    --include-text   include each chunk's text
-          --server URL                `stored` comes from the server (one explain request per batch, text only); the API key is read
-                                      from CHUNKCACHE_API_KEY only
-          --chunker symbol|fixed --chunk-tokens N --configuration C --json --show N (lines, default 40)
-        """;
-
     public static int Run(CliContext ctx, CliArgs args)
     {
         var total = Stopwatch.StartNew();
