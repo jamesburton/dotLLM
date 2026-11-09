@@ -380,6 +380,8 @@ internal static class VerbDefs
         """
         stores[]                            one per --store, in order
           path                              the store directory
+          store_marks                       false when the directory has none of a store's marks (lock, owner lock, registry, ledger,
+                                            or index plus entry directory): a mistyped --store, warned about on stderr
           entries, entry_bytes              entry files (.ckv) and their bytes
           temp_files, temp_bytes            leftover temp files of a crashed writer
           owner_lock                        held (or not probeable) | free: advisory
