@@ -45,8 +45,7 @@ public sealed class CliHelpTests
             string[] args = [.. path.Split(' ', StringSplitOptions.RemoveEmptyEntries), "--help"];
             var (rc, output) = CliCommandModel.Run(args);
             if (rc != 0 || output.Contains("Error:", StringComparison.Ordinal))
-                failures.Add($"'dotllm {path} --help' (exit {rc}): {output.Split('
-').FirstOrDefault(l => l.Contains("Error", StringComparison.Ordinal))}");
+                failures.Add($"'dotllm {path} --help' (exit {rc}): {output.Split(Convert.ToChar(10)).FirstOrDefault(l => l.Contains("Error", StringComparison.Ordinal))}");
         }
         Assert.True(failures.Count == 0, string.Join("; ", failures));
     }

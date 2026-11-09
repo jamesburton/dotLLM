@@ -174,7 +174,7 @@ Also available as the top-level [`dotllm list`](#dotllm-list).
 <!-- BEGIN options:model list -->
 | Option | Default | Env | Description |
 |---|---|---|---|
-| `--json` | off |  | Print one JSON object {"models": [...], "profiles": [...]} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout. |
+| `--json` | off |  | Print one JSON object {"models": array, "profiles": array} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout. |
 | `--paths` | off |  | Add a Path column (full file path) to the model table. Always present in --json output. |
 <!-- END options:model list -->
 
@@ -228,8 +228,8 @@ Creating an existing name overwrites it. A chain of profiles (`fast` -> `terse` 
 |---|---|---|---|
 | `<name>` |  |  | Name of the new model (letters, digits, . _ - and an optional ':tag'). Requests for this name load the base model with these defaults. |
 | `--description` `<text>` | unset |  | Free-text note shown by 'dotllm model show'. |
-| `--device`, `-d` `<text>` | unset |  | Device this model loads on: auto, cpu, vulkan, vulkan:N, gpu[:N] / cuda[:N]. Unset = the server's --device. See docs/CLI.md#device-selection. |
-| `--from`, `-f` `<text>` | unset |  | Base model: a .gguf path, 'owner/repo[:quant]', a local model name, or another profile. |
+| `--device`, `-d` `<text>` | unset |  | Device this model loads on: auto, cpu, vulkan, vulkan:N, gpu, gpu:N, cuda, cuda:N. Unset = the server's --device. See docs/CLI.md#device-selection. |
+| `--from`, `-f` `<text>` | unset |  | Base model: a .gguf path, 'owner/repo' or 'owner/repo:quant', a local model name, or another profile. |
 | `--gpu-layers` `<int>` | unset |  | Transformer layers to offload to the GPU (CUDA partial offload). Omit for the device default (all on a GPU device); ignored on vulkan, which is whole-model resident. |
 | `--keep-alive` `<number>` | unset |  | Seconds to keep the model loaded after its last request (0 = unload after each request, negative = never). |
 | `--max-tokens` `<int>` | unset |  | Default maximum generated tokens per request when the request sets none. |
@@ -249,7 +249,7 @@ Creating an existing name overwrites it. A chain of profiles (`fast` -> `terse` 
 <!-- BEGIN options:model show -->
 | Option | Default | Env | Description |
 |---|---|---|---|
-| `<model>` |  |  | A profile name, 'owner/repo[:quant]', or a local model name. |
+| `<model>` |  |  | A profile name, 'owner/repo', 'owner/repo:quant', or a local model name. |
 <!-- END options:model show -->
 
 #### dotllm model cp
@@ -289,7 +289,7 @@ dotllm list --json           # {"models":[{repo,filename,quant,size_bytes,path,d
 <!-- BEGIN options:list -->
 | Option | Default | Env | Description |
 |---|---|---|---|
-| `--json` | off |  | Print one JSON object {"models": [...], "profiles": [...]} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout. |
+| `--json` | off |  | Print one JSON object {"models": array, "profiles": array} instead of tables (model: repo, filename, quant, size_bytes, path, downloaded_at). Nothing else is written to stdout. |
 | `--paths` | off |  | Add a Path column (full file path) to the model table. Always present in --json output. |
 <!-- END options:list -->
 
@@ -373,7 +373,7 @@ Option groups: sampling (`--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-*`
 | `--speculative-k`, `--draft-tokens` `<int>` | 3 |  | Number of draft tokens per speculative step (K). Default 3. Also used as K for --no-mtp/MTP self-speculative decoding. |
 | `--speculative-model`, `--draft-model` `<text>` | unset |  | Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model. |
 | `--temp`, `-t` `<number>` | 0 |  | Sampling temperature. 0 = greedy (default). |
-| `--tensor-overlay` `<text>` | unset |  | Overlay GGUF replacing named FFN tensors (blk.L.ffn_{gate,up,down}[.E].weight), e.g. with TERN_B64_F16 ternary experts. Unknown names, shape mismatches and a base-hash mismatch are errors. CPU backend, plain transformer / MoE-GGUF models only. |
+| `--tensor-overlay` `<text>` | unset |  | Overlay GGUF replacing named FFN tensors (blk.L.ffn_{gate,up,down}.weight, or blk.L.ffn_{gate,up,down}.E.weight for expert E), e.g. with TERN_B64_F16 ternary experts. Unknown names, shape mismatches and a base-hash mismatch are errors. CPU backend, plain transformer / MoE-GGUF models only. |
 | `--ternary-adapter` `<text>` | unset |  | Path to a ternary residual adapter (.nsadapter or adapter GGUF); repeatable to compose. CPU and Vulkan models with a residual hook only; others are refused. Omit for base. |
 | `--threads` `<int>` | 0 |  | Number of CPU threads for inference. 0 = auto/all cores (default), 1 = single-threaded. |
 | `--tool-choice` `<text>` | `auto` |  | Tool selection: 'auto' (default), 'none', 'required' (constrain output to a valid tool call), or a function name. |
@@ -501,7 +501,7 @@ Notes on interplay:
 | `--cache-type-v` `<text>` | unset |  | KV-cache VALUE storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-v where that exists. K and V may differ (e.g. -k q8_0 -v q4_0). See --cache-type-k. |
 | `--chunk-cache` | off |  | Honour chunk_cache annotations on /v1/chat/completions and /v1/messages (chunk-level K/V reuse convention, docs/CHUNK_CACHE.md): policies exact (default) and shadow, whose output is identical to the unannotated request; responses gain a chunk_cache report. Off by default: annotations are ignored like any unknown field and responses are unchanged. |
 | `--chunk-cache-allow-short-keys` | off |  | With --chunk-cache-api-keys: accept keys shorter than 32 characters (each logged as a warning). Off by default: such a key refuses startup, because namespaces derived from keys appear in the store's file names and can be checked offline. |
-| `--chunk-cache-api-keys` `<text>` | unset |  | With --chunk-cache: a file of API keys (one per line, '<key> [admin] [ns=<namespace>]', keys of 32+ characters, e.g. 32 random bytes base64url; '#' comments; read once at startup) that may use /v1/chunk-cache/* (X-API-Key or Authorization: Bearer); each key gets its own store namespace. Without it only loopback callers may. Security-sensitive: see docs/CHUNK_CACHE.md. Inference endpoints stay unauthenticated either way. |
+| `--chunk-cache-api-keys` `<text>` | unset |  | With --chunk-cache: a file of API keys (one per line: '<key>' optionally followed by 'admin' and/or 'ns=<namespace>', keys of 32+ characters, e.g. 32 random bytes base64url; '#' comments; read once at startup) that may use /v1/chunk-cache/* (X-API-Key or Authorization: Bearer); each key gets its own store namespace. Without it only loopback callers may. Security-sensitive: see docs/CHUNK_CACHE.md. Inference endpoints stay unauthenticated either way. |
 | `--chunk-cache-max-chunks` `<int>` | unset |  | Most chunk annotations read per request (default 4096, at least 1); the rest are dropped with chunk_too_many without being read. |
 | `--chunk-store` `<text>` | unset |  | With --chunk-cache: the chunk store (e.g. built by chunkcache build) the server looks annotated chunks up in, to count hits and plan shadow reuse. Read-only: the server never writes or creates it; a missing directory is reported as chunk_store_unavailable. |
 | `--cpu-moe` | off | `DOTLLM_CPU_MOE` | Keep every MoE layer's routed experts on the CPU (llama.cpp --cpu-moe). CUDA nemotron_h_moe: never cached, always computed on the CPU; other CUDA MoE models (e.g. Flint): computed on the CPU from the mmap'd file; Vulkan Qwen3MoeHybrid (bench): as --n-cpu-moe with every layer. Env fallback: DOTLLM_CPU_MOE=1. |
@@ -565,7 +565,7 @@ Notes on interplay:
 | `--rope-scaling` `<text>` | unset |  | RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic'. Overrides the GGUF-derived value. |
 | `--speculative-k`, `--draft-tokens` `<int>` | 3 |  | Number of draft tokens per speculative step (K). Default 3. Also used as K for MTP. |
 | `--speculative-model`, `--draft-model` `<text>` | unset |  | Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model. |
-| `--tensor-overlay` `<text>` | unset |  | Overlay GGUF replacing named FFN tensors (blk.L.ffn_{gate,up,down}[.E].weight), e.g. with TERN_B64_F16 ternary experts. Unknown names, shape mismatches and a base-hash mismatch are errors. CPU backend, plain transformer / MoE-GGUF models only. |
+| `--tensor-overlay` `<text>` | unset |  | Overlay GGUF replacing named FFN tensors (blk.L.ffn_{gate,up,down}.weight, or blk.L.ffn_{gate,up,down}.E.weight for expert E), e.g. with TERN_B64_F16 ternary experts. Unknown names, shape mismatches and a base-hash mismatch are errors. CPU backend, plain transformer / MoE-GGUF models only. |
 | `--ternary-adapter` `<text>` | unset |  | Ternary residual adapter (.nsadapter or adapter GGUF, docs/TERNARY_ADAPTER.md) applied to every request; CPU and Vulkan models with a residual hook (see docs/TERNARY_ADAPTER.md), any other model fails the load; repeatable to compose. |
 | `--threads` `<int>` | 0 |  | CPU threads for inference. 0 = auto (all cores); 1 = single-threaded. |
 | `--warmup-iterations` `<int>` | 3 |  | Number of warm-up iterations (default: 3). More iterations improve JIT optimization via Dynamic PGO. |
@@ -684,7 +684,7 @@ dotllm perplexity QuantFactory/SmolLM-135M-GGUF --docs-file docs.jsonl --docs-ou
 | `--rope-scale` `<number>` | unset |  | RoPE scaling factor override (linear/YaRN/NTK). |
 | `--rope-scaling` `<text>` | unset |  | RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic' (as on run/serve; issue #1101 measures YaRN's short-context cost). |
 | `--stride` `<int>` | 0 |  | Tokens advanced between window starts. 0 selects the context length (non-overlapping chunks, llama.cpp's default). |
-| `--tensor-overlay` `<text>` | unset |  | Overlay GGUF replacing named FFN tensors (blk.L.ffn_{gate,up,down}[.E].weight), e.g. with TERN_B64_F16 ternary experts. Unknown names, shape mismatches and a base-hash mismatch are errors. CPU backend, plain transformer / MoE-GGUF models only. |
+| `--tensor-overlay` `<text>` | unset |  | Overlay GGUF replacing named FFN tensors (blk.L.ffn_{gate,up,down}.weight, or blk.L.ffn_{gate,up,down}.E.weight for expert E), e.g. with TERN_B64_F16 ternary experts. Unknown names, shape mismatches and a base-hash mismatch are errors. CPU backend, plain transformer / MoE-GGUF models only. |
 | `--threads` `<int>` | 0 |  | Compute threads. 0 = auto. |
 | `--tokens-file` `<text>` | unset |  | Read pre-tokenized whitespace-separated ids instead of tokenizing --corpus. Isolates scoring from tokenization when comparing against another implementation. |
 | `--unscored-prefix` `<int>` | -1 |  | Leading tokens of each window used as context only. -1 selects context/2 (llama.cpp's default). |
