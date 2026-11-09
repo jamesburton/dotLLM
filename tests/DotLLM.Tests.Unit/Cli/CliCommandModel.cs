@@ -39,7 +39,7 @@ internal sealed record CliCommand(string Path, string Description, bool IsBranch
 /// </summary>
 internal static class CliCommandModel
 {
-    private static readonly Regex EnvRegex = new(@"\b(?:DOTLLM_[A-Z0-9_]*[A-Z0-9]|HF_HOME|HF_HUB_CACHE|HF_TOKEN|OLLAMA_MODELS)\b", RegexOptions.Compiled);
+    private static readonly Regex EnvRegex = new(@"\b(?:DOTLLM_[A-Z0-9_]*[A-Z0-9]|HF_HOME|HF_HUB_CACHE|HF_TOKEN|OLLAMA_MODELS)\b", RegexOptions.Compiled | RegexOptions.ExplicitCapture, TimeSpan.FromSeconds(5));
 
     private static readonly Lazy<IReadOnlyList<CliCommand>> s_all = new(Build);
 
@@ -157,7 +157,7 @@ internal static class CliCommandModel
         };
     }
 
-    private static string Collapse(string? s) => Regex.Replace(s ?? "", @"\s+", " ").Trim();
+    private static string Collapse(string? s) => Regex.Replace(s ?? "", @"\s+", " ", RegexOptions.None, TimeSpan.FromSeconds(5)).Trim();
 
     /// <summary>The generated option table for one command (the block between its <c>options:</c> markers in docs/CLI.md).</summary>
     public static string RenderTable(CliCommand cmd)
