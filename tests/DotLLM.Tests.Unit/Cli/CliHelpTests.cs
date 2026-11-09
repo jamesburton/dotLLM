@@ -20,6 +20,9 @@ public sealed class CliHelpTests
 
     private static string DocPath() => Path.Combine(RepoRoot(), "docs", "CLI.md");
 
+    /// <summary>The doc with LF line endings, so a CRLF checkout (autocrlf) compares equal to the generated tables.</summary>
+    private static string ReadDoc() => File.ReadAllText(DocPath()).Replace("\r\n", "\n", StringComparison.Ordinal);
+
     [Fact]
     public void EveryCommandOptionAndArgument_HasADescription()
     {
@@ -62,7 +65,7 @@ public sealed class CliHelpTests
     [Fact]
     public void CliMd_OptionTables_MatchTheCommandTree()
     {
-        string doc = File.ReadAllText(DocPath());
+        string doc = ReadDoc();
         bool regen = Environment.GetEnvironmentVariable(RegenVar) == "1";
         var problems = new List<string>();
 
@@ -90,7 +93,7 @@ public sealed class CliHelpTests
     [Fact]
     public void CliMd_MentionsEveryCommand_AndTheUserFacingEnvironmentVariables()
     {
-        string doc = File.ReadAllText(DocPath());
+        string doc = ReadDoc();
         string root = RepoRoot();
 
         foreach (var c in CliCommandModel.All.Where(c => !c.IsDebug && !c.IsBranch))

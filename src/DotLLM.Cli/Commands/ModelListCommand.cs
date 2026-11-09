@@ -26,7 +26,7 @@ internal sealed partial class ModelListCommand : Command<ModelListCommand.Settin
         public bool Paths { get; set; }
     }
 
-    [GeneratedRegex(@"[.\-_]((?:IQ|PQ|TQ|Q)\d\w*|BF16|F16|F32|MXFP4|NVFP4)(?=\.gguf$|-\d{5}-of-\d{5}\.gguf$)", RegexOptions.IgnoreCase)]
+    [GeneratedRegex(@"[.\-_]((?:IQ|PQ|TQ|Q)\d\w*?|BF16|F16|F32|MXFP4|NVFP4)(?=[.\-]|\.gguf$)", RegexOptions.IgnoreCase)]
     private static partial Regex QuantRegex();
 
     /// <summary>Quantization label parsed from a GGUF file name (e.g. <c>Q4_K_M</c>), or <c>-</c> when the name carries none.</summary>
