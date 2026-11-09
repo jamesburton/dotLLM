@@ -41,6 +41,7 @@ public sealed class ChunkCacheCliHelpTests
             foreach (string required in new[] { "json", "help" })
                 if (verb.Options.All(o => o.Name != required)) problems.Add($"{name}: --{required} is not registered");
             string help = verb.Help;
+            Dictionary<string, string> entries = OptionEntries(help);
             foreach (OptionSpec o in verb.Options)
             {
                 string at = $"{name} --{o.Name}";
@@ -49,12 +50,42 @@ public sealed class ChunkCacheCliHelpTests
                 if (o.Kind == OptionKind.Flag && o.Value is not null) problems.Add($"{at}: a flag has no value form");
                 if (o.Kind != OptionKind.Flag && string.IsNullOrWhiteSpace(o.Value)) problems.Add($"{at}: no value form");
                 if (o.Name == "server" && o.Env != "CHUNKCACHE_API_KEY") problems.Add($"{at}: does not name the CHUNKCACHE_API_KEY environment variable");
-                if (!help.Contains("  " + o.Header + "\n", StringComparison.Ordinal) && !help.Contains("  " + o.Header + "\r\n", StringComparison.Ordinal))
+                if (!entries.TryGetValue(o.Header, out string? entry))
+                {
                     problems.Add($"{at}: --help does not print its entry");
-                if (!Squash(help).Contains(Squash(o.Description), StringComparison.Ordinal)) problems.Add($"{at}: --help does not print its text, values, repeatability, default and environment clauses");
+                    continue;
+                }
+                if (!entry.Contains(Squash(o.Description), StringComparison.Ordinal)) problems.Add($"{at}: --help does not print its description");
+                // The clauses are checked against the registered fields themselves, not against the renderer's own output.
+                if (!entry.Contains("Default: " + o.Default.TrimEnd('.'), StringComparison.Ordinal)) problems.Add($"{at}: --help does not print its default");
+                if (o.Values is not null && !entry.Contains("Values: " + o.Values.TrimEnd('.'), StringComparison.Ordinal)) problems.Add($"{at}: --help does not print its valid values");
+                if (o.Env is not null && !entry.Contains("Env: " + o.Env, StringComparison.Ordinal)) problems.Add($"{at}: --help does not print its environment variable");
+                if (o.Kind == OptionKind.List && !entry.Contains("Repeatable", StringComparison.Ordinal)) problems.Add($"{at}: --help does not say it repeats");
             }
         }
         return problems;
+    }
+
+    /// <summary>The entries of the <c>options:</c> section of a verb's help: header line (<c>--name VALUE</c>) to its wrapped text, whitespace squashed.</summary>
+    private static Dictionary<string, string> OptionEntries(string help)
+    {
+        var entries = new Dictionary<string, string>(StringComparer.Ordinal);
+        string[] lines = help.Split('\n').Select(l => l.TrimEnd('\r')).ToArray();
+        int i = Array.IndexOf(lines, "options:") + 1;
+        string? header = null;
+        var body = new StringBuilder();
+        for (; i > 0 && i < lines.Length && lines[i].Length > 0; i++)
+        {
+            if (lines[i].StartsWith("  --", StringComparison.Ordinal) && !lines[i].StartsWith("   ", StringComparison.Ordinal))
+            {
+                if (header is not null) entries[header] = Squash(body.ToString());
+                header = lines[i].Trim();
+                body.Clear();
+            }
+            else body.Append(lines[i]).Append(' ');
+        }
+        if (header is not null) entries[header] = Squash(body.ToString());
+        return entries;
     }
 
     private static string Squash(string s) => Rx(@"\s+").Replace(s, " ");
