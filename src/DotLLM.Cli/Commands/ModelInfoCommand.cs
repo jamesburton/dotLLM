@@ -16,11 +16,54 @@ internal sealed class ModelInfoCommand : AsyncCommand<ModelInfoCommand.Settings>
         [CommandArgument(0, "<repo-id>")]
         [Description("HuggingFace repository ID (e.g. 'TheBloke/Llama-2-7B-GGUF').")]
         public string RepoId { get; set; } = string.Empty;
+
+        [CommandOption("--json")]
+        [Description("Print one JSON object {\"version\": 1, repo, author, downloads, likes, pipeline, tags, local_path, gguf_files: array} instead of tables (file: filename, size_bytes, quant, local). A failure (unknown repo, no network) prints {\"error\": {code, message, exit_code}} on stdout and exits 1. Nothing else is written to stdout.")]
+        [DefaultValue(false)]
+        public bool Json { get; set; }
+    }
+
+    /// <summary>Builds the <c>--json</c> document from the hub answer and the local files of the same repo.</summary>
+    internal static ModelInfoJsonResult BuildJson(HuggingFaceModelInfo model, IReadOnlyList<RepoFileEntry> ggufFiles, IReadOnlyList<LocalModel> localFiles)
+    {
+        var local = localFiles.ToDictionary(m => m.Filename, m => m, StringComparer.OrdinalIgnoreCase);
+        return new ModelInfoJsonResult
+        {
+            Version = CliJson.SchemaVersion,
+            Repo = model.Id,
+            Author = model.Author,
+            Downloads = model.Downloads,
+            Likes = model.Likes,
+            Pipeline = model.PipelineTag,
+            Tags = model.Tags.ToArray(),
+            LocalPath = local.Count > 0 ? Path.GetDirectoryName(local.Values.First().FullPath) : null,
+            GgufFiles = ggufFiles.OrderBy(f => f.Path, StringComparer.Ordinal).Select(f => new ModelInfoJsonFile
+            {
+                Filename = f.Path, SizeBytes = f.Size, Quant = ModelListCommand.InferQuant(f.Path), Local = local.ContainsKey(f.Path),
+            }).ToArray(),
+        };
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
         using var client = new HuggingFaceClient();
+
+        if (settings.Json)
+        {
+            try
+            {
+                var m = await client.GetModelInfoAsync(settings.RepoId);
+                var files = await client.ListGgufFilesAsync(settings.RepoId);
+                var localFiles = ModelResolver.EnumerateLocal()
+                    .Where(l => l.RepoId.Equals(settings.RepoId, StringComparison.OrdinalIgnoreCase)).ToList();
+                Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(BuildJson(m, files, localFiles), CliJsonContext.Default.ModelInfoJsonResult));
+                return 0;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.Text.Json.JsonException)
+            {
+                return CliJson.WriteError("error", $"Could not fetch '{settings.RepoId}' from Hugging Face: {ex.Message}", 1);
+            }
+        }
 
         var (model, ggufFiles) = await AnsiConsole.Status()
             .StartAsync("Fetching model info...", async _ =>

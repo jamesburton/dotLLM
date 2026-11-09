@@ -12,6 +12,9 @@ namespace DotLLM.Cli;
 [JsonSerializable(typeof(BenchJsonResult))]
 [JsonSerializable(typeof(BenchJsonResult[]))]
 [JsonSerializable(typeof(ModelListJsonResult))]
+[JsonSerializable(typeof(PsJsonResult))]
+[JsonSerializable(typeof(ModelInfoJsonResult))]
+[JsonSerializable(typeof(CliJsonErrorResult))]
 [JsonSourceGenerationOptions(
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]

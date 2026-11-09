@@ -17,15 +17,51 @@ internal class ServerClientSettings : CommandSettings
 }
 
 /// <summary><c>dotllm ps</c>: the models a running server has resident, with idle time and auto-unload countdown (ollama <c>ps</c>).</summary>
-internal sealed class PsCommand : AsyncCommand<ServerClientSettings>
+internal sealed class PsCommand : AsyncCommand<PsCommand.Settings>
 {
-    public override async Task<int> ExecuteAsync(CommandContext context, ServerClientSettings s)
+    public sealed class Settings : ServerClientSettings
+    {
+        [CommandOption("--json")]
+        [Description("Print one JSON object {\"version\": 1, \"url\", \"models\": array, \"device_warning\"} instead of a table (model: id, active, device, size_bytes, idle_seconds, expires_in_seconds). A failure prints {\"error\": {code, message, exit_code}} on stdout. Nothing else is written to stdout.")]
+        [DefaultValue(false)]
+        public bool Json { get; set; }
+    }
+
+    /// <summary>
+    /// Builds the resident-model rows from a <c>/v1/models</c> response (the "none" placeholder and known-but-unloaded entries are skipped).
+    /// Shared by the table and <c>--json</c> so they cannot disagree.
+    /// </summary>
+    internal static PsJsonResult Build(JsonElement modelsResponse, string baseUrl, string? activeDevice, string? deviceWarning)
+    {
+        var rows = new List<PsJsonModel>();
+        foreach (var m in modelsResponse.GetProperty("data").EnumerateArray())
+        {
+            string id = m.GetProperty("id").GetString() ?? "";
+            if (id == "none") continue;   // the placeholder entry of a server with no model loaded
+            long size = m.TryGetProperty("size_bytes", out var sz) && sz.ValueKind == JsonValueKind.Number ? sz.GetInt64() : 0;
+            bool active = m.TryGetProperty("is_active", out var a) && a.ValueKind == JsonValueKind.True;
+            if (!active && size == 0) continue;   // known but not resident (unloaded): not part of ps
+            rows.Add(new PsJsonModel
+            {
+                Id = id,
+                Active = active,
+                Device = active ? activeDevice : null,
+                SizeBytes = size,
+                IdleSeconds = m.TryGetProperty("idle_seconds", out var i) && i.ValueKind == JsonValueKind.Number ? i.GetDouble() : null,
+                ExpiresInSeconds = m.TryGetProperty("expires_in_seconds", out var e) && e.ValueKind == JsonValueKind.Number ? e.GetDouble() : null,
+            });
+        }
+        return new PsJsonResult { Version = CliJson.SchemaVersion, Url = baseUrl, Models = rows.ToArray(), DeviceWarning = deviceWarning };
+    }
+
+    public override async Task<int> ExecuteAsync(CommandContext context, Settings s)
     {
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
         JsonDocument doc;
         try { doc = JsonDocument.Parse(await http.GetStringAsync($"{s.BaseUrl}/v1/models")); }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
         {
+            if (s.Json) return CliJson.WriteError("error", $"No dotllm server answering at {s.BaseUrl} ({ex.Message}). Start one with 'dotllm serve'.", 1);
             AnsiConsole.MarkupLine($"[red]No dotllm server answering at {s.BaseUrl.EscapeMarkup()}[/] ({ex.Message.EscapeMarkup()}). Start one with 'dotllm serve'.");
             return 1;
         }
@@ -46,26 +82,32 @@ internal sealed class PsCommand : AsyncCommand<ServerClientSettings>
 
         using (doc)
         {
+            PsJsonResult result;
+            try { result = Build(doc.RootElement, s.BaseUrl, activeDevice, deviceWarning); }
+            catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
+            {
+                if (s.Json) return CliJson.WriteError("error", $"{s.BaseUrl}/v1/models did not return the expected shape: {ex.Message}", 1);
+                AnsiConsole.MarkupLine($"[red]{s.BaseUrl.EscapeMarkup()}/v1/models did not return the expected shape:[/] {ex.Message.EscapeMarkup()}");
+                return 1;
+            }
+
+            if (s.Json)
+            {
+                Console.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.PsJsonResult));
+                return 0;
+            }
+
+            if (result.Models.Length == 0) { AnsiConsole.MarkupLine("[yellow]No models are loaded.[/]"); return 0; }
             var table = new Table().Border(TableBorder.Rounded);
             table.AddColumn("Model"); table.AddColumn("Active"); table.AddColumn("Device"); table.AddColumn(new TableColumn("Size").RightAligned());
             table.AddColumn(new TableColumn("Idle").RightAligned()); table.AddColumn(new TableColumn("Unloads in").RightAligned());
-            int rows = 0;
-            foreach (var m in doc.RootElement.GetProperty("data").EnumerateArray())
-            {
-                string id = m.GetProperty("id").GetString() ?? "";
-                if (id == "none") continue;   // the placeholder entry of a server with no model loaded
-                long size = m.TryGetProperty("size_bytes", out var sz) && sz.ValueKind == JsonValueKind.Number ? sz.GetInt64() : 0;
-                bool active = m.TryGetProperty("is_active", out var a) && a.ValueKind == JsonValueKind.True;
-                if (!active && size == 0) continue;   // known but not resident (unloaded): not part of ps
-                string idle = m.TryGetProperty("idle_seconds", out var i) && i.ValueKind == JsonValueKind.Number ? $"{i.GetDouble():F0}s" : "-";
-                string expires = m.TryGetProperty("expires_in_seconds", out var e) && e.ValueKind == JsonValueKind.Number ? $"{e.GetDouble():F0}s" : "never";
-                table.AddRow(id.EscapeMarkup(), active ? "[green]yes[/]" : "-", active && activeDevice is not null ? activeDevice.EscapeMarkup() : "-", size > 0 ? FormatHelpers.FormatSize(size) : "-", idle, expires);
-                rows++;
-            }
-            if (rows == 0) { AnsiConsole.MarkupLine("[yellow]No models are loaded.[/]"); return 0; }
+            foreach (var m in result.Models)
+                table.AddRow(m.Id.EscapeMarkup(), m.Active ? "[green]yes[/]" : "-", m.Device is not null ? m.Device.EscapeMarkup() : "-",
+                    m.SizeBytes > 0 ? FormatHelpers.FormatSize(m.SizeBytes) : "-",
+                    m.IdleSeconds is { } i ? $"{i:F0}s" : "-", m.ExpiresInSeconds is { } e ? $"{e:F0}s" : "never");
             AnsiConsole.Write(table);
-            if (deviceWarning is not null)
-                AnsiConsole.MarkupLine($"[bold yellow]WARNING: {deviceWarning.EscapeMarkup()}[/]");
+            if (result.DeviceWarning is not null)
+                AnsiConsole.MarkupLine($"[bold yellow]WARNING: {result.DeviceWarning.EscapeMarkup()}[/]");
         }
         return 0;
     }

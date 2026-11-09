@@ -56,6 +56,8 @@
     <!-- #409: chat-template fixtures are read at runtime from the output dir. [CallerFilePath] is
          deterministic-path-mapped to "/_/..." in CI, so it cannot locate source files. -->
     <None Include="Tokenizers\ChatTemplates\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- dotllm JSON output schemas (issue #1721), checked by CliJsonTests -->
+    <None Include="Cli\Fixtures\v1\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- chunk_cache wire-contract fixtures: byte-exact copies of ChunkedkvCache docs/contracts/chunk-cache-v1 (ContractFixtureTests). -->
     <None Include="ChunkCache\Fixtures\v1\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- SolutionScannerTests: a small solution read with MSBuildWorkspace from a temp copy. Its sources are data, never compiled

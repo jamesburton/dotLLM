@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dotllm list --json / dotllm model list --json (version 1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "models", "profiles"],
+  "properties": {
+    "version": {"type": "integer", "enum": [1]},
+    "models": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repo", "filename", "quant", "size_bytes", "path", "downloaded_at"],
+      "properties": {
+        "repo": {"type": "string"}, "filename": {"type": "string"}, "quant": {"type": "string"},
+        "size_bytes": {"type": "integer"}, "path": {"type": "string"}, "downloaded_at": {"type": "string"}}}},
+    "profiles": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name"],
+      "properties": {"name": {"type": "string"}, "from": {"type": "string"}, "device": {"type": "string"}}}}
+  }
+}

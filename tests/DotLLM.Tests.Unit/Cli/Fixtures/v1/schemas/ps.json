@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dotllm ps --json (version 1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "url", "models"],
+  "properties": {
+    "version": {"type": "integer", "enum": [1]},
+    "url": {"type": "string"},
+    "device_warning": {"type": "string"},
+    "models": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "active", "size_bytes"],
+      "properties": {
+        "id": {"type": "string"},
+        "active": {"type": "boolean"},
+        "device": {"type": "string"},
+        "size_bytes": {"type": "integer"},
+        "idle_seconds": {"type": "number"},
+        "expires_in_seconds": {"type": "number"}}}}
+  }
+}
