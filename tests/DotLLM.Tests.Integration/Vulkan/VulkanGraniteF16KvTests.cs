@@ -147,7 +147,10 @@ public class VulkanGraniteF16KvTests
         {
             Assert.True(kls[i][kls[i].Count / 2] > 0, "F16 KV is bit-identical to F32: the arms are not different (control insensitive)");
             Assert.True(kls[i][kls[i].Count / 2] < 3e-3, $"{names[i]} median KL {kls[i][kls[i].Count / 2]:E2}");
-            Assert.True(100.0 * top[i] / cnt[i] > 93.0, $"{names[i]} top-1 {100.0 * top[i] / cnt[i]:F1}%");
+            Assert.True(100.0 * top[i] / cnt[i] > 98.0, $"{names[i]} top-1 {100.0 * top[i] / cnt[i]:F1}%");
+            // Mean KL is outlier-sensitive: a 5 % RoPE-theta error confined to the F16 arm kept median KL 4.9e-4 and top-1 95.7 % (mutant survived the
+            // median/93 % gate) but moved mean KL to 1.0e-1 / 4.3e-1. Clean: 6.2e-4 / 4.6e-4.
+            Assert.True(kls[i].Average() < 4e-3, $"{names[i]} mean KL {kls[i].Average():E2}");
         }
     }
 
