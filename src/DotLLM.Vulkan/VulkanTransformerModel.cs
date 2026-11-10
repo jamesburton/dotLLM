@@ -531,6 +531,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         return v is null ? 8 : int.TryParse(v, out int n) && n >= 0 ? n : 8;
     }
 
+    // Prefill host-synced submit splitting (#1760). 0 (default) = the whole prefill forward is ONE command buffer.
+    // N > 0 = every N layers (seqLen > 1, autoregressive forwards) the recorded work is submitted and fence-waited,
+    // then recording continues on a fresh command buffer. Same ordering semantics as the per-stage splits of
+    // DOTLLM_VULKAN_PREFILL_PROFILE=1, with N x fewer syncs. Diagnostic/workaround for NVIDIA (RTX 3060) device loss on
+    // dense models whose monolithic prefill submit faults (TwIL-8B / Llama-3.2-3B, #1760).
+    private static readonly int PrefillSplitLayers =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PREFILL_SPLIT_LAYERS"), out int psl) && psl > 0 ? psl : 0;
+
     // ── Hazard-scoped barriers (issue #144) ────────────────────────────
     // Legacy behaviour emitted a full-pipeline barrier after essentially
     // every dispatch (~573/token on SmolLM decode), serialising the GPU so
@@ -4647,6 +4655,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 && !diffusionForward && layer < Config.NumLayers - 1)
             {
                 _submit.SplitSubmit();
+                cmdBuf = _submit.CommandBuffer;
+            }
+
+            if (PrefillSplitLayers > 0 && seqLen > 1 && layer > 0 && layer % PrefillSplitLayers == 0 && !diffusionForward)
+            {
+                _submit.SubmitAndWait();
+                _submit.Begin();
+                KernelSupport.HostToComputeBarrier(_submit.CommandBuffer);
                 cmdBuf = _submit.CommandBuffer;
             }
 
