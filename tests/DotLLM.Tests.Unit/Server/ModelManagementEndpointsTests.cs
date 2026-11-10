@@ -357,8 +357,8 @@ public sealed class ModelManagementEndpointsTests
     }
 
     /// <summary>
-    /// #712: Vulkan is servable exactly when a device AND the shader blobs exist, and then offers the one device string the loader accepts
-    /// (<c>vulkan</c>); otherwise it offers none.
+    /// #712: Vulkan is servable exactly when a device AND the shader blobs exist, and then (#1704) lists EVERY physical device as
+    /// <c>vulkan:N</c> (the string the loader accepts), exactly one flagged default; otherwise it offers none. (#1750)
     /// </summary>
     [Fact]
     public void Devices_VulkanServableIffDevicePresentAndShadersFound()
@@ -367,8 +367,14 @@ public sealed class ModelManagementEndpointsTests
         if (vulkan.Servable)
         {
             Assert.True(vulkan.Available);
-            Assert.Equal("vulkan", Assert.Single(vulkan.Devices).DeviceString);
-            Assert.True(DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(vulkan.Devices[0].DeviceString));
+            Assert.NotEmpty(vulkan.Devices);
+            Assert.Equal(vulkan.DeviceCount, vulkan.Devices.Length);
+            foreach (var d in vulkan.Devices)
+            {
+                Assert.Equal($"vulkan:{d.Index}", d.DeviceString);
+                Assert.True(DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(d.DeviceString));
+            }
+            Assert.Single(vulkan.Devices, d => d.IsDefault == true);
         }
         else
         {

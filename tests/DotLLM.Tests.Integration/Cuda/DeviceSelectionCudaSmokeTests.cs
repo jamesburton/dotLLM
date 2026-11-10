@@ -101,9 +101,9 @@ public sealed class DeviceSelectionCudaSmokeTests(ITestOutputHelper output)
 
             // Auto must try CUDA first on a CUDA host, fail it, optionally fall to Vulkan, and end on CPU with a warning naming the CUDA error.
             var auto = DeviceModelLoader.LoadWith(gguf, config, "auto", null, threading, bytes, name, output.WriteLine, output.WriteLine, devices,
-                (d, l) => d == "vulkan" ? throw new InvalidOperationException("vulkan skipped in this test") : BreakGpu(d, l));
+                (d, l) => d.StartsWith("vulkan", StringComparison.Ordinal) ? throw new InvalidOperationException("vulkan skipped in this test") : BreakGpu(d, l));
             using var _ = auto.Model;
-            Assert.Equal("cpu", auto.ResolvedDevice);
+            Assert.Equal("cpu", auto.ResolvedDevice);   // #1753: a "vulkan:N" here means the skip predicate missed and a real GPU load ran
             Assert.Contains("gpu:0", auto.Warning);
             Assert.Contains("CUDA_ERROR_OUT_OF_MEMORY", auto.Warning);
         }
