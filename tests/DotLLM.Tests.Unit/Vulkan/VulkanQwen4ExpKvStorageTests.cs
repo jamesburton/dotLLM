@@ -179,6 +179,35 @@ public sealed class VulkanQwen4ExpKvStorageTests
 
     // ───────────────────────── caches ─────────────────────────
 
+    /// <summary>
+    /// Issue #1741: a prefill's growth must leave headroom so the first decode token does not land on the allocation edge and re-create
+    /// every KV buffer (a full copy plus a descriptor-cache rebuild: the 1.4-2.3x slower decode right after a long prefill).
+    /// </summary>
+    [SkippableFact]
+    public void LazyCache_GrowthWithHeadroom_LeavesRoomForTheNextToken()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        using var device = VulkanDevice.Create();
+        int old = VulkanNemotronHKvCache.LazyGrowthQuantum;
+        VulkanNemotronHKvCache.LazyGrowthQuantum = 8;
+        try
+        {
+            using var noRoom = new VulkanNemotronHKvCache(device, [0], 1, 2, 8, 100, VulkanKvStorage.F32, lazy: true);
+            Assert.True(noRoom.EnsureCapacity(64));
+            Assert.True(noRoom.EnsureCapacity(65), "baseline: without headroom the very next position regrows");
+
+            using var cache = new VulkanNemotronHKvCache(device, [0], 1, 2, 8, 100, VulkanKvStorage.F32, lazy: true);
+            Assert.True(cache.EnsureCapacity(64, headroom: 8));
+            Assert.True(cache.AllocatedLength >= 72);
+            Assert.False(cache.EnsureCapacity(65), "the decode token after a prefill must not regrow the cache");
+
+            using var capped = new VulkanNemotronHKvCache(device, [0], 1, 2, 8, 66, VulkanKvStorage.F32, lazy: true);
+            Assert.True(capped.EnsureCapacity(64, headroom: 8));
+            Assert.Equal(66, capped.AllocatedLength);   // clamped to the logical limit
+        }
+        finally { VulkanNemotronHKvCache.LazyGrowthQuantum = old; }
+    }
+
     [SkippableTheory]
     [InlineData(VulkanKvStorage.F32)]
     [InlineData(VulkanKvStorage.F16)]
