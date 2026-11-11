@@ -17,17 +17,26 @@ internal static class CliConfiguration
     /// <summary>Exit code of a usage error (unknown command or option, missing argument). Shared exit-code table: 0 ok, 1 runtime error, 2 usage, 3 strict/check failure.</summary>
     internal const int UsageExitCode = 2;
 
+    /// <summary>Set by <see cref="ExecutionStartedInterceptor"/> once parsing succeeded and the command is about to run; tells a usage error from a runtime failure.</summary>
+    private sealed class ExecutionStartedInterceptor : ICommandInterceptor
+    {
+        public bool Started { get; private set; }
+        public void Intercept(CommandContext context, CommandSettings settings) => Started = true;
+    }
+
     /// <summary>
     /// Prints the same text as Spectre's default handler but returns the documented exit codes: 2 for a command-line usage error,
-    /// 1 for any other failure (Spectre's own default is a code that cannot be told apart).
+    /// 1 for any other failure (Spectre's own default is a code that cannot be told apart). A <see cref="CommandRuntimeException"/> is a
+    /// usage error only while the command line is still being parsed and bound (unknown command or option, missing argument); once the
+    /// command has started running, the same exception type thrown by a command is a runtime failure (exit 1).
     /// </summary>
-    private static int HandleException(Exception ex, ITypeResolver? resolver)
+    private static int HandleException(Exception ex, ExecutionStartedInterceptor interceptor)
     {
         if (ex is CommandRuntimeException { Pretty: { } pretty })
             AnsiConsole.Write(pretty);
         else
             AnsiConsole.WriteException(ex, ExceptionFormats.ShortenEverything);
-        return ex is CommandRuntimeException ? UsageExitCode : 1;   // parse errors and missing arguments are both CommandRuntimeException
+        return ex is CommandRuntimeException && !interceptor.Started ? UsageExitCode : 1;
     }
 
     /// <summary>Registers every command, branch, description and example.</summary>
@@ -42,7 +51,11 @@ internal static class CliConfiguration
         if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_DEBUG_ERRORS"), "1", StringComparison.Ordinal))
             config.PropagateExceptions();
         else
-            config.SetExceptionHandler(HandleException);
+        {
+            var started = new ExecutionStartedInterceptor();
+            config.SetInterceptor(started);
+            config.SetExceptionHandler((ex, _) => HandleException(ex, started));
+        }
         // The assembly informational version (0.3.0-dev.N+sha), not a literal: a harness must be able to
         // tell which build it is talking to (#774).
         config.SetApplicationVersion(DotLLM.Core.BuildInfo.Version);

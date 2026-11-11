@@ -61,7 +61,7 @@ internal sealed class PsCommand : AsyncCommand<PsCommand.Settings>
         try { doc = JsonDocument.Parse(await http.GetStringAsync($"{s.BaseUrl}/v1/models")); }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
         {
-            if (s.Json) return CliJson.WriteError("error", $"No dotllm server answering at {s.BaseUrl} ({ex.Message}). Start one with 'dotllm serve'.", 1);
+            if (s.Json) return CliJson.WriteError(CliJson.Codes.ServerUnreachable, $"No dotllm server answering at {s.BaseUrl} ({ex.Message}). Start one with 'dotllm serve'.", 1);
             AnsiConsole.MarkupLine($"[red]No dotllm server answering at {s.BaseUrl.EscapeMarkup()}[/] ({ex.Message.EscapeMarkup()}). Start one with 'dotllm serve'.");
             return 1;
         }
@@ -86,7 +86,7 @@ internal sealed class PsCommand : AsyncCommand<PsCommand.Settings>
             try { result = Build(doc.RootElement, s.BaseUrl, activeDevice, deviceWarning); }
             catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
             {
-                if (s.Json) return CliJson.WriteError("error", $"{s.BaseUrl}/v1/models did not return the expected shape: {ex.Message}", 1);
+                if (s.Json) return CliJson.WriteError(CliJson.Codes.ServerBadResponse, $"{s.BaseUrl}/v1/models did not return the expected shape: {ex.Message}", 1);
                 AnsiConsole.MarkupLine($"[red]{s.BaseUrl.EscapeMarkup()}/v1/models did not return the expected shape:[/] {ex.Message.EscapeMarkup()}");
                 return 1;
             }

@@ -65,7 +65,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         public bool NormalizeLineEndings { get; set; }
 
         [CommandOption("--context|-c")]
-        [Description("Context window in tokens. Clamped to the model's maximum sequence length.")]
+        [Description("Context window in tokens. Clamped to the model's maximum sequence length. Default: 512.")]
         [DefaultValue(512)]
         public int Context { get; set; } = 512;
 
@@ -174,7 +174,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
 
         [CommandOption("--first-layer")]
         [Description("First global layer index of the GPU window, so the offloaded block is an arbitrary " +
-                     "contiguous range rather than a prefix. Requires --gpu-layers; incompatible with --cycle.")]
+                     "contiguous range rather than a prefix. Requires --gpu-layers; incompatible with --cycle. Default: 0.")]
         [DefaultValue(0)]
         public int FirstLayer { get; set; }
 

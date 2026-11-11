@@ -44,25 +44,38 @@ internal sealed class ModelInfoCommand : AsyncCommand<ModelInfoCommand.Settings>
         };
     }
 
+    /// <summary>
+    /// The <c>--json</c> path: any failure becomes the error document on stdout with exit 1 (never a stack trace), with a code naming the kind
+    /// (<see cref="CliJson.ClassifyHubFailure"/>). <paramref name="fetch"/> is the hub call, injectable so a failure can be tested offline.
+    /// </summary>
+    internal static async Task<int> RunJsonAsync(string repoId, Func<Task<(HuggingFaceModelInfo Model, IReadOnlyList<RepoFileEntry> Files)>> fetch)
+    {
+        try
+        {
+            var (m, files) = await fetch();
+            var localFiles = ModelResolver.EnumerateLocal()
+                .Where(l => l.RepoId.Equals(repoId, StringComparison.OrdinalIgnoreCase)).ToList();
+            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(BuildJson(m, files, localFiles), CliJsonContext.Default.ModelInfoJsonResult));
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            return CliJson.WriteError(CliJson.ClassifyHubFailure(ex), $"Could not fetch '{repoId}' from Hugging Face: {ex.Message}", 1);
+        }
+    }
+
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
         using var client = new HuggingFaceClient();
 
         if (settings.Json)
         {
-            try
+            return await RunJsonAsync(settings.RepoId, async () =>
             {
                 var m = await client.GetModelInfoAsync(settings.RepoId);
                 var files = await client.ListGgufFilesAsync(settings.RepoId);
-                var localFiles = ModelResolver.EnumerateLocal()
-                    .Where(l => l.RepoId.Equals(settings.RepoId, StringComparison.OrdinalIgnoreCase)).ToList();
-                Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(BuildJson(m, files, localFiles), CliJsonContext.Default.ModelInfoJsonResult));
-                return 0;
-            }
-            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.Text.Json.JsonException)
-            {
-                return CliJson.WriteError("error", $"Could not fetch '{settings.RepoId}' from Hugging Face: {ex.Message}", 1);
-            }
+                return (m, files);
+            });
         }
 
         var (model, ggufFiles) = await AnsiConsole.Status()

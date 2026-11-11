@@ -28,7 +28,7 @@ internal sealed class DebugEmbedLookupCommand : Command<DebugEmbedLookupCommand.
         public string FilePath { get; set; } = string.Empty;
 
         [CommandOption("--token-id|-i")]
-        [Description("Token ID to look up (required).")]
+        [Description("Token ID to look up (required; the default -1 means not given and is rejected).")]
         public int TokenId { get; set; } = -1;
     }
 

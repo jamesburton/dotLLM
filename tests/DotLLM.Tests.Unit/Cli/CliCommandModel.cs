@@ -27,7 +27,7 @@ internal sealed record CliParam(
 }
 
 /// <summary>A command (or branch) of the dotllm tree.</summary>
-internal sealed record CliCommand(string Path, string Description, bool IsBranch, IReadOnlyList<CliParam> Params, string? SettingsType)
+internal sealed record CliCommand(string Path, string Description, bool IsBranch, IReadOnlyList<CliParam> Params, string? SettingsType, int ExampleCount = 0)
 {
     /// <summary>True for the Debug-build-only <c>debug</c> branch, which Release builds do not register.</summary>
     public bool IsDebug => Path == "debug" || Path.StartsWith("debug ", StringComparison.Ordinal);
@@ -95,7 +95,8 @@ internal static class CliCommandModel
         foreach (var p in cmd.Element("Parameters")?.Elements() ?? [])
             ps.Add(ToParam(p, settings));
 
-        into.Add(new CliCommand(path, Collapse(cmd.Element("Description")?.Value), isBranch, ps, settingsName));
+        into.Add(new CliCommand(path, Collapse(cmd.Element("Description")?.Value), isBranch, ps, settingsName,
+            cmd.Element("Examples")?.Elements("Example").Count() ?? 0));
         foreach (var child in cmd.Elements("Command"))
             Walk(child, path, into);
     }

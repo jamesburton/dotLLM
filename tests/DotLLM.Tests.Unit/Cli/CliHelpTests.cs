@@ -23,18 +23,49 @@ public sealed class CliHelpTests
     /// <summary>The doc with LF line endings, so a CRLF checkout (autocrlf) compares equal to the generated tables.</summary>
     private static string ReadDoc() => File.ReadAllText(DocPath()).Replace("\r\n", "\n", StringComparison.Ordinal);
 
-    [Fact]
-    public void EveryCommandOptionAndArgument_HasADescription()
+    /// <summary>
+    /// The help-quality rules of issue #1721 over a command list: every command, option and argument has a description; every runnable
+    /// (non-branch) command shows at least one example; an option with a declared default states it in its help text. Pure, so the
+    /// guard itself can be run against deliberately broken trees.
+    /// </summary>
+    internal static List<string> HelpViolations(IEnumerable<CliCommand> commands)
     {
-        var missing = new List<string>();
-        foreach (var c in CliCommandModel.All)
+        var v = new List<string>();
+        foreach (var c in commands)
         {
-            if (string.IsNullOrWhiteSpace(c.Description)) missing.Add($"command '{c.Path}'");
+            if (string.IsNullOrWhiteSpace(c.Description)) v.Add($"command '{c.Path}' has no description");
+            if (!c.IsBranch && c.ExampleCount == 0) v.Add($"command '{c.Path}' has no example");
             foreach (var p in c.Params)
-                if (string.IsNullOrWhiteSpace(p.Description))
-                    missing.Add($"'{c.Path}' {(p.IsArgument ? "argument" : "option")} '{p.Name}'");
+            {
+                string what = $"'{c.Path}' {(p.IsArgument ? "argument" : "option")} '{p.Name}'";
+                if (string.IsNullOrWhiteSpace(p.Description)) { v.Add($"{what} has no description"); continue; }
+                bool hasDefault = !p.IsArgument && !p.IsFlag && p.Default.Length > 0;
+                if (hasDefault && !p.Description.Contains("default", StringComparison.OrdinalIgnoreCase)
+                               && !p.Description.Contains(p.Default.Trim('`'), StringComparison.OrdinalIgnoreCase))
+                    v.Add($"{what} has default {p.Default} but its description does not state it (add 'Default: {p.Default.Trim('`')}.')");
+            }
         }
-        Assert.True(missing.Count == 0, "Missing [Description] / WithDescription for: " + string.Join("; ", missing));
+        return v;
+    }
+
+    [Fact]
+    public void EveryCommandOptionAndArgument_HasADescription_AnExample_AndItsDefault()
+    {
+        var violations = HelpViolations(CliCommandModel.All);
+        Assert.True(violations.Count == 0, "Help-quality violations: " + string.Join("; ", violations));
+    }
+
+    [Fact]
+    public void HelpGuard_FailsOnAnUndescribedOption_AMissingExample_AndAnUnstatedDefault()
+    {
+        // Prove the guard can fail: take a real, passing command and break it three ways.
+        var good = CliCommandModel.All.First(c => !c.IsBranch && !c.IsDebug && c.ExampleCount > 0 && c.Params.Any(p => !p.IsArgument && !p.IsFlag && p.Default.Length > 0));
+        Assert.Empty(HelpViolations([good]));
+
+        var opt = good.Params.First(p => !p.IsArgument && !p.IsFlag && p.Default.Length > 0);
+        Assert.Contains(HelpViolations([good with { Params = [.. good.Params, opt with { Name = "undescribed", Description = "" }] }]), m => m.Contains("no description", StringComparison.Ordinal));
+        Assert.Contains(HelpViolations([good with { ExampleCount = 0 }]), m => m.Contains("no example", StringComparison.Ordinal));
+        Assert.Contains(HelpViolations([good with { Params = [opt with { Description = "Something unrelated." }] }]), m => m.Contains("does not state", StringComparison.Ordinal));
     }
 
     [Fact]

@@ -51,7 +51,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>Maximum tokens per response.</summary>
         [CommandOption("--max-tokens|-n")]
-        [Description("Maximum number of tokens to generate per response.")]
+        [Description("Maximum number of tokens to generate per response. Default: 512.")]
         [DefaultValue(512)]
         public int MaxTokens { get; set; } = 512;
 
@@ -69,7 +69,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>Top-P sampling.</summary>
         [CommandOption("--top-p")]
-        [Description("Top-P (nucleus) sampling threshold.")]
+        [Description("Top-P (nucleus) sampling threshold. Default: 1.")]
         [DefaultValue(1.0f)]
         public float TopP { get; set; } = 1.0f;
 
