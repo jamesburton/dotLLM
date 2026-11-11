@@ -2339,7 +2339,7 @@ public sealed partial class TextGenerator
         int chunkSize = configured > 0 ? Math.Min(configured, prefillLen) : prefillLen;
         int[] positionsArray = ArrayPool<int>.Shared.Rent(chunkSize);
         ITensor? logits = null;
-        PrefillPulse? pulse = RequestTimingLog.BeginPrefill(prefillLen); // null (free) unless timing logs are on (#1288)
+        PrefillPulse? pulse = RequestTimingLog.BeginPrefill(prefillLen, singlePass: chunkSize >= prefillLen); // null (free) unless timing logs are on (#1288)
         int end = prefillStart + prefillLen;
         try
         {

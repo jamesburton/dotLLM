@@ -95,12 +95,13 @@ public static class RequestTimingLog
     /// allocation, no timer) when no sink is installed.
     /// </summary>
     /// <param name="total">Tokens this prefill computes (prefix-cache hits excluded).</param>
+    /// <param name="singlePass">True when the prefill is one forward that cannot report partial progress (#1723): the pulse then prints elapsed time, never <c>0/N (0.0%)</c>.</param>
     /// <returns>The pulse to <see cref="PrefillPulse.Advance"/> after each completed chunk and dispose at the end; or null.</returns>
-    public static PrefillPulse? BeginPrefill(int total)
+    public static PrefillPulse? BeginPrefill(int total, bool singlePass = false)
     {
         if (Sink is not { } sink || total <= 0)
             return null;
-        var pulse = new PrefillPulse(sink, total, PulseInterval);
+        var pulse = new PrefillPulse(sink, total, PulseInterval) { SinglePass = singlePass };
         t_pulseCreated?.Invoke(pulse);
         return pulse;
     }
@@ -109,20 +110,21 @@ public static class RequestTimingLog
     [ThreadStatic] internal static Action<PrefillPulse>? t_pulseCreated;
 
     /// <summary>
-    /// <see cref="BeginPrefill(int)"/> inside <paramref name="context"/>, so the pulse's timer (which captures the
+    /// <see cref="BeginPrefill(int, bool)"/> inside <paramref name="context"/>, so the pulse's timer (which captures the
     /// execution context) writes with the submitting request's log scope even when started on the scheduler loop.
     /// </summary>
     /// <param name="total">Tokens this prefill computes.</param>
     /// <param name="context">A context from <see cref="CaptureContext"/>, or null.</param>
+    /// <param name="singlePass">See <see cref="BeginPrefill(int, bool)"/>.</param>
     /// <returns>The pulse, or null when logging is off.</returns>
-    public static PrefillPulse? BeginPrefill(int total, ExecutionContext? context)
+    public static PrefillPulse? BeginPrefill(int total, ExecutionContext? context, bool singlePass = false)
     {
         if (context is null)
-            return BeginPrefill(total);
+            return BeginPrefill(total, singlePass);
 
         // A non-null context means logging was on at submission, so this closure is never paid when it is off.
         PrefillPulse? pulse = null;
-        ExecutionContext.Run(context, _ => pulse = BeginPrefill(total), null);
+        ExecutionContext.Run(context, _ => pulse = BeginPrefill(total, singlePass), null);
         return pulse;
     }
 
@@ -158,6 +160,9 @@ public sealed class PrefillPulse : IDisposable
     /// <summary>Tokens this prefill computes.</summary>
     public int Total { get; }
 
+    /// <summary>True when the prefill is a single uninterruptible forward: nothing completes until it ends, so a token count would read 0 throughout (#1723).</summary>
+    public bool SinglePass { get; init; }
+
     /// <summary>Tokens the device has completed so far.</summary>
     public int Completed => Volatile.Read(ref _completed);
 
@@ -170,6 +175,12 @@ public sealed class PrefillPulse : IDisposable
     {
         int done = Completed;
         double seconds = Stopwatch.GetElapsedTime(_start).TotalSeconds;
+        if (SinglePass && done == 0)
+        {
+            _sink(string.Format(CultureInfo.InvariantCulture,
+                "prefill in progress (single pass), {0} tokens, {1:F1}s elapsed", Total, seconds));
+            return;
+        }
         _sink(string.Format(CultureInfo.InvariantCulture,
             "prefill: {0}/{1} tokens ({2:F1}%), {3:F1} tok/s, {4:F1}s elapsed",
             done, Total, done * 100.0 / Total, seconds > 0 ? done / seconds : 0, seconds));
