@@ -4,6 +4,7 @@ using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using System.Numerics.Tensors;
 using Xunit;
 using Xunit.Abstractions;
@@ -57,8 +58,11 @@ public sealed unsafe class LoraStackCpuErrorBudgetTests
 
     public LoraStackCpuErrorBudgetTests(ITestOutputHelper output) => _output = output;
 
-    private const string ModelPath =
-        @"C:\Users\james\.dotllm\models\QuantFactory\SmolLM-135M-GGUF\SmolLM-135M.Q8_0.gguf";
+    // Resolved through the shared fixture store (env override, ~/.dotllm/models, HF cache), never a
+    // user-specific path (#1754).
+    private static readonly string ModelPath = TestFixtureResolver.ResolveFile(
+        ["DOTLLM_SMOLLM_135M_Q8_0_GGUF"], "QuantFactory", "SmolLM-135M-GGUF",
+        ["SmolLM-135M.Q8_0.gguf"], extraDirectories: null).Path ?? "SmolLM-135M.Q8_0.gguf (not found)";
 
     /// <summary>
     /// Establishes the defect-signature floor: every plausible composition defect (dropped
@@ -136,10 +140,18 @@ public sealed unsafe class LoraStackCpuErrorBudgetTests
         //     whole-logit cosine. The CUDA deficit under investigation is 1.09e-3 — 3x larger than
         //     the entire LoRA path can produce. Pin that bound so the argument cannot silently rot.
         double maxLoraAttributableDeficit = 2.0 * (1.0 - cosBaseStack) * 2.0;
-        Assert.True(maxLoraAttributableDeficit < (1.0 - 0.998909),
+        // #1754: the bound is the CPU reference's own Q8_0 activation-quant noise floor, so it moves with the
+        // base kernel's rounding. Measured reversed-delta cost: 4.4e-4 (docstring, original kernel),
+        // 6.8e-4 with the pre-#1119 Q8_0 kernels (DOTLLM_CPU_Q8_ROWS8=0), 1.54e-3 with the exact
+        // eight-row VNNI kernel and the scalar tier (bit-identical to VecDotQ8_0Scalar). The #488
+        // claim "the 1.09e-3 CUDA deficit cannot be the LoRA path" holds only for the old kernels;
+        // against the exact reference the LoRA path can account for it, so the CUDA deficit is
+        // attributed by the GPU-side controls, not by this bound. This pins the perturbation size.
+        const double MaxLoraAttributableDeficit = 2.5e-3;
+        Assert.True(maxLoraAttributableDeficit < MaxLoraAttributableDeficit,
             $"The LoRA delta perturbation grew: a fully-reversed delta could now cost " +
-            $"{maxLoraAttributableDeficit:E2} of whole-logit cosine, which reaches the 1.09e-3 CUDA " +
-            "deficit. #488's 'the deficit cannot be the LoRA path' argument no longer holds.");
+            $"{maxLoraAttributableDeficit:E2} of whole-logit cosine (pinned < {MaxLoraAttributableDeficit:E1}; " +
+            "1.54e-3 measured on the exact Q8_0 kernel, #1754).");
 
         // (2) In delta space every defect is loud. This is NOT a usable GPU gate (FP16 staging
         //     alone rotates the delta as far — see the class remarks); it pins the signatures so
