@@ -299,6 +299,8 @@ Not 3060-only (can run on Strix): everything in 8.1 and 8.3.
 
 ## 10. Open questions for the owner
 
+> **Decided by James, 2026-11-11: all recommendations below are accepted.** The TdrDelay=10 registry experiment (Q1) and the 3060 window (Q11) are accepted in principle; each still needs a fresh go-ahead from James at run time (admin edit, GPU coordination).
+
 1. **Confirm the mechanism with a TdrDelay experiment?** It needs an admin registry edit on the Framework laptop (revert
    after) and settles watchdog vs something else. **Recommendation: yes**, as step 2 of the window; the design is the same
    either way, but a negative result would change the budget rationale and the Linux default.
