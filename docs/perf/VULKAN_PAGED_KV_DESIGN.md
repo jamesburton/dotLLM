@@ -501,18 +501,18 @@ Totals: roughly 8-10 engineer-weeks for S1-S5 (default-on for the Qwen3.5/3.6 hy
 4. **OQ5 CUDA follow-up: RESOLVED (approved).** S1 unblocks CUDA's scheduler/trie wiring and #1270, and the CUDA gather
    default (a rule 2 violation) should be removed; the coordinator opens that issue separately.
 
-**Provisional, awaiting James (recommendations only):**
+**Decided by James, 2026-11-11 (all four recommendations accepted):**
 
-5. **OQ3 pool sizing (provisional, awaiting James).** Flag name (`--kv-pool-gib`? fraction of post-load headroom?) and
+5. **OQ3 pool sizing (decided by James, 2026-11-11: recommendation accepted).** Flag name (`--kv-pool-gib`? fraction of post-load headroom?) and
    initial size. Recommendation: initial = min(one window, 32K tokens) x 2 sequences, grow to 40 % of canary-admitted
    headroom, cap by slab limit. On the hybrids the GDN slots also bound concurrency.
-6. **OQ6 discrete-GPU access (provisional, awaiting James).** The Framework RTX 3060 is the only dGPU Vulkan box, is
+6. **OQ6 discrete-GPU access (decided by James, 2026-11-11: recommendation accepted).** The Framework RTX 3060 is the only dGPU Vulkan box, is
    flaky/contended, and is now a hard gate for the default flip. Recommendation: schedule a dedicated window before S5
    completes; no better alternative identified.
-7. **OQ7 split rounding (provisional, awaiting James).** Allow a later, separately measured change that rounds split
+7. **OQ7 split rounding (decided by James, 2026-11-11: recommendation accepted).** Allow a later, separately measured change that rounds split
    boundaries to multiples of `B` (faster, changes reduction order, drops bit-exactness for that kernel).
    Recommendation: not in v1; revisit after S3 numbers.
-8. **OQ8 Arc (provisional, awaiting James).** Recommendation: best-effort, not a sign-off gate.
+8. **OQ8 Arc (decided by James, 2026-11-11: recommendation accepted).** Recommendation: best-effort, not a sign-off gate.
 
 ## 9. References
 
