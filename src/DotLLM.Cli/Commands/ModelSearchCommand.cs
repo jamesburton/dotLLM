@@ -17,7 +17,7 @@ internal sealed class ModelSearchCommand : AsyncCommand<ModelSearchCommand.Setti
         public string Query { get; set; } = string.Empty;
 
         [CommandOption("--limit")]
-        [Description("Maximum number of results.")]
+        [Description("Maximum number of results. Default: 20.")]
         [DefaultValue(20)]
         public int Limit { get; set; } = 20;
 

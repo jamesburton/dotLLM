@@ -40,28 +40,28 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         public string Device { get; set; } = DeviceCli.DefaultDevice;
 
         [CommandOption("--prompt-tokens|-p")]
-        [Description("Synthetic prompt length in tokens (tiled from the seed prompt).")]
+        [Description("Synthetic prompt length in tokens (tiled from the seed prompt). Default: 512.")]
         [DefaultValue(512)]
         public int PromptTokens { get; set; } = 512;
 
         [CommandOption("--gen-tokens|-n")]
-        [Description("Greedy decode steps to time per repetition.")]
+        [Description("Greedy decode steps to time per repetition. Default: 128.")]
         [DefaultValue(128)]
         public int GenTokens { get; set; } = 128;
 
         [CommandOption("--reps|-r")]
-        [Description("Measured repetitions (one extra warm-up rep runs first and is discarded).")]
+        [Description("Measured repetitions (one extra warm-up rep runs first and is discarded). Default: 5.")]
         [DefaultValue(5)]
         public int Reps { get; set; } = 5;
 
         [CommandOption("--depth")]
         [Description("Extra synthetic context tokens fed (untimed) after prefill, before the timed decode. " +
-                     "Decode runs at context depth p + depth.")]
+                     "Decode runs at context depth p + depth. Default: 0.")]
         [DefaultValue(0)]
         public int Depth { get; set; }
 
         [CommandOption("--seed-prompt")]
-        [Description("Seed text tiled to synthesize the prompt.")]
+        [Description("Seed text tiled to synthesize the prompt. Default: 'The quick brown fox jumps over the lazy dog.' (with a trailing space).")]
         public string SeedPrompt { get; set; } = DefaultSeedPrompt;
 
         [CommandOption("--quant|-q")]

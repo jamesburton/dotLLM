@@ -8,6 +8,29 @@ internal static class CliJson
     /// <summary>Value of the top-level <c>version</c> field. Bumped only for a breaking change; fields are only ever added within a version.</summary>
     internal const int SchemaVersion = 1;
 
+    /// <summary>Failure-kind codes of the error document (<c>error.code</c>); the same style as chunkcache's (<c>store_busy</c>, <c>server_unreachable</c>, ...).</summary>
+    internal static class Codes
+    {
+        /// <summary>No dotllm server answered (connection refused, timeout).</summary>
+        internal const string ServerUnreachable = "server_unreachable";
+        /// <summary>A server answered with something that is not the expected JSON shape.</summary>
+        internal const string ServerBadResponse = "server_bad_response";
+        /// <summary>Hugging Face could not be reached or answered an HTTP error (unknown repo, 5xx, offline).</summary>
+        internal const string HubUnreachable = "hub_unreachable";
+        /// <summary>Hugging Face answered with something that is not the expected JSON.</summary>
+        internal const string HubBadResponse = "hub_bad_response";
+        /// <summary>Any other failure (I/O, a bug); the message carries the exception text.</summary>
+        internal const string Internal = "internal_error";
+    }
+
+    /// <summary>Maps an exception from a Hugging Face call to a <see cref="Codes"/> value.</summary>
+    internal static string ClassifyHubFailure(Exception ex) => ex switch
+    {
+        HttpRequestException or TaskCanceledException => Codes.HubUnreachable,
+        JsonException => Codes.HubBadResponse,
+        _ => Codes.Internal,
+    };
+
     /// <summary>Prints the error document <c>{"error":{"code","message","exit_code"}}</c> on stdout (same shape as chunkcache) and returns <paramref name="exitCode"/>.</summary>
     internal static int WriteError(string code, string message, int exitCode)
     {

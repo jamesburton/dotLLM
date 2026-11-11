@@ -57,7 +57,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         public int TopK { get; set; }
 
         [CommandOption("--top-p")]
-        [Description("Top-P (nucleus) sampling threshold.")]
+        [Description("Top-P (nucleus) sampling threshold. Default: 1.")]
         [DefaultValue(1.0f)]
         public float TopP { get; set; } = 1.0f;
 
@@ -101,12 +101,12 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         public float DryMultiplier { get; set; }
 
         [CommandOption("--dry-base")]
-        [Description("DRY exponential base for the match-length penalty curve.")]
+        [Description("DRY exponential base for the match-length penalty curve. Default: 1.75.")]
         [DefaultValue(1.75f)]
         public float DryBase { get; set; } = 1.75f;
 
         [CommandOption("--dry-allowed-length")]
-        [Description("Minimum matched n-gram length before DRY starts penalizing.")]
+        [Description("Minimum matched n-gram length before DRY starts penalizing. Default: 2.")]
         [DefaultValue(2)]
         public int DryAllowedLength { get; set; } = 2;
 

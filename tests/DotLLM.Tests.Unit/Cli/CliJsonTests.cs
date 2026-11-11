@@ -1,4 +1,6 @@
 using System.Net;
+using Spectre.Console;
+using Spectre.Console.Cli;
 using System.Text;
 using System.Text.Json;
 using DotLLM.Cli;
@@ -177,7 +179,7 @@ public sealed class CliJsonTests
         Assert.Equal(1, code);
         Assert.Empty(SchemaErrors("error", stdout));
         JsonElement err = JsonDocument.Parse(stdout).RootElement.GetProperty("error");
-        Assert.Equal("error", err.GetProperty("code").GetString());
+        Assert.Equal("server_unreachable", err.GetProperty("code").GetString());
         Assert.Equal(1, err.GetProperty("exit_code").GetInt32());
         Assert.Contains("No dotllm server answering", err.GetProperty("message").GetString(), StringComparison.Ordinal);
     }
@@ -291,5 +293,85 @@ public sealed class CliJsonTests
         Assert.Equal(2, Run("model", "info").Code);                     // missing required argument
         Assert.Equal(2, Run("run").Code);                               // missing required argument
         Assert.Equal(1, Run("ps", "--url", "http://127.0.0.1:1").Code); // runtime error: nothing listening
+    }
+
+    // ------------------------------------------------------------------------------------------------ failures
+
+    /// <summary>A command that fails at run time by throwing Spectre's <see cref="Spectre.Console.Cli.CommandRuntimeException"/>.</summary>
+    private sealed class ThrowingSettings : Spectre.Console.Cli.CommandSettings { }
+
+    private sealed class ThrowingCommand : Spectre.Console.Cli.Command<ThrowingSettings>
+    {
+        public override int Execute(Spectre.Console.Cli.CommandContext context, ThrowingSettings settings)
+            => throw MakeRuntimeException("boom at run time");
+
+        // The constructors are internal to Spectre (it throws the type itself); build one the way a runtime fault inside Spectre would.
+        private static Exception MakeRuntimeException(string message)
+        {
+            var ctor = typeof(Spectre.Console.Cli.CommandRuntimeException).GetConstructors(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)
+                .OrderBy(c => c.GetParameters().Length).First();
+            object?[] args = ctor.GetParameters().Select(p => p.ParameterType == typeof(string) ? message : p.ParameterType.IsValueType ? Activator.CreateInstance(p.ParameterType) : null).ToArray();
+            return (Exception)ctor.Invoke(args);
+        }
+    }
+
+    [Fact]
+    public void CommandRuntimeException_ThrownByARunningCommand_IsExitOne_ButAParseErrorIsExitTwo()
+    {
+        static int Go(params string[] args)
+        {
+            var sw = new StringWriter();
+            var console = Spectre.Console.AnsiConsole.Create(new Spectre.Console.AnsiConsoleSettings { Out = new Spectre.Console.AnsiConsoleOutput(sw) });
+            var app = new Spectre.Console.Cli.CommandApp();
+            app.Configure(c =>
+            {
+                CliConfiguration.Configure(c);
+                c.AddCommand<ThrowingCommand>("boom-test");
+                c.ConfigureConsole(console);
+            });
+            return app.Run(args);
+        }
+        Assert.Equal(1, Go("boom-test"));              // runtime failure: same exception type as a usage error, but the command had started
+        Assert.Equal(2, Go("boom-test", "--nope"));    // parse error on the same command: usage
+        Assert.Equal(2, Go("no-such-command"));
+    }
+
+    [Fact]
+    public async Task ModelInfo_Json_Failures_PrintTheErrorDocument_WithAKindCode_ExitOne()
+    {
+        static Task<(HuggingFaceModelInfo, IReadOnlyList<RepoFileEntry>)> Throw(Exception ex) => Task.FromException<(HuggingFaceModelInfo, IReadOnlyList<RepoFileEntry>)>(ex);
+        var cases = new (Exception Ex, string Code)[]
+        {
+            (new HttpRequestException("404 not found"), "hub_unreachable"),
+            (new TaskCanceledException("timeout"), "hub_unreachable"),
+            (new JsonException("bad json"), "hub_bad_response"),
+            (new InvalidOperationException("surprise"), "internal_error"),     // used to escape as a stack trace
+            (new IOException("disk"), "internal_error"),
+        };
+        foreach (var (ex, code) in cases)
+        {
+            var original = Console.Out;
+            var sw = new StringWriter();
+            Console.SetOut(sw);
+            int rc;
+            try { rc = await ModelInfoCommand.RunJsonAsync("acme/none", () => Throw(ex)); }
+            finally { Console.SetOut(original); }
+
+            Assert.Equal(1, rc);
+            Assert.Empty(SchemaErrors("error", sw.ToString()));
+            using var doc = JsonDocument.Parse(sw.ToString());
+            JsonElement e = doc.RootElement.GetProperty("error");
+            Assert.Equal(code, e.GetProperty("code").GetString());
+            Assert.Equal(1, e.GetProperty("exit_code").GetInt32());
+            Assert.Contains("acme/none", e.GetProperty("message").GetString());
+        }
+    }
+
+    [Fact]
+    public void Ps_Json_NoServer_CodeIsServerUnreachable()
+    {
+        var (_, stdout) = Run("ps", "--json", "--url", "http://127.0.0.1:1");
+        using var doc = JsonDocument.Parse(stdout);
+        Assert.Equal("server_unreachable", doc.RootElement.GetProperty("error").GetProperty("code").GetString());
     }
 }
