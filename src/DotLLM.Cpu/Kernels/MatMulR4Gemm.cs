@@ -181,24 +181,55 @@ public static unsafe partial class MatMul
         public int BlockBytes;
         public int InputRowBytes;
         public int TileGroups;
+        public int NextGroup;
         public delegate*<byte*, byte*, float*, int, int, int, void> ComputeRowsInterleaved;
         public delegate*<byte*, int, byte*, int, float*, int, void> GroupTok4;
     }
+
+    /// <summary>
+    /// Test/diagnostic switch (also <c>DOTLLM_CPU_GEMM_STATIC=1</c>): partition the R4 tiled GEMM statically (one contiguous row range
+    /// per thread) instead of by dynamic chunk claiming. Results are bit-identical either way (#1675).
+    /// </summary>
+    internal static volatile bool ForceStaticGemmPartition =
+        Environment.GetEnvironmentVariable("DOTLLM_CPU_GEMM_STATIC") == "1";
 
     private static void GemmR4TiledWorker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var ctx = ref Unsafe.AsRef<GemmR4TiledCtx>((void*)ctxPtr);
 
-        // Partition whole 4-row groups across threads: each thread owns a disjoint row range of C,
-        // and group boundaries never move, so the arithmetic is thread-count independent.
-        int groupsPerThread = (ctx.FullGroups + threadCount - 1) / threadCount;
-        int startGroup = threadIdx * groupsPerThread;
-        int endGroup = Math.Min(startGroup + groupsPerThread, ctx.FullGroups);
-        if (startGroup > endGroup) startGroup = endGroup;
+        if (ForceStaticGemmPartition)
+        {
+            // Partition whole 4-row groups across threads: each thread owns a disjoint row range of C,
+            // and group boundaries never move, so the arithmetic is thread-count independent.
+            int groupsPerThread = (ctx.FullGroups + threadCount - 1) / threadCount;
+            int startGroup = threadIdx * groupsPerThread;
+            int endGroup = Math.Min(startGroup + groupsPerThread, ctx.FullGroups);
+            if (startGroup > endGroup) startGroup = endGroup;
 
-        GemmR4TiledRange(ctx.RepackedWeights, ctx.InputQ, ctx.C, startGroup, endGroup,
-            ctx.FullGroups, ctx.TailRows, ctx.BlockCount, ctx.M, ctx.N, ctx.BlockBytes,
-            ctx.InputRowBytes, ctx.TileGroups, doTail: threadIdx == 0, ctx.ComputeRowsInterleaved, ctx.GroupTok4);
+            GemmR4TiledRange(ctx.RepackedWeights, ctx.InputQ, ctx.C, startGroup, endGroup,
+                ctx.FullGroups, ctx.TailRows, ctx.BlockCount, ctx.M, ctx.N, ctx.BlockBytes,
+                ctx.InputRowBytes, ctx.TileGroups, doTail: threadIdx == 0, ctx.ComputeRowsInterleaved, ctx.GroupTok4);
+            return;
+        }
+
+        // Dynamic claiming (#1675): a statically split GEMM runs at the speed of its slowest thread, and with every logical
+        // processor busy a single descheduled worker (any other process on the box) stalls all the others at the barrier.
+        // Claim chunks of whole 4-row groups from a shared counter instead; group boundaries never move and each output
+        // element is still produced by exactly one kernel call, so the arithmetic stays thread-count and schedule independent.
+        if (threadIdx == 0 && ctx.TailRows > 0)
+            GemmR4TiledRange(ctx.RepackedWeights, ctx.InputQ, ctx.C, 0, 0, ctx.FullGroups, ctx.TailRows, ctx.BlockCount,
+                ctx.M, ctx.N, ctx.BlockBytes, ctx.InputRowBytes, ctx.TileGroups, doTail: true, ctx.ComputeRowsInterleaved, ctx.GroupTok4);
+
+        int chunk = Math.Clamp(ctx.FullGroups / (threadCount * 8), Math.Min(4, ctx.TileGroups), ctx.TileGroups);
+        while (true)
+        {
+            int start = Interlocked.Add(ref ctx.NextGroup, chunk) - chunk;
+            if (start >= ctx.FullGroups) break;
+            int end = Math.Min(start + chunk, ctx.FullGroups);
+            GemmR4TiledRange(ctx.RepackedWeights, ctx.InputQ, ctx.C, start, end,
+                ctx.FullGroups, ctx.TailRows, ctx.BlockCount, ctx.M, ctx.N, ctx.BlockBytes,
+                ctx.InputRowBytes, ctx.TileGroups, doTail: false, ctx.ComputeRowsInterleaved, ctx.GroupTok4);
+        }
     }
 
     // ──────────────────── Per-quant wrappers ────────────────────

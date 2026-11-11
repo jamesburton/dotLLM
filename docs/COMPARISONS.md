@@ -425,6 +425,65 @@ Source: bench round 2026-11-09, issue #1675 (dotLLM `dev` `157dc8ee`; llama.cpp 
 dotLLM CPU prefill is 0.45-0.58x at every thread count, and decode peaks at 24 threads and collapses at 32 (the S0 finding of 4.5-6 tok/s
 stands). llama.cpp's own decode also drops at 32 threads (14.9). Not run: a `--decode-threads` sweep.
 
+### 4.5 TwIL-8B Q4_K_M CPU prefill profile and dynamic GEMM partition (#1675)
+
+Source: issue #1675, branch `issue/1675-cpu-prefill-twil8b`, 2026-11-11, `cpu-bench` held, Ryzen AI Max+ 395, `bench -d cpu -p 512 -n 32 -r 2`.
+llama.cpp is `74ade5274 (9672)` `llama-bench -dev none` (the same build as 4.4). The box was slower than on 2026-11-09 (llama.cpp
+pp512 at 16 threads 95-104 here against 136-145 then), so only the same-session ratios below are meaningful.
+
+**Where prefill time goes** (`DOTLLM_CPU_PROF=1`, 16 threads, pp512; totals over warmup + 2 reps, so three prefills and three decode
+tokens; the decode share is under 1 % of every bucket; two runs, range shown):
+
+| stage | total ms | share |
+|---|---|---|
+| FFN gate+up GEMM (Q4_K) | 8.7-11.3 s | 41-43 % |
+| FFN down GEMM (Q6_K, K = 12800) | 5.1-7.1 s | 26-27 % |
+| FFN norm + quantize + SwiGLU + down quantize (serial before this change) | about 2.0 s (0.35 + 1.0 + 0.7) | about 9 % |
+| QKV (norm + Q4_K/Q6_K GEMM) | 2.7-3.3 s | 13-15 % |
+| RoPE + attention | 2.2-2.3 s | 10-11 % |
+| o_proj + residual | 1.7-2.0 s | 8-9 % |
+| lm_head (last row only) | 0.08-0.09 s | under 1 % |
+
+GEMMs are about 85 % of prefill. The attention path (blocked causal, #1570) is 10 %. The per-call serial element-wise FFN stages
+cost 2.9 ms (norm + quantize), 4.2 ms (SwiGLU) and 2.8 ms (down quantize) per layer-prefill before this change, against 0.7 / 1.0 / 0.4 ms after.
+
+**Root cause of the poor thread scaling.** The R4 tiled GEMM split rows statically, one contiguous range per thread, so a prefill
+GEMM ran at the speed of its slowest thread. With 16+ threads on a 16-core box that is also running anything else (Docker, sshd,
+dwm: 9-14 % baseline load here) one descheduled worker stalls every GEMM. In-process kernel timing (`Q4KGemmTimingTests`,
+m = 12800, k = 4096, n = 512, Q4_K, best of 6 interleaved, GMAC/s):
+
+| threads | static | dynamic chunks |
+|---|---|---|
+| 1 | 72 | 71 |
+| 8 | 574 | 599 |
+| 12 | 795 | 886 |
+| 16 | 696 | 966 |
+| 24 | 750 | 1133 |
+| 32 | 868 | 1094 |
+
+Single-thread throughput is 70 GMAC/s; static scaling fell off a cliff at 16 threads (36 GMAC/s per thread against 67 at 12).
+
+**End-to-end A/B** (same session, interleaved base / dynamic GEMM / dynamic GEMM + parallel element-wise stages, pp512 tok/s, 3 rounds; the box drifts
+slower round over round, so read within a round):
+
+| threads | base (static, serial) | dynamic GEMM | + parallel element-wise |
+|---|---|---|---|
+| 16 | 58.2 / 52.4 / 51.8 | 73.1 / 62.3 / 60.6 | 69.7 / 63.7 / 61.3 |
+| 24 | 63.5 / 59.3 / 58.2 | 67.1 / 63.4 / 61.7 | 67.0 / 64.3 / 62.9 |
+
+Dynamic claiming is +17-25 % at 16 threads and +4-6 % at 24. The parallel element-wise stages are worth 0-3 % (within noise end to end), which
+matches their 2 s of 21 s profile share. Decode (tg) is identical across the arms (12.2-14.4 tok/s).
+The arms are env switches (`DOTLLM_CPU_GEMM_STATIC=1`, `DOTLLM_CPU_SERIAL_ELTWISE=1`), so the new path demonstrably ran: switching it off gives the base numbers.
+
+**Same-session ratio after the change** (llama.cpp `74ade5274`, `-dev none`; dotLLM new): 16 threads 61-67 vs 95-104 (0.62-0.66x),
+24 threads 62-64 vs 96-106 (0.60-0.66x). That is up from 0.45-0.48x in 4.4, but part of the movement is llama.cpp running slower in this session.
+
+**What is left** (diagnosis, not changed here): the single-thread Q4_K microkernel at 70 GMAC/s sets the ceiling (16 threads x 70 = 1.1 TMAC/s
+against llama.cpp's roughly 1.0-1.1 TMAC/s whole-model on 11-09). `Rows4Tokens4` runs four one-row x four-token calls per group so the activation
+rows are reloaded per row; an 8-row x 4-token register tile like the Q8_0 work in #1119 is the next lever. 32-thread decode: `--threads 32`
+auto-selects 28 spin-decode threads; with `--decode-threads` 16 / 24 / 28 decode was 13.5 / 15.6 / 14.9 tok/s (one round of two reps, pp64 + tg64), so the
+collapse seen in 4.4 did not reproduce in this session; whether the default should be lowered is a policy question left open.
+
 ## 5. Quality parity
 
 Throughput is meaningless if the output differs, so the perplexity comparisons are summarised here; the protocol

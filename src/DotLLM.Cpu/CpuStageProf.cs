@@ -16,6 +16,7 @@ public static class CpuStageProf
     {
         "qkv(norm+proj)", "rope+attention", "o_proj+resid", "moe_norm", "moe_route", "moe_experts(total)", "moe_final_resid",
         "dense_ffn", "lm_head", "exp:gather+quant", "exp:gate+up gemm", "exp:swiglu", "exp:down gemm", "exp:scatter", "moe_shared", "embed",
+        "ffn:norm+quant", "ffn:gate+up gemm", "ffn:swiglu", "ffn:down quant", "ffn:down gemm",
     };
 
     static CpuStageProf() { if (On) AppDomain.CurrentDomain.ProcessExit += (_, _) => Dump(); }
