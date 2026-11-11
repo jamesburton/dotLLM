@@ -234,12 +234,18 @@ public sealed class VulkanNemotronHKvCache : IKvCache
     /// name the old handles (freed handles are recycled into the new buffers; a stale cached set silently reads zeros). Call BEFORE recording.
     /// Growth is 25% (at least <see cref="LazyGrowthQuantum"/>) so the transient cost is one layer's K and V, copied layer by layer.
     /// </summary>
-    internal bool EnsureCapacity(int positions)
+    /// <param name="positions">Positions the forward needs.</param>
+    /// <param name="headroom">
+    /// Extra positions to allocate beyond <paramref name="positions"/> when (and only when) the buffers must grow, clamped to the cache limit. A multi-row prefill
+    /// passes one growth quantum so the first decode token after it does not land exactly on the allocation edge and pay a full
+    /// copy-and-reallocate of the whole prompt's KV plus a descriptor-cache rebuild (issue #1741).
+    /// </param>
+    internal bool EnsureCapacity(int positions, int headroom = 0)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (positions > _maxSeqLen) throw new ArgumentOutOfRangeException(nameof(positions), $"{positions} exceeds the cache limit {_maxSeqLen}.");
         if (positions <= _allocLength) return false;
-        int target = Math.Max(positions, _allocLength + Math.Max(LazyGrowthQuantum, _allocLength / 4));
+        int target = Math.Max((int)Math.Min(_maxSeqLen, (long)positions + headroom), _allocLength + Math.Max(LazyGrowthQuantum, _allocLength / 4));
         target = (int)Math.Min(_maxSeqLen, ((long)target + LazyGrowthQuantum - 1) / LazyGrowthQuantum * LazyGrowthQuantum);
         GrowTo(target);
         return true;
@@ -286,12 +292,13 @@ public sealed class VulkanNemotronHKvCache : IKvCache
     /// <param name="kvCache">The forward's cache; anything but a <see cref="VulkanNemotronHKvCache"/> is only checked for the epoch.</param>
     /// <param name="positionsEnd">One past the largest position the forward writes.</param>
     /// <param name="seenEpoch">The caller's last seen <see cref="BufferEpoch"/>; updated.</param>
+    /// <param name="growthHeadroom">Extra positions to allocate when growth is needed anyway (see <see cref="EnsureCapacity"/>).</param>
     /// <returns><see langword="true"/> when descriptor caches must be dropped.</returns>
-    internal static bool PrepareForForward(IKvCache? kvCache, int positionsEnd, ref long seenEpoch)
+    internal static bool PrepareForForward(IKvCache? kvCache, int positionsEnd, ref long seenEpoch, int growthHeadroom = 0)
     {
         if (kvCache is VulkanNemotronHKvCache vk)
         {
-            try { vk.EnsureCapacity(positionsEnd); }
+            try { vk.EnsureCapacity(positionsEnd, growthHeadroom); }
             catch (VulkanException e) when (e.ErrorCode is VulkanOutOfDeviceMemory or VulkanOutOfHostMemory)
             {
                 throw new Core.Configuration.DeviceMemoryAdmissionException(
