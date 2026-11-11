@@ -2098,16 +2098,17 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
             else
             {
                 // Prefill path: unfused RmsNorm + Quantize + individual projections
-                for (int t = 0; t < seqLen; t++)
+                long _pf = DotLLM.Cpu.CpuStageProf.T();
+                fixed (float* ffnNormW = lw.FfnNormWeight)
                 {
-                    PreNorm(
-                        new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
-                        lw.FfnNormWeight, eps,
-                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
+                    var nc = new ParTokCtx { Kind = ParTokKindNorm, SeqLen = seqLen, Dim = hiddenSize, In = hidden, Out = normOut,
+                        NormWeight = ffnNormW, Eps = eps, PostNormOnly = _postNormOnly };
+                    RunParTok(ref nc);
                 }
 
                 if (DotLLM.Cpu.ActivationRangeProbe.On) DotLLM.Cpu.ActivationRangeProbe.Record(layer, "ffn_in", normOut, (long)seqLen * hiddenSize);
-                byte* preQuantFfn = QuantizeInput(normOut, inputQ8Scratch, hiddenSize, seqLen, lw.GateQuantType);
+                byte* preQuantFfn = QuantizeInputPar(normOut, inputQ8Scratch, hiddenSize, seqLen, lw.GateQuantType);
+                DotLLM.Cpu.CpuStageProf.E(16, _pf); _pf = DotLLM.Cpu.CpuStageProf.T();
 
                 var rwGate = rl?.Gate ?? default;
                 var rwUp = rl?.Up ?? default;
@@ -2115,6 +2116,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                     preQuantFfn, in rwGate);
                 GemmInterleaved(lw.UpWeight, lw.UpQuantType, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen,
                     IsCompatiblePreQuant(lw.GateQuantType, lw.UpQuantType) ? preQuantFfn : null, in rwUp);
+                DotLLM.Cpu.CpuStageProf.E(17, _pf);
                 preQuantFfnHoisted = preQuantFfn;
             }
             AddBias(lw.GateBias, ffnGate, lw.GateOutputDim, seqLen);
@@ -2137,21 +2139,11 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
             // ReLU² for BitNet (ReluSquared), otherwise SwiGLU (SiLU). Single tiled
             // pass per token; all kernels are shape-identical (down(act(gate) * up)).
             bool useReluSquared = Config.ActivationFunction == ActivationFunction.ReluSquared;
-            for (int t = 0; t < seqLen; t++)
+            long _ps2 = DotLLM.Cpu.CpuStageProf.T();
             {
-                float* gateT = ffnGate + t * intermediateSize;
-                float* upT = ffnUp + t * intermediateSize;
-                float* siluT = siluOut + t * intermediateSize;
-
-                var gateSpan = new ReadOnlySpan<float>(gateT, intermediateSize);
-                var upSpan = new ReadOnlySpan<float>(upT, intermediateSize);
-                var outSpan = new Span<float>(siluT, intermediateSize);
-                if (_useGeGLU)
-                    FusedOps.GeGLUTanh(gateSpan, upSpan, outSpan);
-                else if (useReluSquared)
-                    FusedOps.ReLU2GLU(gateSpan, upSpan, outSpan);
-                else
-                    FusedOps.SwiGLU(gateSpan, upSpan, outSpan);
+                var gc = new ParTokCtx { Kind = ParTokKindGlu, SeqLen = seqLen, Dim = intermediateSize, In = ffnGate, In2 = ffnUp,
+                    Out = siluOut, GeGlu = _useGeGLU, ReluSquared = useReluSquared };
+                RunParTok(ref gc);
             }
 
             // Optional FFN sub-norm (BitNet Sub-LN): RMSNorm over the gated intermediate
@@ -2167,12 +2159,15 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
 
             if (DotLLM.Cpu.ActivationRangeProbe.On) DotLLM.Cpu.ActivationRangeProbe.Record(layer, "ffn_down_in", siluOut, (long)seqLen * intermediateSize);
             // Pre-quantize siluOutput for Down projection (different input dim = intermediateSize)
-            byte* preQuantSilu = QuantizeInput(siluOut, inputQ8Scratch, intermediateSize, seqLen, lw.DownQuantType);
+            DotLLM.Cpu.CpuStageProf.E(18, _ps2); _ps2 = DotLLM.Cpu.CpuStageProf.T();
+            byte* preQuantSilu = QuantizeInputPar(siluOut, inputQ8Scratch, intermediateSize, seqLen, lw.DownQuantType);
+            DotLLM.Cpu.CpuStageProf.E(19, _ps2); _ps2 = DotLLM.Cpu.CpuStageProf.T();
 
             // Batched Down projection (output into normOut as scratch)
             var rwDown = rl?.Down ?? default;
             GemmInterleaved(lw.DownWeight, lw.DownQuantType, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen,
                 preQuantSilu, in rwDown);
+            DotLLM.Cpu.CpuStageProf.E(20, _ps2);
             AddBias(lw.DownBias, normOut, lw.DownOutputDim, seqLen);
 
             // LoRA delta (down_proj): y += scale * (siluOut · B) · A.
@@ -3063,6 +3058,78 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
             ArrayPool<float>.Shared.Return(activatedBuf);
             ArrayPool<float>.Shared.Return(firstPredBuf);
         }
+    }
+
+    // ──────────────────── Parallel per-token element-wise stages (#1675) ────────────────────
+    // Prefill ran the FFN input RMSNorm, the activation quantizers and the gate*up activation as serial per-token loops on the
+    // caller thread while every other worker idled (about 12 % of TwIL-8B's FFN time at 16 threads). Each token row is
+    // independent and processed by exactly the same kernel call as before, so results are bit-identical; only the rows are
+    // spread across the pool.
+
+    /// <summary>Test/diagnostic switch (also <c>DOTLLM_CPU_SERIAL_ELTWISE=1</c>): run the per-token FFN stages serially.</summary>
+    internal static volatile bool ForceSerialElementwise =
+        Environment.GetEnvironmentVariable("DOTLLM_CPU_SERIAL_ELTWISE") == "1";
+
+    private const int ParTokKindNorm = 0, ParTokKindQuant = 1, ParTokKindGlu = 2;
+
+    private struct ParTokCtx
+    {
+        public int Kind, SeqLen, Dim;
+        public float* In, In2, Out;
+        public float* NormWeight;
+        public float Eps;
+        public byte* Q;
+        public int QFamily;
+        public bool PostNormOnly, GeGlu, ReluSquared;
+    }
+
+    private static void ParTokWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var c = ref Unsafe.AsRef<ParTokCtx>((void*)ctxPtr);
+        ComputeThreadPool.PartitionRange(c.SeqLen, threadIdx, threadCount, out int start, out int end);
+        ParTokRange(ref c, start, end);
+    }
+
+    private static void ParTokRange(ref ParTokCtx c, int start, int end)
+    {
+        int dim = c.Dim;
+        switch (c.Kind)
+        {
+            case ParTokKindNorm:
+                for (int t = start; t < end; t++)
+                {
+                    var x = new ReadOnlySpan<float>(c.In + (long)t * dim, dim);
+                    var y = new Span<float>(c.Out + (long)t * dim, dim);
+                    if (c.PostNormOnly) x.CopyTo(y);
+                    else RmsNorm.Execute(x, new ReadOnlySpan<float>(c.NormWeight, dim), c.Eps, y);
+                }
+                break;
+            case ParTokKindQuant:
+                QuantizeInputRange(c.In, c.Q, dim, start, end, c.QFamily);
+                break;
+            default:
+                for (int t = start; t < end; t++)
+                {
+                    var g = new ReadOnlySpan<float>(c.In + (long)t * dim, dim);
+                    var u = new ReadOnlySpan<float>(c.In2 + (long)t * dim, dim);
+                    var o = new Span<float>(c.Out + (long)t * dim, dim);
+                    if (c.GeGlu) FusedOps.GeGLUTanh(g, u, o);
+                    else if (c.ReluSquared) FusedOps.ReLU2GLU(g, u, o);
+                    else FusedOps.SwiGLU(g, u, o);
+                }
+                break;
+        }
+    }
+
+    private void RunParTok(ref ParTokCtx c)
+    {
+        if (_threadPool is null || c.SeqLen < 8 || ForceSerialElementwise)
+        {
+            ParTokRange(ref c, 0, c.SeqLen);
+            return;
+        }
+        fixed (ParTokCtx* p = &c)
+            _threadPool.Dispatch((nint)p, &ParTokWorker);
     }
 
     private struct GeGluCtx
@@ -4607,35 +4674,55 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     private static byte* QuantizeInput(float* input, byte* scratch, int dim, int seqLen,
                                        QuantizationType qt)
     {
-        if (MatMul.UsesQ8KDot(qt))
+        int family = QuantFamily(qt, seqLen);
+        if (family == 0) return null;
+        QuantizeInputRange(input, scratch, dim, 0, seqLen, family);
+        return scratch;
+    }
+
+    /// <summary><see cref="QuantizeInput"/> with the token rows spread across the pool (bit-identical, per-row independent).</summary>
+    private byte* QuantizeInputPar(float* input, byte* scratch, int dim, int seqLen, QuantizationType qt)
+    {
+        int family = QuantFamily(qt, seqLen);
+        if (family == 0) return null;
+        var c = new ParTokCtx { Kind = ParTokKindQuant, SeqLen = seqLen, Dim = dim, In = input, Q = scratch, QFamily = family };
+        RunParTok(ref c);
+        return scratch;
+    }
+
+    /// <summary>Activation-quantizer family for a weight type: 0 none, 1 Q8_K, 2 Q8_1, 3 Q8_0 (same priority order as always).</summary>
+    private static int QuantFamily(QuantizationType qt, int seqLen)
+    {
+        if (MatMul.UsesQ8KDot(qt)) return 1;
+        // Q5_0 and the packed legacy quants (Q4_0/Q4_1/Q5_1/IQ4_NL, #489) all dot against Q8_1.
+        if (qt == QuantizationType.Q5_0 || MatMul.UsesPackedLegacyDot(qt, seqLen)) return 2;
+        if (qt == QuantizationType.Q8_0) return 3;
+        return 0;
+    }
+
+    private static void QuantizeInputRange(float* input, byte* scratch, int dim, int t0, int t1, int family)
+    {
+        if (family == 1)
         {
             int blockCount = dim / 256; // Q8_K_GroupSize
             int q8kRowBytes = blockCount * MatMul.Q8_K_BlockBytes;
-            for (int t = 0; t < seqLen; t++)
-                MatMul.QuantizeF32ToQ8_K(input + t * dim, scratch + t * q8kRowBytes, dim);
-            return scratch;
+            for (int t = t0; t < t1; t++)
+                MatMul.QuantizeF32ToQ8_K(input + (long)t * dim, scratch + (long)t * q8kRowBytes, dim);
         }
-
-        // Q5_0 and the packed legacy quants (Q4_0/Q4_1/Q5_1/IQ4_NL, #489) all dot against Q8_1.
-        if (qt == QuantizationType.Q5_0 || MatMul.UsesPackedLegacyDot(qt, seqLen))
+        else if (family == 2)
         {
             int blockCount = dim / Q8_1GroupSize;
             int q8_1RowBytes = blockCount * MatMul.Q8_1BlockBytes;
-            for (int t = 0; t < seqLen; t++)
-                MatMul.QuantizeF32ToQ8_1(input + t * dim, scratch + t * q8_1RowBytes, dim);
-            return scratch;
+            for (int t = t0; t < t1; t++)
+                MatMul.QuantizeF32ToQ8_1(input + (long)t * dim, scratch + (long)t * q8_1RowBytes, dim);
         }
-
-        if (qt == QuantizationType.Q8_0)
+        else
         {
             int blockCount = dim / Q8_0GroupSize;
             int q8RowBytes = blockCount * Q8_0BlockBytes;
-            for (int t = 0; t < seqLen; t++)
-                MatMul.QuantizeF32ToQ8_0(input + t * dim, scratch + t * q8RowBytes, dim);
-            return scratch;
+            for (int t = t0; t < t1; t++)
+                MatMul.QuantizeF32ToQ8_0(input + (long)t * dim, scratch + (long)t * q8RowBytes, dim);
         }
-
-        return null;
     }
 
     /// <summary>

@@ -220,7 +220,7 @@ public static unsafe partial class MatMul
             GemmR4TiledRange(ctx.RepackedWeights, ctx.InputQ, ctx.C, 0, 0, ctx.FullGroups, ctx.TailRows, ctx.BlockCount,
                 ctx.M, ctx.N, ctx.BlockBytes, ctx.InputRowBytes, ctx.TileGroups, doTail: true, ctx.ComputeRowsInterleaved, ctx.GroupTok4);
 
-        int chunk = Math.Clamp(ctx.FullGroups / (threadCount * 8), 4, ctx.TileGroups);
+        int chunk = Math.Clamp(ctx.FullGroups / (threadCount * 8), Math.Min(4, ctx.TileGroups), ctx.TileGroups);
         while (true)
         {
             int start = Interlocked.Add(ref ctx.NextGroup, chunk) - chunk;

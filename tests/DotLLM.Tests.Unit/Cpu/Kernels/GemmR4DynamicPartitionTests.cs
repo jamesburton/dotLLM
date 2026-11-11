@@ -15,13 +15,14 @@ public sealed unsafe class GemmR4DynamicPartitionTests
     private const int Q8KBytes = 292, BlockBytes = 144;
 
     [SkippableTheory]
-    [InlineData(4 * 301, 3)]   // many chunks, 3 tail rows
-    [InlineData(4 * 301, 0)]
-    [InlineData(4 * 5, 1)]     // fewer groups than one chunk per thread
-    public void DynamicPartition_BitIdenticalToSingleThreadAndStatic(int fullRows, int tail)
+    [InlineData(4 * 301, 3, 2)]   // many chunks, 3 tail rows
+    [InlineData(4 * 301, 0, 2)]
+    [InlineData(4 * 8, 1, 2)]     // above ParallelMinRows, 2 chunks for up to 16 threads
+    [InlineData(4 * 200, 2, 120)] // K = 30720: TileGroups < 4 (regression: Math.Clamp min > max)
+    public void DynamicPartition_BitIdenticalToSingleThreadAndStatic(int fullRows, int tail, int sb)
     {
         Skip.IfNot(MatMul.FastKQuantIsa, "needs AVX2 + SSE4.1");
-        int m = fullRows + tail, sb = 2, k = sb * 256, n = 9;
+        int m = fullRows + tail, k = sb * 256, n = 9;
         var rng = new Random(1675);
         byte* w = (byte*)NativeMemory.AlignedAlloc((nuint)((long)m * sb * BlockBytes), 64);
         byte* x = (byte*)NativeMemory.AlignedAlloc((nuint)((long)n * sb * Q8KBytes), 64);
