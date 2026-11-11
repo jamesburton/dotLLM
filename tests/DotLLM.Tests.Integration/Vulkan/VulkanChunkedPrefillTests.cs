@@ -98,6 +98,28 @@ public class VulkanChunkedPrefillTests
         Assert.Equal(single, chunked);
     }
 
+    /// <summary>Same-session interleaved A/B of total prefill time: single pass vs chunk 512 vs 1024 (one model, explicit chunk sizes). Reports ranges; asserts nothing about speed.</summary>
+    [SkippableFact]
+    public void PrefillTime_ChunkVsSinglePass_Report()
+    {
+        using var l = Load("0");
+        var arms = new (string name, int chunk)[] { ("single", 0), ("512", 512), ("1024", 1024) };
+        var ms = arms.ToDictionary(a => a.name, _ => new List<double>());
+        foreach (var a in arms)   // warm-up, discarded
+            new TextGenerator(l.Vk, l.Tok, prefillChunkSize: a.chunk, kvCacheFactory: (_, n) => l.Vk.CreateKvCache(n))
+                .Generate(l.PromptText, new InferenceOptions { Temperature = 0f, MaxTokens = 1 });
+        for (int round = 0; round < 4; round++)
+            foreach (var a in arms)
+            {
+                var gen = new TextGenerator(l.Vk, l.Tok, prefillChunkSize: a.chunk, kvCacheFactory: (_, n) => l.Vk.CreateKvCache(n));
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                gen.Generate(l.PromptText, new InferenceOptions { Temperature = 0f, MaxTokens = 1 });
+                ms[a.name].Add(System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
+            }
+        foreach (var a in arms)
+            _out.WriteLine($"[1723] {PromptTokens} tok prefill, {a.name,6}: min {ms[a.name].Min():F0} max {ms[a.name].Max():F0} ms ({PromptTokens * 1000.0 / ms[a.name].Max():F0}-{PromptTokens * 1000.0 / ms[a.name].Min():F0} tok/s) [path: TextGenerator.ForwardPrefill -> VulkanTransformerModel.Forward, chunk={a.chunk}]");
+    }
+
     /// <summary>Cancelling after the first chunk stops the prefill there: the model sees ONE forward, not the whole prompt.</summary>
     [SkippableFact]
     public void CancellationBetweenChunks_StopsThePrefillAfterTheFirstChunk()
