@@ -911,11 +911,20 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         if (rows <= 0 || rows > src._currentLength || rows > _maxSeqLen) return false;
         for (int i = 0; i < _numLayers; i++)
             if (src._kvStride[i] != _kvStride[i]) return false;
-        for (int i = 0; i < _numLayers; i++)
+        // No allocation: the rows land in this cache's own buffers (the miss's allocation, admitted when it was made). A failed submit
+        // leaves CurrentLength as it was, so no partly copied row is ever claimed.
+        try
         {
-            ulong bytes = (ulong)((long)rows * _storage.RowBytes(_kvStride[i]));   // RowBytes, not _elemBytes: Q8_0 rows have no element size
-            _device.CopyBufferRangeSynchronous(src._keys[i], _keys[i], 0, 0, bytes);
-            _device.CopyBufferRangeSynchronous(src._values[i], _values[i], 0, 0, bytes);
+            for (int i = 0; i < _numLayers; i++)
+            {
+                ulong bytes = (ulong)((long)rows * _storage.RowBytes(_kvStride[i]));   // RowBytes, not _elemBytes: Q8_0 rows have no element size
+                _device.CopyBufferRangeSynchronous(src._keys[i], _keys[i], 0, 0, bytes);
+                _device.CopyBufferRangeSynchronous(src._values[i], _values[i], 0, 0, bytes);
+            }
+        }
+        catch (VulkanException e) when (e.ErrorCode is VulkanNemotronHKvCache.VulkanOutOfDeviceMemory or VulkanNemotronHKvCache.VulkanOutOfHostMemory)
+        {
+            return false;
         }
         _currentLength = rows;
         return true;
