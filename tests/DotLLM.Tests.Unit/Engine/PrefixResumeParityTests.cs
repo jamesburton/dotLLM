@@ -14,7 +14,12 @@ using Xunit.Abstractions;
 
 namespace DotLLM.Tests.Unit.Engine;
 
-/// <summary>Issue #1702 probe.</summary>
+/// <summary>
+/// Issue #1702 on a real model (Qwen2.5-0.5B q8_0, CPU): a live <see cref="PrefixCache"/> resume of a prompt that continues a
+/// length-stopped reply must equal a cold run. Before the fix the resume reused the row of the reply's last sampled token,
+/// which was never forwarded and held another request's K/V (first-token logprob -1.137 resumed vs -1.551 cold). Also prints
+/// a cache-free split sweep (one prefill split into two forwards at row k): flat, so row-count numerics play no part here.
+/// </summary>
 public sealed class PrefixResumeParityTests
 {
     private readonly ITestOutputHelper _out;
@@ -57,7 +62,7 @@ public sealed class PrefixResumeParityTests
 
     [SkippableFact]
     [Trait("Category", "Model")]
-    public void Probe()
+    public void Qwen25_LiveResumeAfterLengthStoppedReply_MatchesColdRun()
     {
         string? path = TestFixtureResolver.ResolveFile("DOTLLM_QWEN25_05B_GGUF", "Qwen", "Qwen2.5-0.5B-Instruct-GGUF", "*q8_0.gguf").Path;
         Skip.If(path is null, "Qwen2.5-0.5B-Instruct q8_0 GGUF not found.");
@@ -109,5 +114,11 @@ public sealed class PrefixResumeParityTests
             using var lg = Fwd(model, b, resume, b.Length, kv);
             _out.WriteLine($"replay resume={resume}: lp {LastRow(lg, vocab).MaxLogprob:F5}");
         }
+
+        Assert.Equal(FinishReason.Length, s1aRes.FinishReason);       // the reply's last token was never forwarded
+        Assert.True(common > written, $"s1b matches only {common} rows of the stored sequence: the unwritten row is not exercised");
+        Assert.Equal(written, rb.Timings.CachedTokenCount);
+        Assert.Equal(cold.Text, rb.Text);
+        Assert.Equal(cold.Logprobs![0].Logprob, rb.Logprobs![0].Logprob, 1e-4f);
     }
 }
