@@ -232,6 +232,29 @@ public sealed class RoslynBudgetTests
         }
     }
 
+    // Control for the test above: with the same detection harness, a faulted task that nobody observes MUST be reported.
+    // Without this the test above can pass vacuously (finalizers never ran, or the event never fires on this runtime).
+    [Fact]
+    public void UnobservedFaultedTask_IsReportedByTheHarness_SoTheObserveTestIsNotVacuous()
+    {
+        var unobserved = new List<AggregateException>();
+        void OnUnobserved(object? s, UnobservedTaskExceptionEventArgs e) { lock (unobserved) unobserved.Add(e.Exception); }
+        TaskScheduler.UnobservedTaskException += OnUnobserved;
+        try
+        {
+            DropUnobserved(new GitException("control over the cap"));
+            for (int i = 0; i < 5; i++) { GC.Collect(); GC.WaitForPendingFinalizers(); }
+            lock (unobserved) Assert.Contains(unobserved, e => e.InnerExceptions.Any(x => x.Message == "control over the cap"));
+        }
+        finally
+        {
+            TaskScheduler.UnobservedTaskException -= OnUnobserved;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void DropUnobserved(Exception error) { _ = Task.FromException<string>(error); }
+
     // Not inlined: the tasks must be unreachable once Observe returns, so the GC can finalise an unobserved one.
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static Exception? Observe(Exception stdoutError, Exception stderrError) =>
