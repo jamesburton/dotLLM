@@ -3,6 +3,10 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <IsPackable>false</IsPackable>
+    <!-- The sample serves no static web assets. SDK 11.0.100 (picked up through global.json's
+         rollForward: latestMajor) fails the Debug build otherwise: "scoped css bundles do not have
+         matching endpoints: _framework/Microsoft.NET.Sdk.BlazorWeb.HotReload..." (#1772). -->
+    <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
   </PropertyGroup>
 
   <ItemGroup>
