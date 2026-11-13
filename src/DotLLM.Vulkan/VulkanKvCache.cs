@@ -33,7 +33,7 @@ namespace DotLLM.Vulkan;
 /// object satisfy the same API.
 /// </para>
 /// </remarks>
-public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IPositionedHostKvCache, IWindowedKvCache, IPrefixReusableKvCache
+public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IPositionedHostKvCache, IWindowedKvCache, IPrefixReusableKvCache, IKvPrefixSeedable
 {
     private readonly VulkanDevice _device;
     private readonly VulkanDevice.Buffer[] _keys;
@@ -894,6 +894,40 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         _device.CopyBufferRangeSynchronous(source._values[layerIndex], _values[layerIndex], (ulong)(srcStart * rowBytes), (ulong)(dstStart * rowBytes), bytes);
         if (dstStart + count > _currentLength)
             _currentLength = dstStart + count;
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Issue #1780. Needs another full-history <see cref="VulkanKvCache"/> on the same device with the same element format and per-layer row
+    /// widths. Rows are copied device to device in that format (F16 stays F16, Q8_0 blocks stay blocks): the cost is
+    /// <c>rows x (K + V row bytes)</c> summed over layers, with no extra allocation. Must not run while a forward is recording.
+    /// </remarks>
+    public bool TrySeedPrefixFrom(IKvCache source, int rows)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (source is not VulkanKvCache src || ReferenceEquals(src, this) || src._disposed) return false;
+        if (!ReferenceEquals(src._device, _device) || src._storage != _storage || src._numLayers != _numLayers) return false;
+        if (_rows is not null || src._rows is not null) return false;
+        if (rows <= 0 || rows > src._currentLength || rows > _maxSeqLen) return false;
+        for (int i = 0; i < _numLayers; i++)
+            if (src._kvStride[i] != _kvStride[i]) return false;
+        // No allocation: the rows land in this cache's own buffers (the miss's allocation, admitted when it was made). A failed submit
+        // leaves CurrentLength as it was, so no partly copied row is ever claimed.
+        try
+        {
+            for (int i = 0; i < _numLayers; i++)
+            {
+                ulong bytes = (ulong)((long)rows * _storage.RowBytes(_kvStride[i]));   // RowBytes, not _elemBytes: Q8_0 rows have no element size
+                _device.CopyBufferRangeSynchronous(src._keys[i], _keys[i], 0, 0, bytes);
+                _device.CopyBufferRangeSynchronous(src._values[i], _values[i], 0, 0, bytes);
+            }
+        }
+        catch (VulkanException e) when (e.ErrorCode is VulkanNemotronHKvCache.VulkanOutOfDeviceMemory or VulkanNemotronHKvCache.VulkanOutOfHostMemory)
+        {
+            return false;
+        }
+        _currentLength = rows;
+        return true;
     }
 
     private long CheckRowRange(int layerIndex, int startPosition, int count, string operation)

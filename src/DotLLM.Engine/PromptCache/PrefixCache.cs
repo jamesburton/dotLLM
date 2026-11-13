@@ -79,12 +79,32 @@ public sealed class PrefixCache : IDisposable
     /// </remarks>
     internal (PrefixCacheEntry? Entry, int MatchedTokens) FindMatch(
         ReadOnlySpan<int> promptTokenIds, bool allowApprox, out int approxRowsReused)
+        => FindMatch(promptTokenIds, allowApprox, out approxRowsReused, out _, out _);
+
+    /// <summary>
+    /// As <see cref="FindMatch(ReadOnlySpan{int}, bool, out int)"/>, also reporting the protected entry that shares the most exact
+    /// leading rows with the prompt, when the lookup is a miss because of protection (issue #1780). The caller may copy those rows
+    /// into a fresh cache (<see cref="Core.Attention.IKvPrefixSeedable"/>) instead of running cold; the protected entry is left as it
+    /// is (no clock refresh, no truncation).
+    /// </summary>
+    /// <param name="promptTokenIds">The request's prompt.</param>
+    /// <param name="protectedEntry">On a protected miss, the protected entry with the longest exact share; otherwise null.</param>
+    /// <param name="protectedShared">Exact leading tokens it shares with the prompt; 0 when <paramref name="protectedEntry"/> is null.</param>
+    internal (PrefixCacheEntry? Entry, int MatchedTokens) FindMatch(
+        ReadOnlySpan<int> promptTokenIds, out PrefixCacheEntry? protectedEntry, out int protectedShared)
+        => FindMatch(promptTokenIds, allowApprox: false, out _, out protectedEntry, out protectedShared);
+
+    private (PrefixCacheEntry? Entry, int MatchedTokens) FindMatch(
+        ReadOnlySpan<int> promptTokenIds, bool allowApprox, out int approxRowsReused,
+        out PrefixCacheEntry? protectedEntry, out int protectedShared)
     {
         _clock += promptTokenIds.Length;
         PrefixCacheEntry? bestEntry = null;
         int bestMatch = 0;
         bool protectedSome = false;
         approxRowsReused = 0;
+        protectedEntry = null;
+        protectedShared = 0;
 
         for (int i = 0; i < _entries.Count; i++)
         {
@@ -97,6 +117,12 @@ public sealed class PrefixCache : IDisposable
                 if (PrefixRetention.Protects(_policy, _clock, entry.LastUseClock, entry.TokenSequence.Length, match, entry.SavePoint))
                 {
                     protectedSome = true;
+                    int exact = allowApprox ? entry.GetPrefixMatchLength(promptTokenIds) : match;
+                    if (exact > protectedShared)
+                    {
+                        protectedShared = exact;
+                        protectedEntry = entry;
+                    }
                     continue;
                 }
                 bestMatch = match;
@@ -110,6 +136,8 @@ public sealed class PrefixCache : IDisposable
             bestEntry.LastUseClock = _clock;
             approxRowsReused = bestEntry.ApproxRowsIn(bestMatch);
             _hits++;
+            protectedEntry = null;
+            protectedShared = 0;
         }
         else
         {

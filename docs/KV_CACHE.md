@@ -1122,6 +1122,20 @@ One rule, applied by every cache through `PrefixRetention` (`src/DotLLM.Engine/P
   `dotllm.engine.prefix_cache.lookups{result="protected"}`). Once the entry has expired the request takes over as before, so
   equal-sized peers (a classifier's questions) still churn exactly as under LRU. Applied to `PrefixCache` and the single
   recurrent slot; the tiered and trie caches never destroy an entry on a hit, so they only need the eviction rule.
+- **A protected miss seeds from the entry (issue #1780).** On the live-KV `PrefixCache` (Vulkan, CPU `--no-paged`), a protected
+  miss copies the protected entry's shared rows into its fresh cache and prefills only the rest. The rows are clamped to the rows
+  the entry holds and to `promptLen - 1`, and must number at least `ProtectedSeedMinTokens` (256).
+  - It uses `IKvPrefixSeedable.TrySeedPrefixFrom`, implemented by `SimpleKvCache` (memcpy) and `VulkanKvCache` (device to device).
+    Both copy in the same element format, with no widening, and refuse other geometry or compact windows.
+  - The entry is untouched: no truncation, no clock refresh. The copy lands in the allocation the miss makes anyway, so it adds no
+    memory.
+  - This keeps agent's protection and recovers lru's reuse for a same-conversation request that diverged before the save point (a
+    client inserting a message mid-history: lru 9,277 cached of 11,734, agent 0 before #1780).
+  - `SeedFromProtectedEntry` in `TextGenerator` is the single seam where a miss starts from rows it did not compute; a future prompt
+    KV seeder (#1590) can plug in there.
+  - The recurrent slot and tiered snapshots cannot do this. A snapshot holds state only at its boundary, and the state after the
+    shared prefix was never captured, so that request stays a miss there.
+  - Tests: `AgentProtectedSeedTests` (CPU, greedy identity) and `VulkanKvCacheSeedTests` (GPU).
 - **Save point = conversation identity.** The server passes `InferenceOptions.SavePointPrefix`: the prompt up to the start of
   the last *non-assistant* message's content, a user message or the tool result an agent loop ends with (derived from a marked
   re-render, because on Qwen3 templates a head render is not a prefix of the full one). With a system prompt and one user
