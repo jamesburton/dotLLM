@@ -11,7 +11,7 @@ namespace DotLLM.Engine.KvCache;
 /// A geometry with sliding windows (<see cref="KvGeometry.HasSlidingWindows"/>) keeps only the recent rows of those
 /// layers (<see cref="IWindowedKvCache"/>, issue #1169).
 /// </summary>
-public sealed unsafe class SimpleKvCache : IKvCache, IPerLayerKvCache, IWindowedKvCache
+public sealed unsafe class SimpleKvCache : IKvCache, IPerLayerKvCache, IWindowedKvCache, IKvPrefixSeedable
 {
     /// <inheritdoc/>
     public bool SupportsExactF32PrefixCopy => _rows is null;
@@ -300,6 +300,26 @@ public sealed unsafe class SimpleKvCache : IKvCache, IPerLayerKvCache, IWindowed
             throw new NotSupportedException(
                 $"Layer {layerIndex} keeps only its sliding-window rows; it has no position-0-based span. Build the cache with "
                 + "KvGeometry.FromConfig(config) (no compact windows) for full-history consumers.");
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>Needs another full-history <see cref="SimpleKvCache"/> with the same per-layer row widths (issue #1780).</remarks>
+    public bool TrySeedPrefixFrom(IKvCache source, int rows)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (source is not SimpleKvCache src || ReferenceEquals(src, this) || src._disposed) return false;
+        if (rows <= 0 || rows > src._currentLength || rows > _maxSeqLen) return false;
+        if (_rows is not null || src._rows is not null || src._numLayers != _numLayers) return false;
+        for (int i = 0; i < _numLayers; i++)
+            if (src._geom.KvStrideOf(i) != _geom.KvStrideOf(i)) return false;
+        for (int i = 0; i < _numLayers; i++)
+        {
+            long bytes = (long)rows * _geom.KvStrideOf(i) * sizeof(float);
+            Buffer.MemoryCopy((void*)src._keys[i], (void*)_keys[i], bytes, bytes);
+            Buffer.MemoryCopy((void*)src._values[i], (void*)_values[i], bytes, bytes);
+        }
+        _currentLength = rows;
+        return true;
     }
 
     /// <inheritdoc/>

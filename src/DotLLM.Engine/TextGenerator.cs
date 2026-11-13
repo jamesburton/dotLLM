@@ -1654,7 +1654,7 @@ public sealed partial class TextGenerator
 
         if (_prefixCache != null && !recurrent)
         {
-            var (entry, matchedTokens) = _prefixCache.FindMatch(promptIds);
+            var (entry, matchedTokens) = _prefixCache.FindMatch(promptIds, out var protectedEntry, out int protectedShared);
 
             if (entry != null && matchedTokens > 0)
             {
@@ -1718,7 +1718,8 @@ public sealed partial class TextGenerator
             // (a cache is only reused while it can hold the whole next request).
             int cacheSize = Math.Min(promptLen + maxTokens + _prefixCacheHeadroomTokens, _model.Config.MaxSequenceLength);
             var kvCache = AllocateKvCache(cacheSize);
-            return (kvCache, 0, true); // owned by the request until StoreInPrefixCache hands it to the prefix cache (issue #1589: disposed if the request fails first)
+            int seeded = SeedFromProtectedEntry(kvCache, protectedEntry, protectedShared, promptLen);
+            return (kvCache, seeded, true); // owned by the request until StoreInPrefixCache hands it to the prefix cache (issue #1589: disposed if the request fails first)
         }
 
         // No prefix cache — allocate normally, caller owns
@@ -2046,6 +2047,38 @@ public sealed partial class TextGenerator
             $"[prefix-cache] could not grow the cached KV ({kv.GetType().Name}) from {kv.MaxLength} to {needed} positions; " +
             $"re-prefilling its {matchedTokens} matching tokens (issue #1781).");
         return false;
+    }
+
+    /// <summary>
+    /// Least shared rows worth seeding a fresh cache from a protected entry (issue #1780). Below it the miss just prefills: a few
+    /// hundred tokens prefill in well under a second, while the seed costs a copy per layer. Internal so tests can lower it.
+    /// </summary>
+    internal int ProtectedSeedMinTokens { get; set; } = DefaultProtectedSeedMinTokens;
+
+    /// <summary>Default <see cref="ProtectedSeedMinTokens"/>.</summary>
+    internal const int DefaultProtectedSeedMinTokens = 256;
+
+    /// <summary>
+    /// Rows of a fresh miss cache taken from another cache's shared prefix before the prefill: the one seam where a live-KV miss starts
+    /// from rows it did not compute (issue #1780). Today the source is the agent policy's protected entry: a same-conversation request
+    /// that diverged before the entry's save point (an inserted or edited earlier message) shares a long prefix with it, but a hit would
+    /// truncate the entry its conversation still needs. Copying the shared rows (<see cref="Core.Attention.IKvPrefixSeedable"/>, same
+    /// element format, no widening) keeps the entry intact AND reuses the prefix. Returns the rows seeded, 0 when nothing was (no
+    /// protected entry, too short a share, an incompatible cache): the request then prefills everything, as before.
+    /// </summary>
+    private int SeedFromProtectedEntry(Core.Attention.IKvCache kvCache, PrefixCacheEntry? protectedEntry, int shared, int promptLen)
+    {
+        if (protectedEntry is null || kvCache is not Core.Attention.IKvPrefixSeedable seedable) return 0;
+        var source = protectedEntry.KvCache;
+        if (!source.HasExclusiveStorage) return 0;
+        // Only rows the entry holds (#1702), and one prompt token stays for the prefill that yields the first logits.
+        int rows = Math.Min(shared, Math.Min(source.CurrentLength, promptLen - 1));
+        if (rows < ProtectedSeedMinTokens || rows <= 0) return 0;
+        // The miss allocation already holds the whole prompt; any capacity need still goes through the one growth path (#1781).
+        if (!EnsureLivePrefixKvCapacity(kvCache, rows, rows)) return 0;
+        if (!seedable.TrySeedPrefixFrom(source, rows)) return 0;
+        LastPrefixCacheTier = "seed";
+        return rows;
     }
 
     /// <summary>
