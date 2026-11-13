@@ -59,7 +59,9 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
                      QuantizationType.Q5_0, QuantizationType.Q8_0,
                  })
         {
-            for (int n = 1; n <= 5; n++)
+            // 1..5 cover the per-token and 4-token kernels; 8, 12, 13 reach the 8-token tile (#1675) alone, then
+            // followed by the 4-token kernel, then by both plus a per-token tail.
+            foreach (int n in new[] { 1, 2, 3, 4, 5, 8, 12, 13 })
                 data.Add(qt, n);
         }
 
