@@ -1658,6 +1658,15 @@ public sealed partial class TextGenerator
 
             if (entry != null && matchedTokens > 0)
             {
+                // Only rows the cache actually holds can be reused (issue #1702). The stored sequence ends with the last sampled
+                // token, which a request that stopped on its length limit never forwarded, so a prompt that continues that reply
+                // matches one row nobody wrote for it — a stale row of whatever request used this cache before (measured on
+                // Qwen2.5-0.5B: first-token logprob -1.137 resumed vs -1.551 cold). SetCurrentLength does not check this: it can
+                // also extend a cache. A full-prompt hit after the clamp is still served by the re-forward of the last token.
+                matchedTokens = Math.Min(matchedTokens, entry.KvCache.CurrentLength);
+                if (matchedTokens <= 0)
+                    goto cacheMiss;
+
                 // Cache hit — reuse existing KV-cache, truncate to matched prefix
                 switch (entry.KvCache)
                 {

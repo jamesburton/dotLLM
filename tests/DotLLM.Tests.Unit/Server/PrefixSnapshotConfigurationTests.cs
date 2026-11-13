@@ -26,17 +26,49 @@ public sealed class PrefixSnapshotConfigurationTests
     }
 
     [Fact]
-    public void PromptCachePolicy_DefaultsToLru_AndReachesEveryEngineOption()
+    public void PromptCachePolicy_DefaultsToAgent_LruStaysSelectable_AndBothReachEveryEngineOption()
     {
-        var lru = ServerOptions.Parse(["--model", "m.gguf"]);
+        // #1778: the default is agent. The parse path reads DOTLLM_PREFIX_POLICY, so only assert the default when it is unset.
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(ServerOptions.PromptCachePolicyEnvVar)))
+        {
+            var byDefault = ServerOptions.Parse(["--model", "m.gguf"]);
+            Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent, byDefault.PromptCachePolicy);
+            Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent, byDefault.GetPrefixSnapshotOptions().Policy);
+        }
+
+        var lru = ServerOptions.Parse(["--model", "m.gguf", "--prompt-cache-policy", "lru"]);
         Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Lru, lru.PromptCachePolicy);
         Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Lru, lru.GetPrefixSnapshotOptions().Policy);
+        Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Lru,
+            ServerOptions.BuildPrefixSnapshotOptions(null, null, policy: DotLLM.Engine.PromptCache.PrefixCachePolicy.Lru).Policy);
 
         var agent = ServerOptions.Parse(["--model", "m.gguf", "--prompt-cache-policy", "Agent"]);
         Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent, agent.PromptCachePolicy);
         Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent, agent.GetPrefixSnapshotOptions().Policy);
         Assert.Equal(DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent,
             ServerOptions.BuildPrefixSnapshotOptions(null, null, policy: DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent).Policy);
+    }
+
+    /// <summary>
+    /// #1778 pins the default in both of its sources: the <see cref="ServerOptions.PromptCachePolicy"/> initializer (direct
+    /// construction, the tray / test / model-swap paths) and the CLI-and-environment fallback (<c>dotllm serve</c>,
+    /// <c>dotllm chat</c>, <c>dotllm-server</c>). Uses the pure resolver so an ambient DOTLLM_PREFIX_POLICY cannot mask it.
+    /// </summary>
+    [Fact]
+    public void PromptCachePolicy_DefaultIsAgent_InBothSources_AndLruIsSelectableByFlagOrEnvironment()
+    {
+        var agent = DotLLM.Engine.PromptCache.PrefixCachePolicy.Agent;
+        var lru = DotLLM.Engine.PromptCache.PrefixCachePolicy.Lru;
+        Assert.Equal(agent, new ServerOptions { Model = "m.gguf" }.PromptCachePolicy);
+        Assert.Equal(agent, new ServerOptions { Model = "m.gguf" }.GetPrefixSnapshotOptions().Policy);
+        Assert.Equal(agent, ServerOptions.BuildPrefixSnapshotOptions(null, null).Policy);
+        Assert.Equal(agent, ServerOptions.ResolvePromptCachePolicy(null, null));
+        Assert.Equal(agent, ServerOptions.ResolvePromptCachePolicy("", "  "));
+
+        Assert.Equal(lru, ServerOptions.ResolvePromptCachePolicy("lru", null));       // the flag
+        Assert.Equal(lru, ServerOptions.ResolvePromptCachePolicy(null, "LRU"));       // the environment
+        Assert.Equal(agent, ServerOptions.ResolvePromptCachePolicy("agent", "lru"));  // the flag beats the environment
+        Assert.Equal(lru, ServerOptions.ResolvePromptCachePolicy("lru", "agent"));
     }
 
     [Theory]

@@ -760,7 +760,7 @@ public static class ServerStartup
             : new PrefixCache(Math.Min(options.PromptCacheSize, VulkanPrefixCacheMaxEntries), options.PromptCachePolicy);
         int prefixCacheHeadroom = vulkanKvFactory is not null && prefixCache is not null ? VulkanPrefixCacheHeadroomTokens : 0;
         if (options.PromptCacheEnabled && options.PromptCachePolicy == PrefixCachePolicy.Agent)
-            Console.WriteLine("[dotllm] Prompt-cache policy: agent (own-length eviction, protected conversations, save-point and end-of-reply checkpoints; #1654)");
+            Console.WriteLine("[dotllm] Prompt-cache policy: agent (own-length eviction, protected conversations, save-point and end-of-reply checkpoints; #1654; default since #1778, --prompt-cache-policy lru for LRU)");
 
         // Load speculative draft model if configured
         IModel? draftModel = null;

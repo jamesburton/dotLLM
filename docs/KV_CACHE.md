@@ -94,6 +94,14 @@ was made with (a growing chat session needs that on almost every turn). The Vulk
   growth and a snapshot's dispose, not only this cache's. The Arc driver does not recycle a handle soon enough for a stale set
   to change the logits. The tests therefore pin the invalidation itself (`KvBufferInvalidationsForTest`), as well as
   bit-identical logits against a cache allocated in one step.
+- **Headroom after a prefill (issues #1741, #1770).** Growth rounds to the 1,024-position quantum, so a prefill ending on a
+  quantum edge used to leave the first decode token to re-create every layer's K/V and drop every descriptor cache (+12-200 ms
+  after an 8K prompt, growing with depth and model size). Every lazy host (LFM2, LFM3, the dense hybrid, Qwen4-Exp K/V and its QSA indexer) passes
+  `ForwardGrowthHeadroom(rows)` (one quantum when `rows > 1`, else 0) to `PrepareForForward` / `EnsureCapacity`. The headroom is slack
+  to keep, not padding on a growth: a multi-row forward that fits but leaves less than a quantum grows too, because a row-sliced
+  prefill can end inside the buffers just short of the edge. It is clamped to `MaxLength` and best-effort: when the padded
+  allocation runs out of device memory the cache falls back to what the forward needs, so the headroom never refuses a request.
+  The default headroom stays 0.
 - **Snapshots.** `SnapshotPrefix` copies into an exactly-sized eager cache. `RestorePrefixFrom` grows a lazy destination first.
   A snapshot taken before a growth restores exactly after it (`VulkanQwen3HybridDenseKvGrowthTests`).
 - **Cost.** Growth, admission and snapshot copies size everything from the cache's `ElementBytes` / `BytesPerPosition`, never an
@@ -114,6 +122,15 @@ grow in place, so `prefixCacheHeadroomTokens` (1,024 on Vulkan) sizes the retain
 recurrent state, non-exclusive storage, TurboQuant/MLA/pipeline caches) take a miss. Tests: `PrefixCacheReusableKvTests` (CPU model behind a
 delegating cache; mutants: no CurrentLength clamp, ignored exclusivity flag, ignored `CanTruncateTo`, wrong cached count, no cap, no headroom
 all fail) and `VulkanPrefixReuseTests` (greedy continuation equals a cold prefill on the real model).
+
+The `CurrentLength` clamp applies to **every** live entry, not just device caches (issue #1702). The host `SimpleKvCache` and
+`PagedKvCache` branches used to call `SetCurrentLength(match)`, which only checks the cache's capacity and so can *extend* the cache
+over the unforwarded row: a prompt continuing a length-stopped reply then attended to a stale row from whatever request used that
+cache before (Qwen2.5-0.5B q8_0: first-token logprob -1.137 resumed vs -1.551 cold). A cache-free split control (one prefill split
+into two forwards at any row) was flat to 1e-5, so row-count numerics played no part. Tests: `PrefixResumeUnwrittenRowTests`
+(tiny random-weight model; mutants: no clamp, clamp to `CurrentLength - 1` both fail) and `PrefixResumeParityTests` (real model).
+Since the shared clamp runs first, the `CurrentLength` term in the device branch is redundant: the "no CurrentLength clamp" mutant
+listed for `PrefixCacheReusableKvTests` above now means removing the shared clamp, not the device-branch one.
 
 ### Vulkan dense-hybrid (Bonsai 2) KV: F16 storage read in place (issue #1102)
 
@@ -1045,8 +1062,26 @@ project instructions, title or summary side requests over the same history, and 
 above was LRU, and a hit on the live-KV `PrefixCache` or the single recurrent slot *truncates or replaces* the entry it hits.
 So a 3k-token subagent that shared only the system prompt destroyed a 100k-token conversation for 2k tokens of saving,
 and the conversation's next turn re-prefilled everything. Idea from the halogen-flash review (`.docs/HALOGEN_FLASH_REVIEW.md`
-T6; ideas only, its engine is closed). Opt-in: `--prompt-cache-policy agent` (`DOTLLM_PREFIX_POLICY=agent`); default `lru`
-keeps the pre-#1654 behaviour exactly. The policy decides only what is *reused*, never what is computed: output is unchanged.
+T6; ideas only, its engine is closed). **The default since #1778** for `dotllm serve`, `dotllm chat` and the tray-launched
+server; `--prompt-cache-policy lru` (`DOTLLM_PREFIX_POLICY=lru`) keeps the pre-#1654 behaviour exactly. The policy decides
+only what is *reused*, never what is computed: output is unchanged. The engine types (`PrefixCache`, `PrefixTrie`,
+`PrefixCacheConfig`, `RecurrentPrefixCacheOptions`, `ContinuousBatchSchedulerOptions`) still default to `Lru` when constructed
+directly; the default lives in `ServerOptions.DefaultPromptCachePolicy`, which every server and CLI path threads through.
+
+Why agent is the default (#1778): agent clients send side requests to the same server between turns (a tool or `web_fetch`
+summariser, compaction, an advisor). Under `lru` such a request adopts and truncates the conversation's live-KV entry, or
+replaces the single recurrent snapshot, and turns 2 and 3 re-prefill almost the whole prompt. Measured on Strix Halo
+(Vulkan, dev `1ee7e803`, ~6.8k-token prompt + 12 tools, 3 turns, a short side request between turns):
+
+| model | `lru` turn 2/3: cached tokens, wall | `agent` turn 2/3: cached tokens, wall |
+|---|---|---|
+| TwIL-8B Q4_K_M (dense Granite) | 3, 9.5-11.8 s | 6863 / 6883, 2.0 s |
+| Qwen3.8-27B Q4_K_M (hybrid) | 986, 25 s | 6754 / 6776, 6 s |
+| Bonsai-2-27B PQ2_0-MTP (hybrid) | 986, 31-33 s | 6754 / 6776, 4.1 s |
+
+Without side requests `lru` already reuses the prefix (TwIL: 6863/6884). The cost of `agent` is that the side requests stop
+reusing the cache (TwIL side request 0.5 s -> 1.3 s; hybrids ~4-6 s). `ServerPrefixCacheWiringTests` reproduces the scenario
+on the CPU live-KV path in CI, with an explicit `lru` control arm.
 
 One rule, applied by every cache through `PrefixRetention` (`src/DotLLM.Engine/PromptCache/PrefixCachePolicy.cs`):
 

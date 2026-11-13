@@ -142,6 +142,15 @@ public sealed class VulkanNemotronHKvCache : IKvCache
     /// <summary>Smallest step a lazy cache grows by (positions); growth is otherwise 25% of what is held, rounded up to this.</summary>
     internal static int LazyGrowthQuantum { get; set; } = 1024;
 
+    /// <summary>
+    /// Growth headroom for a forward of <paramref name="rows"/> rows (issues #1741, #1770): one <see cref="LazyGrowthQuantum"/> for a multi-row
+    /// forward, none for a single row. A prefill whose end lands exactly on the allocation edge would otherwise make the first decode token
+    /// re-create and copy every layer's K/V and drop every descriptor cache. A forward that already leaves that much slack grows nothing.
+    /// </summary>
+    /// <param name="rows">Rows the forward writes.</param>
+    /// <returns>Positions of headroom to pass to <see cref="EnsureCapacity"/> / <see cref="PrepareForForward"/>.</returns>
+    internal static int ForwardGrowthHeadroom(int rows) => rows > 1 ? LazyGrowthQuantum : 0;
+
     private static long s_bufferEpoch;
 
     /// <summary>
@@ -236,20 +245,36 @@ public sealed class VulkanNemotronHKvCache : IKvCache
     /// </summary>
     /// <param name="positions">Positions the forward needs.</param>
     /// <param name="headroom">
-    /// Extra positions to allocate beyond <paramref name="positions"/> when (and only when) the buffers must grow, clamped to the cache limit. A multi-row prefill
-    /// passes one growth quantum so the first decode token after it does not land exactly on the allocation edge and pay a full
-    /// copy-and-reallocate of the whole prompt's KV plus a descriptor-cache rebuild (issue #1741).
+    /// Positions of slack to leave beyond <paramref name="positions"/>, clamped to the cache limit: the buffers grow whenever fewer than
+    /// <c>positions + headroom</c> are allocated. A multi-row prefill passes one growth quantum so the first decode token after it does not land
+    /// exactly on the allocation edge and pay a full copy-and-reallocate of the whole prompt's KV plus a descriptor-cache rebuild (issue #1741).
+    /// The slack is checked even when <paramref name="positions"/> already fit: a prefill run as row slices can end inside the buffer
+    /// but closer to the edge than one quantum, leaving the edge to the decode token (issue #1770).
     /// </param>
     internal bool EnsureCapacity(int positions, int headroom = 0)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (positions > _maxSeqLen) throw new ArgumentOutOfRangeException(nameof(positions), $"{positions} exceeds the cache limit {_maxSeqLen}.");
-        if (positions <= _allocLength) return false;
-        int target = Math.Max((int)Math.Min(_maxSeqLen, (long)positions + headroom), _allocLength + Math.Max(LazyGrowthQuantum, _allocLength / 4));
+        int needed = (int)Math.Min(_maxSeqLen, (long)positions + Math.Max(0, headroom));
+        if (needed <= _allocLength) return false;
+        int target = Math.Max(needed, _allocLength + Math.Max(LazyGrowthQuantum, _allocLength / 4));
         target = (int)Math.Min(_maxSeqLen, ((long)target + LazyGrowthQuantum - 1) / LazyGrowthQuantum * LazyGrowthQuantum);
-        GrowTo(target);
+        long epoch = BufferEpoch;
+        try { GrowTo(target); }
+        catch (VulkanException e) when (needed > positions && IsOutOfMemory(e))
+        {
+            // The headroom is best-effort (issue #1770): never refuse a forward the cache could hold without it. A partial growth left every
+            // layer at least _allocLength long and bumped the epoch for each buffer it freed.
+            if (positions > _allocLength) EnsureCapacity(positions);
+            return BufferEpoch != epoch;
+        }
         return true;
     }
+
+    /// <summary>True for <c>VK_ERROR_OUT_OF_DEVICE_MEMORY</c> / <c>VK_ERROR_OUT_OF_HOST_MEMORY</c>.</summary>
+    /// <param name="e">The failure.</param>
+    /// <returns>Whether it is an out-of-memory error.</returns>
+    internal static bool IsOutOfMemory(VulkanException e) => e.ErrorCode is VulkanOutOfDeviceMemory or VulkanOutOfHostMemory;
 
     /// <summary>
     /// Raises <see cref="MaxLength"/> to <paramref name="maxLength"/>, up to the growth limit the cache was created with (issue #1100), so a
@@ -292,7 +317,7 @@ public sealed class VulkanNemotronHKvCache : IKvCache
     /// <param name="kvCache">The forward's cache; anything but a <see cref="VulkanNemotronHKvCache"/> is only checked for the epoch.</param>
     /// <param name="positionsEnd">One past the largest position the forward writes.</param>
     /// <param name="seenEpoch">The caller's last seen <see cref="BufferEpoch"/>; updated.</param>
-    /// <param name="growthHeadroom">Extra positions to allocate when growth is needed anyway (see <see cref="EnsureCapacity"/>).</param>
+    /// <param name="growthHeadroom">Positions of slack to keep allocated beyond <paramref name="positionsEnd"/> (see <see cref="EnsureCapacity"/>).</param>
     /// <returns><see langword="true"/> when descriptor caches must be dropped.</returns>
     internal static bool PrepareForForward(IKvCache? kvCache, int positionsEnd, ref long seenEpoch, int growthHeadroom = 0)
     {

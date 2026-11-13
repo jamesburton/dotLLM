@@ -962,6 +962,7 @@ public sealed partial class ChunkIndex
             try
             {
                 File.Move(temp, full, overwrite: true);
+                StorePaths.SyncDirectory(Path.GetDirectoryName(full)!);
                 return;
             }
             catch (Exception ex) when (ex is UnauthorizedAccessException

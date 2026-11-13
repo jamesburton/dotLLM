@@ -170,14 +170,16 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
     /// <summary>
     /// Before recording a forward: see <see cref="VulkanNemotronHKvCache.PrepareForForward"/>. True when the descriptor caches must be
-    /// dropped because a KV buffer was freed.
+    /// dropped because a KV buffer was freed. A multi-row forward grows with a quantum of headroom, so the decode token after a prefill that
+    /// ends on the allocation edge does not re-create every layer's K/V (issue #1770).
     /// </summary>
     /// <param name="kvCache">The forward's cache, or null.</param>
     /// <param name="positions">The forward's positions.</param>
     /// <returns><see langword="true"/> when descriptor caches must be dropped.</returns>
     private bool PrepareKvCache(IKvCache? kvCache, ReadOnlySpan<int> positions)
     {
-        if (!VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch))
+        if (!VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch,
+                growthHeadroom: VulkanNemotronHKvCache.ForwardGrowthHeadroom(positions.Length)))
             return false;
         KvBufferInvalidationsForTest++;
         return true;

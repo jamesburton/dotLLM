@@ -65,21 +65,39 @@ public sealed record ServerOptions
     public int PromptCacheSize { get; init; } = 4;
 
     /// <summary>
-    /// Prefix-cache retention policy (issue #1654): <see cref="PrefixCachePolicy.Lru"/> (default) or
-    /// <see cref="PrefixCachePolicy.Agent"/> (own-length eviction, protected conversations, save-point and end-of-reply
-    /// checkpoints). Applies to every prefix cache the server builds: the live-KV cache, the paged trie, the recurrent snapshot
+    /// Prefix-cache retention policy (issue #1654): <see cref="PrefixCachePolicy.Agent"/> (the default since #1778: own-length
+    /// eviction, protected conversations, save-point and end-of-reply checkpoints) or <see cref="PrefixCachePolicy.Lru"/>
+    /// (the pre-#1654 behaviour, still selectable). Applies to every prefix cache the server builds: the live-KV cache, the paged trie, the recurrent snapshot
     /// tiers and the scheduler's recurrent entries. CLI <c>--prompt-cache-policy</c>; environment <c>DOTLLM_PREFIX_POLICY</c>.
     /// </summary>
-    public PrefixCachePolicy PromptCachePolicy { get; init; } = PrefixCachePolicy.Lru;
+    /// <remarks>
+    /// Agent is the default (#1778) because under LRU a side request between an agent's turns (a tool summariser, compaction,
+    /// an advisor) truncates the conversation's live-KV entry or replaces the single recurrent snapshot, and the next turn
+    /// re-prefills almost the whole prompt. Not deserialized through a source-generated JSON context, so the initializer holds.
+    /// </remarks>
+    public PrefixCachePolicy PromptCachePolicy { get; init; } = DefaultPromptCachePolicy;
+
+    /// <summary>The policy used when neither the CLI nor <see cref="PromptCachePolicyEnvVar"/> selects one (#1778).</summary>
+    public const PrefixCachePolicy DefaultPromptCachePolicy = PrefixCachePolicy.Agent;
 
     /// <summary>Environment variable that selects <see cref="PromptCachePolicy"/> when the CLI does not.</summary>
     public const string PromptCachePolicyEnvVar = "DOTLLM_PREFIX_POLICY";
 
-    /// <summary>Parses <c>lru</c> / <c>agent</c> (case-insensitive); null or empty falls back to the environment, then to LRU.</summary>
+    /// <summary>
+    /// Parses <c>lru</c> / <c>agent</c> (case-insensitive); null or empty falls back to the environment, then to
+    /// <see cref="DefaultPromptCachePolicy"/> (agent, #1778).
+    /// </summary>
     public static PrefixCachePolicy ParsePromptCachePolicy(string? value)
+        => ResolvePromptCachePolicy(value, Environment.GetEnvironmentVariable(PromptCachePolicyEnvVar));
+
+    /// <summary>
+    /// <see cref="ParsePromptCachePolicy"/> with the environment value passed in (testable without touching the process
+    /// environment): the CLI value wins, then <paramref name="environmentValue"/>, then <see cref="DefaultPromptCachePolicy"/>.
+    /// </summary>
+    internal static PrefixCachePolicy ResolvePromptCachePolicy(string? cliValue, string? environmentValue)
     {
-        value = string.IsNullOrWhiteSpace(value) ? Environment.GetEnvironmentVariable(PromptCachePolicyEnvVar) : value;
-        if (string.IsNullOrWhiteSpace(value)) return PrefixCachePolicy.Lru;
+        string? value = string.IsNullOrWhiteSpace(cliValue) ? environmentValue : cliValue;
+        if (string.IsNullOrWhiteSpace(value)) return DefaultPromptCachePolicy;
         return value.Trim().ToLowerInvariant() switch
         {
             "lru" => PrefixCachePolicy.Lru,
@@ -135,7 +153,7 @@ public sealed record ServerOptions
     /// <summary>Resolves CLI count and human-readable host byte budget before loading a model.</summary>
     public static RecurrentPrefixCacheOptions BuildPrefixSnapshotOptions(int? count, string? hostBudget,
         string? diskDirectory = null, string? diskBudget = null, int step = 0, int? stepKeep = null,
-        PrefixCachePolicy policy = PrefixCachePolicy.Lru)
+        PrefixCachePolicy policy = DefaultPromptCachePolicy)
         => new ServerOptions { Model = "", PrefixSnapshots = count, PrefixSnapshotHostBudgetBytes = ParsePrefixSnapshotHostBudget(hostBudget),
             PrefixSnapshotDiskDirectory = diskDirectory, PrefixSnapshotDiskBudgetBytes = ParsePrefixSnapshotDiskBudget(diskBudget),
             PromptCacheStep = step, PromptCacheStepKeep = stepKeep, PromptCachePolicy = policy }

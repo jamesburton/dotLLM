@@ -84,6 +84,33 @@ public sealed unsafe class VulkanLfm2KvGrowthTests : IDisposable
     }
 
     /// <summary>
+    /// Issue #1770: a prefill ending exactly on a growth quantum must leave room for the decode token after it. Otherwise that token
+    /// re-creates every attention layer's K/V and drops every descriptor cache (129-219 ms on LFM2.5-24B-A2B after -p 8192).
+    /// </summary>
+    [SkippableFact]
+    public void PrefillOnTheAllocationEdge_LeavesRoomForTheFirstDecodeToken()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var fixture = new Lfm2TestFixture();
+        using var gguf = GgufFile.Open(fixture.Path);
+        using var device = VulkanDevice.Create();
+        using var model = VulkanLfm2MoeTransformerModel.BuildFromGguf(device, gguf, fixture.Config, spvDir);
+        VulkanNemotronHKvCache.LazyGrowthQuantum = 4;
+
+        IModel api = model;
+        using var state = api.CreateSequenceState();
+        using var kv = model.CreateKvCache(Window);
+        using (model.Forward([1, 2, 3, 4, 5, 6, 1, 2], [0, 1, 2, 3, 4, 5, 6, 7], 0, kv, (ISsmState)state!)) { }
+        Assert.True(kv.AllocatedLength > 8, $"an 8-row prefill left {kv.AllocatedLength} positions: no room for the next token");
+
+        long bytes = kv.AllocatedBytes;
+        int invalidations = model.KvBufferInvalidationsForTest;
+        using (model.Forward([3], [8], 0, kv, (ISsmState)state!)) { }
+        Assert.Equal(bytes, kv.AllocatedBytes);
+        Assert.Equal(invalidations, model.KvBufferInvalidationsForTest);
+    }
+
+    /// <summary>
     /// A prefill of 3 then 13 decode steps up to the window, each grown first the way the engine does (<c>TryGrowTo</c>). A cache
     /// created at the full window allocates once; one created at 3 grows on decode steps. A decode step that re-created the KV
     /// buffers must have dropped the descriptor caches.

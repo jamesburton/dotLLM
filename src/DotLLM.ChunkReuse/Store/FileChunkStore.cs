@@ -303,6 +303,7 @@ public sealed class FileChunkStore : IChunkStore
             try
             {
                 File.Move(temp, path, overwrite: true);
+                StorePaths.SyncDirectory(dir);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
