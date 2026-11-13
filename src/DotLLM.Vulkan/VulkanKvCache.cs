@@ -39,7 +39,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     private readonly VulkanDevice.Buffer[] _keys;
     private readonly VulkanDevice.Buffer[] _values;
     private readonly int _numLayers;
-    private readonly int _maxSeqLen;
+    private int _maxSeqLen;   // raised by TryGrowTo (issue #1781)
     // Per-layer row stride (numKvHeads × headDim, FP32 elements). Uniform across
     // layers for every dense/GQA/MoE model; PER-LAYER for Gemma-4, whose sliding
     // and global layers carry different KV-head counts AND head dims (e.g. sliding
@@ -463,6 +463,101 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// <param name="length">The length to cut back to.</param>
     /// <returns>Whether <see cref="Rollback"/> / <see cref="SetCurrentLength"/> to that length succeeds.</returns>
     public bool CanTruncateTo(int length) => _rows is null || _rows.CanTruncateTo(length);
+
+    /// <summary>
+    /// Test hook (issue #1781): replaces the free-device-memory admission of <see cref="TryGrowTo"/>. Called with the device and the
+    /// peak extra bytes the growth needs; returns whether it fits.
+    /// </summary>
+    internal static Func<VulkanDevice, long, bool>? GrowthAdmissionOverride { get; set; }
+
+    /// <summary>Number of growths <see cref="TryGrowTo"/> carried out, process-wide (test hook).</summary>
+    internal static long GrowthsForTest => Interlocked.Read(ref s_growths);
+    private static long s_growths;
+
+    /// <summary>
+    /// Raises <see cref="MaxLength"/> to <paramref name="maxLength"/> keeping the <see cref="CurrentLength"/> committed rows (issue #1781),
+    /// so a retained prefix-cache entry serves a next turn that outgrew it instead of re-prefilling the whole conversation. Layer by layer,
+    /// larger K and V buffers are allocated, the live rows copied device to device in the cache's own format (no widening), and the old
+    /// buffers freed: the transient cost is one old layer's K and V. The growth is admitted against free device memory before anything is
+    /// allocated (never spill: on an integrated GPU an allocation past the OS limit succeeds and the next submit loses the device), and an
+    /// out-of-memory error is caught as well; either refusal returns <see langword="false"/> with the cache unchanged. Must not run while
+    /// a forward is recording. The freed handles are evicted from every descriptor cache by the device's destroy log (#467).
+    /// A cache with compact sliding-window layers does not grow (its ring capacities are planned for the length it was made with).
+    /// </summary>
+    /// <param name="maxLength">Positions the cache must hold.</param>
+    /// <returns><see langword="true"/> when <see cref="MaxLength"/> is now at least <paramref name="maxLength"/>.</returns>
+    public bool TryGrowTo(int maxLength)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (maxLength <= _maxSeqLen) return true;
+        if (_rows is not null) return false;
+
+        long growth = 0, transit = 0;
+        for (int i = 0; i < _numLayers; i++)
+        {
+            long rowBytes = _storage.RowBytes(_kvStride[i]);
+            growth += 2L * (maxLength - _maxSeqLen) * rowBytes;
+            transit = Math.Max(transit, 2L * _maxSeqLen * rowBytes);
+        }
+        if (!AdmitGrowth(growth + transit))
+            return false;
+
+        int layer = 0;
+        try
+        {
+            for (; layer < _numLayers; layer++)
+            {
+                long rowBytes = _storage.RowBytes(_kvStride[layer]);
+                long newBytes = (long)maxLength * rowBytes;
+                ulong keep = (ulong)((long)_currentLength * rowBytes);
+                var nk = _device.AllocateDeviceLocal(newBytes);
+                VulkanDevice.Buffer nv;
+                try { nv = _device.AllocateDeviceLocal(newBytes); }
+                catch { nk.Dispose(); throw; }
+                if (keep > 0)
+                {
+                    try
+                    {
+                        _device.CopyBufferRangeSynchronous(_keys[layer], nk, 0, 0, keep);
+                        _device.CopyBufferRangeSynchronous(_values[layer], nv, 0, 0, keep);
+                    }
+                    catch { nk.Dispose(); nv.Dispose(); throw; }
+                }
+                _keys[layer].Dispose();
+                _values[layer].Dispose();
+                _keys[layer] = nk;
+                _values[layer] = nv;
+            }
+        }
+        catch (VulkanException e) when (e.ErrorCode is VulkanNemotronHKvCache.VulkanOutOfDeviceMemory or VulkanNemotronHKvCache.VulkanOutOfHostMemory)
+        {
+            // Layers below `layer` already hold maxLength positions; the rest keep the old length, so the cache stays at the old one.
+            return false;
+        }
+
+        _maxSeqLen = maxLength;
+        Interlocked.Increment(ref s_growths);
+        return true;
+    }
+
+    private bool AdmitGrowth(long bytes)
+    {
+        if (GrowthAdmissionOverride is { } admit) return admit(_device, bytes);
+        if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_ALLOW_OVERCOMMIT"), "1", StringComparison.Ordinal)) return true;
+        try
+        {
+            // As the MTP-head attach (#880): what the device can hold resident (UMA: capped at the OS limit), minus what this process and
+            // other processes already hold there.
+            long usable = VulkanMemoryCapacity.UsableCapacityBytes(_device.ResidentCapacityBytes(),
+                GC.GetGCMemoryInfo().TotalAvailableMemoryBytes, _device.PhysicalDeviceTypeValue);
+            long others = _device.ReadOtherProcessPressure()?.OtherBytes ?? 0;
+            return bytes <= usable - _device.ResidentLiveBytes() - others;
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            return false;   // no reading, no growth: the caller falls back to a miss
+        }
+    }
 
     /// <summary>
     /// Grows any compact sliding-window slot too small for an append of <paramref name="positions"/> (a prefill chunk longer
