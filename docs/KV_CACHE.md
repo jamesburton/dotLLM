@@ -95,11 +95,13 @@ was made with (a growing chat session needs that on almost every turn). The Vulk
   to change the logits. The tests therefore pin the invalidation itself (`KvBufferInvalidationsForTest`), as well as
   bit-identical logits against a cache allocated in one step.
 - **Headroom after a prefill (issues #1741, #1770).** Growth rounds to the 1,024-position quantum, so a prefill ending on a
-  quantum edge used to leave the first decode token to re-create every layer's K/V and drop every descriptor cache (+60-200 ms
-  after an 8K prompt). Every lazy host (LFM2, LFM3, the dense hybrid, Qwen4-Exp K/V and its QSA indexer) passes
+  quantum edge used to leave the first decode token to re-create every layer's K/V and drop every descriptor cache (+12-200 ms
+  after an 8K prompt, growing with depth and model size). Every lazy host (LFM2, LFM3, the dense hybrid, Qwen4-Exp K/V and its QSA indexer) passes
   `ForwardGrowthHeadroom(rows)` (one quantum when `rows > 1`, else 0) to `PrepareForForward` / `EnsureCapacity`. The headroom is slack
   to keep, not padding on a growth: a multi-row forward that fits but leaves less than a quantum grows too, because a row-sliced
-  prefill can end inside the buffers just short of the edge. It is clamped to `MaxLength`. The default headroom stays 0.
+  prefill can end inside the buffers just short of the edge. It is clamped to `MaxLength` and best-effort: when the padded
+  allocation runs out of device memory the cache falls back to what the forward needs, so the headroom never refuses a request.
+  The default headroom stays 0.
 - **Snapshots.** `SnapshotPrefix` copies into an exactly-sized eager cache. `RestorePrefixFrom` grows a lazy destination first.
   A snapshot taken before a growth restores exactly after it (`VulkanQwen3HybridDenseKvGrowthTests`).
 - **Cost.** Growth, admission and snapshot copies size everything from the cache's `ElementBytes` / `BytesPerPosition`, never an

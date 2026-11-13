@@ -259,9 +259,22 @@ public sealed class VulkanNemotronHKvCache : IKvCache
         if (needed <= _allocLength) return false;
         int target = Math.Max(needed, _allocLength + Math.Max(LazyGrowthQuantum, _allocLength / 4));
         target = (int)Math.Min(_maxSeqLen, ((long)target + LazyGrowthQuantum - 1) / LazyGrowthQuantum * LazyGrowthQuantum);
-        GrowTo(target);
+        long epoch = BufferEpoch;
+        try { GrowTo(target); }
+        catch (VulkanException e) when (needed > positions && IsOutOfMemory(e))
+        {
+            // The headroom is best-effort (issue #1770): never refuse a forward the cache could hold without it. A partial growth left every
+            // layer at least _allocLength long and bumped the epoch for each buffer it freed.
+            if (positions > _allocLength) EnsureCapacity(positions);
+            return BufferEpoch != epoch;
+        }
         return true;
     }
+
+    /// <summary>True for <c>VK_ERROR_OUT_OF_DEVICE_MEMORY</c> / <c>VK_ERROR_OUT_OF_HOST_MEMORY</c>.</summary>
+    /// <param name="e">The failure.</param>
+    /// <returns>Whether it is an out-of-memory error.</returns>
+    internal static bool IsOutOfMemory(VulkanException e) => e.ErrorCode is VulkanOutOfDeviceMemory or VulkanOutOfHostMemory;
 
     /// <summary>
     /// Raises <see cref="MaxLength"/> to <paramref name="maxLength"/>, up to the growth limit the cache was created with (issue #1100), so a

@@ -70,26 +70,47 @@ public sealed class VulkanQwen4ExpIndexerState : IDisposable
         int q = VulkanNemotronHKvCache.LazyGrowthQuantum;
         int target = Math.Max(needed, AllocatedPositions + Math.Max(q, AllocatedPositions / 4));
         target = (int)Math.Min(Capacity, ((long)target + q - 1) / q * q);
+        bool replaced = false;
+        try { GrowTo(target, validLength, ref replaced); }
+        catch (Interop.VulkanException e) when (needed > positions && VulkanNemotronHKvCache.IsOutOfMemory(e))
+        {
+            // The headroom is best-effort (issue #1770): never refuse a forward the state could hold without it.
+            if (positions > AllocatedPositions) return EnsureCapacity(positions, validLength) | replaced;
+        }
+        return replaced;
+    }
+
+    /// <summary>
+    /// Re-creates every layer's buffers at <paramref name="target"/> positions, copying the first <paramref name="validLength"/> positions. Each
+    /// layer's new buffers are allocated before its old ones are released, so an allocation failure leaves every layer valid (the ones already
+    /// grown are larger than <see cref="AllocatedPositions"/>, which still names the smaller size).
+    /// </summary>
+    private void GrowTo(int target, int validLength, ref bool replaced)
+    {
         int rawBytesPerPos = _dim * (RawF16 ? 2 : 4);
         ulong rawKeep = (ulong)validLength * (ulong)rawBytesPerPos, poolKeep = (ulong)(validLength / _blockSize) * (ulong)_dim * 4;
         for (int i = 0; i < _qsaLayers; i++)
         {
             var oldRaw = Raw[i]; var oldPooled = Pooled[i];
-            Allocate(i, target);
+            var newRaw = _device.AllocateDeviceLocal((long)target * _dim * (RawF16 ? 2 : 4));
+            VulkanDevice.Buffer newPooled;
+            try { newPooled = _device.AllocateDeviceLocal((long)(target / _blockSize + 1) * _dim * 4); }
+            catch { newRaw.Dispose(); throw; }
             if (oldRaw is not null && (rawKeep > 0 || poolKeep > 0))
             {
                 using var ctx = _device.CreateSubmitContext();
                 ctx.Begin();
                 KernelSupport.ComputeToTransferBarrier(ctx.CommandBuffer);
-                if (rawKeep > 0) VulkanQwen3MoeHybridTransformerModel.Q4Copy(ctx.CommandBuffer, oldRaw, Raw[i], 0, 0, rawKeep);
-                if (poolKeep > 0) VulkanQwen3MoeHybridTransformerModel.Q4Copy(ctx.CommandBuffer, oldPooled, Pooled[i], 0, 0, poolKeep);
+                if (rawKeep > 0) VulkanQwen3MoeHybridTransformerModel.Q4Copy(ctx.CommandBuffer, oldRaw, newRaw, 0, 0, rawKeep);
+                if (poolKeep > 0) VulkanQwen3MoeHybridTransformerModel.Q4Copy(ctx.CommandBuffer, oldPooled, newPooled, 0, 0, poolKeep);
                 KernelSupport.TransferToComputeBarrier(ctx.CommandBuffer);
                 ctx.SubmitAndWait();
             }
+            Raw[i] = newRaw; Pooled[i] = newPooled;
             oldRaw?.Dispose(); oldPooled?.Dispose();
+            replaced = true;
         }
         AllocatedPositions = target;
-        return true;
     }
 
     /// <summary>Device bytes the indexer state of <paramref name="qsaLayers"/> layers needs for <paramref name="capacity"/> positions.</summary>
