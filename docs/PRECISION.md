@@ -591,7 +591,7 @@ PRs #1103, #1122, #1125, #1126.
 | C7 | CPU | MTP KV and hidden F32 | 32 MiB @4096 positions | **KV fixed** (#1141): F16 default (16 MiB), q8_0 (8.5), q4_0 (4.5) when the trunk cache is quantized; hidden stays F32 (#1144); `DOTLLM_CPU_MTP_KV=f32` reference arm | #1141 |
 | C8 | CPU | MLA KV, TurboQuant norms, MoE scatter F32 | per token | open | #1140 |
 | C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence (speculative verify: read-only scan + in-place replay of row inputs, no state copy at all, #1194) | sign-off pending | #1144 |
-| X1 | CPU | safetensors BF16 → F32 | L8B +16 GB; L1B +2.5 GB | open | #1143 (needs #1118) |
+| X1 | CPU | safetensors BF16 → F32 | Dense linear/embedding/head now borrow 2-byte BF16; no owned matrix copy | partial | #1143: explicit fused splits, MoE/MLA and other F32-only consumers still convert |
 | X2 | CPU | MLA-MoE routed experts → F32 | ≈57 GB on V2-Lite | open | #1140 |
 | X3 | CPU | MLA projections, shared / Granite-MoE experts → F32 | `Σ out·in·4` | open | #1140 |
 | X4 | CPU | R4 repack: second same-width copy | L8B Q4_K_M +4.9 GB | **fixed**: R4 is a zero-copy view; same kernels on the mmap rows, bit-identical, same speed | #1156 (from #1143) |
