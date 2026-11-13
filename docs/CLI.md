@@ -119,7 +119,7 @@ is sized up front. `serve` is paged by default (`--no-paged` to opt out); `run` 
 KV widths (Gemma-4, MiMo-V2) always use the contiguous cache.
 
 **Prompt and prefix caches** (reuse of already computed KV, as opposed to its size): `--no-prompt-cache`, `--prompt-cache-size` (cached sessions; default 4 for `serve`, 1 for `chat`),
-`--prompt-cache-policy lru|agent` (env `DOTLLM_PREFIX_POLICY`), `--prompt-cache-step N` / `--prompt-cache-step-keep N` (recurrent-state checkpoints every N prefill tokens),
+`--prompt-cache-policy agent|lru` (default `agent` since #1778; env `DOTLLM_PREFIX_POLICY`), `--prompt-cache-step N` / `--prompt-cache-step-keep N` (recurrent-state checkpoints every N prefill tokens),
 and for recurrent/hybrid models `--prefix-snapshots`, `--prefix-snapshot-host-budget`, `--prefix-snapshot-disk-dir`, `--prefix-snapshot-disk-budget`
 (sizes such as `8GiB`). Deep reference: [KV_CACHE.md](KV_CACHE.md) (formats, windows, hybrid geometry, Vulkan/CUDA specifics) and [SCHEDULING.md](SCHEDULING.md).
 
@@ -452,7 +452,7 @@ dotllm chat Qwen/Qwen3-0.6B-GGUF --tools @tools.json --tool-choice auto
 | `--prefix-snapshot-disk-dir` `<text>` | unset |  | Directory for recurrent prefix spill files; requires a positive disk budget. |
 | `--prefix-snapshot-host-budget` `<text>` | unset |  | Page-locked host snapshot budget, such as 8GiB. Default 0 disables host retention. |
 | `--prefix-snapshots` `<int>` | unset |  | Maximum recurrent prefix snapshots (default 1). |
-| `--prompt-cache-policy` `<text>` | unset | `DOTLLM_PREFIX_POLICY` | Prefix-cache retention policy: lru (default) or agent (a conversation survives about its own length of other prompt tokens; side requests run without truncating it; recurrent models checkpoint at the last user message and after the reply). Env DOTLLM_PREFIX_POLICY. |
+| `--prompt-cache-policy` `<text>` | unset | `DOTLLM_PREFIX_POLICY` | Prefix-cache retention policy: agent (default; a conversation survives about its own length of other prompt tokens; side requests run without truncating it; recurrent models checkpoint at the last user message and after the reply) or lru (least recently used; any hit may truncate an entry). Env DOTLLM_PREFIX_POLICY. |
 | `--prompt-cache-size` `<int>` | 1 |  | Maximum number of cached sessions kept for prompt caching. Default 1 (one conversation). |
 | `--prompt-cache-step` `<int>` | 0 |  | Recurrent-state checkpoint every N prefill tokens, so a prompt that diverges mid-history (a trimmed tool result) resumes from the nearest one. Default 0 (off). |
 | `--prompt-cache-step-keep` `<int>` | unset |  | Most --prompt-cache-step checkpoints kept, deepest first (default 8). |
@@ -555,7 +555,7 @@ Notes on interplay:
 | `--prefix-snapshot-disk-dir` `<text>` | unset |  | Directory for recurrent prefix spill files; requires a positive disk budget. |
 | `--prefix-snapshot-host-budget` `<text>` | unset |  | Page-locked host snapshot budget, such as 8GiB. Default 0 disables host retention. |
 | `--prefix-snapshots` `<int>` | unset |  | Maximum recurrent prefix snapshots (default 1). Use with --prefix-snapshot-host-budget for alternating sessions. |
-| `--prompt-cache-policy` `<text>` | unset | `DOTLLM_PREFIX_POLICY` | Prefix-cache retention policy: lru (default) or agent (a conversation survives about its own length of other prompt tokens, side requests run without truncating it, recurrent models checkpoint at the last user message and after the reply). Env DOTLLM_PREFIX_POLICY. |
+| `--prompt-cache-policy` `<text>` | unset | `DOTLLM_PREFIX_POLICY` | Prefix-cache retention policy: agent (default; a conversation survives about its own length of other prompt tokens, side requests run without truncating it, recurrent models checkpoint at the last user message and after the reply) or lru (least recently used; any hit may truncate an entry). Env DOTLLM_PREFIX_POLICY. |
 | `--prompt-cache-size` `<int>` | 4 |  | Maximum number of cached sessions (prompt prefixes) kept for reuse. Default 4. |
 | `--prompt-cache-step` `<int>` | 0 |  | Recurrent-state checkpoint every N prefill tokens, so a prompt that diverges mid-history (a trimmed tool result) resumes from the nearest one. Default 0 (off). |
 | `--prompt-cache-step-keep` `<int>` | unset |  | Most --prompt-cache-step checkpoints kept, deepest first (default 8). |
@@ -814,7 +814,7 @@ Some variables are read at process start, others per model load - set them befor
 | Variable | Default | Effect |
 |---|---|---|
 | `DOTLLM_MAX_MESSAGES` | 8192 | Messages accepted per chat request when `--max-messages` is absent (0 = unlimited). |
-| `DOTLLM_PREFIX_POLICY` | `lru` | Prefix-cache retention policy (`lru` or `agent`) when `--prompt-cache-policy` is absent. |
+| `DOTLLM_PREFIX_POLICY` | `agent` | Prefix-cache retention policy (`agent` or `lru`) when `--prompt-cache-policy` is absent. |
 | `DOTLLM_LOG_TIMINGS` | on | `0` turns off the per-request timing log lines. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enables OpenTelemetry (OTLP) export of metrics and traces to this endpoint. |
 | `DOTLLM_VK_SCHEDULER` | auto | `0`/`1` forces the Vulkan continuous-batch scheduler off/on (default: on at `--expected-concurrency` >= 5 for supported models). |

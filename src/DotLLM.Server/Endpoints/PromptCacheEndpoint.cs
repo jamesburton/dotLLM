@@ -113,7 +113,7 @@ public static class PromptCacheEndpoint
     }
 
     internal static PromptCacheStatsResponse BuildStats(PrefixTrieManager? manager, RecurrentPrefixCacheStatistics? recurrent,
-        PrefixCache? live = null, PrefixCachePolicy policy = PrefixCachePolicy.Lru)
+        PrefixCache? live = null, PrefixCachePolicy policy = ServerOptions.DefaultPromptCachePolicy)
     {
         var liveStats = live is null ? null : new LivePrefixCacheStats
         {
@@ -135,7 +135,7 @@ public static class PromptCacheEndpoint
 
     private static PromptCacheStatsResponse EmptyStats() => new()
     {
-        Policy = "lru",
+        Policy = ServerOptions.DefaultPromptCachePolicy.ToString().ToLowerInvariant(),   // every caller overrides it; never a second default
         Enabled = false,
         BlockSize = 0,
         Nodes = 0,

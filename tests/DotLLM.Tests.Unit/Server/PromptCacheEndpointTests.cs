@@ -128,14 +128,20 @@ public sealed class PromptCacheEndpointTests
     }
 
     [Fact]
-    public void Stats_WithoutALiveCache_OmitTheLiveSection_AndDefaultToLru()
+    public void Stats_WithoutALiveCache_OmitTheLiveSection_AndDefaultToAgent()
     {
         var stats = DotLLM.Server.Endpoints.PromptCacheEndpoint.BuildStats(null, null);
         string json = JsonSerializer.Serialize(stats, ServerJsonContext.Default.PromptCacheStatsResponse);
         using var doc = JsonDocument.Parse(json);
 
         Assert.False(doc.RootElement.TryGetProperty("live", out _));
-        Assert.Equal("lru", doc.RootElement.GetProperty("policy").GetString());
+        Assert.Equal("agent", doc.RootElement.GetProperty("policy").GetString());   // #1778
+
+        // /v1/prompt-cache reports the server's policy: a default ServerOptions reports agent, an explicit lru reports lru.
+        var byDefault = DotLLM.Server.Endpoints.PromptCacheEndpoint.BuildStats(null, null, null, new ServerOptions { Model = "m" }.PromptCachePolicy);
+        Assert.Equal("agent", byDefault.Policy);
+        var lru = DotLLM.Server.Endpoints.PromptCacheEndpoint.BuildStats(null, null, null, PrefixCachePolicy.Lru);
+        Assert.Equal("lru", lru.Policy);
     }
 
     [Fact]

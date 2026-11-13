@@ -1062,8 +1062,26 @@ project instructions, title or summary side requests over the same history, and 
 above was LRU, and a hit on the live-KV `PrefixCache` or the single recurrent slot *truncates or replaces* the entry it hits.
 So a 3k-token subagent that shared only the system prompt destroyed a 100k-token conversation for 2k tokens of saving,
 and the conversation's next turn re-prefilled everything. Idea from the halogen-flash review (`.docs/HALOGEN_FLASH_REVIEW.md`
-T6; ideas only, its engine is closed). Opt-in: `--prompt-cache-policy agent` (`DOTLLM_PREFIX_POLICY=agent`); default `lru`
-keeps the pre-#1654 behaviour exactly. The policy decides only what is *reused*, never what is computed: output is unchanged.
+T6; ideas only, its engine is closed). **The default since #1778** for `dotllm serve`, `dotllm chat` and the tray-launched
+server; `--prompt-cache-policy lru` (`DOTLLM_PREFIX_POLICY=lru`) keeps the pre-#1654 behaviour exactly. The policy decides
+only what is *reused*, never what is computed: output is unchanged. The engine types (`PrefixCache`, `PrefixTrie`,
+`PrefixCacheConfig`, `RecurrentPrefixCacheOptions`, `ContinuousBatchSchedulerOptions`) still default to `Lru` when constructed
+directly; the default lives in `ServerOptions.DefaultPromptCachePolicy`, which every server and CLI path threads through.
+
+Why agent is the default (#1778): agent clients send side requests to the same server between turns (a tool or `web_fetch`
+summariser, compaction, an advisor). Under `lru` such a request adopts and truncates the conversation's live-KV entry, or
+replaces the single recurrent snapshot, and turns 2 and 3 re-prefill almost the whole prompt. Measured on Strix Halo
+(Vulkan, dev `1ee7e803`, ~6.8k-token prompt + 12 tools, 3 turns, a short side request between turns):
+
+| model | `lru` turn 2/3: cached tokens, wall | `agent` turn 2/3: cached tokens, wall |
+|---|---|---|
+| TwIL-8B Q4_K_M (dense Granite) | 3, 9.5-11.8 s | 6863 / 6883, 2.0 s |
+| Qwen3.8-27B Q4_K_M (hybrid) | 986, 25 s | 6754 / 6776, 6 s |
+| Bonsai-2-27B PQ2_0-MTP (hybrid) | 986, 31-33 s | 6754 / 6776, 4.1 s |
+
+Without side requests `lru` already reuses the prefix (TwIL: 6863/6884). The cost of `agent` is that the side requests stop
+reusing the cache (TwIL side request 0.5 s -> 1.3 s; hybrids ~4-6 s). `ServerPrefixCacheWiringTests` reproduces the scenario
+on the CPU live-KV path in CI, with an explicit `lru` control arm.
 
 One rule, applied by every cache through `PrefixRetention` (`src/DotLLM.Engine/PromptCache/PrefixCachePolicy.cs`):
 
