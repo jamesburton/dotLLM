@@ -47,11 +47,22 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
         public string DecodeToken(int id) => id.ToString();
     }
 
-    /// <summary>Exposes a SimpleKvCache only through the interfaces a device cache offers (never as a SimpleKvCache).</summary>
-    private sealed class ReusableKv(SimpleKvCache inner, bool exclusive, bool canTruncate) : IPrefixReusableKvCache, IPerLayerKvCache
+    /// <summary>
+    /// Exposes a SimpleKvCache only through the interfaces a device cache offers (never as a SimpleKvCache). <paramref name="growLimit"/>:
+    /// the largest <see cref="IKvCache.MaxLength"/> a <see cref="IKvCache.TryGrowTo"/> may reach (0 = never grows, the interface default),
+    /// standing in for a device cache whose admission refuses a growth that would not fit in free device memory (issue #1781).
+    /// </summary>
+    private sealed class ReusableKv(SimpleKvCache inner, bool exclusive, bool canTruncate, int growLimit = 0) : IPrefixReusableKvCache, IPerLayerKvCache
     {
         public bool Disposed;
         public bool Exclusive = exclusive;
+        public List<int> GrowthRequests { get; } = [];
+        public bool TryGrowTo(int maxLength)
+        {
+            if (maxLength <= inner.MaxLength) return true;
+            GrowthRequests.Add(maxLength);
+            return maxLength <= growLimit && inner.TryGrowTo(maxLength);
+        }
         public int CurrentLength => inner.CurrentLength;
         public int MaxLength => inner.MaxLength;
         public int LayerCount => ((IPerLayerKvCache)inner).LayerCount;
@@ -86,14 +97,15 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
         public void Dispose() { Disposed = true; inner.Dispose(); }
     }
 
-    private (TextGenerator Gen, PrefixCache Prefix, List<ReusableKv> Caches) Make(bool exclusive = true, bool canTruncate = true, int headroom = 0, int entries = 2)
+    private (TextGenerator Gen, PrefixCache Prefix, List<ReusableKv> Caches) Make(bool exclusive = true, bool canTruncate = true, int headroom = 0, int entries = 2,
+        int growLimit = 0, PrefixCachePolicy policy = PrefixCachePolicy.Lru)
     {
         var caches = new List<ReusableKv>();
-        var prefix = new PrefixCache(entries);
+        var prefix = new PrefixCache(entries, policy);
         var gen = new TextGenerator(_tiny.Model, new Tok(TinyQwen.Vocab),
             kvCacheFactory: (c, size) =>
             {
-                var k = new ReusableKv(new SimpleKvCache(KvGeometry.FromConfig(c, false), size), exclusive, canTruncate);
+                var k = new ReusableKv(new SimpleKvCache(KvGeometry.FromConfig(c, false), size), exclusive, canTruncate, growLimit);
                 caches.Add(k);
                 return k;
             },
@@ -165,6 +177,70 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
             Assert.Equal(Cold(longer).GeneratedTokenIds, warm.GeneratedTokenIds);
             Assert.Single(c1);
         }
+    }
+
+    /// <summary>
+    /// Issue #1781: the next turn of the conversation adds more than the headroom (an agent's large tool result). The retained cache
+    /// grows, keeps the reused rows, and the request prefills only the new suffix; the output equals a cold prefill.
+    /// </summary>
+    [Theory]
+    [InlineData(PrefixCachePolicy.Lru)]
+    [InlineData(PrefixCachePolicy.Agent)]
+    public void TurnGrowingPastTheHeadroom_GrowsTheRetainedCache_AndReusesThePrefix(PrefixCachePolicy policy)
+    {
+        var (gen, prefix, caches) = Make(headroom: 4, growLimit: TinyQwen.Context, policy: policy);
+        using var _ = prefix;
+        var first = gen.Generate(Text(A), Opts());
+        int retained = caches[0].MaxLength;                                 // A + MaxTokens + 4 = 34
+        int[] next = [.. A, .. first.GeneratedTokenIds, .. Ids(16, 23)];    // 46 tokens: 46 + 6 > 34
+        Assert.True(next.Length + MaxTokens > retained);
+
+        var warm = gen.Generate(Text(next), Opts());
+
+        Assert.Equal(A.Length + MaxTokens - 1, warm.Timings.CachedTokenCount);  // every row the first request wrote
+        Assert.Equal(Cold(next).GeneratedTokenIds, warm.GeneratedTokenIds);
+        Assert.Single(caches);                                              // grown in place, not replaced
+        Assert.True(caches[0].MaxLength >= next.Length + MaxTokens);
+        Assert.Equal(1, prefix.EntryCount);
+    }
+
+    /// <summary>
+    /// Issue #1781 fallback: a growth the cache refuses (a device cache whose admission finds no room) leaves the request a miss with
+    /// a fresh cache, as before, and the output is still a cold prefill's. The growth was asked for: with headroom first, then exactly.
+    /// </summary>
+    [Fact]
+    public void RefusedGrowth_FallsBackToAMiss_AndIsStillCorrect()
+    {
+        var (gen, prefix, caches) = Make(headroom: 4, growLimit: 40);
+        using var _ = prefix;
+        var first = gen.Generate(Text(A), Opts());
+        int[] next = [.. A, .. first.GeneratedTokenIds, .. Ids(16, 23)];    // needs 52 > 40
+
+        var warm = gen.Generate(Text(next), Opts());
+
+        Assert.Equal(0, warm.Timings.CachedTokenCount);
+        Assert.Equal(Cold(next).GeneratedTokenIds, warm.GeneratedTokenIds);
+        Assert.Equal([56, 52], caches[0].GrowthRequests);                   // headroom target, then the exact size
+        Assert.Equal(2, caches.Count);
+    }
+
+    /// <summary>
+    /// Issue #1781 on the CPU <c>--no-paged</c> path: the server passes no headroom off Vulkan, so before the fix any next turn longer
+    /// than the first request's prompt + max tokens missed. <see cref="SimpleKvCache"/> grows, and the next turn reuses the prefix.
+    /// </summary>
+    [Fact]
+    public void HostSimpleKvCache_NextTurn_GrowsAndReusesThePrefix()
+    {
+        using var prefix = new PrefixCache(2, PrefixCachePolicy.Agent);
+        var gen = new TextGenerator(_tiny.Model, new Tok(TinyQwen.Vocab), prefixCache: prefix, prefillChunkSize: 4);
+        var first = gen.Generate(Text(A), Opts());
+        int[] next = [.. A, .. first.GeneratedTokenIds, .. Ids(16, 23)];
+
+        var warm = gen.Generate(Text(next), Opts());
+
+        Assert.Equal(A.Length + MaxTokens - 1, warm.Timings.CachedTokenCount);
+        Assert.Equal(Cold(next).GeneratedTokenIds, warm.GeneratedTokenIds);
+        Assert.Equal(1, prefix.EntryCount);
     }
 
     [Fact]
