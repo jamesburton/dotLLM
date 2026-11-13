@@ -55,13 +55,20 @@ public sealed class VulkanQwen4ExpIndexerState : IDisposable
     /// <paramref name="validLength"/> positions (layer by layer, so the transient is one layer). True when buffers were re-created: the caller MUST then drop
     /// every descriptor cache that may name the old handles. Call BEFORE recording.
     /// </summary>
-    internal bool EnsureCapacity(int positions, int validLength)
+    /// <param name="positions">Positions the forward needs.</param>
+    /// <param name="validLength">Positions whose rows and pooled blocks must survive a re-creation.</param>
+    /// <param name="headroom">
+    /// Positions of slack to leave beyond <paramref name="positions"/>, clamped to <see cref="Capacity"/> (the buffers grow whenever fewer are allocated); mirrors
+    /// <see cref="VulkanNemotronHKvCache.EnsureCapacity"/> so a prefill does not leave the indexer on the allocation edge (issue #1770).
+    /// </param>
+    internal bool EnsureCapacity(int positions, int validLength, int headroom = 0)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (positions > Capacity) throw new ArgumentOutOfRangeException(nameof(positions), $"{positions} exceeds the indexer capacity {Capacity}.");
-        if (positions <= AllocatedPositions) return false;
+        int needed = (int)Math.Min(Capacity, (long)positions + Math.Max(0, headroom));
+        if (needed <= AllocatedPositions) return false;
         int q = VulkanNemotronHKvCache.LazyGrowthQuantum;
-        int target = Math.Max(positions, AllocatedPositions + Math.Max(q, AllocatedPositions / 4));
+        int target = Math.Max(needed, AllocatedPositions + Math.Max(q, AllocatedPositions / 4));
         target = (int)Math.Min(Capacity, ((long)target + q - 1) / q * q);
         int rawBytesPerPos = _dim * (RawF16 ? 2 : 4);
         ulong rawKeep = (ulong)validLength * (ulong)rawBytesPerPos, poolKeep = (ulong)(validLength / _blockSize) * (ulong)_dim * 4;

@@ -90,6 +90,28 @@ public sealed class VulkanQwen3HybridDenseKvGrowthTests : IDisposable
     }
 
     /// <summary>
+    /// Issue #1770: a prefill ending exactly on a growth quantum must leave room for the decode token after it. Otherwise that token
+    /// re-creates every attention layer's K/V and drops every descriptor cache (60-67 ms on Tev1-4B after -p 8192).
+    /// </summary>
+    [SkippableFact]
+    public void PrefillOnTheAllocationEdge_LeavesRoomForTheFirstDecodeToken()
+    {
+        using var f = Open();
+        VulkanNemotronHKvCache.LazyGrowthQuantum = 16;
+        f.Model.ResetSequenceState();
+        using var gdn = f.Model.CreateGdnStateCache();
+        using var kv = f.Model.CreateKvCache(Window);
+        Forward(f, Tokens(32, salt: 3), 0, kv, gdn);
+        Assert.True(kv.AllocatedLength > 32, $"a 32-row prefill left {kv.AllocatedLength} positions: no room for the next token");
+
+        long bytes = kv.AllocatedBytes;
+        int invalidations = f.Model.KvBufferInvalidationsForTest;
+        Forward(f, Tokens(1, salt: 9), 32, kv, gdn);
+        Assert.Equal(bytes, kv.AllocatedBytes);
+        Assert.Equal(invalidations, f.Model.KvBufferInvalidationsForTest);
+    }
+
+    /// <summary>
     /// A prefix snapshot taken before a growth restores exactly afterwards: restoring it and forwarding the same suffix
     /// reproduces the logits of the run that never left the prefix.
     /// </summary>

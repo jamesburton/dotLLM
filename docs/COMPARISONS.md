@@ -579,4 +579,12 @@ Gaps and stale rows, each of which a reader could mistake for a current figure:
 13. **#1717 overlay decode** (OLMoE `sel32.gguf`, ~4x slower than base per the PR): the overlay file was not available locally, so only
     the base figure was replayed. **#1699 Tev1-4B IQ4_NL**, **#1685/#1701/#1691 GLM-4.5-Air REAP-82B** and the CUDA PRs (#1689 etc.) were
     not replayed in the 2026-11-09 round.
-14. **LFM3 decode after a long sliced prefill** (2.11): 24-41 tok/s vs 71 at the same depth when depth-fed; cause not investigated.
+14. **LFM3 decode after a long sliced prefill** (2.11): 24-41 tok/s vs 71 at the same depth when depth-fed. Cause found in #1741:
+    the first decode token re-created every layer's lazy K/V (fixed by #1767; #1770 also covers a sliced prefill that ends inside
+    the buffers but within one quantum of the edge). Re-measure the tg rows.
+15. **Decode right after one long prefill on the other lazy-KV Vulkan hosts** (#1770): LFM2 / LFM2-MoE (LFM2.5-24B-A2B), the dense
+    hybrids (Tev1, Bonsai-2, Qwen3.5 / OmniCoder, Qwen3.8-27B) and qwen4exp (Qwen3.8-Flash-Next, 2.7 / 2.8). Before #1770 a
+    `bench -p N -n M` whose prompt ends on a 1,024-position growth edge (and some sliced prefills) charged the first decode token a
+    full K/V re-create: +60-200 ms, which is 0.6x tok/s at `-n 16` on LFM2.5-24B-A2B at 8K. Rows to re-check: any tg figure taken
+    with no `--depth` after a prompt of 1,024 tokens or more, including the 2.8 "plain decode" row (its prompt length is not
+    recorded). Short-prompt chat-style decode rows (2.1, 2.7 tg64 after pp512) are not affected.

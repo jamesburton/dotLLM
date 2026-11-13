@@ -208,6 +208,31 @@ public sealed class VulkanQwen4ExpKvStorageTests
         finally { VulkanNemotronHKvCache.LazyGrowthQuantum = old; }
     }
 
+    /// <summary>
+    /// Issue #1770: the headroom is slack to keep, not only padding for a growth that happens anyway. A prefill run as row slices can
+    /// end inside the buffers but closer to the edge than one quantum (Tev1-4B at -p 8192: the last slice ended on 8192 of 8192
+    /// allocated), and the decode token then re-created every layer. A multi-row forward that fits but leaves less slack must grow.
+    /// </summary>
+    [SkippableFact]
+    public void LazyCache_Headroom_GrowsWhenTheForwardFitsButLeavesLessSlack()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        using var device = VulkanDevice.Create();
+        int old = VulkanNemotronHKvCache.LazyGrowthQuantum;
+        VulkanNemotronHKvCache.LazyGrowthQuantum = 8;
+        try
+        {
+            using var cache = new VulkanNemotronHKvCache(device, [0], 1, 2, 8, 100, VulkanKvStorage.F32, lazy: true);
+            Assert.True(cache.EnsureCapacity(40));
+            Assert.Equal(40, cache.AllocatedLength);
+            Assert.True(cache.EnsureCapacity(36, headroom: 8), "36 fits in 40 but leaves 4 of the 8 positions of slack asked for");
+            Assert.True(cache.AllocatedLength >= 44);
+            Assert.False(cache.EnsureCapacity(37), "the decode token after it must not regrow");
+            Assert.False(cache.EnsureCapacity(cache.AllocatedLength - 8, headroom: 8), "exactly the slack asked for: nothing to grow");
+        }
+        finally { VulkanNemotronHKvCache.LazyGrowthQuantum = old; }
+    }
+
     [SkippableTheory]
     [InlineData(VulkanKvStorage.F32)]
     [InlineData(VulkanKvStorage.F16)]
@@ -323,6 +348,32 @@ public sealed class VulkanQwen4ExpKvStorageTests
             all.Add(Q4eRig.Row(t, 0));
         }
         return all;
+    }
+
+    /// <summary>
+    /// Issue #1770 on the Qwen4-Exp host: a prefill ending exactly on a growth quantum must leave both the K/V cache and the QSA indexer
+    /// room for the decode token after it. Otherwise that token re-creates every QSA layer's buffers and drops every descriptor cache
+    /// (105-130 ms on Qwen3.8-Flash-Next IQ1_M after -p 7168). <see cref="VulkanQwen4ExpTransformerModel.CacheGrowths"/> counts forwards
+    /// that re-created either one, so a headroom given to only one of them still fails.
+    /// </summary>
+    [SkippableFact]
+    public void LazyGrowth_PrefillOnTheEdge_LeavesRoomForTheFirstDecodeToken()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var rig = new Q4eRig(SmallBudgetModel(), spvDir);
+        var ids = VulkanQwen4ExpParityTests.Ids(34, rig.Config.VocabSize, seed: 23);
+        using (new Flags(VulkanKvStorage.F32, lazy: true, quantum: 16))
+        {
+            using var st = rig.Vk.CreateState();
+            long g0 = rig.Vk.CacheGrowths;
+            using (var t = rig.Vk.Forward(ids.AsSpan(0, 32), Enumerable.Range(0, 32).ToArray(), -1, st)) { }
+            Assert.True(rig.Vk.CacheGrowths > g0, "the prefill must grow the caches");
+            Assert.True(st.OwnKvAllocatedForTests > 32, $"a 32-row prefill left {st.OwnKvAllocatedForTests} positions: no room for the next token");
+            long g1 = rig.Vk.CacheGrowths;
+            using (var t = rig.Vk.Forward(ids.AsSpan(32, 1), [32], -1, st)) { }
+            using (var t = rig.Vk.Forward(ids.AsSpan(33, 1), [33], -1, st)) { }
+            Assert.Equal(g1, rig.Vk.CacheGrowths);
+        }
     }
 
     [SkippableFact]
