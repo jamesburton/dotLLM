@@ -16,6 +16,54 @@ namespace DotLLM.ChunkReuse.Store;
 /// </remarks>
 internal static class StorePaths
 {
+    // Per async flow: a test records which directories were synced (a process-wide hook raced between parallel test classes).
+    private static readonly AsyncLocal<Action<string>?> s_directorySyncedForTest = new();
+
+    /// <summary>Test hook: called with the directory each time <see cref="SyncDirectory"/> runs (on every OS).</summary>
+    internal static Action<string>? DirectorySyncedForTest
+    {
+        get => s_directorySyncedForTest.Value;
+        set => s_directorySyncedForTest.Value = value;
+    }
+
+    /// <summary>
+    /// Flushes the directory entry of a file just renamed into <paramref name="directory"/>, so a crash cannot roll the rename back
+    /// (a stale ledger or index; the effect is only re-encoding). POSIX only: Windows has no directory fsync and NTFS journals the
+    /// rename. Best effort: a failure (a file system that refuses fsync on a directory, no libc) is ignored, as the file itself
+    /// was already flushed before the rename.
+    /// </summary>
+    public static void SyncDirectory(string directory)
+    {
+        DirectorySyncedForTest?.Invoke(directory);
+        if (OperatingSystem.IsWindows()) return;
+        try
+        {
+            int fd = NativeSync.Open(directory, NativeSync.ReadOnlyDirectory);
+            if (fd < 0) return;
+            try { _ = NativeSync.Fsync(fd); }
+            finally { _ = NativeSync.Close(fd); }
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException) { }
+    }
+
+    private static class NativeSync
+    {
+        // O_RDONLY | O_DIRECTORY: 0x10000 on Linux x86-64/arm64 (0x100000 on macOS); plain O_RDONLY (0) opens a directory on both,
+        // which is all fsync needs, so use that and keep the value portable.
+        public const int ReadOnlyDirectory = 0;
+
+#pragma warning disable SYSLIB1054, CA5392 // best-effort libc calls with blittable arguments; no marshalling source generator needed
+        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "open", SetLastError = true)]
+        public static extern int Open([System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPUTF8Str)] string path, int flags);
+
+        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fsync", SetLastError = true)]
+        public static extern int Fsync(int fd);
+
+        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "close", SetLastError = true)]
+        public static extern int Close(int fd);
+#pragma warning restore SYSLIB1054, CA5392
+    }
+
     /// <summary>Mode of a directory created by the store (owner only).</summary>
     public const UnixFileMode PrivateDirectoryMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
 
