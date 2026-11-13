@@ -100,7 +100,7 @@ public sealed unsafe class VulkanLfm2KvGrowthTests : IDisposable
         IModel api = model;
         using var state = api.CreateSequenceState();
         using var kv = model.CreateKvCache(Window);
-        using (model.Forward([1, 2, 3, 4, 5, 6, 7, 8], [0, 1, 2, 3, 4, 5, 6, 7], 0, kv, (ISsmState)state!)) { }
+        using (model.Forward([1, 2, 3, 4, 5, 6, 1, 2], [0, 1, 2, 3, 4, 5, 6, 7], 0, kv, (ISsmState)state!)) { }
         Assert.True(kv.AllocatedLength > 8, $"an 8-row prefill left {kv.AllocatedLength} positions: no room for the next token");
 
         long bytes = kv.AllocatedBytes;

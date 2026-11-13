@@ -391,7 +391,8 @@ public sealed class VulkanQwen4ExpKvStorageTests
             eager = Trace(rig.Vk, st, ids, chunks);
             Assert.Equal(rig.Vk.ContextCapacity, st.OwnKvAllocatedForTests);
         }
-        using (new Flags(VulkanKvStorage.F32, lazy: true))
+        // Quantum 8, not 16: since #1770 a multi-row forward keeps one quantum of slack, which absorbs some chunk growths at 16.
+        using (new Flags(VulkanKvStorage.F32, lazy: true, quantum: 8))
         {
             long g0 = rig.Vk.CacheGrowths;
             using var st = rig.Vk.CreateState();
