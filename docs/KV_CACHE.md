@@ -121,6 +121,8 @@ over the unforwarded row: a prompt continuing a length-stopped reply then attend
 cache before (Qwen2.5-0.5B q8_0: first-token logprob -1.137 resumed vs -1.551 cold). A cache-free split control (one prefill split
 into two forwards at any row) was flat to 1e-5, so row-count numerics played no part. Tests: `PrefixResumeUnwrittenRowTests`
 (tiny random-weight model; mutants: no clamp, clamp to `CurrentLength - 1` both fail) and `PrefixResumeParityTests` (real model).
+Since the shared clamp runs first, the `CurrentLength` term in the device branch is redundant: the "no CurrentLength clamp" mutant
+listed for `PrefixCacheReusableKvTests` above now means removing the shared clamp, not the device-branch one.
 
 ### Vulkan dense-hybrid (Bonsai 2) KV: F16 storage read in place (issue #1102)
 
