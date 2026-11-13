@@ -47,6 +47,7 @@ public static unsafe partial class MatMul
     /// <param name="quantizeRow">Quantizer used when <paramref name="inputQ"/> is null.</param>
     /// <param name="pool">Thread pool, or null for single-threaded.</param>
     /// <param name="groupTok4">Optional 4-row-group x 4-token kernel (weights decoded once for four tokens); null = per-token only.</param>
+    /// <param name="groupTok8">Optional 4-row-group x 8-token kernel, same per-element arithmetic (#1675); null = none.</param>
     [SkipLocalsInit]
     internal static void GemmR4Tiled(
         byte* repackedWeights, float* b, byte* inputQ, float* c,
@@ -55,12 +56,13 @@ public static unsafe partial class MatMul
         delegate*<byte*, byte*, float*, int, int, int, void> computeRowsInterleaved,
         delegate*<float*, byte*, int, void> quantizeRow,
         ComputeThreadPool? pool,
-        delegate*<byte*, int, byte*, int, float*, int, void> groupTok4 = null)
+        delegate*<byte*, int, byte*, int, float*, int, void> groupTok4 = null,
+        delegate*<byte*, int, byte*, int, float*, int, void> groupTok8 = null)
     {
         if (inputQ != null)
         {
             GemmR4TiledCore(repackedWeights, inputQ, c, fullGroups, tailRows, blockCount,
-                m, n, blockBytes, inputRowBytes, computeRowsInterleaved, pool, groupTok4);
+                m, n, blockBytes, inputRowBytes, computeRowsInterleaved, pool, groupTok4, groupTok8);
             return;
         }
 
@@ -73,7 +75,7 @@ public static unsafe partial class MatMul
                     quantizeRow(b + (long)t * k, scratch + (long)t * inputRowBytes, k);
 
                 GemmR4TiledCore(repackedWeights, scratch, c, fullGroups, tailRows, blockCount,
-                    m, n, blockBytes, inputRowBytes, computeRowsInterleaved, pool, groupTok4);
+                    m, n, blockBytes, inputRowBytes, computeRowsInterleaved, pool, groupTok4, groupTok8);
             }
         }
         finally
@@ -88,7 +90,8 @@ public static unsafe partial class MatMul
         int blockBytes, int inputRowBytes,
         delegate*<byte*, byte*, float*, int, int, int, void> computeRowsInterleaved,
         ComputeThreadPool? pool,
-        delegate*<byte*, int, byte*, int, float*, int, void> groupTok4 = null)
+        delegate*<byte*, int, byte*, int, float*, int, void> groupTok4 = null,
+        delegate*<byte*, int, byte*, int, float*, int, void> groupTok8 = null)
     {
         int tileGroups = Math.Max(1, ComputeTileM(blockCount * blockBytes) / 4);
 
@@ -96,7 +99,7 @@ public static unsafe partial class MatMul
         {
             GemmR4TiledRange(repackedWeights, inputQ, c, 0, fullGroups, fullGroups,
                 tailRows, blockCount, m, n, blockBytes, inputRowBytes, tileGroups,
-                doTail: true, computeRowsInterleaved, groupTok4);
+                doTail: true, computeRowsInterleaved, groupTok4, groupTok8);
             return;
         }
 
@@ -105,7 +108,7 @@ public static unsafe partial class MatMul
             RepackedWeights = repackedWeights, InputQ = inputQ, C = c,
             FullGroups = fullGroups, TailRows = tailRows, BlockCount = blockCount,
             M = m, N = n, BlockBytes = blockBytes, InputRowBytes = inputRowBytes,
-            TileGroups = tileGroups, ComputeRowsInterleaved = computeRowsInterleaved, GroupTok4 = groupTok4,
+            TileGroups = tileGroups, ComputeRowsInterleaved = computeRowsInterleaved, GroupTok4 = groupTok4, GroupTok8 = groupTok8,
         };
         pool.Dispatch((nint)(&ctx), &GemmR4TiledWorker);
     }
@@ -120,7 +123,8 @@ public static unsafe partial class MatMul
         int startGroup, int endGroup, int fullGroups, int tailRows, int blockCount,
         int m, int n, int blockBytes, int inputRowBytes, int tileGroups, bool doTail,
         delegate*<byte*, byte*, float*, int, int, int, void> computeRowsInterleaved,
-        delegate*<byte*, int, byte*, int, float*, int, void> groupTok4 = null)
+        delegate*<byte*, int, byte*, int, float*, int, void> groupTok4 = null,
+        delegate*<byte*, int, byte*, int, float*, int, void> groupTok8 = null)
     {
         int groupBytes = 4 * blockCount * blockBytes;
 
@@ -130,6 +134,17 @@ public static unsafe partial class MatMul
             byte* tileWeights = repackedWeights + (long)gStart * groupBytes;
 
             int t = 0;
+            if (groupTok8 != null)
+            {
+                // Eight tokens per weight decode (#1675): same per-element arithmetic as the 4-token and per-token kernels.
+                for (; t + 8 <= n; t += 8)
+                {
+                    for (int g = 0; g < gCount; g++)
+                        groupTok8(tileWeights + (long)g * groupBytes, blockCount,
+                            inputQ + (long)t * inputRowBytes, inputRowBytes,
+                            c + (long)t * m + (gStart + g) * 4, m);
+                }
+            }
             if (groupTok4 != null)
             {
                 // Four tokens per weight decode: the kernel unpacks each row's scales/nibbles once and
@@ -184,6 +199,7 @@ public static unsafe partial class MatMul
         public int NextGroup;
         public delegate*<byte*, byte*, float*, int, int, int, void> ComputeRowsInterleaved;
         public delegate*<byte*, int, byte*, int, float*, int, void> GroupTok4;
+        public delegate*<byte*, int, byte*, int, float*, int, void> GroupTok8;
     }
 
     /// <summary>
@@ -208,7 +224,7 @@ public static unsafe partial class MatMul
 
             GemmR4TiledRange(ctx.RepackedWeights, ctx.InputQ, ctx.C, startGroup, endGroup,
                 ctx.FullGroups, ctx.TailRows, ctx.BlockCount, ctx.M, ctx.N, ctx.BlockBytes,
-                ctx.InputRowBytes, ctx.TileGroups, doTail: threadIdx == 0, ctx.ComputeRowsInterleaved, ctx.GroupTok4);
+                ctx.InputRowBytes, ctx.TileGroups, doTail: threadIdx == 0, ctx.ComputeRowsInterleaved, ctx.GroupTok4, ctx.GroupTok8);
             return;
         }
 
@@ -218,7 +234,7 @@ public static unsafe partial class MatMul
         // element is still produced by exactly one kernel call, so the arithmetic stays thread-count and schedule independent.
         if (threadIdx == 0 && ctx.TailRows > 0)
             GemmR4TiledRange(ctx.RepackedWeights, ctx.InputQ, ctx.C, 0, 0, ctx.FullGroups, ctx.TailRows, ctx.BlockCount,
-                ctx.M, ctx.N, ctx.BlockBytes, ctx.InputRowBytes, ctx.TileGroups, doTail: true, ctx.ComputeRowsInterleaved, ctx.GroupTok4);
+                ctx.M, ctx.N, ctx.BlockBytes, ctx.InputRowBytes, ctx.TileGroups, doTail: true, ctx.ComputeRowsInterleaved, ctx.GroupTok4, ctx.GroupTok8);
 
         int chunk = Math.Clamp(ctx.FullGroups / (threadCount * 8), Math.Min(4, ctx.TileGroups), ctx.TileGroups);
         while (true)
@@ -228,7 +244,7 @@ public static unsafe partial class MatMul
             int end = Math.Min(start + chunk, ctx.FullGroups);
             GemmR4TiledRange(ctx.RepackedWeights, ctx.InputQ, ctx.C, start, end,
                 ctx.FullGroups, ctx.TailRows, ctx.BlockCount, ctx.M, ctx.N, ctx.BlockBytes,
-                ctx.InputRowBytes, ctx.TileGroups, doTail: false, ctx.ComputeRowsInterleaved, ctx.GroupTok4);
+                ctx.InputRowBytes, ctx.TileGroups, doTail: false, ctx.ComputeRowsInterleaved, ctx.GroupTok4, ctx.GroupTok8);
         }
     }
 
@@ -287,7 +303,8 @@ public static unsafe partial class MatMul
         => GemmR4Tiled(repackedWeights, b, inputQ, c, fullGroups, tailRows, superBlockCount, m, k, n,
             Q4_K_BlockBytes, superBlockCount * Q8_K_BlockBytes,
             &ComputeRowsQ4_KInterleaved, &QuantizeF32ToQ8_K, pool,
-            FastKQuantIsa ? &Rows4Tokens4 : null);
+            FastKQuantIsa ? &Rows4Tokens4 : null,
+            FastKQuantIsa && KQuantTile ? &Q4KRows4Tokens8 : null);
 
     /// <inheritdoc cref="GemmR4Tiled"/>
     [SkipLocalsInit]

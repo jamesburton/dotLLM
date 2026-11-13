@@ -7,18 +7,29 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Cpu.Kernels;
 
 /// <summary>
-/// In-process timing of the R4 tiled Q4_K prefill GEMM on the TwIL-8B gate/up shape (#1675). Run with <c>DOTLLM_Q4K_BENCH=1</c>.
-/// Diagnostic only: prints ms per call and per-thread GMAC/s over a thread sweep; indicative on a contended box.
+/// In-process timing of the R4 tiled K-quant prefill GEMM on TwIL-8B shapes (#1675). Run with <c>DOTLLM_Q4K_BENCH=1</c>.
+/// Diagnostic only: prints ms per call and GMAC/s; indicative on a contended box.
 /// </summary>
+/// <remarks>
+/// Knobs: <c>DOTLLM_Q4K_M</c> / <c>DOTLLM_Q4K_K</c> (shape, default the gate/up shape 12800 x 4096), <c>DOTLLM_Q4K_N</c> (tokens, 512),
+/// <c>DOTLLM_Q4K_QUANT</c> (<c>Q4_K</c> or <c>Q6_K</c>), <c>DOTLLM_Q4K_THREADS</c> (comma list, default 1,16).
+/// Arms, interleaved per rep: <c>base</c> = the current 4-row x 4-token kernel; <c>tile</c> = the #1675 8-row tile (when the quant has one).
+/// </remarks>
 public sealed unsafe class Q4KGemmTimingTests
 {
     [SkippableFact]
     [Trait("Category", "Benchmark")]
-    public void Q4K_Gemm_ThreadSweep_TwilGateUpShape()
+    public void KQuant_Gemm_TwilShapes()
     {
         Skip.If(Environment.GetEnvironmentVariable("DOTLLM_Q4K_BENCH") != "1", "set DOTLLM_Q4K_BENCH=1");
         int m = int.Parse(Environment.GetEnvironmentVariable("DOTLLM_Q4K_M") ?? "12800");
-        const int k = 4096, n = 512, blockBytes = 144, q8Bytes = 292;
+        int k = int.Parse(Environment.GetEnvironmentVariable("DOTLLM_Q4K_K") ?? "4096");
+        int n = int.Parse(Environment.GetEnvironmentVariable("DOTLLM_Q4K_N") ?? "512");
+        string quant = Environment.GetEnvironmentVariable("DOTLLM_Q4K_QUANT") ?? "Q4_K";
+        int[] threadList = (Environment.GetEnvironmentVariable("DOTLLM_Q4K_THREADS") ?? "1,16").Split(',').Select(int.Parse).ToArray();
+        bool q6 = quant == "Q6_K";
+        int blockBytes = q6 ? 210 : 144;
+        const int q8Bytes = 292;
         int sb = k / 256;
         var rng = new Random(1675);
         byte* w = (byte*)NativeMemory.AlignedAlloc((nuint)((long)m * sb * blockBytes), 64);
@@ -30,36 +41,51 @@ public sealed unsafe class Q4KGemmTimingTests
             for (long i = 0; i < (long)m * sb * blockBytes; i++) w[i] = (byte)rng.Next(256);
             for (long b = 0; b < (long)m * sb; b++)
             {
-                *(Half*)(w + b * blockBytes) = (Half)(float)(rng.NextDouble() * 0.02 + 0.001);
-                *(Half*)(w + b * blockBytes + 2) = (Half)(float)(rng.NextDouble() * 0.02 + 0.001);
+                if (q6)
+                {
+                    *(Half*)(w + b * blockBytes + 208) = (Half)(float)(rng.NextDouble() * 0.002 + 0.0001);
+                }
+                else
+                {
+                    *(Half*)(w + b * blockBytes) = (Half)(float)(rng.NextDouble() * 0.02 + 0.001);
+                    *(Half*)(w + b * blockBytes + 2) = (Half)(float)(rng.NextDouble() * 0.02 + 0.001);
+                }
             }
             for (int t = 0; t < n; t++)
             {
                 for (int i = 0; i < k; i++) src[i] = (float)((rng.NextDouble() - 0.5) * 4);
                 MatMul.QuantizeF32ToQ8_K(src, x + (long)t * sb * q8Bytes, k);
             }
-            foreach (int threads in new[] { 1, 4, 8, 12, 16, 24, 32 })
+
+            bool hasTile = MatMul.KQuantTileAvailable(q6);
+            string[] arms = hasTile ? new[] { "base", "tile" } : new[] { "base" };
+            bool savedTile = MatMul.KQuantTile;
+            foreach (int threads in threadList)
             {
                 ComputeThreadPool? pool = threads > 1 ? new ComputeThreadPool(threads) : null;
                 try
                 {
-                    MatMul.GemmR4TiledQ4_K(w, null, x, c, m / 4, m % 4, sb, m, k, n, pool); // warm
-                    double[] best = { double.MaxValue, double.MaxValue };
-                    for (int r = 0; r < 6; r++)
+                    var best = new double[arms.Length];
+                    Array.Fill(best, double.MaxValue);
+                    int reps = threads == 1 ? 3 : 6;
+                    for (int r = -1; r < reps; r++)
                     {
-                        for (int arm = 0; arm < 2; arm++) // interleaved: 0 = static partition, 1 = dynamic chunks
+                        for (int arm = 0; arm < arms.Length; arm++)
                         {
-                            MatMul.ForceStaticGemmPartition = arm == 0;
+                            MatMul.KQuantTile = arms[arm] == "tile";
                             var sw = Stopwatch.StartNew();
-                            MatMul.GemmR4TiledQ4_K(w, null, x, c, m / 4, m % 4, sb, m, k, n, pool);
-                            best[arm] = Math.Min(best[arm], sw.Elapsed.TotalMilliseconds);
+                            if (q6) MatMul.GemmR4TiledQ6_K(w, null, x, c, m / 4, m % 4, sb, m, k, n, pool);
+                            else MatMul.GemmR4TiledQ4_K(w, null, x, c, m / 4, m % 4, sb, m, k, n, pool);
+                            if (r >= 0) best[arm] = Math.Min(best[arm], sw.Elapsed.TotalMilliseconds);
                         }
                     }
-                    MatMul.ForceStaticGemmPartition = false;
                     double gmac = (double)m * k * n / 1e9;
-                    Console.WriteLine($"[q4k-bench] m={m} threads={threads,2} static={best[0],7:F1} ms ({gmac / best[0] * 1000:F0} GMAC/s)  dynamic={best[1],7:F1} ms ({gmac / best[1] * 1000:F0} GMAC/s)");
+                    string line = $"[kq-bench] {quant} m={m} k={k} n={n} threads={threads,2}";
+                    for (int arm = 0; arm < arms.Length; arm++)
+                        line += $"  {arms[arm]}={best[arm],8:F1} ms ({gmac / best[arm] * 1000:F0} GMAC/s)";
+                    Console.WriteLine(line);
                 }
-                finally { pool?.Dispose(); }
+                finally { pool?.Dispose(); MatMul.KQuantTile = savedTile; }
             }
         }
         finally { NativeMemory.AlignedFree(w); NativeMemory.AlignedFree(x); NativeMemory.AlignedFree(src); NativeMemory.AlignedFree(c); }
