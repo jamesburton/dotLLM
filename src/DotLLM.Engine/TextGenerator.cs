@@ -1696,8 +1696,11 @@ public sealed partial class TextGenerator
                 // Verify the cache is large enough for the new prompt + generation.
                 // Reusing a cache that can only fit the prompt but not the requested generation
                 // causes silent truncation once pos >= MaxLength in the decode loop.
-                int requiredSize = promptLen + maxTokens;
-                if (entry.KvCache.MaxLength >= requiredSize)
+                // A cache too small for this request grows (issue #1781): an agent turn that adds a large tool result outgrows any
+                // fixed headroom, and the miss would re-prefill the whole conversation. The cut above already holds the cache at the
+                // match, so a growth copies only the reused rows. Capped at the context window, as a miss's allocation is.
+                int requiredSize = Math.Min(promptLen + maxTokens, _model.Config.MaxSequenceLength);
+                if (EnsureLivePrefixKvCapacity(entry.KvCache, requiredSize, matchedTokens))
                 {
                     // Prefill is about to overwrite rows matchedTokens.. of this cache. Narrow the entry to the rows that
                     // stay valid BEFORE any write, so a failed or cancelled request cannot leave it advertising a token
@@ -1706,7 +1709,8 @@ public sealed partial class TextGenerator
                     return (entry.KvCache, matchedTokens, false);
                 }
 
-                // Cache too small — fall through to allocate fresh
+                // Cache too small and it could not grow: fall through to allocate fresh. The entry now holds only the matched rows.
+                _prefixCache.Narrow(entry, matchedTokens);
             }
             cacheMiss:
 
@@ -2023,6 +2027,25 @@ public sealed partial class TextGenerator
         if (snapshot)
             snapshotAt = boundary;
         return (kv, 0, true);
+    }
+
+    /// <summary>
+    /// True when a live prefix-cache hit's <paramref name="kv"/> holds <paramref name="needed"/> positions, growing it when needed
+    /// (issue #1781): first to <paramref name="needed"/> plus the prefix-cache headroom, so the conversation's next turn fits too, then
+    /// to exactly <paramref name="needed"/>. A cache that cannot grow (the <see cref="Core.Attention.IKvCache.TryGrowTo"/> default) or
+    /// whose growth is refused (a device cache with no room in free device memory) returns false and the refusal is logged; the
+    /// caller then misses, the behaviour before #1781.
+    /// </summary>
+    private bool EnsureLivePrefixKvCapacity(Core.Attention.IKvCache kv, int needed, int matchedTokens)
+    {
+        if (kv.MaxLength >= needed) return true;
+        int target = (int)Math.Min(_model.Config.MaxSequenceLength, (long)needed + _prefixCacheHeadroomTokens);
+        if (kv.TryGrowTo(target) || (target > needed && kv.TryGrowTo(needed)))
+            return true;
+        Console.Error.WriteLine(
+            $"[prefix-cache] could not grow the cached KV ({kv.GetType().Name}) from {kv.MaxLength} to {needed} positions; " +
+            $"re-prefilling its {matchedTokens} matching tokens (issue #1781).");
+        return false;
     }
 
     /// <summary>
