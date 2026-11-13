@@ -132,8 +132,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Prefix-cache retention policy (issue #1654).</summary>
         [CommandOption("--prompt-cache-policy")]
-        [Description("Prefix-cache retention policy: lru (default) or agent (a conversation survives about its own length of other prompt tokens, " +
-                     "side requests run without truncating it, recurrent models checkpoint at the last user message and after the reply). Env DOTLLM_PREFIX_POLICY.")]
+        [Description("Prefix-cache retention policy: agent (default; a conversation survives about its own length of other prompt tokens, " +
+                     "side requests run without truncating it, recurrent models checkpoint at the last user message and after the reply) or lru (least recently used; any hit may truncate an entry). Env DOTLLM_PREFIX_POLICY.")]
         public string? PromptCachePolicy { get; set; }
 
         /// <summary>Disable warm-up (enabled by default).</summary>
