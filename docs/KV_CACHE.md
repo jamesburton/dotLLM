@@ -117,11 +117,34 @@ rows valid only until a forward runs on a different cache otherwise), `CanTrunca
 their margin) and is large enough for the next request. `TextGenerator.ResolveKvCache` then clamps the match to
 `min(common prefix, cache.CurrentLength, promptLen - 1)` and `Rollback`s. The `CurrentLength` clamp matters: the stored sequence ends with
 the last sampled token, which was never forwarded, so its row does not exist. The `promptLen - 1` clamp keeps one token to prefill.
-`StoreInPrefixCache` retains only reusable cache types (others were retained until evicted without ever matching). Device caches cannot
-grow in place, so `prefixCacheHeadroomTokens` (1,024 on Vulkan) sizes the retained allocation for the next turn. Unsafe hosts (sinks,
+`StoreInPrefixCache` retains only reusable cache types (others were retained until evicted without ever matching).
+`prefixCacheHeadroomTokens` (1,024 on Vulkan) sizes the retained allocation for the next turn. Unsafe hosts (sinks,
 recurrent state, non-exclusive storage, TurboQuant/MLA/pipeline caches) take a miss. Tests: `PrefixCacheReusableKvTests` (CPU model behind a
 delegating cache; mutants: no CurrentLength clamp, ignored exclusivity flag, ignored `CanTruncateTo`, wrong cached count, no cap, no headroom
 all fail) and `VulkanPrefixReuseTests` (greedy continuation equals a cold prefill on the real model).
+
+**A turn that outgrows the entry grows it (issue #1781).** Before #1781, a hit whose cache was smaller than `promptLen + maxTokens` fell
+through to a miss. An agent turn that adds a tool result larger than the headroom then re-prefilled the whole conversation. On CPU
+`--no-paged` that happened on almost every turn, because the server passes no headroom off Vulkan. Now `ResolveKvCache` cuts the hit back to
+the match and then calls `IKvCache.TryGrowTo`: first to the requirement plus the headroom, then to exactly the requirement, both capped at
+the context window. On success it prefills only the suffix. A refusal is logged (`[prefix-cache] could not grow ...`) and keeps the old miss.
+
+- **`SimpleKvCache`.** Grows on the host (#1025).
+- **`VulkanKvCache.TryGrowTo`.**
+  - Works layer by layer: it allocates larger K and V, copies the `CurrentLength` rows device to device in the cache's own format (no
+    widening; sizes come from `RowBytes`, so Q8_0 rows are sized right), and frees the old buffers. The extra memory in flight is one old
+    layer's K and V.
+  - Before allocating, it admits the growth plus that in-flight memory against `UsableCapacityBytes - ResidentLiveBytes - other processes`.
+    On UMA an allocation past the OS limit succeeds and the next submit loses the device. Out-of-memory errors are caught too.
+  - Freed handles leave the descriptor caches through the device destroy log (#467).
+  - Caches with compact sliding windows do not grow.
+- **No growth path.**
+  - `VulkanQuantizedKvCache` keeps the interface default: its F32 dequant scratch is sized by `maxSeqLen`, a #1107 expansion not worth growing.
+  - CUDA dense caches are never retained by this `PrefixCache`, and CUDA hybrids already grow on the recurrent-prefix path (#1080/#1093).
+- **Tests.**
+  - `PrefixCacheReusableKvTests` (`TurnGrowingPastTheHeadroom_*`, `RefusedGrowth_*`, `HostSimpleKvCache_NextTurn_*`).
+  - `VulkanKvCacheGrowthTests`: rows kept bit-exactly in F32 and F16; admission refusal; greedy identity on Qwen2.5-0.5B across a grown
+    turn and a refused one.
 
 The `CurrentLength` clamp applies to **every** live entry, not just device caches (issue #1702). The host `SimpleKvCache` and
 `PagedKvCache` branches used to call `SetCurrentLength(match)`, which only checks the cache's capacity and so can *extend* the cache
