@@ -481,7 +481,10 @@ public sealed unsafe partial class VulkanLfm2MoeTransformerModel : IModel
         bool resized = _host.Q4EnsureCapacity(T);
         resized |= EnsureDense(T);
         if (allRows) resized |= EnsureMultiRow(T, V);
-        if (VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch))
+        // A multi-row forward grows with a quantum of headroom so the decode token after a prefill ending on the allocation edge does not
+        // re-create every layer's K/V and rebuild all descriptors (issues #1741, #1770).
+        if (VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch,
+                growthHeadroom: VulkanNemotronHKvCache.ForwardGrowthHeadroom(T)))
         {
             KvBufferInvalidationsForTest++;
             resized = true;

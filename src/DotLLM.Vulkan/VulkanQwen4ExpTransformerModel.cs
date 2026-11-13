@@ -295,13 +295,16 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
 
     /// <summary>
     /// Grows the lazily allocated K/V cache and indexer state of a sequence to hold <paramref name="positions"/> positions (before any recording), and
-    /// drops every descriptor cache that could name the freed buffers. True when anything was re-created.
+    /// drops every descriptor cache that could name the freed buffers. True when anything was re-created. A multi-row forward grows both with
+    /// a quantum of headroom (<paramref name="rows"/> &gt; 1), so the decode token after a prefill that ends on the allocation edge does not
+    /// re-create them (issue #1770).
     /// </summary>
-    private bool EnsureContext(VulkanNemotronHKvCache kv, VulkanQwen4ExpSequenceState state, int positions)
+    private bool EnsureContext(VulkanNemotronHKvCache kv, VulkanQwen4ExpSequenceState state, int positions, int rows)
     {
         bool grew;
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        try { grew = kv.EnsureCapacity(positions) | state.Indexer.EnsureCapacity(positions, state.Length); }
+        int headroom = VulkanNemotronHKvCache.ForwardGrowthHeadroom(rows);
+        try { grew = kv.EnsureCapacity(positions, headroom) | state.Indexer.EnsureCapacity(positions, state.Length, headroom); }
         catch (Interop.VulkanException e) when (e.ErrorCode is -2 or -1)   // out of device / host memory
         {
             throw new InvalidOperationException(
@@ -515,7 +518,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
 
         if (kv.Storage == VulkanKvStorage.F16 && !VulkanQwen4ExpQsa.Enabled)
             throw new NotSupportedException("An F16 KV cache is read only by the QSA gather kernel; DOTLLM_VK_QWEN4EXP_QSA=0 cannot be combined with DOTLLM_VK_QWEN4EXP_KV=f16.");
-        EnsureContext(kv, state, state.Length + T);   // lazy K/V + indexer growth (#437)
+        EnsureContext(kv, state, state.Length + T, T);   // lazy K/V + indexer growth (#437)
 
         bool resized = _core.Q4EnsureCapacity(T);
         EnsureScratch(T);
