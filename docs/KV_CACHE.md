@@ -115,6 +115,15 @@ recurrent state, non-exclusive storage, TurboQuant/MLA/pipeline caches) take a m
 delegating cache; mutants: no CurrentLength clamp, ignored exclusivity flag, ignored `CanTruncateTo`, wrong cached count, no cap, no headroom
 all fail) and `VulkanPrefixReuseTests` (greedy continuation equals a cold prefill on the real model).
 
+The `CurrentLength` clamp applies to **every** live entry, not just device caches (issue #1702). The host `SimpleKvCache` and
+`PagedKvCache` branches used to call `SetCurrentLength(match)`, which only checks the cache's capacity and so can *extend* the cache
+over the unforwarded row: a prompt continuing a length-stopped reply then attended to a stale row from whatever request used that
+cache before (Qwen2.5-0.5B q8_0: first-token logprob -1.137 resumed vs -1.551 cold). A cache-free split control (one prefill split
+into two forwards at any row) was flat to 1e-5, so row-count numerics played no part. Tests: `PrefixResumeUnwrittenRowTests`
+(tiny random-weight model; mutants: no clamp, clamp to `CurrentLength - 1` both fail) and `PrefixResumeParityTests` (real model).
+Since the shared clamp runs first, the `CurrentLength` term in the device branch is redundant: the "no CurrentLength clamp" mutant
+listed for `PrefixCacheReusableKvTests` above now means removing the shared clamp, not the device-branch one.
+
 ### Vulkan dense-hybrid (Bonsai 2) KV: F16 storage read in place (issue #1102)
 
 `VulkanQwen3HybridDenseTransformerModel` (Bonsai 2, Qwen3.5 / 3.6 dense hybrids) keeps its KV in a lazy, growable
