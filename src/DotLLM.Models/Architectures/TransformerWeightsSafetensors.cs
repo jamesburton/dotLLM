@@ -17,12 +17,11 @@ namespace DotLLM.Models.Architectures;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Stored F32 tensors are wired as zero-copy <c>nint</c> handles into the
-/// mmap view. BF16 tensors are upcast into 64-byte-aligned
-/// <see cref="NativeMemory.AlignedAlloc"/> scratch (a copy-at-load cost, but
-/// the only way to feed existing F32 SIMD kernels). Any owned scratch
-/// allocations are tracked by <see cref="TransformerWeights"/> and released
-/// by its <see cref="TransformerWeights.Dispose"/>.
+/// Dense F32, F16 and BF16 tensors are wired as zero-copy <c>nint</c> handles
+/// into the mmap view. Explicit F32-only consumers (including fused splits,
+/// MoE and MLA) still request converted scratch. Those owned allocations
+/// are tracked by <see cref="TransformerWeights"/> and released by
+/// <see cref="TransformerWeights.Dispose"/>.
 /// </para>
 /// <para>
 /// <b>tie_word_embeddings.</b> When the HF config declares tied embeddings
