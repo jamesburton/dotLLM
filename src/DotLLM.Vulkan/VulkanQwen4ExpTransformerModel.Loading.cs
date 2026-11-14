@@ -294,6 +294,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             // #880: allocate the per-forward scratch for the planned row count NOW, so (a) the post-upload check below counts it and (b) no
             // forward up to that size has to grow it after the weights fill the heap (a small-then-larger call order lost the device).
             int plannedRows = Qwen4ExpResidencyPlan.PlannedRows(kvCapacity);
+            long liveBeforeScratch = device.LiveBytesTotal();   // #1791: the row-scaled scratch allocated below is measured, not estimated
             try { core.Q4EnsureCapacity(plannedRows); }
             catch (InvalidOperationException e) when (e.InnerException is Interop.VulkanException)
             {
@@ -321,6 +322,24 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             // #880: re-check after the upload. Another process may have grown while we were loading; surface it here with numbers
                 // instead of letting the first forward end in VK_ERROR_DEVICE_LOST.
                 var after = otherPressureProbe is not null ? otherPressureProbe() : device.ReadOtherProcessPressure();
+
+                // #1791: widen the scratch to 2048 rows when free device memory admits it. The extra is the MEASURED live-byte cost of the
+                // base scratch just allocated (core forward state + the model's own; both linear in rows) scaled to the added rows, plus the
+                // PLE row buffers (exact by their allocation formula; allocated before the measurement window).
+                long scratchBaseBytes = device.LiveBytesTotal() - liveBeforeScratch;
+                int wideRows = Qwen4ExpResidencyPlan.WidePlannedRows;
+                long extraBytes = plannedRows > 0 && wideRows > plannedRows
+                    ? scratchBaseBytes * (wideRows - plannedRows) / plannedRows + (pleGpu?.RowBytes ?? 0) * (wideRows - plannedRows)
+                    : 0;
+                var (rows, why) = slots > 0
+                    ? (plannedRows, "expert tiering runs single-row forwards")
+                    : Qwen4ExpResidencyPlan.ChoosePlannedRows(Qwen4ExpResidencyPlan.PlannedRowsOverride(), kvCapacity, plan.BudgetBytes,
+                        device.LiveBytesTotal(), after?.OtherBytes ?? plan.OtherProcessBytes, plan.ReservedContextBytes, extraBytes);
+                long liveBeforeWiden = device.LiveBytesTotal();
+                model.SetPlannedRows(rows, why);
+                long widened = device.LiveBytesTotal() - liveBeforeWiden;
+                Console.Error.WriteLine($"[dotLLM] qwen4exp planned rows per forward: {rows} ({why}); base {plannedRows}-row scratch measured " +
+                                        $"{scratchBaseBytes / (double)(1L << 20):F0} MiB" + (widened > 0 ? $", widening added {widened / (double)(1L << 20):F0} MiB" : "") + ".");
                 if (after is not null)
                 {
                     long ours = device.LiveBytesTotal();

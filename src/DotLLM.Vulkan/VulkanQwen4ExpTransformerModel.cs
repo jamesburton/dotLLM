@@ -232,6 +232,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
         VulkanQwen4ExpPleGpu? pleGpu = null)
     {
         _pleGpu = pleGpu;
+        _plannedRows = Qwen4ExpResidencyPlan.PlannedRows(kvCapacity);   // what the loader allocated first; SetPlannedRows may widen it
         _qsa = qsa;
         _hostEmbedding = hostEmbedding;
         var ed = gguf.TensorsByName[Qwen4ExpTensors.TokenEmbd];
@@ -453,7 +454,27 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
     /// many rows at load. A longer call (a whole perplexity window, an unchunked prompt) is split into chunks of this size, which equals a chunked prefill
     /// (verified bit-for-bit class: relL2 3e-7) instead of growing the scratch past the resident-memory wall after the weights filled it.
     /// </summary>
-    public int MaxRowsPerForward => _tier is not null ? 1 : Qwen4ExpResidencyPlan.PlannedRows(_kvCapacity);
+    public int MaxRowsPerForward => _tier is not null ? 1 : _plannedRows;
+
+    /// <summary>Rows the per-forward scratch was allocated for at load (#1791: 2048 when free device memory admitted it, else 1024, or the override).</summary>
+    private int _plannedRows;
+
+    /// <summary>Why <see cref="MaxRowsPerForward"/> has its value (logged at load).</summary>
+    internal string? PlannedRowsReason { get; private set; }
+
+    /// <summary>
+    /// Load time only (#1791): sizes every row-scaled scratch (core forward state, the model's own scratch, the PLE row buffers) for
+    /// <paramref name="rows"/> rows. Each buffer set is released before its replacement is allocated, so growing never holds both.
+    /// </summary>
+    internal void SetPlannedRows(int rows, string reason)
+    {
+        _pleGpu?.GrowRows(_device, rows);
+        _core.Q4EnsureCapacity(rows);
+        EnsureScratch(rows);
+        _core.Q4InvalidateCaches();
+        _plannedRows = rows;
+        PlannedRowsReason = reason;
+    }
 
     private ITensor ForwardChunked(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, VulkanQwen4ExpSequenceState state,
                                    IKvCache? kvCache, bool lastTokenLogitsOnly, bool allRows, int cap)

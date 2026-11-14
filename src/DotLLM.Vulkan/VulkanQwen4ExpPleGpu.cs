@@ -20,35 +20,56 @@ internal sealed class VulkanQwen4ExpPleGpu : IDisposable
     /// Largest row count handled: the model's planned rows per forward (decode 1, MTP verify up to 8, prefill chunks up to 1024 by default).
     /// A longer forward is chunked by the caller, so every chunk fits. The scratch is sized once at load (the heap is full of weights afterwards).
     /// </summary>
-    public int MaxRows { get; }
+    public int MaxRows { get; private set; }
 
     public VulkanDevice.Buffer KeyW { get; }
     public VulkanDevice.Buffer ValueW { get; }
     /// <summary>Gathered table rows, <c>[MaxRows, EmbDim]</c> F32, host-written before the submit.</summary>
-    public VulkanDevice.Buffer Emb { get; }
+    public VulkanDevice.Buffer Emb { get; private set; } = null!;
     /// <summary>Raw key projection <c>[MaxRows, KeyDim]</c>, host-readable (cached).</summary>
-    public VulkanDevice.Buffer KeyOut { get; }
+    public VulkanDevice.Buffer KeyOut { get; private set; } = null!;
     /// <summary>Value projection <c>[MaxRows, ValueDim]</c>, host-readable (cached).</summary>
-    public VulkanDevice.Buffer ValueOut { get; }
+    public VulkanDevice.Buffer ValueOut { get; private set; } = null!;
     /// <summary>Copy of the residual after the layer before the PLE layer, host-readable (cached).</summary>
-    public VulkanDevice.Buffer ResidualOut { get; }
+    public VulkanDevice.Buffer ResidualOut { get; private set; } = null!;
     /// <summary>The corrected residual, host-written and copied back into the device residual.</summary>
-    public VulkanDevice.Buffer ResidualIn { get; }
+    public VulkanDevice.Buffer ResidualIn { get; private set; } = null!;
     public int EmbDim { get; }
     public int KeyDim { get; }
     public int ValueDim { get; }
     public long Bytes { get; }
+    private readonly int _residualRowFloats;
+
+    /// <summary>Bytes of per-row scratch (the five row buffers) per planned row.</summary>
+    public long RowBytes => ((long)EmbDim + KeyDim + ValueDim + 2L * _residualRowFloats) * 4;
 
     private VulkanQwen4ExpPleGpu(VulkanDevice.Buffer keyW, VulkanDevice.Buffer valueW, int embDim, int keyDim, int valueDim, int residualRowFloats, long bytes,
         VulkanDevice device, int maxRows)
     {
-        MaxRows = maxRows;
         KeyW = keyW; ValueW = valueW; EmbDim = embDim; KeyDim = keyDim; ValueDim = valueDim; Bytes = bytes;
-        Emb = device.Allocate((long)MaxRows * embDim * 4);
-        KeyOut = device.AllocateHostReadback((long)MaxRows * keyDim * 4);
-        ValueOut = device.AllocateHostReadback((long)MaxRows * valueDim * 4);
-        ResidualOut = device.AllocateHostReadback((long)MaxRows * residualRowFloats * 4);
-        ResidualIn = device.Allocate((long)MaxRows * residualRowFloats * 4);
+        _residualRowFloats = residualRowFloats;
+        AllocateRows(device, maxRows);
+    }
+
+    private void AllocateRows(VulkanDevice device, int maxRows)
+    {
+        MaxRows = maxRows;
+        Emb = device.Allocate((long)MaxRows * EmbDim * 4);
+        KeyOut = device.AllocateHostReadback((long)MaxRows * KeyDim * 4);
+        ValueOut = device.AllocateHostReadback((long)MaxRows * ValueDim * 4);
+        ResidualOut = device.AllocateHostReadback((long)MaxRows * _residualRowFloats * 4);
+        ResidualIn = device.Allocate((long)MaxRows * _residualRowFloats * 4);
+    }
+
+    /// <summary>
+    /// Re-creates the row buffers for <paramref name="maxRows"/> rows (#1791: load time only, before any forward; frees the old buffers first,
+    /// so there is no transient double allocation). The caller drops every cached descriptor set afterwards.
+    /// </summary>
+    public void GrowRows(VulkanDevice device, int maxRows)
+    {
+        if (maxRows <= MaxRows) return;
+        Emb.Dispose(); KeyOut.Dispose(); ValueOut.Dispose(); ResidualOut.Dispose(); ResidualIn.Dispose();
+        AllocateRows(device, maxRows);
     }
 
     /// <summary>Uploads the two projections (exact F32) and allocates the scratch.</summary>
