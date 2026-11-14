@@ -56,6 +56,9 @@ public sealed class VulkanF16KvAttentionKernelTests
     [InlineData(333, 32, 4, 128, 332, true)]    // the largest group one grouped workgroup serves (8)
     [InlineData(8200, 96, 8, 128, 8199, true)]  // #1612 glm4moe: group 12 = two 6-head sub-groups per KV head
     [InlineData(1000, 18, 2, 64, 999, true)]    // group 9 = sub-groups of 5 + 4 (ragged second sub-group)
+    [InlineData(4100, 32, 8, 128, 4099, false)] // #1686 Llama-3.1-8B / Qwen3-4B / Mistral-7B dense F16 host: group 4 over 8 KV heads
+    [InlineData(4100, 32, 8, 128, 4099, true)]
+    [InlineData(2049, 28, 4, 128, 2048, true)]  // #1686 Qwen2.5-7B: group 7 (not a power of two), ragged last split
     public void SplitKv_Decode_ReadsF16InPlace(int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset, bool gqa)
     {
         Assert.True(VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads));

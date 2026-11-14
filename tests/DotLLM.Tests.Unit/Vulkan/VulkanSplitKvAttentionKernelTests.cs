@@ -106,8 +106,25 @@ public class VulkanSplitKvAttentionKernelTests
     [SkippableFact]
     public void Decode_Gqa16_TwoFullSubGroups()
     {
-        // Group 16 = two full 8-head sub-groups over 2 KV heads (the Qwen3.5/3.6 MoE full-attention shape).
+        // Group 16 = two full 8-head sub-groups over 2 KV heads (the nemotron_h_moe Lightning full-attention shape, #1686).
         RunOne(seqKv: 3000, numHeads: 32, numKvHeads: 2, headDim: 128, positionOffset: 2999);
+    }
+
+    [SkippableFact]
+    public void Decode_Qwen36MoeShape_Gqa8_HeadDim256()
+    {
+        // Issue #1686: Qwen3.6-35B-A3B full-attention layers (16 query heads over 2 KV heads, head_dim 256, F32 KV on the MoE hybrid host).
+        // One 8-head sub-group per KV head; head_dim 256 is v1-only (v2 serves <= 128). 9001 positions: several 128-row tiles per split,
+        // so the cross-tile rescale runs, and a ragged last split.
+        RunOne(seqKv: 9001, numHeads: 16, numKvHeads: 2, headDim: 256, positionOffset: 9000);
+    }
+
+    [SkippableFact]
+    public void Decode_NemotronNanoShape_Gqa5_HeadDim128()
+    {
+        // Issue #1686: Nemotron-3-Nano-4B attention layers (40 query heads over 8 KV heads, head_dim 128, F32 KV): a 5-head group, so a
+        // pass that assumes a power-of-two group (or a full 8-head sub-group) reads the next KV head's query heads.
+        RunOne(seqKv: 4500, numHeads: 40, numKvHeads: 8, headDim: 128, positionOffset: 4499);
     }
 
     [SkippableFact]
