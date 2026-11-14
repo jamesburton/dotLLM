@@ -868,9 +868,11 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | Variable | What the source says | Defined in |
 |---|---|---|
 | `DOTLLM_BENCH_ALT_PLANAR` | #1620: DOTLLM_BENCH_ALT_PLANAR=planar-first\|prod-first alternates the planar PQ2_0 decode GEMV per rep inside ONE process (same-session paired A/B, immune to process-start and page-cache noise); each rep reports its mode and p... | `BenchRunner.cs` |
+| `DOTLLM_BENCH_ALT_PREFILL_CHUNK` | #1660: DOTLLM_BENCH_ALT_PREFILL_CHUNK=1024,2048,512,256,0 rotates the timed prefill's chunk size per rep inside ONE process (0 = the whole prompt in one Forward call). Each rep reports its chunk, prefill tok/s, fence-wait count... | `BenchRunner.cs` |
 | `DOTLLM_BENCH_COMMIT` | Point-in-time runtime version for the results.csv runtime_version column (convention: dev-96a892bd). Resolution order: the DOTLLM_BENCH_COMMIT environment variable, git in the current directory (branch tag + short SHA), the ass... | `BenchEnvironment.cs` |
 | `DOTLLM_BENCH_DUMP_TOKENS` | Timed greedy decode: n single-token forwards. Only the Forward calls are inside the stopwatch windows; argmax runs between them. DOTLLM_BENCH_DUMP_TOKENS= appends one line of generated token IDs per rep - the exact-token parity... | `BenchRunner.cs` |
 | `DOTLLM_BENCH_RELEASE_GGUF` | Issue #438 experiment arm - DOTLLM_BENCH_RELEASE_GGUF=1 unmaps the GGUF right after upload. Every device-resident weight was copied into a device buffer by then; nothing in the Vulkan forward path reads a host pointer. If that... | `BenchCommand.cs` |
+| `DOTLLM_BENCH_SEED_FILE` | #1660: DOTLLM_BENCH_SEED_FILE= reads the seed text from a file, so a natural-text prompt longer than a command line (routing-realistic MoE prefill) can be benched; the tiled default concentrates routing on a few experts. | `BenchCommand.cs` |
 | `DOTLLM_BENCH_STEP_LOG` | DOTLLM_BENCH_STEP_LOG= (#801): append one line per rep holding that rep's per-step decode ms so a run's tok/s can be windowed (drift tracking) without changing the timed region. | `BenchRunner.cs` |
 | `DOTLLM_MEM_PROBE` | True when DOTLLM_MEM_PROBE is set to 1. | `HostResidencyProbe.cs` |
 
