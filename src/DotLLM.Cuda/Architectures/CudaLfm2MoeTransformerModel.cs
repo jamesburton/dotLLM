@@ -241,6 +241,9 @@ public sealed unsafe class CudaLfm2MoeTransformerModel : IModel
         if (cache is not null && cache is not CudaHybridKvCacheHandle) throw new ArgumentException("CUDA LFM2 requires its own cache handle.", nameof(cache));
         if (cache is not null && (positions[0] != cache.CurrentLength || positions[^1] >= cache.MaxLength))
             throw new ArgumentException("CUDA LFM2 cache forwards must append contiguous positions within capacity.", nameof(positions));
+        // #1786: an uncached forward that starts at position 0 is a new sequence: drop the previous prompt's model-owned
+        // short-conv state first (mirrors the CPU host).
+        if (cache is null && positions[0] == 0) ResetSequenceState();
         if (!ReferenceEquals(cache, _cacheOwner) && cache is { CurrentLength: > 0 }) throw new NotSupportedException("CUDA LFM2 cannot resume another handle's overwritten KV storage.");
         _context.MakeCurrent(); _cacheOwner = cache;
         nint hidden = Scratch("hidden", (long)t * h * 4), residual = Scratch("residual", (long)t * h * 4), norm = Scratch("norm", (long)t * h * 4);

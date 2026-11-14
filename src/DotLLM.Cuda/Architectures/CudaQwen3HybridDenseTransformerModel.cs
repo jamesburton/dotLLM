@@ -2100,6 +2100,11 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
                            int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
                            IMtpState? mtpState)
     {
+        // #1786: an uncached forward that starts at position 0 is a new sequence: drop the previous prompt's model-owned
+        // GDN + conv state and its row snapshots first (mirrors the CPU host).
+        if (kvCache is null && positions.Length > 0 && positions[0] == 0)
+            ResetSequenceState();
+
         // DFlash (#1175): the state rides on a field for the call, every tile captures and injects its own taps.
         _dflashCall = _dflash is not null ? mtpState as DFlashMtpState : null;
         try { return ForwardCoreTiled(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly, mtpState as CudaMtpState); }

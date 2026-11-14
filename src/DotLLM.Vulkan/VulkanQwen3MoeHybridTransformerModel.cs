@@ -754,6 +754,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         int seqLen = tokenIds.Length;
         if (seqLen == 0) throw new ArgumentException("tokenIds must be non-empty.", nameof(tokenIds));
 
+        // #1786: an uncached forward that starts at position 0 is a new sequence: drop the previous prompt's model-owned
+        // GDN + conv state before recording. Mirrors the CPU host; a caller-threaded state is never touched.
+        if (kvCache is null && gdnState is null && positions[0] == 0)
+            ResetSequenceState();
+
         // Any other forward moves the model-owned GDN state on, so earlier row snapshots no longer describe it (#1188).
         if (ReferenceEquals(gdnCache, _gdnCache) && _rowSnaps is not { Rows: > 0 })
             _rowSnapValid = 0;
@@ -895,7 +900,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// per-sequence state container. Callers that treat each forward as an independent sequence
     /// (perplexity windows) must call this between sequences — see issue #261.
     /// </remarks>
-    public void ResetSequenceState() => _gdnCache.Reset();
+    public void ResetSequenceState()
+    {
+        _gdnCache.Reset();
+        _rowSnapValid = 0;   // row snapshots no longer describe the (zeroed) state
+    }
 
     /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;

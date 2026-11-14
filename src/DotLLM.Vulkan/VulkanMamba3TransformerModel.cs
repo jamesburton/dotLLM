@@ -489,6 +489,11 @@ public sealed class VulkanMamba3TransformerModel : IModel
         int seqLen = tokenIds.Length;
         if (seqLen == 0) throw new ArgumentException("tokenIds must be non-empty.", nameof(tokenIds));
 
+        // #1786: an uncached forward on the model-owned state that starts at position 0 is a new sequence: drop the previous
+        // prompt's recurrent state first (the CPU host allocates a fresh scratch state per uncached call, so this matches it).
+        if (kvCache is null && mambaState is null && positions[0] == 0)
+            ResetSequenceState();
+
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
         int numLayers = Config.NumLayers;

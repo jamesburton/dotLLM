@@ -558,6 +558,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         int seqLen = tokenIds.Length;
         if (seqLen == 0) throw new ArgumentException("tokenIds must be non-empty.", nameof(tokenIds));
 
+        // #1786: an uncached forward that starts at position 0 is a new sequence: drop the previous prompt's model-owned
+        // GDN + conv state and any pending verify rows (ResetSequenceState) before recording. Mirrors the CPU host.
+        if (kvCache is null && gdnState is null && positions[0] == 0)
+            ResetSequenceState();
+
         int hiddenSize = Config.HiddenSize;
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;

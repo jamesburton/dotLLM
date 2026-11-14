@@ -190,6 +190,11 @@ public sealed class HybridQwen3HybridDenseTransformerModel : IModel
                 $"HybridQwen3HybridDenseTransformerModel requires a Qwen3HybridDenseSplitKvCache (from CreateKvCache); got {kvCache.GetType().Name}.",
                 nameof(kvCache));
 
+        // #1786: an uncached forward that starts at position 0 is a new sequence: re-zero BOTH halves' model-owned GDN
+        // state first (the CPU tail is entered through ForwardFromHiddenState, which does not reset on its own).
+        if (kvCache is null && positions.Length > 0 && positions[0] == 0)
+            ResetSequenceState();
+
         ITensor boundaryHidden = _headModel.ForwardHead(tokenIds, positions, split?.GpuHandle);
         try
         {

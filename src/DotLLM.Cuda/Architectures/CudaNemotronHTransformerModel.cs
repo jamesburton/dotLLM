@@ -1139,6 +1139,10 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
         int seqLen = tokenIds.Length;
         if (seqLen == 0 || seqLen != positions.Length)
             throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
+        // #1786: an uncached forward on the model-owned SSM state that starts at position 0 is a new sequence: drop the
+        // previous prompt's conv history and SSM state first (mirrors the CPU host). Threaded state is never touched.
+        if (kvCache is null && _activeSsm is null && positions[0] == 0)
+            ResetSequenceState();
 
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
