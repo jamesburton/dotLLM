@@ -1,0 +1,468 @@
+[
+ {
+  "name": "plain",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello!"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "system",
+  "context": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "no_generation_prompt",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello."
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "expected": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHello.<|im_end|>\n"
+ },
+ {
+  "name": "multi_turn_reasoning",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "Simple sum."
+    },
+    {
+     "role": "user",
+     "content": "And 3+3?"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\nSimple sum.\n</think>\n\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "enable_thinking_false",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false
+  },
+  "expected": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "multi_turn_no_preserve_thinking",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "Simple sum."
+    },
+    {
+     "role": "user",
+     "content": "And 3+3?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "preserve_thinking": false
+  },
+  "expected": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "assistant_without_reasoning",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>user\na<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nb<|im_end|>\n<|im_start|>user\nc<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "assistant_without_reasoning_no_prefix",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "add_generation_prompt": true,
+   "add_non_thinking_prefix": false
+  },
+  "expected": "<|im_start|>user\na<|im_end|>\n<|im_start|>assistant\nb<|im_end|>\n<|im_start|>user\nc<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "reasoning_already_inline",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nr\n</think>\nanswer",
+     "reasoning_content": "r"
+    },
+    {
+     "role": "user",
+     "content": "again"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\n\n<think>\nr\n</think>\nanswer<|im_end|>\n<|im_start|>user\nagain<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools_with_system",
+  "context": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are an agent."
+    },
+    {
+     "role": "user",
+     "content": "Where am I?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "execute_bash",
+      "description": "Run a shell command.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string",
+         "description": "The command."
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file (UTF-8, ünïcode ☃ ok).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"execute_bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command.\"}}, \"required\": [\"command\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a file (UTF-8, ünïcode ☃ ok).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are an agent.<|im_end|>\n<|im_start|>user\nWhere am I?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools_without_system",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "List files"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "execute_bash",
+      "description": "Run a shell command.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string",
+         "description": "The command."
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file (UTF-8, ünïcode ☃ ok).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"execute_bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command.\"}}, \"required\": [\"command\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a file (UTF-8, ünïcode ☃ ok).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nList files<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "parallel_tool_calls_and_results",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "pwd and read a.txt"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two calls.",
+     "tool_calls": [
+      {
+       "id": "call_0",
+       "type": "function",
+       "function": {
+        "name": "execute_bash",
+        "arguments": {
+         "command": "pwd"
+        }
+       }
+      },
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": {
+         "path": "a.txt",
+         "limit": 10
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "/home/u",
+     "tool_call_id": "call_0"
+    },
+    {
+     "role": "tool",
+     "content": "hello",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "execute_bash",
+      "description": "Run a shell command.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string",
+         "description": "The command."
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file (UTF-8, ünïcode ☃ ok).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"execute_bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command.\"}}, \"required\": [\"command\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a file (UTF-8, ünïcode ☃ ok).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\npwd and read a.txt<|im_end|>\n<|im_start|>assistant\n<think>\nTwo calls.\n</think>\n\n<tool_call>\n<function=execute_bash>\n<parameter=command>\npwd\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=limit>\n10\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n/home/u\n</tool_response>\n<tool_response>\nhello\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "content_plus_call_then_answer",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "Running it.",
+     "tool_calls": [
+      {
+       "id": "call_0",
+       "type": "function",
+       "function": {
+        "name": "execute_bash",
+        "arguments": {
+         "command": "ls -la"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "total 0",
+     "tool_call_id": "call_0"
+    },
+    {
+     "role": "assistant",
+     "content": "Empty dir."
+    }
+   ],
+   "add_generation_prompt": false,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "execute_bash",
+      "description": "Run a shell command.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string",
+         "description": "The command."
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"execute_bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command.\"}}, \"required\": [\"command\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\ngo<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nRunning it.\n\n<tool_call>\n<function=execute_bash>\n<parameter=command>\nls -la\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\ntotal 0\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nEmpty dir.<|im_end|>\n"
+ },
+ {
+  "name": "system_mid_conversation",
+  "context": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "first"
+    },
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b"
+    },
+    {
+     "role": "system",
+     "content": "second"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expectedError": "System message must be at the beginning."
+ }
+]

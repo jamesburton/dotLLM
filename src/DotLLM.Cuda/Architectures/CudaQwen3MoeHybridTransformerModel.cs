@@ -1536,7 +1536,12 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             .ThrowOnError();
 
         // Small F32 scalars — A, dt_bias, ssm_norm.
-        nint aDevice = UploadF32Tensor(dataBase, aDesc, gdn.NVHead, allocs);
+        // #1794: the official Clover GGUF stores the raw A_log under ssm_a; the GDN kernels expect qwen35moe's -exp(A_log).
+        float[] aHost = new float[gdn.NVHead];
+        Dequantize.ToFloat32(dataBase.Of(aDesc), gdn.NVHead, aDesc.QuantizationType, aHost);
+        if (CloverGgufConventions.SsmAIsALog(config, tensors, prefix, aHost))
+            CloverGgufConventions.ALogToSsmA(aHost);
+        nint aDevice = UploadF32Array(aHost, allocs);
         nint dtBiasDevice = UploadF32Tensor(dataBase, dtBDesc, gdn.NVHead, allocs);
         nint ssmNormDevice = UploadF32Tensor(dataBase, ssmNormDesc, gdn.DState, allocs);
 

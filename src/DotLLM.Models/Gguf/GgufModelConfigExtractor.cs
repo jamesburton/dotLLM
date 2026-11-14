@@ -235,6 +235,8 @@ public static partial class GgufModelConfigExtractor
             // full-attention and must not be interleaved into the GDN/full-attn pattern.
             if (gdnConfig is { } gdn)
                 hybridLayout = BuildQwen3MoeHybridLayout(numTrunkLayers, gdn.FullAttnInterval, numKvHeads);
+            if (hybridLayout is not null)
+                ValidateRecurrentLayers(metadata, arch, hybridLayout);
         }
         else if (architecture == Architecture.GptOss)
         {
@@ -338,6 +340,7 @@ public static partial class GgufModelConfigExtractor
             Moe = moeConfig,
             GdnConfig = gdnConfig,
             Qwen4Exp = qwen4Exp,
+            Clover = arch == "clover_moe" ? BuildCloverConfig(metadata, arch) : null,
             HadamardFold = GgufHadamardFoldExtractor.TryExtract(metadata),
             ChatTemplate = chatTemplate,
             PoolingType = ExtractPoolingType(metadata, arch),
@@ -1112,6 +1115,44 @@ public static partial class GgufModelConfigExtractor
         };
     }
 
+    /// <summary>
+    /// <c>{arch}.attention.recurrent_layers</c> (a per-layer bool array; Clover writes it next to <c>full_attention_interval</c>) wins over
+    /// the interval in llama.cpp (<c>clover-moe.cpp load_arch_hparams</c>). The host derives the layout from the interval, so a file
+    /// whose array disagrees is refused rather than run with the wrong layer kinds.
+    /// </summary>
+    private static void ValidateRecurrentLayers(GgufMetadata metadata, string arch, HybridLayerLayout layout)
+    {
+        string key = $"{arch}.attention.recurrent_layers";
+        if (!metadata.ContainsKey(key))
+            return;
+        bool[] recurrent = metadata.GetBoolArray(key);
+        int n = layout.LayerKind.Length;
+        if (recurrent.Length < n)
+            throw new InvalidDataException($"'{key}' has {recurrent.Length} entries; the trunk has {n} layers.");
+        for (int i = 0; i < n; i++)
+        {
+            bool expected = layout.LayerKind[i] == HybridLayerKind.GatedDeltaNet;
+            if (recurrent[i] != expected)
+                throw new NotSupportedException(
+                    $"'{key}'[{i}] = {recurrent[i]} disagrees with full_attention_interval (layer {i} is "
+                    + $"{layout.LayerKind[i]}); a non-periodic GDN / attention pattern is not supported by the Qwen3MoeHybrid host.");
+        }
+    }
+
+    /// <summary>
+    /// Clover (<c>clover_moe</c>, #1794) block-diffusion metadata. None of it is read by the causal forward; it is carried for the
+    /// bidirectional-preview / block-diffusion / draft-self stages.
+    /// </summary>
+    private static CloverConfig BuildCloverConfig(GgufMetadata metadata, string arch) => new()
+    {
+        BlockSize = (int)metadata.GetUInt32OrDefault($"{arch}.block_size", 32),
+        MaskTokenId = metadata.TryGetValue("tokenizer.ggml.mask_token_id", out _)
+            ? (int)metadata.GetUInt32OrDefault("tokenizer.ggml.mask_token_id", uint.MaxValue)
+            : -1,
+        MoeBlockCoresetEnabled = metadata.GetBoolOrDefault($"{arch}.moe_block_coreset_enabled", false),
+        MoeBlockCoresetTopP = metadata.GetFloat32OrDefault($"{arch}.moe_block_coreset_top_p", 0.9f),
+    };
+
     private static int MaxNonZero(int[] values, int fallback)
     {
         int max = 0;
@@ -1189,6 +1230,10 @@ public static partial class GgufModelConfigExtractor
             "qwen2moe" or "qwen3moe" or "qwenmoe" => Architecture.QwenMoe,
             // Qwen3.6-35B-A3B: Gated DeltaNet hybrid — NOT a plain Qwen-MoE transformer.
             "qwen35moe" => Architecture.Qwen3MoeHybrid,
+            // DiffuSpace Clover-35B-A3B (#1794): a block-diffusion fine-tune of Qwen3.6-35B-A3B. Its causal forward is the qwen35moe
+            // graph unchanged (llama.cpp PR #31306 src/models/clover-moe.cpp), so it rides the Qwen3MoeHybrid host and keeps every
+            // arch-keyed path; the diffusion metadata goes to ModelConfig.Clover (see BuildCloverConfig).
+            "clover_moe" => Architecture.Qwen3MoeHybrid,
             // Qwen3.8-Flash-Next (llama.cpp LLM_ARCH_QWEN4EXP): GDN/QSA hybrid + 512-expert MoE + 4-stream gated residual +
             // n-gram embedding + optional MTP block. Config/metadata only; no forward pass yet (#814 / #815).
             "qwen4exp" => Architecture.Qwen4Exp,

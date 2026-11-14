@@ -17,6 +17,7 @@ public sealed class VulkanMoeIndexedMatmulKQuantMmvqKernelTests
 {
     [SkippableTheory]
     [InlineData(MoeGroupedKQuant.Q4_K, 8, 16, 48, 512)]
+    [InlineData(MoeGroupedKQuant.Q4_K, 8, 32, 2048, 512)]   // #1794: Clover's Q4_K routed DOWN shape (m = hidden 2048, k = interm 512)
     [InlineData(MoeGroupedKQuant.Q5_K, 8, 16, 96, 512)]
     [InlineData(MoeGroupedKQuant.Q5_K, 5, 7, 12, 768)]
     [InlineData(MoeGroupedKQuant.Q6_K, 8, 16, 96, 512)]
