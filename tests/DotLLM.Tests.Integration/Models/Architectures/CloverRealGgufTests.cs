@@ -122,17 +122,39 @@ public sealed class CloverRealGgufCpuTests
     }
 }
 
-/// <summary>Vulkan causal-path gate on the real Clover GGUF (#1794): same next token as llama.cpp, and the last-row distribution close to the CPU host's.</summary>
+/// <summary>
+/// Vulkan causal-path gate on the real Clover GGUF (#1794), teacher-forced over a 66-token paragraph: Vulkan prefills the first 16 tokens
+/// (the grouped MoE prefill path) and DECODES the other 50 one at a time (the fused single-token MoE layer and the Q4_K / Q6_K / Q8_0 down
+/// MMVQ kernels, which perplexity never reaches), and every row is scored against the CPU host's one-pass logits.
+/// </summary>
+/// <remarks>
+/// Single positions cannot carry this gate: Clover's causal distributions are high-entropy, so ANY two implementations differ at mean KL
+/// ~0.05 and on ~11% of top-1s over wikitext-2 (llama.cpp CPU vs llama.cpp Vulkan: 0.052 / 90.0%; Qwen3.6-35B-A3B under the same pairs:
+/// 0.007 / 96%). The bounds are aggregates set above that floor; the substitution arm (RoPE theta 1e7 -> 1e4, a finite, plausible wrong
+/// config) shows they can fail. No non-finite arm on the GPU: NaN router logits would feed garbage expert ids to the device.
+/// </remarks>
 [Trait("Category", "GPU")]
 [Collection(GpuCollection.Name)]
 public sealed class CloverRealGgufVulkanTests
 {
+    /// <summary>"The Roman Empire was the post-Republican state of ancient Rome. ..." tokenized by llama.cpp (no BOS).</summary>
+    private static readonly int[] Paragraph =
+    [
+        760, 12386, 19825, 557, 279, 1675, 12, 66139, 1528, 314, 13437, 21047, 13, 1049, 369, 8524, 15513, 310, 2977, 279, 4031, 321,
+        17435, 20632, 539, 279, 47091, 2614, 4756, 57177, 579, 23571, 314, 12924, 5728, 1172, 279, 43051, 344, 303, 220, 17, 22, 17501,
+        13, 1049, 5064, 37167, 303, 4357, 11, 4634, 9871, 11, 321, 10550, 13229, 11, 321, 557, 20632, 539, 945, 692, 1052, 13,
+    ];
+
+    private const int PrefillRows = 16;
+    private const double MaxMeanKl = 0.08;   // measured 0.029 (2026-11-14); corpus floor ~0.05; wrong-theta arm 0.166
+    private const double MinTop1 = 0.75;
+
     private readonly ITestOutputHelper _output;
 
     public CloverRealGgufVulkanTests(ITestOutputHelper output) => _output = output;
 
     [SkippableFact]
-    public void Vulkan_CausalNextToken_MatchesLlamaCpp_AndCpu()
+    public void Vulkan_TeacherForcedPrefillAndDecode_TrackTheCpuHost()
     {
         string? path = CloverRealGguf.Resolve();
         Skip.If(path is null, "Clover GGUF not found: set DOTLLM_CLOVER_GGUF or hf-download Diffuspace/Clover-35B-A3B-Preview-GGUF.");
@@ -146,43 +168,66 @@ public sealed class CloverRealGgufVulkanTests
         {
             using var gguf = GgufFile.Open(path!);
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-            float[] cpu = CloverRealGguf.CpuLastRow(gguf, config);
+            float[][] cpu = CpuRows(gguf, config);
 
-            // Decode step after " Paris": CPU scores the 6-token sequence in one forward; Vulkan prefills 5 and then DECODES one token, so
-            // this row runs the single-token MoE path (fused decode layer, Q4_K / Q6_K / Q8_0 down MMVQ, #1794) that perplexity never touches.
-            int[] withParis = [.. CloverRealGguf.Prompt, CloverRealGguf.Paris];
-            float[] cpuDecode = CloverRealGguf.CpuLastRow(gguf, config, withParis);
+            var (kl, top1) = Score(cpu, VulkanRows(device, gguf, config, spvDir!));
+            _output.WriteLine($"[clover vulkan] rows {PrefillRows - 1}..{Paragraph.Length - 2}: meanKL(cpu||vk)={kl:E3} top1={top1:F3}");
+            Assert.True(kl < MaxMeanKl, $"mean KL(cpu || vulkan) = {kl:E3}");
+            Assert.True(top1 >= MinTop1, $"top-1 agreement {top1:F3}");
 
-            float[] vk, vkDecode;
-            using (var model = VulkanQwen3MoeHybridTransformerModel.BuildFromGguf(device, gguf, config, spvDir!))
-            using (var kv = model.CreateKvCache(64))
-            {
-                int[] positions = Enumerable.Range(0, CloverRealGguf.Prompt.Length).ToArray();
-                using (ITensor logits = model.Forward(CloverRealGguf.Prompt, positions, deviceId: -1, kv))
-                    vk = CloverRealGguf.LastRow(logits, config.VocabSize);
-                using (ITensor step = model.Forward([CloverRealGguf.Paris], [CloverRealGguf.Prompt.Length], deviceId: -1, kv))
-                    vkDecode = CloverRealGguf.LastRow(step, config.VocabSize);
-            }
-
-            var (decodeTop, decodeMargin) = CloverRealGguf.Top1(vkDecode);
-            double decodeKl = CloverRealGguf.Kl(cpuDecode, vkDecode);
-            _output.WriteLine($"[clover vulkan decode] top1={decodeTop} margin={decodeMargin:F3} KL(cpu||vk)={decodeKl:E3} cpuTop1={CloverRealGguf.Top1(cpuDecode).Top}");
-            Assert.Equal(CloverRealGguf.Period, decodeTop);
-            Assert.True(decodeKl < 0.5, $"decode-step KL(cpu || vulkan) = {decodeKl:E3}");
-
-            var (top, margin) = CloverRealGguf.Top1(vk);
-            double kl = CloverRealGguf.Kl(cpu, vk);
-            int[] cpuTop2 = cpu.Select((v, i) => (v, i)).OrderByDescending(t => t.v).Take(2).Select(t => t.i).ToArray();
-            _output.WriteLine($"[clover vulkan] top1={top} margin={margin:F3} KL(cpu||vk)={kl:E3} cpuTop2=[{string.Join(",", cpuTop2)}]");
-            // Clover's causal forward is unusually sensitive to kernel numerics: on wikitext-2 (16 x 512) EVERY pair of implementations sits
-            // at mean KL ~0.05 (llama.cpp CPU vs llama.cpp Vulkan 0.052, 99.9th-percentile token 1.37; Qwen3.6-35B-A3B under the same pairs
-            // 0.007), so single positions need bounds well above that noise. Measured 2026-11-14 (Strix, Q4_K_M) at this 5-token prefill:
-            // KL 0.20 with the F32-in indexed Q4_K down, 0.34 (top-1 " France" by 0.09 over " Paris") with the Q8_1-activation MMVQ down
-            // that short batches now take (#1794; corpus-wide that path costs +0.004 KL and no top-1). A wrong-decay model never gets here
-            // (non-finite state, see the CPU test's sensitivity arm).
-            Assert.Contains(top, cpuTop2);
-            Assert.True(kl < 0.5, $"KL(cpu || vulkan) = {kl:E3}");
+            // Substitution arm: the same host with a plausible wrong RoPE base must fail at least one bound.
+            var wrong = config with { RoPEConfig = config.RoPEConfig!.Value with { Theta = 10_000f } };
+            var (wkl, wtop1) = Score(cpu, VulkanRows(device, gguf, wrong, spvDir!));
+            _output.WriteLine($"[clover vulkan, rope theta 1e4] meanKL={wkl:E3} top1={wtop1:F3}");
+            Assert.True(wkl >= MaxMeanKl || wtop1 < MinTop1, $"wrong-theta run passed the gate (KL {wkl:E3}, top1 {wtop1:F3}): the bounds cannot fail");
         }
+    }
+
+    private static unsafe float[][] CpuRows(GgufFile gguf, ModelConfig config)
+    {
+        using var model = ModelLoader.CreateCpuModelFromGguf(gguf, config);
+        var hybrid = Assert.IsType<Qwen3MoeHybridTransformerModel>(model);
+        using var kv = new SimpleKvCache(hybrid.AttentionLayerCount, config.NumKvHeads, config.HeadDim, 128);
+        using ITensor logits = model.Forward(Paragraph, Enumerable.Range(0, Paragraph.Length).ToArray(), deviceId: -1, kv);
+        Assert.Equal(Paragraph.Length, logits.Shape[0]);
+        int v = config.VocabSize;
+        var rows = new float[Paragraph.Length][];
+        for (int r = 0; r < rows.Length; r++)
+        {
+            rows[r] = new float[v];
+            new ReadOnlySpan<float>((float*)logits.DataPointer + (long)r * v, v).CopyTo(rows[r]);
+        }
+        return rows;
+    }
+
+    /// <summary>Row r predicts token r+1. Rows 0..14 come from the 16-row prefill (only its last row is returned); 15..64 from decode.</summary>
+    private static float[]?[] VulkanRows(VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir)
+    {
+        var rows = new float[]?[Paragraph.Length];
+        using var model = VulkanQwen3MoeHybridTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+        using var kv = model.CreateKvCache(128);
+        using (ITensor pre = model.Forward(Paragraph.AsSpan(0, PrefillRows), Enumerable.Range(0, PrefillRows).ToArray(), deviceId: -1, kv))
+            rows[PrefillRows - 1] = CloverRealGguf.LastRow(pre, config.VocabSize);
+        for (int t = PrefillRows; t < Paragraph.Length - 1; t++)
+        {
+            using ITensor step = model.Forward(Paragraph.AsSpan(t, 1), [t], deviceId: -1, kv);
+            rows[t] = CloverRealGguf.LastRow(step, config.VocabSize);
+        }
+        return rows;
+    }
+
+    private static (double MeanKl, double Top1) Score(float[][] cpu, float[]?[] vk)
+    {
+        double kl = 0;
+        int agree = 0, n = 0;
+        for (int r = 0; r < vk.Length; r++)
+        {
+            if (vk[r] is not { } row) continue;
+            kl += CloverRealGguf.Kl(cpu[r], row);
+            if (CloverRealGguf.Top1(cpu[r]).Top == CloverRealGguf.Top1(row).Top) agree++;
+            n++;
+        }
+        return (kl / n, (double)agree / n);
     }
 
     private static string? ResolveSpvDir()
