@@ -674,17 +674,17 @@ SPIR-V missing, load failure) fails with what/why/model-vs-device-memory and the
 `/props` reports `device` (as requested) and `resolved_device` (as loaded) for every load path, explicit or `auto`; `dotllm ps` shows the same.
 
 Experimental AMD HIP is selected explicitly with `--device hip` (device 0) or `hip:N`; `auto` does not select it.
-It supports dense Llama GGUF (F16/Q4_0/Q8_0 matrices) and HF SafeTensors (F16/BF16 or validated AWQ4/GPTQ4) on Windows x64 with required DirectStorage loading and per-request device KV pages.
+It supports dense Llama GGUF (F16/Q4_0/Q8_0 matrices) and HF SafeTensors (F16/BF16 or validated AWQ4/GPTQ4) with required platform direct loading and per-request device KV pages.
 K and V independently select F16 or Q8_0; Q8_0 requires head dimensions divisible by 32. Partial layer offload, F32/Q4_0 KV and mixed-precision windows fail explicitly. `/v1/devices` reports per-device HIP readiness;
 the WebUI lists only usable HIP devices and keeps them explicit choices. See [HIP.md](HIP.md) for prerequisites and limits.
-HIP defaults to F16 KV. Q8_0 on either plane requires `DOTLLM_HIP_ALLOW_Q8_KV=1` in the server process environment to acknowledge measured precision loss; without it, startup rejects the option before opening the model. Q8 failed the original 1K–8K logit quality gates. See [precision measurements](PRECISION.md#actual-1k8k-histories).
+HIP defaults to F16 KV. Q8_0 on either plane requires `DOTLLM_HIP_ALLOW_Q8_KV=1` in the server process environment to acknowledge measured precision loss; without it, startup rejects the option before opening the model. Q8 failed the original 1K–8K logit quality gates. See [precision measurements](PRECISION.md#actual-1k8k-histories) and [the testing handbook](HIP_TESTING.md).
 
 Local HuggingFace directories also load on CPU (`cpu` or `auto`). The existing HF config,
 tokenizer and single-file/sharded readers are reused. A model owns its SafeTensors source
 through active and resident states; replacement, eviction, unload and shutdown release it.
 Declared templates are validated before weight allocation, including named tool templates.
 HF serving currently rejects overlays, adapters, context/RoPE overrides, expert offload and
-speculative decoding options. HIP uses the same validated AWQ GEMM4/legacy GPTQ4 subset as CPU. Windows uses DirectStorage; Linux model loading is not implemented in this slice.
+speculative decoding options. HIP uses the same validated AWQ GEMM4/legacy GPTQ4 subset as CPU. Windows uses DirectStorage; Linux uses AMD Infinity Storage and remains hardware-unverified.
 
 ## GPU memory on Windows: no silent spill into system RAM (#1068)
 

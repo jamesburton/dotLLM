@@ -2,11 +2,12 @@ using DotLLM.Hip.Interop;
 
 namespace DotLLM.Hip.DirectStorage;
 
-/// <summary>An independently owned, device-local D3D12 allocation imported into HIP.</summary>
+/// <summary>An independently owned device allocation populated by direct storage I/O.</summary>
 public sealed class HipDirectWeightBuffer : IDisposable
 {
     private readonly int _deviceId;
     private readonly nint _pointer;
+    private readonly nint _allocation;
     private readonly nint _externalMemory;
     private readonly nint _resource;
     private readonly nint _heap;
@@ -17,9 +18,19 @@ public sealed class HipDirectWeightBuffer : IDisposable
     {
         _deviceId = deviceId;
         _pointer = pointer;
+        _allocation = pointer;
         _externalMemory = externalMemory;
         _resource = resource;
         _heap = heap;
+        ByteLength = byteLength;
+        AllocatedBytes = allocatedBytes;
+    }
+
+    internal HipDirectWeightBuffer(int deviceId, nint pointer, nint allocation, long byteLength, long allocatedBytes)
+    {
+        _deviceId = deviceId;
+        _pointer = pointer;
+        _allocation = allocation;
         ByteLength = byteLength;
         AllocatedBytes = allocatedBytes;
     }
@@ -37,7 +48,7 @@ public sealed class HipDirectWeightBuffer : IDisposable
     /// <summary>Number of requested file bytes.</summary>
     public long ByteLength { get; }
 
-    /// <summary>Device allocation size including D3D12's 64 KiB heap alignment.</summary>
+    /// <summary>Device allocation size including platform alignment and file-range padding.</summary>
     public long AllocatedBytes { get; }
 
     internal nint Resource => _resource;
@@ -50,8 +61,8 @@ public sealed class HipDirectWeightBuffer : IDisposable
         if (error == 0)
         {
             error = HipDriverApi.hipDeviceSynchronize();
-            int freeError = HipDriverApi.hipFree(_pointer);
-            int destroyError = HipExternalMemoryApi.DestroyExternalMemory(_externalMemory);
+            int freeError = HipDriverApi.hipFree(_allocation);
+            int destroyError = _externalMemory != 0 ? HipExternalMemoryApi.DestroyExternalMemory(_externalMemory) : 0;
             if (error == 0) error = freeError != 0 ? freeError : destroyError;
         }
         ComVtbl.Release(_resource);

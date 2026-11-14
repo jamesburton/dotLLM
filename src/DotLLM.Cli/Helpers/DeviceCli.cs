@@ -22,7 +22,7 @@ internal static class DeviceCli
     public const string OptionHelp =
         "Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - with a warning if it ends on the CPU), " +
         "'cpu', 'vulkan' (the default Vulkan GPU), 'vulkan:N' (Vulkan physical device N), 'gpu'/'cuda' (CUDA device 0), " +
-        "'gpu:N'/'cuda:N' (CUDA ordinal N), 'hip'/'hip:N' (run/chat/serve only: experimental AMD HIP; explicit-only, Windows x64, dense Llama GGUF or supported F16/BF16/AWQ4/GPTQ4 SafeTensors). " +
+        "'gpu:N'/'cuda:N' (CUDA ordinal N), 'hip'/'hip:N' (run/chat/serve only: experimental AMD HIP; explicit-only, Windows/Linux x64 direct loading, dense Llama GGUF or supported F16/BF16/AWQ4/GPTQ4 SafeTensors). " +
         "Case-insensitive. An explicit GPU that cannot be honoured is an error, never a silent CPU run. " +
         "Env: DOTLLM_VULKAN_DEVICE_INDEX picks the Vulkan device behind plain 'vulkan'.";
 

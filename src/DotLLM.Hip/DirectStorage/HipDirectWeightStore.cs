@@ -4,7 +4,7 @@ using DotLLM.Hip.Interop;
 namespace DotLLM.Hip.DirectStorage;
 
 /// <summary>
-/// Loads file ranges through Windows DirectStorage into D3D12 buffers imported into HIP.
+/// Loads file ranges through Windows DirectStorage or Linux AMD Infinity Storage into HIP.
 /// No application host staging or host-copy fallback is used. Returned buffers outlive the store.
 /// </summary>
 public sealed unsafe class HipDirectWeightStore : IDisposable
@@ -12,18 +12,28 @@ public sealed unsafe class HipDirectWeightStore : IDisposable
     private const long HeapAlignment = 64 * 1024;
     private const uint RequestBytes = 32 * 1024 * 1024;
     private readonly HipContext _context;
+    private readonly nint _linuxRead;
     private readonly object _gate = new();
     private nint _device, _factory, _queue, _fence, _event, _module, _coreModule;
     private ulong _fenceValue;
     private bool _disposed;
 
-    /// <summary>Creates a DirectStorage session on the context's exact Windows x64 adapter.</summary>
+    /// <summary>Creates direct I/O on the context's exact Windows or Linux x64 device.</summary>
     public HipDirectWeightStore(HipContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (!OperatingSystem.IsWindows() || RuntimeInformation.ProcessArchitecture != Architecture.X64)
-            throw new PlatformNotSupportedException("HIP direct weight loading currently requires Windows x64 and DirectStorage.");
+
+        if ((!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux()) || RuntimeInformation.ProcessArchitecture != Architecture.X64)
+            throw new PlatformNotSupportedException("HIP direct weight loading requires Windows x64 DirectStorage or Linux x64 AMD Infinity Storage.");
+
         _context = context;
+
+        if (OperatingSystem.IsLinux())
+        {
+            _linuxRead = HipLinuxDirectIo.Resolve(context);
+            return;
+        }
+
         try
         {
             context.MakeCurrent();
@@ -72,6 +82,8 @@ public sealed unsafe class HipDirectWeightStore : IDisposable
             ObjectDisposedException.ThrowIf(_disposed, this);
             _context.MakeCurrent();
             string fullPath = Path.GetFullPath(path);
+            if (_linuxRead != 0)
+                return HipLinuxDirectIo.Load(_context, _linuxRead, fullPath, offset, byteLength);
             // Hold the same file against writes/deletion until its queued read completes.
             using var fileGuard = File.OpenHandle(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read);
             ValidateRange(RandomAccess.GetLength(fileGuard), offset, byteLength);
@@ -214,6 +226,7 @@ public sealed unsafe class HipDirectWeightStore : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
+            if (_linuxRead != 0) return;
             DStorageNative.CloseQueue(_queue);
             ComVtbl.Release(_factory);
             ComVtbl.Release(_fence);

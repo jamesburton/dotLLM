@@ -6,7 +6,7 @@ loader dispatch in `ModelLoader`, the field consumption in
 `HfConfigExtractor` / `GgufModelConfigExtractor`, and the verification
 evidence in the test tree.
 
-**Experimental HIP.** The broader architecture matrix below does not imply HIP support. HIP currently accepts the bounded dense Llama subset documented in [HIP.md](HIP.md): GGUF F16/Q4_0/Q8_0 or HF F16/BF16/validated AWQ4/GPTQ4 checkpoints on Windows x64, qualified on RX 6900 XT. Other backends do not inherit these HIP format capabilities.
+**Experimental HIP.** The broader architecture matrix below does not imply HIP support. HIP currently accepts the bounded dense Llama subset documented in [HIP.md](HIP.md): GGUF F16/Q4_0/Q8_0 or HF F16/BF16/validated AWQ4/GPTQ4 checkpoints, hardware-qualified on Windows x64 with RX 6900 XT. Linux x64 AIS loading is implemented and software-tested; physical Linux GPU/storage qualification remains outstanding. Other backends do not inherit these HIP format capabilities.
 
 **How to read.** Each row is one `Architecture` enum variant. The `Verified
 on` column reports the strongest evidence that exists today, tagged per the

@@ -21,6 +21,13 @@ internal static partial class HipDriverApi
     [LibraryImport(LibName)]
     internal static partial int hipInit(uint flags);
 
+    [LibraryImport(LibName)]
+    internal static partial int hipRuntimeGetVersion(out int version);
+
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int hipGetProcAddress(string symbol, out nint function,
+        int hipVersion, ulong flags, out int symbolStatus);
+
     // ── Device ──────────────────────────────────────────────────────
 
     [LibraryImport(LibName)]
