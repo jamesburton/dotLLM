@@ -84,7 +84,20 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
     public const int MaxAllRowLogitsSeqLen = 16;
 
     /// <inheritdoc/>
-    public int MaxAllRowLogitsLength => MaxAllRowLogitsSeqLen;
+    public int MaxAllRowLogitsLength => _allRowLogitsLimit;
+
+    // Instance bound: defaults to the speculative-verify length; widened on request for perplexity / full-vocab KL scoring (#564, #1794).
+    // Before #1794 this host had no widening hook, so `dotllm perplexity --device vulkan` fell back to the O(n^2) growing-prefix scorer
+    // (minutes per 512-token window at 35B-A3B scale).
+    private int _allRowLogitsLimit = MaxAllRowLogitsSeqLen;
+
+    /// <inheritdoc/>
+    public bool TrySetAllRowLogitsLimit(int maxSeqLen)
+    {
+        if (maxSeqLen > _allRowLogitsLimit)
+            _allRowLogitsLimit = maxSeqLen;
+        return _allRowLogitsLimit >= maxSeqLen;
+    }
 
     private VulkanDevice.Buffer? _multiRowLogits;
     private int _multiRowLogitsRows;

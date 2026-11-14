@@ -180,6 +180,7 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
         var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
         Nvfp4Support.RejectUnappliedScales(tensors, consumedScales: null, "The Qwen3 MoE-hybrid loader"); // #1038
+        CloverGgufConventions.LogUnconsumedTensors(config, tensors, "Qwen3MoeHybrid CPU loader"); // #1794
         var layout = config.HybridLayout;
 
         var embDesc = tensors["token_embd.weight"];
@@ -826,6 +827,9 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
         float[] conv1dWeight = DequantizeF32(dataBase, conv1dWDesc, gdn.DConv * convDim);
         float[] conv1dBias = new float[convDim]; // GDN has no conv bias — zeros satisfy Conv1dCausal precondition
         float[] a = DequantizeF32(dataBase, aDesc, gdn.NVHead);
+        // #1794: the official Clover GGUF stores the raw A_log under ssm_a; the forward expects qwen35moe's -exp(A_log).
+        if (CloverGgufConventions.SsmAIsALog(config, tensors, prefix, a))
+            CloverGgufConventions.ALogToSsmA(a);
         float[] dtBias = DequantizeF32(dataBase, dtBDesc, gdn.NVHead);
         float[] ssmNormWeight = DequantizeF32(dataBase, normDesc, gdn.DState);
 
@@ -1791,6 +1795,11 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
                 return;
             case QuantizationType.F16:
                 MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
+                return;
+            case QuantizationType.BF16:
+                // Clover (#1794) ships a BF16 LM head and BF16 GDN alpha/beta: shift-widen in place, pool-parallel (#1118). The
+                // default arm below is single-threaded and made the 248320-row head dominate CPU decode.
+                MatMul.GemmBf16(weights, b, c, m, k, n, _threadPool);
                 return;
             case QuantizationType.Q4_0:
             case QuantizationType.Q4_1:

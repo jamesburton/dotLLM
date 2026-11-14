@@ -339,6 +339,12 @@ public record ModelConfig
     public Qwen4ExpConfig? Qwen4Exp { get; init; }
 
     /// <summary>
+    /// DiffuSpace Clover (<c>clover_moe</c>) block-diffusion metadata. Non-null iff the GGUF declares <c>clover_moe</c>, which runs on the
+    /// <see cref="DotLLM.Core.Configuration.Architecture.Qwen3MoeHybrid"/> host (issue #1794). See <see cref="CloverConfig"/>.
+    /// </summary>
+    public CloverConfig? Clover { get; init; }
+
+    /// <summary>
     /// Ripple (<c>ricursive</c>) gated-attention / value-residual / FFN-clamp / embedding-scale switches. Non-null iff
     /// <see cref="Architecture"/> is <see cref="DotLLM.Core.Configuration.Architecture.Ricursive"/>; null for every other architecture.
     /// See <see cref="RicursiveConfig"/>.

@@ -24,6 +24,26 @@ namespace DotLLM.Models.Gguf;
 /// </remarks>
 public static class SyntheticQwen35MoeGguf
 {
+    /// <summary>
+    /// How <see cref="Build"/> renders the fixture as a DiffuSpace Clover (<c>clover_moe</c>, issue #1794) file. The trunk weights are
+    /// drawn from the same PRNG stream in every mode, so a Clover fixture describes the SAME causal model as the plain qwen35moe one.
+    /// </summary>
+    public enum CloverLayout
+    {
+        /// <summary>Plain <c>qwen35moe</c> (the default).</summary>
+        None,
+
+        /// <summary>
+        /// The official <c>Diffuspace/Clover-35B-A3B-Preview-GGUF</c> layout: arch <c>clover_moe</c>, the block-diffusion keys,
+        /// <c>attention.recurrent_layers</c>, the four bidirectional-preview tensors per GDN layer, and <c>ssm_a</c> holding the raw
+        /// <c>A_log = ln(-a)</c> rather than qwen35moe's <c>a = -exp(A_log)</c>.
+        /// </summary>
+        Official,
+
+        /// <summary>llama.cpp PR #31306's converter: arch <c>clover_moe</c>, qwen35moe-form <c>ssm_a</c>, no preview tensors.</summary>
+        LlamaCppConverter,
+    }
+
     // Compact but architecturally valid shapes (mirrors the CPU unit-test fixture dims).
     internal const int VocabSize = 8;
     private const int HiddenSize = 32;
@@ -61,8 +81,9 @@ public static class SyntheticQwen35MoeGguf
     /// alternating GDN / attention layout ending on an attention layer. Values above the default exist for layer-window coverage,
     /// where a cut must have recurrent layers on both sides to prove anything (issue #395).
     /// </param>
+    /// <param name="clover">Render the fixture as a Clover file (see <see cref="CloverLayout"/>); trunk weights are unchanged.</param>
     public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = false, int contextLength = ContextLength,
-                               int blockCount = BlockCount)
+                               int blockCount = BlockCount, CloverLayout clover = CloverLayout.None)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockCount);
         if (blockCount % FullAttnInterval != 0)
@@ -71,7 +92,9 @@ public static class SyntheticQwen35MoeGguf
 
         var w = new GgufWriter();
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
-        const string arch = "qwen35moe";
+        // The Clover-only preview tensors come from their own stream so the trunk stream (and so the trunk weights) is unchanged.
+        var previewRng = new SyntheticGemma4Gguf.Xorshift(seed ^ 0x5EEDB10Cu);
+        string arch = clover == CloverLayout.None ? "qwen35moe" : "clover_moe";
 
         // ── Metadata ──────────────────────────────────────────────────────
         w.AddString("general.architecture", arch);
@@ -108,6 +131,17 @@ public static class SyntheticQwen35MoeGguf
         w.AddUInt32($"{arch}.expert_feed_forward_length", MoeIntermediate);
         w.AddUInt32($"{arch}.expert_shared_feed_forward_length", SharedIntermediate);
 
+        if (clover != CloverLayout.None)
+        {
+            var recurrent = new bool[blockCount];
+            for (int i = 0; i < blockCount; i++) recurrent[i] = (i + 1) % FullAttnInterval != 0;
+            w.AddBoolArray($"{arch}.attention.recurrent_layers", recurrent);
+            w.AddUInt32($"{arch}.block_size", 32);
+            w.AddBool($"{arch}.moe_block_coreset_enabled", true);
+            w.AddFloat32($"{arch}.moe_block_coreset_top_p", 0.9f);
+            w.AddUInt32("tokenizer.ggml.mask_token_id", VocabSize - 1);
+        }
+
         AddTokenizer(w);
 
         // ── Tensors ───────────────────────────────────────────────────────
@@ -126,7 +160,7 @@ public static class SyntheticQwen35MoeGguf
             if (fullAttn)
                 AddFullAttnLayer(w, rng, p);
             else
-                AddGdnLayer(w, rng, p);
+                AddGdnLayer(w, rng, p, clover, previewRng);
 
             AddMoeLayer(w, rng, p);
         }
@@ -153,10 +187,11 @@ public static class SyntheticQwen35MoeGguf
     /// <param name="withMtp">See <see cref="Build"/>.</param>
     /// <param name="contextLength">See <see cref="Build"/>.</param>
     /// <param name="blockCount">See <see cref="Build"/>.</param>
+    /// <param name="clover">See <see cref="Build"/>.</param>
     public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = false, int contextLength = ContextLength,
-                               int blockCount = BlockCount)
+                               int blockCount = BlockCount, CloverLayout clover = CloverLayout.None)
     {
-        File.WriteAllBytes(path, Build(seed, withMtp, contextLength, blockCount));
+        File.WriteAllBytes(path, Build(seed, withMtp, contextLength, blockCount, clover));
         return path;
     }
 
@@ -164,7 +199,8 @@ public static class SyntheticQwen35MoeGguf
     /// GDN (Gated DeltaNet) token-mixing tensors. Note: NO attn_output.weight — that absence
     /// is what discriminates the hybrid loader from the plain TransformerModel loader.
     /// </summary>
-    private static void AddGdnLayer(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string p)
+    private static void AddGdnLayer(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string p,
+                                    CloverLayout clover = CloverLayout.None, SyntheticGemma4Gguf.Xorshift? previewRng = null)
     {
         int gdnKDim = NKHead * DState;
         int gdnVDim = NVHead * DState;
@@ -177,7 +213,18 @@ public static class SyntheticQwen35MoeGguf
         // ssm_a: per-V-head decay base — must be negative (exp(a·dt) < 1).
         var a = new float[NVHead];
         for (int i = 0; i < NVHead; i++) a[i] = -0.5f + rng.NextSigned(0.25f);
-        AddF32Tensor(w, $"{p}.ssm_a", [NVHead], a);
+        if (clover == CloverLayout.Official)
+        {
+            // DiffuSpace's converter stores A_log itself: a = -exp(A_log) <=> A_log = ln(-a). Every A_log here is negative, so the
+            // loader has to recognise the layout from the preview tensors, not from a positive entry.
+            var aLog = new float[NVHead];
+            for (int i = 0; i < NVHead; i++) aLog[i] = MathF.Log(-a[i]);
+            AddF32Tensor(w, $"{p}.ssm_a", [NVHead], aLog);
+        }
+        else
+        {
+            AddF32Tensor(w, $"{p}.ssm_a", [NVHead], a);
+        }
 
         AddMatrixF32(w, rng, $"{p}.ssm_alpha.weight", inK: HiddenSize, outM: NVHead, 0.05f);
         AddMatrixF32(w, rng, $"{p}.ssm_beta.weight", inK: HiddenSize, outM: NVHead, 0.05f);
@@ -192,6 +239,25 @@ public static class SyntheticQwen35MoeGguf
 
         AddNorm(w, rng, $"{p}.ssm_norm.weight", DState);
         AddMatrixF32(w, rng, $"{p}.ssm_out.weight", inK: gdnVDim, outM: HiddenSize, 0.05f);
+
+        if (clover == CloverLayout.Official)
+        {
+            // Bidirectional-preview tensors (inert on the causal path), drawn from the preview stream.
+            var r = previewRng!;
+            AddMatrixF32(w, r, $"{p}.ssm_conv1d.weight_right", inK: DConv - 1, outM: convDim, 0.1f);
+            var scale = new float[NVHead];
+            var bias = new float[NVHead];
+            var c = new float[NVHead];
+            for (int i = 0; i < NVHead; i++)
+            {
+                scale[i] = 10f + r.NextSigned(2f);
+                bias[i] = 5f + r.NextSigned(1f);
+                c[i] = 1f + r.NextSigned(0.2f);
+            }
+            AddF32Tensor(w, $"{p}.ssm_bd_logit_scale.weight", [NVHead], scale);
+            AddF32Tensor(w, $"{p}.ssm_bd_history.bias", [NVHead], bias);
+            AddF32Tensor(w, $"{p}.ssm_bd_history.weight", [NVHead], c);
+        }
     }
 
     /// <summary>Full-attention tensors: fused Q+Gate projection + QK-norm, per qwen35moe.</summary>

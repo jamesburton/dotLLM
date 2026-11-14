@@ -782,7 +782,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 
         // Rows the LM head covers (#1188): every row of a short batch (a speculative verify is K+1 rows and is indexed row by row), the last
         // row of a long prefill. Resolved before any recording: growing the buffer invalidates the descriptor caches.
-        int headRows = seqLen <= MaxAllRowLogitsSeqLen ? seqLen : 1;
+        int headRows = seqLen <= _allRowLogitsLimit ? seqLen : 1;
         var logitsBuf = headRows == 1 ? _state.Logits : EnsureMultiRowLogits(headRows, vocabSize);
 
         UploadPositions(positions);
