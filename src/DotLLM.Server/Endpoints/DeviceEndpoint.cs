@@ -196,7 +196,7 @@ public static class DeviceEndpoint
     internal static BackendInfoDto DescribeHip(Func<bool> available, Func<int> count,
         Func<int, DeviceInfoDto> describe, Action<int> validate)
     {
-        const string boundary = "Experimental, explicit --device hip:N only; dense Llama GGUF (F16/Q4_0/Q8_0) or F16 SafeTensors, F16/Q8_0 KV, Windows x64. Hardware qualification: RX 6900 XT / HIP 6.4.2.";
+        const string boundary = "Experimental, explicit --device hip:N only; dense Llama GGUF (F16/Q4_0/Q8_0) or F16/BF16/AWQ4/GPTQ4 SafeTensors, F16/Q8_0 KV. Windows x64 DirectStorage. Hardware qualification: Windows RX 6900 XT / HIP 6.4.2.";
         if (!SafeProbe(available))
             return new BackendInfoDto { Name = "hip", Available = false, Servable = false,
                 Note = "No HIP runtime / no HIP-capable AMD GPU detected." };

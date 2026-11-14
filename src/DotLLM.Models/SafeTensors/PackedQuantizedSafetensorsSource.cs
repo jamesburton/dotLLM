@@ -5,7 +5,7 @@ using DotLLM.Core.Models;
 namespace DotLLM.Models.SafeTensors;
 
 /// <summary>
-/// Validated, CPU-only AutoAWQ GEMM4 / legacy AutoGPTQ4 tensor groups. Owns the
+/// Validated AutoAWQ GEMM4 / legacy AutoGPTQ4 tensor groups. Owns the
 /// underlying source, including all shards; weights and F16 scales stay mapped.
 /// Dispose the model before disposing its returned source, as for plain SafeTensors.
 /// </summary>
@@ -58,6 +58,13 @@ public sealed class PackedQuantizedSafetensorsSource : ISafetensorsTensorSource
         return _source.GetTensorSpan(name);
     }
 
+    /// <inheritdoc/>
+    public (string Path, long FileOffset) GetTensorFileLocation(string name)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return _source.GetTensorFileLocation(name);
+    }
+
     internal bool TryGetWeight(string name, out Packed4Weight weight)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -91,13 +98,13 @@ public sealed class PackedQuantizedSafetensorsSource : ISafetensorsTensorSource
         if (method is not ("awq" or "gptq"))
         {
             if (hasPacked)
-                throw new NotSupportedException($"Packed quant_method '{method ?? "missing"}' is unsupported; use AWQ GEMM4 or legacy AutoGPTQ4 on CPU.");
+                throw new NotSupportedException($"Packed quant_method '{method ?? "missing"}' is unsupported; use AWQ GEMM4 or legacy AutoGPTQ4.");
             // Other existing loaders (e.g. BitNet) own their quantization metadata.
             return source;
         }
 
         if (RequiredInt(quant, "bits") != 4)
-            throw new NotSupportedException("AWQ/GPTQ CPU loading supports exactly 4 bits.");
+            throw new NotSupportedException("AWQ/GPTQ loading supports exactly 4 bits.");
         int groupSize = RequiredInt(quant, "group_size");
         if (groupSize is not (32 or 64 or 128 or -1))
             throw new NotSupportedException("AWQ/GPTQ group_size must be 32, 64, 128, or -1 (one group per input axis).");
@@ -107,7 +114,7 @@ public sealed class PackedQuantizedSafetensorsSource : ISafetensorsTensorSource
         {
             if (!string.Equals(OptionalString(quant, "version"), "gemm", StringComparison.OrdinalIgnoreCase)
                 || !RequiredBool(quant, "zero_point"))
-                throw new NotSupportedException("AWQ CPU loading requires version='gemm', bits=4 and zero_point=true; GEMV, Marlin and symmetric AWQ layouts are unsupported.");
+                throw new NotSupportedException("AWQ loading requires version='gemm', bits=4 and zero_point=true; GEMV, Marlin and symmetric AWQ layouts are unsupported.");
         }
         else
         {
@@ -117,7 +124,7 @@ public sealed class PackedQuantizedSafetensorsSource : ISafetensorsTensorSource
             if (format is not (null or "gptq")
                 || (quant.TryGetProperty("is_marlin_format", out var marlin) && marlin.ValueKind != JsonValueKind.False)
                 || (OptionalString(quant, "pack_dtype") is { } dtype && dtype is not ("int32" or "torch.int32")))
-                throw new NotSupportedException("GPTQ CPU loading supports the legacy AutoGPTQ int32 layout (checkpoint_format='gptq', stored zero + 1); GPTQ v2, Marlin and other packing are unsupported.");
+                throw new NotSupportedException("GPTQ loading supports the legacy AutoGPTQ int32 layout (checkpoint_format='gptq', stored zero + 1); GPTQ v2, Marlin and other packing are unsupported.");
         }
 
         ValidateModel(model);
@@ -234,7 +241,7 @@ public sealed class PackedQuantizedSafetensorsSource : ISafetensorsTensorSource
     {
         if (OptionalString(model, "model_type") != "llama"
             || (OptionalString(model, "hidden_act") is { } act && act != "silu"))
-            throw new NotSupportedException("Packed AWQ/GPTQ CPU inference currently supports dense Llama with SiLU only.");
+            throw new NotSupportedException("Packed AWQ/GPTQ inference currently supports dense Llama with SiLU only.");
         foreach (string flag in new[] { "attention_bias", "mlp_bias", "qk_norm", "use_qk_norm" })
             if (model.TryGetProperty(flag, out var value) && value.ValueKind != JsonValueKind.False)
                 throw new NotSupportedException($"Packed Llama does not support '{flag}'.");

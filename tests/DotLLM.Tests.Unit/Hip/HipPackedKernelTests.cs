@@ -127,7 +127,7 @@ public sealed class HipPackedKernelTests : IDisposable
         RequireGpu();
         Assert.Throws<ArgumentException>(() => _kernels!.Linear(1, 1, 1, 7, 48, QuantizationType.Q4_0));
         Assert.Throws<ArgumentException>(() => _kernels!.Embed(1, 1, 1, 31, QuantizationType.Q8_0));
-        Assert.Throws<NotSupportedException>(() => _kernels!.Linear(1, 1, 1, 7, 32, QuantizationType.BF16));
+        Assert.Throws<NotSupportedException>(() => _kernels!.Linear(1, 1, 1, 7, 32, QuantizationType.F32));
         Assert.Throws<NotSupportedException>(() => _kernels!.Embed(1, 1, 1, 32, QuantizationType.Q5_0));
         Assert.Throws<NotSupportedException>(() => _kernels!.WriteKv(1, 1, 1, 1, 3, 2, 40, 0, KvCacheDType.Q8_0, KvCacheDType.F32));
         Assert.Throws<NotSupportedException>(() => _kernels!.WriteKv(1, 1, 1, 1, 3, 2, 64, 0, KvCacheDType.Q4_0, KvCacheDType.F32));

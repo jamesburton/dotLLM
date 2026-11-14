@@ -7,12 +7,13 @@
 3. **Q4_0** — Basic 4-bit
 4. **Q4_K_M** — Most popular, best quality/size tradeoff
 5. **Q5_K_M, Q6_K** — Higher quality K-quants
-6. **GPTQ/AWQ** — bounded packed SafeTensors CPU support; GPU execution remains unsupported
+6. **GPTQ/AWQ** — bounded packed SafeTensors CPU and explicit HIP support
 
-## Hugging Face packed AWQ/GPTQ on CPU
+## Hugging Face packed AWQ/GPTQ on CPU and HIP
 
 The SafeTensors loader accepts **dense Llama** checkpoints with an explicit
-`config.json` `quantization_config`. Use `--device cpu`. The supported projections
+`config.json` `quantization_config`. Use `--device cpu` or explicit `--device hip:N`
+with the [HIP platform prerequisites](HIP.md). The supported projections
 are separate `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj` and
 `down_proj`; excluded modules may retain their ordinary floating-point weights.
 Embeddings and `lm_head` must remain floating point. The mapped packed tensors
@@ -26,7 +27,7 @@ The binary contract is pinned to these producer implementations:
 | [Legacy AutoGPTQ4](https://github.com/AutoGPTQ/AutoGPTQ/blob/9f7d37072917ab3a7545835f23e808294a542153/auto_gptq/nn_modules/qlinear/qlinear_cuda.py) | `quant_method="gptq"`, `bits=4`, explicit `desc_act` and `sym`; `checkpoint_format` absent or `"gptq"` | I32 `qweight[K/8,M]`, I32 `qzeros[G,M/8]`, F16 `scales[G,M]`, I32 `g_idx[K]` | Eight consecutive input codes per word; output zeros are consecutive nibbles and decode as **stored value + 1**. `g_idx[k]` selects each input's scale/zero group. |
 
 For both formats, `weight[m,k] = (code - zero) * scale`. Scales remain F16 in
-storage; multiplication and accumulation use F32 activations. Group size must
+storage; CPU uses F32 activations, HIP uses F16 activations with F32 register accumulation. Group size must
 be 32, 64, 128, or -1 (one group covering K), K must contain whole groups, and
 M must be divisible by 8. GPTQ additionally requires K divisible by 32.
 Every component's dtype, shape and exact byte count is validated. Scales must
@@ -40,11 +41,11 @@ packed embeddings/heads, fused projections, QK normalization, nonzero biases,
 MoE and other architectures fail during loading. GPTQ exports may contain
 F16 bias buffers for bias-free Llama: only exact-zero vectors of the expected
 shape are accepted and ignored, without allocating converted biases. Tensor
-overlays and GPU execution are rejected. Raw `SafetensorsFile.Open` callers
+overlays and CUDA/Vulkan execution of these producer formats are rejected. Raw `SafetensorsFile.Open` callers
 must use `ModelLoader.OpenSafetensorsAndConfig` before loading packed weights;
 the loader never guesses AWQ versus GPTQ from tensor shapes.
 
-Each projection owns a **64-byte descriptor** pointing into the source's
+On CPU, each projection owns a **64-byte descriptor** pointing into the source's
 existing single-file or sharded mappings. `PackedQuantizedSafetensorsSource`
 exposes packed physical bytes and logical parameter counts separately; its
 `Tensors` still describes the original physical storage. The source owns the
@@ -68,6 +69,15 @@ Transformers 4.51.3 and SafeTensors installed. The script runs the pinned
 producer's unpacking code with F32 scratch scales, then the Hugging Face eager
 Llama implementation; this isolates format correctness from GPU F16 arithmetic
 rounding. Model data and generated logits remain outside the repository.
+
+HIP directly loads every original component range, including GPTQ group indices;
+it never uploads the CPU descriptor's host pointers. Device kernels decode the
+producer's packing and zero-point convention in registers. Floating-point tensors
+may be F16 or BF16; F32 norms narrow on device. `HipSafeTensorsKernelTests` and
+`HipSafetensorsFormatsTests` cover primitive layouts, shards, tied heads, byte
+accounting and real checkpoints, with deliberately incorrect layouts/file ranges
+that must fail the numerical comparison. HIP activations remain F16; see
+[PRECISION.md](PRECISION.md#9-hip-dense-integration-rx-6900-xt) for measured limits.
 
 ## Block Layouts
 

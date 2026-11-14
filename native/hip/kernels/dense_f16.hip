@@ -1,4 +1,4 @@
-// Dense single-token HIP primitives. Resident tensors are F16 or packed GGUF; reductions stay in registers.
+// Dense single-token HIP primitives. Resident weights stay F16/BF16/packed; reductions stay in registers.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
@@ -42,6 +42,64 @@ extern "C" __global__ void dense_linear_f16(
     float sum = 0.0f;
     for (size_t i = threadIdx.x; i < (size_t)inDim; i += 32)
         sum = fmaf(__half2float(input[i]), __half2float(weights[(size_t)row * inDim + i]), sum);
+    sum = sum32(sum);
+    if (threadIdx.x == 0) output[row] = __float2half(sum);
+}
+
+__device__ __forceinline__ float bf16_value(unsigned short value)
+{
+    return __uint_as_float((unsigned int)value << 16);
+}
+
+extern "C" __global__ void dense_embed_bf16(__half* output, const unsigned short* weights, int token, int dim)
+{
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) output[i] = __float2half(bf16_value(weights[(size_t)token * dim + i]));
+}
+
+extern "C" __global__ void dense_rmsnorm_bf16(
+    __half* output, const __half* input, const unsigned short* weight, int dim, float epsilon)
+{
+    float sum = 0.0f;
+    for (size_t i = threadIdx.x; i < (size_t)dim; i += 32)
+    {
+        float value = __half2float(input[i]);
+        sum = fmaf(value, value, sum);
+    }
+    float inverse = rsqrtf(sum32(sum) / dim + epsilon);
+    for (size_t i = threadIdx.x; i < (size_t)dim; i += 32)
+        output[i] = __float2half(__half2float(input[i]) * inverse * bf16_value(weight[i]));
+}
+
+extern "C" __global__ void dense_linear_bf16(
+    __half* output, const __half* input, const unsigned short* weights, int outDim, int inDim)
+{
+    int row = blockIdx.x;
+    float sum = 0.0f;
+    for (size_t i = threadIdx.x; i < (size_t)inDim; i += 32)
+        sum = fmaf(__half2float(input[i]), bf16_value(weights[(size_t)row * inDim + i]), sum);
+    sum = sum32(sum);
+    if (threadIdx.x == 0) output[row] = __float2half(sum);
+}
+
+extern "C" __global__ void dense_linear_packed4(
+    __half* output, const __half* input, const unsigned int* qweight, const __half* scales,
+    const unsigned int* qzeros, const int* groupIndices, int outDim, int inDim, int groupSize, int awq)
+{
+    int row = blockIdx.x, lane = row % 8;
+    // AutoAWQ packs logical outputs [0,2,4,6,1,3,5,7]; GPTQ packs consecutive K values.
+    int zeroShift = (awq ? (lane % 2) * 4 + lane / 2 : lane) * 4;
+    float sum = 0.0f;
+    for (size_t i = threadIdx.x; i < (size_t)inDim; i += 32)
+    {
+        int group = awq ? i / groupSize : groupIndices[i];
+        unsigned int packed = awq ? qweight[i * (outDim / 8) + row / 8]
+            : qweight[(i / 8) * outDim + row];
+        int code = (packed >> (awq ? zeroShift : (i % 8) * 4)) & 15;
+        int zero = ((qzeros[(size_t)group * (outDim / 8) + row / 8] >> zeroShift) & 15) + (awq ? 0 : 1);
+        float weight = (code - zero) * __half2float(scales[(size_t)group * outDim + row]);
+        sum = fmaf(__half2float(input[i]), weight, sum);
+    }
     sum = sum32(sum);
     if (threadIdx.x == 0) output[row] = __float2half(sum);
 }

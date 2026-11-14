@@ -12,6 +12,7 @@ public sealed unsafe class DenseF16Kernels : IDisposable
     private readonly HipModule _module;
     private readonly nint _embed, _convertF32, _rmsNorm, _linear, _add, _swiGlu, _rope, _writeKv, _attention;
     private readonly nint _embedPacked, _linearPacked, _writeKvPacked, _attentionPacked;
+    private readonly nint _embedBf16, _linearBf16, _rmsNormBf16, _linearPacked4;
     private bool _disposed;
 
     /// <summary>Loads the complete dense primitive manifest from <c>dense_f16.co</c>.</summary>
@@ -43,6 +44,10 @@ public sealed unsafe class DenseF16Kernels : IDisposable
             _linearPacked = _module.GetFunction("dense_linear_packed");
             _writeKvPacked = _module.GetFunction("dense_write_kv_packed");
             _attentionPacked = _module.GetFunction("dense_attention_packed");
+            _embedBf16 = _module.GetFunction("dense_embed_bf16");
+            _linearBf16 = _module.GetFunction("dense_linear_bf16");
+            _rmsNormBf16 = _module.GetFunction("dense_rmsnorm_bf16");
+            _linearPacked4 = _module.GetFunction("dense_linear_packed4");
         }
         catch
         {
@@ -60,10 +65,18 @@ public sealed unsafe class DenseF16Kernels : IDisposable
         Launch(_embed, Blocks(dim), 256, args);
     }
 
-    /// <summary>Reads one F16/Q4_0/Q8_0 embedding row directly into an F16 activation row.</summary>
+    /// <summary>Reads one F16/BF16/Q4_0/Q8_0 embedding row directly into an F16 activation row.</summary>
     public void Embed(nint output, nint weights, int token, int dim, QuantizationType qt)
     {
         if (qt == QuantizationType.F16) { Embed(output, weights, token, dim); return; }
+        if (qt == QuantizationType.BF16)
+        {
+            Pointer(output); Pointer(weights); Positive(dim);
+            ArgumentOutOfRangeException.ThrowIfNegative(token);
+            void** bf16Args = stackalloc void*[] { &output, &weights, &token, &dim };
+            Launch(_embedBf16, Blocks(dim), 256, bf16Args);
+            return;
+        }
         int type = PackedWeightType(qt, dim);
         Pointer(output); Pointer(weights);
         ArgumentOutOfRangeException.ThrowIfNegative(token);
@@ -87,6 +100,17 @@ public sealed unsafe class DenseF16Kernels : IDisposable
         Launch(_rmsNorm, 1, 32, args);
     }
 
+    /// <summary>Normalizes one F16 row using a resident F16 or BF16 scale vector.</summary>
+    public void RmsNorm(nint output, nint input, nint weight, int dim, float epsilon, QuantizationType qt)
+    {
+        if (qt == QuantizationType.F16) { RmsNorm(output, input, weight, dim, epsilon); return; }
+        if (qt != QuantizationType.BF16)
+            throw new NotSupportedException($"HIP norm weights support F16 or BF16, not {qt}.");
+        Pointer(output); Pointer(input); Pointer(weight); Positive(dim); PositiveFinite(epsilon);
+        void** args = stackalloc void*[] { &output, &input, &weight, &dim, &epsilon };
+        Launch(_rmsNormBf16, 1, 32, args);
+    }
+
     /// <summary>Computes output[outDim] = weights[outDim,inDim] × input[inDim], with F32 register accumulation.</summary>
     public void Linear(nint output, nint input, nint weights, int outDim, int inDim)
     {
@@ -95,14 +119,42 @@ public sealed unsafe class DenseF16Kernels : IDisposable
         Launch(_linear, (uint)outDim, 32, args);
     }
 
-    /// <summary>Projects an F16 activation row using resident F16/Q4_0/Q8_0 weights without expanding the matrix.</summary>
+    /// <summary>Projects an F16 activation row using resident F16/BF16/Q4_0/Q8_0 weights without expanding the matrix.</summary>
     public void Linear(nint output, nint input, nint weights, int outDim, int inDim, QuantizationType qt)
     {
         if (qt == QuantizationType.F16) { Linear(output, input, weights, outDim, inDim); return; }
+        if (qt == QuantizationType.BF16)
+        {
+            Pointer(output); Pointer(input); Pointer(weights); Positive(outDim); Positive(inDim);
+            void** bf16Args = stackalloc void*[] { &output, &input, &weights, &outDim, &inDim };
+            Launch(_linearBf16, (uint)outDim, 32, bf16Args);
+            return;
+        }
         int type = PackedWeightType(qt, inDim);
         Pointer(output); Pointer(input); Pointer(weights); Positive(outDim);
         void** args = stackalloc void*[] { &output, &input, &weights, &outDim, &inDim, &type };
         Launch(_linearPacked, (uint)outDim, 32, args);
+    }
+
+    /// <summary>Projects an F16 activation row directly from validated AutoAWQ GEMM4 or legacy AutoGPTQ4 components.</summary>
+    /// <remarks>GPTQ group indices and component extents must already have been validated by the model loader.</remarks>
+    public void LinearPacked4(nint output, nint input, nint qweight, nint scales, nint qzeros,
+        nint groupIndices, int outDim, int inDim, int groupSize, QuantizationType qt)
+    {
+        if (qt is not (QuantizationType.Awq4 or QuantizationType.Gptq4))
+            throw new NotSupportedException($"HIP packed4 weights require Awq4 or Gptq4, not {qt}.");
+        Pointer(output); Pointer(input); Pointer(qweight); Pointer(scales); Pointer(qzeros);
+        Positive(outDim); Positive(inDim);
+        if (groupSize == -1) groupSize = inDim;
+        if (outDim % 8 != 0 || groupSize <= 0 || inDim % groupSize != 0
+            || (groupSize is not (32 or 64 or 128) && groupSize != inDim)
+            || (qt == QuantizationType.Gptq4 && inDim % 32 != 0))
+            throw new ArgumentException("Packed HIP dimensions require complete validated groups and eight output lanes.");
+        if (qt == QuantizationType.Gptq4) Pointer(groupIndices);
+        int awq = qt == QuantizationType.Awq4 ? 1 : 0;
+        void** args = stackalloc void*[] { &output, &input, &qweight, &scales, &qzeros, &groupIndices,
+            &outDim, &inDim, &groupSize, &awq };
+        Launch(_linearPacked4, (uint)outDim, 32, args);
     }
 
     /// <summary>Adds two F16 vectors; output may alias either input.</summary>
@@ -198,7 +250,7 @@ public sealed unsafe class DenseF16Kernels : IDisposable
     private static int PackedWeightType(QuantizationType type, int width)
     {
         if (type is not (QuantizationType.Q4_0 or QuantizationType.Q8_0))
-            throw new NotSupportedException($"HIP dense weights support F16, Q4_0 and Q8_0, not {type}.");
+            throw new NotSupportedException($"HIP dense weights support F16, BF16, Q4_0 and Q8_0, not {type}.");
         Positive(width);
         if (width % 32 != 0)
             throw new ArgumentException("Packed HIP weight rows must contain a multiple of 32 elements.", nameof(width));

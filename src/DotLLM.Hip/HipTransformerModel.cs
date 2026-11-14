@@ -65,7 +65,7 @@ public sealed unsafe class HipTransformerModel : IModel
         return Load(config, deviceId, coDirectory, (context, stream, kernels) => HipWeights.Load(file, config, context, stream, kernels));
     }
 
-    /// <summary>Loads supported F16 HuggingFace weights directly from their original shards. The caller owns the source.</summary>
+    /// <summary>Loads supported F16, BF16 or validated AWQ4/GPTQ4 weights directly from their original shards. The caller owns the source.</summary>
     public static HipTransformerModel LoadFromSafetensors(ISafetensorsTensorSource source, ModelConfig config,
         int deviceId = 0, string? coDirectory = null)
     {
@@ -202,7 +202,7 @@ public sealed unsafe class HipTransformerModel : IModel
                         ForwardToken(tokenIds[i], positions[i], cache);
                         cache.CommitPosition();
                     }
-                    _kernels.RmsNorm(_norm, _hidden, _weights.OutputNorm, Config.HiddenSize, Config.NormEpsilon);
+                    RmsNorm(_norm, _hidden, _weights.OutputNorm);
                     Linear(_logits, _norm, _weights.Output, Config.VocabSize, Config.HiddenSize);
                     _stream.Synchronize();
                     HipDriverApi.hipMemcpyDtoH(_hostLogits.DataPointer, _logits, checked((nuint)Config.VocabSize * sizeof(ushort))).ThrowOnError();
@@ -234,7 +234,7 @@ public sealed unsafe class HipTransformerModel : IModel
         for (int layer = 0; layer < _weights.Layers.Length; layer++)
         {
             var w = _weights.Layers[layer];
-            _kernels.RmsNorm(_norm, _hidden, w.AttnNorm, h, Config.NormEpsilon);
+            RmsNorm(_norm, _hidden, w.AttnNorm);
             Linear(_q, _norm, w.Q, q, h);
             Linear(_k, _norm, w.K, kv, h);
             Linear(_v, _norm, w.V, kv, h);
@@ -246,7 +246,7 @@ public sealed unsafe class HipTransformerModel : IModel
                 cache.PageTokens, heads, kvHeads, d, position + 1, 1f / MathF.Sqrt(d), cache.KeyType, cache.ValueType);
             Linear(_projection, _attention, w.O, h, q);
             _kernels.Add(_hidden, _hidden, _projection, h);
-            _kernels.RmsNorm(_norm, _hidden, w.FfnNorm, h, Config.NormEpsilon);
+            RmsNorm(_norm, _hidden, w.FfnNorm);
             Linear(_ffnGate, _norm, w.Gate, f, h);
             Linear(_ffnUp, _norm, w.Up, f, h);
             _kernels.SwiGlu(_ffnGate, _ffnGate, _ffnUp, f);
@@ -256,7 +256,16 @@ public sealed unsafe class HipTransformerModel : IModel
     }
 
     private void Linear(nint output, nint input, HipWeights.Matrix weight, int rows, int columns)
-        => _kernels.Linear(output, input, weight.Pointer, rows, columns, weight.Type);
+    {
+        if (weight.Type is QuantizationType.Awq4 or QuantizationType.Gptq4)
+            _kernels.LinearPacked4(output, input, weight.Pointer, weight.Scales, weight.QZeros, weight.GroupIndices,
+                rows, columns, weight.GroupSize, weight.Type);
+        else
+            _kernels.Linear(output, input, weight.Pointer, rows, columns, weight.Type);
+    }
+
+    private void RmsNorm(nint output, nint input, HipWeights.Matrix weight)
+        => _kernels.RmsNorm(output, input, weight.Pointer, Config.HiddenSize, Config.NormEpsilon, weight.Type);
 
     /// <inheritdoc/>
     public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)

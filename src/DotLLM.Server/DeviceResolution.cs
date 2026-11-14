@@ -151,9 +151,9 @@ public static class DeviceModelLoader
         if (spec.Kind is DeviceKind.Cpu or DeviceKind.Auto)
         {
             if (requestedGpuLayers is not null and not 0)
-                throw new NotSupportedException("SafeTensors CPU loading has no GPU offload. Omit --gpu-layers, or select --device hip for supported full-device F16 models.");
+                throw new NotSupportedException("SafeTensors CPU loading has no GPU offload. Omit --gpu-layers, or select --device hip for supported full-device F16/BF16/AWQ4/GPTQ4 models.");
             string? warning = spec.Kind == DeviceKind.Auto
-                ? "Running SafeTensors on the CPU: --device auto does not opt into experimental HIP. Select --device hip:N explicitly for supported F16 checkpoints."
+                ? "Running SafeTensors on the CPU: --device auto does not opt into experimental HIP. Select --device hip:N explicitly for supported F16/BF16/AWQ4/GPTQ4 checkpoints."
                 : null;
             log($"CPU SafeTensors inference ({threading.EffectiveThreadCount} threads)");
             var (model, source, _) = ModelLoader.LoadFromSafetensors(directory, threading);
@@ -174,7 +174,7 @@ public static class DeviceModelLoader
             tensors = opened.Source;
             if (requestedGpuLayers is >= 0 && requestedGpuLayers < opened.Config.NumLayers)
                 throw new NotSupportedException("HIP SafeTensors loading requires all layers on the selected GPU; partial offload is unsupported.");
-            log($"HIP SafeTensors inference (device {spec.Ordinal}); dense Llama F16, paged device KV");
+            log($"HIP SafeTensors inference (device {spec.Ordinal}); dense Llama F16/BF16/AWQ4/GPTQ4, paged device KV");
             var model = DotLLM.Hip.HipTransformerModel.LoadFromSafetensors(tensors, opened.Config, spec.Ordinal);
             return (new DeviceLoadResult(model, size => model.CreateKvCache(size), spec.Canonical, null), tensors);
         }

@@ -28,10 +28,10 @@ The .NET project also rebuilds stale code objects when `hipcc` is available. `Hi
 
 | Code object | Entry points |
 | --- | --- |
-| `dense_f16.co` | `dense_embed_f16`, `dense_convert_f32_f16`, `dense_rmsnorm_f16`, `dense_linear_f16`, `dense_add_f16`, `dense_swiglu_f16`, `dense_rope_f16`, `dense_write_kv_f16`, `dense_attention_f16`, `dense_embed_packed`, `dense_linear_packed`, `dense_write_kv_packed`, `dense_attention_packed` |
+| `dense_f16.co` | `dense_embed_f16`, `dense_convert_f32_f16`, `dense_rmsnorm_f16`, `dense_linear_f16`, `dense_add_f16`, `dense_swiglu_f16`, `dense_rope_f16`, `dense_write_kv_f16`, `dense_attention_f16`, `dense_embed_packed`, `dense_linear_packed`, `dense_write_kv_packed`, `dense_attention_packed`, `dense_embed_bf16`, `dense_rmsnorm_bf16`, `dense_linear_bf16`, `dense_linear_packed4` |
 | `rmsnorm.co` | Existing `rmsnorm_f32` and `rmsnorm_f16` |
 
-The dense kernels store F16 activations, F16 or packed weights, and independently typed F16/Q8_0 K/V. Projection, RMSNorm and online attention use F32 register accumulation. The conversion kernel is for narrowing file-backed F32 tensors during loading; callers release the source after the queued conversion completes.
+The dense kernels store F16 activations, F16/BF16 or packed weights, and independently typed F16/Q8_0 K/V. Projection, RMSNorm and online attention use F32 register accumulation. BF16 weights are decoded from their original bits in registers. The conversion kernel is for narrowing file-backed F32 norms during loading; callers release the source after the queued conversion completes.
 
 - Linear weights are row-major `[outputDimension,inputDimension]`; this initial path processes one token at a time.
 - RoPE supports standard adjacent-pair and NeoX split-half layouts, including a partial rotary dimension. Its scale multiplies the position.
@@ -45,7 +45,7 @@ The packed overloads accept `QuantizationType` for embedding/projection and inde
 
 | Resident format | Bytes per row of N elements | Shape boundary |
 | --- | --- | --- |
-| F16 weights | `2 * N` | Positive row width |
+| F16/BF16 weights | `2 * N` | Positive row width |
 | GGUF Q4_0 weights | `18 * N / 32` | Row width divisible by 32 |
 | GGUF Q8_0 weights | `34 * N / 32` | Row width divisible by 32 |
 | F16 KV | `2 * N` | Head dimension up to 256 |
@@ -53,7 +53,9 @@ The packed overloads accept `QuantizationType` for embedding/projection and inde
 
 Packed embedding reads only the selected row into the F16 activation. Projection decodes individual packed values in registers, including during sequential prefill; it never materializes a wider matrix. KV pages hold `[pageTokens, kvHeads * headDimension]` rows in each plane's own format. K and V tables may name separate allocations or separate regions of a combined allocation; their row strides are independent. Attention reads those rows directly without dequantized history or score scratch. Q8 writes use max-absolute-value scales, ties-to-even rounding and symmetric [-127,127] clamping, matching the target CPU quantizer. Packed block layouts follow the target CPU scalar dequantizers.
 
-This primitive set does not implement Q4 KV, other quantized formats, BF16 weights, AWQ/GPTQ, hybrid/recurrent layers, or fused multi-token prefill. Unsupported format/shape overloads fail before launch.
+SafeTensors AWQ GEMM4 and legacy GPTQ4 projection reads the original qweight, F16 scales, qzeros and optional GPTQ group-index buffers. Each matrix holds `K*N/2` qweight bytes, `2*groups*N` scale bytes and `groups*N/2` zero bytes; GPTQ also retains `4*K` group-index bytes. AWQ uses its producer nibble permutation. GPTQ packs along K, adds one to stored zero points and follows validated group indices. No wider matrix is stored. The managed loader validates these layouts and supported group sizes before allocating.
+
+This primitive set does not implement Q4 KV, quantized formats outside the stated subset, hybrid/recurrent layers, or fused multi-token prefill. Unsupported format/shape overloads fail before launch.
 
 ## Qualification
 
@@ -71,3 +73,5 @@ The matrix tests cover nonsquare shapes, padded leading dimensions and all trans
 Changing the native GQA mapping to `head % kvHeads` caused both attention cases (head dimensions 40 and 256) to fail numerically; restoring the division mapping passed both. The `gfx1030` code-object metadata reports zero shared/private segment bytes and zero register spills for all dense kernels, including attention.
 
 The packed extension adds 22 cases: Q4_0/Q8_0 nonsquare projection and nonzero embedding rows at widths 32/64/128/256; independent F16/Q8_0 K/V combinations; byte-exact Q8 writes including zero blocks and rounding ties; reversed page tables, partially filled pages, guard bytes and unsupported geometry. With the 18 existing checks, **40/40 passed with zero skips** on the same RX 6900 XT. Swapping the native Q4 nibble halves failed all four Q4 cases while Q8 cases passed. Replacing the packed attention head grouping with modulo failed all twelve mixed/quantized cases while F16/F16 passed. The restored binary passed all forty again. Both compiled architectures report zero shared/private segment bytes and zero register spills in all thirteen kernels; only gfx1030 was executed. These are primitive checks; real-checkpoint quantized quality and throughput are separate qualification.
+
+The SafeTensors extension adds **11/11 passing GPU cases, zero skips** on the same RX 6900 XT: BF16 embedding, RMSNorm and projection, plus AWQ/GPTQ grouped projection. Wrong BF16 interpretation, AWQ nibble ordering, GPTQ zero offsets and noncanonical group indices all change the asserted results; original packed component bytes remain unchanged. The rebuilt object contains all 17 entry points for both architectures. Its SHA-256 is `5BB968AF7A33B4ABA4B4C98A7B3F4163EEB56BEA7B91CFA139E9015E228217A7`.

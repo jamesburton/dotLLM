@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Engine.KvCache;
 using DotLLM.Hip;
@@ -13,12 +14,16 @@ namespace DotLLM.Tests.Unit.Hip;
 public sealed partial class HipTransformerModelTests
 {
     [SkippableTheory]
-    [InlineData(false, false)]
-    [InlineData(false, true)]
-    [InlineData(true, false)]
-    [InlineData(true, true)]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(false, false, true)]
+    [InlineData(false, true, true)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, true)]
     [Trait("Category", "GPU")]
-    public void SafeTensorsDirectLoading_MatchesCpuAcrossShardsAndTiedHeads(bool sharded, bool tied)
+    public void SafeTensorsDirectLoading_MatchesCpuAcrossShardsAndTiedHeads(bool sharded, bool tied, bool bf16)
     {
         RequireGpu();
         Fixture fixture = CreateFixture(tied);
@@ -26,7 +31,7 @@ public sealed partial class HipTransformerModelTests
         Directory.CreateDirectory(directory);
         try
         {
-            string path = WriteHfFixture(fixture, directory, sharded);
+            string path = WriteHfFixture(fixture, directory, sharded, bf16: bf16);
             HipTransformerModel model;
             using (var source = Open(path)) model = HipTransformerModel.LoadFromSafetensors(source, fixture.Config);
             using (model)
@@ -54,24 +59,24 @@ public sealed partial class HipTransformerModelTests
     }
 
     [Fact]
-    public void SafeTensorsBf16IsRejectedBeforeDeviceInitialization()
+    public void SafeTensorsF32MatrixIsRejectedBeforeDeviceInitialization()
     {
         Fixture fixture = CreateFixture(false);
         string directory = Path.Combine(Path.GetTempPath(), $"dotllm-hip-hf-reject-{Guid.NewGuid():N}");
         Directory.CreateDirectory(directory);
         try
         {
-            using var source = SafetensorsFile.Open(WriteHfFixture(fixture, directory, false, bf16Embedding: true));
+            using var source = SafetensorsFile.Open(WriteHfFixture(fixture, directory, false, f32Embedding: true));
             var error = Assert.Throws<NotSupportedException>(() =>
             {
                 using var rejected = HipTransformerModel.LoadFromSafetensors(source, fixture.Config, deviceId: -1);
             });
-            Assert.Contains("BF16", error.Message, StringComparison.Ordinal);
+            Assert.Contains("F32", error.Message, StringComparison.Ordinal);
         }
         finally { Directory.Delete(directory, recursive: true); }
     }
 
-    private static unsafe string WriteHfFixture(Fixture fixture, string directory, bool sharded, bool bf16Embedding = false)
+    private static unsafe string WriteHfFixture(Fixture fixture, string directory, bool sharded, bool bf16 = false, bool f32Embedding = false)
     {
         using var gguf = GgufFile.Open(fixture.Path);
         var builders = new[] { new SafetensorsFixtureBuilder(), new SafetensorsFixtureBuilder() };
@@ -88,9 +93,28 @@ public sealed partial class HipTransformerModelTests
             int[] shape = tensor.Shape.Dimensions.Reverse().ToArray();
             int bytes = checked(shape.Aggregate(1, (a, b) => a * b) * (tensor.QuantizationType == QuantizationType.F32 ? 4 : 2));
             string dtype = tensor.QuantizationType == QuantizationType.F32 ? "F32" : "F16";
-            if (bf16Embedding && string.Equals(tensor.Name, "token_embd.weight", StringComparison.Ordinal)) dtype = "BF16";
+            byte[] data = new ReadOnlySpan<byte>((void*)gguf.TensorDataPointer(tensor.Name), bytes).ToArray();
+            if (bf16)
+            {
+                int count = shape.Aggregate(1, (a, b) => a * b);
+                var values = new ushort[count];
+                for (int i = 0; i < count; i++)
+                {
+                    float value = tensor.QuantizationType == QuantizationType.F32
+                        ? ((float*)gguf.TensorDataPointer(tensor.Name))[i] : (float)((Half*)gguf.TensorDataPointer(tensor.Name))[i];
+                    uint bits = BitConverter.SingleToUInt32Bits(value);
+                    values[i] = (ushort)((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
+                }
+                data = MemoryMarshal.AsBytes(values.AsSpan()).ToArray();
+                dtype = "BF16";
+            }
+            if (f32Embedding && string.Equals(tensor.Name, "token_embd.weight", StringComparison.Ordinal))
+            {
+                data = MemoryMarshal.AsBytes(MemoryMarshal.Cast<byte, Half>(data).ToArray().Select(x => (float)x).ToArray().AsSpan()).ToArray();
+                dtype = "F32";
+            }
             int shard = sharded ? map.Count % 2 : 0;
-            builders[shard].AddRaw(name, dtype, shape, new ReadOnlySpan<byte>((void*)gguf.TensorDataPointer(tensor.Name), bytes).ToArray());
+            builders[shard].AddRaw(name, dtype, shape, data);
             map.Add(name, shard == 0 ? "a.safetensors" : "b.safetensors");
         }
         string aPath = Path.Combine(directory, "a.safetensors");

@@ -65,6 +65,7 @@ public sealed unsafe class PackedQuantizedSafetensorsTests : IDisposable
             Assert.Equal(40, result.Shape[1]);
         }
         Assert.Throws<ObjectDisposedException>(() => source.GetTensorPointer(Projection + ".qweight"));
+        Assert.Throws<ObjectDisposedException>(() => source.GetTensorFileLocation(Projection + ".qweight"));
         source.Dispose();
     }
 
@@ -273,8 +274,8 @@ public sealed unsafe class PackedQuantizedSafetensorsTests : IDisposable
             Assert.InRange(Math.Abs(expected[i] - actual[i]), 0, tolerance * (1 + Math.Abs(expected[i])));
     }
 
-    private sealed record Tensor(string DType, int[] Shape, byte[] Bytes);
-    private sealed class Fixture
+    internal sealed record Tensor(string DType, int[] Shape, byte[] Bytes);
+    internal sealed class Fixture
     {
         public Dictionary<string, Tensor> Tensors { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, float[]> Dense { get; } = new(StringComparer.Ordinal);

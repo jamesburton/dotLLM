@@ -2,8 +2,9 @@
 
 `run`, `chat` and `serve` accept `--device hip` (HIP device 0) or `--device hip:N`.
 The implementation supports dense Llama GGUF checkpoints with F16, Q4_0 or Q8_0 matrices,
-and local HuggingFace SafeTensors checkpoints with F16 matrices. Normalization weights
-may be F16 or F32; F32 norms are narrowed on the GPU during load. Quantized matrices
+and local HuggingFace SafeTensors checkpoints with F16, BF16, validated AWQ GEMM4 or
+legacy GPTQ4 matrices. HF normalization weights may be F16, BF16 or F32; F32 norms
+are narrowed on the GPU during load. BF16 weights retain their original bits. Quantized matrices
 stay packed, activations stay F16, and reductions accumulate in registers at F32.
 The final logit row widens to the existing `IModel` CPU-sampling F32 result contract
 (`4 * vocabulary` bytes, 196,608 bytes for the qualified SmolLM2 checkpoint).
@@ -37,21 +38,23 @@ have no long-context quality qualification. See the [measurements and limits](PR
 
 ## Current boundary
 
-- Windows x64, AMD HIP SDK 6.4.2, with the runtime and a compatible display driver installed.
+- Windows x64 is hardware-qualified with AMD HIP SDK 6.4.2 and a compatible display driver.
 - Native kernels and direct loading have been exercised on an RX 6900 XT (`gfx1030`).
   The distributed code objects also contain `gfx1100`; that target is not hardware-qualified here.
   Enumeration alone does not establish inference support: for example, `gfx1036` has no bundled image.
 - Dense Llama, causal GQA/MHA, RMSNorm, SiLU and standard or linear RoPE.
   Unsupported geometry or architecture features fail before weight allocation.
 - GGUF matrices support F16, Q4_0 and Q8_0. KV pages independently support F16 or Q8_0
-  for keys and values; Q8_0 requires head dimensions divisible by 32. Q4_0 KV, BF16 model
-  weights, bias tensors, MoE, recurrent/hybrid architectures, LoRA and MTP are unsupported.
+  for keys and values; Q8_0 requires head dimensions divisible by 32. Q4_0 KV, BF16 GGUF,
+  nonzero bias tensors, MoE, recurrent/hybrid architectures, LoRA and MTP are unsupported.
 - All weights stay on the selected GPU. Partial `--gpu-layers` and `--gpu-layers 0`
   are rejected. Omit this flag or use `-1` for all layers.
 - HF SafeTensors uses the existing single-file/sharded reader and HF config/tokenizer
-  extraction. It accepts F16 matrices and F16/F32 norms. Raw HF Q/K rows use NeoX
+  extraction. It accepts F16/BF16 matrices and F16/BF16/F32 norms. Raw HF Q/K rows use NeoX
   rotate-half RoPE; GGUF-converted Llama Q/K rows normally use adjacent pairs.
-  BF16 and packed AWQ/GPTQ HF checkpoints require separate GPU support and are rejected.
+  Packed AWQ/GPTQ follows the same validated subset as CPU: separate dense Llama projections,
+  four-bit producer layouts, F16 scales, supported group sizes and validated GPTQ group indices.
+  Original qweight/qzeros/scales/g_idx file ranges load directly and stay packed on device.
 - `bench`, `perplexity` and `embed` have separate execution paths and do not accept HIP yet.
 - Linux runtime probing and native compilation exist, but model loading currently
   requires the Windows DirectStorage route and fails explicitly on other platforms.
@@ -81,6 +84,9 @@ dotllm serve E:\models\hf-llama-f16 --device hip:0
 K/V defaults to F16. Each side accepts `f16` or `q8_0`, including mixed K/V selections.
 F32, Q4_0, TurboQuant and a mixed-precision window are rejected. HIP always uses
 its own pages allocated as the sequence grows, regardless of generic CPU cache flags.
+Actual 1K/2K/4K/8K probes pass the original logit-error gates with F16 KV; Q8 fails
+those gates at every length. Q8 saves memory but is not qualified as F16-equivalent
+quality. See the measured scoring windows and memory results in [PRECISION.md](PRECISION.md#actual-1k8k-histories).
 
 HF directories must contain `config.json`, tokenizer assets and either a SafeTensors
 file or `model.safetensors.index.json`. `auto` chooses CPU for HF; HIP requires an
@@ -91,8 +97,8 @@ separate MTP/DFlash heads. There is no runtime BF16-to-F16 checkpoint conversion
 
 `GET /v1/devices` distinguishes runtime availability from inference readiness.
 HIP entries report `servable` and a `note` per device. Readiness checks load the
-complete dense kernel manifest on that device and initialize its DirectStorage
-session. Missing assets or an unsupported device remain visible but unselectable.
+complete dense kernel manifest on that device and initialize its DirectStorage session.
+Missing assets or an unsupported device remain visible but unselectable.
 This preflight does not promise that a particular model will fit in free memory.
 The WebUI offers only servable devices and leaves HIP as an explicit choice.
 
