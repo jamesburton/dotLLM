@@ -249,6 +249,26 @@ Templates use **Jinja2 syntax** (HuggingFace standard), stored in:
 - GGUF: `tokenizer.chat_template` metadata key
 - HuggingFace: `tokenizer_config.json` → `chat_template` field
 
+For local HuggingFace SafeTensors checkpoints, `run` and `chat` use
+`HfChatTemplateFactory` with the existing HF tokenizer. It accepts an embedded
+string, a name-to-template object, or a list of `{ "name", "template" } entries.
+Standalone `chat_template.jinja` overrides the embedded `default` entry;
+`additional_chat_templates/<name>.jinja` overrides the corresponding named entry.
+With tools, `tool_use` is selected when present; otherwise `default` is required.
+The loader never picks an arbitrary named entry. Invalid JSON, malformed template
+declarations and unsupported Jinja fail instead of silently changing the prompt.
+
+Templates receive the loaded tokenizer's BOS/EOS spellings and retain its
+control-token guard. With no template, `run` keeps the raw prompt and `chat` warns
+and uses its plain transcript fallback. With a template, SafeTensors `run` formats
+the prompt as one user turn and appends the generation prompt. GGUF selection is
+unchanged. HF tool prompting requires the selected template to reference the
+wired `tools` or `xml_tools` variable; comments and quoted text do not qualify.
+Otherwise the CLI warns and ignores `--tools`. The existing parser is selected
+from the chosen template source and model architecture. A `python_tools`-only
+template needs explicit template kwargs, which these CLI entry points do not
+currently provide. Template wiring does not establish a model's tool-calling quality.
+
 ### Required Jinja2 Subset
 
 Full Jinja2 is not needed. Required features:
