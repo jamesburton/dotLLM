@@ -223,13 +223,25 @@ public sealed unsafe class NemotronHTransformerModelRecurrentBatchTests
                 "an uncached continuation (positions[0] > 0) matched a cold model: the state was reset on a continuing call.");
         }
 
+        float[] defaultContinued;
+        using (var used = Build(fix))
+        {
+            AllRows(used.Forward(a, posA, -1));
+            defaultContinued = AllRows(used.Forward(b, posCont, -1));
+        }
+
         using (var used = Build(fix))
         using (var state = used.CreateSequenceState()!)
         {
-            AllRows(used.Forward(a, posA, -1, kvCache: null, ssmState: (ISsmState)state));
+            AllRows(used.Forward(a, posA, -1));   // a model-owned sequence in flight...
+            AllRows(used.Forward(a, posA, -1, kvCache: null, ssmState: (ISsmState)state));   // ...while a threaded one runs A then B
             float[] carried = AllRows(used.Forward(b, posB, -1, kvCache: null, ssmState: (ISsmState)state));
             Assert.True(MaxAbsDiff(freshB, carried) > 1e-4f,
                 "a caller-threaded SSM state was zeroed by a position-0 forward: only the model-owned default may be reset.");
+            float[] continued = AllRows(used.Forward(b, posCont, -1));
+            Assert.True(defaultContinued.AsSpan().SequenceEqual(continued),
+                "a threaded position-0 forward reset another sequence's model-owned default SSM state: the auto-reset must only " +
+                "fire when no state container is passed.");
         }
     }
 

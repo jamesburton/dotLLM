@@ -182,12 +182,24 @@ public sealed class UncachedForwardRecurrentResetTests : IDisposable
     private static void AssertThreadedStateKept<TModel>(TModel model, TModel fresh, Func<TModel, int[], int[], ITensor> threaded)
         where TModel : IModel
     {
+        Func<TModel, int[], int[], ITensor> uncached = (m, ids, pos) => m.Forward(ids, pos, -1);
+
+        // A model-owned sequence is in flight while a threaded sequence runs A then B at position 0 through its own container.
+        Run(model, uncached, PromptA, From(0, PromptA.Length));
         Run(model, threaded, PromptA, From(0, PromptA.Length));
         float[] carried = Run(model, threaded, PromptB, From(0, PromptB.Length));
-        float[] freshB = Run(fresh, (m, ids, pos) => m.Forward(ids, pos, -1), PromptB, From(0, PromptB.Length));
+        float[] freshB = Run(fresh, uncached, PromptB, From(0, PromptB.Length));
         Assert.True(MaxAbsDiff(carried, freshB) > 1e-4f,
             "a caller-threaded state container was zeroed by a position-0 forward: the auto-reset must only touch the " +
             "model-owned default state.");
+
+        // ...and the threaded calls must not have reset the in-flight model-owned sequence either.
+        float[] continued = Run(model, uncached, Continuation, From(PromptA.Length, Continuation.Length));
+        Run(fresh, uncached, PromptA, From(0, PromptA.Length));
+        float[] expected = Run(fresh, uncached, Continuation, From(PromptA.Length, Continuation.Length));
+        Assert.True(expected.AsSpan().SequenceEqual(continued),
+            $"a threaded position-0 forward reset the model-owned default state of another sequence (max |diff| " +
+            $"{MaxAbsDiff(expected, continued):G4}): the auto-reset must only fire when no state container is passed.");
     }
 
     private static unsafe float[] Run<TModel>(TModel model, Func<TModel, int[], int[], ITensor> forward, int[] ids, int[] pos)
