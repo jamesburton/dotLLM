@@ -12,6 +12,7 @@ namespace DotLLM.Tests.Unit.Hip;
 /// GPU is not present. Mirrors the CUDA RmsNormF32 comparison test.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection("HipGpu")]
 public sealed class HipRmsNormKernelTests : IDisposable
 {
     private const int HiddenSize = 1024;

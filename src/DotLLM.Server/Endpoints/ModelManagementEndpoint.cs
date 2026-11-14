@@ -154,6 +154,7 @@ public static class ModelManagementEndpoint
                     state.LoadedModelPath = resolvedPath;
                     state.RememberIssuedId(state.Options.ModelId, resolvedPath);
                     state.CurrentGguf = newState.CurrentGguf;
+                    state.CurrentSafetensors = newState.CurrentSafetensors;
                     state.DraftModel = newState.DraftModel;
                     state.DraftModelPath = newState.DraftModelPath;
                     state.DraftGguf = newState.DraftGguf;

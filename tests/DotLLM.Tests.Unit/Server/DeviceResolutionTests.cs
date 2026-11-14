@@ -59,6 +59,8 @@ public sealed class DeviceResolutionTests
     [InlineData("GPU:1", DeviceKind.Cuda, 1, "gpu:1")]
     [InlineData("cuda", DeviceKind.Cuda, 0, "gpu:0")]
     [InlineData("cuda:2", DeviceKind.Cuda, 2, "gpu:2")]
+    [InlineData("hip", DeviceKind.Hip, 0, "hip:0")]
+    [InlineData("HIP:2", DeviceKind.Hip, 2, "hip:2")]
     public void Parser_AcceptsEveryDocumentedForm_AndNormalises(string input, DeviceKind kind, int ordinal, string canonical)
     {
         Assert.True(DeviceSpec.TryParse(input, out var spec, out var error), error);
@@ -102,7 +104,11 @@ public sealed class DeviceResolutionTests
     [InlineData("vulkan:+1")]
     [InlineData("cpu:0")]
     [InlineData("auto:1")]
-    [InlineData("hip")]
+    [InlineData("hip:")]
+    [InlineData("hip:x")]
+    [InlineData("hip:-1")]
+    [InlineData("hip:+1")]
+    [InlineData("hip:2147483648")]
     public void Parser_RejectsAnythingElse_ListingTheAcceptedValues(string input)
     {
         Assert.False(DeviceSpec.TryParse(input, out _, out var error));

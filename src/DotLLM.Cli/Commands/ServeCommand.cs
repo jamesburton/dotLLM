@@ -629,7 +629,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         if (!string.IsNullOrEmpty(settings.Model))
         {
             // Resolve and load model
-            var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
+            var resolvedPath = RunCommand.TryResolveHfDirectory(settings.Model)
+                ?? GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
             if (resolvedPath is null)
                 return 1;
 

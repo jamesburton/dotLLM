@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>DotLLM.Tests.Integration</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../src/DotLLM.Hip/DotLLM.Hip.csproj" />
+    <ProjectReference Include="../../../src/DotLLM.Engine/DotLLM.Engine.csproj" />
+  </ItemGroup>
+</Project>

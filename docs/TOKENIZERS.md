@@ -133,12 +133,13 @@ actually used for encode/decode (model vocab/merges, pre-tokenizer,
 normalizer, decoder, added tokens); post-processor / template logic is
 handled elsewhere.
 
-Two pipelines are supported today:
+Three pipeline shapes are supported today:
 
 | Pipeline | Pre-tokenizer (JSON) | Decoder (JSON) | Norm | BPE encoder | Checkpoints |
 |---|---|---|---|---|---|
 | **SentencePiece / Metaspace** | `Metaspace` or `null` | `Sequence[Replace, ByteFallback, Fuse, Strip]` | — | `BpeTokenizer.CreateSentencePiece` | Llama 1/2, Mistral, TinyLlama, Phi-3.5-mini, ib-ssm Mamba-3 |
 | **GPT-2 / ByteLevel** | `ByteLevel` **or** `Sequence[Split, ByteLevel]` | `ByteLevel` | NFC (Qwen) | `BpeTokenizer.CreateTiktoken{,WithRegex}` | Qwen2 / Qwen2.5, Granite-3 dense, GPT-2 proper |
+| **SmolLM / individual digits** | Exact `Sequence[Digits(individual_digits:true), ByteLevel(add_prefix_space:false, trim_offsets:true, use_regex:true)]` | `ByteLevel` | As declared | `BpeTokenizer.CreateTiktoken(..., "smollm")` | SmolLM2 |
 
 ##### ByteLevel contract
 
@@ -167,6 +168,13 @@ regex to byte-mapped text would misclassify multi-byte chars (`é` splits
 to `Ã` + `©` across segment boundaries, losing the merge).
 
 Regex source priority inside the factory:
+
+For the qualified SmolLM shape, isolate each Unicode number before applying the
+default GPT-2 ByteLevel regex to each remaining segment. Stage order preserves
+whitespace boundaries; supplementary-plane numbers are handled as Unicode scalar
+values. Other Digits options or sequence arrangements are rejected.
+
+For the remaining ByteLevel shapes:
 
 1. If `Sequence[Split(regex=X), ByteLevel(use_regex=false)]` (Qwen2 shape),
    use `X` compiled from the JSON. The Qwen2 pattern is
@@ -198,6 +206,7 @@ trained against.
 | Qwen2 / Qwen2.5 | GPT-2 BPE | `Sequence[Split, ByteLevel]` + NFC |
 | Llama 3 | GPT-2 BPE | ByteLevel (standalone, use_regex=true) |
 | Granite-3 dense | GPT-2 BPE | ByteLevel (standalone, use_regex=true) |
+| SmolLM2 | GPT-2 BPE | Exact `Sequence[Digits, ByteLevel]` described above |
 | Granite-3 MoE | GPT-2 BPE (vocab.json, no tokenizer.json) | — out of adapter scope; uses slow-tokenizer path |
 | GPT-2 / GPT-4 | GPT-2 BPE | ByteLevel |
 
@@ -205,7 +214,8 @@ trained against.
 
 - **Multi-step Sequence pre-tokenizers.** DeepSeek-V2/V2-Lite uses
   `Sequence[Split, Split, Split, Split, Split, Digits, ByteLevel]`. The
-  adapter only recognizes the `[Split, ByteLevel]` shape; other
+  adapter recognizes `[Split, ByteLevel]` and the exact two-stage SmolLM
+  `[Digits, ByteLevel]` shape described above; other
   compositions surface as `HfPreTokenizerKind.Sequence` and the factory
   throws. Tracked as a P0.1 follow-up.
 - **Slow-tokenizer checkpoints.** Granite-3 MoE (and older Llama-family
@@ -248,6 +258,26 @@ Models require specific prompt formatting. The OpenAI API sends `messages[]` —
 Templates use **Jinja2 syntax** (HuggingFace standard), stored in:
 - GGUF: `tokenizer.chat_template` metadata key
 - HuggingFace: `tokenizer_config.json` → `chat_template` field
+
+For local HuggingFace SafeTensors checkpoints, `run` and `chat` use
+`HfChatTemplateFactory` with the existing HF tokenizer. It accepts an embedded
+string, a name-to-template object, or a list of `{ "name", "template" } entries.
+Standalone `chat_template.jinja` overrides the embedded `default` entry;
+`additional_chat_templates/<name>.jinja` overrides the corresponding named entry.
+With tools, `tool_use` is selected when present; otherwise `default` is required.
+The loader never picks an arbitrary named entry. Invalid JSON, malformed template
+declarations and unsupported Jinja fail instead of silently changing the prompt.
+
+Templates receive the loaded tokenizer's BOS/EOS spellings and retain its
+control-token guard. With no template, `run` keeps the raw prompt and `chat` warns
+and uses its plain transcript fallback. With a template, SafeTensors `run` formats
+the prompt as one user turn and appends the generation prompt. GGUF selection is
+unchanged. HF tool prompting requires the selected template to reference the
+wired `tools` or `xml_tools` variable; comments and quoted text do not qualify.
+Otherwise the CLI warns and ignores `--tools`. The existing parser is selected
+from the chosen template source and model architecture. A `python_tools`-only
+template needs explicit template kwargs, which these CLI entry points do not
+currently provide. Template wiring does not establish a model's tool-calling quality.
 
 ### Required Jinja2 Subset
 

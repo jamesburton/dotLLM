@@ -4,6 +4,7 @@ using DotLLM.Core.Models;
 using DotLLM.Core.Moe;
 using DotLLM.Models;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 using DotLLM.Server.Models;
 
 namespace DotLLM.Server;
@@ -19,6 +20,8 @@ public enum DeviceKind
     Cuda,
     /// <summary><c>vulkan</c> (the default GPU) or <c>vulkan:N</c> (physical device N, #1704).</summary>
     Vulkan,
+    /// <summary><c>hip[:N]</c>: experimental AMD HIP inference; explicit selection only.</summary>
+    Hip,
 }
 
 /// <summary>
@@ -32,7 +35,7 @@ public enum DeviceKind
 public readonly record struct DeviceSpec(DeviceKind Kind, int Ordinal, bool ExplicitIndex = false)
 {
     /// <summary>Human-readable list of accepted values, used in every validation error.</summary>
-    public const string Accepted = "auto, cpu, vulkan, vulkan:N, gpu, gpu:N, cuda, cuda:N";
+    public const string Accepted = "auto, cpu, vulkan, vulkan:N, gpu, gpu:N, cuda, cuda:N, hip, hip:N";
 
     /// <summary>Parses a <c>--device</c> value (case-insensitive; <c>gpu</c> is an alias of <c>cuda</c>).</summary>
     public static bool TryParse(string? value, out DeviceSpec spec, out string? error)
@@ -59,6 +62,10 @@ public readonly record struct DeviceSpec(DeviceKind Kind, int Ordinal, bool Expl
                 if (tail is null) { spec = new(DeviceKind.Vulkan, 0); return true; }
                 if (int.TryParse(tail, System.Globalization.NumberStyles.None, null, out int vi)) { spec = new(DeviceKind.Vulkan, vi, true); return true; }
                 break;
+            case "hip":
+                if (tail is null) { spec = new(DeviceKind.Hip, 0); return true; }
+                if (int.TryParse(tail, System.Globalization.NumberStyles.None, null, out int hi)) { spec = new(DeviceKind.Hip, hi); return true; }
+                break;
         }
         error = $"Unknown --device '{value}'. Expected one of: {Accepted}.";
         return false;
@@ -74,14 +81,16 @@ public readonly record struct DeviceSpec(DeviceKind Kind, int Ordinal, bool Expl
         DeviceKind.Auto => "auto",
         DeviceKind.Cpu => "cpu",
         DeviceKind.Cuda => $"gpu:{Ordinal}",
-        _ => ExplicitIndex ? $"vulkan:{Ordinal}" : "vulkan",
+        DeviceKind.Vulkan => ExplicitIndex ? $"vulkan:{Ordinal}" : "vulkan",
+        DeviceKind.Hip => $"hip:{Ordinal}",
+        _ => throw new InvalidOperationException($"Unknown device kind: {Kind}."),
     };
 
     /// <summary>The Vulkan physical-device index to load on, or null for the process default device (plain <c>vulkan</c>).</summary>
     public int? VulkanIndex => Kind == DeviceKind.Vulkan && ExplicitIndex ? Ordinal : null;
 
-    /// <summary>True for CUDA and Vulkan.</summary>
-    public bool IsGpu => Kind is DeviceKind.Cuda or DeviceKind.Vulkan;
+    /// <summary>True for CUDA, Vulkan and HIP.</summary>
+    public bool IsGpu => Kind is DeviceKind.Cuda or DeviceKind.Vulkan or DeviceKind.Hip;
 }
 
 /// <summary>An explicitly requested GPU device that cannot be honoured. Carries the full actionable message; callers print it, not a stack.</summary>
@@ -115,6 +124,81 @@ public sealed record DeviceLoadResult(IModel Model, Func<int, IKvCache>? KvCache
 /// </summary>
 public static class DeviceModelLoader
 {
+    /// <summary>Recognizes a local HF checkpoint directory without opening its weight mappings.</summary>
+    public static string? TryResolveSafetensorsDirectory(string? path)
+    {
+        if (string.IsNullOrEmpty(path) || !Directory.Exists(path) || !File.Exists(Path.Combine(path, "config.json")))
+            return null;
+        return File.Exists(Path.Combine(path, "model.safetensors.index.json"))
+               || Directory.EnumerateFiles(path, "*.safetensors", SearchOption.TopDirectoryOnly).Any()
+            ? Path.GetFullPath(path) : null;
+    }
+
+    /// <summary>Conservative on-disk weight size, including all SafeTensors shards when the path is a directory.</summary>
+    public static long WeightFileBytes(string path) => Directory.Exists(path)
+        ? Directory.EnumerateFiles(path, "*.safetensors", SearchOption.TopDirectoryOnly)
+            .Sum(DotLLM.HuggingFace.ModelResolver.FileLength)
+        : DotLLM.HuggingFace.ModelResolver.FileLength(path);
+
+    /// <summary>Loads an HF checkpoint on CPU or explicit HIP. The caller owns the returned source until after model disposal.</summary>
+    public static (DeviceLoadResult Load, ISafetensorsTensorSource Source) LoadSafetensors(
+        string directory, string requestedDevice, int? requestedGpuLayers, ThreadingConfig threading,
+        Action<string> log, Action<string> warn)
+    {
+        var spec = DeviceSpec.Parse(requestedDevice);
+        if (spec.Kind is not (DeviceKind.Auto or DeviceKind.Cpu or DeviceKind.Hip))
+            throw new DeviceUnavailableException($"SafeTensors application loading does not support --device {requestedDevice}. Use --device cpu or the qualified explicit HIP path; no CPU fallback was attempted.");
+        if (spec.Kind is DeviceKind.Cpu or DeviceKind.Auto)
+        {
+            if (requestedGpuLayers is not null and not 0)
+                throw new NotSupportedException("SafeTensors CPU loading has no GPU offload. Omit --gpu-layers, or select --device hip for supported full-device F16/BF16/AWQ4/GPTQ4 models.");
+            string? warning = spec.Kind == DeviceKind.Auto
+                ? "Running SafeTensors on the CPU: --device auto does not opt into experimental HIP. Select --device hip:N explicitly for supported F16/BF16/AWQ4/GPTQ4 checkpoints."
+                : null;
+            log($"CPU SafeTensors inference ({threading.EffectiveThreadCount} threads)");
+            var (model, source, _) = ModelLoader.LoadFromSafetensors(directory, threading);
+            return (new DeviceLoadResult(model, null, "cpu", warning), source);
+        }
+
+        if (requestedGpuLayers == 0)
+            throw new NotSupportedException("HIP requires full-device loading; --gpu-layers 0 is unsupported.");
+        long bytes = WeightFileBytes(directory);
+        var plan = DeviceSelector.Plan(spec, bytes, Endpoints.DeviceEndpoint.Describe());
+        if (plan.Error is not null)
+            throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(requestedDevice, Path.GetFileName(directory), bytes, plan.Error));
+
+        ISafetensorsTensorSource? tensors = null;
+        try
+        {
+            var opened = ModelLoader.OpenSafetensorsAndConfig(directory);
+            tensors = opened.Source;
+            if (requestedGpuLayers is >= 0 && requestedGpuLayers < opened.Config.NumLayers)
+                throw new NotSupportedException("HIP SafeTensors loading requires all layers on the selected GPU; partial offload is unsupported.");
+            log($"HIP SafeTensors inference (device {spec.Ordinal}); dense Llama F16/BF16/AWQ4/GPTQ4, paged device KV");
+            var model = DotLLM.Hip.HipTransformerModel.LoadFromSafetensors(tensors, opened.Config, spec.Ordinal);
+            return (new DeviceLoadResult(model, size => model.CreateKvCache(size), spec.Canonical, null), tensors);
+        }
+        catch (Exception ex)
+        {
+            tensors?.Dispose();
+            throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(
+                requestedDevice, Path.GetFileName(directory), bytes, $"SafeTensors load failed: {ex.Message}"), ex);
+        }
+    }
+
+    /// <summary>Validates HIP KV options before allocating a model; omitted types select F16.</summary>
+    public static string? HipKvOptionError(string device, string? key, string? value, int cacheWindow = 0)
+    {
+        if (DeviceSpec.Parse(device).Kind != DeviceKind.Hip) return null;
+        static bool IsSupported(string? type) => type is null || type.Trim().ToLowerInvariant() is "f16" or "fp16" or "q8_0";
+        if (!IsSupported(key) || !IsSupported(value)
+            || cacheWindow != 0)
+            return "HIP supports only F16 or Q8_0 K/V storage with no mixed-precision window. Each side may select f16 or q8_0; Q8_0 requires head dimensions divisible by 32.";
+        return DotLLM.Hip.HipPagedKvCache.ExperimentalQ8Error(
+            key?.Trim().ToLowerInvariant() == "q8_0" ? KvCacheDType.Q8_0 : KvCacheDType.F32,
+            value?.Trim().ToLowerInvariant() == "q8_0" ? KvCacheDType.Q8_0 : KvCacheDType.F32);
+    }
+
     /// <summary>
     /// Loads <paramref name="gguf"/> on exactly <paramref name="canonicalDevice"/> (<c>cpu</c>, <c>gpu:N</c> or <c>vulkan</c>); no fallback.
     /// </summary>
@@ -164,6 +248,15 @@ public static class DeviceModelLoader
             log($"Vulkan inference ({vkDev.DeviceName})");
             var (m, kv) = DotLLM.Vulkan.VulkanModelLoader.CreateOnDeviceFromGguf(gguf, config, spec.VulkanIndex);
             return (m, kv);
+        }
+
+        if (spec.Kind == DeviceKind.Hip)
+        {
+            if (requestedGpuLayers is >= 0 && requestedGpuLayers < config.NumLayers)
+                throw new NotSupportedException("HIP requires the entire model on the selected GPU; partial offload and --gpu-layers 0 are unsupported. Omit --gpu-layers or use -1.");
+            log($"HIP inference (device {spec.Ordinal}); experimental dense Llama GGUF, paged device KV");
+            var hip = DotLLM.Hip.HipTransformerModel.LoadFromGguf(gguf, config, spec.Ordinal);
+            return (hip, size => hip.CreateKvCache(size));
         }
 
         int gpuLayers = ServerStartup.ResolveGpuLayers(requestedGpuLayers, spec.Canonical, config.NumLayers);

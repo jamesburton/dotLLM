@@ -2,3 +2,6 @@
 tests/DotLLM.Tests.Unit/Tokenizers/ChatTemplates/Fixtures/* -text
 # chunk_cache wire-contract fixtures are hashed byte for byte (fixtures.sha256).
 tests/DotLLM.Tests.Unit/ChunkCache/Fixtures/v1/* -text
+# HIP entry points must remain runnable from Linux and WSL checkouts.
+native/hip/build.sh text eol=lf
+tests/scripts/hip-linux-direct-io/run.sh text eol=lf

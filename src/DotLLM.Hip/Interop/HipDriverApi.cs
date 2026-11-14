@@ -21,6 +21,13 @@ internal static partial class HipDriverApi
     [LibraryImport(LibName)]
     internal static partial int hipInit(uint flags);
 
+    [LibraryImport(LibName)]
+    internal static partial int hipRuntimeGetVersion(out int version);
+
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int hipGetProcAddress(string symbol, out nint function,
+        int hipVersion, ulong flags, out int symbolStatus);
+
     // ── Device ──────────────────────────────────────────────────────
 
     [LibraryImport(LibName)]
@@ -111,7 +118,6 @@ internal static partial class HipDriverApi
     internal static partial int hipMalloc(out nint devicePtr, nuint bytesize);
 
     [LibraryImport(LibName)]
-    [SuppressGCTransition]
     internal static partial int hipFree(nint devicePtr);
 
     [LibraryImport(LibName)]
@@ -164,20 +170,20 @@ internal static partial class HipDriverApi
     // HIP attribute enum values; match hip_runtime_api.h (hipDeviceAttribute_t).
 
     /// <summary>Maximum number of threads per block.</summary>
-    internal const int HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 1;
+    internal const int HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 56;
 
     /// <summary>Maximum shared memory per block in bytes.</summary>
-    internal const int HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK = 8;
+    internal const int HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK = 74;
 
-    /// <summary>Warp size in threads (typically 32 on CDNA, 32 or 64 on RDNA depending on wave mode).</summary>
-    internal const int HIP_DEVICE_ATTRIBUTE_WARP_SIZE = 10;
+    /// <summary>Warp size in threads (32 on wave32 RDNA, 64 on CDNA).</summary>
+    internal const int HIP_DEVICE_ATTRIBUTE_WARP_SIZE = 87;
 
     /// <summary>Number of compute units (analogous to CUDA SM count).</summary>
-    internal const int HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16;
+    internal const int HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 63;
 
     /// <summary>Compute capability major (CUDA-like, not meaningful on AMD — reports 0 or PCI ID-ish value).</summary>
     internal const int HIP_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 23;
 
     /// <summary>Compute capability minor.</summary>
-    internal const int HIP_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 24;
+    internal const int HIP_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 61;
 }

@@ -25,12 +25,18 @@ public enum HfPreTokenizerKind
     Whitespace,
     /// <summary>
     /// A <c>Sequence</c> wrapper of pre-tokenizers. Currently only the
-    /// <c>[Split, ByteLevel]</c> composition (Qwen2/Qwen2.5) is fully wired —
+    /// <c>[Split, ByteLevel]</c> composition (Qwen2/Qwen2.5) and the exact
+    /// SmolLM digit pipeline are wired —
     /// see <see cref="HfTokenizerSpec.ByteLevelSplitRegex"/>.
     /// </summary>
     Sequence,
     /// <summary>An unrecognised pre-tokenizer type — caller may warn or fall back.</summary>
     Unknown,
+    /// <summary>
+    /// SmolLM's exact <c>Digits(individual_digits:true)</c> then
+    /// <c>ByteLevel(add_prefix_space:false, trim_offsets:true, use_regex:true)</c> pipeline.
+    /// </summary>
+    DigitsByteLevel,
 }
 
 /// <summary>
@@ -134,14 +140,14 @@ public sealed class HfTokenizerSpec
     public required string? MetaspacePrependScheme { get; init; }
 
     /// <summary>
-    /// When <see cref="PreTokenizerKind"/> is <see cref="HfPreTokenizerKind.ByteLevel"/>,
+    /// When the supported pre-tokenizer includes a ByteLevel stage,
     /// whether the declared ByteLevel pre-tokenizer applies the default GPT-2
     /// regex (<c>use_regex: true</c>). Null otherwise.
     /// </summary>
     public required bool? ByteLevelUseRegex { get; init; }
 
     /// <summary>
-    /// When <see cref="PreTokenizerKind"/> is <see cref="HfPreTokenizerKind.ByteLevel"/>,
+    /// When the supported pre-tokenizer includes a ByteLevel stage,
     /// whether the declared ByteLevel pre-tokenizer forces a leading space
     /// (<c>add_prefix_space: true</c>). Null otherwise.
     /// </summary>
@@ -339,7 +345,8 @@ public static class HfTokenizerJsonParser
 
     /// <summary>
     /// Parses the pre_tokenizer object. Handles <c>Metaspace</c>,
-    /// <c>ByteLevel</c> (standalone), and <c>Sequence[Split, ByteLevel]</c>
+    /// <c>ByteLevel</c> (standalone), SmolLM's exact <c>Sequence[Digits, ByteLevel]</c>,
+    /// and <c>Sequence[Split, ByteLevel]</c>
     /// (Qwen2 style) — the last collapses into
     /// <see cref="HfPreTokenizerKind.ByteLevel"/> with
     /// <see cref="HfTokenizerSpec.ByteLevelSplitRegex"/> populated so the
@@ -404,7 +411,8 @@ public static class HfTokenizerJsonParser
     }
 
     /// <summary>
-    /// Parses a <c>Sequence</c> pre-tokenizer. Recognised shape is
+    /// Parses a <c>Sequence</c> pre-tokenizer. Recognised shapes are SmolLM's
+    /// exact <c>[Digits(individual_digits:true), ByteLevel(false,true,true)]</c> and
     /// <c>[Split(regex), ByteLevel(use_regex:false)]</c> as used by Qwen2 —
     /// this resolves to <see cref="HfPreTokenizerKind.ByteLevel"/> with the
     /// Split regex captured. Any other composition becomes
@@ -430,6 +438,27 @@ public static class HfTokenizerJsonParser
             return;
         if (subs.ValueKind != JsonValueKind.Array)
             return;
+
+        // Digits must run before ByteLevel: merely replacing the number-run regex
+        // also changes whitespace boundaries (for example the two spaces in "a  12").
+        // Recognise only the qualified SmolLM shape; other Digits options/compositions
+        // remain Sequence and are rejected by the factory.
+        if (subs.GetArrayLength() == 2 &&
+            subs[0].ValueKind == JsonValueKind.Object && subs[1].ValueKind == JsonValueKind.Object &&
+            subs[0].TryGetProperty("type", out JsonElement firstType) && firstType.ValueKind == JsonValueKind.String && firstType.ValueEquals("Digits") &&
+            subs[1].TryGetProperty("type", out JsonElement secondType) && secondType.ValueKind == JsonValueKind.String && secondType.ValueEquals("ByteLevel") &&
+            ReadBoolProp(subs[0], "individual_digits") == true &&
+            ReadBoolProp(subs[1], "add_prefix_space") == false &&
+            ReadBoolProp(subs[1], "trim_offsets") == true &&
+            ReadBoolProp(subs[1], "use_regex") == true &&
+            subs[0].EnumerateObject().All(property => property.Name is "type" or "individual_digits") &&
+            subs[1].EnumerateObject().All(property => property.Name is "type" or "add_prefix_space" or "trim_offsets" or "use_regex"))
+        {
+            kind = HfPreTokenizerKind.DigitsByteLevel;
+            byteLevelUseRegex = true;
+            byteLevelAddPrefixSpace = false;
+            return;
+        }
 
         // Qwen2 shape: exactly one Split then one ByteLevel.
         string? splitRegex = null;

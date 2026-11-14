@@ -304,6 +304,10 @@ public static class ModelLoader
             string configJson = File.ReadAllText(configPath);
             using var doc = JsonDocument.Parse(configJson);
 
+            // Validate the packed format before architecture-specific early returns. The wrapper
+            // preserves all mapped components and their lifetime; only the CPU loader opts in.
+            source = PackedQuantizedSafetensorsSource.WrapIfQuantized(source, doc.RootElement);
+
             // DiffusionGemma wrapper: model_type=diffusion_gemma /
             // diffusion_gemma_text houses a Gemma-4 MoE text tower plus the block
             // masked-diffusion decode parameters. DiffusionGemmaConfigExtractor

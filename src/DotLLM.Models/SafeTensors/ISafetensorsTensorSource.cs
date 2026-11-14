@@ -11,9 +11,8 @@ namespace DotLLM.Models.SafeTensors;
 /// <para>
 /// The interface intentionally mirrors exactly what consumers (dense
 /// transformer loader, Mamba-3 loader) actually call: enumeration,
-/// by-name lookup, and zero-copy data access. Anything format-specific
-/// (header length, data section offset, individual shard files) stays on
-/// the concrete type so callers that genuinely need it can down-cast.
+/// by-name lookup, zero-copy data access, and optional original file locations
+/// for direct device loading. Container header details stay on the concrete type.
 /// </para>
 /// <para>
 /// Implementations must keep the backing memory-mapped regions alive
@@ -36,6 +35,11 @@ public interface ISafetensorsTensorSource : IDisposable
     /// in its owning memory-mapped region. Throws if the tensor is unknown.
     /// </summary>
     nint GetTensorPointer(string name);
+
+    /// <summary>Returns the original file range for direct device loading, without reading tensor data.</summary>
+    /// <remarks>In-memory or transformed sources must reject this operation instead of returning stale backing bytes.</remarks>
+    (string Path, long FileOffset) GetTensorFileLocation(string name)
+        => throw new NotSupportedException("This SafeTensors source does not expose original file ranges for direct device loading.");
 
     /// <summary>
     /// Returns a <see cref="ReadOnlySpan{Byte}"/> over the raw bytes of the

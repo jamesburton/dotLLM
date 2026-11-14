@@ -69,12 +69,21 @@ public sealed class JinjaChatTemplate : IChatTemplate
 
         var lexer = new JinjaLexer(templateSource);
         var tokens = lexer.Tokenize();
+        SupportsTools = tokens.Any(t => t.Type == JinjaTokenType.Identifier
+            && (t.Value is "tools" || (_aliasXmlTools && t.Value is "xml_tools")));
         var parser = new JinjaParser(tokens);
         _ast = parser.Parse();
     }
 
     /// <summary>The Jinja source this template was built from (trailing newline normalised, <c>{% generation %}</c> markers rewritten).</summary>
     public string TemplateSource { get; }
+
+    /// <summary>
+    /// Whether the template references a tool-list variable supplied by <see cref="ChatTemplateOptions.Tools"/>.
+    /// Comments and literal text do not count; python_tools requires explicit template kwargs.
+    /// This describes prompt wiring, not the model's ability to generate valid tool calls.
+    /// </summary>
+    public bool SupportsTools { get; }
 
     /// <summary>The reasoning markup this template's model uses, detected from the source (#798).</summary>
     public Reasoning.ReasoningMarkup ReasoningMarkup { get; }
