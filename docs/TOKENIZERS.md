@@ -133,12 +133,13 @@ actually used for encode/decode (model vocab/merges, pre-tokenizer,
 normalizer, decoder, added tokens); post-processor / template logic is
 handled elsewhere.
 
-Two pipelines are supported today:
+Three pipeline shapes are supported today:
 
 | Pipeline | Pre-tokenizer (JSON) | Decoder (JSON) | Norm | BPE encoder | Checkpoints |
 |---|---|---|---|---|---|
 | **SentencePiece / Metaspace** | `Metaspace` or `null` | `Sequence[Replace, ByteFallback, Fuse, Strip]` | — | `BpeTokenizer.CreateSentencePiece` | Llama 1/2, Mistral, TinyLlama, Phi-3.5-mini, ib-ssm Mamba-3 |
 | **GPT-2 / ByteLevel** | `ByteLevel` **or** `Sequence[Split, ByteLevel]` | `ByteLevel` | NFC (Qwen) | `BpeTokenizer.CreateTiktoken{,WithRegex}` | Qwen2 / Qwen2.5, Granite-3 dense, GPT-2 proper |
+| **SmolLM / individual digits** | Exact `Sequence[Digits(individual_digits:true), ByteLevel(add_prefix_space:false, trim_offsets:true, use_regex:true)]` | `ByteLevel` | As declared | `BpeTokenizer.CreateTiktoken(..., "smollm")` | SmolLM2 |
 
 ##### ByteLevel contract
 
@@ -167,6 +168,13 @@ regex to byte-mapped text would misclassify multi-byte chars (`é` splits
 to `Ã` + `©` across segment boundaries, losing the merge).
 
 Regex source priority inside the factory:
+
+For the qualified SmolLM shape, isolate each Unicode number before applying the
+default GPT-2 ByteLevel regex to each remaining segment. Stage order preserves
+whitespace boundaries; supplementary-plane numbers are handled as Unicode scalar
+values. Other Digits options or sequence arrangements are rejected.
+
+For the remaining ByteLevel shapes:
 
 1. If `Sequence[Split(regex=X), ByteLevel(use_regex=false)]` (Qwen2 shape),
    use `X` compiled from the JSON. The Qwen2 pattern is
@@ -198,6 +206,7 @@ trained against.
 | Qwen2 / Qwen2.5 | GPT-2 BPE | `Sequence[Split, ByteLevel]` + NFC |
 | Llama 3 | GPT-2 BPE | ByteLevel (standalone, use_regex=true) |
 | Granite-3 dense | GPT-2 BPE | ByteLevel (standalone, use_regex=true) |
+| SmolLM2 | GPT-2 BPE | Exact `Sequence[Digits, ByteLevel]` described above |
 | Granite-3 MoE | GPT-2 BPE (vocab.json, no tokenizer.json) | — out of adapter scope; uses slow-tokenizer path |
 | GPT-2 / GPT-4 | GPT-2 BPE | ByteLevel |
 
@@ -205,7 +214,8 @@ trained against.
 
 - **Multi-step Sequence pre-tokenizers.** DeepSeek-V2/V2-Lite uses
   `Sequence[Split, Split, Split, Split, Split, Digits, ByteLevel]`. The
-  adapter only recognizes the `[Split, ByteLevel]` shape; other
+  adapter recognizes `[Split, ByteLevel]` and the exact two-stage SmolLM
+  `[Digits, ByteLevel]` shape described above; other
   compositions surface as `HfPreTokenizerKind.Sequence` and the factory
   throws. Tracked as a P0.1 follow-up.
 - **Slow-tokenizer checkpoints.** Granite-3 MoE (and older Llama-family
