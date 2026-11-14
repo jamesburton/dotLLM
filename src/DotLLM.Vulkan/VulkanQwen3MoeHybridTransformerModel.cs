@@ -261,6 +261,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // refuted at <= 2K, #885). DOTLLM_VULKAN_SPLITKV_GQA=0 restores the per-head pass.
         if (config.Architecture == Architecture.Qwen3MoeHybrid)
             _kernels.EnableGqaDecode();
+        // Issue #1794: Clover's official Q4_K_M keeps layer 0's routed banks in Q8_0. Off the grouped path that ONE layer took the F32-in
+        // indexed kernels and ~1.3 s of a 1.7 s pp512 (the other 39 layers group). Opt both Q8_0 gate/up switches in, as the LFM2-MoE host
+        // does (#1015); other Qwen3MoeHybrid files keep their previous path. DOTLLM_VK_CLOVER_Q8_GROUPED=0 restores it for A/B.
+        if (config.Clover is not null && Environment.GetEnvironmentVariable("DOTLLM_VK_CLOVER_Q8_GROUPED") != "0")
+        {
+            Q8GroupedGateUp = true;
+            Q8GateUpMmvq = true;
+        }
         _layout = config.HybridLayout!;
         _gdn = config.GdnConfig ?? default;   // null for the LFM2-MoE headless host (#1015)
         _kvSlotForLayer = kvSlotForLayer;
@@ -1582,10 +1590,17 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             && moeW.W1QuantType == QuantizationType.Q4_K && moeW.W3QuantType == QuantizationType.Q4_K
             // K-quant down only: the legacy Q5_1 / Q8_0 down banks (#849) take the general MMVQ path in RecordMoeLayer. The fused single-token
             // layer is not exercised by any Q5_1 / Q8_0 fixture (qwen4exp has no post-attention norm and never enters it), so it is not widened blind.
-            && moeW.W2QuantType is QuantizationType.Q5_K or QuantizationType.Q6_K
+            // #1794: Q4_K down (Clover's Q4_K_M has 20 such layers) rides the same Q4_K MMVQ kernel the gate/up already use.
+            && (moeW.W2QuantType is QuantizationType.Q5_K or QuantizationType.Q6_K || (moeW.W2QuantType == QuantizationType.Q4_K && Q4KDownMmvqEnabled))
             && DownMmvqFits(moeW.W2QuantType, moeW.IntermediateSize)
             && moeW.HasSharedExpert && moeW.SharedExpertGate is not null
             && (hidden % 256) == 0;
+
+    /// <summary>
+    /// Q4_K routed down banks take the dp4a MMVQ decode kernel (#1794). Before, no Qwen3MoeHybrid file in use had a Q4_K down bank, so the
+    /// type was missing and decode fell to the one-thread-per-cell F32-in indexed kernel. <c>DOTLLM_VK_MOE_Q4K_DOWN_MMVQ=0</c> restores it.
+    /// </summary>
+    private static readonly bool Q4KDownMmvqEnabled = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_Q4K_DOWN_MMVQ") != "0";
 
     /// <summary>
     /// True when the down bank of quant <paramref name="qt"/> with input width <paramref name="interm"/> has an MMVQ decode kernel. K-quants
@@ -1594,6 +1609,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// </summary>
     private bool DownMmvqFits(QuantizationType qt, int interm) => qt switch
     {
+        QuantizationType.Q4_K => Q4KDownMmvqEnabled && _kernels.MoeMmvqQ4K is not null && (interm % 256) == 0,
         QuantizationType.Q5_K => _kernels.MoeMmvqQ5K is not null && (interm % 256) == 0,
         QuantizationType.Q6_K => _kernels.MoeMmvqQ6K is not null && (interm % 256) == 0,
         QuantizationType.Q5_1 => _kernels.MoeMmvqQ5_1 is not null && _moeUnitScale is not null && (interm % 32) == 0,
@@ -1607,6 +1623,10 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     {
         switch (qt)
         {
+            case QuantizationType.Q4_K:
+                _kernels.MoeMmvqQ4K!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                    _state.MoeTopkIndices, _state.MoeDownRows, m: hidden, k: interm, n: n, numExperts: numE);
+                break;
             case QuantizationType.Q5_K:
                 _kernels.MoeMmvqQ5K!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
                     _state.MoeTopkIndices, _state.MoeDownRows, m: hidden, k: interm, n: n, numExperts: numE);
