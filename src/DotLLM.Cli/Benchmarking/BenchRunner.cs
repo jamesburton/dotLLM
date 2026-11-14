@@ -73,10 +73,22 @@ public static class BenchRunner
         // (same-session paired A/B, immune to process-start and page-cache noise); each rep reports its mode and planar-call delta on stderr.
         string? alt = Environment.GetEnvironmentVariable("DOTLLM_BENCH_ALT_PLANAR");
         bool altOn = alt is "planar-first" or "prod-first";
+        // #1660: DOTLLM_BENCH_ALT_PREFILL_CHUNK=1024,2048,512,256,0 rotates the timed prefill's chunk size per rep inside ONE process
+        // (0 = the whole prompt in one Forward call). Each rep reports its chunk, prefill tok/s, fence-wait count and longest fence wait
+        // (a lower bound on the longest GPU submission), the prefill's last-row argmax and max |dlogit| against the first arm's first rep,
+        // and the greedy continuation, on stderr. Measurement only: the timed region is the chunk loop, as a chunked serving prefill is.
+        int[]? chunkArms = ParseChunkArms(Environment.GetEnvironmentVariable("DOTLLM_BENCH_ALT_PREFILL_CHUNK"));
+        float[]? refLogits = null;
         for (int rep = 0; rep < totalReps; rep++)
         {
             if (altOn) DotLLM.Cpu.Kernels.MatMul.PQ2_0PlanarEnabled = ((rep & 1) == 0) == (alt == "planar-first");
             long calls0 = DotLLM.Cpu.Kernels.MatMul.PQ2_0PlanarCalls;
+            if (chunkArms is not null)
+            {
+                int chunk = chunkArms[rep % chunkArms.Length];
+                all.Add(RunOneRep(model, kvCacheFactory, promptTokens, decodeTokens, depth, cacheSize, chunk, rep, ref refLogits));
+                continue;
+            }
             all.Add(RunOneRep(model, kvCacheFactory, promptTokens, decodeTokens, depth, cacheSize));
             if (altOn)
                 Console.Error.WriteLine($"ALT rep={rep} mode={(DotLLM.Cpu.Kernels.MatMul.PQ2_0PlanarEnabled ? "planar" : "prod")} " +
@@ -204,6 +216,85 @@ public static class BenchRunner
         }
 
         return new BenchRep(prefillSw.Elapsed.TotalMilliseconds, decodeMs, promptLen, decodeTokens);
+    }
+
+    private static int[]? ParseChunkArms(string? spec)
+    {
+        if (string.IsNullOrWhiteSpace(spec)) return null;
+        var arms = new List<int>();
+        foreach (var part in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            if (int.TryParse(part, out int c) && c >= 0) arms.Add(c);
+        return arms.Count > 0 ? arms.ToArray() : null;
+    }
+
+    /// <summary>#1660: one rep whose timed prefill feeds the prompt in <paramref name="chunk"/>-token Forward calls (0 = one call).</summary>
+    private static unsafe BenchRep RunOneRep(
+        IModel model, Func<int, IKvCache> kvCacheFactory, int[] promptTokens, int decodeTokens, int depth, int cacheSize,
+        int chunk, int rep, ref float[]? refLogits)
+    {
+        if (depth != 0) throw new ArgumentException("DOTLLM_BENCH_ALT_PREFILL_CHUNK does not support --depth.");
+        using IKvCache cache = kvCacheFactory(cacheSize);
+        int promptLen = promptTokens.Length;
+        int[] positions = new int[promptLen];
+        for (int i = 0; i < promptLen; i++) positions[i] = i;
+        int step = chunk > 0 ? chunk : promptLen;
+
+        DotLLM.Vulkan.VulkanDevice.SubmitContext.DiagFenceWaits = 0;
+        DotLLM.Vulkan.VulkanDevice.SubmitContext.DiagFenceWaitMaxMs = 0;
+        int calls = 0;
+        ITensor? last = null;
+        var prefillSw = Stopwatch.StartNew();
+        for (int a = 0; a < promptLen; a += step)
+        {
+            int n = Math.Min(step, promptLen - a);
+            last?.Dispose();
+            last = model.Forward(promptTokens.AsSpan(a, n), positions.AsSpan(a, n), deviceId: -1, cache, lastTokenLogitsOnly: true);
+            calls++;
+        }
+        prefillSw.Stop();
+        long waits = DotLLM.Vulkan.VulkanDevice.SubmitContext.DiagFenceWaits;
+        double maxWait = DotLLM.Vulkan.VulkanDevice.SubmitContext.DiagFenceWaitMaxMs;
+
+        int nextToken;
+        float maxAbs = 0, top1 = 0, top2 = float.NegativeInfinity;
+        using (last!)
+        {
+            nextToken = ArgmaxLastRow(last!);
+            int rank = last!.Shape.Rank;
+            int vocab = last.Shape[rank - 1];
+            long rows = 1;
+            for (int d = 0; d < rank - 1; d++) rows *= last.Shape[d];
+            var row = new ReadOnlySpan<float>((float*)last.DataPointer + (rows - 1) * vocab, vocab);
+            top1 = row[nextToken];
+            for (int i = 0; i < vocab; i++) if (i != nextToken && row[i] > top2) top2 = row[i];
+            if (refLogits is null) refLogits = row.ToArray();
+            else for (int i = 0; i < vocab; i++) maxAbs = Math.Max(maxAbs, Math.Abs(row[i] - refLogits[i]));
+        }
+
+        double decodeMs = 0;
+        var gen = new List<int>(decodeTokens) { nextToken };
+        int[] single = new int[1];
+        int[] singlePos = new int[1];
+        int nextPos = promptLen;
+        for (int i = 0; i < decodeTokens; i++)
+        {
+            single[0] = nextToken;
+            singlePos[0] = nextPos++;
+            var sw = Stopwatch.StartNew();
+            ITensor logits = model.Forward(single, singlePos, deviceId: -1, cache);
+            sw.Stop();
+            decodeMs += sw.Elapsed.TotalMilliseconds;
+            using (logits) nextToken = ArgmaxLastRow(logits);
+            gen.Add(nextToken);
+        }
+
+        double ms = prefillSw.Elapsed.TotalMilliseconds;
+        Console.Error.WriteLine(System.FormattableString.Invariant(
+            $"CHUNK rep={rep} chunk={chunk} prompt={promptLen} calls={calls} prefill_ms={ms:F1} prefill_tok_s={promptLen * 1000.0 / ms:F2} ") +
+            System.FormattableString.Invariant(
+            $"fence_waits={waits} max_fence_ms={maxWait:F1} argmax={gen[0]} top1_top2_gap={top1 - top2:F4} max_abs_dlogit_vs_ref={maxAbs:F4} ") +
+            $"gen={string.Join(',', gen)}");
+        return new BenchRep(ms, decodeMs, promptLen, decodeTokens);
     }
 
     /// <summary>

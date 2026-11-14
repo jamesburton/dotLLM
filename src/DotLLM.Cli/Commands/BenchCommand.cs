@@ -218,7 +218,12 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
-        int[] seedTokens = tokenizer.Encode(settings.SeedPrompt).ToArray();
+        // #1660: DOTLLM_BENCH_SEED_FILE=<path> reads the seed text from a file, so a natural-text prompt longer than a command line
+        // (routing-realistic MoE prefill) can be benched; the tiled default concentrates routing on a few experts.
+        string seedText = Environment.GetEnvironmentVariable("DOTLLM_BENCH_SEED_FILE") is { Length: > 0 } seedFile
+            ? File.ReadAllText(seedFile)
+            : settings.SeedPrompt;
+        int[] seedTokens = tokenizer.Encode(seedText).ToArray();
         if (seedTokens.Length == 0)
         {
             WriteError(settings, "Seed prompt produced no tokens.");

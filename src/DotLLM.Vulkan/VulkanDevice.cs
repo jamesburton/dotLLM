@@ -3739,7 +3739,19 @@ public sealed class VulkanDevice : IDisposable
             }
             double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             _emaWaitMs = _emaWaitMs == 0 ? ms : _emaWaitMs * 0.7 + ms * 0.3;
+            DiagFenceWaits++;
+            if (ms > DiagFenceWaitMaxMs) DiagFenceWaitMaxMs = ms;
         }
+
+        /// <summary>
+        /// Diagnostic (#1660): fence waits seen by every <see cref="SubmitContext"/> since the caller last reset it, and the longest
+        /// one in ms (a lower bound on that submission's GPU time). Bench uses it to report per-submit cost against the TDR budget.
+        /// Process-wide and unsynchronised: diagnostics only.
+        /// </summary>
+        public static long DiagFenceWaits;
+
+        /// <summary>Diagnostic (#1660): longest fence wait in ms since the caller last reset it; see <see cref="DiagFenceWaits"/>.</summary>
+        public static double DiagFenceWaitMaxMs;
 
         // Lazily-allocated second command buffer for SplitSubmit. At most ONE
         // split per Begin/SubmitAndWait cycle: with two buffers, a second split
