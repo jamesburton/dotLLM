@@ -1744,6 +1744,11 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         if (seqLen == 0 || seqLen != positions.Length)
             throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
 
+        // #1786: an uncached forward that starts at position 0 is a new sequence: drop the previous prompt's model-owned
+        // GDN + conv state first (mirrors the CPU host).
+        if (kvCache is null && positions[0] == 0)
+            ResetSequenceState();
+
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
         int numHeads = Config.NumAttentionHeads;

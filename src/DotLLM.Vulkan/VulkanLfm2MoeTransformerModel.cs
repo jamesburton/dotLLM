@@ -456,6 +456,10 @@ public sealed unsafe partial class VulkanLfm2MoeTransformerModel : IModel
             if ((uint)positions[i] >= (uint)Config.MaxSequenceLength)
                 throw new ArgumentOutOfRangeException(nameof(positions), $"Position {positions[i]} at index {i} exceeds max sequence length {Config.MaxSequenceLength}.");
 
+        // #1786: an uncached forward on the model-owned conv state that starts at position 0 is a new sequence: drop the
+        // previous prompt's short-conv history first (mirrors the CPU host). A caller-threaded state is never touched.
+        if (kvCache is null && state is null && positions[0] == 0)
+            ResetSequenceState();
         var prev = _activeState;
         _activeState = state ?? _defaultState;
         try

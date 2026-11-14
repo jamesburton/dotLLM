@@ -261,6 +261,12 @@ public interface IModel : IDisposable
     /// <see cref="SequenceForwardRequest.KvCache"/> is required and non-nullable) to thread state
     /// itself. Without this hook the throwaway probe forward and every preceding window leaked into
     /// the scored window's state and corrupted the reported number with no error (issue #261).</para>
+    /// <para><b>Automatic reset at position 0 (#1786).</b> A forward that carries neither a KV cache nor a
+    /// caller-threaded state container and whose first position is 0 is, by definition, a new sequence, so
+    /// every recurrent host calls this method itself before such a forward. Calls with a KV cache, with a
+    /// threaded state, or that start above position 0 still continue the model-owned state unchanged, so a
+    /// caller that starts a new sequence with a KV cache (e.g. <c>TextGenerator</c>) must still call this
+    /// explicitly.</para>
     /// <para><b>Why the default throws for recurrent models.</b> A silent no-op default would let a
     /// future recurrent architecture inherit exactly the bug this method fixes, and the failure mode
     /// is a plausible-looking wrong number rather than an exception. So the default is a no-op only

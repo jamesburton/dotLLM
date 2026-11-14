@@ -989,8 +989,10 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
     /// Runs a forward pass with optional KV-cache (for the GQA layers) and optional
     /// per-sequence GDN recurrent state (for the GDN layers). When
     /// <paramref name="gdnState"/> is <see langword="null"/>, falls back to the
-    /// model-owned default cache — safe only for single-sequence dispatch from a
-    /// freshly-constructed model. Multi-seq batched dispatch must supply a fresh
+    /// model-owned default cache — single-sequence dispatch only. A call with neither
+    /// <paramref name="kvCache"/> nor <paramref name="gdnState"/> whose first position is 0
+    /// starts a new sequence and re-zeroes that default state first (#1786); every other
+    /// call continues it. Multi-seq batched dispatch must supply a fresh
     /// per-seq <see cref="GdnStateCache"/> for each request, otherwise state leaks
     /// across sequences.
     /// </summary>
@@ -1058,6 +1060,11 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         int seqLen = tokenIds.Length;
         if (seqLen == 0 || seqLen != positions.Length)
             throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
+
+        // #1786: an uncached forward that starts at position 0 is a new sequence: drop the previous prompt's model-owned
+        // GDN + conv state (and any pending verify rows, which ResetSequenceState also clears) before anything reads it.
+        if (kvCache is null && gdnState is null && positions[0] == 0)
+            ResetSequenceState();
 
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;

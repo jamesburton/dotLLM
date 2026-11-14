@@ -188,6 +188,65 @@ public sealed unsafe class NemotronHTransformerModelRecurrentBatchTests
         Assert.Equal(full, last);
     }
 
+    /// <summary>
+    /// #1786: an uncached position-0 forward starts a new sequence: prompt B after prompt A through one model equals a fresh model's B
+    /// on every row (SSM state AND conv history are dropped), while an uncached continuation (positions[0] &gt; 0) and a
+    /// caller-threaded state still carry A's state. See <see cref="UncachedForwardRecurrentResetTests"/> for the other hosts.
+    /// </summary>
+    [Fact]
+    public void UncachedPositionZero_ResetsDefaultState_ContinuationAndThreadedStateKeepIt()
+    {
+        var kinds = new[] { HybridLayerKind.Ssm, HybridLayerKind.Attention, HybridLayerKind.Ssm };
+        using var fix = NemotronHFixture.Build(kinds, seed: 41);
+        int[] a = [2, 4, 6, 1, 3];
+        int[] b = [5, 1, 7, 2];
+        int[] posA = Enumerable.Range(0, a.Length).ToArray();
+        int[] posB = Enumerable.Range(0, b.Length).ToArray();
+        int[] posCont = Enumerable.Range(a.Length, b.Length).ToArray();
+
+        float[] freshB, freshCont;
+        using (var fresh = Build(fix)) freshB = AllRows(fresh.Forward(b, posB, -1));
+        using (var fresh = Build(fix)) freshCont = AllRows(fresh.Forward(b, posCont, -1));
+
+        using (var used = Build(fix))
+        {
+            AllRows(used.Forward(a, posA, -1));
+            float[] reused = AllRows(used.Forward(b, posB, -1));
+            Assert.True(freshB.AsSpan().SequenceEqual(reused),
+                $"prompt B after A differs from a fresh B (max |diff| {MaxAbsDiff(freshB, reused):G4}): the model-owned SSM state leaked (#1786).");
+        }
+
+        using (var used = Build(fix))
+        {
+            AllRows(used.Forward(a, posA, -1));
+            Assert.True(MaxAbsDiff(freshCont, AllRows(used.Forward(b, posCont, -1))) > 1e-4f,
+                "an uncached continuation (positions[0] > 0) matched a cold model: the state was reset on a continuing call.");
+        }
+
+        using (var used = Build(fix))
+        using (var state = used.CreateSequenceState()!)
+        {
+            AllRows(used.Forward(a, posA, -1, kvCache: null, ssmState: (ISsmState)state));
+            float[] carried = AllRows(used.Forward(b, posB, -1, kvCache: null, ssmState: (ISsmState)state));
+            Assert.True(MaxAbsDiff(freshB, carried) > 1e-4f,
+                "a caller-threaded SSM state was zeroed by a position-0 forward: only the model-owned default may be reset.");
+        }
+    }
+
+    private static float[] AllRows(ITensor logits)
+    {
+        using (logits)
+            return new ReadOnlySpan<float>((float*)logits.DataPointer, (int)logits.ElementCount).ToArray();
+    }
+
+    private static float MaxAbsDiff(float[] x, float[] y)
+    {
+        Assert.Equal(x.Length, y.Length);
+        float max = 0;
+        for (int i = 0; i < x.Length; i++) max = MathF.Max(max, MathF.Abs(x[i] - y[i]));
+        return max;
+    }
+
     // ── Helpers ──
 
     private static NemotronHTransformerModel Build(NemotronHFixture f)

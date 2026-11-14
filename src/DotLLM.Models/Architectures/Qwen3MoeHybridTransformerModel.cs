@@ -1196,6 +1196,12 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
         if (hiddenIn.IsEmpty && seqLen != tokenIds.Length)
             throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
 
+        // #1786: an uncached token-id forward that starts at position 0 is a new sequence, so it must not inherit the
+        // previous prompt's model-owned recurrent state. Layer windows (non-empty hiddenOut) are excluded: a window above
+        // layer 0 also starts at position 0 and must keep the state its predecessor wrote; those callers reset explicitly.
+        if (kvCache is null && gdnState is null && positions[0] == 0 && firstLayer == 0 && hiddenOut.IsEmpty)
+            ResetSequenceState();
+
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
         int numKvHeads = Config.NumKvHeads;

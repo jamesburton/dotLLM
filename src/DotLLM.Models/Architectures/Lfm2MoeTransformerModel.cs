@@ -315,6 +315,10 @@ public sealed unsafe partial class Lfm2MoeTransformerModel : IModel
         if (adapter is not null) Lfm2Lora.Validate(adapter, Config);
         var prevAdapter = _activeAdapter;
         _activeAdapter = adapter;
+        // #1786: an uncached forward on the model-owned conv state that starts at position 0 is a new sequence: drop the
+        // previous prompt's short-conv history first. A caller-threaded state is never touched.
+        if (kvCache is null && state is null && positions[0] == 0)
+            ResetSequenceState();
         var prevState = _activeState;
         _activeState = state ?? _defaultState;
         try
