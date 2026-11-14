@@ -450,7 +450,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
         => ForwardCore(tokenIds, positions, deviceId, state, null, lastTokenLogitsOnly: false);
 
     /// <summary>
-    /// Largest number of rows one device forward processes (<c>DOTLLM_VK_PLANNED_ROWS</c>, default 1024): the per-forward scratch is planned and allocated for this
+    /// Largest number of rows one device forward processes (<c>DOTLLM_VK_PLANNED_ROWS</c>; default 2048 when free device memory admits it, else 1024, #1791): the per-forward scratch is planned and allocated for this
     /// many rows at load. A longer call (a whole perplexity window, an unchunked prompt) is split into chunks of this size, which equals a chunked prefill
     /// (verified bit-for-bit class: relL2 3e-7) instead of growing the scratch past the resident-memory wall after the weights filled it.
     /// </summary>
@@ -468,10 +468,13 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
     /// </summary>
     internal void SetPlannedRows(int rows, string reason)
     {
-        _pleGpu?.GrowRows(_device, rows);
-        _core.Q4EnsureCapacity(rows);
-        EnsureScratch(rows);
-        _core.Q4InvalidateCaches();
+        if (rows > _plannedRows)
+        {
+            _pleGpu?.GrowRows(_device, rows);
+            _core.Q4EnsureCapacity(rows);
+            EnsureScratch(rows);
+            _core.Q4InvalidateCaches();   // the PLE row buffers were re-created too (only when something grew: an idle invalidate re-allocates lazily)
+        }
         _plannedRows = rows;
         PlannedRowsReason = reason;
     }

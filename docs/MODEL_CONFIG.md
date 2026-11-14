@@ -381,11 +381,13 @@ Facts below come from the vendor `modeling_ricursive.py` / `configuration_ricurs
   `MAX_EXPERTS` 512. Validated against the CPU oracle on random-weight checkpoints (tiny, 512-expert top-10, 256-wide K-quant, Q8_0/Q5_1/BF16
   mixes): per-layer residual and last-row logits, 24-step greedy decode, chunked prefill. Attention is dense up to `top_k + block - 1` = 2051 tokens (QSA == dense there) and **sparse QSA beyond it** (#819: device indexer
   pooling / scoring / exact top-k / gather attention, see `docs/ATTENTION.md`; context capacity default 8192 tokens, `DOTLLM_VK_QWEN4EXP_CONTEXT`); token embeddings
-  are gathered on the host (no 2.4 GiB device table); a call longer than `MaxRowsPerForward` (`DOTLLM_VK_PLANNED_ROWS`, default 1024 rows: the scratch planned at load)
-  is split into chunks internally instead of growing the scratch past the resident-memory wall. Sweep (#1660, UD-IQ4_XS, Strix Vulkan, wikitext prompt, one process,
+  are gathered on the host (no 2.4 GiB device table); a call longer than `MaxRowsPerForward` (`DOTLLM_VK_PLANNED_ROWS`: the scratch planned at load)
+  is split into chunks internally instead of growing the scratch past the resident-memory wall. Default (#1791): the loader allocates 1024 rows, measures that
+  scratch's live bytes, and widens to 2048 rows only when the budget less this process, other processes and the still-unallocated context covers the scaled
+  extra plus 1 GiB; the choice and its numbers are logged (`qwen4exp planned rows per forward`), and an explicit `DOTLLM_VK_PLANNED_ROWS` always wins. Measured on
+  UD-IQ4_XS: 1024-row scratch 919 MiB, widening to 2048 added 947 MiB (estimate 1.03 GiB). Sweep (#1660, UD-IQ4_XS, Strix Vulkan, wikitext prompt, one process,
   both orders): 2048 rows beat 1024 by +8 % at pp4096 (405-436 vs 347-393 tok/s) and +11 % at pp2048 (506-519 vs 455-467); 512/256 lose 12/29 %; longest fence wait
-  255 ms at 2048. 2048 rows needs ~0.55 GiB more scratch; UD-Q4_K_XL's slack is ~1.3 GiB per the plan's comment (not re-measured), so the default stays 1024
-  pending the user's call. V1 limits: the n-gram branch runs on the **host** at its layer (one residual
+  255 ms at 2048. V1 limits: the n-gram branch runs on the **host** at its layer (one residual
   round-trip; table registered host-only so no upload/import/staging path can take it); model-owned single sequence state (#817); no MTP;
   Q5_1 / Q8_0 / IQ expert banks are widened to F32 (no resident kernel yet), which the pre-load gate (`Qwen4ExpResidencyPlan`, refuses over
   `ResidentCapacityBytes - headroom`, `DOTLLM_VK_ALLOW_OVERCOMMIT=1` overrides) accounts for.
