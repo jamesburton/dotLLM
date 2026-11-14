@@ -231,7 +231,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
 
-        var weights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache, allowFactorized: true, overlay: overlay);
+        var weights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache, allowFactorized: true, overlay: overlay, allowPackedQuantization: true);
         return BuildFromPrebuiltWeightsInternal(weights, config, threading, anchorSource: file);
     }
 
@@ -4306,7 +4306,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Gemv(nint weights, QuantizationType qt, float* x, float* y, int m, int k)
     {
-        if (qt == QuantizationType.NVFP4)
+        if (qt is QuantizationType.Awq4 or QuantizationType.Gptq4)
+            Packed4MatMul.Gemm((Packed4Weight*)weights, x, y, m, k, 1, _threadPool);
+        else if (qt == QuantizationType.NVFP4)
             GemmNvfp4Scaled(weights, x, y, m, k, 1);
         else if (qt == QuantizationType.Q8_0)
             MatMul.GemvQ8_0((byte*)weights, x, y, m, k, _threadPool);
@@ -4368,7 +4370,10 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     private void Gemm(nint weights, QuantizationType qt, float* b, float* c,
                       int m, int k, int n, byte* preQuantizedInput = null)
     {
-        if (s_diagF32Act && qt is not (QuantizationType.F32 or QuantizationType.F16))
+        // Descriptor formats must dispatch before generic row decoders, including diagnostic mode.
+        if (qt is QuantizationType.Awq4 or QuantizationType.Gptq4)
+            Packed4MatMul.Gemm((Packed4Weight*)weights, b, c, m, k, n, _threadPool);
+        else if (s_diagF32Act && qt is not (QuantizationType.F32 or QuantizationType.F16))
             MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.LittleBit)
             GemmLittleBit(weights, b, c, m, k, n);

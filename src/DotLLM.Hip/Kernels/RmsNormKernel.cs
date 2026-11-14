@@ -21,8 +21,16 @@ public sealed unsafe class RmsNormKernel : IDisposable
     public RmsNormKernel(string coPath)
     {
         _module = HipModule.LoadFromFile(coPath);
-        _fp32Func = _module.GetFunction("rmsnorm_f32");
-        _fp16Func = _module.GetFunction("rmsnorm_f16");
+        try
+        {
+            _fp32Func = _module.GetFunction("rmsnorm_f32");
+            _fp16Func = _module.GetFunction("rmsnorm_f16");
+        }
+        catch
+        {
+            _module.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
