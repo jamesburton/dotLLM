@@ -10,10 +10,12 @@ using DotLLM.HuggingFace;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 using DotLLM.Server.RateLimiting;
 using DotLLM.Telemetry;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
+using DotLLM.Tokenizers.ToolCallParsers;
 
 namespace DotLLM.Server;
 
@@ -78,8 +80,9 @@ public static class ServerStartup
     {
         // A profile name resolves to its base model (#716); profiles shadow a model that happens to share the name.
         if (ModelProfileStore.Resolve(modelArg) is { } resolved)
-            return ModelResolver.ResolveLocal(resolved.BaseReference, quant, includeOllama: true);
-        return ModelResolver.ResolveLocal(modelArg, quant, includeOllama: true);
+            modelArg = resolved.BaseReference;
+        return DeviceModelLoader.TryResolveSafetensorsDirectory(modelArg)
+            ?? ModelResolver.ResolveLocal(modelArg, quant, includeOllama: true);
     }
 
     /// <summary>
@@ -168,6 +171,17 @@ public static class ServerStartup
         // One parser for every entry point (#790): "cuda", a typo or "vulkan:x" must never silently mean the CPU.
         if (!DeviceSpec.TryParse(options.Device, out var spec, out string? deviceError))
             throw new ArgumentException(deviceError);
+
+        if (DeviceModelLoader.HipKvOptionError(options.Device, options.CacheTypeK, options.CacheTypeV) is { } hipKvError)
+            throw new InvalidServerOptionException(hipKvError);
+        if (spec.Kind == DeviceKind.Hip && (options.TernaryAdapterPaths is { Count: > 0 }
+            || options.SpeculativeModel is not null || options.MtpHeadPath is not null || options.DFlashPath is not null
+            || options.PromptLookup is not null
+            || (options.MoeOffload is not null && options.MoeOffload != DotLLM.Core.Moe.MoeOffloadOptions.Default)))
+            throw new InvalidServerOptionException("HIP does not support adapters, speculative decoding or expert offload/context override options.");
+
+        if (DeviceModelLoader.TryResolveSafetensorsDirectory(resolvedPath) is { } hfDirectory)
+            return LoadSafetensorsModelCore(hfDirectory, options);
 
         if (spec.Kind != DeviceKind.Auto)
         {
@@ -501,6 +515,15 @@ public static class ServerStartup
 
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
 
+        // Reject an unsupported cache geometry while only the GGUF mapping is open.
+        if (DeviceSpec.Parse(options.Device).Kind == DeviceKind.Hip && config.HeadDim % 32 != 0
+            && (KvCacheConfig.ParseDType(options.CacheTypeK ?? "f16") == KvCacheDType.Q8_0
+                || KvCacheConfig.ParseDType(options.CacheTypeV ?? "f16") == KvCacheDType.Q8_0))
+        {
+            gguf.Dispose();
+            throw new InvalidServerOptionException("HIP Q8_0 KV requires head dimensions divisible by 32.");
+        }
+
         // A draft that cannot load must fail NOW, not after the target (up to tens of GiB) is resident, and not as a "device" failure (#1319).
         ValidateSpeculativeDraftEarly(options, config);
 
@@ -511,59 +534,125 @@ public static class ServerStartup
 
         // One shared dispatch for CPU / all-GPU / partial CUDA / Vulkan (#259, #729, #790) - the same call run and chat make.
         // Architectures that cannot split layers load all-GPU or FAIL with an actionable error (never a silent CPU fallback).
-        var (model, deviceKvFactory) = DeviceModelLoader.LoadExact(
-            gguf, config, options.Device, options.GpuLayers, threading,
-            msg => Console.WriteLine($"[dotllm] {msg}"),
-            w => Console.WriteLine($"[dotllm] WARNING: {w}"),
-            options.MoeOffload);
-        // Only the Vulkan models' KV factory is wired here (CUDA/hybrid models keep their own per-request caches).
-        Func<int, IKvCache>? vulkanKvFactory = DeviceSpec.Parse(options.Device).Kind == DeviceKind.Vulkan ? deviceKvFactory : null;
-
-        var ternaryAdapters = AttachTernaryAdapters(model, config, gguf, options);
-
-        if (gguf.Overlay is { } appliedOverlay)
-        {
-            try { appliedOverlay.VerifyAllApplied(); }
-            catch (NotSupportedException ex)
-            {
-                model.Dispose();
-                gguf.Dispose();
-                throw new InvalidServerOptionException(ex.Message);
-            }
-        }
-
-        // Create chat template. The declared template is untrusted input from the GGUF's
-        // tokenizer.chat_template metadata — a parse failure (unsupported Jinja construct,
-        // malformed template, etc.) must not take down the whole server process (#273). Fall
-        // back to the plain completion-style transcript and keep loading; chat formatting will
-        // look wrong for this model, but the model still loads and serves.
-        JinjaChatTemplate? declaredChatTemplate;
+        IModel model;
+        Func<int, IKvCache>? deviceKvFactory;
         try
         {
-            declaredChatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer, config.Architecture);
+            (model, deviceKvFactory) = DeviceModelLoader.LoadExact(
+                gguf, config, options.Device, options.GpuLayers, threading,
+                msg => Console.WriteLine($"[dotllm] {msg}"),
+                w => Console.WriteLine($"[dotllm] WARNING: {w}"),
+                options.MoeOffload);
         }
-        catch (JinjaException ex)
+        catch { gguf.Dispose(); throw; }
+        var ternaryAdapters = AttachTernaryAdapters(model, config, gguf, options);
+
+        try
         {
-            Console.WriteLine(
-                $"[dotllm] WARNING: model's declared chat_template failed to parse ({ex.Message}); " +
-                "falling back to a plain completion-style transcript. Chat formatting will not match " +
-                "this model's expected format until the template issue is fixed.");
-            declaredChatTemplate = null;
+            if (gguf.Overlay is { } appliedOverlay)
+            {
+                try { appliedOverlay.VerifyAllApplied(); }
+                catch (NotSupportedException ex)
+                {
+                    throw new InvalidServerOptionException(ex.Message);
+                }
+            }
+
+            // Create chat template. The declared template is untrusted input from the GGUF's
+            // tokenizer.chat_template metadata — a parse failure (unsupported Jinja construct,
+            // malformed template, etc.) must not take down the whole server process (#273). Fall
+            // back to the plain completion-style transcript and keep loading; chat formatting will
+            // look wrong for this model, but the model still loads and serves.
+            JinjaChatTemplate? declaredChatTemplate;
+            try
+            {
+                declaredChatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer, config.Architecture);
+            }
+            catch (JinjaException ex)
+            {
+                Console.WriteLine(
+                    $"[dotllm] WARNING: model's declared chat_template failed to parse ({ex.Message}); " +
+                    "falling back to a plain completion-style transcript. Chat formatting will not match " +
+                    "this model's expected format until the template issue is fixed.");
+                declaredChatTemplate = null;
+            }
+
+            if (declaredChatTemplate is null)
+                Console.WriteLine("[dotllm] Model has no usable GGUF chat template; using a plain completion-style transcript.");
+            IChatTemplate chatTemplate = declaredChatTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
+
+            // Tool call parser
+            var toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
+
+            var state = BuildDecoderState(resolvedPath, options, config, tokenizer, model, deviceKvFactory,
+                chatTemplate, toolCallParser, gguf, null);
+            state.TernaryAdapters = ternaryAdapters;
+            return state;
         }
+        catch
+        {
+            try { ternaryAdapters?.Dispose(); }
+            finally
+            {
+                try { model.Dispose(); }
+                finally { gguf.Dispose(); }
+            }
+            throw;
+        }
+    }
 
-        if (declaredChatTemplate is null)
-            Console.WriteLine("[dotllm] Model has no usable GGUF chat template; using a plain completion-style transcript.");
-        IChatTemplate chatTemplate = declaredChatTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
+    private static ServerState LoadSafetensorsModelCore(string directory, ServerOptions options)
+    {
+        if (options.TensorOverlayPath is not null || options.TernaryAdapterPaths is { Count: > 0 }
+            || options.RopeOverride is not null || options.ContextSize is > 0
+            || (options.MoeOffload is not null && options.MoeOffload != DotLLM.Core.Moe.MoeOffloadOptions.Default))
+            throw new InvalidServerOptionException("SafeTensors serving does not yet support tensor overlays, ternary adapters, RoPE/context overrides or expert offload options.");
+        if (options.SpeculativeModel is not null || options.MtpHeadPath is not null || options.DFlashPath is not null
+            || options.PromptLookup is not null)
+            throw new InvalidServerOptionException("SafeTensors serving does not yet support draft-model, MTP-head, DFlash or prompt-lookup speculation.");
 
-        // Tool call parser
-        var toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
+        // Declared templates are validated before opening weight mappings or allocating model/device buffers.
+        var tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(directory)
+            ?? throw new InvalidDataException($"No supported tokenizer was found in '{directory}'.");
+        var declared = HfChatTemplateFactory.TryCreate(directory, tokenizer);
+        var toolTemplate = HfChatTemplateFactory.TryCreate(directory, tokenizer, useTools: true);
+        IChatTemplate chatTemplate = declared ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
+        if (toolTemplate is not null && toolTemplate.TemplateSource != declared?.TemplateSource)
+            chatTemplate = new HfServerChatTemplate(chatTemplate, toolTemplate);
+        var (load, source) = DeviceModelLoader.LoadSafetensors(directory, options.Device, options.GpuLayers,
+            new ThreadingConfig(options.Threads, options.DecodeThreads),
+            msg => Console.WriteLine($"[dotllm] {msg}"), msg => Console.WriteLine($"[dotllm] WARNING: {msg}"));
+        try
+        {
+            var parser = ToolCallParserFactory.Create(load.Model.Config.Architecture, (toolTemplate ?? declared)?.TemplateSource);
+            var state = BuildDecoderState(directory, options with { ResolvedDevice = load.ResolvedDevice, MtpEnabled = false },
+                load.Model.Config, tokenizer, load.Model, load.KvCacheFactory, chatTemplate, parser, null, source);
+            state.DeviceFallbackWarning = load.Warning;
+            if (load.Warning is not null) Console.WriteLine($"[dotllm] WARNING: {load.Warning}");
+            return state;
+        }
+        catch
+        {
+            try { load.Model.Dispose(); }
+            finally { source.Dispose(); }
+            throw;
+        }
+    }
+
+    private static ServerState BuildDecoderState(string resolvedPath, ServerOptions options, ModelConfig config,
+        ITokenizer tokenizer, IModel model, Func<int, IKvCache>? deviceKvFactory, IChatTemplate chatTemplate,
+        IToolCallParser? toolCallParser, GgufFile? gguf, ISafetensorsTensorSource? safetensors)
+    {
+        // CUDA/hybrid models construct their caches below; Vulkan and HIP retain their backend factory.
+        Func<int, IKvCache>? vulkanKvFactory = DeviceSpec.Parse(options.Device).Kind == DeviceKind.Vulkan ? deviceKvFactory : null;
 
         // KV-cache configuration. TurboQuant applies uniformly to K and V, so its bit-width and
         // QJL flag are taken from the key dtype string (e.g. "tq4", "tq4q").
-        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK ?? "f32", out int tqBits, out bool tqUseQjl);
+        string defaultKvType = model is DotLLM.Hip.HipTransformerModel ? "f16" : "f32";
+        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK ?? defaultKvType, out int tqBits, out bool tqUseQjl);
         var kvConfig = new KvCacheConfig(
             keyDType,
-            KvCacheConfig.ParseDType(options.CacheTypeV ?? "f32"),
+            KvCacheConfig.ParseDType(options.CacheTypeV ?? defaultKvType),
             TurboQuantBits: tqBits > 0 ? tqBits : 4,
             TurboQuantUseQjl: tqUseQjl);
 
@@ -571,7 +660,15 @@ public static class ServerStartup
         PagedKvCacheFactory? pagedFactory = null;
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
         PrefixTrieManager? prefixTrieManager = null;
-        if (vulkanKvFactory is not null)
+        if (model is DotLLM.Hip.HipTransformerModel hipModel)
+        {
+            if (deviceKvFactory is null) throw new InvalidOperationException("HIP did not supply its device KV-cache factory.");
+            if (kvConfig.IsQuantized && config.HeadDim % 32 != 0)
+                throw new InvalidServerOptionException("HIP Q8_0 KV requires head dimensions divisible by 32.");
+            kvFactory = (_, size) => hipModel.CreateKvCache(size, keyType: kvConfig.KeyDType, valueType: kvConfig.ValueDType);
+            Console.WriteLine($"[dotllm] HIP paged KV-cache (K={options.CacheTypeK ?? "f16"}, V={options.CacheTypeV ?? "f16"}; allocated on demand per request; serialized inference)");
+        }
+        else if (vulkanKvFactory is not null)
         {
             // Vulkan models own their device-resident KV storage. Requests run one at a time through the
             // per-request TextGenerator unless the opt-in Vulkan scheduler below engages (hybrid models,
@@ -817,7 +914,8 @@ public static class ServerStartup
             prefixTrieManager: prefixTrieManager,
             prefixCacheHeadroomTokens: prefixCacheHeadroom,
             prefillChunkSize: options.PrefillChunkSize,
-            recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions());
+            recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions(),
+            deviceId: model is DotLLM.Hip.HipTransformerModel hipDeviceModel ? hipDeviceModel.DeviceId : -1);
         if (options.PrefillChunkSize > 0)
             Console.WriteLine($"[dotllm] Prefill chunk size: {options.PrefillChunkSize} tokens per forward pass");
         if (options.PromptLookup is { } lookup)
@@ -910,7 +1008,6 @@ public static class ServerStartup
         return new ServerState
         {
             Options = options,
-            TernaryAdapters = ternaryAdapters,
             Config = config,
             ToolCallParser = toolCallParser,
             KvCacheConfig = kvConfig,
@@ -928,6 +1025,7 @@ public static class ServerStartup
             Scheduler = scheduler,
             LoadedModelPath = resolvedPath,
             CurrentGguf = gguf,
+            CurrentSafetensors = safetensors,
             DraftModel = draftModel,
             DraftModelPath = draftModelPath,
             DraftGguf = draftGguf,
@@ -1024,7 +1122,7 @@ public static class ServerStartup
     {
         try
         {
-            return ModelResolver.FileLength(path);   // follows symlinks; sums every shard of a split GGUF (#756)
+            return DeviceModelLoader.WeightFileBytes(path);   // follows symlinks and includes GGUF/SafeTensors shards
         }
         catch { return 0; }
     }

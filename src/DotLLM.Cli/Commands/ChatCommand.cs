@@ -379,6 +379,13 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             return 1;
         }
 
+        if (DotLLM.Server.DeviceModelLoader.HipKvOptionError(settings.Device,
+                settings.CacheTypeK, settings.CacheTypeV, settings.CacheWindow) is { } hipKvError)
+        {
+            DeviceCli.PrintError(hipKvError, json: false);
+            return 1;
+        }
+
         // Resolve before loading the model so a bad path fails fast.
         if (!TextArgument.TryResolve(settings.SystemPrompt, settings.SystemPromptFile,
                 "--system|-s", "--system-file", required: false,
@@ -392,6 +399,20 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         // index.json)? Auto-detected; loads via the safetensors path. The GGUF
         // path is unchanged.
         string? hfDir = RunCommand.TryResolveHfDirectory(settings.Model);
+        bool hipRequested = DotLLM.Server.DeviceSpec.Parse(settings.Device).Kind == DotLLM.Server.DeviceKind.Hip;
+        if (hipRequested && (settings.TernaryAdapterPaths.Length > 0 || settings.SpeculativeModel is not null
+            || settings.MtpHead is not null || settings.DFlash is not null || settings.PromptLookup
+            || MoeOffloadCli.Build(settings.MoeValues) != DotLLM.Core.Moe.MoeOffloadOptions.Default))
+        {
+            DeviceCli.PrintError("HIP does not support ternary adapters, speculative decoding or expert offload/context override options.", json: false);
+            return 1;
+        }
+        if (hfDir is not null && (settings.MtpHead is not null || settings.DFlash is not null
+            || MoeOffloadCli.Build(settings.MoeValues) != DotLLM.Core.Moe.MoeOffloadOptions.Default))
+        {
+            DeviceCli.PrintError("SafeTensors loading does not support MTP/DFlash heads or expert offload/context override options.", json: false);
+            return 1;
+        }
 
         string resolvedPath;
         if (hfDir is not null)
@@ -424,8 +445,6 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             {
                 if (hfDir is not null)
                 {
-                    // Explicit GPU -> error before loading anything; auto -> CPU with a warning (#790).
-                    deviceOutcome = DeviceCli.ResolveCpuOnly(settings.Device, "HuggingFace safetensors checkpoints", Path.GetFileName(hfDir));
                     ctx.Status("Loading tokenizer and chat template...");
                     tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
                         ?? throw new InvalidOperationException(
@@ -434,10 +453,11 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                     ctx.Status("Opening HuggingFace safetensors checkpoint...");
                     var threadingCfg = new ThreadingConfig(
                         settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                    var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, threadingCfg);
-                    model = m;
+                    var (loadedHf, src, outcome) = DeviceCli.LoadSafetensors(hfDir, settings.Device, settings.GpuLayers, threadingCfg);
+                    model = loadedHf.Model;
                     safetensorsSource = src;
-                    config = cfg;
+                    config = model.Config;
+                    deviceOutcome = outcome;
                     return;
                 }
 
@@ -607,6 +627,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         var samplingLabel = BuildSamplingLabel(settings);
         var deviceLabel = model is DotLLM.Cuda.CudaTransformerModel
             ? DotLLM.Cuda.CudaDevice.GetDevice(DeviceCli.CudaOrdinal(deviceOutcome.Resolved)).ToString()
+            : model is DotLLM.Hip.HipTransformerModel
+                ? $"hip {DeviceCli.DeviceLabel(deviceOutcome.Resolved)}"
             : vulkanKv is not null
                 ? $"vulkan {DeviceCli.DeviceLabel(deviceOutcome.Resolved)}"
                 : $"{threadingInfo.EffectiveThreadCount} threads";
@@ -622,14 +644,20 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             history.Add(new ChatMessage { Role = "system", Content = systemPrompt });
 
         var kvConfig = new KvCacheConfig(
-            KvCacheConfig.ParseDType(settings.CacheTypeK ?? "f32"),
-            KvCacheConfig.ParseDType(settings.CacheTypeV ?? "f32"),
+            KvCacheConfig.ParseDType(settings.CacheTypeK ?? (model is DotLLM.Hip.HipTransformerModel ? "f16" : "f32")),
+            KvCacheConfig.ParseDType(settings.CacheTypeV ?? (model is DotLLM.Hip.HipTransformerModel ? "f16" : "f32")),
             settings.CacheWindow);
 
         Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
         DotLLM.Engine.KvCache.PagedKvCacheFactory? pagedFactory = null;
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
-        if (vulkanKv is not null)
+        if (model is DotLLM.Hip.HipTransformerModel hipModel)
+        {
+            if (kvConfig.IsQuantized && config!.HeadDim % 32 != 0)
+                throw new NotSupportedException("HIP Q8_0 KV requires head dimensions divisible by 32.");
+            kvFactory = (_, size) => hipModel.CreateKvCache(size, keyType: kvConfig.KeyDType, valueType: kvConfig.ValueDType);
+        }
+        else if (vulkanKv is not null)
         {
             if (settings.Paged)
                 AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache is not supported on Vulkan; using the model's own device KV-cache.[/]");
@@ -762,7 +790,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             mtpEnabled: !settings.NoMtp, mtpAdaptive: true, recurrentPrefixCache: !settings.NoPromptCache,
             prefillChunkSize: settings.PrefillChunkSize,
             recurrentPrefixCacheOptions: DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(settings.PrefixSnapshots, settings.PrefixSnapshotHostBudget, settings.PrefixSnapshotDiskDirectory, settings.PrefixSnapshotDiskBudget, settings.PromptCacheStep, settings.PromptCacheStepKeep, promptCachePolicy),
-            promptLookup: settings.PromptLookupOptions);
+            promptLookup: settings.PromptLookupOptions,
+            deviceId: model is DotLLM.Hip.HipTransformerModel hipDeviceModel ? hipDeviceModel.DeviceId : -1);
 
         if (generator.RecurrentStepCheckpointBytes > 0)
             Console.WriteLine($"[dotllm] Prompt-cache steps: a {generator.RecurrentStepCheckpointBytes / 1048576.0:F1} MiB recurrent checkpoint every {settings.PromptCacheStep} prefill tokens, keeping {settings.PromptCacheStepKeep ?? 8}");

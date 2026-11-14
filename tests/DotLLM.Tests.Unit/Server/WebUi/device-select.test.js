@@ -54,5 +54,18 @@ assert.equal(DS.supportsLayerOffload('gpu'), true);
 assert.equal(DS.supportsLayerOffload('vulkan:1'), false);
 assert.equal(DS.supportsLayerOffload('vulkan'), false);
 assert.equal(DS.supportsLayerOffload('cpu'), false);
+assert.equal(DS.supportsLayerOffload('hip:0'), false);
+
+// HIP is an explicit experimental choice, and an enumerated unsupported GPU is never offered.
+const hipPayload = { recommended_device: 'cpu', backends: [{ name: 'hip', servable: true, devices: [
+    { index: 0, name: 'RX 6900 XT', device_string: 'hip:0', servable: true },
+    { index: 1, name: 'unsupported AMD GPU', device_string: 'hip:1', servable: false },
+] }] };
+const hipChoices = DS.buildChoices(hipPayload);
+assert.deepEqual(hipChoices.map(c => c.value), ['cpu', 'hip:0']);
+assert.match(hipChoices[1].label, /HIP \(experimental\)/);
+assert.equal(hipChoices[1].supportsLayers, false);
+assert.equal(DS.defaultValue(hipChoices, hipPayload), 'cpu');
+assert.equal(DS.resolveSelection(hipChoices, 'hip:0', true, hipPayload), 'hip:0');
 
 console.log('ok');

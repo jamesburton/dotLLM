@@ -82,6 +82,19 @@ jobs:
       - name: List packages
         run: ls -lh artifacts/nuget/
 
+      - name: Verify HIP tool payload
+        shell: bash
+        env:
+          TOOL_PACKAGE_ID: ${{ vars.DOTLLM_TOOL_PACKAGE_ID }}
+        run: |
+          package="artifacts/nuget/${TOOL_PACKAGE_ID:-DotLLM.Cli}.${{ needs.version.outputs.version }}.nupkg"
+          for kernel in dense_f16 rmsnorm; do
+            if ! unzip -Z1 "$package" | grep -E "^tools/[^/]+/any/co/${kernel}\.co$" >/dev/null; then
+              echo "::error::dotnet-tool package is missing co/${kernel}.co"
+              exit 1
+            fi
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: nuget-packages
@@ -182,6 +195,15 @@ jobs:
             echo "::error::release payload has no spv/*.spv - the Vulkan backend would be broken"
             exit 1
           fi
+          # HIP loads code objects from co/ beside the executable. These are precompiled repository assets,
+          # so release hosts do not need the HIP SDK. DirectStorage DLL redistribution remains disabled above.
+          cp -r "publish/${{ matrix.rid }}/co" "$stage/"
+          for kernel in dense_f16 rmsnorm; do
+            if [ ! -s "$stage/co/${kernel}.co" ]; then
+              echo "::error::release payload is missing co/${kernel}.co"
+              exit 1
+            fi
+          done
           cp README.md "$stage/"
           cp LICENSE "$stage/"
           ls -lh "$stage/"
@@ -269,6 +291,13 @@ jobs:
           if [ -d "publish-aot/${{ matrix.rid }}/ptx" ]; then
             cp -r "publish-aot/${{ matrix.rid }}/ptx" "$stage/"
           fi
+          cp -r "publish-aot/${{ matrix.rid }}/co" "$stage/"
+          for kernel in dense_f16 rmsnorm; do
+            if [ ! -s "$stage/co/${kernel}.co" ]; then
+              echo "::error::AOT release payload is missing co/${kernel}.co"
+              exit 1
+            fi
+          done
           cp README.md "$stage/"
           cp LICENSE "$stage/"
           ls -lh "$stage/"

@@ -424,10 +424,31 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             return 1;
         }
 
+        if (DotLLM.Server.DeviceModelLoader.HipKvOptionError(settings.Device,
+                kvStorageRequest.KeyText, kvStorageRequest.ValueText, settings.CacheWindow) is { } hipKvError)
+        {
+            DeviceCli.PrintError(hipKvError, settings.Json);
+            return 1;
+        }
+
         // HuggingFace safetensors directory? (config.json + *.safetensors /
         // model.safetensors.index.json). Auto-detected; loads via the
         // safetensors path instead of GGUF. The GGUF path is unchanged.
         string? hfDir = TryResolveHfDirectory(settings.Model);
+        bool hipRequested = DotLLM.Server.DeviceSpec.Parse(settings.Device).Kind == DotLLM.Server.DeviceKind.Hip;
+        if (hipRequested && (settings.LoraPaths.Length > 0 || settings.TernaryAdapterPaths.Length > 0
+            || settings.SpeculativeModel is not null || settings.MtpHead is not null || settings.DFlash is not null || settings.PromptLookup
+            || MoeOffloadCli.Build(settings.MoeValues) != DotLLM.Core.Moe.MoeOffloadOptions.Default))
+        {
+            DeviceCli.PrintError("HIP does not support LoRA/ternary adapters, speculative decoding or expert offload/context override options.", settings.Json);
+            return 1;
+        }
+        if (hfDir is not null && (settings.TensorOverlay is not null || BuildRoPEOverride(settings) is not null
+            || settings.MtpHead is not null || settings.DFlash is not null || MoeOffloadCli.Build(settings.MoeValues) != DotLLM.Core.Moe.MoeOffloadOptions.Default))
+        {
+            DeviceCli.PrintError("SafeTensors loading does not support tensor overlays, RoPE/context overrides, MTP/DFlash heads or expert offload options.", settings.Json);
+            return 1;
+        }
 
         string resolvedPath;
         if (hfDir is not null)
@@ -457,11 +478,6 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         {
             if (hfDir is not null)
             {
-                // HuggingFace safetensors checkpoint (e.g. BitNet b1.58 bf16).
-                // CPU load via the shared safetensors loader; GPU offload for
-                // this path is not wired through the CLI yet.
-                // Explicit GPU -> error before loading anything; auto -> CPU with a warning (#790).
-                deviceOutcome = DeviceCli.ResolveCpuOnly(settings.Device, "HuggingFace safetensors checkpoints", Path.GetFileName(hfDir));
                 // Validate tokenizer/template before opening weight mappings or allocating the model.
                 tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
                     ?? throw new InvalidOperationException(
@@ -469,10 +485,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 hfTemplate = HfChatTemplateFactory.TryCreate(hfDir, tokenizer, useTools: tools is { Length: > 0 });
                 var threadingCfg = new ThreadingConfig(
                     settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, threadingCfg);
-                model = m;
+                var (loadedHf, src, outcome) = DeviceCli.LoadSafetensors(hfDir, settings.Device, settings.GpuLayers, threadingCfg);
+                model = loadedHf.Model;
                 safetensorsSource = src;
-                config = cfg;
+                config = model.Config;
+                deviceOutcome = outcome;
                 return;
             }
 
@@ -734,6 +751,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             var deviceLabel = model switch
             {
                 DotLLM.Cuda.CudaTransformerModel => DotLLM.Cuda.CudaDevice.GetDevice(DeviceCli.CudaOrdinal(deviceOutcome.Resolved)).ToString(),
+                DotLLM.Hip.HipTransformerModel => $"hip {DeviceCli.DeviceLabel(deviceOutcome.Resolved)}",
                 DotLLM.Cuda.HybridTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
                 DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
                 _ when vulkanKv is not null => $"vulkan {DeviceCli.DeviceLabel(deviceOutcome.Resolved)}",
@@ -765,12 +783,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 Console.Write(tools is { Length: > 0 } ? "" : prompt);
 
             var kvConfig = new KvCacheConfig(
-                kvStorageRequest.Key ?? KvCacheDType.F32,
+                kvStorageRequest.Key ?? KvCacheDType.F32, // F32 means unquantized here; HIP stores F16 on device.
                 kvStorageRequest.Value ?? KvCacheDType.F32,
                 settings.CacheWindow);
 
             Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
-            if (vulkanKv is not null)
+            if (model is DotLLM.Hip.HipTransformerModel hipModel)
+                kvFactory = (_, size) => hipModel.CreateKvCache(size, keyType: kvConfig.KeyDType, valueType: kvConfig.ValueDType);
+            else if (vulkanKv is not null)
             {
                 if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
                 {
@@ -912,7 +932,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
                 mtpEnabled: !settings.NoMtp, mtpAdaptive: true,
                 prefillChunkSize: settings.PrefillChunkSize,
-                promptLookup: settings.PromptLookupOptions);
+                promptLookup: settings.PromptLookupOptions,
+                deviceId: model is DotLLM.Hip.HipTransformerModel hipDeviceModel ? hipDeviceModel.DeviceId : -1);
             var totalSw = Stopwatch.StartNew();
             int generated = 0;
             InferenceTimings timings = default;
@@ -981,7 +1002,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             else
                 kvCacheBytes = (long)DotLLM.Core.Attention.KvGeometry.SlotCount(config) * 2 * cacheSize
                     * config.NumKvHeads * config.HeadDim
-                    * (model is DotLLM.Cuda.CudaTransformerModel ? sizeof(ushort) : sizeof(float));
+                    * (model is DotLLM.Cuda.CudaTransformerModel or DotLLM.Hip.HipTransformerModel ? sizeof(ushort) : sizeof(float));
             // R4-interleaved buffers are a second, committed copy of the weights held alongside
             // the mapped file — counting only the mapping understates the footprint by ~2x.
             long repackedBytes = model.RepackedWeightBytes;
@@ -1224,19 +1245,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
     /// directory (leaving the GGUF resolution path unchanged).
     /// </summary>
     internal static string? TryResolveHfDirectory(string modelArg)
-    {
-        if (string.IsNullOrEmpty(modelArg) || !Directory.Exists(modelArg))
-            return null;
-
-        if (!File.Exists(Path.Combine(modelArg, "config.json")))
-            return null;
-
-        bool hasWeights =
-            File.Exists(Path.Combine(modelArg, "model.safetensors.index.json"))
-            || Directory.EnumerateFiles(modelArg, "*.safetensors", SearchOption.TopDirectoryOnly).Any();
-
-        return hasWeights ? Path.GetFullPath(modelArg) : null;
-    }
+        => DotLLM.Server.DeviceModelLoader.TryResolveSafetensorsDirectory(modelArg);
 
     /// <summary>
     /// Builds a <see cref="RoPEOverrideOptions"/> from CLI flags. Returns null (no-op) when none

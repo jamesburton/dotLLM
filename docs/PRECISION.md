@@ -697,7 +697,7 @@ Text comes from the actual first chapter of [Project Gutenberg ebook 11](https:/
 
 The original gates remain **maximum relative L2 < 0.02 and KL < 0.002**. F16 passes all four windows. Q8 fails both gates at every window; small perplexity changes and mostly unchanged winners do not cancel those failures.
 
-HIP Q8 KV therefore requires the explicit process flag **`DOTLLM_HIP_ALLOW_Q8_KV=1`** in addition to selecting Q8 for either cache plane. Direct library cache creation enforces the acknowledgement. It does not improve the quantizer or relax these gates; F16 remains the default. Q8 model weights are unaffected.
+HIP Q8 KV therefore requires the explicit process flag **`DOTLLM_HIP_ALLOW_Q8_KV=1`** in addition to selecting Q8 for either cache plane. CLI/server startup and direct library cache creation enforce the acknowledgement. It does not improve the quantizer or relax these gates; F16 remains the default. Q8 model weights are unaffected.
 
 | Context | F16 max L2 / KL | Q8 max L2 / KL | Top-1 matches F16 / Q8 (of 128) | Window PPL CPU F32 / HIP F16 / HIP Q8 |
 | ---: | ---: | ---: | ---: | ---: |
