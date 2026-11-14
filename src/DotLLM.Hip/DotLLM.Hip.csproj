@@ -2,7 +2,8 @@
 
   <PropertyGroup>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Description>HIP/ROCm GPU backend for dotLLM — AMD GPU path via P/Invoke against libamdhip64 + hipBLAS. Code objects (.co) loaded through the HIP runtime module API. Proof-of-pipeline scaffold; kernels port mechanically from DotLLM.Cuda via hipify-perl.</Description>
+    <DefineConstants>$(DefineConstants);DOTLLM_HIP_DIRECTSTORAGE</DefineConstants>
+    <Description>HIP/ROCm GPU backend for dotLLM, with F16 dense primitives and paged attention. Code objects (.co) loaded through the HIP runtime module API.</Description>
   </PropertyGroup>
 
   <ItemGroup>
@@ -11,13 +12,21 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\DotLLM.Core\DotLLM.Core.csproj" />
+    <Compile Include="..\DotLLM.Vulkan\DirectStorage\DirectStorageInterop.cs" Link="DirectStorage\DirectStorageInterop.cs" />
+  </ItemGroup>
+
+  <!-- Reuse the existing development-only DirectStorage package; releases do not redistribute its DLLs. -->
+  <ItemGroup Condition="'$(OS)' == 'Windows_NT'">
+    <PackageReference Include="Microsoft.Direct3D.DirectStorage" PrivateAssets="all" ExcludeAssets="all" GeneratePathProperty="true" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(OS)' == 'Windows_NT' And '$(PkgMicrosoft_Direct3D_DirectStorage)' != '' And '$(DotLLMBundleDirectStorage)' != 'false'">
+    <Content Include="$(PkgMicrosoft_Direct3D_DirectStorage)\native\bin\x64\dstorage.dll" Link="dstorage.dll" CopyToOutputDirectory="PreserveNewest" Pack="false" />
+    <Content Include="$(PkgMicrosoft_Direct3D_DirectStorage)\native\bin\x64\dstoragecore.dll" Link="dstoragecore.dll" CopyToOutputDirectory="PreserveNewest" Pack="false" />
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="..\..\native\hip\co\*.co" Link="co\%(Filename)%(Extension)" Condition="Exists('..\..\native\hip\co\')">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
+    <ProjectReference Include="..\DotLLM.Core\DotLLM.Core.csproj" />
+    <ProjectReference Include="..\DotLLM.Models\DotLLM.Models.csproj" />
   </ItemGroup>
 
   <!-- HIP code-object compilation: .hip to .co via 'hipcc genco'.
@@ -27,28 +36,42 @@
     <HipKernelDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', '..', 'native', 'hip', 'kernels'))</HipKernelDir>
     <HipCoOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', '..', 'native', 'hip', 'co'))</HipCoOutputDir>
     <!-- gfx1030 = RDNA2 (RX 6000), gfx1100 = RDNA3 (RX 7000). Extend as needed. -->
-    <HipOffloadArchs>--offload-arch=gfx1030 --offload-arch=gfx1100</HipOffloadArchs>
+    <HipOffloadArchs Condition="'$(HipOffloadArchs)' == ''">--offload-arch=gfx1030 --offload-arch=gfx1100</HipOffloadArchs>
+    <HipCompiler Condition="'$(HipCompiler)' == ''">hipcc</HipCompiler>
   </PropertyGroup>
 
   <ItemGroup>
     <HipKernel Include="$(HipKernelDir)\*.hip" />
+    <Content Include="@(HipKernel->'$(HipCoOutputDir)\%(Filename).co')">
+      <Link>co\%(Filename)%(Extension)</Link>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
   </ItemGroup>
 
   <Target Name="CompileHipCodeObjects"
           BeforeTargets="BeforeBuild"
           Inputs="@(HipKernel)"
           Outputs="@(HipKernel->'$(HipCoOutputDir)\%(Filename).co')">
-    <Exec Command="hipcc --version" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
+    <Exec Command="&quot;$(HipCompiler)&quot; --version" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ExitCode" PropertyName="_HipccExitCode" />
     </Exec>
     <Message Condition="'$(_HipccExitCode)' != '0'" Importance="high"
              Text="WARNING: .hip source newer than .co but hipcc not found in PATH. Pre-compiled code objects may be stale. Install ROCm to auto-compile kernels." />
+    <Error Condition="'$(_HipccExitCode)' != '0' and '$(RequireHipKernels)' == 'true'"
+           Text="HIP native validation requires hipcc. Use the SDK bin on PATH and a C++ developer environment, or set HipCompiler." />
 
     <MakeDir Condition="'$(_HipccExitCode)' == '0'" Directories="$(HipCoOutputDir)" />
     <Message Condition="'$(_HipccExitCode)' == '0'" Importance="high" Text="Compiling %(HipKernel.Filename).hip to code object" />
     <Exec Condition="'$(_HipccExitCode)' == '0'"
-          Command="hipcc --genco $(HipOffloadArchs) -o &quot;$(HipCoOutputDir)/%(HipKernel.Filename).co&quot; &quot;%(HipKernel.FullPath)&quot;"
+          Command="&quot;$(HipCompiler)&quot; --genco $(HipOffloadArchs) -o &quot;$(HipCoOutputDir)/%(HipKernel.Filename).co&quot; &quot;%(HipKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
+  </Target>
+
+  <Target Name="IncludeBuiltHipCodeObjects" BeforeTargets="AssignTargetPaths" DependsOnTargets="CompileHipCodeObjects">
+    <Error Condition="'$(RequireHipKernels)' == 'true' and !Exists('$(HipCoOutputDir)\dense_f16.co')"
+           Text="Required HIP dense_f16.co code object is missing." />
   </Target>
 
 </Project>

@@ -40,6 +40,7 @@ public sealed unsafe class SafetensorsFile : ISafetensorsTensorSource
     private MemoryMappedViewAccessor? _accessor;
     private byte* _basePointer;
     private bool _disposed;
+    private readonly string _filePath;
 
     /// <summary>Byte length of the JSON header, read from the 8-byte prefix.</summary>
     public long HeaderLength { get; }
@@ -73,6 +74,7 @@ public sealed unsafe class SafetensorsFile : ISafetensorsTensorSource
     public nint DataBasePointer { get; }
 
     private SafetensorsFile(
+        string filePath,
         long headerLength,
         long fileLength,
         IReadOnlyDictionary<string, string> metadata,
@@ -83,6 +85,7 @@ public sealed unsafe class SafetensorsFile : ISafetensorsTensorSource
         MemoryMappedViewAccessor? accessor,
         byte* basePointer)
     {
+        _filePath = filePath;
         HeaderLength = headerLength;
         FileLength = fileLength;
         Metadata = metadata;
@@ -106,6 +109,7 @@ public sealed unsafe class SafetensorsFile : ISafetensorsTensorSource
     /// <exception cref="InvalidDataException">Header malformed or data ranges inconsistent.</exception>
     public static SafetensorsFile Open(string filePath)
     {
+        filePath = Path.GetFullPath(filePath);
         if (!File.Exists(filePath))
             throw new FileNotFoundException($"Safetensors file not found: {filePath}", filePath);
 
@@ -189,6 +193,7 @@ public sealed unsafe class SafetensorsFile : ISafetensorsTensorSource
         }
 
         return new SafetensorsFile(
+            filePath,
             headerLen,
             fileLength,
             metadata,
@@ -317,6 +322,15 @@ public sealed unsafe class SafetensorsFile : ISafetensorsTensorSource
         if (!TensorsByName.TryGetValue(name, out var desc))
             throw new KeyNotFoundException($"Safetensors file has no tensor named '{name}'.");
         return DataBasePointer + (nint)desc.DataBeginOffset;
+    }
+
+    /// <inheritdoc/>
+    public (string Path, long FileOffset) GetTensorFileLocation(string name)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!TensorsByName.TryGetValue(name, out var tensor))
+            throw new KeyNotFoundException($"Safetensors file has no tensor named '{name}'.");
+        return (_filePath, checked(DataSectionOffset + tensor.DataBeginOffset));
     }
 
     /// <summary>

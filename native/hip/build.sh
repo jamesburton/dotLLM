@@ -7,7 +7,7 @@
 # each --offload-arch target. The HIP runtime picks the matching arch at
 # hipModuleLoadData time.
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT_DIR="$SCRIPT_DIR/co"
@@ -19,9 +19,9 @@ mkdir -p "$OUT_DIR"
 # Override with HIP_ARCHS env var, e.g. HIP_ARCHS="gfx942 gfx90a" for MI300/MI250.
 ARCHS="${HIP_ARCHS:-gfx1030 gfx1100}"
 
-OFFLOAD_FLAGS=""
+OFFLOAD_FLAGS=()
 for a in $ARCHS; do
-    OFFLOAD_FLAGS="$OFFLOAD_FLAGS --offload-arch=$a"
+    OFFLOAD_FLAGS+=("--offload-arch=$a")
 done
 
 if ! command -v hipcc >/dev/null 2>&1; then
@@ -30,13 +30,20 @@ if ! command -v hipcc >/dev/null 2>&1; then
 fi
 
 echo "Compiling HIP kernels → code objects (archs: $ARCHS)..."
+hipcc --version
 
-for src in "$KERNEL_DIR"/*.hip; do
-    [ -e "$src" ] || continue
+shopt -s nullglob
+sources=("$KERNEL_DIR"/*.hip)
+if [ "${#sources[@]}" -eq 0 ]; then
+    echo "No HIP sources found in $KERNEL_DIR" >&2
+    exit 1
+fi
+
+for src in "${sources[@]}"; do
     name="$(basename "$src" .hip)"
     out="$OUT_DIR/$name.co"
-    echo "  hipcc --genco $OFFLOAD_FLAGS -o $out $src"
-    hipcc --genco $OFFLOAD_FLAGS -o "$out" "$src"
+    echo "  hipcc --genco ${OFFLOAD_FLAGS[*]} -o $out $src"
+    hipcc --genco "${OFFLOAD_FLAGS[@]}" -o "$out" "$src"
 done
 
 echo "Done. Code objects in $OUT_DIR"

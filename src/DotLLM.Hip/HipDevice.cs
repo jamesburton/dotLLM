@@ -50,20 +50,7 @@ public sealed class HipDevice
             // This must happen BEFORE any reference to HipDriverApi, because
             // the JIT resolves [LibraryImport] P/Invoke stubs when compiling
             // a method — triggering DllNotFoundException on systems without ROCm.
-            string hipLib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-                ? "amdhip64.dll" : "libamdhip64.so";
-            if (!NativeLibrary.TryLoad(hipLib, out nint handle))
-            {
-                // Try Linux versioned fallbacks.
-                if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                {
-                    foreach (var n in new[] { "libamdhip64.so.6", "libamdhip64.so.5" })
-                        if (NativeLibrary.TryLoad(n, out handle))
-                            goto loaded;
-                }
-                return false;
-            }
-        loaded:
+            if (!HipLibraryResolver.TryLoadRuntime(out nint handle)) return false;
             NativeLibrary.Free(handle);
             return ProbeGpuCount();
         }
@@ -99,6 +86,7 @@ public sealed class HipDevice
     /// <summary>Queries device properties for the given ordinal.</summary>
     public static HipDevice GetDevice(int ordinal)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(ordinal);
         HipLibraryResolver.Register();
         HipDriverApi.hipInit(0).ThrowOnError();
 
@@ -127,18 +115,21 @@ public sealed class HipDevice
     /// <summary>Uploads host memory to device (blocking).</summary>
     public static void Upload(nint devicePtr, nint hostPtr, long byteCount)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(byteCount);
         HipDriverApi.hipMemcpyHtoD(devicePtr, hostPtr, (nuint)byteCount).ThrowOnError();
     }
 
     /// <summary>Downloads device memory to host (blocking).</summary>
     public static void Download(nint hostPtr, nint devicePtr, long byteCount)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(byteCount);
         HipDriverApi.hipMemcpyDtoH(hostPtr, devicePtr, (nuint)byteCount).ThrowOnError();
     }
 
     /// <summary>Allocates device memory of the given byte size.</summary>
     public static nint Allocate(long byteCount)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(byteCount);
         HipDriverApi.hipMalloc(out nint dptr, (nuint)byteCount).ThrowOnError();
         return dptr;
     }
