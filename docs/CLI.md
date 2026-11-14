@@ -868,9 +868,11 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | Variable | What the source says | Defined in |
 |---|---|---|
 | `DOTLLM_BENCH_ALT_PLANAR` | #1620: DOTLLM_BENCH_ALT_PLANAR=planar-first\|prod-first alternates the planar PQ2_0 decode GEMV per rep inside ONE process (same-session paired A/B, immune to process-start and page-cache noise); each rep reports its mode and p... | `BenchRunner.cs` |
+| `DOTLLM_BENCH_ALT_PREFILL_CHUNK` | #1660: DOTLLM_BENCH_ALT_PREFILL_CHUNK=1024,2048,512,256,0 rotates the timed prefill's chunk size per rep inside ONE process (0 = the whole prompt in one Forward call). Each rep reports its chunk, prefill tok/s, fence-wait count... | `BenchRunner.cs` |
 | `DOTLLM_BENCH_COMMIT` | Point-in-time runtime version for the results.csv runtime_version column (convention: dev-96a892bd). Resolution order: the DOTLLM_BENCH_COMMIT environment variable, git in the current directory (branch tag + short SHA), the ass... | `BenchEnvironment.cs` |
 | `DOTLLM_BENCH_DUMP_TOKENS` | Timed greedy decode: n single-token forwards. Only the Forward calls are inside the stopwatch windows; argmax runs between them. DOTLLM_BENCH_DUMP_TOKENS= appends one line of generated token IDs per rep - the exact-token parity... | `BenchRunner.cs` |
 | `DOTLLM_BENCH_RELEASE_GGUF` | Issue #438 experiment arm - DOTLLM_BENCH_RELEASE_GGUF=1 unmaps the GGUF right after upload. Every device-resident weight was copied into a device buffer by then; nothing in the Vulkan forward path reads a host pointer. If that... | `BenchCommand.cs` |
+| `DOTLLM_BENCH_SEED_FILE` | #1660: DOTLLM_BENCH_SEED_FILE= reads the seed text from a file, so a natural-text prompt longer than a command line (routing-realistic MoE prefill) can be benched; the tiled default concentrates routing on a few experts. | `BenchCommand.cs` |
 | `DOTLLM_BENCH_STEP_LOG` | DOTLLM_BENCH_STEP_LOG= (#801): append one line per rep holding that rep's per-step decode ms so a run's tok/s can be windowed (drift tracking) without changing the timed region. | `BenchRunner.cs` |
 | `DOTLLM_MEM_PROBE` | True when DOTLLM_MEM_PROBE is set to 1. | `HostResidencyProbe.cs` |
 
@@ -889,6 +891,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_CPU_BF16_512` | BF16 weight GEMV/GEMM by shift-widening (#1118). BF16 is the top half of an F32, so bf16 &lt;&lt; 16 is the exact F32 value: every tier widens 4/8/16 weights in registers (vpmovzxwd + vpslld) and multiplies into F32 accumulator... | `MatMul.Bf16.cs` |
 | `DOTLLM_CPU_BF16_KERNEL` | BF16 weight GEMV/GEMM by shift-widening (#1118). BF16 is the top half of an F32, so bf16 &lt;&lt; 16 is the exact F32 value: every tier widens 4/8/16 weights in registers (vpmovzxwd + vpslld) and multiplies into F32 accumulator... | `MatMul.Bf16.cs` |
 | `DOTLLM_CPU_BF16_SCRATCH` | A/B switch between the two bit-identical AVX2/FMA GEMM forms: the register tile (default) and the F16-style four-row F32 scratch (DOTLLM_CPU_BF16_SCRATCH=1). Settable for in-process A/B. | `MatMul.Bf16.cs` |
+| `DOTLLM_CPU_GEMM_STATIC` | Test/diagnostic switch (also DOTLLM_CPU_GEMM_STATIC=1): partition the R4 tiled GEMM statically (one contiguous row range per thread) instead of by dynamic chunk claiming. Results are bit-identical either way (#1675). | `MatMulR4Gemm.cs` |
 | `DOTLLM_CPU_IQ1M_PACKED` | IQ1_M routed experts use the packed x Q8_K dot (default). DOTLLM_CPU_IQ1M_PACKED=0 falls back to dequantize-per-row (A/B baseline). | `MoeSwiGluMlp.cs` |
 | `DOTLLM_CPU_MOE_DECODE_N1` | Decode (one token) routed-expert fast path. The grouped path runs the k selected experts as k independent single-threaded tasks (Parallel.For, inner GEMMs without a pool): only k cores work, the work per expert is serial gate -... | `MoeSwiGluMlp.DecodeN1.cs` |
 | `DOTLLM_CPU_NVFP4_LEGACY_ORDER` | DOTLLM_CPU_NVFP4_LEGACY_ORDER=1 (read once): use the pre-#1587 float summation order (8-lane FMA partials) for every CPU NVFP4 x Q8_0 dot, single- and multi-row, so perplexity figures measured before #1587 reproduce. Default of... | `MatMulNvfp4.cs` |
@@ -1007,6 +1010,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | Variable | What the source says | Defined in |
 |---|---|---|
 | `DOTLLM_CPU_MTP_KV` | Environment variable selecting the head KV format: f16 (default), q8_0, q4_0 or f32 (reference arm only). | `CpuMtpState.cs` |
+| `DOTLLM_CPU_SERIAL_ELTWISE` | Test/diagnostic switch (also DOTLLM_CPU_SERIAL_ELTWISE=1): run the per-token FFN stages serially. | `TransformerModel.cs` |
 | `DOTLLM_DFLASH_DRAFT_VOCAB` | Draft-vocabulary limit (#1360): DOTLLM_DFLASH_DRAFT_VOCAB=K reads only token ids [0, K) of the lm-head for proposals; 0 = full; unset = the target's default. | `DFlashDrafter.cs` |
 | `DOTLLM_DFLASH_TRACE` | DOTLLM_DFLASH_TRACE=1: per-request draft / inject wall time on stderr at dispose. | `DFlashMtpState.cs` |
 | `DOTLLM_DIAG_EMBED_NOISE` | DIAGNOSTIC (DOTLLM_DIAG_EMBED_NOISE=&lt;eps&gt;): multiplies every embedding element by 1 + eps*u, u in [-1,1] (fixed seed): the noise-injection floor probe (#1599). | `TransformerModel.cs` |
@@ -1278,6 +1282,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_VULKAN_PARALLEL_UPLOAD` | Uploads the routed banks of every non-null entry of layers resident (raw quant), eagerly and in layer order, through one multi-threaded staging buffer, with the next layers' banks allocated ahead on background threads (#874). S... | `VulkanQwen3MoeMoeUpload.cs` |
 | `DOTLLM_VULKAN_PREFILL_PROFILE` | issue #139: env-gated prefill per-op-category profiler (DOTLLM_VULKAN_PREFILL_PROFILE=1). Splits the single per-forward command buffer at category boundaries (SubmitAndWait + re-Begin) so each bucket's wall time ~ its GPU time... | `VulkanTransformerModel.cs` |
 | `DOTLLM_VULKAN_PREFILL_PROFILE_OUT` | (not described in source) | `VulkanTransformerModel.cs` |
+| `DOTLLM_VULKAN_PREFILL_SPLIT_LAYERS` | Prefill host-synced submit splitting (#1760). 0 (default) = the whole prefill forward is ONE command buffer. N > 0 = every N layers (seqLen > 1, autoregressive forwards) the recorded work is submitted and fence-waited, then rec... | `VulkanTransformerModel.cs` |
 | `DOTLLM_VULKAN_Q4K_COOPMAT_MIN_TOKENS` | Env var moving the K-quant coopmat crossover (token count from which the coopmat GEMM replaces the dp4a MMQ). | `VulkanDensePrefillGemmPolicy.cs` |
 | `DOTLLM_VULKAN_Q8_0_COOPMAT_MIN_TOKENS` | Row count from which Q8_0PrefillKernel.Auto prefers the coopmat GEMM on a qualifying device (DOTLLM_VULKAN_Q8_0_COOPMAT_MIN_TOKENS, default 128 like the K-quants). | `VulkanTransformerModel.cs` |
 | `DOTLLM_VULKAN_Q8_0_PREFILL` | Startup override for Q8_0Prefill: auto (default), mmq or coopmat. | `VulkanTransformerModel.cs` |

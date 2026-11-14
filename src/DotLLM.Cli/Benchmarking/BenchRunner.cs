@@ -233,6 +233,7 @@ public static class BenchRunner
         int chunk, int rep, ref float[]? refLogits)
     {
         if (depth != 0) throw new ArgumentException("DOTLLM_BENCH_ALT_PREFILL_CHUNK does not support --depth.");
+        model.ResetSequenceState();   // untimed: every arm starts from a zero recurrent state, so the parity columns compare like with like
         using IKvCache cache = kvCacheFactory(cacheSize);
         int promptLen = promptTokens.Length;
         int[] positions = new int[promptLen];
