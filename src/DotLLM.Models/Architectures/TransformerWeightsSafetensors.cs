@@ -17,12 +17,11 @@ namespace DotLLM.Models.Architectures;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Stored F32 tensors are wired as zero-copy <c>nint</c> handles into the
-/// mmap view. BF16 tensors are upcast into 64-byte-aligned
-/// <see cref="NativeMemory.AlignedAlloc"/> scratch (a copy-at-load cost, but
-/// the only way to feed existing F32 SIMD kernels). Any owned scratch
-/// allocations are tracked by <see cref="TransformerWeights"/> and released
-/// by its <see cref="TransformerWeights.Dispose"/>.
+/// Dense F32, F16 and BF16 tensors are wired as zero-copy <c>nint</c> handles
+/// into the mmap view. Explicit F32-only consumers (including fused splits,
+/// MoE and MLA) still request converted scratch. Those owned allocations
+/// are tracked by <see cref="TransformerWeights"/> and released by
+/// <see cref="TransformerWeights.Dispose"/>.
 /// </para>
 /// <para>
 /// <b>tie_word_embeddings.</b> When the HF config declares tied embeddings
@@ -41,10 +40,22 @@ internal static class TransformerWeightsSafetensorsLoader
     /// </summary>
     public static TransformerWeights Load(
         ISafetensorsTensorSource file, ModelConfig config, BitNetI2SCacheContext? i2sCache = null,
-        bool allowFactorized = false, TensorOverlay? overlay = null)
+        bool allowFactorized = false, TensorOverlay? overlay = null, bool allowPackedQuantization = false)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
+
+        if (PackedQuantizedSafetensorsSource.HasPackedTensors(file))
+        {
+            if (file is not PackedQuantizedSafetensorsSource)
+                throw new InvalidDataException("Packed AWQ/GPTQ tensors require ModelLoader.OpenSafetensorsAndConfig and explicit quantization_config metadata.");
+            if (!allowPackedQuantization)
+                throw new NotSupportedException("Packed AWQ/GPTQ projections currently run on CPU only; use --device cpu. CUDA, Vulkan and HIP are unsupported.");
+            if (config.Architecture != DotLLM.Core.Configuration.Architecture.Llama || config.Moe is not null || config.MlaConfig is not null)
+                throw new NotSupportedException("Packed AWQ/GPTQ projections currently support dense Llama only.");
+            if (overlay is not null)
+                throw new NotSupportedException("Tensor overlays on packed AWQ/GPTQ checkpoints are unsupported.");
+        }
 
         // LittleBit factorized checkpoints (#864) are a CPU-only weight kind for dense Qwen3. Every other consumer of
         // this loader (Vulkan, CUDA, HIP, tools) must fail loudly instead of falling through to "missing tensor".
