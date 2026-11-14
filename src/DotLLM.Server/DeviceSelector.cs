@@ -106,7 +106,26 @@ public static class DeviceSelector
                 return new DevicePlan(spec, [], why + AlternativeHint(backends, except: "cuda"), null);
             }
 
-            default: // Vulkan
+            case DeviceKind.Hip:
+            {
+                var hip = backends.FirstOrDefault(b => b.Name == "hip");
+                var dev = hip?.Devices.FirstOrDefault(d => d.Index == spec.Ordinal);
+                string want = spec.Canonical;
+                if (hip is { Servable: true } && dev is { Servable: true, DeviceString: not null })
+                {
+                    long? available = dev.FreeMemoryBytes ?? dev.TotalMemoryBytes;
+                    if (available is { } bytes && modelBytes > bytes)
+                        return new DevicePlan(spec, [], $"the model's {Gib(modelBytes)} of weights exceed the {Gib(bytes)} available on {want}; HIP has no partial offload", null);
+                    return new DevicePlan(spec, [want], null, null);
+                }
+                string why = hip is not { Available: true }
+                    ? "HIP runtime / AMD GPU is unavailable" + (hip?.Note is { } n ? $" ({n})" : "")
+                    : dev is null ? $"HIP device {spec.Ordinal} does not exist (this machine has {hip.DeviceCount} HIP device(s))"
+                    : $"HIP device {spec.Ordinal} cannot serve models: {dev.Note ?? hip.Note ?? "required runtime assets are unavailable"}";
+                return new DevicePlan(spec, [], why + AlternativeHint(backends, except: "hip"), null);
+            }
+
+            case DeviceKind.Vulkan:
             {
                 var vk = backends.FirstOrDefault(b => b.Name == "vulkan");
                 if (vk is { Servable: true } && vk.Devices is { Length: > 0 })
@@ -119,22 +138,32 @@ public static class DeviceSelector
                 string why = "Vulkan is not usable on this machine" + (vk?.Note is { } n ? $" ({n})" : "");
                 return new DevicePlan(spec, [], why + AlternativeHint(backends, except: "vulkan"), null);
             }
+            default:
+                throw new ArgumentOutOfRangeException(nameof(spec));
         }
     }
 
-    private static string Gib(long bytes) => $"{bytes / (1024.0 * 1024 * 1024):F1} GiB";
+    private static string Gib(long bytes) => FormattableString.Invariant($"{bytes / (1024.0 * 1024 * 1024):F1} GiB");
 
     private static string AlternativeHint(Models.BackendInfoDto[] backends, string except)
     {
-        var other = backends.Where(b => b.Servable && b.Name != except && b.Name != "cpu").Select(b => b.Name).ToArray();
-        return other.Length == 0 ? "" : $"; {string.Join(" / ", other)} is available - try --device {(other[0] == "cuda" ? "gpu" : other[0])}";
+        var other = backends.Where(b => b.Servable && b.Name != except && b.Name != "cpu").ToArray();
+        if (other.Length == 0) return "";
+        string suggestion = other[0].Name switch
+        {
+            "cuda" => "gpu",
+            "hip" => other[0].Devices.First(d => d.Servable == true).DeviceString!,
+            _ => other[0].Name,
+        };
+        return $"; {string.Join(" / ", other.Select(b => b.Name))} is available - try --device {suggestion}";
     }
 
     /// <summary>Why <c>--device auto</c> had no GPU to try (per-backend notes) and what that costs.</summary>
     public static string NoGpuWarning(Models.BackendInfoDto[] backends, long modelBytes)
     {
         var reasons = backends.Where(b => b.Name != "cpu")
-            .Select(b => $"{b.Name}: " + (b.Servable ? $"does not fit a {modelBytes / (1024.0 * 1024 * 1024):F1} GiB model" : b.Note ?? "unavailable"))
+            .Select(b => $"{b.Name}: " + (b.Name == "hip" ? "experimental; select explicitly with --device hip:N"
+                : b.Servable ? $"does not fit a {modelBytes / (1024.0 * 1024 * 1024):F1} GiB model" : b.Note ?? "unavailable"))
             .ToArray();
         return "Running on the CPU: --device auto found no GPU that can load this model"
             + (reasons.Length > 0 ? $" ({string.Join("; ", reasons)})" : "")
@@ -146,14 +175,15 @@ public static class DeviceSelector
     /// </summary>
     public static string ExplicitFailureMessage(string requested, string modelName, long modelBytes, string reason)
     {
-        string size = $"{modelBytes / (1024.0 * 1024 * 1024):F1} GiB";
+        string size = Gib(modelBytes);
         string mem = "";
         try
         {
-            if (DeviceSpec.TryParse(requested, out var s, out _) && s.Kind == DeviceKind.Cuda)
+            if (DeviceSpec.TryParse(requested, out var s, out _) && s.Kind is DeviceKind.Cuda or DeviceKind.Hip)
             {
-                var d = DeviceEndpoint.Describe().Backends?.FirstOrDefault(b => b.Name == "cuda")?.Devices?.FirstOrDefault(x => x.Index == s.Ordinal);
-                if (d?.TotalMemoryBytes is { } t) mem = $" on a {t / (1024.0 * 1024 * 1024):F1} GiB device";
+                string backend = s.Kind == DeviceKind.Hip ? "hip" : "cuda";
+                var d = DeviceEndpoint.Describe().Backends?.FirstOrDefault(b => b.Name == backend)?.Devices?.FirstOrDefault(x => x.Index == s.Ordinal);
+                if (d?.TotalMemoryBytes is { } t) mem = $" on a {Gib(t)} device";
             }
         }
         catch { /* inventory is best-effort */ }

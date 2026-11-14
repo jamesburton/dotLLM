@@ -245,6 +245,15 @@ public sealed class MultiShardSafetensorsFile : ISafetensorsTensorSource
     }
 
     /// <inheritdoc/>
+    public (string Path, long FileOffset) GetTensorFileLocation(string name)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_tensorShardIndex.TryGetValue(name, out int shardIdx))
+            throw new KeyNotFoundException($"Multi-shard safetensors view has no tensor named '{name}'.");
+        return _shards[shardIdx].GetTensorFileLocation(name);
+    }
+
+    /// <inheritdoc/>
     public ReadOnlySpan<byte> GetTensorSpan(string name)
     {
         if (!_tensorShardIndex.TryGetValue(name, out int shardIdx))

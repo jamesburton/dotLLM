@@ -1,6 +1,7 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 using DotLLM.Server.Models;
 
 namespace DotLLM.Server;
@@ -18,14 +19,16 @@ internal static class ModelMeta
     /// </summary>
     /// <param name="config">The served config: <see cref="ModelConfig.MaxSequenceLength"/> is the window after any fit or <c>--ctx-size</c>.</param>
     /// <param name="gguf">The model's GGUF, for the trained window, vocabulary type and tensor directory. May be null (non-GGUF loads).</param>
+    /// <param name="safetensors">The HF checkpoint's tensor source, for physical storage and parameter accounting.</param>
     /// <returns>The meta object, or <c>null</c> when <paramref name="config"/> is null.</returns>
-    public static ModelMetaDto? Build(ModelConfig? config, GgufFile? gguf)
+    public static ModelMetaDto? Build(ModelConfig? config, GgufFile? gguf, ISafetensorsTensorSource? safetensors = null)
     {
         if (config is null)
             return null;
 
         long nParams = 0, size = 0;
         var bytesByType = new Dictionary<QuantizationType, long>();
+        string? safetensorsType = null;
         if (gguf is not null)
         {
             foreach (var t in gguf.Tensors)
@@ -46,6 +49,23 @@ internal static class ModelMeta
                 bytesByType[t.QuantizationType] = bytesByType.GetValueOrDefault(t.QuantizationType) + bytes;
             }
         }
+        else if (safetensors is not null)
+        {
+            var sourceBytesByType = new Dictionary<SafetensorsDType, long>();
+            foreach (var tensor in safetensors.Tensors)
+            {
+                nParams = checked(nParams + tensor.ElementCount);
+                size = checked(size + tensor.ByteCount);
+                sourceBytesByType[tensor.DType] = sourceBytesByType.GetValueOrDefault(tensor.DType) + tensor.ByteCount;
+            }
+            if (safetensors is PackedQuantizedSafetensorsSource packed)
+            {
+                nParams = packed.LogicalParameterCount;
+                safetensorsType = FormattableString.Invariant($"{packed.Format} - {size * 8.0 / nParams:F2} bpw");
+            }
+            else if (nParams > 0 && sourceBytesByType.Count > 0)
+                safetensorsType = FormattableString.Invariant($"{sourceBytesByType.MaxBy(kv => kv.Value).Key} - {size * 8.0 / nParams:F2} bpw");
+        }
 
         return new ModelMetaDto
         {
@@ -56,7 +76,7 @@ internal static class ModelMeta
             NEmbd = config.HiddenSize,
             NParams = nParams,
             Size = size,
-            Ftype = Ftype(bytesByType, size, nParams),
+            Ftype = safetensorsType ?? Ftype(bytesByType, size, nParams),
         };
     }
 

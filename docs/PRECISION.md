@@ -591,7 +591,7 @@ PRs #1103, #1122, #1125, #1126.
 | C7 | CPU | MTP KV and hidden F32 | 32 MiB @4096 positions | **KV fixed** (#1141): F16 default (16 MiB), q8_0 (8.5), q4_0 (4.5) when the trunk cache is quantized; hidden stays F32 (#1144); `DOTLLM_CPU_MTP_KV=f32` reference arm | #1141 |
 | C8 | CPU | MLA KV, TurboQuant norms, MoE scatter F32 | per token | open | #1140 |
 | C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence (speculative verify: read-only scan + in-place replay of row inputs, no state copy at all, #1194) | sign-off pending | #1144 |
-| X1 | CPU | safetensors BF16 → F32 | L8B +16 GB; L1B +2.5 GB | open | #1143 (needs #1118) |
+| X1 | CPU | safetensors BF16 → F32 | Dense linear/embedding/head now borrow 2-byte BF16; no owned matrix copy | partial | #1143: explicit fused splits, MoE/MLA and other F32-only consumers still convert |
 | X2 | CPU | MLA-MoE routed experts → F32 | ≈57 GB on V2-Lite | open | #1140 |
 | X3 | CPU | MLA projections, shared / Granite-MoE experts → F32 | `Σ out·in·4` | open | #1140 |
 | X4 | CPU | R4 repack: second same-width copy | L8B Q4_K_M +4.9 GB | **fixed**: R4 is a zero-copy view; same kernels on the mmap rows, bit-identical, same speed | #1156 (from #1143) |
@@ -676,3 +676,57 @@ New issues filed by this study: #1134–#1146 (inventory), #1148–#1151 (Vulkan
 | Weight-format quality (CPU Q4_0/Q4_K_M were requantized from Q8_0) | activation comparisons are unaffected | — |
 | FP8 / MXFP4 compute | no FP8 hardware on any target device; FP8 storage offers nothing over q8_0 | — |
 | Disk ↔ device transfer paths (rule 3) | outside this study | — |
+
+## 9. HIP dense integration: RX 6900 XT
+
+The initial `DotLLM.Hip` path was qualified on Windows, RX 6900 XT (`gfx1030`), HIP SDK 6.4.2 and driver 32.0.21045.16010. Resident activations and scratch are F16; GGUF Q4_0/Q8_0 matrices and optional Q8_0 KV are read directly in packed form. RMSNorm, projections and attention accumulate in F32 registers. No expanded matrix, score tensor or full-history KV scratch is stored. F32 file norms narrow on the device and release their original import. DirectStorage uses its own internal staging; application host weight staging is zero.
+
+The existing `IModel`/CPU sampler boundary still receives one F32 logit row (`4 * vocabulary` bytes; 196,608 bytes for SmolLM2-135M). That compatibility result is distinct from resident GPU tensor storage; this integration does not migrate the shared sampling contract.
+
+For the real SmolLM2-135M GGUF checkpoints, weight payload/aligned allocation bytes are 269,030,016/274,928,256 (F16), 142,955,136/150,082,176 (Q8_0), and 75,715,200/78,910,080 (Q4_0). `ComputeMemoryBytes` stays 209,280: 110,976 bytes of GPU scratch plus a 98,304-byte host F16 logit row, excluding the caller-owned F32 result. Empty caches reserve logical context without device pages. Fifty live tokens use 1,476,480 bytes with F16 K/V, or 785,280 with Q8_0 K/V, including page tables. Driver-wide memory deltas are larger than these owned allocations and can remain elevated after disposal.
+
+With F16 KV, all three formats match CPU top-1 on 50/50 teacher-forced rows, with maximum relative L2 below 0.008 and KL below 0.000055. Packed-weight references decode the exact checkpoint into F32 **for testing only**, avoiding the CPU packed engine's separate activation quantization. With matched Q8_0 KV references, Q8/Q4 weights reach 49/50 and 50/50 top-1 matches, maximum L2 0.02298/0.02883 and KL 0.000611/0.001352. Short-text PPL changes are below 0.35%; these Q8 KV runs exceed the original 2% L2 probe threshold and are not F16-equivalent parity or a corpus benchmark. F16 remains the default KV format.
+
+The genuine HF F16 derivative retains original NeoX Q/K ordering. Its 12-row check has 11 exact top-1 matches, maximum L2 0.00435 and KL 0.000041. The remaining CPU winner margin is 0.00430, below one F16 ULP of 0.015625; the test permits at most one such near tie. Substituting GGUF adjacent-pair RoPE produces L2 1.27 and fails the numerical gate. Native byte/layout oracles, full-model tests and deliberate mutations guard the packed and cache paths; see [HIP.md](HIP.md) and [native qualification](../native/hip/README.md).
+
+### Original BF16 and packed SafeTensors
+
+The follow-up preserves BF16 weight bits and reads AWQ/GPTQ components directly on GPU. Activations remain F16 and reductions remain F32 registers. Seventeen focused format/model checks passed without skips, covering shards, tied heads, noncanonical GPTQ group indices, validated zero biases, original file ranges and ownership. The real checkpoint probes use the original BF16 SmolLM2 versus CPU and six independent Hugging Face reference rows per packed TinyLlama checkpoint, with pinned model/producer hashes in the tests.
+
+| Checkpoint | Resident payload bytes | Max relative L2 | Max KL | Exact top-1 |
+| --- | ---: | ---: | ---: | ---: |
+| SmolLM2-135M-Instruct BF16 | 269,030,016 | .00434425 | .00004050 | 5/6 |
+| TinyLlama-1.1B-Chat-v1.0 AWQ | 765,693,952 | .00879382 | .00015286 | 5/6 |
+| TinyLlama-1.1B-Chat-v1.0 GPTQ | 767,270,912 | .00459750 | .00001075 | 6/6 |
+
+These pass the predeclared L2 < .02 and KL < .001 gates; reversed winners must remain within .03 of the CPU/reference winner. They are short-checkpoint parity probes, not exact token identity or 8K qualification of these formats. The GPTQ checkpoint also exercises BF16 embedding/head/norms; its 788,480 bytes of validated zero biases are omitted from resident payload. Payload includes packed words, F16 scales, zero points and group indices, plus ordinary tensors; platform allocation padding is separate. Reinterpreting original BF16 as F16 produces nonfinite output, and redirecting qzeros reads to qweight file ranges produces L2 1.36205 (AWQ) / 2.80458 (GPTQ). The tests reject each wrong-data substitution without loosening a gate.
+
+### Actual 1K–8K histories
+
+The 2026-11-14 follow-up consumed one continuous 8,192-token natural-text history on the same RX 6900 XT, using the F16 SmolLM2 GGUF (SHA256 `5157CA60744D21631818364854AC8E4452E1B8022D2AB4C8A2F9CDA2344AFB30`). It compared independent CPU F32, CPU Q8, HIP F16 and HIP Q8 caches. Each boundary scores its last 128 next-token predictions, including input position 8,191 predicting target 8,192: **512 scored rows per comparison**, not a full-corpus perplexity benchmark. Unscored prefixes use 32-token forwards with last-row logits only; every backend receives identical tokens and positions.
+
+Text comes from the actual first chapter of [Project Gutenberg ebook 11](https://www.gutenberg.org/cache/epub/11/pg11.txt), excluding the contents. Raw text SHA256 is `01B38EA4C710A84BC18D0BD41271A5A1A92B94E97B2812F4DECE97D4A694725E`; the first 8,193 token IDs, serialized as little-endian int32, hash to `7C043C12B9A873068520D7D7A4E3AB3B89A0F6AE9BF456BFBE53D3B61FDA4F37`. CRLF is normalized to LF, with no added BOS. This is a parity probe on one text/model; the text is not claimed to be held out from training.
+
+The original gates remain **maximum relative L2 < 0.02 and KL < 0.002**. F16 passes all four windows. Q8 fails both gates at every window; small perplexity changes and mostly unchanged winners do not cancel those failures.
+
+HIP Q8 KV therefore requires the explicit process flag **`DOTLLM_HIP_ALLOW_Q8_KV=1`** in addition to selecting Q8 for either cache plane. CLI/server startup and direct library cache creation enforce the acknowledgement. It does not improve the quantizer or relax these gates; F16 remains the default. Q8 model weights are unaffected.
+
+| Context | F16 max L2 / KL | Q8 max L2 / KL | Top-1 matches F16 / Q8 (of 128) | Window PPL CPU F32 / HIP F16 / HIP Q8 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,024 | .010677 / .00024083 | .048763 / .0057087 | 128 / 125 | 17.63146 / 17.62577 / 17.59891 |
+| 2,048 | .009193 / .00009873 | .057338 / .0094629 | 127 / 127 | 14.29722 / 14.29509 / 14.33021 |
+| 4,096 | .006852 / .00008600 | .068570 / .0078572 | 128 / 126 | 12.19606 / 12.19037 / 12.24910 |
+| 8,192 | .006174 / .00005271 | .050690 / .0038931 | 128 / 126 | 13.26378 / 13.27099 / 13.28250 |
+
+An independent CPU replay also fails the same Q8-versus-F32 gates at all four boundaries (8K maximum L2 .056259, KL .0049326). HIP Q8 versus matched CPU Q8 fails too (8K L2 .038145, KL .0039596). CPU/HIP quantizers use the same max-absolute-value scale, half-stored scale and ties-to-even policy, but receive F32/F16 K/V values respectively. These results establish quantization loss; they do not isolate a HIP implementation defect or establish F16-equivalent Q8 quality. **F16 remains the default.** Rotating the real vocabulary output by one fails with L2 1.22433 and KL 13.5632, demonstrating the probe detects wrong logits.
+
+| Actual context | Owned F16 KV bytes | Owned Q8 KV bytes | Driver growth from empty caches |
+| ---: | ---: | ---: | ---: |
+| 1,024 | 23,623,680 | 12,564,480 | 13,434,880 |
+| 2,048 | 47,247,360 | 25,128,960 | 80,543,744 |
+| 4,096 | 94,494,720 | 50,257,920 | 214,761,472 |
+| 8,192 | 188,989,440 | 100,515,840 | 416,088,064 |
+
+The 8K caches each use 512 token pages; payload costs are 23,040 bytes/token for F16 and 12,240 for Q8, plus 245,760 bytes of pointer tables per cache at 8K. Both start at zero and return to zero owned KV bytes after reset. Disposal reports zero owned weights/compute bytes. Driver figures include both caches and allocator reuse; they are not per-cache physical-memory totals.
+
+The full run took 2,020.3 seconds, including four backend/reference paths; it is not a throughput comparison. It used baseline `e2de144` and dense object `CA16ABD3BEA6584C8B2A857631D43BC227D65A2E4A8CE82E1DE92F79345C90DC`, frozen while new format work proceeded. A subsequent 1K replay with the final BF16/AWQ/GPTQ-enabled code object (`5BB968AF7A33B4ABA4B4C98A7B3F4163EEB56BEA7B91CFA139E9015E228217A7`) and identical managed assemblies reproduced every aggregate numerical metric exactly. The harness targets .NET 10 and executed on runtime 10.0.15. Its artifact validator checks actual lengths, scoring positions, memory geometry, lifecycle and the failed negative control. Historical raw results remain local in `.docs/hip-long-context/`. A tracked portable reproduction protocol accompanies the subsequent qualification-documentation slice. Other models, other GPUs and broad corpus quality remain unqualified.

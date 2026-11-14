@@ -34,6 +34,8 @@ public enum KvFlagTarget
     CudaPlain,
     /// <summary>CPU backends: honour via the engine's QuantizedKvCache (run/serve only).</summary>
     Cpu,
+    /// <summary>HIP: independently selected F16 or Q8_0 storage in device pages.</summary>
+    Hip,
     /// <summary>Vulkan VulkanTransformerModel: device-resident KV, quantized storage supported.</summary>
     VulkanQuantSupported,
     /// <summary>Vulkan: device-resident KV, no quantized storage.</summary>
@@ -148,6 +150,7 @@ internal static class KvStorageCli
             KvFlagTarget.CudaHybridDense => true,
             KvFlagTarget.VulkanHybridDense => true,   // Apply rejects what it cannot store (q8_0, q4_0, mixed K/V)
             KvFlagTarget.VulkanQuantSupported => true,
+            KvFlagTarget.Hip => true,
             KvFlagTarget.CudaPlain or KvFlagTarget.Cpu or KvFlagTarget.Other => engineCacheHonoured,
             _ => false,
         };
@@ -189,6 +192,7 @@ internal static class KvStorageCli
         }
         return model switch
         {
+            DotLLM.Hip.HipTransformerModel => KvFlagTarget.Hip,
             CudaQwen3HybridDenseTransformerModel => KvFlagTarget.CudaHybridDense,
             HybridQwen3HybridDenseTransformerModel or DotLLM.Cuda.HybridTransformerModel
                 or CudaQwen3MoeHybridTransformerModel or CudaNemotronHTransformerModel or CudaLfm2MoeTransformerModel => KvFlagTarget.OwnCacheUnsupported,
@@ -205,6 +209,9 @@ internal static class KvStorageCli
     /// </summary>
     public static void Apply(IModel model, KvStorageRequest request)
     {
+        if (model is DotLLM.Hip.HipTransformerModel && (request.Key == KvCacheDType.Q8_0 || request.Value == KvCacheDType.Q8_0)
+            && model.Config.HeadDim % 32 != 0)
+            throw new NotSupportedException("HIP Q8_0 KV requires head dimensions divisible by 32.");
         if (model is CudaLfm2MoeTransformerModel)
             CudaLfm2MoeTransformerModel.ValidateKvStorage(request.Key ?? KvCacheDType.F32, request.Value ?? KvCacheDType.F32, request.CacheWindow);
         if (model is CudaQwen3HybridDenseTransformerModel dense && (request.Key is not null || request.Value is not null))

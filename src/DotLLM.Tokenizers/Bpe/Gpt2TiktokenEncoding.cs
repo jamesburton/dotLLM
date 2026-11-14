@@ -197,19 +197,43 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
 
         foreach (Regex regex in pipeline)
         {
+            // .NET Regex character classes inspect UTF-16 code units. The exact
+            // individual-number stage (SmolLM/StarCoder) instead needs Unicode
+            // scalar values, including astral digits such as U+1D7D9. Keep this
+            // narrow: the remaining expressions retain their normal regex path.
+            bool individualNumbers = string.Equals(regex.ToString(), @"\p{N}", StringComparison.Ordinal);
             var next = new List<(int Start, int Length)>(spans.Count * 2);
             foreach ((int start, int length) in spans)
             {
                 if (length == 0) continue;
 
                 int cursor = 0;
-                foreach (ValueMatch match in regex.EnumerateMatches(text.Slice(start, length)))
+                if (individualNumbers)
                 {
-                    if (match.Length == 0) continue;
-                    if (match.Index > cursor)
-                        next.Add((start + cursor, match.Index - cursor));   // unmatched gap
-                    next.Add((start + match.Index, match.Length));
-                    cursor = match.Index + match.Length;
+                    int runeStart = 0;
+                    foreach (Rune rune in text.Slice(start, length).EnumerateRunes())
+                    {
+                        int runeLength = rune.Utf16SequenceLength;
+                        if (Rune.IsNumber(rune))
+                        {
+                            if (runeStart > cursor)
+                                next.Add((start + cursor, runeStart - cursor));
+                            next.Add((start + runeStart, runeLength));
+                            cursor = runeStart + runeLength;
+                        }
+                        runeStart += runeLength;
+                    }
+                }
+                else
+                {
+                    foreach (ValueMatch match in regex.EnumerateMatches(text.Slice(start, length)))
+                    {
+                        if (match.Length == 0) continue;
+                        if (match.Index > cursor)
+                            next.Add((start + cursor, match.Index - cursor));   // unmatched gap
+                        next.Add((start + match.Index, match.Length));
+                        cursor = match.Index + match.Length;
+                    }
                 }
 
                 if (cursor < length)

@@ -132,6 +132,7 @@ internal static class ReasoningSupport
     /// </summary>
     internal static Models.ReasoningCapabilitiesDto? Capabilities(IChatTemplate? template)
     {
+        template = HfServerChatTemplate.Select(template, useTools: false);
         if (template is not JinjaChatTemplate jinja)
             return null;
         string src = jinja.TemplateSource;
@@ -300,7 +301,7 @@ internal static class ReasoningSupport
         IChatTemplate? template = null)
     {
         error = null;
-        var markup = (template as JinjaChatTemplate)?.ReasoningMarkup ?? ReasoningMarkup.Think;
+        var markup = (HfServerChatTemplate.Select(template, useTools: false) as JinjaChatTemplate)?.ReasoningMarkup ?? ReasoningMarkup.Think;
         var format = serverFormat;
         if (requestFormat is not null)
         {

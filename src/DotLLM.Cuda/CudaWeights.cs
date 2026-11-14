@@ -791,7 +791,7 @@ internal sealed class CudaWeights : IDisposable
     private static nint UploadQuantized(nint hostPtr, QuantizationType qt,
                                           int outputDim, int inputDim, List<nint> allocs)
     {
-        if (qt is QuantizationType.F16 or QuantizationType.F32)
+        if (!IsQuantized(qt))
             return 0; // Non-quantized weights don't need a separate quantized copy
 
         long quantBytes = Dequantize.RowByteSize(inputDim, qt) * outputDim;
@@ -1026,7 +1026,7 @@ internal sealed class CudaWeights : IDisposable
     }
 
     private static bool IsQuantized(QuantizationType qt) =>
-        qt is not QuantizationType.F16 and not QuantizationType.F32;
+        qt is not QuantizationType.F16 and not QuantizationType.F32 and not QuantizationType.BF16;
 
     /// <summary>
     /// Whether to skip the persistent FP16 copy for this quant type.
