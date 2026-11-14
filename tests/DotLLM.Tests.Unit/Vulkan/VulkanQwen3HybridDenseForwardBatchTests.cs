@@ -84,11 +84,11 @@ public sealed class VulkanQwen3HybridDenseForwardBatchTests
             return new SequenceForwardRequest { TokenIds = ids.AsMemory(), Positions = pos.AsMemory(), KvCache = Kv, GdnState = Gdn };
         }
 
-        public void Accept(float[] row, int consumed)
+        public void Accept(float[] row, int consumed, int? forcedNext = null)
         {
             Rows.Add(row);
             Pos += consumed;
-            Next = Argmax(row);
+            Next = forcedNext ?? Argmax(row);
         }
     }
 
@@ -122,8 +122,12 @@ public sealed class VulkanQwen3HybridDenseForwardBatchTests
         return all;
     }
 
-    /// <summary>Batched run: every step issues ONE <c>ForwardBatch</c> over all sequences, interleaving their states.</summary>
-    private static List<float[]>[] RunBatched(Fixture f, bool shareGdn)
+    /// <summary>
+    /// Batched run: every step issues ONE <c>ForwardBatch</c> over all sequences, interleaving their states. With
+    /// <paramref name="teacher"/>, each sequence is fed the teacher's greedy token instead of its own (#1749): a near-tie at one step
+    /// must not turn the rest of the comparison into one between two different token streams.
+    /// </summary>
+    private static List<float[]>[] RunBatched(Fixture f, bool shareGdn, List<float[]>[]? teacher = null)
     {
         var slots = new List<VulkanGdnStateCache>();
         VulkanGdnStateCache? shared = shareGdn ? f.Model.CreateGdnStateCache() : null;
@@ -143,7 +147,8 @@ public sealed class VulkanQwen3HybridDenseForwardBatchTests
                 try
                 {
                     for (int s = 0; s < seqs.Length; s++)
-                        seqs[s].Accept(LastRow(results[s], f.Config.VocabSize), requests[s].TokenIds.Length);
+                        seqs[s].Accept(LastRow(results[s], f.Config.VocabSize), requests[s].TokenIds.Length,
+                            teacher is null ? null : Argmax(teacher[s][step]));
                 }
                 finally { foreach (var t in results) t.Dispose(); }
             }
@@ -230,43 +235,109 @@ public sealed class VulkanQwen3HybridDenseForwardBatchTests
     private static T WithSerialBatch<T>(Func<T> body) => WithEnv("DOTLLM_VK_BATCH_FUSE", "0", body);
 
     /// <summary>
-    /// #687: the stacked forward (FFN GEMMs over the rows of every sequence, token mixing per sequence) must stay on the serial
-    /// oracle. Not bit-identical: the FFN GEMMs run at a different n. Same greedy tokens and logits close.
+    /// Runs <paramref name="body"/> with every projection GEMM on the same route whatever the row count (#1749): the small-row GEMVs
+    /// and the dp4a MMQ off, so the serial prefills (5..40 rows) and the stacked one (67 rows) all take the F16 coopmat (or, on a
+    /// device without it, the scalar) GEMM. Both switches are read when the model is built, so the fixture is opened inside.
+    /// </summary>
+    private static T WithSingleGemmRoute<T>(Func<Fixture, T> body)
+    {
+        bool saved = VulkanQwen3HybridDenseTransformerModel.SmallRowGemvEnabled;
+        VulkanQwen3HybridDenseTransformerModel.SmallRowGemvEnabled = false;
+        try
+        {
+            return WithEnv(VulkanQwen3MoeHybridKernels.HybridPrefillMmqEnvVar, "0", () =>
+            {
+                using var f = Open();
+                return body(f);
+            });
+        }
+        finally { VulkanQwen3HybridDenseTransformerModel.SmallRowGemvEnabled = saved; }
+    }
+
+    private static double MaxAbsDiff(float[] a, float[] b)
+    {
+        double worst = 0;
+        for (int i = 0; i < a.Length; i++) worst = Math.Max(worst, Math.Abs(a[i] - b[i]));
+        return worst;
+    }
+
+    private static double MaxAbsDiff(List<float[]>[] a, List<float[]>[] b)
+    {
+        double worst = 0;
+        for (int s = 0; s < a.Length; s++)
+        {
+            Assert.Equal(a[s].Count, b[s].Count);
+            for (int step = 0; step < a[s].Count; step++) worst = Math.Max(worst, MaxAbsDiff(a[s][step], b[s][step]));
+        }
+        return worst;
+    }
+
+    /// <summary>Bound for the strict same-route gate: measured 7.2e-3 on the 8060S (GEMV at n = 1 vs coopmat at n = 4 on the decode steps).</summary>
+    private const double SameRouteBound = 0.05;
+
+    /// <summary>
+    /// Bound for the default-route check. The stacked prefill takes the F16 coopmat GEMM while a short serial prefill takes the
+    /// small-row GEMVs, so the two differ by route, not by a bug (#1749). Measured max |diff|: 0.22 on the 8060S, 0.31 on Arc, 0.18 on
+    /// the RTX 3060 Vulkan; against the CPU oracle both routes sit 0.22-0.68 away, with neither consistently closer.
+    /// </summary>
+    private const double DefaultRouteBound = 0.5;
+
+    /// <summary>
+    /// #687 / #1749, the discriminating gate: with every GEMM on one route, the stacked forward (FFN GEMMs over the rows of every
+    /// sequence, token mixing per sequence) must reproduce the serial oracle. The full-history prefills (prompts up to the all-row
+    /// logits length) are bit-identical; the rest differ only by the decode GEMV-vs-GEMM route, within <see cref="SameRouteBound"/>,
+    /// with the same greedy token. Teacher-forced on the serial tokens.
+    /// </summary>
+    [SkippableFact]
+    public void ForwardBatchFused_SameGemmRoute_MatchesSerialOracle()
+    {
+        WithSingleGemmRoute(f =>
+        {
+            var serial = RunSerial(f);
+            var fused = WithFusedBatch(() => RunBatched(f, shareGdn: false, teacher: serial));
+            for (int s = 0; s < Prompts.Length; s++)
+            {
+                Assert.Equal(serial[s].Count, fused[s].Count);
+                for (int step = 0; step < serial[s].Count; step++)
+                    Assert.Equal(Argmax(serial[s][step]), Argmax(fused[s][step]));
+            }
+            for (int s = 0; s < 3; s++)
+            {
+                double prefill = MaxAbsDiff(serial[s][0], fused[s][0]);
+                Assert.True(prefill == 0, $"seq {s}: same-route stacked prefill is not bit-identical to the serial one: max |diff| = {prefill:E3}");
+            }
+            double worst = MaxAbsDiff(serial, fused);
+            Assert.True(worst < SameRouteBound, $"same-route fused vs serial logits differ: max |diff| = {worst:E3}");
+            return 0;
+        });
+    }
+
+    /// <summary>
+    /// #687 on the default routes: teacher-forced on the serial tokens, the stacked forward stays within
+    /// <see cref="DefaultRouteBound"/> of the serial oracle. No greedy-token assertion here: with every logit within the bound, a flip
+    /// can only occur where the top two are within twice the bound, which is a near-tie on either route (seq 2's prefill: margin 0.21).
     /// </summary>
     [SkippableFact]
     public void ForwardBatchFused_MatchesSerialOracle()
     {
         using var f = Open();
         var serial = RunSerial(f);
-        var fused = WithFusedBatch(() => RunBatched(f, shareGdn: false));
-
-        double worst = 0;
-        for (int s = 0; s < Prompts.Length; s++)
-        {
-            Assert.Equal(serial[s].Count, fused[s].Count);
-            for (int step = 0; step < serial[s].Count; step++)
-            {
-                Assert.Equal(Argmax(serial[s][step]), Argmax(fused[s][step]));
-                for (int i = 0; i < serial[s][step].Length; i++)
-                    worst = Math.Max(worst, Math.Abs(serial[s][step][i] - fused[s][step][i]));
-            }
-        }
-        Assert.True(worst < 0.05, $"fused vs serial logits differ: max |diff| = {worst:E3}");
+        var fused = WithFusedBatch(() => RunBatched(f, shareGdn: false, teacher: serial));
+        double worst = MaxAbsDiff(serial, fused);
+        Assert.True(worst < DefaultRouteBound, $"fused vs serial logits differ: max |diff| = {worst:E3}");
     }
 
-    /// <summary>Sensitivity control for the stacked path: one shared GDN slot must corrupt it just like the serial loop.</summary>
+    /// <summary>
+    /// Sensitivity control for the stacked path: one shared GDN slot must corrupt it just like the serial loop, by more than the
+    /// looser of the two gates above, so both could have failed.
+    /// </summary>
     [SkippableFact]
     public void ForwardBatchFused_SharedGdnSlot_Mutant_Diverges()
     {
         using var f = Open();
         var serial = RunSerial(f);
-        var mutant = WithFusedBatch(() => RunBatched(f, shareGdn: true));
-
-        double worst = 0;
-        for (int s = 0; s < Prompts.Length; s++)
-            for (int step = 0; step < serial[s].Count; step++)
-                for (int i = 0; i < serial[s][step].Length; i++)
-                    worst = Math.Max(worst, Math.Abs(serial[s][step][i] - mutant[s][step][i]));
-        Assert.True(worst > 1e-3, $"fused shared-slot mutant did not diverge (max |diff| = {worst:E3})");
+        var mutant = WithFusedBatch(() => RunBatched(f, shareGdn: true, teacher: serial));
+        double worst = MaxAbsDiff(serial, mutant);
+        Assert.True(worst > DefaultRouteBound, $"fused shared-slot mutant stayed within the gate (max |diff| = {worst:E3}): the gate is insensitive");
     }
 }
