@@ -2,6 +2,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models;
+using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 using Xunit;
@@ -43,6 +44,10 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// They use the tiny seeded synthetic Qwen3.5-MoE fixture (layer 0 is a real Gated DeltaNet layer
 /// with a real <c>GdnStateCache</c>), so they need no multi-GB download and no known-good reference:
 /// only determinism.</para>
+///
+/// <para><b>Since #1786</b> the uncached position-0 forward re-zeroes the model-owned state itself, so the loop is
+/// sequence-independent without the explicit reset too. The negative control (the loop must leak when state is NOT
+/// reset) therefore threads one caller-owned state container through every step instead, which nothing resets.</para>
 /// </remarks>
 [Collection(GpuCollection.Name)]
 public sealed class ReprefillSequenceStateResetTests : IDisposable
@@ -87,8 +92,19 @@ public sealed class ReprefillSequenceStateResetTests : IDisposable
         (float[] first, float[] replay) = RunReprefillLoop(withReset, resetBetweenSteps: true);
         AssertBitIdentical(first, replay, expectEqual: true);
 
-        using IModel withoutReset = LoadCpuModel();
-        (float[] leakedFirst, float[] leakedReplay) = RunReprefillLoop(withoutReset, resetBetweenSteps: false);
+        // #1786: the uncached position-0 forward now re-zeroes the model-owned state itself, so the loop is
+        // sequence-independent even without the explicit reset.
+        using IModel autoReset = LoadCpuModel();
+        (float[] autoFirst, float[] autoReplay) = RunReprefillLoop(autoReset, resetBetweenSteps: false);
+        AssertBitIdentical(autoFirst, autoReplay, expectEqual: true);
+
+        // Negative control: the same loop through ONE caller-threaded state container, which nothing resets, must leak -
+        // otherwise the fixture carries no recurrent state and both assertions above prove nothing.
+        using IModel leaky = LoadCpuModel();
+        using IRecurrentSequenceState state = leaky.CreateSequenceState()!;
+        var hybrid = Assert.IsType<Qwen3MoeHybridTransformerModel>(leaky);
+        (float[] leakedFirst, float[] leakedReplay) = RunReprefillLoop(leaky, resetBetweenSteps: false,
+            (ids, pos) => hybrid.Forward(ids, pos, -1, kvCache: null, gdnState: (IGdnState)state));
         AssertBitIdentical(leakedFirst, leakedReplay, expectEqual: false);
     }
 
@@ -133,7 +149,15 @@ public sealed class ReprefillSequenceStateResetTests : IDisposable
         (IModel leaky, _) = VulkanModelLoader.CreateFromGguf(device, gguf2, config2, spvDir);
         using (leaky)
         {
-            (float[] leakedFirst, float[] leakedReplay) = RunReprefillLoop(leaky, resetBetweenSteps: false);
+            // #1786: without an explicit reset the uncached position-0 forward resets itself...
+            (float[] autoFirst, float[] autoReplay) = RunReprefillLoop(leaky, resetBetweenSteps: false);
+            AssertBitIdentical(autoFirst, autoReplay, expectEqual: true);
+
+            // ...while one caller-threaded container, which nothing resets, must leak (the negative control).
+            using IRecurrentSequenceState state = leaky.CreateSequenceState()!;
+            var hybrid = Assert.IsType<VulkanQwen3MoeHybridTransformerModel>(leaky);
+            (float[] leakedFirst, float[] leakedReplay) = RunReprefillLoop(leaky, resetBetweenSteps: false,
+                (ids, pos) => hybrid.Forward(ids, pos, -1, kvCache: null, gdnState: (IGdnState)state));
             AssertBitIdentical(leakedFirst, leakedReplay, expectEqual: false);
         }
     }
@@ -186,8 +210,10 @@ public sealed class ReprefillSequenceStateResetTests : IDisposable
     /// Runs the parity driver's growing-context re-prefill loop and then replays step 0's exact
     /// inputs. Returns (step-0 logits, replayed step-0 logits).
     /// </summary>
-    private (float[] First, float[] Replay) RunReprefillLoop(IModel model, bool resetBetweenSteps)
+    private (float[] First, float[] Replay) RunReprefillLoop(IModel model, bool resetBetweenSteps,
+                                                            Func<int[], int[], ITensor>? forward = null)
     {
+        forward ??= (ids, pos) => model.Forward(ids, pos, deviceId: -1);
         var tokens = new List<int>(Prompt);
         float[]? first = null;
         int[] firstTokens = [];
@@ -200,7 +226,7 @@ public sealed class ReprefillSequenceStateResetTests : IDisposable
             for (int i = 0; i < positions.Length; i++) positions[i] = i;
 
             if (resetBetweenSteps) model.ResetSequenceState();
-            float[] logits = LastRow(model, tokenIds, positions);
+            float[] logits = LastRow(forward, tokenIds, positions);
 
             if (step == 0)
             {
@@ -213,14 +239,14 @@ public sealed class ReprefillSequenceStateResetTests : IDisposable
         }
 
         if (resetBetweenSteps) model.ResetSequenceState();
-        float[] replay = LastRow(model, firstTokens, firstPositions);
+        float[] replay = LastRow(forward, firstTokens, firstPositions);
         _output.WriteLine($"reset={resetBetweenSteps}: step0[0]={first![0]:R} replay[0]={replay[0]:R}");
         return (first, replay);
     }
 
-    private static unsafe float[] LastRow(IModel model, int[] tokenIds, int[] positions)
+    private static unsafe float[] LastRow(Func<int[], int[], ITensor> forward, int[] tokenIds, int[] positions)
     {
-        using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+        using ITensor logits = forward(tokenIds, positions);
         Assert.Equal(2, logits.Shape.Rank);
         int seqLen = logits.Shape[0];
         int vocab = logits.Shape[1];
