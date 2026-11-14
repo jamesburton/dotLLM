@@ -115,7 +115,7 @@ public sealed class CloverRealGgufCpuTests
             _output.WriteLine($"[clover cpu, no A_log transform] finite={finite} top1={wrongTop} margin={wrongMargin:F3}");
             Assert.False(finite && wrongTop == CloverRealGguf.Paris, "the untransformed model still predicts \" Paris\"");
         }
-        catch (IndexOutOfRangeException ex)
+        catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)   // today IndexOutOfRange (#1797); any non-assert failure counts
         {
             _output.WriteLine($"[clover cpu, no A_log transform] forward failed (non-finite routing): {ex.Message}");
         }
