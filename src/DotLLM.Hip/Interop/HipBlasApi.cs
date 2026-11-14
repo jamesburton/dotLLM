@@ -38,7 +38,7 @@ internal static partial class HipBlasApi
         nint C, int ldc);
 
     /// <summary>
-    /// Mixed-precision GEMM — FP16 input, FP32 accumulate.
+    /// Legacy hipblasGemmEx ABI: input and compute types are hipblasDatatype_t, not the v2 compute enum.
     /// </summary>
     [LibraryImport(LibName)]
     internal static partial int hipblasGemmEx(
@@ -69,11 +69,11 @@ internal static partial class HipBlasApi
     /// <summary>HIPBLAS_R_32F — FP32 data type.</summary>
     internal const int HIPBLAS_R_32F = 151;
 
-    /// <summary>HIPBLAS_COMPUTE_16F — FP16 compute.</summary>
-    internal const int HIPBLAS_COMPUTE_16F = 0;
+    /// <summary>FP16 compute for the legacy hipblasGemmEx symbol (hipblasDatatype_t).</summary>
+    internal const int HIPBLAS_COMPUTE_16F = HIPBLAS_R_16F;
 
-    /// <summary>HIPBLAS_COMPUTE_32F — FP32 compute.</summary>
-    internal const int HIPBLAS_COMPUTE_32F = 1;
+    /// <summary>FP32 compute for the legacy hipblasGemmEx symbol (hipblasDatatype_t).</summary>
+    internal const int HIPBLAS_COMPUTE_32F = HIPBLAS_R_32F;
 
     /// <summary>HIPBLAS_GEMM_DEFAULT — default algorithm selection.</summary>
     internal const int HIPBLAS_GEMM_DEFAULT = 160;

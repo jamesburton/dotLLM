@@ -12,6 +12,7 @@ using DotLLM.Engine.PromptCache;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
 using DotLLM.Tokenizers.ToolCallParsers;
@@ -378,6 +379,13 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             return 1;
         }
 
+        if (DotLLM.Server.DeviceModelLoader.HipKvOptionError(settings.Device,
+                settings.CacheTypeK, settings.CacheTypeV, settings.CacheWindow) is { } hipKvError)
+        {
+            DeviceCli.PrintError(hipKvError, json: false);
+            return 1;
+        }
+
         // Resolve before loading the model so a bad path fails fast.
         if (!TextArgument.TryResolve(settings.SystemPrompt, settings.SystemPromptFile,
                 "--system|-s", "--system-file", required: false,
@@ -391,6 +399,20 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         // index.json)? Auto-detected; loads via the safetensors path. The GGUF
         // path is unchanged.
         string? hfDir = RunCommand.TryResolveHfDirectory(settings.Model);
+        bool hipRequested = DotLLM.Server.DeviceSpec.Parse(settings.Device).Kind == DotLLM.Server.DeviceKind.Hip;
+        if (hipRequested && (settings.TernaryAdapterPaths.Length > 0 || settings.SpeculativeModel is not null
+            || settings.MtpHead is not null || settings.DFlash is not null || settings.PromptLookup
+            || MoeOffloadCli.Build(settings.MoeValues) != DotLLM.Core.Moe.MoeOffloadOptions.Default))
+        {
+            DeviceCli.PrintError("HIP does not support ternary adapters, speculative decoding or expert offload/context override options.", json: false);
+            return 1;
+        }
+        if (hfDir is not null && (settings.MtpHead is not null || settings.DFlash is not null
+            || MoeOffloadCli.Build(settings.MoeValues) != DotLLM.Core.Moe.MoeOffloadOptions.Default))
+        {
+            DeviceCli.PrintError("SafeTensors loading does not support MTP/DFlash heads or expert offload/context override options.", json: false);
+            return 1;
+        }
 
         string resolvedPath;
         if (hfDir is not null)
@@ -412,6 +434,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         IModel? model = null;
         Func<int, DotLLM.Core.Attention.IKvCache>? vulkanKv = null;
         DeviceCli.Outcome deviceOutcome = null!;
+        ToolDefinition[]? tools = ParseToolDefinitions(settings.Tools);
+        JinjaChatTemplate? hfTemplate = null;
 
         try
         {
@@ -421,19 +445,19 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             {
                 if (hfDir is not null)
                 {
-                    // Explicit GPU -> error before loading anything; auto -> CPU with a warning (#790).
-                    deviceOutcome = DeviceCli.ResolveCpuOnly(settings.Device, "HuggingFace safetensors checkpoints", Path.GetFileName(hfDir));
-                    ctx.Status("Opening HuggingFace safetensors checkpoint...");
-                    var threadingCfg = new ThreadingConfig(
-                        settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                    var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, threadingCfg);
-                    model = m;
-                    safetensorsSource = src;
-                    config = cfg;
-                    ctx.Status("Loading tokenizer...");
+                    ctx.Status("Loading tokenizer and chat template...");
                     tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
                         ?? throw new InvalidOperationException(
                             $"No tokenizer.json (or legacy vocab.json/merges.txt) found in '{hfDir}'.");
+                    hfTemplate = HfChatTemplateFactory.TryCreate(hfDir, tokenizer, useTools: tools is { Length: > 0 });
+                    ctx.Status("Opening HuggingFace safetensors checkpoint...");
+                    var threadingCfg = new ThreadingConfig(
+                        settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
+                    var (loadedHf, src, outcome) = DeviceCli.LoadSafetensors(hfDir, settings.Device, settings.GpuLayers, threadingCfg);
+                    model = loadedHf.Model;
+                    safetensorsSource = src;
+                    config = model.Config;
+                    deviceOutcome = outcome;
                     return;
                 }
 
@@ -512,30 +536,26 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         if (vramWarning is not null)
             AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(vramWarning)}[/]");
 
-        // GGUF checkpoints carry an embedded Jinja chat template; the HF
-        // safetensors path doesn't surface one here, so it falls back to the
-        // plain completion-style transcript.
         var jinjaTemplate = gguf is not null
             ? GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer!, config!.Architecture)
-            : null;
+            : hfTemplate;
         IChatTemplate chatTemplate = jinjaTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer!);
         if (jinjaTemplate is null)
         {
             AnsiConsole.MarkupLine(
-                "[yellow]WARNING: model has no GGUF chat template; using a plain completion-style transcript. " +
+                "[yellow]WARNING: model has no chat template; using a plain completion-style transcript. " +
                 "This usually means the model is not instruction/chat tuned.[/]");
         }
 
-        // Parse tool definitions. Tool calling relies on the GGUF-embedded chat
-        // template, so it is unavailable on the HF safetensors path.
-        ToolDefinition[]? tools = ParseToolDefinitions(settings.Tools);
-        if (tools is { Length: > 0 } && gguf is null)
+        if (tools is { Length: > 0 } && gguf is null && jinjaTemplate?.SupportsTools != true)
         {
-            AnsiConsole.MarkupLine("[yellow]WARNING: --tools is not supported for HuggingFace safetensors models; ignoring.[/]");
+            AnsiConsole.MarkupLine("[yellow]WARNING: the selected HuggingFace chat template does not support tool prompting; --tools is ignored.[/]");
             tools = null;
         }
-        IToolCallParser? toolCallParser = tools is { Length: > 0 } && gguf is not null
-            ? GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config!.Architecture)
+        IToolCallParser? toolCallParser = tools is { Length: > 0 }
+            ? gguf is not null
+                ? GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config!.Architecture)
+                : ToolCallParserFactory.Create(config!.Architecture, jinjaTemplate!.TemplateSource)
             : null;
         ToolChoice toolChoice = ParseToolChoice(settings.ToolChoiceStr, tools);
 
@@ -607,6 +627,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         var samplingLabel = BuildSamplingLabel(settings);
         var deviceLabel = model is DotLLM.Cuda.CudaTransformerModel
             ? DotLLM.Cuda.CudaDevice.GetDevice(DeviceCli.CudaOrdinal(deviceOutcome.Resolved)).ToString()
+            : model is DotLLM.Hip.HipTransformerModel
+                ? $"hip {DeviceCli.DeviceLabel(deviceOutcome.Resolved)}"
             : vulkanKv is not null
                 ? $"vulkan {DeviceCli.DeviceLabel(deviceOutcome.Resolved)}"
                 : $"{threadingInfo.EffectiveThreadCount} threads";
@@ -622,14 +644,20 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             history.Add(new ChatMessage { Role = "system", Content = systemPrompt });
 
         var kvConfig = new KvCacheConfig(
-            KvCacheConfig.ParseDType(settings.CacheTypeK ?? "f32"),
-            KvCacheConfig.ParseDType(settings.CacheTypeV ?? "f32"),
+            KvCacheConfig.ParseDType(settings.CacheTypeK ?? (model is DotLLM.Hip.HipTransformerModel ? "f16" : "f32")),
+            KvCacheConfig.ParseDType(settings.CacheTypeV ?? (model is DotLLM.Hip.HipTransformerModel ? "f16" : "f32")),
             settings.CacheWindow);
 
         Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
         DotLLM.Engine.KvCache.PagedKvCacheFactory? pagedFactory = null;
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
-        if (vulkanKv is not null)
+        if (model is DotLLM.Hip.HipTransformerModel hipModel)
+        {
+            if (kvConfig.IsQuantized && config!.HeadDim % 32 != 0)
+                throw new NotSupportedException("HIP Q8_0 KV requires head dimensions divisible by 32.");
+            kvFactory = (_, size) => hipModel.CreateKvCache(size, keyType: kvConfig.KeyDType, valueType: kvConfig.ValueDType);
+        }
+        else if (vulkanKv is not null)
         {
             if (settings.Paged)
                 AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache is not supported on Vulkan; using the model's own device KV-cache.[/]");
@@ -762,7 +790,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             mtpEnabled: !settings.NoMtp, mtpAdaptive: true, recurrentPrefixCache: !settings.NoPromptCache,
             prefillChunkSize: settings.PrefillChunkSize,
             recurrentPrefixCacheOptions: DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(settings.PrefixSnapshots, settings.PrefixSnapshotHostBudget, settings.PrefixSnapshotDiskDirectory, settings.PrefixSnapshotDiskBudget, settings.PromptCacheStep, settings.PromptCacheStepKeep, promptCachePolicy),
-            promptLookup: settings.PromptLookupOptions);
+            promptLookup: settings.PromptLookupOptions,
+            deviceId: model is DotLLM.Hip.HipTransformerModel hipDeviceModel ? hipDeviceModel.DeviceId : -1);
 
         if (generator.RecurrentStepCheckpointBytes > 0)
             Console.WriteLine($"[dotllm] Prompt-cache steps: a {generator.RecurrentStepCheckpointBytes / 1048576.0:F1} MiB recurrent checkpoint every {settings.PromptCacheStep} prefill tokens, keeping {settings.PromptCacheStepKeep ?? 8}");

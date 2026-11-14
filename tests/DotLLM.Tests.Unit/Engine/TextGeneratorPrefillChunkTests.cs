@@ -21,6 +21,26 @@ public sealed class TextGeneratorPrefillChunkTests
     private const int VocabSize = 16;
     private const int PromptLen = 10;
 
+    [Theory]
+    [InlineData(false, -1)]
+    [InlineData(true, -1)]
+    [InlineData(false, 3)]
+    [InlineData(true, 3)]
+    public async Task SelectedDevice_ReachesEveryPrefillAndDecodeForward(bool streaming, int deviceId)
+    {
+        using var model = new RecordingModel(argmaxToken: 3);
+        var generator = new TextGenerator(model, new StubTokenizer(), prefillChunkSize: 4, deviceId: deviceId);
+        var options = new InferenceOptions { MaxTokens = 3, Temperature = 0f };
+        if (streaming)
+        {
+            await foreach (var _ in generator.GenerateStreamingTokensAsync("prompt", options)) { }
+        }
+        else
+            generator.Generate("prompt", options);
+        Assert.True(model.Calls.Count > 3); // three prefill chunks followed by single-token decoding
+        Assert.All(model.Calls, call => Assert.Equal(deviceId, call.DeviceId));
+    }
+
     [Fact]
     public void DefaultChunkSize_SinglePrefillForward()
     {
@@ -196,7 +216,7 @@ public sealed class TextGeneratorPrefillChunkTests
 
     // ── Fakes ──
 
-    private sealed record ForwardCall(int Length, int FirstPosition);
+    private sealed record ForwardCall(int Length, int FirstPosition, int DeviceId);
 
     /// <summary>Stub tokenizer: any prompt encodes to PromptLen sequential ids; EOS is never produced.</summary>
     private sealed class StubTokenizer : ITokenizer
@@ -248,7 +268,7 @@ public sealed class TextGeneratorPrefillChunkTests
         public unsafe ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
             int deviceId, IKvCache? kvCache)
         {
-            Calls.Add(new ForwardCall(tokenIds.Length, positions[0]));
+            Calls.Add(new ForwardCall(tokenIds.Length, positions[0], deviceId));
             if (tokenIds.Length > 1)
                 OnPrefillForward?.Invoke();
 
@@ -277,7 +297,7 @@ public sealed class TextGeneratorPrefillChunkTests
                 NativeMemory.AlignedFree((void*)vPtr);
             }
 
-            return new UnmanagedTensor(new TensorShape(batchSize, VocabSize), DType.Float32, deviceId, ptr);
+            return new UnmanagedTensor(new TensorShape(batchSize, VocabSize), DType.Float32, -1, ptr);
         }
 
         public void Dispose() { }

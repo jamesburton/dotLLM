@@ -188,7 +188,7 @@ public sealed class TransformerSafetensorsLoadTests : IDisposable
     }
 
     [Fact]
-    public void Bf16Dtype_UpcastsAndLoads()
+    public void Bf16Dtype_LoadsAndRuns()
     {
         // Build a fixture where gate_proj is bf16 and everything else is F32.
         const int hidden = 64, numHeads = 4, headDim = 16, intermediate = 128, vocab = 32;

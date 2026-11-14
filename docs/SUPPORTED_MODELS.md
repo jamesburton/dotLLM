@@ -6,6 +6,8 @@ loader dispatch in `ModelLoader`, the field consumption in
 `HfConfigExtractor` / `GgufModelConfigExtractor`, and the verification
 evidence in the test tree.
 
+**Experimental HIP.** The broader architecture matrix below does not imply HIP support. HIP currently accepts the bounded dense Llama subset documented in [HIP.md](HIP.md): GGUF F16/Q4_0/Q8_0 or F16 HF checkpoints on Windows x64, qualified on RX 6900 XT. BF16 and AWQ/GPTQ SafeTensors support remains CPU-only for this integration.
+
 **How to read.** Each row is one `Architecture` enum variant. The `Verified
 on` column reports the strongest evidence that exists today, tagged per the
 legend at the bottom of this page. Rows tagged `planned` have an enum value

@@ -7,7 +7,67 @@
 3. **Q4_0** — Basic 4-bit
 4. **Q4_K_M** — Most popular, best quality/size tradeoff
 5. **Q5_K_M, Q6_K** — Higher quality K-quants
-6. **GPTQ/AWQ** — GPU-native (future)
+6. **GPTQ/AWQ** — bounded packed SafeTensors CPU support; GPU execution remains unsupported
+
+## Hugging Face packed AWQ/GPTQ on CPU
+
+The SafeTensors loader accepts **dense Llama** checkpoints with an explicit
+`config.json` `quantization_config`. Use `--device cpu`. The supported projections
+are separate `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj` and
+`down_proj`; excluded modules may retain their ordinary floating-point weights.
+Embeddings and `lm_head` must remain floating point. The mapped packed tensors
+are never relabeled as GGUF Q4_0 or expanded into resident F16/F32 matrices.
+
+The binary contract is pinned to these producer implementations:
+
+| Format | Required metadata | Mapped shapes (M outputs, K inputs, G groups) | Decode semantics |
+|---|---|---|---|
+| [AutoAWQ GEMM4](https://github.com/casper-hansen/AutoAWQ/blob/88e4c76b20755db275574e6a03c83c84ba3bece5/awq/modules/linear/gemm.py) | `quant_method="awq"`, `bits=4`, `version="gemm"`, `zero_point=true` | I32 `qweight[K,M/8]`, I32 `qzeros[G,M/8]`, F16 `scales[G,M]` | Eight output codes per word in order `[0,2,4,6,1,3,5,7]`; zeros use the same order and are stored directly. |
+| [Legacy AutoGPTQ4](https://github.com/AutoGPTQ/AutoGPTQ/blob/9f7d37072917ab3a7545835f23e808294a542153/auto_gptq/nn_modules/qlinear/qlinear_cuda.py) | `quant_method="gptq"`, `bits=4`, explicit `desc_act` and `sym`; `checkpoint_format` absent or `"gptq"` | I32 `qweight[K/8,M]`, I32 `qzeros[G,M/8]`, F16 `scales[G,M]`, I32 `g_idx[K]` | Eight consecutive input codes per word; output zeros are consecutive nibbles and decode as **stored value + 1**. `g_idx[k]` selects each input's scale/zero group. |
+
+For both formats, `weight[m,k] = (code - zero) * scale`. Scales remain F16 in
+storage; multiplication and accumulation use F32 activations. Group size must
+be 32, 64, 128, or -1 (one group covering K), K must contain whole groups, and
+M must be divisible by 8. GPTQ additionally requires K divisible by 32.
+Every component's dtype, shape and exact byte count is validated. Scales must
+be finite and positive. GPTQ `g_idx` must be in range and assign exactly one
+group's worth of inputs to every group. Nonidentity activation-order mappings
+are supported when `desc_act=true`; `desc_act=false` requires canonical groups.
+Symmetric GPTQ requires zero point 8 (stored nibble 7).
+
+AWQ GEMV/Marlin, GPTQ v2/Marlin, other bit widths/group sizes, non-F16 scales,
+packed embeddings/heads, fused projections, QK normalization, nonzero biases,
+MoE and other architectures fail during loading. GPTQ exports may contain
+F16 bias buffers for bias-free Llama: only exact-zero vectors of the expected
+shape are accepted and ignored, without allocating converted biases. Tensor
+overlays and GPU execution are rejected. Raw `SafetensorsFile.Open` callers
+must use `ModelLoader.OpenSafetensorsAndConfig` before loading packed weights;
+the loader never guesses AWQ versus GPTQ from tensor shapes.
+
+Each projection owns a **64-byte descriptor** pointing into the source's
+existing single-file or sharded mappings. `PackedQuantizedSafetensorsSource`
+exposes packed physical bytes and logical parameter counts separately; its
+`Tensors` still describes the original physical storage. The source owns the
+mappings and must outlive its model, following the existing SafeTensors lifetime
+contract. There is also managed lookup metadata per projection; GPTQ validation
+temporarily allocates one integer count per group. CPU GEMV/GEMM accumulates eight
+outputs in a vector register and uses a fixed stack dispatch context. It stores
+only the existing F32 activation output, with no explicit widened-weight or
+accumulator scratch. Logical parameter counts exclude ignored zero-bias padding.
+This initial kernel prioritizes correctness; no throughput improvement over
+other quantization formats is claimed.
+
+`PackedQuantizedSafetensorsTests` covers nonuniform nonsquare matrices, multiple
+group sizes, nonidentity `g_idx`, malformed data, shard boundaries, tied heads,
+descriptor disposal, prefill and cached decode. Optional
+`PackedQuantizedRealModelTests` resolves TheBloke TinyLlama-1.1B-Chat-v1.0 AWQ/GPTQ
+from the shared model store/HF cache or `DOTLLM_TEST_TINYLLAMA_AWQ` /
+`DOTLLM_TEST_TINYLLAMA_GPTQ`. Generate its adjacent `packed-reference.json` using
+`tests/scripts/generate_packed_hf_reference.py MODEL_DIRECTORY` with CPU PyTorch,
+Transformers 4.51.3 and SafeTensors installed. The script runs the pinned
+producer's unpacking code with F32 scratch scales, then the Hugging Face eager
+Llama implementation; this isolates format correctness from GPU F16 arithmetic
+rounding. Model data and generated logits remain outside the repository.
 
 ## Block Layouts
 

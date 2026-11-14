@@ -63,6 +63,11 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
     public override unsafe int Execute(CommandContext context, Settings s)
     {
         Console.OutputEncoding = new UTF8Encoding(false);
+        if (DeviceSpec.TryParse(s.Device, out var requestedDevice, out _) && requestedDevice.Kind == DeviceKind.Hip)
+        {
+            Console.Error.WriteLine("HIP has no embedding execution path; use --device cpu or --device vulkan.");
+            return 1;
+        }
         string? path = GgufFileResolver.Resolve(s.Model, s.Quant);
         if (path is null) { Console.Error.WriteLine($"Model not found: {s.Model}"); return 1; }
 

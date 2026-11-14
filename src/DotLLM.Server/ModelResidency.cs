@@ -5,6 +5,7 @@ using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
 
@@ -45,6 +46,7 @@ public sealed class ResidentModelSnapshot : IDisposable
     public DiffusionTextGenerator? DiffusionGenerator { get; init; }
     public string LoadedModelPath { get; init; } = "";
     public GgufFile? CurrentGguf { get; init; }
+    public ISafetensorsTensorSource? CurrentSafetensors { get; init; }
     public IModel? DraftModel { get; init; }
     public string DraftModelPath { get; init; } = "";
     public GgufFile? DraftGguf { get; init; }
@@ -73,6 +75,7 @@ public sealed class ResidentModelSnapshot : IDisposable
         DraftGguf?.Dispose();
         Model?.Dispose();
         CurrentGguf?.Dispose();
+        CurrentSafetensors?.Dispose();
     }
 }
 
@@ -242,7 +245,7 @@ public sealed class ModelResidencyManager : IDisposable
                     EffectiveKeepAliveSeconds = keepAlive,
                     EstimatedBytes = s.EstimatedBytes,
                     ExpiresInSeconds = expiresIn,
-                    Meta = ModelMeta.Build(s.Config, s.CurrentGguf),
+                    Meta = ModelMeta.Build(s.Config, s.CurrentGguf, s.CurrentSafetensors),
                 };
             }).ToList();
         }

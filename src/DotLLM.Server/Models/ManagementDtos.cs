@@ -159,7 +159,7 @@ public sealed record DeviceListResponse
 /// <summary>One compute backend and the devices it can enumerate.</summary>
 public sealed record BackendInfoDto
 {
-    /// <summary><c>cpu</c>, <c>cuda</c> or <c>vulkan</c>.</summary>
+    /// <summary><c>cpu</c>, <c>cuda</c>, <c>vulkan</c> or <c>hip</c>.</summary>
     [JsonPropertyName("name")]
     public required string Name { get; init; }
 
@@ -189,6 +189,16 @@ public sealed record BackendInfoDto
 /// <summary>One enumerated device.</summary>
 public sealed record DeviceInfoDto
 {
+    /// <summary>Per-device readiness when the backend checks native assets and device compatibility.</summary>
+    [JsonPropertyName("servable")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Servable { get; init; }
+
+    /// <summary>Why this enumerated device cannot serve, or its experimental support boundary.</summary>
+    [JsonPropertyName("note")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Note { get; init; }
+
     [JsonPropertyName("index")]
     public int Index { get; init; }
 
