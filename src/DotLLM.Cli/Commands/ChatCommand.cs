@@ -12,6 +12,7 @@ using DotLLM.Engine.PromptCache;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
 using DotLLM.Tokenizers.ToolCallParsers;
@@ -412,6 +413,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         IModel? model = null;
         Func<int, DotLLM.Core.Attention.IKvCache>? vulkanKv = null;
         DeviceCli.Outcome deviceOutcome = null!;
+        ToolDefinition[]? tools = ParseToolDefinitions(settings.Tools);
+        JinjaChatTemplate? hfTemplate = null;
 
         try
         {
@@ -423,6 +426,11 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 {
                     // Explicit GPU -> error before loading anything; auto -> CPU with a warning (#790).
                     deviceOutcome = DeviceCli.ResolveCpuOnly(settings.Device, "HuggingFace safetensors checkpoints", Path.GetFileName(hfDir));
+                    ctx.Status("Loading tokenizer and chat template...");
+                    tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
+                        ?? throw new InvalidOperationException(
+                            $"No tokenizer.json (or legacy vocab.json/merges.txt) found in '{hfDir}'.");
+                    hfTemplate = HfChatTemplateFactory.TryCreate(hfDir, tokenizer, useTools: tools is { Length: > 0 });
                     ctx.Status("Opening HuggingFace safetensors checkpoint...");
                     var threadingCfg = new ThreadingConfig(
                         settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
@@ -430,10 +438,6 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                     model = m;
                     safetensorsSource = src;
                     config = cfg;
-                    ctx.Status("Loading tokenizer...");
-                    tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
-                        ?? throw new InvalidOperationException(
-                            $"No tokenizer.json (or legacy vocab.json/merges.txt) found in '{hfDir}'.");
                     return;
                 }
 
@@ -512,30 +516,26 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         if (vramWarning is not null)
             AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(vramWarning)}[/]");
 
-        // GGUF checkpoints carry an embedded Jinja chat template; the HF
-        // safetensors path doesn't surface one here, so it falls back to the
-        // plain completion-style transcript.
         var jinjaTemplate = gguf is not null
             ? GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer!, config!.Architecture)
-            : null;
+            : hfTemplate;
         IChatTemplate chatTemplate = jinjaTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer!);
         if (jinjaTemplate is null)
         {
             AnsiConsole.MarkupLine(
-                "[yellow]WARNING: model has no GGUF chat template; using a plain completion-style transcript. " +
+                "[yellow]WARNING: model has no chat template; using a plain completion-style transcript. " +
                 "This usually means the model is not instruction/chat tuned.[/]");
         }
 
-        // Parse tool definitions. Tool calling relies on the GGUF-embedded chat
-        // template, so it is unavailable on the HF safetensors path.
-        ToolDefinition[]? tools = ParseToolDefinitions(settings.Tools);
-        if (tools is { Length: > 0 } && gguf is null)
+        if (tools is { Length: > 0 } && gguf is null && jinjaTemplate?.SupportsTools != true)
         {
-            AnsiConsole.MarkupLine("[yellow]WARNING: --tools is not supported for HuggingFace safetensors models; ignoring.[/]");
+            AnsiConsole.MarkupLine("[yellow]WARNING: the selected HuggingFace chat template does not support tool prompting; --tools is ignored.[/]");
             tools = null;
         }
-        IToolCallParser? toolCallParser = tools is { Length: > 0 } && gguf is not null
-            ? GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config!.Architecture)
+        IToolCallParser? toolCallParser = tools is { Length: > 0 }
+            ? gguf is not null
+                ? GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config!.Architecture)
+                : ToolCallParserFactory.Create(config!.Architecture, jinjaTemplate!.TemplateSource)
             : null;
         ToolChoice toolChoice = ParseToolChoice(settings.ToolChoiceStr, tools);
 
