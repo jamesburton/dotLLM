@@ -1159,7 +1159,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
         // Live progress for this step's prefill (#1288), tagged with the first submitter; null (free) when logging is off.
         // A prompt prefills in one step here, so the pulse mostly shows elapsed time until the forward returns.
-        using var pulse = count > 0 ? RequestTimingLog.BeginPrefill(totalTokens, _prefillReady[0].Seq.LogContext) : null;
+        using var pulse = count > 0 ? RequestTimingLog.BeginPrefill(totalTokens, _prefillReady[0].Seq.LogContext, singlePass: count == 1) : null;
 
         _prefillBatch.Clear();
         int off = 0;

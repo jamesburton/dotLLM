@@ -531,6 +531,15 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         return v is null ? 8 : int.TryParse(v, out int n) && n >= 0 ? n : 8;
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Issue #1723: the engine splits a long prompt here so progress moves and cancellation is observed between chunks.
+    /// Diffusion (non-causal) models are one bidirectional pass and cannot be tiled: 0.
+    /// </remarks>
+    public int PreferredPrefillChunkTokens
+        => Config.DiffusionConfig is not null ? 0 : _prefillChunkTokens ??= VulkanPrefillChunk.Resolve(_device);
+    private int? _prefillChunkTokens;
+
     // Prefill host-synced submit splitting (#1760). 0 (default) = the whole prefill forward is ONE command buffer.
     // N > 0 = every N layers (seqLen > 1, autoregressive forwards) the recorded work is submitted and fence-waited,
     // then recording continues on a fresh command buffer. Same ordering semantics as the per-stage splits of

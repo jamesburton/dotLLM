@@ -49,6 +49,49 @@ public sealed class RequestTimingLogTests
         Assert.DoesNotContain("prompt cache", line);
     }
 
+    /// <summary>#1723: a single-pass prefill cannot report partial progress, so it must not print a misleading 0/N (0.0%).</summary>
+    [Fact]
+    public void Pulse_SinglePass_PrintsInProgressNotZeroPercent()
+    {
+        var lines = new List<string>();
+        using var pulse = new PrefillPulse(lines.Add, total: 9200, Timeout.InfiniteTimeSpan) { SinglePass = true };
+
+        pulse.Pulse();
+
+        string line = Assert.Single(lines);
+        Assert.StartsWith("prefill in progress (single pass), 9200 tokens", line);
+        Assert.DoesNotContain("0.0%", line);
+    }
+
+    /// <summary>A chunked prefill (not single-pass) keeps the counted form even at zero completed.</summary>
+    [Fact]
+    public void Pulse_Chunked_StillPrintsCounts()
+    {
+        var lines = new List<string>();
+        using var pulse = new PrefillPulse(lines.Add, total: 400, Timeout.InfiniteTimeSpan);
+
+        pulse.Pulse();
+
+        Assert.StartsWith("prefill: 0/400 tokens (0.0%)", Assert.Single(lines));
+    }
+
+    [Theory]
+    [InlineData(1, null, DotLLM.Vulkan.VulkanPrefillChunk.IntegratedDefault)]
+    [InlineData(2, null, DotLLM.Vulkan.VulkanPrefillChunk.DiscreteDefault)]
+    [InlineData(1, "0", 0)]          // explicit single pass
+    [InlineData(2, "1024", 1024)]    // explicit override wins over the device default
+    [InlineData(1, "-3", DotLLM.Vulkan.VulkanPrefillChunk.IntegratedDefault)]   // malformed -> default
+    [InlineData(1, "abc", DotLLM.Vulkan.VulkanPrefillChunk.IntegratedDefault)]
+    public void VulkanPrefillChunk_ResolvesEnvThenDeviceDefault(int deviceType, string? env, int expected)
+        => Assert.Equal(expected, DotLLM.Vulkan.VulkanPrefillChunk.Resolve(deviceType, env));
+
+    [Fact]
+    public void VulkanPrefillChunk_DefaultsAreConservative()
+    {
+        Assert.InRange(DotLLM.Vulkan.VulkanPrefillChunk.IntegratedDefault, 64, 1024);
+        Assert.InRange(DotLLM.Vulkan.VulkanPrefillChunk.DiscreteDefault, 64, 1024);
+    }
+
     [Fact]
     public void Pulse_ReportsCompletedOverTotal()
     {
