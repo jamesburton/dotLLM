@@ -53,12 +53,55 @@ internal readonly record struct Qwen4ExpResidencyPlan(
         => Math.Max(0, ourBytes + otherBytes - Math.Max(0, capacityBytes - headroomBytes));
 
     /// <summary>
-    /// Rows the per-forward scratch is pre-sized to at load (<c>DOTLLM_VK_PLANNED_ROWS</c>, default 1024: ~0.55 GiB, because on a 127 GiB box the real file leaves only ~1.3 GiB under the OS limit), clamped to
-    /// <paramref name="kvCapacity"/>. Scratch otherwise grows lazily on the first larger forward - AFTER the weights already fill the
-    /// device-local heap - and a 512-row then 1024-row call sequence was seen to end in VK_ERROR_DEVICE_LOST (#880).
+    /// Rows the per-forward scratch is first allocated for at load: <c>DOTLLM_VK_PLANNED_ROWS</c> when set, else <see cref="BasePlannedRows"/>,
+    /// clamped to <paramref name="kvCapacity"/>. With no override the loader may then grow it to <see cref="WidePlannedRows"/> (#1791,
+    /// <see cref="ChoosePlannedRows"/>). Scratch is never grown lazily after load: a 512-row then 1024-row call sequence after the weights
+    /// filled the heap ended in VK_ERROR_DEVICE_LOST (#880).
     /// </summary>
-    public static int PlannedRows(int kvCapacity)
-        => Math.Clamp(int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS"), out int v) && v > 0 ? v : 1024, 1, Math.Max(1, kvCapacity));
+    public static int PlannedRows(int kvCapacity) => Math.Clamp(PlannedRowsOverride() ?? BasePlannedRows, 1, Math.Max(1, kvCapacity));
+
+    /// <summary><c>DOTLLM_VK_PLANNED_ROWS</c> when it parses to a positive int, else null (no override).</summary>
+    public static int? PlannedRowsOverride()
+        => int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS"), out int v) && v > 0 ? v : null;
+
+    /// <summary>Rows allocated first, and the fallback when the wide scratch does not fit.</summary>
+    public const int BasePlannedRows = 1024;
+
+    /// <summary>
+    /// Rows chosen when free device memory admits them (#1791). #1660 measured 2048 rows +8 % at pp4096 and +11 % at pp2048 over 1024
+    /// (Qwen3.8-Flash-Next UD-IQ4_XS, Strix Halo Vulkan): the MoE GEMMs see twice the rows per expert.
+    /// </summary>
+    public const int WidePlannedRows = 2048;
+
+    /// <summary>Free device memory that must remain beyond the measured extra scratch before the wide scratch is chosen (on top of the budget's headroom).</summary>
+    public const long WideRowsMarginBytes = 1L << 30;
+
+    /// <summary>The flat scratch allowance <see cref="Create"/> adds to the per-position context bytes.</summary>
+    public const long FlatScratchAllowanceBytes = 1L << 30;
+
+    /// <summary>KV + indexer bytes reserved for the full context window (allocated lazily, so not yet in the live bytes at load).</summary>
+    public long ReservedContextBytes => Math.Max(0, KvAndScratchBytes - FlatScratchAllowanceBytes);
+
+    /// <summary>
+    /// #1791: the planned row count once the base scratch is resident. An explicit <paramref name="overrideRows"/> always wins (clamped to
+    /// <paramref name="kvCapacity"/>). Otherwise the wide count is chosen only when the budget, less what this process holds, what other
+    /// processes hold and the context still to be allocated, covers <paramref name="extraBytes"/> (the measured cost of the wider scratch)
+    /// plus <see cref="WideRowsMarginBytes"/>: the choice is admitted against free device memory and never spills.
+    /// </summary>
+    public static (int Rows, string Reason) ChoosePlannedRows(int? overrideRows, int kvCapacity, long budgetBytes, long liveBytes, long otherBytes,
+                                                             long reservedContextBytes, long extraBytes)
+    {
+        static string G(long b) => $"{b / (double)(1L << 30):F2} GiB";
+        int cap = Math.Max(1, kvCapacity);
+        if (overrideRows is int o) return (Math.Clamp(o, 1, cap), $"DOTLLM_VK_PLANNED_ROWS={o}");
+        int baseRows = Math.Min(BasePlannedRows, cap);
+        if (cap < WidePlannedRows) return (baseRows, $"context capacity {cap} < {WidePlannedRows}");
+        long free = budgetBytes - liveBytes - otherBytes - reservedContextBytes;
+        long need = extraBytes + WideRowsMarginBytes;
+        string numbers = $"free {G(free)} = budget {G(budgetBytes)} - this process {G(liveBytes)} - other processes {G(otherBytes)} - " +
+                         $"unallocated context {G(reservedContextBytes)}; {WidePlannedRows} rows need +{G(extraBytes)} measured + {G(WideRowsMarginBytes)} margin";
+        return free >= need ? (WidePlannedRows, numbers) : (baseRows, numbers + " (does not fit)");
+    }
 
     /// <summary>Error text for a scratch (re)allocation that failed after the weights were resident.</summary>
     public static string ScratchGrowthMessage(int rows, string inner)
@@ -169,7 +212,7 @@ internal readonly record struct Qwen4ExpResidencyPlan(
     {
         var (device, hostOnly) = EstimateWeights(tensors, config, integerDot, expertSlots);
         // Scratch: the prefill chunk working set (routed-expert intermediates dominate) - a flat allowance plus per-position KV.
-        long scratch = 1L << 30;
+        long scratch = FlatScratchAllowanceBytes;
         return new Qwen4ExpResidencyPlan(device, ContextBytes(config, kvPositions, kvElementBytes, rawKeysF16) + scratch, hostOnly,
             capacityBytes, headroomBytes ?? DefaultHeadroom(capacityBytes), physicalRamBytes);
     }
