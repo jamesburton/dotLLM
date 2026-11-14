@@ -32,8 +32,20 @@ internal static class SafetensorsTensorResolver
     public static unsafe (nint ptr, QuantizationType qt, int m, int k) ResolveLinear(
         ISafetensorsTensorSource file, string name, List<nint> owned)
     {
+        if (file is PackedQuantizedSafetensorsSource packed && packed.TryGetWeight(name, out var projection))
+        {
+            // Metadata only: the large packed tensors and scales remain in the source mappings.
+            var descriptor = (Packed4Weight*)NativeMemory.AlignedAlloc(64, 64);
+            if (descriptor is null) throw new OutOfMemoryException();
+            *descriptor = projection;
+            owned.Add((nint)descriptor);
+            return ((nint)descriptor, projection.Layout, projection.OutputFeatures, projection.InputFeatures);
+        }
         if (!file.TensorsByName.TryGetValue(name, out var desc))
         {
+            if (name.EndsWith(".weight", StringComparison.Ordinal)
+                && file.TensorsByName.ContainsKey(name[..^"weight".Length] + "qweight"))
+                throw new InvalidDataException("Packed AWQ/GPTQ tensors must be opened with ModelLoader.OpenSafetensorsAndConfig so their quantization metadata is validated.");
             // LittleBit factorized composite stored under <module>.U_packed etc. (issue #864).
             if (name.EndsWith(".weight", StringComparison.Ordinal))
             {
@@ -325,6 +337,7 @@ internal static class SafetensorsTensorResolver
 
     public static float[]? ResolveOptionalBias(ISafetensorsTensorSource file, string name, int expectedSize)
     {
+        if (file is PackedQuantizedSafetensorsSource packed && packed.IsZeroBias(name)) return null;
         if (!file.TensorsByName.TryGetValue(name, out var desc)) return null;
 
         long elementCount = desc.ElementCount;

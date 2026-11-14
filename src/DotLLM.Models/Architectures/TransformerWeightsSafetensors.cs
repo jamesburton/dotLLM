@@ -40,10 +40,22 @@ internal static class TransformerWeightsSafetensorsLoader
     /// </summary>
     public static TransformerWeights Load(
         ISafetensorsTensorSource file, ModelConfig config, BitNetI2SCacheContext? i2sCache = null,
-        bool allowFactorized = false, TensorOverlay? overlay = null)
+        bool allowFactorized = false, TensorOverlay? overlay = null, bool allowPackedQuantization = false)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
+
+        if (PackedQuantizedSafetensorsSource.HasPackedTensors(file))
+        {
+            if (file is not PackedQuantizedSafetensorsSource)
+                throw new InvalidDataException("Packed AWQ/GPTQ tensors require ModelLoader.OpenSafetensorsAndConfig and explicit quantization_config metadata.");
+            if (!allowPackedQuantization)
+                throw new NotSupportedException("Packed AWQ/GPTQ projections currently run on CPU only; use --device cpu. CUDA, Vulkan and HIP are unsupported.");
+            if (config.Architecture != DotLLM.Core.Configuration.Architecture.Llama || config.Moe is not null || config.MlaConfig is not null)
+                throw new NotSupportedException("Packed AWQ/GPTQ projections currently support dense Llama only.");
+            if (overlay is not null)
+                throw new NotSupportedException("Tensor overlays on packed AWQ/GPTQ checkpoints are unsupported.");
+        }
 
         // LittleBit factorized checkpoints (#864) are a CPU-only weight kind for dense Qwen3. Every other consumer of
         // this loader (Vulkan, CUDA, HIP, tools) must fail loudly instead of falling through to "missing tensor".
