@@ -162,8 +162,8 @@ public sealed class VulkanGroupedSplitKvHostDepthTests
 
         VulkanSplitKvAttentionKernel kernel = HostKernel(model, cache)
             ?? throw new InvalidOperationException("the host built no split-KV decode kernel");
-        Assert.True(kernel.UsesGqa(numHeads, numKvHeads, headDim), $"the grouped pass cannot serve {numHeads} / {numKvHeads} / {headDim}");
         Assert.True(kernel.PreferGqa, $"{model.GetType().Name} must opt into the grouped split-KV pass by default (#1686)");
+        Assert.True(kernel.UsesGqa(numHeads, numKvHeads, headDim), $"the grouped pass cannot serve {numHeads} / {numKvHeads} / {headDim}");
         _out.WriteLine($"kv storage {kernel.KvStorage}, grouped v2: {kernel.UsesGqa2(numHeads, numKvHeads, headDim)}, " +
                        $"sub-groups {VulkanSplitKvAttentionKernel.GqaSubGroups(numHeads, numKvHeads)}");
 

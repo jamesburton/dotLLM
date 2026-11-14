@@ -889,6 +889,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_CPU_BF16_512` | BF16 weight GEMV/GEMM by shift-widening (#1118). BF16 is the top half of an F32, so bf16 &lt;&lt; 16 is the exact F32 value: every tier widens 4/8/16 weights in registers (vpmovzxwd + vpslld) and multiplies into F32 accumulator... | `MatMul.Bf16.cs` |
 | `DOTLLM_CPU_BF16_KERNEL` | BF16 weight GEMV/GEMM by shift-widening (#1118). BF16 is the top half of an F32, so bf16 &lt;&lt; 16 is the exact F32 value: every tier widens 4/8/16 weights in registers (vpmovzxwd + vpslld) and multiplies into F32 accumulator... | `MatMul.Bf16.cs` |
 | `DOTLLM_CPU_BF16_SCRATCH` | A/B switch between the two bit-identical AVX2/FMA GEMM forms: the register tile (default) and the F16-style four-row F32 scratch (DOTLLM_CPU_BF16_SCRATCH=1). Settable for in-process A/B. | `MatMul.Bf16.cs` |
+| `DOTLLM_CPU_GEMM_STATIC` | Test/diagnostic switch (also DOTLLM_CPU_GEMM_STATIC=1): partition the R4 tiled GEMM statically (one contiguous row range per thread) instead of by dynamic chunk claiming. Results are bit-identical either way (#1675). | `MatMulR4Gemm.cs` |
 | `DOTLLM_CPU_IQ1M_PACKED` | IQ1_M routed experts use the packed x Q8_K dot (default). DOTLLM_CPU_IQ1M_PACKED=0 falls back to dequantize-per-row (A/B baseline). | `MoeSwiGluMlp.cs` |
 | `DOTLLM_CPU_MOE_DECODE_N1` | Decode (one token) routed-expert fast path. The grouped path runs the k selected experts as k independent single-threaded tasks (Parallel.For, inner GEMMs without a pool): only k cores work, the work per expert is serial gate -... | `MoeSwiGluMlp.DecodeN1.cs` |
 | `DOTLLM_CPU_NVFP4_LEGACY_ORDER` | DOTLLM_CPU_NVFP4_LEGACY_ORDER=1 (read once): use the pre-#1587 float summation order (8-lane FMA partials) for every CPU NVFP4 x Q8_0 dot, single- and multi-row, so perplexity figures measured before #1587 reproduce. Default of... | `MatMulNvfp4.cs` |
@@ -1007,6 +1008,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | Variable | What the source says | Defined in |
 |---|---|---|
 | `DOTLLM_CPU_MTP_KV` | Environment variable selecting the head KV format: f16 (default), q8_0, q4_0 or f32 (reference arm only). | `CpuMtpState.cs` |
+| `DOTLLM_CPU_SERIAL_ELTWISE` | Test/diagnostic switch (also DOTLLM_CPU_SERIAL_ELTWISE=1): run the per-token FFN stages serially. | `TransformerModel.cs` |
 | `DOTLLM_DFLASH_DRAFT_VOCAB` | Draft-vocabulary limit (#1360): DOTLLM_DFLASH_DRAFT_VOCAB=K reads only token ids [0, K) of the lm-head for proposals; 0 = full; unset = the target's default. | `DFlashDrafter.cs` |
 | `DOTLLM_DFLASH_TRACE` | DOTLLM_DFLASH_TRACE=1: per-request draft / inject wall time on stderr at dispose. | `DFlashMtpState.cs` |
 | `DOTLLM_DIAG_EMBED_NOISE` | DIAGNOSTIC (DOTLLM_DIAG_EMBED_NOISE=&lt;eps&gt;): multiplies every embedding element by 1 + eps*u, u in [-1,1] (fixed seed): the noise-injection floor probe (#1599). | `TransformerModel.cs` |
@@ -1067,7 +1069,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_VK_F32_TILED64` | (not described in source) | `MatMulF32Kernel.cs` |
 | `DOTLLM_VK_FLASH_HD256` | Environment override for the wide-head variant: br16 (default), br8, or off. | `VulkanFlashAttentionF32Kernel.cs` |
 | `DOTLLM_VK_FLASH_HD512` | #914: optional 512-dim variant (Gemma-4 global layers). Same degrade-don't-throw contract as the wide SPV; only meaningful on top of a loaded wide variant so SupportedMaxHeadDim stays monotone. | `VulkanFlashAttentionF32Kernel.cs` |
-| `DOTLLM_VK_FUSED_ROPE_KV_F16` | Writer + split-KV decode twin. The GQA-grouped split pass (one KV read per (KV head, sub-group) instead of one per query head) is on for glm4moe (#1612: 96 / 8 heads, `attn_split` was 70 % of a decode step at 8K); the other den... | `VulkanTransformerModel.cs` |
+| `DOTLLM_VK_FUSED_ROPE_KV_F16` | Writer + split-KV decode twin. The GQA-grouped split pass (one KV read per (KV head, sub-group) instead of one per query head) is on for every F16-eligible dense architecture: glm4moe (#1612, 8K 2.3x), Granite / TwIL (#1744, 32... | `VulkanTransformerModel.cs` |
 | `DOTLLM_VK_FUSE_FORWARD` | (not described in source) | `VulkanQwen3HybridDenseTransformerModel.Profiling.cs` |
 | `DOTLLM_VK_GDN_CONV_FUSED` | (not described in source) | `VulkanQwen3MoeHybridKernels.cs` |
 | `DOTLLM_VK_GDN_SCAN_VARIANT` | Raw VkPipeline handle - diagnostics only, so VulkanDevice.GetShaderStatisticsAmd can report this kernel's post-compile VGPR/SGPR/LDS/scratch allocation. No codepath's correctness or performance depends on it. | `GdnScanMultiTokenF32Kernel.cs` |
@@ -1278,6 +1280,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_VULKAN_PARALLEL_UPLOAD` | Uploads the routed banks of every non-null entry of layers resident (raw quant), eagerly and in layer order, through one multi-threaded staging buffer, with the next layers' banks allocated ahead on background threads (#874). S... | `VulkanQwen3MoeMoeUpload.cs` |
 | `DOTLLM_VULKAN_PREFILL_PROFILE` | issue #139: env-gated prefill per-op-category profiler (DOTLLM_VULKAN_PREFILL_PROFILE=1). Splits the single per-forward command buffer at category boundaries (SubmitAndWait + re-Begin) so each bucket's wall time ~ its GPU time... | `VulkanTransformerModel.cs` |
 | `DOTLLM_VULKAN_PREFILL_PROFILE_OUT` | (not described in source) | `VulkanTransformerModel.cs` |
+| `DOTLLM_VULKAN_PREFILL_SPLIT_LAYERS` | Prefill host-synced submit splitting (#1760). 0 (default) = the whole prefill forward is ONE command buffer. N > 0 = every N layers (seqLen > 1, autoregressive forwards) the recorded work is submitted and fence-waited, then rec... | `VulkanTransformerModel.cs` |
 | `DOTLLM_VULKAN_Q4K_COOPMAT_MIN_TOKENS` | Env var moving the K-quant coopmat crossover (token count from which the coopmat GEMM replaces the dp4a MMQ). | `VulkanDensePrefillGemmPolicy.cs` |
 | `DOTLLM_VULKAN_Q8_0_COOPMAT_MIN_TOKENS` | Row count from which Q8_0PrefillKernel.Auto prefers the coopmat GEMM on a qualifying device (DOTLLM_VULKAN_Q8_0_COOPMAT_MIN_TOKENS, default 128 like the K-quants). | `VulkanTransformerModel.cs` |
 | `DOTLLM_VULKAN_Q8_0_PREFILL` | Startup override for Q8_0Prefill: auto (default), mmq or coopmat. | `VulkanTransformerModel.cs` |
