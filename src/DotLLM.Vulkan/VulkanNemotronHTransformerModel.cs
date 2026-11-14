@@ -603,6 +603,9 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
             VulkanTransformerModel.IsSplitDecodeDisabled() || config.HeadDim > VulkanSplitKvAttentionKernel.MaxHeadDim
                 ? null
                 : VulkanSplitKvAttentionKernel.TryCreate(device, spvDir);
+        // Issue #1686: the GQA-grouped split-KV decode pass (Nemotron-3-Nano-4B 40 / 8 heads; the nemotron_h_moe Lightning file 32 / 2 =
+        // two 8-head sub-groups). Also serves the DFlash verify decode. DOTLLM_VULKAN_SPLITKV_GQA=0 restores the per-head pass.
+        splitKvAttention?.EnableGqaByDefault();
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
         var biasAdd = BiasAddF32Kernel.Create(device, spvDir);

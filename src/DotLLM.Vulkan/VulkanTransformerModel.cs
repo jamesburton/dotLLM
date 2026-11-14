@@ -1413,9 +1413,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     private void InitDenseKvF16Kernels(string spvDir)
     {
         // Writer + split-KV decode twin. The GQA-grouped split pass (one KV read per (KV head, sub-group) instead of one per query head) is
-        // on for glm4moe (#1612: 96 / 8 heads, `attn_split` was 70 % of a decode step at 8K); the other dense architectures keep the
-        // per-head pass until the grouped pass is measured on them. DOTLLM_VULKAN_SPLITKV_GQA=1 / 0 overrides on any host.
-        InitKvF16Kernels(spvDir, gqaSplit: Config.Architecture is DotLLM.Core.Configuration.Architecture.Glm4Moe or DotLLM.Core.Configuration.Architecture.Granite);
+        // on for every F16-eligible dense architecture: glm4moe (#1612, 8K 2.3x), Granite / TwIL (#1744, 32K 2x) and Llama / Qwen / Mistral
+        // / Phi (#1686, measured in its PR). An MHA model (group 1) never takes it (UsesGqa). DOTLLM_VULKAN_SPLITKV_GQA=0 restores the
+        // per-head pass on any host; =1 forces the grouped one.
+        InitKvF16Kernels(spvDir);
         _attentionKvF16 = AttentionF32Kernel.Create(_device, spvDir, VulkanKvStorage.F16);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_FUSED_ROPE_KV_F16") != "0")
         {
@@ -1440,7 +1441,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     }
 
     /// <summary>The F16-KV writer and attention twins. Every Flint layer has sinks, so these three kernels cover every attention dispatch.</summary>
-    private void InitKvF16Kernels(string spvDir, bool gqaSplit = true)
+    private void InitKvF16Kernels(string spvDir)
     {
         _kvF16Writer = VulkanKvF16WriteKernel.Create(_device, spvDir);
         if (!IsSplitDecodeDisabled())
@@ -1449,7 +1450,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
 
             // #1200: the GQA-grouped split pass reads each K / V row once for the 8 query heads of a group (the per-head pass reads it
             // 8 times); at 32K the full layers' decode attention dominated the step. DOTLLM_VULKAN_SPLITKV_GQA=0 restores the per-head pass.
-            if (gqaSplit) _splitKvAttentionKvF16?.EnableGqaByDefault();   // the dense host keeps the F32 chain's per-head pass until the grouped pass is measured there
+            _splitKvAttentionKvF16?.EnableGqaByDefault();   // the F32 chain (_splitKvAttention) keeps the per-head pass: unmeasured there (#1686)
         }
         if (_smallRowAttn is not null)
             _smallRowAttnKvF16 = VulkanSplitKvRowsAttentionKernel.TryCreate(_device, spvDir, VulkanKvStorage.F16);

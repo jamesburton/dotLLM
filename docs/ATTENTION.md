@@ -486,9 +486,14 @@ The dense hybrid host (`VulkanQwen3HybridDenseTransformerModel`, Bonsai 2) can s
   group is served in ceil(G / 8) balanced sub-groups (issue #1612: glm4moe's 12 -> 6 + 6, 9 -> 5 + 4), one workgroup per
   (KV head, sub-group, split), so the KV rows are read ceil(G / 8) times per decoded token instead of G. The sub-grouping is
   derived in-shader from the push constants (both the v1 and v2 bodies), and the host counts `numKvHeads * GqaSubGroups` units
-  for the split heuristic and the dispatch. The dense hybrid host opts in (`VulkanQwen3MoeHybridKernels.EnableGqaDecode`), the
-  dense F16 host for glm4moe only (`InitDenseKvF16Kernels`; Llama / Qwen / Mistral / Phi stay on the per-head pass until measured);
-  `DOTLLM_VULKAN_SPLITKV_GQA=1` / `0` forces it on or off on any host.
+  for the split heuristic and the dispatch. Hosts that take it by default: the dense hybrid (Bonsai 2), the dense F16 host for every
+  F16-eligible architecture (`InitDenseKvF16Kernels`: glm4moe #1612, Granite #1744, Llama / Qwen / Mistral / Phi #1686), the
+  Qwen3.5/3.6 MoE hybrid (#1686; not qwen4exp or LFM2-MoE, which reuse that class) and Nemotron-H / nemotron_h_moe (#1686).
+  The dense host's F32-KV chain (`_splitKvAttention`) and qwen4exp stay on the per-head pass (qwen4exp only reaches split-KV
+  below its ~2K QSA dense limit, where the grouped pass was refuted, #885). `DOTLLM_VULKAN_SPLITKV_GQA=1` / `0` forces it on
+  or off on any host. Decode tok/s, per-head -> grouped, same process, ABBA x2, at 16K (#1686): Llama-3.1-8B Q4_K_M
+  16.0 -> 27.2 (1.70x), Qwen3-4B 17.5 -> 35.8 (2.05x), Qwen3.6-35B-A3B 32 -> 36 (1.13x), Nemotron-3.5 Lightning 40.5 -> 52.0
+  (1.28x), Nemotron-3-Nano-4B 45 -> 53 (1.17x); `VulkanGroupedSplitKvHostDepthTests` replays it on any of these files.
   `VulkanSplitKvAttentionKernelTests` (ALiBi, soft-cap, sliding window, bidirectional, masked tails) and the F16 tests run
   both passes. `VulkanSplitKvDecodeBench` (`DOTLLM_SPLITKV_DECODE_AB=1`) times all four arms at the Bonsai shape.
 - **Measured** (`VulkanSplitKvDecodeBench`, one layer's decode attention, Bonsai shape 24 / 4 / 256, minimum of 9 interleaved

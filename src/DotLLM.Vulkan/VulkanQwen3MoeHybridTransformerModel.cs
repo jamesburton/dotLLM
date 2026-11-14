@@ -254,6 +254,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         _gdnCache = gdnCache;
         _kernels = kernels;
         _q4kDecode = kernels.Q4KDecodeOnRows;
+
+        // Issue #1686: Qwen3.5/3.6 MoE full-attention layers (Qwen3.6-35B-A3B: 16 query heads over 2 KV heads, head_dim 256) take the
+        // GQA-grouped split-KV decode pass, reading each cached row once per (KV head, sub-group) instead of once per query head.
+        // Qwen3MoeHybrid only: qwen4exp (#818) and the LFM2-MoE host reuse this class and stay on the per-head pass (qwen4exp was
+        // refuted at <= 2K, #885). DOTLLM_VULKAN_SPLITKV_GQA=0 restores the per-head pass.
+        if (config.Architecture == Architecture.Qwen3MoeHybrid)
+            _kernels.EnableGqaDecode();
         _layout = config.HybridLayout!;
         _gdn = config.GdnConfig ?? default;   // null for the LFM2-MoE headless host (#1015)
         _kvSlotForLayer = kvSlotForLayer;
