@@ -274,4 +274,65 @@ public sealed class Qwen4ExpScratchMessageTests
         }
         finally { Environment.SetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS", prior); }
     }
+
+}
+
+/// <summary>#1791: 2048 planned rows when free device memory covers the measured extra + margin, else 1024; an override always wins. Pure arithmetic.</summary>
+public sealed class Qwen4ExpPlannedRowsChoiceTests
+{
+    private const long GiB = 1L << 30;
+    private const long Budget = 80 * GiB, Live = 70 * GiB, Extra = (long)(0.55 * GiB);
+    private static long FreeNeeded => Extra + Qwen4ExpResidencyPlan.WideRowsMarginBytes;
+
+    [Fact]
+    public void ChoosePlannedRows_Headroom_PicksWide()
+    {
+        var (rows, why) = Qwen4ExpResidencyPlan.ChoosePlannedRows(null, 8192, Budget, Live, otherBytes: GiB, reservedContextBytes: GiB, Extra);
+        Assert.Equal(2048, rows);
+        Assert.Contains("free", why, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ChoosePlannedRows_ExactlyEnough_PicksWide_OneByteShort_PicksBase()
+    {
+        long live = Budget - FreeNeeded;   // free == need
+        Assert.Equal(2048, Qwen4ExpResidencyPlan.ChoosePlannedRows(null, 8192, Budget, live, 0, 0, Extra).Rows);
+        var (rows, why) = Qwen4ExpResidencyPlan.ChoosePlannedRows(null, 8192, Budget, live + 1, 0, 0, Extra);
+        Assert.Equal(1024, rows);
+        Assert.Contains("does not fit", why, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(1, 0)]   // other processes' GPU memory eats the slack
+    [InlineData(0, 1)]   // the lazily-allocated context reservation eats it
+    public void ChoosePlannedRows_OtherProcessesAndUnallocatedContext_CountAgainstFree(int otherGiB, int contextGiB)
+    {
+        long live = Budget - FreeNeeded - GiB / 2;   // fits by 0.5 GiB on its own
+        Assert.Equal(2048, Qwen4ExpResidencyPlan.ChoosePlannedRows(null, 8192, Budget, live, 0, 0, Extra).Rows);
+        Assert.Equal(1024, Qwen4ExpResidencyPlan.ChoosePlannedRows(null, 8192, Budget, live, otherGiB * GiB, contextGiB * GiB, Extra).Rows);
+    }
+
+    [Fact]
+    public void ChoosePlannedRows_MarginIsRequired_NotJustTheExtra()
+    {
+        long live = Budget - Extra;   // the extra alone fits, the margin does not
+        Assert.Equal(1024, Qwen4ExpResidencyPlan.ChoosePlannedRows(null, 8192, Budget, live, 0, 0, Extra).Rows);
+    }
+
+    [Theory]
+    [InlineData(512, 8192, 80, 512)]      // override below the default wins even with ample headroom
+    [InlineData(2048, 8192, 0, 2048)]     // override above the base wins even with no headroom at all
+    [InlineData(4096, 3000, 80, 3000)]    // ...clamped to the context capacity
+    public void ChoosePlannedRows_OverrideWins(int overrideRows, int kv, int budgetGiB, int expected)
+    {
+        var (rows, why) = Qwen4ExpResidencyPlan.ChoosePlannedRows(overrideRows, kv, budgetGiB * GiB, Live, 0, 0, Extra);
+        Assert.Equal(expected, rows);
+        Assert.Contains("DOTLLM_VK_PLANNED_ROWS", why, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(2047, 1024)]
+    [InlineData(600, 600)]
+    public void ChoosePlannedRows_ShortContext_StaysAtBase(int kv, int expected)
+        => Assert.Equal(expected, Qwen4ExpResidencyPlan.ChoosePlannedRows(null, kv, Budget, 0, 0, 0, Extra).Rows);
 }
