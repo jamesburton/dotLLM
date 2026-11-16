@@ -351,6 +351,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     // but go through different launch sequences.
     private object? _decodeGraphKvCache;
     private int _decodeGraphLayerCount;       // DebugMaxLayers snapshot at capture time
+    private int _decodeGraphKvGeneration;     // the cache's Generation at capture time: a grown cache has new buffers (#1594)
 
     // ── graph-engagement observables (#338) ─────────────────────────────────────────────
     // Setting UseGraphCapture is NOT evidence that capture engaged: the constructor clears the
@@ -1233,17 +1234,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         {
             if (kvCache is CudaKvCache stdKv)
             {
-                // Guard against silent corruption: if speculative-verify rolled the
-                // cache back, the captured cuGraphExec was instantiated against a
-                // device-side write-pos counter that is now stale relative to the
-                // actual cache state. Today speculative decoding is restricted to
-                // greedy (non-graph), so this branch only fires if a future change
-                // wires both on simultaneously without invalidating the graph.
-                if (stdKv.WasRolledBack)
-                    throw new InvalidOperationException(
-                        "CudaKvCache.Rollback was called on this cache; the captured " +
-                        "cuGraphExec is no longer valid. Either disable UseGraphCapture " +
-                        "before the rollback or invalidate the graph and recapture.");
+                // A rollback (speculative verify, prefix reuse #1594) leaves the graph valid: the write row and seq_kv come from
+                // device scalars uploaded before every replay. A growth replaces the buffers and is caught by the Generation key.
                 return ForwardDecodeGraph(tokenIds, positions, deviceId, stdKv);
             }
             if (kvCache is CudaQuantizedKvCache qKv && qKv.WindowCapacity > 0)
@@ -1601,7 +1593,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                 // pure square-causal global-attention prefill on an eligible device;
                 // otherwise the FP32 CUDA-core attention_f16. Same Q/K/V FP16 buffers and
                 // same row-major [seq, heads, headDim] output either way.
-                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset)
+                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset, bool offsetG3 = false)
                 {
                     // Long-context prefill on GeForce Ampere → G-flash (fused mma.sync, fewer
                     // FLOPs + no score round-trip). Shorter prefill on Ampere → G3 (cuBLAS+
@@ -1621,6 +1613,13 @@ public sealed unsafe class CudaTransformerModel : IModel
                         && _g3Attention.CanUse(seqLen, seqKv, positionOffset, slidingWindow, numHeads, numKvHeads))
                         _g3Attention.Run(_cublas.Handle, qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, numHeads, numKvHeads, headDim, s);
+                    // Prefill over a cached prefix (prefix-cache hit, #1594): G3 with the query rows offset into the cache.
+                    // Only the dense F16 cache opts in (offsetG3): over the q8_0 dequant scratch it moved Qwen2.5-0.5B's
+                    // first-token logprob 0.055 nats from cold against attention_f16's 0.015, cause not yet found (#1846).
+                    else if (layerSinks == 0 && offsetG3
+                        && _g3Attention.CanUseOffset(seqLen, seqKv, positionOffset, slidingWindow, numHeads, numKvHeads))
+                        _g3Attention.RunOffset(_cublas.Handle, qPtr, kBuf, vBuf, _state.AttnOutput,
+                            seqLen, positionOffset, numHeads, numKvHeads, headDim, s);
                     else
                         _kernels.LaunchAttention(qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, seqKv, numHeads, numKvHeads, headDim,
@@ -1656,7 +1655,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                     MarkProfile(ProfileCategory.KvUpdate);
 
                     DispatchAttention(cudaKvCache.GetKeysPtr(layer), cudaKvCache.GetValuesPtr(layer),
-                        seqKv, positions[0]);
+                        seqKv, positions[0], offsetG3: true);
                 }
                 else if (kvCache is CudaPagedKvCache cudaPagedKvCache)
                 {
@@ -2282,12 +2281,14 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         if (_decodeGraphExec == 0
             || !ReferenceEquals(_decodeGraphKvCache, kvCache)
+            || _decodeGraphKvGeneration != kvCache.Generation
             || _decodeGraphLayerCount != effectiveLayers)
         {
             DisposeDecodeGraph();
             CaptureDecodeGraph(kvCache, effectiveLayers);
             GraphCaptureCount++;   // #338: engagement observable
             _decodeGraphKvCache = kvCache;
+            _decodeGraphKvGeneration = kvCache.Generation;
             _decodeGraphLayerCount = effectiveLayers;
         }
 
@@ -2348,12 +2349,14 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         if (_decodeGraphExec == 0
             || !ReferenceEquals(_decodeGraphKvCache, kvCache)
+            || _decodeGraphKvGeneration != kvCache.Generation
             || _decodeGraphLayerCount != effectiveLayers)
         {
             DisposeDecodeGraph();
             CaptureDecodeGraphQuantized(kvCache, effectiveLayers);
             GraphCaptureCount++;   // #338: engagement observable
             _decodeGraphKvCache = kvCache;
+            _decodeGraphKvGeneration = kvCache.Generation;
             _decodeGraphLayerCount = effectiveLayers;
         }
 
@@ -3151,8 +3154,8 @@ public sealed unsafe class CudaTransformerModel : IModel
             0 => Config.NumLayers,
             _ => Math.Min(DebugMaxLayers, Config.NumLayers),
         };
-        var key = (kvCache, effectiveLayers, _state.Generation, _moeScratch?.Generation ?? -1, _moeHost?.Generation ?? -1,
-            _scratchGeneration);
+        var key = (kvCache, kvCache.Generation, effectiveLayers, _state.Generation, _moeScratch?.Generation ?? -1,
+            _moeHost?.Generation ?? -1, _scratchGeneration);
         if (_moeGraphExec == 0 || !key.Equals(_moeGraphKey))
         {
             DisposeMoeGraph();
@@ -4595,7 +4598,9 @@ public sealed unsafe class CudaTransformerModel : IModel
     public CudaKvCache CreateKvCache(int maxSeqLen)
     {
         _context.MakeCurrent();
-        return new CudaKvCache(Core.Attention.KvGeometry.FromConfig(Config), maxSeqLen);
+        // The context travels with the cache (#1594): a retained prefix-cache entry is grown, seeded and disposed later, maybe on
+        // another thread, and the current context is per thread.
+        return new CudaKvCache(Core.Attention.KvGeometry.FromConfig(Config), maxSeqLen, _context);
     }
 
     /// <summary>
@@ -4608,8 +4613,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         _context.MakeCurrent();
         var geom = Core.Attention.KvGeometry.FromConfig(Config);
         if (!config.IsQuantized)
-            return new CudaKvCache(geom, maxSeqLen);
-        return new CudaQuantizedKvCache(geom, maxSeqLen, config);
+            return new CudaKvCache(geom, maxSeqLen, _context);
+        return new CudaQuantizedKvCache(geom, maxSeqLen, config, _context);
     }
 
     /// <summary>

@@ -114,6 +114,77 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
             $"CudaG3Attention.Run vs attention_f16: {mismatches}/{outElems} outside tol; worst abs {maxAbs} rel {maxRel}.");
     }
 
+    /// <summary>
+    /// Issue #1594: <see cref="CudaG3Attention.RunOffset"/> (queries starting <paramref name="offset"/> rows into the cache,
+    /// the prefill of a prefix-cache hit) vs <c>attention_f16</c> with the same position offset. <paramref name="maxElems"/>
+    /// below the default forces the query-row chunking (several chunks, each seeing only the keys up to its last row).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(100, 300, 32, 8, 128, 0L)]
+    [InlineData(647, 4113, 32, 8, 128, 0L)]
+    [InlineData(200, 700, 14, 2, 64, 14L * 900 * 37)]   // chunks of 37 rows
+    public void ProductionG3RunOffset_MatchesAttentionF16(int sq, int offset, int numHeads, int numKvHeads, int headDim, long maxElems)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        string ptxDir = ResolvePtxDir();
+        Skip.IfNot(File.Exists(Path.Combine(ptxDir, "attention_softmax_causal_offset.ptx")), "attention_softmax_causal_offset.ptx not built.");
+
+        using var ctx = CudaContext.Create(0);
+        ctx.MakeCurrent();
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir);
+        using var cublas = CudaCublasHandle.Create();
+        cublas.SetStream(stream);
+        Skip.IfNot(kernels.HasAttentionSoftmaxCausalOffsetF32In, "Offset causal-softmax kernel not loaded.");
+
+        int skv = offset + sq;
+        int qElems = sq * numHeads * headDim;
+        int kvElems = skv * numKvHeads * headDim;
+        using var q = CudaTensor.Allocate(new TensorShape(qElems), DType.Float16, 0);
+        using var k = CudaTensor.Allocate(new TensorShape(kvElems), DType.Float16, 0);
+        using var v = CudaTensor.Allocate(new TensorShape(kvElems), DType.Float16, 0);
+        using var outG3 = CudaTensor.Allocate(new TensorShape(qElems), DType.Float16, 0);
+        using var outRef = CudaTensor.Allocate(new TensorShape(qElems), DType.Float16, 0);
+        Upload(q.DataPointer, RandomHalf(qElems, 11));
+        Upload(k.DataPointer, RandomHalf(kvElems, 12));
+        Upload(v.DataPointer, RandomHalf(kvElems, 13));
+
+        kernels.LaunchAttention(q.DataPointer, k.DataPointer, v.DataPointer, outRef.DataPointer,
+            seqQ: sq, seqKv: skv, numHeads, numKvHeads, headDim, offset, 0, stream.Handle);
+        ushort[] refHost = Download(outRef.DataPointer, qElems);
+
+        using var g3 = new CudaG3Attention(kernels);
+        CudaG3Attention.Enabled = true;
+        Assert.True(g3.CanUseOffset(sq, skv, offset, 0, numHeads, numKvHeads));
+        if (maxElems > 0) CudaG3Attention.OffsetMaxScoreElems = maxElems;
+        try
+        {
+            g3.RunOffset(cublas.Handle, q.DataPointer, k.DataPointer, v.DataPointer, outG3.DataPointer,
+                sq, offset, numHeads, numKvHeads, headDim, stream.Handle);
+        }
+        finally
+        {
+            CudaG3Attention.OffsetMaxScoreElems = CudaG3Attention.DefaultOffsetMaxScoreElems;
+        }
+        stream.Synchronize();
+        ushort[] g3Host = Download(outG3.DataPointer, qElems);
+
+        int mismatches = 0;
+        float maxAbs = 0f, maxRel = 0f;
+        for (int i = 0; i < qElems; i++)
+        {
+            float a = (float)BitConverter.UInt16BitsToHalf(refHost[i]);
+            float b = (float)BitConverter.UInt16BitsToHalf(g3Host[i]);
+            float abs = MathF.Abs(a - b);
+            float rel = abs / (MathF.Abs(a) + 1e-6f);
+            if (!(abs <= AbsTol || rel <= RelTol)) mismatches++;
+            if (abs > maxAbs) { maxAbs = abs; maxRel = rel; }
+        }
+        _output.WriteLine($"G3 offset sq={sq} offset={offset} heads={numHeads}/{numKvHeads} hd={headDim} maxElems={maxElems}: " +
+                          $"mismatches={mismatches}/{qElems} worst abs={maxAbs:E3} rel={maxRel:E3}");
+        Assert.True(mismatches == 0, $"RunOffset vs attention_f16: {mismatches}/{qElems} outside tol; worst abs {maxAbs} rel {maxRel}.");
+    }
+
     [SkippableTheory]
     [InlineData(128, 32, 8, 64)]
     [InlineData(256, 32, 8, 64)]

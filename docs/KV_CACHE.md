@@ -138,9 +138,35 @@ the context window. On success it prefills only the suffix. A refusal is logged 
     On UMA an allocation past the OS limit succeeds and the next submit loses the device. Out-of-memory errors are caught too.
   - Freed handles leave the descriptor caches through the device destroy log (#467).
   - Caches with compact sliding windows do not grow.
+- **`CudaKvCache` / `CudaQuantizedKvCache.TryGrowTo` (issue #1594).** CUDA `serve --no-paged` retains these caches the same way
+  (`IPrefixReusableKvCache`, `IKvPrefixSeedable`; at most 2 entries, as on Vulkan, and no headroom because a growth is cheap).
+  - Layer by layer: allocate larger K and V, `cuMemcpyDtoD` only the live rows in the stored format (F16, or Q8_0/Q4_0 blocks),
+    free the old pair. The quantized cache's shared F16 dequant scratch (an existing #1107 expansion, 4 B x max stride per position)
+    is reallocated at the new size, not copied.
+  - Admitted before allocating (`CudaKvGrowth.Admit`): the growth plus one old layer in transit (plus the new scratch) must fit in
+    `cuMemGetInfo` free memory minus `DOTLLM_CUDA_VRAM_RESERVE_MB` (default 256 MiB). Under WDDM an over-allocation spills to shared
+    memory instead of failing (#1068), so a refusal is the only safe answer; it falls back to a miss. `DOTLLM_VRAM_BUDGET_MB`
+    exercises it on a large card.
+  - Each growth bumps the cache's `Generation`; the dense, quantized and MoE decode graphs key on it and recapture, because they
+    bake the buffer pointers in. A rollback does not invalidate a graph (the write row and `seq_kv` are device scalars uploaded per
+    replay), so the old `WasRolledBack` throw, which would have failed the first decode of every reused turn, is gone.
+  - With a mixed-precision window (`CudaQuantizedKvCache`, window > 0) no cut is allowed once a row has been evicted
+    (`CanTruncate`). Both update paths assume quantized length = length - window: the eager path would then read ring slots that
+    still hold cut rows, and the graph path re-evicts a slot over a correct quantized row. Before the first eviction any cut is safe.
+    Serve's default window is 0. Seeding refuses a windowed cache.
+  - When a device cache's growth is refused, `ResolveKvCache` removes and disposes that entry before the miss allocates
+    (`PrefixCache.Remove`), so the two never hold device memory side by side. The miss allocation itself is not yet admitted
+    against free VRAM (#1848).
+  - The suffix prefill runs at a position offset. G3 and flash refuse that, and `attention_f16` ran a 442-token suffix over a
+    2,965-token TwIL-8B prefix slower than the whole prompt cold. `CudaG3Attention.RunOffset` (offset causal softmax over
+    `[sq x skv]` planes, chunked by query rows to 64M score elements) serves the dense F16 cache from 32 query rows.
+    `DOTLLM_CUDA_G3_OFFSET=0` turns it off. q8_0 stays on `attention_f16` until #1846 is understood.
+  - `CudaPagedKvCache` is not reusable yet (falls to a miss); block-level reuse is #1843.
+  - Tests: `CudaPrefixReuseTests` (two-turn TextGenerator on Qwen2.5-0.5B, f16 and q8_0: tokens equal cold, logprobs bit-identical to
+    an ungrown warm run, refused admission misses; seed and grow are bit-identical to a rollback), `CudaKvGrowthLogicTests`.
 - **No growth path.**
   - `VulkanQuantizedKvCache` keeps the interface default: its F32 dequant scratch is sized by `maxSeqLen`, a #1107 expansion not worth growing.
-  - CUDA dense caches are never retained by this `PrefixCache`, and CUDA hybrids already grow on the recurrent-prefix path (#1080/#1093).
+  - CUDA hybrids grow on the recurrent-prefix path instead (#1080/#1093).
 - **Tests.**
   - `PrefixCacheReusableKvTests` (`TurnGrowingPastTheHeadroom_*`, `RefusedGrowth_*`, `HostSimpleKvCache_NextTurn_*`).
   - `VulkanKvCacheGrowthTests`: rows kept bit-exactly in F32 and F16; admission refusal; greedy identity on Qwen2.5-0.5B across a grown

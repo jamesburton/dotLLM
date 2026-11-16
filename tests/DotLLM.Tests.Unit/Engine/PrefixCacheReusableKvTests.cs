@@ -97,6 +97,8 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
         public void Dispose() { Disposed = true; inner.Dispose(); }
     }
 
+    private bool _firstDisposedBeforeSecondAlloc;
+
     private (TextGenerator Gen, PrefixCache Prefix, List<ReusableKv> Caches) Make(bool exclusive = true, bool canTruncate = true, int headroom = 0, int entries = 2,
         int growLimit = 0, PrefixCachePolicy policy = PrefixCachePolicy.Lru)
     {
@@ -106,6 +108,7 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
             kvCacheFactory: (c, size) =>
             {
                 var k = new ReusableKv(new SimpleKvCache(KvGeometry.FromConfig(c, false), size), exclusive, canTruncate, growLimit);
+                if (caches.Count == 1) _firstDisposedBeforeSecondAlloc = caches[0].Disposed;
                 caches.Add(k);
                 return k;
             },
@@ -222,6 +225,11 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
         Assert.Equal(Cold(next).GeneratedTokenIds, warm.GeneratedTokenIds);
         Assert.Equal([56, 52], caches[0].GrowthRequests);                   // headroom target, then the exact size
         Assert.Equal(2, caches.Count);
+        // The refused device cache is freed BEFORE the miss allocates its replacement (#1594 review): holding both would spill a
+        // card whose free memory just refused the growth. Only the new cache is retained.
+        Assert.True(_firstDisposedBeforeSecondAlloc, "the refused entry was still resident when the miss allocated");
+        Assert.Equal(1, prefix.EntryCount);
+        Assert.False(caches[1].Disposed);
     }
 
     /// <summary>
