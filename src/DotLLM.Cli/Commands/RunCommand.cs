@@ -927,19 +927,35 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             FinishReason finishReason = FinishReason.Length;
             var generatedText = new System.Text.StringBuilder();
 
-            await foreach (var token in generator.GenerateStreamingTokensAsync(effectivePrompt, inferenceOptions, adapter: loraAdapter))
+            try
             {
-                generatedText.Append(token.Text);
-                if (!settings.Json)
-                    Console.Write(token.Text);
-
-                if (token.FinishReason is null || token.Text.Length > 0)
-                    generated++;
-                if (token.FinishReason.HasValue)
+                await foreach (var token in generator.GenerateStreamingTokensAsync(effectivePrompt, inferenceOptions, adapter: loraAdapter))
                 {
-                    finishReason = token.FinishReason.Value;
-                    timings = token.Timings ?? default;
+                    generatedText.Append(token.Text);
+                    if (!settings.Json)
+                        Console.Write(token.Text);
+
+                    if (token.FinishReason is null || token.Text.Length > 0)
+                        generated++;
+                    if (token.FinishReason.HasValue)
+                    {
+                        finishReason = token.FinishReason.Value;
+                        timings = token.Timings ?? default;
+                    }
                 }
+            }
+            catch (DotLLM.Core.Configuration.DeviceMemoryAdmissionException ex)
+            {
+                // #1848: a device allocation the request needs does not fit in free GPU memory and was refused rather than spilled.
+                // The message names the buffer, the sizes and the remedies; a stack trace adds nothing.
+                if (settings.Json)
+                    Console.Error.WriteLine($"Error: {ex.Message}");
+                else
+                {
+                    Console.WriteLine();
+                    AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+                }
+                return 1;
             }
 
             totalSw.Stop();
