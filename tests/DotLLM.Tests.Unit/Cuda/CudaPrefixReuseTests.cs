@@ -113,7 +113,12 @@ public sealed class CudaPrefixReuseTests
         long offsetRunsBefore = CudaG3Attention.OffsetRunCount;
         long growthsBefore = CudaKvGrowth.GrowthCount;
         int capturesBefore = model.GraphCaptureCount, replaysBefore = model.GraphReplayCount;
-        var actual = grown.Generate(t2, opts);
+        // Poison new device allocations (NaN bytes) while the growth runs: CUDA hands back freed VRAM unchanged, and an earlier
+        // cache of this same prompt left identical K/V rows there, so a growth that skipped rows passed without it (mutant m1).
+        DotLLM.Cuda.Interop.CudaDriverApi.TestPoisonAllocations = true;
+        InferenceResponse actual;
+        try { actual = grown.Generate(t2, opts); }
+        finally { DotLLM.Cuda.Interop.CudaDriverApi.TestPoisonAllocations = false; }
         long growths = CudaKvGrowth.GrowthCount - growthsBefore;
         _out.WriteLine($"{kvType}: turn2 prompt {actual.PromptTokenCount}, cached {actual.Timings.CachedTokenCount} (common {common}), " +
                        $"growths {growths}, graph captures +{model.GraphCaptureCount - capturesBefore}, replays +{model.GraphReplayCount - replaysBefore}");
@@ -209,7 +214,9 @@ public sealed class CudaPrefixReuseTests
         // Grown from an exact-size cache holding `cut` rows, then the suffix: bit-identical too.
         using var small = model.CreateKvCache(cut, kvConfig);
         Assert.True(((Core.Attention.IKvPrefixSeedable)small).TrySeedPrefixFrom(src, cut));
-        Assert.True(small.TryGrowTo(n));
+        DotLLM.Cuda.Interop.CudaDriverApi.TestPoisonAllocations = true;   // see RunTwoTurn: freed VRAM still holds this prompt's rows
+        try { Assert.True(small.TryGrowTo(n)); }
+        finally { DotLLM.Cuda.Interop.CudaDriverApi.TestPoisonAllocations = false; }
         Assert.Equal(n, small.MaxLength);
         Assert.Equal(reference, Suffix(small));
     }
