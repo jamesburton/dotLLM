@@ -79,10 +79,20 @@ public sealed class CudaPrefixReuseTests
         string? path = FindGguf();
         Skip.If(path is null, "Qwen2.5-0.5B q8_0 GGUF not found.");
 
-        using var gguf = GgufFile.Open(path!);
+        // The decode graph only engages below its depth ceiling (a perf limit, 512 by default); turn 2 decodes past it, so lift it
+        // here or the graph-recapture-after-growth path under test never runs.
+        int savedDepth = CudaTransformerModel.GraphCaptureMaxDepth;
+        CudaTransformerModel.GraphCaptureMaxDepth = 8192;
+        try { RunTwoTurn(kvType, ptxDir!, path!); }
+        finally { CudaTransformerModel.GraphCaptureMaxDepth = savedDepth; }
+    }
+
+    private void RunTwoTurn(string kvType, string ptxDir, string path)
+    {
+        using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
-        using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptxDir!);
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptxDir);
         var kvConfig = kvType == "q8_0" ? new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0) : new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32);
         Func<Core.Models.ModelConfig, int, Core.Attention.IKvCache> factory = (_, size) => model.CreateKvCache(size, kvConfig);
         var opts = new InferenceOptions { Temperature = 0, MaxTokens = 16, Logprobs = true };
@@ -91,7 +101,10 @@ public sealed class CudaPrefixReuseTests
         var turn1 = cold.Generate(Turn1(), opts);
         string t2 = Turn2(turn1.Text);
         var expected = cold.Generate(t2, opts);
-        int common = tokenizer.Encode(t2).AsSpan().CommonPrefixLength(tokenizer.Encode(Turn1()));
+        // The retained cache holds turn 1's prompt AND its forwarded reply rows (all but the last sampled token), so the hit can
+        // extend into the reply when turn 2 re-tokenizes it identically.
+        int[] stored = tokenizer.Encode(Turn1()).Concat(turn1.GeneratedTokenIds[..^1]).ToArray();
+        int common = tokenizer.Encode(t2).AsSpan().CommonPrefixLength(stored);
 
         // Warm, headroom 0: turn 2 outgrows turn 1's (prompt + 16) allocation, so the hit must grow the cache.
         using var growCache = new PrefixCache(2);
