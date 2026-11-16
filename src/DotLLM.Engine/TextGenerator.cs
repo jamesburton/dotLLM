@@ -1718,8 +1718,17 @@ public sealed partial class TextGenerator
                     return (entry.KvCache, matchedTokens, false);
                 }
 
-                // Cache too small and it could not grow: fall through to allocate fresh. The entry now holds only the matched rows.
-                _prefixCache.Narrow(entry, matchedTokens);
+                // Cache too small and it could not grow: fall through to allocate fresh. A device cache's growth is refused when it
+                // does not fit in free device memory, so keeping the entry resident while the miss allocates a whole new cache next to
+                // it would push the card into the very spill the refusal avoided (#1594 review). Drop it first. A host cache keeps
+                // the matched rows (narrowed) for a later, shorter request.
+                if (entry.KvCache is Core.Attention.IPrefixReusableKvCache)
+                {
+                    if (ReferenceEquals(protectedEntry, entry)) protectedEntry = null;
+                    _prefixCache.Remove(entry);
+                }
+                else
+                    _prefixCache.Narrow(entry, matchedTokens);
             }
             cacheMiss:
 

@@ -293,11 +293,16 @@ internal sealed class CudaG3Attention : IDisposable
     private void EnsureScratch(long elems)
     {
         if (elems <= _planeElems) return;
-        if (_scoresF32 != 0) CudaDriverApi.cuMemFree_v2(_scoresF32);
-        if (_probsF16 != 0) CudaDriverApi.cuMemFree_v2(_probsF16);
-        CudaDriverApi.cuMemAlloc_v2(out _scoresF32, (nuint)(elems * Fp32Size)).ThrowOnError();
-        CudaDriverApi.cuMemAlloc_v2(out _probsF16, (nuint)(elems * Fp16Size)).ThrowOnError();
-        _planeElems = elems;
+        // Release and forget the old pair first: if an allocation below throws, the object must not keep a freed pointer or a
+        // plane size it no longer has (the next call would reuse a dangling buffer).
+        if (_scoresF32 != 0) { CudaDriverApi.cuMemFree_v2(_scoresF32); _scoresF32 = 0; }
+        if (_probsF16 != 0) { CudaDriverApi.cuMemFree_v2(_probsF16); _probsF16 = 0; }
+        _planeElems = 0;
+        CudaDriverApi.cuMemAlloc_v2(out nint scores, (nuint)(elems * Fp32Size)).ThrowOnError();
+        _scoresF32 = scores;
+        CudaDriverApi.cuMemAlloc_v2(out nint probs, (nuint)(elems * Fp16Size)).ThrowOnError();
+        _probsF16 = probs;
+        _planeElems = elems;   // only once both exist; a throw above leaves a zero size, so the next call reallocates
     }
 
     public void Dispose()

@@ -37,14 +37,18 @@ public sealed class CudaKvGrowthLogicTests
     [InlineData(0, 100, 100, 37, true)]
     [InlineData(0, 100, 100, 100, true)]
     [InlineData(0, 100, 100, 101, false)]
-    // Window 32, 100 rows, 68 already evicted to the quantized region: only cuts at or above 68.
-    [InlineData(32, 100, 68, 68, true)]
-    [InlineData(32, 100, 68, 90, true)]
+    // Window 32, 100 rows, 68 already evicted: no cut at all (a cut to 90 then a short append lowers the quantized length below 68
+    // and reads stale ring slots; the graph path re-evicts row pos - 32 from a slot now holding a cut row). A no-op cut is fine.
+    [InlineData(32, 100, 68, 99, false)]
+    [InlineData(32, 100, 68, 90, false)]
+    [InlineData(32, 100, 68, 68, false)]
     [InlineData(32, 100, 68, 67, false)]
     [InlineData(32, 100, 68, 10, false)]
-    // Window not yet full: nothing evicted, any cut.
+    [InlineData(32, 100, 68, 100, true)]
+    // Window not yet full: nothing evicted, every row is still in its own ring slot, any cut.
     [InlineData(32, 20, 0, 5, true)]
-    public void QuantizedCanTruncate_RefusesCutsBelowTheEvictedRowsOfAWindow(int window, int current, int quantized, int length, bool expected)
+    [InlineData(32, 32, 0, 31, true)]
+    public void QuantizedCanTruncate_RefusesCutsOnceAWindowHasEvicted(int window, int current, int quantized, int length, bool expected)
         => Assert.Equal(expected, CudaQuantizedKvCache.CanTruncate(window, current, quantized, length));
 
     [Fact]

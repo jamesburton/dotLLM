@@ -210,6 +210,22 @@ public sealed class PrefixCache : IDisposable
     }
 
     /// <summary>
+    /// Removes <paramref name="entry"/> and disposes its KV-cache, freeing its storage now rather than at eviction. Used when a
+    /// device cache could not grow for the request that matched it (#1594): the miss allocates a new cache, and the old one must not
+    /// hold device memory beside it.
+    /// </summary>
+    /// <param name="entry">The entry to remove.</param>
+    /// <returns><see langword="true"/> when the entry was present.</returns>
+    internal bool Remove(PrefixCacheEntry entry)
+    {
+        int i = _entries.IndexOf(entry);
+        if (i < 0) return false;
+        _entries[i].Dispose();
+        _entries.RemoveAt(i);
+        return true;
+    }
+
+    /// <summary>
     /// Removes all entries and disposes their KV-caches.
     /// </summary>
     public void Clear()

@@ -150,8 +150,13 @@ the context window. On success it prefills only the suffix. A refusal is logged 
   - Each growth bumps the cache's `Generation`; the dense, quantized and MoE decode graphs key on it and recapture, because they
     bake the buffer pointers in. A rollback does not invalidate a graph (the write row and `seq_kv` are device scalars uploaded per
     replay), so the old `WasRolledBack` throw, which would have failed the first decode of every reused turn, is gone.
-  - With a mixed-precision window (`CudaQuantizedKvCache`, window > 0) a cut must stay at or above the evicted rows: the ring no
-    longer holds the rows below them (`CanTruncate`). Serve's default window is 0. Seeding refuses a windowed cache.
+  - With a mixed-precision window (`CudaQuantizedKvCache`, window > 0) no cut is allowed once a row has been evicted
+    (`CanTruncate`). Both update paths assume quantized length = length - window: the eager path would then read ring slots that
+    still hold cut rows, and the graph path re-evicts a slot over a correct quantized row. Before the first eviction any cut is safe.
+    Serve's default window is 0. Seeding refuses a windowed cache.
+  - When a device cache's growth is refused, `ResolveKvCache` removes and disposes that entry before the miss allocates
+    (`PrefixCache.Remove`), so the two never hold device memory side by side. The miss allocation itself is not yet admitted
+    against free VRAM (#1848).
   - The suffix prefill runs at a position offset. G3 and flash refuse that, and `attention_f16` ran a 442-token suffix over a
     2,965-token TwIL-8B prefix slower than the whole prompt cold. `CudaG3Attention.RunOffset` (offset causal softmax over
     `[sq x skv]` planes, chunked by query rows to 64M score elements) serves the dense F16 cache from 32 query rows.

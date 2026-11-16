@@ -17,7 +17,7 @@ namespace DotLLM.Cuda;
 /// Prefix reuse (issue #1594): the cache owns its buffers and keeps its rows after a request ends, so the live <c>PrefixCache</c>
 /// retains it and a later request cuts it back to the common prompt prefix (<see cref="IPrefixReusableKvCache"/>), grows it
 /// (<see cref="TryGrowTo"/>) or seeds a fresh cache from it (<see cref="TrySeedPrefixFrom"/>). Rows move in their stored
-/// quantized format, never widened. With a mixed-precision window a cut is only safe while it stays at or above the evicted rows
+/// quantized format, never widened. With a mixed-precision window a cut is only safe before any row has been evicted
 /// (<see cref="CanTruncateTo"/>).
 /// </para>
 /// </summary>
@@ -537,13 +537,15 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
     /// <summary>
     /// Whether a cache with an FP16 window of <paramref name="windowSize"/> rows (0 = pure quantized), holding
     /// <paramref name="currentLength"/> rows of which <paramref name="quantizedLength"/> were evicted into the quantized region, can
-    /// be cut back to <paramref name="length"/> with every row below it intact. Pure quantized: always, every row sits at its own
-    /// position. Windowed: only while <paramref name="length"/> is at or above the evicted rows, because the window is a ring:
-    /// the rows a shorter cache would hold in FP16 were already quantized and their ring slots overwritten, and the eviction
-    /// counters assume the window holds the newest rows. Pure so it is testable without a GPU.
+    /// be cut back to <paramref name="length"/> and then appended to without corrupting any row. Pure quantized: always, every row
+    /// sits at its own position. Windowed: only while nothing has been evicted yet (every row is still in the ring at its own slot),
+    /// or for a no-op cut. Once rows were evicted, a cut breaks the invariant both update paths rely on (quantized length =
+    /// length - window): the eager <c>UpdateDevice</c> lowers the quantized length below the rows already evicted, so attention reads
+    /// ring slots still holding the cut rows; the graph path evicts row pos - window from its ring slot again, overwriting a
+    /// correctly quantized row with a cut one (#1594 review). Pure so it is testable without a GPU.
     /// </summary>
     internal static bool CanTruncate(int windowSize, int currentLength, int quantizedLength, int length)
-        => (uint)length <= (uint)currentLength && (windowSize <= 0 || length >= quantizedLength);
+        => (uint)length <= (uint)currentLength && (windowSize <= 0 || quantizedLength == 0 || length == currentLength);
 
     /// <summary>
     /// Raises <see cref="MaxLength"/> to <paramref name="maxLength"/> keeping the committed rows (issue #1594, the CUDA side of
