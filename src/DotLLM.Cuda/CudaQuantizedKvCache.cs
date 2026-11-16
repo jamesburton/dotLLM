@@ -13,8 +13,15 @@ namespace DotLLM.Cuda;
 /// then combine with window data and call the regular attention kernel.
 /// Memory savings come from permanent quantized storage between attention calls.
 /// </para>
+/// <para>
+/// Prefix reuse (issue #1594): the cache owns its buffers and keeps its rows after a request ends, so the live <c>PrefixCache</c>
+/// retains it and a later request cuts it back to the common prompt prefix (<see cref="IPrefixReusableKvCache"/>), grows it
+/// (<see cref="TryGrowTo"/>) or seeds a fresh cache from it (<see cref="TrySeedPrefixFrom"/>). Rows move in their stored
+/// quantized format, never widened. With a mixed-precision window a cut is only safe while it stays at or above the evicted rows
+/// (<see cref="CanTruncateTo"/>).
+/// </para>
 /// </summary>
-public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
+public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, IPrefixReusableKvCache, IKvPrefixSeedable
 {
     private const int BlockSize = 32;
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
@@ -29,7 +36,9 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
     private readonly bool _uniform;          // _geom.IsUniform, hoisted for the hot path
     private readonly int _uniformStride;     // _geom.UniformStride when _uniform; else 0
     private readonly int _maxStride;         // max per-layer stride — sizes the shared scratch
-    private readonly int _maxSeqLen;
+    private int _maxSeqLen;                  // raised by TryGrowTo (issue #1594)
+    private int _generation;                 // bumped whenever device buffers are replaced (TryGrowTo)
+    private readonly CudaContext? _context;  // context the buffers live on; null = the ambient current context
     private readonly int _windowSize;
     private readonly int[] _keyQuantRowBytes;   // [numLayers] quantized K row bytes
     private readonly int[] _valueQuantRowBytes; // [numLayers] quantized V row bytes
@@ -85,7 +94,13 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
     public int KvStrideOf(int layerIndex) => _geom.KvStrideOf(layerIndex);
 
     /// <summary>Total device memory allocated in bytes.</summary>
-    public long AllocatedBytes { get; }
+    public long AllocatedBytes { get; private set; }
+
+    /// <summary>
+    /// Changes whenever device buffers are replaced (<see cref="TryGrowTo"/>). The captured quantized decode graph bakes the buffer
+    /// pointers and <see cref="MaxLength"/> in, so <see cref="CudaTransformerModel"/> recaptures when this moves.
+    /// </summary>
+    internal int Generation => _generation;
 
     /// <summary>
     /// Creates a GPU quantized KV-cache with a single uniform <c>numKvHeads * headDim</c>
@@ -104,7 +119,19 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
     /// generalises the constructor + buffer/scratch sizing only (no CUDA Gemma-4 decode path).
     /// </summary>
     public CudaQuantizedKvCache(KvGeometry geometry, int maxSeqLen, KvCacheConfig config)
+        : this(geometry, maxSeqLen, config, context: null)
     {
+    }
+
+    /// <summary>
+    /// As <see cref="CudaQuantizedKvCache(KvGeometry, int, KvCacheConfig)"/>, with the CUDA context the buffers live on. Growth, seeding
+    /// and disposal make it current first: a retained prefix-cache entry can be grown or evicted from a thread other than the one
+    /// that created it, and the current context is per thread.
+    /// </summary>
+    public CudaQuantizedKvCache(KvGeometry geometry, int maxSeqLen, KvCacheConfig config, CudaContext? context)
+    {
+        _context = context;
+        _context?.MakeCurrent();
         int numLayers = geometry.LayerCount;
         _numLayers = numLayers;
         _geom = geometry;
@@ -504,8 +531,128 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
     }
 
     /// <inheritdoc/>
+    /// <remarks>See <see cref="CanTruncate"/>.</remarks>
+    public bool CanTruncateTo(int length) => CanTruncate(_windowSize, _currentLength, _quantizedLength, length);
+
+    /// <summary>
+    /// Whether a cache with an FP16 window of <paramref name="windowSize"/> rows (0 = pure quantized), holding
+    /// <paramref name="currentLength"/> rows of which <paramref name="quantizedLength"/> were evicted into the quantized region, can
+    /// be cut back to <paramref name="length"/> with every row below it intact. Pure quantized: always, every row sits at its own
+    /// position. Windowed: only while <paramref name="length"/> is at or above the evicted rows, because the window is a ring:
+    /// the rows a shorter cache would hold in FP16 were already quantized and their ring slots overwritten, and the eviction
+    /// counters assume the window holds the newest rows. Pure so it is testable without a GPU.
+    /// </summary>
+    internal static bool CanTruncate(int windowSize, int currentLength, int quantizedLength, int length)
+        => (uint)length <= (uint)currentLength && (windowSize <= 0 || length >= quantizedLength);
+
+    /// <summary>
+    /// Raises <see cref="MaxLength"/> to <paramref name="maxLength"/> keeping the committed rows (issue #1594, the CUDA side of
+    /// #1781). Layer by layer it allocates larger quantized K and V, copies the live quantized rows device to device in their
+    /// stored format (no widening) and frees the old pair; the FP16 window is a ring sized independently of
+    /// <see cref="MaxLength"/> and stays. The shared FP16 dequant scratch (<c>[maxSeqLen, maxStride]</c> for K and V, an existing
+    /// #1107 expansion: 4 x maxStride bytes per position) is reallocated at the new size, not copied: attention rebuilds it on
+    /// every call. The peak extra memory is admitted against free VRAM first (never spill); a refusal or allocation failure returns
+    /// <see langword="false"/> and leaves the cache valid at its old <see cref="MaxLength"/>.
+    /// </summary>
+    /// <param name="maxLength">Positions the cache must hold.</param>
+    /// <returns><see langword="true"/> when <see cref="MaxLength"/> is now at least <paramref name="maxLength"/>.</returns>
+    public bool TryGrowTo(int maxLength)
+    {
+        if (maxLength <= _maxSeqLen) return true;
+        _context?.MakeCurrent();
+
+        long[] rowBytes = new long[_numLayers]; // planning path, once per growth
+        for (int i = 0; i < _numLayers; i++) rowBytes[i] = (long)_keyQuantRowBytes[i] + _valueQuantRowBytes[i];
+        long scratchBytes = (long)maxLength * _maxStride * sizeof(ushort);
+        if (!CudaKvGrowth.Admit(CudaKvGrowth.PeakGrowthBytes(rowBytes, _maxSeqLen, maxLength, fixedExtraBytes: 2 * scratchBytes)))
+            return false;
+
+        // Scratch first: the new pair is allocated before the old is freed, which the admission counted in full.
+        nint ks = 0, vs = 0;
+        int rc = CudaDriverApi.cuMemAlloc_v2(out ks, (nuint)scratchBytes);
+        if (rc == 0) rc = CudaDriverApi.cuMemAlloc_v2(out vs, (nuint)scratchBytes);
+        if (rc != 0)
+        {
+            if (ks != 0) CudaDriverApi.cuMemFree_v2(ks);
+            if (vs != 0) CudaDriverApi.cuMemFree_v2(vs);
+            Console.Error.WriteLine($"[dotLLM.Cuda] quantized KV growth to {maxLength} positions failed (scratch, CUresult {rc}); keeping {_maxSeqLen}.");
+            return false;
+        }
+        long oldScratch = (long)_maxSeqLen * _maxStride * sizeof(ushort);
+        CudaDriverApi.cuMemFree_v2(_kScratch);
+        CudaDriverApi.cuMemFree_v2(_vScratch);
+        _kScratch = ks;
+        _vScratch = vs;
+        AllocatedBytes += 2 * (scratchBytes - oldScratch);
+        _generation++;
+
+        // Quantized rows are live below _quantizedLength (pure quantized: every row); window rows sit in the ring, untouched.
+        int keepRows = _windowSize > 0 ? _quantizedLength : _currentLength;
+        for (int layer = 0; layer < _numLayers; layer++)
+        {
+            nuint kBytes = (nuint)((long)maxLength * _keyQuantRowBytes[layer]);
+            nuint vBytes = (nuint)((long)maxLength * _valueQuantRowBytes[layer]);
+            nuint kKeep = (nuint)((long)keepRows * _keyQuantRowBytes[layer]);
+            nuint vKeep = (nuint)((long)keepRows * _valueQuantRowBytes[layer]);
+            nint nk = 0, nv = 0;
+            rc = CudaDriverApi.cuMemAlloc_v2(out nk, kBytes);
+            if (rc == 0) rc = CudaDriverApi.cuMemAlloc_v2(out nv, vBytes);
+            if (rc == 0 && kKeep > 0) rc = CudaDriverApi.cuMemcpyDtoD_v2(nk, _keysQuant[layer], kKeep);
+            if (rc == 0 && vKeep > 0) rc = CudaDriverApi.cuMemcpyDtoD_v2(nv, _valuesQuant[layer], vKeep);
+            if (rc != 0)
+            {
+                if (nk != 0) CudaDriverApi.cuMemFree_v2(nk);
+                if (nv != 0) CudaDriverApi.cuMemFree_v2(nv);
+                // Layers below `layer` (and the scratch) already hold maxLength rows; the cache stays valid at the old length.
+                Console.Error.WriteLine($"[dotLLM.Cuda] quantized KV growth to {maxLength} positions failed at layer {layer} (CUresult {rc}); keeping {_maxSeqLen}.");
+                return false;
+            }
+            CudaDriverApi.cuMemFree_v2(_keysQuant[layer]);
+            CudaDriverApi.cuMemFree_v2(_valuesQuant[layer]);
+            _keysQuant[layer] = nk;
+            _valuesQuant[layer] = nv;
+            AllocatedBytes += (long)(kBytes + vBytes) - (long)_maxSeqLen * rowBytes[layer];
+        }
+        _maxSeqLen = maxLength;
+        CudaKvGrowth.RecordGrowth();
+        return true;
+    }
+
+    /// <summary>
+    /// Copies rows <c>[0, rows)</c> of every layer from another pure-quantized <see cref="CudaQuantizedKvCache"/> of the same geometry
+    /// and K/V types into this one, device to device in the stored quantized format (the #1780 protected-entry seed on CUDA, issue
+    /// #1594), and sets <see cref="CurrentLength"/> to <paramref name="rows"/>. The source is not modified. False, with this cache
+    /// unchanged, for a mixed-precision window on either side (its ring holds the newest rows, not a prefix), another type,
+    /// geometry, format or context, too few source rows, or too little room here.
+    /// </summary>
+    /// <param name="source">The cache whose leading rows to copy.</param>
+    /// <param name="rows">Rows to copy.</param>
+    /// <returns>Whether the rows were copied.</returns>
+    public bool TrySeedPrefixFrom(IKvCache source, int rows)
+    {
+        if (source is not CudaQuantizedKvCache src || ReferenceEquals(src, this)) return false;
+        if (_windowSize > 0 || src._windowSize > 0) return false;
+        if (rows <= 0 || rows > src._currentLength || rows > _maxSeqLen) return false;
+        if (src._numLayers != _numLayers || src.KeyDType != KeyDType || src.ValueDType != ValueDType
+            || !ReferenceEquals(src._context, _context)) return false;
+        for (int i = 0; i < _numLayers; i++)
+            if (src.Stride(i) != Stride(i)) return false;
+
+        _context?.MakeCurrent();
+        for (int i = 0; i < _numLayers; i++)
+        {
+            CudaDriverApi.cuMemcpyDtoD_v2(_keysQuant[i], src._keysQuant[i], (nuint)((long)rows * _keyQuantRowBytes[i])).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoD_v2(_valuesQuant[i], src._valuesQuant[i], (nuint)((long)rows * _valueQuantRowBytes[i])).ThrowOnError();
+        }
+        _currentLength = rows;
+        _quantizedLength = rows;
+        return true;
+    }
+
+    /// <inheritdoc/>
     public void Dispose()
     {
+        _context?.MakeCurrent();
         for (int i = 0; i < _numLayers; i++)
         {
             if (_keysQuant[i] != 0) { CudaDriverApi.cuMemFree_v2(_keysQuant[i]); _keysQuant[i] = 0; }

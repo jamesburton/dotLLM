@@ -11,7 +11,13 @@ namespace DotLLM.Cuda;
 /// GPU-resident KV-cache storing FP16 key and value vectors per layer.
 /// Layout: [maxSeqLen, numKvHeads * headDim] per layer, FP16.
 /// </summary>
-public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
+/// <remarks>
+/// Prefix reuse (issue #1594): the cache owns its buffers and keeps its rows after a request ends, so the engine's live
+/// <c>PrefixCache</c> retains it and a later request cuts it back (<see cref="Rollback"/>) to the common prompt prefix
+/// (<see cref="IPrefixReusableKvCache"/>), grows it when the next turn is longer (<see cref="TryGrowTo"/>), or seeds a fresh cache
+/// from a protected entry's shared rows (<see cref="TrySeedPrefixFrom"/>). Growth and seeding copy F16 rows device to device.
+/// </remarks>
+public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IPrefixReusableKvCache, IKvPrefixSeedable
 {
     private readonly nint[] _keys;
     private readonly nint[] _values;
@@ -19,8 +25,9 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
     private readonly KvGeometry _geom;     // per-layer KV row width (numKvHeads(l) * headDim(l))
     private readonly bool _uniform;        // _geom.IsUniform, hoisted for the hot path
     private readonly int _uniformStride;   // _geom.UniformStride when _uniform; else 0
-    private readonly int _maxSeqLen;
+    private int _maxSeqLen;                // raised by TryGrowTo (issue #1594)
     private int _currentLength;
+    private int _generation;               // bumped whenever a layer's device buffers are replaced (TryGrowTo)
     // CUDA context this cache's buffers live on. Non-null only for explicit multi-device placement
     // (e.g. the cross-device handoff): host↔device staging makes this current first so a copy targets
     // the right GPU. Null = legacy single-device callers operate on the ambient current context.
@@ -34,6 +41,12 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
 
     /// <inheritdoc/>
     int IPerLayerKvCache.LayerCount => _numLayers;
+
+    /// <summary>
+    /// Changes whenever a layer's device buffers are replaced (<see cref="TryGrowTo"/>). A captured decode graph bakes those pointers
+    /// in, so <see cref="CudaTransformerModel"/> keys its graphs on the cache AND this value and recaptures when it moves.
+    /// </summary>
+    internal int Generation => _generation;
 
     /// <inheritdoc/>
     public int KvStrideOf(int layerIndex) => _geom.KvStrideOf(layerIndex);
@@ -313,15 +326,96 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
     }
 
     /// <summary>
-    /// Set on the first <see cref="Rollback"/> call against this cache.
-    /// <see cref="CudaTransformerModel"/>'s graph-replay fast path consults
-    /// this flag to guard against the silent-corruption case where a captured
-    /// <c>cuGraphExec</c> would replay with a stale device-side write-pos.
-    /// Speculative decoding is the only Rollback caller today and is currently
-    /// restricted to greedy (non-graph) — this flag exists so a future
-    /// speculative+graph combination fails fast at the graph-launch site.
+    /// Set on the first <see cref="Rollback"/> call against this cache (speculative verify, prefix reuse). Informational only: a
+    /// captured decode graph reads the write row and the attended length from device scalars uploaded before every replay
+    /// (<c>ForwardDecodeGraph</c>), so a rollback leaves it valid (issue #1594: the old throw on this flag killed the first decode
+    /// of every reused turn). Buffer replacement is what invalidates a graph; see <see cref="Generation"/>.
     /// </summary>
     public bool WasRolledBack { get; private set; }
+
+    /// <inheritdoc/>
+    /// <remarks>Every layer holds the full history, so any cut within <see cref="CurrentLength"/> leaves the rows below it intact.</remarks>
+    public bool CanTruncateTo(int length) => (uint)length <= (uint)_currentLength;
+
+    /// <summary>
+    /// Raises <see cref="MaxLength"/> to <paramref name="maxLength"/> keeping the <see cref="CurrentLength"/> committed rows (issue
+    /// #1594, the CUDA side of #1781), so a retained prefix-cache entry serves a longer next turn instead of re-prefilling the whole
+    /// conversation. Layer by layer it allocates larger K and V, copies only the live F16 rows device to device and frees the old
+    /// pair; the peak extra memory (<see cref="CudaKvGrowth.PeakGrowthBytes"/>: the growth plus one old layer in transit) is admitted
+    /// against free VRAM before anything is allocated, so a growth never pushes the card into WDDM's shared-memory spill. A refusal
+    /// or an allocation failure returns <see langword="false"/> and leaves the cache valid at its old <see cref="MaxLength"/> (the
+    /// caller then misses). Must not run while a forward is in flight on this cache.
+    /// </summary>
+    /// <param name="maxLength">Positions the cache must hold.</param>
+    /// <returns><see langword="true"/> when <see cref="MaxLength"/> is now at least <paramref name="maxLength"/>.</returns>
+    public bool TryGrowTo(int maxLength)
+    {
+        if (maxLength <= _maxSeqLen) return true;
+        _context?.MakeCurrent();
+
+        long[] rowBytes = new long[_numLayers]; // planning path, once per growth
+        for (int i = 0; i < _numLayers; i++) rowBytes[i] = 2L * Stride(i) * sizeof(ushort); // K + V, FP16
+        if (!CudaKvGrowth.Admit(CudaKvGrowth.PeakGrowthBytes(rowBytes, _maxSeqLen, maxLength)))
+            return false;
+
+        // The legacy-stream copies below wait for the model's stream (created blocking), so no forward's writes are in flight.
+        for (int layer = 0; layer < _numLayers; layer++)
+        {
+            long strideBytes = (long)Stride(layer) * sizeof(ushort);
+            nuint bytes = (nuint)((long)maxLength * strideBytes);
+            nuint keep = (nuint)((long)_currentLength * strideBytes);
+            nint nk = 0, nv = 0;
+            int rc = CudaDriverApi.cuMemAlloc_v2(out nk, bytes);
+            if (rc == 0) rc = CudaDriverApi.cuMemAlloc_v2(out nv, bytes);
+            if (rc == 0 && keep > 0) rc = CudaDriverApi.cuMemcpyDtoD_v2(nk, _keys[layer], keep);
+            if (rc == 0 && keep > 0) rc = CudaDriverApi.cuMemcpyDtoD_v2(nv, _values[layer], keep);
+            if (rc != 0)
+            {
+                if (nk != 0) CudaDriverApi.cuMemFree_v2(nk);
+                if (nv != 0) CudaDriverApi.cuMemFree_v2(nv);
+                // Layers below `layer` already hold maxLength rows; the rest keep the old size, so the cache stays at the old one.
+                if (layer > 0) _generation++;
+                Console.Error.WriteLine($"[dotLLM.Cuda] KV growth to {maxLength} positions failed at layer {layer} (CUresult {rc}); keeping {_maxSeqLen}.");
+                return false;
+            }
+            CudaDriverApi.cuMemFree_v2(_keys[layer]);
+            CudaDriverApi.cuMemFree_v2(_values[layer]);
+            _keys[layer] = nk;
+            _values[layer] = nv;
+        }
+        _maxSeqLen = maxLength;
+        _generation++;
+        CudaKvGrowth.RecordGrowth();
+        return true;
+    }
+
+    /// <summary>
+    /// Copies rows <c>[0, rows)</c> of every layer from another <see cref="CudaKvCache"/> of the same geometry into this cache, device
+    /// to device in F16 (the #1780 protected-entry seed on CUDA, issue #1594), and sets <see cref="CurrentLength"/> to
+    /// <paramref name="rows"/>. The source is not modified. False, with this cache unchanged, for another cache type, geometry or
+    /// context, too few source rows, or too little room here.
+    /// </summary>
+    /// <param name="source">The cache whose leading rows to copy.</param>
+    /// <param name="rows">Rows to copy.</param>
+    /// <returns>Whether the rows were copied.</returns>
+    public bool TrySeedPrefixFrom(IKvCache source, int rows)
+    {
+        if (source is not CudaKvCache src || ReferenceEquals(src, this)) return false;
+        if (rows <= 0 || rows > src._currentLength || rows > _maxSeqLen) return false;
+        if (src._numLayers != _numLayers || !ReferenceEquals(src._context, _context)) return false;
+        for (int i = 0; i < _numLayers; i++)
+            if (src.Stride(i) != Stride(i)) return false;
+
+        _context?.MakeCurrent();
+        for (int i = 0; i < _numLayers; i++)
+        {
+            nuint bytes = (nuint)((long)rows * Stride(i) * sizeof(ushort));
+            CudaDriverApi.cuMemcpyDtoD_v2(_keys[i], src._keys[i], bytes).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoD_v2(_values[i], src._values[i], bytes).ThrowOnError();
+        }
+        _currentLength = rows;
+        return true;
+    }
 
     // ── IHostStagedKvCache: device↔host staging for cross-device KV handoff ──
     // DownloadLayer reads this cache's FP16 K/V to host (→FP32); UploadLayer converts FP32 host data back

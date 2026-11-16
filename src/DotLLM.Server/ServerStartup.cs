@@ -757,8 +757,13 @@ public static class ServerStartup
 
         // Vulkan (single-request path): the cache a request filled stays resident and a later request adopts its longest common prefix
         // (#1591). Each entry holds a whole device KV allocation, so keep few; the headroom lets the next turn of a conversation fit it.
+        // CUDA dense (--no-paged) caches are retained the same way since #1594, so they get the same cap: under WDDM a card that runs
+        // out of VRAM spills into shared memory instead of failing (#1068). No headroom: a CUDA cache grows by a device-to-device copy
+        // of its rows (TryGrowTo, admitted against free VRAM), which costs milliseconds, so it is sized for the request alone.
+        bool deviceOwnedPrefixKv = vulkanKvFactory is not null
+            || (model is DotLLM.Cuda.CudaTransformerModel && cudaPagedFactory is null);
         PrefixCache? prefixCache = !options.PromptCacheEnabled ? null
-            : vulkanKvFactory is null ? new PrefixCache(options.PromptCacheSize, options.PromptCachePolicy)
+            : !deviceOwnedPrefixKv ? new PrefixCache(options.PromptCacheSize, options.PromptCachePolicy)
             : new PrefixCache(Math.Min(options.PromptCacheSize, VulkanPrefixCacheMaxEntries), options.PromptCachePolicy);
         int prefixCacheHeadroom = vulkanKvFactory is not null && prefixCache is not null ? VulkanPrefixCacheHeadroomTokens : 0;
         if (options.PromptCacheEnabled && options.PromptCachePolicy == PrefixCachePolicy.Agent)
