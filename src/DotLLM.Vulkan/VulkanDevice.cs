@@ -364,6 +364,8 @@ public sealed class VulkanDevice : IDisposable
         DeviceName = name;
         VendorId = vendor;
         DeviceType = type;
+        _allowDeviceLocalFallback = AllowsDeviceLocalFallback(
+            type, Environment.GetEnvironmentVariable(StrictDeviceLocalEnvVar));
         QueueFamilyIndex = queueFamily;
         SubgroupSize = subgroupSize;
         HasSubgroupArithmetic = hasSubgroupArithmetic;
@@ -2085,13 +2087,29 @@ public sealed class VulkanDevice : IDisposable
     /// <summary>VkResult VK_ERROR_OUT_OF_DEVICE_MEMORY.</summary>
     private const int VkErrorOutOfDeviceMemory = -2;
 
+    /// <summary>Environment variable overriding <see cref="AllowsDeviceLocalFallback"/> (issue #1849).</summary>
+    internal const string StrictDeviceLocalEnvVar = "DOTLLM_VULKAN_STRICT_DEVICE_LOCAL";
+
     /// <summary>
-    /// <c>DOTLLM_VULKAN_STRICT_DEVICE_LOCAL=1</c> disables the host-visible fallback
-    /// on device-local allocation failure (an exhausted strict heap then throws, the
-    /// pre-fallback behaviour).
+    /// Host-visible fallback policy for an exhausted device-local heap (issue #1849), as a pure
+    /// function of the device type and the <c>DOTLLM_VULKAN_STRICT_DEVICE_LOCAL</c> value.
+    /// <c>=1</c> forces strict everywhere (an exhausted device-local heap throws);
+    /// <c>=0</c> forces the fallback on everywhere, discrete included. Unset (or any other value):
+    /// discrete GPUs are strict, because spilling weights to host memory over PCIe silently
+    /// cripples throughput and hides an over-committed model; integrated/UMA, virtual and CPU
+    /// devices keep the fallback, since there the host-visible heap is the same DRAM.
     /// </summary>
-    private static readonly bool s_strictDeviceLocal =
-        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_STRICT_DEVICE_LOCAL") == "1";
+    /// <param name="deviceType">The device's <c>VkPhysicalDeviceType</c> value.</param>
+    /// <param name="envValue">The raw <c>DOTLLM_VULKAN_STRICT_DEVICE_LOCAL</c> value, or null.</param>
+    internal static bool AllowsDeviceLocalFallback(int deviceType, string? envValue) => envValue?.Trim() switch
+    {
+        "1" => false,
+        "0" => true,
+        _ => deviceType != VkPhysicalDeviceType.DiscreteGpu,
+    };
+
+    /// <summary>This device's <see cref="AllowsDeviceLocalFallback"/> result, fixed at creation.</summary>
+    private readonly bool _allowDeviceLocalFallback;
 
     private long _deviceLocalFallbacks;
 
@@ -2503,9 +2521,10 @@ public sealed class VulkanDevice : IDisposable
             // HOST_VISIBLE type, then plain host-visible — the llama.cpp
             // GGML_VK_ALLOW_SYSMEM_FALLBACK equivalent. On UMA parts the fallback reads
             // the same DRAM; on discrete GPUs it is slower than VRAM but beats an OOM
-            // crash. Opt out with DOTLLM_VULKAN_STRICT_DEVICE_LOCAL=1; occurrences are
+            // crash. Discrete GPUs refuse by default (#1849); see AllowsDeviceLocalFallback
+            // for the DOTLLM_VULKAN_STRICT_DEVICE_LOCAL overrides. Occurrences are
             // counted in DeviceLocalFallbackCount for harness reporting.
-            if (allocResult == VkErrorOutOfDeviceMemory && deviceLocal && !s_strictDeviceLocal)
+            if (allocResult == VkErrorOutOfDeviceMemory && deviceLocal && _allowDeviceLocalFallback)
             {
                 // Heap-aware: on AMD APUs the FIRST type matching a fallback flag combo can
                 // sit on the same exhausted carve-out heap as the failed type, so ranking by
@@ -2567,7 +2586,10 @@ public sealed class VulkanDevice : IDisposable
                 $"vkAllocateMemory ({bytes} bytes{(IsTransientMemoryResult(allocResult) ? $", {s_memRetries} retries exhausted" : "")}" +
                 $"; memoryTypeIndex={preferredTypeIndex} flags=0x{chosenFlags:X} heapIndex={chosenHeap} " +
                 $"heapSize={heapSize / (1024 * 1024)} MiB; typeBits=0x{req.memoryTypeBits:X}" +
-                $"; live: {MemorySnapshot()}){OtherProcessOomHint(allocResult)}");
+                $"; live: {MemorySnapshot()}){OtherProcessOomHint(allocResult)}" +
+                (allocResult == VkErrorOutOfDeviceMemory && deviceLocal && !_allowDeviceLocalFallback
+                    ? $" Host-visible fallback is disabled on this device (#1849); set {StrictDeviceLocalEnvVar}=0 to spill to system memory instead."
+                    : ""));
         }
 
         int bindResult = VulkanApi.vkBindBufferMemory(_device, buffer, memory, 0);

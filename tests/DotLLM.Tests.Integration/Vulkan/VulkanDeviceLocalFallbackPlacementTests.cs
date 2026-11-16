@@ -25,6 +25,19 @@ public sealed class VulkanDeviceLocalFallbackPlacementTests(ITestOutputHelper ou
     private static void SkipIfVulkanNotServable() =>
         Skip.If(!DeviceEndpoint.Describe().Backends!.Any(b => b.Name == "vulkan" && b.Servable), "Vulkan is not servable on this machine.");
 
+    /// <summary>
+    /// Discrete GPUs refuse the fallback by default (#1849); arms that exercise the fallback itself opt back in with
+    /// <c>DOTLLM_VULKAN_STRICT_DEVICE_LOCAL=0</c> before the device is created (the policy is fixed at creation).
+    /// </summary>
+    private static IDisposable ForceFallbackOn()
+    {
+        string? saved = Environment.GetEnvironmentVariable(VulkanDevice.StrictDeviceLocalEnvVar);
+        Environment.SetEnvironmentVariable(VulkanDevice.StrictDeviceLocalEnvVar, "0");
+        return new Restore(() => Environment.SetEnvironmentVariable(VulkanDevice.StrictDeviceLocalEnvVar, saved));
+    }
+
+    private sealed class Restore(Action a) : IDisposable { public void Dispose() => a(); }
+
     private static int HeapHolding(VulkanDevice d, long minBytes, int exceptHeap = -1)
     {
         for (int h = 0; h < 16; h++)
@@ -71,6 +84,7 @@ public sealed class VulkanDeviceLocalFallbackPlacementTests(ITestOutputHelper ou
     {
         const int steps = 8;
         Environment.SetEnvironmentVariable(DeviceMemoryBudget.SimulatedBudgetEnvVar, budgetMib?.ToString());
+        using var fallbackOn = ForceFallbackOn();
         try
         {
             using var gguf = GgufFile.Open(path);
@@ -125,6 +139,7 @@ public sealed class VulkanDeviceLocalFallbackPlacementTests(ITestOutputHelper ou
     public void ForcedExhaustion_OverflowLandsOnADifferentHeap_AndIsAccountedAsFallback()
     {
         SkipIfVulkanNotServable();
+        using var fallbackOn = ForceFallbackOn();
         using var dev = VulkanDevice.Create();
         dev.SetDeviceLocalLimitBytes(48 * MiB);
         using var first = dev.AllocateDeviceLocal(32 * MiB);              // fits under the limit: preferred heap
@@ -142,5 +157,40 @@ public sealed class VulkanDeviceLocalFallbackPlacementTests(ITestOutputHelper ou
         Assert.True(dev.FallbackBytesOnHeap(fb) >= 64 * MiB);
         Assert.Equal(0, dev.FallbackBytesOnHeap(preferred));
         Assert.True(dev.LiveBytesOnHeap(preferred) is >= 32 * MiB and < 64 * MiB, "preferred heap keeps only the first buffer");
+    }
+
+    /// <summary>
+    /// #1849: with no override, a forced device-local exhaustion THROWS on a discrete GPU (no host-visible spill) and still
+    /// falls back on an integrated/UMA device. The same arm runs on both kinds of hardware and asserts the branch that applies.
+    /// </summary>
+    [SkippableFact]
+    public void DefaultPolicy_DiscreteRefusesFallback_IntegratedKeepsIt()
+    {
+        SkipIfVulkanNotServable();
+        string? saved = Environment.GetEnvironmentVariable(VulkanDevice.StrictDeviceLocalEnvVar);
+        Environment.SetEnvironmentVariable(VulkanDevice.StrictDeviceLocalEnvVar, null);
+        try
+        {
+            using var dev = VulkanDevice.Create();
+            dev.SetDeviceLocalLimitBytes(48 * MiB);
+            using var first = dev.AllocateDeviceLocal(32 * MiB);
+            output.WriteLine($"device type {dev.DeviceType} ({dev.DeviceName})");
+            if (dev.DeviceType == 2) // VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+            {
+                var ex = Assert.ThrowsAny<Exception>(() => dev.AllocateDeviceLocal(32 * MiB));
+                output.WriteLine(ex.Message);
+                Assert.Contains(VulkanDevice.StrictDeviceLocalEnvVar, ex.Message);
+                Assert.Equal(0, dev.DeviceLocalFallbackCount);
+            }
+            else
+            {
+                using var second = dev.AllocateDeviceLocal(32 * MiB);
+                Assert.True(dev.DeviceLocalFallbackCount > 0, "integrated/UMA devices keep the host-visible fallback");
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(VulkanDevice.StrictDeviceLocalEnvVar, saved);
+        }
     }
 }
