@@ -149,6 +149,13 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <summary>Whether the WDDM spill monitor is attached (tests; #1834).</summary>
     internal bool HasSpillMonitor => _spillMonitor is not null;
 
+    /// <summary>Whether a cold square-causal prefill of <paramref name="seqLen"/> rows may take G3 on this model (tests; #1848).</summary>
+    internal bool G3CanUse(int seqLen)
+        => _g3Attention.CanUse(seqLen, seqLen, 0, Config.SlidingWindowSize ?? 0, Config.NumAttentionHeads, Config.NumKvHeads);
+
+    /// <summary>Score elements the G3 scratch holds now (tests; #1848).</summary>
+    internal long G3ScratchElems => _g3Attention.PlaneElems;
+
     /// <inheritdoc/>
     public long ComputeMemoryBytes => _state.AllocatedBytes;
 
