@@ -1613,6 +1613,11 @@ public sealed unsafe class CudaTransformerModel : IModel
                         && _g3Attention.CanUse(seqLen, seqKv, positionOffset, slidingWindow, numHeads, numKvHeads))
                         _g3Attention.Run(_cublas.Handle, qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, numHeads, numKvHeads, headDim, s);
+                    // Prefill over a cached prefix (prefix-cache hit, #1594): G3 with the query rows offset into the cache.
+                    else if (layerSinks == 0
+                        && _g3Attention.CanUseOffset(seqLen, seqKv, positionOffset, slidingWindow, numHeads, numKvHeads))
+                        _g3Attention.RunOffset(_cublas.Handle, qPtr, kBuf, vBuf, _state.AttnOutput,
+                            seqLen, positionOffset, numHeads, numKvHeads, headDim, s);
                     else
                         _kernels.LaunchAttention(qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, seqKv, numHeads, numKvHeads, headDim,

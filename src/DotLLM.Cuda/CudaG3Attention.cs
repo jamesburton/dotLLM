@@ -178,6 +178,112 @@ internal sealed class CudaG3Attention : IDisposable
         }
     }
 
+    /// <summary>
+    /// Least query rows for the offset path (#1594). Below it (speculative / MTP verify rows, single-token decode) the
+    /// fused <c>attention_f16</c> is cheaper than two cuBLAS GEMMs plus a softmax, and those paths keep their numerics.
+    /// </summary>
+    internal const int OffsetMinQueryRows = 32;
+
+    /// <summary>
+    /// Score elements (query heads x query rows x keys) one offset-path chunk may hold (#1594). The suffix is processed in
+    /// query-row chunks under this bound, so a long cached prefix never sizes the scratch to heads x suffix x context
+    /// (6 bytes per element: FP32 scores + FP16 probs; 64M elements = 384 MiB).
+    /// </summary>
+    internal static long OffsetMaxScoreElems { get; set; } = DefaultOffsetMaxScoreElems;
+
+    /// <summary>Default <see cref="OffsetMaxScoreElems"/>.</summary>
+    internal const long DefaultOffsetMaxScoreElems = 64L << 20;
+
+    /// <summary>
+    /// True when the G3 offset path may run: queries <c>[positionOffset, positionOffset + seqLen)</c> attending the whole
+    /// cached history (<c>seqKv == positionOffset + seqLen</c>), at least <see cref="OffsetMinQueryRows"/> rows, global
+    /// attention, GQA dividing evenly, and the offset softmax loaded. This is the prefill of a prefix-cache hit (#1594):
+    /// before it, those prefills fell to <c>attention_f16</c>, which ran a 647-token suffix over a 4K-token TwIL-8B prefix
+    /// 2.5x slower than G3 prefilled the whole 4.7K-token prompt cold.
+    /// </summary>
+    internal bool CanUseOffset(int seqLen, int seqKv, int positionOffset, int slidingWindow, int numHeads, int numKvHeads)
+        => Enabled
+        && _kernels.HasAttentionSoftmaxCausalOffsetF32In
+        && seqLen >= OffsetMinQueryRows
+        && positionOffset > 0
+        && seqKv == positionOffset + seqLen
+        && slidingWindow <= 0
+        && numKvHeads > 0
+        && (numHeads % numKvHeads) == 0;
+
+    /// <summary>Calls of <see cref="RunOffset"/>, process-wide (test observable: proves the offset path ran).</summary>
+    internal static long OffsetRunCount => Interlocked.Read(ref s_offsetRuns);
+    private static long s_offsetRuns;
+
+    /// <summary>
+    /// G3 attention for queries that start <paramref name="positionOffset"/> rows into the cache: per query-row chunk,
+    /// QK^T over the keys that chunk can see (<c>[chunk x (offset + chunkEnd)]</c>, FP32), the offset causal softmax, and P.V
+    /// written row-major into <paramref name="output"/>. <paramref name="q"/> and <paramref name="output"/> hold the
+    /// <paramref name="seqLen"/> new rows; <paramref name="k"/>/<paramref name="v"/> are the cache from row 0. Caller must have
+    /// confirmed <see cref="CanUseOffset"/>.
+    /// </summary>
+    internal unsafe void RunOffset(nint cublasHandle, nint q, nint k, nint v, nint output,
+                                   int seqLen, int positionOffset, int numHeads, int numKvHeads, int headDim, nint stream)
+    {
+        int group = numHeads / numKvHeads;
+        int qStride = numHeads * headDim;
+        int kvStride = numKvHeads * headDim;
+        float scale = 1.0f / MathF.Sqrt(headDim);
+        float one = 1.0f, zero = 0.0f, sc = scale;
+
+        Interlocked.Increment(ref s_offsetRuns);
+        long perRow = (long)numHeads * (positionOffset + seqLen);
+        int chunk = (int)Math.Clamp(OffsetMaxScoreElems / Math.Max(1, perRow), 1, seqLen);
+        EnsureScratch((long)numHeads * chunk * (positionOffset + seqLen));
+
+        for (int c0 = 0; c0 < seqLen; c0 += chunk)
+        {
+            int sq = Math.Min(chunk, seqLen - c0);
+            int off = positionOffset + c0;
+            int skv = off + sq;   // keys this chunk can see
+            nint qc = q + (nint)((long)c0 * qStride * Fp16Size);
+            nint oc = output + (nint)((long)c0 * qStride * Fp16Size);
+
+            // QK^T -> FP32 scores, col-major [sq x skv] per query head (ldc = sq).
+            for (int h = 0; h < numKvHeads; h++)
+            {
+                nint qBase = qc + (nint)((long)h * group * headDim * Fp16Size);
+                nint kBase = k + (nint)((long)h * headDim * Fp16Size);
+                nint scBase = _scoresF32 + (nint)((long)h * group * sq * skv * Fp32Size);
+                CublasApi.cublasGemmStridedBatchedEx(cublasHandle,
+                    CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+                    sq, skv, headDim,
+                    (nint)(&sc),
+                    qBase, CublasApi.CUDA_R_16F, qStride, headDim,
+                    kBase, CublasApi.CUDA_R_16F, kvStride, 0,
+                    (nint)(&zero),
+                    scBase, CublasApi.CUDA_R_32F, sq, (long)sq * skv,
+                    group, CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT)
+                    .ThrowOnCublasError();
+            }
+
+            _kernels.LaunchAttentionSoftmaxCausalOffsetF32In(_scoresF32, _probsF16, sq, skv, off, numHeads, stream);
+
+            // P.V: out^T[d, tq] = sum_tk V[tk, d] * probs[tq, tk]; m = headDim, n = sq, k = skv.
+            for (int h = 0; h < numKvHeads; h++)
+            {
+                nint vBase = v + (nint)((long)h * headDim * Fp16Size);
+                nint pBase = _probsF16 + (nint)((long)h * group * sq * skv * Fp16Size);
+                nint oBase = oc + (nint)((long)h * group * headDim * Fp16Size);
+                CublasApi.cublasGemmStridedBatchedEx(cublasHandle,
+                    CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_T,
+                    headDim, sq, skv,
+                    (nint)(&one),
+                    vBase, CublasApi.CUDA_R_16F, kvStride, 0,
+                    pBase, CublasApi.CUDA_R_16F, sq, (long)sq * skv,
+                    (nint)(&zero),
+                    oBase, CublasApi.CUDA_R_16F, numHeads * headDim, headDim,
+                    group, CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT)
+                    .ThrowOnCublasError();
+            }
+        }
+    }
+
     private void EnsureScratch(long elems)
     {
         if (elems <= _planeElems) return;

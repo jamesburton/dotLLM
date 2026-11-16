@@ -110,6 +110,7 @@ public sealed class CudaPrefixReuseTests
         using var growCache = new PrefixCache(2);
         var grown = new TextGenerator(model, tokenizer, factory, growCache, mtpEnabled: false, prefixCacheHeadroomTokens: 0);
         Assert.Equal(turn1.GeneratedTokenIds, grown.Generate(Turn1(), opts).GeneratedTokenIds);
+        long offsetRunsBefore = CudaG3Attention.OffsetRunCount;
         long growthsBefore = CudaKvGrowth.GrowthCount;
         int capturesBefore = model.GraphCaptureCount, replaysBefore = model.GraphReplayCount;
         var actual = grown.Generate(t2, opts);
@@ -120,6 +121,8 @@ public sealed class CudaPrefixReuseTests
         Assert.True(actual.Timings.CachedTokenCount > 0, "expected a prefix hit");
         Assert.True(actual.Timings.CachedTokenCount <= common, "cached more rows than the prompts share");
         Assert.True(growths >= 1, "turn 2 should have grown the retained cache");
+        if (CudaG3Attention.Enabled)   // GeForce Ampere default: the suffix prefill must take the G3 offset path, not attention_f16
+            Assert.True(CudaG3Attention.OffsetRunCount > offsetRunsBefore, "the reused prefill did not run G3 with a position offset");
         if (kvType == "f16" && model.UseGraphCapture)
         {
             // Decode after the growth must recapture against the new buffers and then replay (not silently fall back to eager).

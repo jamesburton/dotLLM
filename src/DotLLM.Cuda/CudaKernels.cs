@@ -570,6 +570,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
     // FP32-scores variant: reads FP32 QK scores, writes FP16 probs to a separate buffer.
     // Removes the dominant precision loss of rounding pre-softmax scores to FP16 (G3 e2e).
     private readonly nint _attentionSoftmaxCausalCoalescedF32InFunc;
+    // Offset variant (#1594): [sq x skv] planes, query rows starting `offset` positions into the cache (prefix-cache hit).
+    private readonly CudaModule? _attentionSoftmaxCausalOffsetModule;
+    private readonly nint _attentionSoftmaxCausalOffsetF32InFunc;
 
     // Hand-fused FP16 tensor-core (mma.sync) flash-attention prefill kernel — keeps the
     // s x s scores in shared/registers, never materialising them to global memory.
@@ -1421,6 +1424,14 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _attentionSoftmaxCausalCoalescedF32InFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_coalesced_f32in_f16out");
         }
 
+        // Offset causal softmax for G3 over a cached prefix (#1594). Optional, like the module above.
+        string attentionSoftmaxCausalOffsetPath = Path.Combine(ptxDir, "attention_softmax_causal_offset.ptx");
+        if (File.Exists(attentionSoftmaxCausalOffsetPath))
+        {
+            _attentionSoftmaxCausalOffsetModule = CudaModule.LoadFromFile(attentionSoftmaxCausalOffsetPath);
+            _attentionSoftmaxCausalOffsetF32InFunc = _attentionSoftmaxCausalOffsetModule.TryGetFunction("attention_softmax_causal_offset_f32in_f16out");
+        }
+
         // Hand-fused mma.sync flash-attention prefill kernel (G-flash). Optional, and the
         // ONLY module compiled to compute_86 (mma.sync.m16n8k16 is sm_80+). On a pre-Ampere
         // GPU (e.g. Turing sm_75) the driver cannot JIT this PTX: cuModuleLoadData JITs
@@ -1716,6 +1727,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// pre-softmax scores at realistic activation magnitudes.
     /// </summary>
     public bool HasAttentionSoftmaxCausalCoalescedF32In => _attentionSoftmaxCausalCoalescedF32InFunc != 0;
+
+    /// <summary>True when the offset causal softmax (<c>attention_softmax_causal_offset_f32in_f16out</c>, #1594) is loaded.</summary>
+    public bool HasAttentionSoftmaxCausalOffsetF32In => _attentionSoftmaxCausalOffsetF32InFunc != 0;
 
     /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
     public bool HasMlaAttentionKernel => _attentionMlaF32Func != 0;
@@ -4778,6 +4792,31 @@ public sealed unsafe partial class CudaKernels : IDisposable
                     (uint)numBlocks, 1, 1, BlockSize, 1, 1,
                     0, stream, (nint)args, 0).ThrowOnError();
         }
+    }
+
+    /// <summary>
+    /// Launches the offset causal softmax (#1594): FP32 QK <paramref name="scores"/> per head col-major [sq × skv], query row
+    /// tq at absolute position <paramref name="offset"/> + tq attending keys 0..offset+tq; normalized FP16 probs into
+    /// <paramref name="probs"/> with the same layout, masked tail zeroed. Coalesced one-thread-per-row.
+    /// </summary>
+    /// <param name="scores">Device pointer to FP32 QK scores ([numHeads × sq × skv]).</param>
+    /// <param name="probs">Device pointer to FP16 output probs ([numHeads × sq × skv]).</param>
+    /// <param name="sq">Query rows.</param>
+    /// <param name="skv">Key rows (the cached prefix plus the query rows).</param>
+    /// <param name="offset">Absolute position of query row 0.</param>
+    /// <param name="numHeads">Number of query heads (score planes).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchAttentionSoftmaxCausalOffsetF32In(nint scores, nint probs, int sq, int skv, int offset, int numHeads, nint stream)
+    {
+        nint scoresArg = scores, probsArg = probs;
+        int sqArg = sq, skvArg = skv, offArg = offset, nhArg = numHeads;
+        void** args = stackalloc void*[] {&scoresArg, &probsArg, &sqArg, &skvArg, &offArg, &nhArg};
+
+        int totalRows = numHeads * sq;
+        uint gridDim = (uint)((totalRows + BlockSize - 1) / BlockSize);
+        CudaDriverApi.cuLaunchKernel(_attentionSoftmaxCausalOffsetF32InFunc,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>
@@ -8279,6 +8318,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
+        _attentionSoftmaxCausalOffsetModule?.Dispose();
         _rmsnormModule.Dispose();
         _ropeModule.Dispose();
         _swigluModule.Dispose();
