@@ -126,7 +126,7 @@ public sealed class CudaPrefixReuseTests
         Assert.True(actual.Timings.CachedTokenCount > 0, "expected a prefix hit");
         Assert.True(actual.Timings.CachedTokenCount <= common, "cached more rows than the prompts share");
         Assert.True(growths >= 1, "turn 2 should have grown the retained cache");
-        if (CudaG3Attention.Enabled)   // GeForce Ampere default: the suffix prefill must take the G3 offset path, not attention_f16
+        if (kvType == "f16" && CudaG3Attention.Enabled)   // GeForce Ampere default: the F16 suffix prefill must take the G3 offset path
             Assert.True(CudaG3Attention.OffsetRunCount > offsetRunsBefore, "the reused prefill did not run G3 with a position offset");
         if (kvType == "f16" && model.UseGraphCapture)
         {

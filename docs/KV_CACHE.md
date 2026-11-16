@@ -152,7 +152,11 @@ the context window. On success it prefills only the suffix. A refusal is logged 
     replay), so the old `WasRolledBack` throw, which would have failed the first decode of every reused turn, is gone.
   - With a mixed-precision window (`CudaQuantizedKvCache`, window > 0) a cut must stay at or above the evicted rows: the ring no
     longer holds the rows below them (`CanTruncate`). Serve's default window is 0. Seeding refuses a windowed cache.
-  - `CudaPagedKvCache` is not reusable yet (falls to a miss); block-level reuse is a follow-up.
+  - The suffix prefill runs at a position offset. G3 and flash refuse that, and `attention_f16` ran a 442-token suffix over a
+    2,965-token TwIL-8B prefix slower than the whole prompt cold. `CudaG3Attention.RunOffset` (offset causal softmax over
+    `[sq x skv]` planes, chunked by query rows to 64M score elements) serves the dense F16 cache from 32 query rows.
+    `DOTLLM_CUDA_G3_OFFSET=0` turns it off. q8_0 stays on `attention_f16` until #1846 is understood.
+  - `CudaPagedKvCache` is not reusable yet (falls to a miss); block-level reuse is #1843.
   - Tests: `CudaPrefixReuseTests` (two-turn TextGenerator on Qwen2.5-0.5B, f16 and q8_0: tokens equal cold, logprobs bit-identical to
     an ungrown warm run, refused admission misses; seed and grow are bit-identical to a rollback), `CudaKvGrowthLogicTests`.
 - **No growth path.**

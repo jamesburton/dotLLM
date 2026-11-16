@@ -1593,7 +1593,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                 // pure square-causal global-attention prefill on an eligible device;
                 // otherwise the FP32 CUDA-core attention_f16. Same Q/K/V FP16 buffers and
                 // same row-major [seq, heads, headDim] output either way.
-                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset)
+                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset, bool offsetG3 = false)
                 {
                     // Long-context prefill on GeForce Ampere → G-flash (fused mma.sync, fewer
                     // FLOPs + no score round-trip). Shorter prefill on Ampere → G3 (cuBLAS+
@@ -1614,7 +1614,9 @@ public sealed unsafe class CudaTransformerModel : IModel
                         _g3Attention.Run(_cublas.Handle, qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, numHeads, numKvHeads, headDim, s);
                     // Prefill over a cached prefix (prefix-cache hit, #1594): G3 with the query rows offset into the cache.
-                    else if (layerSinks == 0
+                    // Only the dense F16 cache opts in (offsetG3): over the q8_0 dequant scratch it moved Qwen2.5-0.5B's
+                    // first-token logprob 0.055 nats from cold against attention_f16's 0.015, cause not yet found (#1846).
+                    else if (layerSinks == 0 && offsetG3
                         && _g3Attention.CanUseOffset(seqLen, seqKv, positionOffset, slidingWindow, numHeads, numKvHeads))
                         _g3Attention.RunOffset(_cublas.Handle, qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, positionOffset, numHeads, numKvHeads, headDim, s);
@@ -1653,7 +1655,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                     MarkProfile(ProfileCategory.KvUpdate);
 
                     DispatchAttention(cudaKvCache.GetKeysPtr(layer), cudaKvCache.GetValuesPtr(layer),
-                        seqKv, positions[0]);
+                        seqKv, positions[0], offsetG3: true);
                 }
                 else if (kvCache is CudaPagedKvCache cudaPagedKvCache)
                 {
