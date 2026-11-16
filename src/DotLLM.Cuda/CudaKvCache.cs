@@ -90,12 +90,31 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
         // Bind the target device before allocating so the buffers land on this cache's GPU.
         _context?.MakeCurrent();
 
+        // #1848: admitted against free VRAM before anything is allocated. Under WDDM a cache past dedicated VRAM is not refused by
+        // the driver, it lands in shared system memory and every attention read crosses PCIe. The refusal names the remedies; the
+        // engine evicts retained prefix entries and retries before it gives up (TextGenerator.AllocateKvCache).
+        CudaAdmission.EnsureFits($"KV cache (f16) for {maxSeqLen} tokens", DeviceBytes(geometry, maxSeqLen));
+
         for (int i = 0; i < _numLayers; i++)
         {
             long bytesPerLayer = (long)maxSeqLen * geometry.KvStrideOf(i) * sizeof(ushort); // FP16
             CudaDriverApi.cuMemAlloc_v2(out _keys[i], (nuint)bytesPerLayer).ThrowOnError();
             CudaDriverApi.cuMemAlloc_v2(out _values[i], (nuint)bytesPerLayer).ThrowOnError();
         }
+    }
+
+    /// <summary>
+    /// Device bytes a cache of <paramref name="maxSeqLen"/> positions allocates (#1848): FP16 K and V rows for every layer.
+    /// </summary>
+    /// <param name="geometry">Per-layer KV row widths.</param>
+    /// <param name="maxSeqLen">Positions.</param>
+    /// <returns>Bytes.</returns>
+    internal static long DeviceBytes(KvGeometry geometry, int maxSeqLen)
+    {
+        long bytes = 0;
+        for (int i = 0; i < geometry.LayerCount; i++)
+            bytes += 2L * maxSeqLen * geometry.KvStrideOf(i) * sizeof(ushort);
+        return bytes;
     }
 
     /// <summary>

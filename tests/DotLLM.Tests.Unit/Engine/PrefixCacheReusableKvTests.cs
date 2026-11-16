@@ -314,4 +314,75 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
         Assert.Equal(0, warm.Timings.CachedTokenCount);
         Assert.Equal(Cold(Fork(12)).GeneratedTokenIds, warm.GeneratedTokenIds);
     }
+
+    /// <summary>
+    /// A factory standing in for a device whose free memory holds <paramref name="room"/> live caches (#1848): one more is refused
+    /// with <see cref="DeviceMemoryAdmissionException"/>, as the CUDA KV cache constructors refuse past free VRAM.
+    /// </summary>
+    private (TextGenerator Gen, PrefixCache Prefix, List<ReusableKv> Caches) MakeAdmitting(int room, int entries = 2)
+    {
+        var caches = new List<ReusableKv>();
+        var prefix = new PrefixCache(entries);
+        var gen = new TextGenerator(_tiny.Model, new Tok(TinyQwen.Vocab),
+            kvCacheFactory: (c, size) =>
+            {
+                if (caches.Count(k => !k.Disposed) >= room)
+                    throw new DeviceMemoryAdmissionException("Not enough free GPU memory for the KV cache (test)");
+                var k = new ReusableKv(new SimpleKvCache(KvGeometry.FromConfig(c, false), size), exclusive: true, canTruncate: true);
+                caches.Add(k);
+                return k;
+            },
+            prefixCache: prefix, prefillChunkSize: 4);
+        return (gen, prefix, caches);
+    }
+
+    [Fact]
+    public void RefusedMissAllocation_EvictsTheRetainedEntry_AndRetries()
+    {
+        // #1848: a miss allocates a whole new cache beside the retained one; on a card with room for one, the retained entry is
+        // evicted and the allocation retried, instead of the refusal failing the request (or the cache spilling).
+        var (gen, prefix, caches) = MakeAdmitting(room: 1);
+        using var _ = prefix;
+        gen.Generate(Text(A), Opts());
+        Assert.Equal(1, prefix.EntryCount);
+
+        int[] unrelated = Ids(20, 41);
+        var warm = gen.Generate(Text(unrelated), Opts());
+
+        Assert.True(caches[0].Disposed);
+        Assert.Equal(1, prefix.AdmissionEvictions);
+        Assert.Equal(Cold(unrelated).GeneratedTokenIds, warm.GeneratedTokenIds);
+        Assert.Equal(1, prefix.EntryCount);   // the new request's cache is retained in its place
+    }
+
+    [Fact]
+    public void RefusedMissAllocation_WithNothingLeftToEvict_ReachesTheCaller()
+    {
+        var (gen, prefix, _) = MakeAdmitting(room: 0);
+        using var __ = prefix;
+        var ex = Assert.Throws<DeviceMemoryAdmissionException>(() => gen.Generate(Text(A), Opts()));
+        Assert.Contains("Not enough free GPU memory", ex.Message);
+        Assert.Equal(0, prefix.AdmissionEvictions);
+    }
+
+    [Fact]
+    public void EvictForAdmission_TakesTheProtectedEntryLast()
+    {
+        // #1848: the protected entry a miss seeds from (#1780) goes only when nothing else is left. k1 is stored first, so it is the
+        // LRU victim a keep-blind eviction would pick.
+        using var prefix = new PrefixCache(4);
+        var k1 = new ReusableKv(new SimpleKvCache(KvGeometry.FromConfig(_tiny.Model.Config, false), 32), true, true);
+        var k2 = new ReusableKv(new SimpleKvCache(KvGeometry.FromConfig(_tiny.Model.Config, false), 32), true, true);
+        prefix.Store(Ids(8, 1), k1);
+        prefix.Store(Ids(8, 2), k2);
+        var keep = prefix.Entries.Single(e => ReferenceEquals(e.KvCache, k1));
+
+        Assert.Same(k2, prefix.EvictForAdmission(keep)!.KvCache);
+        Assert.True(k2.Disposed);
+        Assert.False(k1.Disposed);
+        Assert.Same(k1, prefix.EvictForAdmission(keep)!.KvCache);
+        Assert.True(k1.Disposed);
+        Assert.Null(prefix.EvictForAdmission(keep));
+        Assert.Equal(2, prefix.AdmissionEvictions);
+    }
 }

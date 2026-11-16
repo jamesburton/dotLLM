@@ -118,6 +118,9 @@ public sealed class CudaMlaKvCache : IDisposable
         long kBytes = (long)maxSeqLen * numHeads * qkNopeHeadDim * _elementSize;
         long vBytes = (long)maxSeqLen * numHeads * vHeadDim * _elementSize;
         long kPeBytes = (long)maxSeqLen * qkRopeHeadDim * _elementSize;
+        // #1848: admitted against free VRAM before anything is allocated (WDDM spills an over-commit into shared memory).
+        CudaAdmission.EnsureFits($"MLA KV cache ({precision.ToString().ToLowerInvariant()}) for {maxSeqLen} tokens",
+            numLayers * (kBytes + vBytes + kPeBytes));
         for (int i = 0; i < numLayers; i++)
         {
             CudaDriverApi.cuMemAlloc_v2(out _kNope[i], (nuint)kBytes).ThrowOnError();

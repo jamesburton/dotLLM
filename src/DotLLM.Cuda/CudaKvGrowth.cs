@@ -28,9 +28,8 @@ internal static class CudaKvGrowth
 
     internal static void RecordGrowth() => Interlocked.Increment(ref s_growths);
 
-    /// <summary>Free VRAM a growth must leave untouched (<see cref="DeviceMemoryBudget.ReserveEnvVar"/>).</summary>
-    internal static long ReserveBytes =>
-        DeviceMemoryBudget.ResolveReserveBytes(Environment.GetEnvironmentVariable(DeviceMemoryBudget.ReserveEnvVar));
+    /// <summary>Free VRAM a growth must leave untouched (<see cref="CudaAdmission.ReserveBytes"/>).</summary>
+    internal static long ReserveBytes => CudaAdmission.ReserveBytes;
 
     /// <summary>
     /// Peak extra device bytes of a layer-by-layer copying growth from <paramref name="oldLength"/> to
@@ -53,25 +52,13 @@ internal static class CudaKvGrowth
 
     /// <summary>
     /// True when <paramref name="bytes"/> more can be allocated on the current context's device leaving <see cref="ReserveBytes"/>
-    /// free. Reads <c>cuMemGetInfo</c> (already clamped by <see cref="DeviceMemoryBudget.SimulatedBudgetEnvVar"/>). A failed reading
-    /// refuses: no reading, no growth, and the caller falls back to a miss.
+    /// free, through <see cref="CudaAdmission.TryFit"/>. A failed reading refuses: no reading, no growth, and the caller falls back
+    /// to a miss.
     /// </summary>
     internal static bool Admit(long bytes)
     {
-        bool ok;
-        if (AdmissionOverride is { } admit) ok = admit(bytes);
-        else
-        {
-            try
-            {
-                ok = CudaDriverApi.cuMemGetInfo_v2(out nuint free, out _) == 0
-                     && DeviceMemoryBudget.Fits((long)free, bytes, ReserveBytes);
-            }
-            catch (Exception e) when (e is not OutOfMemoryException)
-            {
-                ok = false;
-            }
-        }
+        // #1848: one admission path for every CUDA allocation (CudaAdmission); the bool hook stays for the #1847 tests.
+        bool ok = AdmissionOverride is { } admit ? admit(bytes) : CudaAdmission.TryFit(bytes, out _);
         if (!ok) Interlocked.Increment(ref s_refusals);
         return ok;
     }

@@ -631,6 +631,7 @@ public sealed class ServerState : IDisposable
             BusyElapsedSeconds = heldSince is { } s ? Math.Round((now - s).TotalSeconds, 1) : null,
             WaitingRequests = Volatile.Read(ref _gateWaiters),
             Device = ready ? ActiveDevice : null,
+            NCtx = ready ? Config?.MaxSequenceLength : null,
             DeviceFallback = ready ? DeviceFallbackWarning is not null : null,
             DeviceFallbackReason = ready ? DeviceFallbackWarning : null,
             PrefillTokensDone = first?.PrefillTokensDone,

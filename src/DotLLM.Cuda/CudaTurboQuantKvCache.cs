@@ -85,6 +85,10 @@ public sealed class CudaTurboQuantKvCache : IKvCache, IPerLayerKvCache
         nuint normBytesPerLayer = (nuint)((long)maxSeqLen * numKvHeads * sizeof(float));
         nuint scratchBytes = (nuint)((long)maxSeqLen * _stride * sizeof(ushort)); // half
 
+        // #1848: admitted against free VRAM before anything is allocated (WDDM spills an over-commit into shared memory).
+        CudaAdmission.EnsureFits($"KV cache (tq{mseBits}) for {maxSeqLen} tokens",
+            (long)numLayers * 2 * ((long)codeBytesPerLayer + (long)normBytesPerLayer) + 2L * (long)scratchBytes);
+
         _keyCodes = new nint[numLayers];
         _valueCodes = new nint[numLayers];
         _keyNorms = new nint[numLayers];

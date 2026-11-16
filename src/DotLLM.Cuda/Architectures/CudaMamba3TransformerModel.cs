@@ -57,6 +57,13 @@ namespace DotLLM.Cuda.Architectures;
 /// </remarks>
 public sealed unsafe class CudaMamba3TransformerModel : IModel
 {
+    // #1848 / #1834: WDDM sysmem-fallback detector for this CUDA host. Created with the model object (baseline: this process's shared usage then,
+    // so later growth past dedicated VRAM warns); polls in the background, never on the inference thread. No-op off Windows.
+    private readonly GpuSpillMonitor _spillMonitor = new(() => "CudaMamba3TransformerModel");
+
+    /// <summary>Whether the WDDM spill monitor is attached (tests; #1848).</summary>
+    internal bool HasSpillMonitor => _spillMonitor is not null;
+
     private readonly CudaContext _context;
     private readonly CudaStream _stream;
     private readonly CudaCublasHandle _cublas;
@@ -1115,6 +1122,7 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _spillMonitor.Dispose();
         if (_disposed) return;
         _disposed = true;
         _context.MakeCurrent();

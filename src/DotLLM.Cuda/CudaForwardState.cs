@@ -83,7 +83,7 @@ internal sealed class CudaForwardState : IDisposable
 
     /// <summary>FP16 dequant target for the largest projection, allocated on first use.</summary>
     public nint DequantScratch => _dequantScratch != 0 ? _dequantScratch
-        : _dequantScratch = AllocDeviceAnyCapture(_maxProjectionElements * sizeof(ushort));
+        : _dequantScratch = AllocDeviceAnyCapture(_maxProjectionElements * sizeof(ushort), "FP16 weight dequant scratch");
 
     /// <summary>
     /// Bytes the lazily allocated dequant scratch will still take on first use (#1833): the FP16 target, plus the F32 one when
@@ -120,7 +120,7 @@ internal sealed class CudaForwardState : IDisposable
 
     /// <summary>F32 dequant / norm-weight target for the largest projection, allocated on first use.</summary>
     public nint DequantScratchF32 => _dequantScratchF32 != 0 ? _dequantScratchF32
-        : _dequantScratchF32 = AllocDeviceAnyCapture(_maxProjectionElements * sizeof(float));
+        : _dequantScratchF32 = AllocDeviceAnyCapture(_maxProjectionElements * sizeof(float), "F32 weight dequant scratch");
 
     // Pre-Q8_1 input quantization scratch (single buffer per forward state, sized
     // for the largest GEMV input vector across all call sites in the model).
@@ -147,7 +147,8 @@ internal sealed class CudaForwardState : IDisposable
 
     /// <summary>Batched pre-Q8_1 scratch for the rows4 multi-column GEMVs, allocated on first use (#1316/#1375).</summary>
     public nint KQuantMultiScratch => _kquantMultiScratch != 0 ? _kquantMultiScratch
-        : _kquantMultiScratch = AllocDeviceAnyCapture((long)CudaKernels.KQuantRows4MaxColumns * PreQ8_1ScratchBytes(PreQ8_1ScratchK));
+        : _kquantMultiScratch = AllocDeviceAnyCapture((long)CudaKernels.KQuantRows4MaxColumns * PreQ8_1ScratchBytes(PreQ8_1ScratchK),
+            "multi-row GEMV input scratch");
 
     // Small device buffers for H2D copy of token IDs and positions
     public nint TokenIdsDevice; // [maxSeqLen] int32
@@ -223,53 +224,122 @@ internal sealed class CudaForwardState : IDisposable
     }
 
     /// <summary>
+    /// Upper bound on the power-of-two rounding of <see cref="EnsureCapacity"/> (#1848): the model's served context. Rounding a
+    /// 10K-token prompt up to 16K costs ~0.9 GB on an 8B model that no context fit counted. Default: unbounded.
+    /// </summary>
+    internal int CapacityCap { get; set; } = int.MaxValue;
+
+    /// <summary>Device bytes the per-token sequence buffers currently hold (#1848).</summary>
+    internal long SequenceBytes { get; private set; }
+
+    /// <summary>
+    /// Device bytes the per-token sequence buffers take at <paramref name="capacity"/> tokens (#1848): exactly what
+    /// <see cref="EnsureCapacity"/> allocates, from the same buffer list.
+    /// </summary>
+    /// <param name="capacity">Capacity in tokens.</param>
+    /// <returns>Bytes.</returns>
+    internal long SequenceBytesAt(int capacity) => SequenceBuffers(capacity, allocate: false);
+
+    /// <summary>
     /// Ensures all scratch buffers are large enough for <paramref name="seqLen"/> tokens.
     /// Uses power-of-2 growth to amortize reallocation cost.
     /// </summary>
+    /// <remarks>
+    /// #1848: the growth is admitted against free VRAM (the buffers it replaces count as free) BEFORE the old buffers are released,
+    /// so a refusal leaves the state intact at its old capacity. When the power-of-two capacity does not fit but the exact one does,
+    /// the exact one is taken.
+    /// </remarks>
+    /// <exception cref="Core.Configuration.DeviceMemoryAdmissionException">Not even the exact capacity fits.</exception>
     public void EnsureCapacity(int seqLen)
     {
         if (seqLen <= _currentSeqLen)
             return;
 
-        int newCapacity = (int)BitOperations.RoundUpToPowerOf2((uint)seqLen);
+        long held = SequenceBytes;
+        int newCapacity = ChooseCapacity(seqLen, CapacityCap, SequenceBytesAt,
+            bytes => CudaAdmission.TryFit(bytes, out _, releasedBytes: held));
+        if (newCapacity < 0)
+        {
+            CudaAdmission.EnsureFits($"forward scratch for a {seqLen}-token forward pass", SequenceBytesAt(seqLen),
+                releasedBytes: held,
+                remedies: "Bound it with --prefill-chunk (e.g. 1024), shorten the prompt, or free GPU memory");
+            newCapacity = seqLen;   // admitted on the re-check (free memory moved): exact size
+        }
+
         FreeSequenceBuffers();
         Generation++;
+        SequenceBytes = SequenceBuffers(newCapacity, allocate: true);
+        _currentSeqLen = newCapacity;
+    }
+
+    /// <summary>
+    /// The capacity a growth to <paramref name="seqLen"/> takes (#1848): the power of two at or above it (capped at
+    /// <paramref name="cap"/>, never below <paramref name="seqLen"/>) when that fits, else <paramref name="seqLen"/> itself when that
+    /// fits, else -1. Pure, so the choice is unit-testable without a GPU.
+    /// </summary>
+    /// <param name="seqLen">Tokens the forward needs.</param>
+    /// <param name="cap">Upper bound on the rounding (the served context).</param>
+    /// <param name="bytesAt">Device bytes at a capacity.</param>
+    /// <param name="fits">Whether that many bytes are admitted.</param>
+    /// <returns>The capacity, or -1 when nothing fits.</returns>
+    internal static int ChooseCapacity(int seqLen, int cap, Func<int, long> bytesAt, Func<long, bool> fits)
+    {
+        int rounded = (int)Math.Min(BitOperations.RoundUpToPowerOf2((uint)seqLen), (uint)Math.Max(seqLen, cap));
+        if (fits(bytesAt(rounded))) return rounded;
+        if (rounded != seqLen && fits(bytesAt(seqLen))) return seqLen;
+        return -1;
+    }
+
+    /// <summary>
+    /// The per-token sequence buffers at <paramref name="newCapacity"/>: allocates them when <paramref name="allocate"/>, else only
+    /// adds up their sizes (one list, so the admission and the allocation cannot drift apart).
+    /// </summary>
+    private long SequenceBuffers(int newCapacity, bool allocate)
+    {
+        long total = 0;
+        nint A(long bytes)
+        {
+            total += bytes;
+            return allocate ? AllocDevice(bytes) : 0;
+        }
 
         int half = sizeof(ushort); // FP16 = 2 bytes
 
         // All activation buffers are FP16 — per GPU.md spec for memory-bandwidth-optimal inference.
         // Only LogitsF32 (output to host) stays FP32.
-        HiddenState = AllocDevice((long)newCapacity * _hiddenSize * half);
-        Residual = AllocDevice((long)newCapacity * _hiddenSize * half);
-        NormOutput = AllocDevice((long)newCapacity * _hiddenSize * half);
-        Q = AllocDevice((long)newCapacity * _numHeads * _headDim * half);
-        K = AllocDevice((long)newCapacity * _numKvHeads * _headDim * half);
-        V = AllocDevice((long)newCapacity * _numKvHeads * _headDim * half);
-        AttnOutput = AllocDevice((long)newCapacity * _numHeads * _headDim * half);
-        FfnGate = AllocDevice((long)newCapacity * _intermediateSize * half);
-        FfnUp = AllocDevice((long)newCapacity * _intermediateSize * half);
-        SiluOutput = AllocDevice((long)newCapacity * _intermediateSize * half);
+        nint hiddenState = A((long)newCapacity * _hiddenSize * half);
+        nint residual = A((long)newCapacity * _hiddenSize * half);
+        nint normOutput = A((long)newCapacity * _hiddenSize * half);
+        nint q = A((long)newCapacity * _numHeads * _headDim * half);
+        nint k = A((long)newCapacity * _numKvHeads * _headDim * half);
+        nint v = A((long)newCapacity * _numKvHeads * _headDim * half);
+        nint attnOutput = A((long)newCapacity * _numHeads * _headDim * half);
+        nint ffnGate = A((long)newCapacity * _intermediateSize * half);
+        nint ffnUp = A((long)newCapacity * _intermediateSize * half);
+        nint siluOutput = A((long)newCapacity * _intermediateSize * half);
+        nint residualF32 = 0, hiddenStateF32 = 0, normOutputF32 = 0, qF32 = 0, kF32 = 0, vF32 = 0, attnOutputF32 = 0,
+             ffnGateF32 = 0, ffnUpF32 = 0, siluOutputF32 = 0, preQ8Batched = 0;
         if (_f32Activations || _useFp32Residual)
-            ResidualF32 = AllocDevice((long)newCapacity * _hiddenSize * sizeof(float));
+            residualF32 = A((long)newCapacity * _hiddenSize * sizeof(float));
         if (_f32Activations)
         {
-            HiddenStateF32 = AllocDevice((long)newCapacity * _hiddenSize * sizeof(float));
-            NormOutputF32 = AllocDevice((long)newCapacity * _hiddenSize * sizeof(float));
-            QF32 = AllocDevice((long)newCapacity * _numHeads * _headDim * sizeof(float));
-            KF32 = AllocDevice((long)newCapacity * _numKvHeads * _headDim * sizeof(float));
-            VF32 = AllocDevice((long)newCapacity * _numKvHeads * _headDim * sizeof(float));
-            AttnOutputF32 = AllocDevice((long)newCapacity * _numHeads * _headDim * sizeof(float));
-            FfnGateF32 = AllocDevice((long)newCapacity * _intermediateSize * sizeof(float));
-            FfnUpF32 = AllocDevice((long)newCapacity * _intermediateSize * sizeof(float));
-            SiluOutputF32 = AllocDevice((long)newCapacity * _intermediateSize * sizeof(float));
+            hiddenStateF32 = A((long)newCapacity * _hiddenSize * sizeof(float));
+            normOutputF32 = A((long)newCapacity * _hiddenSize * sizeof(float));
+            qF32 = A((long)newCapacity * _numHeads * _headDim * sizeof(float));
+            kF32 = A((long)newCapacity * _numKvHeads * _headDim * sizeof(float));
+            vF32 = A((long)newCapacity * _numKvHeads * _headDim * sizeof(float));
+            attnOutputF32 = A((long)newCapacity * _numHeads * _headDim * sizeof(float));
+            ffnGateF32 = A((long)newCapacity * _intermediateSize * sizeof(float));
+            ffnUpF32 = A((long)newCapacity * _intermediateSize * sizeof(float));
+            siluOutputF32 = A((long)newCapacity * _intermediateSize * sizeof(float));
         }
         // General scratch: must fit largest projection output or LM head logits
         long maxPerLayer = (long)newCapacity * Math.Max(Math.Max(_numHeads * _headDim, _intermediateSize), _hiddenSize);
         long maxLmHead = _vocabSize;
-        GemmOutputF16 = AllocDevice(Math.Max(maxPerLayer, maxLmHead) * half);
-        TokenIdsDevice = AllocDevice((long)newCapacity * sizeof(int));
-        PositionsDevice = AllocDevice((long)newCapacity * sizeof(int));
-        LoraTmp = AllocDevice((long)newCapacity * MaxLoraRank * half);
+        nint gemmOutputF16 = A(Math.Max(maxPerLayer, maxLmHead) * half);
+        nint tokenIds = A((long)newCapacity * sizeof(int));
+        nint positions = A((long)newCapacity * sizeof(int));
+        nint loraTmp = A((long)newCapacity * MaxLoraRank * half);
         // Only allocate the batched-MMQ prefill scratch when the dispatcher gate can actually
         // fire (issue #349/#367): at the shipped default (MmqBatchedMinSeqLen=int.MaxValue) the
         // buffer would otherwise sit allocated-but-unreadable for every model, CPU or GPU-bound,
@@ -281,9 +351,20 @@ internal sealed class CudaForwardState : IDisposable
         // complementary guard covering the case where MmqBatchedMinSeqLen is lowered after this
         // allocation decision was made.
         if (newCapacity >= CudaKernels.MmqBatchedMinSeqLen)
-            PreQ8_1BatchedScratch = AllocDevice((long)newCapacity * PreQ8_1ScratchBytes(PreQ8_1ScratchK));
+            preQ8Batched = A((long)newCapacity * PreQ8_1ScratchBytes(PreQ8_1ScratchK));
 
-        _currentSeqLen = newCapacity;
+        if (allocate)
+        {
+            HiddenState = hiddenState; Residual = residual; NormOutput = normOutput;
+            Q = q; K = k; V = v; AttnOutput = attnOutput;
+            FfnGate = ffnGate; FfnUp = ffnUp; SiluOutput = siluOutput;
+            ResidualF32 = residualF32; HiddenStateF32 = hiddenStateF32; NormOutputF32 = normOutputF32;
+            QF32 = qF32; KF32 = kF32; VF32 = vF32; AttnOutputF32 = attnOutputF32;
+            FfnGateF32 = ffnGateF32; FfnUpF32 = ffnUpF32; SiluOutputF32 = siluOutputF32;
+            GemmOutputF16 = gemmOutputF16; TokenIdsDevice = tokenIds; PositionsDevice = positions; LoraTmp = loraTmp;
+            PreQ8_1BatchedScratch = preQ8Batched;
+        }
+        return total;
     }
 
     private nint AllocDevice(long bytes)
@@ -297,12 +378,14 @@ internal sealed class CudaForwardState : IDisposable
     /// Allocates even while this thread's stream is being captured (a lazily allocated buffer may first be needed inside a
     /// decode-graph capture): switches the thread to relaxed capture mode for the call. The allocation is not a graph node.
     /// </summary>
-    private nint AllocDeviceAnyCapture(long bytes)
+    private nint AllocDeviceAnyCapture(long bytes, string what)
     {
         uint mode = CudaDriverApi.CU_STREAM_CAPTURE_MODE_RELAXED;
         CudaDriverApi.cuThreadExchangeStreamCaptureMode(ref mode).ThrowOnError();
         try
         {
+            // #1848: admitted like every runtime-sized allocation, inside the relaxed capture mode the allocation itself needs.
+            CudaAdmission.EnsureFits(what, bytes, remedies: "Free GPU memory or use a smaller model");
             return AllocDevice(bytes);
         }
         finally
@@ -347,6 +430,7 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref PositionsDevice);
         FreeIfNonZero(ref LoraTmp);
         FreeIfNonZero(ref PreQ8_1BatchedScratch);
+        SequenceBytes = 0;
     }
 
     public void Dispose()

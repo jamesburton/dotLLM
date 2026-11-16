@@ -149,6 +149,12 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
         _keysQuant = new nint[numLayers];
         _valuesQuant = new nint[numLayers];
 
+        // #1848: the whole cache (quantized rows, FP16 window, and the FP16 full-history dequant scratch) is admitted against free
+        // VRAM before anything is allocated; under WDDM an over-commit spills to shared system memory instead of failing.
+        CudaAdmission.EnsureFits(
+            $"KV cache ({config.KeyDType.ToString().ToLowerInvariant()}/{config.ValueDType.ToString().ToLowerInvariant()}) for {maxSeqLen} tokens",
+            DeviceBytes(geometry, maxSeqLen, config));
+
         long totalBytes = 0;
         int maxStride = 0;
 
@@ -667,6 +673,36 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
         if (_kScratch != 0) { CudaDriverApi.cuMemFree_v2(_kScratch); _kScratch = 0; }
         if (_vScratch != 0) { CudaDriverApi.cuMemFree_v2(_vScratch); _vScratch = 0; }
     }
+
+    /// <summary>
+    /// Device bytes a cache of <paramref name="maxSeqLen"/> positions allocates (#1848), mirroring the constructor: quantized K and V
+    /// rows per layer, the FP16 window, and the FP16 K and V dequant scratch over the whole history at the widest stride.
+    /// </summary>
+    /// <param name="geometry">Per-layer KV row widths.</param>
+    /// <param name="maxSeqLen">Positions.</param>
+    /// <param name="config">KV types and window.</param>
+    /// <returns>Bytes.</returns>
+    internal static long DeviceBytes(KvGeometry geometry, int maxSeqLen, KvCacheConfig config)
+    {
+        long bytes = 0;
+        int maxStride = 0;
+        for (int i = 0; i < geometry.LayerCount; i++)
+        {
+            int stride = geometry.KvStrideOf(i);
+            maxStride = Math.Max(maxStride, stride);
+            bytes += (long)maxSeqLen * (ComputeQuantRowBytes(stride, config.KeyDType) + ComputeQuantRowBytes(stride, config.ValueDType));
+            if (config.MixedPrecisionWindowSize > 0)
+                bytes += 2L * config.MixedPrecisionWindowSize * stride * sizeof(ushort);
+        }
+        return bytes + 2L * maxSeqLen * maxStride * sizeof(ushort);
+    }
+
+    /// <summary>Device bytes one position costs in a cache of this configuration (#1848 context fit), window excluded.</summary>
+    /// <param name="geometry">Per-layer KV row widths.</param>
+    /// <param name="config">KV types.</param>
+    /// <returns>Bytes per position.</returns>
+    internal static long BytesPerPosition(KvGeometry geometry, KvCacheConfig config)
+        => DeviceBytes(geometry, 1, config with { MixedPrecisionWindowSize = 0 });
 
     private static int ComputeQuantRowBytes(int kvStride, KvCacheDType dtype) => dtype switch
     {
