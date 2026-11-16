@@ -152,7 +152,6 @@ public sealed class CudaPrefixReuseTests
             finally { CudaG3Attention.OffsetEnabled = true; }
         }
         _out.WriteLine($"{kvType}: first-token logprob cold {expected.Logprobs[0].Logprob:R} warm {actual.Logprobs[0].Logprob:R} (|d| {dCold:E2})");
-        Assert.True(dCold < 0.05, $"first-token logprob moved {dCold} vs cold");
 
         // vs warm-without-growth: a big headroom sizes turn 1's cache for turn 2, so the same rollback + suffix prefill runs on an
         // ungrown cache. Every token and logprob must be bit-identical: the growth copied every live row and nothing else changed.
@@ -166,6 +165,8 @@ public sealed class CudaPrefixReuseTests
         Assert.Equal(ungrown.GeneratedTokenIds, actual.GeneratedTokenIds);
         for (int i = 0; i < ungrown.Logprobs!.Length; i++)
             Assert.Equal(ungrown.Logprobs[i].Logprob, actual.Logprobs[i].Logprob);
+        _out.WriteLine($"{kvType}: ungrown warm logprob {ungrown.Logprobs[0].Logprob:R}");
+        Assert.True(dCold < 0.05, $"first-token logprob moved {dCold} vs cold");
 
         // Refused growth (no room in VRAM): the hit misses and re-prefills; the result is still the cold one.
         using var refuseCache = new PrefixCache(2);
