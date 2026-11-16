@@ -138,6 +138,19 @@ public sealed class CudaPrefixReuseTests
         // vs cold: same tokens, close first-token logprob (different prefill attention kernels; not bit-exact).
         Assert.Equal(expected.GeneratedTokenIds, actual.GeneratedTokenIds);
         double dCold = Math.Abs(expected.Logprobs![0].Logprob - actual.Logprobs![0].Logprob);
+        {
+            // Diagnostic: the same warm turn with the suffix attention on attention_f16 instead of the G3 offset path.
+            using var diagCache = new PrefixCache(2);
+            var diag = new TextGenerator(model, tokenizer, factory, diagCache, mtpEnabled: false, prefixCacheHeadroomTokens: 4096);
+            diag.Generate(Turn1(), opts);
+            CudaG3Attention.OffsetEnabled = false;
+            try
+            {
+                var d = diag.Generate(t2, opts);
+                _out.WriteLine($"{kvType}: warm logprob with attention_f16 suffix {d.Logprobs![0].Logprob:R} (cached {d.Timings.CachedTokenCount})");
+            }
+            finally { CudaG3Attention.OffsetEnabled = true; }
+        }
         _out.WriteLine($"{kvType}: first-token logprob cold {expected.Logprobs[0].Logprob:R} warm {actual.Logprobs[0].Logprob:R} (|d| {dCold:E2})");
         Assert.True(dCold < 0.05, $"first-token logprob moved {dCold} vs cold");
 

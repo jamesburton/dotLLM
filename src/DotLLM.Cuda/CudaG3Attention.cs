@@ -185,6 +185,12 @@ internal sealed class CudaG3Attention : IDisposable
     internal const int OffsetMinQueryRows = 32;
 
     /// <summary>
+    /// Kill switch for the offset path (#1594): <c>DOTLLM_CUDA_G3_OFFSET=0</c> sends prefills over a cached prefix back to
+    /// <c>attention_f16</c>. Mutable so a test can compare both in one process.
+    /// </summary>
+    internal static bool OffsetEnabled = Environment.GetEnvironmentVariable("DOTLLM_CUDA_G3_OFFSET") != "0";
+
+    /// <summary>
     /// Score elements (query heads x query rows x keys) one offset-path chunk may hold (#1594). The suffix is processed in
     /// query-row chunks under this bound, so a long cached prefix never sizes the scratch to heads x suffix x context
     /// (6 bytes per element: FP32 scores + FP16 probs; 64M elements = 384 MiB).
@@ -202,7 +208,7 @@ internal sealed class CudaG3Attention : IDisposable
     /// 2.5x slower than G3 prefilled the whole 4.7K-token prompt cold.
     /// </summary>
     internal bool CanUseOffset(int seqLen, int seqKv, int positionOffset, int slidingWindow, int numHeads, int numKvHeads)
-        => Enabled
+        => Enabled && OffsetEnabled
         && _kernels.HasAttentionSoftmaxCausalOffsetF32In
         && seqLen >= OffsetMinQueryRows
         && positionOffset > 0
