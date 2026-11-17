@@ -181,6 +181,43 @@ default and does not cover `bench`, which submits the whole prompt in one `Forwa
   tile and cuBLAS picks algorithms per M. The drift is the usual accumulation-order kind and is
   bounded by the standard CUDA fixture-parity tolerance (abs 1e-4 + rel 1e-3).
 
+### Dense CUDA serve: chunked prefill by default (issue #1862)
+
+`dotllm serve` on the dense CUDA host (`CudaTransformerModel`) prefills in 1,024-token chunks when
+`--prefill-chunk-size` is not given, on the non-paged f16 cache only (`ServerStartup.ResolvePrefillChunk`).
+Any explicit value wins, and `--prefill-chunk-size 0` restores one pass. `run`, `chat`, the paged pool,
+q8_0 / q4_0 KV, and the CPU, Vulkan and HIP backends are unchanged.
+
+Why it pays:
+
+- **Window.** An unchunked prefill grows the forward scratch with the prompt, about as much per token as f16
+  KV, so the context fit charges it per token. Chunked, it is a fixed cost. TwIL-8B on the RTX 3060 serves
+  17,408 tokens unchunked (304.5 KiB/token) and 32,768 chunked (160 KiB/token plus 526 MiB fixed).
+- **Prefill.** A long cold prompt's square G3 plane (heads x s^2 x 6 B) does not fit, so unchunked it runs
+  `attention_f16`. Chunked, the first chunk's plane is 192 MiB at 32 heads, inside the 384 MiB plane the fit
+  already charges, and later chunks run G3's offset path (#1847), bounded to the same plane.
+- **Cancellation.** The engine checks it between chunks, so a client disconnect stops a long prefill.
+
+A chunk larger than about 1,448 tokens (at 32 heads) needs a square plane above the retained one. The fit then
+charges that plane as fixed bytes (`CudaTransformerModel.G3PlaneChargeBytes`), so G3 still runs at a full
+window, at the cost of window size.
+
+TwIL-8B Q4_K_M cold prefill, framework RTX 3060 eGPU (x4 link), `run --json`, 2 reps (r1 / r2). These are
+**functional-only** numbers from a contended laptop, not benchmarks:
+
+| chunk | 2,693 tokens | 8,392 tokens | served window (`serve --no-paged`) |
+|---|---|---|---|
+| unchunked | 810 / 800 | 59 / 59 (G3 declined, `attention_f16`) | 17,408 |
+| 512 | 733 / 825 | 723 / 724 | |
+| **1024 (default)** | 933 / 749 | 808 / 820 | **32,768** |
+| 2048 | 920 / 950 (re-run; r2 was refused admission once) | 913 / 915 | 29,696 |
+| 4096 | 860 / 776 | 912 / 925 | |
+
+q8_0 KV at 8,392 tokens: 51 / 51 unchunked (G3 declined) and 54 / 55 at 1,024, because the quantized cache
+has no offset path (#1846). Greedy text was identical across every chunk size in the table, per prompt and
+per KV type (32 tokens). A 31,548-token prompt on the 32,768 window completed with no spill and flat shared
+GPU memory. Its prefill ran at 227 tok/s: the offset path's query-row chunks shrink as the cached history grows.
+
 ## cuBLAS GEMM/GEMV
 
 cuBLAS provides the most compute-intensive operations:

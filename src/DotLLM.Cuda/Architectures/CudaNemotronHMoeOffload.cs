@@ -122,7 +122,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         if (DeviceMemoryBudget.Fits((long)free, growth, reserve)) return;
         throw new DeviceMemoryAdmissionException(
             DeviceMemoryBudget.DescribeRefusal($"a {seqLen}-token forward's activation buffers (experts offloaded)", growth, (long)free, reserve)
-            + $" Prefill in chunks of at most {_moeScratchTokens} tokens (the engine does this by default; check --prefill-chunk).");
+            + $" Prefill in chunks of at most {_moeScratchTokens} tokens (the engine does this by default; check --prefill-chunk-size).");
     }
 
     private void DisposeMoeOffload()
