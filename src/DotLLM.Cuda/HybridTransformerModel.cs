@@ -68,6 +68,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     private readonly RoPEType _cpuRopeType;
     private readonly int? _slidingWindowSize;
     private readonly float _cpuQPrescale;
+    private int _f16TailLogged;
     private nint _fp16TransferBuffer;
     private int _fp16TransferCapacity; // in elements
 
@@ -128,7 +129,7 @@ public sealed unsafe class HybridTransformerModel : IModel
         VramWarning = vramWarning;
         // #1851: a Granite attention multiplier that folds into RoPE (TwIL-8B). The GPU half gets it from the RoPE mscale
         // (CudaWeights); the CPU tail's attention kernels hard-code 1/sqrt(headDim), so Q is pre-scaled there, as on the CPU host.
-        _cpuQPrescale = config.AttentionScale.HasValue
+        _cpuQPrescale = config.GraniteScalarsFoldIntoRope
             ? config.AttentionScoreScale(config.HeadDim) * MathF.Sqrt(config.HeadDim)
             : 1f;
 
@@ -446,6 +447,12 @@ public sealed unsafe class HybridTransformerModel : IModel
     /// <summary>KV storage type of the CPU tail (#1851): Q8_0 blocks, read in place by the CPU attention (rule 1: no FP32 KV).</summary>
     internal const KvCacheDType CpuTailKvDType = KvCacheDType.Q8_0;
 
+    /// <summary>
+    /// Whether the CPU tail can store Q8_0 for this head dimension (#1851): a Q8_0 block must not straddle two heads, because the
+    /// quantized attention decodes one head at a time. Otherwise the tail is F16 (<see cref="HybridF16TailKvCache"/>), never FP32.
+    /// </summary>
+    public static bool TailUsesQ8_0(int headDim) => headDim % QuantFormat.LegacyGroupSize == 0;
+
     /// <summary>Test control (#1851): the pre-#1851 FP32 tail KV, to separate the Q8_0 tail's error from the split's.</summary>
     internal HybridKvCache CreateKvCacheWithF32TailForTests(int maxSeqLen)
     {
@@ -466,11 +473,26 @@ public sealed unsafe class HybridTransformerModel : IModel
         var gpu = new CudaKvCache(_numGpuLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
         try
         {
-            return new HybridKvCache(
-                gpu,
-                new QuantizedKvCache(Config.NumLayers - _numGpuLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen,
-                    CpuTailKvDType, CpuTailKvDType, windowSize: 0),
-                _numGpuLayers);
+            int tailLayers = Config.NumLayers - _numGpuLayers;
+            IKvCache tail;
+            if (TailUsesQ8_0(Config.HeadDim))
+            {
+                tail = new QuantizedKvCache(tailLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen, CpuTailKvDType, CpuTailKvDType, windowSize: 0);
+            }
+            else
+            {
+                // TODO(#1870): temporary F16 fallback for head_dim % 32 != 0; remove when quantized KV supports it
+                if (Interlocked.Exchange(ref _f16TailLogged, 1) == 0)
+                {
+                    long stride = (long)Config.NumKvHeads * Config.HeadDim;
+                    long f16 = 2 * tailLayers * stride * sizeof(ushort);
+                    long q8 = 2 * tailLayers * (stride / QuantFormat.LegacyGroupSize) * QuantFormat.Q8_0BlockBytes;
+                    Console.Error.WriteLine($"[dotllm] CPU-tail KV is F16, not q8_0: head_dim {Config.HeadDim} is not a multiple of " +
+                        $"{QuantFormat.LegacyGroupSize} ({f16} bytes per token over {tailLayers} tail layers, ~{q8} at q8_0). Temporary; see #1870.");
+                }
+                tail = new HybridF16TailKvCache(tailLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
+            }
+            return new HybridKvCache(gpu, tail, _numGpuLayers);
         }
         catch
         {
@@ -965,7 +987,14 @@ public sealed unsafe class HybridTransformerModel : IModel
 
                     int seqKv = hybridKvCache.CpuCache.CurrentLength;
 
-                    if (hybridKvCache.CpuCache is IQuantizedKvCache qkvCache)
+                    if (hybridKvCache.CpuCache is HybridF16TailKvCache f16Tail)
+                    {
+                        // head_dim not a multiple of 32 (#1851): F16 rows read in place.
+                        Attention.ExecuteContiguousRows(q, f16Tail.KeysOf(cpuLocalLayer), f16Tail.ValuesOf(cpuLocalLayer),
+                            Attention.KvRowFormat.F16, f16Tail.RowBytes, attnOut, seqLen, seqKv, numHeads, numKvHeads, headDim,
+                            positions[0], _threadPool, _slidingWindowSize);
+                    }
+                    else if (hybridKvCache.CpuCache is IQuantizedKvCache qkvCache)
                     {
                         Attention.Execute(q, qkvCache, cpuLocalLayer, attnOut,
                             seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,

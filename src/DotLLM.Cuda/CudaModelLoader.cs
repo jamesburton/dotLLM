@@ -218,18 +218,19 @@ public static class CudaModelLoader
     /// <param name="moeOffload">Routed-expert offload; its <c>ContextTokens</c> (<c>--ctx-size</c>) is the context auto plans for.</param>
     /// <param name="igpuProbe">Finds an iGPU for the tail under auto; null for none.</param>
     /// <param name="log">Informational messages (the auto placement line).</param>
+    /// <param name="prefillChunkTokens">The <c>--prefill-chunk-size</c> value (0 = the split default) auto plans its scratch for.</param>
     /// <returns>The model and its KV-cache factory.</returns>
     public static (IModel Model, Func<int, IKvCache>? KvCacheFactory) CreateForGpuLayers(
         GgufFile gguf, ModelConfig config, int requestedGpuLayers, int deviceId,
         ThreadingConfig threading, Action<string>? warn, MoeOffloadOptions? moeOffload,
-        Func<IgpuTier?>? igpuProbe, Action<string>? log)
+        Func<IgpuTier?>? igpuProbe, Action<string>? log, int prefillChunkTokens = 0)
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
 
         if (GpuOffloadPlanner.IsAuto(requestedGpuLayers))
         {
-            var (m, kv, _) = CudaAutoSplit.Load(gguf, config, deviceId, threading, moeOffload, igpuProbe, log ?? warn);
+            var (m, kv, _) = CudaAutoSplit.Load(gguf, config, deviceId, threading, moeOffload, igpuProbe, log ?? warn, prefillChunkTokens);
             return (m, kv);
         }
 

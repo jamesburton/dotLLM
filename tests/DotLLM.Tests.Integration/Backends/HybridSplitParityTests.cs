@@ -1,8 +1,11 @@
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
+using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
+using DotLLM.Engine.PromptCache;
 using DotLLM.Models;
 using DotLLM.Models.Gguf;
 using Xunit;
@@ -114,8 +117,11 @@ public sealed class HybridSplitParityTests
         threading ??= ThreadingConfig.SingleThreaded;
         using (var cpuModel = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading))
         {
-            cpu = Run(cpuModel, () => new QuantizedKvCache(layers, config.NumKvHeads, config.HeadDim, maxLen,
-                HybridTransformerModel.CpuTailKvDType, HybridTransformerModel.CpuTailKvDType, windowSize: 0), vocab);
+            // The reference KV matches the tail's format: Q8_0, or (head_dim % 32 != 0, #1870) the F32 reference cache.
+            cpu = HybridTransformerModel.TailUsesQ8_0(config.HeadDim)
+                ? Run(cpuModel, () => new QuantizedKvCache(layers, config.NumKvHeads, config.HeadDim, maxLen,
+                    HybridTransformerModel.CpuTailKvDType, HybridTransformerModel.CpuTailKvDType, windowSize: 0), vocab)
+                : Run(cpuModel, () => new SimpleKvCache(layers, config.NumKvHeads, config.HeadDim, maxLen), vocab);
             cpuF32 = Run(cpuModel, () => new SimpleKvCache(layers, config.NumKvHeads, config.HeadDim, maxLen), vocab);
         }
 
@@ -140,8 +146,18 @@ public sealed class HybridSplitParityTests
             using (var probe = hybrid.CreateKvCache(maxLen))
             {
                 // Rule 1 (#1851): the tail KV is Q8_0 blocks, not an FP32 SimpleKvCache.
-                var tail = Assert.IsType<QuantizedKvCache>(probe.CpuCache);
-                Assert.Equal((KvCacheDType.Q8_0, KvCacheDType.Q8_0), (tail.KeyDType, tail.ValueDType));
+                if (HybridTransformerModel.TailUsesQ8_0(config.HeadDim))
+                {
+                    var tail = Assert.IsType<QuantizedKvCache>(probe.CpuCache);
+                    Assert.Equal((KvCacheDType.Q8_0, KvCacheDType.Q8_0), (tail.KeyDType, tail.ValueDType));
+                }
+                else
+                {
+                    Assert.IsType<HybridF16TailKvCache>(probe.CpuCache);   // TODO(#1870): temporary F16 fallback
+                }
+                // The engine sees the GPU half's device bytes (#1851 review): retained split caches are evictable for admission.
+                Assert.Equal(probe.GpuCache.DeviceBytes, ((IDeviceResidentKvCache)probe).DeviceBytes);
+                Assert.True(probe.GpuCache.DeviceBytes > 0);
             }
             var split = Run(hybrid, () => hybrid.CreateKvCache(maxLen), vocab);
             var splitF32 = Run(hybrid, () => hybrid.CreateKvCacheWithF32TailForTests(maxLen), vocab);
@@ -215,6 +231,84 @@ public sealed class HybridSplitParityTests
         finally
         {
             CudaAdmission.FreeBytesOverride = null;
+        }
+    }
+
+    /// <summary>
+    /// Review blocker 2 (#1851): head_dim 80 (Phi-2 / some Granite and Qwen shapes) is not a multiple of the Q8_0 block, and the Q8_0
+    /// tail's head-at-a-time attention threw. The tail falls back to F16 (TODO #1870) and must match both references.
+    /// </summary>
+    [SkippableFact]
+    public void HeadDim80_TailFallsBackToF16_AndMatchesCpuAndGpu()
+    {
+        Skip.If(!CudaDevice.IsAvailable(), "No CUDA device available.");
+        string path = Path.Combine(Path.GetTempPath(), $"syn_granite_hd80_{Guid.NewGuid():N}.gguf");
+        SyntheticGraniteGguf.Write(path, new SyntheticGraniteConfig
+            { Hidden = 320, Heads = 4, KvHeads = 2, Layers = 3, EmbeddingScale = 1f, ResidualScale = 1f, LogitScale = 1f, AttentionScale = 1f / 80, QkWeightScale = 1f });
+        try
+        {
+            using (var gguf = GgufFile.Open(path))
+            {
+                var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+                Assert.Equal(80, config.HeadDim);
+                Assert.False(HybridTransformerModel.TailUsesQ8_0(config.HeadDim));
+            }
+            CheckModel(path, "hd80");
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { /* best-effort */ }
+        }
+    }
+
+    /// <summary>
+    /// Review blocker 1 (#1851): two unrelated prompts in turn through a prefix-cached generator, on a simulated card with room for
+    /// one request's cache beside the split. The second request must not be refused because of the first one's cache.
+    /// </summary>
+    [SkippableFact]
+    public unsafe void TwoUnrelatedPrompts_UnderABudgetForOneCache_BothRun()
+    {
+        Skip.If(!File.Exists(SmolLmPath), "SmolLM-135M Q8_0 GGUF not found.");
+        Skip.If(!CudaDevice.IsAvailable(), "No CUDA device available.");
+        using var gguf = GgufFile.Open(SmolLmPath!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using var hybrid = HybridTransformerModel.LoadFromGguf(gguf, config, config.NumLayers / 2, deviceId: 0, ThreadingConfig.SingleThreaded);
+        var opts = new InferenceOptions { MaxTokens = 48, Temperature = 0 };
+        const string first = "The capital of France is", second = "def fibonacci(n):";
+
+        // Warm the forward scratch to the prompt length first, so the budget below only has the KV caches to admit.
+        new TextGenerator(hybrid, tokenizer, (c, size) => hybrid.CreateKvCache(size), prefillChunkSize: 1024).Generate(first, opts);
+
+        long cacheBytes = 0;
+        var prefix = new PrefixCache(4);
+        var gen = new TextGenerator(hybrid, tokenizer, (c, size) =>
+        {
+            var kv = hybrid.CreateKvCache(size);
+            cacheBytes = Math.Max(cacheBytes, kv.GpuCache.DeviceBytes);
+            return kv;
+        }, prefixCache: prefix, prefillChunkSize: 1024);
+
+        // Simulated free memory: what is really free now, minus everything except the reserve plus 1.5 request caches. A second
+        // cache allocated beside a retained first one does not fit; after evicting it, it does.
+        Assert.Equal(0, DotLLM.Cuda.Interop.CudaDriverApi.cuMemGetInfoRaw(out nuint baseFree, out _));
+        long probeBytes;
+        using (var probe = hybrid.CreateKvCache(Tokens.Length + opts.MaxTokens + 16)) probeBytes = probe.GpuCache.DeviceBytes;
+        long slack = CudaAdmission.ReserveBytes + probeBytes * 3 / 2;
+        CudaAdmission.FreeBytesOverride = () =>
+            DotLLM.Cuda.Interop.CudaDriverApi.cuMemGetInfoRaw(out nuint free, out _) == 0 ? slack - ((long)baseFree - (long)free) : null;
+        try
+        {
+            var a = gen.Generate(first, opts);
+            var b = gen.Generate(second, opts);
+            Assert.NotEmpty(a.GeneratedTokenIds);
+            Assert.NotEmpty(b.GeneratedTokenIds);
+            _output.WriteLine($"cache {cacheBytes} B, probe {probeBytes} B; prefix entries {prefix.EntryCount}, admission evictions {prefix.AdmissionEvictions}");
+        }
+        finally
+        {
+            CudaAdmission.FreeBytesOverride = null;
+            prefix.Clear();
         }
     }
 

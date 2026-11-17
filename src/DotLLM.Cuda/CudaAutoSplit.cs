@@ -18,6 +18,18 @@ public static class CudaAutoSplit
     /// <summary>Follow-up for splitting Granite (TwIL-8B), Gemma and the rest of the FP32-dense-forward family.</summary>
     public const string CompositeIssueUrl = "https://github.com/jamesburton/dotLLM/issues/1864";
 
+    /// <summary>
+    /// Prefill chunk of a GPU/CPU split when <c>--prefill-chunk-size</c> is not given (#1851, James 2026-11-17): the planner reserves
+    /// forward scratch for this many tokens, not for an unchunked full-context prefill, and run / chat / serve chunk a split's
+    /// prefill to it.
+    /// </summary>
+    public const int DefaultSplitPrefillChunk = 1024;
+
+    /// <summary>The prefill chunk a split runs with: an explicit <c>--prefill-chunk-size</c> wins, else <see cref="DefaultSplitPrefillChunk"/>.</summary>
+    /// <param name="explicitChunk">The <c>--prefill-chunk-size</c> value (0 = not given).</param>
+    /// <returns>Tokens per prefill forward.</returns>
+    public static int SplitPrefillChunk(int explicitChunk) => explicitChunk > 0 ? explicitChunk : DefaultSplitPrefillChunk;
+
     /// <summary>Context the split is planned for when <c>--ctx-size</c> is not given (as <c>PlanCpuMoeLayers</c>).</summary>
     public const int DefaultPlanContextTokens = 4096;
 
@@ -65,11 +77,12 @@ public static class CudaAutoSplit
     /// <param name="moeOffload">Offload options; <see cref="MoeOffloadOptions.ContextTokens"/> (<c>--ctx-size</c>) is the planned context.</param>
     /// <param name="igpuProbe">Finds an iGPU for the tail, called only when the model does not fit the dGPU; null for none.</param>
     /// <param name="log">Receives the placement line and its reason.</param>
+    /// <param name="prefillChunkTokens">The <c>--prefill-chunk-size</c> value (0 = <see cref="DefaultSplitPrefillChunk"/>).</param>
     /// <returns>The model, its KV factory, and the plan (null when no split was considered).</returns>
     /// <exception cref="DeviceMemoryAdmissionException">Not even one layer fits on the dGPU.</exception>
     public static (IModel Model, Func<int, IKvCache> KvCacheFactory, LayerSplitPlan? Plan) Load(
         GgufFile gguf, ModelConfig config, int deviceId, ThreadingConfig threading, MoeOffloadOptions? moeOffload,
-        Func<IgpuTier?>? igpuProbe, Action<string>? log)
+        Func<IgpuTier?>? igpuProbe, Action<string>? log, int prefillChunkTokens = 0)
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
@@ -91,11 +104,12 @@ public static class CudaAutoSplit
             return (full, fullKv, null);
         }
 
-        var input = BuildInput(config, m, free, CudaAdmission.ReserveBytes, ctx, igpu: null);
+        int chunk = SplitPrefillChunk(prefillChunkTokens);
+        var input = BuildInput(config, m, free, CudaAdmission.ReserveBytes, ctx, igpu: null, chunk);
         var plan = LayerSplitPlanner.Plan(input);
         if (!plan.AllOnDgpu && plan.DgpuLayers > 0 && igpuProbe?.Invoke() is { } igpu)
             plan = LayerSplitPlanner.Plan(input with { Igpu = igpu });
-        log($"--gpu-layers auto: {plan.Describe()} for a {ctx}-token context ({plan.Reason}).");
+        log($"--gpu-layers auto: {plan.Describe()} for a {ctx}-token context, prefill chunk {Math.Min(chunk, ctx)} ({plan.Reason}).");
 
         if (plan.AllOnDgpu)
         {
@@ -134,16 +148,18 @@ public static class CudaAutoSplit
     /// <param name="reserveBytes">Admission reserve.</param>
     /// <param name="ctx">Planned context.</param>
     /// <param name="igpu">iGPU tier or null.</param>
+    /// <param name="prefillChunk">Tokens per prefill forward: the forward scratch is reserved for this many (at most the context).</param>
     /// <returns>The input.</returns>
-    internal static LayerSplitInput BuildInput(ModelConfig config, Measurement m, long freeBytes, long reserveBytes, int ctx, IgpuTier? igpu)
+    internal static LayerSplitInput BuildInput(ModelConfig config, Measurement m, long freeBytes, long reserveBytes, int ctx, IgpuTier? igpu,
+        int prefillChunk = DefaultSplitPrefillChunk)
         => new(freeBytes, reserveBytes,
             DgpuFixedBytes: m.EmbeddingBytes + m.PendingLazyBytes,
             LayerWeightBytes: m.LayerBytes,
             KvBytesPerTokenPerLayer: CudaKvCache.BytesFor(KvGeometry.FromConfig(config), 1) / Math.Max(1, config.NumLayers),
             ContextTokens: ctx,
             ActivationBytesPerToken: m.ActivationBytesPerToken,
-            // Unchunked prefill of a full-context prompt: the scratch the hybrid's forward state grows to.
-            ActivationTokens: ctx,
+            // A split's prefill runs in chunks (SplitPrefillChunk), so the forward state grows to the chunk, not the context.
+            ActivationTokens: Math.Min(ctx, Math.Max(1, prefillChunk)),
             HeadBytes: m.HeadBytes,
             Igpu: igpu);
 

@@ -182,7 +182,7 @@ public static class ServerStartup
                 // -1 is "all layers"; auto (#1851) is sized by the loader, like an explicit partial count.
                 var plan = DeviceSelector.Plan(spec, bytes, Endpoints.DeviceEndpoint.Describe(),
                     fullOffload: options.GpuLayers is null or -1 && !ExpertOffloadPossible(resolvedPath, options.MoeOffload),
-                    autoSplit: spec.Kind == DeviceKind.Cuda && options.GpuLayers is null && AutoSplitBlocker(resolvedPath) is null);
+                    autoSplit: spec.Kind == DeviceKind.Cuda && options.GpuLayers is null && AutoSplitBlocker(resolvedPath, options) is null);
                 if (plan.Error is not null)
                     throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(options.Device, name, bytes, plan.Error));
             }
@@ -205,7 +205,7 @@ public static class ServerStartup
         // WARNING (console + ServerState.DeviceFallbackWarning -> /props) rather than a quiet log line (#733).
         Exception? last = null;
         var gpuFailures = new List<string>();
-        string? splitBlocker = options.GpuLayers is null or GpuOffloadPlanner.AutoGpuLayers ? AutoSplitBlocker(resolvedPath) : "explicit --gpu-layers";
+        string? splitBlocker = options.GpuLayers is null or GpuOffloadPlanner.AutoGpuLayers ? AutoSplitBlocker(resolvedPath, options) : "explicit --gpu-layers";
         var autoDevices = Endpoints.DeviceEndpoint.Describe();
         var autoPlan = DeviceSelector.Plan(spec, ModelResolver.FileLength(resolvedPath), autoDevices, autoSplit: splitBlocker is null);
         if (options.GpuLayers is null)
@@ -491,12 +491,14 @@ public static class ServerStartup
     /// (#1070), read from its metadata; false when the file cannot be read.
     /// </summary>
     /// <summary>Why the GPU/CPU split host cannot run the model at <paramref name="path"/> (#1851), or null when it can.</summary>
-    private static string? AutoSplitBlocker(string path)
+    private static string? AutoSplitBlocker(string path, ServerOptions options)
     {
         try
         {
             using var gguf = GgufFile.Open(path);
-            return DotLLM.Cuda.CudaAutoSplit.Blocker(gguf, GgufModelConfigExtractor.Extract(gguf.Metadata));
+            // The config the load will use: --rope-scaling and friends can turn YaRN on (or off), which decides the split (#432).
+            var config = GgufModelConfigExtractor.ApplyRoPEOverride(GgufModelConfigExtractor.Extract(gguf.Metadata), options.RopeOverride);
+            return DotLLM.Cuda.CudaAutoSplit.Blocker(gguf, config);
         }
         catch (Exception ex)
         {
@@ -610,7 +612,7 @@ public static class ServerStartup
             gguf, config, options.Device, options.GpuLayers, threading,
             msg => Console.WriteLine($"[dotllm] {msg}"),
             w => Console.WriteLine($"[dotllm] WARNING: {w}"),
-            options.MoeOffload);
+            options.MoeOffload, options.PrefillChunkSize);
         // Only the Vulkan models' KV factory is wired here (CUDA/hybrid models keep their own per-request caches).
         Func<int, IKvCache>? vulkanKvFactory = DeviceSpec.Parse(options.Device).Kind == DeviceKind.Vulkan ? deviceKvFactory : null;
 
@@ -735,7 +737,8 @@ public static class ServerStartup
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
             if (kvConfig.IsQuantized)
-                Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: the hybrid GPU/CPU model owns its KV cache and has no quantized storage (model {config.Architecture}).");
+                Console.WriteLine($"[dotllm] --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) does not apply to the GPU/CPU split: its KV is " +
+                                  $"F16 on the GPU layers and {(DotLLM.Cuda.HybridTransformerModel.TailUsesQ8_0(config.HeadDim) ? "q8_0" : "f16")} on the CPU tail.");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3SplitModel)
@@ -914,16 +917,20 @@ public static class ServerStartup
         if (mtpDecision.Message is { } mtpMsg)
             Console.WriteLine(mtpMsg);
 
+        // #1851: a GPU/CPU split prefills in chunks (1024 unless --prefill-chunk-size), the scratch it was planned for.
+        int prefillChunk = model is DotLLM.Cuda.HybridTransformerModel
+            ? DotLLM.Cuda.CudaAutoSplit.SplitPrefillChunk(options.PrefillChunkSize) : options.PrefillChunkSize;
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
             mtpEnabled: options.MtpEnabled, mtpAdaptive: true, recurrentPrefixCache: options.PromptCacheEnabled,
             promptLookup: options.PromptLookup,
             prefixTrieManager: prefixTrieManager,
             prefixCacheHeadroomTokens: prefixCacheHeadroom,
-            prefillChunkSize: options.PrefillChunkSize,
+            prefillChunkSize: prefillChunk,
             recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions());
-        if (options.PrefillChunkSize > 0)
-            Console.WriteLine($"[dotllm] Prefill chunk size: {options.PrefillChunkSize} tokens per forward pass");
+        if (prefillChunk > 0)
+            Console.WriteLine($"[dotllm] Prefill chunk size: {prefillChunk} tokens per forward pass" +
+                              (prefillChunk != options.PrefillChunkSize ? " (GPU/CPU split default; --prefill-chunk-size overrides)" : ""));
         if (options.PromptLookup is { } lookup)
             Console.WriteLine($"[dotllm] Prompt lookup: up to {lookup.DraftTokens} drafts, n-gram {lookup.MinNgram}..{lookup.MaxNgram} (greedy requests; continuous batching off)");
         if (generator.RecurrentStepCheckpointBytes > 0)

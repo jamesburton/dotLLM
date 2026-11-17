@@ -71,7 +71,12 @@ public sealed class CudaAutoSplitTests
         var input = CudaAutoSplit.BuildInput(config, m, 1L << 30, 256L << 20, ctx: 4096, igpu: null);
         Assert.Equal(2L * 2 * 64 * 2, input.KvBytesPerTokenPerLayer);   // K + V, 2 KV heads x 64, F16
         Assert.Equal(1007, input.DgpuFixedBytes);
-        Assert.Equal(4096, input.ActivationTokens);
+        // The scratch is reserved for the split's prefill chunk (1024 by default, James 2026-11-17), not the whole context.
+        Assert.Equal(CudaAutoSplit.DefaultSplitPrefillChunk, input.ActivationTokens);
+        Assert.Equal(512, CudaAutoSplit.BuildInput(config, m, 1L << 30, 256L << 20, ctx: 4096, igpu: null, prefillChunk: 512).ActivationTokens);
+        Assert.Equal(300, CudaAutoSplit.BuildInput(config, m, 1L << 30, 256L << 20, ctx: 300, igpu: null).ActivationTokens);
+        Assert.Equal(1024, CudaAutoSplit.SplitPrefillChunk(0));
+        Assert.Equal(256, CudaAutoSplit.SplitPrefillChunk(256));
         Assert.Equal(CudaAutoSplit.DefaultPlanContextTokens, CudaAutoSplit.PlanContext(null, 32768));
         Assert.Equal(2048, CudaAutoSplit.PlanContext(null, 2048));
     }
@@ -86,5 +91,39 @@ public sealed class CudaAutoSplitTests
         Assert.Contains("cannot be split", GpuOffloadPlanner.AutoSplitBlocker(Config() with { Architecture = Architecture.NemotronH }));
         // A uniform window (Mistral) is what the tail already honours.
         Assert.Null(GpuOffloadPlanner.AutoSplitBlocker(Config() with { SlidingWindowSize = 4096 }));
+    }
+
+    [Theory]
+    [InlineData(64, true)]
+    [InlineData(128, true)]
+    [InlineData(80, false)]
+    [InlineData(96, true)]
+    [InlineData(72, false)]
+    public void TailKv_IsQ8_0_OnlyWhenHeadsSitOnWholeBlocks(int headDim, bool q8)
+        => Assert.Equal(q8, HybridTransformerModel.TailUsesQ8_0(headDim));
+
+    [Fact]
+    public unsafe void F16Tail_StoresHalfRows_AtTheirPositions_AndRollsBack()
+    {
+        const int heads = 2, headDim = 80, stride = heads * headDim;
+        using var cache = new HybridF16TailKvCache(numLayers: 2, heads, headDim, maxSeqLen: 8);
+        Assert.Equal(stride * 2, cache.RowBytes);
+        var k = new float[3 * stride];
+        var v = new float[3 * stride];
+        for (int i = 0; i < k.Length; i++) { k[i] = i * 0.25f; v[i] = -i * 0.5f; }
+        fixed (float* kp = k, vp = v)
+            cache.Update(new DotLLM.Core.Tensors.TensorRef(3, stride, DotLLM.Core.Tensors.DType.Float32, -1, (nint)kp),
+                         new DotLLM.Core.Tensors.TensorRef(3, stride, DotLLM.Core.Tensors.DType.Float32, -1, (nint)vp), [2, 3, 4], 1);
+        Assert.Equal(5, cache.CurrentLength);
+        Half* kr = (Half*)cache.KeysOf(1), vr = (Half*)cache.ValuesOf(1);
+        for (int t = 0; t < 3; t++)
+            for (int c = 0; c < stride; c += 37)
+            {
+                Assert.Equal((float)(Half)k[t * stride + c], (float)kr[(t + 2) * stride + c]);
+                Assert.Equal((float)(Half)v[t * stride + c], (float)vr[(t + 2) * stride + c]);
+            }
+        Assert.Equal(DotLLM.Core.Tensors.DType.Float16, cache.GetKeysRef(1).DType);
+        cache.Rollback(3);
+        Assert.Equal(3, cache.CurrentLength);
     }
 }

@@ -33,11 +33,11 @@ public static class ModelManagementEndpoint
     }
 
     /// <summary>
-    /// Precedence request > profile > startup, except that the "all layers" sentinel (negative) is returned as null
+    /// Precedence request > profile > startup, except that the "all layers" sentinel (-1) is returned as null; auto (-2, #1851) passes through
     /// (unset: a GPU device then loads every layer as the loader counts them) so no profile/startup count can leak in.
     /// </summary>
     internal static int? ResolveRequestedGpuLayers(int? request, int? profile, int? startup) =>
-        request is < 0 ? null : request ?? profile ?? startup;
+        request is -1 ? null : request ?? profile ?? startup;
 
     /// <summary>
     /// KV cache type for a load (#1416). Omitted field: the operator's startup default (never the previous model's

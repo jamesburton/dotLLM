@@ -133,10 +133,11 @@ public static class DeviceModelLoader
     /// <param name="log">Informational messages.</param>
     /// <param name="warn">Warnings.</param>
     /// <param name="moeOffload">Routed-expert offload (CUDA <c>nemotron_h_moe</c>, #1070); null = defaults plus environment.</param>
+    /// <param name="prefillChunkTokens">The <c>--prefill-chunk-size</c> value (0 = the split default) an automatic split plans for (#1851).</param>
     /// <returns>The model and its KV-cache factory (null for the CPU model).</returns>
     public static (IModel Model, Func<int, IKvCache>? KvCacheFactory) LoadExact(
         GgufFile gguf, ModelConfig config, string canonicalDevice, int? requestedGpuLayers,
-        ThreadingConfig threading, Action<string> log, Action<string> warn, MoeOffloadOptions? moeOffload = null)
+        ThreadingConfig threading, Action<string> log, Action<string> warn, MoeOffloadOptions? moeOffload = null, int prefillChunkTokens = 0)
     {
         var spec = DeviceSpec.Parse(canonicalDevice);
         if (spec.Kind == DeviceKind.Auto)
@@ -180,7 +181,7 @@ public static class DeviceModelLoader
                 // #1851: the planner chooses N and logs the placement and why.
                 var autoMoe = moeOffload ?? MoeOffloadOptions.WithEnvironmentFallback(null);
                 return DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(gguf, config, GpuOffloadPlanner.AutoGpuLayers, spec.Ordinal, threading,
-                    warn, autoMoe with { Log = autoMoe.Log ?? log }, ProbeIgpu, log);
+                    warn, autoMoe with { Log = autoMoe.Log ?? log }, ProbeIgpu, log, prefillChunkTokens);
             }
             requestedGpuLayers = 0;   // --device cpu --gpu-layers auto: nothing to place on a GPU
         }
@@ -260,14 +261,15 @@ public static class DeviceModelLoader
     /// <param name="log">Informational messages.</param>
     /// <param name="warn">Warnings.</param>
     /// <param name="moeOffload">Routed-expert offload (CUDA <c>nemotron_h_moe</c>, #1070); null = defaults plus environment.</param>
+    /// <param name="prefillChunkTokens">The <c>--prefill-chunk-size</c> value (0 = the split default) an automatic split plans for (#1851).</param>
     /// <returns>The load result.</returns>
     public static DeviceLoadResult Load(
         GgufFile gguf, ModelConfig config, string requestedDevice, int? requestedGpuLayers,
         ThreadingConfig threading, long modelBytes, string modelName, Action<string> log, Action<string> warn,
-        MoeOffloadOptions? moeOffload = null)
+        MoeOffloadOptions? moeOffload = null, int prefillChunkTokens = 0)
         => LoadWith(gguf, config, requestedDevice, requestedGpuLayers, threading, modelBytes, modelName, log, warn,
             Endpoints.DeviceEndpoint.Describe(),
-            (device, layers) => LoadExact(gguf, config, device, layers, threading, log, warn, moeOffload), moeOffload,
+            (device, layers) => LoadExact(gguf, config, device, layers, threading, log, warn, moeOffload, prefillChunkTokens), moeOffload,
             c => DotLLM.Cuda.CudaAutoSplit.Blocker(gguf, c));
 
     /// <summary>

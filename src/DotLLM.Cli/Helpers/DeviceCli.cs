@@ -51,14 +51,14 @@ internal static class DeviceCli
     /// </summary>
     public static (DeviceLoadResult Load, Outcome Outcome) Load(
         GgufFile gguf, ModelConfig config, string device, int? gpuLayers, ThreadingConfig threading,
-        string modelPath, DotLLM.Core.Moe.MoeOffloadOptions? moeOffload = null)
+        string modelPath, DotLLM.Core.Moe.MoeOffloadOptions? moeOffload = null, int prefillChunkTokens = 0)
     {
         var notes = new List<string>();
         var warnings = new List<string>();
         var res = DeviceModelLoader.Load(
             gguf, config, device, gpuLayers, threading,
             ModelResolver.FileLength(modelPath), Path.GetFileName(modelPath),
-            notes.Add, warnings.Add, moeOffload);
+            notes.Add, warnings.Add, moeOffload, prefillChunkTokens);
         string? warning = res.Warning;
         if (warnings.Count > 0)
             warning = warning is null ? string.Join(" ", warnings) : warning + " " + string.Join(" ", warnings);
