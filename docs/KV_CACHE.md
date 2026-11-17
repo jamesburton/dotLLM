@@ -729,7 +729,9 @@ On each new token write, the oldest window entry is quantized and appended to th
     (`__float2half(d * q)`, the eager dequant's expression) and rows past the quantized length read from the FP16 window ring at slot
     `t % window`. Bit-identical to dequant-into-scratch + `attention_f16`. Decode (eager and the windowed decode graph's
     `attention_kvq_dyn`) and every prefill the tensor-core kernel does not take: sliding window, sinks, a window ring, head dims
-    other than 64 / 128, GQA groups above 8, fewer than 16 rows.
+    other than 64 / 128, GQA groups above 8, fewer than 16 rows. A head that straddles 32-element blocks (head_dim % 32 != 0, e.g.
+    hd80) is read one element at a time; the cache only requires the whole KV row to be a multiple of 32. Both K and V must be
+    q8_0 / q4_0: an f16 + block mix is refused when the cache is created (it failed at the first KV write before).
   - `attention_flash_mma_prefill_kvq` (`native/kernels/attention_flash_mma_prefill_kvq.cu`, Ampere+): tensor-core causal prefill,
     head_dim 64 / 128, F16 output, each thread decoding its 8-element chunk into the shared K/V tile. Cold prefill and the #1847
     prefix-reuse suffix prefill (`position_offset > 0`) share it, so q8_0 no longer goes through G3 over a dequantized scratch
