@@ -32,6 +32,13 @@ public sealed unsafe class HybridTransformerModel : IModel
     /// <summary>Whether the WDDM spill monitor is attached (tests; #1848).</summary>
     internal bool HasSpillMonitor => _spillMonitor is not null;
 
+    /// <summary>Reads the spill counter now; shared GPU memory above the post-load level, in bytes (tests; #1851).</summary>
+    internal long CheckSpill(string context)
+    {
+        _spillMonitor.Check(context);
+        return _spillMonitor.SpilledBytes;
+    }
+
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
     private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
     private const int Q8_1GroupSize = QuantFormat.LegacyGroupSize;
@@ -60,6 +67,8 @@ public sealed unsafe class HybridTransformerModel : IModel
     private readonly int _gpuRopeType;
     private readonly RoPEType _cpuRopeType;
     private readonly int? _slidingWindowSize;
+    private readonly float _cpuQPrescale;
+    private int _f16TailLogged;
     private nint _fp16TransferBuffer;
     private int _fp16TransferCapacity; // in elements
 
@@ -118,6 +127,11 @@ public sealed unsafe class HybridTransformerModel : IModel
         _cpuRopeType = cpuRopeType;
         _slidingWindowSize = slidingWindowSize;
         VramWarning = vramWarning;
+        // #1851: a Granite attention multiplier that folds into RoPE (TwIL-8B). The GPU half gets it from the RoPE mscale
+        // (CudaWeights); the CPU tail's attention kernels hard-code 1/sqrt(headDim), so Q is pre-scaled there, as on the CPU host.
+        _cpuQPrescale = config.GraniteScalarsFoldIntoRope
+            ? config.AttentionScoreScale(config.HeadDim) * MathF.Sqrt(config.HeadDim)
+            : 1f;
 
         // Initial transfer buffer for decode (1 token)
         _fp16TransferCapacity = config.HiddenSize;
@@ -137,7 +151,7 @@ public sealed unsafe class HybridTransformerModel : IModel
         GgufFile gguf, ModelConfig config, int numGpuLayers,
         int deviceId, ThreadingConfig threading)
     {
-        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel));
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel), allowFoldedGraniteScalars: true);
         if (numGpuLayers <= 0 || numGpuLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
                 $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
@@ -176,7 +190,13 @@ public sealed unsafe class HybridTransformerModel : IModel
 
                 kernels = new CudaKernels(ptxDir);
 
-                // 3. Upload only GPU layers to VRAM
+                // 3. Upload only GPU layers to VRAM. #1851: admitted first, like the whole-model load (#1848), so a --gpu-layers N
+                //    that does not fit is refused with the numbers instead of being backed by shared system memory.
+                var (estLayers, estEmbedding, _) = CudaAutoSplit.EstimateWeightBytes(gguf, config, kernels);
+                long gpuWeightBytes = estEmbedding;
+                for (int l = 0; l < numGpuLayers; l++) gpuWeightBytes += estLayers[l];
+                CudaAdmission.EnsureFits($"model weights for {numGpuLayers} of {config.NumLayers} GPU layers (~{gpuWeightBytes >> 20} MiB)",
+                    gpuWeightBytes, remedies: GpuLayersRemedies);
                 gpuWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle, numGpuLayers);
 
                 // 4. VRAM estimation and warning
@@ -307,7 +327,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(cpuWeights);
         ArgumentNullException.ThrowIfNull(config);
-        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel));
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel), allowFoldedGraniteScalars: true);
         if (numGpuLayers <= 0 || numGpuLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
                 $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
@@ -420,14 +440,65 @@ public sealed unsafe class HybridTransformerModel : IModel
         }
     }
 
-    /// <summary>Creates a <see cref="HybridKvCache"/> for this model.</summary>
-    public HybridKvCache CreateKvCache(int maxSeqLen)
+    /// <summary>Remedies for a <c>--gpu-layers N</c> whose weights do not fit (#1851).</summary>
+    internal const string GpuLayersRemedies =
+        "Lower --gpu-layers, let dotllm choose the count with --gpu-layers auto, use a smaller quantization, or free GPU memory";
+
+    /// <summary>KV storage type of the CPU tail (#1851): Q8_0 blocks, read in place by the CPU attention (rule 1: no FP32 KV).</summary>
+    internal const KvCacheDType CpuTailKvDType = KvCacheDType.Q8_0;
+
+    /// <summary>
+    /// Whether the CPU tail can store Q8_0 for this head dimension (#1851): a Q8_0 block must not straddle two heads, because the
+    /// quantized attention decodes one head at a time. Otherwise the tail is F16 (<see cref="HybridF16TailKvCache"/>), never FP32.
+    /// </summary>
+    public static bool TailUsesQ8_0(int headDim) => headDim % QuantFormat.LegacyGroupSize == 0;
+
+    /// <summary>Test control (#1851): the pre-#1851 FP32 tail KV, to separate the Q8_0 tail's error from the split's.</summary>
+    internal HybridKvCache CreateKvCacheWithF32TailForTests(int maxSeqLen)
     {
         _context.MakeCurrent();
         return new HybridKvCache(
             new CudaKvCache(_numGpuLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen),
             new SimpleKvCache(Config.NumLayers - _numGpuLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen),
             _numGpuLayers);
+    }
+
+    /// <summary>
+    /// Creates a <see cref="HybridKvCache"/> for this model: F16 device KV for the GPU layers and Q8_0 host KV for the CPU tail
+    /// (#1851; the tail was an FP32 <see cref="SimpleKvCache"/>, 4x the bytes, against rule 1).
+    /// </summary>
+    public HybridKvCache CreateKvCache(int maxSeqLen)
+    {
+        _context.MakeCurrent();
+        var gpu = new CudaKvCache(_numGpuLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
+        try
+        {
+            int tailLayers = Config.NumLayers - _numGpuLayers;
+            IKvCache tail;
+            if (TailUsesQ8_0(Config.HeadDim))
+            {
+                tail = new QuantizedKvCache(tailLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen, CpuTailKvDType, CpuTailKvDType, windowSize: 0);
+            }
+            else
+            {
+                // TODO(#1870): temporary F16 fallback for head_dim % 32 != 0; remove when quantized KV supports it
+                if (Interlocked.Exchange(ref _f16TailLogged, 1) == 0)
+                {
+                    long stride = (long)Config.NumKvHeads * Config.HeadDim;
+                    long f16 = 2 * tailLayers * stride * sizeof(ushort);
+                    long q8 = 2 * tailLayers * (stride / QuantFormat.LegacyGroupSize) * QuantFormat.Q8_0BlockBytes;
+                    Console.Error.WriteLine($"[dotllm] CPU-tail KV is F16, not q8_0: head_dim {Config.HeadDim} is not a multiple of " +
+                        $"{QuantFormat.LegacyGroupSize} ({f16} bytes per token over {tailLayers} tail layers, ~{q8} at q8_0). Temporary; see #1870.");
+                }
+                tail = new HybridF16TailKvCache(tailLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
+            }
+            return new HybridKvCache(gpu, tail, _numGpuLayers);
+        }
+        catch
+        {
+            gpu.Dispose();
+            throw;
+        }
     }
 
     /// <inheritdoc/>
@@ -901,6 +972,11 @@ public sealed unsafe class HybridTransformerModel : IModel
                     positions, numHeads, numKvHeads, headDim, _ropeDim,
                     _cpuState.CosTable, _cpuState.SinTable, _cpuRopeType);
 
+                // Non-default score scale (#1851, folded Granite multiplier): the CPU attention kernels use 1/sqrt(headDim).
+                if (_cpuQPrescale != 1f)
+                    TensorPrimitives.Multiply(new Span<float>(q, seqLen * numHeads * headDim), _cpuQPrescale,
+                        new Span<float>(q, seqLen * numHeads * headDim));
+
                 // Attention with KV-cache
                 if (hybridKvCache is not null)
                 {
@@ -911,7 +987,14 @@ public sealed unsafe class HybridTransformerModel : IModel
 
                     int seqKv = hybridKvCache.CpuCache.CurrentLength;
 
-                    if (hybridKvCache.CpuCache is IQuantizedKvCache qkvCache)
+                    if (hybridKvCache.CpuCache is HybridF16TailKvCache f16Tail)
+                    {
+                        // head_dim not a multiple of 32 (#1851): F16 rows read in place.
+                        Attention.ExecuteContiguousRows(q, f16Tail.KeysOf(cpuLocalLayer), f16Tail.ValuesOf(cpuLocalLayer),
+                            Attention.KvRowFormat.F16, f16Tail.RowBytes, attnOut, seqLen, seqKv, numHeads, numKvHeads, headDim,
+                            positions[0], _threadPool, _slidingWindowSize);
+                    }
+                    else if (hybridKvCache.CpuCache is IQuantizedKvCache qkvCache)
                     {
                         Attention.Execute(q, qkvCache, cpuLocalLayer, attnOut,
                             seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
@@ -1092,6 +1175,10 @@ public sealed unsafe class HybridTransformerModel : IModel
             // LM Head — last token only
             float* lastHidden = hidden + (seqLen - 1) * hiddenSize;
             {
+                // #1851: since #1137 the logits buffer is allocated on demand for the rows the head computes, and this host never
+                // asked for it, so the head wrote through a null pointer (AccessViolation in the LM-head GEMV on every split).
+                _cpuState.EnsureLogitsCapacity(1);
+                logits = (float*)_cpuState.Logits;
                 var rwOutput = _cpuWeights.RepackedOutput ?? default;
                 GemvInterleaved(_cpuWeights.OutputWeight, _cpuWeights.OutputQuantType,
                     lastHidden, logits, _cpuWeights.OutputOutputDim, _cpuWeights.OutputInputDim, in rwOutput);

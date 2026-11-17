@@ -203,9 +203,36 @@ public static class CudaModelLoader
     public static (IModel Model, Func<int, IKvCache>? KvCacheFactory) CreateForGpuLayers(
         GgufFile gguf, ModelConfig config, int requestedGpuLayers, int deviceId,
         ThreadingConfig threading, Action<string>? warn = null, MoeOffloadOptions? moeOffload = null)
+        => CreateForGpuLayers(gguf, config, requestedGpuLayers, deviceId, threading, warn, moeOffload, igpuProbe: null, log: null);
+
+    /// <summary>
+    /// <inheritdoc cref="CreateForGpuLayers(GgufFile, ModelConfig, int, int, ThreadingConfig, Action{string}?, MoeOffloadOptions?)"/>
+    /// <see cref="GpuOffloadPlanner.AutoGpuLayers"/> chooses the count with <see cref="CudaAutoSplit"/> (#1851).
+    /// </summary>
+    /// <param name="gguf">An opened GGUF file; must outlive the model.</param>
+    /// <param name="config">Model configuration.</param>
+    /// <param name="requestedGpuLayers">Requested GPU layer count, or <see cref="GpuOffloadPlanner.AutoGpuLayers"/>.</param>
+    /// <param name="deviceId">GPU device ordinal.</param>
+    /// <param name="threading">CPU threading.</param>
+    /// <param name="warn">User-facing warnings.</param>
+    /// <param name="moeOffload">Routed-expert offload; its <c>ContextTokens</c> (<c>--ctx-size</c>) is the context auto plans for.</param>
+    /// <param name="igpuProbe">Finds an iGPU for the tail under auto; null for none.</param>
+    /// <param name="log">Informational messages (the auto placement line).</param>
+    /// <param name="prefillChunkTokens">The <c>--prefill-chunk-size</c> value (0 = the split default) auto plans its scratch for.</param>
+    /// <returns>The model and its KV-cache factory.</returns>
+    public static (IModel Model, Func<int, IKvCache>? KvCacheFactory) CreateForGpuLayers(
+        GgufFile gguf, ModelConfig config, int requestedGpuLayers, int deviceId,
+        ThreadingConfig threading, Action<string>? warn, MoeOffloadOptions? moeOffload,
+        Func<IgpuTier?>? igpuProbe, Action<string>? log, int prefillChunkTokens = 0)
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
+
+        if (GpuOffloadPlanner.IsAuto(requestedGpuLayers))
+        {
+            var (m, kv, _) = CudaAutoSplit.Load(gguf, config, deviceId, threading, moeOffload, igpuProbe, log ?? warn, prefillChunkTokens);
+            return (m, kv);
+        }
 
         var plan = GpuOffloadPlanner.Plan(config.Architecture, requestedGpuLayers, config.NumLayers);
         if (plan.Warning is not null) warn?.Invoke(plan.Warning);

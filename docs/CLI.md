@@ -75,7 +75,11 @@ Where models live: the dotLLM store `~/.dotllm/models/` (`DOTLLM_MODELS_DIR` rel
 Values are case-insensitive; a typo is an error that lists the accepted values. An **explicit GPU that cannot be honoured is an error, never a
 silent CPU run**; only `auto` falls through (CUDA, then Vulkan, then CPU). After the load a line `device: requested -> resolved (GPU name)` is printed
 (to stderr with `--json`); `dotllm ps` and `GET /props` report it for a server. A model profile's `--device` overrides the server's `--device` for that model.
-`--gpu-layers N` is CUDA partial offload (the other layers run on the CPU) and is ignored on Vulkan, where the model is device-resident. MoE expert
+`--gpu-layers N` is CUDA partial offload (the other layers run on the CPU) and is ignored on Vulkan, where the model is device-resident.
+`--gpu-layers auto` chooses N: the most leading layers whose weights, KV for the context (`--ctx-size`, default 4096) and scratch fit in free
+VRAM, and logs the placement and why ([GPU.md](GPU.md#automatic-layer-count---gpu-layers-auto)). Under `--device auto`, a CUDA device the whole
+model does not fit is tried as such a split before Vulkan and the CPU; an explicit `--device gpu` that does not fit refuses, with a
+`--gpu-layers auto` hint, and never splits on its own. MoE expert
 placement is controlled by the `--moe-*`, `--cpu-moe` and `--n-cpu-moe` options ([MOE_OFFLOAD.md](MOE_OFFLOAD.md)).
 Backend background: [GPU.md](GPU.md), [VULKAN.md](VULKAN.md), [CUDA.md](CUDA.md).
 
@@ -240,7 +244,7 @@ Creating an existing name overwrites it. A chain of profiles (`fast` -> `terse` 
 | `--description` `<text>` | unset |  | Free-text note shown by 'dotllm model show'. |
 | `--device`, `-d` `<text>` | unset |  | Device this model loads on: auto, cpu, vulkan, vulkan:N, gpu, gpu:N, cuda, cuda:N. Unset = the server's --device. See docs/CLI.md#device-selection. |
 | `--from`, `-f` `<text>` | unset |  | Base model: a .gguf path, 'owner/repo' or 'owner/repo:quant', a local model name, or another profile. |
-| `--gpu-layers` `<int>` | unset |  | Transformer layers to offload to the GPU (CUDA partial offload). Omit for the device default (all on a GPU device); ignored on vulkan, which is whole-model resident. |
+| `--gpu-layers` `<int>` | unset |  | Transformer layers to offload to the GPU (CUDA partial offload): 'auto' (as many leading layers as fit), N, or 'all'. Omit for the device default (all on a GPU device); ignored on vulkan, which is whole-model resident. |
 | `--keep-alive` `<number>` | unset |  | Seconds to keep the model loaded after its last request (0 = unload after each request, negative = never). |
 | `--max-tokens` `<int>` | unset |  | Default maximum generated tokens per request when the request sets none. |
 | `--min-p` `<number>` | unset |  | Default min-P threshold for requests that omit it. 0 = disabled. |
@@ -342,7 +346,7 @@ Option groups: sampling (`--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-*`
 | `--dry-penalty-last-n` `<int>` | 0 |  | Number of recent tokens considered for DRY matching. 0 = full history. |
 | `--dry-sequence-breaker` `<text>` | unset |  | Token string that resets DRY n-gram matching, repeatable. Default: newline, ':', '"', '*'. |
 | `--frequency-penalty` `<number>` | 0 |  | OpenAI-style frequency penalty: subtracted proportionally to occurrence count. 0 = disabled. |
-| `--gpu-layers` `<int>` | unset |  | Number of transformer layers to offload to GPU (CUDA). 0 = CPU only. Omit for default (all layers on a GPU device, 0 with --device cpu). Ignored on vulkan (whole model is device-resident). |
+| `--gpu-layers` `<int>` | unset |  | CUDA layer placement: 'auto' (the largest number of leading layers whose weights, KV for the context and scratch fit in free VRAM; the rest run on the CPU), or N leading layers on the GPU and the rest on the CPU (0 = CPU only, 'all' or -1 = every layer). Omit for the device default: every layer with --device gpu, and with --device auto an automatic split when the model does not fit a CUDA device whole. Ignored on vulkan (whole model is device-resident). |
 | `--grammar` `<text>` | unset |  | GBNF grammar string or file path (prefixed with @) for grammar response format. |
 | `--json` | off |  | Output result as a single JSON object (suppresses all formatted output). |
 | `--kv-quant-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache key storage: f16, q8_0, q4_0. Synonym of --cache-type-k. For the CUDA hybrid-dense model (Bonsai-2 / qwen35) overrides DOTLLM_HYBRID_KV; quantized KV needs numKvHeads*headDim % 32 == 0. |
@@ -429,7 +433,7 @@ dotllm chat Qwen/Qwen3-0.6B-GGUF --tools @tools.json --tool-choice auto
 | `--decode-threads` `<int>` | 0 |  | Number of threads for decode. 0 = auto (caps at memory channel count). |
 | `--device`, `-d` `<text>` | `auto` | `DOTLLM_VULKAN_DEVICE_INDEX` | Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - with a warning if it ends on the CPU), 'cpu', 'vulkan' (the default Vulkan GPU), 'vulkan:N' (Vulkan physical device N), 'gpu'/'cuda' (CUDA device 0), 'gpu:N'/'cuda:N' (CUDA ordinal N). Case-insensitive. An explicit GPU that cannot be honoured is an error, never a silent CPU run. Env: DOTLLM_VULKAN_DEVICE_INDEX picks the Vulkan device behind plain 'vulkan'. |
 | `--dflash` `<text>` | unset |  | Path of a DFlash / DFlash2 drafter GGUF (arch 'dflash', e.g. z-lab/Qwen3.8-27B-DFlash2-GGUF). It takes the MTP slot: drafts are verified by the MTP speculative decoder, greedy output is identical to plain decode. qwen35 targets on CPU, CUDA or Vulkan (drafter on the CPU). Overrides an embedded MTP head. |
-| `--gpu-layers` `<int>` | unset |  | Number of transformer layers to offload to GPU (CUDA). 0 = CPU only. Omit for default (all layers on a GPU device, 0 with --device cpu). Ignored on vulkan (whole model is device-resident). |
+| `--gpu-layers` `<int>` | unset |  | CUDA layer placement: 'auto' (the largest number of leading layers whose weights, KV for the context and scratch fit in free VRAM; the rest run on the CPU), or N leading layers on the GPU and the rest on the CPU (0 = CPU only, 'all' or -1 = every layer). Omit for the device default: every layer with --device gpu, and with --device auto an automatic split when the model does not fit a CUDA device whole. Ignored on vulkan (whole model is device-resident). |
 | `--grammar` `<text>` | unset |  | GBNF grammar string or file path (prefixed with @) for grammar response format. |
 | `--lookup-draft` `<int>` | 8 |  | Maximum drafts per prompt-lookup round. Default 8. |
 | `--lookup-ngram` `<int>` | 6 |  | Longest context suffix (tokens) prompt lookup matches; shorter matches down to 2 tokens are used when it does not recur. Default 6. |
@@ -524,7 +528,7 @@ Notes on interplay:
 | `--device`, `-d` `<text>` | `auto` | `DOTLLM_VULKAN_DEVICE_INDEX` | Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - with a warning if it ends on the CPU), 'cpu', 'vulkan' (the default Vulkan GPU), 'vulkan:N' (Vulkan physical device N), 'gpu'/'cuda' (CUDA device 0), 'gpu:N'/'cuda:N' (CUDA ordinal N). Case-insensitive. An explicit GPU that cannot be honoured is an error, never a silent CPU run. Env: DOTLLM_VULKAN_DEVICE_INDEX picks the Vulkan device behind plain 'vulkan'. A model profile's device overrides it for that model. |
 | `--dflash` `<text>` | unset |  | Path of a DFlash / DFlash2 drafter GGUF (arch 'dflash'). It takes the MTP slot; qwen35 targets on CPU, CUDA or Vulkan (drafter on the CPU). |
 | `--expected-concurrency` `<int>` | 0 | `DOTLLM_VK_SCHEDULER` | Expected number of concurrently decoding requests. At 5 or more, Vulkan hybrid models serve through the continuous-batch scheduler (measured +73% aggregate decode throughput at 8 concurrent on Tev1-4B; parity at 4 or fewer). At 5 or more, default-on MTP is dropped for the model. 0 (default) keeps the serial per-request path. DOTLLM_VK_SCHEDULER=0\|1 overrides. |
-| `--gpu-layers` `<int>` | unset |  | CUDA partial offload: number of transformer layers kept on the GPU, the rest run on the CPU. Omit for all layers on a GPU device (0 with --device cpu). Ignored on vulkan, where the whole model is device-resident. |
+| `--gpu-layers` `<int>` | unset |  | CUDA layer placement: 'auto' (the largest number of leading layers whose weights, KV for the context and scratch fit in free VRAM; the rest run on the CPU), or N leading layers on the GPU and the rest on the CPU (0 = CPU only, 'all' or -1 = every layer). Omit for the device default: every layer with --device gpu, and with --device auto an automatic split when the model does not fit a CUDA device whole. Ignored on vulkan (whole model is device-resident). |
 | `--host` `<text>` | `localhost` |  | Address to bind (default localhost = loopback only). Use 0.0.0.0 to serve the network - the inference endpoints are unauthenticated, so pair that with a firewall or reverse proxy. /metrics is on by default for loopback binds only. |
 | `--keep-alive` `<number>` | 300 |  | Idle-unload timeout in seconds (ollama parity). Default 300 (5 min); 0 = unload after every request; negative = never unload. A model profile's keep_alive overrides it for that model. |
 | `--kv-quant-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache key storage: f16, q8_0, q4_0. Synonym of --cache-type-k. For the CUDA hybrid-dense model (Bonsai-2 / qwen35) overrides DOTLLM_HYBRID_KV; quantized KV needs numKvHeads*headDim % 32 == 0. |

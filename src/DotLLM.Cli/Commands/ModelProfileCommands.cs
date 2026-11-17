@@ -58,7 +58,8 @@ internal sealed class ModelCreateCommand : Command<ModelCreateCommand.Settings>
         public string? Device { get; set; }
 
         [CommandOption("--gpu-layers")]
-        [Description("Transformer layers to offload to the GPU (CUDA partial offload). Omit for the device default (all on a GPU device); ignored on vulkan, which is whole-model resident.")]
+        [Description("Transformer layers to offload to the GPU (CUDA partial offload): 'auto' (as many leading layers as fit), N, or 'all'. Omit for the device default (all on a GPU device); ignored on vulkan, which is whole-model resident.")]
+        [System.ComponentModel.TypeConverter(typeof(DotLLM.Cli.Helpers.GpuLayersConverter))]
         public int? GpuLayers { get; set; }
 
         [CommandOption("--keep-alive")]
@@ -159,7 +160,7 @@ internal sealed class ModelShowCommand : Command<ModelShowCommand.Settings>
             void Row(string k, object? v) { if (v is not null) table.AddRow($"[bold]{k}[/]", (v is string[] a ? string.Join(", ", a) : v.ToString() ?? "").EscapeMarkup()); }
             Row("Description", m.Description); Row("System", m.System); Row("Temperature", m.Temperature); Row("Top-P", m.TopP); Row("Top-K", m.TopK);
             Row("Min-P", m.MinP); Row("Repeat penalty", m.RepeatPenalty); Row("Max tokens", m.MaxTokens); Row("Seed", m.Seed); Row("Stop", m.Stop);
-            Row("Device", m.Device); Row("GPU layers", m.GpuLayers); Row("Keep-alive (s)", m.KeepAlive);
+            Row("Device", m.Device); Row("GPU layers", m.GpuLayers switch { DotLLM.Core.Configuration.GpuOffloadPlanner.AutoGpuLayers => "auto", -1 => "all", var g => (object?)g }); Row("Keep-alive (s)", m.KeepAlive);
         }
         else table.AddRow("[bold]Kind[/]", "model");
 

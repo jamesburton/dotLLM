@@ -39,7 +39,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Number of GPU layers for hybrid offloading.</summary>
         [CommandOption("--gpu-layers")]
-        [Description("CUDA partial offload: number of transformer layers kept on the GPU, the rest run on the CPU. Omit for all layers on a GPU device (0 with --device cpu). Ignored on vulkan, where the whole model is device-resident.")]
+        [Description(DotLLM.Cli.Helpers.GpuLayersConverter.OptionHelp)]
+        [System.ComponentModel.TypeConverter(typeof(DotLLM.Cli.Helpers.GpuLayersConverter))]
         public int? GpuLayers { get; set; }
 
         /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
