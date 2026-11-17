@@ -653,7 +653,9 @@ Layers are assigned bottom-up: GPU gets layers 0..N-1 (lower/earlier layers), CP
 
 ### KV-Cache Split
 
-GPU layers store their KV-cache in FP16 GPU device memory (`CudaKvCache`). CPU layers store their KV-cache in FP32 host memory (`SimpleKvCache`). A `HybridKvCache` routes KV operations by layer index:
+GPU layers store their KV-cache in FP16 GPU device memory (`CudaKvCache`). CPU layers store theirs as Q8_0 blocks in host memory
+(`QuantizedKvCache`, read in place by the CPU attention; #1851, it was an FP32 `SimpleKvCache` at 4x the bytes, against the no-FP32-storage
+rule). A `HybridKvCache` routes KV operations by layer index:
 
 - Layers 0..N-1: GPU cache, updated via device-side copies (`UpdateDevice`)
 - Layers N..L-1: CPU cache, updated via standard `IKvCache.Update()` with remapped indices
@@ -694,14 +696,58 @@ Approximate formula:
 VRAM ≈ (N / L) × model_weight_bytes + embed_bytes + gpu_kv_cache + gpu_scratch
 ```
 
+### Automatic layer count (`--gpu-layers auto`)
+
+`--gpu-layers auto` (issue #1851) picks N with `LayerSplitPlanner` (`DotLLM.Core.Configuration`), from figures `CudaAutoSplit` measures with
+the CUDA context, stream, cuBLAS, kernels and the fixed forward buffers already created:
+
+| Term | Charged | Source |
+|------|---------|--------|
+| Free VRAM | | `cuMemGetInfo`, clamped by `DOTLLM_VRAM_BUDGET_MB` |
+| Reserve | once | `DOTLLM_CUDA_VRAM_RESERVE_MB` (default 256 MiB), the admission reserve |
+| Token embedding + lazy dequant scratch | once | as `CudaWeights` uploads it (FP16 table when no per-row lookup kernel exists) |
+| Forward scratch | once | `ActivationBytesPerToken` x the context (an unchunked full-context prefill) |
+| Layer weights | per GPU layer | raw quantized blocks, plus an FP16 copy for a projection type without a quantized GEMV |
+| F16 KV | per GPU layer | `2 x kvHeads x headDim x 2` bytes x the context |
+| Final norm + LM head | only when every layer fits | otherwise it runs on the tail |
+
+The context is `--ctx-size`, else 4096 (as the MoE expert planner), capped at the model's window, and a split model serves no more than
+that window. The result is the largest prefix that fits, at most L-1 layers so the tail keeps the head. Then:
+
+- **Every layer fits:** `CudaTransformerModel`, as without the flag.
+- **A split:** `HybridTransformerModel` with N GPU layers.
+- **Not one layer fits:** a refusal (`DeviceMemoryAdmissionException`). Under `--device auto` the next device is tried.
+
+The tier order is dGPU, then the iGPU, then the CPU. The planner models the iGPU tier: the tail goes there when an integrated Vulkan device is
+present and holds all of it. No dGPU + iGPU host is wired yet (#1863), so that case is logged ("the dGPU + iGPU split is not available yet")
+and the tail runs on the CPU.
+
+A line such as `--gpu-layers auto: 18 cuda + 10 cpu layers for a 4096-token context (...)` logs the placement and the numbers behind it.
+
+What can be split automatically (`GpuOffloadPlanner.AutoSplitBlocker`, `CudaAutoSplit.Blocker`) is dense Llama-style layers, plus Granite
+whose only scalar is the attention multiplier (TwIL-8B: folded into RoPE on the GPU half, Q pre-scaled on the CPU tail). These are refused
+with the reason:
+- MoE, MLA and hybrid-SSM models.
+- Per-layer sliding-window patterns and dense YaRN (#432: the CPU tail has neither).
+- Attention sinks.
+- Gemma, full-scalar Granite, SmolLM3 and OLMo-2 (#1864).
+
+A refused model loads whole on the GPU, or `--device auto` moves on, saying why.
+
+`--gpu-layers N` weights are admitted before upload too, so an N that does not fit is refused with the numbers instead of being backed by shared
+system memory.
+
 ### Edge Cases
 
 | Scenario | Behavior |
 |----------|----------|
 | `--gpu-layers 0` | Pure CPU, no CUDA initialization (safe on machines without GPU) |
-| `--gpu-layers N >= L` | Pure GPU, identical to `--device gpu` |
+| `--gpu-layers N >= L`, `all`, `-1` | Pure GPU, identical to `--device gpu` |
 | `--gpu-layers 1` | Single layer on GPU — minimal GPU acceleration, validates pipeline |
 | `--device gpu --gpu-layers N` | Explicit GPU device with partial offload — uses specified GPU ordinal |
+| `--device gpu --gpu-layers auto` | The planner chooses N on that device; refuses when not one layer fits |
+| `--device gpu` (no `--gpu-layers`), model too large | Refused before loading, with a `--gpu-layers auto` hint when the model can be split |
+| `--device auto`, model too large for the CUDA device | Tried as `--gpu-layers auto` on it first, then Vulkan, then the CPU |
 
 ### Numerical Precision
 
@@ -710,7 +756,8 @@ GPU layers compute in FP16 (Half precision). At the boundary, the hidden state i
 ### Implementation
 
 - `HybridTransformerModel` — `IModel` implementation orchestrating split forward pass
-- `HybridKvCache` — Routes `IKvCache` operations to `CudaKvCache` or `SimpleKvCache` by layer
+- `HybridKvCache` — Routes `IKvCache` operations to `CudaKvCache` or the Q8_0 `QuantizedKvCache` by layer
+- `LayerSplitPlanner` / `CudaAutoSplit` — `--gpu-layers auto` (#1851)
 - `CudaQuantizedKvCache` — Q8_0/Q4_0 GPU KV-cache with FP16 scratch-buffer attention (see [KV_CACHE.md](KV_CACHE.md))
 - `CudaWeights.LoadFromGguf(numGpuLayers)` — Partial weight upload to VRAM
 
