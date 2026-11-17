@@ -83,8 +83,11 @@ internal static class CudaAdmission
     internal static void EnsureFits(string what, long bytes, long releasedBytes = 0, string? remedies = null)
     {
         if (!TryFit(bytes, out long free, releasedBytes))
+        {
+            long effectiveFree = free + Math.Max(0, releasedBytes);
             throw new DeviceMemoryAdmissionException(
-                DeviceMemoryBudget.DescribeRefusal(what, bytes, free + Math.Max(0, releasedBytes), ReserveBytes, remedies));
+                DeviceMemoryBudget.DescribeRefusal(what, bytes, effectiveFree, ReserveBytes, remedies), bytes, effectiveFree, ReserveBytes);
+        }
     }
 
 }

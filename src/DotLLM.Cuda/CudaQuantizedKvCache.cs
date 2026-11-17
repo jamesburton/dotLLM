@@ -21,7 +21,8 @@ namespace DotLLM.Cuda;
 /// (<see cref="CanTruncateTo"/>).
 /// </para>
 /// </summary>
-public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, IPrefixReusableKvCache, IKvPrefixSeedable
+public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, IPrefixReusableKvCache, IKvPrefixSeedable,
+    IDeviceResidentKvCache
 {
     private const int BlockSize = 32;
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
@@ -59,6 +60,9 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
 
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
+
+    /// <inheritdoc/>
+    public long DeviceBytes => BytesFor(_geom, _maxSeqLen, new KvCacheConfig(KeyDType, ValueDType, _windowSize));
 
     /// <inheritdoc/>
     public int QuantizedLength => _quantizedLength;
@@ -153,7 +157,7 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
         // VRAM before anything is allocated; under WDDM an over-commit spills to shared system memory instead of failing.
         CudaAdmission.EnsureFits(
             $"KV cache ({config.KeyDType.ToString().ToLowerInvariant()}/{config.ValueDType.ToString().ToLowerInvariant()}) for {maxSeqLen} tokens",
-            DeviceBytes(geometry, maxSeqLen, config));
+            BytesFor(geometry, maxSeqLen, config));
 
         long totalBytes = 0;
         int maxStride = 0;
@@ -682,7 +686,7 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
     /// <param name="maxSeqLen">Positions.</param>
     /// <param name="config">KV types and window.</param>
     /// <returns>Bytes.</returns>
-    internal static long DeviceBytes(KvGeometry geometry, int maxSeqLen, KvCacheConfig config)
+    internal static long BytesFor(KvGeometry geometry, int maxSeqLen, KvCacheConfig config)
     {
         long bytes = 0;
         int maxStride = 0;
@@ -702,7 +706,7 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
     /// <param name="config">KV types.</param>
     /// <returns>Bytes per position.</returns>
     internal static long BytesPerPosition(KvGeometry geometry, KvCacheConfig config)
-        => DeviceBytes(geometry, 1, config with { MixedPrecisionWindowSize = 0 });
+        => BytesFor(geometry, 1, config with { MixedPrecisionWindowSize = 0 });
 
     private static int ComputeQuantRowBytes(int kvStride, KvCacheDType dtype) => dtype switch
     {

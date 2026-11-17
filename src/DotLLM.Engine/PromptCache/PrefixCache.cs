@@ -254,6 +254,21 @@ public sealed class PrefixCache : IDisposable
         return victim;
     }
 
+    /// <summary>
+    /// Device bytes the retained entries hold, as their caches report it (<see cref="IDeviceResidentKvCache"/>; a cache that does
+    /// not report counts 0), i.e. what evicting every entry could free for a refused allocation (#1848).
+    /// </summary>
+    public long DeviceBytesHeld
+    {
+        get
+        {
+            long bytes = 0;
+            foreach (var e in _entries)
+                if (e.KvCache is IDeviceResidentKvCache d) bytes += d.DeviceBytes;
+            return bytes;
+        }
+    }
+
     /// <summary>Entries evicted by <see cref="EvictForAdmission"/> to make room for a refused KV cache (#1848).</summary>
     public long AdmissionEvictions => _admissionEvictions;
     private long _admissionEvictions;

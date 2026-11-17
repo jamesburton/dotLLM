@@ -65,8 +65,8 @@ public sealed class CudaAdmissionTests
     public void DenseF16KvCache_IsRefusedBeforeAllocating()
     {
         // 40 layers x 2 (K, V) x 1,024 x 2 B = 160 KiB per position (#1841): 8,192 positions are 1,280 MiB.
-        Assert.Equal(160 * 1024, CudaKvCache.DeviceBytes(Twil, 1));
-        Assert.Equal(1280 * MiB, CudaKvCache.DeviceBytes(Twil, 8192));
+        Assert.Equal(160 * 1024, CudaKvCache.BytesFor(Twil, 1));
+        Assert.Equal(1280 * MiB, CudaKvCache.BytesFor(Twil, 8192));
 
         var ex = Refused(1024 * MiB, () => new CudaKvCache(Twil, 8192));
         AssertStandardRefusal(ex.Message, "KV cache (f16) for 8192 tokens");
@@ -83,7 +83,7 @@ public sealed class CudaAdmissionTests
         Assert.Equal(40L * 2 * 1088 + 2 * 1024 * 2, CudaQuantizedKvCache.BytesPerPosition(Twil, q8));
         var windowed = q8 with { MixedPrecisionWindowSize = 64 };
         Assert.Equal(1000 * CudaQuantizedKvCache.BytesPerPosition(Twil, q8) + 40L * 2 * 64 * 1024 * 2,
-            CudaQuantizedKvCache.DeviceBytes(Twil, 1000, windowed));
+            CudaQuantizedKvCache.BytesFor(Twil, 1000, windowed));
 
         var ex = Refused(64 * MiB, () => new CudaQuantizedKvCache(Twil, 8192, q8));
         AssertStandardRefusal(ex.Message, "KV cache (q8_0/q8_0) for 8192 tokens");
@@ -137,13 +137,15 @@ public sealed class CudaAdmissionTests
     [Fact]
     public void PagedRequest_PastTheFreeBlocks_IsRefusedAtAdmission()
     {
-        long perToken = CudaKvCache.DeviceBytes(Twil, 1);
+        long perToken = CudaKvCache.BytesFor(Twil, 1);
         Assert.Null(CudaTransformerModel.DescribePoolRefusal(17_408, 16, 1088, 1088, perToken));
         Assert.Null(CudaTransformerModel.DescribePoolRefusal(17_393, 16, 1088, 1088, perToken));   // 1,088 blocks exactly
 
         string? message = CudaTransformerModel.DescribePoolRefusal(17_409, 16, 1088, 1088, perToken);
         Assert.NotNull(message);
         Assert.StartsWith("Not enough free GPU memory for the paged KV cache for 17409 tokens (1089 blocks; 1088 of the pool's 1088 are free)", message);
+        Assert.Contains("it needs 2723 MiB and the pool has 2720 MiB free", message);
+        Assert.DoesNotContain("kept in reserve", message);   // the pool is not admitted against the VRAM reserve
         Assert.NotNull(CudaTransformerModel.DescribePoolRefusal(160, 16, 9, 1088, perToken));   // other sequences hold the rest
     }
 
@@ -157,6 +159,62 @@ public sealed class CudaAdmissionTests
         Assert.Equal(160 * 1024, CudaTransformerModel.DenseContextBytesPerToken(Twil, f16, act, chunkedPrefill: true));
         Assert.Equal(CudaQuantizedKvCache.BytesPerPosition(Twil, q8) + act,
             CudaTransformerModel.DenseContextBytesPerToken(Twil, q8, act, chunkedPrefill: false));
+    }
+
+    // FitDenseContext with 1 KiB per token: every MiB left over is exactly 1,024 tokens (one granule).
+    private const long PerToken = 1024;
+    private const long G3Plane = CudaG3Attention.RetainedMaxElems * CudaG3Attention.ScratchBytesPerElement;   // 384 MiB
+
+    [Fact]
+    public void DenseFit_Unchunked_CountsHeldScratchAsFree_AndChargesTheRetainedG3Plane()
+    {
+        Assert.Equal(384 * MiB, G3Plane);
+        // 3,000 free + 200 held forward scratch (replaced by the growth) - 256 reserve - 100 lazy - 384 G3 plane = 2,460 MiB.
+        var fit = CudaTransformerModel.FitDenseContext(3000 * MiB, 256 * MiB, 100 * MiB, 200 * MiB, chunkScratchBytes: null,
+            g3PlaneHeldBytes: 0, g3PlaneMaxBytes: G3Plane, PerToken, native: int.MaxValue);
+        Assert.Equal(2460 * 1024, fit.MaxContext);
+        Assert.Equal(3200 * MiB, fit.FreeBytes);
+        Assert.Equal((100 + 384) * MiB, fit.FixedBytes);
+        Assert.Null(fit.SizingError);
+    }
+
+    [Fact]
+    public void DenseFit_Chunked_ChargesTheChunkScratchGrowth_NotTheHeldScratchAsFree()
+    {
+        // 3,000 - 256 - 100 - 384 - (500 chunk scratch - 200 held) = 1,960 MiB.
+        var fit = CudaTransformerModel.FitDenseContext(3000 * MiB, 256 * MiB, 100 * MiB, 200 * MiB, chunkScratchBytes: 500 * MiB,
+            g3PlaneHeldBytes: 0, g3PlaneMaxBytes: G3Plane, PerToken, native: int.MaxValue);
+        Assert.Equal(1960 * 1024, fit.MaxContext);
+    }
+
+    [Fact]
+    public void DenseFit_ChargesOnlyTheG3PlaneNotYetHeld_AndNoneWhenG3CannotRun()
+    {
+        // A 100 MiB plane is already out of the free figure: only the other 284 MiB is charged.
+        var held = CudaTransformerModel.FitDenseContext(3000 * MiB, 256 * MiB, 0, 0, null, 100 * MiB, G3Plane, PerToken, int.MaxValue);
+        Assert.Equal((3000 - 256 - 284) * 1024, held.MaxContext);
+        var off = CudaTransformerModel.FitDenseContext(3000 * MiB, 256 * MiB, 0, 0, null, 0, 0, PerToken, int.MaxValue);
+        Assert.Equal((3000 - 256) * 1024, off.MaxContext);
+        Assert.Equal(131_072, CudaTransformerModel.FitDenseContext(3000 * MiB, 0, 0, 0, null, 0, 0, PerToken, 131_072).MaxContext);
+    }
+
+    [Fact]
+    public void DenseFit_WithoutAReading_FitsNothing_AndSaysWhy()
+    {
+        var fit = CudaTransformerModel.FitDenseContext(null, 256 * MiB, 0, 0, null, 0, G3Plane, PerToken, int.MaxValue);
+        Assert.Equal(0, fit.MaxContext);
+        Assert.Contains("cuMemGetInfo", fit.SizingError);
+    }
+
+    [Fact]
+    public void RefusalFromEnsureFits_CarriesTheNumbers()
+    {
+        var ex = Refused(100 * MiB, () => CudaAdmission.EnsureFits("test buffer", 200 * MiB));
+        Assert.Equal(200 * MiB, ex.RequiredBytes);
+        Assert.Equal(100 * MiB, ex.FreeBytes);
+        Assert.Equal(CudaAdmission.ReserveBytes, ex.ReserveBytes);
+        Assert.False(ex.CouldFitAfterReleasing(50 * MiB));
+        Assert.True(ex.CouldFitAfterReleasing(100 * MiB + CudaAdmission.ReserveBytes));
     }
 
     [Fact]

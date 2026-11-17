@@ -17,7 +17,8 @@ namespace DotLLM.Cuda;
 /// (<see cref="IPrefixReusableKvCache"/>), grows it when the next turn is longer (<see cref="TryGrowTo"/>), or seeds a fresh cache
 /// from a protected entry's shared rows (<see cref="TrySeedPrefixFrom"/>). Growth and seeding copy F16 rows device to device.
 /// </remarks>
-public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IPrefixReusableKvCache, IKvPrefixSeedable
+public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IPrefixReusableKvCache, IKvPrefixSeedable,
+    IDeviceResidentKvCache
 {
     private readonly nint[] _keys;
     private readonly nint[] _values;
@@ -38,6 +39,9 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
 
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
+
+    /// <inheritdoc/>
+    public long DeviceBytes => BytesFor(_geom, _maxSeqLen);
 
     /// <inheritdoc/>
     int IPerLayerKvCache.LayerCount => _numLayers;
@@ -93,7 +97,7 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
         // #1848: admitted against free VRAM before anything is allocated. Under WDDM a cache past dedicated VRAM is not refused by
         // the driver, it lands in shared system memory and every attention read crosses PCIe. The refusal names the remedies; the
         // engine evicts retained prefix entries and retries before it gives up (TextGenerator.AllocateKvCache).
-        CudaAdmission.EnsureFits($"KV cache (f16) for {maxSeqLen} tokens", DeviceBytes(geometry, maxSeqLen));
+        CudaAdmission.EnsureFits($"KV cache (f16) for {maxSeqLen} tokens", BytesFor(geometry, maxSeqLen));
 
         for (int i = 0; i < _numLayers; i++)
         {
@@ -109,7 +113,7 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
     /// <param name="geometry">Per-layer KV row widths.</param>
     /// <param name="maxSeqLen">Positions.</param>
     /// <returns>Bytes.</returns>
-    internal static long DeviceBytes(KvGeometry geometry, int maxSeqLen)
+    internal static long BytesFor(KvGeometry geometry, int maxSeqLen)
     {
         long bytes = 0;
         for (int i = 0; i < geometry.LayerCount; i++)

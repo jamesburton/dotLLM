@@ -373,7 +373,10 @@ public static class ServerStartup
         }
 
         var fit = model.MeasureServingContextFit(kv, options.PrefillChunkSize);
-        int served = ChooseServedContext(options.ContextSize, fit.MaxContext, native, out string? warning);
+        if (fit.SizingError is { } sizingError)
+            Console.WriteLine($"[dotllm] WARNING: the context fit could not measure free VRAM ({sizingError}); serving the smallest window.");
+        int served = ChooseServedContext(options.ContextSize, fit.MaxContext, native, out string? warning,
+            smallWindowHint: DenseSmallWindowHint);
         if (warning is not null)
             Console.WriteLine($"[dotllm] WARNING: {warning}");
         if (served < native)
@@ -386,6 +389,10 @@ public static class ServerStartup
               "Set --ctx-size to override.");
         return model.Config;
     }
+
+    /// <summary>The small-window remedy for the dense CUDA host (#1848): it has no MTP head, and its prefill scratch is per token.</summary>
+    internal const string DenseSmallWindowHint =
+        "Use a smaller KV type (--kv-quant-k/-v q8_0 or q4_0), bound the prefill scratch with --prefill-chunk (e.g. 1024), or free GPU memory.";
 
     /// <summary>
     /// The served context on the CUDA paged pool (#1836): <c>--ctx-size</c> or the model's window, never more than the pool holds.
@@ -448,8 +455,9 @@ public static class ServerStartup
     /// <param name="fit">Tokens that fit in free VRAM.</param>
     /// <param name="native">The checkpoint's window.</param>
     /// <param name="warning">A warning to log, or null.</param>
+    /// <param name="smallWindowHint">Remedies for a small fitted window; null for the hybrid default (KV type, --no-mtp).</param>
     /// <returns>The window to serve.</returns>
-    internal static int ChooseServedContext(int? requested, int fit, int native, out string? warning)
+    internal static int ChooseServedContext(int? requested, int fit, int native, out string? warning, string? smallWindowHint = null)
     {
         warning = null;
         if (requested is > 0 and int r)
@@ -463,8 +471,8 @@ public static class ServerStartup
 
         int served = Math.Clamp(fit, Math.Min(DeviceMemoryBudget.ContextGranularity, native), native);
         if (fit < SmallContextWarningTokens)
-            warning = $"only {fit} tokens of context fit in free VRAM (serving {served}). Use a smaller KV type " +
-                      "(--kv-quant-k/-v q8_0 or q4_0), --no-mtp, or free GPU memory.";
+            warning = $"only {fit} tokens of context fit in free VRAM (serving {served}). " +
+                      (smallWindowHint ?? "Use a smaller KV type (--kv-quant-k/-v q8_0 or q4_0), --no-mtp, or free GPU memory.");
         return served;
     }
 

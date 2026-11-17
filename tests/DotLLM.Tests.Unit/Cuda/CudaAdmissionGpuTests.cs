@@ -162,6 +162,17 @@ public sealed class CudaAdmissionGpuTests
             using (var kv = model.CreateKvCache(512))
             using (var logits = model.Forward(Tokens(n, config.VocabSize), Positions(n), 0, kv)) { }
             Assert.True(model.G3ScratchElems > 0, "G3 should have allocated its scratch when it fits");
+
+            // #1848 review: a retained plane is given back when a KV cache is refused. The fake device has room only once the plane
+            // is gone, so the cache is created iff the model released it.
+            var saved = CudaAdmission.FreeBytesOverride;
+            CudaAdmission.FreeBytesOverride = () => model.G3ScratchElems > 0 ? 0 : 4L << 30;
+            try
+            {
+                using var kv = model.CreateKvCache(512);
+                Assert.Equal(0, model.G3ScratchElems);
+            }
+            finally { CudaAdmission.FreeBytesOverride = saved; }
         }
         finally { CudaG3Attention.Enabled = savedEnabled; }
     }

@@ -1767,7 +1767,11 @@ public sealed partial class TextGenerator
             {
                 return AllocateKvCache(cacheSize);
             }
-            catch (DeviceMemoryAdmissionException) when (_prefixCache is { EntryCount: > 0 })
+            // Only when evicting can help: a refusal whose numbers say the retained entries' device memory would not make it fit
+            // anyway (an oversized request, e.g. --ctx-size above the fit) goes straight to the caller and keeps every entry. A
+            // refusal without numbers (a backend that only has a message) still evicts, since that cannot be ruled out.
+            catch (DeviceMemoryAdmissionException ex) when (_prefixCache is { EntryCount: > 0 }
+                && ex.CouldFitAfterReleasing(_prefixCache.DeviceBytesHeld))
             {
                 var evicted = _prefixCache.EvictForAdmission(keep: protectedEntry);
                 if (ReferenceEquals(evicted, protectedEntry)) protectedEntry = null;

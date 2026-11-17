@@ -1186,6 +1186,19 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <summary>Shortest forward after which the spill counter is read (#1834); speculative verify rows stay cheap.</summary>
     private const int SpillCheckMinTokens = 64;
 
+    /// <summary>
+    /// After a forward whose logits are on the host (the stream is idle): #1848, a long cold prompt grows the quadratic G3 score
+    /// scratch to GiBs, so it is not kept past the prefill; #1834, a prefill is where a spill would first show.
+    /// </summary>
+    /// <param name="tokens">The most tokens any sequence of the forward carried.</param>
+    private void AfterMultiTokenForward(int tokens)
+    {
+        if (tokens <= 1) return;
+        _g3Attention.ReleaseIfLarge();
+        if (tokens >= SpillCheckMinTokens)
+            _spillMonitor.Check($"{tokens}-token prefill; forward scratch {_state.SequenceBytes >> 20} MiB");
+    }
+
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
@@ -1193,14 +1206,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         var r = ForwardInternal(tokenIds, positions, deviceId, kvCache,
             suppressGraphCapture: false, deferredHostDest: 0)!;
         CudaMemTrace.Mark(tokenIds.Length > 1 ? "multi-token forward" : "decode forward");
-        if (tokenIds.Length > 1)
-        {
-            // #1848: a long cold prompt grows the quadratic G3 score scratch to GiBs; do not keep it past the prefill (the logits
-            // above are already on the host, so the stream is idle). #1834: a prefill is where a spill would first show.
-            _g3Attention.ReleaseIfLarge();
-            if (tokenIds.Length >= SpillCheckMinTokens)
-                _spillMonitor.Check($"{tokenIds.Length}-token prefill; forward scratch {_state.SequenceBytes >> 20} MiB");
-        }
+        AfterMultiTokenForward(tokenIds.Length);
         return r;
     }
 
@@ -2253,6 +2259,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         // The ONE synchronize for the entire batch — see the doc comment above for why removing
         // the other (requests.Count - 1) host-blocking syncs is this override's whole point.
         _stream.Synchronize();
+        int longest = 0;
+        for (int i = 0; i < requests.Count; i++) longest = Math.Max(longest, requests[i].TokenIds.Length);
+        AfterMultiTokenForward(longest);
 
         var results = new ITensor[requests.Count];
         long bytes = (long)vocabSize * sizeof(float);
@@ -4668,9 +4677,30 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         _context.MakeCurrent();
         // The context travels with the cache (#1594): a retained prefix-cache entry is grown, seeded and disposed later, maybe on
         // another thread, and the current context is per thread. The constructor admits it against free VRAM (#1848).
-        var cache = new CudaKvCache(Core.Attention.KvGeometry.FromConfig(Config), maxSeqLen, _context);
+        var cache = AdmitReleasingG3(() => new CudaKvCache(Core.Attention.KvGeometry.FromConfig(Config), maxSeqLen, _context));
         _spillMonitor.Check($"KV cache (f16) allocated for {maxSeqLen} tokens");
         return cache;
+    }
+
+    /// <summary>
+    /// Runs a KV cache constructor; when it is refused admission and a retained G3 score plane holds VRAM (#1848: up to 384 MiB stays
+    /// allocated between prefills), frees the plane and tries once more. The next prefill then re-admits the plane, or runs
+    /// <c>attention_f16</c> when it no longer fits. Only a refusal that releasing the plane cannot fix reaches the caller, whose
+    /// prefix-cache eviction runs next.
+    /// </summary>
+    private T AdmitReleasingG3<T>(Func<T> create)
+    {
+        try
+        {
+            return create();
+        }
+        catch (DeviceMemoryAdmissionException ex) when (_g3Attention.PlaneElems > 0
+            && ex.CouldFitAfterReleasing(_g3Attention.PlaneElems * CudaG3Attention.ScratchBytesPerElement))
+        {
+            _stream.Synchronize();   // the plane may still be read by queued work
+            _g3Attention.Release();
+            return create();
+        }
     }
 
     /// <summary>
@@ -4682,9 +4712,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     {
         _context.MakeCurrent();
         var geom = Core.Attention.KvGeometry.FromConfig(Config);
-        Core.Attention.IKvCache cache = config.IsQuantized
+        Core.Attention.IKvCache cache = AdmitReleasingG3<Core.Attention.IKvCache>(() => config.IsQuantized
             ? new CudaQuantizedKvCache(geom, maxSeqLen, config, _context)
-            : new CudaKvCache(geom, maxSeqLen, _context);
+            : new CudaKvCache(geom, maxSeqLen, _context));
         _spillMonitor.Check($"KV cache ({config.KeyDType}/{config.ValueDType}) allocated for {maxSeqLen} tokens");
         return cache;
     }
@@ -4779,11 +4809,12 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     {
         int needed = (maxSeqLen + blockSize - 1) / blockSize;
         if (needed <= freeBlocks) return null;
-        return DeviceMemoryBudget.DescribeRefusal(
-            $"paged KV cache for {maxSeqLen} tokens ({needed} blocks; {freeBlocks} of the pool's {totalBlocks} are free)",
-            (long)needed * blockSize * poolBytesPerToken, (long)freeBlocks * blockSize * poolBytesPerToken, 0,
-            "Shorten the conversation or max_tokens, or lower the context with 'dotllm serve --ctx-size' (the pool was sized " +
-            "to free VRAM at startup), or free GPU memory before starting");
+        long needBytes = (long)needed * blockSize * poolBytesPerToken, freeBytes = (long)freeBlocks * blockSize * poolBytesPerToken;
+        return $"Not enough free GPU memory for the paged KV cache for {maxSeqLen} tokens ({needed} blocks; {freeBlocks} of the " +
+               $"pool's {totalBlocks} are free): it needs {(needBytes + (1L << 20) - 1) >> 20} MiB and the pool has " +
+               $"{(freeBytes + (1L << 20) - 1) >> 20} MiB free. The pool was sized to free VRAM at startup and does not grow; refusing " +
+               "rather than letting the driver spill into shared system memory. Shorten the conversation or max_tokens, lower the " +
+               "context with 'dotllm serve --ctx-size', or free GPU memory before starting the server.";
     }
 
     /// <summary>
@@ -4803,7 +4834,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         bool blockQuant = kv.IsQuantized
             && kv.KeyDType is KvCacheDType.Q8_0 or KvCacheDType.Q4_0 or KvCacheDType.F32
             && kv.ValueDType is KvCacheDType.Q8_0 or KvCacheDType.Q4_0 or KvCacheDType.F32;
-        long kvBytes = blockQuant ? CudaQuantizedKvCache.BytesPerPosition(geometry, kv) : CudaKvCache.DeviceBytes(geometry, 1);
+        long kvBytes = blockQuant ? CudaQuantizedKvCache.BytesPerPosition(geometry, kv) : CudaKvCache.BytesFor(geometry, 1);
         return kvBytes + (chunkedPrefill ? 0 : activationBytesPerToken);
     }
 
@@ -4818,21 +4849,55 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     public Architectures.HybridContextFit MeasureServingContextFit(KvCacheConfig kv, int prefillChunkTokens)
     {
         _context.MakeCurrent();
-        long free = CudaAdmission.QueryFreeBytes() ?? 0;
-        long reserve = CudaAdmission.ReserveBytes;
         bool chunked = prefillChunkTokens > 0;
-        long fixedBytes = _state.PendingLazyScratchBytes;
+        long? chunkScratch = null;
         if (chunked)
         {
             int chunkCapacity = (int)Math.Min(System.Numerics.BitOperations.RoundUpToPowerOf2((uint)prefillChunkTokens),
                 (uint)Math.Max(prefillChunkTokens, NativeMaxSequenceLength));
-            fixedBytes += Math.Max(0, _state.SequenceBytesAt(chunkCapacity) - _state.SequenceBytes);
+            chunkScratch = _state.SequenceBytesAt(chunkCapacity);
         }
+        return FitDenseContext(
+            CudaAdmission.QueryFreeBytes(), CudaAdmission.ReserveBytes, _state.PendingLazyScratchBytes, _state.SequenceBytes, chunkScratch,
+            g3PlaneHeldBytes: _g3Attention.PlaneElems * CudaG3Attention.ScratchBytesPerElement,
+            g3PlaneMaxBytes: _g3Attention.MayRun ? CudaG3Attention.RetainedMaxElems * CudaG3Attention.ScratchBytesPerElement : 0,
+            perTokenBytes: DenseContextBytesPerToken(KvGeometry.FromConfig(Config), kv, _state.ActivationBytesPerToken, chunked),
+            NativeMaxSequenceLength);
+    }
+
+    /// <summary>
+    /// Arithmetic of <see cref="MeasureServingContextFit"/> (#1841 / #1848), pure so it is unit-testable:
+    /// <list type="bullet">
+    /// <item>fixed bytes: the lazy dequant scratch not yet allocated, plus the G3 score plane that can stay allocated between
+    /// prefills (<paramref name="g3PlaneMaxBytes"/>, 384 MiB when G3 can run) minus what of it is already held, and with a prefill
+    /// chunk the growth of the forward scratch to the chunk (<paramref name="chunkScratchBytes"/> minus what is held);</item>
+    /// <item>without a chunk, the forward scratch grows per token (inside <paramref name="perTokenBytes"/>) and replaces the scratch
+    /// held now, which therefore counts as free.</item>
+    /// </list>
+    /// </summary>
+    /// <param name="freeBytes">Free device bytes, or null when there is no reading (the fit is then refused: 0 tokens).</param>
+    /// <param name="reserveBytes">Bytes kept free.</param>
+    /// <param name="pendingLazyBytes">Lazy scratch not yet allocated.</param>
+    /// <param name="sequenceBytesHeld">Forward scratch held now.</param>
+    /// <param name="chunkScratchBytes">Forward scratch at the prefill chunk, or null when prefill is not chunked.</param>
+    /// <param name="g3PlaneHeldBytes">G3 score plane held now.</param>
+    /// <param name="g3PlaneMaxBytes">Largest G3 plane kept between prefills (0 when G3 cannot run).</param>
+    /// <param name="perTokenBytes">Bytes per context token (<see cref="DenseContextBytesPerToken"/>).</param>
+    /// <param name="native">The model's window.</param>
+    /// <returns>The fit.</returns>
+    internal static Architectures.HybridContextFit FitDenseContext(long? freeBytes, long reserveBytes, long pendingLazyBytes,
+        long sequenceBytesHeld, long? chunkScratchBytes, long g3PlaneHeldBytes, long g3PlaneMaxBytes, long perTokenBytes, int native)
+    {
+        if (freeBytes is not long free)
+            return new Architectures.HybridContextFit(0, 0, reserveBytes, 0, perTokenBytes,
+                "no free-memory reading from the driver (cuMemGetInfo failed)");
+        long fixedBytes = pendingLazyBytes + Math.Max(0, g3PlaneMaxBytes - g3PlaneHeldBytes);
+        if (chunkScratchBytes is long chunk)
+            fixedBytes += Math.Max(0, chunk - sequenceBytesHeld);
         else
-            free += _state.SequenceBytes;   // an unchunked prefill replaces the current scratch, which then counts as free
-        long perToken = DenseContextBytesPerToken(KvGeometry.FromConfig(Config), kv, _state.ActivationBytesPerToken, chunked);
-        int fit = DeviceMemoryBudget.MaxFittingContext(free, reserve, fixedBytes, perToken, NativeMaxSequenceLength);
-        return new Architectures.HybridContextFit(fit, free, reserve, fixedBytes, perToken, null);
+            free += sequenceBytesHeld;
+        int fit = DeviceMemoryBudget.MaxFittingContext(free, reserveBytes, fixedBytes, perTokenBytes, native);
+        return new Architectures.HybridContextFit(fit, free, reserveBytes, fixedBytes, perTokenBytes, null);
     }
 
     /// <summary>

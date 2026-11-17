@@ -356,6 +356,23 @@ internal sealed class CudaG3Attention : IDisposable
     /// <summary>Score elements the scratch holds now (tests).</summary>
     internal long PlaneElems => _planeElems;
 
+    /// <summary>
+    /// Whether any G3 prefill can run on this model and device (#1848): the toggle is on and the causal softmax is loaded. When it
+    /// can, a plane of up to <see cref="RetainedMaxElems"/> stays allocated between prefills and the context fit must charge it.
+    /// </summary>
+    internal bool MayRun => Enabled && _kernels.HasAttentionSoftmaxCausalCoalescedF32In;
+
+    /// <summary>Frees the score scratch whatever its size (#1848): a KV cache that was refused gets its room back first.</summary>
+    /// <returns>The bytes released.</returns>
+    internal long Release()
+    {
+        long bytes = _planeElems * ScratchBytesPerElement;
+        if (_scoresF32 != 0) { CudaDriverApi.cuMemFree_v2(_scoresF32); _scoresF32 = 0; }
+        if (_probsF16 != 0) { CudaDriverApi.cuMemFree_v2(_probsF16); _probsF16 = 0; }
+        _planeElems = 0;
+        return bytes;
+    }
+
     private void EnsureScratch(long elems)
     {
         if (elems <= _planeElems) return;
