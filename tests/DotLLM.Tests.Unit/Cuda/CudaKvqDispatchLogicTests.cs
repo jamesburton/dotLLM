@@ -1,3 +1,5 @@
+using DotLLM.Core.Attention;
+using DotLLM.Core.Configuration;
 using DotLLM.Cuda;
 using Xunit;
 
@@ -36,5 +38,16 @@ public sealed class CudaKvqDispatchLogicTests
         Assert.False(Use(heads: 30, kvHeads: 8));                              // uneven GQA
         Assert.False(Use(enabled: false));                                     // DOTLLM_CUDA_KVQ_FLASH_PREFILL=0
         Assert.False(Use(loaded: false));                                      // pre-Ampere / missing PTX
+    }
+
+    [Theory]
+    [InlineData(KvCacheDType.F32, KvCacheDType.Q8_0)]
+    [InlineData(KvCacheDType.Q4_0, KvCacheDType.F32)]
+    public void MixedF16AndBlockKv_IsRefusedAtCreation_NotMidForward(KvCacheDType k, KvCacheDType v)
+    {
+        // Neither the quantize-on-write nor the in-place attention kernels have an FP16 arm; refused before any device call.
+        var ex = Assert.Throws<NotSupportedException>(() =>
+            new CudaQuantizedKvCache(KvGeometry.Uniform(2, 2, 64), 16, new KvCacheConfig(k, v)));
+        Assert.Contains("q8_0 or q4_0", ex.Message);
     }
 }

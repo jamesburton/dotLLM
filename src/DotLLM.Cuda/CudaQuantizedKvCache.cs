@@ -162,6 +162,14 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
         _keysQuant = new nint[numLayers];
         _valuesQuant = new nint[numLayers];
 
+        // Both sides must be block formats: the quantize-on-write kernels (LaunchQuantKv) and the in-place attention kernels
+        // (#1850) have no FP16 arm, so an f16/q8_0 mix used to throw at the first KV write, mid-forward. Refuse it up front.
+        if (KeyDType is not (KvCacheDType.Q8_0 or KvCacheDType.Q4_0) || ValueDType is not (KvCacheDType.Q8_0 or KvCacheDType.Q4_0))
+            throw new NotSupportedException(
+                $"The dense CUDA quantized KV cache needs both keys and values in q8_0 or q4_0 (got {KeyDType.ToString().ToLowerInvariant()}/" +
+                $"{ValueDType.ToString().ToLowerInvariant()}); mixing f16 with a block format is not supported. Use the same type for " +
+                "--cache-type-k and --cache-type-v.");
+
         // #1848: the whole cache (quantized rows and the FP16 window) is admitted against free VRAM before anything is allocated;
         // under WDDM an over-commit spills to shared system memory instead of failing.
         CudaAdmission.EnsureFits(

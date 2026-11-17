@@ -36,7 +36,7 @@ internal static class CudaKvGrowth
     /// <paramref name="newLength"/> positions: the added rows of every buffer plus the largest single layer's old buffers, which
     /// are still held while that layer's new ones are filled. <paramref name="rowBytesPerLayer"/> is the summed row bytes of the
     /// buffers each layer grows (K and V, in their stored format). <paramref name="fixedExtraBytes"/> is any other buffer allocated
-    /// at its new size before the old one is freed (the quantized cache's shared dequant scratch).
+    /// at its new size before the old one is freed (none today: the quantized cache's shared dequant scratch went in #1850).
     /// </summary>
     internal static long PeakGrowthBytes(ReadOnlySpan<long> rowBytesPerLayer, int oldLength, int newLength, long fixedExtraBytes = 0)
     {
