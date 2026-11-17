@@ -236,6 +236,26 @@ public sealed class CudaAdmissionTests
     }
 
     [Fact]
+    public void G3ServesOnlyTheF16Cache_SoAQuantizedFitChargesNoPlane()
+    {
+        // #1850: q8_0 / q4_0 read in place and TurboQuant runs attention_f16, so G3's plane is never used over them.
+        Assert.True(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32)));
+        Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0)));
+        Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.Q4_0, KvCacheDType.Q4_0)));
+        Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant)));
+
+        // TwIL-8B-shaped q8_0 at the 1,024 chunk, as above: the 384 MiB plane is ~4,700 tokens of q8_0 window.
+        var q8 = new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0);
+        long perToken = CudaTransformerModel.DenseContextBytesPerToken(Twil, q8, 150_000, chunkedPrefill: true);
+        var charged = CudaTransformerModel.FitDenseContext(6000 * MiB, 256 * MiB, 0, 100 * MiB, 400 * MiB, 0,
+            CudaTransformerModel.G3PlaneChargeBytes(true, 1024, 32), perToken, native: 131_072);
+        var notCharged = CudaTransformerModel.FitDenseContext(6000 * MiB, 256 * MiB, 0, 100 * MiB, 400 * MiB, 0,
+            CudaTransformerModel.G3PlaneChargeBytes(CudaTransformerModel.G3ServesKvCache(q8), 1024, 32), perToken, native: 131_072);
+        Assert.True(notCharged.MaxContext - charged.MaxContext >= 4096,
+            $"q8_0 window {notCharged.MaxContext} without the plane vs {charged.MaxContext} with it");
+    }
+
+    [Fact]
     public void DenseFit_WithoutAReading_FitsNothing_AndSaysWhy()
     {
         var fit = CudaTransformerModel.FitDenseContext(null, 256 * MiB, 0, 0, null, 0, G3Plane, PerToken, int.MaxValue);

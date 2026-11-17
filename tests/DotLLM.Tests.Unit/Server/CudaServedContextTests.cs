@@ -71,9 +71,9 @@ public sealed class CudaServedContextTests
     }
 
     [Theory]
-    // #1862: no flag on the dense CUDA non-paged f16 path -> the default chunk.
+    // #1862 / #1850: no flag on the dense CUDA non-paged path (f16, q8_0 or q4_0) -> the default chunk.
     [InlineData(null, true, ServerStartup.DefaultCudaDensePrefillChunkTokens)]
-    // No flag anywhere else (CPU, Vulkan, HIP, CUDA paged or quantized KV) -> one pass, unchanged.
+    // No flag anywhere else (CPU, Vulkan, HIP, CUDA paged, a windowed quantized cache) -> one pass, unchanged.
     [InlineData(null, false, 0)]
     // An explicit value always wins, on either path, and 0 is an explicit opt-out back to one pass.
     [InlineData(512, true, 512)]
@@ -93,17 +93,25 @@ public sealed class CudaServedContextTests
     }
 
     [Fact]
-    public void PrefillChunkDefault_AppliesOnlyToTheDenseCudaHostsNonPagedF16Cache()
+    public void PrefillChunkDefault_AppliesOnlyToTheDenseCudaHostsNonPagedCache()
     {
         // No driver is needed: only the model's type is inspected, so an uninitialised instance stands in for a loaded one.
         var cuda = (IModel)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(DotLLM.Cuda.CudaTransformerModel));
         var f16 = new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32);
         var q8 = new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0);
-        Assert.True(ServerStartup.IsCudaDenseF16NonPaged(cuda, cudaPagedPool: false, f16));
-        Assert.False(ServerStartup.IsCudaDenseF16NonPaged(cuda, cudaPagedPool: true, f16));
-        Assert.False(ServerStartup.IsCudaDenseF16NonPaged(cuda, cudaPagedPool: false, q8));
+        var q4 = new KvCacheConfig(KvCacheDType.Q4_0, KvCacheDType.Q4_0);
+        var q8Windowed = new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0, MixedPrecisionWindowSize: 32);
+        Assert.True(ServerStartup.TakesCudaDensePrefillChunkDefault(cuda, cudaPagedPool: false, f16));
+        Assert.False(ServerStartup.TakesCudaDensePrefillChunkDefault(cuda, cudaPagedPool: true, f16));
+        // #1850: q8_0 / q4_0 read in place, and every chunk runs the tensor-core kvq prefill at its offset.
+        Assert.True(ServerStartup.TakesCudaDensePrefillChunkDefault(cuda, cudaPagedPool: false, q8));
+        Assert.True(ServerStartup.TakesCudaDensePrefillChunkDefault(cuda, cudaPagedPool: false, q4));
+        Assert.False(ServerStartup.TakesCudaDensePrefillChunkDefault(cuda, cudaPagedPool: true, q8));
+        // An FP16 window ring would run every chunk on the scalar kernel, with no parity coverage across chunk boundaries.
+        Assert.False(ServerStartup.TakesCudaDensePrefillChunkDefault(cuda, cudaPagedPool: false, q8Windowed));
         // Any other model (CPU, Vulkan, HIP) keeps one-pass prefill, whatever its cache.
-        Assert.False(ServerStartup.IsCudaDenseF16NonPaged(new StubModel(), cudaPagedPool: false, f16));
+        Assert.False(ServerStartup.TakesCudaDensePrefillChunkDefault(new StubModel(), cudaPagedPool: false, f16));
+        Assert.False(ServerStartup.TakesCudaDensePrefillChunkDefault(new StubModel(), cudaPagedPool: false, q8));
     }
 
     [Fact]

@@ -184,9 +184,11 @@ default and does not cover `bench`, which submits the whole prompt in one `Forwa
 ### Dense CUDA serve: chunked prefill by default (issue #1862)
 
 `dotllm serve` on the dense CUDA host (`CudaTransformerModel`) prefills in 1,024-token chunks when
-`--prefill-chunk-size` is not given, on the non-paged f16 cache only (`ServerStartup.ResolvePrefillChunk`).
-Any explicit value wins, and `--prefill-chunk-size 0` restores one pass. `run`, `chat`, the paged pool,
-q8_0 / q4_0 KV, and the CPU, Vulkan and HIP backends are unchanged.
+`--prefill-chunk-size` is not given, on the non-paged cache: f16, and q8_0 / q4_0 since #1850
+(`ServerStartup.ResolvePrefillChunk`). Any explicit value wins, and `--prefill-chunk-size 0` restores one pass. `run`,
+`chat`, the paged pool, and the CPU, Vulkan and HIP backends are unchanged. On q8_0 / q4_0 every chunk runs the
+tensor-core in-place `attention_flash_mma_prefill_kvq` at its position offset; G3 never runs over a quantized cache, so the
+fit charges no score plane for it.
 
 Why it pays:
 

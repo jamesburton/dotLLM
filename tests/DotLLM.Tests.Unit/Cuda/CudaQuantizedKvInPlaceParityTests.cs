@@ -139,6 +139,48 @@ public sealed class CudaQuantizedKvInPlaceParityTests
     }
 
     /// <summary>
+    /// The chunked serve default (#1850, after #1862): a prompt prefilled in 100-token chunks (not a multiple of the 16-row q-tile
+    /// or the KV tile, and not a divisor of the prompt, so offsets land mid-tile and the last chunk is partial) runs every chunk
+    /// on the kvq tensor-core kernel at its position offset, and must match one pass: identical greedy tokens, a first-token
+    /// logprob within 0.02 nats, and a small mean KL. The one-pass arm reads the same quantized rows, so only GEMM M and the
+    /// chunk's offset differ. The legacy oracle (dequant scratch, unchunked) is reported for #1846.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(KvCacheDType.Q8_0)]
+    [InlineData(KvCacheDType.Q4_0)]
+    public void ChunkedPrefill_MatchesOnePass_OnTheTensorCoreKernelAtEachOffset(KvCacheDType type)
+    {
+        using var env = Load(out var model, out int[] prompt);
+        Skip.IfNot(model.Kernels.HasAttentionFlashPrefillKvq(model.Config.HeadDim, type, type),
+            $"kvq tensor-core prefill not loaded for {type}");
+        const int chunk = 100;
+        Assert.True(prompt.Length > 3 * chunk && prompt.Length % chunk != 0, $"prompt {prompt.Length} must span 3+ partial chunks");
+        var kv = new KvCacheConfig(type, type);
+
+        var onePass = Run(model, kv, prompt, reference: false, forced: null);
+        long flash0 = CudaKernels.AttentionFlashPrefillKvqLaunches;
+        var chunked = Run(model, kv, prompt, reference: false, forced: onePass.Tokens, chunk: chunk);
+        long flash = CudaKernels.AttentionFlashPrefillKvqLaunches - flash0;
+        int chunks = (prompt.Length + chunk - 1) / chunk;
+        var legacy = type == KvCacheDType.Q8_0 ? Run(model, kv, prompt, reference: true, forced: onePass.Tokens) : null;
+        var f16 = Run(model, new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32), prompt, reference: false, forced: onePass.Tokens);
+
+        double[] kl = Kl(onePass, chunked);
+        double lpOne = LogProb(onePass.Logits[0], onePass.Tokens[0]), lpChunk = LogProb(chunked.Logits[0], onePass.Tokens[0]);
+        _out.WriteLine($"{type}: prompt {prompt.Length} tokens in {chunks} chunks of {chunk}; kvq flash launches {flash}");
+        _out.WriteLine($"first-token logprob: one pass {lpOne:R}, chunked {lpChunk:R}, f16 KV {LogProb(f16.Logits[0], onePass.Tokens[0]):R}" +
+                       (legacy is null ? "" : $", legacy scratch {LogProb(legacy.Logits[0], onePass.Tokens[0]):R}"));
+        _out.WriteLine($"KL(one pass||chunked) mean {kl.Average():E3} max {kl.Max():E3}; KL(f16||chunked) mean {Kl(f16, chunked).Average():E3}; " +
+                       $"KL(f16||one pass) mean {Kl(f16, onePass).Average():E3}");
+
+        Assert.True(flash >= (long)model.Config.NumLayers * chunks, $"{flash} kvq flash launches; every chunk of every layer should take it");
+        for (int s = 0; s < onePass.Tokens.Length; s++)
+            Assert.True(Argmax(chunked.Logits[s]) == onePass.Tokens[s], $"greedy token {s} differs from one pass");
+        Assert.True(Math.Abs(lpChunk - lpOne) < 0.02, $"first-token logprob moved {lpChunk - lpOne:R}");
+        Assert.True(kl.Average() < 2e-3, $"mean KL(one pass||chunked) {kl.Average()}");
+    }
+
+    /// <summary>
     /// A cuMemGetInfo delta proves the history scratch is gone: a one-layer cache of 65,536 positions at stride 1,024 (TwIL-8B's)
     /// costs its q8_0 rows (2 x 68 MiB) and not the 256 MiB the FP16 K+V scratch added before #1850.
     /// </summary>
@@ -166,7 +208,7 @@ public sealed class CudaQuantizedKvInPlaceParityTests
     private sealed record Arm(List<float[]> Logits, int[] Tokens);
 
     /// <summary>Prefill the prompt, then <see cref="Steps"/> decode steps (greedy, or forced to <paramref name="forced"/>).</summary>
-    private static Arm Run(CudaTransformerModel model, KvCacheConfig kv, int[] prompt, bool reference, int[]? forced)
+    private static Arm Run(CudaTransformerModel model, KvCacheConfig kv, int[] prompt, bool reference, int[]? forced, int chunk = 0)
     {
         {
             using var cache = (IKvCache)model.CreateKvCache(prompt.Length + Steps + 8, kv);
@@ -175,8 +217,13 @@ public sealed class CudaQuantizedKvInPlaceParityTests
             int vocab = model.Config.VocabSize;
             var logits = new List<float[]>();
             var tokens = new int[Steps];
-            using (ITensor t = model.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), 0, cache))
-                logits.Add(LastRow(t, vocab));
+            int step = chunk > 0 ? chunk : prompt.Length;
+            for (int start = 0; start < prompt.Length; start += step)
+            {
+                int n = Math.Min(step, prompt.Length - start);
+                using ITensor t = model.Forward(prompt.AsSpan(start, n).ToArray(), Enumerable.Range(start, n).ToArray(), 0, cache);
+                if (start + n == prompt.Length) logits.Add(LastRow(t, vocab));
+            }
             for (int s = 0; s < Steps; s++)
             {
                 tokens[s] = forced?[s] ?? Argmax(logits[^1]);
