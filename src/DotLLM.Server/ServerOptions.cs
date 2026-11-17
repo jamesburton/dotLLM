@@ -565,7 +565,9 @@ public sealed record ServerOptions
                 case "--moe-calibrate":
                     moeCalibrate = true; break;
                 case "--gpu-layers":
-                    gpuLayers = int.Parse(next!); i++; break;
+                    if (!GpuOffloadPlanner.TryParseGpuLayers(next, out gpuLayers, out string? gpuLayersError))
+                        throw new ArgumentException(gpuLayersError);
+                    i++; break;
                 case "--threads":
                     threads = int.Parse(next!); i++; break;
                 case "--decode-threads":

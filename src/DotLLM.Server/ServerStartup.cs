@@ -179,8 +179,10 @@ public static class ServerStartup
             string name = ModelIdFor(options.Model, resolvedPath);
             if (spec.IsGpu)
             {
+                // -1 is "all layers"; auto (#1851) is sized by the loader, like an explicit partial count.
                 var plan = DeviceSelector.Plan(spec, bytes, Endpoints.DeviceEndpoint.Describe(),
-                    fullOffload: options.GpuLayers is null or < 0 && !ExpertOffloadPossible(resolvedPath, options.MoeOffload));
+                    fullOffload: options.GpuLayers is null or -1 && !ExpertOffloadPossible(resolvedPath, options.MoeOffload),
+                    autoSplit: spec.Kind == DeviceKind.Cuda && options.GpuLayers is null && AutoSplitBlocker(resolvedPath) is null);
                 if (plan.Error is not null)
                     throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(options.Device, name, bytes, plan.Error));
             }
@@ -203,15 +205,21 @@ public static class ServerStartup
         // WARNING (console + ServerState.DeviceFallbackWarning -> /props) rather than a quiet log line (#733).
         Exception? last = null;
         var gpuFailures = new List<string>();
-        var autoPlan = DeviceSelector.Plan(spec, ModelResolver.FileLength(resolvedPath), Endpoints.DeviceEndpoint.Describe());
+        string? splitBlocker = options.GpuLayers is null or GpuOffloadPlanner.AutoGpuLayers ? AutoSplitBlocker(resolvedPath) : "explicit --gpu-layers";
+        var autoDevices = Endpoints.DeviceEndpoint.Describe();
+        var autoPlan = DeviceSelector.Plan(spec, ModelResolver.FileLength(resolvedPath), autoDevices, autoSplit: splitBlocker is null);
+        if (options.GpuLayers is null)
+            DeviceModelLoader.LogSkippedSplit(autoPlan, autoDevices, splitBlocker, m => Console.WriteLine($"[dotllm] {m}"));
         foreach (string device in autoPlan.Candidates)
         {
             if (options.TernaryAdapterPaths is { Count: > 0 } && TernaryAdapterAttach.BackendHasNoHook(device)) continue;   // no CUDA model has the residual hook (#1711): never load a GPU model the adapters cannot attach to
             try
             {
                 Console.WriteLine($"[dotllm] --device auto: trying {device}");
-                var loaded = LoadModelCore(resolvedPath, options with { Device = device });
-                loaded.Options = loaded.Options with { Device = options.Device, ResolvedDevice = device, DeviceFallbackWarning = null };   // (#1822) set below when it fell back
+                // #1851: a CUDA device the whole model does not fit is loaded as an automatic GPU/CPU layer split.
+                int? layers = options.GpuLayers is null && device == autoPlan.SplitCandidate ? GpuOffloadPlanner.AutoGpuLayers : options.GpuLayers;
+                var loaded = LoadModelCore(resolvedPath, options with { Device = device, GpuLayers = layers });
+                loaded.Options = loaded.Options with { Device = options.Device, GpuLayers = options.GpuLayers, ResolvedDevice = device, DeviceFallbackWarning = null };   // (#1822) set below when it fell back
                 if (device == "cpu" && (gpuFailures.Count > 0 || autoPlan.CpuWarning is not null))
                 {
                     // Auto on the CPU always warns: after a failed GPU load (reason + consequence), or because no GPU was servable at all.
@@ -240,7 +248,9 @@ public static class ServerStartup
     /// request is clamped to <c>[0, numLayers]</c>; unset on a non-GPU device is 0.
     /// </summary>
     public static int ResolveGpuLayers(int? requested, string device, int numLayers) =>
-        requested is < 0 ? numLayers
+        GpuOffloadPlanner.IsAuto(requested)
+            ? throw new ArgumentException("--gpu-layers auto is resolved by the loader (CudaAutoSplit), not by a layer count.", nameof(requested))
+        : requested is < 0 ? numLayers
         : requested.HasValue ? Math.Clamp(requested.Value, 0, numLayers)
         : DeviceSpec.TryParse(device, out var spec, out _) && spec.Kind == DeviceKind.Cuda ? numLayers : 0;
 
@@ -480,6 +490,20 @@ public static class ServerStartup
     /// Whether the GGUF at <paramref name="path"/> is a <c>nemotron_h_moe</c> model whose routed experts may be offloaded
     /// (#1070), read from its metadata; false when the file cannot be read.
     /// </summary>
+    /// <summary>Why the GPU/CPU split host cannot run the model at <paramref name="path"/> (#1851), or null when it can.</summary>
+    private static string? AutoSplitBlocker(string path)
+    {
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            return DotLLM.Cuda.CudaAutoSplit.Blocker(gguf, GgufModelConfigExtractor.Extract(gguf.Metadata));
+        }
+        catch (Exception ex)
+        {
+            return $"the model could not be inspected ({ex.Message})";
+        }
+    }
+
     private static bool ExpertOffloadPossible(string path, DotLLM.Core.Moe.MoeOffloadOptions? moeOffload)
     {
         try

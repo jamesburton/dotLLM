@@ -176,7 +176,13 @@ public sealed unsafe class HybridTransformerModel : IModel
 
                 kernels = new CudaKernels(ptxDir);
 
-                // 3. Upload only GPU layers to VRAM
+                // 3. Upload only GPU layers to VRAM. #1851: admitted first, like the whole-model load (#1848), so a --gpu-layers N
+                //    that does not fit is refused with the numbers instead of being backed by shared system memory.
+                var (estLayers, estEmbedding, _) = CudaAutoSplit.EstimateWeightBytes(gguf, config, kernels);
+                long gpuWeightBytes = estEmbedding;
+                for (int l = 0; l < numGpuLayers; l++) gpuWeightBytes += estLayers[l];
+                CudaAdmission.EnsureFits($"model weights for {numGpuLayers} of {config.NumLayers} GPU layers (~{gpuWeightBytes >> 20} MiB)",
+                    gpuWeightBytes, remedies: GpuLayersRemedies);
                 gpuWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle, numGpuLayers);
 
                 // 4. VRAM estimation and warning
@@ -420,14 +426,34 @@ public sealed unsafe class HybridTransformerModel : IModel
         }
     }
 
-    /// <summary>Creates a <see cref="HybridKvCache"/> for this model.</summary>
+    /// <summary>Remedies for a <c>--gpu-layers N</c> whose weights do not fit (#1851).</summary>
+    internal const string GpuLayersRemedies =
+        "Lower --gpu-layers, let dotllm choose the count with --gpu-layers auto, use a smaller quantization, or free GPU memory";
+
+    /// <summary>KV storage type of the CPU tail (#1851): Q8_0 blocks, read in place by the CPU attention (rule 1: no FP32 KV).</summary>
+    internal const KvCacheDType CpuTailKvDType = KvCacheDType.Q8_0;
+
+    /// <summary>
+    /// Creates a <see cref="HybridKvCache"/> for this model: F16 device KV for the GPU layers and Q8_0 host KV for the CPU tail
+    /// (#1851; the tail was an FP32 <see cref="SimpleKvCache"/>, 4x the bytes, against rule 1).
+    /// </summary>
     public HybridKvCache CreateKvCache(int maxSeqLen)
     {
         _context.MakeCurrent();
-        return new HybridKvCache(
-            new CudaKvCache(_numGpuLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen),
-            new SimpleKvCache(Config.NumLayers - _numGpuLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen),
-            _numGpuLayers);
+        var gpu = new CudaKvCache(_numGpuLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
+        try
+        {
+            return new HybridKvCache(
+                gpu,
+                new QuantizedKvCache(Config.NumLayers - _numGpuLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen,
+                    CpuTailKvDType, CpuTailKvDType, windowSize: 0),
+                _numGpuLayers);
+        }
+        catch
+        {
+            gpu.Dispose();
+            throw;
+        }
     }
 
     /// <inheritdoc/>

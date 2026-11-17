@@ -58,7 +58,8 @@ internal sealed class ModelCreateCommand : Command<ModelCreateCommand.Settings>
         public string? Device { get; set; }
 
         [CommandOption("--gpu-layers")]
-        [Description("Transformer layers to offload to the GPU (CUDA partial offload). Omit for the device default (all on a GPU device); ignored on vulkan, which is whole-model resident.")]
+        [Description("Transformer layers to offload to the GPU (CUDA partial offload): 'auto' (as many leading layers as fit), N, or 'all'. Omit for the device default (all on a GPU device); ignored on vulkan, which is whole-model resident.")]
+        [System.ComponentModel.TypeConverter(typeof(DotLLM.Cli.Helpers.GpuLayersConverter))]
         public int? GpuLayers { get; set; }
 
         [CommandOption("--keep-alive")]
