@@ -354,9 +354,11 @@ public static class ServerStartup
     /// <param name="options">Server options.</param>
     /// <param name="kv">KV storage types of the non-paged cache.</param>
     /// <param name="paged">The GPU paged-KV factory, or null on the non-paged path.</param>
+    /// <param name="prefillChunk">The prefill chunk the generator uses (<see cref="ResolvePrefillChunk"/>), 0 for one pass.</param>
     /// <returns>The model's config after the limit.</returns>
     internal static ModelConfig ApplyCudaDenseContextFit(
-        DotLLM.Cuda.CudaTransformerModel model, ServerOptions options, KvCacheConfig kv, DotLLM.Cuda.CudaPagedKvCacheFactory? paged)
+        DotLLM.Cuda.CudaTransformerModel model, ServerOptions options, KvCacheConfig kv, DotLLM.Cuda.CudaPagedKvCacheFactory? paged,
+        int prefillChunk)
     {
         int native = model.NativeMaxSequenceLength;
         if (paged is not null)
@@ -372,7 +374,7 @@ public static class ServerStartup
             return model.Config;
         }
 
-        var fit = model.MeasureServingContextFit(kv, options.PrefillChunkSize);
+        var fit = model.MeasureServingContextFit(kv, prefillChunk);
         if (fit.SizingError is { } sizingError)
             Console.WriteLine($"[dotllm] WARNING: the context fit could not measure free VRAM ({sizingError}); serving the smallest window.");
         int served = ChooseServedContext(options.ContextSize, fit.MaxContext, native, out string? warning,
@@ -382,7 +384,7 @@ public static class ServerStartup
         if (served < native)
             model.LimitContextLength(served);
         string kvLabel = kv.IsQuantized ? $"{kv.KeyDType}/{kv.ValueDType}".ToLowerInvariant() : "f16";
-        string prefill = options.PrefillChunkSize > 0 ? $", prefill chunk {options.PrefillChunkSize}" : ", unchunked prefill";
+        string prefill = prefillChunk > 0 ? $", prefill chunk {prefillChunk}" : ", unchunked prefill";
         Console.WriteLine(options.ContextSize is > 0
             ? $"[dotllm] Context window: {model.Config.MaxSequenceLength} tokens (--ctx-size; {fit.MaxContext} fit in free VRAM: {fit.Describe()}, {kvLabel} KV{prefill})."
             : $"[dotllm] Context window: {model.Config.MaxSequenceLength} of {native} tokens, fitted to free VRAM ({fit.Describe()}, {kvLabel} KV{prefill}). " +
@@ -390,9 +392,42 @@ public static class ServerStartup
         return model.Config;
     }
 
-    /// <summary>The small-window remedy for the dense CUDA host (#1848): it has no MTP head, and its prefill scratch is per token.</summary>
+    /// <summary>The small-window remedy for the dense CUDA host (#1848): it has no MTP head, and an unchunked prefill's scratch is per token.</summary>
     internal const string DenseSmallWindowHint =
-        "Use a smaller KV type (--kv-quant-k/-v q8_0 or q4_0), bound the prefill scratch with --prefill-chunk (e.g. 1024), or free GPU memory.";
+        "Use a smaller KV type (--kv-quant-k/-v q8_0 or q4_0), keep the prefill chunked (--prefill-chunk-size, 1024 by default on --no-paged f16), " +
+        "or free GPU memory.";
+
+    /// <summary>
+    /// Prefill chunk the dense CUDA host uses when <c>--prefill-chunk-size</c> is not given (#1862), on the non-paged f16 path only.
+    /// Chunked, the forward scratch is a fixed cost instead of about as much per token as f16 KV, so the VRAM-fitted window roughly
+    /// doubles; cancellation is checked between chunks, so a client disconnect stops a long prefill; and the first chunk's square
+    /// G3 score plane (numHeads x chunk^2 x 6 B, 192 MiB for 32 heads) stays inside the plane the fit already retains, while every
+    /// later chunk runs G3's offset path (#1847), bounded to the same plane. Measured on framework: see the PR for #1862.
+    /// </summary>
+    internal const int DefaultCudaDensePrefillChunkTokens = 1024;
+
+    /// <summary>
+    /// The prefill chunk a server uses (#1862): an explicit <c>--prefill-chunk-size</c> always wins, 0 (one pass) included; with none,
+    /// <see cref="DefaultCudaDensePrefillChunkTokens"/> on the dense CUDA non-paged f16 path and one pass everywhere else. Paged and
+    /// q8_0 / q4_0 caches stay unchunked by default: their later chunks cannot use G3's offset path and would run <c>attention_f16</c>.
+    /// </summary>
+    /// <param name="requested">The <c>--prefill-chunk-size</c> value, or null when it was not given.</param>
+    /// <param name="cudaDenseF16NonPaged">Whether the model is the dense CUDA host on its non-paged f16 KV cache.</param>
+    /// <returns>Tokens per prefill forward pass, 0 for one pass.</returns>
+    internal static int ResolvePrefillChunk(int? requested, bool cudaDenseF16NonPaged)
+        => requested is int r ? Math.Max(0, r) : cudaDenseF16NonPaged ? DefaultCudaDensePrefillChunkTokens : 0;
+
+    /// <summary>
+    /// Whether <paramref name="model"/> takes the dense CUDA prefill default (#1862): the dense CUDA host
+    /// (<see cref="DotLLM.Cuda.CudaTransformerModel"/>, not the CUDA hybrids, which chunk themselves) on its non-paged f16 cache,
+    /// the one cache whose later chunks run G3's offset path. CPU, Vulkan and HIP models never do.
+    /// </summary>
+    /// <param name="model">The loaded model.</param>
+    /// <param name="cudaPagedPool">Whether the GPU paged KV pool serves it.</param>
+    /// <param name="kv">KV storage types.</param>
+    /// <returns>Whether the default applies.</returns>
+    internal static bool IsCudaDenseF16NonPaged(IModel model, bool cudaPagedPool, KvCacheConfig kv)
+        => model is DotLLM.Cuda.CudaTransformerModel && !cudaPagedPool && !kv.IsQuantized;
 
     /// <summary>
     /// The served context on the CUDA paged pool (#1836): <c>--ctx-size</c> or the model's window, never more than the pool holds.
@@ -835,6 +870,11 @@ public static class ServerStartup
         // of its rows (TryGrowTo, admitted against free VRAM), which costs milliseconds, so it is sized for the request alone.
         bool deviceOwnedPrefixKv = vulkanKvFactory is not null
             || (model is DotLLM.Cuda.CudaTransformerModel && cudaPagedFactory is null);
+
+        // #1862: the prefill chunk this server uses. An explicit --prefill-chunk-size (0 included) wins; otherwise the dense CUDA
+        // non-paged f16 path chunks by default, so its context fit charges a fixed forward scratch instead of a per-token one.
+        int prefillChunk = ResolvePrefillChunk(options.PrefillChunkSize,
+            IsCudaDenseF16NonPaged(model, cudaPagedFactory is not null, kvConfig));
         PrefixCache? prefixCache = !options.PromptCacheEnabled ? null
             : !deviceOwnedPrefixKv ? new PrefixCache(options.PromptCacheSize, options.PromptCachePolicy)
             : new PrefixCache(Math.Min(options.PromptCacheSize, VulkanPrefixCacheMaxEntries), options.PromptCachePolicy);
@@ -896,10 +936,11 @@ public static class ServerStartup
             promptLookup: options.PromptLookup,
             prefixTrieManager: prefixTrieManager,
             prefixCacheHeadroomTokens: prefixCacheHeadroom,
-            prefillChunkSize: options.PrefillChunkSize,
+            prefillChunkSize: prefillChunk,
             recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions());
-        if (options.PrefillChunkSize > 0)
-            Console.WriteLine($"[dotllm] Prefill chunk size: {options.PrefillChunkSize} tokens per forward pass");
+        if (prefillChunk > 0)
+            Console.WriteLine($"[dotllm] Prefill chunk size: {prefillChunk} tokens per forward pass" +
+                              (options.PrefillChunkSize is null ? " (dense CUDA default; --prefill-chunk-size 0 for one pass)" : ""));
         if (options.PromptLookup is { } lookup)
             Console.WriteLine($"[dotllm] Prompt lookup: up to {lookup.DraftTokens} drafts, n-gram {lookup.MinNgram}..{lookup.MaxNgram} (greedy requests; continuous batching off)");
         if (generator.RecurrentStepCheckpointBytes > 0)
@@ -928,7 +969,7 @@ public static class ServerStartup
         // Issues #1841 / #1836: dense CUDA honours --ctx-size and serves no more than fits: the paged pool's capacity, or the
         // non-paged KV + forward scratch that fit in free VRAM after warm-up.
         else if (model is DotLLM.Cuda.CudaTransformerModel cudaDense)
-            config = ApplyCudaDenseContextFit(cudaDense, options, kvConfig, cudaPagedFactory);
+            config = ApplyCudaDenseContextFit(cudaDense, options, kvConfig, cudaPagedFactory, prefillChunk);
         else if (model is DotLLM.Vulkan.VulkanQwen4ExpTransformerModel q4Vulkan)
         {
             // #1324: the window is the capacity the caches were sized for at load (--ctx-size, reduced to fit), already in Config.
@@ -1135,11 +1176,11 @@ public static class ServerStartup
     {
         var schedulerOptions = options.Scheduler;
 
-        if (options.PrefillChunkSize > 0 && (schedulerOptions?.MaxPrefillTokensPerStep ?? 0) <= 0)
+        if (options.PrefillChunkSize is > 0 and int chunk && (schedulerOptions?.MaxPrefillTokensPerStep ?? 0) <= 0)
         {
             schedulerOptions = (schedulerOptions ?? new ContinuousBatchSchedulerOptions()) with
             {
-                MaxPrefillTokensPerStep = options.PrefillChunkSize,
+                MaxPrefillTokensPerStep = chunk,
             };
         }
 

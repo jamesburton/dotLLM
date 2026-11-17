@@ -262,7 +262,7 @@ internal sealed class CudaForwardState : IDisposable
         {
             CudaAdmission.EnsureFits($"forward scratch for a {seqLen}-token forward pass", SequenceBytesAt(seqLen),
                 releasedBytes: held,
-                remedies: "Bound it with --prefill-chunk (e.g. 1024), shorten the prompt, or free GPU memory");
+                remedies: "Bound it with --prefill-chunk-size (e.g. 1024), shorten the prompt, or free GPU memory");
             newCapacity = seqLen;   // admitted on the re-check (free memory moved): exact size
         }
 
