@@ -66,6 +66,15 @@ __device__ __forceinline__ float kvq_dot_quant(const float* q_shared, const uint
                                                int elem0, int head_dim)
 {
     float score = 0.0f;
+    // A head that does not start and end on a 32-element block boundary (head_dim % 32 != 0, e.g. hd80 / hd112: the cache
+    // only requires the whole KV row to be a multiple of 32) straddles blocks; the block loops below would read the wrong
+    // block and run past q_shared. Fall back to one element at a time -- same d order, same per-element expression and FMA.
+    if (((elem0 | head_dim) & 31) != 0)
+    {
+        for (int d = 0; d < head_dim; d++)
+            score += q_shared[d] * kvq_elem(row, fmt, elem0 + d);
+        return score;
+    }
     if (fmt == KVQ_FMT_Q8_0)
     {
         for (int bb = 0; bb < head_dim; bb += 32)

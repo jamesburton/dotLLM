@@ -62,6 +62,14 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
         [KvCacheDType.Q4_0, KvCacheDType.Q8_0, 128, 8, 2, 1, 300, 0, false, 32, 275],
         // windowed prefill chunk
         [KvCacheDType.Q8_0, KvCacheDType.Q8_0, 64, 6, 2, 10, 291, 0, false, 32, 269],
+        // head_dim % 32 != 0 (Phi-2 / StableLM hd80): KV head 1 starts mid-block (element 80), so the per-head block loop
+        // must not assume 32-aligned heads. Both formats, decode and a windowed prefill.
+        [KvCacheDType.Q8_0, KvCacheDType.Q8_0, 80, 4, 2, 1, 300, 0, false, 0, -1],
+        [KvCacheDType.Q4_0, KvCacheDType.Q8_0, 80, 4, 2, 19, 0, 0, false, 0, -1],
+        [KvCacheDType.Q8_0, KvCacheDType.Q4_0, 80, 6, 2, 10, 291, 0, false, 32, 269],
+        // head_dim 96 (Phi-3) and 256 (Gemma / Qwen3.5 full attention): aligned, but outside the tensor-core prefill's hd64/128.
+        [KvCacheDType.Q8_0, KvCacheDType.Q8_0, 96, 32, 8, 20, 50, 0, false, 0, -1],
+        [KvCacheDType.Q4_0, KvCacheDType.Q4_0, 256, 8, 2, 17, 40, 0, false, 0, -1],
     ];
 
     [SkippableTheory]
