@@ -223,6 +223,10 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         if (_callerPinAttempted == 0)
             PinCallerThread();
 
+        // Every thread that drives a dispatch also opts out of EcoQoS once (#1675); the caller is thread 0 of the barrier.
+        if (!t_powerThrottleOptOutDone)
+            OptOutCallerOfPowerThrottling();
+
         int activeWorkers = _activeWorkerCount;
         int totalActive = activeWorkers + 1; // workers + caller
 
@@ -311,6 +315,9 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         // Pin thread to assigned core if configured
         if (_workerCoreAssignment[arrayIdx] >= 0)
             CpuAffinity.PinCurrentThread(_workerCoreAssignment[arrayIdx]);
+
+        // Run at full speed even when the process counts as background work (#1675); see OptOutCallerOfPowerThrottling.
+        CpuAffinity.OptOutOfPowerThrottling();
 
         // Baseline for "has a new dispatch happened since I last checked". This MUST be the
         // constant 0, not a live Volatile.Read of the mutable _dispatchGeneration field.
@@ -410,6 +417,29 @@ public sealed unsafe class ComputeThreadPool : IDisposable
                 _completion.Signal();
             }
         }
+    }
+
+    /// <summary>Per-thread: this thread already asked Windows not to power-throttle it (any pool, any dispatch).</summary>
+    [ThreadStatic]
+    private static bool t_powerThrottleOptOutDone;
+
+    /// <summary>
+    /// Opts the dispatching thread out of Windows execution-speed power throttling (EcoQoS), once per thread (#1675).
+    /// </summary>
+    /// <remarks>
+    /// Windows 11 may run the threads of a windowless or background process (a CLI under ssh, a service, a
+    /// minimised console) as low-QoS work: packed onto few cores or E-cores, at reduced clocks. Decode synchronises
+    /// every thread at a barrier 30-40 times per layer, so one throttled thread sets the pace for the whole pool.
+    /// llama.cpp opts every compute thread out at default priority (<c>ggml_thread_apply_priority</c>); this is the
+    /// same request. It is a scheduling hint and changes no result. Unlike affinity, it is also applied to ThreadPool
+    /// threads: it only asks for full clocks, and leaves no state that would hurt other work later run on that thread.
+    /// Disabled with <c>DOTLLM_CPU_POWER_THROTTLE_OPTOUT=0</c>.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void OptOutCallerOfPowerThrottling()
+    {
+        t_powerThrottleOptOutDone = true;
+        CpuAffinity.OptOutOfPowerThrottling();
     }
 
     /// <summary>
