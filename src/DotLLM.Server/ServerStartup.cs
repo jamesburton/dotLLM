@@ -963,6 +963,14 @@ public static class ServerStartup
                 $"; K/V + indexer {perToken / 1024.0:F1} KiB/token ({DotLLM.Vulkan.VulkanQwen4ExpTransformerModel.KvStorage.ToString().ToLowerInvariant()} K/V), " +
                 $"{perToken * (long)config.MaxSequenceLength / 1048576.0:F0} MiB if the window fills (allocated lazily). Raise with --ctx-size.");
         }
+        else if (model is DotLLM.Cuda.HybridTransformerModel split)
+        {
+            // #1851: an automatic split was sized for --ctx-size (default 4096) of KV, and its Config carries that window; serve
+            // and report it, so a longer request is refused at admission instead of failing on a position past the window.
+            config = split.Config;
+            Console.WriteLine($"[dotllm] Context window: {config.MaxSequenceLength} tokens ({split.NumGpuLayers} GPU + " +
+                              $"{config.NumLayers - split.NumGpuLayers} CPU layers).");
+        }
         else if (model is IContextLimitable limitable)
             config = ApplyRequestedContextSize(model, limitable, options);
 
