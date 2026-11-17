@@ -55,6 +55,9 @@ public sealed class HybridSplitParityTests
         return dot / Math.Sqrt(na * nb);
     }
 
+    private static int[] TopK(float[] v, int k) =>
+        Enumerable.Range(0, v.Length).OrderByDescending(i => v[i]).Take(k).ToArray();
+
     private static int ArgMax(float[] v)
     {
         int best = 0;
@@ -99,7 +102,7 @@ public sealed class HybridSplitParityTests
     private const double GapMultiple = 3.0;
     private const double MinGap = 2e-4;
 
-    private void CheckModel(string path, string name)
+    private void CheckModel(string path, string name, ThreadingConfig? threading = null, int[]? splits = null)
     {
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -108,7 +111,8 @@ public sealed class HybridSplitParityTests
         int layers = config.NumLayers;
 
         List<float[]> cpu, cpuF32;
-        using (var cpuModel = ModelLoader.CreateCpuModelFromGguf(gguf, config, ThreadingConfig.SingleThreaded))
+        threading ??= ThreadingConfig.SingleThreaded;
+        using (var cpuModel = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading))
         {
             cpu = Run(cpuModel, () => new QuantizedKvCache(layers, config.NumKvHeads, config.HeadDim, maxLen,
                 HybridTransformerModel.CpuTailKvDType, HybridTransformerModel.CpuTailKvDType, windowSize: 0), vocab);
@@ -130,9 +134,9 @@ public sealed class HybridSplitParityTests
         }
 
         var failures = new List<string>();
-        foreach (int n in new[] { 1, layers / 2, layers - 1 }.Distinct())
+        foreach (int n in (splits ?? [1, layers / 2, layers - 1]).Distinct())
         {
-            using var hybrid = HybridTransformerModel.LoadFromGguf(gguf, config, n, deviceId: 0, ThreadingConfig.SingleThreaded);
+            using var hybrid = HybridTransformerModel.LoadFromGguf(gguf, config, n, deviceId: 0, threading.Value);
             using (var probe = hybrid.CreateKvCache(maxLen))
             {
                 // Rule 1 (#1851): the tail KV is Q8_0 blocks, not an FP32 SimpleKvCache.
@@ -155,8 +159,11 @@ public sealed class HybridSplitParityTests
                                   $"(f32-tail split vs gpu {dF32:E3}); bar {bar:E3}; red arm {dRed:E3}");
                 if (dCpu > bar) failures.Add($"{name} N={n} step {s}: split vs CPU 1-cos {dCpu:E3} > {bar:E3}");
                 if (dGpu > bar) failures.Add($"{name} N={n} step {s}: split vs GPU 1-cos {dGpu:E3} > {bar:E3}");
-                if (ArgMax(split[s]) != ArgMax(gpu[s]) && ArgMax(split[s]) != ArgMax(cpu[s]))
-                    failures.Add($"{name} N={n} step {s}: argmax matches neither reference");
+                // Top-1 must be among both references' top 5: a near tie may pick a different winner (the references themselves can
+                // disagree there), but a broken tail does not land in both top-5 lists.
+                int top = ArgMax(split[s]);
+                if (!TopK(gpu[s], 5).Contains(top) || !TopK(cpu[s], 5).Contains(top))
+                    failures.Add($"{name} N={n} step {s}: split argmax {top} is outside a reference's top 5");
                 if (s > 0 && dRed > bar) redCaught = true;
             }
             if (!redCaught) failures.Add($"{name} N={n}: the red arm (history dropped) passed the bar, so the bar cannot see a lost KV");
@@ -170,6 +177,20 @@ public sealed class HybridSplitParityTests
         Skip.If(!File.Exists(SmolLmPath), "SmolLM-135M Q8_0 GGUF not found.");
         Skip.If(!CudaDevice.IsAvailable(), "No CUDA device available.");
         CheckModel(SmolLmPath!, "SmolLM-135M");
+    }
+
+    /// <summary>
+    /// Opt-in: the same parity on a real model named by <c>DOTLLM_SPLIT_PARITY_GGUF</c> (e.g. TwIL-8B), threaded, at the split points
+    /// in <c>DOTLLM_SPLIT_PARITY_LAYERS</c> (comma-separated; default 1, L/2, L-1).
+    /// </summary>
+    [SkippableFact]
+    public void RealModel_FromEnvironment_SplitMatchesCpuAndGpu()
+    {
+        string? path = Environment.GetEnvironmentVariable("DOTLLM_SPLIT_PARITY_GGUF");
+        Skip.If(string.IsNullOrEmpty(path) || !File.Exists(path), "DOTLLM_SPLIT_PARITY_GGUF not set.");
+        Skip.If(!CudaDevice.IsAvailable(), "No CUDA device available.");
+        int[]? splits = Environment.GetEnvironmentVariable("DOTLLM_SPLIT_PARITY_LAYERS")?.Split(',').Select(int.Parse).ToArray();
+        CheckModel(path!, Path.GetFileNameWithoutExtension(path!), new ThreadingConfig(0, 0), splits);
     }
 
     [SkippableFact]
