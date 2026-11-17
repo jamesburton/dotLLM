@@ -66,8 +66,9 @@ public sealed class CudaPagedPrefixReuseTests
         Turn1() + reply + "<|im_end|>\n<|im_start|>user\n" + string.Concat(Enumerable.Repeat(Filler, 6))
         + "Question 2: now name one colour.<|im_end|>\n<|im_start|>assistant\n";
 
+    // Shares no leading token with Turn1 (not even the chat template's system header), so it can never hit Turn1's entry.
     private static string Unrelated() =>
-        "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\n"
+        "Harbour log, evening watch. "
         + string.Concat(Enumerable.Repeat("Seven sailors sorted silver spoons beside the harbour wall at dusk. ", 22))
         + "Count the sailors.<|im_end|>\n<|im_start|>assistant\n";
 
