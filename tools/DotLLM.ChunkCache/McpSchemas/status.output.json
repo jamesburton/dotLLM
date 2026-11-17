@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chunkcache_status output (integration spec 7.2)",
+  "type": "object",
+  "required": ["total_chunks", "missing_chunks", "missing_tokens", "up_to_date", "stale_files", "new_files", "deleted_files", "store_bytes", "entries"],
+  "properties": {
+    "total_chunks": {"type": "integer"},
+    "missing_chunks": {"type": "integer"},
+    "missing_tokens": {"type": "integer"},
+    "up_to_date": {"type": "boolean"},
+    "stale_files": {"type": "array", "items": {"type": "string"}},
+    "new_files": {"type": "array", "items": {"type": "string"}},
+    "deleted_files": {"type": "array", "items": {"type": "string"}},
+    "missing": {"type": "array", "items": {"type": "object", "required": ["path", "start_line", "end_line", "tokens"], "properties": {
+      "path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}, "tokens": {"type": "integer"}}}},
+    "store_bytes": {"type": "integer"},
+    "budget_bytes": {"type": "integer"},
+    "entries": {"type": "integer"}
+  }
+}
