@@ -75,12 +75,15 @@ public sealed class CudaAdmissionTests
     }
 
     [Fact]
-    public void QuantizedKvCache_CountsTheFullHistoryDequantScratch_AndIsRefused()
+    public void QuantizedKvCache_CountsOnlyItsBlockBytes_AndIsRefused()
     {
         var q8 = new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0);
-        // q8_0: 1,024 / 32 blocks x 34 B = 1,088 B per K or V row -> 40 x 2,176 = 85 KiB, plus the FP16 K+V dequant scratch over
-        // the whole history at the widest stride: 2 x 1,024 x 2 B = 4 KiB (#1841's 85 + 4 KiB per token).
-        Assert.Equal(40L * 2 * 1088 + 2 * 1024 * 2, CudaQuantizedKvCache.BytesPerPosition(Twil, q8));
+        // q8_0: 1,024 / 32 blocks x 34 B = 1,088 B per K or V row -> 40 x 2,176 = 85 KiB per token. Since #1850 attention reads the
+        // rows in place, so the 4 KiB/token FP16 K+V dequant scratch #1841 counted is gone.
+        Assert.Equal(40L * 2 * 1088, CudaQuantizedKvCache.BytesPerPosition(Twil, q8));
+        Assert.Equal(85 * 1024, CudaQuantizedKvCache.BytesPerPosition(Twil, q8));
+        var q4 = new KvCacheConfig(KvCacheDType.Q4_0, KvCacheDType.Q4_0);
+        Assert.Equal(40L * 2 * (1024 / 32 * 18), CudaQuantizedKvCache.BytesPerPosition(Twil, q4));
         var windowed = q8 with { MixedPrecisionWindowSize = 64 };
         Assert.Equal(1000 * CudaQuantizedKvCache.BytesPerPosition(Twil, q8) + 40L * 2 * 64 * 1024 * 2,
             CudaQuantizedKvCache.BytesFor(Twil, 1000, windowed));

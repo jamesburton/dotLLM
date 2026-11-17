@@ -111,6 +111,7 @@ public sealed class CudaPrefixReuseTests
         var grown = new TextGenerator(model, tokenizer, factory, growCache, mtpEnabled: false, prefixCacheHeadroomTokens: 0);
         Assert.Equal(turn1.GeneratedTokenIds, grown.Generate(Turn1(), opts).GeneratedTokenIds);
         long offsetRunsBefore = CudaG3Attention.OffsetRunCount;
+        long kvqFlashBefore = CudaKernels.AttentionFlashPrefillKvqLaunches;
         long growthsBefore = CudaKvGrowth.GrowthCount;
         int capturesBefore = model.GraphCaptureCount, replaysBefore = model.GraphReplayCount;
         // Poison new device allocations (NaN bytes) while the growth runs: CUDA hands back freed VRAM unchanged, and an earlier
@@ -129,6 +130,10 @@ public sealed class CudaPrefixReuseTests
         _out.WriteLine($"{kvType}: G3 enabled {CudaG3Attention.Enabled}, offset runs +{CudaG3Attention.OffsetRunCount - offsetRunsBefore}");
         if (kvType == "f16" && CudaG3Attention.Enabled)   // GeForce Ampere default: the F16 suffix prefill must take the G3 offset path
             Assert.True(CudaG3Attention.OffsetRunCount > offsetRunsBefore, "the reused prefill did not run G3 with a position offset");
+        _out.WriteLine($"{kvType}: kvq flash prefill launches +{CudaKernels.AttentionFlashPrefillKvqLaunches - kvqFlashBefore}");
+        if (kvType == "q8_0" && model.Kernels.HasAttentionFlashPrefillKvq(config.HeadDim, KvCacheDType.Q8_0, KvCacheDType.Q8_0))
+            // #1850: the q8_0 suffix prefill reads the quantized prefix in place through the tensor-core kernel at an offset.
+            Assert.True(CudaKernels.AttentionFlashPrefillKvqLaunches > kvqFlashBefore, "the q8_0 suffix prefill did not run the kvq kernel");
         if (kvType == "f16" && model.UseGraphCapture)
         {
             // Decode after the growth must recapture against the new buffers and then replay (not silently fall back to eager).

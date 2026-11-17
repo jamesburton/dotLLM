@@ -10,9 +10,9 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <summary>
 /// Direct equivalence checks for the graph-friendly variants on
 /// <see cref="CudaQuantizedKvCache"/>. Compares the per-layer Q-cache + FP16 ring
-/// + dequant scratch byte-for-byte between the eager <c>UpdateDevice</c> path
-/// and the new <c>UpdateDeviceForGraph</c> + <c>PrepareAttentionScratchForGraph</c>
-/// path. Uses synthetic FP16 data so we can isolate the eviction state machine
+/// byte-for-byte between the eager <c>UpdateDevice</c> path and <c>UpdateDeviceForGraph</c>, and
+/// the in-place attention output (#1850: eager <c>attention_kvq</c> with the host quantized length vs
+/// graph <c>attention_kvq_dyn</c> deriving it from the device position) bit for bit. Uses synthetic FP16 data so we can isolate the eviction state machine
 /// from any model-loading concerns.
 /// </summary>
 [Trait("Category", "GPU")]
@@ -136,6 +136,17 @@ public sealed unsafe class CudaQuantizedKvCacheGraphTest : IDisposable
         CudaDriverApi.cuMemAlloc_v2(out nint kRowDev, rowBytes).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out nint vRowDev, rowBytes).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out nint posDev, sizeof(int)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint seqKvDev, sizeof(int)).ThrowOnError();
+        const int numHeads = numKvHeads * 2;
+        nuint qBytes = (nuint)(numHeads * headDim * sizeof(ushort));
+        CudaDriverApi.cuMemAlloc_v2(out nint qDev, qBytes).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint outEager, qBytes).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint outGraph, qBytes).ThrowOnError();
+        {
+            var hq = new ushort[numHeads * headDim];
+            for (int i = 0; i < hq.Length; i++) hq[i] = FloatToHalf(MathF.Sin(i * 0.37f));
+            fixed (ushort* p = hq) CudaDriverApi.cuMemcpyHtoD_v2(qDev, (nint)p, qBytes).ThrowOnError();
+        }
 
         try
         {
@@ -175,14 +186,19 @@ public sealed unsafe class CudaQuantizedKvCacheGraphTest : IDisposable
                 CompareWindow(cacheEager, cacheGraph, kvStride, pos);
                 CompareQuant(cacheEager, cacheGraph, kvStride, pos);
 
-                // Now also drive PrepareAttentionScratch on each side and compare.
-                var (kEager, vEager) = cacheEager.PrepareAttentionScratch(0, _stream.Handle, _kernels!);
-                var (kGraph, vGraph) = cacheGraph.PrepareAttentionScratchForGraph(0, posDev, _stream.Handle, _kernels!);
-                _stream.Synchronize();
-
+                // Attention over each cache, read in place: eager (host quantized length) vs graph (derived on the device).
                 int currentLen = pos + 1;
-                CompareScratch(kEager, kGraph, kvStride, currentLen, $"K-scratch pos={pos}");
-                CompareScratch(vEager, vGraph, kvStride, currentLen, $"V-scratch pos={pos}");
+                CudaDriverApi.cuMemcpyHtoD_v2(seqKvDev, (nint)(&currentLen), sizeof(int)).ThrowOnError();
+                _kernels!.LaunchAttentionKvq(qDev, cacheEager.GetQuantizedKeysPtr(0), cacheEager.GetQuantizedValuesPtr(0),
+                    cacheEager.GetWindowKeysPtr(0), cacheEager.GetWindowValuesPtr(0), outEager,
+                    1, currentLen, numHeads, numKvHeads, headDim, pos, 0, _stream.Handle, 0,
+                    KvCacheDType.Q8_0, KvCacheDType.Q8_0, cacheEager.QuantizedLength, windowSize);
+                _kernels.LaunchAttentionKvqDyn(qDev, cacheGraph.GetQuantizedKeysPtr(0), cacheGraph.GetQuantizedValuesPtr(0),
+                    cacheGraph.GetWindowKeysPtr(0), cacheGraph.GetWindowValuesPtr(0), outGraph,
+                    1, seqKvDev, numHeads, numKvHeads, headDim, posDev, 0, _stream.Handle, 0,
+                    KvCacheDType.Q8_0, KvCacheDType.Q8_0, windowSize);
+                _stream.Synchronize();
+                CompareScratch(outEager, outGraph, numHeads * headDim, 1, $"attention pos={pos}");
             }
         }
         finally
@@ -190,6 +206,10 @@ public sealed unsafe class CudaQuantizedKvCacheGraphTest : IDisposable
             CudaDriverApi.cuMemFree_v2(kRowDev);
             CudaDriverApi.cuMemFree_v2(vRowDev);
             CudaDriverApi.cuMemFree_v2(posDev);
+            CudaDriverApi.cuMemFree_v2(seqKvDev);
+            CudaDriverApi.cuMemFree_v2(qDev);
+            CudaDriverApi.cuMemFree_v2(outEager);
+            CudaDriverApi.cuMemFree_v2(outGraph);
         }
     }
 

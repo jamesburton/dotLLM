@@ -606,6 +606,19 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly CudaModule? _attentionFlashPrefillHd256KvqModule;
     private readonly nint[] _attentionFlashPrefillHd256KvqFuncs = new nint[4];
 
+    // Dense quantized-KV attention read in place (issue #1850 -- native/kernels/attention_kvq.cu): attention_f16 with K/V
+    // dequantized per element in registers from CudaQuantizedKvCache's Q8_0 / Q4_0 rows (+ optional FP16 ring), so the cache
+    // needs no full-history FP16 scratch. Best-effort load: absent PTX leaves them 0 (HasAttentionKvq false).
+    private readonly CudaModule? _attentionKvqModule;
+    private readonly nint _attentionKvqFunc;
+    private readonly nint _attentionKvqDynFunc;
+
+    // Tensor-core flash prefill over the dense quantized KV cache, head_dim 64 / 128, F16 output (issue #1850 --
+    // native/kernels/attention_flash_mma_prefill_kvq.cu). Indexed [hdIndex * 5 + fmtIndex]: hdIndex 0 = hd64, 1 = hd128;
+    // fmtIndex = KvqIndex (0 q8q8, 1 q4q4, 2 q8q4, 3 q4q8) or 4 = f16f16 (the kernel-level oracle entry). Ampere-only, best effort.
+    private readonly CudaModule? _attentionFlashPrefillKvqModule;
+    private readonly nint[] _attentionFlashPrefillKvqFuncs = new nint[10];
+
     private readonly CudaModule? _attentionMmaDecodeKvqModule;
     private readonly nint[] _attentionMmaDecodeKvqFuncs = new nint[4];
     private readonly int[] _attentionMmaDecodeKvqMaxCoResident = { -1, -1, -1, -1 };
@@ -1559,6 +1572,48 @@ public sealed unsafe partial class CudaKernels : IDisposable
             {
                 _attentionFlashPrefillHd256KvqModule = null;
                 Array.Clear(_attentionFlashPrefillHd256KvqFuncs);
+            }
+        }
+
+        // Dense quantized-KV attention in place (issue #1850).
+        string attentionKvqPath = Path.Combine(ptxDir, "attention_kvq.ptx");
+        if (File.Exists(attentionKvqPath))
+        {
+            try
+            {
+                var m = CudaModule.LoadFromFile(attentionKvqPath);
+                _attentionKvqFunc = m.TryGetFunction("attention_kvq");
+                _attentionKvqDynFunc = m.TryGetFunction("attention_kvq_dyn");
+                _attentionKvqModule = m;
+            }
+            catch (CudaException)
+            {
+                _attentionKvqModule = null;
+                _attentionKvqFunc = _attentionKvqDynFunc = 0;
+            }
+        }
+
+        string attentionFlashPrefillKvqPath = Path.Combine(ptxDir, "attention_flash_mma_prefill_kvq.ptx");
+        if (File.Exists(attentionFlashPrefillKvqPath))
+        {
+            try
+            {
+                var m = CudaModule.LoadFromFile(attentionFlashPrefillKvqPath);
+                string[] fmts = { "q8q8", "q4q4", "q8q4", "q4q8", "f16f16" };
+                for (int hd = 0; hd < 2; hd++)
+                    for (int f = 0; f < fmts.Length; f++)
+                    {
+                        nint fn = m.TryGetFunction($"attention_flash_mma_prefill_kvq_hd{(hd == 0 ? 64 : 128)}_{fmts[f]}");
+                        if (fn != 0)
+                            SetMaxDynamicSharedBytes(fn, AttentionFlashPrefillHd256MaxSmemBytes);
+                        _attentionFlashPrefillKvqFuncs[hd * 5 + f] = fn;
+                    }
+                _attentionFlashPrefillKvqModule = m;
+            }
+            catch (CudaException)
+            {
+                _attentionFlashPrefillKvqModule = null;
+                Array.Clear(_attentionFlashPrefillKvqFuncs);
             }
         }
     }
@@ -5002,6 +5057,152 @@ public sealed unsafe partial class CudaKernels : IDisposable
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
     }
     #pragma warning restore CS1573
+
+    /// <summary>True when the in-place quantized-KV attention kernels (issue #1850, <c>attention_kvq.ptx</c>) are loaded.</summary>
+    public bool HasAttentionKvq => _attentionKvqFunc != 0 && _attentionKvqDynFunc != 0;
+
+    /// <summary>
+    /// Launches since process start of <see cref="LaunchAttentionKvq"/> / <see cref="LaunchAttentionKvqDyn"/> (eager calls only;
+    /// a graph replay does not count). Diagnostics: lets a test prove the in-place path ran.
+    /// </summary>
+    internal static long AttentionKvqLaunches;
+
+    /// <summary>Launches since process start of <see cref="LaunchAttentionFlashPrefillKvq"/> with a quantized K/V pair.</summary>
+    internal static long AttentionFlashPrefillKvqLaunches;
+
+    private static int KvqFormatCode(KvCacheDType dtype) => dtype switch
+    {
+        KvCacheDType.Q8_0 => 1,
+        KvCacheDType.Q4_0 => 2,
+        _ => throw new NotSupportedException($"In-place KV attention does not support {dtype} blocks."),
+    };
+
+    /// <summary>
+    /// <see cref="LaunchAttention"/> over <see cref="CudaQuantizedKvCache"/> storage read in place (issue #1850): row
+    /// <c>t &lt; quantLen</c> of the history is a KV-format <paramref name="kDtype"/> / <paramref name="vDtype"/> row
+    /// (Q8_0 or Q4_0) of <paramref name="kQuant"/> / <paramref name="vQuant"/>; later rows are FP16 at ring slot
+    /// <c>t % window</c> of <paramref name="kRing"/> / <paramref name="vRing"/> (window 0: no ring). Same grid, shared memory,
+    /// masking, sinks and output as <c>attention_f16</c>, and bit-identical to dequantizing the history into an FP16 scratch
+    /// and running it.
+    /// </summary>
+    #pragma warning disable CS1573 // match LaunchAttention; params are self-documenting
+    public void LaunchAttentionKvq(nint q, nint kQuant, nint vQuant, nint kRing, nint vRing, nint output,
+                                   int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+                                   int positionOffset, int slidingWindow, nint stream, nint sinks,
+                                   KvCacheDType kDtype, KvCacheDType vDtype, int quantLen, int window)
+    {
+        if (_attentionKvqFunc == 0)
+            throw new InvalidOperationException("attention_kvq kernel is not loaded (attention_kvq.ptx missing/stale).");
+        if (window <= 0 && quantLen < seqKv)
+            throw new ArgumentException("Without a window every row must be quantized (quantLen >= seqKv).", nameof(quantLen));
+        nint qArg = q, kArg = kQuant, vArg = vQuant, krArg = kRing, vrArg = vRing, outArg = output, sinksArg = sinks;
+        int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        int poArg = positionOffset, swArg = slidingWindow;
+        int kfArg = KvqFormatCode(kDtype), vfArg = KvqFormatCode(vDtype), qlArg = quantLen, wArg = window;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &krArg, &vrArg, &outArg,
+                        &sqArg, &skvArg, &nhArg, &nkvArg, &hdArg, &poArg, &swArg, &sinksArg,
+                        &kfArg, &vfArg, &qlArg, &wArg};
+
+        const int TileKv = 256;
+        uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+        AttentionKvqLaunches++;
+        CudaDriverApi.cuLaunchKernel(_attentionKvqFunc,
+                (uint)(seqQ * numHeads), 1, 1, BlockSize, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Graph-capture variant of <see cref="LaunchAttentionKvq"/>: <c>seqKv</c> and <c>positionOffset</c> are read from the
+    /// device ints at <paramref name="seqKvPtr"/> / <paramref name="positionOffsetPtr"/>, and the quantized row count is derived
+    /// device-side as <c>max(0, seqKv - window)</c> (window 0: every row), the invariant the captured quantize-on-evict keeps.
+    /// </summary>
+    public void LaunchAttentionKvqDyn(nint q, nint kQuant, nint vQuant, nint kRing, nint vRing, nint output,
+                                      int seqQ, nint seqKvPtr, int numHeads, int numKvHeads, int headDim,
+                                      nint positionOffsetPtr, int slidingWindow, nint stream, nint sinks,
+                                      KvCacheDType kDtype, KvCacheDType vDtype, int window)
+    {
+        if (_attentionKvqDynFunc == 0)
+            throw new InvalidOperationException("attention_kvq_dyn kernel is not loaded (attention_kvq.ptx missing/stale).");
+        nint qArg = q, kArg = kQuant, vArg = vQuant, krArg = kRing, vrArg = vRing, outArg = output, sinksArg = sinks;
+        int sqArg = seqQ;
+        nint skvPtrArg = seqKvPtr, poPtrArg = positionOffsetPtr;
+        int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim, swArg = slidingWindow;
+        int kfArg = KvqFormatCode(kDtype), vfArg = KvqFormatCode(vDtype), wArg = window;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &krArg, &vrArg, &outArg,
+                        &sqArg, &skvPtrArg, &nhArg, &nkvArg, &hdArg, &poPtrArg, &swArg, &sinksArg,
+                        &kfArg, &vfArg, &wArg};
+
+        const int TileKv = 256;
+        uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+        CudaDriverApi.cuLaunchKernel(_attentionKvqDynFunc,
+                (uint)(seqQ * numHeads), 1, 1, BlockSize, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+    #pragma warning restore CS1573
+
+    /// <summary>Dynamic shared memory of the dense flash prefill kvq kernel for a head dim and GQA group.</summary>
+    public static int AttentionFlashPrefillKvqSmemBytes(int headDim, int group)
+        => (group * 16 * (headDim + 8) + 2 * 2 * 16 * (headDim + 8)) * 2;
+
+    /// <summary>
+    /// Pure shape check for <see cref="LaunchAttentionFlashPrefillKvq"/>: head_dim 64 or 128, GQA dividing evenly with a group
+    /// of at most 8 (one warp per query head) and the shared memory within the opt-in cap.
+    /// </summary>
+    public static bool IsAttentionFlashPrefillKvqShape(int numHeads, int numKvHeads, int headDim)
+    {
+        if (headDim is not (64 or 128) || numKvHeads <= 0 || numHeads % numKvHeads != 0) return false;
+        int group = numHeads / numKvHeads;
+        return group <= 8 && AttentionFlashPrefillKvqSmemBytes(headDim, group) <= AttentionFlashPrefillHd256MaxSmemBytes;
+    }
+
+    private int FlashPrefillKvqIndex(int headDim, KvCacheDType? kDtype, KvCacheDType? vDtype)
+    {
+        int hd = headDim == 64 ? 0 : headDim == 128 ? 1 : -1;
+        int f = kDtype is null && vDtype is null ? 4 : kDtype is { } k && vDtype is { } v ? KvqIndex(k, v) : -1;
+        return hd < 0 || f < 0 ? -1 : hd * 5 + f;
+    }
+
+    /// <summary>
+    /// True when the dense flash prefill kvq kernel (issue #1850) for this head dim and K/V pair is loaded. Null formats name the
+    /// F16-KV entry (the kernel-level oracle).
+    /// </summary>
+    public bool HasAttentionFlashPrefillKvq(int headDim, KvCacheDType? kDtype, KvCacheDType? vDtype)
+    {
+        int i = FlashPrefillKvqIndex(headDim, kDtype, vDtype);
+        return i >= 0 && _attentionFlashPrefillKvqFuncs[i] != 0;
+    }
+
+    /// <summary>
+    /// Tensor-core causal prefill attention over the dense quantized KV cache (issue #1850). <paramref name="q"/> is F16
+    /// <c>[seqQ, numHeads*headDim]</c>; <paramref name="k"/> / <paramref name="v"/> are the raw KV-format blocks of rows
+    /// <c>[0, seqKv)</c> (or F16 rows when both formats are null); <paramref name="output"/> is F16 <c>[seqQ, numHeads*headDim]</c>,
+    /// the <c>attention_f16</c> layout. Query row i attends keys <c>0..positionOffset+i</c> with scale <c>1/sqrt(headDim)</c>.
+    /// Caller checks <see cref="IsAttentionFlashPrefillKvqShape"/> and <see cref="HasAttentionFlashPrefillKvq"/>; no sliding
+    /// window, sinks or FP16 ring.
+    /// </summary>
+    public void LaunchAttentionFlashPrefillKvq(nint q, nint k, nint v, KvCacheDType? kDtype, KvCacheDType? vDtype,
+        nint output, int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset, nint stream)
+    {
+        int idx = FlashPrefillKvqIndex(headDim, kDtype, vDtype);
+        if (idx < 0 || _attentionFlashPrefillKvqFuncs[idx] == 0)
+            throw new InvalidOperationException(
+                $"attention_flash_mma_prefill_kvq kernel for hd{headDim} {kDtype?.ToString() ?? "F16"}/{vDtype?.ToString() ?? "F16"} is not loaded.");
+        if (!IsAttentionFlashPrefillKvqShape(numHeads, numKvHeads, headDim))
+            throw new ArgumentException($"Unsupported shape for the flash prefill kvq kernel: {numHeads}/{numKvHeads}/{headDim}.");
+        DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
+        if (kDtype is not null) AttentionFlashPrefillKvqLaunches++;
+
+        int group = numHeads / numKvHeads;
+        nint qArg = q, kArg = k, vArg = v, oArg = output;
+        int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, poArg = positionOffset;
+        float scArg = 1f / MathF.Sqrt(headDim);
+        void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &sqArg, &skvArg, &nhArg, &nkvArg, &poArg, &scArg };
+        CudaDriverApi.cuLaunchKernel(_attentionFlashPrefillKvqFuncs[idx],
+                (uint)((seqQ + 15) / 16), (uint)numKvHeads, 1, (uint)(group * 32), 1, 1,
+                (uint)AttentionFlashPrefillKvqSmemBytes(headDim, group), stream, (nint)args, 0).ThrowOnError();
+    }
 
     /// <summary>
     /// Whether the opt-in direct block-table-read paged decode attention kernel (issue #200,
