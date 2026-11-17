@@ -304,7 +304,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog); null = the backend default (#1862).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
         [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass. Default: " +
-                     "1024 on dense CUDA with --no-paged and f16 KV (bounds the forward scratch so the VRAM-fitted window is larger, and lets " +
+                     "1024 on dense CUDA with --no-paged and f16 KV, 2048 with q8_0 or q4_0 KV (bounds the forward scratch so the VRAM-fitted window is larger, and lets " +
                      "a client disconnect stop a long prefill); one pass elsewhere. With the continuous-batch scheduler this caps prefill " +
                      "tokens admitted per step instead.")]
         public int? PrefillChunkSize { get; set; }

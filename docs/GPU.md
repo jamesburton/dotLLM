@@ -183,10 +183,23 @@ default and does not cover `bench`, which submits the whole prompt in one `Forwa
 
 ### Dense CUDA serve: chunked prefill by default (issue #1862)
 
-`dotllm serve` on the dense CUDA host (`CudaTransformerModel`) prefills in 1,024-token chunks when
-`--prefill-chunk-size` is not given, on the non-paged f16 cache only (`ServerStartup.ResolvePrefillChunk`).
-Any explicit value wins, and `--prefill-chunk-size 0` restores one pass. `run`, `chat`, the paged pool,
-q8_0 / q4_0 KV, and the CPU, Vulkan and HIP backends are unchanged.
+`dotllm serve` on the dense CUDA host (`CudaTransformerModel`) prefills in chunks when `--prefill-chunk-size` is
+not given, on the non-paged cache: 1,024 tokens on f16, and 2,048 on q8_0 / q4_0 since #1850
+(`ServerStartup.ResolvePrefillChunk`). Any explicit value wins, and `--prefill-chunk-size 0` restores one pass. `run`,
+`chat`, the paged pool, and the CPU, Vulkan and HIP backends are unchanged. On q8_0 / q4_0 every chunk runs the
+tensor-core in-place `attention_flash_mma_prefill_kvq` at its position offset; G3 never runs over a quantized cache, so the
+fit charges no score plane for it, and the chunk is a pure speed / window trade (TwIL-8B, RTX 3060, q8_0, 8,407-token
+cold prompt, 2 reps; #1875):
+
+| q8_0 chunk | prefill tok/s | served window |
+|---|---|---|
+| one pass | 1,674-1,693 | 25,600 |
+| 1024 | 1,325-1,341 | 67,584 |
+| **2048 (default)** | 1,508-1,533 | **65,536** |
+| 4096 | 1,501-1,511 | 62,464 |
+
+q4_0 serves 30,720 one pass and about 128,000 chunked (a 117,672-token prompt ran with no spill). Greedy text at every
+chunk size matches the chunked f16 text; it differs from one pass a dozen tokens in, as f16's does.
 
 Why it pays:
 
@@ -213,8 +226,8 @@ TwIL-8B Q4_K_M cold prefill, framework RTX 3060 eGPU (x4 link), `run --json`, 2 
 | 2048 | 920 / 950 (re-run; r2 was refused admission once) | 913 / 915 | 29,696 |
 | 4096 | 860 / 776 | 912 / 925 | |
 
-q8_0 KV at 8,392 tokens: 51 / 51 unchunked (G3 declined) and 54 / 55 at 1,024, because the quantized cache
-has no offset path (#1846). Greedy text was identical across every chunk size in the table, per prompt and
+q8_0 KV at 8,392 tokens (before #1850's in-place read): 51 / 51 unchunked (G3 declined) and 54 / 55 at 1,024,
+because the quantized cache had no offset path (#1846). Greedy text was identical across every chunk size in the table, per prompt and
 per KV type (32 tokens). A 31,548-token prompt on the 32,768 window completed with no spill and flat shared
 GPU memory. Its prefill ran at 227 tok/s: the offset path's query-row chunks shrink as the cached history grows.
 

@@ -479,7 +479,7 @@ prefill runs before it, which takes minutes for a long agent conversation:
 
 A client that disconnects (or a server shutdown) stops the prefill at the next chunk boundary: 1,024 tokens on the CUDA Qwen3
 hybrids and the Vulkan dense hybrid (Bonsai-2, #1100) (`IModel.PreferredPrefillChunkTokens`), the dense CUDA host on
-`--no-paged` f16 (#1862), or `--prefill-chunk-size`. Non-streaming requests observe the same cancellation.
+`--no-paged` (#1862; f16, q8_0 and q4_0 KV since #1850), or `--prefill-chunk-size`. Non-streaming requests observe the same cancellation.
 
 ## Model names, the hub cache and pulling (#714)
 
@@ -739,24 +739,27 @@ The CUDA hybrid model (Qwen3HybridDense: Bonsai, Qwen3.5/3.6 dense) now refuses 
   scratch, the GPU paged cache's per-request gather scratch, and the G3 prefill-attention score scratch.
 - The G3 scratch is quadratic in the prompt (heads x s^2 x 6 B: ~3 GiB for a 4K-token prompt on an 8B model). When it does not
   fit, that prefill runs `attention_f16` instead (logged once), and a plane larger than 384 MiB is released after the prefill
-  that grew it. `--prefill-chunk-size N` bounds both it and the forward scratch (on by default on `--no-paged` f16, below).
+  that grew it. `--prefill-chunk-size N` bounds both it and the forward scratch (on by default on `--no-paged`, below).
 - A new request whose KV cache is refused first evicts the retained prefix-cache entries (the one it would seed from last) and
   retries; only when nothing is left does it fail with `400 context_length_exceeded`.
 - After warm-up the served window is fitted: on the non-paged path to free VRAM at KV bytes per token for the chosen type, plus
   the forward scratch an unchunked prefill of that length needs, or with a prefill chunk that scratch at the chunk and the
-  chunk's G3 score plane as fixed costs; on the GPU paged path to the pool's capacity (the pool itself is
+  chunk's G3 score plane as fixed costs (f16 only: q8_0 / q4_0 never run G3, so their fit charges no plane and frees one warm-up
+  left behind, #1850); on the GPU paged path to the pool's capacity (the pool itself is
   sized to free VRAM at startup, #1835). `--ctx-size` is honoured on both; on the paged path a value above the pool is capped.
   `GET /props` (`max_sequence_length`), `GET /v1/status` (`n_ctx`) and `GET /v1/models` (`meta.n_ctx`) report the served window.
 - Every CUDA host carries the spill monitor; the dense host also reads it after each long prefill and KV allocation.
-- **Chunked prefill is the default on `--no-paged` f16 (#1862).** With no `--prefill-chunk-size`, the dense host prefills in
-  1,024-token chunks on its non-paged f16 cache. Unchunked, the forward scratch costs about as much per token as f16 KV, so the
+- **Chunked prefill is the default on `--no-paged` (#1862, #1850).** With no `--prefill-chunk-size`, the dense host prefills in
+  chunks on its non-paged cache: 1,024 tokens on f16, 2,048 on q8_0 / q4_0. Unchunked, the forward scratch costs about as much per token as f16 KV, so the
   fit charged it per token and served about half the window; chunked, it is a fixed cost. The first chunk's square G3 plane
   (heads x 1,024^2 x 6 B, 192 MiB at 32 heads) fits the 384 MiB plane the fit already charges, and later chunks run G3's offset
   path (#1847), bounded to the same plane, so chunking keeps G3. A larger explicit chunk charges its own square plane.
   Cancellation is checked between chunks, so a client disconnect stops a long prefill. `--prefill-chunk-size 0` restores one
-  pass; any explicit value wins. The GPU paged pool and q8_0 / q4_0 caches stay unchunked by default: their later chunks cannot
-  use the offset path and would run `attention_f16`. CPU, Vulkan and HIP are unchanged. Measured numbers are in the PR for #1862
-  and in docs/GPU.md.
+  pass; any explicit value wins. On q8_0 / q4_0 every chunk runs the tensor-core in-place kernel
+  (`attention_flash_mma_prefill_kvq`) at its position offset, with no score plane, so their chunk trades only speed against
+  window: 2,048 keeps most of one-pass prefill speed for a 3% smaller window than 1,024. The GPU paged pool stays unchunked by default.
+  CPU, Vulkan and HIP are unchanged. Measured numbers are in the PRs for #1862
+  and #1850 and in docs/GPU.md.
 
 ### The served context is fitted to free VRAM
 
