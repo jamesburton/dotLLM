@@ -127,6 +127,9 @@ public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
         pool.Context?.MakeCurrent();
 
         long scratchBytes = (long)maxSeqLen * maxStride * sizeof(ushort);
+        // #1848: the gather scratch is allocated per request on top of the pool, so it is admitted against free VRAM before
+        // anything is allocated (WDDM would otherwise spill it into shared memory).
+        CudaAdmission.EnsureFits($"paged KV gather scratch for {maxSeqLen} tokens", 2 * scratchBytes);
         CudaDriverApi.cuMemAlloc_v2(out _kScratch, (nuint)scratchBytes).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out _vScratch, (nuint)scratchBytes).ThrowOnError();
 

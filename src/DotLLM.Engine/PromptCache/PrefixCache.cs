@@ -26,6 +26,9 @@ public sealed class PrefixCache : IDisposable
     /// <summary>Number of cached entries.</summary>
     public int EntryCount => _entries.Count;
 
+    /// <summary>The entries, oldest stored first (tests).</summary>
+    internal IReadOnlyList<PrefixCacheEntry> Entries => _entries;
+
     /// <summary>The retention policy in force.</summary>
     public PrefixCachePolicy Policy => _policy;
 
@@ -224,6 +227,51 @@ public sealed class PrefixCache : IDisposable
         _entries.RemoveAt(i);
         return true;
     }
+
+    /// <summary>
+    /// Evicts one entry other than <paramref name="keep"/> to free device memory for a new KV cache that was refused admission
+    /// (#1848): the entry the policy would evict first (LRU, or oldest relative to its own length under
+    /// <see cref="PrefixCachePolicy.Agent"/>), else <paramref name="keep"/> itself when it is the only one left. Disposes it.
+    /// </summary>
+    /// <param name="keep">An entry to evict only as the last resort (the protected entry a miss is about to seed from), or null.</param>
+    /// <returns>The evicted entry, or <see langword="null"/> when the cache is empty.</returns>
+    internal PrefixCacheEntry? EvictForAdmission(PrefixCacheEntry? keep)
+    {
+        if (_entries.Count == 0) return null;
+        PrefixCacheEntry victim;
+        var others = _entries.Where(e => !ReferenceEquals(e, keep)).ToList();
+        if (others.Count == 0)
+            victim = _entries[0];
+        else
+        {
+            int i = _policy == PrefixCachePolicy.Agent
+                ? PrefixRetention.SelectVictim(others, e => e.LastUseClock, e => e.TokenSequence.Length, _clock, _policy)
+                : PrefixRetention.SelectVictim(others, e => e.LastAccessTicks, e => e.TokenSequence.Length, _clock, _policy);
+            victim = others[i];
+        }
+        Remove(victim);
+        _admissionEvictions++;
+        return victim;
+    }
+
+    /// <summary>
+    /// Device bytes the retained entries hold, as their caches report it (<see cref="IDeviceResidentKvCache"/>; a cache that does
+    /// not report counts 0), i.e. what evicting every entry could free for a refused allocation (#1848).
+    /// </summary>
+    public long DeviceBytesHeld
+    {
+        get
+        {
+            long bytes = 0;
+            foreach (var e in _entries)
+                if (e.KvCache is IDeviceResidentKvCache d) bytes += d.DeviceBytes;
+            return bytes;
+        }
+    }
+
+    /// <summary>Entries evicted by <see cref="EvictForAdmission"/> to make room for a refused KV cache (#1848).</summary>
+    public long AdmissionEvictions => _admissionEvictions;
+    private long _admissionEvictions;
 
     /// <summary>
     /// Removes all entries and disposes their KV-caches.

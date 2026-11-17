@@ -90,10 +90,14 @@ public static class DeviceSelector
                 if (cuda is { Servable: true } && (cuda.Devices ?? []).FirstOrDefault(d => d.DeviceString == want) is { } dev)
                 {
                     // (#1023) Weights larger than the device's FREE memory cannot load: say so now with the numbers, instead of
-                    // starting a load that fails late or crawls. Only the weights are compared (no headroom), so a tight fit that
-                    // works today is never refused; partial offload (--gpu-layers) is checked by the loader instead.
-                    if (dev.FreeMemoryBytes is { } free && modelBytes > free && fullOffload)
+                    // starting a load that fails late or crawls. The weights plus the admission reserve (#1848) are compared, as the
+                    // CUDA loader does before it uploads; partial offload (--gpu-layers) is checked by the loader instead. Never a
+                    // silent move to the CPU: an explicit GPU request that does not fit is an error with a hint.
+                    if (dev.FreeMemoryBytes is { } free && fullOffload
+                        && !Core.Configuration.DeviceMemoryBudget.Fits(free, modelBytes, Core.Configuration.DeviceMemoryBudget.ResolveReserveBytes(
+                            Environment.GetEnvironmentVariable(Core.Configuration.DeviceMemoryBudget.ReserveEnvVar))))
                         return new DevicePlan(spec, [], $"the model's {Gib(modelBytes)} of weights exceed the {Gib(free)} free on {want} "
+                            + (modelBytes <= free ? $"once the {Core.Configuration.DeviceMemoryBudget.ReserveEnvVar} reserve is kept free " : "")
                             + $"({(dev.TotalMemoryBytes is { } t ? Gib(t) + " total; " : "")}other models or processes hold the rest)", null);
                     return new DevicePlan(spec, [want], null, null);
                 }

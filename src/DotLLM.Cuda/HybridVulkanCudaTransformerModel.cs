@@ -38,6 +38,13 @@ namespace DotLLM.Cuda;
 /// </remarks>
 public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
 {
+    // #1848 / #1834: WDDM sysmem-fallback detector for this CUDA host. Created with the model object (baseline: this process's shared usage then,
+    // so later growth past dedicated VRAM warns); polls in the background, never on the inference thread. No-op off Windows.
+    private readonly GpuSpillMonitor _spillMonitor = new(() => "HybridVulkanCudaTransformerModel");
+
+    /// <summary>Whether the WDDM spill monitor is attached (tests; #1848).</summary>
+    internal bool HasSpillMonitor => _spillMonitor is not null;
+
     // ── Vulkan resources (Phase 1) ──
     private readonly VulkanTransformerModel _vulkanModel;
     private readonly int _numVulkanLayers;
@@ -685,6 +692,7 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
     /// <summary>Releases all Vulkan, CUDA, and host resources owned by this model.</summary>
     public void Dispose()
     {
+        _spillMonitor.Dispose();
         _context.MakeCurrent();
         if (_tempF32Device != 0)
         {

@@ -59,6 +59,13 @@ public sealed record ServerStatusResponse
     [JsonPropertyName("device")]
     public string? Device { get; init; }
 
+    /// <summary>
+    /// The served context window in tokens (#1836): after <c>--ctx-size</c> and any fit to free device memory or the GPU paged pool,
+    /// the same figure as <c>/props</c> and <c>/v1/models</c>. Null when no model is loaded.
+    /// </summary>
+    [JsonPropertyName("n_ctx")]
+    public int? NCtx { get; init; }
+
     /// <summary>True when <c>--device auto</c> fell back to the CPU after a faster device failed to load the model (#1822). Null when no model is ready.</summary>
     [JsonPropertyName("device_fallback")]
     public bool? DeviceFallback { get; init; }

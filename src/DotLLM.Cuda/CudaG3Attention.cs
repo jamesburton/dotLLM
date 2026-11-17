@@ -129,7 +129,7 @@ internal sealed class CudaG3Attention : IDisposable
         float scale = 1.0f / MathF.Sqrt(headDim);
         float one = 1.0f, zero = 0.0f, sc = scale;
 
-        EnsureScratch((long)numHeads * s * s);
+        EnsureScratch(SquareScratchElems(s, numHeads));
 
         // ── QK^T → FP32 scores (col-major [s × s] per query head, ldc=s; scale in alpha) ──
         // FP16 inputs + tensor cores + COMPUTE_32F, but the C output is CUDA_R_32F so the
@@ -240,7 +240,7 @@ internal sealed class CudaG3Attention : IDisposable
         Interlocked.Increment(ref s_offsetRuns);
         long perRow = (long)numHeads * (positionOffset + seqLen);
         int chunk = (int)Math.Clamp(OffsetMaxScoreElems / Math.Max(1, perRow), 1, seqLen);
-        EnsureScratch((long)numHeads * chunk * (positionOffset + seqLen));
+        EnsureScratch(OffsetScratchElems(seqLen, positionOffset, numHeads));
 
         for (int c0 = 0; c0 < seqLen; c0 += chunk)
         {
@@ -288,6 +288,89 @@ internal sealed class CudaG3Attention : IDisposable
                     .ThrowOnCublasError();
             }
         }
+    }
+
+    /// <summary>Bytes of score scratch per element: FP32 scores + FP16 probs.</summary>
+    internal const int ScratchBytesPerElement = Fp32Size + Fp16Size;
+
+    /// <summary>
+    /// Plane size above which the scratch is released at the end of the forward that grew it (#1848, <see cref="ReleaseIfLarge"/>):
+    /// 64M elements = 384 MiB, the offset path's chunk bound. Smaller planes stay for reuse.
+    /// </summary>
+    internal const long RetainedMaxElems = DefaultOffsetMaxScoreElems;
+
+    /// <summary>Times a G3 call was declined because its scratch did not fit in free VRAM (#1848; test observable).</summary>
+    internal static long ScratchRefusalCount => Interlocked.Read(ref s_scratchRefusals);
+    private static long s_scratchRefusals;
+    private static int s_refusalLogged;
+
+    /// <summary>Score elements <see cref="Run"/> needs for a square-causal prefill of <paramref name="seqLen"/> rows.</summary>
+    internal static long SquareScratchElems(int seqLen, int numHeads) => (long)numHeads * seqLen * seqLen;
+
+    /// <summary>Score elements <see cref="RunOffset"/> needs (one query-row chunk under <see cref="OffsetMaxScoreElems"/>).</summary>
+    internal static long OffsetScratchElems(int seqLen, int positionOffset, int numHeads)
+    {
+        long perRow = (long)numHeads * (positionOffset + seqLen);
+        int chunk = (int)Math.Clamp(OffsetMaxScoreElems / Math.Max(1, perRow), 1, seqLen);
+        return (long)numHeads * chunk * (positionOffset + seqLen);
+    }
+
+    /// <summary>
+    /// Makes the score scratch hold <paramref name="elems"/> elements, or declines (#1848). The scratch is quadratic in the prompt
+    /// (numHeads x s^2 x 6 B: 3 GiB at 4K tokens with 32 heads), so no per-token context fit can count it: it is admitted against
+    /// free VRAM here (the plane it replaces counts as free) and, when it does not fit, the caller runs <c>attention_f16</c>, which
+    /// needs no scratch, instead of letting WDDM spill it into shared memory. Call after <see cref="CanUse"/> /
+    /// <see cref="CanUseOffset"/> and before <see cref="Run"/> / <see cref="RunOffset"/>.
+    /// </summary>
+    /// <param name="elems">Score elements needed.</param>
+    /// <returns>Whether the scratch is ready.</returns>
+    internal bool TryReserve(long elems)
+    {
+        if (elems <= _planeElems) return true;
+        if (!CudaAdmission.TryFit(elems * ScratchBytesPerElement, out long free, releasedBytes: _planeElems * ScratchBytesPerElement))
+        {
+            Interlocked.Increment(ref s_scratchRefusals);
+            if (Interlocked.Exchange(ref s_refusalLogged, 1) == 0)
+                Console.Error.WriteLine(
+                    $"[dotllm] G3 prefill attention needs {(elems * ScratchBytesPerElement) >> 20} MiB of score scratch and only " +
+                    $"{free >> 20} MiB of VRAM is free ({CudaAdmission.ReserveBytes >> 20} MiB reserve): running attention_f16 for " +
+                    "this prefill instead (slower on GeForce Ampere, but no shared-memory spill). --prefill-chunk bounds it. Logged once.");
+            return false;
+        }
+        EnsureScratch(elems);
+        return true;
+    }
+
+    /// <summary>
+    /// Frees the score scratch when it is larger than <see cref="RetainedMaxElems"/> (#1848). A long cold prompt grows it to GiBs;
+    /// kept, it would hold VRAM the context fit gave to the KV cache. Call at the end of a prefill forward.
+    /// </summary>
+    internal void ReleaseIfLarge()
+    {
+        if (_planeElems <= RetainedMaxElems) return;
+        if (_scoresF32 != 0) { CudaDriverApi.cuMemFree_v2(_scoresF32); _scoresF32 = 0; }
+        if (_probsF16 != 0) { CudaDriverApi.cuMemFree_v2(_probsF16); _probsF16 = 0; }
+        _planeElems = 0;
+    }
+
+    /// <summary>Score elements the scratch holds now (tests).</summary>
+    internal long PlaneElems => _planeElems;
+
+    /// <summary>
+    /// Whether any G3 prefill can run on this model and device (#1848): the toggle is on and the causal softmax is loaded. When it
+    /// can, a plane of up to <see cref="RetainedMaxElems"/> stays allocated between prefills and the context fit must charge it.
+    /// </summary>
+    internal bool MayRun => Enabled && _kernels.HasAttentionSoftmaxCausalCoalescedF32In;
+
+    /// <summary>Frees the score scratch whatever its size (#1848): a KV cache that was refused gets its room back first.</summary>
+    /// <returns>The bytes released.</returns>
+    internal long Release()
+    {
+        long bytes = _planeElems * ScratchBytesPerElement;
+        if (_scoresF32 != 0) { CudaDriverApi.cuMemFree_v2(_scoresF32); _scoresF32 = 0; }
+        if (_probsF16 != 0) { CudaDriverApi.cuMemFree_v2(_probsF16); _probsF16 = 0; }
+        _planeElems = 0;
+        return bytes;
     }
 
     private void EnsureScratch(long elems)

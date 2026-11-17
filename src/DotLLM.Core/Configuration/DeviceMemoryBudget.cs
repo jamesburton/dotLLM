@@ -120,13 +120,20 @@ public static class DeviceMemoryBudget
     /// <param name="requiredBytes">Bytes the growth needs.</param>
     /// <param name="freeBytes">Free device memory.</param>
     /// <param name="reserveBytes">Bytes kept free.</param>
+    /// <param name="remedies">The remedies sentence, or <see langword="null"/> for <see cref="DefaultRemedies"/> (context and KV type).
+    /// Issue #1848: model weights that do not fit are fixed by a partial offload or a smaller quant, not by <c>--ctx-size</c>.</param>
     /// <returns>The message.</returns>
-    public static string DescribeRefusal(string what, long requiredBytes, long freeBytes, long reserveBytes)
+    public static string DescribeRefusal(string what, long requiredBytes, long freeBytes, long reserveBytes, string? remedies = null)
         => $"Not enough free GPU memory for the {what}: it needs {Mib(requiredBytes)} MiB, {Mib(freeBytes)} MiB is free " +
            $"and {Mib(reserveBytes)} MiB is kept in reserve. Refusing rather than letting the driver spill into shared " +
-           "system memory, which makes generation orders of magnitude slower. Shorten the conversation, lower the " +
-           $"context with 'dotllm serve --ctx-size', use a smaller KV type (--kv-quant-k/-v q8_0 or q4_0), or free GPU memory " +
-           $"({ReserveEnvVar} sets the reserve).";
+           "system memory, which makes generation orders of magnitude slower. " +
+           (remedies ?? DefaultRemedies) +
+           $" ({ReserveEnvVar} sets the reserve).";
+
+    /// <summary>The default remedies sentence of <see cref="DescribeRefusal"/>.</summary>
+    public const string DefaultRemedies =
+        "Shorten the conversation, lower the context with 'dotllm serve --ctx-size', use a smaller KV type " +
+        "(--kv-quant-k/-v q8_0 or q4_0), or free GPU memory";
 
     /// <summary>
     /// The longest context whose per-token device memory fits: <c>(free − reserve − fixed) / perToken</c>, rounded down to

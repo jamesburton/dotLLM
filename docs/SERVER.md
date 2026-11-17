@@ -728,6 +728,25 @@ The CUDA hybrid model (Qwen3HybridDense: Bonsai, Qwen3.5/3.6 dense) now refuses 
   another 256 MiB above its post-load level. That catches a spill admission cannot prevent, for example when another
   program takes the VRAM the server was counting on.
 
+**Dense CUDA models (#1848).** The same rule now covers `CudaTransformerModel` (Llama, Qwen, Granite/TwIL, Mistral, ...):
+
+- Every runtime-sized device allocation goes through one admission check (`CudaAdmission`) before `cuMemAlloc`: the model
+  weights (a model that does not fit is refused at load, not warned about; explicit `--device gpu` reports it, `--device auto`
+  moves on to the next device, and nothing is silently moved to the CPU), the f16 / q8_0 / q4_0 / TurboQuant / MLA KV caches
+  (including the q8_0 cache's full-history FP16 dequant scratch), forward-scratch growth for a long prompt (admitted before the
+  old buffers are freed; when the power-of-two size does not fit, the exact size is used), the lazily allocated weight-dequant
+  scratch, the GPU paged cache's per-request gather scratch, and the G3 prefill-attention score scratch.
+- The G3 scratch is quadratic in the prompt (heads x s^2 x 6 B: ~3 GiB for a 4K-token prompt on an 8B model). When it does not
+  fit, that prefill runs `attention_f16` instead (logged once), and a plane larger than 384 MiB is released after the prefill
+  that grew it. `--prefill-chunk N` bounds both it and the forward scratch.
+- A new request whose KV cache is refused first evicts the retained prefix-cache entries (the one it would seed from last) and
+  retries; only when nothing is left does it fail with `400 context_length_exceeded`.
+- After warm-up the served window is fitted: on the non-paged path to free VRAM at KV bytes per token for the chosen type plus
+  the forward scratch an unchunked prefill of that length needs; on the GPU paged path to the pool's capacity (the pool itself is
+  sized to free VRAM at startup, #1835). `--ctx-size` is honoured on both; on the paged path a value above the pool is capped.
+  `GET /props` (`max_sequence_length`), `GET /v1/status` (`n_ctx`) and `GET /v1/models` (`meta.n_ctx`) report the served window.
+- Every CUDA host carries the spill monitor; the dense host also reads it after each long prefill and KV allocation.
+
 ### The served context is fitted to free VRAM
 
 The checkpoint's window (262,144 tokens for Bonsai-2) is far more than a 12 GB card holds next to 7 GB of weights, and a

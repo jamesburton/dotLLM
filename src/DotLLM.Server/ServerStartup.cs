@@ -344,6 +344,76 @@ public static class ServerStartup
     }
 
     /// <summary>
+    /// Issues #1841 / #1836: chooses the served context for the dense CUDA host and applies it. With the GPU paged pool the window
+    /// is capped to the pool (a request past it cannot run: the pool was sized to free VRAM at startup), so the prompt-length
+    /// check refuses an over-long request at admission instead of the pool failing part-way through prefill. Without it the
+    /// window is what fits in free VRAM after warm-up (<see cref="DotLLM.Cuda.CudaTransformerModel.MeasureServingContextFit"/>).
+    /// Either way <c>--ctx-size</c> is honoured, and <c>/props</c>, <c>/v1/status</c> and <c>/v1/models</c> report the result.
+    /// </summary>
+    /// <param name="model">The loaded, warmed-up model.</param>
+    /// <param name="options">Server options.</param>
+    /// <param name="kv">KV storage types of the non-paged cache.</param>
+    /// <param name="paged">The GPU paged-KV factory, or null on the non-paged path.</param>
+    /// <returns>The model's config after the limit.</returns>
+    internal static ModelConfig ApplyCudaDenseContextFit(
+        DotLLM.Cuda.CudaTransformerModel model, ServerOptions options, KvCacheConfig kv, DotLLM.Cuda.CudaPagedKvCacheFactory? paged)
+    {
+        int native = model.NativeMaxSequenceLength;
+        if (paged is not null)
+        {
+            int pool = paged.Pool.TotalBlocks * paged.Pool.BlockSize;
+            int chosen = ChoosePagedServedContext(options.ContextSize, pool, native, out string? pagedWarning);
+            if (pagedWarning is not null)
+                Console.WriteLine($"[dotllm] WARNING: {pagedWarning}");
+            if (chosen < model.Config.MaxSequenceLength)
+                model.LimitContextLength(chosen);
+            Console.WriteLine($"[dotllm] Context window: {model.Config.MaxSequenceLength} of {native} tokens, capped to the GPU paged KV pool " +
+                              $"({pool} tokens, sized to free VRAM){(options.ContextSize is > 0 ? "; --ctx-size " + options.ContextSize : "")}.");
+            return model.Config;
+        }
+
+        var fit = model.MeasureServingContextFit(kv, options.PrefillChunkSize);
+        if (fit.SizingError is { } sizingError)
+            Console.WriteLine($"[dotllm] WARNING: the context fit could not measure free VRAM ({sizingError}); serving the smallest window.");
+        int served = ChooseServedContext(options.ContextSize, fit.MaxContext, native, out string? warning,
+            smallWindowHint: DenseSmallWindowHint);
+        if (warning is not null)
+            Console.WriteLine($"[dotllm] WARNING: {warning}");
+        if (served < native)
+            model.LimitContextLength(served);
+        string kvLabel = kv.IsQuantized ? $"{kv.KeyDType}/{kv.ValueDType}".ToLowerInvariant() : "f16";
+        string prefill = options.PrefillChunkSize > 0 ? $", prefill chunk {options.PrefillChunkSize}" : ", unchunked prefill";
+        Console.WriteLine(options.ContextSize is > 0
+            ? $"[dotllm] Context window: {model.Config.MaxSequenceLength} tokens (--ctx-size; {fit.MaxContext} fit in free VRAM: {fit.Describe()}, {kvLabel} KV{prefill})."
+            : $"[dotllm] Context window: {model.Config.MaxSequenceLength} of {native} tokens, fitted to free VRAM ({fit.Describe()}, {kvLabel} KV{prefill}). " +
+              "Set --ctx-size to override.");
+        return model.Config;
+    }
+
+    /// <summary>The small-window remedy for the dense CUDA host (#1848): it has no MTP head, and its prefill scratch is per token.</summary>
+    internal const string DenseSmallWindowHint =
+        "Use a smaller KV type (--kv-quant-k/-v q8_0 or q4_0), bound the prefill scratch with --prefill-chunk (e.g. 1024), or free GPU memory.";
+
+    /// <summary>
+    /// The served context on the CUDA paged pool (#1836): <c>--ctx-size</c> or the model's window, never more than the pool holds.
+    /// </summary>
+    /// <param name="requested">The <c>--ctx-size</c> value, or null.</param>
+    /// <param name="poolTokens">Tokens the pool holds.</param>
+    /// <param name="native">The model's window.</param>
+    /// <param name="warning">Set when <c>--ctx-size</c> asked for more than the pool holds.</param>
+    /// <returns>The window to serve.</returns>
+    internal static int ChoosePagedServedContext(int? requested, int poolTokens, int native, out string? warning)
+    {
+        warning = null;
+        int want = requested is > 0 and int r ? Math.Min(r, native) : native;
+        if (want <= poolTokens) return want;
+        if (requested is > 0)
+            warning = $"--ctx-size {want} exceeds the {poolTokens} tokens the GPU paged KV pool holds in free VRAM; serving {poolTokens}. " +
+                      "Use --no-paged with a smaller KV type, or free GPU memory, for a longer window.";
+        return Math.Max(1, poolTokens);
+    }
+
+    /// <summary>
     /// Issue #1101: applies <c>--ctx-size</c> to a model that can lower its window but has no VRAM fit (the Vulkan hybrid). With
     /// YaRN its window is factor × original (about 1M for Bonsai-2); without this the flag was ignored on Vulkan and the server
     /// advertised the whole window.
@@ -385,8 +455,9 @@ public static class ServerStartup
     /// <param name="fit">Tokens that fit in free VRAM.</param>
     /// <param name="native">The checkpoint's window.</param>
     /// <param name="warning">A warning to log, or null.</param>
+    /// <param name="smallWindowHint">Remedies for a small fitted window; null for the hybrid default (KV type, --no-mtp).</param>
     /// <returns>The window to serve.</returns>
-    internal static int ChooseServedContext(int? requested, int fit, int native, out string? warning)
+    internal static int ChooseServedContext(int? requested, int fit, int native, out string? warning, string? smallWindowHint = null)
     {
         warning = null;
         if (requested is > 0 and int r)
@@ -400,8 +471,8 @@ public static class ServerStartup
 
         int served = Math.Clamp(fit, Math.Min(DeviceMemoryBudget.ContextGranularity, native), native);
         if (fit < SmallContextWarningTokens)
-            warning = $"only {fit} tokens of context fit in free VRAM (serving {served}). Use a smaller KV type " +
-                      "(--kv-quant-k/-v q8_0 or q4_0), --no-mtp, or free GPU memory.";
+            warning = $"only {fit} tokens of context fit in free VRAM (serving {served}). " +
+                      (smallWindowHint ?? "Use a smaller KV type (--kv-quant-k/-v q8_0 or q4_0), --no-mtp, or free GPU memory.");
         return served;
     }
 
@@ -619,8 +690,10 @@ public static class ServerStartup
                 // the per-request TextGenerator path. Only the per-request KV-cache backing changes
                 // (block-based instead of one flat buffer).
                 // #1833: sized to free VRAM, not a fixed 65536 tokens (10 GiB for TwIL-8B on a 12 GB card, spilled by WDDM).
+                // #1848: --ctx-size bounds the pool request too; the served context is then capped to the pool after warm-up.
                 cudaPagedFactory = cudaModel.CreateFittedPagedKvCacheFactory(
-                    Math.Min(config.MaxSequenceLength, DotLLM.Cuda.CudaPagedKvCacheFactory.DefaultMaxTotalTokens), out string poolSummary);
+                    Math.Min(options.ContextSize is > 0 and int ctx ? Math.Min(ctx, config.MaxSequenceLength) : config.MaxSequenceLength,
+                        DotLLM.Cuda.CudaPagedKvCacheFactory.DefaultMaxTotalTokens), out string poolSummary);
                 var factory = cudaPagedFactory;
                 kvFactory = (cfg, size) => cudaModel.CreatePagedKvCache(factory.Pool, size);
                 Console.WriteLine("[dotllm] Using GPU paged KV-cache (block-based allocation, single-request dispatch)");
@@ -852,6 +925,10 @@ public static class ServerStartup
         // Issue #1068: size the CUDA hybrid's served context to free VRAM (after warm-up, so its buffers are counted).
         if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel hybridDense)
             config = ApplyHybridContextFit(hybridDense, options, mtpActive, mtpK);
+        // Issues #1841 / #1836: dense CUDA honours --ctx-size and serves no more than fits: the paged pool's capacity, or the
+        // non-paged KV + forward scratch that fit in free VRAM after warm-up.
+        else if (model is DotLLM.Cuda.CudaTransformerModel cudaDense)
+            config = ApplyCudaDenseContextFit(cudaDense, options, kvConfig, cudaPagedFactory);
         else if (model is DotLLM.Vulkan.VulkanQwen4ExpTransformerModel q4Vulkan)
         {
             // #1324: the window is the capacity the caches were sized for at load (--ctx-size, reduced to fit), already in Config.

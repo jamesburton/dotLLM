@@ -25,6 +25,13 @@ namespace DotLLM.Cuda;
 /// </summary>
 public sealed unsafe class HybridTransformerModel : IModel
 {
+    // #1848 / #1834: WDDM sysmem-fallback detector for this CUDA host. Created with the model object (baseline: this process's shared usage then,
+    // so later growth past dedicated VRAM warns); polls in the background, never on the inference thread. No-op off Windows.
+    private readonly GpuSpillMonitor _spillMonitor = new(() => "HybridTransformerModel");
+
+    /// <summary>Whether the WDDM spill monitor is attached (tests; #1848).</summary>
+    internal bool HasSpillMonitor => _spillMonitor is not null;
+
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
     private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
     private const int Q8_1GroupSize = QuantFormat.LegacyGroupSize;
@@ -1579,6 +1586,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _spillMonitor.Dispose();
         _context.MakeCurrent();
         _cudaLora?.Dispose();
         _gpuState.Dispose();

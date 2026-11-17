@@ -27,6 +27,13 @@ namespace DotLLM.Cuda.Architectures;
 /// </remarks>
 public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
 {
+    // #1848 / #1834: WDDM sysmem-fallback detector for this CUDA host. Created with the model object (baseline: this process's shared usage then,
+    // so later growth past dedicated VRAM warns); polls in the background, never on the inference thread. No-op off Windows.
+    private readonly GpuSpillMonitor _spillMonitor = new(() => "CudaNemotronHTransformerModel");
+
+    /// <summary>Whether the WDDM spill monitor is attached (tests; #1848).</summary>
+    internal bool HasSpillMonitor => _spillMonitor is not null;
+
     private readonly CudaNemotronHForwardState _state;
     private readonly CudaNemotronHSsmStateCache _ssmCache;
     private readonly CudaStream _stream;
@@ -307,6 +314,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _spillMonitor.Dispose();
         if (_disposed) return;
         _context.MakeCurrent();
         _state.Dispose();

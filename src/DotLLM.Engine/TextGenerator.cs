@@ -1735,7 +1735,7 @@ public sealed partial class TextGenerator
             // Cache miss or incompatible — allocate with room for the next, longer prompt of the same conversation
             // (a cache is only reused while it can hold the whole next request).
             int cacheSize = Math.Min(promptLen + maxTokens + _prefixCacheHeadroomTokens, _model.Config.MaxSequenceLength);
-            var kvCache = AllocateKvCache(cacheSize);
+            var kvCache = AllocateKvCacheEvicting(cacheSize, ref protectedEntry);
             int seeded = SeedFromProtectedEntry(kvCache, protectedEntry, protectedShared, promptLen);
             return (kvCache, seeded, true); // owned by the request until StoreInPrefixCache hands it to the prefix cache (issue #1589: disposed if the request fails first)
         }
@@ -1745,6 +1745,37 @@ public sealed partial class TextGenerator
             int cacheSize = Math.Min(promptLen + maxTokens, _model.Config.MaxSequenceLength);
             var kvCache = AllocateKvCache(cacheSize);
             return (kvCache, 0, true);
+        }
+    }
+
+    /// <summary>
+    /// Allocates a fresh KV-cache on a prefix-cache miss (issue #1848). A device cache is admitted against free device memory by its
+    /// backend and refused with <see cref="DeviceMemoryAdmissionException"/> when it does not fit; the retained prefix entries
+    /// beside it are then the memory to reclaim, so they are evicted one at a time (the policy's victim first, the protected entry
+    /// the miss would seed from last) and the allocation retried. Only when nothing is left to evict does the refusal reach the
+    /// caller (HTTP 400 <c>context_length_exceeded</c> on the server). Without this the context fit would have to charge every
+    /// retained entry a full window.
+    /// </summary>
+    /// <param name="cacheSize">Positions the cache needs.</param>
+    /// <param name="protectedEntry">The protected entry the miss seeds from; nulled when it had to be evicted.</param>
+    /// <returns>The cache.</returns>
+    private Core.Attention.IKvCache AllocateKvCacheEvicting(int cacheSize, ref PrefixCacheEntry? protectedEntry)
+    {
+        while (true)
+        {
+            try
+            {
+                return AllocateKvCache(cacheSize);
+            }
+            // Only when evicting can help: a refusal whose numbers say the retained entries' device memory would not make it fit
+            // anyway (an oversized request, e.g. --ctx-size above the fit) goes straight to the caller and keeps every entry. A
+            // refusal without numbers (a backend that only has a message) still evicts, since that cannot be ruled out.
+            catch (DeviceMemoryAdmissionException ex) when (_prefixCache is { EntryCount: > 0 }
+                && ex.CouldFitAfterReleasing(_prefixCache.DeviceBytesHeld))
+            {
+                var evicted = _prefixCache.EvictForAdmission(keep: protectedEntry);
+                if (ReferenceEquals(evicted, protectedEntry)) protectedEntry = null;
+            }
         }
     }
 
