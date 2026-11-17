@@ -414,20 +414,33 @@ public static class ServerStartup
     /// square G3 score plane (numHeads x chunk^2 x 6 B, 192 MiB for 32 heads) stays inside the plane the fit already retains, while
     /// every later chunk runs G3's offset path (#1847), bounded to the same plane. On q8_0 / q4_0 KV every chunk runs the
     /// tensor-core in-place kernel (<c>attention_flash_mma_prefill_kvq</c>, #1850), later chunks with their position offset, and
-    /// needs no plane. Measured on framework: see the PRs for #1862 and #1850.
+    /// needs no plane, so it takes the larger <see cref="DefaultCudaDenseQuantizedPrefillChunkTokens"/>. Measured on framework: see
+    /// the PRs for #1862 and #1850.
     /// </summary>
     internal const int DefaultCudaDensePrefillChunkTokens = 1024;
 
     /// <summary>
+    /// Prefill chunk the dense CUDA host uses on q8_0 / q4_0 KV when <c>--prefill-chunk-size</c> is not given (#1850). Quantized KV
+    /// never runs G3, so the f16 bound (the first chunk's square plane inside the retained one) does not apply and the chunk is a
+    /// pure speed / window trade. TwIL-8B on the RTX 3060, 8.4K-token cold prefill: chunk 1024 = 1,325-1,341 tok/s at a 67,584
+    /// window, 2048 = 1,508-1,533 at 65,536, 4096 = 1,501-1,511 at 62,464, one pass = ~1,680 at 25,600. 2048 takes most of the
+    /// speed back for a 3% smaller window (user decision, PR #1875).
+    /// </summary>
+    internal const int DefaultCudaDenseQuantizedPrefillChunkTokens = 2048;
+
+    /// <summary>
     /// The prefill chunk a server uses (#1862): an explicit <c>--prefill-chunk-size</c> always wins, 0 (one pass) included; with none,
-    /// <see cref="DefaultCudaDensePrefillChunkTokens"/> where <see cref="TakesCudaDensePrefillChunkDefault"/> holds and one pass
-    /// everywhere else.
+    /// where <see cref="TakesCudaDensePrefillChunkDefault"/> holds, <see cref="DefaultCudaDenseQuantizedPrefillChunkTokens"/> on
+    /// q8_0 / q4_0 KV and <see cref="DefaultCudaDensePrefillChunkTokens"/> otherwise; one pass everywhere else.
     /// </summary>
     /// <param name="requested">The <c>--prefill-chunk-size</c> value, or null when it was not given.</param>
     /// <param name="cudaDenseDefault">Whether the model takes the dense CUDA default (<see cref="TakesCudaDensePrefillChunkDefault"/>).</param>
+    /// <param name="quantizedKv">Whether the KV cache is q8_0 / q4_0 (<see cref="KvCacheConfig.IsQuantized"/>).</param>
     /// <returns>Tokens per prefill forward pass, 0 for one pass.</returns>
-    internal static int ResolvePrefillChunk(int? requested, bool cudaDenseDefault)
-        => requested is int r ? Math.Max(0, r) : cudaDenseDefault ? DefaultCudaDensePrefillChunkTokens : 0;
+    internal static int ResolvePrefillChunk(int? requested, bool cudaDenseDefault, bool quantizedKv = false)
+        => requested is int r ? Math.Max(0, r)
+            : !cudaDenseDefault ? 0
+            : quantizedKv ? DefaultCudaDenseQuantizedPrefillChunkTokens : DefaultCudaDensePrefillChunkTokens;
 
     /// <summary>
     /// Whether <paramref name="model"/> takes the dense CUDA prefill default (#1862, #1850): the dense CUDA host
@@ -908,7 +921,8 @@ public static class ServerStartup
         bool splitModel = model is DotLLM.Cuda.HybridTransformerModel;
         int prefillChunk = splitModel
             ? DotLLM.Cuda.CudaAutoSplit.SplitPrefillChunk(options.PrefillChunkSize ?? 0)
-            : ResolvePrefillChunk(options.PrefillChunkSize, TakesCudaDensePrefillChunkDefault(model, cudaPagedFactory is not null, kvConfig));
+            : ResolvePrefillChunk(options.PrefillChunkSize, TakesCudaDensePrefillChunkDefault(model, cudaPagedFactory is not null, kvConfig),
+                kvConfig.IsQuantized);
         PrefixCache? prefixCache = !options.PromptCacheEnabled ? null
             : !deviceOwnedPrefixKv ? new PrefixCache(options.PromptCacheSize, options.PromptCachePolicy)
             : new PrefixCache(Math.Min(options.PromptCacheSize, VulkanPrefixCacheMaxEntries), options.PromptCachePolicy);

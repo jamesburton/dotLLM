@@ -750,13 +750,14 @@ The CUDA hybrid model (Qwen3HybridDense: Bonsai, Qwen3.5/3.6 dense) now refuses 
   `GET /props` (`max_sequence_length`), `GET /v1/status` (`n_ctx`) and `GET /v1/models` (`meta.n_ctx`) report the served window.
 - Every CUDA host carries the spill monitor; the dense host also reads it after each long prefill and KV allocation.
 - **Chunked prefill is the default on `--no-paged` (#1862, #1850).** With no `--prefill-chunk-size`, the dense host prefills in
-  1,024-token chunks on its non-paged cache, f16, q8_0 or q4_0. Unchunked, the forward scratch costs about as much per token as f16 KV, so the
+  chunks on its non-paged cache: 1,024 tokens on f16, 2,048 on q8_0 / q4_0. Unchunked, the forward scratch costs about as much per token as f16 KV, so the
   fit charged it per token and served about half the window; chunked, it is a fixed cost. The first chunk's square G3 plane
   (heads x 1,024^2 x 6 B, 192 MiB at 32 heads) fits the 384 MiB plane the fit already charges, and later chunks run G3's offset
   path (#1847), bounded to the same plane, so chunking keeps G3. A larger explicit chunk charges its own square plane.
   Cancellation is checked between chunks, so a client disconnect stops a long prefill. `--prefill-chunk-size 0` restores one
   pass; any explicit value wins. On q8_0 / q4_0 every chunk runs the tensor-core in-place kernel
-  (`attention_flash_mma_prefill_kvq`) at its position offset, with no score plane. The GPU paged pool stays unchunked by default.
+  (`attention_flash_mma_prefill_kvq`) at its position offset, with no score plane, so their chunk trades only speed against
+  window: 2,048 keeps most of one-pass prefill speed for a 3% smaller window than 1,024. The GPU paged pool stays unchunked by default.
   CPU, Vulkan and HIP are unchanged. Measured numbers are in the PRs for #1862
   and #1850 and in docs/GPU.md.
 

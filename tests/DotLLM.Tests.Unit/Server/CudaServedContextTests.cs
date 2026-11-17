@@ -84,6 +84,20 @@ public sealed class CudaServedContextTests
     public void PrefillChunk_DefaultsOnDenseCudaOnly_AndAnExplicitValueWins(int? requested, bool cudaDense, int expected)
         => Assert.Equal(expected, ServerStartup.ResolvePrefillChunk(requested, cudaDense));
 
+    [Theory]
+    // #1850: q8_0 / q4_0 never run G3, so they take the larger quantized default; f16 keeps the G3-bounded 1024.
+    [InlineData(null, true, true, ServerStartup.DefaultCudaDenseQuantizedPrefillChunkTokens)]
+    [InlineData(null, true, false, ServerStartup.DefaultCudaDensePrefillChunkTokens)]
+    [InlineData(null, false, true, 0)]
+    // An explicit value still wins over either default.
+    [InlineData(512, true, true, 512)]
+    [InlineData(0, true, true, 0)]
+    public void PrefillChunk_QuantizedKv_TakesItsOwnDefault(int? requested, bool cudaDense, bool quantized, int expected)
+    {
+        Assert.Equal(2048, ServerStartup.DefaultCudaDenseQuantizedPrefillChunkTokens);
+        Assert.Equal(expected, ServerStartup.ResolvePrefillChunk(requested, cudaDense, quantized));
+    }
+
     [Fact]
     public void PrefillChunkDefault_IsBoundedByTheRetainedG3Plane()
     {
