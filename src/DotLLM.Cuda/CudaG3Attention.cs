@@ -334,7 +334,7 @@ internal sealed class CudaG3Attention : IDisposable
                 Console.Error.WriteLine(
                     $"[dotllm] G3 prefill attention needs {(elems * ScratchBytesPerElement) >> 20} MiB of score scratch and only " +
                     $"{free >> 20} MiB of VRAM is free ({CudaAdmission.ReserveBytes >> 20} MiB reserve): running attention_f16 for " +
-                    "this prefill instead (slower on GeForce Ampere, but no shared-memory spill). --prefill-chunk bounds it. Logged once.");
+                    "this prefill instead (slower on GeForce Ampere, but no shared-memory spill). --prefill-chunk-size bounds it. Logged once.");
             return false;
         }
         EnsureScratch(elems);

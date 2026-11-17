@@ -29,11 +29,11 @@ public class ServerOptionsParseTests
     [Fact]
     public void Default_NoSpeculativeAndNoPrefillChunk()
     {
-        // Zero behavior change when unset: no draft model, K default, chunking off.
+        // Zero behavior change when unset: no draft model, K default, chunk not given (the backend default applies, #1862).
         var opts = ServerOptions.Parse(new[] { "--model", "m.gguf" });
         Assert.Null(opts.SpeculativeModel);
         Assert.Equal(3, opts.SpeculativeCandidates);
-        Assert.Equal(0, opts.PrefillChunkSize);
+        Assert.Null(opts.PrefillChunkSize);
     }
 
     [Theory]
