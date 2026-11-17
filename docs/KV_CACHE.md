@@ -141,9 +141,8 @@ the context window. On success it prefills only the suffix. A refusal is logged 
 - **`CudaKvCache` / `CudaQuantizedKvCache.TryGrowTo` (issue #1594).** CUDA `serve --no-paged` retains these caches the same way
   (`IPrefixReusableKvCache`, `IKvPrefixSeedable`; at most 2 entries, as on Vulkan, and no headroom because a growth is cheap).
   - Layer by layer: allocate larger K and V, `cuMemcpyDtoD` only the live rows in the stored format (F16, or Q8_0/Q4_0 blocks),
-    free the old pair. The quantized cache's shared F16 dequant scratch (an existing #1107 expansion, 4 B x max stride per position)
-    is reallocated at the new size, not copied.
-  - Admitted before allocating (`CudaKvGrowth.Admit`): the growth plus one old layer in transit (plus the new scratch) must fit in
+    free the old pair. Since #1850 the quantized cache has no F16 dequant scratch to resize: attention reads the blocks in place.
+  - Admitted before allocating (`CudaKvGrowth.Admit`): the growth plus one old layer in transit must fit in
     `cuMemGetInfo` free memory minus `DOTLLM_CUDA_VRAM_RESERVE_MB` (default 256 MiB). Under WDDM an over-allocation spills to shared
     memory instead of failing (#1068), so a refusal is the only safe answer; it falls back to a miss. `DOTLLM_VRAM_BUDGET_MB`
     exercises it on a large card.
@@ -723,7 +722,24 @@ On each new token write, the oldest window entry is quantized and appended to th
 
 ### Attention Integration
 - **CPU**: Per-tile dequantization inside tiled attention kernel (`Attention.ExecuteTiledQuantizedHead`). Phase 1 processes quantized region with on-the-fly dequant, Phase 2 reads FP32 window directly.
-- **GPU**: Scratch-buffer approach — dequant quantized region + ring-ordered window copy into temporary FP16 buffer, then standard attention kernel.
+- **GPU (CUDA dense, `CudaQuantizedKvCache`, #1850)**: read in place, no history scratch (CLAUDE.md rule 2). A position costs exactly its
+  K and V block bytes (TwIL-8B q8_0: 85 KiB/token vs 160 KiB F16; before #1850 a shared F16 K+V scratch added 4 B x max stride per
+  position, 4 KiB on TwIL-8B).
+  - `attention_kvq` (`native/kernels/attention_kvq.cu`): `attention_f16` with each Q8_0 / Q4_0 element dequantized in registers
+    (`__float2half(d * q)`, the eager dequant's expression) and rows past the quantized length read from the FP16 window ring at slot
+    `t % window`. Bit-identical to dequant-into-scratch + `attention_f16`. Decode (eager and the windowed decode graph's
+    `attention_kvq_dyn`) and every prefill the tensor-core kernel does not take: sliding window, sinks, a window ring, head dims
+    other than 64 / 128, GQA groups above 8, fewer than 16 rows.
+  - `attention_flash_mma_prefill_kvq` (`native/kernels/attention_flash_mma_prefill_kvq.cu`, Ampere+): tensor-core causal prefill,
+    head_dim 64 / 128, F16 output, each thread decoding its 8-element chunk into the shared K/V tile. Cold prefill and the #1847
+    prefix-reuse suffix prefill (`position_offset > 0`) share it, so q8_0 no longer goes through G3 over a dequantized scratch
+    (#1846's suspect path is gone for q8_0). `DOTLLM_CUDA_KVQ_FLASH_PREFILL=0` forces the scalar kernel.
+  - The quantize step writes one launch per contiguous run of rows (#1845; it was one per row: ~237K launches for a 2,966-token
+    TwIL-8B prefill).
+  - Neither path has an expansion fallback. `CudaQuantizedKvCache.ReferenceDequantScratch` keeps the pre-#1850 path as a
+    test-only oracle (lazily allocated, no env var).
+- **GPU (others)**: `CudaTurboQuantKvCache` and the Vulkan quantized caches still dequantize into a scratch (#1139); the CUDA
+  hybrid host reads Q8_0 / Q4_0 in place (#956 / #1094).
 
 ### CLI
 ```
