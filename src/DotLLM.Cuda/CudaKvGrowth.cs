@@ -35,10 +35,9 @@ internal static class CudaKvGrowth
     /// Peak extra device bytes of a layer-by-layer copying growth from <paramref name="oldLength"/> to
     /// <paramref name="newLength"/> positions: the added rows of every buffer plus the largest single layer's old buffers, which
     /// are still held while that layer's new ones are filled. <paramref name="rowBytesPerLayer"/> is the summed row bytes of the
-    /// buffers each layer grows (K and V, in their stored format). <paramref name="fixedExtraBytes"/> is any other buffer allocated
-    /// at its new size before the old one is freed (none today: the quantized cache's shared dequant scratch went in #1850).
+    /// buffers each layer grows (K and V, in their stored format).
     /// </summary>
-    internal static long PeakGrowthBytes(ReadOnlySpan<long> rowBytesPerLayer, int oldLength, int newLength, long fixedExtraBytes = 0)
+    internal static long PeakGrowthBytes(ReadOnlySpan<long> rowBytesPerLayer, int oldLength, int newLength)
     {
         if (newLength <= oldLength) return 0;
         long growth = 0, transit = 0;
@@ -47,7 +46,7 @@ internal static class CudaKvGrowth
             growth += (long)(newLength - oldLength) * rowBytes;
             transit = Math.Max(transit, (long)oldLength * rowBytes);
         }
-        return growth + transit + fixedExtraBytes;
+        return growth + transit;
     }
 
     /// <summary>

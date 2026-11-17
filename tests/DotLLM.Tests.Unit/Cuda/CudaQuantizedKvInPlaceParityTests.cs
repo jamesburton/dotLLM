@@ -168,10 +168,10 @@ public sealed class CudaQuantizedKvInPlaceParityTests
     /// <summary>Prefill the prompt, then <see cref="Steps"/> decode steps (greedy, or forced to <paramref name="forced"/>).</summary>
     private static Arm Run(CudaTransformerModel model, KvCacheConfig kv, int[] prompt, bool reference, int[]? forced)
     {
-        CudaQuantizedKvCache.ReferenceDequantScratch = reference;
-        try
         {
             using var cache = (IKvCache)model.CreateKvCache(prompt.Length + Steps + 8, kv);
+            if (cache is CudaQuantizedKvCache qc) qc.ReferenceDequantScratch = reference;   // per cache: no other cache can see it
+            else if (reference) throw new InvalidOperationException("the reference arm needs a quantized cache");
             int vocab = model.Config.VocabSize;
             var logits = new List<float[]>();
             var tokens = new int[Steps];
@@ -186,7 +186,6 @@ public sealed class CudaQuantizedKvInPlaceParityTests
             }
             return new Arm(logits, tokens);
         }
-        finally { CudaQuantizedKvCache.ReferenceDequantScratch = false; }
     }
 
     private static unsafe float[] LastRow(ITensor t, int vocab)

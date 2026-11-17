@@ -366,13 +366,10 @@ public sealed unsafe partial class CudaKernels : IDisposable
     // baked into the graph at instantiate time.
     private readonly CudaModule? _kvWriteModule;
     private readonly nint _kvWriteOneF16Func;
-    // Graph-friendly KV-quant scratch helpers (live in kv_write.ptx alongside
-    // the FP16 ring write so they share device-resident pos_ptr conventions).
+    // Graph-friendly FP16 ring write and the eager KV Q4_0 dequant (kv_write.ptx, sharing the device-resident pos_ptr
+    // conventions). The graph dequant / window-scatter helpers went with the full-history scratch in #1850.
     private readonly nint _kvWriteOneF16RingFunc;
-    private readonly nint _kvDequantQ8_0DynFunc;
-    private readonly nint _kvDequantQ4_0DynFunc;
     private readonly nint _kvDequantQ4_0Func;
-    private readonly nint _kvWindowToScratchDynFunc;
 
     // Fused decode-step RoPE + KV-cache write. Replaces three eager launches per
     // layer (rope_f16 + 2× cuMemcpyDtoDAsync) with one. Eager-only; the graph
@@ -1200,10 +1197,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _kvWriteModule = CudaModule.LoadFromFile(kvWritePath);
             _kvWriteOneF16Func = _kvWriteModule.GetFunction("kv_write_one_f16");
             _kvWriteOneF16RingFunc = _kvWriteModule.GetFunction("kv_write_one_f16_ring");
-            _kvDequantQ8_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q8_0_dyn");
-            _kvDequantQ4_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q4_0_dyn");
             _kvDequantQ4_0Func = _kvWriteModule.TryGetFunction("kv_dequant_q4_0");
-            _kvWindowToScratchDynFunc = _kvWriteModule.GetFunction("kv_window_to_scratch_dyn");
         }
 
         // Fused decode-step RoPE + KV-cache write (optional — eager decode optimization).
@@ -5062,8 +5056,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
     public bool HasAttentionKvq => _attentionKvqFunc != 0 && _attentionKvqDynFunc != 0;
 
     /// <summary>
-    /// Launches since process start of <see cref="LaunchAttentionKvq"/> / <see cref="LaunchAttentionKvqDyn"/> (eager calls only;
-    /// a graph replay does not count). Diagnostics: lets a test prove the in-place path ran.
+    /// Launches since process start of the eager <see cref="LaunchAttentionKvq"/> only (<see cref="LaunchAttentionKvqDyn"/> is
+    /// issued once at graph capture and never per replay, so it is not counted). Diagnostics: lets a test prove the in-place path ran.
     /// </summary>
     internal static long AttentionKvqLaunches;
 
@@ -5106,7 +5100,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
 
         const int TileKv = 256;
         uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
-        AttentionKvqLaunches++;
+        Interlocked.Increment(ref AttentionKvqLaunches);
         CudaDriverApi.cuLaunchKernel(_attentionKvqFunc,
                 (uint)(seqQ * numHeads), 1, 1, BlockSize, 1, 1,
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
@@ -5192,7 +5186,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         if (!IsAttentionFlashPrefillKvqShape(numHeads, numKvHeads, headDim))
             throw new ArgumentException($"Unsupported shape for the flash prefill kvq kernel: {numHeads}/{numKvHeads}/{headDim}.");
         DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
-        if (kDtype is not null) AttentionFlashPrefillKvqLaunches++;
+        if (kDtype is not null) Interlocked.Increment(ref AttentionFlashPrefillKvqLaunches);
 
         int group = numHeads / numKvHeads;
         nint qArg = q, kArg = k, vArg = v, oArg = output;
@@ -5357,43 +5351,6 @@ public sealed unsafe partial class CudaKernels : IDisposable
     }
 
     /// <summary>
-    /// Dequantizes the <c>[0, max(0, posPtr[0] + 1 - windowSize))</c> prefix of the per-layer
-    /// quantized cache into FP16 attention scratch. Predicated: no-op when the FP16 window
-    /// hasn't yet started evicting. Grid is sized for the maximum quantized region; the
-    /// kernel's grid-stride loop bounds the work to the live prefix.
-    /// </summary>
-    public void LaunchKvDequantDyn(nint quantBase, nint scratchBase, int kvStride, int windowSize,
-                                     int maxSeqLen, KvCacheDType dtype, nint posPtr, nint stream)
-    {
-        if (_kvWriteModule == null)
-            throw new InvalidOperationException(
-                "KV write kernel not available. Compile native/kernels/kv_write.cu to PTX.");
-
-        nint qArg = quantBase, sArg = scratchBase, posArg = posPtr;
-        int kvArg = kvStride, wsArg = windowSize;
-        void** args = stackalloc void*[] { &qArg, &sArg, &kvArg, &wsArg, &posArg };
-
-        // Match LaunchDequantToF16's grid sizing: cap at MaxDequantGridSize CUDA blocks.
-        // Each CUDA block has 8 warps (one per quant block of 32 elements).
-        int blocksPerRow = kvStride / 32;
-        int maxQuantRows = Math.Max(0, maxSeqLen - windowSize);
-        int totalBlocks = Math.Max(blocksPerRow, maxQuantRows * blocksPerRow);
-        uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
-        if (gridDim == 0) gridDim = 1;
-
-        nint func = dtype switch
-        {
-            KvCacheDType.Q8_0 => _kvDequantQ8_0DynFunc,
-            KvCacheDType.Q4_0 => _kvDequantQ4_0DynFunc,
-            _ => throw new NotSupportedException($"Dynamic KV dequant not supported for {dtype}.")
-        };
-
-        CudaDriverApi.cuLaunchKernel(func,
-                gridDim, 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
-    }
-
-    /// <summary>
     /// Eager dequantization of a contiguous run of KV-format blocks (as written by
     /// <see cref="LaunchQuantKv"/>) to FP16. KV Q4_0 packs ADJACENT PAIRS (low nibble = even
     /// element), which differs from the GGUF weight layout <see cref="LaunchDequantToF16"/>
@@ -5426,34 +5383,6 @@ public sealed unsafe partial class CudaKernels : IDisposable
             default:
                 throw new NotSupportedException($"KV dequant not supported for {dtype}.");
         }
-    }
-
-    /// <summary>
-    /// Scatters the live FP16 window from a per-layer ring buffer into the FP16 attention
-    /// scratch starting at row <c>max(0, posPtr[0] + 1 - windowSize)</c>. One CUDA block
-    /// per ring slot — each block predicates on whether its slot is currently populated
-    /// at the device-side decode position.
-    /// </summary>
-    public void LaunchKvWindowToScratchDyn(nint ringBase, nint scratchBase, int kvStride,
-                                             int windowSize, nint posPtr, nint stream)
-    {
-        if (_kvWriteModule == null)
-            throw new InvalidOperationException(
-                "KV write kernel not available. Compile native/kernels/kv_write.cu to PTX.");
-
-        nint rArg = ringBase, sArg = scratchBase, posArg = posPtr;
-        int kvArg = kvStride, wsArg = windowSize;
-        void** args = stackalloc void*[] { &rArg, &sArg, &kvArg, &wsArg, &posArg };
-
-        // One CUDA block per ring slot; threads-per-block sized to cover kvStride
-        // with a per-thread stride loop.
-        uint gridDim = (uint)windowSize;
-        uint threadsPerBlock = (uint)Math.Min(BlockSize, kvStride);
-        if (threadsPerBlock == 0) threadsPerBlock = 32;
-
-        CudaDriverApi.cuLaunchKernel(_kvWindowToScratchDynFunc,
-                gridDim, 1, 1, threadsPerBlock, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>True when the fused decode-step RoPE+KV-write kernel is loaded (PTX present).</summary>

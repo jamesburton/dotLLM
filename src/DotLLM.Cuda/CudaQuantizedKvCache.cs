@@ -37,7 +37,7 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
     private readonly KvGeometry _geom;       // per-layer KV row width (numKvHeads(l) * headDim(l))
     private readonly bool _uniform;          // _geom.IsUniform, hoisted for the hot path
     private readonly int _uniformStride;     // _geom.UniformStride when _uniform; else 0
-    private readonly int _maxStride;         // max per-layer stride — sizes the shared scratch
+    private readonly int _maxStride;         // max per-layer stride — sizes the test-only reference scratch (ReferenceDequantScratch)
     private int _maxSeqLen;                  // raised by TryGrowTo (issue #1594)
     private int _generation;                 // bumped whenever device buffers are replaced (TryGrowTo)
     private readonly CudaContext? _context;  // context the buffers live on; null = the ambient current context
@@ -48,18 +48,19 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
     private int _currentLength;
     private int _quantizedLength;
 
-    // Test-only oracle (issue #1850): the pre-#1850 full-history FP16 dequant scratch, allocated lazily and ONLY while
+    // Test-only oracle (issue #1850): the pre-#1850 full-history FP16 dequant scratch, allocated lazily and ONLY when this cache's
     // ReferenceDequantScratch is set, so parity tests can run the legacy path in the same process. Never allocated in production.
     private nint _refKScratch;  // device ptr: FP16 [maxSeqLen, maxStride]
     private nint _refVScratch;  // device ptr: FP16 [maxSeqLen, maxStride]
 
     /// <summary>
-    /// Test-only oracle switch (issue #1850): when set, <see cref="CudaTransformerModel"/> runs attention the pre-#1850 way, over
-    /// a full-history FP16 scratch the cache dequantizes into (<see cref="PrepareReferenceScratch"/>), and skips the quantized
-    /// decode graph. A reference/baseline comparison under CLAUDE.md's oracle exemption: reachable only from tests (no env var),
-    /// lazily allocated, outside <see cref="BytesFor"/>.
+    /// Test-only oracle switch (issue #1850), per cache: when set on THIS cache, <see cref="CudaTransformerModel"/> runs its
+    /// attention the pre-#1850 way, over a full-history FP16 scratch the cache dequantizes into (<see cref="PrepareReferenceScratch"/>),
+    /// and skips the quantized decode graph. A reference/baseline comparison under CLAUDE.md's oracle exemption: set only by tests on
+    /// a cache they own (no env var, no process-wide state, so no other cache can fall back to the scratch), lazily allocated,
+    /// outside <see cref="BytesFor"/>.
     /// </summary>
-    internal static bool ReferenceDequantScratch;
+    internal bool ReferenceDequantScratch { get; set; }
 
     /// <summary>Per-layer KV row width (FP16 elements); scalar shortcut hoisted when uniform.</summary>
     private int Stride(int layerIndex) => _uniform ? _uniformStride : _geom.KvStrideOf(layerIndex);
@@ -142,6 +143,17 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
     /// that created it, and the current context is per thread.
     /// </summary>
     public CudaQuantizedKvCache(KvGeometry geometry, int maxSeqLen, KvCacheConfig config, CudaContext? context)
+        : this(geometry, maxSeqLen, config, context, inPlaceAttentionLoaded: null)
+    {
+    }
+
+    /// <summary>
+    /// As <see cref="CudaQuantizedKvCache(KvGeometry, int, KvCacheConfig, CudaContext?)"/>. <paramref name="inPlaceAttentionLoaded"/>
+    /// is whether the model's kernel set loaded the in-place attention kernels (<see cref="CudaKernels.HasAttentionKvq"/>): attention
+    /// over this cache has no other path since #1850, so <see langword="false"/> refuses here, before anything is allocated, instead
+    /// of at the first forward (or mid-way through a decode-graph capture). <see langword="null"/> skips the check (kernel tests).
+    /// </summary>
+    internal CudaQuantizedKvCache(KvGeometry geometry, int maxSeqLen, KvCacheConfig config, CudaContext? context, bool? inPlaceAttentionLoaded)
     {
         _context = context;
         _context?.MakeCurrent();
@@ -166,9 +178,14 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
         // (#1850) have no FP16 arm, so an f16/q8_0 mix used to throw at the first KV write, mid-forward. Refuse it up front.
         if (KeyDType is not (KvCacheDType.Q8_0 or KvCacheDType.Q4_0) || ValueDType is not (KvCacheDType.Q8_0 or KvCacheDType.Q4_0))
             throw new NotSupportedException(
-                $"The dense CUDA quantized KV cache needs both keys and values in q8_0 or q4_0 (got {KeyDType.ToString().ToLowerInvariant()}/" +
-                $"{ValueDType.ToString().ToLowerInvariant()}); mixing f16 with a block format is not supported. Use the same type for " +
-                "--cache-type-k and --cache-type-v.");
+                $"The dense CUDA quantized KV cache needs keys AND values in a block format, q8_0 or q4_0 (got " +
+                $"{KeyDType.ToString().ToLowerInvariant()}/{ValueDType.ToString().ToLowerInvariant()}); mixing f16 with a block format is " +
+                "not supported. Set --cache-type-k and --cache-type-v each to q8_0 or q4_0 (they may differ), or both to f16.");
+        if (inPlaceAttentionLoaded == false)
+            throw new InvalidOperationException(
+                "The q8_0/q4_0 KV cache needs the in-place attention kernels (attention_kvq.ptx), which did not load on this device " +
+                "(missing, stale or unloadable PTX next to DotLLM.Cuda). Rebuild or reinstall the native PTX, or use f16 KV " +
+                "(--cache-type-k f16 --cache-type-v f16).");
 
         // #1848: the whole cache (quantized rows and the FP16 window) is admitted against free VRAM before anything is allocated;
         // under WDDM an over-commit spills to shared system memory instead of failing.
@@ -248,17 +265,21 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
                 if (positions[i] < minNewPos) minNewPos = positions[i];
             int safeEvictEnd = Math.Min(newQuantLen, minNewPos);
 
-            for (int evictPos = prevQuantLen; evictPos < safeEvictEnd; evictPos++)
+            // One launch per tensor per contiguous run of ring slots: consecutive positions are consecutive slots until the ring
+            // wraps, and consecutive quantized rows, so a run [evictPos, evictPos + rows) is one source span and one destination span.
+            for (int evictPos = prevQuantLen; evictPos < safeEvictEnd;)
             {
                 int ringIdx = evictPos % _windowSize;
+                int rows = Math.Min(safeEvictEnd - evictPos, _windowSize - ringIdx);
 
                 nint evictedK = _keysWindow![layerIndex] + (nint)(ringIdx * fp16RowBytes);
                 nint quantDstK = _keysQuant[layerIndex] + (nint)((long)evictPos * keyRowBytes);
-                kernels.LaunchQuantKv(evictedK, quantDstK, stride, KeyDType, stream);
+                kernels.LaunchQuantKv(evictedK, quantDstK, rows * stride, KeyDType, stream);
 
                 nint evictedV = _valuesWindow![layerIndex] + (nint)(ringIdx * fp16RowBytes);
                 nint quantDstV = _valuesQuant[layerIndex] + (nint)((long)evictPos * valueRowBytes);
-                kernels.LaunchQuantKv(evictedV, quantDstV, stride, ValueDType, stream);
+                kernels.LaunchQuantKv(evictedV, quantDstV, rows * stride, ValueDType, stream);
+                evictPos += rows;
             }
 
             // Phase 2: current-batch positions that will be evicted immediately —
@@ -267,21 +288,23 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
 
             _layerQuantizedLength[layerIndex] = newQuantLen;
 
-            // Phase 3: positions that stay in the window — write FP16 into the ring.
-            for (int i = 0; i < seqLen; i++)
+            // Phase 3: positions that stay in the window — write FP16 into the ring, one copy per tensor per maximal run of
+            // consecutive batch rows with consecutive positions, split where the ring wraps.
+            for (int i = 0; i < seqLen;)
             {
                 int pos = positions[i];
-                if (pos >= newQuantLen)
-                {
-                    int ringIdx = pos % _windowSize;
-                    nint kDst = _keysWindow![layerIndex] + (nint)(ringIdx * fp16RowBytes);
-                    nint vDst = _valuesWindow![layerIndex] + (nint)(ringIdx * fp16RowBytes);
-                    nint kSrc = keysDevice + (nint)(i * fp16RowBytes);
-                    nint vSrc = valuesDevice + (nint)(i * fp16RowBytes);
+                if (pos < newQuantLen) { i++; continue; }
+                int ringIdx = pos % _windowSize;
+                int rows = 1;
+                while (i + rows < seqLen && positions[i + rows] == pos + rows && ringIdx + rows < _windowSize) rows++;
 
-                    CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, kSrc, (nuint)fp16RowBytes, stream).ThrowOnError();
-                    CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, vSrc, (nuint)fp16RowBytes, stream).ThrowOnError();
-                }
+                nint kDst = _keysWindow![layerIndex] + (nint)(ringIdx * fp16RowBytes);
+                nint vDst = _valuesWindow![layerIndex] + (nint)(ringIdx * fp16RowBytes);
+                nint kSrc = keysDevice + (nint)(i * fp16RowBytes);
+                nint vSrc = valuesDevice + (nint)(i * fp16RowBytes);
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, kSrc, (nuint)(rows * fp16RowBytes), stream).ThrowOnError();
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, vSrc, (nuint)(rows * fp16RowBytes), stream).ThrowOnError();
+                i += rows;
             }
 
             _quantizedLength = newQuantLen;
@@ -565,7 +588,7 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
 
         long[] rowBytes = new long[_numLayers]; // planning path, once per growth
         for (int i = 0; i < _numLayers; i++) rowBytes[i] = (long)_keyQuantRowBytes[i] + _valueQuantRowBytes[i];
-        if (!CudaKvGrowth.Admit(CudaKvGrowth.PeakGrowthBytes(rowBytes, _maxSeqLen, maxLength, fixedExtraBytes: 0)))
+        if (!CudaKvGrowth.Admit(CudaKvGrowth.PeakGrowthBytes(rowBytes, _maxSeqLen, maxLength)))
             return false;
 
         FreeReferenceScratch();   // test-only oracle: re-allocated at the new length on next use

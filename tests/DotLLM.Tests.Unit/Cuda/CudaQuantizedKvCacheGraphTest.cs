@@ -213,6 +213,77 @@ public sealed unsafe class CudaQuantizedKvCacheGraphTest : IDisposable
         }
     }
 
+    /// <summary>
+    /// #1850 review: the windowed eager update batches the Phase-1 ring eviction and the Phase-3 ring write into one launch / copy per
+    /// contiguous run, split where the ring wraps. Feeding the same rows one per call (every run is one row, so the batching is
+    /// inert) and in uneven chunks (5/7/13/... rows: multi-row evictions and ring writes that wrap at slot 8) must leave the
+    /// quantized rows and both FP16 rings byte-identical. Mixed Q8_0 K / Q4_0 V covers both quantize kernels.
+    /// </summary>
+    [SkippableFact]
+    public void UpdateDevice_BatchedRingRuns_MatchOneRowPerCall()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null, "PTX kernels not available");
+
+        const int numKvHeads = 3, headDim = 64, kvStride = numKvHeads * headDim, maxSeqLen = 64, windowSize = 8, total = 45;
+        int[] chunks = [5, 7, 13, 1, 3, 9, 7];
+        Assert.Equal(total, chunks.Sum());
+        var cfg = new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q4_0, windowSize);
+        using var perRow = new CudaQuantizedKvCache(1, numKvHeads, headDim, maxSeqLen, cfg);
+        using var chunked = new CudaQuantizedKvCache(1, numKvHeads, headDim, maxSeqLen, cfg);
+
+        long rowBytes = (long)kvStride * sizeof(ushort);
+        var hk = new ushort[total * kvStride];
+        var hv = new ushort[total * kvStride];
+        for (int i = 0; i < hk.Length; i++)
+        {
+            hk[i] = FloatToHalf(MathF.Sin(i * 0.013f) * (1 + (i / kvStride) % 5));
+            hv[i] = FloatToHalf(MathF.Cos(i * 0.029f) * (1 + (i / 32) % 7));
+        }
+        CudaDriverApi.cuMemAlloc_v2(out nint kAll, (nuint)(total * rowBytes)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint vAll, (nuint)(total * rowBytes)).ThrowOnError();
+        try
+        {
+            fixed (ushort* p = hk) CudaDriverApi.cuMemcpyHtoD_v2(kAll, (nint)p, (nuint)(total * rowBytes)).ThrowOnError();
+            fixed (ushort* p = hv) CudaDriverApi.cuMemcpyHtoD_v2(vAll, (nint)p, (nuint)(total * rowBytes)).ThrowOnError();
+
+            for (int pos = 0; pos < total; pos++)
+                perRow.UpdateDevice(kAll + (nint)(pos * rowBytes), vAll + (nint)(pos * rowBytes), [pos], 1, 0, _stream!.Handle, _kernels!);
+            int start = 0;
+            foreach (int n in chunks)
+            {
+                int[] positions = Enumerable.Range(start, n).ToArray();
+                chunked.UpdateDevice(kAll + (nint)(start * rowBytes), vAll + (nint)(start * rowBytes), positions, n, 0, _stream!.Handle, _kernels!);
+                start += n;
+            }
+            _stream!.Synchronize();
+
+            Assert.Equal(total - windowSize, perRow.QuantizedLength);
+            Assert.Equal(perRow.QuantizedLength, chunked.QuantizedLength);
+            int quantLen = perRow.QuantizedLength;
+            AssertSameBytes(perRow.GetQuantizedKeysPtr(0), chunked.GetQuantizedKeysPtr(0), (long)quantLen * perRow.KeyQuantizedRowBytes, "quantized K");
+            AssertSameBytes(perRow.GetQuantizedValuesPtr(0), chunked.GetQuantizedValuesPtr(0), (long)quantLen * perRow.ValueQuantizedRowBytes, "quantized V");
+            AssertSameBytes(perRow.GetWindowKeysPtr(0), chunked.GetWindowKeysPtr(0), windowSize * rowBytes, "K ring");
+            AssertSameBytes(perRow.GetWindowValuesPtr(0), chunked.GetWindowValuesPtr(0), windowSize * rowBytes, "V ring");
+        }
+        finally
+        {
+            CudaDriverApi.cuMemFree_v2(kAll);
+            CudaDriverApi.cuMemFree_v2(vAll);
+        }
+    }
+
+    private static void AssertSameBytes(nint a, nint b, long bytes, string what)
+    {
+        var ha = new byte[bytes];
+        var hb = new byte[bytes];
+        fixed (byte* pa = ha) CudaDriverApi.cuMemcpyDtoH_v2((nint)pa, a, (nuint)bytes).ThrowOnError();
+        fixed (byte* pb = hb) CudaDriverApi.cuMemcpyDtoH_v2((nint)pb, b, (nuint)bytes).ThrowOnError();
+        int first = -1;
+        for (int i = 0; i < ha.Length; i++) if (ha[i] != hb[i]) { first = i; break; }
+        Assert.True(first < 0, $"{what} differs at byte {first} of {bytes}");
+    }
+
     private void CompareWindow(CudaQuantizedKvCache eager, CudaQuantizedKvCache graph, int kvStride, int pos)
     {
         // Ring buffer compare for layer 0.

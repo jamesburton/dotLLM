@@ -17,7 +17,6 @@ public sealed class CudaKvGrowthLogicTests
         long[] rows = [100, 300];
         // 1000 -> 1500 positions: added = 500 * (100 + 300) = 200,000; largest old layer = 1000 * 300 = 300,000.
         Assert.Equal(500_000, CudaKvGrowth.PeakGrowthBytes(rows, 1000, 1500));
-        Assert.Equal(500_000 + 64, CudaKvGrowth.PeakGrowthBytes(rows, 1000, 1500, fixedExtraBytes: 64));
         Assert.Equal(0, CudaKvGrowth.PeakGrowthBytes(rows, 1500, 1500));
         Assert.Equal(0, CudaKvGrowth.PeakGrowthBytes(rows, 1500, 1000));
     }

@@ -1308,7 +1308,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                 // device scalars uploaded before every replay. A growth replaces the buffers and is caught by the Generation key.
                 return ForwardDecodeGraph(tokenIds, positions, deviceId, stdKv);
             }
-            if (kvCache is CudaQuantizedKvCache qKv && qKv.WindowCapacity > 0 && !CudaQuantizedKvCache.ReferenceDequantScratch)
+            if (kvCache is CudaQuantizedKvCache qKv && qKv.WindowCapacity > 0 && !qKv.ReferenceDequantScratch)
                 return ForwardDecodeGraphQuantized(tokenIds, positions, deviceId, qKv);
         }
 
@@ -1705,7 +1705,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                     cudaQKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s, _kernels);
                     int seqKv = cudaQKvCache.CurrentLength;
 
-                    if (CudaQuantizedKvCache.ReferenceDequantScratch)
+                    if (cudaQKvCache.ReferenceDequantScratch)
                     {
                         // Test-only oracle (#1850): the pre-#1850 path, dequant into a full-history FP16 scratch + DispatchAttention.
                         var (kCachePtr, vCachePtr) = cudaQKvCache.PrepareReferenceScratch(layer, s, _kernels);
@@ -4787,7 +4787,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         _context.MakeCurrent();
         var geom = Core.Attention.KvGeometry.FromConfig(Config);
         Core.Attention.IKvCache cache = AdmitReleasingG3<Core.Attention.IKvCache>(() => config.IsQuantized
-            ? new CudaQuantizedKvCache(geom, maxSeqLen, config, _context)
+            ? new CudaQuantizedKvCache(geom, maxSeqLen, config, _context, inPlaceAttentionLoaded: _kernels.HasAttentionKvq)
             : new CudaKvCache(geom, maxSeqLen, _context));
         _spillMonitor.Check($"KV cache ({config.KeyDType}/{config.ValueDType}) allocated for {maxSeqLen} tokens");
         return cache;

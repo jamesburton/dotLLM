@@ -277,21 +277,21 @@ __device__ __forceinline__ void attention_kvq_body(
         // 2e. Weighted V (V read in place).
         // Same t order and the same `v_acc += w * v` per weight as attention_f16; the tile is split at quant_len so neither
         // half carries a per-element region branch, and this thread's block offset / in-block index are hoisted.
-        int tq = quant_len - t_start;
-        tq = tq < 0 ? 0 : (tq > tile_len ? tile_len : tq);
+        int tq_split = quant_len - t_start;   // tile rows [0, tq_split) are quantized, the rest are ring rows
+        tq_split = tq_split < 0 ? 0 : (tq_split > tile_len ? tile_len : tq_split);
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
         {
             float v_acc = 0.0f;
             const int e = elem0 + d;
             const int j = e & 31;
             const uint8_t* vb = vq + (size_t)t_start * v_row_bytes + (size_t)(e >> 5) * KvqFmt<VF>::kBlockBytes;
-            for (int t = 0; t < tq; t++, vb += v_row_bytes)
+            for (int t = 0; t < tq_split; t++, vb += v_row_bytes)
             {
                 const float w = score_tile[t];
                 if (w > 0.0f)
                     v_acc += w * __half2float(KvqFmt<VF>::elem(vb, kvq_scale(vb), j));
             }
-            for (int t = tq; t < tile_len; t++)
+            for (int t = tq_split; t < tile_len; t++)
             {
                 const float w = score_tile[t];
                 if (w > 0.0f)

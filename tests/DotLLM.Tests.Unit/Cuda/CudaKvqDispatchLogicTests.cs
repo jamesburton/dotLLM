@@ -50,4 +50,14 @@ public sealed class CudaKvqDispatchLogicTests
             new CudaQuantizedKvCache(KvGeometry.Uniform(2, 2, 64), 16, new KvCacheConfig(k, v)));
         Assert.Contains("q8_0 or q4_0", ex.Message);
     }
+
+    [Fact]
+    public void MissingInPlaceAttentionKernels_AreRefusedAtCreation_NotAtTheFirstForward()
+    {
+        // CreateKvCache passes CudaKernels.HasAttentionKvq; a missing / unloadable attention_kvq.ptx must refuse before any device
+        // call (here: before admission, so no GPU is needed), not throw inside the first forward or a decode-graph capture.
+        var ex = Assert.Throws<InvalidOperationException>(() => new CudaQuantizedKvCache(KvGeometry.Uniform(2, 2, 64), 16,
+            new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q4_0), context: null, inPlaceAttentionLoaded: false));
+        Assert.Contains("attention_kvq.ptx", ex.Message);
+    }
 }
