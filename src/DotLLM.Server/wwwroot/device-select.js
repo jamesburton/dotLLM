@@ -29,11 +29,11 @@
         for (const b of (devices && devices.backends) || []) {
             if (b.name === 'cpu' || !b.servable) continue;
             for (const d of b.devices || []) {
-                if (!d.device_string) continue;
+                if (!d.device_string || d.servable === false) continue;
                 const mem = memoryText(d);
                 choices.push({
                     value: d.device_string,
-                    label: `${d.name} [${d.device_string}${b.name === 'cuda' ? ', CUDA' : ', Vulkan'}]` + (mem ? ` - ${mem}` : ''),
+                    label: `${d.name} [${d.device_string}, ${b.name === 'hip' ? 'HIP (experimental)' : b.name === 'cuda' ? 'CUDA' : 'Vulkan'}]` + (mem ? ` - ${mem}` : ''),
                     kind: b.name,
                     supportsLayers: supportsLayerOffload(d.device_string),
                     isDefault: d.is_default === true,
@@ -53,7 +53,8 @@
                 if (v) return v.value;
             }
         }
-        const gpu = choices.find(c => c.kind !== 'cpu');
+        // HIP remains explicit-only; a CPU recommendation must not select it by default.
+        const gpu = choices.find(c => c.kind !== 'cpu' && c.kind !== 'hip');
         return gpu ? gpu.value : 'cpu';
     }
 

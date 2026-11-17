@@ -25,27 +25,39 @@ namespace DotLLM.Server.Endpoints;
 public static class DeviceEndpoint
 {
     private static DeviceListResponse? s_cached;
+    private static bool s_hipValidated;
     private static readonly object s_lock = new();
 
     public static void Map(WebApplication app) =>
         app.MapGet("/v1/devices", (long? model_bytes) =>
         {
-            var d = Describe();
+            var d = Describe(validateHip: true);
             return Results.Ok(d with { RecommendedDevice = DeviceSelector.Candidates(Math.Max(0, model_bytes ?? 0), d)[0] });
         });
 
-    /// <summary>Cached backend/device description. Separated from the route so tests can call it.</summary>
-    public static DeviceListResponse Describe()
+    /// <summary>Cached inventory. Full HIP readiness is requested only by explicit HIP loads or the devices endpoint.</summary>
+    public static DeviceListResponse Describe(bool validateHip = false)
     {
         lock (s_lock)
         {
-            return s_cached ??= Probe();
+            if (s_cached is null)
+            {
+                s_cached = Probe(validateHip);
+                s_hipValidated = validateHip;
+            }
+            else if (validateHip && !s_hipValidated)
+            {
+                s_cached = s_cached with { Backends = s_cached.Backends.Select(
+                    backend => backend.Name == "hip" ? DescribeHip(true) : backend).ToArray() };
+                s_hipValidated = true;
+            }
+            return s_cached;
         }
     }
 
-    private static DeviceListResponse Probe() => new()
+    private static DeviceListResponse Probe(bool validateHip) => new()
     {
-        Backends = [DescribeCpu(), DescribeCuda(), DescribeVulkan()],
+        Backends = [DescribeCpu(), DescribeCuda(), DescribeVulkan(), DescribeHip(validateHip)],
     };
 
     private static BackendInfoDto DescribeCpu() => new()
@@ -172,6 +184,67 @@ public static class DeviceEndpoint
                 }).ToArray()
                 : [],
         };
+    }
+
+    private static BackendInfoDto DescribeHip(bool validateReadiness) => DescribeHip(
+        DotLLM.Hip.HipDevice.IsAvailable,
+        DotLLM.Hip.HipDevice.GetDeviceCount,
+        i =>
+        {
+            var device = DotLLM.Hip.HipDevice.GetDevice(i);
+            return new DeviceInfoDto { Index = i, Name = device.Name, TotalMemoryBytes = device.TotalMemoryBytes };
+        },
+        i =>
+        {
+            // Probe the same native manifest and loading path used by the model. Enumeration alone is insufficient:
+            // e.g. gfx1036 can enumerate even though the bundled code objects have no compatible image for it.
+            using var context = DotLLM.Hip.HipContext.Create(i);
+            using var stream = DotLLM.Hip.HipStream.Create();
+            using var kernels = new DotLLM.Hip.Kernels.DenseF16Kernels(context, stream);
+            using var storage = new DotLLM.Hip.DirectStorage.HipDirectWeightStore(context);
+        }, validateReadiness);
+
+    /// <summary>Separates runtime detection from per-device inference readiness; injectable for hosts without HIP.</summary>
+    internal static BackendInfoDto DescribeHip(Func<bool> available, Func<int> count,
+        Func<int, DeviceInfoDto> describe, Action<int> validate, bool validateReadiness = true)
+    {
+        const string boundary = "Experimental, explicit --device hip:N only; dense Llama GGUF (F16/Q4_0/Q8_0) or F16/BF16/AWQ4/GPTQ4 SafeTensors, F16/Q8_0 KV. Windows x64 DirectStorage; Linux x64 requires AIS-capable driver/storage and remains hardware-unverified. Hardware qualification: Windows RX 6900 XT / HIP 6.4.2.";
+        if (!SafeProbe(available))
+            return new BackendInfoDto { Name = "hip", Available = false, Servable = false,
+                Note = "No HIP runtime / no HIP-capable AMD GPU detected." };
+        var devices = new List<DeviceInfoDto>();
+        try
+        {
+            int n = count();
+            for (int i = 0; i < n; i++)
+            {
+                DeviceInfoDto device = new() { Index = i, Name = $"HIP device {i}" };
+                try
+                {
+                    device = describe(i);
+                    if (validateReadiness)
+                    {
+                        validate(i);
+                        device = device with { DeviceString = $"hip:{i}", Servable = true, Note = boundary };
+                    }
+                    else
+                        device = device with { DeviceString = null, Servable = false,
+                            Note = "HIP readiness has not been checked; request HIP explicitly or query /v1/devices." };
+                }
+                catch (Exception ex)
+                {
+                    device = device with { DeviceString = null, Servable = false, Note = ex.Message };
+                }
+                devices.Add(device);
+            }
+        }
+        catch (Exception ex)
+        {
+            return new BackendInfoDto { Name = "hip", Available = true, Servable = false,
+                Note = $"HIP runtime detected, but device enumeration failed: {ex.Message}" };
+        }
+        return new BackendInfoDto { Name = "hip", Available = true, DeviceCount = devices.Count,
+            Servable = devices.Any(d => d.Servable == true), Devices = devices.ToArray(), Note = boundary };
     }
 
     private static bool SafeProbe(Func<bool> probe)

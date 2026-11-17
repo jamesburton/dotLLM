@@ -25,6 +25,8 @@ namespace DotLLM.Tokenizers.Hf;
 ///     <c>ByteLevel</c> decoder — Granite-3 dense, GPT-2 proper.</description></item>
 ///   <item><description><c>Sequence[Split, ByteLevel(use_regex:false)]</c> pre-tokenizer +
 ///     <c>ByteLevel</c> decoder — Qwen-2 / Qwen-2.5.</description></item>
+///   <item><description><c>Sequence[Digits(individual_digits:true), ByteLevel(false,true,true)]</c>
+///     — SmolLM's individual digits followed by byte-level word splitting.</description></item>
 /// </list>
 /// <para>
 /// <b>Not supported yet:</b> multi-step pre-tokenizer sequences (DeepSeek-V2
@@ -66,7 +68,7 @@ public static class HfBpeTokenizerFactory
     /// <exception cref="InvalidDataException">
     /// The spec declares a pipeline this factory does not yet support
     /// (e.g. an un-wired pre-tokenizer kind or a multi-step Sequence that
-    /// isn't <c>[Split, ByteLevel]</c>).
+    /// isn't a supported ByteLevel composition).
     /// </exception>
     public static ITokenizer Create(HfTokenizerSpec spec, int bosId = -1, int eosId = -1)
     {
@@ -76,11 +78,12 @@ public static class HfBpeTokenizerFactory
         {
             HfPreTokenizerKind.Metaspace or HfPreTokenizerKind.None
                 => CreateSentencePiece(spec, bosId, eosId),
-            HfPreTokenizerKind.ByteLevel
+            HfPreTokenizerKind.ByteLevel or HfPreTokenizerKind.DigitsByteLevel
                 => CreateByteLevel(spec, bosId, eosId),
             _ => throw new InvalidDataException(
                 $"HF tokenizer.json pre-tokenizer '{spec.PreTokenizerKind}' is not supported yet. "
-                + "Supported pipelines: Metaspace+ByteFallback (SPM) and ByteLevel (GPT-2/Qwen/Granite)."),
+                + "Supported pipelines: Metaspace+ByteFallback (SPM), ByteLevel (GPT-2/Qwen/Granite), "
+                + "and SmolLM Digits(true)+ByteLevel(add_prefix_space:false,trim_offsets:true,use_regex:true)."),
         };
     }
 
@@ -150,6 +153,10 @@ public static class HfBpeTokenizerFactory
 
     private static ITokenizer CreateByteLevel(HfTokenizerSpec spec, int bosId, int eosId)
     {
+        if (spec.PreTokenizerKind == HfPreTokenizerKind.DigitsByteLevel &&
+            (spec.ByteLevelUseRegex != true || spec.ByteLevelAddPrefixSpace != false || spec.ByteLevelSplitRegex is not null))
+            throw new InvalidDataException("SmolLM Digits+ByteLevel requires individual digits, no prefix space, and the default ByteLevel regex.");
+
         string[] tokens = BuildIdToTokenTable(spec.Vocab);
         int[] tokenTypes = BuildTokenTypes(tokens, spec.AddedTokens);
         string[] mergeStrings = BuildByteLevelMerges(spec.Merges);
@@ -169,9 +176,9 @@ public static class HfBpeTokenizerFactory
         else
             preRegex = null;
 
-        ITokenizer inner = BpeTokenizer.CreateTiktokenWithRegex(
-            tokens, mergeStrings, tokenTypes,
-            resolvedBos, resolvedEos, preRegex);
+        ITokenizer inner = spec.PreTokenizerKind == HfPreTokenizerKind.DigitsByteLevel
+            ? BpeTokenizer.CreateTiktoken(tokens, mergeStrings, tokenTypes, resolvedBos, resolvedEos, "smollm")
+            : BpeTokenizer.CreateTiktokenWithRegex(tokens, mergeStrings, tokenTypes, resolvedBos, resolvedEos, preRegex);
 
         // Apply a normalizer decorator if the spec declares one (Qwen2 → NFC).
         return spec.NormalizerKind switch

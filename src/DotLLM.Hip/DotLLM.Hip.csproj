@@ -2,53 +2,71 @@
 
   <PropertyGroup>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Description>HIP/ROCm GPU backend for dotLLM — AMD GPU path via P/Invoke against libamdhip64 + hipBLAS. Code objects (.co) loaded through the HIP runtime module API. Proof-of-pipeline scaffold; kernels port mechanically from DotLLM.Cuda via hipify-perl.</Description>
+    <DefineConstants>$(DefineConstants);DOTLLM_HIP_DIRECTSTORAGE</DefineConstants>
+    <Description>HIP/ROCm GPU backend for dotLLM, with F16 dense primitives and paged attention. Code objects (.co) loaded through the HIP runtime module API.</Description>
   </PropertyGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
     <InternalsVisibleTo Include="DotLLM.Tests.Integration" />
+    <InternalsVisibleTo Include="HipLinuxProbe" />
+    <InternalsVisibleTo Include="HipContextQualification" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\DotLLM.Vulkan\DirectStorage\DirectStorageInterop.cs" Link="DirectStorage\DirectStorageInterop.cs" />
+  </ItemGroup>
+
+  <!-- Reuse the existing development-only DirectStorage package; releases do not redistribute its DLLs. -->
+  <ItemGroup Condition="'$(OS)' == 'Windows_NT'">
+    <PackageReference Include="Microsoft.Direct3D.DirectStorage" PrivateAssets="all" ExcludeAssets="all" GeneratePathProperty="true" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(OS)' == 'Windows_NT' And '$(PkgMicrosoft_Direct3D_DirectStorage)' != '' And '$(DotLLMBundleDirectStorage)' != 'false'">
+    <Content Include="$(PkgMicrosoft_Direct3D_DirectStorage)\native\bin\x64\dstorage.dll" Link="dstorage.dll" CopyToOutputDirectory="PreserveNewest" Pack="false" />
+    <Content Include="$(PkgMicrosoft_Direct3D_DirectStorage)\native\bin\x64\dstoragecore.dll" Link="dstoragecore.dll" CopyToOutputDirectory="PreserveNewest" Pack="false" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\DotLLM.Core\DotLLM.Core.csproj" />
+    <ProjectReference Include="..\DotLLM.Models\DotLLM.Models.csproj" />
   </ItemGroup>
 
-  <ItemGroup>
-    <Content Include="..\..\native\hip\co\*.co" Link="co\%(Filename)%(Extension)" Condition="Exists('..\..\native\hip\co\')">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
-  </ItemGroup>
-
-  <!-- HIP code-object compilation: .hip to .co via 'hipcc genco'.
-       Skipped when ROCm is not installed (end users can ship with pre-compiled .co files).
-       Incremental build: only recompiles kernels when source is newer than .co output. -->
+  <!-- Ordinary builds consume qualified tracked objects; rebuilding them is explicit. -->
   <PropertyGroup>
     <HipKernelDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', '..', 'native', 'hip', 'kernels'))</HipKernelDir>
     <HipCoOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', '..', 'native', 'hip', 'co'))</HipCoOutputDir>
-    <!-- gfx1030 = RDNA2 (RX 6000), gfx1100 = RDNA3 (RX 7000). Extend as needed. -->
-    <HipOffloadArchs>--offload-arch=gfx1030 --offload-arch=gfx1100</HipOffloadArchs>
+    <!-- gfx1030 = RDNA2, gfx1100 = RDNA3, gfx1151 = Strix Halo. -->
+    <HipOffloadArchs Condition="'$(HipOffloadArchs)' == ''">--offload-arch=gfx1030 --offload-arch=gfx1100 --offload-arch=gfx1151</HipOffloadArchs>
+    <HipCompiler Condition="'$(HipCompiler)' == ''">hipcc</HipCompiler>
   </PropertyGroup>
 
   <ItemGroup>
     <HipKernel Include="$(HipKernelDir)\*.hip" />
+    <Content Include="$(HipCoOutputDir)\MANIFEST" Link="co\MANIFEST" ExcludeFromSingleFile="true"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="@(HipKernel->'$(HipCoOutputDir)\%(Filename).co')">
+      <Link>co\%(Filename)%(Extension)</Link>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
   </ItemGroup>
 
-  <Target Name="CompileHipCodeObjects"
-          BeforeTargets="BeforeBuild"
-          Inputs="@(HipKernel)"
-          Outputs="@(HipKernel->'$(HipCoOutputDir)\%(Filename).co')">
-    <Exec Command="hipcc --version" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
-      <Output TaskParameter="ExitCode" PropertyName="_HipccExitCode" />
-    </Exec>
-    <Message Condition="'$(_HipccExitCode)' != '0'" Importance="high"
-             Text="WARNING: .hip source newer than .co but hipcc not found in PATH. Pre-compiled code objects may be stale. Install ROCm to auto-compile kernels." />
+  <Target Name="CompileHipCodeObjects" BeforeTargets="BeforeBuild" Condition="'$(BuildHipKernels)' == 'true'">
+    <PropertyGroup>
+      <_HipArchs>$(HipOffloadArchs.Replace('--offload-arch=', ''))</_HipArchs>
+    </PropertyGroup>
+    <Exec Condition="'$(OS)' == 'Windows_NT'"
+          Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(HipKernelDir)/../build.ps1&quot; -HipCompiler &quot;$(HipCompiler)&quot;"
+          EnvironmentVariables="HIP_ARCHS=$(_HipArchs)" />
+    <Exec Condition="'$(OS)' != 'Windows_NT'"
+          Command="bash &quot;$(HipKernelDir)/../build.sh&quot;"
+          EnvironmentVariables="HIP_ARCHS=$(_HipArchs);HIP_COMPILER=$(HipCompiler)" />
+  </Target>
 
-    <MakeDir Condition="'$(_HipccExitCode)' == '0'" Directories="$(HipCoOutputDir)" />
-    <Message Condition="'$(_HipccExitCode)' == '0'" Importance="high" Text="Compiling %(HipKernel.Filename).hip to code object" />
-    <Exec Condition="'$(_HipccExitCode)' == '0'"
-          Command="hipcc --genco $(HipOffloadArchs) -o &quot;$(HipCoOutputDir)/%(HipKernel.Filename).co&quot; &quot;%(HipKernel.FullPath)&quot;"
-          StandardOutputImportance="low" />
+  <Target Name="IncludeBuiltHipCodeObjects" BeforeTargets="AssignTargetPaths" DependsOnTargets="CompileHipCodeObjects">
+    <Error Condition="'$(RequireHipKernels)' == 'true' and !Exists('$(HipCoOutputDir)\%(HipKernel.Filename).co')"
+           Text="Required HIP %(HipKernel.Filename).co is missing. Run native/hip/build.ps1 or build.sh, or pass -p:BuildHipKernels=true." />
   </Target>
 
 </Project>

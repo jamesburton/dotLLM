@@ -29,21 +29,36 @@ internal static class DirectStoragePrompt
                 return;
             }
 
-            string? dir = DirectStorageInstaller.InstallAsync(ConfirmLicense).GetAwaiter().GetResult();
-            if (dir is null)
-            {
-                Decline();
-                AnsiConsole.MarkupLine("[grey]Licence not accepted; nothing was installed. dotLLM will not ask again.[/]");
-                return;
-            }
-            AnsiConsole.MarkupLine("[green]Installed[/] to " + Markup.Escape(dir) + ".");
-            AnsiConsole.MarkupLine("DirectStorage weight loading is still opt-in: set [blue]DOTLLM_VULKAN_DIRECT_STORAGE=1[/] to use it.");
+            if (Install() != 0) Decline();
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or PlatformNotSupportedException)
         {
             // A failed offer must never stop the command the user actually asked for.
             AnsiConsole.MarkupLine("[yellow]DirectStorage install skipped:[/] " + Markup.Escape(e.Message));
         }
+    }
+
+    /// <summary>Installs explicitly, including after an earlier declined startup offer; never accepts a license silently.</summary>
+    internal static int Install()
+    {
+        if (!DirectStorageInstaller.IsSupportedPlatform)
+            throw new PlatformNotSupportedException("DirectStorage installation requires Windows x64 or ARM64.");
+        if (DirectStorageInstaller.IsAvailable())
+        {
+            AnsiConsole.MarkupLine("[green]DirectStorage is already installed.[/]");
+            return 0;
+        }
+        if (Console.IsInputRedirected || Console.IsOutputRedirected || Console.IsErrorRedirected)
+            throw new InvalidOperationException("Run 'dotllm directstorage install' in an interactive terminal to review and accept Microsoft's license.");
+        string? directory = DirectStorageInstaller.InstallAsync(ConfirmLicense).GetAwaiter().GetResult();
+        if (directory is null)
+        {
+            AnsiConsole.MarkupLine("[grey]License not accepted; nothing was installed.[/]");
+            return 1;
+        }
+        AnsiConsole.MarkupLine("[green]Installed[/] to " + Markup.Escape(directory) + ".");
+        AnsiConsole.MarkupLine("HIP uses DirectStorage automatically. For Vulkan, set [blue]DOTLLM_VULKAN_DIRECT_STORAGE=1[/].");
+        return 0;
     }
 
     private static bool ShouldOffer(string[] args)
