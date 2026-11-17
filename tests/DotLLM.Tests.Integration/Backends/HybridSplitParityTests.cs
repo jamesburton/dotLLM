@@ -36,9 +36,6 @@ public sealed class HybridSplitParityTests
 
     private const int PrefillLen = 18;   // then 6 single-token decode steps
 
-    /// <summary>Cosine every step must reach against each reference.</summary>
-    private const double MinCosine = 0.999;
-
     private static string? SmolLmPath =>
         DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile(
             [], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path;
@@ -92,19 +89,15 @@ public sealed class HybridSplitParityTests
         return rows;
     }
 
-    private void AssertClose(string label, List<float[]> reference, List<float[]> actual, out double worst)
-    {
-        worst = 1;
-        Assert.Equal(reference.Count, actual.Count);
-        for (int s = 0; s < reference.Count; s++)
-        {
-            double cos = Cosine(reference[s], actual[s]);
-            worst = Math.Min(worst, cos);
-            Assert.True(cos >= MinCosine, $"{label} step {s}: cosine {cos:F6} < {MinCosine}");
-            Assert.Equal(ArgMax(reference[s]), ArgMax(actual[s]));
-        }
-        _output.WriteLine($"{label}: worst cosine {worst:F6} over prefill + {reference.Count - 1} decode steps");
-    }
+    /// <summary>
+    /// The bar for one step: the split may be no further from a reference than <see cref="GapMultiple"/> times the distance between
+    /// the two references themselves (all-CPU and all-GPU disagree by their F16-activation and KV-format differences, and a split is
+    /// a mix of the two), with a floor of <see cref="MinGap"/>.
+    /// </summary>
+    private static double Allowed(double referenceGap) => Math.Max(GapMultiple * referenceGap, MinGap);
+
+    private const double GapMultiple = 3.0;
+    private const double MinGap = 2e-4;
 
     private void CheckModel(string path, string name)
     {
@@ -114,16 +107,29 @@ public sealed class HybridSplitParityTests
         int maxLen = Tokens.Length + 1;
         int layers = config.NumLayers;
 
-        List<float[]> cpu;
+        List<float[]> cpu, cpuF32;
         using (var cpuModel = ModelLoader.CreateCpuModelFromGguf(gguf, config, ThreadingConfig.SingleThreaded))
+        {
             cpu = Run(cpuModel, () => new QuantizedKvCache(layers, config.NumKvHeads, config.HeadDim, maxLen,
                 HybridTransformerModel.CpuTailKvDType, HybridTransformerModel.CpuTailKvDType, windowSize: 0), vocab);
+            cpuF32 = Run(cpuModel, () => new SimpleKvCache(layers, config.NumKvHeads, config.HeadDim, maxLen), vocab);
+        }
 
         List<float[]> gpu;
         var (gpuModel, gpuKv) = CudaModelLoader.CreateFromGguf(gguf, config, deviceId: 0);
         using (gpuModel)
             gpu = Run(gpuModel, () => gpuKv(maxLen), vocab);
 
+        int steps = cpu.Count;
+        var gap = new double[steps];
+        for (int s = 0; s < steps; s++)
+        {
+            gap[s] = 1 - Cosine(cpu[s], gpu[s]);
+            _output.WriteLine($"{name} step {s}: 1-cos cpu(q8_0 KV) vs gpu {gap[s]:E3}, cpu(f32 KV) vs gpu {1 - Cosine(cpuF32[s], gpu[s]):E3}, " +
+                              $"cpu q8_0 vs f32 KV {1 - Cosine(cpu[s], cpuF32[s]):E3}");
+        }
+
+        var failures = new List<string>();
         foreach (int n in new[] { 1, layers / 2, layers - 1 }.Distinct())
         {
             using var hybrid = HybridTransformerModel.LoadFromGguf(gguf, config, n, deviceId: 0, ThreadingConfig.SingleThreaded);
@@ -134,16 +140,28 @@ public sealed class HybridSplitParityTests
                 Assert.Equal((KvCacheDType.Q8_0, KvCacheDType.Q8_0), (tail.KeyDType, tail.ValueDType));
             }
             var split = Run(hybrid, () => hybrid.CreateKvCache(maxLen), vocab);
+            var splitF32 = Run(hybrid, () => hybrid.CreateKvCacheWithF32TailForTests(maxLen), vocab);
             Assert.Equal(0, hybrid.CheckSpill($"after the N={n} parity run"));   // WDDM: no device buffer backed by system RAM
-            AssertClose($"{name} N={n}/{layers} vs CPU (q8_0 KV)", cpu, split, out _);
-            AssertClose($"{name} N={n}/{layers} vs all-GPU", gpu, split, out _);
 
-            // Red arm: the same bar must reject a tail that has lost its history.
+            // Red arm: the same decode with its history dropped.
             var amnesic = Run(hybrid, () => hybrid.CreateKvCache(maxLen), vocab, dropHistory: true);
-            double worstRed = Enumerable.Range(1, cpu.Count - 1).Min(s => Cosine(cpu[s], amnesic[s]));
-            _output.WriteLine($"{name} N={n}: red arm (history dropped) worst cosine {worstRed:F6}");
-            Assert.True(worstRed < MinCosine, $"{name} N={n}: a cacheless decode still reached cosine {worstRed:F6}; the bar cannot see a lost KV");
+            bool redCaught = false;
+            for (int s = 0; s < steps; s++)
+            {
+                double dCpu = 1 - Cosine(cpu[s], split[s]), dGpu = 1 - Cosine(gpu[s], split[s]);
+                double dF32 = 1 - Cosine(gpu[s], splitF32[s]), dRed = 1 - Cosine(cpu[s], amnesic[s]);
+                double bar = Allowed(gap[s]);
+                _output.WriteLine($"{name} N={n}/{layers} step {s}: 1-cos split vs cpu {dCpu:E3}, vs gpu {dGpu:E3} " +
+                                  $"(f32-tail split vs gpu {dF32:E3}); bar {bar:E3}; red arm {dRed:E3}");
+                if (dCpu > bar) failures.Add($"{name} N={n} step {s}: split vs CPU 1-cos {dCpu:E3} > {bar:E3}");
+                if (dGpu > bar) failures.Add($"{name} N={n} step {s}: split vs GPU 1-cos {dGpu:E3} > {bar:E3}");
+                if (ArgMax(split[s]) != ArgMax(gpu[s]) && ArgMax(split[s]) != ArgMax(cpu[s]))
+                    failures.Add($"{name} N={n} step {s}: argmax matches neither reference");
+                if (s > 0 && dRed > bar) redCaught = true;
+            }
+            if (!redCaught) failures.Add($"{name} N={n}: the red arm (history dropped) passed the bar, so the bar cannot see a lost KV");
         }
+        Assert.True(failures.Count == 0, string.Join("\n", failures));
     }
 
     [SkippableFact]

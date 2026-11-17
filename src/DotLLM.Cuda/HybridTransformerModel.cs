@@ -446,6 +446,16 @@ public sealed unsafe class HybridTransformerModel : IModel
     /// <summary>KV storage type of the CPU tail (#1851): Q8_0 blocks, read in place by the CPU attention (rule 1: no FP32 KV).</summary>
     internal const KvCacheDType CpuTailKvDType = KvCacheDType.Q8_0;
 
+    /// <summary>Test control (#1851): the pre-#1851 FP32 tail KV, to separate the Q8_0 tail's error from the split's.</summary>
+    internal HybridKvCache CreateKvCacheWithF32TailForTests(int maxSeqLen)
+    {
+        _context.MakeCurrent();
+        return new HybridKvCache(
+            new CudaKvCache(_numGpuLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen),
+            new SimpleKvCache(Config.NumLayers - _numGpuLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen),
+            _numGpuLayers);
+    }
+
     /// <summary>
     /// Creates a <see cref="HybridKvCache"/> for this model: F16 device KV for the GPU layers and Q8_0 host KV for the CPU tail
     /// (#1851; the tail was an FP32 <see cref="SimpleKvCache"/>, 4x the bytes, against rule 1).
