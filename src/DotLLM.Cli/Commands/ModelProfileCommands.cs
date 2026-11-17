@@ -160,7 +160,7 @@ internal sealed class ModelShowCommand : Command<ModelShowCommand.Settings>
             void Row(string k, object? v) { if (v is not null) table.AddRow($"[bold]{k}[/]", (v is string[] a ? string.Join(", ", a) : v.ToString() ?? "").EscapeMarkup()); }
             Row("Description", m.Description); Row("System", m.System); Row("Temperature", m.Temperature); Row("Top-P", m.TopP); Row("Top-K", m.TopK);
             Row("Min-P", m.MinP); Row("Repeat penalty", m.RepeatPenalty); Row("Max tokens", m.MaxTokens); Row("Seed", m.Seed); Row("Stop", m.Stop);
-            Row("Device", m.Device); Row("GPU layers", m.GpuLayers); Row("Keep-alive (s)", m.KeepAlive);
+            Row("Device", m.Device); Row("GPU layers", m.GpuLayers switch { DotLLM.Core.Configuration.GpuOffloadPlanner.AutoGpuLayers => "auto", -1 => "all", var g => (object?)g }); Row("Keep-alive (s)", m.KeepAlive);
         }
         else table.AddRow("[bold]Kind[/]", "model");
 
