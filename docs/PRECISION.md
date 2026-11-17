@@ -611,7 +611,7 @@ PRs #1103, #1122, #1125, #1126.
 | GX1 | CUDA | prefill dequant → F16 scratch → cuBLAS | L1B 33.5 MB, 70B 470 MB + 2 B/weight traffic | hybrid PQ2_0 **fixed** (#1222: int8-mma W2A8 MMQ default on sm_80+); dense 2..8-row projections (verify / draft / short prefill) over Q2_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ4_NL **fixed** (#1316/#1375: rows4 `_c2..c8` dp4a GEMVs read the blocks in place; `DOTLLM_CUDA_KQUANT_SMALL_S_MAX=0` restores the scratch); dense `seqLen > 8` open | #1132 (hybrid PQ2_0), #1135 (dense) |
 | GX2 | CUDA | LM head > 8 rows → whole-head F16 | B2 2.54 GB | **fixed on dev** (#1099, PR #1125): 2,425 → 170 MiB | — |
 | GX2b | CUDA | multi-row LM head for non-PQ2_0 heads: tiled F16 dequant | ≤ max(layer scratch, 64 MiB) per tile | open (bounded, admitted) | #1136 |
-| GX3 | CUDA | quantized-KV full-history F16 scratch | stride 1024 @32k: 128 MB | hybrid **fixed on dev** (#1094, PR #1103); dense `CudaQuantizedKvCache`/TurboQuant open | #1139 |
+| GX3 | CUDA | quantized-KV full-history F16 scratch | stride 1024 @32k: 128 MB | hybrid **fixed on dev** (#1094, PR #1103); dense `CudaQuantizedKvCache` fixed (#1850, read in place); TurboQuant open | #1139 |
 | GX4 | CUDA | hybrid KV F16 dequant scratch, remaining tiers | B2 4 KiB/token | open | #1136 |
 | GX5 | CUDA | load-time F16 copies (no GEMV kernel), embedding, dense LM head | Qwen3-8B embedding 1.16 GiB | open (gated) | #1135 |
 | GX6 | CUDA | Gemma `ProjectF32` quant → F16 → F32 | `4·maxProj` | open | #1135 |

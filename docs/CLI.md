@@ -949,6 +949,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_CUDA_HYBRID_GRAPH` | Environment switch for the decode graph; 0 keeps eager launches. | `CudaQwen3HybridDenseTransformerModel.DecodeGraph.cs` |
 | `DOTLLM_CUDA_I2S_A8` | (not described in source) | `CudaTransformerModel.cs` |
 | `DOTLLM_CUDA_KQUANT_SMALL_S_MAX` | Environment variable capping the K-quant / IQ4 multi-column range (issues #1316/#1375): projections of 2 &lt;= seqLen &lt;= KQuantMaxColumns over Q2_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ4_NL weights take the rows4 _c{S} GEMV (weights read... | `CudaSmallSGemvDispatch.cs` |
+| `DOTLLM_CUDA_KVQ_FLASH_PREFILL` | Opt-out for the in-place tensor-core prefill over the dense quantized KV cache (issue #1850): DOTLLM_CUDA_KVQ_FLASH_PREFILL=0 sends every quantized-KV prefill to the scalar attention_kvq kernel (also in place, slower). Read onc... | `CudaTransformerModel.cs` |
 | `DOTLLM_CUDA_MEM_TRACE` | True when DOTLLM_CUDA_MEM_TRACE=1. | `CudaMemTrace.cs` |
 | `DOTLLM_CUDA_MMVQ_COALESCED` | Opt-in: route Q4_K decode GEMV (k >= MmvqLargeKThreshold) through the experimental coalesced MMVQ kernel (warp-per-superblock, coalesced 128-byte qs loads) instead of the default MMVQ-large. On-the-fly only (ignores preq scratc... | `CudaKernels.cs` |
 | `DOTLLM_CUDA_MMVQ_LLAMACPP` | Opt-in: route Q4_K decode GEMV (k >= MmvqLargeKThreshold) through the llama.cpp-faithful coalesced+accumulate-once MMVQ kernel (quantized_gemv_q4_k_mmvq_llamacpp) instead of the default MMVQ-large. Unlike MmvqCoalesced (#363, w... | `CudaKernels.cs` |
