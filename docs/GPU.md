@@ -655,7 +655,9 @@ Layers are assigned bottom-up: GPU gets layers 0..N-1 (lower/earlier layers), CP
 
 GPU layers store their KV-cache in FP16 GPU device memory (`CudaKvCache`). CPU layers store theirs as Q8_0 blocks in host memory
 (`QuantizedKvCache`, read in place by the CPU attention; #1851, it was an FP32 `SimpleKvCache` at 4x the bytes, against the no-FP32-storage
-rule). A `HybridKvCache` routes KV operations by layer index:
+rule). When `head_dim` is not a multiple of 32 the Q8_0 blocks would straddle heads, so the tail stores F16 rows instead
+(`HybridF16TailKvCache`, logged once with its per-token cost). That is a temporary workaround until quantized KV supports these
+head sizes (#1870); it is never FP32. `HybridKvCache` reports the GPU half's bytes as `IDeviceResidentKvCache`. It routes KV operations by layer index:
 
 - Layers 0..N-1: GPU cache, updated via device-side copies (`UpdateDevice`)
 - Layers N..L-1: CPU cache, updated via standard `IKvCache.Update()` with remapped indices
@@ -706,7 +708,7 @@ the CUDA context, stream, cuBLAS, kernels and the fixed forward buffers already 
 | Free VRAM | | `cuMemGetInfo`, clamped by `DOTLLM_VRAM_BUDGET_MB` |
 | Reserve | once | `DOTLLM_CUDA_VRAM_RESERVE_MB` (default 256 MiB), the admission reserve |
 | Token embedding + lazy dequant scratch | once | as `CudaWeights` uploads it (FP16 table when no per-row lookup kernel exists) |
-| Forward scratch | once | `ActivationBytesPerToken` x the context (an unchunked full-context prefill) |
+| Forward scratch | once | `ActivationBytesPerToken` x the prefill chunk: a split prefills 1024 tokens per forward (`--prefill-chunk-size` overrides) in run, chat and serve |
 | Layer weights | per GPU layer | raw quantized blocks, plus an FP16 copy for a projection type without a quantized GEMV |
 | F16 KV | per GPU layer | `2 x kvHeads x headDim x 2` bytes x the context |
 | Final norm + LM head | only when every layer fits | otherwise it runs on the tail |
