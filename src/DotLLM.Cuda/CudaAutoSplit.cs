@@ -44,7 +44,7 @@ public static class CudaAutoSplit
         if (GpuOffloadPlanner.AutoSplitBlocker(config, sinks) is { } reason) return reason;
         try
         {
-            CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel));
+            CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel), allowFoldedGraniteScalars: true);
         }
         catch (NotSupportedException)
         {

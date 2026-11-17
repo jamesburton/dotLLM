@@ -3980,9 +3980,14 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// generic FP16 layer loops, which have no Gemma ops; loading Gemma 1/2 through them would
     /// silently produce wrong logits. Refuse loudly instead.
     /// </summary>
-    internal static void RejectGemmaForCompositeHost(ModelConfig config, string host)
+    /// <param name="config">Model configuration.</param>
+    /// <param name="host">Host name for the message.</param>
+    /// <param name="allowFoldedGraniteScalars">The host applies a Granite attention multiplier that folds into RoPE
+    /// (<see cref="ModelConfig.GraniteScalarsFoldIntoRope"/>, TwIL-8B) on every layer it runs (#1851).</param>
+    internal static void RejectGemmaForCompositeHost(ModelConfig config, string host, bool allowFoldedGraniteScalars = false)
     {
-        if (UsesF32DenseForward(config) || config.HasGraniteScalars || config.QkNormWholeProjection
+        bool graniteScalars = config.HasGraniteScalars && !(allowFoldedGraniteScalars && config.GraniteScalarsFoldIntoRope);
+        if (UsesF32DenseForward(config) || graniteScalars || config.QkNormWholeProjection
             || config.NoRopeLayers is { Count: > 0 })
             throw new NotSupportedException(
                 $"{config.Architecture} (GGUF 'gemma'/'gemma2'/'gemma3'/'granite'/'smollm3'/'olmo2'/'olmoe') is not supported by {host}: its layer loop has no "

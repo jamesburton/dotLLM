@@ -32,6 +32,13 @@ public sealed unsafe class HybridTransformerModel : IModel
     /// <summary>Whether the WDDM spill monitor is attached (tests; #1848).</summary>
     internal bool HasSpillMonitor => _spillMonitor is not null;
 
+    /// <summary>Reads the spill counter now; shared GPU memory above the post-load level, in bytes (tests; #1851).</summary>
+    internal long CheckSpill(string context)
+    {
+        _spillMonitor.Check(context);
+        return _spillMonitor.SpilledBytes;
+    }
+
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
     private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
     private const int Q8_1GroupSize = QuantFormat.LegacyGroupSize;
@@ -60,6 +67,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     private readonly int _gpuRopeType;
     private readonly RoPEType _cpuRopeType;
     private readonly int? _slidingWindowSize;
+    private readonly float _cpuQPrescale;
     private nint _fp16TransferBuffer;
     private int _fp16TransferCapacity; // in elements
 
@@ -118,6 +126,11 @@ public sealed unsafe class HybridTransformerModel : IModel
         _cpuRopeType = cpuRopeType;
         _slidingWindowSize = slidingWindowSize;
         VramWarning = vramWarning;
+        // #1851: a Granite attention multiplier that folds into RoPE (TwIL-8B). The GPU half gets it from the RoPE mscale
+        // (CudaWeights); the CPU tail's attention kernels hard-code 1/sqrt(headDim), so Q is pre-scaled there, as on the CPU host.
+        _cpuQPrescale = config.AttentionScale.HasValue
+            ? config.AttentionScoreScale(config.HeadDim) * MathF.Sqrt(config.HeadDim)
+            : 1f;
 
         // Initial transfer buffer for decode (1 token)
         _fp16TransferCapacity = config.HiddenSize;
@@ -137,7 +150,7 @@ public sealed unsafe class HybridTransformerModel : IModel
         GgufFile gguf, ModelConfig config, int numGpuLayers,
         int deviceId, ThreadingConfig threading)
     {
-        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel));
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel), allowFoldedGraniteScalars: true);
         if (numGpuLayers <= 0 || numGpuLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
                 $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
@@ -313,7 +326,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(cpuWeights);
         ArgumentNullException.ThrowIfNull(config);
-        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel));
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel), allowFoldedGraniteScalars: true);
         if (numGpuLayers <= 0 || numGpuLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
                 $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
@@ -926,6 +939,11 @@ public sealed unsafe class HybridTransformerModel : IModel
                     new Span<float>(k, seqLen * kvStride),
                     positions, numHeads, numKvHeads, headDim, _ropeDim,
                     _cpuState.CosTable, _cpuState.SinTable, _cpuRopeType);
+
+                // Non-default score scale (#1851, folded Granite multiplier): the CPU attention kernels use 1/sqrt(headDim).
+                if (_cpuQPrescale != 1f)
+                    TensorPrimitives.Multiply(new Span<float>(q, seqLen * numHeads * headDim), _cpuQPrescale,
+                        new Span<float>(q, seqLen * numHeads * headDim));
 
                 // Attention with KV-cache
                 if (hybridKvCache is not null)
