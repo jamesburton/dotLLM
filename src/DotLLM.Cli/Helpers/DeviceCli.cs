@@ -22,7 +22,8 @@ internal static class DeviceCli
     public const string OptionHelp =
         "Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - with a warning if it ends on the CPU), " +
         "'cpu', 'vulkan' (the default Vulkan GPU), 'vulkan:N' (Vulkan physical device N), 'gpu'/'cuda' (CUDA device 0), " +
-        "'gpu:N'/'cuda:N' (CUDA ordinal N). Case-insensitive. An explicit GPU that cannot be honoured is an error, never a silent CPU run. " +
+        "'gpu:N'/'cuda:N' (CUDA ordinal N), 'hip'/'hip:N' (run/chat/serve only: experimental AMD HIP; explicit-only, Windows x64, dense Llama GGUF or supported F16/BF16/AWQ4/GPTQ4 SafeTensors). " +
+        "Case-insensitive. An explicit GPU that cannot be honoured is an error, never a silent CPU run. " +
         "Env: DOTLLM_VULKAN_DEVICE_INDEX picks the Vulkan device behind plain 'vulkan'.";
 
     /// <summary>Returns a user-facing error for an unrecognised <c>--device</c> value, else null.</summary>
@@ -65,6 +66,15 @@ internal static class DeviceCli
         return (res, new Outcome(device, res.ResolvedDevice, warning, notes, DeviceLabel(res.ResolvedDevice)));
     }
 
+    /// <summary>HF counterpart of the shared load path. Validate tokenizer and template before calling.</summary>
+    public static (DeviceLoadResult Load, DotLLM.Models.SafeTensors.ISafetensorsTensorSource Source, Outcome Outcome) LoadSafetensors(
+        string directory, string device, int? gpuLayers, ThreadingConfig threading)
+    {
+        var notes = new List<string>();
+        var (load, source) = DeviceModelLoader.LoadSafetensors(directory, device, gpuLayers, threading, notes.Add, notes.Add);
+        return (load, source, new Outcome(device, load.ResolvedDevice, load.Warning, notes, DeviceLabel(load.ResolvedDevice)));
+    }
+
     /// <summary>Human-readable name of the resolved device (GPU name, or the CPU thread count), best effort.</summary>
     public static string? DeviceLabel(string resolved)
     {
@@ -75,26 +85,11 @@ internal static class DeviceCli
             {
                 DeviceKind.Vulkan => DeviceModelLoader.VulkanDeviceFor(s).DeviceName,
                 DeviceKind.Cuda => DotLLM.Cuda.CudaDevice.GetDevice(s.Ordinal).Name,
+                DeviceKind.Hip => DotLLM.Hip.HipDevice.GetDevice(s.Ordinal).Name,
                 _ => null,
             };
         }
         catch { return null; }
-    }
-
-    /// <summary>
-    /// Device resolution for checkpoints the CLI can only load on the CPU (HuggingFace safetensors). An explicit GPU request is an error;
-    /// <c>auto</c> resolves to the CPU with a prominent warning.
-    /// </summary>
-    public static Outcome ResolveCpuOnly(string device, string what, string modelName)
-    {
-        var spec = DeviceSpec.Parse(device);
-        if (spec.IsGpu)
-            throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(
-                device, modelName, 0, $"{what} can only be loaded on the CPU by the CLI (no GPU loader for them yet)"));
-        string? warning = spec.Kind == DeviceKind.Auto
-            ? $"Running on the CPU: --device auto cannot use a GPU for {what} (CPU-only loader). Expect much lower throughput than a GPU run. Pass --device cpu to silence this."
-            : null;
-        return new Outcome(device, "cpu", warning, []);
     }
 
     /// <summary>
@@ -115,6 +110,11 @@ internal static class DeviceCli
     {
         backend = "cpu"; ordinal = 0; vulkanIndex = null;
         if (!DeviceSpec.TryParse(device, out var spec, out string? error)) { PrintError(error!, json); return false; }
+        if (spec.Kind == DeviceKind.Hip)
+        {
+            PrintError("HIP is supported by run, chat and serve only; this command has no HIP execution path.", json);
+            return false;
+        }
         long bytes = ModelResolver.FileLength(modelPath);
         var plan = DeviceSelector.Plan(spec, bytes, DotLLM.Server.Endpoints.DeviceEndpoint.Describe(), fullOffload: false);   // tools take --gpu-layers; the loader judges fit
         if (plan.Error is not null)

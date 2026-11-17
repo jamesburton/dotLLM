@@ -8,6 +8,7 @@ using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Scheduler;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
@@ -341,11 +342,14 @@ public sealed class ServerState : IDisposable
     /// </summary>
     public SamplingDefaults EffectiveSamplingDefaults => ActiveProfile is { } p ? SamplingDefaults.OverlayProfile(p) : SamplingDefaults;
 
-    /// <summary>Path of the currently loaded GGUF file.</summary>
+    /// <summary>Path of the currently loaded GGUF file or HF SafeTensors directory.</summary>
     public string LoadedModelPath { get; set; } = "";
 
     /// <summary>Open GGUF file handle (disposed on model swap).</summary>
     public GgufFile? CurrentGguf { get; set; }
+
+    /// <summary>Open SafeTensors source; disposed after its model on swap, eviction and shutdown.</summary>
+    public ISafetensorsTensorSource? CurrentSafetensors { get; set; }
 
     /// <summary>True when MTP self-speculative decoding is actually engaging requests for the loaded model (#757).</summary>
     public bool MtpActive { get; set; }
@@ -1032,7 +1036,7 @@ public sealed class ServerState : IDisposable
                 EffectiveKeepAliveSeconds = keepAlive,
                 EstimatedBytes = EstimatedBytes,
                 ExpiresInSeconds = expiresIn,
-                Meta = ModelMeta.Build(Config, CurrentGguf),
+                Meta = ModelMeta.Build(Config, CurrentGguf, CurrentSafetensors),
                 Device = ActiveDevice,                          // (#1822)
                 DeviceFallbackReason = DeviceFallbackWarning,
             });
@@ -1259,6 +1263,7 @@ public sealed class ServerState : IDisposable
             DiffusionGenerator = DiffusionGenerator,
             LoadedModelPath = LoadedModelPath,
             CurrentGguf = CurrentGguf,
+            CurrentSafetensors = CurrentSafetensors,
             DraftModel = DraftModel,
             DraftModelPath = DraftModelPath,
             DraftGguf = DraftGguf,
@@ -1284,6 +1289,7 @@ public sealed class ServerState : IDisposable
         Generator = null;
         DiffusionGenerator = null;
         CurrentGguf = null;
+        CurrentSafetensors = null;
         DraftModel = null;
         DraftGguf = null;
         KeepAliveSecondsOverride = null;
@@ -1309,6 +1315,7 @@ public sealed class ServerState : IDisposable
         DiffusionGenerator = snapshot.DiffusionGenerator;
         LoadedModelPath = snapshot.LoadedModelPath;
         CurrentGguf = snapshot.CurrentGguf;
+        CurrentSafetensors = snapshot.CurrentSafetensors;
         DraftModel = snapshot.DraftModel;
         DraftModelPath = snapshot.DraftModelPath;
         DraftGguf = snapshot.DraftGguf;
@@ -1343,6 +1350,7 @@ public sealed class ServerState : IDisposable
         Scheduler = loaded.Scheduler;
         LoadedModelPath = loaded.LoadedModelPath;
         CurrentGguf = loaded.CurrentGguf;
+        CurrentSafetensors = loaded.CurrentSafetensors;
         DraftModel = loaded.DraftModel;
         DraftModelPath = loaded.DraftModelPath;
         DraftGguf = loaded.DraftGguf;
@@ -1416,6 +1424,7 @@ public sealed class ServerState : IDisposable
         TernaryAdapters = null;
         Model?.Dispose();
         CurrentGguf?.Dispose();
+        CurrentSafetensors?.Dispose();
 
         Config = null;
         ToolCallParser = null;
@@ -1430,6 +1439,7 @@ public sealed class ServerState : IDisposable
         Generator = null;
         DiffusionGenerator = null;
         CurrentGguf = null;
+        CurrentSafetensors = null;
         DraftModel = null;
         DraftGguf = null;
     }
@@ -1450,6 +1460,7 @@ public sealed class ServerState : IDisposable
         DraftGguf?.Dispose();
         Model?.Dispose();
         CurrentGguf?.Dispose();
+        CurrentSafetensors?.Dispose();
         LoraRegistry?.Dispose();
         Residency.Dispose();
         _requestGate.Dispose();

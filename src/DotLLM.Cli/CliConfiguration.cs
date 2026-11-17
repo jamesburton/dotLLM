@@ -64,6 +64,14 @@ internal static class CliConfiguration
             config.ValidateExamples();
         config.Settings.StrictParsing = true;
 
+        config.AddBranch("directstorage", storage =>
+        {
+            storage.SetDescription("Install the Microsoft DirectStorage runtime for Windows GPU loading.");
+            storage.AddCommand<DirectStorageInstallCommand>("install")
+                .WithDescription("Download the pinned runtime and install it after interactive license acceptance.")
+                .WithExample("directstorage", "install");
+        });
+
         config.AddBranch("model", model =>
         {
             model.SetDescription("Manage models: search/pull from Hugging Face, add local files, list, delete, and create named profiles. Full reference: docs/CLI.md.");
