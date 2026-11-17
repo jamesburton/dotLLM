@@ -150,6 +150,17 @@ public sealed class CudaPagedDecodeBookkeepingTests
         Assert.Equal(0, uploads);
     }
 
+    [Theory]
+    // #1843: blocks a cache still needs to hold maxLength positions, given what it holds; -1 past the whole pool.
+    [InlineData(32, 0, 10, 2)]
+    [InlineData(33, 2, 10, 1)]
+    [InlineData(16, 3, 10, 0)]     // holds more than it needs (rolled back): nothing to allocate
+    [InlineData(160, 0, 10, 10)]
+    [InlineData(161, 0, 10, -1)]
+    [InlineData(161, 10, 10, -1)]
+    public void BlocksStillNeeded_CountsOnlyMissingBlocks_AndRefusesPastThePool(int maxLength, int held, int total, int expected)
+        => Assert.Equal(expected, CudaPagedKvCache.BlocksStillNeeded(maxLength, held, BlockSize, total));
+
     [Fact]
     public void Version_BumpsOnSeed()
     {

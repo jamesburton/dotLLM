@@ -1790,7 +1790,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                         PagedGatherAttentionCalls++;
                         var (kCachePtr, vCachePtr) = cudaPagedKvCache.PrepareAttentionScratch(layer, s);
                         MarkProfile(ProfileCategory.KvUpdate);
-                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+                        // #1843: the gather is the same contiguous F16 layout as CudaKvCache, so a prefix-reuse suffix (or a later
+                        // prefill chunk) takes G3's offset path over it, as the dense F16 cache does (#1594).
+                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0], offsetG3: true);
                     }
                 }
                 else

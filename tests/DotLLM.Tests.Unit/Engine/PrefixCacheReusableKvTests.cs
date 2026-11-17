@@ -52,7 +52,8 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
     /// the largest <see cref="IKvCache.MaxLength"/> a <see cref="IKvCache.TryGrowTo"/> may reach (0 = never grows, the interface default),
     /// standing in for a device cache whose admission refuses a growth that would not fit in free device memory (issue #1781).
     /// </summary>
-    private sealed class ReusableKv(SimpleKvCache inner, bool exclusive, bool canTruncate, int growLimit = 0) : IPrefixReusableKvCache, IPerLayerKvCache, IDeviceResidentKvCache
+    private sealed class ReusableKv(SimpleKvCache inner, bool exclusive, bool canTruncate, int growLimit = 0, Func<bool>? roomToGrow = null)
+        : IPrefixReusableKvCache, IPerLayerKvCache, IDeviceResidentKvCache
     {
         public bool Disposed;
         public long DeviceBytes { get; set; }
@@ -62,7 +63,7 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
         {
             if (maxLength <= inner.MaxLength) return true;
             GrowthRequests.Add(maxLength);
-            return maxLength <= growLimit && inner.TryGrowTo(maxLength);
+            return (roomToGrow?.Invoke() ?? true) && maxLength <= growLimit && inner.TryGrowTo(maxLength);
         }
         public int CurrentLength => inner.CurrentLength;
         public int MaxLength => inner.MaxLength;
@@ -101,14 +102,15 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
     private bool _firstDisposedBeforeSecondAlloc;
 
     private (TextGenerator Gen, PrefixCache Prefix, List<ReusableKv> Caches) Make(bool exclusive = true, bool canTruncate = true, int headroom = 0, int entries = 2,
-        int growLimit = 0, PrefixCachePolicy policy = PrefixCachePolicy.Lru)
+        int growLimit = 0, PrefixCachePolicy policy = PrefixCachePolicy.Lru, Func<List<ReusableKv>, bool>? roomToGrow = null)
     {
         var caches = new List<ReusableKv>();
         var prefix = new PrefixCache(entries, policy);
+        Func<bool>? room = roomToGrow is null ? null : () => roomToGrow(caches);
         var gen = new TextGenerator(_tiny.Model, new Tok(TinyQwen.Vocab),
             kvCacheFactory: (c, size) =>
             {
-                var k = new ReusableKv(new SimpleKvCache(KvGeometry.FromConfig(c, false), size), exclusive, canTruncate, growLimit);
+                var k = new ReusableKv(new SimpleKvCache(KvGeometry.FromConfig(c, false), size), exclusive, canTruncate, growLimit, room);
                 if (caches.Count == 1) _firstDisposedBeforeSecondAlloc = caches[0].Disposed;
                 caches.Add(k);
                 return k;
@@ -231,6 +233,33 @@ public sealed class PrefixCacheReusableKvTests : IClassFixture<PrefixCacheFailed
         Assert.True(_firstDisposedBeforeSecondAlloc, "the refused entry was still resident when the miss allocated");
         Assert.Equal(1, prefix.EntryCount);
         Assert.False(caches[1].Disposed);
+    }
+
+    /// <summary>
+    /// Issue #1843: a hit whose growth is refused only because ANOTHER retained entry holds the device memory (or, on the CUDA paged
+    /// pool, the blocks) evicts that entry and retries the growth, instead of giving up the hit and re-prefilling the conversation.
+    /// Here a growth fits only while one cache is alive.
+    /// </summary>
+    [Fact]
+    public void RefusedGrowth_EvictsAnotherRetainedEntry_AndKeepsTheHit()
+    {
+        var (gen, prefix, caches) = Make(headroom: 4, growLimit: TinyQwen.Context,
+            roomToGrow: all => all.Count(c => !c.Disposed) <= 1);
+        using var _ = prefix;
+        var first = gen.Generate(Text(A), Opts());
+        int[] unrelated = Ids(20, 41);
+        gen.Generate(Text(unrelated), Opts());                              // a second, unrelated entry is retained beside A's
+        Assert.Equal(2, prefix.EntryCount);
+        int[] next = [.. A, .. first.GeneratedTokenIds, .. Ids(16, 23)];    // outgrows A's cache
+
+        var warm = gen.Generate(Text(next), Opts());
+
+        Assert.Equal(A.Length + MaxTokens - 1, warm.Timings.CachedTokenCount);   // the hit was kept
+        Assert.True(caches[1].Disposed, "the other entry was not evicted");
+        Assert.False(caches[0].Disposed);
+        Assert.Equal(2, caches.Count);                                           // grown in place, no miss allocation
+        Assert.Equal(1, prefix.AdmissionEvictions);
+        Assert.Equal(Cold(next).GeneratedTokenIds, warm.GeneratedTokenIds);
     }
 
     /// <summary>
