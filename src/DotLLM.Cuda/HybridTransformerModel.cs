@@ -1136,6 +1136,10 @@ public sealed unsafe class HybridTransformerModel : IModel
             // LM Head — last token only
             float* lastHidden = hidden + (seqLen - 1) * hiddenSize;
             {
+                // #1851: since #1137 the logits buffer is allocated on demand for the rows the head computes, and this host never
+                // asked for it, so the head wrote through a null pointer (AccessViolation in the LM-head GEMV on every split).
+                _cpuState.EnsureLogitsCapacity(1);
+                logits = (float*)_cpuState.Logits;
                 var rwOutput = _cpuWeights.RepackedOutput ?? default;
                 GemvInterleaved(_cpuWeights.OutputWeight, _cpuWeights.OutputQuantType,
                     lastHidden, logits, _cpuWeights.OutputOutputDim, _cpuWeights.OutputInputDim, in rwOutput);

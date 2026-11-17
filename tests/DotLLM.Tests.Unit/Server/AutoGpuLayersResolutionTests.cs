@@ -87,6 +87,16 @@ public sealed class AutoGpuLayersResolutionTests
     }
 
     [Fact]
+    public void Auto_SplitCandidate_LeadsWhateverOrderTheBackendsAreListedIn()
+    {
+        var tried = new List<string>();
+        DeviceModelLoader.LoadWith(null!, null!, "auto", null, default, 8 * GiB, "m.gguf", _ => { }, _ => { },
+            Devices(Cpu(), Vulkan(), SmallFreeCuda()), (d, _) => { tried.Add(d); return FakeModel(); },
+            autoSplitBlocker: _ => null);
+        Assert.Equal(["gpu:0"], tried);
+    }
+
+    [Fact]
     public void Auto_SplitThatFails_FallsThroughToVulkanThenCpu_WithLayersUnset()
     {
         var tried = new List<(string Device, int? Layers)>();
