@@ -163,10 +163,13 @@ public sealed class CudaAdmissionGpuTests
             using (var logits = model.Forward(Tokens(n, config.VocabSize), Positions(n), 0, kv)) { }
             Assert.True(model.G3ScratchElems > 0, "G3 should have allocated its scratch when it fits");
 
-            // #1848 review: a retained plane is given back when a KV cache is refused. The fake device has room only once the plane
-            // is gone, so the cache is created iff the model released it.
+            // #1848 review: a retained plane is given back when a KV cache is refused and the plane's bytes would make it fit. The
+            // fake device is one byte short while the plane is held (so releasing the plane can help) and has room once it is gone,
+            // so the cache is created iff the model released it.
+            long kvBytes = CudaKvCache.BytesFor(DotLLM.Core.Attention.KvGeometry.FromConfig(config), 512);
+            long shortBy1 = CudaAdmission.ReserveBytes + kvBytes - 1;
             var saved = CudaAdmission.FreeBytesOverride;
-            CudaAdmission.FreeBytesOverride = () => model.G3ScratchElems > 0 ? 0 : 4L << 30;
+            CudaAdmission.FreeBytesOverride = () => model.G3ScratchElems > 0 ? shortBy1 : 4L << 30;
             try
             {
                 using var kv = model.CreateKvCache(512);
