@@ -65,9 +65,13 @@ public sealed record ModelLoadRequest
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Device { get; init; }
 
-    /// <summary>Layers on GPU; a negative value (-1) means "all layers" and overrides profile/startup defaults.</summary>
+    /// <summary>
+    /// Layers on GPU: a count, <c>"all"</c> / -1 ("all layers", overriding profile/startup defaults) or <c>"auto"</c> (#1851). Any
+    /// other value is refused, as on the CLI.
+    /// </summary>
     [JsonPropertyName("gpu_layers")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonConverter(typeof(DotLLM.Core.Configuration.GpuLayersJsonConverter))]
     public int? GpuLayers { get; init; }
 
     [JsonPropertyName("cache_type_k")]

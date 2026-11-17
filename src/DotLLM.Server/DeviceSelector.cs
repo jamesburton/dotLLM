@@ -19,15 +19,35 @@ public static class DeviceSelector
 
     /// <summary>Same, from an explicit device description (testable).</summary>
     public static IReadOnlyList<string> Candidates(long modelBytes, Models.DeviceListResponse devices)
+        => Candidates(modelBytes, devices, autoSplit: false, out _);
+
+    /// <summary>
+    /// Same, and with <paramref name="autoSplit"/> (#1851) a CUDA device the whole model does not fit is still tried first, as an
+    /// automatic GPU/CPU layer split (<c>--gpu-layers auto</c>), reported in <paramref name="splitCandidate"/>: the dGPU tier comes
+    /// before Vulkan and the CPU.
+    /// </summary>
+    /// <param name="modelBytes">Size of the model's weights.</param>
+    /// <param name="devices">The machine's devices.</param>
+    /// <param name="autoSplit">Whether this model can be split automatically.</param>
+    /// <param name="splitCandidate">The CUDA candidate that is to be loaded as an automatic split, or null.</param>
+    /// <returns>The candidates, best first, ending in <c>cpu</c>.</returns>
+    public static IReadOnlyList<string> Candidates(long modelBytes, Models.DeviceListResponse devices, bool autoSplit, out string? splitCandidate)
     {
+        splitCandidate = null;
         var order = new List<string>();
         foreach (var backend in devices.Backends ?? [])
         {
             if (!backend.Servable) continue;
             if (backend.Name == "cuda")
             {
-                var best = (backend.Devices ?? []).Where(d => d.DeviceString is not null && FitsCuda(modelBytes, d))
-                    .OrderByDescending(d => d.FreeMemoryBytes ?? d.TotalMemoryBytes ?? 0).FirstOrDefault();
+                var usable = (backend.Devices ?? []).Where(d => d.DeviceString is not null)
+                    .OrderByDescending(d => d.FreeMemoryBytes ?? d.TotalMemoryBytes ?? 0).ToList();
+                var best = usable.FirstOrDefault(d => FitsCuda(modelBytes, d));
+                if (best is null && autoSplit && usable.Count > 0)
+                {
+                    best = usable[0];
+                    splitCandidate = best.DeviceString;
+                }
                 if (best is not null) order.Insert(0, best.DeviceString!);   // CUDA first
             }
             else if (backend.Name == "vulkan" && backend.Devices is { Length: > 0 } vk
@@ -68,7 +88,10 @@ public static class DeviceSelector
     /// <param name="devices">The machine's device inventory.</param>
     /// <param name="fullOffload">False when <c>--gpu-layers</c> asks for a partial offload, which exempts it from the free-memory refusal.</param>
     /// <returns>The candidate devices, or the error.</returns>
-    public static DevicePlan Plan(DeviceSpec spec, long modelBytes, Models.DeviceListResponse devices, bool fullOffload = true)
+    /// <param name="autoSplit">Whether the model can be split across a CUDA device and the CPU (#1851). Under <c>auto</c> it keeps a
+    /// CUDA device the whole model does not fit as a split candidate; for an explicit CUDA device that does not fit it adds the
+    /// <c>--gpu-layers auto</c> hint to the refusal.</param>
+    public static DevicePlan Plan(DeviceSpec spec, long modelBytes, Models.DeviceListResponse devices, bool fullOffload = true, bool autoSplit = false)
     {
         var backends = devices.Backends ?? [];
         switch (spec.Kind)
@@ -78,9 +101,9 @@ public static class DeviceSelector
 
             case DeviceKind.Auto:
             {
-                var candidates = Candidates(modelBytes, devices);
+                var candidates = Candidates(modelBytes, devices, autoSplit, out string? split);
                 string? warn = candidates[0] == "cpu" ? NoGpuWarning(backends, modelBytes) : null;
-                return new DevicePlan(spec, candidates, null, warn);
+                return new DevicePlan(spec, candidates, null, warn) { SplitCandidate = split };
             }
 
             case DeviceKind.Cuda:
@@ -98,7 +121,8 @@ public static class DeviceSelector
                             Environment.GetEnvironmentVariable(Core.Configuration.DeviceMemoryBudget.ReserveEnvVar))))
                         return new DevicePlan(spec, [], $"the model's {Gib(modelBytes)} of weights exceed the {Gib(free)} free on {want} "
                             + (modelBytes <= free ? $"once the {Core.Configuration.DeviceMemoryBudget.ReserveEnvVar} reserve is kept free " : "")
-                            + $"({(dev.TotalMemoryBytes is { } t ? Gib(t) + " total; " : "")}other models or processes hold the rest)", null);
+                            + $"({(dev.TotalMemoryBytes is { } t ? Gib(t) + " total; " : "")}other models or processes hold the rest); "
+                            + (autoSplit ? AutoGpuLayersHint : "use a smaller quantization or free GPU memory"), null);
                     return new DevicePlan(spec, [want], null, null);
                 }
                 // Distinguish "no CUDA here" (this branch: nothing was attempted) from "CUDA present but the load failed" (a load-time error
@@ -125,6 +149,10 @@ public static class DeviceSelector
             }
         }
     }
+
+    /// <summary>The remedy an explicit GPU request whose weights do not fit is given (#1851): it is never split behind the user's back.</summary>
+    public const string AutoGpuLayersHint =
+        "pass --gpu-layers auto to keep only the layers that fit on the GPU and run the rest on the CPU (or --gpu-layers N)";
 
     private static string Gib(long bytes) => $"{bytes / (1024.0 * 1024 * 1024):F1} GiB";
 

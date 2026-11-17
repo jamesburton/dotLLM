@@ -179,8 +179,10 @@ public static class ServerStartup
             string name = ModelIdFor(options.Model, resolvedPath);
             if (spec.IsGpu)
             {
+                // -1 is "all layers"; auto (#1851) is sized by the loader, like an explicit partial count.
                 var plan = DeviceSelector.Plan(spec, bytes, Endpoints.DeviceEndpoint.Describe(),
-                    fullOffload: options.GpuLayers is null or < 0 && !ExpertOffloadPossible(resolvedPath, options.MoeOffload));
+                    fullOffload: options.GpuLayers is null or -1 && !ExpertOffloadPossible(resolvedPath, options.MoeOffload),
+                    autoSplit: spec.Kind == DeviceKind.Cuda && options.GpuLayers is null && AutoSplitBlocker(resolvedPath, options) is null);
                 if (plan.Error is not null)
                     throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(options.Device, name, bytes, plan.Error));
             }
@@ -203,15 +205,21 @@ public static class ServerStartup
         // WARNING (console + ServerState.DeviceFallbackWarning -> /props) rather than a quiet log line (#733).
         Exception? last = null;
         var gpuFailures = new List<string>();
-        var autoPlan = DeviceSelector.Plan(spec, ModelResolver.FileLength(resolvedPath), Endpoints.DeviceEndpoint.Describe());
+        string? splitBlocker = options.GpuLayers is null or GpuOffloadPlanner.AutoGpuLayers ? AutoSplitBlocker(resolvedPath, options) : "explicit --gpu-layers";
+        var autoDevices = Endpoints.DeviceEndpoint.Describe();
+        var autoPlan = DeviceSelector.Plan(spec, ModelResolver.FileLength(resolvedPath), autoDevices, autoSplit: splitBlocker is null);
+        if (options.GpuLayers is null)
+            DeviceModelLoader.LogSkippedSplit(autoPlan, autoDevices, splitBlocker, m => Console.WriteLine($"[dotllm] {m}"));
         foreach (string device in autoPlan.Candidates)
         {
             if (options.TernaryAdapterPaths is { Count: > 0 } && TernaryAdapterAttach.BackendHasNoHook(device)) continue;   // no CUDA model has the residual hook (#1711): never load a GPU model the adapters cannot attach to
             try
             {
                 Console.WriteLine($"[dotllm] --device auto: trying {device}");
-                var loaded = LoadModelCore(resolvedPath, options with { Device = device });
-                loaded.Options = loaded.Options with { Device = options.Device, ResolvedDevice = device, DeviceFallbackWarning = null };   // (#1822) set below when it fell back
+                // #1851: a CUDA device the whole model does not fit is loaded as an automatic GPU/CPU layer split.
+                int? layers = options.GpuLayers is null && device == autoPlan.SplitCandidate ? GpuOffloadPlanner.AutoGpuLayers : options.GpuLayers;
+                var loaded = LoadModelCore(resolvedPath, options with { Device = device, GpuLayers = layers });
+                loaded.Options = loaded.Options with { Device = options.Device, GpuLayers = options.GpuLayers, ResolvedDevice = device, DeviceFallbackWarning = null };   // (#1822) set below when it fell back
                 if (device == "cpu" && (gpuFailures.Count > 0 || autoPlan.CpuWarning is not null))
                 {
                     // Auto on the CPU always warns: after a failed GPU load (reason + consequence), or because no GPU was servable at all.
@@ -240,7 +248,9 @@ public static class ServerStartup
     /// request is clamped to <c>[0, numLayers]</c>; unset on a non-GPU device is 0.
     /// </summary>
     public static int ResolveGpuLayers(int? requested, string device, int numLayers) =>
-        requested is < 0 ? numLayers
+        GpuOffloadPlanner.IsAuto(requested)
+            ? throw new ArgumentException("--gpu-layers auto is resolved by the loader (CudaAutoSplit), not by a layer count.", nameof(requested))
+        : requested is < 0 ? numLayers
         : requested.HasValue ? Math.Clamp(requested.Value, 0, numLayers)
         : DeviceSpec.TryParse(device, out var spec, out _) && spec.Kind == DeviceKind.Cuda ? numLayers : 0;
 
@@ -515,6 +525,22 @@ public static class ServerStartup
     /// Whether the GGUF at <paramref name="path"/> is a <c>nemotron_h_moe</c> model whose routed experts may be offloaded
     /// (#1070), read from its metadata; false when the file cannot be read.
     /// </summary>
+    /// <summary>Why the GPU/CPU split host cannot run the model at <paramref name="path"/> (#1851), or null when it can.</summary>
+    private static string? AutoSplitBlocker(string path, ServerOptions options)
+    {
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            // The config the load will use: --rope-scaling and friends can turn YaRN on (or off), which decides the split (#432).
+            var config = GgufModelConfigExtractor.ApplyRoPEOverride(GgufModelConfigExtractor.Extract(gguf.Metadata), options.RopeOverride);
+            return DotLLM.Cuda.CudaAutoSplit.Blocker(gguf, config);
+        }
+        catch (Exception ex)
+        {
+            return $"the model could not be inspected ({ex.Message})";
+        }
+    }
+
     private static bool ExpertOffloadPossible(string path, DotLLM.Core.Moe.MoeOffloadOptions? moeOffload)
     {
         try
@@ -621,7 +647,7 @@ public static class ServerStartup
             gguf, config, options.Device, options.GpuLayers, threading,
             msg => Console.WriteLine($"[dotllm] {msg}"),
             w => Console.WriteLine($"[dotllm] WARNING: {w}"),
-            options.MoeOffload);
+            options.MoeOffload, options.PrefillChunkSize ?? 0);
         // Only the Vulkan models' KV factory is wired here (CUDA/hybrid models keep their own per-request caches).
         Func<int, IKvCache>? vulkanKvFactory = DeviceSpec.Parse(options.Device).Kind == DeviceKind.Vulkan ? deviceKvFactory : null;
 
@@ -746,7 +772,8 @@ public static class ServerStartup
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
             if (kvConfig.IsQuantized)
-                Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: the hybrid GPU/CPU model owns its KV cache and has no quantized storage (model {config.Architecture}).");
+                Console.WriteLine($"[dotllm] --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) does not apply to the GPU/CPU split: its KV is " +
+                                  $"F16 on the GPU layers and {(DotLLM.Cuda.HybridTransformerModel.TailUsesQ8_0(config.HeadDim) ? "q8_0" : "f16")} on the CPU tail.");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3SplitModel)
@@ -873,8 +900,11 @@ public static class ServerStartup
 
         // #1862: the prefill chunk this server uses. An explicit --prefill-chunk-size (0 included) wins; otherwise the dense CUDA
         // non-paged f16 path chunks by default, so its context fit charges a fixed forward scratch instead of a per-token one.
-        int prefillChunk = ResolvePrefillChunk(options.PrefillChunkSize,
-            IsCudaDenseF16NonPaged(model, cudaPagedFactory is not null, kvConfig));
+        // #1851: a GPU/CPU split always prefills in chunks (1024 unless a positive --prefill-chunk-size), the scratch it was planned for.
+        bool splitModel = model is DotLLM.Cuda.HybridTransformerModel;
+        int prefillChunk = splitModel
+            ? DotLLM.Cuda.CudaAutoSplit.SplitPrefillChunk(options.PrefillChunkSize ?? 0)
+            : ResolvePrefillChunk(options.PrefillChunkSize, IsCudaDenseF16NonPaged(model, cudaPagedFactory is not null, kvConfig));
         PrefixCache? prefixCache = !options.PromptCacheEnabled ? null
             : !deviceOwnedPrefixKv ? new PrefixCache(options.PromptCacheSize, options.PromptCachePolicy)
             : new PrefixCache(Math.Min(options.PromptCacheSize, VulkanPrefixCacheMaxEntries), options.PromptCachePolicy);
@@ -940,7 +970,8 @@ public static class ServerStartup
             recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions());
         if (prefillChunk > 0)
             Console.WriteLine($"[dotllm] Prefill chunk size: {prefillChunk} tokens per forward pass" +
-                              (options.PrefillChunkSize is null ? " (dense CUDA default; --prefill-chunk-size 0 for one pass)" : ""));
+                              (splitModel && prefillChunk != options.PrefillChunkSize ? " (GPU/CPU split default; --prefill-chunk-size overrides)"
+                               : options.PrefillChunkSize is null ? " (dense CUDA default; --prefill-chunk-size 0 for one pass)" : ""));
         if (options.PromptLookup is { } lookup)
             Console.WriteLine($"[dotllm] Prompt lookup: up to {lookup.DraftTokens} drafts, n-gram {lookup.MinNgram}..{lookup.MaxNgram} (greedy requests; continuous batching off)");
         if (generator.RecurrentStepCheckpointBytes > 0)
@@ -979,6 +1010,14 @@ public static class ServerStartup
                 (options.ContextSize is > 0 ? " (--ctx-size" + (options.ContextSize > config.MaxSequenceLength ? $" {options.ContextSize} reduced to fit the device" : "") + ")" : " (default)") +
                 $"; K/V + indexer {perToken / 1024.0:F1} KiB/token ({DotLLM.Vulkan.VulkanQwen4ExpTransformerModel.KvStorage.ToString().ToLowerInvariant()} K/V), " +
                 $"{perToken * (long)config.MaxSequenceLength / 1048576.0:F0} MiB if the window fills (allocated lazily). Raise with --ctx-size.");
+        }
+        else if (model is DotLLM.Cuda.HybridTransformerModel split)
+        {
+            // #1851: an automatic split was sized for --ctx-size (default 4096) of KV, and its Config carries that window; serve
+            // and report it, so a longer request is refused at admission instead of failing on a position past the window.
+            config = split.Config;
+            Console.WriteLine($"[dotllm] Context window: {config.MaxSequenceLength} tokens ({split.NumGpuLayers} GPU + " +
+                              $"{config.NumLayers - split.NumGpuLayers} CPU layers).");
         }
         else if (model is IContextLimitable limitable)
             config = ApplyRequestedContextSize(model, limitable, options);

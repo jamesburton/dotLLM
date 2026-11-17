@@ -49,8 +49,10 @@ public sealed record ModelProfile
     /// <summary>Device this model loads on (<c>cpu</c>, <c>vulkan</c>, <c>gpu:0</c>); the server default otherwise.</summary>
     [JsonPropertyName("device")] public string? Device { get; init; }
 
-    /// <summary>GPU layers for a partial offload.</summary>
-    [JsonPropertyName("gpu_layers")] public int? GpuLayers { get; init; }
+    /// <summary>GPU layers for a partial offload: a count, <c>"all"</c> / -1, or <c>"auto"</c> (#1851).</summary>
+    [JsonPropertyName("gpu_layers")]
+    [JsonConverter(typeof(DotLLM.Core.Configuration.GpuLayersJsonConverter))]
+    public int? GpuLayers { get; init; }
 
     /// <summary>Keep-alive seconds for this model (0 = unload after each request, negative = never).</summary>
     [JsonPropertyName("keep_alive")] public double? KeepAlive { get; init; }
