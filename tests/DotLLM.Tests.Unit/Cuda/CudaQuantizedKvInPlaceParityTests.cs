@@ -144,10 +144,13 @@ public sealed class CudaQuantizedKvInPlaceParityTests
     /// on the kvq tensor-core kernel at its position offset, and must match one pass: identical greedy tokens, a first-token
     /// logprob within 0.02 nats, and a small mean KL. The one-pass arm reads the same quantized rows, so only GEMM M and the
     /// chunk's offset differ. The legacy oracle (dequant scratch, unchunked) is reported for #1846.
+    /// <para>No q4_0 arm: q4_0 KV is degraded on this fixture (KL vs F16 KV 0.68-0.97), so q4_0 rounding turns chunking's GEMM-M
+    /// drift into KL ~0.1 on the scalar kernel too (0.105 scalar, 0.110 tensor-core, framework 2026-11-17). It cannot tell a
+    /// right kernel from a wrong one here; <c>CudaAttentionKvqTests</c> covers q4_0 at an offset against the scalar kernel.
+    /// Mutant (positionOffset passed as 0 to the tensor-core launch) moved q8_0 KL from 5e-4 to 1.7.</para>
     /// </summary>
     [SkippableTheory]
     [InlineData(KvCacheDType.Q8_0)]
-    [InlineData(KvCacheDType.Q4_0)]
     public void ChunkedPrefill_MatchesOnePass_OnTheTensorCoreKernelAtEachOffset(KvCacheDType type)
     {
         using var env = Load(out var model, out int[] prompt);
