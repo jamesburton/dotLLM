@@ -4923,9 +4923,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     public Architectures.HybridContextFit MeasureServingContextFit(KvCacheConfig kv, int prefillChunkTokens)
     {
         _context.MakeCurrent();
-        // #1850: G3 runs only over the plain f16 CudaKvCache. A q8_0 / q4_0 cache reads in place (attention_kvq / the tensor-core
-        // kvq prefill) and TurboQuant runs attention_f16, so the plane is never used there: free a plane warm-up left behind
-        // and charge none, instead of losing up to RetainedMaxElems x 6 B (384 MiB) of window to it.
+        // #1850: a q8_0 / q4_0 cache reads in place (attention_kvq / the tensor-core kvq prefill), so G3's plane is never used
+        // over it: free a plane warm-up left behind and charge none, instead of losing up to RetainedMaxElems x 6 B (384 MiB) of
+        // window to it.
         bool g3Serves = G3ServesKvCache(kv);
         if (!g3Serves && _g3Attention.PlaneElems > 0)
         {
@@ -4949,12 +4949,13 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     }
 
     /// <summary>
-    /// Whether attention over a dense cache of <paramref name="kv"/> can take G3 (#1850): only the plain f16 <see cref="CudaKvCache"/>
-    /// does. q8_0 / q4_0 (<see cref="CudaQuantizedKvCache"/>) read in place and TurboQuant runs <c>attention_f16</c>.
+    /// Whether attention over the dense cache <see cref="CreateKvCache(int, Core.Configuration.KvCacheConfig)"/> builds for <paramref name="kv"/> can take G3 (#1850):
+    /// q8_0 / q4_0 (<see cref="CudaQuantizedKvCache"/>) read in place and never do; everything else gets the f16
+    /// <see cref="CudaKvCache"/>, which does (TurboQuant included: <see cref="KvCacheConfig.IsQuantized"/> is false for it).
     /// </summary>
     /// <param name="kv">KV storage types.</param>
     /// <returns>Whether G3 may run over that cache.</returns>
-    internal static bool G3ServesKvCache(KvCacheConfig kv) => !kv.IsQuantized && !kv.IsTurboQuant;
+    internal static bool G3ServesKvCache(KvCacheConfig kv) => !kv.IsQuantized;
 
     /// <summary>
     /// G3 score-plane bytes the dense context fit charges as fixed (#1848 / #1862): 0 when G3 cannot run; otherwise the plane kept
