@@ -55,6 +55,12 @@ minutes, so a brand-new version can be downloadable before `dnx` resolves it. Th
 
 Only the tool package is pushed; the `DotLLM.*` libraries are still packed (so a build proves they pack) but not published.
 
+**HIP payload.** Native archives (including experimental AOT archives) and the dotnet-tool package carry `co/dense_f16.co` and
+`co/rmsnorm.co` beside the application. The precompiled files in `native/hip/co/` must be refreshed with the kernel sources;
+release jobs do not install a HIP compiler. Payload checks fail when either file is missing. HIP remains explicit-only and
+requires the installed AMD runtime; only Windows x64 has the direct model-loading path. DirectStorage DLLs remain excluded
+from all release artifacts (`DotLLMBundleDirectStorage=false`). See [HIP.md](HIP.md).
+
 **`DotLLM.ChunkCache.Client` is the one MIT package** (its own `PackageLicenseExpression` override and
 `src/DotLLM.ChunkCache.Client/LICENSE`; everything else is `GPL-3.0-only`). It stays pure HTTP plus DTOs with no reference to
 any GPL `DotLLM.*` project; its one package dependency is `Microsoft.Extensions.AI.Abstractions` (MIT, pinned in

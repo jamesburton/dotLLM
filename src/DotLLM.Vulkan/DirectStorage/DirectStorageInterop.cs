@@ -1,6 +1,10 @@
 using System.Runtime.InteropServices;
 
+#if DOTLLM_HIP_DIRECTSTORAGE
+namespace DotLLM.Hip.DirectStorage;
+#else
 namespace DotLLM.Vulkan.DirectStorage;
+#endif
 
 /// <summary>
 /// Hand-rolled, allocation-free COM interop for the handful of D3D12 / DXGI / DirectStorage calls #1304 needs. Plain

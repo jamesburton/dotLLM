@@ -1938,7 +1938,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
     public static void EnsureQuantExpansionAllowed(
         QuantizationType qt, string tensorLabel, long compactBytes, long expandedBytes)
     {
-        if (AllowQuantExpansion) return;
+        // BF16 to F16 keeps storage width but narrows the representable range.
+        if (AllowQuantExpansion || (qt == QuantizationType.BF16 && compactBytes == expandedBytes)) return;
         throw new InvalidOperationException(
             $"CUDA has no native kernel for quantization type {qt} on '{tensorLabel}'. Running "
             + $"this model on CUDA as-is would silently expand this tensor from "

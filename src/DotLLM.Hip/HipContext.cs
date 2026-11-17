@@ -34,6 +34,7 @@ public sealed class HipContext : IDisposable
     /// <param name="deviceId">Device ordinal (0-based).</param>
     public static HipContext Create(int deviceId)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(deviceId);
         HipLibraryResolver.Register();
         HipDriverApi.hipInit(0).ThrowOnError();
         HipDriverApi.hipSetDevice(deviceId).ThrowOnError();
@@ -43,6 +44,7 @@ public sealed class HipContext : IDisposable
     /// <summary>Makes this device current on the calling thread.</summary>
     public void MakeCurrent()
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         HipDriverApi.hipSetDevice(DeviceId).ThrowOnError();
     }
 
@@ -52,6 +54,11 @@ public sealed class HipContext : IDisposable
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         // Primary context lifecycle is owned by the HIP runtime. Syncing here
         // ensures any pending kernels finish before the process tears down.
-        try { HipDriverApi.hipDeviceSynchronize(); } catch { /* best-effort */ }
+        try
+        {
+            HipDriverApi.hipSetDevice(DeviceId).ThrowOnError();
+            HipDriverApi.hipDeviceSynchronize();
+        }
+        catch { /* best-effort */ }
     }
 }

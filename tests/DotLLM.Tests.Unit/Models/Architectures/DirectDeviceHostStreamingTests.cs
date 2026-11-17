@@ -30,6 +30,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 public sealed class DirectDeviceHostStreamingTests : IDisposable
 {
     private readonly string _scratch;
+    private readonly List<SafetensorsFile> _files = [];
 
     public DirectDeviceHostStreamingTests()
     {
@@ -39,6 +40,8 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
 
     public void Dispose()
     {
+        foreach (var file in _files)
+            file.Dispose();
         try { Directory.Delete(_scratch, recursive: true); } catch { /* best-effort */ }
     }
 
@@ -89,26 +92,26 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
     }
 
     [Fact]
-    public void MixedLlama_StreamsOnlyOwnedUpcasts_MmapViewsUntouched()
+    public void FusedGateUp_StreamsOnlyOwnedSplits_MmapViewsUntouched()
     {
-        // gate_proj is BF16 (→ owned F32 upcast); everything else is F32 (→ mmap view).
-        using var w = LoadLlamaWeights(numLayers: 3, gateAsBf16: true);
+        // Fused BF16 gate/up splits require owned F32 buffers; dense tensors remain borrowed.
+        using var w = LoadLlamaWeights(numLayers: 3, gateAsBf16: true, fusedGateUp: true);
         try
         {
-            // Exactly one owned allocation per layer (the gate upcast). q/k/v/o/up/down
+            // Exactly two owned allocations per layer (gate/up splits). q/k/v/o/down
             // are zero-copy mmap views and are NOT owned.
-            Assert.Equal(3, w.LiveOwnedAllocationCount);
+            Assert.Equal(6, w.LiveOwnedAllocationCount);
 
             // Releasing an mmap view is a no-op and never decrements the owned count.
             ref readonly var l0 = ref w.Layers[0];
             Assert.False(w.TryReleaseOwnedHostAllocation(l0.QWeight));   // F32 mmap
             Assert.False(w.TryReleaseOwnedHostAllocation(l0.DownWeight)); // F32 mmap
             Assert.False(w.TryReleaseOwnedHostAllocation(w.TokenEmbedWeight)); // F32 mmap embed
-            Assert.Equal(3, w.LiveOwnedAllocationCount);
+            Assert.Equal(6, w.LiveOwnedAllocationCount);
 
-            // Simulated upload frees exactly the 3 owned gate upcasts, nothing else.
+            // Simulated upload frees all six owned gate/up splits, nothing else.
             int freed = SimulateStreamedUpload(w);
-            Assert.Equal(3, freed);
+            Assert.Equal(6, freed);
             Assert.Equal(0, w.LiveOwnedAllocationCount);
         }
         finally
@@ -122,19 +125,33 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
     [Fact]
     public void OwnedRelease_IsIdempotent_NoDoubleFree()
     {
-        using var w = LoadLlamaWeights(numLayers: 1, gateAsBf16: true);
+        using var w = LoadLlamaWeights(numLayers: 1, gateAsBf16: true, fusedGateUp: true);
         try
         {
             nint gate = w.Layers[0].GateWeight;
             Assert.True(w.TryReleaseOwnedHostAllocation(gate));  // first free
             Assert.False(w.TryReleaseOwnedHostAllocation(gate)); // idempotent — already gone
             Assert.False(w.TryReleaseOwnedHostAllocation(gate)); // still safe
+            Assert.Equal(1, w.LiveOwnedAllocationCount);
+            Assert.True(w.TryReleaseOwnedHostAllocation(w.Layers[0].UpWeight));
             Assert.Equal(0, w.LiveOwnedAllocationCount);
         }
         finally
         {
             w.Dispose();
         }
+    }
+
+    [Fact]
+    public void DenseBf16_IsBorrowed_StreamingDoesNotReleaseIt()
+    {
+        using var w = LoadLlamaWeights(numLayers: 1, gateAsBf16: true);
+        nint mappedGate = _files[0].GetTensorPointer("model.layers.0.mlp.gate_proj.weight");
+        Assert.Equal(mappedGate, w.Layers[0].GateWeight);
+        Assert.Equal(QuantizationType.BF16, w.Layers[0].GateQuantType);
+        Assert.Equal(0, w.LiveOwnedAllocationCount);
+        Assert.False(w.TryReleaseOwnedHostAllocation(mappedGate));
+        Assert.Equal(0, SimulateStreamedUpload(w));
     }
 
     [Fact]
@@ -192,7 +209,7 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
 
     // ────────────────────────── fixtures ──────────────────────────
 
-    private TransformerWeights LoadLlamaWeights(int numLayers, bool gateAsBf16)
+    private TransformerWeights LoadLlamaWeights(int numLayers, bool gateAsBf16, bool fusedGateUp = false)
     {
         var rng = new Random(42);
         var b = new SafetensorsFixtureBuilder();
@@ -208,17 +225,21 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
             b.AddFloat32($"{p}.self_attn.k_proj.weight", [NumHeads * HeadDim, Hidden], Rand(rng, NumHeads * HeadDim * Hidden));
             b.AddFloat32($"{p}.self_attn.v_proj.weight", [NumHeads * HeadDim, Hidden], Rand(rng, NumHeads * HeadDim * Hidden));
             b.AddFloat32($"{p}.self_attn.o_proj.weight", [Hidden, NumHeads * HeadDim], Rand(rng, Hidden * NumHeads * HeadDim));
-            if (gateAsBf16)
+            if (fusedGateUp)
+                AddBf16($"{p}.mlp.gate_up_proj.weight", [2 * Intermediate, Hidden], b, rng);
+            else if (gateAsBf16)
                 AddBf16($"{p}.mlp.gate_proj.weight", [Intermediate, Hidden], b, rng);
             else
                 b.AddFloat32($"{p}.mlp.gate_proj.weight", [Intermediate, Hidden], Rand(rng, Intermediate * Hidden));
-            b.AddFloat32($"{p}.mlp.up_proj.weight", [Intermediate, Hidden], Rand(rng, Intermediate * Hidden));
+            if (!fusedGateUp)
+                b.AddFloat32($"{p}.mlp.up_proj.weight", [Intermediate, Hidden], Rand(rng, Intermediate * Hidden));
             b.AddFloat32($"{p}.mlp.down_proj.weight", [Hidden, Intermediate], Rand(rng, Hidden * Intermediate));
         }
         string path = Path.Combine(_scratch, $"llama-{numLayers}-{gateAsBf16}.safetensors");
         b.WriteTo(path);
 
         var file = SafetensorsFile.Open(path);
+        _files.Add(file);
         var config = new ModelConfig
         {
             Architecture = Architecture.Llama,
@@ -233,9 +254,7 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
             NormEpsilon = 1e-5f,
             RoPEConfig = new RoPEConfig(Theta: 10000.0f, DimensionCount: HeadDim, Type: RoPEType.Norm),
         };
-        // The loader copies BF16 into owned scratch and wires F32 as mmap views; the file
-        // must outlive the weights (mmap anchor). We dispose it at test end via Dispose of
-        // the scratch dir; keep it alive by not disposing here (fine for a unit test's lifetime).
+        // Keep mapped storage alive until each test has disposed its weights.
         return TransformerWeightsSafetensorsLoader.Load(file, config);
     }
 
@@ -264,6 +283,7 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
         b.WriteTo(path);
 
         var file = SafetensorsFile.Open(path);
+        _files.Add(file);
         var config = new ModelConfig
         {
             Architecture = Architecture.BitNet,

@@ -145,7 +145,8 @@ public static class MessagesEndpoint
             return;
         }
 
-        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError, state.ChatTemplate);
+        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError,
+            HfServerChatTemplate.Select(state.ChatTemplate, tools is { Length: > 0 }));
         if (planError is not null)
         {
             await WriteErrorAsync(httpContext, 400, "invalid_request_error", planError);

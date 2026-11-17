@@ -707,6 +707,20 @@ SPIR-V missing, load failure) fails with what/why/model-vs-device-memory and the
 `auto` ending on the CPU always sets `device_fallback_warning` in `/props` (no GPU servable, or the GPU load failed and why) and prints it at startup.
 `/props` reports `device` (as requested) and `resolved_device` (as loaded) for every load path, explicit or `auto`; `dotllm ps` shows the same.
 
+Experimental AMD HIP is selected explicitly with `--device hip` (device 0) or `hip:N`; `auto` does not select it.
+It supports dense Llama GGUF (F16/Q4_0/Q8_0 matrices) and HF SafeTensors (F16 matrices) on Windows x64, with required DirectStorage loading and per-request device KV pages.
+K and V independently select F16 or Q8_0; Q8_0 requires head dimensions divisible by 32. Partial layer offload, F32/Q4_0 KV and mixed-precision windows fail explicitly. `/v1/devices` reports per-device HIP readiness;
+the WebUI lists only usable HIP devices and keeps them explicit choices. See [HIP.md](HIP.md) for prerequisites and limits.
+
+HIP defaults to F16 KV. Q8_0 uses the standard cache-type options without a HIP-specific environment gate. Q8 failed the original 1K–8K logit quality gates; see [precision measurements](PRECISION.md#actual-1k8k-histories).
+
+Local HuggingFace directories also load on CPU (`cpu` or `auto`). The existing HF config,
+tokenizer and single-file/sharded readers are reused. A model owns its SafeTensors source
+through active and resident states; replacement, eviction, unload and shutdown release it.
+Declared templates are validated before weight allocation, including named tool templates.
+HF serving currently rejects overlays, adapters, context/RoPE overrides, expert offload and
+speculative decoding options. Packed AWQ/GPTQ support on CPU does not imply HIP support.
+
 ## GPU memory on Windows: no silent spill into system RAM (#1068)
 
 On Windows the NVIDIA driver (WDDM) does not fail a CUDA allocation that exceeds dedicated VRAM by default. It backs the

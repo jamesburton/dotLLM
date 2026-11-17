@@ -112,7 +112,8 @@ public static class ChatCompletionEndpoint
             return;
         }
         var (engineMessages, messages, tools, toolChoice, constrained, templateOptions, prompt) = rendered;
-        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError, state.ChatTemplate);
+        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError,
+            HfServerChatTemplate.Select(state.ChatTemplate, tools is { Length: > 0 }));
         if (planError is not null)
         {
             await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(planError, param: "reasoning_format"), keepAlive);
