@@ -3987,9 +3987,14 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// generic FP16 layer loops, which have no Gemma ops; loading Gemma 1/2 through them would
     /// silently produce wrong logits. Refuse loudly instead.
     /// </summary>
-    internal static void RejectGemmaForCompositeHost(ModelConfig config, string host)
+    /// <param name="config">Model configuration.</param>
+    /// <param name="host">Host name for the message.</param>
+    /// <param name="allowFoldedGraniteScalars">The host applies a Granite attention multiplier that folds into RoPE
+    /// (<see cref="ModelConfig.GraniteScalarsFoldIntoRope"/>, TwIL-8B) on every layer it runs (#1851).</param>
+    internal static void RejectGemmaForCompositeHost(ModelConfig config, string host, bool allowFoldedGraniteScalars = false)
     {
-        if (UsesF32DenseForward(config) || config.HasGraniteScalars || config.QkNormWholeProjection
+        bool graniteScalars = config.HasGraniteScalars && !(allowFoldedGraniteScalars && config.GraniteScalarsFoldIntoRope);
+        if (UsesF32DenseForward(config) || graniteScalars || config.QkNormWholeProjection
             || config.NoRopeLayers is { Count: > 0 })
             throw new NotSupportedException(
                 $"{config.Architecture} (GGUF 'gemma'/'gemma2'/'gemma3'/'granite'/'smollm3'/'olmo2'/'olmoe') is not supported by {host}: its layer loop has no "
@@ -4896,7 +4901,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <param name="geometry">KV row widths.</param>
     /// <param name="kv">KV storage types.</param>
     /// <param name="activationBytesPerToken">Forward scratch bytes per token (<see cref="CudaForwardState.ActivationBytesPerToken"/>).</param>
-    /// <param name="chunkedPrefill">Whether prefill is chunked (<c>--prefill-chunk</c>).</param>
+    /// <param name="chunkedPrefill">Whether prefill is chunked (<c>--prefill-chunk-size</c>).</param>
     /// <returns>Bytes per token.</returns>
     internal static long DenseContextBytesPerToken(KvGeometry geometry, KvCacheConfig kv, long activationBytesPerToken, bool chunkedPrefill)
     {
@@ -4913,7 +4918,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// retained prefix entries before it refuses a new cache (<c>TextGenerator</c>), so they need no share of the fit.
     /// </summary>
     /// <param name="kv">KV storage types the server will use.</param>
-    /// <param name="prefillChunkTokens">The prefill chunk (<c>--prefill-chunk</c>), 0 when prefill is not chunked.</param>
+    /// <param name="prefillChunkTokens">The prefill chunk (<c>--prefill-chunk-size</c>), 0 when prefill is not chunked.</param>
     /// <returns>The fit and the numbers behind it.</returns>
     public Architectures.HybridContextFit MeasureServingContextFit(KvCacheConfig kv, int prefillChunkTokens)
     {
@@ -4929,16 +4934,37 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         return FitDenseContext(
             CudaAdmission.QueryFreeBytes(), CudaAdmission.ReserveBytes, _state.PendingLazyScratchBytes, _state.SequenceBytes, chunkScratch,
             g3PlaneHeldBytes: _g3Attention.PlaneElems * CudaG3Attention.ScratchBytesPerElement,
-            g3PlaneMaxBytes: _g3Attention.MayRun ? CudaG3Attention.RetainedMaxElems * CudaG3Attention.ScratchBytesPerElement : 0,
+            g3PlaneMaxBytes: G3PlaneChargeBytes(_g3Attention.MayRun, prefillChunkTokens, Config.NumAttentionHeads),
             perTokenBytes: DenseContextBytesPerToken(KvGeometry.FromConfig(Config), kv, _state.ActivationBytesPerToken, chunked),
             NativeMaxSequenceLength);
+    }
+
+    /// <summary>
+    /// G3 score-plane bytes the dense context fit charges as fixed (#1848 / #1862): 0 when G3 cannot run; otherwise the plane kept
+    /// between prefills (<see cref="CudaG3Attention.RetainedMaxElems"/>, 384 MiB), or, with a prefill chunk, the first chunk's square
+    /// plane (numHeads x chunk^2) when that is larger. A chunked prefill's plane is bounded (later chunks run the offset path, which
+    /// stays under the retained plane), so charging it lets the first chunk keep G3 at a full window instead of falling back to
+    /// <c>attention_f16</c>. An unchunked prefill's square plane grows with the prompt and is admitted per prefill instead.
+    /// </summary>
+    /// <param name="mayRun">Whether G3 can run on this model and device.</param>
+    /// <param name="prefillChunkTokens">The prefill chunk, 0 when prefill is not chunked.</param>
+    /// <param name="numHeads">Query heads.</param>
+    /// <returns>Bytes.</returns>
+    internal static long G3PlaneChargeBytes(bool mayRun, int prefillChunkTokens, int numHeads)
+    {
+        if (!mayRun) return 0;
+        long elems = CudaG3Attention.RetainedMaxElems;
+        if (prefillChunkTokens > 0)
+            elems = Math.Max(elems, CudaG3Attention.SquareScratchElems(prefillChunkTokens, numHeads));
+        return elems * CudaG3Attention.ScratchBytesPerElement;
     }
 
     /// <summary>
     /// Arithmetic of <see cref="MeasureServingContextFit"/> (#1841 / #1848), pure so it is unit-testable:
     /// <list type="bullet">
     /// <item>fixed bytes: the lazy dequant scratch not yet allocated, plus the G3 score plane that can stay allocated between
-    /// prefills (<paramref name="g3PlaneMaxBytes"/>, 384 MiB when G3 can run) minus what of it is already held, and with a prefill
+    /// prefills or that one prefill chunk needs (<paramref name="g3PlaneMaxBytes"/>, <see cref="G3PlaneChargeBytes"/>) minus what of
+    /// it is already held, and with a prefill
     /// chunk the growth of the forward scratch to the chunk (<paramref name="chunkScratchBytes"/> minus what is held);</item>
     /// <item>without a chunk, the forward scratch grows per token (inside <paramref name="perTokenBytes"/>) and replaces the scratch
     /// held now, which therefore counts as free.</item>

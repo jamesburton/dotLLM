@@ -41,6 +41,7 @@ public sealed record PropsResponse
 
     [JsonPropertyName("gpu_layers")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonConverter(typeof(DotLLM.Core.Configuration.GpuLayersJsonConverter))]
     public int? GpuLayers { get; init; }
 
     [JsonPropertyName("threads")]

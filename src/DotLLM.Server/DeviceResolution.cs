@@ -96,7 +96,14 @@ public sealed class DeviceUnavailableException : Exception
 /// <param name="Candidates">Canonical device strings to try, best first. Empty when <see cref="Error"/> is set.</param>
 /// <param name="Error">Non-null when an explicitly requested device cannot be honoured (never resolved to CPU).</param>
 /// <param name="CpuWarning">Non-null when <c>auto</c> will land on the CPU without any GPU having been tried.</param>
-public sealed record DevicePlan(DeviceSpec Spec, IReadOnlyList<string> Candidates, string? Error, string? CpuWarning);
+public sealed record DevicePlan(DeviceSpec Spec, IReadOnlyList<string> Candidates, string? Error, string? CpuWarning)
+{
+    /// <summary>
+    /// Under <c>auto</c>: the CUDA candidate the whole model does not fit, to be loaded as an automatic GPU/CPU layer split
+    /// (<c>--gpu-layers auto</c>, #1851); null when there is none.
+    /// </summary>
+    public string? SplitCandidate { get; init; }
+}
 
 /// <summary>Result of <see cref="DeviceModelLoader"/>.</summary>
 /// <param name="Model">The loaded model.</param>
@@ -126,10 +133,11 @@ public static class DeviceModelLoader
     /// <param name="log">Informational messages.</param>
     /// <param name="warn">Warnings.</param>
     /// <param name="moeOffload">Routed-expert offload (CUDA <c>nemotron_h_moe</c>, #1070); null = defaults plus environment.</param>
+    /// <param name="prefillChunkTokens">The <c>--prefill-chunk-size</c> value (0 = the split default) an automatic split plans for (#1851).</param>
     /// <returns>The model and its KV-cache factory (null for the CPU model).</returns>
     public static (IModel Model, Func<int, IKvCache>? KvCacheFactory) LoadExact(
         GgufFile gguf, ModelConfig config, string canonicalDevice, int? requestedGpuLayers,
-        ThreadingConfig threading, Action<string> log, Action<string> warn, MoeOffloadOptions? moeOffload = null)
+        ThreadingConfig threading, Action<string> log, Action<string> warn, MoeOffloadOptions? moeOffload = null, int prefillChunkTokens = 0)
     {
         var spec = DeviceSpec.Parse(canonicalDevice);
         if (spec.Kind == DeviceKind.Auto)
@@ -166,6 +174,18 @@ public static class DeviceModelLoader
             return (m, kv);
         }
 
+        if (GpuOffloadPlanner.IsAuto(requestedGpuLayers))
+        {
+            if (spec.Kind == DeviceKind.Cuda)
+            {
+                // #1851: the planner chooses N and logs the placement and why.
+                var autoMoe = moeOffload ?? MoeOffloadOptions.WithEnvironmentFallback(null);
+                return DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(gguf, config, GpuOffloadPlanner.AutoGpuLayers, spec.Ordinal, threading,
+                    warn, autoMoe with { Log = autoMoe.Log ?? log }, ProbeIgpu, log, prefillChunkTokens);
+            }
+            requestedGpuLayers = 0;   // --device cpu --gpu-layers auto: nothing to place on a GPU
+        }
+
         int gpuLayers = ServerStartup.ResolveGpuLayers(requestedGpuLayers, spec.Canonical, config.NumLayers);
         var plan = GpuOffloadPlanner.Plan(config.Architecture, gpuLayers, config.NumLayers);
         log(plan.Mode switch
@@ -177,6 +197,49 @@ public static class DeviceModelLoader
         });
         return DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(gguf, config, gpuLayers, spec.Ordinal, threading, warn,
             (moeOffload ?? MoeOffloadOptions.WithEnvironmentFallback(null)) is var moe ? moe with { Log = moe.Log ?? log } : null);
+    }
+
+    /// <summary>
+    /// The iGPU an automatic split could place its tail on (#1851): the first integrated Vulkan device, with its device-local heap
+    /// (clamped by <c>DOTLLM_VRAM_BUDGET_MB</c>) as its budget. <see cref="IgpuTier.Supported"/> is false until the dGPU + iGPU host
+    /// exists (#1863), so the planner reports it and keeps the tail on the CPU. Null when there is none.
+    /// </summary>
+    /// <returns>The tier, or null.</returns>
+    public static IgpuTier? ProbeIgpu()
+    {
+        try
+        {
+            foreach (var d in DotLLM.Vulkan.VulkanDevice.EnumeratePhysicalDevices())
+            {
+                if (d.DeviceType != VkIntegratedGpu || d.DeviceLocalHeapBytes <= 0) continue;
+                return new IgpuTier($"vulkan:{d.Index}", d.Name, DeviceMemoryBudget.ClampSimulatedCapacity(d.DeviceLocalHeapBytes),
+                    DeviceMemoryBudget.DefaultReserveBytes, Supported: false);
+            }
+        }
+        catch (Exception)
+        {
+            // No Vulkan here: no iGPU tier.
+        }
+        return null;
+    }
+
+    /// <summary><c>VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU</c>.</summary>
+    private const int VkIntegratedGpu = 1;
+
+    /// <summary>
+    /// Says why <c>--device auto</c> passed over a CUDA device (#1851): the whole model does not fit it, and the split host cannot
+    /// run this model. Silent when a CUDA device is a candidate or there is none.
+    /// </summary>
+    /// <param name="plan">The auto plan.</param>
+    /// <param name="devices">The machine's devices.</param>
+    /// <param name="blocker">Why no split, or null.</param>
+    /// <param name="log">Receives the line.</param>
+    public static void LogSkippedSplit(DevicePlan plan, DeviceListResponse devices, string? blocker, Action<string> log)
+    {
+        if (blocker is null || plan.Candidates.Any(c => c.StartsWith("gpu:", StringComparison.Ordinal))) return;
+        if (devices.Backends?.FirstOrDefault(b => b.Name == "cuda") is not { Servable: true, Devices.Length: > 0 }) return;
+        log($"--device auto: the model does not fit the CUDA device whole, and it cannot be split between GPU and CPU ({blocker}); " +
+            "trying the next device");
     }
 
     /// <summary>The Vulkan device a spec names: physical index N for <c>vulkan:N</c>, else the process default (#1704).</summary>
@@ -198,14 +261,16 @@ public static class DeviceModelLoader
     /// <param name="log">Informational messages.</param>
     /// <param name="warn">Warnings.</param>
     /// <param name="moeOffload">Routed-expert offload (CUDA <c>nemotron_h_moe</c>, #1070); null = defaults plus environment.</param>
+    /// <param name="prefillChunkTokens">The <c>--prefill-chunk-size</c> value (0 = the split default) an automatic split plans for (#1851).</param>
     /// <returns>The load result.</returns>
     public static DeviceLoadResult Load(
         GgufFile gguf, ModelConfig config, string requestedDevice, int? requestedGpuLayers,
         ThreadingConfig threading, long modelBytes, string modelName, Action<string> log, Action<string> warn,
-        MoeOffloadOptions? moeOffload = null)
+        MoeOffloadOptions? moeOffload = null, int prefillChunkTokens = 0)
         => LoadWith(gguf, config, requestedDevice, requestedGpuLayers, threading, modelBytes, modelName, log, warn,
             Endpoints.DeviceEndpoint.Describe(),
-            (device, layers) => LoadExact(gguf, config, device, layers, threading, log, warn, moeOffload), moeOffload);
+            (device, layers) => LoadExact(gguf, config, device, layers, threading, log, warn, moeOffload, prefillChunkTokens), moeOffload,
+            c => DotLLM.Cuda.CudaAutoSplit.Blocker(gguf, c));
 
     /// <summary>
     /// True when a CUDA load of this model may keep its routed experts on the host (#1070: <c>nemotron_h_moe</c> with
@@ -223,8 +288,10 @@ public static class DeviceModelLoader
         GgufFile gguf, ModelConfig config, string requestedDevice, int? requestedGpuLayers,
         ThreadingConfig threading, long modelBytes, string modelName, Action<string> log, Action<string> warn,
         DeviceListResponse devices, Func<string, int?, (IModel Model, Func<int, IKvCache>? Kv)> loadExact,
-        MoeOffloadOptions? moeOffload = null)
+        MoeOffloadOptions? moeOffload = null, Func<ModelConfig, string?>? autoSplitBlocker = null)
     {
+        // #1851: null = the split host can run this model. Without a probe (tests) no split is offered.
+        string? blocker = autoSplitBlocker is null ? "no split probe" : autoSplitBlocker(config);
         var spec = DeviceSpec.Parse(requestedDevice);
 
         // --gpu-layers 0 is the user choosing the CPU, under auto as under cuda.
@@ -232,8 +299,12 @@ public static class DeviceModelLoader
             spec = new(DeviceKind.Cpu, 0);
 
         // An offloadable MoE (#1070) is exempt from the weights-vs-free-VRAM refusal, like a partial --gpu-layers offload.
+        // -1 is "all layers"; auto (-2, #1851) is a partial request the loader sizes, so it is not judged on the whole model here.
         var plan = DeviceSelector.Plan(spec, modelBytes, devices,
-            fullOffload: requestedGpuLayers is null or < 0 && !ExpertOffloadPossible(config, moeOffload));
+            fullOffload: requestedGpuLayers is null or -1 && !ExpertOffloadPossible(config, moeOffload),
+            autoSplit: blocker is null && requestedGpuLayers is null or GpuOffloadPlanner.AutoGpuLayers);
+        if (spec.Kind == DeviceKind.Auto && requestedGpuLayers is null && autoSplitBlocker is not null)
+            LogSkippedSplit(plan, devices, blocker, log);
         if (plan.Error is not null)
             throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(requestedDevice, modelName, modelBytes, plan.Error));
 
@@ -243,7 +314,9 @@ public static class DeviceModelLoader
         {
             try
             {
-                var (model, kv) = loadExact(device, requestedGpuLayers);
+                // #1851: under auto, a CUDA device the whole model does not fit is loaded as an automatic layer split.
+                int? layers = requestedGpuLayers is null && device == plan.SplitCandidate ? GpuOffloadPlanner.AutoGpuLayers : requestedGpuLayers;
+                var (model, kv) = loadExact(device, layers);
                 string? warning = null;
                 if (device == "cpu" && spec.Kind == DeviceKind.Auto)
                     warning = failures.Count > 0 ? DeviceSelector.FallbackWarning(modelName, failures) : plan.CpuWarning;

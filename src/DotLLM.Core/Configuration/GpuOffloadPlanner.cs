@@ -1,3 +1,5 @@
+using DotLLM.Core.Models;
+
 namespace DotLLM.Core.Configuration;
 
 /// <summary>How a requested <c>--gpu-layers</c> count is to be honoured for a given architecture.</summary>
@@ -59,6 +61,73 @@ public static class GpuOffloadPlanner
         return new(GpuOffloadMode.FullGpuOrFail, numLayers,
             $"Partial GPU offload ({n}/{numLayers} layers) is not supported for architecture {architecture} "
             + $"(tracked in {PriorityIssueUrl}); loading all {numLayers} layers on the GPU, and failing if they do not fit.");
+    }
+
+    /// <summary>
+    /// Sentinel <c>--gpu-layers</c> value for <c>auto</c> (issue #1851): the loader chooses N with <see cref="LayerSplitPlanner"/>.
+    /// Distinct from <c>-1</c> ("all layers"), so code that treats any negative value as "all" must test for this first.
+    /// </summary>
+    public const int AutoGpuLayers = -2;
+
+    /// <summary>True when <paramref name="requestedGpuLayers"/> is <see cref="AutoGpuLayers"/>.</summary>
+    /// <param name="requestedGpuLayers">The requested value.</param>
+    /// <returns>Whether the loader is to choose N.</returns>
+    public static bool IsAuto(int? requestedGpuLayers) => requestedGpuLayers == AutoGpuLayers;
+
+    /// <summary>
+    /// Parses a <c>--gpu-layers</c> value: <c>auto</c> (<see cref="AutoGpuLayers"/>), <c>all</c> or <c>-1</c> (every layer), or a
+    /// non-negative count. Empty means unset.
+    /// </summary>
+    /// <param name="value">The raw value.</param>
+    /// <param name="layers">The parsed value, or <see langword="null"/> when unset.</param>
+    /// <param name="error">The validation message when parsing fails.</param>
+    /// <returns>Whether the value is valid.</returns>
+    public static bool TryParseGpuLayers(string? value, out int? layers, out string? error)
+    {
+        layers = null;
+        error = null;
+        string v = (value ?? "").Trim();
+        if (v.Length == 0) return true;
+        if (v.Equals("auto", StringComparison.OrdinalIgnoreCase)) { layers = AutoGpuLayers; return true; }
+        if (v.Equals("all", StringComparison.OrdinalIgnoreCase)) { layers = -1; return true; }
+        if (int.TryParse(v, System.Globalization.NumberStyles.AllowLeadingSign, System.Globalization.CultureInfo.InvariantCulture, out int n) && n >= -1)
+        {
+            layers = n;
+            return true;
+        }
+        error = $"Invalid --gpu-layers '{value}'. Expected 'auto', 'all', -1 or a non-negative layer count.";
+        return false;
+    }
+
+    /// <summary>
+    /// Why <c>--gpu-layers auto</c> cannot split this model across the dGPU and the CPU (issue #1851), or <see langword="null"/>
+    /// when it can. The split host (<c>HybridTransformerModel</c>) runs dense Llama-style layers; its CPU tail has no per-layer
+    /// sliding window or dense-YaRN RoPE yet (#432), no MoE or MLA, and no attention sinks. A model it cannot run correctly is
+    /// never split automatically: auto then loads it whole on the GPU or moves on to the next device.
+    /// </summary>
+    /// <param name="config">Model configuration.</param>
+    /// <param name="hasAttentionSinks">Whether the GGUF carries <c>attn_sinks</c> tensors.</param>
+    /// <returns>The reason, or null.</returns>
+    public static string? AutoSplitBlocker(ModelConfig config, bool hasAttentionSinks = false)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        if (!SupportsPartialOffload(config.Architecture))
+            return $"{config.Architecture} cannot be split between GPU and CPU ({PriorityIssueUrl})";
+        if (config.Architecture == Architecture.Qwen3HybridDense)
+            return "the Qwen3.5/3.6 hybrid has its own split host, which the automatic planner does not size yet (use --gpu-layers N)";
+        if (config.NumLayers < 2)
+            return "the model has fewer than two layers";
+        if (config.Moe is not null)
+            return "MoE layers are not supported by the GPU/CPU layer split (expert offload covers MoE: --moe-offload)";
+        if (config.MlaConfig is not null)
+            return "MLA attention is not supported by the GPU/CPU layer split";
+        if (config.SlidingWindowPattern > 0 || config.PerLayerSlidingWindow is { Count: > 0 })
+            return "per-layer sliding-window attention is not implemented on the CPU tail (#432)";
+        if (config.RoPEConfig is { IsDenseYarnActive: true })
+            return "YaRN RoPE scaling is not implemented on the CPU tail (#432)";
+        if (hasAttentionSinks)
+            return "attention sinks are not implemented on the CPU tail";
+        return null;
     }
 
     /// <summary>Tracking issue for true split offload of the hybrid SSM architectures.</summary>

@@ -806,7 +806,7 @@ public sealed class ServerState : IDisposable
     /// </summary>
     private string? CannotFitReason(long incomingBytes, string? device, int? gpuLayers)
     {
-        if (DeviceSelector.IsAuto(device) || gpuLayers is >= 0) return null;
+        if (DeviceSelector.IsAuto(device) || gpuLayers is >= 0 || GpuOffloadPlanner.IsAuto(gpuLayers)) return null;
         if (!DeviceSpec.TryParse(device, out var spec, out _) || spec.Kind != DeviceKind.Cuda) return null;
         if (CudaMemoryProbe(spec.Ordinal) is not { } mem) return null;
 

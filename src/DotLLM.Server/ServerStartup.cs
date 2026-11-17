@@ -179,8 +179,10 @@ public static class ServerStartup
             string name = ModelIdFor(options.Model, resolvedPath);
             if (spec.IsGpu)
             {
+                // -1 is "all layers"; auto (#1851) is sized by the loader, like an explicit partial count.
                 var plan = DeviceSelector.Plan(spec, bytes, Endpoints.DeviceEndpoint.Describe(),
-                    fullOffload: options.GpuLayers is null or < 0 && !ExpertOffloadPossible(resolvedPath, options.MoeOffload));
+                    fullOffload: options.GpuLayers is null or -1 && !ExpertOffloadPossible(resolvedPath, options.MoeOffload),
+                    autoSplit: spec.Kind == DeviceKind.Cuda && options.GpuLayers is null && AutoSplitBlocker(resolvedPath, options) is null);
                 if (plan.Error is not null)
                     throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(options.Device, name, bytes, plan.Error));
             }
@@ -203,15 +205,21 @@ public static class ServerStartup
         // WARNING (console + ServerState.DeviceFallbackWarning -> /props) rather than a quiet log line (#733).
         Exception? last = null;
         var gpuFailures = new List<string>();
-        var autoPlan = DeviceSelector.Plan(spec, ModelResolver.FileLength(resolvedPath), Endpoints.DeviceEndpoint.Describe());
+        string? splitBlocker = options.GpuLayers is null or GpuOffloadPlanner.AutoGpuLayers ? AutoSplitBlocker(resolvedPath, options) : "explicit --gpu-layers";
+        var autoDevices = Endpoints.DeviceEndpoint.Describe();
+        var autoPlan = DeviceSelector.Plan(spec, ModelResolver.FileLength(resolvedPath), autoDevices, autoSplit: splitBlocker is null);
+        if (options.GpuLayers is null)
+            DeviceModelLoader.LogSkippedSplit(autoPlan, autoDevices, splitBlocker, m => Console.WriteLine($"[dotllm] {m}"));
         foreach (string device in autoPlan.Candidates)
         {
             if (options.TernaryAdapterPaths is { Count: > 0 } && TernaryAdapterAttach.BackendHasNoHook(device)) continue;   // no CUDA model has the residual hook (#1711): never load a GPU model the adapters cannot attach to
             try
             {
                 Console.WriteLine($"[dotllm] --device auto: trying {device}");
-                var loaded = LoadModelCore(resolvedPath, options with { Device = device });
-                loaded.Options = loaded.Options with { Device = options.Device, ResolvedDevice = device, DeviceFallbackWarning = null };   // (#1822) set below when it fell back
+                // #1851: a CUDA device the whole model does not fit is loaded as an automatic GPU/CPU layer split.
+                int? layers = options.GpuLayers is null && device == autoPlan.SplitCandidate ? GpuOffloadPlanner.AutoGpuLayers : options.GpuLayers;
+                var loaded = LoadModelCore(resolvedPath, options with { Device = device, GpuLayers = layers });
+                loaded.Options = loaded.Options with { Device = options.Device, GpuLayers = options.GpuLayers, ResolvedDevice = device, DeviceFallbackWarning = null };   // (#1822) set below when it fell back
                 if (device == "cpu" && (gpuFailures.Count > 0 || autoPlan.CpuWarning is not null))
                 {
                     // Auto on the CPU always warns: after a failed GPU load (reason + consequence), or because no GPU was servable at all.
@@ -240,7 +248,9 @@ public static class ServerStartup
     /// request is clamped to <c>[0, numLayers]</c>; unset on a non-GPU device is 0.
     /// </summary>
     public static int ResolveGpuLayers(int? requested, string device, int numLayers) =>
-        requested is < 0 ? numLayers
+        GpuOffloadPlanner.IsAuto(requested)
+            ? throw new ArgumentException("--gpu-layers auto is resolved by the loader (CudaAutoSplit), not by a layer count.", nameof(requested))
+        : requested is < 0 ? numLayers
         : requested.HasValue ? Math.Clamp(requested.Value, 0, numLayers)
         : DeviceSpec.TryParse(device, out var spec, out _) && spec.Kind == DeviceKind.Cuda ? numLayers : 0;
 
@@ -354,9 +364,11 @@ public static class ServerStartup
     /// <param name="options">Server options.</param>
     /// <param name="kv">KV storage types of the non-paged cache.</param>
     /// <param name="paged">The GPU paged-KV factory, or null on the non-paged path.</param>
+    /// <param name="prefillChunk">The prefill chunk the generator uses (<see cref="ResolvePrefillChunk"/>), 0 for one pass.</param>
     /// <returns>The model's config after the limit.</returns>
     internal static ModelConfig ApplyCudaDenseContextFit(
-        DotLLM.Cuda.CudaTransformerModel model, ServerOptions options, KvCacheConfig kv, DotLLM.Cuda.CudaPagedKvCacheFactory? paged)
+        DotLLM.Cuda.CudaTransformerModel model, ServerOptions options, KvCacheConfig kv, DotLLM.Cuda.CudaPagedKvCacheFactory? paged,
+        int prefillChunk)
     {
         int native = model.NativeMaxSequenceLength;
         if (paged is not null)
@@ -372,7 +384,7 @@ public static class ServerStartup
             return model.Config;
         }
 
-        var fit = model.MeasureServingContextFit(kv, options.PrefillChunkSize);
+        var fit = model.MeasureServingContextFit(kv, prefillChunk);
         if (fit.SizingError is { } sizingError)
             Console.WriteLine($"[dotllm] WARNING: the context fit could not measure free VRAM ({sizingError}); serving the smallest window.");
         int served = ChooseServedContext(options.ContextSize, fit.MaxContext, native, out string? warning,
@@ -382,7 +394,7 @@ public static class ServerStartup
         if (served < native)
             model.LimitContextLength(served);
         string kvLabel = kv.IsQuantized ? $"{kv.KeyDType}/{kv.ValueDType}".ToLowerInvariant() : "f16";
-        string prefill = options.PrefillChunkSize > 0 ? $", prefill chunk {options.PrefillChunkSize}" : ", unchunked prefill";
+        string prefill = prefillChunk > 0 ? $", prefill chunk {prefillChunk}" : ", unchunked prefill";
         Console.WriteLine(options.ContextSize is > 0
             ? $"[dotllm] Context window: {model.Config.MaxSequenceLength} tokens (--ctx-size; {fit.MaxContext} fit in free VRAM: {fit.Describe()}, {kvLabel} KV{prefill})."
             : $"[dotllm] Context window: {model.Config.MaxSequenceLength} of {native} tokens, fitted to free VRAM ({fit.Describe()}, {kvLabel} KV{prefill}). " +
@@ -390,9 +402,42 @@ public static class ServerStartup
         return model.Config;
     }
 
-    /// <summary>The small-window remedy for the dense CUDA host (#1848): it has no MTP head, and its prefill scratch is per token.</summary>
+    /// <summary>The small-window remedy for the dense CUDA host (#1848): it has no MTP head, and an unchunked prefill's scratch is per token.</summary>
     internal const string DenseSmallWindowHint =
-        "Use a smaller KV type (--kv-quant-k/-v q8_0 or q4_0), bound the prefill scratch with --prefill-chunk (e.g. 1024), or free GPU memory.";
+        "Use a smaller KV type (--kv-quant-k/-v q8_0 or q4_0), keep the prefill chunked (--prefill-chunk-size, 1024 by default on --no-paged f16), " +
+        "or free GPU memory.";
+
+    /// <summary>
+    /// Prefill chunk the dense CUDA host uses when <c>--prefill-chunk-size</c> is not given (#1862), on the non-paged f16 path only.
+    /// Chunked, the forward scratch is a fixed cost instead of about as much per token as f16 KV, so the VRAM-fitted window roughly
+    /// doubles; cancellation is checked between chunks, so a client disconnect stops a long prefill; and the first chunk's square
+    /// G3 score plane (numHeads x chunk^2 x 6 B, 192 MiB for 32 heads) stays inside the plane the fit already retains, while every
+    /// later chunk runs G3's offset path (#1847), bounded to the same plane. Measured on framework: see the PR for #1862.
+    /// </summary>
+    internal const int DefaultCudaDensePrefillChunkTokens = 1024;
+
+    /// <summary>
+    /// The prefill chunk a server uses (#1862): an explicit <c>--prefill-chunk-size</c> always wins, 0 (one pass) included; with none,
+    /// <see cref="DefaultCudaDensePrefillChunkTokens"/> on the dense CUDA non-paged f16 path and one pass everywhere else. Paged and
+    /// q8_0 / q4_0 caches stay unchunked by default: their later chunks cannot use G3's offset path and would run <c>attention_f16</c>.
+    /// </summary>
+    /// <param name="requested">The <c>--prefill-chunk-size</c> value, or null when it was not given.</param>
+    /// <param name="cudaDenseF16NonPaged">Whether the model is the dense CUDA host on its non-paged f16 KV cache.</param>
+    /// <returns>Tokens per prefill forward pass, 0 for one pass.</returns>
+    internal static int ResolvePrefillChunk(int? requested, bool cudaDenseF16NonPaged)
+        => requested is int r ? Math.Max(0, r) : cudaDenseF16NonPaged ? DefaultCudaDensePrefillChunkTokens : 0;
+
+    /// <summary>
+    /// Whether <paramref name="model"/> takes the dense CUDA prefill default (#1862): the dense CUDA host
+    /// (<see cref="DotLLM.Cuda.CudaTransformerModel"/>, not the CUDA hybrids, which chunk themselves) on its non-paged f16 cache,
+    /// the one cache whose later chunks run G3's offset path. CPU, Vulkan and HIP models never do.
+    /// </summary>
+    /// <param name="model">The loaded model.</param>
+    /// <param name="cudaPagedPool">Whether the GPU paged KV pool serves it.</param>
+    /// <param name="kv">KV storage types.</param>
+    /// <returns>Whether the default applies.</returns>
+    internal static bool IsCudaDenseF16NonPaged(IModel model, bool cudaPagedPool, KvCacheConfig kv)
+        => model is DotLLM.Cuda.CudaTransformerModel && !cudaPagedPool && !kv.IsQuantized;
 
     /// <summary>
     /// The served context on the CUDA paged pool (#1836): <c>--ctx-size</c> or the model's window, never more than the pool holds.
@@ -480,6 +525,22 @@ public static class ServerStartup
     /// Whether the GGUF at <paramref name="path"/> is a <c>nemotron_h_moe</c> model whose routed experts may be offloaded
     /// (#1070), read from its metadata; false when the file cannot be read.
     /// </summary>
+    /// <summary>Why the GPU/CPU split host cannot run the model at <paramref name="path"/> (#1851), or null when it can.</summary>
+    private static string? AutoSplitBlocker(string path, ServerOptions options)
+    {
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            // The config the load will use: --rope-scaling and friends can turn YaRN on (or off), which decides the split (#432).
+            var config = GgufModelConfigExtractor.ApplyRoPEOverride(GgufModelConfigExtractor.Extract(gguf.Metadata), options.RopeOverride);
+            return DotLLM.Cuda.CudaAutoSplit.Blocker(gguf, config);
+        }
+        catch (Exception ex)
+        {
+            return $"the model could not be inspected ({ex.Message})";
+        }
+    }
+
     private static bool ExpertOffloadPossible(string path, DotLLM.Core.Moe.MoeOffloadOptions? moeOffload)
     {
         try
@@ -586,7 +647,7 @@ public static class ServerStartup
             gguf, config, options.Device, options.GpuLayers, threading,
             msg => Console.WriteLine($"[dotllm] {msg}"),
             w => Console.WriteLine($"[dotllm] WARNING: {w}"),
-            options.MoeOffload);
+            options.MoeOffload, options.PrefillChunkSize ?? 0);
         // Only the Vulkan models' KV factory is wired here (CUDA/hybrid models keep their own per-request caches).
         Func<int, IKvCache>? vulkanKvFactory = DeviceSpec.Parse(options.Device).Kind == DeviceKind.Vulkan ? deviceKvFactory : null;
 
@@ -711,7 +772,8 @@ public static class ServerStartup
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
             if (kvConfig.IsQuantized)
-                Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: the hybrid GPU/CPU model owns its KV cache and has no quantized storage (model {config.Architecture}).");
+                Console.WriteLine($"[dotllm] --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) does not apply to the GPU/CPU split: its KV is " +
+                                  $"F16 on the GPU layers and {(DotLLM.Cuda.HybridTransformerModel.TailUsesQ8_0(config.HeadDim) ? "q8_0" : "f16")} on the CPU tail.");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3SplitModel)
@@ -835,6 +897,14 @@ public static class ServerStartup
         // of its rows (TryGrowTo, admitted against free VRAM), which costs milliseconds, so it is sized for the request alone.
         bool deviceOwnedPrefixKv = vulkanKvFactory is not null
             || (model is DotLLM.Cuda.CudaTransformerModel && cudaPagedFactory is null);
+
+        // #1862: the prefill chunk this server uses. An explicit --prefill-chunk-size (0 included) wins; otherwise the dense CUDA
+        // non-paged f16 path chunks by default, so its context fit charges a fixed forward scratch instead of a per-token one.
+        // #1851: a GPU/CPU split always prefills in chunks (1024 unless a positive --prefill-chunk-size), the scratch it was planned for.
+        bool splitModel = model is DotLLM.Cuda.HybridTransformerModel;
+        int prefillChunk = splitModel
+            ? DotLLM.Cuda.CudaAutoSplit.SplitPrefillChunk(options.PrefillChunkSize ?? 0)
+            : ResolvePrefillChunk(options.PrefillChunkSize, IsCudaDenseF16NonPaged(model, cudaPagedFactory is not null, kvConfig));
         PrefixCache? prefixCache = !options.PromptCacheEnabled ? null
             : !deviceOwnedPrefixKv ? new PrefixCache(options.PromptCacheSize, options.PromptCachePolicy)
             : new PrefixCache(Math.Min(options.PromptCacheSize, VulkanPrefixCacheMaxEntries), options.PromptCachePolicy);
@@ -896,10 +966,12 @@ public static class ServerStartup
             promptLookup: options.PromptLookup,
             prefixTrieManager: prefixTrieManager,
             prefixCacheHeadroomTokens: prefixCacheHeadroom,
-            prefillChunkSize: options.PrefillChunkSize,
+            prefillChunkSize: prefillChunk,
             recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions());
-        if (options.PrefillChunkSize > 0)
-            Console.WriteLine($"[dotllm] Prefill chunk size: {options.PrefillChunkSize} tokens per forward pass");
+        if (prefillChunk > 0)
+            Console.WriteLine($"[dotllm] Prefill chunk size: {prefillChunk} tokens per forward pass" +
+                              (splitModel && prefillChunk != options.PrefillChunkSize ? " (GPU/CPU split default; --prefill-chunk-size overrides)"
+                               : options.PrefillChunkSize is null ? " (dense CUDA default; --prefill-chunk-size 0 for one pass)" : ""));
         if (options.PromptLookup is { } lookup)
             Console.WriteLine($"[dotllm] Prompt lookup: up to {lookup.DraftTokens} drafts, n-gram {lookup.MinNgram}..{lookup.MaxNgram} (greedy requests; continuous batching off)");
         if (generator.RecurrentStepCheckpointBytes > 0)
@@ -928,7 +1000,7 @@ public static class ServerStartup
         // Issues #1841 / #1836: dense CUDA honours --ctx-size and serves no more than fits: the paged pool's capacity, or the
         // non-paged KV + forward scratch that fit in free VRAM after warm-up.
         else if (model is DotLLM.Cuda.CudaTransformerModel cudaDense)
-            config = ApplyCudaDenseContextFit(cudaDense, options, kvConfig, cudaPagedFactory);
+            config = ApplyCudaDenseContextFit(cudaDense, options, kvConfig, cudaPagedFactory, prefillChunk);
         else if (model is DotLLM.Vulkan.VulkanQwen4ExpTransformerModel q4Vulkan)
         {
             // #1324: the window is the capacity the caches were sized for at load (--ctx-size, reduced to fit), already in Config.
@@ -938,6 +1010,14 @@ public static class ServerStartup
                 (options.ContextSize is > 0 ? " (--ctx-size" + (options.ContextSize > config.MaxSequenceLength ? $" {options.ContextSize} reduced to fit the device" : "") + ")" : " (default)") +
                 $"; K/V + indexer {perToken / 1024.0:F1} KiB/token ({DotLLM.Vulkan.VulkanQwen4ExpTransformerModel.KvStorage.ToString().ToLowerInvariant()} K/V), " +
                 $"{perToken * (long)config.MaxSequenceLength / 1048576.0:F0} MiB if the window fills (allocated lazily). Raise with --ctx-size.");
+        }
+        else if (model is DotLLM.Cuda.HybridTransformerModel split)
+        {
+            // #1851: an automatic split was sized for --ctx-size (default 4096) of KV, and its Config carries that window; serve
+            // and report it, so a longer request is refused at admission instead of failing on a position past the window.
+            config = split.Config;
+            Console.WriteLine($"[dotllm] Context window: {config.MaxSequenceLength} tokens ({split.NumGpuLayers} GPU + " +
+                              $"{config.NumLayers - split.NumGpuLayers} CPU layers).");
         }
         else if (model is IContextLimitable limitable)
             config = ApplyRequestedContextSize(model, limitable, options);
@@ -1135,11 +1215,11 @@ public static class ServerStartup
     {
         var schedulerOptions = options.Scheduler;
 
-        if (options.PrefillChunkSize > 0 && (schedulerOptions?.MaxPrefillTokensPerStep ?? 0) <= 0)
+        if (options.PrefillChunkSize is > 0 and int chunk && (schedulerOptions?.MaxPrefillTokensPerStep ?? 0) <= 0)
         {
             schedulerOptions = (schedulerOptions ?? new ContinuousBatchSchedulerOptions()) with
             {
-                MaxPrefillTokensPerStep = options.PrefillChunkSize,
+                MaxPrefillTokensPerStep = chunk,
             };
         }
 

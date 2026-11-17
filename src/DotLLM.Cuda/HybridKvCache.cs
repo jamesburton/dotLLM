@@ -11,8 +11,14 @@ namespace DotLLM.Cuda;
 /// GPU layers are updated via <see cref="GpuCache"/> directly (device-side copies);
 /// CPU layers use the standard <see cref="IKvCache"/> interface with remapped layer indices.
 /// </summary>
-public sealed class HybridKvCache : IKvCache
+public sealed class HybridKvCache : IKvCache, IDeviceResidentKvCache
 {
+    /// <summary>
+    /// Device bytes the GPU half holds (#1851), so the engine can tell whether evicting a retained split cache would let a refused
+    /// allocation fit. The host tail is not device memory.
+    /// </summary>
+    public long DeviceBytes => GpuCache.DeviceBytes;
+
     private readonly int _numGpuLayers;
 
     /// <summary>GPU-side KV-cache for layers 0..N-1 (FP16, device memory).</summary>

@@ -69,4 +69,47 @@ public sealed class CudaServedContextTests
         using var state = new ServerState { Options = new ServerOptions { Model = "", ModelId = "none" } };
         Assert.Null(state.GetStatus().NCtx);
     }
+
+    [Theory]
+    // #1862: no flag on the dense CUDA non-paged f16 path -> the default chunk.
+    [InlineData(null, true, ServerStartup.DefaultCudaDensePrefillChunkTokens)]
+    // No flag anywhere else (CPU, Vulkan, HIP, CUDA paged or quantized KV) -> one pass, unchanged.
+    [InlineData(null, false, 0)]
+    // An explicit value always wins, on either path, and 0 is an explicit opt-out back to one pass.
+    [InlineData(512, true, 512)]
+    [InlineData(4096, true, 4096)]
+    [InlineData(0, true, 0)]
+    [InlineData(256, false, 256)]
+    [InlineData(-5, true, 0)]
+    public void PrefillChunk_DefaultsOnDenseCudaOnly_AndAnExplicitValueWins(int? requested, bool cudaDense, int expected)
+        => Assert.Equal(expected, ServerStartup.ResolvePrefillChunk(requested, cudaDense));
+
+    [Fact]
+    public void PrefillChunkDefault_IsBoundedByTheRetainedG3Plane()
+    {
+        // The default's first chunk must keep G3 inside the plane the fit always charges, for a 32-head model like TwIL-8B (#1862).
+        Assert.True(DotLLM.Cuda.CudaG3Attention.SquareScratchElems(ServerStartup.DefaultCudaDensePrefillChunkTokens, 32)
+                    <= DotLLM.Cuda.CudaG3Attention.RetainedMaxElems);
+    }
+
+    [Fact]
+    public void PrefillChunkDefault_AppliesOnlyToTheDenseCudaHostsNonPagedF16Cache()
+    {
+        // No driver is needed: only the model's type is inspected, so an uninitialised instance stands in for a loaded one.
+        var cuda = (IModel)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(DotLLM.Cuda.CudaTransformerModel));
+        var f16 = new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32);
+        var q8 = new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0);
+        Assert.True(ServerStartup.IsCudaDenseF16NonPaged(cuda, cudaPagedPool: false, f16));
+        Assert.False(ServerStartup.IsCudaDenseF16NonPaged(cuda, cudaPagedPool: true, f16));
+        Assert.False(ServerStartup.IsCudaDenseF16NonPaged(cuda, cudaPagedPool: false, q8));
+        // Any other model (CPU, Vulkan, HIP) keeps one-pass prefill, whatever its cache.
+        Assert.False(ServerStartup.IsCudaDenseF16NonPaged(new StubModel(), cudaPagedPool: false, f16));
+    }
+
+    [Fact]
+    public void ServeOptions_WithoutTheFlag_LeaveTheChunkUnset_SoTheBackendDefaultApplies()
+    {
+        Assert.Null(ServerOptions.Parse(new[] { "--model", "m.gguf" }).PrefillChunkSize);
+        Assert.Equal(0, ServerOptions.Parse(new[] { "--model", "m.gguf", "--prefill-chunk-size", "0" }).PrefillChunkSize);
+    }
 }

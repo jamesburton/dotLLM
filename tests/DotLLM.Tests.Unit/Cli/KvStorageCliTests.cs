@@ -219,6 +219,16 @@ public sealed class KvStorageCliTests
         Assert.Equal("q4_0", s.CacheTypeK);
     }
 
+    // ── serve --prefill-chunk-size (#1862): omitted reaches the server as null (the dense CUDA default applies), 0 stays 0 ──
+
+    [Fact]
+    public void Serve_PrefillChunkSize_OmittedReachesTheServerAsNull_AndAnExplicitValueAsGiven()
+    {
+        Assert.Null(ServeCommand.BuildServerOptions(Parse<ServeCommand.Settings>("model.gguf"), null).PrefillChunkSize);
+        Assert.Equal(0, ServeCommand.BuildServerOptions(Parse<ServeCommand.Settings>("model.gguf", "--prefill-chunk-size", "0"), null).PrefillChunkSize);
+        Assert.Equal(2048, ServeCommand.BuildServerOptions(Parse<ServeCommand.Settings>("model.gguf", "--ubatch-size", "2048"), null).PrefillChunkSize);
+    }
+
     // ── serve --ctx-size (#1068) is also the MoE offload context (#1071): one option, one value ──
 
     [Theory]

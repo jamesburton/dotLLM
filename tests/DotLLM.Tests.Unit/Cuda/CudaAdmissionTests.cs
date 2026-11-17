@@ -201,6 +201,40 @@ public sealed class CudaAdmissionTests
         Assert.Equal(131_072, CudaTransformerModel.FitDenseContext(3000 * MiB, 0, 0, 0, null, 0, 0, PerToken, 131_072).MaxContext);
     }
 
+    [Theory]
+    // #1862: G3 off charges nothing, whatever the chunk.
+    [InlineData(false, 1024, 32, 0L)]
+    [InlineData(false, 0, 32, 0L)]
+    // Unchunked: the retained plane only (the square plane grows with the prompt and is admitted per prefill).
+    [InlineData(true, 0, 32, 384L)]
+    // The default 1,024 chunk: 32 x 1,024^2 = 32M elements (192 MiB) sits inside the retained 64M-element plane.
+    [InlineData(true, 1024, 32, 384L)]
+    // Past ~1,448 tokens (32 heads) the first chunk's square plane is larger than the retained one, and is charged instead.
+    [InlineData(true, 2048, 32, 768L)]
+    [InlineData(true, 4096, 32, 3072L)]
+    [InlineData(true, 2048, 8, 384L)]
+    public void G3PlaneCharge_IsTheRetainedPlane_OrTheFirstChunksSquarePlaneWhenLarger(bool mayRun, int chunk, int heads, long expectedMiB)
+        => Assert.Equal(expectedMiB * MiB, CudaTransformerModel.G3PlaneChargeBytes(mayRun, chunk, heads));
+
+    [Fact]
+    public void DenseFit_TheChunkedFixedCost_RoughlyDoublesTheF16Window()
+    {
+        // #1862, TwIL-8B-shaped: f16 KV is 160 KiB a token and an unchunked prefill adds ~146 KiB a token of forward scratch. 6,000 MiB
+        // free after warm-up, 100 MiB of forward scratch held, 400 MiB of it at the 1,024 chunk, G3 able to run, 32 query heads.
+        const long act = 150_000;
+        var f16 = new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32);
+        var unchunked = CudaTransformerModel.FitDenseContext(6000 * MiB, 256 * MiB, 0, 100 * MiB, chunkScratchBytes: null,
+            g3PlaneHeldBytes: 0, CudaTransformerModel.G3PlaneChargeBytes(true, 0, 32),
+            CudaTransformerModel.DenseContextBytesPerToken(Twil, f16, act, chunkedPrefill: false), native: 131_072);
+        var chunked = CudaTransformerModel.FitDenseContext(6000 * MiB, 256 * MiB, 0, 100 * MiB, chunkScratchBytes: 400 * MiB,
+            g3PlaneHeldBytes: 0, CudaTransformerModel.G3PlaneChargeBytes(true, 1024, 32),
+            CudaTransformerModel.DenseContextBytesPerToken(Twil, f16, act, chunkedPrefill: true), native: 131_072);
+        // Unchunked: (6,100 - 256 - 384) MiB / 313,840 B = 18,242 -> 17,408. Chunked: (6,000 - 256 - 384 - 300) MiB / 163,840 B = 32,384 -> 31,744.
+        Assert.Equal(17_408, unchunked.MaxContext);
+        Assert.Equal(31_744, chunked.MaxContext);
+        Assert.Equal((384 + 300) * MiB, chunked.FixedBytes);
+    }
+
     [Fact]
     public void DenseFit_WithoutAReading_FitsNothing_AndSaysWhy()
     {

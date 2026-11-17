@@ -128,8 +128,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>Number of GPU layers for hybrid offloading.</summary>
         [CommandOption("--gpu-layers")]
-        [Description("Number of transformer layers to offload to GPU (CUDA). 0 = CPU only. " +
-                     "Omit for default (all layers on a GPU device, 0 with --device cpu). Ignored on vulkan (whole model is device-resident).")]
+        [Description(DotLLM.Cli.Helpers.GpuLayersConverter.OptionHelp)]
+        [System.ComponentModel.TypeConverter(typeof(DotLLM.Cli.Helpers.GpuLayersConverter))]
         public int? GpuLayers { get; set; }
 
         /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
@@ -461,7 +461,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 DotLLM.Server.DeviceLoadResult loaded;
                 (loaded, deviceOutcome) = DeviceCli.Load(gguf, config, settings.Device, settings.GpuLayers,
                     new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
-                    resolvedPath, MoeOffloadCli.Build(settings.MoeValues));
+                    resolvedPath, MoeOffloadCli.Build(settings.MoeValues), settings.PrefillChunkSize);
                 model = loaded.Model;
                 vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
                 if (settings.DFlash is not null)
@@ -770,7 +770,9 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
             mtpEnabled: !settings.NoMtp, mtpAdaptive: true, recurrentPrefixCache: !settings.NoPromptCache,
-            prefillChunkSize: settings.PrefillChunkSize,
+            // #1851: a GPU/CPU split prefills in chunks (1024 unless --prefill-chunk-size), the scratch it was planned for.
+            prefillChunkSize: model is DotLLM.Cuda.HybridTransformerModel
+                ? DotLLM.Cuda.CudaAutoSplit.SplitPrefillChunk(settings.PrefillChunkSize) : settings.PrefillChunkSize,
             recurrentPrefixCacheOptions: DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(settings.PrefixSnapshots, settings.PrefixSnapshotHostBudget, settings.PrefixSnapshotDiskDirectory, settings.PrefixSnapshotDiskBudget, settings.PromptCacheStep, settings.PromptCacheStepKeep, promptCachePolicy),
             promptLookup: settings.PromptLookupOptions);
         if (settings.CloverDecode is not null)

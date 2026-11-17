@@ -268,14 +268,16 @@ public sealed record ServerOptions
 
     /// <summary>
     /// Maximum prompt tokens per prefill forward pass (llama.cpp <c>-ub</c> / micro-batch analog).
-    /// 0 (default) = whole prompt in one forward pass. On the single-request
+    /// 0 = whole prompt in one forward pass. Null (not given) = the backend default: chunks of
+    /// <see cref="ServerStartup.DefaultCudaDensePrefillChunkTokens"/> on the dense CUDA non-paged f16 path, one pass elsewhere
+    /// (issue #1862; <see cref="ServerStartup.ResolvePrefillChunk"/>). On the single-request
     /// <see cref="DotLLM.Engine.TextGenerator"/> path this chunks the prompt-suffix prefill; when
     /// the continuous-batch scheduler is active it is applied as the scheduler's per-step prefill
     /// admission cap (<see cref="ContinuousBatchSchedulerOptions.MaxPrefillTokensPerStep"/>) unless
     /// the <see cref="Scheduler"/> section already sets one — a single prompt longer than the cap
     /// still prefills in one forward pass there (admission-level cap, not intra-prompt chunking).
     /// </summary>
-    public int PrefillChunkSize { get; init; }
+    public int? PrefillChunkSize { get; init; }
 
     /// <summary>
     /// Served context window in tokens (<c>--ctx-size</c>, llama.cpp <c>-c</c>). Null or 0 (default): models that size their
@@ -508,7 +510,7 @@ public sealed record ServerOptions
         string? mtpHeadPath = null;
         string? dflashPath = null;
         var reasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto;
-        int prefillChunkSize = 0;
+        int? prefillChunkSize = null;
         string? ropeScaling = null;
         float? ropeFreqBase = null;
         float? ropeScale = null;
@@ -565,7 +567,9 @@ public sealed record ServerOptions
                 case "--moe-calibrate":
                     moeCalibrate = true; break;
                 case "--gpu-layers":
-                    gpuLayers = int.Parse(next!); i++; break;
+                    if (!GpuOffloadPlanner.TryParseGpuLayers(next, out gpuLayers, out string? gpuLayersError))
+                        throw new ArgumentException(gpuLayersError);
+                    i++; break;
                 case "--threads":
                     threads = int.Parse(next!); i++; break;
                 case "--decode-threads":

@@ -181,6 +181,43 @@ default and does not cover `bench`, which submits the whole prompt in one `Forwa
   tile and cuBLAS picks algorithms per M. The drift is the usual accumulation-order kind and is
   bounded by the standard CUDA fixture-parity tolerance (abs 1e-4 + rel 1e-3).
 
+### Dense CUDA serve: chunked prefill by default (issue #1862)
+
+`dotllm serve` on the dense CUDA host (`CudaTransformerModel`) prefills in 1,024-token chunks when
+`--prefill-chunk-size` is not given, on the non-paged f16 cache only (`ServerStartup.ResolvePrefillChunk`).
+Any explicit value wins, and `--prefill-chunk-size 0` restores one pass. `run`, `chat`, the paged pool,
+q8_0 / q4_0 KV, and the CPU, Vulkan and HIP backends are unchanged.
+
+Why it pays:
+
+- **Window.** An unchunked prefill grows the forward scratch with the prompt, about as much per token as f16
+  KV, so the context fit charges it per token. Chunked, it is a fixed cost. TwIL-8B on the RTX 3060 serves
+  17,408 tokens unchunked (304.5 KiB/token) and 32,768 chunked (160 KiB/token plus 526 MiB fixed).
+- **Prefill.** A long cold prompt's square G3 plane (heads x s^2 x 6 B) does not fit, so unchunked it runs
+  `attention_f16`. Chunked, the first chunk's plane is 192 MiB at 32 heads, inside the 384 MiB plane the fit
+  already charges, and later chunks run G3's offset path (#1847), bounded to the same plane.
+- **Cancellation.** The engine checks it between chunks, so a client disconnect stops a long prefill.
+
+A chunk larger than about 1,448 tokens (at 32 heads) needs a square plane above the retained one. The fit then
+charges that plane as fixed bytes (`CudaTransformerModel.G3PlaneChargeBytes`), so G3 still runs at a full
+window, at the cost of window size.
+
+TwIL-8B Q4_K_M cold prefill, framework RTX 3060 eGPU (x4 link), `run --json`, 2 reps (r1 / r2). These are
+**functional-only** numbers from a contended laptop, not benchmarks:
+
+| chunk | 2,693 tokens | 8,392 tokens | served window (`serve --no-paged`) |
+|---|---|---|---|
+| unchunked | 810 / 800 | 59 / 59 (G3 declined, `attention_f16`) | 17,408 |
+| 512 | 733 / 825 | 723 / 724 | |
+| **1024 (default)** | 933 / 749 | 808 / 820 | **32,768** |
+| 2048 | 920 / 950 (re-run; r2 was refused admission once) | 913 / 915 | 29,696 |
+| 4096 | 860 / 776 | 912 / 925 | |
+
+q8_0 KV at 8,392 tokens: 51 / 51 unchunked (G3 declined) and 54 / 55 at 1,024, because the quantized cache
+has no offset path (#1846). Greedy text was identical across every chunk size in the table, per prompt and
+per KV type (32 tokens). A 31,548-token prompt on the 32,768 window completed with no spill and flat shared
+GPU memory. Its prefill ran at 227 tok/s: the offset path's query-row chunks shrink as the cached history grows.
+
 ## cuBLAS GEMM/GEMV
 
 cuBLAS provides the most compute-intensive operations:
@@ -653,7 +690,11 @@ Layers are assigned bottom-up: GPU gets layers 0..N-1 (lower/earlier layers), CP
 
 ### KV-Cache Split
 
-GPU layers store their KV-cache in FP16 GPU device memory (`CudaKvCache`). CPU layers store their KV-cache in FP32 host memory (`SimpleKvCache`). A `HybridKvCache` routes KV operations by layer index:
+GPU layers store their KV-cache in FP16 GPU device memory (`CudaKvCache`). CPU layers store theirs as Q8_0 blocks in host memory
+(`QuantizedKvCache`, read in place by the CPU attention; #1851, it was an FP32 `SimpleKvCache` at 4x the bytes, against the no-FP32-storage
+rule). When `head_dim` is not a multiple of 32 the Q8_0 blocks would straddle heads, so the tail stores F16 rows instead
+(`HybridF16TailKvCache`, logged once with its per-token cost). That is a temporary workaround until quantized KV supports these
+head sizes (#1870); it is never FP32. `HybridKvCache` reports the GPU half's bytes as `IDeviceResidentKvCache`. It routes KV operations by layer index:
 
 - Layers 0..N-1: GPU cache, updated via device-side copies (`UpdateDevice`)
 - Layers N..L-1: CPU cache, updated via standard `IKvCache.Update()` with remapped indices
@@ -694,14 +735,58 @@ Approximate formula:
 VRAM ≈ (N / L) × model_weight_bytes + embed_bytes + gpu_kv_cache + gpu_scratch
 ```
 
+### Automatic layer count (`--gpu-layers auto`)
+
+`--gpu-layers auto` (issue #1851) picks N with `LayerSplitPlanner` (`DotLLM.Core.Configuration`), from figures `CudaAutoSplit` measures with
+the CUDA context, stream, cuBLAS, kernels and the fixed forward buffers already created:
+
+| Term | Charged | Source |
+|------|---------|--------|
+| Free VRAM | | `cuMemGetInfo`, clamped by `DOTLLM_VRAM_BUDGET_MB` |
+| Reserve | once | `DOTLLM_CUDA_VRAM_RESERVE_MB` (default 256 MiB), the admission reserve |
+| Token embedding + lazy dequant scratch | once | as `CudaWeights` uploads it (FP16 table when no per-row lookup kernel exists) |
+| Forward scratch | once | `ActivationBytesPerToken` x the prefill chunk: a split prefills 1024 tokens per forward (`--prefill-chunk-size` overrides) in run, chat and serve |
+| Layer weights | per GPU layer | raw quantized blocks, plus an FP16 copy for a projection type without a quantized GEMV |
+| F16 KV | per GPU layer | `2 x kvHeads x headDim x 2` bytes x the context |
+| Final norm + LM head | only when every layer fits | otherwise it runs on the tail |
+
+The context is `--ctx-size`, else 4096 (as the MoE expert planner), capped at the model's window, and a split model serves no more than
+that window. The result is the largest prefix that fits, at most L-1 layers so the tail keeps the head. Then:
+
+- **Every layer fits:** `CudaTransformerModel`, as without the flag.
+- **A split:** `HybridTransformerModel` with N GPU layers.
+- **Not one layer fits:** a refusal (`DeviceMemoryAdmissionException`). Under `--device auto` the next device is tried.
+
+The tier order is dGPU, then the iGPU, then the CPU. The planner models the iGPU tier: the tail goes there when an integrated Vulkan device is
+present and holds all of it. No dGPU + iGPU host is wired yet (#1863), so that case is logged ("the dGPU + iGPU split is not available yet")
+and the tail runs on the CPU.
+
+A line such as `--gpu-layers auto: 18 cuda + 10 cpu layers for a 4096-token context (...)` logs the placement and the numbers behind it.
+
+What can be split automatically (`GpuOffloadPlanner.AutoSplitBlocker`, `CudaAutoSplit.Blocker`) is dense Llama-style layers, plus Granite
+whose only scalar is the attention multiplier (TwIL-8B: folded into RoPE on the GPU half, Q pre-scaled on the CPU tail). These are refused
+with the reason:
+- MoE, MLA and hybrid-SSM models.
+- Per-layer sliding-window patterns and dense YaRN (#432: the CPU tail has neither).
+- Attention sinks.
+- Gemma, full-scalar Granite, SmolLM3 and OLMo-2 (#1864).
+
+A refused model loads whole on the GPU, or `--device auto` moves on, saying why.
+
+`--gpu-layers N` weights are admitted before upload too, so an N that does not fit is refused with the numbers instead of being backed by shared
+system memory.
+
 ### Edge Cases
 
 | Scenario | Behavior |
 |----------|----------|
 | `--gpu-layers 0` | Pure CPU, no CUDA initialization (safe on machines without GPU) |
-| `--gpu-layers N >= L` | Pure GPU, identical to `--device gpu` |
+| `--gpu-layers N >= L`, `all`, `-1` | Pure GPU, identical to `--device gpu` |
 | `--gpu-layers 1` | Single layer on GPU — minimal GPU acceleration, validates pipeline |
 | `--device gpu --gpu-layers N` | Explicit GPU device with partial offload — uses specified GPU ordinal |
+| `--device gpu --gpu-layers auto` | The planner chooses N on that device; refuses when not one layer fits |
+| `--device gpu` (no `--gpu-layers`), model too large | Refused before loading, with a `--gpu-layers auto` hint when the model can be split |
+| `--device auto`, model too large for the CUDA device | Tried as `--gpu-layers auto` on it first, then Vulkan, then the CPU |
 
 ### Numerical Precision
 
@@ -710,7 +795,8 @@ GPU layers compute in FP16 (Half precision). At the boundary, the hidden state i
 ### Implementation
 
 - `HybridTransformerModel` — `IModel` implementation orchestrating split forward pass
-- `HybridKvCache` — Routes `IKvCache` operations to `CudaKvCache` or `SimpleKvCache` by layer
+- `HybridKvCache` — Routes `IKvCache` operations to `CudaKvCache` or the Q8_0 `QuantizedKvCache` by layer
+- `LayerSplitPlanner` / `CudaAutoSplit` — `--gpu-layers auto` (#1851)
 - `CudaQuantizedKvCache` — Q8_0/Q4_0 GPU KV-cache with FP16 scratch-buffer attention (see [KV_CACHE.md](KV_CACHE.md))
 - `CudaWeights.LoadFromGguf(numGpuLayers)` — Partial weight upload to VRAM
 

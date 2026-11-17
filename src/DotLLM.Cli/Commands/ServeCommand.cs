@@ -39,7 +39,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Number of GPU layers for hybrid offloading.</summary>
         [CommandOption("--gpu-layers")]
-        [Description("CUDA partial offload: number of transformer layers kept on the GPU, the rest run on the CPU. Omit for all layers on a GPU device (0 with --device cpu). Ignored on vulkan, where the whole model is device-resident.")]
+        [Description(DotLLM.Cli.Helpers.GpuLayersConverter.OptionHelp)]
+        [System.ComponentModel.TypeConverter(typeof(DotLLM.Cli.Helpers.GpuLayersConverter))]
         public int? GpuLayers { get; set; }
 
         /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
@@ -300,11 +301,13 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
                      "(capped at the checkpoint's window); past the fit, requests are refused with an out-of-memory error instead of spilling into system RAM.")]
         public int? CtxSize { get; set; }
 
-        /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
+        /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog); null = the backend default (#1862).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
-        [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). With the continuous-batch scheduler this caps prefill tokens admitted per step instead.")]
-        [DefaultValue(0)]
-        public int PrefillChunkSize { get; set; }
+        [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass. Default: " +
+                     "1024 on dense CUDA with --no-paged and f16 KV (bounds the forward scratch so the VRAM-fitted window is larger, and lets " +
+                     "a client disconnect stop a long prefill); one pass elsewhere. With the continuous-batch scheduler this caps prefill " +
+                     "tokens admitted per step instead.")]
+        public int? PrefillChunkSize { get; set; }
 
         /// <summary>Repeat guard: identical tokens in a row that end a request as finish_reason=length (#1291).</summary>
         [CommandOption("--repeat-guard")]
@@ -485,6 +488,81 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
     }
 
     /// <summary>
+    /// The <see cref="ServerOptions"/> a <c>serve</c> invocation runs with, from its parsed settings (pure, so a test can check what
+    /// reaches the server, e.g. that an omitted <c>--prefill-chunk-size</c> stays null so the backend default applies, #1862).
+    /// </summary>
+    /// <param name="settings">The parsed settings.</param>
+    /// <param name="maxMessages">The resolved <c>--max-messages</c> cap.</param>
+    /// <returns>The options; <see cref="ServerOptions.ModelId"/> is "none" until a model resolves.</returns>
+    internal static ServerOptions BuildServerOptions(Settings settings, int? maxMessages)
+        => new ServerOptions
+        {
+            MaxMessages = maxMessages,
+            Model = settings.Model ?? "",
+            ExpectedConcurrency = settings.ExpectedConcurrency,
+            AutoPull = settings.AutoPull,
+            DecisionTemperature = settings.DecisionTemperature,
+            DecisionOrderings = Math.Clamp(settings.DecisionOrderings, 1, 2),
+            Quant = settings.Quant,
+            Device = settings.Device,
+            GpuLayers = settings.GpuLayers,
+            MoeOffload = DotLLM.Cli.Helpers.MoeOffloadCli.Build(settings.MoeValues),
+            Threads = settings.Threads,
+            DecodeThreads = settings.DecodeThreads,
+            Host = settings.Host,
+            Port = settings.Port,
+            CacheTypeK = settings.KvQuantK ?? settings.CacheTypeK,
+            CacheTypeV = settings.KvQuantV ?? settings.CacheTypeV,
+            PromptCacheEnabled = !settings.NoPromptCache,
+            PromptCacheSize = settings.PromptCacheSize,
+            PromptCachePolicy = ServerOptions.ParsePromptCachePolicy(settings.PromptCachePolicy),
+            Warmup = new WarmupOptions
+            {
+                Enabled = !settings.NoWarmup,
+                Iterations = settings.WarmupIterations,
+            },
+            UsePaged = !settings.NoPaged,
+            SpeculativeModel = settings.SpeculativeModel,
+            SpeculativeCandidates = settings.SpeculativeK,
+            PromptLookup = settings.PromptLookupOptions,
+            MtpEnabled = !settings.NoMtp,
+            MtpExplicit = settings.Mtp && !settings.NoMtp,
+            MtpHeadPath = settings.MtpHead,
+            DFlashPath = settings.DFlash,
+            ReasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(settings.ReasoningFormat),
+            ReasoningBudget = Math.Max(-1, settings.ReasoningBudget),
+            ReasoningBudgetMessage = settings.ReasoningBudgetMessage,
+            ReasoningAnswerReserve = Math.Max(0, settings.ReasoningAnswerReserve),
+            PrefillChunkSize = settings.PrefillChunkSize,
+            PrefixSnapshots = settings.PrefixSnapshots,
+            PrefixSnapshotHostBudgetBytes = ServerOptions.ParsePrefixSnapshotHostBudget(settings.PrefixSnapshotHostBudget),
+            PrefixSnapshotDiskDirectory = settings.PrefixSnapshotDiskDirectory,
+            PrefixSnapshotDiskBudgetBytes = ServerOptions.ParsePrefixSnapshotDiskBudget(settings.PrefixSnapshotDiskBudget),
+            PromptCacheStep = settings.PromptCacheStep,
+            PromptCacheStepKeep = settings.PromptCacheStepKeep,
+            ContextSize = settings.CtxSize is > 0 ? settings.CtxSize : null,
+            KeepAliveSeconds = settings.KeepAlive,
+            MaxResidentModels = settings.MaxResidentModels,
+            ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,
+            AllowModelAdminApi = settings.AllowModelAdmin,
+            Metrics = settings.NoMetrics ? false : settings.Metrics ? true : null,
+            AllowLoraAdminApi = settings.AllowLoraAdmin,
+            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(settings.ChunkCache, settings.ChunkCacheMaxChunks, settings.ChunkStore, settings.ChunkCacheApiKeys, settings.ChunkCacheAllowShortKeys),
+            TernaryAdapterPaths = settings.TernaryAdapterPaths is { Length: > 0 } ? settings.TernaryAdapterPaths : null,
+            TensorOverlayPath = settings.TensorOverlay,
+            OverlaySkipBaseHash = settings.OverlaySkipBaseHash,
+            // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
+            // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,
+            // and the limiter was exercised only by unit tests constructing the config directly.
+            // Off unless a cap is given, so the default behaviour is unchanged.
+            RateLimit = BuildRateLimit(settings),
+            ModelId = "none",
+            RopeOverride = ServerOptions.BuildRopeOverride(settings.RopeScaling, settings.RopeFreqBase,
+                settings.RopeScale, settings.YarnOrigCtx, settings.YarnAttnFactor,
+                settings.YarnBetaFast, settings.YarnBetaSlow),
+        };
+
+    /// <summary>
     /// Builds the rate-limit config from the CLI options (#457), or <see langword="null"/> when
     /// no cap was requested.
     /// </summary>
@@ -557,72 +635,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             return 1;
         }
 
-        var serverOptions = new ServerOptions
-        {
-            MaxMessages = maxMessages,
-            Model = settings.Model ?? "",
-            ExpectedConcurrency = settings.ExpectedConcurrency,
-            AutoPull = settings.AutoPull,
-            DecisionTemperature = settings.DecisionTemperature,
-            DecisionOrderings = Math.Clamp(settings.DecisionOrderings, 1, 2),
-            Quant = settings.Quant,
-            Device = settings.Device,
-            GpuLayers = settings.GpuLayers,
-            MoeOffload = DotLLM.Cli.Helpers.MoeOffloadCli.Build(settings.MoeValues),
-            Threads = settings.Threads,
-            DecodeThreads = settings.DecodeThreads,
-            Host = settings.Host,
-            Port = settings.Port,
-            CacheTypeK = settings.KvQuantK ?? settings.CacheTypeK,
-            CacheTypeV = settings.KvQuantV ?? settings.CacheTypeV,
-            PromptCacheEnabled = !settings.NoPromptCache,
-            PromptCacheSize = settings.PromptCacheSize,
-            PromptCachePolicy = ServerOptions.ParsePromptCachePolicy(settings.PromptCachePolicy),
-            Warmup = new WarmupOptions
-            {
-                Enabled = !settings.NoWarmup,
-                Iterations = settings.WarmupIterations,
-            },
-            UsePaged = !settings.NoPaged,
-            SpeculativeModel = settings.SpeculativeModel,
-            SpeculativeCandidates = settings.SpeculativeK,
-            PromptLookup = settings.PromptLookupOptions,
-            MtpEnabled = !settings.NoMtp,
-            MtpExplicit = settings.Mtp && !settings.NoMtp,
-            MtpHeadPath = settings.MtpHead,
-            DFlashPath = settings.DFlash,
-            ReasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(settings.ReasoningFormat),
-            ReasoningBudget = Math.Max(-1, settings.ReasoningBudget),
-            ReasoningBudgetMessage = settings.ReasoningBudgetMessage,
-            ReasoningAnswerReserve = Math.Max(0, settings.ReasoningAnswerReserve),
-            PrefillChunkSize = settings.PrefillChunkSize,
-            PrefixSnapshots = settings.PrefixSnapshots,
-            PrefixSnapshotHostBudgetBytes = ServerOptions.ParsePrefixSnapshotHostBudget(settings.PrefixSnapshotHostBudget),
-            PrefixSnapshotDiskDirectory = settings.PrefixSnapshotDiskDirectory,
-            PrefixSnapshotDiskBudgetBytes = ServerOptions.ParsePrefixSnapshotDiskBudget(settings.PrefixSnapshotDiskBudget),
-            PromptCacheStep = settings.PromptCacheStep,
-            PromptCacheStepKeep = settings.PromptCacheStepKeep,
-            ContextSize = settings.CtxSize is > 0 ? settings.CtxSize : null,
-            KeepAliveSeconds = settings.KeepAlive,
-            MaxResidentModels = settings.MaxResidentModels,
-            ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,
-            AllowModelAdminApi = settings.AllowModelAdmin,
-            Metrics = settings.NoMetrics ? false : settings.Metrics ? true : null,
-            AllowLoraAdminApi = settings.AllowLoraAdmin,
-            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(settings.ChunkCache, settings.ChunkCacheMaxChunks, settings.ChunkStore, settings.ChunkCacheApiKeys, settings.ChunkCacheAllowShortKeys),
-            TernaryAdapterPaths = settings.TernaryAdapterPaths is { Length: > 0 } ? settings.TernaryAdapterPaths : null,
-            TensorOverlayPath = settings.TensorOverlay,
-            OverlaySkipBaseHash = settings.OverlaySkipBaseHash,
-            // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
-            // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,
-            // and the limiter was exercised only by unit tests constructing the config directly.
-            // Off unless a cap is given, so the default behaviour is unchanged.
-            RateLimit = BuildRateLimit(settings),
-            ModelId = "none",
-            RopeOverride = ServerOptions.BuildRopeOverride(settings.RopeScaling, settings.RopeFreqBase,
-                settings.RopeScale, settings.YarnOrigCtx, settings.YarnAttnFactor,
-                settings.YarnBetaFast, settings.YarnBetaSlow),
-        };
+        var serverOptions = BuildServerOptions(settings, maxMessages);
 
         ServerState? state = null;
 
