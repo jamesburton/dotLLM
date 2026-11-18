@@ -72,7 +72,8 @@ public static class TurboQuantKvSupport
         if (!kv.IsTurboQuantAny) return null;
 
         if (kv.IsTurboQuantMixed)
-            return Refuse($"TurboQuant KV must be used for both K and V (got K={kv.KeyDType}, V={kv.ValueDType}); mixed K/V pairs with TurboQuant arrive in step 6");
+            return Refuse($"TurboQuant KV must be used for both K and V (got K={kv.KeyDType}, V={kv.ValueDType}): pass the same tq value to both " +
+                "--cache-type-k and --cache-type-v; mixed K/V pairs with TurboQuant arrive in step 6");
         if (ctx.Backend is KvBackendKind.Cuda or KvBackendKind.Vulkan or KvBackendKind.Hip)
             return Refuse($"TurboQuant KV does not run on {ctx.Backend.ToString().ToLowerInvariant()} yet (step 2)");
         if (ctx.Command is KvCommand.Run or KvCommand.Chat)
@@ -93,6 +94,13 @@ public static class TurboQuantKvSupport
             return Refuse($"TurboQuant KV does not run on the {ctx.Config.Architecture} CPU model yet");
         return null;
     }
+
+    /// <summary>The refusal for two TurboQuant sides whose bit width or QJL flag differ (a mixed format, #1887 step 6).</summary>
+    /// <param name="keyText">The K flag as given (e.g. <c>tq3</c>).</param>
+    /// <param name="valueText">The V flag as given.</param>
+    /// <returns>The refusal reason.</returns>
+    public static string MixedFormatRefusal(string keyText, string valueText)
+        => Refuse($"TurboQuant K and V must use the same format (got --cache-type-k {keyText}, --cache-type-v {valueText}); mixed TurboQuant formats arrive in step 6");
 
     /// <summary>The backend <paramref name="model"/> runs on, by its type: Vulkan, CUDA (including the GPU/CPU split) or HIP models, else CPU.
     /// The post-load host rule (an exact <c>TransformerModel</c> type check) backstops any model this misclassifies.</summary>

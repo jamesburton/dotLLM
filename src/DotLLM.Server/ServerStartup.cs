@@ -575,6 +575,43 @@ public static class ServerStartup
     /// Opens only the metadata of the <c>--speculative-model</c> draft (the file is mapped, no tensor is read) and rejects architectures the dense draft
     /// loader cannot take. A draft that is missing or unreadable is left to the real load below, which reports it as before.
     /// </summary>
+    /// <summary>
+    /// The KV storage <paramref name="options"/> asks for. K and V are parsed independently (#1888): a TurboQuant side carries its own
+    /// bit width and QJL flag, and <paramref name="formatMismatch"/> reports two TurboQuant sides that disagree (a mixed format, #1887 step 6).
+    /// </summary>
+    internal static KvCacheConfig BuildKvConfig(ServerOptions options, out string? formatMismatch)
+    {
+        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK ?? "f32", out int kBits, out bool kQjl);
+        var valueDType = KvCacheConfig.ParseDType(options.CacheTypeV ?? "f32", out int vBits, out bool vQjl);
+        bool kTq = keyDType == KvCacheDType.TurboQuant, vTq = valueDType == KvCacheDType.TurboQuant;
+        int bits = kTq ? kBits : vTq ? vBits : 0;
+        bool qjl = kTq ? kQjl : vTq && vQjl;
+        formatMismatch = kTq && vTq && (kBits != vBits || kQjl != vQjl)
+            ? TurboQuantKvSupport.MixedFormatRefusal(options.CacheTypeK!, options.CacheTypeV!)
+            : null;
+        return new KvCacheConfig(keyDType, valueDType, TurboQuantBits: bits > 0 ? bits : 4, TurboQuantUseQjl: qjl);
+    }
+
+    /// <summary>
+    /// The TurboQuant refusal decidable before the model loads (#1888): mixed formats, a GPU device, the paged cache, the geometry, a draft
+    /// model. Null when nothing is wrong yet; the post-load pass then checks the backend an <c>auto</c> device landed on, the host and MTP.
+    /// </summary>
+    internal static string? PreLoadTurboQuantRefusal(ServerOptions options, ModelConfig config)
+    {
+        var kv = BuildKvConfig(options, out string? mismatch);
+        if (mismatch is not null) return mismatch;
+        var backend = DeviceSpec.Parse(options.Device).Kind switch
+        {
+            DeviceKind.Cpu => KvBackendKind.Cpu,
+            DeviceKind.Cuda => KvBackendKind.Cuda,
+            DeviceKind.Vulkan => KvBackendKind.Vulkan,
+            _ => KvBackendKind.Unknown,
+        };
+        return TurboQuantKvSupport.RefusalReason(kv, new TurboQuantContext(
+            KvCommand.Serve, backend, options.UsePaged, config, HostIsPlainCpuTransformer: null,
+            HasDraftModel: !string.IsNullOrEmpty(options.SpeculativeModel), MtpWillAttach: false));
+    }
+
     private static void ValidateSpeculativeDraftEarly(ServerOptions options, ModelConfig target)
     {
         if (string.IsNullOrEmpty(options.SpeculativeModel)) return;
@@ -653,6 +690,13 @@ public static class ServerStartup
         // A draft that cannot load must fail NOW, not after the target (up to tens of GiB) is resident, and not as a "device" failure (#1319).
         ValidateSpeculativeDraftEarly(options, config);
 
+        // #1888: a TurboQuant KV request that cannot run for real fails now, before the weights load.
+        if (PreLoadTurboQuantRefusal(options, config) is { } tqRefusal)
+        {
+            gguf.Dispose();
+            throw new InvalidServerOptionException(tqRefusal);
+        }
+
         if (options.GpuLayers is { } requestedLayers && requestedLayers > config.NumLayers)
             Console.WriteLine($"[dotllm] Requested {requestedLayers} GPU layers but {Path.GetFileName(resolvedPath)} has {config.NumLayers}; using all {config.NumLayers}.");
 
@@ -707,20 +751,35 @@ public static class ServerStartup
         // Tool call parser
         var toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
 
-        // KV-cache configuration. TurboQuant applies uniformly to K and V, so its bit-width and
-        // QJL flag are taken from the key dtype string (e.g. "tq4", "tq4q").
-        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK ?? "f32", out int tqBits, out bool tqUseQjl);
-        var kvConfig = new KvCacheConfig(
-            keyDType,
-            KvCacheConfig.ParseDType(options.CacheTypeV ?? "f32"),
-            TurboQuantBits: tqBits > 0 ? tqBits : 4,
-            TurboQuantUseQjl: tqUseQjl);
+        // KV-cache configuration. K and V are parsed independently; a TurboQuant side carries its bit width and QJL flag (#1888).
+        var kvConfig = BuildKvConfig(options, out _);   // a mismatch was refused before load
+        // #1888: the post-load pass - the backend an auto device landed on, the host model, an attaching MTP head.
+        if (TurboQuantKvSupport.RefusalReason(kvConfig, new TurboQuantContext(
+                KvCommand.Serve, TurboQuantKvSupport.BackendOf(model), options.UsePaged, config,
+                HostIsPlainCpuTransformer: model.GetType() == typeof(TransformerModel),
+                HasDraftModel: !string.IsNullOrEmpty(options.SpeculativeModel),
+                MtpWillAttach: options.MtpEnabled && model.SupportsMtp)) is { } tqPostRefusal)
+        {
+            model.Dispose();
+            gguf.Dispose();
+            throw new InvalidServerOptionException(tqPostRefusal);
+        }
 
         Func<ModelConfig, int, IKvCache>? kvFactory = null;
         PagedKvCacheFactory? pagedFactory = null;
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
         PrefixTrieManager? prefixTrieManager = null;
-        if (vulkanKvFactory is not null)
+        if (kvConfig.IsTurboQuantAny)
+        {
+            // #1888: first, so no later branch can take a TurboQuant request (IsQuantized excludes it, so every branch below used to). The
+            // post-load pass has refused every context but the real one: the plain CPU transformer, not paged.
+            Console.WriteLine($"[dotllm] Using TurboQuant KV-cache ({kvConfig.TurboQuantBits}-bit, data-oblivious" +
+                (kvConfig.TurboQuantUseQjl ? ", QJL unbiased scores)." : ")."));
+            kvFactory = (cfg, size) => new TurboQuantKvCache(
+                DotLLM.Core.Attention.KvGeometry.SlotCount(cfg), cfg.NumKvHeads, cfg.HeadDim, size,
+                kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed, kvConfig.TurboQuantUseQjl);
+        }
+        else if (vulkanKvFactory is not null)
         {
             // Vulkan models own their device-resident KV storage. Requests run one at a time through the
             // per-request TextGenerator unless the opt-in Vulkan scheduler below engages (hybrid models,
@@ -900,14 +959,6 @@ public static class ServerStartup
             kvFactory = (cfg, size) => new QuantizedKvCache(
                 DotLLM.Core.Attention.KvGeometry.FromConfig(cfg, model?.SupportsCompactSlidingKv == true), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
-        }
-        else if (kvConfig.IsTurboQuant)
-        {
-            Console.WriteLine($"[dotllm] Using TurboQuant KV-cache ({kvConfig.TurboQuantBits}-bit, data-oblivious" +
-                (kvConfig.TurboQuantUseQjl ? ", QJL unbiased scores)." : ")."));
-            kvFactory = (cfg, size) => new TurboQuantKvCache(
-                DotLLM.Core.Attention.KvGeometry.SlotCount(cfg), cfg.NumKvHeads, cfg.HeadDim, size,
-                kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed, kvConfig.TurboQuantUseQjl);
         }
 
         // Vulkan (single-request path): the cache a request filled stays resident and a later request adopts its longest common prefix
