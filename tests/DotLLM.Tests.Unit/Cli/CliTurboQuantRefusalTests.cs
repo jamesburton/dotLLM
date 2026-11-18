@@ -42,3 +42,35 @@ public class CliTurboQuantRefusalTests
     public void Run_UnknownKvType_IsLeftToTheFlagParser()
         => Assert.Null(KvStorageCli.TurboQuantRefusal(KvCommand.Run, "bogus", null));
 }
+
+/// <summary>#1888: the real command tree refuses before resolving or loading the model (kills a removed call site in run / chat).</summary>
+[Collection(CliConsoleCollection.Name)]
+public sealed class CliTurboQuantCommandTests
+{
+    private static (int Code, string Output) Run(params string[] args)
+    {
+        var (out0, err0) = (Console.Out, Console.Error);
+        var sw = new StringWriter();
+        Console.SetOut(sw);
+        Console.SetError(sw);
+        try { return (CliCommandModel.Run(args).ExitCode, sw.ToString()); }
+        finally { Console.SetOut(out0); Console.SetError(err0); }
+    }
+
+    [Fact]
+    public void Run_Tq4_ExitsNonZero_WithTheRefusal()
+    {
+        var (code, output) = Run("run", "no-such-model-1888", "-p", "hi", "--cache-type-k", "tq4", "--cache-type-v", "tq4", "--json");
+        Assert.NotEqual(0, code);
+        Assert.Contains("#1887", output);
+    }
+
+    [Fact]
+    public void Chat_Tq4_ExitsNonZero_WithTheRefusal()
+    {
+        var (code, output) = Run("chat", "no-such-model-1888", "--cache-type-k", "tq4", "--cache-type-v", "tq4");
+        Assert.NotEqual(0, code);
+        Assert.Contains("#1887", output);
+    }
+}
+
