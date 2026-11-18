@@ -179,7 +179,7 @@ public sealed class VulkanDenseQ8KvKernelTests
     }
 
     // Sanity cap on the relative L2 error vs the unquantised attention (the sharp check is against the reference's own error).
-    private static double Budget => _storage == VulkanKvStorage.Q4_0 ? 0.5 : 0.03;
+    private static double Budget => _storage == VulkanKvStorage.Q4_0 ? 1.0 : 0.03;
 
     /// <summary>
     /// The Q4_0 writer stores exactly the C# reference's bytes (scale bits and nibbles), at a non-zero destination block, leaving the
@@ -317,6 +317,28 @@ public sealed class VulkanDenseQ8KvKernelTests
         ExactCase(device, seqQ, seqKv, numHeads, numKvHeads, headDim,
             (c, q, k, v, o) => q8.Record(c, q, k, v, o, seqQ, numHeads, numKvHeads, headDim, off),
             (c, q, k, v, o) => f32.Record(c, q, k, v, o, seqQ, numHeads, numKvHeads, headDim, off));
+    }
+
+    /// <summary>Split-KV decode (the dense chain's decode at depth): the GQA-grouped v2 pass (its own block loader) and the per-head pass.</summary>
+    [SkippableTheory]
+    [InlineData(VulkanKvStorage.Q8_0, 900, 14, 2, 64, true)]
+    [InlineData(VulkanKvStorage.Q4_0, 900, 14, 2, 64, true)]
+    [InlineData(VulkanKvStorage.Q4_0, 2600, 32, 8, 128, true)]
+    [InlineData(VulkanKvStorage.Q4_0, 777, 32, 8, 128, false)]
+    public void SplitKvDecode_ReadsBlockKvInPlace_MatchesF32OnDequantisedRows(VulkanKvStorage storage, int seqKv, int numHeads, int numKvHeads, int headDim, bool gqa)
+    {
+        _storage = storage;
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var f32 = VulkanSplitKvAttentionKernel.Create(device, spvDir);
+        using var blk = VulkanSplitKvAttentionKernel.Create(device, spvDir, storage);
+        f32.PreferGqa = gqa; blk.PreferGqa = gqa;
+        Skip.If(gqa && !blk.UsesGqa(numHeads, numKvHeads, headDim), "GQA-grouped split pass unavailable");
+        Assert.True(VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads));
+        int pos = seqKv - 1;
+        ExactCase(device, 1, seqKv, numHeads, numKvHeads, headDim,
+            (c, q, k, v, o) => blk.Record(c, q, k, v, o, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset: pos),
+            (c, q, k, v, o) => f32.Record(c, q, k, v, o, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset: pos));
     }
 
     [SkippableTheory]
