@@ -25,6 +25,13 @@ public enum VulkanKvStorage
     /// (<see cref="VulkanKvStorageExtensions.EnvVar"/> = <c>q8_0</c>). Rows must be a multiple of 32 elements.
     /// </summary>
     Q8_0 = 2,
+
+    /// <summary>
+    /// Q4_0 (issue #1884), 20-byte blocks of 32 elements (<c>[float scale][16 bytes]</c>, 0.625 bytes per element) in the CPU / CUDA KV
+    /// convention (adjacent-pair nibbles, value = (nibble - 8) * scale, scale = amax / 7), written by <c>convert_f32_to_q4_0_kv_range</c> and
+    /// read in place by the <c>_kvq4</c> twins. Rows must be a multiple of 32 elements.
+    /// </summary>
+    Q4_0 = 3,
 }
 
 /// <summary>Per-format facts the attention kernels and the KV cache share (issue #1102).</summary>
@@ -46,12 +53,22 @@ public static class VulkanKvStorageExtensions
     /// <summary>Bytes per Q8_0 KV block: a 4-byte F32 scale plus 32 int8 (see <c>kv_load.glsl</c>).</summary>
     public const int Q8BlockBytes = 36;
 
+    /// <summary>Bytes per Q4_0 KV block: a 4-byte F32 scale plus 16 bytes of adjacent-pair nibbles (see <c>kv_load.glsl</c>, #1884).</summary>
+    public const int Q4BlockBytes = 20;
+
+    /// <summary>True for the 32-element block formats (Q8_0, Q4_0): rows are sized by <see cref="RowBytes"/>, there is no element size.</summary>
+    /// <param name="storage">The storage format.</param>
+    /// <returns>Whether the format is block-quantised.</returns>
+    public static bool IsBlockQuantized(this VulkanKvStorage storage) => storage is VulkanKvStorage.Q8_0 or VulkanKvStorage.Q4_0;
+
     /// <summary>Bytes of one cached row of <paramref name="stride"/> elements in this format (Q8_0 needs a multiple of 32).</summary>
     /// <param name="storage">The storage format.</param>
     /// <param name="stride">Elements per row.</param>
     /// <returns>Row bytes.</returns>
-    public static long RowBytes(this VulkanKvStorage storage, long stride) => storage == VulkanKvStorage.Q8_0
-        ? (stride % Q8BlockElements == 0 ? stride / Q8BlockElements * Q8BlockBytes : throw new ArgumentException($"A Q8_0 KV row must be a multiple of {Q8BlockElements} elements; got {stride}.", nameof(stride)))
+    public static long RowBytes(this VulkanKvStorage storage, long stride) => storage.IsBlockQuantized()
+        ? (stride % Q8BlockElements == 0
+            ? stride / Q8BlockElements * (storage == VulkanKvStorage.Q8_0 ? Q8BlockBytes : Q4BlockBytes)
+            : throw new ArgumentException($"A {storage} KV row must be a multiple of {Q8BlockElements} elements; got {stride}.", nameof(stride)))
         : stride * storage.ElementBytes();
 
     /// <summary>
@@ -66,6 +83,7 @@ public static class VulkanKvStorageExtensions
         VulkanKvStorage.F32 => f32ShaderName,
         VulkanKvStorage.F16 => f32ShaderName + "_kvf16",
         VulkanKvStorage.Q8_0 => f32ShaderName + "_kvq8",
+        VulkanKvStorage.Q4_0 => f32ShaderName + "_kvq4",
         _ => throw new ArgumentOutOfRangeException(nameof(storage)),
     };
 
@@ -103,6 +121,7 @@ public static class VulkanKvStorageExtensions
             "f32" or "fp32" => VulkanKvStorage.F32,
             "f16" or "fp16" => VulkanKvStorage.F16,
             "q8_0" or "q8" when allowQ8 => VulkanKvStorage.Q8_0,
+            "q4_0" or "q4" when allowQ8 => VulkanKvStorage.Q4_0,   // #1884: hosts with in-place block KV (allowQ8 = block formats)
             _ => throw new NotSupportedException(
                 $"KV storage '{raw}' is not available on Vulkan for this model; use f16 (half the KV of the f32 default)."),
         };

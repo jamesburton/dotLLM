@@ -63,6 +63,17 @@ vec4 q8Group(uint w, float d) {
 }
 vec4 loadK(uint i) { uint e = i << 2u, b = (e >> 5u) * 9u; return q8Group(kw[b + 1u + ((e & 31u) >> 2u)], uintBitsToFloat(kw[b])); }
 vec4 loadV(uint i) { uint e = i << 2u, b = (e >> 5u) * 9u; return q8Group(vw[b + 1u + ((e & 31u) >> 2u)], uintBitsToFloat(vw[b])); }
+#elif defined(KV_Q4)
+// Q4_0 rows (kv_load.glsl KV_Q4 layout, #1884): 20-byte blocks [float scale][16 bytes], adjacent-pair nibbles. Group i is elements
+// 4i..4i+3: two bytes, the 16-bit half ((4i & 31) >> 2) & 1 of word 1 + ((4i & 31) >> 3) of block (4i) >> 5.
+layout(set = 0, binding = 1, std430) readonly  buffer BufK   { uint kw[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufV   { uint vw[]; };
+vec4 q4Group(uint w, uint e, float d) {
+    uint h = w >> (((e >> 2u) & 1u) << 4u);
+    return (vec4(float(h & 15u), float((h >> 4u) & 15u), float((h >> 8u) & 15u), float((h >> 12u) & 15u)) - 8.0) * d;
+}
+vec4 loadK(uint i) { uint e = (i << 2u) & 31u, b = (i >> 3u) * 5u; return q4Group(kw[b + 1u + (e >> 3u)], e, uintBitsToFloat(kw[b])); }
+vec4 loadV(uint i) { uint e = (i << 2u) & 31u, b = (i >> 3u) * 5u; return q4Group(vw[b + 1u + (e >> 3u)], e, uintBitsToFloat(vw[b])); }
 #else
 layout(set = 0, binding = 1, std430) readonly  buffer BufK   { vec4 k4[]; };      // [seq_kv, num_kv_heads * head_dim] F32
 layout(set = 0, binding = 2, std430) readonly  buffer BufV   { vec4 v4[]; };

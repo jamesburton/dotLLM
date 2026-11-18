@@ -173,7 +173,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         _maxSeqLen = maxSeqLen;
         _kvStride = (int[])kvStridePerLayer.Clone();
         _storage = storage;
-        _elemBytes = storage == VulkanKvStorage.Q8_0 ? 0 : storage.ElementBytes();   // Q8_0 rows are sized by RowBytes; the host-staged element paths refuse Q8_0
+        _elemBytes = storage.IsBlockQuantized() ? 0 : storage.ElementBytes();   // Q8_0 rows are sized by RowBytes; the host-staged element paths refuse Q8_0
         _rows = rows;
 
         _keys = new VulkanDevice.Buffer[_numLayers];
@@ -186,8 +186,8 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
                     $"Per-layer KV stride must be positive; layer {i} = {_kvStride[i]}.");
             if (storage == VulkanKvStorage.F16 && (_kvStride[i] & 1) != 0)
                 throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer), $"An F16 KV row must hold an even element count; layer {i} = {_kvStride[i]}.");
-            if (storage == VulkanKvStorage.Q8_0 && (_kvStride[i] & 31) != 0)
-                throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer), $"A Q8_0 KV row must be a multiple of 32 elements; layer {i} = {_kvStride[i]}.");
+            if (storage.IsBlockQuantized() && (_kvStride[i] & 31) != 0)
+                throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer), $"A {storage} KV row must be a multiple of 32 elements; layer {i} = {_kvStride[i]}.");
             long bytesPerLayer = (long)(rows?.CapacityOf(i) ?? maxSeqLen) * storage.RowBytes(_kvStride[i]);
             _keys[i] = device.AllocateDeviceLocal(bytesPerLayer);
             _values[i] = device.AllocateDeviceLocal(bytesPerLayer);
@@ -306,11 +306,13 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
             rowBase = _rows.BaseOf(layerIndex);
         }
 
-        if (_storage == VulkanKvStorage.Q8_0)
+        if (_storage.IsBlockQuantized())
         {
             // Quantised on the device, one invocation per 32-element block; rows are a multiple of 32 elements, so every append is whole blocks.
             if (!contiguous || q8Writer is null)
-                throw new InvalidOperationException("A Q8_0 KV cache is written by the quantise kernel from contiguous positions only.");
+                throw new InvalidOperationException($"A {_storage} KV cache is written by the quantise kernel from contiguous positions only.");
+            if (q8Writer.Storage != _storage)
+                throw new InvalidOperationException($"The {q8Writer.Storage} writer cannot write a {_storage} KV cache (#1884).");
             long elemOffset = (long)(positions[0] - rowBase) * _kvStride[layerIndex], count = (long)seqLen * _kvStride[layerIndex];
             q8Writer.RecordF32ToQ8(cmdBuf, kDev, _keys[layerIndex], elemOffset, count);
             q8Writer.RecordF32ToQ8(cmdBuf, vDev, _values[layerIndex], elemOffset, count);
@@ -832,8 +834,8 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     // shortcut: the host-staged F32 transport (handoff, ingest) has no F16 arm yet; add one when an F16 model needs cross-device handoff.
     private void RequireNotQ8(string operation)
     {
-        if (_storage == VulkanKvStorage.Q8_0)
-            throw new NotSupportedException($"VulkanKvCache {operation} has no Q8_0 arm (prefix snapshots, handoff and host row access need F16 or F32 KV); the Q8_0 cache is read in place by the attention kernels only.");
+        if (_storage.IsBlockQuantized())
+            throw new NotSupportedException($"VulkanKvCache {operation} has no {_storage} arm (prefix snapshots, handoff and host row access need F16 or F32 KV); the Q8_0 cache is read in place by the attention kernels only.");
     }
 
     // The synchronous test/diagnostic UpdateDevice moves F32 rows only; the host-staged transports (handoff, ingest) convert for F16 (#1151).

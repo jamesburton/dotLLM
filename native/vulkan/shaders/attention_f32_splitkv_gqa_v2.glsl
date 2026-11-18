@@ -53,6 +53,24 @@ RAW loadV8(uint i) {
 }
 vec4 lo4(RAW r) { return r[0]; }
 vec4 hi4(RAW r) { return r[1]; }
+#elif defined(KV_Q4)
+// Q4_0 (#1884, kv_load.glsl KV_Q4 layout: 20-byte blocks, [float scale][16 bytes], adjacent-pair nibbles); a lane's 8 columns are one word.
+layout(set = 0, binding = 1, std430) readonly  buffer BufK       { uint kw[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufV       { uint vw[]; };
+#define RAW mat2x4
+vec4 q4x4(uint h, float sc) { return (vec4(float(h & 15u), float((h >> 4u) & 15u), float((h >> 8u) & 15u), float((h >> 12u) & 15u)) - 8.0) * sc; }
+RAW loadK8(uint i) {
+    uint blk = i >> 5u, w = kw[blk * 5u + 1u + ((i & 31u) >> 3u)];
+    float sc = uintBitsToFloat(kw[blk * 5u]);
+    return mat2x4(q4x4(w, sc), q4x4(w >> 16u, sc));
+}
+RAW loadV8(uint i) {
+    uint blk = i >> 5u, w = vw[blk * 5u + 1u + ((i & 31u) >> 3u)];
+    float sc = uintBitsToFloat(vw[blk * 5u]);
+    return mat2x4(q4x4(w, sc), q4x4(w >> 16u, sc));
+}
+vec4 lo4(RAW r) { return r[0]; }
+vec4 hi4(RAW r) { return r[1]; }
 #elif defined(KV_F16)
 layout(set = 0, binding = 1, std430) readonly  buffer BufK       { uvec4 k8[]; };      // [seq_kv, num_kv_heads * head_dim] F16, 8 per element
 layout(set = 0, binding = 2, std430) readonly  buffer BufV       { uvec4 v8[]; };
