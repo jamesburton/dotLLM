@@ -65,7 +65,7 @@ public sealed class AttentionQueryPositionsKernel : IDisposable
         if (headDim <= 0 || headDim > MaxHeadDim) throw new ArgumentOutOfRangeException(nameof(headDim));
         if (slidingWindow < 0 || softCap < 0 || scaleOverride < 0) throw new ArgumentOutOfRangeException(nameof(slidingWindow));
         long qBytes = (long)seqQ * numHeads * headDim * sizeof(float);
-        long kvBytes = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
+        long kvBytes = KvStorage.RowBytes((long)numKvHeads * headDim) * seqKv;   // RowBytes: Q8_0 rows are 36-byte blocks (#1884)
         if (q.Size < qBytes || output.Size < qBytes) throw new ArgumentException("Q/output buffer too small.");
         if (k.Size < kvBytes || v.Size < kvBytes) throw new ArgumentException("K/V buffer too small.");
         if (queryPositions.Size < (long)seqQ * sizeof(int)) throw new ArgumentException("Positions buffer too small.", nameof(queryPositions));

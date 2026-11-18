@@ -113,7 +113,7 @@ public sealed class VulkanSplitKvRowsAttentionKernel : IDisposable
         if (sinks is not null && sinks.Size < (long)numHeads * sizeof(float)) throw new ArgumentException("Sinks buffer too small.", nameof(sinks));
         int seqKv = positionOffset + seqQ;
         long qBytes = (long)seqQ * numHeads * headDim * sizeof(float);
-        long kvBytes = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
+        long kvBytes = KvStorage.RowBytes((long)numKvHeads * headDim) * seqKv;   // RowBytes: Q8_0 rows are 36-byte blocks (#1884)
         if (q.Size < qBytes || output.Size < qBytes) throw new ArgumentException("Q / output buffer too small.");
         if (k.Size < kvBytes || v.Size < kvBytes) throw new ArgumentException("K / V buffer too small.");
 

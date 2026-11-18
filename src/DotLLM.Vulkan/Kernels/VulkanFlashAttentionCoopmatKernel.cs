@@ -617,7 +617,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * (ActivationsF16 ? sizeof(ushort) : sizeof(float));
-        long kvBytes  = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
+        long kvBytes  = KvStorage.RowBytes((long)numKvHeads * headDim) * seqKv;   // RowBytes: Q8_0 rows are 36-byte blocks (#1884)
         long outBytes = qBytes;
         if (q.Size - qOff      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
         if (k.Size - kOff      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
