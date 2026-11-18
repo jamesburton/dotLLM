@@ -161,6 +161,21 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
     }
 
     [Fact]
+    public async Task PerCallModel_ReplacesTheLaunchDefault()
+    {
+        string tree = NewTree();
+        string store = NewDir("store");
+        await using McpWire wire = await McpWire.StartAsync(["--store", store], new FakeServer(_ => (HttpStatusCode.NotFound, "{}"))); // no launch --model
+        string args = $$"""{"path": {{JsonSerializer.Serialize(tree)}}""";
+
+        JsonElement without = await wire.CallToolAsync("chunkcache_build", args + "}");
+        Assert.True(IsError(without), without.ToString());                 // control: no model anywhere is an error
+        JsonElement with = await wire.CallToolAsync("chunkcache_build", args + $$""", "model": {{JsonSerializer.Serialize(_fx.ModelA)}}}""");
+        Assert.False(IsError(with), with.ToString());
+        Assert.True(with.GetProperty("structuredContent").GetProperty("chunks").GetInt32() > 0);
+    }
+
+    [Fact]
     public async Task Evict_DefaultsToDryRun()
     {
         var fake = new FakeServer(s => s is { Method: "POST", Path: "/v1/chunk-cache/evict" }

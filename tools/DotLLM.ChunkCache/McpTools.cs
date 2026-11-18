@@ -55,7 +55,7 @@ internal static class McpTools
             "Scan a solution or folder, chunk it with a wire-eligible chunker and update the store's index (tokenizer only; nothing is encoded unless encode is true, which queues the missing chunks on the server).",
             Input($$$$"""
                 {"required": ["path"], "properties": {
-                  "store": {"type": "string"}, "server": {"type": "string"},
+                  "store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the server's launch --model"},
                   "path": {"type": "string", "description": ".sln/.slnx/.csproj or folder"},
                   "chunker": {{{{ChunkerProp}}}},
                   "configuration": {"type": "string", "default": "Release"},
@@ -67,7 +67,7 @@ internal static class McpTools
             "Choose the chunks for a context (paths/globs, a symbol's neighbourhood, git changes) under a token budget, from an index and its reference graph.",
             Input($$$$"""
                 {"properties": {
-                  "store": {"type": "string"}, "server": {"type": "string"},
+                  "store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the server's launch --model"},
                   "path": {"type": "string", "description": "solution/folder whose index to use"},
                   "chunker": {{{{ChunkerProp}}}},
                   "paths": {"type": "array", "items": {"type": "string"}}, "exclude": {"type": "array", "items": {"type": "string"}},
@@ -80,7 +80,7 @@ internal static class McpTools
         new("chunkcache_status",
             "Which chunks are missing or stale for a tree (by file and line range), and the store's statistics.",
             Input($$$$"""
-                {"properties": {"store": {"type": "string"}, "server": {"type": "string"}, "path": {"type": "string"},
+                {"properties": {"store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the server's launch --model"}, "path": {"type": "string"},
                   "chunker": {{{{ChunkerProp}}}},
                   "list_missing": {"type": "boolean", "default": false}}}
                 """),
@@ -88,7 +88,7 @@ internal static class McpTools
         new("chunkcache_evict",
             "Evict chunk entries through the server (or, with only a store, from that store directly): orphans, a path glob, a namespace, or all. A dry run unless dry_run is false.",
             Input("""
-                {"properties": {"store": {"type": "string"}, "server": {"type": "string"},
+                {"properties": {"store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the server's launch --model"},
                   "mode": {"enum": ["orphans", "path", "namespace", "all"], "default": "orphans"},
                   "path": {"type": "string", "description": "glob; mode=path: forget every entry first seen under it"},
                   "namespace": {"type": "string", "description": "admin keys only; others act on their own namespace"},
@@ -98,7 +98,7 @@ internal static class McpTools
         new("chunkcache_prewarm",
             "Queue isolated encodes of chunk texts on the server (text only: a chunkcache_select input read locally, or explicit texts).",
             Input("""
-                {"properties": {"store": {"type": "string"}, "server": {"type": "string"},
+                {"properties": {"store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the server's launch --model"},
                   "select": {"type": "object", "additionalProperties": true, "description": "a chunkcache_select input; text is read locally"},
                   "texts": {"type": "array", "items": {"type": "object", "required": ["id", "text"], "additionalProperties": false,
                      "properties": {"id": {"type": "string"}, "text": {"type": "string"}}}},
@@ -205,9 +205,9 @@ internal static class McpTools
 
     private static string? Server(JsonObject a, McpDefaults d) => Str(a, "server") ?? d.Server;
 
-    private static void ModelOptions(Argv v, McpDefaults d)
+    private static void ModelOptions(Argv v, JsonObject a, McpDefaults d)
     {
-        v.Add("model", d.Model);
+        v.Add("model", Str(a, "model") ?? d.Model); // a per-call GGUF, else the one the server was started with
         v.Add("threads", d.Threads?.ToString(System.Globalization.CultureInfo.InvariantCulture));
     }
 
@@ -219,7 +219,7 @@ internal static class McpTools
         Source(v, Str(a, "path")!);
         Chunker(v, a);
         v.Add("configuration", Str(a, "configuration"));
-        ModelOptions(v, d);
+        ModelOptions(v, a, d);
         v.Add("server", server);
         if (Bool(a, "encode", false))
         {
@@ -255,7 +255,7 @@ internal static class McpTools
         v.Add("store", Str(a, "store") ?? d.Store);
         if (Str(a, "path") is { } path) Source(v, path);
         Chunker(v, a);
-        ModelOptions(v, d);
+        ModelOptions(v, a, d);
         v.Add("server", Server(a, d));
         SelectOptions(v, a, outputOptions: true);
         return v.Done();
@@ -268,7 +268,7 @@ internal static class McpTools
         if (Str(a, "path") is { } path) Source(v, path);
         else v.Flag("no-scan"); // without a tree: the store against its index
         Chunker(v, a);
-        ModelOptions(v, d);
+        ModelOptions(v, a, d);
         v.Add("server", Server(a, d));
         if (Bool(a, "list_missing", false)) v.Flag("list-missing");
         return v.Done();
@@ -287,7 +287,7 @@ internal static class McpTools
         {
             v.Flag("offline");
             v.Add("store", Str(a, "store") ?? d.Store);
-            if (mode == "all") ModelOptions(v, d);
+            if (mode == "all") ModelOptions(v, a, d);
         }
         if (!Bool(a, "dry_run", true)) v.Flag("apply"); // a dry run unless dry_run is false
         return v.Done();
@@ -314,7 +314,7 @@ internal static class McpTools
             if (Str(sel, "path") is not { } path) throw new McpArgumentException("prewarm: select.path (the solution or folder to read the chunk text from) is required.");
             Source(v, path);
             Chunker(v, sel);
-            ModelOptions(v, d);
+            ModelOptions(v, a, d);
             SelectOptions(v, sel, outputOptions: false);
         }
         return v.Done();
