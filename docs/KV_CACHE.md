@@ -177,6 +177,14 @@ the context window. On success it prefills only the suffix. A refusal is logged 
       growth then a write inside the partial block; a 52-block pool where the hit must evict the other entry).
   - Tests: `CudaPrefixReuseTests` (two-turn TextGenerator on Qwen2.5-0.5B, f16 and q8_0: tokens equal cold, logprobs bit-identical to
     an ungrown warm run, refused admission misses; seed and grow are bit-identical to a rollback), `CudaKvGrowthLogicTests`.
+- **CPU `QuantizedKvCache` (issue #1843).** q8_0 / q4_0 KV on `--no-paged`, or a paged request the block pool cannot serve
+  (q4_0, mixed K/V, a window), is now prefix-reusable like the CUDA and Vulkan quantized caches.
+  - `CanTruncateTo`: always without a full-precision window; with one, only before the first row was evicted to quantized
+    storage (the ring then holds later rows), the `CudaQuantizedKvCache` rule. Compact sliding-window layers as `SimpleKvCache`.
+  - `TryGrowTo` reallocates each full-history layer's quantized buffers and copies the held rows as stored. Host memory: never refused.
+  - `TrySeedPrefixFrom` copies another quantized cache's rows as stored; refused for a window or compact sliding layers.
+  - Head dims that are not a multiple of 32 throw in CPU quantized attention (#1883, all backends).
+  - Tests: `QuantizedKvPrefixReuseTests` (q8_0, q4_0 and mixed growth vs cold; window cut refused after eviction; seed; growth keeps rows).
 - **`VulkanQuantizedKvCache.TryGrowTo` / `TrySeedPrefixFrom` (issue #1843, the Vulkan side of CUDA's #1594 quantized growth).**
   - Layer by layer: allocate larger scale and quant buffers, copy only the live blocks device to device as stored, free the old.
     Admitted like `VulkanKvCache` (shared `VulkanKvCache.AdmitGrowth`, `GrowthAdmissionOverride` in tests).

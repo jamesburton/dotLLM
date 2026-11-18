@@ -13,7 +13,8 @@ namespace DotLLM.Tests.Unit.Engine;
 /// Issue #1843, CPU side: <see cref="QuantizedKvCache"/> (q8_0 / q4_0 KV, <c>--no-paged</c> or a paged request the block pool cannot
 /// serve) is prefix-reusable like CUDA's and Vulkan's quantized caches: a later request cuts it back, grows it when the next turn is
 /// longer, and the continuation equals a cold run on the same cache type. A full-precision window may only be cut before its first
-/// eviction. Runs the deterministic CPU qwen3 (head dim 32: one Q block per head).
+/// eviction. Runs the deterministic CPU qwen3 at head dim 32: CPU quantized attention dequantizes per head and throws for a head dim
+/// that is not a multiple of 32 (the head-dim-16 fixture), a cross-backend gap tracked in #1883.
 /// </summary>
 public sealed class QuantizedKvPrefixReuseTests : IClassFixture<PrefixCacheFailedRequestTests.TinyQwen>
 {
