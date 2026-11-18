@@ -27,7 +27,7 @@ internal static class McpCommand
           --server URL    default dotLLM server (the server owns the model identity and all K/V writes). The API key is read from
                           CHUNKCACHE_API_KEY, never from an argument.
           --model FILE    the GGUF whose tokenizer chunks the tree (build, select, status; the file the server serves).
-                          Not a tool argument: set it here.
+                          Default of a call that gives its own `model`.
           --threads N     CPU threads the model is opened with (default min(8, cores))
           --help          this text
 

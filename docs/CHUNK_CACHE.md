@@ -441,6 +441,27 @@ reached; whether the CLR loads the `DotLLM.ChunkReuse` assembly at all with the 
 opt-in AOT publish of `dotllm` (docs/AOT.md) has not been re-verified with this reference. Before upstreaming, the key,
 store, tokenisation and identity types are candidates for a small assembly without Roslyn or Vulkan.
 
+### MCP server (`chunkcache mcp`)
+
+`chunkcache mcp [--store DIR] [--server URL] [--model FILE.gguf] [--threads N]` runs a stdio Model Context Protocol server
+(newline-delimited JSON-RPC) with six tools: `chunkcache_build`, `chunkcache_select`, `chunkcache_status`,
+`chunkcache_evict`, `chunkcache_prewarm`, `chunkcache_explain`. It is a thin wrapper: each call is turned into the argument
+list of the matching `chunkcache <verb> --json`, run in process, and the verb's JSON is projected onto the tool's
+`outputSchema` and returned as `structuredContent` plus a serialised text copy. A failing verb is a tool result with
+`isError` (an `{"error": {"code", "message"}}` object), not a protocol error. Unknown arguments are rejected by the schema.
+
+Defaults that protect: `chunkcache_evict` is a dry run unless `dry_run` is `false`; `chunkcache_build` only indexes
+(tokenizer, nothing is encoded) unless `encode` is `true`, which queues the missing chunks on the server (an error without
+a server); `max_encode_tokens` is a strict token cap, not a chunk count. The API key is read from `CHUNKCACHE_API_KEY` only
+and is sent as `X-API-Key`; it never appears in a frame or on stderr. Tools that open a model take an optional `model`
+(a GGUF path) that overrides the launch `--model`.
+
+Claude Code (`.mcp.json`):
+
+```json
+{"mcpServers": {"chunkcache": {"command": "chunkcache", "args": ["mcp", "--store", "./store", "--model", "M.gguf", "--server", "http://localhost:8080"]}}}
+```
+
 ## Pinned server behaviour (before the convention)
 
 What the server does **today** with the three things the convention leans on. Each fact is pinned by a test in
