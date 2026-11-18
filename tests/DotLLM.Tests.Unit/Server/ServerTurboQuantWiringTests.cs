@@ -86,9 +86,101 @@ public sealed class ServerTurboQuantWiringTests : IClassFixture<PrefixCacheFaile
     }
 
     [Fact]
+    public void Tq4_Paged_RefusesBeforeLoad()
+    {
+        // The paged default is the commonest accident; refuse it before the weights load, not after.
+        Assert.Contains("--no-paged", ServerStartup.PreLoadTurboQuantRefusal(Options("tq4", "tq4", paged: true), _tiny.Config));
+    }
+
+    [Fact]
     public void Tq4_DeviceAuto_IsDecidedAfterLoad()
     {
         // The backend is unknown before an auto device loads; the post-load pass decides (here it lands on the CPU, which is real).
         Assert.Null(ServerStartup.PreLoadTurboQuantRefusal(Options("tq4", "tq4", paged: false, "auto"), _tiny.Config));
+    }
+}
+
+/// <summary>#1888: the post-load rules (host model type, an attaching MTP head) that the pre-load pass cannot see.</summary>
+public sealed class ServerTurboQuantPostLoadTests : IClassFixture<PrefixCacheFailedRequestTests.TinyQwen>
+{
+    private readonly PrefixCacheFailedRequestTests.TinyQwen _tiny;
+    public ServerTurboQuantPostLoadTests(PrefixCacheFailedRequestTests.TinyQwen tiny) => _tiny = tiny;
+
+    private static ServerOptions Tq4(bool mtp = true) => new()
+    {
+        Model = "x", ModelId = "x", Device = "cpu", UsePaged = false, Warmup = WarmupOptions.Disabled,
+        CacheTypeK = "tq4", CacheTypeV = "tq4", MtpEnabled = mtp,
+    };
+
+    /// <summary>A CPU model that is not the plain <c>TransformerModel</c>, optionally with an MTP head.</summary>
+    private sealed class OtherCpuModel(ModelConfig config, bool mtp) : IModel
+    {
+        public ModelConfig Config { get; } = config;
+        public long ComputeMemoryBytes => 0;
+        public bool SupportsMtp => mtp;
+        public DotLLM.Core.Tensors.ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId) => throw new NotSupportedException();
+        public DotLLM.Core.Tensors.ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, DotLLM.Core.Attention.IKvCache? kvCache) => throw new NotSupportedException();
+        public void Dispose() { }
+    }
+
+    [Fact]
+    public void PlainTransformer_IsReal()
+        => Assert.Null(ServerStartup.PostLoadTurboQuantRefusal(Tq4(), _tiny.Config, _tiny.Model));
+
+    [Fact]
+    public void OtherCpuHost_Refuses()
+    {
+        string? reason = ServerStartup.PostLoadTurboQuantRefusal(Tq4(), _tiny.Config, new OtherCpuModel(_tiny.Config, mtp: false));
+        Assert.Contains("CPU model", reason);
+    }
+
+    [Fact]
+    public void AttachingMtpHead_Refuses_WithNoMtpHint()
+    {
+        string? reason = ServerStartup.PostLoadTurboQuantRefusal(Tq4(), _tiny.Config, new OtherCpuModel(_tiny.Config, mtp: true));
+        Assert.Contains("--no-mtp", reason);
+    }
+
+    [Fact]
+    public void MtpDisabled_DoesNotRefuseForMtp()
+    {
+        string? reason = ServerStartup.PostLoadTurboQuantRefusal(Tq4(mtp: false), _tiny.Config, new OtherCpuModel(_tiny.Config, mtp: true));
+        Assert.DoesNotContain("--no-mtp", reason);
+    }
+}
+
+/// <summary>
+/// #1888 Review Focus 1: <c>--device auto</c> resolves to a backend only when the model loads, so the post-load pass must refuse when it
+/// lands on a GPU; without it the CPU TurboQuant cache would be handed to a GPU model. Needs a GPU, so it runs under the GPU lock.
+/// </summary>
+[Trait("Category", "GPU")]
+public sealed class ServerTurboQuantAutoDeviceTests : IClassFixture<PrefixCacheFailedRequestTests.TinyQwen>
+{
+    private readonly PrefixCacheFailedRequestTests.TinyQwen _tiny;
+    public ServerTurboQuantAutoDeviceTests(PrefixCacheFailedRequestTests.TinyQwen tiny) => _tiny = tiny;
+
+    [Fact]
+    public void Tq4_DeviceAuto_RunsOnlyWhereTurboQuantIsReal()
+    {
+        var options = new ServerOptions
+        {
+            Model = _tiny.GgufPath, ModelId = "tiny-1888-auto", Device = "auto", UsePaged = false, Warmup = WarmupOptions.Disabled,
+            CacheTypeK = "tq4", CacheTypeV = "tq4",
+        };
+        ServerState state;
+        try { state = ServerStartup.LoadModel(_tiny.GgufPath, options); }
+        catch (InvalidServerOptionException e)
+        {
+            // Landed on a GPU: refused, naming the backend.
+            Assert.Matches("(?i)vulkan|cuda|hip", e.Message);
+            return;
+        }
+        using (state)
+        {
+            // Landed on the CPU: the real path, on the CPU model.
+            Assert.Equal(KvBackendKind.Cpu, TurboQuantKvSupport.BackendOf(state.Model!));
+            using var cache = state.KvCacheFactory!(_tiny.Config, 32);
+            Assert.IsType<TurboQuantKvCache>(cache);
+        }
     }
 }

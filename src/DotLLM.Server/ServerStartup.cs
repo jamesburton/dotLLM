@@ -593,6 +593,21 @@ public static class ServerStartup
     }
 
     /// <summary>
+    /// The authoritative TurboQuant refusal once <paramref name="model"/> has loaded (#1888): every pre-load rule, plus the backend an
+    /// <c>auto</c> device landed on, whether the host is the plain CPU transformer, and whether an MTP head will attach.
+    /// </summary>
+    internal static string? PostLoadTurboQuantRefusal(ServerOptions options, ModelConfig config, IModel model)
+    {
+        var kv = BuildKvConfig(options, out string? mismatch);
+        if (mismatch is not null) return mismatch;
+        return TurboQuantKvSupport.RefusalReason(kv, new TurboQuantContext(
+            KvCommand.Serve, TurboQuantKvSupport.BackendOf(model), options.UsePaged, config,
+            HostIsPlainCpuTransformer: model.GetType() == typeof(TransformerModel),
+            HasDraftModel: !string.IsNullOrEmpty(options.SpeculativeModel),
+            MtpWillAttach: options.MtpEnabled && model.SupportsMtp));
+    }
+
+    /// <summary>
     /// The TurboQuant refusal decidable before the model loads (#1888): mixed formats, a GPU device, the paged cache, the geometry, a draft
     /// model. Null when nothing is wrong yet; the post-load pass then checks the backend an <c>auto</c> device landed on, the host and MTP.
     /// </summary>
@@ -754,11 +769,7 @@ public static class ServerStartup
         // KV-cache configuration. K and V are parsed independently; a TurboQuant side carries its bit width and QJL flag (#1888).
         var kvConfig = BuildKvConfig(options, out _);   // a mismatch was refused before load
         // #1888: the post-load pass - the backend an auto device landed on, the host model, an attaching MTP head.
-        if (TurboQuantKvSupport.RefusalReason(kvConfig, new TurboQuantContext(
-                KvCommand.Serve, TurboQuantKvSupport.BackendOf(model), options.UsePaged, config,
-                HostIsPlainCpuTransformer: model.GetType() == typeof(TransformerModel),
-                HasDraftModel: !string.IsNullOrEmpty(options.SpeculativeModel),
-                MtpWillAttach: options.MtpEnabled && model.SupportsMtp)) is { } tqPostRefusal)
+        if (PostLoadTurboQuantRefusal(options, config, model) is { } tqPostRefusal)
         {
             model.Dispose();
             gguf.Dispose();
