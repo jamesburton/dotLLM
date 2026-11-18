@@ -453,4 +453,59 @@ public sealed class VulkanDenseQ8KvKernelTests
             (c, q, k, v, o) => gpt.RecordAttentionSinks(c, q, k, v, o, bS, 1, seqKv, numHeads, numKvHeads, headDim, pos, window, kvStorage: storage),
             (c, q, k, v, o) => gpt.RecordAttentionSinks(c, q, k, v, o, bS, 1, seqKv, numHeads, numKvHeads, headDim, pos, window, kvStorage: VulkanKvStorage.F32));
     }
+
+    /// <summary>
+    /// The row-scatter writer (selective recompute and chunk-KV reuse write non-contiguous positions, #1884): rows written at permuted
+    /// positions store exactly the bytes the contiguous writer stores for the same rows at those positions, and rows not named stay as
+    /// they were.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(VulkanKvStorage.Q8_0, 512)]
+    [InlineData(VulkanKvStorage.Q4_0, 512)]
+    [InlineData(VulkanKvStorage.Q4_0, 128)]
+    public void ScatterWriter_MatchesTheContiguousWriter_ByteForByte(VulkanKvStorage storage, int stride)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var writer = VulkanKvQ8WriteKernel.Create(device, spvDir, storage);
+        Skip.IfNot(writer.SupportsScatter, "row-scatter SPIR-V missing");
+        const int cacheRows = 16;
+        int[] positions = [11, 2, 7, 3, 14];
+        var rng = new Random(0x5C + stride);
+        float[] src = Rand(rng, positions.Length * stride, 0.5f);
+        long rowBytes = storage.RowBytes(stride), bytes = cacheRows * rowBytes;
+        using var bSrc = device.Allocate((long)src.Length * 4);
+        using var bPos = device.Allocate(positions.Length * 4L);
+        using var bScatter = device.Allocate(bytes);
+        using var bRange = device.Allocate(bytes);
+        byte[] sentinel = Enumerable.Repeat((byte)0xEE, (int)bytes).ToArray();
+        device.Upload(sentinel, bScatter); device.Upload(sentinel, bRange);
+        device.Upload(src, bSrc);
+        device.Upload(positions.Select(x => (float)BitConverter.Int32BitsToSingle(x)).ToArray(), bPos);
+        using var bRow = device.Allocate((long)stride * 4);
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            writer.RecordScatterRows(ctx.CommandBuffer, bSrc, bScatter, bPos, stride, positions.Length, rowBase: 0);
+            ctx.SubmitAndWait();
+        }
+        for (int t = 0; t < positions.Length; t++)   // the contiguous writer, one row at a time at the same positions
+        {
+            device.Upload(src.AsSpan(t * stride, stride).ToArray(), bRow);
+            using var ctx = device.CreateSubmitContext();
+            ctx.Begin();
+            writer.RecordF32ToQ8(ctx.CommandBuffer, bRow, bRange, (long)positions[t] * stride, stride);
+            ctx.SubmitAndWait();
+        }
+        byte[] Bytes(VulkanDevice.Buffer b)
+        {
+            var f = new float[bytes / 4];
+            device.Download(b, f.AsSpan());
+            return MemoryMarshal.AsBytes(f.AsSpan()).ToArray();
+        }
+        byte[] scattered = Bytes(bScatter), ranged = Bytes(bRange);
+        Assert.Equal(ranged, scattered);
+        Assert.Equal(0xEE, scattered[(int)(5 * rowBytes)]);   // row 5 was not named: untouched
+        Assert.NotEqual(0xEE, scattered[(int)(7 * rowBytes)]);
+    }
 }

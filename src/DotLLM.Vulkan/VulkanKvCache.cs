@@ -310,14 +310,25 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         if (_storage.IsBlockQuantized())
         {
             // Quantised on the device, one invocation per 32-element block; rows are a multiple of 32 elements, so every append is whole blocks.
-            if (!contiguous || q8Writer is null)
-                throw new InvalidOperationException($"A {_storage} KV cache is written by the quantise kernel from contiguous positions only.");
+            if (q8Writer is null)
+                throw new InvalidOperationException($"A {_storage} KV cache is written by the quantise kernel; pass the writer.");
             var vWriter = q8ValueWriter ?? q8Writer;
             if (q8Writer.Storage != _storage.KeyFormat() || vWriter.Storage != _storage.ValueFormat())
                 throw new InvalidOperationException($"The {q8Writer.Storage} / {vWriter.Storage} writers cannot write a {_storage} KV cache (#1884).");
-            long elemOffset = (long)(positions[0] - rowBase) * _kvStride[layerIndex], count = (long)seqLen * _kvStride[layerIndex];
-            q8Writer.RecordF32ToQ8(cmdBuf, kDev, _keys[layerIndex], elemOffset, count);
-            vWriter.RecordF32ToQ8(cmdBuf, vDev, _values[layerIndex], elemOffset, count);
+            if (!contiguous)
+            {
+                // Selective recompute / chunk-KV reuse (#1884): rows at arbitrary positions, one scatter dispatch per tensor.
+                if (positionsDev is null)
+                    throw new InvalidOperationException($"Writing a {_storage} KV cache at non-contiguous positions needs the device positions buffer.");
+                q8Writer.RecordScatterRows(cmdBuf, kDev, _keys[layerIndex], positionsDev, _kvStride[layerIndex], seqLen, rowBase);
+                vWriter.RecordScatterRows(cmdBuf, vDev, _values[layerIndex], positionsDev, _kvStride[layerIndex], seqLen, rowBase);
+            }
+            else
+            {
+                long elemOffset = (long)(positions[0] - rowBase) * _kvStride[layerIndex], count = (long)seqLen * _kvStride[layerIndex];
+                q8Writer.RecordF32ToQ8(cmdBuf, kDev, _keys[layerIndex], elemOffset, count);
+                vWriter.RecordF32ToQ8(cmdBuf, vDev, _values[layerIndex], elemOffset, count);
+            }
             if (maxPos + 1 > _currentLength) _currentLength = maxPos + 1;
             return;
         }

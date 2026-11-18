@@ -1,0 +1,62 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "q8_1_exact_div.glsl"
+// F32 -> Q4_0 KV row scatter (issue #1884): rows land at arbitrary cache positions, as convert_f32_to_f16_rows.comp does for the
+// F16 cache. Row srcRow0 + t of src becomes cache row (positions[srcRow0 + t] - rowBase); one invocation per 32-element block.
+// The quantise rule is convert_f32_to_q4_0_kv_range.comp's (CPU / CUDA KV rule, adjacent pairs), so a scattered row stores exactly
+// the bytes a contiguous write of the same row does.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufSrc { float src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufDst { uint  dst[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufPos { int   positions[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint blocksPerRow;
+    uint rows;
+    int  rowBase;
+    uint srcRow0;
+} pc;
+
+const float Q4_RCP_7 = 0.14285715;   // 1/7 rounded to nearest float (0x3e124925)
+
+float q4DivBy7(float a) {   // correctly rounded a / 7 (see convert_f32_to_q4_0_kv_range.comp)
+    precise float q = a * Q4_RCP_7;
+    precise float p = q * 8.0;
+    precise float s = p - q;
+    precise float z = s - p;
+    precise float err = -q - z;
+    precise float r = (a - s) - err;
+    precise float rq = r * Q4_RCP_7;
+    precise float q2 = q + rq;
+    return q2;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.rows * pc.blocksPerRow) return;
+    uint t = i / pc.blocksPerRow, b = i % pc.blocksPerRow;
+    uint s0 = ((pc.srcRow0 + t) * pc.blocksPerRow + b) * 32u;
+    float v[32];
+    float amax = 0.0;
+    for (uint j = 0u; j < 32u; j++) {
+        v[j] = src[s0 + j];
+        amax = max(amax, abs(v[j]));
+    }
+    float d = q4DivBy7(amax);
+    float id = d != 0.0 ? q81Recip(d) : 0.0;
+    uint row = uint(positions[pc.srcRow0 + t] - pc.rowBase);
+    uint o = (row * pc.blocksPerRow + b) * 5u;
+    dst[o] = floatBitsToUint(d);
+    for (uint w = 0u; w < 4u; w++) {
+        uint packed = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            uint e = w * 8u + j * 2u;
+            uint lo = d != 0.0 ? uint(clamp(int(roundEven(v[e] * id)) + 8, 0, 15)) : 8u;
+            uint hi = d != 0.0 ? uint(clamp(int(roundEven(v[e + 1u] * id)) + 8, 0, 15)) : 8u;
+            packed |= ((hi << 4u) | lo) << (8u * j);
+        }
+        dst[o + 1u + w] = packed;
+    }
+}

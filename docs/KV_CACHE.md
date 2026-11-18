@@ -419,8 +419,14 @@ an F32 scratch of 8 KiB per *context position* (64 MiB at 8K, 1 GiB at 128K), an
   - decode over the block cache vs over its dequantised rows in an F32 cache (the decoded token's own row is the only difference).
 - Shader mutants, all killed, are listed in the PR.
 
-**Not covered yet** (owner decisions in the PR): writes at non-contiguous positions (selective recompute, chunk-KV reuse) into a
-block cache, and hosts outside the audited dense chain and Flint, which keep `VulkanQuantizedKvCache`.
+**Non-contiguous writes** (selective recompute, chunk-KV reuse): `convert_f32_to_q8_0_kv_rows` / `convert_f32_to_q4_0_kv_rows` scatter
+rows by a positions buffer with the same quantise rule, so a scattered row stores the bytes a contiguous write does
+(`ScatterWriter_MatchesTheContiguousWriter_ByteForByte`). The qpos arms read the block twins.
+`VulkanSelectiveRecomputeTests.Qwen3_4B_NonContiguousSubsetRecompute_BlockCache` recomputes a poisoned subset on Qwen3-4B. The qpos
+twin runs on all 36 layers, the untouched rows stay byte-identical, and the rows land within the contiguous floor: Q8_0 0.036 vs
+0.030 rel L2, Q4_0 0.29 vs 0.18, K8V4 0.15 vs 0.16.
+
+**Not covered yet:** hosts outside the audited dense chain and Flint keep `VulkanQuantizedKvCache` (#1885).
 
 ### CUDA hybrid-dense KV: staging, quantized storage, fused decode (issue #956)
 
