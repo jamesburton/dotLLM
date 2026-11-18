@@ -2,13 +2,23 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <!-- Not a dotnet tool package yet: the release plan (Phase S Task 9) decides the package set and the command name. -->
-    <IsPackable>false</IsPackable>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>chunkcache</ToolCommandName>
+    <!-- The release workflow passes the repo variable CHUNKCACHE_TOOL_PACKAGE_ID as ChunkCacheToolPackageId (unset keeps this id).
+         The command stays `chunkcache` whatever the package is called. See docs/PACKAGING.md. -->
+    <PackageId>dotllm-chunkcache</PackageId>
+    <PackageId Condition="'$(ChunkCacheToolPackageId)' != ''">$(ChunkCacheToolPackageId)</PackageId>
+    <PackageTags>llm;kv-cache;chunk-cache;dotllm;agents;mcp;dotnet-tool</PackageTags>
     <AssemblyName>chunkcache</AssemblyName>
     <RootNamespace>DotLLM.ChunkCache</RootNamespace>
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <Description>chunkcache (research): build, select, status, evict and compare for dotLLM chunk-level KV reuse over a .NET solution or a source directory.</Description>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Version from the git tag, like every project under src/ (tools/ does not inherit src/Directory.Build.props). -->
+    <PackageReference Include="MinVer" PrivateAssets="all" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\DotLLM.ChunkCache.Client\DotLLM.ChunkCache.Client.csproj" />

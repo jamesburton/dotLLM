@@ -77,7 +77,7 @@ jobs:
 
       - name: Pack
         # DOTLLM_TOOL_PACKAGE_ID (repo variable) renames the dotnet-tool package - upstream owns the DotLLM.* ids on nuget.org (docs/PACKAGING.md).
-        run: dotnet pack -c Release --no-restore -o artifacts/nuget -p:MinVerVersionOverride=${{ needs.version.outputs.version }} -p:DotLlmToolPackageId=${{ vars.DOTLLM_TOOL_PACKAGE_ID }}
+        run: dotnet pack -c Release --no-restore -o artifacts/nuget -p:MinVerVersionOverride=${{ needs.version.outputs.version }} -p:DotLlmToolPackageId=${{ vars.DOTLLM_TOOL_PACKAGE_ID }} -p:ChunkCacheToolPackageId=${{ vars.CHUNKCACHE_TOOL_PACKAGE_ID }}
 
       - name: List packages
         run: ls -lh artifacts/nuget/
@@ -319,38 +319,48 @@ jobs:
 
       # The fork cannot push the upstream-owned DotLLM.* ids, so nothing is published until the repo variable
       # DOTLLM_TOOL_PACKAGE_ID names a package id this account owns (docs/PACKAGING.md lists the options).
-      # Only that one package ships - it is what `dnx <id>` / `dotnet tool install -g <id>` runs.
-      # Preferred: trusted publishing (no stored secret). Enabled by the repo variable NUGET_USER (the nuget.org profile name, not an
+      # Up to three packages ship, each only when its own variable is set: the dotllm tool (DOTLLM_TOOL_PACKAGE_ID),
+      # the chunkcache tool (CHUNKCACHE_TOOL_PACKAGE_ID) and the client library (CHUNKCACHE_CLIENT_PACKAGE_ID).      # Preferred: trusted publishing (no stored secret). Enabled by the repo variable NUGET_USER (the nuget.org profile name, not an
       # email); the policy lives on nuget.org (docs/PACKAGING.md). Falls back to a NUGET_API_KEY secret when NUGET_USER is unset.
       - name: NuGet login (OIDC -> temporary API key)
         id: login
-        if: ${{ vars.NUGET_USER != '' && vars.DOTLLM_TOOL_PACKAGE_ID != '' }}
+        if: ${{ vars.NUGET_USER != '' && (vars.DOTLLM_TOOL_PACKAGE_ID != '' || vars.CHUNKCACHE_TOOL_PACKAGE_ID != '' || vars.CHUNKCACHE_CLIENT_PACKAGE_ID != '') }}
         uses: NuGet/login@v1
         with:
           user: ${{ vars.NUGET_USER }}
 
-      - name: Push tool package
+      - name: Push packages
         env:
           NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY || secrets.NUGET_API_KEY }}
           TOOL_ID: ${{ vars.DOTLLM_TOOL_PACKAGE_ID }}
+          CHUNKCACHE_TOOL_ID: ${{ vars.CHUNKCACHE_TOOL_PACKAGE_ID }}
+          CHUNKCACHE_CLIENT_ID: ${{ vars.CHUNKCACHE_CLIENT_PACKAGE_ID }}
         run: |
-          if [ -z "$TOOL_ID" ]; then
-            echo "::notice::DOTLLM_TOOL_PACKAGE_ID is not set - skipping the NuGet push (see docs/PACKAGING.md)."
-            exit 0
-          fi
-          if [ -z "$NUGET_API_KEY" ]; then
-            echo "::warning::neither NUGET_USER (trusted publishing) nor NUGET_API_KEY is set - skipping the NuGet push of $TOOL_ID."
-            exit 0
-          fi
+          # Each package is pushed only when its own repo variable names an id this account owns; unset ones are skipped.
+          # CHUNKCACHE_CLIENT_PACKAGE_ID must equal the packed id (DotLLM.ChunkCache.Client): the client csproj has a fixed PackageId.
           shopt -s nullglob
-          pkgs=(artifacts/nuget/"$TOOL_ID".*.nupkg)
-          if [ "${#pkgs[@]}" -eq 0 ]; then
-            echo "::error::no $TOOL_ID.*.nupkg was packed"
-            exit 1
-          fi
-          for p in "${pkgs[@]}"; do
-            dotnet nuget push "$p" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          status=0
+          for var in DOTLLM_TOOL_PACKAGE_ID:"$TOOL_ID" CHUNKCACHE_TOOL_PACKAGE_ID:"$CHUNKCACHE_TOOL_ID" CHUNKCACHE_CLIENT_PACKAGE_ID:"$CHUNKCACHE_CLIENT_ID"; do
+            name="${var%%:*}"; id="${var#*:}"
+            if [ -z "$id" ]; then
+              echo "::notice::$name is not set - skipping that NuGet push (see docs/PACKAGING.md)."
+              continue
+            fi
+            if [ -z "$NUGET_API_KEY" ]; then
+              echo "::warning::neither NUGET_USER (trusted publishing) nor NUGET_API_KEY is set - skipping the NuGet push of $id."
+              continue
+            fi
+            pkgs=(artifacts/nuget/"$id".[0-9]*.nupkg)
+            if [ "${#pkgs[@]}" -eq 0 ]; then
+              echo "::error::no $id.*.nupkg was packed"
+              status=1
+              continue
+            fi
+            for p in "${pkgs[@]}"; do
+              dotnet nuget push "$p" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+            done
           done
+          exit $status
 
   create-release:
     name: Create GitHub Release
