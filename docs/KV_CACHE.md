@@ -361,6 +361,32 @@ twin, no host row IO, prefix snapshots or handoff (they refuse Q8_0). It stays o
 - **Proof the path ran:** halving the writer's stored scale moves q8_0 NLL 2.34 -> 9.53 while F16 stays bit-identical (2.3242); zeroing
   the GQA v2 decode kernel's K scale turns a q8_0 needle HIT into a MISS with F16 unchanged.
 
+### TurboQuant availability: refuse, never substitute (issue #1888, epic #1887)
+
+`KvCacheConfig.IsQuantized` excludes TurboQuant, so a `tq*` request used to fall through every branch: Vulkan served it with the default
+`VulkanKvCache`, CUDA with the f16 `CudaKvCache`, CPU paged with F16 blocks, and `run` / `chat` dropped the bit width. Now:
+
+- `TurboQuantKvSupport.RefusalReason` (`DotLLM.Server`) decides whether TurboQuant is real for a request.
+  - `serve` calls it before the weights load (`ServerStartup.PreLoadTurboQuantRefusal`) and after (`PostLoadTurboQuantRefusal`: the backend an
+    `auto` device landed on, the host type, an attaching MTP head).
+  - `run` / `chat` call it before anything loads (`KvStorageCli.TurboQuantRefusal`).
+- K and V are judged independently (`IsTurboQuantAny`, `IsTurboQuantMixed`).
+- The TurboQuant branch is first in serve's KV chain, so no later branch can take a TurboQuant request.
+- CUDA G3 never runs over TurboQuant KV (`G3ServesKvCache`).
+
+| Backend / command | Setting | TurboQuant (`tq`, `tq1`..`tq8`, `tq*q`) |
+|---|---|---|
+| CPU `serve` | `--no-paged`, plain transformer, no draft model, no MTP head | runs (`TurboQuantKvCache`; still decodes into an FP32 scratch until step 2) |
+| CPU `serve` | paged (the default) | refused: pass `--no-paged` (step 3) |
+| CPU `serve` | hybrid / recurrent / other CPU hosts | refused |
+| `run`, `chat`, `bench` | any | refused until step 2 |
+| CUDA, Vulkan, HIP (any command; `--device auto` that lands on a GPU) | any | refused until step 2 |
+| any | K and V differ (mixed pair, V-only, or different bit widths) | refused until step 6 |
+| any | head dim not a power of two or above 256, or per-layer KV widths | refused |
+| any | MLA models (DeepSeek-V2/V3, GLM-4.7-Flash, Kimi): their attention keeps its own latent KV | refused |
+
+The plan for the in-place caches (rotate Q and O, code-reading attention twins) is `docs/superpowers/specs/2026-11-18-turboquant-in-place-design.md`.
+
 ### Vulkan in-place block KV: q8_0, q4_0 and mixed K / V (issue #1884)
 
 `--cache-type-k/-v q8_0|q4_0` (or `--kv-quant-k/-v`) on a plain dense host (`IsDenseF16KvEligible`: Llama, Mistral, Qwen, Phi, GLM-4 MoE,

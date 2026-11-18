@@ -4958,12 +4958,12 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
 
     /// <summary>
     /// Whether attention over the dense cache <see cref="CreateKvCache(int, Core.Configuration.KvCacheConfig)"/> builds for <paramref name="kv"/> can take G3 (#1850):
-    /// q8_0 / q4_0 (<see cref="CudaQuantizedKvCache"/>) read in place and never do; everything else gets the f16
-    /// <see cref="CudaKvCache"/>, which does (TurboQuant included: <see cref="KvCacheConfig.IsQuantized"/> is false for it).
+    /// q8_0 / q4_0 (<see cref="CudaQuantizedKvCache"/>) read in place and never do; f16 / f32 get the f16 <see cref="CudaKvCache"/>,
+    /// which does. TurboQuant (either side) never does: its KV is codes, read in place (#1888, #1887), so it is never served by the f16 cache.
     /// </summary>
     /// <param name="kv">KV storage types.</param>
     /// <returns>Whether G3 may run over that cache.</returns>
-    internal static bool G3ServesKvCache(KvCacheConfig kv) => !kv.IsQuantized;
+    internal static bool G3ServesKvCache(KvCacheConfig kv) => !kv.IsQuantized && !kv.IsTurboQuantAny;
 
     /// <summary>
     /// G3 score-plane bytes the dense context fit charges as fixed (#1848 / #1862): 0 when G3 cannot run; otherwise the plane kept
