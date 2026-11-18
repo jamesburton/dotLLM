@@ -84,7 +84,7 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
             ("build", $$"""{"path": {{treeJson}}}""",
                 ["build", "--model", _fx.ModelA, "--store", NewDir("cli-store"), "--directory", tree, "--index-only", "--json"], ["mode", "store", "root"]),
             ("status", $$"""{"path": {{treeJson}}}""",
-                ["status", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--json"], ["store"]),
+                ["status", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--json"], ["index_path", "scanned", "ledger"]),
             ("select", $$"""{"path": {{treeJson}}, "paths": ["src/Calc.cs"], "include_text": true}""",
                 ["select", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--path", "src/Calc.cs", "--include-text", "--json"], ["order"]),
             ("evict", """{"server": "http://fake.test:8080", "mode": "orphans"}""",
@@ -152,10 +152,11 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
 
         string store2 = NewDir("store2");
         await using McpWire wire2 = await McpWire.StartAsync(["--store", store2, "--model", _fx.ModelA, "--server", FakeUrl], PrewarmingServer(model));
-        JsonElement capped = await wire2.CallToolAsync("chunkcache_build", $$"""{"path": {{JsonSerializer.Serialize(tree)}}, "encode": true, "max_encode_tokens": 100}""");
+        long budget = queuedAll - 1; // a strict token cap: every chunk but the last fits, so a chunk-count reading would queue them all
+        JsonElement capped = await wire2.CallToolAsync("chunkcache_build", $$"""{"path": {{JsonSerializer.Serialize(tree)}}, "encode": true, "max_encode_tokens": {{budget}}}""");
         Assert.False(IsError(capped), capped.ToString());
         long queued = capped.GetProperty("structuredContent").GetProperty("encode_queued_tokens").GetInt64();
-        Assert.InRange(queued, 1, 100 + 600); // a budget in tokens (a chunk is at most 512), never a chunk count
+        Assert.InRange(queued, 1, budget); // a strict budget in tokens, never a chunk count
         Assert.True(queued < queuedAll);
     }
 
@@ -261,7 +262,7 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
         await using McpWire wire = await McpWire.StartAsync(["--server", FakeUrl], fake, env: n => n == "CHUNKCACHE_API_KEY" ? key : null);
         JsonElement result = await wire.CallToolAsync("chunkcache_evict", "{}");
         Assert.True(IsError(result));
-        Assert.Equal(key, Assert.Single(fake.Requests).Headers["Authorization"].Replace("Bearer ", "", StringComparison.Ordinal)); // control: the key was used
+        Assert.Equal(key, Assert.Single(fake.Requests).Headers["X-API-Key"]); // control: the key was used
         Assert.DoesNotContain(key, string.Join('\n', wire.AllFrames), StringComparison.Ordinal);
         Assert.DoesNotContain(key, wire.Stderr, StringComparison.Ordinal);
     }
