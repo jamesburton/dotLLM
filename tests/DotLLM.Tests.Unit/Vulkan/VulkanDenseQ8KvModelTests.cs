@@ -11,14 +11,14 @@ using Xunit.Abstractions;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// Issue #1884 end to end on Qwen2.5-0.5B (dense, hd64, GQA 7): q8_0 K and V run on an in-place Q8_0 <see cref="VulkanKvCache"/>, with
+/// Issue #1884 end to end on Qwen2.5-0.5B (dense, hd64, GQA 7): q8_0 or q4_0 K and V run on an in-place block <see cref="VulkanKvCache"/>, with
 /// no F32 dequant scratch.
 /// </summary>
 /// <remarks>
 /// <list type="bullet">
 /// <item>The prefill dispatches the Q8_0 GQA flash twin (counter), and the cache is the in-place one.</item>
-/// <item>Greedy tokens match the old <see cref="VulkanQuantizedKvCache"/> path: same Q8_0 rule, same values; only the attention kernel
-/// differs.</item>
+/// <item>Greedy tokens match the CPU <c>QuantizedKvCache</c> (the same KV rule), and for Q8_0 the old <see cref="VulkanQuantizedKvCache"/>
+/// path too (same Q8_0 rule, same values; only the attention kernel differs).</item>
 /// <item>A second turn reuses the first turn's prefix from the in-place cache, grows it, and matches a cold in-place run.</item>
 /// </list>
 /// </remarks>
@@ -35,9 +35,12 @@ public sealed class VulkanDenseQ8KvModelTests
     private static string Turn1() => "<|im_start|>user\n" + string.Concat(Enumerable.Repeat("The quick brown fox jumps over the lazy dog. ", 30))
         + "Summarise that in one sentence.<|im_end|>\n<|im_start|>assistant\n";
 
-    [SkippableFact]
-    public void Q8Kv_RunsInPlace_MatchesTheDequantScratchPath_AndReusesItsPrefix()
+    [SkippableTheory]
+    [InlineData(KvCacheDType.Q8_0)]
+    [InlineData(KvCacheDType.Q4_0)]
+    public void BlockKv_RunsInPlace_MatchesTheDequantScratchPath_AndReusesItsPrefix(KvCacheDType dtype)
     {
+        var storage = dtype == KvCacheDType.Q4_0 ? VulkanKvStorage.Q4_0 : VulkanKvStorage.Q8_0;
         string? path = FindGguf();
         Skip.If(path is null, "Qwen2.5-0.5B q8_0 GGUF not found.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -51,25 +54,48 @@ public sealed class VulkanDenseQ8KvModelTests
         var opts = new InferenceOptions { Temperature = 0, MaxTokens = 16, Logprobs = true };
 
         // Reference: the dequant-scratch cache (before the switch, so the factory is unaffected).
-        var scratch = new TextGenerator(model, tokenizer, (_, size) => vk.CreateQuantizedKvCache(spvDir, size, KvCacheDType.Q8_0, KvCacheDType.Q8_0), mtpEnabled: false);
+        var scratch = new TextGenerator(model, tokenizer, (_, size) => vk.CreateQuantizedKvCache(spvDir, size, dtype, dtype), mtpEnabled: false);
         var expected = scratch.Generate(Turn1(), opts);
 
-        Assert.True(vk.TryUseInPlaceQuantizedKv(KvCacheDType.Q8_0, KvCacheDType.Q8_0, spvDir));
+        // The CPU oracle: QuantizedKvCache uses exactly the Q8_0 / Q4_0 KV rule the in-place cache copies (#1884; CUDA uses it too).
+        InferenceResponse cpu;
+        using (var cpuModel = DotLLM.Models.Architectures.TransformerModel.LoadFromGguf(gguf, config, DotLLM.Core.Configuration.ThreadingConfig.Auto))
+        {
+            var cpuGen = new TextGenerator(cpuModel, tokenizer,
+                (c, size) => new DotLLM.Engine.KvCache.QuantizedKvCache(DotLLM.Core.Attention.KvGeometry.FromConfig(c), size, dtype, dtype, 0), mtpEnabled: false);
+            cpu = cpuGen.Generate(Turn1(), opts);
+        }
+        _out.WriteLine($"cpu {dtype}: lp0 {cpu.Logprobs![0].Logprob:R} text: {cpu.Text}");
+
+        Assert.True(vk.TryUseInPlaceQuantizedKv(dtype, dtype, spvDir));
         Assert.False(vk.TryUseInPlaceQuantizedKv(KvCacheDType.Q8_0, KvCacheDType.Q4_0, spvDir));   // mixed: not yet in place
         using (var probe = kvFactory(64))
-            Assert.Equal(VulkanKvStorage.Q8_0, Assert.IsType<VulkanKvCache>(probe).Storage);
+            Assert.Equal(storage, Assert.IsType<VulkanKvCache>(probe).Storage);
 
         var inPlace = new TextGenerator(model, tokenizer, (_, size) => kvFactory(size), mtpEnabled: false);
         long gqa0 = vk.PrefillGqaFlashCount;
         var actual = inPlace.Generate(Turn1(), opts);
         long gqaRuns = vk.PrefillGqaFlashCount - gqa0;
         double d = Math.Abs(expected.Logprobs![0].Logprob - actual.Logprobs![0].Logprob);
-        _out.WriteLine($"in-place q8: GQA flash prefills {gqaRuns}; first-token logprob scratch {expected.Logprobs[0].Logprob:R} in-place {actual.Logprobs[0].Logprob:R} (|d| {d:E2})");
+        _out.WriteLine($"in-place {dtype}: GQA flash prefills {gqaRuns}; first-token logprob scratch {expected.Logprobs[0].Logprob:R} in-place {actual.Logprobs[0].Logprob:R} (|d| {d:E2})");
         _out.WriteLine($"text scratch: {expected.Text}");
         _out.WriteLine($"text inplace: {actual.Text}");
-        Assert.True(gqaRuns > 0, "the prefill did not run the Q8_0 GQA flash twin");
-        Assert.Equal(expected.GeneratedTokenIds, actual.GeneratedTokenIds);
-        Assert.True(d < 0.05, $"first-token logprob moved {d}");
+        Assert.True(gqaRuns > 0, $"the prefill did not run the {dtype} GQA flash twin");
+        Assert.Equal(expected.GeneratedTokenIds[0], actual.GeneratedTokenIds[0]);
+        if (dtype == KvCacheDType.Q8_0)
+        {
+            Assert.Equal(expected.GeneratedTokenIds, actual.GeneratedTokenIds);   // same Q8_0 rule, same values
+            Assert.True(d < 0.05, $"first-token logprob moved {d}");
+        }
+        // The CPU oracle (QuantizedKvCache, the same KV rule): greedy tokens equal. On Q4_0 the first-token logprob is NOT a tight gauge: a 0.5B
+        // model with 4-bit KV amplifies f16-vs-f32 scale and coopmat rounding differences (measured: CPU -1.478, old Vulkan path -0.781, in place
+        // -0.373, all three with the same text), so the token sequence is the gate.
+        Assert.Equal(cpu.GeneratedTokenIds, actual.GeneratedTokenIds);
+        // Run to run bit-identical: the Q4_0 write once took the transfer barrier, so attention raced the quantiser and five runs gave five
+        // first-token logprobs (-0.43, -1.57, -0.93, -0.82, -0.58). A missing write -> read barrier fails this with high probability.
+        var again = inPlace.Generate(Turn1(), opts);
+        for (int i = 0; i < actual.Logprobs!.Length; i++)
+            Assert.Equal(actual.Logprobs[i].Logprob, again.Logprobs![i].Logprob);
 
         // Prefix reuse on the in-place cache: turn 2 adopts turn 1's cache, grows it, and matches a cold in-place run.
         using var prefix = new PrefixCache(2, PrefixCachePolicy.Agent);
@@ -93,10 +119,10 @@ public sealed class VulkanDenseQ8KvModelTests
             var c16 = new TextGenerator(model, tokenizer, (_, size) => kvFactory(size), mtpEnabled: false).Generate(t2, opts);
             _out.WriteLine($"F16 control warm: {s16.Text} | lp0 {s16.Logprobs![0].Logprob:R}");
             _out.WriteLine($"F16 control cold: {c16.Text} | lp0 {c16.Logprobs![0].Logprob:R}");
-            vk.KvStorageOverride = VulkanKvStorage.Q8_0;
+            vk.KvStorageOverride = storage;
         }
         Assert.True(second.Timings.CachedTokenCount > 0, "turn 2 missed");
-        Assert.True(VulkanKvCache.GrowthsForTest - g0 >= 1, "turn 2 should have grown the Q8_0 cache");
+        Assert.True(VulkanKvCache.GrowthsForTest - g0 >= 1, $"turn 2 should have grown the {dtype} cache");
 
         // The discriminating check: a warm run that never grew (headroom sized for turn 2) runs the same kernels on the same rows, so
         // it must be bit-identical to the grown one. Warm vs cold is not: the suffix runs other attention kernels than one long prefill,
@@ -113,6 +139,6 @@ public sealed class VulkanDenseQ8KvModelTests
             Assert.Equal(ungrown.Logprobs[i].Logprob, second.Logprobs![i].Logprob);
         Assert.Equal(cold.GeneratedTokenIds[0], second.GeneratedTokenIds[0]);
         double dCold = Math.Abs(cold.Logprobs![0].Logprob - second.Logprobs![0].Logprob);
-        Assert.True(dCold < 0.1, $"turn 2 first-token logprob moved {dCold} vs cold");
+        Assert.True(dCold < (dtype == KvCacheDType.Q4_0 ? 0.3 : 0.1), $"turn 2 first-token logprob moved {dCold} vs cold");
     }
 }

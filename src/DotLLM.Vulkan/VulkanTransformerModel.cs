@@ -4979,8 +4979,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                     // Barrier the RoPE → KV copy, then the KV copy → attention. (The F32 copy path adds its own COMPUTE→TRANSFER barrier.)
                     BarrierComputeToCompute(cmdBuf);
                     vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer, _kvF16Writer, _state.PositionsBuffer, BlockSet(vkCache.Storage)?.Writer);
-                    // F32 rows are copied (transfer); F16 rows are converted by a compute dispatch.
-                    if (vkCache.Storage is VulkanKvStorage.F16 or VulkanKvStorage.Q8_0) BarrierComputeToCompute(cmdBuf);
+                    // F32 rows are copied (transfer); F16, Q8_0 and Q4_0 rows are written by a compute dispatch. Q4_0 once took the transfer barrier
+                    // here (#1884): attention then raced the quantiser and the logits changed run to run.
+                    if (vkCache.Storage != VulkanKvStorage.F32) BarrierComputeToCompute(cmdBuf);
                     else BarrierTransferToCompute(cmdBuf);
                     kSrc = vkCache.GetKeysBuffer(layer);
                     vSrc = vkCache.GetValuesBuffer(layer);
