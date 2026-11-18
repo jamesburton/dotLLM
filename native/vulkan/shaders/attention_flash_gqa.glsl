@@ -52,6 +52,17 @@ layout(set = 0, binding = 1, std430) readonly  buffer BufK   { uvec2 k4[]; };   
 layout(set = 0, binding = 2, std430) readonly  buffer BufV   { uvec2 v4[]; };
 vec4 loadK(uint i) { uvec2 w = k4[i]; return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y)); }
 vec4 loadV(uint i) { uvec2 w = v4[i]; return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y)); }
+#elif defined(KV_Q8)
+// Q8_0 rows (kv_load.glsl layout, #1884): 36-byte blocks [float scale][32 x int8]. Group i is elements 4i..4i+3, one packed word of
+// block (4i) >> 5; dequantised here, in the tile load (int8 * scale, both exact in f32).
+layout(set = 0, binding = 1, std430) readonly  buffer BufK   { uint kw[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufV   { uint vw[]; };
+vec4 q8Group(uint w, float d) {
+    return vec4(float(bitfieldExtract(int(w), 0, 8)), float(bitfieldExtract(int(w), 8, 8)),
+                float(bitfieldExtract(int(w), 16, 8)), float(bitfieldExtract(int(w), 24, 8))) * d;
+}
+vec4 loadK(uint i) { uint e = i << 2u, b = (e >> 5u) * 9u; return q8Group(kw[b + 1u + ((e & 31u) >> 2u)], uintBitsToFloat(kw[b])); }
+vec4 loadV(uint i) { uint e = i << 2u, b = (e >> 5u) * 9u; return q8Group(vw[b + 1u + ((e & 31u) >> 2u)], uintBitsToFloat(vw[b])); }
 #else
 layout(set = 0, binding = 1, std430) readonly  buffer BufK   { vec4 k4[]; };      // [seq_kv, num_kv_heads * head_dim] F32
 layout(set = 0, binding = 2, std430) readonly  buffer BufV   { vec4 v4[]; };
