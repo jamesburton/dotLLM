@@ -83,6 +83,21 @@ model does not fit is tried as such a split before Vulkan and the CPU; an explic
 placement is controlled by the `--moe-*`, `--cpu-moe` and `--n-cpu-moe` options ([MOE_OFFLOAD.md](MOE_OFFLOAD.md)).
 Backend background: [GPU.md](GPU.md), [VULKAN.md](VULKAN.md), [CUDA.md](CUDA.md).
 
+## TurboQuant KV availability (#1887)
+
+A TurboQuant request runs TurboQuant for real, or startup fails and says why (#1888). It is never served by another cache. Pass the same
+value to `--cache-type-k` and `--cache-type-v`. TurboQuant on every backend, read in place, is tracked in #1887.
+
+| Backend / command | Setting | TurboQuant (`tq`, `tq1`..`tq8`, `tq*q`) |
+|---|---|---|
+| CPU `serve` | `--no-paged`, plain transformer, no draft model, no MTP head | runs (`TurboQuantKvCache`; still decodes into an FP32 scratch until step 2) |
+| CPU `serve` | paged (the default) | refused: pass `--no-paged` (step 3) |
+| CPU `serve` | hybrid / recurrent / other CPU hosts | refused |
+| `run`, `chat` | any | refused until step 2 |
+| CUDA, Vulkan, HIP (any command; `--device auto` that lands on a GPU) | any | refused until step 2 |
+| any | K and V differ (mixed pair, V-only, or different bit widths) | refused until step 6 |
+| any | head dim not a power of two or above 256, or per-layer KV widths | refused |
+
 ## KV-cache sizing
 
 The KV cache holds K and V for every layer and every position of the live context(s). For uniform full-attention layers:
