@@ -31,6 +31,8 @@ public class TurboQuantKvSupportTests
     {
         { "mixed K tq / V q8_0", new(KvCacheDType.TurboQuant, KvCacheDType.Q8_0), Real(), "step 6" },
         { "V-only tq", new(KvCacheDType.F32, KvCacheDType.TurboQuant), Real(), "step 6" },
+        // Mixed is unsupported on every backend: say so first, so moving to the CPU does not hit a second refusal.
+        { "mixed on vulkan", new(KvCacheDType.TurboQuant, KvCacheDType.Q4_0), Real() with { Backend = KvBackendKind.Vulkan }, "step 6" },
         { "vulkan", Tq4, Real() with { Backend = KvBackendKind.Vulkan }, "vulkan" },
         { "cuda", Tq4, Real() with { Backend = KvBackendKind.Cuda }, "cuda" },
         { "hip", Tq4, Real() with { Backend = KvBackendKind.Hip }, "hip" },
