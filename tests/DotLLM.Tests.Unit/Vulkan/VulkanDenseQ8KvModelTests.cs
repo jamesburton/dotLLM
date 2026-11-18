@@ -239,4 +239,62 @@ public sealed class VulkanDenseQ8KvModelTests
         }
         finally { vk.KvStorageOverride = storage; }
     }
+
+    /// <summary>
+    /// The protected-entry seed (#1780) on an in-place block cache copies each side's blocks with its own row size (mixed formats), so a
+    /// suffix over the seeded cache gives bit-identical logits to the same suffix over the cut-back source; another format is refused.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(VulkanKvStorage.Q8_0)]
+    [InlineData(VulkanKvStorage.Q4_0)]
+    [InlineData(VulkanKvStorage.Q8_0K_Q4_0V)]
+    [InlineData(VulkanKvStorage.Q4_0K_Q8_0V)]
+    public unsafe void BlockCacheSeed_GivesTheCutBackLogits(VulkanKvStorage storage)
+    {
+        string? path = FindGguf();
+        Skip.If(path is null, "Qwen2.5-0.5B q8_0 GGUF not found.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        var (model, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+        using var _ = model as IDisposable;
+        var vk = Assert.IsType<VulkanTransformerModel>(model);
+        static KvCacheDType D(VulkanKvStorage f) => f == VulkanKvStorage.Q4_0 ? KvCacheDType.Q4_0 : KvCacheDType.Q8_0;
+        Assert.True(vk.TryUseInPlaceQuantizedKv(D(storage.KeyFormat()), D(storage.ValueFormat()), spvDir));
+
+        int[] tokens = tokenizer.Encode(Turn1());
+        int n = tokens.Length, cut = n / 2 + 5, vocab = config.VocabSize;
+        int[] positions = Enumerable.Range(0, n).ToArray();
+        float[] Suffix(DotLLM.Core.Attention.IKvCache kv)
+        {
+            using var t = model.Forward(tokens.AsSpan(cut), positions.AsSpan(cut), -1, kv);
+            var row = new float[vocab];
+            new ReadOnlySpan<float>((float*)t.DataPointer + (long)(t.Shape[0] - 1) * vocab, vocab).CopyTo(row);
+            return row;
+        }
+
+        using var src = Assert.IsType<VulkanKvCache>(kvFactory(n + 8));
+        model.Forward(tokens, positions, -1, src).Dispose();
+        using var seeded = Assert.IsType<VulkanKvCache>(kvFactory(n + 8));
+        Assert.True(seeded.TrySeedPrefixFrom(src, cut));
+        Assert.Equal(cut, seeded.CurrentLength);
+        float[] fromSeed = Suffix(seeded);
+        src.Rollback(cut);
+        Assert.Equal(Suffix(src), fromSeed);
+
+        var other = storage == VulkanKvStorage.Q8_0 ? VulkanKvStorage.Q4_0 : VulkanKvStorage.Q8_0;
+        vk.KvStorageOverride = other;
+        try
+        {
+            if (vk.TryUseInPlaceQuantizedKv(D(other.KeyFormat()), D(other.ValueFormat()), spvDir))
+            {
+                using var wrong = Assert.IsType<VulkanKvCache>(kvFactory(n + 8));
+                Assert.False(wrong.TrySeedPrefixFrom(src, cut));   // another block format: refused, unchanged
+                Assert.Equal(0, wrong.CurrentLength);
+            }
+        }
+        finally { vk.KvStorageOverride = storage; }
+    }
 }
