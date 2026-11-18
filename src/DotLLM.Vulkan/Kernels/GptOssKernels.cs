@@ -112,10 +112,9 @@ internal sealed class VulkanGptOssKernels : IDisposable
     private readonly SimpleComputeKernel _attnSinks;
     // F16-KV twin (issue #1171, Flint): attention_sinks_f32_kvf16 reads K / V stored as F16 in place. Null when the SPIR-V is absent.
     private readonly SimpleComputeKernel? _attnSinksKvF16;
-    // Q8_0-KV twin (Flint opt-in Q8_0 KV): attention_sinks_f32_kvq8. Null when the SPIR-V is absent.
-    private readonly SimpleComputeKernel? _attnSinksKvQ8;
-    // Q4_0-KV twin (#1884): attention_sinks_f32_kvq4. Null when the SPIR-V is absent.
-    private readonly SimpleComputeKernel? _attnSinksKvQ4;
+    // Block-quantised KV twins (Flint's Q8_0; Q4_0 and mixed K/V since #1884): attention_sinks_f32_kvq8 / _kvq4 / _kvq8q4 / _kvq4q8, each
+    // present only when its SPIR-V is.
+    private readonly Dictionary<VulkanKvStorage, SimpleComputeKernel> _attnSinksBlock;
     private readonly SimpleComputeKernel _swigluOai;
     private readonly SimpleComputeKernel _expertBias;
     private readonly SimpleComputeKernel _topkRaw;
@@ -128,13 +127,12 @@ internal sealed class VulkanGptOssKernels : IDisposable
 
     private VulkanGptOssKernels(SimpleComputeKernel attnSinks, SimpleComputeKernel swigluOai,
         SimpleComputeKernel expertBias, SimpleComputeKernel topkRaw, MoeIndexedMatmulMxfp4F32Kernel mxfp4,
-        SimpleComputeKernel ropeYarn, SimpleComputeKernel? attnSinksKvF16, SimpleComputeKernel? attnSinksKvQ8, SimpleComputeKernel? attnSinksKvQ4)
+        SimpleComputeKernel ropeYarn, SimpleComputeKernel? attnSinksKvF16, Dictionary<VulkanKvStorage, SimpleComputeKernel> attnSinksBlock)
     {
         _ropeYarn = ropeYarn;
         _attnSinks = attnSinks;
         _attnSinksKvF16 = attnSinksKvF16;
-        _attnSinksKvQ8 = attnSinksKvQ8;
-        _attnSinksKvQ4 = attnSinksKvQ4;
+        _attnSinksBlock = attnSinksBlock;
         _swigluOai = swigluOai;
         _expertBias = expertBias;
         _topkRaw = topkRaw;
@@ -155,21 +153,21 @@ internal sealed class VulkanGptOssKernels : IDisposable
         var attnF16 = File.Exists(Path.Combine(spvDir, "attention_sinks_f32_kvf16.spv"))
             ? SimpleComputeKernel.Create(device, spvDir, "attention_sinks_f32_kvf16", buffers: 5, pushWords: 12)
             : null;
-        var attnQ8 = File.Exists(Path.Combine(spvDir, "attention_sinks_f32_kvq8.spv"))
-            ? SimpleComputeKernel.Create(device, spvDir, "attention_sinks_f32_kvq8", buffers: 5, pushWords: 12)
-            : null;
-        var attnQ4 = File.Exists(Path.Combine(spvDir, "attention_sinks_f32_kvq4.spv"))
-            ? SimpleComputeKernel.Create(device, spvDir, "attention_sinks_f32_kvq4", buffers: 5, pushWords: 12)
-            : null;
-        return new VulkanGptOssKernels(attn, swi, bias, topk, mx, yarn, attnF16, attnQ8, attnQ4);
+        var block = new Dictionary<VulkanKvStorage, SimpleComputeKernel>();
+        foreach (var st in new[] { VulkanKvStorage.Q8_0, VulkanKvStorage.Q4_0, VulkanKvStorage.Q8_0K_Q4_0V, VulkanKvStorage.Q4_0K_Q8_0V })
+        {
+            string name = st.ShaderName("attention_sinks_f32");
+            if (File.Exists(Path.Combine(spvDir, name + ".spv")))
+                block[st] = SimpleComputeKernel.Create(device, spvDir, name, buffers: 5, pushWords: 12);
+        }
+        return new VulkanGptOssKernels(attn, swi, bias, topk, mx, yarn, attnF16, block);
     }
 
     internal void InvalidateDescriptorCaches()
     {
         _attnSinks.InvalidateDescriptorCache();
         _attnSinksKvF16?.InvalidateDescriptorCache();
-        _attnSinksKvQ8?.InvalidateDescriptorCache();
-        _attnSinksKvQ4?.InvalidateDescriptorCache();
+        foreach (var k in _attnSinksBlock.Values) k.InvalidateDescriptorCache();
         _swigluOai.InvalidateDescriptorCache();
         _expertBias.InvalidateDescriptorCache();
         _topkRaw.InvalidateDescriptorCache();
@@ -192,8 +190,8 @@ internal sealed class VulkanGptOssKernels : IDisposable
         var kernel = kvStorage switch
         {
             VulkanKvStorage.F16 => _attnSinksKvF16 ?? throw new NotSupportedException("F16 KV sink attention needs attention_sinks_f32_kvf16.spv, which this build lacks."),
-            VulkanKvStorage.Q8_0 => _attnSinksKvQ8 ?? throw new NotSupportedException("Q8_0 KV sink attention needs attention_sinks_f32_kvq8.spv, which this build lacks."),
-            VulkanKvStorage.Q4_0 => _attnSinksKvQ4 ?? throw new NotSupportedException("Q4_0 KV sink attention needs attention_sinks_f32_kvq4.spv, which this build lacks."),
+            _ when kvStorage.IsBlockQuantized() => _attnSinksBlock.TryGetValue(kvStorage, out var bk) ? bk
+                : throw new NotSupportedException($"{kvStorage} KV sink attention needs {kvStorage.ShaderName("attention_sinks_f32")}.spv, which this build lacks."),
             VulkanKvStorage.F32 => _attnSinks,
             _ => throw new NotSupportedException($"No sink attention kernel reads {kvStorage} KV."),   // never fall through to the F32 reader (#1884)
         };
@@ -280,8 +278,7 @@ internal sealed class VulkanGptOssKernels : IDisposable
     {
         _attnSinks.Dispose();
         _attnSinksKvF16?.Dispose();
-        _attnSinksKvQ8?.Dispose();
-        _attnSinksKvQ4?.Dispose();
+        foreach (var k in _attnSinksBlock.Values) k.Dispose();
         _swigluOai.Dispose();
         _expertBias.Dispose();
         _topkRaw.Dispose();

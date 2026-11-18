@@ -1530,10 +1530,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         }
     }
 
+    /// <summary>Environment variable: <c>0</c> disables in-place block KV (#1884) so q8_0 / q4_0 KV runs on the dequant-scratch cache (A/B only).</summary>
+    public const string InPlaceBlockKvEnvVar = "DOTLLM_VK_KV_INPLACE";
+
     /// <summary>
     /// Switches this dense model's <see cref="CreateKvCache(int)"/> to an in-place Q8_0 or Q4_0 <see cref="VulkanKvCache"/> for q8_0 or q4_0 K and V
-    /// (issue #1884), building the Q8_0 twins if the model was loaded without them. Returns false, changing nothing, for a model whose
-    /// dispatch is not audited for in-place KV (<see cref="IsDenseF16KvEligible"/>), other K / V types, or a device that cannot build
+    /// (issue #1884), building the twins if the model was loaded without them. Returns false, changing nothing, for a model whose
+    /// dispatch is not audited for in-place KV (neither <see cref="IsDenseF16KvEligible"/> nor Flint's all-sink dispatch), other K / V types, or a device that cannot build
     /// the writer or the per-token Q8_0 kernel; the caller then keeps <see cref="VulkanQuantizedKvCache"/>.
     /// </summary>
     /// <param name="keyDType">K element type.</param>
@@ -1542,7 +1545,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     /// <returns>Whether in-place Q8_0 KV is now the default.</returns>
     public bool TryUseInPlaceQuantizedKv(KvCacheDType keyDType, KvCacheDType valueDType, string spvDir)
     {
-        if (!IsDenseF16KvEligible) return false;
+        // A/B baseline only: DOTLLM_VK_KV_INPLACE=0 keeps the full-history dequant-scratch VulkanQuantizedKvCache (#1107 expansion).
+        if (Environment.GetEnvironmentVariable(InPlaceBlockKvEnvVar) == "0") return false;
+        bool flint = Config.Architecture == DotLLM.Core.Configuration.Architecture.Flint && _gptOss is not null;
+        if (!IsDenseF16KvEligible && !flint) return false;
         VulkanKvStorage storage = (keyDType, valueDType) switch
         {
             (KvCacheDType.Q8_0, KvCacheDType.Q8_0) => VulkanKvStorage.Q8_0,
@@ -1554,8 +1560,20 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         if (storage == VulkanKvStorage.F32) return false;
         if (Config.NumKvHeads * Config.HeadDim % 32 != 0) return false;   // Q8_0 blocks tile each row; head dims not a multiple of 32: #1883
         var set = BlockSet(storage)!;
-        if (set.Attention is null) InitDenseBlockKvKernels(spvDir, storage);
-        if (set.Attention is null || set.Writer is null) return false;
+        if (flint)
+        {
+            // Every Flint layer has sinks: the writer, the split-KV decode twin and the GQA sink flash prefill twin cover its dispatch; the
+            // reference sink kernel (GptOssKernels) has every block twin (#1884).
+            InitBlockKvKernels(spvDir, storage);
+            if (Environment.GetEnvironmentVariable(SinkFlashEnvVar) != "0" && !IsFlashAttentionDisabled())
+                set.SinkFlash ??= VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, storage, sinks: true, splitQ: null);
+            if (set.Writer is null || set.SplitKv is null || set.SinkFlash is null) return false;
+        }
+        else
+        {
+            if (set.Attention is null) InitDenseBlockKvKernels(spvDir, storage);
+            if (set.Attention is null || set.Writer is null) return false;
+        }
         KvStorageOverride = storage;
         return true;
     }

@@ -383,4 +383,74 @@ public sealed class VulkanDenseQ8KvKernelTests
             (c, q, k, v, o) => q8.Record(c, q, k, v, o, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset: off),
             (c, q, k, v, o) => f16.Record(c, q, k, v, o, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset: off));
     }
+
+    // ── Flint sink attention (#1884: the Q4_0 and mixed twins of the sink kernels; Flint selects them with DOTLLM_VK_KV) ──
+
+    private static VulkanDevice.Buffer Sinks(VulkanDevice device, int numHeads)
+    {
+        var b = device.Allocate(numHeads * 4L);
+        device.Upload(Enumerable.Range(0, numHeads).Select(h => 0.5f + 0.01f * h).ToArray(), b);
+        return b;
+    }
+
+    [SkippableTheory]
+    [InlineData(VulkanKvStorage.Q4_0, 2600, 513, true)]
+    [InlineData(VulkanKvStorage.Q4_0, 777, 0, false)]
+    [InlineData(VulkanKvStorage.Q8_0K_Q4_0V, 2600, 513, true)]
+    [InlineData(VulkanKvStorage.Q4_0K_Q8_0V, 4000, 0, true)]
+    public void SinkSplitKvDecode_ReadsBlockKvInPlace_MatchesF32OnDequantisedRows(VulkanKvStorage storage, int seqKv, int window, bool gqa)
+    {
+        _storage = storage;
+        const int numHeads = 32, numKvHeads = 4, headDim = 128;   // a Flint layer
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var f32 = VulkanSplitKvAttentionKernel.Create(device, spvDir);
+        using var blk = VulkanSplitKvAttentionKernel.Create(device, spvDir, storage);
+        f32.PreferGqa = gqa; blk.PreferGqa = gqa;
+        Skip.If(gqa && !blk.UsesGqa(numHeads, numKvHeads, headDim), "GQA-grouped split pass unavailable");
+        using var bS = Sinks(device, numHeads);
+        int pos = seqKv - 1, kvStart = window > 0 ? Math.Max(0, pos - window + 1) : 0;
+        ExactCase(device, 1, seqKv, numHeads, numKvHeads, headDim,
+            (c, q, k, v, o) => blk.Record(c, q, k, v, o, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset: pos, slidingWindow: window, sinks: bS, kvStart: kvStart),
+            (c, q, k, v, o) => f32.Record(c, q, k, v, o, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset: pos, slidingWindow: window, sinks: bS, kvStart: kvStart));
+    }
+
+    [SkippableTheory]
+    [InlineData(VulkanKvStorage.Q4_0, 100, 612, 512, 0)]
+    [InlineData(VulkanKvStorage.Q4_0, 77, 1205, 1128, 513)]
+    [InlineData(VulkanKvStorage.Q8_0K_Q4_0V, 100, 612, 512, 0)]
+    [InlineData(VulkanKvStorage.Q4_0K_Q8_0V, 77, 1205, 1128, 513)]
+    public void SinkFlashPrefill_ReadsBlockKvInPlace_MatchesF16TwinOnDequantisedRows(VulkanKvStorage storage, int seqQ, int seqKv, int posOffset, int window)
+    {
+        _storage = storage;
+        const int numHeads = 32, numKvHeads = 4, headDim = 128;
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var blk = VulkanFlashAttentionGqaKernel.TryCreate(device, spvDir, storage, sinks: true, splitQ: null);
+        var f16 = VulkanFlashAttentionGqaKernel.TryCreate(device, spvDir, VulkanKvStorage.F16, sinks: true, splitQ: null);
+        Skip.If(blk is null || f16 is null || !blk.CanDispatch(headDim, numHeads, numKvHeads), "no coopmat GQA sink flash on this device");
+        using var _b = blk!; using var _f = f16!;
+        using var bS = Sinks(device, numHeads);
+        CoopmatCase(device, seqQ, seqKv, numHeads, numKvHeads, headDim,
+            (c, q, k, v, o) => blk.Record(c, q, k, v, o, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset: posOffset, slidingWindow: window, sinks: bS),
+            (c, q, k, v, o) => f16.Record(c, q, k, v, o, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset: posOffset, slidingWindow: window, sinks: bS));
+    }
+
+    [SkippableTheory]
+    [InlineData(VulkanKvStorage.Q4_0, 20, 0)]
+    [InlineData(VulkanKvStorage.Q8_0K_Q4_0V, 40, 16)]
+    [InlineData(VulkanKvStorage.Q4_0K_Q8_0V, 33, 0)]
+    public void ReferenceSinkKernel_ReadsBlockKvInPlace_MatchesF32OnDequantisedRows(VulkanKvStorage storage, int seqKv, int window)
+    {
+        _storage = storage;
+        const int numHeads = 32, numKvHeads = 4, headDim = 128;
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var gpt = VulkanGptOssKernels.Create(device, spvDir);
+        using var bS = Sinks(device, numHeads);
+        int pos = seqKv - 1;
+        ExactCase(device, 1, seqKv, numHeads, numKvHeads, headDim,
+            (c, q, k, v, o) => gpt.RecordAttentionSinks(c, q, k, v, o, bS, 1, seqKv, numHeads, numKvHeads, headDim, pos, window, kvStorage: storage),
+            (c, q, k, v, o) => gpt.RecordAttentionSinks(c, q, k, v, o, bS, 1, seqKv, numHeads, numKvHeads, headDim, pos, window, kvStorage: VulkanKvStorage.F32));
+    }
 }
