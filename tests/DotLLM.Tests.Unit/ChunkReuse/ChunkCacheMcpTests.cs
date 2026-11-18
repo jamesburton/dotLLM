@@ -91,7 +91,7 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
                 ["evict", "--server", FakeUrl, "--mode", "orphans", "--json"], ["mode", "server"]),
             ("prewarm", $$"""{"server": "http://fake.test:8080", "texts": [{"id": "a", "text": "class A { }"}]}""",
                 ["prewarm", "--server", FakeUrl, "--texts", texts, "--json"], ["requests", "skipped_ineligible"]),
-            ("explain", $$"""{"server": "http://fake.test:8080", "request": {"model": "m", "messages": [{"role": "user", "content": "hi"}]}}""",
+            ("explain", """{"server": "http://fake.test:8080", "request": {"model": "m", "messages": [{"role": "user", "content": "hi"}]}}""",
                 ["explain", "--server", FakeUrl, "--request", request, "--json"], ["server"]),
         };
         foreach ((string tool, string args, string[] cli, string[] dropped) in cases)
@@ -234,7 +234,7 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
         string store = Path.Combine(NewDir("none"), "no-such-store");
         await using McpWire wire = await McpWire.StartAsync(["--model", _fx.ModelA]);
 
-        JsonElement response = await wire.CallAsync("tools/call", $$"""{"name": "chunkcache_status", "arguments": {"store": {{JsonSerializer.Serialize(store)}}}}""");
+        JsonElement response = await wire.CallAsync("tools/call", $$$"""{"name": "chunkcache_status", "arguments": {"store": {{{JsonSerializer.Serialize(store)}}}}}""");
         Assert.False(response.TryGetProperty("error", out _), "a tool failure is not a JSON-RPC error");
         JsonElement result = response.GetProperty("result");
         Assert.True(IsError(result));
@@ -257,7 +257,7 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
     public async Task ApiKey_NeverOnTheWire()
     {
         const string key = "sk-test-9f8e7d6c5b4a39281716";
-        var fake = new FakeServer(_ => (HttpStatusCode.InternalServerError, $$"""{"error":{"message":"bad key {{key}}"}}"""));
+        var fake = new FakeServer(_ => (HttpStatusCode.InternalServerError, $$$"""{"error":{"message":"bad key {{{key}}}"}}"""));
         await using McpWire wire = await McpWire.StartAsync(["--server", FakeUrl], fake, env: n => n == "CHUNKCACHE_API_KEY" ? key : null);
         JsonElement result = await wire.CallToolAsync("chunkcache_evict", "{}");
         Assert.True(IsError(result));
@@ -306,7 +306,7 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
             JsonElement tools = await Roundtrip("""{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}""", 2);
             Assert.Equal(6, tools.GetProperty("result").GetProperty("tools").GetArrayLength());
             // A real tool run in the child: status of an empty store is a tool error (no index), as a result, with the progress text off stdout.
-            JsonElement call = await Roundtrip($$"""{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"chunkcache_evict","arguments":{}}}""", 3);
+            JsonElement call = await Roundtrip("""{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"chunkcache_evict","arguments":{}}}""", 3);
             Assert.True(call.GetProperty("result").GetProperty("isError").GetBoolean()); // no --server and no store layout to evict from
         }
         finally
@@ -510,6 +510,8 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
             try { await _run.WaitAsync(TimeSpan.FromSeconds(20)); }
             catch (TimeoutException) { _cts.Cancel(); }
             catch (OperationCanceledException) { }
+            _reader.Dispose();
+            _stderr.Dispose();
             _fromServer.Dispose();
             _serverIn.Dispose();
             _serverOut.Dispose();

@@ -53,11 +53,11 @@ internal static class McpTools
     [
         new("chunkcache_build",
             "Scan a solution or folder, chunk it with a wire-eligible chunker and update the store's index (tokenizer only; nothing is encoded unless encode is true, which queues the missing chunks on the server).",
-            Input($$"""
+            Input($$$$"""
                 {"required": ["path"], "properties": {
                   "store": {"type": "string"}, "server": {"type": "string"},
                   "path": {"type": "string", "description": ".sln/.slnx/.csproj or folder"},
-                  "chunker": {{ChunkerProp}},
+                  "chunker": {{{{ChunkerProp}}}},
                   "configuration": {"type": "string", "default": "Release"},
                   "encode": {"type": "boolean", "default": false, "description": "queue all missing chunks via the server's prewarm"},
                   "max_encode_tokens": {"type": "integer", "minimum": 0}}}
@@ -65,11 +65,11 @@ internal static class McpTools
             Output("build"), PlanBuild, readOnly: false, destructive: false),
         new("chunkcache_select",
             "Choose the chunks for a context (paths/globs, a symbol's neighbourhood, git changes) under a token budget, from an index and its reference graph.",
-            Input($$"""
+            Input($$$$"""
                 {"properties": {
                   "store": {"type": "string"}, "server": {"type": "string"},
                   "path": {"type": "string", "description": "solution/folder whose index to use"},
-                  "chunker": {{ChunkerProp}},
+                  "chunker": {{{{ChunkerProp}}}},
                   "paths": {"type": "array", "items": {"type": "string"}}, "exclude": {"type": "array", "items": {"type": "string"}},
                   "symbol": {"type": "string"}, "hops": {"type": "integer", "default": 1, "minimum": 0, "maximum": 100},
                   "changed_since": {"type": "string"}, "token_budget": {"type": "integer", "minimum": 0},
@@ -79,9 +79,9 @@ internal static class McpTools
             Output("select"), PlanSelect, readOnly: true, destructive: false),
         new("chunkcache_status",
             "Which chunks are missing or stale for a tree (by file and line range), and the store's statistics.",
-            Input($$"""
+            Input($$$$"""
                 {"properties": {"store": {"type": "string"}, "server": {"type": "string"}, "path": {"type": "string"},
-                  "chunker": {{ChunkerProp}},
+                  "chunker": {{{{ChunkerProp}}}},
                   "list_missing": {"type": "boolean", "default": false}}}
                 """),
             Output("status"), PlanStatus, readOnly: true, destructive: false),
