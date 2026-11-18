@@ -182,4 +182,55 @@ public sealed class VulkanKvCacheGrowthTests
             }
         }
     }
+
+    /// <summary>
+    /// Issue #1843 on Vulkan, as on CUDA: with a second, unrelated entry retained, a hit whose growth is refused evicts that entry
+    /// and retries the growth, keeping the hit, instead of re-prefilling the conversation. Admission is refused until the
+    /// neighbour is gone, as when it holds the memory the growth needs.
+    /// </summary>
+    [SkippableFact]
+    public void RefusedGrowth_WithANeighbourRetained_EvictsIt_AndKeepsTheHit()
+    {
+        string? path = FindGguf();
+        Skip.If(path is null, "Qwen2.5-0.5B q8_0 GGUF not found.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        var (model, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+        using var _ = model as IDisposable;
+        var opts = new InferenceOptions { Temperature = 0, MaxTokens = 12 };
+        var cold = new TextGenerator(model, tokenizer, (cfg, size) => kvFactory(size), mtpEnabled: false);
+
+        string turn1 = "<|im_start|>user\n" + string.Concat(Enumerable.Repeat("The quick brown fox jumps over the lazy dog. ", 20))
+            + "Fetch the page.<|im_end|>\n";
+        string unrelated = "Harbour log, evening watch. " + string.Concat(Enumerable.Repeat("Seven sailors sorted silver spoons. ", 15))
+            + "Count the sailors.<|im_end|>\n";
+        string toolResult = "<|im_start|>user\n<tool_response>\n"
+            + string.Concat(Enumerable.Range(0, 60).Select(i => $"Row {i}: the value of item {i * 7 % 13} is {i * 31 % 97}. "))
+            + "\n</tool_response><|im_end|>\n";
+
+        using var prefix = new PrefixCache(2, PrefixCachePolicy.Lru);
+        var warm = new TextGenerator(model, tokenizer, (cfg, size) => kvFactory(size), prefix, mtpEnabled: false,
+            prefixCacheHeadroomTokens: 16);
+        var first = warm.Generate(Turn(turn1), opts);
+        warm.Generate(Turn(unrelated), opts);
+        Assert.Equal(2, prefix.EntryCount);
+        string turn2 = Turn(turn1 + "<|im_start|>assistant\n" + first.Text + "<|im_end|>\n" + toolResult);
+        int firstRows = tokenizer.Encode(Turn(turn1)).Length + first.GeneratedTokenIds.Length - 1;
+
+        long growths = VulkanKvCache.GrowthsForTest, evictions = prefix.AdmissionEvictions;
+        VulkanKvCache.GrowthAdmissionOverride = (_, _) => prefix.AdmissionEvictions > evictions;
+        InferenceResponse actual;
+        try { actual = warm.Generate(turn2, opts); }
+        finally { VulkanKvCache.GrowthAdmissionOverride = null; }
+
+        Assert.Equal(evictions + 1, prefix.AdmissionEvictions);
+        Assert.Equal(1, prefix.EntryCount);
+        Assert.Equal(growths + 1, VulkanKvCache.GrowthsForTest);
+        Assert.InRange(actual.Timings.CachedTokenCount, firstRows - 8, firstRows + 2);
+        Assert.Equal(cold.Generate(turn2, opts).GeneratedTokenIds, actual.GeneratedTokenIds);
+    }
 }

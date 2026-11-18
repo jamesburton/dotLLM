@@ -33,7 +33,8 @@ namespace DotLLM.Vulkan;
 /// object satisfy the same API.
 /// </para>
 /// </remarks>
-public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IPositionedHostKvCache, IWindowedKvCache, IPrefixReusableKvCache, IKvPrefixSeedable
+public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IPositionedHostKvCache, IWindowedKvCache, IPrefixReusableKvCache, IKvPrefixSeedable,
+    IDeviceResidentKvCache
 {
     private readonly VulkanDevice _device;
     private readonly VulkanDevice.Buffer[] _keys;
@@ -65,6 +66,21 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
 
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
+
+    /// <summary>
+    /// Device bytes this cache holds now (<see cref="IDeviceResidentKvCache"/>): every layer's K and V buffer plus the compaction
+    /// scratch. Being device-resident is what lets a prefix hit whose growth is refused evict the other retained entry and retry
+    /// (issue #1843, as on CUDA) instead of re-prefilling the conversation.
+    /// </summary>
+    public long DeviceBytes
+    {
+        get
+        {
+            long bytes = _moveScratch?.Size ?? 0;
+            for (int i = 0; i < _numLayers; i++) bytes += _keys[i].Size + _values[i].Size;
+            return bytes;
+        }
+    }
 
     /// <summary>
     /// Element format of the cached rows. <see cref="VulkanKvStorage.F16"/> rows are written by the F16 convert kernel and read in place by the
