@@ -84,34 +84,34 @@ public static class TurboQuantKvSupport
         if (!kv.IsTurboQuantAny) return null;
 
         if (kv.IsTurboQuantMixed)
-            return Refuse($"TurboQuant KV must be used for both K and V (got K={kv.KeyDType}, V={kv.ValueDType}): pass the same tq value to both " +
+            return Refuse(Gap.Mixed, $"TurboQuant KV must be used for both K and V (got K={kv.KeyDType}, V={kv.ValueDType}): pass the same tq value to both " +
                 "--cache-type-k and --cache-type-v; mixed K/V pairs with TurboQuant arrive in step 6");
         if (ctx.Backend is KvBackendKind.Cuda or KvBackendKind.Vulkan or KvBackendKind.Hip)
-            return Refuse($"TurboQuant KV does not run on {ctx.Backend.ToString().ToLowerInvariant()} yet (step 2)" +
+            return Refuse(ctx.Backend == KvBackendKind.Hip ? Gap.Hip : Gap.InPlace, $"TurboQuant KV does not run on {ctx.Backend.ToString().ToLowerInvariant()} yet (step 2)" +
                 (ctx.Command == KvCommand.Serve ? "; for the CPU path pass --device cpu --no-paged" : ""));
         if (ctx.Command is KvCommand.Run or KvCommand.Chat or KvCommand.Bench)
-            return Refuse($"'{ctx.Command.ToString().ToLowerInvariant()}' does not run TurboQuant KV yet (step 2); use `dotllm serve --device cpu --no-paged` until then");
+            return Refuse(Gap.InPlace, $"'{ctx.Command.ToString().ToLowerInvariant()}' does not run TurboQuant KV yet (step 2); use `dotllm serve --device cpu --no-paged` until then");
         if (ctx.Paged)
-            return Refuse("the paged KV cache has no TurboQuant blocks yet (step 3); pass --no-paged");
+            return Refuse(Gap.Paged, "the paged KV cache has no TurboQuant blocks yet (step 3); pass --no-paged");
 
         if (ctx.Config is { } config)
         {
             // MLA (DeepSeek-V2/V3, GLM-4.7-Flash, Kimi) keeps its own latent KV state and ignores the caller's cache: a TurboQuant cache
             // would be allocated and never used. Checked before the head dim, which on MLA is qk_nope + qk_rope and can be a power of two.
             if (config.MlaConfig is not null)
-                return Refuse($"TurboQuant KV does not run on MLA models ({config.Architecture}) yet: their attention keeps its own latent KV");
+                return Refuse(Gap.Mla, $"TurboQuant KV does not run on MLA models ({config.Architecture}) yet: their attention keeps its own latent KV");
             int headDim = config.HeadDim;
             if (headDim <= 0 || (headDim & (headDim - 1)) != 0 || headDim > MaxHeadDim)
-                return Refuse($"TurboQuant KV needs a power-of-two head dim of at most {MaxHeadDim}; this model has head dim {headDim}");
+                return Refuse(Gap.HeadDim, $"TurboQuant KV needs a power-of-two head dim of at most {MaxHeadDim}; this model has head dim {headDim}");
             if (!KvGeometry.FromConfig(config).IsUniform)
-                return Refuse("TurboQuant KV needs the same KV width on every layer; this model's layers differ");
+                return Refuse(Gap.PerLayer, "TurboQuant KV needs the same KV width on every layer; this model's layers differ");
         }
         if (ctx.HasDraftModel)
-            return Refuse("the speculative draft model's KV would not be TurboQuant; drop --speculative-model");
+            return Refuse(Gap.DraftMtp, "the speculative draft model's KV would not be TurboQuant; drop --speculative-model");
         if (ctx.MtpWillAttach)
-            return Refuse("the MTP head's KV would not be TurboQuant; pass --no-mtp");
+            return Refuse(Gap.DraftMtp, "the MTP head's KV would not be TurboQuant; pass --no-mtp");
         if (ctx.HostIsPlainCpuTransformer == false)
-            return Refuse($"TurboQuant KV does not run on the {ctx.Config?.Architecture.ToString() ?? "loaded"} CPU model yet");
+            return Refuse(Gap.Host, $"TurboQuant KV does not run on the {ctx.Config?.Architecture.ToString() ?? "loaded"} CPU model yet");
         return null;
     }
 
@@ -120,7 +120,7 @@ public static class TurboQuantKvSupport
     /// <param name="valueText">The V flag as given.</param>
     /// <returns>The refusal reason.</returns>
     public static string MixedFormatRefusal(string keyText, string valueText)
-        => Refuse($"TurboQuant K and V must use the same format (got --cache-type-k {keyText}, --cache-type-v {valueText}); mixed TurboQuant formats arrive in step 6");
+        => Refuse(Gap.Mixed, $"TurboQuant K and V must use the same format (got --cache-type-k {keyText}, --cache-type-v {valueText}); mixed TurboQuant formats arrive in step 6");
 
     /// <summary>The backend <paramref name="model"/> runs on, by its type: Vulkan, CUDA (including the GPU/CPU split) or HIP models, else CPU.
     /// The post-load host rule (an exact <c>TransformerModel</c> type check) backstops any model this misclassifies.</summary>
@@ -136,5 +136,23 @@ public static class TurboQuantKvSupport
         return KvBackendKind.Cpu;
     }
 
-    private static string Refuse(string what) => $"{what}; {Alternative}. TurboQuant on every backend is tracked in #{EpicIssue}.";
+    /// <summary>
+    /// The ticket that closes each refused gap (#1887). Each carries a checklist to remove the refusal, its hint and the
+    /// "use q8_0 or q4_0 instead" suggestion once the gap is closed: every "use something else" here is a gap, not guidance.
+    /// </summary>
+    internal static class Gap
+    {
+        public const int InPlace = 1892;   // step 2: CUDA/Vulkan in-place attention; run/chat/bench
+        public const int Paged = 1893;     // step 3: paged pools, scheduler, Vulkan pool (#1882), tray
+        public const int Mixed = 1895;     // step 6: mixed K/V pairs, V-only, differing bits
+        public const int Hip = 1896;
+        public const int HeadDim = 1897;
+        public const int PerLayer = 1898;
+        public const int Mla = 1899;
+        public const int Host = 1900;
+        public const int DraftMtp = 1901;
+    }
+
+    private static string Refuse(int gap, string what)
+        => $"{what}; {Alternative} for now. Closing this gap: #{gap}; TurboQuant on every backend is tracked in #{EpicIssue}.";
 }

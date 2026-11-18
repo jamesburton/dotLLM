@@ -57,6 +57,36 @@ public class TurboQuantKvSupportTests
         Assert.False(string.IsNullOrEmpty(name));
     }
 
+    /// <summary>Every refusal names the ticket that closes its gap (each carries the checklist to remove this guidance), not only the epic.</summary>
+    public static TheoryData<string, KvCacheConfig, TurboQuantContext, int> GapTicketCases() => new()
+    {
+        { "mixed", new(KvCacheDType.TurboQuant, KvCacheDType.Q8_0), Real(), 1895 },
+        { "vulkan", Tq4, Real() with { Backend = KvBackendKind.Vulkan }, 1892 },
+        { "cuda", Tq4, Real() with { Backend = KvBackendKind.Cuda }, 1892 },
+        { "hip", Tq4, Real() with { Backend = KvBackendKind.Hip }, 1896 },
+        { "run", Tq4, Real() with { Command = KvCommand.Run }, 1892 },
+        { "bench", Tq4, Real() with { Command = KvCommand.Bench }, 1892 },
+        { "paged", Tq4, Real() with { Paged = true }, 1893 },
+        { "head dim", Tq4, Real(Dense(headDim: 80)), 1897 },
+        { "draft", Tq4, Real() with { HasDraftModel = true }, 1901 },
+        { "mtp", Tq4, Real() with { MtpWillAttach = true }, 1901 },
+        { "host", Tq4, Real() with { HostIsPlainCpuTransformer = false }, 1900 },
+    };
+
+    [Theory]
+    [MemberData(nameof(GapTicketCases))]
+    public void EachRefusal_CitesItsGapTicket(string name, KvCacheConfig kv, TurboQuantContext ctx, int ticket)
+    {
+        string? reason = TurboQuantKvSupport.RefusalReason(kv, ctx);
+        Assert.Contains($"#{ticket}", reason);
+        Assert.Contains($"#{TurboQuantKvSupport.EpicIssue}", reason);
+        Assert.False(string.IsNullOrEmpty(name));
+    }
+
+    [Fact]
+    public void MixedFormatRefusal_CitesStep6()
+        => Assert.Contains("#1895", TurboQuantKvSupport.MixedFormatRefusal("tq3", "tq4"));
+
     [Theory]
     [InlineData("tq4")]
     [InlineData("tq4q")]

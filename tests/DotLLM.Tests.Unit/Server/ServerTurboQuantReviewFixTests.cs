@@ -48,6 +48,7 @@ public sealed class ServerTurboQuantReviewFixTests : IClassFixture<PrefixCacheFa
             KvCommand.Serve, KvBackendKind.Cpu, Paged: false, config, HostIsPlainCpuTransformer: true, HasDraftModel: false, MtpWillAttach: false));
         Assert.NotNull(reason);
         Assert.Contains("MLA", reason);
+        Assert.Contains("#1899", reason);
     }
 
     [Theory]
