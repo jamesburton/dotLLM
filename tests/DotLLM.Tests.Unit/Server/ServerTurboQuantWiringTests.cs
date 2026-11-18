@@ -150,8 +150,9 @@ public sealed class ServerTurboQuantPostLoadTests : IClassFixture<PrefixCacheFai
 }
 
 /// <summary>
-/// #1888 Review Focus 1: <c>--device auto</c> must never run TurboQuant on a GPU model, and must not quietly fall back to the CPU either.
-/// Auto loads each candidate as an explicit device, so the pre-load pass refuses the GPU candidate before its weights load and the refusal
+/// #1888 Review Focus 1, <b>step 1 only</b>: GPUs have no in-place TurboQuant kernels until #1887 step 2, so while that holds a tq request
+/// that <c>--device auto</c> lands on a GPU must be refused - not served f16 as before, and not quietly moved to the CPU.
+/// <b>Step 2 inverts this test</b>: auto on a GPU must then build the GPU TurboQuant cache. Auto loads each candidate as an explicit device, so the pre-load pass refuses the GPU candidate before its weights load and the refusal
 /// reaches the user (measured on gfx1151: "trying vulkan:0", then the refusal, no CPU attempt). The post-load backend rule is a backstop
 /// this test cannot isolate. Needs a GPU, so it runs under the GPU lock.
 /// </summary>

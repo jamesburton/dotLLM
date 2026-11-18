@@ -430,6 +430,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             DeviceCli.PrintError(kvFlagError!, settings.Json);
             return 1;
         }
+        // #1888: TurboQuant KV does not run in 'run' until #1887 step 2; never serve it with another cache.
+        if (DotLLM.Cli.Helpers.KvStorageCli.TurboQuantRefusal(DotLLM.Server.KvCommand.Run,
+                settings.KvQuantK ?? settings.CacheTypeK, settings.KvQuantV ?? settings.CacheTypeV) is { } tqRefusal)
+        {
+            DeviceCli.PrintError(tqRefusal, settings.Json);
+            return 1;
+        }
 
         // HuggingFace safetensors directory? (config.json + *.safetensors /
         // model.safetensors.index.json). Auto-detected; loads via the

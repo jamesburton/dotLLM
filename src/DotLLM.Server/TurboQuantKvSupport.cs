@@ -34,13 +34,13 @@ public enum KvCommand
 /// <param name="Command">The command the request comes from.</param>
 /// <param name="Backend">The backend; <see cref="KvBackendKind.Unknown"/> before an <c>auto</c> device has loaded.</param>
 /// <param name="Paged">Whether the paged KV cache is selected.</param>
-/// <param name="Config">The model configuration (geometry).</param>
+/// <param name="Config">The model configuration (geometry); null when no model config is known yet (the geometry rules are then skipped).</param>
 /// <param name="HostIsPlainCpuTransformer">Whether the loaded model is the plain CPU <c>TransformerModel</c>; null before load.</param>
 /// <param name="HasDraftModel">Whether a speculative draft model is configured (its KV would not be TurboQuant).</param>
 /// <param name="MtpWillAttach">Whether an MTP head will attach (its KV would not be TurboQuant).</param>
 public sealed record TurboQuantContext(
     KvCommand Command, KvBackendKind Backend, bool Paged,
-    ModelConfig Config, bool? HostIsPlainCpuTransformer,
+    ModelConfig? Config, bool? HostIsPlainCpuTransformer,
     bool HasDraftModel, bool MtpWillAttach);
 
 /// <summary>
@@ -81,17 +81,20 @@ public static class TurboQuantKvSupport
         if (ctx.Paged)
             return Refuse("the paged KV cache has no TurboQuant blocks yet (step 3); pass --no-paged");
 
-        int headDim = ctx.Config.HeadDim;
-        if (headDim <= 0 || (headDim & (headDim - 1)) != 0 || headDim > MaxHeadDim)
-            return Refuse($"TurboQuant KV needs a power-of-two head dim of at most {MaxHeadDim}; this model has head dim {headDim}");
-        if (!KvGeometry.FromConfig(ctx.Config).IsUniform)
-            return Refuse("TurboQuant KV needs the same KV width on every layer; this model's layers differ");
+        if (ctx.Config is { } config)
+        {
+            int headDim = config.HeadDim;
+            if (headDim <= 0 || (headDim & (headDim - 1)) != 0 || headDim > MaxHeadDim)
+                return Refuse($"TurboQuant KV needs a power-of-two head dim of at most {MaxHeadDim}; this model has head dim {headDim}");
+            if (!KvGeometry.FromConfig(config).IsUniform)
+                return Refuse("TurboQuant KV needs the same KV width on every layer; this model's layers differ");
+        }
         if (ctx.HasDraftModel)
             return Refuse("the speculative draft model's KV would not be TurboQuant; drop --speculative-model");
         if (ctx.MtpWillAttach)
             return Refuse("the MTP head's KV would not be TurboQuant; pass --no-mtp");
         if (ctx.HostIsPlainCpuTransformer == false)
-            return Refuse($"TurboQuant KV does not run on the {ctx.Config.Architecture} CPU model yet");
+            return Refuse($"TurboQuant KV does not run on the {ctx.Config?.Architecture.ToString() ?? "loaded"} CPU model yet");
         return null;
     }
 
