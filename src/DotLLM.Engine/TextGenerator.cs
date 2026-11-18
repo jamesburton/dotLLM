@@ -2106,7 +2106,8 @@ public sealed partial class TextGenerator
     /// other retained entries are what holds the device memory (or, for a GPU paged cache, the pool blocks) it needs, so they are
     /// evicted one at a time (the policy's victim first, the protected entry last) and the growth retried before the hit is
     /// given up. Without this a long agent turn whose retained neighbours filled the pool re-prefilled its whole conversation.
-    /// A host cache, or a refusal with nothing else left to evict, falls back to the plain check.
+    /// A device cache is one implementing <see cref="Core.Attention.IDeviceResidentKvCache"/> (the CUDA caches; the Vulkan ones not
+    /// yet, #1880). Anything else, or a refusal with nothing else left to evict, falls back to the plain check.
     /// </summary>
     private bool EnsureLivePrefixKvCapacityEvicting(PrefixCacheEntry entry, int needed, int matchedTokens, ref PrefixCacheEntry? protectedEntry)
     {

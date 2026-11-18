@@ -169,7 +169,8 @@ the context window. On success it prefills only the suffix. A refusal is logged 
     - `TrySeedPrefixFrom` shares the source's blocks (one pool reference each, no copy). Whichever cache writes a shared block next
       copies it first (`CudaKvBlockTable.EnsureWritable`), the partial last block included.
     - A hit whose growth is refused evicts the OTHER retained entries one at a time (`EvictForAdmission(keep: entry)`) and retries,
-      before giving up the hit (`TextGenerator.EnsureLivePrefixKvCapacityEvicting`; any device-resident cache, Vulkan included).
+      before giving up the hit (`TextGenerator.EnsureLivePrefixKvCapacityEvicting`). It runs for caches implementing
+      `IDeviceResidentKvCache`, i.e. the CUDA ones; the Vulkan caches do not implement it yet, so Vulkan still misses (#1880).
     - The paged gather prefill runs G3 at the suffix's position offset, like the dense cache.
     - Tests: `CudaPagedPrefixReuseTests` (two turns with growth vs cold and vs an ungrown warm run; block-sharing seed + copy-on-write;
       growth then a write inside the partial block; a 52-block pool where the hit must evict the other entry).
