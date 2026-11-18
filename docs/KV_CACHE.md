@@ -160,7 +160,19 @@ the context window. On success it prefills only the suffix. A refusal is logged 
     2,965-token TwIL-8B prefix slower than the whole prompt cold. `CudaG3Attention.RunOffset` (offset causal softmax over
     `[sq x skv]` planes, chunked by query rows to 64M score elements) serves the dense F16 cache from 32 query rows.
     `DOTLLM_CUDA_G3_OFFSET=0` turns it off. q8_0 stays on `attention_f16` until #1846 is understood.
-  - `CudaPagedKvCache` is not reusable yet (falls to a miss); block-level reuse is #1843.
+  - **`CudaPagedKvCache` (issue #1843, `serve --paged`).** Reusable, growable and seedable the same way, at most 2 entries.
+    - Rows live in pool blocks allocated as they are written, so a growth moves nothing. `TryGrowTo` checks that the pool still
+      has the blocks the new rows need (`BlocksStillNeeded`), even within `MaxLength`, because other retained entries hold blocks.
+      Past `MaxLength` it reallocates the per-request gather scratch and the block-pointer arrays (admitted by `CudaKvGrowth.Admit`)
+      and forces a full pointer re-upload, since the arrays and their pitch are new.
+    - `Rollback` keeps the blocks past the cut (they are rewritten by the suffix), so a cut-back hit needs no new blocks or upload.
+    - `TrySeedPrefixFrom` shares the source's blocks (one pool reference each, no copy). Whichever cache writes a shared block next
+      copies it first (`CudaKvBlockTable.EnsureWritable`), the partial last block included.
+    - A hit whose growth is refused evicts the OTHER retained entries one at a time (`EvictForAdmission(keep: entry)`) and retries,
+      before giving up the hit (`TextGenerator.EnsureLivePrefixKvCapacityEvicting`; any device-resident cache, Vulkan included).
+    - The paged gather prefill runs G3 at the suffix's position offset, like the dense cache.
+    - Tests: `CudaPagedPrefixReuseTests` (two turns with growth vs cold and vs an ungrown warm run; block-sharing seed + copy-on-write;
+      growth then a write inside the partial block; a 52-block pool where the hit must evict the other entry).
   - Tests: `CudaPrefixReuseTests` (two-turn TextGenerator on Qwen2.5-0.5B, f16 and q8_0: tokens equal cold, logprobs bit-identical to
     an ungrown warm run, refused admission misses; seed and grow are bit-identical to a rollback), `CudaKvGrowthLogicTests`.
 - **No growth path.**
