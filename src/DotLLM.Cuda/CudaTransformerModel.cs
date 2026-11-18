@@ -1790,7 +1790,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                         PagedGatherAttentionCalls++;
                         var (kCachePtr, vCachePtr) = cudaPagedKvCache.PrepareAttentionScratch(layer, s);
                         MarkProfile(ProfileCategory.KvUpdate);
-                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+                        // #1843: the gather is the same contiguous F16 layout as CudaKvCache, so a prefix-reuse suffix (or a later
+                        // prefill chunk) takes G3's offset path over it, as the dense F16 cache does (#1594).
+                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0], offsetG3: true);
                     }
                 }
                 else
@@ -4804,8 +4806,13 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <param name="maxTotalTokens">Maximum total tokens across all sequences sharing this pool.</param>
     public CudaKvBlockPool CreateKvBlockPool(int blockSize = 16, int maxTotalTokens = 65536)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockSize);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxTotalTokens);
         _context.MakeCurrent();
-        return new CudaKvBlockPool(Core.Attention.KvGeometry.FromConfig(Config), blockSize, maxTotalTokens, _context);
+        // The pool takes a BLOCK count. Passing the token count straight through (as before #1843) made every pool blockSize
+        // times larger than asked: 65536 tokens allocated 65536 blocks (1M tokens of KV).
+        int totalBlocks = (int)(((long)maxTotalTokens + blockSize - 1) / blockSize);
+        return new CudaKvBlockPool(Core.Attention.KvGeometry.FromConfig(Config), blockSize, totalBlocks, _context);
     }
 
     /// <summary>
@@ -4862,8 +4869,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         // pool with the cache's own length error instead of exhausting the pool mid-prefill.
         int length = CudaPagedKvCacheFactory.ClampToPool(maxSeqLen, pool);
         // #1848 / #1836: refused at admission, with the standard message, when the pool cannot hold the request, rather than
-        // throwing "pool exhausted" part-way through prefill. Serving runs one request at a time on this pool, so its free
-        // blocks are normally all of it; the served context is capped to the pool (ServerStartup), so this is the backstop.
+        // throwing "pool exhausted" part-way through prefill. Serving runs one request at a time on this pool, but since #1843 the
+        // prefix cache retains up to 2 entries that hold blocks; a refusal here is what makes TextGenerator.AllocateKvCacheEvicting
+        // evict them and retry. The served context is capped to the pool (ServerStartup), so the whole pool always fits one request.
         if (DescribePoolRefusal(length, pool.BlockSize, pool.FreeBlocks, pool.TotalBlocks,
                 CudaPagedKvCacheFactory.PoolBytesPerToken(KvGeometry.FromConfig(Config))) is { } refusal)
             throw new DeviceMemoryAdmissionException(refusal);

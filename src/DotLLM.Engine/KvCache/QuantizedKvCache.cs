@@ -17,7 +17,7 @@ namespace DotLLM.Engine.KvCache;
 /// In that mode a geometry with sliding windows (<see cref="KvGeometry.HasSlidingWindows"/>) keeps only the recent rows
 /// of those layers (<see cref="IWindowedKvCache"/>, issue #1169).
 /// </summary>
-public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, IWindowedKvCache
+public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, IWindowedKvCache, IPrefixReusableKvCache, IKvPrefixSeedable
 {
     private const int BlockSize = 32;
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
@@ -31,7 +31,7 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
     private readonly KvGeometry _geom;       // per-layer KV row width (numKvHeads(l) * headDim(l))
     private readonly bool _uniform;          // _geom.IsUniform, hoisted for the hot path
     private readonly int _uniformStride;     // _geom.UniformStride when _uniform; else 0
-    private readonly int _maxSeqLen;
+    private int _maxSeqLen;                  // raised by TryGrowTo (#1843)
     private readonly int _windowSize;
     private readonly int[] _keyQuantRowBytes;   // [numLayers] quantized K row bytes
     private readonly int[] _valueQuantRowBytes; // [numLayers] quantized V row bytes
@@ -370,6 +370,70 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
         if (_valuesWindow != null && WindowLength > 0)
             return new TensorRef(WindowLength, Stride(layerIndex), DType.Float32, -1, _valuesWindow[layerIndex]);
         return default;
+    }
+
+    /// <summary>
+    /// Whether a rollback to <paramref name="length"/> keeps every row below it (<see cref="IPrefixReusableKvCache"/>, issue #1843:
+    /// the CPU side of CUDA's and Vulkan's quantized prefix reuse). With a full-precision window, only before the first row was
+    /// evicted to quantized storage: past that the ring already holds later rows, so a cut would leave the window wrong (the CUDA
+    /// <c>CudaQuantizedKvCache</c> rule). Compact sliding-window layers must still hold the rows the cut needs.
+    /// </summary>
+    public bool CanTruncateTo(int length)
+        => (uint)length <= (uint)_currentLength
+           && (_windowSize == 0 || _quantizedLength == 0)
+           && (_rows?.CanTruncateTo(length) ?? true);
+
+    /// <summary>
+    /// Raises <see cref="MaxLength"/> to <paramref name="maxLength"/> keeping the committed rows (issue #1843, as
+    /// <see cref="SimpleKvCache.TryGrowTo"/>): each full-history layer's quantized K and V buffers are reallocated and the held
+    /// rows copied as stored (no dequant). The FP32 window ring and compact sliding-window layers do not depend on the length.
+    /// Host memory, so it never refuses.
+    /// </summary>
+    public bool TryGrowTo(int maxLength)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (maxLength <= _maxSeqLen) return true;
+        for (int i = 0; i < _numLayers; i++)
+        {
+            if (_rows is not null && _rows.IsWindowed(i)) continue;
+            _keysQuant[i] = Regrow(_keysQuant[i], (long)maxLength * _keyQuantRowBytes[i], (long)_currentLength * _keyQuantRowBytes[i]);
+            _valuesQuant[i] = Regrow(_valuesQuant[i], (long)maxLength * _valueQuantRowBytes[i], (long)_currentLength * _valueQuantRowBytes[i]);
+        }
+        _maxSeqLen = maxLength;
+        _rows?.SetFullCapacity(maxLength);
+        return true;
+
+        static nint Regrow(nint old, long newBytes, long keepBytes)
+        {
+            void* p = NativeMemory.AlignedAlloc((nuint)newBytes, 64);
+            Buffer.MemoryCopy((void*)old, p, newBytes, keepBytes);
+            NativeMemory.AlignedFree((void*)old);
+            return (nint)p;
+        }
+    }
+
+    /// <summary>
+    /// Copies rows <c>[0, rows)</c> of every layer from another <see cref="QuantizedKvCache"/> with the same geometry and K/V types
+    /// (the #1780 protected-entry seed, issue #1843), as stored. Refused for a full-precision window or compact sliding-window
+    /// layers (as on CUDA), another type or geometry, too few source rows, or too short a cache; this cache is then unchanged.
+    /// </summary>
+    public bool TrySeedPrefixFrom(IKvCache source, int rows)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (source is not QuantizedKvCache src || ReferenceEquals(src, this) || src._disposed) return false;
+        if (_windowSize != 0 || src._windowSize != 0 || _rows is not null || src._rows is not null) return false;
+        if (src.KeyDType != KeyDType || src.ValueDType != ValueDType || src._numLayers != _numLayers) return false;
+        if (rows <= 0 || rows > src._currentLength || rows > _maxSeqLen) return false;
+        for (int i = 0; i < _numLayers; i++)
+            if (src._geom.KvStrideOf(i) != _geom.KvStrideOf(i)) return false;
+        for (int i = 0; i < _numLayers; i++)
+        {
+            Buffer.MemoryCopy((void*)src._keysQuant[i], (void*)_keysQuant[i], (long)rows * _keyQuantRowBytes[i], (long)rows * _keyQuantRowBytes[i]);
+            Buffer.MemoryCopy((void*)src._valuesQuant[i], (void*)_valuesQuant[i], (long)rows * _valueQuantRowBytes[i], (long)rows * _valueQuantRowBytes[i]);
+        }
+        _currentLength = rows;
+        _quantizedLength = rows;
+        return true;
     }
 
     /// <inheritdoc/>

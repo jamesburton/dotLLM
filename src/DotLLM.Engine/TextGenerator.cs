@@ -1709,7 +1709,7 @@ public sealed partial class TextGenerator
                 // fixed headroom, and the miss would re-prefill the whole conversation. The cut above already holds the cache at the
                 // match, so a growth copies only the reused rows. Capped at the context window, as a miss's allocation is.
                 int requiredSize = Math.Min(promptLen + maxTokens, _model.Config.MaxSequenceLength);
-                if (EnsureLivePrefixKvCapacity(entry.KvCache, requiredSize, matchedTokens))
+                if (EnsureLivePrefixKvCapacityEvicting(entry, requiredSize, matchedTokens, ref protectedEntry))
                 {
                     // Prefill is about to overwrite rows matchedTokens.. of this cache. Narrow the entry to the rows that
                     // stay valid BEFORE any write, so a failed or cancelled request cannot leave it advertising a token
@@ -2086,16 +2086,42 @@ public sealed partial class TextGenerator
     /// whose growth is refused (a device cache with no room in free device memory) returns false and the refusal is logged; the
     /// caller then misses, the behaviour before #1781.
     /// </summary>
-    private bool EnsureLivePrefixKvCapacity(Core.Attention.IKvCache kv, int needed, int matchedTokens)
+    private bool EnsureLivePrefixKvCapacity(Core.Attention.IKvCache kv, int needed, int matchedTokens, bool logRefusal = true)
     {
-        if (kv.MaxLength >= needed) return true;
+        // Within MaxLength every cache answers true at once, except one whose storage is allocated as rows are written: a GPU
+        // paged cache checks that its pool still has the blocks, which other retained entries may hold now (#1843).
+        if (kv.MaxLength >= needed && kv.TryGrowTo(needed)) return true;
         int target = (int)Math.Min(_model.Config.MaxSequenceLength, (long)needed + _prefixCacheHeadroomTokens);
         if (kv.TryGrowTo(target) || (target > needed && kv.TryGrowTo(needed)))
             return true;
+        if (!logRefusal) return false;
         Console.Error.WriteLine(
             $"[prefix-cache] could not grow the cached KV ({kv.GetType().Name}) from {kv.MaxLength} to {needed} positions; " +
             $"re-prefilling its {matchedTokens} matching tokens (issue #1781).");
         return false;
+    }
+
+    /// <summary>
+    /// <see cref="EnsureLivePrefixKvCapacity"/> for a hit's own entry (issue #1843): when a device cache's growth is refused, the
+    /// other retained entries are what holds the device memory (or, for a GPU paged cache, the pool blocks) it needs, so they are
+    /// evicted one at a time (the policy's victim first, the protected entry last) and the growth retried before the hit is
+    /// given up. Without this a long agent turn whose retained neighbours filled the pool re-prefilled its whole conversation.
+    /// A device cache is one implementing <see cref="Core.Attention.IDeviceResidentKvCache"/> (the CUDA caches,
+    /// <c>VulkanKvCache</c> and <c>VulkanQuantizedKvCache</c>). Anything else, or a refusal with nothing else left to evict, falls back
+    /// to the plain check.
+    /// </summary>
+    private bool EnsureLivePrefixKvCapacityEvicting(PrefixCacheEntry entry, int needed, int matchedTokens, ref PrefixCacheEntry? protectedEntry)
+    {
+        var kv = entry.KvCache;
+        while (kv is Core.Attention.IDeviceResidentKvCache && _prefixCache is { EntryCount: > 1 })
+        {
+            if (EnsureLivePrefixKvCapacity(kv, needed, matchedTokens, logRefusal: false)) return true;
+            // EvictForAdmission spares `keep` while any other entry is left, and EntryCount > 1 guarantees one is.
+            var evicted = _prefixCache.EvictForAdmission(keep: entry);
+            if (evicted is null || ReferenceEquals(evicted, entry)) return false;
+            if (ReferenceEquals(evicted, protectedEntry)) protectedEntry = null;
+        }
+        return EnsureLivePrefixKvCapacity(kv, needed, matchedTokens);
     }
 
     /// <summary>

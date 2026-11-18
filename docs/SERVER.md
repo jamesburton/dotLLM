@@ -919,8 +919,7 @@ stretched to 115-144 s. With MTP on (window 51,200 on this card) the first three
   | Qwen3-4B-2507 Q4_K_M (616 tok) | 355 ms (first) | 30-33 ms | 606 |
 
   `cached_tokens` counts exactly the rows reused (one prompt token is always recomputed for its logits). Not covered: multi-slot beyond 2,
-  concurrent requests (single-request mode), paged/trie sharing on Vulkan, CUDA device caches (`IPrefixReusableKvCache` is not yet
-  implemented there), quantized-KV Vulkan models other than `VulkanQuantizedKvCache`.
+  concurrent requests (single-request mode), paged/trie sharing on Vulkan, quantized-KV Vulkan models other than `VulkanQuantizedKvCache` (TurboQuant Vulkan caches are not reusable).
 
 ### Continuing sessions on Vulkan (#1100)
 

@@ -33,7 +33,8 @@ namespace DotLLM.Vulkan;
 /// object satisfy the same API.
 /// </para>
 /// </remarks>
-public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IPositionedHostKvCache, IWindowedKvCache, IPrefixReusableKvCache, IKvPrefixSeedable
+public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IPositionedHostKvCache, IWindowedKvCache, IPrefixReusableKvCache, IKvPrefixSeedable,
+    IDeviceResidentKvCache
 {
     private readonly VulkanDevice _device;
     private readonly VulkanDevice.Buffer[] _keys;
@@ -65,6 +66,21 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
 
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
+
+    /// <summary>
+    /// Device bytes this cache holds now (<see cref="IDeviceResidentKvCache"/>): every layer's K and V buffer plus the compaction
+    /// scratch. Being device-resident is what lets a prefix hit whose growth is refused evict the other retained entry and retry
+    /// (issue #1843, as on CUDA) instead of re-prefilling the conversation.
+    /// </summary>
+    public long DeviceBytes
+    {
+        get
+        {
+            long bytes = _moveScratch?.Size ?? 0;
+            for (int i = 0; i < _numLayers; i++) bytes += _keys[i].Size + _values[i].Size;
+            return bytes;
+        }
+    }
 
     /// <summary>
     /// Element format of the cached rows. <see cref="VulkanKvStorage.F16"/> rows are written by the F16 convert kernel and read in place by the
@@ -499,7 +515,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
             growth += 2L * (maxLength - _maxSeqLen) * rowBytes;
             transit = Math.Max(transit, 2L * _maxSeqLen * rowBytes);
         }
-        if (!AdmitGrowth(growth + transit))
+        if (!AdmitGrowth(_device, growth + transit))
             return false;
 
         int layer = 0;
@@ -536,22 +552,29 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         }
 
         _maxSeqLen = maxLength;
-        Interlocked.Increment(ref s_growths);
+        RecordGrowth();
         return true;
     }
 
-    private bool AdmitGrowth(long bytes)
+    /// <summary>Counts one growth for <see cref="GrowthsForTest"/> (shared with <see cref="VulkanQuantizedKvCache"/>, #1843).</summary>
+    internal static void RecordGrowth() => Interlocked.Increment(ref s_growths);
+
+    /// <summary>
+    /// Admits a KV growth of <paramref name="bytes"/> peak extra device bytes on <paramref name="device"/> (shared with
+    /// <see cref="VulkanQuantizedKvCache"/>, #1843); <see cref="GrowthAdmissionOverride"/> replaces it in tests.
+    /// </summary>
+    internal static bool AdmitGrowth(VulkanDevice device, long bytes)
     {
-        if (GrowthAdmissionOverride is { } admit) return admit(_device, bytes);
+        if (GrowthAdmissionOverride is { } admit) return admit(device, bytes);
         if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_ALLOW_OVERCOMMIT"), "1", StringComparison.Ordinal)) return true;
         try
         {
             // As the MTP-head attach (#880): what the device can hold resident (UMA: capped at the OS limit), minus what this process and
             // other processes already hold there.
-            long usable = VulkanMemoryCapacity.UsableCapacityBytes(_device.ResidentCapacityBytes(),
-                GC.GetGCMemoryInfo().TotalAvailableMemoryBytes, _device.PhysicalDeviceTypeValue);
-            long others = _device.ReadOtherProcessPressure()?.OtherBytes ?? 0;
-            return bytes <= usable - _device.ResidentLiveBytes() - others;
+            long usable = VulkanMemoryCapacity.UsableCapacityBytes(device.ResidentCapacityBytes(),
+                GC.GetGCMemoryInfo().TotalAvailableMemoryBytes, device.PhysicalDeviceTypeValue);
+            long others = device.ReadOtherProcessPressure()?.OtherBytes ?? 0;
+            return bytes <= usable - device.ResidentLiveBytes() - others;
         }
         catch (Exception e) when (e is not OutOfMemoryException)
         {

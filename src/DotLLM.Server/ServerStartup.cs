@@ -912,8 +912,10 @@ public static class ServerStartup
         // CUDA dense (--no-paged) caches are retained the same way since #1594, so they get the same cap: under WDDM a card that runs
         // out of VRAM spills into shared memory instead of failing (#1068). No headroom: a CUDA cache grows by a device-to-device copy
         // of its rows (TryGrowTo, admitted against free VRAM), which costs milliseconds, so it is sized for the request alone.
+        // CUDA paged (#1843) the same: each retained entry holds pool blocks and a gather scratch sized to its window, and the
+        // paged pool fit charges a few live gather scratches (CudaPagedKvCacheFactory.LiveCachesCharged), not one per entry.
         bool deviceOwnedPrefixKv = vulkanKvFactory is not null
-            || (model is DotLLM.Cuda.CudaTransformerModel && cudaPagedFactory is null);
+            || model is DotLLM.Cuda.CudaTransformerModel;
 
         // #1862: the prefill chunk this server uses. An explicit --prefill-chunk-size (0 included) wins; otherwise the dense CUDA
         // non-paged path (f16, and q8_0 / q4_0 since #1850) chunks by default, so its context fit charges a fixed forward scratch instead of a per-token one.

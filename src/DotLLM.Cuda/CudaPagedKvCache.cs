@@ -25,13 +25,22 @@ namespace DotLLM.Cuda;
 /// caches — <c>GetKeysRef</c>/<c>GetValuesRef</c> too, since paged storage has no single
 /// contiguous device pointer to hand back without a gather) all throw
 /// <see cref="NotSupportedException"/> directing callers to the device-pointer methods.
+/// <para>
+/// Prompt-prefix reuse (issue #1843, the paged side of #1594): the engine's <c>PrefixCache</c> retains a finished request's
+/// cache, and a later request cuts it back to the common prompt prefix (<see cref="IPrefixReusableKvCache"/>), grows it
+/// (<see cref="TryGrowTo"/>) or seeds a fresh cache from it (<see cref="TrySeedPrefixFrom"/>). Seeding shares the source's
+/// blocks by reference count instead of copying rows. That is safe because every write goes through
+/// <see cref="CudaKvBlockTable.EnsureWritable"/>, which copies a shared block before writing it, so no cache's rows are ever
+/// overwritten by another cache's forward: the storage is exclusive in the sense <see cref="IKvCache.HasExclusiveStorage"/>
+/// means, even while blocks are shared.
+/// </para>
 /// </remarks>
-public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
+public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache, IPrefixReusableKvCache, IKvPrefixSeedable, IDeviceResidentKvCache
 {
     private readonly CudaKvBlockPool _pool;
     private readonly CudaKvBlockTable _blockTable;
     private readonly int _numLayers;
-    private readonly int _maxSeqLen;
+    private int _maxSeqLen;            // raised by TryGrowTo (issue #1843)
     private readonly int _maxStride; // largest per-layer stride — sizes the shared scratch
 
     // Scratch buffers for the gathered contiguous view (one pair, reused across layers;
@@ -47,7 +56,7 @@ public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
     // single stream-ordered 2D copy only when the block table's Version changes (a new block
     // every BlockSize tokens, CoW, seed, fork, free), not once per layer per step (#1839: the
     // old per-layer synchronous H2D pair cost ~17 ms/token on an RTX 3060 at 40 layers).
-    private readonly int _maxBlocksPerSeq;
+    private int _maxBlocksPerSeq;     // follows _maxSeqLen (TryGrowTo reallocates the arrays)
     private nint _blockPtrsHost;
     private nint _blockPtrsDevice;
     private nint _uploadEvent;      // recorded after each upload; waited on before the host array is rewritten
@@ -75,6 +84,24 @@ public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
     /// Shared block-pool bytes are reported separately by <see cref="CudaKvBlockPool.AllocatedBytes"/>.
     /// </summary>
     public long AllocatedBytes => 2L * _maxSeqLen * _maxStride * sizeof(ushort);
+
+    /// <summary>
+    /// Device bytes this cache holds now (<see cref="IDeviceResidentKvCache"/>, #1843): its pool blocks (a block shared with
+    /// another cache counts in both, so this is an upper bound on what disposing it frees), the gather scratch and the
+    /// block-pointer array.
+    /// </summary>
+    public long DeviceBytes
+    {
+        get
+        {
+            long blockBytes = 0;
+            for (int i = 0; i < _numLayers; i++) blockBytes += 2L * _pool.KvStrideOf(i) * sizeof(ushort);
+            blockBytes *= _pool.BlockSize;
+            return _blockTable.BlockCount * blockBytes + AllocatedBytes + PtrArrayBytes(_numLayers, _maxBlocksPerSeq);
+        }
+    }
+
+    private static long PtrArrayBytes(int numLayers, int maxBlocks) => 2L * numLayers * maxBlocks * IntPtr.Size;
 
     /// <summary>The block table mapping logical positions to physical blocks.</summary>
     internal CudaKvBlockTable BlockTable => _blockTable;
@@ -138,7 +165,7 @@ public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
         // not KV content) so the opt-in native path never needs a first-call allocation on
         // the decode hot path; unused entirely when DOTLLM_ATTN_PAGED_NATIVE is off.
         _maxBlocksPerSeq = (maxSeqLen + pool.BlockSize - 1) / pool.BlockSize;
-        nuint ptrArrayBytes = (nuint)(2L * _numLayers * _maxBlocksPerSeq * IntPtr.Size);
+        nuint ptrArrayBytes = (nuint)PtrArrayBytes(_numLayers, _maxBlocksPerSeq);
         CudaDriverApi.cuMemHostAlloc(out _blockPtrsHost, ptrArrayBytes, 0).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out _blockPtrsDevice, ptrArrayBytes).ThrowOnError();
         CudaDriverApi.cuEventCreate(out _uploadEvent, CudaDriverApi.CU_EVENT_DISABLE_TIMING).ThrowOnError();
@@ -458,11 +485,130 @@ public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
             "device pointer without a gather. Use PrepareAttentionScratch(layerIndex, stream).");
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Keeps the blocks past the cut, as the <see cref="IKvCache.Rollback"/> contract says: a speculative rollback re-decodes into
+    /// the same blocks without a block-pointer re-upload (#1839), and a prefix-reuse hit refills them at once with its suffix.
+    /// The block IDs do not change, so the device block-pointer array stays valid.
+    /// </remarks>
     public void Rollback(int length)
     {
         if ((uint)length > (uint)_blockTable.CurrentLength)
             throw new ArgumentOutOfRangeException(nameof(length));
         _blockTable.SetCurrentLength(length);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>Every layer holds the full history, so any cut within <see cref="CurrentLength"/> leaves the rows below it intact.</remarks>
+    public bool CanTruncateTo(int length) => (uint)length <= (uint)_blockTable.CurrentLength;
+
+    /// <summary>
+    /// Pool blocks a cache holding <paramref name="heldBlocks"/> still needs to hold <paramref name="maxLength"/> positions, or -1
+    /// when the pool cannot hold that many at all (#1843). Pure, for tests.
+    /// </summary>
+    /// <param name="maxLength">Positions to hold.</param>
+    /// <param name="heldBlocks">Blocks the cache holds now.</param>
+    /// <param name="blockSize">Tokens per block.</param>
+    /// <param name="totalBlocks">Blocks in the pool.</param>
+    /// <returns>Blocks still to allocate, or -1.</returns>
+    internal static int BlocksStillNeeded(int maxLength, int heldBlocks, int blockSize, int totalBlocks)
+    {
+        long blocks = ((long)maxLength + blockSize - 1) / blockSize;
+        if (blocks > totalBlocks) return -1;
+        return (int)Math.Max(0, blocks - heldBlocks);
+    }
+
+    /// <summary>
+    /// Whether this cache can hold <paramref name="maxLength"/> positions, raising <see cref="MaxLength"/> to it when needed (issue
+    /// #1843). Unlike a dense cache it moves no rows: blocks are allocated as rows are written.
+    /// <list type="bullet">
+    /// <item>The blocks the new rows need must be free in the pool now, even when <paramref name="maxLength"/> is within
+    /// <see cref="MaxLength"/>: retained prefix entries hold blocks, so a cache sized at creation can no longer count on them, and
+    /// a prefill that found the pool empty would throw part-way through. Serving runs one request at a time on the pool and
+    /// retained entries are idle, so what is free here is still free when the prefill writes. False otherwise; the engine then
+    /// evicts other entries and retries, or misses.</item>
+    /// <item>Past <see cref="MaxLength"/> the gather scratch and the block-pointer arrays are reallocated at the new size (the
+    /// gather is rebuilt on every prefill, so nothing is copied), admitted against free VRAM first. The device array's row
+    /// pitch changes with it, so the next attention call re-uploads every pointer.</item>
+    /// </list>
+    /// Must not run while a forward is in flight on this cache.
+    /// </summary>
+    /// <param name="maxLength">Positions the cache must hold.</param>
+    /// <returns><see langword="true"/> when the pool has the blocks and <see cref="MaxLength"/> is at least <paramref name="maxLength"/>.</returns>
+    public bool TryGrowTo(int maxLength)
+    {
+        int needed = BlocksStillNeeded(maxLength, _blockTable.BlockCount, _pool.BlockSize, _pool.TotalBlocks);
+        if (needed < 0 || needed > _pool.FreeBlocks) return false;
+        if (maxLength <= _maxSeqLen) return true;
+
+        _pool.Context?.MakeCurrent();
+        int newMaxBlocks = (maxLength + _pool.BlockSize - 1) / _pool.BlockSize;
+        long scratchBytes = (long)maxLength * _maxStride * sizeof(ushort);
+        long ptrBytes = PtrArrayBytes(_numLayers, newMaxBlocks);
+        if (!CudaKvGrowth.Admit(2 * scratchBytes + ptrBytes))
+            return false;
+
+        nint k = 0, v = 0, dPtrs = 0, hPtrs = 0;
+        int rc = (int)CudaDriverApi.cuMemAlloc_v2(out k, (nuint)scratchBytes);
+        if (rc == 0) rc = (int)CudaDriverApi.cuMemAlloc_v2(out v, (nuint)scratchBytes);
+        if (rc == 0) rc = (int)CudaDriverApi.cuMemAlloc_v2(out dPtrs, (nuint)ptrBytes);
+        if (rc == 0) rc = (int)CudaDriverApi.cuMemHostAlloc(out hPtrs, (nuint)ptrBytes, 0);
+        if (rc != 0)
+        {
+            if (k != 0) CudaDriverApi.cuMemFree_v2(k);
+            if (v != 0) CudaDriverApi.cuMemFree_v2(v);
+            if (dPtrs != 0) CudaDriverApi.cuMemFree_v2(dPtrs);
+            if (hPtrs != 0) CudaDriverApi.cuMemFreeHost(hPtrs);
+            Console.Error.WriteLine($"[dotLLM.Cuda] paged KV growth to {maxLength} positions failed (CUresult {rc}); keeping {_maxSeqLen}.");
+            return false;
+        }
+
+        // The previous upload may still be reading the old pinned array. The old device buffers are read only by work on the
+        // model's stream, which a finished request has drained (its logits were copied back).
+        if (_uploadPending)
+        {
+            CudaDriverApi.cuEventSynchronize(_uploadEvent).ThrowOnError();
+            _uploadPending = false;
+        }
+        CudaDriverApi.cuMemFree_v2(_kScratch);
+        CudaDriverApi.cuMemFree_v2(_vScratch);
+        CudaDriverApi.cuMemFree_v2(_blockPtrsDevice);
+        CudaDriverApi.cuMemFreeHost(_blockPtrsHost);
+        _kScratch = k;
+        _vScratch = v;
+        _blockPtrsDevice = dPtrs;
+        _blockPtrsHost = hPtrs;
+        _maxBlocksPerSeq = newMaxBlocks;
+        _maxSeqLen = maxLength;
+        _uploadedVersion = -1;   // new arrays, new pitch: re-upload every pointer at the next attention call
+        _uploadedBlocks = 0;
+        CudaKvGrowth.RecordGrowth();
+        return true;
+    }
+
+    /// <summary>
+    /// Takes rows <c>[0, rows)</c> of every layer from another paged cache on the same pool (the #1780 protected-entry seed, issue
+    /// #1843) by sharing its blocks: one reference per block, no copy. The source is not modified; whichever cache writes a shared
+    /// block next copies it first (<see cref="CudaKvBlockTable.EnsureWritable"/>), the partial last block included. False, with
+    /// this cache unchanged, for another cache type or pool, too few source rows, too little room here, or a cache that already
+    /// holds blocks.
+    /// </summary>
+    /// <param name="source">The cache whose leading rows to share.</param>
+    /// <param name="rows">Rows to take.</param>
+    /// <returns>Whether the rows were taken.</returns>
+    public bool TrySeedPrefixFrom(IKvCache source, int rows)
+    {
+        if (source is not CudaPagedKvCache src || ReferenceEquals(src, this) || !ReferenceEquals(src._pool, _pool)) return false;
+        if (rows <= 0 || rows > src.CurrentLength || rows > _maxSeqLen || _blockTable.BlockCount != 0) return false;
+
+        int blocks = (rows + _pool.BlockSize - 1) / _pool.BlockSize;
+        var ids = new int[blocks];   // once per seed, not on the decode path
+        for (int b = 0; b < blocks; b++)
+        {
+            ids[b] = src._blockTable.BlockIdAt(b);
+            _pool.AddRef(ids[b]);
+        }
+        _blockTable.SeedSharedBlocks(ids, rows);
+        return true;
     }
 
     /// <inheritdoc/>
