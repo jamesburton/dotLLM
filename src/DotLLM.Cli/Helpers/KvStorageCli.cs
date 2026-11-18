@@ -108,7 +108,7 @@ internal static class KvStorageCli
         {
             return null;
         }
-        if (key == KvCacheDType.TurboQuant && value == KvCacheDType.TurboQuant && (kBits != vBits || kQjl != vQjl))
+        if (key == KvCacheDType.TurboQuant && value == KvCacheDType.TurboQuant && DotLLM.Server.TurboQuantKvSupport.FormatsDiffer(kBits, kQjl, vBits, vQjl))
             return DotLLM.Server.TurboQuantKvSupport.MixedFormatRefusal(keyText!, valueText!);
         var kv = new KvCacheConfig(key, value);
         return DotLLM.Server.TurboQuantKvSupport.RefusalReason(kv, new DotLLM.Server.TurboQuantContext(

@@ -572,10 +572,6 @@ public static class ServerStartup
     }
 
     /// <summary>
-    /// Opens only the metadata of the <c>--speculative-model</c> draft (the file is mapped, no tensor is read) and rejects architectures the dense draft
-    /// loader cannot take. A draft that is missing or unreadable is left to the real load below, which reports it as before.
-    /// </summary>
-    /// <summary>
     /// The KV storage <paramref name="options"/> asks for. K and V are parsed independently (#1888): a TurboQuant side carries its own
     /// bit width and QJL flag, and <paramref name="formatMismatch"/> reports two TurboQuant sides that disagree (a mixed format, #1887 step 6).
     /// </summary>
@@ -586,7 +582,7 @@ public static class ServerStartup
         bool kTq = keyDType == KvCacheDType.TurboQuant, vTq = valueDType == KvCacheDType.TurboQuant;
         int bits = kTq ? kBits : vTq ? vBits : 0;
         bool qjl = kTq ? kQjl : vTq && vQjl;
-        formatMismatch = kTq && vTq && (kBits != vBits || kQjl != vQjl)
+        formatMismatch = kTq && vTq && TurboQuantKvSupport.FormatsDiffer(kBits, kQjl, vBits, vQjl)
             ? TurboQuantKvSupport.MixedFormatRefusal(options.CacheTypeK!, options.CacheTypeV!)
             : null;
         return new KvCacheConfig(keyDType, valueDType, TurboQuantBits: bits > 0 ? bits : 4, TurboQuantUseQjl: qjl);
@@ -627,6 +623,10 @@ public static class ServerStartup
             HasDraftModel: !string.IsNullOrEmpty(options.SpeculativeModel), MtpWillAttach: false));
     }
 
+    /// <summary>
+    /// Opens only the metadata of the <c>--speculative-model</c> draft (the file is mapped, no tensor is read) and rejects architectures the dense draft
+    /// loader cannot take. A draft that is missing or unreadable is left to the real load below, which reports it as before.
+    /// </summary>
     private static void ValidateSpeculativeDraftEarly(ServerOptions options, ModelConfig target)
     {
         if (string.IsNullOrEmpty(options.SpeculativeModel)) return;

@@ -28,6 +28,8 @@ public enum KvCommand
     Run,
     /// <summary><c>dotllm chat</c>.</summary>
     Chat,
+    /// <summary><c>dotllm bench</c>.</summary>
+    Bench,
 }
 
 /// <summary>What <see cref="TurboQuantKvSupport.RefusalReason"/> needs to know about where a TurboQuant cache would run.</summary>
@@ -53,6 +55,16 @@ public static class TurboQuantKvSupport
     /// <summary>Largest head dimension the TurboQuant rotation supports (a power of two).</summary>
     public const int MaxHeadDim = 256;
 
+    /// <summary>Bits per coordinate when a TurboQuant flag gives none (<c>tq</c>, <c>turboquant</c>): <c>KvCacheConfig.TurboQuantBits</c>'s default.</summary>
+    public const int DefaultBits = 4;
+
+    /// <summary>
+    /// Whether two TurboQuant flags name different formats. A bit width of 0 (none given) means <see cref="DefaultBits"/>, so
+    /// <c>tq</c> and <c>tq4</c> are the same format.
+    /// </summary>
+    public static bool FormatsDiffer(int keyBits, bool keyQjl, int valueBits, bool valueQjl)
+        => (keyBits > 0 ? keyBits : DefaultBits) != (valueBits > 0 ? valueBits : DefaultBits) || keyQjl != valueQjl;
+
     /// <summary>The epic tracking TurboQuant on every backend; cited in every refusal.</summary>
     public static int EpicIssue => 1887;
 
@@ -75,14 +87,19 @@ public static class TurboQuantKvSupport
             return Refuse($"TurboQuant KV must be used for both K and V (got K={kv.KeyDType}, V={kv.ValueDType}): pass the same tq value to both " +
                 "--cache-type-k and --cache-type-v; mixed K/V pairs with TurboQuant arrive in step 6");
         if (ctx.Backend is KvBackendKind.Cuda or KvBackendKind.Vulkan or KvBackendKind.Hip)
-            return Refuse($"TurboQuant KV does not run on {ctx.Backend.ToString().ToLowerInvariant()} yet (step 2)");
-        if (ctx.Command is KvCommand.Run or KvCommand.Chat)
+            return Refuse($"TurboQuant KV does not run on {ctx.Backend.ToString().ToLowerInvariant()} yet (step 2)" +
+                (ctx.Command == KvCommand.Serve ? "; for the CPU path pass --device cpu --no-paged" : ""));
+        if (ctx.Command is KvCommand.Run or KvCommand.Chat or KvCommand.Bench)
             return Refuse($"'{ctx.Command.ToString().ToLowerInvariant()}' does not run TurboQuant KV yet (step 2); use `dotllm serve --device cpu --no-paged` until then");
         if (ctx.Paged)
             return Refuse("the paged KV cache has no TurboQuant blocks yet (step 3); pass --no-paged");
 
         if (ctx.Config is { } config)
         {
+            // MLA (DeepSeek-V2/V3, GLM-4.7-Flash, Kimi) keeps its own latent KV state and ignores the caller's cache: a TurboQuant cache
+            // would be allocated and never used. Checked before the head dim, which on MLA is qk_nope + qk_rope and can be a power of two.
+            if (config.MlaConfig is not null)
+                return Refuse($"TurboQuant KV does not run on MLA models ({config.Architecture}) yet: their attention keeps its own latent KV");
             int headDim = config.HeadDim;
             if (headDim <= 0 || (headDim & (headDim - 1)) != 0 || headDim > MaxHeadDim)
                 return Refuse($"TurboQuant KV needs a power-of-two head dim of at most {MaxHeadDim}; this model has head dim {headDim}");

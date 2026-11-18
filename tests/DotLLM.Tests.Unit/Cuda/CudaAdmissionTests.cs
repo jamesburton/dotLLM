@@ -12,6 +12,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// test's async flow) refuses before any driver call, so removing a check makes the constructor reach <c>cuMemAlloc</c> (no driver
 /// here: <see cref="DllNotFoundException"/>; on a CUDA box: an allocation that succeeds), and the test fails either way.
 /// </summary>
+[Collection(CudaCollection.Name)]
 public sealed class CudaAdmissionTests
 {
     private const long MiB = 1L << 20;

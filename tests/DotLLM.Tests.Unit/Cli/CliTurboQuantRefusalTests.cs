@@ -47,14 +47,21 @@ public class CliTurboQuantRefusalTests
 [Collection(CliConsoleCollection.Name)]
 public sealed class CliTurboQuantCommandTests
 {
-    private static (int Code, string Output) Run(params string[] args)
+    /// <summary>Runs the real command tree, capturing Console and AnsiConsole (chat writes errors through AnsiConsole, which binds the
+    /// console it first saw, so swapping Console.Out alone captures nothing once another test has used it).</summary>
+    internal static (int Code, string Output) Run(params string[] args)
     {
-        var (out0, err0) = (Console.Out, Console.Error);
+        var (out0, err0, ansi0) = (Console.Out, Console.Error, Spectre.Console.AnsiConsole.Console);
         var sw = new StringWriter();
         Console.SetOut(sw);
         Console.SetError(sw);
+        Spectre.Console.AnsiConsole.Console = Spectre.Console.AnsiConsole.Create(new Spectre.Console.AnsiConsoleSettings
+        {
+            Out = new Spectre.Console.AnsiConsoleOutput(sw),
+            Ansi = Spectre.Console.AnsiSupport.No,
+        });
         try { return (CliCommandModel.Run(args).ExitCode, sw.ToString()); }
-        finally { Console.SetOut(out0); Console.SetError(err0); }
+        finally { Console.SetOut(out0); Console.SetError(err0); Spectre.Console.AnsiConsole.Console = ansi0; }
     }
 
     [Fact]
