@@ -71,6 +71,25 @@ RAW loadV8(uint i) {
 }
 vec4 lo4(RAW r) { return r[0]; }
 vec4 hi4(RAW r) { return r[1]; }
+#elif defined(KV_MIXED)
+// K and V in different block formats (#1884): KV_K_Q8 / KV_K_Q4 and KV_V_Q8 / KV_V_Q4, each side with its own loader.
+layout(set = 0, binding = 1, std430) readonly  buffer BufK       { uint kw[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufV       { uint vw[]; };
+#define RAW mat2x4
+vec4 q8x4(uint w, float sc) { return vec4(bitfieldExtract(int(w), 0, 8), bitfieldExtract(int(w), 8, 8), bitfieldExtract(int(w), 16, 8), bitfieldExtract(int(w), 24, 8)) * sc; }
+vec4 q4x4(uint h, float sc) { return (vec4(float(h & 15u), float((h >> 4u) & 15u), float((h >> 8u) & 15u), float((h >> 12u) & 15u)) - 8.0) * sc; }
+#if defined(KV_K_Q8)
+RAW loadK8(uint i) { uint blk = i >> 5u, wi = blk * 9u + 1u + ((i & 31u) >> 2u); float sc = uintBitsToFloat(kw[blk * 9u]); return mat2x4(q8x4(kw[wi], sc), q8x4(kw[wi + 1u], sc)); }
+#else
+RAW loadK8(uint i) { uint blk = i >> 5u, w = kw[blk * 5u + 1u + ((i & 31u) >> 3u)]; float sc = uintBitsToFloat(kw[blk * 5u]); return mat2x4(q4x4(w, sc), q4x4(w >> 16u, sc)); }
+#endif
+#if defined(KV_V_Q8)
+RAW loadV8(uint i) { uint blk = i >> 5u, wi = blk * 9u + 1u + ((i & 31u) >> 2u); float sc = uintBitsToFloat(vw[blk * 9u]); return mat2x4(q8x4(vw[wi], sc), q8x4(vw[wi + 1u], sc)); }
+#else
+RAW loadV8(uint i) { uint blk = i >> 5u, w = vw[blk * 5u + 1u + ((i & 31u) >> 3u)]; float sc = uintBitsToFloat(vw[blk * 5u]); return mat2x4(q4x4(w, sc), q4x4(w >> 16u, sc)); }
+#endif
+vec4 lo4(RAW r) { return r[0]; }
+vec4 hi4(RAW r) { return r[1]; }
 #elif defined(KV_F16)
 layout(set = 0, binding = 1, std430) readonly  buffer BufK       { uvec4 k8[]; };      // [seq_kv, num_kv_heads * head_dim] F16, 8 per element
 layout(set = 0, binding = 2, std430) readonly  buffer BufV       { uvec4 v8[]; };
