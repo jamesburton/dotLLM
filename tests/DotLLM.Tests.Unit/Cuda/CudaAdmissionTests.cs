@@ -238,12 +238,12 @@ public sealed class CudaAdmissionTests
     [Fact]
     public void G3ServesOnlyTheF16Cache_SoAQuantizedFitChargesNoPlane()
     {
-        // #1850: q8_0 / q4_0 read in place, so G3's plane is never used over them. TurboQuant is unchanged: CreateKvCache gives it
-        // the f16 CudaKvCache (IsQuantized is false for it), which G3 serves.
+        // #1850: q8_0 / q4_0 read in place, so G3's plane is never used over them. TurboQuant is never served by G3 (#1888): its KV is
+        // codes read in place, not the f16 cache.
         Assert.True(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32)));
         Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0)));
         Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.Q4_0, KvCacheDType.Q4_0)));
-        Assert.True(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant)));
+        Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant)));
 
         // TwIL-8B-shaped q8_0 at the 1,024 chunk, as above: the 384 MiB plane is ~4,700 tokens of q8_0 window.
         var q8 = new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0);
