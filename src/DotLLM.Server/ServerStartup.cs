@@ -727,7 +727,10 @@ public static class ServerStartup
             // DOTLLM_VK_SCHEDULER); there is no paged KV pool and no cross-request prefix trie yet.
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported on Vulkan; using the model's own KV-cache.");
-            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
+            // #1884: q8_0 K and V on an audited dense host are read in place from the model's own cache (no F32 dequant scratch);
+            // other quantized KV keeps VulkanQuantizedKvCache.
+            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel
+                && !vkModel.TryUseInPlaceQuantizedKv(kvConfig.KeyDType, kvConfig.ValueDType, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()))
             {
                 string spvDir = DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir();
                 kvFactory = (cfg, size) => vkModel.CreateQuantizedKvCache(

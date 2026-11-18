@@ -357,11 +357,12 @@ public sealed class AttentionF32Kernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
-        long kvBytes  = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
+        long kvBytes  = KvStorage.KeyRowBytes((long)numKvHeads * headDim) * seqKv;   // per side: mixed block formats (#1884)
+        long kvBytesV = KvStorage.ValueRowBytes((long)numKvHeads * headDim) * seqKv;
         long outBytes = qBytes;
         if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
         if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
-        if (v.Size      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));
+        if (v.Size      < kvBytesV)  throw new ArgumentException("V buffer too small.",      nameof(v));
         if (output.Size < outBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
         // Coopmat's tiles cap at CoopmatMaxHeadDim; a wider head (gemma4 global,

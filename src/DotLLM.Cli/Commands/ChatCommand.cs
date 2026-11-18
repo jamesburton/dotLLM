@@ -642,7 +642,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             if (settings.Paged)
                 AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache is not supported on Vulkan; using the model's own device KV-cache.[/]");
 
-            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
+            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel
+                && !vkModel.TryUseInPlaceQuantizedKv(kvConfig.KeyDType, kvConfig.ValueDType, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()))
             {
                 string spvDir = DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir();
                 kvFactory = (cfg, size) => vkModel.CreateQuantizedKvCache(

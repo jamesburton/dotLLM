@@ -1,0 +1,9 @@
+#version 450
+// Mixed K Q8_0 / V Q4_0 KV twin of attention_flash_gqa_sinks.comp (issue #1884): the same kernel reading K / V stored as K Q8_0, V Q4_0 (36- / 20-byte blocks
+// of [float scale][16 bytes of adjacent-pair nibbles], dequantised in the tile load). Body: attention_flash_gqa.glsl. F16 twin: attention_flash_gqa_sinks_kvf16.comp.
+#define SINKS 1
+#define KV_MIXED 1
+#define KV_K_Q8 1
+#define KV_V_Q4 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_gqa.glsl"

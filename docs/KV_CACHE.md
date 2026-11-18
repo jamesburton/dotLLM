@@ -189,7 +189,7 @@ the context window. On success it prefills only the suffix. A refusal is logged 
   - Layer by layer: allocate larger scale and quant buffers, copy only the live blocks device to device as stored, free the old.
     Admitted like `VulkanKvCache` (shared `VulkanKvCache.AdmitGrowth`, `GrowthAdmissionOverride` in tests).
   - The F32 dequant scratch is reallocated at the new length, not copied (`RecordDequant` rebuilds it per attention call). It is
-    still a full-history F32 expansion (#1107): growth enlarges it. CUDA removed its equivalent in #1850 (in-place kvq attention).
+    still a full-history F32 expansion (#1107): growth enlarges it. The audited hosts no longer use this cache (#1884, below).
   - The seed copies another quantized cache's blocks as stored (same device, geometry and K/V types).
   - Tests: `VulkanKvCacheGrowthTests.Quantized_*` (q8_0 and q4_0 growth vs cold and vs an ungrown warm run; seed vs cut-back logits).
 - **No growth path.**
@@ -361,54 +361,72 @@ twin, no host row IO, prefix snapshots or handoff (they refuse Q8_0). It stays o
 - **Proof the path ran:** halving the writer's stored scale moves q8_0 NLL 2.34 -> 9.53 while F16 stays bit-identical (2.3242); zeroing
   the GQA v2 decode kernel's K scale turns a q8_0 needle HIT into a MISS with F16 unchanged.
 
-### Vulkan quantized KV and the per-query-position attention (feasibility, issue #1550)
+### Vulkan in-place block KV: q8_0, q4_0 and mixed K / V (issue #1884)
 
-Question: can the per-query-position attention (`attention_flash_gqa_qpos*`, #1540; used for selective recompute and chunk-KV
-reuse) read Q8_0 / Q4_0 KV in place on Vulkan? Read-only study, nothing implemented.
+`--cache-type-k/-v q8_0|q4_0` (or `--kv-quant-k/-v`) on a plain dense host (`IsDenseF16KvEligible`: Llama, Mistral, Qwen, Phi, GLM-4 MoE,
+Granite) and on Flint stores K and V as blocks in a `VulkanKvCache`. The attention kernels read them **in place**: each element is
+dequantised in the load that consumes it, and no F32 history is stored. This is the Vulkan counterpart of CUDA's #1850.
+`VulkanQuantizedKvCache` is kept only as the fallback for hosts whose dispatch is not audited for block KV; it dequantises the whole
+history into an F32 scratch on every forward (CLAUDE.md precision rule 2).
 
-**What the standard Qwen3 / Llama Vulkan path supports today.**
-- `VulkanTransformerModel.CreateKvCache` gives an **F16** `VulkanKvCache` for the plain dense architectures since #1151 (see
-  "Vulkan dense host: F16 KV storage" above; F32 is `DOTLLM_VK_KV=f32` only), so F16 qpos is reachable from a dense model (#1549).
-- `--kv-quant-k/-v q8_0|q4_0` selects `VulkanQuantizedKvCache` (split layout: one `float` scale per 32-element block plus
-  packed quants in a separate buffer; Q8_0 = 8 uints of int8, Q4_0 = 4 uints of nibbles, adjacent pairs per byte). It is
-  **not read in place**: every layer of every forward dequantizes `[0, CurrentLength)` of both K and V into one shared F32
-  scratch (`RecordDequant`) and the ordinary F32 kernels read that. The scratch is allocated up front at
-  `2 x maxSeqLen x stride x 4 B` (Qwen3-4B, 32K: 256 MiB, i.e. twice an F32 cache of one layer, on top of the quantized
-  store), and each forward re-dequantizes the full history of 36 layers. That is the expansion CLAUDE.md precision rule 2
-  calls a defect (the Bonsai-2 Vulkan path refuses q8_0/q4_0 rather than do it).
-- The qpos dispatch arm takes `VulkanKvCache` in F32 or F16 (#1549), not the quantized cache, and `VulkanQuantizedKvCache.RecordUpdate` accepts
-  contiguous ascending positions only. So no quantized qpos path exists; a recompute over a quantized Vulkan cache is
-  refused or mis-masked.
+**Formats** (`VulkanKvStorage`, `kv_load.glsl`; rows must be a multiple of 32 elements):
 
-**Bytes per token, Qwen3-4B (36 layers x K+V x 1024):** F32 288 KiB, F16 144 KiB, Q8_0 split layout 81 KiB (1.125 B/element;
-76.5 KiB in standard 34-byte blocks), Q4_0 split 45 KiB (0.625 B/element).
+| storage | block | bytes / element | rule |
+|---|---|---|---|
+| `Q8_0` | `[f32 scale][32 x int8]`, 36 B | 1.125 | scale = amax / 127, q = roundEven(x / scale) |
+| `Q4_0` | `[f32 scale][16 B]`, 20 B | 0.625 | scale = amax / 7, nibble = clamp(roundEven(x / scale) + 8, 0, 15), adjacent pairs (CPU / CUDA, #956) |
+| `Q8_0K_Q4_0V`, `Q4_0K_Q8_0V` | K and V each in its own format | 0.875 | per side |
 
-**What an in-place qpos variant takes.**
-- *Read side.* The qpos kernels already stage K / V tiles global -> registers -> LDS in `fetchTile` / `storeTile`
-  (`attention_flash_gqa_cm.glsl`, `attention_flash_gqa.glsl`), converting F16 or F32 to the LDS element there. A quantized
-  twin changes only that load: one `uint` of quants (Q8_0: 4 int8 = one vec4; Q4_0: 4 nibbles = 16 bits of a uint) times the
-  block scale, dequantized in registers inside the tile load, so no wide history is ever stored and the LDS tile is
-  unchanged. Cost: two more bindings (K and V scales) on top of q, kq, vq, out, qpos (7 total), and a per-tile scale fetch
-  (one scale per 32 elements, so a 128-wide head is 4 scales per row).
-- *Variants.* K x V dtype pairs (`q8q8`, `q4q4`, `q8q4`, `q4q8`) x {scalar, coopmat hd256, coopmat hd128} = 12 pipelines if
-  done as separate wrappers; fewer with `KV_K_DTYPE` / `KV_V_DTYPE` specialization constants (the repo's rule: spec constant,
-  not runtime uniform, for register-pressure-sensitive choices; needs a third arm in any A/B). Start with `q8q8` and `q4q4`
-  (6 pipelines). Extra LDS: none. VGPRs: the dequant adds a few registers to the prefetch stage `pf[]` (`KVREG` becomes a
-  `uint` pair plus a scale), so re-check the VGPR granularity cliff on gfx1151 with a ballast arm.
-- *Write side.* `KvQuantizeKernel` takes a contiguous block range. Chunk recompute writes arbitrary positions, so it needs a
-  position-indexed quantize (or per-run dispatches) and `VulkanQuantizedKvCache` row IO (`WriteRows` / `ReadRows` /
-  `CopyRowsFrom` like `VulkanKvCache`), plus the routing arm widened from `VulkanKvCache` to the quantized cache.
-- *Precision/oracle.* The parity oracle is "dequant to the F32 scratch, then the F32 qpos kernel" on the same cache, which
-  must be bit-identical for Q8_0 (same arithmetic, same order), plus the f64 reference at 2K..32K and mutants (wrong
-  scale index, nibble order, off-by-block at the tile edge). Re-verify the Q4_0 nibble layout against the CUDA / GGUF
-  convention first: the Vulkan quant shader comment says "matches GGUF" while the byte order it describes (adjacent pairs)
-  is not the GGUF low/high-halves layout.
-- *Effort.* qpos-only, Q8_0 + Q4_0 same-type pairs, with the write path, routing, tests and one measured A/B: about 3-5 days.
-  Removing the full-history scratch from the ordinary prefill / decode / split-KV paths (the part that actually fixes rule 2
-  for ordinary serving) is a separate 2-3 week item: every attention kernel family gains quantized twins, as the CUDA
-  hybrid-dense path did in #988 / #1094.
+- The scale is F32; CPU and CUDA store F16.
+- Division and reciprocal are IEEE-exact in the writers (`q81DivBy127`, `q4DivBy7`), so the bytes match the C# reference quantiser.
+- The writers are `convert_f32_to_q8_0_kv_range` and `convert_f32_to_q4_0_kv_range` (`VulkanKvQ8WriteKernel`, one per side when the
+  formats are mixed).
 
-Tracked in #1550 (implementation).
+**Kernels.** Every dense-chain kernel with a `_kvf16` twin has `_kvq8`, `_kvq4`, `_kvq8q4` and `_kvq4q8` twins. In the model they are
+grouped as one `BlockKvTwins` set per format: split-KV decode (per-head and the GQA v2 pass), small-row split-KV, per-token, scalar
+flash, coopmat flash, GQA flash (coopmat and scalar), the qpos arms, and Flint's sink kernels.
+- The `kv_load.glsl` bodies select K and V storage independently (`KV_K_*` / `KV_V_*`).
+- Three bodies decode the blocks themselves, each with `KV_Q8` / `KV_Q4` / `KV_MIXED` arms: `attention_flash_gqa_cm`,
+  `attention_f32_splitkv_gqa_v2` and `attention_flash_gqa`.
+- A block cache never falls through to an F32 kernel. Every selection picks its own format's twin or throws, including the
+  `GptOssKernels` sink switch.
+- `DOTLLM_VK_KV_INPLACE=0` restores `VulkanQuantizedKvCache` (A/B only). `DOTLLM_VK_KV=q8_0|q4_0` selects the storage when no flag is
+  given.
+
+**Measured** (Strix, Llama-3.2-3B Q8_0, ~7.6K-token prompt, `run`, 2 reps):
+
+| KV | prefill tok/s | decode tok/s |
+|---|---|---|
+| f16 | 2,047 - 2,110 | 42.0 - 42.4 |
+| q8_0 in place | 2,076 - 2,103 | 39.8 - 40.2 |
+| q8_0 `VulkanQuantizedKvCache` | 1,847 - 1,861 | 22.2 - 22.4 |
+
+`bench` at depth 8K (rep 1; rep 2 was contended): f16 41.7, q8_0 39.7, q4_0 39.6 tok/s decode.
+
+**Bytes per token** (Llama-3.2-3B: 28 layers, K + V, 1024 wide): f16 112 KiB, q8_0 63 KiB, q4_0 35 KiB, mixed 49 KiB. The old cache adds
+an F32 scratch of 8 KiB per *context position* (64 MiB at 8K, 1 GiB at 128K), and the in-place cache drops it.
+
+**Tests**
+- `VulkanDenseQ8KvKernelTests`, the kernel oracle:
+  - every twin, all four formats, hd64 and hd128, prefill at an offset and from zero, split-KV decode, and the sink kernels;
+  - an F32-math twin equals its F32 kernel on the dequantised rows; a coopmat twin equals its F16 twin on the F16-rounded rows;
+  - the twin's error vs the unquantised attention equals the reference's own;
+  - the Q4_0 writer is byte for byte.
+- `VulkanDenseQ8KvModelTests`, end to end on Qwen2.5-0.5B:
+  - q8_0 tokens equal CPU `QuantizedKvCache` and the old path;
+  - run-to-run bit-identity;
+  - grown = ungrown prefix reuse, bit-identical;
+  - decode over the block cache vs over its dequantised rows in an F32 cache (the decoded token's own row is the only difference).
+- Shader mutants, all killed, are listed in the PR.
+
+**Non-contiguous writes** (selective recompute, chunk-KV reuse): `convert_f32_to_q8_0_kv_rows` / `convert_f32_to_q4_0_kv_rows` scatter
+rows by a positions buffer with the same quantise rule, so a scattered row stores the bytes a contiguous write does
+(`ScatterWriter_MatchesTheContiguousWriter_ByteForByte`). The qpos arms read the block twins.
+`VulkanSelectiveRecomputeTests.Qwen3_4B_NonContiguousSubsetRecompute_BlockCache` recomputes a poisoned subset on Qwen3-4B. The qpos
+twin runs on all 36 layers, the untouched rows stay byte-identical, and the rows land within the contiguous floor: Q8_0 0.036 vs
+0.030 rel L2, Q4_0 0.29 vs 0.18, K8V4 0.15 vs 0.16.
+
+**Not covered yet:** hosts outside the audited dense chain and Flint keep `VulkanQuantizedKvCache` (#1885).
 
 ### CUDA hybrid-dense KV: staging, quantized storage, fused decode (issue #956)
 

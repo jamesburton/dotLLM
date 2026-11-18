@@ -1,0 +1,11 @@
+#version 450
+// Mixed K Q8_0 / V Q4_0 KV twin of attention_flash_gqa_cm_qpos_hd128.comp (issue #1884): the same kernel reading K / V stored as K Q8_0, V Q4_0 (36- / 20-byte blocks
+// of [float scale][16 bytes of adjacent-pair nibbles], dequantised in the load: see kv_load.glsl). Body: attention_flash_gqa_cm.glsl. F16 twin: attention_flash_gqa_cm_qpos_kvf16_hd128.comp.
+#define MAX_HEAD_DIM 128
+// GQA-grouped cooperative-matrix flash-attention prefill with a position per query token (issue #1540), F16 K / V. Body: attention_flash_gqa_cm.glsl.
+#define QPOS 1
+#define KV_MIXED 1
+#define KV_K_Q8 1
+#define KV_V_Q4 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_gqa_cm.glsl"

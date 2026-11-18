@@ -60,7 +60,7 @@ public sealed class VulkanQ8KvAttentionKernelTests
         return x;
     }
 
-    private static float[] Rand(Random rng, int n, float amp)
+    internal static float[] Rand(Random rng, int n, float amp)
     {
         var r = new float[n];
         // A spread of magnitudes per block (so scales differ), plus the occasional outlier that sets a block's scale.
@@ -213,7 +213,7 @@ public sealed class VulkanQ8KvAttentionKernelTests
         AssertMatchesAndControl(device, oQ8, oRef, oRaw, q.Length);
     }
 
-    private static void AssertMatchesAndControl(VulkanDevice device, VulkanDevice.Buffer oQ8, VulkanDevice.Buffer oRef, VulkanDevice.Buffer oRaw, int n)
+    internal static void AssertMatchesAndControl(VulkanDevice device, VulkanDevice.Buffer oQ8, VulkanDevice.Buffer oRef, VulkanDevice.Buffer oRaw, int n)
     {
         float[] a = new float[n], r = new float[n], raw = new float[n];
         device.Download(oQ8, a); device.Download(oRef, r); device.Download(oRaw, raw);
