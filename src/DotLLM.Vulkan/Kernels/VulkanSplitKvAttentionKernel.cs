@@ -492,10 +492,11 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)numHeads   * headDim * sizeof(float);   // seqQ == 1
-        long kvBytes  = (long)seqKv * KvStorage.RowBytes((long)numKvHeads * headDim);
+        long kvBytes  = KvStorage.KeyRowBytes((long)numKvHeads * headDim) * seqKv;   // per side: mixed block formats (#1884)
+        long kvBytesV = KvStorage.ValueRowBytes((long)numKvHeads * headDim) * seqKv;
         if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
         if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
-        if (v.Size      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));
+        if (v.Size      < kvBytesV)  throw new ArgumentException("V buffer too small.",      nameof(v));
         if (output.Size < qBytes)   throw new ArgumentException("Output buffer too small.", nameof(output));
 
         if (kvStart < 0 || kvStart >= seqKv) throw new ArgumentOutOfRangeException(nameof(kvStart));

@@ -617,11 +617,12 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * (ActivationsF16 ? sizeof(ushort) : sizeof(float));
-        long kvBytes  = KvStorage.RowBytes((long)numKvHeads * headDim) * seqKv;   // RowBytes: Q8_0 rows are 36-byte blocks (#1884)
+        long kvBytes  = KvStorage.KeyRowBytes((long)numKvHeads * headDim) * seqKv;   // per side: mixed block formats (#1884)
+        long kvBytesV = KvStorage.ValueRowBytes((long)numKvHeads * headDim) * seqKv;
         long outBytes = qBytes;
         if (q.Size - qOff      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
         if (k.Size - kOff      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
-        if (v.Size - vOff      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));
+        if (v.Size - vOff      < kvBytesV)  throw new ArgumentException("V buffer too small.",      nameof(v));
         if (output.Size - outOff < outBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
         // Issue #378: route headDim<=64 models with enough KV-tile iterations

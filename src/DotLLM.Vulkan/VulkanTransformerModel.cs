@@ -1094,7 +1094,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     // F16-KV twins that read the rows in place (the sink prefill kernel's twin lives in VulkanGptOssKernels). Null unless the model selects F16 KV.
     private VulkanKvF16WriteKernel? _kvF16Writer;
     // Block-quantised KV (Q8_0: Flint opt-in, then the dense chain in #1884; Q4_0: #1884): one set of writer + attention twins per format.
-    private readonly BlockKvTwins _kvQ8Set = new(), _kvQ4Set = new();
+    private readonly BlockKvTwins _kvQ8Set = new(), _kvQ4Set = new(), _kvQ8Q4Set = new(), _kvQ4Q8Set = new();   // mixed K/V: #1884 stage 3
     private RopeKvWriteF32Kernel? _ropeKvWriteKvF16;   // fused RoPE + F16 KV write (dense hosts, #1151); null when the SPIR-V is missing
     // Dense F16 KV (#1151): F16-KV twins of the non-sink attention kernels (per-token, scalar flash, coopmat flash, GQA flash, per-query-position
     // reference and tiled). Created together with the writer when DefaultKvStorage is F16 on a non-sink architecture; null otherwise.
@@ -1122,7 +1122,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     /// </summary>
     private sealed class BlockKvTwins
     {
-        public VulkanKvQ8WriteKernel? Writer;
+        public VulkanKvQ8WriteKernel? Writer;        // the K side's writer (both sides unless mixed)
+        public VulkanKvQ8WriteKernel? ValueWriter;   // the V side's writer for a mixed format; null otherwise
         public VulkanSplitKvAttentionKernel? SplitKv;
         public VulkanFlashAttentionGqaKernel? SinkFlash;
         public AttentionF32Kernel? Attention;
@@ -1135,7 +1136,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
 
         public void Invalidate()
         {
-            Writer?.InvalidateDescriptorCache(); SplitKv?.InvalidateDescriptorCache(); SinkFlash?.InvalidateDescriptorCache();
+            Writer?.InvalidateDescriptorCache(); ValueWriter?.InvalidateDescriptorCache(); SplitKv?.InvalidateDescriptorCache(); SinkFlash?.InvalidateDescriptorCache();
             Attention?.InvalidateDescriptorCache(); Flash?.InvalidateDescriptorCache(); Coopmat?.InvalidateDescriptorCache();
             PrefillGqa?.InvalidateDescriptorCache(); QPos?.InvalidateDescriptorCache(); QPosTiled?.InvalidateDescriptorCache();
             SmallRow?.InvalidateDescriptorCache();
@@ -1143,7 +1144,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
 
         public void Dispose()
         {
-            Writer?.Dispose(); SplitKv?.Dispose(); SinkFlash?.Dispose(); Attention?.Dispose(); Flash?.Dispose(); Coopmat?.Dispose();
+            Writer?.Dispose(); ValueWriter?.Dispose(); SplitKv?.Dispose(); SinkFlash?.Dispose(); Attention?.Dispose(); Flash?.Dispose(); Coopmat?.Dispose();
             PrefillGqa?.Dispose(); QPos?.Dispose(); QPosTiled?.Dispose(); SmallRow?.Dispose();
         }
     }
@@ -1153,6 +1154,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     {
         VulkanKvStorage.Q8_0 => _kvQ8Set,
         VulkanKvStorage.Q4_0 => _kvQ4Set,
+        VulkanKvStorage.Q8_0K_Q4_0V => _kvQ8Q4Set,
+        VulkanKvStorage.Q4_0K_Q8_0V => _kvQ4Q8Set,
         _ => null,
     };
     // Sink prefill (#1200): the GQA flash kernel's attention-sink twins, per KV format. Null when unavailable or turned off.
@@ -1482,7 +1485,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     /// <summary>The per-query-position kernel reading <paramref name="storage"/> in place; null when this model has none (#1884).</summary>
     private AttentionQueryPositionsKernel? QPosKernelFor(VulkanKvStorage storage) => storage switch
     {
-        VulkanKvStorage.Q8_0 or VulkanKvStorage.Q4_0 => BlockSet(storage)!.QPos,
+        _ when storage.IsBlockQuantized() => BlockSet(storage)!.QPos,
         VulkanKvStorage.F16 => _attentionQPosKvF16,
         _ => _attentionQPos,
     };
@@ -1490,7 +1493,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     /// <summary>The tiled per-query-position kernel reading <paramref name="storage"/> in place, or null (#1884).</summary>
     private VulkanFlashAttentionGqaKernel? QPosTiledKernelFor(VulkanKvStorage storage) => storage switch
     {
-        VulkanKvStorage.Q8_0 or VulkanKvStorage.Q4_0 => BlockSet(storage)!.QPosTiled,
+        _ when storage.IsBlockQuantized() => BlockSet(storage)!.QPosTiled,
         VulkanKvStorage.F16 => _attentionQPosTiledKvF16,
         _ => _attentionQPosTiled,
     };
@@ -1539,12 +1542,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     /// <returns>Whether in-place Q8_0 KV is now the default.</returns>
     public bool TryUseInPlaceQuantizedKv(KvCacheDType keyDType, KvCacheDType valueDType, string spvDir)
     {
-        if (!IsDenseF16KvEligible || keyDType != valueDType) return false;   // mixed K / V: stage 3 of #1884
-        VulkanKvStorage storage = keyDType switch
+        if (!IsDenseF16KvEligible) return false;
+        VulkanKvStorage storage = (keyDType, valueDType) switch
         {
-            KvCacheDType.Q8_0 => VulkanKvStorage.Q8_0,
-            KvCacheDType.Q4_0 => VulkanKvStorage.Q4_0,
-            _ => VulkanKvStorage.F32,
+            (KvCacheDType.Q8_0, KvCacheDType.Q8_0) => VulkanKvStorage.Q8_0,
+            (KvCacheDType.Q4_0, KvCacheDType.Q4_0) => VulkanKvStorage.Q4_0,
+            (KvCacheDType.Q8_0, KvCacheDType.Q4_0) => VulkanKvStorage.Q8_0K_Q4_0V,
+            (KvCacheDType.Q4_0, KvCacheDType.Q8_0) => VulkanKvStorage.Q4_0K_Q8_0V,
+            _ => VulkanKvStorage.F32,   // f16 with a block format, TurboQuant: not in place
         };
         if (storage == VulkanKvStorage.F32) return false;
         if (Config.NumKvHeads * Config.HeadDim % 32 != 0) return false;   // Q8_0 blocks tile each row; head dims not a multiple of 32: #1883
@@ -1578,7 +1583,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     private void InitBlockKvKernels(string spvDir, VulkanKvStorage storage)
     {
         var set = BlockSet(storage) ?? throw new ArgumentOutOfRangeException(nameof(storage));
-        set.Writer ??= VulkanKvQ8WriteKernel.Create(_device, spvDir, storage);
+        set.Writer ??= VulkanKvQ8WriteKernel.Create(_device, spvDir, storage.KeyFormat());
+        if (storage.IsMixed()) set.ValueWriter ??= VulkanKvQ8WriteKernel.Create(_device, spvDir, storage.ValueFormat());
         if (set.SplitKv is null && !IsSplitDecodeDisabled())
         {
             set.SplitKv = VulkanSplitKvAttentionKernel.TryCreate(_device, spvDir, storage);
@@ -4590,7 +4596,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         int seqLen = tokenIds.Length;
         if (seqLen == 0) throw new ArgumentException("tokenIds must be non-empty.", nameof(tokenIds));
 
-        _fwdKvStorage = kvCache is VulkanKvCache { Storage: var kvs and (VulkanKvStorage.F16 or VulkanKvStorage.Q8_0 or VulkanKvStorage.Q4_0) } ? kvs : VulkanKvStorage.F32;
+        _fwdKvStorage = kvCache is VulkanKvCache { Storage: var kvs } && kvs != VulkanKvStorage.F32 ? kvs : VulkanKvStorage.F32;   // F16 and every block format (#1884)
         if (_fwdKvStorage == VulkanKvStorage.F16 && (_kvF16Writer is null || (_gptOss is null && _attentionKvF16 is null)))
             throw new NotSupportedException(
                 "An F16 VulkanKvCache needs the F16-KV attention kernels, which only sink-attention models (Flint) and the dense Llama/Mistral/Qwen/Phi "
@@ -4978,7 +4984,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                     // RoPE writes K; attention (via the cache buffers) reads K.
                     // Barrier the RoPE → KV copy, then the KV copy → attention. (The F32 copy path adds its own COMPUTE→TRANSFER barrier.)
                     BarrierComputeToCompute(cmdBuf);
-                    vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer, _kvF16Writer, _state.PositionsBuffer, BlockSet(vkCache.Storage)?.Writer);
+                    vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer, _kvF16Writer, _state.PositionsBuffer, BlockSet(vkCache.Storage)?.Writer, BlockSet(vkCache.Storage)?.ValueWriter);
                     // F32 rows are copied (transfer); F16, Q8_0 and Q4_0 rows are written by a compute dispatch. Q4_0 once took the transfer barrier
                     // here (#1884): attention then raced the quantiser and the logits changed run to run.
                     if (vkCache.Storage != VulkanKvStorage.F32) BarrierComputeToCompute(cmdBuf);
@@ -6010,6 +6016,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         _kvF16Writer?.InvalidateDescriptorCache();
         _kvQ8Set.Invalidate();
         _kvQ4Set.Invalidate();
+        _kvQ8Q4Set.Invalidate();
+        _kvQ4Q8Set.Invalidate();
         _rowPow2Downscale?.InvalidateDescriptorCache();
         _moeScatterResidual?.InvalidateDescriptorCache();
         _rowScaleMul?.InvalidateDescriptorCache();
@@ -10535,6 +10543,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         _kvF16Writer?.Dispose();
         _kvQ8Set.Dispose();
         _kvQ4Set.Dispose();
+        _kvQ8Q4Set.Dispose();
+        _kvQ4Q8Set.Dispose();
         _rowPow2Downscale?.Dispose();
         _moeScatterResidual?.Dispose();
         _rowScaleMul?.Dispose();

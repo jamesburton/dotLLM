@@ -75,13 +75,15 @@ public sealed class VulkanDenseQ8KvKernelTests
         var rng = new Random(seed);
         int kvElems = seqKv * numKvHeads * headDim;
         float[] q = Rand(rng, seqQ * numHeads * headDim, 0.5f), k = Rand(rng, kvElems, 0.5f), v = Rand(rng, kvElems, 0.5f);
-        if (_storage == VulkanKvStorage.Q4_0)
+        // Each side in its own block format (mixed K / V, #1884).
+        static (byte[] Q, float[] D) Side(VulkanKvStorage f, float[] x)
         {
-            byte[] k4 = QuantizeQ4Ref(k), v4 = QuantizeQ4Ref(v);
-            return (q, k, v, k4, v4, DequantizeQ4Ref(k4), DequantizeQ4Ref(v4));
+            if (f == VulkanKvStorage.Q4_0) { var b = QuantizeQ4Ref(x); return (b, DequantizeQ4Ref(b)); }
+            var b8 = QuantizeRef(x); return (b8, DequantizeRef(b8));
         }
-        byte[] kq = QuantizeRef(k), vq = QuantizeRef(v);
-        return (q, k, v, kq, vq, DequantizeRef(kq), DequantizeRef(vq));
+        var (kq, kd) = Side(_storage.KeyFormat(), k);
+        var (vq, vd) = Side(_storage.ValueFormat(), v);
+        return (q, k, v, kq, vq, kd, vd);
     }
 
     /// <summary>F32-computing twin vs the F32 kernel on the dequantised rows: bit-identical up to FMA contraction.</summary>
@@ -179,7 +181,7 @@ public sealed class VulkanDenseQ8KvKernelTests
     }
 
     // Sanity cap on the relative L2 error vs the unquantised attention (the sharp check is against the reference's own error).
-    private static double Budget => _storage == VulkanKvStorage.Q4_0 ? 1.0 : 0.03;
+    private static double Budget => _storage == VulkanKvStorage.Q8_0 ? 0.03 : 1.0;   // any side in Q4_0: loose cap
 
     /// <summary>
     /// The Q4_0 writer stores exactly the C# reference's bytes (scale bits and nibbles), at a non-zero destination block, leaving the
@@ -240,7 +242,7 @@ public sealed class VulkanDenseQ8KvKernelTests
     public static TheoryData<VulkanKvStorage, int, int, int, int, int> Shapes()
     {
         var d = new TheoryData<VulkanKvStorage, int, int, int, int, int>();
-        foreach (var st in new[] { VulkanKvStorage.Q8_0, VulkanKvStorage.Q4_0 })
+        foreach (var st in new[] { VulkanKvStorage.Q8_0, VulkanKvStorage.Q4_0, VulkanKvStorage.Q8_0K_Q4_0V, VulkanKvStorage.Q4_0K_Q8_0V })
         {
             d.Add(st, 37, 290, 14, 2, 64);    // hd64 prefill at an offset (253), partial tiles
             d.Add(st, 64, 64, 14, 2, 64);     // hd64 fresh prefill
@@ -304,6 +306,8 @@ public sealed class VulkanDenseQ8KvKernelTests
     [InlineData(VulkanKvStorage.Q8_0, 4, 900, 32, 8, 128)]
     [InlineData(VulkanKvStorage.Q4_0, 3, 300, 14, 2, 64)]
     [InlineData(VulkanKvStorage.Q4_0, 4, 900, 32, 8, 128)]
+    [InlineData(VulkanKvStorage.Q8_0K_Q4_0V, 3, 300, 14, 2, 64)]
+    [InlineData(VulkanKvStorage.Q4_0K_Q8_0V, 4, 900, 32, 8, 128)]
     public void SmallRowSplitKv_ReadsBlockKvInPlace_MatchesF32OnDequantisedRows(VulkanKvStorage storage, int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim)
     {
         _storage = storage;
@@ -325,6 +329,9 @@ public sealed class VulkanDenseQ8KvKernelTests
     [InlineData(VulkanKvStorage.Q4_0, 900, 14, 2, 64, true)]
     [InlineData(VulkanKvStorage.Q4_0, 2600, 32, 8, 128, true)]
     [InlineData(VulkanKvStorage.Q4_0, 777, 32, 8, 128, false)]
+    [InlineData(VulkanKvStorage.Q8_0K_Q4_0V, 900, 14, 2, 64, true)]
+    [InlineData(VulkanKvStorage.Q4_0K_Q8_0V, 2600, 32, 8, 128, true)]
+    [InlineData(VulkanKvStorage.Q8_0K_Q4_0V, 777, 32, 8, 128, false)]
     public void SplitKvDecode_ReadsBlockKvInPlace_MatchesF32OnDequantisedRows(VulkanKvStorage storage, int seqKv, int numHeads, int numKvHeads, int headDim, bool gqa)
     {
         _storage = storage;
