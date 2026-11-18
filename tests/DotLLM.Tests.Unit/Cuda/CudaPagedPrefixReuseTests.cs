@@ -222,6 +222,51 @@ public sealed class CudaPagedPrefixReuseTests
         Assert.Equal(freeAtStart, pool.FreeBlocks);
     }
 
+    /// <summary>
+    /// A growth reallocates the block-pointer arrays, so the next attention call must re-upload every pointer even when the block
+    /// table did not change: here the next write lands inside the last, partial block (no block appended, no version bump). The
+    /// turn-level test cannot see this, because its suffix always appends blocks. New allocations are poisoned, so a missed upload
+    /// reads garbage pointers.
+    /// </summary>
+    [SkippableFact]
+    public void Growth_ThenAWriteInsideThePartialBlock_ReuploadsThePointers()
+    {
+        using var env = Load()!;
+        var (model, tokenizer) = (env.Model, env.Tokenizer);
+        int vocab = model.Config.VocabSize;
+        using var pool = model.CreateKvBlockPool(BlockSize, 8192);
+        int[] tokens = tokenizer.Encode(Turn1());
+        int p = (tokens.Length - 2) / BlockSize * BlockSize + 3;   // token p goes into the block holding p-1
+        Assert.True(p < tokens.Length && p % BlockSize is > 0 and < BlockSize - 1);
+        var positions = Enumerable.Range(0, p + 1).ToArray();
+
+        float[] Next(Core.Attention.IKvCache kv)
+        {
+            using var t = model.Forward(tokens.AsSpan(p, 1), positions.AsSpan(p, 1), 0, kv);
+            return LastRow(t, vocab);
+        }
+
+        float[] reference;
+        using (var roomy = model.CreatePagedKvCache(pool, 2048))
+        {
+            model.Forward(tokens.AsSpan(0, p), positions.AsSpan(0, p), 0, roomy).Dispose();
+            reference = Next(roomy);
+        }
+
+        using var grown = model.CreatePagedKvCache(pool, p + 1);
+        model.Forward(tokens.AsSpan(0, p), positions.AsSpan(0, p), 0, grown).Dispose();
+        DotLLM.Cuda.Interop.CudaDriverApi.TestPoisonAllocations = true;
+        try { Assert.True(grown.TryGrowTo(2048)); }
+        finally { DotLLM.Cuda.Interop.CudaDriverApi.TestPoisonAllocations = false; }
+        Assert.Equal(2048, grown.MaxLength);
+        float[] actual = Next(grown);
+
+        float maxDiff = 0;
+        for (int i = 0; i < vocab; i++) maxDiff = Math.Max(maxDiff, Math.Abs(reference[i] - actual[i]));
+        _out.WriteLine($"p {p}: max |logit diff| grown vs roomy {maxDiff:E2}");
+        Assert.True(maxDiff < 1e-3f, $"logits after growth moved {maxDiff}");   // NaN fails too
+    }
+
     /// <summary>Rolls <paramref name="kv"/> back to <paramref name="length"/> so the last token can be re-forwarded over it.</summary>
     private static Core.Attention.IKvCache CloneByRollback(Core.Attention.IKvCache kv, int length)
     {
@@ -261,9 +306,11 @@ public sealed class CudaPagedPrefixReuseTests
         gen.Generate(Unrelated(), opts);
         Assert.Equal(2, prefix.EntryCount);
         long evictions = prefix.AdmissionEvictions;
+        _out.WriteLine($"before turn 2: pool free {pool.FreeBlocks} of {pool.TotalBlocks}");
 
         var warm = gen.Generate(t2, opts);
-        _out.WriteLine($"turn 2 cached {warm.Timings.CachedTokenCount}, admission evictions +{prefix.AdmissionEvictions - evictions}");
+        _out.WriteLine($"turn 2 cached {warm.Timings.CachedTokenCount}, admission evictions +{prefix.AdmissionEvictions - evictions}, " +
+                       $"entries {prefix.EntryCount}, pool free {pool.FreeBlocks}");
         Assert.True(warm.Timings.CachedTokenCount > 0, "the hit was given up");
         Assert.Equal(1, prefix.AdmissionEvictions - evictions);
         Assert.Equal(expected.GeneratedTokenIds, warm.GeneratedTokenIds);
