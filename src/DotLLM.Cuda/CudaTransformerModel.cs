@@ -4806,8 +4806,13 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <param name="maxTotalTokens">Maximum total tokens across all sequences sharing this pool.</param>
     public CudaKvBlockPool CreateKvBlockPool(int blockSize = 16, int maxTotalTokens = 65536)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockSize);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxTotalTokens);
         _context.MakeCurrent();
-        return new CudaKvBlockPool(Core.Attention.KvGeometry.FromConfig(Config), blockSize, maxTotalTokens, _context);
+        // The pool takes a BLOCK count. Passing the token count straight through (as before #1843) made every pool blockSize
+        // times larger than asked: 65536 tokens allocated 65536 blocks (1M tokens of KV).
+        int totalBlocks = (int)(((long)maxTotalTokens + blockSize - 1) / blockSize);
+        return new CudaKvBlockPool(Core.Attention.KvGeometry.FromConfig(Config), blockSize, totalBlocks, _context);
     }
 
     /// <summary>

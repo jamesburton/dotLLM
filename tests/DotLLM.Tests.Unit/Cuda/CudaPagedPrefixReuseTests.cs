@@ -297,6 +297,7 @@ public sealed class CudaPagedPrefixReuseTests
         Assert.True(Blocks(n + opts.MaxTokens) - heldA > total - heldA - heldB, "fixture: turn 2 must not fit beside B");
 
         using var pool = model.CreateKvBlockPool(BlockSize, total * BlockSize);
+        Assert.Equal(total, pool.TotalBlocks);   // CreateKvBlockPool takes TOKENS (it once passed them on as blocks: 16x the pool)
         Func<Core.Models.ModelConfig, int, Core.Attention.IKvCache> paged = (_, size) => model.CreatePagedKvCache(pool, size);
         var expected = new TextGenerator(model, tokenizer, paged, mtpEnabled: false).Generate(t2, opts);
 
