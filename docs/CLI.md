@@ -93,10 +93,11 @@ value to `--cache-type-k` and `--cache-type-v`. TurboQuant on every backend, rea
 | CPU `serve` | `--no-paged`, plain transformer, no draft model, no MTP head | runs (`TurboQuantKvCache`; still decodes into an FP32 scratch until step 2) |
 | CPU `serve` | paged (the default) | refused: pass `--no-paged` (step 3) |
 | CPU `serve` | hybrid / recurrent / other CPU hosts | refused |
-| `run`, `chat` | any | refused until step 2 |
+| `run`, `chat`, `bench` | any | refused until step 2 |
 | CUDA, Vulkan, HIP (any command; `--device auto` that lands on a GPU) | any | refused until step 2 |
 | any | K and V differ (mixed pair, V-only, or different bit widths) | refused until step 6 |
 | any | head dim not a power of two or above 256, or per-layer KV widths | refused |
+| any | MLA models (DeepSeek-V2/V3, GLM-4.7-Flash, Kimi): their attention keeps its own latent KV | refused |
 
 ## KV-cache sizing
 
