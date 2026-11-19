@@ -292,7 +292,7 @@ public sealed class TurboQuantCodec
     }
 
     // In-place unnormalized Walsh–Hadamard transform (H·x); H·H = n·I.
-    private static void FastWalshHadamard(Span<float> a)
+    internal static void FastWalshHadamard(Span<float> a)
     {
         int n = a.Length;
         for (int len = 1; len < n; len <<= 1)
@@ -358,7 +358,16 @@ public sealed class TurboQuantCodec
 
     // ── Scalar quantization ──────────────────────────────────────────────
 
-    private int NearestIndex(float value)
+    /// <summary>Decision boundaries (ascending midpoints between adjacent centroids). Exposed for tests.</summary>
+    internal ReadOnlySpan<float> Boundaries => _boundaries;
+
+    /// <summary>
+    /// Index of the nearest centroid. <b>Tie policy (all backends):</b> a value exactly on a boundary
+    /// (equidistant, in F32 with no FMA contraction) picks the <b>lower</b> centroid index, because the
+    /// index is the count of boundaries strictly below the value. GPU encoders must reproduce this
+    /// (Vulkan: <c>precise</c>/NoContraction on the encode arithmetic).
+    /// </summary>
+    internal int NearestIndex(float value)
     {
         // Boundaries are ascending midpoints; the index is the count of boundaries < value.
         int lo = 0, hi = _boundaries.Length;
