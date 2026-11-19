@@ -1,8 +1,10 @@
 using System;
 using System.Runtime.InteropServices;
+using DotLLM.Core.Attention;
 using DotLLM.Core.Tensors;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.KvCache.Codecs;
+using DotLLM.Tests.Unit.Engine.KvCache;
 using DotLLM.Vulkan;
 using Xunit;
 using Xunit.Abstractions;
@@ -103,6 +105,112 @@ public sealed unsafe class VulkanTurboQuantKvCacheTests
         // rare encode boundary flips.
         Assert.True(mismFrac < 0.005, $"too many element mismatches: {mismFrac:P3}");
         Assert.True(meanAbs < 1e-3, $"mean abs diff too high: {meanAbs:E3}");
+    }
+
+    /// <summary>
+    /// #1892: stored norm bytes equal <see cref="TurboQuantNormCodec.Encode(TqNormFormat, ReadOnlySpan{float}, Span{byte})"/> of the
+    /// encode-time norm, in every format the GPU supports, and the dequant reads them back.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(TqNormFormat.F32Reference)]
+    [InlineData(TqNormFormat.F16)]
+    [InlineData(TqNormFormat.Bf16)]
+    public void Oracle_NormsRoundTripThroughTheSharedCodec(TqNormFormat format)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        const int hd = 128, bits = 4;
+        var corpus = TurboQuantByteExactCorpus.Build(bits, hd, halfInputs: false);
+        var (_, cpuNorms) = TurboQuantByteExactCorpus.CpuEncode(corpus.K, format);
+
+        using var device = VulkanDevice.Create();
+        var ck = corpus.K.Codec; var cv = corpus.V.Codec;
+        using var gpu = new VulkanTurboQuantKvCache(device, spvDir, 1, TurboQuantByteExactCorpus.NumKvHeads, hd,
+            TurboQuantByteExactCorpus.SeqLen, ck.MseBits, ck.Centroids, ck.RotationSigns, cv.RotationSigns, ck.InvSqrtD, format);
+        Assert.Equal(format, gpu.NormFormat);
+        Upload(device, corpus, out var kDev, out var vDev);
+        using (kDev) using (vDev)
+        {
+            var positions = new int[TurboQuantByteExactCorpus.SeqLen];
+            for (int i = 0; i < positions.Length; i++) positions[i] = i;
+            gpu.UpdateSync(kDev, vDev, positions, positions.Length, 0);
+
+            var got = new byte[cpuNorms.Length];
+            gpu.DownloadNormBytes(0, values: false, got);
+            Assert.Equal(cpuNorms, got);
+
+            // and the dequant decodes them: the K scratch carries the decoded norm
+            var recon = new float[positions.Length * TurboQuantByteExactCorpus.NumKvHeads * hd];
+            gpu.DequantKeysToHost(0, recon);
+            int n = TurboQuantByteExactCorpus.SeqLen * TurboQuantByteExactCorpus.NumKvHeads;
+            var codes = new byte[ck.CodeBytesPerVector];
+            var expect = new float[hd];
+            for (int v = 0; v < n; v++)
+            {
+                float norm = TurboQuantNormCodec.Decode(format, cpuNorms, v);
+                ck.Encode(corpus.K.Data.AsSpan(v * hd, hd), codes);
+                ck.Decode(codes, norm, expect);
+                for (int i = 0; i < hd; i++)
+                    Assert.True(Math.Abs(expect[i] - recon[v * hd + i]) <= 1e-4 * Math.Max(1.0, Math.Abs(expect[i])),
+                        $"v={v} i={i}: cpu={expect[i]} gpu={recon[v * hd + i]}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// #1892 gate: encode is byte-identical to the CPU codec (codes AND F16 norm bytes) on random K/V with exact
+    /// F32 distance ties injected after normalise+rotate. CUDA is checked against the same CPU reference on framework.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(ByteExactConfigs))]
+    public void Encode_IsByteIdenticalToCpu_Vulkan(int bits, int headDim)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        var corpus = TurboQuantByteExactCorpus.Build(bits, headDim, halfInputs: false);
+        var format = TurboQuantLayout.DefaultNorm;
+
+        using var device = VulkanDevice.Create();
+        var ck = corpus.K.Codec; var cv = corpus.V.Codec;
+        using var gpu = new VulkanTurboQuantKvCache(device, spvDir, 1, TurboQuantByteExactCorpus.NumKvHeads, headDim,
+            TurboQuantByteExactCorpus.SeqLen, ck.MseBits, ck.Centroids, ck.RotationSigns, cv.RotationSigns, ck.InvSqrtD);
+        Assert.Equal(TqNormFormat.F16, gpu.NormFormat);
+        Upload(device, corpus, out var kDev, out var vDev);
+        using (kDev) using (vDev)
+        {
+            int seq = TurboQuantByteExactCorpus.SeqLen;
+            var positions = new int[seq];
+            for (int i = 0; i < seq; i++) positions[i] = i;
+            gpu.UpdateSync(kDev, vDev, positions, seq, 0);
+
+            int n = seq * TurboQuantByteExactCorpus.NumKvHeads;
+            int cu = gpu.CodeUintsPerVec;
+            int nb = TurboQuantNormCodec.BytesPerNorm(format);
+            string failures = "";
+            foreach (bool values in new[] { false, true })
+            {
+                var side = values ? corpus.V : corpus.K;
+                var (cpuCodes, cpuNorms) = TurboQuantByteExactCorpus.CpuEncode(side, format);
+                var gotCodes = new uint[n * cu];
+                var gotNorms = new byte[n * nb];
+                gpu.DownloadCodeUints(0, values, gotCodes);
+                gpu.DownloadNormBytes(0, values, gotNorms);
+                var (cb, nbad, total) = TurboQuantByteExactCorpus.Compare(cpuCodes, cpuNorms,
+                    MemoryMarshal.AsBytes(gotCodes.AsSpan()), gotNorms, cu * 4, nb);
+                _output.WriteLine($"VULKAN bits={bits} hd={headDim} {(values ? "V" : "K")}: code mismatches {cb}/{total}, norm mismatches {nbad}/{total} (tie coords in corpus: {side.TieCoords})");
+                if (cb != 0 || nbad != 0) failures += $"{(values ? "V" : "K")}: {cb} code / {nbad} norm of {total}; ";
+            }
+            Assert.True(failures.Length == 0, $"Vulkan encode differs from the CPU codec at bits={bits} hd={headDim}: {failures}");
+        }
+    }
+
+    public static System.Collections.Generic.IEnumerable<object[]> ByteExactConfigs() => TurboQuantByteExactCorpus.BitsAndHeadDims();
+
+    private static void Upload(VulkanDevice device, TurboQuantByteExactCorpus.Corpus corpus,
+                               out VulkanDevice.Buffer kDev, out VulkanDevice.Buffer vDev)
+    {
+        kDev = device.Allocate((long)corpus.K.Data.Length * sizeof(float));
+        vDev = device.Allocate((long)corpus.V.Data.Length * sizeof(float));
+        device.Upload(new ReadOnlySpan<float>(corpus.K.Data), kDev);
+        device.Upload(new ReadOnlySpan<float>(corpus.V.Data), vDev);
     }
 
     private static (double maxAbs, long mismatches, double sumAbs) Compare(float[] expected, float[] actual)

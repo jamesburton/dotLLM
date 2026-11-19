@@ -158,22 +158,8 @@ public sealed class TurboQuantCodec
         if (codes.Length < CodeBytesPerVector)
             throw new ArgumentException($"codes too small: need {CodeBytesPerVector}, got {codes.Length}.", nameof(codes));
 
-        double sumSq = 0;
-        for (int i = 0; i < _headDim; i++) sumSq += (double)vector[i] * vector[i];
-        float norm = (float)Math.Sqrt(sumSq);
-
         Span<float> buf = _headDim <= 1024 ? stackalloc float[_headDim] : new float[_headDim];
-        if (norm > 0)
-        {
-            float inv = 1.0f / norm;
-            for (int i = 0; i < _headDim; i++) buf[i] = vector[i] * inv;
-        }
-        else
-        {
-            buf.Clear();
-        }
-
-        Rotate(buf);                 // unit direction → rotated coordinates (~N(0,1/d))
+        float norm = NormalizeAndRotate(vector, buf);   // unit direction -> rotated coordinates (~N(0,1/d))
 
         codes[..CodeBytesPerVector].Clear();
         for (int i = 0; i < _headDim; i++)
@@ -182,6 +168,42 @@ public sealed class TurboQuantCodec
         if (_useQjl)
             EncodeQjlResidual(vector, norm, codes);
 
+        return norm;
+    }
+
+    /// <summary>
+    /// Norm, normalise and forward rotation exactly as every GPU encoder does them, so encode is byte-identical
+    /// across backends (#1892). The sum of squares is a fixed pairwise tree: lane <c>t</c> of <c>min(d,256)</c>
+    /// lanes sums coordinates <c>t, t+256, ...</c>, then lanes fold <c>l[t] += l[t+r]</c> for <c>r = L/2 .. 1</c>.
+    /// sqrt and the per-element divide are IEEE single; nothing here may contract to FMA.
+    /// Returns the L2 norm; <paramref name="rotated"/> receives the rotated unit direction (all zeros for a zero vector).
+    /// </summary>
+    internal float NormalizeAndRotate(ReadOnlySpan<float> vector, Span<float> rotated)
+    {
+        int lanes = Math.Min(_headDim, 256);
+        Span<float> lane = stackalloc float[lanes];
+        for (int t = 0; t < lanes; t++)
+        {
+            float sq = vector[t] * vector[t];
+            float acc = sq;
+            for (int k = t + lanes; k < _headDim; k += lanes)
+            {
+                float q = vector[k] * vector[k];
+                acc = acc + q;
+            }
+            lane[t] = acc;
+        }
+        for (int r = lanes >> 1; r > 0; r >>= 1)
+            for (int t = 0; t < r; t++)
+                lane[t] = lane[t] + lane[t + r];
+        float norm = MathF.Sqrt(lane[0]);
+
+        if (norm > 0)
+            for (int i = 0; i < _headDim; i++) rotated[i] = vector[i] / norm;
+        else
+            rotated[.._headDim].Clear();
+
+        Rotate(rotated);
         return norm;
     }
 
@@ -362,14 +384,14 @@ public sealed class TurboQuantCodec
     internal ReadOnlySpan<float> Boundaries => _boundaries;
 
     /// <summary>
-    /// Index of the nearest centroid. <b>Tie policy (all backends):</b> a value exactly on a boundary
-    /// (equidistant, in F32 with no FMA contraction) picks the <b>lower</b> centroid index, because the
-    /// index is the count of boundaries strictly below the value. GPU encoders must reproduce this
-    /// (Vulkan: <c>precise</c>/NoContraction on the encode arithmetic).
+    /// Index of the nearest centroid, bit-for-bit what the GPU encoders compute: argmin over
+    /// <c>|v - c_j|</c> in F32 (no FMA contraction), scanning ascending with a strict <c>&lt;</c>, so an exact
+    /// equidistant tie picks the <b>lower</b> centroid index. A boundary binary search finds the candidate; its
+    /// neighbours are then scored with the same arithmetic (rounded distances are monotone in the centroid on each
+    /// side of <c>v</c>, so the global argmin is within one step of the boundary result).
     /// </summary>
     internal int NearestIndex(float value)
     {
-        // Boundaries are ascending midpoints; the index is the count of boundaries < value.
         int lo = 0, hi = _boundaries.Length;
         while (lo < hi)
         {
@@ -377,7 +399,29 @@ public sealed class TurboQuantCodec
             if (_boundaries[mid] < value) lo = mid + 1;
             else hi = mid;
         }
-        return lo;
+        int first = lo > 0 ? lo - 1 : 0;
+        int last = lo < _centroids.Length - 1 ? lo + 1 : _centroids.Length - 1;
+        int best = first;
+        float bestD = MathF.Abs(value - _centroids[first]);
+        for (int j = first + 1; j <= last; j++)
+        {
+            float dist = MathF.Abs(value - _centroids[j]);
+            if (dist < bestD) { bestD = dist; best = j; }
+        }
+        return best;
+    }
+
+    /// <summary>Reference argmin over every centroid (ascending, strict <c>&lt;</c>). Exposed for tests.</summary>
+    internal int NearestIndexFullScan(float value)
+    {
+        int best = 0;
+        float bestD = MathF.Abs(value - _centroids[0]);
+        for (int j = 1; j < _centroids.Length; j++)
+        {
+            float dist = MathF.Abs(value - _centroids[j]);
+            if (dist < bestD) { bestD = dist; best = j; }
+        }
+        return best;
     }
 
     private void WriteCode(Span<byte> codes, int coord, int index)

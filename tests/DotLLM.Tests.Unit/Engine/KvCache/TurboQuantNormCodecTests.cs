@@ -138,13 +138,25 @@ public sealed class TurboQuantNormCodecTests
         var codec = new TurboQuantCodec(64, bits, seed: 7);
         var boundaries = codec.Boundaries;
         Assert.Equal(codec.LevelCount - 1, boundaries.Length);
+        var ties = TurboQuantByteExactCorpus.TieValues(codec);
+        Assert.NotEmpty(ties);
+        foreach (var (t, k) in ties)
+        {
+            // Exactly equidistant in the F32 arithmetic the encoders use (|t-c_k| == |c_k+1-t|): the LOWER index must win.
+            Assert.Equal(k, codec.NearestIndex(t));
+            Assert.Equal(k, codec.NearestIndexFullScan(t));
+        }
         for (int k = 0; k < boundaries.Length; k++)
         {
-            // Exactly on the midpoint between centroid k and k+1: equidistant (in the F32 arithmetic the
-            // encoder uses), so the LOWER index must win.
-            Assert.Equal(k, codec.NearestIndex(boundaries[k]));
-            // One ulp above is strictly closer to k+1.
-            Assert.Equal(k + 1, codec.NearestIndex(MathF.BitIncrement(boundaries[k])));
+            // The float midpoint is not always an exact F32 distance tie, so around it the answer is whatever the
+            // argmin gives: NearestIndex must agree with the full-scan argmin (the GPU arithmetic) one ulp either side.
+            float b = boundaries[k];
+            Assert.Equal(codec.NearestIndexFullScan(b), codec.NearestIndex(b));
+            Assert.Equal(codec.NearestIndexFullScan(MathF.BitIncrement(b)), codec.NearestIndex(MathF.BitIncrement(b)));
+            Assert.Equal(codec.NearestIndexFullScan(MathF.BitDecrement(b)), codec.NearestIndex(MathF.BitDecrement(b)));
+            // Clear of the boundary the answer is unambiguous.
+            Assert.Equal(k, codec.NearestIndex(b - 1e-3f * Math.Abs(b) - 1e-6f));
+            Assert.Equal(k + 1, codec.NearestIndex(b + 1e-3f * Math.Abs(b) + 1e-6f));
         }
     }
 }

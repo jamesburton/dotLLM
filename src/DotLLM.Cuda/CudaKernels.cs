@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Cuda.Interop;
 
@@ -7121,14 +7122,15 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// </summary>
     public unsafe void LaunchTurboQuantDequantF32(
         nint codes, nint norms, nint centroids, nint signs, nint dst,
-        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD, nint stream)
+        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD, nint stream,
+        TqNormFormat normFormat = TqNormFormat.F32Reference)
     {
         if (_turboquantDequantF32Func == 0)
             throw new InvalidOperationException("turboquant_dequant_f32 not loaded (turboquant.ptx missing/stale).");
         nint c = codes, n = norms, ce = centroids, s = signs, d = dst;
         int nv = numVectors, hd = headDim, nkv = numKvHeads, mb = mseBits, cu = codeUintsPerVec;
-        float isd = invSqrtD;
-        void** args = stackalloc void*[] { &c, &n, &ce, &s, &d, &nv, &hd, &nkv, &mb, &cu, &isd };
+        float isd = invSqrtD; int nf = (int)normFormat;
+        void** args = stackalloc void*[] { &c, &n, &ce, &s, &d, &nv, &hd, &nkv, &mb, &cu, &isd, &nf };
         CudaDriverApi.cuLaunchKernel(_turboquantDequantF32Func,
                 (uint)numVectors, 1, 1, 256, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
@@ -7142,14 +7144,14 @@ public sealed unsafe partial class CudaKernels : IDisposable
     public unsafe void LaunchTurboQuantEncodeF32(
         nint src, nint centroids, nint signs, nint codes, nint norms,
         int seqLen, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, int levelCount, int startPos,
-        float invSqrtD, nint stream)
+        float invSqrtD, nint stream, TqNormFormat normFormat = TqNormFormat.F32Reference)
     {
         if (_turboquantEncodeF32Func == 0)
             throw new InvalidOperationException("turboquant_encode_f32 not loaded (turboquant.ptx missing/stale).");
         nint sr = src, ce = centroids, sg = signs, co = codes, no = norms;
         int hd = headDim, nkv = numKvHeads, mb = mseBits, cu = codeUintsPerVec, lc = levelCount, sp = startPos;
-        float isd = invSqrtD;
-        void** args = stackalloc void*[] { &sr, &ce, &sg, &co, &no, &hd, &nkv, &mb, &cu, &lc, &sp, &isd };
+        float isd = invSqrtD; int nf = (int)normFormat;
+        void** args = stackalloc void*[] { &sr, &ce, &sg, &co, &no, &hd, &nkv, &mb, &cu, &lc, &sp, &isd, &nf };
         CudaDriverApi.cuLaunchKernel(_turboquantEncodeF32Func,
                 (uint)(seqLen * numKvHeads), 1, 1, 256, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
@@ -7161,14 +7163,15 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <summary>FP16 TurboQuant dequant: codes + fp32 norm → contiguous <c>half</c> scratch (attention input).</summary>
     public unsafe void LaunchTurboQuantDequantF16(
         nint codes, nint norms, nint centroids, nint signs, nint dst,
-        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD, nint stream)
+        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD, nint stream,
+        TqNormFormat normFormat = TqNormFormat.F32Reference)
     {
         if (_turboquantDequantF16Func == 0)
             throw new InvalidOperationException("turboquant_dequant_f16 not loaded (turboquant.ptx missing/stale).");
         nint c = codes, n = norms, ce = centroids, s = signs, d = dst;
         int nv = numVectors, hd = headDim, nkv = numKvHeads, mb = mseBits, cu = codeUintsPerVec;
-        float isd = invSqrtD;
-        void** args = stackalloc void*[] { &c, &n, &ce, &s, &d, &nv, &hd, &nkv, &mb, &cu, &isd };
+        float isd = invSqrtD; int nf = (int)normFormat;
+        void** args = stackalloc void*[] { &c, &n, &ce, &s, &d, &nv, &hd, &nkv, &mb, &cu, &isd, &nf };
         CudaDriverApi.cuLaunchKernel(_turboquantDequantF16Func,
                 (uint)numVectors, 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
     }
@@ -7177,14 +7180,14 @@ public sealed unsafe partial class CudaKernels : IDisposable
     public unsafe void LaunchTurboQuantEncodeF16(
         nint src, nint centroids, nint signs, nint codes, nint norms,
         int seqLen, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, int levelCount, int startPos,
-        float invSqrtD, nint stream)
+        float invSqrtD, nint stream, TqNormFormat normFormat = TqNormFormat.F32Reference)
     {
         if (_turboquantEncodeF16Func == 0)
             throw new InvalidOperationException("turboquant_encode_f16 not loaded (turboquant.ptx missing/stale).");
         nint sr = src, ce = centroids, sg = signs, co = codes, no = norms;
         int hd = headDim, nkv = numKvHeads, mb = mseBits, cu = codeUintsPerVec, lc = levelCount, sp = startPos;
-        float isd = invSqrtD;
-        void** args = stackalloc void*[] { &sr, &ce, &sg, &co, &no, &hd, &nkv, &mb, &cu, &lc, &sp, &isd };
+        float isd = invSqrtD; int nf = (int)normFormat;
+        void** args = stackalloc void*[] { &sr, &ce, &sg, &co, &no, &hd, &nkv, &mb, &cu, &lc, &sp, &isd, &nf };
         CudaDriverApi.cuLaunchKernel(_turboquantEncodeF16Func,
                 (uint)(seqLen * numKvHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
     }
