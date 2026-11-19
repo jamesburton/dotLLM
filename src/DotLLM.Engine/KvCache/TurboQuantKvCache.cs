@@ -53,6 +53,11 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
     private readonly int _maxSeqLen;
     private int _currentLength;
     private bool _disposed;
+    private readonly TqNormFormat _normFormat;
+    private long _normSaturations;
+    private long _normUnderflows;
+    private readonly float _normJitter;
+    private ulong _jitterState = 0x9E3779B97F4A7C15UL;
 
     /// <inheritdoc/>
     public int CurrentLength => _currentLength;
@@ -75,6 +80,15 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
     /// <summary>Whether the QJL unbiased-score residual stage is active.</summary>
     public bool UseQjl => _codecK.UseQjl;
 
+    /// <summary>Norm format simulated on the stored norms (<see cref="TqNormFormat.F32Reference"/> = exact fp32).</summary>
+    public TqNormFormat NormFormat => _normFormat;
+
+    /// <summary>Norms that exceeded the simulated format's range and were clamped (measurement only).</summary>
+    public long NormSaturations => _normSaturations;
+
+    /// <summary>Non-zero norms that decoded to zero under the simulated format (measurement only).</summary>
+    public long NormUnderflows => _normUnderflows;
+
     /// <summary>Total bytes for the permanent compressed store (codes + norms; excludes scratch).</summary>
     public long AllocatedBytes =>
         (long)_numLayers * 2 * _maxSeqLen * _numKvHeads * ((long)_codeBytes + sizeof(float));
@@ -93,9 +107,15 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
     /// <param name="useQjl">Enable the QJL 1-bit residual stage for unbiased attention scores
     /// (debiases the MSE contraction; raises ℓ2 error but removes score bias — see
     /// <see cref="TurboQuantCodec"/>).</param>
+    /// <param name="normFormat">Measurement hook (#1892): round-trips each stored norm through this format so the scratch path reads back what an in-place kernel would. Default is exact fp32.</param>
+    /// <param name="normJitter">Measurement-only null control (#1892): multiplies every stored norm by <c>1 + u*normJitter</c>, u pseudo-random in [-1,1]. A perturbation of known tiny size, to measure the instrument's noise floor. Default 0 = off.</param>
     public TurboQuantKvCache(int numLayers, int numKvHeads, int headDim, int maxSeqLen,
-                             int bits, ulong seed, bool useQjl = false)
+                             int bits, ulong seed, bool useQjl = false,
+                             TqNormFormat normFormat = TqNormFormat.F32Reference,
+                             float normJitter = 0f)
     {
+        _normFormat = normFormat;
+        _normJitter = normJitter;
         if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
         if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
         if (maxSeqLen <= 0) throw new ArgumentOutOfRangeException(nameof(maxSeqLen));
@@ -165,13 +185,36 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
                 var kDst = new Span<byte>(kCodes + (long)headIdx * _codeBytes, _codeBytes);
                 var vDst = new Span<byte>(vCodes + (long)headIdx * _codeBytes, _codeBytes);
 
-                kNorms[headIdx] = _codecK.Encode(kVec, kDst);
-                vNorms[headIdx] = _codecV.Encode(vVec, vDst);
+                kNorms[headIdx] = RoundTripNorm(_codecK.Encode(kVec, kDst));
+                vNorms[headIdx] = RoundTripNorm(_codecV.Encode(vVec, vDst));
             }
         }
 
         int newLength = maxPos + 1;
         if (newLength > _currentLength) _currentLength = newLength;
+    }
+
+    // Measurement hook (#1892): pushes the norm through the candidate storage format so the scratch-path
+    // oracle sees exactly the value an in-place kernel would read back. F32Reference is a no-op.
+    private float RoundTripNorm(float norm)
+    {
+        if (_normJitter != 0f)
+        {
+            _jitterState += 0x9E3779B97F4A7C15UL;
+            ulong z = _jitterState;
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+            z ^= z >> 31;
+            float u = ((z >> 40) * (1.0f / 8388608.0f)) - 1.0f; // [-1, 1)
+            norm *= 1f + u * _normJitter;
+        }
+        if (_normFormat == TqNormFormat.F32Reference) return norm;
+        Span<byte> b = stackalloc byte[4];
+        TurboQuantNormCodec.Encode(_normFormat, new ReadOnlySpan<float>(in norm), b, out int sat);
+        _normSaturations += sat;
+        float back = TurboQuantNormCodec.Decode(_normFormat, b, 0);
+        if (back == 0f && norm > 0f) _normUnderflows++;
+        return back;
     }
 
     /// <inheritdoc/>
