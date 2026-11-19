@@ -117,23 +117,24 @@ void RunGreedy()
         int[] baseline;
         if (File.Exists(f32File)) baseline = JsonSerializer.Deserialize<int[]>(File.ReadAllText(f32File))!;
         else { baseline = Greedy(bits, TqNormFormat.F32Reference, prompt, out _, out _); File.WriteAllText(f32File, JsonSerializer.Serialize(baseline)); }
-        foreach (var fname in formatNames.Where(n => n != "Null"))
+        foreach (var fname in formatNames)
         {
-            var fmt = Enum.Parse<TqNormFormat>(fname);
+            bool isNull = fname == "Null";
+            var fmt = isNull ? TqNormFormat.F32Reference : Enum.Parse<TqNormFormat>(fname);
             var sw = Stopwatch.StartNew();
             long sat = 0, under = 0;
-            int[] g = fmt == TqNormFormat.F32Reference ? baseline : Greedy(bits, fmt, prompt, out sat, out under);
+            int[] g = fmt == TqNormFormat.F32Reference && !isNull ? baseline : Greedy(bits, fmt, prompt, out sat, out under, isNull ? MathF.Pow(2f, -12) : 0f);
             int same = 0, firstDiv = gen;
             for (int i = 0; i < gen; i++) { if (g[i] == baseline[i]) same++; else if (firstDiv == gen) firstDiv = i; }
-            Append(new { kind = "greedy", model = tag, offset, bits, format = fmt.ToString(), gen, identical = same, firstDivergence = firstDiv, fullyIdentical = same == gen, saturated = sat, underflow = under, seconds = sw.Elapsed.TotalSeconds });
-            Console.WriteLine($"  greedy bits={bits} {fmt,-12} identical={same}/{gen} firstDiv={(firstDiv == gen ? "none" : firstDiv)} {sw.Elapsed.TotalSeconds:F0}s");
+            Append(new { kind = "greedy", model = tag, offset, bits, format = fname, gen, identical = same, firstDivergence = firstDiv, fullyIdentical = same == gen, saturated = sat, underflow = under, seconds = sw.Elapsed.TotalSeconds });
+            Console.WriteLine($"  greedy bits={bits} {fname,-12} identical={same}/{gen} firstDiv={(firstDiv == gen ? "none" : firstDiv)} {sw.Elapsed.TotalSeconds:F0}s");
         }
     }
 }
 
-int[] Greedy(int bits, TqNormFormat fmt, int prompt, out long sat, out long under)
+int[] Greedy(int bits, TqNormFormat fmt, int prompt, out long sat, out long under, float jitter = 0f)
 {
-    using var cache = new TurboQuantKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, prompt + gen + 1, bits, seed, false, fmt);
+    using var cache = new TurboQuantKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, prompt + gen + 1, bits, seed, false, fmt, jitter);
     var pt = tokens[..prompt];
     var pp = Enumerable.Range(0, prompt).ToArray();
     int next;

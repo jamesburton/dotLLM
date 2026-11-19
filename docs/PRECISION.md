@@ -554,6 +554,71 @@ Guards: `QuantizerConventionSensitivityTests` (CPU, corpus sensitivity to each w
 `CudaQuantizerTieTests` (CUDA, Half corpus), `ActivationQuantizerTieTests` (Vulkan Q8_1, #1340). `i2_s_gemv.cu`'s per-tensor
 `quantize_f16_to_i8_absmax` is a different (per-token, W2A8) contract with its own oracle and is deliberately unchanged.
 
+### E17 - TurboQuant norms: per-head-vector norm storage format (#1892 task 1)
+
+Question: the in-place TurboQuant kernels read codes in place (rule 2), so the per-head-vector L2 norm is stored too. Which format below FP32 (rule 1)?
+Candidates: F16, BF16 (2 bytes), OCP FP8 E4M3 / E5M2, Log8 (1 byte; `TurboQuantNormCodec`, round-to-nearest-even, saturating, counted).
+Per-vector cost at hd 128: 16 code words x 4 B (4-bit) + norm; F32 norm = +4 B, 2-byte = +2 B, 1-byte = +1 B.
+
+Method (`tools/tq-norm-eval`, CPU, scratch-path `TurboQuantKvCache` with the norm round-tripped through the codec, one real wikitext-2 LF window per
+cell, KL on the last 128 positions, whose attention reads the whole ctx-long quantised history). The reference is the fp32 `SimpleKvCache`
+(there is no F16 `SimpleKvCache`; reference arms are the standing exception). **Cost = (KL(ref || tq, format norms) - KL(ref || tq, F32 norms)) / KL(ref || tq, F32 norms)**,
+paired per row; table cells are the mean over n independent windows and its standard error. Decision rule (binding, #1892): smallest format whose cost is < 10 % at every bit width on both models.
+
+**Noise floor.** Both models quantise activations to int8 (q8_0 / Q4_K weights), which digitises any tiny perturbation (see E16). Direct KL between two
+runs that differ only by a ~2^-12 relative norm jitter is 12-130 % of the tq-vs-ref KL, and the arm is deterministic (re-running the F32 arm gives 0.0). A
+harness-only **Null control** (F32 norms times 1 + u * 2^-12, u in [-1,1): never larger than F16's worst error 2^-11) measures that floor. A format whose
+cost is not separable from Null is at the instrument floor.
+
+
+Qwen2.5-0.5B-Instruct q8_0, ctx 2048: extra KL vs unquantised KV from the norm format, as % of the tq-vs-reference KL (mean +- s.e. over n windows)
+
+| bits | tq-vs-ref KL | F16 | Bf16 | Fp8E4M3 | Fp8E5M2 | Log8 | Null |
+|---|---|---|---|---|---|---|---|
+| 2 | 5.46 | -1% +-1 (n=8) | -1% +-3 (n=8) | +0% +-2 (n=1) | +1% +-2 (n=1) | +0% +-2 (n=1) | +1% +-2 (n=8) |
+| 3 | 3.19 | +1% +-2 (n=8) | +1% +-3 (n=8) | -0% +-3 (n=1) | -0% +-4 (n=1) | +10% +-3 (n=1) | -1% +-2 (n=8) |
+| 4 | 2.76 | +0% +-1 (n=8) | +5% +-3 (n=8) | +13% +-2 (n=1) | -6% +-4 (n=1) | +15% +-3 (n=1) | +1% +-1 (n=8) |
+| 8 | 0.0278 | +1% +-1 (n=31) | +15% +-13 (n=31) | +100% +-14 (n=1) | +943% +-116 (n=1) | +536% +-69 (n=1) | +3% +-2 (n=31) |
+
+Qwen2.5-0.5B-Instruct q8_0, ctx 8192: extra KL vs unquantised KV from the norm format, as % of the tq-vs-reference KL (mean +- s.e. over n windows)
+
+| bits | tq-vs-ref KL | F16 | Bf16 | Fp8E4M3 | Fp8E5M2 | Log8 | Null |
+|---|---|---|---|---|---|---|---|
+| 2 | 6.13 | -1% +-2 (n=1) | +4% +-2 (n=1) | +4% +-3 (n=1) | -1% +-2 (n=1) | +8% +-2 (n=1) | +5% +-2 (n=1) |
+| 3 | 4.92 | -3% +-3 (n=1) | -6% +-3 (n=1) | -2% +-3 (n=1) | -13% +-3 (n=1) | -2% +-3 (n=1) | +2% +-2 (n=1) |
+| 4 | 4.88 | -1% +-2 (n=1) | +2% +-2 (n=1) | -2% +-2 (n=1) | -5% +-2 (n=1) | -4% +-2 (n=1) | +1% +-1 (n=1) |
+| 8 | 0.0147 | +16% +-8 (n=1) | +14% +-15 (n=1) | +202% +-53 (n=1) | +1784% +-369 (n=1) | +633% +-111 (n=1) | +12% +-9 (n=1) |
+
+Qwen3-4B-Instruct-2507 Q4_K_M, ctx 2048: extra KL vs unquantised KV from the norm format, as % of the tq-vs-reference KL (mean +- s.e. over n windows)
+
+| bits | tq-vs-ref KL | F16 | Bf16 | Fp8E4M3 | Fp8E5M2 | Log8 | Null |
+|---|---|---|---|---|---|---|---|
+| 2 | 2 | -0% +-4 (n=1) | -6% +-3 (n=1) | -14% +-4 (n=1) | +3% +-4 (n=1) | -1% +-3 (n=1) | - |
+| 3 | 0.257 | +2% +-9 (n=1) | +8% +-9 (n=1) | +48% +-14 (n=1) | +78% +-18 (n=1) | +25% +-11 (n=1) | - |
+| 4 | 0.0837 | +4% +-10 (n=4) | +1% +-7 (n=4) | +5% +-15 (n=1) | +47% +-13 (n=1) | -2% +-9 (n=1) | -15% +-8 (n=4) |
+| 8 | 0.00356 | +9% +-9 (n=8) | +2% +-5 (n=8) | +627% +-104 (n=1) | +2042% +-216 (n=1) | +334% +-39 (n=1) | +11% +-4 (n=8) |
+
+Qwen3-4B-Instruct-2507 Q4_K_M, ctx 8192: extra KL vs unquantised KV from the norm format, as % of the tq-vs-reference KL (mean +- s.e. over n windows)
+
+| bits | tq-vs-ref KL | F16 | Bf16 | Fp8E4M3 | Fp8E5M2 | Log8 | Null |
+|---|---|---|---|---|---|---|---|
+| 4 | 0.077 | -1% +-10 (n=1) | - | - | - | - | -7% +-10 (n=1) |
+| 8 | 0.00382 | +15% +-10 (n=1) | - | - | - | - | +20% +-24 (n=1) |
+
+Greedy identity (256 tokens, 256-token prompt, vs the F32-norm arm, first divergence index): Qwen2.5-0.5B bits 8: F16 13, BF16 55, E4M3 55, E5M2 7, Log8 2, **Null 55**;
+Qwen3-4B bits 8: F16 37, BF16 11, **Null 15**; bits 4: F16 11, BF16 7. Every arm diverges early, the Null control included, so greedy identity cannot rank norm formats here.
+
+Findings.
+- **1-byte formats fail unambiguously.** At 8 bits the cost is E4M3 100-630 %, E5M2 940-2040 %, Log8 330-630 % on both models and both contexts, far above the floor;
+  they also fail at 3-4 bits on one model or the other (0.5B 4-bit: E4M3 +13 %, Log8 +15 %; 4B 3-bit: E4M3 +48 %, Log8 +25 %). The failing term is mantissa precision (E4M3 2^-4, E5M2 2^-3, Log8 a 3.7 % step), so a per-head scale or learned range would not fix it.
+- **F16 and BF16** both pass (< 10 %) at 2, 3 and 4 bits on both models. At 8 bits the cost reads 1 % +-1 (0.5B, 31 windows) and +9 % +-9 (4B, 8 windows) for F16, but the Null control
+  itself reads +3 % +-2 and +11 % +-4, and at 8K it reads +12 % / +20 %: **the 10 % line is below the instrument floor at 8 bits**, so neither can be certified by this KL, and F16 is not separable from Null.
+  BF16 reads +15 % +-13 (0.5B) / +2 % +-5 (4B); its 8x larger error (2^-8 vs 2^-11) is the reason to prefer F16 on first principles.
+- Saturation/underflow counters were 0 in every arm (norms sit well inside F16's [6.1e-5, 65504]).
+- Hazards: F16 saturates above 65504 and loses precision below 6.1e-5 (BF16 has neither); the codec clamps and counts, never emits Inf/NaN.
+
+Decision: **not taken (BLOCKED, owner sign-off needed).** No format below FP32 is certified by the rule as measured. Leading candidate: F16.
+
 ## 6. Decision table: CLAUDE.md rule → evidence
 
 | CLAUDE.md rule (Precision & Expansion) | evidence | verdict |
