@@ -617,7 +617,9 @@ Findings.
 - Saturation/underflow counters were 0 in every arm (norms sit well inside F16's [6.1e-5, 65504]).
 - Hazards: F16 saturates above 65504 and loses precision below 6.1e-5 (BF16 has neither); the codec clamps and counts, never emits Inf/NaN.
 
-Decision: **not taken (BLOCKED, owner sign-off needed).** No format below FP32 is certified by the rule as measured. Leading candidate: F16.
+Decision: **F16, chosen by controller ruling** (`TurboQuantLayout.DefaultNorm`). The rule gates only a fall back to FP32. The 1-byte formats are rejected on data.
+The 10% line at 8 bits cannot be resolved with this instrument (null control +3% to +20%), and F16 is not separable from that control; it has 8x less error than BF16.
+Follow-up: re-check F16 vs BF16 with a deterministic attention-output metric (per-layer relative error on captured K/V) instead of chaotic KL.
 
 ## 6. Decision table: CLAUDE.md rule → evidence
 

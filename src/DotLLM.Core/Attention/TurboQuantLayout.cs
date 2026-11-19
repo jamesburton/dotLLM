@@ -34,6 +34,14 @@ public enum TqNormFormat : byte
 /// <param name="Norm">Per-vector norm storage format.</param>
 public readonly record struct TurboQuantLayout(int HeadDim, int NumKvHeads, int MseBits, TqNormFormat Norm)
 {
+    /// <summary>
+    /// The shipping per-head-vector norm format for in-place TurboQuant: <see cref="TqNormFormat.F16"/> (2 bytes).
+    /// Chosen by controller ruling on the data in <c>docs/PRECISION.md</c> E17: the 1-byte formats fail clearly, F16 is
+    /// not separable from the null control at the 10% line, and has 8x less error than BF16. F16 saturates above 65504
+    /// (counted by <c>TurboQuantNormCodec</c>, never Inf/NaN).
+    /// </summary>
+    public static TqNormFormat DefaultNorm => TqNormFormat.F16;
+
     /// <summary>32-bit words holding the packed codes of one head vector: <c>ceil(ceil(HeadDim*MseBits/8)/4)</c>.</summary>
     public int CodeUintsPerVec => (((HeadDim * MseBits) + 7) / 8 + 3) / 4;
 

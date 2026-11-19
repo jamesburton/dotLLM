@@ -104,6 +104,13 @@ public sealed class TurboQuantNormCodecTests
     }
 
     [Fact]
+    public void DefaultNorm_IsF16_TwoBytes()
+    {
+        Assert.Equal(TqNormFormat.F16, TurboQuantLayout.DefaultNorm);
+        Assert.Equal(2, new TurboQuantLayout(128, 8, 4, TurboQuantLayout.DefaultNorm).NormBytes);
+    }
+
+    [Fact]
     public void Layout_ByteCounts()
     {
         var l = new TurboQuantLayout(HeadDim: 128, NumKvHeads: 8, MseBits: 4, Norm: TqNormFormat.F16);
