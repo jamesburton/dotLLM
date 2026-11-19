@@ -18,9 +18,7 @@ namespace DotLLM.Models.Architectures;
 /// <c>internal static</c> on a separate type so that sibling loaders
 /// (attention, MoE, eventually FFN) can share the same BF16 / F16 / F32
 /// resolution + validation + owned-allocation bookkeeping without copying
-/// the logic. No behavioral change — callers continue to observe exactly
-/// the same error messages, allocation counts, and tensor-pointer
-/// semantics as before.
+/// the logic.
 /// </para>
 /// </remarks>
 internal static class SafetensorsTensorResolver
@@ -28,9 +26,8 @@ internal static class SafetensorsTensorResolver
     /// <summary>
     /// Resolves a safetensors tensor as a linear projection weight:
     /// HF shape <c>[out_features, in_features]</c> → (ptr, dtype, M, K).
-    /// F32 tensors are zero-copy; BF16 tensors are upcast into an owned
-    /// 64-byte-aligned scratch buffer and registered in
-    /// <paramref name="owned"/>.
+    /// F32, F16 and BF16 tensors borrow their original mapped storage.
+    /// Consumers requiring F32 must use <see cref="ResolveLinearAsF32"/>.
     /// </summary>
     public static unsafe (nint ptr, QuantizationType qt, int m, int k) ResolveLinear(
         ISafetensorsTensorSource file, string name, List<nint> owned)
@@ -79,12 +76,7 @@ internal static class SafetensorsTensorResolver
                 return (srcPtr, QuantizationType.F32, m, k);
 
             case SafetensorsDType.BF16:
-            {
-                long elementCount = (long)m * k;
-                nint dst = AllocBf16ToF32(srcPtr, elementCount);
-                owned.Add(dst);
-                return (dst, QuantizationType.F32, m, k);
-            }
+                return (srcPtr, QuantizationType.BF16, m, k);
 
             case SafetensorsDType.F16:
             {

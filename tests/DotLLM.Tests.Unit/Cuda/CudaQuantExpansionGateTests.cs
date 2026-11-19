@@ -12,6 +12,23 @@ namespace DotLLM.Tests.Unit.Cuda;
 [Collection(CudaCollection.Name)]
 public sealed class CudaQuantExpansionGateTests
 {
+    [Fact]
+    public void Bf16SameWidthConversion_IsAllowedButWideningStillRequiresOptIn()
+    {
+        bool previous = CudaKernels.AllowQuantExpansion;
+        CudaKernels.AllowQuantExpansion = false;
+        try
+        {
+            CudaKernels.EnsureQuantExpansionAllowed(QuantizationType.BF16, "BF16 projection", 2000, 2000);
+            Assert.Throws<InvalidOperationException>(() =>
+                CudaKernels.EnsureQuantExpansionAllowed(QuantizationType.BF16, "BF16 projection", 2000, 4000));
+        }
+        finally
+        {
+            CudaKernels.AllowQuantExpansion = previous;
+        }
+    }
+
     /// <summary>
     /// Default (gate disabled) must throw for a type CUDA has no native kernel for, and the
     /// message must be actionable: name the quant type, the tensor, both sizes, and the
