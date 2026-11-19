@@ -10,6 +10,7 @@ namespace DotLLM.Hip;
 public sealed class HipModule : IDisposable
 {
     private nint _module;
+    private int _deviceId;
     private readonly Dictionary<string, nint> _functions = new();
 
     /// <summary>
@@ -28,7 +29,10 @@ public sealed class HipModule : IDisposable
     /// <param name="bytes">Code-object bytes (ELF container; no null terminator needed).</param>
     public static HipModule LoadFromBytes(byte[] bytes)
     {
+        ArgumentNullException.ThrowIfNull(bytes);
+        if (bytes.Length == 0) throw new ArgumentException("The HIP code object is empty.", nameof(bytes));
         var module = new HipModule();
+        HipDriverApi.hipGetDevice(out module._deviceId).ThrowOnError();
         unsafe
         {
             fixed (byte* p = bytes)
@@ -46,6 +50,9 @@ public sealed class HipModule : IDisposable
     /// <param name="name">The <c>extern "C"</c> kernel function name.</param>
     public nint GetFunction(string name)
     {
+        ObjectDisposedException.ThrowIf(_module == 0, this);
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        HipDriverApi.hipSetDevice(_deviceId).ThrowOnError();
         if (!_functions.TryGetValue(name, out nint func))
         {
             HipDriverApi.hipModuleGetFunction(out func, _module, name)
@@ -61,6 +68,7 @@ public sealed class HipModule : IDisposable
         nint module = Interlocked.Exchange(ref _module, 0);
         if (module != 0)
         {
+            HipDriverApi.hipSetDevice(_deviceId).ThrowOnError();
             HipDriverApi.hipModuleUnload(module);
             _functions.Clear();
         }

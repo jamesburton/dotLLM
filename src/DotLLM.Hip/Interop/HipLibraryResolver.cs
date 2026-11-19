@@ -38,33 +38,20 @@ internal static class HipLibraryResolver
         string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
     {
         if (libraryName == "amdhip64")
-        {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                foreach (var candidate in WindowsRuntimeCandidates(
-                             Environment.GetEnvironmentVariable,
-                             File.Exists,
-                             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)))
-                {
-                    if (NativeLibrary.TryLoad(candidate, out nint handle))
-                        return handle;
-                }
-            }
-            else
-            {
-                // Modern ROCm uses libamdhip64.so.<major>; try a few flavors.
-                foreach (var name in new[] { "libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5" })
-                {
-                    if (NativeLibrary.TryLoad(name, out nint h))
-                        return h;
-                }
-            }
-        }
+            return TryLoadRuntime(out nint runtime) ? runtime : 0;
 
         if (libraryName == "hipblas")
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
+                foreach (var candidate in WindowsRuntimeCandidates(Environment.GetEnvironmentVariable,
+                             File.Exists, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)))
+                {
+                    if (!Path.IsPathFullyQualified(candidate)) continue;
+                    string blasPath = Path.Combine(Path.GetDirectoryName(candidate)!, "hipblas.dll");
+                    if (File.Exists(blasPath) && TryLoadCandidate(blasPath, out nint sdkHandle))
+                        return sdkHandle;
+                }
                 if (NativeLibrary.TryLoad("hipblas.dll", out nint handle))
                     return handle;
             }
@@ -80,6 +67,24 @@ internal static class HipLibraryResolver
 
         return 0; // fall through to default resolution
     }
+
+    internal static bool TryLoadRuntime(out nint handle)
+    {
+        IEnumerable<string> candidates = OperatingSystem.IsWindows()
+            ? WindowsRuntimeCandidates(Environment.GetEnvironmentVariable, File.Exists,
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile))
+            : ["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so.5"];
+        foreach (string candidate in candidates)
+            if (TryLoadCandidate(candidate, out handle)) return true;
+        handle = 0;
+        return false;
+    }
+
+    private static bool TryLoadCandidate(string candidate, out nint handle) =>
+        OperatingSystem.IsWindows() && Path.IsPathFullyQualified(candidate)
+            ? NativeLibrary.TryLoad(candidate, typeof(HipLibraryResolver).Assembly,
+                DllImportSearchPath.UseDllDirectoryForDependencies | DllImportSearchPath.SafeDirectories, out handle)
+            : NativeLibrary.TryLoad(candidate, out handle);
 
     /// <summary>
     /// Windows HIP runtimes to try, newest-first by intent (#1336). A user-space ROCm install (the pip/TheRock SDK:

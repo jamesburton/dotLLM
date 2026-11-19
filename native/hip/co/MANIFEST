@@ -1,0 +1,14 @@
+Built UTC: 2026-11-16T21:28:14.8734615Z
+Platform: Windows x64
+Targets (each object): gfx1030 gfx1100 gfx1151
+Command: hipcc --genco <targets> -o co/<name>.co kernels/<name>.hip
+Compiler: HIP version: 6.4.50101-9a6572ae7
+clang version 20.0.0git (git@github.com:Compute-Mirrors/llvm-project 33ab2c2f7838239f1e2e5c06432bbb8d887e8cb2)
+Target: x86_64-pc-windows-msvc
+Thread model: posix
+InstalledDir: C:\Program Files\AMD\ROCm\6.4\bin
+SHA256  file
+5272a90fbefc925b13d863a939d632b355da3362791718c1bcb23df84a07d536  dense_f16.co
+5a691684993909c4607eba76c2760d5908931924f528df7c090d397bc4ea1662  ../kernels/dense_f16.hip
+29b6e3fda6a3fc29b9776b0a0c99684c1cbad94b1101e94e63d2801ab59cfb54  rmsnorm.co
+14287a03385846b2d105599e06d36cc48fc7b1493f80e89279feebe02b04baf4  ../kernels/rmsnorm.hip

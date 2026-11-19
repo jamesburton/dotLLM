@@ -215,6 +215,12 @@ public enum QuantizationType
     /// </summary>
     LittleBit = 100,
 
+    /// <summary>CPU-only AutoAWQ GEMM4 mapped descriptor. Private id, never a GGUF block type.</summary>
+    Awq4 = 101,
+
+    /// <summary>CPU-only legacy AutoGPTQ4 mapped descriptor (stored zero + 1). Private id, never a GGUF block type.</summary>
+    Gptq4 = 102,
+
     /// <summary>
     /// PrismML ternary weights at group 128 with dense base-3 trit packing
     /// (<c>GGML_TYPE_PTQ1_0 = 143</c> in the PrismML llama.cpp fork). Block layout

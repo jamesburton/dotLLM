@@ -18,9 +18,7 @@ namespace DotLLM.Models.Architectures;
 /// <c>internal static</c> on a separate type so that sibling loaders
 /// (attention, MoE, eventually FFN) can share the same BF16 / F16 / F32
 /// resolution + validation + owned-allocation bookkeeping without copying
-/// the logic. No behavioral change — callers continue to observe exactly
-/// the same error messages, allocation counts, and tensor-pointer
-/// semantics as before.
+/// the logic.
 /// </para>
 /// </remarks>
 internal static class SafetensorsTensorResolver
@@ -28,15 +26,26 @@ internal static class SafetensorsTensorResolver
     /// <summary>
     /// Resolves a safetensors tensor as a linear projection weight:
     /// HF shape <c>[out_features, in_features]</c> → (ptr, dtype, M, K).
-    /// F32 tensors are zero-copy; BF16 tensors are upcast into an owned
-    /// 64-byte-aligned scratch buffer and registered in
-    /// <paramref name="owned"/>.
+    /// F32, F16 and BF16 tensors borrow their original mapped storage.
+    /// Consumers requiring F32 must use <see cref="ResolveLinearAsF32"/>.
     /// </summary>
     public static unsafe (nint ptr, QuantizationType qt, int m, int k) ResolveLinear(
         ISafetensorsTensorSource file, string name, List<nint> owned)
     {
+        if (file is PackedQuantizedSafetensorsSource packed && packed.TryGetWeight(name, out var projection))
+        {
+            // Metadata only: the large packed tensors and scales remain in the source mappings.
+            var descriptor = (Packed4Weight*)NativeMemory.AlignedAlloc(64, 64);
+            if (descriptor is null) throw new OutOfMemoryException();
+            *descriptor = projection;
+            owned.Add((nint)descriptor);
+            return ((nint)descriptor, projection.Layout, projection.OutputFeatures, projection.InputFeatures);
+        }
         if (!file.TensorsByName.TryGetValue(name, out var desc))
         {
+            if (name.EndsWith(".weight", StringComparison.Ordinal)
+                && file.TensorsByName.ContainsKey(name[..^"weight".Length] + "qweight"))
+                throw new InvalidDataException("Packed AWQ/GPTQ tensors must be opened with ModelLoader.OpenSafetensorsAndConfig so their quantization metadata is validated.");
             // LittleBit factorized composite stored under <module>.U_packed etc. (issue #864).
             if (name.EndsWith(".weight", StringComparison.Ordinal))
             {
@@ -79,12 +88,7 @@ internal static class SafetensorsTensorResolver
                 return (srcPtr, QuantizationType.F32, m, k);
 
             case SafetensorsDType.BF16:
-            {
-                long elementCount = (long)m * k;
-                nint dst = AllocBf16ToF32(srcPtr, elementCount);
-                owned.Add(dst);
-                return (dst, QuantizationType.F32, m, k);
-            }
+                return (srcPtr, QuantizationType.BF16, m, k);
 
             case SafetensorsDType.F16:
             {
@@ -333,6 +337,7 @@ internal static class SafetensorsTensorResolver
 
     public static float[]? ResolveOptionalBias(ISafetensorsTensorSource file, string name, int expectedSize)
     {
+        if (file is PackedQuantizedSafetensorsSource packed && packed.IsZeroBias(name)) return null;
         if (!file.TensorsByName.TryGetValue(name, out var desc)) return null;
 
         long elementCount = desc.ElementCount;
