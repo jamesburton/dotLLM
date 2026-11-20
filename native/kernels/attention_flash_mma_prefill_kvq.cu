@@ -154,6 +154,76 @@ struct PkLoadStaged
     }
 };
 
+// Packed-half2 block decoders for the staged rows (#1923): same blocks and same results as V2LoadQ8 / V2LoadQ4::decode8, in about
+// half the ALU work. An int8 (or nibble - 8) q is exact in F16, and d * q is exact in F32 (an 11-bit by 8-bit product), so the
+// correctly rounded F16 product __float2half(d * (float)q) the eager dequant computes equals one mul.rn.f16x2 of the two halves.
+// q is formed exactly as the F16 0x6400 | byte (= 1024 + byte) minus a constant (sub.rn.f16x2 of integers below 2048 is exact).
+// Explicit .rn PTX keeps the sub and mul from being contracted into an fma.
+__device__ __forceinline__ unsigned pk_hsub2_rn(unsigned a, unsigned b)
+{
+    unsigned r;
+    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+__device__ __forceinline__ unsigned pk_hmul2_rn(unsigned a, unsigned b)
+{
+    unsigned r;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+
+struct PkQ8Fast
+{
+    static constexpr int kBlockBytes = 34;
+    __device__ __forceinline__ static uint4 load8(const void* base, size_t elem)
+    {
+        return decode8<V2GlobalLd>(reinterpret_cast<const uint8_t*>(base) + (elem >> 5) * kBlockBytes, (int)(elem & 31));
+    }
+    template <class Ld>
+    __device__ __forceinline__ static uint4 decode8(const uint8_t* b, const int j)
+    {
+        const unsigned d = Ld::u16(reinterpret_cast<const uint16_t*>(b));
+        const unsigned d2 = d | (d << 16);
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(b + 2 + j);
+        const unsigned w0 = (Ld::u16(p) | (Ld::u16(p + 1) << 16)) ^ 0x80808080u;   // int8 + 128, as unsigned bytes
+        const unsigned w1 = (Ld::u16(p + 2) | (Ld::u16(p + 3) << 16)) ^ 0x80808080u;
+        const unsigned bias = 0x64806480u;                                            // half2(1152, 1152) = 1024 + 128
+        unsigned out[4];
+        out[0] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(w0, 0x64646464u, 0x5140), bias), d2);
+        out[1] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(w0, 0x64646464u, 0x7362), bias), d2);
+        out[2] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(w1, 0x64646464u, 0x5140), bias), d2);
+        out[3] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(w1, 0x64646464u, 0x7362), bias), d2);
+        return make_uint4(out[0], out[1], out[2], out[3]);
+    }
+};
+
+struct PkQ4Fast
+{
+    static constexpr int kBlockBytes = 18;
+    __device__ __forceinline__ static uint4 load8(const void* base, size_t elem)
+    {
+        return decode8<V2GlobalLd>(reinterpret_cast<const uint8_t*>(base) + (elem >> 5) * kBlockBytes, (int)(elem & 31));
+    }
+    template <class Ld>
+    __device__ __forceinline__ static uint4 decode8(const uint8_t* b, const int j)
+    {
+        const unsigned d = Ld::u16(reinterpret_cast<const uint16_t*>(b));
+        const unsigned d2 = d | (d << 16);
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(b + 2 + (j >> 1));
+        const unsigned w = Ld::u16(p) | (Ld::u16(p + 1) << 16);                     // 4 bytes = 8 nibbles
+        const unsigned lo = w & 0x0F0F0F0Fu, hi = (w >> 4) & 0x0F0F0F0Fu;
+        const unsigned u01 = __byte_perm(lo, hi, 0x5140);                             // lo0 hi0 lo1 hi1
+        const unsigned u23 = __byte_perm(lo, hi, 0x7362);                             // lo2 hi2 lo3 hi3
+        const unsigned bias = 0x64086408u;                                            // half2(1032, 1032) = 1024 + 8
+        unsigned out[4];
+        out[0] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(u01, 0x64646464u, 0x5140), bias), d2);
+        out[1] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(u01, 0x64646464u, 0x7362), bias), d2);
+        out[2] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(u23, 0x64646464u, 0x5140), bias), d2);
+        out[3] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(u23, 0x64646464u, 0x7362), bias), d2);
+        return make_uint4(out[0], out[1], out[2], out[3]);
+    }
+};
+
 template <class L> struct PkStagedTraits { static constexpr bool staged = false; };
 template <class L, int HD> struct PkStagedTraits<PkLoadStaged<L, HD>> { static constexpr bool staged = true; };
 
@@ -454,10 +524,27 @@ __device__ __forceinline__ void pk_prefill_body(
     }
 }
 
-using PkStQ8_128 = PkLoadStaged<V2LoadQ8, 128>;
-using PkStQ4_128 = PkLoadStaged<V2LoadQ4, 128>;
-using PkStQ8_64 = PkLoadStaged<V2LoadQ8, 64>;
-using PkStQ4_64 = PkLoadStaged<V2LoadQ4, 64>;
+// Quantized loader variant (#1923 A/B): 0 = synchronous __ldg + V2 decode (pre-#1923), 1 = synchronous __ldg + packed-half2 decode,
+// 2 = raw cp.async staging + packed-half2 decode (PK_STAGED_PV_DECODE picks where the decode runs). All are bit-identical.
+#ifndef PK_KVQ_LOADER
+#define PK_KVQ_LOADER 1
+#endif
+#if PK_KVQ_LOADER == 0
+using PkStQ8_128 = PkLoadQuant<V2LoadQ8>;
+using PkStQ4_128 = PkLoadQuant<V2LoadQ4>;
+using PkStQ8_64 = PkLoadQuant<V2LoadQ8>;
+using PkStQ4_64 = PkLoadQuant<V2LoadQ4>;
+#elif PK_KVQ_LOADER == 1
+using PkStQ8_128 = PkLoadQuant<PkQ8Fast>;
+using PkStQ4_128 = PkLoadQuant<PkQ4Fast>;
+using PkStQ8_64 = PkLoadQuant<PkQ8Fast>;
+using PkStQ4_64 = PkLoadQuant<PkQ4Fast>;
+#else
+using PkStQ8_128 = PkLoadStaged<PkQ8Fast, 128>;
+using PkStQ4_128 = PkLoadStaged<PkQ4Fast, 128>;
+using PkStQ8_64 = PkLoadStaged<PkQ8Fast, 64>;
+using PkStQ4_64 = PkLoadStaged<PkQ4Fast, 64>;
+#endif
 
 #define PK_ENTRY(NAME, HD, KLOAD, VLOAD)                                                          \
 extern "C" __global__ void __launch_bounds__(256) NAME(                                           \
