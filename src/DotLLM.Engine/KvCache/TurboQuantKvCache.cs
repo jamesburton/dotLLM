@@ -130,7 +130,7 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
 
         // Independent K/V rotations (paper-consistent): derive a distinct V seed.
         _codecK = new TurboQuantCodec(headDim, bits, seed, useQjl);
-        _codecV = new TurboQuantCodec(headDim, bits, seed ^ 0xD1B54A32D192ED03UL, useQjl);
+        _codecV = new TurboQuantCodec(headDim, bits, seed ^ TurboQuantCodec.VSeedMask, useQjl);
         _codeBytes = _codecK.CodeBytesPerVector;
 
         _keyCodes = new nint[numLayers];

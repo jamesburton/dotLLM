@@ -13,7 +13,7 @@ namespace DotLLM.Tests.Unit.Engine.KvCache;
 public sealed unsafe class TurboQuantRotationTests
 {
     internal const ulong Seed = 0x7A2B_C0DEUL;
-    internal const ulong VSeedXor = 0xD1B54A32D192ED03UL;
+    internal const ulong VSeedXor = TurboQuantCodec.VSeedMask;
 
     public static TheoryData<int, int, int> Geometries => new()
     {

@@ -208,7 +208,7 @@ public sealed class CudaTurboQuantInPlaceKvCacheContractTests
     private static (float[] centroids, float[] signsK, float[] signsV, float invSqrtD) Constants(int bits, int hd)
     {
         var ck = new TurboQuantCodec(hd, bits, 0x5DEECE66DUL);
-        var cv = new TurboQuantCodec(hd, bits, 0x5DEECE66DUL ^ 0xD1B54A32D192ED03UL);
+        var cv = new TurboQuantCodec(hd, bits, 0x5DEECE66DUL ^ TurboQuantCodec.VSeedMask);
         return (ck.Centroids.ToArray(), ck.RotationSigns.ToArray(), cv.RotationSigns.ToArray(), ck.InvSqrtD);
     }
 

@@ -22,7 +22,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 public sealed unsafe class CudaTurboQuantKvEndToEndTests
 {
     private const ulong Seed = 0xC0FFEE_4B2CUL;
-    private const ulong VSeedXor = 0xD1B54A32D192ED03UL;
+    private const ulong VSeedXor = TurboQuantCodec.VSeedMask;
 
     private readonly ITestOutputHelper _out;
     public CudaTurboQuantKvEndToEndTests(ITestOutputHelper output) => _out = output;

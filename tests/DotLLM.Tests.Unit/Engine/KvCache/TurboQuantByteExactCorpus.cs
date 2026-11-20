@@ -18,7 +18,7 @@ internal static class TurboQuantByteExactCorpus
     public static readonly int[] HeadDims = { 64, 128, 256 };
 
     public const ulong Seed = 0x7B_E5_ACE1UL;
-    public const ulong VSeedXor = 0xD1B54A32D192ED03UL; // TurboQuantKvCache's V-seed derivation
+    public const ulong VSeedXor = TurboQuantCodec.VSeedMask; // TurboQuantKvCache's V-seed derivation
     public const int NumKvHeads = 4;
     public const int SeqLen = 10;                       // 40 vectors per side
 

@@ -108,7 +108,7 @@ public sealed unsafe class TurboQuantInPlaceKvCache : ITurboQuantKvCache
         _stride = numKvHeads * headDim;
         _maxSeqLen = maxSeqLen;
         _codecK = new TurboQuantCodec(headDim, bits, seed);
-        _codecV = new TurboQuantCodec(headDim, bits, seed ^ 0xD1B54A32D192ED03UL);
+        _codecV = new TurboQuantCodec(headDim, bits, seed ^ TurboQuantCodec.VSeedMask);
         _signsK = Cpu.Kernels.TurboQuantRotation.SignsToSbyte(_codecK.RotationSigns);
         _signsV = Cpu.Kernels.TurboQuantRotation.SignsToSbyte(_codecV.RotationSigns);
         _codeBytes = _codecK.CodeBytesPerVector;

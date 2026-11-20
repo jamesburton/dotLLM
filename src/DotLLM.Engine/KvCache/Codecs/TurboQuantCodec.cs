@@ -54,6 +54,12 @@ namespace DotLLM.Engine.KvCache.Codecs;
 /// </remarks>
 public sealed class TurboQuantCodec
 {
+    /// <summary>
+    /// The mask the V side's rotation seed is derived with: <c>seedV = seedK ^ VSeedMask</c>. K and V must rotate with independent
+    /// sign sets (#1892); every TurboQuant cache (CPU scratch and in-place, CUDA, and the oracle test callers) uses this one value.
+    /// </summary>
+    public const ulong VSeedMask = 0xD1B54A32D192ED03UL;
+
     private readonly int _headDim;
     private readonly int _bits;            // total per-coordinate bit budget
     private readonly int _mseBits;         // bits the MSE stage uses (= _bits, or _bits-1 when QJL)
