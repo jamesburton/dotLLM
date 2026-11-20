@@ -423,6 +423,91 @@ public sealed class ChunkStoreServerTests : IDisposable
         Assert.Null(Writer(server).Problem);
     }
 
+    private static string WithAdapter(string body, string adapter)
+    {
+        var o = JsonNode.Parse(body)!.AsObject();
+        o["lora_adapter"] = adapter;
+        return o.ToJsonString();
+    }
+
+    private static string Explain(string body) => new JsonObject { ["request"] = JsonNode.Parse(body) }.ToJsonString();
+
+    private static void RegisterAdapter(ChunkCacheTestServer server, string name)
+    {
+        var registry = new DotLLM.Core.Lora.LoraAdapterRegistry((n, _) => new DotLLM.Core.Lora.LoraAdapter(n, rank: 4, alpha: 8f, targetModules: ["q_proj"]));
+        registry.Load(name, "synthetic");
+        server.State.LoraRegistry = registry;
+    }
+
+    /// <summary>
+    /// Re-review C1: a request naming a per-request LoRA adapter is not served base-model chunks. On the wire: a stored
+    /// chunk the same request hits without the adapter is ignored with <c>chunk_model_unsupported</c> (chat and explain), an
+    /// unknown adapter is a 400 on both routes, and the refusal is per request (the next plain request hits again).
+    /// </summary>
+    [Fact]
+    public async Task PerRequestLoraAdapter_StoredChunkNotRead()
+    {
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(NewRoot()));
+        await server.PostAsync("/v1/chat/completions", Body(Manifest()));
+        await server.PostAsync("/v1/chat/completions", Body(Manifest()));
+        Assert.True(Writer(server).Queue.WaitDrained(Drain));
+        var (_, plain) = await server.PostAsync("/v1/chat/completions", Body(Manifest("shadow")));
+        Assert.Equal(1, Report(plain)["chunks"]!["hit"]!.GetValue<int>()); // control: the base request hits
+        RegisterAdapter(server, "style");
+        const string ExplainRoute = "/v1/chunk-cache/explain";
+
+        var (unknown, _) = await server.PostAsync("/v1/chat/completions", WithAdapter(Body(Manifest("shadow")), "nope"));
+        Assert.Equal(400, unknown); // the field is read from the wire
+        var (unknownExplain, _) = await server.PostAsync(ExplainRoute, Explain(WithAdapter(Body(Manifest("shadow")), "nope")));
+        Assert.Equal(400, unknownExplain);
+
+        var (status, adapted) = await server.PostAsync("/v1/chat/completions", WithAdapter(Body(Manifest("shadow")), "style"));
+        Assert.Equal(200, status);
+        var report = Report(adapted);
+        Assert.Equal(0, report["chunks"]!["hit"]!.GetValue<int>());
+        Assert.Equal(1, report["chunks"]!["ignored"]!.GetValue<int>());
+        Assert.Equal(1, WarningCount(report, ChunkCacheCodes.ModelUnsupported));
+
+        var (es, explained) = await server.PostAsync(ExplainRoute, Explain(WithAdapter(Body(Manifest("shadow")), "style")));
+        Assert.Equal(200, es);
+        var e = JsonNode.Parse(explained)!;
+        Assert.Equal(0, e["counts"]!["hit"]!.GetValue<int>());
+        Assert.Equal(1, e["counts"]!["ignored"]!.GetValue<int>());
+        Assert.Contains(ChunkCacheCodes.ModelUnsupported, e["warnings"]!.AsArray().Select(w => w!.GetValue<string>()));
+        var (_, explainedPlain) = await server.PostAsync(ExplainRoute, Explain(Body(Manifest("shadow"))));
+        Assert.Equal(1, JsonNode.Parse(explainedPlain)!["counts"]!["hit"]!.GetValue<int>()); // control: explain without it hits
+
+        var (_, after) = await server.PostAsync("/v1/chat/completions", Body(Manifest("shadow")));
+        Assert.Equal(1, Report(after)["chunks"]!["hit"]!.GetValue<int>()); // per request: the identity cache is not poisoned
+    }
+
+    /// <summary>
+    /// Re-review C1, write side: requests naming a LoRA adapter record no sighting and queue nothing, also with
+    /// <c>on_miss: "encode"</c>; the next plain request is the chunk's first sighting.
+    /// </summary>
+    [Fact]
+    public async Task PerRequestLoraAdapter_NothingAdmitted()
+    {
+        string root = NewRoot();
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
+        RegisterAdapter(server, "style");
+        foreach (var cc in new[] { Manifest(), Manifest(), Manifest(onMiss: "encode") })
+        {
+            var (status, body) = await server.PostAsync("/v1/chat/completions", WithAdapter(Body(cc), "style"));
+            Assert.Equal(200, status);
+            Assert.Null(WarningCount(Report(body), ChunkCacheCodes.EncodeQueued));
+            Assert.Null(WarningCount(Report(body), ChunkCacheCodes.EncodeSkipped));
+            Assert.Equal(1, WarningCount(Report(body), ChunkCacheCodes.ModelUnsupported));
+        }
+        Assert.Equal(0, Writer(server).Sightings.Count);
+
+        var (_, plain) = await server.PostAsync("/v1/chat/completions", Body(Manifest()));
+        Assert.Equal(1, WarningCount(Report(plain), ChunkCacheCodes.EncodeSkipped)); // seen once: the adapter requests left no sighting
+        Assert.Null(WarningCount(Report(plain), ChunkCacheCodes.EncodeQueued));
+        Assert.True(Writer(server).Queue.WaitDrained(Drain));
+        Assert.Empty(new FileChunkStore(root).Keys());
+    }
+
     /// <summary><c>explain</c> is a dry run: it never records a sighting or queues an encode.</summary>
     [Fact]
     public async Task Explain_NeverAdmits()

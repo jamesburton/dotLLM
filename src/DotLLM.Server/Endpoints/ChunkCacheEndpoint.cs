@@ -100,6 +100,8 @@ public static class ChunkCacheEndpoint
         {
             ServerLog.Info("chunk-cache: no --chunk-cache-api-keys; /v1/chunk-cache/* answers local callers only");
         }
+        if (ChunkCacheRuntime.WeightsChangedReason(state.Options) is { } weights)
+            ServerLog.Info($"chunk-cache: {weights} (not part of the model identity, #1915); every annotation is chunk_model_unsupported");
 
         // --chunk-store-write: become the store's sole writer now, at startup, so a second server on the same root fails
         // before it listens (InvalidServerOptionException), and stop the worker before the model goes away.
@@ -393,9 +395,21 @@ public static class ChunkCacheEndpoint
             return;
         }
 
+        // As the chat route: a named adapter must be loaded (else 400), and a request with one gets no chunk reuse (#1915).
+        DotLLM.Core.Lora.ILoraAdapter? adapter;
+        try
+        {
+            adapter = LoraEndpoints.Resolve(request.LoraAdapter, state);
+        }
+        catch (LoraAdapterNotFoundException ex)
+        {
+            await WriteAsync(context, StatusCodes.Status400BadRequest, ErrorResponse.InvalidRequest(ex.Message, param: "lora_adapter"));
+            return;
+        }
+
         var exchange = ChunkCacheExchange.Begin(parsed, caller)!;
         if (exchange.Prepare(state, rendered.Messages, rendered.Messages.Length - rendered.EngineMessages.Length,
-                rendered.TemplateOptions, rendered.Prompt, promptIds) is { } planError)
+                rendered.TemplateOptions, rendered.Prompt, promptIds, requestAdapter: adapter is not null) is { } planError)
         {
             await WriteChunkErrorAsync(context, planError);
             return;

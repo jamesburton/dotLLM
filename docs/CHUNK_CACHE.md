@@ -213,7 +213,9 @@ request reports `cached_tokens` > 0, and a verified chunk wholly inside that res
   re-rotation does not reproduce, or a model whose identity cannot be computed) every annotation is ignored with
   `chunk_model_unsupported` (strict: 400); `reason` carries it when the requested policy was not `exact` (ruling 41). A server started with `--tensor-overlay` or
   `--ternary-adapter` is unsupported too: the model id covers the base GGUF only, so its K/V must not be stored or looked up
-  under the base key (#1915).
+  under the base key (#1915). A `/v1/chat/completions` (or `explain`) request with `lora_adapter` is refused the same way,
+  per request: its annotations are `chunk_model_unsupported`, nothing is looked up, recorded or queued, and the next request
+  without an adapter is unaffected (#1915 puts adapters into the identity).
   Diffusion models get no report.
 - **Per located span**, in prompt order, at most `MaxPlannedSpans` (1,024) per request:
   1. ids = `ChunkTokenization.Encode(text)` (`EncodeRaw(MarkUntrustedSpecials(text))`, ruling 21);

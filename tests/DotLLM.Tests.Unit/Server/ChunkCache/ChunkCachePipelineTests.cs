@@ -353,6 +353,10 @@ public sealed class ChunkCachePipelineTests : IClassFixture<ChunkCachePipelineTe
             new ServerState { Options = new ServerOptions { Model = "m", TernaryAdapterPaths = ["a.gguf"] }, Model = _fx.Model, Config = _fx.Config, CurrentGguf = _fx.Gguf }), StringComparison.Ordinal);
         Assert.Null(ChunkCacheRuntime.UnsupportedReason(
             new ServerState { Options = new ServerOptions { Model = "m", TernaryAdapterPaths = [] }, Model = _fx.Model, Config = _fx.Config, CurrentGguf = _fx.Gguf }));
+        // The startup log names which one (re-review minor).
+        Assert.Equal("a tensor overlay is attached", ChunkCacheRuntime.WeightsChangedReason(new ServerOptions { Model = "m", TensorOverlayPath = "x.overlay" }));
+        Assert.Equal("a ternary adapter is attached", ChunkCacheRuntime.WeightsChangedReason(new ServerOptions { Model = "m", TernaryAdapterPaths = ["a.gguf"] }));
+        Assert.Null(ChunkCacheRuntime.WeightsChangedReason(new ServerOptions { Model = "m", TernaryAdapterPaths = [] }));
 
         var unsupported = ServerModelIdentity.Unsupported("recurrent or hybrid model");
         foreach (string policy in new[] { "exact", "shadow" })

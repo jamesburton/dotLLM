@@ -283,6 +283,7 @@ public sealed class ChunkStoreServiceTests : IDisposable
     [InlineData("src/CRED~1.CS", false)]  // four characters: not a truncation of credentials*
     [InlineData("CREDEN~1.TXT", true)]    // six characters: may be credentials*
     [InlineData("APPSET~1.JSO", true)]
+    [InlineData("APPSE~1.JSO", false)]    // five characters: the whole base name "appse", not a truncation of appsettings*
     [InlineData("src/PROGRA~1.CS", false)]
     [InlineData("src/environment.json", false)]
     [InlineData("C:secrets.json", true)]

@@ -248,8 +248,17 @@ internal sealed class ChunkCacheRuntime : IDisposable
         // The model id hashes the base GGUF only. A tensor overlay or a ternary adapter changes the weights every forward runs
         // on, so K/V computed here are not the base model's: under the base key they would be wrong hits for a base server,
         // the CLI and applied reuse, and base entries would be wrong hits here. Until the identity covers them (#1915): no chunk reuse.
-        if (state.Options.TensorOverlayPath is not null || state.Options.TernaryAdapterPaths is { Count: > 0 })
+        if (WeightsChangedReason(state.Options) is not null)
             return "tensor overlay or adapter attached (not part of the model identity)";
         return null;
     }
+
+    /// <summary>
+    /// Which server-level option changes the weights the base GGUF's identity hashes (<c>--tensor-overlay</c>, a ternary
+    /// adapter), or null. Per-request LoRA adapters are refused per request (<see cref="ChunkCacheExchange.Prepare"/>).
+    /// </summary>
+    internal static string? WeightsChangedReason(ServerOptions options) =>
+        options.TensorOverlayPath is not null ? "a tensor overlay is attached"
+        : options.TernaryAdapterPaths is { Count: > 0 } ? "a ternary adapter is attached"
+        : null;
 }
