@@ -12,7 +12,7 @@
     <AssemblyName>chunkcache</AssemblyName>
     <RootNamespace>DotLLM.ChunkCache</RootNamespace>
     <ServerGarbageCollection>true</ServerGarbageCollection>
-    <Description>chunkcache (research): build, select, status, evict and compare for dotLLM chunk-level KV reuse over a .NET solution or a source directory.</Description>
+    <Description>chunkcache: command-line tool and stdio MCP server for dotLLM chunk-level KV reuse over a .NET solution or source directory (build, select, status, list, evict, prewarm, explain). Install with: dotnet tool install -g dotllm-chunkcache</Description>
   </PropertyGroup>
 
   <ItemGroup>
