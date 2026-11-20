@@ -15,8 +15,11 @@ public static class TurboQuantNormDecoder
     /// <summary>Upper end of the Log8 grid (code 255).</summary>
     public const float Log8Max = 1e4f;
 
-    private static readonly float Log2Min = MathF.Log2(Log8Min);
-    private static readonly float Log2Span = MathF.Log2(Log8Max) - MathF.Log2(Log8Min);
+    /// <summary>log2 of <see cref="Log8Min"/>; shared by the Log8 encoder and decoder.</summary>
+    public static readonly float Log2Min = MathF.Log2(Log8Min);
+
+    /// <summary>log2(<see cref="Log8Max"/>) - log2(<see cref="Log8Min"/>); shared by the Log8 encoder and decoder.</summary>
+    public static readonly float Log2Span = MathF.Log2(Log8Max) - MathF.Log2(Log8Min);
 
     /// <summary>Decodes the norm stored at the start of <paramref name="src"/> (at least <see cref="TurboQuantLayout.NormBytes"/> bytes).</summary>
     public static float Decode(TqNormFormat f, ReadOnlySpan<byte> src)
@@ -44,11 +47,11 @@ public static class TurboQuantNormDecoder
         }
     }
 
-    /// <summary>Pointer form of <see cref="Decode(TqNormFormat, ReadOnlySpan{byte})"/> for kernels.</summary>
-    public static unsafe float Decode(TqNormFormat f, byte* src)
+    /// <summary>Pointer form of <see cref="Decode(TqNormFormat, ReadOnlySpan{byte})"/> for kernels; <paramref name="normBytes"/> is <see cref="TurboQuantLayout.NormBytes"/>.</summary>
+    public static unsafe float Decode(TqNormFormat f, byte* src, int normBytes)
         => f == TqNormFormat.F16
             ? (float)Unsafe.ReadUnaligned<Half>(src)
-            : Decode(f, new ReadOnlySpan<byte>(src, new TurboQuantLayout(1, 1, 1, f).NormBytes));
+            : Decode(f, new ReadOnlySpan<byte>(src, normBytes));
 
     private static float DecodeFp8(byte code, int manBits, int bias)
     {

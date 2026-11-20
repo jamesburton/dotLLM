@@ -15,8 +15,8 @@ public static class TurboQuantNormCodec
     /// <summary>Upper end of the Log8 grid (code 255).</summary>
     public const float Log8Max = TurboQuantNormDecoder.Log8Max;
 
-    private static readonly float Log2Min = MathF.Log2(Log8Min);
-    private static readonly float Log2Span = MathF.Log2(Log8Max) - MathF.Log2(Log8Min);
+    private static readonly float Log2Min = TurboQuantNormDecoder.Log2Min;
+    private static readonly float Log2Span = TurboQuantNormDecoder.Log2Span;
 
     /// <summary>Bytes per stored norm for <paramref name="f"/>.</summary>
     public static int BytesPerNorm(TqNormFormat f) => new TurboQuantLayout(1, 1, 1, f).NormBytes;

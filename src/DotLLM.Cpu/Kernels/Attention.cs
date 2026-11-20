@@ -1289,7 +1289,7 @@ public static class Attention
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe float* LoadTurboQuantHeadRow(in KvRows rows, byte* src, int row, int kvHeadIdx, int headDim, float* scratch)
     {
-        float norm = TurboQuantNormDecoder.Decode(rows.NormFormat, rows.Norms + (long)row * rows.NormRowBytes + kvHeadIdx * rows.NormBytes);
+        float norm = TurboQuantNormDecoder.Decode(rows.NormFormat, rows.Norms + (long)row * rows.NormRowBytes + kvHeadIdx * rows.NormBytes, rows.NormBytes);
         int bits = rows.Bits;
         uint mask = (1u << bits) - 1u;
         float* centroids = rows.Centroids;
@@ -1391,6 +1391,9 @@ public static class Attention
         var tqCache = kvCache as ITurboQuantKvCache;
         if (tqCache is not null && rowBase != 0)
             throw new ArgumentException("An in-place TurboQuant cache has no compact sliding-window rows.", nameof(kvCache));
+        // The window segment (K1/V1) is built over a null pointer for TurboQuant; that is only sound while it is never read.
+        if (tqCache is not null && (windowLen != 0 || kvCache.WindowCapacity != 0))
+            throw new ArgumentException("An in-place TurboQuant cache has no original-space window (WindowLength and WindowCapacity must be 0).", nameof(kvCache));
         // The centroid table is pinned for the whole call (workers read it through a raw pointer).
         fixed (float* centroids = tqCache is null ? default : tqCache.Centroids)
         {

@@ -114,7 +114,7 @@ public sealed unsafe class TurboQuantInPlaceAttentionTests
         float[]? sinks = sinksOn ? Enumerable.Range(0, numHeads).Select(h => 0.3f * h - 0.2f).ToArray() : null;
         var (got, want) = Run(c, bits, hd, groups, seqQ, sinks, null);
 
-        double tol = 1e-4;  // brief allows 1e-4*sqrt(seqKv*hd) (2-10%); measured error is ~1e-6, so a tight bound is used
+        double tol = 1e-4;  // flat bound, much tighter than the brief's 1e-4*sqrt(seqKv*hd) (2-10%); wrong rotations / norms / offsets miss by O(1)
         Assert.True(RelErr(got, want) <= tol, $"rel err {RelErr(got, want):G4} > {tol:G4}");
     }
 
@@ -183,10 +183,15 @@ public sealed unsafe class TurboQuantInPlaceAttentionTests
         Assert.True(RelErr(gotB, wantB) <= 1e-3);
     }
 
+    // Guards CLAUDE.md rule 2 (no decoded history). Two probes, because a managed-only probe is blind to a NativeMemory scratch:
+    //  - managed bytes allocated on this thread during the call;
+    //  - peak private (committed) process memory during the call, sampled from a second thread. Other tests run in parallel and can
+    //    add noise, so up to 3 attempts are made: a real full-history decode (>= rows*hd*4 / 2 bytes, committed for the whole decode)
+    //    exceeds the bound on every attempt, noise does not.
     [Fact]
     public void HistoryIsNeverDecodedWhole()
     {
-        const int hd = 128, numKvHeads = 2, numHeads = 4, rows = 4096, bits = 4;
+        const int hd = 128, numKvHeads = 2, numHeads = 4, rows = 16384, bits = 4;
         int kvStride = numKvHeads * hd;
         using var cache = new TurboQuantInPlaceKvCache(1, numKvHeads, hd, rows, bits, Seed);
         var rng = new Random(5);
@@ -195,17 +200,99 @@ public sealed unsafe class TurboQuantInPlaceAttentionTests
         Fill(cache, k, v, 0, kvStride);
         var q = Gauss(rng, numHeads * hd, 1f);
         var o = new float[numHeads * hd];
+        long oneSideDecoded = (long)rows * numKvHeads * hd * 4;   // a decoded K (or V) history, F32
+        long bound = oneSideDecoded / 2;
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        fixed (float* qp = q)
-        fixed (float* op = o)
-            Attention.ExecuteTurboQuant(qp, cache, 0, op, 1, rows, numHeads, numKvHeads, hd, rows - 1, null);
-        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        void Attend()
+        {
+            fixed (float* qp = q)
+            fixed (float* op = o)
+                Attention.ExecuteTurboQuant(qp, cache, 0, op, 1, rows, numHeads, numKvHeads, hd, rows - 1, null);
+        }
 
-        Assert.True(allocated < (long)rows * hd * 4, $"allocated {allocated} bytes during attention");
+        Attend();   // warm up the JIT
+        long bestNativeDelta = long.MaxValue;
+        for (int attempt = 0; attempt < 3 && bestNativeDelta >= bound; attempt++)
+        {
+            GC.Collect();
+            using var proc = System.Diagnostics.Process.GetCurrentProcess();
+            long baseline = Private(proc);
+            long peak = baseline;
+            bool stop = false;
+            var sampler = new Thread(() =>
+            {
+                using var p = System.Diagnostics.Process.GetCurrentProcess();
+                while (!Volatile.Read(ref stop)) { long x = Private(p); if (x > peak) peak = x; }
+            }) { IsBackground = true };
+            sampler.Start();
+            long managedBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int rep = 0; rep < 20; rep++) Attend();
+            long managed = (GC.GetAllocatedBytesForCurrentThread() - managedBefore) / 20;
+            Volatile.Write(ref stop, true);
+            sampler.Join();
+            Assert.True(managed < (long)rows * hd * 4, $"allocated {managed} managed bytes during attention");
+            bestNativeDelta = Math.Min(bestNativeDelta, peak - baseline);
+        }
+        Assert.True(bestNativeDelta < bound, $"peak private memory grew by {bestNativeDelta} bytes during attention (bound {bound})");
+
         // No decoded view exists to hand out, and the cache owns exactly codes + norms.
         Assert.Throws<NotSupportedException>(() => { cache.GetKeysRef(0); });
         Assert.Equal(cache.Layout.CodeBytesPerLayer(rows) * 2 + cache.Layout.NormBytesPerLayer(rows) * 2, cache.AllocatedBytes);
+
+        static long Private(System.Diagnostics.Process p) { p.Refresh(); return p.PrivateMemorySize64; }
+    }
+
+    // A TurboQuant cache must have no window: the kernel builds the window segment over a null pointer.
+    [Fact]
+    public void CacheReportingAWindow_IsRefusedByTheKernel()
+    {
+        using var inner = new TurboQuantInPlaceKvCache(1, 2, 64, 16, 4, Seed);
+        var q = new float[4 * 64];
+        var o = new float[4 * 64];
+        foreach (var (len, cap) in new[] { (1, 0), (0, 8) })
+        {
+            var wrapped = new WindowedLie(inner, len, cap);
+            fixed (float* qp = q)
+            fixed (float* op = o)
+            {
+                float* qq = qp, oo = op;
+                var ex = Assert.Throws<ArgumentException>(() =>
+                    Attention.ExecuteTurboQuant(qq, wrapped, 0, oo, 1, 1, 4, 2, 64, 0, null));
+                Assert.Contains("window", ex.Message);
+            }
+        }
+    }
+
+    /// <summary>Forwards to a real in-place cache but reports a window it does not have.</summary>
+    private sealed class WindowedLie(TurboQuantInPlaceKvCache inner, int windowLength, int windowCapacity) : ITurboQuantKvCache
+    {
+        public TurboQuantLayout Layout => inner.Layout;
+        public nint GetKeyNormsPtr(int layer) => inner.GetKeyNormsPtr(layer);
+        public nint GetValueNormsPtr(int layer) => inner.GetValueNormsPtr(layer);
+        public ReadOnlySpan<float> Centroids => inner.Centroids;
+        public ReadOnlySpan<sbyte> SignsK => inner.SignsK;
+        public ReadOnlySpan<sbyte> SignsV => inner.SignsV;
+        public int QuantizedLength => inner.QuantizedLength;
+        public int WindowLength => windowLength;
+        public int WindowCapacity => windowCapacity;
+        public DotLLM.Core.Configuration.KvCacheDType KeyDType => inner.KeyDType;
+        public DotLLM.Core.Configuration.KvCacheDType ValueDType => inner.ValueDType;
+        public nint GetQuantizedKeysPtr(int layerIndex) => inner.GetQuantizedKeysPtr(layerIndex);
+        public nint GetQuantizedValuesPtr(int layerIndex) => inner.GetQuantizedValuesPtr(layerIndex);
+        public nint GetWindowKeysPtr(int layerIndex) => 0;
+        public nint GetWindowValuesPtr(int layerIndex) => 0;
+        public int KeyQuantizedRowBytes => inner.KeyQuantizedRowBytes;
+        public int ValueQuantizedRowBytes => inner.ValueQuantizedRowBytes;
+        public int CurrentLength => inner.CurrentLength;
+        public int MaxLength => inner.MaxLength;
+        public void Update(ITensor keys, ITensor values, ReadOnlySpan<int> positions, int layerIndex) => inner.Update(keys, values, positions, layerIndex);
+        public ITensor GetKeys(int layerIndex) => inner.GetKeys(layerIndex);
+        public ITensor GetValues(int layerIndex) => inner.GetValues(layerIndex);
+        public void Update(TensorRef keys, TensorRef values, ReadOnlySpan<int> positions, int layerIndex) => inner.Update(keys, values, positions, layerIndex);
+        public TensorRef GetKeysRef(int layerIndex) => inner.GetKeysRef(layerIndex);
+        public TensorRef GetValuesRef(int layerIndex) => inner.GetValuesRef(layerIndex);
+        public void Rollback(int length) => inner.Rollback(length);
+        public void Dispose() { }
     }
 
     [Fact]
