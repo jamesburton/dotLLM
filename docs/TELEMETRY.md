@@ -149,6 +149,8 @@ Name mapping: dots become underscores, a unit suffix is appended unless the name
 | `dotllm_server_ready`, `dotllm_model_info{model=...}` | gauge | none / `model` |
 | `dotllm_moe_*` | counter / gauge | none |
 | `dotllm_chunk_cache_chunks_total`, `dotllm_chunk_cache_tokens_total` | counter | `status` / `kind` (only with `--chunk-cache`, annotated requests; [CHUNK_CACHE.md](CHUNK_CACHE.md)) |
+| `dotllm_chunk_store_writes_total`, `dotllm_chunk_store_evictions_total`, `dotllm_chunk_store_skips_total` | counter | `result` (`stored`, `failed`, `too_large`) / none / `reason` (fixed admission reasons) (only with `--chunk-store-write`; [CHUNK_CACHE.md](CHUNK_CACHE.md#store-writes-the-sole-writer)) |
+| `dotllm_chunk_store_queue_depth` | gauge | none: background encodes queued or running (only with `--chunk-store-write`) |
 
 Both generation paths record the per-request series: `TextGenerator` through `TelemetryRecorder` and the
 continuous-batch scheduler at request completion (`EngineTelemetry.RecordCompletion`).

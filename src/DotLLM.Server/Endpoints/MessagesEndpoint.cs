@@ -184,7 +184,7 @@ public static class MessagesEndpoint
             toolChoice, tools, state.ToolCallParser, ref options, out bool forcedToolCall);
 
         // chunk_cache: locate, verify and look up the annotated spans in the prompt exactly as rendered (read-only).
-        if (chunkCache?.Prepare(state, rendered.Messages, rendered.EngineMessageOffset, rendered.Options, prompt) is { } chunkPlanError)
+        if (chunkCache?.Prepare(state, rendered.Messages, rendered.EngineMessageOffset, rendered.Options, prompt, admit: true) is { } chunkPlanError)
         {
             await WriteErrorAsync(httpContext, chunkPlanError.Status, chunkPlanError.Type, chunkPlanError.Message, chunkPlanError.Code);
             return;

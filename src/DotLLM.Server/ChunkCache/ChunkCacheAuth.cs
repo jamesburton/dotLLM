@@ -32,8 +32,19 @@ internal enum ChunkAuthFailure
 /// <param name="Namespace">The caller's store namespace.</param>
 internal sealed record ChunkCaller(bool Authenticated, string Namespace)
 {
-    /// <summary>A caller whose key is marked <c>admin</c> in the keys file (store-wide figures and operations, later tasks).</summary>
+    /// <summary>
+    /// An admin: a key marked <c>admin</c> in the keys file, or (no keys file) a local caller, the single user of the server.
+    /// Admins see store-wide capabilities figures and may evict <c>orphans</c>, act on another namespace (the evict body's
+    /// <c>namespace</c>) and wipe the whole store (<c>all</c> without a namespace) (Task 16).
+    /// </summary>
     public bool IsAdmin { get; init; }
+
+    /// <summary>
+    /// An admin by an <c>admin</c> key from the keys file (not merely the local user of a keyless server). Store-wide or
+    /// cross-namespace destructive operations (<c>orphans</c>, a store-wide <c>all</c>, another namespace, with
+    /// <c>dry_run: false</c>) need it (controller ruling on the Task 16 review, S2).
+    /// </summary>
+    public bool IsAdminKey { get; init; }
 
     /// <summary>An unauthenticated caller: the default namespace, no store lookups, counts only.</summary>
     public static ChunkCaller Anonymous { get; } = new(false, ChunkNamespace.Default);
@@ -41,7 +52,7 @@ internal sealed record ChunkCaller(bool Authenticated, string Namespace)
     // Never print the namespace (spec §10): it is a digest of a credential.
     private bool PrintMembers(System.Text.StringBuilder builder)
     {
-        builder.Append(System.Globalization.CultureInfo.InvariantCulture, $"Authenticated = {Authenticated}, IsAdmin = {IsAdmin}");
+        builder.Append(System.Globalization.CultureInfo.InvariantCulture, $"Authenticated = {Authenticated}, IsAdmin = {IsAdmin}, IsAdminKey = {IsAdminKey}");
         return true;
     }
 }
@@ -58,13 +69,15 @@ internal sealed record ChunkCaller(bool Authenticated, string Namespace)
 /// <c>401 authentication_error</c>. The caller's namespace is the key's <c>ns=</c> name, else <see cref="ChunkNamespace.ForApiKey"/> of the key.
 /// </para>
 /// <para>
-/// <b>Without keys:</b> local callers only, all in <see cref="ChunkNamespace.Default"/>; anyone else gets
+/// <b>Without keys:</b> local callers only, all in <see cref="ChunkNamespace.Default"/> and admin (a single-user server); anyone else gets
 /// <c>403 permission_error</c>. Local means all of: the connection's remote address is a loopback address (an
 /// IPv4-mapped one too; an unknown address, as on a Unix socket or in-memory host, is not local); the <c>Host</c> header names
 /// <c>localhost</c> or a loopback address (a DNS-rebinding page reaches loopback under its own host name); and no
 /// <c>Origin</c> header (browsers send one on cross-origin requests, and the server's CORS policy allows any origin, so a web
-/// page could otherwise read a local caller's chunk status). Behind a reverse proxy on the same host every caller is local:
-/// configure keys there.
+/// page could otherwise read a local caller's chunk status). Forwarding headers (<c>Forwarded</c>, <c>X-Forwarded-*</c>,
+/// <c>X-Real-IP</c>) are NOT looked at: behind a reverse proxy on the same host every caller is local, and local means
+/// admin here, so configure keys there. The local caller of a keyless server is admin for figures, dry runs and its own
+/// namespace, never for store-wide or cross-namespace deletes (<see cref="ChunkCaller.IsAdminKey"/>).
 /// </para>
 /// <para>
 /// <b>Inference requests</b> are never refused here (dotLLM inference stays unauthenticated); a caller that would be
@@ -98,7 +111,7 @@ internal static class ChunkCacheAuth
             if (key is not null && keys.TryMatch(key, out bool admin, out string? named))
             {
                 failure = ChunkAuthFailure.None;
-                return new ChunkCaller(true, named ?? ChunkNamespace.ForApiKey(key.Trim(' ', '\t'))) { IsAdmin = admin };
+                return new ChunkCaller(true, named ?? ChunkNamespace.ForApiKey(key.Trim(' ', '\t'))) { IsAdmin = admin, IsAdminKey = admin };
             }
             failure = ChunkAuthFailure.Unauthorized;
             return ChunkCaller.Anonymous;
@@ -106,8 +119,11 @@ internal static class ChunkCacheAuth
 
         if (IsLocal(context))
         {
+            // The single user of a keyless server is its admin for figures, dry runs and its own namespace (Task 14 review,
+            // with the CSRF gates), but never for store-wide or cross-namespace deletes: those need an admin KEY (IsAdminKey;
+            // Task 16 review S2: a same-host reverse proxy makes every caller look local).
             failure = ChunkAuthFailure.None;
-            return new ChunkCaller(true, ChunkNamespace.Default);
+            return new ChunkCaller(true, ChunkNamespace.Default) { IsAdmin = true };
         }
         failure = ChunkAuthFailure.Forbidden;
         return ChunkCaller.Anonymous;

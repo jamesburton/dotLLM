@@ -322,11 +322,10 @@ public sealed class ServerLedgerTests : IDisposable
         ServerLedger ledger = ServerLedger.Load(_root);
         ledger.Record(server, TenantA, null, 1, T0);
         SaveLocked(ledger);
+        // FileShare.None is a sharing-mode lock on Windows and flock(LOCK_EX) on Linux/macOS (.NET's emulation); the ledger
+        // read takes LOCK_SH there, so it is refused on every OS while another handle holds the file exclusively.
         using (new FileStream(LedgerFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-        {
-            if (OperatingSystem.IsWindows()) // POSIX has no mandatory sharing modes
-                Assert.Throws<LedgerUnreadableException>(() => ChunkIndex.StoreWideOrphans(store, _root));
-        }
+            Assert.Throws<LedgerUnreadableException>(() => ChunkIndex.StoreWideOrphans(store, _root));
         Assert.Empty(ChunkIndex.StoreWideOrphans(store, _root));
     }
 
@@ -541,7 +540,8 @@ public sealed class ServerLedgerTests : IDisposable
         ledger.BeforeRename = temp =>
         {
             held = temp;
-            // Hold the temp file open without delete sharing, so the cleanup's delete fails too (on Windows).
+            // Hold the temp file open without delete sharing: on Windows the cleanup's delete fails too; on Linux/macOS unlink
+            // succeeds under an open handle, so the cleanup removes it.
             lockTemp = new FileStream(temp, FileMode.Open, FileAccess.Read, FileShare.Read);
             throw new IOException("original failure");
         };
@@ -549,6 +549,8 @@ public sealed class ServerLedgerTests : IDisposable
         {
             var ex = Assert.Throws<IOException>(() => SaveLocked(ledger));
             Assert.Equal("original failure", ex.Message);
+            Assert.NotNull(held);
+            Assert.Equal(OperatingSystem.IsWindows(), File.Exists(held)); // Windows: the cleanup failed (silently); POSIX: it ran
         }
         finally
         {

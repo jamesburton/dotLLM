@@ -62,7 +62,8 @@ get a 400. Genuinely unknown fields are tolerated too (STJ source-gen skips unma
 declaring these makes the intent explicit and guards against a future strict-DTO pass.
 
 **`chunk_cache`** (chunk-level K/V reuse convention): with `dotllm serve --chunk-cache` (off by default;
-`--chunk-cache-max-chunks`, default 4096, caps annotations per request; `--chunk-store <dir>` names a read-only store) the
+`--chunk-cache-max-chunks`, default 4096, caps annotations per request; `--chunk-store <dir>` names a store, read-only
+unless `--chunk-store-write` makes the server its sole writer with a required `--chunk-store-budget`) the
 annotations are validated and run under `exact` (default) or `shadow`: the output is identical to the unannotated
 request, and the response gains a `chunk_cache` report (blocking response; the finish-reason chunk when streaming) and
 `timings.chunk_n` / `chunk_recomputed_n` (0). `balanced` / `fast` / `auto` are served `exact` with a reason. With the
@@ -71,8 +72,14 @@ addresses a message's string `content` through the manifest; array `content` sta
 server-assigned namespace (its `--chunk-cache-api-keys` key, or the default for a local caller); a caller the chunk-cache
 control plane would refuse is still served, but with no store lookups, and `report: "per_chunk"` adds per-chunk status
 only for an authenticated caller ([Chunk-cache authentication](#chunk-cache-authentication-opt-in)). The control plane,
-`GET /v1/chunk-cache` (capabilities) and `POST /v1/chunk-cache/explain` (dry run), exists only with the flag. See
-[CHUNK_CACHE.md](CHUNK_CACHE.md).
+`GET /v1/chunk-cache` (capabilities), `POST /v1/chunk-cache/explain` (dry run) and (mapped on every `--chunk-cache` server; they act only with `--chunk-store-write` and answer `503` without it)
+`POST /v1/chunk-cache/prewarm` (queue text for a background encode) and `POST /v1/chunk-cache/evict` (orphans, forget a
+path or a namespace; `dry_run` by default; [CHUNK_CACHE.md](CHUNK_CACHE.md#control-plane-prewarm-and-evict-spec-72-10-the-store-tasks)),
+exists only with the flag. With
+`--chunk-store-write`, an authenticated caller's misses are queued for a background encode under the admission rules
+(seen in 2+ requests, not `volatile` / `no_store`, `source.path` not deny-listed, under budget) and the response warns
+`chunk_encode_queued` / `chunk_encode_skipped`; the encode runs only while the server is idle. See
+[CHUNK_CACHE.md](CHUNK_CACHE.md#store-writes-the-sole-writer).
 
 Also accepted (not shown above): `top_k`, `min_p`, `repetition_penalty` — see [SAMPLING.md](SAMPLING.md)
 for the full parameter reference, including the DRY/top-nσ/logit-bias/frequency/presence-penalty
@@ -1330,9 +1337,13 @@ Prompt caching is **enabled by default** in both `chat` and `serve` commands.
 | `--prompt-cache-step-keep` | 8 | Most `--prompt-cache-step` checkpoints kept (deepest first) |
 | `--chunk-cache` | off | Honour `chunk_cache` annotations on `/v1/chat/completions` and `/v1/messages` (chunk-level K/V reuse convention): `exact` (default) and `shadow`, output identical to the unannotated request, plus a `chunk_cache` report and `/metrics` counters (`dotllm_chunk_cache_chunks_total`, `dotllm_chunk_cache_tokens_total`). Off: annotations are ignored like any unknown field ([CHUNK_CACHE.md](CHUNK_CACHE.md)) |
 | `--chunk-cache-max-chunks` | 4096 | Most chunk annotations read per request (1 to 65536); the rest are dropped with `chunk_too_many` without being read |
-| `--chunk-store` | none | With `--chunk-cache` (rejected without it): a chunk store (e.g. from `chunkcache build`) to look annotated chunks up in. Read-only (never written or created); a relative path is resolved at startup; a missing directory is reported as `chunk_store_unavailable` |
+| `--chunk-store` | none | With `--chunk-cache` (rejected without it): a chunk store (e.g. from `chunkcache build`) to look annotated chunks up in. Without `--chunk-store-write` it is read-only (never written or created); with it the server owns and writes it. A relative path is resolved at startup; a missing directory is reported as `chunk_store_unavailable` |
+| `--chunk-store-write` | off | With `--chunk-store`: the server becomes the store's only writer (owns the directory, creating it if missing; a second server on it refuses to start; keeps the server ledger; encodes admitted misses in the background while idle). Needs `--chunk-store-budget` ([CHUNK_CACHE.md](CHUNK_CACHE.md#store-writes-the-sole-writer)) |
+| `--chunk-store-budget` | none | Required with `--chunk-store-write` (rejected without it): the store's byte budget (`20GiB`, `500MB`, bytes; above 0). Over it the server evicts its own least-recently-used entries, never an entry a `chunkcache` index references; when nothing can be freed, encoding stops and responses warn `chunk_store_unavailable` |
+| `--chunk-store-index-only` | off | With `--chunk-store-write`: store only chunks an index file in the store references, so ad-hoc text is never persisted |
+| `--chunk-store-namespace-budget` | off | With `--chunk-store-write` (rejected without it): the most bytes of entries one namespace (API key) may hold (`2GiB`, bytes; above 0, below `--chunk-store-budget`). A cap, not a reservation: budget eviction takes only the writing namespace's own entries, so one tenant's prewarm never evicts another's, and a namespace that finds the store full of others' entries is refused (`namespace_budget_blocked`) until space frees; a startup warning when the caps add up to more than the store budget. Off: one shared LRU |
 | `--chunk-cache-allow-short-keys` | off | With `--chunk-cache-api-keys`: accept keys shorter than 32 characters (a startup warning each) instead of refusing to start |
-| `--chunk-cache-api-keys` | none | With `--chunk-cache` (rejected without it): a file of API keys for the chunk-cache surface (`GET /v1/chunk-cache`, `POST /v1/chunk-cache/explain`), one per line (`<key> [admin] [ns=<namespace>]`, `#` comments), keys of at least 32 characters. Each key gets its own store namespace unless `ns=` names one. Read once at startup (revoke = restart). Without it only local callers may use that surface. **Security-sensitive** opt-in: see [Security](#chunk-cache-authentication-opt-in) and [CHUNK_CACHE.md](CHUNK_CACHE.md#authentication-and-namespaces) |
+| `--chunk-cache-api-keys` | none | With `--chunk-cache` (rejected without it): a file of API keys for the chunk-cache surface (`GET /v1/chunk-cache`, `POST /v1/chunk-cache/explain`, `/prewarm`, `/evict`), one per line (`<key> [admin] [ns=<namespace>]`, `#` comments; `admin` = store-wide figures, orphan eviction, other namespaces), keys of at least 32 characters. Each key gets its own store namespace unless `ns=` names one. Read once at startup (revoke = restart). Without it only local callers may use that surface. **Security-sensitive** opt-in: see [Security](#chunk-cache-authentication-opt-in) and [CHUNK_CACHE.md](CHUNK_CACHE.md#authentication-and-namespaces) |
 
 ### API
 
@@ -1554,8 +1565,8 @@ No built-in auth. For network-exposed deployments, configure your reverse proxy 
 
 ### Chunk-cache authentication (opt-in)
 
-The one exception, and only for the chunk-cache control plane (`GET /v1/chunk-cache`, `POST /v1/chunk-cache/explain`;
-both exist only with `--chunk-cache`): a per-chunk store answer is a membership probe on cached source text, so that
+The one exception, and only for the chunk-cache control plane (`GET /v1/chunk-cache`, `POST /v1/chunk-cache/explain`,
+`POST /v1/chunk-cache/prewarm` and `/evict`; all exist only with `--chunk-cache`, and the last two answer `503` without `--chunk-store-write`): a per-chunk store answer is a membership probe on cached source text, so that
 surface authenticates even though nothing else does. **Security-sensitive; off unless `--chunk-cache` is given.**
 
 - `--chunk-cache-api-keys <file>`: the request must carry a listed key in `X-API-Key` or `Authorization: Bearer`
@@ -1564,7 +1575,17 @@ surface authenticates even though nothing else does. **Security-sensitive; off u
   or named with `ns=`. Keys, their digests and namespaces never appear in responses or logs (namespaces do appear in
   the store's file names). The file is read once: revoking a key needs a restart.
 - Control-plane POSTs must be `application/json` (else 415) and `Sec-Fetch-Site: cross-site` is refused (403), so a web
-  page cannot drive the surface. Explain is capped at 2 concurrent calls (429), 4 MiB bodies (413) and a 10 s body read, taken before a slot (408).
+  page cannot drive the surface (prewarm and evict write the store, so this is their CSRF defence). Explain is capped at
+  2 concurrent calls (429) and 4 MiB bodies (413); prewarm and evict at 2 concurrent calls together and one per caller,
+  prewarm at 256 texts and 4 MiB; every POST body must arrive within 10 s (408) and is read before any slot is taken.
+  Evict is a dry run unless the body says `"dry_run": false`; deleting store-wide (`orphans`, `all`) or in another
+  namespace needs an `admin` key: a server without keys allows its local user dry runs of those and deletes in its own
+  namespace only.
+- **Warning: reverse proxy in front of a keyless server.** A same-host proxy (e.g. nginx's `proxy_pass http://127.0.0.1:...`)
+  makes every caller look local; forwarding headers (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`) are not looked at. A
+  local caller of a keyless server is its admin: it sees store-wide figures, may prewarm, dry-run any eviction and forget
+  the default namespace (store-wide and cross-namespace deletes still need an `admin` key). **Set
+  `--chunk-cache-api-keys` whenever anything but local processes can reach the server.** An opt-in rule that treats a request with forwarding headers as non-local is proposed in #1914.
 - Namespace isolation covers the chunk store only: the prompt (prefix) cache, `cached_tokens` and `/metrics` are shared
   by every caller, as they always were.
 - Without a keys file: local callers only (loopback remote address, a `localhost` / loopback `Host`, no `Origin`

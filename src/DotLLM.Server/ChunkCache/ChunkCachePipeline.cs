@@ -8,7 +8,14 @@ namespace DotLLM.Server.ChunkCache;
 /// <param name="TokenStart">Index of the chunk's first id in the whole-prompt ids.</param>
 /// <param name="TokenCount">Its id count (<c>ChunkTokenization.Encode(text).Length</c>).</param>
 /// <param name="Hit">Whether the store holds an entry under the chunk's key.</param>
-internal readonly record struct PlannedSpan(int TokenStart, int TokenCount, bool Hit);
+internal readonly record struct PlannedSpan(int TokenStart, int TokenCount, bool Hit)
+{
+    /// <summary>The annotation (for admission: its text, <c>volatile</c>, <c>no_store</c>, <c>source.path</c>); null in tests that build spans by hand.</summary>
+    public ChunkSpanRef? Span { get; init; }
+
+    /// <summary>The chunk's store key in the caller's namespace (<see cref="ServerModelIdentity.KeyOf"/>), when computed.</summary>
+    public ChunkKey? Key { get; init; }
+}
 
 /// <summary>
 /// One read annotation's outcome, for per-chunk status (an authenticated caller's <c>report: "per_chunk"</c> and
@@ -55,6 +62,9 @@ internal sealed record ChunkCachePlan(
 {
     /// <summary>Every read annotation's outcome, in document order (see <see cref="SpanStatus"/>).</summary>
     public IReadOnlyList<SpanStatus> Statuses { get; init; } = [];
+
+    /// <summary>Tokens of the misses queued for a background encode by this request (Task 15; <c>tokens.encode_queued</c>).</summary>
+    public int EncodeQueuedTokens { get; init; }
 }
 
 /// <summary>
@@ -276,24 +286,37 @@ internal static class ChunkCachePipeline
                 continue;
             }
 
+            ChunkKey? key = KeyOf(identity, ids, parsed.Namespace);
             bool hit = false;
             if (store is not null || storeUnavailable)
             {
                 lookedUp = true;
-                if (store is not null && !storeUnavailable)
-                    hit = Contains(store, identity, ids, parsed.Namespace);
+                if (store is not null && !storeUnavailable && key is { } k)
+                    hit = Contains(store, k);
             }
-            spans.Add(new PlannedSpan(start, ids.Length, hit));
+            spans.Add(new PlannedSpan(start, ids.Length, hit) { Span = l.Span, Key = key });
             Set(l.Span, new SpanStatus(l.Span.Index, l.Span.Id, hit ? SpanStatus.Hit : SpanStatus.Miss, null, start, ids.Length));
         }
     }
 
-    // A store failure is a miss (spec 5.7), never an exception on the request path.
-    private static bool Contains(IChunkStore store, ServerModelIdentity identity, int[] ids, string ns)
+    private static ChunkKey? KeyOf(ServerModelIdentity identity, int[] ids, string ns)
     {
         try
         {
-            return store.Contains(identity.KeyOf(ids, ns));
+            return identity.KeyOf(ids, ns);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    // A store failure is a miss (spec 5.7), never an exception on the request path.
+    private static bool Contains(IChunkStore store, ChunkKey key)
+    {
+        try
+        {
+            return store.Contains(key);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException)
         {

@@ -192,4 +192,14 @@ public sealed record ChunkCacheWarningDto
     /// <summary>How many.</summary>
     [JsonPropertyName("count")]
     public int Count { get; init; }
+
+    /// <summary>
+    /// A machine-readable cause, for <c>chunk_store_unavailable</c> raised by the store writer (Task 15):
+    /// <c>lock_timeout</c>, <c>budget_exhausted</c>, <c>write_failed</c>, <c>ledger_unreadable</c>, <c>entry_too_large</c>; and
+    /// <c>too_large_for_cpu</c> on <c>chunk_encode_skipped</c> when a chunk was over the CPU encode cap. Omitted otherwise
+    /// (additive: clients ignore unknown keys).
+    /// </summary>
+    [JsonPropertyName("detail")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Detail { get; init; }
 }
