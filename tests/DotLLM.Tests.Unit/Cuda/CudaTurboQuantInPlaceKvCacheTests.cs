@@ -178,7 +178,14 @@ public sealed unsafe class CudaTurboQuantInPlaceKvCacheTests
         Assert.Equal(zero, got);
         Assert.Equal(f.Seq, c.CurrentLength);
         Assert.Equal(TurboQuantLayout.DefaultNorm, c.Layout.Norm);
-        Assert.Equal(CudaTurboQuantInPlaceKvCache.AdmissionBytes(c.Layout, 2, f.Seq), c.AllocatedBytes);
+        // An independent byte formula (not AdmissionBytes): per layer and side, rows*heads*codeUints*4 + 4 guard bytes of codes and
+        // rows*heads*2 F16 norm bytes rounded up to 4; plus the F32 centroids and both sign vectors.
+        long rowsHeads = (long)f.Seq * f.Heads;
+        long codeBytes = rowsHeads * c.CodeUintsPerVec * 4 + 4;
+        long normBytes = (rowsHeads * 2 + 3) / 4 * 4;
+        long independent = 2L * 2 * (codeBytes + normBytes) + 4L * (8 + 2 * 128);
+        Assert.Equal(independent, c.AllocatedBytes);
+        Assert.Equal(independent, CudaTurboQuantInPlaceKvCache.AdmissionBytes(c.Layout, 2, f.Seq));
     }
 
     [SkippableFact]
@@ -199,6 +206,93 @@ public sealed unsafe class CudaTurboQuantInPlaceKvCacheTests
         nint d = Alloc(h.Length * 2L);
         fixed (Half* p = h) CudaDriverApi.cuMemcpyHtoD_v2(d, (nint)p, (nuint)(h.Length * 2)).ThrowOnError();
         return d;
+    }
+
+    /// <summary>An odd rows x heads count makes the F16 norm buffer a non-multiple of 4 bytes; the cache rounds it up (the encode of the
+    /// last vector must still land inside the allocation, and the bytes charged must include the round-up).</summary>
+    [SkippableFact]
+    public void NormBuffer_RoundsUpToFourBytes_WithOddRowCount()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        Skip.If(FindPtxDir() == null, "PTX files not found");
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(FindPtxDir()!);
+        Skip.IfNot(kernels.TurboQuantF16Available, "turboquant f16 kernels not loaded");
+        var corpus = TurboQuantByteExactCorpus.Build(4, 64, halfInputs: true);
+        var ck = corpus.K.Codec; var cv = corpus.V.Codec;
+        const int heads = 1, rows = 3;                         // 3 vectors x 2 B = 6 B of norms: not a multiple of 4
+        using var cache = new CudaTurboQuantInPlaceKvCache(1, heads, 64, rows, ck.MseBits, ck.Centroids, ck.RotationSigns,
+            cv.RotationSigns, ck.InvSqrtD, context: ctx);
+        var layout = cache.Layout;
+        Assert.Equal(6L, layout.NormBytesPerLayer(rows));
+        long codeBytes = (long)rows * heads * layout.CodeUintsPerVec * 4 + 4;
+        long expected = 2L * (codeBytes + 8 /* 6 rounded up to 8 */) + 4L * (16 + 2 * 64);
+        Assert.Equal(expected, cache.AllocatedBytes);
+        Assert.Equal(expected, CudaTurboQuantInPlaceKvCache.AdmissionBytes(layout, 1, rows));
+        Assert.True(CudaTurboQuantInPlaceKvCache.AdmissionBytes(layout, 1, rows) >
+                    2L * (codeBytes + layout.NormBytesPerLayer(rows)) + 4L * (16 + 2 * 64), "the round-up is charged");
+
+        // Encode all three rows (corpus rows 0..2, 64 wide) and read the norm bytes back: the last norm is intact.
+        int n = rows * heads * 64;
+        nint dK = UploadHalf(corpus.K.Data[..n]), dV = UploadHalf(corpus.V.Data[..n]);
+        try
+        {
+            cache.UpdateDevice(dK, dV, new[] { 0, 1, 2 }, rows, 0, stream.Handle, kernels);
+            stream.Synchronize();
+            var norms = new byte[8];
+            cache.DownloadNormBytes(0, false, norms);
+            Assert.Equal(0, norms[6]);                         // the round-up bytes stay zero
+            Assert.Equal(0, norms[7]);
+            Assert.NotEqual(0, norms[4] | norms[5]);           // the third vector's norm was written
+        }
+        finally { Free(dK); Free(dV); }
+    }
+
+    [SkippableFact]
+    public void RollbackAndReset_MoveTheVisibleLength_AndGuardTheirRange()
+    {
+        using var f = Open(bits: 4, headDim: 64);
+        f.EncodeLayer(0);
+        var c = f.Cache;
+        Assert.Equal(f.Seq, c.CurrentLength);
+        c.Rollback(5);
+        Assert.Equal(5, c.CurrentLength);
+        Assert.Throws<ArgumentOutOfRangeException>(() => c.Rollback(6));    // cannot roll forward
+        Assert.Throws<ArgumentOutOfRangeException>(() => c.Rollback(-1));
+        Assert.Equal(5, c.CurrentLength);                                   // a refused rollback changes nothing
+        c.Reset();
+        Assert.Equal(0, c.CurrentLength);
+    }
+
+    [SkippableFact]
+    public void ReEncodeAfterRollback_OverwritesTheTail_AndKeepsTheHead()
+    {
+        using var f = Open(bits: 4, headDim: 64);
+        f.EncodeLayer(0);
+        var c = f.Cache;
+        int words = f.Seq * f.Heads * c.CodeUintsPerVec;
+        var before = new uint[words];
+        c.DownloadCodeUints(0, false, before);
+        c.Rollback(4);
+        f.EncodeLayer(0);                                                   // the same rows again: bytes identical, length restored
+        var after = new uint[words];
+        c.DownloadCodeUints(0, false, after);
+        Assert.Equal(before, after);
+        Assert.Equal(f.Seq, c.CurrentLength);
+    }
+
+    [SkippableFact]
+    public void EmptyUpdate_IsANoOp_AndNonContiguousPositionsAreRefused()
+    {
+        using var f = Open(bits: 4, headDim: 64);
+        var c = f.Cache;
+        c.UpdateDevice(0, 0, ReadOnlySpan<int>.Empty, 0, 0, f.Stream.Handle, f.Kernels);   // used to index positions[0]
+        Assert.Equal(0, c.CurrentLength);
+        Assert.Throws<ArgumentException>(() => c.UpdateDevice(0, 0, new[] { 0 }, 0, 0, f.Stream.Handle, f.Kernels));   // length mismatch
+        Assert.Throws<NotSupportedException>(() => c.UpdateDevice(0, 0, new[] { 0, 2 }, 2, 0, f.Stream.Handle, f.Kernels));
+        Assert.Throws<ArgumentOutOfRangeException>(() => c.UpdateDevice(0, 0, new[] { f.Seq }, 1, 0, f.Stream.Handle, f.Kernels));
+        Assert.Equal(0, c.CurrentLength);
     }
 }
 

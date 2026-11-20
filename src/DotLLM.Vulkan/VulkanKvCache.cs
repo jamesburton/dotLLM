@@ -238,7 +238,8 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         }
         catch
         {
-            Dispose();
+            // A Dispose that itself throws must not mask the allocation failure that got us here.
+            try { Dispose(); } catch { /* best effort: the original exception is the one the caller needs */ }
             throw;
         }
     }

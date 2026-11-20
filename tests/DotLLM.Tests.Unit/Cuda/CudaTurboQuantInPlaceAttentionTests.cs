@@ -505,8 +505,11 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
     private static double MinCos(int bits) => bits switch { 8 => 0.9998, 4 => 0.997, _ => throw new ArgumentOutOfRangeException(nameof(bits)) };
 
     /// <summary>
-    /// Diagnostic, not a gate (#1892 Task 6 fix round): the drift floor between two correct paths, which is why the model-level gate
-    /// excludes tq3. Every variant is teacher-forced on the scratch oracle's greedy tokens.
+    /// Diagnostic, not a gate (#1892 Task 6 fix round): the drift floor between two correct paths. It does not by itself justify
+    /// leaving tq3 out of the model-level gate: that rests on the model (SmolLM-135M is degraded at 3 bits, oracle vs F16 logit cosine
+    /// about 0.79, so the codec dominates the comparison) and on the tq4 and tq8 evidence (the 1-ulp control at tq4 is below the
+    /// in-place-vs-oracle distance, tq8 cosine 0.99994), with tq3 gated strictly at kernel level. The tq3 numbers here are a lower
+    /// bound, not proof of parity. Every variant is teacher-forced on the scratch oracle's greedy tokens.
     /// <list type="bullet">
     /// <item>oracle vs oracle with invSqrtD one F32 ulp up (every encode input moves by about 1 ulp);</item>
     /// <item>in-place vs in-place with the last bit of one F16 key norm flipped (layer 0, position 0, head 0) after prefill;</item>

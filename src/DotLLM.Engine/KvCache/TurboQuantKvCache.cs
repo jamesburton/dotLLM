@@ -85,10 +85,14 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
     public TqNormFormat NormFormat => _normFormat;
 
     /// <summary>Norms that exceeded the format's range and were clamped on store.</summary>
-    public long NormSaturations => _normSaturations;
+    public long NormSaturations => Volatile.Read(ref _normSaturations);
 
-    /// <summary>Non-zero norms that decoded to zero under the storage format.</summary>
-    public long NormUnderflows => _normUnderflows;
+    /// <summary>
+    /// Non-zero norms that decoded to zero under the storage format. This counts a full flush to zero only: a norm that lands in the
+    /// format's subnormal range (F16 below 6.1e-5) decodes non-zero but with fewer significant bits, and is NOT counted here.
+    /// Norms of real activations sit far above that (E17 in docs/PRECISION.md saw none), so a non-zero count is already a finding.
+    /// </summary>
+    public long NormUnderflows => Volatile.Read(ref _normUnderflows);
 
     /// <summary>Total bytes for the permanent compressed store (codes + norms; excludes scratch).</summary>
     public long AllocatedBytes =>
@@ -212,8 +216,8 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
         }
         var dst = new Span<byte>(norms + (long)headIdx * _normBytes, _normBytes);
         TurboQuantNormCodec.Encode(_normFormat, new ReadOnlySpan<float>(in norm), dst, out int sat);
-        _normSaturations += sat;
-        if (norm > 0f && TurboQuantNormCodec.Decode(_normFormat, dst, 0) == 0f) _normUnderflows++;
+        if (sat != 0) Interlocked.Add(ref _normSaturations, sat);   // atomic: Update is public and may run for several layers at once
+        if (norm > 0f && TurboQuantNormCodec.Decode(_normFormat, dst, 0) == 0f) Interlocked.Increment(ref _normUnderflows);
     }
 
     /// <summary>

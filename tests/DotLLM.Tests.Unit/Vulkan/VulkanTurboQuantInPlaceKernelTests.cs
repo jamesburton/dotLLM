@@ -44,7 +44,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
 {
     private const ulong Seed = 0x1892_7C0DEUL;
-    private const ulong VSeedXor = 0xD1B54A32D192ED03UL;   // TurboQuantKvCache's V-seed derivation
+    private const ulong VSeedXor = DotLLM.Engine.KvCache.Codecs.TurboQuantCodec.VSeedMask;   // TurboQuantKvCache's V-seed derivation
 
     private readonly ITestOutputHelper _out;
     public VulkanTurboQuantInPlaceKernelTests(ITestOutputHelper output) => _out = output;

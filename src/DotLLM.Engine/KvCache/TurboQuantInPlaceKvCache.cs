@@ -16,7 +16,7 @@ namespace DotLLM.Engine.KvCache;
 /// <remarks>
 /// Code layout per layer and side: <c>[position, kvHead, CodeUintsPerVec]</c> 32-bit words, each vector padded to a whole word
 /// (not tight across vectors) with one trailing guard word. Norms: <c>[position, kvHead]</c> in the layout's norm format.
-/// K and V use independent rotations (V seed = <c>seed ^ 0xD1B54A32D192ED03</c>), identical to <see cref="TurboQuantKvCache"/>.
+/// K and V use independent rotations (V seed = <c>seed ^ <see cref="TurboQuantCodec.VSeedMask"/></c>), identical to <see cref="TurboQuantKvCache"/>.
 /// </remarks>
 public sealed unsafe class TurboQuantInPlaceKvCache : ITurboQuantKvCache
 {
@@ -78,7 +78,7 @@ public sealed unsafe class TurboQuantInPlaceKvCache : ITurboQuantKvCache
     public int ValueQuantizedRowBytes => _layout.NumKvHeads * _vecBytes;
 
     /// <summary>Norms that exceeded the format's range and were clamped on store.</summary>
-    public long NormSaturations => _normSaturations;
+    public long NormSaturations => Volatile.Read(ref _normSaturations);
 
     /// <summary>Total bytes of the permanent store (codes + guard words + norms, K and V, all layers); there is no scratch.</summary>
     public long AllocatedBytes =>
@@ -90,7 +90,7 @@ public sealed unsafe class TurboQuantInPlaceKvCache : ITurboQuantKvCache
     /// <param name="headDim">Head dimension (power of two, at most 256).</param>
     /// <param name="maxSeqLen">Max cached positions.</param>
     /// <param name="bits">Bits per coordinate (1-8).</param>
-    /// <param name="seed">Rotation seed (K); V derives <c>seed ^ 0xD1B54A32D192ED03</c>, as in <see cref="TurboQuantKvCache"/>.</param>
+    /// <param name="seed">Rotation seed (K); V derives <c>seed ^ <see cref="TurboQuantCodec.VSeedMask"/></c>, as in <see cref="TurboQuantKvCache"/>.</param>
     /// <param name="normFormat">Norm storage format (default <see cref="TurboQuantLayout.DefaultNorm"/>).</param>
     /// <param name="window">Must be 0: there is no original-space window with TurboQuant.</param>
     public TurboQuantInPlaceKvCache(int numLayers, int numKvHeads, int headDim, int maxSeqLen, int bits, ulong seed,
@@ -196,7 +196,7 @@ public sealed unsafe class TurboQuantInPlaceKvCache : ITurboQuantKvCache
         dst.Clear();                                  // the vector's padding bytes stay zero
         float norm = codec.Encode(vec, dst[.._codeBytes]);
         TurboQuantNormCodec.Encode(_layout.Norm, new ReadOnlySpan<float>(in norm), new Span<byte>(normDst, _layout.NormBytes), out int sat);
-        _normSaturations += sat;
+        if (sat != 0) Interlocked.Add(ref _normSaturations, sat);   // atomic, so concurrent Updates (separate layers) cannot lose a count; free when nothing saturates
     }
 
     /// <inheritdoc/>

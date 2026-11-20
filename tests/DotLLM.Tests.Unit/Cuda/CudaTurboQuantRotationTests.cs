@@ -180,4 +180,60 @@ public sealed unsafe class CudaTurboQuantRotationTests
         }
         finally { Free(dO); Free(dSign); Free(dRows); }
     }
+
+    // CheckTqRotate: the kernels serve a power-of-two head dim up to 256 (one thread per coordinate, 256 threads). 96 is not a power of
+    // two and 512 is above the block width; both must throw before any launch (the device pointers are never touched).
+    [SkippableTheory]
+    [InlineData(96)]
+    [InlineData(512)]
+    [InlineData(0)]
+    public void UnsupportedHeadDim_IsRejectedBeforeLaunch(int headDim)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        using var ctx = CudaContext.Create(0);
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.TqRotateAvailable && kernels.TqRotateOF16Available, "turboquant_rotate.ptx not present/loaded");
+
+        Assert.Throws<ArgumentException>(() => kernels.LaunchTqRotateQ(0, 2, 3, headDim, 0, 0));
+        Assert.Throws<ArgumentException>(() => kernels.LaunchTqRotateO(0, 2, 3, headDim, 0, 0));
+        Assert.Throws<ArgumentException>(() => kernels.LaunchTqRotateOF16(0, 2, 3, headDim, 0, 0));
+        Assert.Throws<ArgumentException>(() => kernels.LaunchTqRotateQDyn(0, 0, 2, 3, headDim, 0, 0));
+        Assert.Throws<ArgumentException>(() => kernels.LaunchTqRotateODyn(0, 0, 2, 3, headDim, 0, 0));
+    }
+
+    // The Dyn clamp, documented on LaunchTqRotateQDyn: a live row count above maxRows leaves the rows past maxRows unrotated.
+    [SkippableFact]
+    public void DynLiveCountAboveMaxRows_IsClampedToMaxRows()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.TqRotateAvailable, "turboquant_rotate.ptx not present/loaded");
+
+        const int headDim = 64, numHeads = 2, maxRows = 2, liveRows = 4;
+        var codecK = new TurboQuantCodec(headDim, 4, TurboQuantRotationTests.Seed);
+        float[] signs = codecK.RotationSigns.ToArray();
+        int n = liveRows * numHeads * headDim;
+        var q = new Half[n];
+        for (int i = 0; i < n; i++) q[i] = (Half)(1f + (i % 7));
+        nint dQ = Alloc((long)n * 2), dS = Alloc(signs.Length * 4), dR = Alloc(4);
+        try
+        {
+            Up(dQ, q); Up(dS, signs); Up(dR, new[] { liveRows });
+            kernels.LaunchTqRotateQDyn(dQ, dR, maxRows, numHeads, headDim, dS, stream.Handle);
+            stream.Synchronize();
+            var got = new Half[n];
+            Down(got, dQ);
+            int rowLen = numHeads * headDim;
+            Assert.NotEqual(q[0], got[0]);                                            // row 0 rotated
+            Assert.NotEqual(q[(maxRows - 1) * rowLen], got[(maxRows - 1) * rowLen]);  // last row inside the clamp rotated
+            for (int i = maxRows * rowLen; i < n; i++) Assert.Equal(q[i], got[i]);    // rows past maxRows untouched
+        }
+        finally { Free(dQ); Free(dS); Free(dR); }
+    }
 }

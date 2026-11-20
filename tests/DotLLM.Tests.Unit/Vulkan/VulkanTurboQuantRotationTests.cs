@@ -83,4 +83,19 @@ public sealed class VulkanTurboQuantRotationTests
         }
         _output.WriteLine($"maxAbsDiff={max:E3}");
     }
+
+    // Record: a power-of-two head dim up to TqRotateKernel.MaxHeadDim (256). 96 and 512 must throw before anything is recorded.
+    [SkippableTheory]
+    [InlineData(96)]
+    [InlineData(512)]
+    public void UnsupportedHeadDim_IsRejected(int headDim)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var kernel = TqRotateKernel.Create(device, spvDir);
+        using var data = device.Allocate((long)2 * 3 * headDim * sizeof(float));
+        using var signs = device.Allocate((long)headDim * sizeof(float));
+        Assert.Throws<ArgumentException>(() => kernel.LaunchQuery(data, 2, 3, headDim, signs));
+        Assert.Throws<ArgumentException>(() => kernel.LaunchOutput(data, 2, 3, headDim, signs));
+    }
 }

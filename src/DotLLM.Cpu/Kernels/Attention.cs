@@ -1606,8 +1606,12 @@ public static class Attention
         public bool OneShot;
     }
 
-    /// <summary>Test hook (#1892): floats of per-worker row scratch the tiled kernel last requested. Must equal <c>headDim</c> and never scale with the cached length.</summary>
-    internal static int RowScratchFloatsObserved;
+    /// <summary>
+    /// Test hook (#1892): when a test installs a box here, the tiled kernel stores the floats of per-worker row scratch it requested
+    /// (must equal <c>headDim</c> and never scale with the cached length). Null in production, so the hook costs one static read and a
+    /// null check per worker invocation and never writes shared state (the zero-overhead-hook rule).
+    /// </summary>
+    internal static System.Runtime.CompilerServices.StrongBox<int>? RowScratchObserver;
 
     /// <summary>Query heads sharing one KV head that are processed together, so each cached row is decoded once for all of them.</summary>
     private const int MaxGroupHeads = 4;
@@ -1625,7 +1629,7 @@ public static class Attention
         float* scores = stackalloc float[MaxGroupHeads * scoreStride];
         int rowScratchFloats = ctx.HeadDim;   // one head vector: the only buffer a quantized / TurboQuant row is decoded into
         float* rowScratch = stackalloc float[rowScratchFloats];
-        RowScratchFloatsObserved = rowScratchFloats;
+        if (RowScratchObserver is { } rowScratchObserver) rowScratchObserver.Value = rowScratchFloats;
 
         for (int h = startHead; h < endHead;)
         {

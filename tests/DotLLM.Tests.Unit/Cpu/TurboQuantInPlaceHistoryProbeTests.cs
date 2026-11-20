@@ -42,16 +42,22 @@ public sealed unsafe class TurboQuantInPlaceHistoryProbeTests
     public void RowScratch_IsOneHeadVector_AndDoesNotScaleWithHistory()
     {
         var observed = new List<int>();
-        foreach (int rows in new[] { 16, 4096 })
+        var box = new System.Runtime.CompilerServices.StrongBox<int>(-1);
+        Attention.RowScratchObserver = box;
+        try
         {
-            var (cache, q) = Build(rows);
-            using (cache)
+            foreach (int rows in new[] { 16, 4096 })
             {
-                Attention.RowScratchFloatsObserved = -1;
-                Attend(cache, q, new float[NumHeads * Hd], rows);
-                observed.Add(Attention.RowScratchFloatsObserved);
+                var (cache, q) = Build(rows);
+                using (cache)
+                {
+                    box.Value = -1;
+                    Attend(cache, q, new float[NumHeads * Hd], rows);
+                    observed.Add(box.Value);
+                }
             }
         }
+        finally { Attention.RowScratchObserver = null; }
         Assert.Equal(new[] { Hd, Hd }, observed);
     }
 

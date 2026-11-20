@@ -140,4 +140,24 @@ public sealed unsafe class TurboQuantRotationTests
             Assert.True(MathF.Abs(expected[i] - got[i]) <= 1e-5f * MathF.Max(1f, MathF.Abs(expected[i])),
                 $"i={i}: codec={expected[i]} kernel={got[i]}");
     }
+
+    // Head dims the rotation kernels cannot serve are rejected loudly, never rotated with a wrong butterfly (#1897 keeps them refused above).
+    [Theory]
+    [InlineData(96)]
+    [InlineData(100)]
+    public void NonPowerOfTwoHeadDim_IsRejected(int headDim)
+    {
+        var signs = new sbyte[headDim];
+        Array.Fill(signs, (sbyte)1);
+        var data = new float[2 * 3 * headDim];
+        Assert.Throws<ArgumentException>(() => { fixed (float* p = data) TurboQuantRotation.RotateQueryInPlace(p, 2, 3, headDim, signs); });
+        Assert.Throws<ArgumentException>(() => { fixed (float* p = data) TurboQuantRotation.RotateOutputInPlace(p, 2, 3, headDim, signs); });
+    }
+
+    [Fact]
+    public void SignsLengthMismatch_IsRejected()
+    {
+        var data = new float[2 * 3 * 64];
+        Assert.Throws<ArgumentException>(() => { fixed (float* p = data) TurboQuantRotation.RotateQueryInPlace(p, 2, 3, 64, new sbyte[32]); });
+    }
 }

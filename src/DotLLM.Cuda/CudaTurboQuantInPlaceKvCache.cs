@@ -213,6 +213,8 @@ public sealed class CudaTurboQuantInPlaceKvCache : IKvCache, IPerLayerKvCache
     public void UpdateDevice(nint keysDevice, nint valuesDevice, ReadOnlySpan<int> positions, int seqLen,
                              int layerIndex, nint stream, CudaKernels kernels)
     {
+        if (positions.Length != seqLen) throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
+        if (seqLen == 0) return;                      // nothing to encode (a zero-row grid is an invalid launch); CurrentLength is unchanged
         int startPos = ValidateContiguous(positions, seqLen);
         int levelCount = 1 << _layout.MseBits;
         kernels.LaunchTurboQuantEncodeF16(keysDevice, _centroids, _signsK, _keyCodes[layerIndex], _keyNorms[layerIndex],

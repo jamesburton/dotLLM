@@ -11,7 +11,7 @@ namespace DotLLM.Cpu.Kernels;
 /// <c>o = S_v ⊙ H(ã)/√d</c>.</description></item>
 /// </list>
 /// Both wrap <see cref="Hadamard"/> with <c>blockSize = headDim</c> (one block per head vector). The K side uses the codec seed
-/// and the V side <c>seed ^ 0xD1B54A32D192ED03</c> (see <c>TurboQuantKvCache</c>): pass the matching signs.
+/// and the V side the codec's V seed (<c>seed ^ TurboQuantCodec.VSeedMask</c>; see <c>TurboQuantKvCache</c>): pass the matching signs.
 /// </summary>
 public static unsafe class TurboQuantRotation
 {

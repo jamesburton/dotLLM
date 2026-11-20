@@ -7,7 +7,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// (<c>tq_rotate_q.spv</c>: <c>q~ = H(S_k·q)/√d</c>) and the accumulated output back OUT of V code space
 /// (<c>tq_rotate_o.spv</c>: <c>o = S_v·H(a~)/√d</c>). Both are in place on an F32 <c>[rows, numHeads, headDim]</c> buffer, one
 /// workgroup per (row, head) with the butterfly in shared memory (the <c>turboquant_dequant_f32.comp</c> pattern). The sign
-/// buffer is the codec's F32 ±1 vector (K seed for the query, <c>seed ^ 0xD1B54A32D192ED03</c> for the output), uploaded once with
+/// buffer is the codec's F32 ±1 vector (K seed for the query, <c>seed ^ TurboQuantCodec.VSeedMask</c> for the output), uploaded once with
 /// the cache. <b>headDim a power of two ≤ 256.</b>
 /// </summary>
 public sealed class TqRotateKernel : IDisposable

@@ -7371,6 +7371,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <summary>
     /// CUDA-graph-capture-safe twin of <see cref="LaunchTqRotateQ"/>: the live row count is read from the device int at
     /// <paramref name="rowsPtr"/>; the grid covers <paramref name="maxRows"/> (the capture-time maximum) and surplus blocks exit.
+    /// <para>The live count is effectively clamped to <paramref name="maxRows"/>: the grid cannot grow, so a device-side count above it
+    /// leaves the rows past <paramref name="maxRows"/> unrotated, silently. The caller must pass a <paramref name="maxRows"/> at least as
+    /// large as any live count it will ever store.</para>
     /// </summary>
     public unsafe void LaunchTqRotateQDyn(nint qF16, nint rowsPtr, int maxRows, int numHeads, int headDim, nint signsK, nint stream)
     {
@@ -7423,7 +7426,10 @@ public sealed unsafe partial class CudaKernels : IDisposable
                 (uint)(rows * numHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
     }
 
-    /// <summary>CUDA-graph-capture-safe twin of <see cref="LaunchTqRotateO"/> (row count read from a device pointer).</summary>
+    /// <summary>
+    /// CUDA-graph-capture-safe twin of <see cref="LaunchTqRotateO"/> (row count read from a device pointer). As for
+    /// <see cref="LaunchTqRotateQDyn"/>, a live count above <paramref name="maxRows"/> is clamped to it, leaving later rows unrotated.
+    /// </summary>
     public unsafe void LaunchTqRotateODyn(nint oF32, nint rowsPtr, int maxRows, int numHeads, int headDim, nint signsV, nint stream)
     {
         if (_tqRotateOF32DynFunc == 0)
