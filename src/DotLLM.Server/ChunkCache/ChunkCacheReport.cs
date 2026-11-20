@@ -123,7 +123,7 @@ internal static class ChunkCacheReport
                 ChunkReused = 0,
                 ChunkRecomputed = 0,
                 Prefilled = prefilled,
-                EncodeQueued = 0,
+                EncodeQueued = plan.EncodeQueuedTokens,
             },
             Plan = planDto,
             TimingsMs = new ChunkCacheTimingsDto
@@ -134,7 +134,7 @@ internal static class ChunkCacheReport
                 Prefill = Ms(prefillMs),
                 FullPrefillEstimate = fullEstimate,
             },
-            Warnings = plan.Warnings.Select(w => new ChunkCacheWarningDto { Code = w.Code, Count = w.Count }).ToArray(),
+            Warnings = plan.Warnings.Select(w => new ChunkCacheWarningDto { Code = w.Code, Count = w.Count, Detail = w.Detail }).ToArray(),
         };
     }
 
