@@ -208,9 +208,11 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
             nint dQ = Upload(q), dK = Upload(k), dV = Upload(v);
             try
             {
-                foreach (bool p32 in new[] { false, true })
+                foreach (int arm in new[] { 0, 1, 2 })   // F16 partials, F32 control, F16 partials at 2 blocks/SM (E4 a)
                 {
+                    bool p32 = arm == 1;
                     CudaKernels.DenseDecodeV2F32Partials = p32;
+                    CudaKernels.DenseDecodeV2Lb2 = arm == 2;
                     Skip.IfNot(rig!.Kernels.HasAttentionMmaDecodeDense(hd, F16, F16), "dense v2 kernel not loaded (stale PTX)");
                     var o = RunDense(rig, dQ, dK, dV, F16, F16, seqKv, numHeads, numKvHeads, hd, forcedSplit, out int split);
                     double maxErr = 0, maxRel = 0;
@@ -223,7 +225,7 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                         Assert.True(e <= 1e-3 + 2e-3 * Math.Abs(r[i]),
                             $"p32={p32} split={split} elem {i}: {H(o[i])} vs {r[i]} ({numHeads}/{numKvHeads}/{hd} seqKv={seqKv})");
                     }
-                    _out.WriteLine($"{numHeads}/{numKvHeads}/hd{hd} seqKv={seqKv,6} split={split} p32={p32}: max|err|={maxErr:E2} maxRel={maxRel:E2}");
+                    _out.WriteLine($"{numHeads}/{numKvHeads}/hd{hd} seqKv={seqKv,6} split={split} arm={arm}: max|err|={maxErr:E2} maxRel={maxRel:E2}");
                 }
             }
             finally
@@ -231,7 +233,7 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                 CudaDriverApi.cuMemFree_v2(dQ); CudaDriverApi.cuMemFree_v2(dK); CudaDriverApi.cuMemFree_v2(dV);
             }
         }
-        finally { CudaKernels.DenseDecodeV2F32Partials = prev; }
+        finally { CudaKernels.DenseDecodeV2F32Partials = prev; CudaKernels.DenseDecodeV2Lb2 = false; }
     }
 
     /// <summary>
@@ -496,7 +498,7 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                         }
                         try
                         {
-                            foreach (string arm in new[] { "scalar", "v2-f16p", "v2-f32p" })
+                            foreach (string arm in new[] { "scalar", "v2-f16p", "v2-f32p", "v2-lb2" })
                             {
                                 int sp = 0;
                                 Action launch;
@@ -510,6 +512,7 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                                 else
                                 {
                                     CudaKernels.DenseDecodeV2F32Partials = arm == "v2-f32p";
+                                    CudaKernels.DenseDecodeV2Lb2 = arm == "v2-lb2";
                                     if (!rig!.Kernels.HasAttentionMmaDecodeDense(hd, kd, kd)) continue;
                                     sp = CudaKernels.ComputeAttentionMmaV2KvSplit(seqKv, rig.Kernels.MaxSafeAttentionMmaDecodeDense(nkv, hd, kd, kd));
                                     int spc = sp;
@@ -535,7 +538,7 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                 finally { foreach (var p in new[] { dQ, dOut, dPm, dPs, dPo }) CudaDriverApi.cuMemFree_v2(p); }
             }
         }
-        finally { CudaKernels.DenseDecodeV2F32Partials = prev; }
+        finally { CudaKernels.DenseDecodeV2F32Partials = prev; CudaKernels.DenseDecodeV2Lb2 = false; }
         _out.WriteLine(sb.ToString());
         string? outFile = Environment.GetEnvironmentVariable("DOTLLM_ATTN_MICROBENCH_OUT");
         if (!string.IsNullOrEmpty(outFile)) File.AppendAllText(outFile, sb.ToString());

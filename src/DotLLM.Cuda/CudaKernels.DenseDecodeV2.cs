@@ -15,9 +15,11 @@ public sealed unsafe partial class CudaKernels
     public const int AttentionMmaDecodeDenseMaxSplit = 64;
 
     private CudaModule? _denseDecodeV2Module;
-    // [hdIdx (0 = hd64, 1 = hd128)][fmt (0 f16, 1 q8q8, 2 q4q4, 3 q8q4, 4 q4q8)][partial (0 = F16, 1 = F32 control)]
-    private readonly nint[] _denseDecodeV2Funcs = new nint[2 * 5 * 2];
-    private readonly int[] _denseDecodeV2MaxGrid = Enumerable.Repeat(-1, 2 * 5 * 2).ToArray();
+    // [hdIdx (0 = hd64, 1 = hd128)][fmt (0 f16, 1 q8q8, 2 q4q4, 3 q8q4, 4 q4q8)][variant (0 = F16 partials, 1 = F32 control,
+    // 2 = F16 partials at 2 blocks/SM, E4 arm (a), hd128 f16/q8q8/q4q4 only)]
+    private const int DenseVariants = 3;
+    private readonly nint[] _denseDecodeV2Funcs = new nint[2 * 5 * DenseVariants];
+    private readonly int[] _denseDecodeV2MaxGrid = Enumerable.Repeat(-1, 2 * 5 * DenseVariants).ToArray();
     // [hdIdx (0 = hd64, 1 = hd128, 2 = hd256)][partial]; hd64/hd256 have no F32-control entry (0).
     private readonly nint[] _denseDecodeV2TqFuncs = new nint[3 * 2];
     private readonly int[] _denseDecodeV2TqMaxGrid = Enumerable.Repeat(-1, 3 * 2).ToArray();
@@ -29,6 +31,12 @@ public sealed unsafe partial class CudaKernels
     /// </summary>
     public static bool DenseDecodeV2F32Partials =
         Environment.GetEnvironmentVariable("DOTLLM_CUDA_DENSE_DECODE_V2_P32") == "1";
+
+    /// <summary>
+    /// Issue #1922 E4 arm (a), experimental: the hd128 entries compiled at 2 blocks per SM (<c>DOTLLM_CUDA_DENSE_DECODE_V2_LB2=1</c>).
+    /// Only with F16 partials; formats without an <c>_lb2</c> entry keep the default. Mutable for in-process A/B.
+    /// </summary>
+    public static bool DenseDecodeV2Lb2 = Environment.GetEnvironmentVariable("DOTLLM_CUDA_DENSE_DECODE_V2_LB2") == "1";
 
     /// <summary>Launch counter for the dense v2 decode kernels (all formats), so tests can prove the path ran.</summary>
     internal static long AttentionMmaDecodeDenseLaunches;
@@ -46,8 +54,9 @@ public sealed unsafe partial class CudaKernels
                 for (int f = 0; f < 5; f++)
                 {
                     string n = $"attention_mma_decode_v2_hd{hds[h]}_{fmts[f]}";
-                    _denseDecodeV2Funcs[(h * 5 + f) * 2 + 0] = m.TryGetFunction(n);
-                    _denseDecodeV2Funcs[(h * 5 + f) * 2 + 1] = m.TryGetFunction(n + "_p32");
+                    _denseDecodeV2Funcs[(h * 5 + f) * DenseVariants + 0] = m.TryGetFunction(n);
+                    _denseDecodeV2Funcs[(h * 5 + f) * DenseVariants + 1] = m.TryGetFunction(n + "_p32");
+                    _denseDecodeV2Funcs[(h * 5 + f) * DenseVariants + 2] = m.TryGetFunction(n + "_lb2");
                 }
             int[] tqHds = { 64, 128, 256 };
             for (int h = 0; h < 3; h++)
@@ -77,7 +86,10 @@ public sealed unsafe partial class CudaKernels
     {
         int h = headDim == 64 ? 0 : headDim == 128 ? 1 : -1;
         int f = DenseFmtIndex(k, v);
-        return h < 0 || f < 0 ? -1 : (h * 5 + f) * 2 + (f32Partials ? 1 : 0);
+        if (h < 0 || f < 0) return -1;
+        int b = (h * 5 + f) * DenseVariants;
+        if (f32Partials) return b + 1;
+        return DenseDecodeV2Lb2 && _denseDecodeV2Funcs[b + 2] != 0 ? b + 2 : b;
     }
 
     /// <summary>

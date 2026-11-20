@@ -44,6 +44,24 @@ DV2_ENTRY(attention_mma_decode_v2_hd##HD##_q4q8_p32, HD, DLoadQ4,  DLoadQ8,  flo
 DV2_ENTRIES(64)
 DV2_ENTRIES(128)
 
+// E4 arm (a), experimental: hd128 at 2 blocks per SM (__launch_bounds__(256, 2) caps registers at 128 per thread), so twice
+// the co-resident blocks and a larger kvSplit. Selected by DOTLLM_CUDA_DENSE_DECODE_V2_LB2=1; not a default.
+#define DV2_ENTRY_LB2(NAME, HD, KLT, VLT, PT)                                                          \
+extern "C" __global__ void __launch_bounds__(V2_WARPS * 32, 2) NAME(                                   \
+    const half* __restrict__ q, const void* __restrict__ k, const void* __restrict__ v,               \
+    half* __restrict__ output, const int seq_kv, const int num_heads, const int num_kv_heads,         \
+    const float scale, const int kv_split, float* __restrict__ partial_max,                           \
+    float* __restrict__ partial_sum, PT* __restrict__ partial_out)                                    \
+{                                                                                                     \
+    const KLT kl = { k };                                                                             \
+    const VLT vl = { v };                                                                             \
+    attn_decode_v2_dense_body<HD, KLT, VLT, PT>(q, kl, vl, output, seq_kv, num_heads, num_kv_heads,   \
+        scale, kv_split, partial_max, partial_sum, partial_out);                                      \
+}
+DV2_ENTRY_LB2(attention_mma_decode_v2_hd128_f16_lb2,  128, DLoadF16, DLoadF16, __half)
+DV2_ENTRY_LB2(attention_mma_decode_v2_hd128_q8q8_lb2, 128, DLoadQ8,  DLoadQ8,  __half)
+DV2_ENTRY_LB2(attention_mma_decode_v2_hd128_q4q4_lb2, 128, DLoadQ4,  DLoadQ4,  __half)
+
 // ── TurboQuant in place (E3). The 2^bits centroid table (F32, scaled by 1/sqrt(HD) by the codec) is staged once per block;
 // the body's first barrier publishes it. bits in 1..8. ──
 #define DV2_TQ_ENTRY(NAME, HD, PT)                                                                    \
