@@ -1289,26 +1289,35 @@ public static class Attention
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe float* LoadTurboQuantHeadRow(in KvRows rows, byte* src, int row, int kvHeadIdx, int headDim, float* scratch)
     {
-        DecodeTurboQuantCodes(in rows, src, row, kvHeadIdx, headDim, scratch);
+        float* lut = stackalloc float[TqLutFloats];
+        DecodeTurboQuantCodes(in rows, src, row, kvHeadIdx, headDim, scratch, lut);
         return scratch;
     }
 
-    /// <summary>
-    /// Decodes one head vector of codes to <c>dst[i] = norm * centroid[code_i]</c>. Word-aligned widths (2, 4, 8) and 3 bits (32 codes per
-    /// three words) are unrolled; for widths up to 4 the centroid table is pre-multiplied by the norm (<c>2^bits</c> products instead of
-    /// <c>headDim</c>; the same single product per element, so the floats are identical to the generic loop). Any other width or a
-    /// <paramref name="headDim"/> that is not a multiple of the unroll takes the generic bit-accumulator loop.
-    /// </summary>
-    [SkipLocalsInit]
-    private static unsafe void DecodeTurboQuantCodes(in KvRows rows, byte* src, int row, int kvHeadIdx, int headDim, float* dst)
+    /// <summary>Floats of the pre-multiplied centroid table <see cref="DecodeTurboQuantVector"/> needs (<c>2^4</c>, the widest table it builds).</summary>
+    private const int TqLutFloats = 16;
+
+    /// <summary>Decodes one head vector of codes to <c>dst[i] = norm * centroid[code_i]</c>; <paramref name="lut"/> is caller-owned scratch of <see cref="TqLutFloats"/> floats.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DecodeTurboQuantCodes(in KvRows rows, byte* src, int row, int kvHeadIdx, int headDim, float* dst, float* lut)
     {
         float norm = TurboQuantNormDecoder.Decode(rows.NormFormat, rows.Norms + (long)row * rows.NormRowBytes + kvHeadIdx * rows.NormBytes, rows.NormBytes);
-        int bits = rows.Bits;
-        float* centroids = rows.Centroids;
-        uint* words = (uint*)src;
+        DecodeTurboQuantVector(norm, rows.Bits, rows.Centroids, (uint*)src, headDim, dst, lut);
+    }
+
+    /// <summary>
+    /// Decodes <paramref name="headDim"/> codes of <paramref name="bits"/> bits (little-endian bit stream over <paramref name="words"/>) to
+    /// <c>dst[i] = norm * centroids[code_i]</c>. Word-aligned widths (2, 4, 8) and 3 bits (32 codes per three words) are unrolled; for
+    /// widths up to 4 the centroid table is pre-multiplied by the norm into <paramref name="lut"/> (<c>2^bits</c> products instead of
+    /// <c>headDim</c>; the same single product per element, so the floats are identical to the generic loop). Any other width, or a
+    /// <paramref name="headDim"/> that is not a multiple of the unroll, takes <see cref="DecodeTurboQuantVectorGeneric"/>.
+    /// Internal so the tests can compare it bit for bit with the generic loop.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static unsafe void DecodeTurboQuantVector(float norm, int bits, float* centroids, uint* words, int headDim, float* dst, float* lut)
+    {
         if (bits == 4 && (headDim & 7) == 0)
         {
-            float* lut = stackalloc float[16];
             for (int k = 0; k < 16; k++) lut[k] = norm * centroids[k];
             for (int i = 0; i < headDim; i += 8)
             {
@@ -1320,7 +1329,6 @@ public static class Attention
         }
         if (bits == 2 && (headDim & 15) == 0)
         {
-            float* lut = stackalloc float[4];
             for (int k = 0; k < 4; k++) lut[k] = norm * centroids[k];
             for (int i = 0; i < headDim; i += 16)
             {
@@ -1331,7 +1339,6 @@ public static class Attention
         }
         if (bits == 3 && (headDim & 31) == 0)
         {
-            float* lut = stackalloc float[8];
             for (int k = 0; k < 8; k++) lut[k] = norm * centroids[k];
             for (int i = 0; i < headDim; i += 32)
             {
@@ -1356,6 +1363,12 @@ public static class Attention
             return;
         }
 
+        DecodeTurboQuantVectorGeneric(norm, bits, centroids, words, headDim, dst);
+    }
+
+    /// <summary>The width-agnostic bit-accumulator decode: the oracle for the unrolled arms of <see cref="DecodeTurboQuantVector"/>.</summary>
+    internal static unsafe void DecodeTurboQuantVectorGeneric(float norm, int bits, float* centroids, uint* words, int headDim, float* dst)
+    {
         uint mask = (1u << bits) - 1u;
         ulong acc = 0;
         int have = 0;
@@ -1365,6 +1378,21 @@ public static class Attention
             dst[i] = norm * centroids[(int)(acc & mask)];
             acc >>= bits;
             have -= bits;
+        }
+    }
+
+    /// <summary>Test hook: decodes one head vector of an in-place cache's K or V rows through the production decode (norm format included).</summary>
+    internal static unsafe void DecodeTurboQuantRowForTest(ITurboQuantKvCache cache, int layer, bool values, int row, int kvHead, float* dst)
+    {
+        var layout = cache.Layout;
+        fixed (float* centroids = cache.Centroids)
+        {
+            var rows = values
+                ? KvRows.CreateTurboQuant((void*)cache.GetQuantizedValuesPtr(layer), (void*)cache.GetValueNormsPtr(layer), layout, centroids)
+                : KvRows.CreateTurboQuant((void*)cache.GetQuantizedKeysPtr(layer), (void*)cache.GetKeyNormsPtr(layer), layout, centroids);
+            float* lut = stackalloc float[TqLutFloats];
+            byte* src = rows.Base + (long)row * rows.RowBytes + (long)kvHead * rows.HeadBytes;
+            DecodeTurboQuantCodes(in rows, src, row, kvHead, layout.HeadDim, dst, lut);
         }
     }
 
@@ -1689,13 +1717,14 @@ public static class Attention
 
         int scoreStride = ctx.OneShot ? OneShotMaxKeys : MaxTileSize;
         float* scores = stackalloc float[MaxGroupHeads * scoreStride];
-        int rowScratchFloats = ctx.HeadDim;   // one head vector: the only buffer a quantized / TurboQuant row is decoded into
-        float* rowScratch = stackalloc float[rowScratchFloats];
-        if (RowScratchObserver is { } rowScratchObserver) rowScratchObserver.Value = rowScratchFloats;
-
         // Multi-row TurboQuant prefill decodes each K/V tile once for a block of query rows (see ExecuteHeadGroupTqBlocked).
         bool blockedTq = ctx.K0.Format == KvRowFormat.TurboQuant && ctx.V0.Format == KvRowFormat.TurboQuant
                          && !ctx.OneShot && ctx.Split >= ctx.SeqKv && ctx.SeqQ >= TqBlockedMinRows && !TurboQuantPerRowOnly;
+        // The per-row path decodes one head vector at a time into this scratch (the only buffer a quantized / TurboQuant row is decoded
+        // into); the blocked path decodes into its tile ring instead and needs none.
+        int rowScratchFloats = blockedTq ? 0 : ctx.HeadDim;
+        float* rowScratch = stackalloc float[rowScratchFloats];
+        if (RowScratchObserver is { } rowScratchObserver) rowScratchObserver.Value = rowScratchFloats;
         float* tqState = stackalloc float[blockedTq ? TqStateFloats : 1];
         if (blockedTq)
         {
@@ -1901,7 +1930,7 @@ public static class Attention
     /// <summary>Query rows processed together against one decoded K/V tile.</summary>
     private const int TqBlockRows = 128;
 
-    /// <summary>Below this many query rows the per-row path decodes as cheaply (decode, seqQ == 1) and is kept.</summary>
+    /// <summary>Fewer query rows than this keep the per-row path: a single query row (decode) has nothing to share a decoded tile with, so it already decodes each row once.</summary>
     private const int TqBlockedMinRows = 2;
 
     // Per-worker stack state of the blocked kernel: cursor[R] and rowEnd[R] (ints), maxSoFar[R * MaxGroupHeads] and sumExp[R * MaxGroupHeads].
@@ -1919,7 +1948,13 @@ public static class Attention
     /// </summary>
     private static int TqRingRows(in TiledKvCtx ctx) => ctx.SlidingWindowSize > 0 ? 2 * ctx.TileSize : ctx.TileSize;
 
-    /// <summary>Per-thread decoded K/V tile ring (native, 64-byte aligned, grown on demand, freed with the thread's holder).</summary>
+    /// <summary>
+    /// Per-thread decoded K/V tile ring (native, 64-byte aligned, grown on demand). Deliberate, bounded exception to the "wrap all
+    /// unmanaged memory in a deterministically disposed owner" rule (#1892): the ring is one worker thread's scratch, at most
+    /// <c>4 * TileSize * headDim * 4</c> bytes (512 KiB at hd 128, with a sliding window), never scales with the cached length, and is
+    /// reused across layers and calls so the hot path allocates nothing. It is freed by this holder's finalizer when the thread exits;
+    /// <see cref="TrimTurboQuantTileBuffers(ComputeThreadPool?)"/> frees it deterministically (the model calls it on dispose).
+    /// </summary>
     private sealed unsafe class TqTileBuffers
     {
         public float* K;
@@ -1935,7 +1970,7 @@ public static class Attention
             Floats = floats;
         }
 
-        private void Free()
+        public void Free()
         {
             if (K != null) System.Runtime.InteropServices.NativeMemory.AlignedFree(K);
             if (V != null) System.Runtime.InteropServices.NativeMemory.AlignedFree(V);
@@ -1947,6 +1982,19 @@ public static class Attention
     }
 
     [ThreadStatic] private static TqTileBuffers? t_tqTiles;
+
+    /// <summary>
+    /// Frees the TurboQuant decode-tile buffers of the calling thread and, when <paramref name="pool"/> is given, of every pool worker
+    /// (a broadcast dispatch). Idempotent; buffers are re-grown on the next blocked call. Call it from the owner of a pool when the
+    /// model is disposed, before the pool is.
+    /// </summary>
+    public static unsafe void TrimTurboQuantTileBuffers(ComputeThreadPool? pool)
+    {
+        if (pool is null) { TrimTileBuffersWorker(0, 0, 1); return; }
+        pool.Dispatch(0, &TrimTileBuffersWorker);
+    }
+
+    private static void TrimTileBuffersWorker(nint _, int __, int ___) => t_tqTiles?.Free();
 
     /// <summary>
     /// Flash-style multi-row path for an in-place TurboQuant cache: key tiles outer, query rows inner. Each K/V tile is decoded ONCE
@@ -1969,6 +2017,7 @@ public static class Attention
         float* kRing = tiles.K;
         float* vRing = tiles.V;
 
+        float* lut = stackalloc float[TqLutFloats];
         int* cursor = (int*)state;
         int* rowEnd = cursor + TqBlockRows;
         float* maxSoFar = state + 2 * TqBlockRows;
@@ -2008,8 +2057,8 @@ public static class Attention
                 {
                     byte* kSrc = ctx.K0.Base + (long)row * ctx.K0.RowBytes + (long)kvHeadIdx * ctx.K0.HeadBytes;
                     byte* vSrc = ctx.V0.Base + (long)row * ctx.V0.RowBytes + (long)kvHeadIdx * ctx.V0.HeadBytes;
-                    DecodeTurboQuantCodes(in ctx.K0, kSrc, row, kvHeadIdx, headDim, kRing + (long)slot * headDim);
-                    DecodeTurboQuantCodes(in ctx.V0, vSrc, row, kvHeadIdx, headDim, vRing + (long)slot * headDim);
+                    DecodeTurboQuantCodes(in ctx.K0, kSrc, row, kvHeadIdx, headDim, kRing + (long)slot * headDim, lut);
+                    DecodeTurboQuantCodes(in ctx.V0, vSrc, row, kvHeadIdx, headDim, vRing + (long)slot * headDim, lut);
                 }
 
                 for (int r = 0; r < n; r++)

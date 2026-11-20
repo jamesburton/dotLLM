@@ -5015,6 +5015,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     /// <inheritdoc/>
     public void Dispose()
     {
+        // Free the TurboQuant decode-tile buffers of the pool workers (and this thread) deterministically (#1892).
+        DotLLM.Cpu.Kernels.Attention.TrimTurboQuantTileBuffers(_threadPool);
         if (_ownsThreadPool)
             _threadPool?.Dispose();
         _state.Dispose();
