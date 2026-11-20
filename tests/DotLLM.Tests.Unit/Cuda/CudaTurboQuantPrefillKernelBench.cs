@@ -148,6 +148,7 @@ public sealed unsafe class CudaTurboQuantPrefillKernelBench
     {
         yield return (CudaKernels.TqPrefillVariant.Legacy, "legacy");
         if (k.HasAttentionFlashPrefillKvTqSpecialized(hd, bits)) yield return (CudaKernels.TqPrefillVariant.Specialized, "spec");
+        if (k.HasAttentionFlashPrefillKvTqStaged(hd, bits)) yield return (CudaKernels.TqPrefillVariant.Staged, "cpa");
     }
 
     private static int[]? ParseInts(string? s)

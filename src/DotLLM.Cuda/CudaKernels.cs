@@ -632,6 +632,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
     // table. Indexed [hdIndex * 4 + TqSpecBitsIndex(bits)]. The generic _tqtq above stays for the other bit widths, F32 norms
     // and the A/B.
     private readonly nint[] _attentionFlashPrefillKvTqSpecFuncs = new nint[8];
+    // #1924 E3: the same with cp.async-staged raw code rows and one decoded tile (_tq{bits}_cpa; no hd64 tq3: 24-byte rows).
+    private readonly nint[] _attentionFlashPrefillKvTqCpaFuncs = new nint[8];
 
     // Dense in-place TurboQuant attention (#1892 Task 6 -- native/kernels/attention_kvtq.cu): attention_kvq's skeleton reading
     // CudaTurboQuantInPlaceKvCache's codes + norms in code space. Best-effort load: absent PTX leaves it 0 (HasAttentionKvTq false).
@@ -1647,6 +1649,10 @@ public sealed unsafe partial class CudaKernels : IDisposable
                         if (fs != 0)
                             SetMaxDynamicSharedBytes(fs, AttentionFlashPrefillHd256MaxSmemBytes);
                         _attentionFlashPrefillKvTqSpecFuncs[hd * 4 + b] = fs;
+                        nint fc = m.TryGetFunction($"attention_flash_mma_prefill_kvq_hd{(hd == 0 ? 64 : 128)}_tq{TqSpecBits[b]}_cpa");
+                        if (fc != 0)
+                            SetMaxDynamicSharedBytes(fc, AttentionFlashPrefillHd256MaxSmemBytes);
+                        _attentionFlashPrefillKvTqCpaFuncs[hd * 4 + b] = fc;
                     }
                 }
                 _attentionFlashPrefillKvqModule = m;
@@ -1657,6 +1663,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
                 Array.Clear(_attentionFlashPrefillKvqFuncs);
                 Array.Clear(_attentionFlashPrefillKvTqFuncs);
                 Array.Clear(_attentionFlashPrefillKvTqSpecFuncs);
+                Array.Clear(_attentionFlashPrefillKvTqCpaFuncs);
             }
         }
 
@@ -5351,20 +5358,42 @@ public sealed unsafe partial class CudaKernels : IDisposable
     {
         /// <summary>The generic <c>_tqtq</c> entry: runtime bits, per-element <c>half(norm * centroid)</c> from global memory.</summary>
         Legacy,
-        /// <summary>The bit-specialised <c>_tq{2,3,4,8}</c> entry: shared-memory centroid table, norms applied to the score and P.</summary>
+        /// <summary>The bit-specialised <c>_tq{2,3,4,8}</c> entry: shared-memory centroid table, norms applied to the score and P (E1).</summary>
         Specialized,
+        /// <summary>E1 plus cp.async-staged raw code rows and one decoded K / V tile (<c>_tq{2,3,4,8}_cpa</c>, E3).</summary>
+        Staged,
     }
 
     /// <summary>
-    /// <c>DOTLLM_CUDA_TQ_PREFILL_LEGACY=1</c> forces the generic <c>_tqtq</c> entry for every TurboQuant prefill (#1924 A/B switch).
+    /// <c>DOTLLM_CUDA_TQ_PREFILL</c> = <c>legacy</c> | <c>spec</c> | <c>cpa</c> picks the TurboQuant prefill entry for the #1924 A/B;
+    /// unset = <see cref="DefaultTqPrefillVariant"/>. A variant that does not apply to a launch falls back (cpa -> spec -> legacy).
     /// </summary>
-    private static readonly bool s_tqPrefillForceLegacy = Environment.GetEnvironmentVariable("DOTLLM_CUDA_TQ_PREFILL_LEGACY") == "1";
+    private static readonly TqPrefillVariant? s_tqPrefillEnvVariant = Environment.GetEnvironmentVariable("DOTLLM_CUDA_TQ_PREFILL")?.ToLowerInvariant() switch
+    {
+        "legacy" => TqPrefillVariant.Legacy,
+        "spec" => TqPrefillVariant.Specialized,
+        "cpa" => TqPrefillVariant.Staged,
+        _ => null,
+    };
+
+    /// <summary>The TurboQuant prefill entry used when neither the environment nor a test override picks one.</summary>
+    internal const TqPrefillVariant DefaultTqPrefillVariant = TqPrefillVariant.Specialized;
 
     /// <summary>Test / bench override of the TurboQuant prefill entry; null = automatic (specialised when it applies).</summary>
     internal static TqPrefillVariant? TqPrefillVariantOverride;
 
     /// <summary>Launches since process start that ran a specialised <c>_tq{bits}</c> entry (a subset of <see cref="AttentionFlashPrefillKvTqLaunches"/>).</summary>
     internal static long AttentionFlashPrefillKvTqSpecLaunches;
+
+    /// <summary>Launches since process start that ran a staged <c>_tq{bits}_cpa</c> entry (a subset of <see cref="AttentionFlashPrefillKvTqLaunches"/>).</summary>
+    internal static long AttentionFlashPrefillKvTqCpaLaunches;
+
+    /// <summary>True when the cp.async-staged TurboQuant prefill entry (#1924 E3) for this head dim and bit width is loaded.</summary>
+    public bool HasAttentionFlashPrefillKvTqStaged(int headDim, int mseBits)
+    {
+        int hd = headDim == 64 ? 0 : headDim == 128 ? 1 : -1, b = TqSpecBitsIndex(mseBits);
+        return hd >= 0 && b >= 0 && _attentionFlashPrefillKvTqCpaFuncs[hd * 4 + b] != 0;
+    }
 
     /// <summary>True when the bit-specialised TurboQuant prefill entry for this head dim and bit width is loaded (#1924 E1).</summary>
     public bool HasAttentionFlashPrefillKvTqSpecialized(int headDim, int mseBits)
@@ -5374,12 +5403,20 @@ public sealed unsafe partial class CudaKernels : IDisposable
     }
 
     /// <summary>
-    /// Shared memory the specialised entries add to <see cref="AttentionFlashPrefillKvqSmemBytes"/>: the F16 centroid table (tq2 256 x
-    /// 4 halves, tq3 64 x half2, tq4 256 x half2, tq8 256 halves) and the raw 16-bit K / V norms of both tile buffers (2 x 2 x 16 x 2 B).
-    /// Must match <c>PkTqSpec&lt;BITS&gt;::TABLE_BYTES</c> and <c>PK_TQ_NORM_BYTES</c> in attention_flash_mma_prefill_kvq.cu.
+    /// Dynamic shared memory of a specialised TurboQuant prefill entry (#1924), matching the layouts in attention_flash_mma_prefill_kvq.cu:
+    /// Q <c>[group][16][hd+8]</c> halves, then for E1 two decoded K and V tiles plus the raw 16-bit norms of both (2 x 2 x 16 x 2 B); for
+    /// E3 (<paramref name="staged"/>) one decoded K and V tile, the raw code rows of two tiles per side (2 x 2 x 16 x CodeUintsPerVec x 4 B)
+    /// and one tile's norms (2 x 16 x 2 B). Both end with the F16 centroid table (<c>PkTqSpec&lt;BITS&gt;::TABLE_BYTES</c>: tq2 256 x 4
+    /// halves, tq3 64 x half2, tq4 256 x half2, tq8 256 halves).
     /// </summary>
-    public static int AttentionFlashPrefillKvTqSpecExtraSmemBytes(int mseBits)
-        => mseBits switch { 2 => 2048, 3 => 256, 4 => 1024, 8 => 512, _ => throw new ArgumentOutOfRangeException(nameof(mseBits)) } + 128;
+    public static int AttentionFlashPrefillKvTqSpecSmemBytes(int headDim, int group, int mseBits, bool staged)
+    {
+        int table = mseBits switch { 2 => 2048, 3 => 256, 4 => 1024, 8 => 512, _ => throw new ArgumentOutOfRangeException(nameof(mseBits)) };
+        int q = group * 16 * (headDim + 8) * 2;
+        if (!staged) return q + 2 * 2 * 16 * (headDim + 8) * 2 + table + 2 * 2 * 16 * 2;
+        int cu = headDim * mseBits / 32;
+        return q + 2 * 16 * (headDim + 8) * 2 + 2 * 2 * 16 * cu * 4 + table + 2 * 16 * 2;
+    }
 
     /// <summary>
     /// Tensor-core causal prefill attention over the dense in-place TurboQuant KV cache (#1892 Task 6,
@@ -5401,25 +5438,38 @@ public sealed unsafe partial class CudaKernels : IDisposable
         CheckKvTq(headDim, mseBits, codeUintsPerVec, normFormat);
         DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
 
-        // #1924 E1: the specialised entry needs a compiled-in bit width, a 16-bit norm format (staged raw in shared memory; the F32
-        // oracle format stays on the generic entry) and the TurboQuantLayout word count it was compiled for.
+        // #1924: a specialised entry needs a compiled-in bit width, a 16-bit norm format (staged raw in shared memory; the F32 oracle
+        // format stays on the generic entry) and the TurboQuantLayout word count it was compiled for; the staged one also 16-byte
+        // aligned code buffers (cp.async). Fallback order cpa -> spec -> legacy; a test override that cannot be honoured throws.
+        int group = numHeads / numKvHeads;
         nint fn = _attentionFlashPrefillKvTqFuncs[hdIdx];
-        int smem = AttentionFlashPrefillKvqSmemBytes(headDim, numHeads / numKvHeads);
-        TqPrefillVariant want = TqPrefillVariantOverride ?? (s_tqPrefillForceLegacy ? TqPrefillVariant.Legacy : TqPrefillVariant.Specialized);
+        int smem = AttentionFlashPrefillKvqSmemBytes(headDim, group);
+        TqPrefillVariant want = TqPrefillVariantOverride ?? s_tqPrefillEnvVariant ?? DefaultTqPrefillVariant;
         int bIdx = TqSpecBitsIndex(mseBits);
-        if (want == TqPrefillVariant.Specialized && bIdx >= 0 && _attentionFlashPrefillKvTqSpecFuncs[hdIdx * 4 + bIdx] != 0
-            && normFormat is TqNormFormat.F16 or TqNormFormat.Bf16
-            && codeUintsPerVec == ((headDim * mseBits + 7) / 8 + 3) / 4)
+        bool specOk = bIdx >= 0 && normFormat is TqNormFormat.F16 or TqNormFormat.Bf16
+                      && codeUintsPerVec == ((headDim * mseBits + 7) / 8 + 3) / 4;
+        TqPrefillVariant ran = TqPrefillVariant.Legacy;
+        if (want == TqPrefillVariant.Staged && specOk && _attentionFlashPrefillKvTqCpaFuncs[hdIdx * 4 + bIdx] != 0
+            && ((kCodes | vCodes) & 15) == 0)
+        {
+            fn = _attentionFlashPrefillKvTqCpaFuncs[hdIdx * 4 + bIdx];
+            smem = AttentionFlashPrefillKvTqSpecSmemBytes(headDim, group, mseBits, staged: true);
+            ran = TqPrefillVariant.Staged;
+            Interlocked.Increment(ref AttentionFlashPrefillKvTqCpaLaunches);
+        }
+        else if (want != TqPrefillVariant.Legacy && specOk && _attentionFlashPrefillKvTqSpecFuncs[hdIdx * 4 + bIdx] != 0)
         {
             fn = _attentionFlashPrefillKvTqSpecFuncs[hdIdx * 4 + bIdx];
-            smem += AttentionFlashPrefillKvTqSpecExtraSmemBytes(mseBits);
+            smem = AttentionFlashPrefillKvTqSpecSmemBytes(headDim, group, mseBits, staged: false);
+            ran = TqPrefillVariant.Specialized;
             Interlocked.Increment(ref AttentionFlashPrefillKvTqSpecLaunches);
         }
-        else if (TqPrefillVariantOverride == TqPrefillVariant.Specialized)
-            throw new InvalidOperationException($"specialised TurboQuant prefill requested but not applicable (hd{headDim} b{mseBits} {normFormat}).");
+        if (TqPrefillVariantOverride is { } forced && forced != ran)
+            throw new InvalidOperationException($"TurboQuant prefill variant {forced} requested but not applicable (hd{headDim} b{mseBits} {normFormat}).");
+        if (smem > AttentionFlashPrefillHd256MaxSmemBytes)
+            throw new ArgumentException($"TurboQuant prefill needs {smem} B of shared memory (> {AttentionFlashPrefillHd256MaxSmemBytes}).");
         Interlocked.Increment(ref AttentionFlashPrefillKvTqLaunches);
 
-        int group = numHeads / numKvHeads;
         nint qArg = q, kcArg = kCodes, vcArg = vCodes, knArg = kNorms, vnArg = vNorms, ceArg = centroids, oArg = output;
         int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, poArg = positionOffset;
         float scArg = 1f / MathF.Sqrt(headDim);
