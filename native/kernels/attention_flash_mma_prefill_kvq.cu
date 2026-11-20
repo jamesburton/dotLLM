@@ -623,3 +623,368 @@ extern "C" __global__ void __launch_bounds__(256) NAME(                         
 
 PK_TQ_ENTRY(attention_flash_mma_prefill_kvq_hd128_tqtq, 128)
 PK_TQ_ENTRY(attention_flash_mma_prefill_kvq_hd64_tqtq, 64)
+
+// ─── TurboQuant in place, bit-specialised (#1924 E1) ───────────────────────────────────────────────────────────────────
+// attention_flash_mma_prefill_kvq_hd{64,128}_tq{2,3,4,8}: same launch contract and arguments as _tqtq (mse_bits and
+// code_uints_per_vec are compiled in; the launcher only picks these when they match, and only for F16 / BF16 norms), with
+// three changes to the TQ tile path:
+//   1. Norms stay out of the tile. A K / V tile element is the bare centroid half(c[code]). The K norm scales the score
+//      (S_j = n_kj * q~ . c_j), the V norm scales the P operand (P_j * n_vj); the softmax sum l keeps the raw P, as in the
+//      scalar attention_kvtq. Rounding points: half(c) per operand and half(p * n_v) for P (p <= 1, stored norms <= 65504, so
+//      it cannot overflow), against half(n * c) in _tqtq: one F16 rounding per operand either way.
+//   2. A shared-memory F16 centroid table built once per block replaces the per-element code-dependent __ldg gather:
+//      tq4 256 x half2 (one code byte -> two elements), tq3 64 x half2 (6 bits -> two), tq2 256 x 4 halves (one byte -> four),
+//      tq8 256 halves. Each 8-element chunk is 1 or 2 code-word loads + 2..8 table reads; no conversions.
+//   3. bits is a template constant (no runtime 64-bit shifts).
+// The 16 K and 16 V norms of each tile are staged as their raw stored 16 bits (no F32 storage) and converted at use.
+// The body is a TQ-only copy of pk_prefill_body so the ten entries above (and their PTX) cannot move; it does not inherit
+// later changes to pk_prefill_body.
+// Shared memory = AttentionFlashPrefillKvqSmemBytes + TABLE_BYTES + PK_TQ_NORM_BYTES (CudaKernels.AttentionFlashPrefillKvTqSpecExtraSmemBytes).
+#define PK_TQ_NORM_BYTES (PK_NBUF * 2 * PK_KV_TILE * 2)
+
+template <int BITS> struct PkTqSpec;
+
+template <> struct PkTqSpec<4>
+{
+    static constexpr int TABLE_BYTES = 256 * 4;
+    __device__ __forceinline__ static void build(void* tab, const float* __restrict__ c)
+    {
+        unsigned* t = reinterpret_cast<unsigned*>(tab);
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) t[i] = pk_pack_half2(__ldg(c + (i & 15)), __ldg(c + (i >> 4)));
+    }
+    __device__ __forceinline__ static uint4 decode8(const void* tab, const uint32_t* __restrict__ vec, int chunk)
+    {
+        const unsigned* t = reinterpret_cast<const unsigned*>(tab);
+        const unsigned w = __ldg(vec + chunk);
+        return make_uint4(t[w & 0xFFu], t[(w >> 8) & 0xFFu], t[(w >> 16) & 0xFFu], t[w >> 24]);
+    }
+};
+
+template <> struct PkTqSpec<3>
+{
+    static constexpr int TABLE_BYTES = 64 * 4;
+    __device__ __forceinline__ static void build(void* tab, const float* __restrict__ c)
+    {
+        unsigned* t = reinterpret_cast<unsigned*>(tab);
+        for (int i = threadIdx.x; i < 64; i += blockDim.x) t[i] = pk_pack_half2(__ldg(c + (i & 7)), __ldg(c + (i >> 3)));
+    }
+    __device__ __forceinline__ static uint4 decode8(const void* tab, const uint32_t* __restrict__ vec, int chunk)
+    {
+        const unsigned* t = reinterpret_cast<const unsigned*>(tab);
+        const unsigned bit0 = (unsigned)chunk * 24u;
+        const unsigned shift = bit0 & 31u;
+        unsigned long long win = __ldg(vec + (bit0 >> 5));
+        if (shift > 8u) win |= (unsigned long long)__ldg(vec + (bit0 >> 5) + 1) << 32;   // 24 bits straddle; stays in the vector
+        const unsigned b = (unsigned)(win >> shift);
+        return make_uint4(t[b & 0x3Fu], t[(b >> 6) & 0x3Fu], t[(b >> 12) & 0x3Fu], t[(b >> 18) & 0x3Fu]);
+    }
+};
+
+template <> struct PkTqSpec<2>
+{
+    static constexpr int TABLE_BYTES = 256 * 8;
+    __device__ __forceinline__ static void build(void* tab, const float* __restrict__ c)
+    {
+        uint2* t = reinterpret_cast<uint2*>(tab);
+        for (int i = threadIdx.x; i < 256; i += blockDim.x)
+            t[i] = make_uint2(pk_pack_half2(__ldg(c + (i & 3)), __ldg(c + ((i >> 2) & 3))),
+                              pk_pack_half2(__ldg(c + ((i >> 4) & 3)), __ldg(c + (i >> 6))));
+    }
+    __device__ __forceinline__ static uint4 decode8(const void* tab, const uint32_t* __restrict__ vec, int chunk)
+    {
+        const uint2* t = reinterpret_cast<const uint2*>(tab);
+        const unsigned h = __ldg(vec + (chunk >> 1)) >> ((chunk & 1) * 16);
+        const uint2 a = t[h & 0xFFu], b = t[(h >> 8) & 0xFFu];
+        return make_uint4(a.x, a.y, b.x, b.y);
+    }
+};
+
+template <> struct PkTqSpec<8>
+{
+    static constexpr int TABLE_BYTES = 256 * 2;
+    __device__ __forceinline__ static void build(void* tab, const float* __restrict__ c)
+    {
+        unsigned short* t = reinterpret_cast<unsigned short*>(tab);
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) t[i] = __half_as_ushort(__float2half(__ldg(c + i)));
+    }
+    __device__ __forceinline__ static unsigned pair(const unsigned short* t, unsigned x)
+    {
+        return (unsigned)t[x & 0xFFu] | ((unsigned)t[(x >> 8) & 0xFFu] << 16);
+    }
+    __device__ __forceinline__ static uint4 decode8(const void* tab, const uint32_t* __restrict__ vec, int chunk)
+    {
+        const unsigned short* t = reinterpret_cast<const unsigned short*>(tab);
+        const uint2 w = __ldg(reinterpret_cast<const uint2*>(vec) + chunk);
+        return make_uint4(pair(t, w.x), pair(t, w.x >> 16), pair(t, w.y), pair(t, w.y >> 16));
+    }
+};
+
+// Raw stored 16-bit norm -> float: 1 = F16, 2 = BF16 (the launcher never sends the F32 reference format here).
+__device__ __forceinline__ float pk_tq_norm16(const unsigned short h, const int fmt)
+{
+    return fmt == 1 ? __half2float(__ushort_as_half(h)) : __uint_as_float(((unsigned)h) << 16);
+}
+
+template <int HD, int BITS>
+__device__ __forceinline__ void pk_tq_prefill_body(
+    const half* __restrict__ q,
+    const uint32_t* __restrict__ k_codes,
+    const uint32_t* __restrict__ v_codes,
+    const unsigned short* __restrict__ k_norms,
+    const unsigned short* __restrict__ v_norms,
+    const float* __restrict__ centroids,
+    half* __restrict__ output,
+    const int seq_q,
+    const int seq_kv,
+    const int num_heads,
+    const int num_kv_heads,
+    const int position_offset,
+    const float scale,
+    const int norm_format)
+{
+    using Spec = PkTqSpec<BITS>;
+    constexpr int SS = HD + 8;
+    constexpr int CPR = HD / 8;
+    constexpr int CU = HD * BITS / 32;   // code words per head vector (TurboQuantLayout.CodeUintsPerVec; exact for these shapes)
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int group = num_heads / num_kv_heads;
+    const int nq_tiles = (seq_q + PK_Q_TILE - 1) / PK_Q_TILE;
+    const int qt = nq_tiles - 1 - (int)blockIdx.x;
+    const int hkv = blockIdx.y;
+    const int hq = hkv * group + warp;
+    const int qbase = qt * PK_Q_TILE;
+    const int q_stride = num_heads * HD;
+
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    half* sQ = reinterpret_cast<half*>(smem_raw);                  // [group][16][SS]
+    half* sK = sQ + group * PK_Q_TILE * SS;                        // [NBUF][KV_TILE][SS]
+    half* sV = sK + PK_NBUF * PK_KV_TILE * SS;                     // [NBUF][KV_TILE][SS]
+    void* sTab = sV + PK_NBUF * PK_KV_TILE * SS;                   // Spec::TABLE_BYTES
+    unsigned short* sNk = reinterpret_cast<unsigned short*>(reinterpret_cast<unsigned char*>(sTab) + Spec::TABLE_BYTES); // [NBUF][16]
+    unsigned short* sNv = sNk + PK_NBUF * PK_KV_TILE;                                                                     // [NBUF][16]
+
+    for (int i = threadIdx.x; i < group * PK_Q_TILE * CPR; i += blockDim.x)
+    {
+        int c = i % CPR;
+        int r = (i / CPR) % PK_Q_TILE;
+        int w = i / (PK_Q_TILE * CPR);
+        int qrow = qbase + r;
+        uint4 val = make_uint4(0, 0, 0, 0);
+        if (qrow < seq_q)
+            val = *reinterpret_cast<const uint4*>(
+                q + (size_t)qrow * q_stride + (size_t)(hkv * group + w) * HD + c * 8);
+        *reinterpret_cast<uint4*>(sQ + (size_t)(w * PK_Q_TILE + r) * SS + c * 8) = val;
+    }
+    Spec::build(sTab, centroids);
+    __syncthreads();   // the table is read by the first load_tile
+
+    int kv_end = position_offset + qbase + PK_Q_TILE;
+    if (kv_end > seq_kv) kv_end = seq_kv;
+    const int num_tiles = (kv_end + PK_KV_TILE - 1) / PK_KV_TILE;
+
+    auto load_tile = [&](int t, int buf)
+    {
+        const int k0 = t * PK_KV_TILE;
+        half* dK = sK + (size_t)buf * PK_KV_TILE * SS;
+        half* dV = sV + (size_t)buf * PK_KV_TILE * SS;
+        for (int i = threadIdx.x; i < PK_KV_TILE * CPR; i += blockDim.x)
+        {
+            int c = i % CPR, r = i / CPR;
+            int key = k0 + r;
+            if (key > seq_kv - 1) key = seq_kv - 1;          // clamp: masked later, stays finite
+            const size_t hv = (size_t)key * num_kv_heads + hkv;
+            *reinterpret_cast<uint4*>(dK + (size_t)r * SS + c * 8) = Spec::decode8(sTab, k_codes + hv * CU, c);
+            *reinterpret_cast<uint4*>(dV + (size_t)r * SS + c * 8) = Spec::decode8(sTab, v_codes + hv * CU, c);
+        }
+        if (threadIdx.x < 2 * PK_KV_TILE)
+        {
+            const int r = threadIdx.x & (PK_KV_TILE - 1);
+            int key = k0 + r;
+            if (key > seq_kv - 1) key = seq_kv - 1;
+            const size_t hv = (size_t)key * num_kv_heads + hkv;
+            if (threadIdx.x < PK_KV_TILE) sNk[buf * PK_KV_TILE + r] = __ldg(k_norms + hv);
+            else                          sNv[buf * PK_KV_TILE + r] = __ldg(v_norms + hv);
+        }
+    };
+
+    float o[HD / 8][4];
+    #pragma unroll
+    for (int n = 0; n < HD / 8; n++) { o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f; }
+    float m_lo = PK_NEG_INF, m_hi = PK_NEG_INF;
+    float l_lo = 0.0f, l_hi = 0.0f;
+
+    const float scale_log2 = scale * PK_LOG2E;
+    const int r_lo = lane >> 2;
+    const int col_lo = (lane & 3) * 2;
+    const int pos_lo = position_offset + qbase + r_lo;
+    const int pos_hi = pos_lo + 8;
+    const half* qw = sQ + (size_t)warp * PK_Q_TILE * SS;
+
+    if (num_tiles > 0) load_tile(0, 0);
+
+    for (int t = 0; t < num_tiles; t++)
+    {
+        const int buf = t & 1;
+        if (t + 1 < num_tiles) load_tile(t + 1, (t + 1) & 1);
+        __syncthreads();
+
+        if (warp < group)
+        {
+            const half* kb = sK + (size_t)buf * PK_KV_TILE * SS;
+            const half* vb = sV + (size_t)buf * PK_KV_TILE * SS;
+            const unsigned short* nkb = sNk + buf * PK_KV_TILE;
+            const unsigned short* nvb = sNv + buf * PK_KV_TILE;
+            const int k0 = t * PK_KV_TILE;
+
+            // ---- S = Q . C^T (bare centroids) ----
+            float sa[PK_NT][4], sb[PK_NT][4];
+            #pragma unroll
+            for (int n = 0; n < PK_NT; n++)
+            { sa[n][0] = sa[n][1] = sa[n][2] = sa[n][3] = 0.f; sb[n][0] = sb[n][1] = sb[n][2] = sb[n][3] = 0.f; }
+
+            #pragma unroll
+            for (int ks = 0; ks < HD / 16; ks++)
+            {
+                unsigned a[4];
+                pk_ldmatrix_x4(a, qw + (size_t)(lane & 15) * SS + ks * 16 + (lane >> 4) * 8);
+                #pragma unroll
+                for (int np = 0; np < PK_NT / 2; np++)
+                {
+                    unsigned b[4];
+                    pk_ldmatrix_x4(b, kb + (size_t)(np * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * SS
+                                         + ks * 16 + ((lane >> 3) & 1) * 8);
+                    if ((ks & 1) == 0)
+                    {
+                        pk_mma(sa[2 * np], a, b[0], b[1]);
+                        pk_mma(sa[2 * np + 1], a, b[2], b[3]);
+                    }
+                    else
+                    {
+                        pk_mma(sb[2 * np], a, b[0], b[1]);
+                        pk_mma(sb[2 * np + 1], a, b[2], b[3]);
+                    }
+                }
+            }
+
+            // ---- K norm, scale, causal/tail mask, tile row max ----
+            float nv[PK_NT][2];
+            float tmax_lo = PK_NEG_INF, tmax_hi = PK_NEG_INF;
+            #pragma unroll
+            for (int n = 0; n < PK_NT; n++)
+            {
+                const float nk0 = pk_tq_norm16(nkb[n * 8 + col_lo], norm_format);
+                const float nk1 = pk_tq_norm16(nkb[n * 8 + col_lo + 1], norm_format);
+                nv[n][0] = pk_tq_norm16(nvb[n * 8 + col_lo], norm_format);
+                nv[n][1] = pk_tq_norm16(nvb[n * 8 + col_lo + 1], norm_format);
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                {
+                    int key = k0 + n * 8 + col_lo + (j & 1);
+                    int pos = (j >> 1) ? pos_hi : pos_lo;
+                    float sv = (sa[n][j] + sb[n][j]) * ((j & 1) ? nk1 : nk0) * scale_log2;
+                    sv = (key <= pos && key < seq_kv) ? sv : PK_NEG_INF;
+                    sa[n][j] = sv;
+                    if (j >> 1) tmax_hi = fmaxf(tmax_hi, sv); else tmax_lo = fmaxf(tmax_lo, sv);
+                }
+            }
+            tmax_lo = fmaxf(tmax_lo, __shfl_xor_sync(0xffffffffu, tmax_lo, 1));
+            tmax_lo = fmaxf(tmax_lo, __shfl_xor_sync(0xffffffffu, tmax_lo, 2));
+            tmax_hi = fmaxf(tmax_hi, __shfl_xor_sync(0xffffffffu, tmax_hi, 1));
+            tmax_hi = fmaxf(tmax_hi, __shfl_xor_sync(0xffffffffu, tmax_hi, 2));
+
+            const float mn_lo = fmaxf(m_lo, tmax_lo);
+            const float mn_hi = fmaxf(m_hi, tmax_hi);
+            const float mu_lo = (mn_lo == PK_NEG_INF) ? 0.0f : mn_lo;
+            const float mu_hi = (mn_hi == PK_NEG_INF) ? 0.0f : mn_hi;
+
+            const bool changed = (mn_lo != m_lo) || (mn_hi != m_hi);
+            if (__any_sync(0xffffffffu, changed))
+            {
+                const float c_lo = exp2f(m_lo - mu_lo);
+                const float c_hi = exp2f(m_hi - mu_hi);
+                l_lo *= c_lo; l_hi *= c_hi;
+                #pragma unroll
+                for (int n = 0; n < HD / 8; n++)
+                { o[n][0] *= c_lo; o[n][1] *= c_lo; o[n][2] *= c_hi; o[n][3] *= c_hi; }
+            }
+            m_lo = mn_lo; m_hi = mn_hi;
+
+            // ---- P = exp2(S - m); l takes the raw P, the PV operand is P * n_v ----
+            unsigned pa[PK_NT / 2][4];
+            #pragma unroll
+            for (int n = 0; n < PK_NT; n++)
+            {
+                float p0 = exp2f(sa[n][0] - mu_lo);
+                float p1 = exp2f(sa[n][1] - mu_lo);
+                float p2 = exp2f(sa[n][2] - mu_hi);
+                float p3 = exp2f(sa[n][3] - mu_hi);
+                l_lo += p0 + p1; l_hi += p2 + p3;
+                pa[n >> 1][(n & 1) * 2 + 0] = pk_pack_half2(p0 * nv[n][0], p1 * nv[n][1]);
+                pa[n >> 1][(n & 1) * 2 + 1] = pk_pack_half2(p2 * nv[n][0], p3 * nv[n][1]);
+            }
+
+            // ---- O += (P n_v) . C ----
+            #pragma unroll
+            for (int kk = 0; kk < PK_KV_TILE / 16; kk++)
+            {
+                #pragma unroll
+                for (int np = 0; np < HD / 16; np++)
+                {
+                    unsigned b[4];
+                    pk_ldmatrix_x4_trans(b, vb + (size_t)(kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * SS
+                                               + (np * 2 + (lane >> 4)) * 8);
+                    pk_mma(o[2 * np], pa[kk], b[0], b[1]);
+                    pk_mma(o[2 * np + 1], pa[kk], b[2], b[3]);
+                }
+            }
+        }
+        __syncthreads();   // all warps done with this buffer before it is refilled
+    }
+
+    l_lo += __shfl_xor_sync(0xffffffffu, l_lo, 1);
+    l_lo += __shfl_xor_sync(0xffffffffu, l_lo, 2);
+    l_hi += __shfl_xor_sync(0xffffffffu, l_hi, 1);
+    l_hi += __shfl_xor_sync(0xffffffffu, l_hi, 2);
+    const float inv_lo = (l_lo > 0.0f) ? 1.0f / l_lo : 0.0f;
+    const float inv_hi = (l_hi > 0.0f) ? 1.0f / l_hi : 0.0f;
+
+    if (warp < group)
+    {
+        const int row_lo = qbase + r_lo;
+        const int row_hi = row_lo + 8;
+        half* out_lo = output + (size_t)row_lo * q_stride + (size_t)hq * HD + col_lo;
+        half* out_hi = output + (size_t)row_hi * q_stride + (size_t)hq * HD + col_lo;
+        #pragma unroll
+        for (int n = 0; n < HD / 8; n++)
+        {
+            if (row_lo < seq_q)
+                *reinterpret_cast<__half2*>(out_lo + n * 8) = __floats2half2_rn(o[n][0] * inv_lo, o[n][1] * inv_lo);
+            if (row_hi < seq_q)
+                *reinterpret_cast<__half2*>(out_hi + n * 8) = __floats2half2_rn(o[n][2] * inv_hi, o[n][3] * inv_hi);
+        }
+    }
+}
+
+#define PK_TQ_SPEC_ENTRY(NAME, HD, BITS)                                                          \
+extern "C" __global__ void __launch_bounds__(256) NAME(                                           \
+    const half* __restrict__ q, const uint32_t* __restrict__ k_codes,                             \
+    const uint32_t* __restrict__ v_codes, const void* __restrict__ k_norms,                       \
+    const void* __restrict__ v_norms, const float* __restrict__ centroids,                        \
+    half* __restrict__ output, const int seq_q, const int seq_kv, const int num_heads,            \
+    const int num_kv_heads, const int position_offset, const float scale,                         \
+    const int mse_bits, const int code_uints_per_vec, const int norm_format)                      \
+{                                                                                                 \
+    pk_tq_prefill_body<HD, BITS>(q, k_codes, v_codes,                                             \
+        reinterpret_cast<const unsigned short*>(k_norms), reinterpret_cast<const unsigned short*>(v_norms), \
+        centroids, output, seq_q, seq_kv, num_heads, num_kv_heads, position_offset, scale, norm_format); \
+}
+
+PK_TQ_SPEC_ENTRY(attention_flash_mma_prefill_kvq_hd128_tq2, 128, 2)
+PK_TQ_SPEC_ENTRY(attention_flash_mma_prefill_kvq_hd128_tq3, 128, 3)
+PK_TQ_SPEC_ENTRY(attention_flash_mma_prefill_kvq_hd128_tq4, 128, 4)
+PK_TQ_SPEC_ENTRY(attention_flash_mma_prefill_kvq_hd128_tq8, 128, 8)
+PK_TQ_SPEC_ENTRY(attention_flash_mma_prefill_kvq_hd64_tq2, 64, 2)
+PK_TQ_SPEC_ENTRY(attention_flash_mma_prefill_kvq_hd64_tq3, 64, 3)
+PK_TQ_SPEC_ENTRY(attention_flash_mma_prefill_kvq_hd64_tq4, 64, 4)
+PK_TQ_SPEC_ENTRY(attention_flash_mma_prefill_kvq_hd64_tq8, 64, 8)
