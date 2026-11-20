@@ -320,7 +320,8 @@ jobs:
       # The fork cannot push the upstream-owned DotLLM.* ids, so nothing is published until the repo variable
       # DOTLLM_TOOL_PACKAGE_ID names a package id this account owns (docs/PACKAGING.md lists the options).
       # Up to three packages ship, each only when its own variable is set: the dotllm tool (DOTLLM_TOOL_PACKAGE_ID),
-      # the chunkcache tool (CHUNKCACHE_TOOL_PACKAGE_ID) and the client library (CHUNKCACHE_CLIENT_PACKAGE_ID).      # Preferred: trusted publishing (no stored secret). Enabled by the repo variable NUGET_USER (the nuget.org profile name, not an
+      # the chunkcache tool (CHUNKCACHE_TOOL_PACKAGE_ID) and the client library (CHUNKCACHE_CLIENT_PACKAGE_ID).
+      # Preferred: trusted publishing (no stored secret). Enabled by the repo variable NUGET_USER (the nuget.org profile name, not an
       # email); the policy lives on nuget.org (docs/PACKAGING.md). Falls back to a NUGET_API_KEY secret when NUGET_USER is unset.
       - name: NuGet login (OIDC -> temporary API key)
         id: login
