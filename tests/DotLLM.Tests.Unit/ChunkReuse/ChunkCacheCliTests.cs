@@ -239,6 +239,32 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
     // ------------------------------------------------------------------------------------------------ status
 
     [Fact]
+    public void IndexCutByAnOlderChunkerAlgorithm_StatusSaysStale_AndBuildReChunksIt()
+    {
+        string tree = NewTree();
+        string store = NewDir("store");
+        string[] common = ["--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64"];
+        Assert.Equal(0, Cli(["build", .. common, "--directory", tree]).Code);
+        static string[] Stale(string json) => [.. JsonDocument.Parse(json).RootElement.GetProperty("stale_files").EnumerateArray().Select(e => e.GetString()!)];
+        Assert.Empty(Stale(Cli(["status", .. common, "--json"]).Out)); // control: a fresh index is current
+
+        // Make the index what a build before the algorithm change wrote: no chunkerVersion on any file (absent = version 1).
+        string indexFile = Assert.Single(Directory.GetFiles(store, "index-*.json"));
+        string text = File.ReadAllText(indexFile);
+        Assert.Contains("\"chunkerVersion\":2", text, StringComparison.Ordinal);
+        File.WriteAllText(indexFile, text.Replace("\"chunkerVersion\":2,", "", StringComparison.Ordinal));
+
+        var before = Cli(["status", .. common, "--strict", "--json"]);
+        Assert.Equal(3, before.Code);
+        Assert.NotEmpty(Stale(before.Out));                                  // text unchanged, yet stale
+        Assert.NotEmpty(Stale(Cli(["status", .. common, "--no-scan", "--json"]).Out)); // and without scanning the tree
+
+        Assert.Equal(0, Cli(["build", .. common, "--directory", tree]).Code);
+        Assert.Contains("\"chunkerVersion\":2", File.ReadAllText(indexFile), StringComparison.Ordinal);
+        Assert.Empty(Stale(Cli(["status", .. common, "--json"]).Out));
+    }
+
+    [Fact]
     public void Status_AfterEdit_ListsTheStaleFile_AndARebuildEncodesOnlyItsChangedChunks()
     {
         string tree = NewTree();

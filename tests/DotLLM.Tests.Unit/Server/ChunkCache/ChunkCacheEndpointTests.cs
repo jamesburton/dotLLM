@@ -594,7 +594,6 @@ public sealed class ChunkCacheEndpointTests : IDisposable
         Assert.Equal(ChunkNamespace.ForApiKey(KeyC), ChunkCacheAuth.Resolve(ctx, server.State.Options.ChunkCache, out _).Namespace);
     }
 
-    /// <summary>Ruling 52: <c>store</c> is always an object; <c>configured: false</c> without <c>--chunk-store</c>, absent with one.</summary>
     [Fact]
     public async Task Capabilities_ListLines512()
     {
@@ -606,6 +605,7 @@ public sealed class ChunkCacheEndpointTests : IDisposable
         Assert.Empty(got["auto_validated"]!.AsArray());
     }
 
+    /// <summary>Ruling 52: <c>store</c> is always an object; <c>configured: false</c> without <c>--chunk-store</c>, absent with one.</summary>
     [Fact]
     public async Task Capabilities_StoreConfiguredFalse_WithoutStore()
     {

@@ -175,6 +175,11 @@ decides whether it is reusable:
   three frozen corpora (Qwen3-4B tokenizer): `symbol-512` had 5,910 of 6,684 edges unstable (88 %), now 0; `lines-512` had
   0 of 2,542 and still 0 (`experiments/corpus.md`). If no stable edge is in reach, the greedy cut stays and that edge can
   still merge (not seen on the corpora).
+- **An index built before this change is re-chunked, not kept.** The chunkers kept their names, so each index entry records
+  the chunker's algorithm version (`chunkerVersion` per file; absent = 1, the old cuts; `symbol-*` and `lines-*` are now 2).
+  `chunkcache status` reports a file cut by another version as stale even when its text is unchanged, and the next
+  `chunkcache build` re-chunks it. The new chunks have new keys: the old entries miss (never hit wrongly) and become orphans
+  that `chunkcache evict` removes.
 - **A newline join is not safe.** Every chunk ends in a newline (both chunkers cut after line ends), and a newline
   followed by an inserted `"\n"` merges. The Anthropic converter joins text blocks of one message with `"\n"`, so inline
   chunk blocks that end in a newline are all `chunk_template_altered` (e2e A6: 3 of 3). The same holds for any glue that

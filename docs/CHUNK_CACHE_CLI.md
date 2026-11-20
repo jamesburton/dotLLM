@@ -98,7 +98,7 @@ writes nothing. The result reports `wire_ineligible_chunks` (off the allow-list,
 | `--solution` | `FILE` | none | Scan a .sln, .slnx or .csproj with Roslyn (authored C# files only). Give --solution or --directory, not both. One of the two is required. |
 | `--directory` | `DIR` | none | Scan the C# files under this directory tree (secrets and build output are skipped). Give --solution or --directory, not both. |
 | `--configuration` | `NAME` | Release | MSBuild configuration to evaluate --solution with. Only with --solution (an error with --directory). |
-| `--chunker` | `symbol\|fixed\|lines` | symbol | How files are cut into chunks: symbol (one chunk per member), lines (whole lines up to the limit) or fixed (token windows). Only symbol with 512 tokens is wire-eligible; anything else needs --lab. |
+| `--chunker` | `symbol\|fixed\|lines` | symbol | How files are cut into chunks: symbol (one chunk per member), lines (whole lines up to the limit) or fixed (token windows). Only symbol and lines with 512 tokens are wire-eligible; anything else needs --lab. |
 | `--chunk-tokens` | `N` | 512 | Maximum tokens per chunk. Part of the chunker name (symbol-512) and of the index file name. Values: integer 1..1048576 (tokens). |
 | `--path` | `GLOB` | none | Encode only the chunks of files matching this glob (a leading '!' negates). Combine with --symbol and --since: the selection is their union. Repeatable: one value per flag, values may not contain commas. |
 | `--exclude` | `GLOB` | none | Drop files matching this glob from the selection everywhere. Repeatable: one value per flag, values may not contain commas. |

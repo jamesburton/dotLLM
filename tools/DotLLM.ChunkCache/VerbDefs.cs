@@ -83,7 +83,7 @@ internal static class VerbDefs
             Threads("Only an --offline encode runs forward passes with them."),
             O("store", Single, "The store directory (entries, one index per model and chunker, the registry). Created when missing; --dry-run writes nothing.", "DIR", "required"),
             .. SourceOptions("One of the two is required."),
-            .. ChunkerOptions("Only symbol with 512 tokens is wire-eligible; anything else needs --lab."),
+            .. ChunkerOptions("Only symbol and lines with 512 tokens are wire-eligible; anything else needs --lab."),
             .. SelectionOptions("Encode only the chunks of"),
             O("server", Single,
                 "The server owns the model identity and every K/V write: the index is named by its model.id and model.producer, and the chunks are queued as text through "

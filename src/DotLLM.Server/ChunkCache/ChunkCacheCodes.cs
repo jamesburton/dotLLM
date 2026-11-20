@@ -25,7 +25,7 @@ internal static class ChunkCacheCodes
     /// The chat template altered the span's text (Task 11), or the tokenizer merges across one of its edges with the text next to
     /// it. Chunks end in a newline, so a chunk followed by a newline-starting joiner (the Anthropic converter's <c>"\n"</c> join of
     /// inline text blocks) is always altered: send such chunks as a manifest over one string message
-    /// (<c>docs/CHUNK_CACHE.md</c>, "Chunk edges and joining"; contract ruling 75).
+    /// (<c>docs/CHUNK_CACHE.md</c>, "Chunk edges and joining").
     /// </summary>
     public const string TemplateAltered = "chunk_template_altered";
 
