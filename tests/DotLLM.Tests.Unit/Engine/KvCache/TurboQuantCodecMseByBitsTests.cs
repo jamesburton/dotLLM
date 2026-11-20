@@ -66,7 +66,7 @@ public sealed class TurboQuantCodecMseByBitsTests
     {
         double m = RelMse(d, bits, r => Gaussian(r, d));
         _output.WriteLine($"gaussian d={d} b={bits}: relMse={m:E4} eps={Eps(bits):E4} ratio={m / Eps(bits):F2}");
-        Assert.InRange(m, 0.7 * Eps(bits), 1.3 * Eps(bits));
+        Assert.InRange(m, 0.9 * Eps(bits), 1.1 * Eps(bits));
     }
 
     /// <summary>
