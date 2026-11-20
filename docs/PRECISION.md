@@ -670,7 +670,7 @@ PRs #1103, #1122, #1125, #1126.
 | G3 | CUDA | hybrid forward state F32 (activations, GDN, logits `rows·V·4`) | logits 970 MiB @1024 rows; +486 MiB per 512-row window | open | #1138 (activations), #1137 (logits) |
 | G4 | CUDA | hybrid F32 K/V staging (tiers without flash/kvq) | B2 8 KiB/token | open | #1136 (siblings: #968) |
 | G5 | CUDA | MTP head KV F32, doubled on growth | B2 16,392 B/token | **fixed on dev** (#1095, PR #1126): 1,156 B/token at q4_0 | #979 (duplicate) |
-| G6 | CUDA | G3 attention F32 score matrix | 32 heads @4096 ≈3.2 GB | open | #1134 |
+| G6 | CUDA | G3 attention F32 score matrix | 32 heads @4096 ≈3.2 GB | **gone for dense f16-KV prefills on hd64 / hd128 (group <= 8, 16+ rows)**: they run the fused `attention_flash_mma_prefill_kvq` F16 entry, F32 statistics in registers, no plane (#1923). Open for other shapes (G3 square / offset) | #1134, #1923 |
 | G7 | CUDA | Nemotron-H KV F32; MLA latent / default MLA KV F32 | per token | open | #968 (Nemotron-H), #1140 (MLA) |
 | G8 | CUDA | Gemma F32 KV round-trip + activation scratch | `2·kvLen·kvStride·4` | open | #1134 |
 | G9 | CUDA | split-KV partials F32 | ≈0.8 MB | sign-off pending | #1144 |

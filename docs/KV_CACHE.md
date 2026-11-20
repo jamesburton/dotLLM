@@ -864,7 +864,9 @@ On each new token write, the oldest window entry is quantized and appended to th
     hd80) is read one element at a time; the cache only requires the whole KV row to be a multiple of 32. Both K and V must be
     q8_0 / q4_0: an f16 + block mix is refused when the cache is created (it failed at the first KV write before).
   - `attention_flash_mma_prefill_kvq` (`native/kernels/attention_flash_mma_prefill_kvq.cu`, Ampere+): tensor-core causal prefill,
-    head_dim 64 / 128, F16 output, each thread decoding its 8-element chunk into the shared K/V tile. Cold prefill and the #1847
+    head_dim 64 / 128, F16 output. Each raw head row is staged in shared memory with 8-byte (hd128) / 4-byte (hd64) `cp.async`
+    copies issued one tile ahead and decoded in place (#1923; before, each thread `__ldg`-decoded its chunk synchronously). Its F16
+    entry serves the dense F16 cache's prefills since #1923 (`DOTLLM_CUDA_F16_FLASH_PREFILL=0` opts out). Cold prefill and the #1847
     prefix-reuse suffix prefill (`position_offset > 0`) share it, so q8_0 no longer goes through G3 over a dequantized scratch
     (#1846's suspect path is gone for q8_0). `DOTLLM_CUDA_KVQ_FLASH_PREFILL=0` forces the scalar kernel.
   - The quantize step writes one launch per contiguous run of rows (#1845; it was one per row: ~237K launches for a 2,966-token
