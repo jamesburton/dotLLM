@@ -55,7 +55,7 @@ internal static class McpTools
             "Scan a solution or folder, chunk it with a wire-eligible chunker and update the store's index (tokenizer only; nothing is encoded unless encode is true, which queues the missing chunks on the server).",
             Input($$$$"""
                 {"required": ["path"], "properties": {
-                  "store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the server's launch --model"},
+                  "store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the --model chunkcache mcp was started with"},
                   "path": {"type": "string", "description": ".sln/.slnx/.csproj or folder"},
                   "chunker": {{{{ChunkerProp}}}},
                   "configuration": {"type": "string", "default": "Release"},
@@ -67,7 +67,7 @@ internal static class McpTools
             "Choose the chunks for a context (paths/globs, a symbol's neighbourhood, git changes) under a token budget, from an index and its reference graph.",
             Input($$$$"""
                 {"properties": {
-                  "store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the server's launch --model"},
+                  "store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the --model chunkcache mcp was started with"},
                   "path": {"type": "string", "description": "solution/folder whose index to use"},
                   "chunker": {{{{ChunkerProp}}}},
                   "paths": {"type": "array", "items": {"type": "string"}}, "exclude": {"type": "array", "items": {"type": "string"}},
@@ -80,7 +80,7 @@ internal static class McpTools
         new("chunkcache_status",
             "Which chunks are missing or stale for a tree (by file and line range), and the store's statistics.",
             Input($$$$"""
-                {"properties": {"store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the server's launch --model"}, "path": {"type": "string"},
+                {"properties": {"store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the --model chunkcache mcp was started with"}, "path": {"type": "string"},
                   "chunker": {{{{ChunkerProp}}}},
                   "list_missing": {"type": "boolean", "default": false}}}
                 """),
@@ -88,7 +88,7 @@ internal static class McpTools
         new("chunkcache_evict",
             "Evict chunk entries through the server (or, with only a store, from that store directly): orphans, a path glob, a namespace, or all. A dry run unless dry_run is false.",
             Input("""
-                {"properties": {"store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the server's launch --model"},
+                {"properties": {"store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the --model chunkcache mcp was started with"},
                   "mode": {"enum": ["orphans", "path", "namespace", "all"], "default": "orphans"},
                   "path": {"type": "string", "description": "glob; mode=path: forget every entry first seen under it"},
                   "namespace": {"type": "string", "description": "admin keys only; others act on their own namespace"},
@@ -98,7 +98,7 @@ internal static class McpTools
         new("chunkcache_prewarm",
             "Queue isolated encodes of chunk texts on the server (text only: a chunkcache_select input read locally, or explicit texts).",
             Input("""
-                {"properties": {"store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the server's launch --model"},
+                {"properties": {"store": {"type": "string"}, "server": {"type": "string"}, "model": {"type": "string", "description": "GGUF for the tokenizer and chunk keys; default: the --model chunkcache mcp was started with"},
                   "select": {"type": "object", "additionalProperties": true, "description": "a chunkcache_select input; text is read locally"},
                   "texts": {"type": "array", "items": {"type": "object", "required": ["id", "text"], "additionalProperties": false,
                      "properties": {"id": {"type": "string"}, "text": {"type": "string"}}}},
@@ -179,7 +179,17 @@ internal static class McpTools
 
     private static bool Bool(JsonObject a, string name, bool fallback) => a[name] is JsonValue v && v.TryGetValue(out bool b) ? b : fallback;
 
-    private static string? Num(JsonObject a, string name) => a[name] is JsonValue v && v.TryGetValue(out long n) ? n.ToString(System.Globalization.CultureInfo.InvariantCulture) : null;
+    /// <summary>
+    /// An integer argument as the CLI spells it. A JSON integer may be written <c>100</c>, <c>100.0</c> or <c>1e2</c> (all pass the
+    /// schema's <c>integer</c>); each must reach the verb, because a dropped <c>max_encode_tokens</c> is an unbounded encode.
+    /// </summary>
+    private static string? Num(JsonObject a, string name)
+    {
+        if (a[name] is not JsonValue v) return null;
+        if (v.TryGetValue(out long n)) return n.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (v.TryGetValue(out double d) && d == Math.Floor(d) && Math.Abs(d) < 9e15) return ((long)d).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        throw new McpArgumentException($"{name}: not an integer in range.");
+    }
 
     private static IEnumerable<string> Strings(JsonObject a, string name) =>
         a[name] is JsonArray arr ? arr.Select(x => x!.GetValue<string>()) : [];
@@ -314,7 +324,7 @@ internal static class McpTools
             if (Str(sel, "path") is not { } path) throw new McpArgumentException("prewarm: select.path (the solution or folder to read the chunk text from) is required.");
             Source(v, path);
             Chunker(v, sel);
-            ModelOptions(v, a, d);
+            ModelOptions(v, Str(a, "model") is null && Str(sel, "model") is { } m ? new JsonObject { ["model"] = m } : a, d); // select.model counts too
             SelectOptions(v, sel, outputOptions: false);
         }
         return v.Done();

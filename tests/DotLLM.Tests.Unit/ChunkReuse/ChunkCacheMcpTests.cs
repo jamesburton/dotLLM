@@ -158,6 +158,35 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
         long queued = capped.GetProperty("structuredContent").GetProperty("encode_queued_tokens").GetInt64();
         Assert.InRange(queued, 1, budget); // a strict budget in tokens, never a chunk count
         Assert.True(queued < queuedAll);
+
+        // A JSON integer may arrive as 123.0 or 1.23e2 (it validates as "integer"): the cap must still apply, never be dropped.
+        foreach (string spelled in new[] { budget.ToString(System.Globalization.CultureInfo.InvariantCulture) + ".0", "1e2" })
+        {
+            await using McpWire wire3 = await McpWire.StartAsync(["--store", NewDir("store3"), "--model", _fx.ModelA, "--server", FakeUrl], PrewarmingServer(model));
+            JsonElement floaty = await wire3.CallToolAsync("chunkcache_build", $$"""{"path": {{JsonSerializer.Serialize(tree)}}, "encode": true, "max_encode_tokens": {{spelled}}}""");
+            Assert.False(IsError(floaty), floaty.ToString());
+            Assert.True(floaty.GetProperty("structuredContent").GetProperty("encode_queued_tokens").GetInt64() < queuedAll, spelled);
+        }
+    }
+
+    [Fact]
+    public async Task Prewarm_FromASelection_SendsTheChunkTextOnly()
+    {
+        string tree = NewTree();
+        using ModelHandle model = OpenModel();
+        var fake = PrewarmingServer(model);
+        await using McpWire wire = await McpWire.StartAsync(["--model", _fx.ModelA, "--server", FakeUrl], fake);
+
+        JsonElement result = await wire.CallToolAsync("chunkcache_prewarm", $$"""{"select": {"path": {{JsonSerializer.Serialize(tree)}}, "paths": ["src/Calc.cs"]} }""");
+        Assert.False(IsError(result), result.ToString());
+        Assert.True(result.GetProperty("structuredContent").GetProperty("queued").GetInt32() > 0);
+        JsonNode sent = JsonNode.Parse(Assert.Single(fake.Requests, r => r.Method == "POST").Body)!;
+        string calc = File.ReadAllText(Path.Combine(tree, "src", "Calc.cs")).ReplaceLineEndings("\n");
+        Assert.All(sent["texts"]!.AsArray(), t => Assert.Contains(t!["text"]!.GetValue<string>().Trim(), calc, StringComparison.Ordinal)); // only the selected file's text
+        Assert.All(sent["texts"]!.AsArray(), t => Assert.Subset(new HashSet<string>(StringComparer.Ordinal) { "id", "text", "source" }, t!.AsObject().Select(kv => kv.Key).ToHashSet(StringComparer.Ordinal))); // no hash, K/V or token ids
+
+        // Exactly one of texts / select.
+        Assert.True(IsError(await wire.CallToolAsync("chunkcache_prewarm", "{}")));
     }
 
     [Fact]
