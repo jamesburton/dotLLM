@@ -121,6 +121,10 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     // the dispatch falls through to G3, then attention_f16.
     private readonly CudaFlashAttention _flashAttention;
 
+    // #1922: split-KV tensor-core decode attention at depth (eager decode, f16 / q8_0 / q4_0 / TurboQuant in place).
+    private readonly CudaDenseDecodeV2 _denseDecodeV2;
+    internal CudaDenseDecodeV2 DenseDecodeV2 => _denseDecodeV2;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; private set; }
 
@@ -579,6 +583,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
 
         _g3Attention = new CudaG3Attention(kernels);
         _flashAttention = new CudaFlashAttention(kernels);
+        _denseDecodeV2 = new CudaDenseDecodeV2(kernels, config.NumAttentionHeads, config.NumKvHeads, config.HeadDim);
         _useHighPrecisionForward = ShouldUseHighPrecisionForward(weights);
         // The gemma4 forward runs the F32 path and uses the host LM head (the tied
         // vocab x hidden table is too large to expand to F32 device scratch), so it
@@ -1644,10 +1649,14 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                 int seqKv = cudaKvCache.CurrentLength;
                 MarkProfile(ProfileCategory.KvUpdate);
 
-                _kernels.LaunchAttention(qPtr, cudaKvCache.GetKeysPtr(layer),
-                    cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim,
-                    positions[0], slidingWindow, s, lw.AttnSinksDevice);
+                // #1922: split-KV tensor-core decode at depth; otherwise the scalar attention_f16.
+                if (!_denseDecodeV2.TryRun(qPtr, cudaKvCache.GetKeysPtr(layer), cudaKvCache.GetValuesPtr(layer),
+                        KvCacheDType.F32, KvCacheDType.F32, _state.AttnOutput, seqLen, seqKv, positions[0], slidingWindow,
+                        lw.AttnSinksDevice, window: 0, numHeads, numKvHeads, headDim, s))
+                    _kernels.LaunchAttention(qPtr, cudaKvCache.GetKeysPtr(layer),
+                        cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
+                        seqLen, seqKv, numHeads, numKvHeads, headDim,
+                        positions[0], slidingWindow, s, lw.AttnSinksDevice);
             }
             else
             {
@@ -1746,7 +1755,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                     // the graph-capture gate above admits CudaKvCache / windowed CudaQuantizedKvCache, never this type.
                     MarkProfile(ProfileCategory.KvUpdate);
                     CudaTurboQuantInPlaceAttention.Run(_kernels, tqInPlaceCache, layer, qPtr, kPtr, vPtr, positions, seqLen,
-                        numHeads, numKvHeads, headDim, slidingWindow, layerSinks, _state.AttnOutput, s, EnableKvqFlashPrefill);
+                        numHeads, numKvHeads, headDim, slidingWindow, layerSinks, _state.AttnOutput, s, EnableKvqFlashPrefill,
+                        _denseDecodeV2);
                 }
                 else if (kvCache is CudaKvCache cudaKvCache)
                 {
@@ -4782,6 +4792,12 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
             return;
         }
 
+        // #1922: split-KV tensor-core decode at depth over the quantized rows in place (pure quantized only: window == 0).
+        if (_denseDecodeV2.TryRun(qPtr, cache.GetQuantizedKeysPtr(layer), cache.GetQuantizedValuesPtr(layer),
+                cache.KeyDType, cache.ValueDType, _state.AttnOutput, seqLen, seqKv, positionOffset, slidingWindow, sinks, window,
+                numHeads, numKvHeads, headDim, s))
+            return;
+
         if (seqLen >= KvqFlashPrefillMinRows && Interlocked.Exchange(ref s_kvqScalarPrefillLogged, 1) == 0)
             Console.Error.WriteLine(
                 $"[dotLLM.Cuda] {cache.KeyDType}/{cache.ValueDType} KV prefill runs the scalar in-place attention_kvq kernel " +
@@ -5147,6 +5163,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         _context.MakeCurrent();
         CudaMemTrace.Dump("CudaTransformerModel.Dispose");
         ReportLaunchProfile();
+        _denseDecodeV2.Dispose();
         _cudaLora?.Dispose();
         DisposeDecodeGraph();
         DisposeMoeGraph();
