@@ -5247,7 +5247,15 @@ public sealed unsafe partial class CudaKernels : IDisposable
         if (!IsAttentionFlashPrefillKvqShape(numHeads, numKvHeads, headDim))
             throw new ArgumentException($"Unsupported shape for the flash prefill kvq kernel: {numHeads}/{numKvHeads}/{headDim}.");
         DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
-        if (kDtype is not null) Interlocked.Increment(ref AttentionFlashPrefillKvqLaunches);
+        if (kDtype is not null)
+        {
+            // #1923: the quantized entries copy raw head rows with cp.async of 8 B (hd128) / 4 B (hd64); every head row is then
+            // aligned iff the base is.
+            int align = headDim == 128 ? 8 : 4;
+            if ((k % align) != 0 || (v % align) != 0)
+                throw new ArgumentException($"flash prefill kvq needs {align}-byte-aligned K/V block bases (hd{headDim}).");
+            Interlocked.Increment(ref AttentionFlashPrefillKvqLaunches);
+        }
         else Interlocked.Increment(ref AttentionFlashPrefillF16Launches);
 
         int group = numHeads / numKvHeads;

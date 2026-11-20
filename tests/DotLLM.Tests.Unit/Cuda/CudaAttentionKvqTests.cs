@@ -106,6 +106,13 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
         [KvCacheDType.Q4_0, KvCacheDType.Q4_0, 128, 16, 2, 33, 50],    // group 8
         [KvCacheDType.Q8_0, KvCacheDType.Q4_0, 128, 8, 2, 17, 0],
         [KvCacheDType.Q4_0, KvCacheDType.Q8_0, 64, 6, 2, 64, 30],
+        // #1923 raw cp.async staging: odd KV head counts (head rows at 8- / 4-byte but not 16-byte offsets), seqKv = 16n + 1 (the
+        // tail clamp reads the last row; the NaN guard rows past the cache catch an unclamped read), a 4K-key history, and
+        // K Q8_0 with V Q4_0 at hd64.
+        [KvCacheDType.Q8_0, KvCacheDType.Q8_0, 128, 12, 3, 33, 288],
+        [KvCacheDType.Q4_0, KvCacheDType.Q4_0, 128, 15, 5, 40, 4057],
+        [KvCacheDType.Q8_0, KvCacheDType.Q4_0, 64, 9, 3, 47, 2002],
+        [KvCacheDType.Q4_0, KvCacheDType.Q8_0, 64, 6, 3, 17, 0],
     ];
 
     [SkippableTheory]
@@ -408,7 +415,12 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
         var h = new ushort[rows.Length];
         for (int i = 0; i < h.Length; i++) h[i] = FloatToHalf(rows[i]);
         nint src = Upload(h);
-        nint dst = Alloc((long)count * (stride / 32) * (fmt == KvCacheDType.Q8_0 ? 34 : 18));
+        long bytes = (long)count * (stride / 32) * (fmt == KvCacheDType.Q8_0 ? 34 : 18);
+        // 16 guard rows of 0xFF past the cache (#1923): every block scale there is an F16 NaN, so a kernel that reads past seqKv
+        // (an unclamped tail tile) produces NaN instead of silently reading zeros.
+        long guard = 16L * (stride / 32) * (fmt == KvCacheDType.Q8_0 ? 34 : 18);
+        nint dst = Alloc(bytes + guard);
+        CudaDriverApi.cuMemsetD8_v2(dst + (nint)bytes, 0xFF, (nuint)guard).ThrowOnError();
         _kernels!.LaunchQuantKv(src, dst, count * stride, fmt, _stream!.Handle);
         _stream.Synchronize();
         CudaDriverApi.cuMemFree_v2(src);
