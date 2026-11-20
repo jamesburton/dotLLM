@@ -57,13 +57,18 @@ public readonly record struct TurboQuantLayout(int HeadDim, int NumKvHeads, int 
     /// <summary>Code bytes for <paramref name="rows"/> positions of one layer, plus a 4-byte guard word.</summary>
     public long CodeBytesPerLayer(int rows) => (long)rows * NumKvHeads * CodeUintsPerVec * 4 + 4;
 
+    /// <summary>The most bytes per layer (both sides) that <see cref="KvBytesPerPosition"/> leaves out: a 4-byte guard word plus up to 3 bytes of norm round-up, per side.</summary>
+    public const int FixedBytesPerLayerBound = 2 * (4 + 3);
+
     /// <summary>Norm bytes for <paramref name="rows"/> positions of one layer.</summary>
     public long NormBytesPerLayer(int rows) => (long)rows * NumKvHeads * NormBytes;
 
     /// <summary>
     /// The real bytes one cached position costs across <paramref name="numLayers"/> layers, K and V: packed codes plus the norm
     /// (#1892). This is what KV sizing and admission charge for TurboQuant instead of an F16 figure; the per-layer guard word
-    /// (4 bytes per side per layer) is a fixed cost, not a per-position one, and is left out.
+    /// (4 bytes per side per layer) is a fixed cost, not a per-position one, and is left out; so is the CUDA cache's rounding of each
+    /// layer's norm buffer up to a 4-byte multiple (at most 3 bytes per side per layer). Both are a constant per-layer delta of at
+    /// most <see cref="FixedBytesPerLayerBound"/>, independent of context length.
     /// </summary>
     /// <param name="numLayers">KV slots (layers that hold KV).</param>
     /// <returns>Bytes per position.</returns>

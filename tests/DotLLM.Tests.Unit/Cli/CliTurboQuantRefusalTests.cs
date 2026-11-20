@@ -96,17 +96,45 @@ public sealed class CliTurboQuantCommandTests
 {
     /// <summary>Runs the real command tree, capturing Console and AnsiConsole (chat writes errors through AnsiConsole, which binds the
     /// console it first saw, so swapping Console.Out alone captures nothing once another test has used it).</summary>
-    internal static (int Code, string Output) Run(params string[] args)
+    internal static (int Code, string Output) Run(params string[] args) => RunWithInput(null, args);
+
+    /// <summary>Scripted keyboard for <c>AnsiConsole.Prompt</c>: each line is typed, then Enter; after the last line the input is exhausted.</summary>
+    private sealed class ScriptedInput(string text) : Spectre.Console.IAnsiConsoleInput
+    {
+        private readonly Queue<ConsoleKeyInfo> _keys = new(text.Select(ch => ch == (char)10
+            ? new ConsoleKeyInfo((char)13, ConsoleKey.Enter, false, false, false)
+            : new ConsoleKeyInfo(ch, ConsoleKey.A, false, false, false)));
+        public bool IsKeyAvailable() => _keys.Count > 0;
+        public ConsoleKeyInfo? ReadKey(bool intercept) => _keys.Count > 0 ? _keys.Dequeue() : null;
+        public Task<ConsoleKeyInfo?> ReadKeyAsync(bool intercept, CancellationToken cancellationToken) => Task.FromResult(ReadKey(intercept));
+    }
+
+    /// <summary>The captured console with the scripted keyboard in front of it.</summary>
+    private sealed class ConsoleWithInput(Spectre.Console.IAnsiConsole inner, Spectre.Console.IAnsiConsoleInput input) : Spectre.Console.IAnsiConsole
+    {
+        public Spectre.Console.Profile Profile => inner.Profile;
+        public Spectre.Console.IAnsiConsoleCursor Cursor => inner.Cursor;
+        public Spectre.Console.IAnsiConsoleInput Input => input;
+        public Spectre.Console.IExclusivityMode ExclusivityMode => inner.ExclusivityMode;
+        public Spectre.Console.Rendering.RenderPipeline Pipeline => inner.Pipeline;
+        public void Clear(bool home) => inner.Clear(home);
+        public void Write(Spectre.Console.Rendering.IRenderable renderable) => inner.Write(renderable);
+    }
+
+    /// <summary>As <see cref="Run"/> with <paramref name="stdin"/> typed at the console (a chat turn; lines end with a newline).</summary>
+    internal static (int Code, string Output) RunWithInput(string? stdin, params string[] args)
     {
         var (out0, err0, ansi0) = (Console.Out, Console.Error, Spectre.Console.AnsiConsole.Console);
         var sw = new StringWriter();
         Console.SetOut(sw);
         Console.SetError(sw);
-        Spectre.Console.AnsiConsole.Console = Spectre.Console.AnsiConsole.Create(new Spectre.Console.AnsiConsoleSettings
+        var captured = Spectre.Console.AnsiConsole.Create(new Spectre.Console.AnsiConsoleSettings
         {
             Out = new Spectre.Console.AnsiConsoleOutput(sw),
             Ansi = Spectre.Console.AnsiSupport.No,
+            Interactive = Spectre.Console.InteractionSupport.Yes,
         });
+        Spectre.Console.AnsiConsole.Console = stdin is null ? captured : new ConsoleWithInput(captured, new ScriptedInput(stdin));
         try { return (CliCommandModel.Run(args).ExitCode, sw.ToString()); }
         finally { Console.SetOut(out0); Console.SetError(err0); Spectre.Console.AnsiConsole.Console = ansi0; }
     }

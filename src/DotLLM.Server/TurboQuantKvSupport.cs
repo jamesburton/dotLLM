@@ -96,7 +96,7 @@ public static class TurboQuantKvSupport
             return Refuse(Gap.Hip, "TurboQuant KV does not run on hip yet");
         if (kv.TurboQuantUseQjl && ctx.Backend is KvBackendKind.Cuda or KvBackendKind.Vulkan)
             return Refuse(Gap.Qjl, $"TurboQuant with QJL (tq*q) does not run on {ctx.Backend.ToString().ToLowerInvariant()} yet: " +
-                "the in-place GPU kernels cover the MSE stage only (step 5); use tq without the trailing q");
+                "the in-place GPU kernels cover the MSE stage only (step 5); use tq without the trailing q, or --device cpu for tq*q (QJL)");
         // Not a gap and not a ticket to close: there is no original-space ring in a TurboQuant cache (codes are all it holds), so a
         // mixed-precision window has nothing to keep recent tokens in. Refused before any cache is built.
         if (ctx.CacheWindow > 0)
@@ -136,7 +136,7 @@ public static class TurboQuantKvSupport
         return null;
     }
 
-/// <summary>The refusal for two TurboQuant sides whose bit width or QJL flag differ (a mixed format, #1887 step 6).</summary>
+    /// <summary>The refusal for two TurboQuant sides whose bit width or QJL flag differ (a mixed format, #1887 step 6).</summary>
     /// <param name="keyText">The K flag as given (e.g. <c>tq3</c>).</param>
     /// <param name="valueText">The V flag as given.</param>
     /// <returns>The refusal reason.</returns>

@@ -122,11 +122,20 @@ public static class BenchRunner
         // value nothing but the last row consumes; other models ignore the hint and behave as
         // before.
         int nextToken;
+        // #1892: a model with a hard per-forward limit (Vulkan in-place TurboQuant) is never handed the whole prompt; the prefill is split at
+        // the limit through the same rule the generator uses. No limit: one call, as before.
+        int prefillStep = PrefillStep(model, 0, promptLen);
+        ITensor? prefillLogits = null;
         var prefillSw = Stopwatch.StartNew();
-        ITensor prefillLogits = model.Forward(promptTokens, positions, deviceId: -1, cache, lastTokenLogitsOnly: true);
+        for (int a = 0; a < promptLen; a += prefillStep)
+        {
+            int n = Math.Min(prefillStep, promptLen - a);
+            prefillLogits?.Dispose();
+            prefillLogits = model.Forward(promptTokens.AsSpan(a, n), positions.AsSpan(a, n), deviceId: -1, cache, lastTokenLogitsOnly: true);
+        }
         prefillSw.Stop();
         using (prefillLogits)
-            nextToken = ArgmaxLastRow(prefillLogits);
+            nextToken = ArgmaxLastRow(prefillLogits!);
 
         int nextPos = promptLen;
 
@@ -164,7 +173,7 @@ public static class BenchRunner
             int offset = 0;
             while (offset < depth)
             {
-                int chunkLen = Math.Min(DepthExtensionChunkSize, depth - offset);
+                int chunkLen = Math.Min(PrefillStep(model, DepthExtensionChunkSize, depth), depth - offset);
                 using var logits = model.Forward(
                     extra.AsSpan(offset, chunkLen), extraPos.AsSpan(offset, chunkLen),
                     deviceId: -1, cache, lastTokenLogitsOnly: true);
@@ -218,6 +227,16 @@ public static class BenchRunner
         return new BenchRep(prefillSw.Elapsed.TotalMilliseconds, decodeMs, promptLen, decodeTokens);
     }
 
+    /// <summary>
+    /// Tokens per prefill forward: the configured size (0 = the whole <paramref name="length"/>), never above the model's hard limit
+    /// (<see cref="IModel.MaxPrefillForwardTokens"/>, #1892) - <see cref="DotLLM.Engine.PrefillChunkBound"/>, the rule every engine path shares.
+    /// </summary>
+    internal static int PrefillStep(IModel model, int configured, int length)
+    {
+        int step = DotLLM.Engine.PrefillChunkBound.Resolve(configured, 0, model.MaxPrefillForwardTokens, out _);
+        return step > 0 ? step : Math.Max(1, length);
+    }
+
     private static int[]? ParseChunkArms(string? spec)
     {
         if (string.IsNullOrWhiteSpace(spec)) return null;
@@ -238,7 +257,7 @@ public static class BenchRunner
         int promptLen = promptTokens.Length;
         int[] positions = new int[promptLen];
         for (int i = 0; i < promptLen; i++) positions[i] = i;
-        int step = chunk > 0 ? chunk : promptLen;
+        int step = PrefillStep(model, chunk, promptLen);
 
         DotLLM.Vulkan.VulkanDevice.SubmitContext.DiagFenceWaits = 0;
         DotLLM.Vulkan.VulkanDevice.SubmitContext.DiagFenceWaitMaxMs = 0;

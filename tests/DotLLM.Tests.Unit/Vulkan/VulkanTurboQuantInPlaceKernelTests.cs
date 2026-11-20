@@ -1105,6 +1105,22 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         });
 
     /// <summary>
+    /// #1892 Task 8: the shared factory is self-sufficient on Vulkan. It builds the twin set itself, so a caller that skipped the post-load
+    /// pass still gets the in-place cache, and a request the host cannot serve is refused with the Vulkan reason, not a #1900 host-gap message.
+    /// </summary>
+    [SkippableFact]
+    public void CreateFactory_BuildsTheTwinSetItself_AndRefusesWithAnAccurateReason()
+        => WithSyntheticModel(layers: 1, heads: 4, kvHeads: 2, hd: 32, hidden: 128, vocab: 96, maxSeq: 128, (model, config, spvDir) =>
+        {
+            var kv = new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant, TurboQuantBits: 4);
+            using (var cache = DotLLM.Server.TurboQuantKv.CreateFactory(model, kv)(config, 32))   // no PostLoadRefusal first
+                Assert.Equal(VulkanKvStorage.Tq, Assert.IsType<VulkanKvCache>(cache).Storage);
+            var e = Assert.Throws<NotSupportedException>(() => DotLLM.Server.TurboQuantKv.CreateFactory(model, kv with { TurboQuantUseQjl = true }));
+            Assert.Contains("Vulkan host", e.Message);
+            Assert.DoesNotContain("there is no other TurboQuant cache", e.Message);
+        });
+
+    /// <summary>
     /// A prompt longer than one TurboQuant forward may take (32 KV heads: 2047 rows) through <see cref="TextGenerator"/> with no
     /// chunk size configured: the generator chunks by the model's preference instead of meeting the guard in <c>Forward</c>, and
     /// the result equals a run with an explicit small chunk size (one layer, so both hold identical codes).

@@ -15,6 +15,19 @@ namespace DotLLM.Server;
 public static class TurboQuantKv
 {
     private static long s_inPlaceCaches, s_scratchCaches;
+    private static readonly AsyncLocal<Action<IKvCache>?> s_observer = new();
+
+    /// <summary>
+    /// Test hook, scoped to the calling async context: receives every cache the factories of <see cref="CreateFactory"/> build there (so a
+    /// test can assert the type and bytes of what ITS command built, which the process-wide counters cannot show under parallel tests).
+    /// </summary>
+    internal static Action<IKvCache>? Observer { get => s_observer.Value; set => s_observer.Value = value; }
+
+    private static T Built<T>(T cache) where T : IKvCache
+    {
+        s_observer.Value?.Invoke(cache);
+        return cache;
+    }
 
     /// <summary>In-place TurboQuant caches the factories of <see cref="CreateFactory"/> have built since process start (diagnostic / test: proves a command built the in-place cache).</summary>
     public static long InPlaceCachesBuilt => Interlocked.Read(ref s_inPlaceCaches);
@@ -116,25 +129,33 @@ public static class TurboQuantKv
     public static Func<ModelConfig, int, IKvCache> CreateFactory(IModel model, KvCacheConfig kv)
     {
         ArgumentNullException.ThrowIfNull(model);
+        // A Vulkan host's capability is only meaningful once its twin set is built for this request: build it here, so the factory never
+        // depends on a caller having run PostLoadRefusal first.
+        if (model is DotLLM.Vulkan.VulkanTransformerModel vkHost)
+            PrepareHost(vkHost, kv, vkHost.Config);
         switch (model)
         {
             case DotLLM.Cuda.CudaTransformerModel cuda when cuda.SupportsInPlaceTurboQuant(kv):
-                return (_, size) => { Interlocked.Increment(ref s_inPlaceCaches); return cuda.CreateKvCache(size, kv); };
+                return (_, size) => { Interlocked.Increment(ref s_inPlaceCaches); return Built(cuda.CreateKvCache(size, kv)); };
             case DotLLM.Vulkan.VulkanTransformerModel vk when vk.SupportsInPlaceTurboQuant(kv):
-                return (_, size) => { Interlocked.Increment(ref s_inPlaceCaches); return vk.CreateKvCache(size); };
+                return (_, size) => { Interlocked.Increment(ref s_inPlaceCaches); return Built(vk.CreateKvCache(size)); };
+            case DotLLM.Vulkan.VulkanTransformerModel:
+                throw new NotSupportedException(
+                    "TurboQuant KV does not run in place on this Vulkan host for this request: its twin set could not be built complete " +
+                    "(a missing _kvtq shader or an unsupported geometry, head dim or format), so no cache is built. See #1892; hybrid hosts: #1900.");
             case TransformerModel when kv.TurboQuantUseQjl:
                 return (cfg, size) =>
                 {
                     Interlocked.Increment(ref s_scratchCaches);
-                    return new TurboQuantKvCache(KvGeometry.SlotCount(cfg), cfg.NumKvHeads, cfg.HeadDim, size,
-                        kv.TurboQuantBits, kv.TurboQuantSeed, useQjl: true);
+                    return Built(new TurboQuantKvCache(KvGeometry.SlotCount(cfg), cfg.NumKvHeads, cfg.HeadDim, size,
+                        kv.TurboQuantBits, kv.TurboQuantSeed, useQjl: true));
                 };
             case TransformerModel tm when tm.SupportsInPlaceTurboQuant(kv):
                 return (cfg, size) =>
                 {
                     Interlocked.Increment(ref s_inPlaceCaches);
-                    return new TurboQuantInPlaceKvCache(KvGeometry.SlotCount(cfg), cfg.NumKvHeads, cfg.HeadDim, size,
-                        kv.TurboQuantBits, kv.TurboQuantSeed);
+                    return Built(new TurboQuantInPlaceKvCache(KvGeometry.SlotCount(cfg), cfg.NumKvHeads, cfg.HeadDim, size,
+                        kv.TurboQuantBits, kv.TurboQuantSeed));
                 };
             default:
                 throw new NotSupportedException(

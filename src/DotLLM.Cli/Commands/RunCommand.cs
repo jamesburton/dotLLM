@@ -789,6 +789,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 if (tqPostRefusal is not null)
                 {
                     DeviceCli.PrintError(tqPostRefusal, settings.Json);
+                    model.Dispose();
                     return 1;
                 }
                 if (!settings.Json)

@@ -200,6 +200,8 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         _supportsThreadedState = model.SupportsThreadedSequenceState;
     }
 
+    private bool _loggedPrefillBound;
+
     /// <summary>True when a pending prefill is longer than the model's hard per-forward limit (<see cref="IModel.MaxPrefillForwardTokens"/>, #1892).</summary>
     private bool PrefillOverBound()
     {
@@ -221,6 +223,13 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         if (cap <= 0 || len <= cap)
             return _model.Forward(seq.PromptTokenIds.AsSpan(start, len), _prefillPositions.AsSpan(posOff, len),
                 deviceId: -1, seq.KvCache, lastTokenLogitsOnly: true);
+        if (!_loggedPrefillBound)
+        {
+            _loggedPrefillBound = true;
+            Console.Error.WriteLine($"[dotllm] a {len}-token prompt is above the {cap} rows one forward may take on this model's KV cache " +
+                $"(the Vulkan TurboQuant dispatch grid bounds it); the scheduler prefills in passes of {cap}" +
+                (_options.MaxPrefillTokensPerStep > cap ? $" (--prefill-chunk-size {_options.MaxPrefillTokensPerStep} is an admission cap, not a pass size)." : "."));
+        }
         ITensor? logits = null;
         try
         {
@@ -1226,7 +1235,8 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         }
 
         // #1892: a model that bounds one forward's rows (Vulkan in-place TurboQuant) takes an over-long prompt in bounded passes, so the
-        // fused batch (which would hand it the whole suffix) is skipped for it.
+        // fused batch (which would hand it the whole suffix) is skipped for it. A threaded-state host keeps its batch: only ForwardBatch carries
+        // its per-sequence state, no such host has a limit today, and sending it down the stateless per-sequence path would lose that state.
         if (ShouldBatch(count) && !(PrefillOverBound() && !_supportsThreadedState))
         {
             IReadOnlyList<ITensor> results;
