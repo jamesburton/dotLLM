@@ -906,6 +906,36 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
         Assert.True(s.ShouldEncode(Item('o', x, "docs/B.md", last)));
     }
 
+    /// <summary>
+    /// The namespace and whole-store forgets fence by sequence number too: an item queued at or before the forget is never
+    /// encoded or written afterwards, in the forgotten namespace (namespace mode) or in any (all without a namespace); an
+    /// item queued later is.
+    /// </summary>
+    [Fact]
+    public async Task NamespaceAndStoreWideForgets_FenceItemsQueuedBeforeThem()
+    {
+        string Text(char ch) => new string(ch, 64) + "\n";
+        long e = ChunkStoreServiceTests.FileBytes(Text('a'), 4);
+        var x = new ChunkCaller(true, "tenant-x");
+        var y = new ChunkCaller(true, "tenant-y");
+        using var s = StartService(NewStore(), budget: 100 * e, nsBudget: 0);
+        Put(s, x, Text('1'));
+        Put(s, y, Text('2'));
+        long last = s.Queue.LastSeq;
+        ChunkEncodeItem Item(char ch, ChunkCaller who, long seq) =>
+            new(who.Namespace, ChunkStoreServiceTests.KeyFor(Text(ch), who.Namespace), Text(ch), 65, "src/A.cs") { Seq = seq };
+
+        await s.EvictAsync(new EvictRequest(EvictMode.Namespace, x.Namespace, null, false), CancellationToken.None);
+        Assert.False(s.ShouldEncode(Item('a', x, last)));
+        Assert.True(s.ShouldEncode(Item('b', y, last)));       // control: the other namespace is untouched
+        Assert.True(s.ShouldEncode(Item('c', x, last + 1)));   // queued after the forget
+
+        await s.EvictAsync(new EvictRequest(EvictMode.All, null, null, false), CancellationToken.None);
+        Assert.False(s.ShouldEncode(Item('b', y, last)));      // the whole store: every namespace
+        Assert.False(s.ShouldEncode(Item('d', x, 1)));
+        Assert.True(s.ShouldEncode(Item('e', y, last + 1)));
+    }
+
     [Fact]
     public async Task NamespaceBudget_PrewarmEvictsOnlyOwnRows()
     {
