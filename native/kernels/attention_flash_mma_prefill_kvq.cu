@@ -345,15 +345,6 @@ __device__ __forceinline__ void pk_prefill_body(
             for (int g = warp; g < NG; g += nwarps) decode_group(buf, g);
         }
     };
-    // Staged tile t+1 is decoded inside tile t's P.V loop (#1923, as #1094's hd256 kernel does): its copies were issued at the top
-    // of iteration t and land during QK; this warp waits for them after P.V step 0 and decodes its row groups spread over the
-    // remaining steps, so the shared-memory loads / ALU / stores issue while the tensor pipe runs the preceding HMMAs.
-    // PK_STAGED_PV_DECODE=0 decodes at the top of iteration t instead (before the opening barrier; A/B only).
-#ifndef PK_STAGED_PV_DECODE
-#define PK_STAGED_PV_DECODE 1
-#endif
-    constexpr int NPV = HD / 16;             // P.V steps per tile (8 at hd128, 4 at hd64)
-    const int my_groups = (NG - warp + nwarps - 1) / nwarps;
 
     float o[HD / 8][4];
     #pragma unroll
@@ -368,12 +359,7 @@ __device__ __forceinline__ void pk_prefill_body(
     const int pos_hi = pos_lo + 8;
     const half* qw = sQ + (size_t)warp * PK_Q_TILE * SS;
 
-    if (num_tiles > 0)
-    {
-        load_tile(0, 0);
-        pk_cp_async_commit();
-        if constexpr (kStaged && PK_STAGED_PV_DECODE) { pk_cp_async_wait<0>(); decode_tile(0); }
-    }
+    if (num_tiles > 0) { load_tile(0, 0); pk_cp_async_commit(); }
 
     for (int t = 0; t < num_tiles; t++)
     {
@@ -381,7 +367,7 @@ __device__ __forceinline__ void pk_prefill_body(
         if (t + 1 < num_tiles) load_tile(t + 1, (t + 1) & 1);
         pk_cp_async_commit();
         pk_cp_async_wait<1>();
-        if constexpr (kStaged && !PK_STAGED_PV_DECODE) decode_tile(buf);
+        decode_tile(buf);   // staged only: tile t landed (wait above); decoded before the barrier publishes it
         __syncthreads();
 
         if (warp < group)
@@ -484,15 +470,6 @@ __device__ __forceinline__ void pk_prefill_body(
                                                + (np * 2 + (lane >> 4)) * 8);
                     pk_mma(o[2 * np], pa[kk], b[0], b[1]);
                     pk_mma(o[2 * np + 1], pa[kk], b[2], b[3]);
-                    if constexpr (kStaged && PK_STAGED_PV_DECODE && PK_KV_TILE == 16)
-                    {
-                        if (np >= 1 && t + 1 < num_tiles)
-                        {
-                            if (np == 1) { pk_cp_async_wait<0>(); __syncwarp(); }
-                            for (int u = (np - 1) * my_groups / (NPV - 1); u < np * my_groups / (NPV - 1); u++)
-                                decode_group((t + 1) & 1, warp + u * nwarps);
-                        }
-                    }
                 }
             }
         }
@@ -525,9 +502,11 @@ __device__ __forceinline__ void pk_prefill_body(
 }
 
 // Quantized loader variant (#1923 A/B): 0 = synchronous __ldg + V2 decode (pre-#1923), 1 = synchronous __ldg + packed-half2 decode,
-// 2 = raw cp.async staging + packed-half2 decode (PK_STAGED_PV_DECODE picks where the decode runs). All are bit-identical.
+// 2 = raw cp.async staging + packed-half2 decode (default). All are bit-identical. RTX 3060, 1024 rows at 31,744 keys, 32/8/128,
+// ms per launch (f16f16 entry 25.7-25.9): q8_0 0: 37.0, 1: 35.5, 2: 32.9; q4_0 0: 36.2-36.4, 1: 35.1-35.5, 2: 31.6. Decoding the staged tile
+// inside the previous tile's P.V loop instead (#1094's hd256 schedule) measured 41.0 / 39.8: removed.
 #ifndef PK_KVQ_LOADER
-#define PK_KVQ_LOADER 1
+#define PK_KVQ_LOADER 2
 #endif
 #if PK_KVQ_LOADER == 0
 using PkStQ8_128 = PkLoadQuant<V2LoadQ8>;
