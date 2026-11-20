@@ -65,6 +65,7 @@ switch (mode)
     case "parity": foreach (int b in bitsList) Parity(b); break;
     case "quality": Quality(); break;
     case "vgpr": foreach (int b in bitsList) Vgpr(b); break;
+    case "bytes": Bytes(); break;
     default: throw new ArgumentException("mode");
 }
 return;
@@ -395,6 +396,16 @@ static double Kl(float[] r, float[] c)
     double lr = Math.Log(rs), lc = Math.Log(cs), kl = 0;
     for (int i = 0; i < r.Length; i++) { double lp = r[i] - rm - lr; double p = Math.Exp(lp); if (p > 0) kl += p * (lp - (c[i] - cm - lc)); }
     return kl;
+}
+
+// ───────────────────────── bytes per token ─────────────────────────
+void Bytes()
+{
+    long elems = 2L * config.NumLayers * config.NumKvHeads * config.HeadDim;   // K and V
+    var rowsOut = new List<string> { $"f16	{elems * 2}", $"q8_0	{elems / 32 * 34}", $"q4_0	{elems / 32 * 18}" };
+    foreach (int b in new[] { 2, 3, 4, 8 })
+        rowsOut.Add($"tq{b}	{DotLLM.Core.Attention.TurboQuantInPlaceSupport.KvBytesPerToken(config, new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant, 0, TurboQuantBits: b))}");
+    foreach (var r in rowsOut) Log($"BYTES/token {tag}: {r}");
 }
 
 // ───────────────────────── vgpr (Vulkan, VK_AMD_shader_info) ─────────────────────────
