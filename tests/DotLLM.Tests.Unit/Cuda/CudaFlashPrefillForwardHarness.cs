@@ -82,6 +82,8 @@ public sealed class CudaFlashPrefillForwardHarness
     public void FlashPrefill_ParityAndPpSpeedup()
     {
         Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_CUDA_FLASH_E2E"), "1", StringComparison.Ordinal), "DOTLLM_CUDA_FLASH_E2E=1 not set.");
+        // #1923: this harness measures the older kernels; the F16 flash prefill would take their calls (opt-in, process-wide).
+        CudaTransformerModel.EnableF16FlashPrefill = false;
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
 
         string? modelPath = ResolveModelPath();

@@ -5031,6 +5031,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
         _ => false,
     };
 
+    /// <summary>Launches since process start of <see cref="LaunchAttention"/> with more than one query row (prefill; #1923 diagnostics).</summary>
+    internal static long AttentionF16PrefillLaunches;
+
     /// <summary>
     /// Naive scaled dot-product attention with causal mask and GQA.
     /// <para>
@@ -5059,6 +5062,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         // Tiled online softmax: q_shared[headDim] + score_tile[256] + out_accum[headDim] + warp_scratch[32]
         const int TileKv = 256;
         uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+        if (seqQ > 1) Interlocked.Increment(ref AttentionF16PrefillLaunches);
 
         CudaDriverApi.cuLaunchKernel(_attentionFunc,
                 (uint)numBlocks, 1, 1, BlockSize, 1, 1,
@@ -5117,6 +5121,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
 
     /// <summary>Launches since process start of <see cref="LaunchAttentionFlashPrefillKvq"/> with a quantized K/V pair.</summary>
     internal static long AttentionFlashPrefillKvqLaunches;
+
+    /// <summary>Launches since process start of <see cref="LaunchAttentionFlashPrefillKvq"/> with F16 K/V (null formats; #1923).</summary>
+    internal static long AttentionFlashPrefillF16Launches;
 
     private static int KvqFormatCode(KvCacheDType dtype) => dtype switch
     {
@@ -5241,6 +5248,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
             throw new ArgumentException($"Unsupported shape for the flash prefill kvq kernel: {numHeads}/{numKvHeads}/{headDim}.");
         DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
         if (kDtype is not null) Interlocked.Increment(ref AttentionFlashPrefillKvqLaunches);
+        else Interlocked.Increment(ref AttentionFlashPrefillF16Launches);
 
         int group = numHeads / numKvHeads;
         nint qArg = q, kArg = k, vArg = v, oArg = output;

@@ -126,10 +126,11 @@ public sealed class CudaAdmissionGpuTests
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptx);
-        bool savedEnabled = CudaG3Attention.Enabled;
+        bool savedEnabled = CudaG3Attention.Enabled, savedF16Flash = CudaTransformerModel.EnableF16FlashPrefill;
         int n = 400;
         try
         {
+            CudaTransformerModel.EnableF16FlashPrefill = false;   // #1923: a G3 test; the F16 flash prefill would take the call first
             // Reference: G3 off (attention_f16), which also grows the forward scratch to n so the arm below allocates nothing else.
             CudaG3Attention.Enabled = false;
             float[] f16;
@@ -177,6 +178,10 @@ public sealed class CudaAdmissionGpuTests
             }
             finally { CudaAdmission.FreeBytesOverride = saved; }
         }
-        finally { CudaG3Attention.Enabled = savedEnabled; }
+        finally
+        {
+            CudaG3Attention.Enabled = savedEnabled;
+            CudaTransformerModel.EnableF16FlashPrefill = savedF16Flash;
+        }
     }
 }

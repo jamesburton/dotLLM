@@ -111,6 +111,7 @@ public sealed class CudaPrefixReuseTests
         var grown = new TextGenerator(model, tokenizer, factory, growCache, mtpEnabled: false, prefixCacheHeadroomTokens: 0);
         Assert.Equal(turn1.GeneratedTokenIds, grown.Generate(Turn1(), opts).GeneratedTokenIds);
         long offsetRunsBefore = CudaG3Attention.OffsetRunCount;
+        long f16FlashBefore = CudaKernels.AttentionFlashPrefillF16Launches;
         long kvqFlashBefore = CudaKernels.AttentionFlashPrefillKvqLaunches;
         long growthsBefore = CudaKvGrowth.GrowthCount;
         int capturesBefore = model.GraphCaptureCount, replaysBefore = model.GraphReplayCount;
@@ -128,7 +129,12 @@ public sealed class CudaPrefixReuseTests
         Assert.True(actual.Timings.CachedTokenCount <= common, "cached more rows than the prompts share");
         Assert.True(growths >= 1, "turn 2 should have grown the retained cache");
         _out.WriteLine($"{kvType}: G3 enabled {CudaG3Attention.Enabled}, offset runs +{CudaG3Attention.OffsetRunCount - offsetRunsBefore}");
-        if (kvType == "f16" && CudaG3Attention.Enabled)   // GeForce Ampere default: the F16 suffix prefill must take the G3 offset path
+        bool f16Flash = CudaTransformerModel.EnableF16FlashPrefill && model.Kernels.HasAttentionFlashPrefillKvq(config.HeadDim, null, null)
+            && CudaKernels.IsAttentionFlashPrefillKvqShape(config.NumAttentionHeads, config.NumKvHeads, config.HeadDim);
+        _out.WriteLine($"{kvType}: F16 flash prefill launches +{CudaKernels.AttentionFlashPrefillF16Launches - f16FlashBefore}");
+        if (kvType == "f16" && f16Flash)   // #1923: the F16 suffix prefill takes the tensor-core flash entry at an offset
+            Assert.True(CudaKernels.AttentionFlashPrefillF16Launches > f16FlashBefore, "the reused prefill did not run the F16 flash entry");
+        else if (kvType == "f16" && CudaG3Attention.Enabled)   // otherwise, on GeForce Ampere, the G3 offset path
             Assert.True(CudaG3Attention.OffsetRunCount > offsetRunsBefore, "the reused prefill did not run G3 with a position offset");
         _out.WriteLine($"{kvType}: kvq flash prefill launches +{CudaKernels.AttentionFlashPrefillKvqLaunches - kvqFlashBefore}");
         if (kvType == "q8_0" && model.Kernels.HasAttentionFlashPrefillKvq(config.HeadDim, KvCacheDType.Q8_0, KvCacheDType.Q8_0))
