@@ -1816,7 +1816,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                     // (Gemma query_pre_attn_scalar, Granite attention_multiplier) by pre-scaling Q.
                     PrescaleQForKernelDefault(q, seqLen * qStrideLayer, attnScale, headDimLayer);
                     // Quantized path: dequantize KV tiles on-the-fly during attention
-                    Attention.Execute(q, qkvCache, layer, attnOut,
+                    AttendQuantizedKv(q, qkvCache, layer, attnOut,
                         seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], _threadPool,
                         layerSlidingWindow, attnSoftCap, lw.AttnSinks);
                 }
@@ -2502,7 +2502,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                 {
                     // Gemma-4 scale is 1.0; the quantized kernel hard-codes 1/sqrt(headDim).
                     PrescaleQForKernelDefault(q, seqLen * qStrideLayer, attnScale, headDimLayer);
-                    Attention.Execute(q, qkvCacheShared, donorLayer, attnOut,
+                    AttendQuantizedKv(q, qkvCacheShared, donorLayer, attnOut,
                         seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], _threadPool,
                         layerSlidingWindow, softCap: 0f);
                 }
@@ -2599,7 +2599,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                 // so this branch is reached only for uniform-head-dim Gemma-4.)
                 // Gemma-4 scale is 1.0; the quantized kernel hard-codes 1/sqrt(headDim).
                 PrescaleQForKernelDefault(q, seqLen * qStrideLayer, attnScale, headDimLayer);
-                Attention.Execute(q, qkvCache, layer, attnOut,
+                AttendQuantizedKv(q, qkvCache, layer, attnOut,
                     seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], _threadPool,
                     layerSlidingWindow, softCap: 0f);
             }
@@ -3921,7 +3921,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                 if (kvCache is IQuantizedKvCache qkvCache)
                 {
                     PrescaleQForKernelDefault(qSlice, n * qStride, attnScale, headDim);
-                    Attention.Execute(qSlice, qkvCache, layer, aSlice,
+                    AttendQuantizedKv(qSlice, qkvCache, layer, aSlice,
                         n, seqKv, numHeads, numKvHeadsLayer, headDim, positions[0], _threadPool,
                         layerSlidingWindow, attnSoftCap);
                 }
@@ -4179,6 +4179,23 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     {
         if (_residualScale != 1.0f)
             TensorPrimitives.Multiply(new Span<float>(buf, count), _residualScale, new Span<float>(buf, count));
+    }
+
+    /// <summary>
+    /// Attention over a quantized KV cache. A TurboQuant cache (<see cref="ITurboQuantKvCache"/>) is read in place in rotated code
+    /// space: the query is rotated before and the output rotated back after (#1892). Every other quantized cache keeps the plain
+    /// kernel; the plain kernel refuses a TurboQuant cache, so no host can reach it without the rotations.
+    /// </summary>
+    private static void AttendQuantizedKv(float* q, IQuantizedKvCache cache, int layer, float* output,
+                                          int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset,
+                                          ComputeThreadPool? pool, int? slidingWindow, float softCap, float[]? sinks = null)
+    {
+        if (cache is ITurboQuantKvCache tq)
+            Attention.ExecuteTurboQuant(q, tq, layer, output, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, pool,
+                                        slidingWindow, softCap, sinks);
+        else
+            Attention.Execute(q, cache, layer, output, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, pool,
+                              slidingWindow, softCap, sinks);
     }
 
     /// <summary>

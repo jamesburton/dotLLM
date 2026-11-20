@@ -1171,6 +1171,8 @@ public static class Attention
         Q8_0,
         /// <summary>Q4_0 blocks.</summary>
         Q4_0,
+        /// <summary>TurboQuant codes (packed words per head vector) with a separate norm array, decoded as <c>norm * centroid[code]</c> (#1892).</summary>
+        TurboQuant,
     }
 
     /// <summary>
@@ -1190,6 +1192,14 @@ public static class Attention
         /// <summary>Non-null: logical block → physical block table (paged).</summary>
         public int* Blocks;
         public int BlockSize;
+        // TurboQuant only (Format == TurboQuant): the norm array parallel to the code rows, the norm format, the code width and the
+        // centroid table. Contiguous rows only (no ring, no paging).
+        public byte* Norms;
+        public int NormRowBytes;
+        public int NormBytes;
+        public TqNormFormat NormFormat;
+        public int Bits;
+        public float* Centroids;
 
         /// <summary>
         /// Address of logical row <paramref name="row"/>; <paramref name="runLen"/> receives how many rows from it on
@@ -1220,6 +1230,16 @@ public static class Attention
 
             return Base + physical * RowBytes;
         }
+
+        /// <summary>Builds a TurboQuant descriptor over a layer's code rows and norm array.</summary>
+        public static KvRows CreateTurboQuant(void* codes, void* norms, in TurboQuantLayout layout, float* centroids)
+            => new()
+            {
+                Base = (byte*)codes, RowBytes = layout.NumKvHeads * layout.CodeUintsPerVec * 4, Format = KvRowFormat.TurboQuant,
+                HeadBytes = layout.CodeUintsPerVec * 4,
+                Norms = (byte*)norms, NormBytes = layout.NormBytes, NormRowBytes = layout.NumKvHeads * layout.NormBytes,
+                NormFormat = layout.Norm, Bits = layout.MseBits, Centroids = centroids,
+            };
 
         /// <summary>Builds a descriptor; <see cref="HeadBytes"/> follows from the format.</summary>
         public static KvRows Create(void* basePtr, int rowBytes, KvRowFormat format, int headDim,
@@ -1262,9 +1282,36 @@ public static class Attention
     }
 
     /// <summary>
+    /// One head slice of a TurboQuant row, decoded into <paramref name="scratch"/> as <c>norm * centroid[code]</c>. This is the
+    /// code-space vector (the rotation is applied once to the query and once to the output, never per row). Reads only the words
+    /// of this head vector; nothing wider than one row is ever materialised (#1892).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float* LoadTurboQuantHeadRow(in KvRows rows, byte* src, int row, int kvHeadIdx, int headDim, float* scratch)
+    {
+        float norm = TurboQuantNormDecoder.Decode(rows.NormFormat, rows.Norms + (long)row * rows.NormRowBytes + kvHeadIdx * rows.NormBytes);
+        int bits = rows.Bits;
+        uint mask = (1u << bits) - 1u;
+        float* centroids = rows.Centroids;
+        uint* words = (uint*)src;
+        ulong acc = 0;
+        int have = 0;
+        for (int i = 0; i < headDim; i++)
+        {
+            if (have < bits) { acc |= (ulong)(*words++) << have; have += 32; }
+            scratch[i] = norm * centroids[(int)(acc & mask)];
+            acc >>= bits;
+            have -= bits;
+        }
+        return scratch;
+    }
+
+    /// <summary>
     /// Attention with quantized KV-cache. Dequantizes tiles on-the-fly during attention
     /// computation, then processes the full-precision window region directly.
     /// </summary>
+    /// <exception cref="InvalidOperationException">The cache is an <see cref="ITurboQuantKvCache"/>: its codes live in rotated space, so
+    /// the caller must go through <see cref="ExecuteTurboQuant"/>, which rotates the query and the output.</exception>
     [SkipLocalsInit]
     public static unsafe void Execute(float* q, IQuantizedKvCache kvCache, int layerIndex,
                                        float* output,
@@ -1272,6 +1319,59 @@ public static class Attention
                                        int positionOffset, ComputeThreadPool? pool,
                                        int? slidingWindowSize = null, float softCap = 0f,
                                        float[]? sinks = null)
+    {
+        if (kvCache is ITurboQuantKvCache)
+            throw new InvalidOperationException(
+                "A TurboQuant cache stores rotated codes; call Attention.ExecuteTurboQuant so the query and output are rotated.");
+        ExecuteQuantizedCore(q, kvCache, layerIndex, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
+                             positionOffset, pool, slidingWindowSize, softCap, sinks);
+    }
+
+    /// <summary>
+    /// Attention over an in-place TurboQuant cache (#1892): rotates the query into K code space, runs the tiled quantized-cache
+    /// kernel (each row decoded to <c>norm * centroid[code]</c> in a per-worker row scratch), then rotates the code-space output back
+    /// with the V rotation. The pre-rotation is gated on K being TurboQuant and the post-rotation on V being TurboQuant, so the
+    /// call stays pair-shaped even though only both-side TurboQuant exists today.
+    /// </summary>
+    /// <param name="q">Queries <c>[seqQ, numHeads * headDim]</c>, already scaled for a non-default score scale; rotated IN PLACE.</param>
+    /// <param name="kvCache">The in-place cache already holding positions <c>[0, seqKv)</c>.</param>
+    /// <param name="layerIndex">Layer to read.</param>
+    /// <param name="output">Output <c>[seqQ, numHeads * headDim]</c>, in original space.</param>
+    /// <param name="seqQ">Query rows.</param>
+    /// <param name="seqKv">Cached positions.</param>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="numKvHeads">KV heads (must equal the cache layout).</param>
+    /// <param name="headDim">Head dimension (must equal the cache layout).</param>
+    /// <param name="positionOffset">Position of the first query row.</param>
+    /// <param name="pool">Optional worker pool.</param>
+    /// <param name="slidingWindowSize">Optional sliding-window attention mask (not a cache window).</param>
+    /// <param name="softCap">Attention-logit soft-cap; 0 = disabled.</param>
+    /// <param name="sinks">Optional per-head sink logits.</param>
+    [SkipLocalsInit]
+    public static unsafe void ExecuteTurboQuant(float* q, ITurboQuantKvCache kvCache, int layerIndex, float* output,
+                                                int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+                                                int positionOffset, ComputeThreadPool? pool,
+                                                int? slidingWindowSize = null, float softCap = 0f, float[]? sinks = null)
+    {
+        var layout = kvCache.Layout;
+        if (layout.HeadDim != headDim || layout.NumKvHeads != numKvHeads)
+            throw new ArgumentException(
+                $"Cache layout ({layout.NumKvHeads} kv heads x {layout.HeadDim}) does not match the call ({numKvHeads} x {headDim}).");
+        var pair = KvFormatPair.Both(KvSideFormat.Tq);
+        if (pair.RotatesQuery)
+            TurboQuantRotation.RotateQueryInPlace(q, seqQ, numHeads, headDim, kvCache.SignsK);
+        ExecuteQuantizedCore(q, kvCache, layerIndex, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
+                             positionOffset, pool, slidingWindowSize, softCap, sinks);
+        if (pair.RotatesOutput)
+            TurboQuantRotation.RotateOutputInPlace(output, seqQ, numHeads, headDim, kvCache.SignsV);
+    }
+
+    [SkipLocalsInit]
+    private static unsafe void ExecuteQuantizedCore(float* q, IQuantizedKvCache kvCache, int layerIndex,
+                                       float* output,
+                                       int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+                                       int positionOffset, ComputeThreadPool? pool,
+                                       int? slidingWindowSize, float softCap, float[]? sinks)
     {
         ValidateHeads(numHeads, numKvHeads, headDim);
 
@@ -1288,11 +1388,21 @@ public static class Attention
         // model; for Gemma-4 the sliding/global layers carry distinct widths. The
         // kvStride local above is already per-layer (derived from the per-call
         // numKvHeads/headDim the caller passes for this layer).
+        var tqCache = kvCache as ITurboQuantKvCache;
+        if (tqCache is not null && rowBase != 0)
+            throw new ArgumentException("An in-place TurboQuant cache has no compact sliding-window rows.", nameof(kvCache));
+        // The centroid table is pinned for the whole call (workers read it through a raw pointer).
+        fixed (float* centroids = tqCache is null ? default : tqCache.Centroids)
+        {
         var ctx = new TiledKvCtx
         {
-            K0 = KvRows.Create((void*)kvCache.GetQuantizedKeysPtr(layerIndex), kvCache.KeyQuantizedRowBytesOf(layerIndex),
+            K0 = tqCache is not null
+                ? KvRows.CreateTurboQuant((void*)kvCache.GetQuantizedKeysPtr(layerIndex), (void*)tqCache.GetKeyNormsPtr(layerIndex), tqCache.Layout, centroids)
+                : KvRows.Create((void*)kvCache.GetQuantizedKeysPtr(layerIndex), kvCache.KeyQuantizedRowBytesOf(layerIndex),
                                QuantizedRowFormat(kvCache.KeyDType), headDim),
-            V0 = KvRows.Create((void*)kvCache.GetQuantizedValuesPtr(layerIndex), kvCache.ValueQuantizedRowBytesOf(layerIndex),
+            V0 = tqCache is not null
+                ? KvRows.CreateTurboQuant((void*)kvCache.GetQuantizedValuesPtr(layerIndex), (void*)tqCache.GetValueNormsPtr(layerIndex), tqCache.Layout, centroids)
+                : KvRows.Create((void*)kvCache.GetQuantizedValuesPtr(layerIndex), kvCache.ValueQuantizedRowBytesOf(layerIndex),
                                QuantizedRowFormat(kvCache.ValueDType), headDim),
             // The full-precision recent window is an F32 ring indexed by logical position.
             K1 = KvRows.Create((void*)kvCache.GetWindowKeysPtr(layerIndex), kvStride * sizeof(float), KvRowFormat.F32, headDim,
@@ -1305,6 +1415,7 @@ public static class Attention
         };
         RunTiled(ref ctx, q, output, seqQ, numHeads, numKvHeads, headDim, positionOffset, pool,
                  slidingWindowSize, softCap, sinks);
+        }
     }
 
     /// <summary>
@@ -1655,7 +1766,10 @@ public static class Attention
             byte* row = k.Run(start + j, n - j, out int run) + headOffset;
             for (int r = 0; r < run; r++, j++, row += rowBytes)
             {
-                var kRow = new ReadOnlySpan<float>(LoadHeadRow(row, format, headDim, rowScratch), headDim);
+                float* kPtr = format == KvRowFormat.TurboQuant
+                    ? LoadTurboQuantHeadRow(in k, row, start + j, kvHeadIdx, headDim, rowScratch)
+                    : LoadHeadRow(row, format, headDim, rowScratch);
+                var kRow = new ReadOnlySpan<float>(kPtr, headDim);
                 for (int g = 0; g < count; g++)
                     scores[g * scoreStride + j] = TensorPrimitives.Dot(new ReadOnlySpan<float>(q + g * headDim, headDim), kRow) * scale;
             }
@@ -1683,7 +1797,9 @@ public static class Attention
                 {
                     float w = weights[g * weightStride + j];
                     if (w == 0f) continue;
-                    vRow = vRow != null ? vRow : LoadHeadRow(row, format, headDim, rowScratch);
+                    vRow = vRow != null ? vRow
+                        : format == KvRowFormat.TurboQuant ? LoadTurboQuantHeadRow(in v, row, start + j, kvHeadIdx, headDim, rowScratch)
+                        : LoadHeadRow(row, format, headDim, rowScratch);
                     var outRow = new Span<float>(outRows + g * headDim, headDim);
                     TensorPrimitives.MultiplyAdd(new ReadOnlySpan<float>(vRow, headDim), w, outRow, outRow);
                 }

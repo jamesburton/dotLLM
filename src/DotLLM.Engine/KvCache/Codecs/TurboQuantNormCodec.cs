@@ -11,9 +11,9 @@ namespace DotLLM.Engine.KvCache.Codecs;
 public static class TurboQuantNormCodec
 {
     /// <summary>Lower end of the Log8 grid (code 1 decodes near this; exact 0 is code 0).</summary>
-    public const float Log8Min = 1e-4f;
+    public const float Log8Min = TurboQuantNormDecoder.Log8Min;
     /// <summary>Upper end of the Log8 grid (code 255).</summary>
-    public const float Log8Max = 1e4f;
+    public const float Log8Max = TurboQuantNormDecoder.Log8Max;
 
     private static readonly float Log2Min = MathF.Log2(Log8Min);
     private static readonly float Log2Span = MathF.Log2(Log8Max) - MathF.Log2(Log8Min);
@@ -78,27 +78,8 @@ public static class TurboQuantNormCodec
     /// <summary>Decodes the <paramref name="index"/>-th norm from <paramref name="src"/>.</summary>
     public static float Decode(TqNormFormat f, ReadOnlySpan<byte> src, int index)
     {
-        switch (f)
-        {
-            case TqNormFormat.F32Reference:
-                return BinaryPrimitives.ReadSingleLittleEndian(src.Slice(index * 4, 4));
-            case TqNormFormat.F16:
-                return (float)BinaryPrimitives.ReadHalfLittleEndian(src.Slice(index * 2, 2));
-            case TqNormFormat.Bf16:
-                return BitConverter.UInt32BitsToSingle((uint)BinaryPrimitives.ReadUInt16LittleEndian(src.Slice(index * 2, 2)) << 16);
-            case TqNormFormat.Fp8E4M3:
-                return DecodeFp8(src[index], manBits: 3, bias: 7);
-            case TqNormFormat.Fp8E5M2:
-                return DecodeFp8(src[index], manBits: 2, bias: 15);
-            case TqNormFormat.Log8:
-                {
-                    int code = src[index];
-                    if (code == 0) return 0f;
-                    return MathF.Pow(2f, Log2Min + code * (Log2Span / 255f));
-                }
-            default:
-                throw new ArgumentOutOfRangeException(nameof(f), f, "unknown norm format");
-        }
+        int nb = BytesPerNorm(f);
+        return TurboQuantNormDecoder.Decode(f, src.Slice(index * nb, nb));
     }
 
     // Non-negative FP8, round-to-nearest-even, saturating. A subnormal-range value keeps the format's
@@ -128,14 +109,6 @@ public static class TurboQuantNormCodec
         }
         if (code > maxCode) { code = maxCode; saturated++; }
         return (byte)code;
-    }
-
-    private static float DecodeFp8(byte code, int manBits, int bias)
-    {
-        int man = code & ((1 << manBits) - 1);
-        int exp = code >> manBits;
-        if (exp == 0) return MathF.ScaleB(man, 1 - bias - manBits);
-        return MathF.ScaleB(1f + man / (float)(1 << manBits), exp - bias);
     }
 
     private static byte EncodeLog8(float x, ref int saturated)
