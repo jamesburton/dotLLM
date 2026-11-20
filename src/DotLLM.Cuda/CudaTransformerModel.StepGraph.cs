@@ -42,6 +42,11 @@ public sealed unsafe partial class CudaTransformerModel
     internal int StepGraphInstantiations { get; private set; }
     internal int StepGraphFallbacks { get; private set; }
 
+    // Host time spent capturing + updating/instantiating (not launching) the step graph; printed at dispose when
+    // DOTLLM_CUDA_STEP_GRAPH_STATS=1, so a bench can tell whether the serial re-capture is the remaining cost.
+    private long _stepGraphHostTicks;
+    private static readonly bool s_stepGraphStats = Environment.GetEnvironmentVariable("DOTLLM_CUDA_STEP_GRAPH_STATS") == "1";
+
     private bool StepGraphEligible(int rows, bool suppressGraphCapture, nint deferredHostDest, bool isMla, bool isMoe, IKvCache? kvCache)
     {
         if (!StepGraphEnabled || _stepGraphFailed || !UseGraphCapture || suppressGraphCapture || deferredHostDest != 0
@@ -72,6 +77,7 @@ public sealed unsafe partial class CudaTransformerModel
         CudaDriverApi.cuMemcpyHtoD_v2(_state.TokenIdsDevice, (nint)(&tok), sizeof(int)).ThrowOnError();
         CudaDriverApi.cuMemcpyHtoD_v2(_state.PositionsDevice, (nint)(&pos), sizeof(int)).ThrowOnError();
 
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         nint graph = 0;
         Exception? error = null;
         CudaDriverApi.cuStreamBeginCapture_v2(s, CudaDriverApi.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).ThrowOnError();
@@ -120,6 +126,7 @@ public sealed unsafe partial class CudaTransformerModel
             if (graph != 0) CudaDriverApi.cuGraphDestroy(graph);
         }
 
+        _stepGraphHostTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
         CudaDriverApi.cuGraphLaunch(_stepGraphExec, s).ThrowOnError();
         StepGraphLaunches++;
         GraphReplayCount++;
@@ -133,6 +140,9 @@ public sealed unsafe partial class CudaTransformerModel
 
     private void DisposeStepGraph()
     {
+        if (s_stepGraphStats && StepGraphLaunches > 0)
+            Console.Error.WriteLine($"[dotLLM.Cuda] step graph: launches={StepGraphLaunches} instantiations={StepGraphInstantiations} " +
+                $"fallbacks={StepGraphFallbacks} capture+update={_stepGraphHostTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency / StepGraphLaunches:F3} ms/step");
         if (_stepGraphExec != 0) { CudaDriverApi.cuGraphExecDestroy(_stepGraphExec); _stepGraphExec = 0; }
     }
 }
