@@ -442,6 +442,9 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptxDir!);
         Skip.IfNot(model.UseGraphCapture, "graph capture disabled in this environment (DOTLLM_DISABLE_GRAPH_CAPTURE)");
         Assert.True(CudaKernels.IsAttentionFlashPrefillKvqShape(config.NumAttentionHeads, config.NumKvHeads, config.HeadDim));
+        // #1922 E2 captures in-place TurboQuant decode in the step graph; this test pins the eager arm it was written for
+        // (CudaDenseDecodeDepthModelTests covers the step graph, bit-identical to this eager body).
+        using var stepGraphOff = StaticToggle.StepGraph(false);
 
         // Control: the F16 cache's decode IS captured.
         using (var f16 = model.CreateKvCache(maxSeq))
