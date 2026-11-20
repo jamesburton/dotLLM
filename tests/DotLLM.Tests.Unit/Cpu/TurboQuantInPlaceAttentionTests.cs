@@ -140,6 +140,32 @@ public sealed unsafe class TurboQuantInPlaceAttentionTests
         Assert.True(RelErr(got, want) <= 1e-3, $"rel err {RelErr(got, want):G4}");
     }
 
+    // Pins the shared layout (every backend reads these bytes): vector (pos, head) starts at (pos * numKvHeads + head) * CodeUintsPerVec * 4,
+    // padding bytes zero. A self-consistent but tight-packed cache would still match the oracle, so the bytes are checked directly.
+    [Theory]
+    [InlineData(3, 16)]
+    [InlineData(5, 16)]
+    [InlineData(4, 64)]
+    public void CodeBytes_FollowTheSharedLayout_PaddedPerVector(int bits, int hd)
+    {
+        const int numKvHeads = 2, rows = 5;
+        int kvStride = numKvHeads * hd;
+        var k = Gauss(new Random(31), rows * kvStride, 1f);
+        var v = Gauss(new Random(32), rows * kvStride, 1f);
+        using var cache = new TurboQuantInPlaceKvCache(1, numKvHeads, hd, 8, bits, Seed);
+        Fill(cache, k, v, 0, kvStride);
+        var codec = new DotLLM.Engine.KvCache.Codecs.TurboQuantCodec(hd, bits, Seed);
+        int vecBytes = cache.Layout.CodeUintsPerVec * 4;
+        for (int pos = 0; pos < rows; pos++)
+            for (int h = 0; h < numKvHeads; h++)
+            {
+                var expected = new byte[vecBytes];
+                codec.Encode(new ReadOnlySpan<float>(k, pos * kvStride + h * hd, hd), expected.AsSpan(0, codec.CodeBytesPerVector));
+                var actual = new ReadOnlySpan<byte>((byte*)cache.GetQuantizedKeysPtr(0) + (long)(pos * numKvHeads + h) * vecBytes, vecBytes);
+                Assert.True(actual.SequenceEqual(expected), $"code bytes of (pos {pos}, head {h}) differ from the layout");
+            }
+    }
+
     [Fact]
     public void CurrentChunkRows_ComeFromTheCache()
     {
