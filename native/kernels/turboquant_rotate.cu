@@ -97,3 +97,22 @@ extern "C" __global__ void __launch_bounds__(256) tq_rotate_o_f32_dyn(
     if (b >= rowsPtr[0] * numHeads) return;
     tq_rotate_o_body(o, signs, headDim, invSqrtD, b);
 }
+
+// o: half [rows, numHeads, headDim], rotated in place (#1892 Task 6). The dense CUDA attention arms write their output in F16
+// (_state.AttnOutput), so the output rotation reads half, runs the same F32 shared-memory butterfly as tq_rotate_o_body and
+// writes half once: no F32 copy of the output is stored. Same operation order (WHT, then x (invSqrtD * sign)). Grid = rows * numHeads.
+extern "C" __global__ void __launch_bounds__(256) tq_rotate_o_f16(
+    half* __restrict__ o, const float* __restrict__ signs,
+    const int rows, const int numHeads, const int headDim, const float invSqrtD)
+{
+    const int b = blockIdx.x;
+    if (b >= rows * numHeads) return;
+    __shared__ float s[TQ_MAX_HEADDIM];
+    const int t = threadIdx.x;
+    const bool live = t < headDim;
+    const size_t off = (size_t)b * headDim;
+    if (live) s[t] = __half2float(o[off + t]);
+    __syncthreads();
+    tq_wht(s, t, headDim, live);
+    if (live) o[off + t] = __float2half(s[t] * (invSqrtD * signs[t]));
+}

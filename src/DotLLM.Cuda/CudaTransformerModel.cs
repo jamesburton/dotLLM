@@ -1247,6 +1247,12 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         bool isMoe = _weights.MoeLayers is not null;
         bool isBitNet = Config.Architecture == Architecture.BitNet;
 
+        // #1892: the MLA attention block runs on its own _mlaKvCache and never reads `kvCache`, so an in-place TurboQuant cache
+        // handed to an MLA model would be silently ignored (KV kept in F16). Refuse instead (MLA TurboQuant: #1899 / #1900).
+        if (isMla && kvCache is CudaTurboQuantInPlaceKvCache)
+            throw new NotSupportedException(
+                "TurboQuant KV is not supported on CUDA MLA models: the MLA attention keeps its own cache (#1899, #1900). Use q8_0/q4_0 or f16 KV.");
+
         // Gemma-4 (DiffusionGemma AR) — dedicated F32 forward. AR only (no KV cache
         // on CUDA yet; the cacheless path covers single-shot / short-context decode).
         if (_isGemma4)
@@ -1732,12 +1738,14 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                         seqLen, seqKv, numHeads, numKvHeads, headDim,
                         positions[0], slidingWindow, s, layerSinks);
                 }
-                else if (kvCache is CudaTurboQuantInPlaceKvCache)
+                else if (kvCache is CudaTurboQuantInPlaceKvCache tqInPlaceCache)
                 {
-                    // #1892 Task 5 builds the cache; the CUDA attention kernels that read it in place are Task 6. Falling through to
-                    // the cacheless branch below would attend to the current chunk only, silently.
-                    throw new NotSupportedException(
-                        "CudaTurboQuantInPlaceKvCache cannot be used in a forward pass yet: the in-place CUDA attention kernels are not wired (#1892).");
+                    // #1892 (CLAUDE.md rule 2): encode the current rows into codes, rotate Q into K code space, attend over the
+                    // cache only (current rows included, never the fresh K/V), rotate the output back with the V signs. Eager only:
+                    // the graph-capture gate above admits CudaKvCache / windowed CudaQuantizedKvCache, never this type.
+                    MarkProfile(ProfileCategory.KvUpdate);
+                    CudaTurboQuantInPlaceAttention.Run(_kernels, tqInPlaceCache, layer, qPtr, kPtr, vPtr, positions, seqLen,
+                        numHeads, numKvHeads, headDim, slidingWindow, layerSinks, _state.AttnOutput, s, EnableKvqFlashPrefill);
                 }
                 else if (kvCache is CudaKvCache cudaKvCache)
                 {
@@ -4808,9 +4816,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         if (UsesInPlaceTurboQuant(config, geom, Config.HeadDim))
         {
             // #1892: both-side TurboQuant (MSE stage) is stored as codes + norms and never decoded into a history. K and V
-            // rotations use independent seeds (V = seed ^ 0xD1B54A32D192ED03), as the scratch oracle and the CPU cache do.
+            // rotations use independent seeds (V = seed ^ TurboQuantCodec.VSeedMask), as the scratch oracle and the CPU cache do.
             var codecK = new Engine.KvCache.Codecs.TurboQuantCodec(Config.HeadDim, config.TurboQuantBits, config.TurboQuantSeed);
-            var codecV = new Engine.KvCache.Codecs.TurboQuantCodec(Config.HeadDim, config.TurboQuantBits, config.TurboQuantSeed ^ 0xD1B54A32D192ED03UL);
+            var codecV = new Engine.KvCache.Codecs.TurboQuantCodec(Config.HeadDim, config.TurboQuantBits, config.TurboQuantSeed ^ Engine.KvCache.Codecs.TurboQuantCodec.VSeedMask);
             var tqCache = AdmitReleasingG3<CudaTurboQuantInPlaceKvCache>(() => new CudaTurboQuantInPlaceKvCache(
                 Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen, codecK.MseBits,
                 codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD,

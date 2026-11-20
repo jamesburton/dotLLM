@@ -1,0 +1,500 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using DotLLM.Core.Configuration;
+using DotLLM.Cuda;
+using DotLLM.Cuda.Interop;
+using DotLLM.Engine.KvCache.Codecs;
+using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace DotLLM.Tests.Unit.Cuda;
+
+/// <summary>
+/// #1892 Task 6: the dense CUDA in-place TurboQuant attention (<see cref="CudaTurboQuantInPlaceAttention"/>: encode, rotate Q with
+/// the K signs, <c>attention_kvtq</c> or the tensor-core <c>_tqtq</c> prefill, rotate O with the V signs) against the scratch
+/// oracle (<see cref="CudaTurboQuantKvCache"/>: the same codes and the same F16 norm format, dequantized into an FP16 history
+/// scratch, then <c>attention_f16</c>). Tolerance <c>2e-3 * sqrt(seqKv * headDim)</c> on every output element.
+/// <para>Fixtures are built so the tolerance can fail: K and V sign seeds differ (V = K ^ <see cref="TurboQuantCodec.VSeedMask"/>),
+/// every K / V row has its own amplitude (a dropped norm shows), Q is large enough for a peaked softmax and V large enough that the
+/// oracle output RMS is well above the tolerance (asserted per case), bits 3 (codes straddle words) and 8 at every head dim, hd16
+/// bits 3 (the only shape where padded and tight packing differ), several KV heads, offsets crossing the 256-row tile.</para>
+/// Runs on framework (RTX 3060).
+/// </summary>
+[Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
+public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
+{
+    private const ulong Seed = 0x7A3C_91E5_2B44UL;
+    private static readonly ConcurrentDictionary<(int, int, ulong), TurboQuantCodec> s_codecs = new();
+
+    private readonly CudaContext? _ctx;
+    private readonly CudaStream? _stream;
+    private readonly CudaKernels? _kernels;
+    private readonly ITestOutputHelper _out;
+
+    public CudaTurboQuantInPlaceAttentionTests(ITestOutputHelper output)
+    {
+        _out = output;
+        if (!IsCudaDriverPresent()) return;
+        _ctx = CudaContext.Create(0);
+        _stream = CudaStream.Create();
+        string? ptxDir = FindPtxDir();
+        if (ptxDir != null) _kernels = new CudaKernels(ptxDir);
+    }
+
+    public void Dispose()
+    {
+        _kernels?.Dispose();
+        _stream?.Dispose();
+        _ctx?.Dispose();
+    }
+
+    private static bool IsCudaDriverPresent()
+    {
+        string lib = OperatingSystem.IsWindows() ? "nvcuda.dll" : "libcuda.so.1";
+        if (!NativeLibrary.TryLoad(lib, out nint h)) return false;
+        NativeLibrary.Free(h);
+        return CudaDevice.IsAvailable();
+    }
+
+    private static string? FindPtxDir()
+    {
+        foreach (var dir in new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "ptx"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "native", "ptx"),
+        })
+        {
+            var full = Path.GetFullPath(dir);
+            if (Directory.Exists(full) && Directory.GetFiles(full, "*.ptx").Length > 0) return full;
+        }
+        return null;
+    }
+
+    private void RequireKernels()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        Skip.If(_kernels is null, "PTX files not found");
+        // A loaded module set without these is a stale build: fail, do not skip (a skipped CUDA test is not a pass).
+        Assert.True(_kernels!.HasAttentionKvTq, "attention_kvtq not loaded (stale attention_kvtq.ptx?)");
+        Assert.True(_kernels.TqRotateOF16Available, "tq_rotate_o_f16 not loaded (stale turboquant_rotate.ptx?)");
+        Assert.True(_kernels.TqRotateAvailable && _kernels.TurboQuantF16Available, "TurboQuant codec / rotation PTX not loaded");
+    }
+
+    private static TurboQuantCodec Codec(int hd, int bits, ulong seed) => s_codecs.GetOrAdd((hd, bits, seed), k => new TurboQuantCodec(k.Item1, k.Item2, k.Item3));
+
+    private static nint Alloc(long bytes) { CudaDriverApi.cuMemAlloc_v2(out nint p, (nuint)Math.Max(bytes, 4)).ThrowOnError(); return p; }
+    private static void Free(nint p) { if (p != 0) CudaDriverApi.cuMemFree_v2(p); }
+    private static void Up<T>(nint dst, T[] src) where T : unmanaged
+    { fixed (T* p = src) CudaDriverApi.cuMemcpyHtoD_v2(dst, (nint)p, (nuint)(src.Length * sizeof(T))).ThrowOnError(); }
+    private static void Down<T>(T[] dst, nint src) where T : unmanaged
+    { fixed (T* p = dst) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, src, (nuint)(dst.Length * sizeof(T))).ThrowOnError(); }
+
+    private static float Gauss(Random r)
+    {
+        double u1 = 1.0 - r.NextDouble(), u2 = r.NextDouble();
+        return (float)(Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2));
+    }
+
+    /// <summary>[rows, heads*hd] half data; each (row, head) vector gets its own amplitude in [lo, hi] times <paramref name="scale"/>.</summary>
+    private static Half[] Rows(Random r, int rows, int heads, int hd, float scale, float lo, float hi)
+    {
+        var a = new Half[rows * heads * hd];
+        for (int v = 0; v < rows * heads; v++)
+        {
+            float amp = scale * (lo + (hi - lo) * (float)r.NextDouble());
+            for (int i = 0; i < hd; i++) a[v * hd + i] = (Half)(Gauss(r) * amp);
+        }
+        return a;
+    }
+
+    private static float[] ToFloat(Half[] h) { var f = new float[h.Length]; for (int i = 0; i < h.Length; i++) f[i] = (float)h[i]; return f; }
+
+    private static double Tolerance(int seqKv, int hd) => 2e-3 * Math.Sqrt((double)seqKv * hd);
+
+    private sealed class CaseResult
+    {
+        public required float[] InPlace;
+        public required float[] Oracle;
+        public required float[] Fresh;      // attention_f16 over the unquantized K/V (rows never encoded)
+        public required int SeqKv;
+        public required bool Flash;
+        public required long ScalarLaunches;
+        public required long FlashLaunches;
+    }
+
+    /// <summary>
+    /// Encodes <paramref name="offset"/> history rows into both caches, then runs one attention call for <paramref name="seqQ"/>
+    /// current rows: in place through <see cref="CudaTurboQuantInPlaceAttention.Run"/> (which encodes them), and through the oracle.
+    /// </summary>
+    private CaseResult RunCase(int bits, int hd, int numHeads, int numKvHeads, int seqQ, int offset, int sliding, bool sinks,
+                               bool flashEnabled, int seed, float kScale = 1f, float vScale = 2f, float qScale = 2.5f,
+                               float histKScale = 1f)
+    {
+        var codecK = Codec(hd, bits, Seed);
+        var codecV = Codec(hd, bits, Seed ^ TurboQuantCodec.VSeedMask);
+        Assert.False(codecK.RotationSigns.SequenceEqual(codecV.RotationSigns), "fixture: K and V signs must differ");
+
+        int total = offset + seqQ;
+        int kvStride = numKvHeads * hd, qStride = numHeads * hd;
+        var rng = new Random(seed);
+        Half[] k = Rows(rng, total, numKvHeads, hd, kScale, 0.5f, 2f);
+        for (int i = 0; i < offset * kvStride; i++) k[i] = (Half)((float)k[i] * histKScale);
+        Half[] v = Rows(rng, total, numKvHeads, hd, vScale, 0.5f, 2f);
+        Half[] q = Rows(rng, seqQ, numHeads, hd, qScale, 1f, 1f);
+        float[] sinkVals = new float[numHeads];
+        for (int i = 0; i < numHeads; i++) sinkVals[i] = Gauss(rng) * 2f;
+        int[] positions = new int[total];
+        for (int i = 0; i < total; i++) positions[i] = i;
+
+        long rowBytes = (long)kvStride * sizeof(ushort);
+        nint dK = 0, dV = 0, dQ = 0, dQo = 0, dQf = 0, dOut = 0, dOutO = 0, dOutF = 0, dSinks = 0;
+        try
+        {
+            dK = Alloc(total * rowBytes); dV = Alloc(total * rowBytes);
+            dQ = Alloc((long)seqQ * qStride * 2); dQo = Alloc((long)seqQ * qStride * 2); dQf = Alloc((long)seqQ * qStride * 2);
+            dOut = Alloc((long)seqQ * qStride * 2); dOutO = Alloc((long)seqQ * qStride * 2); dOutF = Alloc((long)seqQ * qStride * 2);
+            dSinks = Alloc(numHeads * sizeof(float));
+            Up(dK, k); Up(dV, v); Up(dQ, q); Up(dQo, q); Up(dQf, q); Up(dSinks, sinkVals);
+            nint sinksPtr = sinks ? dSinks : 0;
+            nint s = _stream!.Handle;
+
+            using var ip = new CudaTurboQuantInPlaceKvCache(1, numKvHeads, hd, total + 3, bits,
+                codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD);
+            using var oracle = new CudaTurboQuantKvCache(1, numKvHeads, hd, total + 3, bits,
+                codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD);
+            Assert.Equal(ip.NormFormat, oracle.NormFormat);
+
+            if (offset > 0)
+            {
+                ip.UpdateDevice(dK, dV, positions.AsSpan(0, offset), offset, 0, s, _kernels!);
+                oracle.UpdateDevice(dK, dV, positions.AsSpan(0, offset), offset, 0, s, _kernels!);
+            }
+
+            long scalar0 = CudaKernels.AttentionKvTqLaunches, flash0 = CudaKernels.AttentionFlashPrefillKvTqLaunches;
+            bool flash = CudaTurboQuantInPlaceAttention.Run(_kernels!, ip, 0, dQ, dK + (nint)(offset * rowBytes), dV + (nint)(offset * rowBytes),
+                positions.AsSpan(offset, seqQ), seqQ, numHeads, numKvHeads, hd, sliding, sinksPtr, dOut, s, flashEnabled);
+            long scalarRuns = CudaKernels.AttentionKvTqLaunches - scalar0, flashRuns = CudaKernels.AttentionFlashPrefillKvTqLaunches - flash0;
+            Assert.Equal(total, ip.CurrentLength);
+
+            oracle.UpdateDevice(dK + (nint)(offset * rowBytes), dV + (nint)(offset * rowBytes), positions.AsSpan(offset, seqQ), seqQ, 0, s, _kernels!);
+            var (kS, vS) = oracle.PrepareAttentionScratch(0, s, _kernels!);
+            _kernels!.LaunchAttention(dQo, kS, vS, dOutO, seqQ, total, numHeads, numKvHeads, hd, offset, sliding, s, sinksPtr);
+            _kernels.LaunchAttention(dQf, dK, dV, dOutF, seqQ, total, numHeads, numKvHeads, hd, offset, sliding, s, sinksPtr);
+            _stream.Synchronize();
+
+            var got = new Half[seqQ * qStride]; var exp = new Half[seqQ * qStride]; var fresh = new Half[seqQ * qStride];
+            Down(got, dOut); Down(exp, dOutO); Down(fresh, dOutF);
+            return new CaseResult
+            {
+                InPlace = ToFloat(got), Oracle = ToFloat(exp), Fresh = ToFloat(fresh), SeqKv = total, Flash = flash,
+                ScalarLaunches = scalarRuns, FlashLaunches = flashRuns,
+            };
+        }
+        finally
+        {
+            Free(dK); Free(dV); Free(dQ); Free(dQo); Free(dQf); Free(dOut); Free(dOutO); Free(dOutF); Free(dSinks);
+        }
+    }
+
+    private static (double maxAbs, int at, double rmsRef) Compare(float[] got, float[] reference)
+    {
+        double max = 0, ss = 0; int at = -1;
+        for (int i = 0; i < got.Length; i++)
+        {
+            Assert.True(float.IsFinite(got[i]), $"non-finite output at {i}");
+            double d = Math.Abs(got[i] - reference[i]);
+            if (d > max) { max = d; at = i; }
+            ss += (double)reference[i] * reference[i];
+        }
+        return (max, at, Math.Sqrt(ss / got.Length));
+    }
+
+    private void AssertMatchesOracle(CaseResult r, int hd, string label)
+    {
+        double tol = Tolerance(r.SeqKv, hd);
+        var (max, at, rms) = Compare(r.InPlace, r.Oracle);
+        _out.WriteLine($"{label}: seqKv={r.SeqKv} flash={r.Flash} maxAbs={max:E3} (at {at}) tol={tol:E3} oracleRms={rms:F3}");
+        // Precondition: the oracle output must dwarf the tolerance, else a wrong kernel could hide inside it.
+        Assert.True(rms > 2 * tol, $"{label}: fixture too weak, oracle RMS {rms:F4} <= 2 x tol {tol:F4}");
+        Assert.True(max <= tol, $"{label}: in-place vs oracle maxAbs {max:E4} > tol {tol:E4} at element {at} " +
+                                $"(in-place {r.InPlace[at]}, oracle {r.Oracle[at]})");
+    }
+
+    // ── F16 output rotation (D1) ─────────────────────────────────────────────────────────────────────────
+
+    public static TheoryData<int, int, int> RotateGeometries => new() { { 16, 3, 2 }, { 64, 3, 2 }, { 128, 8, 4 }, { 256, 2, 3 } };
+
+    [SkippableTheory]
+    [MemberData(nameof(RotateGeometries))]
+    public void RotateOutputF16_InvertsCodec(int headDim, int numHeads, int rows)
+    {
+        RequireKernels();
+        var codecV = Codec(headDim, 4, Seed ^ TurboQuantCodec.VSeedMask);
+        var rng = new Random(headDim * 7 + rows);
+        int n = rows * numHeads * headDim;
+        Half[] a = Rows(rng, rows, numHeads, headDim, 2f, 0.5f, 2f);
+        float[] expected = ToFloat(a);
+        for (int vec = 0; vec < rows * numHeads; vec++) codecV.InverseRotate(expected.AsSpan(vec * headDim, headDim));
+
+        float[] sv = codecV.RotationSigns.ToArray();
+        // Two sentinel rows after the live ones must stay untouched.
+        int extra = 2 * numHeads * headDim;
+        var init = new Half[n + extra];
+        Array.Copy(a, init, n);
+        for (int i = n; i < init.Length; i++) init[i] = (Half)123.5f;
+        nint dO = Alloc(init.Length * 2), dS = Alloc(sv.Length * 4);
+        try
+        {
+            Up(dO, init); Up(dS, sv);
+            _kernels!.LaunchTqRotateOF16(dO, rows, numHeads, headDim, dS, _stream!.Handle);
+            _stream.Synchronize();
+            var got = new Half[init.Length];
+            Down(got, dO);
+            double max = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double d = Math.Abs(expected[i] - (float)got[i]);
+                max = Math.Max(max, d);
+                // one F16 rounding of the result (2^-11 relative) plus F32 butterfly drift
+                Assert.True(d <= 1e-3 * Math.Abs(expected[i]) + 2e-3, $"i={i}: codec={expected[i]} gpu={(float)got[i]}");
+            }
+            for (int i = n; i < init.Length; i++) Assert.Equal(123.5f, (float)got[i]);
+            Assert.True(TurboQuantRotationTestsMaxDiff(ToFloat(a), expected, n) > 0.1, "fixture: rotation must change the data");
+            _out.WriteLine($"hd={headDim}: maxAbsDiff={max:E3}");
+        }
+        finally { Free(dO); Free(dS); }
+    }
+
+    private static double TurboQuantRotationTestsMaxDiff(float[] a, float[] b, int n)
+    {
+        double m = 0; for (int i = 0; i < n; i++) m = Math.Max(m, Math.Abs(a[i] - b[i])); return m;
+    }
+
+    // ── Scalar arm (attention_kvtq) ──────────────────────────────────────────────────────────────────────
+
+    public static IEnumerable<object[]> ScalarCases() =>
+    [
+        // bits, hd, numHeads, numKvHeads, seqQ, offset, slidingWindow, sinks
+        [3, 16, 4, 2, 1, 40, 0, false],     // hd16 bits 3: 48 code bits in 2 words -- the padded-vs-tight packing discriminator
+        [3, 16, 4, 2, 7, 33, 0, true],
+        [8, 16, 4, 2, 1, 20, 0, false],
+        [2, 64, 6, 2, 1, 300, 0, false],    // crosses the 256-row tile
+        [3, 64, 6, 2, 7, 120, 0, true],
+        [4, 64, 6, 2, 16, 0, 0, false],     // a cold 16-row prefill on the scalar arm (flash disabled)
+        [8, 64, 6, 2, 64, 37, 0, false],
+        [3, 64, 8, 8, 1, 90, 25, false],    // MHA, sliding window
+        [2, 128, 8, 2, 7, 0, 0, false],
+        [3, 128, 8, 2, 1, 301, 0, false],
+        [4, 128, 8, 2, 1, 100, 50, false],  // sliding window decode
+        [8, 128, 8, 2, 16, 40, 0, true],
+        [3, 128, 16, 1, 7, 50, 0, false],   // group 16 (> 8: never the tensor-core arm)
+        [2, 256, 4, 2, 1, 90, 0, false],
+        [3, 256, 4, 2, 7, 50, 0, false],
+        [4, 256, 8, 2, 64, 0, 0, false],
+        [8, 256, 4, 1, 16, 20, 0, true],
+        [3, 256, 4, 2, 1, 60, 20, false],
+    ];
+
+    [SkippableTheory]
+    [MemberData(nameof(ScalarCases))]
+    public void Scalar_MatchesOracle(int bits, int hd, int numHeads, int numKvHeads, int seqQ, int offset, int sliding, bool sinks)
+    {
+        RequireKernels();
+        var r = RunCase(bits, hd, numHeads, numKvHeads, seqQ, offset, sliding, sinks, flashEnabled: false,
+                        seed: bits * 1000 + hd * 10 + seqQ);
+        Assert.False(r.Flash);
+        Assert.Equal(1, r.ScalarLaunches);
+        Assert.Equal(0, r.FlashLaunches);
+        AssertMatchesOracle(r, hd, $"scalar b{bits} hd{hd} {numHeads}/{numKvHeads} q{seqQ}@{offset} sw{sliding} sinks={sinks}");
+    }
+
+    // ── Tensor-core prefill arm (attention_flash_mma_prefill_kvq_hd{64,128}_tqtq) ─────────────────────────
+
+    public static IEnumerable<object[]> FlashCases() =>
+    [
+        // bits, hd, numHeads, numKvHeads, seqQ, offset
+        [3, 64, 6, 2, 16, 0],
+        [8, 64, 6, 2, 64, 45],
+        [2, 64, 9, 3, 40, 5],       // SmolLM-like group 3, a partial q-tile
+        [4, 128, 8, 2, 16, 77],
+        [2, 128, 8, 2, 64, 0],
+        [3, 128, 32, 4, 64, 10],    // group 8: 52 KB dynamic shared memory
+        [8, 128, 8, 8, 16, 0],      // MHA
+        [3, 128, 8, 2, 64, 260],    // history past one 256-row span
+    ];
+
+    [SkippableTheory]
+    [MemberData(nameof(FlashCases))]
+    public void FlashPrefill_MatchesOracle(int bits, int hd, int numHeads, int numKvHeads, int seqQ, int offset)
+    {
+        RequireKernels();
+        Assert.True(_kernels!.HasAttentionFlashPrefillKvTq(hd), $"tensor-core TurboQuant prefill hd{hd} not loaded (stale PTX / pre-Ampere?)");
+        var r = RunCase(bits, hd, numHeads, numKvHeads, seqQ, offset, 0, false, flashEnabled: true,
+                        seed: 77 + bits * 100 + hd + seqQ);
+        Assert.True(r.Flash, "the tensor-core arm must be the one dispatched for this shape");
+        Assert.Equal(1, r.FlashLaunches);
+        Assert.Equal(0, r.ScalarLaunches);
+        AssertMatchesOracle(r, hd, $"flash b{bits} hd{hd} {numHeads}/{numKvHeads} q{seqQ}@{offset}");
+    }
+
+    /// <summary>D3: a dense hd256 prefill (no tensor-core TurboQuant twin) takes the scalar TQ body, not a dequant path, and matches.</summary>
+    [SkippableTheory]
+    [InlineData(3, 16, 0)]
+    [InlineData(8, 64, 30)]
+    public void Hd256Prefill_TakesScalarPath_MatchesOracle(int bits, int seqQ, int offset)
+    {
+        RequireKernels();
+        var r = RunCase(bits, 256, 8, 2, seqQ, offset, 0, false, flashEnabled: true, seed: 900 + bits + seqQ);
+        Assert.False(r.Flash);
+        Assert.Equal(1, r.ScalarLaunches);
+        Assert.Equal(0, r.FlashLaunches);
+        AssertMatchesOracle(r, 256, $"hd256 prefill b{bits} q{seqQ}@{offset}");
+    }
+
+    /// <summary>
+    /// The current chunk's rows are attended from the cache (codes), never from the fresh K/V. At 2 bits, with the current rows
+    /// dominating the softmax (small history keys), attention over the fresh rows is far outside the tolerance of the oracle
+    /// (asserted: the fixture can tell the two apart), while the in-place output matches the oracle. seqQ 16 is the tensor-core arm
+    /// at offset 0 (a cold prefill, where every row is current); seqQ 7 is the scalar arm over a short history.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(16, 0, true)]
+    [InlineData(7, 3, false)]
+    public void CurrentChunkRows_ComeFromTheCache(int seqQ, int offset, bool expectFlash)
+    {
+        RequireKernels();
+        var r = RunCase(2, 64, 6, 2, seqQ, offset, 0, false, flashEnabled: true, seed: 4242 + seqQ, histKScale: 0.1f);
+        Assert.Equal(expectFlash, r.Flash);
+        double tol = Tolerance(r.SeqKv, 64);
+        var (freshMax, _, _) = Compare(r.Fresh, r.Oracle);
+        _out.WriteLine($"fresh-K/V attention vs oracle maxAbs={freshMax:E3} (tol {tol:E3})");
+        Assert.True(freshMax > 4 * tol, $"fixture cannot tell fresh rows from cached codes: {freshMax:E3} <= 4 x {tol:E3}");
+        AssertMatchesOracle(r, 64, $"current-chunk q{seqQ}@{offset}");
+        var (ipVsFresh, _, _) = Compare(r.InPlace, r.Fresh);
+        Assert.True(ipVsFresh > 2 * tol, $"in-place output tracks the fresh K/V ({ipVsFresh:E3}), not the cache");
+    }
+
+    // ── Model level: the CudaTransformerModel wiring, decode stays eager (D2) ─────────────────────────────
+
+    /// <summary>
+    /// SmolLM-135M (hd64, 9/3 heads) through <see cref="CudaTransformerModel"/> with the in-place cache from <c>CreateKvCache</c>:
+    /// a 16+ token prefill runs the tensor-core TurboQuant arm on every layer, and each decode step runs eager (graph capture never
+    /// engages for this cache type, D2) on the scalar arm; logits track the scratch oracle (same codec constants) at every step.
+    /// Precondition: graph capture is on and a plain F16 cache's decode does get captured, so "not captured" is not vacuous.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void TqDecode_RunsEager_NotCaptured_MatchesOracle(int bits)
+    {
+        RequireKernels();
+        string modelPath = Environment.GetEnvironmentVariable("DOTLLM_SMOLLM_Q8_GGUF")
+            ?? TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
+        Skip.If(!File.Exists(modelPath), $"SmolLM-135M Q8_0 GGUF not found at {modelPath}");
+
+        using var gguf = GgufFile.Open(modelPath);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int[] prompt = tokenizer.Encode("The quick brown fox jumps over the lazy dog, and then the capital of France is Paris while the capital of Germany is");
+        Assert.True(prompt.Length >= CudaTransformerModel.KvqFlashPrefillMinRows, $"prompt has only {prompt.Length} tokens");
+        const int decodeSteps = 3;
+        int maxSeq = prompt.Length + decodeSteps + 2;
+        int layers = config.NumLayers, vocab = config.VocabSize;
+        string? ptxDir = FindPtxDir();
+
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptxDir!);
+        Skip.IfNot(model.UseGraphCapture, "graph capture disabled in this environment (DOTLLM_DISABLE_GRAPH_CAPTURE)");
+        Assert.True(CudaKernels.IsAttentionFlashPrefillKvqShape(config.NumAttentionHeads, config.NumKvHeads, config.HeadDim));
+
+        // Control: the F16 cache's decode IS captured.
+        using (var f16 = model.CreateKvCache(maxSeq))
+        {
+            int cap0 = model.GraphCaptureCount;
+            Forward(model, f16, prompt, 0).Dispose();
+            int next = prompt.Length;
+            for (int i = 0; i < 2; i++) Forward(model, f16, [1], next++).Dispose();
+            Assert.True(model.GraphCaptureCount > cap0, "control: an F16 decode must engage graph capture");
+        }
+
+        var kvConfig = new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant, 0, bits, Seed);
+        var codecK = Codec(config.HeadDim, bits, Seed);
+        var codecV = Codec(config.HeadDim, bits, Seed ^ TurboQuantCodec.VSeedMask);
+        using var ipCache = model.CreateKvCache(maxSeq, kvConfig);
+        Assert.IsType<CudaTurboQuantInPlaceKvCache>(ipCache);
+        using var oracle = model.CreateTurboQuantKvCache(maxSeq, codecK.MseBits, codecK.Centroids, codecK.RotationSigns,
+                                                          codecV.RotationSigns, codecK.InvSqrtD);
+
+        long flash0 = CudaKernels.AttentionFlashPrefillKvTqLaunches, scalar0 = CudaKernels.AttentionKvTqLaunches;
+        int capBefore = model.GraphCaptureCount, eagerBefore = model.EagerDecodeCount;
+
+        float[] ipRow, orRow;
+        using (var l = Forward(model, ipCache, prompt, 0)) ipRow = LastRow(l, vocab);
+        using (var l = Forward(model, oracle, prompt, 0)) orRow = LastRow(l, vocab);
+        Assert.Equal(layers, CudaKernels.AttentionFlashPrefillKvTqLaunches - flash0);
+        Assert.Equal(0, CudaKernels.AttentionKvTqLaunches - scalar0);
+        AssertLogitsTrack(ipRow, orRow, "prefill");
+
+        int pos = prompt.Length;
+        for (int step = 0; step < decodeSteps; step++, pos++)
+        {
+            int token = Argmax(ipRow);   // teacher-forced: both caches see the same token
+            using (var l = Forward(model, ipCache, [token], pos)) ipRow = LastRow(l, vocab);
+            using (var l = Forward(model, oracle, [token], pos)) orRow = LastRow(l, vocab);
+            AssertLogitsTrack(ipRow, orRow, $"decode {step}");
+        }
+
+        Assert.Equal(capBefore, model.GraphCaptureCount);
+        // Both the in-place and the oracle decodes are eager.
+        Assert.Equal(eagerBefore + 2 * decodeSteps, model.EagerDecodeCount);
+        Assert.Equal(decodeSteps * layers, CudaKernels.AttentionKvTqLaunches - scalar0);
+        Assert.Equal(layers, CudaKernels.AttentionFlashPrefillKvTqLaunches - flash0);
+        Assert.Equal(prompt.Length + decodeSteps, ipCache.CurrentLength);
+    }
+
+    private static DotLLM.Core.Tensors.ITensor Forward(CudaTransformerModel model, DotLLM.Core.Attention.IKvCache cache, int[] tokens, int start)
+    {
+        var positions = new int[tokens.Length];
+        for (int i = 0; i < positions.Length; i++) positions[i] = start + i;
+        return model.Forward(tokens, positions, 0, cache);
+    }
+
+    private void AssertLogitsTrack(float[] got, float[] oracle, string label)
+    {
+        double dot = 0, ng = 0, no = 0, max = 0;
+        for (int i = 0; i < got.Length; i++)
+        {
+            Assert.True(float.IsFinite(got[i]), $"{label}: non-finite logit {i}");
+            dot += (double)got[i] * oracle[i]; ng += (double)got[i] * got[i]; no += (double)oracle[i] * oracle[i];
+            max = Math.Max(max, Math.Abs(got[i] - oracle[i]));
+        }
+        double cos = dot / (Math.Sqrt(ng) * Math.Sqrt(no) + 1e-30);
+        int ga = Argmax(got), oa = Argmax(oracle);
+        float[] sorted = (float[])oracle.Clone(); Array.Sort(sorted);
+        double gap = sorted[^1] - sorted[^2];
+        _out.WriteLine($"{label}: cos={cos:F6} maxAbsLogit={max:F4} argmax in-place={ga} oracle={oa} oracleTop2Gap={gap:F4}");
+        Assert.True(cos > 0.999, $"{label}: logits diverged from the oracle, cos={cos:F6}");
+        if (gap > 0.1) Assert.Equal(oa, ga);
+    }
+
+    private static float[] LastRow(DotLLM.Core.Tensors.ITensor logits, int vocab)
+    {
+        Assert.Equal(1, logits.Shape[0]);
+        var row = new float[vocab];
+        float* p = (float*)logits.DataPointer;
+        for (int i = 0; i < vocab; i++) row[i] = p[i];
+        return row;
+    }
+
+    private static int Argmax(float[] row)
+    {
+        int best = 0; float bv = row[0];
+        for (int i = 1; i < row.Length; i++) if (row[i] > bv) { bv = row[i]; best = i; }
+        return best;
+    }
+}

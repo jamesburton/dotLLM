@@ -21,8 +21,9 @@ namespace DotLLM.Cuda;
 /// reallocated: a pointer read from this object stays valid until <see cref="Dispose"/>. Rows beyond <see cref="CurrentLength"/> hold
 /// zero codes and zero norms until encoded; <see cref="Rollback"/> only lowers the visible length (stale rows are overwritten by the
 /// next <see cref="UpdateDevice"/>).</para>
-/// <para><b>Not attention-capable yet.</b> The CUDA attention kernels that read these buffers are #1892 Task 6. The host
-/// <see cref="IKvCache"/> members throw, and the CUDA forward refuses this cache type loudly until that work lands.</para>
+/// <para><b>Attention.</b> The dense CUDA forward reads these buffers in place through <see cref="CudaTurboQuantInPlaceAttention"/>
+/// (#1892 Task 6: encode, rotate Q with the K signs, <c>attention_kvtq</c> or the tensor-core <c>_tqtq</c> prefill, rotate O with
+/// the V signs). Decode is eager: graph capture never engages for this type. The host <see cref="IKvCache"/> members throw.</para>
 /// </remarks>
 public sealed class CudaTurboQuantInPlaceKvCache : IKvCache, IPerLayerKvCache
 {
@@ -275,7 +276,7 @@ public sealed class CudaTurboQuantInPlaceKvCache : IKvCache, IPerLayerKvCache
 
     private const string DeviceOnly = "CudaTurboQuantInPlaceKvCache is updated via UpdateDevice from the CUDA forward pass.";
     private const string NoDecodedView =
-        "The in-place TurboQuant cache keeps no decoded history; attention reads the codes directly (CUDA attention kernels: #1892 Task 6).";
+        "The in-place TurboQuant cache keeps no decoded history; the CUDA attention kernels read the codes directly (CudaTurboQuantInPlaceAttention, #1892).";
 
     /// <inheritdoc/>
     public void Update(TensorRef keys, TensorRef values, ReadOnlySpan<int> positions, int layerIndex) => throw new NotSupportedException(DeviceOnly);
