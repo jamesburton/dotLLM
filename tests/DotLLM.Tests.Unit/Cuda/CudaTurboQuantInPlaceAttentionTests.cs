@@ -433,20 +433,19 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         long flash0 = CudaKernels.AttentionFlashPrefillKvTqLaunches, scalar0 = CudaKernels.AttentionKvTqLaunches;
         int capBefore = model.GraphCaptureCount, eagerBefore = model.EagerDecodeCount;
 
-        float[] ipRow, orRow;
-        using (var l = Forward(model, ipCache, prompt, 0)) ipRow = LastRow(l, vocab);
-        using (var l = Forward(model, oracle, prompt, 0)) orRow = LastRow(l, vocab);
+        var ipRows = new List<float[]>(); var orRows = new List<float[]>(); var fed = new List<int>();
+        using (var l = Forward(model, ipCache, prompt, 0)) ipRows.Add(LastRow(l, vocab));
+        using (var l = Forward(model, oracle, prompt, 0)) orRows.Add(LastRow(l, vocab));
         Assert.Equal(layers, CudaKernels.AttentionFlashPrefillKvTqLaunches - flash0);
         Assert.Equal(0, CudaKernels.AttentionKvTqLaunches - scalar0);
-        AssertLogitsTrack(ipRow, orRow, "prefill");
 
         int pos = prompt.Length;
         for (int step = 0; step < decodeSteps; step++, pos++)
         {
-            int token = Argmax(ipRow);   // teacher-forced: both caches see the same token
-            using (var l = Forward(model, ipCache, [token], pos)) ipRow = LastRow(l, vocab);
-            using (var l = Forward(model, oracle, [token], pos)) orRow = LastRow(l, vocab);
-            AssertLogitsTrack(ipRow, orRow, $"decode {step}");
+            int token = Argmax(ipRows[^1]);   // teacher-forced: both caches see the same token
+            fed.Add(token);
+            using (var l = Forward(model, ipCache, [token], pos)) ipRows.Add(LastRow(l, vocab));
+            using (var l = Forward(model, oracle, [token], pos)) orRows.Add(LastRow(l, vocab));
         }
 
         Assert.Equal(capBefore, model.GraphCaptureCount);
@@ -455,6 +454,17 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         Assert.Equal(decodeSteps * layers, CudaKernels.AttentionKvTqLaunches - scalar0);
         Assert.Equal(layers, CudaKernels.AttentionFlashPrefillKvTqLaunches - flash0);
         Assert.Equal(prompt.Length + decodeSteps, ipCache.CurrentLength);
+
+        // F16-KV reference over the same tokens (run last: its decode is graph-captured).
+        var f16Rows = new List<float[]>();
+        using (var f16 = model.CreateKvCache(maxSeq))
+        {
+            using (var l = Forward(model, f16, prompt, 0)) f16Rows.Add(LastRow(l, vocab));
+            for (int step = 0; step < decodeSteps; step++)
+                using (var l = Forward(model, f16, [fed[step]], prompt.Length + step)) f16Rows.Add(LastRow(l, vocab));
+        }
+        for (int i = 0; i <= decodeSteps; i++)
+            AssertLogitsTrack(ipRows[i], orRows[i], f16Rows[i], i == 0 ? "prefill" : $"decode {i - 1}");
     }
 
     private static DotLLM.Core.Tensors.ITensor Forward(CudaTransformerModel model, DotLLM.Core.Attention.IKvCache cache, int[] tokens, int start)
@@ -464,21 +474,38 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         return model.Forward(tokens, positions, 0, cache);
     }
 
-    private void AssertLogitsTrack(float[] got, float[] oracle, string label)
+    private static (double cos, double maxAbs) Cos(float[] a, float[] b)
     {
-        double dot = 0, ng = 0, no = 0, max = 0;
-        for (int i = 0; i < got.Length; i++)
+        double dot = 0, na = 0, nb = 0, max = 0;
+        for (int i = 0; i < a.Length; i++)
         {
-            Assert.True(float.IsFinite(got[i]), $"{label}: non-finite logit {i}");
-            dot += (double)got[i] * oracle[i]; ng += (double)got[i] * got[i]; no += (double)oracle[i] * oracle[i];
-            max = Math.Max(max, Math.Abs(got[i] - oracle[i]));
+            Assert.True(float.IsFinite(a[i]), $"non-finite logit {i}");
+            dot += (double)a[i] * b[i]; na += (double)a[i] * a[i]; nb += (double)b[i] * b[i];
+            max = Math.Max(max, Math.Abs(a[i] - b[i]));
         }
-        double cos = dot / (Math.Sqrt(ng) * Math.Sqrt(no) + 1e-30);
+        return (dot / (Math.Sqrt(na) * Math.Sqrt(nb) + 1e-30), max);
+    }
+
+    /// <summary>
+    /// In-place vs the scratch oracle across 30 layers: the two paths round at different points, and a 1-ulp change in a
+    /// later layer's K/V input can flip a TurboQuant code (quantization digitizes ULP drift), so whole-model logits are not
+    /// held to the kernel tolerance. Gates: cos(in-place, oracle) > 0.99, the argmax agrees unless the oracle's top-2 gap is
+    /// below 0.1, and the in-place path is no farther from the F16-KV logits than about the oracle is
+    /// (1 - cos_ip_f16 &lt;= 2 (1 - cos_oracle_f16) + 1e-3). A wrong kernel or rotation destroys all three.
+    /// </summary>
+    private void AssertLogitsTrack(float[] got, float[] oracle, float[] f16, string label)
+    {
+        var (cos, max) = Cos(got, oracle);
+        var (cosIpF16, _) = Cos(got, f16);
+        var (cosOrF16, _) = Cos(oracle, f16);
         int ga = Argmax(got), oa = Argmax(oracle);
         float[] sorted = (float[])oracle.Clone(); Array.Sort(sorted);
         double gap = sorted[^1] - sorted[^2];
-        _out.WriteLine($"{label}: cos={cos:F6} maxAbsLogit={max:F4} argmax in-place={ga} oracle={oa} oracleTop2Gap={gap:F4}");
-        Assert.True(cos > 0.999, $"{label}: logits diverged from the oracle, cos={cos:F6}");
+        _out.WriteLine($"{label}: cos(ip,oracle)={cos:F6} maxAbsLogit={max:F4} cos(ip,f16)={cosIpF16:F6} cos(oracle,f16)={cosOrF16:F6} " +
+                       $"argmax ip={ga} oracle={oa} f16={Argmax(f16)} oracleTop2Gap={gap:F4}");
+        Assert.True(cos > 0.99, $"{label}: logits diverged from the oracle, cos={cos:F6}");
+        Assert.True(1 - cosIpF16 <= 2 * (1 - cosOrF16) + 1e-3,
+            $"{label}: in-place is farther from F16 KV (cos {cosIpF16:F6}) than the oracle is (cos {cosOrF16:F6})");
         if (gap > 0.1) Assert.Equal(oa, ga);
     }
 
