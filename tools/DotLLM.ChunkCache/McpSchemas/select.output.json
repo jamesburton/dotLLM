@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chunkcache_select output (integration spec 7.2)",
+  "type": "object",
+  "required": ["chunks", "selected_tokens", "candidate_tokens", "trimmed", "unmatched_patterns", "notes"],
+  "properties": {
+    "chunks": {"type": "array", "items": {"type": "object", "required": ["id", "path", "start_line", "end_line", "tokens", "hash", "reason", "detail"], "properties": {
+      "id": {"type": "string"}, "path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"},
+      "tokens": {"type": "integer"}, "hash": {"type": "string"}, "reason": {"type": "string"}, "detail": {"type": "string"},
+      "hop": {"type": "integer"}, "stored": {"type": "boolean"}, "text": {"type": "string"}}}},
+    "selected_tokens": {"type": "integer"},
+    "candidate_tokens": {"type": "integer"},
+    "trimmed": {"type": "integer"},
+    "unmatched_patterns": {"type": "array", "items": {"type": "string"}},
+    "notes": {"type": "array", "items": {"type": "string"}}
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chunkcache_explain output (integration spec 7.2)",
+  "type": "object",
+  "required": ["chunks", "warnings"],
+  "properties": {
+    "policy_would_apply": {"type": "string"},
+    "reason": {"type": "string"},
+    "chunks": {"type": "array", "items": {"type": "object", "properties": {
+      "id": {"type": "string"}, "status": {"enum": ["prefix", "hit", "miss", "ignored"]}, "why": {"type": "string"}}}},
+    "predicted_ms": {"type": "object", "properties": {"reuse": {"type": "number"}, "full_prefill": {"type": "number"}}},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  }
+}
