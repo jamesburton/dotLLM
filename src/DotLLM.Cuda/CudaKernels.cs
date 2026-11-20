@@ -5379,6 +5379,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <summary>The TurboQuant prefill entry used when neither the environment nor a test override picks one.</summary>
     internal const TqPrefillVariant DefaultTqPrefillVariant = TqPrefillVariant.Specialized;
 
+    private static int s_tqPrefillEntryReported;
+
     /// <summary>Test / bench override of the TurboQuant prefill entry; null = automatic (specialised when it applies).</summary>
     internal static TqPrefillVariant? TqPrefillVariantOverride;
 
@@ -5469,6 +5471,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
         if (smem > AttentionFlashPrefillHd256MaxSmemBytes)
             throw new ArgumentException($"TurboQuant prefill needs {smem} B of shared memory (> {AttentionFlashPrefillHd256MaxSmemBytes}).");
         Interlocked.Increment(ref AttentionFlashPrefillKvTqLaunches);
+        // A/B proof: when the switch is set, say once per process which entry actually ran (the CLI exposes no launch counters).
+        if (s_tqPrefillEnvVariant is not null && Interlocked.Exchange(ref s_tqPrefillEntryReported, 1) == 0)
+            Console.Error.WriteLine($"dotLLM CUDA: TurboQuant prefill entry {ran} (DOTLLM_CUDA_TQ_PREFILL={s_tqPrefillEnvVariant}, hd{headDim} tq{mseBits})");
 
         nint qArg = q, kcArg = kCodes, vcArg = vCodes, knArg = kNorms, vnArg = vNorms, ceArg = centroids, oArg = output;
         int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, poArg = positionOffset;
