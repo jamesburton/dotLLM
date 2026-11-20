@@ -154,6 +154,8 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
 
         var codecK = new TurboQuantCodec(hd, bits, Seed, useQjl: false);
         var codecV = new TurboQuantCodec(hd, bits, Seed ^ VSeedXor, useQjl: false);
+        // K and V rotate with different sign sets: a twin or a rotation that took the other side's signs cannot pass.
+        Assert.False(codecK.RotationSigns.SequenceEqual(codecV.RotationSigns), "K and V sign seeds must differ");
         using var enc = TurboQuantEncodeF32Kernel.Create(device, spvDir);
         using var rot = TqRotateKernel.Create(device, spvDir);
         using var cache = new VulkanKvCache(device, 1, seqKv, l, codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD);
@@ -591,6 +593,7 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         var corpus = TurboQuantByteExactCorpus.Build(bits, hd, halfInputs: false);
+        Assert.False(corpus.K.Codec.RotationSigns.SequenceEqual(corpus.V.Codec.RotationSigns), "K and V sign seeds must differ");
         const int kvHeads = TurboQuantByteExactCorpus.NumKvHeads, seqLen = TurboQuantByteExactCorpus.SeqLen, startPos = 3, layer = 1;
         var l = Layout(bits, hd, kvHeads);
         int maxSeq = startPos + seqLen;
@@ -763,6 +766,7 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
 
         var codecK = new TurboQuantCodec(hd, bits, Seed, useQjl: false);
         var codecV = new TurboQuantCodec(hd, bits, Seed ^ VSeedXor, useQjl: false);
+        Assert.False(codecK.RotationSigns.SequenceEqual(codecV.RotationSigns), "K and V sign seeds must differ");
         using var model = VulkanTransformerModel.LoadFromGguf(gguf, config, spvDir);
 
         // Baseline (the model's default KV) and the scratch oracle first: the switch below changes what CreateKvCache makes.
@@ -790,6 +794,11 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         int forwards = (promptTokens - 1 + chunk - 1) / chunk + 1;
         Assert.Equal((long)forwards * config.NumLayers, model.TurboQuantAttentionCount - attn0);   // every layer of every forward ran in code space
         Assert.Equal(expectSplitKv ? (long)config.NumLayers : 0L, model.TurboQuantSplitKvCount - split0);
+
+        // One forward writes at most 65535 head vectors (the encode's and the rotations' dispatch bound): a longer one is refused, not clipped.
+        int tooMany = VulkanTransformerModel.MaxTurboQuantVectorsPerForward / config.NumKvHeads + 1;
+        using (var c = model.CreateKvCache(tooMany))
+            Assert.Throws<NotSupportedException>(() => model.Forward(new int[tooMany], Enumerable.Range(0, tooMany).ToArray(), -1, c));
 
         var rows = new[] { ("prefill", inPlace.Prefill, oracle.Prefill, plain.Prefill), ("decode", inPlace.Decode, oracle.Decode, plain.Decode) };
         foreach (var (name, a, o, p) in rows)

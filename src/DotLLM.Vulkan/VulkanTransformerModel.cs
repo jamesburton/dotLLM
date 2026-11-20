@@ -1100,6 +1100,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     private readonly BlockKvTwins _kvTqSet = new();
     private TurboQuantKvConstants? _tqKv;
 
+    /// <summary>Head vectors (rows x KV heads) one forward may write to a TurboQuant cache: the guaranteed <c>maxComputeWorkGroupCount</c> per dimension.</summary>
+    internal const int MaxTurboQuantVectorsPerForward = 65535;
+
     /// <summary>Count of attention dispatches that ran in TurboQuant code space: query rotated in, <c>_kvtq</c> twin, output rotated out (#1892; test/diagnostic).</summary>
     public long TurboQuantAttentionCount { get; private set; }
 
@@ -1579,7 +1582,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     /// rotation or required twin (dense: the per-token kernel; Flint: split-KV decode, the GQA sink flash and the reference sink kernel).
     /// The caller must then refuse the request at startup; there is no other TurboQuant path to take.</para>
     /// <para>The codec constants come from the caller (<c>TurboQuantCodec</c>: <c>Centroids</c>, the K codec's and the V codec's
-    /// <c>RotationSigns</c>, <c>InvSqrtD</c>). QJL (<c>tq*q</c>) is not served here (step 5).</para>
+    /// <c>RotationSigns</c>, <c>InvSqrtD</c>). QJL (<c>tq*q</c>) is not served here (step 5). Must not run while a forward is recording
+    /// (a call with another layout disposes the previous layout's twins).</para>
+    /// <para>One forward takes at most <c>65535 / numKvHeads</c> rows on a TurboQuant cache (the encode dispatches one workgroup per head
+    /// vector and the rotations one workgroup row per query row); a longer one throws, so prefill must be chunked.</para>
     /// </summary>
     /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
     /// <param name="mseBits">Bits per coordinate (1..8).</param>
@@ -1601,11 +1607,23 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         if (centroids.Length != 1 << mseBits) throw new ArgumentException("centroids must have 2^mseBits entries.", nameof(centroids));
         if (signsK.Length != headDim || signsV.Length != headDim) throw new ArgumentException("signs must have headDim entries.", nameof(signsK));
         var layout = new TurboQuantLayout(headDim, Config.NumKvHeads, mseBits, normFormat ?? TurboQuantLayout.DefaultNorm);
-        if (layout.Norm is not (TqNormFormat.F16 or TqNormFormat.Bf16 or TqNormFormat.F32Reference)) return false;
+        if (layout.Norm == TqNormFormat.F32Reference)
+            throw new NotSupportedException("FP32 norms are a reference format (oracles, A/B measurement); a serving cache stores F16 or BF16 norms (CLAUDE.md precision rule 1).");
+        if (layout.Norm is not (TqNormFormat.F16 or TqNormFormat.Bf16)) return false;
 
         var set = _kvTqSet;
-        if (set.Tq is { } built && built != layout) set.Dispose();   // another layout: its twins are specialised for the old one
+        if (set.Tq is { } built && built != layout) Fail();   // another layout: the twins are specialised for the old one; rebuilt below
         set.Tq = layout;
+
+        // A refusal leaves no half-built TurboQuant state behind: no twins, no constants, and CreateKvCache back on the model's default.
+        bool Fail()
+        {
+            set.Dispose();
+            set.Tq = null;
+            _tqKv = null;
+            if (KvStorageOverride == VulkanKvStorage.Tq) KvStorageOverride = null;
+            return false;
+        }
         try
         {
             if (flint)
@@ -1616,25 +1634,18 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 if (Environment.GetEnvironmentVariable(SinkFlashEnvVar) != "0" && !IsFlashAttentionDisabled())
                     set.SinkFlash ??= VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, VulkanKvStorage.Tq, sinks: true, splitQ: null, tq: layout);
                 if (!set.HasWriter || set.SplitKv is null || set.SinkFlash is null || !_gptOss!.TryEnsureTurboQuantSinks(_device, spvDir, layout))
-                {
-                    set.Dispose(); set.Tq = null;
-                    return false;
-                }
+                    return Fail();
             }
             else
             {
                 if (set.Attention is null) InitDenseBlockKvKernels(spvDir, VulkanKvStorage.Tq);
                 if (set.Attention is null || !set.HasWriter)
-                {
-                    set.Dispose(); set.Tq = null;
-                    return false;
-                }
+                    return Fail();
             }
         }
         catch (Exception e) when (e is FileNotFoundException or VulkanException)
         {
-            set.Dispose(); set.Tq = null;
-            return false;
+            return Fail();
         }
         _tqKv = new TurboQuantKvConstants(layout, centroids.ToArray(), signsK.ToArray(), signsV.ToArray(), invSqrtD);
         KvStorageOverride = VulkanKvStorage.Tq;
@@ -4793,6 +4804,12 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 $"A {_fwdKvStorage} VulkanKvCache needs this model's {_fwdKvStorage}-KV writer and attention twins (dense chain: the per-token twin; Flint: split-KV and coopmat sink flash); use CreateKvCache after TryUseInPlaceQuantizedKv / TryUseInPlaceTurboQuantKv.");
         if (_fwdKvStorage == VulkanKvStorage.Tq && ((VulkanKvCache)kvCache!).TurboQuantLayout != _kvTqSet.Tq)
             throw new NotSupportedException("This TurboQuant KV cache was made for another layout than the model's twins are specialised for (#1892).");
+        // The encode dispatches one workgroup per head vector (rows x numKvHeads on X) and the Q / O rotations one workgroup row per query
+        // row (Y): both are bounded by the 65535 workgroups Vulkan guarantees per dimension. Refuse rather than record a dispatch the
+        // device may clip.
+        if (_fwdKvStorage == VulkanKvStorage.Tq && (long)seqLen * Config.NumKvHeads > MaxTurboQuantVectorsPerForward)
+            throw new NotSupportedException(
+                $"A TurboQuant KV forward takes at most {MaxTurboQuantVectorsPerForward / Config.NumKvHeads} rows on this model ({Config.NumKvHeads} KV heads); got {seqLen}. Chunk the prefill.");
 
         DpBegin(seqLen);
 

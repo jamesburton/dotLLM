@@ -29,8 +29,8 @@
 //              pipeline compile time and costs a body no push-constant register. Each layer's code buffer ends in one guard word
 //              (the straddle read of the last vector's last code).
 //              Norm formats (TqNormFormat): 1 = F16, 2 = BF16, two vectors per word, the even one in the low half; 0 = F32 (reference).
-//              KV_K4 / KV_V4 (i a multiple of 4) and kvTqK8 / kvTqV8 (i a multiple of 8) load consecutive elements of one head vector
-//              with one norm read, for the bodies that load in groups.
+//              kvTqK4 / kvTqV4 (i a multiple of 4) and kvTqK8 / kvTqV8 (i a multiple of 8) load consecutive elements of one head
+//              vector with one norm read, for the bodies that load in groups.
 //
 // K and V pick their storage independently (issue #1884, mixed --cache-type-k / -v): KV_K_F16 | KV_K_Q8 | KV_K_Q4 | KV_K_TQ and the
 // KV_V_* twins. KV_F16 / KV_Q8 / KV_Q4 / KV_TQ set both sides.
@@ -116,7 +116,6 @@ mat2x4 kvTqK8(uint i) {
     return mat2x4(tqGroup4(kw[w], kw[w + 1u], bit & 31u, norm), tqGroup4(kw[w2], kw[w2 + 1u], bit2 & 31u, norm));
 }
 #define KV_K(i) kvTqK(i)
-#define KV_K4(i) kvTqK4(i)
 #elif defined(KV_K_F16)
 layout(set = 0, binding = 1, std430) readonly  buffer BufK   { uint kw[]; };    // [seq_kv, num_kv_heads * head_dim] F16, 2 per word
 #define KV_K(i) unpackHalf2x16(kw[(i) >> 1u] >> (((i) & 1u) << 4u)).x
@@ -156,7 +155,6 @@ mat2x4 kvTqV8(uint i) {
     return mat2x4(tqGroup4(vw[w], vw[w + 1u], bit & 31u, norm), tqGroup4(vw[w2], vw[w2 + 1u], bit2 & 31u, norm));
 }
 #define KV_V(i) kvTqV(i)
-#define KV_V4(i) kvTqV4(i)
 #elif defined(KV_V_F16)
 layout(set = 0, binding = 2, std430) readonly  buffer BufV   { uint vw[]; };    // [seq_kv, num_kv_heads * head_dim] F16, 2 per word
 #define KV_V(i) unpackHalf2x16(vw[(i) >> 1u] >> (((i) & 1u) << 4u)).x
