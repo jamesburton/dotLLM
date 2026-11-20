@@ -320,9 +320,13 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                         rig.Kernels.LaunchKvDequantToF16(dKq, kd, dKs, (int)kvElems, rig.Stream.Handle);
                         rig.Kernels.LaunchKvDequantToF16(dVq, vd, dVs, (int)kvElems, rig.Stream.Handle);
                         rig.Stream.Synchronize();
-                        var a = RunDense(rig, dQ, dKs, dVs, F16, F16, seqKv, numHeads, numKvHeads, hd, 0, out int s1);
-                        var b = RunDense(rig, dQ, dKq, dVq, kd, vd, seqKv, numHeads, numKvHeads, hd, 0, out int s2);
-                        Assert.Equal(s1, s2);
+                        // The entries differ in register count, so their co-residency ceilings (and so the default split) can
+                        // differ: pin both to the same split, the one both can launch.
+                        int split = CudaKernels.ComputeAttentionMmaV2KvSplit(seqKv, Math.Min(
+                            rig.Kernels.MaxSafeAttentionMmaDecodeDense(numKvHeads, hd, F16, F16),
+                            rig.Kernels.MaxSafeAttentionMmaDecodeDense(numKvHeads, hd, kd, vd)));
+                        var a = RunDense(rig, dQ, dKs, dVs, F16, F16, seqKv, numHeads, numKvHeads, hd, split, out int s1);
+                        var b = RunDense(rig, dQ, dKq, dVq, kd, vd, seqKv, numHeads, numKvHeads, hd, split, out int s2);
                         int diff = 0, nonZero = 0;
                         for (int i = 0; i < a.Length; i++) { if (a[i] != b[i]) diff++; if ((a[i] & 0x7FFF) != 0) nonZero++; }
                         _out.WriteLine($"{numHeads}/{numKvHeads}/hd{hd} seqKv={seqKv} {kd}/{vd} p32={p32} split={s1}: bit-diff {diff}, non-zero {nonZero}/{a.Length}");
@@ -432,10 +436,12 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                 double e = Math.Abs(H(o[i]) - H(r[i]));
                 maxErr = Math.Max(maxErr, e); maxRef = Math.Max(maxRef, Math.Abs(H(r[i])));
                 swapDiff = Math.Max(swapDiff, Math.Abs(H(swapped[i]) - H(r[i])));
-                Assert.True(e <= 2e-3 + 4e-3 * Math.Abs(H(r[i])), $"tq{bits} hd{hd} elem {i}: {H(o[i])} vs scalar {H(r[i])}");
+                // Measured worst 3.05e-5 (framework, first run): the scalar kernel and v2 differ only by the F16 rounding of each
+                // decoded element and of P. Budget 1e-4 + 1e-3 |r| is ~3x that.
+                Assert.True(e <= 1e-4 + 1e-3 * Math.Abs(H(r[i])), $"tq{bits} hd{hd} elem {i}: {H(o[i])} vs scalar {H(r[i])}");
             }
             _out.WriteLine($"tq{bits} {nh}/{nkv}/hd{hd} seqKv={seqKv}: max|v2-scalar|={maxErr:E2} max|ref|={maxRef:E2} swapped-KV diff={swapDiff:E2}");
-            Assert.True(swapDiff > 20 * (2e-3 + 4e-3 * maxRef), $"substitution: swapping K and V moved the output only {swapDiff:E2}");
+            Assert.True(swapDiff > 20 * (1e-4 + 1e-3 * maxRef), $"substitution: swapping K and V moved the output only {swapDiff:E2}");
         }
         finally { foreach (var p in new[] { dQ, kc, vc, kn, vn, ce }) CudaDriverApi.cuMemFree_v2(p); }
     }
