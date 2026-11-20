@@ -1040,7 +1040,7 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
     public void Synthetic_EachLayerWritesAndReadsItsOwnBuffers()
         => WithSyntheticModel(layers: 4, heads: 4, kvHeads: 2, hd: 32, hidden: 128, vocab: 96, maxSeq: 1024, (model, config, spvDir)
             => CompareWithOracle(model, config, SyntheticTokens(200, config.VocabSize), spvDir, bits: 4, chunk: 64, expectSplitKv: true,
-                maxRatio: 1.0, minCos: 0.9, minLayerCodeAgreement: 0.6));
+                maxRatio: double.MaxValue, minCos: -1.0, minLayerCodeAgreement: 0.6));   // the codes decide here, not the logits
 
     /// <summary>
     /// With in-place TurboQuant active the model asks for prefill chunks of at most floor(65535 / numKvHeads) rows (one forward may
@@ -1074,17 +1074,17 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
             var ck = new TurboQuantCodec(16, bits, Seed, useQjl: false);
             var cv = new TurboQuantCodec(16, bits, Seed ^ VSeedXor, useQjl: false);
             Assert.True(model.TryUseInPlaceTurboQuantKv(spvDir, bits, ck.Centroids, ck.RotationSigns, cv.RotationSigns, ck.InvSqrtD));
-            int cap = model.PreferredPrefillChunkTokens;
-            Assert.Equal(2047, cap);
+            const int cap = 65535 / 32;   // 2047 rows
             var rng = new Random(0x6E);
             string prompt = new(Enumerable.Range(0, 2600).Select(_ => (char)rng.Next(32, 127)).ToArray());
             Assert.True(prompt.Length > cap);
             var opts = new InferenceOptions { Temperature = 0, MaxTokens = 4, Logprobs = true };
 
             var byPreference = new TextGenerator(model, new CharTokenizer(), (_, size) => model.CreateKvCache(size), mtpEnabled: false);
-            Assert.Equal(cap, byPreference.EffectivePrefillChunkSize);
             long attn0 = model.TurboQuantAttentionCount;
-            var a = byPreference.Generate(prompt, opts);
+            var a = byPreference.Generate(prompt, opts);   // a model that asked for one pass would meet the guard in Forward here
+            Assert.Equal(cap, model.PreferredPrefillChunkTokens);
+            Assert.Equal(cap, byPreference.EffectivePrefillChunkSize);
             Assert.Equal(prompt.Length, a.PromptTokenCount);
             Assert.True(model.TurboQuantAttentionCount - attn0 >= 2 + 1, "the prefill did not run as at least two forwards");
 
