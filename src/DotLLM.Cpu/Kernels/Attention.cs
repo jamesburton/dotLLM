@@ -1606,6 +1606,9 @@ public static class Attention
         public bool OneShot;
     }
 
+    /// <summary>Test hook (#1892): floats of per-worker row scratch the tiled kernel last requested. Must equal <c>headDim</c> and never scale with the cached length.</summary>
+    internal static int RowScratchFloatsObserved;
+
     /// <summary>Query heads sharing one KV head that are processed together, so each cached row is decoded once for all of them.</summary>
     private const int MaxGroupHeads = 4;
 
@@ -1620,7 +1623,9 @@ public static class Attention
 
         int scoreStride = ctx.OneShot ? OneShotMaxKeys : MaxTileSize;
         float* scores = stackalloc float[MaxGroupHeads * scoreStride];
-        float* rowScratch = stackalloc float[ctx.HeadDim];
+        int rowScratchFloats = ctx.HeadDim;   // one head vector: the only buffer a quantized / TurboQuant row is decoded into
+        float* rowScratch = stackalloc float[rowScratchFloats];
+        RowScratchFloatsObserved = rowScratchFloats;
 
         for (int h = startHead; h < endHead;)
         {

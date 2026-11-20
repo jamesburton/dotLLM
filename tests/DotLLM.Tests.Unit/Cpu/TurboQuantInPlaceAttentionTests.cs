@@ -14,12 +14,12 @@ namespace DotLLM.Tests.Unit.Cpu;
 /// </summary>
 public sealed unsafe class TurboQuantInPlaceAttentionTests
 {
-    private const ulong Seed = 0x5EEDC0DEUL;
+    internal const ulong Seed = 0x5EEDC0DEUL;
     private const int History = 40;
 
     private sealed record Case(float[] KHist, float[] VHist, float[] KChunk, float[] VChunk, float[] Q);
 
-    private static float[] Gauss(Random rng, int n, float scale)
+    internal static float[] Gauss(Random rng, int n, float scale)
     {
         var a = new float[n];
         for (int i = 0; i < n; i++)
@@ -38,7 +38,7 @@ public sealed unsafe class TurboQuantInPlaceAttentionTests
                         Gauss(rng, seqQ * qStride, 1.0f));
     }
 
-    private static void Fill(IKvCache cache, float[] k, float[] v, int firstPos, int kvStride)
+    internal static void Fill(IKvCache cache, float[] k, float[] v, int firstPos, int kvStride)
     {
         int n = k.Length / kvStride;
         var pos = new int[n];
@@ -181,65 +181,6 @@ public sealed unsafe class TurboQuantInPlaceAttentionTests
         Assert.True(RelErr(wantA, wantB) > 1e-2);
         Assert.True(RelErr(gotA, wantA) <= 1e-3);
         Assert.True(RelErr(gotB, wantB) <= 1e-3);
-    }
-
-    // Guards CLAUDE.md rule 2 (no decoded history). Two probes, because a managed-only probe is blind to a NativeMemory scratch:
-    //  - managed bytes allocated on this thread during the call;
-    //  - peak private (committed) process memory during the call, sampled from a second thread. Other tests run in parallel and can
-    //    add noise, so up to 3 attempts are made: a real full-history decode (>= rows*hd*4 / 2 bytes, committed for the whole decode)
-    //    exceeds the bound on every attempt, noise does not.
-    [Fact]
-    public void HistoryIsNeverDecodedWhole()
-    {
-        const int hd = 128, numKvHeads = 2, numHeads = 4, rows = 16384, bits = 4;
-        int kvStride = numKvHeads * hd;
-        using var cache = new TurboQuantInPlaceKvCache(1, numKvHeads, hd, rows, bits, Seed);
-        var rng = new Random(5);
-        var k = Gauss(rng, rows * kvStride, 1f);
-        var v = Gauss(rng, rows * kvStride, 1f);
-        Fill(cache, k, v, 0, kvStride);
-        var q = Gauss(rng, numHeads * hd, 1f);
-        var o = new float[numHeads * hd];
-        long oneSideDecoded = (long)rows * numKvHeads * hd * 4;   // a decoded K (or V) history, F32
-        long bound = oneSideDecoded / 2;
-
-        void Attend()
-        {
-            fixed (float* qp = q)
-            fixed (float* op = o)
-                Attention.ExecuteTurboQuant(qp, cache, 0, op, 1, rows, numHeads, numKvHeads, hd, rows - 1, null);
-        }
-
-        Attend();   // warm up the JIT
-        long bestNativeDelta = long.MaxValue;
-        for (int attempt = 0; attempt < 3 && bestNativeDelta >= bound; attempt++)
-        {
-            GC.Collect();
-            using var proc = System.Diagnostics.Process.GetCurrentProcess();
-            long baseline = Private(proc);
-            long peak = baseline;
-            bool stop = false;
-            var sampler = new Thread(() =>
-            {
-                using var p = System.Diagnostics.Process.GetCurrentProcess();
-                while (!Volatile.Read(ref stop)) { long x = Private(p); if (x > peak) peak = x; }
-            }) { IsBackground = true };
-            sampler.Start();
-            long managedBefore = GC.GetAllocatedBytesForCurrentThread();
-            for (int rep = 0; rep < 20; rep++) Attend();
-            long managed = (GC.GetAllocatedBytesForCurrentThread() - managedBefore) / 20;
-            Volatile.Write(ref stop, true);
-            sampler.Join();
-            Assert.True(managed < (long)rows * hd * 4, $"allocated {managed} managed bytes during attention");
-            bestNativeDelta = Math.Min(bestNativeDelta, peak - baseline);
-        }
-        Assert.True(bestNativeDelta < bound, $"peak private memory grew by {bestNativeDelta} bytes during attention (bound {bound})");
-
-        // No decoded view exists to hand out, and the cache owns exactly codes + norms.
-        Assert.Throws<NotSupportedException>(() => { cache.GetKeysRef(0); });
-        Assert.Equal(cache.Layout.CodeBytesPerLayer(rows) * 2 + cache.Layout.NormBytesPerLayer(rows) * 2, cache.AllocatedBytes);
-
-        static long Private(System.Diagnostics.Process p) { p.Refresh(); return p.PrivateMemorySize64; }
     }
 
     // A TurboQuant cache must have no window: the kernel builds the window segment over a null pointer.
