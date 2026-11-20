@@ -335,6 +335,111 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
         finally { CudaKernels.DenseDecodeV2F32Partials = prev; }
     }
 
+    // ── TurboQuant in place (E3): the dense v2 TQ entry vs the scalar attention_kvtq on the same codes, norms and centroids. ──
+
+    private sealed record TqFixture(uint[] KCodes, uint[] VCodes, ushort[] KNorms, ushort[] VNorms, float[] Centroids, int Cu);
+
+    /// <summary>
+    /// Random codes (every centroid used), per-(position, head) F16 norms that differ across keys and heads, and a sorted
+    /// non-uniform centroid table scaled by 1/sqrt(hd) like the codec's.
+    /// </summary>
+    private static TqFixture MakeTq(Random rng, int seqKv, int nkv, int hd, int bits)
+    {
+        int cu = (hd * bits + 31) / 32;
+        long vecs = (long)seqKv * nkv;
+        var kc = new uint[vecs * cu]; var vc = new uint[vecs * cu];
+        for (long i = 0; i < kc.Length; i++) { kc[i] = (uint)rng.NextInt64(0, 1L << 32); vc[i] = (uint)rng.NextInt64(0, 1L << 32); }
+        var kn = new ushort[vecs]; var vn = new ushort[vecs];
+        for (long i = 0; i < vecs; i++)
+        {
+            kn[i] = BitConverter.HalfToUInt16Bits((Half)(0.5f + 2.5f * (float)rng.NextDouble()));
+            vn[i] = BitConverter.HalfToUInt16Bits((Half)(0.5f + 2.5f * (float)rng.NextDouble()));
+        }
+        int levels = 1 << bits;
+        var c = new float[levels];
+        for (int i = 0; i < levels; i++) c[i] = (float)((-1.0 + 2.0 * (i + 0.5) / levels + 0.15 * Math.Sin(i * 1.7)) * 2.5 / Math.Sqrt(hd));
+        Array.Sort(c);
+        return new TqFixture(kc, vc, kn, vn, c, cu);
+    }
+
+    private static ushort[] RunTqDense(Rig rig, nint dQ, nint kc, nint vc, nint kn, nint vn, nint cent, int seqKv, int nh, int nkv,
+        int hd, int bits, int cu, int forcedSplit)
+    {
+        int maxSafe = rig.Kernels.MaxSafeAttentionMmaDecodeDenseTq(nkv, hd);
+        Assert.True(maxSafe >= 1);
+        int split = forcedSplit > 0 ? forcedSplit : CudaKernels.ComputeAttentionMmaV2KvSplit(seqKv, maxSafe);
+        nint dOut = Alloc(nh * hd * 2), dPm = Alloc(nh * split * 4), dPs = Alloc(nh * split * 4),
+             dPo = Alloc((long)nh * split * hd * CudaKernels.AttentionMmaDecodeDensePartialBytes);
+        try
+        {
+            rig.Kernels.LaunchAttentionMmaDecodeDenseTq(dQ, kc, vc, kn, vn, cent, dOut, seqKv, nh, nkv, hd, split, dPm, dPs, dPo,
+                bits, cu, DotLLM.Core.Attention.TqNormFormat.F16, rig.Stream.Handle);
+            rig.Stream.Synchronize();
+            return DownloadHalf(dOut, nh * hd);
+        }
+        finally { foreach (var p in new[] { dOut, dPm, dPs, dPo }) CudaDriverApi.cuMemFree_v2(p); }
+    }
+
+    private static ushort[] RunTqScalar(Rig rig, nint dQ, nint kc, nint vc, nint kn, nint vn, nint cent, int seqKv, int nh, int nkv,
+        int hd, int bits, int cu)
+    {
+        nint dOut = Alloc(nh * hd * 2);
+        try
+        {
+            rig.Kernels.LaunchAttentionKvTq(dQ, kc, vc, kn, vn, cent, dOut, 1, seqKv, nh, nkv, hd, seqKv - 1, 0, rig.Stream.Handle, 0,
+                bits, cu, DotLLM.Core.Attention.TqNormFormat.F16);
+            rig.Stream.Synchronize();
+            return DownloadHalf(dOut, nh * hd);
+        }
+        finally { CudaDriverApi.cuMemFree_v2(dOut); }
+    }
+
+    public static IEnumerable<object[]> TqCases()
+    {
+        foreach (int bits in new[] { 1, 2, 3, 4, 5, 6, 7, 8 })
+            yield return new object[] { 32, 8, 128, bits, 1037, 0 };
+        yield return new object[] { 14, 2, 64, 3, 385, 3 };
+        yield return new object[] { 14, 2, 64, 4, 4097, 0 };
+        yield return new object[] { 16, 4, 256, 4, 300, 0 };
+        yield return new object[] { 16, 4, 256, 3, 129, 2 };
+        yield return new object[] { 32, 8, 128, 4, 8191, 0 };
+    }
+
+    /// <summary>
+    /// E3 oracle: dense v2 TQ == scalar attention_kvtq within the F16 element-rounding budget, for tq1..tq8 (tq3/5/6/7 straddle
+    /// words; tq7 needs the third word), hd 64/128/256, uneven splits. Substitution: the same codes with K and V swapped must move
+    /// the output far outside that budget, so the fixture can see a K/V mix-up.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(TqCases))]
+    public void DenseTq_MatchesScalarKvTq(int nh, int nkv, int hd, int bits, int seqKv, int forcedSplit)
+    {
+        using var rig = TrySetUp(out string? skip);
+        Skip.If(rig == null, skip);
+        Skip.IfNot(rig!.Kernels.HasAttentionMmaDecodeDenseTq(hd) && rig.Kernels.HasAttentionKvTq, "TQ kernels not loaded");
+        var rng = new Random(0x7E3 + bits * 101 + hd + seqKv);
+        var f = MakeTq(rng, seqKv, nkv, hd, bits);
+        nint dQ = Upload(RandomHalf(rng, nh * hd, 2.0f));
+        nint kc = Upload(f.KCodes), vc = Upload(f.VCodes), kn = Upload(f.KNorms), vn = Upload(f.VNorms), ce = Upload(f.Centroids);
+        try
+        {
+            var r = RunTqScalar(rig, dQ, kc, vc, kn, vn, ce, seqKv, nh, nkv, hd, bits, f.Cu);
+            var o = RunTqDense(rig, dQ, kc, vc, kn, vn, ce, seqKv, nh, nkv, hd, bits, f.Cu, forcedSplit);
+            var swapped = RunTqDense(rig, dQ, vc, kc, vn, kn, ce, seqKv, nh, nkv, hd, bits, f.Cu, forcedSplit);
+            double maxErr = 0, maxRef = 0, swapDiff = 0;
+            for (int i = 0; i < r.Length; i++)
+            {
+                double e = Math.Abs(H(o[i]) - H(r[i]));
+                maxErr = Math.Max(maxErr, e); maxRef = Math.Max(maxRef, Math.Abs(H(r[i])));
+                swapDiff = Math.Max(swapDiff, Math.Abs(H(swapped[i]) - H(r[i])));
+                Assert.True(e <= 2e-3 + 4e-3 * Math.Abs(H(r[i])), $"tq{bits} hd{hd} elem {i}: {H(o[i])} vs scalar {H(r[i])}");
+            }
+            _out.WriteLine($"tq{bits} {nh}/{nkv}/hd{hd} seqKv={seqKv}: max|v2-scalar|={maxErr:E2} max|ref|={maxRef:E2} swapped-KV diff={swapDiff:E2}");
+            Assert.True(swapDiff > 20 * (2e-3 + 4e-3 * maxRef), $"substitution: swapping K and V moved the output only {swapDiff:E2}");
+        }
+        finally { foreach (var p in new[] { dQ, kc, vc, kn, vn, ce }) CudaDriverApi.cuMemFree_v2(p); }
+    }
+
     /// <summary>The C# wrapper must refuse a kvSplit above the co-residency ceiling before launching (a hard CUDA error otherwise).</summary>
     [SkippableFact]
     public void Dense_RejectsSplitAboveCoResidencyCeiling()
