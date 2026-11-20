@@ -1052,7 +1052,7 @@ __device__ __forceinline__ void pk_tq_prefill_body_cpa(PK_TQ_BODY_ARGS)
             const int rem = i - side * (PK_KV_TILE * CH);
             const int r = rem / CH, ch = rem - (rem / CH) * CH;
             int key = k0 + r;
-            if (key > seq_kv - 1) key = seq_kv - 1;          // clamp: masked later, stays finite
+            if (key > seq_kv - 1) key = seq_kv - 1;          // clamp the staged code row: masked later, stays in bounds
             const uint32_t* src = (side ? v_codes : k_codes) + ((size_t)key * num_kv_heads + hkv) * CU + ch * 4;
             pk_cp_async16(sRaw + ((size_t)(buf * 2 + side) * PK_KV_TILE + r) * CU + ch * 4, src);
         }
@@ -1061,7 +1061,7 @@ __device__ __forceinline__ void pk_tq_prefill_body_cpa(PK_TQ_BODY_ARGS)
     auto norm_of = [&](int t) -> unsigned short
     {
         int key = t * PK_KV_TILE + (threadIdx.x & (PK_KV_TILE - 1));
-        if (key > seq_kv - 1) key = seq_kv - 1;
+        if (key > seq_kv - 1) key = seq_kv - 1;   // clamp the prefetched norm
         const size_t hv = (size_t)key * num_kv_heads + hkv;
         return __ldg((threadIdx.x < PK_KV_TILE ? k_norms : v_norms) + hv);
     };
@@ -1090,7 +1090,7 @@ __device__ __forceinline__ void pk_tq_prefill_body_cpa(PK_TQ_BODY_ARGS)
     for (int t = 0; t < num_tiles; t++)
     {
         const int buf = t & 1;
-        pk_cp_async_wait<1>();
+        pk_cp_async_wait<1>();   // tile t has landed; only tile t+1's group may still be in flight
         __syncthreads();
         const uint32_t* rk = sRaw + (size_t)(buf * 2 + 0) * PK_KV_TILE * CU;
         const uint32_t* rv = sRaw + (size_t)(buf * 2 + 1) * PK_KV_TILE * CU;
