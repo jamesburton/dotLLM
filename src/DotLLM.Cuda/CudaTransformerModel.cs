@@ -20,7 +20,7 @@ namespace DotLLM.Cuda;
 /// CUDA stream with no host synchronization until the final logits D2H transfer.
 /// Mirrors <see cref="TransformerModel"/> structure but uses cuBLAS GEMM/GEMV and custom PTX kernels.
 /// </summary>
-public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
+public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimitable
 {
     private readonly CudaWeights _weights;
     private readonly CudaForwardState _state;
@@ -1334,12 +1334,21 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
             && _kernels.HasFusedRopeKvWriteKernel && CanCaptureMoeDecode()
             && ForwardMoeDecodeGraph(tokenIds, positions, deviceId, moeKv) is { } graphLogits)
             return graphLogits;
+
+        // #1922 E2: a dense decode step the graphs above did not take (past GraphCaptureMaxDepth, pure-quantized or in-place
+        // TurboQuant KV) runs this eager body captured whole, re-captured every step and pushed with cuGraphExecUpdate.
+        if (!_stepGraphCapturing && !_moeGraphCapturing
+            && StepGraphEligible(tokenIds.Length, suppressGraphCapture, deferredHostDest, isMla, isMoe, kvCache)
+            && ForwardStepGraph(tokenIds, positions, deviceId, kvCache!) is { } stepLogits)
+            return stepLogits;
+
         bool capturing = _moeGraphCapturing;
+        bool stepCapturing = _stepGraphCapturing;
 
         // #338: a single-token decode reaching here did NOT use graph replay, whatever
         // UseGraphCapture says. Counted so a test can tell "capture engaged" from "capture
         // was requested and silently declined".
-        if (tokenIds.Length == 1 && !capturing) EagerDecodeCount++;
+        if (tokenIds.Length == 1 && !capturing && !stepCapturing) EagerDecodeCount++;
 
         _context.MakeCurrent();
         int seqLen = tokenIds.Length;
@@ -1371,8 +1380,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
             CudaDriverApi.cuEventRecord(_evtStart, s).ThrowOnError();
         }
 
-        // 1. Upload tokenIds + positions to device (a captured MoE decode has them uploaded before each replay)
-        if (!capturing)
+        // 1. Upload tokenIds + positions to device (a captured MoE / step decode has them uploaded before each replay)
+        if (!capturing && !stepCapturing)
         {
             fixed (int* tokenPtr = tokenIds)
                 CudaDriverApi.cuMemcpyHtoD_v2(_state.TokenIdsDevice, (nint)tokenPtr,
@@ -2082,14 +2091,14 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
 
         // Decode CUDA-graph capture for this straight-through body is not used here;
         // dev's ForwardDecodeGraph early-return path handles graph replay separately.
-        if (seqLen == 1)
+        if (seqLen == 1 && !stepCapturing)
             DecodeGraphState = CudaDecodeGraphState.Off;
 
         // Capture dispatch-only time (all launches queued, before GPU wait).
         long dispatchEndTs = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
-        // A captured MoE decode ends at the F32 logits; the replay copies them out.
-        if (capturing)
+        // A captured MoE / step decode ends at the F32 logits; the replay copies them out.
+        if (capturing || stepCapturing)
             return null;
 
         // #251 batched-decode path: enqueue a genuinely async D2H copy into caller-owned
@@ -5164,6 +5173,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         CudaMemTrace.Dump("CudaTransformerModel.Dispose");
         ReportLaunchProfile();
         _denseDecodeV2.Dispose();
+        DisposeStepGraph();
         _cudaLora?.Dispose();
         DisposeDecodeGraph();
         DisposeMoeGraph();
