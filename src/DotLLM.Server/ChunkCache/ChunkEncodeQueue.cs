@@ -142,6 +142,13 @@ internal sealed class ChunkEncodeQueue : IDisposable
     /// <summary>Quiet period before each encode (a fixed default; tests shorten it).</summary>
     internal TimeSpan QuietPeriod { get; set; } = DefaultQuietPeriod;
 
+    /// <summary>
+    /// The monotonic clock the quiet period is measured on (<see cref="TimeProvider.GetTimestamp"/>; the system one is a
+    /// stopwatch, so a wall-clock step never shortens it). A test sets a stepped clock before queuing work, so that the
+    /// timeline follows the worker's own probes and not the runner's scheduling.
+    /// </summary>
+    internal TimeProvider QuietClock { get; set; } = TimeProvider.System;
+
     /// <summary>Most encodes in one quiet window before a cool-down.</summary>
     internal int MaxEncodesPerIdleWindow { get; set; } = 4;
 
@@ -388,9 +395,10 @@ internal sealed class ChunkEncodeQueue : IDisposable
             }
 
             // Quiet so far: watch for the quiet period, restarting on any busy probe or new activity.
-            var quietClock = System.Diagnostics.Stopwatch.StartNew(); // monotonic: a wall-clock step never shortens it
+            var clock = QuietClock;
+            long quietStart = clock.GetTimestamp(); // monotonic: a wall-clock step never shortens it
             bool quiet = true;
-            while (quietClock.Elapsed < QuietPeriod)
+            while (clock.GetElapsedTime(quietStart) < QuietPeriod)
             {
                 if (ct.WaitHandle.WaitOne(IdlePollInterval))
                     return null;

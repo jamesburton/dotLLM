@@ -47,7 +47,14 @@ public sealed class ChunkStoreServiceTests : IDisposable
         public ManualResetEventSlim? Block;
         public readonly ManualResetEventSlim Entered = new(false);
 
-        public long ActivityStamp() => Interlocked.Read(ref Stamp);
+        /// <summary>Runs on the worker thread at the start of every idle probe (before the stamp and busy reads).</summary>
+        public volatile Action? OnProbe;
+
+        public long ActivityStamp()
+        {
+            OnProbe?.Invoke();
+            return Interlocked.Read(ref Stamp);
+        }
 
         public bool IsBusy() => Busy || !Idle;
 

@@ -201,84 +201,114 @@ public sealed class ChunkStoreHardeningTests : IDisposable
         Assert.Null(s.Problem);
     }
 
-    /// <summary>S4: the worker takes the model only after a quiet period; idle gaps shorter than it never get an encode.</summary>
-    [Fact]
-    public async Task QuietPeriod_ShortIdleGaps_NoEncode()
+    /// <summary>A monotonic clock that only moves when the test (here: the worker's own probes) steps it.</summary>
+    private sealed class StepClock : TimeProvider
     {
-        string root = NewRoot();
-        var host = new FakeHost();
-        var s = Start(root, host);
-        // Quiet period 2.5 s against activity every 200-450 ms, observed for 4 s (longer than the quiet period, so a worker
-        // that ignores the activity encodes inside the window); a correct one fails only if the runner stalls over 2 s.
-        s.Queue.QuietPeriod = TimeSpan.FromSeconds(2.5);
-        using var stop = new CancellationTokenSource();
-        var toggler = Task.Run(async () =>
+        private long _ticks;
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => Interlocked.Read(ref _ticks);
+        public TimeSpan Elapsed => TimeSpan.FromTicks(Interlocked.Read(ref _ticks));
+        public void Advance(TimeSpan by) => Interlocked.Add(ref _ticks, by.Ticks);
+    }
+
+    private static readonly TimeSpan ProbeStep = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan StepQuietPeriod = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan Observed = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan HangBackstop = TimeSpan.FromSeconds(120);
+
+    /// <summary>
+    /// Drives the worker on a <see cref="StepClock"/>: every idle probe advances it by <see cref="ProbeStep"/> and, while
+    /// <paramref name="active"/> holds, every fourth probe sees activity through <paramref name="activity"/> (gaps of 300 ms
+    /// of clock time against a 1 s quiet period). The timeline is the probe count, not the runner's scheduling: a slow runner
+    /// only takes longer, it cannot stretch a gap (a deliberate real stall over the quiet period proves it, see below).
+    /// Returns once the clock has run <see cref="Observed"/> (ten quiet periods).
+    /// </summary>
+    private static void RunOnStepClock(ChunkStoreService s, FakeHost host, Func<bool> active, Action<int> activity, string text)
+    {
+        var clock = new StepClock();
+        s.Queue.QuietClock = clock;
+        s.Queue.QuietPeriod = StepQuietPeriod;
+        int probes = 0;
+        host.OnProbe = () =>
         {
-            while (!stop.IsCancellationRequested)
-            {
-                host.Busy = true;
-                Interlocked.Increment(ref host.Stamp);
-                await Task.Delay(150);
-                host.Busy = false;
-                await Task.Delay(300); // idle gaps far shorter than the quiet period
-            }
-        });
-        Admitted(s, Text('g'), KeyFor(Text('g')));
-        await Task.Delay(4000);
+            // A real stall longer than the quiet period, on a quiet probe inside the quiet loop (the 7th: after the busy or
+            // active 4th). A worker that measured the quiet period on wall-clock time would encode here; this one cannot.
+            if (Volatile.Read(ref probes) == 6)
+                Thread.Sleep(StepQuietPeriod + TimeSpan.FromMilliseconds(500));
+            clock.Advance(ProbeStep);
+            activity(active() ? Interlocked.Increment(ref probes) : 1);
+        };
+        Admitted(s, text, KeyFor(text));
+        // Wall-clock only as a hang backstop: reaching the clock time needs about 100 probes (a few seconds), however slow.
+        Assert.True(Eventually(() => clock.Elapsed >= Observed || host.Encodes > 0, HangBackstop), "the worker stopped probing");
+    }
+
+    /// <summary>
+    /// S4: the worker takes the model only after a quiet period; busy probes with idle gaps shorter than it never get an
+    /// encode (busy only, no activity stamp), and once the server stays idle the item is encoded.
+    /// </summary>
+    [Fact]
+    public void QuietPeriod_ShortIdleGaps_NoEncode()
+    {
+        var host = new FakeHost();
+        var s = Start(NewRoot(), host);
+        bool active = true;
+        RunOnStepClock(s, host, () => Volatile.Read(ref active), p => host.Busy = p % 4 == 0, Text('g'));
         Assert.Equal(0, host.Encodes);
-        stop.Cancel();
-        await toggler;
+        Volatile.Write(ref active, false);
         host.Busy = false;
         Assert.True(s.Queue.WaitDrained(Drain));
         Assert.Equal(1, host.Encodes);
     }
 
-    /// <summary>S4: a request that starts and ends between two polls still restarts the quiet period (activity stamp).</summary>
+    /// <summary>
+    /// S4: a request that starts and ends between two polls still restarts the quiet period: activity seen only as a new
+    /// stamp (never as busy) keeps the item from being encoded, and once it stops the item is encoded.
+    /// </summary>
     [Fact]
-    public async Task QuietPeriod_RestartedByActivityBetweenPolls()
+    public void QuietPeriod_RestartedByActivityBetweenPolls()
     {
-        string root = NewRoot();
         var host = new FakeHost();
-        var s = Start(root, host);
-        // Quiet period 2.5 s against activity every 200-450 ms, observed for 4 s (longer than the quiet period, so a worker
-        // that ignores the activity encodes inside the window); a correct one fails only if the runner stalls over 2 s.
-        s.Queue.QuietPeriod = TimeSpan.FromSeconds(2.5);
-        using var stop = new CancellationTokenSource();
-        var bumper = Task.Run(async () =>
-        {
-            while (!stop.IsCancellationRequested)
-            {
-                Interlocked.Increment(ref host.Stamp); // never observed as busy, only as activity
-                await Task.Delay(200);
-            }
-        });
-        Admitted(s, Text('q'), KeyFor(Text('q')));
-        await Task.Delay(4000);
+        var s = Start(NewRoot(), host);
+        bool active = true;
+        RunOnStepClock(s, host, () => Volatile.Read(ref active), p => { if (p % 4 == 0) Interlocked.Increment(ref host.Stamp); }, Text('q'));
         Assert.Equal(0, host.Encodes);
-        stop.Cancel();
-        await bumper;
+        Volatile.Write(ref active, false);
         Assert.True(s.Queue.WaitDrained(Drain));
         Assert.Equal(1, host.Encodes);
     }
 
-    /// <summary>S4: at most <c>MaxEncodesPerIdleWindow</c> encodes per idle window, then a cool-down.</summary>
+    /// <summary>
+    /// S4: at most <c>MaxEncodesPerIdleWindow</c> encodes per idle window, then a cool-down. The cap is checked against a
+    /// cool-down no stall can outlast (a slow runner can only make the "still 2" check weaker, never fail it); that the
+    /// cool-down ends is checked separately, as an eventual result.
+    /// </summary>
     [Fact]
     public void IdleWindow_EncodeCap_ThenCooldown()
     {
-        string root = NewRoot();
-        var host = new FakeHost { Idle = false };
-        var s = Start(root, host);
-        s.Queue.QuietPeriod = TimeSpan.FromMilliseconds(50);
-        s.Queue.MaxEncodesPerIdleWindow = 2;
-        s.Queue.WindowCooldown = TimeSpan.FromSeconds(2);
-        foreach (char c in "uvw")
-            Admitted(s, Text(c), KeyFor(Text(c)));
-        host.Idle = true;
-        Assert.True(Eventually(() => host.Encodes >= 2, TimeSpan.FromSeconds(5)));
+        ChunkStoreService Capped(FakeHost host, TimeSpan cooldown)
+        {
+            var s = Start(NewRoot(), host);
+            s.Queue.QuietPeriod = TimeSpan.FromMilliseconds(50);
+            s.Queue.MaxEncodesPerIdleWindow = 2;
+            s.Queue.WindowCooldown = cooldown;
+            foreach (char c in "uvw")
+                Admitted(s, Text(c), KeyFor(Text(c)));
+            host.Idle = true;
+            return s;
+        }
+
+        var held = new FakeHost { Idle = false };
+        var capped = Capped(held, TimeSpan.FromHours(1));
+        Assert.True(Eventually(() => held.Encodes >= 2, HangBackstop));
         Thread.Sleep(800);
-        Assert.Equal(2, host.Encodes);
-        Assert.True(s.Queue.WaitDrained(Drain));
-        Assert.Equal(3, host.Encodes);
+        Assert.Equal(2, held.Encodes); // the third waits for the cool-down (Dispose cancels that wait)
+        capped.Dispose();
+
+        var ends = new FakeHost { Idle = false };
+        var cooled = Capped(ends, TimeSpan.FromMilliseconds(500));
+        Assert.True(cooled.Queue.WaitDrained(Drain));
+        Assert.Equal(3, ends.Encodes);
     }
 
     /// <summary>S5: one namespace holds at most its share of the queue; another namespace still queues.</summary>
