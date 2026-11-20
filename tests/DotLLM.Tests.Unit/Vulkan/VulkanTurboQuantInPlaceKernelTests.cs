@@ -269,6 +269,31 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         }
     }
 
+    /// <summary>
+    /// Head vectors whose codes do not fill their last word (head dim 16: 3 bits = 48 of 64 bits, 5 bits = 80 of 96, 7 bits = 112 of
+    /// 128, 1 bit = 16 of 32): the next vector starts at the next WORD, not at the next bit. At head dims 64 / 128 / 256 every code
+    /// length is a whole number of words, so only these shapes can tell the per-vector word stride from tight packing.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(3, 16)]
+    [InlineData(5, 16)]
+    [InlineData(7, 16)]
+    [InlineData(1, 16)]
+    public void PerToken_CodesNotFillingTheirLastWord_UseTheWordStride(int bits, int hd)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        const int seqQ = 9, seqKv = 50, heads = 6, kvHeads = 3;
+        var l = Layout(bits, hd, kvHeads);
+        Assert.NotEqual(0, hd * bits % 32);
+        using var tq = AttentionF32Kernel.Create(device, spvDir, l);
+        using var f32 = AttentionF32Kernel.Create(device, spvDir, VulkanKvStorage.F32);
+        int off = seqKv - seqQ;
+        Case(device, spvDir, l, seqQ, seqKv, heads,
+            (c, q, k, v, o, t) => tq.Record(c, q, k, v, o, seqQ, seqKv, heads, kvHeads, hd, positionOffset: off, tq: t),
+            (c, q, k, v, o, _) => f32.Record(c, q, k, v, o, seqQ, seqKv, heads, kvHeads, hd, positionOffset: off));
+    }
+
     /// <summary>The shared-memory per-token body too (the subgroup one is what this device picks): both have a twin.</summary>
     [SkippableTheory]
     [InlineData(3, 64)]
