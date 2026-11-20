@@ -81,9 +81,8 @@ public sealed record ChunkCacheOptions(bool Enabled, int MaxChunks, string? Stor
     /// <param name="storeWrite"><c>--chunk-store-write</c> (needs <c>--chunk-store</c> and <c>--chunk-store-budget</c>).</param>
     /// <param name="storeBudget"><c>--chunk-store-budget</c>: a byte size such as <c>20GiB</c> (needs <c>--chunk-store-write</c>).</param>
     /// <param name="storeIndexOnly"><c>--chunk-store-index-only</c> (needs <c>--chunk-store-write</c>).</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxChunks"/> is below 1 or above <see cref="AbsoluteMaxChunks"/>.</exception>
     /// <param name="storeNamespaceBudget"><c>--chunk-store-namespace-budget</c>: a byte size (needs <c>--chunk-store-write</c>); null = off.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxChunks"/> is below 1.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxChunks"/> is below 1 or above <see cref="AbsoluteMaxChunks"/>.</exception>
     /// <exception cref="ArgumentException">A store or keys file is given without <c>--chunk-cache</c>, the keys file is
     /// unreadable or invalid (<see cref="ChunkCacheKeys.Load"/>; the message names the line, never a key), or a store-write
     /// option is given without what it needs (the budget is required with <c>--chunk-store-write</c>).</exception>

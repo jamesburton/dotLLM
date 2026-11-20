@@ -62,7 +62,13 @@ internal sealed class ChunkCacheRuntime : IDisposable
     /// How long an <c>explain</c> body may take to arrive (<see cref="Endpoints.ChunkCacheEndpoint.ExplainBodyReadTimeoutSeconds"/>);
     /// a slower body is <c>408</c>. Settable for tests.
     /// </summary>
-    internal TimeSpan ExplainBodyReadTimeout { get; set; } = TimeSpan.FromSeconds(Endpoints.ChunkCacheEndpoint.ExplainBodyReadTimeoutSeconds);
+    internal TimeSpan ExplainBodyReadTimeout
+    {
+        get => _explainBodyReadTimeout ?? Endpoints.ChunkCacheEndpoint.BodyReadTimeout; // one deadline for every POST body unless a test set this one
+        set => _explainBodyReadTimeout = value;
+    }
+
+    private TimeSpan? _explainBodyReadTimeout;
 
     private int _explainBodyReadsInFlight;
     private int _inferenceCallerResolutions;

@@ -869,37 +869,6 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
         using (var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
         {
             var r = Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--json"]);
-            int failures = JsonDocument.Parse(r.Out).RootElement.GetProperty("store_failures").GetInt32();
-            if (OperatingSystem.IsWindows())
-            {
-                Assert.Equal(1, r.Code);
-                Assert.Equal(1, failures);
-                Assert.Equal(3, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code); // a chunk missing
-            }
-            else
-            {
-                Assert.Equal(0, r.Code);
-                Assert.Equal(0, failures);
-                Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
-            }
-            var held = new MemoryStream();
-            reader.CopyTo(held);
-            Assert.Equal(new byte[] { 1, 2, 3 }, held.ToArray()); // never rewritten in place
-        }
-        Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64"]).Code); // repaired
-        Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
-    }
-
-    private string FirstEntryPath(string tree, string store)
-    {
-        JsonElement dry = Json(Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--dry-run", "--json"]));
-        string key = dry.GetProperty("would_encode")[0].GetProperty("key").GetString()!;
-        string path = new FileChunkStore(store).PathOf(new ChunkKey(key));
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllBytes(path, [1, 2, 3]);
-        using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
-        {
-            var r = Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--json"]);
             if (OperatingSystem.IsWindows())
             {
                 Assert.Equal(1, r.Code);
@@ -912,6 +881,14 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
         }
         Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64"]).Code); // repaired
         Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
+    }
+
+    private string FirstEntryPath(string tree, string store)
+    {
+        JsonElement dry = Json(Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--dry-run", "--json"]));
+        string key = dry.GetProperty("would_encode")[0].GetProperty("key").GetString()!;
+        string path = new FileChunkStore(store).PathOf(new ChunkKey(key));
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         return path;
     }
 

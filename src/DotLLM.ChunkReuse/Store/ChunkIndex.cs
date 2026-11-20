@@ -733,36 +733,7 @@ public sealed partial class ChunkIndex
         string? skip = exceptPath is null ? null : Path.GetFullPath(exceptPath);
         foreach (string file in IndexFilesUnder(storeRoot))
         {
-            if (!file.EndsWith(IndexFileSuffix, StringComparison.OrdinalIgnoreCase)) continue;
-            // The platform's path rule (case-sensitive off Windows): on Linux index-a.json and index-A.json are two indexes, and
-            // skipping both would let eviction delete keys only the other one references.
-            if (skip is not null && PathComparer.Equals(Path.GetFullPath(file), skip)) continue;
-            IndexDocument? doc;
-            try
-            {
-                using FileStream stream = OpenForRead(file);
-                doc = JsonSerializer.Deserialize(stream, ChunkIndexJsonContext.Default.IndexDocument);
-            }
-            catch (FileNotFoundException)
-            {
-                continue; // removed between enumeration and open
-            }
-            catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
-            {
-                throw new InvalidDataException($"Index file '{file}' cannot be read ({ex.Message}); eviction cannot be decided. Repair or remove it if it is not an index of this store.", ex);
-            }
-            if (doc?.Files is null)
-                throw new InvalidDataException($"Index file '{file}' has no file list; eviction cannot be decided.");
-            foreach (FileDocument? f in doc.Files)
-            {
-                foreach (ChunkDocument? c in f?.Chunks ?? [])
-                {
-                    if (c is null || !ChunkKey.IsWellFormed(c.Key))
-                        throw new InvalidDataException($"Index file '{file}' has a malformed chunk entry; eviction cannot be decided.");
-                    keys.Add(new ChunkKey(c.Key));
-                }
-            }
-            if (skip is not null && string.Equals(Path.GetFullPath(file), skip, StringComparison.OrdinalIgnoreCase)) continue;
+            if (skip is not null && PathComparer.Equals(Path.GetFullPath(file), skip)) continue; // platform path rule: on Linux index-a.json and index-A.json are two indexes
             AddKeysOf(file, keys);
         }
         return keys;

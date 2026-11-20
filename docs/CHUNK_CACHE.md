@@ -14,11 +14,15 @@ The `chunkcache` command-line tool that builds, selects, inspects and evicts the
 |---|---|---|
 | `--chunk-cache` | off | honour `chunk_cache` annotations on `/v1/chat/completions` and `/v1/messages`: policies `exact` (default) and `shadow`, whose output is identical to the unannotated request, plus a `chunk_cache` report in the response (below). Off: the annotations are never read; the body behaves exactly as without them (pinned over HTTP by `ChunkCacheFlagHttpTests` and `FlagOff_AnnotatedBodies_AnsweredLikePlain_EverySurface`, blocking and streaming, both surfaces) |
 | `--chunk-cache-max-chunks <n>` | 4096 | most annotations read per request (1 to 65536, so the per-request parse work stays bounded); the rest are counted from the array length and dropped with `chunk_too_many` without being read |
-| `--chunk-store <dir>` | none | the chunk store (e.g. built by `chunkcache build` from the same GGUF, without `--strict-model-id`) the server looks annotated chunks up in. **Read-only**: the server never writes, encodes into or creates it (the sole-writer encode path, its budget and admission rules come with a later task). Needs `--chunk-cache` (rejected without it); a relative path is resolved at startup. No store: every verified chunk is a miss, no warning. A configured root that does not exist: misses plus `chunk_store_unavailable` (strict: 503) |
+| `--chunk-store <dir>` | none | the chunk store (e.g. built by `chunkcache build` from the same GGUF, without `--strict-model-id`) the server looks annotated chunks up in. **Read-only unless `--chunk-store-write`**: the server then never writes, encodes into or creates it. Needs `--chunk-cache` (rejected without it); a relative path is resolved at startup. No store: every verified chunk is a miss, no warning. A configured root that does not exist (read-only): misses plus `chunk_store_unavailable` (strict: 503) |
+| `--chunk-store-write` | off | the server becomes the store's **sole writer** ([Store writes](#store-writes-the-sole-writer)): it owns the directory (created if missing; a second server on it refuses to start), keeps the server ledger, and encodes admitted misses in the background while idle. Needs `--chunk-store` and `--chunk-store-budget` |
+| `--chunk-store-budget <bytes>` | none | the store's byte budget (bytes or units: `20GiB`, `500MB`), **required** with `--chunk-store-write` (no unlimited default) and rejected without it; above 0 |
+| `--chunk-store-index-only` | off | with `--chunk-store-write`: store only chunks that an index file in the store (`index-*.json`, from `chunkcache build` over a scanned, deny-listed tree) references, so text from ad-hoc reads is never persisted (spec §10). Rejected without `--chunk-store-write` |
+| `--chunk-store-namespace-budget <bytes>` | off | with `--chunk-store-write`: the most bytes of ledger entries one namespace (API key) may hold, a **cap, not a reservation**. When set, budget eviction takes **only the writing namespace's own** rows ([Budget](#store-writes-the-sole-writer)), so one tenant's prewarm or encodes never evict another tenant's entries; non-admin capabilities report it as `budget_bytes`. Off: one shared LRU. Rejected without `--chunk-store-write`; above 0 and **below `--chunk-store-budget`** (startup error otherwise); a startup warning when the caps of all namespaces (the keys file's, or 2 without one) add up to more than the store budget |
 | `--chunk-cache-api-keys <file>` | none | the API keys of the chunk-cache surface (below, [Authentication and namespaces](#authentication-and-namespaces)): `<key> [admin] [ns=<namespace>]` per line, keys of at least 32 characters; each key is its own store namespace unless `ns=` names one. Needs `--chunk-cache`. Unset: the control plane answers local callers only, all in the default namespace. Read once at startup (revoking a key = restart). **Security-sensitive** |
 | `--chunk-cache-allow-short-keys` | off | accept keys shorter than 32 characters, each with a startup warning (otherwise they refuse startup). Needs `--chunk-cache-api-keys` |
 
-All five exist on `dotllm serve` and on `ServerOptions.Parse` (`ServerOptions.ChunkCache`).
+All nine exist on `dotllm serve` and on `ServerOptions.Parse` (`ServerOptions.ChunkCache`).
 
 ## Request parsing (`ChunkAnnotationParser`)
 
@@ -280,10 +284,167 @@ fields are unchanged: no `cache_read_input_tokens`, rulings 40 and 46). Shapes m
 `dotllm_chunk_cache_tokens_total{kind}` (each key of `tokens`), counted for every annotated request (also with
 `report: "none"`). Labels carry no namespace, text or hash.
 
+## Store writes: the sole writer
+
+With `--chunk-store-write` (spec §5.10, §10, §14 L1/L2; `ChunkStoreService`, `ChunkEncodeQueue`, `SightingTable`) the
+server is the only process that writes K/V into the store. Without it nothing below happens and the store is read-only
+exactly as before.
+
+**Ownership.** `dotllm serve` takes `<store>/.chunkstore.owner.lock` exclusively **before the model loads** and holds it
+for the process lifetime (`StoreOwnerLock`; the OS releases it if the process dies). A second server with
+`--chunk-store-write` on the same directory refuses to start within seconds, with a message naming the lock; a read-only
+server on it is fine. An offline `chunkcache` writer must take the same lock with `StoreOwnerLock.TryAcquire` and **hold
+it for its whole write**; `StoreOwnerLock.IsHeldByAnother` is a racy probe (a server can start between the probe and the
+write), for status display only. The owner lock is not the store lock: every write still takes the short store lock
+(`.chunkstore.lock`), so a CLI index update or orphan pass interleaves with the server between entries. **Local file
+systems only:** the lock relies on the OS releasing an exclusive handle when its process dies (verified on NTFS; `flock`
+on local Linux file systems); on network shares (SMB, NFS) two servers may both believe they own the store.
+
+**Admission** (request thread; never blocks and never touches a lock file). After `exact` / `shadow` planning, each
+verified **miss** of an **authenticated** caller (a local caller without keys, or a valid key: the control plane's rule;
+anyone else gets no lookups and no side effects) on an inference request (never `explain`, never a request that fails
+strict) is queued for a background encode only when all of these hold:
+
+1. not `no_store` (no sighting is recorded either) and not `stability: "volatile"`;
+2. its `source.path`, when the annotation carries one, is not on the secrets deny-list (`ChunkDenyList`, by file name
+   at any depth: `.env*`, `*.env`, `*.pem`, `*.key`, `*.pfx`, `*.p12`, `id_*`, `id_rsa*`, `secrets.*`,
+   `appsettings*.json`, `credentials*` (so `.aws/credentials`), `.npmrc`, `.netrc`, `.pgpass`, `*.keystore`, `*.jks`,
+   `kubeconfig*`, `*.tfvars`, `*.tfstate`; and anything under a `.git`, `.ssh`, `.kube` or `.docker` directory;
+   case-insensitive on every platform). Windows spellings of the same file are normalised first: trailing dots and
+   spaces per segment are dropped, a path containing `::` (an alternate data stream) is denied, a segment with a colon
+   is checked on both sides of it (`secrets.json:stream`, and the drive-relative `C:secrets.json`), and an 8.3 short
+   name is denied when its stem could be a denied name (`SECRET~1.JSO`) or, in NTFS's hashed form (`SE1A2B~1.JSO`),
+   when its extension could be a denied one. A `source` that is not an object, or a non-string or over-long `path`,
+   cannot be checked and is never admitted. The chunk **text** is also refused when a PEM armour line
+   (`-----BEGIN ` or `-----END `) says `PRIVATE KEY` (RSA, EC, OPENSSH, ENCRYPTED, PGP `PRIVATE KEY BLOCK`); a key body
+   that a chunker split into a chunk with neither armour line is not detected (known limit: harnesses set `no_store`,
+   and the path list covers key files). Not on the list (a later deny-list flag): `*.kdbx`, `*.p8`, `.pypirc`,
+   `.gnupg/`. The server cannot see files: it
+   trusts `no_store` and matches only the path it is told (`source` never affects lookup and is never an annotation
+   defect). When the same text occurs twice in one request, the most restrictive occurrence decides;
+3. the served backend is CPU (a Vulkan server writes nothing until the per-backend schema question is settled: Vulkan
+   K/V also depends on the shader binaries and the driver) and the chunk has at most **512 tokens** (`MaxCpuEncodeTokens`,
+   a constant; ruling after the Task 15 re-review): a longer chunk is refused at admission and the response's
+   `chunk_encode_skipped` carries `detail: "too_large_for_cpu"`. This bounds how long a request can wait behind one
+   encode (below);
+4. it has been seen in at least **2 requests** in the caller's namespace (`SightingTable`: in memory, keyed by namespace
+   and text hash, at most 100,000 rows and 25,000 per namespace, least recently seen dropped first, a namespace at its
+   share dropping its own; one sighting per request and text; `source.path` stored verbatim up to 256 characters, longer
+   as a prefix plus `#` and 16 hex digits of its SHA-256, cut at a character boundary; a later forget must compare
+   `SightingTable.StoredPath(requested)`, not the raw path). `on_miss: "encode"` bypasses this rule only (the request
+   itself is still served `exact`). Texts past a request's cap of 16 queued texts record no sighting in that request;
+5. the writer is not stopped (unreadable ledger, budget exhausted: below);
+6. with `--chunk-store-index-only`, an index references its key (a snapshot refreshed when the index files change,
+   checked again under the store lock before the put);
+7. the queue has room: at most 256 items (the one being encoded included), at most 64 of them from one namespace, and
+   16 Mi characters of text; one request queues at most 16 texts; a text already queued is not queued twice;
+8. once the writer has stored an entry (so it knows this model's bytes per token), a chunk whose entry could never fit
+   the budget is refused before any encode (`over_budget`).
+
+The response's `chunk_cache.warnings` then carry `chunk_encode_queued` and / or `chunk_encode_skipped` with counts (one
+per verified miss), and `tokens.encode_queued` counts the queued tokens. Hits refresh their ledger rows' last use. The
+refusal reason is not reported per chunk (it would be a membership probe on the deny-list and on the sightings).
+
+**Background encode** (`ChunkEncodeQueue`: one dedicated, below-normal-priority thread). An item is encoded only after
+the server has been **quiet for 2 s** (a fixed constant: no request running or waiting, no model loading or activating,
+the continuous-batch scheduler idle, and no request started meanwhile, counted by `ServerState.ActivityStamp` so a
+request between two 25 ms polls also restarts the wait), and then only through `ServerState.TryAcquireIdleModel`. The
+worker holds the gate and the scheduler's model lease for **one** chunk's forward pass and releases them before any disk
+I/O. After 4 encodes in one quiet window it pauses 10 s. **Worst-case wait for a request:** one encode, i.e. a request
+that arrives just after the worker took the model waits for that chunk (at most 512 tokens on CPU) to finish. Measured on the
+synthetic test model (CPU, 1 thread): 86 tokens about 35 ms, 2048 tokens about 2.0-2.2 s. **Measured on the reference
+model** (Qwen3-4B-Instruct-2507 Q4_K_M, CPU, 8 threads, Strix Halo, one run, CPU otherwise lightly loaded): a 512-token
+chunk 8.35 s, a 2048-token chunk 43.5 s. With the 512-token CPU cap the worst-case request wait on that model and
+machine is therefore about **8.4 s** (the 2048-token figure is why the cap exists). Other models, thread counts and
+hardware are **unmeasured**; the wait scales roughly with model size and chunk length.
+The quiet-period and window clocks are monotonic (`Stopwatch`), so a wall-clock step never shortens or extends them. Transient memory per encode is about twice the chunk's F32
+K/V (the encode cache plus the host copy), e.g. about 1 GiB for 2048 tokens of an 8B model. The chunk is tokenised again with `ChunkTokenization.Encode` (ruling 21: the wire path's tokenisation), its key
+is recomputed with the served model's identity (an item whose key no longer matches, e.g. after a model swap, is
+dropped), and it is encoded in isolation at positions `0..n-1` on the server's own model (`ChunkEncoder`,
+`CpuChunkBackend`). The entry is F32 (the store's only dtype; capabilities `kv_dtype`), stamped with the model
+fingerprint and the backend tag: exactly what `chunkcache build` writes for the same GGUF, so a CLI reader and the
+server's own lookups agree (`EntriesTaggedWithServerBackend` compares the K/V bit for bit). **Shutdown** cancels the
+worker and drops what is queued; an encode in progress cannot be interrupted (the forward takes no cancellation). The
+server waits up to 30 s for it; if the worker is still encoding after that, the model, the request gate and the store's
+ownership are **not** freed (the model is left for the process exit, logged by type only), so a running forward never
+touches freed memory and no second writer can start on the store before the encode has ended.
+
+**Writing** (worker thread only, so the store lock's 20 ms retry loop never runs on a request thread). Per entry,
+**one** store-lock scope holds: budget eviction if needed, the put (temp file + rename), the ledger row
+(`ServerLedger.Record`) and the ledger save (temp file + rename; it requires the held lock handle). The file comes first,
+then its row, so no other lock holder ever sees a row without a file; a crash leaves at most a file without a row (an
+orphan, removable by an orphans pass), and a row whose file is gone is dropped on the next load. A failed put (disk
+full, I/O error) stores nothing and records nothing. A failed ledger save leaves the old ledger file, reloads it, and
+deletes the just-written file unless an index references its key. If the ledger cannot be read back then (after brief
+retries for a sharing violation), the unsaved row leaves memory and **writes stop** (`ledger_unreadable`): no admission,
+no encode, no write, and the file is never written over; the worker retries a read every 30 s and only a successful
+(verified) read re-enables writes. The store is never wrapped in `LockingChunkStore` (the lock is not re-entrant). The
+lock timeout is 10 s; a timeout drops the item (a later sighting can queue it again).
+
+**Budget.** The byte total of all entry files in the store (CLI entries included) stays within `--chunk-store-budget`.
+When an entry does not fit, ledger rows are evicted: the writing namespace's own rows first, then the others', each in
+least-recently-used order (last write or hit, then key). Keys are content-addressed, so a CLI index may reference the
+same key as a ledger row: such a row is removed but its file is kept and frees nothing (decided under the lock, after the
+ledger save, from every index and the remaining ledger). Entries only an index references are never evicted by the
+server. When evicting cannot make room, **nothing is evicted**, and the decision never depends on how large the current
+entry is: the writer stops (`budget_exhausted`, re-checked every 30 s until a minimum-size entry fits) only when not even
+a **minimum-size entry** (`min_chunk_tokens` = 32 tokens of this model) would fit after evicting everything the server
+may evict, i.e. the store is genuinely full of entries the server may not evict. In every other case only the current
+entry is dropped (`entry_too_large`; the writer keeps running, so no caller can stop it for everyone). An entry larger
+than the whole budget is dropped before the store is even counted. An unreadable CLI index file also stops it (eviction cannot be decided; fail closed).
+
+**Per-namespace budget** (`--chunk-store-namespace-budget`, off by default). **A cap, not a reservation.** Each
+namespace's ledger bytes must also stay within it. Budget eviction then takes **only the writing namespace's own rows**
+(least recently used first), for both limits: a namespace over its share evicts its own rows. Nothing is reserved for a
+namespace: when the store is full of **other** namespaces' rows, the entry is dropped (never another tenant's entry,
+never a writer stop) and the namespace is **blocked** at admission (`chunk_encode_skipped` with `detail:
+"namespace_budget_blocked"`, reason label `namespace_budget_blocked`; queued items of it are not encoded either), so no
+encode is spent and thrown away, until a minimum-size entry fits again (re-checked every 30 s, and at once after an evict
+that freed space) (`NamespaceBudget_PrewarmEvictsOnlyOwnRows`). Only `namespaces x namespace budget <= store budget` (minus
+CLI entries and orphans, which are not counted per namespace, ruling 69) is a real quota: the budget must be below the
+store budget (startup error), and the server warns at startup when the keys file's namespaces (or 2 without a keys file)
+times the namespace budget exceed it. Admission refuses (`over_budget`) a chunk that could never fit the smaller of the two
+budgets. Without the option the shared LRU above applies (own rows first, then the others').
+
+**Store problems in responses.** While the writer cannot store, responses with at least one verified miss of an
+authenticated caller carry `chunk_store_unavailable` (a warning, never a strict-mode error here: the request itself is
+unaffected) with an additive `detail`: `ledger_unreadable` (writes disabled until a verified reload), `budget_exhausted`
+(encoding stopped: the store is full of entries the server may not evict), `entry_too_large` (the last encoded entry
+could not fit and was dropped), `lock_timeout` (another writer held the store lock past the timeout; never reported as a
+plain busy store) or `write_failed` (the last put or ledger save failed). `entry_too_large`, `lock_timeout` and
+`write_failed` clear on the next successful write. These details are writer-wide (every authenticated tenant sees
+them). A configured root that is missing in read-only mode keeps its earlier behaviour (strict: 503).
+
+**Unreadable ledger at startup** (`ledger-server.json` exists but cannot be read after brief retries): the server starts
+and inference runs, but writes stay disabled: the ledger is never replaced by an empty one and never saved over (an
+empty ledger would turn every server-written entry into an orphan). The startup log names the file. Writes resume only
+when a later read of the file succeeds (every 30 s), e.g. after it is repaired or restored.
+
+**Privacy.** Nothing here logs chunk text, hashes, keys or namespaces (log lines carry exception types, sizes and
+counts). The ledger records each row's namespace and first `source.path` (tree-relative paths only; others are dropped),
+and the sighting table holds text hashes, in memory only. **The store holds the source code**: every entry stores the
+chunk's token ids beside its K/V, so treat the store root like the repository: the same access controls, outside synced
+folders, git-ignored, and excluded from crash dumps and telemetry (spec §10). The writer creates a missing root with
+inherited permissions.
+
+**Metrics** (`/metrics`, fixed label sets, no namespace): `dotllm_chunk_store_writes_total{result}` (`stored`, `failed`,
+`too_large`), `dotllm_chunk_store_evictions_total`, `dotllm_chunk_store_skips_total{reason}` (the admission reasons:
+`no_store`, `volatile`, `denied_path`, `source_unreadable`, `secret_content`, `backend_not_writable`, `too_long`,
+`not_seen_twice`, `index_only`, `writes_disabled`, `budget_exhausted`, `queue_full`, `namespace_queue_share`,
+`request_cap`, `over_budget`, `too_large_for_cpu`, `namespace_budget_blocked`) and the gauge `dotllm_chunk_store_queue_depth`.
+
+**Known limits (multi-tenant).** Isolation between API keys stops at fairness: (a) the queue is shared (each namespace
+may hold at most 64 of its 256 items, one request at most 16); (b) the sighting table is shared (each namespace at most
+25,000 of its 100,000 rows); (c) memory per sighting row is bounded by the 256-character path cap; (d) the byte budget
+and its LRU are shared: eviction takes the writing namespace's own rows first, but a tenant with no rows of its own
+evicts others' least recently used entries, unless `--chunk-store-namespace-budget` is set (then only its own).
+The writer-wide `detail` values above are visible to every authenticated tenant.
+
 ## Control plane: capabilities and explain (spec §5.9, §7.2)
 
 Both routes are **mapped only with `--chunk-cache`**: with the flag off they do not exist (the usual bare 404 for any
-method, pinned by `FlagOff_404`). Both authenticate (below). Neither writes the store, generates, or counts in `/metrics`.
+method, pinned by `FlagOff_404`). Both authenticate (below). Neither writes the store, generates, or counts in `/metrics`
+(prewarm and evict, which do write, are [below](#control-plane-prewarm-and-evict-spec-72-10-the-store-tasks)).
 
 **Rate limiting** applies to them only when it is configured (`--rate-limit-*`; off by default): `/v1/` paths are
 metered unless exempted, and these are deliberately not exempt. The limiter's buckets are keyed by the raw presented key
@@ -316,10 +477,13 @@ The contract's `capabilities.json` shape (`Capabilities_MatchesFixtureShape`), p
   index from `model.id` and `model.producer`: `index-<chunker>.<ModelTag(model.id)>.<producer[..8]>.<ns-or-default>.json`.
   The namespace itself is never in a response; the CLI derives it from its own key (`ChunkNamespace.ForApiKey`), or
   is told the `ns=` name by its operator, or uses `default`.
-- `store` is always an object (ruling 52). Its figures are the caller's own namespace's (non-admin callers never see
-  store-wide figures); they are all 0 until the server keeps a ledger of what it wrote (the sole-writer task), and
-  `budget_bytes` is 0 until a budget exists. Without `--chunk-store` it carries `"configured": false`; with one,
-  `configured` is absent (`Capabilities_StoreConfiguredFalse_WithoutStore`).
+- `store` is always an object (ruling 52). With `--chunk-store-write`, a **non-admin** sees its own namespace's figures:
+  `entries` and `bytes` of its ledger rows (what the server wrote for it; a CLI's offline entries are not counted) and
+  `budget_bytes` = the per-namespace budget when set, else the store budget. An **admin** sees store-wide figures: every
+  entry file in the store (CLI entries and orphans included) and the store budget (`Capabilities_ReportsStoreFigures`).
+  Without a writer there is no ledger: a non-admin sees 0, an admin the read-only store's files, and `budget_bytes` is 0.
+  `dtype` is `f32`. Without `--chunk-store` it carries `"configured": false`; with one, `configured` is absent
+  (`Capabilities_StoreConfiguredFalse_WithoutStore`).
 - `wire_chunkers` is the server's wire-eligible list (`symbol-512`; `lines-512` joins in a later task).
 
 ### `POST /v1/chunk-cache/explain`
@@ -357,6 +521,130 @@ large body at Kestrel's minimum data rate (~240 B/s) never holds a slot (`Explai
   default rate (`chunk-cost-model.json`). `warnings` lists the codes (counts are in the inference report only).
 - OpenAI surface only in v1 (the CLI's `select --server` sends OpenAI string-content messages, ruling 19).
 
+## Control plane: prewarm and evict (spec §7.2, §10; the store tasks)
+
+Both routes exist only with `--chunk-cache`, change the store only through the sole writer, and need
+`--chunk-store-write` (without it they answer `503 api_error` / `chunk_store_unavailable`). The gates run in this order:
+`Sec-Fetch-Site: cross-site` is `403`; a `Content-Type` other than `application/json` is `415` (a browser must preflight,
+which the `Origin` rule refuses: no web page can drive them, CSRF); authentication as for the other routes (`401` /
+`403`); the body is then read **before any slot is taken**, within `BodyReadTimeout` (10 s, a constant: later is `408
+request_timeout`) and the size cap (`413`), so a trickling body holds nothing; then **one call per namespace at a time**
+and at most `MaxConcurrentWrites` (2) prewarm / evict calls per server at once (`429 chunk_control_busy`, `Retry-After:
+1`) (`WriteRoutes_BodyReadBeforeTheGate_PerNamespaceAndGlobalSlots`). When rate limiting is configured they are metered like inference. Bodies are parsed strictly: an
+unknown or repeated field, a wrong type or a body that is not a JSON object is `400 invalid_request_error`, whose message
+never echoes the content. Responses carry **counts only**: no text, hash, key, namespace or path, and so do the logs
+(`WriteRoutes_NoNamespaceKeyTextOrPathInBodiesOrLogs`).
+
+### `POST /v1/chunk-cache/prewarm`
+
+Queues texts for a background encode in the caller's namespace. **Text only** (no hash list exists: a hash-only API
+would be a membership oracle):
+
+```json
+{"texts": [{"id": "Program.cs#3", "text": "...", "source": {"path": "src/Program.cs"}}], "max_tokens": 20000}
+→ {"requested": 1, "already_stored": 0, "queued": 1, "queued_tokens": 431, "refused": 0, "refused_reasons": []}
+```
+
+- Each text is tokenised as the chat path tokenises chunk text (`ChunkTokenization.Encode`, ruling 21) and keyed with the
+  served model's identity in the caller's namespace. A text whose entry is already stored counts as `already_stored`
+  (and refreshes its ledger row's last use). Every other text goes through the sole writer's admission
+  (`ChunkStoreService.AdmitPrewarm`) with **every rule of [Store writes](#store-writes-the-sole-writer) except
+  "seen in 2 requests"**, and **without recording a sighting**: the deny-list on `source.path` (`source` is advisory,
+  ruling 14: `{path}` only; the server cannot rely on it), the PEM private-key sniff, CPU only and at most 512 tokens
+  (ruling 65), the budget (`over_budget`), the writer not stopped, index-only, and the queue's bounds (256 items, 64 per
+  namespace). Encodes then run under the idle rule exactly as encodes on miss.
+- **Caps**: at most `MaxPrewarmItems` (256) texts per call (more is `400 chunk_too_many`, nothing queued); a body over
+  `MaxPrewarmBodyBytes` (4 MiB) is `413`; `max_tokens` (optional, a positive integer) bounds the tokens one call queues:
+  a text that would pass it is refused with `max_tokens`. The same text twice in one call is decided once.
+- `refused_reasons` lists the distinct admission reasons (the `dotllm_chunk_store_skips_total` reason labels, plus
+  `max_tokens` and `empty`), not per text. `queued` counts every text that is queued, a repeat of a text in the same call
+  included, while `queued_tokens` counts each distinct text once. An unsupported model or backend is `400 chunk_model_unsupported`; no model
+  loaded is `503 model_not_loaded`.
+
+### `POST /v1/chunk-cache/evict`
+
+```json
+{"mode": "path", "path": "src/**", "dry_run": false}
+→ {"evicted": 12, "freed_bytes": 48211968, "kept_referenced": 1, "dry_run": false,
+   "removed": {"ledger_rows": 13, "index_files": 0, "sightings": 40, "queued": 2}}
+```
+
+- **`dry_run` defaults to `true`**: the counts of what would go, and nothing changes. Only an explicit JSON `false`
+  deletes (a string `"false"` is a 400). `mode` defaults to `orphans`. `removed` and `warnings` are additive to the spec's
+  output (`evicted`, `freed_bytes`, `kept_referenced`, `dry_run`).
+- **Namespaces are the caller's** (server-assigned). The body's `namespace` is honoured only for an **admin** (an `admin`
+  key, or the local user of a server without keys): `default` names the default namespace, otherwise a valid namespace
+  name (`ns=` names, `k-<16 hex>`), else 400. From anyone else it is ignored with the warning `chunk_namespace_ignored`
+  and the call acts on the caller's own namespace (`NonAdmin_EvictBodyNamespace_Ignored`).
+- **Deleting store-wide or in another namespace needs an admin key** (ruling on the security review): `orphans`, an
+  admin's store-wide `all`, or a body namespace other than the caller's, with `dry_run: false`, need a key marked `admin`
+  in `--chunk-cache-api-keys`. The local user of a server **without keys** may prewarm, delete in its own (default)
+  namespace, and dry-run anything, but gets `403 chunk_cache_admin_key_required` for those deletes
+  (`Keyless_StoreWideDestructive_NeedsAdminKey`). **Proxy hazard:** without keys, anything that reaches the server through
+  a same-host reverse proxy looks local. A request carrying `Forwarded`, any `X-Forwarded-*` or `X-Real-IP` is never
+  local (`Keyless_ForwardedHeaders_NotLocal`), but a proxy that adds none of them (nginx's bare `proxy_pass`) passes
+  every caller through as local: with keys off, such a caller could prewarm and forget the default namespace. Configure
+  keys whenever anything other than local processes can reach the server.
+- The default `mode` is `orphans`, which is admin-only: a non-admin's `{}` is a 403; send `"mode": "namespace"` (or
+  `path`).
+- **Modes**:
+  - `orphans`: entry files that neither an index file nor the server ledger references (store-wide, so **admin only**;
+    others get `403 chunk_cache_admin_only`). Ledger keys and index keys stay (`Evict_Orphans_KeepsLedgerAndIndexKeys`).
+  - `path` ("forget this repo"): in the namespace, the ledger rows whose first-seen `source.path` matches the glob
+    (`PathGlob`: relative, `**` any depth, a pattern without `/` matches a file name at any depth, case-insensitive on
+    Windows; rooted, `..` and negated `!` globs and globs over 1,024 characters are a 400), their entry files, the
+    sighting rows and queued encodes with a matching provenance. Rows and sightings that carry no `source.path` (an
+    annotation without `source`) are never reached by a path: use `namespace` for a full forget. Paths over 256 characters are held in the sighting table as a prefix plus a hash; forget also
+    compares the requested path in that stored form, so a long literal path matches (`Evict_Path_LongPath_MatchesStoredForm`).
+  - `namespace`: everything of the namespace: its ledger rows, its own **index files** (current names,
+    `index-<chunker>.<model12>.<p8>.<ns-or-default>.json`; their index locks are taken first), the entries those rows
+    and indexes referenced, its sighting rows and queued encodes
+    (`EvictNamespaceMode_RemovesThatNamespacesIndexFilesRowsAndSightingsOnly`). Another namespace is never touched
+    (`Evict_Namespace_CannotTouchOtherNamespace`).
+  - `all`: the caller's namespace as `namespace` for a non-admin; for an admin without a body namespace, the **whole
+    store**: every ledger row, every current-name index file, every sighting and queued encode, and every entry file
+    (orphans and CLI entries too) except those a remaining (legacy-named) index references.
+- **What forget keeps** (Task 15 rule (c)): an entry file whose key an index the call does not remove still references
+  (a CLI index, which the server never edits; a legacy-named index, never deleted) keeps its file and is counted in
+  `kept_referenced`; its ledger row still goes. So `path` removes K/V, ledger rows and sightings, and **reports** rather
+  than edits the index references (the server owns none): rebuild or forget them with `chunkcache` (Task 17).
+  The store registry (`chunkcache.json`) is advisory and drops rows of deleted index files on its next load.
+- **No marker**: removing the rows and saving suffices. A later request with the same text is a first sighting again,
+  so it is re-admitted only after two more requests (`Forget_ClearsSightings_NoMarker`). An encode already running when
+  its namespace is forgotten is dropped before its write by a fence (the queue's sequence number), so nothing forgotten
+  comes back (`Forget_DropsQueuedAndInFlightItems`). A forgotten item is checked again before it is encoded, so it is
+  never encoded only to be thrown away. `namespace` / `all` drop every queued and in-flight item of the namespace (or the
+  store); `path` drops only the items whose provenance matches, queued or in flight
+  (`Forget_WriteTimeFence_InFlightOnly_PathDropsMatchingItemsOnly`). A request whose second sighting was counted before
+  a forget but whose item is queued after it is a later request: its entry is stored.
+- **Fail closed** (Review Focus): with writes disabled (an unreadable ledger at startup or after a failed save), a ledger
+  file that no longer reads, or an unreadable index file, **nothing is deleted**, dry runs included: `503 api_error` /
+  `chunk_store_unavailable` with the cause (`ledger_unreadable`, `index_unreadable`) in the message
+  (`Evict_UnreadableLedger_FailsClosed`, `Evict_UnreadableIndex_FailsClosed`). The ledger file is retried briefly first
+  (4 x 100 ms, awaited, a sharing violation is not corruption); a real (non-dry) evict that still cannot read it disables
+  writes until it reads back, exactly as the writer's own failed save; a dry run never changes the writer's state.
+  Fail-closed is store-wide: one unreadable index file (perhaps another tenant's CLI index) blocks every tenant's forget
+  until it is repaired or removed.
+- **Partial deletes are reported** (counts only): an index or entry file that cannot be deleted (held open by a scanner
+  or a reader) is left in place, and the response adds the warning `chunk_evict_partial` and `failed: {entry_files,
+  index_files}` (an index left in place keeps its entries referenced; an entry left in place is an orphan for a later
+  `orphans` pass). A ledger save that fails is a 503 whose message says that no entry or index file was deleted and the
+  rows stay, but the matching sightings and queued encodes (counted in the message) were already dropped: they come back
+  with new sightings (`Evict_PartialDelete_WarnsWithCounts_FailedSave_SaysWhatWasDropped`). The rollback after a failed
+  save re-reads the ledger with brief retries on the request thread (failure path only).
+- **Locks** (lock order index then store): the index locks of the index files it deletes, then the writer's in-memory
+  ledger gate (shared with the background writer), then the store lock for **one short scope**: verify the ledger and the
+  indexes, save the ledger without the forgotten rows, delete the index files, re-read every reference from disk, delete
+  the entry files no longer referenced. Each index file is read once for that decision, and every reference again just
+  before the entry files are deleted. All locks are waited for asynchronously within the writer's lock timeout (10 s),
+  never by sleeping on a request thread; a timeout is `503` (`lock_timeout`) with nothing deleted
+  (`Evict_StoreLockHeld_LockTimeout_NothingDeleted`, `Evict_WhileWriterHoldsLedgerGate_WaitsThenSeesRow_OrTimesOutCleanly`:
+  an evict that starts while the writer is mid-write waits for it and then sees its row). A **dry run** takes no lock
+  file and reads the index files and the ledger file once, before the ledger gate, so it never stalls the writer on disk
+  reads. Matching sightings holds the sighting table's lock while it scans (at most 100,000 rows), briefly delaying
+  inference sightings.
+- Deleted entry files count in `dotllm_chunk_store_evictions_total`; one log line per call gives the counts and the mode.
+
 ### Authentication and namespaces
 
 dotLLM has no authentication anywhere else (`docs/SERVER.md` § Security). This is opt-in, covers the chunk-cache surface
@@ -380,7 +668,10 @@ membership probe on source code (spec §10).
   ```powershell
   [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).TrimEnd('=').Replace('+','-').Replace('/','_')
   ```
-- **`admin`**: store-wide figures and operations, from the store tasks (it grants nothing yet).
+- **`admin`**: store-wide capabilities figures, `evict` of `orphans`, `evict` of another namespace (the body's
+  `namespace`) and of the whole store (`all` without a namespace). Without a keys file the local caller is admin for
+  figures, dry runs and its own namespace only: store-wide or cross-namespace **deletes** always need an `admin` key
+  (proxy hazard: a same-host reverse proxy makes every caller look local).
 - **`ns=<namespace>`**: the key uses that namespace (`ChunkNamespace.IsValid`, not empty, never `default`) instead of
   the one derived from it. Two keys may name the same namespace on purpose (a team; a rotated key keeping the old
   key's entries). A named namespace is not derived from the key, so the store's file names say nothing about the key
@@ -389,9 +680,11 @@ membership probe on source code (spec §10).
   fall-back to `Bearer`) or `Authorization: Bearer`. Matching is constant-time
   (`CryptographicOperations.FixedTimeEquals` over the digests of every key, no early exit). Otherwise
   `401 authentication_error` (`WWW-Authenticate: Bearer`). A loopback caller needs a key too.
-- **Without keys**: local callers only, in the default namespace, else `403 permission_error`. Local means all of: the
+- **Without keys**: local callers only, in the default namespace (admin for figures and dry runs, not for store-wide
+  deletes), else `403 permission_error`. Local means all of: the
   connection's remote address is loopback (IPv4-mapped too; an unknown address, as on a Unix socket, is not local); the
-  `Host` header is `localhost` or a loopback address (any port); and there is no `Origin` header. The last two stop a
+  `Host` header is `localhost` or a loopback address (any port); there is no `Origin` header; and there is no
+  forwarding header (`Forwarded`, any `X-Forwarded-*`, `X-Real-IP`: a same-host proxy). The last two stop a
   web page in the user's browser: the server's CORS policy allows any origin, and DNS rebinding reaches loopback under a
   foreign host name. "Local" still admits **every process on the machine**, including a service that can be made to
   fetch URLs for someone else (SSRF), and behind a reverse proxy on the same host every caller is local: configure keys
@@ -418,8 +711,8 @@ membership probe on source code (spec §10).
   the inference request (scheduler fairness). None of these is logged.
 - **Inference** stays unauthenticated: an annotated request is never refused here. A caller the control plane would
   refuse is served normally, but its chunks are never looked up in the store (all misses, no warning) and
-  `report: "per_chunk"` gives it the summary (`ReportPerChunk_UnauthenticatedGetsSummary`). The same rule will gate store
-  writes (prewarm, background encode).
+  `report: "per_chunk"` gives it the summary (`ReportPerChunk_UnauthenticatedGetsSummary`). The same rule gates store
+  writes (prewarm, background encode, evict).
 - **Stack traces**: the server runs `UseDeveloperExceptionPage()` unconditionally (pre-existing). The chunk-cache handlers
   catch their own failures (explain answers 500 `api_error` with a fixed message, capabilities degrades to an
   unsupported model), so no stack trace leaves them; other endpoints may still return one.

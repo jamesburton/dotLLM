@@ -662,7 +662,6 @@ public sealed class ChunkIndexTests : IDisposable
 
     [Fact]
     public async Task Save_WhileAReaderHoldsTheIndex_Succeeds()
-    public async Task Save_WhileAReaderHoldsTheIndex_WindowsWaitsForIt_PosixReplacesUnderIt()
     {
         var chunker = new FixedSizeChunker(new CharTokenizer(), chunkTokens: 10);
         Directory.CreateDirectory(_root);
@@ -693,24 +692,6 @@ public sealed class ChunkIndexTests : IDisposable
                 await save.WaitAsync(TimeSpan.FromSeconds(30));
                 Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
             }
-            save = Task.Run(() => index.Save(path));
-            if (OperatingSystem.IsWindows())
-            {
-                // Windows cannot rename over an open file: Save retries while the reader holds it.
-                await Task.Delay(150);
-                Assert.Single(ChunkIndex.Load(path, KeyA).ChunksOf("A.txt")); // a second reader still sees the old file
-            }
-            else
-            {
-                // POSIX rename(2) replaces the directory entry under the open reader: Save does not wait, a new reader sees
-                // the new file at once.
-                await save.WaitAsync(TimeSpan.FromSeconds(10));
-                Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
-            }
-            // Either way the held reader still reads the old file, unchanged (an atomic replace, never an in-place rewrite).
-            var held = new MemoryStream();
-            reader.CopyTo(held);
-            Assert.Equal(oldBytes, held.ToArray());
         }
         await save.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);

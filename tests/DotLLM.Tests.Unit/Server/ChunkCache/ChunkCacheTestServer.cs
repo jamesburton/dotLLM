@@ -81,6 +81,8 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
             UsePaged = paged,
             ChunkCache = chunkCache,
             Metrics = true,
+            // Since #1596 the Vulkan single-request path gets a device PrefixCache that would serve a repeated chunk as `prefix`, not `miss`/`hit`.
+            PromptCacheEnabled = device != "vulkan",
         };
         var state = ServerStartup.LoadModel(modelPath, options);
         if (schedulerTrie)
@@ -89,6 +91,15 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
             state.Scheduler!.Dispose();
             state.Scheduler = new DotLLM.Engine.Scheduler.ContinuousBatchSchedulerService(state.Model!, state.Tokenizer!, state.KvCacheFactory!,
                 ServerStartup.ResolveSchedulerOptions(state.Options), state.PagedFactory!.Pool, state.PrefixTrieManager,
+                registerTelemetryProviders: false);
+        }
+        else if (paged && state.Scheduler is not null && state.PagedFactory is not null)
+        {
+            // Since #1596 the server wires the prefix trie into the scheduler by default, so an identical leading chunk is served from the
+            // trie (reported as `prefix`, not `hit`). These tests exercise the chunk store with no trie unless they opt in via schedulerTrie.
+            state.Scheduler.Dispose();
+            state.Scheduler = new DotLLM.Engine.Scheduler.ContinuousBatchSchedulerService(state.Model!, state.Tokenizer!, state.KvCacheFactory!,
+                ServerStartup.ResolveSchedulerOptions(state.Options), state.PagedFactory.Pool, prefixCache: null,
                 registerTelemetryProviders: false);
         }
         var builder = WebApplication.CreateSlimBuilder();
