@@ -252,26 +252,38 @@ __device__ __forceinline__ void pk_prefill_body(
         }
     };
 
-    // Staged only: decode buffer buf in place, after this thread's copies of it have landed (cp.async.wait).
+    // Staged only: decode row group g of buffer buf in place. The caller has waited for this thread's copies of it and
+    // __syncwarp'd (the warp's raw rows are complete and visible to all its lanes).
+    auto decode_group = [&](int buf, int g)
+    {
+        if constexpr (kStaged)
+        {
+            const int j = lane % RJ;
+            const bool isV = j >= CPR;
+            const int c = isV ? j - CPR : j;
+            half* slot = (isV ? sV : sK) + (size_t)buf * PK_KV_TILE * SS + (size_t)(g * RP + lane / RJ) * SS;
+            const uint4 h = isV ? VL::decode_chunk(slot, c) : KL::decode_chunk(slot, c);
+            __syncwarp();                     // every raw byte of these rows read before any F16 chunk overwrites it
+            *reinterpret_cast<uint4*>(slot + c * 8) = h;
+        }
+    };
     auto decode_tile = [&](int buf)
     {
         if constexpr (kStaged)
         {
-            half* dK = sK + (size_t)buf * PK_KV_TILE * SS;
-            half* dV = sV + (size_t)buf * PK_KV_TILE * SS;
-            const int j = lane % RJ;
-            const bool isV = j >= CPR;
-            const int c = isV ? j - CPR : j;
-            __syncwarp();                         // the warp's raw rows are complete and visible to all its lanes
-            for (int g = warp; g < NG; g += nwarps)
-            {
-                half* slot = (isV ? dV : dK) + (size_t)(g * RP + lane / RJ) * SS;
-                const uint4 h = isV ? VL::decode_chunk(slot, c) : KL::decode_chunk(slot, c);
-                __syncwarp();                     // every raw byte of these rows read before any F16 chunk overwrites it
-                *reinterpret_cast<uint4*>(slot + c * 8) = h;
-            }
+            __syncwarp();
+            for (int g = warp; g < NG; g += nwarps) decode_group(buf, g);
         }
     };
+    // Staged tile t+1 is decoded inside tile t's P.V loop (#1923, as #1094's hd256 kernel does): its copies were issued at the top
+    // of iteration t and land during QK; this warp waits for them after P.V step 0 and decodes its row groups spread over the
+    // remaining steps, so the shared-memory loads / ALU / stores issue while the tensor pipe runs the preceding HMMAs.
+    // PK_STAGED_PV_DECODE=0 decodes at the top of iteration t instead (before the opening barrier; A/B only).
+#ifndef PK_STAGED_PV_DECODE
+#define PK_STAGED_PV_DECODE 1
+#endif
+    constexpr int NPV = HD / 16;             // P.V steps per tile (8 at hd128, 4 at hd64)
+    const int my_groups = (NG - warp + nwarps - 1) / nwarps;
 
     float o[HD / 8][4];
     #pragma unroll
@@ -286,7 +298,12 @@ __device__ __forceinline__ void pk_prefill_body(
     const int pos_hi = pos_lo + 8;
     const half* qw = sQ + (size_t)warp * PK_Q_TILE * SS;
 
-    if (num_tiles > 0) { load_tile(0, 0); pk_cp_async_commit(); }
+    if (num_tiles > 0)
+    {
+        load_tile(0, 0);
+        pk_cp_async_commit();
+        if constexpr (kStaged && PK_STAGED_PV_DECODE) { pk_cp_async_wait<0>(); decode_tile(0); }
+    }
 
     for (int t = 0; t < num_tiles; t++)
     {
@@ -294,7 +311,7 @@ __device__ __forceinline__ void pk_prefill_body(
         if (t + 1 < num_tiles) load_tile(t + 1, (t + 1) & 1);
         pk_cp_async_commit();
         pk_cp_async_wait<1>();
-        decode_tile(buf);
+        if constexpr (kStaged && !PK_STAGED_PV_DECODE) decode_tile(buf);
         __syncthreads();
 
         if (warp < group)
@@ -397,6 +414,15 @@ __device__ __forceinline__ void pk_prefill_body(
                                                + (np * 2 + (lane >> 4)) * 8);
                     pk_mma(o[2 * np], pa[kk], b[0], b[1]);
                     pk_mma(o[2 * np + 1], pa[kk], b[2], b[3]);
+                    if constexpr (kStaged && PK_STAGED_PV_DECODE && PK_KV_TILE == 16)
+                    {
+                        if (np >= 1 && t + 1 < num_tiles)
+                        {
+                            if (np == 1) { pk_cp_async_wait<0>(); __syncwarp(); }
+                            for (int u = (np - 1) * my_groups / (NPV - 1); u < np * my_groups / (NPV - 1); u++)
+                                decode_group((t + 1) & 1, warp + u * nwarps);
+                        }
+                    }
                 }
             }
         }
