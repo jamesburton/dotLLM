@@ -1732,6 +1732,13 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                         seqLen, seqKv, numHeads, numKvHeads, headDim,
                         positions[0], slidingWindow, s, layerSinks);
                 }
+                else if (kvCache is CudaTurboQuantInPlaceKvCache)
+                {
+                    // #1892 Task 5 builds the cache; the CUDA attention kernels that read it in place are Task 6. Falling through to
+                    // the cacheless branch below would attend to the current chunk only, silently.
+                    throw new NotSupportedException(
+                        "CudaTurboQuantInPlaceKvCache cannot be used in a forward pass yet: the in-place CUDA attention kernels are not wired (#1892).");
+                }
                 else if (kvCache is CudaKvCache cudaKvCache)
                 {
                     cudaKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s);
@@ -4780,6 +4787,16 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     }
 
     /// <summary>
+    /// Whether <see cref="CreateKvCache(int, KvCacheConfig)"/> builds the in-place TurboQuant cache (#1892): TurboQuant on BOTH sides,
+    /// MSE stage only (no <c>tq*q</c>/QJL, step 5), a uniform geometry, and a head dim that is a power of two of at most 256. Every other
+    /// config, including mixed and V-only TurboQuant, keeps the behaviour it had before; none is routed here.
+    /// </summary>
+    internal static bool UsesInPlaceTurboQuant(KvCacheConfig kv, Core.Attention.KvGeometry geometry, int headDim)
+        => kv.KeyDType == KvCacheDType.TurboQuant && kv.ValueDType == KvCacheDType.TurboQuant
+        && !kv.TurboQuantUseQjl && geometry.IsUniform
+        && headDim > 0 && headDim <= 256 && (headDim & (headDim - 1)) == 0;
+
+    /// <summary>
     /// Creates a KV-cache with optional quantization for this model.
     /// Returns <see cref="CudaQuantizedKvCache"/> when quantization is configured,
     /// otherwise a standard <see cref="CudaKvCache"/>.
@@ -4788,6 +4805,19 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     {
         _context.MakeCurrent();
         var geom = Core.Attention.KvGeometry.FromConfig(Config);
+        if (UsesInPlaceTurboQuant(config, geom, Config.HeadDim))
+        {
+            // #1892: both-side TurboQuant (MSE stage) is stored as codes + norms and never decoded into a history. K and V
+            // rotations use independent seeds (V = seed ^ 0xD1B54A32D192ED03), as the scratch oracle and the CPU cache do.
+            var codecK = new Engine.KvCache.Codecs.TurboQuantCodec(Config.HeadDim, config.TurboQuantBits, config.TurboQuantSeed);
+            var codecV = new Engine.KvCache.Codecs.TurboQuantCodec(Config.HeadDim, config.TurboQuantBits, config.TurboQuantSeed ^ 0xD1B54A32D192ED03UL);
+            var tqCache = AdmitReleasingG3<CudaTurboQuantInPlaceKvCache>(() => new CudaTurboQuantInPlaceKvCache(
+                Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen, codecK.MseBits,
+                codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD,
+                window: config.MixedPrecisionWindowSize, context: _context));
+            _spillMonitor.Check($"KV cache (in-place tq{config.TurboQuantBits}) allocated for {maxSeqLen} tokens");
+            return tqCache;
+        }
         Core.Attention.IKvCache cache = AdmitReleasingG3<Core.Attention.IKvCache>(() => config.IsQuantized
             ? new CudaQuantizedKvCache(geom, maxSeqLen, config, _context, inPlaceAttentionLoaded: _kernels.HasAttentionKvq)
             : new CudaKvCache(geom, maxSeqLen, _context));
