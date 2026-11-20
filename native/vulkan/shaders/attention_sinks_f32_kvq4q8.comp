@@ -1,0 +1,8 @@
+#version 450
+// Mixed K Q4_0 / V Q8_0 KV twin of attention_sinks_f32.comp (issue #1171): the same kernel reading K / V stored as K Q4_0, V Q8_0 (36- / 20-byte blocks,
+// see kv_load.glsl). Body: attention_sinks_f32.glsl.
+#define KV_MIXED 1
+#define KV_K_Q4 1
+#define KV_V_Q8 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_sinks_f32.glsl"

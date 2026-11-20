@@ -269,7 +269,7 @@ public sealed record ServerOptions
     /// <summary>
     /// Maximum prompt tokens per prefill forward pass (llama.cpp <c>-ub</c> / micro-batch analog).
     /// 0 = whole prompt in one forward pass. Null (not given) = the backend default: chunks of
-    /// <see cref="ServerStartup.DefaultCudaDensePrefillChunkTokens"/> on the dense CUDA non-paged f16 path, one pass elsewhere
+    /// <see cref="ServerStartup.DefaultCudaDensePrefillChunkTokens"/> (f16) or <see cref="ServerStartup.DefaultCudaDenseQuantizedPrefillChunkTokens"/> (q8_0 / q4_0) on the dense CUDA non-paged path, one pass elsewhere
     /// (issue #1862; <see cref="ServerStartup.ResolvePrefillChunk"/>). On the single-request
     /// <see cref="DotLLM.Engine.TextGenerator"/> path this chunks the prompt-suffix prefill; when
     /// the continuous-batch scheduler is active it is applied as the scheduler's per-step prefill

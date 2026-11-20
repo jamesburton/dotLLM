@@ -344,10 +344,11 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
                 nameof(headDim));
 
         long qBytes = (long)seqQ * numHeads * headDim * sizeof(float);
-        long kvBytes = (long)seqKv * KvStorage.RowBytes((long)numKvHeads * headDim);
+        long kvBytes  = KvStorage.KeyRowBytes((long)numKvHeads * headDim) * seqKv;   // per side: mixed block formats (#1884)
+        long kvBytesV = KvStorage.ValueRowBytes((long)numKvHeads * headDim) * seqKv;
         if (q.Size < qBytes) throw new ArgumentException("Q buffer too small.", nameof(q));
         if (k.Size < kvBytes) throw new ArgumentException("K buffer too small.", nameof(k));
-        if (v.Size < kvBytes) throw new ArgumentException("V buffer too small.", nameof(v));
+        if (v.Size < kvBytesV) throw new ArgumentException("V buffer too small.", nameof(v));
         if (output.Size < qBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
         Span<nint> buffers = stackalloc nint[5] { q.Handle, k.Handle, v.Handle, output.Handle, sinks?.Handle ?? queryPositions?.Handle ?? 0 };

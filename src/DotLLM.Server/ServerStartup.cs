@@ -404,40 +404,57 @@ public static class ServerStartup
 
     /// <summary>The small-window remedy for the dense CUDA host (#1848): it has no MTP head, and an unchunked prefill's scratch is per token.</summary>
     internal const string DenseSmallWindowHint =
-        "Use a smaller KV type (--kv-quant-k/-v q8_0 or q4_0), keep the prefill chunked (--prefill-chunk-size, 1024 by default on --no-paged f16), " +
+        "Use a smaller KV type (--kv-quant-k/-v q8_0 or q4_0), keep the prefill chunked (--prefill-chunk-size, 1024 by default on --no-paged), " +
         "or free GPU memory.";
 
     /// <summary>
-    /// Prefill chunk the dense CUDA host uses when <c>--prefill-chunk-size</c> is not given (#1862), on the non-paged f16 path only.
+    /// Prefill chunk the dense CUDA host uses when <c>--prefill-chunk-size</c> is not given (#1862), on its non-paged cache.
     /// Chunked, the forward scratch is a fixed cost instead of about as much per token as f16 KV, so the VRAM-fitted window roughly
-    /// doubles; cancellation is checked between chunks, so a client disconnect stops a long prefill; and the first chunk's square
-    /// G3 score plane (numHeads x chunk^2 x 6 B, 192 MiB for 32 heads) stays inside the plane the fit already retains, while every
-    /// later chunk runs G3's offset path (#1847), bounded to the same plane. Measured on framework: see the PR for #1862.
+    /// doubles; cancellation is checked between chunks, so a client disconnect stops a long prefill. On f16 KV the first chunk's
+    /// square G3 score plane (numHeads x chunk^2 x 6 B, 192 MiB for 32 heads) stays inside the plane the fit already retains, while
+    /// every later chunk runs G3's offset path (#1847), bounded to the same plane. On q8_0 / q4_0 KV every chunk runs the
+    /// tensor-core in-place kernel (<c>attention_flash_mma_prefill_kvq</c>, #1850), later chunks with their position offset, and
+    /// needs no plane, so it takes the larger <see cref="DefaultCudaDenseQuantizedPrefillChunkTokens"/>. Measured on framework: see
+    /// the PRs for #1862 and #1850.
     /// </summary>
     internal const int DefaultCudaDensePrefillChunkTokens = 1024;
 
     /// <summary>
-    /// The prefill chunk a server uses (#1862): an explicit <c>--prefill-chunk-size</c> always wins, 0 (one pass) included; with none,
-    /// <see cref="DefaultCudaDensePrefillChunkTokens"/> on the dense CUDA non-paged f16 path and one pass everywhere else. Paged and
-    /// q8_0 / q4_0 caches stay unchunked by default: their later chunks cannot use G3's offset path and would run <c>attention_f16</c>.
+    /// Prefill chunk the dense CUDA host uses on q8_0 / q4_0 KV when <c>--prefill-chunk-size</c> is not given (#1850). Quantized KV
+    /// never runs G3, so the f16 bound (the first chunk's square plane inside the retained one) does not apply and the chunk is a
+    /// pure speed / window trade. TwIL-8B on the RTX 3060, 8.4K-token cold prefill: chunk 1024 = 1,325-1,341 tok/s at a 67,584
+    /// window, 2048 = 1,508-1,533 at 65,536, 4096 = 1,501-1,511 at 62,464, one pass = ~1,680 at 25,600. 2048 takes most of the
+    /// speed back for a 3% smaller window (user decision, PR #1875).
     /// </summary>
-    /// <param name="requested">The <c>--prefill-chunk-size</c> value, or null when it was not given.</param>
-    /// <param name="cudaDenseF16NonPaged">Whether the model is the dense CUDA host on its non-paged f16 KV cache.</param>
-    /// <returns>Tokens per prefill forward pass, 0 for one pass.</returns>
-    internal static int ResolvePrefillChunk(int? requested, bool cudaDenseF16NonPaged)
-        => requested is int r ? Math.Max(0, r) : cudaDenseF16NonPaged ? DefaultCudaDensePrefillChunkTokens : 0;
+    internal const int DefaultCudaDenseQuantizedPrefillChunkTokens = 2048;
 
     /// <summary>
-    /// Whether <paramref name="model"/> takes the dense CUDA prefill default (#1862): the dense CUDA host
-    /// (<see cref="DotLLM.Cuda.CudaTransformerModel"/>, not the CUDA hybrids, which chunk themselves) on its non-paged f16 cache,
-    /// the one cache whose later chunks run G3's offset path. CPU, Vulkan and HIP models never do.
+    /// The prefill chunk a server uses (#1862): an explicit <c>--prefill-chunk-size</c> always wins, 0 (one pass) included; with none,
+    /// where <see cref="TakesCudaDensePrefillChunkDefault"/> holds, <see cref="DefaultCudaDenseQuantizedPrefillChunkTokens"/> on
+    /// q8_0 / q4_0 KV and <see cref="DefaultCudaDensePrefillChunkTokens"/> otherwise; one pass everywhere else.
+    /// </summary>
+    /// <param name="requested">The <c>--prefill-chunk-size</c> value, or null when it was not given.</param>
+    /// <param name="cudaDenseDefault">Whether the model takes the dense CUDA default (<see cref="TakesCudaDensePrefillChunkDefault"/>).</param>
+    /// <param name="quantizedKv">Whether the KV cache is q8_0 / q4_0 (<see cref="KvCacheConfig.IsQuantized"/>).</param>
+    /// <returns>Tokens per prefill forward pass, 0 for one pass.</returns>
+    internal static int ResolvePrefillChunk(int? requested, bool cudaDenseDefault, bool quantizedKv = false)
+        => requested is int r ? Math.Max(0, r)
+            : !cudaDenseDefault ? 0
+            : quantizedKv ? DefaultCudaDenseQuantizedPrefillChunkTokens : DefaultCudaDensePrefillChunkTokens;
+
+    /// <summary>
+    /// Whether <paramref name="model"/> takes the dense CUDA prefill default (#1862, #1850): the dense CUDA host
+    /// (<see cref="DotLLM.Cuda.CudaTransformerModel"/>, not the CUDA hybrids, which chunk themselves) on its non-paged cache, f16
+    /// (later chunks run G3's offset path) or q8_0 / q4_0 read in place (later chunks run the tensor-core kvq prefill at their
+    /// offset). A quantized cache with an FP16 window ring keeps one pass (serve builds none today; the guard is for when it does):
+    /// every chunk would run the scalar kernel, and quantize-on-evict across chunk boundaries has no parity coverage. CPU, Vulkan, HIP and the paged pool never do.
     /// </summary>
     /// <param name="model">The loaded model.</param>
     /// <param name="cudaPagedPool">Whether the GPU paged KV pool serves it.</param>
     /// <param name="kv">KV storage types.</param>
     /// <returns>Whether the default applies.</returns>
-    internal static bool IsCudaDenseF16NonPaged(IModel model, bool cudaPagedPool, KvCacheConfig kv)
-        => model is DotLLM.Cuda.CudaTransformerModel && !cudaPagedPool && !kv.IsQuantized;
+    internal static bool TakesCudaDensePrefillChunkDefault(IModel model, bool cudaPagedPool, KvCacheConfig kv)
+        => model is DotLLM.Cuda.CudaTransformerModel && !cudaPagedPool && !(kv.IsQuantized && kv.MixedPrecisionWindowSize > 0);
 
     /// <summary>
     /// The served context on the CUDA paged pool (#1836): <c>--ctx-size</c> or the model's window, never more than the pool holds.
@@ -555,6 +572,58 @@ public static class ServerStartup
     }
 
     /// <summary>
+    /// The KV storage <paramref name="options"/> asks for. K and V are parsed independently (#1888): a TurboQuant side carries its own
+    /// bit width and QJL flag, and <paramref name="formatMismatch"/> reports two TurboQuant sides that disagree (a mixed format, #1887 step 6).
+    /// </summary>
+    internal static KvCacheConfig BuildKvConfig(ServerOptions options, out string? formatMismatch)
+    {
+        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK ?? "f32", out int kBits, out bool kQjl);
+        var valueDType = KvCacheConfig.ParseDType(options.CacheTypeV ?? "f32", out int vBits, out bool vQjl);
+        bool kTq = keyDType == KvCacheDType.TurboQuant, vTq = valueDType == KvCacheDType.TurboQuant;
+        int bits = kTq ? kBits : vTq ? vBits : 0;
+        bool qjl = kTq ? kQjl : vTq && vQjl;
+        formatMismatch = kTq && vTq && TurboQuantKvSupport.FormatsDiffer(kBits, kQjl, vBits, vQjl)
+            ? TurboQuantKvSupport.MixedFormatRefusal(options.CacheTypeK!, options.CacheTypeV!)
+            : null;
+        return new KvCacheConfig(keyDType, valueDType, TurboQuantBits: bits > 0 ? bits : 4, TurboQuantUseQjl: qjl);
+    }
+
+    /// <summary>
+    /// The authoritative TurboQuant refusal once <paramref name="model"/> has loaded (#1888): every pre-load rule, plus the backend an
+    /// <c>auto</c> device landed on, whether the host is the plain CPU transformer, and whether an MTP head will attach.
+    /// </summary>
+    internal static string? PostLoadTurboQuantRefusal(ServerOptions options, ModelConfig config, IModel model)
+    {
+        var kv = BuildKvConfig(options, out string? mismatch);
+        if (mismatch is not null) return mismatch;
+        return TurboQuantKvSupport.RefusalReason(kv, new TurboQuantContext(
+            KvCommand.Serve, TurboQuantKvSupport.BackendOf(model), options.UsePaged, config,
+            HostIsPlainCpuTransformer: model.GetType() == typeof(TransformerModel),
+            HasDraftModel: !string.IsNullOrEmpty(options.SpeculativeModel),
+            MtpWillAttach: options.MtpEnabled && model.SupportsMtp));
+    }
+
+    /// <summary>
+    /// The TurboQuant refusal decidable before the model loads (#1888): mixed formats, a GPU device, the paged cache, the geometry, a draft
+    /// model. Null when nothing is wrong yet; the post-load pass then checks the backend an <c>auto</c> device landed on, the host and MTP.
+    /// </summary>
+    internal static string? PreLoadTurboQuantRefusal(ServerOptions options, ModelConfig config)
+    {
+        var kv = BuildKvConfig(options, out string? mismatch);
+        if (mismatch is not null) return mismatch;
+        var backend = DeviceSpec.Parse(options.Device).Kind switch
+        {
+            DeviceKind.Cpu => KvBackendKind.Cpu,
+            DeviceKind.Cuda => KvBackendKind.Cuda,
+            DeviceKind.Vulkan => KvBackendKind.Vulkan,
+            _ => KvBackendKind.Unknown,
+        };
+        return TurboQuantKvSupport.RefusalReason(kv, new TurboQuantContext(
+            KvCommand.Serve, backend, options.UsePaged, config, HostIsPlainCpuTransformer: null,
+            HasDraftModel: !string.IsNullOrEmpty(options.SpeculativeModel), MtpWillAttach: false));
+    }
+
+    /// <summary>
     /// Opens only the metadata of the <c>--speculative-model</c> draft (the file is mapped, no tensor is read) and rejects architectures the dense draft
     /// loader cannot take. A draft that is missing or unreadable is left to the real load below, which reports it as before.
     /// </summary>
@@ -636,6 +705,13 @@ public static class ServerStartup
         // A draft that cannot load must fail NOW, not after the target (up to tens of GiB) is resident, and not as a "device" failure (#1319).
         ValidateSpeculativeDraftEarly(options, config);
 
+        // #1888: a TurboQuant KV request that cannot run for real fails now, before the weights load.
+        if (PreLoadTurboQuantRefusal(options, config) is { } tqRefusal)
+        {
+            gguf.Dispose();
+            throw new InvalidServerOptionException(tqRefusal);
+        }
+
         if (options.GpuLayers is { } requestedLayers && requestedLayers > config.NumLayers)
             Console.WriteLine($"[dotllm] Requested {requestedLayers} GPU layers but {Path.GetFileName(resolvedPath)} has {config.NumLayers}; using all {config.NumLayers}.");
 
@@ -690,27 +766,41 @@ public static class ServerStartup
         // Tool call parser
         var toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
 
-        // KV-cache configuration. TurboQuant applies uniformly to K and V, so its bit-width and
-        // QJL flag are taken from the key dtype string (e.g. "tq4", "tq4q").
-        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK ?? "f32", out int tqBits, out bool tqUseQjl);
-        var kvConfig = new KvCacheConfig(
-            keyDType,
-            KvCacheConfig.ParseDType(options.CacheTypeV ?? "f32"),
-            TurboQuantBits: tqBits > 0 ? tqBits : 4,
-            TurboQuantUseQjl: tqUseQjl);
+        // KV-cache configuration. K and V are parsed independently; a TurboQuant side carries its bit width and QJL flag (#1888).
+        var kvConfig = BuildKvConfig(options, out _);   // a mismatch was refused before load
+        // #1888: the post-load pass - the backend an auto device landed on, the host model, an attaching MTP head.
+        if (PostLoadTurboQuantRefusal(options, config, model) is { } tqPostRefusal)
+        {
+            model.Dispose();
+            gguf.Dispose();
+            throw new InvalidServerOptionException(tqPostRefusal);
+        }
 
         Func<ModelConfig, int, IKvCache>? kvFactory = null;
         PagedKvCacheFactory? pagedFactory = null;
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
         PrefixTrieManager? prefixTrieManager = null;
-        if (vulkanKvFactory is not null)
+        if (kvConfig.IsTurboQuantAny)
+        {
+            // #1888: first, so no later branch can take a TurboQuant request (IsQuantized excludes it, so every branch below used to). The
+            // post-load pass has refused every context but the real one: the plain CPU transformer, not paged.
+            Console.WriteLine($"[dotllm] Using TurboQuant KV-cache ({kvConfig.TurboQuantBits}-bit, data-oblivious" +
+                (kvConfig.TurboQuantUseQjl ? ", QJL unbiased scores)." : ")."));
+            kvFactory = (cfg, size) => new TurboQuantKvCache(
+                DotLLM.Core.Attention.KvGeometry.SlotCount(cfg), cfg.NumKvHeads, cfg.HeadDim, size,
+                kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed, kvConfig.TurboQuantUseQjl);
+        }
+        else if (vulkanKvFactory is not null)
         {
             // Vulkan models own their device-resident KV storage. Requests run one at a time through the
             // per-request TextGenerator unless the opt-in Vulkan scheduler below engages (hybrid models,
             // DOTLLM_VK_SCHEDULER); there is no paged KV pool and no cross-request prefix trie yet.
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported on Vulkan; using the model's own KV-cache.");
-            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
+            // #1884: q8_0 K and V on an audited dense host are read in place from the model's own cache (no F32 dequant scratch);
+            // other quantized KV keeps VulkanQuantizedKvCache.
+            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel
+                && !vkModel.TryUseInPlaceQuantizedKv(kvConfig.KeyDType, kvConfig.ValueDType, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()))
             {
                 string spvDir = DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir();
                 kvFactory = (cfg, size) => vkModel.CreateQuantizedKvCache(
@@ -881,30 +971,25 @@ public static class ServerStartup
                 DotLLM.Core.Attention.KvGeometry.FromConfig(cfg, model?.SupportsCompactSlidingKv == true), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
-        else if (kvConfig.IsTurboQuant)
-        {
-            Console.WriteLine($"[dotllm] Using TurboQuant KV-cache ({kvConfig.TurboQuantBits}-bit, data-oblivious" +
-                (kvConfig.TurboQuantUseQjl ? ", QJL unbiased scores)." : ")."));
-            kvFactory = (cfg, size) => new TurboQuantKvCache(
-                DotLLM.Core.Attention.KvGeometry.SlotCount(cfg), cfg.NumKvHeads, cfg.HeadDim, size,
-                kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed, kvConfig.TurboQuantUseQjl);
-        }
 
         // Vulkan (single-request path): the cache a request filled stays resident and a later request adopts its longest common prefix
         // (#1591). Each entry holds a whole device KV allocation, so keep few; the headroom lets the next turn of a conversation fit it.
         // CUDA dense (--no-paged) caches are retained the same way since #1594, so they get the same cap: under WDDM a card that runs
         // out of VRAM spills into shared memory instead of failing (#1068). No headroom: a CUDA cache grows by a device-to-device copy
         // of its rows (TryGrowTo, admitted against free VRAM), which costs milliseconds, so it is sized for the request alone.
+        // CUDA paged (#1843) the same: each retained entry holds pool blocks and a gather scratch sized to its window, and the
+        // paged pool fit charges a few live gather scratches (CudaPagedKvCacheFactory.LiveCachesCharged), not one per entry.
         bool deviceOwnedPrefixKv = vulkanKvFactory is not null
-            || (model is DotLLM.Cuda.CudaTransformerModel && cudaPagedFactory is null);
+            || model is DotLLM.Cuda.CudaTransformerModel;
 
         // #1862: the prefill chunk this server uses. An explicit --prefill-chunk-size (0 included) wins; otherwise the dense CUDA
-        // non-paged f16 path chunks by default, so its context fit charges a fixed forward scratch instead of a per-token one.
+        // non-paged path (f16, and q8_0 / q4_0 since #1850) chunks by default, so its context fit charges a fixed forward scratch instead of a per-token one.
         // #1851: a GPU/CPU split always prefills in chunks (1024 unless a positive --prefill-chunk-size), the scratch it was planned for.
         bool splitModel = model is DotLLM.Cuda.HybridTransformerModel;
         int prefillChunk = splitModel
             ? DotLLM.Cuda.CudaAutoSplit.SplitPrefillChunk(options.PrefillChunkSize ?? 0)
-            : ResolvePrefillChunk(options.PrefillChunkSize, IsCudaDenseF16NonPaged(model, cudaPagedFactory is not null, kvConfig));
+            : ResolvePrefillChunk(options.PrefillChunkSize, TakesCudaDensePrefillChunkDefault(model, cudaPagedFactory is not null, kvConfig),
+                kvConfig.IsQuantized);
         PrefixCache? prefixCache = !options.PromptCacheEnabled ? null
             : !deviceOwnedPrefixKv ? new PrefixCache(options.PromptCacheSize, options.PromptCachePolicy)
             : new PrefixCache(Math.Min(options.PromptCacheSize, VulkanPrefixCacheMaxEntries), options.PromptCachePolicy);

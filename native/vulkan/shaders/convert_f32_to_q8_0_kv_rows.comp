@@ -1,0 +1,46 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "q8_1_exact_div.glsl"
+// F32 -> Q8_0 KV row scatter (issue #1884): rows land at arbitrary cache positions (selective recompute, chunk-KV reuse), as
+// convert_f32_to_f16_rows.comp does for the F16 cache. Row srcRow0 + t of src (blocksPerRow * 32 F32 elements) becomes cache row
+// (positions[srcRow0 + t] - rowBase); one invocation per 32-element block. The quantise rule is convert_f32_to_q8_0_kv_range.comp's,
+// so a scattered row stores exactly the bytes a contiguous write of the same row does.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufSrc { float src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufDst { uint  dst[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufPos { int   positions[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint blocksPerRow;   // kvStride / 32
+    uint rows;           // rows to write
+    int  rowBase;        // first position held by the destination slot (0 unless the slot is a compact window)
+    uint srcRow0;        // first source row (and first positions[] entry) this dispatch writes
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.rows * pc.blocksPerRow) return;
+    uint t = i / pc.blocksPerRow, b = i % pc.blocksPerRow;
+    uint s0 = ((pc.srcRow0 + t) * pc.blocksPerRow + b) * 32u;
+    float v[32];
+    float amax = 0.0;
+    for (uint j = 0u; j < 32u; j++) {
+        v[j] = src[s0 + j];
+        amax = max(amax, abs(v[j]));
+    }
+    float d = q81DivBy127(amax);
+    float id = d != 0.0 ? q81Recip(d) : 0.0;
+    uint row = uint(positions[pc.srcRow0 + t] - pc.rowBase);
+    uint o = (row * pc.blocksPerRow + b) * 9u;
+    dst[o] = floatBitsToUint(d);
+    for (uint w = 0u; w < 8u; w++) {
+        uint packed = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            int q = clamp(int(roundEven(v[w * 4u + j] * id)), -127, 127);
+            packed |= (uint(q) & 0xFFu) << (8u * j);
+        }
+        dst[o + 1u + w] = packed;
+    }
+}

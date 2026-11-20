@@ -34,8 +34,15 @@ public readonly record struct KvCacheConfig(
         KeyDType is KvCacheDType.Q8_0 or KvCacheDType.Q4_0 ||
         ValueDType is KvCacheDType.Q8_0 or KvCacheDType.Q4_0;
 
-    /// <summary>True when TurboQuant KV is selected (applies to both keys and values).</summary>
+    /// <summary>True when the KEY side is TurboQuant. Use <see cref="IsTurboQuantAny"/> to decide whether a config asks for
+    /// TurboQuant at all: a V-only request leaves this false (#1888).</summary>
     public bool IsTurboQuant => KeyDType == KvCacheDType.TurboQuant;
+
+    /// <summary>True when either side (K or V) is TurboQuant (#1888).</summary>
+    public bool IsTurboQuantAny => KeyDType == KvCacheDType.TurboQuant || ValueDType == KvCacheDType.TurboQuant;
+
+    /// <summary>True when exactly one side is TurboQuant: a mixed pair (e.g. K=tq, V=q8_0) or V-only tq (#1888, #1887 step 6).</summary>
+    public bool IsTurboQuantMixed => (KeyDType == KvCacheDType.TurboQuant) != (ValueDType == KvCacheDType.TurboQuant);
 
     /// <summary>
     /// Parses a CLI string to <see cref="KvCacheDType"/>, also surfacing the TurboQuant bit-width

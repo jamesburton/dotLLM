@@ -430,6 +430,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             DeviceCli.PrintError(kvFlagError!, settings.Json);
             return 1;
         }
+        // #1888: TurboQuant KV does not run in 'run' until #1887 step 2; never serve it with another cache.
+        if (DotLLM.Cli.Helpers.KvStorageCli.TurboQuantRefusal(DotLLM.Server.KvCommand.Run,
+                settings.KvQuantK ?? settings.CacheTypeK, settings.KvQuantV ?? settings.CacheTypeV) is { } tqRefusal)
+        {
+            DeviceCli.PrintError(tqRefusal, settings.Json);
+            return 1;
+        }
 
         // HuggingFace safetensors directory? (config.json + *.safetensors /
         // model.safetensors.index.json). Auto-detected; loads via the
@@ -776,7 +783,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
             if (vulkanKv is not null)
             {
-                if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
+                if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel
+                    && !vkModel.TryUseInPlaceQuantizedKv(kvConfig.KeyDType, kvConfig.ValueDType, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()))
                 {
                     string spvDir = DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir();
                     kvFactory = (cfg, size) => vkModel.CreateQuantizedKvCache(

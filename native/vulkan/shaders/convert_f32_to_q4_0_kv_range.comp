@@ -1,0 +1,62 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "q8_1_exact_div.glsl"
+// F32 -> Q4_0 KV range convert (issue #1884, kv_load.glsl KV_Q4 layout).
+//
+// One invocation per 32-element block: dst block = [float scale][16 bytes] (20 bytes = 5 words). The rule is the CPU KV quantiser's
+// (KvQuantize.F32ToQ4_0Scalar) and CUDA's (attention_kvq.cu, #956): scale = amax / 7, nibble = clamp(roundEven(x * (1 / scale)) + 8, 0, 15),
+// ADJACENT PAIRS (byte j = element 2j low nibble | element 2j + 1 high nibble). An all-zero block stores scale 0 and nibbles 8 (0x88).
+// The scale is F32 (CPU / CUDA store F16), as Vulkan's Q8_0 KV does. Division and reciprocal are IEEE-exact (#1500): a plain amax / 7 is
+// lowered to a multiply by an approximate reciprocal on RDNA.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufSrc { float src[]; };   // starts at element 0; nBlocks * 32 elements
+layout(set = 0, binding = 1, std430) writeonly buffer BufDst { uint  dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint dstBlockOffset;   // first destination block
+    uint nBlocks;
+} pc;
+
+// 1/7 rounded to nearest float (0x3e124925).
+const float Q4_RCP_7 = 0.14285715;
+
+// amax / 7, correctly rounded: 7 * q = 8 * q - q with 8 * q exact, so a fast-two-sum gives 7 * q = s + err exactly and a - s is exact
+// (the q81DivBy127 construction with 8 in place of 128).
+float q4DivBy7(float a) {
+    precise float q = a * Q4_RCP_7;
+    precise float p = q * 8.0;
+    precise float s = p - q;
+    precise float z = s - p;
+    precise float err = -q - z;
+    precise float r = (a - s) - err;
+    precise float rq = r * Q4_RCP_7;
+    precise float q2 = q + rq;
+    return q2;
+}
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.nBlocks) return;
+    float v[32];
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; i++) {
+        v[i] = src[b * 32u + i];
+        amax = max(amax, abs(v[i]));
+    }
+    float d = q4DivBy7(amax);
+    float id = d != 0.0 ? q81Recip(d) : 0.0;
+    uint o = (pc.dstBlockOffset + b) * 5u;
+    dst[o] = floatBitsToUint(d);
+    for (uint w = 0u; w < 4u; w++) {
+        uint packed = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            uint e = w * 8u + j * 2u;   // byte 4w + j holds elements e (low nibble) and e + 1 (high nibble)
+            uint lo = d != 0.0 ? uint(clamp(int(roundEven(v[e] * id)) + 8, 0, 15)) : 8u;
+            uint hi = d != 0.0 ? uint(clamp(int(roundEven(v[e + 1u] * id)) + 8, 0, 15)) : 8u;
+            packed |= ((hi << 4u) | lo) << (8u * j);
+        }
+        dst[o + 1u + w] = packed;
+    }
+}

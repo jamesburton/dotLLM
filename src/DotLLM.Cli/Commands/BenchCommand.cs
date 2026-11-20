@@ -199,6 +199,12 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
 
     public override int Execute(CommandContext context, Settings settings)
     {
+        // #1888: bench measured the default cache for a TurboQuant request while its reproduce line said tq; refuse until #1887 step 2.
+        if (DotLLM.Cli.Helpers.KvStorageCli.TurboQuantRefusal(DotLLM.Server.KvCommand.Bench, settings.KvQuantK, settings.KvQuantV) is { } tqRefusal)
+        {
+            WriteError(settings, tqRefusal);
+            return 1;
+        }
         var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
         if (ggufPath is null)
             return 1;

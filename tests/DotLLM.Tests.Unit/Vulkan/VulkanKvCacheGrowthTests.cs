@@ -182,4 +182,161 @@ public sealed class VulkanKvCacheGrowthTests
             }
         }
     }
+
+    /// <summary>
+    /// Issue #1843 on Vulkan, as on CUDA: with a second, unrelated entry retained, a hit whose growth is refused evicts that entry
+    /// and retries the growth, keeping the hit, instead of re-prefilling the conversation. Admission is refused until the
+    /// neighbour is gone, as when it holds the memory the growth needs.
+    /// </summary>
+    [SkippableFact]
+    public void RefusedGrowth_WithANeighbourRetained_EvictsIt_AndKeepsTheHit()
+    {
+        string? path = FindGguf();
+        Skip.If(path is null, "Qwen2.5-0.5B q8_0 GGUF not found.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        var (model, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+        using var _ = model as IDisposable;
+        var opts = new InferenceOptions { Temperature = 0, MaxTokens = 12 };
+        var cold = new TextGenerator(model, tokenizer, (cfg, size) => kvFactory(size), mtpEnabled: false);
+
+        string turn1 = "<|im_start|>user\n" + string.Concat(Enumerable.Repeat("The quick brown fox jumps over the lazy dog. ", 20))
+            + "Fetch the page.<|im_end|>\n";
+        string unrelated = "Harbour log, evening watch. " + string.Concat(Enumerable.Repeat("Seven sailors sorted silver spoons. ", 15))
+            + "Count the sailors.<|im_end|>\n";
+        string toolResult = "<|im_start|>user\n<tool_response>\n"
+            + string.Concat(Enumerable.Range(0, 60).Select(i => $"Row {i}: the value of item {i * 7 % 13} is {i * 31 % 97}. "))
+            + "\n</tool_response><|im_end|>\n";
+
+        using var prefix = new PrefixCache(2, PrefixCachePolicy.Lru);
+        var warm = new TextGenerator(model, tokenizer, (cfg, size) => kvFactory(size), prefix, mtpEnabled: false,
+            prefixCacheHeadroomTokens: 16);
+        var first = warm.Generate(Turn(turn1), opts);
+        warm.Generate(Turn(unrelated), opts);
+        Assert.Equal(2, prefix.EntryCount);
+        string turn2 = Turn(turn1 + "<|im_start|>assistant\n" + first.Text + "<|im_end|>\n" + toolResult);
+        int firstRows = tokenizer.Encode(Turn(turn1)).Length + first.GeneratedTokenIds.Length - 1;
+
+        long growths = VulkanKvCache.GrowthsForTest, evictions = prefix.AdmissionEvictions;
+        VulkanKvCache.GrowthAdmissionOverride = (_, _) => prefix.AdmissionEvictions > evictions;
+        InferenceResponse actual;
+        try { actual = warm.Generate(turn2, opts); }
+        finally { VulkanKvCache.GrowthAdmissionOverride = null; }
+
+        Assert.Equal(evictions + 1, prefix.AdmissionEvictions);
+        Assert.Equal(1, prefix.EntryCount);
+        Assert.Equal(growths + 1, VulkanKvCache.GrowthsForTest);
+        Assert.InRange(actual.Timings.CachedTokenCount, firstRows - 8, firstRows + 2);
+        Assert.Equal(cold.Generate(turn2, opts).GeneratedTokenIds, actual.GeneratedTokenIds);
+    }
+
+    /// <summary>
+    /// Issue #1843, Vulkan side of CUDA's quantized growth (#1594): a retained <see cref="VulkanQuantizedKvCache"/> grows for a next
+    /// turn longer than its headroom, keeps every first-turn row, and the continuation equals a cold quantized prefill and a warm run
+    /// that never grew (same blocks, same kernels: bit-identical tokens).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(KvCacheDType.Q8_0, KvCacheDType.Q8_0)]
+    [InlineData(KvCacheDType.Q4_0, KvCacheDType.Q4_0)]
+    public void Quantized_NextTurnLongerThanTheHeadroom_GrowsTheCache_AndMatchesColdAndUngrown(KvCacheDType kType, KvCacheDType vType)
+    {
+        string? path = FindGguf();
+        Skip.If(path is null, "Qwen2.5-0.5B q8_0 GGUF not found.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        var (model, _) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+        using var __ = model as IDisposable;
+        var vk = Assert.IsType<VulkanTransformerModel>(model);
+        Func<DotLLM.Core.Models.ModelConfig, int, DotLLM.Core.Attention.IKvCache> quantized =
+            (_, size) => vk.CreateQuantizedKvCache(spvDir, size, kType, vType);
+        var opts = new InferenceOptions { Temperature = 0, MaxTokens = 12 };
+        var cold = new TextGenerator(model, tokenizer, quantized, mtpEnabled: false);
+
+        string turn1 = "<|im_start|>user\n" + string.Concat(Enumerable.Repeat("The quick brown fox jumps over the lazy dog. ", 20))
+            + "Fetch the page.<|im_end|>\n";
+        string toolResult = "<|im_start|>user\n<tool_response>\n"
+            + string.Concat(Enumerable.Range(0, 60).Select(i => $"Row {i}: the value of item {i * 7 % 13} is {i * 31 % 97}. "))
+            + "\n</tool_response><|im_end|>\n";
+
+        InferenceResponse Warm(int headroom, out long grew, out int firstRows)
+        {
+            using var prefix = new PrefixCache(2, PrefixCachePolicy.Agent);
+            var warm = new TextGenerator(model, tokenizer, quantized, prefix, mtpEnabled: false, prefixCacheHeadroomTokens: headroom);
+            var first = warm.Generate(Turn(turn1), opts);
+            firstRows = tokenizer.Encode(Turn(turn1)).Length + first.GeneratedTokenIds.Length - 1;
+            string turn2 = Turn(turn1 + "<|im_start|>assistant\n" + first.Text + "<|im_end|>\n" + toolResult);
+            long g0 = VulkanKvCache.GrowthsForTest;
+            var r = warm.Generate(turn2, opts);
+            grew = VulkanKvCache.GrowthsForTest - g0;
+            return r;
+        }
+
+        var grown = Warm(16, out long growths, out int rows);
+        var ungrown = Warm(4096, out long noGrowths, out _);
+        string t2 = Turn(turn1 + "<|im_start|>assistant\n" + cold.Generate(Turn(turn1), opts).Text + "<|im_end|>\n" + toolResult);
+        var expected = cold.Generate(t2, opts);
+
+        Assert.Equal(1, growths);
+        Assert.Equal(0, noGrowths);
+        Assert.InRange(grown.Timings.CachedTokenCount, rows - 8, rows + 2);
+        Assert.Equal(ungrown.Timings.CachedTokenCount, grown.Timings.CachedTokenCount);
+        Assert.Equal(ungrown.GeneratedTokenIds, grown.GeneratedTokenIds);
+        Assert.Equal(expected.GeneratedTokenIds, grown.GeneratedTokenIds);
+    }
+
+    /// <summary>
+    /// Issue #1843: <see cref="VulkanQuantizedKvCache.TrySeedPrefixFrom"/> copies the scale and quant blocks as stored, so a suffix
+    /// over a seeded cache gives bit-identical logits to the same suffix over the cut-back source.
+    /// </summary>
+    [SkippableFact]
+    public void Quantized_Seed_GivesTheCutBackLogits()
+    {
+        string? path = FindGguf();
+        Skip.If(path is null, "Qwen2.5-0.5B q8_0 GGUF not found.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        var (model, _) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+        using var __ = model as IDisposable;
+        var vk = Assert.IsType<VulkanTransformerModel>(model);
+
+        int[] tokens = tokenizer.Encode("<|im_start|>user\n" + string.Concat(Enumerable.Repeat("The quick brown fox jumps over the lazy dog. ", 12))
+            + "Fetch the page.<|im_end|>\n<|im_start|>assistant\n");
+        int n = tokens.Length, cut = n / 2 + 3;
+        int[] positions = Enumerable.Range(0, n).ToArray();
+        unsafe float[] Suffix(DotLLM.Core.Attention.IKvCache kv)
+        {
+            using var t = model.Forward(tokens.AsSpan(cut), positions.AsSpan(cut), -1, kv);
+            int vocab = config.VocabSize, rowsOut = t.Shape[0];
+            var row = new float[vocab];
+            new ReadOnlySpan<float>((float*)t.DataPointer + (long)(rowsOut - 1) * vocab, vocab).CopyTo(row);
+            return row;
+        }
+
+        using var src = vk.CreateQuantizedKvCache(spvDir, n, KvCacheDType.Q8_0, KvCacheDType.Q8_0);
+        model.Forward(tokens, positions, -1, src).Dispose();
+        using var seeded = vk.CreateQuantizedKvCache(spvDir, n, KvCacheDType.Q8_0, KvCacheDType.Q8_0);
+        Assert.True(seeded.TrySeedPrefixFrom(src, cut));
+        Assert.Equal(cut, seeded.CurrentLength);
+        float[] fromSeed = Suffix(seeded);
+
+        src.Rollback(cut);
+        float[] reference = Suffix(src);
+        Assert.Equal(reference, fromSeed);
+
+        using var otherType = vk.CreateQuantizedKvCache(spvDir, n, KvCacheDType.Q4_0, KvCacheDType.Q4_0);
+        Assert.False(otherType.TrySeedPrefixFrom(src, cut));   // another block format: refused, unchanged
+        Assert.Equal(0, otherType.CurrentLength);
+    }
 }

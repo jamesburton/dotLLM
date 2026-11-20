@@ -1,0 +1,8 @@
+#version 450
+// Mixed K Q8_0 / V Q4_0 KV twin of query_relevance_lse_f32.comp (issue #1884): the same kernel reading K / V stored as K Q8_0, V Q4_0 (36- / 20-byte blocks
+// of [float scale][16 bytes of adjacent-pair nibbles], dequantised in the load: see kv_load.glsl). Body: query_relevance_lse_f32.glsl. F16 twin: query_relevance_lse_f32_kvf16.comp.
+#define KV_MIXED 1
+#define KV_K_Q8 1
+#define KV_V_Q4 1
+#extension GL_GOOGLE_include_directive : require
+#include "query_relevance_lse_f32.glsl"

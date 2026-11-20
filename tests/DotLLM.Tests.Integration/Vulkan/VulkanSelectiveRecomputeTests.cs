@@ -144,4 +144,104 @@ public class VulkanSelectiveRecomputeTests
         Assert.True(sub.k <= 2 * floorK + 1e-3 && sub.v <= 2 * floorV + 1e-3,
             $"subset recompute drifts more than the numerics floor: K {sub.k:E2} vs {floorK:E2}, V {sub.v:E2} vs {floorV:E2}");
     }
+
+    /// <summary>
+    /// #1884: the same subset recompute on an in-place block cache (Q8_0, Q4_0, mixed). The selected rows are first overwritten by a
+    /// recompute with WRONG tokens, then recomputed with the right ones (both non-contiguous: the row-scatter writer and the block qpos
+    /// twins). Each selected row must come back to the full prefill's row as closely as a contiguous tail recompute does (the numerics
+    /// floor), and every other row must stay byte-identical. A scatter that wrote elsewhere leaves the poison in place.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(VulkanKvStorage.Q8_0)]
+    [InlineData(VulkanKvStorage.Q4_0)]
+    [InlineData(VulkanKvStorage.Q8_0K_Q4_0V)]
+    public void Qwen3_4B_NonContiguousSubsetRecompute_BlockCache(VulkanKvStorage storage)
+    {
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device");
+        FixtureLocation fx = TestFixtureResolver.ResolveFile("DOTLLM_QWEN3_4B_Q4_K_M_GGUF", "bartowski", "Qwen_Qwen3-4B-Instruct-2507-GGUF",
+            "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+        Skip.If(!fx.Found, fx.SkipMessage("Qwen3-4B Q4_K_M GGUF"));
+        using var gguf = GgufFile.Open(fx.Path!);
+        var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        string spvDir = VulkanModelLoader.ResolveSpvDir();
+        using var vk = VulkanTransformerModel.LoadFromGguf(gguf, cfg, spvDir);
+        static DotLLM.Core.Configuration.KvCacheDType D(VulkanKvStorage f)
+            => f == VulkanKvStorage.Q4_0 ? DotLLM.Core.Configuration.KvCacheDType.Q4_0 : DotLLM.Core.Configuration.KvCacheDType.Q8_0;
+        Assert.True(vk.TryUseInPlaceQuantizedKv(D(storage.KeyFormat()), D(storage.ValueFormat()), spvDir));
+
+        const int N = 96;
+        int[] subset = [3, 4, 5, 20, 33, 34, 70, 95];
+        int[] ids = Enumerable.Range(0, N).Select(i => (i * 131 + 17) % 5000 + 100).ToArray();
+        int[] pos = Enumerable.Range(0, N).ToArray();
+        int layers = cfg.NumLayers, stride = cfg.NumKvHeads * cfg.HeadDim;
+        long kRow = storage.KeyRowBytes(stride), vRow = storage.ValueRowBytes(stride);
+
+        byte[] Bytes(VulkanDevice.Buffer b, long n)
+        {
+            var f = new float[(n + 3) / 4];
+            vk.Device.Download(b, f.AsSpan());
+            return System.Runtime.InteropServices.MemoryMarshal.AsBytes(f.AsSpan()).Slice(0, (int)n).ToArray();
+        }
+        static float[] Deq(VulkanKvStorage f, ReadOnlySpan<byte> row)
+        {
+            int blocks = f == VulkanKvStorage.Q4_0 ? row.Length / 20 : row.Length / 36;
+            var r = new float[blocks * 32];
+            for (int b = 0; b < blocks; b++)
+            {
+                if (f == VulkanKvStorage.Q4_0)
+                {
+                    float d = BitConverter.ToSingle(row.Slice(b * 20, 4));
+                    for (int j = 0; j < 16; j++) { byte x = row[b * 20 + 4 + j]; r[b * 32 + 2 * j] = ((x & 15) - 8) * d; r[b * 32 + 2 * j + 1] = ((x >> 4) - 8) * d; }
+                }
+                else
+                {
+                    float d = BitConverter.ToSingle(row.Slice(b * 36, 4));
+                    for (int j = 0; j < 32; j++) r[b * 32 + j] = (sbyte)row[b * 36 + 4 + j] * d;
+                }
+            }
+            return r;
+        }
+        static double RelL2(float[] a, float[] b) { double n = 0, d = 0; for (int i = 0; i < a.Length; i++) { d += (a[i] - b[i]) * (double)(a[i] - b[i]); n += a[i] * (double)a[i]; } return Math.Sqrt(d / n); }
+
+        using var reference = vk.CreateKvCache(N + 32, false, storage);
+        using (vk.Forward(ids, pos, 0, reference)) { }
+
+        // Returns (worst rel L2 over the selected rows' K and V, whether every other row is byte-identical, qpos layers run).
+        (double Worst, bool OthersIdentical, long Qpos) Recompute(int[] rows)
+        {
+            using var c = vk.CreateKvCache(N + 32, false, storage);
+            using (vk.Forward(ids, pos, 0, c)) { }
+            int[] wrong = rows.Select(p => (ids[p] + 977) % 5000 + 100).ToArray();
+            using (vk.Forward(wrong, rows, 0, c)) { }                               // poison the rows (non-contiguous write)
+            long before = vk.AttentionQueryPositionsCount;
+            using (vk.Forward(rows.Select(p => ids[p]).ToArray(), rows, 0, c)) { }  // and recompute them
+            long qpos = vk.AttentionQueryPositionsCount - before;
+            Assert.Equal(N, c.CurrentLength);
+            double worst = 0; bool same = true;
+            for (int l = 0; l < layers; l++)
+            {
+                byte[] rk = Bytes(reference.GetKeysBuffer(l), N * kRow), ck = Bytes(c.GetKeysBuffer(l), N * kRow);
+                byte[] rv = Bytes(reference.GetValuesBuffer(l), N * vRow), cv = Bytes(c.GetValuesBuffer(l), N * vRow);
+                for (int p = 0; p < N; p++)
+                {
+                    var rkr = rk.AsSpan((int)(p * kRow), (int)kRow); var ckr = ck.AsSpan((int)(p * kRow), (int)kRow);
+                    var rvr = rv.AsSpan((int)(p * vRow), (int)vRow); var cvr = cv.AsSpan((int)(p * vRow), (int)vRow);
+                    if (Array.IndexOf(rows, p) >= 0)
+                        worst = Math.Max(worst, Math.Max(RelL2(Deq(storage.KeyFormat(), rkr), Deq(storage.KeyFormat(), ckr)),
+                                                         RelL2(Deq(storage.ValueFormat(), rvr), Deq(storage.ValueFormat(), cvr))));
+                    else if (!rkr.SequenceEqual(ckr) || !rvr.SequenceEqual(cvr)) same = false;
+                }
+            }
+            return (worst, same, qpos);
+        }
+
+        var sub = Recompute(subset);
+        var ctl = Recompute(Enumerable.Range(N - subset.Length, subset.Length).ToArray());   // contiguous tail: the numerics floor
+        _out.WriteLine($"[1884] {storage}: subset worst rel L2 {sub.Worst:E2} (qpos layers {sub.Qpos}), contiguous control {ctl.Worst:E2}");
+        Assert.Equal(layers, (int)sub.Qpos);           // the block qpos twin ran on every layer
+        Assert.True(sub.OthersIdentical, "a row outside the subset changed");
+        Assert.True(ctl.OthersIdentical, "a row outside the control changed");
+        Assert.True(sub.Worst <= 2 * ctl.Worst + 2e-2, $"subset recompute {sub.Worst:E2} drifts past the floor {ctl.Worst:E2}");
+    }
 }

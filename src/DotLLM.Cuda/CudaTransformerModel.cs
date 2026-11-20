@@ -1308,7 +1308,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                 // device scalars uploaded before every replay. A growth replaces the buffers and is caught by the Generation key.
                 return ForwardDecodeGraph(tokenIds, positions, deviceId, stdKv);
             }
-            if (kvCache is CudaQuantizedKvCache qKv && qKv.WindowCapacity > 0)
+            if (kvCache is CudaQuantizedKvCache qKv && qKv.WindowCapacity > 0 && !qKv.ReferenceDequantScratch)
                 return ForwardDecodeGraphQuantized(tokenIds, positions, deviceId, qKv);
         }
 
@@ -1705,10 +1705,20 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                     cudaQKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s, _kernels);
                     int seqKv = cudaQKvCache.CurrentLength;
 
-                    // Dequant quantized region + copy window → scratch, then regular attention
-                    var (kCachePtr, vCachePtr) = cudaQKvCache.PrepareAttentionScratch(layer, s, _kernels);
-                    MarkProfile(ProfileCategory.KvUpdate);
-                    DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+                    if (cudaQKvCache.ReferenceDequantScratch)
+                    {
+                        // Test-only oracle (#1850): the pre-#1850 path, dequant into a full-history FP16 scratch + DispatchAttention.
+                        var (kCachePtr, vCachePtr) = cudaQKvCache.PrepareReferenceScratch(layer, s, _kernels);
+                        MarkProfile(ProfileCategory.KvUpdate);
+                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+                    }
+                    else
+                    {
+                        // #1850 (CLAUDE.md rule 2): attention reads the quantized rows (and the FP16 window ring) in place.
+                        MarkProfile(ProfileCategory.KvUpdate);
+                        DispatchQuantizedKvAttention(cudaQKvCache, layer, qPtr, seqLen, seqKv, positions[0],
+                            slidingWindow, numHeads, numKvHeads, headDim, layerSinks, s);
+                    }
                 }
                 else if (kvCache is CudaTurboQuantKvCache cudaTqKvCache)
                 {
@@ -1780,7 +1790,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                         PagedGatherAttentionCalls++;
                         var (kCachePtr, vCachePtr) = cudaPagedKvCache.PrepareAttentionScratch(layer, s);
                         MarkProfile(ProfileCategory.KvUpdate);
-                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+                        // #1843: the gather is the same contiguous F16 layout as CudaKvCache, so a prefix-reuse suffix (or a later
+                        // prefill chunk) takes G3's offset path over it, as the dense F16 cache does (#1594).
+                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0], offsetG3: true);
                     }
                 }
                 else
@@ -2390,8 +2402,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <summary>
     /// CUDA Graphs decode replay path for the mixed-precision quantized KV cache.
     /// Mirrors <see cref="ForwardDecodeGraph"/> but routes the KV-cache update and
-    /// attention-scratch preparation through <see cref="CudaQuantizedKvCache"/>'s
-    /// graph-friendly variants, which read the absolute decode position from
+    /// attention through <see cref="CudaQuantizedKvCache"/>'s graph-friendly update and the
+    /// in-place <c>attention_kvq_dyn</c> kernel, which read the absolute decode position from
     /// <see cref="_decodePosDevice"/> and predicate quantize-on-evict device-side.
     /// </summary>
     private ITensor ForwardDecodeGraphQuantized(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
@@ -2775,11 +2787,10 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// Quantized-KV variant of <see cref="CaptureDecodeGraph"/>. Identical kernel
     /// sequence except the per-layer KV-cache update goes through
     /// <see cref="CudaQuantizedKvCache.UpdateDeviceForGraph"/> (FP16 ring write +
-    /// predicated quantize-on-evict) and the attention reads from
-    /// <see cref="CudaQuantizedKvCache.PrepareAttentionScratchForGraph"/>'s scratch
-    /// buffers (predicated dequant + window scatter). Both ops are driven by the
-    /// existing device-resident <see cref="_decodePosDevice"/> counter so no new
-    /// device-side state is required.
+    /// predicated quantize-on-evict) and the attention (<c>attention_kvq_dyn</c>, #1850) reads
+    /// the quantized rows and the FP16 ring in place. Both are driven by the existing
+    /// device-resident <see cref="_decodePosDevice"/> / <see cref="_decodeSeqKvDevice"/>
+    /// counters so no new device-side state is required.
     /// </summary>
     private void CaptureDecodeGraphQuantized(CudaQuantizedKvCache kvCache, int numLayers)
     {
@@ -2903,17 +2914,15 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                 // device-side eviction state.
                 kvCache.UpdateDeviceForGraph(kPtr, vPtr, layer, _decodePosDevice, s, _kernels);
 
-                // Dequant the quantized region + scatter the window into the FP16 attention
-                // scratch — both predicated, both reading position from _decodePosDevice.
-                var (kCachePtr, vCachePtr) =
-                    kvCache.PrepareAttentionScratchForGraph(layer, _decodePosDevice, s, _kernels);
-
-                // Attention with device-resident seq_kv / position_offset.
-                // lw.AttnSinksDevice (#365): graph-safe baked argument — see the sibling
+                // Attention reads the quantized rows [0, seqKv - window) and the FP16 ring in place (#1850), with device-resident
+                // seq_kv / position_offset. lw.AttnSinksDevice (#365): graph-safe baked argument — see the sibling
                 // LaunchAttentionDyn call in the FP16-cache graph body above.
-                _kernels.LaunchAttentionDyn(qPtr, kCachePtr, vCachePtr, _state.AttnOutput,
+                _kernels.LaunchAttentionKvqDyn(qPtr,
+                    kvCache.GetQuantizedKeysPtr(layer), kvCache.GetQuantizedValuesPtr(layer),
+                    kvCache.GetWindowKeysPtr(layer), kvCache.GetWindowValuesPtr(layer), _state.AttnOutput,
                     seqLen, _decodeSeqKvDevice, numHeads, numKvHeads, headDim,
-                    _decodePosDevice, slidingWindow, s, lw.AttnSinksDevice);
+                    _decodePosDevice, slidingWindow, s, lw.AttnSinksDevice,
+                    kvCache.KeyDType, kvCache.ValueDType, kvCache.WindowCapacity);
 
                 // Optional attention Sub-LN (BitNet), fused into the O-projection GEMV when
                 // eligible — mirrors the eager path's fusedAttnSubNormO branch (issue #212).
@@ -4709,6 +4718,68 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     }
 
     /// <summary>
+    /// Opt-out for the in-place tensor-core prefill over the dense quantized KV cache (issue #1850):
+    /// <c>DOTLLM_CUDA_KVQ_FLASH_PREFILL=0</c> sends every quantized-KV prefill to the scalar <c>attention_kvq</c> kernel (also in
+    /// place, slower). Read once; default on. Mutable so a test can pin the scalar arm.
+    /// </summary>
+    internal static bool EnableKvqFlashPrefill =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_KVQ_FLASH_PREFILL") != "0";
+
+    /// <summary>Query rows from which a quantized-KV prefill uses the tensor-core kernel (one 16-row q-tile); below it, scalar.</summary>
+    internal const int KvqFlashPrefillMinRows = 16;
+
+    private static int s_kvqScalarPrefillLogged;
+
+    /// <summary>The model's kernel set (tests: which optional kernels loaded on this device).</summary>
+    internal CudaKernels Kernels => _kernels;
+
+    /// <summary>
+    /// Whether a quantized-KV attention call goes to the tensor-core <c>attention_flash_mma_prefill_kvq</c> kernel (issue #1850):
+    /// a prefill of at least <see cref="KvqFlashPrefillMinRows"/> rows whose queries are the newest rows (<paramref name="seqKv"/>
+    /// = offset + rows; cold or prefix-reuse suffix), global causal attention without sinks, no FP16 window ring (pure quantized,
+    /// the serve default), head_dim 64 / 128 with a GQA group of at most 8, and a loaded kernel for the K/V pair. Everything else
+    /// runs the scalar <c>attention_kvq</c>, which reads the same storage in place. Pure so it is testable without a GPU.
+    /// </summary>
+    internal static bool UseKvqFlashPrefill(bool enabled, bool kernelLoaded, int seqLen, int seqKv, int positionOffset,
+        int slidingWindow, bool hasSinks, int window, int numHeads, int numKvHeads, int headDim)
+        => enabled && kernelLoaded
+        && seqLen >= KvqFlashPrefillMinRows
+        && seqKv == positionOffset + seqLen
+        && slidingWindow <= 0 && !hasSinks && window <= 0
+        && CudaKernels.IsAttentionFlashPrefillKvqShape(numHeads, numKvHeads, headDim);
+
+    /// <summary>
+    /// Attention for one layer over <see cref="CudaQuantizedKvCache"/> storage, read in place (issue #1850): the tensor-core prefill
+    /// kernel when <see cref="UseKvqFlashPrefill"/> allows, else the scalar <c>attention_kvq</c> (decode, short prefills, sliding
+    /// window, sinks, the FP16 window ring, other head dims). Neither allocates anything: there is no fallback that expands the
+    /// history. Output goes to <c>_state.AttnOutput</c> (F16), as <c>attention_f16</c>'s does.
+    /// </summary>
+    private void DispatchQuantizedKvAttention(CudaQuantizedKvCache cache, int layer, nint qPtr, int seqLen, int seqKv,
+        int positionOffset, int slidingWindow, int numHeads, int numKvHeads, int headDim, nint sinks, nint s)
+    {
+        int window = cache.WindowCapacity;
+        if (UseKvqFlashPrefill(EnableKvqFlashPrefill, _kernels.HasAttentionFlashPrefillKvq(headDim, cache.KeyDType, cache.ValueDType),
+                seqLen, seqKv, positionOffset, slidingWindow, sinks != 0, window, numHeads, numKvHeads, headDim))
+        {
+            _kernels.LaunchAttentionFlashPrefillKvq(qPtr, cache.GetQuantizedKeysPtr(layer), cache.GetQuantizedValuesPtr(layer),
+                cache.KeyDType, cache.ValueDType, _state.AttnOutput, seqLen, seqKv, numHeads, numKvHeads, headDim, positionOffset, s);
+            return;
+        }
+
+        if (seqLen >= KvqFlashPrefillMinRows && Interlocked.Exchange(ref s_kvqScalarPrefillLogged, 1) == 0)
+            Console.Error.WriteLine(
+                $"[dotLLM.Cuda] {cache.KeyDType}/{cache.ValueDType} KV prefill runs the scalar in-place attention_kvq kernel " +
+                $"(head_dim {headDim}, {numHeads}/{numKvHeads} heads, window {window}, sliding {slidingWindow}, sinks {sinks != 0}, " +
+                $"tensor-core kernel loaded {_kernels.HasAttentionFlashPrefillKvq(headDim, cache.KeyDType, cache.ValueDType)}): " +
+                "correct and allocation-free, but slower than the tensor-core prefill.");
+
+        _kernels.LaunchAttentionKvq(qPtr, cache.GetQuantizedKeysPtr(layer), cache.GetQuantizedValuesPtr(layer),
+            cache.GetWindowKeysPtr(layer), cache.GetWindowValuesPtr(layer), _state.AttnOutput,
+            seqLen, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow, s, sinks,
+            cache.KeyDType, cache.ValueDType, quantLen: window > 0 ? cache.QuantizedLength : seqKv, window);
+    }
+
+    /// <summary>
     /// Creates a KV-cache with optional quantization for this model.
     /// Returns <see cref="CudaQuantizedKvCache"/> when quantization is configured,
     /// otherwise a standard <see cref="CudaKvCache"/>.
@@ -4718,7 +4789,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         _context.MakeCurrent();
         var geom = Core.Attention.KvGeometry.FromConfig(Config);
         Core.Attention.IKvCache cache = AdmitReleasingG3<Core.Attention.IKvCache>(() => config.IsQuantized
-            ? new CudaQuantizedKvCache(geom, maxSeqLen, config, _context)
+            ? new CudaQuantizedKvCache(geom, maxSeqLen, config, _context, inPlaceAttentionLoaded: _kernels.HasAttentionKvq)
             : new CudaKvCache(geom, maxSeqLen, _context));
         _spillMonitor.Check($"KV cache ({config.KeyDType}/{config.ValueDType}) allocated for {maxSeqLen} tokens");
         return cache;
@@ -4735,8 +4806,13 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <param name="maxTotalTokens">Maximum total tokens across all sequences sharing this pool.</param>
     public CudaKvBlockPool CreateKvBlockPool(int blockSize = 16, int maxTotalTokens = 65536)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockSize);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxTotalTokens);
         _context.MakeCurrent();
-        return new CudaKvBlockPool(Core.Attention.KvGeometry.FromConfig(Config), blockSize, maxTotalTokens, _context);
+        // The pool takes a BLOCK count. Passing the token count straight through (as before #1843) made every pool blockSize
+        // times larger than asked: 65536 tokens allocated 65536 blocks (1M tokens of KV).
+        int totalBlocks = (int)(((long)maxTotalTokens + blockSize - 1) / blockSize);
+        return new CudaKvBlockPool(Core.Attention.KvGeometry.FromConfig(Config), blockSize, totalBlocks, _context);
     }
 
     /// <summary>
@@ -4793,8 +4869,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         // pool with the cache's own length error instead of exhausting the pool mid-prefill.
         int length = CudaPagedKvCacheFactory.ClampToPool(maxSeqLen, pool);
         // #1848 / #1836: refused at admission, with the standard message, when the pool cannot hold the request, rather than
-        // throwing "pool exhausted" part-way through prefill. Serving runs one request at a time on this pool, so its free
-        // blocks are normally all of it; the served context is capped to the pool (ServerStartup), so this is the backstop.
+        // throwing "pool exhausted" part-way through prefill. Serving runs one request at a time on this pool, but since #1843 the
+        // prefix cache retains up to 2 entries that hold blocks; a refusal here is what makes TextGenerator.AllocateKvCacheEvicting
+        // evict them and retry. The served context is capped to the pool (ServerStartup), so the whole pool always fits one request.
         if (DescribePoolRefusal(length, pool.BlockSize, pool.FreeBlocks, pool.TotalBlocks,
                 CudaPagedKvCacheFactory.PoolBytesPerToken(KvGeometry.FromConfig(Config))) is { } refusal)
             throw new DeviceMemoryAdmissionException(refusal);
@@ -4824,7 +4901,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
 
     /// <summary>
     /// Device bytes one served context token costs on the dense (non-paged) path (issue #1841): its K/V rows in the requested KV
-    /// type (q8_0 / q4_0 add the full-history FP16 dequant scratch of <see cref="CudaQuantizedKvCache"/>), plus the forward
+    /// type (q8_0 / q4_0: only their block bytes, read in place since #1850), plus the forward
     /// scratch an unchunked prefill of that length grows (<paramref name="activationBytesPerToken"/>; none when
     /// <paramref name="chunkedPrefill"/>, which bounds it to the chunk). The quadratic G3 score scratch is not per-token: it is
     /// admitted per prefill and falls back to <c>attention_f16</c> when it does not fit (<see cref="CudaG3Attention.TryReserve"/>).
@@ -4854,6 +4931,15 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     public Architectures.HybridContextFit MeasureServingContextFit(KvCacheConfig kv, int prefillChunkTokens)
     {
         _context.MakeCurrent();
+        // #1850: a q8_0 / q4_0 cache reads in place (attention_kvq / the tensor-core kvq prefill), so G3's plane is never used
+        // over it: free a plane warm-up left behind and charge none, instead of losing up to RetainedMaxElems x 6 B (384 MiB) of
+        // window to it.
+        bool g3Serves = G3ServesKvCache(kv);
+        if (!g3Serves && _g3Attention.PlaneElems > 0)
+        {
+            _stream.Synchronize();   // the plane may still be read by queued work
+            _g3Attention.Release();
+        }
         bool chunked = prefillChunkTokens > 0;
         long? chunkScratch = null;
         if (chunked)
@@ -4865,10 +4951,19 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         return FitDenseContext(
             CudaAdmission.QueryFreeBytes(), CudaAdmission.ReserveBytes, _state.PendingLazyScratchBytes, _state.SequenceBytes, chunkScratch,
             g3PlaneHeldBytes: _g3Attention.PlaneElems * CudaG3Attention.ScratchBytesPerElement,
-            g3PlaneMaxBytes: G3PlaneChargeBytes(_g3Attention.MayRun, prefillChunkTokens, Config.NumAttentionHeads),
+            g3PlaneMaxBytes: G3PlaneChargeBytes(g3Serves && _g3Attention.MayRun, prefillChunkTokens, Config.NumAttentionHeads),
             perTokenBytes: DenseContextBytesPerToken(KvGeometry.FromConfig(Config), kv, _state.ActivationBytesPerToken, chunked),
             NativeMaxSequenceLength);
     }
+
+    /// <summary>
+    /// Whether attention over the dense cache <see cref="CreateKvCache(int, Core.Configuration.KvCacheConfig)"/> builds for <paramref name="kv"/> can take G3 (#1850):
+    /// q8_0 / q4_0 (<see cref="CudaQuantizedKvCache"/>) read in place and never do; f16 / f32 get the f16 <see cref="CudaKvCache"/>,
+    /// which does. TurboQuant (either side) never does: its KV is codes, read in place (#1888, #1887), so it is never served by the f16 cache.
+    /// </summary>
+    /// <param name="kv">KV storage types.</param>
+    /// <returns>Whether G3 may run over that cache.</returns>
+    internal static bool G3ServesKvCache(KvCacheConfig kv) => !kv.IsQuantized && !kv.IsTurboQuantAny;
 
     /// <summary>
     /// G3 score-plane bytes the dense context fit charges as fixed (#1848 / #1862): 0 when G3 cannot run; otherwise the plane kept

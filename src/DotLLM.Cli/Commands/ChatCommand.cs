@@ -385,6 +385,12 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             DeviceCli.PrintError(moeError, json: false);
             return 1;
         }
+        // #1888: TurboQuant KV does not run in 'chat' until #1887 step 2; never serve it with another cache.
+        if (DotLLM.Cli.Helpers.KvStorageCli.TurboQuantRefusal(DotLLM.Server.KvCommand.Chat, settings.CacheTypeK, settings.CacheTypeV) is { } tqRefusal)
+        {
+            DeviceCli.PrintError(tqRefusal, json: false);
+            return 1;
+        }
 
         // Resolve before loading the model so a bad path fails fast.
         if (!TextArgument.TryResolve(settings.SystemPrompt, settings.SystemPromptFile,
@@ -642,7 +648,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             if (settings.Paged)
                 AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache is not supported on Vulkan; using the model's own device KV-cache.[/]");
 
-            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
+            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel
+                && !vkModel.TryUseInPlaceQuantizedKv(kvConfig.KeyDType, kvConfig.ValueDType, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()))
             {
                 string spvDir = DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir();
                 kvFactory = (cfg, size) => vkModel.CreateQuantizedKvCache(

@@ -1,0 +1,6 @@
+#version 450
+// Q8_0-KV twin of query_relevance_lse_f32.comp (issue #1884): the same kernel reading K / V stored as Q8_0 (36-byte blocks
+// of [float scale][32 x int8], dequantised in the load: see kv_load.glsl). Body: query_relevance_lse_f32.glsl. F16 twin: query_relevance_lse_f32_kvf16.comp.
+#define KV_Q8 1
+#extension GL_GOOGLE_include_directive : require
+#include "query_relevance_lse_f32.glsl"

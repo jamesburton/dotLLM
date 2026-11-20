@@ -24,7 +24,7 @@ namespace DotLLM.Vulkan;
 /// <para><b>Mixed K/V types.</b> Keys and values can use different quantization (e.g. K=Q8_0,
 /// V=Q4_0 for the K8V4 configuration). Separate kernel instances handle each.</para>
 /// </remarks>
-public sealed class VulkanQuantizedKvCache : IPrefixReusableKvCache, IPerLayerKvCache, IDisposable
+public sealed class VulkanQuantizedKvCache : IPrefixReusableKvCache, IPerLayerKvCache, IKvPrefixSeedable, IDeviceResidentKvCache, IDisposable
 {
     private const int BlockSize = 32;
 
@@ -37,8 +37,8 @@ public sealed class VulkanQuantizedKvCache : IPrefixReusableKvCache, IPerLayerKv
     private readonly VulkanDevice.Buffer[] _valueQuants;
 
     // Shared FP32 scratch for attention (dequant target, shared across layers).
-    private readonly VulkanDevice.Buffer _kScratch;
-    private readonly VulkanDevice.Buffer _vScratch;
+    private VulkanDevice.Buffer _kScratch;   // replaced by TryGrowTo (#1843)
+    private VulkanDevice.Buffer _vScratch;
 
     // Kernels.
     private readonly KvQuantizeKernel _keyQuantize;
@@ -51,7 +51,7 @@ public sealed class VulkanQuantizedKvCache : IPrefixReusableKvCache, IPerLayerKv
     private readonly int _numLayers;
     private readonly int _stride;         // numKvHeads * headDim (uniform)
     private readonly int _blocksPerRow;   // stride / 32
-    private readonly int _maxSeqLen;
+    private int _maxSeqLen;              // raised by TryGrowTo (#1843)
 
     // State.
     private int _currentLength;
@@ -71,7 +71,10 @@ public sealed class VulkanQuantizedKvCache : IPrefixReusableKvCache, IPerLayerKv
     public KvCacheDType ValueDType { get; }
 
     /// <summary>Total bytes allocated for all quantized buffers + scratch.</summary>
-    public long AllocatedBytes { get; }
+    public long AllocatedBytes { get; private set; }
+
+    /// <inheritdoc/>
+    public long DeviceBytes => AllocatedBytes;
 
     /// <summary>
     /// Creates a uniform-geometry quantized KV cache with caller-owned (shared) kernels.
@@ -262,6 +265,119 @@ public sealed class VulkanQuantizedKvCache : IPrefixReusableKvCache, IPerLayerKv
 
     /// <summary>Resets the visible length (new sequence).</summary>
     public void Reset() => _currentLength = 0;
+
+    private long ScaleBytes(long rows) => rows * _blocksPerRow * sizeof(float);
+    private long KeyQuantBytes(long rows) => rows * _blocksPerRow * _keyQuantize.QuantUintsPerBlock * sizeof(uint);
+    private long ValueQuantBytes(long rows) => rows * _blocksPerRow * _valueQuantize.QuantUintsPerBlock * sizeof(uint);
+    private long ScratchBytes(long rows) => rows * _stride * sizeof(float);
+
+    /// <summary>
+    /// Raises <see cref="MaxLength"/> to <paramref name="maxLength"/> keeping the <see cref="CurrentLength"/> committed rows (issue
+    /// #1843; the Vulkan side of CUDA's #1594 quantized growth), so a retained prefix-cache entry serves a next turn that outgrew it
+    /// instead of re-prefilling the conversation. Layer by layer, larger scale and quant buffers are allocated, the live blocks
+    /// copied device to device in their quantized format (no widening), and the old buffers freed. The dequant scratch is
+    /// reallocated at the new length without a copy: <see cref="RecordDequant"/> rebuilds it on every attention call. Admitted
+    /// against free device memory first, as <see cref="VulkanKvCache.TryGrowTo"/> (never spill); an out-of-memory error is caught.
+    /// Either refusal returns <see langword="false"/>; a cache refused part-way keeps its old <see cref="MaxLength"/> (layers
+    /// already grown simply hold more). Must not run while a forward is recording.
+    /// </summary>
+    public bool TryGrowTo(int maxLength)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (maxLength <= _maxSeqLen) return true;
+
+        long perLayerOld = 2 * ScaleBytes(_maxSeqLen) + KeyQuantBytes(_maxSeqLen) + ValueQuantBytes(_maxSeqLen);
+        long perLayerNew = 2 * ScaleBytes(maxLength) + KeyQuantBytes(maxLength) + ValueQuantBytes(maxLength);
+        long growth = _numLayers * (perLayerNew - perLayerOld) + 2 * (ScratchBytes(maxLength) - ScratchBytes(_maxSeqLen));
+        // In flight: the new scratch pair is allocated before the old pair is freed, and one old layer before its copy is freed.
+        long transit = Math.Max(2 * ScratchBytes(_maxSeqLen), perLayerOld);
+        if (!VulkanKvCache.AdmitGrowth(_device, growth + transit))
+            return false;
+
+        try
+        {
+            if (_kScratch.Size < ScratchBytes(maxLength))
+            {
+                var nk = _device.Allocate(ScratchBytes(maxLength));
+                VulkanDevice.Buffer nv;
+                try { nv = _device.Allocate(ScratchBytes(maxLength)); }
+                catch { nk.Dispose(); throw; }
+                _kScratch.Dispose();
+                _vScratch.Dispose();
+                _kScratch = nk;
+                _vScratch = nv;
+            }
+
+            for (int i = 0; i < _numLayers; i++)
+            {
+                _keyScales[i] = Regrow(_keyScales[i], ScaleBytes(maxLength), ScaleBytes(_currentLength));
+                _keyQuants[i] = Regrow(_keyQuants[i], KeyQuantBytes(maxLength), KeyQuantBytes(_currentLength));
+                _valueScales[i] = Regrow(_valueScales[i], ScaleBytes(maxLength), ScaleBytes(_currentLength));
+                _valueQuants[i] = Regrow(_valueQuants[i], ValueQuantBytes(maxLength), ValueQuantBytes(_currentLength));
+            }
+        }
+        catch (VulkanException e) when (e.ErrorCode is VulkanNemotronHKvCache.VulkanOutOfDeviceMemory or VulkanNemotronHKvCache.VulkanOutOfHostMemory)
+        {
+            AllocatedBytes = CountBytes();
+            return false;
+        }
+
+        _maxSeqLen = maxLength;
+        AllocatedBytes = CountBytes();
+        VulkanKvCache.RecordGrowth();
+        return true;
+
+        VulkanDevice.Buffer Regrow(VulkanDevice.Buffer old, long newBytes, long keepBytes)
+        {
+            if (old.Size >= newBytes) return old;   // grown already by an earlier, partly refused growth
+            var grown = _device.Allocate(newBytes);
+            if (keepBytes > 0)
+            {
+                try { _device.CopyBufferRangeSynchronous(old, grown, 0, 0, (ulong)keepBytes); }
+                catch { grown.Dispose(); throw; }
+            }
+            old.Dispose();
+            return grown;
+        }
+    }
+
+    private long CountBytes()
+    {
+        long bytes = _kScratch.Size + _vScratch.Size;
+        for (int i = 0; i < _numLayers; i++)
+            bytes += _keyScales[i].Size + _keyQuants[i].Size + _valueScales[i].Size + _valueQuants[i].Size;
+        return bytes;
+    }
+
+    /// <summary>
+    /// Copies rows <c>[0, rows)</c> of every layer from another <see cref="VulkanQuantizedKvCache"/> on the same device with the same
+    /// geometry and K/V types (the #1780 protected-entry seed; the Vulkan side of CUDA's quantized seed, issue #1843): the scale and
+    /// quant blocks are copied as stored, no dequant. False, with this cache unchanged, otherwise or when this cache is too short.
+    /// </summary>
+    public bool TrySeedPrefixFrom(IKvCache source, int rows)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (source is not VulkanQuantizedKvCache src || ReferenceEquals(src, this) || src._disposed) return false;
+        if (!ReferenceEquals(src._device, _device) || src._numLayers != _numLayers || src._stride != _stride
+            || src.KeyDType != KeyDType || src.ValueDType != ValueDType) return false;
+        if (rows <= 0 || rows > src._currentLength || rows > _maxSeqLen) return false;
+        try
+        {
+            for (int i = 0; i < _numLayers; i++)
+            {
+                _device.CopyBufferRangeSynchronous(src._keyScales[i], _keyScales[i], 0, 0, (ulong)ScaleBytes(rows));
+                _device.CopyBufferRangeSynchronous(src._keyQuants[i], _keyQuants[i], 0, 0, (ulong)KeyQuantBytes(rows));
+                _device.CopyBufferRangeSynchronous(src._valueScales[i], _valueScales[i], 0, 0, (ulong)ScaleBytes(rows));
+                _device.CopyBufferRangeSynchronous(src._valueQuants[i], _valueQuants[i], 0, 0, (ulong)ValueQuantBytes(rows));
+            }
+        }
+        catch (VulkanException e) when (e.ErrorCode is VulkanNemotronHKvCache.VulkanOutOfDeviceMemory or VulkanNemotronHKvCache.VulkanOutOfHostMemory)
+        {
+            return false;
+        }
+        _currentLength = rows;
+        return true;
+    }
 
     // IKvCache host overloads are not used on the Vulkan device path.
     /// <inheritdoc/>

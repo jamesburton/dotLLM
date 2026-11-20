@@ -12,6 +12,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// test's async flow) refuses before any driver call, so removing a check makes the constructor reach <c>cuMemAlloc</c> (no driver
 /// here: <see cref="DllNotFoundException"/>; on a CUDA box: an allocation that succeeds), and the test fails either way.
 /// </summary>
+[Collection(CudaCollection.Name)]
 public sealed class CudaAdmissionTests
 {
     private const long MiB = 1L << 20;
@@ -75,12 +76,15 @@ public sealed class CudaAdmissionTests
     }
 
     [Fact]
-    public void QuantizedKvCache_CountsTheFullHistoryDequantScratch_AndIsRefused()
+    public void QuantizedKvCache_CountsOnlyItsBlockBytes_AndIsRefused()
     {
         var q8 = new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0);
-        // q8_0: 1,024 / 32 blocks x 34 B = 1,088 B per K or V row -> 40 x 2,176 = 85 KiB, plus the FP16 K+V dequant scratch over
-        // the whole history at the widest stride: 2 x 1,024 x 2 B = 4 KiB (#1841's 85 + 4 KiB per token).
-        Assert.Equal(40L * 2 * 1088 + 2 * 1024 * 2, CudaQuantizedKvCache.BytesPerPosition(Twil, q8));
+        // q8_0: 1,024 / 32 blocks x 34 B = 1,088 B per K or V row -> 40 x 2,176 = 85 KiB per token. Since #1850 attention reads the
+        // rows in place, so the 4 KiB/token FP16 K+V dequant scratch #1841 counted is gone.
+        Assert.Equal(40L * 2 * 1088, CudaQuantizedKvCache.BytesPerPosition(Twil, q8));
+        Assert.Equal(85 * 1024, CudaQuantizedKvCache.BytesPerPosition(Twil, q8));
+        var q4 = new KvCacheConfig(KvCacheDType.Q4_0, KvCacheDType.Q4_0);
+        Assert.Equal(40L * 2 * (1024 / 32 * 18), CudaQuantizedKvCache.BytesPerPosition(Twil, q4));
         var windowed = q8 with { MixedPrecisionWindowSize = 64 };
         Assert.Equal(1000 * CudaQuantizedKvCache.BytesPerPosition(Twil, q8) + 40L * 2 * 64 * 1024 * 2,
             CudaQuantizedKvCache.BytesFor(Twil, 1000, windowed));
@@ -230,6 +234,27 @@ public sealed class CudaAdmissionTests
         Assert.Equal(17_408, unchunked.MaxContext);
         Assert.Equal(31_744, chunked.MaxContext);
         Assert.Equal((384 + 300) * MiB, chunked.FixedBytes);
+    }
+
+    [Fact]
+    public void G3ServesOnlyTheF16Cache_SoAQuantizedFitChargesNoPlane()
+    {
+        // #1850: q8_0 / q4_0 read in place, so G3's plane is never used over them. TurboQuant is never served by G3 (#1888): its KV is
+        // codes read in place, not the f16 cache.
+        Assert.True(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32)));
+        Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0)));
+        Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.Q4_0, KvCacheDType.Q4_0)));
+        Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant)));
+
+        // TwIL-8B-shaped q8_0 at the 1,024 chunk, as above: the 384 MiB plane is ~4,700 tokens of q8_0 window.
+        var q8 = new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0);
+        long perToken = CudaTransformerModel.DenseContextBytesPerToken(Twil, q8, 150_000, chunkedPrefill: true);
+        var charged = CudaTransformerModel.FitDenseContext(6000 * MiB, 256 * MiB, 0, 100 * MiB, 400 * MiB, 0,
+            CudaTransformerModel.G3PlaneChargeBytes(true, 1024, 32), perToken, native: 131_072);
+        var notCharged = CudaTransformerModel.FitDenseContext(6000 * MiB, 256 * MiB, 0, 100 * MiB, 400 * MiB, 0,
+            CudaTransformerModel.G3PlaneChargeBytes(CudaTransformerModel.G3ServesKvCache(q8), 1024, 32), perToken, native: 131_072);
+        Assert.True(notCharged.MaxContext - charged.MaxContext >= 4096,
+            $"q8_0 window {notCharged.MaxContext} without the plane vs {charged.MaxContext} with it");
     }
 
     [Fact]
