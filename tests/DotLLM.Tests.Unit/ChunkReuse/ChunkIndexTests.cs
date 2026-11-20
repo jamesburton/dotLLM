@@ -757,6 +757,62 @@ public sealed class ChunkIndexTests : IDisposable
         Assert.Equal(index.ChunksOf("A.txt"), loaded.ChunksOf("A.txt"));
     }
 
+    [Fact]
+    public void ChangedChunkerAlgorithm_SameName_UnchangedText_IsStaleAndReChunked()
+    {
+        var files = new[] { new SourceFile("A.txt", "one\ntwo\nthree\n"), new SourceFile("B.txt", "x\ny\n") };
+        var store = new KeySetStore();
+        string path = Path.Combine(_root, "index-versioned-1.json");
+        Directory.CreateDirectory(_root);
+
+        // Built by algorithm version 1 (one chunk per line), saved, loaded: what a store built before an algorithm change holds.
+        var built = new ChunkIndex(KeyA);
+        built.Update(files, new VersionedChunker(1));
+        foreach (ChunkRef r in built.ChunksOf("A.txt").Concat(built.ChunksOf("B.txt"))) store.Add(r.Key!.Value);
+        built.Save(path);
+        ChunkIndex index = ChunkIndex.Load(path, KeyA);
+        Assert.Equal(3, index.ChunksOf("A.txt").Count);
+
+        // Controls: the same algorithm sees nothing to do, with or without the tree.
+        Assert.True(index.Status(store, files, new VersionedChunker(1).AlgorithmVersion).IsUpToDate);
+        IndexDiff same = index.Update(files, new VersionedChunker(1));
+        Assert.Empty(same.Added);
+        Assert.Empty(same.Removed);
+
+        // Version 2 (same name, same text): every file is stale before the update, re-chunked by it, and up to date after.
+        var v2 = new VersionedChunker(2);
+        StatusReport before = index.Status(store, files, v2.AlgorithmVersion);
+        Assert.False(before.IsUpToDate);
+        Assert.Equal(["A.txt", "B.txt"], before.Files.Where(f => f.State == FileState.Stale).Select(f => f.Path));
+        Assert.False(index.Status(store, null, v2.AlgorithmVersion).IsUpToDate); // also without scanning the tree
+
+        index.Update([files[0]], v2, removeMissingFiles: false); // one file only: the other must stay marked as the old algorithm's
+        Assert.Single(index.ChunksOf("A.txt"));
+        Assert.Equal(2, index.ChunksOf("B.txt").Count);
+        Assert.Equal(["B.txt"], index.Status(store, files, v2.AlgorithmVersion).Files.Where(f => f.State == FileState.Stale).Select(f => f.Path));
+
+        index.Update(files, v2);
+        Assert.Single(index.ChunksOf("B.txt"));
+        index.Save(path);
+        ChunkIndex reloaded = ChunkIndex.Load(path, KeyA);
+        Assert.DoesNotContain(reloaded.Status(store, files, v2.AlgorithmVersion).Files, f => f.State == FileState.Stale); // the version round-trips
+        Assert.Empty(reloaded.Update(files, v2).Added);
+    }
+
+    /// <summary>One name, two algorithms: version 1 cuts one chunk per line, version 2 one chunk per file.</summary>
+    private sealed class VersionedChunker(int version) : IChunker
+    {
+        public string Name => "versioned-1";
+        public int MaxChunkTokens => int.MaxValue;
+        public int AlgorithmVersion => version;
+        public IReadOnlyList<Chunk> Chunk(SourceFile file)
+        {
+            if (version == 1) return new LineChunker().Chunk(file);
+            int lines = file.Text.Count(c => c == '\n');
+            return file.Text.Length == 0 ? [] : [new Chunk(file.Path, 1, Math.Max(1, lines), file.Text.Select(c => (int)c).ToArray()) { StartOffset = 0, EndOffset = file.Text.Length }];
+        }
+    }
+
     /// <summary>One chunk per line (a chunker that is neither symbol nor fixed).</summary>
     private sealed class LineChunker : IChunker
     {

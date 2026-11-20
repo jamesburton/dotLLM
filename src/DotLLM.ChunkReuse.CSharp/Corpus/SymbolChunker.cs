@@ -33,6 +33,9 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// </remarks>
 public sealed partial class SymbolChunker : IChunker
 {
+    /// <summary>2: unstable edges between wire-eligible chunks move to a token-stable line start (<see cref="ChunkBoundary"/>); 1 cut at member edges only.</summary>
+    public int AlgorithmVersion => 2;
+
     /// <summary>Parse options for corpus code: the newest language version, no preprocessor symbols.</summary>
     public static readonly CSharpParseOptions ParseOptions = new(LanguageVersion.Preview, DocumentationMode.Parse);
 

@@ -125,8 +125,9 @@ public sealed record StatusReport(IReadOnlyList<FileStatus> Files, int TotalChun
 /// A file whose text hash and chunker are unchanged is not re-chunked. A changed file is re-chunked and its new chunks are
 /// matched to its old ones by key (as a multiset), so with symbol chunks an edit inside one method changes that method's chunk
 /// only, and with fixed-size chunks an edit that changes the token count re-keys every chunk from the edit point to the end of
-/// the file. The chunker's identity is its <see cref="IChunker.Name"/> only: a chunker whose algorithm changes must change its
-/// name, or files with unchanged text keep their old boundaries.
+/// the file. The chunker's identity is its <see cref="IChunker.Name"/> and, per file, its
+/// <see cref="IChunker.AlgorithmVersion"/>: a file chunked by another version of the same chunker is re-chunked on the next
+/// update even when its text is unchanged, and <see cref="Status"/> reports it stale until then.
 /// </para>
 /// <para>
 /// <b>Paths</b> are normalised (<see cref="NormalizePath"/>): relative, '/' separated, no <c>.</c> or <c>..</c> segments;
@@ -554,7 +555,7 @@ public sealed partial class ChunkIndex
             if (old is not null) file = file with { Path = old.Path };
 
             string hash = HashText(file.Text);
-            if (old is not null && sameChunker && old.TextHash == hash && !old.Legacy)
+            if (old is not null && sameChunker && old.TextHash == hash && !old.Legacy && old.AlgorithmVersion == chunker.AlgorithmVersion)
             {
                 plan.Add((path, old, old));
                 continue;
@@ -567,7 +568,7 @@ public sealed partial class ChunkIndex
             if (problem is not null)
                 throw new InvalidOperationException($"Chunker '{chunker.Name}' produced chunks that do not tile '{file.Path}': {problem}. "
                     + "An index needs chunks that cover the file in order, from offset 0 to its end, without gaps or overlaps.");
-            plan.Add((path, old, new FileEntry(file.Path, hash, chunks)));
+            plan.Add((path, old, new FileEntry(file.Path, hash, chunks) { AlgorithmVersion = chunker.AlgorithmVersion }));
         }
 
         // Phase 2: apply.
@@ -720,8 +721,9 @@ public sealed partial class ChunkIndex
     /// </summary>
     /// <param name="store">The store.</param>
     /// <param name="currentFiles">The current tree, or null to check the store only.</param>
+    /// <param name="chunkerAlgorithmVersion">The <see cref="IChunker.AlgorithmVersion"/> a build would use now; a file chunked by another version is reported stale (with or without <paramref name="currentFiles"/>). Null: not checked.</param>
     /// <returns>The report.</returns>
-    public StatusReport Status(IChunkStore store, IReadOnlyList<SourceFile>? currentFiles = null)
+    public StatusReport Status(IChunkStore store, IReadOnlyList<SourceFile>? currentFiles = null, int? chunkerAlgorithmVersion = null)
     {
         ArgumentNullException.ThrowIfNull(store);
         Dictionary<string, SourceFile>? current = null;
@@ -755,8 +757,11 @@ public sealed partial class ChunkIndex
                 missingChunks++;
                 missingTokens += r.TokenCount ?? 0;
             }
-            FileState state = current is null ? FileState.Indexed
+            // Chunked by another version of the chunker's algorithm: its boundaries are not the ones a build would cut now.
+            bool otherAlgorithm = chunkerAlgorithmVersion is int expected && entry.AlgorithmVersion != expected;
+            FileState state = current is null ? (otherAlgorithm ? FileState.Stale : FileState.Indexed)
                 : !current.TryGetValue(path, out SourceFile? now) ? FileState.Deleted
+                : otherAlgorithm ? FileState.Stale
                 : HashText(now.Text) != entry.TextHash ? FileState.Stale
                 : FileState.Indexed;
             if (state != FileState.Indexed || missing.Count > 0) report.Add(new FileStatus(entry.Path, state, missing));
@@ -809,6 +814,7 @@ public sealed partial class ChunkIndex
             {
                 Path = f.Path,
                 Sha256 = f.TextHash,
+                ChunkerVersion = f.AlgorithmVersion == 1 ? null : f.AlgorithmVersion, // absent = 1, so older readers and files are unchanged
                 Chunks = f.Chunks.Select(r => (ChunkDocument?)new ChunkDocument
                 {
                     StartLine = r.StartLine, EndLine = r.EndLine, StartOffset = r.StartOffset, EndOffset = r.EndOffset,
@@ -928,7 +934,7 @@ public sealed partial class ChunkIndex
                 KeyHex = c.Key,
                 WireEligible = c.WireEligible ?? true,
             }).ToList();
-            index._files[norm] = new FileEntry(norm, f.Sha256!, chunks) { Legacy = legacy };
+            index._files[norm] = new FileEntry(norm, f.Sha256!, chunks) { Legacy = legacy, AlgorithmVersion = f.ChunkerVersion ?? 1 };
             foreach (ChunkRef r in chunks) index.AddRef(r.KeyHex!);
         }
         index.ChunkerName = doc.Chunker;
@@ -1062,6 +1068,9 @@ public sealed partial class ChunkIndex
     {
         /// <summary>Loaded from an index written before Phase I Task 5: re-chunked on the next update even if unchanged.</summary>
         public bool Legacy { get; init; }
+
+        /// <summary>The <see cref="IChunker.AlgorithmVersion"/> that cut these chunks (1 when the index file records none).</summary>
+        public int AlgorithmVersion { get; init; } = 1;
     }
 
     internal sealed class IndexDocument
@@ -1076,6 +1085,7 @@ public sealed partial class ChunkIndex
     {
         public string? Path { get; set; }
         public string? Sha256 { get; set; }
+        public int? ChunkerVersion { get; set; }
         public List<ChunkDocument?>? Chunks { get; set; }
     }
 

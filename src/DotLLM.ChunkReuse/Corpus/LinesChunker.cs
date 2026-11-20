@@ -25,6 +25,9 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// </remarks>
 public sealed class LinesChunker : IChunker
 {
+    /// <summary>2: cuts moved to token-stable edges (<see cref="ChunkBoundary"/>); 1 was the greedy line cut.</summary>
+    public int AlgorithmVersion => 2;
+
     private readonly ITokenizer _tokenizer;
 
     /// <summary>Creates the chunker.</summary>
