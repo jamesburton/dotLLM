@@ -4805,6 +4805,37 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         && headDim > 0 && headDim <= 256 && (headDim & (headDim - 1)) == 0;
 
     /// <summary>
+    /// The in-place TurboQuant kernels this host needs, all loaded: encode, the Q / O rotations and the code-space attention
+    /// (#1892). Pure over the four flags so a test can drive each one.
+    /// </summary>
+    internal static bool InPlaceTurboQuantKernelsLoaded(bool encode, bool rotateQ, bool rotateO, bool attention)
+        => encode && rotateQ && rotateO && attention;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// True when the request is both-side MSE TurboQuant on a geometry in-place TurboQuant serves
+    /// (<see cref="TurboQuantInPlaceSupport.Eligible"/>), this host is the dense F16 chain (not MLA, whose attention keeps its own
+    /// cache, nor the F32 Gemma-4 forward) and every kernel of the forward is loaded: a missing or stale PTX is a refusal here, at
+    /// startup, not an exception mid-forward.
+    /// </remarks>
+    public bool SupportsInPlaceTurboQuant(KvCacheConfig kv)
+        => TurboQuantInPlaceSupport.Eligible(kv, Config)
+           && _weights.MlaLayers is null && !_isGemma4
+           && InPlaceTurboQuantKernelsLoaded(_kernels.TurboQuantF16Available, _kernels.TqRotateAvailable, _kernels.TqRotateOF16Available,
+               _kernels.HasAttentionKvTq);
+
+    private string DescribeInPlaceTurboQuantRefusal(KvCacheConfig kv)
+    {
+        if (kv.IsTurboQuantMixed) return $"TurboQuant KV must be used for both K and V (got K={kv.KeyDType}, V={kv.ValueDType}); mixed pairs arrive in #1895.";
+        if (kv.TurboQuantUseQjl) return "TurboQuant with QJL (tq*q) does not run on CUDA yet (#1894).";
+        if (kv.MixedPrecisionWindowSize > 0) return "TurboQuant KV has no original-space window: drop --cache-window.";
+        if (_weights.MlaLayers is not null) return "TurboQuant KV is not supported on CUDA MLA models: the MLA attention keeps its own cache (#1899, #1900).";
+        if (!TurboQuantInPlaceSupport.Eligible(kv, Config))
+            return $"TurboQuant KV needs a uniform KV width and a power-of-two head dim of at most {TurboQuantInPlaceSupport.MaxHeadDim} (#1897, #1898); this model has head dim {Config.HeadDim}.";
+        return "In-place TurboQuant KV needs turboquant.ptx, turboquant_rotate.ptx and attention_kvtq.ptx; one is missing or stale (#1892).";
+    }
+
+    /// <summary>
     /// Creates a KV-cache with optional quantization for this model.
     /// Returns <see cref="CudaQuantizedKvCache"/> when quantization is configured,
     /// otherwise a standard <see cref="CudaKvCache"/>.
@@ -4813,8 +4844,12 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     {
         _context.MakeCurrent();
         var geom = Core.Attention.KvGeometry.FromConfig(Config);
-        if (UsesInPlaceTurboQuant(config, geom, Config.HeadDim))
+        if (config.IsTurboQuantAny)
         {
+            // #1892: a TurboQuant request is served in place or refused, never by the F16 cache below (which a request this host
+            // cannot run - mixed, V-only, QJL, an odd head dim, a missing kernel - used to reach, because IsQuantized excludes it).
+            if (!SupportsInPlaceTurboQuant(config))
+                throw new NotSupportedException(DescribeInPlaceTurboQuantRefusal(config));
             // #1892: both-side TurboQuant (MSE stage) is stored as codes + norms and never decoded into a history. K and V
             // rotations use independent seeds (V = seed ^ TurboQuantCodec.VSeedMask), as the scratch oracle and the CPU cache do.
             var codecK = new Engine.KvCache.Codecs.TurboQuantCodec(Config.HeadDim, config.TurboQuantBits, config.TurboQuantSeed);
@@ -4948,9 +4983,19 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <param name="kv">KV storage types.</param>
     /// <param name="activationBytesPerToken">Forward scratch bytes per token (<see cref="CudaForwardState.ActivationBytesPerToken"/>).</param>
     /// <param name="chunkedPrefill">Whether prefill is chunked (<c>--prefill-chunk-size</c>).</param>
+    /// <param name="headDim">The head dimension; required for TurboQuant, whose cost is its codes plus norms (#1892).</param>
     /// <returns>Bytes per token.</returns>
-    internal static long DenseContextBytesPerToken(KvGeometry geometry, KvCacheConfig kv, long activationBytesPerToken, bool chunkedPrefill)
+    internal static long DenseContextBytesPerToken(KvGeometry geometry, KvCacheConfig kv, long activationBytesPerToken, bool chunkedPrefill,
+        int headDim = 0)
     {
+        if (kv.IsTurboQuantAny)
+        {
+            // #1892: the in-place cache holds codes + norms, so that is what a token costs - not the F16 figure this used to charge.
+            if (headDim <= 0 || !geometry.IsUniform)
+                throw new ArgumentException("TurboQuant sizing needs the head dim and a uniform geometry.", nameof(headDim));
+            var layout = new TurboQuantLayout(headDim, geometry.UniformStride / headDim, kv.TurboQuantBits, TurboQuantLayout.DefaultNorm);
+            return layout.KvBytesPerPosition(geometry.LayerCount) + (chunkedPrefill ? 0 : activationBytesPerToken);
+        }
         bool blockQuant = kv.IsQuantized
             && kv.KeyDType is KvCacheDType.Q8_0 or KvCacheDType.Q4_0 or KvCacheDType.F32
             && kv.ValueDType is KvCacheDType.Q8_0 or KvCacheDType.Q4_0 or KvCacheDType.F32;
@@ -4990,7 +5035,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
             CudaAdmission.QueryFreeBytes(), CudaAdmission.ReserveBytes, _state.PendingLazyScratchBytes, _state.SequenceBytes, chunkScratch,
             g3PlaneHeldBytes: _g3Attention.PlaneElems * CudaG3Attention.ScratchBytesPerElement,
             g3PlaneMaxBytes: G3PlaneChargeBytes(g3Serves && _g3Attention.MayRun, prefillChunkTokens, Config.NumAttentionHeads),
-            perTokenBytes: DenseContextBytesPerToken(KvGeometry.FromConfig(Config), kv, _state.ActivationBytesPerToken, chunked),
+            perTokenBytes: DenseContextBytesPerToken(KvGeometry.FromConfig(Config), kv, _state.ActivationBytesPerToken, chunked, Config.HeadDim),
             NativeMaxSequenceLength);
     }
 

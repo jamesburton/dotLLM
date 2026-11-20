@@ -168,6 +168,9 @@ internal sealed class VulkanGptOssKernels : IDisposable
         return new VulkanGptOssKernels(attn, swi, bias, topk, mx, yarn, attnF16, block);
     }
 
+    /// <summary>Whether the reference sink kernel's TurboQuant twin is built (#1892).</summary>
+    public bool HasTurboQuantSinks => _attnSinksTq is not null;
+
     /// <summary>
     /// Builds the TurboQuant twin of the reference sink kernel for <paramref name="tq"/> (issue #1892); a no-op when it already
     /// exists for that layout. Must not run while a forward is recording.

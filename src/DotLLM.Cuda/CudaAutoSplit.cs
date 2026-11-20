@@ -78,11 +78,12 @@ public static class CudaAutoSplit
     /// <param name="igpuProbe">Finds an iGPU for the tail, called only when the model does not fit the dGPU; null for none.</param>
     /// <param name="log">Receives the placement line and its reason.</param>
     /// <param name="prefillChunkTokens">The <c>--prefill-chunk-size</c> value (0 = <see cref="DefaultSplitPrefillChunk"/>).</param>
+    /// <param name="kv">The requested KV storage, so the plan charges a TurboQuant cache its real bytes (#1892); null = F16.</param>
     /// <returns>The model, its KV factory, and the plan (null when no split was considered).</returns>
     /// <exception cref="DeviceMemoryAdmissionException">Not even one layer fits on the dGPU.</exception>
     public static (IModel Model, Func<int, IKvCache> KvCacheFactory, LayerSplitPlan? Plan) Load(
         GgufFile gguf, ModelConfig config, int deviceId, ThreadingConfig threading, MoeOffloadOptions? moeOffload,
-        Func<IgpuTier?>? igpuProbe, Action<string>? log, int prefillChunkTokens = 0)
+        Func<IgpuTier?>? igpuProbe, Action<string>? log, int prefillChunkTokens = 0, KvCacheConfig? kv = null)
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
@@ -105,7 +106,7 @@ public static class CudaAutoSplit
         }
 
         int chunk = SplitPrefillChunk(prefillChunkTokens);
-        var input = BuildInput(config, m, free, CudaAdmission.ReserveBytes, ctx, igpu: null, chunk);
+        var input = BuildInput(config, m, free, CudaAdmission.ReserveBytes, ctx, igpu: null, chunk, kv);
         var plan = LayerSplitPlanner.Plan(input);
         if (!plan.AllOnDgpu && plan.DgpuLayers > 0 && igpuProbe?.Invoke() is { } igpu)
             plan = LayerSplitPlanner.Plan(input with { Igpu = igpu });
@@ -149,19 +150,29 @@ public static class CudaAutoSplit
     /// <param name="ctx">Planned context.</param>
     /// <param name="igpu">iGPU tier or null.</param>
     /// <param name="prefillChunk">Tokens per prefill forward: the forward scratch is reserved for this many (at most the context).</param>
+    /// <param name="kv">The requested KV storage; TurboQuant is charged its real bytes (#1892). Null = F16.</param>
     /// <returns>The input.</returns>
     internal static LayerSplitInput BuildInput(ModelConfig config, Measurement m, long freeBytes, long reserveBytes, int ctx, IgpuTier? igpu,
-        int prefillChunk = DefaultSplitPrefillChunk)
+        int prefillChunk = DefaultSplitPrefillChunk, KvCacheConfig? kv = null)
         => new(freeBytes, reserveBytes,
             DgpuFixedBytes: m.EmbeddingBytes + m.PendingLazyBytes,
             LayerWeightBytes: m.LayerBytes,
-            KvBytesPerTokenPerLayer: CudaKvCache.BytesFor(KvGeometry.FromConfig(config), 1) / Math.Max(1, config.NumLayers),
+            KvBytesPerTokenPerLayer: KvBytesPerTokenPerLayer(config, kv),
             ContextTokens: ctx,
             ActivationBytesPerToken: m.ActivationBytesPerToken,
             // A split's prefill runs in chunks (SplitPrefillChunk), so the forward state grows to the chunk, not the context.
             ActivationTokens: Math.Min(ctx, Math.Max(1, prefillChunk)),
             HeadBytes: m.HeadBytes,
             Igpu: igpu);
+
+    /// <summary>
+    /// dGPU KV bytes per context token per layer the plan charges (#1892): F16 K and V, or for TurboQuant the real codes plus norms
+    /// (<see cref="TurboQuantInPlaceSupport.KvBytesPerToken"/>), never the F16 figure.
+    /// </summary>
+    internal static long KvBytesPerTokenPerLayer(ModelConfig config, KvCacheConfig? kv)
+        => kv is { IsTurboQuantAny: true } tq
+            ? TurboQuantInPlaceSupport.KvBytesPerToken(config, tq) / Math.Max(1, KvGeometry.SlotCount(config))
+            : CudaKvCache.BytesFor(KvGeometry.FromConfig(config), 1) / Math.Max(1, config.NumLayers);
 
     /// <summary>
     /// Brings up the CUDA runtime and the hybrid's fixed forward buffers exactly as <see cref="HybridTransformerModel.LoadFromGguf"/>

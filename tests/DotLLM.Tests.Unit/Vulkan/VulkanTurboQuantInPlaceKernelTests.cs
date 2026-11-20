@@ -1047,18 +1047,24 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
     /// write 65535 head vectors), and for one pass (0) otherwise.
     /// </summary>
     [SkippableTheory]
-    [InlineData(4, 2, 32)]
-    [InlineData(32, 32, 16)]
-    public void PreferredPrefillChunk_IsTheTurboQuantForwardBound(int heads, int kvHeads, int hd)
+    [InlineData(4, 2, 32, 32767)]    // the encode grid binds: floor(65535 / 2)
+    [InlineData(32, 32, 16, 2047)]   // the encode grid binds: floor(65535 / 32)
+    [InlineData(32, 1, 32, 32752)]   // GQA ratio 32: the flash twin's ceil(rows / 16) x 32 groups bind, not the encode (65535 / 1)
+    public void PreferredPrefillChunk_IsTheTurboQuantForwardBound(int heads, int kvHeads, int hd, int expected)
         => WithSyntheticModel(layers: 1, heads, kvHeads, hd, hidden: 64, vocab: 128, maxSeq: 256, (model, config, spvDir) =>
         {
             Assert.Equal(0, model.PreferredPrefillChunkTokens);
+            Assert.Equal(0, model.MaxPrefillForwardTokens);
             var ck = new TurboQuantCodec(hd, 4, Seed, useQjl: false);
             var cv = new TurboQuantCodec(hd, 4, Seed ^ VSeedXor, useQjl: false);
             Assert.True(model.TryUseInPlaceTurboQuantKv(spvDir, 4, ck.Centroids, ck.RotationSigns, cv.RotationSigns, ck.InvSqrtD));
-            Assert.Equal(65535 / kvHeads, model.PreferredPrefillChunkTokens);
+            Assert.Equal(expected, model.PreferredPrefillChunkTokens);
+            Assert.Equal(expected, model.MaxPrefillForwardTokens);   // the same bound is the hard limit the engine clamps to
             Assert.True((long)model.PreferredPrefillChunkTokens * kvHeads <= VulkanTransformerModel.MaxTurboQuantVectorsPerForward);
-            Assert.True((long)(model.PreferredPrefillChunkTokens + 1) * kvHeads > VulkanTransformerModel.MaxTurboQuantVectorsPerForward);
+            // The flash twin's X groups, ceil(rows / 16) x heads, stay inside the dispatch limit at the bound and not one row above it.
+            Assert.True((long)((model.PreferredPrefillChunkTokens + 15) / 16) * heads <= 65535);
+            Assert.True(((long)(model.PreferredPrefillChunkTokens + 1) * kvHeads > 65535)
+                        || (long)((model.PreferredPrefillChunkTokens + 16) / 16) * heads > 65535, "the bound is not tight");
         });
 
     /// <summary>
@@ -1095,8 +1101,15 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
                 Assert.True(Math.Abs(a.Logprobs[i].Logprob - b.Logprobs![i].Logprob) < 2e-2,
                     $"token {i}: logprob {a.Logprobs[i].Logprob:R} by preference vs {b.Logprobs[i].Logprob:R} with 512-row chunks");
 
-            // The last-resort guard is still there: an explicit chunk size above the bound overrides the preference and is refused.
+            // #1892: an explicit chunk size above the bound is CLAMPED to it (with one log line), not refused: it used to override the
+            // preference and meet the guard in Forward. 0 (one pass) becomes the bound too, so no engine path hands the model a whole prompt.
             var tooBig = new TextGenerator(model, new CharTokenizer(), (_, size) => model.CreateKvCache(size), mtpEnabled: false, prefillChunkSize: cap + 1);
-            Assert.Throws<NotSupportedException>(() => tooBig.Generate(prompt, opts));
+            Assert.Equal(cap, tooBig.EffectivePrefillChunkSize);
+            var c = tooBig.Generate(prompt, opts);
+            Assert.Equal(a.GeneratedTokenIds, c.GeneratedTokenIds);
+            // The last-resort guard in Forward is still there for a caller that bypasses the generator.
+            using var direct = model.CreateKvCache(prompt.Length + 8);
+            var ids = new CharTokenizer().Encode(prompt).ToArray();
+            Assert.Throws<NotSupportedException>(() => model.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), -1, direct));
         });
 }

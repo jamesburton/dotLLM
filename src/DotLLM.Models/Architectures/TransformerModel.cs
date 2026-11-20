@@ -942,6 +942,14 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     /// <remarks>Every cached read goes through <see cref="AttendCachedF32"/> or the quantized kernel, which both apply the row base.</remarks>
     public bool SupportsCompactSlidingKv => true;
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Every attention arm of this host goes through <see cref="AttendQuantizedKv"/>, which reads a <see cref="ITurboQuantKvCache"/> in
+    /// place in code space, so the host-independent geometry check is the whole answer. MLA layers keep their own latent KV and are
+    /// refused by it (#1899); the other host classes (hybrids, recurrent, Qwen4Exp) keep the interface default (#1900).
+    /// </remarks>
+    public bool SupportsInPlaceTurboQuant(KvCacheConfig kv) => TurboQuantInPlaceSupport.Eligible(kv, Config);
+
     /// <summary>
     /// Causal attention of <paramref name="seqQ"/> queries over the F32 rows cached for <paramref name="cacheLayer"/>,
     /// or over an <see cref="IPagedKvCache"/>'s blocks in place (F16/Q8_0, no staging). Applies a compact sliding-window cache's row base (<see cref="IWindowedKvCache"/>, #1169): the kernel sees rows

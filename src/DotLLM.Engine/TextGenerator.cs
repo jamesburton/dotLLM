@@ -335,9 +335,24 @@ public sealed partial class TextGenerator
 
     /// <summary>
     /// Chunk size the prompt prefill actually uses: the configured <see cref="PrefillChunkSize"/>, else the model's
-    /// <see cref="IModel.PreferredPrefillChunkTokens"/> (0 = one forward pass).
+    /// <see cref="IModel.PreferredPrefillChunkTokens"/> (0 = one forward pass), never above the model's hard
+    /// <see cref="IModel.MaxPrefillForwardTokens"/> (#1892: a configured size above it is clamped, with one log line; 0 becomes it).
     /// </summary>
-    internal int EffectivePrefillChunkSize => _prefillChunkSize > 0 ? _prefillChunkSize : Math.Max(0, _model.PreferredPrefillChunkTokens);
+    internal int EffectivePrefillChunkSize
+    {
+        get
+        {
+            int chunk = PrefillChunkBound.Resolve(_prefillChunkSize, _model.PreferredPrefillChunkTokens, _model.MaxPrefillForwardTokens, out bool clamped);
+            if (clamped && !_loggedPrefillClamp)
+            {
+                _loggedPrefillClamp = true;
+                Console.Error.WriteLine(PrefillChunkBound.ClampMessage(_prefillChunkSize, chunk));
+            }
+            return chunk;
+        }
+    }
+
+    private bool _loggedPrefillClamp;
 
     /// <summary>
     /// Generates text from the given prompt using the specified options.

@@ -1,12 +1,13 @@
 using DotLLM.Cli.Helpers;
+using DotLLM.Core.Configuration;
 using DotLLM.Server;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Cli;
 
 /// <summary>
-/// #1888: <c>run</c> and <c>chat</c> had no TurboQuant branch at all, dropped the bit width at parse time and served tq with the default
-/// cache. Until #1887 step 2 they refuse every TurboQuant form before the model loads.
+/// #1888, inverted by #1892: <c>run</c>, <c>chat</c> and <c>bench</c> run TurboQuant in place like <c>serve</c>. What is still refused before
+/// the model loads is what the flags alone decide: mixed formats, QJL on a named GPU, <c>--cache-window</c>, the paged cache.
 /// </summary>
 public class CliTurboQuantRefusalTests
 {
@@ -14,36 +15,82 @@ public class CliTurboQuantRefusalTests
     [InlineData("tq4", "tq4")]
     [InlineData("tq4q", "tq4q")]
     [InlineData("turboquant", "turboquant")]
+    [InlineData("tq2", "tq2")]
+    [InlineData("tq8", "tq8")]
+    public void Run_Chat_Bench_TurboQuant_IsNoLongerRefusedBeforeLoad(string k, string v)
+    {
+        foreach (var command in new[] { KvCommand.Run, KvCommand.Chat, KvCommand.Bench })
+            Assert.Null(KvStorageCli.TurboQuantRefusal(command, k, v));
+    }
+
+    [Theory]
     [InlineData(null, "tq4")]
     [InlineData("tq4", null)]
-    public void Run_TurboQuant_IsRefused_BeforeLoad(string? k, string? v)
+    [InlineData("tq3", "tq4")]
+    [InlineData("tq4", "tq4q")]
+    public void MixedOrOneSidedTq_IsRefused_BeforeLoad(string? k, string? v)
     {
         string? reason = KvStorageCli.TurboQuantRefusal(KvCommand.Run, k, v);
         Assert.NotNull(reason);
-        Assert.Contains("#1887", reason);
+        Assert.Contains("#1895", reason);
     }
 
     [Fact]
-    public void Run_Tq4_PointsAtTheRealPath()
-        => Assert.Contains("dotllm serve --device cpu --no-paged", KvStorageCli.TurboQuantRefusal(KvCommand.Run, "tq4", "tq4"));
+    public void CacheWindow_WithTq_IsRefused_BeforeLoad_ForRunAndChat()
+    {
+        foreach (var command in new[] { KvCommand.Run, KvCommand.Chat })
+        {
+            string? reason = KvStorageCli.TurboQuantRefusal(command, "tq4", "tq4", cacheWindow: 32);
+            Assert.NotNull(reason);
+            Assert.Contains("--cache-window 32", reason);
+        }
+    }
+
+    [Theory]
+    [InlineData("vulkan")]
+    [InlineData("gpu:0")]
+    public void Tq4q_OnANamedGpu_IsRefused_BeforeLoad(string device)
+    {
+        string? reason = KvStorageCli.TurboQuantRefusal(KvCommand.Run, "tq4q", "tq4q", device: device);
+        Assert.NotNull(reason);
+        Assert.Contains("#1894", reason);
+        Assert.Null(KvStorageCli.TurboQuantRefusal(KvCommand.Run, "tq4q", "tq4q", device: "cpu"));
+        Assert.Null(KvStorageCli.TurboQuantRefusal(KvCommand.Run, "tq4q", "tq4q", device: "auto"));
+    }
 
     [Fact]
-    public void Chat_Tq4_IsRefused_BeforeLoad()
-        => Assert.Contains("dotllm serve --device cpu --no-paged", KvStorageCli.TurboQuantRefusal(KvCommand.Chat, "tq4", "tq4"));
+    public void Paged_WithTq_IsRefused_BeforeLoad()
+        => Assert.Contains("--no-paged", KvStorageCli.TurboQuantRefusal(KvCommand.Chat, "tq4", "tq4", paged: true));
 
     [Theory]
     [InlineData(null, null)]
     [InlineData("q8_0", "q8_0")]
     [InlineData("f16", "q4_0")]
     public void Run_NonTurboQuant_IsNotRefused(string? k, string? v)
-        => Assert.Null(KvStorageCli.TurboQuantRefusal(KvCommand.Run, k, v));
+        => Assert.Null(KvStorageCli.TurboQuantRefusal(KvCommand.Run, k, v, cacheWindow: 16));
 
     [Fact]
     public void Run_UnknownKvType_IsLeftToTheFlagParser()
         => Assert.Null(KvStorageCli.TurboQuantRefusal(KvCommand.Run, "bogus", null));
+
+    [Theory]
+    [InlineData("tq3", 3, false)]
+    [InlineData("tq8", 8, false)]
+    [InlineData("tq4q", 4, true)]
+    [InlineData("tq", 4, false)]
+    public void BuildKvConfig_KeepsBitsAndQjl_PerSide(string flag, int bits, bool qjl)
+    {
+        // run / chat / bench used to build `new KvCacheConfig(Key, Value, window)` and drop both.
+        Assert.True(KvStorageCli.TryBuild(flag, flag, null, null, 0, out var request, out _));
+        var kv = KvStorageCli.BuildKvConfig(request, 0, out string? mismatch);
+        Assert.Null(mismatch);
+        Assert.Equal(KvCacheDType.TurboQuant, kv.KeyDType);
+        Assert.Equal(bits, kv.TurboQuantBits);
+        Assert.Equal(qjl, kv.TurboQuantUseQjl);
+    }
 }
 
-/// <summary>#1888: the real command tree refuses before resolving or loading the model (kills a removed call site in run / chat).</summary>
+/// <summary>#1888 / #1892: the real command tree refuses before resolving or loading the model (kills a removed call site in run / chat).</summary>
 [Collection(CliConsoleCollection.Name)]
 public sealed class CliTurboQuantCommandTests
 {
@@ -65,19 +112,29 @@ public sealed class CliTurboQuantCommandTests
     }
 
     [Fact]
-    public void Run_Tq4_ExitsNonZero_WithTheRefusal()
+    public void Run_Tq4_WithCacheWindow_ExitsNonZero_WithTheRefusal()
     {
-        var (code, output) = Run("run", "no-such-model-1888", "-p", "hi", "--cache-type-k", "tq4", "--cache-type-v", "tq4", "--json");
+        var (code, output) = Run("run", "no-such-model-1892", "-p", "hi", "--cache-type-k", "tq4", "--cache-type-v", "tq4", "--cache-window", "16", "--json");
         Assert.NotEqual(0, code);
+        Assert.Contains("--cache-window 16", output);
         Assert.Contains("#1887", output);
     }
 
     [Fact]
-    public void Chat_Tq4_ExitsNonZero_WithTheRefusal()
+    public void Chat_Tq4_WithCacheWindow_ExitsNonZero_WithTheRefusal()
     {
-        var (code, output) = Run("chat", "no-such-model-1888", "--cache-type-k", "tq4", "--cache-type-v", "tq4");
+        var (code, output) = Run("chat", "no-such-model-1892", "--cache-type-k", "tq4", "--cache-type-v", "tq4", "--cache-window", "16");
         Assert.NotEqual(0, code);
-        Assert.Contains("#1887", output);
+        Assert.Contains("--cache-window 16", output);
+    }
+
+    [Fact]
+    public void Run_Tq4_IsNotRefusedBeforeTheModelResolves()
+    {
+        // Used to exit with #1887 before resolving anything; now it reaches model resolution, which fails for a different reason.
+        var (code, output) = Run("run", "no-such-model-1892", "-p", "hi", "--cache-type-k", "tq4", "--cache-type-v", "tq4", "--json");
+        Assert.NotEqual(0, code);
+        Assert.DoesNotContain("does not run TurboQuant", output);
+        Assert.DoesNotContain("--device cpu --no-paged", output);
     }
 }
-

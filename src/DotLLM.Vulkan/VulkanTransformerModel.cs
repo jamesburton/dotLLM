@@ -1102,16 +1102,82 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
 
     /// <inheritdoc/>
     /// <remarks>
-    /// With in-place TurboQuant KV active (issue #1892) a forward may write at most <see cref="MaxTurboQuantVectorsPerForward"/> head
-    /// vectors, so the model asks the engine to prefill in chunks of at most <c>floor(65535 / numKvHeads)</c> rows: a long prompt is
-    /// chunked instead of reaching the guard in <c>Forward</c>. 0 (one pass) otherwise. An explicitly configured larger chunk size
-    /// overrides this preference and then meets that guard.
+    /// With in-place TurboQuant KV active (issue #1892) a forward is bounded by <see cref="MaxTurboQuantRowsPerForward"/> rows, so the
+    /// model asks the engine to prefill in chunks of at most that many: a long prompt is chunked instead of reaching the guard in
+    /// <c>Forward</c>. 0 (one pass) otherwise. It is also the HARD limit <see cref="MaxPrefillForwardTokens"/>, which the engine
+    /// applies to an explicit chunk size and to the scheduler.
     /// </remarks>
     public int PreferredPrefillChunkTokens =>
-        DefaultKvStorage == VulkanKvStorage.Tq ? MaxTurboQuantVectorsPerForward / Config.NumKvHeads : 0;
+        DefaultKvStorage == VulkanKvStorage.Tq ? MaxTurboQuantRowsPerForward(Config.NumAttentionHeads, Config.NumKvHeads) : 0;
+
+    /// <inheritdoc/>
+    public int MaxPrefillForwardTokens => PreferredPrefillChunkTokens;
 
     /// <summary>Head vectors (rows x KV heads) one forward may write to a TurboQuant cache: the guaranteed <c>maxComputeWorkGroupCount</c> per dimension.</summary>
     internal const int MaxTurboQuantVectorsPerForward = 65535;
+
+    /// <summary>
+    /// Rows one TurboQuant forward may take (#1892): the encode dispatches one workgroup per head vector (rows x <paramref name="numKvHeads"/>
+    /// on X), the rotations one workgroup row per query row, and the flash twin's X groups are <c>ceil(rows / 16) x numHeads</c>, each
+    /// bounded by the 65535 workgroups Vulkan guarantees per dimension. So <c>min(65535 / numKvHeads, 16 * (65535 / numHeads))</c>:
+    /// at a GQA ratio of 16 or more the flash grid, not the encode, binds.
+    /// </summary>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="numKvHeads">KV heads.</param>
+    /// <returns>The most rows one forward may take.</returns>
+    internal static int MaxTurboQuantRowsPerForward(int numHeads, int numKvHeads)
+        => Math.Min(MaxTurboQuantVectorsPerForward / numKvHeads, 16 * (MaxTurboQuantVectorsPerForward / numHeads));
+
+    /// <summary>The attention arms of one KV format's twin set, as loaded flags (#1892; pure input to <see cref="TqArmsComplete"/>).</summary>
+    internal readonly record struct TqArms(bool Attention, bool SplitKv, bool Flash, bool Coopmat, bool PrefillGqa, bool QPos, bool QPosTiled,
+        bool SinkFlash, bool SinkReference);
+
+    /// <summary>
+    /// Whether a TurboQuant twin set covers every attention arm its host can dispatch (#1892). Dense chain: the per-token kernel is the
+    /// arm of last resort and must exist, and every arm the F32 chain loaded (<paramref name="baseline"/>: split-KV decode, scalar
+    /// flash, coopmat flash, GQA prefill flash, the two per-query-position arms) must have its twin, so a stale or missing
+    /// <c>_kvtq</c> shader refuses at startup instead of silently running a slower arm. Flint (every layer has sinks): split-KV
+    /// decode, the GQA sink flash and the reference sink kernel. Always needs the encoder and the rotations.
+    /// </summary>
+    /// <param name="flint">The host is Flint's all-sink dispatch.</param>
+    /// <param name="writerAndRotation">The encode writer and the Q / O rotation kernel are built.</param>
+    /// <param name="tq">The TurboQuant twins loaded.</param>
+    /// <param name="baseline">The F32 chain's arms, which the host can dispatch.</param>
+    /// <returns>Whether nothing the host can dispatch lacks a TurboQuant twin.</returns>
+    internal static bool TqArmsComplete(bool flint, bool writerAndRotation, in TqArms tq, in TqArms baseline)
+    {
+        if (!writerAndRotation) return false;
+        if (flint) return tq.SplitKv && tq.SinkFlash && tq.SinkReference;
+        return tq.Attention
+            && (!baseline.SplitKv || tq.SplitKv)
+            && (!baseline.Flash || tq.Flash)
+            && (!baseline.Coopmat || tq.Coopmat)
+            && (!baseline.PrefillGqa || tq.PrefillGqa)
+            && (!baseline.QPos || tq.QPos)
+            && (!baseline.QPosTiled || tq.QPosTiled);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Meaningful only after <see cref="TryUseInPlaceTurboQuantKv"/> succeeded for this request (it builds the twin set; the codec
+    /// constants come from the caller): before that, or after a refused or different-layout call, it is false. Then every arm of the
+    /// host must have its twin (<see cref="TqArmsComplete"/>), and bits and norm format must be the twin set's.
+    /// </remarks>
+    public bool SupportsInPlaceTurboQuant(KvCacheConfig kv)
+    {
+        if (!TurboQuantInPlaceSupport.Eligible(kv, Config)) return false;
+        bool flint = Config.Architecture == DotLLM.Core.Configuration.Architecture.Flint && _gptOss is not null;
+        if (!IsDenseF16KvEligible && !flint) return false;
+        var set = _kvTqSet;
+        if (set.Tq is not { } layout || _tqKv is null || KvStorageOverride != VulkanKvStorage.Tq) return false;
+        if (layout.MseBits != kv.TurboQuantBits || layout.Norm != TurboQuantLayout.DefaultNorm
+            || layout.HeadDim != Config.HeadDim || layout.NumKvHeads != Config.NumKvHeads) return false;
+        var tq = new TqArms(set.Attention is not null, set.SplitKv is not null, set.Flash is not null, set.Coopmat is not null,
+            set.PrefillGqa is not null, set.QPos is not null, set.QPosTiled is not null, set.SinkFlash is not null, _gptOss?.HasTurboQuantSinks == true);
+        var baseline = new TqArms(true, _splitKvAttention is not null, _flashAttention is not null, _flashAttentionCoopmat is not null,
+            _prefillGqaFlash is not null, _attentionQPos is not null, _attentionQPosTiled is not null, false, false);
+        return TqArmsComplete(flint, set.HasWriter, tq, baseline);
+    }
 
     /// <summary>Count of attention dispatches that ran in TurboQuant code space: query rotated in, <c>_kvtq</c> twin, output rotated out (#1892; test/diagnostic).</summary>
     public long TurboQuantAttentionCount { get; private set; }
@@ -4817,9 +4883,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         // The encode dispatches one workgroup per head vector (rows x numKvHeads on X) and the Q / O rotations one workgroup row per query
         // row (Y): both are bounded by the 65535 workgroups Vulkan guarantees per dimension. Refuse rather than record a dispatch the
         // device may clip.
-        if (_fwdKvStorage == VulkanKvStorage.Tq && (long)seqLen * Config.NumKvHeads > MaxTurboQuantVectorsPerForward)
+        if (_fwdKvStorage == VulkanKvStorage.Tq && seqLen > MaxTurboQuantRowsPerForward(Config.NumAttentionHeads, Config.NumKvHeads))
             throw new NotSupportedException(
-                $"A TurboQuant KV forward takes at most {MaxTurboQuantVectorsPerForward / Config.NumKvHeads} rows on this model ({Config.NumKvHeads} KV heads); got {seqLen}. Chunk the prefill.");
+                $"A TurboQuant KV forward takes at most {MaxTurboQuantRowsPerForward(Config.NumAttentionHeads, Config.NumKvHeads)} rows on this model " +
+                $"({Config.NumAttentionHeads} heads, {Config.NumKvHeads} KV heads); got {seqLen}. Chunk the prefill.");
 
         DpBegin(seqLen);
 
