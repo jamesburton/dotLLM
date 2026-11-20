@@ -249,6 +249,39 @@ public sealed class ChunkStoreServerTests : IDisposable
     /// The second request with a chunk queues it; the worker stores exactly the CLI's entry for it (same ids, K/V bit for bit,
     /// fingerprint, backend tag <c>cpu</c>) with a ledger row in the default namespace; the next shadow request hits it.
     /// </summary>
+    /// <summary>
+    /// The backend is part of the key: an entry this CPU server wrote is a hit for it and a miss for a server whose identity
+    /// differs only in the backend tag (what a Vulkan server over the same store sees), on the same store and request.
+    /// </summary>
+    [Fact]
+    public async Task EntryWrittenByOneBackend_IsAMissForAnother_SameStoreSameRequest()
+    {
+        string root = NewRoot();
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
+        await server.PostAsync("/v1/chat/completions", Body(Manifest()));
+        await server.PostAsync("/v1/chat/completions", Body(Manifest()));
+        Assert.True(Writer(server).Queue.WaitDrained(Drain));
+        var (_, hit) = await server.PostAsync("/v1/chat/completions", Body(Manifest("shadow")));
+        Assert.Equal(1, Report(hit)["chunks"]!["hit"]!.GetValue<int>());   // control: the writing backend hits
+
+        var runtime = server.State.ChunkCacheRuntime;
+        ServerModelIdentity cpu = runtime.IdentityFor(server.State);
+        runtime.IdentityOverride = ServerModelIdentity.Create(server.State.Config!, cpu.ModelId, cpu.Quantization, cpu.TokenizerId, "vulkan");
+        try
+        {
+            Assert.Equal(cpu.ModelId, runtime.IdentityFor(server.State).ModelId);
+            Assert.NotEqual(cpu.KeyOf([1, 2, 3], ""), runtime.IdentityFor(server.State).KeyOf([1, 2, 3], ""));
+            var (status, other) = await server.PostAsync("/v1/chat/completions", Body(Manifest("shadow")));
+            Assert.Equal(200, status);
+            Assert.Equal(0, Report(other)["chunks"]!["hit"]!.GetValue<int>());
+            Assert.Equal(1, Report(other)["chunks"]!["miss"]!.GetValue<int>());
+        }
+        finally
+        {
+            runtime.IdentityOverride = null;
+        }
+    }
+
     [Fact]
     public async Task EntriesTaggedWithServerBackend()
     {

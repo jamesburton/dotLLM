@@ -834,6 +834,34 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
         Assert.Equal(1L << 30, Long(admin, "budget_bytes"));
     }
 
+    /// <summary>
+    /// The store-wide figures walk every entry file and the route has no slot: the walk is reused for
+    /// <c>StoreFiguresTtl</c> instead of running per call (review I3). Stale by at most that long, never wrong after it.
+    /// </summary>
+    [Fact]
+    public async Task Capabilities_StoreWideFigures_AreWalkedOncePerTtl()
+    {
+        string root = NewStore();
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
+        var runtime = server.State.ChunkCacheRuntime;
+        long Entries() => Long(JsonNode.Parse(server.SendAsync(HttpMethod.Get, "/v1/chunk-cache", null).GetAwaiter().GetResult().Body)!["store"]!, "entries");
+
+        runtime.StoreFiguresTtl = TimeSpan.FromMinutes(10);
+        int walks = runtime.StoreFigureWalks;
+        Assert.Equal(0, Entries());
+        for (int i = 0; i < 5; i++) Assert.Equal(0, Entries());
+        Assert.Equal(walks + 1, runtime.StoreFigureWalks);            // six calls, one walk
+
+        await Store(server, [], (ChunkA, null));
+        Assert.Equal(0, Entries());                                   // inside the TTL: the old figures, and still no new walk
+        Assert.Equal(walks + 1, runtime.StoreFigureWalks);
+
+        runtime.StoreFiguresTtl = TimeSpan.Zero;                      // control: without the cache every call walks and sees the entry
+        Assert.Equal(1, Entries());
+        Assert.Equal(1, Entries());
+        Assert.Equal(walks + 3, runtime.StoreFigureWalks);
+    }
+
     // ------------------------------------------------------------------------------------------------ namespace budget
 
     /// <summary>

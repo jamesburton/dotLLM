@@ -1585,7 +1585,7 @@ surface authenticates even though nothing else does. **Security-sensitive; off u
   makes every caller look local; forwarding headers (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`) are not looked at. A
   local caller of a keyless server is its admin: it sees store-wide figures, may prewarm, dry-run any eviction and forget
   the default namespace (store-wide and cross-namespace deletes still need an `admin` key). **Set
-  `--chunk-cache-api-keys` whenever anything but local processes can reach the server.**
+  `--chunk-cache-api-keys` whenever anything but local processes can reach the server.** An opt-in rule that treats a request with forwarding headers as non-local is proposed in #1914.
 - Namespace isolation covers the chunk store only: the prompt (prefix) cache, `cached_tokens` and `/metrics` are shared
   by every caller, as they always were.
 - Without a keys file: local callers only (loopback remote address, a `localhost` / loopback `Host`, no `Origin`

@@ -184,7 +184,9 @@ request reports `cached_tokens` > 0, and a verified chunk wholly inside that res
   and that warning once (rulings 42; strict: 400) until applied reuse ships. On a model or backend that cannot assemble
   chunks (recurrent or hybrid layers, a diffusion model, a backend other than CPU or Vulkan, a RoPE variant the
   re-rotation does not reproduce, or a model whose identity cannot be computed) every annotation is ignored with
-  `chunk_model_unsupported` (strict: 400); `reason` carries it when the requested policy was not `exact` (ruling 41).
+  `chunk_model_unsupported` (strict: 400); `reason` carries it when the requested policy was not `exact` (ruling 41). A server started with `--tensor-overlay` or
+  `--ternary-adapter` is unsupported too: the model id covers the base GGUF only, so its K/V must not be stored or looked up
+  under the base key (#1915).
   Diffusion models get no report.
 - **Per located span**, in prompt order, at most `MaxPlannedSpans` (1,024) per request:
   1. ids = `ChunkTokenization.Encode(text)` (`EncodeRaw(MarkUntrustedSpecials(text))`, ruling 21);
@@ -477,7 +479,8 @@ The contract's `capabilities.json` shape (`Capabilities_MatchesFixtureShape`), p
   index from `model.id` and `model.producer`: `index-<chunker>.<ModelTag(model.id)>.<producer[..8]>.<ns-or-default>.json`.
   The namespace itself is never in a response; the CLI derives it from its own key (`ChunkNamespace.ForApiKey`), or
   is told the `ns=` name by its operator, or uses `default`.
-- `store` is always an object (ruling 52). With `--chunk-store-write`, a **non-admin** sees its own namespace's figures:
+- `store` is always an object (ruling 52). The store-wide figures come from a walk over the entry files that is reused for 5 s
+  (the route has no slot), so they can be that old. With `--chunk-store-write`, a **non-admin** sees its own namespace's figures:
   `entries` and `bytes` of its ledger rows (what the server wrote for it; a CLI's offline entries are not counted) and
   `budget_bytes` = the per-namespace budget when set, else the store budget. An **admin** sees store-wide figures: every
   entry file in the store (CLI entries and orphans included) and the store budget (`Capabilities_ReportsStoreFigures`).

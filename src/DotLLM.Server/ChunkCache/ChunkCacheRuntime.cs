@@ -247,7 +247,7 @@ internal sealed class ChunkCacheRuntime : IDisposable
             return "no GGUF identity";
         // The model id hashes the base GGUF only. A tensor overlay or a ternary adapter changes the weights every forward runs
         // on, so K/V computed here are not the base model's: under the base key they would be wrong hits for a base server,
-        // the CLI and applied reuse, and base entries would be wrong hits here. Until the identity covers them: no chunk reuse.
+        // the CLI and applied reuse, and base entries would be wrong hits here. Until the identity covers them (#1915): no chunk reuse.
         if (state.Options.TensorOverlayPath is not null || state.Options.TernaryAdapterPaths is { Count: > 0 })
             return "tensor overlay or adapter attached (not part of the model identity)";
         return null;
