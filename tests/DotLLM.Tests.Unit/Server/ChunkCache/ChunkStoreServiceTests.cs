@@ -102,7 +102,7 @@ public sealed class ChunkStoreServiceTests : IDisposable
         return root;
     }
 
-    private ChunkStoreService Start(string root, FakeHost host, long budget = 1L << 30, bool indexOnly = false, IChunkStore? store = null,
+    private ChunkStoreService Start(string root, IChunkEncodeHost host, long budget = 1L << 30, bool indexOnly = false, IChunkStore? store = null,
         TimeProvider? time = null)
     {
         var options = new ChunkCacheOptions(true, ChunkCacheOptions.DefaultMaxChunks, root, null, StoreWrite: true, StoreBudgetBytes: budget, StoreIndexOnly: indexOnly);
@@ -352,6 +352,65 @@ public sealed class ChunkStoreServiceTests : IDisposable
         Assert.True(s.Queue.WaitDrained(Drain));
         Assert.Equal(1, host.Encodes);
         Assert.Equal(0, host.EncodesOutsideLease);
+        Assert.True(new FileChunkStore(root).Contains(KeyFor(text)));
+    }
+
+    /// <summary>A host whose lease is always grantable but whose busy probe says busy: only the worker's own busy check holds it back.</summary>
+    private sealed class BusyProbeHost : IChunkEncodeHost
+    {
+        public volatile bool Busy = true;
+        public int BusyProbes;
+        public int LeaseRequests;
+        public int Encodes;
+
+        public long ActivityStamp() => 0;
+
+        public bool IsBusy()
+        {
+            Interlocked.Increment(ref BusyProbes);
+            return Busy;
+        }
+
+        public IDisposable? TryEnterIdle()
+        {
+            Interlocked.Increment(ref LeaseRequests);
+            return new Lease();
+        }
+
+        public ChunkKvEntry? Encode(ChunkEncodeItem item)
+        {
+            Interlocked.Increment(ref Encodes);
+            return EntryFor(item.Text, 4);
+        }
+
+        private sealed class Lease : IDisposable
+        {
+            public void Dispose() { }
+        }
+    }
+
+    /// <summary>The worker's own busy check (not the host's lease refusal) keeps it from encoding while the server is busy.</summary>
+    [Fact]
+    public void BusyServer_NeverEncodes_UntilTheHostGoesIdle()
+    {
+        string root = NewRoot();
+        var host = new BusyProbeHost();
+        var s = Start(root, host);
+        string text = Text('b');
+        Admitted(s, text, KeyFor(text), onMissEncode: true);
+
+        // Gate on state: the worker has polled the busy host many times (a generous backstop, not a timing assertion).
+        var backstop = Stopwatch.StartNew();
+        while (Volatile.Read(ref host.BusyProbes) < 8 && Volatile.Read(ref host.Encodes) == 0 && backstop.Elapsed < Drain)
+            Thread.Sleep(5);
+        Assert.Equal(0, Volatile.Read(ref host.Encodes));
+        Assert.Equal(0, Volatile.Read(ref host.LeaseRequests));
+        Assert.True(Volatile.Read(ref host.BusyProbes) >= 8, "the worker never polled the busy host");
+        Assert.Equal(1, s.Queue.Pending);
+
+        host.Busy = false;
+        Assert.True(s.Queue.WaitDrained(Drain));
+        Assert.Equal(1, host.Encodes);
         Assert.True(new FileChunkStore(root).Contains(KeyFor(text)));
     }
 

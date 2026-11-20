@@ -1157,6 +1157,51 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
     }
 
     /// <summary>
+    /// A write route's 408 on a stalled body says <c>Connection: close</c> (the unread rest of the body is not drained). Real
+    /// wire bytes over a raw socket: the client announces a long body, sends one byte and stops; HttpClient would hide the header.
+    /// </summary>
+    [Fact]
+    public async Task WriteRoute_SlowBody_408_ClosesTheConnection()
+    {
+        string root = NewStore();
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root, KeysFile(KeyA)));
+        var uri = new Uri(server.App.Urls.First());
+        var saved = ChunkCacheEndpoint.BodyReadTimeout;
+        ChunkCacheEndpoint.BodyReadTimeout = TimeSpan.FromSeconds(1);
+        try
+        {
+            using var client = new System.Net.Sockets.TcpClient();
+            await client.ConnectAsync(uri.Host, uri.Port);
+            var stream = client.GetStream();
+            byte[] head = Encoding.ASCII.GetBytes(
+                $"POST {Evict} HTTP/1.1\r\nHost: {uri.Host}:{uri.Port}\r\nContent-Type: application/json\r\nX-API-Key: {KeyA}\r\n"
+                + "Content-Length: 4096\r\n\r\n{");
+            await stream.WriteAsync(head);
+            await stream.FlushAsync();
+
+            // Generous hang backstop only; the 408 arrives when the server's own deadline passes.
+            using var backstop = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            var buffer = new byte[1024];
+            var received = new StringBuilder();
+            while (!received.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+            {
+                int n = await stream.ReadAsync(buffer, backstop.Token);
+                if (n == 0)
+                    break;
+                received.Append(Encoding.ASCII.GetString(buffer, 0, n));
+            }
+            string text = received.ToString();
+            string headers = text.Split("\r\n\r\n")[0];
+            Assert.StartsWith("HTTP/1.1 408", headers, StringComparison.Ordinal);
+            Assert.Contains("\r\nConnection: close", headers, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            ChunkCacheEndpoint.BodyReadTimeout = saved;
+        }
+    }
+
+    /// <summary>
     /// S3: the body is read, with a deadline and the size limit, before a write slot is taken: two trickling bodies from
     /// one tenant hold no slot (another tenant's evict answers at once) and end with 408 at the deadline; explain likewise.
     /// One tenant has at most one write call at once (429), and the server at most two (429).

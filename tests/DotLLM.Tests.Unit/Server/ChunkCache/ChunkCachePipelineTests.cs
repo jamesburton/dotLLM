@@ -320,6 +320,19 @@ public sealed class ChunkCachePipelineTests : IClassFixture<ChunkCachePipelineTe
             Assert.Null(Report(Apply(Body(Conversation(User), same, AllChunks())).Plan).Reason); // ruling 6
     }
 
+    /// <summary>The backend tag is itself part of the key: two identities identical except for the backend never share a key.</summary>
+    [Fact]
+    public void KeyOf_BackendIsPartOfTheKey()
+    {
+        var cpu = _fx.Identity;
+        Assert.Equal("cpu", cpu.Backend);
+        var vulkan = cpu with { Backend = "vulkan" }; // same fingerprint on purpose: only the Backend field differs
+        Assert.Equal(cpu.Fingerprint, vulkan.Fingerprint);
+        int[] ids = [1, 2, 3];
+        Assert.Equal(cpu.KeyOf(ids, ""), cpu.KeyOf(ids, "")); // control: the key is deterministic
+        Assert.NotEqual(cpu.KeyOf(ids, ""), vulkan.KeyOf(ids, ""));
+    }
+
     /// <summary>Recurrent / hybrid models (and other unsupported cases) give <c>chunk_model_unsupported</c>: every annotation ignored, exact served.</summary>
     [Fact]
     public void RecurrentModel_ModelUnsupported()
