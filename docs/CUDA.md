@@ -1261,6 +1261,29 @@ End-to-end (`bench -p 512 -n 64 --depth-list 0,3584,15872`, MTP off), decode tok
 Parity: v2 vs F64 reference max abs error ~1e-5 at seqKv in {1,15,16,17,255,256,4096,16385} (v1 vs v2 <= 2.6e-5);
 `CudaAttentionMmaDecodeGqaSplitGenerationParityTests` PPL delta -0.04% (pre-gate bit-identical).
 
+## Dense split-KV decode and the step decode graph (issue #1922)
+
+The plain `CudaTransformerModel` used to decode with the scalar one-block-per-query-head kernels (`attention_f16`,
+`attention_kvq`, `attention_kvtq`) at every depth, eagerly past depth 512. Two changes:
+
+- **Dense v2 decode** (`attention_mma_decode_v2_dense.cu/.cuh`, `CudaKernels.DenseDecodeV2.cs`, gate `CudaDenseDecodeV2`):
+  the #988 body above generalised to head dim 64 / 128 (and 256 for TurboQuant), loader objects (F16, Q8_0, Q4_0, in-place
+  TurboQuant codes + norms with a per-block shared centroid table), F16 output. `attention_mma_decode_v2.cuh` is untouched, so
+  the hybrid model's hd256 PTX cannot move. Split partials are stored **normalised** (o/l), F16 by default with F32 m, l
+  (James, 2026-11-20); the unnormalised #988 form overflows F16 on long splits. `_p32` entries are the F32 control arm
+  (`DOTLLM_CUDA_DENSE_DECODE_V2_P32=1`), not a default. Engages for a decode row that is the newest cache row, seqKv >= 512
+  (`DOTLLM_CUDA_DENSE_DECODE_V2_MIN_KV`), no sliding window, no sinks, no FP16 window ring, GQA group <= 8;
+  `DOTLLM_CUDA_DENSE_DECODE_V2=0` turns it off. Scratch: one buffer for all layers, allocated at model construction
+  (Qwen3-4B on an RTX 3060: kvSplit 3, about 49 KiB at the F32 size so both arms fit).
+- **Step decode graph** (`CudaTransformerModel.StepGraph.cs`): the eager `ForwardInternal` body captured for one step,
+  pushed with `cuGraphExecUpdate` and launched once (the hybrid's capture-don't-patch). Engages where the older graphs do
+  not: F16 past `GraphCaptureMaxDepth`, pure-quantized q8_0 / q4_0 and in-place TurboQuant at any depth. Bit-identical to
+  eager by construction (tested for f16, q8_0, q4_0, tq4, tq3). `DOTLLM_CUDA_STEP_GRAPH=0` turns it off.
+
+Kernel microbench (RTX 3060 on framework, hd128 32/8, kvSplit 3, `CudaAttentionMmaDecodeDenseTests.Microbench_Scalar_vs_DenseV2`):
+at 32,768 keys f16 0.410 ms (scalar 7.19 ms, 328 GB/s effective), q8_0 0.267 ms (scalar 7.81), q4_0 0.215 ms (scalar 11.4).
+F16 and F32 partials time the same. End-to-end A/B: `.docs/bench-plan.md` of the #1922 worktree.
+
 ## Flash-style tensor-core prefill attention, head_dim 256 (issue #962)
 
 `native/kernels/attention_flash_mma_prefill_hd256.cu` replaces the naive `attention_f32` prefill
