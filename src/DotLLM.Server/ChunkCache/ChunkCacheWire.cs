@@ -23,9 +23,9 @@ internal static class ChunkCacheWire
 
     /// <summary>
     /// The text-first chunkers (spec §5.3 item 4) a span may name. A copy of <c>WireChunking.Eligible</c> in
-    /// <c>DotLLM.ChunkReuse</c> until the server references that assembly; <c>lines-512</c> joins it in a later task.
+    /// <c>DotLLM.ChunkReuse</c> until the server references that assembly (pinned equal by a test).
     /// </summary>
-    public static IReadOnlySet<string> WireChunkers { get; } = new HashSet<string>(StringComparer.Ordinal) { "symbol-512" };
+    public static IReadOnlySet<string> WireChunkers { get; } = new HashSet<string>(StringComparer.Ordinal) { "symbol-512", "lines-512" };
 }
 
 /// <summary>The requested reuse policy (spec §5.5). Only <see cref="Exact"/> and <see cref="Shadow"/> run in v1.</summary>

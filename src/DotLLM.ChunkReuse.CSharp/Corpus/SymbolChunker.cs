@@ -18,6 +18,8 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// <item>Split points are the line starts of each member's full span (trivia included). Namespaces and types with members are
 /// containers: their header (usings, <c>namespace</c> line, type declaration and opening brace) carries no member, so it
 /// glues forward to the next chunk; a type's closing brace stays with its last member.</item>
+/// <item>Edges are token-stable: an edge where the tokenizer would merge across it (a chunk's last newline with the blank line
+/// that starts the next) moves over the blank lines to the previous chunk (see <see cref="ChunkBoundary"/>).</item>
 /// <item>Consecutive field/event-field declarations form one chunk, and so do consecutive top-level statements (a local
 /// function among them included).</item>
 /// <item>A member starting mid-line after other code (e.g. several members on one line) does not split.</item>
@@ -31,6 +33,9 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// </remarks>
 public sealed partial class SymbolChunker : IChunker
 {
+    /// <summary>2: unstable edges between wire-eligible chunks move to a token-stable line start (<see cref="ChunkBoundary"/>); 1 cut at member edges only.</summary>
+    public int AlgorithmVersion => 2;
+
     /// <summary>Parse options for corpus code: the newest language version, no preprocessor symbols.</summary>
     public static readonly CSharpParseOptions ParseOptions = new(LanguageVersion.Preview, DocumentationMode.Parse);
 
@@ -156,8 +161,64 @@ public sealed partial class SymbolChunker : IChunker
             else if (pending < text.Length) pieces[^1] = (pieces[^1].Start, text.Length);
 
             foreach ((int s, int e) in pieces) Emit(s, e);
+            Stabilize();
             return _out;
         }
+
+        /// <summary>Line starts tried on each side of an unstable edge (forward first).</summary>
+        private const int MaxEdgeProbes = 8;
+
+        /// <summary>
+        /// Makes every edge between two wire-eligible chunks token-stable (<see cref="ChunkBoundary"/>). An edge that would merge
+        /// (typically a chunk ending in a newline, the next one starting with a blank line) moves to the nearest stable line start:
+        /// first later (the blank lines go to the previous chunk, members stay whole; a chunk that is only blank lines joins the
+        /// previous one), then earlier, taking the first candidate
+        /// where both chunks still fit <see cref="Limit"/>. With none in reach the edge stays (it merges when shown back to back).
+        /// Stability depends only on the position, so each edge is decided once, left to right.
+        /// </summary>
+        private void Stabilize()
+        {
+            for (int i = 0; i + 1 < _out.Count; i++)
+            {
+                Chunk a = _out[i], b = _out[i + 1];
+                if (!a.WireEligible || !b.WireEligible || a.EndOffset != b.StartOffset) continue;
+                int p = a.EndOffset;
+                if (ChunkBoundary.IsStableAt(owner._tokenizer, text, p)) continue;
+                foreach (int q in EdgeCandidates(a.StartOffset, p, b.EndOffset))
+                {
+                    if (!ChunkBoundary.IsStableAt(owner._tokenizer, text, q)) continue;
+                    int[] left = ChunkTokenization.Encode(owner._tokenizer, text[a.StartOffset..q]);
+                    if (left.Length > Limit) continue;
+                    _out[i] = Make(a.StartOffset, q, left);
+                    if (q == b.EndOffset)
+                    {
+                        _out.RemoveAt(i + 1);
+                        break;
+                    }
+                    int[] right = ChunkTokenization.Encode(owner._tokenizer, text[q..b.EndOffset]);
+                    if (right.Length > Limit) { _out[i] = a; continue; }
+                    _out[i + 1] = Make(q, b.EndOffset, right);
+                    break;
+                }
+            }
+        }
+
+        private IEnumerable<int> EdgeCandidates(int start, int p, int end)
+        {
+            int n = 0;
+            foreach (int q in _lines.LineStartsInside(p, end))
+            {
+                if (n++ >= MaxEdgeProbes) break;
+                yield return q;
+            }
+            yield return end; // the whole next chunk joins this one (a lone blank line, say)
+            n = 0;
+            for (int q = _lines.LineStartOf(p - 1); q > start && n < MaxEdgeProbes; q = _lines.LineStartOf(q - 1), n++)
+                yield return q;
+        }
+
+        private Chunk Make(int start, int end, int[] ids) =>
+            new(path, _lines.LineOf(start), _lines.LineOf(end - 1), ids) { StartOffset = start, EndOffset = end };
 
         private bool HasLeaf(int start, int end)
         {

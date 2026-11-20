@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chunkcache_prewarm output (integration spec 7.2)",
+  "type": "object",
+  "required": ["requested", "already_stored", "queued", "queued_tokens", "refused", "refused_reasons"],
+  "properties": {
+    "requested": {"type": "integer"},
+    "already_stored": {"type": "integer"},
+    "queued": {"type": "integer"},
+    "queued_tokens": {"type": "integer"},
+    "refused": {"type": "integer"},
+    "refused_reasons": {"type": "array", "items": {"type": "string"}}
+  }
+}

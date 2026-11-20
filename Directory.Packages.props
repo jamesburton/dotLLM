@@ -11,6 +11,8 @@
     <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.15.2" />
     <!-- Chunk-cache client (MIT): the MEAI decorator base class. Pinned exact; MIT-licensed. -->
     <PackageVersion Include="Microsoft.Extensions.AI.Abstractions" Version="10.10.0" />
+    <!-- chunkcache MCP server (tools/DotLLM.ChunkCache only; Apache-2.0): low-level server API, stdio transport -->
+    <PackageVersion Include="ModelContextProtocol.Core" Version="2.2.0" />
     <!-- Testing -->
     <!-- tests/DotLLM.ChunkCache.Client.Tests only: the real MEAI OpenAI bridge on the wire (MIT). -->
     <PackageVersion Include="Microsoft.Extensions.AI.OpenAI" Version="10.10.0" />
