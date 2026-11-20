@@ -453,7 +453,8 @@ list of the matching `chunkcache <verb> --json`, run in process, and the verb's 
 Defaults that protect: `chunkcache_evict` is a dry run unless `dry_run` is `false`; `chunkcache_build` only indexes
 (tokenizer, nothing is encoded) unless `encode` is `true`, which queues the missing chunks on the server (an error without
 a server); `max_encode_tokens` is a strict token cap, not a chunk count. The API key is read from `CHUNKCACHE_API_KEY` only
-and is sent as `X-API-Key`; it never appears in a frame or on stderr. Tools that open a model take an optional `model`
+and is sent as `X-API-Key`, to the launch `--server`'s origin only (with the key set, a call whose `server` names another
+origin is refused); it never appears in a frame or on stderr. Tools that open a model take an optional `model`
 (a GGUF path) that overrides the launch `--model`.
 
 Claude Code (`.mcp.json`):

@@ -25,10 +25,12 @@ internal static class McpCommand
 
           --store DIR     default store of a call that gives none
           --server URL    default dotLLM server (the server owns the model identity and all K/V writes). The API key is read from
-                          CHUNKCACHE_API_KEY, never from an argument.
+                          CHUNKCACHE_API_KEY, never from an argument, and is sent to this server's origin only: with the key
+                          set, a tool call naming another server is refused.
           --model FILE    the GGUF whose tokenizer chunks the tree (build, select, status; the file the server serves).
                           Default for a call that gives no `model` of its own.
           --threads N     CPU threads the model is opened with (default min(8, cores))
+          --verbose       accepted and ignored (tool errors never carry stack traces)
           --help          this text
 
         Claude Code (.mcp.json):
@@ -141,6 +143,13 @@ internal static class McpCommand
         List<string> problems = McpSchema.Validate(arguments, tool.InputSchema, "arguments");
         if (problems.Count > 0) return Failure("invalid_arguments", $"{tool.Name}: " + string.Join("; ", problems));
 
+        // The API key is sent to whatever server a verb talks to. A tool call's own `server` is caller-controlled (an agent
+        // can be prompt-injected), so with a key in the environment only the launch server's origin may be named.
+        if (arguments["server"] is JsonValue sv && sv.TryGetValue(out string? perCall) && !string.IsNullOrEmpty(getEnv(ServerConnection.ApiKeyVariable))
+            && !SameOrigin(perCall, defaults.Server))
+            return Failure("invalid_arguments", $"{tool.Name}: server is not the launch server ('chunkcache mcp --server URL'). {ServerConnection.ApiKeyVariable} is set "
+                + "and is only ever sent to the launch server's origin; start the MCP server with that --server, or without the key.");
+
         McpCall call;
         try
         {
@@ -167,10 +176,12 @@ internal static class McpCommand
             {
                 return Failure("internal", $"{tool.Name}: the verb printed no JSON document (exit {code}).");
             }
+            if (doc is not JsonObject)
+                return Failure("internal", $"{tool.Name}: the verb's result is not a JSON object (exit {code}).");
             if (code != ExitCodes.Ok)
             {
-                if (doc?["error"] is JsonObject err)
-                    return Failure(err["code"]?.GetValue<string>() ?? "error", err["message"]?.GetValue<string>() ?? $"exit {code}");
+                if (doc["error"] is JsonObject err)
+                    return Failure(Text(err["code"]) ?? "error", Text(err["message"]) ?? $"exit {code}");
                 return Failure("error", $"{tool.Name}: exit {code}.");
             }
 
@@ -194,6 +205,14 @@ internal static class McpCommand
             }
         }
     }
+
+    private static string? Text(JsonNode? node) => node is JsonValue v && v.TryGetValue(out string? s) ? s : null;
+
+    /// <summary>Whether two server URLs have the same scheme, host and port (the origin the API key is bound to).</summary>
+    internal static bool SameOrigin(string? a, string? b) =>
+        Uri.TryCreate(a, UriKind.Absolute, out Uri? x) && Uri.TryCreate(b, UriKind.Absolute, out Uri? y)
+        && x.Scheme is "http" or "https" && string.Equals(x.Scheme, y!.Scheme, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(x.IdnHost, y.IdnHost, StringComparison.OrdinalIgnoreCase) && x.Port == y.Port;
 
     private static CallToolResult Failure(string code, string message) => new()
     {

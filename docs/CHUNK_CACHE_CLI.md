@@ -424,8 +424,9 @@ JSON-RPC on stdin/stdout; stdout carries nothing else, diagnostics go to stderr)
 `chunkcache <verb> --json` and return the document, projected onto the tool's output schema, as `structuredContent` plus a
 text copy. A failing verb is a tool result with `isError` (`{"error": {"code", "message"}}`). `chunkcache_build` only indexes
 unless `encode` is true (then it needs a server and queues the missing chunks; `max_encode_tokens` counts tokens), and
-`chunkcache_evict` is a dry run unless `dry_run` is false. `compare` is not a tool. `--model` is a server option, not a tool
-argument (the tools' schemas follow the integration spec); the API key comes from `CHUNKCACHE_API_KEY`.
+`chunkcache_evict` is a dry run unless `dry_run` is false. `compare` is not a tool. The tools that open a model take an
+optional `model` (a GGUF path) that replaces the launch `--model`. The API key comes from `CHUNKCACHE_API_KEY` and is sent to the
+launch `--server`'s origin only: with the key set, a call whose `server` names another origin is refused before any request.
 
 Claude Code (`.mcp.json` in the project):
 

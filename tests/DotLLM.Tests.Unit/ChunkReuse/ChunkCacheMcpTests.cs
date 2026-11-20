@@ -350,6 +350,66 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
     }
 
     [Fact]
+    public async Task ApiKey_GoesOnlyToTheLaunchServer_APerCallServerOfAnotherOriginIsRefused()
+    {
+        const string key = "sk-test-0a1b2c3d4e5f60718293";
+        static (HttpStatusCode, string) Explain(Seen s) => s.Path.EndsWith("/explain", StringComparison.Ordinal)
+            ? (HttpStatusCode.OK, """{"policy_would_apply":"exact","reason":null,"chunks":[],"warnings":[]}""") : (HttpStatusCode.NotFound, "{}");
+        const string request = """ "request": {"model": "m", "messages": [{"role": "user", "content": "hi"}]} """;
+
+        var fake = new FakeServer(Explain);
+        await using McpWire wire = await McpWire.StartAsync(["--server", FakeUrl], fake, env: n => n == "CHUNKCACHE_API_KEY" ? key : null);
+        foreach (string other in new[] { "http://other.test:8080", "https://fake.test:8080", "http://fake.test:8081", "http://fake.test.evil.example:8080" })
+        {
+            JsonElement refused = await wire.CallToolAsync("chunkcache_explain", "{" + request + $$""", "server": "{{other}}" }""");
+            Assert.True(IsError(refused), other + ": " + refused);
+            Assert.Contains("launch server", ErrorText(refused), StringComparison.Ordinal);
+        }
+        Assert.Empty(fake.Requests); // refused before any request: the key never left for another origin
+
+        // Control: the launch server (named or defaulted, any path spelling of the same origin) gets the key.
+        foreach (string same in new[] { "", $$""", "server": "{{FakeUrl}}/v1" """ })
+        {
+            JsonElement ok = await wire.CallToolAsync("chunkcache_explain", "{" + request + same + "}");
+            Assert.False(IsError(ok), ok.ToString());
+        }
+        Assert.Equal(2, fake.Requests.Count);
+        Assert.All(fake.Requests, r => Assert.Equal(key, r.Headers["X-API-Key"]));
+
+        // Without a key there is nothing to leak: a per-call server is allowed.
+        var keyless = new FakeServer(Explain);
+        await using McpWire open = await McpWire.StartAsync(["--server", FakeUrl], keyless);
+        Assert.False(IsError(await open.CallToolAsync("chunkcache_explain", "{" + request + """, "server": "http://other.test:8080" }""")));
+        Assert.False(Assert.Single(keyless.Requests).Headers.ContainsKey("X-API-Key"));
+    }
+
+    [Fact]
+    public async Task OptionLikeValues_StayValues_AndNeverBecomeFlags()
+    {
+        var fake = new FakeServer(s => s is { Method: "POST", Path: "/v1/chunk-cache/evict" }
+            ? (HttpStatusCode.OK, """{"evicted":0,"freed_bytes":0,"kept_referenced":0}""") : (HttpStatusCode.NotFound, "{}"));
+        await using McpWire wire = await McpWire.StartAsync(["--server", FakeUrl], fake);
+
+        // "--verbose" is stripped from the CLI's argv wherever it stands; as a value it must not vanish and shift "--apply" into a flag.
+        // With separate tokens this call became `--path --namespace --apply`: an APPLIED eviction of the path "--namespace".
+        // Now every value stays a value, so the verb sees path + namespace together and refuses that combination itself.
+        JsonElement both = await wire.CallToolAsync("chunkcache_evict", """{"mode": "path", "path": "--verbose", "namespace": "--apply"}""");
+        Assert.True(IsError(both), both.ToString());
+        Assert.Contains("--namespace goes with --mode namespace", ErrorText(both), StringComparison.Ordinal);
+        Assert.DoesNotContain(fake.Requests, r => r.Method == "POST"); // nothing was sent, applied or not
+
+        JsonElement path = await wire.CallToolAsync("chunkcache_evict", """{"mode": "path", "path": "--verbose"}""");
+        Assert.False(IsError(path), path.ToString());
+        JsonElement ns = await wire.CallToolAsync("chunkcache_evict", """{"mode": "namespace", "namespace": "--apply"}""");
+        Assert.False(IsError(ns), ns.ToString());
+        JsonNode[] sent = [.. fake.Requests.Where(r => r.Method == "POST").Select(r => JsonNode.Parse(r.Body)!)];
+        Assert.Equal(2, sent.Length);
+        Assert.All(sent, s => Assert.True(s["dry_run"]!.GetValue<bool>()));
+        Assert.Equal("--verbose", sent[0]["path"]!.GetValue<string>());
+        Assert.Equal("--apply", sent[1]["namespace"]!.GetValue<string>());
+    }
+
+    [Fact]
     public async Task ApiKey_NeverOnTheWire()
     {
         const string key = "sk-test-9f8e7d6c5b4a39281716";

@@ -39,7 +39,7 @@ internal sealed class McpToolDef(string name, string description, JsonObject inp
 /// </summary>
 internal static class McpTools
 {
-    private const string ChunkerProp = """{"enum": ["symbol-512"], "default": "symbol-512", "description": "lines-512 is wire-eligible; not quality-validated"}""";
+    private const string ChunkerProp = """{"enum": ["symbol-512"], "default": "symbol-512", "description": "the wire-eligible chunkers this build accepts"}""";
 
     private static readonly Lazy<IReadOnlyList<McpToolDef>> AllTools = new(Build);
 
@@ -165,11 +165,15 @@ internal static class McpTools
 
         public void Flag(string name) => Items.Add("--" + name);
 
+        /// <summary>
+        /// Adds <c>--name=value</c> as ONE token. A value is caller-controlled text: as a token of its own it could be read as an
+        /// option (and the CLI strips a bare <c>--verbose</c> anywhere, which would shift the next value into a flag such as
+        /// <c>--apply</c>). The inline form keeps it a value whatever it contains.
+        /// </summary>
         public void Add(string name, string? value)
         {
             if (value is null) return;
-            Items.Add("--" + name);
-            Items.Add(value);
+            Items.Add("--" + name + "=" + value);
         }
 
         public McpCall Done() => new([.. Items, "--json"], Temp);
