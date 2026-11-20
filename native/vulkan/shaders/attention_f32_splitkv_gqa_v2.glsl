@@ -35,7 +35,15 @@
 layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufQ       { float q[]; };       // [1, numHeads * head_dim]
-#if defined(KV_Q8)
+#if defined(KV_TQ)
+// TurboQuant (#1892, kv_load.glsl KV_TQ): a lane's 8 columns are 8 consecutive codes of one head vector times its norm, in code space.
+#include "kv_load.glsl"
+#define RAW mat2x4
+RAW loadK8(uint i) { return kvTqK8(i); }
+RAW loadV8(uint i) { return kvTqV8(i); }
+vec4 lo4(RAW r) { return r[0]; }
+vec4 hi4(RAW r) { return r[1]; }
+#elif defined(KV_Q8)
 // Q8_0 (kv_load.glsl layout: 36-byte blocks, [float scale][32 x int8]); a lane's 8 columns are 8 consecutive bytes of one block.
 layout(set = 0, binding = 1, std430) readonly  buffer BufK       { uint kw[]; };
 layout(set = 0, binding = 2, std430) readonly  buffer BufV       { uint vw[]; };

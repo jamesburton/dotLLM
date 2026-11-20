@@ -42,8 +42,8 @@ public enum VulkanKvStorage
     /// <summary>
     /// TurboQuant on both sides (issue #1892): per-head-vector Lloyd-Max codes plus a norm, read in place in code space (the query is
     /// rotated by <c>tq_rotate_q</c> and the output by <c>tq_rotate_o</c>). It has no element size or block size: rows are sized by the
-    /// TurboQuant layout, so <see cref="VulkanKvStorageExtensions.ElementBytes"/>, <see cref="VulkanKvStorageExtensions.RowBytes"/> and
-    /// <see cref="VulkanKvStorageExtensions.ShaderName"/> refuse it rather than guess.
+    /// TurboQuant layout, so <see cref="VulkanKvStorageExtensions.ElementBytes"/> and <see cref="VulkanKvStorageExtensions.RowBytes"/>
+    /// refuse it rather than guess. Its attention twins are the <c>_kvtq</c> shaders.
     /// </summary>
     Tq = 6,
 }
@@ -166,6 +166,7 @@ public static class VulkanKvStorageExtensions
         VulkanKvStorage.Q4_0 => f32ShaderName + "_kvq4",
         VulkanKvStorage.Q8_0K_Q4_0V => f32ShaderName + "_kvq8q4",
         VulkanKvStorage.Q4_0K_Q8_0V => f32ShaderName + "_kvq4q8",
+        VulkanKvStorage.Tq => f32ShaderName + "_kvtq",   // #1892: the body with kv_load.glsl's KV_TQ loader
         _ => throw new ArgumentOutOfRangeException(nameof(storage)),
     };
 

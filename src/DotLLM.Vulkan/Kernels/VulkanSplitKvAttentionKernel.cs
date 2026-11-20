@@ -187,32 +187,52 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         VulkanModule splitModule, ComputePipeline splitPipeline, nint splitPool,
         VulkanModule mergeModule, ComputePipeline mergePipeline, nint mergePool, VulkanKvStorage kvStorage,
         VulkanModule? gqaModule, ComputePipeline? gqaPipeline, nint gqaPool,
-        VulkanModule? gqa2Module, ComputePipeline? gqa2Pipeline, nint gqa2Pool)
+        VulkanModule? gqa2Module, ComputePipeline? gqa2Pipeline, nint gqa2Pool, DotLLM.Core.Attention.TurboQuantLayout? tq)
     {
         _device = device;
+        _tq = tq;
         _gqa2Module = gqa2Module;
         _gqa2Pipeline = gqa2Pipeline;
         _gqa2Pool = gqa2Pool;
         if (gqa2Pipeline is not null)
-            _gqa2Cache = new DescriptorSetCache(device, gqa2Pool, gqa2Pipeline, buffersPerSet: 5);
+            _gqa2Cache = TqKvTwin.CreateCache(device, gqa2Pool, gqa2Pipeline, 5, tq);
         KvStorage = kvStorage;
         _gqaModule = gqaModule;
         _gqaPipeline = gqaPipeline;
         _gqaPool = gqaPool;
         if (gqaPipeline is not null)
-            _gqaCache = new DescriptorSetCache(device, gqaPool, gqaPipeline, buffersPerSet: 5);
+            _gqaCache = TqKvTwin.CreateCache(device, gqaPool, gqaPipeline, 5, tq);
         _splitModule = splitModule;
         _splitPipeline = splitPipeline;
         _splitPool = splitPool;
         _mergeModule = mergeModule;
         _mergePipeline = mergePipeline;
         _mergePool = mergePool;
-        _splitCache = new DescriptorSetCache(device, splitPool, splitPipeline, buffersPerSet: 5);
+        _splitCache = TqKvTwin.CreateCache(device, splitPool, splitPipeline, 5, tq);
         _mergeCache = new DescriptorSetCache(device, mergePool, mergePipeline, buffersPerSet: 4);
     }
 
     /// <summary>Element format of the K / V buffers this instance reads (issue #1102); fixed at creation.</summary>
     public VulkanKvStorage KvStorage { get; }
+
+    // TurboQuant twin (#1892): the layout the split passes are specialised for; null for every other KV storage.
+    private readonly DotLLM.Core.Attention.TurboQuantLayout? _tq;
+
+    /// <summary>
+    /// The TurboQuant twin (issue #1892): the split passes (<c>attention_f32_splitkv[_gqa[_v2]]_kvtq.spv</c>) read codes and norms in
+    /// place and accumulate in V code space; the merge pass is the shared one (it only combines partials). The output rotation back out
+    /// of code space therefore belongs AFTER <see cref="Record"/> returns, once per query head, never per split.
+    /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="tq">Layout of the cached codes and norms.</param>
+    /// <returns>The kernel, or <see langword="null"/> when an SPIR-V is missing or a pipeline fails.</returns>
+    public static VulkanSplitKvAttentionKernel? TryCreate(VulkanDevice device, string spvDir, DotLLM.Core.Attention.TurboQuantLayout tq)
+    {
+        try { return Create(device, spvDir, VulkanKvStorage.Tq, tq); }
+        catch (FileNotFoundException) { return null; }
+        catch (VulkanException) { return null; }
+    }
 
     /// <summary>
     /// Loads <c>attention_f32_splitkv.spv</c> + <c>attention_f32_splitkv_merge.spv</c>
@@ -235,7 +255,11 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     /// <param name="kvStorage">Element format of the K / V buffers <see cref="Record"/> will be given.</param>
     /// <returns>The kernel.</returns>
     public static VulkanSplitKvAttentionKernel Create(VulkanDevice device, string spvDir, VulkanKvStorage kvStorage)
+        => Create(device, spvDir, kvStorage, null);
+
+    private static VulkanSplitKvAttentionKernel Create(VulkanDevice device, string spvDir, VulkanKvStorage kvStorage, DotLLM.Core.Attention.TurboQuantLayout? tq)
     {
+        tq = TqKvTwin.Require(kvStorage, tq);
         string splitPath = Path.Combine(spvDir, kvStorage.ShaderName("attention_f32_splitkv") + ".spv");
         string mergePath = Path.Combine(spvDir, "attention_f32_splitkv_merge.spv");
         if (!File.Exists(splitPath))
@@ -251,7 +275,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         ComputePipeline? mergePipeline = null;
         try
         {
-            splitPipeline = CreatePipeline(splitModule, bindingCount: 5, SplitPushConstantBytes);
+            splitPipeline = TqKvTwin.CreatePipeline(splitModule, 5, SplitPushConstantBytes, tq);
             mergeModule = VulkanModule.LoadFromFile(device, mergePath);
             mergePipeline = CreatePipeline(mergeModule, bindingCount: 4, MergePushConstantBytes);
         }
@@ -264,7 +288,8 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
             throw;
         }
 
-        nint splitPool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 5);
+        uint splitBuffers = (uint)(5 + TqKvTwin.Extra(tq));
+        nint splitPool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: splitBuffers);
         nint mergePool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
 
         // The GQA-grouped pass is optional: a missing or rejected SPV leaves the per-query-head pass in charge.
@@ -277,8 +302,8 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
             try
             {
                 gqaModule = VulkanModule.LoadFromFile(device, gqaPath);
-                gqaPipeline = CreatePipeline(gqaModule, bindingCount: 5, SplitPushConstantBytes);
-                gqaPool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 5);
+                gqaPipeline = TqKvTwin.CreatePipeline(gqaModule, 5, SplitPushConstantBytes, tq);
+                gqaPool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: splitBuffers);
             }
             catch (VulkanException)
             {
@@ -290,23 +315,23 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         }
 
         var (gqa2Module, gqa2Pipeline, gqa2Pool) = device.SubgroupSize == 64 && Environment.GetEnvironmentVariable(Gqa2EnvVar) != "0"
-            ? TryLoadOptional(device, Path.Combine(spvDir, kvStorage.ShaderName("attention_f32_splitkv_gqa_v2") + ".spv"))
+            ? TryLoadOptional(device, Path.Combine(spvDir, kvStorage.ShaderName("attention_f32_splitkv_gqa_v2") + ".spv"), tq)
             : (null, null, 0);
 
         return new VulkanSplitKvAttentionKernel(
             device, splitModule, splitPipeline, splitPool, mergeModule!, mergePipeline, mergePool, kvStorage,
-            gqaModule, gqaPipeline, gqaPool, gqa2Module, gqa2Pipeline, gqa2Pool);
+            gqaModule, gqaPipeline, gqaPool, gqa2Module, gqa2Pipeline, gqa2Pool, tq);
     }
 
-    private static (VulkanModule?, ComputePipeline?, nint) TryLoadOptional(VulkanDevice device, string path)
+    private static (VulkanModule?, ComputePipeline?, nint) TryLoadOptional(VulkanDevice device, string path, DotLLM.Core.Attention.TurboQuantLayout? tq)
     {
         if (!File.Exists(path)) return (null, null, 0);
         VulkanModule? module = null;
         try
         {
             module = VulkanModule.LoadFromFile(device, path);
-            var pipeline = CreatePipeline(module, bindingCount: 5, SplitPushConstantBytes);
-            return (module, pipeline, KernelSupport.CreateDescriptorPool(device, buffersPerSet: 5));
+            var pipeline = TqKvTwin.CreatePipeline(module, 5, SplitPushConstantBytes, tq);
+            return (module, pipeline, KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)(5 + TqKvTwin.Extra(tq))));
         }
         catch (VulkanException)
         {
@@ -469,7 +494,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         float softCap = 0.0f, float scaleOverride = 0.0f,
         AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0,
         Action<nint>? interPassStamp = null,
-        VulkanDevice.Buffer? sinks = null, int kvStart = 0)
+        VulkanDevice.Buffer? sinks = null, int kvStart = 0, TqKvOperands? tq = null)
     {
         if (seqQ != 1)
             throw new ArgumentException("VulkanSplitKvAttentionKernel is decode-only (seqQ must be 1).", nameof(seqQ));
@@ -492,11 +517,8 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)numHeads   * headDim * sizeof(float);   // seqQ == 1
-        long kvBytes  = KvStorage.KeyRowBytes((long)numKvHeads * headDim) * seqKv;   // per side: mixed block formats (#1884)
-        long kvBytesV = KvStorage.ValueRowBytes((long)numKvHeads * headDim) * seqKv;
         if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
-        if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
-        if (v.Size      < kvBytesV)  throw new ArgumentException("V buffer too small.",      nameof(v));
+        TqKvTwin.CheckKv(KvStorage, _tq, tq, k, v, seqKv, numKvHeads, headDim);   // per side: mixed block formats (#1884); codes + norms for TurboQuant
         if (output.Size < qBytes)   throw new ArgumentException("Output buffer too small.", nameof(output));
 
         if (kvStart < 0 || kvStart >= seqKv) throw new ArgumentOutOfRangeException(nameof(kvStart));
@@ -524,7 +546,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         Span<nint> splitBuffers = stackalloc nint[5]
             { q.Handle, k.Handle, v.Handle, _partOut!.Handle, _partMS!.Handle };
         ComputePipeline splitPipeline = gqa2 ? _gqa2Pipeline! : gqa ? _gqaPipeline! : _splitPipeline;
-        nint splitSet = (gqa2 ? _gqa2Cache! : gqa ? _gqaCache! : _splitCache).GetOrCreate(splitBuffers);
+        nint splitSet = TqKvTwin.GetSet(gqa2 ? _gqa2Cache! : gqa ? _gqaCache! : _splitCache, splitBuffers, _tq, tq);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, splitPipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(

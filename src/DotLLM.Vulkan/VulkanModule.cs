@@ -96,13 +96,20 @@ public sealed class VulkanModule : IDisposable
     /// one is resolved at compile time and the dead side costs no registers.
     /// Empty (the default) leaves every constant at its shader-declared default.
     /// </param>
+    /// <param name="specConstantIds">
+    /// The <c>constant_id</c> of each entry of <paramref name="specConstants"/>, when they are not 0, 1, ... (the TurboQuant KV
+    /// loader's constants sit at fixed high ids so they cannot collide with a body's own, #1892). Empty = ids 0..n-1.
+    /// </param>
     public unsafe ComputePipeline CreateComputePipeline(
         string entryPoint,
         ReadOnlySpan<VkDescriptorBinding> bindings,
         uint pushConstantBytes = 0,
         uint requiredSubgroupSize = 0,
-        ReadOnlySpan<uint> specConstants = default)
+        ReadOnlySpan<uint> specConstants = default,
+        ReadOnlySpan<uint> specConstantIds = default)
     {
+        if (!specConstantIds.IsEmpty && specConstantIds.Length != specConstants.Length)
+            throw new ArgumentException("One id per specialization constant.", nameof(specConstantIds));
         // 1. Descriptor-set layout — one binding per storage buffer in the shader.
         nint setLayout = 0;
         nint pipelineLayout = 0;
@@ -178,7 +185,7 @@ public sealed class VulkanModule : IDisposable
             for (int i = 0; i < specCount; i++)
                 entries[i] = new VkSpecializationMapEntry
                 {
-                    constantID = (uint)i,
+                    constantID = specConstantIds.IsEmpty ? (uint)i : specConstantIds[i],
                     offset = (uint)(i * sizeof(uint)),
                     size = sizeof(uint),
                 };
