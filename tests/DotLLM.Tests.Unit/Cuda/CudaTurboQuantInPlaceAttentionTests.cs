@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Interop;
@@ -134,7 +135,7 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
     /// </summary>
     private CaseResult RunCase(int bits, int hd, int numHeads, int numKvHeads, int seqQ, int offset, int sliding, bool sinks,
                                bool flashEnabled, int seed, float kScale = 1f, float vScale = 2f, float qScale = 2.5f,
-                               float histKScale = 1f)
+                               float histKScale = 1f, TqNormFormat? normFormat = null)
     {
         var codecK = Codec(hd, bits, Seed);
         var codecV = Codec(hd, bits, Seed ^ TurboQuantCodec.VSeedMask);
@@ -165,10 +166,11 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
             nint s = _stream!.Handle;
 
             using var ip = new CudaTurboQuantInPlaceKvCache(1, numKvHeads, hd, total + 3, bits,
-                codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD);
+                codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD, normFormat);
             using var oracle = new CudaTurboQuantKvCache(1, numKvHeads, hd, total + 3, bits,
-                codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD);
+                codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD, normFormat);
             Assert.Equal(ip.NormFormat, oracle.NormFormat);
+            if (normFormat is { } nf) Assert.Equal(nf, ip.NormFormat);
 
             if (offset > 0)
             {
@@ -299,6 +301,9 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         [4, 256, 8, 2, 64, 0, 0, false],
         [8, 256, 4, 1, 16, 20, 0, true],
         [3, 256, 4, 2, 1, 60, 20, false],
+        [5, 64, 6, 2, 7, 45, 0, false],     // bits 5/6/7: codes straddle a 32-bit word (64-bit buffer refill, V straddle)
+        [6, 128, 8, 2, 1, 70, 0, true],
+        [7, 128, 8, 2, 16, 33, 0, false],
     ];
 
     [SkippableTheory]
@@ -327,6 +332,8 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         [3, 128, 32, 4, 64, 10],    // group 8: 52 KB dynamic shared memory
         [8, 128, 8, 8, 16, 0],      // MHA
         [3, 128, 8, 2, 64, 260],    // history past one 256-row span
+        [7, 128, 8, 2, 16, 20],     // b7: shift + 8b > 64, the third-word read
+        [5, 64, 6, 2, 16, 9],
     ];
 
     [SkippableTheory]
@@ -341,6 +348,27 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         Assert.Equal(1, r.FlashLaunches);
         Assert.Equal(0, r.ScalarLaunches);
         AssertMatchesOracle(r, hd, $"flash b{bits} hd{hd} {numHeads}/{numKvHeads} q{seqQ}@{offset}");
+    }
+
+    /// <summary>
+    /// The non-default norm formats (F32Reference = 0, Bf16 = 2) through both arms: kvtq_load_norm / pk_tq_norm branch on the format,
+    /// and the F16 default alone never reaches the other branches.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(TqNormFormat.F32Reference, false)]
+    [InlineData(TqNormFormat.Bf16, false)]
+    [InlineData(TqNormFormat.F32Reference, true)]
+    [InlineData(TqNormFormat.Bf16, true)]
+    public void NormFormats_MatchOracle(TqNormFormat fmt, bool flash)
+    {
+        RequireKernels();
+        var r = flash
+            ? RunCase(4, 128, 8, 2, 16, 30, 0, false, flashEnabled: true, seed: 5150 + (int)fmt, normFormat: fmt)
+            : RunCase(3, 64, 6, 2, 1, 80, 0, true, flashEnabled: false, seed: 5160 + (int)fmt, normFormat: fmt);
+        Assert.Equal(flash, r.Flash);
+        Assert.Equal(flash ? 1 : 0, r.FlashLaunches);
+        Assert.Equal(flash ? 0 : 1, r.ScalarLaunches);
+        AssertMatchesOracle(r, flash ? 128 : 64, $"norm {fmt} {(flash ? "flash" : "scalar")}");
     }
 
     /// <summary>D3: a dense hd256 prefill (no tensor-core TurboQuant twin) takes the scalar TQ body, not a dequant path, and matches.</summary>
@@ -467,7 +495,92 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
                 using (var l = Forward(model, f16, [fed[step]], prompt.Length + step)) f16Rows.Add(LastRow(l, vocab));
         }
         for (int i = 0; i <= decodeSteps; i++)
-            AssertLogitsTrack(ipRows[i], orRows[i], f16Rows[i], i == 0 ? "prefill" : $"decode {i - 1}");
+            AssertLogitsTrack(ipRows[i], orRows[i], f16Rows[i], i == 0 ? "prefill" : $"decode {i - 1}", MinCos(bits));
+    }
+
+    /// <summary>
+    /// Per-bit floor on cos(in-place, oracle), set about 3x the measured 1 - cos (framework RTX 3060, a965cd33: worst step tq4
+    /// 0.999080, tq8 0.999940).
+    /// </summary>
+    private static double MinCos(int bits) => bits switch { 8 => 0.9998, 4 => 0.997, _ => throw new ArgumentOutOfRangeException(nameof(bits)) };
+
+    /// <summary>
+    /// Diagnostic, not a gate (#1892 Task 6 fix round): the drift floor between two correct paths, which is why the model-level gate
+    /// excludes tq3. Every variant is teacher-forced on the scratch oracle's greedy tokens.
+    /// <list type="bullet">
+    /// <item>oracle vs oracle with invSqrtD one F32 ulp up (every encode input moves by about 1 ulp);</item>
+    /// <item>in-place vs in-place with the last bit of one F16 key norm flipped (layer 0, position 0, head 0) after prefill;</item>
+    /// <item>in-place vs oracle, and each one's distance to F16 KV.</item>
+    /// </list>
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void Diagnostic_DriftFloor_OneUlpControl(int bits)
+    {
+        RequireKernels();
+        string modelPath = Environment.GetEnvironmentVariable("DOTLLM_SMOLLM_Q8_GGUF")
+            ?? TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
+        Skip.If(!File.Exists(modelPath), $"SmolLM-135M Q8_0 GGUF not found at {modelPath}");
+        using var gguf = GgufFile.Open(modelPath);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int[] prompt = tokenizer.Encode("The quick brown fox jumps over the lazy dog, and then the capital of France is Paris while the capital of Germany is");
+        const int steps = 3;
+        int maxSeq = prompt.Length + steps + 2, vocab = config.VocabSize;
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, FindPtxDir()!);
+
+        var kvConfig = new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant, 0, bits, Seed);
+        var codecK = Codec(config.HeadDim, bits, Seed);
+        var codecV = Codec(config.HeadDim, bits, Seed ^ TurboQuantCodec.VSeedMask);
+        float invUp = MathF.BitIncrement(codecK.InvSqrtD);
+        Assert.NotEqual(codecK.InvSqrtD, invUp);
+
+        var fed = new List<int>();
+        List<float[]> oracle, oracleUlp, ip, ipFlip, f16;
+        using (var c = model.CreateTurboQuantKvCache(maxSeq, codecK.MseBits, codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD))
+            oracle = RunSeq(model, c, prompt, fed, steps, vocab);
+        using (var c = model.CreateTurboQuantKvCache(maxSeq, codecK.MseBits, codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, invUp))
+            oracleUlp = RunSeq(model, c, prompt, fed, steps, vocab);
+        using (var c = model.CreateKvCache(maxSeq, kvConfig)) ip = RunSeq(model, c, prompt, fed, steps, vocab);
+        using (var c = (CudaTurboQuantInPlaceKvCache)model.CreateKvCache(maxSeq, kvConfig))
+        {
+            Assert.Equal(TqNormFormat.F16, c.NormFormat);
+            ipFlip = RunSeq(model, c, prompt, fed, steps, vocab, afterPrefill: () =>
+            {
+                var h = new ushort[1];
+                Down(h, c.GetKeyNormsPtr(0));
+                h[0] ^= 1;
+                Up(c.GetKeyNormsPtr(0), h);
+            });
+        }
+        using (var c = model.CreateKvCache(maxSeq)) f16 = RunSeq(model, c, prompt, fed, steps, vocab);
+
+        for (int i = 0; i <= steps; i++)
+        {
+            string label = i == 0 ? "prefill" : $"decode {i - 1}";
+            _out.WriteLine($"DRIFT b{bits} {label}: cos(oracle,oracle+ulp(invSqrtD))={Cos(oracle[i], oracleUlp[i]).cos:F6} " +
+                           $"cos(ip,ip+normLsbFlip)={Cos(ip[i], ipFlip[i]).cos:F6} cos(ip,oracle)={Cos(ip[i], oracle[i]).cos:F6} " +
+                           $"cos(ip,f16)={Cos(ip[i], f16[i]).cos:F6} cos(oracle,f16)={Cos(oracle[i], f16[i]).cos:F6} " +
+                           $"argmax oracle={Argmax(oracle[i])} ulp={Argmax(oracleUlp[i])} ip={Argmax(ip[i])} flip={Argmax(ipFlip[i])} f16={Argmax(f16[i])}");
+        }
+        // Precondition only: the flip lands after prefill, so the two in-place prefill rows are the same computation.
+        Assert.Equal(1.0, Cos(ip[0], ipFlip[0]).cos, 6);
+    }
+
+    private static List<float[]> RunSeq(CudaTransformerModel model, DotLLM.Core.Attention.IKvCache cache, int[] prompt, List<int> fed,
+                                        int steps, int vocab, Action? afterPrefill = null)
+    {
+        var rows = new List<float[]>();
+        using (var l = Forward(model, cache, prompt, 0)) rows.Add(LastRow(l, vocab));
+        afterPrefill?.Invoke();
+        for (int s = 0; s < steps; s++)
+        {
+            if (fed.Count <= s) fed.Add(Argmax(rows[^1]));
+            using var l = Forward(model, cache, [fed[s]], prompt.Length + s);
+            rows.Add(LastRow(l, vocab));
+        }
+        return rows;
     }
 
     private static DotLLM.Core.Tensors.ITensor Forward(CudaTransformerModel model, DotLLM.Core.Attention.IKvCache cache, int[] tokens, int start)
@@ -492,11 +605,11 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
     /// <summary>
     /// In-place vs the scratch oracle across 30 layers: the two paths round at different points, and a 1-ulp change in a
     /// later layer's K/V input can flip a TurboQuant code (quantization digitizes ULP drift), so whole-model logits are not
-    /// held to the kernel tolerance. Gates: cos(in-place, oracle) > 0.99, the argmax agrees unless the oracle's top-2 gap is
+    /// held to the kernel tolerance. Gates: cos(in-place, oracle) > <paramref name="minCos"/> (per bit, <see cref="MinCos"/>), the argmax agrees unless the oracle's top-2 gap is
     /// below 0.1, and the in-place path is no farther from the F16-KV logits than about the oracle is
     /// (1 - cos_ip_f16 &lt;= 2 (1 - cos_oracle_f16) + 1e-3). A wrong kernel or rotation destroys all three.
     /// </summary>
-    private void AssertLogitsTrack(float[] got, float[] oracle, float[] f16, string label)
+    private void AssertLogitsTrack(float[] got, float[] oracle, float[] f16, string label, double minCos)
     {
         var (cos, max) = Cos(got, oracle);
         var (cosIpF16, _) = Cos(got, f16);
@@ -506,7 +619,7 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         double gap = sorted[^1] - sorted[^2];
         _out.WriteLine($"{label}: cos(ip,oracle)={cos:F6} maxAbsLogit={max:F4} cos(ip,f16)={cosIpF16:F6} cos(oracle,f16)={cosOrF16:F6} " +
                        $"argmax ip={ga} oracle={oa} f16={Argmax(f16)} oracleTop2Gap={gap:F4}");
-        Assert.True(cos > 0.99, $"{label}: logits diverged from the oracle, cos={cos:F6}");
+        Assert.True(cos > minCos, $"{label}: logits diverged from the oracle, cos={cos:F6} <= {minCos}");
         Assert.True(1 - cosIpF16 <= 2 * (1 - cosOrF16) + 1e-3,
             $"{label}: in-place is farther from F16 KV (cos {cosIpF16:F6}) than the oracle is (cos {cosOrF16:F6})");
         if (gap > 0.1) Assert.Equal(oa, ga);
