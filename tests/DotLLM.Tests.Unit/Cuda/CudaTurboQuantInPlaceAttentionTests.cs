@@ -127,6 +127,7 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         public required bool Flash;
         public required long ScalarLaunches;
         public required long FlashLaunches;
+        public required long SpecLaunches;  // the subset of FlashLaunches that ran a bit-specialised _tq{bits} entry (#1924)
     }
 
     /// <summary>
@@ -179,9 +180,11 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
             }
 
             long scalar0 = CudaKernels.AttentionKvTqLaunches, flash0 = CudaKernels.AttentionFlashPrefillKvTqLaunches;
+            long spec0 = CudaKernels.AttentionFlashPrefillKvTqSpecLaunches;
             bool flash = CudaTurboQuantInPlaceAttention.Run(_kernels!, ip, 0, dQ, dK + (nint)(offset * rowBytes), dV + (nint)(offset * rowBytes),
                 positions.AsSpan(offset, seqQ), seqQ, numHeads, numKvHeads, hd, sliding, sinksPtr, dOut, s, flashEnabled);
             long scalarRuns = CudaKernels.AttentionKvTqLaunches - scalar0, flashRuns = CudaKernels.AttentionFlashPrefillKvTqLaunches - flash0;
+            long specRuns = CudaKernels.AttentionFlashPrefillKvTqSpecLaunches - spec0;
             Assert.Equal(total, ip.CurrentLength);
 
             oracle.UpdateDevice(dK + (nint)(offset * rowBytes), dV + (nint)(offset * rowBytes), positions.AsSpan(offset, seqQ), seqQ, 0, s, _kernels!);
@@ -195,7 +198,7 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
             return new CaseResult
             {
                 InPlace = ToFloat(got), Oracle = ToFloat(exp), Fresh = ToFloat(fresh), SeqKv = total, Flash = flash,
-                ScalarLaunches = scalarRuns, FlashLaunches = flashRuns,
+                ScalarLaunches = scalarRuns, FlashLaunches = flashRuns, SpecLaunches = specRuns,
             };
         }
         finally
@@ -217,9 +220,9 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         return (max, at, Math.Sqrt(ss / got.Length));
     }
 
-    private void AssertMatchesOracle(CaseResult r, int hd, string label)
+    private void AssertMatchesOracle(CaseResult r, int hd, string label, double tolScale = 1.0)
     {
-        double tol = Tolerance(r.SeqKv, hd);
+        double tol = Tolerance(r.SeqKv, hd) * tolScale;
         var (max, at, rms) = Compare(r.InPlace, r.Oracle);
         _out.WriteLine($"{label}: seqKv={r.SeqKv} flash={r.Flash} maxAbs={max:E3} (at {at}) tol={tol:E3} oracleRms={rms:F3}");
         // Precondition: the oracle output must dwarf the tolerance, else a wrong kernel could hide inside it.
@@ -321,7 +324,14 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
 
     // ── Tensor-core prefill arm (attention_flash_mma_prefill_kvq_hd{64,128}_tqtq) ─────────────────────────
 
-    public static IEnumerable<object[]> FlashCases() =>
+    public static IEnumerable<object[]> FlashCases()
+    {
+        foreach (var c in FlashShapes())
+            foreach (bool legacy in new[] { false, true })
+                yield return [.. c, legacy];
+    }
+
+    private static IEnumerable<object[]> FlashShapes() =>
     [
         // bits, hd, numHeads, numKvHeads, seqQ, offset
         [3, 64, 6, 2, 16, 0],
@@ -334,20 +344,64 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         [3, 128, 8, 2, 64, 260],    // history past one 256-row span
         [7, 128, 8, 2, 16, 20],     // b7: shift + 8b > 64, the third-word read
         [5, 64, 6, 2, 16, 9],
+        [4, 64, 6, 2, 32, 20],      // #1924: hd64 tq4 on the specialised entry
+        // #1924 E1: Qwen3-4B geometry (32/8, group 4), partial query tile + tail clamp at hd128, every specialised bit width
+        [4, 128, 32, 8, 64, 300],
+        [3, 128, 32, 8, 64, 300],
+        [4, 128, 8, 2, 40, 5],
+        [2, 128, 32, 8, 64, 40],
+        [8, 128, 32, 8, 32, 40],
     ];
 
+    /// <summary>Bit widths with a specialised tensor-core TurboQuant prefill entry (#1924 E1); the others run the generic _tqtq.</summary>
+    private static bool HasSpecEntry(int bits) => bits is 2 or 3 or 4 or 8;
+
+    /// <summary>
+    /// The tensor-core prefill arm against the oracle, on both entries: <paramref name="legacy"/> forces the generic <c>_tqtq</c>
+    /// (#1924 A/B switch); otherwise bits 2/3/4/8 must run the bit-specialised <c>_tq{bits}</c> entry (deferred norms, shared-memory
+    /// centroid table) and bits 5/7 the generic one. The specialised-launch counter proves which entry ran.
+    /// </summary>
     [SkippableTheory]
     [MemberData(nameof(FlashCases))]
-    public void FlashPrefill_MatchesOracle(int bits, int hd, int numHeads, int numKvHeads, int seqQ, int offset)
+    public void FlashPrefill_MatchesOracle(int bits, int hd, int numHeads, int numKvHeads, int seqQ, int offset, bool legacy)
     {
         RequireKernels();
         Assert.True(_kernels!.HasAttentionFlashPrefillKvTq(hd), $"tensor-core TurboQuant prefill hd{hd} not loaded (stale PTX / pre-Ampere?)");
-        var r = RunCase(bits, hd, numHeads, numKvHeads, seqQ, offset, 0, false, flashEnabled: true,
+        bool expectSpec = !legacy && HasSpecEntry(bits);
+        if (HasSpecEntry(bits))
+            Assert.True(_kernels.HasAttentionFlashPrefillKvTqSpecialized(hd, bits), $"specialised TurboQuant prefill hd{hd} tq{bits} not loaded (stale PTX?)");
+        CaseResult r;
+        CudaKernels.TqPrefillVariantOverride = legacy ? CudaKernels.TqPrefillVariant.Legacy : null;
+        try
+        {
+            r = RunCase(bits, hd, numHeads, numKvHeads, seqQ, offset, 0, false, flashEnabled: true,
                         seed: 77 + bits * 100 + hd + seqQ);
+        }
+        finally { CudaKernels.TqPrefillVariantOverride = null; }
         Assert.True(r.Flash, "the tensor-core arm must be the one dispatched for this shape");
         Assert.Equal(1, r.FlashLaunches);
+        Assert.Equal(expectSpec ? 1 : 0, r.SpecLaunches);
         Assert.Equal(0, r.ScalarLaunches);
-        AssertMatchesOracle(r, hd, $"flash b{bits} hd{hd} {numHeads}/{numKvHeads} q{seqQ}@{offset}");
+        AssertMatchesOracle(r, hd, $"flash {(expectSpec ? "spec" : "legacy")} b{bits} hd{hd} {numHeads}/{numKvHeads} q{seqQ}@{offset}");
+    }
+
+    /// <summary>
+    /// #1924 E1: the specialised entry folds the V norm into the P operand as <c>half(p * n_v)</c>. V rows are scaled so the stored
+    /// V norms sit near the F16 maximum (about 15K to 59K, under 65,504, so nothing saturates): an overflow or a lost norm in that
+    /// packing shows. The tolerance scales with the V amplitude (the default fixture's vScale is 2), since the output and every
+    /// rounding in it scale linearly with V.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(4)]
+    [InlineData(3)]
+    public void DeferredNorm_NearF16MaxNorm_MatchesOracle(int bits)
+    {
+        RequireKernels();
+        const float vScale = 2600f;
+        var r = RunCase(bits, 128, 32, 8, 64, 40, 0, false, flashEnabled: true, seed: 6100 + bits, vScale: vScale);
+        Assert.True(r.Flash);
+        Assert.Equal(1, r.SpecLaunches);
+        AssertMatchesOracle(r, 128, $"near-F16-max V norm b{bits}", tolScale: vScale / 2f);
     }
 
     /// <summary>
@@ -367,6 +421,8 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
             : RunCase(3, 64, 6, 2, 1, 80, 0, true, flashEnabled: false, seed: 5160 + (int)fmt, normFormat: fmt);
         Assert.Equal(flash, r.Flash);
         Assert.Equal(flash ? 1 : 0, r.FlashLaunches);
+        // #1924: BF16 norms run the specialised entry (raw 16-bit staging); the F32 reference format stays on the generic _tqtq.
+        Assert.Equal(flash && fmt == TqNormFormat.Bf16 ? 1 : 0, r.SpecLaunches);
         Assert.Equal(flash ? 0 : 1, r.ScalarLaunches);
         AssertMatchesOracle(r, flash ? 128 : 64, $"norm {fmt} {(flash ? "flash" : "scalar")}");
     }
