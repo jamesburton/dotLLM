@@ -387,10 +387,13 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
     /// a 16+ token prefill runs the tensor-core TurboQuant arm on every layer, and each decode step runs eager (graph capture never
     /// engages for this cache type, D2) on the scalar arm; logits track the scratch oracle (same codec constants) at every step.
     /// Precondition: graph capture is on and a plain F16 cache's decode does get captured, so "not captured" is not vacuous.
+    /// Bits 4 and 8 only: at tq3 SmolLM is so degraded (oracle-vs-F16 cos 0.79 by decode step 1) that rounding-point differences
+    /// between two correct paths flip codes downstream and cos(in-place, oracle) drops to 0.98 with every argmax still equal
+    /// (measured on framework, #1892 Task 6); bits 3 is gated strictly at the kernel level instead.
     /// </summary>
     [SkippableTheory]
-    [InlineData(3)]
     [InlineData(4)]
+    [InlineData(8)]
     public void TqDecode_RunsEager_NotCaptured_MatchesOracle(int bits)
     {
         RequireKernels();
