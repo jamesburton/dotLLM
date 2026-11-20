@@ -64,6 +64,7 @@ switch (mode)
     case "speed": foreach (int b in bitsList) Speed(b); break;
     case "parity": foreach (int b in bitsList) Parity(b); break;
     case "quality": Quality(); break;
+    case "vgpr": foreach (int b in bitsList) Vgpr(b); break;
     default: throw new ArgumentException("mode");
 }
 return;
@@ -107,6 +108,10 @@ Func<ModelConfig, int, IKvCache> InPlaceFactory(int bits)
     if (model is DotLLM.Cuda.CudaTransformerModel cu)
     {
         eager = Prop(cu, "EagerDecodeCount"); cap = Prop(cu, "GraphCaptureCount"); rep = Prop(cu, "GraphReplayCount");
+        var kt = typeof(DotLLM.Cuda.CudaTransformerModel).Assembly.GetType("DotLLM.Cuda.CudaKernels")!;
+        foreach (var n in new[] { "AttentionKvTqLaunches", "AttentionFlashPrefillKvTqLaunches" })
+            attn += Convert.ToInt64(kt.GetProperty(n, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(null)
+                ?? kt.GetField(n, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(null) ?? 0L);
     }
     return (attn, eager, cap, rep, TurboQuantKv.InPlaceCachesBuilt);
 }
@@ -145,6 +150,19 @@ double Decode(IKvCache c, int[] t, int from, int n)
 }
 
 // ───────────────────────── speed ─────────────────────────
+static string Vram()
+{
+    try
+    {
+        var psi = new ProcessStartInfo("nvidia-smi", "--query-gpu=memory.used,memory.total --format=csv,noheader,nounits") { RedirectStandardOutput = true, UseShellExecute = false };
+        using var p = Process.Start(psi)!;
+        string o = p.StandardOutput.ReadToEnd().Trim(); p.WaitForExit();
+        return o.Replace(" ", "").Replace(",", "/") + "MiB";
+    }
+    catch { return "n/a"; }
+}
+
+
 void Speed(int bits)
 {
     if (all.Length < ctx + decodeN + 2) throw new InvalidOperationException("corpus too short");
@@ -158,16 +176,45 @@ void Speed(int bits)
     };
     var res = new Dictionary<string, List<(double pf, double dc)>> { ["scratch"] = [], ["inplace"] = [] };
     var paths = new Dictionary<string, string>();
+    if (a.ContainsKey("reuse-prefill"))
+    {
+        // Decode-only A/B: ONE timed prefill per arm (reported without a range), then the decode reps roll the cache back to ctx. Same-session, interleaved.
+        var caches = new Dictionary<string, IKvCache>(); var pfOnce = new Dictionary<string, double>();
+        foreach (var (name, make) in arms) { caches[name] = make(); pfOnce[name] = Prefill(caches[name], t, ctx); Log($"{name} prefill once: {ctx / pfOnce[name]:F1} tok/s ({pfOnce[name]:F0}s) vram={Vram()}"); }
+        for (int r = 0; r <= reps; r++)
+            foreach (var (name, _) in arms)
+            {
+                var c0 = Counters();
+                double dc = Decode(caches[name], t, ctx, decodeN);
+                caches[name].Rollback(ctx);
+                var c1 = Counters();
+                paths[name] = $"{caches[name].GetType().Name}; reusePrefill; vram={Vram()}; attnDelta={c1.attn - c0.attn} eagerDelta={c1.eager - c0.eager} captureDelta={c1.capture - c0.capture} replayDelta={c1.replay - c0.replay} inPlaceCachesBuilt={c1.inplaceCaches}";
+                if (r == 0) { Log($"warmup {name}: decode {decodeN / dc:F2} tok/s [{paths[name]}]"); continue; }
+                res[name].Add((pfOnce[name], dc));
+                Log($"rep {r} {name}: decode {decodeN / dc:F2} tok/s ({dc:F1}s)");
+            }
+        foreach (var c in caches.Values) c.Dispose();
+        foreach (var name in res.Keys)
+        {
+            var dcs = res[name].Select(x => decodeN / x.dc).OrderBy(x => x).ToArray();
+            Append(new { kind = "speed", backend, model = tag, bits, ctx, decodeN, chunk, reps, arm = name, path = paths[name], decodeOnly = true,
+                prefillOnce = ctx / pfOnce[name], decodeMedian = Med(dcs), decodeMin = dcs[0], decodeMax = dcs[^1] });
+        }
+        Log($"SPEED(decode-only) {backend} tq{bits} ctx={ctx}: decode median scratch {Med(res["scratch"].Select(x => decodeN / x.dc).OrderBy(x => x).ToArray()):F2} vs inplace {Med(res["inplace"].Select(x => decodeN / x.dc).OrderBy(x => x).ToArray()):F2}");
+        return;
+    }
     // reps+1 rounds; round 0 is the discarded warm-up (one per arm). Order: A B A B ...
     for (int r = 0; r <= reps; r++)
         foreach (var (name, make) in arms)
         {
             var c0 = Counters();
             using var c = make();
+            string vramAlloc = Vram();
             double pf = Prefill(c, t, ctx);
+            string vramPrefill = Vram();
             double dc = Decode(c, t, ctx, decodeN);
             var c1 = Counters();
-            paths[name] = $"{c.GetType().Name}; attnDelta={c1.attn - c0.attn} eagerDelta={c1.eager - c0.eager} captureDelta={c1.capture - c0.capture} replayDelta={c1.replay - c0.replay} inPlaceCachesBuilt={c1.inplaceCaches}";
+            paths[name] = $"{c.GetType().Name}; vramUsedAfterAlloc={vramAlloc} afterPrefill={vramPrefill} afterDecode={Vram()}; attnDelta={c1.attn - c0.attn} eagerDelta={c1.eager - c0.eager} captureDelta={c1.capture - c0.capture} replayDelta={c1.replay - c0.replay} inPlaceCachesBuilt={c1.inplaceCaches}";
             if (r == 0) { Log($"warmup {name}: prefill {ctx / pf:F1} tok/s decode {decodeN / dc:F2} tok/s  [{paths[name]}]"); continue; }
             res[name].Add((pf, dc));
             Log($"rep {r} {name}: prefill {ctx / pf:F1} tok/s ({pf:F1}s)  decode {decodeN / dc:F2} tok/s ({dc:F1}s)");
@@ -190,7 +237,10 @@ List<float[]> TeacherForced(IKvCache c, int[] t, int n)
     var rows = new List<float[]>();
     const int P = 64;
     using (var l = model.Forward(t.AsSpan(0, P), Enumerable.Range(0, P).ToArray(), dev, c))
-        for (int i = 0; i < P; i++) rows.Add(Row(l, i));
+    {
+        for (int i = 0; i < P - 1; i++) rows.Add([]);   // only the last prompt row is compared (a GPU forward may return only that row)
+        rows.Add(Row(l, (int)l.Shape[0] - 1));
+    }
     for (int i = P; i < P + n; i++)
     {
         using var l = model.Forward(t.AsSpan(i, 1), [i], dev, c);
@@ -240,18 +290,18 @@ void Parity(int bits)
     using (var c = factory(config, 64 + gen + 8)) gIn = Greedy(c, all, gen);
     // Compared rows: the last prompt row (prefill) and every decode row.
     var rowsIdx = Enumerable.Range(63, steps + 1).ToArray();
-    double minCos = 1, maxMeanAbs = 0, sumEff = 0, sumVs = 0; int agree = 0;
+    double minCos = 1, maxMeanAbs = 0, sumEff = 0, sumVs = 0; int agree = 0, worst = -1; var coses = new List<double>();
     foreach (int r in rowsIdx)
     {
         var (vsM, cos, same) = Cmp(inp[r], oracle[r]);
         var (effM, _, _) = Cmp(oracle[r], plain[r]);
-        sumVs += vsM; sumEff += effM; if (cos < minCos) minCos = cos; if (vsM > maxMeanAbs) maxMeanAbs = vsM; if (same) agree++;
+        coses.Add(cos); sumVs += vsM; sumEff += effM; if (cos < minCos) { minCos = cos; worst = r; } if (vsM > maxMeanAbs) maxMeanAbs = vsM; if (same) agree++;
     }
     double ratio = sumVs / sumEff;
     int firstDiv = FirstDiff(gIn.ids, gOracle.ids);
     Append(new { kind = "parity", backend, model = tag, layers = config.NumLayers, bits, steps, rows = rowsIdx.Length,
         oraclePath, inPath, oracleAttnDelta = oracleAttn, inPlaceAttnDelta = cs1.attn - cs0.attn, inPlaceCachesBuilt = cs1.inplaceCaches,
-        meanAbsInVsOracle = sumVs / rowsIdx.Length, meanAbsCodecEffect = sumEff / rowsIdx.Length, ratio, minCosInVsOracle = minCos,
+        meanAbsInVsOracle = sumVs / rowsIdx.Length, meanAbsCodecEffect = sumEff / rowsIdx.Length, ratio, minCosInVsOracle = minCos, worstRow = worst, p5Cos = coses.OrderBy(x => x).ElementAt(coses.Count / 20),
         maxRowMeanAbs = maxMeanAbs, argmaxAgree = (double)agree / rowsIdx.Length,
         greedyLen = gen, firstDivergence = firstDiv,
         top2GapOracleAtDiv = firstDiv >= 0 ? gOracle.gap[firstDiv] : (double?)null, top2GapInPlaceAtDiv = firstDiv >= 0 ? gIn.gap[firstDiv] : (double?)null,
@@ -284,9 +334,10 @@ void Quality()
     float[][] Run(IKvCache c)
     {
         var keep = new float[evalRows][];
-        for (int s = 0; s < ctx; s += chunk)
+        int qchunk = Math.Max(1, Math.Min(chunk, model.MaxAllRowLogitsLength));   // a GPU forward returns every row only up to this
+        for (int s = 0; s < ctx; s += qchunk)
         {
-            int m = Math.Min(chunk, ctx - s);
+            int m = Math.Min(qchunk, ctx - s);
             var pos = Enumerable.Range(s, m).ToArray();
             using var l = model.Forward(t.AsSpan(s, m), pos, dev, c);
             for (int i = 0; i < m; i++) { int g = s + i; if (g >= ctx - evalRows) keep[g - (ctx - evalRows)] = Row(l, i); }
@@ -334,6 +385,55 @@ static double Kl(float[] r, float[] c)
     for (int i = 0; i < r.Length; i++) { double lp = r[i] - rm - lr; double p = Math.Exp(lp); if (p > 0) kl += p * (lp - (c[i] - cm - lc)); }
     return kl;
 }
+
+// ───────────────────────── vgpr (Vulkan, VK_AMD_shader_info) ─────────────────────────
+// Walks the model's kernel objects by reflection, collects every ComputePipeline and asks the driver for its post-compile VGPR / SGPR / LDS /
+// scratch use. The TurboQuant twins live under the host's _kvTqSet; the F16 siblings are the same kernel classes under the model's own fields.
+void Vgpr(int bits)
+{
+    var vk = (DotLLM.Vulkan.VulkanTransformerModel)model;
+    var factory = InPlaceFactory(bits);
+    using (var c = factory(config, 256)) { }   // builds the twin set (and proves it is complete)
+    const BindingFlags F = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+    object dev = vk.GetType().GetProperty("Device", F)!.GetValue(vk)!;
+    var stat = dev.GetType().GetMethod("GetShaderStatisticsAmd", F)!;
+    if (!(bool)dev.GetType().GetProperty("HasShaderInfoAmd", F)!.GetValue(dev)!) throw new InvalidOperationException("no VK_AMD_shader_info");
+    Type pipeT = typeof(DotLLM.Vulkan.ComputePipeline);
+    var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
+    var found = new List<(string path, nint pipe)>();
+    void Walk(object? o, string path, int depth)
+    {
+        if (o is null || depth > 5 || !seen.Add(o)) return;
+        var t = o.GetType();
+        if (t == pipeT) { found.Add((path, (nint)pipeT.GetProperty("Pipeline")!.GetValue(o)!)); return; }
+        if (o is string || t.IsPrimitive || t.IsEnum || t.IsPointer) return;
+        if (o is System.Collections.IEnumerable en) { int i = 0; foreach (var x in en) Walk(x, path + "[" + i++ + "]", depth + 1); return; }
+        if (t.Assembly != pipeT.Assembly) return;
+        if (t.Name.Contains("VulkanDevice") || t.Name.Contains("VulkanModule") || t == typeof(DotLLM.Vulkan.VulkanTransformerModel)) return;
+        for (var bt = t; bt != null && bt != typeof(object); bt = bt.BaseType)
+            foreach (var f in bt.GetFields(F | BindingFlags.DeclaredOnly))
+                if (!f.FieldType.IsPointer) Walk(f.GetValue(o), path + "/" + t.Name + "." + f.Name, depth + 1);
+    }
+    object tqSet = vk.GetType().GetField("_kvTqSet", F)!.GetValue(vk)!;
+    Walk(tqSet, "tq", 0);
+    int nTq = found.Count;
+    foreach (var f in vk.GetType().GetFields(F))
+        if (f.Name != "_kvTqSet" && f.GetValue(vk) is { } v && v.GetType().Assembly == pipeT.Assembly && v.GetType().Name.Contains("Kernel")
+            && (f.Name.Contains("ttention") || f.Name.Contains("Flash") || f.Name.Contains("Kv")))
+            Walk(v, "ref:" + f.Name, 0);
+    Log("VGPR table (columns: VGPR used, SGPR used, LDS used B, scratch B, VGPR available); tq = _kvTqSet twins, ref: = the model's own kernel fields");
+    for (int i = 0; i < found.Count; i++)
+    {
+        object st = stat.Invoke(dev, [found[i].pipe, 32u])!;   // VkShaderStageFlags.Compute = 0x20
+        var ru = st.GetType().GetField("resourceUsage", F)!.GetValue(st)!;
+        uint G(object o, string n) { var v = o.GetType().GetField(n, F)!.GetValue(o); return v is UIntPtr up ? (uint)up : v is nuint nu ? (uint)nu : Convert.ToUInt32(v); }
+        string r = $"{G(ru, "numUsedVgprs")}\t{G(ru, "numUsedSgprs")}\t{G(ru, "ldsUsageSizeInBytes")}\t{G(ru, "scratchMemUsageInBytes")}\t{G(st, "numAvailableVgprs")}";
+        Append(new { kind = "vgpr", bits, group = i < nTq ? "tq" : "ref", path = found[i].path, vgpr = G(ru, "numUsedVgprs"), sgpr = G(ru, "numUsedSgprs"),
+            lds = G(ru, "ldsUsageSizeInBytes"), scratch = G(ru, "scratchMemUsageInBytes"), vgprAvail = G(st, "numAvailableVgprs") });
+        Log($"VGPR {(i < nTq ? "TQ " : "REF")} {found[i].path}\t{r}");
+    }
+}
+
 
 // ───────────────────────── plumbing ─────────────────────────
 double Med(double[] sorted) => sorted.Length % 2 == 1 ? sorted[sorted.Length / 2] : (sorted[sorted.Length / 2 - 1] + sorted[sorted.Length / 2]) / 2;
