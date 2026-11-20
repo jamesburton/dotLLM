@@ -277,6 +277,23 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.False(IsError(perCall), perCall.ToString());
     }
 
+    [Fact]
+    public async Task Status_WithoutAPath_ReadsTheIndexOnly_NoScan()
+    {
+        string tree = NewTree();
+        string store = NewDir("store");
+        await using McpWire wire = await McpWire.StartAsync(["--store", store, "--model", _fx.ModelA]);
+        Assert.False(IsError(await wire.CallToolAsync("chunkcache_build", $$"""{"path": {{JsonSerializer.Serialize(tree)}}}""")));
+        Directory.Delete(tree, recursive: true); // the tree is gone: only a scan-free status can answer
+
+        JsonElement status = await wire.CallToolAsync("chunkcache_status", "{}");
+        Assert.False(IsError(status), status.ToString());
+        Assert.True(status.GetProperty("structuredContent").GetProperty("total_chunks").GetInt32() > 0);
+
+        // Control: with the path, status scans, and the missing tree is an error.
+        Assert.True(IsError(await wire.CallToolAsync("chunkcache_status", $$"""{"path": {{JsonSerializer.Serialize(tree)}}}""")));
+    }
+
     // ------------------------------------------------------------------------------------------------ errors
 
     [Fact]
