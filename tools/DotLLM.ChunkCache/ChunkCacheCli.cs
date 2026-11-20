@@ -24,6 +24,7 @@ internal static class ChunkCacheCli
                     --offline: list or delete orphans (or, with --mode all --model, one model's entries) holding the store's owner lock
           prewarm   --server: queue chunk texts (a selection or a --texts file) for the server to encode (text only)
           explain   --server: a dry run of the chunk_cache plan for a request file (POST /v1/chunk-cache/explain)
+          mcp       a stdio MCP server whose tools wrap the verbs above (chunkcache mcp --help)
 
         Every verb's --help lists all of its options (value form, default, whether repeatable, environment variable), its exit codes,
         its --json fields and examples. The server owns the model identity and every K/V write: build/prewarm/evict go through

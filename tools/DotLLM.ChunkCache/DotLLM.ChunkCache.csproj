@@ -11,6 +11,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="ModelContextProtocol.Core" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\DotLLM.ChunkCache.Client\DotLLM.ChunkCache.Client.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse\DotLLM.ChunkReuse.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.CSharp\DotLLM.ChunkReuse.CSharp.csproj" />
@@ -19,6 +23,10 @@
     <ProjectReference Include="..\..\src\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Engine\DotLLM.Engine.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Cpu\DotLLM.Cpu.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="McpSchemas\*.output.json" />
   </ItemGroup>
 
   <ItemGroup>
