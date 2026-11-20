@@ -279,9 +279,20 @@ void Parity(int bits)
     using (var c = Plain(64 + gen + 8)) gPlain = Greedy(c, all, gen);
     List<float[]> oracle; (int[] ids, double[] gap) gOracle; string oraclePath;
     long a0 = Counters().attn;
-    using (var c = Scratch(64 + steps + 8, bits)) { oracle = TeacherForced(c, t, steps); oraclePath = c.GetType().Name; }
+    var oracleClock = Stopwatch.StartNew();
+    bool oracleCached = false;
+    if (backend == "cpu" && OracleCache.TryLoad(modelPath, bits, config.NumLayers, steps, gen, vocab, out var cachedRows, out var cachedIds, out var cachedGap))
+    {
+        oracle = cachedRows; gOracle = (cachedIds, cachedGap); oraclePath = "TurboQuantKvCache (cached, F16-rounded rows)"; oracleCached = true;
+    }
+    else
+    {
+        using (var c = Scratch(64 + steps + 8, bits)) { oracle = TeacherForced(c, t, steps); oraclePath = c.GetType().Name; }
+        using (var c = Scratch(64 + gen + 8, bits)) gOracle = Greedy(c, all, gen);
+        if (backend == "cpu") OracleCache.Save(modelPath, bits, config.NumLayers, steps, gen, oracle, gOracle.ids, gOracle.gap);
+    }
+    double oracleSeconds = oracleClock.Elapsed.TotalSeconds;
     long oracleAttn = Counters().attn - a0;
-    using (var c = Scratch(64 + gen + 8, bits)) gOracle = Greedy(c, all, gen);
     var factory = InPlaceFactory(bits);
     var cs0 = Counters();
     List<float[]> inp; (int[] ids, double[] gap) gIn; string inPath;
@@ -300,7 +311,7 @@ void Parity(int bits)
     double ratio = sumVs / sumEff;
     int firstDiv = FirstDiff(gIn.ids, gOracle.ids);
     Append(new { kind = "parity", backend, model = tag, layers = config.NumLayers, bits, steps, rows = rowsIdx.Length,
-        oraclePath, inPath, oracleAttnDelta = oracleAttn, inPlaceAttnDelta = cs1.attn - cs0.attn, inPlaceCachesBuilt = cs1.inplaceCaches,
+        oraclePath, oracleCached, oracleSeconds, inPath, oracleAttnDelta = oracleAttn, inPlaceAttnDelta = cs1.attn - cs0.attn, inPlaceCachesBuilt = cs1.inplaceCaches,
         meanAbsInVsOracle = sumVs / rowsIdx.Length, meanAbsCodecEffect = sumEff / rowsIdx.Length, ratio, minCosInVsOracle = minCos, worstRow = worst, p5Cos = coses.OrderBy(x => x).ElementAt(coses.Count / 20),
         maxRowMeanAbs = maxMeanAbs, argmaxAgree = (double)agree / rowsIdx.Length,
         greedyLen = gen, firstDivergence = firstDiv,
@@ -445,4 +456,52 @@ static Dictionary<string, string> ParseArgs(string[] argv)
     for (int i = 0; i < argv.Length; i++)
         if (argv[i].StartsWith("--")) d[argv[i][2..]] = i + 1 < argv.Length && !argv[i + 1].StartsWith("--") ? argv[++i] : "true";
     return d;
+}
+
+// Slow CPU scratch-oracle results are kept so they are never recomputed: per-row F16 logits (the compared rows) plus the greedy ids and top-2 gaps,
+// keyed by model SHA-256, bits, layers, teacher-forced steps, greedy length and the code commit the oracle was built from.
+static class OracleCache
+{
+    static string Dir => Path.Combine(Environment.CurrentDirectory, ".docs", "t10", "oracle-cache");
+    static string Sha(string model)
+    {
+        Directory.CreateDirectory(Dir);
+        string side = Path.Combine(Dir, Path.GetFileName(model) + ".sha");
+        if (File.Exists(side)) return File.ReadAllText(side).Trim();
+        using var fs = File.OpenRead(model);
+        string h = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fs)).ToLowerInvariant();
+        File.WriteAllText(side, h);
+        return h;
+    }
+    static string Commit()
+    {
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo("git", "rev-parse --short=10 HEAD") { RedirectStandardOutput = true, UseShellExecute = false })!;
+            string o = p.StandardOutput.ReadToEnd().Trim(); p.WaitForExit(); return o.Length > 0 ? o : "nocommit";
+        }
+        catch { return "nocommit"; }
+    }
+    static string File_(string model, int bits, int layers, int steps, int gen)
+        => Path.Combine(Dir, $"{Sha(model)[..16]}_b{bits}_L{layers}_s{steps}_g{gen}_c{Commit()}.oracle");
+    public static void Save(string model, int bits, int layers, int steps, int gen, List<float[]> rows, int[] ids, double[] gap)
+    {
+        using var w = new BinaryWriter(File.Create(File_(model, bits, layers, steps, gen)));
+        w.Write(rows.Count);
+        foreach (var r in rows) { w.Write(r.Length); foreach (float x in r) w.Write((Half)x); }
+        w.Write(ids.Length); foreach (int i in ids) w.Write(i); foreach (double g in gap) w.Write(g);
+    }
+    public static bool TryLoad(string model, int bits, int layers, int steps, int gen, int vocab, out List<float[]> rows, out int[] ids, out double[] gap)
+    {
+        rows = []; ids = []; gap = [];
+        string f = File_(model, bits, layers, steps, gen);
+        if (!File.Exists(f)) return false;
+        using var r = new BinaryReader(File.OpenRead(f));
+        int n = r.ReadInt32();
+        for (int i = 0; i < n; i++) { int len = r.ReadInt32(); var row = new float[len]; for (int j = 0; j < len; j++) row[j] = (float)r.ReadHalf(); rows.Add(row); }
+        int m = r.ReadInt32(); ids = new int[m]; gap = new double[m];
+        for (int i = 0; i < m; i++) ids[i] = r.ReadInt32();
+        for (int i = 0; i < m; i++) gap[i] = r.ReadDouble();
+        return true;
+    }
 }
