@@ -45,7 +45,7 @@ function Assert-PtxVersion {
 # across time steps, so the two kernels backing it disable FMA fusion AND
 # precise math (no --use_fast_math). The bit-perfect set is small; everything
 # else stays on the legacy fast-math path that this build script ships with.
-$bitPerfect = @('conv1d_causal', 'gated_delta_net_scan', 'hadamard_fwht')
+$bitPerfect = @('conv1d_causal', 'gated_delta_net_scan', 'hadamard_fwht', 'turboquant', 'turboquant_rotate')
 
 # Kernels that emit Ampere-only PTX (mma.sync / cp.async) and so MUST be built at
 # compute_86 instead of the global default (dispatch-gated to Ampere+ in C#).

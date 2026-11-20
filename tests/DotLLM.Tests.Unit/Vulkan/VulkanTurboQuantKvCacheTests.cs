@@ -138,21 +138,31 @@ public sealed unsafe class VulkanTurboQuantKvCacheTests
             gpu.DownloadNormBytes(0, values: false, got);
             Assert.Equal(cpuNorms, got);
 
-            // and the dequant decodes them: the K scratch carries the decoded norm
+            // and the dequant decodes them. Recover the norm the SHADER applied directly: the scratch is norm * unitDirection, so
+            // at the coordinate where the CPU unit direction is largest, scratch / unit is the decoded norm to ~1e-7. That is
+            // compared against TurboQuantNormCodec.Decode at a relative 1e-5, which a flushed F16 subnormal norm (decoded 0, a 100%
+            // error) cannot pass. The former 1e-4 absolute-scaled dequant comparison could not see that, because a subnormal norm
+            // contributes < 1e-4 to every element either way.
             var recon = new float[positions.Length * TurboQuantByteExactCorpus.NumKvHeads * hd];
             gpu.DequantKeysToHost(0, recon);
             int n = TurboQuantByteExactCorpus.SeqLen * TurboQuantByteExactCorpus.NumKvHeads;
             var codes = new byte[ck.CodeBytesPerVector];
-            var expect = new float[hd];
+            var unit = new float[hd];
+            int subnormals = 0;
             for (int v = 0; v < n; v++)
             {
                 float norm = TurboQuantNormCodec.Decode(format, cpuNorms, v);
                 ck.Encode(corpus.K.Data.AsSpan(v * hd, hd), codes);
-                ck.Decode(codes, norm, expect);
-                for (int i = 0; i < hd; i++)
-                    Assert.True(Math.Abs(expect[i] - recon[v * hd + i]) <= 1e-4 * Math.Max(1.0, Math.Abs(expect[i])),
-                        $"v={v} i={i}: cpu={expect[i]} gpu={recon[v * hd + i]}");
+                ck.Decode(codes, 1.0f, unit);
+                int j = 0;
+                for (int i = 1; i < hd; i++) if (Math.Abs(unit[i]) > Math.Abs(unit[j])) j = i;
+                float shaderNorm = recon[v * hd + j] / unit[j];
+                Assert.True(Math.Abs(shaderNorm - norm) <= 1e-5f * norm,
+                    $"v={v}: decoded norm cpu={norm:R} shader={shaderNorm:R}");
+                if (format == TqNormFormat.F16 && norm > 0f && norm < 6.103515625e-5f) subnormals++;
             }
+            if (format == TqNormFormat.F16)
+                Assert.True(subnormals > 0, "the corpus has no F16-subnormal norm, so a flush-to-zero decode would pass unseen");
         }
     }
 

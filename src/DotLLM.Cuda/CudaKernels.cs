@@ -108,6 +108,14 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly nint _turboquantDequantF16Func;
     private readonly nint _turboquantEncodeF16Func;
 
+    // TurboQuant Q/O rotation (#1892 step 2) — optional module (turboquant_rotate.ptx): rotates the query into K code space and
+    // the accumulated attention output back out of V code space. `_dyn` twins read the row count from a device pointer.
+    private readonly CudaModule? _tqRotateModule;
+    private readonly nint _tqRotateQF16Func;
+    private readonly nint _tqRotateQF16DynFunc;
+    private readonly nint _tqRotateOF32Func;
+    private readonly nint _tqRotateOF32DynFunc;
+
     // PrismML Hadamard activation transform (hadamard_fwht.ptx) — optional module. The CUDA twin
     // of the Vulkan hadamard_fwht_f32 shader and DotLLM.Cpu.Kernels.Hadamard (issue #479). 0 when
     // the PTX is absent/stale; Hadamard-folded checkpoints then refuse to load on CUDA.
@@ -882,6 +890,16 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _turboquantEncodeF32Func = _turboquantModule.TryGetFunction("turboquant_encode_f32");
             _turboquantDequantF16Func = _turboquantModule.TryGetFunction("turboquant_dequant_f16");
             _turboquantEncodeF16Func = _turboquantModule.TryGetFunction("turboquant_encode_f16");
+        }
+
+        string tqRotatePath = Path.Combine(ptxDir, "turboquant_rotate.ptx");
+        if (File.Exists(tqRotatePath))
+        {
+            _tqRotateModule = CudaModule.LoadFromFile(tqRotatePath);
+            _tqRotateQF16Func = _tqRotateModule.TryGetFunction("tq_rotate_q_f16");
+            _tqRotateQF16DynFunc = _tqRotateModule.TryGetFunction("tq_rotate_q_f16_dyn");
+            _tqRotateOF32Func = _tqRotateModule.TryGetFunction("tq_rotate_o_f32");
+            _tqRotateOF32DynFunc = _tqRotateModule.TryGetFunction("tq_rotate_o_f32_dyn");
         }
 
         string hadamardFwhtPath = Path.Combine(ptxDir, "hadamard_fwht.ptx");
@@ -7192,6 +7210,82 @@ public sealed unsafe partial class CudaKernels : IDisposable
                 (uint)(seqLen * numKvHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>Whether the TurboQuant Q/O rotation kernels (and their <c>_dyn</c> twins) are loaded.</summary>
+    public bool TqRotateAvailable => _tqRotateQF16Func != 0 && _tqRotateQF16DynFunc != 0
+                                     && _tqRotateOF32Func != 0 && _tqRotateOF32DynFunc != 0;
+
+    private static void CheckTqRotate(int numHeads, int headDim)
+    {
+        if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
+        if (headDim <= 0 || (headDim & (headDim - 1)) != 0 || headDim > 256)
+            throw new ArgumentException($"headDim must be a power of two <= 256; got {headDim}.", nameof(headDim));
+    }
+
+    /// <summary>
+    /// Rotates the FP16 query <c>[rows, numHeads, headDim]</c> into K code space in place: <c>q~ = H(S_k * q)/sqrt(d)</c>.
+    /// One block per (row, head). <paramref name="signsK"/> is the device F32 K-side +/-1 sign vector (<c>headDim</c> floats).
+    /// </summary>
+    public unsafe void LaunchTqRotateQ(nint qF16, int rows, int numHeads, int headDim, nint signsK, nint stream)
+    {
+        if (_tqRotateQF16Func == 0)
+            throw new InvalidOperationException("tq_rotate_q_f16 not loaded (turboquant_rotate.ptx missing/stale).");
+        CheckTqRotate(numHeads, headDim);
+        if (rows <= 0) return;
+        nint q = qF16, sg = signsK; int r = rows, nh = numHeads, hd = headDim;
+        float isd = 1.0f / MathF.Sqrt(headDim);
+        void** args = stackalloc void*[] { &q, &sg, &r, &nh, &hd, &isd };
+        CudaDriverApi.cuLaunchKernel(_tqRotateQF16Func,
+                (uint)(rows * numHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// CUDA-graph-capture-safe twin of <see cref="LaunchTqRotateQ"/>: the live row count is read from the device int at
+    /// <paramref name="rowsPtr"/>; the grid covers <paramref name="maxRows"/> (the capture-time maximum) and surplus blocks exit.
+    /// </summary>
+    public unsafe void LaunchTqRotateQDyn(nint qF16, nint rowsPtr, int maxRows, int numHeads, int headDim, nint signsK, nint stream)
+    {
+        if (_tqRotateQF16DynFunc == 0)
+            throw new InvalidOperationException("tq_rotate_q_f16_dyn not loaded (turboquant_rotate.ptx missing/stale).");
+        CheckTqRotate(numHeads, headDim);
+        if (maxRows <= 0) return;
+        nint q = qF16, sg = signsK, rp = rowsPtr; int nh = numHeads, hd = headDim;
+        float isd = 1.0f / MathF.Sqrt(headDim);
+        void** args = stackalloc void*[] { &q, &sg, &rp, &nh, &hd, &isd };
+        CudaDriverApi.cuLaunchKernel(_tqRotateQF16DynFunc,
+                (uint)(maxRows * numHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Rotates the F32 code-space attention output <c>[rows, numHeads, headDim]</c> back in place: <c>o = S_v * H(a~)/sqrt(d)</c>.
+    /// One block per (row, head). <paramref name="signsV"/> is the device F32 V-side +/-1 sign vector.
+    /// </summary>
+    public unsafe void LaunchTqRotateO(nint oF32, int rows, int numHeads, int headDim, nint signsV, nint stream)
+    {
+        if (_tqRotateOF32Func == 0)
+            throw new InvalidOperationException("tq_rotate_o_f32 not loaded (turboquant_rotate.ptx missing/stale).");
+        CheckTqRotate(numHeads, headDim);
+        if (rows <= 0) return;
+        nint o = oF32, sg = signsV; int r = rows, nh = numHeads, hd = headDim;
+        float isd = 1.0f / MathF.Sqrt(headDim);
+        void** args = stackalloc void*[] { &o, &sg, &r, &nh, &hd, &isd };
+        CudaDriverApi.cuLaunchKernel(_tqRotateOF32Func,
+                (uint)(rows * numHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>CUDA-graph-capture-safe twin of <see cref="LaunchTqRotateO"/> (row count read from a device pointer).</summary>
+    public unsafe void LaunchTqRotateODyn(nint oF32, nint rowsPtr, int maxRows, int numHeads, int headDim, nint signsV, nint stream)
+    {
+        if (_tqRotateOF32DynFunc == 0)
+            throw new InvalidOperationException("tq_rotate_o_f32_dyn not loaded (turboquant_rotate.ptx missing/stale).");
+        CheckTqRotate(numHeads, headDim);
+        if (maxRows <= 0) return;
+        nint o = oF32, sg = signsV, rp = rowsPtr; int nh = numHeads, hd = headDim;
+        float isd = 1.0f / MathF.Sqrt(headDim);
+        void** args = stackalloc void*[] { &o, &sg, &rp, &nh, &hd, &isd };
+        CudaDriverApi.cuLaunchKernel(_tqRotateOF32DynFunc,
+                (uint)(maxRows * numHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Dequantizes a quantized weight/KV blob to a contiguous fp32 buffer on device.</summary>
     public void LaunchDequantToF32(nint src, QuantizationType srcDtype,
                                      nint dst, int totalElements, nint stream)
@@ -8496,6 +8590,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         _nemotronMoeModule?.Dispose();
         _quantKvModule?.Dispose();
         _turboquantModule?.Dispose();
+        _tqRotateModule?.Dispose();
         _hadamardFwhtModule?.Dispose();
         _pq2_0GemvMultiModule?.Dispose();
         _pq2_0GemvDp4aModule?.Dispose();

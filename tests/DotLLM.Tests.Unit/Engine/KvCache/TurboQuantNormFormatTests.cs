@@ -150,7 +150,10 @@ public sealed unsafe class TurboQuantNormFormatTests
             var codec = side.Codec;
             int possible = TurboQuantByteExactCorpus.TieValues(codec).Count;
             _output.WriteLine($"b={bits} hd={headDim} half={half} {name}: {side.TieCoords} tie coords in {side.TieVectors} vectors ({possible}/{codec.LevelCount - 1} boundaries admit an exact F32 tie)");
-            if (possible > 0) Assert.True(side.TieCoords >= 4, $"{name}: corpus has only {side.TieCoords} exact ties");
+            // Every config in Configs() admits at least one exact F32 tie (measured: no (0/N) line over all configs), so this is
+            // unconditional: a guard on `possible > 0` would let a corpus that lost its ties pass vacuously.
+            Assert.True(possible > 0, $"{name}: no centroid boundary admits an exact F32 tie at b={bits} hd={headDim}");
+            Assert.True(side.TieCoords >= 4, $"{name}: corpus has only {side.TieCoords} exact ties");
 
             var rot = new float[headDim];
             int n = TurboQuantByteExactCorpus.SeqLen * TurboQuantByteExactCorpus.NumKvHeads;

@@ -38,6 +38,14 @@ public enum VulkanKvStorage
 
     /// <summary>Mixed block KV (issue #1884): K in <see cref="Q4_0"/>, V in <see cref="Q8_0"/>.</summary>
     Q4_0K_Q8_0V = 5,
+
+    /// <summary>
+    /// TurboQuant on both sides (issue #1892): per-head-vector Lloyd-Max codes plus a norm, read in place in code space (the query is
+    /// rotated by <c>tq_rotate_q</c> and the output by <c>tq_rotate_o</c>). It has no element size or block size: rows are sized by the
+    /// TurboQuant layout, so <see cref="VulkanKvStorageExtensions.ElementBytes"/>, <see cref="VulkanKvStorageExtensions.RowBytes"/> and
+    /// <see cref="VulkanKvStorageExtensions.ShaderName"/> refuse it rather than guess.
+    /// </summary>
+    Tq = 6,
 }
 
 /// <summary>Per-format facts the attention kernels and the KV cache share (issue #1102).</summary>
@@ -52,6 +60,32 @@ public static class VulkanKvStorageExtensions
         VulkanKvStorage.F16 => 2,
         _ => throw new ArgumentOutOfRangeException(nameof(storage)),
     };
+
+    /// <summary>The per-side format pair this storage denotes (the combinations are expressed as a pair, #1892).</summary>
+    /// <param name="storage">The storage format.</param>
+    /// <returns>The K and V side formats.</returns>
+    public static DotLLM.Core.Attention.KvFormatPair ToFormatPair(this VulkanKvStorage storage) => storage switch
+    {
+        VulkanKvStorage.F32 => DotLLM.Core.Attention.KvFormatPair.Both(DotLLM.Core.Attention.KvSideFormat.F32),
+        VulkanKvStorage.F16 => DotLLM.Core.Attention.KvFormatPair.Both(DotLLM.Core.Attention.KvSideFormat.F16),
+        VulkanKvStorage.Q8_0 => DotLLM.Core.Attention.KvFormatPair.Both(DotLLM.Core.Attention.KvSideFormat.Q8_0),
+        VulkanKvStorage.Q4_0 => DotLLM.Core.Attention.KvFormatPair.Both(DotLLM.Core.Attention.KvSideFormat.Q4_0),
+        VulkanKvStorage.Q8_0K_Q4_0V => new(DotLLM.Core.Attention.KvSideFormat.Q8_0, DotLLM.Core.Attention.KvSideFormat.Q4_0),
+        VulkanKvStorage.Q4_0K_Q8_0V => new(DotLLM.Core.Attention.KvSideFormat.Q4_0, DotLLM.Core.Attention.KvSideFormat.Q8_0),
+        VulkanKvStorage.Tq => DotLLM.Core.Attention.KvFormatPair.Both(DotLLM.Core.Attention.KvSideFormat.Tq),
+        _ => throw new ArgumentOutOfRangeException(nameof(storage)),
+    };
+
+    /// <summary>The storage a format pair maps onto, or throws when no Vulkan storage holds that combination.</summary>
+    /// <param name="pair">The K and V side formats.</param>
+    /// <returns>The matching storage.</returns>
+    /// <exception cref="NotSupportedException">The combination has no Vulkan storage (mixed TurboQuant is step 6).</exception>
+    public static VulkanKvStorage FromFormatPair(DotLLM.Core.Attention.KvFormatPair pair)
+    {
+        foreach (VulkanKvStorage st in Enum.GetValues<VulkanKvStorage>())
+            if (st.ToFormatPair() == pair) return st;
+        throw new NotSupportedException($"No Vulkan KV storage holds K={pair.K}, V={pair.V}.");
+    }
 
     /// <summary>Elements per Q8_0 KV block.</summary>
     public const int Q8BlockElements = 32;

@@ -298,7 +298,7 @@ public sealed class TurboQuantCodec
     // ── Rotation (Randomized Hadamard Transform) ─────────────────────────
 
     // Forward: y = (1/√d) · H · (D · x)  — sign flip, then Walsh–Hadamard, then normalize.
-    private void Rotate(Span<float> x)
+    internal void Rotate(Span<float> x)
     {
         for (int i = 0; i < _headDim; i++) x[i] *= _signs[i];
         FastWalshHadamard(x);
@@ -307,7 +307,7 @@ public sealed class TurboQuantCodec
 
     // Inverse: x = D · ((1/√d) · H · y). Because H is symmetric with H·H = d·I and D·D = I,
     // applying the normalized WHT then the sign flip inverts the forward transform exactly.
-    private void InverseRotate(Span<float> y)
+    internal void InverseRotate(Span<float> y)
     {
         FastWalshHadamard(y);
         for (int i = 0; i < _headDim; i++) y[i] *= _invSqrtD * _signs[i];
@@ -437,7 +437,7 @@ public sealed class TurboQuantCodec
         }
     }
 
-    private int ReadCode(ReadOnlySpan<byte> codes, int coord)
+    internal int ReadCode(ReadOnlySpan<byte> codes, int coord)
     {
         int bitPos = coord * _mseBits;
         int index = 0;
