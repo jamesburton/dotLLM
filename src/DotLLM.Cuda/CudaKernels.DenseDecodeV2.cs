@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Cuda.Interop;
 
