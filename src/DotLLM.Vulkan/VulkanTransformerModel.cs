@@ -1100,6 +1100,16 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     private readonly BlockKvTwins _kvTqSet = new();
     private TurboQuantKvConstants? _tqKv;
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// With in-place TurboQuant KV active (issue #1892) a forward may write at most <see cref="MaxTurboQuantVectorsPerForward"/> head
+    /// vectors, so the model asks the engine to prefill in chunks of at most <c>floor(65535 / numKvHeads)</c> rows: a long prompt is
+    /// chunked instead of reaching the guard in <c>Forward</c>. 0 (one pass) otherwise. An explicitly configured larger chunk size
+    /// overrides this preference and then meets that guard.
+    /// </remarks>
+    public int PreferredPrefillChunkTokens =>
+        DefaultKvStorage == VulkanKvStorage.Tq ? MaxTurboQuantVectorsPerForward / Config.NumKvHeads : 0;
+
     /// <summary>Head vectors (rows x KV heads) one forward may write to a TurboQuant cache: the guaranteed <c>maxComputeWorkGroupCount</c> per dimension.</summary>
     internal const int MaxTurboQuantVectorsPerForward = 65535;
 

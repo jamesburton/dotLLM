@@ -1,6 +1,13 @@
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
+using DotLLM.Core.Configuration;
+using DotLLM.Core.Models;
+using DotLLM.Core.PositionEncoding;
+using DotLLM.Engine;
 using DotLLM.Engine.KvCache.Codecs;
+using DotLLM.Models.SafeTensors;
+using DotLLM.Tests.Unit.ChunkReuse;
+using DotLLM.Tests.Unit.Models.SafeTensors;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tests.Unit.Engine.KvCache;
@@ -762,12 +769,54 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
             "The quick brown fox jumps over the lazy dog while seven wizards quietly judge a boxing match in Zurich. ", 1 + promptTokens / 12)));
         Assert.True(text.Length >= promptTokens, $"prompt too short: {text.Length}");
         int[] tokens = text[..promptTokens];
+        using var model = VulkanTransformerModel.LoadFromGguf(gguf, config, spvDir);
+        CompareWithOracle(model, config, tokens, spvDir, bits, chunk, expectSplitKv, maxRatio, minCos);
+    }
+
+    /// <summary>Per-coordinate codes of the first <paramref name="vecs"/> head vectors of a layer side, from its stored words.</summary>
+    private static byte[] Codes(uint[] words, TurboQuantLayout l, int vecs)
+    {
+        var codes = new byte[vecs * l.HeadDim];
+        for (int hv = 0; hv < vecs; hv++)
+            for (int c = 0; c < l.HeadDim; c++)
+            {
+                int code = 0;
+                for (int b = 0; b < l.MseBits; b++)
+                {
+                    long bit = (long)c * l.MseBits + b;
+                    code |= (int)((words[hv * l.CodeUintsPerVec + (bit >> 5)] >> (int)(bit & 31)) & 1u) << b;
+                }
+                codes[hv * l.HeadDim + c] = (byte)code;
+            }
+        return codes;
+    }
+
+    private static double Agreement(byte[] a, byte[] b)
+    {
+        int same = 0;
+        for (int i = 0; i < a.Length; i++) if (a[i] == b[i]) same++;
+        return (double)same / a.Length;
+    }
+
+    /// <summary>
+    /// The three-way comparison on an already loaded model (real GGUF or synthetic): plain KV, scratch oracle, in place, all through
+    /// the model's own <c>Forward</c> (so through <c>RecordAttention</c>: rotate Q in, arm, rotate the output out).
+    /// <paramref name="minLayerCodeAgreement"/> &gt; 0 also compares, layer by layer, the K and V codes the two TurboQuant caches end
+    /// up holding.
+    /// </summary>
+    private void CompareWithOracle(VulkanTransformerModel model, ModelConfig config, int[] tokens, string spvDir, int bits, int chunk,
+        bool expectSplitKv, double maxRatio, double minCos, double minLayerCodeAgreement = 0)
+    {
+        int promptTokens = tokens.Length;
         int hd = config.HeadDim, vocab = config.VocabSize;
 
         var codecK = new TurboQuantCodec(hd, bits, Seed, useQjl: false);
         var codecV = new TurboQuantCodec(hd, bits, Seed ^ VSeedXor, useQjl: false);
         Assert.False(codecK.RotationSigns.SequenceEqual(codecV.RotationSigns), "K and V sign seeds must differ");
-        using var model = VulkanTransformerModel.LoadFromGguf(gguf, config, spvDir);
+        var layout = new TurboQuantLayout(hd, config.NumKvHeads, bits, TurboQuantLayout.DefaultNorm);
+        int vecs = promptTokens * config.NumKvHeads;
+        var oracleCodes = new byte[config.NumLayers][][];
+        var inPlaceCodes = new byte[config.NumLayers][][];
 
         // Baseline (the model's default KV) and the scratch oracle first: the switch below changes what CreateKvCache makes.
         (float[] Prefill, float[] Decode) plain, oracle, inPlace;
@@ -776,6 +825,16 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         {
             Assert.Equal(TurboQuantLayout.DefaultNorm, c.NormFormat);
             oracle = Run(model, c, tokens, chunk, vocab);
+            for (int layer = 0; layer < config.NumLayers && minLayerCodeAgreement > 0; layer++)
+            {
+                oracleCodes[layer] = new byte[2][];
+                for (int side = 0; side < 2; side++)
+                {
+                    var words = new uint[vecs * layout.CodeUintsPerVec];
+                    c.DownloadCodeUints(layer, side == 1, words);
+                    oracleCodes[layer][side] = Codes(words, layout, vecs);
+                }
+            }
         }
 
         Assert.True(model.TryUseInPlaceTurboQuantKv(spvDir, bits, codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD));
@@ -786,6 +845,16 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
             var l = new TurboQuantLayout(hd, config.NumKvHeads, bits, TurboQuantLayout.DefaultNorm);
             Assert.Equal(l, c.TurboQuantLayout);
             inPlace = Run(model, c, tokens, chunk, vocab);
+            for (int layer = 0; layer < config.NumLayers && minLayerCodeAgreement > 0; layer++)
+            {
+                inPlaceCodes[layer] = new byte[2][];
+                for (int side = 0; side < 2; side++)
+                {
+                    var words = new uint[vecs * layout.CodeUintsPerVec];
+                    c.DownloadTqCodes(layer, side == 1, words);
+                    inPlaceCodes[layer][side] = Codes(words, layout, vecs);
+                }
+            }
             // The cache holds codes (plus a guard word per layer side) and F16 norms, the centroids and two sign vectors: nothing wider.
             long vectors = (long)(promptTokens + 4) * config.NumKvHeads;
             Assert.Equal(2L * config.NumLayers * (l.CodeBytesPerLayer(promptTokens + 4) + TqKvTwin.NormBufferBytes(vectors, l.Norm)) + (1L << bits) * 4 + 2L * hd * 4,
@@ -819,6 +888,24 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
                 $"{name}: in-place vs oracle {vsOracle.MeanAbs:G4} exceeds {maxRatio} x the codec's own effect {effect.MeanAbs:G4}");
             Assert.True(vsOracle.Cos > minCos, $"{name}: logits diverged from the oracle, cos {vsOracle.Cos:F6}");
         }
+
+        if (minLayerCodeAgreement <= 0) return;
+        // Per layer: the codes the in-place cache holds against the codes the oracle cache holds. Layer 0's K / V depend only on the
+        // embeddings, so they are bit-identical. A deeper layer's codes agree as long as every earlier layer read ITS OWN codes and
+        // norms; a layer that read another layer's buffers hands the next layer different K / V, and agreement drops to chance
+        // (compare the cross-layer control below: the same metric between different layers).
+        for (int layer = 0; layer < config.NumLayers; layer++)
+            for (int side = 0; side < 2; side++)
+            {
+                double own = Agreement(inPlaceCodes[layer][side], oracleCodes[layer][side]);
+                int other = (layer + 1) % config.NumLayers;
+                double cross = Agreement(inPlaceCodes[layer][side], oracleCodes[other][side]);
+                _out.WriteLine($"layer {layer} {(side == 0 ? "K" : "V")}: code agreement with the oracle's layer {layer} {own:P2}; with its layer {other} {cross:P2}");
+                if (layer == 0) Assert.True(own == 1.0, $"layer 0 {(side == 0 ? "K" : "V")} codes are not bit-identical to the oracle's ({own:P3})");
+                Assert.True(own >= minLayerCodeAgreement, $"layer {layer} {(side == 0 ? "K" : "V")}: only {own:P2} of the codes match the oracle's");
+                if (config.NumLayers > 1)
+                    Assert.True(cross < minLayerCodeAgreement / 2, $"control: layer {layer} agrees {cross:P2} with the oracle's layer {other}; the metric cannot tell layers apart");
+            }
     }
 
     /// <summary>
@@ -841,10 +928,175 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         => ModelCase(bits: 2, promptTokens: 13, chunk: 12, expectSplitKv: false, layers: 1, maxRatio: 0.05, minCos: 0.9999);
 
     /// <summary>
-    /// Full depth, 8 bits: every layer writes and reads its own code and norm buffers (a forward that used another layer's would
-    /// differ from the oracle by more than the codec's whole effect). Loose by necessity: see <see cref="ModelCase"/>.
+    /// Real model, full depth, 8 bits. <b>This is NOT an oracle-parity gate.</b> Its one job is to notice a layer reading or writing
+    /// another layer's code / norm buffers on a real 24-layer model, which moves the logits by more than the codec's whole effect.
+    /// It cannot be a parity gate: at full depth every layer re-quantises K / V that already carry the earlier layers' rounding
+    /// differences, so two correct arithmetic paths legitimately drift apart by a fraction of the codec's own noise (measured: 0.10
+    /// to 0.12 of it at 8 bits, about 0.5 at 4 bits, 0.68 at 3 bits). Hence the loose bounds (0.4, cos 0.995). The deterministic
+    /// per-layer check is <see cref="Synthetic_EachLayerWritesAndReadsItsOwnBuffers"/>; parity is gated per attention at kernel level
+    /// and on one-layer models.
     /// </summary>
     [SkippableFact]
-    public void FullDepth_EveryLayerReadsItsOwnCodes_TracksOracle()
+    public void FullDepth_EachLayerReadsItsOwnBuffers_Statistical()
         => ModelCase(bits: 8, promptTokens: 300, chunk: 128, expectSplitKv: true, layers: 0, maxRatio: 0.4, minCos: 0.995);
+
+    // ── model-free: a synthetic Llama-shape model, so these never skip for a missing GGUF ──────────────────────────────────────
+
+    /// <summary>Writes a random Llama-shape safetensors model (RMSNorm, GQA, SwiGLU) and returns its config.</summary>
+    private static ModelConfig WriteSyntheticModel(string path, int layers, int heads, int kvHeads, int hd, int hidden, int vocab, int maxSeq)
+    {
+        var rng = new Random(0x7157 + layers * 31 + heads * 7 + kvHeads);
+        float[] R(int n, float amp) { var r = new float[n]; for (int i = 0; i < n; i++) r[i] = (float)((rng.NextDouble() * 2 - 1) * amp); return r; }
+        float[] Ones(int n) { var r = new float[n]; Array.Fill(r, 1f); return r; }
+        int inter = hidden * 2;
+        var bld = new SafetensorsFixtureBuilder();
+        bld.AddFloat32("model.embed_tokens.weight", [vocab, hidden], R(vocab * hidden, 1.0f));
+        bld.AddFloat32("model.norm.weight", [hidden], Ones(hidden));
+        for (int i = 0; i < layers; i++)
+        {
+            string p = $"model.layers.{i}";
+            bld.AddFloat32($"{p}.input_layernorm.weight", [hidden], Ones(hidden));
+            bld.AddFloat32($"{p}.post_attention_layernorm.weight", [hidden], Ones(hidden));
+            // Q / K large enough for a peaked softmax, so a wrong K-side rotation moves the output as much as a wrong V-side one.
+            bld.AddFloat32($"{p}.self_attn.q_proj.weight", [heads * hd, hidden], R(heads * hd * hidden, 0.35f));
+            bld.AddFloat32($"{p}.self_attn.k_proj.weight", [kvHeads * hd, hidden], R(kvHeads * hd * hidden, 0.35f));
+            bld.AddFloat32($"{p}.self_attn.v_proj.weight", [kvHeads * hd, hidden], R(kvHeads * hd * hidden, 0.2f));
+            bld.AddFloat32($"{p}.self_attn.o_proj.weight", [hidden, heads * hd], R(hidden * heads * hd, 0.2f));
+            bld.AddFloat32($"{p}.mlp.gate_proj.weight", [inter, hidden], R(inter * hidden, 0.1f));
+            bld.AddFloat32($"{p}.mlp.up_proj.weight", [inter, hidden], R(inter * hidden, 0.1f));
+            bld.AddFloat32($"{p}.mlp.down_proj.weight", [hidden, inter], R(hidden * inter, 0.1f));
+        }
+        bld.AddFloat32("lm_head.weight", [vocab, hidden], R(vocab * hidden, 0.5f));
+        bld.WriteTo(path);
+        return new ModelConfig
+        {
+            Architecture = DotLLM.Core.Configuration.Architecture.Llama,
+            VocabSize = vocab,
+            HiddenSize = hidden,
+            IntermediateSize = inter,
+            NumLayers = layers,
+            NumAttentionHeads = heads,
+            NumKvHeads = kvHeads,
+            HeadDim = hd,
+            MaxSequenceLength = maxSeq,
+            NormEpsilon = 1e-5f,
+            RoPEConfig = new RoPEConfig(Theta: 10000f, DimensionCount: hd, Type: RoPEType.Norm),
+        };
+    }
+
+    private void WithSyntheticModel(int layers, int heads, int kvHeads, int hd, int hidden, int vocab, int maxSeq,
+        Action<VulkanTransformerModel, ModelConfig, string> body)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        string dir = Path.Combine(Path.GetTempPath(), $"dotllm-tq-inplace-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string path = Path.Combine(dir, "model.safetensors");
+            var config = WriteSyntheticModel(path, layers, heads, kvHeads, hd, hidden, vocab, maxSeq);
+            using var file = SafetensorsFile.Open(path);
+            using var model = VulkanTransformerModel.LoadFromSafetensors(file, config, spvDir);
+            body(model, config, spvDir);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    private static int[] SyntheticTokens(int n, int vocab)
+    {
+        var rng = new Random(0x70C + n);
+        return Enumerable.Range(0, n).Select(_ => rng.Next(vocab)).ToArray();
+    }
+
+    /// <summary>
+    /// The real dispatch wrapper (<c>RecordAttention</c>: K-sign rotation of Q, the arm, V-sign rotation of the output) on a
+    /// one-layer synthetic model: a 12-row prefill chunk into an empty cache, whose rows attend each other from the codes just
+    /// written, then one decode row on the per-token arm (13 keys, below the split-KV threshold). Needs no model file.
+    /// </summary>
+    [SkippableFact]
+    public void Synthetic_PrefillChunkAndPerTokenDecode_ThroughTheRealDispatch_MatchOracle()
+        => WithSyntheticModel(layers: 1, heads: 4, kvHeads: 2, hd: 32, hidden: 128, vocab: 96, maxSeq: 1024, (model, config, spvDir)
+            => CompareWithOracle(model, config, SyntheticTokens(13, config.VocabSize), spvDir, bits: 2, chunk: 12, expectSplitKv: false, maxRatio: 0.05, minCos: 0.9999));
+
+    /// <summary>
+    /// The real dispatch wrapper with the split-KV decode arm: 600 keys, so the decode row is split and combined, and the output
+    /// rotation recorded by the wrapper must land after the combine pass. Prefill runs in 128-row chunks at growing offsets. 3 bits
+    /// (codes straddle words). Needs no model file.
+    /// </summary>
+    [SkippableFact]
+    public void Synthetic_SplitKvDecode_ThroughTheRealDispatch_RotatesAfterCombine()
+        => WithSyntheticModel(layers: 1, heads: 4, kvHeads: 2, hd: 32, hidden: 128, vocab: 96, maxSeq: 1024, (model, config, spvDir)
+            => CompareWithOracle(model, config, SyntheticTokens(600, config.VocabSize), spvDir, bits: 3, chunk: 128, expectSplitKv: true, maxRatio: 0.05, minCos: 0.9999));
+
+    /// <summary>
+    /// Four layers: after the same prompt, each layer's K and V codes in the in-place cache are compared with the oracle cache's
+    /// codes for that layer. Layer 0 must be bit-identical; deeper layers must agree far above chance, which they only do when
+    /// every earlier layer wrote and read its own code and norm buffers; and the same metric against a DIFFERENT layer is at chance.
+    /// Deterministic (codes, not logits) and model-free.
+    /// </summary>
+    [SkippableFact]
+    public void Synthetic_EachLayerWritesAndReadsItsOwnBuffers()
+        => WithSyntheticModel(layers: 4, heads: 4, kvHeads: 2, hd: 32, hidden: 128, vocab: 96, maxSeq: 1024, (model, config, spvDir)
+            => CompareWithOracle(model, config, SyntheticTokens(200, config.VocabSize), spvDir, bits: 4, chunk: 64, expectSplitKv: true,
+                maxRatio: 1.0, minCos: 0.9, minLayerCodeAgreement: 0.6));
+
+    /// <summary>
+    /// With in-place TurboQuant active the model asks for prefill chunks of at most floor(65535 / numKvHeads) rows (one forward may
+    /// write 65535 head vectors), and for one pass (0) otherwise.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(4, 2, 32)]
+    [InlineData(32, 32, 16)]
+    public void PreferredPrefillChunk_IsTheTurboQuantForwardBound(int heads, int kvHeads, int hd)
+        => WithSyntheticModel(layers: 1, heads, kvHeads, hd, hidden: 64, vocab: 128, maxSeq: 256, (model, config, spvDir) =>
+        {
+            Assert.Equal(0, model.PreferredPrefillChunkTokens);
+            var ck = new TurboQuantCodec(hd, 4, Seed, useQjl: false);
+            var cv = new TurboQuantCodec(hd, 4, Seed ^ VSeedXor, useQjl: false);
+            Assert.True(model.TryUseInPlaceTurboQuantKv(spvDir, 4, ck.Centroids, ck.RotationSigns, cv.RotationSigns, ck.InvSqrtD));
+            Assert.Equal(65535 / kvHeads, model.PreferredPrefillChunkTokens);
+            Assert.True((long)model.PreferredPrefillChunkTokens * kvHeads <= VulkanTransformerModel.MaxTurboQuantVectorsPerForward);
+            Assert.True((long)(model.PreferredPrefillChunkTokens + 1) * kvHeads > VulkanTransformerModel.MaxTurboQuantVectorsPerForward);
+        });
+
+    /// <summary>
+    /// A prompt longer than one TurboQuant forward may take (32 KV heads: 2047 rows) through <see cref="TextGenerator"/> with no
+    /// chunk size configured: the generator chunks by the model's preference instead of meeting the guard in <c>Forward</c>, and
+    /// the result equals a run with an explicit small chunk size (one layer, so both hold identical codes).
+    /// </summary>
+    [SkippableFact]
+    public void Generator_PromptLongerThanOneTurboQuantForward_IsChunkedByTheModelPreference()
+        => WithSyntheticModel(layers: 1, heads: 32, kvHeads: 32, hd: 16, hidden: 64, vocab: 128, maxSeq: 4096, (model, config, spvDir) =>
+        {
+            const int bits = 4;
+            var ck = new TurboQuantCodec(16, bits, Seed, useQjl: false);
+            var cv = new TurboQuantCodec(16, bits, Seed ^ VSeedXor, useQjl: false);
+            Assert.True(model.TryUseInPlaceTurboQuantKv(spvDir, bits, ck.Centroids, ck.RotationSigns, cv.RotationSigns, ck.InvSqrtD));
+            int cap = model.PreferredPrefillChunkTokens;
+            Assert.Equal(2047, cap);
+            var rng = new Random(0x6E);
+            string prompt = new(Enumerable.Range(0, 2600).Select(_ => (char)rng.Next(32, 127)).ToArray());
+            Assert.True(prompt.Length > cap);
+            var opts = new InferenceOptions { Temperature = 0, MaxTokens = 4, Logprobs = true };
+
+            var byPreference = new TextGenerator(model, new CharTokenizer(), (_, size) => model.CreateKvCache(size), mtpEnabled: false);
+            Assert.Equal(cap, byPreference.EffectivePrefillChunkSize);
+            long attn0 = model.TurboQuantAttentionCount;
+            var a = byPreference.Generate(prompt, opts);
+            Assert.Equal(prompt.Length, a.PromptTokenCount);
+            Assert.True(model.TurboQuantAttentionCount - attn0 >= 2 + 1, "the prefill did not run as at least two forwards");
+
+            var explicitChunks = new TextGenerator(model, new CharTokenizer(), (_, size) => model.CreateKvCache(size), mtpEnabled: false, prefillChunkSize: 512);
+            var b = explicitChunks.Generate(prompt, opts);
+            Assert.Equal(b.GeneratedTokenIds, a.GeneratedTokenIds);
+            for (int i = 0; i < a.Logprobs!.Length; i++)
+                Assert.True(Math.Abs(a.Logprobs[i].Logprob - b.Logprobs![i].Logprob) < 2e-2,
+                    $"token {i}: logprob {a.Logprobs[i].Logprob:R} by preference vs {b.Logprobs[i].Logprob:R} with 512-row chunks");
+
+            // The last-resort guard is still there: an explicit chunk size above the bound overrides the preference and is refused.
+            var tooBig = new TextGenerator(model, new CharTokenizer(), (_, size) => model.CreateKvCache(size), mtpEnabled: false, prefillChunkSize: cap + 1);
+            Assert.Throws<NotSupportedException>(() => tooBig.Generate(prompt, opts));
+        });
 }

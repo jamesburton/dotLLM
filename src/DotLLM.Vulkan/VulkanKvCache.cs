@@ -220,19 +220,27 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         _valueNorms = new VulkanDevice.Buffer[numLayers];
         long codeBytes = layout.CodeBytesPerLayer(maxSeqLen);   // includes the guard word of the straddle read
         long normBytes = Kernels.TqKvTwin.NormBufferBytes((long)maxSeqLen * layout.NumKvHeads, layout.Norm);
-        for (int i = 0; i < numLayers; i++)
+        try
         {
-            _keys[i] = device.AllocateDeviceLocal(codeBytes);
-            _values[i] = device.AllocateDeviceLocal(codeBytes);
-            _keyNorms[i] = device.AllocateDeviceLocal(normBytes);
-            _valueNorms[i] = device.AllocateDeviceLocal(normBytes);
+            for (int i = 0; i < numLayers; i++)
+            {
+                _keys[i] = device.AllocateDeviceLocal(codeBytes);
+                _values[i] = device.AllocateDeviceLocal(codeBytes);
+                _keyNorms[i] = device.AllocateDeviceLocal(normBytes);
+                _valueNorms[i] = device.AllocateDeviceLocal(normBytes);
+            }
+            _tqCentroids = device.Allocate((long)centroids.Length * sizeof(float));
+            _tqSignsK = device.Allocate((long)layout.HeadDim * sizeof(float));
+            _tqSignsV = device.Allocate((long)layout.HeadDim * sizeof(float));
+            device.Upload(centroids, _tqCentroids);
+            device.Upload(signsK, _tqSignsK);
+            device.Upload(signsV, _tqSignsV);
         }
-        _tqCentroids = device.Allocate((long)centroids.Length * sizeof(float));
-        _tqSignsK = device.Allocate((long)layout.HeadDim * sizeof(float));
-        _tqSignsV = device.Allocate((long)layout.HeadDim * sizeof(float));
-        device.Upload(centroids, _tqCentroids);
-        device.Upload(signsK, _tqSignsK);
-        device.Upload(signsV, _tqSignsV);
+        catch
+        {
+            Dispose();
+            throw;
+        }
     }
 
     /// <summary>The TurboQuant layout of a <see cref="VulkanKvStorage.Tq"/> cache (issue #1892); null for every other storage.</summary>
