@@ -127,12 +127,15 @@ public static class BenchRunner
         int prefillStep = PrefillStep(model, 0, promptLen);
         ITensor? prefillLogits = null;
         var prefillSw = Stopwatch.StartNew();
-        for (int a = 0; a < promptLen; a += prefillStep)
+        // do-while: an empty prompt still makes its one (empty) forward, as before the split, so there are always logits to read.
+        int a = 0;
+        do
         {
             int n = Math.Min(prefillStep, promptLen - a);
             prefillLogits?.Dispose();
             prefillLogits = model.Forward(promptTokens.AsSpan(a, n), positions.AsSpan(a, n), deviceId: -1, cache, lastTokenLogitsOnly: true);
-        }
+            a += n;
+        } while (a < promptLen);
         prefillSw.Stop();
         using (prefillLogits)
             nextToken = ArgmaxLastRow(prefillLogits!);

@@ -789,8 +789,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 if (tqPostRefusal is not null)
                 {
                     DeviceCli.PrintError(tqPostRefusal, settings.Json);
-                    model.Dispose();
-                    return 1;
+                    return 1;   // the finally below disposes the model: a second Dispose here tore GPU models down twice
                 }
                 if (!settings.Json)
                     AnsiConsole.MarkupLine($"[dim]KV cache: TurboQuant {kvConfig.TurboQuantBits}-bit" +

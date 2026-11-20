@@ -61,6 +61,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     // (i, i + GlobalHeadDim/2), with the freq base over the full GlobalHeadDim.
     // Computed once in the ctor; mirror of TransformerModel's GetLayerRope.
     private readonly bool _isGemma4;
+    private bool _disposed;
     private readonly float _gemma4GlobalRopeTheta;
     private readonly int _gemma4GlobalRotatedPairs;
     private readonly float _gemma4FinalSoftcap;
@@ -5141,6 +5142,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <inheritdoc/>
     public void Dispose()
     {
+        if (_disposed) return;   // idempotent: a refusal path and a finally may both dispose (#1892)
+        _disposed = true;
         _context.MakeCurrent();
         CudaMemTrace.Dump("CudaTransformerModel.Dispose");
         ReportLaunchProfile();

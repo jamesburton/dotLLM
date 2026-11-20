@@ -88,6 +88,21 @@ public sealed unsafe class CudaTurboQuantKvEndToEndTests
     }
 
     [SkippableFact]
+    public void Cuda_Dispose_IsIdempotent()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        string modelPath = Environment.GetEnvironmentVariable("DOTLLM_SMOLLM_Q8_GGUF")
+            ?? TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
+        Skip.If(!File.Exists(modelPath), $"SmolLM-135M Q8_0 GGUF not found at {modelPath}");
+        using var gguf = GgufFile.Open(modelPath);
+        var model = CudaTransformerModel.LoadFromGguf(gguf, GgufModelConfigExtractor.Extract(gguf.Metadata), 0, ptxDir);
+        model.Dispose();
+        model.Dispose();   // #1892: a refusal path and a finally may both dispose; the second must be a no-op
+    }
+
+    [SkippableFact]
     public void Cuda_TurboQuantKv_TracksFullPrecision_OnSmolLM()
     {
         Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");

@@ -1105,6 +1105,18 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         });
 
     /// <summary>
+    /// #1892: a refusal path and a finally may both dispose the model (run's post-load refusal used to); a second Dispose must be a no-op.
+    /// The synthetic model's own <c>using</c> is a third.
+    /// </summary>
+    [SkippableFact]
+    public void Dispose_IsIdempotent()
+        => WithSyntheticModel(layers: 1, heads: 4, kvHeads: 2, hd: 32, hidden: 128, vocab: 96, maxSeq: 64, (model, config, spvDir) =>
+        {
+            model.Dispose();
+            model.Dispose();
+        });
+
+    /// <summary>
     /// #1892 Task 8: the shared factory is self-sufficient on Vulkan. It builds the twin set itself, so a caller that skipped the post-load
     /// pass still gets the in-place cache, and a request the host cannot serve is refused with the Vulkan reason, not a #1900 host-gap message.
     /// </summary>

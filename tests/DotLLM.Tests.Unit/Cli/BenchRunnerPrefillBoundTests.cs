@@ -68,6 +68,15 @@ public sealed class BenchRunnerPrefillBoundTests : IClassFixture<PrefixCacheFail
         Assert.Equal(23, model.ForwardLengths[0]);
     }
 
+    [Fact]
+    public void EmptyPrompt_IsRefusedWithAClearError_NotANullLogitsCrash()
+    {
+        var model = new LimitedModel(_tiny.Model, limit: 5);
+        var e = Assert.Throws<ArgumentOutOfRangeException>(() => Run(model, promptLen: 0));
+        Assert.Contains("promptTokens", e.Message);
+        Assert.Empty(model.ForwardLengths);
+    }
+
     [Theory]
     [InlineData(0, 100, 0, 100)]
     [InlineData(0, 100, 7, 7)]

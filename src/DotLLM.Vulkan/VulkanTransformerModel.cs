@@ -1098,6 +1098,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     // TurboQuant KV read in place in code space (#1892): the same twin slots, specialised for one layout, plus the encode writer and the
     // Q / O rotation kernel. Empty until TryUseInPlaceTurboQuantKv.
     private readonly BlockKvTwins _kvTqSet = new();
+    private bool _disposedModel;
     private TurboQuantKvConstants? _tqKv;
 
     /// <inheritdoc/>
@@ -10631,6 +10632,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     /// <inheritdoc/>
     public void Dispose()
     {
+        if (_disposedModel) return;   // idempotent: a refusal path and a finally may both dispose (#1892)
+        _disposedModel = true;
         _gumbelHostDrawer?.Dispose();
         // Drop the device-side LoRA cache before tearing down the device —
         // each VulkanLoraAdapter owns VkBuffers that must be freed before
