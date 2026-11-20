@@ -366,6 +366,15 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
     /// <summary>Bit widths with a specialised tensor-core TurboQuant prefill entry (#1924 E1); the others run the generic _tqtq.</summary>
     private static bool HasSpecEntry(int bits) => bits is 2 or 3 or 4 or 8;
 
+    /// <summary>The entry the launcher picks with no override: the default variant, falling back Staged -> Specialized -> Legacy.</summary>
+    private static CudaKernels.TqPrefillVariant DefaultEntry(int hd, int bits)
+    {
+        var d = CudaKernels.DefaultTqPrefillVariant;
+        if (d == CudaKernels.TqPrefillVariant.Staged && !HasCpaEntry(hd, bits)) d = CudaKernels.TqPrefillVariant.Specialized;
+        if (d != CudaKernels.TqPrefillVariant.Legacy && !HasSpecEntry(bits)) d = CudaKernels.TqPrefillVariant.Legacy;
+        return d;
+    }
+
     /// <summary>Shapes with a cp.async-staged entry (#1924 E3): code rows a multiple of 16 B, so not hd64 tq3 (24 B).</summary>
     private static bool HasCpaEntry(int hd, int bits) => HasSpecEntry(bits) && hd * bits / 32 % 4 == 0;
 
@@ -391,7 +400,7 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
             "cpa" => CudaKernels.TqPrefillVariant.Staged,
             _ => null,
         };
-        var expected = forced ?? (HasSpecEntry(bits) ? CudaKernels.DefaultTqPrefillVariant : CudaKernels.TqPrefillVariant.Legacy);
+        var expected = forced ?? DefaultEntry(hd, bits);
         CaseResult r;
         CudaKernels.TqPrefillVariantOverride = forced;
         try
@@ -452,8 +461,9 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         Assert.Equal(flash, r.Flash);
         Assert.Equal(flash ? 1 : 0, r.FlashLaunches);
         // #1924: BF16 norms run the specialised entry (raw 16-bit staging); the F32 reference format stays on the generic _tqtq.
-        Assert.Equal(flash && fmt == TqNormFormat.Bf16 && CudaKernels.DefaultTqPrefillVariant == CudaKernels.TqPrefillVariant.Specialized ? 1 : 0, r.SpecLaunches);
-        Assert.Equal(flash && fmt == TqNormFormat.Bf16 && CudaKernels.DefaultTqPrefillVariant == CudaKernels.TqPrefillVariant.Staged ? 1 : 0, r.CpaLaunches);
+        var entry = flash && fmt == TqNormFormat.Bf16 ? DefaultEntry(128, 4) : CudaKernels.TqPrefillVariant.Legacy;
+        Assert.Equal(entry == CudaKernels.TqPrefillVariant.Specialized ? 1 : 0, r.SpecLaunches);
+        Assert.Equal(entry == CudaKernels.TqPrefillVariant.Staged ? 1 : 0, r.CpaLaunches);
         Assert.Equal(flash ? 0 : 1, r.ScalarLaunches);
         AssertMatchesOracle(r, flash ? 128 : 64, $"norm {fmt} {(flash ? "flash" : "scalar")}");
     }
