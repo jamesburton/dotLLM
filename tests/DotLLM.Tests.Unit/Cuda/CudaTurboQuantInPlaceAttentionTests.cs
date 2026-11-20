@@ -360,6 +360,7 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         [4, 128, 8, 2, 40, 5],
         [2, 128, 32, 8, 64, 40],
         [8, 128, 32, 8, 32, 40],
+        [4, 64, 9, 3, 26, 0],       // SmolLM-135M geometry (hd64, 9/3, group 3), a cold prefill as in the model-level test
     ];
 
     /// <summary>Bit widths with a specialised tensor-core TurboQuant prefill entry (#1924 E1); the others run the generic _tqtq.</summary>
