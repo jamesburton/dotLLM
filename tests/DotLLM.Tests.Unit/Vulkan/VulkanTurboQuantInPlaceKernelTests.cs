@@ -1068,6 +1068,43 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         });
 
     /// <summary>
+    /// #1892 Task 8: the real capability. False until the shared helper has built the twin set for the request, then true for exactly that
+    /// request (its bits; not tq*q; not a window), and the helper's factory builds the Vulkan in-place cache, which then runs a forward.
+    /// A host whose twin set lacks an arm its device runs would answer false here and refuse at startup.
+    /// </summary>
+    [SkippableFact]
+    public void Capability_IsFalseUntilTheTwinSetIsBuilt_ThenTrueOnlyForThatRequest()
+        => WithSyntheticModel(layers: 2, heads: 4, kvHeads: 2, hd: 32, hidden: 128, vocab: 96, maxSeq: 256, (model, config, spvDir) =>
+        {
+            var kv4 = new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant, TurboQuantBits: 4);
+            var kv3 = kv4 with { TurboQuantBits = 3 };
+            Assert.False(model.SupportsInPlaceTurboQuant(kv4), "nothing is built yet");
+            Assert.Equal(0, model.MaxPrefillForwardTokens);
+
+            Assert.Null(DotLLM.Server.TurboQuantKv.PostLoadRefusal(kv4, null, DotLLM.Server.KvCommand.Serve, paged: false, config, model,
+                hasDraftModel: false, mtpWillAttach: false));
+            Assert.True(model.SupportsInPlaceTurboQuant(kv4), "the twin set is built and complete");
+            Assert.False(model.SupportsInPlaceTurboQuant(kv3), "the twins are specialised for 4 bits");
+            Assert.False(model.SupportsInPlaceTurboQuant(kv4 with { TurboQuantUseQjl = true }));
+            Assert.False(model.SupportsInPlaceTurboQuant(kv4 with { MixedPrecisionWindowSize = 16 }));
+            Assert.False(model.SupportsInPlaceTurboQuant(new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.Q8_0, TurboQuantBits: 4)));
+            Assert.Equal(VulkanTransformerModel.MaxTurboQuantRowsPerForward(config.NumAttentionHeads, config.NumKvHeads), model.MaxPrefillForwardTokens);
+
+            using (var cache = DotLLM.Server.TurboQuantKv.CreateFactory(model, kv4)(config, 64))
+            {
+                var vk = Assert.IsType<VulkanKvCache>(cache);
+                Assert.Equal(VulkanKvStorage.Tq, vk.Storage);
+                using var logits = model.Forward(SyntheticTokens(8, config.VocabSize), Enumerable.Range(0, 8).ToArray(), -1, cache);
+                Assert.True(logits.Shape[0] >= 1);
+            }
+
+            // Asking for another width through the helper rebuilds the set for it: the capability follows the request.
+            Assert.Null(DotLLM.Server.TurboQuantKv.PostLoadRefusal(kv3, null, DotLLM.Server.KvCommand.Run, paged: false, config, model, false, false));
+            Assert.True(model.SupportsInPlaceTurboQuant(kv3));
+            Assert.False(model.SupportsInPlaceTurboQuant(kv4));
+        });
+
+    /// <summary>
     /// A prompt longer than one TurboQuant forward may take (32 KV heads: 2047 rows) through <see cref="TextGenerator"/> with no
     /// chunk size configured: the generator chunks by the model's preference instead of meeting the guard in <c>Forward</c>, and
     /// the result equals a run with an explicit small chunk size (one layer, so both hold identical codes).
