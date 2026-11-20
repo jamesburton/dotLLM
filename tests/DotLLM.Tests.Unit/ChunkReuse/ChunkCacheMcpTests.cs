@@ -185,8 +185,31 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.All(sent["texts"]!.AsArray(), t => Assert.Contains(t!["text"]!.GetValue<string>().Trim(), calc, StringComparison.Ordinal)); // only the selected file's text
         Assert.All(sent["texts"]!.AsArray(), t => Assert.Subset(new HashSet<string>(StringComparer.Ordinal) { "id", "text", "source" }, t!.AsObject().Select(kv => kv.Key).ToHashSet(StringComparer.Ordinal))); // no hash, K/V or token ids
 
-        // Exactly one of texts / select.
-        Assert.True(IsError(await wire.CallToolAsync("chunkcache_prewarm", "{}")));
+        // Exactly one of texts / select: neither and both are refused by the wrapper, before any request.
+        int before = fake.Requests.Count;
+        foreach (string args in new[] { "{}", $$"""{"texts": [{"id": "a", "text": "class A { }"}], "select": {"path": {{JsonSerializer.Serialize(tree)}}} }""" })
+        {
+            JsonElement refused = await wire.CallToolAsync("chunkcache_prewarm", args);
+            Assert.True(IsError(refused), refused.ToString());
+            Assert.Contains("exactly one of texts or select", ErrorText(refused), StringComparison.Ordinal);
+        }
+        Assert.Equal(before, fake.Requests.Count);
+    }
+
+    [Fact]
+    public async Task Build_EncodeWithoutAServer_IsAToolError_AndWritesNothing()
+    {
+        string tree = NewTree();
+        string store = NewDir("store");
+        await using McpWire wire = await McpWire.StartAsync(["--store", store, "--model", _fx.ModelA]); // no --server
+
+        JsonElement result = await wire.CallToolAsync("chunkcache_build", $$"""{"path": {{JsonSerializer.Serialize(tree)}}, "encode": true}""");
+        Assert.True(IsError(result), result.ToString());
+        Assert.Contains("encode: true needs a server", ErrorText(result), StringComparison.Ordinal);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(store)); // refused before the verb ran: no index, no local encode
+
+        // Control: the same call without encode indexes.
+        Assert.False(IsError(await wire.CallToolAsync("chunkcache_build", $$"""{"path": {{JsonSerializer.Serialize(tree)}}}""")));
     }
 
     [Fact]
