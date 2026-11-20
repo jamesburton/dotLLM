@@ -264,6 +264,17 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.False(IsError(dry), dry.ToString());
         Assert.True(dry.GetProperty("structuredContent").GetProperty("dry_run").GetBoolean());
         Assert.Equal(before, new FileChunkStore(store).Keys().Count());
+
+        // Only an explicit dry_run: false applies (orphans mode: the indexed entries are referenced, so they stay).
+        JsonElement applied = await wire.CallToolAsync("chunkcache_evict", """{"dry_run": false}""");
+        Assert.False(IsError(applied), applied.ToString());
+        Assert.False(applied.GetProperty("structuredContent").GetProperty("dry_run").GetBoolean());
+
+        // A per-call store replaces the launch default (here a directory that is not a store).
+        await using McpWire other = await McpWire.StartAsync(["--store", Path.Combine(NewDir("none"), "no-such-store")]);
+        Assert.True(IsError(await other.CallToolAsync("chunkcache_evict", "{}")));                       // control: the default is unusable
+        JsonElement perCall = await other.CallToolAsync("chunkcache_evict", $$"""{"store": {{JsonSerializer.Serialize(store)}}}""");
+        Assert.False(IsError(perCall), perCall.ToString());
     }
 
     // ------------------------------------------------------------------------------------------------ errors
