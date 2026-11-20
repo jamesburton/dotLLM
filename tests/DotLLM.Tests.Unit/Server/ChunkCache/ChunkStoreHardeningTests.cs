@@ -183,7 +183,7 @@ public sealed class ChunkStoreHardeningTests : IDisposable
 
     /// <summary>S3: a ledger held open briefly at startup (sharing violation) is retried, not declared unreadable.</summary>
     [Fact]
-    public async Task LedgerBrieflyLocked_AtStartup_IsRetried()
+    public void LedgerBrieflyLocked_AtStartup_IsRetried()
     {
         string root = NewRoot();
         var first = Start(root, new FakeHost());
@@ -191,9 +191,12 @@ public sealed class ChunkStoreHardeningTests : IDisposable
         Assert.True(first.Queue.WaitDrained(Drain));
         first.Dispose();
         var holder = new FileStream(ServerLedger.DefaultPath(root), FileMode.Open, FileAccess.Read, FileShare.None);
-        var release = Task.Run(async () => { await Task.Delay(150); holder.Dispose(); });
+        // A dedicated thread, not the thread pool: Start blocks while it retries (about 400 ms), and on a loaded runner a
+        // pool timer can fire after that window (seen on Linux CI-equivalent runs), failing the test for the wrong reason.
+        var release = new Thread(() => { Thread.Sleep(150); holder.Dispose(); }) { IsBackground = true };
+        release.Start();
         var s = Start(root, new FakeHost());
-        await release;
+        Assert.True(release.Join(TimeSpan.FromSeconds(30)));
         Assert.False(s.WritesDisabled);
         Assert.Null(s.Problem);
     }
