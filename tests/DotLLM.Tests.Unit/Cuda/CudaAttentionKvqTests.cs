@@ -204,6 +204,45 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
     }
 
     /// <summary>
+    /// Opt-in microbench (#1923, <c>DOTLLM_CUDA_KVQ_BENCH=1</c>): wall time per launch of the flash prefill kvq entries on one
+    /// 1024-row chunk at depth (Qwen3-4B shape, 32/8/128), F16 vs Q8_0 vs Q4_0 K/V. Same-process relative figures only.
+    /// Optional <c>DOTLLM_CUDA_KVQ_BENCH_DEPTH</c> (default 15360 cached rows before the chunk).
+    /// </summary>
+    [SkippableFact]
+    public void FlashPrefillKvq_Microbench()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_CUDA_KVQ_BENCH") == "1", "DOTLLM_CUDA_KVQ_BENCH=1 not set");
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null || !_kernels.HasAttentionFlashPrefillKvq(128, null, null), "flash prefill kvq kernel not loaded");
+        int offset = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CUDA_KVQ_BENCH_DEPTH"), out int d) ? d : 15360;
+        const int seqQ = 1024, heads = 32, kvHeads = 8, hd = 128, reps = 10;
+        int seqKv = offset + seqQ;
+        foreach (var fmt in new[] { KvCacheDType.Q8_0, KvCacheDType.Q4_0 })
+        {
+            using var f = new Fixture(this, fmt, fmt, hd, heads, kvHeads, seqQ, seqKv, seqKv, window: 0, sinks: false);
+            double Time(nint k, nint v, KvCacheDType? kf, KvCacheDType? vf)
+            {
+                for (int i = 0; i < 2; i++)
+                    _kernels!.LaunchAttentionFlashPrefillKvq(f.Q, k, v, kf, vf, f.OutNew, seqQ, seqKv, heads, kvHeads, hd, offset, _stream!.Handle);
+                _stream!.Synchronize();
+                double best = double.MaxValue;
+                for (int r = 0; r < 3; r++)
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < reps; i++)
+                        _kernels!.LaunchAttentionFlashPrefillKvq(f.Q, k, v, kf, vf, f.OutNew, seqQ, seqKv, heads, kvHeads, hd, offset, _stream.Handle);
+                    _stream.Synchronize();
+                    best = Math.Min(best, sw.Elapsed.TotalMilliseconds / reps);
+                }
+                return best;
+            }
+            double tF16 = Time(f.KScratch, f.VScratch, null, null), tQ = Time(f.KQuant, f.VQuant, fmt, fmt);
+            double tF16b = Time(f.KScratch, f.VScratch, null, null);
+            _out.WriteLine($"depth {offset} + {seqQ} rows: f16f16 {tF16:F3} / {tF16b:F3} ms, {fmt} {tQ:F3} ms, {fmt}/f16 {tQ / Math.Min(tF16, tF16b):F3}");
+        }
+    }
+
+    /// <summary>
     /// The quantize step that feeds both paths: one launch over a run of rows writes the same bytes as one launch per row (#1845's
     /// batching relies on it).
     /// </summary>
