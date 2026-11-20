@@ -72,13 +72,14 @@ internal static class Common
         {
             "symbol" => new SymbolChunker(tokenizer, tokens),
             "fixed" => new FixedSizeChunker(tokenizer, tokens),
-            _ => throw new UsageException($"{args.Verb}: unknown chunker '{name}' (symbol|fixed)."),
+            "lines" => new LinesChunker(tokenizer, tokens),
+            _ => throw new UsageException($"{args.Verb}: unknown chunker '{name}' (symbol|fixed|lines)."),
         };
     }
 
-    /// <summary>The chunker kind name (<c>symbol</c>/<c>fixed</c>) validated, for a list option.</summary>
-    public static string CheckChunkerName(CliArgs args, string name) => name is "symbol" or "fixed"
-        ? name : throw new UsageException($"{args.Verb}: unknown chunker '{name}' (symbol|fixed).");
+    /// <summary>The chunker kind name (<c>symbol</c>/<c>fixed</c>/<c>lines</c>) validated, for a list option.</summary>
+    public static string CheckChunkerName(CliArgs args, string name) => name is "symbol" or "fixed" or "lines"
+        ? name : throw new UsageException($"{args.Verb}: unknown chunker '{name}' (symbol|fixed|lines).");
 
     /// <summary>Whether any selection criterion was given.</summary>
     public static bool HasSelection(CliArgs args) =>

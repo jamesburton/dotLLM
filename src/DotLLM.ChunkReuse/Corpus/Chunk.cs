@@ -46,6 +46,13 @@ public interface IChunker
     int MaxChunkTokens { get; }
 
     /// <summary>
+    /// Version of the cutting algorithm behind <see cref="Name"/>. Raise it whenever the same text can be cut differently than
+    /// before (a boundary rule changed): a chunk index records it per file and re-chunks a file whose recorded version differs,
+    /// even when its text is unchanged. 1 for a chunker that has never changed.
+    /// </summary>
+    int AlgorithmVersion => 1;
+
+    /// <summary>
     /// Chunks <paramref name="file"/> in text order. The chunks cover the file without overlap (their texts concatenate to the
     /// file text); an empty file has no chunks.
     /// </summary>

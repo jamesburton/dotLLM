@@ -45,7 +45,7 @@ internal static class VerbDefs
 
     private static OptionSpec[] ChunkerOptions(string note) =>
     [
-        O("chunker", Single, $"How files are cut into chunks: symbol (one chunk per member) or fixed (token windows). {note}", "symbol|fixed", "symbol"),
+        O("chunker", Single, $"How files are cut into chunks: symbol (one chunk per member), lines (whole lines up to the limit) or fixed (token windows). {note}", "symbol|fixed|lines", "symbol"),
         O("chunk-tokens", Single, "Maximum tokens per chunk. Part of the chunker name (symbol-512) and of the index file name.", "N", "512", "integer 1..1048576 (tokens)"),
     ];
 
@@ -72,7 +72,7 @@ internal static class VerbDefs
         ],
         """
         Scans the tree (files on the secrets deny-list are never read past the scan: .env*, *.pem, *.key, *.pfx, id_*, secrets.json,
-        appsettings.*.Development.json, .git/**), chunks it with a wire-eligible chunker (symbol-512; anything else needs --lab), updates
+        appsettings.*.Development.json, .git/**), chunks it with a wire-eligible chunker (symbol-512 or lines-512; anything else needs --lab), updates
         this model's and chunker's index in --store and handles every indexed chunk the store lacks. A rerun re-chunks only changed files
         and handles only what is still missing, so an interrupted build resumes. You must say who encodes: --server, --offline or
         --index-only (--dry-run needs none).
@@ -83,7 +83,7 @@ internal static class VerbDefs
             Threads("Only an --offline encode runs forward passes with them."),
             O("store", Single, "The store directory (entries, one index per model and chunker, the registry). Created when missing; --dry-run writes nothing.", "DIR", "required"),
             .. SourceOptions("One of the two is required."),
-            .. ChunkerOptions("Only symbol with 512 tokens is wire-eligible; anything else needs --lab."),
+            .. ChunkerOptions("Only symbol and lines with 512 tokens are wire-eligible; anything else needs --lab."),
             .. SelectionOptions("Encode only the chunks of"),
             O("server", Single,
                 "The server owns the model identity and every K/V write: the index is named by its model.id and model.producer, and the chunks are queued as text through "
@@ -96,7 +96,7 @@ internal static class VerbDefs
             O("encode", Flag, "Encode the missing chunks. This is what --server and --offline already do; accepted for clarity. Contradicts --index-only.", @default: "on with --server or --offline"),
             O("max-chunks", Single, "Encode or queue at most this many missing chunks, in path order. Counts chunks (--max-encode-tokens counts tokens).", "N", "no limit", "integer >= 0 (chunks)"),
             O("max-encode-tokens", Single, "Encode or queue at most this many tokens of missing chunks. Counts tokens (--max-chunks counts chunks).", "N", "no limit", "integer >= 0 (tokens)"),
-            O("lab", Flag, "Allow a chunker that is not wire-eligible (only symbol-512 is), for a research build of a store that never leaves this machine. Every chunk then counts as wire-ineligible.", @default: "off"),
+            O("lab", Flag, "Allow a chunker that is not wire-eligible (only symbol-512 and lines-512 are), for a research build of a store that never leaves this machine. Every chunk then counts as wire-ineligible.", @default: "off"),
             O("dry-run", Flag, "List what would be encoded and the estimated store size; write nothing (no index, registry or entry).", @default: "off"),
             O("strict", Flag, "Exit 3, before anything is written, if a project was skipped, a load failure was not attributed to a project, or a file is on another volume than the tree root.", @default: "off"),
             O("reroot", Flag, "Accept a different tree root than the index recorded and re-path every file (otherwise a changed root is refused).", @default: "off"),
@@ -303,7 +303,7 @@ internal static class VerbDefs
             O("texts", Single, "A JSON file of chunk texts to queue (up to 64 MiB). Give --texts or a tree selection, not both.", "FILE", "none"),
             O("max-tokens", Single, "Ask the server to queue at most this many tokens in total.", "N", "no limit", "integer >= 1 (tokens)"),
             .. SourceOptions("Required with a selection."),
-            .. ChunkerOptions("The server accepts symbol-512 only."),
+            .. ChunkerOptions("The server accepts symbol-512 and lines-512."),
             .. SelectionOptions("Queue only the chunks of"),
             O("store", Single, "Accepted and ignored: prewarm never reads or writes a store.", "DIR", "none"),
             Json(),

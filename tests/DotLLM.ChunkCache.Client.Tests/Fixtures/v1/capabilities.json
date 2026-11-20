@@ -13,6 +13,7 @@
     "chunk_starts"
   ],
   "wire_chunkers": [
+    "lines-512",
     "symbol-512"
   ],
   "auto_validated": [],

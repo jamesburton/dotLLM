@@ -369,6 +369,12 @@ public sealed class ChunkAnnotationParserTests
         var symbol = ChunkAnnotationParser.Parse(OpenAi(Body("symbol-512", false)), On, Ns)!;
         Assert.Equal("symbol-512", symbol.Spans.Single().Chunker);
         Assert.Empty(symbol.Warnings);
+
+        // Phase I Task 19: lines-512 is on the wire allow-list.
+        var lines = ChunkAnnotationParser.Parse(OpenAi(Body("lines-512", true)), On, Ns)!;
+        Assert.Null(lines.Error);
+        Assert.Equal("lines-512", lines.Spans.Single().Chunker);
+        Assert.Empty(lines.Warnings);
     }
 
     // ------------------------------------------------------------------------------------------ request options

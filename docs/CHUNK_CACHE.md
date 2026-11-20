@@ -67,7 +67,7 @@ joined with `'\n'`. The parser then checks that the engine message holds the spa
       `{message, part[, start, end]}` with integers; any string that cannot be decoded (a lone-surrogate escape);
    2. **version** → `chunk_version_unsupported`: `v` ≠ 1, or `positioning` other than `isolated`;
    3. **id** → `chunk_span_invalid`: not 1–256 characters (Unicode scalar values);
-   4. **eligibility** → `chunk_not_wire_eligible`: a `chunker` outside the wire-eligible list (`symbol-512` today); the
+   4. **eligibility** → `chunk_not_wire_eligible`: a `chunker` outside the wire-eligible list (`symbol-512` and `lines-512`); the
       span is dropped (rulings 26, 35: a warning, 400 when strict) and reserves no range;
    5. **range / boundary** → `chunk_span_invalid`: message or part out of range, a non-text part, an empty or
       out-of-range byte range, an offset inside a multi-byte character;
@@ -163,6 +163,33 @@ including any BOS text the template writes) for each located span, and warnings 
   SentencePiece leading space; live reasoning tags in assistant turns). Execution (below) checks the span's token ids
   against the whole-prompt tokenisation over the located range before counting a span as reusable.
 
+#### Chunk edges and joining (token stability)
+
+A span counts only if its own ids occur in the whole-prompt ids at its position, so what a harness puts **next to** a chunk
+decides whether it is reusable:
+
+- **Back to back is safe.** `symbol-512` and `lines-512` accept an edge only where
+  `Encode(left + right) == Encode(left) ++ Encode(right)` (`ChunkBoundary`, with `ChunkTokenization.Encode`): an edge that
+  would merge (a chunk's last newline with the blank line starting the next, `"\n" + "\n"` becoming one `"\n\n"` token) moves
+  to a stable edge (symbol: over the blank lines to the previous chunk; lines: back to the previous line end). Census on the
+  three frozen corpora (Qwen3-4B tokenizer): `symbol-512` had 5,910 of 6,684 edges unstable (88 %), now 0; `lines-512` had
+  0 of 2,542 and still 0 (`experiments/corpus.md`). If no stable edge is in reach, the greedy cut stays and that edge can
+  still merge (not seen on the corpora).
+- **An index built before this change is re-chunked, not kept.** The chunkers kept their names, so each index entry records
+  the chunker's algorithm version (`chunkerVersion` per file; absent = 1, the old cuts; `symbol-*` and `lines-*` are now 2).
+  `chunkcache status` reports a file cut by another version as stale even when its text is unchanged, and the next
+  `chunkcache build` re-chunks it. The new chunks have new keys: the old entries miss (never hit wrongly) and become orphans
+  that `chunkcache evict` removes.
+- **A newline join is not safe.** Every chunk ends in a newline (both chunkers cut after line ends), and a newline
+  followed by an inserted `"\n"` merges. The Anthropic converter joins text blocks of one message with `"\n"`, so inline
+  chunk blocks that end in a newline are all `chunk_template_altered` (e2e A6: 3 of 3). The same holds for any glue that
+  starts with a newline. Client rules: send the chunks of an Anthropic request as a **manifest over one string message**
+  (e2e A6m works), or put glue that does not start with a newline between chunks and end a header with a non-whitespace
+  character (a `// path` line, e2e A3g). Census of chunks ending in a newline: 99.6 % (`symbol-512`) and 99.7 %
+  (`lines-512`) of the left-hand chunks merge under a newline join. The chunkers do not try to avoid a trailing newline:
+  every chunk is whole lines, and the alternative (ending before the newline) only moves the merge to the start of the
+  next chunk.
+
 ## Execution: `exact` and `shadow` (`ChunkCachePipeline`, `ChunkCacheReport`)
 
 Only `exact` (the default) and `shadow` run. **Both generate exactly what the unannotated request generates**: the prompt
@@ -187,7 +214,8 @@ request reports `cached_tokens` > 0, and a verified chunk wholly inside that res
   2. fewer than `min_chunk_tokens` (default 32) ids: `chunk_ignored_too_short` (warning only);
   3. **token check**: the span counts only if those ids occur in the whole-prompt ids exactly where its characters are.
      A span the check finds different is `chunk_template_altered` (strict: 400): a span glued to the text before it where
-     the tokenizer merges across the edge, a SentencePiece leading-space piece on the span itself, a Qwen3 assistant span
+     the tokenizer merges across the edge (in particular a chunk ending in a newline followed by the Anthropic `"\n"` join of
+     inline text blocks: see "Chunk edges and joining" above), a SentencePiece leading-space piece on the span itself, a Qwen3 assistant span
      holding a live `<think>` (`Span_TokenIdsDifferAtBoundary_NotCountedReusable`, `AssistantSpanWithThinkTag_VerifiedByIds`).
      How: with a token boundary known at the end of the previous verified span, the glue up to the next span is encoded
      alone and compared with the prompt's ids; a tokenizer that adds a leading piece to every encode (SentencePiece's
@@ -302,7 +330,7 @@ The contract's `capabilities.json` shape (`Capabilities_MatchesFixtureShape`), p
 
 ```json
 {"versions": [1], "policies": ["exact", "shadow", "balanced", "fast", "auto"],
- "selectors": ["chunk_starts"], "wire_chunkers": ["symbol-512"], "auto_validated": [],
+ "selectors": ["chunk_starts"], "wire_chunkers": ["lines-512", "symbol-512"], "auto_validated": [],
  "model": {"id": "<GgufIdentity.ModelId>", "supported": true, "reason": null, "id_kind": "sampled",
            "tokenizer_id": "<GgufIdentity.TokenizerId>", "producer": "<64 hex: keyOf([]) in the caller's namespace>",
            "quantization": "ftype-15", "backend": "cpu", "kv_dtype": "f32",
@@ -320,7 +348,8 @@ The contract's `capabilities.json` shape (`Capabilities_MatchesFixtureShape`), p
   store-wide figures); they are all 0 until the server keeps a ledger of what it wrote (the sole-writer task), and
   `budget_bytes` is 0 until a budget exists. Without `--chunk-store` it carries `"configured": false`; with one,
   `configured` is absent (`Capabilities_StoreConfiguredFalse_WithoutStore`).
-- `wire_chunkers` is the server's wire-eligible list (`symbol-512`; `lines-512` joins in a later task).
+- `wire_chunkers` is the server's wire-eligible list (`lines-512`, `symbol-512`; sorted). `lines-512` is eligible on correctness
+  (its text round-trips by construction); its reuse **quality** is not validated, so `auto_validated` stays `[]` (Phase I5's gate).
 
 ### `POST /v1/chunk-cache/explain`
 
@@ -440,6 +469,28 @@ the server never constructs the chunk-cache runtime (it is created on first use)
 reached; whether the CLR loads the `DotLLM.ChunkReuse` assembly at all with the flag off has not been measured. The
 opt-in AOT publish of `dotllm` (docs/AOT.md) has not been re-verified with this reference. Before upstreaming, the key,
 store, tokenisation and identity types are candidates for a small assembly without Roslyn or Vulkan.
+
+### MCP server (`chunkcache mcp`)
+
+`chunkcache mcp [--store DIR] [--server URL] [--model FILE.gguf] [--threads N]` runs a stdio Model Context Protocol server
+(newline-delimited JSON-RPC) with six tools: `chunkcache_build`, `chunkcache_select`, `chunkcache_status`,
+`chunkcache_evict`, `chunkcache_prewarm`, `chunkcache_explain`. It is a thin wrapper: each call is turned into the argument
+list of the matching `chunkcache <verb> --json`, run in process, and the verb's JSON is projected onto the tool's
+`outputSchema` and returned as `structuredContent` plus a serialised text copy. A failing verb is a tool result with
+`isError` (an `{"error": {"code", "message"}}` object), not a protocol error. Unknown arguments are rejected by the schema.
+
+Defaults that protect: `chunkcache_evict` is a dry run unless `dry_run` is `false`; `chunkcache_build` only indexes
+(tokenizer, nothing is encoded) unless `encode` is `true`, which queues the missing chunks on the server (an error without
+a server); `max_encode_tokens` is a strict token cap, not a chunk count. The API key is read from `CHUNKCACHE_API_KEY` only
+and is sent as `X-API-Key`, to the launch `--server`'s origin only (with the key set, a call whose `server` names another
+origin is refused); it never appears in a frame or on stderr. Tools that open a model take an optional `model`
+(a GGUF path) that overrides the launch `--model`.
+
+Claude Code (`.mcp.json`):
+
+```json
+{"mcpServers": {"chunkcache": {"command": "chunkcache", "args": ["mcp", "--store", "./store", "--model", "M.gguf", "--server", "http://localhost:8080"]}}}
+```
 
 ## Pinned server behaviour (before the convention)
 
