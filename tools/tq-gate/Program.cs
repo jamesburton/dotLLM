@@ -64,6 +64,7 @@ switch (mode)
     case "speed": foreach (int b in bitsList) Speed(b); break;
     case "parity": foreach (int b in bitsList) Parity(b); break;
     case "quality": Quality(); break;
+    case "q8control": Q8Control(); break;
     case "vgpr": foreach (int b in bitsList) Vgpr(b); break;
     default: throw new ArgumentException("mode");
 }
@@ -308,6 +309,29 @@ void Parity(int bits)
         greedyInVsPlainFirstDiv = FirstDiff(gIn.ids, gPlain.ids), greedyOracleVsPlainFirstDiv = FirstDiff(gOracle.ids, gPlain.ids) });
     Log($"PARITY {backend} layers={config.NumLayers} tq{bits}: ratio {ratio:F4} (mean|d| {sumVs / rowsIdx.Length:E3} vs codec effect {sumEff / rowsIdx.Length:E3}) minCos {minCos:F6} argmax {(double)agree / rowsIdx.Length:P1}; " +
         $"greedy first divergence {(firstDiv < 0 ? "none" : firstDiv.ToString())} paths {oraclePath}/{inPath} attnDelta oracle {oracleAttn} inplace {cs1.attn - cs0.attn}");
+}
+
+// Control for the CPU "codec effect" anomaly (#1892): the same teacher-forced rows as Parity, plain F32 cache vs QuantizedKvCache Q8_0 K and V
+// (no F32 window). If this effect is also ~0.1 on CPU, the CPU forward is simply more sensitive to a KV perturbation, so it is not a TQ issue.
+// No OracleCache is used: both arms are computed fresh.
+void Q8Control()
+{
+    int[] t = all[..(64 + steps + 2)];
+    List<float[]> plain, q8;
+    using (var c = Plain(64 + steps + 8)) plain = TeacherForced(c, t, steps);
+    string path;
+    using (var c = new QuantizedKvCache(KvGeometry.SlotCount(config), config.NumKvHeads, config.HeadDim, 64 + steps + 8, KvCacheDType.Q8_0, KvCacheDType.Q8_0, 0))
+    { q8 = TeacherForced(c, t, steps); path = c.GetType().Name; }
+    var rowsIdx = Enumerable.Range(63, steps + 1).ToArray();
+    double sum = 0, minCos = 1; int agree = 0, worst = -1;
+    foreach (int r in rowsIdx)
+    {
+        var (m, cos, same) = Cmp(q8[r], plain[r]);
+        sum += m; if (same) agree++; if (cos < minCos) { minCos = cos; worst = r; }
+    }
+    Append(new { kind = "q8control", backend, model = tag, layers = config.NumLayers, steps, rows = rowsIdx.Length, path, oracleCache = false,
+        meanAbsQ8VsPlain = sum / rowsIdx.Length, minCosQ8VsPlain = minCos, worstRow = worst, argmaxAgree = (double)agree / rowsIdx.Length });
+    Log($"Q8CONTROL {backend} rows={rowsIdx.Length}: mean|d| Q8_0 vs F32 {sum / rowsIdx.Length:E3} minCos {minCos:F6} argmax {(double)agree / rowsIdx.Length:P1} path {path}");
 }
 
 static int FirstDiff(int[] x, int[] y) { for (int i = 0; i < Math.Min(x.Length, y.Length); i++) if (x[i] != y[i]) return i; return -1; }
