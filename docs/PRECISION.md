@@ -560,10 +560,10 @@ Question: the in-place TurboQuant kernels read codes in place (rule 2), so the p
 Candidates: F16, BF16 (2 bytes), OCP FP8 E4M3 / E5M2, Log8 (1 byte; `TurboQuantNormCodec`, round-to-nearest-even, saturating, counted).
 Per-vector cost at hd 128: 16 code words x 4 B (4-bit) + norm; F32 norm = +4 B, 2-byte = +2 B, 1-byte = +1 B.
 
-Method (`tools/tq-norm-eval`, CPU, scratch-path `TurboQuantKvCache` with the norm round-tripped through the codec, one real wikitext-2 LF window per
-cell, KL on the last 128 positions, whose attention reads the whole ctx-long quantised history). The reference is the fp32 `SimpleKvCache`
+Method (`tools/tq-norm-eval`, CPU, scratch-path `TurboQuantKvCache` with the norm round-tripped through the codec, n independent real wikitext-2 LF windows per
+cell (n is printed in each cell: 1 to 31, fewer where a 4B or 8K run was costly), KL on the last 128 positions, whose attention reads the whole ctx-long quantised history). The reference is the fp32 `SimpleKvCache`
 (there is no F16 `SimpleKvCache`; reference arms are the standing exception). **Cost = (KL(ref || tq, format norms) - KL(ref || tq, F32 norms)) / KL(ref || tq, F32 norms)**,
-paired per row; table cells are the mean over n independent windows and its standard error. Decision rule (binding, #1892): smallest format whose cost is < 10 % at every bit width on both models.
+paired per row; table cells are the mean over n independent windows and its standard error. Decision rule (set in the #1892 task plan, before the data; see Decision below for how it was applied): smallest format whose cost is < 10 % at every bit width on both models. Read cells with n=1 with care: their s.e. is about 10 % on the 4B model (and 2-4 % on the 0.5B), which is the size of the line being tested, so a single window cannot place a format on either side of it.
 
 **Noise floor.** Both models quantise activations to int8 (q8_0 / Q4_K weights), which digitises any tiny perturbation (see E16). Direct KL between two
 runs that differ only by a ~2^-12 relative norm jitter is 12-130 % of the tq-vs-ref KL, and the arm is deterministic (re-running the F32 arm gives 0.0). A
@@ -662,7 +662,7 @@ PRs #1103, #1122, #1125, #1126.
 | X2 | CPU | MLA-MoE routed experts → F32 | ≈57 GB on V2-Lite | open | #1140 |
 | X3 | CPU | MLA projections, shared / Granite-MoE experts → F32 | `Σ out·in·4` | open | #1140 |
 | X4 | CPU | R4 repack: second same-width copy | L8B Q4_K_M +4.9 GB | **fixed**: R4 is a zero-copy view; same kernels on the mmap rows, bit-identical, same speed | #1156 (from #1143) |
-| X5 | CPU | TurboQuant full-history F32 scratch | L8B @128k 1 GiB | open | #1139 |
+| X5 | CPU | TurboQuant full-history F32 scratch | L8B @128k 1 GiB | **fixed for the MSE stage** (#1892: `TurboQuantInPlaceKvCache` reads codes + F16 norms in place); the QJL form (`tq*q`) stays on the scratch cache until #1894 | #1139, #1892 |
 | X6 | CPU | dequant-rows prefill (Q4_0/Q4_1/Q5_1/IQ4_NL, BF16, F16, MXFP4, PQ2_0) | bounded `k·4` per worker | open (missing kernels) | #1119, #1118, #489 |
 | X7 | CPU | quantized-KV tile dequant per head, allocated per call | `tile·hd·8` per head call | open | #970, #1120 |
 | G1 | CUDA | F32 activation set for every model | L1B ≈587 MB @4096 | open | #1134 |
@@ -678,7 +678,7 @@ PRs #1103, #1122, #1125, #1126.
 | GX1 | CUDA | prefill dequant → F16 scratch → cuBLAS | L1B 33.5 MB, 70B 470 MB + 2 B/weight traffic | hybrid PQ2_0 **fixed** (#1222: int8-mma W2A8 MMQ default on sm_80+); dense 2..8-row projections (verify / draft / short prefill) over Q2_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ4_NL **fixed** (#1316/#1375: rows4 `_c2..c8` dp4a GEMVs read the blocks in place; `DOTLLM_CUDA_KQUANT_SMALL_S_MAX=0` restores the scratch); dense `seqLen > 8` open | #1132 (hybrid PQ2_0), #1135 (dense) |
 | GX2 | CUDA | LM head > 8 rows → whole-head F16 | B2 2.54 GB | **fixed on dev** (#1099, PR #1125): 2,425 → 170 MiB | — |
 | GX2b | CUDA | multi-row LM head for non-PQ2_0 heads: tiled F16 dequant | ≤ max(layer scratch, 64 MiB) per tile | open (bounded, admitted) | #1136 |
-| GX3 | CUDA | quantized-KV full-history F16 scratch | stride 1024 @32k: 128 MB | hybrid **fixed on dev** (#1094, PR #1103); dense `CudaQuantizedKvCache` fixed (#1850, read in place); TurboQuant open | #1139 |
+| GX3 | CUDA | quantized-KV full-history F16 scratch | stride 1024 @32k: 128 MB | hybrid **fixed on dev** (#1094, PR #1103); dense `CudaQuantizedKvCache` fixed (#1850, read in place); TurboQuant dense fixed (#1892: `CudaTurboQuantInPlaceKvCache`, codes + F16 norms read in place); `tq*q` refused on CUDA (#1894) | #1139, #1892 |
 | GX4 | CUDA | hybrid KV F16 dequant scratch, remaining tiers | B2 4 KiB/token | open | #1136 |
 | GX5 | CUDA | load-time F16 copies (no GEMV kernel), embedding, dense LM head | Qwen3-8B embedding 1.16 GiB | open (gated) | #1135 |
 | GX6 | CUDA | Gemma `ProjectF32` quant → F16 → F32 | `4·maxProj` | open | #1135 |
@@ -691,7 +691,7 @@ PRs #1103, #1122, #1125, #1126.
 | V6 | Vulkan | logits `rows·V·4`; recurrent state; MLA KV; Q8_1 `(d,s)` and KV scales F32 | various | open | #1137, #1144, #1140, #1146 |
 | VX1 | Vulkan | token embedding → F32 for every type but Q8_0 | Qwen3.8-27B 4.85 GiB vs 682 MiB (Q4_K); Bolt 2 GiB vs 544 MiB (Q8_0) | **fixed for Nemotron-H and qwen35 dense** (#1174: Q8_0 / Q4_K / Q6_K / PQ2_0 gathered packed); dense `VulkanWeights` K-quants and `VulkanQwen3MoeHybrid` open | #919 |
 | VX2 | Vulkan | matrices outside `DeviceQuantTypeFor` → F32 | `m·k·4` | open | #921, #627 |
-| VX3 | Vulkan | quantized-KV / TurboQuant F32 full-history scratch | `2·maxSeq·stride·4` | open | #1139 (hybrid: #1112) |
+| VX3 | Vulkan | quantized-KV / TurboQuant F32 full-history scratch | `2·maxSeq·stride·4` | TurboQuant on the dense chain and Flint **fixed** (#1892, read in place); quantized-KV and hybrids open | #1139 (hybrid: #1112), #1892 |
 | VX4 | Vulkan | IQ1/2/3 (+ fallback NVFP4) prefill F16 scratch | L3B 50.3 MB + 4 B/weight traffic | **fixed for the dense and Nemotron-H hosts** (#1677: IQ1_S / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S decode inside the 128x128 coopmat tile, scratch never allocated; IQ2_XXS #1069, NVFP4 #1064); hybrid hosts open (#1149) | #1146 (#1064, #1069, #1677) |
 | VX5 | Vulkan | shared-expert / expert-bank F32 fallbacks; legacy MLA F32 | up to ≈265 GB if they fall through | open | #1140 |
 | F374 | Vulkan | 16-bit storage / `shaderFloat16` / `shaderInt8` never enabled | — | **fixed on dev** (972d5c53, PR #1122) | #374 |

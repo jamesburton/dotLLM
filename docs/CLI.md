@@ -86,18 +86,25 @@ Backend background: [GPU.md](GPU.md), [VULKAN.md](VULKAN.md), [CUDA.md](CUDA.md)
 ## TurboQuant KV availability (#1887)
 
 A TurboQuant request runs TurboQuant for real, or startup fails and says why (#1888). It is never served by another cache. Pass the same
-value to `--cache-type-k` and `--cache-type-v`. TurboQuant on every backend, read in place, is tracked in #1887.
+value to `--cache-type-k` and `--cache-type-v`. Since #1892 the MSE stage (`tq`, `tq1`..`tq8`) is read in place, as packed codes plus F16
+norms with no decoded history, on CPU, CUDA and Vulkan, for `serve`, `run`, `chat` and `bench`. Layout, rotations and kernels are in
+[KV_CACHE.md](KV_CACHE.md). Epic: #1887.
 
 | Backend / command | Setting | TurboQuant (`tq`, `tq1`..`tq8`, `tq*q`) |
 |---|---|---|
-| CPU `serve` | `--no-paged`, plain transformer, no draft model, no MTP head | runs (`TurboQuantKvCache`; still decodes into an FP32 scratch until step 2) |
-| CPU `serve` | paged (the default) | refused: pass `--no-paged` (step 3) |
-| CPU `serve` | hybrid / recurrent / other CPU hosts | refused |
-| `run`, `chat`, `bench` | any | refused until step 2 |
-| CUDA, Vulkan, HIP (any command; `--device auto` that lands on a GPU) | any | refused until step 2 |
-| any | K and V differ (mixed pair, V-only, or different bit widths) | refused until step 6 |
-| any | head dim not a power of two or above 256, or per-layer KV widths | refused |
-| any | MLA models (DeepSeek-V2/V3, GLM-4.7-Flash, Kimi): their attention keeps its own latent KV | refused |
+| CPU `serve`, `run`, `chat`, `bench` | `--no-paged` (contiguous), plain transformer, no draft model, no MTP head | runs in place; `tq*q` (QJL) on the scratch cache until #1894 |
+| CUDA `serve`, `run`, `chat`, `bench` | dense, non-paged | runs in place; `tq*q` refused (#1894) |
+| Vulkan `serve`, `run`, `chat`, `bench` | dense chain or Flint, non-paged | runs in place; `tq*q` refused (#1894) |
+| `--device auto` | lands on any of the above | same as the backend it lands on |
+| any | paged KV (the `serve` default) | refused: pass `--no-paged` (#1893) |
+| any | K and V differ (mixed pair, V-only, or different bit widths) | refused (#1895) |
+| HIP | any | refused (#1896) |
+| any | head dim not a power of two or above 256 | refused (#1897) |
+| any | per-layer KV widths, or a V head dim different from K | refused (#1898) |
+| any | MLA models (DeepSeek-V2/V3, GLM-4.7-Flash, Kimi): their attention keeps its own latent KV | refused (#1899) |
+| any | hybrid, recurrent, Qwen4-Exp and pipeline hosts | refused (#1900) |
+| any | speculative draft model, or an attaching MTP head | refused (#1901) |
+| any | `--cache-window > 0` | refused: a TurboQuant cache holds codes only, with no original-space window |
 
 ## KV-cache sizing
 
