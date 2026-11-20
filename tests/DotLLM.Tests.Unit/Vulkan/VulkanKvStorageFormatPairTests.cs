@@ -27,6 +27,9 @@ public sealed class VulkanKvStorageFormatPairTests
     public void Tq_RefusesElementAndBlockSizing()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => VulkanKvStorage.Tq.ElementBytes());
-        Assert.Throws<ArgumentOutOfRangeException>(() => VulkanKvStorage.Tq.ShaderName("attention_f32"));
+        Assert.Throws<ArgumentOutOfRangeException>(() => VulkanKvStorage.Tq.RowBytes(128));
+        Assert.False(VulkanKvStorage.Tq.IsBlockQuantized());
+        // Its attention twins exist since #1892 task 7: the body compiled with kv_load.glsl's KV_TQ loader.
+        Assert.Equal("attention_f32_kvtq", VulkanKvStorage.Tq.ShaderName("attention_f32"));
     }
 }
