@@ -247,8 +247,14 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _blockedNamespaces = new(StringComparer.Ordinal);
     private long _lastBlockedCheckMs = Environment.TickCount64;
 
-    // Path forgets fence single in-flight items by sequence number (under _ledgerSync); namespace / all forgets use the fences.
-    private readonly HashSet<long> _forgottenItems = [];
+    // Path forgets are fenced like namespace / all forgets, by sequence number (under _ledgerSync): every item queued at or
+    // before the forget that its matcher selects is forgotten, wherever it is (queued, being encoded, or just taken by the
+    // worker). Checking only the queue and the current item leaves a window: the worker can take a matching item between
+    // the two looks and write it back after the forget was reported.
+    private readonly List<(long Seq, Func<ChunkEncodeItem, bool> Match)> _pathFences = [];
+
+    /// <summary>Most path-forget fences kept; the oldest goes first (its items were queued long before and are done).</summary>
+    internal const int MaxPathFences = 256;
 
     /// <summary>The per-namespace byte budget (<c>--chunk-store-namespace-budget</c>); 0 = off (one shared LRU).</summary>
     public long NamespaceBudgetBytes { get; private init; }
@@ -697,17 +703,22 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
     private bool Forgotten(ChunkEncodeItem item) =>
         (_forgetAllFence > 0 && item.Seq <= _forgetAllFence)
         || (_forgetFences.TryGetValue(item.Namespace, out long fence) && fence > 0 && item.Seq <= fence)
-        || (item.Seq > 0 && _forgottenItems.Contains(item.Seq));
+        || PathForgotten(item);
+
+    private bool PathForgotten(ChunkEncodeItem item)
+    {
+        foreach ((long seq, Func<ChunkEncodeItem, bool> match) in _pathFences)
+            if (item.Seq <= seq && match(item))
+                return true;
+        return false;
+    }
 
     private void WriteLocked(ChunkEncodeItem item, ChunkKvEntry entry)
     {
         if (_writesDisabled || _ledger is not { } ledger)
             return;
         if (Forgotten(item))
-        {
-            _forgottenItems.Remove(item.Seq);
             return; // forgotten while it was being encoded
-        }
         ChunkKey key = item.Key;
         string path = _files.PathOf(key);
         long estimate = EntryBytes(entry);
@@ -1330,8 +1341,11 @@ internal sealed class ChunkStoreService : IChunkEncodeSink, IDisposable
         {
             if (request.Mode == EvictMode.Path)
             {
-                if (_queue?.Current is { } current && queueMatch!(current))
-                    _forgottenItems.Add(current.Seq);
+                if ((_queue?.LastSeq ?? 0) is > 0 and long pathFence)
+                {
+                    if (_pathFences.Count >= MaxPathFences) _pathFences.RemoveAt(0);
+                    _pathFences.Add((pathFence, queueMatch!));
+                }
             }
             else
             {

@@ -199,6 +199,37 @@ internal sealed class ChunkCacheRuntime : IDisposable
     }
 
     /// <summary>
+    /// How long the store-wide figures of <c>GET /v1/chunk-cache</c> (a walk over every entry file) are reused. The route
+    /// has no slot and a keyless local caller may call it freely, so the walk must not run per request.
+    /// </summary>
+    internal TimeSpan StoreFiguresTtl { get; set; } = TimeSpan.FromSeconds(5);
+
+    private readonly Lock _figuresGate = new();
+    private (long Entries, long Bytes) _figures;
+    private long _figuresAtMs = long.MinValue;
+    private int _figureWalks;
+
+    /// <summary>Directory walks done for the store-wide figures (test observability).</summary>
+    internal int StoreFigureWalks => Volatile.Read(ref _figureWalks);
+
+    /// <summary>The store-wide figures, walked at most once per <see cref="StoreFiguresTtl"/> (one walk at a time).</summary>
+    /// <param name="walk">Counts the store's entry files and bytes.</param>
+    /// <returns>Entries and bytes, at most <see cref="StoreFiguresTtl"/> old.</returns>
+    internal (long Entries, long Bytes) StoreFigures(Func<(long Entries, long Bytes)> walk)
+    {
+        lock (_figuresGate)
+        {
+            long now = Environment.TickCount64;
+            if (_figuresAtMs != long.MinValue && StoreFiguresTtl > TimeSpan.Zero && now - _figuresAtMs < StoreFiguresTtl.TotalMilliseconds)
+                return _figures;
+            _figures = walk();
+            _figuresAtMs = now;
+            Interlocked.Increment(ref _figureWalks);
+            return _figures;
+        }
+    }
+
+    /// <summary>
     /// Why chunk reuse cannot apply to the served model (spec §5.5: recurrent / hybrid models, a backend without assembly),
     /// or null.
     /// </summary>
@@ -214,6 +245,11 @@ internal sealed class ChunkCacheRuntime : IDisposable
             return "backend without chunk assembly";
         if (state.CurrentGguf is null)
             return "no GGUF identity";
+        // The model id hashes the base GGUF only. A tensor overlay or a ternary adapter changes the weights every forward runs
+        // on, so K/V computed here are not the base model's: under the base key they would be wrong hits for a base server,
+        // the CLI and applied reuse, and base entries would be wrong hits here. Until the identity covers them: no chunk reuse.
+        if (state.Options.TensorOverlayPath is not null || state.Options.TernaryAdapterPaths is { Count: > 0 })
+            return "tensor overlay or adapter attached (not part of the model identity)";
         return null;
     }
 }

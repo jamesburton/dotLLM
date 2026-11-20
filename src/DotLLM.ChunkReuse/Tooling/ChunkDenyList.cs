@@ -159,7 +159,10 @@ public sealed class ChunkDenyList
             int wild = p.IndexOfAny(['*', '?']);
             string literal = (wild < 0 ? p : p[..wild]).TrimStart('.');
             if (literal.Length == 0) continue;
-            if (literal.StartsWith(stem, StringComparison.OrdinalIgnoreCase) || stem.StartsWith(literal, StringComparison.OrdinalIgnoreCase))
+            // A stem is the first six characters of the long name; a shorter stem is the whole base name (nothing was cut), so
+            // only a six-character stem may stand for a longer pattern start ("APPSET" for appsettings, but not "a").
+            bool truncated = stem.Length >= 6;
+            if ((truncated && literal.StartsWith(stem, StringComparison.OrdinalIgnoreCase)) || stem.StartsWith(literal, StringComparison.OrdinalIgnoreCase))
                 return true;
         }
         return false;

@@ -72,7 +72,7 @@ addresses a message's string `content` through the manifest; array `content` sta
 server-assigned namespace (its `--chunk-cache-api-keys` key, or the default for a local caller); a caller the chunk-cache
 control plane would refuse is still served, but with no store lookups, and `report: "per_chunk"` adds per-chunk status
 only for an authenticated caller ([Chunk-cache authentication](#chunk-cache-authentication-opt-in)). The control plane,
-`GET /v1/chunk-cache` (capabilities), `POST /v1/chunk-cache/explain` (dry run) and, with `--chunk-store-write`,
+`GET /v1/chunk-cache` (capabilities), `POST /v1/chunk-cache/explain` (dry run) and (mapped on every `--chunk-cache` server; they act only with `--chunk-store-write` and answer `503` without it)
 `POST /v1/chunk-cache/prewarm` (queue text for a background encode) and `POST /v1/chunk-cache/evict` (orphans, forget a
 path or a namespace; `dry_run` by default; [CHUNK_CACHE.md](CHUNK_CACHE.md#control-plane-prewarm-and-evict-spec-72-10-the-store-tasks)),
 exists only with the flag. With
@@ -1337,7 +1337,7 @@ Prompt caching is **enabled by default** in both `chat` and `serve` commands.
 | `--prompt-cache-step-keep` | 8 | Most `--prompt-cache-step` checkpoints kept (deepest first) |
 | `--chunk-cache` | off | Honour `chunk_cache` annotations on `/v1/chat/completions` and `/v1/messages` (chunk-level K/V reuse convention): `exact` (default) and `shadow`, output identical to the unannotated request, plus a `chunk_cache` report and `/metrics` counters (`dotllm_chunk_cache_chunks_total`, `dotllm_chunk_cache_tokens_total`). Off: annotations are ignored like any unknown field ([CHUNK_CACHE.md](CHUNK_CACHE.md)) |
 | `--chunk-cache-max-chunks` | 4096 | Most chunk annotations read per request (1 to 65536); the rest are dropped with `chunk_too_many` without being read |
-| `--chunk-store` | none | With `--chunk-cache` (rejected without it): a chunk store (e.g. from `chunkcache build`) to look annotated chunks up in. Read-only unless `--chunk-store-write` (never written or created); a relative path is resolved at startup; a missing directory is reported as `chunk_store_unavailable` |
+| `--chunk-store` | none | With `--chunk-cache` (rejected without it): a chunk store (e.g. from `chunkcache build`) to look annotated chunks up in. Without `--chunk-store-write` it is read-only (never written or created); with it the server owns and writes it. A relative path is resolved at startup; a missing directory is reported as `chunk_store_unavailable` |
 | `--chunk-store-write` | off | With `--chunk-store`: the server becomes the store's only writer (owns the directory, creating it if missing; a second server on it refuses to start; keeps the server ledger; encodes admitted misses in the background while idle). Needs `--chunk-store-budget` ([CHUNK_CACHE.md](CHUNK_CACHE.md#store-writes-the-sole-writer)) |
 | `--chunk-store-budget` | none | Required with `--chunk-store-write` (rejected without it): the store's byte budget (`20GiB`, `500MB`, bytes; above 0). Over it the server evicts its own least-recently-used entries, never an entry a `chunkcache` index references; when nothing can be freed, encoding stops and responses warn `chunk_store_unavailable` |
 | `--chunk-store-index-only` | off | With `--chunk-store-write`: store only chunks an index file in the store references, so ad-hoc text is never persisted |
@@ -1566,7 +1566,7 @@ No built-in auth. For network-exposed deployments, configure your reverse proxy 
 ### Chunk-cache authentication (opt-in)
 
 The one exception, and only for the chunk-cache control plane (`GET /v1/chunk-cache`, `POST /v1/chunk-cache/explain`,
-and with `--chunk-store-write` `POST /v1/chunk-cache/prewarm` and `/evict`; all exist only with `--chunk-cache`): a per-chunk store answer is a membership probe on cached source text, so that
+`POST /v1/chunk-cache/prewarm` and `/evict`; all exist only with `--chunk-cache`, and the last two answer `503` without `--chunk-store-write`): a per-chunk store answer is a membership probe on cached source text, so that
 surface authenticates even though nothing else does. **Security-sensitive; off unless `--chunk-cache` is given.**
 
 - `--chunk-cache-api-keys <file>`: the request must carry a listed key in `X-API-Key` or `Authorization: Bearer`
@@ -1581,10 +1581,11 @@ surface authenticates even though nothing else does. **Security-sensitive; off u
   Evict is a dry run unless the body says `"dry_run": false`; deleting store-wide (`orphans`, `all`) or in another
   namespace needs an `admin` key: a server without keys allows its local user dry runs of those and deletes in its own
   namespace only.
-- **Reverse-proxy hazard (keyless servers).** A request carrying `Forwarded`, any `X-Forwarded-*` or `X-Real-IP` is never
-  "local". A same-host proxy that adds none of them (e.g. nginx's bare `proxy_pass http://127.0.0.1:...`) makes every
-  caller look local, so anything that reaches it could use the keyless control plane, including prewarm and forget of
-  the default namespace. Configure `--chunk-cache-api-keys` whenever anything but local processes can reach the server.
+- **Warning: reverse proxy in front of a keyless server.** A same-host proxy (e.g. nginx's `proxy_pass http://127.0.0.1:...`)
+  makes every caller look local; forwarding headers (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`) are not looked at. A
+  local caller of a keyless server is its admin: it sees store-wide figures, may prewarm, dry-run any eviction and forget
+  the default namespace (store-wide and cross-namespace deletes still need an `admin` key). **Set
+  `--chunk-cache-api-keys` whenever anything but local processes can reach the server.**
 - Namespace isolation covers the chunk store only: the prompt (prefix) cache, `cached_tokens` and `/metrics` are shared
   by every caller, as they always were.
 - Without a keys file: local callers only (loopback remote address, a `localhost` / loopback `Host`, no `Origin`

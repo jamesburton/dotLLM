@@ -379,9 +379,14 @@ public sealed class StoreLockTests : IDisposable
         Assert.Empty(ChunkIndex.ReferencedKeysUnder(_root));
     }
 
-    [Fact]
+    private static bool OnPath(string exe) =>
+        (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+            .Any(dir => { try { return File.Exists(Path.Combine(dir, exe)); } catch (ArgumentException) { return false; } });
+
+    [SkippableFact]
     public void CrashedHolder_ItsLockIsFreedByTheOs()
     {
+        Skip.IfNot(OnPath(OperatingSystem.IsWindows() ? "powershell.exe" : "pwsh"), "needs PowerShell on PATH (powershell.exe on Windows, pwsh elsewhere) as the second process");
         // The holder is another .NET process (PowerShell) opening the lock file with FileShare.None, as the lock helpers do:
         // a sharing-mode lock on Windows, flock(LOCK_EX) on Linux/macOS. Either is released by the OS when the process dies.
         // Windows PowerShell on Windows; PowerShell 7 (pwsh) elsewhere (on the GitHub ubuntu runners and in the .NET SDK images).

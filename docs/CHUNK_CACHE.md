@@ -581,10 +581,10 @@ would be a membership oracle):
   in `--chunk-cache-api-keys`. The local user of a server **without keys** may prewarm, delete in its own (default)
   namespace, and dry-run anything, but gets `403 chunk_cache_admin_key_required` for those deletes
   (`Keyless_StoreWideDestructive_NeedsAdminKey`). **Proxy hazard:** without keys, anything that reaches the server through
-  a same-host reverse proxy looks local. A request carrying `Forwarded`, any `X-Forwarded-*` or `X-Real-IP` is never
-  local (`Keyless_ForwardedHeaders_NotLocal`), but a proxy that adds none of them (nginx's bare `proxy_pass`) passes
-  every caller through as local: with keys off, such a caller could prewarm and forget the default namespace. Configure
-  keys whenever anything other than local processes can reach the server.
+  a same-host reverse proxy looks local, whatever forwarding headers it adds (`Forwarded`, `X-Forwarded-*` and `X-Real-IP`
+  are not looked at; `Keyless_ForwardedHeaders_StayLocal_ButStoreWideDeletesStillNeedAnAdminKey`): with keys off, such a
+  caller is the server's local admin and could read store-wide figures, prewarm, and forget the default namespace.
+  **Set `--chunk-cache-api-keys` whenever anything other than local processes can reach the server.**
 - The default `mode` is `orphans`, which is admin-only: a non-admin's `{}` is a 403; send `"mode": "namespace"` (or
   `path`).
 - **Modes**:
@@ -683,8 +683,7 @@ membership probe on source code (spec §10).
 - **Without keys**: local callers only, in the default namespace (admin for figures and dry runs, not for store-wide
   deletes), else `403 permission_error`. Local means all of: the
   connection's remote address is loopback (IPv4-mapped too; an unknown address, as on a Unix socket, is not local); the
-  `Host` header is `localhost` or a loopback address (any port); there is no `Origin` header; and there is no
-  forwarding header (`Forwarded`, any `X-Forwarded-*`, `X-Real-IP`: a same-host proxy). The last two stop a
+  `Host` header is `localhost` or a loopback address (any port); and there is no `Origin` header. The last two stop a
   web page in the user's browser: the server's CORS policy allows any origin, and DNS rebinding reaches loopback under a
   foreign host name. "Local" still admits **every process on the machine**, including a service that can be made to
   fetch URLs for someone else (SSRF), and behind a reverse proxy on the same host every caller is local: configure keys

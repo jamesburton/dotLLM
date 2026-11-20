@@ -60,10 +60,9 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
     /// <param name="chunkCache">The chunk-cache options (flag on or off, store).</param>
     /// <param name="paged">True: the default paged KV with the scheduler; false: the single-slot prefix cache.</param>
     /// <param name="schedulerTrie">
-    /// Paged only: give the scheduler the cross-request prefix trie. <c>ServerStartup</c> builds the trie
-    /// (<c>ServerState.PrefixTrieManager</c>) but does not pass it to the scheduler, so the default serving path has no
-    /// cross-request prefix reuse at all; this wires it the way the engine supports (<c>ContinuousBatchSchedulerService</c>'s
-    /// <c>prefixCache</c>), so warm-slot neutrality can be checked on the trie + scheduler path too.
+    /// Paged only: keep the cross-request prefix trie that <c>ServerStartup</c> gives the scheduler (the serving default since
+    /// #1596). False (the default here) rebuilds the scheduler without it: a chunk the trie serves is reported
+    /// <c>prefix</c>, never <c>hit</c>, so tests of the chunk store need it out of the way; the neutrality tests ask for it.
     /// </param>
     /// <param name="configure">Runs on the app before the endpoints are mapped (test middleware: a remote address, the rate limiter).</param>
     /// <param name="logs">Receives the host's <c>ILogger</c> output (every level).</param>
@@ -85,6 +84,7 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
             PromptCacheEnabled = device != "vulkan",
         };
         var state = ServerStartup.LoadModel(modelPath, options);
+        state.ChunkCacheRuntime.StoreFiguresTtl = TimeSpan.Zero; // tests read the store figures right after changing the store
         if (schedulerTrie)
         {
             Assert.True(paged && state.Scheduler is not null && state.PrefixTrieManager is not null && state.PagedFactory is not null);

@@ -842,6 +842,42 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
     /// others' rows and none of its own, its entry is dropped instead. Without the option the shared LRU applies (the
     /// control). The flag parses on both option paths and needs <c>--chunk-store-write</c>.
     /// </summary>
+    /// <summary>
+    /// A path forget covers every matching item queued before it, wherever the worker has it. The window it closes: the worker
+    /// takes a matching item from the queue after the forget looked at the current item and before it emptied the queue; that
+    /// item is then neither queued nor "current" as the forget saw it, and without a fence it is encoded and written back
+    /// after the response reported the forget. Such an item is modelled directly: right sequence number, not in the queue.
+    /// </summary>
+    [Fact]
+    public async Task PathForget_FencesEveryMatchingItemQueuedBeforeIt_NotOnlyTheOneBeingEncoded()
+    {
+        string Text(char ch) => new string(ch, 64) + "\n";
+        long e = ChunkStoreServiceTests.FileBytes(Text('a'), 4);
+        var x = new ChunkCaller(true, "tenant-x");
+        var y = new ChunkCaller(true, "tenant-y");
+        using var s = StartService(NewStore(), budget: 100 * e, nsBudget: 0);
+        Put(s, x, Text('1'));
+        Put(s, x, Text('2'));
+        long last = s.Queue.LastSeq;
+        Assert.True(last >= 2);
+        ChunkEncodeItem Item(char ch, ChunkCaller who, string path, long seq) =>
+            new(who.Namespace, ChunkStoreServiceTests.KeyFor(Text(ch), who.Namespace), Text(ch), 65, path) { Seq = seq };
+
+        var raced = Item('r', x, "src/A.cs", last);
+        Assert.True(s.ShouldEncode(raced)); // control: wanted until the forget
+        await s.EvictAsync(new EvictRequest(EvictMode.Path, x.Namespace, "src/**", false), CancellationToken.None);
+
+        Assert.False(s.ShouldEncode(raced));                                 // taken by the worker around the forget: still forgotten
+        Assert.False(s.ShouldEncode(Item('q', x, "src/deep/B.cs", 1)));      // any earlier matching item
+        Assert.True(s.ShouldEncode(Item('o', x, "docs/B.md", last)));        // another path
+        Assert.True(s.ShouldEncode(Item('y', y, "src/A.cs", last)));         // another namespace
+        Assert.True(s.ShouldEncode(Item('n', x, "src/A.cs", last + 1)));     // queued after the forget
+
+        // A dry run fences nothing.
+        await s.EvictAsync(new EvictRequest(EvictMode.Path, x.Namespace, "docs/**", true), CancellationToken.None);
+        Assert.True(s.ShouldEncode(Item('o', x, "docs/B.md", last)));
+    }
+
     [Fact]
     public async Task NamespaceBudget_PrewarmEvictsOnlyOwnRows()
     {
@@ -969,24 +1005,25 @@ public sealed class ChunkCacheWriteEndpointTests : IDisposable
     // ------------------------------------------------------------------------------------------------ fix round (review S1-S6)
 
     /// <summary>
-    /// S2 ruling: a request carrying a forwarding header (<c>Forwarded</c>, <c>X-Forwarded-*</c>, <c>X-Real-IP</c>) is not
-    /// local, whatever its address (a same-host reverse proxy): on a keyless server every chunk-cache route answers 403.
+    /// Locality is unchanged from before the store routes (owner's decision, 2026-11-20): a forwarding header
+    /// (<c>Forwarded</c>, <c>X-Forwarded-*</c>, <c>X-Real-IP</c>) does NOT make a loopback caller non-local, so existing keyless
+    /// setups behind a same-host proxy keep working. The exposure that leaves (a proxied caller is local, and local is admin
+    /// for figures, dry runs and the default namespace) is documented; store-wide and cross-namespace deletes still need an
+    /// admin key (<see cref="Keyless_StoreWideDestructive_NeedsAdminKey"/>). An opt-in rule is a separate issue.
     /// </summary>
     [Fact]
-    public async Task Keyless_ForwardedHeaders_NotLocal()
+    public async Task Keyless_ForwardedHeaders_StayLocal_ButStoreWideDeletesStillNeedAnAdminKey()
     {
         string root = NewStore();
         await using var server = await ChunkCacheTestServer.StartAsync(_model, Writing(root));
-        Assert.Equal(200, (await server.SendAsync(HttpMethod.Get, "/v1/chunk-cache", null)).Status);
-        foreach (var header in new[] { ("Forwarded", "for=203.0.113.7"), ("X-Forwarded-For", "203.0.113.7"), ("X-Forwarded-Host", "example.org"),
-                     ("X-Forwarded-Proto", "https"), ("X-Real-IP", "203.0.113.7"), ("x-forwarded-for", "10.0.0.1") })
+        foreach (var header in new[] { ("Forwarded", "for=203.0.113.7"), ("X-Forwarded-For", "203.0.113.7"), ("X-Real-IP", "203.0.113.7") })
         {
-            Assert.Equal(403, (await server.SendAsync(HttpMethod.Get, "/v1/chunk-cache", null, header)).Status);
-            Assert.Equal(403, (await server.SendAsync(HttpMethod.Post, Prewarm, PrewarmBody((ChunkA, null)), header)).Status);
-            Assert.Equal(403, (await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"namespace","dry_run":false}""", header)).Status);
+            Assert.Equal(200, (await server.SendAsync(HttpMethod.Get, "/v1/chunk-cache", null, header)).Status);
+            Assert.Equal(200, (await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"namespace"}""", header)).Status);
+            Assert.Equal(403, (await server.SendAsync(HttpMethod.Post, Evict, """{"mode":"orphans","dry_run":false}""", header)).Status);
         }
-        Assert.True(Writer(server).Queue.WaitDrained(Drain));
-        Assert.Empty(new FileChunkStore(root).Keys());
+        // Control: what does make a loopback caller non-local is unchanged (a browser's Origin header).
+        Assert.Equal(403, (await server.SendAsync(HttpMethod.Get, "/v1/chunk-cache", null, ("Origin", "https://example.org"))).Status);
     }
 
     /// <summary>

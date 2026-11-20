@@ -361,8 +361,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         /// <summary>The chunk store the server looks chunks up in (read-only for now).</summary>
         [CommandOption("--chunk-store")]
         [Description("With --chunk-cache: the chunk store (e.g. built by chunkcache build) the server looks annotated chunks up in, to count hits " +
-                     "and plan shadow reuse. Read-only unless --chunk-store-write: the server then never writes or creates it, and a missing directory " +
-                     "is reported as chunk_store_unavailable.")]
+                     "and plan shadow reuse. Without --chunk-store-write it is read-only: the server never writes or creates it, and a missing directory " +
+                     "is reported as chunk_store_unavailable. With --chunk-store-write the server owns and writes it.")]
         public string? ChunkStore { get; set; }
 
         /// <summary>Make the server the store's sole writer (background encode of admitted misses).</summary>

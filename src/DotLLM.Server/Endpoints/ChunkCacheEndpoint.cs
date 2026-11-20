@@ -201,7 +201,7 @@ public static class ChunkCacheEndpoint
             {
                 if (caller.IsAdmin)
                 {
-                    (entries, bytes) = writer.StoreFigures();
+                    (entries, bytes) = state.ChunkCacheRuntime.StoreFigures(writer.StoreFigures);
                     budget = writer.BudgetBytes;
                 }
                 else
@@ -212,8 +212,11 @@ public static class ChunkCacheEndpoint
             }
             else if (caller.IsAdmin && state.ChunkCacheRuntime.Store(options, out _) is FileChunkStore files)
             {
-                var stats = files.GetStats();
-                (entries, bytes) = (stats.Entries, stats.EntryBytes);
+                (entries, bytes) = state.ChunkCacheRuntime.StoreFigures(() =>
+                {
+                    var stats = files.GetStats();
+                    return (stats.Entries, stats.EntryBytes);
+                });
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1009,6 +1012,8 @@ public static class ChunkCacheEndpoint
         }
         catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
         {
+            // The rest of the body is never read: close the connection rather than drain it (as explain does).
+            context.Response.Headers.Connection = "close";
             await WriteAsync(context, StatusCodes.Status408RequestTimeout, ErrorResponse.InvalidRequest(
                 $"{route}: the request body did not arrive within {BodyReadTimeout.TotalSeconds:0.#} s", code: "request_timeout"));
             return null;

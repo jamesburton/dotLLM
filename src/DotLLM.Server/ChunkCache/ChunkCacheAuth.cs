@@ -74,9 +74,9 @@ internal sealed record ChunkCaller(bool Authenticated, string Namespace)
 /// IPv4-mapped one too; an unknown address, as on a Unix socket or in-memory host, is not local); the <c>Host</c> header names
 /// <c>localhost</c> or a loopback address (a DNS-rebinding page reaches loopback under its own host name); and no
 /// <c>Origin</c> header (browsers send one on cross-origin requests, and the server's CORS policy allows any origin, so a web
-/// page could otherwise read a local caller's chunk status); and no forwarding header (<c>Forwarded</c>,
-/// <c>X-Forwarded-*</c>, <c>X-Real-IP</c>: a same-host proxy). A proxy that adds none of them still makes every caller
-/// look local: configure keys there. The local caller of a keyless server is admin for figures, dry runs and its own
+/// page could otherwise read a local caller's chunk status). Forwarding headers (<c>Forwarded</c>, <c>X-Forwarded-*</c>,
+/// <c>X-Real-IP</c>) are NOT looked at: behind a reverse proxy on the same host every caller is local, and local means
+/// admin here, so configure keys there. The local caller of a keyless server is admin for figures, dry runs and its own
 /// namespace, never for store-wide or cross-namespace deletes (<see cref="ChunkCaller.IsAdminKey"/>).
 /// </para>
 /// <para>
@@ -213,23 +213,6 @@ internal static class ChunkCacheAuth
         return null;
     }
 
-    /// <summary>
-    /// Whether a request carries a forwarding header (<c>Forwarded</c>, any <c>X-Forwarded-*</c>, <c>X-Real-IP</c>): it came
-    /// through a proxy, so it is never local, whatever its connection's address (Task 16 review S2 ruling).
-    /// </summary>
-    internal static bool IsForwarded(IHeaderDictionary headers)
-    {
-        foreach (var header in headers)
-        {
-            string name = header.Key;
-            if (name.Equals("Forwarded", StringComparison.OrdinalIgnoreCase)
-                || name.Equals("X-Real-IP", StringComparison.OrdinalIgnoreCase)
-                || name.StartsWith("X-Forwarded-", StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        return false;
-    }
-
     /// <summary>Whether a request comes from this machine and not through a browser (see the class remarks).</summary>
     internal static bool IsLocal(HttpContext context)
     {
@@ -242,8 +225,6 @@ internal static class ChunkCacheAuth
             return false;
         if (context.Request.Headers.ContainsKey(HeaderNames.Origin))
             return false;
-        if (IsForwarded(context.Request.Headers))
-            return false; // a same-host reverse proxy: the real caller is elsewhere
         string host = context.Request.Host.Host;
         if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase))
             return true;

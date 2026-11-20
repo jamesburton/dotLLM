@@ -333,6 +333,14 @@ public sealed class ChunkCachePipelineTests : IClassFixture<ChunkCachePipelineTe
         Assert.Null(ChunkCacheRuntime.UnsupportedReason(
             new ServerState { Options = new ServerOptions { Model = "m" }, Model = _fx.Model, Config = _fx.Config, CurrentGguf = _fx.Gguf }));
 
+        // An overlay or adapter changes the weights but not the model id: no keys at all (control: the same state without them is supported, above).
+        Assert.StartsWith("tensor overlay or adapter attached", ChunkCacheRuntime.UnsupportedReason(
+            new ServerState { Options = new ServerOptions { Model = "m", TensorOverlayPath = "x.overlay" }, Model = _fx.Model, Config = _fx.Config, CurrentGguf = _fx.Gguf }), StringComparison.Ordinal);
+        Assert.StartsWith("tensor overlay or adapter attached", ChunkCacheRuntime.UnsupportedReason(
+            new ServerState { Options = new ServerOptions { Model = "m", TernaryAdapterPaths = ["a.gguf"] }, Model = _fx.Model, Config = _fx.Config, CurrentGguf = _fx.Gguf }), StringComparison.Ordinal);
+        Assert.Null(ChunkCacheRuntime.UnsupportedReason(
+            new ServerState { Options = new ServerOptions { Model = "m", TernaryAdapterPaths = [] }, Model = _fx.Model, Config = _fx.Config, CurrentGguf = _fx.Gguf }));
+
         var unsupported = ServerModelIdentity.Unsupported("recurrent or hybrid model");
         foreach (string policy in new[] { "exact", "shadow" })
         {
