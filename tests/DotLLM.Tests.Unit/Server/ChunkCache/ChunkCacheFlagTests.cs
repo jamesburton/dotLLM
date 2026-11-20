@@ -21,7 +21,7 @@ public sealed class ContractFixtureTests
     /// SHA-256 of <c>fixtures.sha256</c> itself, so a fixture edited together with its list entry still fails here.
     /// Changing it means the contract changed: re-copy the whole set from the contract folder.
     /// </summary>
-    private const string ListSha256 = "b93229171a5179e488a96d2d2605b5a5cce641e24ee7816a1adf22a50b61511c";
+    private const string ListSha256 = "4e2991048177f22b849fb9dfffc8e2b34415b74d5aa2885b3b964b274b44e3ee";
 
     [Fact]
     public void FixtureList_IsTheContractList() =>

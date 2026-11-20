@@ -98,7 +98,7 @@ writes nothing. The result reports `wire_ineligible_chunks` (off the allow-list,
 | `--solution` | `FILE` | none | Scan a .sln, .slnx or .csproj with Roslyn (authored C# files only). Give --solution or --directory, not both. One of the two is required. |
 | `--directory` | `DIR` | none | Scan the C# files under this directory tree (secrets and build output are skipped). Give --solution or --directory, not both. |
 | `--configuration` | `NAME` | Release | MSBuild configuration to evaluate --solution with. Only with --solution (an error with --directory). |
-| `--chunker` | `symbol\|fixed` | symbol | How files are cut into chunks: symbol (one chunk per member) or fixed (token windows). Only symbol with 512 tokens is wire-eligible; anything else needs --lab. |
+| `--chunker` | `symbol\|fixed\|lines` | symbol | How files are cut into chunks: symbol (one chunk per member), lines (whole lines up to the limit) or fixed (token windows). Only symbol and lines with 512 tokens are wire-eligible; anything else needs --lab. |
 | `--chunk-tokens` | `N` | 512 | Maximum tokens per chunk. Part of the chunker name (symbol-512) and of the index file name. Values: integer 1..1048576 (tokens). |
 | `--path` | `GLOB` | none | Encode only the chunks of files matching this glob (a leading '!' negates). Combine with --symbol and --since: the selection is their union. Repeatable: one value per flag, values may not contain commas. |
 | `--exclude` | `GLOB` | none | Drop files matching this glob from the selection everywhere. Repeatable: one value per flag, values may not contain commas. |
@@ -114,7 +114,7 @@ writes nothing. The result reports `wire_ineligible_chunks` (off the allow-list,
 | `--encode` |  | on with --server or --offline | Encode the missing chunks. This is what --server and --offline already do; accepted for clarity. Contradicts --index-only. |
 | `--max-chunks` | `N` | no limit | Encode or queue at most this many missing chunks, in path order. Counts chunks (--max-encode-tokens counts tokens). Values: integer >= 0 (chunks). |
 | `--max-encode-tokens` | `N` | no limit | Encode or queue at most this many tokens of missing chunks. Counts tokens (--max-chunks counts chunks). Values: integer >= 0 (tokens). |
-| `--lab` |  | off | Allow a chunker that is not wire-eligible (only symbol-512 is), for a research build of a store that never leaves this machine. Every chunk then counts as wire-ineligible. |
+| `--lab` |  | off | Allow a chunker that is not wire-eligible (only symbol-512 and lines-512 are), for a research build of a store that never leaves this machine. Every chunk then counts as wire-ineligible. |
 | `--dry-run` |  | off | List what would be encoded and the estimated store size; write nothing (no index, registry or entry). |
 | `--strict` |  | off | Exit 3, before anything is written, if a project was skipped, a load failure was not attributed to a project, or a file is on another volume than the tree root. |
 | `--reroot` |  | off | Accept a different tree root than the index recorded and re-path every file (otherwise a changed root is refused). |
@@ -163,7 +163,7 @@ Chooses chunks for a context (the union of `--path`, `--symbol --hops`, `--since
 | `--solution` | `FILE` | none | Scan a .sln, .slnx or .csproj with Roslyn (authored C# files only). Give --solution or --directory, not both. Required unless --store names the source. |
 | `--directory` | `DIR` | none | Scan the C# files under this directory tree (secrets and build output are skipped). Give --solution or --directory, not both. |
 | `--configuration` | `NAME` | Release | MSBuild configuration to evaluate --solution with. Only with --solution (an error with --directory). |
-| `--chunker` | `symbol\|fixed` | symbol | How files are cut into chunks: symbol (one chunk per member) or fixed (token windows). The chunker must match the index you compare with. |
+| `--chunker` | `symbol\|fixed\|lines` | symbol | How files are cut into chunks: symbol (one chunk per member), lines (whole lines up to the limit) or fixed (token windows). The chunker must match the index you compare with. |
 | `--chunk-tokens` | `N` | 512 | Maximum tokens per chunk. Part of the chunker name (symbol-512) and of the index file name. Values: integer 1..1048576 (tokens). |
 | `--path` | `GLOB` | none | Select the chunks of files matching this glob (a leading '!' negates). Combine with --symbol and --since: the selection is their union. Repeatable: one value per flag, values may not contain commas. |
 | `--exclude` | `GLOB` | none | Drop files matching this glob from the selection everywhere. Repeatable: one value per flag, values may not contain commas. |
@@ -211,7 +211,7 @@ server's own entries, bytes and `budget_bytes`. Read-only: no lock, nothing writ
 | `--solution` | `FILE` | none | Scan a .sln, .slnx or .csproj with Roslyn (authored C# files only). Give --solution or --directory, not both. Default: the source the index recorded. |
 | `--directory` | `DIR` | none | Scan the C# files under this directory tree (secrets and build output are skipped). Give --solution or --directory, not both. |
 | `--configuration` | `NAME` | Release | MSBuild configuration to evaluate --solution with. Only with --solution (an error with --directory). |
-| `--chunker` | `symbol\|fixed` | symbol | How files are cut into chunks: symbol (one chunk per member) or fixed (token windows). Names which index of the store to read (symbol-512 by default). |
+| `--chunker` | `symbol\|fixed\|lines` | symbol | How files are cut into chunks: symbol (one chunk per member), lines (whole lines up to the limit) or fixed (token windows). Names which index of the store to read (symbol-512 by default). |
 | `--chunk-tokens` | `N` | 512 | Maximum tokens per chunk. Part of the chunker name (symbol-512) and of the index file name. Values: integer 1..1048576 (tokens). |
 | `--no-scan` |  | off | Check the store against the index only; edits made since the last build are not seen. Takes no source. |
 | `--strict` |  | off | Exit 3 when the store is not up to date for the tree (for CI), or when the server ledger is unreadable. |
@@ -366,7 +366,7 @@ Queues chunk TEXT on the server (`POST /v1/chunk-cache/prewarm`); the server dec
 | `--solution` | `FILE` | none | Scan a .sln, .slnx or .csproj with Roslyn (authored C# files only). Give --solution or --directory, not both. Required with a selection. |
 | `--directory` | `DIR` | none | Scan the C# files under this directory tree (secrets and build output are skipped). Give --solution or --directory, not both. |
 | `--configuration` | `NAME` | Release | MSBuild configuration to evaluate --solution with. Only with --solution (an error with --directory). |
-| `--chunker` | `symbol\|fixed` | symbol | How files are cut into chunks: symbol (one chunk per member) or fixed (token windows). The server accepts symbol-512 only. |
+| `--chunker` | `symbol\|fixed\|lines` | symbol | How files are cut into chunks: symbol (one chunk per member), lines (whole lines up to the limit) or fixed (token windows). The server accepts symbol-512 and lines-512. |
 | `--chunk-tokens` | `N` | 512 | Maximum tokens per chunk. Part of the chunker name (symbol-512) and of the index file name. Values: integer 1..1048576 (tokens). |
 | `--path` | `GLOB` | none | Queue only the chunks of files matching this glob (a leading '!' negates). Combine with --symbol and --since: the selection is their union. Repeatable: one value per flag, values may not contain commas. |
 | `--exclude` | `GLOB` | none | Drop files matching this glob from the selection everywhere. Repeatable: one value per flag, values may not contain commas. |

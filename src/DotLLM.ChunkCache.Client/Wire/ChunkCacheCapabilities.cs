@@ -18,7 +18,7 @@ public sealed record ChunkCacheCapabilities
     /// <summary>Selectors that run on the active backend (<c>query_relevance</c> appears once a probe exists).</summary>
     public IReadOnlyList<string>? Selectors { get; init; }
 
-    /// <summary>Text-first chunkers the wire accepts (<c>symbol-512</c>; <c>lines-512</c> after E4c).</summary>
+    /// <summary>Text-first chunkers the wire accepts (<c>symbol-512</c> and <c>lines-512</c>).</summary>
     public IReadOnlyList<string>? WireChunkers { get; init; }
 
     /// <summary>The <c>auto</c> policy's validated combinations; empty today. Element shape not yet fixed by the spec.</summary>

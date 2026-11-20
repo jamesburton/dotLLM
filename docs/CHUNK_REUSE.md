@@ -70,7 +70,7 @@ the engine's K/V output. Two layers capture that:
 - **`FixedSizeChunker`** (`fixed-N`): token-id slices of the whole file's ids. Cheap, but a slice is not text-reproducible
   (BPE merges across a boundary, a slice ending inside a multi-byte character).
 - **`WireChunking`**: which chunker names may be used for chunks that travel as text (`Eligible`, `IsWireChunker`;
-  `lines-512` waits in `PendingE4c` for its eligibility gate), the wire hash (`sha256:` + lowercase hex of the UTF-8 text) and `VerifyRoundTrip`, which re-encodes
+  `symbol-512` and `lines-512` are eligible since Phase I Task 19; both cut only at token-stable edges, `ChunkBoundary`), the wire hash (`sha256:` + lowercase hex of the UTF-8 text) and `VerifyRoundTrip`, which re-encodes
   each chunk's text and reports the chunks whose ids differ.
 
 ## On-disk store

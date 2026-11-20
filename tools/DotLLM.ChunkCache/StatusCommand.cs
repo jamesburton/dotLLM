@@ -76,7 +76,7 @@ internal static class StatusCommand
             if (record is not null && !ChunkIndex.PathComparer.Equals(Path.TrimEndingDirectorySeparator(record.Root), Path.TrimEndingDirectorySeparator(tree.Root)))
                 ctx.Info($"warning: the index paths are relative to {record.Root}; the scanned tree's root is {tree.Root}");
         }
-        StatusReport report = index.Status(layout.Existing, tree?.Files);
+        StatusReport report = index.Status(layout.Existing, tree?.Files, chunker.AlgorithmVersion);
         LedgerJson ledger = ReadLedger(storeRoot);
         StoreStats stats = layout.Stats;
         var missing = report.Files.SelectMany(f => f.Missing).Select(r => new MissingJson(r.FilePath, r.StartLine, r.EndLine, r.TokenCount ?? 0)).ToList();

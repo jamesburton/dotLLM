@@ -51,7 +51,7 @@ public sealed class ChunkCacheHttpClientTests : IDisposable
         Assert.True(caps.SupportsVersion(1));
         Assert.Equal(["exact", "shadow", "balanced", "fast", "auto"], caps.Policies!);
         Assert.Equal(["chunk_starts"], caps.Selectors!);
-        Assert.Equal(["symbol-512"], caps.WireChunkers!);
+        Assert.Equal(["lines-512", "symbol-512"], caps.WireChunkers!);
         Assert.Empty(caps.AutoValidated!);
         Assert.Equal("qwen3-4b", caps.Model!.Id);
         Assert.True(caps.Model.Supported);

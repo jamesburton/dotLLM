@@ -39,7 +39,7 @@ internal sealed class McpToolDef(string name, string description, JsonObject inp
 /// </summary>
 internal static class McpTools
 {
-    private const string ChunkerProp = """{"enum": ["symbol-512"], "default": "symbol-512", "description": "the wire-eligible chunkers this build accepts"}""";
+    private const string ChunkerProp = """{"enum": ["symbol-512", "lines-512"], "default": "symbol-512", "description": "the wire-eligible chunkers this build accepts"}""";
 
     private static readonly Lazy<IReadOnlyList<McpToolDef>> AllTools = new(Build);
 
