@@ -925,6 +925,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_AMAX_PROBE` | True when DOTLLM_AMAX_PROBE names an output file. | `ActivationRangeProbe.cs` |
 | `DOTLLM_CPU_ATTN_BLOCKED` | Environment variable: 0 disables ExecuteBlockedCausal (the head-parallel per-row path runs instead; A/B). | `Attention.cs` |
 | `DOTLLM_CPU_ATTN_PACK` | Environment variable: 0 makes BlockedCausalItem read K/V slices in place instead of from a dense packed tile (#1927 A/B; the output is bit-identical either way). | `Attention.cs` |
+| `DOTLLM_CPU_ATTN_SPLITKV` | Environment variable selecting the split-KV decode kernel's partial-output storage: f16 (default), f32 (control arm) or 0 (off: the per-head TiledRow path). | `Attention.cs` |
 | `DOTLLM_CPU_BF16_512` | BF16 weight GEMV/GEMM by shift-widening (#1118). BF16 is the top half of an F32, so bf16 &lt;&lt; 16 is the exact F32 value: every tier widens 4/8/16 weights in registers (vpmovzxwd + vpslld) and multiplies into F32 accumulator... | `MatMul.Bf16.cs` |
 | `DOTLLM_CPU_BF16_KERNEL` | BF16 weight GEMV/GEMM by shift-widening (#1118). BF16 is the top half of an F32, so bf16 &lt;&lt; 16 is the exact F32 value: every tier widens 4/8/16 weights in registers (vpmovzxwd + vpslld) and multiplies into F32 accumulator... | `MatMul.Bf16.cs` |
 | `DOTLLM_CPU_BF16_SCRATCH` | A/B switch between the two bit-identical AVX2/FMA GEMM forms: the register tile (default) and the F16-style four-row F32 scratch (DOTLLM_CPU_BF16_SCRATCH=1). Settable for in-process A/B. | `MatMul.Bf16.cs` |

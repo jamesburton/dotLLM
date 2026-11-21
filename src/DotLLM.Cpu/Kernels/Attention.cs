@@ -1,5 +1,6 @@
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
@@ -439,6 +440,12 @@ public static class Attention
             return;
         }
 
+        if (DecodeSplitKvApplies(seqQ, seqKv, numHeads, numKvHeads, positionOffset, alibiSlopes, slidingWindowSize, softCap, maskMode, sinks))
+        {
+            ExecuteDecodeSplitKv(q, k, v, output, Math.Min(seqKv, positionOffset + 1), numHeads, numKvHeads, headDim, scale, pool);
+            return;
+        }
+
         fixed (float* sinksPtr = sinks)
         {
             var ctx = new AttentionCtx
@@ -763,6 +770,237 @@ public static class Attention
             }
         }
     }
+
+    // ──────────────────── Split-KV decode attention (#1927 E2c) ────────────────────
+
+    /// <summary>
+    /// Environment variable selecting the split-KV decode kernel's partial-output storage: <c>f16</c> (default), <c>f32</c> (control
+    /// arm) or <c>0</c> (off: the per-head <see cref="TiledRow"/> path).
+    /// </summary>
+    public const string DecodeSplitKvEnvVar = "DOTLLM_CPU_ATTN_SPLITKV";
+
+    /// <summary>
+    /// Split-KV decode mode (tests, in-process A/B, quality gates); initialised from <see cref="DecodeSplitKvEnvVar"/>.
+    /// </summary>
+    public static DecodeSplitKvPartials DecodeSplitKv { get; set; } =
+        Environment.GetEnvironmentVariable(DecodeSplitKvEnvVar)?.Trim().ToLowerInvariant() switch
+        {
+            "0" or "off" => DecodeSplitKvPartials.Off,
+            "f32" => DecodeSplitKvPartials.F32,
+            _ => DecodeSplitKvPartials.F16,
+        };
+
+    /// <summary>Keys per split-KV range. Fixed (not <c>seqKv / threads</c>), so the result does not depend on the thread count.</summary>
+    internal const int SplitKvRangeKeys = 256;
+
+    /// <summary>Number of times <see cref="ExecuteDecodeSplitKv"/> ran (test and profiling hook).</summary>
+    public static long DecodeSplitKvCount;
+
+    /// <summary>
+    /// Whether the split-KV kernel serves a call: one query row (decode), plain causal GQA attention (no ALiBi, soft-cap, sinks,
+    /// mask variant or sliding window), and a visible range past the one-shot bound (shorter rows keep the exact one-shot form).
+    /// </summary>
+    internal static unsafe bool DecodeSplitKvApplies(int seqQ, int seqKv, int numHeads, int numKvHeads, int positionOffset, float* alibiSlopes,
+                                                     int? slidingWindowSize, float softCap, AttentionMaskMode maskMode, float[]? sinks)
+        => DecodeSplitKv != DecodeSplitKvPartials.Off && seqQ == 1 && alibiSlopes is null && (slidingWindowSize ?? 0) <= 0
+           && softCap == 0f && maskMode == AttentionMaskMode.Causal && sinks is null && numHeads <= 256
+           && Math.Min(seqKv, positionOffset + 1) > OneShotMaxKeys;
+
+    private unsafe struct SplitKvCtx
+    {
+        public float* Q, K, V, Output, PartM, PartS, PartF32;
+        public Half* PartF16;
+        public int NumHeads, HeadDim, GroupSize, KvStride, Visible, Ranges;
+        public float Scale;
+        public int Next;
+    }
+
+    /// <summary>
+    /// Decode attention split over the KEY range (llama.cpp's shape, issue #1927 E2c). Pass 1: fixed 256-key ranges are claimed
+    /// dynamically; each walks its keys in order and reads every K and V row once for ALL query heads (whole 4 KiB rows: a sequential
+    /// stream, and one read per GQA group instead of one per query head), keeping the range's running max and exp-sum in F32 and its
+    /// normalised output in a per-worker F32 accumulator, then stores the output as F16 (or F32, the control arm) with the max and sum
+    /// as F32 scalars. Pass 2 combines the ranges of each head in range order: <c>out = Σ s_r e^(m_r - M) o_r / Σ s_r e^(m_r - M)</c>.
+    /// <para>
+    /// Not bit-identical to <see cref="TiledRow"/> (the per-head online recurrence is replaced by a combine, and the partials are
+    /// rounded to F16): a token's attention output differs between decode and prefill (#530). Gated on teacher-forced KL/PPL at depth
+    /// (James 2026-11-21: F16 partials, F32 running max/sum, F32-partials control arm). The result is thread-count independent: the
+    /// ranges and the combine order are fixed. Partials cost <c>ceil(visible / 256) x numHeads x (2 x headDim + 8)</c> bytes
+    /// (245 KiB at 7.6K keys, 32 heads, hd128, F16), held by the calling thread and grown on demand.
+    /// </para>
+    /// </summary>
+    [SkipLocalsInit]
+    internal static unsafe void ExecuteDecodeSplitKv(float* q, float* k, float* v, float* output, int visible,
+                                                    int numHeads, int numKvHeads, int headDim, float scale, ComputeThreadPool pool)
+    {
+        int ranges = (visible + SplitKvRangeKeys - 1) / SplitKvRangeKeys;
+        bool f16 = DecodeSplitKv != DecodeSplitKvPartials.F32;
+        SplitKvPartialBuffers parts = t_splitKvParts ??= new SplitKvPartialBuffers();
+        parts.Ensure(ranges * numHeads, headDim);
+        var ctx = new SplitKvCtx
+        {
+            Q = q, K = k, V = v, Output = output, PartM = parts.M, PartS = parts.S,
+            PartF32 = f16 ? null : parts.O32, PartF16 = f16 ? parts.O16 : null,
+            NumHeads = numHeads, HeadDim = headDim, GroupSize = numHeads / numKvHeads, KvStride = numKvHeads * headDim,
+            Visible = visible, Ranges = ranges, Scale = scale, Next = 0,
+        };
+        Interlocked.Increment(ref DecodeSplitKvCount);
+        pool.Dispatch((nint)(&ctx), &SplitKvRangeWorker);
+        ctx.Next = 0;
+        pool.Dispatch((nint)(&ctx), &SplitKvCombineWorker);
+    }
+
+    [SkipLocalsInit]
+    private static unsafe void SplitKvRangeWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<SplitKvCtx>((void*)ctxPtr);
+        int H = ctx.NumHeads, hd = ctx.HeadDim, G = ctx.GroupSize, R = SplitKvRangeKeys;
+        KvTileBuffers tiles = t_kvTiles ??= new KvTileBuffers();
+        tiles.Ensure(Math.Max(H * R, H * hd));
+        float* sc = tiles.K;    // scores [H][R]
+        float* acc = tiles.V;   // F32 output accumulators [H][hd]
+
+        while (true)
+        {
+            int r = Interlocked.Increment(ref ctx.Next) - 1;
+            if (r >= ctx.Ranges) break;
+            int k0 = r * R, len = Math.Min(R, ctx.Visible - k0);
+
+            // Scores, key-major: each K row is read once, front to back, for every query head.
+            for (int j = 0; j < len; j++)
+            {
+                float* kRow = ctx.K + (long)(k0 + j) * ctx.KvStride;
+                for (int h = 0; h < H; h++)
+                    sc[h * R + j] = TensorPrimitives.Dot(new ReadOnlySpan<float>(ctx.Q + (long)h * hd, hd),
+                                                         new ReadOnlySpan<float>(kRow + (long)(h / G) * hd, hd)) * ctx.Scale;
+            }
+
+            int pBase = r * H;
+            for (int h = 0; h < H; h++)
+            {
+                var s = new Span<float>(sc + h * R, len);
+                float m = TensorPrimitives.Max((ReadOnlySpan<float>)s);
+                ctx.PartM[pBase + h] = m;
+                ctx.PartS[pBase + h] = FastMath.ExpSumAndStore(s, s, -m);   // >= 1: the max key contributes e^0
+            }
+
+            new Span<float>(acc, H * hd).Clear();
+            for (int j = 0; j < len; j++)
+            {
+                float* vRow = ctx.V + (long)(k0 + j) * ctx.KvStride;
+                for (int h = 0; h < H; h++)
+                {
+                    float w = sc[h * R + j];
+                    if (w == 0f) continue;
+                    var o = new Span<float>(acc + (long)h * hd, hd);
+                    TensorPrimitives.MultiplyAdd(new ReadOnlySpan<float>(vRow + (long)(h / G) * hd, hd), w, o, o);
+                }
+            }
+
+            // Store each head's range output normalised by its own sum (|o| <= max |V|, F16-safe), as F16 or F32.
+            for (int h = 0; h < H; h++)
+            {
+                var o = new Span<float>(acc + (long)h * hd, hd);
+                float inv = 1f / ctx.PartS[pBase + h];
+                long off = (long)(pBase + h) * hd;
+                if (ctx.PartF16 != null)
+                {
+                    TensorPrimitives.Multiply(o, inv, o);
+                    TensorPrimitives.ConvertToHalf(o, new Span<Half>(ctx.PartF16 + off, hd));
+                }
+                else
+                {
+                    TensorPrimitives.Multiply(o, inv, new Span<float>(ctx.PartF32 + off, hd));
+                }
+            }
+        }
+    }
+
+    [SkipLocalsInit]
+    private static unsafe void SplitKvCombineWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<SplitKvCtx>((void*)ctxPtr);
+        int H = ctx.NumHeads, hd = ctx.HeadDim;
+        float* tmp = stackalloc float[hd];
+        while (true)
+        {
+            int h = Interlocked.Increment(ref ctx.Next) - 1;
+            if (h >= H) break;
+            float M = float.NegativeInfinity;
+            for (int r = 0; r < ctx.Ranges; r++) M = MathF.Max(M, ctx.PartM[r * H + h]);
+            var o = new Span<float>(ctx.Output + (long)h * hd, hd);
+            o.Clear();
+            float den = 0f;
+            for (int r = 0; r < ctx.Ranges; r++)
+            {
+                int p = r * H + h;
+                float w = ctx.PartS[p] * MathF.Exp(ctx.PartM[p] - M);
+                den += w;
+                ReadOnlySpan<float> part;
+                if (ctx.PartF16 != null)
+                {
+                    TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(ctx.PartF16 + (long)p * hd, hd), new Span<float>(tmp, hd));
+                    part = new ReadOnlySpan<float>(tmp, hd);
+                }
+                else
+                {
+                    part = new ReadOnlySpan<float>(ctx.PartF32 + (long)p * hd, hd);
+                }
+                TensorPrimitives.MultiplyAdd(part, w, o, o);
+            }
+            TensorPrimitives.Multiply(o, 1f / den, o);
+        }
+    }
+
+    /// <summary>
+    /// Split-KV partials of the calling (dispatching) thread: per (range, head) max and sum (F32) and the normalised output (F16, or
+    /// F32 for the control arm). Grown on demand, never shrunk; freed by the finalizer at thread exit or by
+    /// <see cref="TrimTurboQuantTileBuffers(ComputeThreadPool?)"/>.
+    /// </summary>
+    private sealed unsafe class SplitKvPartialBuffers
+    {
+        public float* M, S, O32;
+        public Half* O16;
+        private long _slots, _o16, _o32;
+
+        public void Ensure(int slots, int headDim)
+        {
+            bool f32 = DecodeSplitKv == DecodeSplitKvPartials.F32;
+            if (_slots < slots)
+            {
+                if (M != null) { NativeMemory.AlignedFree(M); NativeMemory.AlignedFree(S); }
+                M = (float*)NativeMemory.AlignedAlloc((nuint)slots * sizeof(float), 64);
+                S = (float*)NativeMemory.AlignedAlloc((nuint)slots * sizeof(float), 64);
+                _slots = slots;
+            }
+            long need = (long)slots * headDim;
+            if (!f32 && _o16 < need)
+            {
+                if (O16 != null) NativeMemory.AlignedFree(O16);
+                O16 = (Half*)NativeMemory.AlignedAlloc((nuint)need * 2, 64);
+                _o16 = need;
+            }
+            if (f32 && _o32 < need)
+            {
+                if (O32 != null) NativeMemory.AlignedFree(O32);
+                O32 = (float*)NativeMemory.AlignedAlloc((nuint)need * sizeof(float), 64);
+                _o32 = need;
+            }
+        }
+
+        public void Free()
+        {
+            if (M != null) NativeMemory.AlignedFree(M);
+            if (S != null) NativeMemory.AlignedFree(S);
+            if (O16 != null) NativeMemory.AlignedFree(O16);
+            if (O32 != null) NativeMemory.AlignedFree(O32);
+            M = S = O32 = null; O16 = null; _slots = _o16 = _o32 = 0;
+        }
+
+        ~SplitKvPartialBuffers() => Free();
+    }
+
+    [ThreadStatic] private static SplitKvPartialBuffers? t_splitKvParts;
 
     // ──────────────────── Bidirectional encoder attention (#1402) ────────────────────
 
@@ -2051,7 +2289,7 @@ public static class Attention
         pool.Dispatch(0, &TrimTileBuffersWorker);
     }
 
-    private static void TrimTileBuffersWorker(nint _, int __, int ___) => t_kvTiles?.Free();
+    private static void TrimTileBuffersWorker(nint _, int __, int ___) { t_kvTiles?.Free(); t_splitKvParts?.Free(); }
 
     /// <summary>
     /// Flash-style multi-row path for an in-place TurboQuant cache: key tiles outer, query rows inner. Each K/V tile is decoded ONCE
@@ -2192,4 +2430,15 @@ public static class Attention
             }
         }
     }
+}
+
+/// <summary>Partial-output storage of the CPU split-KV decode attention kernel (#1927 E2c).</summary>
+public enum DecodeSplitKvPartials
+{
+    /// <summary>Kernel off: decode runs the per-head tiled online-softmax path.</summary>
+    Off = 0,
+    /// <summary>Range outputs stored as F16 (default); running max and sum stay F32.</summary>
+    F16 = 1,
+    /// <summary>Range outputs stored as F32 (control arm for the F16 quality gate).</summary>
+    F32 = 2,
 }
