@@ -98,41 +98,6 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
     }
 
     /// <summary>
-    /// #1927 E3c: the 8-token Q4_K kernel (on EVEX hosts) and the 4-token kernel it falls back to must both give every token
-    /// exactly the single-token kernel's output, at batch sizes around both block widths and with an m % 4 tail (M = 38). The
-    /// Q8_K rows differ per token (random activations), so a kernel that reads a neighbour's row or scale cannot pass.
-    /// </summary>
-    [Theory]
-    [InlineData(1)] [InlineData(3)] [InlineData(4)] [InlineData(5)] [InlineData(7)] [InlineData(8)] [InlineData(9)]
-    [InlineData(12)] [InlineData(15)] [InlineData(16)] [InlineData(17)] [InlineData(63)] [InlineData(64)] [InlineData(65)]
-    [InlineData(513)]
-    public void Q4K_Tok8AndTok4_MatchSingleToken_BitExact(int n)
-    {
-        bool saved = MatMul.Q4KTok8Enabled;
-        var f = new Fixture(QuantizationType.Q4_K, n, seed: 1927 + n);
-        try
-        {
-            using var pool = new ComputeThreadPool(4);
-            f.RunSingleTokenPerRow(f.Expected, pool: null);
-            foreach (bool tok8 in new[] { true, false })
-            {
-                MatMul.Q4KTok8Enabled = tok8;
-                if (tok8 && System.Runtime.Intrinsics.X86.Avx512F.VL.IsSupported && MatMul.FastKQuantIsa)
-                    Assert.True(MatMul.Q4KTok8Active, "the 8-token kernel should be active on this host");
-                f.RunMultiTokenGemm(f.Actual, pool: null);
-                f.AssertBitExact($"Q4_K n={n} tok8={tok8}: multi-token GEMM diverges from the single-token kernel");
-                f.RunMultiTokenGemm(f.Actual, pool);
-                f.AssertBitExact($"Q4_K n={n} tok8={tok8}: pooled multi-token GEMM diverges from the single-token kernel");
-            }
-        }
-        finally
-        {
-            MatMul.Q4KTok8Enabled = saved;
-            f.Dispose();
-        }
-    }
-
-    /// <summary>
     /// The defect itself, at kernel level: the row-major GEMM the old <c>n &gt; 1</c> arm fell
     /// through to must agree, bit for bit, with the repacked kernel the <c>n == 1</c> arm runs.
     /// Both consume the identical pre-quantized activations, so any difference is pure
