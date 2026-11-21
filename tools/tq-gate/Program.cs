@@ -303,10 +303,12 @@ void Parity(int bits)
     using (var c = factory(config, 64 + gen + 8)) gIn = Greedy(c, all, gen);
     // Compared rows: the last prompt row (prefill) and every decode row.
     var rowsIdx = Enumerable.Range(63, steps + 1).ToArray();
-    double minCos = 1, maxMeanAbs = 0, sumEff = 0, sumVs = 0; int agree = 0, worst = -1; var coses = new List<double>();
+    double minCos = 1, maxMeanAbs = 0, sumEff = 0, sumVs = 0, maxAbsElem = 0, prefillRowMeanAbs = 0, decodeSumVs = 0; int agree = 0, worst = -1; var coses = new List<double>();
     foreach (int r in rowsIdx)
     {
         var (vsM, cos, same) = Cmp(inp[r], oracle[r]);
+        maxAbsElem = Math.Max(maxAbsElem, MaxAbs(inp[r], oracle[r]));
+        if (r == 63) prefillRowMeanAbs = vsM; else decodeSumVs += vsM;
         var (effM, _, _) = Cmp(oracle[r], plain[r]);
         coses.Add(cos); sumVs += vsM; sumEff += effM; if (cos < minCos) { minCos = cos; worst = r; } if (vsM > maxMeanAbs) maxMeanAbs = vsM; if (same) agree++;
     }
@@ -315,12 +317,12 @@ void Parity(int bits)
     Append(new { kind = "parity", backend, model = tag, layers = config.NumLayers, bits, steps, rows = rowsIdx.Length,
         oraclePath, oracleCached, oracleSeconds, inPath, oracleAttnDelta = oracleAttn, inPlaceAttnDelta = cs1.attn - cs0.attn, inPlaceCachesBuilt = cs1.inplaceCaches,
         meanAbsInVsOracle = sumVs / rowsIdx.Length, meanAbsCodecEffect = sumEff / rowsIdx.Length, ratio, minCosInVsOracle = minCos, worstRow = worst, p5Cos = coses.OrderBy(x => x).ElementAt(coses.Count / 20),
-        maxRowMeanAbs = maxMeanAbs, argmaxAgree = (double)agree / rowsIdx.Length,
+        maxRowMeanAbs = maxMeanAbs, maxAbsElementInVsOracle = maxAbsElem, prefillRowMeanAbs, decodeRowsMeanAbs = decodeSumVs / Math.Max(1, rowsIdx.Length - 1), argmaxAgree = (double)agree / rowsIdx.Length,
         greedyLen = gen, firstDivergence = firstDiv,
         top2GapOracleAtDiv = firstDiv >= 0 ? gOracle.gap[firstDiv] : (double?)null, top2GapInPlaceAtDiv = firstDiv >= 0 ? gIn.gap[firstDiv] : (double?)null,
         greedyInVsPlainFirstDiv = FirstDiff(gIn.ids, gPlain.ids), greedyOracleVsPlainFirstDiv = FirstDiff(gOracle.ids, gPlain.ids) });
     Log($"PARITY {backend} layers={config.NumLayers} tq{bits}: ratio {ratio:F4} (mean|d| {sumVs / rowsIdx.Length:E3} vs codec effect {sumEff / rowsIdx.Length:E3}) minCos {minCos:F6} argmax {(double)agree / rowsIdx.Length:P1}; " +
-        $"greedy first divergence {(firstDiv < 0 ? "none" : firstDiv.ToString())} paths {oraclePath}/{inPath} attnDelta oracle {oracleAttn} inplace {cs1.attn - cs0.attn}");
+        $"maxAbsElem {maxAbsElem:E3} prefillRow {prefillRowMeanAbs:E3} decodeRows {decodeSumVs / Math.Max(1, rowsIdx.Length - 1):E3}; greedy first divergence {(firstDiv < 0 ? "none" : firstDiv.ToString())} paths {oraclePath}/{inPath} attnDelta oracle {oracleAttn} inplace {cs1.attn - cs0.attn}");
 }
 
 // Control for the CPU "codec effect" anomaly (#1892): the same teacher-forced rows as Parity, plain F32 cache vs QuantizedKvCache Q8_0 K and V
@@ -347,6 +349,13 @@ void Q8Control()
 }
 
 static int FirstDiff(int[] x, int[] y) { for (int i = 0; i < Math.Min(x.Length, y.Length); i++) if (x[i] != y[i]) return i; return -1; }
+
+static double MaxAbs(float[] x, float[] y)
+{
+    double m = 0;
+    for (int i = 0; i < x.Length; i++) m = Math.Max(m, Math.Abs((double)x[i] - y[i]));
+    return m;
+}
 
 static (double MeanAbs, double Cos, bool Same) Cmp(float[] x, float[] y)
 {
