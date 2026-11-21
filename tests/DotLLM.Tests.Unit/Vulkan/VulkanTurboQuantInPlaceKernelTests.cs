@@ -677,7 +677,8 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
     public void TqTwins_BindOperandsAt12To14_AndAddNoSharedMemory()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
-        string[] twins = Directory.GetFiles(spvDir, "*_kvtq*.spv");
+        // The retained #1926 pre-change controls (*_pre1926) are A/B and bit-identity arms, never dispatched by a model.
+        string[] twins = Directory.GetFiles(spvDir, "*_kvtq*.spv").Where(p => !p.EndsWith("_pre1926.spv", StringComparison.Ordinal)).ToArray();
         // One twin per body the dense chain and Flint can dispatch (VulkanTransformerModel.RecordAttentionArm and the per-position arm).
         string[] expected =
         [
@@ -702,6 +703,9 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
             Assert.True(File.Exists(q8), $"{name}: no Q8_0 twin to compare shared memory with");
             long q8Lds = Reflect(q8).WorkgroupBytes;
             _out.WriteLine($"{name}: shared memory {lds} B (Q8_0 twin {q8Lds} B)");
+            // #1926 E3: the v2 split-KV twin alone copies the 2^bits centroid table into shared memory (tqCentSh, 4 << bits bytes:
+            // 64 B at tq4). The array is sized by the TQ_MSE_BITS specialization constant, which this SPIR-V reflection does not count,
+            // so its fixed arrays still equal the Q8_0 twin's; the driver's figure is in Probe1926SplitKvV2ShaderInfoTests.
             Assert.True(lds == q8Lds, $"{name}: shared memory {lds} B differs from its Q8_0 twin's {q8Lds} B");
         }
         Assert.DoesNotContain(twins, p => Path.GetFileName(p).Contains("hd64"));

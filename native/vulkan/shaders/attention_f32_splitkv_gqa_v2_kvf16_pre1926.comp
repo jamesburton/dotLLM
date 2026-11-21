@@ -1,0 +1,7 @@
+#version 450
+// #1926 CONTROL: the v2 body frozen before the E1/E3 loader changes, kept as the bit-identity oracle and the A/B baseline. Do not edit.
+// F16-KV twin of attention_f32_splitkv_gqa_v2.comp (issue #1161): K / V read as packed halves (kv_load.glsl).
+// Body: attention_f32_splitkv_gqa_v2.glsl.
+#define KV_F16 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32_splitkv_gqa_v2_pre1926.glsl"
