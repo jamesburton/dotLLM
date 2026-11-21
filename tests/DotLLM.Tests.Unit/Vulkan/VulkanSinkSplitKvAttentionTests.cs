@@ -31,6 +31,7 @@ public sealed class VulkanSinkSplitKvAttentionTests
         using var device = VulkanDevice.Create();
         using var gpt = VulkanGptOssKernels.Create(device, spvDir);
         using var split = VulkanSplitKvAttentionKernel.Create(device, spvDir);
+        split.PreferPartF16 = false;   // #1926 E4: compared with the single-pass sink kernel at F32 tolerance; F16 partials: SplitKvPartialF16Tests
         split.PreferGqa = gqa;
         Skip.If(gqa && !split.UsesGqa(numHeads, numKvHeads, headDim), "GQA-grouped split pass unavailable");
         Assert.Equal(gqa, split.UsesGqa(numHeads, numKvHeads, headDim));
@@ -78,6 +79,7 @@ public sealed class VulkanSinkSplitKvAttentionTests
         using var device = VulkanDevice.Create();
         using var gpt = VulkanGptOssKernels.Create(device, spvDir);
         using var split = VulkanSplitKvAttentionKernel.Create(device, spvDir);
+        split.PreferPartF16 = false;   // #1926 E4: compared with the single-pass sink kernel at F32 tolerance; F16 partials: SplitKvPartialF16Tests
         const int seqKv = 400, numHeads = 64, numKvHeads = 8, headDim = 64;
         var rng = new Random(77);
         float[] q = Rand(rng, numHeads * headDim, 1f), k = Rand(rng, seqKv * numKvHeads * headDim, 1f), v = Rand(rng, seqKv * numKvHeads * headDim, 1f);

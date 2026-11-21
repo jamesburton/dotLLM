@@ -133,12 +133,14 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
 
     /// <summary>
     /// #1926 E4 (precision rule 1, ruling 2026-11-20: F16 first, F32 the control): the v2 grouped pass stores its O partials as F16,
-    /// normalized by the split's running sum, and the merge multiplies the sum back in. OPT-IN (<c>DOTLLM_VULKAN_SPLITKV_PART=f16</c>)
-    /// until the model-level PPL / KL gate against the F32 control has run (.docs/bench-plan.md B4); unset or <c>f32</c> keeps the
-    /// F32 un-normalized partials, bit-identical to the pre-change path. The per-query-head and v1 grouped passes always store F32.
-    /// A kernel created with a pre-change v2 module (<c>gqa2Suffix</c>) cannot write F16 partials and pins this off.
+    /// normalized by the split's running sum, and the merge multiplies the sum back in. DEFAULT ON after the model gate (Qwen3-4B,
+    /// teacher-forced decode, F16 vs F32 partials: f16 KV KL 2.1e-7 / 4.2e-7 and PPL -0.004% / -0.009% at 7.6K / 32K, top-1 identical;
+    /// q4_0 KV moves only within the decode-time quantizer's digitization noise, which a 1-2 ULP change also produces).
+    /// <c>DOTLLM_VULKAN_SPLITKV_PART=f32</c> is the control: F32 un-normalized partials, bit-identical to the pre-change path. The
+    /// per-query-head and v1 grouped passes always store F32. A kernel created with a pre-change v2 module (<c>gqa2Suffix</c>) cannot
+    /// write F16 partials and pins this off.
     /// </summary>
-    internal bool PreferPartF16 { get; set; } = Environment.GetEnvironmentVariable(PartFormatEnvVar) == "f16";
+    internal bool PreferPartF16 { get; set; } = Environment.GetEnvironmentVariable(PartFormatEnvVar) != "f32";
 
     private readonly bool _gqa2CanWriteF16 = true;
 
@@ -536,17 +538,20 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     /// Workgroup target of the v2 grouped pass (#1926 P3). Measured on Strix (gfx1151, 40 CUs, 32/8/128, kernel microbench, both orders):
     /// the grid wants to be a whole number of waves of 2 workgroups per CU. 80 workgroups (10 splits x 8 KV heads; llama.cpp's
     /// <c>2 * CUs</c>) beat the shared 256 by 16-18% at 8K and 6-12% at 32K on f16 / q4_0 / tq4; 160 and 240 were close to 80, 64, 96, 120
-    /// and 256 were not. So: <c>2 x</c> the device's compute units (AMD CUs / NVIDIA SMs) when the driver reports them, clamped to
+    /// and 256 were not. So, on AMD: <c>2 x</c> the device's compute units when the driver reports them, clamped to
     /// <see cref="TargetWorkgroups"/> (the partial-scratch bound); otherwise <see cref="TargetWorkgroups"/>. An explicit
     /// <c>DOTLLM_VULKAN_SPLIT_TARGET_WG</c> still sets every pass; <c>DOTLLM_VULKAN_SPLITKV_GQA2_TARGET_WG</c> sets this one alone.
     /// </summary>
     internal int Gqa2TargetWorkgroups { get; set; }
 
+    private const uint AmdVendorId = 0x1002;
+
     private static int ResolveGqa2Target(VulkanDevice device)
     {
         if (int.TryParse(Environment.GetEnvironmentVariable(Gqa2TargetWorkgroupsEnvVar), out int v) && v > 0) return Math.Min(v, TargetWorkgroups);
         if (Environment.GetEnvironmentVariable(TargetWorkgroupsEnvVar) is { Length: > 0 }) return TargetWorkgroups;
-        return device.ComputeUnitCount is int cu ? Math.Clamp(2 * cu, 1, TargetWorkgroups) : TargetWorkgroups;
+        // AMD only until the grid is measured on a discrete NVIDIA device (#1926 bench plan B5): other vendors keep the shared target.
+        return device.VendorId == AmdVendorId && device.ComputeUnitCount is int cu ? Math.Clamp(2 * cu, 1, TargetWorkgroups) : TargetWorkgroups;
     }
 
     /// <summary>Position floor per split of the v2 grouped pass (measured: 64 beat 16, 128 and 256 on Flint / Strix).</summary>

@@ -124,7 +124,7 @@ public sealed class SplitKvV2LoaderBitIdentityTests
         using var device = VulkanDevice.Create();
         using var k = VulkanSplitKvAttentionKernel.Create(device, spvDir, VulkanKvStorage.F16);
         int? cu = device.ComputeUnitCount;
-        int expect = cu is int n ? Math.Clamp(2 * n, 1, VulkanSplitKvAttentionKernel.TargetWorkgroups) : VulkanSplitKvAttentionKernel.TargetWorkgroups;
+        int expect = device.VendorId == 0x1002 && cu is int n ? Math.Clamp(2 * n, 1, VulkanSplitKvAttentionKernel.TargetWorkgroups) : VulkanSplitKvAttentionKernel.TargetWorkgroups;
         Assert.Equal(expect, k.Gqa2TargetWorkgroups);
         if (device.DeviceName.Contains("8060S", StringComparison.Ordinal))
         {

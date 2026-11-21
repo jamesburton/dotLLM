@@ -394,6 +394,9 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         Assert.True(tq is not null, "no TurboQuant split-KV twin");
         f32.PreferGqa = gqa; tq!.PreferGqa = gqa;
         f32.PreferGqa2 = gqa2; tq.PreferGqa2 = gqa2;
+        // F32 partials (#1926 E4 control): these tests hold the LOADER to the scratch oracle at reduction-order tolerance; the F16
+        // partial format has its own stated-tolerance tests (SplitKvPartialF16Tests) and model gate.
+        f32.PreferPartF16 = false; tq.PreferPartF16 = false;
         Assert.Equal(f32.UsesGqa(heads, kvHeads, hd), tq.UsesGqa(heads, kvHeads, hd));        // same pass as the F32 kernel takes
         Assert.Equal(f32.UsesGqa2(heads, kvHeads, hd), tq.UsesGqa2(heads, kvHeads, hd));
         Skip.If(gqa && !f32.UsesGqa(heads, kvHeads, hd), "GQA-grouped split pass unavailable for this shape");
