@@ -55,6 +55,7 @@ public sealed class SplitKvV2LoaderBitIdentityTests
         using var now = VulkanSplitKvAttentionKernel.Create(device, spvDir, storage, null, "");
         using var pre = VulkanSplitKvAttentionKernel.Create(device, spvDir, storage, null, "_pre1926");
         now.PreferGqa = pre.PreferGqa = true;
+        now.PreferPartF16 = false;   // the F32 partials: the pre-change layout (E4's F16 arm has its own tests)
         Skip.IfNot(now.UsesGqa2(numHeads, numKvHeads, headDim) && pre.UsesGqa2(numHeads, numKvHeads, headDim), "v2 pass unavailable on this device");
         Assert.True(VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads));
 
@@ -140,6 +141,7 @@ public sealed class SplitKvV2LoaderBitIdentityTests
         using var now = VulkanSplitKvAttentionKernel.Create(device, spvDir, VulkanKvStorage.Tq, l, "");
         using var pre = VulkanSplitKvAttentionKernel.Create(device, spvDir, VulkanKvStorage.Tq, l, "_pre1926");
         now.PreferGqa = pre.PreferGqa = true;
+        now.PreferPartF16 = false;   // the F32 partials: the pre-change layout (E4's F16 arm has its own tests)
         Skip.IfNot(now.UsesGqa2(numHeads, numKvHeads, headDim), "v2 pass unavailable on this device");
         var rng = new Random(0x19263 + bits * 17 + seqKv + headDim);
         float[] q = Rand(rng, numHeads * headDim, 2f);

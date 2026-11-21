@@ -121,7 +121,29 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     // #1926 E1b: the v2 body's GROUP specialization constant (constant_id 0) sizes its per-thread accumulators, dot products and reduce on
     // the sub-group it serves. _gqa2Pipeline is built at GROUP = GqaMaxGroup (the safe value, any shape); a pipeline per smaller sub-group
     // size is built on first use. DOTLLM_VULKAN_SPLITKV_GROUP_SPEC=0 keeps every shape on the GqaMaxGroup pipeline (the A/B control).
-    private readonly (ComputePipeline Pipeline, nint Pool, DescriptorSetCache Cache)?[] _gqa2ByGroup = new (ComputePipeline, nint, DescriptorSetCache)?[GqaMaxGroup + 1];
+    // Indexed group * 2 + (F16 partials ? 1 : 0) (#1926 E4).
+    private readonly (ComputePipeline Pipeline, nint Pool, DescriptorSetCache Cache)?[] _gqa2ByGroup = new (ComputePipeline, nint, DescriptorSetCache)?[(GqaMaxGroup + 1) * 2];
+
+    // #1926 E4: the merge pass specialised to read the v2 pass's F16 partials (PART_F16 = 1), built on first use.
+    private ComputePipeline? _mergeF16Pipeline;
+    private nint _mergeF16Pool;
+    private DescriptorSetCache? _mergeF16Cache;
+
+    internal const string PartFormatEnvVar = "DOTLLM_VULKAN_SPLITKV_PART";
+
+    /// <summary>
+    /// #1926 E4 (precision rule 1, ruling 2026-11-20: F16 first, F32 the control): the v2 grouped pass stores its O partials as F16,
+    /// normalized by the split's running sum, and the merge multiplies the sum back in. OPT-IN (<c>DOTLLM_VULKAN_SPLITKV_PART=f16</c>)
+    /// until the model-level PPL / KL gate against the F32 control has run (.docs/bench-plan.md B4); unset or <c>f32</c> keeps the
+    /// F32 un-normalized partials, bit-identical to the pre-change path. The per-query-head and v1 grouped passes always store F32.
+    /// A kernel created with a pre-change v2 module (<c>gqa2Suffix</c>) cannot write F16 partials and pins this off.
+    /// </summary>
+    internal bool PreferPartF16 { get; set; } = Environment.GetEnvironmentVariable(PartFormatEnvVar) == "f16";
+
+    private readonly bool _gqa2CanWriteF16 = true;
+
+    /// <summary>Whether the last <see cref="Record"/> stored F16 partials (test hook).</summary>
+    internal bool LastPartF16 { get; private set; }
 
     internal const string GroupSpecEnvVar = "DOTLLM_VULKAN_SPLITKV_GROUP_SPEC";
 
@@ -139,18 +161,34 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         return Math.Clamp((g + subs - 1) / subs, 2, GqaMaxGroup);
     }
 
-    private (ComputePipeline Pipeline, DescriptorSetCache Cache) Gqa2PipelineFor(int group)
+    private (ComputePipeline Pipeline, DescriptorSetCache Cache) Gqa2PipelineFor(int group, bool partF16)
     {
-        if (group >= GqaMaxGroup) return (_gqa2Pipeline!, _gqa2Cache!);
-        if (_gqa2ByGroup[group] is { } built) return (built.Pipeline, built.Cache);
-        ReadOnlySpan<uint> spec = [(uint)group];
+        if (group >= GqaMaxGroup && !partF16) return (_gqa2Pipeline!, _gqa2Cache!);
+        int slot = group * 2 + (partF16 ? 1 : 0);
+        if (_gqa2ByGroup[slot] is { } built) return (built.Pipeline, built.Cache);
+        ReadOnlySpan<uint> spec = [(uint)group, partF16 ? 1u : 0u];
         ComputePipeline p = TqKvTwin.CreatePipeline(_gqa2Module!, 5, SplitPushConstantBytes, _tq, spec: spec);
         nint pool = KernelSupport.CreateDescriptorPool(_device, buffersPerSet: (uint)(5 + TqKvTwin.Extra(_tq)));
         var cache = TqKvTwin.CreateCache(_device, pool, p, 5, _tq);
-        _gqa2ByGroup[group] = (p, pool, cache);
+        _gqa2ByGroup[slot] = (p, pool, cache);
         if (Environment.GetEnvironmentVariable("DOTLLM_VULKAN_SPLITKV_GROUP_LOG") == "1")
-            Console.Error.WriteLine($"[splitkv-v2] {KvStorage}: built GROUP={group} pipeline");
+            Console.Error.WriteLine($"[splitkv-v2] {KvStorage}: built GROUP={group} PART={(partF16 ? "f16" : "f32")} pipeline");
         return (p, cache);
+    }
+
+    private (ComputePipeline Pipeline, DescriptorSetCache Cache) MergePipelineFor(bool partF16)
+    {
+        if (!partF16) return (_mergePipeline, _mergeCache);
+        if (_mergeF16Pipeline is null)
+        {
+            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
+            for (int i = 0; i < 4; i++) bindings[i] = new VkDescriptorBinding((uint)i);
+            ReadOnlySpan<uint> spec = [1u];
+            _mergeF16Pipeline = _mergeModule.CreateComputePipeline("main", bindings, MergePushConstantBytes, 0, spec);
+            _mergeF16Pool = KernelSupport.CreateDescriptorPool(_device, buffersPerSet: 4);
+            _mergeF16Cache = new DescriptorSetCache(_device, _mergeF16Pool, _mergeF16Pipeline, buffersPerSet: 4);
+        }
+        return (_mergeF16Pipeline, _mergeF16Cache!);
     }
 
     /// <summary>Largest head_dim the v2 grouped pass serves.</summary>
@@ -222,9 +260,11 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         VulkanModule splitModule, ComputePipeline splitPipeline, nint splitPool,
         VulkanModule mergeModule, ComputePipeline mergePipeline, nint mergePool, VulkanKvStorage kvStorage,
         VulkanModule? gqaModule, ComputePipeline? gqaPipeline, nint gqaPool,
-        VulkanModule? gqa2Module, ComputePipeline? gqa2Pipeline, nint gqa2Pool, DotLLM.Core.Attention.TurboQuantLayout? tq)
+        VulkanModule? gqa2Module, ComputePipeline? gqa2Pipeline, nint gqa2Pool, DotLLM.Core.Attention.TurboQuantLayout? tq,
+        bool gqa2CanWriteF16 = true)
     {
         _device = device;
+        _gqa2CanWriteF16 = gqa2CanWriteF16;
         _tq = tq;
         _gqa2Module = gqa2Module;
         _gqa2Pipeline = gqa2Pipeline;
@@ -361,9 +401,10 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
             ? TryLoadOptional(device, Path.Combine(spvDir, kvStorage.ShaderName("attention_f32_splitkv_gqa_v2") + gqa2Suffix + ".spv"), tq)
             : (null, null, 0);
 
-        return new VulkanSplitKvAttentionKernel(
+        var kernel = new VulkanSplitKvAttentionKernel(
             device, splitModule, splitPipeline, splitPool, mergeModule!, mergePipeline, mergePool, kvStorage,
-            gqaModule, gqaPipeline, gqaPool, gqa2Module, gqa2Pipeline, gqa2Pool, tq);
+            gqaModule, gqaPipeline, gqaPool, gqa2Module, gqa2Pipeline, gqa2Pool, tq, gqa2CanWriteF16: gqa2Suffix.Length == 0);
+        return kernel;
     }
 
     private static (VulkanModule?, ComputePipeline?, nint) TryLoadOptional(VulkanDevice device, string path, DotLLM.Core.Attention.TurboQuantLayout? tq)
@@ -506,6 +547,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         _gqaCache?.Reset();
         _gqa2Cache?.Reset();
         foreach (var e in _gqa2ByGroup) e?.Cache.Reset();
+        _mergeF16Cache?.Reset();
     }
 
     /// <summary>
@@ -592,10 +634,12 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
             { q.Handle, k.Handle, v.Handle, _partOut!.Handle, _partMS!.Handle };
         ComputePipeline splitPipeline;
         DescriptorSetCache splitCache;
+        bool partF16 = false;
         if (gqa2)
         {
             int group = Gqa2GroupFor(numHeads, numKvHeads);
-            (splitPipeline, splitCache) = Gqa2PipelineFor(group);
+            partF16 = PreferPartF16 && _gqa2CanWriteF16;
+            (splitPipeline, splitCache) = Gqa2PipelineFor(group, partF16);
             LastGqa2Group = group;
         }
         else
@@ -645,11 +689,13 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
 
         // ── Pass 2: merge ────────────────────────────────────────────────
         Span<nint> mergeBuffers = stackalloc nint[4] { _partOut!.Handle, _partMS!.Handle, output.Handle, (sinks ?? output).Handle };
-        nint mergeSet = _mergeCache.GetOrCreate(mergeBuffers);
+        LastPartF16 = partF16;
+        var (mergePipeline, mergeCache) = MergePipelineFor(partF16);
+        nint mergeSet = mergeCache.GetOrCreate(mergeBuffers);
 
-        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _mergePipeline.Pipeline);
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, mergePipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(
-            cmdBuf, VkPipelineBindPoint.Compute, _mergePipeline.Layout, 0, 1, mergeSet, 0, 0);
+            cmdBuf, VkPipelineBindPoint.Compute, mergePipeline.Layout, 0, 1, mergeSet, 0, 0);
 
         Span<uint> mpc = stackalloc uint[4];
         mpc[0] = (uint)numHeads;
@@ -659,7 +705,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         fixed (uint* pcPtr = mpc)
         {
             VulkanApi.vkCmdPushConstants(
-                cmdBuf, _mergePipeline.Layout, VkShaderStageFlags.Compute, 0, MergePushConstantBytes, (nint)pcPtr);
+                cmdBuf, mergePipeline.Layout, VkShaderStageFlags.Compute, 0, MergePushConstantBytes, (nint)pcPtr);
         }
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)numHeads, 1, 1);
     }
@@ -727,6 +773,8 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         _gqa2Module?.Dispose();
         _partOut?.Dispose();
         _partMS?.Dispose();
+        if (_mergeF16Pool != 0) VulkanApi.vkDestroyDescriptorPool(_device.Handle, _mergeF16Pool, 0);
+        _mergeF16Pipeline?.Dispose();
         _mergePipeline.Dispose();
         _mergeModule.Dispose();
         _splitPipeline.Dispose();

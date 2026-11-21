@@ -147,7 +147,13 @@ vec4 hi4(RAW r) { return r[1]; }
 #define loV4 lo4
 #define hiV4 hi4
 #endif
-layout(set = 0, binding = 3, std430) writeonly buffer BufPartOut { float partOut[]; }; // [numHeads*numSplits, head_dim] (un-normalized acc)
+// #1926 E4: PART_F16 = 0 writes the F32 un-normalized accumulator (the control, bit-identical to the pre-change body: a float stored
+// through its bits); PART_F16 = 1 writes the accumulator NORMALIZED by the split's running sum as packed halves, two per word, so
+// |value| <= max|v| and the F16 range cannot be exceeded by the softmax mass of a long split. attention_f32_splitkv_merge.comp is
+// specialised the same way and multiplies the split's running sum back in. partMS stays F32 (an F16 running max near 20 would move
+// exp() weights by ~1%, docs/PRECISION.md).
+layout(constant_id = 1) const uint PART_F16 = 0u;
+layout(set = 0, binding = 3, std430) writeonly buffer BufPartOut { uint partOutW[]; }; // F32: [numHeads*numSplits, head_dim]; F16: [.., head_dim / 2]
 layout(set = 0, binding = 4, std430) writeonly buffer BufPartMS  { float partMS[]; };  // [numHeads*numSplits, 2] (running max, running sum)
 
 layout(push_constant) uniform PushConstants {
@@ -377,11 +383,20 @@ void main() {
             if (g < G) {
                 vec4 sum = vec4(0.0);
                 for (uint w = 0u; w < nSub; w++) sum += qShared[(w * 2u + gg) * (MAX_HEAD_DIM / 4) + c];
-                uint o = ((hq0 + g) * pc.numSplits + splitId) * hd + c * 4u;
-                partOut[o] = sum.x;
-                partOut[o + 1u] = sum.y;
-                partOut[o + 2u] = sum.z;
-                partOut[o + 3u] = sum.w;
+                uint row = (hq0 + g) * pc.numSplits + splitId;
+                if (PART_F16 != 0u) {
+                    float rs = runSum[g];
+                    vec4 o4 = clamp(sum * (rs > 0.0 ? 1.0 / rs : 0.0), vec4(-65504.0), vec4(65504.0));
+                    uint ow = row * (hd >> 1u) + c * 2u;
+                    partOutW[ow] = packHalf2x16(o4.xy);
+                    partOutW[ow + 1u] = packHalf2x16(o4.zw);
+                } else {
+                    uint o = row * hd + c * 4u;
+                    partOutW[o] = floatBitsToUint(sum.x);
+                    partOutW[o + 1u] = floatBitsToUint(sum.y);
+                    partOutW[o + 2u] = floatBitsToUint(sum.z);
+                    partOutW[o + 3u] = floatBitsToUint(sum.w);
+                }
             }
         }
         barrier();

@@ -227,6 +227,7 @@ public sealed class VulkanSplitKvDecodeBench
                     arms.Add(new QuantArm($"{arm}-pre", pre, false, bk, bv, ops, bpe, -1));
                     arms.Add(new QuantArm($"{arm}-g8", now, false, bk, bv, ops, bpe, refIdx));
                     arms.Add(new QuantArm($"{arm}-gspec", now, true, bk, bv, ops, bpe, refIdx));
+                    arms.Add(new QuantArm($"{arm}-gspec-f16p", now, true, bk, bv, ops, bpe, refIdx, PartF16: true));
                 }
                 kf = null!; vf = null!;
 
@@ -244,7 +245,9 @@ public sealed class VulkanSplitKvDecodeBench
                     float[] r = outputs[arms[a].Ref];
                     float amp = r.Max(MathF.Abs), worst = 0;
                     for (int i = 0; i < q.Length; i++) worst = MathF.Max(worst, MathF.Abs(outputs[a][i] - r[i]));
-                    Assert.True(amp > 1e-4f && worst <= 1e-6f * amp, $"{arms[a].Name} vs {arms[arms[a].Ref].Name}: {worst:G3} (amplitude {amp:G3})");
+                    // F16 partials (E4): the stated 1e-3-of-amplitude tolerance (SplitKvPartialF16Tests); every other arm 1e-6.
+                    float tol = arms[a].PartF16 ? 1e-3f : 1e-6f;
+                    Assert.True(amp > 1e-4f && worst <= tol * amp, $"{arms[a].Name} vs {arms[arms[a].Ref].Name}: {worst:G3} (amplitude {amp:G3})");
                     check[a] = worst == 0 ? "bit-identical" : $"{worst / amp:E1}";
                 }
 
@@ -276,6 +279,7 @@ public sealed class VulkanSplitKvDecodeBench
             void Submit(QuantArm arm, int reps)
             {
                 arm.Kernel.PreferGroupSpec = arm.Spec;
+                arm.Kernel.PreferPartF16 = arm.PartF16;
                 Assert.True(arm.Kernel.UsesGqa2(NumHeads, NumKvHeads, HeadDim), $"{arm.Name}: v2 pass not taken");
                 using var ctx = device.CreateSubmitContext();
                 ctx.Begin();
@@ -287,7 +291,7 @@ public sealed class VulkanSplitKvDecodeBench
     }
 
     private sealed record QuantArm(string Name, VulkanSplitKvAttentionKernel Kernel, bool Spec, VulkanDevice.Buffer K, VulkanDevice.Buffer V,
-        TqKvOperands? Tq, double Bpe, int Ref);
+        TqKvOperands? Tq, double Bpe, int Ref, bool PartF16 = false);
 
     // Dispatches per timed submit in the quantized-arm bench (each is one layer's split + merge).
     private const int QuantRepsPerSubmit = 20;
