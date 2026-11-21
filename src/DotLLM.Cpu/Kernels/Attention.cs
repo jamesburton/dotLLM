@@ -282,10 +282,6 @@ public static class Attention
         float maxSoFar = hasSink ? sinkLogit : float.NegativeInfinity;
         float sumExp = hasSink ? 1f : 0f;
 
-        // Software prefetch (#1927 E2a): on a GQA cache one head's slices sit a full KV row apart (4 KiB at 8 x hd128), a new page
-        // per key, which the hardware prefetcher does not follow. Prefetching changes no value.
-        bool prefetch = RowPrefetchEnabled && kvStride * sizeof(float) >= PrefetchMinStrideBytes;
-        int headOff = kvHeadIdx * headDim;
         for (int tileBase = visibleStart; tileBase < visibleEnd; tileBase += tileSize)
         {
             int tileLen = Math.Min(tileSize, visibleEnd - tileBase);
@@ -293,8 +289,6 @@ public static class Attention
 
             for (int j = 0; j < tileLen; j++)
             {
-                if (prefetch && tileBase + j + RowPrefetchDistance < visibleEnd)
-                    PrefetchSlice(k, (tileBase + j + RowPrefetchDistance) * kvStride + headOff, headDim);
                 var kRow = k.Slice((tileBase + j) * kvStride + kvHeadIdx * headDim, headDim);
                 int keyPosition = tileBase + j;
                 scores[j] = TensorPrimitives.Dot(qRow, kRow) * scale
@@ -320,8 +314,6 @@ public static class Attention
 
             for (int j = 0; j < tileLen; j++)
             {
-                if (prefetch && j + RowPrefetchDistance < tileLen)
-                    PrefetchSlice(v, (tileBase + j + RowPrefetchDistance) * kvStride + headOff, headDim);
                 float w = scores[j];
                 if (w == 0f) continue;
                 var vRow = v.Slice((tileBase + j) * kvStride + kvHeadIdx * headDim, headDim);
@@ -333,30 +325,6 @@ public static class Attention
 
         if (sumExp > 0f)
             TensorPrimitives.Multiply(outRow, 1f / sumExp, outRow);
-    }
-
-    /// <summary>Environment variable: <c>0</c> disables the K/V software prefetch in <see cref="TiledRow"/> (#1927 E2a A/B).</summary>
-    public const string RowPrefetchEnvVar = "DOTLLM_CPU_ATTN_PREFETCH";
-
-    /// <summary>Keys ahead to prefetch in <see cref="TiledRow"/>; <c>DOTLLM_CPU_ATTN_PREFETCH_DIST</c> overrides (sweeps), default 8.</summary>
-    private static readonly int RowPrefetchDistance =
-        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CPU_ATTN_PREFETCH_DIST"), out int d) && d > 0 ? d : 8;
-
-    /// <summary>Runtime switch (tests, in-process A/B); initialised from <see cref="RowPrefetchEnvVar"/>.</summary>
-    internal static bool RowPrefetchEnabled =
-        System.Runtime.Intrinsics.X86.Sse.IsSupported && Environment.GetEnvironmentVariable(RowPrefetchEnvVar) != "0";
-
-    /// <summary>Contiguous (MHA-like, stride &lt; one page) slices stream well without help; prefetch only page-strided ones.</summary>
-    private const int PrefetchMinStrideBytes = 1024;
-
-    /// <summary>Issues a T0 prefetch for every cache line of <c>src[offset .. offset + count)</c>. Never faults; changes no value.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void PrefetchSlice(ReadOnlySpan<float> src, int offset, int count)
-    {
-        byte* p = (byte*)Unsafe.AsPointer(ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(src), offset));
-        int bytes = count * sizeof(float);
-        for (int o = 0; o < bytes; o += 64)
-            System.Runtime.Intrinsics.X86.Sse.Prefetch0(p + o);
     }
 
     /// <summary>
