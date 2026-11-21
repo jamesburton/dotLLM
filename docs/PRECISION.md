@@ -635,11 +635,24 @@ arm on the same cache (rolled back between arms), wikitext-2 LF corpus. Referenc
 | split-KV, F32 partials | 2.58e-3 | 1.55e-2 | 7.98e-2 | 9.4442 (+0.33%) | 96.9% | 17.05 [16.84-17.10] |
 
 Kernel level (unit test, same shapes): |d| vs the tiled reference 1.6-2.2e-7 (F32 partials) and 2.7-8.0e-5 (F16 partials).
-Reading: the F16 and F32 arms are indistinguishable at model level (KL means equal to 3 digits, PPL deltas of opposite sign),
-so F16 storage adds nothing measurable; the residual divergence is the change of reduction order itself (2e-7 at the kernel,
-digitised by the Q8_K activation quantization downstream) and the PPL instrument cannot resolve below about +-0.5% at 768
-steps. Decision: **F16 partials, default on** (passes the +0.30% PPL bar). Bytes: ceil(visible/256) x heads x (2 hd + 8):
-248 KiB at 7.6K (240 KiB F16 outputs + 7.5 KiB F32 max/sum), 1.03 MiB at 32K, per dispatching thread.
+
+The table above is **free-running teacher-forced**: each arm decodes on its own history, so the KL compounds and the two PPL
+deltas (opposite signs) only show that 768 steps cannot resolve +-0.5%. The **paired per-step** form (`--mode splitkv-paired`)
+runs every arm for step i on the reference history (rollback, reference last), and adds a **negative control**: a temporary,
+uncommitted build that rounds the partials to BF16 (7-bit mantissa, 16x the F16 rounding) before the F16 store.
+
+| arm (paired, 768 steps) | per-step KL mean | median | p99 | max | paired dNLL +- SE | PPL delta | top-1 |
+|---|---|---|---|---|---|---|---|
+| F32 partials (control) | 2.003e-3 | 1.046e-3 | 1.293e-2 | 2.53e-2 | -0.00109 +- 0.00304 | -0.11% | 97.9% |
+| F16 partials (shipped) | 2.036e-3 | 1.070e-3 | 1.299e-2 | 3.03e-2 | -0.00007 +- 0.00298 | -0.01% | 98.1% |
+| BF16 partials (negative control) | 2.135e-3 | 1.068e-3 | 1.426e-2 | 6.69e-2 | +0.00003 +- 0.00282 | +0.00% | 96.9% |
+
+Reading: the per-step KL orders BF16 > F16 > F32 as it must, but the instrument is **nearly saturated**: a 2e-7 change of
+reduction order (F32 arm) already costs 2.0e-3 per step (Q8_K activation rounding digitises it, see the "quantization digitises
+ULP drift" note), so the F16 rounding adds +1.6% to the mean KL and BF16 +6.6% (max 2.6x, top-1 -1.2 points). dNLL resolves
++-0.3% (1 SE) and sees none of them. Decision: **F16 partials, default on** (no measurable cost above the reorder floor; the
+kernel-level error is the sensitive instrument: 8e-5 absolute). The reorder floor itself (decode rows no longer equal prefill or
+verify rows past 2,048 keys, #530) is the accepted consequence of E2c.
 
 ## 6. Decision table: CLAUDE.md rule → evidence
 
