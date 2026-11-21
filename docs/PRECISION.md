@@ -180,6 +180,10 @@ keeps the output exact, so tune by acceptance × cost, not KL (#1095 measured no
 duplicated (64 MiB × 2 at 128k on Llama-8B); F16 tables from F32 angles are not measured (#1142).
 
 **Split partials.** *m*/*ℓ* stay F32 (a few KB); O partials and split-K slabs to F16 are not measured (#1144).
+CUDA dense decode (#1922) stores its split-KV O partials **normalised** (o/ℓ, bounded by max|v|) in **F16** with *m*, *ℓ*
+F32 (James's ruling, 2026-11-20; the unnormalised form overflows F16 on a long split, guarded by a flat-score |V|≈20 32K test).
+Kernel level (RTX 3060, F64 oracle over F16 inputs): max |err| F16 partials vs F32 partials 2.9e-4 vs 2.9e-4 at short seqKv,
+1.3e-5 vs 1.1e-5 at 32K; no time difference. Teacher-forced PPL/KL on Qwen3-4B: `CudaDenseDecodeQualityGateTests` (pending).
 
 ---
 
