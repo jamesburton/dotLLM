@@ -835,7 +835,7 @@ __device__ __forceinline__ void pk_tq_tile(PkTqAcc<HD>& A, const half* qw, const
 
     const float mn_lo = fmaxf(A.m_lo, tmax_lo);
     const float mn_hi = fmaxf(A.m_hi, tmax_hi);
-    const float mu_lo = (mn_lo == PK_NEG_INF) ? 0.0f : mn_lo;
+    const float mu_lo = (mn_lo == PK_NEG_INF) ? 0.0f : mn_lo;   // softmax offset of the TQ tile
     const float mu_hi = (mn_hi == PK_NEG_INF) ? 0.0f : mn_hi;
 
     const bool changed = (mn_lo != A.m_lo) || (mn_hi != A.m_hi);

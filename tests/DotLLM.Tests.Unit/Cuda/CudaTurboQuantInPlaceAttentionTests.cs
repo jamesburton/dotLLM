@@ -327,7 +327,9 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
 
     public static IEnumerable<object[]> FlashCases()
     {
-        // variant: "auto" (the default entry for the shape), "legacy" (forced _tqtq), "cpa" (forced E3 entry, where one exists)
+        // variant: "auto" (the default entry for the shape), "legacy" (forced _tqtq), "spec" (forced E1 entry), "cpa" (forced E3 entry,
+        // where one exists). With Staged as the default "auto" mostly repeats "cpa"; "spec" keeps E1 (the hd64 tq3 / unaligned fallback)
+        // covered on every shape.
         foreach (var c in FlashShapes())
         {
             int bits = (int)c[0], hd = (int)c[1];
@@ -335,6 +337,7 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
             if (HasSpecEntry(bits))
             {
                 yield return [.. c, "legacy"];
+                yield return [.. c, "spec"];
                 if (HasCpaEntry(hd, bits)) yield return [.. c, "cpa"];
             }
         }
@@ -397,6 +400,7 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         CudaKernels.TqPrefillVariant? forced = variant switch
         {
             "legacy" => CudaKernels.TqPrefillVariant.Legacy,
+            "spec" => CudaKernels.TqPrefillVariant.Specialized,
             "cpa" => CudaKernels.TqPrefillVariant.Staged,
             _ => null,
         };
