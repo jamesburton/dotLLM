@@ -160,7 +160,7 @@ public sealed class VulkanSplitKvDecodeBench
             .Split(',', StringSplitOptions.RemoveEmptyEntries);
 
         using var device = VulkanDevice.Create();
-        _output.WriteLine($"device {device.DeviceName}; shape {NumHeads}/{NumKvHeads}/{HeadDim}; {QuantRepsPerSubmit} dispatches per submit");
+        _output.WriteLine($"device {device.DeviceName}; compute units {device.ComputeUnitCount?.ToString() ?? "unknown"}; shape {NumHeads}/{NumKvHeads}/{HeadDim}; {QuantRepsPerSubmit} dispatches per submit");
         _output.WriteLine("seqKv\tarm\tmin_ms\tmedian_ms\tunique_GB/s\tG_elem/s\tcheck");
         using var f32 = VulkanSplitKvAttentionKernel.Create(device, spvDir, VulkanKvStorage.F32);
         f32.PreferGqa = true;
@@ -228,6 +228,18 @@ public sealed class VulkanSplitKvDecodeBench
                     arms.Add(new QuantArm($"{arm}-g8", now, false, bk, bv, ops, bpe, refIdx));
                     arms.Add(new QuantArm($"{arm}-gspec", now, true, bk, bv, ops, bpe, refIdx));
                     arms.Add(new QuantArm($"{arm}-gspec-f16p", now, true, bk, bv, ops, bpe, refIdx, PartF16: true));
+                    // #1926 P3: the same pipeline on the pre-change grid (the shared 256-workgroup target) vs the CU-sized default.
+                    arms.Add(new QuantArm($"{arm}-gspec-wg256", now, true, bk, bv, ops, bpe, refIdx, TargetWg: 256));
+                    // DOTLLM_SPLITKV_DECODE_AB_EXTRA=<suffix>: one more arm from attention_f32_splitkv_gqa_v2{twin}<suffix>.spv (dropped in
+                    // the test bin's spv dir by hand), e.g. the previous commit's module, at the specialised GROUP.
+                    string? extra = Environment.GetEnvironmentVariable("DOTLLM_SPLITKV_DECODE_AB_EXTRA");
+                    if (!string.IsNullOrEmpty(extra) && File.Exists(Path.Combine(spvDir, st.ShaderName("attention_f32_splitkv_gqa_v2") + extra + ".spv")))
+                    {
+                        var x = VulkanSplitKvAttentionKernel.Create(device, spvDir, st, l, extra);
+                        owned.Add(x);
+                        x.PreferGqa = true;
+                        arms.Add(new QuantArm($"{arm}-x{extra}-gspec", x, true, bk, bv, ops, bpe, refIdx));
+                    }
                 }
                 kf = null!; vf = null!;
 
@@ -280,6 +292,7 @@ public sealed class VulkanSplitKvDecodeBench
             {
                 arm.Kernel.PreferGroupSpec = arm.Spec;
                 arm.Kernel.PreferPartF16 = arm.PartF16;
+                arm.Kernel.Gqa2TargetWorkgroups = arm.TargetWg > 0 ? arm.TargetWg : DefaultTarget(arm.Kernel);
                 Assert.True(arm.Kernel.UsesGqa2(NumHeads, NumKvHeads, HeadDim), $"{arm.Name}: v2 pass not taken");
                 using var ctx = device.CreateSubmitContext();
                 ctx.Begin();
@@ -290,8 +303,16 @@ public sealed class VulkanSplitKvDecodeBench
         }
     }
 
+    private static readonly Dictionary<VulkanSplitKvAttentionKernel, int> s_defaultTarget = new();
+
+    private static int DefaultTarget(VulkanSplitKvAttentionKernel k)
+    {
+        if (!s_defaultTarget.TryGetValue(k, out int t)) s_defaultTarget[k] = t = k.Gqa2TargetWorkgroups;
+        return t;
+    }
+
     private sealed record QuantArm(string Name, VulkanSplitKvAttentionKernel Kernel, bool Spec, VulkanDevice.Buffer K, VulkanDevice.Buffer V,
-        TqKvOperands? Tq, double Bpe, int Ref, bool PartF16 = false);
+        TqKvOperands? Tq, double Bpe, int Ref, bool PartF16 = false, int TargetWg = 0);
 
     // Dispatches per timed submit in the quantized-arm bench (each is one layer's split + merge).
     private const int QuantRepsPerSubmit = 20;

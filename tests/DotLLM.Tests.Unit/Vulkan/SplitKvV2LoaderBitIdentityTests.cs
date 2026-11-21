@@ -111,6 +111,28 @@ public sealed class SplitKvV2LoaderBitIdentityTests
             Assert.True(differ == 0, $"GROUP={expectGroup}: {differ} outputs not bit-identical (only GROUP=4 is known to drift)");
     }
 
+    /// <summary>
+    /// #1926 P3: the v2 pass sizes its grid on the device (2 x compute units, clamped to the partial-scratch bound) unless an
+    /// environment override is set, and the split count it dispatches follows that target, not the shared 256.
+    /// </summary>
+    [SkippableFact]
+    public void V2Grid_IsTwiceTheComputeUnits_WhenTheDriverReportsThem()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_SPLIT_TARGET_WG") is { Length: > 0 }
+             || Environment.GetEnvironmentVariable("DOTLLM_VULKAN_SPLITKV_GQA2_TARGET_WG") is { Length: > 0 }, "a grid override is set");
+        using var device = VulkanDevice.Create();
+        using var k = VulkanSplitKvAttentionKernel.Create(device, spvDir, VulkanKvStorage.F16);
+        int? cu = device.ComputeUnitCount;
+        int expect = cu is int n ? Math.Clamp(2 * n, 1, VulkanSplitKvAttentionKernel.TargetWorkgroups) : VulkanSplitKvAttentionKernel.TargetWorkgroups;
+        Assert.Equal(expect, k.Gqa2TargetWorkgroups);
+        if (device.DeviceName.Contains("8060S", StringComparison.Ordinal))
+        {
+            Assert.Equal(40, cu);   // Strix Halo: 40 CUs -> 80 workgroups = 10 splits x 8 KV heads at depth
+            Assert.Equal(10, VulkanSplitKvAttentionKernel.ComputeGqa2Splits(32768, 8, k.Gqa2TargetWorkgroups));
+        }
+    }
+
     public static TheoryData<int, int, int, int, int> TqCases()
     {
         var d = new TheoryData<int, int, int, int, int>();

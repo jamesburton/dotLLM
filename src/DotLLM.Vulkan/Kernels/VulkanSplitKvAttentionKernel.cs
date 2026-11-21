@@ -265,6 +265,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     {
         _device = device;
         _gqa2CanWriteF16 = gqa2CanWriteF16;
+        Gqa2TargetWorkgroups = ResolveGqa2Target(device);
         _tq = tq;
         _gqa2Module = gqa2Module;
         _gqa2Pipeline = gqa2Pipeline;
@@ -522,9 +523,31 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     /// <param name="seqKv">KV positions the splits cover.</param>
     /// <param name="units">KV heads times <see cref="GqaSubGroups"/> (equal to the KV heads for groups of at most 8).</param>
     /// <returns>The split count (at least 1).</returns>
-    public static int ComputeGqa2Splits(int seqKv, int units)
+    public static int ComputeGqa2Splits(int seqKv, int units) => ComputeGqa2Splits(seqKv, units, TargetWorkgroups);
+
+    /// <summary><see cref="ComputeGqa2Splits(int, int)"/> for an explicit workgroup target (<see cref="Gqa2TargetWorkgroups"/>).</summary>
+    public static int ComputeGqa2Splits(int seqKv, int units, int targetWorkgroups)
         => seqKv <= 0 || units <= 0 ? 1
-            : Math.Max(1, Math.Min(Math.Max(1, TargetWorkgroups / units), (seqKv + Gqa2MinKvPerSplit - 1) / Gqa2MinKvPerSplit));
+            : Math.Max(1, Math.Min(Math.Max(1, targetWorkgroups / units), (seqKv + Gqa2MinKvPerSplit - 1) / Gqa2MinKvPerSplit));
+
+    internal const string Gqa2TargetWorkgroupsEnvVar = "DOTLLM_VULKAN_SPLITKV_GQA2_TARGET_WG";
+
+    /// <summary>
+    /// Workgroup target of the v2 grouped pass (#1926 P3). Measured on Strix (gfx1151, 40 CUs, 32/8/128, kernel microbench, both orders):
+    /// the grid wants to be a whole number of waves of 2 workgroups per CU. 80 workgroups (10 splits x 8 KV heads; llama.cpp's
+    /// <c>2 * CUs</c>) beat the shared 256 by 16-18% at 8K and 6-12% at 32K on f16 / q4_0 / tq4; 160 and 240 were close to 80, 64, 96, 120
+    /// and 256 were not. So: <c>2 x</c> the device's compute units (AMD CUs / NVIDIA SMs) when the driver reports them, clamped to
+    /// <see cref="TargetWorkgroups"/> (the partial-scratch bound); otherwise <see cref="TargetWorkgroups"/>. An explicit
+    /// <c>DOTLLM_VULKAN_SPLIT_TARGET_WG</c> still sets every pass; <c>DOTLLM_VULKAN_SPLITKV_GQA2_TARGET_WG</c> sets this one alone.
+    /// </summary>
+    internal int Gqa2TargetWorkgroups { get; set; }
+
+    private static int ResolveGqa2Target(VulkanDevice device)
+    {
+        if (int.TryParse(Environment.GetEnvironmentVariable(Gqa2TargetWorkgroupsEnvVar), out int v) && v > 0) return Math.Min(v, TargetWorkgroups);
+        if (Environment.GetEnvironmentVariable(TargetWorkgroupsEnvVar) is { Length: > 0 }) return TargetWorkgroups;
+        return device.ComputeUnitCount is int cu ? Math.Clamp(2 * cu, 1, TargetWorkgroups) : TargetWorkgroups;
+    }
 
     /// <summary>Position floor per split of the v2 grouped pass (measured: 64 beat 16, 128 and 256 on Flint / Strix).</summary>
     public const int Gqa2MinKvPerSplit = 64;
@@ -614,7 +637,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         bool gqa2 = gqa && UsesGqa2(numHeads, numKvHeads, headDim);
         // Grouped passes run one workgroup per (KV head, sub-group, split); the shaders derive the same sub-grouping from the push constants.
         int gqaUnits = numKvHeads * GqaSubGroups(numHeads, numKvHeads);
-        int numSplits = gqa2 ? ComputeGqa2Splits(seqKv - kvStart, gqaUnits)
+        int numSplits = gqa2 ? ComputeGqa2Splits(seqKv - kvStart, gqaUnits, Gqa2TargetWorkgroups)
             : gqa ? ComputeGqaSplits(seqKv - kvStart, gqaUnits) : ComputeSplits(seqKv - kvStart, numHeads);
 
         EnsureScratch(numHeads);
