@@ -284,7 +284,9 @@ public sealed unsafe class CudaDenseDecodeDepthModelTests
         using var _g = gguf;
         var prompt = Enumerable.Repeat(prompt0, 4).SelectMany(x => x).Take(100).ToArray();
         const int steps = 200;   // seqKv 101 .. 300
-        using var v2 = StaticToggle.DenseV2(true, 128);
+        // v2 from 160 rows, so the scalar -> cooperative-v2 switch happens inside the step graph for every KV type (f16 enters
+        // it at the 128-row cap). kvSplit growth alone (1 -> 2 at 129) is absorbed by cuGraphExecUpdate (measured, framework).
+        using var v2 = StaticToggle.DenseV2(true, 160);
         using var cap = StaticToggle.GraphMaxDepth(128);
         Run eager, graphed;
         int[] fed;
