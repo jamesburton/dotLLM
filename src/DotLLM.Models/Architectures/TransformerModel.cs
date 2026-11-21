@@ -946,9 +946,10 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     /// <remarks>
     /// Every attention arm of this host goes through <see cref="AttendQuantizedKv"/>, which reads a <see cref="ITurboQuantKvCache"/> in
     /// place in code space, so the host-independent geometry check is the whole answer. MLA layers keep their own latent KV and are
-    /// refused by it (#1899); the other host classes (hybrids, recurrent, Qwen4Exp) keep the interface default (#1900).
+    /// refused by it (#1899); Gemma-3n's <c>RunGemma3nLayer</c> attends through <see cref="AttendCachedF32"/> (<c>GetKeysRef</c>), which an in-place
+    /// cache cannot serve, so it is refused here (#1892); the other host classes (hybrids, recurrent, Qwen4Exp) keep the interface default (#1900).
     /// </remarks>
-    public bool SupportsInPlaceTurboQuant(KvCacheConfig kv) => TurboQuantInPlaceSupport.Eligible(kv, Config);
+    public bool SupportsInPlaceTurboQuant(KvCacheConfig kv) => Config.Gemma3n is null && TurboQuantInPlaceSupport.Eligible(kv, Config);
 
     /// <summary>
     /// Causal attention of <paramref name="seqQ"/> queries over the F32 rows cached for <paramref name="cacheLayer"/>,
@@ -2905,8 +2906,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                     int donorLayer = Config.SharedKvDonorLayer(layer);
                     if (kvCache is not null)
                     {
-                        AttendCachedF32(q, kvCache, donorLayer, attnOut, seqLen, positions[0],
-                            numHeads, numKvHeadsLayer, headDimLayer, attnScale, layerSlidingWindow, softCap: attnSoftcap);
+                        AttendGemma3nCached(q, kvCache, donorLayer, attnOut, seqLen, positions[0], numHeads, numKvHeadsLayer,
+                            headDimLayer, qStrideLayer, attnScale, layerSlidingWindow, attnSoftcap);
                     }
                     else
                     {
@@ -2926,8 +2927,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                     var kRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)k);
                     var vRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)v);
                     kvCache.Update(kRef, vRef, positions, layer);
-                    AttendCachedF32(q, kvCache, layer, attnOut, seqLen, positions[0],
-                        numHeads, numKvHeadsLayer, headDimLayer, attnScale, layerSlidingWindow, softCap: attnSoftcap);
+                    AttendGemma3nCached(q, kvCache, layer, attnOut, seqLen, positions[0], numHeads, numKvHeadsLayer,
+                        headDimLayer, qStrideLayer, attnScale, layerSlidingWindow, attnSoftcap);
                 }
                 else
                 {
@@ -4190,6 +4191,28 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     }
 
     /// <summary>
+    /// Gemma-3n's cached attention: a quantized cache (q8_0/q4_0) goes through the quantized kernel (Q prescaled to the kernel's fixed
+    /// <c>1/sqrt(headDim)</c>), anything else through <see cref="AttendCachedF32"/>. Until #1892's review this arm called
+    /// <see cref="AttendCachedF32"/> for every cache, whose <c>GetKeysRef</c> is empty on a <c>QuantizedKvCache</c>.
+    /// TurboQuant stays refused for Gemma-3n at the capability check (not validated on this arm).
+    /// </summary>
+    private void AttendGemma3nCached(float* q, IKvCache kvCache, int cacheLayer, float* output, int seqLen, int positionOffset,
+        int numHeads, int numKvHeads, int headDim, int qStride, float scale, int? slidingWindow, float softCap)
+    {
+        if (kvCache is IQuantizedKvCache qkv)
+        {
+            PrescaleQForKernelDefault(q, seqLen * qStride, scale, headDim);
+            AttendQuantizedKv(q, qkv, cacheLayer, output, seqLen, kvCache.CurrentLength, numHeads, numKvHeads, headDim, positionOffset,
+                _threadPool, slidingWindow, softCap);
+        }
+        else
+        {
+            AttendCachedF32(q, kvCache, cacheLayer, output, seqLen, positionOffset, numHeads, numKvHeads, headDim, scale, slidingWindow,
+                softCap);
+        }
+    }
+
+    /// <summary>
     /// Attention over a quantized KV cache. A TurboQuant cache (<see cref="ITurboQuantKvCache"/>) is read in place in rotated code
     /// space: the query is rotated before and the output rotated back after (#1892). Every other quantized cache keeps the plain
     /// kernel; the plain kernel refuses a TurboQuant cache, so no host can reach it without the rotations.
@@ -5016,7 +5039,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     public void Dispose()
     {
         // Free the TurboQuant decode-tile buffers of the pool workers (and this thread) deterministically (#1892).
-        DotLLM.Cpu.Kernels.Attention.TrimTurboQuantTileBuffers(_threadPool);
+        // A pool this model does not own may already be disposed (a broadcast dispatch on it would throw from Dispose): trim only this thread then.
+        DotLLM.Cpu.Kernels.Attention.TrimTurboQuantTileBuffers(_ownsThreadPool ? _threadPool : null);
         if (_ownsThreadPool)
             _threadPool?.Dispose();
         _state.Dispose();

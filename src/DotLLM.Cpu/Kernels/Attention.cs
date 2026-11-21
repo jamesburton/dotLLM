@@ -1984,8 +1984,9 @@ public static class Attention
     [ThreadStatic] private static TqTileBuffers? t_tqTiles;
 
     /// <summary>
-    /// Frees the TurboQuant decode-tile buffers of the calling thread and, when <paramref name="pool"/> is given, of every pool worker
-    /// (a broadcast dispatch). Idempotent; buffers are re-grown on the next blocked call. Call it from the owner of a pool when the
+    /// Frees the TurboQuant decode-tile buffers of the calling thread and, when <paramref name="pool"/> is given, of the workers its
+    /// dispatch reaches (the active ones: in decode spin mode a prefill-only worker keeps its ring, at most 512 KiB, until that thread
+    /// exits and the holder's finalizer runs). Idempotent; buffers are re-grown on the next blocked call. Call it from the owner of a pool when the
     /// model is disposed, before the pool is.
     /// </summary>
     public static unsafe void TrimTurboQuantTileBuffers(ComputeThreadPool? pool)
