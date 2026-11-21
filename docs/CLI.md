@@ -924,6 +924,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 |---|---|---|
 | `DOTLLM_AMAX_PROBE` | True when DOTLLM_AMAX_PROBE names an output file. | `ActivationRangeProbe.cs` |
 | `DOTLLM_CPU_ATTN_BLOCKED` | Environment variable: 0 disables ExecuteBlockedCausal (the head-parallel per-row path runs instead; A/B). | `Attention.cs` |
+| `DOTLLM_CPU_ATTN_PACK` | Environment variable: 0 makes BlockedCausalItem read K/V slices in place instead of from a dense packed tile (#1927 A/B; the output is bit-identical either way). | `Attention.cs` |
 | `DOTLLM_CPU_BF16_512` | BF16 weight GEMV/GEMM by shift-widening (#1118). BF16 is the top half of an F32, so bf16 &lt;&lt; 16 is the exact F32 value: every tier widens 4/8/16 weights in registers (vpmovzxwd + vpslld) and multiplies into F32 accumulator... | `MatMul.Bf16.cs` |
 | `DOTLLM_CPU_BF16_KERNEL` | BF16 weight GEMV/GEMM by shift-widening (#1118). BF16 is the top half of an F32, so bf16 &lt;&lt; 16 is the exact F32 value: every tier widens 4/8/16 weights in registers (vpmovzxwd + vpslld) and multiplies into F32 accumulator... | `MatMul.Bf16.cs` |
 | `DOTLLM_CPU_BF16_SCRATCH` | A/B switch between the two bit-identical AVX2/FMA GEMM forms: the register tile (default) and the F16-style four-row F32 scratch (DOTLLM_CPU_BF16_SCRATCH=1). Settable for in-process A/B. | `MatMul.Bf16.cs` |
@@ -1125,6 +1126,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_VK_IQ2_XXS_GEMM_LEGACY` | Environment variable that disables this kernel so callers fall back to the F16 or scalar IQ2_XXS GEMM (A/B). | `MatMulIq2XxsGemmCoopmatKernel.cs` |
 | `DOTLLM_VK_IQ4_XS_GEMM_LEGACY` | Environment variable that disables this kernel so the tiled F32 GEMM is used (A/B). | `MatMulIq4XsGemmCoopmatKernel.cs` |
 | `DOTLLM_VK_KEEP_HOST_SHARED` | #890: the shared-expert gate/up/down F32 host copies (LoadMoe.SharedF32) existed only to be uploaded as F16; every copy is drained above. They are ~3.3 GiB of private memory on the real UD-Q4_K_XL file, and the OS caps a proces... | `VulkanQwen4ExpTransformerModel.Loading.cs` |
+| `DOTLLM_VK_KV_INPLACE` | Environment variable: 0 disables in-place block KV (#1884) so q8_0 / q4_0 KV runs on the dequant-scratch cache (A/B only). | `VulkanTransformerModel.cs` |
 | `DOTLLM_VK_LFM2_HOST_PROFILE` | Host-side split of a decode forward (DOTLLM_VK_LFM2_HOST_PROFILE=1): command recording, submit + GPU wait, logits download; printed per 32 tokens. | `VulkanLfm2MoeTransformerModel.cs` |
 | `DOTLLM_VK_LFM2_Q8_GATEUP_MMVQ` | The layer-less host sizes its MoE scratch from config.Moe; LFM3 has none, so hand it a one-expert placeholder it never uses. | `VulkanLfm2MoeTransformerModel.cs` |
 | `DOTLLM_VK_LFM2_STAGE_PROFILE` | GPU-timestamp stage profile (DOTLLM_VK_LFM2_STAGE_PROFILE=ts): one BOTTOM_OF_PIPE stamp per stage in the real submission structure; per-forward breakdown on stderr (decode: averaged over 32 forwards). | `VulkanLfm2MoeTransformerModel.cs` |
