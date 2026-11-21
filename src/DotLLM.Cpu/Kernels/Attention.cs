@@ -561,7 +561,9 @@ public static class Attention
     /// Causal GQA prefill attention blocked as <c>(KV head) x (query-row block) x (key tile)</c> (issue #1570). A work item is one KV
     /// head and <see cref="BlockedRowsPerItem"/> consecutive query tokens: all <c>groupSize</c> query heads of those tokens walk the
     /// same key tiles, so one K/V tile (hd128: 2 x 128 KiB at the 256-key tile) is read from L2 by every row of the item instead of
-    /// being streamed from memory once per (head, row) as the per-row kernel does over a 32K history.
+    /// being streamed from memory once per (head, row) as the per-row kernel does over a 32K history. Each tile's K and V slices of the
+    /// item's KV head are first copied into dense per-worker buffers (#1927): read in place they sit one KV row apart (4 KiB at
+    /// 8 x hd128), so a tile maps onto a few L1 sets and every dot refetches from L2. The copy changes no value or order.
     /// <para>
     /// The arithmetic of every row is exactly that of the per-row kernel: rows whose visible length fits the one-shot bound take
     /// <see cref="OneShotRow"/>; longer rows run <see cref="TiledRow"/>'s online softmax with the same tile size, the same tiles
@@ -604,6 +606,17 @@ public static class Attention
         int G = ctx.GroupSize;
         if (G > 64) throw new NotSupportedException("Blocked attention supports at most 64 query heads per KV head.");
 
+        // Dense per-worker copies of one key tile's K and V slices for the item's KV head (#1927): bounded by TileSize x headDim.
+        Span<float> kPack = default, vPack = default;
+        if (BlockedPackEnabled)
+        {
+            int packFloats = ctx.TileSize * ctx.HeadDim;
+            KvTileBuffers tiles = t_kvTiles ??= new KvTileBuffers();
+            tiles.Ensure(packFloats);
+            kPack = new Span<float>(tiles.K, packFloats);
+            vPack = new Span<float>(tiles.V, packFloats);
+        }
+
         while (true)
         {
             int item = Interlocked.Increment(ref ctx.Next) - 1;
@@ -613,15 +626,39 @@ public static class Attention
             int block = ctx.ItemsPerKvHead - 1 - item / ctx.NumKvHeads;
             int t0 = block * ctx.RowsPerItem;
             int t1 = Math.Min(ctx.SeqQ, t0 + ctx.RowsPerItem);
-            BlockedCausalItem(ref ctx, qSpan, kSpan, vSpan, outSpan, scratch, maxSoFar, sumExp, kvHead, t0, t1);
+            BlockedCausalItem(ref ctx, qSpan, kSpan, vSpan, outSpan, scratch, maxSoFar, sumExp, kPack, vPack, kvHead, t0, t1);
         }
+    }
+
+    /// <summary>
+    /// Environment variable: <c>0</c> makes <see cref="BlockedCausalItem"/> read K/V slices in place instead of from a dense packed
+    /// tile (#1927 A/B; the output is bit-identical either way).
+    /// </summary>
+    public const string BlockedPackEnvVar = "DOTLLM_CPU_ATTN_PACK";
+
+    /// <summary>Runtime switch (tests, in-process A/B); initialised from <see cref="BlockedPackEnvVar"/>.</summary>
+    internal static bool BlockedPackEnabled = Environment.GetEnvironmentVariable(BlockedPackEnvVar) != "0";
+
+    /// <summary>
+    /// Copies keys <c>[tileBase, tileBase + tileLen)</c> of KV head <paramref name="kvHead"/> from the strided cache layout
+    /// <c>[key][kvHead][dim]</c> into <paramref name="dst"/> as dense rows of <paramref name="hd"/> floats. On a GQA model the source
+    /// rows sit one full KV row apart (4 KiB on Qwen3-4B), so a 256-key tile maps onto a handful of L1 sets; the dense copy is
+    /// contiguous and stays cache-resident for every query row of the item.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void PackKvTile(ReadOnlySpan<float> src, Span<float> dst, int tileBase, int tileLen, int kvStride, int kvHead, int hd)
+    {
+        int off = tileBase * kvStride + kvHead * hd;
+        for (int j = 0; j < tileLen; j++, off += kvStride)
+            src.Slice(off, hd).CopyTo(dst.Slice(j * hd, hd));
     }
 
     /// <summary>One work item: KV head <paramref name="kvHead"/>, query tokens <c>[t0, t1)</c>, all of its query heads.</summary>
     private static void BlockedCausalItem(ref BlockedCausalCtx ctx, ReadOnlySpan<float> q, ReadOnlySpan<float> k, ReadOnlySpan<float> v,
                                           Span<float> output, Span<float> scratch, Span<float> maxSoFar, Span<float> sumExp,
-                                          int kvHead, int t0, int t1)
+                                          Span<float> kPack, Span<float> vPack, int kvHead, int t0, int t1)
     {
+        bool packed = !kPack.IsEmpty;
         int G = ctx.GroupSize, hd = ctx.HeadDim, qStride = ctx.QStride, kvStride = ctx.KvStride, tileSize = ctx.TileSize;
         float scale = ctx.Scale;
         int firstHead = kvHead * G;
@@ -657,8 +694,24 @@ public static class Attention
         // Key tiles anchored at 0 (= every causal row's visible start), the per-row kernel's tile grid.
         int blockEnd = Math.Min(ctx.SeqKv, ctx.PositionOffset + t1);
         var tileScores = scratch.Slice(0, tileSize);
+        // With packing, K/V slices are read from dense copies: row j of the tile at j * hd (stride hd, offset 0); else in place.
+        ReadOnlySpan<float> kTile = packed ? kPack : k, vTile = packed ? vPack : v;
+        int tileStride = packed ? hd : kvStride, headOff = packed ? 0 : kvHead * hd;
         for (int tileBase = 0; tileBase < blockEnd; tileBase += tileSize)
         {
+            int keyBase = 0;
+            if (packed)
+            {
+                // Every row of the item needs at most the keys below blockEnd; pack them once for all (token, head) rows.
+                int packLen = Math.Min(tileSize, blockEnd - tileBase);
+                PackKvTile(k, kPack, tileBase, packLen, kvStride, kvHead, hd);
+                PackKvTile(v, vPack, tileBase, packLen, kvStride, kvHead, hd);
+            }
+            else
+            {
+                keyBase = tileBase;
+            }
+
             for (int r = 0; r < rows; r++)
             {
                 int t = tiledFrom + r / G, h = firstHead + r % G;
@@ -672,7 +725,7 @@ public static class Attention
 
                 for (int j = 0; j < tileLen; j++)
                 {
-                    var kRow = k.Slice((tileBase + j) * kvStride + kvHead * hd, hd);
+                    var kRow = kTile.Slice((keyBase + j) * tileStride + headOff, hd);
                     // TiledRow subtracts `0f * (qPos - key)` here (ALiBi slope 0): x - (+0.0) is x for every x, so dropping it is exact.
                     scores[j] = TensorPrimitives.Dot(qRow, kRow) * scale;
                 }
@@ -691,7 +744,7 @@ public static class Attention
                 {
                     float w = scores[j];
                     if (w == 0f) continue;
-                    var vRow = v.Slice((tileBase + j) * kvStride + kvHead * hd, hd);
+                    var vRow = vTile.Slice((keyBase + j) * tileStride + headOff, hd);
                     TensorPrimitives.MultiplyAdd(vRow, w, outRow, outRow);
                 }
                 maxSoFar[r] = newMax;
@@ -1729,7 +1782,7 @@ public static class Attention
         if (blockedTq)
         {
 
-            TqTileBuffers tiles = t_tqTiles ??= new TqTileBuffers();
+            KvTileBuffers tiles = t_kvTiles ??= new KvTileBuffers();
             tiles.Ensure(TqRingRows(in ctx) * ctx.HeadDim);
             if (TqTileBufferObserver is { } tileObserver) tileObserver.Value = 2L * TqRingRows(in ctx) * ctx.HeadDim * sizeof(float);
         }
@@ -1949,13 +2002,15 @@ public static class Attention
     private static int TqRingRows(in TiledKvCtx ctx) => ctx.SlidingWindowSize > 0 ? 2 * ctx.TileSize : ctx.TileSize;
 
     /// <summary>
-    /// Per-thread decoded K/V tile ring (native, 64-byte aligned, grown on demand). Deliberate, bounded exception to the "wrap all
+    /// Per-thread dense K/V tile buffers (native, 64-byte aligned, grown on demand): the decoded tile ring of the blocked TurboQuant
+    /// prefill and the packed F32 tile of <see cref="BlockedCausalItem"/> (#1927). A worker runs one kernel at a time, so the two
+    /// share one holder. Deliberate, bounded exception to the "wrap all
     /// unmanaged memory in a deterministically disposed owner" rule (#1892): the ring is one worker thread's scratch, at most
     /// <c>4 * TileSize * headDim * 4</c> bytes (512 KiB at hd 128, with a sliding window), never scales with the cached length, and is
     /// reused across layers and calls so the hot path allocates nothing. It is freed by this holder's finalizer when the thread exits;
     /// <see cref="TrimTurboQuantTileBuffers(ComputeThreadPool?)"/> frees it deterministically (the model calls it on dispose).
     /// </summary>
-    private sealed unsafe class TqTileBuffers
+    private sealed unsafe class KvTileBuffers
     {
         public float* K;
         public float* V;
@@ -1978,10 +2033,10 @@ public static class Attention
             Floats = 0;
         }
 
-        ~TqTileBuffers() => Free();
+        ~KvTileBuffers() => Free();
     }
 
-    [ThreadStatic] private static TqTileBuffers? t_tqTiles;
+    [ThreadStatic] private static KvTileBuffers? t_kvTiles;
 
     /// <summary>
     /// Frees the TurboQuant decode-tile buffers of the calling thread and, when <paramref name="pool"/> is given, of every pool worker
@@ -1994,7 +2049,7 @@ public static class Attention
         pool.Dispatch(0, &TrimTileBuffersWorker);
     }
 
-    private static void TrimTileBuffersWorker(nint _, int __, int ___) => t_tqTiles?.Free();
+    private static void TrimTileBuffersWorker(nint _, int __, int ___) => t_kvTiles?.Free();
 
     /// <summary>
     /// Flash-style multi-row path for an in-place TurboQuant cache: key tiles outer, query rows inner. Each K/V tile is decoded ONCE
@@ -2013,7 +2068,7 @@ public static class Attention
         int kvHeadIdx = firstHead / ctx.GroupSize;
         int window = ctx.SlidingWindowSize;
         float softCap = ctx.SoftCap;
-        TqTileBuffers tiles = t_tqTiles!;
+        KvTileBuffers tiles = t_kvTiles!;
         float* kRing = tiles.K;
         float* vRing = tiles.V;
 
