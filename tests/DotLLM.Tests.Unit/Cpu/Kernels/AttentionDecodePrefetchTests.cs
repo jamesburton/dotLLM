@@ -34,16 +34,18 @@ public sealed unsafe class AttentionDecodePrefetchTests
             Attention.RowPrefetchEnabled = false;
             Attention.Execute(q, k, v, expected, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1);
 
-            using var pool = new ComputeThreadPool(7);
+            // Thread-count independence: the head partition changes, the per-head arithmetic must not.
+            foreach (int threads in new[] { 2, 7, 14, 16 })   // 1 thread is the reference above
             foreach (bool prefetch in new[] { true, false })
             {
+                using var pool = new ComputeThreadPool(threads);
                 Attention.RowPrefetchEnabled = prefetch;
                 float[] got = new float[q.Length];
                 fixed (float* qp = q, kp = k, vp = v, op = got)
                     Attention.Execute(qp, kp, vp, op, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1, pool);
                 for (int i = 0; i < q.Length; i++)
                     Assert.True(BitConverter.SingleToInt32Bits(expected[i]) == BitConverter.SingleToInt32Bits(got[i]),
-                        $"prefetch={prefetch}: output {i} differs ({expected[i]} vs {got[i]})");
+                        $"threads={threads} prefetch={prefetch}: output {i} differs ({expected[i]} vs {got[i]})");
             }
         }
         finally { Attention.RowPrefetchEnabled = saved; }
