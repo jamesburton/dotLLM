@@ -607,6 +607,8 @@ public static class Attention
         if (G > 64) throw new NotSupportedException("Blocked attention supports at most 64 query heads per KV head.");
 
         // Dense per-worker copies of one key tile's K and V slices for the item's KV head (#1927): bounded by TileSize x headDim.
+        // F32 storage approval (rule 1): James 2026-11-21, bounded F32 tile pack; follows cache dtype under #1107 (256 KiB per worker
+        // at hd128, context-independent, bit-identical). When the CPU cache moves to F16 (#1107) this pack becomes the F16 -> F32 tile load.
         Span<float> kPack = default, vPack = default;
         if (BlockedPackEnabled)
         {
