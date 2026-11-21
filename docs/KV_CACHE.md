@@ -865,7 +865,8 @@ On each new token write, the oldest window entry is quantized and appended to th
     q8_0 / q4_0: an f16 + block mix is refused when the cache is created (it failed at the first KV write before).
   - `attention_flash_mma_prefill_kvq` (`native/kernels/attention_flash_mma_prefill_kvq.cu`, Ampere+): tensor-core causal prefill,
     head_dim 64 / 128, F16 output. Each raw head row is staged in shared memory with 8-byte (hd128) / 4-byte (hd64) `cp.async`
-    copies issued one tile ahead and decoded in place (#1923; before, each thread `__ldg`-decoded its chunk synchronously). Its F16
+    copies issued one tile ahead and decoded in place with packed-half2 math (#1923, bit-identical; before, each thread
+    `__ldg`-decoded its chunk synchronously: 1.13x q8_0 / 1.15x q4_0 at 31K keys on the RTX 3060). Its F16
     entry serves the dense F16 cache's prefills since #1923 (`DOTLLM_CUDA_F16_FLASH_PREFILL=0` opts out). Cold prefill and the #1847
     prefix-reuse suffix prefill (`position_offset > 0`) share it, so q8_0 no longer goes through G3 over a dequantized scratch
     (#1846's suspect path is gone for q8_0). `DOTLLM_CUDA_KVQ_FLASH_PREFILL=0` forces the scalar kernel.
