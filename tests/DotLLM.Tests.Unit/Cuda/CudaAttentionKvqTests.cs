@@ -158,6 +158,36 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
             $"{HalfToFloat(quant[worstAt])} vs {HalfToFloat(scalar[worstAt])}");
     }
 
+    /// <summary>
+    /// #1923: the staged packed-half2 decoders against the F16 entry over the eager dequant, with a third of the blocks scaled so
+    /// small that their F16 scale d is subnormal. Bit identity holds only if mul.rn.f16x2 rounds a subnormal product as
+    /// __float2half(d * (float)q) does; the regular FlashCases never produce a subnormal d.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(KvCacheDType.Q8_0, KvCacheDType.Q8_0, 128, 16, 4, 33, 291)]
+    [InlineData(KvCacheDType.Q4_0, KvCacheDType.Q4_0, 128, 12, 3, 40, 57)]
+    [InlineData(KvCacheDType.Q8_0, KvCacheDType.Q4_0, 64, 6, 2, 17, 30)]
+    public void FlashPrefillKvq_SubnormalBlockScales_MatchItsF16EntryBitForBit(KvCacheDType kFmt, KvCacheDType vFmt, int headDim,
+        int numHeads, int numKvHeads, int seqQ, int offset)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null, "PTX kernels not available");
+        Skip.IfNot(_kernels!.HasAttentionFlashPrefillKvq(headDim, kFmt, vFmt) && _kernels.HasAttentionFlashPrefillKvq(headDim, null, null),
+            "flash prefill kvq kernel not loaded (needs Ampere+)");
+        int seqKv = offset + seqQ;
+        using var f = new Fixture(this, kFmt, vFmt, headDim, numHeads, numKvHeads, seqQ, seqKv, seqKv, window: 0, sinks: false,
+            tinyBlocks: true);
+        _kernels.LaunchAttentionFlashPrefillKvq(f.Q, f.KScratch, f.VScratch, null, null, f.OutRef,
+            seqQ, seqKv, numHeads, numKvHeads, headDim, offset, _stream!.Handle);
+        _kernels.LaunchAttentionFlashPrefillKvq(f.Q, f.KQuant, f.VQuant, kFmt, vFmt, f.OutNew,
+            seqQ, seqKv, numHeads, numKvHeads, headDim, offset, _stream.Handle);
+        _stream.Synchronize();
+        ushort[] f16 = f.Read(f.OutRef), quant = f.Read(f.OutNew);
+        AssertFinite(quant);
+        int diff = FirstDiff(f16, quant);
+        Assert.True(diff < 0, $"quantized flash entry differs from the F16 entry at element {diff} with subnormal block scales");
+    }
+
     public static IEnumerable<object[]> F16FlashCases() =>
     [
         // headDim, numHeads, numKvHeads, seqQ, offset  (seqKv = offset + seqQ, never a multiple of 16)
@@ -292,12 +322,12 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
         private readonly int _outElems;
 
         public Fixture(CudaAttentionKvqTests t, KvCacheDType kFmt, KvCacheDType vFmt, int headDim, int numHeads, int numKvHeads,
-            int seqQ, int seqKv, int quantLen, int window, bool sinks)
+            int seqQ, int seqKv, int quantLen, int window, bool sinks, bool tinyBlocks = false)
         {
             int stride = numKvHeads * headDim;
             var rng = new Random(1850 + headDim + seqKv + quantLen);
             // True K/V history, block-varying amplitude; and "wrong" rows for regions that must not be read.
-            float[] k = Rows(rng, seqKv, stride, 1.0f), v = Rows(rng, seqKv, stride, 0.8f);
+            float[] k = Rows(rng, seqKv, stride, 1.0f, tinyBlocks), v = Rows(rng, seqKv, stride, 0.8f, tinyBlocks);
             float[] kWrong = Rows(rng, seqKv, stride, 2.5f), vWrong = Rows(rng, seqKv, stride, 2.0f);
 
             var q = new ushort[seqQ * numHeads * headDim];
@@ -370,13 +400,15 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
             foreach (nint p in _allocs) CudaDriverApi.cuMemFree_v2(p);
         }
 
-        private static float[] Rows(Random rng, int rows, int stride, float scale)
+        // tinyBlocks: every third 32-block has amplitude 2e-4, so its Q8_0 / Q4_0 scale d is an F16 subnormal (< 6.1e-5): the regime
+        // where the packed-half2 decoder's mul.rn.f16x2 must still equal __float2half(d * (float)q) (#1923).
+        private static float[] Rows(Random rng, int rows, int stride, float scale, bool tinyBlocks = false)
         {
             var a = new float[rows * stride];
             for (int r = 0; r < rows; r++)
                 for (int i = 0; i < stride; i++)
                 {
-                    float amp = scale * (0.25f + 0.5f * ((r * 7 + i / 32) % 5));
+                    float amp = tinyBlocks && (r + i / 32) % 3 == 0 ? 2e-4f : scale * (0.25f + 0.5f * ((r * 7 + i / 32) % 5));
                     a[r * stride + i] = (float)(rng.NextDouble() * 2 - 1) * amp;
                 }
             return a;
