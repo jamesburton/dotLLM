@@ -621,6 +621,26 @@ Decision: **F16, chosen by controller ruling** (`TurboQuantLayout.DefaultNorm`).
 The 10% line at 8 bits cannot be resolved with this instrument (null control +3% to +20%), and F16 is not separable from that control; it has 8x less error than BF16.
 Follow-up: re-check F16 vs BF16 with a deterministic attention-output metric (per-layer relative error on captured K/V) instead of chaotic KL.
 
+### E18 - CPU split-KV decode partials, F16 vs F32 (#1927 E2c; James 2026-11-21: F16 partials, F32 max/sum, F32 control)
+
+Qwen3-4B Q4_K_M (32/8 heads, hd128), F32 `SimpleKvCache`, prefill 7,600 tokens once, then 768 teacher-forced decode steps per
+arm on the same cache (rolled back between arms), wikitext-2 LF corpus. Reference = the per-head tiled online-softmax decode
+(`DOTLLM_CPU_ATTN_SPLITKV=0`). Partials: 256-key ranges; per (range, head) the normalised output (F16 or F32) plus max and sum
+(F32 scalars, 8 B). `tools/tq-gate --mode splitkv`.
+
+| arm | KL mean | KL p99 | KL max | PPL (ref 9.4136) | top-1 | decode tok/s, 3 interleaved rounds |
+|---|---|---|---|---|---|---|
+| ref (tiled) | - | - | - | 9.4136 | - | 8.48 [8.48-8.49] |
+| split-KV, F16 partials | 2.58e-3 | 1.60e-2 | 4.75e-2 | 9.3614 (-0.55%) | 97.0% | 16.89 [16.72-17.09] |
+| split-KV, F32 partials | 2.58e-3 | 1.55e-2 | 7.98e-2 | 9.4442 (+0.33%) | 96.9% | 17.05 [16.84-17.10] |
+
+Kernel level (unit test, same shapes): |d| vs the tiled reference 1.6-2.2e-7 (F32 partials) and 2.7-8.0e-5 (F16 partials).
+Reading: the F16 and F32 arms are indistinguishable at model level (KL means equal to 3 digits, PPL deltas of opposite sign),
+so F16 storage adds nothing measurable; the residual divergence is the change of reduction order itself (2e-7 at the kernel,
+digitised by the Q8_K activation quantization downstream) and the PPL instrument cannot resolve below about +-0.5% at 768
+steps. Decision: **F16 partials, default on** (passes the +0.30% PPL bar). Bytes: ceil(visible/256) x heads x (2 hd + 8):
+248 KiB at 7.6K (240 KiB F16 outputs + 7.5 KiB F32 max/sum), 1.03 MiB at 32K, per dispatching thread.
+
 ## 6. Decision table: CLAUDE.md rule → evidence
 
 | CLAUDE.md rule (Precision & Expansion) | evidence | verdict |
@@ -632,7 +652,7 @@ Follow-up: re-check F16 vs BF16 with a deterministic attention-output metric (pe
 | 1. … recurrent-state updates, split-reduction combines | not measured | open → #1144 |
 | 1. Compute-bound GEMM: F16 accumulation where faster and KL-parity passes; promote every 64–256 for long K | RTX 3060: plain F16-acc 1.11–1.20× faster but fails on Bonsai (median 1.16e-4, 0.6% top-1 flips, grows 3.7× with K); **promote every 256: 6.3e-6** (E2). **Strix: F16-acc is not faster (1.00–1.01×)** and fails (1.6e-3, 65.8% of rows > 1e-3; Q4_0 max 0.106) (E11, E12). Arc: no F16 path is faster (0.60–0.68×) | **3060: yes, with promotion** (fused, #1132). **Strix, Arc: no** — F32 accumulation |
 | 1. Integer dot products accumulate int32 | CPU W8A8/W4A8 KL 1–2e-4 at per-32 scales (E4); CUDA W2A8 5.1e-5, better than F16-acc (E2); Vulkan MMVQ 1–3e-4 vs F32-in, 1.3–1.7× (Arc), 1.6× (Strix Q4_0); Arc MMQ prefill 34× (E12) | confirmed; per-32 activation scales preferred over per-256; Strix Q8_0 prefill is the F32-acc coopmat (#1150, E12b) |
-| 1. Stored F32 partials (split-K, split-KV) need sign-off | not measured | open → #1144 |
+| 1. Stored F32 partials (split-K, split-KV) need sign-off | CPU decode: F16 partial outputs indistinguishable from F32 at model level (E18) | **CPU: F16** (#1927); CUDA/Vulkan open → #1144 |
 | (not a rule; a kernel extra) Q hi/lo split in Vulkan GQA prefill | dropping it: KL ≤ 1.5e-7 median, 1.67× attention, 1.46× a 128k tile (E9) | turn off by default → #1148 (user sign-off) |
 | 1. Model-declared FP32 state is evidence, not exemption | engines unanimous `[lit]`; no dotLLM measurement | open → #1144 |
 | 2. Kernels read quantized blocks directly | int8 tiers beat dequant tiers on every CPU (E1); W2A8 MMQ more accurate than dequant + F16 GEMM (E2); LM head packed: 2,425 → 170 MiB, PPL +0.03% (#1099); kvq prefill without the F16 scratch (#1094) | confirmed; remaining expansions in §7 |
@@ -659,6 +679,8 @@ PRs #1103, #1122, #1125, #1126.
 | C8 | CPU | MLA KV, TurboQuant norms, MoE scatter F32 | per token | open | #1140 |
 | C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence (speculative verify: read-only scan + in-place replay of row inputs, no state copy at all, #1194) | sign-off pending | #1144 |
 | C10 | CPU | chunk store entries (`--chunk-store-write`, `chunkcache build --offline`): F32 K and V rows per layer on disk, encoded through `SimpleKvCache` into managed `float[]` per layer (`ChunkEncoder`) | L8B 256 KiB/token on disk and in the encode (one 512-token chunk: 128 MiB); Qwen3-4B 288 KiB/token | **signed-off temporary exception** (James, 2026-11-20, #1912): the format predates the writer and the chunk key carries the dtype, so a new format is a new cache line, not a migration; target F16 then q8_0 in native memory | #1913 |
+| C11 | CPU | blocked prefill attention: dense F32 K/V tile pack per worker | 256 KiB per worker at hd128, context-independent | **signed off** (James 2026-11-21, bounded F32 tile pack; follows cache dtype under #1107) | #1927 |
+| C12 | CPU | split-KV decode partials: output F16, max/sum F32 scalars | 248 KiB at 7.6K (7.5 KiB of it F32 max/sum) | **signed off** (James 2026-11-21: F16 partials, F32 running max/sum); evidence E18 | #1927 |
 | X1 | CPU | safetensors BF16 → F32 | L8B +16 GB; L1B +2.5 GB | open | #1143 (needs #1118) |
 | X2 | CPU | MLA-MoE routed experts → F32 | ≈57 GB on V2-Lite | open | #1140 |
 | X3 | CPU | MLA projections, shared / Granite-MoE experts → F32 | `Σ out·in·4` | open | #1140 |

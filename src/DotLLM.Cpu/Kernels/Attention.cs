@@ -826,7 +826,7 @@ public static class Attention
     /// rounded to F16): a token's attention output differs between decode and prefill (#530). Gated on teacher-forced KL/PPL at depth
     /// (James 2026-11-21: F16 partials, F32 running max/sum, F32-partials control arm). The result is thread-count independent: the
     /// ranges and the combine order are fixed. Partials cost <c>ceil(visible / 256) x numHeads x (2 x headDim + 8)</c> bytes
-    /// (245 KiB at 7.6K keys, 32 heads, hd128, F16), held by the calling thread and grown on demand.
+    /// (248 KiB at 7.6K keys, 32 heads, hd128, F16: 240 KiB outputs + 7.5 KiB F32 max/sum), held by the calling thread and grown on demand.
     /// </para>
     /// </summary>
     [SkipLocalsInit]
