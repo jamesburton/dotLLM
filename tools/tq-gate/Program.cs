@@ -22,6 +22,22 @@ using DotLLM.Models.Gguf;
 using DotLLM.Server;
 
 var a = ParseArgs(args);
+if (a.GetValueOrDefault("mode") == "cmpdump")
+{
+    // tool-only: compare two row dumps (raw float32, [rows, vocab]) written by `--mode parity --dump <prefix>`; no model, no GPU.
+    var fa = File.ReadAllBytes(a["a"]); var fb = File.ReadAllBytes(a["b"]);
+    int vocabDump = int.Parse(a["vocab"]); int rowsDump = fa.Length / 4 / vocabDump;
+    if (fa.Length != fb.Length) throw new InvalidOperationException("dump sizes differ");
+    var xa = new float[vocabDump]; var xb = new float[vocabDump];
+    double sumMean = 0, maxAbsAll = 0, minCosAll = 1;
+    for (int r = 0; r < rowsDump; r++)
+    {
+        Buffer.BlockCopy(fa, r * vocabDump * 4, xa, 0, vocabDump * 4); Buffer.BlockCopy(fb, r * vocabDump * 4, xb, 0, vocabDump * 4);
+        var (m, c, _) = Cmp(xa, xb); sumMean += m; if (c < minCosAll) minCosAll = c; maxAbsAll = Math.Max(maxAbsAll, MaxAbs(xa, xb));
+    }
+    Console.WriteLine($"CMPDUMP {a["a"]} vs {a["b"]}: rows {rowsDump} meanAbs {sumMean / rowsDump:E3} maxAbs {maxAbsAll:E3} minCos {minCosAll:F6}");
+    return;
+}
 string backend = a["backend"], modelPath = a["model"], mode = a["mode"], outFile = a["out"];
 int[] bitsList = a.GetValueOrDefault("bits", "4").Split(',').Select(int.Parse).ToArray();
 int ctx = int.Parse(a.GetValueOrDefault("ctx", "7600"));
@@ -313,6 +329,15 @@ void Parity(int bits)
         coses.Add(cos); sumVs += vsM; sumEff += effM; if (cos < minCos) { minCos = cos; worst = r; } if (vsM > maxMeanAbs) maxMeanAbs = vsM; if (same) agree++;
     }
     double ratio = sumVs / sumEff;
+    if (a.TryGetValue("dump", out var dumpPrefix))
+    {
+        foreach (var (suffix, rows) in new[] { ("oracle", oracle), ("inplace", inp), ("plain", plain) })
+        {
+            using var fs = File.Create($"{dumpPrefix}.{suffix}.f32");
+            foreach (int r in rowsIdx) { var bytes = new byte[rows[r].Length * 4]; Buffer.BlockCopy(rows[r], 0, bytes, 0, bytes.Length); fs.Write(bytes); }
+        }
+        Log($"DUMP wrote {dumpPrefix}.{{oracle,inplace,plain}}.f32 rows={rowsIdx.Length} vocab={vocab}");
+    }
     int firstDiv = FirstDiff(gIn.ids, gOracle.ids);
     Append(new { kind = "parity", backend, model = tag, layers = config.NumLayers, bits, steps, rows = rowsIdx.Length,
         oraclePath, oracleCached, oracleSeconds, inPath, oracleAttnDelta = oracleAttn, inPlaceAttnDelta = cs1.attn - cs0.attn, inPlaceCachesBuilt = cs1.inplaceCaches,
