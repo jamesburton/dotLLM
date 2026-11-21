@@ -4776,9 +4776,22 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// numHeads x 15^2 elements and needs no fixed charge in the context fit). Sliding-window and sink layers never reach G3 either.
     /// </summary>
     private bool F16FlashPrefillCoversModel
-        => EnableF16FlashPrefill && Core.Attention.KvGeometry.FromConfig(Config).IsUniform
-        && _kernels.HasAttentionFlashPrefillKvq(Config.HeadDim, null, null)
-        && CudaKernels.IsAttentionFlashPrefillKvqShape(Config.NumAttentionHeads, Config.NumKvHeads, Config.HeadDim);
+        => F16FlashPrefillCovers(EnableF16FlashPrefill, Core.Attention.KvGeometry.FromConfig(Config).IsUniform,
+            _kernels.HasAttentionFlashPrefillKvq(Config.HeadDim, null, null),
+            Config.NumAttentionHeads, Config.NumKvHeads, Config.HeadDim);
+
+    /// <summary>Pure form of <see cref="F16FlashPrefillCoversModel"/> (testable without a GPU).</summary>
+    internal static bool F16FlashPrefillCovers(bool enabled, bool uniformGeometry, bool kernelLoaded,
+        int numHeads, int numKvHeads, int headDim)
+        => enabled && uniformGeometry && kernelLoaded
+        && CudaKernels.IsAttentionFlashPrefillKvqShape(numHeads, numKvHeads, headDim);
+
+    /// <summary>
+    /// Whether the dense context fit charges (and keeps) a G3 score plane for <paramref name="kv"/> (#1850, #1923): only when G3 can
+    /// serve the cache (<see cref="G3ServesKvCache"/>) and the F16 flash prefill does not already take every prefill G3 would.
+    /// </summary>
+    internal static bool G3PlaneCharged(KvCacheConfig kv, bool f16FlashCoversModel)
+        => G3ServesKvCache(kv) && !f16FlashCoversModel;
 
     /// <summary>The model's kernel set (tests: which optional kernels loaded on this device).</summary>
     internal CudaKernels Kernels => _kernels;
@@ -5054,7 +5067,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         // window to it.
         // #1923: likewise when the F16 flash prefill serves every prefill of 16+ rows (G3 then only sees shorter ones, whose plane
         // is a few tens of KiB and admitted per prefill by TryReserve).
-        bool g3Serves = G3ServesKvCache(kv) && !F16FlashPrefillCoversModel;
+        bool g3Serves = G3PlaneCharged(kv, F16FlashPrefillCoversModel);
         if (!g3Serves && _g3Attention.PlaneElems > 0)
         {
             _stream.Synchronize();   // the plane may still be read by queued work

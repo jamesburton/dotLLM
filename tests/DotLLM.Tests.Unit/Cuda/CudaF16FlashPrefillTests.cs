@@ -15,19 +15,26 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Issue #1923, model level: the dense F16 KV cache's prefill on the kvq flash kernel's F16 entry, on Qwen3-4B (head_dim 128,
 /// 32/8 heads: group 4, 36 layers; the model of the llama.cpp gap measurement).
 /// <list type="bullet">
-/// <item><b>Proof of fire.</b> A chunked prefill (chunks of 1000: off the 16-row grid, so offsets land mid-tile and the last chunk is
-/// partial) launches the F16 flash entry exactly once per layer per chunk; G3's offset path and the scalar <c>attention_f16</c>
-/// prefill never run.</item>
-/// <item><b>Against the exact arm</b> (G3, G-flash and the F16 flash prefill off: <c>attention_f16</c>, F32 softmax). The chunk-end
-/// logits and teacher-forced decode steps: per-step KL median at most 1e-5 (the PRECISION.md E7 class), the worst step no worse than
-/// the G3 arm it replaces (+25%) or 1e-3, first-token logprob within 0.01 nats (top-1 agreement reported, not gated).</item>
+/// <item><b>Rows.</b> The dense CUDA forward returns the last row's logits only, so the last <see cref="Rows"/> prompt rows are
+/// produced one each: the prefix is prefilled in chunks of 1000 (off the 16-row grid, partial last chunk), then for each row r the
+/// cache is rolled back to r - 31 and the 32-row window ending at r is prefilled at its offset. Every arm takes its own kernel for
+/// every window (32 rows is G3's offset minimum, and above the flash entry's 16).</item>
+/// <item><b>Proof of fire.</b> The F16 flash entry runs exactly once per layer per forward; G3's offset path and the scalar
+/// <c>attention_f16</c> prefill never run. The G3 arm must really run G3's offset path (a reference that cannot differ proves
+/// nothing).</item>
+/// <item><b>Gate (James 2026-11-21)</b>, per-row KL against the exact arm (G3, G-flash and the F16 flash prefill off:
+/// <c>attention_f16</c>, F32 softmax) over the last 256 prompt rows: median at most 1e-5, and max at most
+/// max(1e-3, 1.25 x the G3 arm's max). A relative max bar: G3, the path this replaces, does not meet an absolute 1e-3 either
+/// (framework 2026-11-20 over 21 rows: G3 max 7.1e-3, flash 4.3e-3; both round P to F16 for a tensor-core P.V). First-token
+/// logprob within 0.01 nats; top-1 agreement reported, not gated (a near-tie may flip on a quantized model).</item>
 /// </list>
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(CudaCollection.Name)]
 public sealed class CudaF16FlashPrefillTests
 {
-    private const int Steps = 16;
+    private const int Rows = 256;
+    private const int Window = 32;
     private const int Chunk = 1000;
     private readonly ITestOutputHelper _out;
     public CudaF16FlashPrefillTests(ITestOutputHelper output) => _out = output;
@@ -77,34 +84,40 @@ public sealed class CudaF16FlashPrefillTests
     {
         using var env = Load(out var model, out int[] prompt);
         Skip.IfNot(model.Kernels.HasAttentionFlashPrefillKvq(model.Config.HeadDim, null, null), "F16 flash prefill entry not loaded");
-        // Trim so the length is off the 16-row grid and the partial last chunk still has >= 32 rows (a chunk under 16 rows would
-        // rightly skip the flash entry and break the exact launch count).
+        Skip.IfNot(CudaG3Attention.Enabled, "G3 (the relative gate's reference arm) is off on this device");
+        // Trim so the length is off the 16-row grid and the prefix's partial last chunk still has >= 32 rows (a chunk under 16 rows
+        // would rightly skip the flash entry and break the exact launch count).
         int len = prompt.Length;
-        while (len % 16 == 0 || len % Chunk < 32) len--;
+        while (len % 16 == 0 || (len - Rows - (Window - 1)) % Chunk < 32) len--;
         prompt = prompt[..len];
-        Assert.True(prompt.Length > 3 * Chunk, $"prompt {prompt.Length} must span 3+ chunks");
-        int chunks = (prompt.Length + Chunk - 1) / Chunk;
+        int prefix = prompt.Length - Rows - (Window - 1);
+        Assert.True(prefix > 3 * Chunk, $"prompt {prompt.Length} must leave a prefix of 3+ chunks");
+        int forwards = (prefix + Chunk - 1) / Chunk + Rows;
+        long layers = model.Config.NumLayers;
         var kv = new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32);   // the dense F16 CudaKvCache
 
         bool g3 = CudaG3Attention.Enabled, flash = CudaFlashAttention.Enabled, f16Flash = CudaTransformerModel.EnableF16FlashPrefill;
-        Arm exact, fresh, g3Arm;
-        long flashLaunches, offsetRuns, scalarPrefills;
+        List<float[]> exact, fresh, g3Arm;
+        long flashLaunches, offsetRuns, scalarPrefills, g3OffsetRuns, exactScalar;
         try
         {
             CudaG3Attention.Enabled = false;
             CudaFlashAttention.Enabled = false;
             CudaTransformerModel.EnableF16FlashPrefill = false;
-            exact = Run(model, kv, prompt, forced: null);
+            long e0 = CudaKernels.AttentionF16PrefillLaunches;
+            exact = Run(model, kv, prompt);
+            exactScalar = CudaKernels.AttentionF16PrefillLaunches - e0;
 
             CudaG3Attention.Enabled = g3;
             CudaFlashAttention.Enabled = flash;
-            CudaTransformerModel.EnableF16FlashPrefill = false;
-            g3Arm = Run(model, kv, prompt, forced: exact.Tokens);
+            long g0 = CudaG3Attention.OffsetRunCount;
+            g3Arm = Run(model, kv, prompt);
+            g3OffsetRuns = CudaG3Attention.OffsetRunCount - g0;
 
             CudaTransformerModel.EnableF16FlashPrefill = true;
             long f0 = CudaKernels.AttentionFlashPrefillF16Launches, o0 = CudaG3Attention.OffsetRunCount;
             long s0 = CudaKernels.AttentionF16PrefillLaunches;
-            fresh = Run(model, kv, prompt, forced: exact.Tokens);
+            fresh = Run(model, kv, prompt);
             flashLaunches = CudaKernels.AttentionFlashPrefillF16Launches - f0;
             offsetRuns = CudaG3Attention.OffsetRunCount - o0;
             scalarPrefills = CudaKernels.AttentionF16PrefillLaunches - s0;
@@ -117,55 +130,51 @@ public sealed class CudaF16FlashPrefillTests
         }
 
         double[] kl = Kl(exact, fresh), klG3 = Kl(exact, g3Arm);
-        int first = chunks - 1;   // the logits that predict the first generated token
-        double lpExact = LogProb(exact.Logits[first], exact.Tokens[0]);
-        _out.WriteLine($"prompt {prompt.Length} tokens in {chunks} chunks of {Chunk}; F16 flash launches {flashLaunches}, " +
-                       $"G3 offset runs {offsetRuns}, attention_f16 prefill launches {scalarPrefills}");
-        _out.WriteLine($"KL(exact||flash) median {Median(kl):E3} max {kl.Max():E3}; KL(exact||G3) median {Median(klG3):E3} max {klG3.Max():E3}");
-        _out.WriteLine($"first-token logprob: exact {lpExact:R}, flash {LogProb(fresh.Logits[first], exact.Tokens[0]):R}, " +
-                       $"G3 {LogProb(g3Arm.Logits[first], exact.Tokens[0]):R}");
+        int next = Argmax(exact[^1]);   // the exact arm's first generated token
+        double lpExact = LogProb(exact[^1], next), lpFresh = LogProb(fresh[^1], next);
+        int top1 = Enumerable.Range(0, Rows).Count(r => Argmax(fresh[r]) == Argmax(exact[r]));
+        int top1G3 = Enumerable.Range(0, Rows).Count(r => Argmax(g3Arm[r]) == Argmax(exact[r]));
+        _out.WriteLine($"prompt {prompt.Length} tokens: prefix {prefix} in chunks of {Chunk}, then {Rows} windows of {Window}; " +
+                       $"{forwards} forwards per arm");
+        _out.WriteLine($"F16 flash launches {flashLaunches}, G3 offset runs {offsetRuns}, attention_f16 prefill launches {scalarPrefills}; " +
+                       $"G3 arm offset runs {g3OffsetRuns}; exact arm attention_f16 prefill launches {exactScalar}");
+        _out.WriteLine($"KL(exact||flash) over the last {Rows} rows: median {Median(kl):E3} max {kl.Max():E3}; " +
+                       $"KL(exact||G3) median {Median(klG3):E3} max {klG3.Max():E3}");
+        _out.WriteLine($"first-token logprob: exact {lpExact:R}, flash {lpFresh:R}, G3 {LogProb(g3Arm[^1], next):R}; " +
+                       $"top-1 agreement flash {top1}/{Rows}, G3 {top1G3}/{Rows}");
 
-        Assert.Equal((long)model.Config.NumLayers * chunks, flashLaunches);
+        Assert.Equal(layers * forwards, flashLaunches);
         Assert.Equal(0, offsetRuns);
         Assert.Equal(0, scalarPrefills);
-        // Top-1 is reported, not gated: on a quantized model a near-tie may flip (the plan's E1 rule). KL is the gate.
-        int top1 = Enumerable.Range(0, exact.Tokens.Length).Count(s => Argmax(fresh.Logits[first + s]) == exact.Tokens[s]);
-        _out.WriteLine($"top-1 agreement with the exact arm: {top1}/{exact.Tokens.Length}");
-        Assert.True(Math.Abs(LogProb(fresh.Logits[first], exact.Tokens[0]) - lpExact) < 0.01,
-            "first-token logprob moved");
+        Assert.True(g3OffsetRuns >= layers * Rows, $"the G3 reference arm ran its offset path only {g3OffsetRuns} times");
+        Assert.True(exactScalar >= layers * forwards, $"the exact arm ran attention_f16 only {exactScalar} times");
+        Assert.True(Math.Abs(lpFresh - lpExact) < 0.01, $"first-token logprob moved {lpFresh - lpExact:R}");
+        // James 2026-11-21: relative gate, median <= 1e-5 and max <= max(1e-3, 1.25 x G3 max), over the last 256 rows.
         Assert.True(Median(kl) <= 1e-5, $"median KL(exact||flash) {Median(kl)}");
-        _out.WriteLine("per-step KL(exact||flash): " + string.Join(" ", kl.Select(x => x.ToString("E1"))));
-        _out.WriteLine("per-step KL(exact||G3):    " + string.Join(" ", klG3.Select(x => x.ToString("E1"))));
-        // The plan's absolute max bar (1e-3) is not met by the path this replaces either: on framework 2026-11-20 G3's worst step was
-        // 7.1e-3 and this kernel's 4.3e-3 (both round P to F16 for a tensor-core P.V; the exact arm keeps P in F32). So the max is
-        // gated at no worse than G3 (+25%) or 1e-3, whichever is larger; the absolute bar is an open sign-off item (#1923).
         Assert.True(kl.Max() <= Math.Max(1e-3, 1.25 * klG3.Max()), $"max KL(exact||flash) {kl.Max()} vs G3 {klG3.Max()}");
     }
 
-    /// <summary>Logits at the end of every prefill chunk, then the teacher-forced decode steps.</summary>
-    private sealed record Arm(List<float[]> Logits, int[] Tokens);
-
-    private static Arm Run(CudaTransformerModel model, KvCacheConfig kv, int[] prompt, int[]? forced)
+    /// <summary>Logits of the last <see cref="Rows"/> prompt rows, row r from the <see cref="Window"/>-row forward ending at r.</summary>
+    private static List<float[]> Run(CudaTransformerModel model, KvCacheConfig kv, int[] prompt)
     {
-        using var cache = (IKvCache)model.CreateKvCache(prompt.Length + Steps + 8, kv);
+        using var cache = (IKvCache)model.CreateKvCache(prompt.Length + 8, kv);
         Assert.IsType<CudaKvCache>(cache);
         int vocab = model.Config.VocabSize;
-        var logits = new List<float[]>();
-        var tokens = new int[Steps];
-        for (int start = 0; start < prompt.Length; start += Chunk)
+        int prefix = prompt.Length - Rows - (Window - 1);
+        for (int start = 0; start < prefix; start += Chunk)
         {
-            int n = Math.Min(Chunk, prompt.Length - start);
+            int n = Math.Min(Chunk, prefix - start);
             using ITensor t = model.Forward(prompt.AsSpan(start, n).ToArray(), Enumerable.Range(start, n).ToArray(), 0, cache);
-            logits.Add(LastRow(t, vocab));
         }
-        for (int s = 0; s < Steps; s++)
+        var logits = new List<float[]>(Rows);
+        for (int r = prompt.Length - Rows; r < prompt.Length; r++)
         {
-            tokens[s] = forced?[s] ?? Argmax(logits[^1]);
-            if (s == Steps - 1) break;
-            using ITensor t = model.Forward([tokens[s]], [prompt.Length + s], 0, cache);
+            int start = r - (Window - 1);
+            cache.Rollback(start);
+            using ITensor t = model.Forward(prompt.AsSpan(start, Window).ToArray(), Enumerable.Range(start, Window).ToArray(), 0, cache);
             logits.Add(LastRow(t, vocab));
         }
-        return new Arm(logits, tokens);
+        return logits;
     }
 
     private static unsafe float[] LastRow(ITensor t, int vocab)
@@ -194,12 +203,12 @@ public sealed class CudaF16FlashPrefillTests
         return s.Length % 2 == 1 ? s[s.Length / 2] : 0.5 * (s[s.Length / 2 - 1] + s[s.Length / 2]);
     }
 
-    private static double[] Kl(Arm p, Arm q)
+    private static double[] Kl(List<float[]> p, List<float[]> q)
     {
-        var kl = new double[p.Logits.Count];
+        var kl = new double[p.Count];
         for (int s = 0; s < kl.Length; s++)
         {
-            double[] lp = LogSoftmax(p.Logits[s]), lq = LogSoftmax(q.Logits[s]);
+            double[] lp = LogSoftmax(p[s]), lq = LogSoftmax(q[s]);
             double acc = 0;
             for (int i = 0; i < lp.Length; i++) acc += Math.Exp(lp[i]) * (lp[i] - lq[i]);
             kl[s] = acc;
