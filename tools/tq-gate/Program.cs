@@ -8,6 +8,7 @@
 // quality : KL / PPL / top-1 / greedy identity of the in-place cache against the plain KV (f16 on GPU, f32 SimpleKvCache on CPU).
 // splitkv : CPU split-KV decode attention (#1927 E2c), F16 and F32 partials vs the tiled path: teacher-forced KL / PPL at depth
 //           --ctx over --steps decode steps, then a decode speed A/B (--decode --reps).
+// splitkv-paired : the same arms per step on a shared (reference) history: per-step KL and paired dNLL with its SE.
 // Every arm records the cache type it built; GPU arms record the attention-path counters.
 // A Vulkan host holds one KV storage override, so on Vulkan give ONE --bits value per process.
 using System.Diagnostics;
@@ -70,6 +71,7 @@ switch (mode)
     case "vgpr": foreach (int b in bitsList) Vgpr(b); break;
     case "bytes": Bytes(); break;
     case "splitkv": SplitKv(); break;
+    case "splitkv-paired": SplitKvPaired(); break;
     default: throw new ArgumentException("mode");
 }
 return;
@@ -511,6 +513,75 @@ void SplitKv()
         }
     }
     finally { DotLLM.Cpu.Kernels.Attention.DecodeSplitKv = saved; }
+}
+
+// Paired per-step form of the split-KV gate (#1927): at every step all arms see the SAME history. For step i each candidate arm
+// runs token ctx+i, its row is recorded and the cache is rolled back to ctx+i; the reference runs last and its K/V is kept. So the
+// per-step KL and the paired dNLL measure one decode step's attention change, not a diverging trajectory. Negative control: when the
+// build carries the internal test hook `Attention.SplitKvBf16NegativeControl` (a temporary substitution that rounds the partials to
+// BF16, 7-bit mantissa, before the F16 store), a "bf16" arm runs too; a sensitive gate must order bf16 > f16 > f32.
+void SplitKvPaired()
+{
+    if (backend != "cpu") throw new ArgumentException("splitkv-paired is a CPU gate");
+    if (all.Length < ctx + steps + 2) throw new InvalidOperationException("corpus too short");
+    int[] t = all[..(ctx + steps + 2)];
+    using var c = Plain(ctx + steps + 8);
+    var attn = typeof(DotLLM.Cpu.Kernels.Attention);
+    var negField = attn.GetField("SplitKvBf16NegativeControl", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+    var saved = DotLLM.Cpu.Kernels.Attention.DecodeSplitKv;
+    try
+    {
+        DotLLM.Cpu.Kernels.Attention.DecodeSplitKv = DotLLM.Cpu.Kernels.DecodeSplitKvPartials.Off;
+        double pf = Prefill(c, t, ctx);
+        Log($"prefill {ctx} tokens once: {ctx / pf:F1} tok/s ({pf:F0}s); negative-control hook {(negField is null ? "ABSENT (bf16 arm skipped)" : "present")}");
+        var arms = new List<(string name, DotLLM.Cpu.Kernels.DecodeSplitKvPartials mode, bool bf16)>
+        {
+            ("f16", DotLLM.Cpu.Kernels.DecodeSplitKvPartials.F16, false),
+            ("f32", DotLLM.Cpu.Kernels.DecodeSplitKvPartials.F32, false),
+        };
+        if (negField is not null) arms.Add(("bf16", DotLLM.Cpu.Kernels.DecodeSplitKvPartials.F16, true));
+        var kl = arms.ToDictionary(x => x.name, _ => new List<double>());
+        var dn = arms.ToDictionary(x => x.name, _ => new List<double>());
+        var top1 = arms.ToDictionary(x => x.name, _ => 0);
+        double refNll = 0;
+        for (int i = 0; i < steps; i++)
+        {
+            var rows = new Dictionary<string, float[]>();
+            foreach (var (name, mode, bf16) in arms)
+            {
+                DotLLM.Cpu.Kernels.Attention.DecodeSplitKv = mode;
+                negField?.SetValue(null, bf16);
+                using (var l = model.Forward(t.AsSpan(ctx + i, 1), [ctx + i], dev, c)) rows[name] = Row(l, 0);
+                c.Rollback(ctx + i);
+            }
+            negField?.SetValue(null, false);
+            DotLLM.Cpu.Kernels.Attention.DecodeSplitKv = DotLLM.Cpu.Kernels.DecodeSplitKvPartials.Off;
+            float[] refRow;
+            using (var l = model.Forward(t.AsSpan(ctx + i, 1), [ctx + i], dev, c)) refRow = Row(l, 0);   // committed history = reference
+            double rn = -LogSoftmaxAt(refRow, t[ctx + i + 1]);
+            refNll += rn;
+            foreach (var (name, _, _) in arms)
+            {
+                kl[name].Add(Kl(refRow, rows[name]));
+                dn[name].Add(-LogSoftmaxAt(rows[name], t[ctx + i + 1]) - rn);
+                if (Cmp(refRow, rows[name]).Same) top1[name]++;
+            }
+            if ((i + 1) % 128 == 0) Log($"step {i + 1}/{steps}");
+        }
+        double pplRef = Math.Exp(refNll / steps);
+        foreach (var (name, _, _) in arms)
+        {
+            var k = kl[name].OrderBy(x => x).ToArray();
+            double mean = dn[name].Average();
+            double sd = Math.Sqrt(dn[name].Sum(x => (x - mean) * (x - mean)) / (steps - 1));
+            double se = sd / Math.Sqrt(steps);
+            Append(new { kind = "splitkv-paired", backend, model = tag, ctx, steps, arm = name, klMean = k.Average(), klMedian = Med(k), klP99 = k[(int)(0.99 * (k.Length - 1))],
+                klMax = k[^1], dNllMean = mean, dNllSe = se, pplRef, pplArm = pplRef * Math.Exp(mean), pplDeltaPct = 100 * (Math.Exp(mean) - 1), top1Agree = (double)top1[name] / steps });
+            Log($"PAIRED {name}: per-step KL mean {k.Average():E3} median {Med(k):E3} p99 {k[(int)(0.99 * (k.Length - 1))]:E3} max {k[^1]:E3}  " +
+                $"dNLL {mean:+0.000000;-0.000000} +- {se:0.000000} (SE)  PPL {100 * (Math.Exp(mean) - 1):+0.000;-0.000}% vs ref {pplRef:F4}  top1 {(double)top1[name] / steps:P2}");
+        }
+    }
+    finally { DotLLM.Cpu.Kernels.Attention.DecodeSplitKv = saved; negField?.SetValue(null, false); }
 }
 
 // ───────────────────────── bytes per token ─────────────────────────

@@ -417,6 +417,14 @@ public static class Attention
             throw new ArgumentException(
                 $"numHeads ({numHeads}) must be divisible by numKvHeads ({numKvHeads})", nameof(numKvHeads));
 
+        // Before the single-threaded fallback: decode past the one-shot bound takes the split-KV kernel at ANY thread count (with
+        // no pool it runs inline), so a token's logits do not depend on whether a pool exists (#1927 E2c).
+        if (DecodeSplitKvApplies(seqQ, seqKv, numHeads, numKvHeads, positionOffset, alibiSlopes, slidingWindowSize, softCap, maskMode, sinks))
+        {
+            ExecuteDecodeSplitKv(q, k, v, output, Math.Min(seqKv, positionOffset + 1), numHeads, numKvHeads, headDim, scale, pool);
+            return;
+        }
+
         if (pool is null || numHeads < 2)
         {
             // Fall back to span-based single-threaded path
@@ -440,11 +448,6 @@ public static class Attention
             return;
         }
 
-        if (DecodeSplitKvApplies(seqQ, seqKv, numHeads, numKvHeads, positionOffset, alibiSlopes, slidingWindowSize, softCap, maskMode, sinks))
-        {
-            ExecuteDecodeSplitKv(q, k, v, output, Math.Min(seqKv, positionOffset + 1), numHeads, numKvHeads, headDim, scale, pool);
-            return;
-        }
 
         fixed (float* sinksPtr = sinks)
         {
@@ -831,12 +834,12 @@ public static class Attention
     /// </summary>
     [SkipLocalsInit]
     internal static unsafe void ExecuteDecodeSplitKv(float* q, float* k, float* v, float* output, int visible,
-                                                    int numHeads, int numKvHeads, int headDim, float scale, ComputeThreadPool pool)
+                                                    int numHeads, int numKvHeads, int headDim, float scale, ComputeThreadPool? pool)
     {
         int ranges = (visible + SplitKvRangeKeys - 1) / SplitKvRangeKeys;
-        bool f16 = DecodeSplitKv != DecodeSplitKvPartials.F32;
+        bool f16 = DecodeSplitKv != DecodeSplitKvPartials.F32;   // read once: the buffers and the kernel use the same choice
         SplitKvPartialBuffers parts = t_splitKvParts ??= new SplitKvPartialBuffers();
-        parts.Ensure(ranges * numHeads, headDim);
+        parts.Ensure(ranges * numHeads, headDim, f16);
         var ctx = new SplitKvCtx
         {
             Q = q, K = k, V = v, Output = output, PartM = parts.M, PartS = parts.S,
@@ -845,10 +848,21 @@ public static class Attention
             Visible = visible, Ranges = ranges, Scale = scale, Next = 0,
         };
         Interlocked.Increment(ref DecodeSplitKvCount);
+        t_decodeSplitKvCalls++;
+        if (pool is null)
+        {
+            SplitKvRangeWorker((nint)(&ctx), 0, 1);
+            ctx.Next = 0;
+            SplitKvCombineWorker((nint)(&ctx), 0, 1);
+            return;
+        }
         pool.Dispatch((nint)(&ctx), &SplitKvRangeWorker);
         ctx.Next = 0;
         pool.Dispatch((nint)(&ctx), &SplitKvCombineWorker);
     }
+
+    /// <summary>Split-KV calls dispatched from the CURRENT thread (tests: immune to concurrent decodes on other threads).</summary>
+    [ThreadStatic] internal static long t_decodeSplitKvCalls;
 
     [SkipLocalsInit]
     private static unsafe void SplitKvRangeWorker(nint ctxPtr, int threadIdx, int threadCount)
@@ -963,9 +977,9 @@ public static class Attention
         public Half* O16;
         private long _slots, _o16, _o32;
 
-        public void Ensure(int slots, int headDim)
+        public void Ensure(int slots, int headDim, bool f16)
         {
-            bool f32 = DecodeSplitKv == DecodeSplitKvPartials.F32;
+            bool f32 = !f16;
             if (_slots < slots)
             {
                 if (M != null) { NativeMemory.AlignedFree(M); NativeMemory.AlignedFree(S); }

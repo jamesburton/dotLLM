@@ -48,11 +48,11 @@ public sealed unsafe class AttentionDecodeSplitKvTests
         try
         {
             Attention.DecodeSplitKv = mode;
-            using var pool = new ComputeThreadPool(threads);
-            long before = Attention.DecodeSplitKvCount;
+            using var pool = threads > 1 ? new ComputeThreadPool(threads) : null;   // 1 = no pool: the inline form
+            long before = Attention.t_decodeSplitKvCalls;
             fixed (float* qp = q, kp = k, vp = v, op = got)
                 Attention.Execute(qp, kp, vp, op, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1, pool);
-            engaged = Attention.DecodeSplitKvCount - before;
+            engaged = Attention.t_decodeSplitKvCalls - before;
         }
         finally { Attention.DecodeSplitKv = saved; }
         return got;
@@ -72,7 +72,7 @@ public sealed unsafe class AttentionDecodeSplitKvTests
         foreach (var (mode, tol) in new[] { (DecodeSplitKvPartials.F32, 1e-6f), (DecodeSplitKvPartials.F16, 3e-4f) })
         {
             float[] got = Run(q, k, v, numHeads, numKvHeads, headDim, seqKv, 7, mode, out long engaged);
-            Assert.True(engaged >= 1, "the split-KV kernel did not run");   // >=: the counter is process-wide
+            Assert.Equal(1, engaged);
             float maxAbs = 0; int worst = -1;
             for (int i = 0; i < got.Length; i++)
             {
@@ -91,7 +91,7 @@ public sealed unsafe class AttentionDecodeSplitKvTests
         const int numHeads = 32, numKvHeads = 8, headDim = 128, seqKv = 5000;
         var (q, k, v) = Fixture(numHeads, numKvHeads, headDim, seqKv);
         float[] baseline = Run(q, k, v, numHeads, numKvHeads, headDim, seqKv, 2, mode, out _);
-        foreach (int threads in new[] { 7, 14, 16 })
+        foreach (int threads in new[] { 1, 7, 14, 16 })
         {
             float[] got = Run(q, k, v, numHeads, numKvHeads, headDim, seqKv, threads, mode, out _);
             for (int i = 0; i < got.Length; i++)
@@ -111,19 +111,19 @@ public sealed unsafe class AttentionDecodeSplitKvTests
             Attention.DecodeSplitKv = DecodeSplitKvPartials.F16;
             using var pool = new ComputeThreadPool(4);
             var outA = new float[q.Length];
-            long before = Attention.DecodeSplitKvCount;
+            long before = Attention.t_decodeSplitKvCalls;
             fixed (float* qp = q, kp = k, vp = v, op = outA)
             {
                 Attention.Execute(qp, kp, vp, op, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1, pool, slidingWindowSize: 4096);
                 Attention.Execute(qp, kp, vp, op, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1, pool, softCap: 30f);
                 Attention.Execute(qp, kp, vp, op, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1, pool, sinks: new float[numHeads]);
                 Attention.Execute(qp, kp, vp, op, 1, 2048, numHeads, numKvHeads, headDim, 2047, pool);   // one-shot bound
-                Assert.Equal(before, Attention.DecodeSplitKvCount);
+                Assert.Equal(before, Attention.t_decodeSplitKvCalls);
                 Attention.Execute(qp, kp, vp, op, 1, 2049, numHeads, numKvHeads, headDim, 2048, pool);
-                Assert.Equal(before + 1, Attention.DecodeSplitKvCount);
+                Assert.Equal(before + 1, Attention.t_decodeSplitKvCalls);
                 Attention.DecodeSplitKv = DecodeSplitKvPartials.Off;
                 Attention.Execute(qp, kp, vp, op, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1, pool);
-                Assert.Equal(before + 1, Attention.DecodeSplitKvCount);
+                Assert.Equal(before + 1, Attention.t_decodeSplitKvCalls);
             }
         }
         finally { Attention.DecodeSplitKv = saved; }
