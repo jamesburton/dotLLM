@@ -156,6 +156,30 @@ public sealed class CliTurboQuantCommandTests
         Assert.Contains("--cache-window 16", output);
     }
 
+    /// <summary>
+    /// #1892 final review I5 (#1901): <c>chat</c> hard-coded "no draft model", so <c>--speculative-model</c> with tq started and ran the
+    /// draft on its own non-TurboQuant cache. The model path does not exist: only a refusal before resolution can produce this message.
+    /// Kills the mutant "ChatCommand passes hasDraftModel: false".
+    /// </summary>
+    [Fact]
+    public void Chat_Tq4_WithSpeculativeModel_IsRefusedUpFront()
+    {
+        var (code, output) = Run("chat", "no-such-model-1892", "--cache-type-k", "tq4", "--cache-type-v", "tq4",
+            "--speculative-model", "no-such-draft-1892");
+        Assert.NotEqual(0, code);
+        Assert.Contains("--speculative-model", output);
+        Assert.Contains("TurboQuant", output);
+    }
+
+    [Fact]
+    public void Run_Tq4_WithSpeculativeModel_IsRefusedUpFront()
+    {
+        var (code, output) = Run("run", "no-such-model-1892", "-p", "hi", "--cache-type-k", "tq4", "--cache-type-v", "tq4",
+            "--speculative-model", "no-such-draft-1892", "--json");
+        Assert.NotEqual(0, code);
+        Assert.Contains("--speculative-model", output);
+    }
+
     [Fact]
     public void Run_Tq4_IsNotRefusedBeforeTheModelResolves()
     {

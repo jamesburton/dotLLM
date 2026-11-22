@@ -93,13 +93,10 @@ public sealed class TurboQuantInPlaceCapabilityTests : IClassFixture<PrefixCache
     [Fact]
     public void CreateFactory_Cpu_Mse_BuildsInPlace_Qjl_BuildsTheScratchCache()
     {
-        long inPlace0 = TurboQuantKv.InPlaceCachesBuilt, scratch0 = TurboQuantKv.ScratchCachesBuilt;
         using (var c = TurboQuantKv.CreateFactory(_tiny.Model, Tq(3))(_tiny.Config, 32))
             Assert.IsType<TurboQuantInPlaceKvCache>(c);
-        Assert.True(TurboQuantKv.InPlaceCachesBuilt >= inPlace0 + 1);   // the counters are process-wide and tests run in parallel: >=, the type asserts decide
         using (var c = TurboQuantKv.CreateFactory(_tiny.Model, Tq(4, qjl: true))(_tiny.Config, 32))
             Assert.IsType<TurboQuantKvCache>(c);
-        Assert.True(TurboQuantKv.ScratchCachesBuilt >= scratch0 + 1);
     }
 
     [Fact]
@@ -181,6 +178,26 @@ public sealed class TurboQuantInPlaceCapabilityTests : IClassFixture<PrefixCache
     [InlineData(true, true, true, false, false)]   // attention_kvtq.ptx missing
     public void CudaKernelsLoaded_NeedsEveryKernel(bool encode, bool rotQ, bool rotO, bool attn, bool expected)
         => Assert.Equal(expected, CudaTransformerModel.InPlaceTurboQuantKernelsLoaded(encode, rotQ, rotO, attn));
+
+    /// <summary>
+    /// #1892 final review I1: the F32 dense forward (<c>ForwardGemmaF32</c>) accepts only a <c>CudaKvCache</c>, so a host that runs it
+    /// must not claim in-place TurboQuant (the first forward would throw mid-request). Kills the mutant "drop the _isGemmaFamily clause".
+    /// Compile-checked plus this predicate test only: the host-level wiring needs a GPU.
+    /// </summary>
+    [Theory]
+    [InlineData(false, false, false, true)]
+    [InlineData(true, false, false, false)]    // MLA keeps its own cache
+    [InlineData(false, true, false, false)]    // Gemma-4 F32 forward
+    [InlineData(false, false, true, false)]    // Gemma 1/2, Olmo2, SmolLM3, non-fold Granite
+    public void CudaHostServed_RefusesTheF32DenseFamily(bool mla, bool gemma4, bool gemmaFamily, bool expected)
+        => Assert.Equal(expected, CudaTransformerModel.InPlaceTurboQuantHostServed(mla, gemma4, gemmaFamily));
+
+    [Theory]
+    [InlineData(Architecture.Olmo2, true)]
+    [InlineData(Architecture.SmolLM3, true)]
+    [InlineData(Architecture.Llama, false)]
+    public void CudaUsesF32DenseForward_ForTheArchitecturesTheCapabilityMustRefuse(Architecture arch, bool expected)
+        => Assert.Equal(expected, CudaTransformerModel.UsesF32DenseForward(Dense() with { Architecture = arch }));
 
     // ---------------------------------------------------------------- Vulkan: the row bound and the arm completeness
 
@@ -268,7 +285,6 @@ public sealed class TurboQuantInPlaceCapabilityTests : IClassFixture<PrefixCache
     [Fact]
     public void Serve_BuildsTheInPlaceCache()
     {
-        long before = TurboQuantKv.InPlaceCachesBuilt;
         var options = new ServerOptions
         {
             Model = _tiny.GgufPath, ModelId = "tiny-1892", Device = "cpu", UsePaged = false, Warmup = WarmupOptions.Disabled,
@@ -277,6 +293,5 @@ public sealed class TurboQuantInPlaceCapabilityTests : IClassFixture<PrefixCache
         using var state = ServerStartup.LoadModel(_tiny.GgufPath, options);
         using var cache = state.KvCacheFactory!(_tiny.Config, 32);
         Assert.IsType<TurboQuantInPlaceKvCache>(cache);
-        Assert.True(TurboQuantKv.InPlaceCachesBuilt >= before + 1);
     }
 }

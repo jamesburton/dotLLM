@@ -662,6 +662,7 @@ PRs #1103, #1122, #1125, #1126.
 | C7 | CPU | MTP KV and hidden F32 | 32 MiB @4096 positions | **KV fixed** (#1141): F16 default (16 MiB), q8_0 (8.5), q4_0 (4.5) when the trunk cache is quantized; hidden stays F32 (#1144); `DOTLLM_CPU_MTP_KV=f32` reference arm | #1141 |
 | C8 | CPU | MLA KV, TurboQuant norms, MoE scatter F32 | per token | open | #1140 |
 | C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence (speculative verify: read-only scan + in-place replay of row inputs, no state copy at all, #1194) | sign-off pending | #1144 |
+| C10 | CPU | chunk store entries (`--chunk-store-write`, `chunkcache build --offline`): F32 K and V rows per layer on disk, encoded through `SimpleKvCache` into managed `float[]` per layer (`ChunkEncoder`) | L8B 256 KiB/token on disk and in the encode (one 512-token chunk: 128 MiB); Qwen3-4B 288 KiB/token | **signed-off temporary exception** (James, 2026-11-20, #1912): the format predates the writer and the chunk key carries the dtype, so a new format is a new cache line, not a migration; target F16 then q8_0 in native memory | #1913 |
 | X1 | CPU | safetensors BF16 → F32 | L8B +16 GB; L1B +2.5 GB | open | #1143 (needs #1118) |
 | X2 | CPU | MLA-MoE routed experts → F32 | ≈57 GB on V2-Lite | open | #1140 |
 | X3 | CPU | MLA projections, shared / Granite-MoE experts → F32 | `Σ out·in·4` | open | #1140 |

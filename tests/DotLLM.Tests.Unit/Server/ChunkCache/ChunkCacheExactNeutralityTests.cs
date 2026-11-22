@@ -276,7 +276,7 @@ public sealed class ChunkCacheExactNeutralityTests : IDisposable
     private Task<ChunkCacheTestServer> Start(string path, string? store = null) => path switch
     {
         "single" => ChunkCacheTestServer.StartAsync(_model, On(store), paged: false),
-        _ => ChunkCacheTestServer.StartAsync(_model, On(store), paged: true),
+        _ => ChunkCacheTestServer.StartAsync(_model, On(store), paged: true, schedulerTrie: true), // the serving default since #1596; the test server leaves the trie out unless asked
     };
 
     /// <summary>The <c>chunk_cache</c> object of a blocking body or of the event that carries it in a stream.</summary>

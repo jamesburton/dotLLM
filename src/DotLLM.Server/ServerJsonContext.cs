@@ -80,6 +80,8 @@ namespace DotLLM.Server;
 // chunk-cache control plane (docs/CHUNK_CACHE.md), mapped only with --chunk-cache.
 [JsonSerializable(typeof(ChunkCacheCapabilitiesDto))]
 [JsonSerializable(typeof(ChunkCacheExplainDto))]
+[JsonSerializable(typeof(ChunkCachePrewarmDto))]
+[JsonSerializable(typeof(ChunkCacheEvictDto))]
 [JsonSourceGenerationOptions(
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]

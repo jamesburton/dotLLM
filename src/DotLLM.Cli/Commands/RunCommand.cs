@@ -433,7 +433,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         // #1888, #1892: a TurboQuant request runs in place or is refused here (before anything loads) or after the load; never another cache.
         if (DotLLM.Cli.Helpers.KvStorageCli.TurboQuantRefusal(DotLLM.Server.KvCommand.Run,
                 settings.KvQuantK ?? settings.CacheTypeK, settings.KvQuantV ?? settings.CacheTypeV,
-                settings.CacheWindow, settings.Paged, settings.Device) is { } tqRefusal)
+                settings.CacheWindow, settings.Paged, settings.Device, hasDraftModel: !string.IsNullOrEmpty(settings.SpeculativeModel)) is { } tqRefusal)
         {
             DeviceCli.PrintError(tqRefusal, settings.Json);
             return 1;
