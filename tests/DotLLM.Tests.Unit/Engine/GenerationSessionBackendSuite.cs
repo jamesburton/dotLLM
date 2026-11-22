@@ -158,6 +158,31 @@ public abstract class GenerationSessionBackendSuite
         Assert.Equal(freshNext, (await s.GenerateUntilBoundaryAsync(new StopAfter(5))).TokenIds);
     }
 
+    /// <summary>
+    /// Path-matched exactness of an attention rollback: RollbackTo(k) re-forwards token k-1 as one decode row over rows [0, k-1) kept from
+    /// the earlier forwards, which is exactly what a fresh session does for [prefill k-1 tokens, append token k-1]. Both go through the
+    /// same kernels, so they agree to 5e-4 on every backend even where prefill-vs-decode noise (see <c>LogitTolerance</c>) is larger.
+    /// </summary>
+    [SkippableFact]
+    public async Task AttentionModel_Rollback_MatchesAPathMatchedOracle()
+    {
+        using var fx = Open(Llama);
+        using var oracle = Open(Llama);
+        await using var s = fx.NewGenerator().CreateSession(Greedy(), Tag());
+        int[] all = await Build(s, fx);
+        foreach (int k in new[] { fx.Prompt.Length + 2, fx.Prompt.Length })
+        {
+            s.RollbackTo(k);
+            await using var o = oracle.NewGenerator().CreateSession(Greedy(), Tag());
+            await o.PrefillAsync(all.Take(k - 1).ToArray());
+            await o.AppendObservationTokensAsync(new[] { all[k - 1] });
+            var a = Logits(s);
+            var b = Logits(o);
+            for (int i = 0; i < a.Length; i++)
+                Assert.True(Math.Abs(a[i] - b[i]) <= 5e-4f, $"k={k} logit {i}: rolled back {a[i]} vs path-matched oracle {b[i]}");
+        }
+    }
+
     /// <summary>A recurrent model refuses a position that is not a recorded pause, changing nothing.</summary>
     [SkippableTheory]
     [InlineData(HybridDense)]
