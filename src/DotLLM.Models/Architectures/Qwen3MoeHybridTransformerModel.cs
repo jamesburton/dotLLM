@@ -1165,7 +1165,11 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
 
         // MTP capture reads every post-final-norm row, so only a head without capture may skip the other rows (#1485).
         bool captureMtp = _mtpHead is not null && mtpState is CpuMtpState;
-        int firstNorm = lastRowOnly && !captureMtp ? seqLen - 1 : 0;
+        // PreLmHead + TapRows.All means every trunk row of the forward on every backend (#1920 M-1), even when the head projects only the
+        // last one: such a tap forces the all-row norm (only while attached).
+        bool tapAllPre = taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1)
+                         && taps.WantsAllRows(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1);
+        int firstNorm = lastRowOnly && !captureMtp && !tapAllPre ? seqLen - 1 : 0;
         int headRows = lastRowOnly ? 1 : seqLen;
         float* headIn = hidden + (long)(seqLen - headRows) * hiddenSize;
 
@@ -1180,10 +1184,11 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
         if (TensorDump.Enabled)
             TensorDump.Dump2D("result_norm", hidden, seqLen, hiddenSize);
 
-        // PreLmHead (#1920): the post-norm rows the LM head projects (the last row when the head is last-row only).
+        // PreLmHead (#1920): the post-norm rows (Last: the last row; All: every trunk row, see tapAllPre above).
+        int preRows = tapAllPre ? seqLen : headRows;
         if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1)
             && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1,
-                            hidden + (long)(seqLen - headRows) * hiddenSize, headRows, seqLen - headRows, positions, out _headAbort))
+                            hidden + (long)(seqLen - preRows) * hiddenSize, preRows, seqLen - preRows, positions, out _headAbort))
             return null;
 
         // The GEMM writes straight into the caller-owned result: no model-state logits buffer, no rows*V*4 copy (#1485).

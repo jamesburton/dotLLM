@@ -64,6 +64,10 @@ internal sealed class CpuHiddenStateTapFixture : HiddenStateTapFixture
 
     private readonly List<IModel> _extra = [];
 
+    public override float[] OutputNormWeight => ReadF32Row(_gguf, "output_norm.weight", 0, _config.HiddenSize);
+    public override float NormEps => _config.NormEpsilon;
+    public override float[] EmbeddingRow(int token) => ReadF32Row(_gguf, "token_embd.weight", token, _config.HiddenSize);
+
     public override DotLLM.Core.Diagnostics.IHiddenStateTapHost? NewSlidingWindowConfigHost()
     {
         if (_family != HiddenStateTapBackendSuite.Llama) return null;

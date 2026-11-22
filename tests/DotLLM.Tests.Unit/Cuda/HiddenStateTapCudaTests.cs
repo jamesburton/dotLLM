@@ -67,6 +67,14 @@ internal sealed class CudaHiddenStateTapFixture : HiddenStateTapFixture
         return model;
     }
 
+    public override float[] OutputNormWeight => ReadF32Row(_gguf, "output_norm.weight", 0, _config.HiddenSize);
+    public override float NormEps => _config.NormEpsilon;
+    public override float[] EmbeddingRow(int token) => ReadF32Row(_gguf, "token_embd.weight", token, _config.HiddenSize);
+
+    /// <summary>The dense CUDA host stores the final-norm output and the residual in F16, so its device rows carry a half rounding; the hybrids are F32.</summary>
+    public override float NormRelTol => Family == HiddenStateTapBackendSuite.Llama ? 3e-3f : 2e-5f;
+    public override float EmbedRelTol => Family == HiddenStateTapBackendSuite.Llama ? 1e-3f : 1e-6f;
+
     public string Family { get; }
     public override IModel Model { get; }
     public override int NumLayers => _config.NumLayers;

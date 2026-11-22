@@ -1316,7 +1316,11 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         int headRows = lastOnly ? 1 : seqLen;
         CpuMtpState? mtpCapture = mtpState as CpuMtpState;
         bool captureMtp = mtpCapture is not null && _mtpHead is not null;
-        int firstNorm = lastOnly && !captureMtp ? seqLen - 1 : 0;
+        // PreLmHead + TapRows.All means every trunk row of the forward on every backend (#1920 M-1), even when the head projects only the
+        // last one: such a tap forces the all-row norm (only while attached).
+        bool tapAllPre = taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1)
+                         && taps.WantsAllRows(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1);
+        int firstNorm = lastOnly && !captureMtp && !tapAllPre ? seqLen - 1 : 0;
         for (int t = firstNorm; t < seqLen; t++)
         {
             RmsNorm.Execute(
@@ -1327,10 +1331,11 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         if (TensorDump.Enabled)
             TensorDump.Dump2D("result_norm", hidden, seqLen, hiddenSize);
 
-        // PreLmHead (#1920): the post-norm rows the LM head projects (the last row when the head is last-row only).
+        // PreLmHead (#1920): the post-norm rows (Last: the last row; All: every trunk row, see tapAllPre above).
+        int preRows = tapAllPre ? seqLen : headRows;
         if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1)
             && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1,
-                            hidden + (long)(seqLen - headRows) * hiddenSize, headRows, seqLen - headRows, positions, out abort))
+                            hidden + (long)(seqLen - preRows) * hiddenSize, preRows, seqLen - preRows, positions, out abort))
             return null;
 
         // MTP (issues #253, #469): capture the POST-final-norm hidden state for every position —

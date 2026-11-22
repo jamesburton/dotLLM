@@ -2,6 +2,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Diagnostics;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
+using DotLLM.Models.Gguf;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Diagnostics;
@@ -42,6 +43,27 @@ public abstract class HiddenStateTapFixture : IDisposable
     public virtual long[]? DeviceCounters() => null;
     /// <summary>The census delta over 16 untapped decode forwards at the merge base (same order as <see cref="DeviceCounters"/>); null when not recorded.</summary>
     public virtual long[]? BaselineDeviceCountersPer16Decodes => null;
+    /// <summary>The model's <c>output_norm.weight</c> (F32 in every synthetic fixture), the oracle for the PreLmHead data.</summary>
+    public abstract float[] OutputNormWeight { get; }
+    /// <summary>The model's RMS-norm epsilon.</summary>
+    public abstract float NormEps { get; }
+    /// <summary>One row of the F32 token embedding table (the oracle for PostEmbedding row data).</summary>
+    public abstract float[] EmbeddingRow(int token);
+    /// <summary>Relative tolerance (of the largest reference magnitude) for a device-computed final norm against the host reference; F16 norm outputs widen it.</summary>
+    public virtual float NormRelTol => 2e-5f;
+    /// <summary>Relative tolerance for a device-staged embedding row against the F32 table (F16 residual storage widens it).</summary>
+    public virtual float EmbedRelTol => 1e-6f;
+
+    /// <summary>Reads <paramref name="width"/> floats of row <paramref name="row"/> of an F32 GGUF tensor.</summary>
+    protected static unsafe float[] ReadF32Row(GgufFile gguf, string name, int row, int width)
+    {
+        var d = gguf.TensorsByName[name];
+        if (d.QuantizationType != DotLLM.Core.Configuration.QuantizationType.F32)
+            throw new InvalidOperationException($"{name} is {d.QuantizationType}; the tap oracle needs F32.");
+        float* p = (float*)gguf.TensorDataPointer(name);
+        return new ReadOnlySpan<float>(p + (long)row * width, width).ToArray();
+    }
+
     public abstract IKvCache NewKv(int maxLen = 96);
     /// <summary>
     /// A KV-cache of the type this backend would create for a sliding-window model (compact windows, window 8 on the even layers), or
@@ -212,6 +234,97 @@ public abstract class HiddenStateTapBackendSuite
         Assert.All(lastBy[HookPoint.PreLmHead], v => Assert.True(float.IsFinite(v)));
         // The embedding row differs from the deep residual (a tap that always returned one buffer would not).
         Assert.False(lastBy[HookPoint.PostEmbedding].AsSpan().SequenceEqual(lastBy[HookPoint.PostLayer]));
+    }
+
+    private static float[] RmsNormRef(float[] x, float[] w, float eps)
+    {
+        double ss = 0;
+        foreach (float v in x) ss += (double)v * v;
+        double scale = 1.0 / Math.Sqrt(ss / x.Length + eps);
+        var o = new float[x.Length];
+        for (int j = 0; j < x.Length; j++) o[j] = (float)(x[j] * scale * w[j]);
+        return o;
+    }
+
+    private static float MaxAbsDiff(float[] a, float[] b)
+    {
+        float m = 0;
+        for (int i = 0; i < a.Length; i++) m = Math.Max(m, MathF.Abs(a[i] - b[i]));
+        return m;
+    }
+
+    /// <summary>
+    /// I-5 / M-1: with TapRows.All on a forward whose head projects only the last row (lastTokenLogitsOnly), PreLmHead still delivers every
+    /// trunk row, and each row's DATA equals the host reference <c>rmsnorm(PreFinalNorm[r]) * output_norm.weight</c> to a bound scaled to the
+    /// hidden size and derived from a same-run control (the F32 float-versus-double reference gap); PostEmbedding row r is the token
+    /// embedding of token r. Every row is checked against its own oracle, so a staging-offset bug that repeats one row cannot pass. The
+    /// control arms (wrong weight, a repeated row, the un-normalised residual) must each exceed the bound, which proves the gate can fail.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void PreLmHeadAndEmbedding_AllRows_MatchHostReferences_ForEveryRow(string family)
+    {
+        using var fx = Open(family);
+        int last = fx.NumLayers - 1;
+        var pre = new List<float[]>(); var preNorm = new List<float[]>(); var emb = new List<float[]>();
+        var preRows = new List<int>();
+        using var h = fx.Host.RegisterTap(new HiddenStateTapSubscription([last], AllPoints, TapRows.All), s =>
+        {
+            if (s.Point == HookPoint.PreFinalNorm) preNorm.Add(s.Data.ToArray());
+            else if (s.Point == HookPoint.PreLmHead) { pre.Add(s.Data.ToArray()); preRows.Add(s.RowIndex); }
+            else if (s.Point == HookPoint.PostEmbedding) emb.Add(s.Data.ToArray());
+        });
+        var prompt = fx.Prompt;
+        int P = prompt.Length;
+        using var kv = fx.NewKv();
+        using (fx.Model.Forward(prompt, Enumerable.Range(0, P).ToArray(), -1, kv, null, null, lastTokenLogitsOnly: true)) { }
+
+        // M-1: one meaning on every backend: every trunk row, even though the head projects one.
+        Assert.Equal(P, pre.Count);
+        Assert.Equal(Enumerable.Range(0, P), preRows);
+        Assert.Equal(P, preNorm.Count);
+        Assert.Equal(P, emb.Count);
+
+        var w = fx.OutputNormWeight;
+        var refs = new List<float[]>();
+        float maxRef = 0, control = 0;
+        for (int r = 0; r < P; r++)
+        {
+            var reference = RmsNormRef(preNorm[r], w, fx.NormEps);
+            refs.Add(reference);
+            maxRef = Math.Max(maxRef, reference.Max(MathF.Abs));
+            // Control: the same reference computed in float arithmetic; its gap to the double reference is the instrument's own noise.
+            float ss = 0;
+            foreach (float v in preNorm[r]) ss += v * v;
+            float sc = 1f / MathF.Sqrt(ss / preNorm[r].Length + fx.NormEps);
+            var f32 = preNorm[r].Select((v, j) => v * sc * w[j]).ToArray();
+            control = Math.Max(control, MaxAbsDiff(f32, reference));
+        }
+        float tol = Math.Max(4 * control, fx.NormRelTol * maxRef);
+        // Sensitivity of the gate: each wrong implementation must sit clearly outside the bound.
+        float wrongWeight = 0, repeated = 0, unnormalised = 0;
+        for (int r = 0; r < P; r++)
+        {
+            wrongWeight = Math.Max(wrongWeight, MaxAbsDiff(RmsNormRef(preNorm[r], w.Select(v => v * 1.01f).ToArray(), fx.NormEps), refs[r]));
+            repeated = Math.Max(repeated, MaxAbsDiff(refs[(r + 1) % P], refs[r]));
+            unnormalised = Math.Max(unnormalised, MaxAbsDiff(preNorm[r], refs[r]));
+        }
+        Assert.True(wrongWeight > 2 * tol, $"the gate cannot see a 1% wrong weight: {wrongWeight} vs tolerance {tol}");
+        Assert.True(repeated > 2 * tol, "the gate cannot see a repeated row (rows are not distinct)");
+        Assert.True(unnormalised > 2 * tol, "the gate cannot see an un-normalised copy");
+
+        for (int r = 0; r < P; r++)
+        {
+            float d = MaxAbsDiff(pre[r], refs[r]);
+            Assert.True(d <= tol, $"PreLmHead row {r}: max |device - host reference| = {d} exceeds {tol} (hidden {fx.Hidden}, control {control})");
+            var e = fx.EmbeddingRow(prompt[r]);
+            float ed = MaxAbsDiff(emb[r], e);
+            float etol = fx.EmbedRelTol * e.Max(MathF.Abs) + 1e-7f;
+            Assert.True(ed <= etol, $"PostEmbedding row {r} is not the embedding of token {prompt[r]}: {ed} > {etol}");
+        }
+        // The embedding rows are pairwise distinct (they are for distinct tokens), so a repeated-row staging bug cannot pass the loop above.
+        for (int r = 1; r < P; r++)
+            if (prompt[r] != prompt[0]) Assert.True(MaxAbsDiff(emb[r], emb[0]) > 0, $"embedding rows 0 and {r} are identical");
     }
 
     /// <summary>A tap on layer L never fires for another layer, and a tap on nothing delivers nothing.</summary>
