@@ -461,6 +461,7 @@ public abstract class HiddenStateTapBackendSuite
         Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
 
         sut.Armed = false;
+        h.Dispose();   // the refusal is per forward while an abortable tap is attached; detach to continue
         int[] t = [fx.Prompt[2]];
         int[] p = [fx.Prompt.Length];
         using var la = fx.Model.Forward(t, p, -1, kvA);

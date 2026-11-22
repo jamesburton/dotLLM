@@ -73,7 +73,7 @@ public sealed class AbortableTapKvGuardTests
     {
         using var inner = new SimpleKvCache(KvGeometry.FromConfig(Config()), MaxSeq);
         Fill(inner, 8);
-        var kv = new BackstopKv(inner);
+        IKvCache kv = new BackstopKv(inner);
         Assert.True(kv.SupportsAbortRollback);
         Assert.Equal(8, AbortableTapKvGuard.Checkpoint(kv, [8]));
         Assert.Throws<NotSupportedException>(() => AbortableTapKvGuard.Checkpoint(kv, [700]));
