@@ -35,7 +35,8 @@
 // Dynamic shared memory: group*16*(HD+8)*2 (Q) + NBUF*2*KV_TILE*(HD+8)*2 (K, V); hd128 group 8 = 52 KB,
 // so the launcher opts the functions into > 48 KB.
 //
-// Entries: attention_flash_mma_prefill_kvq_hd{64,128}_{q8q8,q4q4,q8q4,q4q8,f16f16}.
+// Entries: attention_flash_mma_prefill_kvq_hd{64,128}_{q8q8,q4q4,q8q4,q4q8,f16f16}, and the TurboQuant in-place
+// attention_flash_mma_prefill_kvq_hd{64,128}_tqtq (#1892, at the end of the file).
 
 #include <cuda_fp16.h>
 #include <float.h>
@@ -345,3 +346,81 @@ PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q4q4, 64, PkLoadQuant<V2LoadQ4>, P
 PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q8q4, 64, PkLoadQuant<V2LoadQ8>, PkLoadQuant<V2LoadQ4>)
 PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q4q8, 64, PkLoadQuant<V2LoadQ4>, PkLoadQuant<V2LoadQ8>)
 PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_f16f16, 64, PkLoadF16, PkLoadF16)
+
+// ─── TurboQuant in place (#1892 Task 6) ────────────────────────────────────────────────────────────────
+// The dense in-place TurboQuant cache (CudaTurboQuantInPlaceKvCache) stores each K / V head vector as mse_bits-bit Lloyd-Max
+// codes (LSB-first, coordinate i at bit i*mse_bits, code_uints_per_vec words per (position, kv head)) plus one norm per head
+// vector. Attention runs in code space: the caller rotates Q into K code space before this kernel (tq_rotate_q_f16) and the
+// F16 output back out of V code space after it (tq_rotate_o_f16), so a tile element is simply __float2half(norm * centroid[code])
+// -- the same single F16 rounding of an mma operand the F16 / q8 / q4 loaders apply, in code space.
+//
+// The loader needs per-side context (codes, norms, centroids, bits, stride, norm format) that the stateless chunk(dst, base,
+// elem) contract cannot carry, so the TQ entries pass a pointer to a per-side context struct as `base`. Everything is
+// force-inlined into the entry, so the struct lives in registers (the PTX has no local depot). pk_prefill_body and the ten
+// entries above are untouched, so their PTX cannot move. The centroid table is read with __ldg from global memory, never
+// staged in shared memory; the loader is register-only, so the shared-memory size is the same as the q8 / q4 entries'.
+// `elem` = key * num_kv_heads * HD + hkv * HD + c * 8, so the head vector is elem / HD and the first coordinate elem % HD.
+struct PkTqSide
+{
+    const uint32_t* codes;
+    const void* norms;
+    const float* centroids;
+    int bits;
+    int code_uints_per_vec;
+    int norm_format;   // 0 = F32 reference, 1 = F16, 2 = BF16 (turboquant.cu's tq_load_norm)
+};
+
+__device__ __forceinline__ float pk_tq_norm(const void* norms, const int fmt, const size_t i)
+{
+    if (fmt == 0) return __ldg(reinterpret_cast<const float*>(norms) + i);
+    const unsigned short h = __ldg(reinterpret_cast<const unsigned short*>(norms) + i);
+    if (fmt == 1) return __half2float(__ushort_as_half(h));
+    return __uint_as_float(((unsigned)h) << 16);
+}
+
+template <int HD>
+struct PkLoadTq
+{
+    __device__ __forceinline__ static void chunk(half* dst, const void* base, size_t elem)
+    {
+        const PkTqSide& s = *reinterpret_cast<const PkTqSide*>(base);
+        const size_t hv = elem / HD;
+        const unsigned bit0 = (unsigned)(elem % HD) * (unsigned)s.bits;
+        const uint32_t* w = s.codes + hv * (size_t)s.code_uints_per_vec + (bit0 >> 5);
+        const unsigned shift = bit0 & 31u;
+        const unsigned need = shift + 8u * (unsigned)s.bits;   // bits to read starting at w[0]; reads stay inside the vector
+        unsigned long long win = __ldg(w);
+        if (need > 32u) win |= (unsigned long long)__ldg(w + 1) << 32;
+        win >>= shift;
+        if (need > 64u) win |= (unsigned long long)__ldg(w + 2) << (64u - shift);
+        const unsigned mask = (1u << s.bits) - 1u;
+        const float n = pk_tq_norm(s.norms, s.norm_format, hv);
+        unsigned packed[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+        {
+            const float lo = __ldg(&s.centroids[(unsigned)(win >> ((2 * j) * s.bits)) & mask]);
+            const float hi = __ldg(&s.centroids[(unsigned)(win >> ((2 * j + 1) * s.bits)) & mask]);
+            packed[j] = pk_pack_half2(n * lo, n * hi);
+        }
+        *reinterpret_cast<uint4*>(dst) = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+    }
+};
+
+#define PK_TQ_ENTRY(NAME, HD)                                                                     \
+extern "C" __global__ void __launch_bounds__(256) NAME(                                           \
+    const half* __restrict__ q, const uint32_t* __restrict__ k_codes,                             \
+    const uint32_t* __restrict__ v_codes, const void* __restrict__ k_norms,                       \
+    const void* __restrict__ v_norms, const float* __restrict__ centroids,                        \
+    half* __restrict__ output, const int seq_q, const int seq_kv, const int num_heads,            \
+    const int num_kv_heads, const int position_offset, const float scale,                         \
+    const int mse_bits, const int code_uints_per_vec, const int norm_format)                      \
+{                                                                                                 \
+    const PkTqSide ks = { k_codes, k_norms, centroids, mse_bits, code_uints_per_vec, norm_format };\
+    const PkTqSide vs = { v_codes, v_norms, centroids, mse_bits, code_uints_per_vec, norm_format };\
+    pk_prefill_body<HD, PkLoadTq<HD>, PkLoadTq<HD>>(q, &ks, &vs, output, seq_q, seq_kv, num_heads, \
+                                                    num_kv_heads, position_offset, scale);        \
+}
+
+PK_TQ_ENTRY(attention_flash_mma_prefill_kvq_hd128_tqtq, 128)
+PK_TQ_ENTRY(attention_flash_mma_prefill_kvq_hd64_tqtq, 64)

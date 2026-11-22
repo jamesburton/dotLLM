@@ -20,7 +20,7 @@ internal sealed class SimpleComputeKernel : IDisposable
     private bool _disposed;
 
     private SimpleComputeKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline,
-        nint pool, int buffers, int pushBytes)
+        nint pool, int buffers, int pushBytes, DotLLM.Core.Attention.TurboQuantLayout? tq = null)
     {
         _device = device;
         _module = module;
@@ -28,11 +28,15 @@ internal sealed class SimpleComputeKernel : IDisposable
         _pool = pool;
         _buffers = buffers;
         _pushBytes = pushBytes;
-        _cache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: buffers);
+        _tq = tq;
+        _cache = TqKvTwin.CreateCache(device, pool, pipeline, buffers, tq);
     }
 
+    // TurboQuant KV twin (#1892): binds the norm and centroid operands after the body's own buffers. Null for every other kernel.
+    private readonly DotLLM.Core.Attention.TurboQuantLayout? _tq;
+
     public static SimpleComputeKernel Create(VulkanDevice device, string spvDir, string spvName,
-        int buffers, int pushWords)
+        int buffers, int pushWords, DotLLM.Core.Attention.TurboQuantLayout? tq = null)
     {
         string path = Path.Combine(spvDir, spvName + ".spv");
         if (!File.Exists(path))
@@ -43,9 +47,7 @@ internal sealed class SimpleComputeKernel : IDisposable
         ComputePipeline pipeline;
         try
         {
-            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[buffers];
-            for (int i = 0; i < buffers; i++) bindings[i] = new VkDescriptorBinding((uint)i);
-            pipeline = module.CreateComputePipeline("main", bindings, (uint)(pushWords * sizeof(uint)));
+            pipeline = TqKvTwin.CreatePipeline(module, buffers, (uint)(pushWords * sizeof(uint)), tq);
         }
         catch
         {
@@ -53,14 +55,14 @@ internal sealed class SimpleComputeKernel : IDisposable
             throw;
         }
 
-        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)buffers);
-        return new SimpleComputeKernel(device, module, pipeline, pool, buffers, pushWords * sizeof(uint));
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)(buffers + TqKvTwin.Extra(tq)));
+        return new SimpleComputeKernel(device, module, pipeline, pool, buffers, pushWords * sizeof(uint), tq);
     }
 
     internal void InvalidateDescriptorCache() => _cache.Reset();
 
     public unsafe void Record(nint cmdBuf, ReadOnlySpan<nint> bufferHandles, ReadOnlySpan<uint> pushWords,
-        uint groupsX, uint groupsY = 1)
+        uint groupsX, uint groupsY = 1, TqKvOperands? tq = null)
     {
         if (bufferHandles.Length != _buffers)
             throw new ArgumentException($"Expected {_buffers} buffers, got {bufferHandles.Length}.", nameof(bufferHandles));
@@ -69,7 +71,7 @@ internal sealed class SimpleComputeKernel : IDisposable
 
         Span<nint> handles = stackalloc nint[_buffers];
         bufferHandles.CopyTo(handles);
-        nint set = _cache.GetOrCreate(handles);
+        nint set = TqKvTwin.GetSet(_cache, handles, _tq, tq);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, set, 0, 0);
@@ -115,6 +117,9 @@ internal sealed class VulkanGptOssKernels : IDisposable
     // Block-quantised KV twins (Flint's Q8_0; Q4_0 and mixed K/V since #1884): attention_sinks_f32_kvq8 / _kvq4 / _kvq8q4 / _kvq4q8, each
     // present only when its SPIR-V is.
     private readonly Dictionary<VulkanKvStorage, SimpleComputeKernel> _attnSinksBlock;
+    // TurboQuant twin (#1892): attention_sinks_f32_kvtq, specialised for one layout, built on demand (the layout is chosen after load).
+    private SimpleComputeKernel? _attnSinksTq;
+    private DotLLM.Core.Attention.TurboQuantLayout _attnSinksTqLayout;
     private readonly SimpleComputeKernel _swigluOai;
     private readonly SimpleComputeKernel _expertBias;
     private readonly SimpleComputeKernel _topkRaw;
@@ -163,8 +168,39 @@ internal sealed class VulkanGptOssKernels : IDisposable
         return new VulkanGptOssKernels(attn, swi, bias, topk, mx, yarn, attnF16, block);
     }
 
+    /// <summary>Whether the reference sink kernel's TurboQuant twin is built (#1892).</summary>
+    public bool HasTurboQuantSinks => _attnSinksTq is not null;
+
+    /// <summary>
+    /// Builds the TurboQuant twin of the reference sink kernel for <paramref name="tq"/> (issue #1892); a no-op when it already
+    /// exists for that layout. Must not run while a forward is recording.
+    /// </summary>
+    /// <returns>False when <c>attention_sinks_f32_kvtq.spv</c> is missing or the pipeline fails.</returns>
+    public bool TryEnsureTurboQuantSinks(VulkanDevice device, string spvDir, DotLLM.Core.Attention.TurboQuantLayout tq)
+    {
+        if (_attnSinksTq is not null && _attnSinksTqLayout == tq) return true;
+        string name = VulkanKvStorage.Tq.ShaderName("attention_sinks_f32");
+        if (!File.Exists(Path.Combine(spvDir, name + ".spv"))) return false;
+        SimpleComputeKernel k;
+        try { k = SimpleComputeKernel.Create(device, spvDir, name, buffers: 5, pushWords: 12, tq: tq); }
+        catch (VulkanException) { return false; }
+        _attnSinksTq?.Dispose();
+        _attnSinksTq = k;
+        _attnSinksTqLayout = tq;
+        return true;
+    }
+
+    /// <summary>Drops the TurboQuant sink twin (a refused or failed twin-set build must not leave a stale layout behind).</summary>
+    internal void DisposeTurboQuantSinks()
+    {
+        _attnSinksTq?.Dispose();
+        _attnSinksTq = null;
+        _attnSinksTqLayout = default;
+    }
+
     internal void InvalidateDescriptorCaches()
     {
+        _attnSinksTq?.InvalidateDescriptorCache();
         _attnSinks.InvalidateDescriptorCache();
         _attnSinksKvF16?.InvalidateDescriptorCache();
         foreach (var k in _attnSinksBlock.Values) k.InvalidateDescriptorCache();
@@ -185,10 +221,12 @@ internal sealed class VulkanGptOssKernels : IDisposable
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         VulkanDevice.Buffer sinks,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
-        int positionOffset, int slidingWindow, float scaleOverride = 0.0f, VulkanKvStorage kvStorage = VulkanKvStorage.F32)
+        int positionOffset, int slidingWindow, float scaleOverride = 0.0f, VulkanKvStorage kvStorage = VulkanKvStorage.F32,
+        TqKvOperands? tq = null)
     {
         var kernel = kvStorage switch
         {
+            VulkanKvStorage.Tq => _attnSinksTq ?? throw new NotSupportedException("TurboQuant KV sink attention needs attention_sinks_f32_kvtq.spv built for the cache's layout (TryEnsureTurboQuantSinks)."),
             VulkanKvStorage.F16 => _attnSinksKvF16 ?? throw new NotSupportedException("F16 KV sink attention needs attention_sinks_f32_kvf16.spv, which this build lacks."),
             _ when kvStorage.IsBlockQuantized() => _attnSinksBlock.TryGetValue(kvStorage, out var bk) ? bk
                 : throw new NotSupportedException($"{kvStorage} KV sink attention needs {kvStorage.ShaderName("attention_sinks_f32")}.spv, which this build lacks."),
@@ -202,6 +240,10 @@ internal sealed class VulkanGptOssKernels : IDisposable
             throw new ArgumentException($"headDim ({headDim}) outside (0, {MaxHeadDim}].", nameof(headDim));
         if (sinks.Size < (long)numHeads * sizeof(float))
             throw new ArgumentException("Sinks buffer too small.", nameof(sinks));
+        if (kvStorage == VulkanKvStorage.Tq)
+            TqKvTwin.CheckKv(kvStorage, _attnSinksTqLayout, tq, k, v, seqKv, numKvHeads, headDim);
+        else if (tq is not null)
+            throw new ArgumentException("TurboQuant operands given to a non-TurboQuant sink kernel.", nameof(tq));
 
         ReadOnlySpan<nint> bufs = [q.Handle, k.Handle, v.Handle, output.Handle, sinks.Handle];
         ReadOnlySpan<uint> pc =
@@ -212,7 +254,7 @@ internal sealed class VulkanGptOssKernels : IDisposable
             0u /*causal*/, 0u,
         ];
         SinkAttentionDispatches++;
-        kernel.Record(cmdBuf, bufs, pc, (uint)seqQ * (uint)numHeads);
+        kernel.Record(cmdBuf, bufs, pc, (uint)seqQ * (uint)numHeads, tq: tq);
     }
 
     /// <summary>gpt-oss clamped SwiGLU: <c>result[i] = swiglu_oai(gate[i], up[i])</c> over <paramref name="n"/> elements.</summary>

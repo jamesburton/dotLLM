@@ -248,26 +248,50 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
         VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool,
         VulkanModule? hd256Module, ComputePipeline? hd256Pipeline, nint hd256Pool,
-        uint requireInvariantPv, VulkanKvStorage kvStorage, bool activationsF16)
+        uint requireInvariantPv, VulkanKvStorage kvStorage, bool activationsF16, DotLLM.Core.Attention.TurboQuantLayout? tq)
     {
         KvStorage = kvStorage;
+        _tq = tq;
         ActivationsF16 = activationsF16;
         _hd256Module = hd256Module;
         _hd256Pipeline = hd256Pipeline;
         _hd256DescriptorPool = hd256Pool;
         if (hd256Pipeline is not null)
-            _hd256DescriptorCache = new DescriptorSetCache(device, hd256Pool, hd256Pipeline, buffersPerSet: 4);
+            _hd256DescriptorCache = TqKvTwin.CreateCache(device, hd256Pool, hd256Pipeline, 4, tq);
         _device = device;
         RequireInvariantPv = requireInvariantPv;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
+        _descriptorCache = TqKvTwin.CreateCache(device, pool, pipeline, 4, tq);
         _hd64Module = hd64Module;
         _hd64Pipeline = hd64Pipeline;
         _hd64DescriptorPool = hd64Pool;
         if (hd64Pipeline is not null)
-            _hd64DescriptorCache = new DescriptorSetCache(device, hd64Pool, hd64Pipeline, buffersPerSet: 4);
+            _hd64DescriptorCache = TqKvTwin.CreateCache(device, hd64Pool, hd64Pipeline, 4, tq);
+    }
+
+    private readonly DotLLM.Core.Attention.TurboQuantLayout? _tq;
+
+    /// <summary>
+    /// The TurboQuant twin (issue #1892): <c>attention_flash_f32_coopmat_kvtq[_hd256].spv</c>. As the other KV twins it has no hd64
+    /// pipeline: head dim 64 runs the base body, so the LDS-tight hd64 shader is untouched. Null when the device lacks the coopmat tile,
+    /// an SPIR-V is missing or a pipeline fails.
+    /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="tq">Layout of the cached codes and norms.</param>
+    /// <returns>The kernel, or <see langword="null"/>.</returns>
+    public static VulkanFlashAttentionCoopmatKernel? TryCreate(VulkanDevice device, string spvDir, DotLLM.Core.Attention.TurboQuantLayout tq)
+    {
+        if (!SupportsDevice(device)) return null;
+        try
+        {
+            return Create(device, spvDir, FlashAttentionCoopmatVariant.SelectFor(device),
+                VulkanKvStorage.Tq.ShaderName(DefaultShaderBaseName), kvStorage: VulkanKvStorage.Tq, tq: tq);
+        }
+        catch (FileNotFoundException) { return null; }
+        catch (VulkanException) { return null; }
     }
 
     /// <summary>
@@ -328,8 +352,10 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// </summary>
     internal static VulkanFlashAttentionCoopmatKernel Create(
         VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant, string shaderBaseName,
-        uint? requireInvariantPv = null, VulkanKvStorage kvStorage = VulkanKvStorage.F32, bool activationsF16 = false)
+        uint? requireInvariantPv = null, VulkanKvStorage kvStorage = VulkanKvStorage.F32, bool activationsF16 = false,
+        DotLLM.Core.Attention.TurboQuantLayout? tq = null)
     {
+        tq = TqKvTwin.Require(kvStorage, tq);
         if (!SupportsDevice(device))
             throw new InvalidOperationException(
                 "VulkanFlashAttentionCoopmatKernel requires a subgroup-scope 16x16x16 " +
@@ -358,17 +384,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         ComputePipeline pipeline;
         try
         {
-            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
-            bindings[0] = new VkDescriptorBinding(0);
-            bindings[1] = new VkDescriptorBinding(1);
-            bindings[2] = new VkDescriptorBinding(2);
-            bindings[3] = new VkDescriptorBinding(3);
-            pipeline = module.CreateComputePipeline(
-                entryPoint: "main",
-                bindings: bindings,
-                pushConstantBytes: PushConstantBytes,
-                requiredSubgroupSize: requiredSubgroupSize,
-                specConstants: spec);
+            pipeline = TqKvTwin.CreatePipeline(module, 4, PushConstantBytes, tq, requiredSubgroupSize, spec);
         }
         catch
         {
@@ -385,22 +401,12 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             hd64Module = VulkanModule.LoadFromFile(device, hd64Path);
             try
             {
-                Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
-                bindings[0] = new VkDescriptorBinding(0);
-                bindings[1] = new VkDescriptorBinding(1);
-                bindings[2] = new VkDescriptorBinding(2);
-                bindings[3] = new VkDescriptorBinding(3);
-                hd64Pipeline = hd64Module.CreateComputePipeline(
-                    entryPoint: "main",
-                    bindings: bindings,
-                    pushConstantBytes: PushConstantBytes,
-                    requiredSubgroupSize: requiredSubgroupSize,
-                    specConstants: spec);
+                hd64Pipeline = TqKvTwin.CreatePipeline(hd64Module, 4, PushConstantBytes, tq, requiredSubgroupSize, spec);
                 // Separate pool per pipeline: DescriptorSetCache.Reset() calls
                 // vkResetDescriptorPool on its whole pool, which would silently
                 // invalidate the OTHER pipeline's still-referenced sets
                 // mid-forward if both caches shared one pool (see #377).
-                hd64Pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
+                hd64Pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)(4 + TqKvTwin.Extra(tq)));
             }
             catch
             {
@@ -421,15 +427,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             try
             {
                 hd256Module = VulkanModule.LoadFromFile(device, hd256Path);
-                Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
-                for (int i = 0; i < 4; i++) bindings[i] = new VkDescriptorBinding((uint)i);
-                hd256Pipeline = hd256Module.CreateComputePipeline(
-                    entryPoint: "main",
-                    bindings: bindings,
-                    pushConstantBytes: PushConstantBytes,
-                    requiredSubgroupSize: requiredSubgroupSize,
-                    specConstants: spec);
-                hd256Pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
+                hd256Pipeline = TqKvTwin.CreatePipeline(hd256Module, 4, PushConstantBytes, tq, requiredSubgroupSize, spec);
+                hd256Pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)(4 + TqKvTwin.Extra(tq)));
             }
             catch
             {
@@ -441,10 +440,10 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             }
         }
 
-        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)(4 + TqKvTwin.Extra(tq)));
         return new VulkanFlashAttentionCoopmatKernel(
             device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool,
-            hd256Module, hd256Pipeline, hd256Pool, gate, kvStorage, activationsF16);
+            hd256Module, hd256Pipeline, hd256Pool, gate, kvStorage, activationsF16, tq);
     }
 
     /// <summary>
@@ -565,10 +564,10 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false,
         float softCap = 0.0f, float scaleOverride = 0.0f,
-        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0, TqKvOperands? tq = null)
     {
         RecordCore(cmdBuf, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow, useAlibi,
-            softCap, scaleOverride, maskMode, prefixLen, 0, 0, 0, 0);
+            softCap, scaleOverride, maskMode, prefixLen, 0, 0, 0, 0, tq);
     }
 
     /// <summary>
@@ -593,7 +592,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         int positionOffset, int slidingWindow, bool useAlibi,
         float softCap, float scaleOverride,
         AttentionMaskMode maskMode, int prefixLen,
-        long qOff, long kOff, long vOff, long outOff)
+        long qOff, long kOff, long vOff, long outOff, TqKvOperands? tq = null)
     {
         if (seqQ <= 0) throw new ArgumentOutOfRangeException(nameof(seqQ));
         if (seqKv <= 0) throw new ArgumentOutOfRangeException(nameof(seqKv));
@@ -617,12 +616,20 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * (ActivationsF16 ? sizeof(ushort) : sizeof(float));
-        long kvBytes  = KvStorage.KeyRowBytes((long)numKvHeads * headDim) * seqKv;   // per side: mixed block formats (#1884)
-        long kvBytesV = KvStorage.ValueRowBytes((long)numKvHeads * headDim) * seqKv;
         long outBytes = qBytes;
         if (q.Size - qOff      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
-        if (k.Size - kOff      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
-        if (v.Size - vOff      < kvBytesV)  throw new ArgumentException("V buffer too small.",      nameof(v));
+        if (_tq is not null)
+        {
+            if ((qOff | kOff | vOff | outOff) != 0) throw new NotSupportedException("A TurboQuant twin takes no buffer sub-ranges.");
+            TqKvTwin.CheckKv(KvStorage, _tq, tq, k, v, seqKv, numKvHeads, headDim);
+        }
+        else
+        {
+            long kvBytes  = KvStorage.KeyRowBytes((long)numKvHeads * headDim) * seqKv;   // per side: mixed block formats (#1884)
+            long kvBytesV = KvStorage.ValueRowBytes((long)numKvHeads * headDim) * seqKv;
+            if (k.Size - kOff      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
+            if (v.Size - vOff      < kvBytesV)  throw new ArgumentException("V buffer too small.",      nameof(v));
+        }
         if (output.Size - outOff < outBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
         // Issue #378: route headDim<=64 models with enough KV-tile iterations
@@ -638,7 +645,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
         Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
         nint descriptorSet;
-        if ((qOff | kOff | vOff | outOff) == 0) descriptorSet = descriptorCache.GetOrCreate(buffers);
+        if ((qOff | kOff | vOff | outOff) == 0) descriptorSet = TqKvTwin.GetSet(descriptorCache, buffers, _tq, tq);
         else
         {
             Span<ulong> offs = stackalloc ulong[4] { (ulong)qOff, (ulong)kOff, (ulong)vOff, (ulong)outOff };

@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Vulkan.Kernels;
@@ -5,7 +6,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// <summary>
 /// TurboQuant (MSE stage) KV dequantization to FP32 — the GPU port of
 /// <c>DotLLM.Engine.KvCache.Codecs.TurboQuantCodec.Decode</c> (without the QJL residual).
-/// Reads per-head-vector packed Lloyd–Max codes + an fp32 norm and writes the contiguous
+/// Reads per-head-vector packed Lloyd–Max codes + a norm (in <see cref="TqNormFormat"/>) and writes the contiguous
 /// fp32 attention scratch <c>[positions, numKvHeads*headDim]</c>.
 /// </summary>
 /// <remarks>
@@ -22,7 +23,7 @@ public sealed class TurboQuantDequantF32Kernel : IDisposable
     public const int MaxHeadDim = 256;
 
     private const int BindingCount = 5;
-    private const int PushConstantBytes = 5 * sizeof(uint); // 4 uints + 1 float
+    private const int PushConstantBytes = 6 * sizeof(uint); // 4 uints + 1 float + normFormat
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -75,12 +76,13 @@ public sealed class TurboQuantDequantF32Kernel : IDisposable
     public void Launch(
         VulkanDevice.Buffer codes, VulkanDevice.Buffer norms, VulkanDevice.Buffer centroids,
         VulkanDevice.Buffer signs, VulkanDevice.Buffer dst,
-        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD)
+        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD,
+        TqNormFormat normFormat = TqNormFormat.F32Reference)
     {
         using var ctx = _device.CreateSubmitContext();
         ctx.Begin();
         Record(ctx.CommandBuffer, codes, norms, centroids, signs, dst,
-               numVectors, headDim, numKvHeads, mseBits, codeUintsPerVec, invSqrtD);
+               numVectors, headDim, numKvHeads, mseBits, codeUintsPerVec, invSqrtD, normFormat);
         ctx.SubmitAndWait();
     }
 
@@ -90,8 +92,11 @@ public sealed class TurboQuantDequantF32Kernel : IDisposable
         nint cmdBuf,
         VulkanDevice.Buffer codes, VulkanDevice.Buffer norms, VulkanDevice.Buffer centroids,
         VulkanDevice.Buffer signs, VulkanDevice.Buffer dst,
-        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD)
+        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD,
+        TqNormFormat normFormat = TqNormFormat.F32Reference)
     {
+        if (normFormat is not (TqNormFormat.F32Reference or TqNormFormat.F16 or TqNormFormat.Bf16))
+            throw new NotSupportedException($"Vulkan TurboQuant dequant supports F32Reference, F16 and Bf16 norms; got {normFormat}.");
         if (numVectors <= 0) throw new ArgumentOutOfRangeException(nameof(numVectors));
         if (headDim <= 0 || (headDim & (headDim - 1)) != 0 || headDim > MaxHeadDim)
             throw new ArgumentException($"headDim must be a power of two in [1,{MaxHeadDim}]; got {headDim}.", nameof(headDim));
@@ -105,7 +110,7 @@ public sealed class TurboQuantDequantF32Kernel : IDisposable
         long codeUintsMin = (long)numVectors * codeUintsPerVec + 1;
         if (codes.Size < codeUintsMin * sizeof(uint))
             throw new ArgumentException($"codes buffer too small: need >= {codeUintsMin * sizeof(uint)} bytes.", nameof(codes));
-        if (norms.Size < (long)numVectors * sizeof(float))
+        if (norms.Size < TurboQuantEncodeF32Kernel.NormBufferBytes(numVectors, normFormat))
             throw new ArgumentException("norms buffer too small.", nameof(norms));
         if (centroids.Size < (long)(1 << mseBits) * sizeof(float))
             throw new ArgumentException("centroids buffer too small.", nameof(centroids));
@@ -125,10 +130,10 @@ public sealed class TurboQuantDequantF32Kernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
-        Span<uint> pc = stackalloc uint[5]
+        Span<uint> pc = stackalloc uint[6]
         {
             (uint)headDim, (uint)numKvHeads, (uint)mseBits, (uint)codeUintsPerVec,
-            BitConverter.SingleToUInt32Bits(invSqrtD),
+            BitConverter.SingleToUInt32Bits(invSqrtD), (uint)normFormat,
         };
         fixed (uint* pcPtr = pc)
         {

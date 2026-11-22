@@ -61,7 +61,7 @@ For hybrid models (`ModelConfig.HybridLayout` set: Qwen3.5/3.6/3.8 GDN, Nemotron
 `KvStrideOf(slot)` takes a slot. `KvGeometry.SlotCount(config)` is the allocation-free slot count (use it instead of
 `config.NumLayers` anywhere a cache or handoff is sized). A 1-in-4 hybrid (Qwen4-Exp: 12 of 48) allocates 4x less KV; dense models
 are unchanged (`HasLayerSlotMap == false`, identity map). Vulkan (`VulkanNemotronHKvCache`) and CUDA (`CudaNemotronHKvCache`) hybrid
-caches were already sparse; the CPU `SimpleKvCache` / `QuantizedKvCache` / `TurboQuantKvCache`, the hybrid CPU-tail cache of the
+caches were already sparse; the CPU `SimpleKvCache` / `QuantizedKvCache` / `TurboQuantKvCache` / `TurboQuantInPlaceKvCache`, the hybrid CPU-tail cache of the
 split Qwen3-hybrid model, the KV handoff paths and the CLI memory estimate now agree with them.
 
 ### Vulkan hybrid KV: element format and lazy growth (issue #898)
@@ -361,31 +361,97 @@ twin, no host row IO, prefix snapshots or handoff (they refuse Q8_0). It stays o
 - **Proof the path ran:** halving the writer's stored scale moves q8_0 NLL 2.34 -> 9.53 while F16 stays bit-identical (2.3242); zeroing
   the GQA v2 decode kernel's K scale turns a q8_0 needle HIT into a MISS with F16 unchanged.
 
-### TurboQuant availability: refuse, never substitute (issue #1888, epic #1887)
+### TurboQuant KV: read in place on CPU, CUDA and Vulkan (issues #1888, #1892; epic #1887)
 
-`KvCacheConfig.IsQuantized` excludes TurboQuant, so a `tq*` request used to fall through every branch: Vulkan served it with the default
-`VulkanKvCache`, CUDA with the f16 `CudaKvCache`, CPU paged with F16 blocks, and `run` / `chat` dropped the bit width. Now:
+`--cache-type-k/-v tq1..tq8` (or `tq`, which is `tq4`) stores each K and V head vector as packed Lloyd-Max codes plus one norm and
+runs attention on the codes. Nothing wider than the codes is ever stored for the history: no decoded copy, no FP32 scratch, no
+original-space window (CLAUDE.md precision rules 1 and 2). A TurboQuant request runs TurboQuant for real, or startup fails and says
+why; it is never served by another cache (#1888).
 
-- `TurboQuantKvSupport.RefusalReason` (`DotLLM.Server`) decides whether TurboQuant is real for a request.
-  - `serve` calls it before the weights load (`ServerStartup.PreLoadTurboQuantRefusal`) and after (`PostLoadTurboQuantRefusal`: the backend an
-    `auto` device landed on, the host type, an attaching MTP head).
-  - `run` / `chat` call it before anything loads (`KvStorageCli.TurboQuantRefusal`).
-- K and V are judged independently (`IsTurboQuantAny`, `IsTurboQuantMixed`).
-- The TurboQuant branch is first in serve's KV chain, so no later branch can take a TurboQuant request.
-- CUDA G3 never runs over TurboQuant KV (`G3ServesKvCache`).
+**Layout** (`TurboQuantLayout`, shared by every backend). Per layer and side:
+- Codes: `[position, kvHead, CodeUintsPerVec]` 32-bit words, `CodeUintsPerVec = ceil(ceil(headDim * bits / 8) / 4)`. Codes are packed
+  LSB-first inside a vector; each vector is padded to a whole word (vectors are not packed tight against each other). One trailing
+  guard word per layer and side lets the kernels read a full word at the last vector.
+- Norms: `[position, kvHead]`, one per head vector, **F16** (`TurboQuantLayout.DefaultNorm`; evidence and ruling in
+  [PRECISION.md](PRECISION.md) E17). F32 norms exist only as an oracle format. The CUDA cache rounds each layer's norm buffer up to a
+  4-byte multiple. A norm that does not fit F16 is clamped and counted (`NormSaturations`), never written as Inf or NaN.
+- Bytes per position (`KvBytesPerPosition`) are what KV sizing and admission charge, instead of an F16 figure. The guard word and the
+  norm round-up are a per-layer constant of at most `FixedBytesPerLayerBound` (14 bytes, K and V together), independent of context.
+  At head dim 128, per head vector: tq2 34 B, tq3 50 B, tq4 66 B, tq8 130 B, against F16 256 B, q8_0 136 B, q4_0 72 B.
+- One in-place cache per backend: CPU `TurboQuantInPlaceKvCache` (`ITurboQuantKvCache`), CUDA `CudaTurboQuantInPlaceKvCache`, Vulkan
+  `VulkanKvCache` with `Storage == Tq`. The dequant-scratch caches (`TurboQuantKvCache`, `CudaTurboQuantKvCache`,
+  `VulkanTurboQuantKvCache`) remain as the test oracle, with the same seed and norm format, so a gap between them and the in-place
+  path is a bug in the in-place path. On CPU `TurboQuantKvCache` is also what still serves `tq*q` (below).
+
+**Rotations.** The codec decodes a vector as `x = n * S * H * c / sqrt(d)` (`H` the Walsh-Hadamard matrix, `S` the sign diagonal,
+`n` the stored norm, `c` the centroid). So attention runs in code space:
+- Q is rotated in place after RoPE and before attention (`H * (S_k . q) / sqrt(d)`), once per query head. Gated on K being TurboQuant.
+- The score is `n_j * sum(q~_i * centroid[code_ij])`; the value accumulator `a~ = sum(p_j * n_j * c_j)` stays in code space, in F32
+  registers with the usual online softmax.
+- O is rotated in place after attention and before the output projection (`S_v . (H * a~) / sqrt(d)`). Gated on V being TurboQuant. On
+  Vulkan with split-KV the output rotation is recorded after the combine pass.
+- K and V use **independent sign seeds**: `seedV = seedK ^ TurboQuantCodec.VSeedMask`. Every cache, oracle and test derives the V seed
+  from that constant, not from a copied literal. A test that cannot tell K signs from V signs cannot see a mix-up, so every
+  attention-vs-oracle test uses different seeds.
+- The encode kernels (CPU codec, `turboquant.cu`, `turboquant_encode_f32.comp`) are **byte-exact across backends**: the norm's sum of
+  squares is a fixed pairwise tree over 256 lanes, and the CPU emulates that tree. `turboquant.cu` and `turboquant_rotate.cu` build
+  with `-fmad=false` and no fast-math.
+
+**Twins per backend.**
+- CPU: `Attention.ExecuteTurboQuant` over `ITurboQuantKvCache`, decoding `norm * centroid[code]` (never the history). Decode (one query row)
+  reads one head vector at a time into a per-worker row scratch. Multi-row prefill (`seqQ >= 2`) is flash-style (#1892): 128 query rows at
+  a time, key tiles outer, each K/V tile decoded ONCE into a bounded per-worker tile ring and reused by every row and every head of the
+  GQA group (without it each KV row was decoded once per query row: prefill 12 tok/s vs 37 for the scratch cache on Qwen3-4B tq4 at 7.6K;
+  now 68). Per row the tiles, dots and online softmax are those of the per-row path, so the output is bit-identical (#530). The ring is
+  `2 * TileSize * headDim * 4` bytes per worker (256 KiB at hd 128; 512 KiB with a sliding window, where a row's tile can straddle two grid
+  chunks) and never scales with the cached length. It is a thread-static native buffer, a deliberate bounded exception to deterministic
+  disposal: reused across layers and calls (no hot-path allocation), freed by a finalizer at thread exit, and freed deterministically by
+  `Attention.TrimTurboQuantTileBuffers(pool)`, which `TransformerModel.Dispose` calls. `TurboQuantRotation` rotates Q and O.
+- CUDA (dense, non-paged `CudaTransformerModel`): scalar code-space attention `attention_kvtq` (sinks, sliding window, any GQA
+  ratio, head dims up to 256); tensor-core flash prefill `_hd64_tqtq` and `_hd128_tqtq` in `attention_flash_mma_prefill_kvq` (hd256
+  uses the scalar body); `tq_rotate_q` / `tq_rotate_o` (and `tq_rotate_o_f16`, which keeps the attention output F16).
+  **Decode is eager and never graph-captured** (#1918, same as q8_0 KV today).
+- Vulkan: dense chain (`IsDenseF16KvEligible`) and Flint. A `_kvtq` twin for every attention arm those hosts dispatch (per-token,
+  per-query-position, tiled, GQA flash, coopmat flash, split-KV decode v1 and v2, Flint's sink flash and reference sink kernel),
+  built from the shared loader `kv_load.glsl` (`KV_TQ`), plus `tq_rotate_q` / `tq_rotate_o`. The twins add no workgroup memory over their
+  q8_0 siblings. `TryUseInPlaceTurboQuantKv` returns false, so startup refuses, unless the twin set covers every arm the host can
+  dispatch.
+- **Vulkan row bound.** One forward takes at most `min(65535 / numKvHeads, 16 * (65535 / numHeads))` rows on a TurboQuant cache (the
+  encode and the rotations dispatch one workgroup per head vector or row, and Vulkan guarantees 65535 per dispatch dimension). The model
+  reports it as `PreferredPrefillChunkTokens` and as the hard `MaxPrefillForwardTokens`, which `TextGenerator`, an explicit
+  `--prefill-chunk-size` and the scheduler all honour.
+- **CPU `tq*q` (QJL) stays on the scratch cache** (`TurboQuantKvCache`) until step 5 (#1894); the plain CPU `TransformerModel` is the
+  only host that serves it. On CUDA and Vulkan `tq*q` is refused.
+
+**Where it runs and what is still refused** (`TurboQuantKvSupport.RefusalReason`; each refusal names its ticket):
 
 | Backend / command | Setting | TurboQuant (`tq`, `tq1`..`tq8`, `tq*q`) |
 |---|---|---|
-| CPU `serve` | `--no-paged`, plain transformer, no draft model, no MTP head | runs (`TurboQuantKvCache`; still decodes into an FP32 scratch until step 2) |
-| CPU `serve` | paged (the default) | refused: pass `--no-paged` (step 3) |
-| CPU `serve` | hybrid / recurrent / other CPU hosts | refused |
-| `run`, `chat`, `bench` | any | refused until step 2 |
-| CUDA, Vulkan, HIP (any command; `--device auto` that lands on a GPU) | any | refused until step 2 |
-| any | K and V differ (mixed pair, V-only, or different bit widths) | refused until step 6 |
-| any | head dim not a power of two or above 256, or per-layer KV widths | refused |
-| any | MLA models (DeepSeek-V2/V3, GLM-4.7-Flash, Kimi): their attention keeps its own latent KV | refused |
+| CPU `serve`, `run`, `chat`, `bench` | `--no-paged` (contiguous), plain transformer, no draft model, no MTP head | runs in place (MSE); `tq*q` on the scratch cache until #1894 |
+| CUDA `serve`, `run`, `chat`, `bench` | dense, non-paged | runs in place (MSE); `tq*q` refused (#1894) |
+| Vulkan `serve`, `run`, `chat`, `bench` | dense chain or Flint, non-paged | runs in place (MSE); `tq*q` refused (#1894) |
+| `--device auto` | lands on any of the above | same as the backend it lands on |
+| any | paged KV (the `serve` default) | refused: pass `--no-paged` (#1893) |
+| any | K and V differ (mixed pair, V-only, or different bit widths) | refused (#1895) |
+| HIP | any | refused (#1896) |
+| any | head dim not a power of two or above 256 | refused (#1897) |
+| any | per-layer KV widths, or a V head dim that differs from K | refused (#1898) |
+| any | MLA models (DeepSeek-V2/V3, GLM-4.7-Flash, Kimi): their attention keeps its own latent KV | refused (#1899) |
+| any | hybrid, recurrent, Qwen4-Exp and pipeline hosts, or a missing kernel | refused (#1900) |
+| any | speculative draft model, or an attaching MTP head | refused (#1901) |
+| any | `--cache-window > 0` | refused: a TurboQuant cache holds codes only, with no original-space window to keep |
 
-The plan for the in-place caches (rotate Q and O, code-reading attention twins) is `docs/superpowers/specs/2026-11-18-turboquant-in-place-design.md`.
+- `serve` runs the rules before the weights load (`ServerStartup.PreLoadTurboQuantRefusal`) and after (`PostLoadTurboQuantRefusal`: the
+  backend an `auto` device landed on, the host's `IModel.SupportsInPlaceTurboQuant`, an attaching MTP head). `run`, `chat` and `bench`
+  share `TurboQuantKv` (parse, pre- and post-load refusal, cache factory) with `serve`.
+- K and V are judged independently (`IsTurboQuantAny`, `IsTurboQuantMixed`). The TurboQuant branch is first in serve's KV chain, so no
+  later branch can take a TurboQuant request. CUDA G3 never runs over TurboQuant KV (`G3ServesKvCache`).
+- A refusal for one of the gaps above still ends with "use --cache-type-k/-v q8_0 or q4_0 instead": that is the only working
+  alternative while the gap is open, and each gap ticket's checklist removes it. No rule refuses a setting that runs, so a working
+  TurboQuant request never prints that hint.
+- Quality (KL, PPL, greedy identity against f16, per bit width) and speed numbers are in the PR for #1892 and in [PRECISION.md](PRECISION.md).
+
+The design is `docs/superpowers/specs/2026-11-18-turboquant-in-place-design.md`.
 
 ### Vulkan in-place block KV: q8_0, q4_0 and mixed K / V (issue #1884)
 
@@ -812,7 +878,7 @@ On each new token write, the oldest window entry is quantized and appended to th
     TwIL-8B prefill).
   - Neither path has an expansion fallback. `CudaQuantizedKvCache.ReferenceDequantScratch` keeps the pre-#1850 path as a
     test-only oracle (lazily allocated, no env var).
-- **GPU (others)**: `CudaTurboQuantKvCache` and the Vulkan quantized caches still dequantize into a scratch (#1139); the CUDA
+- **GPU (others)**: the Vulkan quantized caches still dequantize into a scratch (#1139); TurboQuant no longer does on CUDA and Vulkan (#1892, read in place); the CUDA
   hybrid host reads Q8_0 / Q4_0 in place (#956 / #1094).
 
 ### CLI

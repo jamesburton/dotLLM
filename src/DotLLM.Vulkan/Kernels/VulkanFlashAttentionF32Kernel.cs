@@ -133,14 +133,15 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         VulkanModule? wideModule, ComputePipeline? widePipeline, nint widePool,
         FlashAttentionWideVariant wideVariant,
         VulkanModule? hd512Module = null, ComputePipeline? hd512Pipeline = null, nint hd512Pool = 0,
-        VulkanKvStorage kvStorage = VulkanKvStorage.F32)
+        VulkanKvStorage kvStorage = VulkanKvStorage.F32, DotLLM.Core.Attention.TurboQuantLayout? tq = null)
     {
         _device = device;
         KvStorage = kvStorage;
+        _tq = tq;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
+        _descriptorCache = TqKvTwin.CreateCache(device, pool, pipeline, 4, tq);
         _wideModule = wideModule;
         _widePipeline = widePipeline;
         _widePool = widePool;
@@ -162,6 +163,23 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
 
     /// <summary>Element format of the K / V buffers this instance reads (issue #1102); fixed at creation.</summary>
     public VulkanKvStorage KvStorage { get; }
+
+    private readonly DotLLM.Core.Attention.TurboQuantLayout? _tq;
+
+    /// <summary>
+    /// The TurboQuant twin (issue #1892): <c>attention_flash_f32_kvtq.spv</c>, head dim up to <see cref="MaxHeadDim"/> (the base body; the
+    /// hosts that take TurboQuant KV never load a wide variant). Null when the SPIR-V is missing or the pipeline fails.
+    /// </summary>
+    /// <param name="device">Device to create the pipeline on.</param>
+    /// <param name="spvDir">Directory holding the compiled SPIR-V blobs.</param>
+    /// <param name="tq">Layout of the cached codes and norms.</param>
+    /// <returns>The created kernel, or <c>null</c>.</returns>
+    public static VulkanFlashAttentionF32Kernel? TryCreate(VulkanDevice device, string spvDir, DotLLM.Core.Attention.TurboQuantLayout tq)
+    {
+        try { return Create(device, spvDir, FlashAttentionWideVariant.None, false, VulkanKvStorage.Tq, tq); }
+        catch (FileNotFoundException) { return null; }
+        catch (VulkanException) { return null; }
+    }
 
     /// <summary>The wide-head variant this instance actually loaded, or <see cref="FlashAttentionWideVariant.None"/>.</summary>
     public FlashAttentionWideVariant WideVariant { get; }
@@ -247,7 +265,14 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
     public static VulkanFlashAttentionF32Kernel Create(
         VulkanDevice device, string spvDir, FlashAttentionWideVariant wideVariant, bool includeHd512 = false,
         VulkanKvStorage kvStorage = VulkanKvStorage.F32)
+        => Create(device, spvDir, wideVariant, includeHd512, kvStorage, null);
+
+    private static VulkanFlashAttentionF32Kernel Create(
+        VulkanDevice device, string spvDir, FlashAttentionWideVariant wideVariant, bool includeHd512,
+        VulkanKvStorage kvStorage, DotLLM.Core.Attention.TurboQuantLayout? tq)
     {
+        tq = TqKvTwin.Require(kvStorage, tq);
+        if (tq is not null) wideVariant = FlashAttentionWideVariant.None;   // no wide TurboQuant twin: the base body covers the hosts in scope
         string path = Path.Combine(spvDir, kvStorage.ShaderName("attention_flash_f32") + ".spv");
         if (!File.Exists(path))
             throw new FileNotFoundException(
@@ -257,15 +282,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         ComputePipeline pipeline;
         try
         {
-            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
-            bindings[0] = new VkDescriptorBinding(0);
-            bindings[1] = new VkDescriptorBinding(1);
-            bindings[2] = new VkDescriptorBinding(2);
-            bindings[3] = new VkDescriptorBinding(3);
-            pipeline = module.CreateComputePipeline(
-                entryPoint: "main",
-                bindings: bindings,
-                pushConstantBytes: PushConstantBytes);
+            pipeline = TqKvTwin.CreatePipeline(module, 4, PushConstantBytes, tq);
         }
         catch
         {
@@ -273,7 +290,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
             throw;
         }
 
-        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)(4 + TqKvTwin.Extra(tq)));
 
         VulkanModule? wideModule = null;
         ComputePipeline? widePipeline = null;
@@ -343,7 +360,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
 
         return new VulkanFlashAttentionF32Kernel(
             device, module, pipeline, pool, wideModule, widePipeline, widePool, wideVariant,
-            hd512Module, hd512Pipeline, hd512Pool, kvStorage);
+            hd512Module, hd512Pipeline, hd512Pool, kvStorage, tq);
     }
 
     /// <summary>
@@ -422,7 +439,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false,
         float softCap = 0.0f, float scaleOverride = 0.0f,
-        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0, TqKvOperands? tq = null)
     {
         if (seqQ <= 0) throw new ArgumentOutOfRangeException(nameof(seqQ));
         if (seqKv <= 0) throw new ArgumentOutOfRangeException(nameof(seqKv));
@@ -448,12 +465,9 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
-        long kvBytes  = KvStorage.KeyRowBytes((long)numKvHeads * headDim) * seqKv;   // per side: mixed block formats (#1884)
-        long kvBytesV = KvStorage.ValueRowBytes((long)numKvHeads * headDim) * seqKv;
         long outBytes = qBytes;
         if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
-        if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
-        if (v.Size      < kvBytesV)  throw new ArgumentException("V buffer too small.",      nameof(v));
+        TqKvTwin.CheckKv(KvStorage, _tq, tq, k, v, seqKv, numKvHeads, headDim);   // per side: mixed block formats (#1884); codes + norms for TurboQuant
         if (output.Size < outBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
         // Issue #441: heads wider than the base shader's MAX_HEAD_DIM dispatch the wide SPV,
@@ -465,7 +479,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         int queryTileRows = hd512 ? Hd512QueryTileRows : wide ? _wideQueryTileRows : QueryTileRows;
 
         Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
-        nint descriptorSet = cache.GetOrCreate(buffers);
+        nint descriptorSet = TqKvTwin.GetSet(cache, buffers, _tq, tq);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(

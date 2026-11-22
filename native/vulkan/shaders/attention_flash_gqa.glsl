@@ -47,7 +47,12 @@
 layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufQ   { vec4 q4[]; };      // [seq_q, num_heads * head_dim] F32
-#if defined(KV_F16)
+#if defined(KV_TQ)
+// TurboQuant (#1892, kv_load.glsl KV_TQ): group i is elements 4i..4i+3 of one head vector, centroid[code] * norm, in code space.
+#include "kv_load.glsl"
+vec4 loadK(uint i) { return kvTqK4(i << 2u); }
+vec4 loadV(uint i) { return kvTqV4(i << 2u); }
+#elif defined(KV_F16)
 layout(set = 0, binding = 1, std430) readonly  buffer BufK   { uvec2 k4[]; };     // [seq_kv, num_kv_heads * head_dim] F16
 layout(set = 0, binding = 2, std430) readonly  buffer BufV   { uvec2 v4[]; };
 vec4 loadK(uint i) { uvec2 w = k4[i]; return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y)); }
