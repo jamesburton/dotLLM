@@ -27,6 +27,10 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// max(1e-3, 1.25 x the G3 arm's max). A relative max bar: G3, the path this replaces, does not meet an absolute 1e-3 either
 /// (framework 2026-11-20 over 21 rows: G3 max 7.1e-3, flash 4.3e-3; both round P to F16 for a tensor-core P.V). First-token
 /// logprob within 0.01 nats; top-1 agreement reported, not gated (a near-tie may flip on a quantized model).</item>
+/// <item><b>Sensitivity (review M1, framework 2026-11-22).</b> A subtle mutant, the F16 entry's softmax scale x (1 + 1/1024), raises
+/// the max KL from 5.2e-3 to 9.8e-3 against a bound of 7.2e-3 (1.25 x G3's 5.7e-3): killed by the max bar. The median only moves
+/// 2.25e-9 -> 2.40e-9, so the median bar is a coarse guard (no tightening can see this mutant with margin); the max bar is the
+/// sensitive one.</item>
 /// </list>
 /// </summary>
 [Trait("Category", "GPU")]
