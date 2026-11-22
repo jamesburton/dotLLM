@@ -102,5 +102,9 @@ public sealed partial class VulkanTransformerModel
 
     /// <summary>Takes the entry checkpoint for an abortable tap: the KV length, after proving the cache can truncate.</summary>
     private static int TapKvCheckpoint(IKvCache? kvCache, ReadOnlySpan<int> positions)
-        => DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
+    {
+        int entry = DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
+        if (entry >= 0) HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
+        return entry;
+    }
 }

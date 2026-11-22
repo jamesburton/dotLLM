@@ -78,6 +78,17 @@ tapped and untapped runs take the same kernels; see the per-backend notes). To m
 entry. Only an abortable tap pays for the checkpoint. `TryForward(...)` reports the abort as `false` plus a `ForwardAbortInfo`; the legacy
 `Forward(...)` throws `ForwardAbortedException` after the same rollback. Use `TryForward` for per-token early exit on a hot path.
 
+**Refusal at forward entry (sliding-window caches).** `RegisterAbortableTap` never sees the KV-cache, so it cannot refuse; the check runs
+at the start of every forward while an abortable tap is attached (`AbortableTapKvGuard.Checkpoint`, one null check otherwise), before any
+KV, recurrent or device state is touched. It throws `NotSupportedException` when the cache cannot roll back to the entry length
+*after this forward's append* (`IKvCache.CanRollbackAfterAppend`). A compact sliding-window cache (`SimpleKvCache`, `QuantizedKvCache`,
+`VulkanKvCache` built with `compactSlidingWindows: true`) drops rows during the append when the write runs past its ring, and a cache with
+an FP window (`QuantizedKvCache`, `CudaQuantizedKvCache`) evicts rows into quantized storage once the append passes the window; after
+either, the entry length is unreachable and an abort could only corrupt or throw mid-forward. The message names the cache type, the
+entry length and the written positions. Ordinary contiguous decode into a compact cache stays abortable (compaction keeps a 64-row margin
+beyond the window). Checkpointing the dropped rows instead was rejected as a per-forward copy of every windowed layer; use a cache without
+compact windows (`KvGeometry.FromConfig(config)`) or a read-only tap to avoid the refusal.
+
 **Delivery timing.**
 
 | Backend | Read-only tap | Abortable tap |
