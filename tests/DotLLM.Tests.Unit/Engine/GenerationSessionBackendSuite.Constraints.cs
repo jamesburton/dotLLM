@@ -204,7 +204,11 @@ public abstract partial class GenerationSessionBackendSuite
         s.SetConstraint(json);
         long[] initial = json.GetAllowedTokens().AsSpan().ToArray();
 
-        await s.AppendObservationTokensAsync(fx.Observation);
+        // Observation made of characters this constraint could never accept first: advancing on them would corrupt (or assert in) its parse state.
+        var ct = fx.ConstraintTokenizer;
+        int[] obs = [.. Enumerable.Range(0, ct.VocabSize).Where(i => ct.DecodeToken(i) is "}" or ":" or "a")];
+        Assert.NotEmpty(obs);
+        await s.AppendObservationTokensAsync(obs);
         Assert.Equal(initial, json.GetAllowedTokens().AsSpan().ToArray());
         AssertValidObj(fx, await s.GenerateUntilBoundaryAsync(new StopAfter(60)));
     }
