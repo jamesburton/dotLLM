@@ -40,13 +40,13 @@ internal sealed class GenerationSessionFixture : IDisposable
         => new(family, headDim, backend);
 
     /// <summary>
-    /// Logit tolerance (absolute) versus a fresh-prefill oracle on the same backend: CPU 1e-4; GPU 5e-3 (#1919). The GPU figure is
-    /// measured, not assumed: the Vulkan Llama path (F16 KV, batched prefill vs one-row decode kernels) differs by up to 3.4e-3 on
+    /// Logit tolerance (absolute) versus a fresh-prefill oracle on the same backend: CPU 1e-4; GPU 1e-2 (#1919). The GPU figure is
+    /// measured, not assumed: the Vulkan Llama path (F16 KV, batched prefill vs one-row decode kernels) differs by up to 5.6e-3 on
     /// logits between a rolled-back or appended session and a fresh prefill, with identical tokens, so the 5e-4 the plan guessed is
     /// below that backend's own prefill-vs-decode noise. A dropped rollback or restore moves logits by orders of magnitude more
     /// (the mutants in .docs/progress-expert-integ.md).
     /// </summary>
-    public float LogitTolerance => Backend == SessionBackend.Cpu ? 1e-4f : 5e-3f;
+    public float LogitTolerance => Backend == SessionBackend.Cpu ? 1e-4f : 1e-2f;
 
     /// <summary>Relative part of the tolerance (unused: 0).</summary>
     public float LogitRelativeTolerance => 0f;
