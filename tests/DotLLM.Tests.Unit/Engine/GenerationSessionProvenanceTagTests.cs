@@ -84,4 +84,17 @@ public sealed class GenerationSessionProvenanceTagTests
         Assert.Equal(64, d.Length);
         Assert.Matches("^[0-9a-f]{64}$", d);
     }
+    /// <summary>#1931 review M-5: a <c>with</c> expression cannot smuggle a null past the constructor's checks.</summary>
+    [Fact]
+    public void WithExpression_NullField_IsRejected()
+    {
+        var tag = new CacheProvenanceTag("m", "t", "p", "d", "k");
+        Assert.Throws<ArgumentNullException>(() => tag with { ModelDigest = null! });
+        Assert.Throws<ArgumentNullException>(() => tag with { TokenizerRevision = null! });
+        Assert.Throws<ArgumentNullException>(() => tag with { Precision = null! });
+        Assert.Throws<ArgumentNullException>(() => tag with { ActiveModifiersDigest = null! });
+        Assert.Throws<ArgumentNullException>(() => tag with { KnowledgeSnapshotId = null! });
+        Assert.Equal(tag, tag with { ModelDigest = "m" });
+        Assert.Equal(new[] { "ModelDigest" }, tag.Diff(tag with { ModelDigest = "x" }));
+    }
 }

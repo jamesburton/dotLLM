@@ -30,6 +30,22 @@ if (s.CanRollbackTo(k)) s.RollbackTo(k);
   checked per token and per prefill chunk. A failed or cancelled forward is undone to where it started when the cache and model can; otherwise
   the session is faulted and only `RollbackTo(0)` or disposal remain.
 - `options.ResponseFormat` is not supported on a session (constraints arrive with `SetConstraint`, #1921).
+- **Faulted sessions recover with `RollbackTo(0)`** (and `CanRollbackTo(0)`), which resets KV and recurrent state completely and clears the fault; every other operation throws until then, or disposal.
+- **A forward that restored itself is not a fault.** An exception implementing `DotLLM.Core.Models.IForwardStateRestored` ("thrown after the model restored KV and recurrent state to their values at forward entry") is rethrown with the session intact: no `Recover`, no fault. Mid-segment, the tokens committed before it stay committed (`CurrentPosition`) and `GenerateUntilBoundaryAsync` continues from there. In an attention rollback re-forward the KV cut is part of the rollback and cannot be undone, so the session sits cleanly one token short (KV length == position, no next-token logits): append that token again or roll back further.
+
+## `InferenceOptions` audit
+
+| Field | On a session |
+|---|---|
+| Temperature, TopK, TopP, MinP, TopNSigma, Repetition/Frequency/Presence penalties, LogitBias, DRY*, Seed, GumbelSampling, SamplerSteps, LogitProcessors, IgnoreEos, MinTokens, ThinkingBudget | honoured (the shared `SamplerPipeline`; history is session-wide) |
+| MaxTokens | honoured, per segment |
+| StopSequences, ReasoningStopGate, StopSequencesUngated | honoured per segment (a match keeps its token, trims the text, `FinishReason.Stop`); stop strings cannot span a pause |
+| ResponseFormat, StopConditions, RepeatGuardLimit, Logprobs, TopLogprobs | rejected with `NotSupportedException` at `CreateSession` (use `SetConstraint`, the per-call stop condition, `CopyNextLogits`) |
+| GenerationPromptSuffix, SavePointPrefix, Threading | ignored (prefix-cache and threading knobs; a session bypasses the generator's prefix caches) |
+
+## Capacity
+
+`maxContextTokens = 0` (default) starts the KV-cache at 4096 tokens (`TextGenerator.DefaultInitialContextTokens`, capped at the model maximum) and grows it with `IKvCache.TryGrowTo` (x2, up to the model's `MaxSequenceLength`) when a prefill, append or generated token needs the room; admission against free device memory is whatever the GPU cache does inside `TryGrowTo`. If growth is refused (the cache cannot grow, device admission, ceiling): an append throws `InvalidOperationException`, a segment ends with `FinishReason.Length`, and a warning is traced. A positive `maxContextTokens` is a fixed capacity allocated at once (use it for a cache that cannot grow); above the model maximum it throws `ArgumentOutOfRangeException`.
 
 ## Provenance
 
@@ -82,6 +98,21 @@ The session owns its KV-cache (allocated through the generator's `kvCacheFactory
 disposes the KV-cache and all checkpoints, resets the model's recurrent state and detaches from the generator, after which a new session may open.
 Checkpoints are pooled by the model (one spare) and released with it.
 
+`DisposeAsync` is serialised with the one-operation guard: a dispose from another thread during an in-flight operation refuses new operations at once and performs the release when that operation ends (the returned task completes immediately), so no forward ever runs on freed buffers. The generator is detached even if a release step throws.
+
+### Checkpoint budget and failures
+
+`CreateSession(..., checkpointBudgetBytes)` bounds the recurrent-state checkpoints (plus a logits copy per boundary) a session holds; default 1 GiB, at most 16 boundaries. **On a GPU these are device memory (VRAM), not host RAM.** A checkpoint that fails (for example device admission) never throws after the segment committed: the oldest boundary is freed and the checkpoint retried once, otherwise the boundary is skipped (that position is not a rollback target, `SkippedBoundaries`) and a warning is traced.
+
+## Known limits
+
+- **Sampler RNG is not rewound by a rollback** (M-2): seeded stochastic sampling uses a sequential `Random`, so a continuation after `RollbackTo` differs from the original run and from a fresh session. Only `GumbelSampling` is position-seeded; use it for sessions that roll back.
+- **The segment detokenizer is new per segment** (M-4): a UTF-8 character split across a pause decodes as U+FFFD in both segments' `Text`, and stop strings cannot span segments. `TokenIds` are authoritative.
+- **Model-attached modifiers are not rolled back** (M-8): a stateful `IResidualModifier` (for example one counting consecutive triggers) keeps its state across `RollbackTo`.
+- **A forgotten dispose** (M-3) keeps a recurrent model locked to the session until the model is collected; `CreateSession` then throws naming the cause. Always dispose.
+- **Provenance is caller-asserted** (M-5): the tag is compared, never derived from the model. Prefix-cache provenance stays with #1915; a session bypasses the generator's prefix caches.
+- `StopResult.StopInclude` reports `FinishReason.Length` (mirrors `TextGenerator`; see `GenerationSegmentResult`).
+
 ## Backend status
 
 | Backend | Families | Status |
@@ -90,4 +121,4 @@ Checkpoints are pooled by the model (one spare) and released with it.
 | Vulkan | same three | `GenerationSessionVulkanTests` run and pass on the Strix Halo box (incl. a device-memory leak check across sessions) |
 | CUDA | same three | `GenerationSessionCudaTests` written and built; **not yet run** (needs an NVIDIA GPU: framework / T5500, with the owner's go). `CudaQwen3MoeHybridTransformerModel` gained `CheckpointRecurrentState` / `RestoreRecurrentState` / `RecurrentStateCheckpointBytes` for this (#1919); before, the session refused every rollback on that model |
 
-The same assertions (`GenerationSessionBackendSuite`) run on every backend. The logit tolerance versus a fresh prefill is **derived, not fixed** (James 2026-11-22, consistent with #1928): per backend and in the same run, a control measures the plain path against itself with one change, a prefill-vs-decode split (fresh prefill of the tokens versus prefill of the first half then each remaining token appended singly), the path pair every parity comparison crosses. The bound is 2 x the control's max-abs logit difference (2: the control is one realisation of the noise, the compared pair another of the same order); when the control is exactly 0 the comparison must be bit-identical, with no floor. Measured here: CPU control 0 to 1.2e-7 (bound at most 2.4e-7); Vulkan control 4e-6 to 4.8e-3 (Llama F16-KV paths are the noisy ones; hybrids stay at 1e-5 or below). Exactness of the rollback itself is asserted separately against a path-matched oracle (prefill k-1 tokens then append one) at 5e-4 on every backend.
+The same assertions (`GenerationSessionBackendSuite`) run on every backend. The logit tolerance versus a fresh prefill is **derived, not fixed** (James 2026-11-22, consistent with #1928), and its control does **not** run through the code under test: it is raw `IModel.Forward` on a fresh cache from the generator's KV factory. Arms, against one batched prefill of the same tokens: (1) a genuine **1-ULP arm** (one F32 `BitIncrement` on the largest element of token 0's residual after layer 0, through the residual-modifier hook; CPU models only, so GPU backends have no such arm), which must be observable (> 0) or the control is inert; (2) the prefill-vs-decode path split (prefill of half, the rest one row at a time). Control = the larger; bound = **k = 2** x control (the control is one realisation of the noise, the compared pair another); bit-exact when the control is exactly 0; a control above 1e-1 fails the run as a broken instrument. Exactness of an attention rollback is asserted separately against a path-matched oracle (prefill k-1 tokens then append one) at 5e-4, and a recurrent rollback must restore the logits captured at the boundary bit-exactly and decode one further token like the oracle within the derived bound.
