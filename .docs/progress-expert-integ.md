@@ -12,3 +12,17 @@ suite `FullyQualifiedName~HiddenStateTap` (68 tests). Each was reverted with `gi
 | wrong row index (Last = second-to-last row) | Registry Dispatch | KILLED, 20 |
 | PreLmHead delivers pre-norm data | each model | KILLED, 3 (`Rows_LastVsAll_AndFinalPointsRelate`) |
 - T9 dense VulkanTransformerModel taps wired: llama suite 15/15 on Vulkan (staging scheme in src/DotLLM.Vulkan/VulkanHiddenStateTaps.cs).
+
+## T9 Vulkan taps (#1920)
+
+Hosts: VulkanTransformerModel, VulkanQwen3HybridDenseTransformerModel, VulkanQwen3MoeHybridTransformerModel (shared staging helper `VulkanHiddenStateTaps`).
+Suite `HiddenStateTapVulkanTests` (49 tests: 45 abstract-suite + deferred/immediate plan equivalence x3 + MoE fused-decode bypass) green, CPU suite still green.
+Tolerance: tapped vs untapped is bit-identical (same path) everywhere except hybrid-dense ForwardBatch (untapped = fused batch, tapped = per-sequence): 1e-2 abs + identical argmax (`BatchBitExact`).
+
+| mutant (committed code, reverted with git checkout --) | result |
+|---|---|
+| tap writes back into the device residual (reverse copy, shifted) | KILLED, 14 (llama + hybrid-dense; MoE reads back synchronously so cannot be hit) |
+| fires on unsubscribed layer (PostLayer dispatched as last layer) | KILLED, 7 |
+| abort skips KV rollback (all 3 hosts) | KILLED, 9 |
+| abort skips recurrent restore (both hybrids) | KILLED, 6 |
+| MoE fused decode not bypassed with a tap | KILLED, 5 (counter test + MoE capture/abort) |
