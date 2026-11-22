@@ -379,7 +379,7 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
     /// <summary>The entry the launcher picks with no override: the default variant, falling back Staged -> Specialized -> Legacy.</summary>
     private static CudaKernels.TqPrefillVariant DefaultEntry(int hd, int bits)
     {
-        var d = CudaKernels.DefaultTqPrefillVariant;
+        var d = CudaKernels.DefaultTqPrefillVariantFor(bits);
         if (d == CudaKernels.TqPrefillVariant.Staged && !HasCpaEntry(hd, bits)) d = CudaKernels.TqPrefillVariant.Specialized;
         if (d != CudaKernels.TqPrefillVariant.Legacy && !HasSpecEntry(bits)) d = CudaKernels.TqPrefillVariant.Legacy;
         return d;

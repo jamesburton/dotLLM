@@ -131,6 +131,12 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
         foreach (var (bits, st, band) in gate)
         {
             var (klL, agL) = st[CudaKernels.TqPrefillVariant.Legacy];
+            if (CudaKernels.DefaultTqPrefillVariantFor(bits) == CudaKernels.TqPrefillVariant.Legacy)
+            {
+                // James 2026-11-22: a bit width whose default is routed to legacy is not gated on the new entries (they stay opt-in).
+                _out.WriteLine($"DEPTH b{bits}: default entry is Legacy; spec / cpa not gated at this width (opt-in only)");
+                continue;
+            }
             foreach (var v in new[] { CudaKernels.TqPrefillVariant.Specialized, CudaKernels.TqPrefillVariant.Staged })
             {
                 var (kl, ag) = st[v];

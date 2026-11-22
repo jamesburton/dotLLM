@@ -5366,7 +5366,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
 
     /// <summary>
     /// <c>DOTLLM_CUDA_TQ_PREFILL</c> = <c>legacy</c> | <c>spec</c> | <c>cpa</c> picks the TurboQuant prefill entry for the #1924 A/B;
-    /// unset = <see cref="DefaultTqPrefillVariant"/>. A variant that does not apply to a launch falls back (cpa -> spec -> legacy).
+    /// unset = <see cref="DefaultTqPrefillVariantFor"/>. A variant that does not apply to a launch falls back (cpa -> spec -> legacy).
     /// </summary>
     private static readonly TqPrefillVariant? s_tqPrefillEnvVariant = Environment.GetEnvironmentVariable("DOTLLM_CUDA_TQ_PREFILL")?.ToLowerInvariant() switch
     {
@@ -5377,10 +5377,21 @@ public sealed unsafe partial class CudaKernels : IDisposable
     };
 
     /// <summary>The TurboQuant prefill entry used when neither the environment nor a test override picks one.</summary>
-    /// <remarks>#1924 (James 2026-11-22): Legacy until the model-level bench shows Staged (E3) beating legacy and at parity with
-    /// or better than q4_0 at 7K and 32K; until then Staged / Specialized are opt-in (<c>DOTLLM_CUDA_TQ_PREFILL=cpa|spec</c>). The flip
-    /// is its own commit after that bench. Staged falls back to Specialized (hd64 tq3, unaligned code buffers), then Legacy.</remarks>
-    internal const TqPrefillVariant DefaultTqPrefillVariant = TqPrefillVariant.Legacy;
+    /// <remarks>#1924, James 2026-11-22: Staged (E3), on the model-level bench (framework RTX 3060, Qwen3-4B Q4_K_M tq4, prefill
+    /// chunk 1024): 1.34x legacy at 7K and 2.16x at 32K; 0.983x q4_0 at 7K (counted as parity) and 1.113x at 32K, with 8% fewer KV
+    /// bytes per token. tq3 has its own default (<see cref="DefaultTq3PrefillVariant"/>). Legacy stays reachable with
+    /// <c>DOTLLM_CUDA_TQ_PREFILL=legacy</c>. Staged falls back to Specialized (hd64 tq3, unaligned code buffers), then Legacy.</remarks>
+    internal const TqPrefillVariant DefaultTqPrefillVariant = TqPrefillVariant.Staged;
+
+    /// <summary>
+    /// The tq3 default (#1924, James 2026-11-22): Staged only if the depth gate's 1-ulp drift band covers its +4% mean KL to F16 KV
+    /// against legacy (0.4419 vs 0.4238); Legacy until that band is measured.
+    /// </summary>
+    internal const TqPrefillVariant DefaultTq3PrefillVariant = TqPrefillVariant.Legacy;
+
+    /// <summary>The entry used for <paramref name="mseBits"/> when neither the environment nor a test override picks one.</summary>
+    internal static TqPrefillVariant DefaultTqPrefillVariantFor(int mseBits)
+        => mseBits == 3 ? DefaultTq3PrefillVariant : DefaultTqPrefillVariant;
 
     private static int s_tqPrefillEntryReported;
 
@@ -5455,7 +5466,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         int group = numHeads / numKvHeads;
         nint fn = _attentionFlashPrefillKvTqFuncs[hdIdx];
         int smem = AttentionFlashPrefillKvqSmemBytes(headDim, group);
-        TqPrefillVariant want = TqPrefillVariantOverride ?? s_tqPrefillEnvVariant ?? DefaultTqPrefillVariant;
+        TqPrefillVariant want = TqPrefillVariantOverride ?? s_tqPrefillEnvVariant ?? DefaultTqPrefillVariantFor(mseBits);
         int bIdx = TqSpecBitsIndex(mseBits);
         bool specOk = bIdx >= 0 && normFormat is TqNormFormat.F16 or TqNormFormat.Bf16
                       && codeUintsPerVec == ((headDim * mseBits + 7) / 8 + 3) / 4;
