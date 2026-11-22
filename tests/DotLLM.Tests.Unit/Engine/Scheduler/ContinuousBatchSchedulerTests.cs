@@ -1187,6 +1187,12 @@ public sealed partial class ContinuousBatchSchedulerTests
 
         public bool RequiresPerSequenceState => _requiresPerSeqState;
 
+        /// <summary>The model's hard per-forward limit (#1892); 0 = none.</summary>
+        public int MaxPrefillForwardTokens { get; set; }
+
+        /// <summary>Token count of every <c>Forward</c> call, in order (#1892: proves a prompt is never handed over whole past the limit).</summary>
+        public List<int> ForwardLengths { get; } = new();
+
         /// <summary>When set, row logits are <c>LogitFn(lastInputToken, position, vocabIndex)</c> instead of a scripted peak (#1434 Gumbel tests).</summary>
         public Func<int, int, int, float>? LogitFn { get; set; }
 
@@ -1263,6 +1269,7 @@ public sealed partial class ContinuousBatchSchedulerTests
             int deviceId, IKvCache? kvCache)
         {
             int batchSize = tokenIds.Length;
+            ForwardLengths.Add(batchSize);
 
             // Allocate logits [batchSize, VocabSize]
             long totalFloats = (long)batchSize * VocabSize;

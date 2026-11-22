@@ -6,7 +6,7 @@
 //   - codes:  headDim packed indices of `mseBits` bits each (LSB-first within a vector,
 //             coord i at bit offset i*mseBits), tightly packed across head-vectors at
 //             byte offset hv*codeBytes (codeBytes = (headDim*mseBits + 7)/8).
-//   - norm:   one fp32 L2 norm per head-vector.
+//   - norm:   one L2 norm per head-vector in the cache's norm format (0 = F32, 1 = F16, 2 = BF16).
 // Decode reproduces the codec exactly:
 //   x[i] = centroids[code_i]                 // centroids already scaled by 1/sqrt(d)
 //   x    = WalshHadamard(x)                   // unnormalized H (H*H = d*I)
@@ -22,7 +22,7 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufCodes { uint  codes[]; };
-layout(set = 0, binding = 1, std430) readonly  buffer BufNorm  { float norms[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufNorm  { uint  norms[]; };
 layout(set = 0, binding = 2, std430) readonly  buffer BufCent  { float centroids[]; };
 layout(set = 0, binding = 3, std430) readonly  buffer BufSign  { float signs[]; };
 layout(set = 0, binding = 4, std430) writeonly buffer BufDst   { float dst[]; };
@@ -33,9 +33,17 @@ layout(push_constant) uniform PushConstants {
     uint mseBits;         // 1..8
     uint codeUintsPerVec; // ceil(codeBytes/4) — stride (in uints) between head-vectors' codes
     float invSqrtD;       // 1/sqrt(headDim), the codec's exact constant
+    uint normFormat;      // 0 = F32, 1 = F16, 2 = BF16
 } pc;
 
 shared float s[256];
+
+float loadNorm(uint hv) {
+    if (pc.normFormat == 0u) return uintBitsToFloat(norms[hv]);
+    uint h = (norms[hv >> 1u] >> ((hv & 1u) * 16u)) & 0xFFFFu;
+    if (pc.normFormat == 1u) return unpackHalf2x16(h).x;
+    return uintBitsToFloat(h << 16u);
+}
 
 void main() {
     uint hv  = gl_WorkGroupID.x;       // head-vector index
@@ -74,7 +82,7 @@ void main() {
 
     // --- 3. inverse rotation + rescale by the stored norm ---
     if (live) {
-        float outv  = s[t] * pc.invSqrtD * signs[t] * norms[hv];
+        float outv  = s[t] * pc.invSqrtD * signs[t] * loadNorm(hv);
         uint pos    = hv / pc.numKvHeads;
         uint h      = hv - pos * pc.numKvHeads;
         uint stride = pc.numKvHeads * d;

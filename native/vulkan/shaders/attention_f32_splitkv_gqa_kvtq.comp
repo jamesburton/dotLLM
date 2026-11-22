@@ -1,0 +1,6 @@
+#version 450
+// TurboQuant KV twin (issue #1892): attention_f32_splitkv_gqa.glsl with the K / V loads replaced by kv_load.glsl KV_TQ (codes and norms
+// read in place, in code space; the host rotates Q in before and the output out after).
+#define KV_TQ 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32_splitkv_gqa.glsl"

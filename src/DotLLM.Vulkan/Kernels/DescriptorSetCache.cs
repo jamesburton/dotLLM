@@ -61,6 +61,8 @@ internal sealed class DescriptorSetCache
     private readonly nint _setLayout;
     private readonly int _buffersPerSet;
     private readonly uint _writesMask;
+    private readonly int _tailCount;
+    private readonly uint _tailFirstBinding;
 
     // Parallel arrays indexed by slot. _keys[i] holds MaxBuffersPerSet nints;
     // unused trailing slots are zero. _sets[i] is the descriptor set handle
@@ -88,8 +90,21 @@ internal sealed class DescriptorSetCache
     /// set to the device's active <see cref="VulkanHazardTracker"/> (issue
     /// #144) right before the caller records the dispatch.
     /// </summary>
-    public DescriptorSetCache(VulkanDevice device, nint pool, ComputePipeline pipeline, int buffersPerSet)
+    /// <param name="device">The device.</param>
+    /// <param name="pool">Descriptor pool the sets come from.</param>
+    /// <param name="pipeline">Pipeline whose set layout the sets use.</param>
+    /// <param name="buffersPerSet">Buffers per set, the tail included.</param>
+    /// <param name="tailCount">
+    /// Number of trailing buffers bound at fixed binding numbers from <paramref name="tailFirstBinding"/> instead of at their index
+    /// (the TurboQuant KV operands at bindings 12..14, #1892). Their hazard-mask bits are clear: the tail is read-only by contract.
+    /// </param>
+    /// <param name="tailFirstBinding">Binding number of the first tail buffer.</param>
+    public DescriptorSetCache(VulkanDevice device, nint pool, ComputePipeline pipeline, int buffersPerSet, int tailCount = 0, uint tailFirstBinding = 0)
     {
+        if (tailCount < 0 || tailCount >= buffersPerSet || (tailCount > 0 && tailFirstBinding < (uint)(buffersPerSet - tailCount)))
+            throw new ArgumentOutOfRangeException(nameof(tailCount));
+        _tailCount = tailCount;
+        _tailFirstBinding = tailFirstBinding;
         if (buffersPerSet <= 0 || buffersPerSet > MaxBuffersPerSet)
             throw new ArgumentOutOfRangeException(nameof(buffersPerSet));
         _device = device;
@@ -155,7 +170,7 @@ internal sealed class DescriptorSetCache
         nint set = _freeCount > 0
             ? _freeSets[--_freeCount]
             : KernelSupport.AllocateDescriptorSet(_device, _pool, _setLayout);
-        KernelSupport.WriteBufferBindings(_device, set, buffers);
+        KernelSupport.WriteBufferBindings(_device, set, buffers, tailCount: _tailCount, tailFirstBinding: _tailFirstBinding);
         _device.RecordBuffersBound(buffers);
 
         int slot = _count;
@@ -183,6 +198,7 @@ internal sealed class DescriptorSetCache
     /// </summary>
     public nint GetOrCreateWithOffsets(ReadOnlySpan<nint> buffers, ReadOnlySpan<ulong> offsets)
     {
+        if (_tailCount != 0) throw new InvalidOperationException("Sub-range sets do not support tail bindings.");
         if (buffers.Length != _buffersPerSet || buffers.Length > 4 || offsets.Length != buffers.Length)
             throw new ArgumentException($"Expected {_buffersPerSet} (<= 4) buffers and as many offsets.", nameof(buffers));
         for (int i = 0; i < offsets.Length; i++)

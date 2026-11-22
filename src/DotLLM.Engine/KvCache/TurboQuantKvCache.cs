@@ -9,7 +9,7 @@ namespace DotLLM.Engine.KvCache;
 /// <summary>
 /// KV-cache backed by the data-oblivious <see cref="TurboQuantCodec"/> (arXiv:2504.19874,
 /// MSE stage). Each cached K/V <b>head vector</b> (dimension <c>headDim</c>) is stored as
-/// per-coordinate Lloyd–Max codes plus one fp32 norm; attention dequantizes the whole live
+/// per-coordinate Lloyd–Max codes plus one norm (F16 by default); attention dequantizes the whole live
 /// range into a shared fp32 scratch on demand, so the model's existing full-precision
 /// attention path runs unchanged.
 /// </summary>
@@ -38,7 +38,7 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
 {
     private readonly nint[] _keyCodes;    // [numLayers] -> [maxSeqLen * numKvHeads * codeBytes]
     private readonly nint[] _valueCodes;  // [numLayers]
-    private readonly nint[] _keyNorms;    // [numLayers] -> [maxSeqLen * numKvHeads] fp32
+    private readonly nint[] _keyNorms;    // [numLayers] -> [maxSeqLen * numKvHeads * normBytes] in _normFormat
     private readonly nint[] _valueNorms;  // [numLayers]
     private readonly nint _kScratch;      // [maxSeqLen * stride] fp32, shared across layers
     private readonly nint _vScratch;
@@ -53,6 +53,12 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
     private readonly int _maxSeqLen;
     private int _currentLength;
     private bool _disposed;
+    private readonly TqNormFormat _normFormat;
+    private readonly int _normBytes;      // bytes per stored norm
+    private long _normSaturations;
+    private long _normUnderflows;
+    private readonly float _normJitter;
+    private ulong _jitterState = 0x9E3779B97F4A7C15UL;
 
     /// <inheritdoc/>
     public int CurrentLength => _currentLength;
@@ -75,9 +81,22 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
     /// <summary>Whether the QJL unbiased-score residual stage is active.</summary>
     public bool UseQjl => _codecK.UseQjl;
 
+    /// <summary>Format the per-head-vector norms are stored in (default <see cref="TurboQuantLayout.DefaultNorm"/>).</summary>
+    public TqNormFormat NormFormat => _normFormat;
+
+    /// <summary>Norms that exceeded the format's range and were clamped on store.</summary>
+    public long NormSaturations => Volatile.Read(ref _normSaturations);
+
+    /// <summary>
+    /// Non-zero norms that decoded to zero under the storage format. This counts a full flush to zero only: a norm that lands in the
+    /// format's subnormal range (F16 below 6.1e-5) decodes non-zero but with fewer significant bits, and is NOT counted here.
+    /// Norms of real activations sit far above that (E17 in docs/PRECISION.md saw none), so a non-zero count is already a finding.
+    /// </summary>
+    public long NormUnderflows => Volatile.Read(ref _normUnderflows);
+
     /// <summary>Total bytes for the permanent compressed store (codes + norms; excludes scratch).</summary>
     public long AllocatedBytes =>
-        (long)_numLayers * 2 * _maxSeqLen * _numKvHeads * ((long)_codeBytes + sizeof(float));
+        (long)_numLayers * 2 * _maxSeqLen * _numKvHeads * ((long)_codeBytes + _normBytes);
 
     /// <summary>
     /// Creates a TurboQuant KV-cache for a uniform-geometry model.
@@ -93,9 +112,16 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
     /// <param name="useQjl">Enable the QJL 1-bit residual stage for unbiased attention scores
     /// (debiases the MSE contraction; raises ℓ2 error but removes score bias — see
     /// <see cref="TurboQuantCodec"/>).</param>
+    /// <param name="normFormat">Storage format of the per-head-vector norm (default <see cref="TurboQuantLayout.DefaultNorm"/>, F16). Norms are really stored in this format and decoded through <see cref="TurboQuantNormCodec"/>, the same codec the GPU backends match. <see cref="TqNormFormat.F32Reference"/> is for oracles and A/B only.</param>
+    /// <param name="normJitter">Measurement-only null control (#1892): multiplies every stored norm by <c>1 + u*normJitter</c>, u pseudo-random in [-1,1]. A perturbation of known tiny size, to measure the instrument's noise floor. Default 0 = off.</param>
     public TurboQuantKvCache(int numLayers, int numKvHeads, int headDim, int maxSeqLen,
-                             int bits, ulong seed, bool useQjl = false)
+                             int bits, ulong seed, bool useQjl = false,
+                             TqNormFormat? normFormat = null,
+                             float normJitter = 0f)
     {
+        _normFormat = normFormat ?? TurboQuantLayout.DefaultNorm;
+        _normBytes = TurboQuantNormCodec.BytesPerNorm(_normFormat);
+        _normJitter = normJitter;
         if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
         if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
         if (maxSeqLen <= 0) throw new ArgumentOutOfRangeException(nameof(maxSeqLen));
@@ -108,7 +134,7 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
 
         // Independent K/V rotations (paper-consistent): derive a distinct V seed.
         _codecK = new TurboQuantCodec(headDim, bits, seed, useQjl);
-        _codecV = new TurboQuantCodec(headDim, bits, seed ^ 0xD1B54A32D192ED03UL, useQjl);
+        _codecV = new TurboQuantCodec(headDim, bits, seed ^ TurboQuantCodec.VSeedMask, useQjl);
         _codeBytes = _codecK.CodeBytesPerVector;
 
         _keyCodes = new nint[numLayers];
@@ -117,7 +143,7 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
         _valueNorms = new nint[numLayers];
 
         nuint codeBytesPerLayer = (nuint)((long)maxSeqLen * numKvHeads * _codeBytes);
-        nuint normBytesPerLayer = (nuint)((long)maxSeqLen * numKvHeads * sizeof(float));
+        nuint normBytesPerLayer = (nuint)((long)maxSeqLen * numKvHeads * _normBytes);
         for (int i = 0; i < numLayers; i++)
         {
             _keyCodes[i] = (nint)NativeMemory.AlignedAlloc(codeBytesPerLayer, 64);
@@ -143,8 +169,8 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
 
         byte* kCodes = (byte*)_keyCodes[layerIndex];
         byte* vCodes = (byte*)_valueCodes[layerIndex];
-        float* kNorms = (float*)_keyNorms[layerIndex];
-        float* vNorms = (float*)_valueNorms[layerIndex];
+        byte* kNorms = (byte*)_keyNorms[layerIndex];
+        byte* vNorms = (byte*)_valueNorms[layerIndex];
 
         int maxPos = -1;
         for (int i = 0; i < seqLen; i++)
@@ -165,14 +191,42 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
                 var kDst = new Span<byte>(kCodes + (long)headIdx * _codeBytes, _codeBytes);
                 var vDst = new Span<byte>(vCodes + (long)headIdx * _codeBytes, _codeBytes);
 
-                kNorms[headIdx] = _codecK.Encode(kVec, kDst);
-                vNorms[headIdx] = _codecV.Encode(vVec, vDst);
+                StoreNorm(kNorms, headIdx, _codecK.Encode(kVec, kDst));
+                StoreNorm(vNorms, headIdx, _codecV.Encode(vVec, vDst));
             }
         }
 
         int newLength = maxPos + 1;
         if (newLength > _currentLength) _currentLength = newLength;
     }
+
+    // Stores one norm in the cache's format via the shared codec. normJitter is a harness-only null control
+    // (#1892) that perturbs the norm before it is stored; it is 0 (off) everywhere else.
+    private void StoreNorm(byte* norms, int headIdx, float norm)
+    {
+        if (_normJitter != 0f)
+        {
+            _jitterState += 0x9E3779B97F4A7C15UL;
+            ulong z = _jitterState;
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+            z ^= z >> 31;
+            float u = ((z >> 40) * (1.0f / 8388608.0f)) - 1.0f; // [-1, 1)
+            norm *= 1f + u * _normJitter;
+        }
+        var dst = new Span<byte>(norms + (long)headIdx * _normBytes, _normBytes);
+        TurboQuantNormCodec.Encode(_normFormat, new ReadOnlySpan<float>(in norm), dst, out int sat);
+        if (sat != 0) Interlocked.Add(ref _normSaturations, sat);   // atomic: Update is public and may run for several layers at once
+        if (norm > 0f && TurboQuantNormCodec.Decode(_normFormat, dst, 0) == 0f) Interlocked.Increment(ref _normUnderflows);
+    }
+
+    /// <summary>
+    /// The raw stored norm bytes of a layer for positions <c>[0, CurrentLength)</c> (all KV heads), in
+    /// <see cref="NormFormat"/>. Exposed so tests can compare against the shared codec and other backends.
+    /// </summary>
+    public ReadOnlySpan<byte> StoredNormBytes(int layerIndex, bool values)
+        => new((void*)(values ? _valueNorms[layerIndex] : _keyNorms[layerIndex]),
+               checked(_currentLength * _numKvHeads * _normBytes));
 
     /// <inheritdoc/>
     public void Update(ITensor keys, ITensor values, ReadOnlySpan<int> positions, int layerIndex)
@@ -201,7 +255,7 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
     private void Dequantize(nint codesPtr, nint normsPtr, nint scratch, TurboQuantCodec codec)
     {
         byte* codes = (byte*)codesPtr;
-        float* norms = (float*)normsPtr;
+        var norms = new ReadOnlySpan<byte>((void*)normsPtr, _maxSeqLen * _numKvHeads * _normBytes);
         float* dst = (float*)scratch;
 
         for (int pos = 0; pos < _currentLength; pos++)
@@ -211,7 +265,7 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
                 int headIdx = pos * _numKvHeads + h;
                 var src = new ReadOnlySpan<byte>(codes + (long)headIdx * _codeBytes, _codeBytes);
                 var outSpan = new Span<float>(dst + pos * _stride + h * _headDim, _headDim);
-                codec.Decode(src, norms[headIdx], outSpan);
+                codec.Decode(src, TurboQuantNormCodec.Decode(_normFormat, norms, headIdx), outSpan);
             }
         }
     }

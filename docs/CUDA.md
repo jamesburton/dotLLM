@@ -1447,6 +1447,30 @@ same peak VRAM; logits bit-identical to eager (`CudaFlintCpuMoeTests.MoeDecodeGr
 mixed and all-CPU placements on the synthetic Flint with a NoPE layer, sinks and a 4-token window); real-file parity
 (`CudaFlintCpuMoeRealProbe`) 158/160 top-1, KL mean 2.1e-3, unchanged.
 
+## TurboQuant KV read in place (#1892)
+
+`CudaTransformerModel` (dense, non-paged) serves `--cache-type-k/-v tq1..tq8` from `CudaTurboQuantInPlaceKvCache`: per layer and side,
+packed codes (`[position, kvHead, CodeUintsPerVec]` 32-bit words and one trailing guard word) and F16 norms. Nothing is decoded into a
+history. Layout, rotations, refusals: [KV_CACHE.md](KV_CACHE.md). `CudaTurboQuantInPlaceAttention.Run()` is the one entry the forward
+pass and the tests call; it throws when a kernel is missing instead of falling back to a dequant path.
+
+| Kernel | File | Role |
+|---|---|---|
+| `turboquant_encode_f32`, `turboquant_encode_f16` | `turboquant.cu` | quantize one head vector per block into codes + norm; byte-exact with the CPU codec (fixed pairwise reduction over 256 lanes) |
+| `tq_rotate_q_f16`, `tq_rotate_o_f16`, `tq_rotate_o_f32` (+ `_dyn` row-count variants of the q and f32 forms) | `turboquant_rotate.cu` | in-place FWHT with the sign diagonal: Q after RoPE (K signs), O after attention (V signs). The dense forward keeps the attention output F16 (`tq_rotate_o_f16`, no FP32 widening) |
+| `attention_kvtq` | `attention_kvtq.cu` | scalar code-space attention: decode and prefill, sinks, sliding window, any GQA ratio, power-of-two head dim up to 256 |
+| `attention_flash_mma_prefill_kvq_hd{64,128}_tqtq` | `attention_flash_mma_prefill_kvq.cu` | tensor-core flash prefill reading codes; the shared body and the q8_0 / q4_0 entries are untouched. hd256 takes the scalar kernel |
+
+- Accumulation is F32 in registers; the stored history is codes and F16 norms only.
+- Decode is **eager**: a non-windowed quantized cache never enters CUDA graph capture, and a test pins that (gap ticket #1918). The `_dyn`
+  rotation variants read the row count from a device pointer, but the attention twins have no `_dyn` form, so nothing captures it.
+- **Build flags.** `turboquant.cu` and `turboquant_rotate.cu` are built `-fmad=false` (no fast-math): encode must match the CPU bit for bit.
+  `attention_kvtq.cu` is built **default fmad, no fast-math**, as in `build_ptx.bat` (in neither its FAST_MATH nor its NO_FMA list); the
+  committed PTX follows the bat. `native/build.ps1` lists it in `$noFastMath` to match. One pre-existing difference remains: `build.ps1`
+  builds `attention_flash_mma_prefill_kvq.cu` (which holds the `_tqtq` entries) with `--use_fast_math` and the bat does not.
+- A model-level gate at 3 bits would be dominated by the codec (SmolLM-135M at tq3: oracle vs F16 logit cosine 0.79), so tq3 is gated at kernel level;
+  tq4 and tq8 are gated through the real forward against the scratch oracle.
+
 ## Running CUDA tests under ZLUDA on AMD (opt-in functional smoke, #1663)
 
 Measured 2026-11-09 on a Strix Halo iGPU (gfx1151, Windows, Adrenalin `amdhip64_7.dll`), ZLUDA v7-preview.20. **Functional smoke only, not a parity gate.**

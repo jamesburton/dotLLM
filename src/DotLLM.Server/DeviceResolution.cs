@@ -134,10 +134,12 @@ public static class DeviceModelLoader
     /// <param name="warn">Warnings.</param>
     /// <param name="moeOffload">Routed-expert offload (CUDA <c>nemotron_h_moe</c>, #1070); null = defaults plus environment.</param>
     /// <param name="prefillChunkTokens">The <c>--prefill-chunk-size</c> value (0 = the split default) an automatic split plans for (#1851).</param>
+    /// <param name="kv">The requested KV storage: an automatic split plans a TurboQuant cache's real bytes (#1892). Null = F16.</param>
     /// <returns>The model and its KV-cache factory (null for the CPU model).</returns>
     public static (IModel Model, Func<int, IKvCache>? KvCacheFactory) LoadExact(
         GgufFile gguf, ModelConfig config, string canonicalDevice, int? requestedGpuLayers,
-        ThreadingConfig threading, Action<string> log, Action<string> warn, MoeOffloadOptions? moeOffload = null, int prefillChunkTokens = 0)
+        ThreadingConfig threading, Action<string> log, Action<string> warn, MoeOffloadOptions? moeOffload = null, int prefillChunkTokens = 0,
+        KvCacheConfig? kv = null)
     {
         var spec = DeviceSpec.Parse(canonicalDevice);
         if (spec.Kind == DeviceKind.Auto)
@@ -170,8 +172,8 @@ public static class DeviceModelLoader
                 warn("--gpu-layers is ignored on vulkan: the whole model is device-resident (there is no partial offload).");
             var vkDev = VulkanDeviceFor(spec);
             log($"Vulkan inference ({vkDev.DeviceName})");
-            var (m, kv) = DotLLM.Vulkan.VulkanModelLoader.CreateOnDeviceFromGguf(gguf, config, spec.VulkanIndex);
-            return (m, kv);
+            var (m, vkKv) = DotLLM.Vulkan.VulkanModelLoader.CreateOnDeviceFromGguf(gguf, config, spec.VulkanIndex);
+            return (m, vkKv);
         }
 
         if (GpuOffloadPlanner.IsAuto(requestedGpuLayers))
@@ -181,7 +183,7 @@ public static class DeviceModelLoader
                 // #1851: the planner chooses N and logs the placement and why.
                 var autoMoe = moeOffload ?? MoeOffloadOptions.WithEnvironmentFallback(null);
                 return DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(gguf, config, GpuOffloadPlanner.AutoGpuLayers, spec.Ordinal, threading,
-                    warn, autoMoe with { Log = autoMoe.Log ?? log }, ProbeIgpu, log, prefillChunkTokens);
+                    warn, autoMoe with { Log = autoMoe.Log ?? log }, ProbeIgpu, log, prefillChunkTokens, kv);
             }
             requestedGpuLayers = 0;   // --device cpu --gpu-layers auto: nothing to place on a GPU
         }
@@ -262,14 +264,15 @@ public static class DeviceModelLoader
     /// <param name="warn">Warnings.</param>
     /// <param name="moeOffload">Routed-expert offload (CUDA <c>nemotron_h_moe</c>, #1070); null = defaults plus environment.</param>
     /// <param name="prefillChunkTokens">The <c>--prefill-chunk-size</c> value (0 = the split default) an automatic split plans for (#1851).</param>
+    /// <param name="kv">The requested KV storage: an automatic split plans a TurboQuant cache's real bytes (#1892). Null = F16.</param>
     /// <returns>The load result.</returns>
     public static DeviceLoadResult Load(
         GgufFile gguf, ModelConfig config, string requestedDevice, int? requestedGpuLayers,
         ThreadingConfig threading, long modelBytes, string modelName, Action<string> log, Action<string> warn,
-        MoeOffloadOptions? moeOffload = null, int prefillChunkTokens = 0)
+        MoeOffloadOptions? moeOffload = null, int prefillChunkTokens = 0, KvCacheConfig? kv = null)
         => LoadWith(gguf, config, requestedDevice, requestedGpuLayers, threading, modelBytes, modelName, log, warn,
             Endpoints.DeviceEndpoint.Describe(),
-            (device, layers) => LoadExact(gguf, config, device, layers, threading, log, warn, moeOffload, prefillChunkTokens), moeOffload,
+            (device, layers) => LoadExact(gguf, config, device, layers, threading, log, warn, moeOffload, prefillChunkTokens, kv), moeOffload,
             c => DotLLM.Cuda.CudaAutoSplit.Blocker(gguf, c));
 
     /// <summary>

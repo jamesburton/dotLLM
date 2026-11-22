@@ -30,25 +30,28 @@ public sealed class AttentionQueryPositionsKernel : IDisposable
     /// <summary>KV element format this instance reads.</summary>
     public VulkanKvStorage KvStorage { get; }
 
-    private AttentionQueryPositionsKernel(VulkanDevice device, string spvDir, VulkanKvStorage storage)
+    private readonly DotLLM.Core.Attention.TurboQuantLayout? _tq;
+
+    private AttentionQueryPositionsKernel(VulkanDevice device, string spvDir, VulkanKvStorage storage, DotLLM.Core.Attention.TurboQuantLayout? tq)
     {
         _device = device;
         KvStorage = storage;
+        _tq = TqKvTwin.Require(storage, tq);
         string path = Path.Combine(spvDir, storage.ShaderName("attention_f32_qpos") + ".spv");
         if (!File.Exists(path)) throw new FileNotFoundException($"Vulkan SPIR-V not found: {path}.");
         _module = VulkanModule.LoadFromFile(device, path);
-        var bindings = new VkDescriptorBinding[]
-        {
-            new(0), new(1), new(2), new(3), new(4),
-        };
-        _pipeline = _module.CreateComputePipeline("main", bindings, PushConstantBytes);
-        _pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 5);
-        _cache = new DescriptorSetCache(device, _pool, _pipeline, buffersPerSet: 5);
+        _pipeline = TqKvTwin.CreatePipeline(_module, 5, PushConstantBytes, _tq);
+        _pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)(5 + TqKvTwin.Extra(_tq)));
+        _cache = TqKvTwin.CreateCache(device, _pool, _pipeline, 5, _tq);
     }
 
     /// <summary>Loads the pipeline for <paramref name="storage"/> KV from <paramref name="spvDir"/>.</summary>
     public static AttentionQueryPositionsKernel Create(VulkanDevice device, string spvDir, VulkanKvStorage storage = VulkanKvStorage.F32)
-        => new(device, spvDir, storage);
+        => new(device, spvDir, storage, null);
+
+    /// <summary>The TurboQuant twin (issue #1892): reads codes and norms in <paramref name="tq"/>'s layout in place.</summary>
+    public static AttentionQueryPositionsKernel Create(VulkanDevice device, string spvDir, DotLLM.Core.Attention.TurboQuantLayout tq)
+        => new(device, spvDir, VulkanKvStorage.Tq, tq);
 
     /// <summary>Drops cached descriptor sets; call when scratch buffers were re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _cache.Reset();
@@ -57,7 +60,7 @@ public sealed class AttentionQueryPositionsKernel : IDisposable
     public unsafe void Record(nint cmdBuf,
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output, VulkanDevice.Buffer queryPositions,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
-        int slidingWindow = 0, float softCap = 0.0f, float scaleOverride = 0.0f)
+        int slidingWindow = 0, float softCap = 0.0f, float scaleOverride = 0.0f, TqKvOperands? tq = null)
     {
         if (seqQ <= 0) throw new ArgumentOutOfRangeException(nameof(seqQ));
         if (seqKv <= 0) throw new ArgumentOutOfRangeException(nameof(seqKv));
@@ -65,14 +68,12 @@ public sealed class AttentionQueryPositionsKernel : IDisposable
         if (headDim <= 0 || headDim > MaxHeadDim) throw new ArgumentOutOfRangeException(nameof(headDim));
         if (slidingWindow < 0 || softCap < 0 || scaleOverride < 0) throw new ArgumentOutOfRangeException(nameof(slidingWindow));
         long qBytes = (long)seqQ * numHeads * headDim * sizeof(float);
-        long kvBytes  = KvStorage.KeyRowBytes((long)numKvHeads * headDim) * seqKv;   // per side: mixed block formats (#1884)
-        long kvBytesV = KvStorage.ValueRowBytes((long)numKvHeads * headDim) * seqKv;
         if (q.Size < qBytes || output.Size < qBytes) throw new ArgumentException("Q/output buffer too small.");
-        if (k.Size < kvBytes || v.Size < kvBytesV) throw new ArgumentException("K/V buffer too small.");
+        TqKvTwin.CheckKv(KvStorage, _tq, tq, k, v, seqKv, numKvHeads, headDim);   // per side: mixed block formats (#1884); codes + norms for TurboQuant
         if (queryPositions.Size < (long)seqQ * sizeof(int)) throw new ArgumentException("Positions buffer too small.", nameof(queryPositions));
 
         Span<nint> buffers = stackalloc nint[5] { q.Handle, k.Handle, v.Handle, output.Handle, queryPositions.Handle };
-        nint set = _cache.GetOrCreate(buffers);
+        nint set = TqKvTwin.GetSet(_cache, buffers, _tq, tq);
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, set, 0, 0);
 
