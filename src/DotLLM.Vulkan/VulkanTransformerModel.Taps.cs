@@ -101,6 +101,14 @@ public sealed partial class VulkanTransformerModel
         return null;
     }
 
+    /// <summary>Undoes a failed tapped forward's KV writes (best effort on a windowed cache a read-only tap may legitimately use).</summary>
+    internal static void RollbackKvAfterTapFailure(IKvCache? kvCache, int entry)
+    {
+        if (kvCache is null || entry < 0 || kvCache.CurrentLength <= entry) return;
+        try { kvCache.Rollback(entry); }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException) { }
+    }
+
     /// <summary>Takes the entry checkpoint for an abortable tap: the KV length, after proving the cache can truncate.</summary>
     private static int TapKvCheckpoint(IKvCache? kvCache, ReadOnlySpan<int> positions)
     {

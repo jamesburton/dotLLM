@@ -1023,19 +1023,31 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         var results = new ITensor[requests.Count];
-        bool tapped = _tapState?.Registry.Current is not null;
-        for (int i = 0; i < requests.Count; i++)
+        var batchTaps = _tapState?.Registry.Current;
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.RefuseAbortableBatch(batchTaps);   // abort of request i would leave 0..i-1 committed (#1920 I-6)
+        bool tapped = batchTaps is not null;
+        int done = 0;
+        try
         {
-            var r = requests[i];
-            if (tapped) _tapState!.SeqId = i;
-            try
+            for (int i = 0; i < requests.Count; i++)
             {
-                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+                var r = requests[i];
+                if (tapped) _tapState!.SeqId = i;
+                try
+                {
+                    results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+                    done++;
+                }
+                finally
+                {
+                    if (tapped) _tapState!.SeqId = 0;
+                }
             }
-            finally
-            {
-                if (tapped) _tapState!.SeqId = 0;
-            }
+        }
+        catch
+        {
+            for (int d = 0; d < done; d++) results[d].Dispose();   // do not leak the completed requests' logits
+            throw;
         }
         return results;
     }
@@ -3459,6 +3471,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     {
         _gumbelHostDrawer?.Dispose();
         _tapState?.Dispose();
+        Interlocked.Exchange(ref _tapSpareClone, null)?.Dispose();
         CloseCheckpoints();
         DisposeMtp();
         _submit.Dispose();

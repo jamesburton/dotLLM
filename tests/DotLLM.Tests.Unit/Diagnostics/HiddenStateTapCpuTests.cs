@@ -17,7 +17,7 @@ internal sealed class CpuHiddenStateTapFixture : HiddenStateTapFixture
     private readonly ModelConfig _config;
     private readonly string _family;
 
-    public CpuHiddenStateTapFixture(string family)
+    public CpuHiddenStateTapFixture(string family, bool withMtp = false)
     {
         _family = family;
         _dir = Path.Combine(Path.GetTempPath(), $"dotllm-taps-{Guid.NewGuid():N}");
@@ -30,7 +30,7 @@ internal sealed class CpuHiddenStateTapFixture : HiddenStateTapFixture
                 Prompt = [3, 9, 14, 5, 21, 8, 30, 2];
                 break;
             case HiddenStateTapBackendSuite.HybridDense:
-                SyntheticQwen35HybridDenseMtpGguf.Write(path, withMtp: false, contextLength: 256);
+                SyntheticQwen35HybridDenseMtpGguf.Write(path, withMtp: withMtp, contextLength: 256);
                 Prompt = [3, 4, 5, 6, 3, 7, 5, 4];
                 break;
             case HiddenStateTapBackendSuite.MoeHybrid:
@@ -99,4 +99,5 @@ internal sealed class CpuHiddenStateTapFixture : HiddenStateTapFixture
 public sealed class HiddenStateTapCpuTests : HiddenStateTapBackendSuite
 {
     protected override HiddenStateTapFixture Open(string family) => new CpuHiddenStateTapFixture(family);
+    protected override HiddenStateTapFixture? OpenHybridDenseWithMtp() => new CpuHiddenStateTapFixture(HybridDense, withMtp: true);
 }

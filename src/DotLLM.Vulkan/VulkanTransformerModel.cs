@@ -4403,7 +4403,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         }
         // A hidden-state tap needs each sequence's own rows: the fused batched layer loop has no tap sites, so every sequence takes the
         // per-sequence core (#1920).
-        bool tapped = _tapState?.Registry.Current is not null;
+        var batchTaps = _tapState?.Registry.Current;
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.RefuseAbortableBatch(batchTaps);   // abort of request i would leave 0..i-1 committed (#1920 I-6)
+        bool tapped = batchTaps is not null;
         if (tapped)
         {
             if (!modelHasMlaOrMoe)
@@ -4889,8 +4891,27 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         => ForwardInner(tokenIds, positions, deviceId, kvCache)
            ?? throw new DotLLM.Core.Diagnostics.ForwardAbortedException(_tapAbort);
 
-    /// <summary>The single-sequence forward; <see langword="null"/> when an abortable hidden-state tap aborted it (#1920, <c>_tapAbort</c> says where).</summary>
+    /// <summary>
+    /// The single-sequence forward; <see langword="null"/> when an abortable hidden-state tap aborted it (#1920, <c>_tapAbort</c> says where).
+    /// With a tap attached, a throwing callback rolls the KV-cache back to its entry length and ends the tap plan, then rethrows (I-1).
+    /// </summary>
     private ITensor? ForwardInner(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+    {
+        if (_tapState?.Registry.Current is null)
+            return ForwardInnerCore(tokenIds, positions, deviceId, kvCache);
+        int entry = kvCache?.CurrentLength ?? -1;
+        try { return ForwardInnerCore(tokenIds, positions, deviceId, kvCache); }
+        catch
+        {
+            RollbackKvAfterTapFailure(kvCache, entry);
+            _tapState?.End();
+            DpEnd();
+            if (_profActive) ProfEnd(tokenIds.Length);
+            throw;
+        }
+    }
+
+    private ITensor? ForwardInnerCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
     {
         if (tokenIds.Length != positions.Length)
             throw new ArgumentException("tokenIds and positions must have the same length.");

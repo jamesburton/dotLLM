@@ -20,7 +20,7 @@ internal sealed class VulkanHiddenStateTapFixture : HiddenStateTapFixture
     private readonly Func<int, IKvCache> _kvFactory;
     private readonly VulkanDevice _device;
 
-    public VulkanHiddenStateTapFixture(string family)
+    public VulkanHiddenStateTapFixture(string family, bool withMtp = false)
     {
         _family = family;
         _dir = Path.Combine(Path.GetTempPath(), $"dotllm-taps-vk-{Guid.NewGuid():N}");
@@ -33,7 +33,7 @@ internal sealed class VulkanHiddenStateTapFixture : HiddenStateTapFixture
                 Prompt = [3, 9, 14, 5, 21, 8, 30, 2];
                 break;
             case HiddenStateTapBackendSuite.HybridDense:
-                SyntheticQwen35HybridDenseMtpGguf.Write(path, withMtp: false, contextLength: 256);
+                SyntheticQwen35HybridDenseMtpGguf.Write(path, withMtp: withMtp, contextLength: 256);
                 Prompt = [3, 4, 5, 6, 3, 7, 5, 4];
                 break;
             case HiddenStateTapBackendSuite.MoeHybrid:
@@ -134,6 +134,12 @@ public sealed class HiddenStateTapVulkanTests : HiddenStateTapBackendSuite
     {
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device available on this host.");
         return new VulkanHiddenStateTapFixture(family);
+    }
+
+    protected override HiddenStateTapFixture? OpenHybridDenseWithMtp()
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device available on this host.");
+        return new VulkanHiddenStateTapFixture(HybridDense, withMtp: true);
     }
 
     private static readonly DotLLM.Core.Diagnostics.HookPoint[] All4 =

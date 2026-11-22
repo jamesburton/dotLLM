@@ -1367,7 +1367,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
         ValidateBatchRequests(requests);
 
-        bool tapped = _tapState?.Registry.Current is not null;
+        var batchTaps = _tapState?.Registry.Current;
+        AbortableTapKvGuard.RefuseAbortableBatch(batchTaps);   // abort of request i would leave 0..i-1 committed (#1920 I-6)
+        bool tapped = batchTaps is not null;
         if (requests.Count >= 2 && BatchFuseEnabled && _prof is null && TotalRows(requests) >= BatchFuseMinRows)
         {
             // A hidden-state tap needs each sequence's own rows: the fused batched loop has no tap sites (#1920).
@@ -1377,18 +1379,28 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         }
 
         var results = new ITensor[requests.Count];
-        for (int i = 0; i < requests.Count; i++)
+        int done = 0;
+        try
         {
-            var r = requests[i];
-            if (tapped) _tapState!.SeqId = i;
-            try
+            for (int i = 0; i < requests.Count; i++)
             {
-                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+                var r = requests[i];
+                if (tapped) _tapState!.SeqId = i;
+                try
+                {
+                    results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+                    done++;
+                }
+                finally
+                {
+                    if (tapped) _tapState!.SeqId = 0;
+                }
             }
-            finally
-            {
-                if (tapped) _tapState!.SeqId = 0;
-            }
+        }
+        catch
+        {
+            for (int d = 0; d < done; d++) results[d].Dispose();   // do not leak the completed requests' logits
+            throw;
         }
         return results;
     }
@@ -3311,6 +3323,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         DisposeDFlash();
         Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
         _tapState?.Dispose();
+        Interlocked.Exchange(ref _tapSpareClone, null)?.Dispose();
         FreeRowSnapshots();
         _iqF16Prefill?.Dispose();
         // Before _device: the profiler owns a query pool on it.

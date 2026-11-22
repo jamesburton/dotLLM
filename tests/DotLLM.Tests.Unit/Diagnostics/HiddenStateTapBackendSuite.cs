@@ -59,6 +59,9 @@ public abstract class HiddenStateTapBackendSuite
 
     protected abstract HiddenStateTapFixture Open(string family);
 
+    /// <summary>The GDN-hybrid dense family with an MTP head (so a forward can carry an MTP state), or null when the host has none.</summary>
+    protected virtual HiddenStateTapFixture? OpenHybridDenseWithMtp() => null;
+
     private sealed record Run(List<int> Tokens, List<float[]> Logits, IKvCache Kv);
 
     private static float[] LastRow(ITensor t, int vocab)
@@ -508,6 +511,42 @@ public abstract class HiddenStateTapBackendSuite
         using (fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv)) { }
         Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
         Assert.Equal(1, HiddenStateTapRegistry.PathCounters.TapForwards);
+    }
+
+    /// <summary>
+    /// I-8: a read-only tap works on a forward that carries an MTP state, on every backend (it only reads; delivered after the capture),
+    /// and does not perturb the logits; an abortable tap with an MTP state is refused everywhere (a checkpoint cannot cover the MTP head).
+    /// </summary>
+    [SkippableFact]
+    public void ReadOnlyTap_WithMtpState_Works_AbortableTap_WithMtpState_IsRefused()
+    {
+        using var fx = OpenHybridDenseWithMtp();
+        Skip.If(fx is null, "no MTP hybrid-dense fixture on this host");
+        using var control = OpenHybridDenseWithMtp()!;
+        var mtp = fx!.Model.CreateMtpState(96);
+        var mtpC = control.Model.CreateMtpState(96);
+        Skip.If(mtp is null || mtpC is null, "the synthetic model carries no MTP head");
+        try
+        {
+            using var kvA = fx.NewKv(); using var kvC = control.NewKv();
+            int[] pp = Enumerable.Range(0, fx.Prompt.Length).ToArray();
+            int seen = 0;
+            using (var h = fx.Host.RegisterTap(new HiddenStateTapSubscription(null, [HookPoint.PostLayer, HookPoint.PreLmHead]), _ => seen++))
+            {
+                using var la = fx.Model.Forward(fx.Prompt, pp, -1, kvA, null, mtp);
+                using var lc = control.Model.Forward(control.Prompt, pp, -1, kvC, null, mtpC);
+                Assert.True(seen > 0, "the read-only tap delivered nothing alongside the MTP state");
+                var ra = LastRow(la, fx.Vocab); var rc = LastRow(lc, control.Vocab);
+                if (fx.BitExact) Assert.True(ra.AsSpan().SequenceEqual(rc), "logits differ with a read-only tap and an MTP state");
+                else Assert.All(ra.Zip(rc), q => Assert.InRange(q.First - q.Second, -1e-2f, 1e-2f));
+            }
+            Skip.IfNot(fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+            using var ha = fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, [HookPoint.PostLayer]), _ => HookResult.Continue);
+            int len = kvA.CurrentLength;
+            Assert.Throws<NotSupportedException>(() => fx.Model.Forward([fx.Prompt[1]], [fx.Prompt.Length], -1, kvA, null, mtp));
+            Assert.Equal(len, kvA.CurrentLength);
+        }
+        finally { (mtp as IDisposable)?.Dispose(); (mtpC as IDisposable)?.Dispose(); }
     }
 
     // ── ForwardBatch ──────────────────────────────────────────────────────────
