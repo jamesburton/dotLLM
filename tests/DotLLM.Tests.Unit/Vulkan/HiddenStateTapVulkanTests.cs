@@ -67,6 +67,27 @@ internal sealed class VulkanHiddenStateTapFixture : HiddenStateTapFixture
 
     public override IKvCache NewKv(int maxLen = 96) => _kvFactory(maxLen);
 
+    /// <summary>Merge base d1275eef, 16 untapped decode forwards: managed bytes on this thread.</summary>
+    public override long? BaselineAllocBytesPer16Decodes => 1872;
+
+    public override long[]? DeviceCounters() =>
+    [
+        DotLLM.Vulkan.Interop.ProfileCounters.Dispatches, DotLLM.Vulkan.Interop.ProfileCounters.Copies,
+        DotLLM.Vulkan.Interop.ProfileCounters.Barriers, DotLLM.Vulkan.Interop.ProfileCounters.DescriptorWrites,
+        DotLLM.Vulkan.Interop.ProfileCounters.DescriptorAllocs, DotLLM.Vulkan.Interop.ProfileCounters.Submits,
+    ];
+
+    /// <summary>
+    /// Merge base d1275eef (dispatches, copies, barriers, descriptor writes, descriptor allocs, queue submits), per 16 untapped decodes.
+    /// Queue submits equal fence waits (every forward submit is awaited by a fence or timeline).
+    /// </summary>
+    public override long[]? BaselineDeviceCountersPer16Decodes => _family switch
+    {
+        HiddenStateTapBackendSuite.Llama => [740, 32, 824, 4, 4, 16],
+        HiddenStateTapBackendSuite.HybridDense => [716, 208, 824, 2, 2, 16],
+        _ => [1036, 176, 1128, 2, 2, 16],
+    };
+
     public override IKvCache? NewWindowedKv(int maxLen)
         => _family != HiddenStateTapBackendSuite.Llama ? null
             : new VulkanKvCache(_device, KvGeometry.FromConfig(_config with { SlidingWindowSize = 8, SlidingWindowPattern = 2 }, compactSlidingWindows: true), maxLen);

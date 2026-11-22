@@ -52,6 +52,9 @@ internal sealed class CpuHiddenStateTapFixture : HiddenStateTapFixture
     public override int[] Prompt { get; }
     public override bool ExpectsPackedBatchFallback => _family == HiddenStateTapBackendSuite.Llama;
 
+    /// <summary>Merge base d1275eef, 16 untapped decode forwards on this thread (the MoE model allocates its router scratch).</summary>
+    public override long? BaselineAllocBytesPer16Decodes => _family == HiddenStateTapBackendSuite.MoeHybrid ? 21632 : 1664;
+
     public override IKvCache NewKv(int maxLen = 96)
         => new SimpleKvCache(KvGeometry.FromConfig(_config, Model.SupportsCompactSlidingKv), maxLen);
 

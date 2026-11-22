@@ -2910,6 +2910,7 @@ public sealed class VulkanDevice : IDisposable
             commandBufferCount = 1,
             pCommandBuffers = (nint)(&cmdBufLocal),
         };
+        Interop.ProfileCounters.Submits++;
         VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError("vkQueueSubmit SubmitCopyDeferred");
     }
 
@@ -3002,6 +3003,7 @@ public sealed class VulkanDevice : IDisposable
                 commandBufferCount = 1,
                 pCommandBuffers = (nint)(&cmdBuf),
             };
+            Interop.ProfileCounters.Submits++;
             VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError($"vkQueueSubmit {site}");
 
             nint fenceLocal = fence;
@@ -3719,6 +3721,7 @@ public sealed class VulkanDevice : IDisposable
                 commandBufferCount = 1,
                 pCommandBuffers = (nint)(&cmdBufLocal),
             };
+            Interop.ProfileCounters.Submits++;
             VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence).ThrowOnError("vkQueueSubmit SubmitContext");
 
             nint fenceLocal = _fence;
@@ -3810,6 +3813,7 @@ public sealed class VulkanDevice : IDisposable
                 commandBufferCount = 1,
                 pCommandBuffers = (nint)(&cmdBufLocal),
             };
+            Interop.ProfileCounters.Submits++;
             VulkanApi.vkQueueSubmit(_device._queue, 1, submit, fence: 0)
                 .ThrowOnError("vkQueueSubmit SplitSubmit");
 
@@ -3874,6 +3878,7 @@ public sealed class VulkanDevice : IDisposable
                 signalSemaphoreCount = 1,
                 pSignalSemaphores = (nint)(&semLocal),
             };
+            Interop.ProfileCounters.Submits++;
             VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
                 .ThrowOnError("vkQueueSubmit SubmitAndSignal");
         }
@@ -3920,6 +3925,7 @@ public sealed class VulkanDevice : IDisposable
                 signalSemaphoreCount = 1,
                 pSignalSemaphores = (nint)(&semLocal),
             };
+            Interop.ProfileCounters.Submits++;
             VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
                 .ThrowOnError("vkQueueSubmit SubmitAndSignalTimeline");
         }

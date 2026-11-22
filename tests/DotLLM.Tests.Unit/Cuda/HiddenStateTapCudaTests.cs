@@ -81,6 +81,10 @@ internal sealed class CudaHiddenStateTapFixture : HiddenStateTapFixture
     public override bool SupportsAbortableTaps
         => Family != HiddenStateTapBackendSuite.MoeHybrid || Model.SupportsRecurrentStateCheckpoint;
 
+    /// <summary>An untapped CUDA decode enqueues no tap copy at all (the helper is never entered): baseline zero.</summary>
+    public override long[]? DeviceCounters() => [CudaHiddenStateTaps.EnqueuedCopies];
+    public override long[]? BaselineDeviceCountersPer16Decodes => [0];
+
     public override IKvCache NewKv(int maxLen = 96) => Model switch
     {
         CudaTransformerModel m => m.CreateKvCache(maxLen),

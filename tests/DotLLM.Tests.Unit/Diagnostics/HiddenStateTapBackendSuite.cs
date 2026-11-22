@@ -32,6 +32,16 @@ public abstract class HiddenStateTapFixture : IDisposable
     /// (a fused batch versus the per-sequence loop on Vulkan): tolerance 1e-2 absolute and identical argmax then.
     /// </summary>
     public virtual bool BatchBitExact => BitExact;
+    /// <summary>
+    /// Managed bytes the calling thread allocates over 16 untapped decode forwards (after warm-up) on the merge base of #1932 (d1275eef),
+    /// measured by the same body (<c>MeasureDecode</c>) on that commit; null when not recorded for this host. The zero-overhead
+    /// test asserts equality, so any allocation added to the unattached path fails it.
+    /// </summary>
+    public virtual long? BaselineAllocBytesPer16Decodes => null;
+    /// <summary>A snapshot of the device-work census (Vulkan: dispatches, copies, barriers, descriptor writes and allocs, submits; CUDA: tap copies enqueued), or null.</summary>
+    public virtual long[]? DeviceCounters() => null;
+    /// <summary>The census delta over 16 untapped decode forwards at the merge base (same order as <see cref="DeviceCounters"/>); null when not recorded.</summary>
+    public virtual long[]? BaselineDeviceCountersPer16Decodes => null;
     public abstract IKvCache NewKv(int maxLen = 96);
     /// <summary>
     /// A KV-cache of the type this backend would create for a sliding-window model (compact windows, window 8 on the even layers), or
@@ -233,28 +243,7 @@ public abstract class HiddenStateTapBackendSuite
         Assert.Equal([fx.NumLayers - 1], b);
     }
 
-    /// <summary>Disposed taps stop delivering; with no tap attached nothing is dispatched, no counter moves and decode allocates nothing extra.</summary>
-    [SkippableTheory]
-    [MemberData(nameof(Families))]
-    public void Unattached_HasNoDispatch_NoCounters_NoExtraAllocation(string family)
-    {
-        using var never = Open(family);            // a registry that was never used
-        using var used = Open(family);             // a registry that had a tap and lost it
-        int calls = 0;
-        used.Host.RegisterTap(new HiddenStateTapSubscription(null, AllPoints), _ => calls++).Dispose();
-
-        HiddenStateTapRegistry.PathCounters.Reset();
-        long a = Measure(never, 16);
-        long b = Measure(used, 16);
-        Assert.Equal(0, calls);
-        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.TapForwards);
-        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.PackedBatchFallbacks);
-        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
-        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortedForwards);
-        Assert.Equal(a, b);
-    }
-
-    private static long Measure(HiddenStateTapFixture fx, int steps)
+    private static (long Bytes, long[]? Counters) MeasureDecode(HiddenStateTapFixture fx, int steps)
     {
         // Warm up (JIT, pools, first-use allocation) with the same shape, then measure N decode forwards on this thread.
         using var kv = fx.NewKv();
@@ -264,9 +253,58 @@ public abstract class HiddenStateTapBackendSuite
         int[] tok = [prompt[0]];
         int[] p = new int[1];
         for (int i = 0; i < 4; i++) { p[0] = pos++; using (fx.Model.Forward(tok, p, -1, kv)) { } }
+        var c0 = fx.DeviceCounters();
         long before = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < steps; i++) { p[0] = pos++; using (fx.Model.Forward(tok, p, -1, kv)) { } }
-        return GC.GetAllocatedBytesForCurrentThread() - before;
+        long bytes = GC.GetAllocatedBytesForCurrentThread() - before;
+        var c1 = fx.DeviceCounters();
+        return (bytes, c0 is null || c1 is null ? null : c1.Zip(c0, (x, y) => x - y).ToArray());
+    }
+
+    /// <summary>
+    /// I-2: the zero-overhead guarantee against an ABSOLUTE baseline. Comparing a never-used registry with a registered-then-disposed
+    /// one cannot fail (both run the unattached branch, so an allocation or extra device work added to it shows on both sides). Here the
+    /// untapped decode must allocate exactly what the merge base allocated (recorded per fixture), and a GPU host must do exactly the
+    /// merge base's device work (dispatches, copies, barriers, descriptor traffic, queue submits and their fence waits; CUDA: zero tap
+    /// copies enqueued). Mutants: a <c>new object()</c> on the unattached path, an extra copy or submit there.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void Unattached_Decode_MatchesTheMergeBaseAllocationAndDeviceWork(string family)
+    {
+        using var fx = Open(family);
+        Skip.If(fx.BaselineAllocBytesPer16Decodes is null, "no merge-base baseline recorded for this host");
+        LeaveDetachedRegistry(fx);
+        var (bytes, counters) = MeasureDecode(fx, 16);
+        Assert.Equal(fx.BaselineAllocBytesPer16Decodes!.Value, bytes);
+        if (fx.BaselineDeviceCountersPer16Decodes is { } want)
+            Assert.Equal(want, counters);
+    }
+
+    private static void LeaveDetachedRegistry(HiddenStateTapFixture fx)
+    {
+        // Leave a registry that once held a tap: the detached state must cost nothing either.
+        fx.Host.RegisterTap(new HiddenStateTapSubscription(null, AllPoints), _ => { }).Dispose();
+    }
+
+    /// <summary>Disposed taps stop delivering; with no tap attached nothing is dispatched and no tap counter moves.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void Unattached_HasNoDispatch_NoCounters(string family)
+    {
+        using var never = Open(family);            // a registry that was never used
+        using var used = Open(family);             // a registry that had a tap and lost it
+        int calls = 0;
+        used.Host.RegisterTap(new HiddenStateTapSubscription(null, AllPoints), _ => calls++).Dispose();
+
+        HiddenStateTapRegistry.PathCounters.Reset();
+        MeasureDecode(never, 16);
+        MeasureDecode(used, 16);
+        Assert.Equal(0, calls);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.TapForwards);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.PackedBatchFallbacks);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortedForwards);
     }
 
     [SkippableTheory]

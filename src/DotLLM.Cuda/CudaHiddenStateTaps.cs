@@ -21,6 +21,11 @@ internal sealed unsafe class CudaHiddenStateTaps : IDisposable
 
     private const int SlotAlign = 16;
 
+    private static long s_enqueued;
+
+    /// <summary>Device-to-host tap copies enqueued by any model in the process (an untapped forward never moves it; tests).</summary>
+    internal static long EnqueuedCopies => Interlocked.Read(ref s_enqueued);
+
     private readonly struct Site(HookPoint point, int layer, int rows, int globalStart, long offset, int elemBytes, float scale)
     {
         public readonly HookPoint Point = point;
@@ -149,6 +154,7 @@ internal sealed unsafe class CudaHiddenStateTaps : IDisposable
             _sites.Clear();
             _cursor = 0;
         }
+        Interlocked.Increment(ref s_enqueued);
         long rowBytes = (long)_hidden * elemBytes;
         long offset = _cursor;
         long bytes = rows * rowBytes;
