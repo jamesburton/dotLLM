@@ -41,11 +41,12 @@ public abstract class GenerationSessionBackendSuite
     /// test. Everything here is raw <c>IModel.Forward</c> on a fresh cache from the generator's KV factory, never <see cref="GenerationSession"/>,
     /// so a defect in the session's append or prefill path cannot inflate the control and the compared diff together.
     /// Two arms, same model, same tokens, max |logit diff| against one batched prefill of all tokens:
-    /// (1) the genuine 1-ULP arm: the same prefill with ONE F32 ULP (<c>MathF.BitIncrement</c>) added to the largest element of token 0's
-    /// residual after layer 0, the "one F16/F32 rounding of one input" sensitivity of #1928, through the residual-modifier hook that only the
+    /// (1) the genuine 1-ULP arm: the same prefill with ONE F32 ULP (<c>MathF.BitIncrement</c>) added to every element of token 0's
+    /// residual row after layer 0, the "one F16/F32 rounding of one input" sensitivity of #1928, through the residual-modifier hook that only the
     /// CPU models implement (a GPU backend has no injection point; there the arm is absent and stated as such in the PR);
     /// (2) the prefill-vs-decode path split (prefill of the first half, then every remaining token as a single decode row), the path pair
-    /// every comparison here crosses. Control = max of the arms; the CPU 1-ULP arm must be observable (&gt; 0) or the control is inert.
+    /// every comparison here crosses. Control = max of the arms. A 1-ULP perturbation can be absorbed on one particular sequence, so
+    /// observability is asserted once per family by <see cref="OneUlpArm_IsObservable"/> (an inert arm must fail the run), not per call.
     /// </summary>
     private static float ControlMaxAbsDiff(GenerationSessionFixture oracle, int[] tokens)
     {
@@ -53,9 +54,7 @@ public abstract class GenerationSessionBackendSuite
         float control = MaxAbsDiff(full, RawLastLogits(oracle, tokens, Math.Max(1, tokens.Length / 2), perturb: false));
         if (oracle.Model is IResidualModifierHost)
         {
-            float ulp = MaxAbsDiff(full, RawLastLogits(oracle, tokens, tokens.Length, perturb: true));
-            Assert.True(ulp > 0f, $"{oracle.Backend}: a 1-ULP residual perturbation left the logits bit-identical, so the control cannot disagree (inert instrument)");
-            control = Math.Max(control, ulp);
+            control = Math.Max(control, MaxAbsDiff(full, RawLastLogits(oracle, tokens, tokens.Length, perturb: true)));   // may be 0 on one sequence; OneUlpArm_IsObservable proves the arm can disagree
         }
         Assert.True(control <= ControlSanityCeiling, $"{oracle.Backend}: control {control:E3} exceeds the sanity ceiling {ControlSanityCeiling:E1}");
         return control;
@@ -104,10 +103,22 @@ public abstract class GenerationSessionBackendSuite
             if (_done || layerIndex != 0) return;
             _done = true;
             int hidden = residual.Length / tokenCount;
-            int best = 0;
-            for (int i = 1; i < hidden; i++) if (Math.Abs(residual[i]) > Math.Abs(residual[best])) best = i;
-            residual[best] = MathF.BitIncrement(residual[best]);
+            // One ULP (away from zero) on every element of token 0's residual row: one F32 rounding of one token's input state.
+            for (int i = 0; i < hidden; i++)
+                residual[i] = residual[i] >= 0 ? MathF.BitIncrement(residual[i]) : MathF.BitDecrement(residual[i]);
         }
+    }
+
+    /// <summary>The control's 1-ULP arm must be able to disagree (James 2026-11-22: a control that cannot disagree proves nothing): on every CPU family it moves the logits.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families), MemberType = typeof(GenerationSessionFixture))]
+    public void OneUlpArm_IsObservable(string family)
+    {
+        using var fx = Open(family);
+        Skip.IfNot(fx.Model is IResidualModifierHost, "the 1-ULP arm needs the residual-modifier hook (CPU models only)");
+        int[] tokens = [.. fx.Prompt, .. fx.Observation];
+        float ulp = MaxAbsDiff(RawLastLogits(fx, tokens, tokens.Length, perturb: false), RawLastLogits(fx, tokens, tokens.Length, perturb: true));
+        Assert.True(ulp > 0f, $"{family}: a 1-ULP residual perturbation left the logits bit-identical (inert control arm)");
     }
 
     private static float MaxAbsDiff(float[] x, float[] y)
