@@ -111,6 +111,14 @@ internal sealed class GenerationSessionFixture : IDisposable
     /// <summary>True when the model forwards through the CPU residual-modifier hook, so <see cref="Counter"/> counts real forwards.</summary>
     public bool CountsForwards => Backend == SessionBackend.Cpu;
 
+    /// <summary>
+    /// Tokenizer a constraint is built over (#1921). Llama: its byte-level tokenizer filtered to the alphabet below. The hybrid models' 12-id vocabulary has no
+    /// JSON spelling, and a constraint only needs id to text, so they get a stand-in whose ids 3..7 spell <c>{ " a : }</c>
+    /// (ids 0..2 are pad/bos/eos). The model is indifferent to what an id spells.
+    /// </summary>
+    public ITokenizer ConstraintTokenizer => _constraintTokenizer ??= new CharTokenizer(Tokenizer.VocabSize, Tokenizer is IdTokenizer ? null : Tokenizer);
+    private ITokenizer? _constraintTokenizer;
+
     public bool IsRecurrent => Model.RequiresPerSequenceState;
 
     public TextGenerator NewGenerator()
@@ -159,6 +167,35 @@ internal sealed class GenerationSessionFixture : IDisposable
     {
         public StopResult ShouldStop(int tokenId, IReadOnlyList<int> generatedTokens, string decodedText)
             => generatedTokens.Count >= n ? result : StopResult.Continue;
+    }
+
+    /// <summary>
+    /// Id to text for a constraint: only the single characters <c>{ " a : }</c> keep their spelling; every other id decodes to the empty string
+    /// (never allowed by a constraint, so a free-running model cannot spin on whitespace).
+    /// ids 3..7 are those characters when <paramref name="inner"/> is null (the hybrid vocabularies: 8 ids for MoE).
+    /// </summary>
+    private sealed class CharTokenizer(int vocab, ITokenizer? inner) : ITokenizer
+    {
+        private const string Chars = "{\"a:}";
+        public int[] Encode(string text) => inner?.Encode(text) ?? [.. text.Select(c => Chars.IndexOf(c) + 3)];
+        public string Decode(ReadOnlySpan<int> tokenIds)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (int id in tokenIds) sb.Append(DecodeToken(id));
+            return sb.ToString();
+        }
+        public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => Decode(tokenIds);
+        public string DecodeToken(int tokenId)
+        {
+            string t = inner is null
+                ? (tokenId >= 3 && tokenId - 3 < Chars.Length ? Chars[tokenId - 3].ToString() : "")
+                : inner.DecodeToken(tokenId);
+            return t.Length == 1 && Chars.Contains(t[0]) ? t : "";
+        }
+        public int BosTokenId => inner?.BosTokenId ?? 1;
+        public int EosTokenId => inner?.EosTokenId ?? 2;
+        public int VocabSize => vocab;
+        public int CountTokens(string text) => text.Length;
     }
 
     /// <summary>Token id i decodes to "t{i}|"; no merges, never an end-of-generation marker.</summary>

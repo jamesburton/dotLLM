@@ -2398,7 +2398,7 @@ public sealed partial class TextGenerator
     /// could only sample EOS. Cheap (a popcount over the cached mask) and only evaluated once the constraint reports
     /// completion.
     /// </summary>
-    private bool ConstraintIsTerminal(DotLLM.Core.Constraints.IDecodingConstraint? constraint)
+    internal bool ConstraintIsTerminal(DotLLM.Core.Constraints.IDecodingConstraint? constraint)
     {
         if (constraint is null || !constraint.IsComplete())
             return false;

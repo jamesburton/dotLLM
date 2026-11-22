@@ -3,9 +3,11 @@ using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Engine.KvCache;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Constraints;
 using DotLLM.Core.Models;
 using DotLLM.Core.Sampling;
 using DotLLM.Core.Tensors;
+using DotLLM.Engine.Constraints;
 using DotLLM.Engine.Samplers;
 using DotLLM.Engine.Samplers.StopConditions;
 using DotLLM.Tokenizers;
@@ -49,6 +51,7 @@ public sealed class GenerationSession : IAsyncDisposable
     private int _disposed;
     private bool _faulted;
     private readonly Func<CacheProvenanceTag>? _currentProvenance;
+    private IDecodingConstraint? _constraint;
 
     /// <summary>Most boundary records (position, recurrent checkpoint, logits) a recurrent session keeps; the oldest are evicted.</summary>
     public const int MaxRollbackBoundaries = 16;
@@ -77,8 +80,9 @@ public sealed class GenerationSession : IAsyncDisposable
     }
 
     internal GenerationSession(TextGenerator owner, InferenceOptions options, CacheProvenanceTag tag,
-        Func<CacheProvenanceTag>? currentProvenance, IKvCache kv)
+        Func<CacheProvenanceTag>? currentProvenance, IKvCache kv, IDecodingConstraint? initialConstraint = null)
     {
+        _constraint = initialConstraint;
         _currentProvenance = currentProvenance;
         _owner = owner;
         _model = owner.SessionModel;
@@ -101,6 +105,31 @@ public sealed class GenerationSession : IAsyncDisposable
 
     /// <summary>Number of tokens committed to the session; equals the KV length at every pause.</summary>
     public int CurrentPosition => _position;
+
+    /// <summary>The constraint masking sampled tokens (null = unconstrained). Replaced by <see cref="SetConstraint"/>.</summary>
+    public IDecodingConstraint? ActiveConstraint => _constraint;
+
+    /// <summary>
+    /// Installs <paramref name="constraint"/> (null = unconstrained) for the tokens this session samples from now on. Legal at any pause
+    /// (between operations); throws <see cref="InvalidOperationException"/> while an operation is in flight, after a provenance change or when faulted,
+    /// and <see cref="ObjectDisposedException"/> after disposal.
+    /// <para>The session calls <see cref="IDecodingConstraint.Reset"/> on the supplied instance (so no parser state of an earlier use leaks) and
+    /// <b>takes ownership</b> of it: do not advance, reset or share it with another session or generator while it is active.
+    /// KV, recurrent state, boundary records and next-token logits are untouched, so nothing of the committed prefix is re-prefilled.</para>
+    /// <para>The constraint advances only on tokens the session samples and commits; prompt and observation tokens never advance it.
+    /// <see cref="RollbackTo"/> that discards tokens resets the active constraint to its initial state (its parse state described the discarded tokens);
+    /// call <see cref="SetConstraint"/> again to attach a different one.</para>
+    /// </summary>
+    public void SetConstraint(IDecodingConstraint? constraint)
+    {
+        Begin();
+        try
+        {
+            constraint?.Reset();
+            _constraint = constraint;
+        }
+        finally { End(); }
+    }
 
     /// <summary>The provenance the session's cached state was created under.</summary>
     public CacheProvenanceTag ProvenanceTag { get; }
@@ -201,8 +230,12 @@ public sealed class GenerationSession : IAsyncDisposable
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     if (_position >= _kv.MaxLength) { finish = FinishReason.Length; break; }
+                    // Satisfied and permitting only EOS: nothing left to sample (TextGenerator stops here too).
+                    if (_constraint is not null && _owner.ConstraintIsTerminal(_constraint)) { finish = FinishReason.ConstraintComplete; break; }
 
                     _nextLogits.CopyTo(_sampleScratch, 0);
+                    if (_constraint is not null)
+                        TokenMaskApplier.Apply(_sampleScratch, _constraint.GetAllowedTokens());
                     int token = _pipeline.Sample(_sampleScratch, _committed);
                     generated.Add(token);
                     detok.Append(token);
@@ -217,6 +250,7 @@ public sealed class GenerationSession : IAsyncDisposable
                     }
 
                     CommitAndForward(token);
+                    _constraint?.Advance(token);
                     if (result != StopResult.Continue)
                     {
                         finish = result == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
@@ -332,6 +366,7 @@ public sealed class GenerationSession : IAsyncDisposable
                 DropBoundariesAfter(-1);
                 _position = 0;
                 _logitsPos = -1;
+                _constraint?.Reset();
                 return;
             }
 
@@ -344,6 +379,7 @@ public sealed class GenerationSession : IAsyncDisposable
                 _logitsPos = tokenPosition;
                 _position = tokenPosition;
                 DropBoundariesAfter(tokenPosition);
+                _constraint?.Reset();
                 return;
             }
 
@@ -363,6 +399,7 @@ public sealed class GenerationSession : IAsyncDisposable
                 throw;
             }
             _position = tokenPosition;
+            _constraint?.Reset();
         }
         finally { End(); }
     }

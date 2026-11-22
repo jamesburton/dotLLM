@@ -12,5 +12,8 @@ public enum FinishReason
     Length,
 
     /// <summary>Generation stopped to execute tool calls.</summary>
-    ToolCalls
+    ToolCalls,
+
+    /// <summary>A <see cref="DotLLM.Core.Constraints.IDecodingConstraint"/> is satisfied and permits nothing but end-of-sequence, so a <see cref="GenerationSession"/> segment ended without sampling it (#1921).</summary>
+    ConstraintComplete
 }

@@ -219,12 +219,22 @@ public sealed class GenerationSessionCoreTests
         AssertLogitsEqual(Logits(fresh), Logits(s));
     }
 
+    /// <summary>options.ResponseFormat builds the session's initial constraint (as Generate does); Text and null mean none.</summary>
     [Fact]
-    public void ResponseFormat_IsNotSupportedYet()
+    public async Task ResponseFormat_BuildsTheInitialConstraint()
     {
         using var fx = Create(Llama);
-        var opts = new InferenceOptions { ResponseFormat = new ResponseFormat.JsonObject() };
-        Assert.Throws<NotSupportedException>(() => fx.NewGenerator().CreateSession(opts, Tag()));
+        var opts = Greedy() with { ResponseFormat = new ResponseFormat.Grammar { GbnfGrammar = "root ::= \"}a:a\"" } };
+        await using var s = fx.NewGenerator().CreateSession(opts, Tag());
+        Assert.IsType<DotLLM.Engine.Constraints.GrammarConstraint>(s.ActiveConstraint);
+        await s.PrefillAsync(fx.Prompt);
+        var r = await s.GenerateUntilBoundaryAsync(new StopAfter(60));
+        Assert.Equal(FinishReason.ConstraintComplete, r.FinishReason);
+        Assert.Equal("}a:a", r.Text);
+        s.SetConstraint(null);
+        Assert.Null(s.ActiveConstraint);
+        await using var t = fx.NewGenerator().CreateSession(Greedy() with { ResponseFormat = new ResponseFormat.Text() }, Tag());
+        Assert.Null(t.ActiveConstraint);
     }
 
     [Fact]

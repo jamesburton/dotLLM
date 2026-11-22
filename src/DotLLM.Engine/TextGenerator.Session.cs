@@ -1,7 +1,9 @@
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Constraints;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
+using DotLLM.Engine.Constraints;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.Engine;
@@ -16,7 +18,8 @@ public sealed partial class TextGenerator
     /// append observation tokens, roll back, all without re-prefilling the committed prefix.
     /// </summary>
     /// <param name="options">Sampling options (temperature, seed, penalties) and the per-segment <see cref="InferenceOptions.MaxTokens"/>.
-    /// <see cref="InferenceOptions.ResponseFormat"/> is not supported here.</param>
+    /// <see cref="InferenceOptions.ResponseFormat"/> (when not Text) builds the session's initial constraint exactly as <c>Generate</c> does
+    /// (JSON object, schema, regex, grammar); <see cref="GenerationSession.SetConstraint"/> replaces it later.</param>
     /// <param name="provenanceTag">Identity of the weights, tokenizer, precision, modifiers and knowledge the session's cached state belongs to.</param>
     /// <param name="currentProvenance">Live view of the provenance the orchestrator is running under (adapters, LoRA, knowledge snapshot).
     /// Every session operation compares it with <paramref name="provenanceTag"/> and throws <see cref="InvalidOperationException"/> naming the
@@ -32,8 +35,6 @@ public sealed partial class TextGenerator
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(provenanceTag);
         ArgumentOutOfRangeException.ThrowIfNegative(maxContextTokens);
-        if (options.ResponseFormat is not null and not ResponseFormat.Text)
-            throw new NotSupportedException("GenerationSession does not support options.ResponseFormat; constrain it with SetConstraint (issue #1921).");
         if (_generationGate.CurrentCount == 0)
             throw new InvalidOperationException("A Generate call is running on this generator; open the session when it has finished.");
 
@@ -50,7 +51,15 @@ public sealed partial class TextGenerator
                 : _model.Config.MaxSequenceLength;
             kv = AllocateKvCache(size);
             if (recurrent) _model.ResetSequenceState();   // a previous request left model-owned state behind
-            return new GenerationSession(this, options, provenanceTag, currentProvenance, kv);
+            IDecodingConstraint? initial = options.ResponseFormat switch
+            {
+                ResponseFormat.JsonObject => new JsonConstraint(_tokenizer),
+                ResponseFormat.JsonSchema js => new JsonSchemaConstraint(_tokenizer, js.Schema),
+                ResponseFormat.Regex rx => RegexConstraint.Create(_tokenizer, rx.Pattern),
+                ResponseFormat.Grammar gr => new GrammarConstraint(_tokenizer, gr.GbnfGrammar),
+                _ => null
+            };
+            return new GenerationSession(this, options, provenanceTag, currentProvenance, kv, initial);
         }
         catch
         {
