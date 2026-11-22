@@ -1375,7 +1375,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             // A hidden-state tap needs each sequence's own rows: the fused batched loop has no tap sites (#1920).
             if (!tapped) return ForwardBatchFused(requests);
             HiddenStateTapRegistry.PathCounters.AddPackedBatchFallback();
-            VulkanHiddenStateTaps.LogOnce("a hidden-state tap is attached: ForwardBatch runs per sequence instead of the fused batch.");
+            VulkanHiddenStateTaps.LogOnce("fused-batch", "a hidden-state tap is attached: ForwardBatch runs per sequence instead of the fused batch.");
         }
 
         var results = new ITensor[requests.Count];

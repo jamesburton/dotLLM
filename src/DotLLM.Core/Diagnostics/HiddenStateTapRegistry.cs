@@ -265,7 +265,7 @@ public sealed class HiddenStateTapRegistry
     public static class PathCounters
     {
         private static long s_tapForwards, s_cudaGraphBypassed, s_vulkanFusedDecodeBypassed,
-            s_packedBatchFallbacks, s_abortedForwards, s_abortCheckpoints;
+            s_packedBatchFallbacks, s_abortedForwards, s_abortCheckpoints, s_vulkanRowSliceBypassed;
 
         /// <summary>Forwards that ran with at least one tap attached.</summary>
         public static long TapForwards => Interlocked.Read(ref s_tapForwards);
@@ -273,6 +273,8 @@ public sealed class HiddenStateTapRegistry
         public static long CudaGraphBypassed => Interlocked.Read(ref s_cudaGraphBypassed);
         /// <summary>Vulkan fused-decode launches skipped because a tap was attached.</summary>
         public static long VulkanFusedDecodeBypassed => Interlocked.Read(ref s_vulkanFusedDecodeBypassed);
+        /// <summary>Vulkan hybrid-dense long-prefill row-slice splits skipped because a tap was attached.</summary>
+        public static long VulkanRowSliceBypassed => Interlocked.Read(ref s_vulkanRowSliceBypassed);
         /// <summary>Packed <c>ForwardBatch</c> calls that fell back to per-sequence because a tap was attached.</summary>
         public static long PackedBatchFallbacks => Interlocked.Read(ref s_packedBatchFallbacks);
         /// <summary>Forwards stopped by an abortable tap.</summary>
@@ -286,6 +288,8 @@ public sealed class HiddenStateTapRegistry
         public static void AddCudaGraphBypassed() => Interlocked.Increment(ref s_cudaGraphBypassed);
         /// <summary>Counts one bypassed Vulkan fused decode.</summary>
         public static void AddVulkanFusedDecodeBypassed() => Interlocked.Increment(ref s_vulkanFusedDecodeBypassed);
+        /// <summary>Counts one bypassed Vulkan row-slice split.</summary>
+        public static void AddVulkanRowSliceBypassed() => Interlocked.Increment(ref s_vulkanRowSliceBypassed);
         /// <summary>Counts one packed-batch fallback.</summary>
         public static void AddPackedBatchFallback() => Interlocked.Increment(ref s_packedBatchFallbacks);
         /// <summary>Counts one aborted forward.</summary>
@@ -300,6 +304,7 @@ public sealed class HiddenStateTapRegistry
             Interlocked.Exchange(ref s_cudaGraphBypassed, 0);
             Interlocked.Exchange(ref s_vulkanFusedDecodeBypassed, 0);
             Interlocked.Exchange(ref s_packedBatchFallbacks, 0);
+            Interlocked.Exchange(ref s_vulkanRowSliceBypassed, 0);
             Interlocked.Exchange(ref s_abortedForwards, 0);
             Interlocked.Exchange(ref s_abortCheckpoints, 0);
         }

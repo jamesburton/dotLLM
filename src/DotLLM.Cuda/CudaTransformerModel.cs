@@ -1296,7 +1296,7 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
         if (ts is not null && TapWouldHaveUsedGraph(tokenIds, positions, kvCache, suppressGraphCapture, deferredHostDest, isMla, isMoe, isBitNet))
         {
             HiddenStateTapRegistry.PathCounters.AddCudaGraphBypassed();
-            CudaHiddenStateTaps.LogOnce("a hidden-state tap is attached: the CUDA decode graph is bypassed and the layer loop runs eagerly.");
+            CudaHiddenStateTaps.LogOnce("cuda-graph", "a hidden-state tap is attached: the CUDA decode graph is bypassed and the layer loop runs eagerly.");
         }
         if (ts is null && UseGraphCapture
             && !suppressGraphCapture        // #251: batched calls force the eager body — see doc comment above

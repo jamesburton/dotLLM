@@ -155,6 +155,7 @@ public sealed unsafe partial class CudaTransformerModel
     {
         var ts = _tapState!;
         HiddenStateTapRegistry.PathCounters.AddPackedBatchFallback();
+        CudaHiddenStateTaps.LogOnce("packed-batch", "a hidden-state tap is attached: ForwardBatch runs per sequence instead of the deferred pinned-logits batch.");
         var results = new ITensor[requests.Count];
         int done = 0;
         try

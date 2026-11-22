@@ -232,3 +232,28 @@ public sealed class HiddenStateTapVulkanTests : HiddenStateTapBackendSuite
     }
 }
 
+
+/// <summary>M-4: the bypass notice is logged once per KIND of bypass, not once per process (the first kind used to swallow every other).</summary>
+[Collection("HiddenStateTaps")]
+public sealed class VulkanTapLoggingTests
+{
+    [Fact]
+    public void LogOnce_IsPerKind()
+    {
+        var saved = Console.Error;
+        var sw = new StringWriter();
+        Console.SetError(sw);
+        try
+        {
+            string a = "kind-a-" + Guid.NewGuid().ToString("N"), b = "kind-b-" + Guid.NewGuid().ToString("N");
+            VulkanHiddenStateTaps.LogOnce(a, "first-a");
+            VulkanHiddenStateTaps.LogOnce(b, "first-b");
+            VulkanHiddenStateTaps.LogOnce(a, "second-a");
+        }
+        finally { Console.SetError(saved); }
+        string text = sw.ToString();
+        Assert.Contains("first-a", text, StringComparison.Ordinal);
+        Assert.Contains("first-b", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("second-a", text, StringComparison.Ordinal);
+    }
+}

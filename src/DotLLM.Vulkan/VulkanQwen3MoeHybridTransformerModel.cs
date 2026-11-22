@@ -819,7 +819,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 return ForwardDecodeFused(tokenIds, positions, gdnCache, kvCache, kinds, hiddenSize, vocabSize, numHeads, numKvHeads, headDim, eps);
             // A hidden-state tap needs the layer boundaries the single fused command buffer does not have: take the per-layer loop (#1920).
             HiddenStateTapRegistry.PathCounters.AddVulkanFusedDecodeBypassed();
-            VulkanHiddenStateTaps.LogOnce("a hidden-state tap is attached: single-token MoE decode uses the per-layer path instead of the fused decode.");
+            VulkanHiddenStateTaps.LogOnce("fused-decode", "a hidden-state tap is attached: single-token MoE decode uses the per-layer path instead of the fused decode.");
         }
         if (taps is not null) tapState!.BeginSynchronous(taps, seqLen);
 

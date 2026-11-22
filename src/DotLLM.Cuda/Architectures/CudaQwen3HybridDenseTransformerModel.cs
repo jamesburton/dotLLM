@@ -2266,7 +2266,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         {
             _aheadValid = false;   // a graph captured ahead for the next step no longer matches the state this eager step leaves
             DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddCudaGraphBypassed();
-            CudaHiddenStateTaps.LogOnce("a hidden-state tap is attached: the CUDA decode graph is bypassed and the layer loop runs eagerly.");
+            CudaHiddenStateTaps.LogOnce("cuda-graph", "a hidden-state tap is attached: the CUDA decode graph is bypassed and the layer loop runs eagerly.");
         }
         bool graphed = ts is null && seqLen <= MaxGraphRows && _dflashCall is null
             && TryForwardDecodeGraph(positions, hiddenSize, numHeads, numKvHeads, headDim, eps, kvCache);

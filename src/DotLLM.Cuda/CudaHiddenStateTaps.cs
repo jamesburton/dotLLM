@@ -219,12 +219,12 @@ internal sealed unsafe class CudaHiddenStateTaps : IDisposable
         catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException) { }
     }
 
-    private static int s_logged;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_logged = new();
 
-    /// <summary>Writes <paramref name="message"/> to stderr the first time any model in the process asks (the bypass notices).</summary>
-    internal static void LogOnce(string message)
+    /// <summary>Writes <paramref name="message"/> to stderr the first time any model in the process asks for this <paramref name="kind"/> of bypass notice.</summary>
+    internal static void LogOnce(string kind, string message)
     {
-        if (Interlocked.Exchange(ref s_logged, 1) == 0)
+        if (s_logged.TryAdd(kind, 0))
             Console.Error.WriteLine("[dotllm] " + message);
     }
 
