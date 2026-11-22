@@ -31,7 +31,7 @@ namespace DotLLM.Cuda.Architectures;
 /// (small) are uploaded as F32 device buffers.
 /// </para>
 /// </remarks>
-public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
+public sealed unsafe partial class CudaQwen3MoeHybridTransformerModel : IModel, DotLLM.Core.Diagnostics.IHiddenStateTapHost
 {
     // #1848 / #1834: WDDM sysmem-fallback detector for this CUDA host. Created with the model object (baseline: this process's shared usage then,
     // so later growth past dedicated VRAM warns); polls in the background, never on the inference thread. No-op off Windows.
@@ -1746,9 +1746,16 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         => Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly);
 
     /// <inheritdoc/>
-    [SkipLocalsInit]
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
+        => ForwardTapped(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly)
+           ?? throw new DotLLM.Core.Diagnostics.ForwardAbortedException(_tapAbort);
+
+    /// <summary>The forward; <see langword="null"/> only when an abortable hidden-state tap aborted it (#1920, <c>_tapAbort</c> says where).</summary>
+    [SkipLocalsInit]
+    private ITensor? ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
+                           DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot? taps)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -1801,6 +1808,9 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         if (DebugTrace) LogVram($"after EnsureCapacity (state.AllocatedBytes={_state.AllocatedBytes:N0})");
 
         nint streamH = _stream.Handle;
+        var ts = taps is not null ? _tapState : null;
+        ts?.Begin(taps!, positions);
+        var tapAt = default(DotLLM.Core.Diagnostics.ForwardAbortInfo);
 
         // ── Upload tokenIds + positions to device ──
         fixed (int* tokenPtr = tokenIds)
@@ -1827,12 +1837,22 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                 _state.TokenIdsDevice, _state.HiddenState, seqLen, hiddenSize, streamH);
         }
 
+        if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PostEmbedding, -1, true, seqLen,
+                _state.HiddenState, sizeof(float), 1f, streamH, out tapAt))
+            return TapAborted(tapAt);
+
         // ── Per-layer body ──
         for (int layer = 0; layer < _layers.Length; layer++)
         {
             RunSingleLayerBody(layer, seqLen, positions, hiddenSize,
                 numHeads, numKvHeads, headDim, eps, kvCache);
+            if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PostLayer, layer, true, seqLen,
+                    _state.HiddenState, sizeof(float), 1f, streamH, out tapAt))
+                return TapAborted(tapAt);
         }
+        if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PreFinalNorm, -1, true, seqLen,
+                _state.HiddenState, sizeof(float), 1f, streamH, out tapAt))
+            return TapAborted(tapAt);
 
         // ── Final norm + lm_head ──
         // Issue #185: see CudaQwen3HybridDenseTransformerModel's identically-structured block for
@@ -1845,8 +1865,16 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         nint lmHeadInput = logitsRows == seqLen
             ? _state.HiddenState
             : _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
-        _kernels.LaunchRmsNormF32(lmHeadInput, _outputNormDevice, lmHeadInput,
-            hiddenSize, eps, logitsRows, streamH);
+        // A tap that wants every row after the final norm needs all of them normalised, even when the LM head projects only the last
+        // (in place, as the head's own rows are: the last row is then already normalised for the head below).
+        bool normAll = ts is not null && logitsRows != seqLen
+            && ts.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1) && ts.WantsAll(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1);
+        nint normPtr = normAll ? _state.HiddenState : lmHeadInput;
+        _kernels.LaunchRmsNormF32(normPtr, _outputNormDevice, normPtr,
+            hiddenSize, eps, normAll ? seqLen : logitsRows, streamH);
+        if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1, true, seqLen,
+                _state.HiddenState, sizeof(float), 1f, streamH, out tapAt))
+            return TapAborted(tapAt);
         GemmLmHead(_outputDevice, _outputQt, lmHeadInput, _state.Logits,
              _outputOutputDim, _outputInputDim, logitsRows);
         if (DebugTrace) LogVram("after lm-head");
@@ -1860,6 +1888,11 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             (nuint)((long)logitsRows * vocabSize * sizeof(float))).ThrowOnError();
         if (DebugTrace) LogVram("after D2H logits copy");
 
+        if (ts is not null && !ts.Immediate)
+        {
+            try { ts.DeliverDeferred(); }
+            catch { result.Dispose(); throw; }
+        }
         return result;
     }
 
@@ -3077,6 +3110,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         if (_disposed) return;
         _disposed = true;
         _context.MakeCurrent();
+        _tapState?.Dispose();
 
         // Per-layer weight free.
         for (int i = 0; i < _layers.Length; i++)
