@@ -129,7 +129,8 @@ public sealed class GenerationSessionCoreTests
 
         // Greedy: the refused third token is exactly the next argmax.
         int refused = s.NextTokenArgMax();
-        await using var ref2 = fx.NewGenerator().CreateSession(Greedy(), Tag());
+        using var oracle = Create(family);   // recurrent state is model-owned: the reference needs its own model
+        await using var ref2 = oracle.NewGenerator().CreateSession(Greedy(), Tag());
         await ref2.PrefillAsync(fx.Prompt);
         var three = await ref2.GenerateUntilBoundaryAsync(new StopAfter(3));
         Assert.Equal(three.TokenIds[2], refused);
@@ -227,13 +228,17 @@ public sealed class GenerationSessionCoreTests
     }
 
     [Fact]
-    public async Task RecurrentModel_AllowsOneLiveSession_AndBlocksGenerateWhileOpen()
+    public async Task RecurrentModel_AllowsOneLiveSessionPerModel_AndBlocksGenerateWhileOpen()
     {
         using var fx = Create(HybridDense);
         var gen = fx.NewGenerator();
         await using var s = gen.CreateSession(Greedy(), Tag());
         Assert.Throws<InvalidOperationException>(() => gen.CreateSession(Greedy(), Tag()));
         Assert.Throws<InvalidOperationException>(() => gen.Generate("x", Greedy(2)));
+        // The state is owned by the MODEL: a second generator over the same model is just as blocked.
+        var other = fx.NewGenerator();
+        Assert.Throws<InvalidOperationException>(() => other.CreateSession(Greedy(), Tag()));
+        Assert.Throws<InvalidOperationException>(() => other.Generate("x", Greedy(2)));
     }
 
     [Fact]
@@ -259,5 +264,16 @@ public sealed class GenerationSessionCoreTests
             onCall();
             return StopResult.StopInclude;
         }
+    }
+
+    [Fact]
+    public async Task RecurrentModel_AllowsANewSession_AfterDispose()
+    {
+        using var fx = Create(HybridDense);
+        var gen = fx.NewGenerator();
+        await using (var s = gen.CreateSession(Greedy(), Tag()))
+            await s.PrefillAsync(fx.Prompt);
+        await using var s2 = gen.CreateSession(Greedy(), Tag());
+        await s2.PrefillAsync(fx.Prompt);
     }
 }

@@ -33,9 +33,9 @@ internal sealed class GenerationSessionFixture : IDisposable
     public int[] Prompt { get; }
     public int[] Observation { get; }
 
-    public static GenerationSessionFixture Create(string family) => new(family);
+    public static GenerationSessionFixture Create(string family, int? headDim = null) => new(family, headDim);
 
-    private GenerationSessionFixture(string family)
+    private GenerationSessionFixture(string family, int? headDim)
     {
         _dir = Path.Combine(Path.GetTempPath(), $"dotllm-session-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_dir);
@@ -46,7 +46,7 @@ internal sealed class GenerationSessionFixture : IDisposable
                 File.WriteAllBytes(path, SyntheticDenseGguf.Build("llama", byteLevelVocab: true));
                 break;
             case HybridDense:
-                SyntheticQwen35HybridDenseMtpGguf.Write(path, withMtp: false, contextLength: 256);
+                SyntheticQwen35HybridDenseMtpGguf.Write(path, withMtp: false, contextLength: 256, headDim: headDim, ropeDim: headDim is null ? null : 8);
                 break;
             case MoeHybrid:
                 SyntheticQwen35MoeGguf.Write(path, contextLength: 256);

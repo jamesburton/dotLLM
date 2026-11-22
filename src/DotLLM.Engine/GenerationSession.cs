@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
+using DotLLM.Engine.KvCache;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Sampling;
@@ -23,7 +24,7 @@ namespace DotLLM.Engine;
 /// <para><b>Threading.</b> One operation at a time; a concurrent call throws <see cref="InvalidOperationException"/>.
 /// Operations complete synchronously (the model forward is synchronous); cancellation is checked per token and per prefill chunk.
 /// A cancelled or failed prefill is undone to the position it started from when the cache and model can do that, otherwise the
-/// session is faulted and only RollbackTo(0) or disposal remain.</para>
+/// session is faulted and only <see cref="RollbackTo"/>(0) or disposal remain.</para>
 /// <para>Paused sessions are local to the process and model instance. Sampling history for repetition penalties is the current segment.</para>
 /// </remarks>
 public sealed class GenerationSession : IAsyncDisposable
@@ -47,6 +48,23 @@ public sealed class GenerationSession : IAsyncDisposable
     private int _disposed;
     private bool _faulted;
 
+    /// <summary>Most boundary records (position, recurrent checkpoint, logits) a recurrent session keeps; the oldest are evicted.</summary>
+    public const int MaxRollbackBoundaries = 16;
+    private const long BoundaryByteBudget = 1L << 30;   // host bytes of checkpoints + logits copies a session may hold
+
+    private readonly bool _recurrent;
+    private readonly bool _checkpointing;                // recurrent AND the model can checkpoint
+    private readonly int _maxBoundaries;
+    private readonly List<Boundary> _boundaries = [];
+
+    private sealed class Boundary(int position, object? checkpoint, float[] logits) : IDisposable
+    {
+        public int Position { get; } = position;
+        public object? Checkpoint { get; } = checkpoint;
+        public float[] Logits { get; } = logits;
+        public void Dispose() => (Checkpoint as IDisposable)?.Dispose();
+    }
+
     internal GenerationSession(TextGenerator owner, InferenceOptions options, CacheProvenanceTag tag, IKvCache kv)
     {
         _owner = owner;
@@ -59,6 +77,12 @@ public sealed class GenerationSession : IAsyncDisposable
         _nextLogits = new float[_vocab];
         _sampleScratch = new float[_vocab];
         _pipeline = new SamplerPipeline(options, _tokenizer);
+        _recurrent = _model.RequiresPerSequenceState;
+        _checkpointing = _recurrent && _model.SupportsRecurrentStateCheckpoint;
+        long perBoundary = _model.RecurrentStateCheckpointBytes + (long)_vocab * sizeof(float);
+        _maxBoundaries = _checkpointing
+            ? (int)Math.Clamp(BoundaryByteBudget / Math.Max(1, perBoundary), 1, MaxRollbackBoundaries)
+            : 0;
     }
 
     /// <summary>Number of tokens committed to the session; equals the KV length at every pause.</summary>
@@ -109,6 +133,7 @@ public sealed class GenerationSession : IAsyncDisposable
                 throw;
             }
             _position = start + tokens.Length;
+            RecordBoundary();
             return ValueTask.CompletedTask;
         }
         finally { End(); }
@@ -170,6 +195,7 @@ public sealed class GenerationSession : IAsyncDisposable
                 if (finish == FinishReason.Stop)
                     text = StopSuffixTrimmer.TrimMatchedSuffix(text, conditions);
 
+                RecordBoundary();
                 return ValueTask.FromResult(new GenerationSegmentResult(text, generated.ToArray(), finish, startPos, _position));
             }
             finally { ArrayPool<char>.Shared.Return(scratch); }
@@ -211,9 +237,94 @@ public sealed class GenerationSession : IAsyncDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return ValueTask.CompletedTask;
         _kv.Dispose();
+        DropBoundariesAfter(-1);
         if (_model.RequiresPerSequenceState) _model.ResetSequenceState();
         _owner.ReleaseSession();
         return ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Positions a recurrent session can roll back to (the pauses it recorded a recurrent-state checkpoint at, oldest first).
+    /// Empty for an attention-only model (any position is legal there, see <see cref="CanRollbackTo"/>).
+    /// </summary>
+    public IReadOnlyList<int> RollbackBoundaries
+    {
+        get
+        {
+            var list = new List<int>(_boundaries.Count);
+            foreach (var b in _boundaries) list.Add(b.Position);
+            return list;
+        }
+    }
+
+    /// <summary>
+    /// True when <see cref="RollbackTo"/> would succeed for <paramref name="tokenPosition"/>: always for 0 and the current position;
+    /// otherwise, for an attention-only model, when the KV-cache can be cut to <c>tokenPosition - 1</c>; for a recurrent model, when
+    /// <paramref name="tokenPosition"/> is a recorded boundary and the cache can be cut to it.
+    /// </summary>
+    public bool CanRollbackTo(int tokenPosition) => !IsDisposed && CheckRollback(tokenPosition) is null;
+
+    /// <summary>
+    /// Discards every token at or after <paramref name="tokenPosition"/> from KV, recurrent state and next-token logits, leaving the
+    /// session as it was at that position; nothing of the kept prefix is re-prefilled.
+    /// <list type="bullet">
+    /// <item>Attention-only models: any <c>0 &lt;= k &lt;= CurrentPosition</c>; one token is re-forwarded to regenerate the logits.</item>
+    /// <item>Recurrent models: only a recorded boundary (<see cref="RollbackBoundaries"/>) or 0; state, KV and logits are restored with no forward.</item>
+    /// </list>
+    /// Throws <see cref="ArgumentOutOfRangeException"/> outside <c>[0, CurrentPosition]</c> and <see cref="NotSupportedException"/>
+    /// (changing nothing) where the model or KV-cache cannot do it exactly.
+    /// </summary>
+    public void RollbackTo(int tokenPosition)
+    {
+        Begin();
+        try
+        {
+            if ((uint)tokenPosition > (uint)_position)
+                throw new ArgumentOutOfRangeException(nameof(tokenPosition), tokenPosition, $"Must be in [0, {_position}].");
+            if (CheckRollback(tokenPosition) is { } refusal)
+                throw new NotSupportedException(refusal);
+            if (tokenPosition == _position) return;
+
+            if (tokenPosition == 0)
+            {
+                _kv.Rollback(0);
+                if (_recurrent) _model.ResetSequenceState();
+                DropBoundariesAfter(-1);
+                _position = 0;
+                _logitsPos = -1;
+                return;
+            }
+
+            if (_recurrent)
+            {
+                var b = FindBoundary(tokenPosition)!;
+                _model.RestoreRecurrentState(b.Checkpoint);
+                _kv.Rollback(tokenPosition);
+                b.Logits.CopyTo(_nextLogits, 0);
+                _logitsPos = tokenPosition;
+                _position = tokenPosition;
+                DropBoundariesAfter(tokenPosition);
+                return;
+            }
+
+            // Attention only: KV rows [0, k-1) stay, token k-1 is re-forwarded for the logits (it rewrites its own KV row).
+            int last = tokenPosition - 1;
+            _kv.Rollback(last);
+            _tokBuf[0] = _history[last];
+            _posBuf[0] = last;
+            try
+            {
+                using ITensor logits = _model.Forward(_tokBuf, _posBuf, deviceId: -1, _kv, adapter: null, mtpState: null, lastTokenLogitsOnly: true);
+                StoreLogits(logits, tokenPosition);
+            }
+            catch
+            {
+                _faulted = true;   // KV already cut, position not: cannot be put back
+                throw;
+            }
+            _position = tokenPosition;
+        }
+        finally { End(); }
     }
 
     // ── internals ───────────────────────────────────────────────────────────────
@@ -258,12 +369,73 @@ public sealed class GenerationSession : IAsyncDisposable
             if (_model.RequiresPerSequenceState)
             {
                 if (position == 0) _model.ResetSequenceState();
+                else if (FindBoundary(position) is { } b) _model.RestoreRecurrentState(b.Checkpoint);
                 else _faulted = true;
             }
         }
         catch
         {
             _faulted = true;
+        }
+    }
+
+    private bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
+    /// <summary>Null when rolling back to <paramref name="k"/> is possible, else the reason it is not.</summary>
+    private string? CheckRollback(int k)
+    {
+        if (k < 0 || k > _position) return $"Position {k} is outside [0, {_position}].";
+        if (k == _position || k == 0) return null;
+        if (_recurrent)
+        {
+            if (!_checkpointing)
+                return $"{_model.GetType().Name} is a recurrent model without recurrent-state checkpoint support; only RollbackTo(0) or the current position are possible.";
+            if (FindBoundary(k) is null)
+                return $"Position {k} is not a recorded boundary of this recurrent session (boundaries: {string.Join(", ", _boundaries.Select(b => b.Position))}); recurrent state exists only at pauses.";
+            return KvCanTruncateTo(k);
+        }
+        return KvCanTruncateTo(k - 1);
+    }
+
+    private string? KvCanTruncateTo(int length)
+    {
+        bool ok = _kv switch
+        {
+            SimpleKvCache simple => simple.CanTruncateTo(length),
+            IPrefixReusableKvCache reusable => reusable.CanTruncateTo(length),
+            _ => false,
+        };
+        return ok ? null
+            : $"The session's KV-cache ({_kv.GetType().Name}) cannot be cut back to {length} positions (rows already dropped or no truncation support).";
+    }
+
+    private Boundary? FindBoundary(int position)
+    {
+        foreach (var b in _boundaries)
+            if (b.Position == position) return b;
+        return null;
+    }
+
+    private void DropBoundariesAfter(int position)
+    {
+        for (int i = _boundaries.Count - 1; i >= 0 && _boundaries[i].Position > position; i--)
+        {
+            _boundaries[i].Dispose();
+            _boundaries.RemoveAt(i);
+        }
+    }
+
+    /// <summary>Records recurrent state + logits at the current pause so it can be rolled back to; no-op for attention-only models.</summary>
+    private void RecordBoundary()
+    {
+        if (!_checkpointing || _logitsPos != _position || _position == 0 || FindBoundary(_position) is not null)
+            return;
+        object? checkpoint = _model.CheckpointRecurrentState();
+        _boundaries.Add(new Boundary(_position, checkpoint, (float[])_nextLogits.Clone()));
+        while (_boundaries.Count > _maxBoundaries)
+        {
+            _boundaries[0].Dispose();
+            _boundaries.RemoveAt(0);
         }
     }
 

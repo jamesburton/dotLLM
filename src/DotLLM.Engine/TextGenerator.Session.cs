@@ -8,7 +8,8 @@ namespace DotLLM.Engine;
 
 public sealed partial class TextGenerator
 {
-    private int _liveSessions;
+    // A recurrent model's state lives in the model instance, so the owner is tracked per model, across generators.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IModel, object> s_recurrentOwners = new();
 
     /// <summary>
     /// Opens a resumable single-sequence <see cref="GenerationSession"/> (issue #1919): prefill once, generate until a boundary,
@@ -33,12 +34,9 @@ public sealed partial class TextGenerator
             throw new InvalidOperationException("A Generate call is running on this generator; open the session when it has finished.");
 
         bool recurrent = _model.RequiresPerSequenceState;
-        if (Interlocked.Increment(ref _liveSessions) > 1 && recurrent)
-        {
-            Interlocked.Decrement(ref _liveSessions);
+        if (recurrent && !s_recurrentOwners.TryAdd(_model, this))
             throw new InvalidOperationException(
                 "A GenerationSession is already open on this recurrent model; its state is model-owned, so only one session may be live.");
-        }
 
         IKvCache? kv = null;
         try
@@ -53,7 +51,7 @@ public sealed partial class TextGenerator
         catch
         {
             kv?.Dispose();
-            Interlocked.Decrement(ref _liveSessions);
+            if (recurrent) s_recurrentOwners.Remove(_model);
             throw;
         }
     }
@@ -64,11 +62,14 @@ public sealed partial class TextGenerator
     internal ITensor SessionForwardPrefill(int[] tokens, int start, int length, IKvCache kv, CancellationToken cancellationToken)
         => ForwardPrefill(tokens, start, length, kv, adapter: null, cancellationToken: cancellationToken);
 
-    internal void ReleaseSession() => Interlocked.Decrement(ref _liveSessions);
+    internal void ReleaseSession()
+    {
+        if (_model.RequiresPerSequenceState) s_recurrentOwners.Remove(_model);
+    }
 
     private void ThrowIfRecurrentSessionOpen()
     {
-        if (_model.RequiresPerSequenceState && Volatile.Read(ref _liveSessions) > 0)
+        if (_model.RequiresPerSequenceState && s_recurrentOwners.TryGetValue(_model, out _))
             throw new InvalidOperationException(
                 "A GenerationSession is open on this recurrent model and owns its state; dispose it before calling Generate on this generator.");
     }
