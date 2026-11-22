@@ -1003,16 +1003,23 @@ public static class Attention
         public Half* O16;
         private long _slots, _o16, _o32;
 
+        /// <summary>Slots currently allocated (test hook for the growth policy).</summary>
+        internal long Slots => _slots;
+
         public void Ensure(int slots, int headDim, bool f16)
         {
             bool f32 = !f16;
+            // Geometric growth (#1927 review M1): decode adds a range every 256 keys, so exact-fit growth would free and re-allocate
+            // on the hot path every 256 tokens. Doubling bounds that to O(log context) re-allocations.
             if (_slots < slots)
             {
                 if (M != null) { NativeMemory.AlignedFree(M); NativeMemory.AlignedFree(S); }
+                slots = (int)Math.Min(int.MaxValue, Math.Max(slots, 2L * _slots));
                 M = (float*)NativeMemory.AlignedAlloc((nuint)slots * sizeof(float), 64);
                 S = (float*)NativeMemory.AlignedAlloc((nuint)slots * sizeof(float), 64);
                 _slots = slots;
             }
+            slots = (int)_slots;
             long need = (long)slots * headDim;
             if (!f32 && _o16 < need)
             {
@@ -1041,6 +1048,9 @@ public static class Attention
     }
 
     [ThreadStatic] private static SplitKvPartialBuffers? t_splitKvParts;
+
+    /// <summary>Split-KV partial slots (range x head) the calling thread holds; 0 when none (test hook).</summary>
+    internal static long SplitKvPartialSlotsOnThisThread => t_splitKvParts?.Slots ?? 0;
 
     // ──────────────────── Bidirectional encoder attention (#1402) ────────────────────
 
@@ -2324,13 +2334,10 @@ public static class Attention
     /// exits and the holder's finalizer runs). Idempotent; buffers are re-grown on the next blocked call. Call it from the owner of a pool when the
     /// model is disposed, before the pool is.
     /// </summary>
-    public static unsafe void TrimTurboQuantTileBuffers(ComputeThreadPool? pool)
-    {
-        if (pool is null) { TrimTileBuffersWorker(0, 0, 1); return; }
-        pool.Dispatch(0, &TrimTileBuffersWorker);
-    }
+    public static void TrimTurboQuantTileBuffers(ComputeThreadPool? pool) => CpuKernelScratch.Trim(pool);
 
-    private static void TrimTileBuffersWorker(nint _, int __, int ___) { t_kvTiles?.Free(); t_splitKvParts?.Free(); }
+    /// <summary>Frees the calling thread's attention scratch: the dense K/V tile holder and the split-KV partials (idempotent).</summary>
+    internal static void FreeThreadScratch() { t_kvTiles?.Free(); t_splitKvParts?.Free(); }
 
     /// <summary>
     /// Flash-style multi-row path for an in-place TurboQuant cache: key tiles outer, query rows inner. Each K/V tile is decoded ONCE

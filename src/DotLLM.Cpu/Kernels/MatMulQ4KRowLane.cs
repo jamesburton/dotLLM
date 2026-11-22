@@ -9,7 +9,8 @@ namespace DotLLM.Cpu.Kernels;
 /// <summary>
 /// Row-lane Q4_K GEMM (#1927 E3d; default on, James 2026-11-22; <see cref="Q4KRowLaneEnabled"/>, n >= 16, m % 8 == 0): Q4_K x Q8_K GEMM with SIMD lanes over 8 OUTPUT ROWS,
 /// read in place from the native row-major (mmap'd) Q4_K layout. Each 8-row block's super-blocks are transposed once into a
-/// bounded per-worker L1/L2 tile (lane r = row r's 4 consecutive nibbles), then reused by every token: activations are broadcast
+/// per-worker tile of sbCount x 2,752 B (44 KiB at k = 4096, 104 KiB at k = 9728, 150 KiB at k = 14336; about 2.4x the 8-row slice
+/// it transposes; lane r = row r's 4 consecutive nibbles), then reused by every token: activations are broadcast
 /// 4 bytes at a time, <c>vpmaddubsw</c> results of the 8 four-position chunks of one sub-block are summed in int16 before ONE
 /// scale multiply (<c>vpdpwssd</c>/<c>vpmaddwd</c>) per sub-block, as llama.cpp's q4_Kx8 kernel does. No weight copy is stored.
 /// <para>
@@ -29,43 +30,25 @@ public static unsafe partial class MatMul
     /// </summary>
     public static bool Q4KRowLaneEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_CPU_Q4K_ROWLANE") != "0";
 
-    /// <summary>Fewest tokens for which a Q4_K GEMM takes the row-lane kernel: shorter batches (decode, verify, short chunks) keep the
-    /// R4 kernels, so a decode row and a short verify batch still agree bit for bit (#530).</summary>
+    /// <summary>Fewest tokens for which a Q4_K GEMM takes the row-lane kernel (a speed choice only: below it the tile transpose does not
+    /// pay). Shorter batches run the R4 kernels in the SAME row-lane arithmetic (<see cref="Q4KRlaActive"/>), so a row's bits do not
+    /// depend on the batch size or composition (#530, #1927).</summary>
     internal const int Q4KRowLaneMinTokens = 16;
+
+    /// <summary>Row-lane GEMMs issued from the CURRENT thread (tests: immune to concurrent GEMMs on other threads).</summary>
+    [ThreadStatic] internal static long t_q4kRowLaneCalls;
 
     /// <summary>Number of Q4_K GEMMs served by the row-lane kernel (test and profiling hook).</summary>
     public static long Q4KRowLaneCalls;
 
-    /// <summary>Thread-scoped override of <see cref="Q4KRowLaneEnabled"/> for tests (read on the GEMM's calling thread).</summary>
-    [ThreadStatic] internal static bool? t_q4kRowLaneOverride;
-
-    /// <summary>
-    /// Pins the Q4_K row-lane choice for GEMMs issued from the calling thread until disposed (tests that assert prefill == decode
-    /// row identity: they need the R4 kernel at every batch size, without racing other tests through the process-wide switch).
-    /// </summary>
-    internal static Q4KRowLaneScope OverrideQ4KRowLaneOnThisThread(bool enabled)
-    {
-        var scope = new Q4KRowLaneScope(t_q4kRowLaneOverride);
-        t_q4kRowLaneOverride = enabled;
-        return scope;
-    }
-
-    /// <summary>Restores the previous thread-scoped row-lane override on dispose.</summary>
-    internal readonly struct Q4KRowLaneScope : IDisposable
-    {
-        private readonly bool? _previous;
-        internal Q4KRowLaneScope(bool? previous) => _previous = previous;
-        /// <inheritdoc/>
-        public void Dispose() => t_q4kRowLaneOverride = _previous;
-    }
-
     internal static bool Q4KRowLaneApplies(int m, int tailRows, int n)
-        => (t_q4kRowLaneOverride ?? Q4KRowLaneEnabled) && Q4KRowLaneIsa && n >= Q4KRowLaneMinTokens && tailRows == 0 && m % 8 == 0;
+        => Q4KRlaActive && n >= Q4KRowLaneMinTokens && tailRows == 0 && m % 8 == 0;
 
     /// <summary>Production entry: quantizes the F32 input when no Q8_K input is given, then runs <see cref="GemmQ4KRowLane8"/>.</summary>
     internal static void GemmQ4KRowLaneEntry(byte* w, float* b, byte* inputQ, float* c, int sbCount, int m, int k, int n, ComputeThreadPool? pool)
     {
         Interlocked.Increment(ref Q4KRowLaneCalls);
+        t_q4kRowLaneCalls++;
         if (inputQ != null) { GemmQ4KRowLane8(w, inputQ, c, m, sbCount, n, pool); return; }
         int rowBytes = sbCount * Q8_K_BlockBytes;
         byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(n * rowBytes);
@@ -94,25 +77,55 @@ public static unsafe partial class MatMul
     /// <summary>C[t * m + row] = W[row] . X[t] for rows [0, m) (m % 8 == 0), tokens [0, n). X is Q8_K rows of <paramref name="sbCount"/> blocks.</summary>
     internal static void GemmQ4KRowLane8(byte* w, byte* x, float* c, int m, int sbCount, int n, ComputeThreadPool? pool)
     {
-        if (m % 8 != 0) throw new ArgumentException("prototype needs m % 8 == 0", nameof(m));
+        if (m % 8 != 0) throw new ArgumentException("the row-lane kernel needs m % 8 == 0 (callers fall back to the R4 kernels in the same arithmetic)", nameof(m));
         var ctx = new RowLaneCtx { W = w, X = x, C = c, M = m, N = n, SbCount = sbCount, XRowBytes = sbCount * Q8_K_BlockBytes, Next = 0 };
         if (pool is null) RowLaneWorker((nint)(&ctx), 0, 1);
         else pool.Dispatch((nint)(&ctx), &RowLaneWorker);
     }
 
-    [ThreadStatic] private static nint t_rowLaneTile;
-    [ThreadStatic] private static int t_rowLaneTileSb;
+    /// <summary>
+    /// Per-thread transposed row-lane tile (native, 64-byte aligned, grown on demand to the largest k seen). Finalizable owner, so the
+    /// memory is released when the thread exits; <see cref="CpuKernelScratch.Trim(ComputeThreadPool?)"/> frees it deterministically
+    /// (model dispose and pool teardown call it). Every thread that drives a Q4_K GEMM of 16+ tokens gets one: pool workers and the
+    /// dispatching thread (worker 0).
+    /// </summary>
+    private sealed class RowLaneTile
+    {
+        public nint Ptr;
+        public int SbCount;
+
+        public void Ensure(int sbCount)
+        {
+            if (SbCount >= sbCount) return;
+            Free();
+            Ptr = (nint)NativeMemory.AlignedAlloc((nuint)(sbCount * RowLaneSbVectors * 32), 64);
+            SbCount = sbCount;
+        }
+
+        public void Free()
+        {
+            if (Ptr != 0) NativeMemory.AlignedFree((void*)Ptr);
+            Ptr = 0;
+            SbCount = 0;
+        }
+
+        ~RowLaneTile() => Free();
+    }
+
+    [ThreadStatic] private static RowLaneTile? t_rowLaneTile;
+
+    /// <summary>Frees the calling thread's row-lane tile (idempotent).</summary>
+    internal static void FreeRowLaneTile() => t_rowLaneTile?.Free();
+
+    /// <summary>Bytes of row-lane tile the calling thread holds (test hook).</summary>
+    internal static long RowLaneTileBytesOnThisThread => t_rowLaneTile is { Ptr: not 0 } t ? (long)t.SbCount * RowLaneSbVectors * 32 : 0;
 
     private static void RowLaneWorker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var ctx = ref Unsafe.AsRef<RowLaneCtx>((void*)ctxPtr);
-        if (t_rowLaneTileSb < ctx.SbCount)
-        {
-            if (t_rowLaneTile != 0) NativeMemory.AlignedFree((void*)t_rowLaneTile);
-            t_rowLaneTile = (nint)NativeMemory.AlignedAlloc((nuint)(ctx.SbCount * RowLaneSbVectors * 32), 64);
-            t_rowLaneTileSb = ctx.SbCount;
-        }
-        var tile = (Vector256<int>*)t_rowLaneTile;
+        RowLaneTile holder = t_rowLaneTile ??= new RowLaneTile();
+        holder.Ensure(ctx.SbCount);
+        var tile = (Vector256<int>*)holder.Ptr;
         int blocks = ctx.M / 8;
         while (true)
         {
@@ -177,8 +190,8 @@ public static unsafe partial class MatMul
         }
     }
 
-    /// <summary>Prototype switch: two tokens per tile pass (shared tile loads, two independent chains). Same per-token arithmetic.</summary>
-    internal static bool RowLaneTwoTokens = true;
+    /// <summary>Two tokens per tile pass (shared tile loads, two independent chains). Same per-token arithmetic.</summary>
+    internal static readonly bool RowLaneTwoTokens = true;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<int> RowLaneSub(Vector256<int>* wl, byte* q, Vector256<int> isum, Vector256<int> scPlain)
