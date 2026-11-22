@@ -793,6 +793,32 @@ public static class Attention
             _ => DecodeSplitKvPartials.F16,
         };
 
+    [ThreadStatic] private static DecodeSplitKvPartials? t_decodeSplitKvOverride;
+
+    /// <summary>The mode decode on the CURRENT thread uses: a thread-scoped override if one is active, else <see cref="DecodeSplitKv"/>.</summary>
+    internal static DecodeSplitKvPartials EffectiveDecodeSplitKv => t_decodeSplitKvOverride ?? DecodeSplitKv;
+
+    /// <summary>
+    /// Pins the split-KV mode for attention calls made from the calling thread until the scope is disposed (tests: a reference arm
+    /// that must be the tiled path, without racing other tests through the process-wide <see cref="DecodeSplitKv"/>). The decision
+    /// is taken on the thread that calls <c>Execute</c> (the model's forward thread), never on pool workers.
+    /// </summary>
+    internal static DecodeSplitKvScope OverrideDecodeSplitKvOnThisThread(DecodeSplitKvPartials mode)
+    {
+        var scope = new DecodeSplitKvScope(t_decodeSplitKvOverride);
+        t_decodeSplitKvOverride = mode;
+        return scope;
+    }
+
+    /// <summary>Restores the previous thread-scoped split-KV override on dispose.</summary>
+    internal readonly struct DecodeSplitKvScope : IDisposable
+    {
+        private readonly DecodeSplitKvPartials? _previous;
+        internal DecodeSplitKvScope(DecodeSplitKvPartials? previous) => _previous = previous;
+        /// <inheritdoc/>
+        public void Dispose() => t_decodeSplitKvOverride = _previous;
+    }
+
     /// <summary>Keys per split-KV range. Fixed (not <c>seqKv / threads</c>), so the result does not depend on the thread count.</summary>
     internal const int SplitKvRangeKeys = 256;
 
@@ -805,7 +831,7 @@ public static class Attention
     /// </summary>
     internal static unsafe bool DecodeSplitKvApplies(int seqQ, int seqKv, int numHeads, int numKvHeads, int positionOffset, float* alibiSlopes,
                                                      int? slidingWindowSize, float softCap, AttentionMaskMode maskMode, float[]? sinks)
-        => DecodeSplitKv != DecodeSplitKvPartials.Off && seqQ == 1 && alibiSlopes is null && (slidingWindowSize ?? 0) <= 0
+        => EffectiveDecodeSplitKv != DecodeSplitKvPartials.Off && seqQ == 1 && alibiSlopes is null && (slidingWindowSize ?? 0) <= 0
            && softCap == 0f && maskMode == AttentionMaskMode.Causal && sinks is null && numHeads <= 256
            && Math.Min(seqKv, positionOffset + 1) > OneShotMaxKeys;
 
@@ -837,7 +863,7 @@ public static class Attention
                                                     int numHeads, int numKvHeads, int headDim, float scale, ComputeThreadPool? pool)
     {
         int ranges = (visible + SplitKvRangeKeys - 1) / SplitKvRangeKeys;
-        bool f16 = DecodeSplitKv != DecodeSplitKvPartials.F32;   // read once: the buffers and the kernel use the same choice
+        bool f16 = EffectiveDecodeSplitKv != DecodeSplitKvPartials.F32;   // read once: the buffers and the kernel use the same choice
         SplitKvPartialBuffers parts = t_splitKvParts ??= new SplitKvPartialBuffers();
         parts.Ensure(ranges * numHeads, headDim, f16);
         var ctx = new SplitKvCtx

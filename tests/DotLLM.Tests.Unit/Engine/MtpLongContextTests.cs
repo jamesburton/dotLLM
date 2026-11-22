@@ -136,6 +136,9 @@ public sealed class MtpLongContextTests : IDisposable
     [InlineData(4097)]
     public void MtpGreedy_AcrossGrowthAndTheOldCap_MatchesPlainGreedy(int promptLength)
     {
+        // Spec == plain greedy identity needs decode rows equal to verify rows. Past 2,048 keys CPU decode takes the split-KV
+        // kernel, which is not bit-identical to the verify (multi-row) path (James 2026-11-22, #1927): pin the tiled decode here.
+        using var tiled = DotLLM.Cpu.Kernels.Attention.OverrideDecodeSplitKvOnThisThread(DotLLM.Cpu.Kernels.DecodeSplitKvPartials.Off);
         string path = SyntheticQwen35HybridDenseMtpGguf.Write(
             Path.Combine(_scratch, $"mtp-longctx-{promptLength}.gguf"), withMtp: true, contextLength: ContextLength);
         using var gguf = GgufFile.Open(path);

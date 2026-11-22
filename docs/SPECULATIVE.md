@@ -75,7 +75,22 @@ All buffers are caller-owned or pool-rented — zero per-call heap allocation on
 
 Draft and target **must share the same base tokenizer** — the acceptance scheme requires comparing probabilities over the same token space. A small vocab size difference (up to 128 tokens) is tolerated; see [Vocabulary Compatibility](#vocabulary-compatibility) below.
 
-## KV-Cache Rollback
+## CPU: decode rows past 2,048 keys are not bit-identical to verify rows (#1927)
+
+On the CPU backend, a **one-row decode** whose visible history exceeds 2,048 keys takes the split-KV decode kernel
+(`Attention.ExecuteDecodeSplitKv`: fixed 256-key ranges, F16 partial outputs, F32 max/sum, per-head combine), while
+**prefill and speculative/MTP verify rows** (`seqQ > 1`) take the blocked online-softmax kernel. The two are not
+bit-identical (kernel-level difference about 8e-5; per-step KL about 2e-3 on Qwen3-4B at depth 7,600, see
+`docs/PRECISION.md` E18). Consequence, **accepted by James 2026-11-22**: past 2,048 keys, speculative or MTP greedy
+output can differ from plain greedy output on CPU (a near-tie can resolve differently in the verify row than in the plain
+decode row). Below 2,048 keys, and on any decode with sliding window, soft-cap, sinks or ALiBi, decode stays exact.
+
+- `DOTLLM_CPU_ATTN_SPLITKV=0` restores the tiled decode, which is bit-identical to verify/prefill rows (#530), for runs that need
+  exact spec == greedy identity on long contexts.
+- Tests that assert spec == plain greedy past 2,048 keys on CPU pin the tiled decode with
+  `Attention.OverrideDecodeSplitKvOnThisThread(DecodeSplitKvPartials.Off)` (thread-scoped, no race with other tests):
+  `MtpLongContextTests.MtpGreedy_AcrossGrowthAndTheOldCap_MatchesPlainGreedy` (prompts 4,095-4,097).
+
 
 Speculated tokens that are rejected need their KV-cache entries invalidated:
 - Draft model KV-cache: roll back to pre-speculation position.

@@ -652,7 +652,9 @@ reduction order (F32 arm) already costs 2.0e-3 per step (Q8_K activation roundin
 ULP drift" note), so the F16 rounding adds +1.6% to the mean KL and BF16 +6.6% (max 2.6x, top-1 -1.2 points). dNLL resolves
 +-0.3% (1 SE) and sees none of them. Decision: **F16 partials, default on** (no measurable cost above the reorder floor; the
 kernel-level error is the sensitive instrument: 8e-5 absolute). The reorder floor itself (decode rows no longer equal prefill or
-verify rows past 2,048 keys, #530) is the accepted consequence of E2c.
+verify rows past 2,048 keys, #530) is the accepted consequence of E2c: **James 2026-11-22**: past 2,048 keys CPU decode rows
+are not bit-identical to prefill / verify rows, so speculative / MTP greedy output can differ from plain greedy on CPU
+(`docs/SPECULATIVE.md`; `DOTLLM_CPU_ATTN_SPLITKV=0` restores exact identity).
 
 ## 6. Decision table: CLAUDE.md rule → evidence
 

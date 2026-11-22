@@ -43,18 +43,15 @@ public sealed unsafe class AttentionDecodeSplitKvTests
     private static float[] Run(float[] q, float[] k, float[] v, int numHeads, int numKvHeads, int headDim, int seqKv, int threads,
                                DecodeSplitKvPartials mode, out long engaged)
     {
-        var saved = Attention.DecodeSplitKv;
         var got = new float[q.Length];
-        try
+        using (Attention.OverrideDecodeSplitKvOnThisThread(mode))
         {
-            Attention.DecodeSplitKv = mode;
             using var pool = threads > 1 ? new ComputeThreadPool(threads) : null;   // 1 = no pool: the inline form
             long before = Attention.t_decodeSplitKvCalls;
             fixed (float* qp = q, kp = k, vp = v, op = got)
                 Attention.Execute(qp, kp, vp, op, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1, pool);
             engaged = Attention.t_decodeSplitKvCalls - before;
         }
-        finally { Attention.DecodeSplitKv = saved; }
         return got;
     }
 
@@ -105,10 +102,9 @@ public sealed unsafe class AttentionDecodeSplitKvTests
     {
         const int numHeads = 16, numKvHeads = 4, headDim = 64, seqKv = 3000;
         var (q, k, v) = Fixture(numHeads, numKvHeads, headDim, seqKv);
-        var saved = Attention.DecodeSplitKv;
+        var scope = Attention.OverrideDecodeSplitKvOnThisThread(DecodeSplitKvPartials.F16);
         try
         {
-            Attention.DecodeSplitKv = DecodeSplitKvPartials.F16;
             using var pool = new ComputeThreadPool(4);
             var outA = new float[q.Length];
             long before = Attention.t_decodeSplitKvCalls;
@@ -121,11 +117,11 @@ public sealed unsafe class AttentionDecodeSplitKvTests
                 Assert.Equal(before, Attention.t_decodeSplitKvCalls);
                 Attention.Execute(qp, kp, vp, op, 1, 2049, numHeads, numKvHeads, headDim, 2048, pool);
                 Assert.Equal(before + 1, Attention.t_decodeSplitKvCalls);
-                Attention.DecodeSplitKv = DecodeSplitKvPartials.Off;
+                using var off = Attention.OverrideDecodeSplitKvOnThisThread(DecodeSplitKvPartials.Off);
                 Attention.Execute(qp, kp, vp, op, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1, pool);
                 Assert.Equal(before + 1, Attention.t_decodeSplitKvCalls);
             }
         }
-        finally { Attention.DecodeSplitKv = saved; }
+        finally { scope.Dispose(); }
     }
 }

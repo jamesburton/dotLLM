@@ -112,10 +112,8 @@ public sealed unsafe class PagedAttentionTests
         {
             // The reference is the contiguous TILED path: pin it (the default contiguous decode past 2,048 keys is split-KV, #1927 E2c,
             // which is not bit-identical by design).
-            var savedSplit = Attention.DecodeSplitKv;
-            Attention.DecodeSplitKv = DecodeSplitKvPartials.Off;
-            try { Attention.Execute(qp, kp, vp, ep, 1, length, Heads, KvHeads, HeadDim, length - 1, scale, workers); }
-            finally { Attention.DecodeSplitKv = savedSplit; }
+            using (Attention.OverrideDecodeSplitKvOnThisThread(DecodeSplitKvPartials.Off))
+                Attention.Execute(qp, kp, vp, ep, 1, length, Heads, KvHeads, HeadDim, length - 1, scale, workers);
             Attention.Execute(qp, cache, 0, sp, 1, Heads, KvHeads, HeadDim, length - 1, scale, null);
             Attention.Execute(qp, cache, 0, pp, 1, Heads, KvHeads, HeadDim, length - 1, scale, workers);
         }
