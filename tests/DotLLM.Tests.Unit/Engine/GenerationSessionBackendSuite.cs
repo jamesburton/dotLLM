@@ -1,6 +1,7 @@
 using System.Reflection;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Diagnostics;
 using DotLLM.Engine;
 using Xunit;
 using static DotLLM.Tests.Unit.Engine.GenerationSessionFixture;
@@ -25,28 +26,99 @@ public abstract partial class GenerationSessionBackendSuite
 
     /// <summary>
     /// Safety factor on the control: the bound is <see cref="ControlFactor"/> x the control's max-abs logit difference. 2 because the
-    /// control is one realisation of the prefill-vs-decode noise on one token sequence while the compared pair is another, so the
-    /// two are the same order but not equal; 2 absorbs that without letting a real defect through (a dropped rollback or restore moves
-    /// logits by orders of magnitude, see the mutants in .docs/progress-expert-integ.md). When the control is exactly 0 the comparison
-    /// must be bit-identical: there is no floor.
+    /// control is one realisation of the noise on one token sequence while the compared pair is another, so the two are the same
+    /// order but not equal; 2 absorbs that without letting a real defect through (a dropped rollback or restore moves logits by
+    /// orders of magnitude, see the mutants in the PR body). When the control is exactly 0 the comparison must be bit-identical:
+    /// there is no floor.
     /// </summary>
     private const float ControlFactor = 2f;
 
+    /// <summary>A control above this means the instrument itself is broken (or noisy beyond any parity claim): the run fails instead of deriving a runaway bound.</summary>
+    private const float ControlSanityCeiling = 1e-1f;
+
     /// <summary>
-    /// Derived tolerance (James 2026-11-22, consistent with #1928): no fixed number. Per backend and in the same run, the control is
-    /// the plain path against itself with one thing changed, the prefill-vs-decode split, which is exactly the path pair every parity
-    /// comparison here crosses (a session reaches its state through batched prefill, one-row decode and batched append; the oracle
-    /// reaches the same tokens through one batched prefill). Control = fresh prefill of <paramref name="tokens"/> versus prefill of the
-    /// first half then every remaining token appended singly (decode rows), same model, same tokens, max |logit diff|.
+    /// Derived tolerance (James 2026-11-22, consistent with #1928): no fixed number, and the control does NOT run through the code under
+    /// test. Everything here is raw <c>IModel.Forward</c> on a fresh cache from the generator's KV factory, never <see cref="GenerationSession"/>,
+    /// so a defect in the session's append or prefill path cannot inflate the control and the compared diff together.
+    /// Two arms, same model, same tokens, max |logit diff| against one batched prefill of all tokens:
+    /// (1) the genuine 1-ULP arm: the same prefill with ONE F32 ULP (<c>MathF.BitIncrement</c>) added to every element of token 0's
+    /// residual row after layer 0, the "one F16/F32 rounding of one input" sensitivity of #1928, through the residual-modifier hook that only the
+    /// CPU models implement (a GPU backend has no injection point; there the arm is absent and stated as such in the PR);
+    /// (2) the prefill-vs-decode path split (prefill of the first half, then every remaining token as a single decode row), the path pair
+    /// every comparison here crosses. Control = max of the arms. A 1-ULP perturbation can be absorbed on one particular sequence, so
+    /// observability is asserted once per family by <see cref="OneUlpArm_IsObservable"/> (an inert arm must fail the run), not per call.
     /// </summary>
-    private static async Task<float> ControlMaxAbsDiff(GenerationSessionFixture oracle, int[] tokens)
+    private static float ControlMaxAbsDiff(GenerationSessionFixture oracle, int[] tokens)
     {
-        var (fresh, _) = await Fresh(oracle, tokens);
-        int p = Math.Max(1, tokens.Length / 2);
-        await using var s = oracle.NewGenerator().CreateSession(Greedy(), Tag());
-        await s.PrefillAsync(tokens[..p]);
-        for (int i = p; i < tokens.Length; i++) await s.AppendObservationTokensAsync(new[] { tokens[i] });
-        return MaxAbsDiff(fresh, Logits(s));
+        float[] full = RawLastLogits(oracle, tokens, tokens.Length, perturb: false);
+        float control = MaxAbsDiff(full, RawLastLogits(oracle, tokens, Math.Max(1, tokens.Length / 2), perturb: false));
+        if (oracle.Model is IResidualModifierHost)
+        {
+            control = Math.Max(control, MaxAbsDiff(full, RawLastLogits(oracle, tokens, tokens.Length, perturb: true)));   // may be 0 on one sequence; OneUlpArm_IsObservable proves the arm can disagree
+        }
+        Assert.True(control <= ControlSanityCeiling, $"{oracle.Backend}: control {control:E3} exceeds the sanity ceiling {ControlSanityCeiling:E1}");
+        return control;
+    }
+
+    /// <summary>Last-row logits after a raw forward of <paramref name="tokens"/>: the first <paramref name="firstChunk"/> tokens batched, the rest one row at a time.</summary>
+    private static unsafe float[] RawLastLogits(GenerationSessionFixture fx, int[] tokens, int firstChunk, bool perturb)
+    {
+        var model = fx.Model;
+        using var kv = fx.NewKvCache(tokens.Length + 1);
+        if (model.RequiresPerSequenceState) model.ResetSequenceState();
+        var host = model as IResidualModifierHost;
+        var saved = host?.ResidualModifier;
+        if (perturb) host!.ResidualModifier = new OneUlpPerturber();
+        try
+        {
+            var pos = new int[tokens.Length];
+            for (int i = 0; i < pos.Length; i++) pos[i] = i;
+            float[]? last = null;
+            for (int start = 0, len = firstChunk; start < tokens.Length; start += len, len = 1)
+            {
+                using var logits = model.Forward(tokens.AsSpan(start, len), pos.AsSpan(start, len), -1, kv, null, null, true);
+                if (start + len == tokens.Length)
+                {
+                    int vocab = model.Config.VocabSize;
+                    last = new ReadOnlySpan<float>((float*)logits.DataPointer + (long)(logits.Shape[0] - 1) * vocab, vocab).ToArray();
+                }
+                if (perturb) host!.ResidualModifier = saved;   // the perturbation is one-shot; later rows run clean
+            }
+            return last!;
+        }
+        finally
+        {
+            if (host is not null) host.ResidualModifier = saved;
+            if (model.RequiresPerSequenceState) model.ResetSequenceState();
+        }
+    }
+
+    /// <summary>Adds one F32 ULP to the largest-magnitude element of token 0's residual after layer 0, once.</summary>
+    private sealed class OneUlpPerturber : IResidualModifier
+    {
+        private bool _done;
+        public bool AppliesTo(int layerIndex) => layerIndex == 0 && !_done;
+        public void ModifyResidual(Span<float> residual, int layerIndex, int tokenCount)
+        {
+            if (_done || layerIndex != 0) return;
+            _done = true;
+            int hidden = residual.Length / tokenCount;
+            // One ULP (away from zero) on every element of token 0's residual row: one F32 rounding of one token's input state.
+            for (int i = 0; i < hidden; i++)
+                residual[i] = residual[i] >= 0 ? MathF.BitIncrement(residual[i]) : MathF.BitDecrement(residual[i]);
+        }
+    }
+
+    /// <summary>The control's 1-ULP arm must be able to disagree (James 2026-11-22: a control that cannot disagree proves nothing): on every CPU family it moves the logits.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families), MemberType = typeof(GenerationSessionFixture))]
+    public void OneUlpArm_IsObservable(string family)
+    {
+        using var fx = Open(family);
+        Skip.IfNot(fx.Model is IResidualModifierHost, "the 1-ULP arm needs the residual-modifier hook (CPU models only)");
+        int[] tokens = [.. fx.Prompt, .. fx.Observation];
+        float ulp = MaxAbsDiff(RawLastLogits(fx, tokens, tokens.Length, perturb: false), RawLastLogits(fx, tokens, tokens.Length, perturb: true));
+        Assert.True(ulp > 0f, $"{family}: a 1-ULP residual perturbation left the logits bit-identical (inert control arm)");
     }
 
     private static float MaxAbsDiff(float[] x, float[] y)
@@ -58,8 +130,11 @@ public abstract partial class GenerationSessionBackendSuite
     }
 
     /// <summary>Asserts <paramref name="actual"/> is within <see cref="ControlFactor"/> x the control of the fresh-prefill <paramref name="expected"/> (exact when the control is 0).</summary>
-    private static async Task AssertLogitsMatchFresh(GenerationSessionFixture fx, GenerationSessionFixture oracle, int[] tokens, float[] expected, float[] actual)
-        => AssertWithinControl(fx, tokens.Length, await ControlMaxAbsDiff(oracle, tokens), expected, actual);
+    private static Task AssertLogitsMatchFresh(GenerationSessionFixture fx, GenerationSessionFixture oracle, int[] tokens, float[] expected, float[] actual)
+    {
+        AssertWithinControl(fx, tokens.Length, ControlMaxAbsDiff(oracle, tokens), expected, actual);
+        return Task.CompletedTask;
+    }
 
     /// <summary>The assertion half, for a caller that must measure the control while no session is open on the oracle (a recurrent model owns one session's state).</summary>
     private static void AssertWithinControl(GenerationSessionFixture fx, int n, float control, float[] expected, float[] actual)
@@ -114,7 +189,7 @@ public abstract partial class GenerationSessionBackendSuite
             g2 = [.. (await multi.GenerateUntilBoundaryAsync(new StopAfter(4))).TokenIds];
         }
 
-        float control = await ControlMaxAbsDiff(oracle, [.. fx.Prompt, .. g1, .. fx.Observation]);   // before `single` opens: one session per recurrent model
+        float control = ControlMaxAbsDiff(oracle, [.. fx.Prompt, .. g1, .. fx.Observation]);   // before `single` opens: one session per recurrent model
         await using (var single = oracle.NewGenerator().CreateSession(Greedy(), Tag()))
         {
             await single.PrefillAsync(fx.Prompt.Concat(g1).Concat(fx.Observation).ToArray());
@@ -182,6 +257,44 @@ public abstract partial class GenerationSessionBackendSuite
         var (freshLogits, freshNext) = await Fresh(oracle, other);
         await AssertLogitsMatchFresh(fx, oracle, other, freshLogits, Logits(s));
         Assert.Equal(freshNext, (await s.GenerateUntilBoundaryAsync(new StopAfter(5))).TokenIds);
+    }
+
+    /// <summary>
+    /// #1931 review M-6 (James 2026-11-22, rollback exactness): on a recurrent model RollbackTo(boundary) restores the stored logits and
+    /// recurrent state, so (a) the restored logits are BIT-identical to the ones captured when the boundary was recorded, and (b) one decoded
+    /// token afterwards, which reads the restored GDN state, matches a fresh prefill of the prefix plus that token within the derived bound.
+    /// (b) is what proves the state, not just the logits copy, was restored: a stale state leaves (a) intact.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(HybridDense)]
+    [InlineData(MoeHybrid)]
+    public async Task Recurrent_Rollback_RestoresBoundaryLogitsBitExactly_AndTheStateDecodesLikeTheOracle(string family)
+    {
+        using var fx = Open(family);
+        using var oracle = Open(family);
+        await using var s = fx.NewGenerator().CreateSession(Greedy(), Tag());
+        await s.PrefillAsync(fx.Prompt);
+        var atPrompt = Logits(s);
+        var seg = await s.GenerateUntilBoundaryAsync(new StopAfter(4));
+        var atSegment = Logits(s);
+        int a = fx.Prompt.Length;
+        await s.AppendObservationTokensAsync(fx.Observation);
+
+        foreach (var (k, captured) in new[] { (a + 4, atSegment), (a, atPrompt) })
+        {
+            s.RollbackTo(k);
+            var restored = Logits(s);
+            for (int i = 0; i < restored.Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(captured[i]) == BitConverter.SingleToInt32Bits(restored[i]), $"k={k} logit {i}: restored {restored[i]} != captured {captured[i]} (must be bit-exact)");
+
+            int next = s.NextTokenArgMax();
+            await s.AppendObservationTokensAsync(new[] { next });
+            int[] prefix = [.. fx.Prompt, .. seg.TokenIds];
+            int[] expectedTokens = [.. prefix.Take(k), next];
+            var (freshLogits, _) = await Fresh(oracle, expectedTokens);
+            await AssertLogitsMatchFresh(fx, oracle, expectedTokens, freshLogits, Logits(s));
+            s.RollbackTo(k);
+        }
     }
 
     /// <summary>An attention-only model rolls back to any position (not just a pause) by re-forwarding one token.</summary>

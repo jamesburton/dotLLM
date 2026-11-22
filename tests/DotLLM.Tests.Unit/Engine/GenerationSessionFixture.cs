@@ -39,6 +39,13 @@ internal sealed class GenerationSessionFixture : IDisposable
     public static GenerationSessionFixture Create(string family, int? headDim = null, SessionBackend backend = SessionBackend.Cpu)
         => new(family, headDim, backend);
 
+    /// <summary>A fresh KV-cache of <paramref name="size"/> positions from the same factory the generator uses (for raw <c>IModel.Forward</c> controls that bypass the session).</summary>
+    public DotLLM.Core.Attention.IKvCache NewKvCache(int size)
+        => _gpuKvFactory is not null
+            ? _gpuKvFactory(size)
+            : new DotLLM.Engine.KvCache.SimpleKvCache(
+                DotLLM.Core.Attention.KvGeometry.FromConfig(Model.Config, Model.SupportsCompactSlidingKv), size);
+
     public SessionBackend Backend { get; }
 
     private readonly Func<int, Core.Attention.IKvCache>? _gpuKvFactory;

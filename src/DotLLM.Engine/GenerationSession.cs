@@ -47,20 +47,23 @@ public sealed class GenerationSession : IAsyncDisposable
     private readonly float[] _nextLogits;
     private int _logitsPos = -1;           // position _nextLogits belongs to; -1 = none
     private readonly float[] _sampleScratch;
-    private int _busy;
-    private int _disposed;
+    private int _busy;                   // 0 idle, 1 an operation is running, 2 disposing / disposed
+    private int _disposed;               // set when disposal is requested; new operations are refused from then on
     private bool _faulted;
+    private readonly int _maxContext;    // hard KV capacity ceiling the session may grow to
     private readonly Func<CacheProvenanceTag>? _currentProvenance;
     private IDecodingConstraint? _constraint;
 
     /// <summary>Most boundary records (position, recurrent checkpoint, logits) a recurrent session keeps; the oldest are evicted.</summary>
     public const int MaxRollbackBoundaries = 16;
-    private const long BoundaryByteBudget = 1L << 30;   // host bytes of checkpoints + logits copies a session may hold
+    /// <summary>Default checkpoint budget: 1 GiB. On a GPU the recurrent-state checkpoints are DEVICE memory, so this is VRAM the session may hold.</summary>
+    public const long DefaultCheckpointBudgetBytes = 1L << 30;
 
     private readonly bool _recurrent;
     private readonly bool _checkpointing;                // recurrent AND the model can checkpoint
     private readonly int _maxBoundaries;
     private readonly List<Boundary> _boundaries = [];
+    private int _skippedBoundaries;
 
     /// <summary>Sampler history: every committed token (prompt, generated, observation), session-wide, as the model saw them.</summary>
     private sealed class CommittedView(GenerationSession s) : IReadOnlyList<int>
@@ -80,9 +83,10 @@ public sealed class GenerationSession : IAsyncDisposable
     }
 
     internal GenerationSession(TextGenerator owner, InferenceOptions options, CacheProvenanceTag tag,
-        Func<CacheProvenanceTag>? currentProvenance, IKvCache kv, IDecodingConstraint? initialConstraint = null)
+        Func<CacheProvenanceTag>? currentProvenance, IKvCache kv, int maxContext, long checkpointBudgetBytes, IDecodingConstraint? initialConstraint = null)
     {
         _constraint = initialConstraint;
+        _maxContext = Math.Max(maxContext, kv.MaxLength);
         _currentProvenance = currentProvenance;
         _owner = owner;
         _model = owner.SessionModel;
@@ -99,9 +103,15 @@ public sealed class GenerationSession : IAsyncDisposable
         _checkpointing = _recurrent && _model.SupportsRecurrentStateCheckpoint;
         long perBoundary = _model.RecurrentStateCheckpointBytes + (long)_vocab * sizeof(float);
         _maxBoundaries = _checkpointing
-            ? (int)Math.Clamp(BoundaryByteBudget / Math.Max(1, perBoundary), 1, MaxRollbackBoundaries)
+            ? (int)Math.Clamp(checkpointBudgetBytes / Math.Max(1, perBoundary), 1, MaxRollbackBoundaries)
             : 0;
     }
+
+    /// <summary>Boundaries whose checkpoint failed (admission or allocation) and were not recorded: those positions are not rollback targets.</summary>
+    internal int SkippedBoundaries => _skippedBoundaries;
+
+    /// <summary>Current KV capacity in tokens (grows on demand up to the model maximum / <c>maxContextTokens</c>).</summary>
+    internal int KvCapacity => _kv.MaxLength;
 
     /// <summary>Number of tokens committed to the session; equals the KV length at every pause.</summary>
     public int CurrentPosition => _position;
@@ -181,9 +191,9 @@ public sealed class GenerationSession : IAsyncDisposable
             ct.ThrowIfCancellationRequested();
             if (tokens.Length == 0) return ValueTask.CompletedTask;
             int start = _position;
-            if (start + tokens.Length > _kv.MaxLength)
+            if (!EnsureCapacity(start + tokens.Length))
                 throw new InvalidOperationException(
-                    $"{tokens.Length} tokens at position {start} exceed the session's KV capacity of {_kv.MaxLength}.");
+                    $"{tokens.Length} tokens at position {start} exceed the session's KV capacity of {_kv.MaxLength} (ceiling {_maxContext}; a cache that cannot grow needs an explicit maxContextTokens).");
             EnsureHistory(start + tokens.Length);
             tokens.Span.CopyTo(_history.AsSpan(start));
             try
@@ -191,9 +201,11 @@ public sealed class GenerationSession : IAsyncDisposable
                 using ITensor logits = _owner.SessionForwardPrefill(_history, start, tokens.Length, _kv, ct);
                 StoreLogits(logits, start + tokens.Length);
             }
-            catch
+            catch (Exception ex)
             {
-                Recover(start);
+                // A model that restored its own state (IForwardStateRestored) at the first chunk needs no recovery; a later chunk
+                // left the earlier chunks in KV, which Recover cuts back to the start.
+                if (!(ex is IForwardStateRestored && _kv.CurrentLength == start)) Recover(start);
                 throw;
             }
             _position = start + tokens.Length;
@@ -216,6 +228,8 @@ public sealed class GenerationSession : IAsyncDisposable
         {
             EnsureLogitsValid();
             var conditions = new List<IStopCondition> { EndOfGenerationTokens.CreateStopCondition(_tokenizer), stopCondition };
+            // options.StopSequences (with ReasoningStopGate) apply per segment, as TextGenerator applies them per request (#1931 review I-4).
+            conditions.AddRange(StopStringCondition.CreateAll(_options));
             int tailSize = TextGenerator.ComputeStopTailSize(conditions);
             char[] scratch = ArrayPool<char>.Shared.Rent(tailSize);
             try
@@ -229,7 +243,7 @@ public sealed class GenerationSession : IAsyncDisposable
                 while (generated.Count < max)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    if (_position >= _kv.MaxLength) { finish = FinishReason.Length; break; }
+                    if (!EnsureCapacity(_position + 1)) { finish = FinishReason.Length; break; }
                     // Satisfied and permitting only EOS: nothing left to sample (TextGenerator stops here too).
                     if (_constraint is not null && _owner.ConstraintIsTerminal(_constraint)) { finish = FinishReason.ConstraintComplete; break; }
 
@@ -267,6 +281,12 @@ public sealed class GenerationSession : IAsyncDisposable
                 RecordBoundary();
                 return ValueTask.FromResult(new GenerationSegmentResult(text, generated.ToArray(), finish, startPos, _position));
             }
+            catch (Exception ex) when (ex is IForwardStateRestored)
+            {
+                // The model undid the failed forward: the session sits at a clean pause (tokens committed before it stay committed).
+                RecordBoundary();
+                throw;
+            }
             finally { ArrayPool<char>.Shared.Return(scratch); }
         }
         finally { End(); }
@@ -301,15 +321,33 @@ public sealed class GenerationSession : IAsyncDisposable
         finally { End(); }
     }
 
-    /// <summary>Releases the KV-cache, detaches from the generator and resets model-owned recurrent state.</summary>
+    /// <summary>
+    /// Releases the KV-cache, detaches from the generator and resets model-owned recurrent state. Serialised with the busy guard:
+    /// when an operation is in flight on another thread, new operations are refused at once and the release runs when that
+    /// operation ends (never while a forward reads the buffers); the returned task completes immediately either way. The generator
+    /// is detached even when releasing a buffer throws.
+    /// </summary>
     public ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return ValueTask.CompletedTask;
-        _kv.Dispose();
-        DropBoundariesAfter(-1);
-        if (_model.RequiresPerSequenceState) _model.ResetSequenceState();
-        _owner.ReleaseSession();
+        TryFinishDispose();
         return ValueTask.CompletedTask;
+    }
+
+    /// <summary>Runs the release if no operation holds the guard (CAS 0 to 2); otherwise <see cref="End"/> runs it when the operation ends.</summary>
+    private void TryFinishDispose()
+    {
+        if (Interlocked.CompareExchange(ref _busy, 2, 0) != 0) return;
+        try { _kv.Dispose(); }
+        finally
+        {
+            try { DropBoundariesAfter(-1); }
+            finally
+            {
+                try { if (_model.RequiresPerSequenceState) _model.ResetSequenceState(); }
+                finally { _owner.ReleaseSession(); }
+            }
+        }
     }
 
     /// <summary>
@@ -333,7 +371,7 @@ public sealed class GenerationSession : IAsyncDisposable
     /// </summary>
     public bool CanRollbackTo(int tokenPosition)
     {
-        Begin();
+        Begin(allowFaulted: true);
         try { return CheckRollback(tokenPosition) is null; }
         finally { End(); }
     }
@@ -350,23 +388,25 @@ public sealed class GenerationSession : IAsyncDisposable
     /// </summary>
     public void RollbackTo(int tokenPosition)
     {
-        Begin();
+        Begin(allowFaulted: true);
         try
         {
             if ((uint)tokenPosition > (uint)_position)
                 throw new ArgumentOutOfRangeException(nameof(tokenPosition), tokenPosition, $"Must be in [0, {_position}].");
             if (CheckRollback(tokenPosition) is { } refusal)
                 throw new NotSupportedException(refusal);
-            if (tokenPosition == _position) return;
+            if (tokenPosition == _position && !(_faulted && tokenPosition == 0)) return;
 
             if (tokenPosition == 0)
             {
+                // A full reset: the one recovery for a faulted session (it clears the fault only after every reset step succeeded).
                 _kv.Rollback(0);
                 if (_recurrent) _model.ResetSequenceState();
                 DropBoundariesAfter(-1);
                 _position = 0;
                 _logitsPos = -1;
                 _constraint?.Reset();
+                _faulted = false;
                 return;
             }
 
@@ -393,6 +433,14 @@ public sealed class GenerationSession : IAsyncDisposable
                 using ITensor logits = _model.Forward(_tokBuf, _posBuf, deviceId: -1, _kv, adapter: null, mtpState: null, lastTokenLogitsOnly: true);
                 StoreLogits(logits, tokenPosition);
             }
+            catch (Exception ex) when (ex is IForwardStateRestored)
+            {
+                // The model undid the failed forward. The KV cut is part of this rollback and cannot be undone, so the session sits
+                // cleanly at last (KV length == position) with no next-token logits: append history[last] again, or roll back further.
+                _position = last;
+                _logitsPos = -1;
+                throw;
+            }
             catch
             {
                 _faulted = true;   // KV already cut, position not: cannot be put back
@@ -417,6 +465,12 @@ public sealed class GenerationSession : IAsyncDisposable
         {
             using ITensor logits = _model.Forward(_tokBuf, _posBuf, deviceId: -1, _kv, adapter: null, mtpState: null, lastTokenLogitsOnly: true);
             StoreLogits(logits, pos + 1);
+        }
+        catch (Exception ex) when (ex is IForwardStateRestored)
+        {
+            // The model restored KV and recurrent state to their values at forward entry: the token was never committed here either
+            // (position and logits not advanced), so there is nothing to recover and the session is not faulted.
+            throw;
         }
         catch
         {
@@ -460,6 +514,7 @@ public sealed class GenerationSession : IAsyncDisposable
     private string? CheckRollback(int k)
     {
         if (k < 0 || k > _position) return $"Position {k} is outside [0, {_position}].";
+        if (_faulted) return k == 0 ? null : "The session is faulted (a failed forward could not be undone); only RollbackTo(0) or disposal remain.";
         if (k == _position || k == 0) return null;
         if (_recurrent)
         {
@@ -509,7 +564,26 @@ public sealed class GenerationSession : IAsyncDisposable
     {
         if (!_checkpointing || _logitsPos != _position || _position == 0 || FindBoundary(_position) is not null)
             return;
-        object? checkpoint = _model.CheckpointRecurrentState();
+        object? checkpoint = null;
+        for (int attempt = 0; ; attempt++)
+        {
+            try { checkpoint = _model.CheckpointRecurrentState(); break; }
+            catch (Exception ex)
+            {
+                // Never throw after commit: the segment's tokens are already in KV. Free the oldest checkpoint and retry once,
+                // else skip this boundary (the position is simply not a rollback target).
+                if (attempt == 0 && _boundaries.Count > 0)
+                {
+                    _boundaries[0].Dispose();
+                    _boundaries.RemoveAt(0);
+                    continue;
+                }
+                _skippedBoundaries++;
+                System.Diagnostics.Trace.TraceWarning(
+                    $"GenerationSession: recurrent-state checkpoint at position {_position} failed ({ex.GetType().Name}: {ex.Message}); the position is not a rollback target.");
+                return;
+            }
+        }
         _boundaries.Add(new Boundary(_position, checkpoint, (float[])_nextLogits.Clone()));
         while (_boundaries.Count > _maxBoundaries)
         {
@@ -530,24 +604,53 @@ public sealed class GenerationSession : IAsyncDisposable
             throw new InvalidOperationException("No next-token logits yet: prefill at least one token first.");
     }
 
-    private void Begin()
+    /// <summary>Grows the KV-cache (up to the ceiling) so it holds <paramref name="needed"/> positions; false when it cannot.</summary>
+    private bool EnsureCapacity(int needed)
+    {
+        if (needed <= _kv.MaxLength) return true;
+        if (needed > _maxContext) return false;
+        int target = (int)Math.Min(_maxContext, Math.Max((long)needed, (long)_kv.MaxLength * 2));
+        bool ok;
+        try
+        {
+            ok = _kv.TryGrowTo(target) || (target > needed && _kv.TryGrowTo(needed));
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException && ex is not ObjectDisposedException)
+        {
+            // Device admission refused the growth: report it as a refusal (growth is all-or-nothing).
+            System.Diagnostics.Trace.TraceWarning($"GenerationSession: KV growth to {target} positions refused ({ex.GetType().Name}: {ex.Message}).");
+            return false;
+        }
+        if (!ok)
+            System.Diagnostics.Trace.TraceWarning($"GenerationSession: the KV-cache ({_kv.GetType().Name}) could not grow from {_kv.MaxLength} to {needed} positions.");
+        return ok && _kv.MaxLength >= needed;
+    }
+
+    private void Begin(bool allowFaulted = false)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         if (Interlocked.CompareExchange(ref _busy, 1, 0) != 0)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);   // lost the race against a disposal
             throw new InvalidOperationException("A GenerationSession runs one operation at a time.");
+        }
         try
         {
-            if (_faulted)
+            if (_faulted && !allowFaulted)
                 throw new InvalidOperationException("The session is faulted (a failed forward could not be undone); dispose it.");
             if (_currentProvenance is not null)
                 ValidateProvenance(_currentProvenance() ?? throw new InvalidOperationException("The provenance provider returned null."));
         }
         catch
         {
-            Volatile.Write(ref _busy, 0);
+            End();
             throw;
         }
     }
 
-    private void End() => Volatile.Write(ref _busy, 0);
+    private void End()
+    {
+        Volatile.Write(ref _busy, 0);
+        if (Volatile.Read(ref _disposed) != 0) TryFinishDispose();   // a dispose that arrived mid-operation runs now
+    }
 }

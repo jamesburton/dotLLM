@@ -24,20 +24,55 @@ public sealed partial class TextGenerator
     /// <param name="currentProvenance">Live view of the provenance the orchestrator is running under (adapters, LoRA, knowledge snapshot).
     /// Every session operation compares it with <paramref name="provenanceTag"/> and throws <see cref="InvalidOperationException"/> naming the
     /// differing fields, so cached KV / recurrent state is never reused under a changed identity. Null = no automatic check.</param>
-    /// <param name="maxContextTokens">KV capacity in tokens; 0 (default) = the model's maximum sequence length.</param>
+    /// <param name="maxContextTokens">KV capacity in tokens. 0 (default) = start at <see cref="DefaultInitialContextTokens"/> (capped at the model maximum) and
+    /// grow on demand with <c>IKvCache.TryGrowTo</c> up to the model's maximum sequence length; a positive value is a fixed capacity allocated now (use it
+    /// for a cache that cannot grow). Must not exceed the model's maximum sequence length.</param>
+    /// <param name="checkpointBudgetBytes">Bytes of recurrent-state checkpoints a recurrent session may hold for rollback (plus the logits copies); 0 =
+    /// <see cref="GenerationSession.DefaultCheckpointBudgetBytes"/> (1 GiB). <b>On a GPU these are device memory (VRAM)</b>, not host RAM.</param>
     /// <remarks>
     /// A recurrent (GDN) model keeps its state in the model instance, so only one session may be live per such model and
     /// <c>Generate*</c> on this generator throws while it is open. Dispose the session to release the KV-cache and detach.
     /// </remarks>
     public GenerationSession CreateSession(InferenceOptions options, CacheProvenanceTag provenanceTag,
-        Func<CacheProvenanceTag>? currentProvenance = null, int maxContextTokens = 0)
+        Func<CacheProvenanceTag>? currentProvenance = null, int maxContextTokens = 0, long checkpointBudgetBytes = 0)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(provenanceTag);
         ArgumentOutOfRangeException.ThrowIfNegative(maxContextTokens);
-        if (_generationGate.CurrentCount == 0)
+        ArgumentOutOfRangeException.ThrowIfNegative(checkpointBudgetBytes);
+        int modelMax = _model.Config.MaxSequenceLength;
+        if (maxContextTokens > modelMax)
+            throw new ArgumentOutOfRangeException(nameof(maxContextTokens), maxContextTokens, $"Exceeds the model's maximum sequence length of {modelMax}.");
+        ThrowIfOptionsUnsupported(options);
+        // Hold the generation gate across check + owner registration + state reset so a concurrent Generate cannot slip in between (#1931 review M-1).
+        if (!_generationGate.Wait(0))
             throw new InvalidOperationException("A Generate call is running on this generator; open the session when it has finished.");
+        try
+        {
+            return CreateSessionLocked(options, provenanceTag, currentProvenance, maxContextTokens, modelMax, checkpointBudgetBytes);
+        }
+        finally { _generationGate.Release(); }
+    }
 
+    /// <summary>KV capacity a default session starts with (and grows from).</summary>
+    public const int DefaultInitialContextTokens = 4096;
+
+    /// <summary>
+    /// Fields of <see cref="InferenceOptions"/> a session cannot honour are refused rather than silently ignored (see docs/GENERATION_SESSION.md for the table).
+    /// </summary>
+    private static void ThrowIfOptionsUnsupported(InferenceOptions options)
+    {
+        if (options.StopConditions is not null)
+            throw new NotSupportedException("options.StopConditions is not supported on a session; pass the stop condition to GenerateUntilBoundaryAsync per segment.");
+        if (options.RepeatGuardLimit is not null)
+            throw new NotSupportedException("options.RepeatGuardLimit is not supported on a session; pass a RepeatGuardStopCondition to GenerateUntilBoundaryAsync per segment.");
+        if (options.Logprobs || options.TopLogprobs > 0)
+            throw new NotSupportedException("options.Logprobs / TopLogprobs are not supported on a session; read the raw logits with CopyNextLogits.");
+    }
+
+    private GenerationSession CreateSessionLocked(InferenceOptions options, CacheProvenanceTag provenanceTag,
+        Func<CacheProvenanceTag>? currentProvenance, int maxContextTokens, int modelMax, long checkpointBudgetBytes)
+    {
         bool recurrent = _model.RequiresPerSequenceState;
         if (recurrent && !s_recurrentOwners.TryAdd(_model, this))
             throw new InvalidOperationException(
@@ -46,9 +81,8 @@ public sealed partial class TextGenerator
         IKvCache? kv = null;
         try
         {
-            int size = maxContextTokens > 0
-                ? Math.Min(maxContextTokens, _model.Config.MaxSequenceLength)
-                : _model.Config.MaxSequenceLength;
+            int size = maxContextTokens > 0 ? maxContextTokens : Math.Min(DefaultInitialContextTokens, modelMax);
+            int ceiling = maxContextTokens > 0 ? maxContextTokens : modelMax;
             kv = AllocateKvCache(size);
             if (recurrent) _model.ResetSequenceState();   // a previous request left model-owned state behind
             IDecodingConstraint? initial = options.ResponseFormat switch
@@ -59,7 +93,8 @@ public sealed partial class TextGenerator
                 ResponseFormat.Grammar gr => new GrammarConstraint(_tokenizer, gr.GbnfGrammar),
                 _ => null
             };
-            return new GenerationSession(this, options, provenanceTag, currentProvenance, kv, initial);
+            return new GenerationSession(this, options, provenanceTag, currentProvenance, kv, ceiling,
+                checkpointBudgetBytes > 0 ? checkpointBudgetBytes : GenerationSession.DefaultCheckpointBudgetBytes, initial);
         }
         catch
         {
