@@ -15,8 +15,9 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <summary>
 /// #1924 gate for the bit-specialised (E1, <c>_tq{bits}</c>) and staged (E3, <c>_tq{bits}_cpa</c>) TurboQuant prefill entries, set by
 /// James 2026-11-22 in place of the SmolLM step-1 MinCos bound (which keeps gating the legacy entry): on Qwen3-4B, after a long
-/// chunked prefill, each new entry's mean KL(f16 KV || arm) is no worse than the legacy entry's, and its top-1 agreement with f16 KV is
-/// no worse than legacy's minus 1, at tq3 and tq4.
+/// chunked prefill, each new entry's mean KL(f16 KV || arm) is no worse than the legacy entry's plus the measured 1-ulp drift band
+/// (the legacy entry with its softmax scale one F32 ulp up and down; James 2026-11-22, "measure the noise, then decide"), and its
+/// top-1 agreement with f16 KV is no worse than legacy's minus 1, at tq3 and tq4.
 /// <para>A 4096-token wikitext prompt (<c>DOTLLM_TQ_PREFILL_DEPTH_TOKENS</c> overrides) is prefilled in 1024-row chunks, so every
 /// chunk after the first runs the tensor-core TQ prefill at depth (144 launches per arm); 32 teacher-forced decode rows follow
 /// (scalar kernel, unchanged). 33 rows are compared. The scratch oracle is reported for context, not gated. tq-gate's quality and
@@ -74,7 +75,7 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
             return rows;
         }
 
-        var gate = new List<(int bits, Dictionary<CudaKernels.TqPrefillVariant, (double meanKl, int agree)> stats)>();
+        var gate = new List<(int bits, Dictionary<CudaKernels.TqPrefillVariant, (double meanKl, int agree)> stats, double band)>();
         List<float[]> f16;
         using (var c = model.CreateKvCache(maxSeq)) f16 = Run(c);
         foreach (int bits in new[] { 4, 3 })
@@ -105,16 +106,35 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
             var (cosLs, _) = CosStats(arms[CudaKernels.TqPrefillVariant.Legacy], arms[CudaKernels.TqPrefillVariant.Staged]);
             var (cosSs, _) = CosStats(arms[CudaKernels.TqPrefillVariant.Specialized], arms[CudaKernels.TqPrefillVariant.Staged]);
             _out.WriteLine($"DEPTH b{bits} n={n}: min cos(Legacy, Staged) {cosLs:F6}; min cos(Specialized, Staged) {cosSs:F6} (E1 and E3 should be bit-identical: 1)");
-            gate.Add((bits, stats));
+
+            // 1-ULP drift control (James 2026-11-22): the LEGACY entry with its softmax scale moved one F32 ulp up, then down. The run
+            // is deterministic, so how far that moves KL(f16||arm) is the noise band of two correct implementations of this entry.
+            double band = 0;
+            foreach (int nudge in new[] { +1, -1 })
+            {
+                CudaKernels.TqPrefillVariantOverride = CudaKernels.TqPrefillVariant.Legacy;
+                CudaKernels.TqPrefillScaleUlpNudge = nudge;
+                List<float[]> ctrl;
+                try { using var c = model.CreateKvCache(maxSeq, kv); ctrl = Run(c); }
+                finally { CudaKernels.TqPrefillVariantOverride = null; CudaKernels.TqPrefillScaleUlpNudge = 0; }
+                var (klC, _) = Report(bits, $"Legacy{(nudge > 0 ? "+" : "-")}1ulp", ctrl, f16, oracle, 0);
+                var (cosCtl, _) = CosStats(arms[CudaKernels.TqPrefillVariant.Legacy], ctrl);
+                // A control that cannot move is no control (CLAUDE.md: prove the test can fail).
+                Assert.True(cosCtl < 1.0, $"tq{bits}: the 1-ulp control left every logit unchanged; it cannot measure a band");
+                band = Math.Max(band, Math.Abs(klC - stats[CudaKernels.TqPrefillVariant.Legacy].meanKl));
+            }
+            _out.WriteLine($"DEPTH b{bits}: 1-ulp drift band on mean KL = {band:E4} ({100 * band / stats[CudaKernels.TqPrefillVariant.Legacy].meanKl:F2}% of legacy)");
+            gate.Add((bits, stats, band));
         }
         // The gate (James 2026-11-22), evaluated after every arm is reported so a failure still prints all the numbers.
-        foreach (var (bits, st) in gate)
+        // Tolerance on mean KL = the measured 1-ulp drift band of the legacy entry (James 2026-11-22: "measure the noise, then decide").
+        foreach (var (bits, st, band) in gate)
         {
             var (klL, agL) = st[CudaKernels.TqPrefillVariant.Legacy];
             foreach (var v in new[] { CudaKernels.TqPrefillVariant.Specialized, CudaKernels.TqPrefillVariant.Staged })
             {
                 var (kl, ag) = st[v];
-                Assert.True(kl <= klL, $"tq{bits} {v}: mean KL(f16||arm) {kl:E4} is worse than legacy's {klL:E4}");
+                Assert.True(kl <= klL + band, $"tq{bits} {v}: mean KL(f16||arm) {kl:E4} is worse than legacy's {klL:E4} by more than the 1-ulp drift band {band:E4}");
                 Assert.True(ag >= agL - 1, $"tq{bits} {v}: top-1 agreement with f16 {ag}/33 is below legacy's {agL}/33 minus 1");
             }
         }

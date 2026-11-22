@@ -5384,6 +5384,12 @@ public sealed unsafe partial class CudaKernels : IDisposable
 
     private static int s_tqPrefillEntryReported;
 
+    /// <summary>
+    /// Test-only (#1924, James 2026-11-22): +1 / -1 moves the TurboQuant prefill's softmax scale by one F32 ulp, a deliberate 1-ULP
+    /// perturbation of an otherwise unchanged entry. Its KL-to-F16 movement is the drift band the depth gate's tolerance comes from.
+    /// </summary>
+    internal static int TqPrefillScaleUlpNudge;
+
     /// <summary>Test / bench override of the TurboQuant prefill entry; null = automatic (specialised when it applies).</summary>
     internal static TqPrefillVariant? TqPrefillVariantOverride;
 
@@ -5481,6 +5487,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
         nint qArg = q, kcArg = kCodes, vcArg = vCodes, knArg = kNorms, vnArg = vNorms, ceArg = centroids, oArg = output;
         int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, poArg = positionOffset;
         float scArg = 1f / MathF.Sqrt(headDim);
+        if (TqPrefillScaleUlpNudge != 0)   // #1924 drift control only: one F32 ulp on the softmax scale
+            scArg = TqPrefillScaleUlpNudge > 0 ? MathF.BitIncrement(scArg) : MathF.BitDecrement(scArg);
         int mbArg = mseBits, cuArg = codeUintsPerVec, nfArg = (int)normFormat;
         void** args = stackalloc void*[] { &qArg, &kcArg, &vcArg, &knArg, &vnArg, &ceArg, &oArg,
                                            &sqArg, &skvArg, &nhArg, &nkvArg, &poArg, &scArg, &mbArg, &cuArg, &nfArg };
