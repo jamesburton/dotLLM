@@ -29,11 +29,6 @@ public abstract class HiddenStateTapFixture : IDisposable
     /// </summary>
     public virtual bool SupportsAbortableTaps => true;
     /// <summary>
-    /// Whether the batch test expects bit-identical logits. False where the tapped run takes a different kernel path than the untapped one
-    /// (a fused batch versus the per-sequence loop on Vulkan): tolerance 1e-2 absolute and identical argmax then.
-    /// </summary>
-    public virtual bool BatchBitExact => BitExact;
-    /// <summary>
     /// Managed bytes the calling thread allocates over 16 untapped decode forwards (after warm-up) on the merge base of #1932 (d1275eef),
     /// measured by the same body (<c>MeasureDecode</c>) on that commit; null when not recorded for this host. The zero-overhead
     /// test asserts equality, so any allocation added to the unattached path fails it.
@@ -743,6 +738,17 @@ public abstract class HiddenStateTapBackendSuite
 
     // ── ForwardBatch ──────────────────────────────────────────────────────────
 
+    /// <summary>The same two requests as <see cref="RunBatch"/>, each as its own single-request batch (the untapped per-sequence path).</summary>
+    private static IReadOnlyList<ITensor> RunSeqLoop(HiddenStateTapFixture fx, IKvCache k0, IKvCache k1, IModel m)
+    {
+        int n = fx.Prompt.Length;
+        var a = m.ForwardBatch([new SequenceForwardRequest { TokenIds = fx.Prompt, Positions = Enumerable.Range(0, n).ToArray(), KvCache = k0,
+            GdnState = m.CreateSequenceState() as IGdnState }], -1);
+        var b = m.ForwardBatch([new SequenceForwardRequest { TokenIds = fx.Prompt[..(n - 2)], Positions = Enumerable.Range(0, n - 2).ToArray(), KvCache = k1,
+            GdnState = m.CreateSequenceState() as IGdnState }], -1);
+        return [a[0], b[0]];
+    }
+
     private static IReadOnlyList<ITensor> RunBatch(HiddenStateTapFixture fx, IKvCache k0, IKvCache k1, IModel m)
     {
         int n = fx.Prompt.Length;
@@ -849,8 +855,13 @@ public abstract class HiddenStateTapBackendSuite
         using var a0 = plain.NewKv(); using var a1 = plain.NewKv();
         using var b0 = tapped.NewKv(); using var b1 = tapped.NewKv();
         HiddenStateTapRegistry.PathCounters.Reset();
-        var expect = RunBatch(plain, a0, a1, plain.Model);
+        foreach (var t in RunBatch(plain, a0, a1, plain.Model)) t.Dispose();   // untapped batch: the counter must stay 0
         Assert.Equal(0, HiddenStateTapRegistry.PathCounters.PackedBatchFallbacks);
+        // I-4: the expected logits come from an untapped PER-SEQUENCE loop on a second plain model (same path as the tapped batch's
+        // per-sequence arm), so the comparison is bit-exact where the host is, with no tolerance and no fused-versus-per-sequence gap.
+        using var control = Open(family);
+        using var c0 = control.NewKv(); using var c1 = control.NewKv();
+        var expect = RunSeqLoop(control, c0, c1, control.Model);
 
         var ids = new HashSet<int>();
         using var h = tapped.Host.RegisterTap(new HiddenStateTapSubscription(null, [HookPoint.PostEmbedding]), s => ids.Add(s.SequenceId));
@@ -861,7 +872,7 @@ public abstract class HiddenStateTapBackendSuite
         {
             var e = LastRow(expect[i], plain.Vocab);
             var g = LastRow(got[i], tapped.Vocab);
-            if (plain.BatchBitExact) Assert.True(e.AsSpan().SequenceEqual(g), $"seq {i} logits differ");
+            if (plain.BitExact) Assert.True(e.AsSpan().SequenceEqual(g), $"seq {i} logits differ from the untapped per-sequence loop");
             else
             {
                 Assert.All(e.Zip(g), p => Assert.InRange(p.First - p.Second, -1e-2f, 1e-2f));

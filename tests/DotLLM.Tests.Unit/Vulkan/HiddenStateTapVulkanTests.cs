@@ -62,9 +62,6 @@ internal sealed class VulkanHiddenStateTapFixture : HiddenStateTapFixture
     public override int[] Prompt { get; }
     public override bool ExpectsPackedBatchFallback => _family != HiddenStateTapBackendSuite.MoeHybrid;
 
-    /// <summary>The untapped hybrid-dense ForwardBatch takes the fused batch; the tapped one the per-sequence loop: different kernels, tolerance.</summary>
-    public override bool BatchBitExact => _family != HiddenStateTapBackendSuite.HybridDense;
-
     public override IKvCache NewKv(int maxLen = 96) => _kvFactory(maxLen);
 
     /// <summary>Merge base d1275eef, 16 untapped decode forwards: managed bytes on this thread.</summary>

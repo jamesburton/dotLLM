@@ -215,6 +215,18 @@ public sealed class HiddenStateTapCudaTests : HiddenStateTapBackendSuite
             Assert.Equal((want[i].P, want[i].L, want[i].R, want[i].Pos), (got[i].P, got[i].L, got[i].R, got[i].Pos));
             float scale = want[i].D.Max(MathF.Abs);
             float tol = 0.03f * scale + 1e-3f;
+            if (want[i].P == HookPoint.PostLayer && want[i].L > 0)
+            {
+                // I-9 control arm: the gate must be able to tell PostLayer(L) from PostLayer(L-1). Adjacent residual-stream layers are
+                // highly correlated, so measure the CPU gap between them (same row) and tighten the bound to a quarter of it. The bound
+                // must still clear the F16 storage floor, otherwise this fixture cannot discriminate and the test says so.
+                int prev = Enumerable.Range(0, i).Last(j => want[j].P == HookPoint.PostLayer && want[j].L == want[i].L - 1 && want[j].R == want[i].R);
+                float gap = 0;
+                for (int j = 0; j < want[i].D.Length; j++) gap = MathF.Max(gap, MathF.Abs(want[i].D[j] - want[prev].D[j]));
+                float floor = 2e-3f * scale + 1e-4f;
+                tol = MathF.Min(tol, gap / 4);
+                Assert.True(tol > floor, $"sample {i} (layer {want[i].L} row {want[i].R}): the CPU gap to the previous layer ({gap}) is too small for the F16 floor ({floor}); the gate cannot tell a wrong layer");
+            }
             for (int j = 0; j < want[i].D.Length; j++)
                 Assert.True(MathF.Abs(want[i].D[j] - got[i].D[j]) <= tol,
                     $"sample {i} ({want[i].P} layer {want[i].L} row {want[i].R}) element {j}: cpu {want[i].D[j]} cuda {got[i].D[j]} tol {tol}");
