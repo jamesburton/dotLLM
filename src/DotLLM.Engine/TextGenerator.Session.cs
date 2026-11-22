@@ -18,12 +18,16 @@ public sealed partial class TextGenerator
     /// <param name="options">Sampling options (temperature, seed, penalties) and the per-segment <see cref="InferenceOptions.MaxTokens"/>.
     /// <see cref="InferenceOptions.ResponseFormat"/> is not supported here.</param>
     /// <param name="provenanceTag">Identity of the weights, tokenizer, precision, modifiers and knowledge the session's cached state belongs to.</param>
+    /// <param name="currentProvenance">Live view of the provenance the orchestrator is running under (adapters, LoRA, knowledge snapshot).
+    /// Every session operation compares it with <paramref name="provenanceTag"/> and throws <see cref="InvalidOperationException"/> naming the
+    /// differing fields, so cached KV / recurrent state is never reused under a changed identity. Null = no automatic check.</param>
     /// <param name="maxContextTokens">KV capacity in tokens; 0 (default) = the model's maximum sequence length.</param>
     /// <remarks>
     /// A recurrent (GDN) model keeps its state in the model instance, so only one session may be live per such model and
     /// <c>Generate*</c> on this generator throws while it is open. Dispose the session to release the KV-cache and detach.
     /// </remarks>
-    public GenerationSession CreateSession(InferenceOptions options, CacheProvenanceTag provenanceTag, int maxContextTokens = 0)
+    public GenerationSession CreateSession(InferenceOptions options, CacheProvenanceTag provenanceTag,
+        Func<CacheProvenanceTag>? currentProvenance = null, int maxContextTokens = 0)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(provenanceTag);
@@ -46,7 +50,7 @@ public sealed partial class TextGenerator
                 : _model.Config.MaxSequenceLength;
             kv = AllocateKvCache(size);
             if (recurrent) _model.ResetSequenceState();   // a previous request left model-owned state behind
-            return new GenerationSession(this, options, provenanceTag, kv);
+            return new GenerationSession(this, options, provenanceTag, currentProvenance, kv);
         }
         catch
         {

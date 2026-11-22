@@ -47,6 +47,7 @@ public sealed class GenerationSession : IAsyncDisposable
     private int _busy;
     private int _disposed;
     private bool _faulted;
+    private readonly Func<CacheProvenanceTag>? _currentProvenance;
 
     /// <summary>Most boundary records (position, recurrent checkpoint, logits) a recurrent session keeps; the oldest are evicted.</summary>
     public const int MaxRollbackBoundaries = 16;
@@ -65,8 +66,10 @@ public sealed class GenerationSession : IAsyncDisposable
         public void Dispose() => (Checkpoint as IDisposable)?.Dispose();
     }
 
-    internal GenerationSession(TextGenerator owner, InferenceOptions options, CacheProvenanceTag tag, IKvCache kv)
+    internal GenerationSession(TextGenerator owner, InferenceOptions options, CacheProvenanceTag tag,
+        Func<CacheProvenanceTag>? currentProvenance, IKvCache kv)
     {
+        _currentProvenance = currentProvenance;
         _owner = owner;
         _model = owner.SessionModel;
         _tokenizer = owner.SessionTokenizer;
@@ -90,6 +93,21 @@ public sealed class GenerationSession : IAsyncDisposable
 
     /// <summary>The provenance the session's cached state was created under.</summary>
     public CacheProvenanceTag ProvenanceTag { get; }
+
+    /// <summary>
+    /// Throws <see cref="InvalidOperationException"/> naming the differing fields when <paramref name="current"/> is not
+    /// identical to the <see cref="ProvenanceTag"/> the session was created under. Called automatically with the live view
+    /// on every operation when a provider was given to <see cref="TextGenerator.CreateSession"/>.
+    /// </summary>
+    public void ValidateProvenance(CacheProvenanceTag current)
+    {
+        ArgumentNullException.ThrowIfNull(current);
+        var diff = ProvenanceTag.Diff(current);
+        if (diff.Count > 0)
+            throw new InvalidOperationException(
+                $"Cache provenance mismatch: {string.Join(", ", diff)} differ{(diff.Count == 1 ? "s" : "")} from the tag this session's KV / recurrent state was built under. "
+                + "Open a new session (or restore the original identity) instead of reusing stale state.");
+    }
 
     /// <summary>KV-cache length; equals <see cref="CurrentPosition"/> at every pause (tests assert it).</summary>
     internal int KvLength => _kv.CurrentLength;
@@ -258,11 +276,16 @@ public sealed class GenerationSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// True when <see cref="RollbackTo"/> would succeed for <paramref name="tokenPosition"/>: always for 0 and the current position;
+    /// True when <see cref="RollbackTo"/> would succeed for <paramref name="tokenPosition"/> (same provenance and disposal checks as every operation): always for 0 and the current position;
     /// otherwise, for an attention-only model, when the KV-cache can be cut to <c>tokenPosition - 1</c>; for a recurrent model, when
     /// <paramref name="tokenPosition"/> is a recorded boundary and the cache can be cut to it.
     /// </summary>
-    public bool CanRollbackTo(int tokenPosition) => !IsDisposed && CheckRollback(tokenPosition) is null;
+    public bool CanRollbackTo(int tokenPosition)
+    {
+        Begin();
+        try { return CheckRollback(tokenPosition) is null; }
+        finally { End(); }
+    }
 
     /// <summary>
     /// Discards every token at or after <paramref name="tokenPosition"/> from KV, recurrent state and next-token logits, leaving the
@@ -379,8 +402,6 @@ public sealed class GenerationSession : IAsyncDisposable
         }
     }
 
-    private bool IsDisposed => Volatile.Read(ref _disposed) != 0;
-
     /// <summary>Null when rolling back to <paramref name="k"/> is possible, else the reason it is not.</summary>
     private string? CheckRollback(int k)
     {
@@ -456,10 +477,17 @@ public sealed class GenerationSession : IAsyncDisposable
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         if (Interlocked.CompareExchange(ref _busy, 1, 0) != 0)
             throw new InvalidOperationException("A GenerationSession runs one operation at a time.");
-        if (_faulted)
+        try
+        {
+            if (_faulted)
+                throw new InvalidOperationException("The session is faulted (a failed forward could not be undone); dispose it.");
+            if (_currentProvenance is not null)
+                ValidateProvenance(_currentProvenance() ?? throw new InvalidOperationException("The provenance provider returned null."));
+        }
+        catch
         {
             Volatile.Write(ref _busy, 0);
-            throw new InvalidOperationException("The session is faulted (a failed forward could not be undone); dispose it.");
+            throw;
         }
     }
 
