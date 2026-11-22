@@ -1090,32 +1090,56 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
     {
         DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddTapForward();
         _tapStep++;
-        if (!taps.HasAbortable)
-            return ForwardTrunk(tokenIds, positions, deviceId, kvCache, gdnState, mtpState, lastTokenLogitsOnly, taps, out abort);
-
-        // Abortable: an abort must leave the model exactly as it was at entry. MTP/DFlash state is updated after the trunk and is not
-        // checkpointed, so that combination is refused rather than corrupted.
-        if (mtpState is not null)
-            throw new NotSupportedException("An abortable hidden-state tap cannot be combined with an MTP/DFlash state on this forward.");
-        int kvEntry = -1;
-        if (kvCache is not null)
+        bool abortable = taps.HasAbortable;
+        int kvEntry = kvCache?.CurrentLength ?? -1;   // every tapped forward records it (free): a throwing callback must not leave KV half-advanced
+        GdnStateCache target = gdnState as GdnStateCache ?? _gdnCache;
+        if (abortable)
         {
+            // Abortable: an abort must leave the model exactly as it was at entry. MTP/DFlash state is updated after the trunk and is not
+            // checkpointed, so that combination is refused rather than corrupted (a read-only tap with MTP is fine on every backend).
+            if (mtpState is not null)
+                throw new NotSupportedException("An abortable hidden-state tap cannot be combined with an MTP/DFlash state on this forward.");
+            // Pending verify-row snapshots (MTP/DFlash verify, before RestoreRecurrentStateToRow) must survive: refuse instead of committing them.
+            if (ReferenceEquals(target, _gdnCache) && _rowSnapshotValidRows > 0)
+                throw new NotSupportedException(
+                    "An abortable hidden-state tap cannot start while verify-row snapshots are pending (RestoreRecurrentStateToRow has not run): "
+                    + "the entry checkpoint would commit the rejected draft rows. Nothing was modified.");
             kvEntry = DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
         }
-        CommitPendingRows();
-        GdnStateCache target = gdnState as GdnStateCache ?? _gdnCache;
-        using var checkpoint = TakeGdnCheckpoint(target);
-        DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
-
-        var result = ForwardTrunk(tokenIds, positions, deviceId, kvCache, gdnState, mtpState, lastTokenLogitsOnly, taps, out abort);
-        if (result is null)
+        // Entry checkpoint of the GDN state: always for an abortable tap; for a read-only tap too (so a throwing callback leaves
+        // recurrent state consistent with the rolled-back KV), except with an MTP state or pending verify rows, which a checkpoint
+        // cannot cover. Tapped forwards already leave the fused/graph paths, so one state copy per forward is the cheap side.
+        bool takeCkpt = abortable || (mtpState is null && !(ReferenceEquals(target, _gdnCache) && _rowSnapshotValidRows > 0));
+        PooledGdnCheckpoint? checkpoint = takeCkpt ? TakeGdnCheckpoint(target) : null;
+        if (abortable) DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
+        try
         {
-            if (kvCache is not null) kvCache.Rollback(kvEntry);
-            checkpoint.Snapshot.CopyTo(target);
-            if (ReferenceEquals(target, _gdnCache)) _rowSnapshotValidRows = 0;
-            DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortedForward();
+            var result = ForwardTrunk(tokenIds, positions, deviceId, kvCache, gdnState, mtpState, lastTokenLogitsOnly, taps, out abort);
+            if (result is null)
+            {
+                if (kvCache is not null) kvCache.Rollback(kvEntry);
+                checkpoint?.Snapshot.CopyTo(target);
+                if (ReferenceEquals(target, _gdnCache)) _rowSnapshotValidRows = 0;
+                DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortedForward();
+            }
+            return result;
         }
-        return result;
+        catch
+        {
+            // A throwing tap callback (or any failure on the tapped path): restore KV and recurrent state to forward entry, rethrow.
+            if (kvCache is not null && kvEntry >= 0 && kvCache.CurrentLength > kvEntry)
+            {
+                try { kvCache.Rollback(kvEntry); }
+                catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException) { /* windowed read-only cache: best effort */ }
+            }
+            if (checkpoint is not null)
+            {
+                checkpoint.Snapshot.CopyTo(target);
+                if (ReferenceEquals(target, _gdnCache)) _rowSnapshotValidRows = 0;
+            }
+            throw;
+        }
+        finally { checkpoint?.Dispose(); }
     }
 
     private ITensor? ForwardTrunk(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
@@ -1753,12 +1777,23 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
                     "Re-issue the request without an adapter.");
         }
 
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.RefuseAbortableBatch(_taps.Current);
         var results = new ITensor[requests.Count];
-        for (int i = 0; i < requests.Count; i++)
+        int done = 0;
+        try
         {
-            var r = requests[i];
-            _tapSeqId = i;
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState, null, r.LastTokenLogitsOnly);
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var r = requests[i];
+                _tapSeqId = i;
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState, null, r.LastTokenLogitsOnly);
+                done++;
+            }
+        }
+        catch
+        {
+            for (int d = 0; d < done; d++) results[d].Dispose();   // do not leak the completed requests' logits
+            throw;
         }
         return results;
     }

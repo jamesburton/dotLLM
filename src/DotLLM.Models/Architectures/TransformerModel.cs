@@ -1206,6 +1206,13 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
         return true;
     }
 
+    private static void RollbackAfterFailure(IKvCache? kvCache, int kvEntry)
+    {
+        if (kvCache is null || kvEntry < 0 || kvCache.CurrentLength <= kvEntry) return;
+        try { kvCache.Rollback(kvEntry); }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException) { /* windowed read-only cache: best effort */ }
+    }
+
     private unsafe bool RunLayersWithTaps(
         DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot taps,
         ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache,
@@ -1213,7 +1220,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     {
         DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddTapForward();
         _tapStep++;
-        int kvEntry = -1;
+        // Every tapped forward records the entry length (free): a callback that throws must not leave KV half-advanced (#1920 I-1).
+        int kvEntry = kvCache?.CurrentLength ?? -1;
         if (taps.HasAbortable && kvCache is not null)
         {
             // An abort must be able to undo this forward's KV writes. A cache that cannot truncate refuses here, before
@@ -1221,8 +1229,18 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
             kvEntry = DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
             DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
         }
-        bool done = RunLayerRangeCore(tokenIds, ReadOnlySpan<float>.Empty, positions, kvCache,
-                                      firstLayer: 0, layerCount: -1, hiddenOut: Span<float>.Empty, taps, out abort);
+        bool done;
+        try
+        {
+            done = RunLayerRangeCore(tokenIds, ReadOnlySpan<float>.Empty, positions, kvCache,
+                                     firstLayer: 0, layerCount: -1, hiddenOut: Span<float>.Empty, taps, out abort);
+        }
+        catch
+        {
+            // A throwing tap callback (or any trunk failure on the tapped path): undo this forward's KV writes, then rethrow.
+            RollbackAfterFailure(kvCache, kvEntry);
+            throw;
+        }
         if (!done)
         {
             if (kvCache is not null && kvEntry >= 0)
@@ -3644,6 +3662,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     {
         ArgumentNullException.ThrowIfNull(requests);
         if (requests.Count == 0) return Array.Empty<ITensor>();
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.RefuseAbortableBatch(_taps.Current);
         if (requests.Count == 1)
         {
             var r0 = requests[0];

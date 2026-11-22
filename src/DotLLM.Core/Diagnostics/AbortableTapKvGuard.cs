@@ -10,6 +10,20 @@ namespace DotLLM.Core.Diagnostics;
 public static class AbortableTapKvGuard
 {
     /// <summary>
+    /// <c>ForwardBatch</c> refusal (#1920, review I-6): an abort of request i would leave requests 0..i-1 already committed, so an
+    /// abortable tap is refused before any state changes, identically on every backend. Read-only taps are unaffected.
+    /// </summary>
+    /// <param name="taps">The snapshot the batch read once (null: no tap attached).</param>
+    /// <exception cref="NotSupportedException">An abortable tap is attached.</exception>
+    public static void RefuseAbortableBatch(HiddenStateTapRegistry.Snapshot? taps)
+    {
+        if (taps is { HasAbortable: true })
+            throw new NotSupportedException(
+                "An abortable hidden-state tap is not supported in ForwardBatch: aborting request i would leave requests 0..i-1 "
+                + "committed and the rest unrun. Use Forward/TryForward per sequence, or a read-only tap. Nothing was modified.");
+    }
+
+    /// <summary>
     /// Registration-time refusal (#1920, ruling 3): an abortable tap on a model whose config uses sliding-window attention is refused
     /// up front. Registration cannot see the per-call cache, so this is the config half; <see cref="Checkpoint"/> is the cache half.
     /// </summary>

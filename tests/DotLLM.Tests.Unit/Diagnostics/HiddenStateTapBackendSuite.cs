@@ -512,6 +512,101 @@ public abstract class HiddenStateTapBackendSuite
 
     // ── ForwardBatch ──────────────────────────────────────────────────────────
 
+    private static IReadOnlyList<ITensor> RunBatch(HiddenStateTapFixture fx, IKvCache k0, IKvCache k1, IModel m)
+    {
+        int n = fx.Prompt.Length;
+        var reqs = new[]
+        {
+            new SequenceForwardRequest { TokenIds = fx.Prompt, Positions = Enumerable.Range(0, n).ToArray(), KvCache = k0,
+                GdnState = m.CreateSequenceState() as IGdnState },
+            new SequenceForwardRequest { TokenIds = fx.Prompt[..(n - 2)], Positions = Enumerable.Range(0, n - 2).ToArray(), KvCache = k1,
+                GdnState = m.CreateSequenceState() as IGdnState },
+        };
+        return m.ForwardBatch(reqs, -1);
+    }
+
+    /// <summary>
+    /// I-6: an abortable tap inside ForwardBatch could abort request i after requests 0..i-1 committed, so it is refused up front on every
+    /// backend (NotSupportedException before any KV, recurrent or tap state changes). Read-only taps are unchanged (the test above).
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void AbortableTap_InForwardBatch_IsRefusedBeforeAnyStateChange(string family)
+    {
+        using var fx = Open(family);
+        Skip.IfNot(fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+        using var k0 = fx.NewKv(); using var k1 = fx.NewKv();
+        using var h = fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), _ => HookResult.Continue);
+        HiddenStateTapRegistry.PathCounters.Reset();
+        var ex = Assert.Throws<NotSupportedException>(() => RunBatch(fx, k0, k1, fx.Model));
+        Assert.Contains("ForwardBatch", ex.Message);
+        Assert.Equal(0, k0.CurrentLength);
+        Assert.Equal(0, k1.CurrentLength);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.TapForwards);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
+    }
+
+    // ── A throwing callback ───────────────────────────────────────────────────
+
+    public static TheoryData<string, bool> ThrowCases()
+    {
+        var d = new TheoryData<string, bool>();
+        foreach (var f in new[] { Llama, HybridDense, MoeHybrid })
+            foreach (bool abortable in new[] { false, true })
+                d.Add(f, abortable);
+        return d;
+    }
+
+    /// <summary>
+    /// I-1: a tap callback that throws at a mid layer (user observer, buffer provider, registry validation) leaves KV and recurrent state
+    /// as they were at forward entry on every backend: KV length restored, and the next steps are identical to a model that never ran the
+    /// failed forward (KV bytes too). Read-only and abortable taps both.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(ThrowCases))]
+    public void ThrowingCallback_MidLayer_RestoresKvAndRecurrentState(string family, bool abortable)
+    {
+        using var fx = Open(family);
+        Skip.If(abortable && !fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+        using var control = Open(family);
+        using var kvA = fx.NewKv();
+        using var kvC = control.NewKv();
+        var prompt = fx.Prompt;
+        int[] pp = Enumerable.Range(0, prompt.Length).ToArray();
+        using (fx.Model.Forward(prompt, pp, -1, kvA)) { }
+        using (control.Model.Forward(prompt, pp, -1, kvC)) { }
+
+        int mid = fx.NumLayers / 2;
+        bool armed = true;
+        void Maybe(HiddenStateSample s)
+        {
+            if (armed && s.Point == HookPoint.PostLayer && s.LayerIndex == mid) throw new InvalidOperationException("boom");
+        }
+        var sub = new HiddenStateTapSubscription(null, [HookPoint.PostLayer]);
+        using var h = abortable
+            ? fx.Host.RegisterAbortableTap(sub, s => { Maybe(s); return HookResult.Continue; })
+            : fx.Host.RegisterTap(sub, Maybe);
+
+        int entry = kvA.CurrentLength;
+        var ex = Assert.Throws<InvalidOperationException>(() => fx.Model.Forward([prompt[1]], [prompt.Length], -1, kvA));
+        Assert.Equal("boom", ex.Message);
+        Assert.Equal(entry, kvA.CurrentLength);
+
+        armed = false;
+        for (int step = 0; step < 3; step++)
+        {
+            int[] t = [prompt[(step + 2) % prompt.Length]];
+            int[] p = [prompt.Length + step];
+            using var la = fx.Model.Forward(t, p, -1, kvA);
+            using var lc = control.Model.Forward(t, p, -1, kvC);
+            var ra = LastRow(la, fx.Vocab); var rc = LastRow(lc, control.Vocab);
+            if (fx.BitExact) Assert.True(ra.AsSpan().SequenceEqual(rc), $"logits differ at step {step} after the throwing callback");
+            else Assert.All(ra.Zip(rc), q => Assert.InRange(q.First - q.Second, -1e-2f, 1e-2f));
+        }
+        Assert.Equal(kvC.CurrentLength, kvA.CurrentLength);
+        if (fx.BitExact) Assert.True(control.KvBytes(kvC).AsSpan().SequenceEqual(fx.KvBytes(kvA)), "KV bytes differ after the throwing callback");
+    }
+
     /// <summary>With a tap attached a multi-sequence ForwardBatch goes per sequence (counter on the packed model), each sequence reporting its own id.</summary>
     [SkippableTheory]
     [MemberData(nameof(Families))]
@@ -520,28 +615,15 @@ public abstract class HiddenStateTapBackendSuite
         using var plain = Open(family);
         using var tapped = Open(family);
 
-        IReadOnlyList<ITensor> Batch(HiddenStateTapFixture fx, IKvCache k0, IKvCache k1, IModel m)
-        {
-            int n = fx.Prompt.Length;
-            var reqs = new[]
-            {
-                new SequenceForwardRequest { TokenIds = fx.Prompt, Positions = Enumerable.Range(0, n).ToArray(), KvCache = k0,
-                    GdnState = m.CreateSequenceState() as IGdnState },
-                new SequenceForwardRequest { TokenIds = fx.Prompt[..(n - 2)], Positions = Enumerable.Range(0, n - 2).ToArray(), KvCache = k1,
-                    GdnState = m.CreateSequenceState() as IGdnState },
-            };
-            return m.ForwardBatch(reqs, -1);
-        }
-
         using var a0 = plain.NewKv(); using var a1 = plain.NewKv();
         using var b0 = tapped.NewKv(); using var b1 = tapped.NewKv();
         HiddenStateTapRegistry.PathCounters.Reset();
-        var expect = Batch(plain, a0, a1, plain.Model);
+        var expect = RunBatch(plain, a0, a1, plain.Model);
         Assert.Equal(0, HiddenStateTapRegistry.PathCounters.PackedBatchFallbacks);
 
         var ids = new HashSet<int>();
         using var h = tapped.Host.RegisterTap(new HiddenStateTapSubscription(null, [HookPoint.PostEmbedding]), s => ids.Add(s.SequenceId));
-        var got = Batch(tapped, b0, b1, tapped.Model);
+        var got = RunBatch(tapped, b0, b1, tapped.Model);
         Assert.Equal(tapped.ExpectsPackedBatchFallback ? 1 : 0, HiddenStateTapRegistry.PathCounters.PackedBatchFallbacks);
         Assert.Equal([0, 1], ids.OrderBy(x => x));
         for (int i = 0; i < 2; i++)

@@ -1238,32 +1238,44 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
 
         DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddTapForward();
         _tapStep++;
-        if (!taps.HasAbortable)
-            return ForwardTrunk(tokenIds, hiddenIn, positions, deviceId, kvCache, gdnState, firstLayer, layerCount, hiddenOut,
-                                mtpState, lastTokenLogitsOnly, taps, out abort);
-
-        // Abortable: an abort must leave the model exactly as it was at entry. MTP state is updated after the trunk and is not
-        // checkpointed, so that combination is refused rather than corrupted.
-        if (mtpState is not null)
-            throw new NotSupportedException("An abortable hidden-state tap cannot be combined with an MTP state on this forward.");
-        int kvEntry = -1;
-        if (kvCache is not null)
+        bool abortable = taps.HasAbortable;
+        int kvEntry = kvCache?.CurrentLength ?? -1;   // every tapped forward records it (free): a throwing callback must not leave KV half-advanced
+        if (abortable)
         {
+            // Abortable: an abort must leave the model exactly as it was at entry. MTP state is updated after the trunk and is not
+            // checkpointed, so that combination is refused rather than corrupted (a read-only tap with MTP is fine on every backend).
+            if (mtpState is not null)
+                throw new NotSupportedException("An abortable hidden-state tap cannot be combined with an MTP state on this forward.");
             kvEntry = DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
         }
         GdnStateCache target = gdnState as GdnStateCache ?? _gdnCache;
-        using var checkpoint = TakeGdnCheckpoint(target);
-        DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
-
-        var result = ForwardTrunk(tokenIds, hiddenIn, positions, deviceId, kvCache, gdnState, firstLayer, layerCount, hiddenOut,
-                                  mtpState, lastTokenLogitsOnly, taps, out abort);
-        if (result is null)
+        // Entry checkpoint: always for an abortable tap; for a read-only tap too (a throwing callback must leave recurrent state
+        // consistent with the rolled-back KV), except with an MTP state (not covered by a checkpoint).
+        PooledGdnCheckpoint? checkpoint = abortable || mtpState is null ? TakeGdnCheckpoint(target) : null;
+        if (abortable) DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
+        try
         {
-            if (kvCache is not null) kvCache.Rollback(kvEntry);
-            checkpoint.Snapshot.CopyTo(target);
-            DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortedForward();
+            var result = ForwardTrunk(tokenIds, hiddenIn, positions, deviceId, kvCache, gdnState, firstLayer, layerCount, hiddenOut,
+                                      mtpState, lastTokenLogitsOnly, taps, out abort);
+            if (result is null)
+            {
+                if (kvCache is not null) kvCache.Rollback(kvEntry);
+                checkpoint?.Snapshot.CopyTo(target);
+                DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortedForward();
+            }
+            return result;
         }
-        return result;
+        catch
+        {
+            if (kvCache is not null && kvEntry >= 0 && kvCache.CurrentLength > kvEntry)
+            {
+                try { kvCache.Rollback(kvEntry); }
+                catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException) { /* windowed read-only cache: best effort */ }
+            }
+            checkpoint?.Snapshot.CopyTo(target);
+            throw;
+        }
+        finally { checkpoint?.Dispose(); }
     }
 
     [SkipLocalsInit]
@@ -1529,13 +1541,24 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
                     "(no Qwen3MoeHybrid LoRA path today). Re-issue the request without an adapter.");
         }
 
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.RefuseAbortableBatch(_taps.Current);
         var results = new ITensor[requests.Count];
-        for (int i = 0; i < requests.Count; i++)
+        int done = 0;
+        try
         {
-            var r = requests[i];
-            _tapSeqId = i;
-            results[i] = ForwardCore(r.TokenIds.Span, ReadOnlySpan<float>.Empty, r.Positions.Span, deviceId, r.KvCache, r.GdnState,
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var r = requests[i];
+                _tapSeqId = i;
+                results[i] = ForwardCore(r.TokenIds.Span, ReadOnlySpan<float>.Empty, r.Positions.Span, deviceId, r.KvCache, r.GdnState,
                 firstLayer: 0, layerCount: _layers.Length, hiddenOut: Span<float>.Empty, null, r.LastTokenLogitsOnly)!;
+                done++;
+            }
+        }
+        catch
+        {
+            for (int d = 0; d < done; d++) results[d].Dispose();   // do not leak the completed requests' logits
+            throw;
         }
         return results;
     }
