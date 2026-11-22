@@ -15,13 +15,13 @@ public abstract class KvQuantSettings : CommandSettings
 {
     /// <summary>KV key storage format.</summary>
     [CommandOption("--kv-quant-k")]
-    [Description("KV-cache key storage: f16, q8_0, q4_0. Synonym of --cache-type-k. For the CUDA hybrid-dense " +
+    [Description("KV-cache key storage: f16, q8_0, q4_0, or TurboQuant tq1..tq8 (both sides the same tq format). Synonym of --cache-type-k. For the CUDA hybrid-dense " +
                  "model (Bonsai-2 / qwen35) overrides DOTLLM_HYBRID_KV; quantized KV needs numKvHeads*headDim % 32 == 0.")]
     public string? KvQuantK { get; set; }
 
     /// <summary>KV value storage format.</summary>
     [CommandOption("--kv-quant-v")]
-    [Description("KV-cache value storage: f16, q8_0, q4_0. Synonym of --cache-type-v. See --kv-quant-k.")]
+    [Description("KV-cache value storage: f16, q8_0, q4_0, or TurboQuant tq1..tq8 (both sides the same tq format). Synonym of --cache-type-v. See --kv-quant-k.")]
     public string? KvQuantV { get; set; }
 }
 
@@ -98,9 +98,10 @@ internal static class KvStorageCli
     /// <param name="cacheWindow">The <c>--cache-window</c> value.</param>
     /// <param name="paged">Whether the paged cache was asked for.</param>
     /// <param name="device">The <c>--device</c> value; null or <c>auto</c> leaves the backend to the post-load pass.</param>
+    /// <param name="hasDraftModel">Whether <c>--speculative-model</c> was given (its KV would not be TurboQuant).</param>
     /// <returns>The refusal reason, or null.</returns>
     internal static string? TurboQuantRefusal(DotLLM.Server.KvCommand command, string? keyText, string? valueText,
-        int cacheWindow = 0, bool paged = false, string? device = null)
+        int cacheWindow = 0, bool paged = false, string? device = null, bool hasDraftModel = false)
     {
         KvCacheConfig kv;
         string? mismatch;
@@ -122,7 +123,7 @@ internal static class KvStorageCli
                 DotLLM.Server.DeviceKind.Vulkan => DotLLM.Server.KvBackendKind.Vulkan,
                 _ => DotLLM.Server.KvBackendKind.Unknown,
             };
-        return DotLLM.Server.TurboQuantKv.PreLoadRefusal(kv, mismatch, command, backend, paged, config: null, hasDraftModel: false);
+        return DotLLM.Server.TurboQuantKv.PreLoadRefusal(kv, mismatch, command, backend, paged, config: null, hasDraftModel: hasDraftModel);
     }
 
     /// <summary>
