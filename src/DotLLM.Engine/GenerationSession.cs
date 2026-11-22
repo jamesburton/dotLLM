@@ -67,6 +67,9 @@ public sealed class GenerationSession : IAsyncDisposable
     /// <summary>The provenance the session's cached state was created under.</summary>
     public CacheProvenanceTag ProvenanceTag { get; }
 
+    /// <summary>KV-cache length; equals <see cref="CurrentPosition"/> at every pause (tests assert it).</summary>
+    internal int KvLength => _kv.CurrentLength;
+
     /// <summary>Width of the logits vector <see cref="CopyNextLogits"/> fills.</summary>
     public int VocabSize => _vocab;
 

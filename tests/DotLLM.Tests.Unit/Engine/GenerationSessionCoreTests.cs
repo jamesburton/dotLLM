@@ -209,6 +209,7 @@ public sealed class GenerationSessionCoreTests
         fx.Counter.FailNextForward();
         await Assert.ThrowsAsync<IOException>(async () => await s.AppendObservationTokensAsync(fx.Observation));
         Assert.Equal(fx.Prompt.Length, s.CurrentPosition);
+        Assert.Equal(s.CurrentPosition, s.KvLength);   // the abandoned append did not leave KV rows behind
         AssertLogitsEqual(before, Logits(s));
 
         await s.AppendObservationTokensAsync(fx.Observation);
