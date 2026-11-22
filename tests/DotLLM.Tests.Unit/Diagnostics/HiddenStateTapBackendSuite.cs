@@ -195,6 +195,21 @@ public abstract class HiddenStateTapBackendSuite
         Assert.Equal([target], seen);
     }
 
+    /// <summary>Two taps on different layers: each sees only its own (a single tap cannot tell a per-entry filter from a union filter).</summary>
+    [Theory]
+    [MemberData(nameof(Families))]
+    public void TwoTaps_OnDifferentLayers_EachSeeOnlyTheirOwn(string family)
+    {
+        using var fx = Open(family);
+        var a = new List<int>(); var b = new List<int>();
+        using var ha = fx.Host.RegisterTap(new HiddenStateTapSubscription([0], [HookPoint.PostLayer]), s => a.Add(s.LayerIndex));
+        using var hb = fx.Host.RegisterTap(new HiddenStateTapSubscription([fx.NumLayers - 1], [HookPoint.PostLayer]), s => b.Add(s.LayerIndex));
+        using var kv = fx.NewKv();
+        using (fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv)) { }
+        Assert.Equal([0], a);
+        Assert.Equal([fx.NumLayers - 1], b);
+    }
+
     /// <summary>Disposed taps stop delivering; with no tap attached nothing is dispatched, no counter moves and decode allocates nothing extra.</summary>
     [Theory]
     [MemberData(nameof(Families))]
