@@ -5256,7 +5256,13 @@ public sealed unsafe partial class CudaKernels : IDisposable
                 throw new ArgumentException($"flash prefill kvq needs {align}-byte-aligned K/V block bases (hd{headDim}).");
             Interlocked.Increment(ref AttentionFlashPrefillKvqLaunches);
         }
-        else Interlocked.Increment(ref AttentionFlashPrefillF16Launches);
+        else
+        {
+            // F16 K/V tiles are copied with 16-byte cp.async and Q tiles read as uint4 (#1923 review M4).
+            if (((k | v | q) & 15) != 0)
+                throw new ArgumentException("flash prefill kvq needs 16-byte-aligned Q and F16 K/V bases.");
+            Interlocked.Increment(ref AttentionFlashPrefillF16Launches);
+        }
 
         int group = numHeads / numKvHeads;
         nint qArg = q, kArg = k, vArg = v, oArg = output;

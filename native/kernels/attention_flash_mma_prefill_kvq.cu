@@ -555,8 +555,9 @@ PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_f16f16, 64, PkLoadF16, PkLoadF16)
 //
 // The loader needs per-side context (codes, norms, centroids, bits, stride, norm format) that the stateless chunk(dst, base,
 // elem) contract cannot carry, so the TQ entries pass a pointer to a per-side context struct as `base`. Everything is
-// force-inlined into the entry, so the struct lives in registers (the PTX has no local depot). pk_prefill_body and the ten
-// entries above are untouched, so their PTX cannot move. The centroid table is read with __ldg from global memory, never
+// force-inlined into the entry, so the struct lives in registers (the PTX has no local depot). The TQ entries take the body's
+// unstaged branch (PkStagedTraits false); since #1923 the body is shared with the staged q8 / q4 loaders, so any body edit must
+// be re-validated for the TQ entries too. The centroid table is read with __ldg from global memory, never
 // staged in shared memory; the loader is register-only, so the shared-memory size is the same as the q8 / q4 entries'.
 // `elem` = key * num_kv_heads * HD + hkv * HD + c * 8, so the head vector is elem / HD and the first coordinate elem % HD.
 struct PkTqSide

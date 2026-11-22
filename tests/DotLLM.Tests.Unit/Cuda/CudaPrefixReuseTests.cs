@@ -156,6 +156,7 @@ public sealed class CudaPrefixReuseTests
             var diag = new TextGenerator(model, tokenizer, factory, diagCache, mtpEnabled: false, prefixCacheHeadroomTokens: 4096);
             diag.Generate(Turn1(), opts);
             CudaG3Attention.OffsetEnabled = false;
+            using var f16FlashOff = F16FlashPrefillOverride.Set(false);   // #1923: else the suffix takes the F16 flash entry
             try
             {
                 var d = diag.Generate(t2, opts);
