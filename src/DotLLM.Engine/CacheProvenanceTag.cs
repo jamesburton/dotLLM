@@ -29,19 +29,44 @@ public sealed record CacheProvenanceTag
     }
 
     /// <summary>Content digest of the base weights.</summary>
-    public string ModelDigest { get; init; }
+    public string ModelDigest
+    {
+        get => _ModelDigest;
+        init => _ModelDigest = value ?? throw new ArgumentNullException(nameof(ModelDigest));
+    }
+    private readonly string _ModelDigest = null!;
 
     /// <summary>Tokenizer revision / digest.</summary>
-    public string TokenizerRevision { get; init; }
+    public string TokenizerRevision
+    {
+        get => _TokenizerRevision;
+        init => _TokenizerRevision = value ?? throw new ArgumentNullException(nameof(TokenizerRevision));
+    }
+    private readonly string _TokenizerRevision = null!;
 
     /// <summary>Quantization / KV / compute precision identifier.</summary>
-    public string Precision { get; init; }
+    public string Precision
+    {
+        get => _Precision;
+        init => _Precision = value ?? throw new ArgumentNullException(nameof(Precision));
+    }
+    private readonly string _Precision = null!;
 
     /// <summary>Digest of the active weight overlays, residual modifiers, ternary adapters and per-request LoRAs.</summary>
-    public string ActiveModifiersDigest { get; init; }
+    public string ActiveModifiersDigest
+    {
+        get => _ActiveModifiersDigest;
+        init => _ActiveModifiersDigest = value ?? throw new ArgumentNullException(nameof(ActiveModifiersDigest));
+    }
+    private readonly string _ActiveModifiersDigest = null!;
 
     /// <summary>External knowledge / snapshot revision identifier.</summary>
-    public string KnowledgeSnapshotId { get; init; }
+    public string KnowledgeSnapshotId
+    {
+        get => _KnowledgeSnapshotId;
+        init => _KnowledgeSnapshotId = value ?? throw new ArgumentNullException(nameof(KnowledgeSnapshotId));
+    }
+    private readonly string _KnowledgeSnapshotId = null!;
 
     /// <summary>Names of the fields whose values differ from <paramref name="other"/> (ordinal comparison), in declaration order; empty when equal.</summary>
     public IReadOnlyList<string> Diff(CacheProvenanceTag other)
