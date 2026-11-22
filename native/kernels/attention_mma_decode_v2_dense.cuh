@@ -10,14 +10,14 @@
 //   * HD is a template parameter: KB = HD/32 K "betas" (one LDG.128 each), GQ = HD/64 V groups, NO = HD/16 O fragments.
 //     Only warps < KB build Q fragments (every warp still reaches the barrier).
 //   * Output is F16 (_state.AttnOutput of the plain model), written once by the combine. No F32 output buffer.
-//   * Split partials (James's ruling, 2026-11-20): the partial O is stored NORMALISED (o_i / l_i), in F16 by default
-//     (PartialT = __half), with the running max m_i and sum l_i in F32. Normalising bounds every stored value by max|v|, so
+//   * Split partials (James's ruling, 2026-11-20): the partial O is stored NORMALISED (o_i / l_i) in F16,
+//     with the running max m_i and sum l_i in F32. Normalising bounds every stored value by max|v|, so
 //     F16 cannot overflow however long the split is (the unnormalised #988 form grows with l_i, i.e. with chunk length).
 //     The combine is out = sum_i c_i * o^_i with c_i = l_i e^(m_i - M) / sum_j l_j e^(m_j - M), algebraically identical to
-//     the #988 combine. PartialT = float is the F32 control arm (same body, same normalisation; only the storage differs).
+//     the #988 combine. An F32-storage control arm measured indistinguishable (Qwen3-4B teacher-forced KL, #1922) and was removed.
 //
 // Precision: Q/K/V operands F16, mma accumulation F32, online softmax F32 (expf), P packed to F16 for PV (as #988),
-// in-block warp merge F32 in shared memory, F32 combine in registers. Stored partials: F16 o^ (control: F32), F32 m, l.
+// in-block warp merge F32 in shared memory, F32 combine in registers. Stored partials: F16 o^, F32 m, l.
 
 #pragma once
 
@@ -94,12 +94,7 @@ struct DLoadTq
     }
 };
 
-__device__ __forceinline__ void dv2_store(__half* p, float v) { *p = __float2half(v); }
-__device__ __forceinline__ void dv2_store(float* p, float v) { *p = v; }
-__device__ __forceinline__ float dv2_load(const __half* p) { return __half2float(*p); }
-__device__ __forceinline__ float dv2_load(const float* p) { return *p; }
-
-template <int HD, class KL, class VL, class PartialT>
+template <int HD, class KL, class VL>
 __device__ __forceinline__ void attn_decode_v2_dense_body(
     const half* __restrict__ q,        // [numHeads, HD] (seqQ == 1)
     const KL kl,
@@ -112,7 +107,7 @@ __device__ __forceinline__ void attn_decode_v2_dense_body(
     const int kv_split,                // <= DV2_MAX_SPLIT (host-enforced)
     float* __restrict__ partial_max,   // [num_heads, kv_split] F32
     float* __restrict__ partial_sum,   // [num_heads, kv_split] F32
-    PartialT* __restrict__ partial_out)// [num_heads, kv_split, HD], NORMALISED o / l
+    __half* __restrict__ partial_out)  // [num_heads, kv_split, HD], NORMALISED o / l
 {
     constexpr int KB = HD / 32;   // K betas (32 dims each)
     constexpr int GQ = HD / 64;   // V groups (64 dims each)
@@ -314,7 +309,7 @@ __device__ __forceinline__ void attn_decode_v2_dense_body(
         __syncthreads();
     }
 
-    // ---- publish this block's split partial: m, l in F32; o / l in PartialT ----
+    // ---- publish this block's split partial: m, l in F32; o / l in F16 ----
     if (threadIdx.x < group)
     {
         const int qc = threadIdx.x;
@@ -337,7 +332,7 @@ __device__ __forceinline__ void attn_decode_v2_dense_body(
     {
         const int qc = idx / HD, d = idx % HD;
         const int hq = hkv * group + qc;
-        dv2_store(&partial_out[((size_t)hq * kv_split + s) * HD + d], sO[idx] * sLb[qc]);
+        partial_out[((size_t)hq * kv_split + s) * HD + d] = __float2half(sO[idx] * sLb[qc]);
     }
 
     grid.sync();   // ALL blocks must have published before the combine.
@@ -370,7 +365,7 @@ __device__ __forceinline__ void attn_decode_v2_dense_body(
         const int hq = hkv * group + gg;
         float oo = 0.0f;
         for (int i = 0; i < kv_split; i++)
-            oo += sC[gg][i] * dv2_load(&partial_out[((size_t)hq * kv_split + i) * HD + d]);
+            oo += sC[gg][i] * __half2float(partial_out[((size_t)hq * kv_split + i) * HD + d]);
         output[(size_t)hq * HD + d] = __float2half(oo);
     }
 }

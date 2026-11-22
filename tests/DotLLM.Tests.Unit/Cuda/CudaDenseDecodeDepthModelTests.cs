@@ -32,12 +32,6 @@ internal sealed class StaticToggle : IDisposable
         return new StaticToggle(() => { CudaDenseDecodeV2.Enabled = prevOn; CudaDenseDecodeV2.MinSeqKv = prevMin; });
     }
 
-    internal static StaticToggle F32Partials(bool on)
-    {
-        bool prev = CudaKernels.DenseDecodeV2F32Partials;
-        CudaKernels.DenseDecodeV2F32Partials = on;
-        return new StaticToggle(() => CudaKernels.DenseDecodeV2F32Partials = prev);
-    }
 
     internal static StaticToggle GraphMaxDepth(int depth)
     {

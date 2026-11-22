@@ -18,14 +18,13 @@ namespace DotLLM.Cuda;
 /// </para>
 /// <para>
 /// <b>Scratch.</b> One partial buffer shared by every layer, allocated once here at model construction (never inside a decode
-/// step), sized for the largest kvSplit any dense entry can launch with on this device, at the F32 control arm's 4 bytes per
-/// element so both arms fit: <c>numHeads x maxSplit x headDim x 4</c> + <c>2 x numHeads x maxSplit x 4</c> bytes (Qwen3-4B on
-/// an RTX 3060: maxSplit 3, 49 KiB + 768 B). If the allocation fails the path is simply off.
+/// step), sized for the largest kvSplit any dense entry can launch with on this device: the normalised partial O in F16,
+/// <c>numHeads x maxSplit x headDim x 2</c>, plus F32 m and l, <c>2 x numHeads x maxSplit x 4</c> bytes (Qwen3-4B on an
+/// RTX 3060: maxSplit 3, 24 KiB + 768 B). If the allocation fails the path is simply off.
 /// </para>
 /// <para>
 /// <b>Switches.</b> <c>DOTLLM_CUDA_DENSE_DECODE_V2=0</c> turns it off; <c>DOTLLM_CUDA_DENSE_DECODE_V2_MIN_KV</c> (default 512)
-/// sets the engagement depth; <c>DOTLLM_CUDA_DENSE_DECODE_V2_P32=1</c> selects the F32-partial control arm
-/// (<see cref="CudaKernels.DenseDecodeV2F32Partials"/>).
+/// sets the engagement depth. Default on: James 2026-11-21, bench 2026-11-22 (#1922).
 /// </para>
 /// </remarks>
 internal sealed class CudaDenseDecodeV2 : IDisposable
@@ -59,24 +58,15 @@ internal sealed class CudaDenseDecodeV2 : IDisposable
         if (numKvHeads <= 0 || !CudaKernels.IsGqaGroupShapeSupported(numHeads, numKvHeads)) return;
 
         int maxSplit = 0;
-        bool prev = CudaKernels.DenseDecodeV2F32Partials;
-        try
-        {
-            foreach (bool p32 in new[] { false, true })
-            {
-                CudaKernels.DenseDecodeV2F32Partials = p32;
-                if (headDim is 64 or 128)
-                    foreach (var (k, vv) in new[] { (KvCacheDType.F32, KvCacheDType.F32), (KvCacheDType.Q8_0, KvCacheDType.Q8_0),
-                                 (KvCacheDType.Q4_0, KvCacheDType.Q4_0), (KvCacheDType.Q8_0, KvCacheDType.Q4_0), (KvCacheDType.Q4_0, KvCacheDType.Q8_0) })
-                        maxSplit = Math.Max(maxSplit, kernels.MaxSafeAttentionMmaDecodeDense(numKvHeads, headDim, k, vv));
-                maxSplit = Math.Max(maxSplit, kernels.MaxSafeAttentionMmaDecodeDenseTq(numKvHeads, headDim));
-            }
-        }
-        finally { CudaKernels.DenseDecodeV2F32Partials = prev; }
+        if (headDim is 64 or 128)
+            foreach (var (k, vv) in new[] { (KvCacheDType.F32, KvCacheDType.F32), (KvCacheDType.Q8_0, KvCacheDType.Q8_0),
+                         (KvCacheDType.Q4_0, KvCacheDType.Q4_0), (KvCacheDType.Q8_0, KvCacheDType.Q4_0), (KvCacheDType.Q4_0, KvCacheDType.Q8_0) })
+                maxSplit = Math.Max(maxSplit, kernels.MaxSafeAttentionMmaDecodeDense(numKvHeads, headDim, k, vv));
+        maxSplit = Math.Max(maxSplit, kernels.MaxSafeAttentionMmaDecodeDenseTq(numKvHeads, headDim));
         if (maxSplit <= 0) return;
 
         long statBytes = (long)numHeads * maxSplit * sizeof(float);
-        long outBytes = (long)numHeads * maxSplit * headDim * sizeof(float);
+        long outBytes = (long)numHeads * maxSplit * headDim * CudaKernels.AttentionMmaDecodeDensePartialBytes;
         if (CudaDriverApi.cuMemAlloc_v2(out _partialMax, (nuint)statBytes) != 0
             || CudaDriverApi.cuMemAlloc_v2(out _partialSum, (nuint)statBytes) != 0
             || CudaDriverApi.cuMemAlloc_v2(out _partialOut, (nuint)outBytes) != 0)

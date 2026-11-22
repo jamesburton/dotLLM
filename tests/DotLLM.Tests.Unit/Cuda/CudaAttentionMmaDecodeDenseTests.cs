@@ -10,8 +10,8 @@ namespace DotLLM.Tests.Unit.Cuda;
 
 /// <summary>
 /// Issue #1922 (E1): kernel-level oracle and microbenchmark for the dense split-KV tensor-core decode kernel
-/// (<c>attention_mma_decode_v2_dense.cu</c>), head dim 64 / 128, F16 output, normalised split partials (F16 default, F32
-/// control). References: an F64 CPU attention over the same F16 inputs, and (quantized KV) the dense F16 entry over the
+/// (<c>attention_mma_decode_v2_dense.cu</c>), head dim 64 / 128, F16 output, normalised F16 split partials (F32 m / l).
+/// References: an F64 CPU attention over the same F16 inputs, and (quantized KV) the dense F16 entry over the
 /// dequantized scratch, which must be bit-identical.
 /// <para>
 /// Fixture strength: every KV head and query head has distinct random data, numKvHeads &gt; 1 and group &gt; 1 (except the
@@ -196,8 +196,6 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
     {
         using var rig = TrySetUp(out string? skip);
         Skip.If(rig == null, skip);
-        bool prev = CudaKernels.DenseDecodeV2F32Partials;
-        try
         {
             int kvRow = numKvHeads * hd;
             var rng = new Random(0x1922 ^ (seqKv * 31 + hd * 7 + numHeads));
@@ -208,11 +206,7 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
             nint dQ = Upload(q), dK = Upload(k), dV = Upload(v);
             try
             {
-                foreach (int arm in new[] { 0, 1, 2 })   // F16 partials, F32 control, F16 partials at 2 blocks/SM (E4 a)
                 {
-                    bool p32 = arm == 1;
-                    CudaKernels.DenseDecodeV2F32Partials = p32;
-                    CudaKernels.DenseDecodeV2Lb2 = arm == 2;
                     Skip.IfNot(rig!.Kernels.HasAttentionMmaDecodeDense(hd, F16, F16), "dense v2 kernel not loaded (stale PTX)");
                     var o = RunDense(rig, dQ, dK, dV, F16, F16, seqKv, numHeads, numKvHeads, hd, forcedSplit, out int split);
                     double maxErr = 0, maxRel = 0;
@@ -223,9 +217,9 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                         maxRel = Math.Max(maxRel, e / (Math.Abs(r[i]) + 1e-3));
                         // Two F16 roundings at most (output; partial) plus the F16 P operand: 2e-3 relative + 1e-3 absolute.
                         Assert.True(e <= 1e-3 + 2e-3 * Math.Abs(r[i]),
-                            $"p32={p32} split={split} elem {i}: {H(o[i])} vs {r[i]} ({numHeads}/{numKvHeads}/{hd} seqKv={seqKv})");
+                            $"split={split} elem {i}: {H(o[i])} vs {r[i]} ({numHeads}/{numKvHeads}/{hd} seqKv={seqKv})");
                     }
-                    _out.WriteLine($"{numHeads}/{numKvHeads}/hd{hd} seqKv={seqKv,6} split={split} arm={arm}: max|err|={maxErr:E2} maxRel={maxRel:E2}");
+                    _out.WriteLine($"{numHeads}/{numKvHeads}/hd{hd} seqKv={seqKv,6} split={split}: max|err|={maxErr:E2} maxRel={maxRel:E2}");
                 }
             }
             finally
@@ -233,7 +227,6 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                 CudaDriverApi.cuMemFree_v2(dQ); CudaDriverApi.cuMemFree_v2(dK); CudaDriverApi.cuMemFree_v2(dV);
             }
         }
-        finally { CudaKernels.DenseDecodeV2F32Partials = prev; CudaKernels.DenseDecodeV2Lb2 = false; }
     }
 
     /// <summary>
@@ -247,10 +240,7 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
     {
         using var rig = TrySetUp(out string? skip);
         Skip.If(rig == null, skip);
-        bool prev = CudaKernels.DenseDecodeV2F32Partials;
-        try
         {
-            CudaKernels.DenseDecodeV2F32Partials = false;
             Skip.IfNot(rig!.Kernels.HasAttentionMmaDecodeDense(128, F16, F16), "dense v2 kernel not loaded");
             const int nh = 32, nkv = 8, hd = 128, seqKv = 32768;
             var rng = new Random(0x0F16);
@@ -270,7 +260,6 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
             }
             finally { CudaDriverApi.cuMemFree_v2(dQ); CudaDriverApi.cuMemFree_v2(dK); CudaDriverApi.cuMemFree_v2(dV); }
         }
-        finally { CudaKernels.DenseDecodeV2F32Partials = prev; }
     }
 
     private static byte[] RandomQuantBlocks(Random rng, long elems, KvCacheDType t)
@@ -294,7 +283,7 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
         (KvCacheDType.Q8_0, KvCacheDType.Q4_0), (KvCacheDType.Q4_0, KvCacheDType.Q8_0),
     };
 
-    /// <summary>Fused Q8_0 / Q4_0 loaders == dequantize into an F16 scratch + the dense F16 entry, bit for bit (both partial arms).</summary>
+    /// <summary>Fused Q8_0 / Q4_0 loaders == dequantize into an F16 scratch + the dense F16 entry, bit for bit.</summary>
     [SkippableTheory]
     [InlineData(32, 8, 128, 17)]
     [InlineData(32, 8, 128, 4097)]
@@ -304,14 +293,10 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
     {
         using var rig = TrySetUp(out string? skip);
         Skip.If(rig == null, skip);
-        bool prev = CudaKernels.DenseDecodeV2F32Partials;
-        try
         {
             long kvElems = (long)seqKv * numKvHeads * hd;
-            foreach (bool p32 in new[] { false, true })
                 foreach (var (kd, vd) in KvqCombos)
                 {
-                    CudaKernels.DenseDecodeV2F32Partials = p32;
                     Skip.IfNot(rig!.Kernels.HasAttentionMmaDecodeDense(hd, kd, vd), "dense v2 kvq kernel not loaded");
                     var rng = new Random(0x1922 + seqKv + (int)kd * 7 + (int)vd + hd);
                     nint dQ = Upload(RandomHalf(rng, numHeads * hd, 2.5f));
@@ -331,14 +316,13 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                         var b = RunDense(rig, dQ, dKq, dVq, kd, vd, seqKv, numHeads, numKvHeads, hd, split, out int s2);
                         int diff = 0, nonZero = 0;
                         for (int i = 0; i < a.Length; i++) { if (a[i] != b[i]) diff++; if ((a[i] & 0x7FFF) != 0) nonZero++; }
-                        _out.WriteLine($"{numHeads}/{numKvHeads}/hd{hd} seqKv={seqKv} {kd}/{vd} p32={p32} split={s1}: bit-diff {diff}, non-zero {nonZero}/{a.Length}");
+                        _out.WriteLine($"{numHeads}/{numKvHeads}/hd{hd} seqKv={seqKv} {kd}/{vd} split={s1}: bit-diff {diff}, non-zero {nonZero}/{a.Length}");
                         Assert.True(nonZero > a.Length / 2, "fixture produced a mostly-zero output");
                         Assert.Equal(0, diff);
                     }
                     finally { foreach (var p in new[] { dQ, dKq, dVq, dKs, dVs }) CudaDriverApi.cuMemFree_v2(p); }
                 }
         }
-        finally { CudaKernels.DenseDecodeV2F32Partials = prev; }
     }
 
     // ── TurboQuant in place (E3): the dense v2 TQ entry vs the scalar attention_kvtq on the same codes, norms and centroids. ──
@@ -461,7 +445,7 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
             rig.Kernels.LaunchAttentionMmaDecodeDense(0, 0, 0, F16, F16, 0, 1024, 32, 8, 128, maxSafe + 1, 0, 0, 0, rig.Stream.Handle));
     }
 
-    // ── Microbench: scalar attention_f16 / attention_kvq vs dense v2 (both partial arms), shape 32/8/128. ──
+    // ── Microbench: scalar attention_f16 / attention_kvq vs dense v2, shape 32/8/128. ──
     [SkippableFact]
     public void Microbench_Scalar_vs_DenseV2()
     {
@@ -475,8 +459,6 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("| seqKv | KV | kernel | kvSplit | ms/launch | eff GB/s |");
         sb.AppendLine("|---:|---|---|---:|---:|---:|");
-        bool prev = CudaKernels.DenseDecodeV2F32Partials;
-        try
         {
             foreach (int seqKv in seqList)
             {
@@ -484,7 +466,7 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                 var rng = new Random(seqKv);
                 nint dQ = Upload(RandomHalf(rng, nh * hd, 2.5f));
                 nint dOut = Alloc(nh * hd * 2);
-                nint dPm = Alloc(nh * 64 * 4), dPs = Alloc(nh * 64 * 4), dPo = Alloc((long)nh * 64 * hd * 4);
+                nint dPm = Alloc(nh * 64 * 4), dPs = Alloc(nh * 64 * 4), dPo = Alloc((long)nh * 64 * hd * CudaKernels.AttentionMmaDecodeDensePartialBytes);
                 try
                 {
                     foreach (var kd in new[] { F16, KvCacheDType.Q8_0, KvCacheDType.Q4_0 })
@@ -498,7 +480,7 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                         }
                         try
                         {
-                            foreach (string arm in new[] { "scalar", "v2-f16p", "v2-f32p", "v2-lb2" })
+                            foreach (string arm in new[] { "scalar", "v2" })
                             {
                                 int sp = 0;
                                 Action launch;
@@ -511,8 +493,6 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                                 }
                                 else
                                 {
-                                    CudaKernels.DenseDecodeV2F32Partials = arm == "v2-f32p";
-                                    CudaKernels.DenseDecodeV2Lb2 = arm == "v2-lb2";
                                     if (!rig!.Kernels.HasAttentionMmaDecodeDense(hd, kd, kd)) continue;
                                     sp = CudaKernels.ComputeAttentionMmaV2KvSplit(seqKv, rig.Kernels.MaxSafeAttentionMmaDecodeDense(nkv, hd, kd, kd));
                                     int spc = sp;
@@ -538,7 +518,6 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
                 finally { foreach (var p in new[] { dQ, dOut, dPm, dPs, dPo }) CudaDriverApi.cuMemFree_v2(p); }
             }
         }
-        finally { CudaKernels.DenseDecodeV2F32Partials = prev; CudaKernels.DenseDecodeV2Lb2 = false; }
         _out.WriteLine(sb.ToString());
         string? outFile = Environment.GetEnvironmentVariable("DOTLLM_ATTN_MICROBENCH_OUT");
         if (!string.IsNullOrEmpty(outFile)) File.AppendAllText(outFile, sb.ToString());
