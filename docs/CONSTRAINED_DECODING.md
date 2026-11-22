@@ -117,6 +117,19 @@ For each automaton state, pre-compute allowed token IDs. Cache masks indexed by 
 
 Cost: O(vocabSize / 64) iterations with fast-path skipping for fully-allowed/disallowed blocks. For a 128K vocabulary, this is 2048 long comparisons — negligible compared to model forward pass.
 
+### Mid-Session Constraint Swapping (`GenerationSession.SetConstraint`, #1921)
+
+A `GenerationSession` (see [GENERATION_SESSION.md](GENERATION_SESSION.md)) keeps one sequence alive across many segments, so the constraint can change
+between them: free reasoning (`null`) -> pause -> `SetConstraint(new JsonSchemaConstraint(...))` -> schema-valid request -> `SetConstraint(null)` ->
+`AppendObservationTokensAsync` -> resume, all over the same KV prefix.
+
+- `SetConstraint(IDecodingConstraint?)` is legal at any pause (an in-flight operation, a provenance mismatch or a faulted session throws `InvalidOperationException`; a disposed one `ObjectDisposedException`). It calls `Reset()` on the instance it is given and **takes ownership** of it (not cloned, so grammar/mask caches are shared with the caller's object; do not advance or share it while active). Re-supplying a finished instance therefore starts a fresh document; no parser state leaks between turns. `null` detaches. `ActiveConstraint` reads it back.
+- It touches no model state: KV, recurrent state, boundary records and next-token logits are unchanged, and nothing is re-prefilled.
+- The mask is applied to the logits before the sampler chain, as in `TextGenerator`. The constraint advances only on tokens the session samples **and commits**; prompt and observation tokens never advance it (an end-of-generation token that is dropped does not either).
+- A constraint that is complete and permits only EOS ends the segment with `FinishReason.ConstraintComplete` instead of sampling the forced EOS (the `TextGenerator` early stop). A constraint that stays satisfiable but never terminates (JSON allows trailing whitespace) is ended by the stop condition or `MaxTokens`, as there.
+- `RollbackTo` that discards tokens resets the active constraint to its initial state (its state described the discarded tokens). To resume mid-document, re-`SetConstraint` and replay.
+- `InferenceOptions.ResponseFormat` on `CreateSession` builds the session's initial constraint exactly as `Generate` does (JSON object, schema, regex, grammar; Text = none).
+
 ### Speculative Decoding Interaction
 Draft model must respect constraints. Each speculated token advances automaton. On rejection: `Clone()` state before speculation, restore on rollback.
 

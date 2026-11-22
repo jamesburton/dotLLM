@@ -15,6 +15,7 @@ var seg = await s.GenerateUntilBoundaryAsync(stopCondition);     // seg.TokenIds
 await s.AppendObservationTokensAsync(observationIds);            // full-layer prefill, never sampled or constrained
 int top = s.NextTokenArgMax();                                    // raw model logits probe
 s.CopyNextLogits(buffer);
+s.SetConstraint(new JsonSchemaConstraint(tokenizer, schema));     // mask sampled tokens from now on; null detaches
 if (s.CanRollbackTo(k)) s.RollbackTo(k);
 ```
 
@@ -29,7 +30,7 @@ if (s.CanRollbackTo(k)) s.RollbackTo(k);
 - One operation at a time (a concurrent call throws `InvalidOperationException`). Operations complete synchronously; cancellation is
   checked per token and per prefill chunk. A failed or cancelled forward is undone to where it started when the cache and model can; otherwise
   the session is faulted and only `RollbackTo(0)` or disposal remain.
-- `options.ResponseFormat` is not supported on a session (constraints arrive with `SetConstraint`, #1921).
+- **Constraints** (#1921): `ActiveConstraint` / `SetConstraint(IDecodingConstraint?)` swap the decoding constraint at a pause without touching KV or recurrent state; `options.ResponseFormat` initialises it. See "Mid-Session Constraint Swapping" in [CONSTRAINED_DECODING.md](CONSTRAINED_DECODING.md). A complete constraint that permits only EOS ends a segment with `FinishReason.ConstraintComplete`; `RollbackTo` resets the constraint.
 
 ## Provenance
 
@@ -90,6 +91,6 @@ Checkpoints are pooled by the model (one spare) and released with it.
 | Vulkan | same three | `GenerationSessionVulkanTests` run and pass on the Strix Halo box (incl. a device-memory leak check across sessions) |
 | CUDA | same three | `GenerationSessionCudaTests` written and built; **not yet run** (needs an NVIDIA GPU: framework / T5500, with the owner's go). `CudaQwen3MoeHybridTransformerModel` gained `CheckpointRecurrentState` / `RestoreRecurrentState` / `RecurrentStateCheckpointBytes` for this (#1919); before, the session refused every rollback on that model |
 
-The same assertions (`GenerationSessionBackendSuite`) run on every backend. GPU logit tolerance versus a fresh prefill is 1e-2 absolute
+The same assertions (`GenerationSessionBackendSuite`, incl. the `SetConstraint` tests: end-to-end multi-phase, prefix preserved / no re-prefill, multi-turn isolation, rollback reset, re-entrancy guard, observation tokens never advance) run on every backend. GPU logit tolerance versus a fresh prefill is 1e-2 absolute
 (CPU 1e-4): measured Vulkan Llama prefill-vs-decode differences reach 5.6e-3 with identical tokens. Exactness of the rollback itself is
 asserted separately against a path-matched oracle (prefill k-1 tokens then append one) at 5e-4 on every backend.
