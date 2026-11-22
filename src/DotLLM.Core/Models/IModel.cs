@@ -541,6 +541,25 @@ public interface IModel : IDisposable
     int PreferredPrefillChunkTokens => 0;
 
     /// <summary>
+    /// The most prompt tokens one forward pass may take on the KV cache this model is set up to make, or 0 for no limit (#1892).
+    /// A HARD limit, unlike <see cref="PreferredPrefillChunkTokens"/>: a longer pass is refused by the model (Vulkan in-place
+    /// TurboQuant bounds the rows by the dispatch grid). Every engine path that prefills (the generator, the scheduler) splits
+    /// at this bound, whatever chunk size was configured, and 0 (one pass) becomes this bound.
+    /// </summary>
+    int MaxPrefillForwardTokens => 0;
+
+    /// <summary>
+    /// Whether this model runs TurboQuant KV in place for <paramref name="kv"/> (#1892): codes and norms are the only copy of the
+    /// history and every attention arm the host can dispatch reads them in code space. True only when <b>every</b> arm has its
+    /// TurboQuant twin loaded, the geometry qualifies (<c>TurboQuantInPlaceSupport.Eligible</c>) and the request is both-side MSE
+    /// TurboQuant. False is a refusal, never a fallback: the caller must not build any other cache for a TurboQuant request.
+    /// Hosts that do not implement it (hybrids and recurrent models, Qwen4Exp, pipelines, MLA: #1900) keep the default.
+    /// </summary>
+    /// <param name="kv">The KV request.</param>
+    /// <returns>Whether the in-place TurboQuant cache can serve it on this host.</returns>
+    bool SupportsInPlaceTurboQuant(DotLLM.Core.Configuration.KvCacheConfig kv) => false;
+
+    /// <summary>
     /// Allocates a fresh <see cref="IMtpState"/> — the MTP head's own tiny KV-cache plus pending
     /// hidden-state handoff — or <see langword="null"/> when <see cref="SupportsMtp"/> is
     /// <see langword="false"/>. The caller owns the returned state's lifetime (one per in-flight

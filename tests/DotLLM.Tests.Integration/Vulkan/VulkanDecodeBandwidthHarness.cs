@@ -33,7 +33,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 public sealed class VulkanDecodeBandwidthHarness
 {
     private const ulong Seed = 0xC0FFEE_4B2CUL;
-    private const ulong VSeedXor = 0xD1B54A32D192ED03UL;
+    private const ulong VSeedXor = DotLLM.Engine.KvCache.Codecs.TurboQuantCodec.VSeedMask;
 
     private readonly ITestOutputHelper _output;
     public VulkanDecodeBandwidthHarness(ITestOutputHelper output) => _output = output;

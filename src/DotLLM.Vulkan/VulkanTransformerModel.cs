@@ -1095,6 +1095,96 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     private VulkanKvF16WriteKernel? _kvF16Writer;
     // Block-quantised KV (Q8_0: Flint opt-in, then the dense chain in #1884; Q4_0: #1884): one set of writer + attention twins per format.
     private readonly BlockKvTwins _kvQ8Set = new(), _kvQ4Set = new(), _kvQ8Q4Set = new(), _kvQ4Q8Set = new();   // mixed K/V: #1884 stage 3
+    // TurboQuant KV read in place in code space (#1892): the same twin slots, specialised for one layout, plus the encode writer and the
+    // Q / O rotation kernel. Empty until TryUseInPlaceTurboQuantKv.
+    private readonly BlockKvTwins _kvTqSet = new();
+    private bool _disposedModel;
+    private TurboQuantKvConstants? _tqKv;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// With in-place TurboQuant KV active (issue #1892) a forward is bounded by <see cref="MaxTurboQuantRowsPerForward"/> rows, so the
+    /// model asks the engine to prefill in chunks of at most that many: a long prompt is chunked instead of reaching the guard in
+    /// <c>Forward</c>. 0 (one pass) otherwise. It is also the HARD limit <see cref="MaxPrefillForwardTokens"/>, which the engine
+    /// applies to an explicit chunk size and to the scheduler.
+    /// </remarks>
+    public int PreferredPrefillChunkTokens =>
+        DefaultKvStorage == VulkanKvStorage.Tq ? MaxTurboQuantRowsPerForward(Config.NumAttentionHeads, Config.NumKvHeads) : 0;
+
+    /// <inheritdoc/>
+    public int MaxPrefillForwardTokens => PreferredPrefillChunkTokens;
+
+    /// <summary>Head vectors (rows x KV heads) one forward may write to a TurboQuant cache: the guaranteed <c>maxComputeWorkGroupCount</c> per dimension.</summary>
+    internal const int MaxTurboQuantVectorsPerForward = 65535;
+
+    /// <summary>
+    /// Rows one TurboQuant forward may take (#1892): the encode dispatches one workgroup per head vector (rows x <paramref name="numKvHeads"/>
+    /// on X), the rotations one workgroup row per query row, and the flash twin's X groups are <c>ceil(rows / 16) x numHeads</c>, each
+    /// bounded by the 65535 workgroups Vulkan guarantees per dimension. So <c>min(65535 / numKvHeads, 16 * (65535 / numHeads))</c>:
+    /// at a GQA ratio of 16 or more the flash grid, not the encode, binds.
+    /// </summary>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="numKvHeads">KV heads.</param>
+    /// <returns>The most rows one forward may take.</returns>
+    internal static int MaxTurboQuantRowsPerForward(int numHeads, int numKvHeads)
+        => Math.Min(MaxTurboQuantVectorsPerForward / numKvHeads, 16 * (MaxTurboQuantVectorsPerForward / numHeads));
+
+    /// <summary>The attention arms of one KV format's twin set, as loaded flags (#1892; pure input to <see cref="TqArmsComplete"/>).</summary>
+    internal readonly record struct TqArms(bool Attention, bool SplitKv, bool Flash, bool Coopmat, bool PrefillGqa, bool QPos, bool QPosTiled,
+        bool SinkFlash, bool SinkReference);
+
+    /// <summary>
+    /// Whether a TurboQuant twin set covers every attention arm its host can dispatch (#1892). Dense chain: the per-token kernel is the
+    /// arm of last resort and must exist, and every arm the F32 chain loaded (<paramref name="baseline"/>: split-KV decode, scalar
+    /// flash, coopmat flash, GQA prefill flash, the two per-query-position arms) must have its twin, so a stale or missing
+    /// <c>_kvtq</c> shader refuses at startup instead of silently running a slower arm. Flint (every layer has sinks): split-KV
+    /// decode, the GQA sink flash and the reference sink kernel. Always needs the encoder and the rotations.
+    /// </summary>
+    /// <param name="flint">The host is Flint's all-sink dispatch.</param>
+    /// <param name="writerAndRotation">The encode writer and the Q / O rotation kernel are built.</param>
+    /// <param name="tq">The TurboQuant twins loaded.</param>
+    /// <param name="baseline">The F32 chain's arms, which the host can dispatch.</param>
+    /// <returns>Whether nothing the host can dispatch lacks a TurboQuant twin.</returns>
+    internal static bool TqArmsComplete(bool flint, bool writerAndRotation, in TqArms tq, in TqArms baseline)
+    {
+        if (!writerAndRotation) return false;
+        if (flint) return tq.SplitKv && tq.SinkFlash && tq.SinkReference;
+        return tq.Attention
+            && (!baseline.SplitKv || tq.SplitKv)
+            && (!baseline.Flash || tq.Flash)
+            && (!baseline.Coopmat || tq.Coopmat)
+            && (!baseline.PrefillGqa || tq.PrefillGqa)
+            && (!baseline.QPos || tq.QPos)
+            && (!baseline.QPosTiled || tq.QPosTiled);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Meaningful only after <see cref="TryUseInPlaceTurboQuantKv"/> succeeded for this request (it builds the twin set; the codec
+    /// constants come from the caller): before that, or after a refused or different-layout call, it is false. Then every arm of the
+    /// host must have its twin (<see cref="TqArmsComplete"/>), and bits and norm format must be the twin set's.
+    /// </remarks>
+    public bool SupportsInPlaceTurboQuant(KvCacheConfig kv)
+    {
+        if (!TurboQuantInPlaceSupport.Eligible(kv, Config)) return false;
+        bool flint = Config.Architecture == DotLLM.Core.Configuration.Architecture.Flint && _gptOss is not null;
+        if (!IsDenseF16KvEligible && !flint) return false;
+        var set = _kvTqSet;
+        if (set.Tq is not { } layout || _tqKv is null || KvStorageOverride != VulkanKvStorage.Tq) return false;
+        if (layout.MseBits != kv.TurboQuantBits || layout.Norm != TurboQuantLayout.DefaultNorm
+            || layout.HeadDim != Config.HeadDim || layout.NumKvHeads != Config.NumKvHeads) return false;
+        var tq = new TqArms(set.Attention is not null, set.SplitKv is not null, set.Flash is not null, set.Coopmat is not null,
+            set.PrefillGqa is not null, set.QPos is not null, set.QPosTiled is not null, set.SinkFlash is not null, _gptOss?.HasTurboQuantSinks == true);
+        var baseline = new TqArms(true, _splitKvAttention is not null, _flashAttention is not null, _flashAttentionCoopmat is not null,
+            _prefillGqaFlash is not null, _attentionQPos is not null, _attentionQPosTiled is not null, false, false);
+        return TqArmsComplete(flint, set.HasWriter, tq, baseline);
+    }
+
+    /// <summary>Count of attention dispatches that ran in TurboQuant code space: query rotated in, <c>_kvtq</c> twin, output rotated out (#1892; test/diagnostic).</summary>
+    public long TurboQuantAttentionCount { get; private set; }
+
+    /// <summary>Of <see cref="TurboQuantAttentionCount"/>, decode dispatches served by the split-KV twin (#1892; test/diagnostic).</summary>
+    public long TurboQuantSplitKvCount { get; private set; }
     private RopeKvWriteF32Kernel? _ropeKvWriteKvF16;   // fused RoPE + F16 KV write (dense hosts, #1151); null when the SPIR-V is missing
     // Dense F16 KV (#1151): F16-KV twins of the non-sink attention kernels (per-token, scalar flash, coopmat flash, GQA flash, per-query-position
     // reference and tiled). Created together with the writer when DefaultKvStorage is F16 on a non-sink architecture; null otherwise.
@@ -1133,9 +1223,17 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         public AttentionQueryPositionsKernel? QPos;
         public VulkanFlashAttentionGqaKernel? QPosTiled;
         public VulkanSplitKvRowsAttentionKernel? SmallRow;
+        // TurboQuant set only (#1892): the layout the twins are specialised for, the encode writer and the Q / O rotations.
+        public TurboQuantLayout? Tq;
+        public TurboQuantEncodeF32Kernel? TqWriter;
+        public TqRotateKernel? TqRotate;
+
+        /// <summary>True when the set can write its cache: the block quantiser, or for TurboQuant the encoder and the rotations.</summary>
+        public bool HasWriter => Tq is null ? Writer is not null : TqWriter is not null && TqRotate is not null;
 
         public void Invalidate()
         {
+            TqWriter?.InvalidateDescriptorCache(); TqRotate?.InvalidateDescriptorCache();
             Writer?.InvalidateDescriptorCache(); ValueWriter?.InvalidateDescriptorCache(); SplitKv?.InvalidateDescriptorCache(); SinkFlash?.InvalidateDescriptorCache();
             Attention?.InvalidateDescriptorCache(); Flash?.InvalidateDescriptorCache(); Coopmat?.InvalidateDescriptorCache();
             PrefillGqa?.InvalidateDescriptorCache(); QPos?.InvalidateDescriptorCache(); QPosTiled?.InvalidateDescriptorCache();
@@ -1146,16 +1244,32 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         {
             Writer?.Dispose(); ValueWriter?.Dispose(); SplitKv?.Dispose(); SinkFlash?.Dispose(); Attention?.Dispose(); Flash?.Dispose(); Coopmat?.Dispose();
             PrefillGqa?.Dispose(); QPos?.Dispose(); QPosTiled?.Dispose(); SmallRow?.Dispose();
+            TqWriter?.Dispose(); TqRotate?.Dispose();
+            Writer = ValueWriter = null; SplitKv = null; SinkFlash = PrefillGqa = QPosTiled = null; Attention = null; Flash = null; Coopmat = null;
+            QPos = null; SmallRow = null; TqWriter = null; TqRotate = null;
         }
     }
 
-    /// <summary>The twin set for a block-quantised <paramref name="storage"/>; null for F32 / F16 (#1884).</summary>
+    /// <summary>
+    /// The codec constants of this model's in-place TurboQuant KV (issue #1892): supplied by the caller (the Vulkan project does not
+    /// depend on the Engine codec), uploaded into every cache <see cref="CreateKvCache(int)"/> then makes.
+    /// </summary>
+    private sealed record TurboQuantKvConstants(TurboQuantLayout Layout, float[] Centroids, float[] SignsK, float[] SignsV, float InvSqrtD);
+
+    /// <summary>The signs and operands of the TurboQuant cache layer an attention dispatch reads (issue #1892).</summary>
+    private readonly record struct TqAttention(TqKvOperands Operands, VulkanDevice.Buffer SignsK, VulkanDevice.Buffer SignsV);
+
+    private static TqAttention? TqAttentionOf(IKvCache? cache, int layer)
+        => cache is VulkanKvCache { Storage: VulkanKvStorage.Tq } c ? new TqAttention(c.TqOperands(layer), c.TqSignsK, c.TqSignsV) : null;
+
+    /// <summary>The twin set for a block-quantised or TurboQuant <paramref name="storage"/>; null for F32 / F16 (#1884, #1892).</summary>
     private BlockKvTwins? BlockSet(VulkanKvStorage storage) => storage switch
     {
         VulkanKvStorage.Q8_0 => _kvQ8Set,
         VulkanKvStorage.Q4_0 => _kvQ4Set,
         VulkanKvStorage.Q8_0K_Q4_0V => _kvQ8Q4Set,
         VulkanKvStorage.Q4_0K_Q8_0V => _kvQ4Q8Set,
+        VulkanKvStorage.Tq => _kvTqSet,
         _ => null,
     };
     // Sink prefill (#1200): the GQA flash kernel's attention-sink twins, per KV format. Null when unavailable or turned off.
@@ -1485,7 +1599,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     /// <summary>The per-query-position kernel reading <paramref name="storage"/> in place; null when this model has none (#1884).</summary>
     private AttentionQueryPositionsKernel? QPosKernelFor(VulkanKvStorage storage) => storage switch
     {
-        _ when storage.IsBlockQuantized() => BlockSet(storage)!.QPos,
+        _ when BlockSet(storage) is { } set => set.QPos,
         VulkanKvStorage.F16 => _attentionQPosKvF16,
         _ => _attentionQPos,
     };
@@ -1493,7 +1607,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     /// <summary>The tiled per-query-position kernel reading <paramref name="storage"/> in place, or null (#1884).</summary>
     private VulkanFlashAttentionGqaKernel? QPosTiledKernelFor(VulkanKvStorage storage) => storage switch
     {
-        _ when storage.IsBlockQuantized() => BlockSet(storage)!.QPosTiled,
+        _ when BlockSet(storage) is { } set => set.QPosTiled,
         VulkanKvStorage.F16 => _attentionQPosTiledKvF16,
         _ => _attentionQPosTiled,
     };
@@ -1510,24 +1624,115 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     {
         InitBlockKvKernels(spvDir, storage);
         var set = BlockSet(storage)!;
-        set.Attention ??= AttentionF32Kernel.Create(_device, spvDir, storage);
-        if (_smallRowAttn is not null)
+        // TurboQuant (#1892): the same arms, each twin specialised for the set's layout. The small-row split-KV arm has no TurboQuant twin:
+        // the dense chain never dispatches it (sink / MiMo-V2 layers only) and Flint's block sets never build it.
+        TurboQuantLayout? tq = set.Tq;
+        set.Attention ??= tq is { } la ? AttentionF32Kernel.Create(_device, spvDir, la) : AttentionF32Kernel.Create(_device, spvDir, storage);
+        if (_smallRowAttn is not null && tq is null)
             set.SmallRow ??= VulkanSplitKvRowsAttentionKernel.TryCreate(_device, spvDir, storage);
         if (!IsFlashAttentionDisabled())
         {
-            set.Flash ??= VulkanFlashAttentionF32Kernel.TryCreate(_device, spvDir, FlashAttentionWideVariant.None,
-                includeHd512: false, kvStorage: storage);
+            set.Flash ??= tq is { } lf ? VulkanFlashAttentionF32Kernel.TryCreate(_device, spvDir, lf)
+                : VulkanFlashAttentionF32Kernel.TryCreate(_device, spvDir, FlashAttentionWideVariant.None, includeHd512: false, kvStorage: storage);
             if (!IsCoopmatAttentionDisabled())
-                set.Coopmat ??= VulkanFlashAttentionCoopmatKernel.TryCreate(_device, spvDir, storage);
+                set.Coopmat ??= tq is { } lc ? VulkanFlashAttentionCoopmatKernel.TryCreate(_device, spvDir, lc)
+                    : VulkanFlashAttentionCoopmatKernel.TryCreate(_device, spvDir, storage);
             if (Environment.GetEnvironmentVariable(PrefillGqaFlashEnvVar) != "ref")
-                set.PrefillGqa ??= VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, storage);
+                set.PrefillGqa ??= VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, storage, tq: tq);
         }
         if (_attentionQPos is not null && File.Exists(Path.Combine(spvDir, storage.ShaderName("attention_f32_qpos") + ".spv")))
         {
-            set.QPos ??= AttentionQueryPositionsKernel.Create(_device, spvDir, storage);
+            set.QPos ??= tq is { } lq ? AttentionQueryPositionsKernel.Create(_device, spvDir, lq) : AttentionQueryPositionsKernel.Create(_device, spvDir, storage);
             if (_attentionQPosTiled is not null)
-                set.QPosTiled ??= VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, storage, queryPositions: true);
+                set.QPosTiled ??= VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, storage, queryPositions: true, tq: tq);
         }
+    }
+
+    /// <summary>
+    /// Switches this model's <see cref="CreateKvCache(int)"/> to TurboQuant KV read in place (issue #1892): the cache holds only the packed
+    /// codes and one norm per head vector, every attention arm reads them through its <c>_kvtq</c> twin in code space, and the query /
+    /// output rotations run once per dispatch around the arm (<c>tq_rotate_q</c> before, <c>tq_rotate_o</c> after; for split-KV decode
+    /// after the combine pass). No decoded history exists in any format and nothing falls back to the dequant-scratch
+    /// <see cref="VulkanTurboQuantKvCache"/>, which is now a test oracle.
+    /// <para>Returns false, changing nothing, when this host or device cannot serve it: a host outside the dense chain
+    /// (<see cref="IsDenseF16KvEligible"/>) and Flint, a head dim that is not a power of two at most 256 (#1897), or a missing writer,
+    /// rotation or required twin (dense: the per-token kernel; Flint: split-KV decode, the GQA sink flash and the reference sink kernel).
+    /// The caller must then refuse the request at startup; there is no other TurboQuant path to take.</para>
+    /// <para>The codec constants come from the caller (<c>TurboQuantCodec</c>: <c>Centroids</c>, the K codec's and the V codec's
+    /// <c>RotationSigns</c>, <c>InvSqrtD</c>). QJL (<c>tq*q</c>) is not served here (step 5). Must not run while a forward is recording
+    /// (a call with another layout disposes the previous layout's twins).</para>
+    /// <para>One forward takes at most <c>65535 / numKvHeads</c> rows on a TurboQuant cache (the encode dispatches one workgroup per head
+    /// vector and the rotations one workgroup row per query row); a longer one throws, so prefill must be chunked.</para>
+    /// </summary>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="mseBits">Bits per coordinate (1..8).</param>
+    /// <param name="centroids">The <c>2^mseBits</c> centroids, already scaled by 1/sqrt(d).</param>
+    /// <param name="signsK">K rotation signs, <c>headDim</c> entries of +-1.</param>
+    /// <param name="signsV">V rotation signs (a different seed).</param>
+    /// <param name="invSqrtD">The codec's exact 1/sqrt(headDim).</param>
+    /// <param name="normFormat">Norm storage; null = <see cref="TurboQuantLayout.DefaultNorm"/> (F16).</param>
+    /// <returns>Whether in-place TurboQuant KV is now what <see cref="CreateKvCache(int)"/> makes.</returns>
+    public bool TryUseInPlaceTurboQuantKv(string spvDir, int mseBits,
+        ReadOnlySpan<float> centroids, ReadOnlySpan<float> signsK, ReadOnlySpan<float> signsV, float invSqrtD, TqNormFormat? normFormat = null)
+    {
+        bool flint = Config.Architecture == DotLLM.Core.Configuration.Architecture.Flint && _gptOss is not null;
+        if (!IsDenseF16KvEligible && !flint) return false;
+        if (Config.HasDistinctValueHeadDim) return false;   // one rotation dim for K and V
+        int headDim = Config.HeadDim;
+        if (headDim <= 0 || (headDim & (headDim - 1)) != 0 || headDim > TqRotateKernel.MaxHeadDim) return false;   // #1897
+        if (mseBits is < 1 or > 8) throw new ArgumentOutOfRangeException(nameof(mseBits));
+        if (centroids.Length != 1 << mseBits) throw new ArgumentException("centroids must have 2^mseBits entries.", nameof(centroids));
+        if (signsK.Length != headDim || signsV.Length != headDim) throw new ArgumentException("signs must have headDim entries.", nameof(signsK));
+        var layout = new TurboQuantLayout(headDim, Config.NumKvHeads, mseBits, normFormat ?? TurboQuantLayout.DefaultNorm);
+        if (layout.Norm == TqNormFormat.F32Reference)
+            throw new NotSupportedException("FP32 norms are a reference format (oracles, A/B measurement); a serving cache stores F16 or BF16 norms (CLAUDE.md precision rule 1).");
+        if (layout.Norm is not (TqNormFormat.F16 or TqNormFormat.Bf16)) return false;
+
+        var set = _kvTqSet;
+        if (set.Tq is { } built && built != layout) Fail();   // another layout: the twins are specialised for the old one; rebuilt below
+        set.Tq = layout;
+
+        // A refusal leaves no half-built TurboQuant state behind: no twins, no constants, and CreateKvCache back on the model's default.
+        bool Fail()
+        {
+            set.Dispose();
+            set.Tq = null;
+            _gptOss?.DisposeTurboQuantSinks();
+            _tqKv = null;
+            if (KvStorageOverride == VulkanKvStorage.Tq) KvStorageOverride = null;
+            return false;
+        }
+        try
+        {
+            if (flint)
+            {
+                // Every Flint layer has sinks: the writer, the split-KV decode twin, the GQA sink flash prefill twin and the reference sink
+                // kernel's twin cover its whole dispatch.
+                InitBlockKvKernels(spvDir, VulkanKvStorage.Tq);
+                if (Environment.GetEnvironmentVariable(SinkFlashEnvVar) != "0" && !IsFlashAttentionDisabled())
+                    set.SinkFlash ??= VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, VulkanKvStorage.Tq, sinks: true, splitQ: null, tq: layout);
+                if (!set.HasWriter || set.SplitKv is null || set.SinkFlash is null || !_gptOss!.TryEnsureTurboQuantSinks(_device, spvDir, layout))
+                    return Fail();
+            }
+            else
+            {
+                if (set.Attention is null) InitDenseBlockKvKernels(spvDir, VulkanKvStorage.Tq);
+                if (set.Attention is null || !set.HasWriter)
+                    return Fail();
+            }
+        }
+        catch (Exception e) when (e is FileNotFoundException or VulkanException)
+        {
+            return Fail();
+        }
+        catch
+        {
+            Fail();   // any other failure must not leave a half-built set with set.Tq = layout (#1892 review)
+            throw;
+        }
+        _tqKv = new TurboQuantKvConstants(layout, centroids.ToArray(), signsK.ToArray(), signsV.ToArray(), invSqrtD);
+        KvStorageOverride = VulkanKvStorage.Tq;
+        return true;
     }
 
     /// <summary>Environment variable: <c>0</c> disables in-place block KV (#1884) so q8_0 / q4_0 KV runs on the dequant-scratch cache (A/B only).</summary>
@@ -1601,11 +1806,21 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     private void InitBlockKvKernels(string spvDir, VulkanKvStorage storage)
     {
         var set = BlockSet(storage) ?? throw new ArgumentOutOfRangeException(nameof(storage));
-        set.Writer ??= VulkanKvQ8WriteKernel.Create(_device, spvDir, storage.KeyFormat());
-        if (storage.IsMixed()) set.ValueWriter ??= VulkanKvQ8WriteKernel.Create(_device, spvDir, storage.ValueFormat());
+        if (storage == VulkanKvStorage.Tq)
+        {
+            // #1892: the encoder writes codes + norms; the rotation kernel takes Q into K code space and the output back out of V code space.
+            if (set.Tq is null) throw new InvalidOperationException("The TurboQuant twin set has no layout yet.");
+            set.TqWriter ??= TurboQuantEncodeF32Kernel.Create(_device, spvDir);
+            set.TqRotate ??= TqRotateKernel.Create(_device, spvDir);
+        }
+        else
+        {
+            set.Writer ??= VulkanKvQ8WriteKernel.Create(_device, spvDir, storage.KeyFormat());
+            if (storage.IsMixed()) set.ValueWriter ??= VulkanKvQ8WriteKernel.Create(_device, spvDir, storage.ValueFormat());
+        }
         if (set.SplitKv is null && !IsSplitDecodeDisabled())
         {
-            set.SplitKv = VulkanSplitKvAttentionKernel.TryCreate(_device, spvDir, storage);
+            set.SplitKv = set.Tq is { } tq ? VulkanSplitKvAttentionKernel.TryCreate(_device, spvDir, tq) : VulkanSplitKvAttentionKernel.TryCreate(_device, spvDir, storage);
             set.SplitKv?.EnableGqaByDefault();
         }
     }
@@ -1757,6 +1972,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
             throw new NotSupportedException($"{Config.Architecture} has no F16-KV attention kernels on this Vulkan model (DOTLLM_VK_KV=f32, or an architecture without the audit, #1151).");
         if (compactSlidingWindows && !SupportsCompactSlidingKv)
             throw new NotSupportedException($"{Config.Architecture} on this Vulkan model reads cached rows by absolute position; it cannot take a compact sliding-window cache.");
+        if (storage == VulkanKvStorage.Tq)
+        {
+            // #1892: codes + norms only. Full-length rows on every layer (a compact sliding-window ring of codes is not built; windowed
+            // layers still attend only their window).
+            var c = _tqKv ?? throw new NotSupportedException("TurboQuant KV needs TryUseInPlaceTurboQuantKv (the codec constants) first.");
+            return new(_device, Config.NumLayers, maxSeqLen, c.Layout, c.Centroids, c.SignsK, c.SignsV, c.InvSqrtD);
+        }
         return new(_device, KvGeometry.FromConfig(Config, compactSlidingWindows), maxSeqLen, storage);
     }
 
@@ -3372,14 +3594,52 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         int positionOffset, int slidingWindow,
         float softCap = 0.0f, float scaleOverride = 0.0f,
         AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0,
-        VulkanDevice.Buffer? sinks = null)
+        VulkanDevice.Buffer? sinks = null, TqAttention? tq = null)
+    {
+        if ((_fwdKvStorage == VulkanKvStorage.Tq) != tq is not null)
+            throw new InvalidOperationException("TurboQuant KV and its attention operands go together (#1892): a TurboQuant cache is read only by its _kvtq twins.");
+        // TurboQuant (#1892): attention runs in code space. The query is rotated ONCE into K code space before the arm, and the output ONCE
+        // back out of V code space after it. Whatever the arm (split-KV decode included: its split and combine passes both stay in code
+        // space), the output rotation is recorded after the arm has finished, never per split.
+        RecordTqQueryRotation(cmdBuf, tq, q, seqQ, numHeads, headDim);
+        RecordAttentionArm(cmdBuf, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow,
+            softCap, scaleOverride, maskMode, prefixLen, sinks, tq?.Operands);
+        RecordTqOutputRotation(cmdBuf, tq, output, seqQ, numHeads, headDim);
+    }
+
+    /// <summary>Rotates the query rows in place into K code space, <c>q~ = H(S_k q)/sqrt(d)</c>; a no-op unless the cache is TurboQuant.</summary>
+    private void RecordTqQueryRotation(nint cmdBuf, TqAttention? tq, VulkanDevice.Buffer q, int rows, int numHeads, int headDim)
+    {
+        if (tq is not { } t) return;
+        BarrierComputeToCompute(cmdBuf);   // RoPE / the encode read Q's producers; the rotation writes Q
+        _kvTqSet.TqRotate!.RecordQuery(cmdBuf, q, rows, numHeads, headDim, t.SignsK);
+        BarrierComputeToCompute(cmdBuf);   // the arm reads the rotated Q
+    }
+
+    /// <summary>Rotates the attention output in place back out of V code space, <c>o = S_v H(a~)/sqrt(d)</c>; a no-op unless the cache is TurboQuant.</summary>
+    private void RecordTqOutputRotation(nint cmdBuf, TqAttention? tq, VulkanDevice.Buffer output, int rows, int numHeads, int headDim)
+    {
+        if (tq is not { } t) return;
+        BarrierComputeToCompute(cmdBuf);   // the arm's last pass (the split-KV combine included) wrote the output
+        _kvTqSet.TqRotate!.RecordOutput(cmdBuf, output, rows, numHeads, headDim, t.SignsV);
+        TurboQuantAttentionCount++;
+    }
+
+    private void RecordAttentionArm(
+        nint cmdBuf,
+        VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+        int positionOffset, int slidingWindow,
+        float softCap, float scaleOverride,
+        AttentionMaskMode maskMode, int prefixLen,
+        VulkanDevice.Buffer? sinks, TqKvOperands? tq)
     {
         AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "Vulkan");
 
         // F16 / Q8_0 KV: the sink kernels (Flint, #1171) and the dense non-sink chain (#1151, F16 only) have KV twins; anything without one would
         // misread the stored rows as floats, so it refuses instead.
         bool kvF16 = _fwdKvStorage == VulkanKvStorage.F16;
-        var blk = BlockSet(_fwdKvStorage);   // Q8_0 / Q4_0 twins (#1884); null for F32 / F16
+        var blk = BlockSet(_fwdKvStorage);   // Q8_0 / Q4_0 / TurboQuant twins (#1884, #1892); null for F32 / F16
         bool sinkLayer = sinks is not null && _gptOss is not null && !_gptOssDbg.NoSinks;
         if (blk is not null && !sinkLayer && blk.Attention is null)
             throw new NotSupportedException($"{_fwdKvStorage} KV is wired only for sink attention (Flint) and the dense Llama/Mistral/Qwen/Phi chain (#1884); this layer has neither.");
@@ -3420,11 +3680,12 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 if (VulkanSplitKvAttentionKernel.WouldSplit(seqKv - kvStart, numHeads))
                 {
                     GptOssSinkSplitDispatchCount++;
+                    if (tq is not null) TurboQuantSplitKvCount++;
                     splitKvSink.Record(cmdBuf, q, k, v, output,
                         seqQ: seqQ, seqKv: seqKv, numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                         positionOffset: positionOffset, slidingWindow: slidingWindow,
                         softCap: 0.0f, scaleOverride: scaleOverride,
-                        interPassStamp: DpAttnSplitStamp, sinks: sinks, kvStart: kvStart);
+                        interPassStamp: DpAttnSplitStamp, sinks: sinks, kvStart: kvStart, tq: tq);
                     return;
                 }
             }
@@ -3435,13 +3696,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 SinkFlashDispatchCount++;
                 ProfNote("attn_flash_sink", seqQ, seqKv, numHeads);
                 sinkFlash.Record(cmdBuf, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
-                    positionOffset: positionOffset, slidingWindow: slidingWindow, scaleOverride: scaleOverride, sinks: sinks);
+                    positionOffset: positionOffset, slidingWindow: slidingWindow, scaleOverride: scaleOverride, sinks: sinks, tq: tq);
                 return;
             }
 
             _gptOss.RecordAttentionSinks(cmdBuf, q, k, v, output, sinks,
                 seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow, scaleOverride,
-                _fwdKvStorage);
+                _fwdKvStorage, tq);
             return;
         }
 
@@ -3457,13 +3718,14 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
         {
+            if (tq is not null) TurboQuantSplitKvCount++;
             splitKvSink.Record(cmdBuf, q, k, v, output,
                 seqQ: seqQ, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: slidingWindow,
                 softCap: softCap, scaleOverride: scaleOverride,
                 maskMode: maskMode, prefixLen: prefixLen,
-                interPassStamp: DpAttnSplitStamp);
+                interPassStamp: DpAttnSplitStamp, tq: tq);
             return;
         }
         // Prefill (seqQ > 1): prefer the cooperative-matrix FA kernel (issue
@@ -3475,7 +3737,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
             ProfNote("attn_flash_gqa", seqQ, seqKv, numHeads);
             gqa.Record(cmdBuf, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
                 positionOffset: positionOffset, slidingWindow: slidingWindow,
-                softCap: softCap, scaleOverride: scaleOverride, maskMode: maskMode, prefixLen: prefixLen);
+                softCap: softCap, scaleOverride: scaleOverride, maskMode: maskMode, prefixLen: prefixLen, tq: tq);
             return;
         }
         if (coopmatAttn is not null && seqQ > 1
@@ -3487,7 +3749,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: slidingWindow,
                 softCap: softCap, scaleOverride: scaleOverride,
-                maskMode: maskMode, prefixLen: prefixLen);
+                maskMode: maskMode, prefixLen: prefixLen, tq: tq);
             return;
         }
         if (flashAttn is not null && seqQ > 1 && headDim <= flashAttn.SupportedMaxHeadDim)
@@ -3498,7 +3760,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: slidingWindow,
                 softCap: softCap, scaleOverride: scaleOverride,
-                maskMode: maskMode, prefixLen: prefixLen);
+                maskMode: maskMode, prefixLen: prefixLen, tq: tq);
             return;
         }
         if (seqQ > 1) ProfNote("attn_naive", seqQ, seqKv, numHeads);
@@ -3507,7 +3769,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
             numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
             positionOffset: positionOffset, slidingWindow: slidingWindow,
             softCap: softCap, scaleOverride: scaleOverride,
-            maskMode: maskMode, prefixLen: prefixLen);
+            maskMode: maskMode, prefixLen: prefixLen, tq: tq);
     }
 
     /// <summary>
@@ -4619,10 +4881,19 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
             throw new NotSupportedException(
                 "An F16 VulkanKvCache needs the F16-KV attention kernels, which only sink-attention models (Flint) and the dense Llama/Mistral/Qwen/Phi "
                 + "hosts create (DOTLLM_VK_KV=f32 turns them off); use CreateKvCache.");
-        if (BlockSet(_fwdKvStorage) is { } fwdSet && (fwdSet.Writer is null
+        if (BlockSet(_fwdKvStorage) is { } fwdSet && (!fwdSet.HasWriter
                 || (fwdSet.Attention is null && (_gptOss is null || fwdSet.SplitKv is null || fwdSet.SinkFlash is null))))
             throw new NotSupportedException(
-                "A Q8_0 VulkanKvCache needs the Q8_0-KV writer, split-KV and coopmat sink-flash kernels (Flint, DOTLLM_VK_KV=q8_0 at model creation; the _kvq8 SPIR-V and coopmat are required); use CreateKvCache.");
+                $"A {_fwdKvStorage} VulkanKvCache needs this model's {_fwdKvStorage}-KV writer and attention twins (dense chain: the per-token twin; Flint: split-KV and coopmat sink flash); use CreateKvCache after TryUseInPlaceQuantizedKv / TryUseInPlaceTurboQuantKv.");
+        if (_fwdKvStorage == VulkanKvStorage.Tq && ((VulkanKvCache)kvCache!).TurboQuantLayout != _kvTqSet.Tq)
+            throw new NotSupportedException("This TurboQuant KV cache was made for another layout than the model's twins are specialised for (#1892).");
+        // The encode dispatches one workgroup per head vector (rows x numKvHeads on X) and the Q / O rotations one workgroup row per query
+        // row (Y): both are bounded by the 65535 workgroups Vulkan guarantees per dimension. Refuse rather than record a dispatch the
+        // device may clip.
+        if (_fwdKvStorage == VulkanKvStorage.Tq && seqLen > MaxTurboQuantRowsPerForward(Config.NumAttentionHeads, Config.NumKvHeads))
+            throw new NotSupportedException(
+                $"A TurboQuant KV forward takes at most {MaxTurboQuantRowsPerForward(Config.NumAttentionHeads, Config.NumKvHeads)} rows on this model " +
+                $"({Config.NumAttentionHeads} heads, {Config.NumKvHeads} KV heads); got {seqLen}. Chunk the prefill.");
 
         DpBegin(seqLen);
 
@@ -5002,7 +5273,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                     // RoPE writes K; attention (via the cache buffers) reads K.
                     // Barrier the RoPE → KV copy, then the KV copy → attention. (The F32 copy path adds its own COMPUTE→TRANSFER barrier.)
                     BarrierComputeToCompute(cmdBuf);
-                    vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer, _kvF16Writer, _state.PositionsBuffer, BlockSet(vkCache.Storage)?.Writer, BlockSet(vkCache.Storage)?.ValueWriter);
+                    vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer, _kvF16Writer, _state.PositionsBuffer, BlockSet(vkCache.Storage)?.Writer, BlockSet(vkCache.Storage)?.ValueWriter,
+                        BlockSet(vkCache.Storage)?.TqWriter);
                     // F32 rows are copied (transfer); F16, Q8_0 and Q4_0 rows are written by a compute dispatch. Q4_0 once took the transfer barrier
                     // here (#1884): attention then raced the quantiser and the logits changed run to run.
                     if (vkCache.Storage != VulkanKvStorage.F32) BarrierComputeToCompute(cmdBuf);
@@ -5080,21 +5352,24 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 // Selective recompute (#1531): query rows at arbitrary positions (non-contiguous, or a run inside an already-filled
                 // cache). The flash / coopmat kernels derive each row's position as positionOffset + row and assert a tight span.
                 AttentionQueryPositionsCount++;
+                var tqQPos = TqAttentionOf(qposCache, layer);
+                RecordTqQueryRotation(cmdBuf, tqQPos, _state.Q, seqLen, numHeads, headDim);
                 if (TiledQueryPositionAttentionEnabled && QPosTiledKernelFor(qposCache.Storage) is { } tiled && tiled.CanDispatch(headDim, numHeads, numKvHeads))
                 {
                     ProfNote("attn_qpos_tiled", seqLen, seqKv, numHeads);
                     AttentionQueryPositionsTiledCount++;
                     tiled.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput, seqLen, seqKv, numHeads, numKvHeads, headDim,
                         slidingWindow: layerSlidingWindow, softCap: attnSoftCap, scaleOverride: attnScaleOverride,
-                        queryPositions: _state.PositionsBuffer);
+                        queryPositions: _state.PositionsBuffer, tq: tqQPos?.Operands);
                 }
                 else
                 {
                 ProfNote("attn_qpos", seqLen, seqKv, numHeads);
                 QPosKernelFor(qposCache.Storage)!.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput, _state.PositionsBuffer,
                     seqQ: seqLen, seqKv: seqKv, numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
-                    slidingWindow: layerSlidingWindow, softCap: attnSoftCap, scaleOverride: attnScaleOverride);
+                    slidingWindow: layerSlidingWindow, softCap: attnSoftCap, scaleOverride: attnScaleOverride, tq: tqQPos?.Operands);
                 }
+                RecordTqOutputRotation(cmdBuf, tqQPos, _state.AttnOutput, seqLen, numHeads, headDim);
             }
             else
             RecordAttention(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
@@ -5102,7 +5377,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: layerSlidingWindow,
                 softCap: attnSoftCap, scaleOverride: attnScaleOverride,
-                sinks: lw.AttnSinks);
+                sinks: lw.AttnSinks, tq: TqAttentionOf(kvCache, layer));
             // Query-relevance probe (#1531 step 4): reads the post-RoPE Q and the cache's K the attention just read; own buffers, no model state.
             if (_relevanceProbe is not null && kvCache is VulkanKvCache { HasCompactWindows: false } probeCache && probeCache.Storage == _relevanceProbe.KvStorage)
                 _relevanceProbe.RecordLayer(cmdBuf, _state.Q, kSrc, vSrc, _state.PositionsBuffer, seqLen, numHeads, numKvHeads, headDim,
@@ -6036,6 +6311,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         _kvQ4Set.Invalidate();
         _kvQ8Q4Set.Invalidate();
         _kvQ4Q8Set.Invalidate();
+        _kvTqSet.Invalidate();
         _rowPow2Downscale?.InvalidateDescriptorCache();
         _moeScatterResidual?.InvalidateDescriptorCache();
         _rowScaleMul?.InvalidateDescriptorCache();
@@ -10362,6 +10638,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
     /// <inheritdoc/>
     public void Dispose()
     {
+        if (_disposedModel) return;   // idempotent: a refusal path and a finally may both dispose (#1892)
+        _disposedModel = true;
         _gumbelHostDrawer?.Dispose();
         // Drop the device-side LoRA cache before tearing down the device —
         // each VulkanLoraAdapter owns VkBuffers that must be freed before
@@ -10563,6 +10841,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         _kvQ4Set.Dispose();
         _kvQ8Q4Set.Dispose();
         _kvQ4Q8Set.Dispose();
+        _kvTqSet.Dispose();
         _rowPow2Downscale?.Dispose();
         _moeScatterResidual?.Dispose();
         _rowScaleMul?.Dispose();

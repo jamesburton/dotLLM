@@ -40,6 +40,8 @@ public sealed class CudaTurboQuantKvCache : IKvCache, IPerLayerKvCache
     private readonly int _mseBits;
     private readonly int _codeUintsPerVec;
     private readonly float _invSqrtD;
+    private readonly TqNormFormat _normFormat;
+    private readonly int _normBytes;
     private int _currentLength;
     private bool _disposed;
 
@@ -51,16 +53,25 @@ public sealed class CudaTurboQuantKvCache : IKvCache, IPerLayerKvCache
     public int LayerCount => _numLayers;
     /// <inheritdoc/>
     public int KvStrideOf(int layerIndex) => _stride;
+    /// <summary>Storage format of the per-head-vector norms.</summary>
+    public TqNormFormat NormFormat => _normFormat;
+    /// <summary>Uints per head-vector in the code store.</summary>
+    public int CodeUintsPerVec => _codeUintsPerVec;
 
     /// <summary>
     /// Creates a uniform-geometry CUDA TurboQuant KV cache on the current context. The caller supplies
     /// the codec constants: <paramref name="centroids"/> (length 2^mseBits, scaled by 1/√d), per-K/V
-    /// RHT signs (length headDim, ±1), and <paramref name="invSqrtD"/>.
+    /// RHT signs (length headDim, ±1), and <paramref name="invSqrtD"/>. Norms are stored in <paramref name="normFormat"/>
+    /// (default <see cref="TurboQuantLayout.DefaultNorm"/>; F32Reference, F16 and Bf16 are supported on the GPU).
     /// </summary>
     public unsafe CudaTurboQuantKvCache(
         int numLayers, int numKvHeads, int headDim, int maxSeqLen, int mseBits,
-        ReadOnlySpan<float> centroids, ReadOnlySpan<float> signsK, ReadOnlySpan<float> signsV, float invSqrtD)
+        ReadOnlySpan<float> centroids, ReadOnlySpan<float> signsK, ReadOnlySpan<float> signsV, float invSqrtD,
+        TqNormFormat? normFormat = null)
     {
+        TqNormFormat fmt = normFormat ?? TurboQuantLayout.DefaultNorm;
+        if (fmt is not (TqNormFormat.F32Reference or TqNormFormat.F16 or TqNormFormat.Bf16))
+            throw new NotSupportedException($"CUDA TurboQuant KV cache supports F32Reference, F16 and Bf16 norms; got {fmt}.");
         if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
         if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
         if (headDim <= 0 || (headDim & (headDim - 1)) != 0 || headDim > 256)
@@ -77,12 +88,14 @@ public sealed class CudaTurboQuantKvCache : IKvCache, IPerLayerKvCache
         _maxSeqLen = maxSeqLen;
         _mseBits = mseBits;
         _invSqrtD = invSqrtD;
+        _normFormat = fmt;
+        _normBytes = new TurboQuantLayout(headDim, numKvHeads, mseBits, fmt).NormBytes;
 
         int codeBytes = (headDim * mseBits + 7) / 8;
         _codeUintsPerVec = (codeBytes + 3) / 4;
         long codeUintsPerLayer = (long)maxSeqLen * numKvHeads * _codeUintsPerVec + 1; // +1 dequant guard
         nuint codeBytesPerLayer = (nuint)(codeUintsPerLayer * sizeof(uint));
-        nuint normBytesPerLayer = (nuint)((long)maxSeqLen * numKvHeads * sizeof(float));
+        nuint normBytesPerLayer = (nuint)(((long)maxSeqLen * numKvHeads * _normBytes + 3) / 4 * 4);
         nuint scratchBytes = (nuint)((long)maxSeqLen * _stride * sizeof(ushort)); // half
 
         // #1848: admitted against free VRAM before anything is allocated (WDDM spills an over-commit into shared memory).
@@ -128,9 +141,9 @@ public sealed class CudaTurboQuantKvCache : IKvCache, IPerLayerKvCache
         int startPos = ValidateContiguous(positions, seqLen);
         int levelCount = 1 << _mseBits;
         kernels.LaunchTurboQuantEncodeF16(keysDevice, _centroids, _signsK, _keyCodes[layerIndex], _keyNorms[layerIndex],
-            seqLen, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, levelCount, startPos, _invSqrtD, stream);
+            seqLen, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, levelCount, startPos, _invSqrtD, stream, _normFormat);
         kernels.LaunchTurboQuantEncodeF16(valuesDevice, _centroids, _signsV, _valueCodes[layerIndex], _valueNorms[layerIndex],
-            seqLen, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, levelCount, startPos, _invSqrtD, stream);
+            seqLen, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, levelCount, startPos, _invSqrtD, stream, _normFormat);
         int newLength = startPos + seqLen;
         if (newLength > _currentLength) _currentLength = newLength;
     }
@@ -141,10 +154,25 @@ public sealed class CudaTurboQuantKvCache : IKvCache, IPerLayerKvCache
     {
         int numVectors = _currentLength * _numKvHeads;
         kernels.LaunchTurboQuantDequantF16(_keyCodes[layerIndex], _keyNorms[layerIndex], _centroids, _signsK, _kScratch,
-            numVectors, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, _invSqrtD, stream);
+            numVectors, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, _invSqrtD, stream, _normFormat);
         kernels.LaunchTurboQuantDequantF16(_valueCodes[layerIndex], _valueNorms[layerIndex], _centroids, _signsV, _vScratch,
-            numVectors, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, _invSqrtD, stream);
+            numVectors, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, _invSqrtD, stream, _normFormat);
         return (_kScratch, _vScratch);
+    }
+
+    /// <summary>Downloads the raw stored code words of a layer (test helper). Each head-vector occupies
+    /// <see cref="CodeUintsPerVec"/> uints (zero-padded). The caller synchronises the stream first.</summary>
+    public unsafe void DownloadCodeUints(int layerIndex, bool values, Span<uint> destination)
+    {
+        fixed (uint* p = destination)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, (values ? _valueCodes : _keyCodes)[layerIndex], (nuint)(destination.Length * sizeof(uint))).ThrowOnError();
+    }
+
+    /// <summary>Downloads the raw stored norm bytes of a layer, in <see cref="NormFormat"/> (test helper).</summary>
+    public unsafe void DownloadNormBytes(int layerIndex, bool values, Span<byte> destination)
+    {
+        fixed (byte* p = destination)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, (values ? _valueNorms : _keyNorms)[layerIndex], (nuint)destination.Length).ThrowOnError();
     }
 
     private int ValidateContiguous(ReadOnlySpan<int> positions, int seqLen)

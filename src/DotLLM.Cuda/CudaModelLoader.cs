@@ -219,19 +219,20 @@ public static class CudaModelLoader
     /// <param name="igpuProbe">Finds an iGPU for the tail under auto; null for none.</param>
     /// <param name="log">Informational messages (the auto placement line).</param>
     /// <param name="prefillChunkTokens">The <c>--prefill-chunk-size</c> value (0 = the split default) auto plans its scratch for.</param>
+    /// <param name="kv">The requested KV storage; auto plans a TurboQuant cache's real bytes (#1892). Null = F16.</param>
     /// <returns>The model and its KV-cache factory.</returns>
     public static (IModel Model, Func<int, IKvCache>? KvCacheFactory) CreateForGpuLayers(
         GgufFile gguf, ModelConfig config, int requestedGpuLayers, int deviceId,
         ThreadingConfig threading, Action<string>? warn, MoeOffloadOptions? moeOffload,
-        Func<IgpuTier?>? igpuProbe, Action<string>? log, int prefillChunkTokens = 0)
+        Func<IgpuTier?>? igpuProbe, Action<string>? log, int prefillChunkTokens = 0, KvCacheConfig? kv = null)
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
 
         if (GpuOffloadPlanner.IsAuto(requestedGpuLayers))
         {
-            var (m, kv, _) = CudaAutoSplit.Load(gguf, config, deviceId, threading, moeOffload, igpuProbe, log ?? warn, prefillChunkTokens);
-            return (m, kv);
+            var (m, splitKv, _) = CudaAutoSplit.Load(gguf, config, deviceId, threading, moeOffload, igpuProbe, log ?? warn, prefillChunkTokens, kv);
+            return (m, splitKv);
         }
 
         var plan = GpuOffloadPlanner.Plan(config.Architecture, requestedGpuLayers, config.NumLayers);

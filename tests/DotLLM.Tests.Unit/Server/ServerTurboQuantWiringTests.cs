@@ -1,3 +1,4 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
@@ -29,17 +30,34 @@ public sealed class ServerTurboQuantWiringTests : IClassFixture<PrefixCacheFaile
     };
 
     [Fact]
-    public void Tq4_NoPaged_BuildsTurboQuantKvCache()
+    public void Tq4_NoPaged_BuildsTheInPlaceCache()
     {
+        // #1892: the MSE stage is read in place (codes + norms), no longer the dequant-scratch TurboQuantKvCache.
         using var state = ServerStartup.LoadModel(_tiny.GgufPath, Options("tq4", "tq4", paged: false));
         using var cache = state.KvCacheFactory!(_tiny.Config, 32);
-        var tq = Assert.IsType<TurboQuantKvCache>(cache);
-        Assert.Equal(4, tq.Bits);
-        Assert.False(tq.UseQjl);
+        var tq = Assert.IsType<TurboQuantInPlaceKvCache>(cache);
+        Assert.Equal(KvCacheDType.TurboQuant, tq.KeyDType);
+        Assert.Equal(0, tq.WindowCapacity);
+    }
+
+    [Theory]
+    [InlineData("tq2")]
+    [InlineData("tq3")]
+    [InlineData("tq8")]
+    public void TqBits_ReachTheInPlaceCache(string flag)
+    {
+        // run / chat / bench used to drop the bit width at parse time: the cache must carry the width that was asked for.
+        int bits = int.Parse(flag[2..]);
+        using var state = ServerStartup.LoadModel(_tiny.GgufPath, Options(flag, flag, paged: false));
+        Assert.Equal(bits, state.KvCacheConfig.TurboQuantBits);
+        using var cache = state.KvCacheFactory!(_tiny.Config, 32);
+        var layout = new DotLLM.Core.Attention.TurboQuantLayout(_tiny.Config.HeadDim, _tiny.Config.NumKvHeads, bits, DotLLM.Core.Attention.TurboQuantLayout.DefaultNorm);
+        long expected = (long)DotLLM.Core.Attention.KvGeometry.SlotCount(_tiny.Config) * 2 * (layout.CodeBytesPerLayer(32) + layout.NormBytesPerLayer(32));
+        Assert.Equal(expected, Assert.IsType<TurboQuantInPlaceKvCache>(cache).AllocatedBytes);
     }
 
     [Fact]
-    public void Tq4q_NoPaged_BuildsQjlCache()
+    public void Tq4q_NoPaged_StaysOnTheScratchQjlCache_UntilStep5()
     {
         using var state = ServerStartup.LoadModel(_tiny.GgufPath, Options("tq4q", "tq4q", paged: false));
         using var cache = state.KvCacheFactory!(_tiny.Config, 32);
@@ -78,11 +96,31 @@ public sealed class ServerTurboQuantWiringTests : IClassFixture<PrefixCacheFaile
     [Theory]
     [InlineData("vulkan")]
     [InlineData("cuda")]
-    public void Tq4_GpuDevice_RefusesBeforeLoad(string device)
+    public void Tq4_GpuDevice_IsNoLongerRefusedBeforeLoad(string device)
+        => Assert.Null(ServerStartup.PreLoadTurboQuantRefusal(Options("tq4", "tq4", paged: false, device), _tiny.Config));
+
+    [Theory]
+    [InlineData("vulkan")]
+    [InlineData("cuda")]
+    public void Tq4q_GpuDevice_RefusesBeforeLoad_CitingStep5(string device)
     {
-        string? reason = ServerStartup.PreLoadTurboQuantRefusal(Options("tq4", "tq4", paged: false, device), _tiny.Config);
+        string? reason = ServerStartup.PreLoadTurboQuantRefusal(Options("tq4q", "tq4q", paged: false, device), _tiny.Config);
         Assert.NotNull(reason);
+        Assert.Contains("#1894", reason);
         Assert.Contains(device, reason);
+    }
+
+    [Fact]
+    public void CacheWindow_WithTq_Refuses()
+    {
+        // ServerOptions has no --cache-window; run and chat do, and refuse before anything loads (see CliTurboQuantRefusalTests). Here the
+        // shared parse carries the window into the same resolver the server uses.
+        var kv = TurboQuantKv.Parse("tq4", "tq4", cacheWindow: 64, out _);
+        Assert.Equal(64, kv.MixedPrecisionWindowSize);
+        string? reason = TurboQuantKv.PreLoadRefusal(kv, null, KvCommand.Serve, KvBackendKind.Cpu, paged: false, _tiny.Config, hasDraftModel: false);
+        Assert.Contains("--cache-window 64", reason);
+        // ...and after the load, so the CPU window guard in ExecuteQuantizedCore is never what a user meets.
+        Assert.Contains("--cache-window 64", TurboQuantKv.PostLoadRefusal(kv, null, KvCommand.Serve, paged: false, _tiny.Config, _tiny.Model, false, false));
     }
 
     [Fact]
@@ -128,10 +166,10 @@ public sealed class ServerTurboQuantPostLoadTests : IClassFixture<PrefixCacheFai
         => Assert.Null(ServerStartup.PostLoadTurboQuantRefusal(Tq4(), _tiny.Config, _tiny.Model));
 
     [Fact]
-    public void OtherCpuHost_Refuses()
+    public void OtherCpuHost_Refuses_CitingTheHostGap()
     {
         string? reason = ServerStartup.PostLoadTurboQuantRefusal(Tq4(), _tiny.Config, new OtherCpuModel(_tiny.Config, mtp: false));
-        Assert.Contains("CPU model", reason);
+        Assert.Contains("#1900", reason);
     }
 
     [Fact]
@@ -150,11 +188,10 @@ public sealed class ServerTurboQuantPostLoadTests : IClassFixture<PrefixCacheFai
 }
 
 /// <summary>
-/// #1888 Review Focus 1, <b>step 1 only</b>: GPUs have no in-place TurboQuant kernels until #1887 step 2, so while that holds a tq request
-/// that <c>--device auto</c> lands on a GPU must be refused - not served f16 as before, and not quietly moved to the CPU.
-/// <b>Step 2 inverts this test</b>: auto on a GPU must then build the GPU TurboQuant cache. Auto loads each candidate as an explicit device, so the pre-load pass refuses the GPU candidate before its weights load and the refusal
-/// reaches the user (measured on gfx1151: "trying vulkan:0", then the refusal, no CPU attempt). The post-load backend rule is a backstop
-/// this test cannot isolate. Needs a GPU, so it runs under the GPU lock.
+/// #1888 Review Focus 1, inverted by #1892: with in-place TurboQuant on the GPUs, a tq request that <c>--device auto</c> lands on a GPU must
+/// build that GPU's TurboQuant cache - not refuse (step 1), not serve f16, and not quietly move to the CPU. Whatever backend auto lands on, the
+/// cache is that backend's in-place type: <c>VulkanKvCache</c> in TurboQuant storage on Vulkan, <c>CudaTurboQuantInPlaceKvCache</c> on CUDA,
+/// <c>TurboQuantInPlaceKvCache</c> on the CPU. Needs a GPU, so it runs under the GPU lock (Strix: Vulkan; framework: CUDA).
 /// </summary>
 [Trait("Category", "GPU")]
 public sealed class ServerTurboQuantAutoDeviceTests : IClassFixture<PrefixCacheFailedRequestTests.TinyQwen>
@@ -163,27 +200,30 @@ public sealed class ServerTurboQuantAutoDeviceTests : IClassFixture<PrefixCacheF
     public ServerTurboQuantAutoDeviceTests(PrefixCacheFailedRequestTests.TinyQwen tiny) => _tiny = tiny;
 
     [Fact]
-    public void Tq4_DeviceAuto_RunsOnlyWhereTurboQuantIsReal()
+    public void Tq4_DeviceAuto_BuildsTheInPlaceCacheOfWhicheverBackendItLandsOn()
     {
         var options = new ServerOptions
         {
-            Model = _tiny.GgufPath, ModelId = "tiny-1888-auto", Device = "auto", UsePaged = false, Warmup = WarmupOptions.Disabled,
+            Model = _tiny.GgufPath, ModelId = "tiny-1892-auto", Device = "auto", UsePaged = false, Warmup = WarmupOptions.Disabled,
             CacheTypeK = "tq4", CacheTypeV = "tq4",
         };
-        ServerState state;
-        try { state = ServerStartup.LoadModel(_tiny.GgufPath, options); }
-        catch (InvalidServerOptionException e)
+        using var state = ServerStartup.LoadModel(_tiny.GgufPath, options);   // no refusal: the GPU runs it
+        var backend = TurboQuantKvSupport.BackendOf(state.Model!);
+        using var cache = state.KvCacheFactory!(_tiny.Config, 32);
+        switch (backend)
         {
-            // Landed on a GPU: refused, naming the backend.
-            Assert.Matches("(?i)vulkan|cuda|hip", e.Message);
-            return;
+            case KvBackendKind.Vulkan:
+                var vk = Assert.IsType<DotLLM.Vulkan.VulkanKvCache>(cache);
+                Assert.Equal(DotLLM.Vulkan.VulkanKvStorage.Tq, vk.Storage);
+                break;
+            case KvBackendKind.Cuda:
+                Assert.IsType<DotLLM.Cuda.CudaTurboQuantInPlaceKvCache>(cache);
+                break;
+            default:
+                Assert.Equal(KvBackendKind.Cpu, backend);
+                Assert.IsType<TurboQuantInPlaceKvCache>(cache);
+                break;
         }
-        using (state)
-        {
-            // Landed on the CPU: the real path, on the CPU model.
-            Assert.Equal(KvBackendKind.Cpu, TurboQuantKvSupport.BackendOf(state.Model!));
-            using var cache = state.KvCacheFactory!(_tiny.Config, 32);
-            Assert.IsType<TurboQuantKvCache>(cache);
-        }
+        Console.WriteLine($"auto landed on {backend}: {cache.GetType().Name}");
     }
 }

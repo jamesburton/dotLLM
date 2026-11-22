@@ -72,6 +72,14 @@ public sealed unsafe class TurboQuantKvCacheTests
         finally { FreeKv(k, v); }
     }
 
+    // What the cache's default (F16) norm storage reads back for an encode-time norm.
+    private static float StoredF16(float norm)
+    {
+        Span<byte> b = stackalloc byte[2];
+        TurboQuantNormCodec.Encode(DotLLM.Core.Attention.TqNormFormat.F16, new ReadOnlySpan<float>(in norm), b);
+        return TurboQuantNormCodec.Decode(DotLLM.Core.Attention.TqNormFormat.F16, b, 0);
+    }
+
     [Fact]
     public void Dequant_MatchesStandaloneCodec_ForAHead()
     {
@@ -96,7 +104,7 @@ public sealed unsafe class TurboQuantKvCacheTests
                 for (int h = 0; h < NumKvHeads; h++)
                 {
                     var src = new ReadOnlySpan<float>((float*)k[pos] + h * HeadDim, HeadDim);
-                    float norm = codecK.Encode(src, codes);
+                    float norm = StoredF16(codecK.Encode(src, codes)); // the cache stores the norm in F16 (#1892)
                     codecK.Decode(codes, norm, expected);
                     for (int d = 0; d < HeadDim; d++)
                         Assert.Equal(expected[d], kOut[pos * Stride + h * HeadDim + d], 5);
@@ -179,7 +187,7 @@ public sealed unsafe class TurboQuantKvCacheTests
                 for (int h = 0; h < NumKvHeads; h++)
                 {
                     var src = new ReadOnlySpan<float>((float*)k[pos] + h * HeadDim, HeadDim);
-                    float norm = codecK.Encode(src, codes);
+                    float norm = StoredF16(codecK.Encode(src, codes)); // the cache stores the norm in F16 (#1892)
                     codecK.Decode(codes, norm, expected);
                     for (int d = 0; d < HeadDim; d++)
                         Assert.Equal(expected[d], kOut[pos * Stride + h * HeadDim + d], 5);

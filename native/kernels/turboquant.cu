@@ -5,7 +5,12 @@
 //   codes: headDim packed indices of `mseBits` bits each, LSB-first within a vector, coord i at
 //          bit offset i*mseBits; tightly packed across head-vectors at a uint-aligned stride
 //          codeUintsPerVec = ceil((headDim*mseBits + 7)/8 / 4) uints per vector.
-//   norm:  one fp32 L2 norm per head-vector.
+//   norm:  one L2 norm per head-vector in the cache's norm format (0 = F32, 1 = F16, 2 = BF16).
+//
+// BYTE-EXACT ENCODE (#1892): the norm is a fixed pairwise tree over the 256 lanes (lane t = x_t^2, then
+// l[t] += l[t+r], r = d/2..1), sqrt/div are IEEE (default -prec-sqrt/-prec-div) and the file is built with
+// -fmad=false, so normalise / rotate / distance never contract to FMA. Ties between two centroids pick the
+// LOWER index (strict `<` ascending scan). These match TurboQuantCodec (CPU) and the Vulkan shader.
 // Decode:  x[i]=centroids[code_i]; x=WalshHadamard(x); x[i]*=invSqrtD*signs[i]*norm.
 // Encode:  norm; unit=x/norm; s=(1/sqrt d) H (D unit); code_i=argmin_j |s_i - centroids[j]|; pack.
 // centroids[] (already scaled by 1/sqrt d), signs[] (+/-1) and invSqrtD are codec constants.
@@ -19,15 +24,41 @@
 
 #define TQ_MAX_HEADDIM 256
 
+// ── Norm storage (#1892): 0 = F32 reference, 1 = F16, 2 = BF16 — the formats of TurboQuantNormCodec ──
+// Encode saturates to the format's max finite value (never Inf), round-to-nearest-even, exactly as the
+// shared C# codec does, so the stored bytes are identical across backends.
+__device__ __forceinline__ float tq_load_norm(const void* norms, const int fmt, const int i)
+{
+    if (fmt == 0) return ((const float*)norms)[i];
+    const unsigned short h = ((const unsigned short*)norms)[i];
+    if (fmt == 1) return __half2float(__ushort_as_half(h));
+    return __uint_as_float(((unsigned)h) << 16);
+}
+
+__device__ __forceinline__ void tq_store_norm(void* norms, const int fmt, const int i, const float norm)
+{
+    if (fmt == 0) { ((float*)norms)[i] = norm; return; }
+    if (fmt == 1)
+    {
+        ((unsigned short*)norms)[i] = __half_as_ushort(__float2half_rn(fminf(norm, 65504.0f)));
+        return;
+    }
+    unsigned bits = __float_as_uint(fminf(norm, __uint_as_float(0x7F7F0000u)));
+    bits += 0x7FFFu + ((bits >> 16) & 1u);
+    unsigned h = bits >> 16;
+    if (h > 0x7F7Fu) h = 0x7F7Fu;
+    ((unsigned short*)norms)[i] = (unsigned short)h;
+}
+
 // ── Dequant: codes -> fp32 scratch ──────────────────────────────────────────
 extern "C" __global__ void __launch_bounds__(256) turboquant_dequant_f32(
     const uint32_t* __restrict__ codes,
-    const float*    __restrict__ norms,
+    const void*     __restrict__ norms,
     const float*    __restrict__ centroids,
     const float*    __restrict__ signs,
     float*          __restrict__ dst,
     const int numVectors, const int headDim, const int numKvHeads,
-    const int mseBits, const int codeUintsPerVec, const float invSqrtD)
+    const int mseBits, const int codeUintsPerVec, const float invSqrtD, const int normFormat)
 {
     __shared__ float s[TQ_MAX_HEADDIM];
 
@@ -69,7 +100,7 @@ extern "C" __global__ void __launch_bounds__(256) turboquant_dequant_f32(
     // 3. inverse rotation + rescale by the stored norm.
     if (live)
     {
-        const float outv = s[t] * invSqrtD * signs[t] * norms[hv];
+        const float outv = s[t] * invSqrtD * signs[t] * tq_load_norm(norms, normFormat, hv);
         const int pos    = hv / numKvHeads;
         const int h      = hv - pos * numKvHeads;
         const int stride = numKvHeads * d;
@@ -86,9 +117,9 @@ extern "C" __global__ void __launch_bounds__(256) turboquant_encode_f32(
     const float* __restrict__ centroids,
     const float* __restrict__ signs,
     uint32_t*    __restrict__ codes,
-    float*       __restrict__ norms,
+    void*        __restrict__ norms,
     const int headDim, const int numKvHeads, const int mseBits, const int codeUintsPerVec,
-    const int levelCount, const int startPos, const float invSqrtD)
+    const int levelCount, const int startPos, const float invSqrtD, const int normFormat)
 {
     __shared__ float sh[TQ_MAX_HEADDIM];
     __shared__ unsigned idx[TQ_MAX_HEADDIM];
@@ -166,7 +197,7 @@ extern "C" __global__ void __launch_bounds__(256) turboquant_encode_f32(
         codes[vecBaseUint + t] = word;
     }
 
-    if (t == 0) norms[vecHv] = norm;
+    if (t == 0) tq_store_norm(norms, normFormat, (int)vecHv, norm);
 }
 
 // ── FP16 variants for the CUDA forward (K/V activations + attention scratch are half) ──────────
@@ -175,12 +206,12 @@ extern "C" __global__ void __launch_bounds__(256) turboquant_encode_f32(
 
 extern "C" __global__ void __launch_bounds__(256) turboquant_dequant_f16(
     const uint32_t* __restrict__ codes,
-    const float*    __restrict__ norms,
+    const void*     __restrict__ norms,
     const float*    __restrict__ centroids,
     const float*    __restrict__ signs,
     half*           __restrict__ dst,
     const int numVectors, const int headDim, const int numKvHeads,
-    const int mseBits, const int codeUintsPerVec, const float invSqrtD)
+    const int mseBits, const int codeUintsPerVec, const float invSqrtD, const int normFormat)
 {
     __shared__ float s[TQ_MAX_HEADDIM];
     const int hv = blockIdx.x;
@@ -209,7 +240,7 @@ extern "C" __global__ void __launch_bounds__(256) turboquant_dequant_f16(
     }
     if (live)
     {
-        const float outv = s[t] * invSqrtD * signs[t] * norms[hv];
+        const float outv = s[t] * invSqrtD * signs[t] * tq_load_norm(norms, normFormat, hv);
         const int pos    = hv / numKvHeads;
         const int h      = hv - pos * numKvHeads;
         const int stride = numKvHeads * d;
@@ -222,9 +253,9 @@ extern "C" __global__ void __launch_bounds__(256) turboquant_encode_f16(
     const float* __restrict__ centroids,
     const float* __restrict__ signs,
     uint32_t*    __restrict__ codes,
-    float*       __restrict__ norms,
+    void*        __restrict__ norms,
     const int headDim, const int numKvHeads, const int mseBits, const int codeUintsPerVec,
-    const int levelCount, const int startPos, const float invSqrtD)
+    const int levelCount, const int startPos, const float invSqrtD, const int normFormat)
 {
     __shared__ float sh[TQ_MAX_HEADDIM];
     __shared__ unsigned idx[TQ_MAX_HEADDIM];
@@ -281,5 +312,5 @@ extern "C" __global__ void __launch_bounds__(256) turboquant_encode_f16(
         }
         codes[vecBaseUint + t] = word;
     }
-    if (t == 0) norms[vecHv] = norm;
+    if (t == 0) tq_store_norm(norms, normFormat, (int)vecHv, norm);
 }

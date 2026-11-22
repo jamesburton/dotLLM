@@ -1,0 +1,43 @@
+#version 450
+// TurboQuant attention-output rotation back OUT of V code space (#1892 step 2), in place:
+//   o = S_v . H(a~) / sqrt(d)      a~ = code-space accumulation sum_j p_j * norm_j * centroid[code_j]
+// Same operation order as TurboQuantCodec.InverseRotate (unnormalised Walsh-Hadamard, then x invSqrtD * sign).
+//
+// Dispatch: one workgroup per (row, head) = (numHeads, rows, 1); local_size_x = 256, one thread per coordinate (threads with
+// t >= headDim stay live but idle so every invocation reaches each barrier()). headDim is a power of two <= 256.
+// o is F32 [rows, numHeads, headDim]; signs is the V-side +/-1 F32 vector (seed ^ 0xD1B54A32D192ED03).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufO { float o[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BufSign { float signs[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint headDim;
+    uint numHeads;
+    float invSqrtD;   // 1/sqrt(headDim), the codec's exact constant
+} pc;
+
+shared float s[256];
+
+void main() {
+    uint t    = gl_LocalInvocationID.x;
+    uint d    = pc.headDim;
+    bool live = t < d;
+    uint off  = (gl_WorkGroupID.y * pc.numHeads + gl_WorkGroupID.x) * d;
+
+    if (live) s[t] = o[off + t];
+    barrier();
+
+    for (uint len = 1u; len < d; len <<= 1u) {
+        if (live && (t & len) == 0u) {
+            float u = s[t];
+            float v = s[t + len];
+            s[t]       = u + v;
+            s[t + len] = u - v;
+        }
+        barrier();
+    }
+
+    if (live) o[off + t] = s[t] * (pc.invSqrtD * signs[t]);
+}

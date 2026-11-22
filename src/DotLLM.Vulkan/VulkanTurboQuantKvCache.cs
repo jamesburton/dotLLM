@@ -50,6 +50,8 @@ public sealed class VulkanTurboQuantKvCache : IKvCache, IPerLayerKvCache
     private readonly int _mseBits;
     private readonly int _codeUintsPerVec;
     private readonly float _invSqrtD;
+    private readonly TqNormFormat _normFormat;
+    private readonly int _normBytes;
     private int _currentLength;
     private bool _disposed;
 
@@ -63,27 +65,32 @@ public sealed class VulkanTurboQuantKvCache : IKvCache, IPerLayerKvCache
     public int KvStrideOf(int layerIndex) => _stride;
     /// <summary>MSE bits per coordinate.</summary>
     public int MseBits => _mseBits;
+    /// <summary>Storage format of the per-head-vector norms.</summary>
+    public TqNormFormat NormFormat => _normFormat;
 
     /// <summary>Permanent compressed store bytes (codes + norms; excludes the shared scratch).</summary>
     public long AllocatedBytes =>
         (long)_numLayers * 2 * ((long)_maxSeqLen * _numKvHeads * _codeUintsPerVec * sizeof(uint)
-                                + (long)_maxSeqLen * _numKvHeads * sizeof(float));
+                                + TurboQuantEncodeF32Kernel.NormBufferBytes((long)_maxSeqLen * _numKvHeads, _normFormat));
 
     /// <summary>
     /// Creates a uniform-geometry TurboQuant KV cache. The caller supplies the codec constants:
     /// <paramref name="centroids"/> (length <c>2^mseBits</c>, scaled by 1/√d), the per-coordinate
     /// RHT sign sets for keys/values (length <c>headDim</c>, ±1), <paramref name="invSqrtD"/>, and the
     /// MSE bit-width. Kernels are created from <paramref name="spvDir"/> and owned by this cache.
+    /// Norms are stored in <paramref name="normFormat"/> (default <see cref="TurboQuantLayout.DefaultNorm"/>; F32Reference,
+    /// F16 and Bf16 are supported on the GPU).
     /// </summary>
     public VulkanTurboQuantKvCache(
         VulkanDevice device, string spvDir,
         int numLayers, int numKvHeads, int headDim, int maxSeqLen, int mseBits,
-        ReadOnlySpan<float> centroids, ReadOnlySpan<float> signsK, ReadOnlySpan<float> signsV, float invSqrtD)
+        ReadOnlySpan<float> centroids, ReadOnlySpan<float> signsK, ReadOnlySpan<float> signsV, float invSqrtD,
+        TqNormFormat? normFormat = null)
         : this(device,
                TurboQuantEncodeF32Kernel.Create(device, spvDir),
                TurboQuantDequantF32Kernel.Create(device, spvDir),
                ownsKernels: true,
-               numLayers, numKvHeads, headDim, maxSeqLen, mseBits, centroids, signsK, signsV, invSqrtD)
+               numLayers, numKvHeads, headDim, maxSeqLen, mseBits, centroids, signsK, signsV, invSqrtD, normFormat)
     {
     }
 
@@ -92,8 +99,12 @@ public sealed class VulkanTurboQuantKvCache : IKvCache, IPerLayerKvCache
     public VulkanTurboQuantKvCache(
         VulkanDevice device, TurboQuantEncodeF32Kernel encode, TurboQuantDequantF32Kernel dequant, bool ownsKernels,
         int numLayers, int numKvHeads, int headDim, int maxSeqLen, int mseBits,
-        ReadOnlySpan<float> centroids, ReadOnlySpan<float> signsK, ReadOnlySpan<float> signsV, float invSqrtD)
+        ReadOnlySpan<float> centroids, ReadOnlySpan<float> signsK, ReadOnlySpan<float> signsV, float invSqrtD,
+        TqNormFormat? normFormat = null)
     {
+        TqNormFormat fmt = normFormat ?? TurboQuantLayout.DefaultNorm;
+        if (fmt is not (TqNormFormat.F32Reference or TqNormFormat.F16 or TqNormFormat.Bf16))
+            throw new NotSupportedException($"Vulkan TurboQuant KV cache supports F32Reference, F16 and Bf16 norms; got {fmt}.");
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(encode);
         ArgumentNullException.ThrowIfNull(dequant);
@@ -117,13 +128,15 @@ public sealed class VulkanTurboQuantKvCache : IKvCache, IPerLayerKvCache
         _maxSeqLen = maxSeqLen;
         _mseBits = mseBits;
         _invSqrtD = invSqrtD;
+        _normFormat = fmt;
+        _normBytes = new TurboQuantLayout(headDim, numKvHeads, mseBits, fmt).NormBytes;
 
         int codeBytes = (headDim * mseBits + 7) / 8;
         _codeUintsPerVec = (codeBytes + 3) / 4;
 
         // +1 guard uint per layer for the dequant straddle read of the final coordinate.
         long codeUintsPerLayer = (long)maxSeqLen * numKvHeads * _codeUintsPerVec + 1;
-        long normsPerLayer = (long)maxSeqLen * numKvHeads;
+        long normBufBytes = TurboQuantEncodeF32Kernel.NormBufferBytes((long)maxSeqLen * numKvHeads, fmt);
         long scratchFloats = (long)maxSeqLen * _stride;
 
         _keyCodes = new VulkanDevice.Buffer[numLayers];
@@ -134,8 +147,8 @@ public sealed class VulkanTurboQuantKvCache : IKvCache, IPerLayerKvCache
         {
             _keyCodes[i] = device.Allocate(codeUintsPerLayer * sizeof(uint));
             _valueCodes[i] = device.Allocate(codeUintsPerLayer * sizeof(uint));
-            _keyNorms[i] = device.Allocate(normsPerLayer * sizeof(float));
-            _valueNorms[i] = device.Allocate(normsPerLayer * sizeof(float));
+            _keyNorms[i] = device.Allocate(normBufBytes);
+            _valueNorms[i] = device.Allocate(normBufBytes);
         }
         _kScratch = device.Allocate(scratchFloats * sizeof(float));
         _vScratch = device.Allocate(scratchFloats * sizeof(float));
@@ -161,9 +174,9 @@ public sealed class VulkanTurboQuantKvCache : IKvCache, IPerLayerKvCache
     {
         int startPos = ValidateContiguous(positions, seqLen);
         _encode.Record(cmdBuf, kDev, _centroids, _signsK, _keyCodes[layerIndex], _keyNorms[layerIndex],
-                       seqLen, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, startPos, _invSqrtD);
+                       seqLen, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, startPos, _invSqrtD, _normFormat);
         _encode.Record(cmdBuf, vDev, _centroids, _signsV, _valueCodes[layerIndex], _valueNorms[layerIndex],
-                       seqLen, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, startPos, _invSqrtD);
+                       seqLen, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, startPos, _invSqrtD, _normFormat);
         int newLength = startPos + seqLen;
         if (newLength > _currentLength) _currentLength = newLength;
     }
@@ -174,9 +187,9 @@ public sealed class VulkanTurboQuantKvCache : IKvCache, IPerLayerKvCache
     {
         int numVectors = _currentLength * _numKvHeads;
         _dequant.Record(cmdBuf, _keyCodes[layerIndex], _keyNorms[layerIndex], _centroids, _signsK, _kScratch,
-                        numVectors, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, _invSqrtD);
+                        numVectors, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, _invSqrtD, _normFormat);
         _dequant.Record(cmdBuf, _valueCodes[layerIndex], _valueNorms[layerIndex], _centroids, _signsV, _vScratch,
-                        numVectors, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, _invSqrtD);
+                        numVectors, _headDim, _numKvHeads, _mseBits, _codeUintsPerVec, _invSqrtD, _normFormat);
     }
 
     /// <summary>Synchronous encode of device K/V for one layer (one-shot submit). For tests / non-pipelined use.</summary>
@@ -211,6 +224,26 @@ public sealed class VulkanTurboQuantKvCache : IKvCache, IPerLayerKvCache
         DequantSync(layerIndex);
         _device.Download(_vScratch, destination[..(_currentLength * _stride)]);
     }
+
+    /// <summary>Downloads the raw stored code words for a layer (test helper). Each head-vector occupies
+    /// <see cref="CodeUintsPerVec"/> uints (zero-padded).</summary>
+    public void DownloadCodeUints(int layerIndex, bool values, Span<uint> destination)
+        => DownloadRaw((values ? _valueCodes : _keyCodes)[layerIndex],
+                       System.Runtime.InteropServices.MemoryMarshal.AsBytes(destination));
+
+    /// <summary>Downloads the raw stored norm bytes for a layer, in <see cref="NormFormat"/> (test helper).</summary>
+    public void DownloadNormBytes(int layerIndex, bool values, Span<byte> destination)
+        => DownloadRaw((values ? _valueNorms : _keyNorms)[layerIndex], destination);
+
+    private void DownloadRaw(VulkanDevice.Buffer buf, Span<byte> destination)
+    {
+        var tmp = new float[(destination.Length + 3) / 4];
+        _device.Download(buf, tmp.AsSpan());
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(tmp.AsSpan())[..destination.Length].CopyTo(destination);
+    }
+
+    /// <summary>Uints per head-vector in the code store.</summary>
+    public int CodeUintsPerVec => _codeUintsPerVec;
 
     private int ValidateContiguous(ReadOnlySpan<int> positions, int seqLen)
     {

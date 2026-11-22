@@ -430,9 +430,10 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             DeviceCli.PrintError(kvFlagError!, settings.Json);
             return 1;
         }
-        // #1888: TurboQuant KV does not run in 'run' until #1887 step 2; never serve it with another cache.
+        // #1888, #1892: a TurboQuant request runs in place or is refused here (before anything loads) or after the load; never another cache.
         if (DotLLM.Cli.Helpers.KvStorageCli.TurboQuantRefusal(DotLLM.Server.KvCommand.Run,
-                settings.KvQuantK ?? settings.CacheTypeK, settings.KvQuantV ?? settings.CacheTypeV) is { } tqRefusal)
+                settings.KvQuantK ?? settings.CacheTypeK, settings.KvQuantV ?? settings.CacheTypeV,
+                settings.CacheWindow, settings.Paged, settings.Device, hasDraftModel: !string.IsNullOrEmpty(settings.SpeculativeModel)) is { } tqRefusal)
         {
             DeviceCli.PrintError(tqRefusal, settings.Json);
             return 1;
@@ -499,7 +500,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             DotLLM.Server.DeviceLoadResult loaded;
             (loaded, deviceOutcome) = DeviceCli.Load(gguf, config, settings.Device, settings.GpuLayers,
                 new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
-                resolvedPath, MoeOffloadCli.Build(settings.MoeValues), settings.PrefillChunkSize);
+                resolvedPath, MoeOffloadCli.Build(settings.MoeValues), settings.PrefillChunkSize,
+                DotLLM.Cli.Helpers.KvStorageCli.BuildKvConfig(kvStorageRequest, settings.CacheWindow, out _) is { IsTurboQuantAny: true } planKv ? planKv : null);
             model = loaded.Model;
             if (DotLLM.Cli.Helpers.TensorOverlayCli.TryVerifyApplied(gguf) is { } notApplied)
             {
@@ -775,13 +777,26 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             if (!settings.Json)
                 Console.Write(tools is { Length: > 0 } ? "" : prompt);
 
-            var kvConfig = new KvCacheConfig(
-                kvStorageRequest.Key ?? KvCacheDType.F32,
-                kvStorageRequest.Value ?? KvCacheDType.F32,
-                settings.CacheWindow);
+            var kvConfig = DotLLM.Cli.Helpers.KvStorageCli.BuildKvConfig(kvStorageRequest, settings.CacheWindow, out string? tqMismatch);
 
             Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
-            if (vulkanKv is not null)
+            if (kvConfig.IsTurboQuantAny)
+            {
+                // #1892: first, so no branch below can take it (IsQuantized excludes TurboQuant): the same in-place cache serve builds.
+                string? tqPostRefusal = DotLLM.Server.TurboQuantKv.PostLoadRefusal(kvConfig, tqMismatch, DotLLM.Server.KvCommand.Run, settings.Paged,
+                    config, model, hasDraftModel: !string.IsNullOrEmpty(settings.SpeculativeModel),
+                    mtpWillAttach: string.IsNullOrEmpty(settings.SpeculativeModel) && !settings.NoMtp && model.SupportsMtp);
+                if (tqPostRefusal is not null)
+                {
+                    DeviceCli.PrintError(tqPostRefusal, settings.Json);
+                    return 1;   // the finally below disposes the model: a second Dispose here tore GPU models down twice
+                }
+                if (!settings.Json)
+                    AnsiConsole.MarkupLine($"[dim]KV cache: TurboQuant {kvConfig.TurboQuantBits}-bit" +
+                        (kvConfig.TurboQuantUseQjl ? " with QJL (dequant-scratch CPU path)" : ", read in place in code space") + "[/]");
+                kvFactory = DotLLM.Server.TurboQuantKv.CreateFactory(model, kvConfig);
+            }
+            else if (vulkanKv is not null)
             {
                 if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel
                     && !vkModel.TryUseInPlaceQuantizedKv(kvConfig.KeyDType, kvConfig.ValueDType, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()))
@@ -1010,6 +1025,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 kvCacheBytes = hybridKv.Value.Bytes;
             else if (timings.KvCacheBytes > 0)
                 kvCacheBytes = timings.KvCacheBytes;
+            else if (kvConfig.IsTurboQuantAny)
+                kvCacheBytes = DotLLM.Core.Attention.TurboQuantInPlaceSupport.KvBytesPerToken(config, kvConfig) * cacheSize;   // codes + norms, not F16 (#1892)
             else if (kvConfig.IsQuantized)
                 kvCacheBytes = ComputeQuantizedKvBytes(config, cacheSize, kvConfig);
             else
@@ -1137,6 +1154,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 bodyLines.Add(new Markup(MemLine("Compute", computeBytes, null)));
                 string kvLabel = hybridKv is not null
                     ? $"({cacheSize} slots, {hybridKv.Value.Text})"
+                    : kvConfig.IsTurboQuantAny
+                        ? $"({cacheSize} slots, tq{kvConfig.TurboQuantBits})"
                     : kvConfig.IsQuantized
                         ? $"({cacheSize} slots, K:{kvConfig.KeyDType} V:{kvConfig.ValueDType})"
                         : $"({cacheSize} slots)";
