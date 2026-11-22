@@ -85,14 +85,7 @@ public sealed partial class TextGenerator
             int ceiling = maxContextTokens > 0 ? maxContextTokens : modelMax;
             kv = AllocateKvCache(size);
             if (recurrent) _model.ResetSequenceState();   // a previous request left model-owned state behind
-            IDecodingConstraint? initial = options.ResponseFormat switch
-            {
-                ResponseFormat.JsonObject => new JsonConstraint(_tokenizer),
-                ResponseFormat.JsonSchema js => new JsonSchemaConstraint(_tokenizer, js.Schema),
-                ResponseFormat.Regex rx => RegexConstraint.Create(_tokenizer, rx.Pattern),
-                ResponseFormat.Grammar gr => new GrammarConstraint(_tokenizer, gr.GbnfGrammar),
-                _ => null
-            };
+            IDecodingConstraint? initial = CreateResponseConstraint(options.ResponseFormat);
             return new GenerationSession(this, options, provenanceTag, currentProvenance, kv, ceiling,
                 checkpointBudgetBytes > 0 ? checkpointBudgetBytes : GenerationSession.DefaultCheckpointBudgetBytes, initial);
         }

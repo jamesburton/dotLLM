@@ -440,14 +440,7 @@ public sealed partial class TextGenerator
         List<TokenLogprobInfo>? logprobsList = captureLogprobs ? new List<TokenLogprobInfo>(maxTokens) : null;
 
         // Build decoding constraint for structured output
-        IDecodingConstraint? constraint = options.ResponseFormat switch
-        {
-            ResponseFormat.JsonObject => new JsonConstraint(_tokenizer),
-            ResponseFormat.JsonSchema js => new JsonSchemaConstraint(_tokenizer, js.Schema),
-            ResponseFormat.Regex rx => RegexConstraint.Create(_tokenizer, rx.Pattern),
-            ResponseFormat.Grammar gr => new GrammarConstraint(_tokenizer, gr.GbnfGrammar),
-            _ => null
-        };
+        IDecodingConstraint? constraint = CreateResponseConstraint(options.ResponseFormat);
 
         // Build stop conditions — use explicit list if provided, otherwise default set
         List<IStopCondition> stopConditions;
@@ -1082,14 +1075,7 @@ public sealed partial class TextGenerator
         int topLogprobs = Math.Clamp(options.TopLogprobs, 0, 20);
 
         // Build decoding constraint for structured output
-        IDecodingConstraint? constraint = options.ResponseFormat switch
-        {
-            ResponseFormat.JsonObject => new JsonConstraint(_tokenizer),
-            ResponseFormat.JsonSchema js => new JsonSchemaConstraint(_tokenizer, js.Schema),
-            ResponseFormat.Regex rx => RegexConstraint.Create(_tokenizer, rx.Pattern),
-            ResponseFormat.Grammar gr => new GrammarConstraint(_tokenizer, gr.GbnfGrammar),
-            _ => null
-        };
+        IDecodingConstraint? constraint = CreateResponseConstraint(options.ResponseFormat);
 
         // Build stop conditions
         List<IStopCondition> stopConditions;
@@ -2409,8 +2395,21 @@ public sealed partial class TextGenerator
     public MtpAdaptiveGate? MtpGate => _mtpGate;
 
     /// <summary>
-    /// True when <paramref name="constraint"/> is satisfied and permits no token except EOS, i.e. the next forward pass
-    /// could only sample EOS. Cheap (a popcount over the cached mask) and only evaluated once the constraint reports
+    /// The one factory mapping a <see cref="ResponseFormat"/> to its decoding constraint (null for none / Text), shared by
+    /// <c>Generate</c>, <c>GenerateStreaming</c> and <see cref="GenerationSession"/> so the formats cannot drift.
+    /// </summary>
+    internal IDecodingConstraint? CreateResponseConstraint(ResponseFormat? format) => format switch
+    {
+        ResponseFormat.JsonObject => new JsonConstraint(_tokenizer),
+        ResponseFormat.JsonSchema js => new JsonSchemaConstraint(_tokenizer, js.Schema),
+        ResponseFormat.Regex rx => RegexConstraint.Create(_tokenizer, rx.Pattern),
+        ResponseFormat.Grammar gr => new GrammarConstraint(_tokenizer, gr.GbnfGrammar),
+        _ => null
+    };
+
+    /// <summary>
+    /// True when <paramref name="constraint"/> is satisfied and permits no token except end-of-generation tokens (EOS and the other EOG ids), i.e. the next forward pass
+    /// could only sample an EOG token. Cheap (a popcount over the cached mask) and only evaluated once the constraint reports
     /// completion.
     /// </summary>
     internal bool ConstraintIsTerminal(DotLLM.Core.Constraints.IDecodingConstraint? constraint)
@@ -2423,9 +2422,11 @@ public sealed partial class TextGenerator
         foreach (long word in mask.AsSpan())
             allowed += System.Numerics.BitOperations.PopCount((ulong)word);
 
-        int eos = _tokenizer.EosTokenId;
-        if (eos >= 0 && eos < _model.Config.VocabSize && mask.IsAllowed(eos))
-            allowed--;
+        // Every end-of-generation id (EOS, end-of-turn, ...) is a stop, not content: discount each allowed one.
+        int vocab = _model.Config.VocabSize;
+        foreach (int eog in EndOfGenerationTokens.Resolve(_tokenizer))
+            if (eog >= 0 && eog < vocab && mask.IsAllowed(eog))
+                allowed--;
         return allowed <= 0;
     }
 
