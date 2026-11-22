@@ -58,24 +58,50 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
     /// <summary>Loads <paramref name="modelPath"/> and starts a server on a free loopback port.</summary>
     /// <param name="modelPath">The synthetic GGUF.</param>
     /// <param name="chunkCache">The chunk-cache options (flag on or off, store).</param>
-    /// <param name="paged">True: the default paged KV with the scheduler, which <c>ServerStartup</c> gives the cross-request
-    /// prefix trie (#1596); false: the single-slot prefix cache.</param>
+    /// <param name="paged">True: the default paged KV with the scheduler; false: the single-slot prefix cache.</param>
+    /// <param name="schedulerTrie">
+    /// Paged only: keep the cross-request prefix trie that <c>ServerStartup</c> gives the scheduler (the serving default since
+    /// #1596). False (the default here) rebuilds the scheduler without it: a chunk the trie serves is reported
+    /// <c>prefix</c>, never <c>hit</c>, so tests of the chunk store need it out of the way; the neutrality tests ask for it.
+    /// </param>
     /// <param name="configure">Runs on the app before the endpoints are mapped (test middleware: a remote address, the rate limiter).</param>
     /// <param name="logs">Receives the host's <c>ILogger</c> output (every level).</param>
+    /// <param name="device">The serving device (<c>cpu</c> by default; GPU-gated tests pass <c>vulkan</c>).</param>
     public static async Task<ChunkCacheTestServer> StartAsync(string modelPath, ChunkCacheOptions chunkCache, bool paged = true,
-        Action<WebApplication>? configure = null, Microsoft.Extensions.Logging.ILoggerProvider? logs = null)
+        bool schedulerTrie = false, Action<WebApplication>? configure = null, Microsoft.Extensions.Logging.ILoggerProvider? logs = null,
+        string device = "cpu")
     {
         var options = new ServerOptions
         {
             Model = modelPath,
             ModelId = "tiny",
-            Device = "cpu",
+            Device = device,
             Threads = 1,
             UsePaged = paged,
             ChunkCache = chunkCache,
             Metrics = true,
+            // Since #1596 the Vulkan single-request path gets a device PrefixCache that would serve a repeated chunk as `prefix`, not `miss`/`hit`.
+            PromptCacheEnabled = device != "vulkan",
         };
         var state = ServerStartup.LoadModel(modelPath, options);
+        state.ChunkCacheRuntime.StoreFiguresTtl = TimeSpan.Zero; // tests read the store figures right after changing the store
+        if (schedulerTrie)
+        {
+            Assert.True(paged && state.Scheduler is not null && state.PrefixTrieManager is not null && state.PagedFactory is not null);
+            state.Scheduler!.Dispose();
+            state.Scheduler = new DotLLM.Engine.Scheduler.ContinuousBatchSchedulerService(state.Model!, state.Tokenizer!, state.KvCacheFactory!,
+                ServerStartup.ResolveSchedulerOptions(state.Options), state.PagedFactory!.Pool, state.PrefixTrieManager,
+                registerTelemetryProviders: false);
+        }
+        else if (paged && state.Scheduler is not null && state.PagedFactory is not null)
+        {
+            // Since #1596 the server wires the prefix trie into the scheduler by default, so an identical leading chunk is served from the
+            // trie (reported as `prefix`, not `hit`). These tests exercise the chunk store with no trie unless they opt in via schedulerTrie.
+            state.Scheduler.Dispose();
+            state.Scheduler = new DotLLM.Engine.Scheduler.ContinuousBatchSchedulerService(state.Model!, state.Tokenizer!, state.KvCacheFactory!,
+                ServerStartup.ResolveSchedulerOptions(state.Options), state.PagedFactory.Pool, prefixCache: null,
+                registerTelemetryProviders: false);
+        }
         var builder = WebApplication.CreateSlimBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Services.AddDotLLM(state);
@@ -88,6 +114,8 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
         configure?.Invoke(app);
         app.MapDotLLMEndpoints(serveUi: false);
         await app.StartAsync();
+        if (state.ChunkCacheRuntime.Writer is { } writer)
+            writer.Queue.QuietPeriod = TimeSpan.Zero; // tests drain at once; the quiet period has its own tests
         state.StartSchedulerLoop(); // as ServerStartup does once the host runs (paged: the scheduler serves every request)
         return new ChunkCacheTestServer(app, state, new HttpClient { BaseAddress = new Uri(app.Urls.First()), Timeout = TimeSpan.FromMinutes(2) });
     }

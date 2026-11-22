@@ -398,8 +398,15 @@ why; it is never served by another cache (#1888).
   with `-fmad=false` and no fast-math.
 
 **Twins per backend.**
-- CPU: `Attention.Execute` over `ITurboQuantKvCache`, decoding `norm * centroid[code]` one row at a time into a small per-worker row
-  scratch (never the history). `TurboQuantRotation` rotates Q and O.
+- CPU: `Attention.ExecuteTurboQuant` over `ITurboQuantKvCache`, decoding `norm * centroid[code]` (never the history). Decode (one query row)
+  reads one head vector at a time into a per-worker row scratch. Multi-row prefill (`seqQ >= 2`) is flash-style (#1892): 128 query rows at
+  a time, key tiles outer, each K/V tile decoded ONCE into a bounded per-worker tile ring and reused by every row and every head of the
+  GQA group (without it each KV row was decoded once per query row: prefill 12 tok/s vs 37 for the scratch cache on Qwen3-4B tq4 at 7.6K;
+  now 68). Per row the tiles, dots and online softmax are those of the per-row path, so the output is bit-identical (#530). The ring is
+  `2 * TileSize * headDim * 4` bytes per worker (256 KiB at hd 128; 512 KiB with a sliding window, where a row's tile can straddle two grid
+  chunks) and never scales with the cached length. It is a thread-static native buffer, a deliberate bounded exception to deterministic
+  disposal: reused across layers and calls (no hot-path allocation), freed by a finalizer at thread exit, and freed deterministically by
+  `Attention.TrimTurboQuantTileBuffers(pool)`, which `TransformerModel.Dispose` calls. `TurboQuantRotation` rotates Q and O.
 - CUDA (dense, non-paged `CudaTransformerModel`): scalar code-space attention `attention_kvtq` (sinks, sliding window, any GQA
   ratio, head dims up to 256); tensor-core flash prefill `_hd64_tqtq` and `_hd128_tqtq` in `attention_flash_mma_prefill_kvq` (hd256
   uses the scalar body); `tq_rotate_q` / `tq_rotate_o` (and `tq_rotate_o_f16`, which keeps the attention output F16).

@@ -4856,6 +4856,13 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// The in-place TurboQuant kernels this host needs, all loaded: encode, the Q / O rotations and the code-space attention
     /// (#1892). Pure over the four flags so a test can drive each one.
     /// </summary>
+    /// <summary>
+    /// Whether this host's forward can run an in-place TurboQuant cache: not MLA (own latent cache), not the F32 Gemma-4 forward, and not
+    /// the F32 dense family (<c>ForwardGemmaF32</c>: Gemma 1/2, Olmo2, SmolLM3, non-fold Granite), which accepts only a <c>CudaKvCache</c> (#1892).
+    /// </summary>
+    internal static bool InPlaceTurboQuantHostServed(bool isMla, bool isGemma4, bool isGemmaFamily)
+        => !isMla && !isGemma4 && !isGemmaFamily;
+
     internal static bool InPlaceTurboQuantKernelsLoaded(bool encode, bool rotateQ, bool rotateO, bool attention)
         => encode && rotateQ && rotateO && attention;
 
@@ -4868,7 +4875,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// </remarks>
     public bool SupportsInPlaceTurboQuant(KvCacheConfig kv)
         => TurboQuantInPlaceSupport.Eligible(kv, Config)
-           && _weights.MlaLayers is null && !_isGemma4
+           && InPlaceTurboQuantHostServed(_weights.MlaLayers is not null, _isGemma4, _isGemmaFamily)
            && InPlaceTurboQuantKernelsLoaded(_kernels.TurboQuantF16Available, _kernels.TqRotateAvailable, _kernels.TqRotateOF16Available,
                _kernels.HasAttentionKvTq);
 
@@ -4878,6 +4885,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         if (kv.TurboQuantUseQjl) return "TurboQuant with QJL (tq*q) does not run on CUDA yet (#1894).";
         if (kv.MixedPrecisionWindowSize > 0) return "TurboQuant KV has no original-space window: drop --cache-window.";
         if (_weights.MlaLayers is not null) return "TurboQuant KV is not supported on CUDA MLA models: the MLA attention keeps its own cache (#1899, #1900).";
+        if (_isGemma4 || _isGemmaFamily) return "TurboQuant KV is not supported on this CUDA model's FP32 dense forward (Gemma family, Olmo2, SmolLM3, non-fold Granite): it accepts only the F16 cache (#1892, #1900).";
         if (!TurboQuantInPlaceSupport.Eligible(kv, Config))
             return $"TurboQuant KV needs a uniform KV width and a power-of-two head dim of at most {TurboQuantInPlaceSupport.MaxHeadDim} (#1897, #1898); this model has head dim {Config.HeadDim}.";
         return "In-place TurboQuant KV needs turboquant.ptx, turboquant_rotate.ptx and attention_kvtq.ptx; one is missing or stale (#1892).";

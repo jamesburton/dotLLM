@@ -12,6 +12,7 @@ namespace DotLLM.Tests.Unit.Cpu;
 /// <see cref="TurboQuantKvCache"/> (full-history decode into F32, then ordinary F32 attention) built with the same seed and
 /// norm format. K and V sign seeds differ by construction (V = seed ^ constant), so a swapped rotation cannot pass.
 /// </summary>
+[Collection(TurboQuantHistoryProbeCollection.Name)]   // the kernel hooks (tile-buffer observer, per-row switch) are process-wide statics
 public sealed unsafe class TurboQuantInPlaceAttentionTests
 {
     internal const ulong Seed = 0x5EEDC0DEUL;

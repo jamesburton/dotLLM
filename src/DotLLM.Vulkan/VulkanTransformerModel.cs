@@ -1697,6 +1697,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         {
             set.Dispose();
             set.Tq = null;
+            _gptOss?.DisposeTurboQuantSinks();
             _tqKv = null;
             if (KvStorageOverride == VulkanKvStorage.Tq) KvStorageOverride = null;
             return false;
@@ -1723,6 +1724,11 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         catch (Exception e) when (e is FileNotFoundException or VulkanException)
         {
             return Fail();
+        }
+        catch
+        {
+            Fail();   // any other failure must not leave a half-built set with set.Tq = layout (#1892 review)
+            throw;
         }
         _tqKv = new TurboQuantKvConstants(layout, centroids.ToArray(), signsK.ToArray(), signsV.ToArray(), invSqrtD);
         KvStorageOverride = VulkanKvStorage.Tq;

@@ -142,7 +142,8 @@ public sealed record StatusReport(IReadOnlyList<FileStatus> Files, int TotalChun
 /// <b>Concurrency.</b> An instance is not thread-safe. Across processes, <see cref="Save"/> replaces the file with one
 /// rename, so a reader (<see cref="Load"/>, <see cref="OpenForRead"/>) sees either the old or the new file, never a mix.
 /// Readers share the file for read, write and delete; on Windows a rename over an open file is still refused, so Save retries
-/// for up to two seconds (a Load holds the file for milliseconds) and then throws, leaving the old file intact. Two writers
+/// for up to two seconds (a Load holds the file for milliseconds) and then throws, leaving the old file intact; on Linux and
+/// macOS the rename replaces the file under an open reader at once (the reader keeps the old file). Two writers
 /// do not merge: the last rename wins and the other's update is lost, so writers serialise on the index lock.
 /// </para>
 /// <para>
@@ -172,7 +173,8 @@ public sealed record StatusReport(IReadOnlyList<FileStatus> Files, int TotalChun
 /// <para>
 /// <b>Platforms.</b> Verified on Windows (NTFS): an exclusive handle refuses every other open, readers included, and the OS
 /// closes a killed holder's handle. On Linux and macOS .NET emulates <see cref="FileShare.None"/> with an advisory
-/// <c>flock</c>, which other .NET processes honour and the kernel releases on process exit, but this is not verified here, does
+/// <c>flock</c>, which other .NET processes honour and the kernel releases on process exit (verified on Linux by the unit tests,
+/// including a killed holder process), but it does
 /// not bind non-.NET programs, and is disabled by <c>DOTNET_SYSTEM_IO_DISABLEFILELOCKING</c>; network file systems are not
 /// supported.
 /// </para>
@@ -676,43 +678,95 @@ public sealed partial class ChunkIndex
         return IndexKeysUnder(storeRoot, null);
     }
 
+    /// <summary>
+    /// The index files (<c>index-*.json</c>) directly under <paramref name="storeRoot"/>, as full paths (empty when the root
+    /// does not exist). Every such file counts as an index for eviction, whatever its name form.
+    /// </summary>
+    /// <param name="storeRoot">The store directory.</param>
+    /// <returns>The paths, in ordinal order.</returns>
+    public static IReadOnlyList<string> IndexFilesUnder(string storeRoot)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(storeRoot);
+        string root = Path.GetFullPath(storeRoot);
+        if (!Directory.Exists(root)) return [];
+        return Directory.EnumerateFiles(root, IndexFilePrefix + "*" + IndexFileSuffix, SearchOption.TopDirectoryOnly)
+            .Where(f => f.EndsWith(IndexFileSuffix, StringComparison.OrdinalIgnoreCase))
+            .Order(StringComparer.Ordinal).ToList();
+    }
+
+    /// <summary>
+    /// The keys one index file references (no producer check: any index file protects its keys). A file removed meanwhile
+    /// references nothing.
+    /// </summary>
+    /// <param name="indexPath">An index file.</param>
+    /// <returns>The keys.</returns>
+    /// <exception cref="InvalidDataException">The file cannot be read or parsed (conservative: no guess).</exception>
+    public static IReadOnlySet<ChunkKey> KeysOfIndexFile(string indexPath)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(indexPath);
+        var keys = new HashSet<ChunkKey>();
+        AddKeysOf(Path.GetFullPath(indexPath), keys);
+        return keys;
+    }
+
+    /// <summary>
+    /// The keys referenced by the index files directly under <paramref name="storeRoot"/> other than
+    /// <paramref name="exceptPaths"/> (full paths, compared with <see cref="PathComparer"/>), without the server ledger: what
+    /// still protects a key once those files are deleted.
+    /// </summary>
+    /// <param name="storeRoot">The store directory.</param>
+    /// <param name="exceptPaths">Index files to leave out.</param>
+    /// <returns>The keys.</returns>
+    /// <exception cref="InvalidDataException">An index file cannot be read or parsed (conservative: no guess).</exception>
+    public static IReadOnlySet<ChunkKey> IndexReferencedKeysUnder(string storeRoot, IReadOnlyCollection<string> exceptPaths)
+    {
+        ArgumentNullException.ThrowIfNull(exceptPaths);
+        var skip = new HashSet<string>(exceptPaths.Select(Path.GetFullPath), PathComparer);
+        var keys = new HashSet<ChunkKey>();
+        foreach (string file in IndexFilesUnder(storeRoot))
+            if (!skip.Contains(file)) AddKeysOf(file, keys);
+        return keys;
+    }
+
     private static HashSet<ChunkKey> IndexKeysUnder(string storeRoot, string? exceptPath)
     {
         var keys = new HashSet<ChunkKey>();
-        string root = Path.GetFullPath(storeRoot);
-        if (!Directory.Exists(root)) return keys;
         string? skip = exceptPath is null ? null : Path.GetFullPath(exceptPath);
-        foreach (string file in Directory.EnumerateFiles(root, IndexFilePrefix + "*" + IndexFileSuffix, SearchOption.TopDirectoryOnly))
+        foreach (string file in IndexFilesUnder(storeRoot))
         {
-            if (!file.EndsWith(IndexFileSuffix, StringComparison.OrdinalIgnoreCase)) continue;
-            if (skip is not null && PathComparer.Equals(Path.GetFullPath(file), skip)) continue;
-            IndexDocument? doc;
-            try
-            {
-                using FileStream stream = OpenForRead(file);
-                doc = JsonSerializer.Deserialize(stream, ChunkIndexJsonContext.Default.IndexDocument);
-            }
-            catch (FileNotFoundException)
-            {
-                continue; // removed between enumeration and open
-            }
-            catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
-            {
-                throw new InvalidDataException($"Index file '{file}' cannot be read ({ex.Message}); eviction cannot be decided. Repair or remove it if it is not an index of this store.", ex);
-            }
-            if (doc?.Files is null)
-                throw new InvalidDataException($"Index file '{file}' has no file list; eviction cannot be decided.");
-            foreach (FileDocument? f in doc.Files)
-            {
-                foreach (ChunkDocument? c in f?.Chunks ?? [])
-                {
-                    if (c is null || !ChunkKey.IsWellFormed(c.Key))
-                        throw new InvalidDataException($"Index file '{file}' has a malformed chunk entry; eviction cannot be decided.");
-                    keys.Add(new ChunkKey(c.Key));
-                }
-            }
+            if (skip is not null && PathComparer.Equals(Path.GetFullPath(file), skip)) continue; // platform path rule: on Linux index-a.json and index-A.json are two indexes
+            AddKeysOf(file, keys);
         }
         return keys;
+    }
+
+    private static void AddKeysOf(string file, HashSet<ChunkKey> keys)
+    {
+        IndexDocument? doc;
+        try
+        {
+            using FileStream stream = OpenForRead(file);
+            doc = JsonSerializer.Deserialize(stream, ChunkIndexJsonContext.Default.IndexDocument);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return; // removed between enumeration and open
+        }
+        catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidDataException($"Index file '{file}' cannot be read ({ex.Message}); eviction cannot be decided. Repair or remove it if it is not an index of this store.", ex);
+        }
+        if (doc?.Files is null)
+            throw new InvalidDataException($"Index file '{file}' has no file list; eviction cannot be decided.");
+        foreach (FileDocument? f in doc.Files)
+        {
+            foreach (ChunkDocument? c in f?.Chunks ?? [])
+            {
+                if (c is null || !ChunkKey.IsWellFormed(c.Key))
+                    throw new InvalidDataException($"Index file '{file}' has a malformed chunk entry; eviction cannot be decided.");
+                keys.Add(new ChunkKey(c.Key));
+            }
+        }
     }
 
     /// <summary>
@@ -789,7 +843,8 @@ public sealed partial class ChunkIndex
 
     /// <summary>
     /// Opens an index file for reading the way <see cref="Load"/> does: sharing read, write and delete. Keep it open briefly:
-    /// a concurrent <see cref="Save"/> waits (up to two seconds) for it to close.
+    /// on Windows a concurrent <see cref="Save"/> waits (up to two seconds) for it to close; on Linux and macOS the save's
+    /// rename replaces the file under the open stream at once, and the stream keeps reading the old file unchanged.
     /// </summary>
     /// <param name="path">Index file.</param>
     /// <returns>The stream.</returns>

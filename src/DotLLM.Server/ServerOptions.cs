@@ -167,6 +167,13 @@ public sealed record ServerOptions
     public static long ParsePrefixSnapshotDiskBudget(string? value)
         => ParsePrefixSnapshotByteBudget(value, "--prefix-snapshot-disk-budget");
 
+    /// <summary>Parses a nonnegative byte size (bytes, or decimal / binary units such as 8GB or 8GiB) for <paramref name="flag"/>.</summary>
+    /// <param name="value">The value; null = 0.</param>
+    /// <param name="flag">The flag named in the error message.</param>
+    /// <returns>The size in bytes.</returns>
+    /// <exception cref="ArgumentException">Not a nonnegative whole number of bytes.</exception>
+    public static long ParseByteSize(string? value, string flag) => ParsePrefixSnapshotByteBudget(value, flag);
+
     private static long ParsePrefixSnapshotByteBudget(string? value, string flag)
     {
         if (value is null) return 0;
@@ -534,6 +541,10 @@ public sealed record ServerOptions
         string? chunkStore = null;
         string? chunkCacheApiKeys = null;
         bool chunkCacheAllowShortKeys = false;
+        bool chunkStoreWrite = false;
+        string? chunkStoreBudget = null;
+        bool chunkStoreIndexOnly = false;
+        string? chunkStoreNamespaceBudget = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -674,6 +685,14 @@ public sealed record ServerOptions
                     tensorOverlay = next ?? throw new ArgumentException("--tensor-overlay requires a path."); i++; break;
                 case "--overlay-skip-base-hash":
                     overlaySkipBaseHash = true; break;
+                case "--chunk-store-write":
+                    chunkStoreWrite = true; break;
+                case "--chunk-store-budget":
+                    chunkStoreBudget = next ?? throw new ArgumentException("--chunk-store-budget requires a byte size."); i++; break;
+                case "--chunk-store-index-only":
+                    chunkStoreIndexOnly = true; break;
+                case "--chunk-store-namespace-budget":
+                    chunkStoreNamespaceBudget = next ?? throw new ArgumentException("--chunk-store-namespace-budget requires a byte size."); i++; break;
                 case "--max-messages":
                     maxMessagesCli = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 default:
@@ -751,7 +770,8 @@ public sealed record ServerOptions
             AllowModelAdminApi = allowModelAdmin,
             Metrics = metrics,
             AllowLoraAdminApi = allowLoraAdmin,
-            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(chunkCache, chunkCacheMaxChunks, chunkStore, chunkCacheApiKeys, chunkCacheAllowShortKeys),
+            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(chunkCache, chunkCacheMaxChunks, chunkStore, chunkCacheApiKeys, chunkCacheAllowShortKeys,
+                chunkStoreWrite, chunkStoreBudget, chunkStoreIndexOnly, chunkStoreNamespaceBudget),
             MaxMessages = ResolveMaxMessages(maxMessagesCli, Environment.GetEnvironmentVariable(MaxMessagesEnvVar)),
             ModelId = modelId,
             RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,

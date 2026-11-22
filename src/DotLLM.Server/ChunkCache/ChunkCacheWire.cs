@@ -83,7 +83,20 @@ internal sealed record ChunkSpanRef(
     /// </summary>
     public int Index { get; init; } = -1;
 
-    // Never print the span text or its hash (spec 10: chunk content stays out of logs).
+    /// <summary>
+    /// <c>source.path</c> when the annotation carries one as a string (spec §5.2: provenance; Task 15 matches it against the
+    /// secrets deny-list before admitting a background encode, ruling 14). Null when absent.
+    /// </summary>
+    public string? SourcePath { get; init; }
+
+    /// <summary>
+    /// <c>source</c> was present but not an object, or its <c>path</c> not a string: the provenance cannot be checked against
+    /// the deny-list, so the chunk is never admitted for a background encode. The annotation itself is still accepted
+    /// (<c>source</c> never affects lookup).
+    /// </summary>
+    public bool SourceUnreadable { get; init; }
+
+    // Never print the span text, its hash or its source path (spec 10: chunk content stays out of logs).
     private bool PrintMembers(System.Text.StringBuilder builder)
     {
         builder.Append(System.Globalization.CultureInfo.InvariantCulture,
@@ -93,7 +106,11 @@ internal sealed record ChunkSpanRef(
 }
 
 /// <summary>A warning code and how many annotations (or requests, for request-level codes) it covers.</summary>
-internal sealed record ChunkWarning(string Code, int Count);
+internal sealed record ChunkWarning(string Code, int Count)
+{
+    /// <summary>A machine-readable cause (store-writer <c>chunk_store_unavailable</c> only), or null.</summary>
+    public string? Detail { get; init; }
+}
 
 /// <summary>
 /// Why one annotation was dropped. <see cref="Index"/> counts annotations in document order, inline first then
