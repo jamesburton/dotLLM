@@ -195,22 +195,25 @@ public sealed class GenerationSessionRollbackTests
     }
 
     /// <summary>A KV-cache that has already dropped the rows a cut needs refuses the rollback loudly, naming the cache type.</summary>
-    [Fact]
-    public async Task NonTruncatableKvCache_RefusesRollback_NamingTheCacheType()
+    [Theory]
+    [InlineData(Llama)]
+    [InlineData(HybridDense)]
+    public async Task NonTruncatableKvCache_RefusesRollback_NamingTheCacheType(string family)
     {
-        using var fx = Create(HybridDense, headDim: 32);   // Q8_0 KV blocks are 32 wide
+        using var fx = Create(family, headDim: 32);   // Q8_0 KV blocks are 32 wide
         var gen = new TextGenerator(fx.Model, fx.Tokenizer, kvCacheFactory: (cfg, size) =>
             new QuantizedKvCache(KvGeometry.FromConfig(cfg, false), size, KvCacheDType.Q8_0, KvCacheDType.Q8_0, windowSize: 2));
         await using var s = gen.CreateSession(Greedy(), Tag());
         await s.PrefillAsync(fx.Prompt);
         int a = fx.Prompt.Length;
         await s.GenerateUntilBoundaryAsync(new StopAfter(3));
-        Assert.Contains(a, s.RollbackBoundaries);   // a recorded boundary: only the KV-cache stands in the way
+        if (fx.IsRecurrent) Assert.Contains(a, s.RollbackBoundaries);   // a recorded boundary: only the KV-cache stands in the way
 
         Assert.False(s.CanRollbackTo(a));
         var ex = Assert.Throws<NotSupportedException>(() => s.RollbackTo(a));
         Assert.Contains(nameof(QuantizedKvCache), ex.Message);
         Assert.Equal(a + 3, s.CurrentPosition);
+        Assert.Equal(a + 3, s.KvLength);
         s.RollbackTo(0);   // a full reset never needs the cut
         Assert.Equal(0, s.CurrentPosition);
     }

@@ -43,7 +43,7 @@ internal sealed class GenerationSessionFixture : IDisposable
         switch (family)
         {
             case Llama:
-                File.WriteAllBytes(path, SyntheticDenseGguf.Build("llama", byteLevelVocab: true));
+                File.WriteAllBytes(path, SyntheticDenseGguf.Build("llama", byteLevelVocab: true, headDim: headDim));
                 break;
             case HybridDense:
                 SyntheticQwen35HybridDenseMtpGguf.Write(path, withMtp: false, contextLength: 256, headDim: headDim, ropeDim: headDim is null ? null : 8);
