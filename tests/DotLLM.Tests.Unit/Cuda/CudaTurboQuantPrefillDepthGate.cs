@@ -110,6 +110,7 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
             // 1-ULP drift control (James 2026-11-22): the LEGACY entry with its softmax scale moved one F32 ulp up, then down. The run
             // is deterministic, so how far that moves KL(f16||arm) is the noise band of two correct implementations of this entry.
             double band = 0;
+            bool anyMoved = false;
             foreach (int nudge in new[] { +1, -1 })
             {
                 CudaKernels.TqPrefillVariantOverride = CudaKernels.TqPrefillVariant.Legacy;
@@ -118,11 +119,15 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
                 try { using var c = model.CreateKvCache(maxSeq, kv); ctrl = Run(c); }
                 finally { CudaKernels.TqPrefillVariantOverride = null; CudaKernels.TqPrefillScaleUlpNudge = 0; }
                 var (klC, _) = Report(bits, $"Legacy{(nudge > 0 ? "+" : "-")}1ulp", ctrl, f16, oracle, 0);
-                var (cosCtl, _) = CosStats(arms[CudaKernels.TqPrefillVariant.Legacy], ctrl);
-                // A control that cannot move is no control (CLAUDE.md: prove the test can fail).
-                Assert.True(cosCtl < 1.0, $"tq{bits}: the 1-ulp control left every logit unchanged; it cannot measure a band");
+                // Bitwise, not a cosine: a cosine of two identical rows can still round below 1.
+                bool moved = !arms[CudaKernels.TqPrefillVariant.Legacy].Zip(ctrl).All(p => p.First.AsSpan().SequenceEqual(p.Second));
+                _out.WriteLine($"DEPTH b{bits} Legacy{(nudge > 0 ? "+" : "-")}1ulp moved the logits: {moved}");
+                anyMoved |= moved;
                 band = Math.Max(band, Math.Abs(klC - stats[CudaKernels.TqPrefillVariant.Legacy].meanKl));
             }
+            // A control that cannot move is no control (CLAUDE.md: prove the test can fail). One moving arm is enough: on the 84417b15
+            // run the +1-ulp arm reproduced legacy's KL to every printed digit and the band rested on the -1-ulp arm alone.
+            Assert.True(anyMoved, $"tq{bits}: neither 1-ulp control arm moved any logit; the band cannot be measured");
             _out.WriteLine($"DEPTH b{bits}: 1-ulp drift band on mean KL = {band:E4} ({100 * band / stats[CudaKernels.TqPrefillVariant.Legacy].meanKl:F2}% of legacy)");
             gate.Add((bits, stats, band));
         }

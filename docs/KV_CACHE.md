@@ -412,7 +412,8 @@ why; it is never served by another cache (#1888).
   uses the scalar body); `tq_rotate_q` / `tq_rotate_o` (and `tq_rotate_o_f16`, which keeps the attention output F16).
   **Decode is eager and never graph-captured** (#1918, same as q8_0 KV today).
   - Prefill entries (#1924), picked by `DOTLLM_CUDA_TQ_PREFILL=legacy|spec|cpa`. Unset = `cpa` (Staged) for tq2/tq3/tq4/tq8
-    (James 2026-11-22; tq3's +4% mean KL to F16 KV against legacy is inside the legacy entry's 1-ulp drift band, 7.1%). `legacy` = `_tqtq` (runtime bits,
+    (James 2026-11-22; tq3's +4% mean KL to F16 KV against legacy is inside the legacy entry's 1-ulp drift band, 7.1%; that band
+    rests on the -1-ulp softmax-scale arm alone, the +1-ulp arm left KL unchanged to every printed digit). `legacy` = `_tqtq` (runtime bits,
     `half(norm * centroid)` per element from global memory). `spec` = `_tq{2,3,4,8}`: norms kept out of the tile (the K norm scales
     the score, the V norm scales P; the softmax sum keeps the raw P), a shared-memory F16 centroid table, bits compiled in. `cpa` =
     `_tq{2,3,4,8}_cpa`: `spec` plus `cp.async` staging of the raw code rows one tile ahead and a single decoded tile, which takes hd128
