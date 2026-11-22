@@ -20,7 +20,10 @@ public interface IHiddenStateTapHost
     /// Registers a tap that may stop the forward pass by returning <see cref="HookResult.AbortForward"/>
     /// (<see cref="HookResult.Continue"/> otherwise; <c>Replace</c> is rejected with <see cref="InvalidOperationException"/>).
     /// On abort the model rolls the KV-cache back to its length at forward entry, restores recurrent state from a checkpoint taken
-    /// at entry (only while an abortable tap is attached), and skips the remaining layers and the LM head.
+    /// at entry, and skips the remaining layers and the LM head. Refused with <see cref="NotSupportedException"/>, before any state is
+    /// touched: at registration when the model's config uses sliding-window attention; at the first abortable forward when the supplied cache
+    /// has a compact or full-precision window (<see cref="IKvCache.SupportsAbortRollback"/>); in <c>ForwardBatch</c>; and with an MTP/DFlash state.
+    /// A throwing callback (any tap) restores KV and recurrent state to forward entry before the exception propagates.
     /// </summary>
     IDisposable RegisterAbortableTap(HiddenStateTapSubscription subscription, Func<HiddenStateSample, HookResult> onSample);
 

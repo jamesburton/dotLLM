@@ -62,8 +62,14 @@ Any other `HookPoint` throws `NotSupportedException` at registration (those sit 
 an out-of-range layer or an empty point list throws `ArgumentException`.
 
 **`PreFinalNorm` vs `PreLmHead`.** `PreFinalNorm` is the residual leaving the last layer (the same rows as `PostLayer(last)`).
-`PreLmHead` is *post* final norm: exactly the rows the LM head reads (before any Hadamard rotation the head applies). With `TapRows.All`
-the final norm is widened to every row for the tap even when the head projects only the last, at the cost of one extra norm over those rows.
+`PreLmHead` is *post* final norm: the normed rows the LM head reads (`rmsnorm(PreFinalNorm) * output_norm.weight`, asserted per row against a host
+reference on every backend), taken before any Hadamard rotation the head applies; on a Hadamard-rotated hybrid it is therefore the pre-rotation
+norm output, not the literal head input. **One meaning of `PreLmHead` + `TapRows.All` on every host: every trunk row of the forward**, even when
+the head projects only the last (`lastTokenLogitsOnly`): the final norm is widened to every row while such a tap is attached, at the cost of one
+extra norm over those rows. `TapRows.Last` delivers the last row.
+
+**`PostLayer` vs `IResidualModifier`.** `PostLayer(L)` fires **after** the layer's `IResidualModifier` on every host: a probe sees the steered
+stream, not the pre-steering one. A consumer that steers and probes at the same layer gets the post-steering values.
 
 **Rows.** `TapRows.Last` (default) delivers one sample per forward (a prefill copies one row); `TapRows.All` delivers one sample per input
 row, `RowIndex` the row within the forward and `TokenPosition` its absolute position. `HiddenStateSample.SequenceId` is the request index of
@@ -75,19 +81,33 @@ tapped and untapped runs take the same kernels; see the per-backend notes). To m
 **Abort.** `RegisterAbortableTap` takes a callback returning `HookResult.Continue` or `HookResult.AbortForward` (`Replace` throws
 `InvalidOperationException`). On abort the remaining layers and the LM head are skipped, the KV-cache is rolled back to its length at entry
 (the cache must support `Rollback`, probed before anything is written) and recurrent (GDN) state is restored from a checkpoint taken at
-entry. Only an abortable tap pays for the checkpoint. `TryForward(...)` reports the abort as `false` plus a `ForwardAbortInfo`; the legacy
-`Forward(...)` throws `ForwardAbortedException` after the same rollback. Use `TryForward` for per-token early exit on a hot path.
+entry. `TryForward(...)` reports the abort as `false` plus a `ForwardAbortInfo`; the legacy `Forward(...)` throws `ForwardAbortedException`
+after the same rollback (the exception implements `DotLLM.Core.Models.IForwardStateRestored`: the model already restored KV and recurrent state,
+so a caller's bookkeeping needs no recovery). Use `TryForward` for per-token early exit on a hot path. `TryForward` is decode-shaped: it has no
+`adapter`, `lastTokenLogitsOnly` or `mtpState` parameter (a prefill through it returns the full `[seqLen, vocab]` logits on CPU, and a LoRA
+adapter cannot be applied on this path); use `Forward` with an abortable tap when you need those.
 
-**Refusal at forward entry (sliding-window caches).** `RegisterAbortableTap` never sees the KV-cache, so it cannot refuse; the check runs
-at the start of every forward while an abortable tap is attached (`AbortableTapKvGuard.Checkpoint`, one null check otherwise), before any
-KV, recurrent or device state is touched. It throws `NotSupportedException` when the cache cannot roll back to the entry length
-*after this forward's append* (`IKvCache.CanRollbackAfterAppend`). A compact sliding-window cache (`SimpleKvCache`, `QuantizedKvCache`,
-`VulkanKvCache` built with `compactSlidingWindows: true`) drops rows during the append when the write runs past its ring, and a cache with
-an FP window (`QuantizedKvCache`, `CudaQuantizedKvCache`) evicts rows into quantized storage once the append passes the window; after
-either, the entry length is unreachable and an abort could only corrupt or throw mid-forward. The message names the cache type, the
-entry length and the written positions. Ordinary contiguous decode into a compact cache stays abortable (compaction keeps a 64-row margin
-beyond the window). Checkpointing the dropped rows instead was rejected as a per-forward copy of every windowed layer; use a cache without
-compact windows (`KvGeometry.FromConfig(config)`) or a read-only tap to avoid the refusal.
+**A throwing callback (any tap).** A callback that throws (a user observer, a `BufferProvider`, the registry's own validation) leaves KV and
+recurrent state as they were at forward entry on every backend: the trunk is wrapped so the KV-cache is rolled back to its entry length, the
+recurrent state is restored from the entry checkpoint, and the exception is rethrown. A hybrid therefore takes the entry GDN checkpoint for a
+read-only tap too (one state copy per tapped forward; a tapped forward already leaves the fused/graph paths). Two cases cannot be covered by a
+checkpoint, and a throwing read-only callback there leaves the recurrent state undefined (KV is still rolled back): a forward that carries an
+MTP/DFlash state, and a forward while verify-row snapshots are pending. A windowed cache that cannot truncate is best effort for a read-only tap.
+
+**Abortable-tap refusals (all before any state is touched, identical on every backend).**
+- *Sliding-window models, at registration.* `RegisterAbortableTap` throws `NotSupportedException` when the model's config uses sliding-window
+  attention on any layer (`ModelConfig.SlidingWindowOf`), and
+- *windowed caches, at the first abortable forward.* it throws when the supplied cache has any compact sliding-window layer or full-precision
+  window (`IKvCache.SupportsAbortRollback` is false: `SimpleKvCache`/`VulkanKvCache` with compact windows, `QuantizedKvCache` and
+  `CudaQuantizedKvCache` with an FP window), **independent of the current length**, naming the cache type. The session never fails mid-generation
+  at token N. The older per-forward check (`IKvCache.CanRollbackAfterAppend`) stays as a backstop. Use a cache without windows
+  (`KvGeometry.FromConfig(config)`) or a read-only tap.
+- *`ForwardBatch`.* An abortable tap is refused in `ForwardBatch` (an abort of request i would leave requests 0..i-1 committed and the rest unrun);
+  call `Forward`/`TryForward` per sequence. Read-only taps are unchanged.
+- *MTP/DFlash state.* An abortable tap on a forward that carries an MTP/DFlash state is refused (the checkpoint does not cover the head). A
+  **read-only** tap with an MTP state works on every backend: it only reads, and is delivered after the capture.
+- *Pending verify rows.* On a hybrid, an abortable forward while verify-row snapshots are pending (after `ForwardWithRecurrentSnapshots`, before
+  `RestoreRecurrentStateToRow`) is refused: the entry checkpoint would commit the rejected draft rows.
 
 **Delivery timing.**
 
@@ -101,7 +121,10 @@ Samples of one forward arrive in forward order: embedding, layers ascending, `Pr
 before `Forward` returns.
 
 **Zero cost unattached.** A forward reads the registry once into a local; with no tap it is a null check with no copy, sync or allocation, and
-no counter moves.
+no counter moves. This is asserted against an **absolute baseline**, not against another unattached run: the untapped decode must allocate exactly
+the managed bytes recorded at the merge base (d1275eef; CPU 1664 B per 16 decodes, 21632 B for the MoE hybrid; Vulkan 1872 B), and on Vulkan do
+exactly the merge base's device work per 16 decodes (dispatches, copies, barriers, descriptor writes/allocs, queue submits and fence waits); on CUDA
+zero tap copies are enqueued.
 
 **Fast paths a tap bypasses.** A tap needs layer boundaries, which fused paths do not have, so a tapped forward runs the eager path and says so
 once on stderr (`PathCounters` below). The bypass costs what the fast path saved; no tap-specific number is measured yet, the sources below are the
@@ -118,7 +141,8 @@ reasons the fast paths exist:
   as one tile, so its working set is no longer bounded by the tile.
 
 **PathCounters** (`HiddenStateTapRegistry.PathCounters`, process-wide, `Reset()` for tests): `TapForwards`, `CudaGraphBypassed`,
-`VulkanFusedDecodeBypassed`, `PackedBatchFallbacks`, `AbortedForwards`, `AbortCheckpoints`. A bypass counter moves only when the fast path would
+`VulkanFusedDecodeBypassed`, `VulkanRowSliceBypassed`, `PackedBatchFallbacks`, `AbortedForwards`, `AbortCheckpoints`. The bypass notice on stderr is
+logged once per kind of bypass. A bypass counter moves only when the fast path would
 otherwise have been taken.
 
 **Supported models.**
@@ -130,7 +154,8 @@ otherwise have been taken.
 | GDN-hybrid MoE | `Qwen3MoeHybridTransformerModel` | `VulkanQwen3MoeHybridTransformerModel` | `CudaQwen3MoeHybridTransformerModel` (abortable taps need `IModel.SupportsRecurrentStateCheckpoint`, from #1919; refused with `NotSupportedException` until then) |
 
 Not supported (registration throws `NotSupportedException`): Gemma-3n/4, Gemma / Gemma-2 on CUDA, MLA, diffusion and bidirectional towers,
-trimmed pipeline stages and head-only offload instances, and a tapped forward combined with an MTP/DFlash state. Other architectures (Mamba,
+trimmed pipeline stages and head-only offload instances, and an abortable tap combined with an MTP/DFlash state. Backend differences: the dense
+Vulkan host refuses a tapped forward while all-row logits are widened (`TrySetAllRowLogitsLimit`, perplexity scoring); the hybrids do not. Other architectures (Mamba,
 Nemotron-H, LFM2, ...) do not implement `IHiddenStateTapHost` and are refused by type.
 
 **Why the sample is F32.** The public contract is a hidden-size F32 row, so a consumer needs no per-backend decoding. It is host-side only:

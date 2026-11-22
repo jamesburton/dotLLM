@@ -6,7 +6,10 @@ public enum TapRows
     /// <summary>Only the last row of the forward (decode-friendly; a prefill copies one row).</summary>
     Last,
 
-    /// <summary>Every row of the forward, one sample per row.</summary>
+    /// <summary>
+    /// Every row of the forward, one sample per row. For <see cref="HookPoint.PreLmHead"/> this means every trunk row on every host, even
+    /// when the LM head projects only the last one (the final norm is widened to every row while such a tap is attached).
+    /// </summary>
     All,
 }
 
