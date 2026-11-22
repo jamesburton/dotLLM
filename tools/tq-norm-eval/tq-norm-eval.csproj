@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>DotLLM.TqNormEval</RootNamespace>
+    <Description>Bounded measurement harness for the TurboQuant per-head-vector norm storage format (#1892 task 1).</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DotLLM.Models\DotLLM.Models.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Engine\DotLLM.Engine.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Cpu\DotLLM.Cpu.csproj" />
+  </ItemGroup>
+
+</Project>

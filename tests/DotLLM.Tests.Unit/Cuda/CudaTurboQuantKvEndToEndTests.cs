@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using DotLLM.Core.Configuration;
 using DotLLM.Cuda;
 using DotLLM.Engine.KvCache.Codecs;
 using DotLLM.Models.Gguf;
@@ -22,7 +23,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 public sealed unsafe class CudaTurboQuantKvEndToEndTests
 {
     private const ulong Seed = 0xC0FFEE_4B2CUL;
-    private const ulong VSeedXor = 0xD1B54A32D192ED03UL;
+    private const ulong VSeedXor = TurboQuantCodec.VSeedMask;
 
     private readonly ITestOutputHelper _out;
     public CudaTurboQuantKvEndToEndTests(ITestOutputHelper output) => _out = output;
@@ -47,6 +48,58 @@ public sealed unsafe class CudaTurboQuantKvEndToEndTests
             if (Directory.Exists(full) && Directory.GetFiles(full, "*.ptx").Length > 0) return full;
         }
         return null;
+    }
+
+    /// <summary>
+    /// #1892 Task 8: <c>CreateKvCache</c> serves a TurboQuant request in place or refuses it; it never hands back the F16 cache. Before the gate a
+    /// request this host cannot run (tq*q, a window, mixed, V-only) fell through to <c>config.IsQuantized</c> (false for TurboQuant) and built a
+    /// plain <see cref="CudaKvCache"/>, silently. Kills the mutant that lets the gate fall through.
+    /// </summary>
+    [SkippableFact]
+    public void Cuda_CreateKvCache_TurboQuant_IsInPlaceOrRefused_NeverF16()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        string modelPath = Environment.GetEnvironmentVariable("DOTLLM_SMOLLM_Q8_GGUF")
+            ?? TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
+        Skip.If(!File.Exists(modelPath), $"SmolLM-135M Q8_0 GGUF not found at {modelPath}");
+        using var gguf = GgufFile.Open(modelPath);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        Skip.If(config.HeadDim > 256 || (config.HeadDim & (config.HeadDim - 1)) != 0, "head dim unsupported by TurboQuant kernels");
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptxDir);
+
+        var tq = new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant, TurboQuantBits: 4);
+        Assert.True(model.SupportsInPlaceTurboQuant(tq));
+        using (var ok = model.CreateKvCache(32, tq))
+            Assert.IsType<CudaTurboQuantInPlaceKvCache>(ok);
+
+        foreach (var (name, bad) in new (string, KvCacheConfig)[]
+        {
+            ("tq*q", tq with { TurboQuantUseQjl = true }),
+            ("window", tq with { MixedPrecisionWindowSize = 16 }),
+            ("mixed", new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.Q8_0)),
+            ("V-only", new KvCacheConfig(KvCacheDType.F32, KvCacheDType.TurboQuant)),
+        })
+        {
+            Assert.False(model.SupportsInPlaceTurboQuant(bad), name);
+            Assert.Throws<NotSupportedException>(() => model.CreateKvCache(32, bad).Dispose());
+        }
+    }
+
+    [SkippableFact]
+    public void Cuda_Dispose_IsIdempotent()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        string modelPath = Environment.GetEnvironmentVariable("DOTLLM_SMOLLM_Q8_GGUF")
+            ?? TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
+        Skip.If(!File.Exists(modelPath), $"SmolLM-135M Q8_0 GGUF not found at {modelPath}");
+        using var gguf = GgufFile.Open(modelPath);
+        var model = CudaTransformerModel.LoadFromGguf(gguf, GgufModelConfigExtractor.Extract(gguf.Metadata), 0, ptxDir);
+        model.Dispose();
+        model.Dispose();   // #1892: a refusal path and a finally may both dispose; the second must be a no-op
     }
 
     [SkippableFact]

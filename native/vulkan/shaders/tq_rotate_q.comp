@@ -1,0 +1,43 @@
+#version 450
+// TurboQuant query rotation INTO K code space (#1892 step 2), in place:
+//   q~ = H(S_k . q) / sqrt(d)      score = norm * sum_i q~_i * centroid[code_i]
+// Same operation order as TurboQuantCodec.Rotate (sign flip, unnormalised Walsh-Hadamard, then x invSqrtD).
+//
+// Dispatch: one workgroup per (row, head) = (numHeads, rows, 1); local_size_x = 256, one thread per coordinate (threads with
+// t >= headDim stay live but idle so every invocation reaches each barrier()). headDim is a power of two <= 256.
+// q is F32 [rows, numHeads, headDim] (the Vulkan activation format); signs is the K-side +/-1 F32 vector (codec seed).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufQ { float q[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BufSign { float signs[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint headDim;
+    uint numHeads;
+    float invSqrtD;   // 1/sqrt(headDim), the codec's exact constant
+} pc;
+
+shared float s[256];
+
+void main() {
+    uint t    = gl_LocalInvocationID.x;
+    uint d    = pc.headDim;
+    bool live = t < d;
+    uint off  = (gl_WorkGroupID.y * pc.numHeads + gl_WorkGroupID.x) * d;
+
+    if (live) s[t] = q[off + t] * signs[t];
+    barrier();
+
+    for (uint len = 1u; len < d; len <<= 1u) {
+        if (live && (t & len) == 0u) {
+            float u = s[t];
+            float v = s[t + len];
+            s[t]       = u + v;
+            s[t + len] = u - v;
+        }
+        barrier();
+    }
+
+    if (live) q[off + t] = s[t] * pc.invSqrtD;
+}

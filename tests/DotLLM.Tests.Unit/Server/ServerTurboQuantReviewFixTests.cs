@@ -45,7 +45,7 @@ public sealed class ServerTurboQuantReviewFixTests : IClassFixture<PrefixCacheFa
             MlaConfig = new MlaConfig { KvLoraRank = 512, QkNopeHeadDim = 192, QkRopeHeadDim = 64, VHeadDim = 256 },
         };
         string? reason = TurboQuantKvSupport.RefusalReason(Tq4, new TurboQuantContext(
-            KvCommand.Serve, KvBackendKind.Cpu, Paged: false, config, HostIsPlainCpuTransformer: true, HasDraftModel: false, MtpWillAttach: false));
+            KvCommand.Serve, KvBackendKind.Cpu, Paged: false, config, HostSupportsInPlace: true, HasDraftModel: false, MtpWillAttach: false));
         Assert.NotNull(reason);
         Assert.Contains("MLA", reason);
         Assert.Contains("#1899", reason);
@@ -54,11 +54,21 @@ public sealed class ServerTurboQuantReviewFixTests : IClassFixture<PrefixCacheFa
     [Theory]
     [InlineData("vulkan")]
     [InlineData("cuda")]
-    public void Serve_GpuRefusal_PointsAtTheCpuPath(string device)
+    public void Serve_GpuTq4_IsNoLongerRefusedBeforeLoad(string device)
     {
-        // I1: serve defaults to --device auto, so the user may never have named the GPU; say how to reach the real path.
-        string? reason = ServerStartup.PreLoadTurboQuantRefusal(Options(_tiny.GgufPath, "tq4", "tq4", device), _tiny.Config);
-        Assert.Contains("--device cpu --no-paged", reason);
+        // #1892 inverts I1: a GPU device used to refuse tq with "pass --device cpu --no-paged". It now runs in place, so the pre-load pass lets it
+        // through; the host's own capability decides after the load.
+        Assert.Null(ServerStartup.PreLoadTurboQuantRefusal(Options(_tiny.GgufPath, "tq4", "tq4", device), _tiny.Config));
+    }
+
+    [Theory]
+    [InlineData("vulkan")]
+    [InlineData("cuda")]
+    public void Serve_GpuQjl_RefusedBeforeLoad_CitingStep5(string device)
+    {
+        string? reason = ServerStartup.PreLoadTurboQuantRefusal(Options(_tiny.GgufPath, "tq4q", "tq4q", device), _tiny.Config);
+        Assert.Contains("#1894", reason);
+        Assert.DoesNotContain("--device cpu --no-paged", reason);
     }
 
     [Theory]
@@ -80,7 +90,7 @@ public sealed class ServerTurboQuantReviewFixTests : IClassFixture<PrefixCacheFa
         using (var gguf = GgufFile.Open(path))
             Assert.Null(ServerStartup.PreLoadTurboQuantRefusal(Options(path, "tq4", "tq4"), GgufModelConfigExtractor.Extract(gguf.Metadata)));
         var e = Assert.Throws<InvalidServerOptionException>(() => ServerStartup.LoadModel(path, Options(path, "tq4", "tq4")));
-        Assert.Contains("CPU model", e.Message);
+        Assert.Contains("#1900", e.Message);   // up front, with the gap ticket: not a mid-forward NotSupportedException
     }
 
     [Fact]
@@ -93,15 +103,23 @@ public sealed class ServerTurboQuantReviewFixTests : IClassFixture<PrefixCacheFa
     }
 }
 
-/// <summary>I4: bench measured the default cache while its reproduce line said tq4.</summary>
+/// <summary>I4: bench measured the default cache while its reproduce line said tq4; it now builds the in-place cache or refuses.</summary>
 [Collection(CliConsoleCollection.Name)]
 public sealed class CliBenchTurboQuantTests
 {
     [Fact]
-    public void Bench_Tq4_ExitsNonZero_WithTheRefusal()
+    public void Bench_MixedTqFormats_ExitsNonZero_WithTheRefusal()
     {
-        var (code, output) = CliTurboQuantCommandTests.Run("bench", "no-such-model-1888", "--kv-quant-k", "tq4", "--kv-quant-v", "tq4");
+        var (code, output) = CliTurboQuantCommandTests.Run("bench", "no-such-model-1888", "--kv-quant-k", "tq3", "--kv-quant-v", "tq4");
         Assert.NotEqual(0, code);
-        Assert.Contains("#1887", output);
+        Assert.Contains("#1895", output);
+    }
+
+    [Fact]
+    public void Bench_Tq4q_OnVulkan_ExitsNonZero_WithTheRefusal()
+    {
+        var (code, output) = CliTurboQuantCommandTests.Run("bench", "no-such-model-1892", "--kv-quant-k", "tq4q", "--kv-quant-v", "tq4q", "--device", "vulkan");
+        Assert.NotEqual(0, code);
+        Assert.Contains("#1894", output);
     }
 }

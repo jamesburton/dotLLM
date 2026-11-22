@@ -15,13 +15,13 @@ public abstract class KvQuantSettings : CommandSettings
 {
     /// <summary>KV key storage format.</summary>
     [CommandOption("--kv-quant-k")]
-    [Description("KV-cache key storage: f16, q8_0, q4_0. Synonym of --cache-type-k. For the CUDA hybrid-dense " +
+    [Description("KV-cache key storage: f16, q8_0, q4_0, or TurboQuant tq1..tq8 (both sides the same tq format). Synonym of --cache-type-k. For the CUDA hybrid-dense " +
                  "model (Bonsai-2 / qwen35) overrides DOTLLM_HYBRID_KV; quantized KV needs numKvHeads*headDim % 32 == 0.")]
     public string? KvQuantK { get; set; }
 
     /// <summary>KV value storage format.</summary>
     [CommandOption("--kv-quant-v")]
-    [Description("KV-cache value storage: f16, q8_0, q4_0. Synonym of --cache-type-v. See --kv-quant-k.")]
+    [Description("KV-cache value storage: f16, q8_0, q4_0, or TurboQuant tq1..tq8 (both sides the same tq format). Synonym of --cache-type-v. See --kv-quant-k.")]
     public string? KvQuantV { get; set; }
 }
 
@@ -67,8 +67,9 @@ internal static class KvStorageCli
         "(give only one; conflicting values are an error). Unset: the backend default - F32 in the contiguous CPU cache (run/chat), F16 in GPU caches, " +
         "Q8_0 blocks in the paged CPU cache (pass f16 for BOTH K and V to keep F16 there). On the CUDA hybrid-dense model (Bonsai-2, Qwen3.5/3.6) " +
         "f32 means 'not given' (DOTLLM_HYBRID_KV applies) and quantized KV needs numKvHeads*headDim % 32 == 0. 'run' and 'bench' warn when the " +
-        "model/backend cannot honour a format. TurboQuant (tq, tq1..tq8, trailing q = QJL; pass the same value for -k and -v) runs only in " +
-        "'serve --device cpu --no-paged' for now and is refused everywhere else (#1887). Sizing: docs/CLI.md#kv-cache-sizing.";
+        "model/backend cannot honour a format. TurboQuant (tq, tq1..tq8; pass the same value for -k and -v) is read in place, as codes plus " +
+        "norms with no decoded history, on the CPU, dense CUDA and Vulkan hosts for serve (--no-paged), run, chat and bench; hybrid, recurrent, MLA and pipeline hosts " +
+        "refuse it (#1887). The QJL form (trailing q) runs on the CPU only (#1894). Sizing: docs/CLI.md#kv-cache-sizing.";
 
     /// <summary>Help for <c>--cache-type-v</c> on run/chat/serve.</summary>
     public const string CacheTypeVHelp =
@@ -78,7 +79,8 @@ internal static class KvStorageCli
     /// <summary>Help for <c>--cache-window</c>.</summary>
     public const string CacheWindowHelp =
         "Mixed-precision window: the most recent N tokens stay in full precision, older tokens are quantized on eviction (0 = quantize everything). " +
-        "Only used when --cache-type-k/-v is q8_0 or q4_0; ignored by the hybrid-dense models, which store the whole KV in one format.";
+        "Only used when --cache-type-k/-v is q8_0 or q4_0; ignored by the hybrid-dense models, which store the whole KV in one format. " +
+        "Refused with TurboQuant, whose cache holds codes only.";
 
     /// <summary>Help for <c>--paged</c> on run/chat.</summary>
     public const string PagedHelp =
@@ -86,35 +88,54 @@ internal static class KvStorageCli
         "sized up-front to prompt + --max-tokens. Opt-in here; 'serve' is paged by default (--no-paged to turn off). Needs a uniform per-layer KV width " +
         "(Gemma-4 / MiMo-V2 use the contiguous cache).";
     /// <summary>
-    /// The TurboQuant refusal for <c>run</c> / <c>chat</c> (#1888), decided from the raw K / V flag text before the model loads: these commands
-    /// do not run TurboQuant KV until #1887 step 2, so every TurboQuant form (either side) is refused. Null when neither side asks for
-    /// TurboQuant, or a value does not parse (the flag parser reports that).
+    /// The TurboQuant refusal decidable before the model loads (#1888, #1892), from the raw K / V flag text: mixed formats, QJL on a named
+    /// GPU, <c>--cache-window</c>, the paged cache. The host-dependent rules run after the load (<see cref="DotLLM.Server.TurboQuantKv.PostLoadRefusal"/>).
+    /// Null when neither side asks for TurboQuant, or a value does not parse (the flag parser reports that).
     /// </summary>
     /// <param name="command">The command.</param>
     /// <param name="keyText">The K flag as given, or null.</param>
     /// <param name="valueText">The V flag as given, or null.</param>
+    /// <param name="cacheWindow">The <c>--cache-window</c> value.</param>
+    /// <param name="paged">Whether the paged cache was asked for.</param>
+    /// <param name="device">The <c>--device</c> value; null or <c>auto</c> leaves the backend to the post-load pass.</param>
+    /// <param name="hasDraftModel">Whether <c>--speculative-model</c> was given (its KV would not be TurboQuant).</param>
     /// <returns>The refusal reason, or null.</returns>
-    internal static string? TurboQuantRefusal(DotLLM.Server.KvCommand command, string? keyText, string? valueText)
+    internal static string? TurboQuantRefusal(DotLLM.Server.KvCommand command, string? keyText, string? valueText,
+        int cacheWindow = 0, bool paged = false, string? device = null, bool hasDraftModel = false)
     {
-        KvCacheDType key, value;
-        int kBits = 0, vBits = 0;
-        bool kQjl = false, vQjl = false;
+        KvCacheConfig kv;
+        string? mismatch;
         try
         {
-            key = string.IsNullOrWhiteSpace(keyText) ? KvCacheDType.F32 : KvCacheConfig.ParseDType(keyText.Trim(), out kBits, out kQjl);
-            value = string.IsNullOrWhiteSpace(valueText) ? KvCacheDType.F32 : KvCacheConfig.ParseDType(valueText.Trim(), out vBits, out vQjl);
+            kv = DotLLM.Server.TurboQuantKv.Parse(string.IsNullOrWhiteSpace(keyText) ? null : keyText.Trim(),
+                string.IsNullOrWhiteSpace(valueText) ? null : valueText.Trim(), cacheWindow, out mismatch);
         }
         catch (ArgumentException)
         {
             return null;
         }
-        if (key == KvCacheDType.TurboQuant && value == KvCacheDType.TurboQuant && DotLLM.Server.TurboQuantKvSupport.FormatsDiffer(kBits, kQjl, vBits, vQjl))
-            return DotLLM.Server.TurboQuantKvSupport.MixedFormatRefusal(keyText!, valueText!);
-        var kv = new KvCacheConfig(key, value);
-        return DotLLM.Server.TurboQuantKvSupport.RefusalReason(kv, new DotLLM.Server.TurboQuantContext(
-            command, DotLLM.Server.KvBackendKind.Unknown, Paged: false, Config: null, HostIsPlainCpuTransformer: null,
-            HasDraftModel: false, MtpWillAttach: false));
+        var backend = DotLLM.Server.KvBackendKind.Unknown;
+        if (!string.IsNullOrWhiteSpace(device) && DotLLM.Server.DeviceSpec.TryParse(device, out var spec, out _))
+            backend = spec.Kind switch
+            {
+                DotLLM.Server.DeviceKind.Cpu => DotLLM.Server.KvBackendKind.Cpu,
+                DotLLM.Server.DeviceKind.Cuda => DotLLM.Server.KvBackendKind.Cuda,
+                DotLLM.Server.DeviceKind.Vulkan => DotLLM.Server.KvBackendKind.Vulkan,
+                _ => DotLLM.Server.KvBackendKind.Unknown,
+            };
+        return DotLLM.Server.TurboQuantKv.PreLoadRefusal(kv, mismatch, command, backend, paged, config: null, hasDraftModel: hasDraftModel);
     }
+
+    /// <summary>
+    /// The KV configuration of a parsed request, with a TurboQuant side's bit width and QJL flag (#1892): run, chat and bench used to drop
+    /// both at parse time and build the default cache.
+    /// </summary>
+    /// <param name="request">The parsed flags.</param>
+    /// <param name="cacheWindow">The <c>--cache-window</c> value.</param>
+    /// <param name="formatMismatch">The mixed-format refusal, or null.</param>
+    /// <returns>The configuration.</returns>
+    internal static KvCacheConfig BuildKvConfig(KvStorageRequest request, int cacheWindow, out string? formatMismatch)
+        => DotLLM.Server.TurboQuantKv.Parse(request.KeyText, request.ValueText, cacheWindow, out formatMismatch);
 
     /// <summary>
     /// Builds a request from the raw option strings. <c>--kv-quant-*</c> and <c>--cache-type-*</c> are

@@ -116,10 +116,11 @@ public sealed class AttentionF32Kernel : IDisposable
         VulkanModule sharedModule, ComputePipeline sharedPipeline,
         VulkanModule? subgroupModule, ComputePipeline? subgroupPipeline,
         VulkanModule? coopmatModule, ComputePipeline? coopmatPipeline,
-        nint pool, DispatchMode mode, VulkanKvStorage kvStorage)
+        nint pool, DispatchMode mode, VulkanKvStorage kvStorage, TurboQuantLayout? tq)
     {
         _device = device;
         KvStorage = kvStorage;
+        _tq = tq;
         _sharedModule = sharedModule;
         _sharedPipeline = sharedPipeline;
         _subgroupModule = subgroupModule;
@@ -134,8 +135,21 @@ public sealed class AttentionF32Kernel : IDisposable
             DispatchMode.Subgroup => subgroupPipeline!,
             _                     => sharedPipeline,
         };
-        _descriptorCache = new DescriptorSetCache(device, pool, active, buffersPerSet: 4);
+        _descriptorCache = TqKvTwin.CreateCache(device, pool, active, 4, tq);
     }
+
+    private readonly TurboQuantLayout? _tq;
+
+    /// <summary>
+    /// The TurboQuant twin (issue #1892): <c>attention_f32[_sg]_kvtq.spv</c>, reading codes and norms in <paramref name="tq"/>'s layout
+    /// in place. The query must already be rotated into K code space and the output is left in V code space (<see cref="TqRotateKernel"/>).
+    /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="tq">Layout of the cached codes and norms.</param>
+    /// <returns>The kernel.</returns>
+    public static AttentionF32Kernel Create(VulkanDevice device, string spvDir, TurboQuantLayout tq)
+        => Create(device, spvDir, VulkanKvStorage.Tq, tq);
 
     /// <summary>
     /// Loads <c>attention_f32.spv</c> (always), <c>attention_f32_sg.spv</c>
@@ -168,7 +182,11 @@ public sealed class AttentionF32Kernel : IDisposable
     /// <param name="kvStorage">Element format of the K / V buffers.</param>
     /// <returns>The kernel.</returns>
     public static AttentionF32Kernel Create(VulkanDevice device, string spvDir, VulkanKvStorage kvStorage)
+        => Create(device, spvDir, kvStorage, null);
+
+    private static AttentionF32Kernel Create(VulkanDevice device, string spvDir, VulkanKvStorage kvStorage, TurboQuantLayout? tq)
     {
+        tq = TqKvTwin.Require(kvStorage, tq);
         string sharedPath = Path.Combine(spvDir, kvStorage.ShaderName("attention_f32") + ".spv");
         if (!File.Exists(sharedPath))
             throw new FileNotFoundException(
@@ -178,7 +196,7 @@ public sealed class AttentionF32Kernel : IDisposable
         ComputePipeline sharedPipeline;
         try
         {
-            sharedPipeline = CreatePipeline(sharedModule);
+            sharedPipeline = CreatePipeline(sharedModule, tq);
         }
         catch
         {
@@ -198,7 +216,7 @@ public sealed class AttentionF32Kernel : IDisposable
                 try
                 {
                     subgroupModule = VulkanModule.LoadFromFile(device, subgroupPath);
-                    subgroupPipeline = CreatePipeline(subgroupModule);
+                    subgroupPipeline = CreatePipeline(subgroupModule, tq);
                 }
                 catch
                 {
@@ -234,7 +252,7 @@ public sealed class AttentionF32Kernel : IDisposable
                 try
                 {
                     coopmatModule = VulkanModule.LoadFromFile(device, coopmatPath);
-                    coopmatPipeline = CreatePipeline(coopmatModule);
+                    coopmatPipeline = CreatePipeline(coopmatModule, null);
                 }
                 catch
                 {
@@ -256,29 +274,19 @@ public sealed class AttentionF32Kernel : IDisposable
             mode = DispatchMode.Subgroup;
         }
 
-        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)(4 + TqKvTwin.Extra(tq)));
         return new AttentionF32Kernel(
             device, sharedModule, sharedPipeline,
             subgroupModule, subgroupPipeline,
             coopmatModule, coopmatPipeline,
-            pool, mode, kvStorage);
+            pool, mode, kvStorage, tq);
     }
 
     internal static bool IsUseCoopmat() =>
         Environment.GetEnvironmentVariable(UseCoopmatEnvVar) == "1";
 
-    private static ComputePipeline CreatePipeline(VulkanModule module)
-    {
-        Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
-        bindings[0] = new VkDescriptorBinding(0);
-        bindings[1] = new VkDescriptorBinding(1);
-        bindings[2] = new VkDescriptorBinding(2);
-        bindings[3] = new VkDescriptorBinding(3);
-        return module.CreateComputePipeline(
-            entryPoint: "main",
-            bindings: bindings,
-            pushConstantBytes: PushConstantBytes);
-    }
+    private static ComputePipeline CreatePipeline(VulkanModule module, TurboQuantLayout? tq)
+        => TqKvTwin.CreatePipeline(module, 4, PushConstantBytes, tq);
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
@@ -334,7 +342,7 @@ public sealed class AttentionF32Kernel : IDisposable
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false,
         float softCap = 0.0f, float scaleOverride = 0.0f,
-        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0, TqKvOperands? tq = null)
     {
         if (seqQ <= 0) throw new ArgumentOutOfRangeException(nameof(seqQ));
         if (seqKv <= 0) throw new ArgumentOutOfRangeException(nameof(seqKv));
@@ -357,12 +365,9 @@ public sealed class AttentionF32Kernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
-        long kvBytes  = KvStorage.KeyRowBytes((long)numKvHeads * headDim) * seqKv;   // per side: mixed block formats (#1884)
-        long kvBytesV = KvStorage.ValueRowBytes((long)numKvHeads * headDim) * seqKv;
         long outBytes = qBytes;
         if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
-        if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
-        if (v.Size      < kvBytesV)  throw new ArgumentException("V buffer too small.",      nameof(v));
+        TqKvTwin.CheckKv(KvStorage, _tq, tq, k, v, seqKv, numKvHeads, headDim);   // per side: mixed block formats (#1884); codes + norms for TurboQuant
         if (output.Size < outBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
         // Coopmat's tiles cap at CoopmatMaxHeadDim; a wider head (gemma4 global,
@@ -379,7 +384,7 @@ public sealed class AttentionF32Kernel : IDisposable
         };
 
         Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
-        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
+        nint descriptorSet = TqKvTwin.GetSet(_descriptorCache, buffers, _tq, tq);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(
