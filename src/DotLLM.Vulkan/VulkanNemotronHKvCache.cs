@@ -187,7 +187,7 @@ public static class VulkanKvStorageExtensions
 /// model-level layer indices into slot indices; a value of <c>-1</c> indicates a
 /// non-attention layer and the cache rejects requests against that index.
 /// </remarks>
-public sealed class VulkanNemotronHKvCache : IKvCache
+public sealed class VulkanNemotronHKvCache : IKvCache, IKvLengthRollback
 {
     private readonly VulkanDevice _device;
     private readonly VulkanDevice.Buffer[] _keys;
@@ -614,6 +614,10 @@ public sealed class VulkanNemotronHKvCache : IKvCache
             throw new ArgumentOutOfRangeException(nameof(length));
         _currentLength = length;
     }
+
+    /// <inheritdoc/>
+    /// <remarks>Every attention layer holds the full history; a cut only lowers the visible length and later writes overwrite the rows past it.</remarks>
+    public bool CanTruncateTo(int length) => (uint)length <= (uint)_currentLength;
 
     /// <summary>
     /// Device-to-device copy of the first <paramref name="length"/> positions into a new, independent cache sized exactly

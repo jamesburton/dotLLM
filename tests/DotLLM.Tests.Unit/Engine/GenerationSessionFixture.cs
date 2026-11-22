@@ -11,6 +11,9 @@ using Xunit;
 
 namespace DotLLM.Tests.Unit.Engine;
 
+/// <summary>Backend a <see cref="GenerationSessionFixture"/> loads its synthetic model on.</summary>
+internal enum SessionBackend { Cpu, Vulkan, Cuda }
+
 /// <summary>
 /// CPU model fixture for the <see cref="GenerationSession"/> tests (#1919): one synthetic GGUF per supported family (attention-only
 /// Llama, GDN-hybrid dense, GDN-hybrid MoE), plus a read-only forward counter hung on the residual-modifier hook so a test can
@@ -33,10 +36,19 @@ internal sealed class GenerationSessionFixture : IDisposable
     public int[] Prompt { get; }
     public int[] Observation { get; }
 
-    public static GenerationSessionFixture Create(string family, int? headDim = null) => new(family, headDim);
+    public static GenerationSessionFixture Create(string family, int? headDim = null, SessionBackend backend = SessionBackend.Cpu)
+        => new(family, headDim, backend);
 
-    private GenerationSessionFixture(string family, int? headDim)
+    /// <summary>Logit tolerance versus a fresh-prefill oracle on the same backend: CPU 1e-4, GPU 5e-4 (#1919).</summary>
+    public float LogitTolerance => Backend == SessionBackend.Cpu ? 1e-4f : 5e-4f;
+
+    public SessionBackend Backend { get; }
+
+    private readonly Func<int, Core.Attention.IKvCache>? _gpuKvFactory;
+
+    private GenerationSessionFixture(string family, int? headDim, SessionBackend backend)
     {
+        Backend = backend;
         _dir = Path.Combine(Path.GetTempPath(), $"dotllm-session-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_dir);
         string path = Path.Combine(_dir, "m.gguf");
@@ -57,7 +69,20 @@ internal sealed class GenerationSessionFixture : IDisposable
 
         _gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(_gguf.Metadata);
-        Model = ModelLoader.CreateCpuModelFromGguf(_gguf, config);
+        switch (backend)
+        {
+            case SessionBackend.Cpu:
+                Model = ModelLoader.CreateCpuModelFromGguf(_gguf, config);
+                break;
+            case SessionBackend.Vulkan:
+                (Model, _gpuKvFactory) = DotLLM.Vulkan.VulkanModelLoader.CreateOnDeviceFromGguf(_gguf, config, physicalIndex: null);
+                break;
+            case SessionBackend.Cuda:
+                (Model, _gpuKvFactory) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(_gguf, config);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(backend));
+        }
         if (family == Llama)
         {
             Tokenizer = GgufBpeTokenizerFactory.Load(_gguf.Metadata);
@@ -71,12 +96,16 @@ internal sealed class GenerationSessionFixture : IDisposable
             Prompt = [3, 4, 5, 6, 3, 7, 5, 4];
             Observation = [6, 3, 5];
         }
-        ((IResidualModifierHost)Model).ResidualModifier = Counter;
+        if (Model is IResidualModifierHost host) host.ResidualModifier = Counter;
     }
+
+    /// <summary>True when the model forwards through the CPU residual-modifier hook, so <see cref="Counter"/> counts real forwards.</summary>
+    public bool CountsForwards => Backend == SessionBackend.Cpu;
 
     public bool IsRecurrent => Model.RequiresPerSequenceState;
 
-    public TextGenerator NewGenerator() => new(Model, Tokenizer);
+    public TextGenerator NewGenerator()
+        => _gpuKvFactory is null ? new(Model, Tokenizer) : new(Model, Tokenizer, kvCacheFactory: (_, size) => _gpuKvFactory(size));
 
     public static CacheProvenanceTag Tag() => new("model-a", "tok-1", "f32", "mods-0", "snap-1");
 

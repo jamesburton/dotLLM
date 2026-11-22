@@ -22,8 +22,8 @@ public sealed class GenerationSessionSamplerHistoryTests
         await using (var s = gen.CreateSession(Penalised(), Tag()))
         {
             await s.PrefillAsync(fx.Prompt);
-            var a = await s.GenerateUntilBoundaryAsync(new StopAfter(4));
-            var b = await s.GenerateUntilBoundaryAsync(new StopAfter(4));
+            var a = await s.GenerateUntilBoundaryAsync(new StopAfter(12));
+            var b = await s.GenerateUntilBoundaryAsync(new StopAfter(12));
             split = [.. a.TokenIds, .. b.TokenIds];
         }
 
@@ -31,7 +31,7 @@ public sealed class GenerationSessionSamplerHistoryTests
         await using (var s = gen.CreateSession(Penalised(), Tag()))
         {
             await s.PrefillAsync(fx.Prompt);
-            whole = [.. (await s.GenerateUntilBoundaryAsync(new StopAfter(8))).TokenIds];
+            whole = [.. (await s.GenerateUntilBoundaryAsync(new StopAfter(24))).TokenIds];
         }
         Assert.Equal(whole, split);
 
@@ -39,7 +39,7 @@ public sealed class GenerationSessionSamplerHistoryTests
         await using (var s = gen.CreateSession(Greedy(), Tag()))
         {
             await s.PrefillAsync(fx.Prompt);
-            unpenalised = [.. (await s.GenerateUntilBoundaryAsync(new StopAfter(8))).TokenIds];
+            unpenalised = [.. (await s.GenerateUntilBoundaryAsync(new StopAfter(24))).TokenIds];
         }
         Assert.NotEqual(unpenalised, whole);   // the penalty must be observable, else the equality above proves nothing
     }

@@ -25,7 +25,7 @@ namespace DotLLM.Engine;
 /// Operations complete synchronously (the model forward is synchronous); cancellation is checked per token and per prefill chunk.
 /// A cancelled or failed prefill is undone to the position it started from when the cache and model can do that, otherwise the
 /// session is faulted and only <see cref="RollbackTo"/>(0) or disposal remain.</para>
-/// <para>Paused sessions are local to the process and model instance. Sampling history for repetition penalties is the current segment.</para>
+/// <para>Paused sessions are local to the process and model instance. Sampler history (repetition penalties, DRY, Gumbel index) is session-wide: every committed token, prompt and observation included.</para>
 /// </remarks>
 public sealed class GenerationSession : IAsyncDisposable
 {
@@ -40,6 +40,7 @@ public sealed class GenerationSession : IAsyncDisposable
     private readonly int[] _posBuf = new int[1];
 
     private int[] _history = new int[64];
+    private readonly CommittedView _committed;
     private int _position;
     private readonly float[] _nextLogits;
     private int _logitsPos = -1;           // position _nextLogits belongs to; -1 = none
@@ -57,6 +58,15 @@ public sealed class GenerationSession : IAsyncDisposable
     private readonly bool _checkpointing;                // recurrent AND the model can checkpoint
     private readonly int _maxBoundaries;
     private readonly List<Boundary> _boundaries = [];
+
+    /// <summary>Sampler history: every committed token (prompt, generated, observation), session-wide, as the model saw them.</summary>
+    private sealed class CommittedView(GenerationSession s) : IReadOnlyList<int>
+    {
+        public int Count => s._position;
+        public int this[int index] => (uint)index < (uint)s._position ? s._history[index] : throw new ArgumentOutOfRangeException(nameof(index));
+        public IEnumerator<int> GetEnumerator() { for (int i = 0; i < s._position; i++) yield return s._history[i]; }
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
 
     private sealed class Boundary(int position, object? checkpoint, float[] logits) : IDisposable
     {
@@ -80,6 +90,7 @@ public sealed class GenerationSession : IAsyncDisposable
         _nextLogits = new float[_vocab];
         _sampleScratch = new float[_vocab];
         _pipeline = new SamplerPipeline(options, _tokenizer);
+        _committed = new CommittedView(this);
         _recurrent = _model.RequiresPerSequenceState;
         _checkpointing = _recurrent && _model.SupportsRecurrentStateCheckpoint;
         long perBoundary = _model.RecurrentStateCheckpointBytes + (long)_vocab * sizeof(float);
@@ -111,6 +122,12 @@ public sealed class GenerationSession : IAsyncDisposable
 
     /// <summary>KV-cache length; equals <see cref="CurrentPosition"/> at every pause (tests assert it).</summary>
     internal int KvLength => _kv.CurrentLength;
+
+    /// <summary>The KV-cache this session owns (tests assert its disposal).</summary>
+    internal IKvCache KvForTest => _kv;
+
+    /// <summary>The recurrent-state checkpoints currently held at boundaries (tests assert their disposal).</summary>
+    internal IReadOnlyList<object?> CheckpointsForTest => [.. _boundaries.Select(b => b.Checkpoint)];
 
     /// <summary>Width of the logits vector <see cref="CopyNextLogits"/> fills.</summary>
     public int VocabSize => _vocab;
@@ -186,7 +203,7 @@ public sealed class GenerationSession : IAsyncDisposable
                     if (_position >= _kv.MaxLength) { finish = FinishReason.Length; break; }
 
                     _nextLogits.CopyTo(_sampleScratch, 0);
-                    int token = _pipeline.Sample(_sampleScratch, generated);
+                    int token = _pipeline.Sample(_sampleScratch, _committed);
                     generated.Add(token);
                     detok.Append(token);
                     var tail = detok.GetTailView(tailSize, scratch);
@@ -418,16 +435,20 @@ public sealed class GenerationSession : IAsyncDisposable
         return KvCanTruncateTo(k - 1);
     }
 
-    private string? KvCanTruncateTo(int length)
+    private string? KvCanTruncateTo(int length) => KvTruncationRefusal(_kv, length);
+
+    /// <summary>Null when <paramref name="kv"/> can be cut to <paramref name="length"/> exactly, else the reason (naming the cache type).</summary>
+    internal static string? KvTruncationRefusal(IKvCache kv, int length)
     {
-        bool ok = _kv switch
+        bool ok = kv switch
         {
             SimpleKvCache simple => simple.CanTruncateTo(length),
             IPrefixReusableKvCache reusable => reusable.CanTruncateTo(length),
+            IKvLengthRollback rollback => rollback.CanTruncateTo(length),
             _ => false,
         };
         return ok ? null
-            : $"The session's KV-cache ({_kv.GetType().Name}) cannot be cut back to {length} positions (rows already dropped or no truncation support).";
+            : $"The session's KV-cache ({kv.GetType().Name}) cannot be cut back to {length} positions (rows already dropped or no truncation support).";
     }
 
     private Boundary? FindBoundary(int position)
