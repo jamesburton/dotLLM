@@ -14,8 +14,10 @@ namespace DotLLM.Cpu.Kernels;
 /// 4 bytes at a time, <c>vpmaddubsw</c> results of the 8 four-position chunks of one sub-block are summed in int16 before ONE
 /// scale multiply (<c>vpdpwssd</c>/<c>vpmaddwd</c>) per sub-block, as llama.cpp's q4_Kx8 kernel does. No weight copy is stored.
 /// <para>
-/// NOT bit-identical to <see cref="MatMul.GemmR4TiledQ4_K"/>: the integer super-block sum is formed exactly and converted to float
-/// once per (row, super-block), where the current kernel keeps eight K-direction int lanes and converts each. int16 headroom: a
+/// The integer super-block sum is formed exactly and converted to float once per (row, super-block): the row-lane arithmetic that
+/// every other Q4_K kernel also follows while <see cref="Q4KRlaActive"/> (MatMulQ4KRla.cs), so its output is bit-identical to the
+/// decode GEMV and the short-batch kernels and a row never depends on its batch (#1927). The older R4 arithmetic
+/// (<c>DOTLLM_CPU_Q4K_ROWLANE=0</c>) keeps eight K-direction int lanes and converts each. int16 headroom: a
 /// <c>vpmaddubsw</c> lane is at most 2 x 15 x 128 = 3,840, eight of them 30,720 &lt; 32,767.
 /// </para>
 /// </summary>

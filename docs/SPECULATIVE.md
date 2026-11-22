@@ -83,7 +83,8 @@ On the CPU backend, a **one-row decode** whose visible history exceeds 2,048 key
 bit-identical (kernel-level difference about 8e-5; per-step KL about 2e-3 on Qwen3-4B at depth 7,600, see
 `docs/PRECISION.md` E18). Consequence, **accepted by James 2026-11-22**: past 2,048 keys, speculative or MTP greedy
 output can differ from plain greedy output on CPU (a near-tie can resolve differently in the verify row than in the plain
-decode row). Below 2,048 keys, and on any decode with sliding window, soft-cap, sinks or ALiBi, decode stays exact.
+decode row). Below 2,048 keys, on any decode with sliding window, soft-cap, sinks or ALiBi, and on paged (`IPagedKvCache`),
+quantized-KV and TurboQuant caches (split-KV serves contiguous F32 caches only), decode stays exact.
 
 - `DOTLLM_CPU_ATTN_SPLITKV=0` restores the tiled decode, which is bit-identical to verify/prefill rows (#530), for runs that need
   exact spec == greedy identity on long contexts.
@@ -91,15 +92,15 @@ decode row). Below 2,048 keys, and on any decode with sliding window, soft-cap, 
   `Attention.OverrideDecodeSplitKvOnThisThread(DecodeSplitKvPartials.Off)` (thread-scoped, no race with other tests):
   `MtpLongContextTests.MtpGreedy_AcrossGrowthAndTheOldCap_MatchesPlainGreedy` (prompts 4,095-4,097).
 
-## CPU: Q4_K prefill batches of 16+ tokens are not bit-identical to decode rows (#1927 E3d)
+## CPU: Q4_K rows are batch-invariant under the row-lane arithmetic (#1927 E3d)
 
-The CPU Q4_K GEMM takes the row-lane kernel (`MatMul.GemmQ4KRowLane8`: 8 output rows per SIMD lane set, the exact integer
-super-block sum converted to float once) for batches of **16 or more tokens**; decode (1 row), speculative/MTP verify batches of
-fewer than 16 rows and short chunks keep the R4 kernel. The two kernels round differently (the row-lane one is closer to float64;
-`docs/PRECISION.md` E19). Consequence, **accepted by James 2026-11-22 (default on)**: on Q4_K models, a token's logits from a
-16+-token prefill batch differ slightly from the same token decoded alone, and a verify batch of 16+ rows (K >= 15) can resolve a
-near-tie differently from plain greedy. `DOTLLM_CPU_Q4K_ROWLANE=0` restores the R4 kernel at every batch size. Tests that assert
-prefill == decode row identity on Q4_K pin it with `MatMul.OverrideQ4KRowLaneOnThisThread(false)`.
+The CPU Q4_K GEMM takes the row-lane kernel (`MatMul.GemmQ4KRowLane8`: 8 output rows per SIMD lane set) for batches of 16 or more
+tokens, and every other Q4_K kernel (decode GEMV, fused decode, verify-sized and short GEMMs) follows the same per-row arithmetic:
+the exact integer super-block sum converted to float once (`docs/PRECISION.md` E19; James 2026-11-22: "if numerically exact we
+could consider the branch"). So on Q4_K weights a token's logits are the same whatever batch it is in: decode, verify and prefill
+rows agree bit for bit, and ForwardBatch output does not depend on server load. `DOTLLM_CPU_Q4K_ROWLANE=0` switches every Q4_K
+kernel back to the older R4 arithmetic (also batch-invariant, slightly further from float64). Speculative / MTP greedy output past
+2,048 keys can still differ from plain greedy because of split-KV attention (section above).
 
 ## KV-Cache Rollback
 

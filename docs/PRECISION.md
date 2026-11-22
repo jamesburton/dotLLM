@@ -670,10 +670,29 @@ K-direction int32 lanes and sums them in float at the end. Same F32 accumulation
 | 7,600-token whole-prompt prefill, tok/s (valid reps, interleaved) | 64.1 [58.7-67.1] (4) | 71.7 [69.4-81.2] (3), 1.12x |
 
 Reading: the row-lane form is closer to exact at kernel level; the model-level KL is the activation-quantization digitisation
-floor seen in E18 (any change of reduction order costs about 2-3e-3 here). Batches under 16 tokens (decode, verify, short chunks)
-keep the R4 kernels, so decode rows stay bit-identical to themselves; prefill rows of 16+ tokens differ from decode rows (#530
-class). **Default on, James 2026-11-22**: CPU prefill batches of 16+ tokens through a Q4_K GEMM are no longer bit-identical
-to decode rows (they are closer to float64); `DOTLLM_CPU_Q4K_ROWLANE=0` restores the R4 kernel everywhere.
+floor seen in E18 (any change of reduction order costs about 2-3e-3 here).
+
+**Batch invariance (James 2026-11-22: "if numerically exact we could consider the branch").** Every Q4_K kernel now follows the
+row-lane arithmetic ("RLA": exact int32 super-block sum, `acc = fma(d4*d8, (float)S, acc)`, `sm += (dmin*d8)*(float)mc`, result
+`acc - sm`): the 4-row decode dispatcher, the single-row tails, the 4-token R4 kernel, the row-major tiled GEMM and the row-lane
+GEMM (`MatMulQ4KRla.cs`, scalar oracle `Q4KRlaDot1Scalar`). A row's bits therefore never depend on the batch size or on what else
+shares the GEMM: n = 1 decode, ForwardBatch of 20 sequences, short chunks and long prefills agree bit for bit
+(`Q4KRowLaneTests.Row_IsBitIdentical_AcrossPathsBatchSizesAndPositions`,
+`TransformerModelForwardBatchTests.ForwardBatch_Q4KM_TwentyConcurrentDecodes_AreBitIdenticalToEachDecodedAlone`), so no
+single-sequence gate is needed. The 16-token threshold is a speed choice only. Hosts without AVX2 + SSE4.1 + FMA keep the R4
+arithmetic everywhere (also batch-invariant). `DOTLLM_CPU_Q4K_ROWLANE=0` restores the R4 arithmetic everywhere; R4 and RLA outputs
+differ from each other (by the KL above).
+
+Cost at n = 1 (2026-11-22, Strix, cpu-bench + gpu + cpu held, interleaved):
+
+| measure | R4 arithmetic (`=0`) | RLA (default) |
+|---|---|---|
+| Q4_K GEMV kernel, 14 threads, us/call, 4096x2560 / 12800x4096 / 9728x2560 (9 rounds) | 39.6 / 190.3 / 110.0 | 47.1 / 226.5 / 126.2 (1.13-1.19x slower) |
+| Qwen3-4B Q4_K_M decode tok/s, `bench -p 512 -n 128`, 5 interleaved reps each | 29.51 [29.20-29.64] | 29.32 [29.00-29.70] (0.994x: no change) |
+| same runs, pp512 tok/s | 188.7 [185.3-191.6] | 230.4 [227.8-242.7] (1.22x) |
+
+The per-super-block horizontal int sum costs the GEMV kernel 13-19%, invisible end to end (decode is bound elsewhere). A blocked
+eight-super-block reduction was tried and was no faster.
 
 ## 6. Decision table: CLAUDE.md rule → evidence
 
@@ -714,7 +733,7 @@ PRs #1103, #1122, #1125, #1126.
 | C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence (speculative verify: read-only scan + in-place replay of row inputs, no state copy at all, #1194) | sign-off pending | #1144 |
 | C10 | CPU | chunk store entries (`--chunk-store-write`, `chunkcache build --offline`): F32 K and V rows per layer on disk, encoded through `SimpleKvCache` into managed `float[]` per layer (`ChunkEncoder`) | L8B 256 KiB/token on disk and in the encode (one 512-token chunk: 128 MiB); Qwen3-4B 288 KiB/token | **signed-off temporary exception** (James, 2026-11-20, #1912): the format predates the writer and the chunk key carries the dtype, so a new format is a new cache line, not a migration; target F16 then q8_0 in native memory | #1913 |
 | C11 | CPU | blocked prefill attention: dense F32 K/V tile pack per worker | 256 KiB per worker at hd128, context-independent | **signed off** (James 2026-11-21, bounded F32 tile pack; follows cache dtype under #1107) | #1927 |
-| C12 | CPU | split-KV decode partials: output F16, max/sum F32 scalars | 248 KiB at 7.6K (7.5 KiB of it F32 max/sum) | **signed off** (James 2026-11-21: F16 partials, F32 running max/sum); evidence E18 | #1927 |
+| C12 | CPU | split-KV decode partials (output F16, max/sum F32 scalars), per forward thread; plus the per-worker F32 working set (scores `[H][256]`, accumulators `[H][hd]`) in the shared tile holder | partials `ceil(visible/256) x H x (2 hd + 8)` B, grown geometrically: 248 KiB at 7.6K, about 1.1 MiB at 32K, about 4.3 MiB at 128K (32 heads, hd128), about 8.6 MB at 64 heads and 128K. Working set `2 x max(H x 256, H x hd) x 4` B per worker (64 KiB at H = 32, 512 KiB at H = 256), per-tile and context-independent (design-note option (b), not the context-sized E2b matrix). Freed by `CpuKernelScratch.Trim` (model dispose, pool teardown) or at thread exit | **signed off** (James 2026-11-21: F16 partials, F32 running max/sum); evidence E18. F16 saturates at 65,504: assumes V activations below that | #1927 |
 | X1 | CPU | safetensors BF16 → F32 | L8B +16 GB; L1B +2.5 GB | open | #1143 (needs #1118) |
 | X2 | CPU | MLA-MoE routed experts → F32 | ≈57 GB on V2-Lite | open | #1140 |
 | X3 | CPU | MLA projections, shared / Granite-MoE experts → F32 | `Σ out·in·4` | open | #1140 |

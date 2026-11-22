@@ -448,7 +448,6 @@ public static class Attention
             return;
         }
 
-
         fixed (float* sinksPtr = sinks)
         {
             var ctx = new AttentionCtx
@@ -2293,8 +2292,9 @@ public static class Attention
 
     /// <summary>
     /// Per-thread dense K/V tile buffers (native, 64-byte aligned, grown on demand): the decoded tile ring of the blocked TurboQuant
-    /// prefill and the packed F32 tile of <see cref="BlockedCausalItem"/> (#1927). A worker runs one kernel at a time, so the two
-    /// share one holder. Deliberate, bounded exception to the "wrap all
+    /// prefill, the packed F32 tile of <see cref="BlockedCausalItem"/> and the split-KV per-tile scores and accumulators (#1927). A
+    /// worker runs one kernel at a time, so they share one holder. (The split-KV partials, which DO grow with context, live in
+    /// <see cref="SplitKvPartialBuffers"/>.) Deliberate, bounded exception to the "wrap all
     /// unmanaged memory in a deterministically disposed owner" rule (#1892): the ring is one worker thread's scratch, at most
     /// <c>4 * TileSize * headDim * 4</c> bytes (512 KiB at hd 128, with a sliding window), never scales with the cached length, and is
     /// reused across layers and calls so the hot path allocates nothing. It is freed by this holder's finalizer when the thread exits;
