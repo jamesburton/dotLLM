@@ -39,8 +39,15 @@ internal sealed class GenerationSessionFixture : IDisposable
     public static GenerationSessionFixture Create(string family, int? headDim = null, SessionBackend backend = SessionBackend.Cpu)
         => new(family, headDim, backend);
 
-    /// <summary>Logit tolerance versus a fresh-prefill oracle on the same backend: CPU 1e-4, GPU 5e-4 (#1919).</summary>
+    /// <summary>
+    /// Logit tolerance versus a fresh-prefill oracle on the same backend: CPU 1e-4 absolute; GPU 5e-4 absolute plus 1e-3 relative (#1919).
+    /// The relative term is measured, not assumed: the Vulkan Llama path (F16 KV, batched prefill vs one-row decode kernels) differs
+    /// by up to 1.3e-3 on logits of magnitude ~2.4 between a rolled-back/appended session and a fresh prefill, with identical tokens.
+    /// </summary>
     public float LogitTolerance => Backend == SessionBackend.Cpu ? 1e-4f : 5e-4f;
+
+    /// <summary>Relative part of the tolerance (0 on CPU).</summary>
+    public float LogitRelativeTolerance => Backend == SessionBackend.Cpu ? 0f : 1e-3f;
 
     public SessionBackend Backend { get; }
 

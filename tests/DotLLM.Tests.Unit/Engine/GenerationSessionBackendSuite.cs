@@ -27,7 +27,7 @@ public abstract class GenerationSessionBackendSuite
     {
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
-            Assert.True(Math.Abs(expected[i] - actual[i]) <= fx.LogitTolerance, $"logit {i}: {expected[i]} vs {actual[i]}");
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= fx.LogitTolerance + fx.LogitRelativeTolerance * Math.Abs(expected[i]), $"logit {i}: {expected[i]} vs {actual[i]}");
     }
 
     private static async Task<(float[] Logits, int[] Next)> Fresh(GenerationSessionFixture oracle, IEnumerable<int> tokens)
