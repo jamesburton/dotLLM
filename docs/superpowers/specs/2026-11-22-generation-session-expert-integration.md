@@ -44,7 +44,10 @@ API as in the issue, plus:
 
 ## #1920 Hidden-state taps (Core, Models, Cuda, Vulkan)
 - `DotLLM.Core.Diagnostics`: `HiddenStateTapSubscription(int[]? Layers, HookPoint[] Points, TapRows Rows = Last, BufferProvider?)`.
-  Supported points: `PostEmbedding` (layer -1), `PostLayer`, `PreLmHead` (residual after the last layer, **before** the final norm; layer -1).
+  Supported points: `PostEmbedding` (layer -1), `PostLayer`, `PreLmHead` (**post-final-norm**: the exact input of the LM head, what a logit lens needs; layer -1) and a new
+  `PreFinalNorm` appended to `HookPoint` (the residual after the last layer, before the final norm; what residual probes need). Both are exposed because the consumer
+  (neuro-symbolic-ai) does not pin it down: its residual host works on the raw residual stream (`ForwardPassResult.FinalHiddenState`, layer snapshots), its research notes
+  ask for 25/50/75% depth sites, and nothing there says which side of the norm. Rows for the two final points are the rows fed to the LM head (normally the last row).
   Other `HookPoint`s throw `NotSupportedException` at registration (fused kernels; the consumer needs depth probes + PreLmHead; stated, never silently ignored).
   `TapRows.Last` (default, decode-friendly, prefill copies one row) or `All`. `Layers` null = all; indices validated against the model.
 - `HiddenStateSample` readonly record struct `(HookPoint Point, int LayerIndex, int RowIndex, int TokenPosition, int SequenceId, int Step, ReadOnlyMemory<float> Data)`;
@@ -52,14 +55,19 @@ API as in the issue, plus:
   F32 because the public hook contract is `float`; the GPU F16 residual is converted at the host boundary only (no device F32 store).
 - `IHiddenStateTapHost { IDisposable RegisterTap(sub, Action<HiddenStateSample>); IDisposable RegisterAbortableTap(sub, Func<HiddenStateSample, HookResult>); }`.
   Abortable callbacks may return only `Continue` or `AbortForward` (`Replace` rejected: read-only; injection stays with `IResidualModifier`).
-- `HookResult.AbortForward` singleton. Abort surfaces as `ForwardAbortedException(Layer, Point)` thrown from `Forward`. Reason: `Forward` returns `ITensor`; a null or
-  sentinel return would be silently misused. Before throwing, the model rolls KV back to its length at entry and restores recurrent state (checkpoint taken at entry
+- `HookResult.AbortForward` singleton. Two surfaces, one implementation (each model has an internal forward core returning an abort outcome):
+  `IHiddenStateTapHost.TryForward(tokenIds, positions, kvCache, out ITensor? logits, out ForwardAbortInfo abort)` returns `bool` with no exception (hot-path early exit per token),
+  and the legacy `IModel.Forward` throws `ForwardAbortedException(Layer, Point)` when an abort happens (a null/sentinel return would be silently misused). Consumer check: neuro-symbolic-ai
+  has no per-token early-exit code today (its "routing" is concept routing), but the issue targets mid-layer routing, which can be per token, so the non-throwing path is the primary one. Before throwing, the model rolls KV back to its length at entry and restores recurrent state (checkpoint taken at entry
   **only when an abortable tap is attached**; read-only taps never checkpoint). Layers after L and the LM head are skipped.
 - Registry: `HiddenStateTapRegistry` (Core) holds an immutable snapshot swapped atomically; a model reads it once per forward into a local that is `null` when nothing
   is attached, so the unattached per-layer cost is one local null check. Delivery: CPU inline at the point. GPU: read-only taps deliver after the forward's work
   completes (before `Forward` returns), in (point, layer) order; abortable taps force a sync at the subscribed point (Vulkan: split submit; CUDA: stream sync + D2H).
 - With any tap attached the backend leaves its fast path: CUDA decode graphs bypassed (DFlash/profiling precedent), Vulkan fused decode bypassed, packed `ForwardBatch`
   falls back to per-sequence (the `ResidualModifier` precedent). Unattached paths are unchanged.
+- Path counters: `HiddenStateTapRegistry.PathCounters` (Interlocked counters: `TapForwards`, `CudaGraphBypassed`, `VulkanFusedDecodeBypassed`, `PackedBatchFallbacks`, `AbortedForwards`,
+  `AbortCheckpoints`) plus a one-time Information log when a fast path is bypassed. Tests assert the counters (proves which path ran, and that unattached runs never move them).
+  The cost of the eager fallbacks is documented in `docs/DIAGNOSTICS.md`.
 - Wiring scope (three families x CPU/CUDA/Vulkan = 9 classes), main forward loops: `TransformerModel`, `CudaTransformerModel`, `VulkanTransformerModel`, the three
   `Qwen3HybridDense*` and the three `Qwen3MoeHybrid*`. Out of scope and NOT implementing the interface (registration fails by type, loudly): Gemma loops, pipeline and CPU-GPU split
   models, CloverPreview, other architectures. Listed in the PR.
