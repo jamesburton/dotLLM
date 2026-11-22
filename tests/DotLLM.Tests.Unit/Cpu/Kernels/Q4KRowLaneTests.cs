@@ -117,11 +117,12 @@ public sealed unsafe class Q4KRowLaneTests
     /// The batch-invariance gate (#530, #1927): a token's output rows are bit-identical whatever path and batch serve it: the row-major
     /// ComputeRows (decode / fused decode), the F32-input GEMV, the R4 GEMM at n = 1 and 7 (4-token and single-token kernels), and
     /// the row-lane GEMM at n = 16, 17 and 64 (paired and tail positions), serial and pooled. m = 44 (m % 8 = 4) cannot take the
-    /// row-lane kernel and must still give the same bits through the R4 kernels.
+    /// row-lane kernel and must still give the same bits through the R4 kernels; m = 46 adds two single-row tail rows.
     /// </summary>
     [SkippableTheory]
     [InlineData(48, 512)]
     [InlineData(44, 512)]
+    [InlineData(46, 512)]   // m % 4 = 2: the single-row tail kernels
     [InlineData(64, 2560)]
     public void Row_IsBitIdentical_AcrossPathsBatchSizesAndPositions(int m, int k)
     {
