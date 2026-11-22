@@ -91,6 +91,17 @@ decode row). Below 2,048 keys, and on any decode with sliding window, soft-cap, 
   `Attention.OverrideDecodeSplitKvOnThisThread(DecodeSplitKvPartials.Off)` (thread-scoped, no race with other tests):
   `MtpLongContextTests.MtpGreedy_AcrossGrowthAndTheOldCap_MatchesPlainGreedy` (prompts 4,095-4,097).
 
+## CPU: Q4_K prefill batches of 16+ tokens are not bit-identical to decode rows (#1927 E3d)
+
+The CPU Q4_K GEMM takes the row-lane kernel (`MatMul.GemmQ4KRowLane8`: 8 output rows per SIMD lane set, the exact integer
+super-block sum converted to float once) for batches of **16 or more tokens**; decode (1 row), speculative/MTP verify batches of
+fewer than 16 rows and short chunks keep the R4 kernel. The two kernels round differently (the row-lane one is closer to float64;
+`docs/PRECISION.md` E19). Consequence, **accepted by James 2026-11-22 (default on)**: on Q4_K models, a token's logits from a
+16+-token prefill batch differ slightly from the same token decoded alone, and a verify batch of 16+ rows (K >= 15) can resolve a
+near-tie differently from plain greedy. `DOTLLM_CPU_Q4K_ROWLANE=0` restores the R4 kernel at every batch size. Tests that assert
+prefill == decode row identity on Q4_K pin it with `MatMul.OverrideQ4KRowLaneOnThisThread(false)`.
+
+## KV-Cache Rollback
 
 Speculated tokens that are rejected need their KV-cache entries invalidated:
 - Draft model KV-cache: roll back to pre-speculation position.

@@ -656,7 +656,7 @@ verify rows past 2,048 keys, #530) is the accepted consequence of E2c: **James 2
 are not bit-identical to prefill / verify rows, so speculative / MTP greedy output can differ from plain greedy on CPU
 (`docs/SPECULATIVE.md`; `DOTLLM_CPU_ATTN_SPLITKV=0` restores exact identity).
 
-### E19 - CPU Q4_K row-lane GEMM accumulation order (#1927 E3d, opt-in `DOTLLM_CPU_Q4K_ROWLANE=1`)
+### E19 - CPU Q4_K row-lane GEMM accumulation order (#1927 E3d, default on, `DOTLLM_CPU_Q4K_ROWLANE=0` off)
 
 The row-lane kernel forms each (row, super-block) integer sum exactly and converts it to float once; the R4 kernel converts eight
 K-direction int32 lanes and sums them in float at the end. Same F32 accumulation across super-blocks, int32 integer stage.
@@ -672,7 +672,8 @@ K-direction int32 lanes and sums them in float at the end. Same F32 accumulation
 Reading: the row-lane form is closer to exact at kernel level; the model-level KL is the activation-quantization digitisation
 floor seen in E18 (any change of reduction order costs about 2-3e-3 here). Batches under 16 tokens (decode, verify, short chunks)
 keep the R4 kernels, so decode rows stay bit-identical to themselves; prefill rows of 16+ tokens differ from decode rows (#530
-class) when the switch is on. Default-on needs a ruling.
+class). **Default on, James 2026-11-22**: CPU prefill batches of 16+ tokens through a Q4_K GEMM are no longer bit-identical
+to decode rows (they are closer to float64); `DOTLLM_CPU_Q4K_ROWLANE=0` restores the R4 kernel everywhere.
 
 ## 6. Decision table: CLAUDE.md rule → evidence
 

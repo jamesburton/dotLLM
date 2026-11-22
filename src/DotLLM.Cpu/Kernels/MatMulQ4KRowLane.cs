@@ -7,7 +7,7 @@ using DotLLM.Cpu.Threading;
 namespace DotLLM.Cpu.Kernels;
 
 /// <summary>
-/// Row-lane Q4_K GEMM (#1927 E3d; opt-in via <see cref="Q4KRowLaneEnabled"/>, n >= 16, m % 8 == 0): Q4_K x Q8_K GEMM with SIMD lanes over 8 OUTPUT ROWS,
+/// Row-lane Q4_K GEMM (#1927 E3d; default on, James 2026-11-22; <see cref="Q4KRowLaneEnabled"/>, n >= 16, m % 8 == 0): Q4_K x Q8_K GEMM with SIMD lanes over 8 OUTPUT ROWS,
 /// read in place from the native row-major (mmap'd) Q4_K layout. Each 8-row block's super-blocks are transposed once into a
 /// bounded per-worker L1/L2 tile (lane r = row r's 4 consecutive nibbles), then reused by every token: activations are broadcast
 /// 4 bytes at a time, <c>vpmaddubsw</c> results of the 8 four-position chunks of one sub-block are summed in int16 before ONE
@@ -23,13 +23,11 @@ public static unsafe partial class MatMul
     /// <summary>True when the row-lane kernel can run (AVX2 + SSE4.1 + FMA; AVX-VNNI used when present).</summary>
     internal static bool Q4KRowLaneIsa => CpuFeatures.Avx2 && CpuFeatures.Sse41 && CpuFeatures.Fma;
 
-    private static readonly string? s_q4kRowLaneEnv = Environment.GetEnvironmentVariable("DOTLLM_CPU_Q4K_ROWLANE");
-
     /// <summary>
-    /// Runtime switch for the Q4_K row-lane GEMM (<c>DOTLLM_CPU_Q4K_ROWLANE=1</c> on, <c>0</c> off). Settable for in-process A/B and
-    /// quality gates. Not bit-identical to the R4 kernels; see the class remarks.
+    /// Runtime switch for the Q4_K row-lane GEMM: default ON (James 2026-11-22), <c>DOTLLM_CPU_Q4K_ROWLANE=0</c> off. Settable for
+    /// in-process A/B and quality gates. Not bit-identical to the R4 kernels (closer to float64); see the class remarks.
     /// </summary>
-    public static bool Q4KRowLaneEnabled { get; set; } = s_q4kRowLaneEnv == "1";
+    public static bool Q4KRowLaneEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_CPU_Q4K_ROWLANE") != "0";
 
     /// <summary>Fewest tokens for which a Q4_K GEMM takes the row-lane kernel: shorter batches (decode, verify, short chunks) keep the
     /// R4 kernels, so a decode row and a short verify batch still agree bit for bit (#530).</summary>
@@ -40,6 +38,26 @@ public static unsafe partial class MatMul
 
     /// <summary>Thread-scoped override of <see cref="Q4KRowLaneEnabled"/> for tests (read on the GEMM's calling thread).</summary>
     [ThreadStatic] internal static bool? t_q4kRowLaneOverride;
+
+    /// <summary>
+    /// Pins the Q4_K row-lane choice for GEMMs issued from the calling thread until disposed (tests that assert prefill == decode
+    /// row identity: they need the R4 kernel at every batch size, without racing other tests through the process-wide switch).
+    /// </summary>
+    internal static Q4KRowLaneScope OverrideQ4KRowLaneOnThisThread(bool enabled)
+    {
+        var scope = new Q4KRowLaneScope(t_q4kRowLaneOverride);
+        t_q4kRowLaneOverride = enabled;
+        return scope;
+    }
+
+    /// <summary>Restores the previous thread-scoped row-lane override on dispose.</summary>
+    internal readonly struct Q4KRowLaneScope : IDisposable
+    {
+        private readonly bool? _previous;
+        internal Q4KRowLaneScope(bool? previous) => _previous = previous;
+        /// <inheritdoc/>
+        public void Dispose() => t_q4kRowLaneOverride = _previous;
+    }
 
     internal static bool Q4KRowLaneApplies(int m, int tailRows, int n)
         => (t_q4kRowLaneOverride ?? Q4KRowLaneEnabled) && Q4KRowLaneIsa && n >= Q4KRowLaneMinTokens && tailRows == 0 && m % 8 == 0;
