@@ -17,7 +17,15 @@ public sealed unsafe partial class CudaTransformerModel
     private CudaHiddenStateTaps? _tapTs;   // the plan of the forward in flight (null: untapped)
     private ForwardAbortInfo _tapAbort;
 
-    private CudaHiddenStateTaps TapState => _tapState ??= new CudaHiddenStateTaps(Config.NumLayers, Config.HiddenSize);
+    private CudaHiddenStateTaps TapState
+    {
+        get
+        {
+            // Two concurrent first registrations must share one registry (a plain ??= could drop one, whose tap would then never fire).
+            return _tapState ?? Interlocked.CompareExchange(ref _tapState, new CudaHiddenStateTaps(Config.NumLayers, Config.HiddenSize), null)
+                ?? _tapState!;
+        }
+    }
 
     private void GuardTapsSupported()
     {
@@ -91,7 +99,7 @@ public sealed unsafe partial class CudaTransformerModel
         if (deferredHostDest != 0)
             throw new InvalidOperationException("A tapped forward cannot defer its logits copy (the taps deliver after the forward's synchronize).");
 
-        int kvEntry = -1;
+        int kvEntry = kvCache?.CurrentLength ?? -1;   // every tapped forward records it (free): a throwing callback must not leave KV half-advanced
         try
         {
             if (taps.HasAbortable)
@@ -100,7 +108,7 @@ public sealed unsafe partial class CudaTransformerModel
                 HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
             }
             _context.MakeCurrent();
-            ts!.Begin(taps, positions);
+            ts!.Begin(taps, positions, _stream.Handle);
             _tapTs = ts;
             var result = ForwardInternalCore(tokenIds, positions, deviceId, kvCache, suppressGraphCapture, deferredHostDest);
             if (result is null)
@@ -109,6 +117,13 @@ public sealed unsafe partial class CudaTransformerModel
                 HiddenStateTapRegistry.PathCounters.AddAbortedForward();
             }
             return result;
+        }
+        catch
+        {
+            // A throwing tap callback (or any failure on the tapped path): drain in-flight copies, undo the KV writes, rethrow.
+            try { _stream.Synchronize(); } catch (Exception) { /* the original failure wins */ }
+            CudaHiddenStateTaps.RollbackKvAfterFailure(kvCache, kvEntry);
+            throw;
         }
         finally
         {
@@ -139,6 +154,7 @@ public sealed unsafe partial class CudaTransformerModel
     private IReadOnlyList<ITensor> ForwardBatchTapped(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
     {
         var ts = _tapState!;
+        HiddenStateTapRegistry.PathCounters.AddPackedBatchFallback();
         var results = new ITensor[requests.Count];
         int done = 0;
         try

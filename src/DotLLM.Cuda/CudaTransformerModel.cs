@@ -2293,6 +2293,7 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
     {
         ArgumentNullException.ThrowIfNull(requests);
         if (requests.Count == 0) return Array.Empty<ITensor>();
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.RefuseAbortableBatch(_tapState?.Registry.Current);   // abort of request i would leave 0..i-1 committed (#1920 I-6)
         _context.MakeCurrent();
         if (requests.Count == 1)
         {
@@ -5212,8 +5213,8 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
     {
         if (_disposed) return;   // idempotent: a refusal path and a finally may both dispose (#1892)
         _disposed = true;
-        _tapState?.Dispose();
         _context.MakeCurrent();
+        _tapState?.Dispose();   // after MakeCurrent: cuMemFreeHost needs the context
         CudaMemTrace.Dump("CudaTransformerModel.Dispose");
         ReportLaunchProfile();
         _cudaLora?.Dispose();

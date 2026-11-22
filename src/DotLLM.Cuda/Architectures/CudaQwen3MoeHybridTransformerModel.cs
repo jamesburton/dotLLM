@@ -1809,7 +1809,7 @@ public sealed unsafe partial class CudaQwen3MoeHybridTransformerModel : IModel, 
 
         nint streamH = _stream.Handle;
         var ts = taps is not null ? _tapState : null;
-        ts?.Begin(taps!, positions);
+        ts?.Begin(taps!, positions, _stream.Handle);
         var tapAt = default(DotLLM.Core.Diagnostics.ForwardAbortInfo);
 
         // ── Upload tokenIds + positions to device ──

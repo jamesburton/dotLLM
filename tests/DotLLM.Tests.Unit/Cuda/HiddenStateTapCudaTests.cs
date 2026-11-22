@@ -24,7 +24,7 @@ internal sealed class CudaHiddenStateTapFixture : HiddenStateTapFixture
     private readonly ModelConfig _config;
     private readonly bool? _savedGraphOverride;
 
-    public CudaHiddenStateTapFixture(string family, string ptxDir, bool graphs = false)
+    public CudaHiddenStateTapFixture(string family, string ptxDir, bool graphs = false, bool withMtp = false)
     {
         Family = family;
         _dir = Path.Combine(Path.GetTempPath(), $"dotllm-taps-cuda-{Guid.NewGuid():N}");
@@ -37,7 +37,7 @@ internal sealed class CudaHiddenStateTapFixture : HiddenStateTapFixture
                 Prompt = [3, 9, 14, 5, 21, 8, 30, 2];
                 break;
             case HiddenStateTapBackendSuite.HybridDense:
-                SyntheticQwen35HybridDenseMtpGguf.Write(path, withMtp: false, contextLength: 256);
+                SyntheticQwen35HybridDenseMtpGguf.Write(path, withMtp: withMtp, contextLength: 256);
                 Prompt = [3, 4, 5, 6, 3, 7, 5, 4];
                 break;
             case HiddenStateTapBackendSuite.MoeHybrid:
@@ -144,6 +144,9 @@ public sealed class HiddenStateTapCudaTests : HiddenStateTapBackendSuite
     }
 
     protected override HiddenStateTapFixture Open(string family) => new CudaHiddenStateTapFixture(family, RequireCuda());
+
+    protected override HiddenStateTapFixture? OpenHybridDenseWithMtp()
+        => new CudaHiddenStateTapFixture(HybridDense, RequireCuda(), withMtp: true);
 
     private static bool IsCudaDriverPresent()
     {

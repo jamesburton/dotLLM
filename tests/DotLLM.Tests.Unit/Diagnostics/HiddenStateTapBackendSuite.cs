@@ -549,6 +549,47 @@ public abstract class HiddenStateTapBackendSuite
         finally { (mtp as IDisposable)?.Dispose(); (mtpC as IDisposable)?.Dispose(); }
     }
 
+    /// <summary>
+    /// I-7: while verify-row snapshots are pending (a read-only verify forward, before RestoreRecurrentStateToRow) an abortable forward is
+    /// refused up front: its entry checkpoint would commit the rejected draft rows. The restore afterwards still works and the next forward
+    /// equals a control that never saw the refused call.
+    /// </summary>
+    [SkippableFact]
+    public void AbortableTap_WhileVerifyRowsPending_IsRefused_AndRestoreToRowStillWorks()
+    {
+        using var fx = Open(HybridDense);
+        Skip.IfNot(fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+        Skip.IfNot(fx.Model.SupportsRecurrentRowSnapshots, "no read-only verify on this host/device");
+        using var control = Open(HybridDense);
+        using var kvA = fx.NewKv(); using var kvC = control.NewKv();
+        int P = fx.Prompt.Length;
+        int[] pp = Enumerable.Range(0, P).ToArray();
+        using (fx.Model.Forward(fx.Prompt, pp, -1, kvA)) { }
+        using (control.Model.Forward(control.Prompt, pp, -1, kvC)) { }
+        int[] draft = [fx.Prompt[1], fx.Prompt[2], fx.Prompt[3]];
+        int[] dpos = [P, P + 1, P + 2];
+        using (fx.Model.ForwardWithRecurrentSnapshots(draft, dpos, -1, kvA, null)) { }
+        using (control.Model.ForwardWithRecurrentSnapshots(draft, dpos, -1, kvC, null)) { }
+
+        using (var h = fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, [HookPoint.PostLayer]), _ => HookResult.Continue))
+        {
+            HiddenStateTapRegistry.PathCounters.Reset();
+            Assert.Throws<NotSupportedException>(() => fx.Model.Forward([fx.Prompt[4]], [P + 3], -1, kvA));
+            Assert.Equal(P + 3, kvA.CurrentLength);
+            Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
+        }
+
+        // Accept only the first draft row on both: rejected rows must not have been committed by the refused call.
+        kvA.Rollback(P + 1); kvC.Rollback(P + 1);
+        fx.Model.RestoreRecurrentStateToRow(0);
+        control.Model.RestoreRecurrentStateToRow(0);
+        using var la = fx.Model.Forward([fx.Prompt[5]], [P + 1], -1, kvA);
+        using var lc = control.Model.Forward([fx.Prompt[5]], [P + 1], -1, kvC);
+        var ra = LastRow(la, fx.Vocab); var rc = LastRow(lc, control.Vocab);
+        if (fx.BitExact) Assert.True(ra.AsSpan().SequenceEqual(rc), "logits differ: the refused abortable forward committed the pending rows");
+        else Assert.All(ra.Zip(rc), q => Assert.InRange(q.First - q.Second, -1e-2f, 1e-2f));
+    }
+
     // ── ForwardBatch ──────────────────────────────────────────────────────────
 
     private static IReadOnlyList<ITensor> RunBatch(HiddenStateTapFixture fx, IKvCache k0, IKvCache k1, IModel m)

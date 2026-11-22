@@ -20,7 +20,14 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
     private bool _tapAborted;
     private ForwardAbortInfo _tapAbort;
 
-    private CudaHiddenStateTaps TapState => _tapState ??= new CudaHiddenStateTaps(Config.NumLayers, Config.HiddenSize);
+    private CudaHiddenStateTaps TapState
+    {
+        get
+        {
+            return _tapState ?? Interlocked.CompareExchange(ref _tapState, new CudaHiddenStateTaps(Config.NumLayers, Config.HiddenSize), null)
+                ?? _tapState!;
+        }
+    }
 
     private void GuardTapsSupported()
     {
@@ -68,8 +75,11 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
     {
         ArgumentNullException.ThrowIfNull(requests);
         if (requests.Count == 0) return Array.Empty<ITensor>();
+        // An abort of request i would leave requests 0..i-1 committed: refused up front (#1920 I-6), before any state changes.
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.RefuseAbortableBatch(_tapState?.Registry.Current);
         var results = new ITensor[requests.Count];
         var ts = _tapState;
+        int done = 0;
         try
         {
             for (int i = 0; i < requests.Count; i++)
@@ -77,7 +87,13 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
                 var r = requests[i];
                 if (ts is not null) ts.SeqId = i;
                 results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.Adapter, mtpState: null, r.LastTokenLogitsOnly);
+                done++;
             }
+        }
+        catch
+        {
+            for (int d = 0; d < done; d++) results[d].Dispose();   // do not leak the completed requests' logits
+            throw;
         }
         finally
         {
@@ -102,37 +118,51 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
         if (taps is null || tokenIds.Length == 0 || tokenIds.Length != positions.Length)
             return ForwardCoreInner(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly, mtpState);
 
-        // An MTP/DFlash capture reads the trunk hidden state itself; combining it with a tap is refused rather than half-working.
-        if (mtpState is not null)
-            throw new NotSupportedException("Hidden-state taps are not supported together with an MTP/DFlash state on the same forward.");
         GuardTapsSupported();
 
-        int kvEntry = -1;
+        bool abortable = taps.HasAbortable;
+        int kvEntry = kvCache?.CurrentLength ?? -1;   // every tapped forward records it (free): a throwing callback must not leave KV half-advanced
         object? ckpt = null;
         _tapAborted = false;
         _tapFinalTile = true;
         try
         {
-            if (taps.HasAbortable)
+            bool pending = _rowSnapshotValidRows > 0;   // verify-row snapshots that CheckpointRecurrentState would commit
+            if (abortable)
             {
+                // An MTP/DFlash head is updated after the trunk and is not covered by the checkpoint: abortable + MTP is refused on every
+                // backend. A read-only tap with an MTP state only reads, so it is supported (delivered after the capture).
+                if (mtpState is not null)
+                    throw new NotSupportedException("An abortable hidden-state tap cannot be combined with an MTP/DFlash state on this forward.");
+                // CheckpointRecurrentState runs CommitPendingRows: it would commit rejected draft rows that RestoreRecurrentStateToRow still needs.
+                if (pending)
+                    throw new NotSupportedException(
+                        "An abortable hidden-state tap cannot start while verify-row snapshots are pending (RestoreRecurrentStateToRow has not run): "
+                        + "the entry checkpoint would commit the rejected draft rows. Nothing was modified.");
                 kvEntry = CudaHiddenStateTaps.KvCheckpoint(kvCache, positions);
-                ckpt = CheckpointRecurrentState();
                 HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
             }
+            // Entry checkpoint: always for an abortable tap; for a read-only tap too (a throwing callback must leave the recurrent state
+            // consistent with the rolled-back KV), except with an MTP state or pending verify rows, which a checkpoint cannot cover.
+            if (abortable || (mtpState is null && !pending))
+                ckpt = CheckpointRecurrentState();
             _context.MakeCurrent();
-            ts!.Begin(taps, positions);
+            ts!.Begin(taps, positions, _stream.Handle);
             _tapTs = ts;
             var result = ForwardCoreInner(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly, mtpState);
             if (result is null && _tapAborted)
             {
-                if (kvCache is not null && kvEntry >= 0) kvCache.Rollback(kvEntry);
-                if (kvCache is CudaHybridKvCacheHandle handle)
-                    _f16CacheCurrentLength = HybridKvLengthBookkeeping.SyncToCommitted(
-                        _f16CacheCurrentLength, Span<int>.Empty, handle.CurrentLength);
-                if (ckpt is not null) RestoreRecurrentState(ckpt);
+                RestoreEntryState(kvCache, kvEntry, ckpt);
                 HiddenStateTapRegistry.PathCounters.AddAbortedForward();
             }
             return result;
+        }
+        catch
+        {
+            // A throwing tap callback (or any failure on the tapped path): drain in-flight copies, then KV and recurrent state back to entry.
+            try { _stream.Synchronize(); } catch (Exception) { /* the original failure wins */ }
+            RestoreEntryState(kvCache, kvEntry, ckpt);
+            throw;
         }
         finally
         {
@@ -142,6 +172,15 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
             (ckpt as IDisposable)?.Dispose();
             ts!.End();
         }
+    }
+
+    private void RestoreEntryState(IKvCache? kvCache, int kvEntry, object? ckpt)
+    {
+        CudaHiddenStateTaps.RollbackKvAfterFailure(kvCache, kvEntry);
+        if (kvCache is CudaHybridKvCacheHandle handle)
+            _f16CacheCurrentLength = HybridKvLengthBookkeeping.SyncToCommitted(
+                _f16CacheCurrentLength, Span<int>.Empty, handle.CurrentLength);
+        if (ckpt is not null) RestoreRecurrentState(ckpt);
     }
 
     /// <summary>

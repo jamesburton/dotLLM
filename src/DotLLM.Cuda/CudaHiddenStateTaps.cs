@@ -74,7 +74,7 @@ internal sealed unsafe class CudaHiddenStateTaps : IDisposable
     /// Plans one whole forward of <paramref name="positions"/>.Length rows and sizes the pinned staging buffer. The CUDA context must be
     /// current. Call BEFORE enqueueing: the previous forward ended in a stream synchronize, so replacing the buffer is safe here.
     /// </summary>
-    public void Begin(HiddenStateTapRegistry.Snapshot snap, ReadOnlySpan<int> positions)
+    public void Begin(HiddenStateTapRegistry.Snapshot snap, ReadOnlySpan<int> positions, nint stream = 0)
     {
         HiddenStateTapRegistry.PathCounters.AddTapForward();
         _snap = snap;
@@ -105,6 +105,8 @@ internal sealed unsafe class CudaHiddenStateTaps : IDisposable
         Immediate = snap.HasAbortable || total > MaxDeferredBytes || ForceImmediateForTest;
         long need = Immediate ? largest : total;
         if (need == 0 || _pinnedBytes >= need) return;
+        // A previous forward that threw before its stream synchronize may still have D2H copies in flight into the buffer: drain first.
+        if (_pinned != 0 && stream != 0) CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
         FreePinned();
         CudaDriverApi.cuMemHostAlloc(out _pinned, (nuint)need, 0).ThrowOnError();
         _pinnedBytes = need;
@@ -203,6 +205,14 @@ internal sealed unsafe class CudaHiddenStateTaps : IDisposable
     internal static int KvCheckpoint(DotLLM.Core.Attention.IKvCache? kvCache, ReadOnlySpan<int> positions)
         => DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
 
+    /// <summary>Undoes a failed tapped forward's KV writes (best effort on a windowed cache a read-only tap may legitimately use).</summary>
+    internal static void RollbackKvAfterFailure(DotLLM.Core.Attention.IKvCache? kvCache, int entry)
+    {
+        if (kvCache is null || entry < 0 || kvCache.CurrentLength <= entry) return;
+        try { kvCache.Rollback(entry); }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException) { }
+    }
+
     private static int s_logged;
 
     /// <summary>Writes <paramref name="message"/> to stderr the first time any model in the process asks (the bypass notices).</summary>
@@ -221,7 +231,11 @@ internal sealed unsafe class CudaHiddenStateTaps : IDisposable
 
     private void FreePinned()
     {
-        if (_pinned != 0) CudaDriverApi.cuMemFreeHost(_pinned);
+        if (_pinned != 0)
+        {
+            int rc = CudaDriverApi.cuMemFreeHost(_pinned);
+            if (rc != 0) Console.Error.WriteLine($"[dotllm] cuMemFreeHost of the hidden-state tap staging buffer failed ({rc}): the pinned memory leaks.");
+        }
         _pinned = 0;
         _pinnedBytes = 0;
     }
