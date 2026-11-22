@@ -11,3 +11,4 @@ suite `FullyQualifiedName~HiddenStateTap` (68 tests). Each was reverted with `gi
 | abort skips recurrent restore | both hybrids | KILLED, 6 (hybrids only; llama unaffected as expected) |
 | wrong row index (Last = second-to-last row) | Registry Dispatch | KILLED, 20 |
 | PreLmHead delivers pre-norm data | each model | KILLED, 3 (`Rows_LastVsAll_AndFinalPointsRelate`) |
+- T9 dense VulkanTransformerModel taps wired: llama suite 15/15 on Vulkan (staging scheme in src/DotLLM.Vulkan/VulkanHiddenStateTaps.cs).

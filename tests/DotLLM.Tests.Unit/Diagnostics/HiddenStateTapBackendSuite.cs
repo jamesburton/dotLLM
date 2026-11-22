@@ -94,7 +94,7 @@ public abstract class HiddenStateTapBackendSuite
         [HookPoint.PostEmbedding, HookPoint.PostLayer, HookPoint.PreFinalNorm, HookPoint.PreLmHead];
 
     /// <summary>20 greedy steps with a multi-depth tap are identical to the same run without it: tokens, logits, KV bytes.</summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void MultiLayerTap_DoesNotPerturb_TokensLogitsOrKv(string family)
     {
@@ -142,7 +142,7 @@ public abstract class HiddenStateTapBackendSuite
     }
 
     /// <summary>Rows All delivers one sample per row with the right positions; Last delivers only the final one. The final points agree where they must differ or match.</summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void Rows_LastVsAll_AndFinalPointsRelate(string family)
     {
@@ -182,7 +182,7 @@ public abstract class HiddenStateTapBackendSuite
     }
 
     /// <summary>A tap on layer L never fires for another layer, and a tap on nothing delivers nothing.</summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void Tap_FiresOnlyOnSubscribedLayers(string family)
     {
@@ -196,7 +196,7 @@ public abstract class HiddenStateTapBackendSuite
     }
 
     /// <summary>Two taps on different layers: each sees only its own (a single tap cannot tell a per-entry filter from a union filter).</summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void TwoTaps_OnDifferentLayers_EachSeeOnlyTheirOwn(string family)
     {
@@ -211,7 +211,7 @@ public abstract class HiddenStateTapBackendSuite
     }
 
     /// <summary>Disposed taps stop delivering; with no tap attached nothing is dispatched, no counter moves and decode allocates nothing extra.</summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void Unattached_HasNoDispatch_NoCounters_NoExtraAllocation(string family)
     {
@@ -246,7 +246,7 @@ public abstract class HiddenStateTapBackendSuite
         return GC.GetAllocatedBytesForCurrentThread() - before;
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void DisposedTap_StopsDelivering(string family)
     {
@@ -261,7 +261,7 @@ public abstract class HiddenStateTapBackendSuite
         Assert.Equal(1, n);
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void Registration_Validates(string family)
     {
@@ -276,7 +276,7 @@ public abstract class HiddenStateTapBackendSuite
             fx.Host.RegisterTap(new HiddenStateTapSubscription(null, []), _ => { }));
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void BufferProvider_ReceivesTheRow(string family)
     {
@@ -325,7 +325,7 @@ public abstract class HiddenStateTapBackendSuite
     /// An aborted decode forward returns false without throwing, rolls KV back, restores recurrent state (the abort at the last layer
     /// happens after every GDN layer advanced it), and the next forward is bit-identical to a model that never ran the aborted one.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(AbortCases))]
     public void Abort_TryForward_LeavesModelAsIfNeverStarted(string family, string where)
     {
@@ -376,7 +376,7 @@ public abstract class HiddenStateTapBackendSuite
     }
 
     /// <summary>An abort during a multi-token prefill leaves KV empty and the next full prefill equal to a fresh one.</summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void Abort_DuringPrefill_RollsBackToEmpty(string family)
     {
@@ -396,7 +396,7 @@ public abstract class HiddenStateTapBackendSuite
         Assert.True(control.KvBytes(kvC).AsSpan().SequenceEqual(aborted.KvBytes(kvA)));
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void AbortableTap_ReturningReplace_IsRejected(string family)
     {
@@ -408,7 +408,7 @@ public abstract class HiddenStateTapBackendSuite
     }
 
     /// <summary>Read-only taps never checkpoint: only an abortable tap pays for entry state.</summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void ReadOnlyTap_TakesNoCheckpoint(string family)
     {
@@ -424,7 +424,7 @@ public abstract class HiddenStateTapBackendSuite
     // ── ForwardBatch ──────────────────────────────────────────────────────────
 
     /// <summary>With a tap attached a multi-sequence ForwardBatch goes per sequence (counter on the packed model), each sequence reporting its own id.</summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Families))]
     public void ForwardBatch_WithTap_FallsBackPerSequence(string family)
     {

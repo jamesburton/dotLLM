@@ -1,0 +1,121 @@
+using DotLLM.Core.Attention;
+using DotLLM.Core.Configuration;
+using DotLLM.Core.Models;
+using DotLLM.Models;
+using DotLLM.Models.Gguf;
+using DotLLM.Tests.Unit.ChunkReuse;
+using DotLLM.Tests.Unit.Diagnostics;
+using DotLLM.Vulkan;
+using Xunit;
+
+namespace DotLLM.Tests.Unit.Vulkan;
+
+/// <summary>Vulkan model of one synthetic family for the #1920 tap suite.</summary>
+internal sealed class VulkanHiddenStateTapFixture : HiddenStateTapFixture
+{
+    private readonly string _dir;
+    private readonly GgufFile _gguf;
+    private readonly ModelConfig _config;
+    private readonly string _family;
+    private readonly Func<int, IKvCache> _kvFactory;
+    private readonly VulkanDevice _device;
+
+    public VulkanHiddenStateTapFixture(string family)
+    {
+        _family = family;
+        _dir = Path.Combine(Path.GetTempPath(), $"dotllm-taps-vk-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_dir);
+        string path = Path.Combine(_dir, "m.gguf");
+        switch (family)
+        {
+            case HiddenStateTapBackendSuite.Llama:
+                File.WriteAllBytes(path, SyntheticDenseGguf.Build("llama"));
+                Prompt = [3, 9, 14, 5, 21, 8, 30, 2];
+                break;
+            case HiddenStateTapBackendSuite.HybridDense:
+                SyntheticQwen35HybridDenseMtpGguf.Write(path, withMtp: false, contextLength: 256);
+                Prompt = [3, 4, 5, 6, 3, 7, 5, 4];
+                break;
+            case HiddenStateTapBackendSuite.MoeHybrid:
+                SyntheticQwen35MoeGguf.Write(path, contextLength: 256);
+                Prompt = [3, 4, 5, 6, 3, 7, 5, 4];
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(family));
+        }
+        _gguf = GgufFile.Open(path);
+        _config = GgufModelConfigExtractor.Extract(_gguf.Metadata);
+        (Model, _kvFactory) = VulkanModelLoader.CreateOnDeviceFromGguf(_gguf, _config, physicalIndex: null);
+        _device = Model switch
+        {
+            VulkanTransformerModel m => m.Device,
+            VulkanQwen3HybridDenseTransformerModel m => m.Device,
+            VulkanQwen3MoeHybridTransformerModel m => m.Device,
+            _ => throw new InvalidOperationException(Model.GetType().Name),
+        };
+    }
+
+    public override IModel Model { get; }
+    public override int NumLayers => _config.NumLayers;
+    public override int Hidden => _config.HiddenSize;
+    public override int Vocab => _config.VocabSize;
+    public override int[] Prompt { get; }
+    public override bool ExpectsPackedBatchFallback => _family == HiddenStateTapBackendSuite.Llama;
+
+    public override IKvCache NewKv(int maxLen = 96) => _kvFactory(maxLen);
+
+    public override float[] KvBytes(IKvCache kv)
+    {
+        var all = new List<float>();
+        switch (kv)
+        {
+            case VulkanKvCache c:
+                for (int l = 0; l < _config.NumLayers; l++)
+                {
+                    int n = c.StagedLayerElementCount(l);
+                    if (n == 0) continue;
+                    var k = new float[n]; var v = new float[n];
+                    c.ReadRows(l, 0, c.CurrentLength, k, v);
+                    all.AddRange(k); all.AddRange(v);
+                }
+                break;
+            case VulkanNemotronHKvCache c:
+                long rowBytes = c.BytesPerPosition / (2L * c.AttentionLayerCount);
+                int floats = (int)((c.CurrentLength * rowBytes + 3) / 4);
+                for (int l = 0; l < _config.NumLayers; l++)
+                {
+                    VulkanDevice.Buffer kb, vb;
+                    try { kb = c.GetKeysBuffer(l); vb = c.GetValuesBuffer(l); }
+                    catch (Exception) { continue; }
+                    if (floats == 0) continue;
+                    var k = new float[floats]; var v = new float[floats];
+                    _device.Download(kb, k); _device.Download(vb, v);
+                    all.AddRange(k); all.AddRange(v);
+                }
+                break;
+            default:
+                throw new NotSupportedException(kv.GetType().Name);
+        }
+        return [.. all];
+    }
+
+    public override void Dispose()
+    {
+        Model.Dispose();
+        _gguf.Dispose();
+        try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
+    }
+}
+
+/// <summary>The #1920 tap suite on the Vulkan backend (all three families).</summary>
+[Trait("Category", "GPU")]
+[Collection("VulkanKernels")]
+public sealed class HiddenStateTapVulkanTests : HiddenStateTapBackendSuite
+{
+    protected override HiddenStateTapFixture Open(string family)
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device available on this host.");
+        return new VulkanHiddenStateTapFixture(family);
+    }
+}
+

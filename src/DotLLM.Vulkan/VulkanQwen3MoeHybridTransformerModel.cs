@@ -58,6 +58,7 @@ namespace DotLLM.Vulkan;
 public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 {
     private readonly VulkanDevice _device;
+    internal VulkanDevice Device => _device;
     private readonly bool _ownsDevice;
     private readonly GgufFile? _gguf;
 

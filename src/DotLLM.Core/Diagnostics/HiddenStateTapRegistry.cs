@@ -173,6 +173,17 @@ public sealed class HiddenStateTapRegistry
         };
 
         /// <summary>
+        /// Whether any tap that wants (<paramref name="point"/>, <paramref name="layer"/>) asked for <see cref="TapRows.All"/>.
+        /// A device backend that stages rows before delivery copies one row when this is false and the whole forward when true.
+        /// </summary>
+        public bool WantsAllRows(HookPoint point, int layer)
+        {
+            foreach (var e in _entries)
+                if (e.Sub.Rows == TapRows.All && e.Wants(point, layer)) return true;
+            return false;
+        }
+
+        /// <summary>
         /// Delivers the activation to every tap that wants (<paramref name="point"/>, <paramref name="layer"/>), in registration order.
         /// </summary>
         /// <param name="point">The point being tapped.</param>
