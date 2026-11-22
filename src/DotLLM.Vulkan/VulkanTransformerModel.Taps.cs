@@ -25,6 +25,7 @@ public sealed partial class VulkanTransformerModel
     public IDisposable RegisterAbortableTap(HiddenStateTapSubscription subscription, Func<HiddenStateSample, HookResult> onSample)
     {
         ArgumentNullException.ThrowIfNull(onSample);
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.ThrowIfWindowedConfig(Config);
         GuardTapsSupported();
         return TapState.Registry.Register(subscription, null, onSample);
     }

@@ -68,6 +68,13 @@ public interface IKvCache : IDisposable
     bool CanRollbackAfterAppend(int minPos, int maxPos) => true;
 
     /// <summary>
+    /// False when this cache has any compact sliding-window layer or full-precision window, independent of its current length. An
+    /// abortable hidden-state tap (#1920) is refused at the first forward on such a cache, never mid-session: once the window is
+    /// crossed an abort could no longer restore the entry length. Default true (full-history caches).
+    /// </summary>
+    bool SupportsAbortRollback => true;
+
+    /// <summary>
     /// Grows <see cref="MaxLength"/> to at least <paramref name="maxLength"/> and keeps the committed rows. The engine uses it
     /// when a later, longer prompt reuses a cached prefix (issue #1025). The default only reports whether the cache is
     /// already large enough: a cache that cannot grow returns <see langword="false"/> and the caller allocates a new one.

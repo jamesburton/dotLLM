@@ -32,6 +32,7 @@ public sealed unsafe partial class CudaQwen3MoeHybridTransformerModel
     public IDisposable RegisterAbortableTap(HiddenStateTapSubscription subscription, Func<HiddenStateSample, HookResult> onSample)
     {
         ArgumentNullException.ThrowIfNull(onSample);
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.ThrowIfWindowedConfig(Config);
         if (!((IModel)this).SupportsRecurrentStateCheckpoint)
             throw new NotSupportedException(
                 "An abortable hidden-state tap on the CUDA GDN-hybrid MoE host needs recurrent-state checkpoint/restore "

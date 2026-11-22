@@ -32,6 +32,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IHiddenStateT
     public IDisposable RegisterAbortableTap(HiddenStateTapSubscription subscription, Func<HiddenStateSample, HookResult> onSample)
     {
         ArgumentNullException.ThrowIfNull(onSample);
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.ThrowIfWindowedConfig(Config);
         return TapState.Registry.Register(subscription, null, onSample);
     }
 

@@ -161,6 +161,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                                             Func<DotLLM.Core.Diagnostics.HiddenStateSample, DotLLM.Core.Diagnostics.HookResult> onSample)
     {
         ArgumentNullException.ThrowIfNull(onSample);
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.ThrowIfWindowedConfig(Config);
         GuardTapsSupported();
         return _taps.Register(subscription, null, onSample);
     }

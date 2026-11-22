@@ -555,6 +555,9 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
     }
 
     /// <inheritdoc/>
+    public bool SupportsAbortRollback => _windowSize <= 0;
+
+    /// <inheritdoc/>
     /// <remarks>Windowed: appending past the FP16 window evicts rows into the quantized region, after which a cut to the entry length is unsafe (see <see cref="CanTruncate"/>).</remarks>
     public bool CanRollbackAfterAppend(int minPos, int maxPos)
     {

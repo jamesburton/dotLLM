@@ -59,6 +59,16 @@ internal sealed class CpuHiddenStateTapFixture : HiddenStateTapFixture
         => _family != HiddenStateTapBackendSuite.Llama ? null
             : new SimpleKvCache(KvGeometry.FromConfig(_config with { SlidingWindowSize = 8, SlidingWindowPattern = 2 }, compactSlidingWindows: true), maxLen);
 
+    private readonly List<IModel> _extra = [];
+
+    public override DotLLM.Core.Diagnostics.IHiddenStateTapHost? NewSlidingWindowConfigHost()
+    {
+        if (_family != HiddenStateTapBackendSuite.Llama) return null;
+        var m = ModelLoader.CreateCpuModelFromGguf(_gguf, _config with { SlidingWindowSize = 8, SlidingWindowPattern = 2 });
+        _extra.Add(m);
+        return (DotLLM.Core.Diagnostics.IHiddenStateTapHost)m;
+    }
+
     public override float[] KvBytes(IKvCache kv)
     {
         var cache = (SimpleKvCache)kv;
@@ -77,6 +87,7 @@ internal sealed class CpuHiddenStateTapFixture : HiddenStateTapFixture
 
     public override void Dispose()
     {
+        foreach (var m in _extra) m.Dispose();
         Model.Dispose();
         _gguf.Dispose();
         try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }

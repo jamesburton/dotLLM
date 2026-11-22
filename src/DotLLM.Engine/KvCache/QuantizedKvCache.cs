@@ -437,6 +437,9 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
     }
 
     /// <inheritdoc/>
+    public bool SupportsAbortRollback => _windowSize <= 0 && _rows is null;
+
+    /// <inheritdoc/>
     /// <remarks>
     /// With a full-precision window, appending past the window evicts rows into quantized storage, after which a cut to the entry
     /// length is wrong (see <see cref="CanTruncateTo"/>); compact sliding-window layers are judged by

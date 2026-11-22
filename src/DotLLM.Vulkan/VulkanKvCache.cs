@@ -621,6 +621,9 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     }
 
     /// <inheritdoc/>
+    public bool SupportsAbortRollback => _rows is null;
+
+    /// <inheritdoc/>
     public bool CanRollbackAfterAppend(int minPos, int maxPos) =>
         _rows is null || _rows.CanTruncateToAfterAppend(_currentLength, minPos, maxPos);
 

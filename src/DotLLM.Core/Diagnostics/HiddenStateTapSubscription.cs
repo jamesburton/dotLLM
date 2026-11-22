@@ -62,7 +62,7 @@ public readonly record struct ForwardAbortInfo(int LayerIndex, HookPoint Point);
 /// Thrown by the legacy <c>Forward</c> entry points when an abortable tap aborted the pass. The model has already rolled its
 /// KV-cache and recurrent state back to their values at entry. Use <see cref="IHiddenStateTapHost.TryForward"/> to avoid the exception.
 /// </summary>
-public sealed class ForwardAbortedException : Exception
+public sealed class ForwardAbortedException : Exception, DotLLM.Core.Models.IForwardStateRestored
 {
     /// <summary>Creates the exception for <paramref name="info"/>.</summary>
     public ForwardAbortedException(ForwardAbortInfo info)

@@ -952,6 +952,7 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
                                             Func<DotLLM.Core.Diagnostics.HiddenStateSample, DotLLM.Core.Diagnostics.HookResult> onSample)
     {
         ArgumentNullException.ThrowIfNull(onSample);
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.ThrowIfWindowedConfig(Config);
         return _taps.Register(subscription, null, onSample);
     }
 

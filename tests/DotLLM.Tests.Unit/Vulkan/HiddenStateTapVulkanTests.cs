@@ -71,6 +71,16 @@ internal sealed class VulkanHiddenStateTapFixture : HiddenStateTapFixture
         => _family != HiddenStateTapBackendSuite.Llama ? null
             : new VulkanKvCache(_device, KvGeometry.FromConfig(_config with { SlidingWindowSize = 8, SlidingWindowPattern = 2 }, compactSlidingWindows: true), maxLen);
 
+    private readonly List<IModel> _extra = [];
+
+    public override DotLLM.Core.Diagnostics.IHiddenStateTapHost? NewSlidingWindowConfigHost()
+    {
+        if (_family != HiddenStateTapBackendSuite.Llama) return null;
+        var (m, _) = VulkanModelLoader.CreateOnDeviceFromGguf(_gguf, _config with { SlidingWindowSize = 8, SlidingWindowPattern = 2 }, physicalIndex: null);
+        _extra.Add(m);
+        return (DotLLM.Core.Diagnostics.IHiddenStateTapHost)m;
+    }
+
     public override float[] KvBytes(IKvCache kv)
     {
         var all = new List<float>();
@@ -108,6 +118,7 @@ internal sealed class VulkanHiddenStateTapFixture : HiddenStateTapFixture
 
     public override void Dispose()
     {
+        foreach (var m in _extra) m.Dispose();
         Model.Dispose();
         _gguf.Dispose();
         try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }

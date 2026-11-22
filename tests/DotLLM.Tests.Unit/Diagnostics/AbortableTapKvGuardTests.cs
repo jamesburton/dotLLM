@@ -47,10 +47,58 @@ public sealed class AbortableTapKvGuardTests
         Assert.True(kv.CanRollbackAfterAppend(8, 8));
         Assert.True(kv.CanRollbackAfterAppend(8, 100));   // fits the default ring: no compaction
         Assert.False(kv.CanRollbackAfterAppend(700, 700)); // compacts past the rows the entry length needs
-        Assert.Equal(8, AbortableTapKvGuard.Checkpoint(kv, [8]));
-        var ex = Assert.Throws<NotSupportedException>(() => AbortableTapKvGuard.Checkpoint(kv, [700]));
-        Assert.Contains("SimpleKvCache", ex.Message);
+        Assert.False(kv.SupportsAbortRollback);
+        // Ruling 3 (#1920): refused at the first abortable forward, even for a contiguous append that would not compact yet.
+        foreach (int pos in new[] { 8, 700 })
+        {
+            var ex = Assert.Throws<NotSupportedException>(() => AbortableTapKvGuard.Checkpoint(kv, [pos]));
+            Assert.Contains("SimpleKvCache", ex.Message);
+            Assert.Contains("sliding-window", ex.Message);
+        }
         Assert.Equal(8, kv.CurrentLength);
+    }
+
+    [Fact]
+    public void Simple_FullCache_SupportsAbortRollback_AndCheckpointReturnsEntryLength()
+    {
+        using var kv = new SimpleKvCache(KvGeometry.FromConfig(Config()), MaxSeq);
+        Fill(kv, 8);
+        Assert.True(kv.SupportsAbortRollback);
+        Assert.Equal(8, AbortableTapKvGuard.Checkpoint(kv, [8]));
+    }
+
+    /// <summary>The per-forward post-append check stays as a backstop for a cache that claims abort support but cannot undo this append.</summary>
+    [Fact]
+    public void Checkpoint_BackstopStillRefusesWhenCanRollbackAfterAppendIsFalse()
+    {
+        using var inner = new SimpleKvCache(KvGeometry.FromConfig(Config()), MaxSeq);
+        Fill(inner, 8);
+        var kv = new BackstopKv(inner);
+        Assert.True(kv.SupportsAbortRollback);
+        Assert.Equal(8, AbortableTapKvGuard.Checkpoint(kv, [8]));
+        Assert.Throws<NotSupportedException>(() => AbortableTapKvGuard.Checkpoint(kv, [700]));
+    }
+
+    private sealed class BackstopKv(IKvCache inner) : IKvCache
+    {
+        public int CurrentLength => inner.CurrentLength;
+        public int MaxLength => inner.MaxLength;
+        public void Update(DotLLM.Core.Tensors.ITensor k, DotLLM.Core.Tensors.ITensor v, ReadOnlySpan<int> p, int l) => inner.Update(k, v, p, l);
+        public DotLLM.Core.Tensors.ITensor GetKeys(int l) => inner.GetKeys(l);
+        public DotLLM.Core.Tensors.ITensor GetValues(int l) => inner.GetValues(l);
+        public void Update(DotLLM.Core.Tensors.TensorRef k, DotLLM.Core.Tensors.TensorRef v, ReadOnlySpan<int> p, int l) => inner.Update(k, v, p, l);
+        public DotLLM.Core.Tensors.TensorRef GetKeysRef(int l) => inner.GetKeysRef(l);
+        public DotLLM.Core.Tensors.TensorRef GetValuesRef(int l) => inner.GetValuesRef(l);
+        public void Rollback(int length) => inner.Rollback(length);
+        public bool CanRollbackAfterAppend(int minPos, int maxPos) => maxPos < 100;
+        public void Dispose() { }
+    }
+
+    [Fact]
+    public void ThrowIfWindowedConfig_RefusesSlidingWindowConfig_NotFullAttention()
+    {
+        Assert.Throws<NotSupportedException>(() => AbortableTapKvGuard.ThrowIfWindowedConfig(Config()));
+        AbortableTapKvGuard.ThrowIfWindowedConfig(Config() with { SlidingWindowSize = null, SlidingWindowPattern = 0 });
     }
 
     [Fact]
@@ -60,6 +108,8 @@ public sealed class AbortableTapKvGuardTests
         Fill(kv, 4);
         Assert.True(kv.CanRollbackAfterAppend(4, 10));    // stays inside the 16-row FP window: nothing evicted
         Assert.False(kv.CanRollbackAfterAppend(4, 40));   // evicts rows into quantized storage
+        Assert.False(kv.SupportsAbortRollback);           // ruling 3: refused regardless of length
+        Assert.Throws<NotSupportedException>(() => AbortableTapKvGuard.Checkpoint(kv, [4]));
     }
 
     [Fact]
