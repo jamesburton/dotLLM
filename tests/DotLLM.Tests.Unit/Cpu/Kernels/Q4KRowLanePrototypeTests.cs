@@ -90,6 +90,44 @@ public sealed unsafe class Q4KRowLanePrototypeTests
     }
 
     /// <summary>
+    /// The production entry: with the switch on, a Q4_K GEMM of n >= 16 tokens (m % 8 == 0, no tail rows) takes the row-lane kernel
+    /// and matches it bit for bit; n = 15 keeps the R4 kernel bit for bit (so decode / verify / short chunks are untouched, #530).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(16, true)]
+    [InlineData(15, false)]
+    public void Entry_EngagesFrom16Tokens_AndOtherwiseKeepsTheR4Kernel(int n, bool expectRowLane)
+    {
+        Skip.IfNot(MatMul.Q4KRowLaneIsa);
+        const int m = 48, k = 512;
+        int sb = k / 256;
+        var (wp, xp) = Fixture(m, k, n, 77 + n);
+        byte* w = (byte*)wp, x = (byte*)xp;
+        float* viaEntry = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * 4), 64);
+        float* oracle = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * 4), 64);
+        bool? saved = MatMul.t_q4kRowLaneOverride;
+        try
+        {
+            MatMul.t_q4kRowLaneOverride = false;
+            if (expectRowLane) MatMul.GemmQ4KRowLane8(w, x, oracle, m, sb, n, null);
+            else MatMul.GemmR4TiledQ4_K(w, null, x, oracle, m / 4, 0, sb, m, k, n, null);
+            MatMul.t_q4kRowLaneOverride = true;
+            long before = MatMul.Q4KRowLaneCalls;
+            using var pool = new ComputeThreadPool(4);
+            MatMul.GemmR4TiledQ4_K(w, null, x, viaEntry, m / 4, 0, sb, m, k, n, pool);
+            Assert.Equal(expectRowLane, MatMul.Q4KRowLaneCalls > before);
+            for (int i = 0; i < n * m; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(oracle[i]) == BitConverter.SingleToInt32Bits(viaEntry[i]), $"output {i} differs");
+        }
+        finally
+        {
+            MatMul.t_q4kRowLaneOverride = saved;
+            NativeMemory.AlignedFree(viaEntry); NativeMemory.AlignedFree(oracle);
+            NativeMemory.AlignedFree(w); NativeMemory.AlignedFree(x);
+        }
+    }
+
+    /// <summary>
     /// E3d kill test (DOTLLM_Q4K_BENCH=1): m = 12800, k = 4096, n = 512 (and 2048), 1 and 16 threads, 6 interleaved position-balanced
     /// rounds, row-lane prototype vs the production R4 GEMM. Kill below 1.3x.
     /// </summary>

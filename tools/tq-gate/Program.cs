@@ -8,6 +8,7 @@
 // quality : KL / PPL / top-1 / greedy identity of the in-place cache against the plain KV (f16 on GPU, f32 SimpleKvCache on CPU).
 // splitkv : CPU split-KV decode attention (#1927 E2c), F16 and F32 partials vs the tiled path: teacher-forced KL / PPL at depth
 //           --ctx over --steps decode steps, then a decode speed A/B (--decode --reps).
+// rowlane : CPU Q4_K row-lane GEMM (#1927 E3d) vs the R4 GEMM: KL / PPL / top-1 over the last --rows rows of a chunked prefill.
 // splitkv-paired : the same arms per step on a shared (reference) history: per-step KL and paired dNLL with its SE.
 // Every arm records the cache type it built; GPU arms record the attention-path counters.
 // A Vulkan host holds one KV storage override, so on Vulkan give ONE --bits value per process.
@@ -72,6 +73,7 @@ switch (mode)
     case "bytes": Bytes(); break;
     case "splitkv": SplitKv(); break;
     case "splitkv-paired": SplitKvPaired(); break;
+    case "rowlane": RowLane(); break;
     default: throw new ArgumentException("mode");
 }
 return;
@@ -582,6 +584,50 @@ void SplitKvPaired()
         }
     }
     finally { DotLLM.Cpu.Kernels.Attention.DecodeSplitKv = saved; negField?.SetValue(null, false); }
+}
+
+// ───────────────────────── Q4_K row-lane GEMM gate (#1927 E3d) ─────────────────────────
+// CPU only. Teacher-forced chunked prefill of ctx tokens (chunk --chunk, all rows kept) with the R4 GEMM (reference) and with the
+// row-lane GEMM; the logits of the last --rows rows are compared: KL, PPL, top-1. A fresh cache per arm.
+void RowLane()
+{
+    if (backend != "cpu") throw new ArgumentException("rowlane is a CPU gate");
+    int evalRows = int.Parse(a.GetValueOrDefault("rows", "768"));
+    int[] t = all[..(ctx + 1)];
+    bool saved = DotLLM.Cpu.Kernels.MatMul.Q4KRowLaneEnabled;
+    float[][] Run(bool rowLane, out long calls, out double secs)
+    {
+        DotLLM.Cpu.Kernels.MatMul.Q4KRowLaneEnabled = rowLane;
+        long c0 = DotLLM.Cpu.Kernels.MatMul.Q4KRowLaneCalls;
+        var keep = new float[evalRows][];
+        var sw = Stopwatch.StartNew();
+        using var c = Plain(ctx + 8);
+        for (int s = 0; s < ctx; s += chunk)
+        {
+            int m = Math.Min(chunk, ctx - s);
+            using var l = model.Forward(t.AsSpan(s, m), Enumerable.Range(s, m).ToArray(), dev, c);
+            for (int i = 0; i < m; i++) { int g = s + i; if (g >= ctx - evalRows) keep[g - (ctx - evalRows)] = Row(l, i); }
+        }
+        secs = sw.Elapsed.TotalSeconds;
+        calls = DotLLM.Cpu.Kernels.MatMul.Q4KRowLaneCalls - c0;
+        return keep;
+    }
+    try
+    {
+        var refRows = Run(false, out long refCalls, out double refSecs);
+        double pplRef = Ppl(refRows, t, ctx - evalRows);
+        Log($"ref (R4 GEMM): PPL {pplRef:F4} over the last {evalRows} rows of a {ctx}-token chunk-{chunk} prefill, rowLaneCalls {refCalls}, {ctx / refSecs:F1} tok/s");
+        var cand = Run(true, out long calls, out double secs);
+        var kls = new List<double>(evalRows); int top1 = 0;
+        for (int i = 0; i < evalRows; i++) { kls.Add(Kl(refRows[i], cand[i])); if (Cmp(refRows[i], cand[i]).Same) top1++; }
+        double ppl = Ppl(cand, t, ctx - evalRows);
+        var k = kls.OrderBy(x => x).ToArray();
+        Append(new { kind = "rowlane-quality", backend, model = tag, ctx, chunk, evalRows, rowLaneCalls = calls, klMean = k.Average(), klMedian = Med(k),
+            klP99 = k[(int)(0.99 * (k.Length - 1))], klMax = k[^1], ppl, pplRef, pplDeltaPct = 100 * (ppl / pplRef - 1), top1Agree = (double)top1 / evalRows });
+        Log($"row-lane: KL mean {k.Average():E3} median {Med(k):E3} p99 {k[(int)(0.99 * (k.Length - 1))]:E3} max {k[^1]:E3}  PPL {ppl:F4} vs {pplRef:F4} " +
+            $"({100 * (ppl / pplRef - 1):+0.000;-0.000}%)  top1 {(double)top1 / evalRows:P2}  rowLaneCalls {calls}  {ctx / secs:F1} tok/s");
+    }
+    finally { DotLLM.Cpu.Kernels.MatMul.Q4KRowLaneEnabled = saved; }
 }
 
 // ───────────────────────── bytes per token ─────────────────────────
