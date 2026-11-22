@@ -177,6 +177,57 @@ internal sealed class VulkanHiddenStateTaps
         if (_host.Length < floats) _host = new float[Math.Max(floats, _host.Length * 2)];
     }
 
+    /// <summary>
+    /// Starts a forward for a host whose layer loop is already synchronous (the MoE host submits and waits twice per layer): no staging
+    /// plan, every site is read back right where the GPU is idle through <see cref="DeliverFromDevice"/>.
+    /// </summary>
+    public void BeginSynchronous(HiddenStateTapRegistry.Snapshot snap, int seqLen)
+    {
+        HiddenStateTapRegistry.PathCounters.AddTapForward();
+        _snap = snap;
+        _seqLen = seqLen;
+        _cursor = 0;
+        _sites.Clear();
+        _step++;
+        Immediate = true;
+    }
+
+    /// <summary>
+    /// Synchronous site: with no GPU work in flight, copies the subscribed rows of <paramref name="src"/> to the staging buffer, reads them
+    /// back and dispatches them. <paramref name="srcLastRow"/> is the row a single-row (Last) tap reads; All taps read from row 0.
+    /// </summary>
+    /// <returns><see langword="false"/> when an abortable tap aborted the forward.</returns>
+    public bool DeliverFromDevice(HookPoint point, int layer, VulkanDevice.Buffer src, int srcLastRow,
+                                  ReadOnlySpan<int> positions, out ForwardAbortInfo abort)
+    {
+        abort = default;
+        int rows = Rows(point, layer);
+        if (rows == 0) return true;
+        long rowBytes = (long)_hidden * sizeof(float);
+        long bytes = rows * rowBytes;
+        if (_staging is null || _stagingBytes < bytes)
+        {
+            _staging?.Dispose();
+            _staging = _device.AllocateHostReadback(bytes);
+            _stagingBytes = bytes;
+        }
+        _device.CopyBufferRangeSynchronous(src, _staging, (ulong)((rows == 1 ? srcLastRow : 0) * rowBytes), 0, (ulong)bytes);
+        int floats = rows * _hidden;
+        EnsureHost(floats);
+        _device.Download(_staging, _host.AsSpan(0, floats));
+        return _snap!.Dispatch(point, layer, _host.AsSpan(0, floats), rows, rows == 1 ? _seqLen - 1 : 0, _hidden,
+            positions, SeqId, _step - 1, out abort);
+    }
+
+    private static int s_logged;
+
+    /// <summary>Writes <paramref name="message"/> to stderr the first time any model in the process asks (the bypass notices).</summary>
+    internal static void LogOnce(string message)
+    {
+        if (Interlocked.Exchange(ref s_logged, 1) == 0)
+            Console.Error.WriteLine("[dotllm] " + message);
+    }
+
     /// <summary>Drops the plan's snapshot reference (end of forward).</summary>
     public void End()
     {

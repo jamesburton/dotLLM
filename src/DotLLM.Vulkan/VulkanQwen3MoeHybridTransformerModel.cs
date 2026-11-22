@@ -1,3 +1,4 @@
+using DotLLM.Core.Diagnostics;
 ﻿using System.Buffers;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
@@ -736,7 +737,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <returns>Logits, one row per input position for a short batch (see <see cref="MaxAllRowLogitsSeqLen"/>), else the last row.</returns>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
                            IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState)
+        => ForwardTapped(tokenIds, positions, deviceId, kvCache, gdnState, mtpState)
+           ?? throw new ForwardAbortedException(_tapAbort);
+
+    private ITensor? ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState)
     {
+        var taps = _tapSnap;
+        var tapState = _tapState;
+        ForwardAbortInfo tapAbortAt = default;
         var mtpCapture = _mtpHead is not null ? mtpState as VulkanMtpState : null;
         // Resolve per-seq GDN state container; model-owned _gdnCache is the
         // backwards-compat fallback for single-seq Forward callers.
@@ -805,7 +814,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 
         // Single-token decode with resident fast-path banks in every layer: the whole forward is ONE command buffer (see ForwardDecodeFused).
         if (seqLen == 1 && mtpCapture is null && FuseDecodeEnabled && CanFuseMoeDecode(hiddenSize))
-            return ForwardDecodeFused(tokenIds, positions, gdnCache, kvCache, kinds, hiddenSize, vocabSize, numHeads, numKvHeads, headDim, eps);
+        {
+            if (taps is null)
+                return ForwardDecodeFused(tokenIds, positions, gdnCache, kvCache, kinds, hiddenSize, vocabSize, numHeads, numKvHeads, headDim, eps);
+            // A hidden-state tap needs the layer boundaries the single fused command buffer does not have: take the per-layer loop (#1920).
+            HiddenStateTapRegistry.PathCounters.AddVulkanFusedDecodeBypassed();
+            VulkanHiddenStateTaps.LogOnce("a hidden-state tap is attached: single-token MoE decode uses the per-layer path instead of the fused decode.");
+        }
+        if (taps is not null) tapState!.BeginSynchronous(taps, seqLen);
 
         // ── 1. Token embedding (single submission) ────────────────────────────
         _submit.Begin();
@@ -815,6 +831,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         KernelSupport.TransferToComputeBarrier(cmdBuf);
         _submit.SubmitAndWait();
         if (profActive) { _profEmbedMs += ProfElapsedMs(ref profT0); }
+        if (taps is not null
+            && !tapState!.DeliverFromDevice(HookPoint.PostEmbedding, -1, _state.HiddenState, seqLen - 1, positions, out tapAbortAt))
+            return FinishTapAbort(tapAbortAt, kvCache, gdnState);
 
         // ── 2. Per-layer body. Two submissions per layer: one for the
         //      token-mixing path, one for the MoE FFN (which needs a host
@@ -849,10 +868,18 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 RunGpuPlacedMoeLayer(layer, lw, layerBuf, seqLen, hiddenSize, eps);
             }
             if (profActive) { _profMoeMs += ProfElapsedMs(ref profT0); }
+            if (taps is not null
+                && !tapState!.DeliverFromDevice(HookPoint.PostLayer, layer, _state.HiddenState, seqLen - 1, positions, out tapAbortAt))
+                return FinishTapAbort(tapAbortAt, kvCache, gdnState);
         }
 
         if (mtpCapture is not null)
             CaptureMtpRows(mtpCapture, seqLen);
+
+        if (taps is not null
+            && (!tapState!.DeliverFromDevice(HookPoint.PreFinalNorm, -1, _state.HiddenState, seqLen - 1, positions, out tapAbortAt)
+                || !TapPreLmHead(seqLen, hiddenSize, eps, positions, out tapAbortAt)))
+            return FinishTapAbort(tapAbortAt, kvCache, gdnState);
 
         // ── 3. Final norm + LM head (single submission, headRows trailing rows) ─
         _submit.Begin();
@@ -996,10 +1023,19 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         var results = new ITensor[requests.Count];
+        bool tapped = _tapState?.Registry.Current is not null;
         for (int i = 0; i < requests.Count; i++)
         {
             var r = requests[i];
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+            if (tapped) _tapState!.SeqId = i;
+            try
+            {
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+            }
+            finally
+            {
+                if (tapped) _tapState!.SeqId = 0;
+            }
         }
         return results;
     }
@@ -3422,6 +3458,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     public void Dispose()
     {
         _gumbelHostDrawer?.Dispose();
+        _tapState?.Dispose();
         CloseCheckpoints();
         DisposeMtp();
         _submit.Dispose();

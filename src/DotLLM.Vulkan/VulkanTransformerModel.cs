@@ -4145,7 +4145,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         if (tapped)
         {
             if (!modelHasMlaOrMoe)
-                DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddPackedBatchFallback();
+                { DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddPackedBatchFallback(); VulkanHiddenStateTaps.LogOnce("a hidden-state tap is attached: ForwardBatch runs per sequence instead of the packed batch."); }
             modelHasMlaOrMoe = true;
         }
 

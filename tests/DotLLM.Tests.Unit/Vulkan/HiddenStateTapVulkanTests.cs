@@ -60,7 +60,10 @@ internal sealed class VulkanHiddenStateTapFixture : HiddenStateTapFixture
     public override int Hidden => _config.HiddenSize;
     public override int Vocab => _config.VocabSize;
     public override int[] Prompt { get; }
-    public override bool ExpectsPackedBatchFallback => _family == HiddenStateTapBackendSuite.Llama;
+    public override bool ExpectsPackedBatchFallback => _family != HiddenStateTapBackendSuite.MoeHybrid;
+
+    /// <summary>The untapped hybrid-dense ForwardBatch takes the fused batch; the tapped one the per-sequence loop: different kernels, tolerance.</summary>
+    public override bool BatchBitExact => _family != HiddenStateTapBackendSuite.HybridDense;
 
     public override IKvCache NewKv(int maxLen = 96) => _kvFactory(maxLen);
 
@@ -116,6 +119,73 @@ public sealed class HiddenStateTapVulkanTests : HiddenStateTapBackendSuite
     {
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device available on this host.");
         return new VulkanHiddenStateTapFixture(family);
+    }
+
+    private static readonly DotLLM.Core.Diagnostics.HookPoint[] All4 =
+    [
+        DotLLM.Core.Diagnostics.HookPoint.PostEmbedding, DotLLM.Core.Diagnostics.HookPoint.PostLayer,
+        DotLLM.Core.Diagnostics.HookPoint.PreFinalNorm, DotLLM.Core.Diagnostics.HookPoint.PreLmHead,
+    ];
+
+    private static List<(DotLLM.Core.Diagnostics.HookPoint P, int L, int R, float[] D)> Collect(HiddenStateTapFixture fx, bool immediate)
+    {
+        VulkanHiddenStateTaps.ForceImmediateForTest = immediate;
+        try
+        {
+            var seen = new List<(DotLLM.Core.Diagnostics.HookPoint, int, int, float[])>();
+            using var h = fx.Host.RegisterTap(
+                new DotLLM.Core.Diagnostics.HiddenStateTapSubscription(null, All4, DotLLM.Core.Diagnostics.TapRows.All),
+                s => seen.Add((s.Point, s.LayerIndex, s.RowIndex, s.Data.ToArray())));
+            using var kv = fx.NewKv();
+            using (fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv)) { }
+            using (fx.Model.Forward([fx.Prompt[0]], [fx.Prompt.Length], -1, kv)) { }
+            return seen;
+        }
+        finally { VulkanHiddenStateTaps.ForceImmediateForTest = false; }
+    }
+
+    /// <summary>The deferred plan and the site-by-site (immediate) plan deliver identical samples in the same order.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void DeferredAndImmediatePlans_DeliverIdenticalSamples(string family)
+    {
+        using var a = Open(family);
+        using var b = Open(family);
+        var deferred = Collect(a, immediate: false);
+        var immediate = Collect(b, immediate: true);
+        Assert.NotEmpty(deferred);
+        Assert.Equal(deferred.Count, immediate.Count);
+        for (int i = 0; i < deferred.Count; i++)
+        {
+            Assert.Equal((deferred[i].P, deferred[i].L, deferred[i].R), (immediate[i].P, immediate[i].L, immediate[i].R));
+            Assert.True(deferred[i].D.AsSpan().SequenceEqual(immediate[i].D), $"sample {i} differs");
+        }
+    }
+
+    /// <summary>
+    /// With a tap attached the MoE-hybrid single-token decode must leave the fused-decode path (it has no layer boundaries) and say so in the
+    /// counter; the untapped control proves the fused path is the default for this fixture, so the bypass is observable.
+    /// </summary>
+    [SkippableFact]
+    public void MoeHybrid_FusedDecode_IsBypassed_WhenATapIsAttached()
+    {
+        using var fx = (VulkanHiddenStateTapFixture)Open(MoeHybrid);
+        var model = (VulkanQwen3MoeHybridTransformerModel)fx.Model;
+        using var kv = fx.NewKv();
+        int[] pp = Enumerable.Range(0, fx.Prompt.Length).ToArray();
+        using (model.Forward(fx.Prompt, pp, -1, kv)) { }
+        long fusedBefore = model.FusedDecodeForwards;
+        using (model.Forward([fx.Prompt[0]], [fx.Prompt.Length], -1, kv)) { }
+        Skip.If(model.FusedDecodeForwards == fusedBefore, "the synthetic MoE fixture does not take the fused decode path on this device");
+
+        int rows = 0;
+        using var h = fx.Host.RegisterTap(new DotLLM.Core.Diagnostics.HiddenStateTapSubscription(null, All4), _ => rows++);
+        DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.Reset();
+        long fused = model.FusedDecodeForwards;
+        using (model.Forward([fx.Prompt[1]], [fx.Prompt.Length + 1], -1, kv)) { }
+        Assert.Equal(fused, model.FusedDecodeForwards);
+        Assert.Equal(1, DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.VulkanFusedDecodeBypassed);
+        Assert.Equal(3 + fx.NumLayers, rows);
     }
 }
 

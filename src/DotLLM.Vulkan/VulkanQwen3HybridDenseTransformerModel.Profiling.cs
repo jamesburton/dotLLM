@@ -127,6 +127,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
                                         IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState)
     {
         int rows = tokenIds.Length;
+        if (_tapSnap is not null) return null;   // a tap sees whole forwards: row slices would deliver partial rows (#1920)
         if (rows <= FuseMaxSeqLen || rows <= _allRowLogitsLimit || _rowSnapshotRequestRows > 0
             || kvCache is not VulkanNemotronHKvCache || FixedPrefillLayersPerSubmit != 0 || !FuseForwardEnabled)
             return null;

@@ -22,6 +22,11 @@ public abstract class HiddenStateTapFixture : IDisposable
     public abstract bool ExpectsPackedBatchFallback { get; }
     /// <summary>Whether bit-identical logits are expected with and without a tap (CPU: yes; a GPU may only promise tolerance).</summary>
     public virtual bool BitExact => true;
+    /// <summary>
+    /// Whether the batch test expects bit-identical logits. False where the tapped run takes a different kernel path than the untapped one
+    /// (a fused batch versus the per-sequence loop on Vulkan): tolerance 1e-2 absolute and identical argmax then.
+    /// </summary>
+    public virtual bool BatchBitExact => BitExact;
     public abstract IKvCache NewKv(int maxLen = 96);
     /// <summary>Raw KV contents for the first <c>CurrentLength</c> rows, every layer that has KV, for byte comparison.</summary>
     public abstract float[] KvBytes(IKvCache kv);
@@ -459,8 +464,12 @@ public abstract class HiddenStateTapBackendSuite
         {
             var e = LastRow(expect[i], plain.Vocab);
             var g = LastRow(got[i], tapped.Vocab);
-            if (plain.BitExact) Assert.True(e.AsSpan().SequenceEqual(g), $"seq {i} logits differ");
-            else Assert.All(e.Zip(g), p => Assert.InRange(p.First - p.Second, -1e-2f, 1e-2f));
+            if (plain.BatchBitExact) Assert.True(e.AsSpan().SequenceEqual(g), $"seq {i} logits differ");
+            else
+            {
+                Assert.All(e.Zip(g), p => Assert.InRange(p.First - p.Second, -1e-2f, 1e-2f));
+                Assert.Equal(ArgMax(e), ArgMax(g));
+            }
         }
         foreach (var t in expect) t.Dispose();
         foreach (var t in got) t.Dispose();
