@@ -656,6 +656,24 @@ verify rows past 2,048 keys, #530) is the accepted consequence of E2c: **James 2
 are not bit-identical to prefill / verify rows, so speculative / MTP greedy output can differ from plain greedy on CPU
 (`docs/SPECULATIVE.md`; `DOTLLM_CPU_ATTN_SPLITKV=0` restores exact identity).
 
+### E19 - CPU Q4_K row-lane GEMM accumulation order (#1927 E3d, opt-in `DOTLLM_CPU_Q4K_ROWLANE=1`)
+
+The row-lane kernel forms each (row, super-block) integer sum exactly and converts it to float once; the R4 kernel converts eight
+K-direction int32 lanes and sums them in float at the end. Same F32 accumulation across super-blocks, int32 integer stage.
+
+| measure | R4 (reference) | row-lane |
+|---|---|---|
+| max rel err vs float64, m 64 k 512 / m 40 k 2560 (unit test) | 2.0e-5 / 2.8e-5 | 1.5e-6 / 2.3e-5 |
+| Qwen3-4B Q4_K_M, 7,600-token chunk-512 prefill, last 768 rows: PPL | 7.4926 | 7.4971 (+0.06%) |
+| KL mean / median / p99 vs R4 | - | 3.11e-3 / 1.47e-3 / 2.08e-2 |
+| top-1 agreement | - | 99.1% |
+| 7,600-token whole-prompt prefill, tok/s (valid reps, interleaved) | 64.1 [58.7-67.1] (4) | 71.7 [69.4-81.2] (3), 1.12x |
+
+Reading: the row-lane form is closer to exact at kernel level; the model-level KL is the activation-quantization digitisation
+floor seen in E18 (any change of reduction order costs about 2-3e-3 here). Batches under 16 tokens (decode, verify, short chunks)
+keep the R4 kernels, so decode rows stay bit-identical to themselves; prefill rows of 16+ tokens differ from decode rows (#530
+class) when the switch is on. Default-on needs a ruling.
+
 ## 6. Decision table: CLAUDE.md rule → evidence
 
 | CLAUDE.md rule (Precision & Expansion) | evidence | verdict |
