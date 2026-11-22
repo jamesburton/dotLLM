@@ -23,6 +23,11 @@ public abstract class HiddenStateTapFixture : IDisposable
     /// <summary>Whether bit-identical logits are expected with and without a tap (CPU: yes; a GPU may only promise tolerance).</summary>
     public virtual bool BitExact => true;
     /// <summary>
+    /// Whether <c>RegisterAbortableTap</c> is available for this model (a host whose abort cannot yet restore its recurrent state refuses it).
+    /// The abort tests skip when false.
+    /// </summary>
+    public virtual bool SupportsAbortableTaps => true;
+    /// <summary>
     /// Whether the batch test expects bit-identical logits. False where the tapped run takes a different kernel path than the untapped one
     /// (a fused batch versus the per-sequence loop on Vulkan): tolerance 1e-2 absolute and identical argmax then.
     /// </summary>
@@ -335,6 +340,7 @@ public abstract class HiddenStateTapBackendSuite
     public void Abort_TryForward_LeavesModelAsIfNeverStarted(string family, string where)
     {
         using var aborted = Open(family);
+        Skip.IfNot(aborted.SupportsAbortableTaps, "abortable taps are not available on this host");
         using var control = Open(family);
         var (point, layer) = AbortSite(where, aborted.NumLayers);
         var sut = new Aborter(point, layer);
@@ -386,6 +392,7 @@ public abstract class HiddenStateTapBackendSuite
     public void Abort_DuringPrefill_RollsBackToEmpty(string family)
     {
         using var aborted = Open(family);
+        Skip.IfNot(aborted.SupportsAbortableTaps, "abortable taps are not available on this host");
         using var control = Open(family);
         var sut = new Aborter(HookPoint.PostLayer, aborted.NumLayers - 1) { Armed = true };
         using var h = aborted.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), sut.OnSample);
@@ -406,6 +413,7 @@ public abstract class HiddenStateTapBackendSuite
     public void AbortableTap_ReturningReplace_IsRejected(string family)
     {
         using var fx = Open(family);
+        Skip.IfNot(fx.SupportsAbortableTaps, "abortable taps are not available on this host");
         using var h = fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, [HookPoint.PostEmbedding]),
             _ => HookResult.Replace(new float[fx.Hidden]));
         using var kv = fx.NewKv();

@@ -2,6 +2,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Diagnostics;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
+using DotLLM.Cuda.Interop;
 
 namespace DotLLM.Cuda.Architectures;
 
@@ -134,5 +135,29 @@ public sealed unsafe partial class CudaQwen3MoeHybridTransformerModel
                 "An abortable hidden-state tap needs a KV-cache that supports Rollback; this cache refused.", ex);
         }
         return entry;
+    }
+
+    /// <summary>
+    /// Test hook (#1920): the model-owned F16 KV rows <c>[0, rows)</c> of every attention slot, K then V, widened to F32, for byte comparison.
+    /// Empty before the first attention forward. F16 (non-quantized) KV storage only.
+    /// </summary>
+    internal float[] DebugReadKvRowsForTest(int rows)
+    {
+        if (_f16KCache is null || rows <= 0) return [];
+        _context.MakeCurrent();
+        _stream.Synchronize();
+        int elems = rows * Config.NumKvHeads * Config.HeadDim;
+        var all = new List<float>();
+        var host = new ushort[elems];
+        for (int slot = 0; slot < _attentionLayerCount; slot++)
+        {
+            foreach (nint dev in new[] { _f16KCache[slot], _f16VCache![slot] })
+            {
+                fixed (ushort* p = host)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dev, (nuint)(elems * sizeof(ushort))).ThrowOnError();
+                foreach (ushort bits in host) all.Add((float)BitConverter.UInt16BitsToHalf(bits));
+            }
+        }
+        return [.. all];
     }
 }
