@@ -34,6 +34,10 @@ public static class ChunkedPrefillLogits
     /// </summary>
     public static IReadOnlyDictionary<int, float> MeasureChunkDeltas(string ggufPath)
     {
+        // Bit-exact prefill == decode row identity needs ONE Q4_K kernel at every batch size: pin the R4 kernel (the default
+        // row-lane GEMM serves batches of 16+ tokens and rounds differently, James 2026-11-22, #1927). Thread-scoped: the forwards
+        // run on this thread.
+        using var r4 = DotLLM.Cpu.Kernels.MatMul.OverrideQ4KRowLaneOnThisThread(false);
         using var gguf = GgufFile.Open(ggufPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var model = TransformerModel.LoadFromGguf(gguf, config);
