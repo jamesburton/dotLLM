@@ -29,7 +29,8 @@ public static unsafe partial class MatMul
     /// <summary>One Q4_K row against one Q8_K row in the row-lane arithmetic. <paramref name="wStride"/>: bytes between super-blocks.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float Q4KRlaDot1(byte* w, byte* q8k, int superBlockCount, int wStride)
-        => Q4KRlaDot1Avx2(w, q8k, superBlockCount, wStride);   // only reached when Q4KRlaActive (AVX2 + SSE4.1 + FMA)
+        => CpuFeatures.Avx2 && CpuFeatures.Sse41 ? Q4KRlaDot1Avx2(w, q8k, superBlockCount, wStride)   // always true when Q4KRlaActive
+                                                 : Q4KRlaDot1Scalar(w, q8k, superBlockCount, wStride);
 
     /// <summary>Portable RLA reference: plain integer loops, the same float recurrence. The oracle of the vector forms.</summary>
     [SkipLocalsInit]
