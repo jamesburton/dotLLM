@@ -23,11 +23,53 @@ public abstract class GenerationSessionBackendSuite
         return buf;
     }
 
-    private static void AssertLogitsEqual(GenerationSessionFixture fx, float[] expected, float[] actual)
+    /// <summary>
+    /// Safety factor on the control: the bound is <see cref="ControlFactor"/> x the control's max-abs logit difference. 2 because the
+    /// control is one realisation of the prefill-vs-decode noise on one token sequence while the compared pair is another, so the
+    /// two are the same order but not equal; 2 absorbs that without letting a real defect through (a dropped rollback or restore moves
+    /// logits by orders of magnitude, see the mutants in .docs/progress-expert-integ.md). When the control is exactly 0 the comparison
+    /// must be bit-identical: there is no floor.
+    /// </summary>
+    private const float ControlFactor = 2f;
+
+    /// <summary>
+    /// Derived tolerance (James 2026-11-22, consistent with #1928): no fixed number. Per backend and in the same run, the control is
+    /// the plain path against itself with one thing changed, the prefill-vs-decode split, which is exactly the path pair every parity
+    /// comparison here crosses (a session reaches its state through batched prefill, one-row decode and batched append; the oracle
+    /// reaches the same tokens through one batched prefill). Control = fresh prefill of <paramref name="tokens"/> versus prefill of the
+    /// first half then every remaining token appended singly (decode rows), same model, same tokens, max |logit diff|.
+    /// </summary>
+    private static async Task<float> ControlMaxAbsDiff(GenerationSessionFixture oracle, int[] tokens)
     {
-        Assert.Equal(expected.Length, actual.Length);
-        for (int i = 0; i < expected.Length; i++)
-            Assert.True(Math.Abs(expected[i] - actual[i]) <= fx.LogitTolerance + fx.LogitRelativeTolerance * Math.Abs(expected[i]), $"logit {i}: {expected[i]} vs {actual[i]}");
+        var (fresh, _) = await Fresh(oracle, tokens);
+        int p = Math.Max(1, tokens.Length / 2);
+        await using var s = oracle.NewGenerator().CreateSession(Greedy(), Tag());
+        await s.PrefillAsync(tokens[..p]);
+        for (int i = p; i < tokens.Length; i++) await s.AppendObservationTokensAsync(new[] { tokens[i] });
+        return MaxAbsDiff(fresh, Logits(s));
+    }
+
+    private static float MaxAbsDiff(float[] x, float[] y)
+    {
+        Assert.Equal(x.Length, y.Length);
+        float m = 0;
+        for (int i = 0; i < x.Length; i++) m = Math.Max(m, Math.Abs(x[i] - y[i]));
+        return m;
+    }
+
+    /// <summary>Asserts <paramref name="actual"/> is within <see cref="ControlFactor"/> x the control of the fresh-prefill <paramref name="expected"/> (exact when the control is 0).</summary>
+    private static async Task AssertLogitsMatchFresh(GenerationSessionFixture fx, GenerationSessionFixture oracle, int[] tokens, float[] expected, float[] actual)
+        => AssertWithinControl(fx, tokens.Length, await ControlMaxAbsDiff(oracle, tokens), expected, actual);
+
+    /// <summary>The assertion half, for a caller that must measure the control while no session is open on the oracle (a recurrent model owns one session's state).</summary>
+    private static void AssertWithinControl(GenerationSessionFixture fx, int n, float control, float[] expected, float[] actual)
+    {
+        float bound = ControlFactor * control;
+        float diff = MaxAbsDiff(expected, actual);
+        string? log = Environment.GetEnvironmentVariable("DOTLLM_SESSION_CONTROL_LOG");
+        if (!string.IsNullOrEmpty(log))
+            File.AppendAllText(log, $"{fx.Backend} n={n} control={control:E3} bound={bound:E3} diff={diff:E3}{Environment.NewLine}");
+        Assert.True(diff <= bound, $"{fx.Backend}: max logit diff {diff:E3} exceeds {ControlFactor}x control {control:E3} = {bound:E3} (n={n})");
     }
 
     private static async Task<(float[] Logits, int[] Next)> Fresh(GenerationSessionFixture oracle, IEnumerable<int> tokens)
@@ -72,10 +114,11 @@ public abstract class GenerationSessionBackendSuite
             g2 = [.. (await multi.GenerateUntilBoundaryAsync(new StopAfter(4))).TokenIds];
         }
 
+        float control = await ControlMaxAbsDiff(oracle, [.. fx.Prompt, .. g1, .. fx.Observation]);   // before `single` opens: one session per recurrent model
         await using (var single = oracle.NewGenerator().CreateSession(Greedy(), Tag()))
         {
             await single.PrefillAsync(fx.Prompt.Concat(g1).Concat(fx.Observation).ToArray());
-            AssertLogitsEqual(fx, multiLogits, Logits(single));
+            AssertWithinControl(fx, fx.Prompt.Length + g1.Length + fx.Observation.Length, control, Logits(single), multiLogits);
             Assert.Equal(multiArgMax, single.NextTokenArgMax());
             g2Single = [.. (await single.GenerateUntilBoundaryAsync(new StopAfter(4))).TokenIds];
         }
@@ -100,7 +143,7 @@ public abstract class GenerationSessionBackendSuite
             Assert.Equal(k, s.CurrentPosition);
             Assert.Equal(k, s.KvLength);
             var (freshLogits, freshNext) = await Fresh(oracle, all.Take(k));
-            AssertLogitsEqual(fx, freshLogits, Logits(s));
+            await AssertLogitsMatchFresh(fx, oracle, all[..k], freshLogits, Logits(s));
             var r = await s.GenerateUntilBoundaryAsync(new StopAfter(5));
             Assert.Equal(freshNext, r.TokenIds);
             s.RollbackTo(k);
@@ -119,7 +162,7 @@ public abstract class GenerationSessionBackendSuite
         int[] other = [7, 5, 6, 4];
         await s.AppendObservationTokensAsync(other);
         var (freshLogits, freshNext) = await Fresh(oracle, fx.Prompt.Concat(other));
-        AssertLogitsEqual(fx, freshLogits, Logits(s));
+        await AssertLogitsMatchFresh(fx, oracle, [.. fx.Prompt, .. other], freshLogits, Logits(s));
         Assert.Equal(freshNext, (await s.GenerateUntilBoundaryAsync(new StopAfter(5))).TokenIds);
     }
 
@@ -137,7 +180,7 @@ public abstract class GenerationSessionBackendSuite
         int[] other = [4, 6, 3, 5, 7];
         await s.PrefillAsync(other);
         var (freshLogits, freshNext) = await Fresh(oracle, other);
-        AssertLogitsEqual(fx, freshLogits, Logits(s));
+        await AssertLogitsMatchFresh(fx, oracle, other, freshLogits, Logits(s));
         Assert.Equal(freshNext, (await s.GenerateUntilBoundaryAsync(new StopAfter(5))).TokenIds);
     }
 
@@ -154,14 +197,14 @@ public abstract class GenerationSessionBackendSuite
         s.RollbackTo(k);
         Assert.Equal(k, s.KvLength);
         var (freshLogits, freshNext) = await Fresh(oracle, all.Take(k));
-        AssertLogitsEqual(fx, freshLogits, Logits(s));
+        await AssertLogitsMatchFresh(fx, oracle, all[..k], freshLogits, Logits(s));
         Assert.Equal(freshNext, (await s.GenerateUntilBoundaryAsync(new StopAfter(5))).TokenIds);
     }
 
     /// <summary>
     /// Path-matched exactness of an attention rollback: RollbackTo(k) re-forwards token k-1 as one decode row over rows [0, k-1) kept from
     /// the earlier forwards, which is exactly what a fresh session does for [prefill k-1 tokens, append token k-1]. Both go through the
-    /// same kernels, so they agree to 5e-4 on every backend even where prefill-vs-decode noise (see <c>LogitTolerance</c>) is larger.
+    /// same kernels, so they agree to 5e-4 on every backend even where prefill-vs-decode noise (see <c>ControlMaxAbsDiff</c>) is larger.
     /// </summary>
     [SkippableFact]
     public async Task AttentionModel_Rollback_MatchesAPathMatchedOracle()
