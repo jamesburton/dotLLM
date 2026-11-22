@@ -66,9 +66,11 @@ public sealed unsafe class AttentionDecodeSplitKvTests
         float[] expected = Reference(q, k, v, numHeads, numKvHeads, headDim, seqKv);
         // F32 partials differ from the online recurrence only by reduction order; F16 partials add one F16 rounding (2^-11 relative)
         // of each range's normalised output (|o| <= 1 here). Measured max |d| on these shapes: F32 1.6-2.2e-7, F16 2.7-8.0e-5.
+        var byMode = new Dictionary<DecodeSplitKvPartials, float[]>();
         foreach (var (mode, tol) in new[] { (DecodeSplitKvPartials.F32, 1e-6f), (DecodeSplitKvPartials.F16, 3e-4f) })
         {
             float[] got = Run(q, k, v, numHeads, numKvHeads, headDim, seqKv, 7, mode, out long engaged);
+            byMode[mode] = got;
             Assert.Equal(1, engaged);
             float maxAbs = 0; int worst = -1;
             for (int i = 0; i < got.Length; i++)
@@ -77,7 +79,13 @@ public sealed unsafe class AttentionDecodeSplitKvTests
                 if (!(d <= maxAbs)) { maxAbs = d; worst = i; }
             }
             Assert.True(maxAbs <= tol, $"{mode}: max |d| {maxAbs:E3} at {worst} (head {worst / headDim}) exceeds {tol:E1}");
+            // #1927 review M5: the F16 arm must really round its partials (a mode that silently stored F32 would pass the tolerance).
+            if (mode == DecodeSplitKvPartials.F16)
+                Assert.True(maxAbs >= 1e-6f, $"F16 partials: max |d| {maxAbs:E3} vs the tiled kernel is F32-small: the F16 store did not happen");
         }
+        float f16VsF32 = 0;
+        for (int i = 0; i < expected.Length; i++) f16VsF32 = MathF.Max(f16VsF32, MathF.Abs(byMode[DecodeSplitKvPartials.F16][i] - byMode[DecodeSplitKvPartials.F32][i]));
+        Assert.True(f16VsF32 > 0f, "F16 and F32 partial arms are bit-identical: the mode switch has no effect");
     }
 
     [Theory]
@@ -95,6 +103,30 @@ public sealed unsafe class AttentionDecodeSplitKvTests
                 Assert.True(BitConverter.SingleToInt32Bits(baseline[i]) == BitConverter.SingleToInt32Bits(got[i]),
                     $"{mode} threads={threads}: output {i} differs from 2 threads");
         }
+    }
+
+    /// <summary>#1927 review M1: decode adds a range every 256 keys; the per-thread partials must grow geometrically, not per range.</summary>
+    [Fact]
+    public void SplitKv_Partials_GrowGeometrically_AndTrimFreesThem()
+    {
+        const int numHeads = 8, numKvHeads = 2, headDim = 64;
+        var (q, k, v) = Fixture(numHeads, numKvHeads, headDim, 2049 + 256 * 12);
+        CpuKernelScratch.Trim(null);
+        var sizes = new List<long>();
+        using (Attention.OverrideDecodeSplitKvOnThisThread(DecodeSplitKvPartials.F16))
+        {
+            var o = new float[q.Length];
+            fixed (float* qp = q, kp = k, vp = v, op = o)
+                for (int seqKv = 2049; seqKv <= 2049 + 256 * 12; seqKv += 256)
+                {
+                    Attention.Execute(qp, kp, vp, op, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1, null);
+                    sizes.Add(Attention.SplitKvPartialSlotsOnThisThread);
+                }
+        }
+        int reallocs = sizes.Zip(sizes.Skip(1), (a, b) => b != a ? 1 : 0).Sum();
+        Assert.True(reallocs <= 2, $"13 range counts (9..21) caused {reallocs} re-allocations: [{string.Join(", ", sizes)}]");
+        CpuKernelScratch.Trim(null);
+        Assert.Equal(0, Attention.SplitKvPartialSlotsOnThisThread);
     }
 
     [Fact]
