@@ -196,6 +196,27 @@ public sealed class GenerationSessionCoreTests
         Assert.Equal(fx.Prompt.Length + fx.Observation.Length, s.CurrentPosition);
     }
 
+    /// <summary>A forward that throws mid-append (after the KV advanced) is undone: position, KV and logits are as before.</summary>
+    [Fact]
+    public async Task FailedAppendForward_IsUndone_ForAnAttentionModel()
+    {
+        using var fx = Create(Llama);
+        var gen = fx.NewGenerator();
+        await using var s = gen.CreateSession(Greedy(), Tag());
+        await s.PrefillAsync(fx.Prompt);
+        var before = Logits(s);
+
+        fx.Counter.FailNextForward();
+        await Assert.ThrowsAsync<IOException>(async () => await s.AppendObservationTokensAsync(fx.Observation));
+        Assert.Equal(fx.Prompt.Length, s.CurrentPosition);
+        AssertLogitsEqual(before, Logits(s));
+
+        await s.AppendObservationTokensAsync(fx.Observation);
+        await using var fresh = gen.CreateSession(Greedy(), Tag());
+        await fresh.PrefillAsync(fx.Prompt.Concat(fx.Observation).ToArray());
+        AssertLogitsEqual(Logits(fresh), Logits(s));
+    }
+
     [Fact]
     public void ResponseFormat_IsNotSupportedYet()
     {

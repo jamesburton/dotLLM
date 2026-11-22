@@ -100,9 +100,20 @@ internal sealed class GenerationSessionFixture : IDisposable
     {
         public int Forwards;
         public int Tokens;
-        public bool AppliesTo(int layerIndex) => layerIndex == 0;
-        public void ModifyResidual(Span<float> residual, int layerIndex, int tokenCount) { Forwards++; Tokens += tokenCount; }
-        public void Reset() { Forwards = 0; Tokens = 0; }
+        /// <summary>When &gt; 0: the forward whose number (1-based, since the last Reset) equals this throws at layer 1.</summary>
+        public int FailOnForward;
+        public bool AppliesTo(int layerIndex) => layerIndex <= 1;
+        public void ModifyResidual(Span<float> residual, int layerIndex, int tokenCount)
+        {
+            if (layerIndex == 0) { Forwards++; Tokens += tokenCount; }
+            else if (FailOnForward > 0 && Forwards == FailOnForward)
+            {
+                FailOnForward = 0;
+                throw new IOException("injected forward failure");
+            }
+        }
+        public void Reset() { Forwards = 0; Tokens = 0; FailOnForward = 0; }
+        public void FailNextForward() => FailOnForward = Forwards + 1;
     }
 
     /// <summary>Stops (including the token) after <c>n</c> generated tokens in the segment.</summary>
