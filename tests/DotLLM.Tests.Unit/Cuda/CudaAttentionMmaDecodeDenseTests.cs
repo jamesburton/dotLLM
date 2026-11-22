@@ -436,6 +436,32 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
         finally { foreach (var p in new[] { dQ, kc, vc, kn, vn, ce }) CudaDriverApi.cuMemFree_v2(p); }
     }
 
+    /// <summary>
+    /// #1922 review M6: the split scratch goes through CudaAdmission (no spill). With no free VRAM reported the path is off and
+    /// allocates nothing; with the real reading it is on. Mutant: drop the TryFit check (the refused case then allocates).
+    /// </summary>
+    [SkippableFact]
+    public void DenseScratch_IsAdmittedAgainstFreeVram()
+    {
+        using var rig = TrySetUp(out string? skip);
+        Skip.If(rig == null, skip);
+        Skip.IfNot(rig!.Kernels.HasAttentionMmaDecodeDense(128, F16, F16), "dense v2 kernel not loaded");
+        var prev = CudaAdmission.FreeBytesOverride;
+        try
+        {
+            CudaAdmission.FreeBytesOverride = () => 0;
+            using (var refused = new CudaDenseDecodeV2(rig.Kernels, 32, 8, 128))
+            {
+                Assert.Equal(0, refused.MaxSplit);
+                Assert.Equal(0, refused.ScratchBytes);
+            }
+            CudaAdmission.FreeBytesOverride = prev;
+            using var admitted = new CudaDenseDecodeV2(rig.Kernels, 32, 8, 128);
+            Assert.True(admitted.MaxSplit >= 1);
+            Assert.Equal((long)32 * admitted.MaxSplit * (2 * 4 + 128 * CudaKernels.AttentionMmaDecodeDensePartialBytes), admitted.ScratchBytes);
+        }
+        finally { CudaAdmission.FreeBytesOverride = prev; }
+    }
     /// <summary>The C# wrapper must refuse a kvSplit above the co-residency ceiling before launching (a hard CUDA error otherwise).</summary>
     [SkippableFact]
     public void Dense_RejectsSplitAboveCoResidencyCeiling()

@@ -21,7 +21,8 @@ namespace DotLLM.Cuda;
 /// <b>Scratch.</b> One partial buffer shared by every layer, allocated once here at model construction (never inside a decode
 /// step), sized for the largest kvSplit any dense entry can launch with on this device: the normalised partial O in F16,
 /// <c>numHeads x maxSplit x headDim x 2</c>, plus F32 m and l, <c>2 x numHeads x maxSplit x 4</c> bytes (Qwen3-4B on an
-/// RTX 3060: maxSplit 3, 24 KiB + 768 B). If the allocation fails the path is simply off.
+/// RTX 3060: maxSplit 3, 24 KiB + 768 B), admitted through `CudaAdmission` against free VRAM. If admission refuses or the
+/// allocation fails, the path is simply off.
 /// </para>
 /// <para>
 /// <b>Switches.</b> <c>DOTLLM_CUDA_DENSE_DECODE_V2=0</c> turns it off; <c>DOTLLM_CUDA_DENSE_DECODE_V2_MIN_KV</c> (default 512)
@@ -68,6 +69,14 @@ internal sealed class CudaDenseDecodeV2 : IDisposable
 
         long statBytes = (long)numHeads * maxSplit * sizeof(float);
         long outBytes = (long)numHeads * maxSplit * headDim * CudaKernels.AttentionMmaDecodeDensePartialBytes;
+        // The one CUDA admission path (#1848, no spill): this is an optional accelerator, so a refusal turns the path off (the
+        // scalar kernels need no scratch) instead of failing the model. The allocations are itemised by CudaMemTrace through the
+        // cuMemAlloc_v2 wrapper (site CudaDenseDecodeV2..ctor). Device memory ledger: #1933.
+        if (!CudaAdmission.TryFit(2 * statBytes + outBytes, out _))
+        {
+            Console.Error.WriteLine($"[dotLLM.Cuda] Dense v2 decode off: its {2 * statBytes + outBytes} B split scratch was not admitted.");
+            return;
+        }
         if (CudaDriverApi.cuMemAlloc_v2(out _partialMax, (nuint)statBytes) != 0
             || CudaDriverApi.cuMemAlloc_v2(out _partialSum, (nuint)statBytes) != 0
             || CudaDriverApi.cuMemAlloc_v2(out _partialOut, (nuint)outBytes) != 0)
