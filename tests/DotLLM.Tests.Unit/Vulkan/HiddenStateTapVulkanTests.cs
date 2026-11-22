@@ -67,6 +67,10 @@ internal sealed class VulkanHiddenStateTapFixture : HiddenStateTapFixture
 
     public override IKvCache NewKv(int maxLen = 96) => _kvFactory(maxLen);
 
+    public override IKvCache? NewWindowedKv(int maxLen)
+        => _family != HiddenStateTapBackendSuite.Llama ? null
+            : new VulkanKvCache(_device, KvGeometry.FromConfig(_config with { SlidingWindowSize = 8, SlidingWindowPattern = 2 }, compactSlidingWindows: true), maxLen);
+
     public override float[] KvBytes(IKvCache kv)
     {
         var all = new List<float>();

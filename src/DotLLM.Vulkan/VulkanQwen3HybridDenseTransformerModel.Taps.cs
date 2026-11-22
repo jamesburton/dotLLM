@@ -64,7 +64,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IHiddenStat
         {
             if (taps.HasAbortable)
             {
-                _tapKvEntry = TapKvCheckpoint(kvCache);
+                _tapKvEntry = TapKvCheckpoint(kvCache, positions);
                 if (gdnState is null) _tapCkpt = CheckpointRecurrentState();
                 else if (gdnState is VulkanGdnStateCache own)
                 {
@@ -119,16 +119,6 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IHiddenStat
         return null;
     }
 
-    private static int TapKvCheckpoint(IKvCache? kvCache)
-    {
-        if (kvCache is null) return -1;
-        int entry = kvCache.CurrentLength;
-        try { kvCache.Rollback(entry); }
-        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
-        {
-            throw new NotSupportedException(
-                "An abortable hidden-state tap needs a KV-cache that supports Rollback; this cache refused.", ex);
-        }
-        return entry;
-    }
+    private static int TapKvCheckpoint(IKvCache? kvCache, ReadOnlySpan<int> positions)
+        => DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
 }

@@ -33,6 +33,11 @@ public abstract class HiddenStateTapFixture : IDisposable
     /// </summary>
     public virtual bool BatchBitExact => BitExact;
     public abstract IKvCache NewKv(int maxLen = 96);
+    /// <summary>
+    /// A KV-cache of the type this backend would create for a sliding-window model (compact windows, window 8 on the even layers), or
+    /// <see langword="null"/> when the host has none (the windowed abort tests skip).
+    /// </summary>
+    public virtual IKvCache? NewWindowedKv(int maxLen) => null;
     /// <summary>Raw KV contents for the first <c>CurrentLength</c> rows, every layer that has KV, for byte comparison.</summary>
     public abstract float[] KvBytes(IKvCache kv);
     public abstract void Dispose();
@@ -418,6 +423,61 @@ public abstract class HiddenStateTapBackendSuite
             _ => HookResult.Replace(new float[fx.Hidden]));
         using var kv = fx.NewKv();
         Assert.Throws<InvalidOperationException>(() => fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv));
+    }
+
+    /// <summary>
+    /// Compact sliding-window caches drop rows during an append, after which the entry length is unreachable. An abortable tap must be refused
+    /// at forward entry (NotSupportedException naming the cache), with no KV, recurrent or tap state touched: the next forward equals a
+    /// control that never saw the refused call.
+    /// </summary>
+    [SkippableFact]
+    public void Abort_WindowedCache_RefusedUpFront_NoStateChange()
+    {
+        using var fx = Open(Llama);
+        Skip.IfNot(fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+        using var kvA = fx.NewWindowedKv(1024);
+        Skip.If(kvA is null, "no sliding-window cache on this host");
+        using var control = Open(Llama);
+        using var kvC = control.NewWindowedKv(1024)!;
+        int[] pp = Enumerable.Range(0, fx.Prompt.Length).ToArray();
+        using (fx.Model.Forward(fx.Prompt, pp, -1, kvA)) { }
+        using (control.Model.Forward(control.Prompt, pp, -1, kvC)) { }
+
+        var sut = new Aborter(HookPoint.PostLayer, fx.NumLayers - 1) { Armed = true };
+        using var h = fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), sut.OnSample);
+        HiddenStateTapRegistry.PathCounters.Reset();
+        // A write far past the entry length: the window cache would compact past the entry length's rows before the tap could abort.
+        var ex = Assert.Throws<NotSupportedException>(() => fx.Host.TryForward([fx.Prompt[1]], [700], -1, kvA, out _, out _));
+        Assert.Contains(kvA!.GetType().Name, ex.Message);
+        Assert.Contains("sliding-window", ex.Message);
+        Assert.Equal(fx.Prompt.Length, kvA.CurrentLength);
+        Assert.Equal(0, sut.Hits);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortedForwards);
+
+        sut.Armed = false;
+        int[] t = [fx.Prompt[2]];
+        int[] p = [fx.Prompt.Length];
+        using var la = fx.Model.Forward(t, p, -1, kvA);
+        using var lc = control.Model.Forward(t, p, -1, kvC);
+        Assert.True(LastRow(la, fx.Vocab).AsSpan().SequenceEqual(LastRow(lc, control.Vocab)), "logits differ after the refused forward");
+        Assert.Equal(kvC.CurrentLength, kvA.CurrentLength);
+    }
+
+    /// <summary>Control: the same windowed cache with contiguous positions can roll back, so the abort works and restores the entry length.</summary>
+    [SkippableFact]
+    public void Abort_WindowedCache_ContiguousDecode_StillAborts()
+    {
+        using var fx = Open(Llama);
+        Skip.IfNot(fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+        using var kv = fx.NewWindowedKv(1024);
+        Skip.If(kv is null, "no sliding-window cache on this host");
+        int[] pp = Enumerable.Range(0, fx.Prompt.Length).ToArray();
+        using (fx.Model.Forward(fx.Prompt, pp, -1, kv)) { }
+        var sut = new Aborter(HookPoint.PostLayer, fx.NumLayers - 1) { Armed = true };
+        using var h = fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), sut.OnSample);
+        Assert.False(fx.Host.TryForward([fx.Prompt[1]], [fx.Prompt.Length], -1, kv, out _, out _));
+        Assert.Equal(1, sut.Hits);
+        Assert.Equal(fx.Prompt.Length, kv!.CurrentLength);
     }
 
     /// <summary>Read-only taps never checkpoint: only an abortable tap pays for entry state.</summary>

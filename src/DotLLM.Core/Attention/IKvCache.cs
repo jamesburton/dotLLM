@@ -58,6 +58,16 @@ public interface IKvCache : IDisposable
     void Rollback(int length);
 
     /// <summary>
+    /// True when, after a forward appends positions <paramref name="minPos"/>..<paramref name="maxPos"/>, <see cref="Rollback"/> to the
+    /// current (pre-append) length would still succeed without corrupting rows. A compact sliding-window cache drops rows during the
+    /// append and answers false when the cut would then need them. Default true (full-history caches). Used by the abortable
+    /// hidden-state tap gate (#1920) before any state is touched.
+    /// </summary>
+    /// <param name="minPos">Lowest position about to be written.</param>
+    /// <param name="maxPos">Highest position about to be written.</param>
+    bool CanRollbackAfterAppend(int minPos, int maxPos) => true;
+
+    /// <summary>
     /// Grows <see cref="MaxLength"/> to at least <paramref name="maxLength"/> and keeps the committed rows. The engine uses it
     /// when a later, longer prompt reuses a cached prefix (issue #1025). The default only reports whether the cache is
     /// already large enough: a cache that cannot grow returns <see langword="false"/> and the caller allocates a new one.

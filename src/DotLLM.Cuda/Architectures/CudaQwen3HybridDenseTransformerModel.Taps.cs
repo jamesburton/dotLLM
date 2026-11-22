@@ -114,7 +114,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
         {
             if (taps.HasAbortable)
             {
-                kvEntry = CudaHiddenStateTaps.KvCheckpoint(kvCache);
+                kvEntry = CudaHiddenStateTaps.KvCheckpoint(kvCache, positions);
                 ckpt = CheckpointRecurrentState();
                 HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
             }

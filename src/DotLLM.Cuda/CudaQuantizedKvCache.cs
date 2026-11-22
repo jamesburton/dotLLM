@@ -555,6 +555,15 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, 
     }
 
     /// <inheritdoc/>
+    /// <remarks>Windowed: appending past the FP16 window evicts rows into the quantized region, after which a cut to the entry length is unsafe (see <see cref="CanTruncate"/>).</remarks>
+    public bool CanRollbackAfterAppend(int minPos, int maxPos)
+    {
+        int newLength = Math.Max(_currentLength, maxPos + 1);
+        int newQuant = _windowSize > 0 ? Math.Max(_quantizedLength, newLength - _windowSize) : newLength;
+        return CanTruncate(_windowSize, newLength, newQuant, _currentLength);
+    }
+
+    /// <inheritdoc/>
     /// <remarks>See <see cref="CanTruncate"/>.</remarks>
     public bool CanTruncateTo(int length) => CanTruncate(_windowSize, _currentLength, _quantizedLength, length);
 

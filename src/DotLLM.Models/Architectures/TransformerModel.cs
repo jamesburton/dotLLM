@@ -1217,13 +1217,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
         {
             // An abort must be able to undo this forward's KV writes. A cache that cannot truncate refuses here, before
             // anything is written: a no-op rollback to the current length is the probe.
-            kvEntry = kvCache.CurrentLength;
-            try { kvCache.Rollback(kvEntry); }
-            catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
-            {
-                throw new NotSupportedException(
-                    "An abortable hidden-state tap needs a KV-cache that supports Rollback; this cache refused.", ex);
-            }
+            kvEntry = DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
             DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
         }
         bool done = RunLayerRangeCore(tokenIds, ReadOnlySpan<float>.Empty, positions, kvCache,

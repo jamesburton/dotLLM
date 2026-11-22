@@ -95,7 +95,7 @@ public sealed unsafe partial class CudaTransformerModel
         {
             if (taps.HasAbortable)
             {
-                kvEntry = CudaHiddenStateTaps.KvCheckpoint(kvCache);
+                kvEntry = CudaHiddenStateTaps.KvCheckpoint(kvCache, positions);
                 HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
             }
             _context.MakeCurrent();

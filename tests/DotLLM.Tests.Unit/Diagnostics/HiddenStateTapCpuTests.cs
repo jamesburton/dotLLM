@@ -55,6 +55,10 @@ internal sealed class CpuHiddenStateTapFixture : HiddenStateTapFixture
     public override IKvCache NewKv(int maxLen = 96)
         => new SimpleKvCache(KvGeometry.FromConfig(_config, Model.SupportsCompactSlidingKv), maxLen);
 
+    public override IKvCache? NewWindowedKv(int maxLen)
+        => _family != HiddenStateTapBackendSuite.Llama ? null
+            : new SimpleKvCache(KvGeometry.FromConfig(_config with { SlidingWindowSize = 8, SlidingWindowPattern = 2 }, compactSlidingWindows: true), maxLen);
+
     public override float[] KvBytes(IKvCache kv)
     {
         var cache = (SimpleKvCache)kv;

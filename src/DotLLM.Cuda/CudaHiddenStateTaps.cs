@@ -200,18 +200,8 @@ internal sealed unsafe class CudaHiddenStateTaps : IDisposable
     }
 
     /// <summary>Takes the entry KV length for an abortable tap, after proving the cache can truncate (a no-op rollback is the probe).</summary>
-    internal static int KvCheckpoint(DotLLM.Core.Attention.IKvCache? kvCache)
-    {
-        if (kvCache is null) return -1;
-        int entry = kvCache.CurrentLength;
-        try { kvCache.Rollback(entry); }
-        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
-        {
-            throw new NotSupportedException(
-                "An abortable hidden-state tap needs a KV-cache that supports Rollback; this cache refused.", ex);
-        }
-        return entry;
-    }
+    internal static int KvCheckpoint(DotLLM.Core.Attention.IKvCache? kvCache, ReadOnlySpan<int> positions)
+        => DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
 
     private static int s_logged;
 

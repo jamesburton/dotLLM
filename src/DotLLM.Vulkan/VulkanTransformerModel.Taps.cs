@@ -101,17 +101,6 @@ public sealed partial class VulkanTransformerModel
     }
 
     /// <summary>Takes the entry checkpoint for an abortable tap: the KV length, after proving the cache can truncate.</summary>
-    private static int TapKvCheckpoint(IKvCache? kvCache)
-    {
-        if (kvCache is null) return -1;
-        int entry = kvCache.CurrentLength;
-        try { kvCache.Rollback(entry); }
-        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
-        {
-            throw new NotSupportedException(
-                "An abortable hidden-state tap needs a KV-cache that supports Rollback; this cache refused.", ex);
-        }
-        HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
-        return entry;
-    }
+    private static int TapKvCheckpoint(IKvCache? kvCache, ReadOnlySpan<int> positions)
+        => DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
 }

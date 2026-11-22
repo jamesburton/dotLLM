@@ -100,7 +100,7 @@ public sealed unsafe partial class CudaQwen3MoeHybridTransformerModel
         {
             if (taps.HasAbortable)
             {
-                kvEntry = TapKvCheckpoint(kvCache);
+                kvEntry = TapKvCheckpoint(kvCache, positions);
                 ckpt = ((IModel)this).CheckpointRecurrentState();
                 HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
             }
@@ -124,18 +124,8 @@ public sealed unsafe partial class CudaQwen3MoeHybridTransformerModel
     }
 
     /// <summary>Takes the entry checkpoint for an abortable tap: the KV length, after proving the cache can truncate.</summary>
-    private static int TapKvCheckpoint(IKvCache? kvCache)
-    {
-        if (kvCache is null) return -1;
-        int entry = kvCache.CurrentLength;
-        try { kvCache.Rollback(entry); }
-        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
-        {
-            throw new NotSupportedException(
-                "An abortable hidden-state tap needs a KV-cache that supports Rollback; this cache refused.", ex);
-        }
-        return entry;
-    }
+    private static int TapKvCheckpoint(IKvCache? kvCache, ReadOnlySpan<int> positions)
+        => DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
 
     /// <summary>
     /// Test hook (#1920): the model-owned F16 KV rows <c>[0, rows)</c> of every attention slot, K then V, widened to F32, for byte comparison.

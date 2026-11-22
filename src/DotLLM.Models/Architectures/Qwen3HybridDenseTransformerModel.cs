@@ -1099,13 +1099,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         int kvEntry = -1;
         if (kvCache is not null)
         {
-            kvEntry = kvCache.CurrentLength;
-            try { kvCache.Rollback(kvEntry); }   // no-op probe: a cache that cannot truncate refuses before anything is written
-            catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
-            {
-                throw new NotSupportedException(
-                    "An abortable hidden-state tap needs a KV-cache that supports Rollback; this cache refused.", ex);
-            }
+            kvEntry = DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
         }
         CommitPendingRows();
         GdnStateCache target = gdnState as GdnStateCache ?? _gdnCache;

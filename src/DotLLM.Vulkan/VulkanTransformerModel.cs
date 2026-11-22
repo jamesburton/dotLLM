@@ -4905,7 +4905,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         if (taps is not null)
         {
             GuardTapForward(seqLen);
-            if (taps.HasAbortable) tapKvEntry = TapKvCheckpoint(kvCache);
+            if (taps.HasAbortable) tapKvEntry = TapKvCheckpoint(kvCache, positions);
         }
 
         _fwdKvStorage = kvCache is VulkanKvCache { Storage: var kvs } && kvs != VulkanKvStorage.F32 ? kvs : VulkanKvStorage.F32;   // F16 and every block format (#1884)
