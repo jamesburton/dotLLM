@@ -6,34 +6,38 @@ using DotLLM.Core.Configuration;
 using DotLLM.Cuda;
 using DotLLM.Engine.KvCache.Codecs;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
 namespace DotLLM.Tests.Unit.Cuda;
 
 /// <summary>
-/// Diagnostic, not a gate (#1924), opt-in with <c>DOTLLM_TQ_PREFILL_DEPTH_DIAG=1</c> and <c>DOTLLM_QWEN3_4B_GGUF</c>: does the new
-/// TurboQuant prefill entry move the model further from unquantised KV than the legacy entry? A long prompt (default 4096 wikitext
-/// tokens, <c>DOTLLM_TQ_PREFILL_DEPTH_TOKENS</c>) is prefilled in 1024-row chunks, so every chunk after the first runs the tensor-core
-/// TQ prefill at depth, then 32 teacher-forced decode steps follow (scalar kernel, unchanged). Arms: F16 KV (reference), the scratch
-/// oracle, and the in-place cache with the prefill entry forced to Legacy, Specialized (E1) and Staged (E3). Reported per bit width:
-/// mean / max KL(f16 || arm) and cos(arm, oracle) over the 33 rows. tq-gate's quality and 1-layer parity modes cannot see this change
-/// on CUDA (its forward returns one row, so quality runs one token per forward; one layer cannot move the codes).
+/// #1924 gate for the bit-specialised (E1, <c>_tq{bits}</c>) and staged (E3, <c>_tq{bits}_cpa</c>) TurboQuant prefill entries, set by
+/// James 2026-11-22 in place of the SmolLM step-1 MinCos bound (which keeps gating the legacy entry): on Qwen3-4B, after a long
+/// chunked prefill, each new entry's mean KL(f16 KV || arm) is no worse than the legacy entry's, and its top-1 agreement with f16 KV is
+/// no worse than legacy's minus 1, at tq3 and tq4.
+/// <para>A 4096-token wikitext prompt (<c>DOTLLM_TQ_PREFILL_DEPTH_TOKENS</c> overrides) is prefilled in 1024-row chunks, so every
+/// chunk after the first runs the tensor-core TQ prefill at depth (144 launches per arm); 32 teacher-forced decode rows follow
+/// (scalar kernel, unchanged). 33 rows are compared. The scratch oracle is reported for context, not gated. tq-gate's quality and
+/// 1-layer parity modes cannot see this change on CUDA (the CUDA forward returns one row, so quality runs one token per forward; one
+/// layer cannot move the codes). Model: Qwen3-4B-Instruct-2507 Q4_K_M (<c>DOTLLM_QWEN3_4B_GGUF</c> or the model store).</para>
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(CudaCollection.Name)]
-public sealed unsafe class CudaTurboQuantPrefillDepthDiagnostic
+public sealed unsafe class CudaTurboQuantPrefillDepthGate
 {
     private const ulong Seed = 0x5DEECE66DUL;   // the CLI's default TurboQuant seed
     private readonly ITestOutputHelper _out;
-    public CudaTurboQuantPrefillDepthDiagnostic(ITestOutputHelper output) => _out = output;
+    public CudaTurboQuantPrefillDepthGate(ITestOutputHelper output) => _out = output;
 
     [SkippableFact]
-    public void LongPrefill_PerEntry_DistanceToF16AndOracle()
+    public void LongPrefill_NewEntries_NoFurtherFromF16ThanLegacy()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_TQ_PREFILL_DEPTH_DIAG") == "1", "set DOTLLM_TQ_PREFILL_DEPTH_DIAG=1");
-        string modelPath = Environment.GetEnvironmentVariable("DOTLLM_QWEN3_4B_GGUF") ?? "";
-        Skip.If(!File.Exists(modelPath), "set DOTLLM_QWEN3_4B_GGUF");
+        string modelPath = Environment.GetEnvironmentVariable("DOTLLM_QWEN3_4B_GGUF")
+            ?? TestFixtureResolver.ResolveFile([], "bartowski", "Qwen_Qwen3-4B-Instruct-2507-GGUF",
+                                               ["Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"], null).Path ?? "";
+        Skip.If(!File.Exists(modelPath), $"Qwen3-4B-Instruct-2507 Q4_K_M GGUF not found ({modelPath}); set DOTLLM_QWEN3_4B_GGUF");
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
         int n = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_TQ_PREFILL_DEPTH_TOKENS"), out int nn) ? nn : 4096;
         const int chunk = 1024, steps = 32;
@@ -70,6 +74,7 @@ public sealed unsafe class CudaTurboQuantPrefillDepthDiagnostic
             return rows;
         }
 
+        var gate = new List<(int bits, Dictionary<CudaKernels.TqPrefillVariant, (double meanKl, int agree)> stats)>();
         List<float[]> f16;
         using (var c = model.CreateKvCache(maxSeq)) f16 = Run(c);
         foreach (int bits in new[] { 4, 3 })
@@ -82,6 +87,7 @@ public sealed unsafe class CudaTurboQuantPrefillDepthDiagnostic
             var kv = new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant, 0, bits, Seed);
             Report(bits, "oracle", oracle, f16, oracle, 0);
             var arms = new Dictionary<CudaKernels.TqPrefillVariant, List<float[]>>();
+            var stats = new Dictionary<CudaKernels.TqPrefillVariant, (double meanKl, int agree)>();
             foreach (var v in new[] { CudaKernels.TqPrefillVariant.Legacy, CudaKernels.TqPrefillVariant.Specialized, CudaKernels.TqPrefillVariant.Staged })
             {
                 long l0 = CudaKernels.AttentionFlashPrefillKvTqLaunches, s0 = CudaKernels.AttentionFlashPrefillKvTqSpecLaunches,
@@ -94,21 +100,34 @@ public sealed unsafe class CudaTurboQuantPrefillDepthDiagnostic
                 Assert.True(flash > 0, "the tensor-core TQ prefill never ran");
                 Assert.Equal(v == CudaKernels.TqPrefillVariant.Specialized ? flash : 0, spec);
                 Assert.Equal(v == CudaKernels.TqPrefillVariant.Staged ? flash : 0, cpa);
-                Report(bits, v.ToString(), arms[v], f16, oracle, flash);
+                stats[v] = Report(bits, v.ToString(), arms[v], f16, oracle, flash);
             }
             var (cosLs, _) = CosStats(arms[CudaKernels.TqPrefillVariant.Legacy], arms[CudaKernels.TqPrefillVariant.Staged]);
             var (cosSs, _) = CosStats(arms[CudaKernels.TqPrefillVariant.Specialized], arms[CudaKernels.TqPrefillVariant.Staged]);
             _out.WriteLine($"DEPTH b{bits} n={n}: min cos(Legacy, Staged) {cosLs:F6}; min cos(Specialized, Staged) {cosSs:F6} (E1 and E3 should be bit-identical: 1)");
+            gate.Add((bits, stats));
+        }
+        // The gate (James 2026-11-22), evaluated after every arm is reported so a failure still prints all the numbers.
+        foreach (var (bits, st) in gate)
+        {
+            var (klL, agL) = st[CudaKernels.TqPrefillVariant.Legacy];
+            foreach (var v in new[] { CudaKernels.TqPrefillVariant.Specialized, CudaKernels.TqPrefillVariant.Staged })
+            {
+                var (kl, ag) = st[v];
+                Assert.True(kl <= klL, $"tq{bits} {v}: mean KL(f16||arm) {kl:E4} is worse than legacy's {klL:E4}");
+                Assert.True(ag >= agL - 1, $"tq{bits} {v}: top-1 agreement with f16 {ag}/33 is below legacy's {agL}/33 minus 1");
+            }
         }
     }
 
-    private void Report(int bits, string arm, List<float[]> rows, List<float[]> f16, List<float[]> oracle, long flash)
+    private (double meanKl, int agree) Report(int bits, string arm, List<float[]> rows, List<float[]> f16, List<float[]> oracle, long flash)
     {
         var kl = rows.Select((r, i) => Kl(f16[i], r)).ToArray();
         var (minCosOr, meanCosOr) = CosStats(rows, oracle);
         int agree = rows.Select((r, i) => Argmax(r) == Argmax(f16[i]) ? 1 : 0).Sum();
         _out.WriteLine($"DEPTH b{bits} {arm,-11}: KL(f16||arm) mean {kl.Average():E4} max {kl.Max():E4} prefill-row {kl[0]:E4}; " +
                        $"cos(arm,oracle) min {minCosOr:F6} mean {meanCosOr:F6}; argmax==f16 {agree}/{rows.Count}; flash launches {flash}");
+        return (kl.Average(), agree);
     }
 
     private static (double min, double mean) CosStats(List<float[]> a, List<float[]> b)

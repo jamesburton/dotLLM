@@ -5377,9 +5377,10 @@ public sealed unsafe partial class CudaKernels : IDisposable
     };
 
     /// <summary>The TurboQuant prefill entry used when neither the environment nor a test override picks one.</summary>
-    /// <remarks>#1924: Staged (E3) measured fastest (kernel level 0.33x legacy, 0.55x E1 at a 32K offset); where it does not apply
-    /// (hd64 tq3, unaligned code buffers) the launcher falls back to Specialized, then Legacy.</remarks>
-    internal const TqPrefillVariant DefaultTqPrefillVariant = TqPrefillVariant.Staged;
+    /// <remarks>#1924 (James 2026-11-22): Legacy until the model-level bench shows Staged (E3) beating legacy and at parity with
+    /// or better than q4_0 at 7K and 32K; until then Staged / Specialized are opt-in (<c>DOTLLM_CUDA_TQ_PREFILL=cpa|spec</c>). The flip
+    /// is its own commit after that bench. Staged falls back to Specialized (hd64 tq3, unaligned code buffers), then Legacy.</remarks>
+    internal const TqPrefillVariant DefaultTqPrefillVariant = TqPrefillVariant.Legacy;
 
     private static int s_tqPrefillEntryReported;
 

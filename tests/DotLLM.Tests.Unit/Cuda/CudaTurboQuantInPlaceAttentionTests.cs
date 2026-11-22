@@ -526,6 +526,16 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
     public void TqDecode_RunsEager_NotCaptured_MatchesOracle(int bits)
     {
         RequireKernels();
+        // James 2026-11-22 (#1924): this MinCos bound gates the LEGACY prefill entry only, so the test pins it. The bit-specialised and
+        // staged entries move one rounding point per operand; at tq4 that digitises to cos 0.992 at decode step 1 here (accepted as
+        // drift), and they are gated instead by CudaTurboQuantPrefillDepthGate (Qwen3-4B, KL to F16 KV no worse than legacy).
+        CudaKernels.TqPrefillVariantOverride = CudaKernels.TqPrefillVariant.Legacy;
+        try { TqDecodeRunsEagerCore(bits); }
+        finally { CudaKernels.TqPrefillVariantOverride = null; }
+    }
+
+    private void TqDecodeRunsEagerCore(int bits)
+    {
         string modelPath = Environment.GetEnvironmentVariable("DOTLLM_SMOLLM_Q8_GGUF")
             ?? TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), $"SmolLM-135M Q8_0 GGUF not found at {modelPath}");
