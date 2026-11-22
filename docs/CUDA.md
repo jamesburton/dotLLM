@@ -1282,6 +1282,11 @@ The plain `CudaTransformerModel` used to decode with the scalar one-block-per-qu
   not: F16 past `GraphCaptureMaxDepth`, pure-quantized q8_0 / q4_0 and in-place TurboQuant at any depth. Bit-identical to
   eager by construction (tested for f16, q8_0, q4_0, tq4, tq3, across kernel switches and after a rollback).
   **Kill switch: `DOTLLM_CUDA_STEP_GRAPH=0`.** `DOTLLM_CUDA_STEP_GRAPH_STATS=1` prints the capture + update host time per step.
+  The windowed quantized cache is not captured (its update advances eviction bookkeeping during capture). A failed capture,
+  instantiate or launch runs that step eagerly and disables the graph only until the cache, its buffers or the attention tier
+  change.
+- **Interplay.** For f16 below `GraphCaptureMaxDepth` the older device-scalar graph (`attention_f16_dyn`) owns decode, so raising
+  `DOTLLM_GRAPH_MAX_DEPTH`, or lowering `DOTLLM_CUDA_DENSE_DECODE_V2_MIN_KV` below it, leaves f16 on the scalar kernel in that band.
 
 Kernel microbench (RTX 3060 on framework, hd128 32/8, kvSplit 3, `CudaAttentionMmaDecodeDenseTests.Microbench_Scalar_vs_DenseV2`):
 at 32,768 keys f16 0.41 ms (scalar 7.2-8.1 ms, ~325 GB/s effective, the DRAM roofline), q8_0 0.27-0.30 ms (scalar 7.8-8.3),

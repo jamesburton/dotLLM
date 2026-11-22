@@ -101,11 +101,13 @@ public sealed unsafe class CudaDenseDecodeDepthModelTests
 
     /// <summary>Prefill + teacher-forced decode over <paramref name="fed"/> (or greedy when null). One fresh model per run.</summary>
     private Run Decode(GgufFile gguf, DotLLM.Core.Models.ModelConfig config, int[] prompt, string kv, bool graph,
-        int[]? fed, out int[] tokens, int steps = DecodeSteps, int rewindAt = -1, int rewindBy = 0)
+        int[]? fed, out int[] tokens, int steps = DecodeSteps, int rewindAt = -1, int rewindBy = 0, int growAt = -1,
+        KvCacheConfig? kvConfig = null)
     {
         using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, FindPtxDir()!);
         model.UseGraphCapture = graph;
-        using var cache = model.CreateKvCache(prompt.Length + steps + 4, Kv(kv));
+        int cap = prompt.Length + steps + 4;
+        using var cache = model.CreateKvCache(growAt >= 0 ? prompt.Length + growAt : cap, kvConfig ?? Kv(kv));   // full at growAt
         int vocab = config.VocabSize;
         var rows = new List<float[]>();
         var positions = Enumerable.Range(0, prompt.Length).ToArray();
@@ -117,9 +119,11 @@ public sealed unsafe class CudaDenseDecodeDepthModelTests
         int pos = prompt.Length;
         for (int s = 0; s < steps; s++)
         {
-            // Rollback (speculative reject / prefix reuse): at step rewindAt the position jumps back rewindBy rows and decode
+            // Rollback (speculative reject / prefix reuse): at step rewindAt the cache is truncated by rewindBy rows and decode
             // overwrites them; a graph that baked an old row offset or length would read or write the wrong rows.
-            if (s == rewindAt) pos -= rewindBy;
+            if (s == rewindAt) { pos -= rewindBy; cache.Rollback(pos); }
+            // Growth mid-generation (#1594 prefix-reuse path): the cache's buffers are replaced, so every captured pointer moves.
+            if (s == growAt) Assert.True(cache.TryGrowTo(cap), "KV growth refused");
             int token = fed?[s] ?? Argmax(last);
             tokens[s] = token;
             using var l = model.Forward([token], [pos], 0, cache);
@@ -312,6 +316,91 @@ public sealed unsafe class CudaDenseDecodeDepthModelTests
         using (StaticToggle.StepGraph(false)) eager = Decode(gguf, config, prompt, kv, true, null, out fed, DecodeSteps, rewindAt: 16, rewindBy: 6);
         using (StaticToggle.StepGraph(true)) graphed = Decode(gguf, config, prompt, kv, true, fed, out _, DecodeSteps, rewindAt: 16, rewindBy: 6);
         Assert.Equal(DecodeSteps, graphed.StepGraphLaunches);
+        // The cache is truncated, so the rewound steps are again the newest row and v2 runs on every layer of every step.
+        Assert.Equal((long)config.NumLayers * DecodeSteps, graphed.DenseLaunches);
         Assert.Equal(0, BitDiffs(eager.Rows, graphed.Rows));
+    }
+
+    /// <summary>E2 with KV growth mid-generation: the cache's buffers are replaced at step 10; still bit-identical to eager.</summary>
+    [SkippableTheory]
+    [InlineData("f16")]
+    [InlineData("q8_0")]
+    public void StepGraph_AfterKvGrowth_IsBitIdenticalToEager(string kv)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        var (gguf, config, prompt) = Load();
+        using var _g = gguf;
+        using var v2 = StaticToggle.DenseV2(true, 1);
+        using var cap = StaticToggle.GraphMaxDepth(1);
+        Run eager, graphed;
+        int[] fed;
+        using (StaticToggle.StepGraph(false)) eager = Decode(gguf, config, prompt, kv, true, null, out fed, DecodeSteps, growAt: 10);
+        using (StaticToggle.StepGraph(true)) graphed = Decode(gguf, config, prompt, kv, true, fed, out _, DecodeSteps, growAt: 10);
+        Assert.Equal(DecodeSteps, graphed.StepGraphLaunches);
+        Assert.Equal(0, BitDiffs(eager.Rows, graphed.Rows));
+    }
+
+    /// <summary>
+    /// #1922 review I1: the windowed quantized cache is not captured by the step graph (its update advances host-side eviction
+    /// bookkeeping during capture, so a part-failed capture would corrupt a row). Past the depth cap it runs eagerly, and its
+    /// logits equal the eager body's. The pure gate is covered by <c>CudaDenseDecodeGateTests</c>.
+    /// </summary>
+    [SkippableFact]
+    public void StepGraph_DeclinesTheWindowedQuantizedCache()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        var (gguf, config, prompt) = Load();
+        using var _g = gguf;
+        using var v2 = StaticToggle.DenseV2(true, 1);
+        using var cap = StaticToggle.GraphMaxDepth(1);
+        var windowed = new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0, 16);
+        Run eager, graphed;
+        int[] fed;
+        using (StaticToggle.StepGraph(false)) eager = Decode(gguf, config, prompt, "q8_0", true, null, out fed, kvConfig: windowed);
+        using (StaticToggle.StepGraph(true)) graphed = Decode(gguf, config, prompt, "q8_0", true, fed, out _, kvConfig: windowed);
+        Assert.Equal(0, graphed.StepGraphLaunches);
+        Assert.Equal(DecodeSteps, graphed.EagerDecodes);
+        Assert.Equal(0, BitDiffs(eager.Rows, graphed.Rows));
+    }
+
+    /// <summary>
+    /// #1922 review I2: an instantiate or launch failure is a fallback, not an exception. The failing step runs eagerly with the
+    /// eager body's exact logits, a fallback is counted, and (the configuration unchanged) later steps stay eager too.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1)]   // instantiate
+    [InlineData(2)]   // launch
+    public void StepGraph_InstantiateOrLaunchFailure_FallsBackToEager(int failure)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        var (gguf, config, prompt) = Load();
+        using var _g = gguf;
+        using var v2 = StaticToggle.DenseV2(true, 1);
+        using var cap = StaticToggle.GraphMaxDepth(1);
+        Run eager;
+        int[] fed;
+        using (StaticToggle.StepGraph(false)) eager = Decode(gguf, config, prompt, "f16", true, null, out fed);
+
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, FindPtxDir()!);
+        model.UseGraphCapture = true;
+        using var on = StaticToggle.StepGraph(true);
+        using var cache = model.CreateKvCache(prompt.Length + DecodeSteps + 4, Kv("f16"));
+        int vocab = config.VocabSize;
+        model.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), 0, cache).Dispose();
+        var rows = new List<float[]>();
+        try
+        {
+            CudaTransformerModel.StepGraphInjectFailureForTest = failure;
+            for (int s = 0; s < DecodeSteps; s++)
+            {
+                using var l = model.Forward([fed[s]], [prompt.Length + s], 0, cache);
+                rows.Add(Row(l, vocab));
+            }
+        }
+        finally { CudaTransformerModel.StepGraphInjectFailureForTest = 0; }
+        _out.WriteLine($"failure={failure}: fallbacks={model.StepGraphFallbacks} launches={model.StepGraphLaunches} eager={model.EagerDecodeCount}");
+        Assert.Equal(1, model.StepGraphFallbacks);
+        Assert.Equal(0, model.StepGraphLaunches);
+        Assert.Equal(0, BitDiffs(eager.Rows, rows));
     }
 }

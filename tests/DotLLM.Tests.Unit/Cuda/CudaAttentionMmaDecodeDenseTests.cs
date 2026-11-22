@@ -182,6 +182,10 @@ public sealed unsafe class CudaAttentionMmaDecodeDenseTests
         foreach (var (nh, nkv, hd) in shapes)
             foreach (int s in seqs)
                 yield return new object[] { nh, nkv, hd, s, 0 };
+        // GQA group 8 (#1922 review M2): every mma row live (Qwen3-30B-class 32/4, 70B-class 64/8).
+        foreach (var (nh, nkv) in new[] { (32, 4), (64, 8) })
+            foreach (int s in new[] { 17, 385, 4097 })
+                yield return new object[] { nh, nkv, 128, s, 0 };
         // Forced splits: uneven tails, more splits than 16-key tiles, and the long single-split case.
         yield return new object[] { 32, 8, 128, 32768, 0 };
         yield return new object[] { 32, 8, 128, 385, 3 };

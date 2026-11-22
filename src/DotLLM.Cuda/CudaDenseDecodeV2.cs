@@ -13,8 +13,9 @@ namespace DotLLM.Cuda;
 /// <para>
 /// <b>Scope.</b> Decode only (one query row that is the newest cache row), head dim 64 / 128 (TurboQuant also 256), GQA group
 /// &lt;= 8 dividing evenly, no sliding window, no attention sinks, no FP16 window ring, and <c>seqKv &gt;= MinSeqKv</c>.
-/// Everything else falls through to the existing kernel. Never called while a CUDA graph is being captured (the kernel takes a
-/// scalar seqKv / kvSplit, which a captured graph would bake in).
+/// Everything else falls through to the existing kernel. The kernel takes a scalar seqKv / kvSplit, so it may be captured only by a
+/// graph that is re-captured every step (the step graph, `CudaTransformerModel.StepGraph.cs`), never by a persistent, replayed one (the
+/// shallow f16 / windowed-q8 device-scalar graphs and the MoE graph take their `_dyn` kernels instead).
 /// </para>
 /// <para>
 /// <b>Scratch.</b> One partial buffer shared by every layer, allocated once here at model construction (never inside a decode

@@ -25,7 +25,9 @@ namespace DotLLM.Cuda;
 /// <b>Why re-capture is safe.</b> The eager decode body allocates nothing on these caches (KV growth is explicit,
 /// <c>TryGrowTo</c>, outside the forward; the forward state is grown before the capture), and its only host-side effect is the
 /// KV length, which it <i>sets</i> from the position rather than increments. So a capture that fails part-way leaves nothing
-/// to undo: the step simply runs eagerly and sets the same length. <c>DOTLLM_CUDA_STEP_GRAPH=0</c> turns the path off.
+/// to undo: the step simply runs eagerly and sets the same length. That is why the windowed quantized cache (whose update
+/// advances eviction bookkeeping) is not admitted. A failed capture, instantiate or launch runs that step eagerly and disables
+/// the graph for that configuration only. <c>DOTLLM_CUDA_STEP_GRAPH=0</c> turns the path off.
 /// </para>
 /// </remarks>
 public sealed unsafe partial class CudaTransformerModel
@@ -34,8 +36,15 @@ public sealed unsafe partial class CudaTransformerModel
     internal static bool StepGraphEnabled = Environment.GetEnvironmentVariable("DOTLLM_CUDA_STEP_GRAPH") != "0";
 
     private bool _stepGraphCapturing;
-    private bool _stepGraphFailed;
     private nint _stepGraphExec;
+
+    // A failed capture / instantiate / launch disables the step graph only for the configuration it failed on (#1922 review M4):
+    // the same KV cache, the same cache buffers (generation) and the same attention tier (dense v2 engaged or not). The next
+    // change of any of those retries it, so one bad request cannot cost a long-lived server the graph forever.
+    private (IKvCache Cache, int Generation, bool DenseTier)? _stepGraphFailedOn;
+
+    /// <summary>Test hook (#1922 review I2): 1 = fail the next instantiate, 2 = fail the next launch, as if the driver had.</summary>
+    internal static int StepGraphInjectFailureForTest;
 
     /// <summary>Step-graph launches, (re)instantiations and capture failures (tests and benches read these).</summary>
     internal int StepGraphLaunches { get; private set; }
@@ -47,19 +56,46 @@ public sealed unsafe partial class CudaTransformerModel
     private long _stepGraphHostTicks;
     private static readonly bool s_stepGraphStats = Environment.GetEnvironmentVariable("DOTLLM_CUDA_STEP_GRAPH_STATS") == "1";
 
-    private bool StepGraphEligible(int rows, bool suppressGraphCapture, nint deferredHostDest, bool isMla, bool isMoe, IKvCache? kvCache)
+    private bool StepGraphEligible(int rows, bool suppressGraphCapture, nint deferredHostDest, bool isMla, bool isMoe, IKvCache? kvCache,
+        int position)
     {
-        if (!StepGraphEnabled || _stepGraphFailed || !UseGraphCapture || suppressGraphCapture || deferredHostDest != 0
+        if (!StepGraphEnabled || !UseGraphCapture || suppressGraphCapture || deferredHostDest != 0
             || rows != 1 || isMla || isMoe || ProfilingEnabled || _currentAdapter is not null || DebugCaptureAttnLayer >= 0
             || _weights.TokenEmbedHost != 0)
             return false;
-        return kvCache switch
+        bool admitted = kvCache switch
         {
             CudaKvCache => true,   // reached only when the shallow f16 graph declined (depth cap, NoPE layers)
-            CudaQuantizedKvCache q => !q.ReferenceDequantScratch,   // windowed + shallow takes ForwardDecodeGraphQuantized first
+            CudaQuantizedKvCache q => StepGraphAdmitsQuantized(q.ReferenceDequantScratch, q.WindowCapacity),
             CudaTurboQuantInPlaceKvCache => true,
             _ => false,
         };
+        return admitted && !(_stepGraphFailedOn is { } f && f.Equals(StepGraphKey(kvCache!, position)));
+    }
+
+    /// <summary>
+    /// Which quantized caches the step graph may capture (#1922 review I1): pure quantized only. The windowed cache's eager update
+    /// advances host-side eviction bookkeeping (<c>_layerQuantizedLength</c>) while it is being captured, so a capture that failed
+    /// part-way would make the eager rerun skip an eviction and corrupt a row; the test-only dequant-scratch oracle stays eager.
+    /// Pure so it is testable without a GPU.
+    /// </summary>
+    internal static bool StepGraphAdmitsQuantized(bool referenceDequantScratch, int windowCapacity)
+        => !referenceDequantScratch && windowCapacity == 0;
+
+    private static (IKvCache, int, bool) StepGraphKey(IKvCache cache, int position)
+    {
+        int gen = cache switch { CudaKvCache c => c.Generation, CudaQuantizedKvCache q => q.Generation, _ => 0 };
+        return (cache, gen, CudaDenseDecodeV2.Enabled && position + 1 >= CudaDenseDecodeV2.MinSeqKv);
+    }
+
+    private ITensor? StepGraphFallback(IKvCache kvCache, int position, string what)
+    {
+        StepGraphFallbacks++;
+        bool first = _stepGraphFailedOn is null;
+        _stepGraphFailedOn = StepGraphKey(kvCache, position);
+        if (first)
+            Console.Error.WriteLine($"[dotLLM.Cuda] Step decode graph {what}; this step and this configuration run eagerly.");
+        return null;
     }
 
     /// <summary>
@@ -98,13 +134,7 @@ public sealed unsafe partial class CudaTransformerModel
         try
         {
             if (error is not null || rc != 0)
-            {
-                StepGraphFallbacks++;
-                _stepGraphFailed = true;
-                Console.Error.WriteLine($"[dotLLM.Cuda] Step decode graph capture failed ({error?.Message ?? $"CUresult {rc}"}); "
-                    + "decode at depth stays eager.");
-                return null;
-            }
+                return StepGraphFallback(kvCache, pos, $"capture failed ({error?.Message ?? $"CUresult {rc}"})");
 
             if (_stepGraphExec != 0)
             {
@@ -117,7 +147,16 @@ public sealed unsafe partial class CudaTransformerModel
             }
             if (_stepGraphExec == 0)
             {
-                CudaDriverApi.cuGraphInstantiateWithFlags(out _stepGraphExec, graph, 0).ThrowOnError();
+                // #1922 review I2: an instantiate failure (e.g. out of memory at a topology change) is a fallback, not an
+                // exception out of Forward. The capture's host-side effects are idempotent for every admitted cache.
+                int irc = StepGraphInjectFailureForTest == 1 ? 2 /* CUDA_ERROR_OUT_OF_MEMORY */
+                    : CudaDriverApi.cuGraphInstantiateWithFlags(out _stepGraphExec, graph, 0);
+                if (StepGraphInjectFailureForTest == 1) StepGraphInjectFailureForTest = 0;
+                if (irc != 0)
+                {
+                    _stepGraphExec = 0;
+                    return StepGraphFallback(kvCache, pos, $"instantiate failed (CUresult {irc})");
+                }
                 StepGraphInstantiations++;
             }
         }
@@ -127,7 +166,14 @@ public sealed unsafe partial class CudaTransformerModel
         }
 
         _stepGraphHostTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
-        CudaDriverApi.cuGraphLaunch(_stepGraphExec, s).ThrowOnError();
+        int lrc = StepGraphInjectFailureForTest == 2 ? 2 : CudaDriverApi.cuGraphLaunch(_stepGraphExec, s);
+        if (StepGraphInjectFailureForTest == 2) StepGraphInjectFailureForTest = 0;
+        if (lrc != 0)
+        {
+            CudaDriverApi.cuGraphExecDestroy(_stepGraphExec);
+            _stepGraphExec = 0;
+            return StepGraphFallback(kvCache, pos, $"launch failed (CUresult {lrc})");
+        }
         StepGraphLaunches++;
         GraphReplayCount++;
         DecodeGraphState = CudaDecodeGraphState.Replayed;

@@ -1338,7 +1338,7 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
         // #1922 E2: a dense decode step the graphs above did not take (past GraphCaptureMaxDepth, pure-quantized or in-place
         // TurboQuant KV) runs this eager body captured whole, re-captured every step and pushed with cuGraphExecUpdate.
         if (!_stepGraphCapturing && !_moeGraphCapturing
-            && StepGraphEligible(tokenIds.Length, suppressGraphCapture, deferredHostDest, isMla, isMoe, kvCache)
+            && StepGraphEligible(tokenIds.Length, suppressGraphCapture, deferredHostDest, isMla, isMoe, kvCache, positions[0])
             && ForwardStepGraph(tokenIds, positions, deviceId, kvCache!) is { } stepLogits)
             return stepLogits;
 
@@ -1760,8 +1760,8 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
                 else if (kvCache is CudaTurboQuantInPlaceKvCache tqInPlaceCache)
                 {
                     // #1892 (CLAUDE.md rule 2): encode the current rows into codes, rotate Q into K code space, attend over the
-                    // cache only (current rows included, never the fresh K/V), rotate the output back with the V signs. Eager only:
-                    // the graph-capture gate above admits CudaKvCache / windowed CudaQuantizedKvCache, never this type.
+                    // cache only (current rows included, never the fresh K/V), rotate the output back with the V signs. The device-
+                    // scalar graphs never take this type; the step graph (#1922) captures this body as is, one capture per step.
                     MarkProfile(ProfileCategory.KvUpdate);
                     CudaTurboQuantInPlaceAttention.Run(_kernels, tqInPlaceCache, layer, qPtr, kPtr, vPtr, positions, seqLen,
                         numHeads, numKvHeads, headDim, slidingWindow, layerSinks, _state.AttnOutput, s, EnableKvqFlashPrefill,
@@ -5180,8 +5180,8 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
         _context.MakeCurrent();
         CudaMemTrace.Dump("CudaTransformerModel.Dispose");
         ReportLaunchProfile();
+        DisposeStepGraph();          // the exec first: it was captured against the scratch below
         _denseDecodeV2.Dispose();
-        DisposeStepGraph();
         _cudaLora?.Dispose();
         DisposeDecodeGraph();
         DisposeMoeGraph();
