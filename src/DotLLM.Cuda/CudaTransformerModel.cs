@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Numerics.Tensors;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Diagnostics;
 using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.Moe;
@@ -20,7 +21,7 @@ namespace DotLLM.Cuda;
 /// CUDA stream with no host synchronization until the final logits D2H transfer.
 /// Mirrors <see cref="TransformerModel"/> structure but uses cuBLAS GEMM/GEMV and custom PTX kernels.
 /// </summary>
-public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
+public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimitable, DotLLM.Core.Diagnostics.IHiddenStateTapHost
 {
     private readonly CudaWeights _weights;
     private readonly CudaForwardState _state;
@@ -1204,7 +1205,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                            int deviceId, IKvCache? kvCache)
     {
         var r = ForwardInternal(tokenIds, positions, deviceId, kvCache,
-            suppressGraphCapture: false, deferredHostDest: 0)!;
+            suppressGraphCapture: false, deferredHostDest: 0)
+            ?? throw new DotLLM.Core.Diagnostics.ForwardAbortedException(_tapAbort);
         CudaMemTrace.Mark(tokenIds.Length > 1 ? "multi-token forward" : "decode forward");
         AfterMultiTokenForward(tokenIds.Length);
         return r;
@@ -1240,9 +1242,11 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// is responsible for synchronizing once after every sequence in the batch has been
     /// dispatched, then copying each pinned buffer into its own result tensor.
     /// </param>
-    private ITensor? ForwardInternal(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+    private ITensor? ForwardInternalCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, bool suppressGraphCapture, nint deferredHostDest)
     {
+        var ts = _tapTs;   // the plan of a tapped forward (set by ForwardInternal); null: untapped, one local null check per site
+        var tapAt = default(DotLLM.Core.Diagnostics.ForwardAbortInfo);
         bool isMla = _weights.MlaLayers is not null;
         bool isMoe = _weights.MoeLayers is not null;
         bool isBitNet = Config.Architecture == Architecture.BitNet;
@@ -1281,7 +1285,13 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         // (speculative verify), and pure-quantized configs (windowCapacity == 0).
         // MLA / MoE are not graph-capable today (MoE has host-side bucketing; MLA's
         // absorbed kernel uses dynamic shmem) — they fall through to eager.
-        if (UseGraphCapture
+        // A tap needs the layer boundaries, which a graph launch does not have: a tapped forward runs the eager body (#1920).
+        if (ts is not null && TapWouldHaveUsedGraph(tokenIds, positions, kvCache, suppressGraphCapture, deferredHostDest, isMla, isMoe, isBitNet))
+        {
+            HiddenStateTapRegistry.PathCounters.AddCudaGraphBypassed();
+            CudaHiddenStateTaps.LogOnce("a hidden-state tap is attached: the CUDA decode graph is bypassed and the layer loop runs eagerly.");
+        }
+        if (ts is null && UseGraphCapture
             && !suppressGraphCapture        // #251: batched calls force the eager body — see doc comment above
             && tokenIds.Length == 1
             && _kernels.HasKvWriteKernel
@@ -1315,7 +1325,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         // MoE decode graph (#1210): the eager body below, captured whole. Resident layers route on the device (#1182) and
         // CPU-expert layers run their CPU leg as a host-function node, so nothing in it waits for the host. Position-dependent
         // arguments come from device scalars; NoPE, sinks and sliding windows are the eager body's own.
-        if (!_moeGraphCapturing && !_moeGraphFailed && UseGraphCapture && MoeDecodeGraphEnabled
+        if (ts is null && !_moeGraphCapturing && !_moeGraphFailed && UseGraphCapture && MoeDecodeGraphEnabled
             && !suppressGraphCapture && deferredHostDest == 0 && tokenIds.Length == 1
             && isMoe && !isMla && !ProfilingEnabled && _currentAdapter is null && DebugCaptureAttnLayer < 0
             && kvCache is CudaKvCache moeKv && positions[0] == moeKv.CurrentLength
@@ -1385,6 +1395,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                 _state.TokenIdsDevice, _state.HiddenState,
                 seqLen, hiddenSize, s);
         MarkProfile(ProfileCategory.Embed);
+        // Tap: the embedding, F16 and unscaled (a Flint stream is scaled only from layer 0's attention add on).
+        if (ts is not null && !ts.TapSite(HookPoint.PostEmbedding, -1, true, seqLen, _state.HiddenState, h, 1f, s, out tapAt))
+            return TapAborted(tapAt);
 
         // FP32 residual stream for BitNet (its residual magnitude exceeds FP16's ~65504 ceiling).
         bool fp32Res = _state.ResidualF32 != 0 && isBitNet;
@@ -2024,6 +2037,39 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                         seqLen * hiddenSize, s);
             }
             MarkProfile(ProfileCategory.Norm);
+
+            // Tap: the residual leaving this layer. Layers before the last hold it in Residual (F16, or ResidualF32 for BitNet); the last
+            // layer's add wrote HiddenState. Flint carries it at resScale: the host multiplies by its reciprocal (a power of two, exact).
+            if (ts is not null)
+            {
+                bool last = layer == numLayers - 1;
+                nint src = fp32Res ? _state.ResidualF32 : (last ? _state.HiddenState : _state.Residual);
+                if (!ts.TapSite(HookPoint.PostLayer, layer, true, seqLen, src, fp32Res ? sizeof(float) : h,
+                        fp32Res ? 1f : 1f / resScale, s, out tapAt))
+                    return TapAborted(tapAt);
+            }
+        }
+
+        // Tap: PreFinalNorm is the residual leaving the last layer (the same rows as PostLayer(last)); the final norm below writes NormOutput,
+        // never the residual.
+        if (ts is not null)
+        {
+            bool resF32 = fp32Res && numLayers > 0;
+            if (!ts.TapSite(HookPoint.PreFinalNorm, -1, true, seqLen, resF32 ? _state.ResidualF32 : _state.HiddenState,
+                    resF32 ? sizeof(float) : h, resF32 || numLayers == 0 ? 1f : 1f / resScale, s, out tapAt))
+                return TapAborted(tapAt);
+            // PreLmHead with every row: a dedicated all-row final norm into NormOutput first (copied before the one-row norm overwrites row 0).
+            if (seqLen > 1 && ts.Wants(HookPoint.PreLmHead, -1) && ts.WantsAll(HookPoint.PreLmHead, -1))
+            {
+                if (resF32)
+                    _kernels.LaunchRmsNormF32InF16W(_state.ResidualF32, _weights.OutputNormWeight, _state.NormOutput,
+                        hiddenSize, eps, seqLen, s);
+                else
+                    _kernels.LaunchRmsNorm(_state.HiddenState, _weights.OutputNormWeight, _state.NormOutput,
+                        hiddenSize, numLayers > 0 ? resEps : eps, seqLen, s);
+                if (!ts.TapSite(HookPoint.PreLmHead, -1, true, seqLen, _state.NormOutput, h, 1f, s, out tapAt))
+                    return TapAborted(tapAt);
+            }
         }
 
         // 5. Final RmsNorm (last token only). For BitNet, read the FP32 residual directly so the
@@ -2041,6 +2087,10 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                 hiddenSize, numLayers > 0 ? resEps : eps, 1, s);
         }
         MarkProfile(ProfileCategory.Norm);
+        // Tap: PreLmHead, one row (row 0 of NormOutput). An all-row tap already took its rows above.
+        if (ts is not null && !(seqLen > 1 && ts.Wants(HookPoint.PreLmHead, -1) && ts.WantsAll(HookPoint.PreLmHead, -1))
+            && !ts.TapSite(HookPoint.PreLmHead, -1, true, 1, _state.NormOutput, h, 1f, s, out tapAt))
+            return TapAborted(tapAt);
 
         // 6. LM head (last token only) → FP16 logits, then convert to FP32
         Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
@@ -2130,6 +2180,11 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.LogitsF32,
             (nuint)(vocabSize * sizeof(float))).ThrowOnError();
 
+        if (ts is not null && !ts.Immediate)
+        {
+            try { ts.DeliverDeferred(); }   // the stream synchronize above ended the forward: every staged copy has landed
+            catch { result.Dispose(); throw; }
+        }
         return result;
     }
 
@@ -2239,6 +2294,11 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
             }
             return fallback;
         }
+
+        // A tap delivers after the stream synchronize that ends each forward, so every request runs its own synchronous forward
+        // instead of the deferred pinned-logits batch (one synchronize for the whole batch); the request index is the sample's sequence id.
+        if (_tapState?.Registry.Current is not null)
+            return ForwardBatchTapped(requests, deviceId);
 
         int vocabSize = Config.VocabSize;
         EnsureBatchPinnedHostBuffers(requests.Count, vocabSize);
@@ -5058,6 +5118,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <inheritdoc/>
     public void Dispose()
     {
+        _tapState?.Dispose();
         _context.MakeCurrent();
         CudaMemTrace.Dump("CudaTransformerModel.Dispose");
         ReportLaunchProfile();
