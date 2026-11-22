@@ -27,5 +27,11 @@ public enum HookPoint
     PreLmHead,
 
     /// <summary>After the language model head (logits).</summary>
-    PostLmHead
+    PostLmHead,
+
+    /// <summary>
+    /// The residual stream after the last layer and before the final norm (what residual probes read).
+    /// Appended at the end of the enum so existing values keep their numbers (#1920).
+    /// </summary>
+    PreFinalNorm
 }

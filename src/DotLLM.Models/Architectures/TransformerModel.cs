@@ -19,7 +19,7 @@ namespace DotLLM.Models.Architectures;
 /// Transformer forward pass: embedding lookup → N × transformer blocks → final norm → LM head → logits.
 /// Operates entirely on the CPU using pre-allocated scratch buffers for zero-allocation inference.
 /// </summary>
-public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Core.Diagnostics.IResidualModifierHost
+public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Core.Diagnostics.IResidualModifierHost, DotLLM.Core.Diagnostics.IHiddenStateTapHost
 {
     /// <summary>Q8_0 block: 2 bytes (Half scale) + 32 bytes (sbyte values).</summary>
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
@@ -142,6 +142,63 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
             modifier.ModifyResidual(new Span<float>(hidden, seqLen * Config.HiddenSize), layer, seqLen);
     }
 
+    // ── Hidden-state taps (#1920) ─────────────────────────────────────────────
+    private readonly DotLLM.Core.Diagnostics.HiddenStateTapRegistry _taps;
+    private int _tapStep;       // forwards that ran with a tap attached
+    private int _tapSeqId;      // sequence index reported in samples (ForwardBatch sets it per request)
+
+    /// <inheritdoc/>
+    /// <remarks>Plain dense / GQA / MoE trunks only: Gemma-3n/4, MLA, diffusion and bidirectional towers are refused (their loops carry cross-layer state).</remarks>
+    public IDisposable RegisterTap(DotLLM.Core.Diagnostics.HiddenStateTapSubscription subscription, Action<DotLLM.Core.Diagnostics.HiddenStateSample> onSample)
+    {
+        ArgumentNullException.ThrowIfNull(onSample);
+        GuardTapsSupported();
+        return _taps.Register(subscription, onSample, null);
+    }
+
+    /// <inheritdoc/>
+    public IDisposable RegisterAbortableTap(DotLLM.Core.Diagnostics.HiddenStateTapSubscription subscription,
+                                            Func<DotLLM.Core.Diagnostics.HiddenStateSample, DotLLM.Core.Diagnostics.HookResult> onSample)
+    {
+        ArgumentNullException.ThrowIfNull(onSample);
+        GuardTapsSupported();
+        return _taps.Register(subscription, null, onSample);
+    }
+
+    /// <inheritdoc/>
+    public bool TryForward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
+                           out ITensor? logits, out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+    {
+        if (!RunLayersAndFinalNormTry(tokenIds, positions, kvCache, out abort))
+        {
+            logits = null;
+            return false;
+        }
+        logits = RunLmHead(tokenIds.Length, deviceId);
+        return true;
+    }
+
+    private void GuardTapsSupported()
+    {
+        static NotSupportedException Reject(string what) => new(
+            $"Hidden-state taps are not supported on {what}: its forward pass carries state across the whole trunk "
+            + "(only the plain dense / GQA / MoE trunk is wired).");
+        if (Config.DiffusionConfig is not null) throw Reject("diffusion models");
+        if (Config.BidirectionalAttention) throw Reject("bidirectional embedding towers");
+        if (Config.MlaConfig is not null) throw Reject("MLA models");
+        if (Config.Gemma3n is not null) throw Reject("Gemma-3n models");
+        if (Config.NumSharedKvLayers > 0) throw Reject("shared-KV (Gemma-4) models");
+        if (_weights.PerLayerEmbedding is not null) throw Reject("per-layer-embedding (Gemma-4) models");
+        if (_weights.Layers.Length > 0 && _weights.Layers[0].Gemma4 is not null) throw Reject("Gemma-4 models");
+    }
+
+    /// <summary>Delivers one tap point; false when an abortable tap aborted the forward.</summary>
+    private unsafe bool DispatchTap(DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot taps, DotLLM.Core.Diagnostics.HookPoint point,
+                                    int layer, float* hidden, int seqLen, ReadOnlySpan<int> positions,
+                                    out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+        => taps.Dispatch(point, layer, new ReadOnlySpan<float>(hidden, seqLen * Config.HiddenSize), seqLen, 0,
+                         Config.HiddenSize, positions, _tapSeqId, _tapStep - 1, out abort);
+
     private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
                        object? mmapAnchor, int ropeDim, RoPEType ropeType,
                        ComputeThreadPool? threadPool, bool ownsPool, RoPEType globalRopeType = RoPEType.Norm)
@@ -164,6 +221,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
         _logitScale = config.LogitScale ?? 1.0f;
         _useGeGLU = config.ActivationFunction == ActivationFunction.GELUTanh;
         _canUsePackedBatch = CanUsePackedBatch(config, weights);
+        _taps = new DotLLM.Core.Diagnostics.HiddenStateTapRegistry(config.NumLayers);
     }
 
     /// <summary>
@@ -802,7 +860,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                 $"hiddenOut must hold {seqLen}x{Config.HiddenSize} floats; got {hiddenOut.Length}.", nameof(hiddenOut));
 
         RunLayerRangeCore(tokenIds, hiddenIn, positions, kvCache: null,
-                          firstLayer, layerCount, hiddenOut);
+                          firstLayer, layerCount, hiddenOut, taps: null, out _);
     }
 
     /// <summary>Applies the final output norm + LM head to a post-trunk hidden state, all rows.</summary>
@@ -1116,8 +1174,59 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     /// </summary>
     private unsafe void RunLayersAndFinalNormCore(
         ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache)
-        => RunLayerRangeCore(tokenIds, ReadOnlySpan<float>.Empty, positions, kvCache,
-                             firstLayer: 0, layerCount: -1, hiddenOut: Span<float>.Empty);
+    {
+        if (!RunLayersAndFinalNormTry(tokenIds, positions, kvCache, out var abort))
+            throw new DotLLM.Core.Diagnostics.ForwardAbortedException(abort);
+    }
+
+    /// <summary>
+    /// <see cref="RunLayersAndFinalNormCore"/> without the exception: returns false when an abortable hidden-state tap aborted the
+    /// pass (KV already rolled back; the final norm and everything after it skipped). With no tap attached this is one null check.
+    /// </summary>
+    private unsafe bool RunLayersAndFinalNormTry(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache,
+        out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+    {
+        var taps = _taps.Current;
+        if (taps is not null)
+            return RunLayersWithTaps(taps, tokenIds, positions, kvCache, out abort);
+        abort = default;
+        RunLayerRangeCore(tokenIds, ReadOnlySpan<float>.Empty, positions, kvCache,
+                          firstLayer: 0, layerCount: -1, hiddenOut: Span<float>.Empty, taps: null, out _);
+        return true;
+    }
+
+    private unsafe bool RunLayersWithTaps(
+        DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot taps,
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache,
+        out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+    {
+        DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddTapForward();
+        _tapStep++;
+        int kvEntry = -1;
+        if (taps.HasAbortable && kvCache is not null)
+        {
+            // An abort must be able to undo this forward's KV writes. A cache that cannot truncate refuses here, before
+            // anything is written: a no-op rollback to the current length is the probe.
+            kvEntry = kvCache.CurrentLength;
+            try { kvCache.Rollback(kvEntry); }
+            catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
+            {
+                throw new NotSupportedException(
+                    "An abortable hidden-state tap needs a KV-cache that supports Rollback; this cache refused.", ex);
+            }
+            DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
+        }
+        bool done = RunLayerRangeCore(tokenIds, ReadOnlySpan<float>.Empty, positions, kvCache,
+                                      firstLayer: 0, layerCount: -1, hiddenOut: Span<float>.Empty, taps, out abort);
+        if (!done)
+        {
+            if (kvCache is not null && kvEntry >= 0)
+                kvCache.Rollback(kvEntry);
+            DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortedForward();
+        }
+        return done;
+    }
 
     /// <summary>
     /// The single trunk implementation: embed (or resume from a boundary hidden state), run layers
@@ -1138,10 +1247,17 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
     /// When non-empty, receives the residual stream leaving the last executed layer and the final
     /// norm is skipped.
     /// </param>
-    private unsafe void RunLayerRangeCore(
+    /// <param name="taps">Hidden-state tap snapshot (null when none attached, and ignored for a layer window).</param>
+    /// <param name="abort">Where an abortable tap stopped the pass, when the result is <see langword="false"/>.</param>
+    /// <returns><see langword="false"/> when an abortable tap aborted the pass.</returns>
+    private unsafe bool RunLayerRangeCore(
         ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
-        IKvCache? kvCache, int firstLayer, int layerCount, Span<float> hiddenOut)
+        IKvCache? kvCache, int firstLayer, int layerCount, Span<float> hiddenOut,
+        DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot? taps, out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
     {
+        abort = default;
+        // Taps ride the whole-model path only (a layer window starts or ends mid-trunk).
+        if (!hiddenIn.IsEmpty || !hiddenOut.IsEmpty) taps = null;
         // A distinct per-layer head dim (Gemma 4 global_head_dim) is supported on
         // the cacheless path only — reject a KV-cache up front with a clear message.
         GuardKvCacheHeadDim(kvCache);
@@ -1206,6 +1322,10 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
         // Diagnostic embedding hook (bug-#2 bisection): capture or replace the
         // scaled embedding before the layers. No-op on the normal path (null).
         Gemma4PostEmbeddingHook?.Invoke(hidden, -1, seqLen);
+
+        if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PostEmbedding, -1)
+            && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PostEmbedding, -1, hidden, seqLen, positions, out abort))
+            return false;
 
         // 1b. DIFFUSION region embedding (diffusion-gemma only). The unified
         // [prompt | canvas] forward splits at P = _currentMaskSpec.PrefixLength
@@ -1398,6 +1518,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
             // applying at the top of the next iteration covers all of them).
             if (residualModifier is not null && layer > firstLayer)
                 ApplyResidualModifier(residualModifier, layer - 1, hidden, seqLen);
+            if (taps is not null && layer > firstLayer && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PostLayer, layer - 1)
+                && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PostLayer, layer - 1, hidden, seqLen, positions, out abort))
+                return false;
             if (DotLLM.Cpu.MoeRoutingProbe.Sink is not null) DotLLM.Cpu.MoeRoutingProbe.Layer = layer;   // #1706 routing tap
             ref readonly var lw = ref _weights.Layers[layer];
             var rl = repackedLayers?[layer];
@@ -2272,6 +2395,15 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
 
         if (residualModifier is not null && endLayer > firstLayer)
             ApplyResidualModifier(residualModifier, endLayer - 1, hidden, seqLen);
+        if (taps is not null && endLayer > firstLayer)
+        {
+            if (taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PostLayer, endLayer - 1)
+                && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PostLayer, endLayer - 1, hidden, seqLen, positions, out abort))
+                return false;
+            if (taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreFinalNorm, -1)
+                && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PreFinalNorm, -1, hidden, seqLen, positions, out abort))
+                return false;
+        }
 
         // Window mode: hand back the residual stream leaving the last executed layer and stop short
         // of the final norm — the caller either feeds it to the next window or, after the last
@@ -2279,11 +2411,18 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
         if (!hiddenOut.IsEmpty)
         {
             new ReadOnlySpan<float>(hidden, seqLen * hiddenSize).CopyTo(hiddenOut[..(seqLen * hiddenSize)]);
-            return;
+            return true;
         }
 
         // 3. FINAL NORM (in-place: hidden → hidden)
         ApplyFinalNorm(seqLen);
+
+        // PreLmHead (#1920): post-final-norm, the rows the LM head reads (Last = the last row; All = every trunk row,
+        // including when the head itself only projects the last one).
+        if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1)
+            && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1, hidden, seqLen, positions, out abort))
+            return false;
+        return true;
     }
 
     /// <summary>
@@ -3527,6 +3666,13 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
         // settable at runtime, so it is checked per call. LoRA adapters are
         // per-sequence, so each request is judged individually.
         bool modelHasComplexLayer = !_canUsePackedBatch || Gemma4PostEmbeddingHook is not null || ResidualModifier is not null;
+        // A tap needs each sequence's own rows, like the residual modifier: the packed loop is bypassed (#1920).
+        if (_taps.Current is not null)
+        {
+            if (!modelHasComplexLayer)
+                DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddPackedBatchFallback();
+            modelHasComplexLayer = true;
+        }
         Span<int> simpleIdxs = requests.Count <= 256
             ? stackalloc int[requests.Count]
             : new int[requests.Count];
@@ -3620,6 +3766,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                 }
                 try
                 {
+                    _tapSeqId = origIdx;
                     RunLayersAndFinalNormCore(r.TokenIds.Span, r.Positions.Span, r.KvCache);
                     new ReadOnlySpan<float>(hidden + (long)(n - keep) * hiddenSize, keep * hiddenSize)
                         .CopyTo(staged!.AsSpan(outOffsets[origIdx] * hiddenSize, keep * hiddenSize));
