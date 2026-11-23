@@ -411,13 +411,16 @@ why; it is never served by another cache (#1888).
   ratio, head dims up to 256); tensor-core flash prefill `_hd64_tqtq` and `_hd128_tqtq` in `attention_flash_mma_prefill_kvq` (hd256
   uses the scalar body); `tq_rotate_q` / `tq_rotate_o` (and `tq_rotate_o_f16`, which keeps the attention output F16).
   **Decode is eager and never graph-captured** (#1918, same as q8_0 KV today).
-  - Prefill entries (#1924), picked by `DOTLLM_CUDA_TQ_PREFILL=legacy|spec|cpa`. Unset = `cpa` (Staged) for tq2/tq3/tq4/tq8
+  - Prefill entries (#1924), picked by `DOTLLM_CUDA_TQ_PREFILL=legacy|spec|cpa`. Unset = `cpa` (Staged) for tq2/tq4/tq8 and `legacy` for tq3
+    (after #1922's v2 TQ decode merged, Qwen3-4B tq3 failed the depth gate's top-1 rule, 24/33 against a floor of 25, while its KL
+    was better than legacy's; the legacy entry's own 1-ulp arms span 22-26/33)
     (James 2026-11-22: a width is Staged only while its new entries stay within the legacy entry's drift band on the depth gate).
     The band is the largest mean-KL movement over several 1-ulp perturbations of the legacy entry (softmax scale +-1 and +-2 F32
     ulps, one stored K or V norm's last bit). At hd128 the +1-ulp scale arm is inert by construction (1/sqrt(128) * log2e rounds
     to the same F32) and the -2-ulp arm runs the same kernel as -1, so both are dropped; the first tq3 ruling rested on the -1-ulp arm
     alone (band 7.1% against tq3's +4.3%). With the K / V norm arms (final review, framework a54e871e) the hd128 tq3 band is 7.8e-2
-    (18%) against an excess of 1.8e-2, so tq3 stays Staged; every width passes on both models (Qwen3-4B hd128, Qwen2.5-0.5B hd64).
+    (18%) against an excess of 1.8e-2, so tq3 stayed Staged and every width passed on both models (Qwen3-4B hd128, Qwen2.5-0.5B hd64).
+    Re-run after #1922's decode merged (b0ea3724): tq2/tq4/tq8 pass on both models; tq3 fails top-1 as above and is back on legacy.
     Tightest margin: Qwen2.5-0.5B tq2, 5.677 against a limit of 5.686 (that model's codec effect is large at tq2-tq4: KL 3.5-5.7). `legacy` = `_tqtq` (runtime bits,
     `half(norm * centroid)` per element from global memory). `spec` = `_tq{2,3,4,8}`: norms kept out of the tile (the K norm scales
     the score, the V norm scales P; the softmax sum keeps the raw P), a shared-memory F16 centroid table, bits compiled in. `cpa` =

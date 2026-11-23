@@ -5395,11 +5395,12 @@ public sealed unsafe partial class CudaKernels : IDisposable
     internal const TqPrefillVariant DefaultTqPrefillVariant = TqPrefillVariant.Staged;
 
     /// <summary>
-    /// The tq3 default (#1924, James 2026-11-22: Staged if the depth gate's 1-ulp drift band covers its +4% mean KL to F16 KV against
-    /// legacy). Measured (framework, 84417b15): legacy 0.4238, spec / cpa 0.4419 (+1.81e-2); the legacy entry's -1 ulp softmax-scale
-    /// control moved it to 0.4538 (band 3.01e-2, 7.1%), so +4% is inside the band and tq3 is Staged.
+    /// The tq3 default (#1924, James 2026-11-22: a width is Staged only while its new entries pass the depth gate). Legacy: after
+    /// #1922's v2 TurboQuant decode merged (b0ea3724), Qwen3-4B tq3 passes the KL arm (spec / cpa mean KL 0.4259 vs legacy 0.4311,
+    /// band 0.1234) but fails top-1 (24/33 vs floor 26 - 1). The legacy entry's own 1-ulp control arms span 22-26/33 on that run, so
+    /// the top-1 rule (which has no noise band) is the binding constraint. Spec / cpa stay opt-in at tq3.
     /// </summary>
-    internal const TqPrefillVariant DefaultTq3PrefillVariant = TqPrefillVariant.Staged;
+    internal const TqPrefillVariant DefaultTq3PrefillVariant = TqPrefillVariant.Legacy;
 
     /// <summary>The entry used for <paramref name="mseBits"/> when neither the environment nor a test override picks one.</summary>
     internal static TqPrefillVariant DefaultTqPrefillVariantFor(int mseBits)
