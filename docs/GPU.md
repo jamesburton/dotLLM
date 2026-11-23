@@ -206,12 +206,16 @@ Why it pays:
 - **Window.** An unchunked prefill grows the forward scratch with the prompt, about as much per token as f16
   KV, so the context fit charges it per token. Chunked, it is a fixed cost. TwIL-8B on the RTX 3060 serves
   17,408 tokens unchunked (304.5 KiB/token) and 32,768 chunked (160 KiB/token plus 526 MiB fixed).
-- **Prefill.** A long cold prompt's square G3 plane (heads x s^2 x 6 B) does not fit, so unchunked it runs
-  `attention_f16`. Chunked, the first chunk's plane is 192 MiB at 32 heads, inside the 384 MiB plane the fit
-  already charges, and later chunks run G3's offset path (#1847), bounded to the same plane.
+- **Prefill.** Since #1923, an f16-KV prefill of 16+ rows on head_dim 64 / 128 (GQA group up to 8) runs the
+  F16 entry of the fused tensor-core kernel `attention_flash_mma_prefill_kvq`, cold or at an offset (a later
+  chunk, a prefix-reuse suffix), with no score plane (G-flash keeps the hd64 square prefills it serves;
+  `DOTLLM_CUDA_F16_FLASH_PREFILL=0` restores the paths below). On those models the fit charges no G3 plane.
+  Other shapes keep G3: a long cold prompt's square plane (heads x s^2 x 6 B) does not fit, so unchunked it
+  runs `attention_f16`; chunked, the first chunk's plane is 192 MiB at 32 heads, inside the 384 MiB plane the
+  fit charges, and later chunks run G3's offset path (#1847), bounded to the same plane.
 - **Cancellation.** The engine checks it between chunks, so a client disconnect stops a long prefill.
 
-A chunk larger than about 1,448 tokens (at 32 heads) needs a square plane above the retained one. The fit then
+Where G3 still serves the model, a chunk larger than about 1,448 tokens (at 32 heads) needs a square plane above the retained one. The fit then
 charges that plane as fixed bytes (`CudaTransformerModel.G3PlaneChargeBytes`), so G3 still runs at a full
 window, at the cost of window size.
 
