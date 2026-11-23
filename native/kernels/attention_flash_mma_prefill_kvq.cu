@@ -228,7 +228,7 @@ template <class L> struct PkStagedTraits { static constexpr bool staged = false;
 template <class L, int HD> struct PkStagedTraits<PkLoadStaged<L, HD>> { static constexpr bool staged = true; };
 
 template <int HD, class KL, class VL>
-__device__ __forceinline__ void pk_prefill_body(
+__device__ __forceinline__ void pk_prefill_body_legacy(
     const half* __restrict__ q,
     const void* __restrict__ k,
     const void* __restrict__ v,
@@ -501,6 +501,326 @@ __device__ __forceinline__ void pk_prefill_body(
     }
 }
 
+// ─── E4 body (#1943): the ten f16 / q8 / q4 entries ─────────────────────────────────────────────────────────────────────
+// Same FlashAttention-2 math as pk_prefill_body_legacy above (which now serves only the legacy TurboQuant _tqtq entries, so
+// their PTX and the #1924 depth gate's reference do not move). Changes, each its own A/B (see .docs in #1943):
+//   1. Q in registers: each warp loads its 16 x HD Q fragments once, straight from global memory into the mma A layout (the
+//      same 32-bit words ldmatrix produced, so this step alone is bit-identical), and the per-tile Q ldmatrix is gone. There
+//      is no Q tile in shared memory, so shared memory no longer depends on the GQA group and is STATIC (K / V tiles only);
+//      the launcher reads it from the function (CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES) and passes no dynamic shared memory.
+//   2. PK_E4_NBUF 1: one K and one V tile with alternated copies (V of tile t issued after QK's opening barrier, K of t+1 after
+//      P.V's), replacing the two double buffers; 2: as before.
+//   3. PK_E4_KVT keys per tile (16 / 32 / 64). Above 16 the even/odd-ks split S accumulators are dropped (NT >= 4 independent
+//      mma chains already) and the online-softmax rescale runs once per KVT keys, so outputs differ from the 16-key body by
+//      F16 / F32 rounding (accumulation order), never by math.
+// Precision unchanged: F16 Q/K/V/P operands, F32 mma accumulation, F32 softmax statistics, all in registers; F16 output.
+#ifndef PK_E4_KVT
+#define PK_E4_KVT 16
+#endif
+#ifndef PK_E4_NBUF
+#define PK_E4_NBUF 2
+#endif
+
+__device__ __forceinline__ unsigned pk_ld32(const half* p) { return __ldg(reinterpret_cast<const unsigned*>(p)); }
+
+template <int HD, class KL, class VL>
+__device__ __forceinline__ void pk_prefill_body(
+    const half* __restrict__ q,
+    const void* __restrict__ k,
+    const void* __restrict__ v,
+    half* __restrict__ output,
+    const int seq_q,
+    const int seq_kv,
+    const int num_heads,
+    const int num_kv_heads,
+    const int position_offset,
+    const float scale)
+{
+    constexpr int KVT = PK_E4_KVT;
+    constexpr int NBUF = PK_E4_NBUF;
+    static_assert(KVT == 16 || KVT == 32 || KVT == 64, "KVT is 16, 32 or 64");
+    static_assert(NBUF == 1 || NBUF == 2, "NBUF is 1 or 2");
+    constexpr int NT = KVT / 8;          // 8-key n-tiles of S
+    constexpr bool kSplit = KVT == 16;   // even/odd-ks S accumulators (keeps the 16-key body bit-identical to the legacy one)
+    constexpr int SS = HD + 8;           // padded row stride (halves): ldmatrix rows in distinct banks
+    constexpr int CPR = HD / 8;          // 16-byte chunks per row
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;   // the launcher sends exactly `group` warps, one per query head of the GQA group
+    const int group = num_heads / num_kv_heads;
+    const int nq_tiles = (seq_q + PK_Q_TILE - 1) / PK_Q_TILE;
+    const int qt = nq_tiles - 1 - (int)blockIdx.x;      // heaviest causal tiles first
+    const int hkv = blockIdx.y;
+    const int hq = hkv * group + warp;
+    const int qbase = qt * PK_Q_TILE;
+    const int q_stride = num_heads * HD;
+    const int kv_stride = num_kv_heads * HD;
+
+    __shared__ __align__(16) half sKV[2 * NBUF * KVT * SS];
+    half* sK = sKV;                                                // [NBUF][KVT][SS]
+    half* sV = sKV + NBUF * KVT * SS;                              // [NBUF][KVT][SS]
+
+    const int r_lo = lane >> 2;
+    const int col_lo = (lane & 3) * 2;
+
+    // ---- Q fragments, once: mma A layout of rows r_lo / r_lo + 8, columns ks*16 + col_lo (+8). Padded rows are zero. ----
+    unsigned qf[HD / 16][4];
+    {
+        const int row_lo = qbase + r_lo;
+        const bool v_lo = row_lo < seq_q, v_hi = row_lo + 8 < seq_q;
+        const half* q_lo = q + (size_t)row_lo * q_stride + (size_t)hq * HD + col_lo;
+        const half* q_hi = q_lo + (size_t)8 * q_stride;
+        #pragma unroll
+        for (int ks = 0; ks < HD / 16; ks++)
+        {
+            qf[ks][0] = v_lo ? pk_ld32(q_lo + ks * 16) : 0u;
+            qf[ks][1] = v_hi ? pk_ld32(q_hi + ks * 16) : 0u;
+            qf[ks][2] = v_lo ? pk_ld32(q_lo + ks * 16 + 8) : 0u;
+            qf[ks][3] = v_hi ? pk_ld32(q_hi + ks * 16 + 8) : 0u;
+        }
+    }
+
+    int kv_end = position_offset + qbase + PK_Q_TILE;
+    if (kv_end > seq_kv) kv_end = seq_kv;
+    const int num_tiles = (kv_end + KVT - 1) / KVT;
+
+    // Staged loaders (#1923): row group g (RP rows) of a tile is owned by warp g % nwarps for the raw copy and the decode. With
+    // NBUF 2 one pass decodes a row's K and V chunks together (RJ = 2*CPR jobs per row); with NBUF 1 K and V are decoded at
+    // different points, so a pass covers one side (RJ = CPR jobs per row, twice the rows).
+    constexpr bool kStaged = PkStagedTraits<KL>::staged;
+    static_assert(PkStagedTraits<KL>::staged == PkStagedTraits<VL>::staged, "K and V are both staged or neither");
+    constexpr int RJ = (NBUF == 2 ? 2 : 1) * CPR;
+    constexpr int RP = 32 / RJ;               // rows per warp pass
+    constexpr int NG = KVT / RP;
+    const int nwarps = blockDim.x >> 5;
+
+    // Issue the copies of side K (isV false) or V of tile t into buffer buf.
+    auto load_side = [&](const bool isV, int t, int buf)
+    {
+        const int k0 = t * KVT;
+        half* d = (isV ? sV : sK) + (size_t)buf * KVT * SS;
+        if constexpr (kStaged)
+        {
+            const int units = isV ? VL::kUnits : KL::kUnits;
+            for (int g = warp; g < NG; g += nwarps)
+                for (int x = lane; x < RP * units; x += 32)
+                {
+                    const int r = g * RP + x / units;
+                    int key = k0 + r;
+                    if (key > seq_kv - 1) key = seq_kv - 1;  // clamp: masked later, stays finite
+                    if (isV) VL::copy_unit(d + (size_t)r * SS, VL::row_src(v, (size_t)key * num_kv_heads + hkv), x % units);
+                    else     KL::copy_unit(d + (size_t)r * SS, KL::row_src(k, (size_t)key * num_kv_heads + hkv), x % units);
+                }
+        }
+        else
+        {
+            for (int i = threadIdx.x; i < KVT * CPR; i += blockDim.x)
+            {
+                int c = i % CPR, r = i / CPR;
+                int key = k0 + r;
+                if (key > seq_kv - 1) key = seq_kv - 1;          // clamp: masked later, stays finite
+                size_t g = (size_t)key * kv_stride + (size_t)hkv * HD + c * 8;
+                if (isV) VL::chunk(d + (size_t)r * SS + c * 8, v, g);
+                else     KL::chunk(d + (size_t)r * SS + c * 8, k, g);
+            }
+        }
+    };
+
+    // Staged only: decode this warp's row groups of buffer buf in place (both sides with NBUF 2, one side with NBUF 1). The caller
+    // has waited for this thread's copies; the __syncwarp publishes the warp's raw rows to all its lanes.
+    auto decode = [&](const bool bothSides, const bool isV0, int buf)
+    {
+        if constexpr (kStaged)
+        {
+            __syncwarp();
+            for (int g = warp; g < NG; g += nwarps)
+            {
+                const int j = lane % RJ;
+                const bool isV = bothSides ? j >= CPR : isV0;
+                const int c = (bothSides && isV) ? j - CPR : j;
+                half* slot = (isV ? sV : sK) + (size_t)buf * KVT * SS + (size_t)(g * RP + lane / RJ) * SS;
+                const uint4 h = isV ? VL::decode_chunk(slot, c) : KL::decode_chunk(slot, c);
+                __syncwarp();                     // every raw byte of these rows read before any F16 chunk overwrites it
+                *reinterpret_cast<uint4*>(slot + c * 8) = h;
+            }
+        }
+    };
+
+    float o[HD / 8][4];
+    #pragma unroll
+    for (int n = 0; n < HD / 8; n++) { o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f; }
+    float m_lo = PK_NEG_INF, m_hi = PK_NEG_INF;
+    float l_lo = 0.0f, l_hi = 0.0f;
+
+    const float scale_log2 = scale * PK_LOG2E;
+    const int pos_lo = position_offset + qbase + r_lo;
+    const int pos_hi = pos_lo + 8;
+
+    unsigned pa[NT / 2][4];
+
+    // S = Q K^T over tile t (K in kb), scale, causal / tail mask, online softmax; leaves P packed in pa.
+    auto qk_softmax = [&](const half* kb, int t)
+    {
+        const int k0 = t * KVT;
+        float sa[NT][4], sb[kSplit ? NT : 1][4];
+        #pragma unroll
+        for (int n = 0; n < NT; n++) sa[n][0] = sa[n][1] = sa[n][2] = sa[n][3] = 0.f;
+        if constexpr (kSplit)
+        {
+            #pragma unroll
+            for (int n = 0; n < NT; n++) sb[n][0] = sb[n][1] = sb[n][2] = sb[n][3] = 0.f;
+        }
+
+        #pragma unroll
+        for (int ks = 0; ks < HD / 16; ks++)
+        {
+            #pragma unroll
+            for (int np = 0; np < NT / 2; np++)
+            {
+                unsigned b[4];
+                pk_ldmatrix_x4(b, kb + (size_t)(np * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * SS
+                                     + ks * 16 + ((lane >> 3) & 1) * 8);
+                if (kSplit && (ks & 1))
+                {
+                    pk_mma(sb[kSplit ? 2 * np : 0], qf[ks], b[0], b[1]);
+                    pk_mma(sb[kSplit ? 2 * np + 1 : 0], qf[ks], b[2], b[3]);
+                }
+                else
+                {
+                    pk_mma(sa[2 * np], qf[ks], b[0], b[1]);
+                    pk_mma(sa[2 * np + 1], qf[ks], b[2], b[3]);
+                }
+            }
+        }
+
+        float tmax_lo = PK_NEG_INF, tmax_hi = PK_NEG_INF;
+        #pragma unroll
+        for (int n = 0; n < NT; n++)
+        {
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                int key = k0 + n * 8 + col_lo + (j & 1);
+                int pos = (j >> 1) ? pos_hi : pos_lo;
+                float sv = (kSplit ? sa[n][j] + sb[kSplit ? n : 0][j] : sa[n][j]) * scale_log2;
+                sv = (key <= pos && key < seq_kv) ? sv : PK_NEG_INF;
+                sa[n][j] = sv;
+                if (j >> 1) tmax_hi = fmaxf(tmax_hi, sv); else tmax_lo = fmaxf(tmax_lo, sv);
+            }
+        }
+        tmax_lo = fmaxf(tmax_lo, __shfl_xor_sync(0xffffffffu, tmax_lo, 1));
+        tmax_lo = fmaxf(tmax_lo, __shfl_xor_sync(0xffffffffu, tmax_lo, 2));
+        tmax_hi = fmaxf(tmax_hi, __shfl_xor_sync(0xffffffffu, tmax_hi, 1));
+        tmax_hi = fmaxf(tmax_hi, __shfl_xor_sync(0xffffffffu, tmax_hi, 2));
+
+        const float mn_lo = fmaxf(m_lo, tmax_lo);
+        const float mn_hi = fmaxf(m_hi, tmax_hi);
+        const float mu_lo = (mn_lo == PK_NEG_INF) ? 0.0f : mn_lo;
+        const float mu_hi = (mn_hi == PK_NEG_INF) ? 0.0f : mn_hi;
+
+        const bool changed = (mn_lo != m_lo) || (mn_hi != m_hi);
+        if (__any_sync(0xffffffffu, changed))
+        {
+            const float c_lo = exp2f(m_lo - mu_lo);
+            const float c_hi = exp2f(m_hi - mu_hi);
+            l_lo *= c_lo; l_hi *= c_hi;
+            #pragma unroll
+            for (int n = 0; n < HD / 8; n++)
+            { o[n][0] *= c_lo; o[n][1] *= c_lo; o[n][2] *= c_hi; o[n][3] *= c_hi; }
+        }
+        m_lo = mn_lo; m_hi = mn_hi;
+
+        #pragma unroll
+        for (int n = 0; n < NT; n++)
+        {
+            float p0 = exp2f(sa[n][0] - mu_lo);
+            float p1 = exp2f(sa[n][1] - mu_lo);
+            float p2 = exp2f(sa[n][2] - mu_hi);
+            float p3 = exp2f(sa[n][3] - mu_hi);
+            l_lo += p0 + p1; l_hi += p2 + p3;
+            pa[n >> 1][(n & 1) * 2 + 0] = pk_pack_half2(p0, p1);
+            pa[n >> 1][(n & 1) * 2 + 1] = pk_pack_half2(p2, p3);
+        }
+    };
+
+    // O += P . V over tile t (V in vb).
+    auto pv = [&](const half* vb)
+    {
+        #pragma unroll
+        for (int kk = 0; kk < KVT / 16; kk++)
+        {
+            #pragma unroll
+            for (int np = 0; np < HD / 16; np++)
+            {
+                unsigned b[4];
+                pk_ldmatrix_x4_trans(b, vb + (size_t)(kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * SS
+                                           + (np * 2 + (lane >> 4)) * 8);
+                pk_mma(o[2 * np], pa[kk], b[0], b[1]);
+                pk_mma(o[2 * np + 1], pa[kk], b[2], b[3]);
+            }
+        }
+    };
+
+    if constexpr (NBUF == 2)
+    {
+        // Tile t+1 is issued at the top of iteration t into the buffer released by iteration t-1's closing barrier.
+        if (num_tiles > 0) { load_side(false, 0, 0); load_side(true, 0, 0); pk_cp_async_commit(); }
+        for (int t = 0; t < num_tiles; t++)
+        {
+            const int buf = t & 1;
+            if (t + 1 < num_tiles) { load_side(false, t + 1, buf ^ 1); load_side(true, t + 1, buf ^ 1); }
+            pk_cp_async_commit();
+            pk_cp_async_wait<1>();
+            decode(true, false, buf);   // staged only: tile t landed (wait above); decoded before the barrier publishes it
+            __syncthreads();
+            qk_softmax(sK + (size_t)buf * KVT * SS, t);
+            pv(sV + (size_t)buf * KVT * SS);
+            __syncthreads();            // all warps done with this buffer before it is refilled
+        }
+    }
+    else
+    {
+        // One K and one V tile. Only one copy group is ever in flight, so every wait is wait_group 0.
+        if (num_tiles > 0) load_side(false, 0, 0);
+        pk_cp_async_commit();
+        for (int t = 0; t < num_tiles; t++)
+        {
+            pk_cp_async_wait<0>();
+            decode(false, false, 0);    // staged: K of tile t
+            __syncthreads();            // K_t visible; every warp is past P.V of t-1, so the V tile is free
+            load_side(true, t, 0);
+            pk_cp_async_commit();
+            qk_softmax(sK, t);
+            pk_cp_async_wait<0>();
+            decode(false, true, 0);     // staged: V of tile t
+            __syncthreads();            // V_t visible; every warp is past QK of t, so the K tile is free
+            if (t + 1 < num_tiles) load_side(false, t + 1, 0);
+            pk_cp_async_commit();
+            pv(sV);
+        }
+    }
+
+    // ---- epilogue: O / l -> F16 output ----
+    l_lo += __shfl_xor_sync(0xffffffffu, l_lo, 1);
+    l_lo += __shfl_xor_sync(0xffffffffu, l_lo, 2);
+    l_hi += __shfl_xor_sync(0xffffffffu, l_hi, 1);
+    l_hi += __shfl_xor_sync(0xffffffffu, l_hi, 2);
+    const float inv_lo = (l_lo > 0.0f) ? 1.0f / l_lo : 0.0f;
+    const float inv_hi = (l_hi > 0.0f) ? 1.0f / l_hi : 0.0f;
+
+    const int row_lo = qbase + r_lo;
+    const int row_hi = row_lo + 8;
+    half* out_lo = output + (size_t)row_lo * q_stride + (size_t)hq * HD + col_lo;
+    half* out_hi = output + (size_t)row_hi * q_stride + (size_t)hq * HD + col_lo;
+    #pragma unroll
+    for (int n = 0; n < HD / 8; n++)
+    {
+        if (row_lo < seq_q)
+            *reinterpret_cast<__half2*>(out_lo + n * 8) = __floats2half2_rn(o[n][0] * inv_lo, o[n][1] * inv_lo);
+        if (row_hi < seq_q)
+            *reinterpret_cast<__half2*>(out_hi + n * 8) = __floats2half2_rn(o[n][2] * inv_hi, o[n][3] * inv_hi);
+    }
+}
+
 // Quantized loader variant (#1923 A/B): 0 = synchronous __ldg + V2 decode (pre-#1923), 1 = synchronous __ldg + packed-half2 decode,
 // 2 = raw cp.async staging + packed-half2 decode (default). All are bit-identical. RTX 3060, 1024 rows at 31,744 keys, 32/8/128,
 // ms per launch (f16f16 entry 25.7-25.9): q8_0 0: 37.0, 1: 35.5, 2: 32.9; q4_0 0: 36.2-36.4, 1: 35.1-35.5, 2: 31.6. Decoding the staged tile
@@ -525,8 +845,11 @@ using PkStQ8_64 = PkLoadStaged<PkQ8Fast, 64>;
 using PkStQ4_64 = PkLoadStaged<PkQ4Fast, 64>;
 #endif
 
+#ifndef PK_E4_MINB
+#define PK_E4_MINB 1
+#endif
 #define PK_ENTRY(NAME, HD, KLOAD, VLOAD)                                                          \
-extern "C" __global__ void __launch_bounds__(256) NAME(                                           \
+extern "C" __global__ void __launch_bounds__(256, PK_E4_MINB) NAME(                                         \
     const half* __restrict__ q, const void* __restrict__ k, const void* __restrict__ v,           \
     half* __restrict__ output, const int seq_q, const int seq_kv, const int num_heads,            \
     const int num_kv_heads, const int position_offset, const float scale)                         \
@@ -618,8 +941,8 @@ extern "C" __global__ void __launch_bounds__(256) NAME(                         
 {                                                                                                 \
     const PkTqSide ks = { k_codes, k_norms, centroids, mse_bits, code_uints_per_vec, norm_format };\
     const PkTqSide vs = { v_codes, v_norms, centroids, mse_bits, code_uints_per_vec, norm_format };\
-    pk_prefill_body<HD, PkLoadTq<HD>, PkLoadTq<HD>>(q, &ks, &vs, output, seq_q, seq_kv, num_heads, \
-                                                    num_kv_heads, position_offset, scale);        \
+    pk_prefill_body_legacy<HD, PkLoadTq<HD>, PkLoadTq<HD>>(q, &ks, &vs, output, seq_q, seq_kv,     \
+                                                    num_heads, num_kv_heads, position_offset, scale); \
 }
 
 PK_TQ_ENTRY(attention_flash_mma_prefill_kvq_hd128_tqtq, 128)

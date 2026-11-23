@@ -625,6 +625,10 @@ public sealed unsafe partial class CudaKernels : IDisposable
     // fmtIndex = KvqIndex (0 q8q8, 1 q4q4, 2 q8q4, 3 q4q8) or 4 = f16f16 (the kernel-level oracle entry). Ampere-only, best effort.
     private readonly CudaModule? _attentionFlashPrefillKvqModule;
     private readonly nint[] _attentionFlashPrefillKvqFuncs = new nint[10];
+    // #1943 (E4): static shared memory of each of the above as compiled (CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES). The E4 body keeps its
+    // K / V tiles in static shared memory and takes no dynamic shared memory; a pre-E4 PTX reports 0 here and gets the legacy
+    // dynamic layout (AttentionFlashPrefillKvqSmemBytes). Read from the function, so a swapped PTX can never be under-allocated.
+    private readonly int[] _attentionFlashPrefillKvqStaticSmem = new int[10];
     // TurboQuant in-place twins of the above (#1892 Task 6, attention_flash_mma_prefill_kvq_hd{64,128}_tqtq, same module).
     // Indexed 0 = hd64, 1 = hd128. Not part of the KvqIndex table: TQ needs norm / centroid pointers the q8/q4 launch lacks.
     private readonly nint[] _attentionFlashPrefillKvTqFuncs = new nint[2];
@@ -1637,7 +1641,12 @@ public sealed unsafe partial class CudaKernels : IDisposable
                     {
                         nint fn = m.TryGetFunction($"attention_flash_mma_prefill_kvq_hd{(hd == 0 ? 64 : 128)}_{fmts[f]}");
                         if (fn != 0)
+                        {
                             SetMaxDynamicSharedBytes(fn, AttentionFlashPrefillHd256MaxSmemBytes);
+                            CudaDriverApi.cuFuncGetAttribute(out int staticSmem, CudaDriverApi.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn)
+                                .ThrowOnError();
+                            _attentionFlashPrefillKvqStaticSmem[hd * 5 + f] = staticSmem;
+                        }
                         _attentionFlashPrefillKvqFuncs[hd * 5 + f] = fn;
                     }
                 for (int hd = 0; hd < 2; hd++)
@@ -1664,6 +1673,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
             {
                 _attentionFlashPrefillKvqModule = null;
                 Array.Clear(_attentionFlashPrefillKvqFuncs);
+                Array.Clear(_attentionFlashPrefillKvqStaticSmem);
                 Array.Clear(_attentionFlashPrefillKvTqFuncs);
                 Array.Clear(_attentionFlashPrefillKvTqSpecFuncs);
                 Array.Clear(_attentionFlashPrefillKvTqCpaFuncs);
@@ -5219,7 +5229,11 @@ public sealed unsafe partial class CudaKernels : IDisposable
     }
     #pragma warning restore CS1573
 
-    /// <summary>Dynamic shared memory of the dense flash prefill kvq kernel for a head dim and GQA group.</summary>
+    /// <summary>
+    /// Dynamic shared memory of the pre-E4 flash prefill kvq layout (Q tile + double-buffered K / V) for a head dim and GQA group:
+    /// what the legacy TurboQuant <c>_tqtq</c> entries (and a pre-#1943 PTX) take, and an upper bound on the E4 entries' static
+    /// shared memory at every group (those hold no Q tile).
+    /// </summary>
     public static int AttentionFlashPrefillKvqSmemBytes(int headDim, int group)
         => (group * 16 * (headDim + 8) + 2 * 2 * 16 * (headDim + 8)) * 2;
 
@@ -5293,7 +5307,15 @@ public sealed unsafe partial class CudaKernels : IDisposable
         void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &sqArg, &skvArg, &nhArg, &nkvArg, &poArg, &scArg };
         CudaDriverApi.cuLaunchKernel(_attentionFlashPrefillKvqFuncs[idx],
                 (uint)((seqQ + 15) / 16), (uint)numKvHeads, 1, (uint)(group * 32), 1, 1,
-                (uint)AttentionFlashPrefillKvqSmemBytes(headDim, group), stream, (nint)args, 0).ThrowOnError();
+                (uint)(_attentionFlashPrefillKvqStaticSmem[idx] > 0 ? 0 : AttentionFlashPrefillKvqSmemBytes(headDim, group)),
+                stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Static shared memory of the loaded flash prefill kvq entry (0 = a pre-E4 entry on the dynamic layout; #1943).</summary>
+    internal int AttentionFlashPrefillKvqStaticSmemBytes(int headDim, KvCacheDType? kDtype, KvCacheDType? vDtype)
+    {
+        int i = FlashPrefillKvqIndex(headDim, kDtype, vDtype);
+        return i < 0 ? 0 : _attentionFlashPrefillKvqStaticSmem[i];
     }
 
     /// <summary>True when the scalar in-place TurboQuant attention kernel (#1892 Task 6, <c>attention_kvtq.ptx</c>) is loaded.</summary>
