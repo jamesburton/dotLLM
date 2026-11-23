@@ -434,6 +434,7 @@ public abstract class GenerationSessionBackendSuite
             float bound = ControlFactor * control;
             if (fx.Backend == SessionBackend.Cpu) bound = Math.Max(bound, 5e-4f);   // the 5e-4 floor holds on CPU only
             s.RollbackTo(k);
+            Assert.Equal(k, s.KvLength);   // the logit comparison alone cannot see a skipped truncate (the re-forward rewrites its own row): surviving mutant, killed here
             await using var o = oracle.NewGenerator().CreateSession(Greedy(), Tag());
             await o.PrefillAsync(all.Take(k - 1).ToArray());
             await o.AppendObservationTokensAsync(new[] { all[k - 1] });
