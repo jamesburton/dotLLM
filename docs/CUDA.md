@@ -1261,6 +1261,39 @@ End-to-end (`bench -p 512 -n 64 --depth-list 0,3584,15872`, MTP off), decode tok
 Parity: v2 vs F64 reference max abs error ~1e-5 at seqKv in {1,15,16,17,255,256,4096,16385} (v1 vs v2 <= 2.6e-5);
 `CudaAttentionMmaDecodeGqaSplitGenerationParityTests` PPL delta -0.04% (pre-gate bit-identical).
 
+## Dense split-KV decode and the step decode graph (issue #1922)
+
+The plain `CudaTransformerModel` used to decode with the scalar one-block-per-query-head kernels (`attention_f16`,
+`attention_kvq`, `attention_kvtq`) at every depth, eagerly past depth 512. Two changes, both **default on**
+(James 2026-11-21, bench 2026-11-22):
+
+- **Dense v2 decode** (`attention_mma_decode_v2_dense.cu/.cuh`, `CudaKernels.DenseDecodeV2.cs`, gate `CudaDenseDecodeV2`):
+  the #988 body above generalised to head dim 64 / 128 (and 256 for TurboQuant), loader objects (F16, Q8_0, Q4_0, in-place
+  TurboQuant codes + norms with a per-block shared centroid table), F16 output. `attention_mma_decode_v2.cuh` is untouched, so
+  the hybrid model's hd256 PTX cannot move. Split partials are stored **normalised** (o/l) in **F16**, with the running max m
+  and sum l in F32: the unnormalised #988 form overflows F16 on long splits (guarded by a flat-score |V|~20 32K test). An
+  F32-partial control arm and a 2-blocks-per-SM variant were measured and removed (see `docs/PRECISION.md`).
+  Engages for a decode row that is the newest cache row, seqKv >= 512 (`DOTLLM_CUDA_DENSE_DECODE_V2_MIN_KV`; 128 measured
+  faster in the kernel microbench but inconclusive end to end, so 512 stays), no sliding window, no sinks, no FP16 window ring,
+  GQA group <= 8. **Kill switch: `DOTLLM_CUDA_DENSE_DECODE_V2=0`.** Scratch: one F16 partial buffer plus F32 m / l for all
+  layers, allocated at model construction (Qwen3-4B on an RTX 3060: kvSplit 3, about 25 KiB).
+- **Step decode graph** (`CudaTransformerModel.StepGraph.cs`): the eager `ForwardInternal` body captured for one step,
+  pushed with `cuGraphExecUpdate` and launched once (the hybrid's capture-don't-patch). Engages where the older graphs do
+  not: F16 past `GraphCaptureMaxDepth`, pure-quantized q8_0 / q4_0 and in-place TurboQuant at any depth. Bit-identical to
+  eager by construction (tested for f16, q8_0, q4_0, tq4, tq3, across kernel switches and after a rollback).
+  **Kill switch: `DOTLLM_CUDA_STEP_GRAPH=0`.** `DOTLLM_CUDA_STEP_GRAPH_STATS=1` prints the capture + update host time per step.
+  The windowed quantized cache is not captured (its update advances eviction bookkeeping during capture). A failed capture,
+  instantiate or launch runs that step eagerly and disables the graph only until the cache, its buffers or the attention tier
+  change.
+- **Interplay.** For f16 below `GraphCaptureMaxDepth` the older device-scalar graph (`attention_f16_dyn`) owns decode, so raising
+  `DOTLLM_GRAPH_MAX_DEPTH`, or lowering `DOTLLM_CUDA_DENSE_DECODE_V2_MIN_KV` below it, leaves f16 on the scalar kernel in that band.
+
+Kernel microbench (RTX 3060 on framework, hd128 32/8, kvSplit 3, `CudaAttentionMmaDecodeDenseTests.Microbench_Scalar_vs_DenseV2`):
+at 32,768 keys f16 0.41 ms (scalar 7.2-8.1 ms, ~325 GB/s effective, the DRAM roofline), q8_0 0.27-0.30 ms (scalar 7.8-8.3),
+q4_0 0.22-0.42 ms (scalar 11.4-11.7). End to end (framework, Qwen3-4B Q4_K_M, bench 2026-11-22, ratios only): dense v2 vs the
+scalar kernel at 32K f16 9.5x; the step graph over v2 at 7K 1.9x; base -> v2 + step graph at 32K f16 3.6 -> 37.7 tok/s,
+q4_0 2.3 -> 48.7, tq4 2.2 -> 29.2, i.e. 0.94-1.70x of llama.cpp b12590 at 32K.
+
 ## Dense prefill attention, head_dim 64 / 128 (issues #1850, #1923)
 
 `native/kernels/attention_flash_mma_prefill_kvq.cu`: one mma.sync flash body (16-row q-tiles x one KV head per block, one warp per

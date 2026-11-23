@@ -170,6 +170,8 @@ public class CudaGraphCaptureEquivalenceTest
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
         FixtureLocation fixture = KnownTestFixtures.BitNetI2S;
         Skip.If(!fixture.Found, fixture.SkipMessage(KnownTestFixtures.BitNetI2SDescription));
+        // #1922: past the cap the step graph would now take these steps; this case characterises the shallow -> eager regime.
+        using var stepGraphOff = StaticToggle.StepGraph(false);
 
         using var gguf = GgufFile.Open(fixture.Path!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
