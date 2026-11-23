@@ -63,8 +63,6 @@ public sealed partial class TextGenerator
     {
         if (options.StopConditions is not null)
             throw new NotSupportedException("options.StopConditions is not supported on a session; pass the stop condition to GenerateUntilBoundaryAsync per segment.");
-        if (options.RepeatGuardLimit is not null)
-            throw new NotSupportedException("options.RepeatGuardLimit is not supported on a session; pass a RepeatGuardStopCondition to GenerateUntilBoundaryAsync per segment.");
         if (options.Logprobs || options.TopLogprobs > 0)
             throw new NotSupportedException("options.Logprobs / TopLogprobs are not supported on a session; read the raw logits with CopyNextLogits.");
     }

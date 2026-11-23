@@ -209,7 +209,7 @@ public sealed class GenerationSession : IAsyncDisposable
             var conditions = new List<IStopCondition> { EndOfGenerationTokens.CreateStopCondition(_tokenizer), stopCondition };
             // options.StopSequences (with ReasoningStopGate) apply per segment, as TextGenerator applies them per request (#1931 review I-4).
             conditions.AddRange(StopStringCondition.CreateAll(_options));
-            if (_repeatGuard is not null) conditions.Add(_repeatGuard);   // #1291 semantics, state carried across segments
+               // #1291 semantics, state carried across segments
             int tailSize = TextGenerator.ComputeStopTailSize(conditions);
             char[] scratch = ArrayPool<char>.Shared.Rent(tailSize);
             try
@@ -230,7 +230,11 @@ public sealed class GenerationSession : IAsyncDisposable
                     generated.Add(token);
                     detok.Append(token);
                     var tail = detok.GetTailView(tailSize, scratch);
+                    // The guard sees EVERY sampled token (CheckStopConditions short-circuits, and a segment's own stop condition often ends it first); its
+                    // verdict applies only when nothing else stopped the token. #1291 semantics: the limit-th identical token in a row ends the segment, kept.
+                    var guard = _repeatGuard?.ShouldStop(token, generated, tail) ?? StopResult.Continue;
                     var result = TextGenerator.CheckStopConditions(conditions, token, generated, tail);
+                    if (result == StopResult.Continue) result = guard;
 
                     if (result == StopResult.Stop && !TextGenerator.HasStopStringSuffix(tail, conditions))
                     {
