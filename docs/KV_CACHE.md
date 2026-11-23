@@ -415,7 +415,10 @@ why; it is never served by another cache (#1888).
     (James 2026-11-22: a width is Staged only while its new entries stay within the legacy entry's drift band on the depth gate).
     The band is the largest mean-KL movement over several 1-ulp perturbations of the legacy entry (softmax scale +-1 and +-2 F32
     ulps, one stored K or V norm's last bit). At hd128 the +1-ulp scale arm is inert by construction (1/sqrt(128) * log2e rounds
-    to the same F32), so it is dropped; the first tq3 ruling rested on the -1-ulp arm alone (band 7.1% against tq3's +4.3%). `legacy` = `_tqtq` (runtime bits,
+    to the same F32) and the -2-ulp arm runs the same kernel as -1, so both are dropped; the first tq3 ruling rested on the -1-ulp arm
+    alone (band 7.1% against tq3's +4.3%). With the K / V norm arms (final review, framework a54e871e) the hd128 tq3 band is 7.8e-2
+    (18%) against an excess of 1.8e-2, so tq3 stays Staged; every width passes on both models (Qwen3-4B hd128, Qwen2.5-0.5B hd64).
+    Tightest margin: Qwen2.5-0.5B tq2, 5.677 against a limit of 5.686 (that model's codec effect is large at tq2-tq4: KL 3.5-5.7). `legacy` = `_tqtq` (runtime bits,
     `half(norm * centroid)` per element from global memory). `spec` = `_tq{2,3,4,8}`: norms kept out of the tile (the K norm scales
     the score, the V norm scales P; the softmax sum keeps the raw P), a shared-memory F16 centroid table, bits compiled in. `cpa` =
     `_tq{2,3,4,8}_cpa`: `spec` plus `cp.async` staging of the raw code rows one tile ahead and a single decoded tile, which takes hd128

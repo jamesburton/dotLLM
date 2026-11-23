@@ -162,12 +162,25 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
             double band = 0;
             var moved = new List<string>();
             float baseScale = ScaleLog2(hd, 0);
+            var scalesRun = new Dictionary<int, string>();   // scale*log2e bits -> the arm that already ran that kernel
             foreach (var ctl in Controls)
             {
-                if (ctl.ScaleUlps != 0 && BitConverter.SingleToInt32Bits(ScaleLog2(hd, ctl.ScaleUlps)) == BitConverter.SingleToInt32Bits(baseScale))
+                if (ctl.ScaleUlps != 0)
                 {
-                    _out.WriteLine($"DEPTH b{bits} ctrl {ctl.Name}: DROPPED, inert by construction (scale*log2e is bit-identical at hd{hd})");
-                    continue;
+                    int sb = BitConverter.SingleToInt32Bits(ScaleLog2(hd, ctl.ScaleUlps));
+                    if (sb == BitConverter.SingleToInt32Bits(baseScale))
+                    {
+                        _out.WriteLine($"DEPTH b{bits} ctrl {ctl.Name}: DROPPED, inert by construction (scale*log2e is bit-identical at hd{hd})");
+                        continue;
+                    }
+                    // Two input steps that round to the same scale*log2e run the identical kernel: one sample, not two (at hd128 the
+                    // -1 and -2 ulp arms coincide).
+                    if (scalesRun.TryGetValue(sb, out string? same))
+                    {
+                        _out.WriteLine($"DEPTH b{bits} ctrl {ctl.Name}: DROPPED, same scale*log2e as {same} (identical kernel)");
+                        continue;
+                    }
+                    scalesRun[sb] = ctl.Name;
                 }
                 List<float[]> ctrl;
                 CudaKernels.TqPrefillVariantOverride = CudaKernels.TqPrefillVariant.Legacy;
