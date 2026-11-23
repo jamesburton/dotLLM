@@ -36,6 +36,14 @@ internal sealed class GenerationSessionFixture : IDisposable
     public int[] Prompt { get; }
     public int[] Observation { get; }
 
+    /// <summary>The text that tokenizes to <paramref name="ids"/> on this fixture's tokenizer (round-trip asserted), for the plain-generator path.</summary>
+    public string TextOf(int[] ids)
+    {
+        string text = Tokenizer.Decode(ids);
+        Assert.Equal(ids, Tokenizer.Encode(text));
+        return text;
+    }
+
     public static GenerationSessionFixture Create(string family, int? headDim = null, SessionBackend backend = SessionBackend.Cpu)
         => new(family, headDim, backend);
 
@@ -116,6 +124,11 @@ internal sealed class GenerationSessionFixture : IDisposable
 
     public bool IsRecurrent => Model.RequiresPerSequenceState;
 
+    private ResidualUlpArm? _arm;
+
+    /// <summary>The 1-ULP residual perturbation for this fixture's model (every backend has a PostLayer seam), created on first use; null only for a model without one.</summary>
+    public ResidualUlpArm? Arm => _arm ??= ResidualUlpArm.For(Model);
+
     public TextGenerator NewGenerator()
         => _gpuKvFactory is null ? new(Model, Tokenizer) : new(Model, Tokenizer, kvCacheFactory: (_, size) => _gpuKvFactory(size));
 
@@ -131,6 +144,7 @@ internal sealed class GenerationSessionFixture : IDisposable
 
     public void Dispose()
     {
+        _arm?.Dispose();
         Model.Dispose();
         _gguf.Dispose();
         try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
@@ -196,7 +210,8 @@ internal sealed class GenerationSessionFixture : IDisposable
     /// <summary>Token id i decodes to "t{i}|"; no merges, never an end-of-generation marker.</summary>
     private sealed class IdTokenizer(int vocab) : ITokenizer
     {
-        public int[] Encode(string text) => throw new NotSupportedException();
+        /// <summary>Inverse of <see cref="Decode(ReadOnlySpan{int})"/>: "t3|t4|" gives [3, 4].</summary>
+        public int[] Encode(string text) => text.Split('|', StringSplitOptions.RemoveEmptyEntries).Select(t => int.Parse(t.AsSpan(1), System.Globalization.CultureInfo.InvariantCulture)).ToArray();
         public string Decode(ReadOnlySpan<int> tokenIds)
         {
             var sb = new System.Text.StringBuilder();

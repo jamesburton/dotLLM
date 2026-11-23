@@ -31,8 +31,11 @@ namespace DotLLM.Cuda.Architectures;
 /// (small) are uploaded as F32 device buffers.
 /// </para>
 /// </remarks>
-public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
+public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel, ICudaResidualModifierHost
 {
+    /// <summary>Optional PostLayer residual modifier (#1919): called on the F32 HiddenState after every layer's closing add. This model has no decode graph, so nothing is bypassed. Null costs one branch per layer.</summary>
+    public ICudaResidualModifier? ResidualModifier { get; set; }
+
     // #1848 / #1834: WDDM sysmem-fallback detector for this CUDA host. Created with the model object (baseline: this process's shared usage then,
     // so later growth past dedicated VRAM warns); polls in the background, never on the inference thread. No-op off Windows.
     private readonly GpuSpillMonitor _spillMonitor = new(() => "CudaQwen3MoeHybridTransformerModel");
@@ -2021,6 +2024,8 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // 4. Second residual add: hidden = residual + normOut.
         _kernels.LaunchAddF32(_state.Residual, _state.NormOutput, _state.HiddenState,
             seqLen * hiddenSize, streamH);
+        if (ResidualModifier is { } modifier && modifier.AppliesTo(layerIdx))
+            modifier.Apply(_state.HiddenState, CudaResidualDType.F32, layerIdx, seqLen, hiddenSize, streamH);   // #1919 PostLayer
     }
 
     // ──────────────────────────────────────────────────────────────────────

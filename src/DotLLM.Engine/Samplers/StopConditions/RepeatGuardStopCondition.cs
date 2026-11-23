@@ -46,6 +46,12 @@ public sealed class RepeatGuardStopCondition : IStopCondition
         return n > 0 ? new RepeatGuardStopCondition(n) : null;
     }
 
+    /// <summary>The current run (token, length); <c>(-1, 0)</c> before the first token. A <c>GenerationSession</c> snapshots it per committed position (#1919).</summary>
+    internal (int Token, int Run) State => (_token, _run);
+
+    /// <summary>Puts the run back (a <c>GenerationSession</c> rollback or a pause that must not count an uncommitted token).</summary>
+    internal void Restore(int token, int run) { _token = token; _run = run; }
+
     /// <inheritdoc/>
     public StopResult ShouldStop(int tokenId, IReadOnlyList<int> generatedTokens, string decodedText) => Check(tokenId, generatedTokens.Count);
 

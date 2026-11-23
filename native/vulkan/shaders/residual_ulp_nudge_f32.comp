@@ -1,0 +1,21 @@
+#version 450
+// TEST-ONLY residual perturbation (#1919): x[offset + i] moves exactly one F32 ULP away from zero, i in [0, count).
+// Away from zero is the integer bit pattern + 1 for either sign (sign-magnitude), the same step
+// MathF.BitIncrement (x >= 0) / MathF.BitDecrement (x < 0) takes on the CPU. Only the GenerationSession
+// sensitivity control records this; no production path does.
+// Dispatch: local_size_x = 256, groupCount.x = ceil(count / 256).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufX { uint x[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint offset;
+    uint count;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    x[pc.offset + i] = x[pc.offset + i] + 1u;
+}

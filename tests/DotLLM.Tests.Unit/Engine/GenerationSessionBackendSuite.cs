@@ -2,6 +2,7 @@ using System.Reflection;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Diagnostics;
+using DotLLM.Core.Models;
 using DotLLM.Engine;
 using Xunit;
 using static DotLLM.Tests.Unit.Engine.GenerationSessionFixture;
@@ -41,21 +42,23 @@ public abstract partial class GenerationSessionBackendSuite
     /// test. Everything here is raw <c>IModel.Forward</c> on a fresh cache from the generator's KV factory, never <see cref="GenerationSession"/>,
     /// so a defect in the session's append or prefill path cannot inflate the control and the compared diff together.
     /// Two arms, same model, same tokens, max |logit diff| against one batched prefill of all tokens:
-    /// (1) the genuine 1-ULP arm: the same prefill with ONE F32 ULP (<c>MathF.BitIncrement</c>) added to every element of token 0's
-    /// residual row after layer 0, the "one F16/F32 rounding of one input" sensitivity of #1928, through the residual-modifier hook that only the
-    /// CPU models implement (a GPU backend has no injection point; there the arm is absent and stated as such in the PR);
+    /// (1) the genuine 1-ULP arm (<see cref="ResidualUlpArm"/>, the same instrument on CPU, Vulkan and CUDA): the same prefill with every element
+    /// of the last token's residual row moved by exactly one ULP of the residual's storage dtype (F32; F16 on the CUDA dense model) after layer 0, the
+    /// "one rounding of one input" sensitivity of #1928, through each backend's own PostLayer seam;
     /// (2) the prefill-vs-decode path split (prefill of the first half, then every remaining token as a single decode row), the path pair
-    /// every comparison here crosses. Control = max of the arms. A 1-ULP perturbation can be absorbed on one particular sequence, so
-    /// observability is asserted once per family by <see cref="OneUlpArm_IsObservable"/> (an inert arm must fail the run), not per call.
+    /// every comparison here crosses. Control = max of the arms; the bound is <see cref="ControlFactor"/> x control. A 1-ULP perturbation can be
+    /// absorbed on one particular sequence, so observability is asserted bitwise once per backend and family by
+    /// <see cref="OneUlpArm_IsObservable"/> (an inert arm must fail the run), not per call.
     /// </summary>
     private static float ControlMaxAbsDiff(GenerationSessionFixture oracle, int[] tokens)
     {
         float[] full = RawLastLogits(oracle, tokens, tokens.Length, perturb: false);
-        float control = MaxAbsDiff(full, RawLastLogits(oracle, tokens, Math.Max(1, tokens.Length / 2), perturb: false));
-        if (oracle.Model is IResidualModifierHost)
-        {
-            control = Math.Max(control, MaxAbsDiff(full, RawLastLogits(oracle, tokens, tokens.Length, perturb: true)));   // may be 0 on one sequence; OneUlpArm_IsObservable proves the arm can disagree
-        }
+        float raw = MaxAbsDiff(full, RawLastLogits(oracle, tokens, Math.Max(1, tokens.Length / 2), perturb: false));
+        float ulp = oracle.Arm is null ? 0f : MaxAbsDiff(full, RawLastLogits(oracle, tokens, tokens.Length, perturb: true));   // may be 0 on one sequence; OneUlpArm_IsObservable proves the arm can disagree
+        float control = Math.Max(raw, ulp);
+        string? log = Environment.GetEnvironmentVariable("DOTLLM_SESSION_CONTROL_LOG");
+        if (!string.IsNullOrEmpty(log))
+            File.AppendAllText(log, $"{oracle.Backend} n={tokens.Length} ARMS ulp1={ulp:E3} raw={raw:E3}{Environment.NewLine}");
         Assert.True(control <= ControlSanityCeiling, $"{oracle.Backend}: control {control:E3} exceeds the sanity ceiling {ControlSanityCeiling:E1}");
         return control;
     }
@@ -66,9 +69,8 @@ public abstract partial class GenerationSessionBackendSuite
         var model = fx.Model;
         using var kv = fx.NewKvCache(tokens.Length + 1);
         if (model.RequiresPerSequenceState) model.ResetSequenceState();
-        var host = model as IResidualModifierHost;
-        var saved = host?.ResidualModifier;
-        if (perturb) host!.ResidualModifier = new OneUlpPerturber();
+        var arm = perturb ? fx.Arm! : null;
+        arm?.Attach();
         try
         {
             var pos = new int[tokens.Length];
@@ -82,44 +84,122 @@ public abstract partial class GenerationSessionBackendSuite
                     int vocab = model.Config.VocabSize;
                     last = new ReadOnlySpan<float>((float*)logits.DataPointer + (long)(logits.Shape[0] - 1) * vocab, vocab).ToArray();
                 }
-                if (perturb) host!.ResidualModifier = saved;   // the perturbation is one-shot; later rows run clean
+                arm?.Detach();   // the perturbation is one-shot; later rows run clean
             }
             return last!;
         }
         finally
         {
-            if (host is not null) host.ResidualModifier = saved;
+            arm?.Detach();
             if (model.RequiresPerSequenceState) model.ResetSequenceState();
         }
     }
 
-    /// <summary>Adds one F32 ULP to the largest-magnitude element of token 0's residual after layer 0, once.</summary>
-    private sealed class OneUlpPerturber : IResidualModifier
-    {
-        private bool _done;
-        public bool AppliesTo(int layerIndex) => layerIndex == 0 && !_done;
-        public void ModifyResidual(Span<float> residual, int layerIndex, int tokenCount)
-        {
-            if (_done || layerIndex != 0) return;
-            _done = true;
-            int hidden = residual.Length / tokenCount;
-            // One ULP (away from zero) on every element of token 0's residual row: one F32 rounding of one token's input state.
-            for (int i = 0; i < hidden; i++)
-                residual[i] = residual[i] >= 0 ? MathF.BitIncrement(residual[i]) : MathF.BitDecrement(residual[i]);
-        }
-    }
-
-    /// <summary>The control's 1-ULP arm must be able to disagree (James 2026-11-22: a control that cannot disagree proves nothing): on every CPU family it moves the logits.</summary>
+    /// <summary>
+    /// The control's 1-ULP arm must be able to disagree (James 2026-11-22: a control that cannot disagree proves nothing): on every backend and
+    /// family the model really called the perturber exactly once, and at least one logit differs BITWISE from the clean forward.
+    /// </summary>
     [SkippableTheory]
     [MemberData(nameof(Families), MemberType = typeof(GenerationSessionFixture))]
     public void OneUlpArm_IsObservable(string family)
     {
         using var fx = Open(family);
-        Skip.IfNot(fx.Model is IResidualModifierHost, "the 1-ULP arm needs the residual-modifier hook (CPU models only)");
+        var arm = fx.Arm;
+        Assert.NotNull(arm);
         int[] tokens = [.. fx.Prompt, .. fx.Observation];
-        float ulp = MaxAbsDiff(RawLastLogits(fx, tokens, tokens.Length, perturb: false), RawLastLogits(fx, tokens, tokens.Length, perturb: true));
-        Assert.True(ulp > 0f, $"{family}: a 1-ULP residual perturbation left the logits bit-identical (inert control arm)");
+        float[] clean = RawLastLogits(fx, tokens, tokens.Length, perturb: false);
+        int firedBefore = arm.Fired;
+        float[] moved = RawLastLogits(fx, tokens, tokens.Length, perturb: true);
+        Assert.Equal(1, arm.Fired - firedBefore);   // the hook ran (an uncalled hook is a dead seam, not an absorbed perturbation)
+        bool anyBitwise = false;
+        for (int i = 0; i < clean.Length && !anyBitwise; i++)
+            anyBitwise = BitConverter.SingleToInt32Bits(clean[i]) != BitConverter.SingleToInt32Bits(moved[i]);
+        Assert.True(anyBitwise, $"{fx.Backend}/{family}: a 1-ULP residual perturbation left every logit bit-identical (inert control arm)");
     }
+
+    /// <summary>
+    /// The seam is inert when unset (James 2026-11-22). With the modifier cleared (the hook never attached): (1) after an attach-perturb-detach
+    /// cycle the logits are BIT-identical to before it, on the prefill and the decode path (no residue: a latched bypass, a stale descriptor or
+    /// graph, a left-behind modifier); (2) managed bytes per forward and the backend's path fingerprint (Vulkan fence waits, CUDA eager-decode /
+    /// graph-launch counters) are identical before and after; (3) an unset forward allocates no more managed bytes, and waits on the device no more
+    /// often, than a forward with a modifier attached that never applies (that one pays an AppliesTo call per layer and, on the GPU backends, leaves
+    /// the fused / graphed decode), so a hook that allocates or syncs on the unset path is caught on the backends where attaching changes nothing
+    /// else (CPU), and by (1)-(2) everywhere it leaves residue.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families), MemberType = typeof(GenerationSessionFixture))]
+    public void UnsetHook_IsInert(string family)
+    {
+        using var fx = Open(family);
+        var arm = fx.Arm!;
+        int[] tokens = [.. fx.Prompt, .. fx.Observation];
+        object? saved = arm.ClearModifier();
+        try
+        {
+            foreach (int firstChunk in new[] { tokens.Length, tokens.Length / 2 })   // prefill-only, then prefill + decode rows
+            {
+                for (int w = 0; w < 2; w++) RawLastLogits(fx, tokens, firstChunk, perturb: false);   // warm: pipelines, scratch, JIT
+                var (before, bytesBefore, fpBefore) = MeasureUnset(fx, tokens, firstChunk);
+                RawLastLogits(fx, tokens, firstChunk, perturb: true);
+                var (after, bytesAfter, fpAfter) = MeasureUnset(fx, tokens, firstChunk);
+                for (int i = 0; i < before.Length; i++)
+                    Assert.True(BitConverter.SingleToInt32Bits(before[i]) == BitConverter.SingleToInt32Bits(after[i]), $"{fx.Backend}/{family} chunk={firstChunk} logit {i}: {before[i]} vs {after[i]} after an attach/detach cycle");
+                Assert.Equal(bytesBefore, bytesAfter);
+                Assert.Equal(fpBefore, fpAfter);
+
+                // (3) the unset path against a modifier that is attached and never applies.
+                arm.Attach(layer: int.MaxValue);
+                long inapplicableBytes; string fpInapplicable;
+                try { (_, inapplicableBytes, fpInapplicable) = MeasureUnset(fx, tokens, firstChunk); }
+                finally { arm.Detach(); }
+                Assert.True(bytesBefore <= inapplicableBytes, $"{fx.Backend}/{family}: the unset forward allocates {bytesBefore} B, more than the attached-inapplicable {inapplicableBytes} B");
+                Assert.True(FenceWaits(fpBefore) <= FenceWaits(fpInapplicable), $"{fx.Backend}/{family}: the unset forward waited more on the device ({fpBefore}) than the attached-inapplicable one ({fpInapplicable})");
+                string? log = Environment.GetEnvironmentVariable("DOTLLM_SESSION_CONTROL_LOG");
+                if (!string.IsNullOrEmpty(log))
+                    File.AppendAllText(log, $"{fx.Backend}/{family} UNSET chunk={firstChunk} bytes={bytesBefore} fp[{fpBefore}] | attached-inapplicable bytes={inapplicableBytes} fp[{fpInapplicable}]{Environment.NewLine}");
+            }
+        }
+        finally { arm.RestoreModifier(saved); }
+    }
+
+    /// <summary>Min managed bytes over 6 raw forwards (the allocation count of a deterministic path is exact), the last logits, and the path fingerprint delta of one forward.</summary>
+    private static (float[] Logits, long Bytes, string Fingerprint) MeasureUnset(GenerationSessionFixture fx, int[] tokens, int firstChunk)
+    {
+        long min = long.MaxValue;
+        float[] logits = [];
+        string fp = "";
+        for (int i = 0; i < 6; i++)
+        {
+            string fp0 = PathFingerprint(fx.Model);
+            long b0 = GC.GetAllocatedBytesForCurrentThread();
+            logits = RawLastLogits(fx, tokens, firstChunk, perturb: false);
+            long b = GC.GetAllocatedBytesForCurrentThread() - b0;
+            min = Math.Min(min, b);
+            fp = Delta(fp0, PathFingerprint(fx.Model));
+        }
+        return (logits, min, fp);
+    }
+
+    /// <summary>Counters that move when a forward syncs or leaves a fast path: Vulkan device fence waits; CUDA eager-decode and decode-graph launch counts.</summary>
+    private static string PathFingerprint(IModel model) => model switch
+    {
+        DotLLM.Cuda.CudaTransformerModel cuda => $"eager={cuda.EagerDecodeCount}",
+        DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel hd => $"graph={hd.DecodeGraphCounts}",
+        _ when model.GetType().Namespace == "DotLLM.Vulkan" => $"fence={DotLLM.Vulkan.VulkanDevice.SubmitContext.DiagFenceWaits}",
+        _ => "",
+    };
+
+    /// <summary>Per-counter difference of two fingerprints ("fence=3" then "fence=5" gives "fence=2"; a tuple "(a, b)" is diffed element-wise).</summary>
+    private static string Delta(string a, string b)
+    {
+        if (a == "") return "";
+        static string[] Parts(string x) => x.Split(['=', '(', ')', ',', ' '], StringSplitOptions.RemoveEmptyEntries);
+        string[] pa = Parts(a), pb = Parts(b);
+        return string.Join(",", pb.Select((v, i) => long.TryParse(v, out long n) ? (n - long.Parse(pa[i])).ToString() : v));
+    }
+
+    /// <summary>Vulkan fence waits out of a "fence=n" fingerprint delta; 0 when the backend exposes none.</summary>
+    private static long FenceWaits(string fp) => fp.StartsWith("fence,", StringComparison.Ordinal) ? long.Parse(fp["fence,".Length..]) : 0;
 
     private static float MaxAbsDiff(float[] x, float[] y)
     {
@@ -425,6 +505,84 @@ public abstract partial class GenerationSessionBackendSuite
         await using var s2 = gen.CreateSession(Greedy(), Tag());
         await s2.PrefillAsync(fx.Prompt);
         Assert.Equal(first, (await s2.GenerateUntilBoundaryAsync(new StopAfter(5))).TokenIds);
+    }
+
+    /// <summary>
+    /// A prompt and a repeat-guard limit L (2..6) for which the model's own greedy output (60 tokens, guard off) contains a run of L identical
+    /// tokens: <c>J</c> is the index of the token that completes the first such run. Synthetic models differ (one cycles, one is constant, one
+    /// never repeats a token twice in a row), so the prompt is searched; a family with no repeating prompt skips rather than pass vacuously.
+    /// </summary>
+    private static async Task<(int[] Prompt, int[] Greedy, int L, int J)> FindRepeat(GenerationSessionFixture fx)
+    {
+        var candidates = new List<int[]> { fx.Prompt };
+        if (fx.Prompt.Length > 0 && fx.Tokenizer.VocabSize < 1000 && fx.Prompt[0] < 20)   // the id-token families: any small ids are valid
+            foreach (int a in Enumerable.Range(3, 5)) { candidates.Add([a]); candidates.Add([a, a]); foreach (int b in Enumerable.Range(3, 5)) candidates.Add([a, b, a]); }
+        foreach (int[] prompt in candidates)
+        {
+            await using var s = fx.NewGenerator().CreateSession(Greedy(60) with { RepeatGuardLimit = 0 }, Tag());
+            await s.PrefillAsync(prompt);
+            int[] g = [.. (await s.GenerateUntilBoundaryAsync(new StopAfter(int.MaxValue))).TokenIds];
+            for (int limit = 2; limit <= 6; limit++)
+                for (int j = limit - 1; j < g.Length; j++)
+                    if (Enumerable.Range(j - limit + 1, limit).All(i => g[i] == g[j])) return (prompt, g, limit, j);
+        }
+        Skip.If(true, "no prompt makes this family's greedy output repeat a token 2-6 times in a row");
+        return default;
+    }
+
+    /// <summary>
+    /// options.RepeatGuardLimit on a session stops where the plain generator stops (#1291 semantics, James 2026-11-23): the same prompt and
+    /// limit end after the same tokens, the tripping token kept, <see cref="FinishReason.Length"/>.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families), MemberType = typeof(GenerationSessionFixture))]
+    public async Task RepeatGuard_StopsWhereThePlainGeneratorDoes(string family)
+    {
+        using var fx = Open(family);
+        var (prompt, g, limit, j) = await FindRepeat(fx);
+        var opts = Greedy(60) with { RepeatGuardLimit = limit };
+        var plain = fx.NewGenerator().Generate(fx.TextOf(prompt), opts);
+        Assert.Equal(g[..(j + 1)], plain.GeneratedTokenIds);   // the plain path really tripped, at J
+        await using var s = fx.NewGenerator().CreateSession(opts, Tag());
+        await s.PrefillAsync(prompt);
+        var r = await s.GenerateUntilBoundaryAsync(new StopAfter(int.MaxValue));
+        Assert.Equal(plain.GeneratedTokenIds, r.TokenIds);
+        Assert.Equal(FinishReason.Length, r.FinishReason);
+    }
+
+    /// <summary>The run survives a pause: the segment ends one token before the limit-th repeat, and the next segment trips on its first token.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families), MemberType = typeof(GenerationSessionFixture))]
+    public async Task RepeatGuard_RunSurvivesAPause_OnEveryBackend(string family)
+    {
+        using var fx = Open(family);
+        var (prompt, g, limit, j) = await FindRepeat(fx);
+        await using var s = fx.NewGenerator().CreateSession(Greedy(60) with { RepeatGuardLimit = limit }, Tag());
+        await s.PrefillAsync(prompt);
+        Assert.Equal(g[..j], (await s.GenerateUntilBoundaryAsync(new StopAfter(j))).TokenIds);   // j tokens: not tripped, run = limit - 1
+        Assert.Equal([g[j]], (await s.GenerateUntilBoundaryAsync(new StopAfter(int.MaxValue))).TokenIds);
+    }
+
+    /// <summary>
+    /// RollbackTo restores the guard: after a trip, rolling back to the pause before the run and sampling again reproduces the same run (a stale
+    /// run would trip on its first token). The pause is a recorded boundary, so recurrent models roll back to it as well.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families), MemberType = typeof(GenerationSessionFixture))]
+    public async Task RepeatGuard_RollbackRestoresTheRun_OnEveryBackend(string family)
+    {
+        using var fx = Open(family);
+        var (prompt, g, limit, j) = await FindRepeat(fx);
+        int start = j - limit + 1;   // g[start..j] is the run
+        await using var s = fx.NewGenerator().CreateSession(Greedy(60) with { RepeatGuardLimit = limit }, Tag());
+        await s.PrefillAsync(prompt);
+        if (start > 0) await s.GenerateUntilBoundaryAsync(new StopAfter(start));
+        int pause = prompt.Length + start;
+        Assert.Equal(pause, s.CurrentPosition);
+        Assert.Equal(g[start..(j + 1)], (await s.GenerateUntilBoundaryAsync(new StopAfter(int.MaxValue))).TokenIds);   // tripped
+        Assert.True(s.CanRollbackTo(pause));
+        s.RollbackTo(pause);
+        Assert.Equal(g[start..(j + 1)], (await s.GenerateUntilBoundaryAsync(new StopAfter(int.MaxValue))).TokenIds);
     }
 
     /// <summary>true/false from the cache's private disposed flag; null when the cache has none (a length-only handle that owns no storage).</summary>

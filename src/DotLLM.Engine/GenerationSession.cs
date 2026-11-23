@@ -42,6 +42,11 @@ public sealed class GenerationSession : IAsyncDisposable
     private readonly int[] _posBuf = new int[1];
 
     private int[] _history = new int[64];
+    // Repeat-guard state per position (#1919): _runAt[k] = length of the run of identical SAMPLED tokens ending at position k-1 (0 when token k-1 was
+    // prompt / observation, or k == 0). The guard's live (token, run) is always derivable from (_history, _runAt, _position), which is what makes
+    // RollbackTo restore it exactly.
+    private int[] _runAt = new int[65];
+    private readonly RepeatGuardStopCondition? _repeatGuard;
     private readonly CommittedView _committed;
     private int _position;
     private readonly float[] _nextLogits;
@@ -102,6 +107,7 @@ public sealed class GenerationSession : IAsyncDisposable
         _nextLogits = new float[_vocab];
         _sampleScratch = new float[_vocab];
         _pipeline = new SamplerPipeline(options, _tokenizer);
+        _repeatGuard = RepeatGuardStopCondition.Create(options.RepeatGuardLimit);   // null limit = the engine default, 0 disables, as TextGenerator
         _committed = new CommittedView(this);
         _recurrent = _model.RequiresPerSequenceState;
         _checkpointing = _recurrent && _model.SupportsRecurrentStateCheckpoint;
@@ -207,6 +213,7 @@ public sealed class GenerationSession : IAsyncDisposable
                     $"{tokens.Length} tokens at position {start} exceed the session's KV capacity of {_kv.MaxLength} (ceiling {_maxContext}; a cache that cannot grow needs an explicit maxContextTokens).");
             EnsureHistory(start + tokens.Length);
             tokens.Span.CopyTo(_history.AsSpan(start));
+            Array.Clear(_runAt, start + 1, tokens.Length);   // externally supplied tokens are not sampled: they end a run
             try
             {
                 using ITensor logits = _owner.SessionForwardPrefill(_history, start, tokens.Length, _kv, ct);
@@ -220,6 +227,7 @@ public sealed class GenerationSession : IAsyncDisposable
                 throw;
             }
             _position = start + tokens.Length;
+            SyncGuard();   // the appended tokens end any sampled run
             RecordBoundary();
             return ValueTask.CompletedTask;
         }
@@ -241,6 +249,7 @@ public sealed class GenerationSession : IAsyncDisposable
             var conditions = new List<IStopCondition> { EndOfGenerationTokens.CreateStopCondition(_tokenizer), stopCondition };
             // options.StopSequences (with ReasoningStopGate) apply per segment, as TextGenerator applies them per request (#1931 review I-4).
             conditions.AddRange(StopStringCondition.CreateAll(_options));
+               // #1291 semantics, state carried across segments
             int tailSize = TextGenerator.ComputeStopTailSize(conditions);
             char[] scratch = ArrayPool<char>.Shared.Rent(tailSize);
             try
@@ -267,7 +276,11 @@ public sealed class GenerationSession : IAsyncDisposable
                     generated.Add(token);
                     detok.Append(token);
                     var tail = detok.GetTailView(tailSize, scratch);
+                    // The guard sees EVERY sampled token (CheckStopConditions short-circuits, and a segment's own stop condition often ends it first); its
+                    // verdict applies only when nothing else stopped the token. #1291 semantics: the limit-th identical token in a row ends the segment, kept.
+                    var guard = _repeatGuard?.ShouldStop(token, generated, tail) ?? StopResult.Continue;
                     var result = TextGenerator.CheckStopConditions(conditions, token, generated, tail);
+                    if (result == StopResult.Continue) result = guard;
 
                     if (result == StopResult.Stop && !TextGenerator.HasStopStringSuffix(tail, conditions))
                     {
@@ -278,6 +291,7 @@ public sealed class GenerationSession : IAsyncDisposable
 
                     int tokenPos = _position;
                     CommitAndForward(token);
+                    if (_repeatGuard is not null) _runAt[_position] = _repeatGuard.State.Run;
                     if (_constraint is not null)
                     {
                         _sampled.Add((tokenPos, token));
@@ -297,12 +311,14 @@ public sealed class GenerationSession : IAsyncDisposable
                 if (finish == FinishReason.Stop)
                     text = StopSuffixTrimmer.TrimMatchedSuffix(text, conditions);
 
+                SyncGuard();   // an EOS-like stop evaluated the guard on a token that was not committed
                 RecordBoundary();
                 return ValueTask.FromResult(new GenerationSegmentResult(text, generated.ToArray(), finish, startPos, _position));
             }
             catch (Exception ex) when (ex is IForwardStateRestored)
             {
                 // The model undid the failed forward: the session sits at a clean pause (tokens committed before it stay committed).
+                SyncGuard();
                 RecordBoundary();
                 throw;
             }
@@ -469,7 +485,15 @@ public sealed class GenerationSession : IAsyncDisposable
             _position = tokenPosition;
             RebuildConstraint(tokenPosition);
         }
-        finally { End(); }
+        finally { SyncGuard(); End(); }
+    }
+
+    /// <summary>Sets the live repeat guard to the state it had at <see cref="CurrentPosition"/>: the trailing sampled run recorded in <c>_runAt</c>.</summary>
+    private void SyncGuard()
+    {
+        if (_repeatGuard is null) return;
+        int run = _position == 0 ? 0 : _runAt[_position];
+        _repeatGuard.Restore(run == 0 ? -1 : _history[_position - 1], run);
     }
 
     /// <summary>
@@ -634,6 +658,8 @@ public sealed class GenerationSession : IAsyncDisposable
     {
         if (_history.Length < needed)
             Array.Resize(ref _history, Math.Max(needed, _history.Length * 2));
+        if (_runAt.Length < _history.Length + 1)
+            Array.Resize(ref _runAt, _history.Length + 1);
     }
 
     private void EnsureLogitsValid()

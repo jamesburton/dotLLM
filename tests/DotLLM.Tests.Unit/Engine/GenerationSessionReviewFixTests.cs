@@ -253,7 +253,80 @@ public sealed class GenerationSessionReviewFixTests
         var gen = Gen(new ScriptedModel(false));
         Assert.Throws<NotSupportedException>(() => gen.CreateSession(Greedy() with { StopConditions = [new StopAfter(1)] }, Tag()));
         Assert.Throws<NotSupportedException>(() => gen.CreateSession(Greedy() with { Logprobs = true }, Tag()));
-        Assert.Throws<NotSupportedException>(() => gen.CreateSession(Greedy() with { RepeatGuardLimit = 4 }, Tag()));
+    }
+
+    // ── RepeatGuardLimit (#1919, James 2026-11-23) ────────────────────────────────
+
+    /// <summary>
+    /// A prompt whose last token (1, at position 24) makes the scripted attention model sample 5, then 5 again (7*5 + 25 = 60 = 2 mod 29):
+    /// the first two sampled tokens are identical, so a limit-2 guard trips on the second.
+    /// </summary>
+    private static int[] RepeatPrompt() => [.. Enumerable.Repeat(3, 24), 1];
+
+    private static GenerationSession GuardedSession(int limit)
+        => Gen(new ScriptedModel(false)).CreateSession(Greedy() with { RepeatGuardLimit = limit }, Tag());
+
+    [Fact]
+    public async Task RepeatGuard_TripsOnTheLimitthIdenticalSampledToken_LikeTheEngineGuard()
+    {
+        await using var s = GuardedSession(2);
+        await s.PrefillAsync(RepeatPrompt());
+        var r = await s.GenerateUntilBoundaryAsync(new StopAfter(50));
+        Assert.Equal([5, 5], r.TokenIds);
+        Assert.Equal(FinishReason.Length, r.FinishReason);
+    }
+
+    [Fact]
+    public async Task RepeatGuard_Disabled_WithZero()
+    {
+        await using var s = GuardedSession(0);
+        await s.PrefillAsync(RepeatPrompt());
+        var r = await s.GenerateUntilBoundaryAsync(new StopAfter(4));
+        Assert.Equal(4, r.TokenIds.Count);
+    }
+
+    /// <summary>A pause keeps the run: [5] | pause | [5] trips on the second segment's first token.</summary>
+    [Fact]
+    public async Task RepeatGuard_RunSurvivesAPause()
+    {
+        await using var s = GuardedSession(2);
+        await s.PrefillAsync(RepeatPrompt());
+        Assert.Equal([5], (await s.GenerateUntilBoundaryAsync(new StopAfter(1))).TokenIds);
+        Assert.Equal([5], (await s.GenerateUntilBoundaryAsync(new StopAfter(50))).TokenIds);   // run 2 at its first token: tripped, one token
+    }
+
+    /// <summary>
+    /// An observation append ends the run (observation tokens are externally supplied, not sampled): after [5] | observe [9] the scripted model
+    /// samples 5 again, but the run restarts at 1, so the guard does not trip on it (it would at once if the run were carried over).
+    /// </summary>
+    [Fact]
+    public async Task RepeatGuard_ObservationAppendEndsTheRun()
+    {
+        await using var s = GuardedSession(2);
+        await s.PrefillAsync(RepeatPrompt());
+        await s.GenerateUntilBoundaryAsync(new StopAfter(1));
+        await s.AppendObservationTokensAsync(new[] { 9 });
+        Assert.Equal(5, s.NextTokenArgMax());
+        var r = await s.GenerateUntilBoundaryAsync(new StopAfter(2));
+        Assert.Equal(2, r.TokenIds.Count);
+        Assert.Equal(5, r.TokenIds[0]);
+    }
+
+    /// <summary>
+    /// RollbackTo restores the guard: after [5, 5] tripped, rolling back to before the repetition and sampling again reproduces the same two
+    /// tokens. A stale run (5, 2) would trip on the first token.
+    /// </summary>
+    [Fact]
+    public async Task RepeatGuard_RollbackRestoresTheRun()
+    {
+        await using var s = GuardedSession(2);
+        int[] prompt = RepeatPrompt();
+        await s.PrefillAsync(prompt);
+        Assert.Equal([5, 5], (await s.GenerateUntilBoundaryAsync(new StopAfter(50))).TokenIds);
+        s.RollbackTo(prompt.Length);
+        Assert.Equal([5, 5], (await s.GenerateUntilBoundaryAsync(new StopAfter(50))).TokenIds);
+        s.RollbackTo(prompt.Length + 1);   // mid-run: true state (5, 1)
+        Assert.Equal([5], (await s.GenerateUntilBoundaryAsync(new StopAfter(50))).TokenIds);
     }
 
     // ── I-6 ────────────────────────────────────────────────────────────────────
