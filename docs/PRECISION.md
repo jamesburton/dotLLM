@@ -683,6 +683,9 @@ single-sequence gate is needed. The 16-token threshold is a speed choice only. H
 arithmetic everywhere (also batch-invariant). `DOTLLM_CPU_Q4K_ROWLANE=0` restores the R4 arithmetic everywhere; R4 and RLA outputs
 differ from each other (by the KL above).
 
+**Decision (James 2026-11-23): ship batch-invariant, ungated.** pp512 1.22x, end-to-end decode 0.994x (unchanged within noise),
+the n = 1 GEMV microbench 13-19% slower; output never depends on server load. Numbers:
+
 Cost at n = 1 (2026-11-22, Strix, cpu-bench + gpu + cpu held, interleaved):
 
 | measure | R4 arithmetic (`=0`) | RLA (default) |
