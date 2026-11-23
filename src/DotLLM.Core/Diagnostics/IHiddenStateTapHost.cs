@@ -21,11 +21,30 @@ public interface IHiddenStateTapHost
     /// (<see cref="HookResult.Continue"/> otherwise; <c>Replace</c> is rejected with <see cref="InvalidOperationException"/>).
     /// On abort the model rolls the KV-cache back to its length at forward entry, restores recurrent state from a checkpoint taken
     /// at entry, and skips the remaining layers and the LM head. Refused with <see cref="NotSupportedException"/>, before any state is
-    /// touched: at registration when the model's config uses sliding-window attention; at the first abortable forward when the supplied cache
-    /// has a compact or full-precision window (<see cref="IKvCache.SupportsAbortRollback"/>); in <c>ForwardBatch</c>; and with an MTP/DFlash state.
+    /// touched: at the first abortable forward when the supplied cache drops rows (a compact sliding-window or full-precision-window
+    /// cache, <see cref="IKvCache.SupportsAbortRollback"/> false); in <c>ForwardBatch</c>; and with an MTP/DFlash state. A model with
+    /// sliding-window attention layers on a full-history cache is allowed (no rows are dropped). Registration cannot see the per-call
+    /// cache; use <see cref="RegisterAbortableTap(HiddenStateTapSubscription, Func{HiddenStateSample, HookResult}, IKvCache)"/> to
+    /// validate the cache kind up front.
     /// A throwing callback (any tap) restores KV and recurrent state to forward entry before the exception propagates.
     /// </summary>
     IDisposable RegisterAbortableTap(HiddenStateTapSubscription subscription, Func<HiddenStateSample, HookResult> onSample);
+
+    /// <summary>
+    /// As <see cref="RegisterAbortableTap(HiddenStateTapSubscription, Func{HiddenStateSample, HookResult})"/>, but also validates the
+    /// cache kind immediately, before anything is registered: refused when <paramref name="cache"/> drops rows (compact sliding-window or
+    /// full-precision-window cache, <see cref="IKvCache.SupportsAbortRollback"/> false), because an abort could not restore it.
+    /// A full-history cache is accepted even for a model with sliding-window layers. Default implementation validates, then registers.
+    /// </summary>
+    /// <param name="subscription">What to sample.</param>
+    /// <param name="onSample">The callback.</param>
+    /// <param name="cache">The cache the tap will run against.</param>
+    /// <exception cref="NotSupportedException">The cache cannot roll back; the message names the cache type.</exception>
+    IDisposable RegisterAbortableTap(HiddenStateTapSubscription subscription, Func<HiddenStateSample, HookResult> onSample, IKvCache cache)
+    {
+        AbortableTapKvGuard.ThrowIfCacheCannotAbort(cache);
+        return RegisterAbortableTap(subscription, onSample);
+    }
 
     /// <summary>
     /// Forward pass that reports an abort as <see langword="false"/> instead of throwing <see cref="ForwardAbortedException"/>

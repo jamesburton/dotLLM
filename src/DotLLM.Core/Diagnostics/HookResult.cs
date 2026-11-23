@@ -23,7 +23,7 @@ public abstract record HookResult
     /// <summary>
     /// Stop the forward pass at this point (hidden-state taps only, #1920): the model rolls its KV-cache and
     /// recurrent state back to their values at forward entry and skips the remaining layers and the LM head.
-    /// Valid only from an abortable tap registered through <see cref="IHiddenStateTapHost.RegisterAbortableTap"/>.
+    /// Valid only from an abortable tap registered through <see cref="IHiddenStateTapHost.RegisterAbortableTap(HiddenStateTapSubscription, Func{HiddenStateSample, HookResult})"/>.
     /// </summary>
     public static HookResult AbortForward { get; } = new AbortForwardResult();
 

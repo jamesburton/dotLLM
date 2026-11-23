@@ -48,9 +48,17 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
     public IDisposable RegisterAbortableTap(HiddenStateTapSubscription subscription, Func<HiddenStateSample, HookResult> onSample)
     {
         ArgumentNullException.ThrowIfNull(onSample);
-        DotLLM.Core.Diagnostics.AbortableTapKvGuard.ThrowIfWindowedConfig(Config);
         GuardTapsSupported();
         return TapState.Registry.Register(subscription, null, onSample);
+    }
+
+    /// <inheritdoc/>
+    public IDisposable RegisterAbortableTap(DotLLM.Core.Diagnostics.HiddenStateTapSubscription subscription,
+                                            Func<DotLLM.Core.Diagnostics.HiddenStateSample, DotLLM.Core.Diagnostics.HookResult> onSample,
+                                            DotLLM.Core.Attention.IKvCache cache)
+    {
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.ThrowIfCacheCannotAbort(cache);
+        return RegisterAbortableTap(subscription, onSample);
     }
 
     /// <inheritdoc/>

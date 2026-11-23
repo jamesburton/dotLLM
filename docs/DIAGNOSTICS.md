@@ -95,13 +95,14 @@ checkpoint, and a throwing read-only callback there leaves the recurrent state u
 MTP/DFlash state, and a forward while verify-row snapshots are pending. A windowed cache that cannot truncate is best effort for a read-only tap.
 
 **Abortable-tap refusals (all before any state is touched, identical on every backend).**
-- *Sliding-window models, at registration.* `RegisterAbortableTap` throws `NotSupportedException` when the model's config uses sliding-window
-  attention on any layer (`ModelConfig.SlidingWindowOf`), and
-- *windowed caches, at the first abortable forward.* it throws when the supplied cache has any compact sliding-window layer or full-precision
-  window (`IKvCache.SupportsAbortRollback` is false: `SimpleKvCache`/`VulkanKvCache` with compact windows, `QuantizedKvCache` and
-  `CudaQuantizedKvCache` with an FP window), **independent of the current length**, naming the cache type. The session never fails mid-generation
-  at token N. The older per-forward check (`IKvCache.CanRollbackAfterAppend`) stays as a backstop. Use a cache without windows
-  (`KvGeometry.FromConfig(config)`) or a read-only tap.
+- *Cache kind, not model config (ruling 2026-11-23).* An abortable tap is refused only when the cache actually DROPS rows and so cannot roll
+  back: `IKvCache.SupportsAbortRollback` is false (`SimpleKvCache`/`VulkanKvCache` with compact sliding windows, `QuantizedKvCache` and
+  `CudaQuantizedKvCache` with an FP window). A model with sliding-window attention layers (e.g. Mistral) running on a **full-history** cache
+  (`KvGeometry.FromConfig(config)`, rows never dropped) may use early exit. The refusal is **independent of the current length** and names the
+  cache type, so a session never fails mid-generation at token N. It is raised (a) up front by
+  `RegisterAbortableTap(subscription, callback, IKvCache cache)` (default interface method, also implemented on all nine hosts), which
+  validates the cache kind before registering, and (b) for callers of the plain two-argument overload, at the first abortable forward. The older
+  per-forward check (`IKvCache.CanRollbackAfterAppend`) stays as a backstop. Use a full-history cache or a read-only tap.
 - *`ForwardBatch`.* An abortable tap is refused in `ForwardBatch` (an abort of request i would leave requests 0..i-1 committed and the rest unrun);
   call `Forward`/`TryForward` per sequence. Read-only taps are unchanged.
 - *MTP/DFlash state.* An abortable tap on a forward that carries an MTP/DFlash state is refused (the checkpoint does not cover the head). A

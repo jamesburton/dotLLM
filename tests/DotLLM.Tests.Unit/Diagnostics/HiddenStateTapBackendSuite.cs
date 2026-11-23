@@ -632,17 +632,68 @@ public abstract class HiddenStateTapBackendSuite
         Assert.Equal(1, n);
     }
 
-    /// <summary>Ruling 3, registration half: a model whose config uses sliding-window attention refuses an abortable tap at registration (a read-only tap still registers).</summary>
+    /// <summary>
+    /// Narrowed ruling (2026-11-23): a model whose config has sliding-window attention layers, running on a FULL-HISTORY cache (rows never
+    /// dropped), may use an abortable tap: registration (config and cache overload) succeeds, the abort fires across the window boundary,
+    /// KV is rolled back, and the next steps equal a control sliding-window model that never aborted.
+    /// </summary>
     [SkippableFact]
-    public void RegisterAbortableTap_OnSlidingWindowConfigModel_IsRefusedAtRegistration()
+    public void Abort_SlidingWindowLayersOnFullHistoryCache_IsAllowed_AndRestoresState()
     {
         using var fx = Open(Llama);
-        var host = fx.NewSlidingWindowConfigHost();
-        Skip.If(host is null, "no sliding-window config model on this host");
+        var hostA = fx.NewSlidingWindowConfigHost();
+        Skip.If(hostA is null, "no sliding-window config model on this host");
+        var hostC = fx.NewSlidingWindowConfigHost()!;
+        var modelA = (IModel)hostA!; var modelC = (IModel)hostC;
+        using var kvA = fx.NewKv(); using var kvC = fx.NewKv();   // full history: the 8-row window is crossed once the prompt (8) grows
+        Assert.True(kvA.SupportsAbortRollback);
+        int[] pp = Enumerable.Range(0, fx.Prompt.Length).ToArray();
+        using (modelA.Forward(fx.Prompt, pp, -1, kvA)) { }
+        using (modelC.Forward(fx.Prompt, pp, -1, kvC)) { }
+
+        var sut = new Aborter(HookPoint.PostLayer, fx.NumLayers - 1);
+        using var h = hostA!.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), sut.OnSample, kvA);   // not refused
+        sut.Armed = true;
+        Assert.False(hostA.TryForward([fx.Prompt[1]], [fx.Prompt.Length], -1, kvA, out var lg, out var abort));
+        Assert.Null(lg);
+        Assert.Equal(new ForwardAbortInfo(fx.NumLayers - 1, HookPoint.PostLayer), abort);
+        Assert.Equal(1, sut.Hits);
+        Assert.Equal(fx.Prompt.Length, kvA.CurrentLength);
+        sut.Armed = false;
+        for (int step = 0; step < 3; step++)
+        {
+            int[] t = [fx.Prompt[(step + 2) % fx.Prompt.Length]];
+            int[] p = [fx.Prompt.Length + step];
+            using var la = modelA.Forward(t, p, -1, kvA);
+            using var lc = modelC.Forward(t, p, -1, kvC);
+            Assert.True(LastRow(la, fx.Vocab).AsSpan().SequenceEqual(LastRow(lc, fx.Vocab)), $"logits differ at step {step}");
+        }
+        Assert.True(fx.KvBytes(kvC).AsSpan().SequenceEqual(fx.KvBytes(kvA)), "KV bytes differ after abort");
+    }
+
+    /// <summary>
+    /// The cache-aware overload validates the cache kind at registration: a dropping (compact-window) cache is refused immediately,
+    /// naming the cache type and registering nothing; the plain overload still defers to the first abortable forward (covered above).
+    /// </summary>
+    [SkippableFact]
+    public void RegisterAbortableTap_CacheOverload_RefusesDroppingCache_UpFront_RegistersNothing()
+    {
+        using var fx = Open(Llama);
+        using var kv = fx.NewWindowedKv(1024);
+        Skip.If(kv is null, "no sliding-window cache on this host");
+        Assert.False(kv!.SupportsAbortRollback);
         var ex = Assert.Throws<NotSupportedException>(() =>
-            host!.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), _ => HookResult.Continue));
-        Assert.Contains("sliding-window", ex.Message);
-        host.RegisterTap(new HiddenStateTapSubscription(null, AllPoints), _ => { }).Dispose();
+            fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), _ => HookResult.Continue, kv));
+        Assert.Contains(kv.GetType().Name, ex.Message);
+        // Nothing was registered: a forward on the windowed cache with no tap works and checkpoints nothing.
+        HiddenStateTapRegistry.PathCounters.Reset();
+        using (fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv)) { }
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.TapForwards);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
+        // A full-history cache is accepted by the same overload.
+        using var full = fx.NewKv();
+        if (fx.SupportsAbortableTaps)
+            fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), _ => HookResult.Continue, full).Dispose();
     }
 
     /// <summary>Read-only taps never checkpoint: only an abortable tap pays for entry state.</summary>

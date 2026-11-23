@@ -94,11 +94,47 @@ public sealed class AbortableTapKvGuardTests
         public void Dispose() { }
     }
 
+    /// <summary>
+    /// Narrowed ruling (2026-11-23): the decision is the CACHE kind. A sliding-window config alone refuses nothing; a dropping cache
+    /// (compact Simple, FP-window Quantized) is refused by the guard the cache-aware registration overload uses; a full-history cache
+    /// built from the very same sliding-window config is accepted.
+    /// </summary>
     [Fact]
-    public void ThrowIfWindowedConfig_RefusesSlidingWindowConfig_NotFullAttention()
+    public void ThrowIfCacheCannotAbort_DecidesOnCacheKind_NotModelConfig()
     {
-        Assert.Throws<NotSupportedException>(() => AbortableTapKvGuard.ThrowIfWindowedConfig(Config()));
-        AbortableTapKvGuard.ThrowIfWindowedConfig(Config() with { SlidingWindowSize = null, SlidingWindowPattern = 0 });
+        using var full = new SimpleKvCache(KvGeometry.FromConfig(Config()), MaxSeq);                 // Config() has sliding-window layers
+        AbortableTapKvGuard.ThrowIfCacheCannotAbort(full);
+        using var compact = new SimpleKvCache(KvGeometry.FromConfig(Config(), compactSlidingWindows: true), MaxSeq);
+        var ex = Assert.Throws<NotSupportedException>(() => AbortableTapKvGuard.ThrowIfCacheCannotAbort(compact));
+        Assert.Contains("SimpleKvCache", ex.Message);
+        using var fp = new QuantizedKvCache(KvGeometry.FromConfig(Config()), MaxSeq, KvCacheDType.Q8_0, KvCacheDType.Q8_0, windowSize: 16);
+        ex = Assert.Throws<NotSupportedException>(() => AbortableTapKvGuard.ThrowIfCacheCannotAbort(fp));
+        Assert.Contains("QuantizedKvCache", ex.Message);
+    }
+
+    /// <summary>The interface default (used by any host that does not override it) validates the cache before registering.</summary>
+    [Fact]
+    public void DefaultInterfaceOverload_ValidatesCache_ThenDelegatesToPlainOverload()
+    {
+        var host = new FakeHost();
+        IHiddenStateTapHost h = host;
+        using var full = new SimpleKvCache(KvGeometry.FromConfig(Config()), MaxSeq);
+        h.RegisterAbortableTap(new HiddenStateTapSubscription(null, [HookPoint.PostLayer]), _ => HookResult.Continue, full).Dispose();
+        Assert.Equal(1, host.Registered);
+        using var compact = new SimpleKvCache(KvGeometry.FromConfig(Config(), compactSlidingWindows: true), MaxSeq);
+        Assert.Throws<NotSupportedException>(() =>
+            h.RegisterAbortableTap(new HiddenStateTapSubscription(null, [HookPoint.PostLayer]), _ => HookResult.Continue, compact));
+        Assert.Equal(1, host.Registered);
+    }
+
+    private sealed class FakeHost : IHiddenStateTapHost
+    {
+        public int Registered;
+        public IDisposable RegisterTap(HiddenStateTapSubscription s, Action<HiddenStateSample> o) => throw new NotSupportedException();
+        public IDisposable RegisterAbortableTap(HiddenStateTapSubscription s, Func<HiddenStateSample, HookResult> o) { Registered++; return new Noop(); }
+        public bool TryForward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, out DotLLM.Core.Tensors.ITensor? l, out ForwardAbortInfo a)
+            => throw new NotSupportedException();
+        private sealed class Noop : IDisposable { public void Dispose() { } }
     }
 
     [Fact]
