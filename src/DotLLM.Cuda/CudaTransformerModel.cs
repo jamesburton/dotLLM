@@ -20,7 +20,7 @@ namespace DotLLM.Cuda;
 /// CUDA stream with no host synchronization until the final logits D2H transfer.
 /// Mirrors <see cref="TransformerModel"/> structure but uses cuBLAS GEMM/GEMV and custom PTX kernels.
 /// </summary>
-public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICudaResidualModifierHost
+public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimitable, ICudaResidualModifierHost
 {
     /// <summary>Optional PostLayer residual modifier (#1919): called after every layer of the eager forward; a set modifier bypasses the decode graphs. Null costs one branch per layer.</summary>
     public ICudaResidualModifier? ResidualModifier { get; set; }
@@ -123,6 +123,10 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
     // pure square-causal global prefill at the prototype head shape (headDim 64). Otherwise
     // the dispatch falls through to G3, then attention_f16.
     private readonly CudaFlashAttention _flashAttention;
+
+    // #1922: split-KV tensor-core decode attention at depth (eager decode, f16 / q8_0 / q4_0 / TurboQuant in place).
+    private readonly CudaDenseDecodeV2 _denseDecodeV2;
+    internal CudaDenseDecodeV2 DenseDecodeV2 => _denseDecodeV2;
 
     /// <inheritdoc/>
     public ModelConfig Config { get; private set; }
@@ -582,6 +586,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
 
         _g3Attention = new CudaG3Attention(kernels);
         _flashAttention = new CudaFlashAttention(kernels);
+        _denseDecodeV2 = new CudaDenseDecodeV2(kernels, config.NumAttentionHeads, config.NumKvHeads, config.HeadDim);
         _useHighPrecisionForward = ShouldUseHighPrecisionForward(weights);
         // The gemma4 forward runs the F32 path and uses the host LM head (the tied
         // vocab x hidden table is too large to expand to F32 device scratch), so it
@@ -1333,12 +1338,21 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
             && _kernels.HasFusedRopeKvWriteKernel && CanCaptureMoeDecode()
             && ForwardMoeDecodeGraph(tokenIds, positions, deviceId, moeKv) is { } graphLogits)
             return graphLogits;
+
+        // #1922 E2: a dense decode step the graphs above did not take (past GraphCaptureMaxDepth, pure-quantized or in-place
+        // TurboQuant KV) runs this eager body captured whole, re-captured every step and pushed with cuGraphExecUpdate.
+        if (!_stepGraphCapturing && !_moeGraphCapturing
+            && StepGraphEligible(tokenIds.Length, suppressGraphCapture, deferredHostDest, isMla, isMoe, kvCache, positions[0])
+            && ForwardStepGraph(tokenIds, positions, deviceId, kvCache!) is { } stepLogits)
+            return stepLogits;
+
         bool capturing = _moeGraphCapturing;
+        bool stepCapturing = _stepGraphCapturing;
 
         // #338: a single-token decode reaching here did NOT use graph replay, whatever
         // UseGraphCapture says. Counted so a test can tell "capture engaged" from "capture
         // was requested and silently declined".
-        if (tokenIds.Length == 1 && !capturing) EagerDecodeCount++;
+        if (tokenIds.Length == 1 && !capturing && !stepCapturing) EagerDecodeCount++;
 
         _context.MakeCurrent();
         int seqLen = tokenIds.Length;
@@ -1370,8 +1384,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
             CudaDriverApi.cuEventRecord(_evtStart, s).ThrowOnError();
         }
 
-        // 1. Upload tokenIds + positions to device (a captured MoE decode has them uploaded before each replay)
-        if (!capturing)
+        // 1. Upload tokenIds + positions to device (a captured MoE / step decode has them uploaded before each replay)
+        if (!capturing && !stepCapturing)
         {
             fixed (int* tokenPtr = tokenIds)
                 CudaDriverApi.cuMemcpyHtoD_v2(_state.TokenIdsDevice, (nint)tokenPtr,
@@ -1649,10 +1663,14 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
                 int seqKv = cudaKvCache.CurrentLength;
                 MarkProfile(ProfileCategory.KvUpdate);
 
-                _kernels.LaunchAttention(qPtr, cudaKvCache.GetKeysPtr(layer),
-                    cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim,
-                    positions[0], slidingWindow, s, lw.AttnSinksDevice);
+                // #1922: split-KV tensor-core decode at depth; otherwise the scalar attention_f16.
+                if (!_denseDecodeV2.TryRun(qPtr, cudaKvCache.GetKeysPtr(layer), cudaKvCache.GetValuesPtr(layer),
+                        KvCacheDType.F32, KvCacheDType.F32, _state.AttnOutput, seqLen, seqKv, positions[0], slidingWindow,
+                        lw.AttnSinksDevice, window: 0, numHeads, numKvHeads, headDim, s))
+                    _kernels.LaunchAttention(qPtr, cudaKvCache.GetKeysPtr(layer),
+                        cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
+                        seqLen, seqKv, numHeads, numKvHeads, headDim,
+                        positions[0], slidingWindow, s, lw.AttnSinksDevice);
             }
             else
             {
@@ -1675,7 +1693,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
                 // pure square-causal global-attention prefill on an eligible device;
                 // otherwise the FP32 CUDA-core attention_f16. Same Q/K/V FP16 buffers and
                 // same row-major [seq, heads, headDim] output either way.
-                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset, bool offsetG3 = false)
+                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset, bool offsetG3 = false,
+                    bool f16Flash = true)
                 {
                     // Long-context prefill on GeForce Ampere → G-flash (fused mma.sync, fewer
                     // FLOPs + no score round-trip). Shorter prefill on Ampere → G3 (cuBLAS+
@@ -1691,6 +1710,12 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
                             numHeads, numKvHeads, headDim))
                         _flashAttention.Run(qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, numHeads, numKvHeads, headDim, s);
+                    // #1923: the fused mma.sync flash prefill (the kvq kernel's F16 entry) for hd64 / hd128, cold or at an offset (a
+                    // later prefill chunk, a prefix-reuse suffix). No score plane: replaces G3's FP32 scores + F16 probs round trip.
+                    else if (f16Flash && UseF16FlashPrefill(EnableF16FlashPrefill, _kernels.HasAttentionFlashPrefillKvq(headDim, null, null),
+                                 seqLen, seqKv, positionOffset, slidingWindow, layerSinks != 0, numHeads, numKvHeads, headDim))
+                        _kernels.LaunchAttentionFlashPrefillKvq(qPtr, kBuf, vBuf, null, null, _state.AttnOutput,
+                            seqLen, seqKv, numHeads, numKvHeads, headDim, positionOffset, s);
                     // #1848: G3's score scratch is quadratic in the prompt and admitted against free VRAM (TryReserve); a
                     // prefill whose scratch does not fit runs attention_f16 below instead of spilling.
                     else if (layerSinks == 0
@@ -1722,7 +1747,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
                         // Test-only oracle (#1850): the pre-#1850 path, dequant into a full-history FP16 scratch + DispatchAttention.
                         var (kCachePtr, vCachePtr) = cudaQKvCache.PrepareReferenceScratch(layer, s, _kernels);
                         MarkProfile(ProfileCategory.KvUpdate);
-                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0], f16Flash: false);   // keeps its pre-#1850 meaning
                     }
                     else
                     {
@@ -1747,11 +1772,12 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
                 else if (kvCache is CudaTurboQuantInPlaceKvCache tqInPlaceCache)
                 {
                     // #1892 (CLAUDE.md rule 2): encode the current rows into codes, rotate Q into K code space, attend over the
-                    // cache only (current rows included, never the fresh K/V), rotate the output back with the V signs. Eager only:
-                    // the graph-capture gate above admits CudaKvCache / windowed CudaQuantizedKvCache, never this type.
+                    // cache only (current rows included, never the fresh K/V), rotate the output back with the V signs. The device-
+                    // scalar graphs never take this type; the step graph (#1922) captures this body as is, one capture per step.
                     MarkProfile(ProfileCategory.KvUpdate);
                     CudaTurboQuantInPlaceAttention.Run(_kernels, tqInPlaceCache, layer, qPtr, kPtr, vPtr, positions, seqLen,
-                        numHeads, numKvHeads, headDim, slidingWindow, layerSinks, _state.AttnOutput, s, EnableKvqFlashPrefill);
+                        numHeads, numKvHeads, headDim, slidingWindow, layerSinks, _state.AttnOutput, s, EnableKvqFlashPrefill,
+                        _denseDecodeV2);
                 }
                 else if (kvCache is CudaKvCache cudaKvCache)
                 {
@@ -2079,14 +2105,14 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
 
         // Decode CUDA-graph capture for this straight-through body is not used here;
         // dev's ForwardDecodeGraph early-return path handles graph replay separately.
-        if (seqLen == 1)
+        if (seqLen == 1 && !stepCapturing)
             DecodeGraphState = CudaDecodeGraphState.Off;
 
         // Capture dispatch-only time (all launches queued, before GPU wait).
         long dispatchEndTs = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
-        // A captured MoE decode ends at the F32 logits; the replay copies them out.
-        if (capturing)
+        // A captured MoE / step decode ends at the F32 logits; the replay copies them out.
+        if (capturing || stepCapturing)
             return null;
 
         // #251 batched-decode path: enqueue a genuinely async D2H copy into caller-owned
@@ -4772,6 +4798,46 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
 
     private static int s_kvqScalarPrefillLogged;
 
+    /// <summary>
+    /// Opt-out for the tensor-core flash prefill over F16 K/V (issue #1923): <c>DOTLLM_CUDA_F16_FLASH_PREFILL=0</c> sends the dense F16
+    /// cache's prefills back to G-flash / G3 / <c>attention_f16</c>. Read once; default on. Mutable so a test can pin the old arms.
+    /// </summary>
+    internal static bool EnableF16FlashPrefill =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_F16_FLASH_PREFILL") != "0";
+
+    /// <summary>
+    /// Whether an F16-K/V attention call (the dense <see cref="CudaKvCache"/>, the paged gather, or the uncached forward) takes the
+    /// F16 entry of <c>attention_flash_mma_prefill_kvq</c> (issue #1923): the <see cref="UseKvqFlashPrefill"/> conditions with no
+    /// FP16 window ring. Pure so it is testable without a GPU.
+    /// </summary>
+    internal static bool UseF16FlashPrefill(bool enabled, bool kernelLoaded, int seqLen, int seqKv, int positionOffset,
+        int slidingWindow, bool hasSinks, int numHeads, int numKvHeads, int headDim)
+        => UseKvqFlashPrefill(enabled, kernelLoaded, seqLen, seqKv, positionOffset, slidingWindow, hasSinks, window: 0,
+            numHeads, numKvHeads, headDim);
+
+    /// <summary>
+    /// Whether the F16 flash prefill (<see cref="UseF16FlashPrefill"/>) serves every prefill of at least
+    /// <see cref="KvqFlashPrefillMinRows"/> rows on this model, so G3 only ever sees shorter prefills (its plane is then at most
+    /// numHeads x 15^2 elements and needs no fixed charge in the context fit). Sliding-window and sink layers never reach G3 either.
+    /// </summary>
+    private bool F16FlashPrefillCoversModel
+        => F16FlashPrefillCovers(EnableF16FlashPrefill, Core.Attention.KvGeometry.FromConfig(Config).IsUniform,
+            _kernels.HasAttentionFlashPrefillKvq(Config.HeadDim, null, null),
+            Config.NumAttentionHeads, Config.NumKvHeads, Config.HeadDim);
+
+    /// <summary>Pure form of <see cref="F16FlashPrefillCoversModel"/> (testable without a GPU).</summary>
+    internal static bool F16FlashPrefillCovers(bool enabled, bool uniformGeometry, bool kernelLoaded,
+        int numHeads, int numKvHeads, int headDim)
+        => enabled && uniformGeometry && kernelLoaded
+        && CudaKernels.IsAttentionFlashPrefillKvqShape(numHeads, numKvHeads, headDim);
+
+    /// <summary>
+    /// Whether the dense context fit charges (and keeps) a G3 score plane for <paramref name="kv"/> (#1850, #1923): only when G3 can
+    /// serve the cache (<see cref="G3ServesKvCache"/>) and the F16 flash prefill does not already take every prefill G3 would.
+    /// </summary>
+    internal static bool G3PlaneCharged(KvCacheConfig kv, bool f16FlashCoversModel)
+        => G3ServesKvCache(kv) && !f16FlashCoversModel;
+
     /// <summary>The model's kernel set (tests: which optional kernels loaded on this device).</summary>
     internal CudaKernels Kernels => _kernels;
 
@@ -4807,6 +4873,12 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
                 cache.KeyDType, cache.ValueDType, _state.AttnOutput, seqLen, seqKv, numHeads, numKvHeads, headDim, positionOffset, s);
             return;
         }
+
+        // #1922: split-KV tensor-core decode at depth over the quantized rows in place (pure quantized only: window == 0).
+        if (_denseDecodeV2.TryRun(qPtr, cache.GetQuantizedKeysPtr(layer), cache.GetQuantizedValuesPtr(layer),
+                cache.KeyDType, cache.ValueDType, _state.AttnOutput, seqLen, seqKv, positionOffset, slidingWindow, sinks, window,
+                numHeads, numKvHeads, headDim, s))
+            return;
 
         if (seqLen >= KvqFlashPrefillMinRows && Interlocked.Exchange(ref s_kvqScalarPrefillLogged, 1) == 0)
             Console.Error.WriteLine(
@@ -5052,7 +5124,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
         // #1850: a q8_0 / q4_0 cache reads in place (attention_kvq / the tensor-core kvq prefill), so G3's plane is never used
         // over it: free a plane warm-up left behind and charge none, instead of losing up to RetainedMaxElems x 6 B (384 MiB) of
         // window to it.
-        bool g3Serves = G3ServesKvCache(kv);
+        // #1923: likewise when the F16 flash prefill serves every prefill of 16+ rows (G3 then only sees shorter ones, whose plane
+        // is a few tens of KiB and admitted per prefill by TryReserve).
+        bool g3Serves = G3PlaneCharged(kv, F16FlashPrefillCoversModel);
         if (!g3Serves && _g3Attention.PlaneElems > 0)
         {
             _stream.Synchronize();   // the plane may still be read by queued work
@@ -5181,6 +5255,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable, ICu
         _context.MakeCurrent();
         CudaMemTrace.Dump("CudaTransformerModel.Dispose");
         ReportLaunchProfile();
+        DisposeStepGraph();          // the exec first: it was captured against the scratch below
+        _denseDecodeV2.Dispose();
         _cudaLora?.Dispose();
         DisposeDecodeGraph();
         DisposeMoeGraph();

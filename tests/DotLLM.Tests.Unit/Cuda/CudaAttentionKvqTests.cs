@@ -106,6 +106,13 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
         [KvCacheDType.Q4_0, KvCacheDType.Q4_0, 128, 16, 2, 33, 50],    // group 8
         [KvCacheDType.Q8_0, KvCacheDType.Q4_0, 128, 8, 2, 17, 0],
         [KvCacheDType.Q4_0, KvCacheDType.Q8_0, 64, 6, 2, 64, 30],
+        // #1923 raw cp.async staging: odd KV head counts (head rows at 8- / 4-byte but not 16-byte offsets), seqKv = 16n + 1 (the
+        // tail clamp reads the last row; the NaN guard rows past the cache catch an unclamped read), a 4K-key history, and
+        // K Q8_0 with V Q4_0 at hd64.
+        [KvCacheDType.Q8_0, KvCacheDType.Q8_0, 128, 12, 3, 33, 288],
+        [KvCacheDType.Q4_0, KvCacheDType.Q4_0, 128, 15, 5, 40, 4057],
+        [KvCacheDType.Q8_0, KvCacheDType.Q4_0, 64, 9, 3, 47, 2002],
+        [KvCacheDType.Q4_0, KvCacheDType.Q8_0, 64, 6, 3, 17, 0],
     ];
 
     [SkippableTheory]
@@ -152,6 +159,127 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
     }
 
     /// <summary>
+    /// #1923: the staged packed-half2 decoders against the F16 entry over the eager dequant, with a third of the blocks scaled so
+    /// small that their F16 scale d is subnormal. Bit identity holds only if mul.rn.f16x2 rounds a subnormal product as
+    /// __float2half(d * (float)q) does; the regular FlashCases never produce a subnormal d.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(KvCacheDType.Q8_0, KvCacheDType.Q8_0, 128, 16, 4, 33, 291)]
+    [InlineData(KvCacheDType.Q4_0, KvCacheDType.Q4_0, 128, 12, 3, 40, 57)]
+    [InlineData(KvCacheDType.Q8_0, KvCacheDType.Q4_0, 64, 6, 2, 17, 30)]
+    public void FlashPrefillKvq_SubnormalBlockScales_MatchItsF16EntryBitForBit(KvCacheDType kFmt, KvCacheDType vFmt, int headDim,
+        int numHeads, int numKvHeads, int seqQ, int offset)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null, "PTX kernels not available");
+        Skip.IfNot(_kernels!.HasAttentionFlashPrefillKvq(headDim, kFmt, vFmt) && _kernels.HasAttentionFlashPrefillKvq(headDim, null, null),
+            "flash prefill kvq kernel not loaded (needs Ampere+)");
+        int seqKv = offset + seqQ;
+        using var f = new Fixture(this, kFmt, vFmt, headDim, numHeads, numKvHeads, seqQ, seqKv, seqKv, window: 0, sinks: false,
+            tinyBlocks: true);
+        _kernels.LaunchAttentionFlashPrefillKvq(f.Q, f.KScratch, f.VScratch, null, null, f.OutRef,
+            seqQ, seqKv, numHeads, numKvHeads, headDim, offset, _stream!.Handle);
+        _kernels.LaunchAttentionFlashPrefillKvq(f.Q, f.KQuant, f.VQuant, kFmt, vFmt, f.OutNew,
+            seqQ, seqKv, numHeads, numKvHeads, headDim, offset, _stream.Handle);
+        _stream.Synchronize();
+        ushort[] f16 = f.Read(f.OutRef), quant = f.Read(f.OutNew);
+        AssertFinite(quant);
+        int diff = FirstDiff(f16, quant);
+        Assert.True(diff < 0, $"quantized flash entry differs from the F16 entry at element {diff} with subnormal block scales");
+    }
+
+    public static IEnumerable<object[]> F16FlashCases() =>
+    [
+        // headDim, numHeads, numKvHeads, seqQ, offset  (seqKv = offset + seqQ, never a multiple of 16)
+        [128, 32, 8, 1000, 1024],   // Qwen3-4B shape, a later 1024-row chunk (partial last q-tile)
+        [128, 32, 8, 33, 0],        // cold, two q-tiles + 1 row
+        [128, 32, 8, 1000, 291],    // offset off the 16-row grid
+        [128, 16, 2, 33, 1024],     // group 8
+        [64, 14, 2, 1000, 291],     // Qwen2.5-0.5B shape, group 7
+        [64, 14, 2, 33, 0],
+    ];
+
+    /// <summary>
+    /// Issue #1923: the kvq kernel's F16 entry, which now serves the dense F16 cache's prefills, against the scalar
+    /// <c>attention_f16</c> it replaces (and G3 replaced before it), on F16 K/V with block-varying amplitude. Non-degenerate shapes:
+    /// several KV heads with group 2..8 (a head-mapping bug shows), seqQ and seqKv off every tile, offsets off the q-tile grid.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(F16FlashCases))]
+    public void FlashPrefillF16Entry_AgreesWithAttentionF16(int headDim, int numHeads, int numKvHeads, int seqQ, int offset)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null, "PTX kernels not available");
+        Skip.IfNot(_kernels!.HasAttentionFlashPrefillKvq(headDim, null, null), "flash prefill F16 entry not loaded (needs Ampere+)");
+        int seqKv = offset + seqQ;
+        // The scratch of a Q8_0 fixture is plain F16 K/V (the dequantized rows); only it is read here.
+        using var f = new Fixture(this, KvCacheDType.Q8_0, KvCacheDType.Q8_0, headDim, numHeads, numKvHeads, seqQ, seqKv, seqKv,
+            window: 0, sinks: false);
+
+        long launches = CudaKernels.AttentionFlashPrefillF16Launches;
+        _kernels.LaunchAttention(f.Q, f.KScratch, f.VScratch, f.OutRef, seqQ, seqKv, numHeads, numKvHeads, headDim,
+            offset, 0, _stream!.Handle);
+        _kernels.LaunchAttentionFlashPrefillKvq(f.Q, f.KScratch, f.VScratch, null, null, f.OutNew,
+            seqQ, seqKv, numHeads, numKvHeads, headDim, offset, _stream.Handle);
+        _stream.Synchronize();
+        Assert.Equal(launches + 1, CudaKernels.AttentionFlashPrefillF16Launches);
+
+        ushort[] reference = f.Read(f.OutRef), flash = f.Read(f.OutNew);
+        AssertFinite(flash);
+        double worst = 0;
+        int worstAt = 0;
+        for (int i = 0; i < reference.Length; i++)
+        {
+            double a = HalfToFloat(flash[i]), b = HalfToFloat(reference[i]);
+            double err = Math.Abs(a - b) / (3e-3 + 3e-3 * Math.Abs(b));
+            if (err > worst) { worst = err; worstAt = i; }
+        }
+        _out.WriteLine($"F16 hd{headDim} {numHeads}/{numKvHeads} seqQ {seqQ} offset {offset}: worst normalised error {worst:F3} at " +
+                       $"{worstAt} ({HalfToFloat(flash[worstAt])} vs attention_f16 {HalfToFloat(reference[worstAt])})");
+        Assert.True(worst <= 1.0, $"F16 flash prefill disagrees with attention_f16 at {worstAt}: " +
+            $"{HalfToFloat(flash[worstAt])} vs {HalfToFloat(reference[worstAt])}");
+    }
+
+    /// <summary>
+    /// Opt-in microbench (#1923, <c>DOTLLM_CUDA_KVQ_BENCH=1</c>): wall time per launch of the flash prefill kvq entries on one
+    /// 1024-row chunk at depth (Qwen3-4B shape, 32/8/128), F16 vs Q8_0 vs Q4_0 K/V. Same-process relative figures only.
+    /// Optional <c>DOTLLM_CUDA_KVQ_BENCH_DEPTH</c> (default 15360 cached rows before the chunk).
+    /// </summary>
+    [SkippableFact]
+    public void FlashPrefillKvq_Microbench()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_CUDA_KVQ_BENCH") == "1", "DOTLLM_CUDA_KVQ_BENCH=1 not set");
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null || !_kernels.HasAttentionFlashPrefillKvq(128, null, null), "flash prefill kvq kernel not loaded");
+        int offset = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CUDA_KVQ_BENCH_DEPTH"), out int d) ? d : 15360;
+        const int seqQ = 1024, heads = 32, kvHeads = 8, hd = 128, reps = 10;
+        int seqKv = offset + seqQ;
+        foreach (var fmt in new[] { KvCacheDType.Q8_0, KvCacheDType.Q4_0 })
+        {
+            using var f = new Fixture(this, fmt, fmt, hd, heads, kvHeads, seqQ, seqKv, seqKv, window: 0, sinks: false);
+            double Time(nint k, nint v, KvCacheDType? kf, KvCacheDType? vf)
+            {
+                for (int i = 0; i < 2; i++)
+                    _kernels!.LaunchAttentionFlashPrefillKvq(f.Q, k, v, kf, vf, f.OutNew, seqQ, seqKv, heads, kvHeads, hd, offset, _stream!.Handle);
+                _stream!.Synchronize();
+                double best = double.MaxValue;
+                for (int r = 0; r < 3; r++)
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < reps; i++)
+                        _kernels!.LaunchAttentionFlashPrefillKvq(f.Q, k, v, kf, vf, f.OutNew, seqQ, seqKv, heads, kvHeads, hd, offset, _stream.Handle);
+                    _stream.Synchronize();
+                    best = Math.Min(best, sw.Elapsed.TotalMilliseconds / reps);
+                }
+                return best;
+            }
+            double tF16 = Time(f.KScratch, f.VScratch, null, null), tQ = Time(f.KQuant, f.VQuant, fmt, fmt);
+            double tF16b = Time(f.KScratch, f.VScratch, null, null);
+            _out.WriteLine($"depth {offset} + {seqQ} rows: f16f16 {tF16:F3} / {tF16b:F3} ms, {fmt} {tQ:F3} ms, {fmt}/f16 {tQ / Math.Min(tF16, tF16b):F3}");
+        }
+    }
+
+    /// <summary>
     /// The quantize step that feeds both paths: one launch over a run of rows writes the same bytes as one launch per row (#1845's
     /// batching relies on it).
     /// </summary>
@@ -194,12 +322,12 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
         private readonly int _outElems;
 
         public Fixture(CudaAttentionKvqTests t, KvCacheDType kFmt, KvCacheDType vFmt, int headDim, int numHeads, int numKvHeads,
-            int seqQ, int seqKv, int quantLen, int window, bool sinks)
+            int seqQ, int seqKv, int quantLen, int window, bool sinks, bool tinyBlocks = false)
         {
             int stride = numKvHeads * headDim;
             var rng = new Random(1850 + headDim + seqKv + quantLen);
             // True K/V history, block-varying amplitude; and "wrong" rows for regions that must not be read.
-            float[] k = Rows(rng, seqKv, stride, 1.0f), v = Rows(rng, seqKv, stride, 0.8f);
+            float[] k = Rows(rng, seqKv, stride, 1.0f, tinyBlocks), v = Rows(rng, seqKv, stride, 0.8f, tinyBlocks);
             float[] kWrong = Rows(rng, seqKv, stride, 2.5f), vWrong = Rows(rng, seqKv, stride, 2.0f);
 
             var q = new ushort[seqQ * numHeads * headDim];
@@ -272,13 +400,15 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
             foreach (nint p in _allocs) CudaDriverApi.cuMemFree_v2(p);
         }
 
-        private static float[] Rows(Random rng, int rows, int stride, float scale)
+        // tinyBlocks: every third 32-block has amplitude 2e-4, so its Q8_0 / Q4_0 scale d is an F16 subnormal (< 6.1e-5): the regime
+        // where the packed-half2 decoder's mul.rn.f16x2 must still equal __float2half(d * (float)q) (#1923).
+        private static float[] Rows(Random rng, int rows, int stride, float scale, bool tinyBlocks = false)
         {
             var a = new float[rows * stride];
             for (int r = 0; r < rows; r++)
                 for (int i = 0; i < stride; i++)
                 {
-                    float amp = scale * (0.25f + 0.5f * ((r * 7 + i / 32) % 5));
+                    float amp = tinyBlocks && (r + i / 32) % 3 == 0 ? 2e-4f : scale * (0.25f + 0.5f * ((r * 7 + i / 32) % 5));
                     a[r * stride + i] = (float)(rng.NextDouble() * 2 - 1) * amp;
                 }
             return a;
@@ -317,7 +447,12 @@ public sealed unsafe class CudaAttentionKvqTests : IDisposable
         var h = new ushort[rows.Length];
         for (int i = 0; i < h.Length; i++) h[i] = FloatToHalf(rows[i]);
         nint src = Upload(h);
-        nint dst = Alloc((long)count * (stride / 32) * (fmt == KvCacheDType.Q8_0 ? 34 : 18));
+        long bytes = (long)count * (stride / 32) * (fmt == KvCacheDType.Q8_0 ? 34 : 18);
+        // 16 guard rows of 0xFF past the cache (#1923): every block scale there is an F16 NaN, so a kernel that reads past seqKv
+        // (an unclamped tail tile) produces NaN instead of silently reading zeros.
+        long guard = 16L * (stride / 32) * (fmt == KvCacheDType.Q8_0 ? 34 : 18);
+        nint dst = Alloc(bytes + guard);
+        CudaDriverApi.cuMemsetD8_v2(dst + (nint)bytes, 0xFF, (nuint)guard).ThrowOnError();
         _kernels!.LaunchQuantKv(src, dst, count * stride, fmt, _stream!.Handle);
         _stream.Synchronize();
         CudaDriverApi.cuMemFree_v2(src);

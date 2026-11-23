@@ -72,6 +72,8 @@ public sealed class CudaQuantizedKvInPlaceParityTests
     public void ScalarArm_IsBitIdenticalToTheLegacyScratchPath(int window)
     {
         using var env = Load(out var model, out int[] prompt);
+        // #1922: past 512 rows the pure-quantized decode takes the dense v2 kernel; this test gates the scalar attention_kvq arm.
+        using var scalarOnly = StaticToggle.DenseV2(false, CudaDenseDecodeV2.MinSeqKv);
         bool g3 = CudaG3Attention.Enabled, flash = CudaFlashAttention.Enabled, kvqFlash = CudaTransformerModel.EnableKvqFlashPrefill;
         int depth = CudaTransformerModel.GraphCaptureMaxDepth;
         CudaG3Attention.Enabled = false;

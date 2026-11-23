@@ -39,7 +39,7 @@ internal static class CudaTurboQuantInPlaceAttention
     internal static bool Run(CudaKernels kernels, CudaTurboQuantInPlaceKvCache cache, int layer,
         nint q, nint kFresh, nint vFresh, ReadOnlySpan<int> positions, int seqLen,
         int numHeads, int numKvHeads, int headDim, int slidingWindow, nint sinks, nint output, nint stream,
-        bool flashEnabled)
+        bool flashEnabled, CudaDenseDecodeV2? denseDecode = null)
     {
         EnsureKernels(kernels);
         if (headDim != cache.Layout.HeadDim || numKvHeads != cache.Layout.NumKvHeads)
@@ -64,6 +64,12 @@ internal static class CudaTurboQuantInPlaceAttention
             kernels.LaunchAttentionFlashPrefillKvTq(q, cache.GetKeyCodesPtr(layer), cache.GetValueCodesPtr(layer),
                 cache.GetKeyNormsPtr(layer), cache.GetValueNormsPtr(layer), cache.CentroidsPtr, output,
                 seqLen, seqKv, numHeads, numKvHeads, headDim, positionOffset, bits, cu, cache.NormFormat, stream);
+        }
+        else if (denseDecode is not null && denseDecode.TryRunTq(q, cache.GetKeyCodesPtr(layer), cache.GetValueCodesPtr(layer),
+                     cache.GetKeyNormsPtr(layer), cache.GetValueNormsPtr(layer), cache.CentroidsPtr, output, seqLen, seqKv, positionOffset,
+                     slidingWindow, sinks, numHeads, numKvHeads, headDim, bits, cu, cache.NormFormat, stream))
+        {
+            // #1922 E3: split-KV tensor-core decode over the codes in place (same code space in and out as attention_kvtq).
         }
         else
         {
