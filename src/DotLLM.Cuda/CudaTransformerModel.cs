@@ -1670,7 +1670,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                 // pure square-causal global-attention prefill on an eligible device;
                 // otherwise the FP32 CUDA-core attention_f16. Same Q/K/V FP16 buffers and
                 // same row-major [seq, heads, headDim] output either way.
-                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset, bool offsetG3 = false)
+                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset, bool offsetG3 = false,
+                    bool f16Flash = true)
                 {
                     // Long-context prefill on GeForce Ampere → G-flash (fused mma.sync, fewer
                     // FLOPs + no score round-trip). Shorter prefill on Ampere → G3 (cuBLAS+
@@ -1686,6 +1687,12 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                             numHeads, numKvHeads, headDim))
                         _flashAttention.Run(qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, numHeads, numKvHeads, headDim, s);
+                    // #1923: the fused mma.sync flash prefill (the kvq kernel's F16 entry) for hd64 / hd128, cold or at an offset (a
+                    // later prefill chunk, a prefix-reuse suffix). No score plane: replaces G3's FP32 scores + F16 probs round trip.
+                    else if (f16Flash && UseF16FlashPrefill(EnableF16FlashPrefill, _kernels.HasAttentionFlashPrefillKvq(headDim, null, null),
+                                 seqLen, seqKv, positionOffset, slidingWindow, layerSinks != 0, numHeads, numKvHeads, headDim))
+                        _kernels.LaunchAttentionFlashPrefillKvq(qPtr, kBuf, vBuf, null, null, _state.AttnOutput,
+                            seqLen, seqKv, numHeads, numKvHeads, headDim, positionOffset, s);
                     // #1848: G3's score scratch is quadratic in the prompt and admitted against free VRAM (TryReserve); a
                     // prefill whose scratch does not fit runs attention_f16 below instead of spilling.
                     else if (layerSinks == 0
@@ -1717,7 +1724,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                         // Test-only oracle (#1850): the pre-#1850 path, dequant into a full-history FP16 scratch + DispatchAttention.
                         var (kCachePtr, vCachePtr) = cudaQKvCache.PrepareReferenceScratch(layer, s, _kernels);
                         MarkProfile(ProfileCategory.KvUpdate);
-                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0], f16Flash: false);   // keeps its pre-#1850 meaning
                     }
                     else
                     {
@@ -4746,6 +4753,46 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
 
     private static int s_kvqScalarPrefillLogged;
 
+    /// <summary>
+    /// Opt-out for the tensor-core flash prefill over F16 K/V (issue #1923): <c>DOTLLM_CUDA_F16_FLASH_PREFILL=0</c> sends the dense F16
+    /// cache's prefills back to G-flash / G3 / <c>attention_f16</c>. Read once; default on. Mutable so a test can pin the old arms.
+    /// </summary>
+    internal static bool EnableF16FlashPrefill =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_F16_FLASH_PREFILL") != "0";
+
+    /// <summary>
+    /// Whether an F16-K/V attention call (the dense <see cref="CudaKvCache"/>, the paged gather, or the uncached forward) takes the
+    /// F16 entry of <c>attention_flash_mma_prefill_kvq</c> (issue #1923): the <see cref="UseKvqFlashPrefill"/> conditions with no
+    /// FP16 window ring. Pure so it is testable without a GPU.
+    /// </summary>
+    internal static bool UseF16FlashPrefill(bool enabled, bool kernelLoaded, int seqLen, int seqKv, int positionOffset,
+        int slidingWindow, bool hasSinks, int numHeads, int numKvHeads, int headDim)
+        => UseKvqFlashPrefill(enabled, kernelLoaded, seqLen, seqKv, positionOffset, slidingWindow, hasSinks, window: 0,
+            numHeads, numKvHeads, headDim);
+
+    /// <summary>
+    /// Whether the F16 flash prefill (<see cref="UseF16FlashPrefill"/>) serves every prefill of at least
+    /// <see cref="KvqFlashPrefillMinRows"/> rows on this model, so G3 only ever sees shorter prefills (its plane is then at most
+    /// numHeads x 15^2 elements and needs no fixed charge in the context fit). Sliding-window and sink layers never reach G3 either.
+    /// </summary>
+    private bool F16FlashPrefillCoversModel
+        => F16FlashPrefillCovers(EnableF16FlashPrefill, Core.Attention.KvGeometry.FromConfig(Config).IsUniform,
+            _kernels.HasAttentionFlashPrefillKvq(Config.HeadDim, null, null),
+            Config.NumAttentionHeads, Config.NumKvHeads, Config.HeadDim);
+
+    /// <summary>Pure form of <see cref="F16FlashPrefillCoversModel"/> (testable without a GPU).</summary>
+    internal static bool F16FlashPrefillCovers(bool enabled, bool uniformGeometry, bool kernelLoaded,
+        int numHeads, int numKvHeads, int headDim)
+        => enabled && uniformGeometry && kernelLoaded
+        && CudaKernels.IsAttentionFlashPrefillKvqShape(numHeads, numKvHeads, headDim);
+
+    /// <summary>
+    /// Whether the dense context fit charges (and keeps) a G3 score plane for <paramref name="kv"/> (#1850, #1923): only when G3 can
+    /// serve the cache (<see cref="G3ServesKvCache"/>) and the F16 flash prefill does not already take every prefill G3 would.
+    /// </summary>
+    internal static bool G3PlaneCharged(KvCacheConfig kv, bool f16FlashCoversModel)
+        => G3ServesKvCache(kv) && !f16FlashCoversModel;
+
     /// <summary>The model's kernel set (tests: which optional kernels loaded on this device).</summary>
     internal CudaKernels Kernels => _kernels;
 
@@ -5026,7 +5073,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         // #1850: a q8_0 / q4_0 cache reads in place (attention_kvq / the tensor-core kvq prefill), so G3's plane is never used
         // over it: free a plane warm-up left behind and charge none, instead of losing up to RetainedMaxElems x 6 B (384 MiB) of
         // window to it.
-        bool g3Serves = G3ServesKvCache(kv);
+        // #1923: likewise when the F16 flash prefill serves every prefill of 16+ rows (G3 then only sees shorter ones, whose plane
+        // is a few tens of KiB and admitted per prefill by TryReserve).
+        bool g3Serves = G3PlaneCharged(kv, F16FlashPrefillCoversModel);
         if (!g3Serves && _g3Attention.PlaneElems > 0)
         {
             _stream.Synchronize();   // the plane may still be read by queued work
