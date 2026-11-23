@@ -82,8 +82,13 @@ internal sealed class CudaHiddenStateTapFixture : HiddenStateTapFixture
     public override int Vocab => _config.VocabSize;
     public override int[] Prompt { get; }
 
-    /// <summary>CUDA has no packed-matmul batch: a tapped batch runs per request, as the untapped hybrids already do, so the counter never moves.</summary>
-    public override bool ExpectsPackedBatchFallback => false;
+    /// <summary>
+    /// CUDA has no packed-matmul batch. The dense host's tapped ForwardBatch leaves the deferred pinned-logits batch for a per-request loop
+    /// (<c>CudaTransformerModel.ForwardBatchTapped</c>) and bumps the counter once (first CUDA run, 2026-11-23); the two hybrid hosts only ever
+    /// had the per-request interface-default loop (no override of a packed path), so for them the counter never moves. A ForwardBatchTapped that
+    /// stopped bumping fails the Llama arm (expected 1, actual 0).
+    /// </summary>
+    public override bool ExpectsPackedBatchFallback => Family == HiddenStateTapBackendSuite.Llama;
 
     /// <summary>The GDN-hybrid MoE host takes an abortable tap only once it can checkpoint its recurrent state (#1919).</summary>
     public override bool SupportsAbortableTaps
@@ -263,6 +268,16 @@ public sealed class HiddenStateTapCudaTests : HiddenStateTapBackendSuite
     public void DecodeGraph_IsBypassed_WhenATapIsAttached(string family)
     {
         string ptx = RequireCuda();
+        // Watchdog: a bypass defect (a graph launched with a tap attached) wedged the test host in a mutant run. Run on a background thread
+        // (fixture creation and disposal included, so a stuck stream cannot hang the test thread) and turn a hang into a test failure.
+        var body = Task.Factory.StartNew(() => DecodeGraphBypassBody(family, ptx), TaskCreationOptions.LongRunning);
+        if (!body.Wait(TimeSpan.FromSeconds(60)))
+            Assert.Fail($"{family}: the tapped decode step did not finish within 60 s (decode graph not bypassed with a tap attached?)");
+        body.GetAwaiter().GetResult();   // rethrows the body's failure or skip unwrapped
+    }
+
+    private static void DecodeGraphBypassBody(string family, string ptx)
+    {
         using var fx = new CudaHiddenStateTapFixture(family, ptx, graphs: true);
         using var kv = fx.NewKv();
         int[] pp = Enumerable.Range(0, fx.Prompt.Length).ToArray();
