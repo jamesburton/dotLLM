@@ -266,6 +266,10 @@ public sealed class CudaAdmissionTests
     public void F16FlashPrefillCoveringTheModel_RemovesTheG3PlaneCharge()
     {
         var f16 = new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32);
+        // The claim rests on G3's offset path never taking a prefill the flash entry would (it needs >= 32 rows, flash >= 16). With
+        // a lower offset minimum an uncharged offset plane of up to 384 MiB could be asked for (#1923 review M3).
+        Assert.True(CudaG3Attention.OffsetMinQueryRows >= CudaTransformerModel.KvqFlashPrefillMinRows,
+            $"G3 offset minimum {CudaG3Attention.OffsetMinQueryRows} < flash minimum {CudaTransformerModel.KvqFlashPrefillMinRows}");
         bool Covers(bool enabled = true, bool uniform = true, bool loaded = true, int heads = 32, int kvHeads = 8, int headDim = 128)
             => CudaTransformerModel.F16FlashPrefillCovers(enabled, uniform, loaded, heads, kvHeads, headDim);
 
