@@ -298,7 +298,7 @@ public sealed class ChunkCacheEndpointTests : IDisposable
         ctx.Request.Headers["X-API-Key"] = KeyB;
         var caller = ChunkCacheAuth.Resolve(ctx, server.State.Options.ChunkCache, out var failure);
         Assert.Equal(ChunkAuthFailure.None, failure);
-        Assert.Equal(new ChunkCaller(true, ChunkNamespace.ForApiKey(KeyB)) { IsAdmin = true }, caller);
+        Assert.Equal(new ChunkCaller(true, ChunkNamespace.ForApiKey(KeyB)) { IsAdmin = true, IsAdminKey = true }, caller);
         Assert.DoesNotContain(caller.Namespace, caller.ToString(), StringComparison.Ordinal);
 
         // Two X-API-Key values (HttpClient folds them into one line; a raw client can send two) are ambiguous: no key.

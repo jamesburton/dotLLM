@@ -66,7 +66,7 @@ public sealed unsafe class TurboQuantInPlaceHistoryProbeTests
     [Fact]
     public void HistoryIsNeverDecodedWhole()
     {
-        const int rows = 16384, reps = 20;
+        const int rows = 65536, reps = 4;   // 64 MiB decoded per side: dwarfs the ~16 MiB of GC-commit noise seen on a slow (scalar) CI tier
         var (cache, q) = Build(rows);
         using var _ = cache;
         var o = new float[NumHeads * Hd];
@@ -80,22 +80,28 @@ public sealed unsafe class TurboQuantInPlaceHistoryProbeTests
         long managedPerCall = (GC.GetTotalAllocatedBytes(precise: true) - before) / reps;
         Assert.True(managedPerCall < oneSideDecoded / 8, $"allocated {managedPerCall} managed bytes per call (decoded side = {oneSideDecoded})");
 
-        // Peak private (committed) memory, sampled with a sleep so the sampler does not load the CPU the workers use.
+        // Peak private (committed) memory. Managed commit moves with the GC's gen0 budget, not only with what the kernel allocates
+        // (the sampler itself allocates in Process.Refresh, and a slow tier runs longer), so the managed bytes allocated by ALL threads
+        // during the window are subtracted: what is left is native growth, which is what a whole-history decode would add.
         GC.Collect();
         using var proc = Process.GetCurrentProcess();
         proc.Refresh();
         long baseline = proc.PrivateMemorySize64, peak = baseline;
+        long managedBefore = GC.GetTotalAllocatedBytes(precise: true);
         bool stop = false;
         var sampler = new Thread(() =>
         {
             using var p = Process.GetCurrentProcess();
-            while (!Volatile.Read(ref stop)) { p.Refresh(); long x = p.PrivateMemorySize64; if (x > peak) peak = x; Thread.Sleep(1); }
+            while (!Volatile.Read(ref stop)) { p.Refresh(); long x = p.PrivateMemorySize64; if (x > peak) peak = x; Thread.Sleep(5); }
         }) { IsBackground = true };
         sampler.Start();
         for (int i = 0; i < reps; i++) Attend(cache, q, o, rows);
         Volatile.Write(ref stop, true);
         sampler.Join();
-        Assert.True(peak - baseline < oneSideDecoded / 2, $"peak private memory grew by {peak - baseline} bytes (decoded side = {oneSideDecoded})");
+        long managedDuring = GC.GetTotalAllocatedBytes(precise: true) - managedBefore;
+        long nativeGrowth = peak - baseline - managedDuring;
+        Assert.True(nativeGrowth < oneSideDecoded / 2,
+            $"peak private memory grew by {peak - baseline} bytes, {managedDuring} of them managed, leaving {nativeGrowth} native (decoded side = {oneSideDecoded})");
 
         Assert.Throws<NotSupportedException>(() => { cache.GetKeysRef(0); });
         Assert.Equal(cache.Layout.CodeBytesPerLayer(rows) * 2 + cache.Layout.NormBytesPerLayer(rows) * 2, cache.AllocatedBytes);

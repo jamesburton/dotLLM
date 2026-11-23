@@ -190,6 +190,14 @@ internal sealed class VulkanGptOssKernels : IDisposable
         return true;
     }
 
+    /// <summary>Drops the TurboQuant sink twin (a refused or failed twin-set build must not leave a stale layout behind).</summary>
+    internal void DisposeTurboQuantSinks()
+    {
+        _attnSinksTq?.Dispose();
+        _attnSinksTq = null;
+        _attnSinksTqLayout = default;
+    }
+
     internal void InvalidateDescriptorCaches()
     {
         _attnSinksTq?.InvalidateDescriptorCache();

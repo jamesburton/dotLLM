@@ -180,6 +180,10 @@ keeps the output exact, so tune by acceptance × cost, not KL (#1095 measured no
 duplicated (64 MiB × 2 at 128k on Llama-8B); F16 tables from F32 angles are not measured (#1142).
 
 **Split partials.** *m*/*ℓ* stay F32 (a few KB); O partials and split-K slabs to F16 are not measured (#1144).
+CUDA dense decode (#1922) stores its split-KV O partials **normalised** (o/ℓ, bounded by max|v|) in **F16** with *m*, *ℓ*
+F32 (James's ruling, 2026-11-20; the unnormalised form overflows F16 on a long split, guarded by a flat-score |V|≈20 32K test).
+Kernel level (RTX 3060, F64 oracle over F16 inputs): max |err| F16 partials vs F32 partials 2.9e-4 vs 2.9e-4 at short seqKv,
+1.3e-5 vs 1.1e-5 at 32K; no time difference. Teacher-forced on Qwen3-4B Q4_K_M, 800 decode steps at depth 6,000 (`CudaDenseDecodeQualityGateTests`, framework 2026-11-21), PPL change vs the scalar kernel for F16 / F32 partials: f16 KV -0.057% / -0.044%, q8_0 -0.061% / +0.114%, q4_0 +0.230% / -0.465%, tq4 -0.172% / -0.871%; mean KL vs scalar 6.5e-4 / 6.6e-4 (f16), 9.0e-4 / 9.0e-4 (q8_0), 2.71e-2 / 2.73e-2 (q4_0), 1.99e-2 / 2.16e-2 (tq4). F16 partials are indistinguishable from F32; the q4_0 / tq4 spread is quantized-KV drift digitisation, equal in both arms. Decision (James 2026-11-21, bench 2026-11-22): F16 normalised partials ship, default on together with the step decode graph; the F32-partial control entries were removed, and the scratch is F16 (Qwen3-4B / RTX 3060: about 25 KiB). Kill switches `DOTLLM_CUDA_DENSE_DECODE_V2=0` (kernel) and `DOTLLM_CUDA_STEP_GRAPH=0` (graph).
 
 ---
 
@@ -621,6 +625,21 @@ Decision: **F16, chosen by controller ruling** (`TurboQuantLayout.DefaultNorm`).
 The 10% line at 8 bits cannot be resolved with this instrument (null control +3% to +20%), and F16 is not separable from that control; it has 8x less error than BF16.
 Follow-up: re-check F16 vs BF16 with a deterministic attention-output metric (per-layer relative error on captured K/V) instead of chaotic KL.
 
+### E18 - CUDA TurboQuant prefill rounding points (#1924)
+
+The bit-specialised and staged tensor-core TQ prefill entries (`_tq{bits}`, `_tq{bits}_cpa`) keep the norm out of the tile. The rounding
+points therefore move against the legacy `_tqtq` entry, whose K / V operand is `half(n * c)`:
+- **K side:** the operand is `half(c)` and the norm is applied in F32 after the mma (`S = n_k * (q~ . c)`). This is one rounding fewer
+  than legacy.
+- **V side:** the V operand is `half(c)`, and the norm is folded into the P operand as `half(p * n_v)`.
+- **Softmax sum:** the sum keeps the raw F32 p.
+
+With F16 norms `half(p * n_v)` cannot overflow (p <= 1, n_v <= 65,504). BF16 norms above 65,504, reachable only through the direct
+cache API, could overflow it.
+
+Model-level evidence is `CudaTurboQuantPrefillDepthGate`. The new entries' mean KL to F16 KV must stay within legacy plus a measured
+1-ulp drift band; see KV_CACHE.md "TurboQuant" for the numbers.
+
 ## 6. Decision table: CLAUDE.md rule → evidence
 
 | CLAUDE.md rule (Precision & Expansion) | evidence | verdict |
@@ -658,6 +677,7 @@ PRs #1103, #1122, #1125, #1126.
 | C7 | CPU | MTP KV and hidden F32 | 32 MiB @4096 positions | **KV fixed** (#1141): F16 default (16 MiB), q8_0 (8.5), q4_0 (4.5) when the trunk cache is quantized; hidden stays F32 (#1144); `DOTLLM_CPU_MTP_KV=f32` reference arm | #1141 |
 | C8 | CPU | MLA KV, TurboQuant norms, MoE scatter F32 | per token | open | #1140 |
 | C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence (speculative verify: read-only scan + in-place replay of row inputs, no state copy at all, #1194) | sign-off pending | #1144 |
+| C10 | CPU | chunk store entries (`--chunk-store-write`, `chunkcache build --offline`): F32 K and V rows per layer on disk, encoded through `SimpleKvCache` into managed `float[]` per layer (`ChunkEncoder`) | L8B 256 KiB/token on disk and in the encode (one 512-token chunk: 128 MiB); Qwen3-4B 288 KiB/token | **signed-off temporary exception** (James, 2026-11-20, #1912): the format predates the writer and the chunk key carries the dtype, so a new format is a new cache line, not a migration; target F16 then q8_0 in native memory | #1913 |
 | X1 | CPU | safetensors BF16 → F32 | L8B +16 GB; L1B +2.5 GB | open | #1143 (needs #1118) |
 | X2 | CPU | MLA-MoE routed experts → F32 | ≈57 GB on V2-Lite | open | #1140 |
 | X3 | CPU | MLA projections, shared / Granite-MoE experts → F32 | `Σ out·in·4` | open | #1140 |
@@ -670,7 +690,7 @@ PRs #1103, #1122, #1125, #1126.
 | G3 | CUDA | hybrid forward state F32 (activations, GDN, logits `rows·V·4`) | logits 970 MiB @1024 rows; +486 MiB per 512-row window | open | #1138 (activations), #1137 (logits) |
 | G4 | CUDA | hybrid F32 K/V staging (tiers without flash/kvq) | B2 8 KiB/token | open | #1136 (siblings: #968) |
 | G5 | CUDA | MTP head KV F32, doubled on growth | B2 16,392 B/token | **fixed on dev** (#1095, PR #1126): 1,156 B/token at q4_0 | #979 (duplicate) |
-| G6 | CUDA | G3 attention F32 score matrix | 32 heads @4096 ≈3.2 GB | open | #1134 |
+| G6 | CUDA | G3 attention F32 score matrix | 32 heads @4096 ≈3.2 GB | **gone for dense f16-KV prefills on hd64 / hd128 (group <= 8, 16+ rows)**: they run the fused `attention_flash_mma_prefill_kvq` F16 entry, F32 statistics in registers, no plane (#1923). Open for other shapes (G3 square / offset) | #1134, #1923 |
 | G7 | CUDA | Nemotron-H KV F32; MLA latent / default MLA KV F32 | per token | open | #968 (Nemotron-H), #1140 (MLA) |
 | G8 | CUDA | Gemma F32 KV round-trip + activation scratch | `2·kvLen·kvStride·4` | open | #1134 |
 | G9 | CUDA | split-KV partials F32 | ≈0.8 MB | sign-off pending | #1144 |

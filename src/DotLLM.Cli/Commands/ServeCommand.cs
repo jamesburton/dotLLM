@@ -361,8 +361,34 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         /// <summary>The chunk store the server looks chunks up in (read-only for now).</summary>
         [CommandOption("--chunk-store")]
         [Description("With --chunk-cache: the chunk store (e.g. built by chunkcache build) the server looks annotated chunks up in, to count hits " +
-                     "and plan shadow reuse. Read-only: the server never writes or creates it; a missing directory is reported as chunk_store_unavailable.")]
+                     "and plan shadow reuse. Without --chunk-store-write it is read-only: the server never writes or creates it, and a missing directory " +
+                     "is reported as chunk_store_unavailable. With --chunk-store-write the server owns and writes it.")]
         public string? ChunkStore { get; set; }
+
+        /// <summary>Make the server the store's sole writer (background encode of admitted misses).</summary>
+        [CommandOption("--chunk-store-write")]
+        [Description("With --chunk-store: the server becomes the store's only writer. It owns the directory (a second server on it refuses to start), " +
+                     "keeps the server ledger, and encodes annotated misses in the background while idle (seen in 2+ requests, not volatile / no_store, " +
+                     "not on the secrets deny-list, under --chunk-store-budget). Needs --chunk-store-budget. Off by default: the store is read-only.")]
+        public bool ChunkStoreWrite { get; set; }
+
+        /// <summary>The store's byte budget (required with --chunk-store-write).</summary>
+        [CommandOption("--chunk-store-budget")]
+        [Description("With --chunk-store-write (required there): the store's byte budget, e.g. 20GiB. Over it the server evicts its own least-recently-used " +
+                     "entries (never an entry a chunkcache index references); when nothing can be freed, encoding stops and responses warn chunk_store_unavailable.")]
+        public string? ChunkStoreBudget { get; set; }
+
+        /// <summary>Store only chunks an index references.</summary>
+        [CommandOption("--chunk-store-index-only")]
+        [Description("With --chunk-store-write: store only chunks that a chunkcache index in the store references (built from a scanned, deny-listed tree), " +
+                     "so text from ad-hoc reads is never persisted.")]
+        public bool ChunkStoreIndexOnly { get; set; }
+
+        /// <summary>Per-namespace byte budget (optional; off by default).</summary>
+        [CommandOption("--chunk-store-namespace-budget")]
+        [Description("With --chunk-store-write: the most bytes of entries one namespace (API key) may hold, e.g. 2GiB. When set, budget eviction " +
+                     "takes only the writing namespace's own entries, so one tenant's prewarm never evicts another's. Off by default: one shared LRU.")]
+        public string? ChunkStoreNamespaceBudget { get; set; }
 
         /// <summary>The API keys of the chunk-cache surface (off by default: loopback callers only).</summary>
         [CommandOption("--chunk-cache-api-keys")]
@@ -382,7 +408,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         {
             try { ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget, PromptCacheStep, PromptCacheStepKeep); }
             catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
-            try { DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(ChunkCache, ChunkCacheMaxChunks, ChunkStore, ChunkCacheApiKeys, ChunkCacheAllowShortKeys); }
+            try { DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(ChunkCache, ChunkCacheMaxChunks, ChunkStore, ChunkCacheApiKeys, ChunkCacheAllowShortKeys,
+                ChunkStoreWrite, ChunkStoreBudget, ChunkStoreIndexOnly, ChunkStoreNamespaceBudget); }
             catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
             return base.Validate();
         }
@@ -547,7 +574,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             AllowModelAdminApi = settings.AllowModelAdmin,
             Metrics = settings.NoMetrics ? false : settings.Metrics ? true : null,
             AllowLoraAdminApi = settings.AllowLoraAdmin,
-            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(settings.ChunkCache, settings.ChunkCacheMaxChunks, settings.ChunkStore, settings.ChunkCacheApiKeys, settings.ChunkCacheAllowShortKeys),
+            ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(settings.ChunkCache, settings.ChunkCacheMaxChunks, settings.ChunkStore, settings.ChunkCacheApiKeys, settings.ChunkCacheAllowShortKeys,
+                settings.ChunkStoreWrite, settings.ChunkStoreBudget, settings.ChunkStoreIndexOnly, settings.ChunkStoreNamespaceBudget),
             TernaryAdapterPaths = settings.TernaryAdapterPaths is { Length: > 0 } ? settings.TernaryAdapterPaths : null,
             TensorOverlayPath = settings.TensorOverlay,
             OverlaySkipBaseHash = settings.OverlaySkipBaseHash,
@@ -637,6 +665,18 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         var serverOptions = BuildServerOptions(settings, maxMessages);
 
+        // --chunk-store-write: own the store BEFORE the model loads, so a second writer on the same directory fails in
+        // seconds rather than after loading (and holding) a whole model; the writer started later uses this claim.
+        try
+        {
+            serverOptions.ChunkCache.ClaimStoreOwnership();
+        }
+        catch (InvalidServerOptionException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+            return 1;
+        }
+
         ServerState? state = null;
 
         if (!string.IsNullOrEmpty(settings.Model))
@@ -673,7 +713,18 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         }
 
         // Build app (UI enabled unless --no-ui)
-        var app = ServerStartup.BuildApp(state!, [], serveUi: !settings.NoUi);
+        Microsoft.AspNetCore.Builder.WebApplication app;
+        try
+        {
+            app = ServerStartup.BuildApp(state!, [], serveUi: !settings.NoUi);
+        }
+        catch (InvalidServerOptionException ex)
+        {
+            // E.g. --chunk-store-write on a store another server already owns: a clean message, a failing exit code.
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+            state?.Dispose();
+            return 1;
+        }
 
         var url = $"http://{settings.Host}:{settings.Port}";
 

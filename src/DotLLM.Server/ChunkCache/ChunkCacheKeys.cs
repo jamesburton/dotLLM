@@ -66,6 +66,13 @@ public sealed class ChunkCacheKeys
     /// <summary>Configured admin keys.</summary>
     public int AdminCount => _admin.Count(a => a);
 
+    /// <summary>
+    /// The distinct store namespaces the keys map to (an <c>ns=</c> name, else the key's derived
+    /// <see cref="ChunkNamespace.ForApiKey"/>, computed from the digest: the derived namespace is the digest's first 8 bytes).
+    /// </summary>
+    public int NamespaceCount =>
+        _digests.Select((d, i) => _namespaces[i] ?? "k-" + Convert.ToHexStringLower(d.AsSpan(0, 8))).Distinct(StringComparer.Ordinal).Count();
+
     /// <summary>Startup warnings (short keys accepted by the override), naming line numbers only.</summary>
     public IReadOnlyList<string> Warnings { get; }
 

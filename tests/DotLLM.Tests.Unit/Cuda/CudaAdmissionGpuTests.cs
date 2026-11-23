@@ -119,6 +119,37 @@ public sealed class CudaAdmissionGpuTests
             Assert.Equal(reference, Read(logits));
     }
 
+    /// <summary>
+    /// #1923 wiring: <see cref="CudaTransformerModel.MeasureServingContextFit"/> on a model the F16 flash prefill covers
+    /// (Qwen2.5-0.5B, hd64 14/2) charges no G3 plane; with the F16 flash prefill off it charges the full plane. The pure
+    /// <c>CudaAdmissionTests.F16FlashPrefillCoveringTheModel_RemovesTheG3PlaneCharge</c> cannot see the call site (a mutant passing
+    /// <c>false</c> there survives it); this one can: the two fits' fixed bytes differ by exactly the plane.
+    /// </summary>
+    [SkippableFact]
+    public void ServingFit_ChargesNoG3Plane_WhenTheF16FlashPrefillCoversTheModel()
+    {
+        var (ptx, path) = Require();
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptx);
+        Skip.IfNot(CudaG3Attention.Enabled, "G3 is off on this device: there is no plane to charge either way");
+        Skip.IfNot(model.Kernels.HasAttentionFlashPrefillKvq(config.HeadDim, null, null), "F16 flash prefill entry not loaded");
+        var f16 = new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32);
+        bool saved = CudaTransformerModel.EnableF16FlashPrefill;
+        try
+        {
+            CudaTransformerModel.EnableF16FlashPrefill = false;
+            var charged = model.MeasureServingContextFit(f16, 1024);
+            CudaTransformerModel.EnableF16FlashPrefill = true;
+            var covered = model.MeasureServingContextFit(f16, 1024);
+            long plane = CudaTransformerModel.G3PlaneChargeBytes(true, 1024, config.NumAttentionHeads);
+            _out.WriteLine($"F16 flash off: {charged.Describe()}, window {charged.MaxContext}; on: {covered.Describe()}, window {covered.MaxContext}");
+            Assert.Equal(plane, charged.FixedBytes - covered.FixedBytes);
+            Assert.True(covered.MaxContext >= charged.MaxContext);
+        }
+        finally { CudaTransformerModel.EnableF16FlashPrefill = saved; }
+    }
+
     [SkippableFact]
     public void G3ScratchThatDoesNotFit_FallsBackToAttentionF16()
     {
@@ -126,10 +157,11 @@ public sealed class CudaAdmissionGpuTests
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptx);
-        bool savedEnabled = CudaG3Attention.Enabled;
+        bool savedEnabled = CudaG3Attention.Enabled, savedF16Flash = CudaTransformerModel.EnableF16FlashPrefill;
         int n = 400;
         try
         {
+            CudaTransformerModel.EnableF16FlashPrefill = false;   // #1923: a G3 test; the F16 flash prefill would take the call first
             // Reference: G3 off (attention_f16), which also grows the forward scratch to n so the arm below allocates nothing else.
             CudaG3Attention.Enabled = false;
             float[] f16;
@@ -177,6 +209,10 @@ public sealed class CudaAdmissionGpuTests
             }
             finally { CudaAdmission.FreeBytesOverride = saved; }
         }
-        finally { CudaG3Attention.Enabled = savedEnabled; }
+        finally
+        {
+            CudaG3Attention.Enabled = savedEnabled;
+            CudaTransformerModel.EnableF16FlashPrefill = savedF16Flash;
+        }
     }
 }

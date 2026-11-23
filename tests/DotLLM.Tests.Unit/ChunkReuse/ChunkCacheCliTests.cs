@@ -882,16 +882,31 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
     [Fact]
     public void Build_StoreWriteFailure_ExitsOne()
     {
-        // A damaged entry at a chunk's final path, held open by a reader that does not share delete: the store cannot replace
-        // it (ChunkStoreBusyException), the build uses the fresh K/V for nothing and must report the failure.
+        // A directory at a chunk's final path: the store cannot rename the entry over it on any OS (ChunkStoreBusyException),
+        // the build uses the fresh K/V for nothing and must report the failure.
         string tree = NewTree();
         string store = NewDir("store");
-        JsonElement dry = Json(Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--dry-run", "--json"]));
-        string key = dry.GetProperty("would_encode")[0].GetProperty("key").GetString()!;
-        string path = new FileChunkStore(store).PathOf(new ChunkKey(key));
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        string path = FirstEntryPath(tree, store);
+        Directory.CreateDirectory(path);
+        var r = Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--json"]);
+        Assert.Equal(1, r.Code);
+        Assert.Equal(1, JsonDocument.Parse(r.Out).RootElement.GetProperty("store_failures").GetInt32());
+        Directory.Delete(path);
+        Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64"]).Code); // repaired
+        Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
+    }
+
+    [Fact]
+    public void Build_DamagedEntryHeldByReader_WindowsFailsThenRepairs_PosixReplacesAtOnce()
+    {
+        // A damaged entry at a chunk's final path, held open by a reader that does not share delete. Windows cannot rename over
+        // it (ChunkStoreBusyException): the build reports the failure and a later build repairs it. On Linux/macOS rename(2)
+        // replaces it under the reader: the build succeeds at once and the reader keeps reading the old file.
+        string tree = NewTree();
+        string store = NewDir("store");
+        string path = FirstEntryPath(tree, store);
         File.WriteAllBytes(path, [1, 2, 3]);
-        using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
         {
             var r = Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--json"]);
             if (OperatingSystem.IsWindows())
@@ -906,6 +921,15 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
         }
         Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64"]).Code); // repaired
         Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
+    }
+
+    private string FirstEntryPath(string tree, string store)
+    {
+        JsonElement dry = Json(Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--dry-run", "--json"]));
+        string key = dry.GetProperty("would_encode")[0].GetProperty("key").GetString()!;
+        string path = new FileChunkStore(store).PathOf(new ChunkKey(key));
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        return path;
     }
 
     // ------------------------------------------------------------------------------------------------ JSON schemas

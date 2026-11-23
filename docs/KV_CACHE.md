@@ -398,12 +398,44 @@ why; it is never served by another cache (#1888).
   with `-fmad=false` and no fast-math.
 
 **Twins per backend.**
-- CPU: `Attention.Execute` over `ITurboQuantKvCache`, decoding `norm * centroid[code]` one row at a time into a small per-worker row
-  scratch (never the history). `TurboQuantRotation` rotates Q and O.
+- CPU: `Attention.ExecuteTurboQuant` over `ITurboQuantKvCache`, decoding `norm * centroid[code]` (never the history). Decode (one query row)
+  reads one head vector at a time into a per-worker row scratch. Multi-row prefill (`seqQ >= 2`) is flash-style (#1892): 128 query rows at
+  a time, key tiles outer, each K/V tile decoded ONCE into a bounded per-worker tile ring and reused by every row and every head of the
+  GQA group (without it each KV row was decoded once per query row: prefill 12 tok/s vs 37 for the scratch cache on Qwen3-4B tq4 at 7.6K;
+  now 68). Per row the tiles, dots and online softmax are those of the per-row path, so the output is bit-identical (#530). The ring is
+  `2 * TileSize * headDim * 4` bytes per worker (256 KiB at hd 128; 512 KiB with a sliding window, where a row's tile can straddle two grid
+  chunks) and never scales with the cached length. It is a thread-static native buffer, a deliberate bounded exception to deterministic
+  disposal: reused across layers and calls (no hot-path allocation), freed by a finalizer at thread exit, and freed deterministically by
+  `Attention.TrimTurboQuantTileBuffers(pool)`, which `TransformerModel.Dispose` calls. `TurboQuantRotation` rotates Q and O.
 - CUDA (dense, non-paged `CudaTransformerModel`): scalar code-space attention `attention_kvtq` (sinks, sliding window, any GQA
   ratio, head dims up to 256); tensor-core flash prefill `_hd64_tqtq` and `_hd128_tqtq` in `attention_flash_mma_prefill_kvq` (hd256
   uses the scalar body); `tq_rotate_q` / `tq_rotate_o` (and `tq_rotate_o_f16`, which keeps the attention output F16).
   **Decode is eager and never graph-captured** (#1918, same as q8_0 KV today).
+  - Prefill entries (#1924), picked by `DOTLLM_CUDA_TQ_PREFILL=legacy|spec|cpa`. Unset = `cpa` (Staged) for tq2/tq3/tq4/tq8
+    (after #1922's v2 TQ decode merged, Qwen3-4B tq3 briefly went back to legacy: 24/33 top-1 against a fixed floor of legacy 26 - 1,
+    with better KL than legacy; James 2026-11-23 banded top-1 too, the floor now being legacy minus the control arms' own top-1 spread,
+    which was 22-26/33 on that run)
+    (James 2026-11-22: a width is Staged only while its new entries stay within the legacy entry's drift band on the depth gate).
+    The band is the largest mean-KL movement over several 1-ulp perturbations of the legacy entry (softmax scale +-1 and +-2 F32
+    ulps, one stored K or V norm's last bit). At hd128 the +1-ulp scale arm is inert by construction (1/sqrt(128) * log2e rounds
+    to the same F32) and the -2-ulp arm runs the same kernel as -1, so both are dropped; the first tq3 ruling rested on the -1-ulp arm
+    alone (band 7.1% against tq3's +4.3%). With the K / V norm arms (final review, framework a54e871e) the hd128 tq3 band is 7.8e-2
+    (18%) against an excess of 1.8e-2, so tq3 stayed Staged and every width passed on both models (Qwen3-4B hd128, Qwen2.5-0.5B hd64).
+    Re-run after #1922's decode merged (b0ea3724): tq2/tq4/tq8 pass on both models; tq3 passes KL and passes top-1 under the banded floor.
+    Tightest margin: Qwen2.5-0.5B tq2, 5.677 against a limit of 5.686 (that model's codec effect is large at tq2-tq4: KL 3.5-5.7). `legacy` = `_tqtq` (runtime bits,
+    `half(norm * centroid)` per element from global memory). `spec` = `_tq{2,3,4,8}`: norms kept out of the tile (the K norm scales
+    the score, the V norm scales P; the softmax sum keeps the raw P), a shared-memory F16 centroid table, bits compiled in. `cpa` =
+    `_tq{2,3,4,8}_cpa`: `spec` plus `cp.async` staging of the raw code rows one tile ahead and a single decoded tile, which takes hd128
+    group 4 from 2 to 3 blocks per SM. `spec` and `cpa` give bit-identical output. `cpa` falls back to `spec` for hd64 tq3 (24-byte
+    rows) and unaligned buffers, and both fall back to `legacy` for bits 1/5/6/7 and F32 norms; `spec` is otherwise a diagnostic
+    (its own kill line fired: 0.768x q4_0 at 32K).
+  - Model-level bench (framework RTX 3060, Qwen3-4B Q4_K_M, tq4, `run --prefill-chunk-size 1024`, prefill tok/s, relative only):
+    `cpa` 1.34x `legacy` at 7K and 2.16x at 32K; against q4_0 KV 0.983x at 7K (counted as parity, James 2026-11-22) and 1.113x at
+    32K, at 38,016 vs 41,472 KV bytes per token (8% fewer). tq3 at 7K: `cpa` 1.36x `legacy`. Decode unchanged.
+  - Gates: `legacy` keeps the SmolLM MinCos bound; `spec` / `cpa` are gated by `CudaTurboQuantPrefillDepthGate` (Qwen3-4B hd128 and
+    Qwen2.5-0.5B hd64, tq2/3/4/8; mean KL to F16 KV no worse than legacy plus the drift band, top-1 no worse than legacy minus the control arms' top-1 spread;
+    `spec` and `cpa` bit-identical), and
+    `CudaTurboQuantPrefillTailTests` proves no entry reads a row past `seq_kv`.
 - Vulkan: dense chain (`IsDenseF16KvEligible`) and Flint. A `_kvtq` twin for every attention arm those hosts dispatch (per-token,
   per-query-position, tiled, GQA flash, coopmat flash, split-KV decode v1 and v2, Flint's sink flash and reference sink kernel),
   built from the shared loader `kv_load.glsl` (`KV_TQ`), plus `tq_rotate_q` / `tq_rotate_o`. The twins add no workgroup memory over their
@@ -864,7 +896,10 @@ On each new token write, the oldest window entry is quantized and appended to th
     hd80) is read one element at a time; the cache only requires the whole KV row to be a multiple of 32. Both K and V must be
     q8_0 / q4_0: an f16 + block mix is refused when the cache is created (it failed at the first KV write before).
   - `attention_flash_mma_prefill_kvq` (`native/kernels/attention_flash_mma_prefill_kvq.cu`, Ampere+): tensor-core causal prefill,
-    head_dim 64 / 128, F16 output, each thread decoding its 8-element chunk into the shared K/V tile. Cold prefill and the #1847
+    head_dim 64 / 128, F16 output. Each raw head row is staged in shared memory with 8-byte (hd128) / 4-byte (hd64) `cp.async`
+    copies issued one tile ahead and decoded in place with packed-half2 math (#1923, bit-identical; before, each thread
+    `__ldg`-decoded its chunk synchronously: 1.13x q8_0 / 1.15x q4_0 at 31K keys on the RTX 3060). Its F16
+    entry serves the dense F16 cache's prefills since #1923 (`DOTLLM_CUDA_F16_FLASH_PREFILL=0` opts out). Cold prefill and the #1847
     prefix-reuse suffix prefill (`position_offset > 0`) share it, so q8_0 no longer goes through G3 over a dequantized scratch
     (#1846's suspect path is gone for q8_0). `DOTLLM_CUDA_KVQ_FLASH_PREFILL=0` forces the scalar kernel.
   - The quantize step writes one launch per contiguous run of rows (#1845; it was one per row: ~237K launches for a 2,966-token

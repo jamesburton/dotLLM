@@ -145,6 +145,15 @@ public sealed class ServerLedger
         return ledger;
     }
 
+    /// <summary>
+    /// The keys the ledger file of <paramref name="storeRoot"/> holds, read from disk (no entry-file check): what a writer
+    /// checks before deciding a deletion (fail closed). Empty when there is no ledger.
+    /// </summary>
+    /// <param name="storeRoot">Store directory.</param>
+    /// <returns>The keys.</returns>
+    /// <exception cref="LedgerUnreadableException">The file exists but cannot be read.</exception>
+    public static IReadOnlySet<ChunkKey> KeysOnDisk(string storeRoot) => ReadKeys(storeRoot).ToHashSet();
+
     /// <summary>The keys the ledger of <paramref name="storeRoot"/> protects (no entry-file check); empty when there is no ledger.</summary>
     /// <exception cref="LedgerUnreadableException">The file exists but cannot be read.</exception>
     internal static IEnumerable<ChunkKey> ReadKeys(string storeRoot) => ReadRows(DefaultPath(storeRoot)).Select(r => new ChunkKey(r.KeyHex));

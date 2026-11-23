@@ -387,7 +387,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
         // #1888, #1892: a TurboQuant request runs in place or is refused here (before anything loads) or after the load; never another cache.
         if (DotLLM.Cli.Helpers.KvStorageCli.TurboQuantRefusal(DotLLM.Server.KvCommand.Chat, settings.CacheTypeK, settings.CacheTypeV,
-                settings.CacheWindow, settings.Paged, settings.Device) is { } tqRefusal)
+                settings.CacheWindow, settings.Paged, settings.Device, hasDraftModel: !string.IsNullOrEmpty(settings.SpeculativeModel)) is { } tqRefusal)
         {
             DeviceCli.PrintError(tqRefusal, json: false);
             return 1;
@@ -646,7 +646,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         {
             // #1892: first, so no branch below can take it (IsQuantized excludes TurboQuant): the same in-place cache serve builds.
             string? tqPostRefusal = DotLLM.Server.TurboQuantKv.PostLoadRefusal(kvConfig, tqMismatch, DotLLM.Server.KvCommand.Chat, settings.Paged,
-                config!, model!, hasDraftModel: false, mtpWillAttach: !settings.NoMtp && model!.SupportsMtp);
+                config!, model!, hasDraftModel: !string.IsNullOrEmpty(settings.SpeculativeModel),
+                mtpWillAttach: string.IsNullOrEmpty(settings.SpeculativeModel) && !settings.NoMtp && model!.SupportsMtp);
             if (tqPostRefusal is not null)
             {
                 DeviceCli.PrintError(tqPostRefusal, json: false);
