@@ -517,6 +517,9 @@ __device__ __forceinline__ void pk_prefill_body_legacy(
 #ifndef PK_E4_KVT
 #define PK_E4_KVT 16
 #endif
+#ifndef PK_E4_PV16T
+#define PK_E4_PV16T 0
+#endif
 #ifndef PK_E4_NBUF
 #define PK_E4_NBUF 2
 #endif
@@ -745,6 +748,37 @@ __device__ __forceinline__ void pk_prefill_body(
     // O += P . V over tile t (V in vb).
     auto pv = [&](const half* vb)
     {
+#if PK_E4_PV16T
+        // DIAGNOSTIC ONLY (#1943, never a default without James's sign-off): the tile's P.V accumulated in F16 by the mma
+        // (KVT terms), then promoted and added into the F32 O. Measures the F32-accumulate tensor-rate share of the kernel.
+        unsigned oh[HD / 8][2];
+        #pragma unroll
+        for (int n = 0; n < HD / 8; n++) oh[n][0] = oh[n][1] = 0u;
+        #pragma unroll
+        for (int kk = 0; kk < KVT / 16; kk++)
+        {
+            #pragma unroll
+            for (int np = 0; np < HD / 16; np++)
+            {
+                unsigned b[4];
+                pk_ldmatrix_x4_trans(b, vb + (size_t)(kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * SS
+                                           + (np * 2 + (lane >> 4)) * 8);
+                #pragma unroll
+                for (int h = 0; h < 2; h++)
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                                 : "+r"(oh[2 * np + h][0]), "+r"(oh[2 * np + h][1])
+                                 : "r"(pa[kk][0]), "r"(pa[kk][1]), "r"(pa[kk][2]), "r"(pa[kk][3]), "r"(b[2 * h]), "r"(b[2 * h + 1]));
+            }
+        }
+        #pragma unroll
+        for (int n = 0; n < HD / 8; n++)
+        {
+            const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&oh[n][0]));
+            const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&oh[n][1]));
+            o[n][0] += lo.x; o[n][1] += lo.y; o[n][2] += hi.x; o[n][3] += hi.y;
+        }
+        return;
+#endif
         #pragma unroll
         for (int kk = 0; kk < KVT / 16; kk++)
         {
