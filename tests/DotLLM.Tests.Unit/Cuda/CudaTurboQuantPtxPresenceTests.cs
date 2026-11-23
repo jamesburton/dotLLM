@@ -53,5 +53,18 @@ public sealed class CudaTurboQuantPtxPresenceTests
         Assert.True(kernels.TqRotateAvailable, "turboquant_rotate.ptx (Q rotation) did not load although the base kernels did");
         Assert.True(kernels.TqRotateOF16Available, "turboquant_rotate.ptx (O rotation F16) did not load although the base kernels did");
         Assert.True(kernels.HasAttentionKvTq, "attention_kvtq.ptx did not load although the base kernels did");
+        // #1924: the bit-specialised tensor-core prefill entries (Ampere+ only; the generic _tqtq gates the same arch).
+        foreach (int hd in new[] { 64, 128 })
+        {
+            if (!kernels.HasAttentionFlashPrefillKvTq(hd)) continue;   // pre-Ampere host: none of the tensor-core entries load
+            foreach (int bits in new[] { 2, 3, 4, 8 })
+            {
+                Assert.True(kernels.HasAttentionFlashPrefillKvTqSpecialized(hd, bits),
+                    $"attention_flash_mma_prefill_kvq_hd{hd}_tq{bits} did not load although _tqtq did (stale attention_flash_mma_prefill_kvq.ptx?)");
+                if (hd * bits / 32 % 4 == 0)   // E3 entries need 16-byte code rows (no hd64 tq3)
+                    Assert.True(kernels.HasAttentionFlashPrefillKvTqStaged(hd, bits),
+                        $"attention_flash_mma_prefill_kvq_hd{hd}_tq{bits}_cpa did not load although _tqtq did (stale PTX?)");
+            }
+        }
     }
 }
