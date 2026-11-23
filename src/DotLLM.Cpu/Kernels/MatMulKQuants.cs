@@ -389,6 +389,7 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static float VecDotQ4_K_Q8_KAvx2(byte* qk, byte* q8k, int superBlockCount)
     {
+        if (Q4KRlaActive) return Q4KRlaDot1(qk, q8k, superBlockCount, Q4_K_BlockBytes);   // #1927: batch-invariant row-lane arithmetic
         Vector256<float> acc = Vector256<float>.Zero;
         Vector256<byte> mask0F = Vector256.Create((byte)0x0F);
         float sumMin = 0;
@@ -634,6 +635,15 @@ public static unsafe partial class MatMul
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, int wStride, float* results)
     {
+        if (Q4KRlaActive)
+        {
+            // #1927: the row-lane GEMM's per-row arithmetic, so decode rows equal prefill rows at any batch size.
+            results[0] = Q4KRlaDot1(w0, q8k, superBlockCount, wStride);
+            results[1] = Q4KRlaDot1(w1, q8k, superBlockCount, wStride);
+            results[2] = Q4KRlaDot1(w2, q8k, superBlockCount, wStride);
+            results[3] = Q4KRlaDot1(w3, q8k, superBlockCount, wStride);
+            return;
+        }
         if (FastKQuantIsa)
         {
             // Bit-identical rewrite with hoisted/vectorised scale + min handling (#933).
@@ -1985,6 +1995,9 @@ public static unsafe partial class MatMul
                             else if (q5)
                                 Q5KRowTok4(gw + (long)rr * ctx.KRowBytes, xq, ctx.Q8RowBytes, ctx.SuperBlockCount,
                                     Q5_K_BlockBytes, cc + rr, ctx.M);
+                            else if (Q4KRlaActive)   // #1927: row-lane arithmetic, batch-invariant
+                                Q4KRlaRowTok4(gw + (long)rr * ctx.KRowBytes, xq, ctx.Q8RowBytes, ctx.SuperBlockCount,
+                                    Q4_K_BlockBytes, cc + rr, ctx.M);
                             else
                                 Q4KRowTok4(gw + (long)rr * ctx.KRowBytes, xq, ctx.Q8RowBytes, ctx.SuperBlockCount,
                                     Q4_K_BlockBytes, cc + rr, ctx.M);

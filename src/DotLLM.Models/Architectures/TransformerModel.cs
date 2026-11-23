@@ -4618,9 +4618,10 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
                 return;
             }
 
-            // Every other repackable quant takes the same R4 kernels the n == 1 arm uses, so the
-            // result does not depend on batch size (#530). Self-quantizes when the caller had no
-            // compatible pre-quantized buffer.
+            // Every other repackable quant takes kernels whose per-row arithmetic equals the n == 1 arm's, so the
+            // result does not depend on batch size or composition (#530). Q4_K: 16+ tokens take the row-lane GEMM and
+            // every Q4_K kernel (this one and the decode GEMV) follows the same row-lane arithmetic (#1927). Self-quantizes
+            // when the caller had no compatible pre-quantized buffer.
             switch (qt)
             {
                 case QuantizationType.Q8_0:

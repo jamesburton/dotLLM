@@ -220,7 +220,7 @@ public sealed unsafe class CudaAttentionMmaDecodeGqaSplitTests
 
         float[] cpuOut = new float[qElems];
         fixed (float* pq = q, pk = k, pv = v, pOut = cpuOut)
-            Attention.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, NumHeads, NumKvHeads, HeadDim,
+            AttentionTiledReference.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, NumHeads, NumKvHeads, HeadDim,
                 positionOffset, pool: null, slidingWindowSize: null);
 
         nint dQf32 = 0, dK = 0, dV = 0, dOutF32Baseline = 0;
@@ -403,7 +403,7 @@ public sealed unsafe class CudaAttentionMmaDecodeGqaSplitTests
             float[] vSlice = vFull[..(seqKv * kvElems)];
             float[] cpuOut = new float[qElems];
             fixed (float* pq = q, pk = kSlice, pv = vSlice, pOut = cpuOut)
-                Attention.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, NumHeads, NumKvHeads, HeadDim,
+                AttentionTiledReference.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, NumHeads, NumKvHeads, HeadDim,
                     positionOffset: seqKv - 1, pool: null, slidingWindowSize: null);
 
             ushort[] kSliceF16 = kFullF16[..(seqKv * kvElems)];
