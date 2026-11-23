@@ -879,11 +879,14 @@ using PkStQ8_64 = PkLoadStaged<PkQ8Fast, 64>;
 using PkStQ4_64 = PkLoadStaged<PkQ4Fast, 64>;
 #endif
 
-#ifndef PK_E4_MINB
-#define PK_E4_MINB 1
+// PK_E4_MINB > 1: an A/B arm with __launch_bounds__ min blocks per SM (a register cap). Off by default.
+#if defined(PK_E4_MINB) && PK_E4_MINB > 1
+#define PK_E4_LB __launch_bounds__(256, PK_E4_MINB)
+#else
+#define PK_E4_LB __launch_bounds__(256)
 #endif
 #define PK_ENTRY(NAME, HD, KLOAD, VLOAD)                                                          \
-extern "C" __global__ void __launch_bounds__(256, PK_E4_MINB) NAME(                                         \
+extern "C" __global__ void PK_E4_LB NAME(                                         \
     const half* __restrict__ q, const void* __restrict__ k, const void* __restrict__ v,           \
     half* __restrict__ output, const int seq_q, const int seq_kv, const int num_heads,            \
     const int num_kv_heads, const int position_offset, const float scale)                         \
