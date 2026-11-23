@@ -4,6 +4,8 @@
 
 The KV-cache stores previously computed key and value vectors for all layers, so each decode step computes and appends K/V only for the new token. Attention still reads the cached history: a decode step takes work proportional to the context length, and processing a full causal sequence has quadratic attention work in its length.
 
+Resumable single-sequence use of a cache (pause, observe, roll back, resume) and which caches can be cut back: see [GENERATION_SESSION.md](GENERATION_SESSION.md).
+
 ## Memory Consumption
 
 Llama 3 8B, FP16, 2048 tokens:

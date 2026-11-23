@@ -12,7 +12,7 @@ namespace DotLLM.Cuda.Architectures;
 /// of this interface is unreachable from that call path and throws, mirroring the Vulkan
 /// hybrid path's <c>VulkanNemotronHKvCache</c>.
 /// </summary>
-public sealed class CudaHybridKvCacheHandle : IKvCache
+public sealed class CudaHybridKvCacheHandle : IKvCache, IKvLengthRollback
 {
     private readonly Func<int, bool>? _canGrowTo;
     private int _currentLength;
@@ -66,6 +66,13 @@ public sealed class CudaHybridKvCacheHandle : IKvCache
             throw new ArgumentOutOfRangeException(nameof(length));
         _currentLength = length;
     }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Any cut within <see cref="CurrentLength"/> is exact: the owning model shrinks its own F16 cursor (and staging lengths) to this
+    /// handle's length at the start of every forward (<c>HybridKvLengthBookkeeping.SyncToCommitted</c>), and rows past it are rewritten.
+    /// </remarks>
+    public bool CanTruncateTo(int length) => (uint)length <= (uint)_currentLength;
 
     /// <inheritdoc/>
     public void Update(ITensor keys, ITensor values, ReadOnlySpan<int> positions, int layerIndex)

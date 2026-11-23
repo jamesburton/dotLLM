@@ -56,7 +56,7 @@ namespace DotLLM.Vulkan;
 /// transcendental kernels (decay / sigmoid) target ≤4 ULP drift.
 /// </para>
 /// </remarks>
-public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
+public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel, IVulkanResidualModifierHost
 {
     private readonly VulkanDevice _device;
     internal VulkanDevice Device => _device;
@@ -798,7 +798,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         bool resized = _state.EnsureCapacity(seqLen);
-        if (resized) { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); }
+        if (resized) { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); ResidualModifier?.InvalidateDescriptorCache(); }
 
         // Rows the LM head covers (#1188): every row of a short batch (a speculative verify is K+1 rows and is indexed row by row), the last
         // row of a long prefill. Resolved before any recording: growing the buffer invalidates the descriptor caches.
@@ -813,7 +813,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         long profT0 = profActive ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // Single-token decode with resident fast-path banks in every layer: the whole forward is ONE command buffer (see ForwardDecodeFused).
-        if (seqLen == 1 && mtpCapture is null && FuseDecodeEnabled && CanFuseMoeDecode(hiddenSize))
+        if (seqLen == 1 && mtpCapture is null && ResidualModifier is null && FuseDecodeEnabled && CanFuseMoeDecode(hiddenSize))
         {
             if (taps is null)
                 return ForwardDecodeFused(tokenIds, positions, gdnCache, kvCache, kinds, hiddenSize, vocabSize, numHeads, numKvHeads, headDim, eps);
@@ -838,6 +838,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // ── 2. Per-layer body. Two submissions per layer: one for the
         //      token-mixing path, one for the MoE FFN (which needs a host
         //      dequant + upload of the routed experts in between). ────────────
+        var residualModifier = ResidualModifier;
         for (int layer = 0; layer < _cpuLayers.Length; layer++)
         {
             var lw = _cpuLayers[layer];
@@ -868,6 +869,17 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 RunGpuPlacedMoeLayer(layer, lw, layerBuf, seqLen, hiddenSize, eps);
             }
             if (profActive) { _profMoeMs += ProfElapsedMs(ref profT0); }
+            // Device-side PostLayer residual modifier (#1919 seam, as the dense hosts): its own submission, in place on the
+            // post-layer HiddenState. Null (the default) costs this one branch per layer; a set modifier also bypasses ForwardDecodeFused.
+            if (residualModifier is not null && residualModifier.AppliesTo(layer))
+            {
+                _submit.Begin();
+                nint modBuf = _submit.CommandBuffer;
+                KernelSupport.HostToComputeBarrier(modBuf);
+                residualModifier.Record(modBuf, _state.HiddenState, layer, seqLen, hiddenSize);
+                KernelSupport.ComputeToHostBarrier(modBuf);
+                _submit.SubmitAndWait();
+            }
             if (taps is not null
                 && !tapState!.DeliverFromDevice(HookPoint.PostLayer, layer, _state.HiddenState, seqLen - 1, positions, out tapAbortAt))
                 return FinishTapAbort(tapAbortAt, kvCache, gdnState);
@@ -931,6 +943,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             AbsorbMtp(mtpCapture, tokenIds, positions);
         return result;
     }
+
+    /// <summary>
+    /// Optional device-side in-place modifier of the residual stream after each layer (<c>HookPoint.PostLayer</c>), the seam the dense
+    /// Vulkan hosts have (#1711/#1919). A set modifier takes the per-layer-submission forward (never <c>ForwardDecodeFused</c>); null costs
+    /// one branch per layer. Single-threaded per model instance.
+    /// </summary>
+    public IVulkanResidualModifier? ResidualModifier { get; set; }
+
+    VulkanDevice IVulkanResidualModifierHost.ResidualDevice => _device;
 
     /// <inheritdoc/>
     /// <remarks>
