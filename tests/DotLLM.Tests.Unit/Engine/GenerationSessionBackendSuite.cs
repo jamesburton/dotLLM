@@ -507,6 +507,84 @@ public abstract class GenerationSessionBackendSuite
         Assert.Equal(first, (await s2.GenerateUntilBoundaryAsync(new StopAfter(5))).TokenIds);
     }
 
+    /// <summary>
+    /// A prompt and a repeat-guard limit L (2..6) for which the model's own greedy output (60 tokens, guard off) contains a run of L identical
+    /// tokens: <c>J</c> is the index of the token that completes the first such run. Synthetic models differ (one cycles, one is constant, one
+    /// never repeats a token twice in a row), so the prompt is searched; a family with no repeating prompt skips rather than pass vacuously.
+    /// </summary>
+    private static async Task<(int[] Prompt, int[] Greedy, int L, int J)> FindRepeat(GenerationSessionFixture fx)
+    {
+        var candidates = new List<int[]> { fx.Prompt };
+        if (fx.Prompt.Length > 0 && fx.Tokenizer.VocabSize < 1000 && fx.Prompt[0] < 20)   // the id-token families: any small ids are valid
+            foreach (int a in Enumerable.Range(3, 5)) { candidates.Add([a]); candidates.Add([a, a]); foreach (int b in Enumerable.Range(3, 5)) candidates.Add([a, b, a]); }
+        foreach (int[] prompt in candidates)
+        {
+            await using var s = fx.NewGenerator().CreateSession(Greedy(60) with { RepeatGuardLimit = 0 }, Tag());
+            await s.PrefillAsync(prompt);
+            int[] g = [.. (await s.GenerateUntilBoundaryAsync(new StopAfter(int.MaxValue))).TokenIds];
+            for (int limit = 2; limit <= 6; limit++)
+                for (int j = limit - 1; j < g.Length; j++)
+                    if (Enumerable.Range(j - limit + 1, limit).All(i => g[i] == g[j])) return (prompt, g, limit, j);
+        }
+        Skip.If(true, "no prompt makes this family's greedy output repeat a token 2-6 times in a row");
+        return default;
+    }
+
+    /// <summary>
+    /// options.RepeatGuardLimit on a session stops where the plain generator stops (#1291 semantics, James 2026-11-23): the same prompt and
+    /// limit end after the same tokens, the tripping token kept, <see cref="FinishReason.Length"/>.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families), MemberType = typeof(GenerationSessionFixture))]
+    public async Task RepeatGuard_StopsWhereThePlainGeneratorDoes(string family)
+    {
+        using var fx = Open(family);
+        var (prompt, g, limit, j) = await FindRepeat(fx);
+        var opts = Greedy(60) with { RepeatGuardLimit = limit };
+        var plain = fx.NewGenerator().Generate(fx.TextOf(prompt), opts);
+        Assert.Equal(g[..(j + 1)], plain.GeneratedTokenIds);   // the plain path really tripped, at J
+        await using var s = fx.NewGenerator().CreateSession(opts, Tag());
+        await s.PrefillAsync(prompt);
+        var r = await s.GenerateUntilBoundaryAsync(new StopAfter(int.MaxValue));
+        Assert.Equal(plain.GeneratedTokenIds, r.TokenIds);
+        Assert.Equal(FinishReason.Length, r.FinishReason);
+    }
+
+    /// <summary>The run survives a pause: the segment ends one token before the limit-th repeat, and the next segment trips on its first token.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families), MemberType = typeof(GenerationSessionFixture))]
+    public async Task RepeatGuard_RunSurvivesAPause_OnEveryBackend(string family)
+    {
+        using var fx = Open(family);
+        var (prompt, g, limit, j) = await FindRepeat(fx);
+        await using var s = fx.NewGenerator().CreateSession(Greedy(60) with { RepeatGuardLimit = limit }, Tag());
+        await s.PrefillAsync(prompt);
+        Assert.Equal(g[..j], (await s.GenerateUntilBoundaryAsync(new StopAfter(j))).TokenIds);   // j tokens: not tripped, run = limit - 1
+        Assert.Equal([g[j]], (await s.GenerateUntilBoundaryAsync(new StopAfter(int.MaxValue))).TokenIds);
+    }
+
+    /// <summary>
+    /// RollbackTo restores the guard: after a trip, rolling back to the pause before the run and sampling again reproduces the same run (a stale
+    /// run would trip on its first token). The pause is a recorded boundary, so recurrent models roll back to it as well.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families), MemberType = typeof(GenerationSessionFixture))]
+    public async Task RepeatGuard_RollbackRestoresTheRun_OnEveryBackend(string family)
+    {
+        using var fx = Open(family);
+        var (prompt, g, limit, j) = await FindRepeat(fx);
+        int start = j - limit + 1;   // g[start..j] is the run
+        await using var s = fx.NewGenerator().CreateSession(Greedy(60) with { RepeatGuardLimit = limit }, Tag());
+        await s.PrefillAsync(prompt);
+        if (start > 0) await s.GenerateUntilBoundaryAsync(new StopAfter(start));
+        int pause = prompt.Length + start;
+        Assert.Equal(pause, s.CurrentPosition);
+        Assert.Equal(g[start..(j + 1)], (await s.GenerateUntilBoundaryAsync(new StopAfter(int.MaxValue))).TokenIds);   // tripped
+        Assert.True(s.CanRollbackTo(pause));
+        s.RollbackTo(pause);
+        Assert.Equal(g[start..(j + 1)], (await s.GenerateUntilBoundaryAsync(new StopAfter(int.MaxValue))).TokenIds);
+    }
+
     /// <summary>true/false from the cache's private disposed flag; null when the cache has none (a length-only handle that owns no storage).</summary>
     internal static bool? IsDisposed(IKvCache kv)
     {
