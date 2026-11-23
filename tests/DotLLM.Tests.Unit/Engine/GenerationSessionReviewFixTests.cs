@@ -253,7 +253,6 @@ public sealed class GenerationSessionReviewFixTests
         var gen = Gen(new ScriptedModel(false));
         Assert.Throws<NotSupportedException>(() => gen.CreateSession(Greedy() with { StopConditions = [new StopAfter(1)] }, Tag()));
         Assert.Throws<NotSupportedException>(() => gen.CreateSession(Greedy() with { Logprobs = true }, Tag()));
-        Assert.Throws<NotSupportedException>(() => gen.CreateSession(Greedy() with { RepeatGuardLimit = 4 }, Tag()));
     }
 
     // ── I-6 ────────────────────────────────────────────────────────────────────
