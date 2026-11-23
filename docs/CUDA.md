@@ -1293,6 +1293,32 @@ at 32,768 keys f16 0.41 ms (scalar 7.2-8.1 ms, ~325 GB/s effective, the DRAM roo
 q4_0 0.22-0.42 ms (scalar 11.4-11.7). End to end (framework, Qwen3-4B Q4_K_M, bench 2026-11-22, ratios only): dense v2 vs the
 scalar kernel at 32K f16 9.5x; the step graph over v2 at 7K 1.9x; base -> v2 + step graph at 32K f16 3.6 -> 37.7 tok/s,
 q4_0 2.3 -> 48.7, tq4 2.2 -> 29.2, i.e. 0.94-1.70x of llama.cpp b12590 at 32K.
+
+## Dense prefill attention, head_dim 64 / 128 (issues #1850, #1923)
+
+`native/kernels/attention_flash_mma_prefill_kvq.cu`: one mma.sync flash body (16-row q-tiles x one KV head per block, one warp per
+query head of the GQA group, 16-key K/V tiles double-buffered, F32 online softmax and O in registers, F16 output) with per-KV-type
+tile loaders. Used for every dense prefill of 16+ rows on head_dim 64 / 128 with a GQA group up to 8, cold or at an offset (later
+prefill chunks, prefix-reuse suffixes); no sinks, no sliding window.
+
+| KV | entry | loader |
+|---|---|---|
+| f16 (`CudaKvCache`, the paged gather, the uncached forward) | `_hd{64,128}_f16f16` | 16-byte `cp.async`, one tile ahead. Serves the F16 cache since #1923 (`DOTLLM_CUDA_F16_FLASH_PREFILL=0` restores G-flash / G3 / `attention_f16`) |
+| q8_0 / q4_0 (`CudaQuantizedKvCache`, in place) | `_hd{64,128}_{q8q8,q4q4,q8q4,q4q8}` | raw head rows staged with 8-byte (hd128) / 4-byte (hd64) `cp.async.ca` into the tail of each row's padded F16 slot, decoded in place with packed-half2 math before the tile's barrier (#1923). Bit-identical to dequant + the f16 entry (`DOTLLM_CUDA_KVQ_FLASH_PREFILL=0`: scalar `attention_kvq`) |
+| TurboQuant | `_hd{64,128}_tqtq` | see the TurboQuant section |
+
+- G-flash (`attention_flash_mma_f16`) keeps the hd64 square prefills it already took (group <= 4). G3's square / offset paths
+  remain for shapes outside hd64 / hd128 or groups above 8, and for prefills under 16 rows; on models the f16 entry covers the
+  context fit charges no G3 plane.
+- **Measured (framework RTX 3060 x4, Qwen3-4B Q4_K_M, chunk 1024, relative to 2b08a9c2):** f16 prefill **2.09x at 7K, 4.92x at
+  32K** (G3 offset path replaced; unchunked f16 at 7K 78 -> 3,023 tok/s). q8_0 / q4_0 kernel-level 1.13x / 1.15x at 31K keys, end to
+  end 1.064x / 1.092x at 32K: below the plan's 1.10x bar. **James 2026-11-22: keep E2** (bit-identical, faster at every depth).
+  Raw data: the #1923 bench results.
+- Accuracy gate (James 2026-11-21): per-row KL against `attention_f16` over the last 256 prompt rows, median <= 1e-5 and max <=
+  max(1e-3, 1.25 x G3's max) (`CudaF16FlashPrefillTests`; measured median 2.3e-9, max 5.2e-3 vs G3 5.7e-3).
+- Remaining gap to llama.cpp (0.77-0.89x): every entry is shared-memory limited to 2 blocks/SM and the f16 entry is math-pipe-throttle
+  bound on 16-key tiles; the restructure (Q in registers, single K/V buffers, 32-64-key tiles) is #1923's E4, not done.
+
 ## Flash-style tensor-core prefill attention, head_dim 256 (issue #962)
 
 `native/kernels/attention_flash_mma_prefill_hd256.cu` replaces the naive `attention_f32` prefill
@@ -1491,7 +1517,7 @@ pass and the tests call; it throws when a kernel is missing instead of falling b
 | `turboquant_encode_f32`, `turboquant_encode_f16` | `turboquant.cu` | quantize one head vector per block into codes + norm; byte-exact with the CPU codec (fixed pairwise reduction over 256 lanes) |
 | `tq_rotate_q_f16`, `tq_rotate_o_f16`, `tq_rotate_o_f32` (+ `_dyn` row-count variants of the q and f32 forms) | `turboquant_rotate.cu` | in-place FWHT with the sign diagonal: Q after RoPE (K signs), O after attention (V signs). The dense forward keeps the attention output F16 (`tq_rotate_o_f16`, no FP32 widening) |
 | `attention_kvtq` | `attention_kvtq.cu` | scalar code-space attention: decode and prefill, sinks, sliding window, any GQA ratio, power-of-two head dim up to 256 |
-| `attention_flash_mma_prefill_kvq_hd{64,128}_tqtq` | `attention_flash_mma_prefill_kvq.cu` | tensor-core flash prefill reading codes; the shared body and the q8_0 / q4_0 entries are untouched. hd256 takes the scalar kernel |
+| `attention_flash_mma_prefill_kvq_hd{64,128}_tqtq` | `attention_flash_mma_prefill_kvq.cu` | tensor-core flash prefill reading codes, same body as the q8_0 / q4_0 / f16 entries (their loaders differ; #1923 staged the q8_0 / q4_0 ones). hd256 takes the scalar kernel |
 
 - Accumulation is F32 in registers; the stored history is codes and F16 norms only.
 - Decode is **eager**: a non-windowed quantized cache never enters CUDA graph capture, and a test pins that (gap ticket #1918). The `_dyn`

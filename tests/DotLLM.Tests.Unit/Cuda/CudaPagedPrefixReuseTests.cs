@@ -112,26 +112,31 @@ public sealed class CudaPagedPrefixReuseTests
 
         // Warm, headroom 0: turn 2 outgrows turn 1's (prompt + 16) cache, so the hit must grow it.
         InferenceResponse actual;
-        long growths, offsetRuns;
+        long growths, offsetRuns, f16FlashRuns;
         using (var growCache = new PrefixCache(2))
         {
             var grown = new TextGenerator(model, tokenizer, paged, growCache, mtpEnabled: false, prefixCacheHeadroomTokens: 0);
             Assert.Equal(turn1.GeneratedTokenIds, grown.Generate(Turn1(), opts).GeneratedTokenIds);
             Assert.Equal(1, growCache.EntryCount);   // the paged cache is retained now (it was not before #1843)
-            long g0 = CudaKvGrowth.GrowthCount, o0 = CudaG3Attention.OffsetRunCount;
+            long g0 = CudaKvGrowth.GrowthCount, o0 = CudaG3Attention.OffsetRunCount, f0 = CudaKernels.AttentionFlashPrefillF16Launches;
             // NaN-poison new allocations while the growth runs: the regrown gather scratch must be rebuilt from the blocks.
             DotLLM.Cuda.Interop.CudaDriverApi.TestPoisonAllocations = true;
             try { actual = grown.Generate(t2, opts); }
             finally { DotLLM.Cuda.Interop.CudaDriverApi.TestPoisonAllocations = false; }
             growths = CudaKvGrowth.GrowthCount - g0;
             offsetRuns = CudaG3Attention.OffsetRunCount - o0;
+            f16FlashRuns = CudaKernels.AttentionFlashPrefillF16Launches - f0;
         }
         Assert.Equal(freeAtStart, pool.FreeBlocks);   // disposing the prefix cache returned every retained block
         _out.WriteLine($"turn2 prompt {actual.PromptTokenCount}, cached {actual.Timings.CachedTokenCount}, growths {growths}, " +
-                       $"G3 enabled {CudaG3Attention.Enabled}, offset runs {offsetRuns}");
+                       $"G3 enabled {CudaG3Attention.Enabled}, offset runs {offsetRuns}, F16 flash launches {f16FlashRuns}");
         Assert.True(actual.Timings.CachedTokenCount > 0, "expected a prefix hit");
         Assert.True(growths >= 1, "turn 2 should have grown the retained paged cache");
-        if (CudaG3Attention.Enabled)
+        var cfg = model.Config;
+        if (CudaTransformerModel.EnableF16FlashPrefill && model.Kernels.HasAttentionFlashPrefillKvq(cfg.HeadDim, null, null)
+            && CudaKernels.IsAttentionFlashPrefillKvqShape(cfg.NumAttentionHeads, cfg.NumKvHeads, cfg.HeadDim))
+            Assert.True(f16FlashRuns > 0, "the reused paged prefill did not run the F16 flash entry over the gather");   // #1923
+        else if (CudaG3Attention.Enabled)
             Assert.True(offsetRuns > 0, "the reused paged prefill did not run G3 with a position offset");
 
         Assert.Equal(expected.GeneratedTokenIds, actual.GeneratedTokenIds);

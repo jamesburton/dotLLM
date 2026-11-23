@@ -17,17 +17,20 @@
 //     seq_kv >= position_offset + seq_q (AttentionSpanInvariant). Keys past seq_kv in the tail tile are
 //     clamped to a valid row for the load and masked.
 // Differences: HD is a template parameter (64 / 128), the output is F16 (the dense path's attention
-// output buffer; no F32 storage), and the quantized loaders are synchronous: a Q8_0 head-row is 136 B
-// (hd128) / 68 B (hd64) and a Q4_0 one 72 B / 36 B, none a multiple of 16, so #1094's raw cp.async
-// staging (which needs 16-byte rows) does not apply. Each thread decodes its 8-element chunk with the
-// #988 block decoders (V2LoadQ8 / V2LoadQ4 in attention_mma_decode_v2.cuh, element =
-// __float2half(d * (float)q), the eager dequant kernels' expression) and stores the 8 halves to the
-// tile. The F16 entry (cp.async, used by the kernel-level oracle test) runs the same body, so the
+// output buffer; no F32 storage), and the quantized rows are staged with 8-byte (hd128) / 4-byte (hd64)
+// cp.async copies (#1923, PkLoadStaged below): a Q8_0 head-row is 136 B (hd128) / 68 B (hd64) and a Q4_0
+// one 72 B / 36 B, none a multiple of 16, so #1094's 16-byte copies do not apply, but all are multiples
+// of 8 / 4. The staged rows are decoded in place with the #988 block decoders (V2LoadQ8 / V2LoadQ4 in
+// attention_mma_decode_v2.cuh, element = __float2half(d * (float)q), the eager dequant kernels'
+// expression). Before #1923 each thread __ldg'd and decoded its chunk synchronously (PkLoadQuant).
+// The F16 entry (cp.async; the dense F16 cache's prefill since #1923) runs the same body, so the
 // quantized entry is bit-identical to dequant-into-F16 + the F16 entry.
 //
 // Double buffering is kept: tile t+1 is loaded at the top of iteration t into the buffer last read in
 // iteration t-1 (released by that iteration's closing barrier), and published by iteration t's closing
-// barrier -- for the synchronous loaders the stores simply complete before it.
+// barrier -- for the synchronous loaders the stores simply complete before it. A staged tile t is
+// decoded in place at the top of iteration t, after cp.async.wait and before the opening barrier (its
+// raw copies were issued at the top of iteration t-1, so they overlapped tile t-1's MMAs).
 //
 // ─── Precision ─────────────────────────────────────────────────────────────────────────────────────────
 // F16 Q/K/V/P operands, F32 mma accumulation and softmax statistics, in registers. Output F16.
@@ -108,6 +111,122 @@ struct PkLoadQuant
     }
 };
 
+// ─── Raw cp.async staging for the Q8_0 / Q4_0 loaders (#1923, after #1094's hd256 PrefillTileLoadStaged) ───
+// A raw head row (one key, one KV head) is HD/32 blocks: 136 / 72 B at hd128, 68 / 36 B at hd64. Not 16-byte multiples, but
+// multiples of 8 (hd128) / 4 (hd64), and so is every head row's offset ((key*num_kv_heads + hkv) * row bytes from a page-aligned
+// base; the launcher checks the base). So the row is copied with cp.async.ca of 8 / 4 bytes into the TAIL of its own padded F16
+// slot ([slot - row, slot) of the (HD+8)*2-byte slot), and decoded in place once it has landed: same shared memory as before.
+// Row r of a tile is owned by ONE warp for both the copy and the decode, so warp-level ordering suffices: each lane waits for
+// its own copies, __syncwarp publishes the warp's rows, every lane decodes its chunk into registers, __syncwarp (all raw bytes
+// read), then the F16 chunks are written (they overlap the raw tail: chunk c covers bytes [16c, 16c + 16)). The decode is the
+// same V2LoadQ8 / V2LoadQ4::decode8 expression as the global loader, so the tile halves (and the output) are bit-identical.
+template <class L, int HD>
+struct PkLoadStaged
+{
+    static constexpr int kRowBytes = HD / 32 * L::kBlockBytes;      // 136 / 72 (hd128), 68 / 36 (hd64)
+    static constexpr int kSlotBytes = (HD + 8) * 2;                  // 272 / 144
+    static constexpr int kRawOff = kSlotBytes - kRowBytes;
+    static constexpr int kUnit = (kRowBytes % 8 == 0) ? 8 : 4;      // cp.async.ca copy size
+    static constexpr int kUnits = kRowBytes / kUnit;                 // 17 / 9
+    static_assert(kRowBytes % kUnit == 0 && kRawOff % kUnit == 0, "raw row must be unit-copyable");
+    static_assert(kRawOff >= 0, "raw row must fit its F16 slot");
+
+    __device__ __forceinline__ static const uint8_t* row_src(const void* base, size_t head_row)
+    {
+        return reinterpret_cast<const uint8_t*>(base) + head_row * kRowBytes;
+    }
+
+    // Copy unit u of a raw head row into its slot's tail.
+    __device__ __forceinline__ static void copy_unit(half* slot, const uint8_t* src, int u)
+    {
+        unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(reinterpret_cast<uint8_t*>(slot) + kRawOff + u * kUnit));
+        if constexpr (kUnit == 8)
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(a), "l"(src + u * kUnit) : "memory");
+        else
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(a), "l"(src + u * kUnit) : "memory");
+    }
+
+    // Decode 16-byte chunk c (elements 8c..8c+7) of the staged raw row in this slot.
+    __device__ __forceinline__ static uint4 decode_chunk(const half* slot, int c)
+    {
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(slot) + kRawOff;
+        return L::template decode8<V2PlainLd>(raw + (c >> 2) * L::kBlockBytes, (c & 3) * 8);
+    }
+};
+
+// Packed-half2 block decoders for the staged rows (#1923): same blocks and same results as V2LoadQ8 / V2LoadQ4::decode8, in about
+// half the ALU work. An int8 (or nibble - 8) q is exact in F16, and d * q is exact in F32 (an 11-bit by 8-bit product), so the
+// correctly rounded F16 product __float2half(d * (float)q) the eager dequant computes equals one mul.rn.f16x2 of the two halves.
+// q is formed exactly as the F16 0x6400 | byte (= 1024 + byte) minus a constant (sub.rn.f16x2 of integers below 2048 is exact).
+// Explicit .rn PTX keeps the sub and mul from being contracted into an fma.
+__device__ __forceinline__ unsigned pk_hsub2_rn(unsigned a, unsigned b)
+{
+    unsigned r;
+    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+__device__ __forceinline__ unsigned pk_hmul2_rn(unsigned a, unsigned b)
+{
+    unsigned r;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+
+struct PkQ8Fast
+{
+    static constexpr int kBlockBytes = 34;
+    __device__ __forceinline__ static uint4 load8(const void* base, size_t elem)
+    {
+        return decode8<V2GlobalLd>(reinterpret_cast<const uint8_t*>(base) + (elem >> 5) * kBlockBytes, (int)(elem & 31));
+    }
+    template <class Ld>
+    __device__ __forceinline__ static uint4 decode8(const uint8_t* b, const int j)
+    {
+        const unsigned d = Ld::u16(reinterpret_cast<const uint16_t*>(b));
+        const unsigned d2 = d | (d << 16);
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(b + 2 + j);
+        const unsigned w0 = (Ld::u16(p) | (Ld::u16(p + 1) << 16)) ^ 0x80808080u;   // int8 + 128, as unsigned bytes
+        const unsigned w1 = (Ld::u16(p + 2) | (Ld::u16(p + 3) << 16)) ^ 0x80808080u;
+        const unsigned bias = 0x64806480u;                                            // half2(1152, 1152) = 1024 + 128
+        unsigned out[4];
+        out[0] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(w0, 0x64646464u, 0x5140), bias), d2);
+        out[1] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(w0, 0x64646464u, 0x7362), bias), d2);
+        out[2] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(w1, 0x64646464u, 0x5140), bias), d2);
+        out[3] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(w1, 0x64646464u, 0x7362), bias), d2);
+        return make_uint4(out[0], out[1], out[2], out[3]);
+    }
+};
+
+struct PkQ4Fast
+{
+    static constexpr int kBlockBytes = 18;
+    __device__ __forceinline__ static uint4 load8(const void* base, size_t elem)
+    {
+        return decode8<V2GlobalLd>(reinterpret_cast<const uint8_t*>(base) + (elem >> 5) * kBlockBytes, (int)(elem & 31));
+    }
+    template <class Ld>
+    __device__ __forceinline__ static uint4 decode8(const uint8_t* b, const int j)
+    {
+        const unsigned d = Ld::u16(reinterpret_cast<const uint16_t*>(b));
+        const unsigned d2 = d | (d << 16);
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(b + 2 + (j >> 1));
+        const unsigned w = Ld::u16(p) | (Ld::u16(p + 1) << 16);                     // 4 bytes = 8 nibbles
+        const unsigned lo = w & 0x0F0F0F0Fu, hi = (w >> 4) & 0x0F0F0F0Fu;
+        const unsigned u01 = __byte_perm(lo, hi, 0x5140);                             // lo0 hi0 lo1 hi1
+        const unsigned u23 = __byte_perm(lo, hi, 0x7362);                             // lo2 hi2 lo3 hi3
+        const unsigned bias = 0x64086408u;                                            // half2(1032, 1032) = 1024 + 8
+        unsigned out[4];
+        out[0] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(u01, 0x64646464u, 0x5140), bias), d2);
+        out[1] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(u01, 0x64646464u, 0x7362), bias), d2);
+        out[2] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(u23, 0x64646464u, 0x5140), bias), d2);
+        out[3] = pk_hmul2_rn(pk_hsub2_rn(__byte_perm(u23, 0x64646464u, 0x7362), bias), d2);
+        return make_uint4(out[0], out[1], out[2], out[3]);
+    }
+};
+
+template <class L> struct PkStagedTraits { static constexpr bool staged = false; };
+template <class L, int HD> struct PkStagedTraits<PkLoadStaged<L, HD>> { static constexpr bool staged = true; };
+
 template <int HD, class KL, class VL>
 __device__ __forceinline__ void pk_prefill_body(
     const half* __restrict__ q,
@@ -156,19 +275,74 @@ __device__ __forceinline__ void pk_prefill_body(
     if (kv_end > seq_kv) kv_end = seq_kv;
     const int num_tiles = (kv_end + PK_KV_TILE - 1) / PK_KV_TILE;
 
+    // #1923 staged loaders: row group g (RP rows) of a tile is owned by warp g % nwarps for the raw copy and the decode.
+    constexpr bool kStaged = PkStagedTraits<KL>::staged;
+    static_assert(PkStagedTraits<KL>::staged == PkStagedTraits<VL>::staged, "K and V are both staged or neither");
+    constexpr int RJ = 2 * CPR;               // decode jobs per row: CPR K chunks + CPR V chunks
+    constexpr int RP = 32 / RJ;               // rows per warp pass: 1 (hd128), 2 (hd64)
+    constexpr int NG = PK_KV_TILE / RP;
+    const int nwarps = blockDim.x >> 5;
+
     auto load_tile = [&](int t, int buf)
     {
         const int k0 = t * PK_KV_TILE;
         half* dK = sK + (size_t)buf * PK_KV_TILE * SS;
         half* dV = sV + (size_t)buf * PK_KV_TILE * SS;
-        for (int i = threadIdx.x; i < PK_KV_TILE * CPR; i += blockDim.x)
+        if constexpr (kStaged)
         {
-            int c = i % CPR, r = i / CPR;
-            int key = k0 + r;
-            if (key > seq_kv - 1) key = seq_kv - 1;          // clamp: masked later, stays finite
-            size_t g = (size_t)key * kv_stride + (size_t)hkv * HD + c * 8;
-            KL::chunk(dK + (size_t)r * SS + c * 8, k, g);
-            VL::chunk(dV + (size_t)r * SS + c * 8, v, g);
+            for (int g = warp; g < NG; g += nwarps)
+            {
+                for (int x = lane; x < RP * KL::kUnits; x += 32)
+                {
+                    const int r = g * RP + x / KL::kUnits;
+                    int key = k0 + r;
+                    if (key > seq_kv - 1) key = seq_kv - 1;  // clamp: masked later, stays finite
+                    KL::copy_unit(dK + (size_t)r * SS, KL::row_src(k, (size_t)key * num_kv_heads + hkv), x % KL::kUnits);
+                }
+                for (int x = lane; x < RP * VL::kUnits; x += 32)
+                {
+                    const int r = g * RP + x / VL::kUnits;
+                    int key = k0 + r;
+                    if (key > seq_kv - 1) key = seq_kv - 1;
+                    VL::copy_unit(dV + (size_t)r * SS, VL::row_src(v, (size_t)key * num_kv_heads + hkv), x % VL::kUnits);
+                }
+            }
+        }
+        else
+        {
+            for (int i = threadIdx.x; i < PK_KV_TILE * CPR; i += blockDim.x)
+            {
+                int c = i % CPR, r = i / CPR;
+                int key = k0 + r;
+                if (key > seq_kv - 1) key = seq_kv - 1;          // clamp: masked later, stays finite
+                size_t g = (size_t)key * kv_stride + (size_t)hkv * HD + c * 8;
+                KL::chunk(dK + (size_t)r * SS + c * 8, k, g);
+                VL::chunk(dV + (size_t)r * SS + c * 8, v, g);
+            }
+        }
+    };
+
+    // Staged only: decode row group g of buffer buf in place. The caller has waited for this thread's copies of it and
+    // __syncwarp'd (the warp's raw rows are complete and visible to all its lanes).
+    auto decode_group = [&](int buf, int g)
+    {
+        if constexpr (kStaged)
+        {
+            const int j = lane % RJ;
+            const bool isV = j >= CPR;
+            const int c = isV ? j - CPR : j;
+            half* slot = (isV ? sV : sK) + (size_t)buf * PK_KV_TILE * SS + (size_t)(g * RP + lane / RJ) * SS;
+            const uint4 h = isV ? VL::decode_chunk(slot, c) : KL::decode_chunk(slot, c);
+            __syncwarp();                     // every raw byte of these rows read before any F16 chunk overwrites it
+            *reinterpret_cast<uint4*>(slot + c * 8) = h;
+        }
+    };
+    auto decode_tile = [&](int buf)
+    {
+        if constexpr (kStaged)
+        {
+            __syncwarp();
+            for (int g = warp; g < NG; g += nwarps) decode_group(buf, g);
         }
     };
 
@@ -193,6 +367,7 @@ __device__ __forceinline__ void pk_prefill_body(
         if (t + 1 < num_tiles) load_tile(t + 1, (t + 1) & 1);
         pk_cp_async_commit();
         pk_cp_async_wait<1>();
+        decode_tile(buf);   // staged only: tile t landed (wait above); decoded before the barrier publishes it
         __syncthreads();
 
         if (warp < group)
@@ -326,6 +501,30 @@ __device__ __forceinline__ void pk_prefill_body(
     }
 }
 
+// Quantized loader variant (#1923 A/B): 0 = synchronous __ldg + V2 decode (pre-#1923), 1 = synchronous __ldg + packed-half2 decode,
+// 2 = raw cp.async staging + packed-half2 decode (default). All are bit-identical. RTX 3060, 1024 rows at 31,744 keys, 32/8/128,
+// ms per launch (f16f16 entry 25.7-25.9): q8_0 0: 37.0, 1: 35.5, 2: 32.9; q4_0 0: 36.2-36.4, 1: 35.1-35.5, 2: 31.6. Decoding the staged tile
+// inside the previous tile's P.V loop instead (#1094's hd256 schedule) measured 41.0 / 39.8: removed.
+#ifndef PK_KVQ_LOADER
+#define PK_KVQ_LOADER 2
+#endif
+#if PK_KVQ_LOADER == 0
+using PkStQ8_128 = PkLoadQuant<V2LoadQ8>;
+using PkStQ4_128 = PkLoadQuant<V2LoadQ4>;
+using PkStQ8_64 = PkLoadQuant<V2LoadQ8>;
+using PkStQ4_64 = PkLoadQuant<V2LoadQ4>;
+#elif PK_KVQ_LOADER == 1
+using PkStQ8_128 = PkLoadQuant<PkQ8Fast>;
+using PkStQ4_128 = PkLoadQuant<PkQ4Fast>;
+using PkStQ8_64 = PkLoadQuant<PkQ8Fast>;
+using PkStQ4_64 = PkLoadQuant<PkQ4Fast>;
+#else
+using PkStQ8_128 = PkLoadStaged<PkQ8Fast, 128>;
+using PkStQ4_128 = PkLoadStaged<PkQ4Fast, 128>;
+using PkStQ8_64 = PkLoadStaged<PkQ8Fast, 64>;
+using PkStQ4_64 = PkLoadStaged<PkQ4Fast, 64>;
+#endif
+
 #define PK_ENTRY(NAME, HD, KLOAD, VLOAD)                                                          \
 extern "C" __global__ void __launch_bounds__(256) NAME(                                           \
     const half* __restrict__ q, const void* __restrict__ k, const void* __restrict__ v,           \
@@ -336,15 +535,15 @@ extern "C" __global__ void __launch_bounds__(256) NAME(                         
                                       position_offset, scale);                                    \
 }
 
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q8q8, 128, PkLoadQuant<V2LoadQ8>, PkLoadQuant<V2LoadQ8>)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q4q4, 128, PkLoadQuant<V2LoadQ4>, PkLoadQuant<V2LoadQ4>)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q8q4, 128, PkLoadQuant<V2LoadQ8>, PkLoadQuant<V2LoadQ4>)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q4q8, 128, PkLoadQuant<V2LoadQ4>, PkLoadQuant<V2LoadQ8>)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q8q8, 128, PkStQ8_128, PkStQ8_128)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q4q4, 128, PkStQ4_128, PkStQ4_128)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q8q4, 128, PkStQ8_128, PkStQ4_128)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q4q8, 128, PkStQ4_128, PkStQ8_128)
 PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_f16f16, 128, PkLoadF16, PkLoadF16)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q8q8, 64, PkLoadQuant<V2LoadQ8>, PkLoadQuant<V2LoadQ8>)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q4q4, 64, PkLoadQuant<V2LoadQ4>, PkLoadQuant<V2LoadQ4>)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q8q4, 64, PkLoadQuant<V2LoadQ8>, PkLoadQuant<V2LoadQ4>)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q4q8, 64, PkLoadQuant<V2LoadQ4>, PkLoadQuant<V2LoadQ8>)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q8q8, 64, PkStQ8_64, PkStQ8_64)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q4q4, 64, PkStQ4_64, PkStQ4_64)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q8q4, 64, PkStQ8_64, PkStQ4_64)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q4q8, 64, PkStQ4_64, PkStQ8_64)
 PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_f16f16, 64, PkLoadF16, PkLoadF16)
 
 // ─── TurboQuant in place (#1892 Task 6) ────────────────────────────────────────────────────────────────
@@ -356,8 +555,9 @@ PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_f16f16, 64, PkLoadF16, PkLoadF16)
 //
 // The loader needs per-side context (codes, norms, centroids, bits, stride, norm format) that the stateless chunk(dst, base,
 // elem) contract cannot carry, so the TQ entries pass a pointer to a per-side context struct as `base`. Everything is
-// force-inlined into the entry, so the struct lives in registers (the PTX has no local depot). pk_prefill_body and the ten
-// entries above are untouched, so their PTX cannot move. The centroid table is read with __ldg from global memory, never
+// force-inlined into the entry, so the struct lives in registers (the PTX has no local depot). The TQ entries take the body's
+// unstaged branch (PkStagedTraits false); since #1923 the body is shared with the staged q8 / q4 loaders, so any body edit must
+// be re-validated for the TQ entries too. The centroid table is read with __ldg from global memory, never
 // staged in shared memory; the loader is register-only, so the shared-memory size is the same as the q8 / q4 entries'.
 // `elem` = key * num_kv_heads * HD + hkv * HD + c * 8, so the head vector is elem / HD and the first coordinate elem % HD.
 struct PkTqSide
