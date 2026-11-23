@@ -508,11 +508,18 @@ __device__ __forceinline__ void pk_prefill_body_legacy(
 //      same 32-bit words ldmatrix produced, so this step alone is bit-identical), and the per-tile Q ldmatrix is gone. There
 //      is no Q tile in shared memory, so shared memory no longer depends on the GQA group and is STATIC (K / V tiles only);
 //      the launcher reads it from the function (CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES) and passes no dynamic shared memory.
-//   2. PK_E4_NBUF 1: one K and one V tile with alternated copies (V of tile t issued after QK's opening barrier, K of t+1 after
-//      P.V's), replacing the two double buffers; 2: as before.
+//   2. NBUF 1: one K and one V tile with alternated copies (V of tile t issued after QK's opening barrier, K of t+1 after
+//      P.V's), replacing the two double buffers; NBUF 2: as before. Chosen per entry (A/B, RTX 3060, 32/8/128, 1,024 rows at
+//      31,744 keys, min ms): F16 NBUF 2 23.3 vs NBUF 1 24.0; q8_0 30.1 vs 27.7; q4_0 29.2 vs 25.4 (legacy body 26.1 / 33.3 / 31.8).
+//      Both are the same arithmetic in the same order, so every entry stays bit-identical to the legacy body.
 //   3. PK_E4_KVT keys per tile (16 / 32 / 64). Above 16 the even/odd-ks split S accumulators are dropped (NT >= 4 independent
 //      mma chains already) and the online-softmax rescale runs once per KVT keys, so outputs differ from the 16-key body by
 //      F16 / F32 rounding (accumulation order), never by math.
+//      KVT 32 / 64 measured no better than 16 (32: 0.99-1.01x of 16 at 31,744 keys; 64: 0.94-0.97x), so 16 ships and the
+//      larger tiles stay as A/B arms only.
+// Occupancy: Q in registers costs ~30 registers (hd128 126 -> 156-166), so at GQA group 7 (224 threads) only one block fits per
+// SM where the legacy body fits two (28/4/128: 0.74x). The launcher therefore also carries the legacy body under
+// `<entry>_legacy` and takes it when it keeps more blocks resident (CudaKernels.LaunchAttentionFlashPrefillKvq).
 // Precision unchanged: F16 Q/K/V/P operands, F32 mma accumulation, F32 softmax statistics, all in registers; F16 output.
 #ifndef PK_E4_KVT
 #define PK_E4_KVT 16
@@ -520,13 +527,16 @@ __device__ __forceinline__ void pk_prefill_body_legacy(
 #ifndef PK_E4_PV16T
 #define PK_E4_PV16T 0
 #endif
+// A/B overrides of the per-entry buffering (0 = the shipped per-entry choice).
 #ifndef PK_E4_NBUF
-#define PK_E4_NBUF 2
+#define PK_E4_NBUF 0
 #endif
+#define PK_E4_NBUF_F16 (PK_E4_NBUF ? PK_E4_NBUF : 2)
+#define PK_E4_NBUF_Q (PK_E4_NBUF ? PK_E4_NBUF : 1)
 
 __device__ __forceinline__ unsigned pk_ld32(const half* p) { return __ldg(reinterpret_cast<const unsigned*>(p)); }
 
-template <int HD, class KL, class VL>
+template <int HD, class KL, class VL, int NBUF>
 __device__ __forceinline__ void pk_prefill_body(
     const half* __restrict__ q,
     const void* __restrict__ k,
@@ -540,7 +550,6 @@ __device__ __forceinline__ void pk_prefill_body(
     const float scale)
 {
     constexpr int KVT = PK_E4_KVT;
-    constexpr int NBUF = PK_E4_NBUF;
     static_assert(KVT == 16 || KVT == 32 || KVT == 64, "KVT is 16, 32 or 64");
     static_assert(NBUF == 1 || NBUF == 2, "NBUF is 1 or 2");
     constexpr int NT = KVT / 8;          // 8-key n-tiles of S
@@ -885,26 +894,34 @@ using PkStQ4_64 = PkLoadStaged<PkQ4Fast, 64>;
 #else
 #define PK_E4_LB __launch_bounds__(256)
 #endif
-#define PK_ENTRY(NAME, HD, KLOAD, VLOAD)                                                          \
-extern "C" __global__ void PK_E4_LB NAME(                                         \
+#define PK_ENTRY(NAME, HD, KLOAD, VLOAD, NBUF)                                                    \
+extern "C" __global__ void PK_E4_LB NAME(                                                         \
     const half* __restrict__ q, const void* __restrict__ k, const void* __restrict__ v,           \
     half* __restrict__ output, const int seq_q, const int seq_kv, const int num_heads,            \
     const int num_kv_heads, const int position_offset, const float scale)                         \
 {                                                                                                 \
-    pk_prefill_body<HD, KLOAD, VLOAD>(q, k, v, output, seq_q, seq_kv, num_heads, num_kv_heads,    \
-                                      position_offset, scale);                                    \
+    pk_prefill_body<HD, KLOAD, VLOAD, NBUF>(q, k, v, output, seq_q, seq_kv, num_heads,            \
+                                            num_kv_heads, position_offset, scale);                \
+}                                                                                                 \
+extern "C" __global__ void __launch_bounds__(256) NAME##_legacy(                                  \
+    const half* __restrict__ q, const void* __restrict__ k, const void* __restrict__ v,           \
+    half* __restrict__ output, const int seq_q, const int seq_kv, const int num_heads,            \
+    const int num_kv_heads, const int position_offset, const float scale)                         \
+{                                                                                                 \
+    pk_prefill_body_legacy<HD, KLOAD, VLOAD>(q, k, v, output, seq_q, seq_kv, num_heads,           \
+                                             num_kv_heads, position_offset, scale);               \
 }
 
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q8q8, 128, PkStQ8_128, PkStQ8_128)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q4q4, 128, PkStQ4_128, PkStQ4_128)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q8q4, 128, PkStQ8_128, PkStQ4_128)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q4q8, 128, PkStQ4_128, PkStQ8_128)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_f16f16, 128, PkLoadF16, PkLoadF16)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q8q8, 64, PkStQ8_64, PkStQ8_64)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q4q4, 64, PkStQ4_64, PkStQ4_64)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q8q4, 64, PkStQ8_64, PkStQ4_64)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q4q8, 64, PkStQ4_64, PkStQ8_64)
-PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_f16f16, 64, PkLoadF16, PkLoadF16)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q8q8, 128, PkStQ8_128, PkStQ8_128, PK_E4_NBUF_Q)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q4q4, 128, PkStQ4_128, PkStQ4_128, PK_E4_NBUF_Q)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q8q4, 128, PkStQ8_128, PkStQ4_128, PK_E4_NBUF_Q)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_q4q8, 128, PkStQ4_128, PkStQ8_128, PK_E4_NBUF_Q)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd128_f16f16, 128, PkLoadF16, PkLoadF16, PK_E4_NBUF_F16)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q8q8, 64, PkStQ8_64, PkStQ8_64, PK_E4_NBUF_Q)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q4q4, 64, PkStQ4_64, PkStQ4_64, PK_E4_NBUF_Q)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q8q4, 64, PkStQ8_64, PkStQ4_64, PK_E4_NBUF_Q)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_q4q8, 64, PkStQ4_64, PkStQ8_64, PK_E4_NBUF_Q)
+PK_ENTRY(attention_flash_mma_prefill_kvq_hd64_f16f16, 64, PkLoadF16, PkLoadF16, PK_E4_NBUF_F16)
 
 // ─── TurboQuant in place (#1892 Task 6) ────────────────────────────────────────────────────────────────
 // The dense in-place TurboQuant cache (CudaTurboQuantInPlaceKvCache) stores each K / V head vector as mse_bits-bit Lloyd-Max
