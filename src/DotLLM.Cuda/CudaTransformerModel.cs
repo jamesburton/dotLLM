@@ -1351,7 +1351,7 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
 
         // #1922 E2: a dense decode step the graphs above did not take (past GraphCaptureMaxDepth, pure-quantized or in-place
         // TurboQuant KV) runs this eager body captured whole, re-captured every step and pushed with cuGraphExecUpdate.
-        if (!_stepGraphCapturing && !_moeGraphCapturing
+        if (ts is null && !_stepGraphCapturing && !_moeGraphCapturing   // #1920: a step graph replay never reaches the per-layer tap sites
             && StepGraphEligible(tokenIds.Length, suppressGraphCapture, deferredHostDest, isMla, isMoe, kvCache, positions[0])
             && ForwardStepGraph(tokenIds, positions, deviceId, kvCache!) is { } stepLogits)
             return stepLogits;
