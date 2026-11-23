@@ -390,8 +390,9 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
 
     /// <summary>
     /// The tensor-core prefill arm against the oracle, per entry (#1924): <paramref name="variant"/> "legacy" forces the generic
-    /// <c>_tqtq</c>, "cpa" the cp.async-staged <c>_tq{bits}_cpa</c> (E3), "auto" takes the default, which for bits 2/3/4/8 must be
-    /// the specialised <c>_tq{bits}</c> entry (E1: deferred norms, shared-memory centroid table) and for bits 5/7 the generic one.
+    /// <c>_tqtq</c>, "cpa" the cp.async-staged <c>_tq{bits}_cpa</c> (E3), "auto" takes the default, which for bits 2/3/4/8 is
+    /// the staged entry, falling back to the specialised <c>_tq{bits}</c> (E1: deferred norms, shared-memory centroid table) where there is
+    /// no staged entry (hd64 tq3), and for bits 5/7 the generic one.
     /// The per-entry launch counters prove which one ran.
     /// </summary>
     [SkippableTheory]
@@ -426,6 +427,49 @@ public sealed unsafe class CudaTurboQuantInPlaceAttentionTests : IDisposable
         Assert.Equal(expected == CudaKernels.TqPrefillVariant.Staged ? 1 : 0, r.CpaLaunches);
         Assert.Equal(0, r.ScalarLaunches);
         AssertMatchesOracle(r, hd, $"flash {expected} b{bits} hd{hd} {numHeads}/{numKvHeads} q{seqQ}@{offset}");
+    }
+
+    /// <summary>
+    /// #1924 (final review M1): E1 (<c>_tq{bits}</c>) and E3 (<c>_tq{bits}_cpa</c>) decode the same codes through the same table with the
+    /// same arithmetic, so their outputs must be BIT-identical. Zero tolerance makes this the one check that sees a staged-pipeline
+    /// error (a raw buffer read before its cp.async group lands, a parity swap) even when it stays inside the oracle tolerance. The
+    /// extra shapes are single-tile and two-tile prefills from offset 0 with many KV heads, where tile 0's codes have the shortest
+    /// window between their issue and their decode.
+    /// </summary>
+    public static IEnumerable<object[]> SpecVsStagedCases()
+    {
+        foreach (var c in FlashShapes())
+            if (HasCpaEntry((int)c[1], (int)c[0])) yield return c;
+        yield return [4, 128, 64, 8, 16, 0];
+        yield return [2, 128, 64, 8, 16, 0];
+        yield return [8, 128, 32, 8, 16, 0];
+        yield return [3, 128, 32, 4, 16, 0];
+        yield return [4, 128, 64, 8, 32, 0];
+        yield return [4, 64, 48, 8, 16, 0];
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(SpecVsStagedCases))]
+    public void FlashPrefill_SpecializedAndStaged_BitIdentical(int bits, int hd, int numHeads, int numKvHeads, int seqQ, int offset)
+    {
+        RequireKernels();
+        Assert.True(_kernels!.HasAttentionFlashPrefillKvTqStaged(hd, bits), $"staged TurboQuant prefill hd{hd} tq{bits} not loaded (stale PTX?)");
+        CaseResult Run(CudaKernels.TqPrefillVariant v)
+        {
+            CudaKernels.TqPrefillVariantOverride = v;
+            try { return RunCase(bits, hd, numHeads, numKvHeads, seqQ, offset, 0, false, flashEnabled: true, seed: 3300 + bits * 100 + hd + seqQ); }
+            finally { CudaKernels.TqPrefillVariantOverride = null; }
+        }
+        var spec = Run(CudaKernels.TqPrefillVariant.Specialized);
+        var cpa = Run(CudaKernels.TqPrefillVariant.Staged);
+        Assert.Equal(1, spec.SpecLaunches);
+        Assert.Equal(1, cpa.CpaLaunches);
+        int diff = 0, first = -1;
+        for (int i = 0; i < spec.InPlace.Length; i++)
+            if (BitConverter.SingleToInt32Bits(spec.InPlace[i]) != BitConverter.SingleToInt32Bits(cpa.InPlace[i])) { diff++; if (first < 0) first = i; }
+        _out.WriteLine($"spec vs cpa b{bits} hd{hd} {numHeads}/{numKvHeads} q{seqQ}@{offset}: {diff} of {spec.InPlace.Length} outputs differ");
+        Assert.True(diff == 0, $"Specialized and Staged differ in {diff} outputs (first at {first}: {spec.InPlace[Math.Max(first, 0)]} vs {cpa.InPlace[Math.Max(first, 0)]})");
+        AssertMatchesOracle(cpa, hd, $"cpa b{bits} hd{hd} {numHeads}/{numKvHeads} q{seqQ}@{offset}");
     }
 
     /// <summary>

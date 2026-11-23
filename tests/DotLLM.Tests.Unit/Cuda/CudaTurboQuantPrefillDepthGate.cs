@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using DotLLM.Core.Configuration;
 using DotLLM.Cuda;
+using DotLLM.Cuda.Interop;
 using DotLLM.Engine.KvCache.Codecs;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Integration.Fixtures;
@@ -14,15 +15,19 @@ namespace DotLLM.Tests.Unit.Cuda;
 
 /// <summary>
 /// #1924 gate for the bit-specialised (E1, <c>_tq{bits}</c>) and staged (E3, <c>_tq{bits}_cpa</c>) TurboQuant prefill entries, set by
-/// James 2026-11-22 in place of the SmolLM step-1 MinCos bound (which keeps gating the legacy entry): on Qwen3-4B, after a long
-/// chunked prefill, each new entry's mean KL(f16 KV || arm) is no worse than the legacy entry's plus the measured 1-ulp drift band
-/// (the legacy entry with its softmax scale one F32 ulp up and down; James 2026-11-22, "measure the noise, then decide"), and its
-/// top-1 agreement with f16 KV is no worse than legacy's minus 1, at tq3 and tq4.
+/// James 2026-11-22 in place of the SmolLM step-1 MinCos bound (which keeps gating the legacy entry). On Qwen3-4B (hd128) and
+/// Qwen2.5-0.5B (hd64), at tq4/3/2/8, after a long chunked prefill, each new entry at a width whose default is not legacy must have
+/// mean KL(f16 KV || arm) no worse than the legacy entry's plus the drift band, and top-1 agreement with f16 KV no worse than legacy's
+/// minus 1. The drift band (James 2026-11-22, "measure the noise, then decide"; widened per the final review) is the largest
+/// mean-KL movement over the legacy entry run with one deliberate 1-ulp perturbation per arm: softmax scale +-1 and +-2 F32 ulps, and
+/// the last bit of one stored K or V norm flipped after the first chunk. Arms inert by construction or that move no logit bitwise are
+/// dropped with the reason printed; at least two arms must move. E1 and E3 must be bit-identical.
 /// <para>A 4096-token wikitext prompt (<c>DOTLLM_TQ_PREFILL_DEPTH_TOKENS</c> overrides) is prefilled in 1024-row chunks, so every
-/// chunk after the first runs the tensor-core TQ prefill at depth (144 launches per arm); 32 teacher-forced decode rows follow
-/// (scalar kernel, unchanged). 33 rows are compared. The scratch oracle is reported for context, not gated. tq-gate's quality and
-/// 1-layer parity modes cannot see this change on CUDA (the CUDA forward returns one row, so quality runs one token per forward; one
-/// layer cannot move the codes). Model: Qwen3-4B-Instruct-2507 Q4_K_M (<c>DOTLLM_QWEN3_4B_GGUF</c> or the model store).</para>
+/// chunk after the first runs the tensor-core TQ prefill at depth; 32 teacher-forced decode rows follow (scalar kernel, unchanged).
+/// 33 rows are compared. The scratch oracle is reported for context, not gated. tq-gate's quality and 1-layer parity modes cannot see
+/// this change on CUDA (the CUDA forward returns one row, so quality runs one token per forward; one layer cannot move the codes).
+/// Models: Qwen3-4B-Instruct-2507 Q4_K_M (<c>DOTLLM_QWEN3_4B_GGUF</c>), Qwen2.5-0.5B-Instruct Q8_0 (<c>DOTLLM_QWEN25_05B_GGUF</c>), or
+/// the model store.</para>
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(CudaCollection.Name)]
@@ -32,13 +37,43 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
     private readonly ITestOutputHelper _out;
     public CudaTurboQuantPrefillDepthGate(ITestOutputHelper output) => _out = output;
 
-    [SkippableFact]
-    public void LongPrefill_NewEntries_NoFurtherFromF16ThanLegacy()
+    /// <summary>Models of the gate: a hd128 model (Qwen3-4B) and a hd64 model (Qwen2.5-0.5B), so every head dim the defaults cover has a
+    /// model-level gate (final review I2).</summary>
+    public static TheoryData<string> Models => new() { "qwen3-4b", "qwen2.5-0.5b" };
+
+    private static string ModelPath(string model) => model switch
     {
-        string modelPath = Environment.GetEnvironmentVariable("DOTLLM_QWEN3_4B_GGUF")
+        "qwen3-4b" => Environment.GetEnvironmentVariable("DOTLLM_QWEN3_4B_GGUF")
             ?? TestFixtureResolver.ResolveFile([], "bartowski", "Qwen_Qwen3-4B-Instruct-2507-GGUF",
-                                               ["Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"], null).Path ?? "";
-        Skip.If(!File.Exists(modelPath), $"Qwen3-4B-Instruct-2507 Q4_K_M GGUF not found ({modelPath}); set DOTLLM_QWEN3_4B_GGUF");
+                                               ["Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"], null).Path ?? "",
+        "qwen2.5-0.5b" => Environment.GetEnvironmentVariable("DOTLLM_QWEN25_05B_GGUF")
+            ?? TestFixtureResolver.ResolveFile([], "Qwen", "Qwen2.5-0.5B-Instruct-GGUF", ["qwen2.5-0.5b-instruct-q8_0.gguf"], null).Path ?? "",
+        _ => throw new ArgumentOutOfRangeException(nameof(model)),
+    };
+
+    /// <summary>A drift-control arm: the LEGACY entry with one deliberate 1-ulp perturbation.</summary>
+    private sealed record Ctrl(string Name, int ScaleUlps, int FlipNormSide);   // FlipNormSide: 0 none, 1 K, 2 V
+
+    private static readonly Ctrl[] Controls =
+    [
+        new("scale+1ulp", +1, 0), new("scale-1ulp", -1, 0), new("scale+2ulp", +2, 0), new("scale-2ulp", -2, 0),
+        new("Knorm-lsb", 0, 1), new("Vnorm-lsb", 0, 2),
+    ];
+
+    /// <summary>The kernel's F32 <c>scale * PK_LOG2E</c> for a scale moved <paramref name="ulps"/> F32 ulps from 1/sqrt(hd).</summary>
+    private static float ScaleLog2(int hd, int ulps)
+    {
+        float sc = 1f / MathF.Sqrt(hd);
+        for (int k = 0; k < Math.Abs(ulps); k++) sc = ulps > 0 ? MathF.BitIncrement(sc) : MathF.BitDecrement(sc);
+        return sc * 1.4426950408889634f;
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Models))]
+    public void LongPrefill_NewEntries_NoFurtherFromF16ThanLegacy(string modelName)
+    {
+        string modelPath = ModelPath(modelName);
+        Skip.If(!File.Exists(modelPath), $"{modelName} GGUF not found ({modelPath})");
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
         int n = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_TQ_PREFILL_DEPTH_TOKENS"), out int nn) ? nn : 4096;
         const int chunk = 1024, steps = 32;
@@ -52,10 +87,13 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
         int[] all = tokenizer.Encode(File.ReadAllText(corpus).Substring(0, 400_000));
         Assert.True(all.Length > n + steps + 1, $"corpus too short: {all.Length}");
         int[] toks = all[..(n + steps + 1)];
-        int vocab = config.VocabSize, maxSeq = n + steps + 8;
+        int vocab = config.VocabSize, maxSeq = n + steps + 8, hd = config.HeadDim;
         using var model = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptx);
+        Assert.True(CudaKernels.IsAttentionFlashPrefillKvqShape(config.NumAttentionHeads, config.NumKvHeads, hd),
+            $"{modelName}: {config.NumAttentionHeads}/{config.NumKvHeads} hd{hd} is not a tensor-core TQ prefill shape");
+        _out.WriteLine($"DEPTH model {modelName}: hd{hd} {config.NumAttentionHeads}/{config.NumKvHeads} heads, {config.NumLayers} layers, n={n}");
 
-        List<float[]> Run(DotLLM.Core.Attention.IKvCache cache)
+        List<float[]> Run(DotLLM.Core.Attention.IKvCache cache, Action? afterFirstChunk = null)
         {
             var rows = new List<float[]>();
             float[]? last = null;
@@ -65,6 +103,7 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
                 var pos = Enumerable.Range(s, m).ToArray();
                 using var l = model.Forward(toks.AsSpan(s, m).ToArray(), pos, 0, cache);
                 last = Row(l, vocab);
+                if (s == 0) afterFirstChunk?.Invoke();
             }
             rows.Add(last!);
             for (int k = 0; k < steps; k++)
@@ -74,22 +113,26 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
             }
             return rows;
         }
+        static bool Same(List<float[]> a, List<float[]> b) => a.Zip(b).All(p => p.First.AsSpan().SequenceEqual(p.Second));
 
         var gate = new List<(int bits, Dictionary<CudaKernels.TqPrefillVariant, (double meanKl, int agree)> stats, double band)>();
         List<float[]> f16;
         using (var c = model.CreateKvCache(maxSeq)) f16 = Run(c);
-        foreach (int bits in new[] { 4, 3 })
+        foreach (int bits in new[] { 4, 3, 2, 8 })
         {
-            var codecK = new TurboQuantCodec(config.HeadDim, bits, Seed);
-            var codecV = new TurboQuantCodec(config.HeadDim, bits, Seed ^ TurboQuantCodec.VSeedMask);
+            var codecK = new TurboQuantCodec(hd, bits, Seed);
+            var codecV = new TurboQuantCodec(hd, bits, Seed ^ TurboQuantCodec.VSeedMask);
             List<float[]> oracle;
             using (var c = model.CreateTurboQuantKvCache(maxSeq, codecK.MseBits, codecK.Centroids, codecK.RotationSigns,
                                                          codecV.RotationSigns, codecK.InvSqrtD)) oracle = Run(c);
             var kv = new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant, 0, bits, Seed);
             Report(bits, "oracle", oracle, f16, oracle, 0);
+            bool hasCpa = hd * bits / 32 % 4 == 0;   // staged needs 16-byte code rows (no hd64 tq3)
+            var entries = new List<CudaKernels.TqPrefillVariant> { CudaKernels.TqPrefillVariant.Legacy, CudaKernels.TqPrefillVariant.Specialized };
+            if (hasCpa) entries.Add(CudaKernels.TqPrefillVariant.Staged);
             var arms = new Dictionary<CudaKernels.TqPrefillVariant, List<float[]>>();
             var stats = new Dictionary<CudaKernels.TqPrefillVariant, (double meanKl, int agree)>();
-            foreach (var v in new[] { CudaKernels.TqPrefillVariant.Legacy, CudaKernels.TqPrefillVariant.Specialized, CudaKernels.TqPrefillVariant.Staged })
+            foreach (var v in entries)
             {
                 long l0 = CudaKernels.AttentionFlashPrefillKvTqLaunches, s0 = CudaKernels.AttentionFlashPrefillKvTqSpecLaunches,
                      c0 = CudaKernels.AttentionFlashPrefillKvTqCpaLaunches;
@@ -103,51 +146,84 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
                 Assert.Equal(v == CudaKernels.TqPrefillVariant.Staged ? flash : 0, cpa);
                 stats[v] = Report(bits, v.ToString(), arms[v], f16, oracle, flash);
             }
-            var (cosLs, _) = CosStats(arms[CudaKernels.TqPrefillVariant.Legacy], arms[CudaKernels.TqPrefillVariant.Staged]);
-            var (cosSs, _) = CosStats(arms[CudaKernels.TqPrefillVariant.Specialized], arms[CudaKernels.TqPrefillVariant.Staged]);
-            _out.WriteLine($"DEPTH b{bits} n={n}: min cos(Legacy, Staged) {cosLs:F6}; min cos(Specialized, Staged) {cosSs:F6} (E1 and E3 should be bit-identical: 1)");
-
-            // 1-ULP drift control (James 2026-11-22): the LEGACY entry with its softmax scale moved one F32 ulp up, then down. The run
-            // is deterministic, so how far that moves KL(f16||arm) is the noise band of two correct implementations of this entry.
-            double band = 0;
-            bool anyMoved = false;
-            foreach (int nudge in new[] { +1, -1 })
+            if (hasCpa)
             {
-                CudaKernels.TqPrefillVariantOverride = CudaKernels.TqPrefillVariant.Legacy;
-                CudaKernels.TqPrefillScaleUlpNudge = nudge;
-                List<float[]> ctrl;
-                try { using var c = model.CreateKvCache(maxSeq, kv); ctrl = Run(c); }
-                finally { CudaKernels.TqPrefillVariantOverride = null; CudaKernels.TqPrefillScaleUlpNudge = 0; }
-                var (klC, _) = Report(bits, $"Legacy{(nudge > 0 ? "+" : "-")}1ulp", ctrl, f16, oracle, 0);
-                // Bitwise, not a cosine: a cosine of two identical rows can still round below 1.
-                bool moved = !arms[CudaKernels.TqPrefillVariant.Legacy].Zip(ctrl).All(p => p.First.AsSpan().SequenceEqual(p.Second));
-                _out.WriteLine($"DEPTH b{bits} Legacy{(nudge > 0 ? "+" : "-")}1ulp moved the logits: {moved}");
-                anyMoved |= moved;
-                band = Math.Max(band, Math.Abs(klC - stats[CudaKernels.TqPrefillVariant.Legacy].meanKl));
+                // E1 and E3 decode the same codes through the same table with the same arithmetic: bit-identical by construction. This is
+                // the only zero-tolerance check on the staging pipeline over a long prefill (final review M1).
+                Assert.True(Same(arms[CudaKernels.TqPrefillVariant.Specialized], arms[CudaKernels.TqPrefillVariant.Staged]),
+                    $"{modelName} tq{bits}: Specialized and Staged logits are not bit-identical");
             }
-            // A control that cannot move is no control (CLAUDE.md: prove the test can fail). One moving arm is enough: on the 84417b15
-            // run the +1-ulp arm reproduced legacy's KL to every printed digit and the band rested on the -1-ulp arm alone.
-            Assert.True(anyMoved, $"tq{bits}: neither 1-ulp control arm moved any logit; the band cannot be measured");
-            _out.WriteLine($"DEPTH b{bits}: 1-ulp drift band on mean KL = {band:E4} ({100 * band / stats[CudaKernels.TqPrefillVariant.Legacy].meanKl:F2}% of legacy)");
+
+            // Drift control (James 2026-11-22, "measure the noise, then decide"; widened after final review I1): the LEGACY entry with one
+            // deliberate 1-ulp perturbation per arm. The run is deterministic, so how far each arm moves mean KL(f16||arm) samples the
+            // noise of two correct implementations; the band is the max over every arm that moved. An arm that cannot or did not move
+            // any logit bitwise is dropped with its reason. At hd128 the +1-ulp scale arm is inert BY CONSTRUCTION (1/sqrt(128) * log2e
+            // rounds to the same F32: the product's ulp is twice the input's), which is why the 2-ulp and norm-LSB arms exist.
+            double band = 0;
+            var moved = new List<string>();
+            float baseScale = ScaleLog2(hd, 0);
+            foreach (var ctl in Controls)
+            {
+                if (ctl.ScaleUlps != 0 && BitConverter.SingleToInt32Bits(ScaleLog2(hd, ctl.ScaleUlps)) == BitConverter.SingleToInt32Bits(baseScale))
+                {
+                    _out.WriteLine($"DEPTH b{bits} ctrl {ctl.Name}: DROPPED, inert by construction (scale*log2e is bit-identical at hd{hd})");
+                    continue;
+                }
+                List<float[]> ctrl;
+                CudaKernels.TqPrefillVariantOverride = CudaKernels.TqPrefillVariant.Legacy;
+                CudaKernels.TqPrefillScaleUlpNudge = ctl.ScaleUlps;
+                try
+                {
+                    using var c = (CudaTurboQuantInPlaceKvCache)model.CreateKvCache(maxSeq, kv);
+                    ctrl = Run(c, ctl.FlipNormSide == 0 ? null : () => FlipNormLsb(c, ctl.FlipNormSide));
+                }
+                finally { CudaKernels.TqPrefillVariantOverride = null; CudaKernels.TqPrefillScaleUlpNudge = 0; }
+                if (Same(arms[CudaKernels.TqPrefillVariant.Legacy], ctrl))
+                {
+                    _out.WriteLine($"DEPTH b{bits} ctrl {ctl.Name}: DROPPED, no logit moved bitwise");
+                    continue;
+                }
+                var (klC, _) = Report(bits, $"ctrl {ctl.Name}", ctrl, f16, oracle, 0);
+                band = Math.Max(band, Math.Abs(klC - stats[CudaKernels.TqPrefillVariant.Legacy].meanKl));
+                moved.Add(ctl.Name);
+            }
+            // A control that cannot move is no control (CLAUDE.md: prove the test can fail), and one moving arm is a single sample.
+            Assert.True(moved.Count >= 2, $"{modelName} tq{bits}: only {moved.Count} drift-control arm(s) moved the logits; the band is not measured");
+            _out.WriteLine($"DEPTH b{bits}: drift band on mean KL = {band:E4} ({100 * band / stats[CudaKernels.TqPrefillVariant.Legacy].meanKl:F2}% of legacy) over {moved.Count} arms: {string.Join(", ", moved)}");
             gate.Add((bits, stats, band));
         }
-        // The gate (James 2026-11-22), evaluated after every arm is reported so a failure still prints all the numbers.
-        // Tolerance on mean KL = the measured 1-ulp drift band of the legacy entry (James 2026-11-22: "measure the noise, then decide").
+        // The gate (James 2026-11-22), evaluated after every arm is reported so a failure still prints all the numbers: each new entry
+        // at a width whose default is not legacy must have mean KL no worse than legacy + band and top-1 no worse than legacy - 1.
+        var failures = new List<string>();
         foreach (var (bits, st, band) in gate)
         {
             var (klL, agL) = st[CudaKernels.TqPrefillVariant.Legacy];
             if (CudaKernels.DefaultTqPrefillVariantFor(bits) == CudaKernels.TqPrefillVariant.Legacy)
             {
-                // James 2026-11-22: a bit width whose default is routed to legacy is not gated on the new entries (they stay opt-in).
                 _out.WriteLine($"DEPTH b{bits}: default entry is Legacy; spec / cpa not gated at this width (opt-in only)");
                 continue;
             }
-            foreach (var v in new[] { CudaKernels.TqPrefillVariant.Specialized, CudaKernels.TqPrefillVariant.Staged })
+            foreach (var v in st.Keys.Where(k => k != CudaKernels.TqPrefillVariant.Legacy))
             {
                 var (kl, ag) = st[v];
-                Assert.True(kl <= klL + band, $"tq{bits} {v}: mean KL(f16||arm) {kl:E4} is worse than legacy's {klL:E4} by more than the 1-ulp drift band {band:E4}");
-                Assert.True(ag >= agL - 1, $"tq{bits} {v}: top-1 agreement with f16 {ag}/33 is below legacy's {agL}/33 minus 1");
+                bool ok = kl <= klL + band && ag >= agL - 1;
+                _out.WriteLine($"DEPTH GATE {modelName} tq{bits} {v}: mean KL {kl:E4} vs legacy {klL:E4} + band {band:E4}; top-1 {ag} vs {agL} - 1: {(ok ? "PASS" : "FAIL")}");
+                if (!ok) failures.Add($"tq{bits} {v} (KL {kl:E4} vs limit {klL + band:E4}, top-1 {ag} vs floor {agL - 1})");
             }
+        }
+        Assert.True(failures.Count == 0, $"{modelName}: " + string.Join("; ", failures));
+    }
+
+    /// <summary>Flips the last bit of one F16 norm (layer 0, position 0, kv head 0) of side 1 = K or 2 = V: a 1-ulp change of a stored value.</summary>
+    private static void FlipNormLsb(CudaTurboQuantInPlaceKvCache c, int side)
+    {
+        nint ptr = side == 1 ? c.GetKeyNormsPtr(0) : c.GetValueNormsPtr(0);
+        var h = new ushort[1];
+        fixed (ushort* hp = h)
+        {
+            DotLLM.Cuda.Interop.CudaDriverApi.cuMemcpyDtoH_v2((nint)hp, ptr, 2).ThrowOnError();
+            h[0] ^= 1;
+            DotLLM.Cuda.Interop.CudaDriverApi.cuMemcpyHtoD_v2(ptr, (nint)hp, 2).ThrowOnError();
         }
     }
 

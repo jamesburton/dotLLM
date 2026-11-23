@@ -631,8 +631,9 @@ PK_TQ_ENTRY(attention_flash_mma_prefill_kvq_hd64_tqtq, 64)
 // match, and only for F16 / BF16 norms). Changes to the TQ tile path:
 //   1. Norms stay out of the tile. A K / V tile element is the bare centroid half(c[code]). The K norm scales the score
 //      (S_j = n_kj * q~ . c_j), the V norm scales the P operand (P_j * n_vj); the softmax sum l keeps the raw P, as in the
-//      scalar attention_kvtq. Rounding points: half(c) per operand and half(p * n_v) for P (p <= 1, stored norms <= 65504, so
-//      it cannot overflow), against half(n * c) in _tqtq: one F16 rounding per operand either way.
+//      scalar attention_kvtq. Rounding points: half(c) per operand and half(p * n_v) for P, against half(n * c) in _tqtq: one
+//      F16 rounding per operand either way. p <= 1, so with F16 norms (<= 65504, the production format) half(p * n_v)
+//      cannot overflow; BF16 norms above 65504 (direct-API only) can make it inf where _tqtq stays finite further.
 //   2. A shared-memory F16 centroid table built once per block replaces the per-element code-dependent __ldg gather:
 //      tq4 256 x half2 (one code byte -> two elements), tq3 64 x half2 (6 bits -> two), tq2 256 x 4 halves (one byte -> four),
 //      tq8 256 halves. Each 8-element chunk is 1 or 2 code-word loads + 2..8 table reads; no conversions.

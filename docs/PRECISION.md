@@ -621,6 +621,21 @@ Decision: **F16, chosen by controller ruling** (`TurboQuantLayout.DefaultNorm`).
 The 10% line at 8 bits cannot be resolved with this instrument (null control +3% to +20%), and F16 is not separable from that control; it has 8x less error than BF16.
 Follow-up: re-check F16 vs BF16 with a deterministic attention-output metric (per-layer relative error on captured K/V) instead of chaotic KL.
 
+### E18 - CUDA TurboQuant prefill rounding points (#1924)
+
+The bit-specialised and staged tensor-core TQ prefill entries (`_tq{bits}`, `_tq{bits}_cpa`) keep the norm out of the tile. The rounding
+points therefore move against the legacy `_tqtq` entry, whose K / V operand is `half(n * c)`:
+- **K side:** the operand is `half(c)` and the norm is applied in F32 after the mma (`S = n_k * (q~ . c)`). This is one rounding fewer
+  than legacy.
+- **V side:** the V operand is `half(c)`, and the norm is folded into the P operand as `half(p * n_v)`.
+- **Softmax sum:** the sum keeps the raw F32 p.
+
+With F16 norms `half(p * n_v)` cannot overflow (p <= 1, n_v <= 65,504). BF16 norms above 65,504, reachable only through the direct
+cache API, could overflow it.
+
+Model-level evidence is `CudaTurboQuantPrefillDepthGate`. The new entries' mean KL to F16 KV must stay within legacy plus a measured
+1-ulp drift band; see KV_CACHE.md "TurboQuant" for the numbers.
+
 ## 6. Decision table: CLAUDE.md rule → evidence
 
 | CLAUDE.md rule (Precision & Expansion) | evidence | verdict |

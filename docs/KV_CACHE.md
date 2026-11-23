@@ -412,8 +412,10 @@ why; it is never served by another cache (#1888).
   uses the scalar body); `tq_rotate_q` / `tq_rotate_o` (and `tq_rotate_o_f16`, which keeps the attention output F16).
   **Decode is eager and never graph-captured** (#1918, same as q8_0 KV today).
   - Prefill entries (#1924), picked by `DOTLLM_CUDA_TQ_PREFILL=legacy|spec|cpa`. Unset = `cpa` (Staged) for tq2/tq3/tq4/tq8
-    (James 2026-11-22; tq3's +4% mean KL to F16 KV against legacy is inside the legacy entry's 1-ulp drift band, 7.1%; that band
-    rests on the -1-ulp softmax-scale arm alone, the +1-ulp arm left KL unchanged to every printed digit). `legacy` = `_tqtq` (runtime bits,
+    (James 2026-11-22: a width is Staged only while its new entries stay within the legacy entry's drift band on the depth gate).
+    The band is the largest mean-KL movement over several 1-ulp perturbations of the legacy entry (softmax scale +-1 and +-2 F32
+    ulps, one stored K or V norm's last bit). At hd128 the +1-ulp scale arm is inert by construction (1/sqrt(128) * log2e rounds
+    to the same F32), so it is dropped; the first tq3 ruling rested on the -1-ulp arm alone (band 7.1% against tq3's +4.3%). `legacy` = `_tqtq` (runtime bits,
     `half(norm * centroid)` per element from global memory). `spec` = `_tq{2,3,4,8}`: norms kept out of the tile (the K norm scales
     the score, the V norm scales P; the softmax sum keeps the raw P), a shared-memory F16 centroid table, bits compiled in. `cpa` =
     `_tq{2,3,4,8}_cpa`: `spec` plus `cp.async` staging of the raw code rows one tile ahead and a single decoded tile, which takes hd128
@@ -423,8 +425,9 @@ why; it is never served by another cache (#1888).
   - Model-level bench (framework RTX 3060, Qwen3-4B Q4_K_M, tq4, `run --prefill-chunk-size 1024`, prefill tok/s, relative only):
     `cpa` 1.34x `legacy` at 7K and 2.16x at 32K; against q4_0 KV 0.983x at 7K (counted as parity, James 2026-11-22) and 1.113x at
     32K, at 38,016 vs 41,472 KV bytes per token (8% fewer). tq3 at 7K: `cpa` 1.36x `legacy`. Decode unchanged.
-  - Gates: `legacy` keeps the SmolLM MinCos bound; `spec` / `cpa` are gated by `CudaTurboQuantPrefillDepthGate` (Qwen3-4B, mean KL to
-    F16 KV no worse than legacy plus the legacy entry's 1-ulp drift band, top-1 no worse than legacy minus 1), and
+  - Gates: `legacy` keeps the SmolLM MinCos bound; `spec` / `cpa` are gated by `CudaTurboQuantPrefillDepthGate` (Qwen3-4B hd128 and
+    Qwen2.5-0.5B hd64, tq2/3/4/8; mean KL to F16 KV no worse than legacy plus the drift band, top-1 no worse than legacy minus 1;
+    `spec` and `cpa` bit-identical), and
     `CudaTurboQuantPrefillTailTests` proves no entry reads a row past `seq_kv`.
 - Vulkan: dense chain (`IsDenseF16KvEligible`) and Flint. A `_kvtq` twin for every attention arm those hosts dispatch (per-token,
   per-query-position, tiled, GQA flash, coopmat flash, split-KV decode v1 and v2, Flint's sink flash and reference sink kernel),

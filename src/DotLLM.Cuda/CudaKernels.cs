@@ -5378,8 +5378,10 @@ public sealed unsafe partial class CudaKernels : IDisposable
     {
         "legacy" => TqPrefillVariant.Legacy,
         "spec" => TqPrefillVariant.Specialized,
-        "cpa" => TqPrefillVariant.Staged,
-        _ => null,
+        "cpa" or "staged" or "e3" => TqPrefillVariant.Staged,
+        "specialized" or "specialised" or "e1" => TqPrefillVariant.Specialized,
+        null or "" => null,
+        var other => WarnUnknownTqPrefill(other),
     };
 
     /// <summary>The TurboQuant prefill entry used when neither the environment nor a test override picks one.</summary>
@@ -5408,7 +5410,17 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// </summary>
     internal static int TqPrefillScaleUlpNudge;
 
-    /// <summary>Test / bench override of the TurboQuant prefill entry; null = automatic (specialised when it applies).</summary>
+    /// <summary>
+    /// An unrecognised non-empty <c>DOTLLM_CUDA_TQ_PREFILL</c> is said once on stderr (an A/B arm labelled with a typo would otherwise
+    /// silently run the default) and then ignored.
+    /// </summary>
+    private static TqPrefillVariant? WarnUnknownTqPrefill(string value)
+    {
+        Console.Error.WriteLine($"dotLLM CUDA: DOTLLM_CUDA_TQ_PREFILL={value} is not legacy|spec|cpa (or staged|e1|e3); using the default entry");
+        return null;
+    }
+
+    /// <summary>Test / bench override of the TurboQuant prefill entry; null = automatic (<see cref="DefaultTqPrefillVariantFor"/>).</summary>
     internal static TqPrefillVariant? TqPrefillVariantOverride;
 
     /// <summary>Launches since process start that ran a specialised <c>_tq{bits}</c> entry (a subset of <see cref="AttentionFlashPrefillKvTqLaunches"/>).</summary>
@@ -5486,7 +5498,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
             ran = TqPrefillVariant.Staged;
             Interlocked.Increment(ref AttentionFlashPrefillKvTqCpaLaunches);
         }
-        else if (want != TqPrefillVariant.Legacy && specOk && _attentionFlashPrefillKvTqSpecFuncs[hdIdx * 4 + bIdx] != 0)
+        else if (want != TqPrefillVariant.Legacy && specOk && _attentionFlashPrefillKvTqSpecFuncs[hdIdx * 4 + bIdx] != 0
+                 && (mseBits != 8 || ((kCodes | vCodes) & 7) == 0))   // E1 tq8 reads uint2 code pairs from global memory
         {
             fn = _attentionFlashPrefillKvTqSpecFuncs[hdIdx * 4 + bIdx];
             smem = AttentionFlashPrefillKvTqSpecSmemBytes(headDim, group, mseBits, staged: false);
