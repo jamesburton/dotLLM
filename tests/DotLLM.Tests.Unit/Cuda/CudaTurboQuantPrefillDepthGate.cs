@@ -18,7 +18,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// James 2026-11-22 in place of the SmolLM step-1 MinCos bound (which keeps gating the legacy entry). On Qwen3-4B (hd128) and
 /// Qwen2.5-0.5B (hd64), at tq4/3/2/8, after a long chunked prefill, each new entry at a width whose default is not legacy must have
 /// mean KL(f16 KV || arm) no worse than the legacy entry's plus the drift band, and top-1 agreement with f16 KV no worse than legacy's
-/// minus 1. The drift band (James 2026-11-22, "measure the noise, then decide"; widened per the final review) is the largest
+/// minus the control arms' top-1 spread (James 2026-11-23; it was a fixed minus 1). The drift band (James 2026-11-22, "measure the noise, then decide"; widened per the final review) is the largest
 /// mean-KL movement over the legacy entry run with one deliberate 1-ulp perturbation per arm: softmax scale +-1 and +-2 F32 ulps, and
 /// the last bit of one stored K or V norm flipped after the first chunk. Arms inert by construction or that move no logit bitwise are
 /// dropped with the reason printed; at least two arms must move. E1 and E3 must be bit-identical.
@@ -115,7 +115,7 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
         }
         static bool Same(List<float[]> a, List<float[]> b) => a.Zip(b).All(p => p.First.AsSpan().SequenceEqual(p.Second));
 
-        var gate = new List<(int bits, Dictionary<CudaKernels.TqPrefillVariant, (double meanKl, int agree)> stats, double band)>();
+        var gate = new List<(int bits, Dictionary<CudaKernels.TqPrefillVariant, (double meanKl, int agree)> stats, double band, int topBand)>();
         List<float[]> f16;
         using (var c = model.CreateKvCache(maxSeq)) f16 = Run(c);
         foreach (int bits in new[] { 4, 3, 2, 8 })
@@ -160,6 +160,7 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
             // any logit bitwise is dropped with its reason. At hd128 the +1-ulp scale arm is inert BY CONSTRUCTION (1/sqrt(128) * log2e
             // rounds to the same F32: the product's ulp is twice the input's), which is why the 2-ulp and norm-LSB arms exist.
             double band = 0;
+            int topBand = 0;   // top-1 spread of the same control arms (James 2026-11-23)
             var moved = new List<string>();
             float baseScale = ScaleLog2(hd, 0);
             var scalesRun = new Dictionary<int, string>();   // scale*log2e bits -> the arm that already ran that kernel
@@ -196,19 +197,20 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
                     _out.WriteLine($"DEPTH b{bits} ctrl {ctl.Name}: DROPPED, no logit moved bitwise");
                     continue;
                 }
-                var (klC, _) = Report(bits, $"ctrl {ctl.Name}", ctrl, f16, oracle, 0);
+                var (klC, agC) = Report(bits, $"ctrl {ctl.Name}", ctrl, f16, oracle, 0);
                 band = Math.Max(band, Math.Abs(klC - stats[CudaKernels.TqPrefillVariant.Legacy].meanKl));
+                topBand = Math.Max(topBand, Math.Abs(agC - stats[CudaKernels.TqPrefillVariant.Legacy].agree));
                 moved.Add(ctl.Name);
             }
             // A control that cannot move is no control (CLAUDE.md: prove the test can fail), and one moving arm is a single sample.
             Assert.True(moved.Count >= 2, $"{modelName} tq{bits}: only {moved.Count} drift-control arm(s) moved the logits; the band is not measured");
-            _out.WriteLine($"DEPTH b{bits}: drift band on mean KL = {band:E4} ({100 * band / stats[CudaKernels.TqPrefillVariant.Legacy].meanKl:F2}% of legacy) over {moved.Count} arms: {string.Join(", ", moved)}");
-            gate.Add((bits, stats, band));
+            _out.WriteLine($"DEPTH b{bits}: drift band on mean KL = {band:E4} ({100 * band / stats[CudaKernels.TqPrefillVariant.Legacy].meanKl:F2}% of legacy) over {moved.Count} arms: {string.Join(", ", moved)}; top-1 spread {topBand}/33");
+            gate.Add((bits, stats, band, topBand));
         }
         // The gate (James 2026-11-22), evaluated after every arm is reported so a failure still prints all the numbers: each new entry
         // at a width whose default is not legacy must have mean KL no worse than legacy + band and top-1 no worse than legacy - 1.
         var failures = new List<string>();
-        foreach (var (bits, st, band) in gate)
+        foreach (var (bits, st, band, topBand) in gate)
         {
             var (klL, agL) = st[CudaKernels.TqPrefillVariant.Legacy];
             if (CudaKernels.DefaultTqPrefillVariantFor(bits) == CudaKernels.TqPrefillVariant.Legacy)
@@ -219,9 +221,12 @@ public sealed unsafe class CudaTurboQuantPrefillDepthGate
             foreach (var v in st.Keys.Where(k => k != CudaKernels.TqPrefillVariant.Legacy))
             {
                 var (kl, ag) = st[v];
-                bool ok = kl <= klL + band && ag >= agL - 1;
-                _out.WriteLine($"DEPTH GATE {modelName} tq{bits} {v}: mean KL {kl:E4} vs legacy {klL:E4} + band {band:E4}; top-1 {ag} vs {agL} - 1: {(ok ? "PASS" : "FAIL")}");
-                if (!ok) failures.Add($"tq{bits} {v} (KL {kl:E4} vs limit {klL + band:E4}, top-1 {ag} vs floor {agL - 1})");
+                // Top-1 floor (James 2026-11-23, "band top-1 too"): legacy's top-1 minus the top-1 spread of the same control arms that
+                // set the KL band, derived per run. It replaces the fixed "legacy minus 1", which had no noise band.
+                int floor = agL - topBand;
+                bool ok = kl <= klL + band && ag >= floor;
+                _out.WriteLine($"DEPTH GATE {modelName} tq{bits} {v}: mean KL {kl:E4} vs legacy {klL:E4} + band {band:E4}; top-1 {ag} vs {agL} - spread {topBand} = {floor}: {(ok ? "PASS" : "FAIL")}");
+                if (!ok) failures.Add($"tq{bits} {v} (KL {kl:E4} vs limit {klL + band:E4}, top-1 {ag} vs floor {floor})");
             }
         }
         Assert.True(failures.Count == 0, $"{modelName}: " + string.Join("; ", failures));
