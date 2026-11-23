@@ -164,6 +164,7 @@ public sealed class VulkanSplitKvDecodeBench
         _output.WriteLine("seqKv\tarm\tmin_ms\tmedian_ms\tunique_GB/s\tG_elem/s\tcheck");
         using var f32 = VulkanSplitKvAttentionKernel.Create(device, spvDir, VulkanKvStorage.F32);
         f32.PreferGqa = true;
+        f32.PreferPartF16 = false;   // the oracle for the pre-change arms, which write F32 partials (#1926 E4 control)
 
         foreach (int seqKv in lengths)
         {
