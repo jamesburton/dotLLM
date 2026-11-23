@@ -144,15 +144,31 @@ public abstract class GenerationSessionBackendSuite
                 var (after, bytesAfter, fpAfter) = MeasureUnset(fx, tokens, firstChunk);
                 for (int i = 0; i < before.Length; i++)
                     Assert.True(BitConverter.SingleToInt32Bits(before[i]) == BitConverter.SingleToInt32Bits(after[i]), $"{fx.Backend}/{family} chunk={firstChunk} logit {i}: {before[i]} vs {after[i]} after an attach/detach cycle");
-                Assert.Equal(bytesBefore, bytesAfter);
+                if (fx.Backend != SessionBackend.Cuda) Assert.Equal(bytesBefore, bytesAfter);   // CUDA: bounded by the same-run spread in (3) instead (allocation noise there is real)
                 Assert.Equal(fpBefore, fpAfter);
 
-                // (3) the unset path against a modifier that is attached and never applies.
+                // (3) the unset path against a modifier that is attached and never applies. Arms alternate (inapplicable, unset, inapplicable),
+                // each arm warmed and measured as a minimum over several forwards. The noise floor is a same-run control: the spread of the
+                // repeated identical-arm minimums (the two attached-inapplicable runs, the three unset runs). It is 0 on CPU (exact), so a hook
+                // that allocates on the unset path dies there; on a GPU, first-call / pooled-buffer / ordering noise (observed: CUDA hybrid-dense
+                // unset 8624 B vs inapplicable 7192 B) is bounded by what identical arms themselves disagree by.
+                long inapplicableBytes, inapplicable2; string fpInapplicable;
                 arm.Attach(layer: int.MaxValue);
-                long inapplicableBytes; string fpInapplicable;
-                try { (_, inapplicableBytes, fpInapplicable) = MeasureUnset(fx, tokens, firstChunk); }
+                try
+                {
+                    RawLastLogits(fx, tokens, firstChunk, perturb: false);
+                    (_, inapplicableBytes, fpInapplicable) = MeasureUnset(fx, tokens, firstChunk);
+                }
                 finally { arm.Detach(); }
-                Assert.True(bytesBefore <= inapplicableBytes, $"{fx.Backend}/{family}: the unset forward allocates {bytesBefore} B, more than the attached-inapplicable {inapplicableBytes} B");
+                var (_, unset3, fpUnset3) = MeasureUnset(fx, tokens, firstChunk);
+                arm.Attach(layer: int.MaxValue);
+                try { (_, inapplicable2, _) = MeasureUnset(fx, tokens, firstChunk); }
+                finally { arm.Detach(); }
+                long[] unsetRuns = [bytesBefore, bytesAfter, unset3];
+                long[] inappRuns = [inapplicableBytes, inapplicable2];
+                long spread = Math.Max(unsetRuns.Max() - unsetRuns.Min(), inappRuns.Max() - inappRuns.Min());
+                Assert.True(unsetRuns.Min() <= inappRuns.Min() + spread, $"{fx.Backend}/{family}: the unset forward allocates {unsetRuns.Min()} B (runs {string.Join("/", unsetRuns)}), more than the attached-inapplicable {inappRuns.Min()} B (runs {string.Join("/", inappRuns)}) plus the same-run spread {spread} B");
+                if (fx.Backend == SessionBackend.Cpu) Assert.Equal(0, spread);   // the CPU path is deterministic: the control must be exactly 0, so the comparison is exact there
                 Assert.True(FenceWaits(fpBefore) <= FenceWaits(fpInapplicable), $"{fx.Backend}/{family}: the unset forward waited more on the device ({fpBefore}) than the attached-inapplicable one ({fpInapplicable})");
                 string? log = Environment.GetEnvironmentVariable("DOTLLM_SESSION_CONTROL_LOG");
                 if (!string.IsNullOrEmpty(log))
@@ -398,6 +414,12 @@ public abstract class GenerationSessionBackendSuite
     /// Path-matched exactness of an attention rollback: RollbackTo(k) re-forwards token k-1 as one decode row over rows [0, k-1) kept from
     /// the earlier forwards, which is exactly what a fresh session does for [prefill k-1 tokens, append token k-1]. Both go through the
     /// same kernels, so they agree to 5e-4 on every backend even where prefill-vs-decode noise (see <c>ControlMaxAbsDiff</c>) is larger.
+    /// Bound (James 2026-11-23, after the first CUDA run): DERIVED from the same-run control, no fixed number on GPU. CUDA llama emits F16 logits and
+    /// its oracle is not bit-matched (the rolled-back KV rows [0, k-1) came from the ORIGINAL longer prefill, the oracle prefills only k-1 tokens:
+    /// different tile shapes, legitimately different F16 roundings; observed k=14 logit 0 -1.6220703 vs -1.6210938 = one F16 ULP). So the bound is
+    /// <see cref="ControlFactor"/> x <see cref="ControlMaxAbsDiff"/> (1-ULP residual arm and prefill-vs-decode split), never below the control's own diff; on CPU
+    /// the 5e-4 floor holds as well (max of the two). A rollback that keeps an extra KV row or re-forwards at a wrong position moves logits by orders of
+    /// magnitude more (mutants in the PR body).
     /// </summary>
     [SkippableFact]
     public async Task AttentionModel_Rollback_MatchesAPathMatchedOracle()
@@ -408,14 +430,15 @@ public abstract class GenerationSessionBackendSuite
         int[] all = await Build(s, fx);
         foreach (int k in new[] { fx.Prompt.Length + 2, fx.Prompt.Length })
         {
+            float control = ControlMaxAbsDiff(oracle, all[..k]);
+            float bound = ControlFactor * control;
+            if (fx.Backend == SessionBackend.Cpu) bound = Math.Max(bound, 5e-4f);   // the 5e-4 floor holds on CPU only
             s.RollbackTo(k);
             await using var o = oracle.NewGenerator().CreateSession(Greedy(), Tag());
             await o.PrefillAsync(all.Take(k - 1).ToArray());
             await o.AppendObservationTokensAsync(new[] { all[k - 1] });
-            var a = Logits(s);
-            var b = Logits(o);
-            for (int i = 0; i < a.Length; i++)
-                Assert.True(Math.Abs(a[i] - b[i]) <= 5e-4f, $"k={k} logit {i}: rolled back {a[i]} vs path-matched oracle {b[i]}");
+            float diff = MaxAbsDiff(Logits(s), Logits(o));
+            Assert.True(diff <= bound, $"{fx.Backend} k={k}: rolled back vs path-matched oracle max diff {diff:E3} exceeds {ControlFactor}x control {control:E3} (bound {bound:E3})");
         }
     }
 
