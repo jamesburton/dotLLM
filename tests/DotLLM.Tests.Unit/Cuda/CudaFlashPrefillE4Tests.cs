@@ -202,3 +202,70 @@ public sealed unsafe partial class CudaAttentionKvqTests
         return s.Length % 2 == 1 ? s[s.Length / 2] : 0.5 * (s[s.Length / 2 - 1] + s[s.Length / 2]);
     }
 }
+
+/// <summary>
+/// #1943, regular (not opt-in): the shipped E4 entries and their <c>_legacy</c> (pre-E4 body) twins in the same PTX. Both are 16-key
+/// tiles with the same arithmetic in the same order, so they must agree BIT FOR BIT on every shape and format (Q in registers and
+/// the single-buffer schedule change no rounding); and the occupancy choice must take the twin exactly where the E4 entry fits fewer
+/// blocks per SM (hd128 group 7 on sm_86) and the E4 entry at Qwen3-4B's group 4.
+/// </summary>
+public sealed unsafe partial class CudaAttentionKvqTests
+{
+    public static IEnumerable<object[]> E4BodyCases() =>
+        F16FlashCases().Select(c => new object[] { "F16", c[0], c[1], c[2], c[3], c[4] })
+            .Concat(FlashCases().Select(c => new object[] { $"{c[0]}/{c[1]}", c[2], c[3], c[4], c[5], c[6] }))
+            .Append(new object[] { "F16", 128, 28, 4, 1000, 291 })          // group 7 hd128 (Qwen2.5-7B shape)
+            .Append(new object[] { "Q8_0/Q4_0", 128, 28, 4, 33, 1024 });
+
+    [SkippableTheory]
+    [MemberData(nameof(E4BodyCases))]
+    public void FlashPrefillKvq_E4AndLegacyBodies_BitIdentical(string fmts, int headDim, int numHeads, int numKvHeads, int seqQ, int offset)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null, "PTX kernels not available");
+        KvCacheDType? kFmt = fmts == "F16" ? null : Enum.Parse<KvCacheDType>(fmts.Split('/')[0]);
+        KvCacheDType? vFmt = fmts == "F16" ? null : Enum.Parse<KvCacheDType>(fmts.Split('/')[1]);
+        Skip.IfNot(_kernels!.HasAttentionFlashPrefillKvq(headDim, kFmt, vFmt), "flash prefill kvq kernel not loaded");
+        Skip.If(_kernels.AttentionFlashPrefillKvqStaticSmemBytes(headDim, kFmt, vFmt) == 0, "pre-E4 PTX (no E4 entry)");
+        int seqKv = offset + seqQ;
+        using var f = new Fixture(this, kFmt ?? KvCacheDType.Q8_0, vFmt ?? KvCacheDType.Q8_0, headDim, numHeads, numKvHeads, seqQ, seqKv,
+            seqKv, window: 0, sinks: false);
+        nint k = kFmt is null ? f.KScratch : f.KQuant, v = kFmt is null ? f.VScratch : f.VQuant;
+        bool? saved = CudaKernels.FlashPrefillKvqLegacyBodyOverride;
+        long legacy0 = CudaKernels.AttentionFlashPrefillKvqLegacyBodyLaunches;
+        try
+        {
+            CudaKernels.FlashPrefillKvqLegacyBodyOverride = false;
+            _kernels.LaunchAttentionFlashPrefillKvq(f.Q, k, v, kFmt, vFmt, f.OutNew, seqQ, seqKv, numHeads, numKvHeads, headDim, offset,
+                _stream!.Handle);
+            CudaKernels.FlashPrefillKvqLegacyBodyOverride = true;
+            _kernels.LaunchAttentionFlashPrefillKvq(f.Q, k, v, kFmt, vFmt, f.OutRef, seqQ, seqKv, numHeads, numKvHeads, headDim, offset,
+                _stream.Handle);
+        }
+        finally
+        {
+            CudaKernels.FlashPrefillKvqLegacyBodyOverride = saved;
+        }
+        _stream.Synchronize();
+        Assert.Equal(legacy0 + 1, CudaKernels.AttentionFlashPrefillKvqLegacyBodyLaunches);   // the twin really ran once
+        ushort[] e4 = f.Read(f.OutNew), old = f.Read(f.OutRef);
+        AssertFinite(e4);
+        int diff = FirstDiff(old, e4);
+        Assert.True(diff < 0, $"E4 body differs from the legacy body at element {diff}: " +
+            (diff >= 0 ? $"{HalfToFloat(e4[diff])} vs {HalfToFloat(old[diff])}" : ""));
+    }
+
+    [SkippableFact]
+    public void FlashPrefillKvq_OccupancyChoice_TakesLegacyOnlyWhereItFitsMoreBlocks()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null || !_kernels.HasAttentionFlashPrefillKvq(128, null, null), "flash prefill kvq kernel not loaded");
+        Skip.If(_kernels!.AttentionFlashPrefillKvqStaticSmemBytes(128, null, null) == 0, "pre-E4 PTX (no E4 entry)");
+        Skip.If(CudaKernels.FlashPrefillKvqLegacyBodyOverride is not null, "body override set");
+        var dev = CudaDevice.GetDevice(0);
+        Skip.IfNot(dev.ComputeCapabilityMajor == 8 && dev.ComputeCapabilityMinor == 6, "the expected choices are for sm_86 (RTX 30xx)");
+        // hd128 F16 entry index = 1 * 5 + 4.
+        Assert.False(_kernels.UseFlashPrefillKvqLegacy(9, 128, 4), "group 4 (Qwen3-4B) must run the E4 body");
+        Assert.True(_kernels.UseFlashPrefillKvqLegacy(9, 128, 7), "group 7 hd128 fits 2 legacy blocks vs 1 E4 block per SM");
+    }
+}

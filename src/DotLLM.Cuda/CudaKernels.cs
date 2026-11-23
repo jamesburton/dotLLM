@@ -629,6 +629,11 @@ public sealed unsafe partial class CudaKernels : IDisposable
     // K / V tiles in static shared memory and takes no dynamic shared memory; a pre-E4 PTX reports 0 here and gets the legacy
     // dynamic layout (AttentionFlashPrefillKvqSmemBytes). Read from the function, so a swapped PTX can never be under-allocated.
     private readonly int[] _attentionFlashPrefillKvqStaticSmem = new int[10];
+    // #1943: the pre-E4 body under <entry>_legacy (dynamic shared memory), taken when it keeps more blocks resident per SM than
+    // the E4 entry (Q in registers costs ~30 registers: at GQA group 7, 224 threads, the E4 hd128 entries fit one block per SM
+    // where the legacy body fits two). Choice cached per entry and group (bit 0x10 = decided, bit 0x1 = legacy).
+    private readonly nint[] _attentionFlashPrefillKvqLegacyFuncs = new nint[10];
+    private readonly byte[] _attentionFlashPrefillKvqLegacyChoice = new byte[10 * 9];
     // TurboQuant in-place twins of the above (#1892 Task 6, attention_flash_mma_prefill_kvq_hd{64,128}_tqtq, same module).
     // Indexed 0 = hd64, 1 = hd128. Not part of the KvqIndex table: TQ needs norm / centroid pointers the q8/q4 launch lacks.
     private readonly nint[] _attentionFlashPrefillKvTqFuncs = new nint[2];
@@ -1646,6 +1651,10 @@ public sealed unsafe partial class CudaKernels : IDisposable
                             CudaDriverApi.cuFuncGetAttribute(out int staticSmem, CudaDriverApi.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn)
                                 .ThrowOnError();
                             _attentionFlashPrefillKvqStaticSmem[hd * 5 + f] = staticSmem;
+                            nint lf = m.TryGetFunction($"attention_flash_mma_prefill_kvq_hd{(hd == 0 ? 64 : 128)}_{fmts[f]}_legacy");
+                            if (lf != 0)
+                                SetMaxDynamicSharedBytes(lf, AttentionFlashPrefillHd256MaxSmemBytes);
+                            _attentionFlashPrefillKvqLegacyFuncs[hd * 5 + f] = lf;
                         }
                         _attentionFlashPrefillKvqFuncs[hd * 5 + f] = fn;
                     }
@@ -1674,6 +1683,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
                 _attentionFlashPrefillKvqModule = null;
                 Array.Clear(_attentionFlashPrefillKvqFuncs);
                 Array.Clear(_attentionFlashPrefillKvqStaticSmem);
+                Array.Clear(_attentionFlashPrefillKvqLegacyFuncs);
                 Array.Clear(_attentionFlashPrefillKvTqFuncs);
                 Array.Clear(_attentionFlashPrefillKvTqSpecFuncs);
                 Array.Clear(_attentionFlashPrefillKvTqCpaFuncs);
@@ -5301,14 +5311,47 @@ public sealed unsafe partial class CudaKernels : IDisposable
         }
 
         int group = numHeads / numKvHeads;
+        bool legacy = UseFlashPrefillKvqLegacy(idx, headDim, group);
+        nint fn = legacy ? _attentionFlashPrefillKvqLegacyFuncs[idx] : _attentionFlashPrefillKvqFuncs[idx];
+        uint smem = (uint)(!legacy && _attentionFlashPrefillKvqStaticSmem[idx] > 0 ? 0 : AttentionFlashPrefillKvqSmemBytes(headDim, group));
+        if (legacy) Interlocked.Increment(ref AttentionFlashPrefillKvqLegacyBodyLaunches);
         nint qArg = q, kArg = k, vArg = v, oArg = output;
         int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, poArg = positionOffset;
         float scArg = 1f / MathF.Sqrt(headDim);
         void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &sqArg, &skvArg, &nhArg, &nkvArg, &poArg, &scArg };
-        CudaDriverApi.cuLaunchKernel(_attentionFlashPrefillKvqFuncs[idx],
+        CudaDriverApi.cuLaunchKernel(fn,
                 (uint)((seqQ + 15) / 16), (uint)numKvHeads, 1, (uint)(group * 32), 1, 1,
-                (uint)(_attentionFlashPrefillKvqStaticSmem[idx] > 0 ? 0 : AttentionFlashPrefillKvqSmemBytes(headDim, group)),
-                stream, (nint)args, 0).ThrowOnError();
+                smem, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Launches since process start of the flash prefill kvq kernel that took the <c>_legacy</c> (pre-E4) body (#1943).</summary>
+    internal static long AttentionFlashPrefillKvqLegacyBodyLaunches;
+
+    /// <summary>Test / A/B override of the #1943 body choice: null = by occupancy, true = always legacy, false = always E4.</summary>
+    internal static bool? FlashPrefillKvqLegacyBodyOverride;
+
+    /// <summary>
+    /// True when the <c>_legacy</c> twin of entry <paramref name="idx"/> keeps more blocks resident per SM than the E4 entry at this
+    /// group (cuOccupancyMaxActiveBlocksPerMultiprocessor, each with its own shared memory); ties go to E4. A PTX without twins (pre-E4,
+    /// or a test build) always takes the plain entry.
+    /// </summary>
+    internal bool UseFlashPrefillKvqLegacy(int idx, int headDim, int group)
+    {
+        nint lf = _attentionFlashPrefillKvqLegacyFuncs[idx];
+        if (lf == 0 || _attentionFlashPrefillKvqStaticSmem[idx] == 0) return false;
+        if (FlashPrefillKvqLegacyBodyOverride is { } forced) return forced;
+        int slot = idx * 9 + group;
+        byte c = _attentionFlashPrefillKvqLegacyChoice[slot];
+        if (c == 0)
+        {
+            CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(out int e4, _attentionFlashPrefillKvqFuncs[idx], group * 32, 0)
+                .ThrowOnError();
+            CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(out int old, lf, group * 32,
+                (nuint)AttentionFlashPrefillKvqSmemBytes(headDim, group)).ThrowOnError();
+            c = (byte)(0x10 | (old > e4 ? 1 : 0));
+            _attentionFlashPrefillKvqLegacyChoice[slot] = c;
+        }
+        return (c & 1) != 0;
     }
 
     /// <summary>Static shared memory of the loaded flash prefill kvq entry (0 = a pre-E4 entry on the dynamic layout; #1943).</summary>
