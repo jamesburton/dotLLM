@@ -10,7 +10,7 @@ namespace DotLLM.Tests.Unit.Engine;
 
 /// <summary>
 /// The GenerationSession control's 1-ULP residual perturbation, one instrument for every backend (#1919, James 2026-11-22 "add GPU seams
-/// now"): a ONE-SHOT test-only residual modifier that moves every element of one token row of the residual (<see cref="Row"/>) after one
+/// now"): a ONE-SHOT test-only residual modifier that moves every element of the last token row of the residual after one
 /// layer (<see cref="Layer"/>) by exactly <see cref="Ulps"/> ULPs away from zero in the residual's storage dtype: F32 on CPU, the Vulkan
 /// models and the CUDA hybrids, F16 on the CUDA dense model. It rides the model's own PostLayer seam (<see cref="IResidualModifierHost"/>
 /// on CPU, <see cref="IVulkanResidualModifierHost"/>, <see cref="ICudaResidualModifierHost"/>), so a model with no seam yields no arm.
@@ -22,8 +22,8 @@ internal abstract class ResidualUlpArm : IDisposable
 {
     /// <summary>Layer the nudge follows. 0 = the first layer: the perturbation then runs through the whole trunk.</summary>
     public const int Layer = 0;
-    /// <summary>Token row nudged (the first token of the first forward).</summary>
-    public const int Row = 0;
+    /// <summary>Token row nudged: the LAST row of the forward. Token 0's row is absorbed on Vulkan (F16/Q8 activation steps downstream swallow it: measured, bit-identical logits on llama and hybrid-dense), the last row feeds the output directly.</summary>
+    public static int RowOf(int tokenCount) => tokenCount - 1;
     /// <summary>ULPs added. The "nudge zero ULPs" mutant sets 0 and OneUlpArm_IsObservable must fail.</summary>
     public static int Ulps = 1;
 
@@ -102,7 +102,7 @@ internal abstract class ResidualUlpArm : IDisposable
                 _done = true;
                 arm.Fired++;
                 int hidden = residual.Length / tokenCount;
-                for (int i = 0; i < hidden; i++) residual[Row * hidden + i] = Nudge(residual[Row * hidden + i]);
+                for (int i = 0; i < hidden; i++) residual[RowOf(tokenCount) * hidden + i] = Nudge(residual[RowOf(tokenCount) * hidden + i]);
             }
         }
     }
@@ -162,7 +162,7 @@ internal abstract class ResidualUlpArm : IDisposable
                 for (int u = 0; u < Ulps; u++)
                 {
                     if (u > 0) KernelSupport.ComputeToComputeBarrier(cmdBuf);
-                    arm._kernel.Record(cmdBuf, residual, Row * hiddenSize, hiddenSize);
+                    arm._kernel.Record(cmdBuf, residual, RowOf(tokenCount) * hiddenSize, hiddenSize);
                 }
             }
 
@@ -207,7 +207,7 @@ internal abstract class ResidualUlpArm : IDisposable
                 arm.Fired++;
                 int elem = dtype == CudaResidualDType.F16 ? sizeof(ushort) : sizeof(float);
                 nuint bytes = (nuint)(hiddenSize * elem);
-                nint rowDev = residualDevicePtr + (nint)((long)Row * hiddenSize * elem);
+                nint rowDev = residualDevicePtr + (nint)((long)RowOf(tokenCount) * hiddenSize * elem);
                 byte[] row = new byte[(int)bytes];
                 fixed (byte* p = row)
                 {

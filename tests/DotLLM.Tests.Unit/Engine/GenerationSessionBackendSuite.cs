@@ -43,7 +43,7 @@ public abstract class GenerationSessionBackendSuite
     /// so a defect in the session's append or prefill path cannot inflate the control and the compared diff together.
     /// Two arms, same model, same tokens, max |logit diff| against one batched prefill of all tokens:
     /// (1) the genuine 1-ULP arm (<see cref="ResidualUlpArm"/>, the same instrument on CPU, Vulkan and CUDA): the same prefill with every element
-    /// of token 0's residual row moved by exactly one ULP of the residual's storage dtype (F32; F16 on the CUDA dense model) after layer 0, the
+    /// of the last token's residual row moved by exactly one ULP of the residual's storage dtype (F32; F16 on the CUDA dense model) after layer 0, the
     /// "one rounding of one input" sensitivity of #1928, through each backend's own PostLayer seam;
     /// (2) the prefill-vs-decode path split (prefill of the first half, then every remaining token as a single decode row), the path pair
     /// every comparison here crosses. Control = max of the arms; the bound is <see cref="ControlFactor"/> x control. A 1-ULP perturbation can be
@@ -189,15 +189,17 @@ public abstract class GenerationSessionBackendSuite
         _ => "",
     };
 
-    private static string Delta(string a, string b) => a == "" ? "" : $"{a}->{b}";
-
-    /// <summary>Vulkan fence waits out of a "fence=a->b" fingerprint delta; 0 when the backend exposes none.</summary>
-    private static long FenceWaits(string fp)
+    /// <summary>Per-counter difference of two fingerprints ("fence=3" then "fence=5" gives "fence=2"; a tuple "(a, b)" is diffed element-wise).</summary>
+    private static string Delta(string a, string b)
     {
-        if (!fp.StartsWith("fence=", StringComparison.Ordinal)) return 0;
-        string[] p = fp["fence=".Length..].Split("->");
-        return long.Parse(p[1]) - long.Parse(p[0]);
+        if (a == "") return "";
+        static string[] Parts(string x) => x.Split(['=', '(', ')', ',', ' '], StringSplitOptions.RemoveEmptyEntries);
+        string[] pa = Parts(a), pb = Parts(b);
+        return string.Join(",", pb.Select((v, i) => long.TryParse(v, out long n) ? (n - long.Parse(pa[i])).ToString() : v));
     }
+
+    /// <summary>Vulkan fence waits out of a "fence=n" fingerprint delta; 0 when the backend exposes none.</summary>
+    private static long FenceWaits(string fp) => fp.StartsWith("fence,", StringComparison.Ordinal) ? long.Parse(fp["fence,".Length..]) : 0;
 
     private static float MaxAbsDiff(float[] x, float[] y)
     {
