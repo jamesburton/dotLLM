@@ -39,8 +39,11 @@ namespace DotLLM.Cuda.Architectures;
 /// prefill dequant-then-cuBLAS-HGEMM path (seqLen &gt; 1) still stages through F16.
 /// </para>
 /// </remarks>
-public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel, IContextLimitable, IRecurrentPrefixSnapshotProvider
+public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel, IContextLimitable, IRecurrentPrefixSnapshotProvider, ICudaResidualModifierHost
 {
+    /// <summary>Optional PostLayer residual modifier (#1919): called on the F32 HiddenState after every layer's closing add; a set modifier bypasses the decode graph. Null costs one branch per layer.</summary>
+    public ICudaResidualModifier? ResidualModifier { get; set; }
+
     private readonly CudaQwen3HybridDenseForwardState _state;
     private readonly CudaGdnStateCache _gdnCache;
     private readonly CudaStream _stream;
@@ -2245,7 +2248,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("setup-embed");
 
         // #1222: a decode step or a short verify runs the whole layer loop as one graph launch.
-        bool graphed = seqLen <= MaxGraphRows && _dflashCall is null
+        bool graphed = seqLen <= MaxGraphRows && _dflashCall is null && ResidualModifier is null   // #1919: a graph replay never reaches the per-layer PostLayer call
             && TryForwardDecodeGraph(positions, hiddenSize, numHeads, numKvHeads, headDim, eps, kvCache);
         if (!graphed)
         {
@@ -3487,6 +3490,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         _kernels.LaunchAddF32(_state.Residual, _state.NormOutput, _state.HiddenState,
             seqLen * hiddenSize, streamH);
         ProfMark("layer-resid2");
+        if (ResidualModifier is { } modifier && modifier.AppliesTo(layerIdx))
+            modifier.Apply(_state.HiddenState, CudaResidualDType.F32, layerIdx, seqLen, hiddenSize, streamH);   // #1919 PostLayer
     }
 
     private static readonly bool DebugTrace =

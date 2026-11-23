@@ -108,6 +108,11 @@ internal sealed class GenerationSessionFixture : IDisposable
 
     public bool IsRecurrent => Model.RequiresPerSequenceState;
 
+    private ResidualUlpArm? _arm;
+
+    /// <summary>The 1-ULP residual perturbation for this fixture's model (every backend has a PostLayer seam), created on first use; null only for a model without one.</summary>
+    public ResidualUlpArm? Arm => _arm ??= ResidualUlpArm.For(Model);
+
     public TextGenerator NewGenerator()
         => _gpuKvFactory is null ? new(Model, Tokenizer) : new(Model, Tokenizer, kvCacheFactory: (_, size) => _gpuKvFactory(size));
 
@@ -123,6 +128,7 @@ internal sealed class GenerationSessionFixture : IDisposable
 
     public void Dispose()
     {
+        _arm?.Dispose();
         Model.Dispose();
         _gguf.Dispose();
         try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
