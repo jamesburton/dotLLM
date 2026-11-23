@@ -180,6 +180,10 @@ keeps the output exact, so tune by acceptance × cost, not KL (#1095 measured no
 duplicated (64 MiB × 2 at 128k on Llama-8B); F16 tables from F32 angles are not measured (#1142).
 
 **Split partials.** *m*/*ℓ* stay F32 (a few KB); O partials and split-K slabs to F16 are not measured (#1144).
+CUDA dense decode (#1922) stores its split-KV O partials **normalised** (o/ℓ, bounded by max|v|) in **F16** with *m*, *ℓ*
+F32 (James's ruling, 2026-11-20; the unnormalised form overflows F16 on a long split, guarded by a flat-score |V|≈20 32K test).
+Kernel level (RTX 3060, F64 oracle over F16 inputs): max |err| F16 partials vs F32 partials 2.9e-4 vs 2.9e-4 at short seqKv,
+1.3e-5 vs 1.1e-5 at 32K; no time difference. Teacher-forced on Qwen3-4B Q4_K_M, 800 decode steps at depth 6,000 (`CudaDenseDecodeQualityGateTests`, framework 2026-11-21), PPL change vs the scalar kernel for F16 / F32 partials: f16 KV -0.057% / -0.044%, q8_0 -0.061% / +0.114%, q4_0 +0.230% / -0.465%, tq4 -0.172% / -0.871%; mean KL vs scalar 6.5e-4 / 6.6e-4 (f16), 9.0e-4 / 9.0e-4 (q8_0), 2.71e-2 / 2.73e-2 (q4_0), 1.99e-2 / 2.16e-2 (tq4). F16 partials are indistinguishable from F32; the q4_0 / tq4 spread is quantized-KV drift digitisation, equal in both arms. Decision (James 2026-11-21, bench 2026-11-22): F16 normalised partials ship, default on together with the step decode graph; the F32-partial control entries were removed, and the scratch is F16 (Qwen3-4B / RTX 3060: about 25 KiB). Kill switches `DOTLLM_CUDA_DENSE_DECODE_V2=0` (kernel) and `DOTLLM_CUDA_STEP_GRAPH=0` (graph).
 
 ---
 

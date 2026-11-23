@@ -1551,6 +1551,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
             }
         }
 
+        // Dense split-KV v2 decode, head_dim 64 / 128 (+ TurboQuant), issue #1922. Same best-effort load.
+        LoadDenseDecodeV2(ptxDir);
+
         // Flash-style tensor-core prefill attention, head_dim 256 (issue #962). Same best-effort
         // pattern as the decode kernels above: mma.sync/cp.async PTX is sm_80+, so a pre-Ampere
         // device (or stale PTX) throws CudaException at module load and the feature stays off.
@@ -8885,6 +8888,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
     public void Dispose()
     {
         _attentionSoftmaxCausalOffsetModule?.Dispose();
+        _denseDecodeV2Module?.Dispose();
         _rmsnormModule.Dispose();
         _ropeModule.Dispose();
         _swigluModule.Dispose();
