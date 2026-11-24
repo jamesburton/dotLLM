@@ -64,8 +64,10 @@ internal sealed class VulkanHiddenStateTapFixture : HiddenStateTapFixture
 
     public override IKvCache NewKv(int maxLen = 96) => _kvFactory(maxLen);
 
-    /// <summary>Merge base d1275eef, 16 untapped decode forwards: managed bytes on this thread.</summary>
-    public override long? BaselineAllocBytesPer16Decodes => 1872;
+    /// <summary>16 untapped decode forwards, managed bytes on this thread, steady state (minimum of three windows after a long warm-up and a
+    /// tiering pause). 1664 B = 104 B per decode (the logits tensor wrapper), the same as CPU llama. The earlier figure, 1872 (merge base d1275eef,
+    /// short warm-up), carried 208 B of pre-steady-state noise, which is what made the test sensitive to JIT/tiering order.</summary>
+    public override long? BaselineAllocBytesPer16Decodes => 1664;
 
     public override long[]? DeviceCounters() =>
     [
