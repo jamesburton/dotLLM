@@ -85,13 +85,17 @@ Also accepted (not shown above): `top_k`, `min_p`, `repetition_penalty` — see 
 for the full parameter reference, including the DRY/top-nσ/logit-bias/frequency/presence-penalty
 processors these fields drive. `POST /v1/completions` accepts the same sampling parameter set.
 
-> **Adapter selection**: there is no `lora_adapter` request field (it is not part of the OpenAI
-> surface either, and the server ignores unknown fields silently). LoRA serving is roadmap step 47
-> and is not implemented: the engine has the `IAdapterManager` abstraction and
-> `InferenceRequest.AdapterId`, but there is no implementation, no adapter admin endpoint, and no
-> way to select an adapter per request. Until then, serve an adapted model by merging the adapter
-> into the weights offline and loading the merged model — via `--model` at startup or
-> `POST /v1/models/load`. See [LORA.md](LORA.md) for the planned design.
+> **Adapter selection**: `lora_adapter` (a dotLLM extension, not part of the OpenAI surface)
+> selects a registered LoRA adapter for this request on `/v1/chat/completions` and
+> `/v1/completions`. Omit it, or send null, to run the base model. An unknown name is a `400`
+> (`param: "lora_adapter"`) that lists the loaded adapters. `GET /v1/lora` lists the registered
+> names. Adapters are registered at run time with `POST /v1/lora/load` (`{"name", "path"}`, a
+> HuggingFace PEFT directory with `adapter_config.json` + `adapter_model.safetensors`) and removed
+> with `DELETE /v1/lora/{name}`. Both admin routes need `--allow-lora-admin` (otherwise `403`). A
+> request with an adapter runs on the single-request path (see
+> [Concurrency](#concurrency)). The chunk cache keys it by the adapter's contents
+> ([CHUNK_CACHE.md](CHUNK_CACHE.md)). The Anthropic `/v1/messages` endpoint does not honour the
+> field. Design notes: [LORA.md](LORA.md).
 
 **Response** (non-streaming):
 ```json

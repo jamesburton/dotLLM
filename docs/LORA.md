@@ -1,8 +1,10 @@
 # LoRA Adapter Support — dotLLM
 
-> **Status**: design spec, not implemented. This is roadmap step 47. Only the `IAdapterManager`
-> abstraction and `InferenceRequest.AdapterId` exist today — there is no adapter loader, no server
-> endpoint, and no per-request adapter selection. Everything below describes the intended design.
+> **Status**: per-request LoRA serving is implemented (roadmap step 47). The server takes a
+> `lora_adapter` request field on `/v1/chat/completions` and `/v1/completions`; adapters are
+> registered with `POST /v1/lora/load` behind `--allow-lora-admin`, and the CLI `run` takes `--lora`.
+> See [SERVER.md](SERVER.md) for the wire details. This document is the original design: where
+> it and the code differ, the code is authoritative.
 
 ## Overview
 

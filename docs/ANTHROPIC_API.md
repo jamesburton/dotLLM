@@ -96,9 +96,9 @@ non-streaming (JSON) and streaming (named SSE events).
   `model` (e.g. `claude-sonnet-4-...`) therefore has to be overridden with the
   loaded model's id. The response `model` echoes the model that actually served
   the request, not the requested alias.
-- `lora_adapter` is **not** honoured by this endpoint — per-request adapter
-  selection is not implemented on the server yet (the OpenAI surface does not
-  honour it either). Unknown fields are ignored, not rejected.
+- `lora_adapter` is **not** honoured by this endpoint (the OpenAI-compatible
+  `/v1/chat/completions` and `/v1/completions` honour it; see
+  [SERVER.md](SERVER.md)). Unknown fields are ignored, not rejected.
 
 **Response** (non-streaming):
 ```json
