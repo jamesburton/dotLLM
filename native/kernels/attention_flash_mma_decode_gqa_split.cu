@@ -114,6 +114,12 @@
 #include <math.h>
 #include <cooperative_groups.h>
 #include "attention_mma_decode_v2.cuh"   // issue #988: v2 body (kernel at the end of this file)
+// #1953: P = exp(S - m + GS_P_SHIFT_LN), 2^15 x the softmax numerator (15 ln 2), so the F16 P tile uses the top of the F16 range instead
+// of (0, 1]: unshifted, keys ~17.3+ nats below the max flush to 0 in F16 while the F32 sum l counts them (a bias at long
+// context behind an attention sink). l and O take the same scaled P, so the final O / l cancels it. P <= 2^15 < 65504.
+#ifndef GS_P_SHIFT_LN
+#define GS_P_SHIFT_LN 10.397207708399179f
+#endif
 
 #define HEAD_DIM 256
 #define Q_TILE 16
@@ -331,7 +337,7 @@ extern "C" __global__ void __launch_bounds__(NUM_WARPS * 32) attention_flash_mma
                 float p = 0.0f;
                 if (j < gk_limit)
                 {
-                    p = expf(sScore[lane * KV_TILE + j] - m_cur);
+                    p = expf(sScore[lane * KV_TILE + j] - m_cur + GS_P_SHIFT_LN);   // #1953
                     l_cur += p;
                 }
                 sP[lane * KV_TILE + j] = __float2half(p);

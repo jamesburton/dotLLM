@@ -39,6 +39,12 @@
 #include <cooperative_groups.h>
 
 #define V2_HEAD_DIM 256
+// #1953: P = exp(S - m + V2_P_SHIFT_LN), 2^15 x the softmax numerator (15 ln 2), so the F16 P operand uses the top of the F16 range
+// instead of (0, 1]: unshifted, keys ~17.3+ nats below the max flush to 0 in F16 while the F32 sum l counts them (a bias at
+// long context behind an attention sink). l and O take the same scaled P, so the final O / l cancels it. P <= 2^15 < 65504.
+#ifndef V2_P_SHIFT_LN
+#define V2_P_SHIFT_LN 10.397207708399179f
+#endif
 #define V2_WARPS 8
 #define V2_TILE 16
 #define V2_MAX_GROUP 8
@@ -281,7 +287,7 @@ __device__ __forceinline__ void attn_decode_v2_body(
             for (int e = 0; e < 2; e++)
             {
                 const int key = k0 + 8 * j + 2 * t + e;
-                float pv = (key < kv_hi) ? expf(sv[2 * j + e] - m_new) : 0.0f;
+                float pv = (key < kv_hi) ? expf(sv[2 * j + e] - m_new + V2_P_SHIFT_LN) : 0.0f;   // #1953
                 p[2 * j + e] = pv;
                 psum += pv;
             }

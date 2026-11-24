@@ -1,5 +1,12 @@
 #include <cuda_fp16.h>
 #include <float.h>
+// #1953: the stored FP16 probabilities are P * 2^15 (G3_P_SCALE), not P. A normalised P below ~2^-25 (a key ~17+ nats below
+// the row max, most of a long row behind an attention sink) would round to 0 in FP16 while sum_exp counted it; scaled, the
+// flush point moves ~10 nats down. P * 2^15 <= 2^15 < 65504. The P.V GEMM (CudaG3Attention) takes alpha = 2^-15, which cancels
+// it exactly (a power of two, F32 compute). Override only to build a test mutant (-DG3_P_SCALE=1.0f).
+#ifndef G3_P_SCALE
+#define G3_P_SCALE 32768.0f
+#endif
 
 // Causal softmax for the G3 prefill-attention path when the queries start part way into the
 // cache (issue #1594): a prefix-cache hit, or any multi-token prefill after a cached prefix.
@@ -47,7 +54,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_softmax_causal_offse
     float sum_inv = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
 
     for (int tk = 0; tk < causal_len; tk++)
-        prow[(size_t)tk * sq] = __float2half(expf(srow[(size_t)tk * sq] - max_val) * sum_inv);
+        prow[(size_t)tk * sq] = __float2half(expf(srow[(size_t)tk * sq] - max_val) * (sum_inv * G3_P_SCALE));   // #1953
 
     for (int tk = causal_len; tk < skv; tk++)
         prow[(size_t)tk * sq] = __float2half(0.0f);

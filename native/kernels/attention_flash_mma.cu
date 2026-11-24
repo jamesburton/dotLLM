@@ -45,6 +45,12 @@
 
 #include <cuda_fp16.h>
 #include <float.h>
+// #1953: P = exp(S - m + GF_P_SHIFT_LN), 2^15 x the softmax numerator (15 ln 2), so the F16 P tile uses the top of the F16 range instead
+// of (0, 1]: unshifted, keys ~17.3+ nats below the max flush to 0 in F16 while the F32 sum l counts them (a bias at long
+// context behind an attention sink). l and O take the same scaled P, so the final O / l cancels it. P <= 2^15 < 65504.
+#ifndef GF_P_SHIFT_LN
+#define GF_P_SHIFT_LN 10.397207708399179f
+#endif
 
 #define HEAD_DIM 64
 #define Q_TILE 16
@@ -389,7 +395,7 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_fla
                 float p = 0.0f;
                 if (gk < seq && gk <= causal_last)
                 {
-                    p = __expf(wScore[lane * KV_TILE_PAD_SCORE + j] - m_cur);
+                    p = __expf(wScore[lane * KV_TILE_PAD_SCORE + j] - m_cur + GF_P_SHIFT_LN);   // #1953
                     l_cur += p;
                 }
                 wP[lane * KV_TILE_PAD + j] = __float2half(p);

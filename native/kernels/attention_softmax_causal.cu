@@ -28,6 +28,13 @@
 
 #include <cuda_fp16.h>
 #include <float.h>
+// #1953: the stored FP16 probabilities are P * 2^15 (G3_P_SCALE), not P. A normalised P below ~2^-25 (a key ~17+ nats below
+// the row max, most of a long row behind an attention sink) would round to 0 in FP16 while sum_exp counted it; scaled, the
+// flush point moves ~10 nats down. P * 2^15 <= 2^15 < 65504. The P.V GEMM (CudaG3Attention) takes alpha = 2^-15, which cancels
+// it exactly (a power of two, F32 compute). Override only to build a test mutant (-DG3_P_SCALE=1.0f).
+#ifndef G3_P_SCALE
+#define G3_P_SCALE 32768.0f
+#endif
 
 extern "C" __global__ void __launch_bounds__(256) attention_softmax_causal_f16(
     half* __restrict__ scores,
@@ -216,7 +223,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_softmax_causal_coale
     // Pass 3a: write normalized probs to FP16 (recompute exp from FP32 scores so the
     // only FP16 rounding is on the final [0,1] probability).
     for (int tk = 0; tk < causal_len; tk++)
-        prow[(size_t)tk * s] = __float2half(expf(srow[(size_t)tk * s] - max_val) * sum_inv);
+        prow[(size_t)tk * s] = __float2half(expf(srow[(size_t)tk * s] - max_val) * (sum_inv * G3_P_SCALE));   // #1953
 
     // Pass 3b: zero the masked tail so P*V's full-key sum ignores it.
     for (int tk = causal_len; tk < s; tk++)

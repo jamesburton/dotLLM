@@ -26,6 +26,12 @@
 #define NUM_SLICES   4
 #define NSL          (BC / 16)
 #define NEG_INF      (-3.4e38)
+// #1953: P = exp(s - max + P_SHIFT_LN), 2^15 x the softmax numerator, so the F16 P tile uses the top of the F16 range instead of
+// (0, 1]: unshifted, keys ~17.3+ nats below the max flush to 0. The running sum takes the same (rounded) scaled P, so the
+// partial (m, l, acc) carries a uniform 2^15 in l and acc that qsa_merge_f32 cancels (one kernel per dispatch).
+#ifndef P_SHIFT_LN
+#define P_SHIFT_LN 10.397207708399179
+#endif
 #define S_STRIDE     (BC + 4)
 #define P_STRIDE     (BC + 8)
 #define KV_STRIDE    (KV_D + PAD)
@@ -189,7 +195,7 @@ void main() {
             for (uint m = 0u; m < uint(NSL); m++) {
                 uint c = smJ + m * 16u;
                 float16_t wh = float16_t(0.0);
-                if (c < tileLen && smRow < rows) wh = float16_t(exp(sv[m] - newMax));
+                if (c < tileLen && smRow < rows) wh = float16_t(exp(sv[m] - newMax + P_SHIFT_LN));   // #1953
                 lsum += float(wh);
                 pTile[smRow * uint(P_STRIDE) + c] = wh;
             }

@@ -33,7 +33,8 @@
 // raw copies were issued at the top of iteration t-1, so they overlapped tile t-1's MMAs).
 //
 // ─── Precision ─────────────────────────────────────────────────────────────────────────────────────────
-// F16 Q/K/V/P operands, F32 mma accumulation and softmax statistics, in registers. Output F16.
+// F16 Q/K/V/P operands, F32 mma accumulation and softmax statistics, in registers. Output F16. P is scaled by 2^15 into the top
+// of the F16 range (PK_P_SHIFT, #1953) so the long-context softmax tail does not flush to zero.
 //
 // Dynamic shared memory: group*16*(HD+8)*2 (Q) + NBUF*2*KV_TILE*(HD+8)*2 (K, V); hd128 group 8 = 52 KB,
 // so the launcher opts the functions into > 48 KB.
@@ -53,6 +54,16 @@
 #define PK_NT (PK_KV_TILE / 8)
 #define PK_LOG2E 1.4426950408889634f
 #define PK_NEG_INF __int_as_float(0xff800000)
+// #1953: P is computed as exp2(S - m + PK_P_SHIFT), 2^15 x the softmax numerator, so that it uses the top of the F16 range
+// (P <= 2^15 < 65504) instead of (0, 1]. Unshifted, a key more than ~17.3 nats below the row max is below half F16's smallest
+// subnormal (2^-25) and packs to 0 for the P.V MMA while the F32 sum l still counts it: behind an attention sink at 32K keys that
+// is most of the row, and the lost tail mass biased every output (Qwen3-4B 32K max KL 2.5e-3, first-token logprob +0.046).
+// The factor cancels exactly: l and O accumulate the same scaled P (F32 registers), the online rescale exp2(m_old - m_new) is
+// shift-free, and O / l divides it out. The flush point moves to ~27.7 nats below the max. Registers only, zero instructions
+// (folded into the existing subtraction). Override only to build a test mutant (-DPK_P_SHIFT=0.0f).
+#ifndef PK_P_SHIFT
+#define PK_P_SHIFT 15.0f
+#endif
 
 __device__ __forceinline__ void pk_ldmatrix_x4(unsigned (&r)[4], const void* p)
 {
@@ -446,13 +457,14 @@ __device__ __forceinline__ void pk_prefill_body_legacy(
 
             // ---- P = exp2(S - m), accumulate l, pack as A fragments ----
             unsigned pa[PK_NT / 2][4];
+            const float ms_lo = mu_lo - PK_P_SHIFT, ms_hi = mu_hi - PK_P_SHIFT;   // #1953: P scaled by 2^PK_P_SHIFT
             #pragma unroll
             for (int n = 0; n < PK_NT; n++)
             {
-                float p0 = exp2f(sa[n][0] - mu_lo);
-                float p1 = exp2f(sa[n][1] - mu_lo);
-                float p2 = exp2f(sa[n][2] - mu_hi);
-                float p3 = exp2f(sa[n][3] - mu_hi);
+                float p0 = exp2f(sa[n][0] - ms_lo);
+                float p1 = exp2f(sa[n][1] - ms_lo);
+                float p2 = exp2f(sa[n][2] - ms_hi);
+                float p3 = exp2f(sa[n][3] - ms_hi);
                 l_lo += p0 + p1; l_hi += p2 + p3;
                 pa[n >> 1][(n & 1) * 2 + 0] = pk_pack_half2(p0, p1);
                 pa[n >> 1][(n & 1) * 2 + 1] = pk_pack_half2(p2, p3);
@@ -741,13 +753,14 @@ __device__ __forceinline__ void pk_prefill_body(
         }
         m_lo = mn_lo; m_hi = mn_hi;
 
+        const float ms_lo = mu_lo - PK_P_SHIFT, ms_hi = mu_hi - PK_P_SHIFT;   // #1953: P scaled by 2^PK_P_SHIFT
         #pragma unroll
         for (int n = 0; n < NT; n++)
         {
-            float p0 = exp2f(sa[n][0] - mu_lo);
-            float p1 = exp2f(sa[n][1] - mu_lo);
-            float p2 = exp2f(sa[n][2] - mu_hi);
-            float p3 = exp2f(sa[n][3] - mu_hi);
+            float p0 = exp2f(sa[n][0] - ms_lo);
+            float p1 = exp2f(sa[n][1] - ms_lo);
+            float p2 = exp2f(sa[n][2] - ms_hi);
+            float p3 = exp2f(sa[n][3] - ms_hi);
             l_lo += p0 + p1; l_hi += p2 + p3;
             pa[n >> 1][(n & 1) * 2 + 0] = pk_pack_half2(p0, p1);
             pa[n >> 1][(n & 1) * 2 + 1] = pk_pack_half2(p2, p3);
@@ -1144,7 +1157,18 @@ struct PkTqAcc
 {
     float o[HD / 8][4];
     float m_lo, m_hi, l_lo, l_hi;
+    float k;   // #1953: the warp's current P scale exponent (P = exp2(S - (m - k))); non-increasing, starts at PK_P_SHIFT
 };
+
+// #1953, TQ tile: the P.V operand here is P * |v| (the V norm is not in the tile), so the fixed 2^15 shift of pk_prefill_body
+// would overflow F16 for |v| > 2. Instead each tile picks k_t = min(k, 14 - floor(log2(max |v| over its 16 keys))), so
+// P * |v| * ... < 2^15 (half of F16's max: never saturates), and the online state is rescaled exactly when k drops, like a max
+// change (O and l are F32 and carry the same 2^k; O / l cancels it). k only decreases, so a rescale is rare after the first tiles.
+// (Folding the shift into ms = mu - k adds one rounding of mu, common to the tile: <= 1 ulp of |mu|, negligible vs F16's 5e-4.)
+// PK_TQ_KMODE: 0 adaptive (default); test mutants: 1 = fixed k = 15 (overflows for |v| > 2), 2 = k drop not rescaled.
+#ifndef PK_TQ_KMODE
+#define PK_TQ_KMODE 0
+#endif
 
 // One 16-key tile for one warp: S = Q . C^T over the bare-centroid K tile kb, times the K norms; causal / tail mask; online
 // softmax; O += (P n_v) . C over the V tile vb. nkb / nvb are the tile's 16 raw K / V norms.
@@ -1217,27 +1241,45 @@ __device__ __forceinline__ void pk_tq_tile(PkTqAcc<HD>& A, const half* qw, const
     const float mu_lo = (mn_lo == PK_NEG_INF) ? 0.0f : mn_lo;   // softmax offset of the TQ tile
     const float mu_hi = (mn_hi == PK_NEG_INF) ? 0.0f : mn_hi;
 
+    // #1953: this tile's P scale exponent from its largest V norm (warp-uniform: every row sees the same 16 keys).
+    float vmax = fmaxf(fmaxf(fabsf(nv[0][0]), fabsf(nv[0][1])), fmaxf(fabsf(nv[1][0]), fabsf(nv[1][1])));
+    vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, 1));
+    vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, 2));
+    const int vexp = ((__float_as_int(vmax) >> 23) & 0xff) - 127;          // floor(log2 vmax); -127 for 0 / subnormal
+#if PK_TQ_KMODE == 1
+    const float kt = PK_P_SHIFT;
+#else
+    // A non-finite max norm (inf / all-NaN tile, exponent field 255) keeps k: it must not drive k to -114 for the rest of the
+    // row. k is NOT clamped at 0: BF16 / F32 norms above 2^15 need a negative k to stay finite.
+    const float kt = (vexp == 128) ? A.k : fminf(A.k, (float)(14 - vexp));   // vmax * 2^kt < 2^15
+#endif
+#if PK_TQ_KMODE == 2
     const bool changed = (mn_lo != A.m_lo) || (mn_hi != A.m_hi);
+#else
+    const bool changed = (mn_lo != A.m_lo) || (mn_hi != A.m_hi) || (kt != A.k);
+#endif
+    const float ms_lo = mu_lo - kt, ms_hi = mu_hi - kt;   // P = exp2(S - ms) = 2^kt x the softmax numerator
     if (__any_sync(0xffffffffu, changed))
     {
-        const float c_lo = exp2f(A.m_lo - mu_lo);
-        const float c_hi = exp2f(A.m_hi - mu_hi);
+        const float c_lo = exp2f((A.m_lo - A.k) - ms_lo);   // exp2(-inf) = 0 on the first tile
+        const float c_hi = exp2f((A.m_hi - A.k) - ms_hi);
         A.l_lo *= c_lo; A.l_hi *= c_hi;
         #pragma unroll
         for (int n = 0; n < HD / 8; n++)
         { A.o[n][0] *= c_lo; A.o[n][1] *= c_lo; A.o[n][2] *= c_hi; A.o[n][3] *= c_hi; }
     }
     A.m_lo = mn_lo; A.m_hi = mn_hi;
+    A.k = kt;
 
-    // ---- P = exp2(S - m); l takes the raw P, the PV operand is P * n_v ----
+    // ---- P = exp2(S - m + k); l takes the raw P, the PV operand is P * n_v ----
     unsigned pa[PK_NT / 2][4];
     #pragma unroll
     for (int n = 0; n < PK_NT; n++)
     {
-        float p0 = exp2f(sa[n][0] - mu_lo);
-        float p1 = exp2f(sa[n][1] - mu_lo);
-        float p2 = exp2f(sa[n][2] - mu_hi);
-        float p3 = exp2f(sa[n][3] - mu_hi);
+        float p0 = exp2f(sa[n][0] - ms_lo);
+        float p1 = exp2f(sa[n][1] - ms_lo);
+        float p2 = exp2f(sa[n][2] - ms_hi);
+        float p3 = exp2f(sa[n][3] - ms_hi);
         A.l_lo += p0 + p1; A.l_hi += p2 + p3;
         pa[n >> 1][(n & 1) * 2 + 0] = pk_pack_half2(p0 * nv[n][0], p1 * nv[n][1]);
         pa[n >> 1][(n & 1) * 2 + 1] = pk_pack_half2(p2 * nv[n][0], p3 * nv[n][1]);
@@ -1361,6 +1403,7 @@ __device__ __forceinline__ void pk_tq_prefill_body(PK_TQ_BODY_ARGS)
     for (int n = 0; n < HD / 8; n++) { A.o[n][0] = A.o[n][1] = A.o[n][2] = A.o[n][3] = 0.0f; }
     A.m_lo = A.m_hi = PK_NEG_INF;
     A.l_lo = A.l_hi = 0.0f;
+    A.k = PK_P_SHIFT;
 
     const float scale_log2 = scale * PK_LOG2E;
     const int pos_lo = position_offset + qbase + (lane >> 2);
@@ -1460,6 +1503,7 @@ __device__ __forceinline__ void pk_tq_prefill_body_cpa(PK_TQ_BODY_ARGS)
     for (int n = 0; n < HD / 8; n++) { A.o[n][0] = A.o[n][1] = A.o[n][2] = A.o[n][3] = 0.0f; }
     A.m_lo = A.m_hi = PK_NEG_INF;
     A.l_lo = A.l_hi = 0.0f;
+    A.k = PK_P_SHIFT;
 
     const float scale_log2 = scale * PK_LOG2E;
     const int pos_lo = position_offset + qbase + (lane >> 2);

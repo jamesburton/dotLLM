@@ -82,6 +82,12 @@
 #define PV_ROUNDS_MAX   (MAX_HEAD_DIM / (16 * NUM_SLICES))  // 4
 #define O_CELLS         (BR * MAX_HEAD_DIM / WG_SIZE)       // 8 f32 regs/thread
 #define NEG_INF         (-3.4e38)
+// #1953: P = exp(s - max + P_SHIFT_LN), 2^15 x the softmax numerator (15 ln 2), so the F16 P tile uses the top of the F16
+// range instead of (0, 1]: unshifted, keys ~17.3+ nats below the row max flush to 0 in F16 (behind an attention sink at 32K
+// keys, most of the row's mass). The running sum and O take the same scaled P (both branches), so O / sum cancels it.
+#ifndef P_SHIFT_LN
+#define P_SHIFT_LN 10.397207708399179
+#endif
 
 // Score-tile row stride: +4 floats keeps coopMatStore rows 16-byte aligned
 // (a hard requirement for cooperative-matrix loads/stores) while still
@@ -425,7 +431,7 @@ void main() {
                 float w = 0.0;
                 if (c2 < tileLen) {
                     float val = sTile[sBase + c2];
-                    w = (val > NEG_INF * 0.5) ? exp(val - newMax) : 0.0;
+                    w = (val > NEG_INF * 0.5) ? exp(val - newMax + P_SHIFT_LN) : 0.0;   // #1953
                 }
                 pTile[pBase + c2] = float16_t(w);
                 if (tileSafe) {

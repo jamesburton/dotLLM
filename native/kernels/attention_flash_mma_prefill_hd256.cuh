@@ -71,6 +71,12 @@
 #define NT (KV_TILE / 8)             // n-subtiles of S per KV tile
 #define MAX_GROUP 8
 #define LOG2E 1.4426950408889634f
+// #1953: P = exp2(S - m + P_SHIFT_LOG2), 2^15 x the softmax numerator, so the F16 P operand of the P.V MMA uses the top of the
+// F16 range instead of (0, 1]: unshifted, keys ~17.3+ nats below the row max flush to 0 in F16 while the F32 sum l counts them
+// (a bias at long context behind an attention sink). l and O take the same scaled P, so O / l cancels it. P <= 2^15 < 65504.
+#ifndef P_SHIFT_LOG2
+#define P_SHIFT_LOG2 15.0f
+#endif
 #ifndef PREFILL_STAGE_NP0
 #define PREFILL_STAGE_NP0 3          // first PV np step after which a staged row pair is decoded
 #endif
@@ -352,13 +358,14 @@ __device__ __forceinline__ void attn_flash_prefill_hd256_body(
 
             // ---- P = exp2(S - m), accumulate l, pack as A fragments ----
             unsigned pa[NT / 2][4];
+            const float ms_lo = mu_lo - P_SHIFT_LOG2, ms_hi = mu_hi - P_SHIFT_LOG2;   // #1953
             #pragma unroll
             for (int n = 0; n < NT; n++)
             {
-                float p0 = exp2f(sa[n][0] - mu_lo);
-                float p1 = exp2f(sa[n][1] - mu_lo);
-                float p2 = exp2f(sa[n][2] - mu_hi);
-                float p3 = exp2f(sa[n][3] - mu_hi);
+                float p0 = exp2f(sa[n][0] - ms_lo);
+                float p1 = exp2f(sa[n][1] - ms_lo);
+                float p2 = exp2f(sa[n][2] - ms_hi);
+                float p3 = exp2f(sa[n][3] - ms_hi);
                 l_lo += p0 + p1; l_hi += p2 + p3;
                 // C frag (rows r, r+8; keys n*8+col_lo..+1) -> A frag of the k16 step n/2.
                 pa[n >> 1][(n & 1) * 2 + 0] = pack_half2(p0, p1);
