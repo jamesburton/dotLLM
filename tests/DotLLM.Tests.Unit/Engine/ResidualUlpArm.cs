@@ -43,7 +43,18 @@ internal abstract class ResidualUlpArm : IDisposable
     protected int TargetLayer = Layer;
 
     /// <summary>Installs a fresh one-shot perturber after <paramref name="layer"/>, remembering the modifier that was attached.</summary>
-    public void Attach(int layer = Layer) { TargetLayer = layer; AttachCore(); }
+    public void Attach(int layer = Layer) { TargetLayer = layer; NoOp = false; AttachCore(); }
+
+    /// <summary>
+    /// Installs the SAME perturber (same hook, same seam, same sync/readback on CUDA) but nudging ZERO ULPs, independent of <see cref="Ulps"/>.
+    /// This is the path-matched reference for the 1-ULP arm: attaching a modifier can change the kernel path (CUDA bypasses its decode / step
+    /// graphs whenever a modifier is set), so "unhooked vs 1 ULP" measures path change plus ULP, while "attached-0-ULP vs 1 ULP" measures the ULP only.
+    /// </summary>
+    public void AttachNoOp(int layer = Layer) { TargetLayer = layer; NoOp = true; AttachCore(); }
+
+    /// <summary>True while the installed perturber nudges zero ULPs.</summary>
+    protected bool NoOp;
+    protected int EffectiveUlps => NoOp ? 0 : Ulps;
 
     /// <summary>Per-backend install of the perturber (see <see cref="Attach"/>).</summary>
     protected abstract void AttachCore();
@@ -62,9 +73,9 @@ internal abstract class ResidualUlpArm : IDisposable
 
     public virtual void Dispose() => Detach();
 
-    private static float Nudge(float v)
+    private float Nudge(float v)
     {
-        for (int i = 0; i < Ulps; i++) v = v >= 0 ? MathF.BitIncrement(v) : MathF.BitDecrement(v);
+        for (int i = 0; i < EffectiveUlps; i++) v = v >= 0 ? MathF.BitIncrement(v) : MathF.BitDecrement(v);
         return v;
     }
 
@@ -102,7 +113,7 @@ internal abstract class ResidualUlpArm : IDisposable
                 _done = true;
                 arm.Fired++;
                 int hidden = residual.Length / tokenCount;
-                for (int i = 0; i < hidden; i++) residual[RowOf(tokenCount) * hidden + i] = Nudge(residual[RowOf(tokenCount) * hidden + i]);
+                for (int i = 0; i < hidden; i++) residual[RowOf(tokenCount) * hidden + i] = arm.Nudge(residual[RowOf(tokenCount) * hidden + i]);
             }
         }
     }
@@ -159,7 +170,7 @@ internal abstract class ResidualUlpArm : IDisposable
                 // One-shot and the only recorder on this kernel: a fresh descriptor cache per recording cannot alias a stale buffer handle.
                 arm._kernel.InvalidateDescriptorCache();
                 // The shader adds 1 to the bit pattern (one ULP away from zero): Ulps > 1 records it again.
-                for (int u = 0; u < Ulps; u++)
+                for (int u = 0; u < arm.EffectiveUlps; u++)
                 {
                     if (u > 0) KernelSupport.ComputeToComputeBarrier(cmdBuf);
                     arm._kernel.Record(cmdBuf, residual, RowOf(tokenCount) * hiddenSize, hiddenSize);
@@ -217,8 +228,8 @@ internal abstract class ResidualUlpArm : IDisposable
                     for (int i = 0; i < hiddenSize; i++)
                     {
                         // Sign-magnitude: +1 on the bit pattern is one ULP away from zero for either sign (BitIncrement/BitDecrement on the CPU).
-                        if (dtype == CudaResidualDType.F16) ((ushort*)p)[i] = (ushort)(((ushort*)p)[i] + Ulps);
-                        else ((uint*)p)[i] = (uint)(((uint*)p)[i] + Ulps);
+                        if (dtype == CudaResidualDType.F16) ((ushort*)p)[i] = (ushort)(((ushort*)p)[i] + arm.EffectiveUlps);
+                        else ((uint*)p)[i] = (uint)(((uint*)p)[i] + arm.EffectiveUlps);
                     }
                     CudaDriverApi.cuMemcpyHtoDAsync_v2(rowDev, (nint)p, bytes, stream).ThrowOnError();
                     CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
