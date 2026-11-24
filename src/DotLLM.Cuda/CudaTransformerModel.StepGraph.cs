@@ -61,6 +61,7 @@ public sealed unsafe partial class CudaTransformerModel
     {
         if (!StepGraphEnabled || !UseGraphCapture || suppressGraphCapture || deferredHostDest != 0
             || rows != 1 || isMla || isMoe || ProfilingEnabled || _currentAdapter is not null || DebugCaptureAttnLayer >= 0
+            || ResidualModifier is not null   // #1919: a graph replay never reaches the per-layer PostLayer residual-modifier call
             || _weights.TokenEmbedHost != 0)
             return false;
         bool admitted = kvCache switch

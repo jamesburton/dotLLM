@@ -1,0 +1,9 @@
+#version 450
+// #1926 CONTROL: the v2 body frozen before the E1/E3 loader changes, kept as the bit-identity oracle and the A/B baseline. Do not edit.
+// Mixed K Q4_0 / V Q8_0 KV twin of attention_f32_splitkv_gqa_v2.comp (issue #1161): K / V read as Q8_0 blocks (kv_load.glsl).
+// Body: attention_f32_splitkv_gqa_v2.glsl.
+#define KV_MIXED 1
+#define KV_K_Q4 1
+#define KV_V_Q8 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32_splitkv_gqa_v2_pre1926.glsl"

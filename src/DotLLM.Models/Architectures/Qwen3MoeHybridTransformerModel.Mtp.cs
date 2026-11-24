@@ -106,10 +106,12 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel
 
     /// <inheritdoc/>
     /// <remarks>Pooled (one spare): the speculative decoder takes one per round. Disposing the checkpoint returns its buffers.</remarks>
-    public object? CheckpointRecurrentState()
+    public object? CheckpointRecurrentState() => TakeGdnCheckpoint(_gdnCache);
+
+    private PooledGdnCheckpoint TakeGdnCheckpoint(GdnStateCache source)
     {
         GdnStateCache snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null) ?? new GdnStateCache(_gdn, _gdnCache.NumGdnLayers);
-        _gdnCache.CopyTo(snapshot);
+        source.CopyTo(snapshot);
         return new PooledGdnCheckpoint(this, snapshot);
     }
 

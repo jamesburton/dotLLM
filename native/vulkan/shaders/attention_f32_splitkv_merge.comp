@@ -20,7 +20,10 @@
 
 layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, std430) readonly  buffer BufPartOut { float partOut[]; }; // [numHeads*numSplits, head_dim]
+// #1926 E4: PART_F16 = 1 reads the v2 grouped pass's F16 partials (normalized by the split's running sum l_s, two halves per word) and
+// multiplies l_s back in; 0 (the default, every other split pass) reads F32 un-normalized accumulators exactly as before.
+layout(constant_id = 0) const uint PART_F16 = 0u;
+layout(set = 0, binding = 0, std430) readonly  buffer BufPartOut { uint partOutW[]; }; // F32: [numHeads*numSplits, head_dim]; F16: [.., head_dim / 2]
 layout(set = 0, binding = 1, std430) readonly  buffer BufPartMS  { float partMS[]; };  // [numHeads*numSplits, 2]
 layout(set = 0, binding = 2, std430) writeonly buffer BufOut     { float outp[]; };    // [1, numHeads * head_dim]
 layout(set = 0, binding = 3, std430) readonly  buffer BufSink    { float sinks[]; };   // [numHeads] gpt-oss attention sinks (bound but unread when hasSinks == 0)
@@ -100,7 +103,13 @@ void main() {
         for (uint s = 0u; s < pc.numSplits; s++) {
             float ms = partMS[(headBase + s) * 2u + 0u];
             float w = (ms > NEG_INF * 0.5) ? exp(ms - M) : 0.0;
-            acc += w * partOut[(headBase + s) * pc.headDim + d];
+            if (PART_F16 != 0u) {
+                float ls = partMS[(headBase + s) * 2u + 1u];
+                uint word = partOutW[(headBase + s) * (pc.headDim >> 1u) + (d >> 1u)];
+                acc += (w * ls) * unpackHalf2x16(word >> ((d & 1u) << 4u)).x;
+            } else {
+                acc += w * uintBitsToFloat(partOutW[(headBase + s) * pc.headDim + d]);
+            }
         }
         outp[outBase + d] = acc * invL;
     }

@@ -274,6 +274,13 @@ public sealed unsafe class SimpleKvCache : IKvCache, IPerLayerKvCache, IWindowed
     internal bool CanTruncateTo(int length) => _rows is null || _rows.CanTruncateTo(length);
 
     /// <inheritdoc/>
+    public bool SupportsAbortRollback => _rows is null;
+
+    /// <inheritdoc/>
+    public bool CanRollbackAfterAppend(int minPos, int maxPos) =>
+        _rows is null || _rows.CanTruncateToAfterAppend(_currentLength, minPos, maxPos);
+
+    /// <inheritdoc/>
     public void Rollback(int length)
     {
         if ((uint)length > (uint)_currentLength)

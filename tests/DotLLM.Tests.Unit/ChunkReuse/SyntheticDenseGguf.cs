@@ -31,9 +31,11 @@ internal static class SyntheticDenseGguf
     /// <param name="ropeDim">When positive, writes <c>rope.dimension_count</c> (partial rotary: only the leading dims of each head rotate).</param>
     /// <param name="specials">Control tokens (type 3) appended after the base vocabulary, e.g. <c>&lt;think&gt;</c> (chunk-cache server tests).</param>
     /// <param name="chatTemplate">Written as <c>tokenizer.chat_template</c> when given.</param>
+    /// <param name="headDim">Overrides <see cref="HeadDim"/> (16), e.g. 32 for quantized-KV (32-wide block) tests.</param>
     public static byte[] Build(string arch, int seed = 20261031, bool byteLevelVocab = false, int ropeDim = 0,
-        IReadOnlyList<string>? specials = null, string? chatTemplate = null)
+        IReadOnlyList<string>? specials = null, string? chatTemplate = null, int? headDim = null)
     {
+        int hd = headDim ?? HeadDim;
         specials ??= [];
         int baseVocab = byteLevelVocab ? ByteVocab : Vocab;
         int vocab = baseVocab + specials.Count;
@@ -54,8 +56,8 @@ internal static class SyntheticDenseGguf
         w.AddUInt32($"{arch}.feed_forward_length", Ff);
         w.AddUInt32($"{arch}.attention.head_count", Heads);
         w.AddUInt32($"{arch}.attention.head_count_kv", Kv);
-        w.AddUInt32($"{arch}.attention.key_length", HeadDim);
-        w.AddUInt32($"{arch}.attention.value_length", HeadDim);
+        w.AddUInt32($"{arch}.attention.key_length", (uint)hd);
+        w.AddUInt32($"{arch}.attention.value_length", (uint)hd);
         // Like the real Qwen3-4B-Instruct-2507 GGUF: freq_base only, no rope.dimension_count (full-head rotation) and no
         // rope.scaling.* keys.
         w.AddFloat32($"{arch}.rope.freq_base", RopeTheta);
@@ -84,14 +86,14 @@ internal static class SyntheticDenseGguf
         {
             string p = $"blk.{i}";
             Norm(w, rng, $"{p}.attn_norm.weight", Hidden);
-            Matrix(w, rng, $"{p}.attn_q.weight", Hidden, Heads * HeadDim, sh);
-            Matrix(w, rng, $"{p}.attn_k.weight", Hidden, Kv * HeadDim, sh);
-            Matrix(w, rng, $"{p}.attn_v.weight", Hidden, Kv * HeadDim, sh);
-            Matrix(w, rng, $"{p}.attn_output.weight", Heads * HeadDim, Hidden, 1.4f / MathF.Sqrt(Heads * HeadDim));
+            Matrix(w, rng, $"{p}.attn_q.weight", Hidden, Heads * hd, sh);
+            Matrix(w, rng, $"{p}.attn_k.weight", Hidden, Kv * hd, sh);
+            Matrix(w, rng, $"{p}.attn_v.weight", Hidden, Kv * hd, sh);
+            Matrix(w, rng, $"{p}.attn_output.weight", Heads * hd, Hidden, 1.4f / MathF.Sqrt(Heads * hd));
             if (qkNorm)
             {
-                Norm(w, rng, $"{p}.attn_q_norm.weight", HeadDim);
-                Norm(w, rng, $"{p}.attn_k_norm.weight", HeadDim);
+                Norm(w, rng, $"{p}.attn_q_norm.weight", hd);
+                Norm(w, rng, $"{p}.attn_k_norm.weight", hd);
             }
             Norm(w, rng, $"{p}.ffn_norm.weight", Hidden);
             Matrix(w, rng, $"{p}.ffn_gate.weight", Hidden, Ff, sh);

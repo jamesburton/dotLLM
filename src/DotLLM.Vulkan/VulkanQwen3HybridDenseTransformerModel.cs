@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using DotLLM.Core.Lora;
+using DotLLM.Core.Diagnostics;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -50,6 +51,7 @@ namespace DotLLM.Vulkan;
 public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, IContextLimitable, IVulkanResidualModifierHost
 {
     private readonly VulkanDevice _device;
+    internal VulkanDevice Device => _device;
     private readonly bool _ownsDevice;
     private readonly GgufFile? _gguf;
 
@@ -527,7 +529,15 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     /// </summary>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
                            IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState)
+        => ForwardTapped(tokenIds, positions, deviceId, kvCache, gdnState, mtpState)
+           ?? throw new ForwardAbortedException(_tapAbort);
+
+    private ITensor? ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState)
     {
+        var taps = _tapSnap;
+        var tapState = _tapState;
+        ForwardAbortInfo tapAbortAt = default;
         if (mtpState is not null && mtpState is not VulkanMtpState && !(_dflash is not null && mtpState is DFlashMtpState))
             throw new ArgumentException(
                 $"VulkanQwen3HybridDenseTransformerModel requires a VulkanMtpState; got {mtpState.GetType().Name}.",
@@ -591,6 +601,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
         bool resized = _state.EnsureCapacity(seqLen);
         resized |= PrepareKvCache(kvCache, positions);
+        if (taps is not null) resized |= tapState!.Begin(taps, seqLen);
         if (resized)
         {
             // Every kernel (the FWHT one included) keeps a handle-keyed descriptor cache, and a freed buffer handle can be
@@ -670,6 +681,10 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
                 ProfBeginSubmit(cmdBuf);
             }
 
+            if (taps is not null && layer == 0
+                && !TapAt(HookPoint.PostEmbedding, -1, _state.HiddenState, seqLen - 1, ref cmdBuf, positions, out tapAbortAt))
+                return FinishTapAbort(tapAbortAt, kvCache, gdnState);
+
             if (dflashTaps is not null)
                 RecordDFlashTap(cmdBuf, layer, tapFirst, tapRows);
 
@@ -740,6 +755,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
                 KernelSupport.ComputeTransferFullBarrier(cmdBuf);
                 residualModifier.Record(cmdBuf, _state.HiddenState, layer, seqLen, hiddenSize);
             }
+            if (taps is not null
+                && !TapAt(HookPoint.PostLayer, layer, _state.HiddenState, seqLen - 1, ref cmdBuf, positions, out tapAbortAt))
+                return FinishTapAbort(tapAbortAt, kvCache, gdnState);
             KernelSupport.ComputeToHostBarrier(cmdBuf);
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.Resid);
             if (schedule.SubmitAfter(layer))
@@ -810,6 +828,20 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
         if (dflashTaps is not null)
             RecordDFlashTap(cmdBuf, kinds.Length, tapFirst, tapRows);
+        if (taps is not null)
+        {
+            if (!TapAt(HookPoint.PreFinalNorm, -1, _state.HiddenState, seqLen - 1, ref cmdBuf, positions, out tapAbortAt))
+                return FinishTapAbort(tapAbortAt, kvCache, gdnState);
+            // PreLmHead with several rows: a dedicated all-row final norm into the NormOutput scratch (the head below overwrites it).
+            if (tapState!.Rows(HookPoint.PreLmHead, -1) > 1)
+            {
+                KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+                _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, _weights.OutputNormWeight, _state.NormOutput,
+                    rowCount: seqLen, n: hiddenSize, eps: eps);
+                if (!TapAt(HookPoint.PreLmHead, -1, _state.NormOutput, 0, ref cmdBuf, positions, out tapAbortAt))
+                    return FinishTapAbort(tapAbortAt, kvCache, gdnState);
+            }
+        }
         RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
             srcOffset: (ulong)headSrcOffset, dstOffset: 0, size: (ulong)((long)headRows * hiddenRowBytes));
         KernelSupport.TransferToComputeBarrier(cmdBuf);
@@ -819,6 +851,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             rowCount: headRows, n: hiddenSize, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.Norm);
+        if (taps is not null && tapState!.Rows(HookPoint.PreLmHead, -1) == 1
+            && !TapAt(HookPoint.PreLmHead, -1, _state.NormOutput, headRows - 1, ref cmdBuf, positions, out tapAbortAt))
+            return FinishTapAbort(tapAbortAt, kvCache, gdnState);
 
         var headIn = _state.NormOutput;
         if (_hadamard is { } headRot)
@@ -889,6 +924,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         if (dflashTaps is not null)
             FinishDFlashTaps(dflashTaps, positions.Slice(tapFirst), tapRows);
 
+        if (taps is not null && !tapState!.Immediate)
+        {
+            try { tapState.DeliverDeferred(positions); }
+            catch { result.Dispose(); throw; }
+        }
         return result;
     }
 
@@ -1327,14 +1367,40 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
         ValidateBatchRequests(requests);
 
+        var batchTaps = _tapState?.Registry.Current;
+        AbortableTapKvGuard.RefuseAbortableBatch(batchTaps);   // abort of request i would leave 0..i-1 committed (#1920 I-6)
+        bool tapped = batchTaps is not null;
         if (requests.Count >= 2 && BatchFuseEnabled && _prof is null && TotalRows(requests) >= BatchFuseMinRows)
-            return ForwardBatchFused(requests);
+        {
+            // A hidden-state tap needs each sequence's own rows: the fused batched loop has no tap sites (#1920).
+            if (!tapped) return ForwardBatchFused(requests);
+            HiddenStateTapRegistry.PathCounters.AddPackedBatchFallback();
+            VulkanHiddenStateTaps.LogOnce("fused-batch", "a hidden-state tap is attached: ForwardBatch runs per sequence instead of the fused batch.");
+        }
 
         var results = new ITensor[requests.Count];
-        for (int i = 0; i < requests.Count; i++)
+        int done = 0;
+        try
         {
-            var r = requests[i];
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var r = requests[i];
+                if (tapped) _tapState!.SeqId = i;
+                try
+                {
+                    results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+                    done++;
+                }
+                finally
+                {
+                    if (tapped) _tapState!.SeqId = 0;
+                }
+            }
+        }
+        catch
+        {
+            for (int d = 0; d < done; d++) results[d].Dispose();   // do not leak the completed requests' logits
+            throw;
         }
         return results;
     }
@@ -3256,6 +3322,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         // First: the drafter records with the trunk's kernels and buffers.
         DisposeDFlash();
         Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
+        _tapState?.Dispose();
+        Interlocked.Exchange(ref _tapSpareClone, null)?.Dispose();
         FreeRowSnapshots();
         _iqF16Prefill?.Dispose();
         // Before _device: the profiler owns a query pool on it.

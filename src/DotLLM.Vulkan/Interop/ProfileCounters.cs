@@ -30,4 +30,7 @@ internal static class ProfileCounters
     /// barriers show up in <see cref="Barriers"/> only.
     /// </summary>
     internal static long HazardBarriers;
+
+    /// <summary>Total <c>vkQueueSubmit</c> calls (each is waited on by a fence or a timeline: the submit/fence census, #1920).</summary>
+    internal static long Submits;
 }

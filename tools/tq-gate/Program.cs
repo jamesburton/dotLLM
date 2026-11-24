@@ -26,6 +26,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Server;
 
 var a = ParseArgs(args);
+if (a.GetValueOrDefault("mode") == "klcmp") { KlCompare(a["a"], a["b"], a.GetValueOrDefault("ref")); return; }
 if (a.GetValueOrDefault("mode") == "cmpdump")
 {
     // tool-only: compare two row dumps (raw float32, [rows, vocab]) written by `--mode parity --dump <prefix>`; no model, no GPU.
@@ -87,6 +88,7 @@ switch (mode)
     case "q8control": Q8Control(); break;
     case "vgpr": foreach (int b in bitsList) Vgpr(b); break;
     case "bytes": Bytes(); break;
+    case "decodedump": DecodeDump(); break;
     case "splitkv": SplitKv(); break;
     case "splitkv-paired": SplitKvPaired(); break;
     case "rowlane": RowLane(); break;
@@ -726,6 +728,67 @@ void Vgpr(int bits)
 // ───────────────────────── plumbing ─────────────────────────
 double Med(double[] sorted) => sorted.Length % 2 == 1 ? sorted[sorted.Length / 2] : (sorted[sorted.Length / 2 - 1] + sorted[sorted.Length / 2]) / 2;
 void Append(object row) => File.AppendAllText(outFile, JsonSerializer.Serialize(row) + "\n");
+// ───────────────────────── decodedump / klcmp (#1926 E4 gate) ─────────────────────────
+// decodedump: prefill --ctx corpus tokens with the production plain cache (whatever DOTLLM_VK_KV / DOTLLM_VULKAN_SPLITKV_PART select in
+// this process), then teacher-force --steps single-token decode steps (the split-KV decode path) and write each step's log-softmax row
+// (float32) plus the target token id to --out. klcmp: per-step KL(a || b), the NLL of the target under each, and top-1 agreement;
+// --ref adds KL(ref || a) and KL(ref || b) (the KV format's own floor when ref is the f16-KV run).
+void DecodeDump()
+{
+    int P = ctx, N = steps;
+    int[] t = all[..(P + N + 1)];
+    using var c = Plain(P + N + 1);
+    Prefill(c, t, P);
+    using var fs = File.Create(outFile);
+    using var bw = new BinaryWriter(fs);
+    bw.Write(N); bw.Write(vocab);
+    for (int i = 0; i < N; i++)
+    {
+        using var l = model.Forward(t.AsSpan(P + i, 1), [P + i], dev, c, true);
+        float[] r = Row(l, 0);
+        double mx = r.Max(), sum = 0;
+        foreach (float x in r) sum += Math.Exp(x - mx);
+        double lse = mx + Math.Log(sum);
+        bw.Write(t[P + i + 1]);
+        foreach (float x in r) bw.Write((float)(x - lse));
+    }
+    static string E(string n) => $"{n}={Environment.GetEnvironmentVariable(n) ?? "-"}";
+    Log($"decodedump: ctx {P}, {N} steps -> {outFile} ({E("DOTLLM_VK_KV")}, {E("DOTLLM_VULKAN_SPLITKV_PART")}, {E("DOTLLM_VULKAN_SPLITKV_GROUP_SPEC")}, " +
+        $"{E("DOTLLM_VULKAN_SPLITKV_GQA2_TARGET_WG")}, {E("DOTLLM_VULKAN_SPLIT_TARGET_WG")}, {E("DOTLLM_VULKAN_SPLITKV_GQA2")})");
+}
+
+static void KlCompare(string fa, string fb, string? fref)
+{
+    static (int[] tgt, float[][] lp) Read(string f)
+    {
+        using var br = new BinaryReader(File.OpenRead(f));
+        int n = br.ReadInt32(), v = br.ReadInt32();
+        var tgt = new int[n]; var lp = new float[n][];
+        for (int i = 0; i < n; i++) { tgt[i] = br.ReadInt32(); lp[i] = new float[v]; for (int j = 0; j < v; j++) lp[i][j] = br.ReadSingle(); }
+        return (tgt, lp);
+    }
+    static double Kl(float[] p, float[] q) { double k = 0; for (int j = 0; j < p.Length; j++) { double e = Math.Exp(p[j]); if (e > 0) k += e * (p[j] - q[j]); } return k; }
+    static int Arg(float[] x) { int b = 0; for (int j = 1; j < x.Length; j++) if (x[j] > x[b]) b = j; return b; }
+    var (ta, la) = Read(fa); var (tb, lb) = Read(fb);
+    if (!ta.SequenceEqual(tb)) throw new InvalidOperationException("target tokens differ: not the same corpus window");
+    int n = ta.Length; double kl = 0, klMax = 0, nllA = 0, nllB = 0; int top = 0;
+    for (int i = 0; i < n; i++)
+    {
+        double k = Kl(la[i], lb[i]); kl += k; klMax = Math.Max(klMax, k);
+        nllA -= la[i][ta[i]]; nllB -= lb[i][ta[i]];
+        if (Arg(la[i]) == Arg(lb[i])) top++;
+    }
+    Console.WriteLine($"steps {n}: KL(a||b) mean {kl / n:E3} max {klMax:E3}; PPL a {Math.Exp(nllA / n):F4} b {Math.Exp(nllB / n):F4} (delta {100 * (Math.Exp(nllB / n) / Math.Exp(nllA / n) - 1):+0.000;-0.000}%); top-1 agree {top}/{n}");
+    if (fref is not null)
+    {
+        var (tr, lr) = Read(fref);
+        if (!tr.SequenceEqual(ta)) throw new InvalidOperationException("ref targets differ");
+        double ka = 0, kb = 0;
+        for (int i = 0; i < n; i++) { ka += Kl(lr[i], la[i]); kb += Kl(lr[i], lb[i]); }
+        Console.WriteLine($"KL(ref||a) mean {ka / n:E3}; KL(ref||b) mean {kb / n:E3}");
+    }
+}
+
 static void Log(string s) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {s}");
 static Dictionary<string, string> ParseArgs(string[] argv)
 {
