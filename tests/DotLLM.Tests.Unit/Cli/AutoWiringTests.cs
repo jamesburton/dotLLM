@@ -20,6 +20,9 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     private readonly string? _oldTuning = Environment.GetEnvironmentVariable("DOTLLM_TUNING_DIR");
     private readonly string? _oldHash = Environment.GetEnvironmentVariable("DOTLLM_HASH_CACHE_DIR");
 
+    /// <summary>The head-dim-32 model the fixture also writes: its KV rows fill whole 32-element blocks, which the quantised caches require.</summary>
+    private string Model => Path.Combine(Path.GetDirectoryName(_tiny.GgufPath)!, "qwen3-hd32.gguf");
+
     public AutoWiringTests(PrefixCacheFailedRequestTests.TinyQwen tiny)
     {
         _tiny = tiny;
@@ -35,7 +38,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
         try { Directory.Delete(_store, recursive: true); } catch (IOException) { }
     }
 
-    private AutoRequest Request(AutoCommand command, string[] args) => new(args, _tiny.GgufPath, _tiny.GgufPath, DeviceSpec.Parse("cpu"),
+    private AutoRequest Request(AutoCommand command, string[] args) => new(args, Model, Model, DeviceSpec.Parse("cpu"),
         AutoEntry.DefaultProfile, 0, new AutoPolicy(command), AutoCli.ServeSupported, DefaultPaged: command == AutoCommand.Serve);
 
     /// <summary>Saves a result for the tiny model on the CPU, keyed exactly as the commands will key their lookup.</summary>
@@ -51,16 +54,16 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     private ServeCommand.Settings ServeSettings(params string[] args)
     {
         AutoCli.RawArgsOverride = args;
-        return new ServeCommand.Settings { Model = _tiny.GgufPath, Device = "cpu", Auto = true };
+        return new ServeCommand.Settings { Model = Model, Device = "cpu", Auto = true };
     }
 
     [Fact]
     public void Serve_AutoHit_AppliesSavedKv_AndStatusReportsSources()
     {
         SaveFor(new TunedSettings { CacheTypeK = "q8_0", CacheTypeV = "q8_0", Threads = 2 });
-        var s = ServeSettings("serve", _tiny.GgufPath, "--auto", "--device", "cpu");
+        var s = ServeSettings("serve", Model, "--auto", "--device", "cpu");
 
-        var options = ServeCommand.BuildServerOptionsAuto(s, null, _tiny.GgufPath);
+        var options = ServeCommand.BuildServerOptionsAuto(s, null, Model);
 
         Assert.Equal("q8_0", options.CacheTypeK);
         Assert.Equal("q8_0", options.CacheTypeV);
@@ -69,7 +72,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
         Assert.Equal("flag", options.SettingSources["device"]);
         Assert.Equal("default", options.SettingSources["gpu_layers"]);
 
-        using var state = ServerStartup.LoadModel(_tiny.GgufPath, options with { Warmup = new WarmupOptions { Enabled = false } });
+        using var state = ServerStartup.LoadModel(Model, options with { Warmup = new DotLLM.Engine.WarmupOptions { Enabled = false } });
         var status = state.GetStatus();
         Assert.Equal("auto", status.SettingsSource!["cache_type_k"]);
         string json = JsonSerializer.Serialize(status, ServerJsonContext.Default.ServerStatusResponse);
@@ -79,8 +82,8 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     [Fact]
     public void Serve_AutoMiss_RunsDefaults_AndAdvisesTheTuneCommand()
     {
-        var s = ServeSettings("serve", _tiny.GgufPath, "--auto");
-        var options = ServeCommand.BuildServerOptionsAuto(s, null, _tiny.GgufPath);
+        var s = ServeSettings("serve", Model, "--auto");
+        var options = ServeCommand.BuildServerOptionsAuto(s, null, Model);
         Assert.Null(options.CacheTypeK);
         Assert.All(options.SettingSources!.Values, v => Assert.Equal("default", v));
 
@@ -88,21 +91,21 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
         Assert.Equal(TuningMatchKind.Miss, applied.Match.Kind);
         Assert.Contains("dotllm tune", applied.Advice);
         Assert.Contains("--profile chat", applied.Advice);
-        Assert.Contains(_tiny.GgufPath, applied.Advice);
+        Assert.Contains(Model, applied.Advice);
     }
 
     [Fact]
     public void Serve_WithoutAuto_StatusHasNoSettingsSource_AndTheStoreIsNotTouched()
     {
         SaveFor(new TunedSettings { CacheTypeK = "q8_0", CacheTypeV = "q8_0" });
-        AutoCli.RawArgsOverride = ["serve", _tiny.GgufPath];
-        var s = new ServeCommand.Settings { Model = _tiny.GgufPath, Device = "cpu" };   // no --auto
-        var options = ServeCommand.BuildServerOptionsAuto(s, null, _tiny.GgufPath);
+        AutoCli.RawArgsOverride = ["serve", Model];
+        var s = new ServeCommand.Settings { Model = Model, Device = "cpu" };   // no --auto
+        var options = ServeCommand.BuildServerOptionsAuto(s, null, Model);
         Assert.Null(options.CacheTypeK);               // the saved result was NOT applied
         Assert.Null(options.SettingSources);
         Assert.Null(options.AutoProfile);
 
-        using var state = ServerStartup.LoadModel(_tiny.GgufPath, options with { Warmup = new WarmupOptions { Enabled = false } });
+        using var state = ServerStartup.LoadModel(Model, options with { Warmup = new DotLLM.Engine.WarmupOptions { Enabled = false } });
         var status = state.GetStatus();
         Assert.Null(status.SettingsSource);
         Assert.DoesNotContain("settings_source", JsonSerializer.Serialize(status, ServerJsonContext.Default.ServerStatusResponse));
@@ -113,15 +116,15 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     {
         // A saved tq pair on a multi-session (paged) serve is dropped with its reason, and the server starts on its default cache.
         SaveFor(new TunedSettings { CacheTypeK = "tq4", CacheTypeV = "tq4", Paged = false });
-        AutoCli.RawArgsOverride = ["serve", _tiny.GgufPath, "--auto"];
+        AutoCli.RawArgsOverride = ["serve", Model, "--auto"];
         var applied = AutoEntry.Resolve(Request(AutoCommand.Serve, ["serve", "--auto"]), new TuningStore());
         Assert.Null(applied.Applied.CacheTypeK);
         Assert.Null(applied.Applied.CacheTypeV);
         Assert.Null(applied.Applied.Paged);
         Assert.Contains(applied.Warnings, w => w.Contains("--no-paged", StringComparison.Ordinal));
 
-        var s = new ServeCommand.Settings { Model = _tiny.GgufPath, Device = "cpu", Auto = true };
-        var options = ServeCommand.BuildServerOptionsAuto(s, null, _tiny.GgufPath);
+        var s = new ServeCommand.Settings { Model = Model, Device = "cpu", Auto = true };
+        var options = ServeCommand.BuildServerOptionsAuto(s, null, Model);
         Assert.Null(options.CacheTypeK);
         Assert.True(options.UsePaged);
     }
@@ -140,7 +143,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     private (int Code, string Output) RunCli(params string[] args)
     {
         AutoCli.RawArgsOverride = args;
-        try { return CliTurboQuantRefusalTests.Run(args); }
+        try { return CliTurboQuantCommandTests.Run(args); }
         finally { AutoCli.RawArgsOverride = null; }
     }
 
@@ -149,7 +152,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     {
         SaveFor(new TunedSettings { CacheTypeK = "q8_0", CacheTypeV = "q8_0" });
         // --auto is a plain flag, so the model argument after it is still the model (Review Focus 8).
-        var (code, output) = RunCli("run", "--auto", _tiny.GgufPath, "-p", "ab", "--max-tokens", "2", "--device", "cpu");
+        var (code, output) = RunCli("run", "--auto", Model, "-p", "ab", "--max-tokens", "2", "--device", "cpu");
         Assert.True(code == 0, output);
         Assert.Contains("auto: settings from", output);
         Assert.Contains("K:Q8_0 V:Q8_0", output);                 // the saved KV pair reached the cache
@@ -159,7 +162,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     public void Run_Auto_WithExplicitKvFlag_FlagWins()
     {
         SaveFor(new TunedSettings { CacheTypeK = "q8_0", CacheTypeV = "q8_0" });
-        var (code, output) = RunCli("run", _tiny.GgufPath, "--auto", "-p", "ab", "--max-tokens", "2", "--device", "cpu", "--cache-type-k", "q4_0");
+        var (code, output) = RunCli("run", Model, "--auto", "-p", "ab", "--max-tokens", "2", "--device", "cpu", "--cache-type-k", "q4_0");
         Assert.True(code == 0, output);
         Assert.Contains("K:Q4_0 V:Q8_0", output);                 // the flag for K, the saved value for V
     }
@@ -167,7 +170,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     [Fact]
     public void Run_Auto_Miss_RunsAndPrintsTheTuneCommand()
     {
-        var (code, output) = RunCli("run", _tiny.GgufPath, "--auto", "-p", "ab", "--max-tokens", "2", "--device", "cpu");
+        var (code, output) = RunCli("run", Model, "--auto", "-p", "ab", "--max-tokens", "2", "--device", "cpu");
         Assert.True(code == 0, output);
         Assert.Contains("dotllm tune", output);
         Assert.DoesNotContain("K:Q", output);                     // default cache, nothing applied
@@ -180,7 +183,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
         Environment.SetEnvironmentVariable("DOTLLM_CUDA_STEP_GRAPH", "0");   // an A/B variable that was not set at tune time
         try
         {
-            var (code, output) = RunCli("run", _tiny.GgufPath, "--auto", "-p", "ab", "--max-tokens", "2", "--device", "cpu");
+            var (code, output) = RunCli("run", Model, "--auto", "-p", "ab", "--max-tokens", "2", "--device", "cpu");
             Assert.True(code == 0, output);
             Assert.Contains("DOTLLM_CUDA_STEP_GRAPH", output);
             Assert.Contains("--recheck", output);
@@ -193,7 +196,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     public void Bench_Auto_AppliesSavedKv()
     {
         SaveFor(new TunedSettings { CacheTypeK = "q8_0", CacheTypeV = "q8_0" });
-        var (code, output) = RunCli("bench", _tiny.GgufPath, "--auto", "--device", "cpu", "--prompt-tokens", "8", "--gen-tokens", "2", "--reps", "1");
+        var (code, output) = RunCli("bench", Model, "--auto", "--device", "cpu", "--prompt-tokens", "8", "--gen-tokens", "2", "--reps", "1");
         Assert.True(code == 0, output);
         Assert.Contains("auto: settings from", output);
     }
@@ -202,7 +205,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     public void Chat_Auto_AppliesSavedResult()
     {
         SaveFor(new TunedSettings { CacheTypeK = "q8_0", CacheTypeV = "q8_0" });
-        string[] args = ["chat", _tiny.GgufPath, "--auto", "--device", "cpu", "--max-tokens", "2"];
+        string[] args = ["chat", Model, "--auto", "--device", "cpu", "--max-tokens", "2"];
         AutoCli.RawArgsOverride = args;
         var (code, output) = CliTurboQuantCommandTests.RunWithInput("ab\n/exit\n", args);
         Assert.True(code == 0, output);
