@@ -11,6 +11,7 @@ using DotLLM.Engine.Constraints;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
 using DotLLM.Tokenizers.ToolCallParsers;
@@ -465,6 +466,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         IModel model = null!;
         Func<int, DotLLM.Core.Attention.IKvCache>? vulkanKv = null;
         DeviceCli.Outcome deviceOutcome = null!;
+        ToolDefinition[]? tools = ChatCommand.ParseToolDefinitions(settings.Tools);
+        JinjaChatTemplate? hfTemplate = null;
 
         void LoadModel()
         {
@@ -475,15 +478,18 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 // this path is not wired through the CLI yet.
                 // Explicit GPU -> error before loading anything; auto -> CPU with a warning (#790).
                 deviceOutcome = DeviceCli.ResolveCpuOnly(settings.Device, "HuggingFace safetensors checkpoints", Path.GetFileName(hfDir));
+                // Validate tokenizer/template before opening weight mappings or allocating the model.
+                tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
+                    ?? throw new InvalidOperationException(
+                        $"No tokenizer.json (or legacy vocab.json/merges.txt) found in '{hfDir}'.");
+                if (tools is { Length: > 0 })
+                    hfTemplate = HfChatTemplateFactory.TryCreate(hfDir, tokenizer, useTools: true);
                 var threadingCfg = new ThreadingConfig(
                     settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
                 var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, threadingCfg);
                 model = m;
                 safetensorsSource = src;
                 config = cfg;
-                tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
-                    ?? throw new InvalidOperationException(
-                        $"No tokenizer.json (or legacy vocab.json/merges.txt) found in '{hfDir}'.");
                 return;
             }
 
@@ -653,26 +659,22 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
         var threadingInfo = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
 
-        // Parse tool definitions and format prompt via chat template when tools are provided
-        ToolDefinition[]? tools = ChatCommand.ParseToolDefinitions(settings.Tools);
+        // Run accepts raw prompts for both formats; tools require chat formatting.
         IToolCallParser? toolCallParser = null;
         string effectivePrompt = prompt;
-        if (tools is { Length: > 0 } && gguf is null)
+        if (tools is { Length: > 0 } && gguf is null && hfTemplate?.SupportsTools != true)
         {
-            // Tool calling relies on the GGUF-embedded chat template; the HF
-            // safetensors path doesn't surface one here. Fall back to the raw
-            // prompt so generation still runs.
+            const string warning = "WARNING: the selected HuggingFace chat template does not support tool prompting; --tools is ignored.";
             if (settings.Json)
-                Console.Error.WriteLine("WARNING: --tools is not supported for HuggingFace safetensors models; ignoring.");
+                Console.Error.WriteLine(warning);
             else
-                AnsiConsole.MarkupLine("[yellow]WARNING: --tools is not supported for HuggingFace safetensors models; ignoring.[/]");
+                AnsiConsole.MarkupLine($"[yellow]{warning}[/]");
             tools = null;
         }
         if (tools is { Length: > 0 })
         {
-            string bosToken = tokenizer.DecodeToken(tokenizer.BosTokenId);
-            string eosToken = tokenizer.DecodeToken(tokenizer.EosTokenId);
-            var chatTemplate = GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer, config.Architecture)
+            var chatTemplate = hfTemplate
+                ?? GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer, config.Architecture)
                 ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
 
             var messages = new List<ChatMessage>
@@ -684,7 +686,10 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 AddGenerationPrompt = true,
                 Tools = tools
             });
-            toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf!.Metadata, config.Architecture);
+            if (tools is { Length: > 0 })
+                toolCallParser = gguf is not null
+                    ? GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture)
+                    : ToolCallParserFactory.Create(config.Architecture, chatTemplate.TemplateSource);
         }
         var toolChoice = ChatCommand.ParseToolChoice(settings.ToolChoiceStr, tools);
 
