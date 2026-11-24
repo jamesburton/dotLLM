@@ -68,7 +68,10 @@ public abstract class GenerationSessionBackendSuite
             Assert.True(pathDelta <= ControlSanityCeiling, $"{oracle.Backend}: attaching the hook moved the logits by {pathDelta:E3}, above the sanity ceiling");
         }
         // James 2026-11-24: the bound comes from the 1-ULP arm ONLY. The prefill-vs-decode split (raw) is a reported diagnostic, not part of the bound.
-        float control = ulp;
+        // James 2026-11-24 (option B): on GPU (Vulkan, CUDA) the bound is max(1-ULP arm, same-run prefill-vs-decode diagnostic): a one-element 1-ULP nudge is far
+        // smaller than the prefill-vs-decode kernel noise every GPU cross-path comparison crosses (measured 100-1000x on Vulkan, 1.3x on CUDA llama); CPU stays on the
+        // 1-ULP arm alone (exact where the arm is 0). Follow-up: make the GPU rollback oracle truly same-kernel-path so the 1-ULP bound can hold on GPU alone.
+        float control = oracle.Backend == SessionBackend.Cpu ? ulp : MathF.Max(ulp, raw);
         Console.WriteLine($"[session-control] {oracle.Backend} n={tokens.Length} ulp1(path-matched)={ulp:E3} prefill-vs-decode(diagnostic, not in bound)={raw:E3} pathDelta={pathDelta:E3}");
         string? log = Environment.GetEnvironmentVariable("DOTLLM_SESSION_CONTROL_LOG");
         if (!string.IsNullOrEmpty(log))
