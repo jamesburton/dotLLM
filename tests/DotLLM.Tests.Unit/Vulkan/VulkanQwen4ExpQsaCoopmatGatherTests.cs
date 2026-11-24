@@ -115,4 +115,80 @@ public sealed class VulkanQwen4ExpQsaCoopmatGatherTests
         Assert.True(worst < 3e-3, $"cooperative-matrix gather diverges from the scalar gather: {worst:E2}");
         Assert.True(a.Any(v => Math.Abs(v) > 1e-3), "control: output is all ~0, the comparison proves nothing");
     }
+
+    /// <summary>
+    /// #1953: the matrix kernel packs P to F16 for its P.V coopmat. In (0, 1] a key ~17.3+ nats below the row max rounds to 0 and the
+    /// running sum (of the rounded P) drops it too, so behind an attention sink the long tail vanished. Every block selected (budget =
+    /// all), one sink key (V = 0) 15.6-18.4 nats above ~8K tail keys (V 48..80, one sign): the output IS the tail mass. Reference: the
+    /// scalar F16-KV gather (F32 P). Fails on the pre-fix SPV (output ~0).
+    /// </summary>
+    [SkippableFact]
+    public void CoopmatGather_SinkDominatedLongRow_KeepsTheTailMass()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var k = Qwen4ExpQsaKernels.Create(device, spvDir);
+        Skip.IfNot(k.F16Supported, "F16 SPIR-V twins not built");
+        Skip.IfNot(k.CoopmatSupported, "cooperative-matrix gather not available on this device");
+        const int headDim = 256, heads = 8, kvHeads = 2, blockSize = 64, tokens = 8192, Q = 40, splits = 1;
+        int kvStride = kvHeads * headDim, first = tokens - Q, budget = tokens / blockSize;
+        var rng = new Random(1953);
+        static float H(float x) => (float)(Half)x;
+        var kk = new float[(long)tokens * kvStride];
+        var vv = new float[(long)tokens * kvStride];
+        for (int j = 0; j < tokens; j++)
+            for (int h = 0; h < kvHeads; h++)
+            {
+                long r0 = (long)j * kvStride + h * headDim;
+                kk[r0] = H(j == 0 ? 20f : -2f - 4f * (float)rng.NextDouble());
+                for (int d = 1; d < headDim; d++) kk[r0 + d] = H((float)(rng.NextDouble() * 0.2 - 0.1));
+                for (int d = 0; d < headDim; d++) vv[r0 + d] = H(j == 0 ? 0f : 48f + 32f * (float)rng.NextDouble());
+            }
+        var q = new float[Q * heads * headDim];
+        float q0 = 8f * MathF.Sqrt(headDim / 128f);   // score gap 15.6-18.4 nats at any head_dim
+        for (int r = 0; r < Q; r++)
+            for (int h = 0; h < heads; h++)
+                q[(r * heads + h) * headDim] = H(q0);
+        var sel = new int[Q * budget];
+        for (int tq = 0; tq < Q; tq++)
+        {
+            int nb = (first + tq + 1) / blockSize;   // every complete block before the query (padded with block 0, as above)
+            for (int i = 0; i < budget; i++) sel[tq * budget + i] = i < nb ? i : 0;
+        }
+        long partRows = (long)Q * heads * splits;
+        using var bQ = device.AllocateDeviceLocal(q.Length * 4L);
+        using var bK = device.AllocateDeviceLocal(kk.Length * 2L);
+        using var bV = device.AllocateDeviceLocal(vv.Length * 2L);
+        using var bSel = device.AllocateDeviceLocal(sel.Length * 4L);
+        using var bPart = device.AllocateDeviceLocal(partRows * headDim * 4);
+        using var bMs = device.AllocateDeviceLocal(partRows * 2 * 4);
+        using var bRef = device.AllocateDeviceLocal((long)Q * heads * headDim * 4);
+        using var bCm = device.AllocateDeviceLocal((long)Q * heads * headDim * 4);
+        device.Upload(q, bQ);
+        device.Upload(MemoryMarshal.AsBytes<uint>(PackHalves(kk)), bK);
+        device.Upload(MemoryMarshal.AsBytes<uint>(PackHalves(vv)), bV);
+        device.Upload(MemoryMarshal.AsBytes<int>(sel), bSel);
+        void Attn(VulkanDevice.Buffer o, bool cm)
+        {
+            bool saved = Qwen4ExpQsaKernels.CoopmatGather;
+            Qwen4ExpQsaKernels.CoopmatGather = cm;
+            try { Run(device, cmd => k.RecordAttention(cmd, bQ, bK, bV, bSel, bPart, bMs, o, 0, Q, first, heads, kvHeads, headDim, blockSize, budget, splits, true)); }
+            finally { Qwen4ExpQsaKernels.CoopmatGather = saved; }
+        }
+        long before = k.CoopmatAttentionDispatches;
+        Attn(bRef, false);
+        Attn(bCm, true);
+        Assert.Equal(before + 1, k.CoopmatAttentionDispatches);
+        var a = new float[Q * heads * headDim]; var b = new float[a.Length];
+        device.Download(bRef, a); device.Download(bCm, b);
+        double worst = 0; int at = 0;
+        for (int i = 0; i < a.Length; i++)
+        {
+            double err = Math.Abs(a[i] - b[i]) / Math.Max(Math.Abs(a[i]), 1e-30);
+            if (!(err <= worst)) { worst = err; at = i; }
+        }
+        _out.WriteLine($"QSA coopmat gather sink tail {tokens} keys: worst relative error {worst:E3} at {at} ({b[at]:E4} vs scalar gather {a[at]:E4})");
+        Assert.True(a.Min() > 1e-4, $"control: the tail output must be clearly non-zero (min {a.Min():E3})");
+        Assert.True(worst <= 0.01, $"QSA coopmat gather loses the softmax tail: {b[at]:E4} vs {a[at]:E4} (relative {worst:E3})");
+    }
 }

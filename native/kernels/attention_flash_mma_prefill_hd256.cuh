@@ -358,8 +358,8 @@ __device__ __forceinline__ void attn_flash_prefill_hd256_body(
 
             // ---- P = exp2(S - m), accumulate l, pack as A fragments ----
             unsigned pa[NT / 2][4];
-            #pragma unroll
             const float ms_lo = mu_lo - P_SHIFT_LOG2, ms_hi = mu_hi - P_SHIFT_LOG2;   // #1953
+            #pragma unroll
             for (int n = 0; n < NT; n++)
             {
                 float p0 = exp2f(sa[n][0] - ms_lo);

@@ -1164,6 +1164,7 @@ struct PkTqAcc
 // would overflow F16 for |v| > 2. Instead each tile picks k_t = min(k, 14 - floor(log2(max |v| over its 16 keys))), so
 // P * |v| * ... < 2^15 (half of F16's max: never saturates), and the online state is rescaled exactly when k drops, like a max
 // change (O and l are F32 and carry the same 2^k; O / l cancels it). k only decreases, so a rescale is rare after the first tiles.
+// (Folding the shift into ms = mu - k adds one rounding of mu, common to the tile: <= 1 ulp of |mu|, negligible vs F16's 5e-4.)
 // PK_TQ_KMODE: 0 adaptive (default); test mutants: 1 = fixed k = 15 (overflows for |v| > 2), 2 = k drop not rescaled.
 #ifndef PK_TQ_KMODE
 #define PK_TQ_KMODE 0
@@ -1248,7 +1249,9 @@ __device__ __forceinline__ void pk_tq_tile(PkTqAcc<HD>& A, const half* qw, const
 #if PK_TQ_KMODE == 1
     const float kt = PK_P_SHIFT;
 #else
-    const float kt = fminf(A.k, (float)(14 - vexp));                         // vmax * 2^kt < 2^15
+    // A non-finite max norm (inf / all-NaN tile, exponent field 255) keeps k: it must not drive k to -114 for the rest of the
+    // row. k is NOT clamped at 0: BF16 / F32 norms above 2^15 need a negative k to stay finite.
+    const float kt = (vexp == 128) ? A.k : fminf(A.k, (float)(14 - vexp));   // vmax * 2^kt < 2^15
 #endif
 #if PK_TQ_KMODE == 2
     const bool changed = (mn_lo != A.m_lo) || (mn_hi != A.m_hi);

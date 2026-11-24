@@ -212,6 +212,49 @@ public sealed unsafe partial class CudaAttentionKvqTests
         finally { CudaKernels.MmaDecodeV2Enabled = saved; }
     }
 
+    /// <summary>
+    /// #1953, the same flush in the G3 fallback (cuBLAS QK^T, causal softmax, cuBLAS P.V): its FP16 probability plane now holds
+    /// P * 2^15 and the P.V GEMM's alpha is 2^-15. Offset path (32 query rows over a 32K history, the KL gate's G3 arm).
+    /// <c>DOTLLM_1953_G3_MUTANT=1</c> pairs a PTX built with <c>-DG3_P_SCALE=1.0f</c> with alpha 1 (the pre-fix numerics).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(128)]
+    [InlineData(64)]
+    public void G3Offset_SinkDominatedLongRow_KeepsTheTailMass(int hd)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null || !_kernels.HasAttentionSoftmaxCausalOffsetF32In, "G3 offset softmax not loaded");
+        const int nh = 8, nkv = 2, seqQ = CudaG3Attention.OffsetMinQueryRows, seqKv = 32771;
+        using var cublas = CudaCublasHandle.Create();
+        cublas.SetStream(_stream!);
+        using var g3 = new CudaG3Attention(_kernels);
+        bool saved = CudaG3Attention.Enabled;
+        float savedAlpha = CudaG3Attention.ProbsScaleInverse;
+        try
+        {
+            CudaG3Attention.Enabled = true;
+            if (Environment.GetEnvironmentVariable("DOTLLM_1953_G3_MUTANT") == "1") CudaG3Attention.ProbsScaleInverse = 1f;
+            Skip.IfNot(g3.CanUseOffset(seqQ, seqKv, seqKv - seqQ, 0, nh, nkv), "G3 offset path not usable for this shape");
+            AssertTail($"G3 offset hd{hd} 32K", SinkTailRun(hd, nh, nkv, seqQ, seqKv, 0, (dq, dk, dv) =>
+            {
+                int n = seqQ * nh * hd;
+                nint o = Alloc(n * 2L);
+                try
+                {
+                    g3.RunOffset(cublas.Handle, dq, dk, dv, o, seqQ, seqKv - seqQ, nh, nkv, hd, _stream!.Handle);
+                    _stream.Synchronize();
+                    return ReadHalfAsFloat(o, n);
+                }
+                finally { CudaDriverApi.cuMemFree_v2(o); }
+            }));
+        }
+        finally
+        {
+            CudaG3Attention.Enabled = saved;
+            CudaG3Attention.ProbsScaleInverse = savedAlpha;
+        }
+    }
+
     /// <summary>#1953, same P packing: G-flash (attention_flash_mma, hd64 cold prefill, opt-in): rows 4096+ of an 8,192-row prefill.</summary>
     [SkippableFact]
     public void FlashMmaHd64_SinkDominatedLongRow_KeepsTheTailMass()

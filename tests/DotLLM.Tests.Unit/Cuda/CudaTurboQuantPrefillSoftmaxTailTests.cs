@@ -12,7 +12,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <list type="bullet">
 /// <item><b>Tail</b>: a sink key 16.4-19 nats above 32,770 others with V norm 0, so the output is the tail mass alone. The tail's V
 /// norms are 1 for the first half (P * |v| below F16's subnormal half-step for most keys: unshifted, they flush) and then rise to 4,
-/// so pk_tq_tile's adaptive scale exponent k (#1953) drops twice along the row (15 -> 14 -> 13): a drop that is not rescaled mixes
+/// so pk_tq_tile's adaptive scale exponent k (#1953) drops twice along the row (14 -> 13 -> 12): a drop that is not rescaled mixes
 /// scales. (Large tail norms would lift P * |v| out of the flush range and hide the unshifted bug.)</item>
 /// <item><b>Overflow</b>: uniform scores with V norm 400 on every key: a fixed 2^15 scale in pk_tq_tile packs P * |v| = 1.3e7 into F16
 /// (inf); the adaptive k must keep it finite and exact.</item>

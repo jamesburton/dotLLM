@@ -75,6 +75,13 @@ internal sealed class CudaG3Attention : IDisposable
     private long _planeElems;
     private bool _disposed;
 
+    /// <summary>
+    /// #1953: the softmax kernels store P * 2^15 in the FP16 probability plane (so a long row's small probabilities do not
+    /// flush to zero); the P.V GEMM's alpha is this inverse, which cancels it exactly. Mutable only so a test can pair it with a
+    /// mutant PTX built with <c>-DG3_P_SCALE=1.0f</c> (the pre-#1953 numerics); production never writes it.
+    /// </summary>
+    internal static float ProbsScaleInverse = 1.0f / 32768.0f;
+
     internal CudaG3Attention(CudaKernels kernels) => _kernels = kernels;
 
     /// <summary>
@@ -127,7 +134,7 @@ internal sealed class CudaG3Attention : IDisposable
         int qStride = numHeads * headDim;
         int kvStride = numKvHeads * headDim;
         float scale = 1.0f / MathF.Sqrt(headDim);
-        float one = 1.0f, zero = 0.0f, sc = scale;
+        float pvAlpha = ProbsScaleInverse, zero = 0.0f, sc = scale;
 
         EnsureScratch(SquareScratchElems(s, numHeads));
 
@@ -168,7 +175,7 @@ internal sealed class CudaG3Attention : IDisposable
             CublasApi.cublasGemmStridedBatchedEx(cublasHandle,
                 CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_T,
                 headDim, s, s,
-                (nint)(&one),
+                (nint)(&pvAlpha),
                 vBase, CublasApi.CUDA_R_16F, kvStride, 0,
                 pBase, CublasApi.CUDA_R_16F, s, (long)s * s,
                 (nint)(&zero),
@@ -235,7 +242,7 @@ internal sealed class CudaG3Attention : IDisposable
         int qStride = numHeads * headDim;
         int kvStride = numKvHeads * headDim;
         float scale = 1.0f / MathF.Sqrt(headDim);
-        float one = 1.0f, zero = 0.0f, sc = scale;
+        float pvAlpha = ProbsScaleInverse, zero = 0.0f, sc = scale;
 
         Interlocked.Increment(ref s_offsetRuns);
         long perRow = (long)numHeads * (positionOffset + seqLen);
@@ -279,7 +286,7 @@ internal sealed class CudaG3Attention : IDisposable
                 CublasApi.cublasGemmStridedBatchedEx(cublasHandle,
                     CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_T,
                     headDim, sq, skv,
-                    (nint)(&one),
+                    (nint)(&pvAlpha),
                     vBase, CublasApi.CUDA_R_16F, kvStride, 0,
                     pBase, CublasApi.CUDA_R_16F, sq, (long)sq * skv,
                     (nint)(&zero),
