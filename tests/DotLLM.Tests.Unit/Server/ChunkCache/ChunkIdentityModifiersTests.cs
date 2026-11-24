@@ -167,21 +167,107 @@ public sealed class ChunkIdentityModifiersTests : IDisposable
     {
         var fx = new ModelConfigFixture();
         var cfg = fx.Config;
-        string a = ModifierSetDigest.OfLora(MakeLora("one", cfg, 7), cfg);
-        Assert.Equal(a, ModifierSetDigest.OfLora(MakeLora("another-name", cfg, 7), cfg)); // control: same content, other name
-        Assert.NotEqual(a, ModifierSetDigest.OfLora(MakeLora("one", cfg, 8), cfg));
-        Assert.NotEqual(a, ModifierSetDigest.OfLora(MakeLora("one", cfg, 7, alpha: 9f), cfg));
+        string a = ModifierSetDigest.OfLora(MakeLora("one", cfg, 7));
+        Assert.Equal(a, ModifierSetDigest.OfLora(MakeLora("another-name", cfg, 7))); // control: same content, other name
+        Assert.NotEqual(a, ModifierSetDigest.OfLora(MakeLora("one", cfg, 8)));
+        Assert.NotEqual(a, ModifierSetDigest.OfLora(MakeLora("one", cfg, 7, alpha: 9f)));
 
         // The very last weight byte decides too (a digest that sampled only the head or tail of a buffer would miss it).
         var tweaked = MakeLora("one", cfg, 7);
         var last = tweaked.GetLayerWeights(cfg.NumLayers - 1, "v_proj")!.Value;
         long aElems = (long)last.OutputDim * tweaked.Rank;
         ((float*)last.AHandle)[aElems - 1] += 1e-3f;
-        Assert.NotEqual(a, ModifierSetDigest.OfLora(tweaked, cfg));
+        Assert.NotEqual(a, ModifierSetDigest.OfLora(tweaked));
         var tweakedB = MakeLora("one", cfg, 7);
         var firstQ = tweakedB.GetLayerWeights(0, "q_proj")!.Value;
         ((float*)firstQ.BHandle)[0] += 1e-3f;
-        Assert.NotEqual(a, ModifierSetDigest.OfLora(tweakedB, cfg));
+        Assert.NotEqual(a, ModifierSetDigest.OfLora(tweakedB));
+    }
+
+    /// <summary>One factor pair of <paramref name="dtype"/> (A [dOut, rank], B [rank, dIn]) filled from <paramref name="seed"/>.</summary>
+    private static unsafe void AddPair(LoraAdapter adapter, int layer, string proj, LoraRegion region, LoraWeightDType dtype, int seed,
+        int dIn = 64, int dOut = 32)
+    {
+        long r = adapter.Rank;
+        long elemB = dtype switch { LoraWeightDType.F32 => 4, LoraWeightDType.Q8_0 => 0, _ => 2 };
+        long bBytes = dtype == LoraWeightDType.Q8_0 ? r * LoraAdapter.Q8_0ByteSize(dIn) : r * dIn * elemB;
+        long aBytes = dOut * r * (dtype == LoraWeightDType.F32 ? 4 : 2); // Q8_0 B implies an F16 A
+        nint b = LoraAdapter.AllocAlignedBytes(bBytes), a = LoraAdapter.AllocAlignedBytes(aBytes);
+        var rng = new Random(seed);
+        for (long i = 0; i < bBytes; i++) ((byte*)b)[i] = (byte)rng.Next(1, 120);
+        for (long i = 0; i < aBytes; i++) ((byte*)a)[i] = (byte)rng.Next(1, 120);
+        adapter.AddLayerWeights(layer, proj, new LoraLayerWeights(a, b, dIn, dOut, dtype), region);
+    }
+
+    private sealed record Piece(int Layer, string Proj, LoraRegion Region, LoraWeightDType Dtype, int Seed);
+
+    private static LoraAdapter Build(params Piece[] pieces)
+    {
+        var adapter = new LoraAdapter("x", 4, 8f, ["q_proj"]);
+        foreach (var p in pieces) AddPair(adapter, p.Layer, p.Proj, p.Region, p.Dtype, p.Seed);
+        return adapter;
+    }
+
+    /// <summary>
+    /// I1 (#1915 review): the digest covers EVERY stored tensor, not the standard projection names. Adapters that differ only in an
+    /// MoE expert tensor, a <c>kv_b_proj</c>, one region's entry, or an F16 / Q8_0 buffer get different digests; the same content is the same
+    /// digest. (The old name-probing digest saw none of the first two.)
+    /// </summary>
+    [Fact]
+    public void LoraDigest_CoversEveryStoredTensor_ExpertsKvB_Regions_Dtypes()
+    {
+        const LoraRegion Any = LoraRegion.Any;
+        var common = new[]
+        {
+            new Piece(0, "q_proj", Any, LoraWeightDType.F32, 1),
+            new Piece(1, "q_proj", Any, LoraWeightDType.F32, 2),
+        };
+        string D(params Piece[] extra) => ModifierSetDigest.OfLora(Build([.. common, .. extra]));
+
+        string baseline = D(new Piece(1, "mlp.experts.3.down_proj", Any, LoraWeightDType.F32, 10));
+        Assert.Equal(baseline, D(new Piece(1, "mlp.experts.3.down_proj", Any, LoraWeightDType.F32, 10)));        // control: same content
+        Assert.NotEqual(baseline, D(new Piece(1, "mlp.experts.3.down_proj", Any, LoraWeightDType.F32, 11)));      // an expert's bytes
+        Assert.NotEqual(baseline, D(new Piece(1, "mlp.experts.4.down_proj", Any, LoraWeightDType.F32, 10)));      // which expert
+        Assert.NotEqual(baseline, D());                                                                           // expert present at all
+        Assert.NotEqual(D(new Piece(0, "kv_b_proj", Any, LoraWeightDType.F32, 20)), D(new Piece(0, "kv_b_proj", Any, LoraWeightDType.F32, 21)));
+        Assert.NotEqual(D(new Piece(0, "kv_b_proj", Any, LoraWeightDType.F32, 20)), D());
+
+        // Region entries: a decoder-only difference.
+        string withEnc = D(new Piece(0, "q_proj", LoraRegion.Encoder, LoraWeightDType.F32, 30));
+        Assert.NotEqual(withEnc, D(new Piece(0, "q_proj", LoraRegion.Encoder, LoraWeightDType.F32, 31)));
+        Assert.NotEqual(withEnc, D(new Piece(0, "q_proj", LoraRegion.Decoder, LoraWeightDType.F32, 30)));
+
+        // Dtypes: F16 and Q8_0 (B) buffers are hashed with their real byte sizes (a wrong size would read out of bounds or miss the tail).
+        string f16 = D(new Piece(0, "o_proj", Any, LoraWeightDType.F16, 40));
+        Assert.Equal(f16, D(new Piece(0, "o_proj", Any, LoraWeightDType.F16, 40)));
+        Assert.NotEqual(f16, D(new Piece(0, "o_proj", Any, LoraWeightDType.F16, 41)));
+        Assert.NotEqual(f16, D(new Piece(0, "o_proj", Any, LoraWeightDType.F32, 40)));
+        string q8 = D(new Piece(0, "o_proj", Any, LoraWeightDType.Q8_0, 50));
+        Assert.Equal(q8, D(new Piece(0, "o_proj", Any, LoraWeightDType.Q8_0, 50)));
+        Assert.NotEqual(q8, D(new Piece(0, "o_proj", Any, LoraWeightDType.Q8_0, 51)));
+    }
+
+    /// <summary>An adapter that cannot enumerate its tensors is never given a digest that could miss some: no chunk reuse for its requests.</summary>
+    [Fact]
+    public async Task LoraAdapterThatCannotEnumerate_IsUnsupported_NotDigestedByGuessing()
+    {
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, ReadOnly(NewRoot()));
+        var opaque = new OpaqueAdapter();
+        Assert.Throws<NotSupportedException>(() => ModifierSetDigest.OfLora(opaque));
+        var identity = server.State.ChunkCacheRuntime.IdentityFor(server.State, opaque);
+        Assert.False(identity.Supported);
+        Assert.True(server.State.ChunkCacheRuntime.IdentityFor(server.State).Supported); // control: the base identity is untouched
+    }
+
+    private sealed class OpaqueAdapter : ILoraAdapter
+    {
+        public string Name => "opaque";
+        public int Rank => 4;
+        public float Alpha => 8f;
+        public IReadOnlyList<string> TargetModules => ["q_proj"];
+        public LoraLayerWeights? GetLayerWeights(int layerIndex, string projName, LoraRegion region = LoraRegion.Any) => null;
+        public bool IsCompatible(ModelConfig baseConfig) => true;
+        public void Dispose() { }
     }
 
     /// <summary>Provides a ModelConfig without a server (the synthetic model's).</summary>
@@ -304,37 +390,79 @@ public sealed class ChunkIdentityModifiersTests : IDisposable
         return path;
     }
 
-    private static ServerState StateOf(ChunkCacheTestServer server, ServerOptions options) =>
-        new() { Options = options, Model = server.State.Model, Config = server.State.Config, CurrentGguf = server.State.CurrentGguf };
+    private async Task<string> FingerprintOf(Func<ServerOptions, ServerOptions>? customize)
+    {
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, ReadOnly(NewRoot()), customize: customize);
+        return server.State.ChunkCacheRuntime.IdentityFor(server.State).Fingerprint;
+    }
 
     /// <summary>
     /// The server-level modifier set is content-addressed and order-stable: the same adapter files in another order, or under other
-    /// paths, are the same identity; other content, a missing adapter, or the same bytes as an overlay instead are a different one.
+    /// paths, are the same identity; other content, other membership, or an overlay instead of an adapter are a different one.
     /// </summary>
     [Fact]
     public async Task ServerModifiers_AreContentAddressed_AndOrderStable()
     {
-        string root = NewRoot();
-        await using var server = await ChunkCacheTestServer.StartAsync(_model, ReadOnly(root));
         string a = WriteTernaryAdapter("a.nsadapter", 11, layer: 0), b = WriteTernaryAdapter("b.nsadapter", 22, layer: 1);
         string aCopy = Path.Combine(_scratch, "elsewhere-a.nsadapter");
         File.Copy(a, aCopy);
-        string Fp(ServerOptions o) => new ChunkCacheRuntime().IdentityFor(StateOf(server, o)).Fingerprint;
-        var baseOptions = new ServerOptions { Model = "m" };
+        string overlay = WriteOverlay();
 
-        string baseFp = Fp(baseOptions);
-        Assert.Equal(server.State.ChunkCacheRuntime.IdentityFor(server.State).Fingerprint, baseFp); // control: a base server's identity is the plain one
-        string ab = Fp(baseOptions with { TernaryAdapterPaths = [a, b] });
+        string baseFp = await FingerprintOf(null);
+        string ab = await FingerprintOf(o => o with { TernaryAdapterPaths = [a, b] });
         Assert.NotEqual(baseFp, ab);
-        Assert.Equal(ab, Fp(baseOptions with { TernaryAdapterPaths = [b, a] }));       // order-stable
-        Assert.Equal(ab, Fp(baseOptions with { TernaryAdapterPaths = [aCopy, b] }));   // path-independent
-        Assert.NotEqual(ab, Fp(baseOptions with { TernaryAdapterPaths = [a] }));       // membership
-        Assert.NotEqual(Fp(baseOptions with { TernaryAdapterPaths = [a] }), Fp(baseOptions with { TernaryAdapterPaths = [b] })); // content
-        Assert.NotEqual(Fp(baseOptions with { TernaryAdapterPaths = [a] }), Fp(baseOptions with { TensorOverlayPath = a })); // kind
-        Assert.NotEqual(baseFp, Fp(baseOptions with { TensorOverlayPath = a }));
-        Assert.Equal(baseFp, Fp(baseOptions with { TernaryAdapterPaths = [] }));       // an empty list is a base server
-        // An unreadable adapter file is never a 500 nor a base-keyed identity: unsupported.
-        Assert.False(new ChunkCacheRuntime().IdentityFor(StateOf(server, baseOptions with { TernaryAdapterPaths = [Path.Combine(_scratch, "missing.nsadapter")] })).Supported);
+        Assert.Equal(ab, await FingerprintOf(o => o with { TernaryAdapterPaths = [b, a] }));        // order-stable
+        Assert.Equal(ab, await FingerprintOf(o => o with { TernaryAdapterPaths = [aCopy, b] }));    // path-independent
+        string onlyA = await FingerprintOf(o => o with { TernaryAdapterPaths = [a] });
+        Assert.NotEqual(ab, onlyA);                                                                  // membership
+        Assert.NotEqual(onlyA, await FingerprintOf(o => o with { TernaryAdapterPaths = [b] }));      // content
+        string overlaid = await FingerprintOf(o => o with { TensorOverlayPath = overlay, OverlaySkipBaseHash = true });
+        Assert.NotEqual(baseFp, overlaid);
+        Assert.NotEqual(overlaid, onlyA);                                                            // kind
+        Assert.Equal(baseFp, await FingerprintOf(o => o with { TernaryAdapterPaths = [] }));        // an empty list is a base server
+    }
+
+    /// <summary>
+    /// I2 (#1915 review): the digests are taken at load time from the loaded bytes. A file replaced on disk after load does not change
+    /// the identity of the running server (it would otherwise store the loaded weights' K/V under the replacement's key), a server loaded
+    /// from the replacement has a different one, and a state without load-time digests is unsupported rather than hashed lazily by path.
+    /// </summary>
+    [Fact]
+    public async Task ReplacedAdapterFile_AfterLoad_DoesNotChangeTheLoadedIdentity()
+    {
+        string path = WriteTernaryAdapter("swap.nsadapter", 5);
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, ReadOnly(NewRoot()), customize: o => o with { TernaryAdapterPaths = [path] });
+        string loaded = server.State.ChunkCacheRuntime.IdentityFor(server.State).Fingerprint;
+
+        VulkanTernaryAdapterKernelTests.Synth(rank: 4, d: 64, seed: 77, alpha: 4f, thr: 0f, layer: 0).Save(path); // replaced after load
+        Assert.Equal(loaded, new ChunkCacheRuntime().IdentityFor(server.State).Fingerprint);          // fresh runtime: nothing cached
+        Assert.NotEqual(loaded, await FingerprintOf(o => o with { TernaryAdapterPaths = [path] }));   // control: the replacement IS different
+
+        var handBuilt = new ServerState
+        {
+            Options = new ServerOptions { Model = "m", TernaryAdapterPaths = [path] },
+            Model = server.State.Model, Config = server.State.Config, CurrentGguf = server.State.CurrentGguf,
+        };
+        Assert.False(new ChunkCacheRuntime().IdentityFor(handBuilt).Supported);
+    }
+
+    /// <summary>The overlay digest comes from the mapped tensors: equal content under another path matches, any tensor change does not.</summary>
+    [Fact]
+    public void OverlayContentDigest_IsFromLoadedBytes_PathIndependent()
+    {
+        string one = WriteOverlay();
+        string two = Path.Combine(_scratch, "overlay-copy.gguf");
+        File.Copy(one, two);
+        using var o1 = TensorOverlay.Open(one, null, verifyBaseHash: false);
+        using var o2 = TensorOverlay.Open(two, null, verifyBaseHash: false);
+        Assert.Equal(o1.ContentDigest(), o2.ContentDigest());
+
+        byte[] bytes = File.ReadAllBytes(one);
+        bytes[^1] ^= 0x01; // the last byte of the last tensor
+        string three = Path.Combine(_scratch, "overlay-changed.gguf");
+        File.WriteAllBytes(three, bytes);
+        using var o3 = TensorOverlay.Open(three, null, verifyBaseHash: false);
+        Assert.NotEqual(o1.ContentDigest(), o3.ContentDigest());
     }
 
     /// <summary>
@@ -350,11 +478,13 @@ public sealed class ChunkIdentityModifiersTests : IDisposable
         Func<ServerOptions, ServerOptions> ternary = o => o with { TernaryAdapterPaths = [adapter] };
 
         ChunkKvEntry baseEntry;
+        ChunkKey baseKey;
         await using (var baseServer = await ChunkCacheTestServer.StartAsync(_model, Writing(root)))
         {
             await Warm(baseServer);
             Assert.Equal((1, 0), await Lookup(baseServer));
-            Assert.True(new FileChunkStore(root).TryGet(KeyOf(baseServer), out baseEntry!));
+            baseKey = KeyOf(baseServer);
+            Assert.True(new FileChunkStore(root).TryGet(baseKey, out baseEntry!));
         }
 
         ChunkKvEntry ternaryEntry;
@@ -369,7 +499,7 @@ public sealed class ChunkIdentityModifiersTests : IDisposable
             Assert.True(new FileChunkStore(root).TryGet(ternaryKey, out ternaryEntry!));
         }
 
-        Assert.NotEqual(KeyOf2(baseEntry), ternaryKey.Hex);
+        Assert.NotEqual(baseKey, ternaryKey);
         Assert.NotEqual(baseEntry.ModelFingerprint, ternaryEntry.ModelFingerprint);
         Assert.Equal(baseEntry.TokenIds, ternaryEntry.TokenIds);
         // Real tensors: layer 0 is computed before the adapter's residual edit, every later layer after it.
@@ -412,6 +542,7 @@ public sealed class ChunkIdentityModifiersTests : IDisposable
         }
 
         Assert.NotEqual(baseEntry.ModelFingerprint, overlayEntry.ModelFingerprint);
+        Assert.NotEqual(baseEntry.KeysPerLayer, overlayEntry.KeysPerLayer);
         // The overlay replaces layer 0's FFN: layer 0's K/V (attention before the FFN) match, later layers' do not.
         Assert.Equal(baseEntry.KeysPerLayer[0], overlayEntry.KeysPerLayer[0]);
         for (int l = 1; l < baseEntry.KeysPerLayer.Length; l++)
@@ -458,8 +589,6 @@ public sealed class ChunkIdentityModifiersTests : IDisposable
 
     private static ChunkKey KeyOf(ChunkCacheTestServer server) =>
         server.State.ChunkCacheRuntime.IdentityFor(server.State).KeyOf(IdsOfChunkA(server), ChunkNamespace.Default);
-
-    private static string KeyOf2(ChunkKvEntry entry) => entry.ModelFingerprint;
 
     /// <summary>An overlay GGUF replacing layer 0's dense FFN gate with other F32 values (shape [hidden, ff] in GGUF order).</summary>
     private string WriteOverlay()

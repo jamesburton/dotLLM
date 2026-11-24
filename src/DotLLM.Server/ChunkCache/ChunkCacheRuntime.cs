@@ -187,7 +187,7 @@ internal sealed class ChunkCacheRuntime : IDisposable
             {
                 // The overlay and ternary adapters are applied to the loaded model (the encoder runs on it), so their content is
                 // part of its identity: a separate key space from the base model's and from any other overlay or adapter set (#1915).
-                identity = IdentityFactory(gguf, state.Config!, backend).WithModifiers(ServerModifiers(state.Options));
+                identity = IdentityFactory(gguf, state.Config!, backend).WithModifiers(ServerModifiers(state));
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
@@ -216,7 +216,7 @@ internal sealed class ChunkCacheRuntime : IDisposable
             return identity;
         try
         {
-            return identity.WithModifiers([(ModifierSetDigest.KindLora, "", ModifierSetDigest.OfLora(requestAdapter, state.Config!))]);
+            return identity.WithModifiers([(ModifierSetDigest.KindLora, "", ModifierSetDigest.OfLora(requestAdapter))]);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
@@ -276,20 +276,19 @@ internal sealed class ChunkCacheRuntime : IDisposable
     }
 
     /// <summary>
-    /// What the server's own options change in the weights the base GGUF's identity hashes (<c>--tensor-overlay</c>, each
-    /// <c>--ternary-adapter</c> file), as (kind, id, content digest): file contents, never paths, so the same files elsewhere are the same
-    /// identity. Empty for a base server (#1915). Ids are empty: the content decides.
+    /// What changed the loaded weights without changing the base GGUF (<c>--tensor-overlay</c>, each <c>--ternary-adapter</c> package), as
+    /// (kind, id, content digest) from <see cref="ServerState.WeightModifiers"/>: digests taken at load time from the loaded bytes, so
+    /// nothing is read from disk here and a file replaced since load cannot change the identity (#1915). Ids are empty: content decides.
     /// </summary>
-    /// <param name="options">The server options.</param>
-    /// <returns>The modifiers, in no particular order (the digest sorts them).</returns>
-    internal static List<(string Kind, string Id, string ContentDigest)> ServerModifiers(ServerOptions options)
+    /// <param name="state">The server state.</param>
+    /// <returns>The modifiers (empty for a base model).</returns>
+    /// <exception cref="InvalidOperationException">The options name an overlay or adapter but no digests were computed at load.</exception>
+    internal static IReadOnlyList<(string Kind, string Id, string ContentDigest)> ServerModifiers(ServerState state)
     {
-        var list = new List<(string, string, string)>();
-        if (options.TensorOverlayPath is { } overlay)
-            list.Add((ModifierSetDigest.KindOverlay, "", ModifierSetDigest.OfFile(overlay)));
-        if (options.TernaryAdapterPaths is { Count: > 0 } adapters)
-            foreach (string path in adapters)
-                list.Add((ModifierSetDigest.KindTernaryAdapter, "", ModifierSetDigest.OfFile(path)));
-        return list;
+        if (state.WeightModifiers is { } computed)
+            return computed;
+        if (state.Options.TensorOverlayPath is not null || state.Options.TernaryAdapterPaths is { Count: > 0 })
+            throw new InvalidOperationException("The overlay and adapter digests were not computed at load.");
+        return [];
     }
 }

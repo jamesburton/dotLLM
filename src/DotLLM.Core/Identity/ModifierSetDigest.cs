@@ -28,7 +28,13 @@ public static class ModifierSetDigest
     /// length-prefixed so field boundaries cannot collide, lowercase SHA-256 hex of the stream. The same set in any order gives the
     /// same digest; the empty set gives a fixed value (callers that need "no modifiers" check for emptiness first).
     /// </summary>
-    /// <param name="modifiers">(kind, id, contentDigest) per active modifier.</param>
+    /// <param name="modifiers">
+    /// (kind, id, contentDigest) per active modifier. <c>contentDigest</c> is what identifies the modifier. <c>id</c> is an optional
+    /// disambiguator that is part of the digest: chunk identity (#1915) passes the EMPTY string for every kind, so that the same weights under
+    /// another name or path are the same identity. A caller that wants a renamed adapter to count as a different modifier (e.g. a
+    /// provenance tag that records which adapter by name) may pass the adapter's name as <c>id</c>, but then its digest is not comparable
+    /// with chunk identity's. This is the canonical helper; other digests of the same sets should delegate to it with explicit semantics.
+    /// </param>
     /// <returns>The digest.</returns>
     public static string Compute(IEnumerable<(string Kind, string Id, string ContentDigest)> modifiers)
     {
@@ -67,29 +73,27 @@ public static class ModifierSetDigest
         return Convert.ToHexStringLower(SHA256.HashData(fs));
     }
 
-    private static readonly string[] CanonicalProjections =
-        ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"];
-
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ILoraAdapter, string> LoraDigests = new();
 
     /// <summary>
-    /// Content digest of a loaded LoRA adapter: rank, alpha, and for every (layer, projection, region) it adapts the dims, dtypes and the
-    /// bytes of both factors. The adapter's name is NOT part of it (the same weights under another name are the same adapter).
-    /// Probes the canonical projections plus <see cref="ILoraAdapter.TargetModules"/> over layers
-    /// <c>-1..NumLayers-1</c> (-1 is the self-conditioning slot) and all <see cref="LoraRegion"/>s. Cached per adapter instance
-    /// (adapters are immutable once loaded); reloading under the same name is a new instance and is hashed again.
+    /// Content digest of a loaded LoRA adapter: rank, alpha, and EVERY stored factor pair (<see cref="ILoraAdapter.EnumerateWeights"/>), in
+    /// (layer, projection name, region) order: its coordinates, dims, dtypes and the bytes of both factors, each length-prefixed. Nothing
+    /// is looked up by assumed name, so MoE expert tensors, <c>kv_b_proj</c> and any other target are covered. The adapter's name is NOT
+    /// part of it (the same weights under another name are the same adapter). Cached per adapter instance (adapters are immutable
+    /// once loaded); reloading under the same name is a new instance and is hashed again.
     /// </summary>
     /// <param name="adapter">The adapter.</param>
-    /// <param name="config">The model configuration (layer count).</param>
     /// <returns>The digest.</returns>
-    public static unsafe string OfLora(ILoraAdapter adapter, ModelConfig config)
+    /// <exception cref="NotSupportedException">The adapter cannot enumerate its tensors, so its content cannot be proven.</exception>
+    public static unsafe string OfLora(ILoraAdapter adapter)
     {
         ArgumentNullException.ThrowIfNull(adapter);
-        ArgumentNullException.ThrowIfNull(config);
         if (LoraDigests.TryGetValue(adapter, out string? cached))
             return cached;
 
-        string[] names = CanonicalProjections.Concat(adapter.TargetModules).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+        var entries = adapter.EnumerateWeights()
+            ?? throw new NotSupportedException($"{adapter.GetType().Name} cannot enumerate its tensors; its content cannot be hashed.");
+        var sorted = entries.OrderBy(e => e.Layer).ThenBy(e => e.Proj, StringComparer.Ordinal).ThenBy(e => (int)e.Region).ToArray();
         using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         byte[] w = new byte[8];
         void Int(long v) { BinaryPrimitives.WriteInt64LittleEndian(w, v); sha.AppendData(w); }
@@ -102,23 +106,17 @@ public static class ModifierSetDigest
         }
         Int(adapter.Rank);
         Int(BitConverter.SingleToInt32Bits(adapter.Alpha));
-        int found = 0;
-        for (int layer = -1; layer < config.NumLayers; layer++)
-        foreach (string name in names)
-        foreach (LoraRegion region in Enum.GetValues<LoraRegion>())
+        Int(sorted.Length);
+        foreach (var (layer, proj, region, lw) in sorted)
         {
-            if (adapter.GetLayerWeights(layer, name, region) is not { } lw) continue;
-            found++;
-            Int(layer);
-            sha.AppendData(Encoding.UTF8.GetBytes(name));
-            Int((int)region);
+            byte[] name = Encoding.UTF8.GetBytes(proj);
+            Int(layer); Int(name.Length); sha.AppendData(name); Int((int)region);
             Int(lw.InputDim); Int(lw.OutputDim);
             Int((int)lw.WeightDType); Int((int)lw.ResolvedAWeightDType);
             long r = adapter.Rank;
             Bytes(lw.AHandle, ElementBytes(lw.ResolvedAWeightDType, (long)lw.OutputDim * r, lw.OutputDim, r));
             Bytes(lw.BHandle, ElementBytes(lw.WeightDType, r * lw.InputDim, r, lw.InputDim));
         }
-        Int(found);
         string digest = Convert.ToHexStringLower(sha.GetHashAndReset());
         LoraDigests.TryAdd(adapter, digest);
         return digest;
