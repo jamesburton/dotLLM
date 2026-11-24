@@ -19,6 +19,8 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// regression guards 28/4/128 (group 7: Qwen2.5-7B) and 14/2/64 (group 7, hd64: Qwen2.5-0.5B) on f16.</item>
 /// </list>
 /// </summary>
+// Serialized: this partial class is in [Collection(CudaCollection.Name)] via its main declaration (the attribute may appear on only
+// one part); the line names it so CudaTestCollectionContractTests sees that this file's *Override assignments are covered.
 public sealed unsafe partial class CudaAttentionKvqTests
 {
     private sealed record E4Build(string Name, CudaKernels Kernels, string Dir) : IDisposable

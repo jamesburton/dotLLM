@@ -19,6 +19,8 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </list>
 /// All codes are 0 (centroid c_0 on every dimension) and Q is c_0-aligned, so the score of key j is exactly its K norm.
 /// </summary>
+// Serialized: this partial class is in [Collection(CudaCollection.Name)] via its main declaration (the attribute may appear on only
+// one part); the line names it so CudaTestCollectionContractTests sees that this file's *Override assignments are covered.
 public sealed unsafe partial class CudaTurboQuantPrefillTailTests
 {
     public static TheoryData<int, int, bool> SoftmaxTailCases => new()
