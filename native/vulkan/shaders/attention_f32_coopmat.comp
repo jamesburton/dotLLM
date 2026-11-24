@@ -59,6 +59,12 @@
 // same tile (driver-defined; still correct).
 #define WG_SIZE         64
 #define NEG_INF         (-3.4e38)
+// #1953: P = exp(s - max + P_SHIFT_LN), 2^15 x the softmax numerator (15 ln 2), so the F16 P tile uses the top of the F16
+// range instead of (0, 1]: unshifted, keys ~17.3+ nats below the row max flush to 0 in F16 (behind an attention sink at 32K
+// keys, most of the row's mass). The running sum and O take the same scaled P (both branches), so O / sum cancels it.
+#ifndef P_SHIFT_LN
+#define P_SHIFT_LN 10.397207708399179
+#endif
 
 layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 
@@ -281,7 +287,7 @@ void main() {
             float localSum = 0.0;
             for (uint c = 0u; c < uint(Bc); c++) {
                 float s = sTile[r * uint(Bc) + c];
-                float w = (s > NEG_INF * 0.5) ? exp(s - newMax) : 0.0;
+                float w = (s > NEG_INF * 0.5) ? exp(s - newMax + P_SHIFT_LN) : 0.0;   // #1953
                 // P is fed as f16 into the PV coopmat below.
                 pTile[r * uint(Bc) + c] = float16_t(w);
                 localSum += w;

@@ -73,6 +73,12 @@
 #define P_STRIDE        (BC + 8)                 // P row stride in halves (16 B aligned)
 #define P_STRIP         (STRIP * P_STRIDE)       // >= 256 halves: also holds the 16x16 Q staging
 #define NEG_INF         (-3.4e38)
+// #1953: P = exp(s - max + P_SHIFT_LN), 2^15 x the softmax numerator (15 ln 2), so the F16 P tile uses the top of the F16
+// range instead of (0, 1]: unshifted, keys ~17.3+ nats below the row max flush to 0 in F16 (behind an attention sink at 32K
+// keys, most of the row's mass). The running sum and O take the same scaled P (both branches), so O / sum cancels it.
+#ifndef P_SHIFT_LN
+#define P_SHIFT_LN 10.397207708399179
+#endif
 
 layout(constant_id = 0) const uint REQUIRE_INVARIANT_PV = 1u;
 // 0 (default, #1148): Q is rounded to F16 for QK^T; 1.67x faster at depth on Strix (6.6 vs 4.0 TFLOP/s) and KL at the F32 noise
@@ -326,7 +332,7 @@ void main() {
     if (rowLive) {
         uint tRow = mRow / G;
         runMax = sinks[hkv * G + (mRow - tRow * G)];
-        runSum = 1.0;
+        runSum = exp(P_SHIFT_LN);   // the sink weight exp(sink - max) = 1, scaled like P (#1953)
     }
 #else
     float runMax = NEG_INF;
@@ -427,7 +433,7 @@ void main() {
             float tileSum = 0.0;
             for (uint i = 0u; i < cols; i++) {
                 uint c = myJ + i * lpr;
-                float w = (sv[i] > NEG_INF * 0.5) ? exp(sv[i] - newMax) : 0.0;
+                float w = (sv[i] > NEG_INF * 0.5) ? exp(sv[i] - newMax + P_SHIFT_LN) : 0.0;   // #1953
                 float16_t wh = float16_t(w);
                 sP[pBase + myRow * uint(P_STRIDE) + c] = wh;
                 tileSum += float(wh);
