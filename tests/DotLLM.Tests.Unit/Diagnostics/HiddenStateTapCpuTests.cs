@@ -52,8 +52,13 @@ internal sealed class CpuHiddenStateTapFixture : HiddenStateTapFixture
     public override int[] Prompt { get; }
     public override bool ExpectsPackedBatchFallback => _family == HiddenStateTapBackendSuite.Llama;
 
-    /// <summary>Merge base d1275eef, 16 untapped decode forwards on this thread (the MoE model allocates its router scratch).</summary>
-    public override long? BaselineAllocBytesPer16Decodes => _family == HiddenStateTapBackendSuite.MoeHybrid ? 21632 : 1664;
+    /// <summary>Steady-state managed bytes of 16 untapped decode forwards on this thread (minimum of three windows after a long warm-up).
+    /// <b>MoE-hybrid has NO absolute baseline on CPU:</b> its allocation (router scratch, parallel-region closures) is 21632 B in a clean process but
+    /// 26240 B (+288 B per decode) once <c>SolutionScannerTests</c> (or a similar heavy test) has run earlier in the same process, deterministically in
+    /// both cases, so an absolute figure fails depending on test order, independent of the tap code. The unattached path is the same registry read
+    /// as on the other families, whose absolute baselines (1664 B) hold in every order and die on an allocation mutant; the MoE unattached path
+    /// is still covered by the no-dispatch/no-counter, perturbation and abort tests.</summary>
+    public override long? BaselineAllocBytesPer16Decodes => _family == HiddenStateTapBackendSuite.MoeHybrid ? null : 1664;
 
     public override IKvCache NewKv(int maxLen = 96)
         => new SimpleKvCache(KvGeometry.FromConfig(_config, Model.SupportsCompactSlidingKv), maxLen);
