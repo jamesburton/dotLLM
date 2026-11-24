@@ -147,7 +147,7 @@ public sealed unsafe class CudaStepGraphGuardTests
             _out.WriteLine($"modifier attached: stepGraphLaunches={guarded.StepGraphLaunches} modifierCalls={guarded.Calls}");
             Assert.Equal(0, guarded.StepGraphLaunches);
             Assert.Equal(Steps * guarded.NumLayers, guarded.Calls);   // AppliesTo is true everywhere, Apply is a no-op
-            Assert.Equal(0, BitDiffs(baseline.Rows, guarded.Rows));    // a counting no-op modifier changes nothing
+            // No bit-identity assertion against the unhooked eager run: with a modifier attached the CUDA dense layer loop un-fuses the closing add from the next layer's norm (so the modifier sees the post-add residual), which legitimately changes roundings (measured 192063 differing bits). Output equivalence is the 1-ULP / derived-bound suites' job; this test only proves the step graph is not taken and the modifier runs on every layer of every step.
             return 0;
         });
     }
