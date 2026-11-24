@@ -152,7 +152,7 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
     /// F32 value (the head-dim-256 body's hi / lo tiles) passes <paramref name="coopmat"/> alone and is checked against its F32 kernel.
     /// </summary>
     private void Case(VulkanDevice device, string spvDir, TurboQuantLayout l, int seqQ, int seqKv, int numHeads,
-        Rec twin, Rec reference, Rec? f16Reference = null, bool coopmat = false)
+        Rec twin, Rec reference, Rec? f16Reference = null, bool coopmat = false, bool f16Partials = false)
     {
         int hd = l.HeadDim, kvHeads = l.NumKvHeads, bits = l.MseBits;
         var rng = new Random(0x1892 + bits * 131 + hd * 7 + seqQ * 3 + seqKv);
@@ -222,12 +222,16 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         // 1. Loader: same operands as the reference on the materialised code-space rows.
         float codeMax = refCode.Max(MathF.Abs), codeWorst = MaxAbsDiff(twinCode, refCode);
         float codeTol = cm ? 2e-3f : 1e-5f;
+        // #1926 E4: the split-KV v2 pass's default F16 O-partials round each split's normalized output to 2^-11; both kernels here use
+        // them, so the loader and oracle bounds widen to the stated 1e-3 of the amplitude (SplitKvPartialF16Tests).
+        if (f16Partials) codeTol = MathF.Max(codeTol, 1e-3f);
         Assert.True(codeMax > 1e-3f, "degenerate code-space reference");
         // 2. Oracle: in place == scratch-dequant path, same norm format. F32 arms differ only by the rounding of the two rotations and
         //    the dot / accumulate order, which grows with sqrt(seqKv * headDim); cooperative-matrix arms round K / V to F16 in different
         //    spaces (code space here, original space in the oracle's kernel), so they get the coopmat budget.
         float refMax = r.Max(MathF.Abs), worst = MaxAbsDiff(a, r);
         float tol = cm ? 1.5e-2f : 2f * 1.1920929e-7f * MathF.Sqrt((float)seqKv * hd);
+        if (f16Partials) tol = MathF.Max(tol, 1e-3f);
         double relOracle = RelL2(a, r);
         _out.WriteLine($"bits {bits} hd {hd} seqQ {seqQ} seqKv {seqKv}: loader {codeWorst / codeMax:E2} (tol {codeTol:E1}); oracle max {worst / refMax:E2} (tol {tol:E2}) relL2 {relOracle:E2}");
         Assert.True(codeWorst <= codeTol * codeMax + (cm ? 1e-5f : 0f),
@@ -394,6 +398,8 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         Assert.True(tq is not null, "no TurboQuant split-KV twin");
         f32.PreferGqa = gqa; tq!.PreferGqa = gqa;
         f32.PreferGqa2 = gqa2; tq.PreferGqa2 = gqa2;
+        // #1926 E4: run every case on both partial formats. F32 partials hold the LOADER to the scratch oracle at reduction-order
+        // tolerance; the default F16 partials (v2 pass only) are held to the same oracle at the stated 1e-3 of the amplitude.
         Assert.Equal(f32.UsesGqa(heads, kvHeads, hd), tq.UsesGqa(heads, kvHeads, hd));        // same pass as the F32 kernel takes
         Assert.Equal(f32.UsesGqa2(heads, kvHeads, hd), tq.UsesGqa2(heads, kvHeads, hd));
         Skip.If(gqa && !f32.UsesGqa(heads, kvHeads, hd), "GQA-grouped split pass unavailable for this shape");
@@ -402,9 +408,15 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         using var bS = sinks ? Sinks(device, heads) : null;
         int pos = seqKv - 1, kvStart = window > 0 ? Math.Max(0, pos - window + 1) : 0;
         long before = tq.GqaDispatches;
-        Case(device, spvDir, l, 1, seqKv, heads,
-            (c, q, k, v, o, t) => tq.Record(c, q, k, v, o, 1, seqKv, heads, kvHeads, hd, positionOffset: pos, slidingWindow: window, sinks: bS, kvStart: kvStart, tq: t),
-            (c, q, k, v, o, _) => f32.Record(c, q, k, v, o, 1, seqKv, heads, kvHeads, hd, positionOffset: pos, slidingWindow: window, sinks: bS, kvStart: kvStart));
+        foreach (bool partF16 in gqa2 ? new[] { false, true } : new[] { false })
+        {
+            f32.PreferPartF16 = partF16; tq.PreferPartF16 = partF16;
+            Case(device, spvDir, l, 1, seqKv, heads,
+                (c, q, k, v, o, t) => tq.Record(c, q, k, v, o, 1, seqKv, heads, kvHeads, hd, positionOffset: pos, slidingWindow: window, sinks: bS, kvStart: kvStart, tq: t),
+                (c, q, k, v, o, _) => f32.Record(c, q, k, v, o, 1, seqKv, heads, kvHeads, hd, positionOffset: pos, slidingWindow: window, sinks: bS, kvStart: kvStart),
+                f16Partials: partF16);
+            Assert.Equal(partF16, tq.LastPartF16);
+        }
         Assert.Equal(gqa, tq.GqaDispatches > before);
     }
 
@@ -677,7 +689,8 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
     public void TqTwins_BindOperandsAt12To14_AndAddNoSharedMemory()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
-        string[] twins = Directory.GetFiles(spvDir, "*_kvtq*.spv");
+        // The retained #1926 pre-change controls (*_pre1926) are A/B and bit-identity arms, never dispatched by a model.
+        string[] twins = Directory.GetFiles(spvDir, "*_kvtq*.spv").Where(p => !p.EndsWith("_pre1926.spv", StringComparison.Ordinal)).ToArray();
         // One twin per body the dense chain and Flint can dispatch (VulkanTransformerModel.RecordAttentionArm and the per-position arm).
         string[] expected =
         [
@@ -702,6 +715,9 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
             Assert.True(File.Exists(q8), $"{name}: no Q8_0 twin to compare shared memory with");
             long q8Lds = Reflect(q8).WorkgroupBytes;
             _out.WriteLine($"{name}: shared memory {lds} B (Q8_0 twin {q8Lds} B)");
+            // #1926 E3: the v2 split-KV twin alone copies the 2^bits centroid table into shared memory (tqCentSh, 4 << bits bytes:
+            // 64 B at tq4). The array is sized by the TQ_MSE_BITS specialization constant, which this SPIR-V reflection does not count,
+            // so its fixed arrays still equal the Q8_0 twin's; the driver's figure is in Probe1926SplitKvV2ShaderInfoTests.
             Assert.True(lds == q8Lds, $"{name}: shared memory {lds} B differs from its Q8_0 twin's {q8Lds} B");
         }
         Assert.DoesNotContain(twins, p => Path.GetFileName(p).Contains("hd64"));
