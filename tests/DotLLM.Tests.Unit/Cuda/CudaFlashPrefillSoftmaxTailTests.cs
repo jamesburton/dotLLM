@@ -1,5 +1,6 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Cuda;
+using DotLLM.Cuda.Interop;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Cuda;
@@ -88,14 +89,14 @@ public sealed unsafe partial class CudaAttentionKvqTests
         }
         finally
         {
-            foreach (nint p in new[] { dq, dk, dv, oRef, oNew }) DotLLM.Cuda.Interop.CudaDriverApi.cuMemFree_v2(p);
+            foreach (nint p in new[] { dq, dk, dv, oRef, oNew }) CudaDriverApi.cuMemFree_v2(p);
         }
     }
 
     private static ushort[] ReadHalf(nint dev, int n)
     {
         var h = new ushort[n];
-        fixed (ushort* p = h) DotLLM.Cuda.Interop.CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dev, (nuint)(n * 2)).ThrowOnError();
+        fixed (ushort* p = h) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dev, (nuint)(n * 2)).ThrowOnError();
         return h;
     }
 
