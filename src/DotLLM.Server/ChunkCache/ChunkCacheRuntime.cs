@@ -1,4 +1,5 @@
 using DotLLM.ChunkReuse.Store;
+using DotLLM.Core.Identity;
 using DotLLM.Models.Gguf;
 
 namespace DotLLM.Server.ChunkCache;
@@ -184,7 +185,9 @@ internal sealed class ChunkCacheRuntime : IDisposable
             ServerModelIdentity identity;
             try
             {
-                identity = IdentityFactory(gguf, state.Config!, backend);
+                // The overlay and ternary adapters are applied to the loaded model (the encoder runs on it), so their content is
+                // part of its identity: a separate key space from the base model's and from any other overlay or adapter set (#1915).
+                identity = IdentityFactory(gguf, state.Config!, backend).WithModifiers(ServerModifiers(state));
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
@@ -195,6 +198,30 @@ internal sealed class ChunkCacheRuntime : IDisposable
             _identityKey = gguf;
             _identity = identity;
             return identity;
+        }
+    }
+
+    /// <summary>
+    /// The identity a request is looked up under: <see cref="IdentityFor(ServerState)"/>, plus the request's LoRA adapter folded in
+    /// when it names one (#1915). A LoRA request therefore never shares keys with base-model entries (no wrong hit), and the same
+    /// adapter content always lands on the same keys. An unsupported base identity stays unsupported.
+    /// </summary>
+    /// <param name="state">The server state.</param>
+    /// <param name="requestAdapter">The request's LoRA adapter, or null.</param>
+    /// <returns>The identity; never throws (a digest failure is an unsupported identity).</returns>
+    public ServerModelIdentity IdentityFor(ServerState state, DotLLM.Core.Lora.ILoraAdapter? requestAdapter)
+    {
+        var identity = IdentityFor(state);
+        if (requestAdapter is null || !identity.Supported)
+            return identity;
+        try
+        {
+            return identity.WithModifiers([(ModifierSetDigest.KindLora, "", ModifierSetDigest.OfLora(requestAdapter))]);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            ServerLog.Info($"chunk_cache: LoRA identity unavailable ({ex.GetType().Name}); annotations are ignored for this request");
+            return ServerModelIdentity.Unsupported("LoRA adapter identity unavailable");
         }
     }
 
@@ -245,20 +272,23 @@ internal sealed class ChunkCacheRuntime : IDisposable
             return "backend without chunk assembly";
         if (state.CurrentGguf is null)
             return "no GGUF identity";
-        // The model id hashes the base GGUF only. A tensor overlay or a ternary adapter changes the weights every forward runs
-        // on, so K/V computed here are not the base model's: under the base key they would be wrong hits for a base server,
-        // the CLI and applied reuse, and base entries would be wrong hits here. Until the identity covers them (#1915): no chunk reuse.
-        if (WeightsChangedReason(state.Options) is not null)
-            return "tensor overlay or adapter attached (not part of the model identity)";
         return null;
     }
 
     /// <summary>
-    /// Which server-level option changes the weights the base GGUF's identity hashes (<c>--tensor-overlay</c>, a ternary
-    /// adapter), or null. Per-request LoRA adapters are refused per request (<see cref="ChunkCacheExchange.Prepare"/>).
+    /// What changed the loaded weights without changing the base GGUF (<c>--tensor-overlay</c>, each <c>--ternary-adapter</c> package), as
+    /// (kind, id, content digest) from <see cref="ServerState.WeightModifiers"/>: digests taken at load time from the loaded bytes, so
+    /// nothing is read from disk here and a file replaced since load cannot change the identity (#1915). Ids are empty: content decides.
     /// </summary>
-    internal static string? WeightsChangedReason(ServerOptions options) =>
-        options.TensorOverlayPath is not null ? "a tensor overlay is attached"
-        : options.TernaryAdapterPaths is { Count: > 0 } ? "a ternary adapter is attached"
-        : null;
+    /// <param name="state">The server state.</param>
+    /// <returns>The modifiers (empty for a base model).</returns>
+    /// <exception cref="InvalidOperationException">The options name an overlay or adapter but no digests were computed at load.</exception>
+    internal static IReadOnlyList<(string Kind, string Id, string ContentDigest)> ServerModifiers(ServerState state)
+    {
+        if (state.WeightModifiers is { } computed)
+            return computed;
+        if (state.Options.TensorOverlayPath is not null || state.Options.TernaryAdapterPaths is { Count: > 0 })
+            throw new InvalidOperationException("The overlay and adapter digests were not computed at load.");
+        return [];
+    }
 }

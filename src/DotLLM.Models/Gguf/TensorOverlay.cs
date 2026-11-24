@@ -272,6 +272,31 @@ public sealed partial class TensorOverlay : IDisposable
     /// <param name="Ptr">Address inside the overlay's mmap (valid while the overlay is open).</param>
     internal readonly record struct GpuEntry(string Name, int Layer, int Proj, int Expert, int In, int Out, QuantizationType Qt, nint Ptr);
 
+    /// <summary>
+    /// SHA-256 (lower-case hex) of the overlay's tensors as loaded: for every tensor in name order its name, logical dtype and
+    /// [in, out] shape, then its bytes read from the mapping the model runs on (not from the file path, which may be replaced
+    /// afterwards). Reads the whole overlay once; call at load time (#1915).
+    /// </summary>
+    public unsafe string ContentDigest()
+    {
+        using var sha = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+        byte[] w = new byte[8];
+        void Int(long v) { System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(w, v); sha.AppendData(w); }
+        Int(_entries.Count);
+        foreach (var e in _entries.OrderBy(x => x.Name, StringComparer.Ordinal))
+        {
+            byte[] name = System.Text.Encoding.UTF8.GetBytes(e.Name);
+            Int(name.Length); sha.AppendData(name);
+            Int((int)e.Qt); Int(e.In); Int(e.Out);
+            long bytes = e.Qt.ComputeByteCount((long)e.In * e.Out);
+            Int(bytes);
+            const int Chunk = 1 << 20;
+            for (long off = 0; off < bytes; off += Chunk)
+                sha.AppendData(new ReadOnlySpan<byte>((byte*)e.Ptr + off, (int)Math.Min(Chunk, bytes - off)));
+        }
+        return Convert.ToHexStringLower(sha.GetHashAndReset());
+    }
+
     /// <summary>The overlay's tensors in logical terms (see <see cref="GpuEntry"/>).</summary>
     internal IEnumerable<GpuEntry> GpuEntries()
     {
