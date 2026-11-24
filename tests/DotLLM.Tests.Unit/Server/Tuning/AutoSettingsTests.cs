@@ -14,7 +14,8 @@ public sealed class AutoSettingsTests
     private static readonly AutoPolicy Run = new(AutoCommand.Run);
 
     private static TuningMatch Match(TuningMatchKind kind, TunedSettings s, string reason = "") =>
-        new(kind, kind == TuningMatchKind.Miss ? null : new TuningResult { Settings = s, TunedAtUtc = "2026-11-24T00:00:00Z" }, "p.json", reason);
+        // A Miss deliberately still carries a result: the applier must go by the kind, not by whether a result happens to be present.
+        new(kind, new TuningResult { Settings = s, TunedAtUtc = "2026-11-24T00:00:00Z" }, "p.json", reason);
 
     private static AutoApplied Apply(TuningMatch m, string[]? flags = null, AutoPolicy? policy = null, PlacementAdmission? admit = null,
                                      SettingRefusal? refuse = null, int ctx = 4096) =>
@@ -79,7 +80,7 @@ public sealed class AutoSettingsTests
     [Fact]
     public void Miss_LeavesDefaults_AndAdvises()
     {
-        var a = Apply(Match(TuningMatchKind.Miss, new TunedSettings(), "no saved result"), flags: ["threads"]);
+        var a = Apply(Match(TuningMatchKind.Miss, Saved, "no saved result"), flags: ["threads"]);
         Assert.All(a.Sources.Where(kv => kv.Key != "threads"), kv => Assert.Equal(SettingSource.Default, kv.Value));
         Assert.Equal(SettingSource.Flag, a.Sources["threads"]);
         Assert.Equal(new TunedSettings(), a.Applied);
