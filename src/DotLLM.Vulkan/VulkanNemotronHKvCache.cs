@@ -222,7 +222,7 @@ public static class VulkanKvStorageExtensions
 /// model-level layer indices into slot indices; a value of <c>-1</c> indicates a
 /// non-attention layer and the cache rejects requests against that index.
 /// </remarks>
-public sealed class VulkanNemotronHKvCache : IKvCache
+public sealed class VulkanNemotronHKvCache : IKvCache, IKvLengthRollback
 {
     private readonly VulkanDevice _device;
     private readonly VulkanDevice.Buffer[] _keys;
@@ -394,6 +394,7 @@ public sealed class VulkanNemotronHKvCache : IKvCache
         if (maxLength > _growthLimit) return false;
         if (!_lazy && _attentionLayerCount > 0)
         {
+            if (!AdmitEagerGrowth(maxLength)) return false;
             try { GrowTo(maxLength); }
             catch (VulkanException e) when (e.ErrorCode is VulkanOutOfDeviceMemory or VulkanOutOfHostMemory)
             {
@@ -407,6 +408,29 @@ public sealed class VulkanNemotronHKvCache : IKvCache
 
         _maxSeqLen = maxLength;
         return true;
+    }
+
+    /// <summary>
+    /// Admission for an eager growth (issue #1919): the new K/V buffers must fit in the device's free resident capacity (capacity minus
+    /// this process's live bytes minus other processes' GPU memory) beside the reserve, BEFORE any buffer is allocated, so a refused growth
+    /// leaves the cache untouched. The refusal is printed with its numbers (never silent). Where the free figure cannot be read the
+    /// allocation attempt (and its out-of-memory catch) is the admission.
+    /// </summary>
+    private bool AdmitEagerGrowth(int newLength)
+    {
+        long perLayerNew = 2L * newLength * _kvStride * _elemBytes;
+        // Net growth once every layer is swapped, plus one layer's new buffers alive while its old ones are still held.
+        long required = 2L * _attentionLayerCount * (newLength - _allocLength) * _kvStride * _elemBytes + perLayerNew;
+        long capacity = _device.ResidentCapacityBytes();
+        long other = 0;
+        try { other = _device.ReadOtherProcessPressure()?.OtherBytes ?? 0; } catch (Exception) { /* diagnostics only */ }
+        long free = capacity - _device.ResidentLiveBytes() - other;
+        long reserve = Core.Configuration.DeviceMemoryBudget.ResolveReserveBytes(
+            Environment.GetEnvironmentVariable(Core.Configuration.DeviceMemoryBudget.ReserveEnvVar));
+        if (Core.Configuration.DeviceMemoryBudget.Fits(free, required, reserve)) return true;
+        Console.Error.WriteLine("[dotllm] ERROR: " + Core.Configuration.DeviceMemoryBudget.DescribeRefusal(
+            $"the KV cache grown to {newLength} positions", required, free, reserve));
+        return false;
     }
 
     /// <summary>
@@ -649,6 +673,10 @@ public sealed class VulkanNemotronHKvCache : IKvCache
             throw new ArgumentOutOfRangeException(nameof(length));
         _currentLength = length;
     }
+
+    /// <inheritdoc/>
+    /// <remarks>Every attention layer holds the full history; a cut only lowers the visible length and later writes overwrite the rows past it.</remarks>
+    public bool CanTruncateTo(int length) => (uint)length <= (uint)_currentLength;
 
     /// <summary>
     /// Device-to-device copy of the first <paramref name="length"/> positions into a new, independent cache sized exactly

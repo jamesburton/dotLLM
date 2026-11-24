@@ -20,8 +20,11 @@ namespace DotLLM.Cuda;
 /// CUDA stream with no host synchronization until the final logits D2H transfer.
 /// Mirrors <see cref="TransformerModel"/> structure but uses cuBLAS GEMM/GEMV and custom PTX kernels.
 /// </summary>
-public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimitable
+public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimitable, ICudaResidualModifierHost
 {
+    /// <summary>Optional PostLayer residual modifier (#1919): called after every layer of the eager forward; a set modifier bypasses the decode graphs. Null costs one branch per layer.</summary>
+    public ICudaResidualModifier? ResidualModifier { get; set; }
+
     private readonly CudaWeights _weights;
     private readonly CudaForwardState _state;
     private readonly CudaStream _stream;
@@ -1304,6 +1307,7 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
             // BitNet IS graph-capable (issue #212): CaptureDecodeGraph/CaptureDecodeGraphQuantized
             // now carry the same fp32Res-gated FP32 residual accumulation, Sub-LN, and ReLU² FFN
             // activation as this eager body, ported 1:1 from the branches below.
+            && ResidualModifier is null     // #1919: a graph replay never reaches the per-layer PostLayer call
             && _currentAdapter is null      // the captured body has no ApplyLoraDeltaDevice call, so an active adapter would be silently dropped on every decoded token
             // Issue #213/#218: the graph-friendly attention_f16_dyn kernel is measurably
             // slower than eager's attention_f16 at the same seq_kv (confirmed at the kernel
@@ -1329,7 +1333,7 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
         // arguments come from device scalars; NoPE, sinks and sliding windows are the eager body's own.
         if (!_moeGraphCapturing && !_moeGraphFailed && UseGraphCapture && MoeDecodeGraphEnabled
             && !suppressGraphCapture && deferredHostDest == 0 && tokenIds.Length == 1
-            && isMoe && !isMla && !ProfilingEnabled && _currentAdapter is null && DebugCaptureAttnLayer < 0
+            && isMoe && !isMla && !ProfilingEnabled && _currentAdapter is null && ResidualModifier is null && DebugCaptureAttnLayer < 0
             && kvCache is CudaKvCache moeKv && positions[0] == moeKv.CurrentLength
             && _kernels.HasFusedRopeKvWriteKernel && CanCaptureMoeDecode()
             && ForwardMoeDecodeGraph(tokenIds, positions, deviceId, moeKv) is { } graphLogits)
@@ -1457,6 +1461,7 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
             CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.HiddenState, _state.Residual, (nuint)hiddenBytes, s).ThrowOnError();
         }
 
+        var residualModifier = ResidualModifier;
         for (int layer = 0; layer < numLayers; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
@@ -2065,6 +2070,8 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
                     _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
                         seqLen * hiddenSize, s);
             }
+            if (residualModifier is not null && residualModifier.AppliesTo(layer))
+                ApplyResidualModifier(residualModifier, layer, numLayers, fp32Res, isMla, seqLen, hiddenSize, eps, resEps, s);
             MarkProfile(ProfileCategory.Norm);
         }
 
@@ -2352,6 +2359,25 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
         {
             _currentAdapter = null;
         }
+    }
+
+    /// <summary>
+    /// PostLayer hook of the eager forward (#1919). The layer's closing add is fused with the NEXT layer's attention RMSNorm, so after the
+    /// modifier edits the residual (the last layer's lands in HiddenState, a BitNet model's in ResidualF32) the next layer's normalised input
+    /// is recomputed from the modified residual; without that the perturbation would only reach the skip path.
+    /// </summary>
+    private void ApplyResidualModifier(ICudaResidualModifier modifier, int layer, int numLayers, bool fp32Res, bool isMla,
+        int seqLen, int hiddenSize, float eps, float resEps, nint s)
+    {
+        bool last = layer == numLayers - 1;
+        nint residual = fp32Res ? _state.ResidualF32 : last ? _state.HiddenState : _state.Residual;
+        modifier.Apply(residual, fp32Res ? CudaResidualDType.F32 : CudaResidualDType.F16, layer, seqLen, hiddenSize, s);
+        if (last || isMla) return;   // MLA's next layer norms the raw residual itself
+        ref readonly var nextLw = ref _weights.Layers[layer + 1];
+        if (fp32Res)
+            _kernels.LaunchRmsNormF32InF16W(_state.ResidualF32, nextLw.AttnNormWeight, _state.NormOutput, hiddenSize, eps, seqLen, s);
+        else
+            _kernels.LaunchRmsNorm(_state.Residual, nextLw.AttnNormWeight, _state.NormOutput, hiddenSize, resEps, seqLen, s);
     }
 
     /// <summary>

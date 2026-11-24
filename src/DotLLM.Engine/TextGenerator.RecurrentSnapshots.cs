@@ -37,6 +37,7 @@ public sealed partial class TextGenerator
         LastPrefixCacheTier = null; LastPrefixRestoreMilliseconds = 0;
         try
         {
+            ThrowIfRecurrentSessionOpen();   // #1919
             return UseCloverBlockDiffusion()
                 ? GenerateCloverBlock(prompt, options, onTokenGenerated, adapter, onTextGenerated, cancellationToken)
                 : GenerateCore(prompt, options, onTokenGenerated, adapter, onTextGenerated, cancellationToken);
@@ -52,6 +53,7 @@ public sealed partial class TextGenerator
         LastPrefixCacheTier = null; LastPrefixRestoreMilliseconds = 0;
         try
         {
+            ThrowIfRecurrentSessionOpen();   // #1919
             var stream = UseCloverBlockDiffusion()
                 ? GenerateCloverBlockStreamingAsync(prompt, options, cancellationToken, adapter)   // Clover block diffusion (#1828), opt-in
                 : GenerateStreamingTokensCoreAsync(prompt, options, cancellationToken, adapter);

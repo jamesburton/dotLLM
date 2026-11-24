@@ -1883,7 +1883,7 @@ public sealed partial class TextGenerator
             new KeyValuePair<string, object?>("tier", tier));
     }
 
-    private static StopResult CheckStopConditions(
+    internal static StopResult CheckStopConditions(
         List<IStopCondition> conditions, int tokenId,
         IReadOnlyList<int> generatedTokens, ReadOnlySpan<char> decodedTail)
     {
@@ -1912,12 +1912,12 @@ public sealed partial class TextGenerator
     /// The suffix test here uses exactly the predicate <see cref="StopStringCondition"/>
     /// itself uses (ordinal <c>EndsWith</c> on the same tail window).
     /// </remarks>
-    private static bool HasStopStringSuffix(ReadOnlySpan<char> decodedTail, List<IStopCondition> conditions)
+    internal static bool HasStopStringSuffix(ReadOnlySpan<char> decodedTail, List<IStopCondition> conditions)
         => StopSuffixTrimmer.MatchedSuffixLength(decodedTail, conditions) > 0;
 
     // Tail window passed to stop conditions. Must cover the longest stop string currently
     // registered; a safety cushion absorbs future stop strings added via custom conditions.
-    private static int ComputeStopTailSize(List<IStopCondition> conditions)
+    internal static int ComputeStopTailSize(List<IStopCondition> conditions)
         => Math.Max(64, StopSuffixTrimmer.TailWindowSize(conditions));
 
     // Speculative decoding's greedy acceptance path matches the target pipeline only when the pipeline
