@@ -106,6 +106,19 @@ public sealed unsafe class MatMulKQuantFastKernelTests
                 MatMul.Q5KRows4Tokens4(w, sbCount, x, q8Row, actual, 4);
             else
                 MatMul.Rows4Tokens4(w, sbCount, x, q8Row, actual, 4);
+            if (fmt == 4 && MatMul.Q4KRlaActive)
+            {
+                // #1927: under the row-lane arithmetic (the default) the 4-token kernel and the 4-row dispatcher follow the RLA oracle,
+                // not the R4 reference (which, with Q4KRows4Tokens1 above, still pins the R4 arithmetic of DOTLLM_CPU_Q4K_ROWLANE=0).
+                for (int t = 0; t < tokens; t++)
+                    for (int r = 0; r < 4; r++)
+                        expected[t * 4 + r] = MatMul.Q4KRlaDot1Scalar(w + r * rs, x + (long)t * q8Row, sbCount, wStride);
+                AssertBits(expected, actual, tokens * 4, $"Q4_K sb={sbCount} 4-token kernel (RLA)");
+                for (int t = 0; t < tokens; t++)
+                    MatMul.VecDotQ4_K_Q8_K_4Rows(w, w + rs, w + 2 * rs, w + 3 * rs, x + (long)t * q8Row, sbCount, wStride, actual + t * 4);
+                AssertBits(expected, actual, tokens * 4, $"Q4_K sb={sbCount} 4-row dispatcher (RLA)");
+                return;
+            }
             AssertBits(expected, actual, tokens * 4, $"Q{fmt}_K sb={sbCount} 4-token kernel");
         }
         finally

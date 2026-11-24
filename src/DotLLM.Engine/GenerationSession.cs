@@ -46,6 +46,8 @@ public sealed class GenerationSession : IAsyncDisposable
     // prompt / observation, or k == 0). The guard's live (token, run) is always derivable from (_history, _runAt, _position), which is what makes
     // RollbackTo restore it exactly.
     private int[] _runAt = new int[65];
+    // InferenceOptions.RepeatGuardLimit on a session: plain-generator semantics (#1291). The run survives pauses and is restored by RollbackTo; an
+    // observation append or prefill ENDS it (intended, James 2026-11-24: those tokens are supplied, not sampled).
     private readonly RepeatGuardStopCondition? _repeatGuard;
     private readonly CommittedView _committed;
     private int _position;
@@ -137,8 +139,8 @@ public sealed class GenerationSession : IAsyncDisposable
     /// <b>takes ownership</b> of it: do not advance, reset or share it with another session or generator while it is active.
     /// KV, recurrent state, boundary records and next-token logits are untouched, so nothing of the committed prefix is re-prefilled.</para>
     /// <para>The constraint advances only on tokens the session samples and commits; prompt and observation tokens never advance it.
-    /// <see cref="RollbackTo"/> that discards tokens resets the active constraint to its initial state (its parse state described the discarded tokens);
-    /// call <see cref="SetConstraint"/> again to attach a different one.</para>
+    /// <see cref="RollbackTo"/> that discards tokens rebuilds the active constraint by exact replay of the tokens sampled since it was attached
+    /// (rule below), so the parse state always matches the retained tokens; call <see cref="SetConstraint"/> to attach a different one.</para>
     /// <para>Rollback rule (exact): the session records the position the constraint was attached at and the tokens it sampled since. <c>RollbackTo(k)</c>
     /// resets the constraint and re-advances it over exactly the sampled tokens at positions <c>[attachPos, k)</c>; observation and prefill tokens are never
     /// re-advanced (they never were), and <c>k &lt;= attachPos</c> simply leaves it fresh. No forward pass is needed.</para>
@@ -196,6 +198,9 @@ public sealed class GenerationSession : IAsyncDisposable
     /// Runs full-layer prefill (KV and recurrent state, every layer) of externally supplied <paramref name="tokens"/> after the
     /// committed prefix. Observation tokens are never sampled and never constrained. Throws <see cref="InvalidOperationException"/>
     /// before any forward when they would not fit the KV capacity.
+    /// <para><b>Repeat guard (intended, James 2026-11-24).</b> An observation append (and a prefill) ENDS the repeat-guard run: the appended tokens
+    /// are externally supplied, not sampled, so a run of identical sampled tokens is never carried across them, even though the sampler history
+    /// (all committed tokens) includes them. <c>RollbackTo</c> restores exactly the run that stood at the target position.</para>
     /// </summary>
     public ValueTask AppendObservationTokensAsync(ReadOnlyMemory<int> tokens, CancellationToken cancellationToken = default)
         => AppendCore(tokens, cancellationToken);

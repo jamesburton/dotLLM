@@ -542,6 +542,14 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
+        // Release the kernels' per-thread scratch on every worker while they can still run (#1927): a pool that is torn down
+        // would otherwise leave its workers' tiles to the finalizers.
+        if (!_shutdown)
+        {
+            try { DotLLM.Cpu.Kernels.CpuKernelScratch.Trim(this); }
+            catch (Exception) { /* best effort: teardown must not throw */ }
+        }
+
         _shutdown = true;
 
         // Bump generation to wake any spinners

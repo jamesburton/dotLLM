@@ -407,11 +407,13 @@ public static unsafe partial class MatMul
     /// <summary>Best non-AVX2 Q4_K dot (SSSE3, else scalar).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ4_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
+        Q4KRlaActive ? Q4KRlaDot1(qk, q8k, superBlockCount, Q4_K_BlockBytes) :
         CpuFeatures.Ssse3 ? VecDotQ4_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ4_K_Q8_KScalar(qk, q8k, superBlockCount);
 
     /// <inheritdoc cref="VecDotQ4_K_Q8_KSse(byte*, byte*, int, int)"/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ4_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount, int wStride) =>
+        Q4KRlaActive ? Q4KRlaDot1(qk, q8k, superBlockCount, wStride) :
         CpuFeatures.Ssse3 ? VecDotQ4_K_Q8_KSse(qk, q8k, superBlockCount, wStride)
                           : VecDotQ4_K_Q8_KScalar(qk, q8k, superBlockCount, wStride);
 

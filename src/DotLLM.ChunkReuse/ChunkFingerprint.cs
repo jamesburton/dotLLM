@@ -82,6 +82,26 @@ public static class ChunkFingerprint
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
     }
 
+    /// <summary>
+    /// Folds the identity of whatever changes the weights without changing the base file (tensor overlay, ternary adapters, a per-request
+    /// LoRA; <see cref="DotLLM.Core.Identity.ModifierSetDigest.Compute"/>) into a base fingerprint (#1915). A null or empty digest returns
+    /// <paramref name="baseFingerprint"/> unchanged, so every key and stored file written before modifiers existed stays valid for the
+    /// unmodified model, and no modified request can ever share a fingerprint with it.
+    /// </summary>
+    /// <param name="baseFingerprint">A fingerprint from <c>Compute</c> (of the unmodified model).</param>
+    /// <param name="modifiersDigest">The modifier set's digest, or null / empty for none.</param>
+    /// <returns>The fingerprint of the base model under those modifiers.</returns>
+    public static string WithModifiers(string baseFingerprint, string? modifiersDigest)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(baseFingerprint);
+        if (string.IsNullOrEmpty(modifiersDigest))
+            return baseFingerprint;
+        var sb = new StringBuilder("chunk-kv/v1+modifiers");
+        Append(sb, "base", baseFingerprint);
+        Append(sb, "modifiers", modifiersDigest);
+        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
+    }
+
     /// <summary>dotLLM build identity (informational version of <c>DotLLM.Core</c>); for logs only, not hashed.</summary>
     public static string EngineVersion { get; } =
         typeof(ModelConfig).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion

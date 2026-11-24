@@ -673,14 +673,21 @@ public sealed class ChunkIndexTests : IDisposable
 
         index.Update([new SourceFile("A.txt", "012345678\nmore\n")], chunker);
         Task save;
+        var blocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        TimeSpan savedBudget = ChunkIndex.SaveRetryBudget;
+        ChunkIndex.SaveRetryBudget = TimeSpan.FromMinutes(2); // the wait below is event-driven; a loaded runner must not exhaust the retry budget first
+        ChunkIndex.MoveRetriedForTest = () => blocked.TrySetResult();
+        try
+        {
         using (FileStream reader = ChunkIndex.OpenForRead(path)) // the share mode Load uses
         {
             save = Task.Run(() => index.Save(path)); // Windows: waits while the reader holds the file
             if (OperatingSystem.IsWindows())
             {
-                // The rename waits for the reader, so for as long as it is held a second reader sees the old file (1 chunk). This
-                // holds however late the save starts, so a short delay cannot make it flaky.
-                await Task.Delay(150);
+                // Wait for the save itself to report that its rename was refused (it is blocked on the reader): an event, not a
+                // timer, so a loaded runner cannot make this look too early or too late. While the reader is held, a second reader
+                // sees the old file (1 chunk) and the save has not completed.
+                await blocked.Task.WaitAsync(TimeSpan.FromSeconds(60));
                 Assert.False(save.IsCompleted);
                 Assert.Single(ChunkIndex.Load(path, KeyA).ChunksOf("A.txt"));
             }
@@ -693,7 +700,13 @@ public sealed class ChunkIndexTests : IDisposable
                 Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
             }
         }
-        await save.WaitAsync(TimeSpan.FromSeconds(10));
+        await save.WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            ChunkIndex.MoveRetriedForTest = null;
+            ChunkIndex.SaveRetryBudget = savedBudget;
+        }
         Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
         Assert.Single(Directory.GetFiles(_root)); // no temp file left
 

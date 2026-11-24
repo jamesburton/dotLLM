@@ -680,7 +680,7 @@ internal sealed class JinjaEvaluator
     {
         int step = stepVal ?? 1;
         var result = new List<object?>();
-        if (step == 0) return result; // Python raises; we yield empty rather than throw mid-template.
+        if (step == 0) throw new JinjaException("Slice step cannot be zero"); // CPython: ValueError("slice step cannot be zero")
 
         int lower, upper;
         if (step < 0) { lower = -1; upper = length - 1; }

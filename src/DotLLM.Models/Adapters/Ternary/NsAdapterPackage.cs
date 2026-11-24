@@ -159,6 +159,27 @@ public sealed class NsAdapterPackage
             throw new InvalidDataException($"up tensor {Up.Rows}x{Up.Columns} != InputDimension x Rank {d}x{r}.");
     }
 
+    /// <summary>
+    /// SHA-256 (lower-case hex) of everything that changes what the adapter computes, taken from the LOADED package (not from the
+    /// file it came from): target layer, dimensions, rank, alpha, activation threshold, and both tensors' packed codes and F32 scales.
+    /// Descriptive manifest fields (domain, description, creation time, target model name) are not part of it. Used for chunk identity (#1915).
+    /// </summary>
+    public string ContentDigest()
+    {
+        using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        byte[] w = new byte[4];
+        void Int(int v) { System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(w, v); sha.AppendData(w); }
+        Int(Manifest.TargetLayer); Int(Manifest.InputDimension); Int(Manifest.Rank);
+        Int(BitConverter.SingleToInt32Bits(Manifest.Alpha)); Int(BitConverter.SingleToInt32Bits(Manifest.ActivationThreshold));
+        foreach (PackedTernaryTensor t in new[] { Down, Up })
+        {
+            Int(t.Rows); Int(t.Columns);
+            sha.AppendData(System.Runtime.InteropServices.MemoryMarshal.AsBytes(t.Scales.AsSpan()));
+            sha.AppendData(t.Data);
+        }
+        return Convert.ToHexStringLower(sha.GetHashAndReset());
+    }
+
     /// <summary>Writes the package (checksums are recomputed).</summary>
     public void Save(Stream stream)
     {

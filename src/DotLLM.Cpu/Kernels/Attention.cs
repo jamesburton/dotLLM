@@ -1,5 +1,6 @@
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
@@ -416,6 +417,14 @@ public static class Attention
             throw new ArgumentException(
                 $"numHeads ({numHeads}) must be divisible by numKvHeads ({numKvHeads})", nameof(numKvHeads));
 
+        // Before the single-threaded fallback: decode past the one-shot bound takes the split-KV kernel at ANY thread count (with
+        // no pool it runs inline), so a token's logits do not depend on whether a pool exists (#1927 E2c).
+        if (DecodeSplitKvApplies(seqQ, seqKv, numHeads, numKvHeads, positionOffset, alibiSlopes, slidingWindowSize, softCap, maskMode, sinks))
+        {
+            ExecuteDecodeSplitKv(q, k, v, output, Math.Min(seqKv, positionOffset + 1), numHeads, numKvHeads, headDim, scale, pool);
+            return;
+        }
+
         if (pool is null || numHeads < 2)
         {
             // Fall back to span-based single-threaded path
@@ -561,7 +570,9 @@ public static class Attention
     /// Causal GQA prefill attention blocked as <c>(KV head) x (query-row block) x (key tile)</c> (issue #1570). A work item is one KV
     /// head and <see cref="BlockedRowsPerItem"/> consecutive query tokens: all <c>groupSize</c> query heads of those tokens walk the
     /// same key tiles, so one K/V tile (hd128: 2 x 128 KiB at the 256-key tile) is read from L2 by every row of the item instead of
-    /// being streamed from memory once per (head, row) as the per-row kernel does over a 32K history.
+    /// being streamed from memory once per (head, row) as the per-row kernel does over a 32K history. Each tile's K and V slices of the
+    /// item's KV head are first copied into dense per-worker buffers (#1927): read in place they sit one KV row apart (4 KiB at
+    /// 8 x hd128), so a tile maps onto a few L1 sets and every dot refetches from L2. The copy changes no value or order.
     /// <para>
     /// The arithmetic of every row is exactly that of the per-row kernel: rows whose visible length fits the one-shot bound take
     /// <see cref="OneShotRow"/>; longer rows run <see cref="TiledRow"/>'s online softmax with the same tile size, the same tiles
@@ -604,6 +615,19 @@ public static class Attention
         int G = ctx.GroupSize;
         if (G > 64) throw new NotSupportedException("Blocked attention supports at most 64 query heads per KV head.");
 
+        // Dense per-worker copies of one key tile's K and V slices for the item's KV head (#1927): bounded by TileSize x headDim.
+        // F32 storage approval (rule 1): James 2026-11-21, bounded F32 tile pack; follows cache dtype under #1107 (256 KiB per worker
+        // at hd128, context-independent, bit-identical). When the CPU cache moves to F16 (#1107) this pack becomes the F16 -> F32 tile load.
+        Span<float> kPack = default, vPack = default;
+        if (BlockedPackEnabled)
+        {
+            int packFloats = ctx.TileSize * ctx.HeadDim;
+            KvTileBuffers tiles = t_kvTiles ??= new KvTileBuffers();
+            tiles.Ensure(packFloats);
+            kPack = new Span<float>(tiles.K, packFloats);
+            vPack = new Span<float>(tiles.V, packFloats);
+        }
+
         while (true)
         {
             int item = Interlocked.Increment(ref ctx.Next) - 1;
@@ -613,15 +637,39 @@ public static class Attention
             int block = ctx.ItemsPerKvHead - 1 - item / ctx.NumKvHeads;
             int t0 = block * ctx.RowsPerItem;
             int t1 = Math.Min(ctx.SeqQ, t0 + ctx.RowsPerItem);
-            BlockedCausalItem(ref ctx, qSpan, kSpan, vSpan, outSpan, scratch, maxSoFar, sumExp, kvHead, t0, t1);
+            BlockedCausalItem(ref ctx, qSpan, kSpan, vSpan, outSpan, scratch, maxSoFar, sumExp, kPack, vPack, kvHead, t0, t1);
         }
+    }
+
+    /// <summary>
+    /// Environment variable: <c>0</c> makes <see cref="BlockedCausalItem"/> read K/V slices in place instead of from a dense packed
+    /// tile (#1927 A/B; the output is bit-identical either way).
+    /// </summary>
+    public const string BlockedPackEnvVar = "DOTLLM_CPU_ATTN_PACK";
+
+    /// <summary>Runtime switch (tests, in-process A/B); initialised from <see cref="BlockedPackEnvVar"/>.</summary>
+    internal static bool BlockedPackEnabled = Environment.GetEnvironmentVariable(BlockedPackEnvVar) != "0";
+
+    /// <summary>
+    /// Copies keys <c>[tileBase, tileBase + tileLen)</c> of KV head <paramref name="kvHead"/> from the strided cache layout
+    /// <c>[key][kvHead][dim]</c> into <paramref name="dst"/> as dense rows of <paramref name="hd"/> floats. On a GQA model the source
+    /// rows sit one full KV row apart (4 KiB on Qwen3-4B), so a 256-key tile maps onto a handful of L1 sets; the dense copy is
+    /// contiguous and stays cache-resident for every query row of the item.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void PackKvTile(ReadOnlySpan<float> src, Span<float> dst, int tileBase, int tileLen, int kvStride, int kvHead, int hd)
+    {
+        int off = tileBase * kvStride + kvHead * hd;
+        for (int j = 0; j < tileLen; j++, off += kvStride)
+            src.Slice(off, hd).CopyTo(dst.Slice(j * hd, hd));
     }
 
     /// <summary>One work item: KV head <paramref name="kvHead"/>, query tokens <c>[t0, t1)</c>, all of its query heads.</summary>
     private static void BlockedCausalItem(ref BlockedCausalCtx ctx, ReadOnlySpan<float> q, ReadOnlySpan<float> k, ReadOnlySpan<float> v,
                                           Span<float> output, Span<float> scratch, Span<float> maxSoFar, Span<float> sumExp,
-                                          int kvHead, int t0, int t1)
+                                          Span<float> kPack, Span<float> vPack, int kvHead, int t0, int t1)
     {
+        bool packed = !kPack.IsEmpty;
         int G = ctx.GroupSize, hd = ctx.HeadDim, qStride = ctx.QStride, kvStride = ctx.KvStride, tileSize = ctx.TileSize;
         float scale = ctx.Scale;
         int firstHead = kvHead * G;
@@ -657,8 +705,24 @@ public static class Attention
         // Key tiles anchored at 0 (= every causal row's visible start), the per-row kernel's tile grid.
         int blockEnd = Math.Min(ctx.SeqKv, ctx.PositionOffset + t1);
         var tileScores = scratch.Slice(0, tileSize);
+        // With packing, K/V slices are read from dense copies: row j of the tile at j * hd (stride hd, offset 0); else in place.
+        ReadOnlySpan<float> kTile = packed ? kPack : k, vTile = packed ? vPack : v;
+        int tileStride = packed ? hd : kvStride, headOff = packed ? 0 : kvHead * hd;
         for (int tileBase = 0; tileBase < blockEnd; tileBase += tileSize)
         {
+            int keyBase = 0;
+            if (packed)
+            {
+                // Every row of the item needs at most the keys below blockEnd; pack them once for all (token, head) rows.
+                int packLen = Math.Min(tileSize, blockEnd - tileBase);
+                PackKvTile(k, kPack, tileBase, packLen, kvStride, kvHead, hd);
+                PackKvTile(v, vPack, tileBase, packLen, kvStride, kvHead, hd);
+            }
+            else
+            {
+                keyBase = tileBase;
+            }
+
             for (int r = 0; r < rows; r++)
             {
                 int t = tiledFrom + r / G, h = firstHead + r % G;
@@ -672,7 +736,7 @@ public static class Attention
 
                 for (int j = 0; j < tileLen; j++)
                 {
-                    var kRow = k.Slice((tileBase + j) * kvStride + kvHead * hd, hd);
+                    var kRow = kTile.Slice((keyBase + j) * tileStride + headOff, hd);
                     // TiledRow subtracts `0f * (qPos - key)` here (ALiBi slope 0): x - (+0.0) is x for every x, so dropping it is exact.
                     scores[j] = TensorPrimitives.Dot(qRow, kRow) * scale;
                 }
@@ -691,7 +755,7 @@ public static class Attention
                 {
                     float w = scores[j];
                     if (w == 0f) continue;
-                    var vRow = v.Slice((tileBase + j) * kvStride + kvHead * hd, hd);
+                    var vRow = vTile.Slice((keyBase + j) * tileStride + headOff, hd);
                     TensorPrimitives.MultiplyAdd(vRow, w, outRow, outRow);
                 }
                 maxSoFar[r] = newMax;
@@ -708,6 +772,284 @@ public static class Attention
             }
         }
     }
+
+    // ──────────────────── Split-KV decode attention (#1927 E2c) ────────────────────
+
+    /// <summary>
+    /// Environment variable selecting the split-KV decode kernel's partial-output storage: <c>f16</c> (default), <c>f32</c> (control
+    /// arm) or <c>0</c> (off: the per-head <see cref="TiledRow"/> path).
+    /// </summary>
+    public const string DecodeSplitKvEnvVar = "DOTLLM_CPU_ATTN_SPLITKV";
+
+    /// <summary>
+    /// Split-KV decode mode (tests, in-process A/B, quality gates); initialised from <see cref="DecodeSplitKvEnvVar"/>.
+    /// </summary>
+    public static DecodeSplitKvPartials DecodeSplitKv { get; set; } =
+        Environment.GetEnvironmentVariable(DecodeSplitKvEnvVar)?.Trim().ToLowerInvariant() switch
+        {
+            "0" or "off" => DecodeSplitKvPartials.Off,
+            "f32" => DecodeSplitKvPartials.F32,
+            _ => DecodeSplitKvPartials.F16,
+        };
+
+    [ThreadStatic] private static DecodeSplitKvPartials? t_decodeSplitKvOverride;
+
+    /// <summary>The mode decode on the CURRENT thread uses: a thread-scoped override if one is active, else <see cref="DecodeSplitKv"/>.</summary>
+    internal static DecodeSplitKvPartials EffectiveDecodeSplitKv => t_decodeSplitKvOverride ?? DecodeSplitKv;
+
+    /// <summary>
+    /// Pins the split-KV mode for attention calls made from the calling thread until the scope is disposed (tests: a reference arm
+    /// that must be the tiled path, without racing other tests through the process-wide <see cref="DecodeSplitKv"/>). The decision
+    /// is taken on the thread that calls <c>Execute</c> (the model's forward thread), never on pool workers.
+    /// </summary>
+    internal static DecodeSplitKvScope OverrideDecodeSplitKvOnThisThread(DecodeSplitKvPartials mode)
+    {
+        var scope = new DecodeSplitKvScope(t_decodeSplitKvOverride);
+        t_decodeSplitKvOverride = mode;
+        return scope;
+    }
+
+    /// <summary>Restores the previous thread-scoped split-KV override on dispose.</summary>
+    internal readonly struct DecodeSplitKvScope : IDisposable
+    {
+        private readonly DecodeSplitKvPartials? _previous;
+        internal DecodeSplitKvScope(DecodeSplitKvPartials? previous) => _previous = previous;
+        /// <inheritdoc/>
+        public void Dispose() => t_decodeSplitKvOverride = _previous;
+    }
+
+    /// <summary>Keys per split-KV range. Fixed (not <c>seqKv / threads</c>), so the result does not depend on the thread count.</summary>
+    internal const int SplitKvRangeKeys = 256;
+
+    /// <summary>Number of times <see cref="ExecuteDecodeSplitKv"/> ran (test and profiling hook).</summary>
+    public static long DecodeSplitKvCount;
+
+    /// <summary>
+    /// Whether the split-KV kernel serves a call: one query row (decode), plain causal GQA attention (no ALiBi, soft-cap, sinks,
+    /// mask variant or sliding window), and a visible range past the one-shot bound (shorter rows keep the exact one-shot form).
+    /// </summary>
+    internal static unsafe bool DecodeSplitKvApplies(int seqQ, int seqKv, int numHeads, int numKvHeads, int positionOffset, float* alibiSlopes,
+                                                     int? slidingWindowSize, float softCap, AttentionMaskMode maskMode, float[]? sinks)
+        => EffectiveDecodeSplitKv != DecodeSplitKvPartials.Off && seqQ == 1 && alibiSlopes is null && (slidingWindowSize ?? 0) <= 0
+           && softCap == 0f && maskMode == AttentionMaskMode.Causal && sinks is null && numHeads <= 256
+           && Math.Min(seqKv, positionOffset + 1) > OneShotMaxKeys;
+
+    private unsafe struct SplitKvCtx
+    {
+        public float* Q, K, V, Output, PartM, PartS, PartF32;
+        public Half* PartF16;
+        public int NumHeads, HeadDim, GroupSize, KvStride, Visible, Ranges;
+        public float Scale;
+        public int Next;
+    }
+
+    /// <summary>
+    /// Decode attention split over the KEY range (llama.cpp's shape, issue #1927 E2c). Pass 1: fixed 256-key ranges are claimed
+    /// dynamically; each walks its keys in order and reads every K and V row once for ALL query heads (whole 4 KiB rows: a sequential
+    /// stream, and one read per GQA group instead of one per query head), keeping the range's running max and exp-sum in F32 and its
+    /// normalised output in a per-worker F32 accumulator, then stores the output as F16 (or F32, the control arm) with the max and sum
+    /// as F32 scalars. Pass 2 combines the ranges of each head in range order: <c>out = Σ s_r e^(m_r - M) o_r / Σ s_r e^(m_r - M)</c>.
+    /// <para>
+    /// Not bit-identical to <see cref="TiledRow"/> (the per-head online recurrence is replaced by a combine, and the partials are
+    /// rounded to F16): a token's attention output differs between decode and prefill (#530). Gated on teacher-forced KL/PPL at depth
+    /// (James 2026-11-21: F16 partials, F32 running max/sum, F32-partials control arm). The result is thread-count independent: the
+    /// ranges and the combine order are fixed. Partials cost <c>ceil(visible / 256) x numHeads x (2 x headDim + 8)</c> bytes
+    /// (248 KiB at 7.6K keys, 32 heads, hd128, F16: 240 KiB outputs + 7.5 KiB F32 max/sum), held by the calling thread and grown on demand.
+    /// </para>
+    /// </summary>
+    [SkipLocalsInit]
+    internal static unsafe void ExecuteDecodeSplitKv(float* q, float* k, float* v, float* output, int visible,
+                                                    int numHeads, int numKvHeads, int headDim, float scale, ComputeThreadPool? pool)
+    {
+        int ranges = (visible + SplitKvRangeKeys - 1) / SplitKvRangeKeys;
+        bool f16 = EffectiveDecodeSplitKv != DecodeSplitKvPartials.F32;   // read once: the buffers and the kernel use the same choice
+        SplitKvPartialBuffers parts = t_splitKvParts ??= new SplitKvPartialBuffers();
+        parts.Ensure(ranges * numHeads, headDim, f16);
+        var ctx = new SplitKvCtx
+        {
+            Q = q, K = k, V = v, Output = output, PartM = parts.M, PartS = parts.S,
+            PartF32 = f16 ? null : parts.O32, PartF16 = f16 ? parts.O16 : null,
+            NumHeads = numHeads, HeadDim = headDim, GroupSize = numHeads / numKvHeads, KvStride = numKvHeads * headDim,
+            Visible = visible, Ranges = ranges, Scale = scale, Next = 0,
+        };
+        Interlocked.Increment(ref DecodeSplitKvCount);
+        t_decodeSplitKvCalls++;
+        if (pool is null)
+        {
+            SplitKvRangeWorker((nint)(&ctx), 0, 1);
+            ctx.Next = 0;
+            SplitKvCombineWorker((nint)(&ctx), 0, 1);
+            return;
+        }
+        pool.Dispatch((nint)(&ctx), &SplitKvRangeWorker);
+        ctx.Next = 0;
+        pool.Dispatch((nint)(&ctx), &SplitKvCombineWorker);
+    }
+
+    /// <summary>Split-KV calls dispatched from the CURRENT thread (tests: immune to concurrent decodes on other threads).</summary>
+    [ThreadStatic] internal static long t_decodeSplitKvCalls;
+
+    [SkipLocalsInit]
+    private static unsafe void SplitKvRangeWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<SplitKvCtx>((void*)ctxPtr);
+        int H = ctx.NumHeads, hd = ctx.HeadDim, G = ctx.GroupSize, R = SplitKvRangeKeys;
+        KvTileBuffers tiles = t_kvTiles ??= new KvTileBuffers();
+        tiles.Ensure(Math.Max(H * R, H * hd));
+        float* sc = tiles.K;    // scores [H][R]
+        float* acc = tiles.V;   // F32 output accumulators [H][hd]
+
+        while (true)
+        {
+            int r = Interlocked.Increment(ref ctx.Next) - 1;
+            if (r >= ctx.Ranges) break;
+            int k0 = r * R, len = Math.Min(R, ctx.Visible - k0);
+
+            // Scores, key-major: each K row is read once, front to back, for every query head.
+            for (int j = 0; j < len; j++)
+            {
+                float* kRow = ctx.K + (long)(k0 + j) * ctx.KvStride;
+                for (int h = 0; h < H; h++)
+                    sc[h * R + j] = TensorPrimitives.Dot(new ReadOnlySpan<float>(ctx.Q + (long)h * hd, hd),
+                                                         new ReadOnlySpan<float>(kRow + (long)(h / G) * hd, hd)) * ctx.Scale;
+            }
+
+            int pBase = r * H;
+            for (int h = 0; h < H; h++)
+            {
+                var s = new Span<float>(sc + h * R, len);
+                float m = TensorPrimitives.Max((ReadOnlySpan<float>)s);
+                ctx.PartM[pBase + h] = m;
+                ctx.PartS[pBase + h] = FastMath.ExpSumAndStore(s, s, -m);   // >= 1: the max key contributes e^0
+            }
+
+            new Span<float>(acc, H * hd).Clear();
+            for (int j = 0; j < len; j++)
+            {
+                float* vRow = ctx.V + (long)(k0 + j) * ctx.KvStride;
+                for (int h = 0; h < H; h++)
+                {
+                    float w = sc[h * R + j];
+                    if (w == 0f) continue;
+                    var o = new Span<float>(acc + (long)h * hd, hd);
+                    TensorPrimitives.MultiplyAdd(new ReadOnlySpan<float>(vRow + (long)(h / G) * hd, hd), w, o, o);
+                }
+            }
+
+            // Store each head's range output normalised by its own sum (|o| <= max |V|, F16-safe), as F16 or F32.
+            for (int h = 0; h < H; h++)
+            {
+                var o = new Span<float>(acc + (long)h * hd, hd);
+                float inv = 1f / ctx.PartS[pBase + h];
+                long off = (long)(pBase + h) * hd;
+                if (ctx.PartF16 != null)
+                {
+                    TensorPrimitives.Multiply(o, inv, o);
+                    TensorPrimitives.ConvertToHalf(o, new Span<Half>(ctx.PartF16 + off, hd));
+                }
+                else
+                {
+                    TensorPrimitives.Multiply(o, inv, new Span<float>(ctx.PartF32 + off, hd));
+                }
+            }
+        }
+    }
+
+    [SkipLocalsInit]
+    private static unsafe void SplitKvCombineWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<SplitKvCtx>((void*)ctxPtr);
+        int H = ctx.NumHeads, hd = ctx.HeadDim;
+        float* tmp = stackalloc float[hd];
+        while (true)
+        {
+            int h = Interlocked.Increment(ref ctx.Next) - 1;
+            if (h >= H) break;
+            float M = float.NegativeInfinity;
+            for (int r = 0; r < ctx.Ranges; r++) M = MathF.Max(M, ctx.PartM[r * H + h]);
+            var o = new Span<float>(ctx.Output + (long)h * hd, hd);
+            o.Clear();
+            float den = 0f;
+            for (int r = 0; r < ctx.Ranges; r++)
+            {
+                int p = r * H + h;
+                float w = ctx.PartS[p] * MathF.Exp(ctx.PartM[p] - M);
+                den += w;
+                ReadOnlySpan<float> part;
+                if (ctx.PartF16 != null)
+                {
+                    TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(ctx.PartF16 + (long)p * hd, hd), new Span<float>(tmp, hd));
+                    part = new ReadOnlySpan<float>(tmp, hd);
+                }
+                else
+                {
+                    part = new ReadOnlySpan<float>(ctx.PartF32 + (long)p * hd, hd);
+                }
+                TensorPrimitives.MultiplyAdd(part, w, o, o);
+            }
+            TensorPrimitives.Multiply(o, 1f / den, o);
+        }
+    }
+
+    /// <summary>
+    /// Split-KV partials of the calling (dispatching) thread: per (range, head) max and sum (F32) and the normalised output (F16, or
+    /// F32 for the control arm). Grown on demand, never shrunk; freed by the finalizer at thread exit or by
+    /// <see cref="TrimTurboQuantTileBuffers(ComputeThreadPool?)"/>.
+    /// </summary>
+    private sealed unsafe class SplitKvPartialBuffers
+    {
+        public float* M, S, O32;
+        public Half* O16;
+        private long _slots, _o16, _o32;
+
+        /// <summary>Slots currently allocated (test hook for the growth policy).</summary>
+        internal long Slots => _slots;
+
+        public void Ensure(int slots, int headDim, bool f16)
+        {
+            bool f32 = !f16;
+            // Geometric growth (#1927 review M1): decode adds a range every 256 keys, so exact-fit growth would free and re-allocate
+            // on the hot path every 256 tokens. Doubling bounds that to O(log context) re-allocations.
+            if (_slots < slots)
+            {
+                if (M != null) { NativeMemory.AlignedFree(M); NativeMemory.AlignedFree(S); }
+                slots = (int)Math.Min(int.MaxValue, Math.Max(slots, 2L * _slots));
+                M = (float*)NativeMemory.AlignedAlloc((nuint)slots * sizeof(float), 64);
+                S = (float*)NativeMemory.AlignedAlloc((nuint)slots * sizeof(float), 64);
+                _slots = slots;
+            }
+            slots = (int)_slots;
+            long need = (long)slots * headDim;
+            if (!f32 && _o16 < need)
+            {
+                if (O16 != null) NativeMemory.AlignedFree(O16);
+                O16 = (Half*)NativeMemory.AlignedAlloc((nuint)need * 2, 64);
+                _o16 = need;
+            }
+            if (f32 && _o32 < need)
+            {
+                if (O32 != null) NativeMemory.AlignedFree(O32);
+                O32 = (float*)NativeMemory.AlignedAlloc((nuint)need * sizeof(float), 64);
+                _o32 = need;
+            }
+        }
+
+        public void Free()
+        {
+            if (M != null) NativeMemory.AlignedFree(M);
+            if (S != null) NativeMemory.AlignedFree(S);
+            if (O16 != null) NativeMemory.AlignedFree(O16);
+            if (O32 != null) NativeMemory.AlignedFree(O32);
+            M = S = O32 = null; O16 = null; _slots = _o16 = _o32 = 0;
+        }
+
+        ~SplitKvPartialBuffers() => Free();
+    }
+
+    [ThreadStatic] private static SplitKvPartialBuffers? t_splitKvParts;
+
+    /// <summary>Split-KV partial slots (range x head) the calling thread holds; 0 when none (test hook).</summary>
+    internal static long SplitKvPartialSlotsOnThisThread => t_splitKvParts?.Slots ?? 0;
 
     // ──────────────────── Bidirectional encoder attention (#1402) ────────────────────
 
@@ -1729,7 +2071,7 @@ public static class Attention
         if (blockedTq)
         {
 
-            TqTileBuffers tiles = t_tqTiles ??= new TqTileBuffers();
+            KvTileBuffers tiles = t_kvTiles ??= new KvTileBuffers();
             tiles.Ensure(TqRingRows(in ctx) * ctx.HeadDim);
             if (TqTileBufferObserver is { } tileObserver) tileObserver.Value = 2L * TqRingRows(in ctx) * ctx.HeadDim * sizeof(float);
         }
@@ -1949,13 +2291,16 @@ public static class Attention
     private static int TqRingRows(in TiledKvCtx ctx) => ctx.SlidingWindowSize > 0 ? 2 * ctx.TileSize : ctx.TileSize;
 
     /// <summary>
-    /// Per-thread decoded K/V tile ring (native, 64-byte aligned, grown on demand). Deliberate, bounded exception to the "wrap all
+    /// Per-thread dense K/V tile buffers (native, 64-byte aligned, grown on demand): the decoded tile ring of the blocked TurboQuant
+    /// prefill, the packed F32 tile of <see cref="BlockedCausalItem"/> and the split-KV per-tile scores and accumulators (#1927). A
+    /// worker runs one kernel at a time, so they share one holder. (The split-KV partials, which DO grow with context, live in
+    /// <see cref="SplitKvPartialBuffers"/>.) Deliberate, bounded exception to the "wrap all
     /// unmanaged memory in a deterministically disposed owner" rule (#1892): the ring is one worker thread's scratch, at most
     /// <c>4 * TileSize * headDim * 4</c> bytes (512 KiB at hd 128, with a sliding window), never scales with the cached length, and is
     /// reused across layers and calls so the hot path allocates nothing. It is freed by this holder's finalizer when the thread exits;
     /// <see cref="TrimTurboQuantTileBuffers(ComputeThreadPool?)"/> frees it deterministically (the model calls it on dispose).
     /// </summary>
-    private sealed unsafe class TqTileBuffers
+    private sealed unsafe class KvTileBuffers
     {
         public float* K;
         public float* V;
@@ -1978,10 +2323,10 @@ public static class Attention
             Floats = 0;
         }
 
-        ~TqTileBuffers() => Free();
+        ~KvTileBuffers() => Free();
     }
 
-    [ThreadStatic] private static TqTileBuffers? t_tqTiles;
+    [ThreadStatic] private static KvTileBuffers? t_kvTiles;
 
     /// <summary>
     /// Frees the TurboQuant decode-tile buffers of the calling thread and, when <paramref name="pool"/> is given, of the workers its
@@ -1989,13 +2334,10 @@ public static class Attention
     /// exits and the holder's finalizer runs). Idempotent; buffers are re-grown on the next blocked call. Call it from the owner of a pool when the
     /// model is disposed, before the pool is.
     /// </summary>
-    public static unsafe void TrimTurboQuantTileBuffers(ComputeThreadPool? pool)
-    {
-        if (pool is null) { TrimTileBuffersWorker(0, 0, 1); return; }
-        pool.Dispatch(0, &TrimTileBuffersWorker);
-    }
+    public static void TrimTurboQuantTileBuffers(ComputeThreadPool? pool) => CpuKernelScratch.Trim(pool);
 
-    private static void TrimTileBuffersWorker(nint _, int __, int ___) => t_tqTiles?.Free();
+    /// <summary>Frees the calling thread's attention scratch: the dense K/V tile holder and the split-KV partials (idempotent).</summary>
+    internal static void FreeThreadScratch() { t_kvTiles?.Free(); t_splitKvParts?.Free(); }
 
     /// <summary>
     /// Flash-style multi-row path for an in-place TurboQuant cache: key tiles outer, query rows inner. Each K/V tile is decoded ONCE
@@ -2014,7 +2356,7 @@ public static class Attention
         int kvHeadIdx = firstHead / ctx.GroupSize;
         int window = ctx.SlidingWindowSize;
         float softCap = ctx.SoftCap;
-        TqTileBuffers tiles = t_tqTiles!;
+        KvTileBuffers tiles = t_kvTiles!;
         float* kRing = tiles.K;
         float* vRing = tiles.V;
 
@@ -2136,4 +2478,15 @@ public static class Attention
             }
         }
     }
+}
+
+/// <summary>Partial-output storage of the CPU split-KV decode attention kernel (#1927 E2c).</summary>
+public enum DecodeSplitKvPartials
+{
+    /// <summary>Kernel off: decode runs the per-head tiled online-softmax path.</summary>
+    Off = 0,
+    /// <summary>Range outputs stored as F16 (default); running max and sum stay F32.</summary>
+    F16 = 1,
+    /// <summary>Range outputs stored as F32 (control arm for the F16 quality gate).</summary>
+    F32 = 2,
 }

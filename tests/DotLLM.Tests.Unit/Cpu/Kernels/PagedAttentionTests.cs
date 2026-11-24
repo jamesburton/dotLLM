@@ -11,6 +11,7 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 /// kernel over the same (decoded) rows. Pages are interleaved with another live sequence's pages so logical and physical
 /// order differ; lengths cross both block and tile boundaries. Adapted from Cheongroach's PagedAttention tests.
 /// </summary>
+[Collection("AttentionStaticSwitches")]
 public sealed unsafe class PagedAttentionTests
 {
     private const int BlockSize = 16;
@@ -109,7 +110,10 @@ public sealed unsafe class PagedAttentionTests
         float scale = 1f / MathF.Sqrt(HeadDim);
         fixed (float* qp = q, kp = keys, vp = values, ep = expected, sp = serial, pp = parallel)
         {
-            Attention.Execute(qp, kp, vp, ep, 1, length, Heads, KvHeads, HeadDim, length - 1, scale, workers);
+            // The reference is the contiguous TILED path: pin it (the default contiguous decode past 2,048 keys is split-KV, #1927 E2c,
+            // which is not bit-identical by design).
+            using (Attention.OverrideDecodeSplitKvOnThisThread(DecodeSplitKvPartials.Off))
+                Attention.Execute(qp, kp, vp, ep, 1, length, Heads, KvHeads, HeadDim, length - 1, scale, workers);
             Attention.Execute(qp, cache, 0, sp, 1, Heads, KvHeads, HeadDim, length - 1, scale, null);
             Attention.Execute(qp, cache, 0, pp, 1, Heads, KvHeads, HeadDim, length - 1, scale, workers);
         }
