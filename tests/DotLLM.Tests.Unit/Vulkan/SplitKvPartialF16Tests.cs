@@ -33,6 +33,18 @@ public sealed class SplitKvPartialF16Tests
 
     private const float Tolerance = 1e-3f;
 
+    /// <summary>Unit roundoff of an F16 store (round to nearest, 10 explicit mantissa bits): 2^-11.</summary>
+    internal const float F16UnitRoundoff = 4.8828125e-4f;
+
+    /// <summary>
+    /// The extra absolute error F16 O partials may add to a split-KV decode output, for tests that compare against an F32 reference
+    /// (#1959). Derivation: the merge forms out = sum_s a_s * o_s with a_s = exp(m_s - M) * l_s / L &gt;= 0 and sum_s a_s = 1 (F32), and
+    /// each stored o_s is that split's normalised output, a convex combination of its V rows, so |o_s| &lt;= max|V|. Storing o_s in F16
+    /// moves it by at most u * |o_s| &lt;= u * max|V| (u = 2^-11), and a convex combination of those errors is bounded by the same
+    /// u * max|V|. The bound does not grow with the context or the split count; the caller's F32 reduction-order term is added on top.
+    /// </summary>
+    internal static float F16PartialAbsBound(float maxAbsV) => F16UnitRoundoff * maxAbsV;
+
     public static TheoryData<VulkanKvStorage, int, int, int, int> Cases() => new()
     {
         { VulkanKvStorage.F16, 32, 8, 128, 1000 },

@@ -30,6 +30,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 public sealed class VulkanF16KvAttentionKernelTests
 {
     private const float AbsTol = 1e-4f;
+    private const float KvScale = 3f;   // K / V draws are uniform in [-KvScale, KvScale] before F16 rounding
     private const float RelTol = 1e-3f;
     private const float CoopmatAbsTol = 1e-3f;
     private const float CoopmatRelTol = 1e-2f;
@@ -62,19 +63,31 @@ public sealed class VulkanF16KvAttentionKernelTests
     public void SplitKv_Decode_ReadsF16InPlace(int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset, bool gqa)
     {
         Assert.True(VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads));
-        RunParity(1, seqKv, numHeads, numKvHeads, headDim, positionOffset, AbsTol, RelTol,
-            (device, spvDir, storage) =>
-            {
-                var kernel = VulkanSplitKvAttentionKernel.Create(device, spvDir, storage);
-                kernel.PreferGqa = gqa;
-                Assert.Equal(gqa, kernel.UsesGqa(numHeads, numKvHeads, headDim));
-                return (kernel, (q, k, v, o) =>
+        // #1959: both split-partial formats. F32 partials at the original F32 tolerance; the default F16 O partials (v2 grouped pass
+        // only, #1926 E4) at that tolerance plus the derived F16 bound u * max|V| (SplitKvPartialF16Tests.F16PartialAbsBound; the rows
+        // are F16-rounded draws in [-KvScale, KvScale]).
+        foreach (bool partF16 in new[] { false, true })
+        {
+            bool v2Taken = false;
+            RunParity(1, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+                AbsTol + (partF16 ? SplitKvPartialF16Tests.F16PartialAbsBound(KvScale) : 0f), RelTol,
+                (device, spvDir, storage) =>
                 {
-                    long before = kernel.GqaDispatches;
-                    kernel.Launch(q, k, v, o, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset);
-                    Assert.Equal(gqa ? before + 1 : before, kernel.GqaDispatches);
+                    var kernel = VulkanSplitKvAttentionKernel.Create(device, spvDir, storage);
+                    kernel.PreferGqa = gqa;
+                    kernel.PreferPartF16 = partF16;
+                    Assert.Equal(gqa, kernel.UsesGqa(numHeads, numKvHeads, headDim));
+                    v2Taken = kernel.UsesGqa2(numHeads, numKvHeads, headDim);
+                    return (kernel, (q, k, v, o) =>
+                    {
+                        long before = kernel.GqaDispatches;
+                        kernel.Launch(q, k, v, o, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+                        Assert.Equal(gqa ? before + 1 : before, kernel.GqaDispatches);
+                        Assert.Equal(partF16 && v2Taken, kernel.LastPartF16);
+                    });
                 });
-            });
+            if (!v2Taken) break;   // only the v2 pass has an F16-partial arm
+        }
     }
 
     /// <summary>The scalar flash prefill (the hd256 wide variants on a device without cooperative matrices, e.g. the Arc).</summary>
@@ -168,8 +181,8 @@ public sealed class VulkanF16KvAttentionKernelTests
 
         // K / V with a spread of magnitudes so the F16 rounding is not a no-op, then rounded once: the F16 cache holds exactly these.
         int kvElems = seqKv * numKvHeads * headDim;
-        float[] k = RandomFloats(rng, kvElems, 3f);
-        float[] v = RandomFloats(rng, kvElems, 3f);
+        float[] k = RandomFloats(rng, kvElems, KvScale);
+        float[] v = RandomFloats(rng, kvElems, KvScale);
         ushort[] kHalf = new ushort[kvElems], vHalf = new ushort[kvElems];
         for (int i = 0; i < kvElems; i++)
         {

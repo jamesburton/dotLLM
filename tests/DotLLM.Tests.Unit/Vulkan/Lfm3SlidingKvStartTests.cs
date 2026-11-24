@@ -79,16 +79,26 @@ public sealed class Lfm3SplitKvWindowTests
         using var vB = device.Allocate(v.Length * 4L);
         using var oB = device.Allocate(q.Length * 4L);
         device.Upload(q, qB); device.Upload(k, kB); device.Upload(v, vB);
-        using (var ctx = device.CreateSubmitContext())
+        // #1959: both split-partial formats where the v2 pass runs; F16 O partials (#1926 E4) add the derived bound u * max|V|
+        // (SplitKvPartialF16Tests.F16PartialAbsBound).
+        bool v2 = split.UsesGqa2(numHeads, numKvHeads, headDim);
+        foreach (bool partF16 in v2 ? new[] { false, true } : new[] { false })
         {
-            ctx.Begin();
-            split.Record(ctx.CommandBuffer, qB, kB, vB, oB, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset: pos, slidingWindow: window, kvStart: kvStart);
-            ctx.SubmitAndWait();
+            split.PreferPartF16 = partF16;
+            using (var ctx = device.CreateSubmitContext())
+            {
+                ctx.Begin();
+                split.Record(ctx.CommandBuffer, qB, kB, vB, oB, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset: pos, slidingWindow: window, kvStart: kvStart);
+                ctx.SubmitAndWait();
+            }
+            Assert.Equal(partF16, split.LastPartF16);
+            float[] actual = new float[q.Length];
+            device.Download(oB, actual);
+            float maxAbs = expected.Max(MathF.Abs);
+            float extra = partF16 ? SplitKvPartialF16Tests.F16PartialAbsBound(v.Max(MathF.Abs)) : 0f;
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(MathF.Abs(expected[i] - actual[i]) <= 1e-4f * maxAbs + 1e-5f + extra,
+                    $"i={i} (head {i / headDim}, {(partF16 ? "F16" : "F32")} partials): cpu {expected[i]:G7} vs split {actual[i]:G7}");
         }
-        float[] actual = new float[q.Length];
-        device.Download(oB, actual);
-        float maxAbs = expected.Max(MathF.Abs);
-        for (int i = 0; i < expected.Length; i++)
-            Assert.True(MathF.Abs(expected[i] - actual[i]) <= 1e-4f * maxAbs + 1e-5f, $"i={i} (head {i / headDim}): cpu {expected[i]:G7} vs split {actual[i]:G7}");
     }
 }
