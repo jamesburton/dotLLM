@@ -1683,6 +1683,9 @@ public sealed unsafe class HybridTransformerModel : IModel
         _stream.Dispose();
         _context.Dispose();
 
+        // #1927: free this thread's CPU kernel scratch (attention tiles, split-KV partials, Q4_K row-lane tile); an owned pool trims its
+        // workers when it is disposed.
+        DotLLM.Cpu.Kernels.CpuKernelScratch.Trim(null);
         if (_ownsThreadPool)
             _threadPool?.Dispose();
         _cpuState.Dispose();

@@ -284,10 +284,17 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static void GemmR4TiledQ4_K(byte* repackedWeights, float* b, byte* inputQ, float* c,
         int fullGroups, int tailRows, int superBlockCount, int m, int k, int n, ComputeThreadPool? pool)
-        => GemmR4Tiled(repackedWeights, b, inputQ, c, fullGroups, tailRows, superBlockCount, m, k, n,
+    {
+        if (Q4KRowLaneApplies(m, tailRows, n))
+        {
+            GemmQ4KRowLaneEntry(repackedWeights, b, inputQ, c, superBlockCount, m, k, n, pool);
+            return;
+        }
+        GemmR4Tiled(repackedWeights, b, inputQ, c, fullGroups, tailRows, superBlockCount, m, k, n,
             Q4_K_BlockBytes, superBlockCount * Q8_K_BlockBytes,
             &ComputeRowsQ4_KInterleaved, &QuantizeF32ToQ8_K, pool,
             FastKQuantIsa ? &Rows4Tokens4 : null);
+    }
 
     /// <inheritdoc cref="GemmR4Tiled"/>
     [SkipLocalsInit]

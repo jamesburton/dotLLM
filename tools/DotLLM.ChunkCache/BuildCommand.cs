@@ -100,10 +100,24 @@ internal static class BuildCommand
 
     /// <summary>Test hook: runs after the index is saved (index lock held, store lock not), before the registry save and the
     /// publication check.</summary>
-    internal static Action? TestHookAfterIndexSave { get; set; }
+    internal static Action? TestHookAfterIndexSave
+    {
+        get => s_afterIndexSave.Value;
+        set => s_afterIndexSave.Value = value;
+    }
+
+    // Per async flow, like TestHookAfterOwnerLock: a process-wide hook set by one test ran inside another test's parallel build
+    // (an MCP test) and called the first test's ITestOutputHelper after it had finished ("There is no currently active test").
+    private static readonly AsyncLocal<Action?> s_afterIndexSave = new();
 
     /// <summary>Test hook: runs after the publication check, with no lock held, before the first encode.</summary>
-    internal static Action? TestHookBeforeEncode { get; set; }
+    internal static Action? TestHookBeforeEncode
+    {
+        get => s_beforeEncode.Value;
+        set => s_beforeEncode.Value = value;
+    }
+
+    private static readonly AsyncLocal<Action?> s_beforeEncode = new();
 
     /// <summary>How the missing chunks are handled.</summary>
     private enum EncodeMode

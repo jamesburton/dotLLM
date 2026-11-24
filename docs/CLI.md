@@ -924,6 +924,8 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 |---|---|---|
 | `DOTLLM_AMAX_PROBE` | True when DOTLLM_AMAX_PROBE names an output file. | `ActivationRangeProbe.cs` |
 | `DOTLLM_CPU_ATTN_BLOCKED` | Environment variable: 0 disables ExecuteBlockedCausal (the head-parallel per-row path runs instead; A/B). | `Attention.cs` |
+| `DOTLLM_CPU_ATTN_PACK` | Environment variable: 0 makes BlockedCausalItem read K/V slices in place instead of from a dense packed tile (#1927 A/B; the output is bit-identical either way). | `Attention.cs` |
+| `DOTLLM_CPU_ATTN_SPLITKV` | Environment variable selecting the split-KV decode kernel's partial-output storage: f16 (default), f32 (control arm) or 0 (off: the per-head TiledRow path). | `Attention.cs` |
 | `DOTLLM_CPU_BF16_512` | BF16 weight GEMV/GEMM by shift-widening (#1118). BF16 is the top half of an F32, so bf16 &lt;&lt; 16 is the exact F32 value: every tier widens 4/8/16 weights in registers (vpmovzxwd + vpslld) and multiplies into F32 accumulator... | `MatMul.Bf16.cs` |
 | `DOTLLM_CPU_BF16_KERNEL` | BF16 weight GEMV/GEMM by shift-widening (#1118). BF16 is the top half of an F32, so bf16 &lt;&lt; 16 is the exact F32 value: every tier widens 4/8/16 weights in registers (vpmovzxwd + vpslld) and multiplies into F32 accumulator... | `MatMul.Bf16.cs` |
 | `DOTLLM_CPU_BF16_SCRATCH` | A/B switch between the two bit-identical AVX2/FMA GEMM forms: the register tile (default) and the F16-style four-row F32 scratch (DOTLLM_CPU_BF16_SCRATCH=1). Settable for in-process A/B. | `MatMul.Bf16.cs` |
@@ -934,6 +936,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_CPU_NVFP4_ROWS8` | Whether the 8-row NVFP4 kernel can run (AVX2 gather/permutes; VNNI optional). | `MatMulNvfp4.Rows8.cs` |
 | `DOTLLM_CPU_POWER_THROTTLE_OPTOUT` | Whether compute threads opt out of Windows execution-speed power throttling (EcoQoS). On by default; DOTLLM_CPU_POWER_THROTTLE_OPTOUT=0 keeps the OS default (A/B baseline, #1675). llama.cpp's ggml-cpu does the same for every co... | `CpuAffinity.cs` |
 | `DOTLLM_CPU_PROF` | True when DOTLLM_CPU_PROF=1. | `CpuStageProf.cs` |
+| `DOTLLM_CPU_Q4K_ROWLANE` | Runtime switch for the Q4_K row-lane GEMM: default ON (James 2026-11-22), DOTLLM_CPU_Q4K_ROWLANE=0 off. Settable for in-process A/B and quality gates. Not bit-identical to the R4 kernels (closer to float64); see the class remarks. | `MatMulQ4KRowLane.cs` |
 | `DOTLLM_CPU_Q4_FLOOR_PROBE` | Diagnostic (DOTLLM_CPU_Q4_FLOOR_PROBE=1, #1584): route packed legacy GEMMs through the single-row AVX2 dot to measure float-order sensitivity. | `MatMulLegacyQuants.cs` |
 | `DOTLLM_CPU_Q4_PACKED_PREFILL` | Q4_0 / Q4_1 on AVX2 take the packed path at every column count (#1159). Their eight-row multi-column kernel (ComputeRowsQ4MultiAvx2_8Rows) unpacks and transposes each block once for all columns and is bit-exact per column with... | `MatMulLegacyQuants.cs` |
 | `DOTLLM_CPU_Q8_ROWS8` | Eight-row transposed int8 Q8_0 x Q8_0 kernels on AVX-VNNI (#1119): the Q4_0/Q4_1 eight-row pattern of #1159 applied to Q8_0. Why. The production Q8_0 prefill kernel (Q8_0Rows4Tokens4Avx2) spends about six vector ops per row per... | `MatMul.Q8_0Rows8.cs` |
