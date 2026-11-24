@@ -659,15 +659,29 @@ public static class ServerStartup
         }
     }
 
+    /// <summary>The load-time modifier set of <see cref="ServerState.WeightModifiers"/>.</summary>
+    internal static IReadOnlyList<(string Kind, string Id, string ContentDigest)> WeightModifiersOf(string? overlayDigest, IDisposable? ternaryAdapters)
+    {
+        var list = new List<(string, string, string)>();
+        if (overlayDigest is not null)
+            list.Add((DotLLM.Core.Identity.ModifierSetDigest.KindOverlay, "", overlayDigest));
+        if (ternaryAdapters is TernaryAdapterAttach.Handle handle)
+            foreach (string d in handle.ContentDigests)
+                list.Add((DotLLM.Core.Identity.ModifierSetDigest.KindTernaryAdapter, "", d));
+        return list;
+    }
+
     private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
     {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
         var gguf = GgufFile.Open(resolvedPath);
+        string? overlayDigest = null;
         if (options.TensorOverlayPath is { } overlayPath)
         {
             try
             {
                 var ov = TensorOverlay.Attach(gguf, resolvedPath, overlayPath, verifyBaseHash: !options.OverlaySkipBaseHash);
+                overlayDigest = ov.ContentDigest();   // from the mapped bytes the model will run on, before anything else touches them (#1915)
                 foreach (string note in ov.Notes) Console.WriteLine($"[dotllm] {note}");
                 Console.WriteLine($"[dotllm] Tensor overlay '{overlayPath}': {ov.Count} tensor(s)" + (options.OverlaySkipBaseHash ? " (base hash NOT verified)." : "."));
             }
@@ -1151,6 +1165,7 @@ public static class ServerStartup
         {
             Options = options,
             TernaryAdapters = ternaryAdapters,
+            WeightModifiers = WeightModifiersOf(overlayDigest, ternaryAdapters),
             Config = config,
             ToolCallParser = toolCallParser,
             KvCacheConfig = kvConfig,

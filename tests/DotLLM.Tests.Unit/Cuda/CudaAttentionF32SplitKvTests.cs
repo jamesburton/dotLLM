@@ -116,7 +116,7 @@ public class CudaAttentionF32SplitKvTests
         unsafe
         {
             fixed (float* pq = q, pk = k, pv = v, pOut = cpuOut)
-                Attention.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
+                AttentionTiledReference.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
                     positionOffset, pool: null, slidingWindowSize: null);
         }
 
@@ -275,7 +275,7 @@ public class CudaAttentionF32SplitKvTests
         unsafe
         {
             fixed (float* pq = q, pk = k, pv = v, pOut = cpuOut)
-                Attention.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
+                AttentionTiledReference.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
                     positionOffset, pool: null, slidingWindowSize: null, sinks: sinks);
         }
 
@@ -392,7 +392,7 @@ public class CudaAttentionF32SplitKvTests
         unsafe
         {
             fixed (float* pq = q, pk = k, pv = v, pOut = cpuOut)
-                Attention.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
+                AttentionTiledReference.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
                     positionOffset, pool: null, slidingWindowSize: null);
         }
 
@@ -549,7 +549,7 @@ public class CudaAttentionF32SplitKvTests
                 unsafe
                 {
                     fixed (float* pq = q, pk = kAll, pv = vAll, pOut = cpuOut)
-                        Attention.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
+                        AttentionTiledReference.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
                             positionOffset, pool: null, slidingWindowSize: null);
                 }
 

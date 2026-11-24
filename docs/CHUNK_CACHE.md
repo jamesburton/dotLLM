@@ -211,11 +211,16 @@ request reports `cached_tokens` > 0, and a verified chunk wholly inside that res
   and that warning once (rulings 42; strict: 400) until applied reuse ships. On a model or backend that cannot assemble
   chunks (recurrent or hybrid layers, a diffusion model, a backend other than CPU or Vulkan, a RoPE variant the
   re-rotation does not reproduce, or a model whose identity cannot be computed) every annotation is ignored with
-  `chunk_model_unsupported` (strict: 400); `reason` carries it when the requested policy was not `exact` (ruling 41). A server started with `--tensor-overlay` or
-  `--ternary-adapter` is unsupported too: the model id covers the base GGUF only, so its K/V must not be stored or looked up
-  under the base key (#1915). A `/v1/chat/completions` (or `explain`) request with `lora_adapter` is refused the same way,
-  per request: its annotations are `chunk_model_unsupported`, nothing is looked up, recorded or queued, and the next request
-  without an adapter is unaffected (#1915 puts adapters into the identity).
+  `chunk_model_unsupported` (strict: 400); `reason` carries it when the requested policy was not `exact` (ruling 41). Weights the base GGUF's model id does not cover are part of the
+  identity (#1915): the SHA-256 of the `--tensor-overlay` file and of each `--ternary-adapter` file, and of a request's
+  `lora_adapter` (its rank, alpha and every factor byte; not its name), go into an order-stable modifier digest
+  (`ModifierSetDigest`) that `ChunkFingerprint.WithModifiers` folds into the fingerprint. Contents, never paths: the same
+  files elsewhere, or listed in another order, are the same key space; any other set is a different one, so a base entry is a
+  `miss` under an adapter and the reverse. With no modifiers the fingerprint is exactly the one written before #1915, so
+  existing entries stay valid for the base model and the store layout and index version are unchanged. A request with
+  `lora_adapter` is looked up under its own keys but **never admits** (no sighting, no queue): the background encoder runs the served
+  model without the adapter. The overlay and adapter files are hashed once per loaded model, at the first annotated request
+  (an unreadable file makes the identity unsupported, `chunk_model_unsupported`, never a base-keyed one).
   Diffusion models get no report.
 - **Per located span**, in prompt order, at most `MaxPlannedSpans` (1,024) per request:
   1. ids = `ChunkTokenization.Encode(text)` (`EncodeRaw(MarkUntrustedSpecials(text))`, ruling 21);

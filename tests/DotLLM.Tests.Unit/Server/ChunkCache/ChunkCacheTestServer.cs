@@ -67,9 +67,10 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
     /// <param name="configure">Runs on the app before the endpoints are mapped (test middleware: a remote address, the rate limiter).</param>
     /// <param name="logs">Receives the host's <c>ILogger</c> output (every level).</param>
     /// <param name="device">The serving device (<c>cpu</c> by default; GPU-gated tests pass <c>vulkan</c>).</param>
+    /// <param name="customize">Adjusts the server options before the model loads (e.g. a tensor overlay or ternary adapter).</param>
     public static async Task<ChunkCacheTestServer> StartAsync(string modelPath, ChunkCacheOptions chunkCache, bool paged = true,
         bool schedulerTrie = false, Action<WebApplication>? configure = null, Microsoft.Extensions.Logging.ILoggerProvider? logs = null,
-        string device = "cpu")
+        string device = "cpu", Func<ServerOptions, ServerOptions>? customize = null)
     {
         var options = new ServerOptions
         {
@@ -83,6 +84,8 @@ internal sealed class ChunkCacheTestServer : IAsyncDisposable
             // Since #1596 the Vulkan single-request path gets a device PrefixCache that would serve a repeated chunk as `prefix`, not `miss`/`hit`.
             PromptCacheEnabled = device != "vulkan",
         };
+        if (customize is not null)
+            options = customize(options);
         var state = ServerStartup.LoadModel(modelPath, options);
         state.ChunkCacheRuntime.StoreFiguresTtl = TimeSpan.Zero; // tests read the store figures right after changing the store
         if (schedulerTrie)

@@ -1,6 +1,7 @@
 using DotLLM.ChunkReuse;
 using DotLLM.ChunkReuse.Backends;
 using DotLLM.ChunkReuse.Store;
+using DotLLM.Core.Identity;
 using DotLLM.Core.Models;
 using DotLLM.Models.Gguf;
 
@@ -21,10 +22,39 @@ namespace DotLLM.Server.ChunkCache;
 /// <param name="Fingerprint">The model fingerprint hashed into every key.</param>
 /// <param name="Rope">RoPE parameters hashed into every key.</param>
 /// <param name="UnsupportedReason">Why chunk reuse cannot apply to this model or backend (<c>chunk_model_unsupported</c>), or null.</param>
+/// <param name="BaseFingerprint">The fingerprint of the unmodified model (null: <paramref name="Fingerprint"/> is it).</param>
+/// <param name="Modifiers">
+/// What changes the weights without changing the base file (#1915): <c>--tensor-overlay</c>, <c>--ternary-adapter</c> and a request's LoRA, as
+/// (kind, id, content digest). Folded into <paramref name="Fingerprint"/> (<see cref="ChunkFingerprint.WithModifiers"/>); empty for the base model.
+/// </param>
 internal sealed record ServerModelIdentity(
     string ModelId, string TokenizerId, string Quantization, string Backend, KvDtype KvDtype, string Fingerprint,
-    RopeParameters Rope, string? UnsupportedReason)
+    RopeParameters Rope, string? UnsupportedReason, string? BaseFingerprint = null,
+    IReadOnlyList<(string Kind, string Id, string ContentDigest)>? Modifiers = null)
 {
+    /// <summary>
+    /// This identity with <paramref name="extra"/> modifiers added to those it already has. The fingerprint becomes the fold of
+    /// the unmodified model's fingerprint and the order-stable digest of the whole set, so a different set (or none) is a different
+    /// key space. An unsupported identity is returned unchanged.
+    /// </summary>
+    /// <param name="extra">(kind, id, content digest) per modifier to add.</param>
+    /// <returns>The identity.</returns>
+    public ServerModelIdentity WithModifiers(IEnumerable<(string Kind, string Id, string ContentDigest)> extra)
+    {
+        ArgumentNullException.ThrowIfNull(extra);
+        var added = extra.ToArray();
+        if (!Supported || added.Length == 0)
+            return this;
+        var all = (Modifiers ?? []).Concat(added).ToArray();
+        string baseFp = BaseFingerprint ?? Fingerprint;
+        return this with
+        {
+            BaseFingerprint = baseFp,
+            Modifiers = all,
+            Fingerprint = ChunkFingerprint.WithModifiers(baseFp, ModifierSetDigest.Compute(all)),
+        };
+    }
+
     /// <summary>Whether chunk keys can be computed for this model (not recurrent, hybrid, diffusion, or on a backend without assembly).</summary>
     public bool Supported => UnsupportedReason is null;
 
