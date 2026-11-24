@@ -54,23 +54,35 @@ public abstract class GenerationSessionBackendSuite
     {
         float[] full = RawLastLogits(oracle, tokens, tokens.Length, perturb: false);
         float raw = MaxAbsDiff(full, RawLastLogits(oracle, tokens, Math.Max(1, tokens.Length / 2), perturb: false));
-        float ulp = oracle.Arm is null ? 0f : MaxAbsDiff(full, RawLastLogits(oracle, tokens, tokens.Length, perturb: true));   // may be 0 on one sequence; OneUlpArm_IsObservable proves the arm can disagree
+        // Path-matched 1-ULP arm: the reference runs with the SAME hook attached nudging 0 ULPs, so a backend that changes kernel path whenever a
+        // modifier is set (CUDA bypasses its decode/step graphs) does not leak a path change into the ULP sensitivity. The unhooked-vs-attached-0
+        // difference is reported separately as the path delta and is NOT part of the bound.
+        float ulp = 0f, pathDelta = 0f;
+        if (oracle.Arm is not null)
+        {
+            float[] attached0 = RawLastLogits(oracle, tokens, tokens.Length, perturb: false, attachedNoOp: true);
+            pathDelta = MaxAbsDiff(full, attached0);
+            ulp = MaxAbsDiff(attached0, RawLastLogits(oracle, tokens, tokens.Length, perturb: true));   // may be 0 on one sequence; OneUlpArm_IsObservable proves the arm can disagree
+            // The path delta must be explained: exactly 0 where attaching changes nothing (CPU), below the sanity ceiling elsewhere (a different kernel path).
+            if (oracle.Backend == SessionBackend.Cpu) Assert.Equal(0f, pathDelta);
+            Assert.True(pathDelta <= ControlSanityCeiling, $"{oracle.Backend}: attaching the hook moved the logits by {pathDelta:E3}, above the sanity ceiling");
+        }
         float control = Math.Max(raw, ulp);
         string? log = Environment.GetEnvironmentVariable("DOTLLM_SESSION_CONTROL_LOG");
         if (!string.IsNullOrEmpty(log))
-            File.AppendAllText(log, $"{oracle.Backend} n={tokens.Length} ARMS ulp1={ulp:E3} raw={raw:E3}{Environment.NewLine}");
+            File.AppendAllText(log, $"{oracle.Backend} n={tokens.Length} ARMS ulp1(path-matched)={ulp:E3} raw={raw:E3} pathDelta(unhooked-vs-attached0)={pathDelta:E3}{Environment.NewLine}");
         Assert.True(control <= ControlSanityCeiling, $"{oracle.Backend}: control {control:E3} exceeds the sanity ceiling {ControlSanityCeiling:E1}");
         return control;
     }
 
     /// <summary>Last-row logits after a raw forward of <paramref name="tokens"/>: the first <paramref name="firstChunk"/> tokens batched, the rest one row at a time.</summary>
-    private static unsafe float[] RawLastLogits(GenerationSessionFixture fx, int[] tokens, int firstChunk, bool perturb)
+    private static unsafe float[] RawLastLogits(GenerationSessionFixture fx, int[] tokens, int firstChunk, bool perturb, bool attachedNoOp = false)
     {
         var model = fx.Model;
         using var kv = fx.NewKvCache(tokens.Length + 1);
         if (model.RequiresPerSequenceState) model.ResetSequenceState();
-        var arm = perturb ? fx.Arm! : null;
-        arm?.Attach();
+        var arm = perturb || attachedNoOp ? fx.Arm! : null;
+        if (attachedNoOp) arm!.AttachNoOp(); else arm?.Attach();
         try
         {
             var pos = new int[tokens.Length];
@@ -107,7 +119,8 @@ public abstract class GenerationSessionBackendSuite
         var arm = fx.Arm;
         Assert.NotNull(arm);
         int[] tokens = [.. fx.Prompt, .. fx.Observation];
-        float[] clean = RawLastLogits(fx, tokens, tokens.Length, perturb: false);
+        // Path-matched: the reference has the same hook attached and nudges 0 ULPs, so only the ULP can differ (attaching alone changes the CUDA path).
+        float[] clean = RawLastLogits(fx, tokens, tokens.Length, perturb: false, attachedNoOp: true);
         int firedBefore = arm.Fired;
         float[] moved = RawLastLogits(fx, tokens, tokens.Length, perturb: true);
         Assert.Equal(1, arm.Fired - firedBefore);   // the hook ran (an uncalled hook is a dead seam, not an absorbed perturbation)
@@ -121,10 +134,10 @@ public abstract class GenerationSessionBackendSuite
     /// The seam is inert when unset (James 2026-11-22). With the modifier cleared (the hook never attached): (1) after an attach-perturb-detach
     /// cycle the logits are BIT-identical to before it, on the prefill and the decode path (no residue: a latched bypass, a stale descriptor or
     /// graph, a left-behind modifier); (2) managed bytes per forward and the backend's path fingerprint (Vulkan fence waits, CUDA eager-decode /
-    /// graph-launch counters) are identical before and after; (3) an unset forward allocates no more managed bytes, and waits on the device no more
-    /// often, than a forward with a modifier attached that never applies (that one pays an AppliesTo call per layer and, on the GPU backends, leaves
-    /// the fused / graphed decode), so a hook that allocates or syncs on the unset path is caught on the backends where attaching changes nothing
-    /// else (CPU), and by (1)-(2) everywhere it leaves residue.
+    /// graph-launch counters) are identical before and after; (3) like with like on every backend: unset-before-attach vs unset-after-attach-and-detach (same path)
+    /// allocate the same managed bytes within the same-run spread; (4) CPU only: an unset forward allocates no more than one with a modifier attached
+    /// that never applies. That comparison is invalid on a GPU, where attaching ANY modifier leaves the replayed graph / fused decode for the eager path,
+    /// so the two arms are different paths (CUDA hybrid-dense, deterministic: unset 8624 B vs attached 7192 B).
     /// </summary>
     [SkippableTheory]
     [MemberData(nameof(Families), MemberType = typeof(GenerationSessionFixture))]
@@ -147,29 +160,43 @@ public abstract class GenerationSessionBackendSuite
                 if (fx.Backend != SessionBackend.Cuda) Assert.Equal(bytesBefore, bytesAfter);   // CUDA: bounded by the same-run spread in (3) instead (allocation noise there is real)
                 Assert.Equal(fpBefore, fpAfter);
 
-                // (3) the unset path against a modifier that is attached and never applies. Arms alternate (inapplicable, unset, inapplicable),
-                // each arm warmed and measured as a minimum over several forwards. The noise floor is a same-run control: the spread of the
-                // repeated identical-arm minimums (the two attached-inapplicable runs, the three unset runs). It is 0 on CPU (exact), so a hook
-                // that allocates on the unset path dies there; on a GPU, first-call / pooled-buffer / ordering noise (observed: CUDA hybrid-dense
-                // unset 8624 B vs inapplicable 7192 B) is bounded by what identical arms themselves disagree by.
-                long inapplicableBytes, inapplicable2; string fpInapplicable;
-                arm.Attach(layer: int.MaxValue);
-                try
-                {
-                    RawLastLogits(fx, tokens, firstChunk, perturb: false);
-                    (_, inapplicableBytes, fpInapplicable) = MeasureUnset(fx, tokens, firstChunk);
-                }
-                finally { arm.Detach(); }
+                // (3) like with like. Unset-before-attach vs unset-after-attach-and-detach (the SAME path, so allocations and logits are comparable on
+                // every backend): a second pre-attach measurement gives the same-run spread, and neither post-detach run may exceed the pre-attach
+                // minimum by more than it. Exactly 0 on CPU (deterministic), so a leak on the unset path dies there too.
+                var (_, bytesBefore2, _) = MeasureUnset(fx, tokens, firstChunk);
                 var (_, unset3, fpUnset3) = MeasureUnset(fx, tokens, firstChunk);
-                arm.Attach(layer: int.MaxValue);
-                try { (_, inapplicable2, _) = MeasureUnset(fx, tokens, firstChunk); }
-                finally { arm.Detach(); }
-                long[] unsetRuns = [bytesBefore, bytesAfter, unset3];
-                long[] inappRuns = [inapplicableBytes, inapplicable2];
-                long spread = Math.Max(unsetRuns.Max() - unsetRuns.Min(), inappRuns.Max() - inappRuns.Min());
-                Assert.True(unsetRuns.Min() <= inappRuns.Min() + spread, $"{fx.Backend}/{family}: the unset forward allocates {unsetRuns.Min()} B (runs {string.Join("/", unsetRuns)}), more than the attached-inapplicable {inappRuns.Min()} B (runs {string.Join("/", inappRuns)}) plus the same-run spread {spread} B");
-                if (fx.Backend == SessionBackend.Cpu) Assert.Equal(0, spread);   // the CPU path is deterministic: the control must be exactly 0, so the comparison is exact there
-                Assert.True(FenceWaits(fpBefore) <= FenceWaits(fpInapplicable), $"{fx.Backend}/{family}: the unset forward waited more on the device ({fpBefore}) than the attached-inapplicable one ({fpInapplicable})");
+                long[] pre = [bytesBefore, bytesBefore2];
+                long[] post = [bytesAfter, unset3];
+                long spread = pre.Max() - pre.Min();
+                Assert.True(post.Max() <= pre.Min() + spread, $"{fx.Backend}/{family}: after an attach/detach cycle the unset forward allocates {post.Max()} B (runs {string.Join("/", post)}), more than before it {pre.Min()} B (runs {string.Join("/", pre)}) plus the same-run spread {spread} B");
+                Assert.Equal(fpBefore, fpUnset3);
+                string fpInapplicable = "n/a";
+                long inapplicableBytes = -1;
+                if (fx.Backend == SessionBackend.Cpu)
+                {
+                    // (4) CPU only: attaching a modifier changes nothing else on the CPU path (a null-check vs an AppliesTo call per layer), so the unset
+                    // path must allocate no more than an attached-never-applying hook. A hook that allocates on the unset path (an alloc in the CPU
+                    // modifier branch) is caught here and nowhere else, since it is in both the before and after runs of (2). NOT valid on a GPU:
+                    // there attaching ANY modifier leaves the replayed CUDA graph / fused decode for the eager path (measured on CUDA hybrid-dense,
+                    // unset 8624 B vs attached 7192 B, deterministic), so the two arms are different paths with different managed-allocation profiles.
+                    long inapplicable2;
+                    arm.Attach(layer: int.MaxValue);
+                    try
+                    {
+                        RawLastLogits(fx, tokens, firstChunk, perturb: false);
+                        (_, inapplicableBytes, fpInapplicable) = MeasureUnset(fx, tokens, firstChunk);
+                    }
+                    finally { arm.Detach(); }
+                    arm.Attach(layer: int.MaxValue);
+                    try { (_, inapplicable2, _) = MeasureUnset(fx, tokens, firstChunk); }
+                    finally { arm.Detach(); }
+                    long[] unsetRuns = [bytesBefore, bytesBefore2, bytesAfter, unset3];
+                    long[] inappRuns = [inapplicableBytes, inapplicable2];
+                    long cpuSpread = Math.Max(unsetRuns.Max() - unsetRuns.Min(), inappRuns.Max() - inappRuns.Min());
+                    Assert.Equal(0, cpuSpread);   // deterministic: the control is exactly 0, so the comparison below is exact
+                    Assert.True(unsetRuns.Min() <= inappRuns.Min(), $"{fx.Backend}/{family}: the unset forward allocates {unsetRuns.Min()} B (runs {string.Join("/", unsetRuns)}), more than the attached-inapplicable {inappRuns.Min()} B (runs {string.Join("/", inappRuns)})");
+                    Assert.True(FenceWaits(fpBefore) <= FenceWaits(fpInapplicable), $"{fx.Backend}/{family}: the unset forward waited more on the device ({fpBefore}) than the attached-inapplicable one ({fpInapplicable})");
+                }
                 string? log = Environment.GetEnvironmentVariable("DOTLLM_SESSION_CONTROL_LOG");
                 if (!string.IsNullOrEmpty(log))
                     File.AppendAllText(log, $"{fx.Backend}/{family} UNSET chunk={firstChunk} bytes={bytesBefore} fp[{fpBefore}] | attached-inapplicable bytes={inapplicableBytes} fp[{fpInapplicable}]{Environment.NewLine}");
