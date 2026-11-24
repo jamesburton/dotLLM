@@ -244,10 +244,13 @@ public class VulkanSplitKvAttentionKernelTests
         // Issue #1102: both split passes, the per-query-head one and (where the shape allows) the GQA-grouped one, against the
         // same CPU reference at the same tolerance.
         // Issue #1161: the grouped pass twice, v1 and (where the shape and device allow) v2.
-        foreach (var (gqa, v2) in new[] { (false, false), (true, false), (true, true) })
+        // #1959: the v2 pass twice, F32 partials at the F32 tolerance and the default F16 O partials (#1926 E4) with the derived
+        // F16 bound u * max|V| added (SplitKvPartialF16Tests.F16PartialAbsBound; V is uniform in [-1, 1]).
+        foreach (var (gqa, v2, partF16) in new[] { (false, false, false), (true, false, false), (true, true, false), (true, true, true) })
         {
             kernel.PreferGqa = gqa;
             kernel.PreferGqa2 = v2;
+            kernel.PreferPartF16 = partF16;
             if (gqa && !kernel.UsesGqa(numHeads, numKvHeads, headDim)) continue;
             if (v2 && !kernel.UsesGqa2(numHeads, numKvHeads, headDim)) continue;
             kernel.Launch(bufQ, bufK, bufV, bufOut,
@@ -258,7 +261,9 @@ public class VulkanSplitKvAttentionKernelTests
             float[] actual = new float[expected.Length];
             device.Download(bufOut, actual);
 
-            AssertClose(expected, actual, seqQ, seqKv, numHeads, numKvHeads, headDim);
+            Assert.Equal(partF16, kernel.LastPartF16);
+            float absTol = AbsTol + (partF16 ? SplitKvPartialF16Tests.F16PartialAbsBound(vh.Max(MathF.Abs)) : 0f);
+            AssertClose(expected, actual, seqQ, seqKv, numHeads, numKvHeads, headDim, absTol);
         }
     }
 
@@ -271,7 +276,7 @@ public class VulkanSplitKvAttentionKernelTests
     }
 
     private static void AssertClose(float[] expected, float[] actual,
-        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim)
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, float absTol = AbsTol)
     {
         Assert.Equal(expected.Length, actual.Length);
         int errors = 0;
@@ -284,7 +289,7 @@ public class VulkanSplitKvAttentionKernelTests
             float rel = diff / MathF.Max(MathF.Abs(e), 1e-7f);
             if (diff > maxAbs) maxAbs = diff;
             if (rel > maxRel) maxRel = rel;
-            if (diff > AbsTol && rel > RelTol) errors++;
+            if (diff > absTol && rel > RelTol) errors++;
         }
         Assert.True(errors == 0,
             $"Split-KV attention drift exceeded tolerance " +
