@@ -36,6 +36,12 @@
     <EmbeddedResource Include="McpSchemas\*.output.json" />
   </ItemGroup>
 
+  <!-- The tool bundles DotLLM.ChunkCache.Client.dll, which is MIT: its licence travels with every copy (see NOTICE). -->
+  <ItemGroup>
+    <None Include="..\..\src\DotLLM.ChunkCache.Client\LICENSE" Pack="true" PackagePath="THIRD-PARTY-NOTICES\DotLLM.ChunkCache.Client\" Visible="false" />
+    <None Include="..\..\NOTICE" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
   <ItemGroup>
     <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
   </ItemGroup>

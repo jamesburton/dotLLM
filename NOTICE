@@ -1,0 +1,7 @@
+dotLLM
+
+This repository is licensed under the GNU General Public License v3.0 only (GPL-3.0-only; see LICENSE), with one
+exception: the chunk-cache client library in src/DotLLM.ChunkCache.Client (NuGet package DotLLM.ChunkCache.Client) is
+licensed under the MIT License, Copyright (c) 2026 James Burton and contributors (see src/DotLLM.ChunkCache.Client/LICENSE),
+so that applications under any licence can link it. Its source files carry SPDX-License-Identifier: MIT headers. GPL-3.0-only
+packages that bundle the client, such as the chunkcache dotnet tool, ship its MIT licence under THIRD-PARTY-NOTICES/DotLLM.ChunkCache.Client/.

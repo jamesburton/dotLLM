@@ -72,6 +72,8 @@ repo variable names: `CHUNKCACHE_TOOL_PACKAGE_ID` (the tool; also renames the pa
 (must equal `DotLLM.ChunkCache.Client`, whose id is fixed in its csproj). Unset = that package is skipped, independently of
 `DOTLLM_TOOL_PACKAGE_ID`. Every push to `dev` creates a `0.3.0-dev.<n>` prerelease and publishes each package whose variable is
 set, so set the variables only once the PRs are merged. Run it with `dnx dotllm-chunkcache --prerelease -- mcp --help`.
+The tool bundles the MIT client, so its nupkg carries the client licence at `THIRD-PARTY-NOTICES/DotLLM.ChunkCache.Client/LICENSE`
+and the repository `NOTICE` (the client is the repository's one MIT exception). Other bundled dependencies' notices: #1964.
 
 Availability checked on nuget.org on 2026-10-05:
 
