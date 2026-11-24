@@ -191,10 +191,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel, IVulk
         }
     }
 
+    /// <summary><see cref="VulkanNemotronHKvCache.BufferEpoch"/> when this model last dropped its descriptor caches.</summary>
+    private long _seenKvBufferEpoch = -1;
+
     /// <summary>Creates a sparse <see cref="VulkanNemotronHKvCache"/> sized for this model.</summary>
     public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen)
         => new(_device, _kvSlotForLayer, _attentionLayerCount,
-               Config.NumKvHeads, Config.HeadDim, maxSeqLen);
+               Config.NumKvHeads, Config.HeadDim, maxSeqLen,
+               growthLimit: Config.MaxSequenceLength);   // may grow to the context window, admitted against free memory (#1919)
 
     /// <summary>Creates a sparse KV cache with an explicit element format and (optionally) lazy growth (Qwen4-Exp, issue #437).</summary>
     /// <param name="maxSeqLen">Initial logical capacity in positions.</param>
@@ -798,6 +802,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel, IVulk
         }
 
         bool resized = _state.EnsureCapacity(seqLen);
+        // An eager KV growth between forwards (a session's TryGrowTo, issue #1919) frees and re-creates the K/V buffers: drop the
+        // handle-keyed descriptor caches, a recycled handle would otherwise bind a set naming the freed buffer and read zeros.
+        resized |= VulkanNemotronHKvCache.PrepareForForward(null, 0, ref _seenKvBufferEpoch);
         if (resized) { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); ResidualModifier?.InvalidateDescriptorCache(); }
 
         // Rows the LM head covers (#1188): every row of a short batch (a speculative verify is K+1 rows and is indexed row by row), the last

@@ -278,7 +278,27 @@ public sealed unsafe partial class CudaQwen3MoeHybridTransformerModel : IModel, 
     /// K/V storage is owned internally by this model (a per-attention-layer F16 device
     /// cache) — the returned handle only communicates the capacity to <see cref="Forward(System.ReadOnlySpan{int}, System.ReadOnlySpan{int}, int, IKvCache?)"/>.
     /// </summary>
-    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen);
+    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen, CanGrowKvStorageTo);   // EnsureF16KvCache keeps rows on growth (#1919)
+
+    /// <summary>
+    /// Admission for <see cref="CudaHybridKvCacheHandle.TryGrowTo"/> (issue #1919): the growth copies, so the new storage must fit
+    /// in free device memory beside the old, leaving <see cref="VramReserveBytes"/>. A refusal makes the handle report it cannot grow.
+    /// </summary>
+    /// <param name="maxLength">The handle's requested length.</param>
+    /// <returns><see langword="true"/> when the growth may proceed.</returns>
+    internal bool CanGrowKvStorageTo(int maxLength)
+    {
+        if (maxLength <= _f16CacheMaxSeqLen) return true;
+        long newBytes = (long)maxLength * Config.NumKvHeads * Config.HeadDim * sizeof(ushort) * 2L * _attentionLayerCount;
+        return DeviceMemoryBudget.Fits(QueryFreeDeviceBytes(), newBytes, VramReserveBytes);
+    }
+
+    private long QueryFreeDeviceBytes()
+    {
+        _context.MakeCurrent();
+        CudaDriverApi.cuMemGetInfo_v2(out nuint free, out _).ThrowOnError();
+        return (long)free;
+    }
 
     private CudaQwen3MoeHybridTransformerModel(
         ModelConfig config,
@@ -2423,26 +2443,69 @@ public sealed unsafe partial class CudaQwen3MoeHybridTransformerModel : IModel, 
     {
         if (_f16KCache is not null && maxSeqLen <= _f16CacheMaxSeqLen) return;
 
-        // Free any existing buffers (resize).
-        if (_f16KCache is not null)
+        // Growth keeps the live rows [0, _f16CacheCurrentLength) (issue #1919): a session grows its handle past the initial
+        // capacity (CudaHybridKvCacheHandle.TryGrowTo) and the rows already written live in this storage. A new handle has
+        // already reset the live length to 0 (see _lastForwardKvCache), so nothing is copied for an unrelated sequence.
+        int keepRows = _f16KCache is null ? 0 : Math.Min(_f16CacheCurrentLength, _f16CacheMaxSeqLen);
+        long bytesPerLayer = (long)maxSeqLen * numKvHeads * headDim * sizeof(ushort);
+        if (keepRows == 0)
         {
-            for (int i = 0; i < _f16KCache.Length; i++)
-            {
-                if (_f16KCache[i] != 0) CudaDriverApi.cuMemFree_v2(_f16KCache[i]);
-                if (_f16VCache![i] != 0) CudaDriverApi.cuMemFree_v2(_f16VCache[i]);
-            }
+            FreeF16KvStorage(_f16KCache, _f16VCache);
+            _f16KCache = null;
+            _f16VCache = null;
+            _f16CacheMaxSeqLen = 0;
+            _f16CacheCurrentLength = 0;
         }
 
-        _f16KCache = new nint[_attentionLayerCount];
-        _f16VCache = new nint[_attentionLayerCount];
-        long bytesPerLayer = (long)maxSeqLen * numKvHeads * headDim * sizeof(ushort);
-        for (int i = 0; i < _attentionLayerCount; i++)
+        // Admit against free device memory before allocating (never spill); a copying growth holds old and new together.
+        AdmitDeviceGrowth(bytesPerLayer * 2L * _attentionLayerCount, $"F16 KV cache for {maxSeqLen} tokens");
+
+        var newK = new nint[_attentionLayerCount];
+        var newV = new nint[_attentionLayerCount];
+        try
         {
-            _f16KCache[i] = AllocDevice(bytesPerLayer);
-            _f16VCache[i] = AllocDevice(bytesPerLayer);
+            for (int i = 0; i < _attentionLayerCount; i++)
+            {
+                newK[i] = AllocDevice(bytesPerLayer);
+                newV[i] = AllocDevice(bytesPerLayer);
+            }
+            if (keepRows > 0)
+            {
+                long keepBytes = (long)keepRows * numKvHeads * headDim * sizeof(ushort);
+                nint streamH = _stream.Handle;
+                for (int i = 0; i < _attentionLayerCount; i++)
+                {
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(newK[i], _f16KCache![i], (nuint)keepBytes, streamH).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(newV[i], _f16VCache![i], (nuint)keepBytes, streamH).ThrowOnError();
+                }
+                _stream.Synchronize();   // the old buffers are freed below
+            }
         }
+        catch
+        {
+            if (keepRows > 0)
+            {
+                try { _stream.Synchronize(); } catch { /* a faulted stream: free regardless */ }
+            }
+            FreeF16KvStorage(newK, newV);
+            throw;
+        }
+
+        FreeF16KvStorage(_f16KCache, _f16VCache);
+        _f16KCache = newK;
+        _f16VCache = newV;
         _f16CacheMaxSeqLen = maxSeqLen;
-        _f16CacheCurrentLength = 0;
+        _f16CacheCurrentLength = keepRows;
+    }
+
+    private static void FreeF16KvStorage(nint[]? k, nint[]? v)
+    {
+        if (k is null) return;
+        for (int i = 0; i < k.Length; i++)
+        {
+            if (k[i] != 0) CudaDriverApi.cuMemFree_v2(k[i]);
+            if (v![i] != 0) CudaDriverApi.cuMemFree_v2(v[i]);
+        }
     }
 
     /// <summary>

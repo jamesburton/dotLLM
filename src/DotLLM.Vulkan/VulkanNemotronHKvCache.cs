@@ -394,6 +394,7 @@ public sealed class VulkanNemotronHKvCache : IKvCache, IKvLengthRollback
         if (maxLength > _growthLimit) return false;
         if (!_lazy && _attentionLayerCount > 0)
         {
+            if (!AdmitEagerGrowth(maxLength)) return false;
             try { GrowTo(maxLength); }
             catch (VulkanException e) when (e.ErrorCode is VulkanOutOfDeviceMemory or VulkanOutOfHostMemory)
             {
@@ -407,6 +408,29 @@ public sealed class VulkanNemotronHKvCache : IKvCache, IKvLengthRollback
 
         _maxSeqLen = maxLength;
         return true;
+    }
+
+    /// <summary>
+    /// Admission for an eager growth (issue #1919): the new K/V buffers must fit in the device's free resident capacity (capacity minus
+    /// this process's live bytes minus other processes' GPU memory) beside the reserve, BEFORE any buffer is allocated, so a refused growth
+    /// leaves the cache untouched. The refusal is printed with its numbers (never silent). Where the free figure cannot be read the
+    /// allocation attempt (and its out-of-memory catch) is the admission.
+    /// </summary>
+    private bool AdmitEagerGrowth(int newLength)
+    {
+        long perLayerNew = 2L * newLength * _kvStride * _elemBytes;
+        // Net growth once every layer is swapped, plus one layer's new buffers alive while its old ones are still held.
+        long required = 2L * _attentionLayerCount * (newLength - _allocLength) * _kvStride * _elemBytes + perLayerNew;
+        long capacity = _device.ResidentCapacityBytes();
+        long other = 0;
+        try { other = _device.ReadOtherProcessPressure()?.OtherBytes ?? 0; } catch (Exception) { /* diagnostics only */ }
+        long free = capacity - _device.ResidentLiveBytes() - other;
+        long reserve = Core.Configuration.DeviceMemoryBudget.ResolveReserveBytes(
+            Environment.GetEnvironmentVariable(Core.Configuration.DeviceMemoryBudget.ReserveEnvVar));
+        if (Core.Configuration.DeviceMemoryBudget.Fits(free, required, reserve)) return true;
+        Console.Error.WriteLine("[dotllm] ERROR: " + Core.Configuration.DeviceMemoryBudget.DescribeRefusal(
+            $"the KV cache grown to {newLength} positions", required, free, reserve));
+        return false;
     }
 
     /// <summary>

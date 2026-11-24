@@ -16,7 +16,9 @@ public sealed partial class TextGenerator
     /// append observation tokens, roll back, all without re-prefilling the committed prefix.
     /// </summary>
     /// <param name="options">Sampling options (temperature, seed, penalties) and the per-segment <see cref="InferenceOptions.MaxTokens"/>.
-    /// <see cref="InferenceOptions.ResponseFormat"/> is not supported here.</param>
+    /// <see cref="InferenceOptions.ResponseFormat"/> is not supported here. <see cref="InferenceOptions.RepeatGuardLimit"/> follows the plain generator
+    /// (the limit-th identical sampled token in a row ends the segment, token kept, <see cref="FinishReason.Length"/>); the run survives pauses and
+    /// rollback restores it, but an observation append or prefill ends it (intended: those tokens are supplied, not sampled).</param>
     /// <param name="provenanceTag">Identity of the weights, tokenizer, precision, modifiers and knowledge the session's cached state belongs to.</param>
     /// <param name="currentProvenance">Live view of the provenance the orchestrator is running under (adapters, LoRA, knowledge snapshot).
     /// Every session operation compares it with <paramref name="provenanceTag"/> and throws <see cref="InvalidOperationException"/> naming the
@@ -57,6 +59,13 @@ public sealed partial class TextGenerator
     public const int DefaultInitialContextTokens = 4096;
 
     /// <summary>
+    /// Test hook (issue #1919): when positive, a default session (<c>maxContextTokens</c> 0) starts at this many tokens instead of
+    /// <see cref="DefaultInitialContextTokens"/> and still grows to the model maximum. Lets a test with a small context window reach the
+    /// growth path that a real model reaches at 4096.
+    /// </summary>
+    internal int InitialContextTokensForTest { get; set; }
+
+    /// <summary>
     /// Fields of <see cref="InferenceOptions"/> a session cannot honour are refused rather than silently ignored (see docs/GENERATION_SESSION.md for the table).
     /// </summary>
     private static void ThrowIfOptionsUnsupported(InferenceOptions options)
@@ -78,7 +87,7 @@ public sealed partial class TextGenerator
         IKvCache? kv = null;
         try
         {
-            int size = maxContextTokens > 0 ? maxContextTokens : Math.Min(DefaultInitialContextTokens, modelMax);
+            int size = maxContextTokens > 0 ? maxContextTokens : Math.Min(InitialContextTokensForTest > 0 ? InitialContextTokensForTest : DefaultInitialContextTokens, modelMax);
             int ceiling = maxContextTokens > 0 ? maxContextTokens : modelMax;
             kv = AllocateKvCache(size);
             if (recurrent) _model.ResetSequenceState();   // a previous request left model-owned state behind

@@ -169,6 +169,46 @@ public sealed class ChunkCacheMcpTests : IClassFixture<ChunkCacheCliTests.Fixtur
         }
     }
 
+    /// <summary>
+    /// #1947: <c>BuildCommand</c>'s test hooks were process-wide, so a hook one test class set (it calls that test's
+    /// <c>ITestOutputHelper</c>) ran inside another class's parallel build and threw "There is no currently active test."
+    /// into this test's tool call. A hook must stay in the async flow that set it.
+    /// </summary>
+    [Fact]
+    public async Task BuildTestHooks_SetByAnotherFlow_DoNotRunInThisBuild()
+    {
+        string[] Args(string store, string tree) => ["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--offline", "--lab"];
+        int foreign = 0, own = 0;
+        using var hooksSet = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        Task otherTest = Task.Run(() =>
+        {
+            BuildCommand.TestHookAfterIndexSave = () => Interlocked.Increment(ref foreign);
+            BuildCommand.TestHookBeforeEncode = () => Interlocked.Increment(ref foreign);
+            hooksSet.Set();
+            release.Wait(TimeSpan.FromSeconds(60));
+        });
+        try
+        {
+            Assert.True(hooksSet.Wait(TimeSpan.FromSeconds(30)));
+            var o = new StringWriter();
+            var err = new StringWriter();
+            Assert.True(ChunkCacheCli.Run(Args(NewDir("store"), NewTree()), o, err, _fx.Scratch, null, _ => null) == 0, err.ToString());
+            Assert.Equal(0, Volatile.Read(ref foreign)); // another flow's hooks did not run here
+
+            // Control: a hook set in THIS flow does run (the assertion above could otherwise pass because hooks never fire).
+            BuildCommand.TestHookAfterIndexSave = () => own++;
+            try { Assert.Equal(0, ChunkCacheCli.Run(Args(NewDir("store"), NewTree()), new StringWriter(), new StringWriter(), _fx.Scratch, null, _ => null)); }
+            finally { BuildCommand.TestHookAfterIndexSave = null; }
+            Assert.Equal(1, own);
+        }
+        finally
+        {
+            release.Set();
+            await otherTest;
+        }
+    }
+
     [Fact]
     public async Task Prewarm_FromASelection_SendsTheChunkTextOnly()
     {

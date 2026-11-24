@@ -44,6 +44,8 @@ public sealed class GenerationSession : IAsyncDisposable
     // prompt / observation, or k == 0). The guard's live (token, run) is always derivable from (_history, _runAt, _position), which is what makes
     // RollbackTo restore it exactly.
     private int[] _runAt = new int[65];
+    // InferenceOptions.RepeatGuardLimit on a session: plain-generator semantics (#1291). The run survives pauses and is restored by RollbackTo; an
+    // observation append or prefill ENDS it (intended, James 2026-11-24: those tokens are supplied, not sampled).
     private readonly RepeatGuardStopCondition? _repeatGuard;
     private readonly CommittedView _committed;
     private int _position;
@@ -156,6 +158,9 @@ public sealed class GenerationSession : IAsyncDisposable
     /// Runs full-layer prefill (KV and recurrent state, every layer) of externally supplied <paramref name="tokens"/> after the
     /// committed prefix. Observation tokens are never sampled and never constrained. Throws <see cref="InvalidOperationException"/>
     /// before any forward when they would not fit the KV capacity.
+    /// <para><b>Repeat guard (intended, James 2026-11-24).</b> An observation append (and a prefill) ENDS the repeat-guard run: the appended tokens
+    /// are externally supplied, not sampled, so a run of identical sampled tokens is never carried across them, even though the sampler history
+    /// (all committed tokens) includes them. <c>RollbackTo</c> restores exactly the run that stood at the target position.</para>
     /// </summary>
     public ValueTask AppendObservationTokensAsync(ReadOnlyMemory<int> tokens, CancellationToken cancellationToken = default)
         => AppendCore(tokens, cancellationToken);
