@@ -5318,6 +5318,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
         nint qArg = q, kArg = k, vArg = v, oArg = output;
         int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, poArg = positionOffset;
         float scArg = 1f / MathF.Sqrt(headDim);
+        if (FlashPrefillKvqScaleUlpNudge != 0)   // #1953 control arm only: one F32 ulp on the softmax scale
+            scArg = FlashPrefillKvqScaleUlpNudge > 0 ? MathF.BitIncrement(scArg) : MathF.BitDecrement(scArg);
         void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &sqArg, &skvArg, &nhArg, &nkvArg, &poArg, &scArg };
         CudaDriverApi.cuLaunchKernel(fn,
                 (uint)((seqQ + 15) / 16), (uint)numKvHeads, 1, (uint)(group * 32), 1, 1,
@@ -5477,6 +5479,12 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// perturbation of an otherwise unchanged entry. Its KL-to-F16 movement is the drift band the depth gate's tolerance comes from.
     /// </summary>
     internal static int TqPrefillScaleUlpNudge;
+
+    /// <summary>
+    /// #1953 sensitivity control for the F16 flash KL gate (James 2026-11-24, as #1928): +1 / -1 moves the kvq flash prefill's
+    /// softmax scale by one F32 ulp, an arm that differs from the real one by a single rounding. 0 (default) in production.
+    /// </summary>
+    internal static int FlashPrefillKvqScaleUlpNudge;
 
     /// <summary>
     /// An unrecognised non-empty <c>DOTLLM_CUDA_TQ_PREFILL</c> is said once on stderr (an A/B arm labelled with a typo would otherwise

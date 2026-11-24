@@ -25,8 +25,12 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <item><b>Gate (James 2026-11-21)</b>, per-row KL against the exact arm (G3, G-flash and the F16 flash prefill off:
 /// <c>attention_f16</c>, F32 softmax) over the last 256 prompt rows: median at most 1e-5, and max at most
 /// max(1e-3, 1.25 x the G3 arm's max). A relative max bar: G3, the path this replaces, does not meet an absolute 1e-3 either
-/// (framework 2026-11-20 over 21 rows: G3 max 7.1e-3, flash 4.3e-3; both round P to F16 for a tensor-core P.V). First-token
-/// logprob within 0.01 nats; top-1 agreement reported, not gated (a near-tie may flip on a quantized model).</item>
+/// (framework 2026-11-20 over 21 rows: G3 max 7.1e-3, flash 4.3e-3; both round P to F16 for a tensor-core P.V). Since #1953 the
+/// G3 arm is the FIXED G3 (P x 2^15 in its FP16 plane; James 2026-11-24). First-token logprob (James 2026-11-24, as #1928):
+/// within K = 2 x the larger movement of two same-run control arms, the flash arm with its softmax scale one F32 ulp up and down
+/// (<c>CudaKernels.FlashPrefillKvqScaleUlpNudge</c>); a control that does not move fails the test. It replaces a fixed 0.01,
+/// which sat inside this Q4_K_M model's digitisation noise (G3 itself moved 0.016). Top-1 agreement reported, not gated (a
+/// near-tie may flip on a quantized model).</item>
 /// <item><b>Sensitivity (review M1, framework 2026-11-22).</b> A subtle mutant, the F16 entry's softmax scale x (1 + 1/1024), raises
 /// the max KL from 5.2e-3 to 9.8e-3 against a bound of 7.2e-3 (1.25 x G3's 5.7e-3): killed by the max bar. The median only moves
 /// 2.25e-9 -> 2.40e-9, so the median bar is a coarse guard (no tightening can see this mutant with margin); the max bar is the
@@ -106,7 +110,7 @@ public sealed class CudaF16FlashPrefillTests
         var kv = new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32);   // the dense F16 CudaKvCache
 
         bool g3 = CudaG3Attention.Enabled, flash = CudaFlashAttention.Enabled, f16Flash = CudaTransformerModel.EnableF16FlashPrefill;
-        List<float[]> exact, fresh, g3Arm;
+        List<float[]> exact, fresh, g3Arm, ctrlUp, ctrlDown;
         long flashLaunches, offsetRuns, scalarPrefills;
         long? g3OffsetRuns, exactScalar;   // null = that arm came from the cache, so its launch counts are not re-checked
         try
@@ -132,6 +136,17 @@ public sealed class CudaF16FlashPrefillTests
             flashLaunches = CudaKernels.AttentionFlashPrefillF16Launches - f0;
             offsetRuns = CudaG3Attention.OffsetRunCount - o0;
             scalarPrefills = CudaKernels.AttentionF16PrefillLaunches - s0;
+
+            // #1953 sensitivity control (James 2026-11-24, as #1928): the same flash arm with the softmax scale one F32 ulp up and
+            // down. Their first-token movement is what a single rounding does on this instrument; the bar is derived from it.
+            try
+            {
+                CudaKernels.FlashPrefillKvqScaleUlpNudge = 1;
+                ctrlUp = Run(model, kv, prompt);
+                CudaKernels.FlashPrefillKvqScaleUlpNudge = -1;
+                ctrlDown = Run(model, kv, prompt);
+            }
+            finally { CudaKernels.FlashPrefillKvqScaleUlpNudge = 0; }
         }
         finally
         {
@@ -143,6 +158,11 @@ public sealed class CudaF16FlashPrefillTests
         double[] kl = Kl(exact, fresh), klG3 = Kl(exact, g3Arm);
         int next = Argmax(exact[^1]);   // the exact arm's first generated token
         double lpExact = LogProb(exact[^1], next), lpFresh = LogProb(fresh[^1], next);
+        // First-token bar (James 2026-11-24): K x the larger first-token movement of the two 1-ulp control arms, measured against the
+        // flash arm itself (a control that cannot move is rejected below). K = 2, as #1928's option B.
+        const double K = 2.0;
+        double ctrlShift = Math.Max(Math.Abs(LogProb(ctrlUp[^1], next) - lpFresh), Math.Abs(LogProb(ctrlDown[^1], next) - lpFresh));
+        double lpBar = K * ctrlShift;
         int top1 = Enumerable.Range(0, Rows).Count(r => Argmax(fresh[r]) == Argmax(exact[r]));
         int top1G3 = Enumerable.Range(0, Rows).Count(r => Argmax(g3Arm[r]) == Argmax(exact[r]));
         _out.WriteLine($"prompt {prompt.Length} tokens: prefix {prefix} in chunks of {Chunk}, then {Rows} windows of {Window}; " +
@@ -154,6 +174,8 @@ public sealed class CudaF16FlashPrefillTests
                        $"KL(exact||G3) median {Median(klG3):E3} max {klG3.Max():E3}");
         _out.WriteLine($"first-token logprob: exact {lpExact:R}, flash {lpFresh:R}, G3 {LogProb(g3Arm[^1], next):R}; " +
                        $"top-1 agreement flash {top1}/{Rows}, G3 {top1G3}/{Rows}");
+        _out.WriteLine($"1-ulp control arms: first-token logprob +1 ulp {LogProb(ctrlUp[^1], next):R}, -1 ulp {LogProb(ctrlDown[^1], next):R}; " +
+                       $"control shift {ctrlShift:E3}; bar = {K} x control = {lpBar:E3}; flash |shift| {Math.Abs(lpFresh - lpExact):E3}");
 
         if (Environment.GetEnvironmentVariable("DOTLLM_F16_FLASH_KL_REF_PTX") is { Length: > 0 } refPtx)
         {
@@ -169,9 +191,12 @@ public sealed class CudaF16FlashPrefillTests
             var refArm = Run(refModel, kv, prompt);
             CudaTransformerModel.EnableF16FlashPrefill = f16Flash;
             double[] klRef = Kl(exact, refArm), klRefNew = Kl(refArm, fresh);
+            double lpRef = LogProb(refArm[^1], next);
             _out.WriteLine($"ref build {refPtx}: KL(exact||ref flash) median {Median(klRef):E3} max {klRef.Max():E3}; " +
                            $"KL(ref flash||flash) median {Median(klRefNew):E3} max {klRefNew.Max():E3}; top-1 ref " +
-                           $"{Enumerable.Range(0, Rows).Count(r => Argmax(refArm[r]) == Argmax(exact[r]))}/{Rows}");
+                           $"{Enumerable.Range(0, Rows).Count(r => Argmax(refArm[r]) == Argmax(exact[r]))}/{Rows}; first-token |shift| " +
+                           $"{Math.Abs(lpRef - lpExact):E3} vs bar {lpBar:E3}: {(Math.Abs(lpRef - lpExact) <= lpBar ? "WITHIN" : "OUTSIDE")}; " +
+                           $"max KL vs bound {Math.Max(1e-3, 1.25 * klG3.Max()):E3}: {(klRef.Max() <= Math.Max(1e-3, 1.25 * klG3.Max()) ? "WITHIN" : "OUTSIDE")}");
         }
 
         Assert.Equal(layers * forwards, flashLaunches);
@@ -181,7 +206,9 @@ public sealed class CudaF16FlashPrefillTests
             Assert.True(g3Runs >= layers * Rows, $"the G3 reference arm ran its offset path only {g3Runs} times");
         if (exactScalar is { } exactRuns)
             Assert.True(exactRuns >= layers * forwards, $"the exact arm ran attention_f16 only {exactRuns} times");
-        Assert.True(Math.Abs(lpFresh - lpExact) < 0.01, $"first-token logprob moved {lpFresh - lpExact:R}");
+        Assert.True(ctrlShift > 0, "the 1-ulp control arms did not move the first-token logprob: no bar can be derived from them");
+        Assert.True(Math.Abs(lpFresh - lpExact) <= lpBar,
+            $"first-token logprob moved {lpFresh - lpExact:R}, above {K} x the 1-ulp control's {ctrlShift:E3} = {lpBar:E3}");
         // James 2026-11-21: relative gate, median <= 1e-5 and max <= max(1e-3, 1.25 x G3 max), over the last 256 rows.
         Assert.True(Median(kl) <= 1e-5, $"median KL(exact||flash) {Median(kl)}");
         Assert.True(kl.Max() <= Math.Max(1e-3, 1.25 * klG3.Max()), $"max KL(exact||flash) {kl.Max()} vs G3 {klG3.Max()}");
