@@ -481,7 +481,11 @@ public sealed class VulkanDevice : IDisposable
     /// <param name="DeviceType">Vulkan <c>VkPhysicalDeviceType</c> value (1 integrated, 2 discrete, ...).</param>
     /// <param name="DeviceLocalHeapBytes">Size of the largest device-local heap (0 when none is reported). This is the heap size, not free memory.</param>
     /// <param name="IsDefault">True for the device a plain <see cref="Create()"/> (scoring plus the env overrides) would pick.</param>
-    public readonly record struct PhysicalDeviceInfo(int Index, string Name, uint VendorId, int DeviceType, long DeviceLocalHeapBytes, bool IsDefault);
+    /// <param name="DeviceId">PCI device id (0 when not reported); part of the tuning-result device identity (#1902).</param>
+    /// <param name="DriverVersion">Raw <c>VkPhysicalDeviceProperties::driverVersion</c> (vendor-encoded; 0 when not reported).</param>
+    /// <param name="ApiVersion">Raw <c>VkPhysicalDeviceProperties::apiVersion</c> (0 when not reported).</param>
+    public readonly record struct PhysicalDeviceInfo(int Index, string Name, uint VendorId, int DeviceType, long DeviceLocalHeapBytes, bool IsDefault,
+        uint DeviceId = 0, uint DriverVersion = 0, uint ApiVersion = 0);
 
     /// <summary>
     /// Lists every Vulkan physical device without creating a logical device (one short-lived instance, under the lifecycle write lock like
@@ -524,7 +528,8 @@ public sealed class VulkanDevice : IDisposable
                     ulong best = 0;
                     for (uint h = 0; h < mem.memoryHeapCount && h < 16; h++)
                         if ((heaps[h * 2 + 1] & 1u) != 0 && heaps[h * 2] > best) best = heaps[h * 2];   // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
-                    result[i] = new PhysicalDeviceInfo(i, ReadDeviceName(props), props.vendorID, props.deviceType, (long)best, i == defaultIndex);
+                    result[i] = new PhysicalDeviceInfo(i, ReadDeviceName(props), props.vendorID, props.deviceType, (long)best, i == defaultIndex,
+                        props.deviceID, props.driverVersion, props.apiVersion);
                 }
                 return result;
             }

@@ -93,6 +93,21 @@ public sealed class CudaDevice
         return count;
     }
 
+    /// <summary>
+    /// The CUDA driver version the installed driver supports (<c>cuDriverGetVersion</c>, e.g. 12040), or null when it cannot be read.
+    /// A stale-level component of the tuning key (#1902). Needs no context.
+    /// </summary>
+    public static int? TryGetDriverVersion()
+    {
+        try
+        {
+            CudaLibraryResolver.Register();
+            CudaDriverApi.cuInit(0).ThrowOnError();
+            return CudaDriverApi.cuDriverGetVersion(out int v) == 0 ? v : null;
+        }
+        catch { return null; }
+    }
+
     /// <summary>Queries device properties for the given ordinal.</summary>
     public static CudaDevice GetDevice(int ordinal)
     {

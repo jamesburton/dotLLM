@@ -295,6 +295,15 @@ public sealed record ServerOptions
     /// </summary>
     public int? ContextSize { get; init; }
 
+    /// <summary>
+    /// The profile named by <c>--auto</c> (#1902); null when the server was not started with <c>--auto</c>, in which case nothing here
+    /// changes behaviour.
+    /// </summary>
+    public string? AutoProfile { get; init; }
+
+    /// <summary>Where each tuned setting came from under <c>--auto</c> (<c>flag</c>, <c>auto</c>, <c>default</c>); null without <c>--auto</c>.</summary>
+    public IReadOnlyDictionary<string, string>? SettingSources { get; init; }
+
     /// <summary>Default for <see cref="EffectiveMaxMessages"/> when <see cref="MaxMessages"/> is unset.</summary>
     public const int DefaultMaxMessages = 8192;
 

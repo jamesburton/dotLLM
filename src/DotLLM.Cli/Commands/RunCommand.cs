@@ -394,6 +394,34 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [CommandOption(DotLLM.Cli.Helpers.TensorOverlayCli.SkipHashOption)]
         [Description(DotLLM.Cli.Helpers.TensorOverlayCli.SkipHashHelp)]
         public bool OverlaySkipBaseHash { get; set; }
+
+        /// <summary>Apply the saved tuning result (#1902).</summary>
+        [CommandOption("--auto")]
+        [Description(DotLLM.Cli.Helpers.AutoCli.Help)]
+        public bool Auto { get; set; }
+
+        /// <summary>Profile looked up by <c>--auto</c>.</summary>
+        [CommandOption("--auto-profile <NAME>")]
+        [Description(DotLLM.Cli.Helpers.AutoCli.ProfileHelp)]
+        public string? AutoProfile { get; set; }
+    }
+
+    /// <summary>Copies the settings a saved tuning result chose onto <paramref name="s"/>. A null member keeps the flag or default.</summary>
+    internal static void ApplyAuto(Settings s, DotLLM.Server.Tuning.TunedSettings t)
+    {
+        if (t.Device is not null) s.Device = t.Device;
+        if (t.GpuLayers is not null) s.GpuLayers = t.GpuLayers;
+        if (t.MoeOffload is not null) s.MoeOffload = t.MoeOffload;
+        if (t.MoeCacheMib is not null) s.MoeCacheMib = t.MoeCacheMib.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (t.NCpuMoe is not null) s.NCpuMoe = t.NCpuMoe;
+        if (t.CacheTypeK is not null) s.CacheTypeK = t.CacheTypeK;
+        if (t.CacheTypeV is not null) s.CacheTypeV = t.CacheTypeV;
+        if (t.Paged is not null) s.Paged = t.Paged.Value;
+        if (t.PrefillChunkSize is not null) s.PrefillChunkSize = t.PrefillChunkSize.Value;
+        if (t.MtpEnabled is not null) s.NoMtp = !t.MtpEnabled.Value;
+        if (t.SpeculativeK is not null) s.SpeculativeK = t.SpeculativeK.Value;
+        if (t.Threads is not null) s.Threads = t.Threads.Value;
+        if (t.DecodeThreads is not null) s.DecodeThreads = t.DecodeThreads.Value;
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -416,6 +444,22 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         {
             DeviceCli.PrintError(deviceError, settings.Json);
             return 1;
+        }
+
+        // --auto (#1902): resolve the model first so its saved tuning result can be looked up, then apply it BEFORE the flag checks below,
+        // so what --auto chose is validated like any flag. Without --auto this is skipped and the order is unchanged.
+        string? hfDir = null;
+        string? resolvedPath = null;
+        if (settings.Auto)
+        {
+            hfDir = TryResolveHfDirectory(settings.Model);
+            resolvedPath = hfDir ?? GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
+            if (resolvedPath is null)
+                return 1;
+            var applied = DotLLM.Cli.Helpers.AutoCli.Resolve(DotLLM.Server.Tuning.AutoCommand.Run, settings.Model, resolvedPath, settings.Device,
+                settings.AutoProfile, 0, DotLLM.Cli.Helpers.AutoCli.RunChatSupported, settings.Json, settings.TensorOverlay,
+                settings.TernaryAdapterPaths, settings.MtpHead, settings.DFlash);
+            if (applied is not null) ApplyAuto(settings, applied.Applied);
         }
         if (MoeOffloadCli.Validate(settings.MoeValues) is { } moeError)
         {
@@ -442,19 +486,20 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         // HuggingFace safetensors directory? (config.json + *.safetensors /
         // model.safetensors.index.json). Auto-detected; loads via the
         // safetensors path instead of GGUF. The GGUF path is unchanged.
-        string? hfDir = TryResolveHfDirectory(settings.Model);
-
-        string resolvedPath;
-        if (hfDir is not null)
+        if (resolvedPath is null)
         {
-            resolvedPath = hfDir;
-        }
-        else
-        {
-            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
-            if (ggufPath is null)
-                return 1;
-            resolvedPath = ggufPath;
+            hfDir = TryResolveHfDirectory(settings.Model);
+            if (hfDir is not null)
+            {
+                resolvedPath = hfDir;
+            }
+            else
+            {
+                var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
+                if (ggufPath is null)
+                    return 1;
+                resolvedPath = ggufPath;
+            }
         }
 
         string? mtpHeadPath = null;

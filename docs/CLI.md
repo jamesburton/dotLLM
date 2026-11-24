@@ -16,6 +16,7 @@ equivalent, device selection, KV-cache sizing, and the environment variables the
 - [Model references](#model-references)
 - [Device selection](#device-selection)
 - [KV-cache sizing](#kv-cache-sizing)
+- [Auto-tuned settings (`--auto`)](#auto-tuned-settings---auto)
 - [Commands](#commands): [model](#dotllm-model) - [list](#dotllm-list) - [run](#dotllm-run) - [chat](#dotllm-chat) - [serve](#dotllm-serve) - [ps](#dotllm-ps) - [stop](#dotllm-stop) - [bench](#dotllm-bench) - [perplexity](#dotllm-perplexity) - [embed](#dotllm-embed) - [debug](#dotllm-debug-debug-builds-only)
 - [JSON output and exit codes](#json-output-and-exit-codes)
 - [Companion tool: chunkcache](#companion-tool-chunkcache)
@@ -152,6 +153,42 @@ and for recurrent/hybrid models `--prefix-snapshots`, `--prefix-snapshot-host-bu
 
 Environment equivalents of the format flags (an explicit flag wins): `DOTLLM_HYBRID_KV` (CUDA hybrid-dense: `f16|q8_0|q4_0|k8v4|k4v8`), `DOTLLM_VK_KV` (Vulkan: `f16`, `f32` for A/B),
 `DOTLLM_CUDA_KV_VMM=0` (CUDA hybrid: disable in-place KV growth), `DOTLLM_VK_QWEN4EXP_CONTEXT` and `DOTLLM_VK_QWEN4EXP_KV` (qwen4exp on Vulkan).
+
+## Auto-tuned settings (`--auto`)
+
+`--auto` on `run`, `chat`, `serve` and `bench` (#1902) applies the **saved tuning result** for this model, device and build: the placement and
+speed settings a measured search found best (device, GPU layers, MoE offload, KV format, paged or not, prefill chunk size, MTP, speculative K,
+threads, expected concurrency, context). `--auto-profile <name>` picks the profile (default `chat`; it is the only one so far).
+
+**It only reuses.** `--auto` never starts a search and never measures anything. The command that produces results, `dotllm tune`, is not in
+this release yet (#1902, slice 2); until then a result can only come from a tuning run of a later build.
+
+- **Where results live:** `~/.dotllm/tuning/<model-hash>/<scope>-<profile>.json` (`DOTLLM_TUNING_DIR` moves the root). `<model-hash>` is the
+  GGUF's SHA-256 (cached by path, size and mtime), `hf:<blob id>` for a file in the Hugging Face hub cache, or a digest of a safetensors
+  directory. `<scope>` is the device key (backend, PCI ids and GPU name, or the CPU model) for an explicit `--device`, or `auto-<machine key>`
+  for `--device auto`, whose result names the winning device; an explicit-device result is never found by `auto` or the reverse. Every file
+  carries a SHA-256 checksum of its content.
+- **The four outcomes**, printed as `auto: ...` lines (stderr with `--json`):
+
+  | Outcome | When | What runs |
+  |---|---|---|
+  | hit | the key matches and the run finished | the saved settings |
+  | stale | only a *stale-level* field differs: GPU driver or API version, OS build, dotLLM release, kernel files or kernel assemblies, .NET runtime, a `DOTLLM_*` tuning/A-B variable, the tuner protocol | the saved settings, plus a warning naming old and new values (for a variable, its name) and `dotllm tune ... --recheck` |
+  | partial | the tuning run stopped early | the saved settings, plus a warning and the `dotllm tune` command to finish |
+  | miss | no file, a damaged or hand-edited file (checksum), a different schema, model, model modifiers (overlay, ternary adapters, separate MTP or DFlash head), device, profile or KV quality budget | **today's defaults**, plus the exact `dotllm tune <model> --profile <p> [--device <d>]` command to run |
+
+- **Explicit flags win**, per setting. `--cache-type-k q8_0 --auto` keeps your K and takes the saved V. TurboQuant is the exception: a saved
+  `tq` pair is applied whole or not at all, so a flag on either side drops the saved pair (a mixed tq pair is refused, #1895).
+- **TurboQuant needs `--no-paged`**, so a saved TurboQuant result applies only to `run`, `chat`, `bench` or a single-user `serve`. A
+  multi-session `serve` drops it with a warning (tracked: it lifts when TurboQuant lands on the paged pools, #1893).
+- **Apply-time checks.** A saved placement is re-checked against free memory now: its recorded peak device bytes against the device's free
+  memory (an integrated GPU shares host RAM, so the host figure is used), and its peak host bytes against free RAM. If it no longer fits, **all**
+  saved settings are dropped and the defaults run, with the required and free bytes in the warning; nothing spills. A setting this build
+  refuses (for example a TurboQuant request the current host cannot run in place) is dropped with its reason, never replaced by another one.
+- **Context.** A result tuned at one context is applied at a larger served context with a warning that the figures were not measured at that depth.
+- **Where each value came from** is reported on `GET /v1/status` (and so `/props` `activity`) as `settings_source`: `flag`, `auto` or `default`
+  per setting ([SERVER.md](SERVER.md#model-swaps-get-v1status-and-sse-keep-alive-1023)). Without `--auto` the field is absent and nothing changes.
+- `--auto` costs one store lookup before the model loads, and nothing at all when it is not given.
 
 ## Commands
 
@@ -838,6 +875,7 @@ Some variables are read at process start, others per model load - set them befor
 | `DOTLLM_NO_PROMPT` | unset | `1` suppresses the first-run offer to install the DirectStorage runtime that `run`, `chat`, `bench` and `serve` make on Windows in an interactive terminal. |
 | `DOTLLM_DIRECTSTORAGE_DIR` | package folder | Directory holding the DirectStorage runtime DLLs. |
 | `DOTLLM_VULKAN_DIRECT_STORAGE` | off | `1` loads Vulkan weights straight from disk into device memory via DirectStorage (Windows, opt-in). |
+| `DOTLLM_TUNING_DIR` | `~/.dotllm/tuning` | Root of the saved tuning results that `--auto` reads (#1902). |
 | `DOTLLM_HASH_CACHE_DIR` | `~/.dotllm/hash-cache` | Cache of file digests used to verify `--tensor-overlay` base hashes. |
 | `DOTLLM_GGUF_MAP_COW` | off | `1` maps GGUF files copy-on-write instead of read-only. |
 | `DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER` | off | `1` loads a GGUF whose tokenizer pre-type is unknown with the GPT-2 pipeline instead of refusing (tokenization may differ from the reference). |

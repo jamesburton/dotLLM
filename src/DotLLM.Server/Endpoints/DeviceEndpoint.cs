@@ -79,6 +79,7 @@ public static class DeviceEndpoint
             };
 
         var devices = new List<DeviceInfoDto>();
+        string? driver = DotLLM.Cuda.CudaDevice.TryGetDriverVersion()?.ToString(System.Globalization.CultureInfo.InvariantCulture);
         try
         {
             int count = DotLLM.Cuda.CudaDevice.GetDeviceCount();
@@ -95,6 +96,8 @@ public static class DeviceEndpoint
                         TotalMemoryBytes = d.TotalMemoryBytes,
                         FreeMemoryBytes = DotLLM.Cuda.CudaMemoryInfo.TryGet(i, out long free, out _) ? free : null,
                         ComputeCapability = d.ComputeCapability,
+                        PciVendorId = 0x10DE,
+                        DriverVersion = driver,
                     });
                 }
                 catch
@@ -169,6 +172,11 @@ public static class DeviceEndpoint
                     DeviceString = $"vulkan:{d.Index}",
                     TotalMemoryBytes = d.DeviceLocalHeapBytes > 0 ? d.DeviceLocalHeapBytes : null,
                     IsDefault = d.IsDefault ? true : null,
+                    PciVendorId = d.VendorId,
+                    IsIntegrated = d.DeviceType == 1 ? true : null,
+                    PciDeviceId = d.DeviceId != 0 ? d.DeviceId : null,
+                    DriverVersion = d.DriverVersion != 0 ? d.DriverVersion.ToString(System.Globalization.CultureInfo.InvariantCulture) : null,
+                    ApiVersion = d.ApiVersion != 0 ? $"{d.ApiVersion >> 22}.{(d.ApiVersion >> 12) & 0x3FF}.{d.ApiVersion & 0xFFF}" : null,
                 }).ToArray()
                 : [],
         };
