@@ -448,9 +448,9 @@ public sealed unsafe partial class CudaAttentionKvqTests : IDisposable
         for (int i = 0; i < h.Length; i++) h[i] = FloatToHalf(rows[i]);
         nint src = Upload(h);
         long bytes = (long)count * (stride / 32) * (fmt == KvCacheDType.Q8_0 ? 34 : 18);
-        // 16 guard rows of 0xFF past the cache (#1923): every block scale there is an F16 NaN, so a kernel that reads past seqKv
+        // 64 guard rows of 0xFF past the cache (#1923; 64 = the largest E4 key tile, #1943): every block scale there is an F16 NaN, so a kernel that reads past seqKv
         // (an unclamped tail tile) produces NaN instead of silently reading zeros.
-        long guard = 16L * (stride / 32) * (fmt == KvCacheDType.Q8_0 ? 34 : 18);
+        long guard = 64L * (stride / 32) * (fmt == KvCacheDType.Q8_0 ? 34 : 18);
         nint dst = Alloc(bytes + guard);
         CudaDriverApi.cuMemsetD8_v2(dst + (nint)bytes, 0xFF, (nuint)guard).ThrowOnError();
         _kernels!.LaunchQuantKv(src, dst, count * stride, fmt, _stream!.Handle);

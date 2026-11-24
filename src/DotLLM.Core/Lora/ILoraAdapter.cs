@@ -73,6 +73,15 @@ public interface ILoraAdapter : IDisposable
     /// when the adapter can be applied to a model built from that config.
     /// </summary>
     bool IsCompatible(ModelConfig baseConfig);
+
+    /// <summary>
+    /// Every stored (layer, projection, region) factor pair, whatever the projection is called (<c>q_proj</c>, an MoE expert's
+    /// <c>mlp.experts.3.down_proj</c>, <c>kv_b_proj</c>, ...), or <c>null</c> when this adapter cannot enumerate its tensors. Used to
+    /// hash an adapter's full content (chunk identity, #1915): an implementation that returns <c>null</c> gets no chunk reuse
+    /// rather than a digest that could miss tensors.
+    /// </summary>
+    /// <returns>The entries, or null.</returns>
+    IReadOnlyList<(int Layer, string Proj, LoraRegion Region, LoraLayerWeights Weights)>? EnumerateWeights() => null;
 }
 
 /// <summary>

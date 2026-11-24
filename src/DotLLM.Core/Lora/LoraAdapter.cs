@@ -152,6 +152,19 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
     }
 
     /// <inheritdoc/>
+    public IReadOnlyList<(int Layer, string Proj, LoraRegion Region, LoraLayerWeights Weights)>? EnumerateWeights()
+    {
+        lock (_lock)
+        {
+            var all = new List<(int, string, LoraRegion, LoraLayerWeights)>(_layers.Count + (_regionLayers?.Count ?? 0));
+            foreach (var ((layer, proj), w) in _layers) all.Add((layer, proj, LoraRegion.Any, w));
+            if (_regionLayers is not null)
+                foreach (var ((layer, proj, region), w) in _regionLayers) all.Add((layer, proj, region, w));
+            return all;
+        }
+    }
+
+    /// <inheritdoc/>
     public bool IsCompatible(ModelConfig baseConfig)
     {
         ArgumentNullException.ThrowIfNull(baseConfig);

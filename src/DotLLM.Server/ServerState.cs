@@ -258,6 +258,13 @@ public sealed class ServerState : IDisposable
     /// <summary>Owner of the ternary residual adapters attached to <see cref="Model"/> (#1711), or null.</summary>
     public IDisposable? TernaryAdapters { get; set; }
 
+    /// <summary>
+    /// What changes the loaded weights without changing the base GGUF (<c>--tensor-overlay</c>, each <c>--ternary-adapter</c> package), as
+    /// (kind, id, content digest), computed AT LOAD TIME from the bytes the model was built from (#1915): a file replaced afterwards cannot
+    /// change it. Empty for a base model; null when not computed (a state built by hand), which chunk reuse treats as unknown identity.
+    /// </summary>
+    public IReadOnlyList<(string Kind, string Id, string ContentDigest)>? WeightModifiers { get; set; }
+
     /// <summary>Tokenizer for the loaded model.</summary>
     public ITokenizer? Tokenizer { get; set; }
 
