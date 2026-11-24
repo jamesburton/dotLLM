@@ -10,8 +10,10 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// (0, 1], and the P.V tensor-core MMA takes it as F16, whose subnormal step is 2^-24 (6e-8): a key 17+ nats below the row max
 /// rounds to 0 or to one subnormal step, while the F32 denominator l keeps its exact value. At 32K keys behind an attention sink,
 /// thousands of such keys carry a mass that the numerator loses (or over-counts) and l does not, a bias on every row.
-/// <para>The fixture is that regime and nothing else: one sink key (V = 0) 15.6-18.4 nats above every other key (V ~ 1, one sign),
-/// so the output IS the tail mass, about 1.8e-3 at 32K keys. The random fixtures of <c>FlashPrefillF16Entry_AgreesWithAttentionF16</c>
+/// <para>The fixture is that regime and nothing else: one sink key (V = 0) 15.6-18.4 nats above every other key (V 48..80, one
+/// sign), so the output IS the tail mass (x ~64, in F16's normal range). Every CUDA tensor-core attention kernel packs P the same
+/// way, so each gets the case: kvq prefill, hd256 prefill, dense decode, hd256 mma decode v1 / v2 and G-flash. Before the fix
+/// each returns 0 here (the whole tail flushed). The random fixtures of <c>FlashPrefillF16Entry_AgreesWithAttentionF16</c>
 /// give a near-uniform softmax where no P is small, which is why they could not see this. Oracle: scalar <c>attention_f16</c>
 /// (F32 P).</para>
 /// </summary>
@@ -36,18 +38,13 @@ public sealed unsafe partial class CudaAttentionKvqTests
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
         Skip.If(_kernels == null, "PTX kernels not available");
         Skip.IfNot(_kernels!.HasAttentionFlashPrefillKvq(headDim, null, null), "flash prefill F16 entry not loaded (needs Ampere+)");
-        var (worst, at, got, want) = SinkTailError(_kernels, headDim, numHeads, numKvHeads, seqQ, seqKv);
-        _out.WriteLine($"hd{headDim} {numHeads}/{numKvHeads} seqQ {seqQ} seqKv {seqKv}: worst relative error {worst:E3} at {at} " +
-                       $"({got:E4} vs attention_f16 {want:E4})");
-        Assert.True(worst <= 0.01, $"flash prefill loses the softmax tail: {got:E4} vs attention_f16 {want:E4} at {at} " +
-                                   $"(relative error {worst:E3})");
+        AssertTail($"kvq F16 flash prefill hd{headDim} {numHeads}/{numKvHeads} seqQ {seqQ} seqKv {seqKv}",
+            SinkTailError(_kernels, headDim, numHeads, numKvHeads, seqQ, seqKv));
     }
 
-    /// <summary>Runs the sink/tail fixture through <paramref name="kernels"/>' F16 flash entry and the scalar oracle.</summary>
-    private (double Worst, int At, double Got, double Want) SinkTailError(CudaKernels kernels, int headDim, int numHeads, int numKvHeads,
-        int seqQ, int seqKv)
+    /// <summary>Host Q/K/V of the sink/tail fixture (F16 bits). Score of key j = q0 * k_j[0] / sqrt(hd) (q's other components are 0).</summary>
+    private static (ushort[] Q, ushort[] K, ushort[] V) SinkTailData(int headDim, int numHeads, int numKvHeads, int seqQ, int seqKv)
     {
-        int offset = seqKv - seqQ;
         int stride = numKvHeads * headDim;
         var rng = new Random(1953 + headDim + seqKv);
         var k = new ushort[(long)seqKv * stride];
@@ -56,41 +53,184 @@ public sealed unsafe partial class CudaAttentionKvqTests
             for (int h = 0; h < numKvHeads; h++)
             {
                 long b = (long)j * stride + h * headDim;
-                // Score of key j = q[0] * k[0] / sqrt(hd) (q's other components are 0): sink 20, tail -2..-6.
+                // Sink k[0] = 20, tail -2..-6. V: sink 0, tail 48..80 (one sign): the output is the tail mass x ~64.
                 k[b] = FloatToHalf(j == 0 ? 20f : -2f - 4f * (float)rng.NextDouble());
                 for (int d = 1; d < headDim; d++) k[b + d] = FloatToHalf((float)(rng.NextDouble() * 0.2 - 0.1));
-                for (int d = 0; d < headDim; d++) v[b + d] = FloatToHalf(j == 0 ? 0f : 0.75f + 0.5f * (float)rng.NextDouble());
+                for (int d = 0; d < headDim; d++) v[b + d] = FloatToHalf(j == 0 ? 0f : 48f + 32f * (float)rng.NextDouble());
             }
         var q = new ushort[seqQ * numHeads * headDim];
-        // q[0] scaled so that 8 * 20 / sqrt(128) = 14.1 and the tail sits 15.6-18.4 nats below at hd128 (hd64: same gaps x sqrt 2,
-        // q[0] scaled down to match).
+        // 8 * 20 / sqrt(128) = 14.1, the tail 15.6-18.4 nats below the sink; q0 scales with sqrt(hd) so every head_dim sees the same gaps.
         float q0 = 8f * MathF.Sqrt(headDim / 128f);
         for (int r = 0; r < seqQ; r++)
             for (int h = 0; h < numHeads; h++)
                 q[(r * numHeads + h) * headDim] = FloatToHalf(q0 * (1f + 0.02f * h));
-        nint dq = Upload(q), dk = Upload(k), dv = Upload(v);
-        nint oRef = Alloc(q.Length * 2L), oNew = Alloc(q.Length * 2L);
+        return (q, k, v);
+    }
+
+    private float[] ReadHalfAsFloat(nint dev, int n) => ReadHalf(dev, n).Select(HalfToFloat).ToArray();
+
+    private static float[] ReadFloat(nint dev, int n)
+    {
+        var h = new float[n];
+        fixed (float* p = h) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dev, (nuint)(n * 4L)).ThrowOnError();
+        return h;
+    }
+
+    /// <summary>
+    /// The sink/tail fixture through <paramref name="kernel"/> (given device Q, K, V; returns its output as floats) and through the
+    /// scalar <c>attention_f16</c> oracle (F32 P): worst relative error over rows [minRow, seqQ).
+    /// </summary>
+    private (double Worst, int At, double Got, double Want) SinkTailRun(int headDim, int numHeads, int numKvHeads, int seqQ,
+        int seqKv, int minRow, Func<nint, nint, nint, float[]> kernel)
+    {
+        var (q, k, v) = SinkTailData(headDim, numHeads, numKvHeads, seqQ, seqKv);
+        nint dq = Upload(q), dk = Upload(k), dv = Upload(v), oRef = Alloc(q.Length * 2L);
         try
         {
-            _kernels!.LaunchAttention(dq, dk, dv, oRef, seqQ, seqKv, numHeads, numKvHeads, headDim, offset, 0, _stream!.Handle);
-            kernels.LaunchAttentionFlashPrefillKvq(dq, dk, dv, null, null, oNew, seqQ, seqKv, numHeads, numKvHeads, headDim, offset,
-                _stream.Handle);
+            _kernels!.LaunchAttention(dq, dk, dv, oRef, seqQ, seqKv, numHeads, numKvHeads, headDim, seqKv - seqQ, 0, _stream!.Handle);
             _stream.Synchronize();
-            ushort[] want = ReadHalf(oRef, q.Length), got = ReadHalf(oNew, q.Length);
+            float[] want = ReadHalfAsFloat(oRef, q.Length), got = kernel(dq, dk, dv);
             double worst = 0;
             int at = 0;
-            for (int i = 0; i < want.Length; i++)
+            for (int i = minRow * numHeads * headDim; i < want.Length; i++)
             {
-                double a = HalfToFloat(got[i]), b = HalfToFloat(want[i]);
-                double err = Math.Abs(a - b) / Math.Max(Math.Abs(b), 1e-30);
+                double err = Math.Abs(got[i] - want[i]) / Math.Max(Math.Abs(want[i]), 1e-30);
                 if (!(err <= worst)) { worst = err; at = i; }
             }
-            return (worst, at, HalfToFloat(got[at]), HalfToFloat(want[at]));
+            return (worst, at, got[at], want[at]);
         }
         finally
         {
-            foreach (nint p in new[] { dq, dk, dv, oRef, oNew }) CudaDriverApi.cuMemFree_v2(p);
+            foreach (nint p in new[] { dq, dk, dv, oRef }) CudaDriverApi.cuMemFree_v2(p);
         }
+    }
+
+    /// <summary>The sink/tail fixture through <paramref name="kernels"/>' kvq F16 flash prefill entry.</summary>
+    private (double Worst, int At, double Got, double Want) SinkTailError(CudaKernels kernels, int headDim, int numHeads, int numKvHeads,
+        int seqQ, int seqKv) =>
+        SinkTailRun(headDim, numHeads, numKvHeads, seqQ, seqKv, 0, (dq, dk, dv) =>
+        {
+            int n = seqQ * numHeads * headDim;
+            nint o = Alloc(n * 2L);
+            try
+            {
+                kernels.LaunchAttentionFlashPrefillKvq(dq, dk, dv, null, null, o, seqQ, seqKv, numHeads, numKvHeads, headDim,
+                    seqKv - seqQ, _stream!.Handle);
+                _stream.Synchronize();
+                return ReadHalfAsFloat(o, n);
+            }
+            finally { CudaDriverApi.cuMemFree_v2(o); }
+        });
+
+    private void AssertTail(string what, (double Worst, int At, double Got, double Want) r)
+    {
+        _out.WriteLine($"{what}: worst relative error {r.Worst:E3} at {r.At} ({r.Got:E4} vs attention_f16 {r.Want:E4})");
+        Assert.True(r.Worst <= 0.01, $"{what} loses the softmax tail: {r.Got:E4} vs attention_f16 {r.Want:E4} at {r.At} " +
+                                     $"(relative error {r.Worst:E3})");
+    }
+
+    /// <summary>#1953, same P packing: the hd256 flash prefill (F32 output; hd256 models' F16 prefill).</summary>
+    [SkippableFact]
+    public void FlashPrefillHd256_SinkDominatedLongRow_KeepsTheTailMass()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null || !_kernels.HasAttentionFlashPrefillHd256, "hd256 flash prefill not loaded");
+        const int hd = 256, nh = 8, nkv = 2, seqQ = 16, seqKv = 32771;
+        AssertTail("hd256 flash prefill 32K", SinkTailRun(hd, nh, nkv, seqQ, seqKv, 0, (dq, dk, dv) =>
+        {
+            int n = seqQ * nh * hd;
+            nint o = Alloc(n * 4L);
+            try
+            {
+                _kernels.LaunchAttentionFlashPrefillHd256(dq, dk, dv, o, seqQ, seqKv, nh, nkv, seqKv - seqQ, _stream!.Handle);
+                _stream.Synchronize();
+                return ReadFloat(o, n);
+            }
+            finally { CudaDriverApi.cuMemFree_v2(o); }
+        }));
+    }
+
+    /// <summary>
+    /// #1953, same P packing: the dense split-KV decode (#1922, F16 output). Split 1 runs the whole 32K row in one block (the bug's
+    /// regime); split 0 = the production heuristic.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(128, 1)]
+    [InlineData(128, 0)]
+    [InlineData(64, 1)]
+    public void MmaDecodeDense_SinkDominatedLongRow_KeepsTheTailMass(int hd, int forcedSplit)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null || !_kernels.HasAttentionMmaDecodeDense(hd, KvCacheDType.F32, KvCacheDType.F32), "dense decode v2 not loaded");
+        const int nh = 8, nkv = 2, seqKv = 32771;
+        int maxSafe = _kernels.MaxSafeAttentionMmaDecodeDense(nkv, hd, KvCacheDType.F32, KvCacheDType.F32);
+        Skip.If(maxSafe < 1, "dense decode v2 cannot launch here");
+        int split = forcedSplit > 0 ? forcedSplit : CudaKernels.ComputeAttentionMmaV2KvSplit(seqKv, maxSafe);
+        AssertTail($"dense decode hd{hd} split {split} 32K", SinkTailRun(hd, nh, nkv, 1, seqKv, 0, (dq, dk, dv) =>
+        {
+            int n = nh * hd;
+            nint o = Alloc(n * 2L), pm = Alloc(nh * split * 4L), ps = Alloc(nh * split * 4L),
+                 po = Alloc((long)nh * split * hd * CudaKernels.AttentionMmaDecodeDensePartialBytes);
+            try
+            {
+                _kernels.LaunchAttentionMmaDecodeDense(dq, dk, dv, KvCacheDType.F32, KvCacheDType.F32, o, seqKv, nh, nkv, hd, split,
+                    pm, ps, po, _stream!.Handle);
+                _stream.Synchronize();
+                return ReadHalfAsFloat(o, n);
+            }
+            finally { foreach (nint p in new[] { o, pm, ps, po }) CudaDriverApi.cuMemFree_v2(p); }
+        }));
+    }
+
+    /// <summary>#1953, same P packing: the hd256 cooperative mma decode, v2 (#988, the default) and v1, at split 1.</summary>
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void MmaDecodeGqaSplit_SinkDominatedLongRow_KeepsTheTailMass(bool v2)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null || !_kernels.HasAttentionMmaDecodeGqaSplit, "mma decode gqa split not loaded");
+        const int hd = 256, nh = 8, nkv = 2, seqKv = 32771;
+        bool saved = CudaKernels.MmaDecodeV2Enabled;
+        try
+        {
+            CudaKernels.MmaDecodeV2Enabled = v2;
+            Skip.If(_kernels.MaxSafeAttentionMmaDecodeGqaSplit(nkv, hd, nh / nkv) < 1, "mma decode cannot launch here");
+            AssertTail($"mma decode {(v2 ? "v2" : "v1")} hd256 32K", SinkTailRun(hd, nh, nkv, 1, seqKv, 0, (dq, dk, dv) =>
+            {
+                int n = nh * hd;
+                nint o = Alloc(n * 4L), pm = Alloc(nh * 4L), ps = Alloc(nh * 4L), po = Alloc((long)nh * hd * 4);
+                try
+                {
+                    _kernels.LaunchAttentionMmaDecodeGqaSplit(dq, dk, dv, o, seqKv, nh, nkv, 1, pm, ps, po, _stream!.Handle);
+                    _stream.Synchronize();
+                    return ReadFloat(o, n);
+                }
+                finally { foreach (nint p in new[] { o, pm, ps, po }) CudaDriverApi.cuMemFree_v2(p); }
+            }));
+        }
+        finally { CudaKernels.MmaDecodeV2Enabled = saved; }
+    }
+
+    /// <summary>#1953, same P packing: G-flash (attention_flash_mma, hd64 cold prefill, opt-in): rows 4096+ of an 8,192-row prefill.</summary>
+    [SkippableFact]
+    public void FlashMmaHd64_SinkDominatedLongRow_KeepsTheTailMass()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null || !_kernels.HasAttentionFlashMma, "attention_flash_mma not loaded");
+        const int hd = 64, nh = 8, nkv = 2, seq = 8192;
+        AssertTail("G-flash hd64 rows 4096-8191", SinkTailRun(hd, nh, nkv, seq, seq, 4096, (dq, dk, dv) =>
+        {
+            int n = seq * nh * hd;
+            nint o = Alloc(n * 2L);
+            try
+            {
+                _kernels.LaunchAttentionFlashMma(dq, dk, dv, o, seq, nh, nkv, hd, 1f / MathF.Sqrt(hd), _stream!.Handle);
+                _stream.Synchronize();
+                return ReadHalfAsFloat(o, n);
+            }
+            finally { CudaDriverApi.cuMemFree_v2(o); }
+        }));
     }
 
     private static ushort[] ReadHalf(nint dev, int n)

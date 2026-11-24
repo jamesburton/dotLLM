@@ -33,7 +33,8 @@
 // raw copies were issued at the top of iteration t-1, so they overlapped tile t-1's MMAs).
 //
 // ─── Precision ─────────────────────────────────────────────────────────────────────────────────────────
-// F16 Q/K/V/P operands, F32 mma accumulation and softmax statistics, in registers. Output F16.
+// F16 Q/K/V/P operands, F32 mma accumulation and softmax statistics, in registers. Output F16. P is scaled by 2^15 into the top
+// of the F16 range (PK_P_SHIFT, #1953) so the long-context softmax tail does not flush to zero.
 //
 // Dynamic shared memory: group*16*(HD+8)*2 (Q) + NBUF*2*KV_TILE*(HD+8)*2 (K, V); hd128 group 8 = 52 KB,
 // so the launcher opts the functions into > 48 KB.
@@ -53,14 +54,15 @@
 #define PK_NT (PK_KV_TILE / 8)
 #define PK_LOG2E 1.4426950408889634f
 #define PK_NEG_INF __int_as_float(0xff800000)
+// #1953: P is computed as exp2(S - m + PK_P_SHIFT), 2^15 x the softmax numerator, so that it uses the top of the F16 range
+// (P <= 2^15 < 65504) instead of (0, 1]. Unshifted, a key more than ~17.3 nats below the row max is below half F16's smallest
+// subnormal (2^-25) and packs to 0 for the P.V MMA while the F32 sum l still counts it: behind an attention sink at 32K keys that
+// is most of the row, and the lost tail mass biased every output (Qwen3-4B 32K max KL 2.5e-3, first-token logprob +0.046).
+// The factor cancels exactly: l and O accumulate the same scaled P (F32 registers), the online rescale exp2(m_old - m_new) is
+// shift-free, and O / l divides it out. The flush point moves to ~27.7 nats below the max. Registers only, zero instructions
+// (folded into the existing subtraction). Override only to build a test mutant (-DPK_P_SHIFT=0.0f).
 #ifndef PK_P_SHIFT
-#define PK_P_SHIFT 0.0f
-#endif
-#ifndef PK_L_ROUNDED
-#define PK_L_ROUNDED 0
-#endif
-#ifndef PK_P_HILO
-#define PK_P_HILO 0
+#define PK_P_SHIFT 15.0f
 #endif
 
 __device__ __forceinline__ void pk_ldmatrix_x4(unsigned (&r)[4], const void* p)
@@ -455,10 +457,7 @@ __device__ __forceinline__ void pk_prefill_body(
 
             // ---- P = exp2(S - m), accumulate l, pack as A fragments ----
             unsigned pa[PK_NT / 2][4];
-#if PK_P_HILO
-            unsigned pl[PK_NT / 2][4];
-#endif
-            const float ms_lo = mu_lo - PK_P_SHIFT, ms_hi = mu_hi - PK_P_SHIFT;
+            const float ms_lo = mu_lo - PK_P_SHIFT, ms_hi = mu_hi - PK_P_SHIFT;   // #1953: P scaled by 2^PK_P_SHIFT
             #pragma unroll
             for (int n = 0; n < PK_NT; n++)
             {
@@ -466,18 +465,9 @@ __device__ __forceinline__ void pk_prefill_body(
                 float p1 = exp2f(sa[n][1] - ms_lo);
                 float p2 = exp2f(sa[n][2] - ms_hi);
                 float p3 = exp2f(sa[n][3] - ms_hi);
-                const __half2 h01 = __floats2half2_rn(p0, p1), h23 = __floats2half2_rn(p2, p3);
-#if PK_L_ROUNDED
-                l_lo += __low2float(h01) + __high2float(h01); l_hi += __low2float(h23) + __high2float(h23);
-#else
                 l_lo += p0 + p1; l_hi += p2 + p3;
-#endif
-                pa[n >> 1][(n & 1) * 2 + 0] = *reinterpret_cast<const unsigned*>(&h01);
-                pa[n >> 1][(n & 1) * 2 + 1] = *reinterpret_cast<const unsigned*>(&h23);
-#if PK_P_HILO
-                pl[n >> 1][(n & 1) * 2 + 0] = pk_pack_half2(p0 - __low2float(h01), p1 - __high2float(h01));
-                pl[n >> 1][(n & 1) * 2 + 1] = pk_pack_half2(p2 - __low2float(h23), p3 - __high2float(h23));
-#endif
+                pa[n >> 1][(n & 1) * 2 + 0] = pk_pack_half2(p0, p1);
+                pa[n >> 1][(n & 1) * 2 + 1] = pk_pack_half2(p2, p3);
             }
 
             // ---- O += P . V ----
@@ -492,10 +482,6 @@ __device__ __forceinline__ void pk_prefill_body(
                                                + (np * 2 + (lane >> 4)) * 8);
                     pk_mma(o[2 * np], pa[kk], b[0], b[1]);
                     pk_mma(o[2 * np + 1], pa[kk], b[2], b[3]);
-#if PK_P_HILO
-                    pk_mma(o[2 * np], pl[kk], b[0], b[1]);
-                    pk_mma(o[2 * np + 1], pl[kk], b[2], b[3]);
-#endif
                 }
             }
         }
