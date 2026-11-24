@@ -23,7 +23,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(CudaCollection.Name)]
-public sealed unsafe class CudaAttentionKvqTests : IDisposable
+public sealed unsafe partial class CudaAttentionKvqTests : IDisposable
 {
     private readonly CudaContext? _ctx;
     private readonly CudaStream? _stream;

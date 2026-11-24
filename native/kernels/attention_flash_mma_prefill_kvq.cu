@@ -53,6 +53,15 @@
 #define PK_NT (PK_KV_TILE / 8)
 #define PK_LOG2E 1.4426950408889634f
 #define PK_NEG_INF __int_as_float(0xff800000)
+#ifndef PK_P_SHIFT
+#define PK_P_SHIFT 0.0f
+#endif
+#ifndef PK_L_ROUNDED
+#define PK_L_ROUNDED 0
+#endif
+#ifndef PK_P_HILO
+#define PK_P_HILO 0
+#endif
 
 __device__ __forceinline__ void pk_ldmatrix_x4(unsigned (&r)[4], const void* p)
 {
@@ -446,16 +455,29 @@ __device__ __forceinline__ void pk_prefill_body(
 
             // ---- P = exp2(S - m), accumulate l, pack as A fragments ----
             unsigned pa[PK_NT / 2][4];
+#if PK_P_HILO
+            unsigned pl[PK_NT / 2][4];
+#endif
+            const float ms_lo = mu_lo - PK_P_SHIFT, ms_hi = mu_hi - PK_P_SHIFT;
             #pragma unroll
             for (int n = 0; n < PK_NT; n++)
             {
-                float p0 = exp2f(sa[n][0] - mu_lo);
-                float p1 = exp2f(sa[n][1] - mu_lo);
-                float p2 = exp2f(sa[n][2] - mu_hi);
-                float p3 = exp2f(sa[n][3] - mu_hi);
+                float p0 = exp2f(sa[n][0] - ms_lo);
+                float p1 = exp2f(sa[n][1] - ms_lo);
+                float p2 = exp2f(sa[n][2] - ms_hi);
+                float p3 = exp2f(sa[n][3] - ms_hi);
+                const __half2 h01 = __floats2half2_rn(p0, p1), h23 = __floats2half2_rn(p2, p3);
+#if PK_L_ROUNDED
+                l_lo += __low2float(h01) + __high2float(h01); l_hi += __low2float(h23) + __high2float(h23);
+#else
                 l_lo += p0 + p1; l_hi += p2 + p3;
-                pa[n >> 1][(n & 1) * 2 + 0] = pk_pack_half2(p0, p1);
-                pa[n >> 1][(n & 1) * 2 + 1] = pk_pack_half2(p2, p3);
+#endif
+                pa[n >> 1][(n & 1) * 2 + 0] = *reinterpret_cast<const unsigned*>(&h01);
+                pa[n >> 1][(n & 1) * 2 + 1] = *reinterpret_cast<const unsigned*>(&h23);
+#if PK_P_HILO
+                pl[n >> 1][(n & 1) * 2 + 0] = pk_pack_half2(p0 - __low2float(h01), p1 - __high2float(h01));
+                pl[n >> 1][(n & 1) * 2 + 1] = pk_pack_half2(p2 - __low2float(h23), p3 - __high2float(h23));
+#endif
             }
 
             // ---- O += P . V ----
@@ -470,6 +492,10 @@ __device__ __forceinline__ void pk_prefill_body(
                                                + (np * 2 + (lane >> 4)) * 8);
                     pk_mma(o[2 * np], pa[kk], b[0], b[1]);
                     pk_mma(o[2 * np + 1], pa[kk], b[2], b[3]);
+#if PK_P_HILO
+                    pk_mma(o[2 * np], pl[kk], b[0], b[1]);
+                    pk_mma(o[2 * np + 1], pl[kk], b[2], b[3]);
+#endif
                 }
             }
         }
