@@ -10,9 +10,10 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// #1953 on the TurboQuant tensor-core prefill: every entry (Legacy = pk_prefill_body over norm * centroid tiles; Specialized / Staged =
 /// pk_tq_tile, whose P.V operand is P * |v| over bare-centroid tiles) against the scalar <c>attention_kvtq</c> oracle (F32 P).
 /// <list type="bullet">
-/// <item><b>Tail</b>: a sink key 15.6-18.4 nats above 32,770 others with V norm 0, so the output is the tail mass alone. The tail's V
-/// norms grow with position from 1 to 500, so pk_tq_tile's adaptive scale exponent k (#1953) drops many times along the row: an
-/// unshifted P flushes the tail to 0, and a k drop that is not rescaled mixes scales.</item>
+/// <item><b>Tail</b>: a sink key 16.4-19 nats above 32,770 others with V norm 0, so the output is the tail mass alone. The tail's V
+/// norms are 1 for the first half (P * |v| below F16's subnormal half-step for most keys: unshifted, they flush) and then rise to 4,
+/// so pk_tq_tile's adaptive scale exponent k (#1953) drops twice along the row (15 -> 14 -> 13): a drop that is not rescaled mixes
+/// scales. (Large tail norms would lift P * |v| out of the flush range and hide the unshifted bug.)</item>
 /// <item><b>Overflow</b>: uniform scores with V norm 400 on every key: a fixed 2^15 scale in pk_tq_tile packs P * |v| = 1.3e7 into F16
 /// (inf); the adaptive k must keep it finite and exact.</item>
 /// </list>
@@ -46,7 +47,7 @@ public sealed unsafe partial class CudaTurboQuantPrefillTailTests
                 float k, v;
                 if (overflowCase) { k = 1f; v = 400f; }
                 else if (j == 0) { k = 20f; v = 0f; }
-                else { k = 1.6f + 2.8f * (float)rng.NextDouble(); v = 1f + 499f * j / seqKv; }
+                else { k = 1.0f + 2.6f * (float)rng.NextDouble(); v = j < seqKv / 2 ? 1f : 1f + 3f * (2f * j / seqKv - 1f); }
                 kn[j * numKvHeads + h] = BitConverter.HalfToUInt16Bits((Half)k);
                 vn[j * numKvHeads + h] = BitConverter.HalfToUInt16Bits((Half)v);
             }
