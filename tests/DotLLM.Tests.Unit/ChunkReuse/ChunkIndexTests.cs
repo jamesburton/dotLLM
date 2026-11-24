@@ -359,6 +359,33 @@ public sealed class ChunkIndexTests : IDisposable
         Assert.Throws<InvalidDataException>(() => symIndex.EvictableOrphans(deleted, store.Root, ChunkIndex.DefaultPath(store.Root, symbol.Name)));
     }
 
+    [Fact]
+    public void ReferencedKeysUnder_ExceptPath_SkipsOnlyThatFile_UnderThePlatformsCaseRule()
+    {
+        var chunker = new FixedSizeChunker(new CharTokenizer(), chunkTokens: 4096);
+        var lower = new ChunkIndex(KeyA);
+        lower.Update([new SourceFile("A.txt", "lower\n")], chunker);
+        var upper = new ChunkIndex(KeyA);
+        upper.Update([new SourceFile("A.txt", "UPPER\n")], chunker);
+        ChunkKey lowerKey = new(lower.ChunksOf("A.txt")[0].KeyHex!), upperKey = new(upper.ChunksOf("A.txt")[0].KeyHex!);
+        string lowerPath = Path.Combine(_root, "index-case-a.json"), upperPath = Path.Combine(_root, "index-case-A.json");
+        lower.Save(lowerPath);
+        if (OperatingSystem.IsWindows())
+        {
+            // One file whatever the case: a case variant of its name is the same file and is skipped.
+            Assert.Empty(ChunkIndex.ReferencedKeysUnder(_root, exceptPath: upperPath));
+            Assert.Equal(new[] { lowerKey }, ChunkIndex.ReferencedKeysUnder(_root, exceptPath: null).ToArray());
+        }
+        else
+        {
+            // Case-sensitive names: two indexes, and skipping one must keep the other's keys (they must not be evicted).
+            upper.Save(upperPath);
+            Assert.Equal(2, Directory.GetFiles(_root, "index-case-*.json").Length);
+            Assert.Equal(new[] { upperKey }, ChunkIndex.ReferencedKeysUnder(_root, exceptPath: lowerPath).ToArray());
+            Assert.Equal(new[] { lowerKey }, ChunkIndex.ReferencedKeysUnder(_root, exceptPath: upperPath).ToArray());
+        }
+    }
+
     public static TheoryData<string> StructurallyBadIndexFiles() => new()
     {
         "version", "file-null", "path-null", "sha-bad", "chunks-null", "chunk-null", "key-bad", "duplicate-path", "chunker-null",
@@ -642,17 +669,25 @@ public sealed class ChunkIndexTests : IDisposable
         var index = new ChunkIndex(KeyA);
         index.Update([new SourceFile("A.txt", "012345678\n")], chunker);
         index.Save(path);
+        byte[] oldBytes = File.ReadAllBytes(path);
 
         index.Update([new SourceFile("A.txt", "012345678\nmore\n")], chunker);
         Task save;
+        var blocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        TimeSpan savedBudget = ChunkIndex.SaveRetryBudget;
+        ChunkIndex.SaveRetryBudget = TimeSpan.FromMinutes(2); // the wait below is event-driven; a loaded runner must not exhaust the retry budget first
+        ChunkIndex.MoveRetriedForTest = () => blocked.TrySetResult();
+        try
+        {
         using (FileStream reader = ChunkIndex.OpenForRead(path)) // the share mode Load uses
         {
             save = Task.Run(() => index.Save(path)); // Windows: waits while the reader holds the file
             if (OperatingSystem.IsWindows())
             {
-                // The rename waits for the reader, so for as long as it is held a second reader sees the old file (1 chunk). This
-                // holds however late the save starts, so a short delay cannot make it flaky.
-                await Task.Delay(150);
+                // Wait for the save itself to report that its rename was refused (it is blocked on the reader): an event, not a
+                // timer, so a loaded runner cannot make this look too early or too late. While the reader is held, a second reader
+                // sees the old file (1 chunk) and the save has not completed.
+                await blocked.Task.WaitAsync(TimeSpan.FromSeconds(60));
                 Assert.False(save.IsCompleted);
                 Assert.Single(ChunkIndex.Load(path, KeyA).ChunksOf("A.txt"));
             }
@@ -665,7 +700,13 @@ public sealed class ChunkIndexTests : IDisposable
                 Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
             }
         }
-        await save.WaitAsync(TimeSpan.FromSeconds(10));
+        await save.WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            ChunkIndex.MoveRetriedForTest = null;
+            ChunkIndex.SaveRetryBudget = savedBudget;
+        }
         Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
         Assert.Single(Directory.GetFiles(_root)); // no temp file left
 
@@ -683,7 +724,8 @@ public sealed class ChunkIndexTests : IDisposable
         {
             ChunkIndex.SaveRetryBudget = budget;
         }
-        if (OperatingSystem.IsWindows()) Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
+        // Windows: the old file stays intact. POSIX: the new one is in place.
+        Assert.Equal(OperatingSystem.IsWindows() ? 2 : 1, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
         Assert.Single(Directory.GetFiles(_root));
     }
 
@@ -755,6 +797,62 @@ public sealed class ChunkIndexTests : IDisposable
         ChunkIndex loaded = ChunkIndex.Load(path, KeyA);
         Assert.Null(loaded.LoadNote);
         Assert.Equal(index.ChunksOf("A.txt"), loaded.ChunksOf("A.txt"));
+    }
+
+    [Fact]
+    public void ChangedChunkerAlgorithm_SameName_UnchangedText_IsStaleAndReChunked()
+    {
+        var files = new[] { new SourceFile("A.txt", "one\ntwo\nthree\n"), new SourceFile("B.txt", "x\ny\n") };
+        var store = new KeySetStore();
+        string path = Path.Combine(_root, "index-versioned-1.json");
+        Directory.CreateDirectory(_root);
+
+        // Built by algorithm version 1 (one chunk per line), saved, loaded: what a store built before an algorithm change holds.
+        var built = new ChunkIndex(KeyA);
+        built.Update(files, new VersionedChunker(1));
+        foreach (ChunkRef r in built.ChunksOf("A.txt").Concat(built.ChunksOf("B.txt"))) store.Add(r.Key!.Value);
+        built.Save(path);
+        ChunkIndex index = ChunkIndex.Load(path, KeyA);
+        Assert.Equal(3, index.ChunksOf("A.txt").Count);
+
+        // Controls: the same algorithm sees nothing to do, with or without the tree.
+        Assert.True(index.Status(store, files, new VersionedChunker(1).AlgorithmVersion).IsUpToDate);
+        IndexDiff same = index.Update(files, new VersionedChunker(1));
+        Assert.Empty(same.Added);
+        Assert.Empty(same.Removed);
+
+        // Version 2 (same name, same text): every file is stale before the update, re-chunked by it, and up to date after.
+        var v2 = new VersionedChunker(2);
+        StatusReport before = index.Status(store, files, v2.AlgorithmVersion);
+        Assert.False(before.IsUpToDate);
+        Assert.Equal(["A.txt", "B.txt"], before.Files.Where(f => f.State == FileState.Stale).Select(f => f.Path));
+        Assert.False(index.Status(store, null, v2.AlgorithmVersion).IsUpToDate); // also without scanning the tree
+
+        index.Update([files[0]], v2, removeMissingFiles: false); // one file only: the other must stay marked as the old algorithm's
+        Assert.Single(index.ChunksOf("A.txt"));
+        Assert.Equal(2, index.ChunksOf("B.txt").Count);
+        Assert.Equal(["B.txt"], index.Status(store, files, v2.AlgorithmVersion).Files.Where(f => f.State == FileState.Stale).Select(f => f.Path));
+
+        index.Update(files, v2);
+        Assert.Single(index.ChunksOf("B.txt"));
+        index.Save(path);
+        ChunkIndex reloaded = ChunkIndex.Load(path, KeyA);
+        Assert.DoesNotContain(reloaded.Status(store, files, v2.AlgorithmVersion).Files, f => f.State == FileState.Stale); // the version round-trips
+        Assert.Empty(reloaded.Update(files, v2).Added);
+    }
+
+    /// <summary>One name, two algorithms: version 1 cuts one chunk per line, version 2 one chunk per file.</summary>
+    private sealed class VersionedChunker(int version) : IChunker
+    {
+        public string Name => "versioned-1";
+        public int MaxChunkTokens => int.MaxValue;
+        public int AlgorithmVersion => version;
+        public IReadOnlyList<Chunk> Chunk(SourceFile file)
+        {
+            if (version == 1) return new LineChunker().Chunk(file);
+            int lines = file.Text.Count(c => c == '\n');
+            return file.Text.Length == 0 ? [] : [new Chunk(file.Path, 1, Math.Max(1, lines), file.Text.Select(c => (int)c).ToArray()) { StartOffset = 0, EndOffset = file.Text.Length }];
+        }
     }
 
     /// <summary>One chunk per line (a chunker that is neither symbol nor fixed).</summary>

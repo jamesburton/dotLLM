@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Cuda.Interop;
 
@@ -106,6 +107,15 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly nint _turboquantEncodeF32Func;
     private readonly nint _turboquantDequantF16Func;
     private readonly nint _turboquantEncodeF16Func;
+
+    // TurboQuant Q/O rotation (#1892 step 2) — optional module (turboquant_rotate.ptx): rotates the query into K code space and
+    // the accumulated attention output back out of V code space. `_dyn` twins read the row count from a device pointer.
+    private readonly CudaModule? _tqRotateModule;
+    private readonly nint _tqRotateQF16Func;
+    private readonly nint _tqRotateQF16DynFunc;
+    private readonly nint _tqRotateOF32Func;
+    private readonly nint _tqRotateOF32DynFunc;
+    private readonly nint _tqRotateOF16Func;   // #1892 Task 6: F16 output rotation (the dense attention output is F16)
 
     // PrismML Hadamard activation transform (hadamard_fwht.ptx) — optional module. The CUDA twin
     // of the Vulkan hadamard_fwht_f32 shader and DotLLM.Cpu.Kernels.Hadamard (issue #479). 0 when
@@ -615,6 +625,29 @@ public sealed unsafe partial class CudaKernels : IDisposable
     // fmtIndex = KvqIndex (0 q8q8, 1 q4q4, 2 q8q4, 3 q4q8) or 4 = f16f16 (the kernel-level oracle entry). Ampere-only, best effort.
     private readonly CudaModule? _attentionFlashPrefillKvqModule;
     private readonly nint[] _attentionFlashPrefillKvqFuncs = new nint[10];
+    // #1943 (E4): static shared memory of each of the above as compiled (CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES). The E4 body keeps its
+    // K / V tiles in static shared memory and takes no dynamic shared memory; a pre-E4 PTX reports 0 here and gets the legacy
+    // dynamic layout (AttentionFlashPrefillKvqSmemBytes). Read from the function, so a swapped PTX can never be under-allocated.
+    private readonly int[] _attentionFlashPrefillKvqStaticSmem = new int[10];
+    // #1943: the pre-E4 body under <entry>_legacy (dynamic shared memory), taken when it keeps more blocks resident per SM than
+    // the E4 entry (Q in registers costs ~30 registers: at GQA group 7, 224 threads, the E4 hd128 entries fit one block per SM
+    // where the legacy body fits two). Choice cached per entry and group (bit 0x10 = decided, bit 0x1 = legacy).
+    private readonly nint[] _attentionFlashPrefillKvqLegacyFuncs = new nint[10];
+    private readonly byte[] _attentionFlashPrefillKvqLegacyChoice = new byte[10 * 9];
+    // TurboQuant in-place twins of the above (#1892 Task 6, attention_flash_mma_prefill_kvq_hd{64,128}_tqtq, same module).
+    // Indexed 0 = hd64, 1 = hd128. Not part of the KvqIndex table: TQ needs norm / centroid pointers the q8/q4 launch lacks.
+    private readonly nint[] _attentionFlashPrefillKvTqFuncs = new nint[2];
+    // #1924 E1: bit-specialised TurboQuant prefill entries (_hd{64,128}_tq{2,3,4,8}), deferred norms + shared-memory centroid
+    // table. Indexed [hdIndex * 4 + TqSpecBitsIndex(bits)]. The generic _tqtq above stays for the other bit widths, F32 norms
+    // and the A/B.
+    private readonly nint[] _attentionFlashPrefillKvTqSpecFuncs = new nint[8];
+    // #1924 E3: the same with cp.async-staged raw code rows and one decoded tile (_tq{bits}_cpa; no hd64 tq3: 24-byte rows).
+    private readonly nint[] _attentionFlashPrefillKvTqCpaFuncs = new nint[8];
+
+    // Dense in-place TurboQuant attention (#1892 Task 6 -- native/kernels/attention_kvtq.cu): attention_kvq's skeleton reading
+    // CudaTurboQuantInPlaceKvCache's codes + norms in code space. Best-effort load: absent PTX leaves it 0 (HasAttentionKvTq false).
+    private readonly CudaModule? _attentionKvTqModule;
+    private readonly nint _attentionKvTqFunc;
 
     private readonly CudaModule? _attentionMmaDecodeKvqModule;
     private readonly nint[] _attentionMmaDecodeKvqFuncs = new nint[4];
@@ -881,6 +914,17 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _turboquantEncodeF32Func = _turboquantModule.TryGetFunction("turboquant_encode_f32");
             _turboquantDequantF16Func = _turboquantModule.TryGetFunction("turboquant_dequant_f16");
             _turboquantEncodeF16Func = _turboquantModule.TryGetFunction("turboquant_encode_f16");
+        }
+
+        string tqRotatePath = Path.Combine(ptxDir, "turboquant_rotate.ptx");
+        if (File.Exists(tqRotatePath))
+        {
+            _tqRotateModule = CudaModule.LoadFromFile(tqRotatePath);
+            _tqRotateQF16Func = _tqRotateModule.TryGetFunction("tq_rotate_q_f16");
+            _tqRotateQF16DynFunc = _tqRotateModule.TryGetFunction("tq_rotate_q_f16_dyn");
+            _tqRotateOF32Func = _tqRotateModule.TryGetFunction("tq_rotate_o_f32");
+            _tqRotateOF32DynFunc = _tqRotateModule.TryGetFunction("tq_rotate_o_f32_dyn");
+            _tqRotateOF16Func = _tqRotateModule.TryGetFunction("tq_rotate_o_f16");
         }
 
         string hadamardFwhtPath = Path.Combine(ptxDir, "hadamard_fwht.ptx");
@@ -1516,6 +1560,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
             }
         }
 
+        // Dense split-KV v2 decode, head_dim 64 / 128 (+ TurboQuant), issue #1922. Same best-effort load.
+        LoadDenseDecodeV2(ptxDir);
+
         // Flash-style tensor-core prefill attention, head_dim 256 (issue #962). Same best-effort
         // pattern as the decode kernels above: mma.sync/cp.async PTX is sm_80+, so a pre-Ampere
         // device (or stale PTX) throws CudaException at module load and the feature stays off.
@@ -1599,15 +1646,64 @@ public sealed unsafe partial class CudaKernels : IDisposable
                     {
                         nint fn = m.TryGetFunction($"attention_flash_mma_prefill_kvq_hd{(hd == 0 ? 64 : 128)}_{fmts[f]}");
                         if (fn != 0)
+                        {
                             SetMaxDynamicSharedBytes(fn, AttentionFlashPrefillHd256MaxSmemBytes);
+                            CudaDriverApi.cuFuncGetAttribute(out int staticSmem, CudaDriverApi.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn)
+                                .ThrowOnError();
+                            _attentionFlashPrefillKvqStaticSmem[hd * 5 + f] = staticSmem;
+                            nint lf = m.TryGetFunction($"attention_flash_mma_prefill_kvq_hd{(hd == 0 ? 64 : 128)}_{fmts[f]}_legacy");
+                            if (lf != 0)
+                                SetMaxDynamicSharedBytes(lf, AttentionFlashPrefillHd256MaxSmemBytes);
+                            _attentionFlashPrefillKvqLegacyFuncs[hd * 5 + f] = lf;
+                        }
                         _attentionFlashPrefillKvqFuncs[hd * 5 + f] = fn;
                     }
+                for (int hd = 0; hd < 2; hd++)
+                {
+                    nint fn = m.TryGetFunction($"attention_flash_mma_prefill_kvq_hd{(hd == 0 ? 64 : 128)}_tqtq");
+                    if (fn != 0)
+                        SetMaxDynamicSharedBytes(fn, AttentionFlashPrefillHd256MaxSmemBytes);
+                    _attentionFlashPrefillKvTqFuncs[hd] = fn;
+                    for (int b = 0; b < 4; b++)
+                    {
+                        nint fs = m.TryGetFunction($"attention_flash_mma_prefill_kvq_hd{(hd == 0 ? 64 : 128)}_tq{TqSpecBits[b]}");
+                        if (fs != 0)
+                            SetMaxDynamicSharedBytes(fs, AttentionFlashPrefillHd256MaxSmemBytes);
+                        _attentionFlashPrefillKvTqSpecFuncs[hd * 4 + b] = fs;
+                        nint fc = m.TryGetFunction($"attention_flash_mma_prefill_kvq_hd{(hd == 0 ? 64 : 128)}_tq{TqSpecBits[b]}_cpa");
+                        if (fc != 0)
+                            SetMaxDynamicSharedBytes(fc, AttentionFlashPrefillHd256MaxSmemBytes);
+                        _attentionFlashPrefillKvTqCpaFuncs[hd * 4 + b] = fc;
+                    }
+                }
                 _attentionFlashPrefillKvqModule = m;
             }
             catch (CudaException)
             {
                 _attentionFlashPrefillKvqModule = null;
                 Array.Clear(_attentionFlashPrefillKvqFuncs);
+                Array.Clear(_attentionFlashPrefillKvqStaticSmem);
+                Array.Clear(_attentionFlashPrefillKvqLegacyFuncs);
+                Array.Clear(_attentionFlashPrefillKvTqFuncs);
+                Array.Clear(_attentionFlashPrefillKvTqSpecFuncs);
+                Array.Clear(_attentionFlashPrefillKvTqCpaFuncs);
+            }
+        }
+
+        // Dense in-place TurboQuant attention (#1892 Task 6).
+        string attentionKvTqPath = Path.Combine(ptxDir, "attention_kvtq.ptx");
+        if (File.Exists(attentionKvTqPath))
+        {
+            try
+            {
+                var m = CudaModule.LoadFromFile(attentionKvTqPath);
+                _attentionKvTqFunc = m.TryGetFunction("attention_kvtq");
+                _attentionKvTqModule = m;
+            }
+            catch (CudaException)
+            {
+                _attentionKvTqModule = null;
+                _attentionKvTqFunc = 0;
             }
         }
     }
@@ -4977,6 +5073,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
         _ => false,
     };
 
+    /// <summary>Launches since process start of <see cref="LaunchAttention"/> with more than one query row (prefill; #1923 diagnostics).</summary>
+    internal static long AttentionF16PrefillLaunches;
+
     /// <summary>
     /// Naive scaled dot-product attention with causal mask and GQA.
     /// <para>
@@ -5005,6 +5104,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         // Tiled online softmax: q_shared[headDim] + score_tile[256] + out_accum[headDim] + warp_scratch[32]
         const int TileKv = 256;
         uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+        if (seqQ > 1) Interlocked.Increment(ref AttentionF16PrefillLaunches);
 
         CudaDriverApi.cuLaunchKernel(_attentionFunc,
                 (uint)numBlocks, 1, 1, BlockSize, 1, 1,
@@ -5063,6 +5163,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
 
     /// <summary>Launches since process start of <see cref="LaunchAttentionFlashPrefillKvq"/> with a quantized K/V pair.</summary>
     internal static long AttentionFlashPrefillKvqLaunches;
+
+    /// <summary>Launches since process start of <see cref="LaunchAttentionFlashPrefillKvq"/> with F16 K/V (null formats; #1923).</summary>
+    internal static long AttentionFlashPrefillF16Launches;
 
     private static int KvqFormatCode(KvCacheDType dtype) => dtype switch
     {
@@ -5136,7 +5239,11 @@ public sealed unsafe partial class CudaKernels : IDisposable
     }
     #pragma warning restore CS1573
 
-    /// <summary>Dynamic shared memory of the dense flash prefill kvq kernel for a head dim and GQA group.</summary>
+    /// <summary>
+    /// Dynamic shared memory of the pre-E4 flash prefill kvq layout (Q tile + double-buffered K / V) for a head dim and GQA group:
+    /// what the legacy TurboQuant <c>_tqtq</c> entries (and a pre-#1943 PTX) take, and an upper bound on the E4 entries' static
+    /// shared memory at every group (those hold no Q tile).
+    /// </summary>
     public static int AttentionFlashPrefillKvqSmemBytes(int headDim, int group)
         => (group * 16 * (headDim + 8) + 2 * 2 * 16 * (headDim + 8)) * 2;
 
@@ -5186,17 +5293,309 @@ public sealed unsafe partial class CudaKernels : IDisposable
         if (!IsAttentionFlashPrefillKvqShape(numHeads, numKvHeads, headDim))
             throw new ArgumentException($"Unsupported shape for the flash prefill kvq kernel: {numHeads}/{numKvHeads}/{headDim}.");
         DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
-        if (kDtype is not null) Interlocked.Increment(ref AttentionFlashPrefillKvqLaunches);
+        if (kDtype is not null)
+        {
+            // #1923: the quantized entries copy raw head rows with cp.async of 8 B (hd128) / 4 B (hd64); every head row is then
+            // aligned iff the base is.
+            int align = headDim == 128 ? 8 : 4;
+            if ((k % align) != 0 || (v % align) != 0)
+                throw new ArgumentException($"flash prefill kvq needs {align}-byte-aligned K/V block bases (hd{headDim}).");
+            Interlocked.Increment(ref AttentionFlashPrefillKvqLaunches);
+        }
+        else
+        {
+            // F16 K/V tiles are copied with 16-byte cp.async and Q tiles read as uint4 (#1923 review M4).
+            if (((k | v | q) & 15) != 0)
+                throw new ArgumentException("flash prefill kvq needs 16-byte-aligned Q and F16 K/V bases.");
+            Interlocked.Increment(ref AttentionFlashPrefillF16Launches);
+        }
 
         int group = numHeads / numKvHeads;
+        bool legacy = UseFlashPrefillKvqLegacy(idx, headDim, group);
+        nint fn = legacy ? _attentionFlashPrefillKvqLegacyFuncs[idx] : _attentionFlashPrefillKvqFuncs[idx];
+        uint smem = (uint)(!legacy && _attentionFlashPrefillKvqStaticSmem[idx] > 0 ? 0 : AttentionFlashPrefillKvqSmemBytes(headDim, group));
+        if (legacy) Interlocked.Increment(ref AttentionFlashPrefillKvqLegacyBodyLaunches);
         nint qArg = q, kArg = k, vArg = v, oArg = output;
         int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, poArg = positionOffset;
         float scArg = 1f / MathF.Sqrt(headDim);
         void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &sqArg, &skvArg, &nhArg, &nkvArg, &poArg, &scArg };
-        CudaDriverApi.cuLaunchKernel(_attentionFlashPrefillKvqFuncs[idx],
+        CudaDriverApi.cuLaunchKernel(fn,
                 (uint)((seqQ + 15) / 16), (uint)numKvHeads, 1, (uint)(group * 32), 1, 1,
-                (uint)AttentionFlashPrefillKvqSmemBytes(headDim, group), stream, (nint)args, 0).ThrowOnError();
+                smem, stream, (nint)args, 0).ThrowOnError();
     }
+
+    /// <summary>Launches since process start of the flash prefill kvq kernel that took the <c>_legacy</c> (pre-E4) body (#1943).</summary>
+    internal static long AttentionFlashPrefillKvqLegacyBodyLaunches;
+
+    /// <summary>Test / A/B override of the #1943 body choice: null = by occupancy, true = always legacy, false = always E4.</summary>
+    internal static bool? FlashPrefillKvqLegacyBodyOverride;
+
+    /// <summary>
+    /// True when the <c>_legacy</c> twin of entry <paramref name="idx"/> keeps more blocks resident per SM than the E4 entry at this
+    /// group (cuOccupancyMaxActiveBlocksPerMultiprocessor, each with its own shared memory); ties go to E4. A PTX without twins (pre-E4,
+    /// or a test build) always takes the plain entry.
+    /// </summary>
+    internal bool UseFlashPrefillKvqLegacy(int idx, int headDim, int group)
+    {
+        nint lf = _attentionFlashPrefillKvqLegacyFuncs[idx];
+        if (lf == 0 || _attentionFlashPrefillKvqStaticSmem[idx] == 0) return false;
+        if (FlashPrefillKvqLegacyBodyOverride is { } forced) return forced;
+        int slot = idx * 9 + group;
+        byte c = _attentionFlashPrefillKvqLegacyChoice[slot];
+        if (c == 0)
+        {
+            CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(out int e4, _attentionFlashPrefillKvqFuncs[idx], group * 32, 0)
+                .ThrowOnError();
+            CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(out int old, lf, group * 32,
+                (nuint)AttentionFlashPrefillKvqSmemBytes(headDim, group)).ThrowOnError();
+            c = (byte)(0x10 | (old > e4 ? 1 : 0));
+            _attentionFlashPrefillKvqLegacyChoice[slot] = c;
+        }
+        return (c & 1) != 0;
+    }
+
+    /// <summary>Static shared memory of the loaded flash prefill kvq entry (0 = a pre-E4 entry on the dynamic layout; #1943).</summary>
+    internal int AttentionFlashPrefillKvqStaticSmemBytes(int headDim, KvCacheDType? kDtype, KvCacheDType? vDtype)
+    {
+        int i = FlashPrefillKvqIndex(headDim, kDtype, vDtype);
+        return i < 0 ? 0 : _attentionFlashPrefillKvqStaticSmem[i];
+    }
+
+    /// <summary>True when the scalar in-place TurboQuant attention kernel (#1892 Task 6, <c>attention_kvtq.ptx</c>) is loaded.</summary>
+    public bool HasAttentionKvTq => _attentionKvTqFunc != 0;
+
+    /// <summary>Launches since process start of <see cref="LaunchAttentionKvTq"/> (diagnostics: a test can prove the scalar TQ arm ran).</summary>
+    internal static long AttentionKvTqLaunches;
+
+    /// <summary>Launches since process start of <see cref="LaunchAttentionFlashPrefillKvTq"/>.</summary>
+    internal static long AttentionFlashPrefillKvTqLaunches;
+
+    private static void CheckKvTq(int headDim, int mseBits, int codeUintsPerVec, TqNormFormat normFormat)
+    {
+        if (headDim <= 0 || (headDim & (headDim - 1)) != 0 || headDim > 256)
+            throw new ArgumentException($"TurboQuant attention needs a power-of-two head_dim <= 256; got {headDim}.", nameof(headDim));
+        if (mseBits is < 1 or > 8) throw new ArgumentOutOfRangeException(nameof(mseBits));
+        if (codeUintsPerVec <= 0) throw new ArgumentOutOfRangeException(nameof(codeUintsPerVec));
+        if (normFormat is not (TqNormFormat.F32Reference or TqNormFormat.F16 or TqNormFormat.Bf16))
+            throw new NotSupportedException($"TurboQuant attention supports F32Reference, F16 and Bf16 norms; got {normFormat}.");
+    }
+
+    /// <summary>
+    /// Scalar attention over the dense in-place TurboQuant KV cache, read in code space (#1892 Task 6, <c>attention_kvtq</c>).
+    /// <paramref name="q"/> is F16 <c>[seqQ, numHeads*headDim]</c> ALREADY rotated into K code space (<see cref="LaunchTqRotateQ"/>
+    /// with the K signs); <paramref name="output"/> receives the F16 V-code-space output, which the caller rotates back with
+    /// <see cref="LaunchTqRotateOF16"/> and the V signs. K / V rows <c>[0, seqKv)</c> are <paramref name="mseBits"/>-bit codes at
+    /// <paramref name="codeUintsPerVec"/> words per (position, kv head) plus one norm per head vector in
+    /// <paramref name="normFormat"/>; <paramref name="centroids"/> is the F32 Lloyd-Max table. Same grid, shared memory, causal
+    /// masking, sliding window and sinks as <see cref="LaunchAttentionKvq"/>; there is no FP16 window ring.
+    /// </summary>
+    #pragma warning disable CS1573
+    public void LaunchAttentionKvTq(nint q, nint kCodes, nint vCodes, nint kNorms, nint vNorms, nint centroids, nint output,
+                                    int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+                                    int positionOffset, int slidingWindow, nint stream, nint sinks,
+                                    int mseBits, int codeUintsPerVec, TqNormFormat normFormat)
+    {
+        if (_attentionKvTqFunc == 0)
+            throw new InvalidOperationException("attention_kvtq kernel is not loaded (attention_kvtq.ptx missing/stale).");
+        CheckKvTq(headDim, mseBits, codeUintsPerVec, normFormat);
+        if (numKvHeads <= 0 || numHeads % numKvHeads != 0)
+            throw new ArgumentException($"num_heads {numHeads} must be a multiple of num_kv_heads {numKvHeads}.");
+        if (seqQ <= 0) return;
+        nint qArg = q, kcArg = kCodes, vcArg = vCodes, knArg = kNorms, vnArg = vNorms, ceArg = centroids, outArg = output, sinksArg = sinks;
+        int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        int poArg = positionOffset, swArg = slidingWindow, mbArg = mseBits, cuArg = codeUintsPerVec, nfArg = (int)normFormat;
+
+        void** args = stackalloc void*[] {&qArg, &kcArg, &vcArg, &knArg, &vnArg, &ceArg, &outArg,
+                        &sqArg, &skvArg, &nhArg, &nkvArg, &hdArg, &poArg, &swArg, &sinksArg,
+                        &mbArg, &cuArg, &nfArg};
+
+        const int TileKv = 256;
+        uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+        Interlocked.Increment(ref AttentionKvTqLaunches);
+        CudaDriverApi.cuLaunchKernel(_attentionKvTqFunc,
+                (uint)(seqQ * numHeads), 1, 1, BlockSize, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+    #pragma warning restore CS1573
+
+    /// <summary>True when the tensor-core in-place TurboQuant prefill kernel (#1892 Task 6) for this head dim (64 / 128) is loaded.</summary>
+    public bool HasAttentionFlashPrefillKvTq(int headDim)
+        => headDim switch { 64 => _attentionFlashPrefillKvTqFuncs[0] != 0, 128 => _attentionFlashPrefillKvTqFuncs[1] != 0, _ => false };
+
+    /// <summary>Bit widths with a specialised tensor-core TurboQuant prefill entry (#1924 E1).</summary>
+    private static readonly int[] TqSpecBits = { 2, 3, 4, 8 };
+
+    private static int TqSpecBitsIndex(int bits) => bits switch { 2 => 0, 3 => 1, 4 => 2, 8 => 3, _ => -1 };
+
+    /// <summary>Which tensor-core TurboQuant prefill entry <see cref="LaunchAttentionFlashPrefillKvTq"/> runs (#1924 A/B).</summary>
+    public enum TqPrefillVariant
+    {
+        /// <summary>The generic <c>_tqtq</c> entry: runtime bits, per-element <c>half(norm * centroid)</c> from global memory.</summary>
+        Legacy,
+        /// <summary>The bit-specialised <c>_tq{2,3,4,8}</c> entry: shared-memory centroid table, norms applied to the score and P (E1).</summary>
+        Specialized,
+        /// <summary>E1 plus cp.async-staged raw code rows and one decoded K / V tile (<c>_tq{2,3,4,8}_cpa</c>, E3).</summary>
+        Staged,
+    }
+
+    /// <summary>
+    /// <c>DOTLLM_CUDA_TQ_PREFILL</c> = <c>legacy</c> | <c>spec</c> | <c>cpa</c> picks the TurboQuant prefill entry for the #1924 A/B;
+    /// unset = <see cref="DefaultTqPrefillVariantFor"/>. A variant that does not apply to a launch falls back (cpa -> spec -> legacy).
+    /// </summary>
+    private static readonly TqPrefillVariant? s_tqPrefillEnvVariant = Environment.GetEnvironmentVariable("DOTLLM_CUDA_TQ_PREFILL")?.ToLowerInvariant() switch
+    {
+        "legacy" => TqPrefillVariant.Legacy,
+        "spec" => TqPrefillVariant.Specialized,
+        "cpa" or "staged" or "e3" => TqPrefillVariant.Staged,
+        "specialized" or "specialised" or "e1" => TqPrefillVariant.Specialized,
+        null or "" => null,
+        var other => WarnUnknownTqPrefill(other),
+    };
+
+    /// <summary>The TurboQuant prefill entry used when neither the environment nor a test override picks one.</summary>
+    /// <remarks>#1924, James 2026-11-22: Staged (E3), on the model-level bench (framework RTX 3060, Qwen3-4B Q4_K_M tq4, prefill
+    /// chunk 1024): 1.34x legacy at 7K and 2.16x at 32K; 0.983x q4_0 at 7K (counted as parity) and 1.113x at 32K, with 8% fewer KV
+    /// bytes per token. tq3 has its own default (<see cref="DefaultTq3PrefillVariant"/>). Legacy stays reachable with
+    /// <c>DOTLLM_CUDA_TQ_PREFILL=legacy</c>. Staged falls back to Specialized (hd64 tq3, unaligned code buffers), then Legacy.</remarks>
+    internal const TqPrefillVariant DefaultTqPrefillVariant = TqPrefillVariant.Staged;
+
+    /// <summary>
+    /// The tq3 default (#1924). Staged: after #1922's v2 TurboQuant decode merged, Qwen3-4B tq3 had better KL than legacy (0.4259 vs
+    /// 0.4311) but 24/33 top-1 against a fixed floor of legacy 26 - 1. James 2026-11-23 ("band top-1 too"): the top-1 floor is legacy
+    /// minus the control arms' own top-1 spread (they spanned 22-26/33 on that run), derived per run like the KL band.
+    /// </summary>
+    internal const TqPrefillVariant DefaultTq3PrefillVariant = TqPrefillVariant.Staged;
+
+    /// <summary>The entry used for <paramref name="mseBits"/> when neither the environment nor a test override picks one.</summary>
+    internal static TqPrefillVariant DefaultTqPrefillVariantFor(int mseBits)
+        => mseBits == 3 ? DefaultTq3PrefillVariant : DefaultTqPrefillVariant;
+
+    private static int s_tqPrefillEntryReported;
+
+    /// <summary>
+    /// Test-only (#1924, James 2026-11-22): +1 / -1 moves the TurboQuant prefill's softmax scale by one F32 ulp, a deliberate 1-ULP
+    /// perturbation of an otherwise unchanged entry. Its KL-to-F16 movement is the drift band the depth gate's tolerance comes from.
+    /// </summary>
+    internal static int TqPrefillScaleUlpNudge;
+
+    /// <summary>
+    /// An unrecognised non-empty <c>DOTLLM_CUDA_TQ_PREFILL</c> is said once on stderr (an A/B arm labelled with a typo would otherwise
+    /// silently run the default) and then ignored.
+    /// </summary>
+    private static TqPrefillVariant? WarnUnknownTqPrefill(string value)
+    {
+        Console.Error.WriteLine($"dotLLM CUDA: DOTLLM_CUDA_TQ_PREFILL={value} is not legacy|spec|cpa (or staged|e1|e3); using the default entry");
+        return null;
+    }
+
+    /// <summary>Test / bench override of the TurboQuant prefill entry; null = automatic (<see cref="DefaultTqPrefillVariantFor"/>).</summary>
+    internal static TqPrefillVariant? TqPrefillVariantOverride;
+
+    /// <summary>Launches since process start that ran a specialised <c>_tq{bits}</c> entry (a subset of <see cref="AttentionFlashPrefillKvTqLaunches"/>).</summary>
+    internal static long AttentionFlashPrefillKvTqSpecLaunches;
+
+    /// <summary>Launches since process start that ran a staged <c>_tq{bits}_cpa</c> entry (a subset of <see cref="AttentionFlashPrefillKvTqLaunches"/>).</summary>
+    internal static long AttentionFlashPrefillKvTqCpaLaunches;
+
+    /// <summary>True when the cp.async-staged TurboQuant prefill entry (#1924 E3) for this head dim and bit width is loaded.</summary>
+    public bool HasAttentionFlashPrefillKvTqStaged(int headDim, int mseBits)
+    {
+        int hd = headDim == 64 ? 0 : headDim == 128 ? 1 : -1, b = TqSpecBitsIndex(mseBits);
+        return hd >= 0 && b >= 0 && _attentionFlashPrefillKvTqCpaFuncs[hd * 4 + b] != 0;
+    }
+
+    /// <summary>True when the bit-specialised TurboQuant prefill entry for this head dim and bit width is loaded (#1924 E1).</summary>
+    public bool HasAttentionFlashPrefillKvTqSpecialized(int headDim, int mseBits)
+    {
+        int hd = headDim == 64 ? 0 : headDim == 128 ? 1 : -1, b = TqSpecBitsIndex(mseBits);
+        return hd >= 0 && b >= 0 && _attentionFlashPrefillKvTqSpecFuncs[hd * 4 + b] != 0;
+    }
+
+    /// <summary>
+    /// Dynamic shared memory of a specialised TurboQuant prefill entry (#1924), matching the layouts in attention_flash_mma_prefill_kvq.cu:
+    /// Q <c>[group][16][hd+8]</c> halves, then for E1 two decoded K and V tiles plus the raw 16-bit norms of both (2 x 2 x 16 x 2 B); for
+    /// E3 (<paramref name="staged"/>) one decoded K and V tile, the raw code rows of two tiles per side (2 x 2 x 16 x CodeUintsPerVec x 4 B)
+    /// and one tile's norms (2 x 16 x 2 B). Both end with the F16 centroid table (<c>PkTqSpec&lt;BITS&gt;::TABLE_BYTES</c>: tq2 256 x 4
+    /// halves, tq3 64 x half2, tq4 256 x half2, tq8 256 halves).
+    /// </summary>
+    public static int AttentionFlashPrefillKvTqSpecSmemBytes(int headDim, int group, int mseBits, bool staged)
+    {
+        int table = mseBits switch { 2 => 2048, 3 => 256, 4 => 1024, 8 => 512, _ => throw new ArgumentOutOfRangeException(nameof(mseBits)) };
+        int q = group * 16 * (headDim + 8) * 2;
+        if (!staged) return q + 2 * 2 * 16 * (headDim + 8) * 2 + table + 2 * 2 * 16 * 2;
+        int cu = headDim * mseBits / 32;
+        return q + 2 * 16 * (headDim + 8) * 2 + 2 * 2 * 16 * cu * 4 + table + 2 * 16 * 2;
+    }
+
+    /// <summary>
+    /// Tensor-core causal prefill attention over the dense in-place TurboQuant KV cache (#1892 Task 6,
+    /// <c>attention_flash_mma_prefill_kvq_hd{64,128}_tqtq</c>): the <see cref="LaunchAttentionFlashPrefillKvq"/> body with a TQ tile
+    /// loader (each element <c>half(norm * centroid[code])</c>). Same code-space contract as <see cref="LaunchAttentionKvTq"/>:
+    /// <paramref name="q"/> already rotated with the K signs, <paramref name="output"/> rotated back by the caller. Caller checks
+    /// <see cref="IsAttentionFlashPrefillKvqShape"/> and <see cref="HasAttentionFlashPrefillKvTq"/>; no sliding window or sinks.
+    /// </summary>
+    #pragma warning disable CS1573
+    public void LaunchAttentionFlashPrefillKvTq(nint q, nint kCodes, nint vCodes, nint kNorms, nint vNorms, nint centroids, nint output,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset,
+        int mseBits, int codeUintsPerVec, TqNormFormat normFormat, nint stream)
+    {
+        int hdIdx = headDim == 64 ? 0 : headDim == 128 ? 1 : -1;
+        if (hdIdx < 0 || _attentionFlashPrefillKvTqFuncs[hdIdx] == 0)
+            throw new InvalidOperationException($"attention_flash_mma_prefill_kvq kernel for hd{headDim} TurboQuant is not loaded.");
+        if (!IsAttentionFlashPrefillKvqShape(numHeads, numKvHeads, headDim))
+            throw new ArgumentException($"Unsupported shape for the flash prefill kvq kernel: {numHeads}/{numKvHeads}/{headDim}.");
+        CheckKvTq(headDim, mseBits, codeUintsPerVec, normFormat);
+        DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
+
+        // #1924: a specialised entry needs a compiled-in bit width, a 16-bit norm format (staged raw in shared memory; the F32 oracle
+        // format stays on the generic entry) and the TurboQuantLayout word count it was compiled for; the staged one also 16-byte
+        // aligned code buffers (cp.async). Fallback order cpa -> spec -> legacy; a test override that cannot be honoured throws.
+        int group = numHeads / numKvHeads;
+        nint fn = _attentionFlashPrefillKvTqFuncs[hdIdx];
+        int smem = AttentionFlashPrefillKvqSmemBytes(headDim, group);
+        TqPrefillVariant want = TqPrefillVariantOverride ?? s_tqPrefillEnvVariant ?? DefaultTqPrefillVariantFor(mseBits);
+        int bIdx = TqSpecBitsIndex(mseBits);
+        bool specOk = bIdx >= 0 && normFormat is TqNormFormat.F16 or TqNormFormat.Bf16
+                      && codeUintsPerVec == ((headDim * mseBits + 7) / 8 + 3) / 4;
+        TqPrefillVariant ran = TqPrefillVariant.Legacy;
+        if (want == TqPrefillVariant.Staged && specOk && _attentionFlashPrefillKvTqCpaFuncs[hdIdx * 4 + bIdx] != 0
+            && ((kCodes | vCodes) & 15) == 0)
+        {
+            fn = _attentionFlashPrefillKvTqCpaFuncs[hdIdx * 4 + bIdx];
+            smem = AttentionFlashPrefillKvTqSpecSmemBytes(headDim, group, mseBits, staged: true);
+            ran = TqPrefillVariant.Staged;
+            Interlocked.Increment(ref AttentionFlashPrefillKvTqCpaLaunches);
+        }
+        else if (want != TqPrefillVariant.Legacy && specOk && _attentionFlashPrefillKvTqSpecFuncs[hdIdx * 4 + bIdx] != 0
+                 && (mseBits != 8 || ((kCodes | vCodes) & 7) == 0))   // E1 tq8 reads uint2 code pairs from global memory
+        {
+            fn = _attentionFlashPrefillKvTqSpecFuncs[hdIdx * 4 + bIdx];
+            smem = AttentionFlashPrefillKvTqSpecSmemBytes(headDim, group, mseBits, staged: false);
+            ran = TqPrefillVariant.Specialized;
+            Interlocked.Increment(ref AttentionFlashPrefillKvTqSpecLaunches);
+        }
+        if (TqPrefillVariantOverride is { } forced && forced != ran)
+            throw new InvalidOperationException($"TurboQuant prefill variant {forced} requested but not applicable (hd{headDim} b{mseBits} {normFormat}).");
+        if (smem > AttentionFlashPrefillHd256MaxSmemBytes)
+            throw new ArgumentException($"TurboQuant prefill needs {smem} B of shared memory (> {AttentionFlashPrefillHd256MaxSmemBytes}).");
+        Interlocked.Increment(ref AttentionFlashPrefillKvTqLaunches);
+        // A/B proof: when the switch is set, say once per process which entry actually ran (the CLI exposes no launch counters).
+        if (s_tqPrefillEnvVariant is not null && Interlocked.Exchange(ref s_tqPrefillEntryReported, 1) == 0)
+            Console.Error.WriteLine($"dotLLM CUDA: TurboQuant prefill entry {ran} (DOTLLM_CUDA_TQ_PREFILL={s_tqPrefillEnvVariant}, hd{headDim} tq{mseBits})");
+
+        nint qArg = q, kcArg = kCodes, vcArg = vCodes, knArg = kNorms, vnArg = vNorms, ceArg = centroids, oArg = output;
+        int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, poArg = positionOffset;
+        float scArg = 1f / MathF.Sqrt(headDim);
+        if (TqPrefillScaleUlpNudge != 0)   // #1924 drift control only: one F32 ulp on the softmax scale
+            scArg = TqPrefillScaleUlpNudge > 0 ? MathF.BitIncrement(scArg) : MathF.BitDecrement(scArg);
+        int mbArg = mseBits, cuArg = codeUintsPerVec, nfArg = (int)normFormat;
+        void** args = stackalloc void*[] { &qArg, &kcArg, &vcArg, &knArg, &vnArg, &ceArg, &oArg,
+                                           &sqArg, &skvArg, &nhArg, &nkvArg, &poArg, &scArg, &mbArg, &cuArg, &nfArg };
+        CudaDriverApi.cuLaunchKernel(fn,
+                (uint)((seqQ + 15) / 16), (uint)numKvHeads, 1, (uint)(group * 32), 1, 1,
+                (uint)smem, stream, (nint)args, 0).ThrowOnError();
+    }
+    #pragma warning restore CS1573
 
     /// <summary>
     /// Whether the opt-in direct block-table-read paged decode attention kernel (issue #200,
@@ -7121,14 +7520,15 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// </summary>
     public unsafe void LaunchTurboQuantDequantF32(
         nint codes, nint norms, nint centroids, nint signs, nint dst,
-        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD, nint stream)
+        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD, nint stream,
+        TqNormFormat normFormat = TqNormFormat.F32Reference)
     {
         if (_turboquantDequantF32Func == 0)
             throw new InvalidOperationException("turboquant_dequant_f32 not loaded (turboquant.ptx missing/stale).");
         nint c = codes, n = norms, ce = centroids, s = signs, d = dst;
         int nv = numVectors, hd = headDim, nkv = numKvHeads, mb = mseBits, cu = codeUintsPerVec;
-        float isd = invSqrtD;
-        void** args = stackalloc void*[] { &c, &n, &ce, &s, &d, &nv, &hd, &nkv, &mb, &cu, &isd };
+        float isd = invSqrtD; int nf = (int)normFormat;
+        void** args = stackalloc void*[] { &c, &n, &ce, &s, &d, &nv, &hd, &nkv, &mb, &cu, &isd, &nf };
         CudaDriverApi.cuLaunchKernel(_turboquantDequantF32Func,
                 (uint)numVectors, 1, 1, 256, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
@@ -7142,14 +7542,14 @@ public sealed unsafe partial class CudaKernels : IDisposable
     public unsafe void LaunchTurboQuantEncodeF32(
         nint src, nint centroids, nint signs, nint codes, nint norms,
         int seqLen, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, int levelCount, int startPos,
-        float invSqrtD, nint stream)
+        float invSqrtD, nint stream, TqNormFormat normFormat = TqNormFormat.F32Reference)
     {
         if (_turboquantEncodeF32Func == 0)
             throw new InvalidOperationException("turboquant_encode_f32 not loaded (turboquant.ptx missing/stale).");
         nint sr = src, ce = centroids, sg = signs, co = codes, no = norms;
         int hd = headDim, nkv = numKvHeads, mb = mseBits, cu = codeUintsPerVec, lc = levelCount, sp = startPos;
-        float isd = invSqrtD;
-        void** args = stackalloc void*[] { &sr, &ce, &sg, &co, &no, &hd, &nkv, &mb, &cu, &lc, &sp, &isd };
+        float isd = invSqrtD; int nf = (int)normFormat;
+        void** args = stackalloc void*[] { &sr, &ce, &sg, &co, &no, &hd, &nkv, &mb, &cu, &lc, &sp, &isd, &nf };
         CudaDriverApi.cuLaunchKernel(_turboquantEncodeF32Func,
                 (uint)(seqLen * numKvHeads), 1, 1, 256, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
@@ -7161,14 +7561,15 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <summary>FP16 TurboQuant dequant: codes + fp32 norm → contiguous <c>half</c> scratch (attention input).</summary>
     public unsafe void LaunchTurboQuantDequantF16(
         nint codes, nint norms, nint centroids, nint signs, nint dst,
-        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD, nint stream)
+        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD, nint stream,
+        TqNormFormat normFormat = TqNormFormat.F32Reference)
     {
         if (_turboquantDequantF16Func == 0)
             throw new InvalidOperationException("turboquant_dequant_f16 not loaded (turboquant.ptx missing/stale).");
         nint c = codes, n = norms, ce = centroids, s = signs, d = dst;
         int nv = numVectors, hd = headDim, nkv = numKvHeads, mb = mseBits, cu = codeUintsPerVec;
-        float isd = invSqrtD;
-        void** args = stackalloc void*[] { &c, &n, &ce, &s, &d, &nv, &hd, &nkv, &mb, &cu, &isd };
+        float isd = invSqrtD; int nf = (int)normFormat;
+        void** args = stackalloc void*[] { &c, &n, &ce, &s, &d, &nv, &hd, &nkv, &mb, &cu, &isd, &nf };
         CudaDriverApi.cuLaunchKernel(_turboquantDequantF16Func,
                 (uint)numVectors, 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
     }
@@ -7177,16 +7578,119 @@ public sealed unsafe partial class CudaKernels : IDisposable
     public unsafe void LaunchTurboQuantEncodeF16(
         nint src, nint centroids, nint signs, nint codes, nint norms,
         int seqLen, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, int levelCount, int startPos,
-        float invSqrtD, nint stream)
+        float invSqrtD, nint stream, TqNormFormat normFormat = TqNormFormat.F32Reference)
     {
         if (_turboquantEncodeF16Func == 0)
             throw new InvalidOperationException("turboquant_encode_f16 not loaded (turboquant.ptx missing/stale).");
         nint sr = src, ce = centroids, sg = signs, co = codes, no = norms;
         int hd = headDim, nkv = numKvHeads, mb = mseBits, cu = codeUintsPerVec, lc = levelCount, sp = startPos;
-        float isd = invSqrtD;
-        void** args = stackalloc void*[] { &sr, &ce, &sg, &co, &no, &hd, &nkv, &mb, &cu, &lc, &sp, &isd };
+        float isd = invSqrtD; int nf = (int)normFormat;
+        void** args = stackalloc void*[] { &sr, &ce, &sg, &co, &no, &hd, &nkv, &mb, &cu, &lc, &sp, &isd, &nf };
         CudaDriverApi.cuLaunchKernel(_turboquantEncodeF16Func,
                 (uint)(seqLen * numKvHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Whether the TurboQuant Q/O rotation kernels (and their <c>_dyn</c> twins) are loaded.</summary>
+    public bool TqRotateAvailable => _tqRotateQF16Func != 0 && _tqRotateQF16DynFunc != 0
+                                     && _tqRotateOF32Func != 0 && _tqRotateOF32DynFunc != 0;
+
+    private static void CheckTqRotate(int numHeads, int headDim)
+    {
+        if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
+        if (headDim <= 0 || (headDim & (headDim - 1)) != 0 || headDim > 256)
+            throw new ArgumentException($"headDim must be a power of two <= 256; got {headDim}.", nameof(headDim));
+    }
+
+    /// <summary>
+    /// Rotates the FP16 query <c>[rows, numHeads, headDim]</c> into K code space in place: <c>q~ = H(S_k * q)/sqrt(d)</c>.
+    /// One block per (row, head). <paramref name="signsK"/> is the device F32 K-side +/-1 sign vector (<c>headDim</c> floats).
+    /// </summary>
+    public unsafe void LaunchTqRotateQ(nint qF16, int rows, int numHeads, int headDim, nint signsK, nint stream)
+    {
+        if (_tqRotateQF16Func == 0)
+            throw new InvalidOperationException("tq_rotate_q_f16 not loaded (turboquant_rotate.ptx missing/stale).");
+        CheckTqRotate(numHeads, headDim);
+        if (rows <= 0) return;
+        nint q = qF16, sg = signsK; int r = rows, nh = numHeads, hd = headDim;
+        float isd = 1.0f / MathF.Sqrt(headDim);
+        void** args = stackalloc void*[] { &q, &sg, &r, &nh, &hd, &isd };
+        CudaDriverApi.cuLaunchKernel(_tqRotateQF16Func,
+                (uint)(rows * numHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// CUDA-graph-capture-safe twin of <see cref="LaunchTqRotateQ"/>: the live row count is read from the device int at
+    /// <paramref name="rowsPtr"/>; the grid covers <paramref name="maxRows"/> (the capture-time maximum) and surplus blocks exit.
+    /// <para>The live count is effectively clamped to <paramref name="maxRows"/>: the grid cannot grow, so a device-side count above it
+    /// leaves the rows past <paramref name="maxRows"/> unrotated, silently. The caller must pass a <paramref name="maxRows"/> at least as
+    /// large as any live count it will ever store.</para>
+    /// </summary>
+    public unsafe void LaunchTqRotateQDyn(nint qF16, nint rowsPtr, int maxRows, int numHeads, int headDim, nint signsK, nint stream)
+    {
+        if (_tqRotateQF16DynFunc == 0)
+            throw new InvalidOperationException("tq_rotate_q_f16_dyn not loaded (turboquant_rotate.ptx missing/stale).");
+        CheckTqRotate(numHeads, headDim);
+        if (maxRows <= 0) return;
+        nint q = qF16, sg = signsK, rp = rowsPtr; int nh = numHeads, hd = headDim;
+        float isd = 1.0f / MathF.Sqrt(headDim);
+        void** args = stackalloc void*[] { &q, &sg, &rp, &nh, &hd, &isd };
+        CudaDriverApi.cuLaunchKernel(_tqRotateQF16DynFunc,
+                (uint)(maxRows * numHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Rotates the F32 code-space attention output <c>[rows, numHeads, headDim]</c> back in place: <c>o = S_v * H(a~)/sqrt(d)</c>.
+    /// One block per (row, head). <paramref name="signsV"/> is the device F32 V-side +/-1 sign vector.
+    /// </summary>
+    public unsafe void LaunchTqRotateO(nint oF32, int rows, int numHeads, int headDim, nint signsV, nint stream)
+    {
+        if (_tqRotateOF32Func == 0)
+            throw new InvalidOperationException("tq_rotate_o_f32 not loaded (turboquant_rotate.ptx missing/stale).");
+        CheckTqRotate(numHeads, headDim);
+        if (rows <= 0) return;
+        nint o = oF32, sg = signsV; int r = rows, nh = numHeads, hd = headDim;
+        float isd = 1.0f / MathF.Sqrt(headDim);
+        void** args = stackalloc void*[] { &o, &sg, &r, &nh, &hd, &isd };
+        CudaDriverApi.cuLaunchKernel(_tqRotateOF32Func,
+                (uint)(rows * numHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Whether the F16 output rotation (<c>tq_rotate_o_f16</c>, #1892 Task 6) is loaded.</summary>
+    public bool TqRotateOF16Available => _tqRotateOF16Func != 0;
+
+    /// <summary>
+    /// Rotates the F16 code-space attention output <c>[rows, numHeads, headDim]</c> back in place: <c>o = S_v * H(a~)/sqrt(d)</c>,
+    /// with the WHT in F32 shared memory and one F16 store (the dense attention arms write F16; no F32 copy is stored).
+    /// <paramref name="signsV"/> is the device F32 V-side +/-1 sign vector.
+    /// </summary>
+    public unsafe void LaunchTqRotateOF16(nint oF16, int rows, int numHeads, int headDim, nint signsV, nint stream)
+    {
+        if (_tqRotateOF16Func == 0)
+            throw new InvalidOperationException("tq_rotate_o_f16 not loaded (turboquant_rotate.ptx missing/stale).");
+        CheckTqRotate(numHeads, headDim);
+        if (rows <= 0) return;
+        nint o = oF16, sg = signsV; int r = rows, nh = numHeads, hd = headDim;
+        float isd = 1.0f / MathF.Sqrt(headDim);
+        void** args = stackalloc void*[] { &o, &sg, &r, &nh, &hd, &isd };
+        CudaDriverApi.cuLaunchKernel(_tqRotateOF16Func,
+                (uint)(rows * numHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// CUDA-graph-capture-safe twin of <see cref="LaunchTqRotateO"/> (row count read from a device pointer). As for
+    /// <see cref="LaunchTqRotateQDyn"/>, a live count above <paramref name="maxRows"/> is clamped to it, leaving later rows unrotated.
+    /// </summary>
+    public unsafe void LaunchTqRotateODyn(nint oF32, nint rowsPtr, int maxRows, int numHeads, int headDim, nint signsV, nint stream)
+    {
+        if (_tqRotateOF32DynFunc == 0)
+            throw new InvalidOperationException("tq_rotate_o_f32_dyn not loaded (turboquant_rotate.ptx missing/stale).");
+        CheckTqRotate(numHeads, headDim);
+        if (maxRows <= 0) return;
+        nint o = oF32, sg = signsV, rp = rowsPtr; int nh = numHeads, hd = headDim;
+        float isd = 1.0f / MathF.Sqrt(headDim);
+        void** args = stackalloc void*[] { &o, &sg, &rp, &nh, &hd, &isd };
+        CudaDriverApi.cuLaunchKernel(_tqRotateOF32DynFunc,
+                (uint)(maxRows * numHeads), 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>Dequantizes a quantized weight/KV blob to a contiguous fp32 buffer on device.</summary>
@@ -8449,6 +8953,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
     public void Dispose()
     {
         _attentionSoftmaxCausalOffsetModule?.Dispose();
+        _denseDecodeV2Module?.Dispose();
         _rmsnormModule.Dispose();
         _ropeModule.Dispose();
         _swigluModule.Dispose();
@@ -8493,6 +8998,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         _nemotronMoeModule?.Dispose();
         _quantKvModule?.Dispose();
         _turboquantModule?.Dispose();
+        _tqRotateModule?.Dispose();
         _hadamardFwhtModule?.Dispose();
         _pq2_0GemvMultiModule?.Dispose();
         _pq2_0GemvDp4aModule?.Dispose();

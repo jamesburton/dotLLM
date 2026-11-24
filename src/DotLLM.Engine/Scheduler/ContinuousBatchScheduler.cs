@@ -200,6 +200,56 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         _supportsThreadedState = model.SupportsThreadedSequenceState;
     }
 
+    private bool _loggedPrefillBound;
+
+    /// <summary>True when a pending prefill is longer than the model's hard per-forward limit (<see cref="IModel.MaxPrefillForwardTokens"/>, #1892).</summary>
+    private bool PrefillOverBound()
+    {
+        int cap = _model.MaxPrefillForwardTokens;
+        if (cap <= 0) return false;
+        for (int i = 0; i < _prefillReady.Count; i++)
+            if (_prefillReady[i].ForwardLen > cap) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// One sequence's prompt-suffix forward, split at <see cref="IModel.MaxPrefillForwardTokens"/> when the model has one (#1892), so a
+    /// prompt longer than the bound is never handed to the model whole. Only the last pass's logits are returned (the caller samples its
+    /// final row); earlier passes' are disposed.
+    /// </summary>
+    private ITensor ForwardPrefillBounded(SchedulerRequest seq, int start, int len, int posOff)
+    {
+        int cap = _model.MaxPrefillForwardTokens;
+        if (cap <= 0 || len <= cap)
+            return _model.Forward(seq.PromptTokenIds.AsSpan(start, len), _prefillPositions.AsSpan(posOff, len),
+                deviceId: -1, seq.KvCache, lastTokenLogitsOnly: true);
+        if (!_loggedPrefillBound)
+        {
+            _loggedPrefillBound = true;
+            Console.Error.WriteLine($"[dotllm] a {len}-token prompt is above the {cap} rows one forward may take on this model's KV cache " +
+                $"(the Vulkan TurboQuant dispatch grid bounds it); the scheduler prefills in passes of {cap}" +
+                (_options.MaxPrefillTokensPerStep > cap ? $" (--prefill-chunk-size {_options.MaxPrefillTokensPerStep} is an admission cap, not a pass size)." : "."));
+        }
+        ITensor? logits = null;
+        try
+        {
+            for (int o = 0; o < len; o += cap)
+            {
+                int n = Math.Min(cap, len - o);
+                logits?.Dispose();
+                logits = null;
+                logits = _model.Forward(seq.PromptTokenIds.AsSpan(start + o, n), _prefillPositions.AsSpan(posOff + o, n),
+                    deviceId: -1, seq.KvCache, lastTokenLogitsOnly: true);
+            }
+            return logits!;
+        }
+        catch
+        {
+            logits?.Dispose();
+            throw;
+        }
+    }
+
     /// <summary>
     /// Whether a forward over <paramref name="count"/> sequences should be dispatched as a single
     /// <see cref="IModel.ForwardBatch"/> rather than per-sequence <c>IModel.Forward</c>:
@@ -1184,7 +1234,10 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             off += p.ForwardLen;
         }
 
-        if (ShouldBatch(count))
+        // #1892: a model that bounds one forward's rows (Vulkan in-place TurboQuant) takes an over-long prompt in bounded passes, so the
+        // fused batch (which would hand it the whole suffix) is skipped for it. A threaded-state host keeps its batch: only ForwardBatch carries
+        // its per-sequence state, no such host has a limit today, and sending it down the stateless per-sequence path would lose that state.
+        if (ShouldBatch(count) && !(PrefillOverBound() && !_supportsThreadedState))
         {
             IReadOnlyList<ITensor> results;
             long fwdStart = Stopwatch.GetTimestamp();
@@ -1256,10 +1309,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                     // PendingPrefill always covers the prompt suffix through its final token
                     // (MaxPrefillTokensPerStep gates ADMISSION of a whole prompt, it does not
                     // split one across steps), so the last-row hint is safe on every path here.
-                    logits = _model.Forward(
-                        seq.PromptTokenIds.AsSpan(p.ForwardStart, p.ForwardLen),
-                        _prefillPositions.AsSpan(posOff, p.ForwardLen),
-                        deviceId: -1, seq.KvCache, lastTokenLogitsOnly: true);
+                    logits = ForwardPrefillBounded(seq, p.ForwardStart, p.ForwardLen, posOff);
                 }
                 catch (OperationCanceledException)
                 {

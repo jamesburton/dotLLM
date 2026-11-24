@@ -31,8 +31,11 @@ namespace DotLLM.Cuda.Architectures;
 /// (small) are uploaded as F32 device buffers.
 /// </para>
 /// </remarks>
-public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
+public sealed unsafe partial class CudaQwen3MoeHybridTransformerModel : IModel, DotLLM.Core.Diagnostics.IHiddenStateTapHost, ICudaResidualModifierHost
 {
+    /// <summary>Optional PostLayer residual modifier (#1919): called on the F32 HiddenState after every layer's closing add. This model has no decode graph, so nothing is bypassed. Null costs one branch per layer.</summary>
+    public ICudaResidualModifier? ResidualModifier { get; set; }
+
     // #1848 / #1834: WDDM sysmem-fallback detector for this CUDA host. Created with the model object (baseline: this process's shared usage then,
     // so later growth past dedicated VRAM warns); polls in the background, never on the inference thread. No-op off Windows.
     private readonly GpuSpillMonitor _spillMonitor = new(() => "CudaQwen3MoeHybridTransformerModel");
@@ -198,6 +201,75 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// </remarks>
     public bool RequiresPerSequenceState => true;
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Issue #1919 CUDA parity with <c>CudaQwen3HybridDenseTransformerModel</c> and the CPU MoE host: a <c>GenerationSession</c>
+    /// rolls recurrent state back to a recorded pause, and <see cref="CudaGdnStateCache"/> has no position addressing, so the
+    /// whole model-owned cache is snapshotted device-to-device. Without this the session refuses every rollback on this model.
+    /// </remarks>
+    public bool SupportsRecurrentStateCheckpoint => true;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Snapshots are pooled (one spare), like the dense hybrid (#469): disposing the returned checkpoint hands its device buffers
+    /// back for the next one. A fresh snapshot allocation is admitted against free device memory (never spills), like every
+    /// other growth on this host (#1099).
+    /// </remarks>
+    public object? CheckpointRecurrentState()
+    {
+        _stream.Synchronize();
+        _context.MakeCurrent();
+        CudaGdnStateCache? snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null);
+        if (snapshot is null)
+        {
+            AdmitDeviceGrowth(_gdnCache.AllocatedBytes, "recurrent-state checkpoint");
+            snapshot = new CudaGdnStateCache(_gdn, _gdnCache.NumGdnLayers);
+        }
+        _gdnCache.CopyTo(snapshot);
+        return new PooledGdnCheckpoint(this, snapshot);
+    }
+
+    /// <inheritdoc/>
+    public void RestoreRecurrentState(object? checkpoint)
+    {
+        CudaGdnStateCache? snapshot = checkpoint switch
+        {
+            null => null,
+            PooledGdnCheckpoint pooled => pooled.Snapshot,
+            CudaGdnStateCache raw => raw,
+            _ => throw new ArgumentException(
+                $"{GetType().Name}.RestoreRecurrentState expects a checkpoint from CheckpointRecurrentState; " +
+                $"got {checkpoint.GetType().Name}.",
+                nameof(checkpoint)),
+        };
+        if (snapshot is null) return;
+        _stream.Synchronize();
+        _context.MakeCurrent();
+        snapshot.CopyTo(_gdnCache);
+    }
+
+    /// <inheritdoc/>
+    public long RecurrentStateCheckpointBytes => _gdnCache.AllocatedBytes;
+
+    private CudaGdnStateCache? _spareGdnCheckpoint;
+
+    /// <summary>A pooled GDN snapshot; disposing returns its buffers to the owning model (issue #469 pattern).</summary>
+    private sealed class PooledGdnCheckpoint(CudaQwen3MoeHybridTransformerModel owner, CudaGdnStateCache snapshot) : IDisposable
+    {
+        private CudaGdnStateCache? _snapshot = snapshot;
+
+        public CudaGdnStateCache Snapshot
+            => _snapshot ?? throw new ObjectDisposedException(nameof(PooledGdnCheckpoint));
+
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _snapshot, null);
+            if (s is null) return;
+            if (owner._disposed || Interlocked.CompareExchange(ref owner._spareGdnCheckpoint, s, null) is not null)
+                s.Dispose();
+        }
+    }
+
     /// <summary>Number of full-attention layers — matches the sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
 
@@ -206,7 +278,27 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// K/V storage is owned internally by this model (a per-attention-layer F16 device
     /// cache) — the returned handle only communicates the capacity to <see cref="Forward(System.ReadOnlySpan{int}, System.ReadOnlySpan{int}, int, IKvCache?)"/>.
     /// </summary>
-    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen);
+    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen, CanGrowKvStorageTo);   // EnsureF16KvCache keeps rows on growth (#1919)
+
+    /// <summary>
+    /// Admission for <see cref="CudaHybridKvCacheHandle.TryGrowTo"/> (issue #1919): the growth copies, so the new storage must fit
+    /// in free device memory beside the old, leaving <see cref="VramReserveBytes"/>. A refusal makes the handle report it cannot grow.
+    /// </summary>
+    /// <param name="maxLength">The handle's requested length.</param>
+    /// <returns><see langword="true"/> when the growth may proceed.</returns>
+    internal bool CanGrowKvStorageTo(int maxLength)
+    {
+        if (maxLength <= _f16CacheMaxSeqLen) return true;
+        long newBytes = (long)maxLength * Config.NumKvHeads * Config.HeadDim * sizeof(ushort) * 2L * _attentionLayerCount;
+        return DeviceMemoryBudget.Fits(QueryFreeDeviceBytes(), newBytes, VramReserveBytes);
+    }
+
+    private long QueryFreeDeviceBytes()
+    {
+        _context.MakeCurrent();
+        CudaDriverApi.cuMemGetInfo_v2(out nuint free, out _).ThrowOnError();
+        return (long)free;
+    }
 
     private CudaQwen3MoeHybridTransformerModel(
         ModelConfig config,
@@ -1746,9 +1838,16 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         => Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly);
 
     /// <inheritdoc/>
-    [SkipLocalsInit]
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
+        => ForwardTapped(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly)
+           ?? throw new DotLLM.Core.Diagnostics.ForwardAbortedException(_tapAbort);
+
+    /// <summary>The forward; <see langword="null"/> only when an abortable hidden-state tap aborted it (#1920, <c>_tapAbort</c> says where).</summary>
+    [SkipLocalsInit]
+    private ITensor? ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
+                           DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot? taps)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -1801,6 +1900,9 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         if (DebugTrace) LogVram($"after EnsureCapacity (state.AllocatedBytes={_state.AllocatedBytes:N0})");
 
         nint streamH = _stream.Handle;
+        var ts = taps is not null ? _tapState : null;
+        ts?.Begin(taps!, positions, _stream.Handle);
+        var tapAt = default(DotLLM.Core.Diagnostics.ForwardAbortInfo);
 
         // ── Upload tokenIds + positions to device ──
         fixed (int* tokenPtr = tokenIds)
@@ -1827,12 +1929,22 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                 _state.TokenIdsDevice, _state.HiddenState, seqLen, hiddenSize, streamH);
         }
 
+        if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PostEmbedding, -1, true, seqLen,
+                _state.HiddenState, sizeof(float), 1f, streamH, out tapAt))
+            return TapAborted(tapAt);
+
         // ── Per-layer body ──
         for (int layer = 0; layer < _layers.Length; layer++)
         {
             RunSingleLayerBody(layer, seqLen, positions, hiddenSize,
                 numHeads, numKvHeads, headDim, eps, kvCache);
+            if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PostLayer, layer, true, seqLen,
+                    _state.HiddenState, sizeof(float), 1f, streamH, out tapAt))
+                return TapAborted(tapAt);
         }
+        if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PreFinalNorm, -1, true, seqLen,
+                _state.HiddenState, sizeof(float), 1f, streamH, out tapAt))
+            return TapAborted(tapAt);
 
         // ── Final norm + lm_head ──
         // Issue #185: see CudaQwen3HybridDenseTransformerModel's identically-structured block for
@@ -1845,8 +1957,16 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         nint lmHeadInput = logitsRows == seqLen
             ? _state.HiddenState
             : _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
-        _kernels.LaunchRmsNormF32(lmHeadInput, _outputNormDevice, lmHeadInput,
-            hiddenSize, eps, logitsRows, streamH);
+        // A tap that wants every row after the final norm needs all of them normalised, even when the LM head projects only the last
+        // (in place, as the head's own rows are: the last row is then already normalised for the head below).
+        bool normAll = ts is not null && logitsRows != seqLen
+            && ts.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1) && ts.WantsAll(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1);
+        nint normPtr = normAll ? _state.HiddenState : lmHeadInput;
+        _kernels.LaunchRmsNormF32(normPtr, _outputNormDevice, normPtr,
+            hiddenSize, eps, normAll ? seqLen : logitsRows, streamH);
+        if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1, true, seqLen,
+                _state.HiddenState, sizeof(float), 1f, streamH, out tapAt))
+            return TapAborted(tapAt);
         GemmLmHead(_outputDevice, _outputQt, lmHeadInput, _state.Logits,
              _outputOutputDim, _outputInputDim, logitsRows);
         if (DebugTrace) LogVram("after lm-head");
@@ -1860,6 +1980,11 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             (nuint)((long)logitsRows * vocabSize * sizeof(float))).ThrowOnError();
         if (DebugTrace) LogVram("after D2H logits copy");
 
+        if (ts is not null && !ts.Immediate)
+        {
+            try { ts.DeliverDeferred(); }
+            catch { result.Dispose(); throw; }
+        }
         return result;
     }
 
@@ -1952,6 +2077,8 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // 4. Second residual add: hidden = residual + normOut.
         _kernels.LaunchAddF32(_state.Residual, _state.NormOutput, _state.HiddenState,
             seqLen * hiddenSize, streamH);
+        if (ResidualModifier is { } modifier && modifier.AppliesTo(layerIdx))
+            modifier.Apply(_state.HiddenState, CudaResidualDType.F32, layerIdx, seqLen, hiddenSize, streamH);   // #1919 PostLayer
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -2316,26 +2443,69 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     {
         if (_f16KCache is not null && maxSeqLen <= _f16CacheMaxSeqLen) return;
 
-        // Free any existing buffers (resize).
-        if (_f16KCache is not null)
+        // Growth keeps the live rows [0, _f16CacheCurrentLength) (issue #1919): a session grows its handle past the initial
+        // capacity (CudaHybridKvCacheHandle.TryGrowTo) and the rows already written live in this storage. A new handle has
+        // already reset the live length to 0 (see _lastForwardKvCache), so nothing is copied for an unrelated sequence.
+        int keepRows = _f16KCache is null ? 0 : Math.Min(_f16CacheCurrentLength, _f16CacheMaxSeqLen);
+        long bytesPerLayer = (long)maxSeqLen * numKvHeads * headDim * sizeof(ushort);
+        if (keepRows == 0)
         {
-            for (int i = 0; i < _f16KCache.Length; i++)
-            {
-                if (_f16KCache[i] != 0) CudaDriverApi.cuMemFree_v2(_f16KCache[i]);
-                if (_f16VCache![i] != 0) CudaDriverApi.cuMemFree_v2(_f16VCache[i]);
-            }
+            FreeF16KvStorage(_f16KCache, _f16VCache);
+            _f16KCache = null;
+            _f16VCache = null;
+            _f16CacheMaxSeqLen = 0;
+            _f16CacheCurrentLength = 0;
         }
 
-        _f16KCache = new nint[_attentionLayerCount];
-        _f16VCache = new nint[_attentionLayerCount];
-        long bytesPerLayer = (long)maxSeqLen * numKvHeads * headDim * sizeof(ushort);
-        for (int i = 0; i < _attentionLayerCount; i++)
+        // Admit against free device memory before allocating (never spill); a copying growth holds old and new together.
+        AdmitDeviceGrowth(bytesPerLayer * 2L * _attentionLayerCount, $"F16 KV cache for {maxSeqLen} tokens");
+
+        var newK = new nint[_attentionLayerCount];
+        var newV = new nint[_attentionLayerCount];
+        try
         {
-            _f16KCache[i] = AllocDevice(bytesPerLayer);
-            _f16VCache[i] = AllocDevice(bytesPerLayer);
+            for (int i = 0; i < _attentionLayerCount; i++)
+            {
+                newK[i] = AllocDevice(bytesPerLayer);
+                newV[i] = AllocDevice(bytesPerLayer);
+            }
+            if (keepRows > 0)
+            {
+                long keepBytes = (long)keepRows * numKvHeads * headDim * sizeof(ushort);
+                nint streamH = _stream.Handle;
+                for (int i = 0; i < _attentionLayerCount; i++)
+                {
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(newK[i], _f16KCache![i], (nuint)keepBytes, streamH).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(newV[i], _f16VCache![i], (nuint)keepBytes, streamH).ThrowOnError();
+                }
+                _stream.Synchronize();   // the old buffers are freed below
+            }
         }
+        catch
+        {
+            if (keepRows > 0)
+            {
+                try { _stream.Synchronize(); } catch { /* a faulted stream: free regardless */ }
+            }
+            FreeF16KvStorage(newK, newV);
+            throw;
+        }
+
+        FreeF16KvStorage(_f16KCache, _f16VCache);
+        _f16KCache = newK;
+        _f16VCache = newV;
         _f16CacheMaxSeqLen = maxSeqLen;
-        _f16CacheCurrentLength = 0;
+        _f16CacheCurrentLength = keepRows;
+    }
+
+    private static void FreeF16KvStorage(nint[]? k, nint[]? v)
+    {
+        if (k is null) return;
+        for (int i = 0; i < k.Length; i++)
+        {
+            if (k[i] != 0) CudaDriverApi.cuMemFree_v2(k[i]);
+            if (v![i] != 0) CudaDriverApi.cuMemFree_v2(v[i]);
+        }
     }
 
     /// <summary>
@@ -3077,6 +3247,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         if (_disposed) return;
         _disposed = true;
         _context.MakeCurrent();
+        _tapState?.Dispose();
 
         // Per-layer weight free.
         for (int i = 0; i < _layers.Length; i++)
@@ -3130,6 +3301,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
         _moeScratch.Dispose();
         _state.Dispose();
+        Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
         _gdnCache.Dispose();
         _kernels.Dispose();
         _cublas.Dispose();

@@ -385,6 +385,13 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             DeviceCli.PrintError(moeError, json: false);
             return 1;
         }
+        // #1888, #1892: a TurboQuant request runs in place or is refused here (before anything loads) or after the load; never another cache.
+        if (DotLLM.Cli.Helpers.KvStorageCli.TurboQuantRefusal(DotLLM.Server.KvCommand.Chat, settings.CacheTypeK, settings.CacheTypeV,
+                settings.CacheWindow, settings.Paged, settings.Device, hasDraftModel: !string.IsNullOrEmpty(settings.SpeculativeModel)) is { } tqRefusal)
+        {
+            DeviceCli.PrintError(tqRefusal, json: false);
+            return 1;
+        }
 
         // Resolve before loading the model so a bad path fails fast.
         if (!TextArgument.TryResolve(settings.SystemPrompt, settings.SystemPromptFile,
@@ -461,7 +468,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 DotLLM.Server.DeviceLoadResult loaded;
                 (loaded, deviceOutcome) = DeviceCli.Load(gguf, config, settings.Device, settings.GpuLayers,
                     new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
-                    resolvedPath, MoeOffloadCli.Build(settings.MoeValues), settings.PrefillChunkSize);
+                    resolvedPath, MoeOffloadCli.Build(settings.MoeValues), settings.PrefillChunkSize,
+                    DotLLM.Server.TurboQuantKv.Parse(settings.CacheTypeK, settings.CacheTypeV, settings.CacheWindow, out _) is { IsTurboQuantAny: true } planKv ? planKv : null);
                 model = loaded.Model;
                 vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
                 if (settings.DFlash is not null)
@@ -629,15 +637,28 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         if (!string.IsNullOrEmpty(systemPrompt))
             history.Add(new ChatMessage { Role = "system", Content = systemPrompt });
 
-        var kvConfig = new KvCacheConfig(
-            KvCacheConfig.ParseDType(settings.CacheTypeK ?? "f32"),
-            KvCacheConfig.ParseDType(settings.CacheTypeV ?? "f32"),
-            settings.CacheWindow);
+        var kvConfig = DotLLM.Server.TurboQuantKv.Parse(settings.CacheTypeK, settings.CacheTypeV, settings.CacheWindow, out string? tqMismatch);
 
         Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
         DotLLM.Engine.KvCache.PagedKvCacheFactory? pagedFactory = null;
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
-        if (vulkanKv is not null)
+        if (kvConfig.IsTurboQuantAny)
+        {
+            // #1892: first, so no branch below can take it (IsQuantized excludes TurboQuant): the same in-place cache serve builds.
+            string? tqPostRefusal = DotLLM.Server.TurboQuantKv.PostLoadRefusal(kvConfig, tqMismatch, DotLLM.Server.KvCommand.Chat, settings.Paged,
+                config!, model!, hasDraftModel: !string.IsNullOrEmpty(settings.SpeculativeModel),
+                mtpWillAttach: string.IsNullOrEmpty(settings.SpeculativeModel) && !settings.NoMtp && model!.SupportsMtp);
+            if (tqPostRefusal is not null)
+            {
+                DeviceCli.PrintError(tqPostRefusal, json: false);
+                model!.Dispose();
+                return 1;
+            }
+            AnsiConsole.MarkupLine($"[dim]KV cache: TurboQuant {kvConfig.TurboQuantBits}-bit" +
+                (kvConfig.TurboQuantUseQjl ? " with QJL (dequant-scratch CPU path)" : ", read in place in code space") + "[/]");
+            kvFactory = DotLLM.Server.TurboQuantKv.CreateFactory(model!, kvConfig);
+        }
+        else if (vulkanKv is not null)
         {
             if (settings.Paged)
                 AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache is not supported on Vulkan; using the model's own device KV-cache.[/]");

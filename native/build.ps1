@@ -45,20 +45,28 @@ function Assert-PtxVersion {
 # across time steps, so the two kernels backing it disable FMA fusion AND
 # precise math (no --use_fast_math). The bit-perfect set is small; everything
 # else stays on the legacy fast-math path that this build script ships with.
-$bitPerfect = @('conv1d_causal', 'gated_delta_net_scan', 'hadamard_fwht')
+$bitPerfect = @('conv1d_causal', 'gated_delta_net_scan', 'hadamard_fwht', 'turboquant', 'turboquant_rotate')
+
+# Kernels built with neither --use_fast_math nor -fmad=false (default FMA contraction, precise math): build_ptx.bat's behaviour for any
+# kernel in neither its FAST_MATH nor its NO_FMA list, and what the committed PTX of these files was built with.
+# attention_kvtq: TurboQuant code-space attention; never fast-math (#1892).
+# Known, pre-existing difference NOT changed here: this script builds attention_flash_mma_prefill_kvq (which holds the _tqtq entries)
+# with --use_fast_math, while build_ptx.bat builds it without. The committed PTX follows the bat.
+# attention_mma_decode_v2_dense: dense split-KV decode (#1922); precise expf like the #988 v2 body.
+$noFastMath = @('attention_kvtq', 'attention_mma_decode_v2_dense')
 
 # Kernels that emit Ampere-only PTX (mma.sync / cp.async) and so MUST be built at
 # compute_86 instead of the global default (dispatch-gated to Ampere+ in C#).
 # Mirrors build_ptx.bat's ARCH_86 list.
 $arch86 = @('pq2_0_mmq_mma', 'attention_flash_mma', 'attention_flash_mma_decode_gqa_split',
     'attention_flash_mma_decode_gqa_split_kvq', 'attention_flash_mma_prefill_hd256',
-    'attention_flash_mma_prefill_hd256_kvq', 'attention_flash_mma_prefill_kvq')
+    'attention_flash_mma_prefill_hd256_kvq', 'attention_flash_mma_prefill_kvq', 'attention_mma_decode_v2_dense')
 
 # Kernels that #include <cooperative_groups.h> (libcu++ needs C++17).
 # Mirrors build_ptx.bat's CXX17 list.
 $cxx17 = @('gated_delta_net_scan', 'attention_f32', 'attention_flash_mma_decode_gqa_split',
     'attention_flash_mma_decode_gqa_split_kvq', 'attention_flash_mma_prefill_hd256',
-    'attention_flash_mma_prefill_hd256_kvq', 'attention_flash_mma_prefill_kvq')
+    'attention_flash_mma_prefill_hd256_kvq', 'attention_flash_mma_prefill_kvq', 'attention_mma_decode_v2_dense')
 
 Write-Host "Compiling CUDA kernels -> PTX (target: $arch)..."
 
@@ -70,6 +78,10 @@ foreach ($cuFile in Get-ChildItem "$kernelDir\*.cu") {
     if ($bitPerfect -contains $base) {
         & nvcc -ptx -arch=$kArch @stdFlag `
             -fmad=false `
+            -o "$outDir\$base.ptx" `
+            $cuFile.FullName
+    } elseif ($noFastMath -contains $base) {
+        & nvcc -ptx -arch=$kArch @stdFlag `
             -o "$outDir\$base.ptx" `
             $cuFile.FullName
     } else {

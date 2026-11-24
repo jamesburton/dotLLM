@@ -44,7 +44,7 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
         string store = NewDir("usage-store");
         Assert.Equal(2, Cli(["build", "--store", store, "--directory", _fx.TreeTemplate]).Code); // no --model
         Assert.Equal(2, Cli(["build", "--model", _fx.ModelA, "--store", store]).Code); // no source
-        Assert.Equal(2, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", _fx.TreeTemplate, "--chunker", "lines"]).Code);
+        Assert.Equal(2, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", _fx.TreeTemplate, "--chunker", "nonesuch"]).Code);
         Assert.Equal(2, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", _fx.TreeTemplate, "--max-chunks", "-1"]).Code);
         Assert.Equal(2, Cli(["build", "--model", _fx.ModelA, "--store", store, "--solution", "x.sln", "--directory", _fx.TreeTemplate]).Code);
         Assert.Equal(2, Cli(["select", "--model", _fx.ModelA, "--directory", _fx.TreeTemplate]).Code); // no criterion
@@ -239,6 +239,32 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
     // ------------------------------------------------------------------------------------------------ status
 
     [Fact]
+    public void IndexCutByAnOlderChunkerAlgorithm_StatusSaysStale_AndBuildReChunksIt()
+    {
+        string tree = NewTree();
+        string store = NewDir("store");
+        string[] common = ["--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64"];
+        Assert.Equal(0, Cli(["build", .. common, "--directory", tree]).Code);
+        static string[] Stale(string json) => [.. JsonDocument.Parse(json).RootElement.GetProperty("stale_files").EnumerateArray().Select(e => e.GetString()!)];
+        Assert.Empty(Stale(Cli(["status", .. common, "--json"]).Out)); // control: a fresh index is current
+
+        // Make the index what a build before the algorithm change wrote: no chunkerVersion on any file (absent = version 1).
+        string indexFile = Assert.Single(Directory.GetFiles(store, "index-*.json"));
+        string text = File.ReadAllText(indexFile);
+        Assert.Contains("\"chunkerVersion\":2", text, StringComparison.Ordinal);
+        File.WriteAllText(indexFile, text.Replace("\"chunkerVersion\":2,", "", StringComparison.Ordinal));
+
+        var before = Cli(["status", .. common, "--strict", "--json"]);
+        Assert.Equal(3, before.Code);
+        Assert.NotEmpty(Stale(before.Out));                                  // text unchanged, yet stale
+        Assert.NotEmpty(Stale(Cli(["status", .. common, "--no-scan", "--json"]).Out)); // and without scanning the tree
+
+        Assert.Equal(0, Cli(["build", .. common, "--directory", tree]).Code);
+        Assert.Contains("\"chunkerVersion\":2", File.ReadAllText(indexFile), StringComparison.Ordinal);
+        Assert.Empty(Stale(Cli(["status", .. common, "--json"]).Out));
+    }
+
+    [Fact]
     public void Status_AfterEdit_ListsTheStaleFile_AndARebuildEncodesOnlyItsChangedChunks()
     {
         string tree = NewTree();
@@ -385,6 +411,20 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
         Assert.Equal(entries - orphans.Count, fs.GetStats().Entries);
         Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
         Assert.Equal(0, Json(Cli(["evict", "--store", store, "--json"])).GetProperty("evicted").GetInt32());
+    }
+
+    [Fact]
+    public void CliChunkerEnum_IncludesLines()
+    {
+        // Phase I Task 19: lines-512 is a wire chunker, so the CLI can build and query it (symbol|fixed|lines).
+        string tree = NewTree();
+        string store = NewDir("lines-store");
+        foreach (string verb in new[] { "build", "select", "status" })
+            Assert.Contains("symbol|fixed|lines", Cli([verb, "--help"]).Out, StringComparison.Ordinal);
+        Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--chunker", "lines"]).Code);
+        Assert.Contains(Directory.GetFiles(store, "index-*.json"), f => Path.GetFileName(f).StartsWith("index-lines-64.", StringComparison.Ordinal));
+        Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--chunker", "lines", "--no-scan", "--strict"]).Code);
+        Assert.Equal(0, Cli(["select", "--model", _fx.ModelA, "--directory", tree, "--chunk-tokens", "64", "--chunker", "lines", "--path", "**/*.cs"]).Code);
     }
 
     [Fact]
@@ -842,16 +882,31 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
     [Fact]
     public void Build_StoreWriteFailure_ExitsOne()
     {
-        // A damaged entry at a chunk's final path, held open by a reader that does not share delete: the store cannot replace
-        // it (ChunkStoreBusyException), the build uses the fresh K/V for nothing and must report the failure.
+        // A directory at a chunk's final path: the store cannot rename the entry over it on any OS (ChunkStoreBusyException),
+        // the build uses the fresh K/V for nothing and must report the failure.
         string tree = NewTree();
         string store = NewDir("store");
-        JsonElement dry = Json(Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--dry-run", "--json"]));
-        string key = dry.GetProperty("would_encode")[0].GetProperty("key").GetString()!;
-        string path = new FileChunkStore(store).PathOf(new ChunkKey(key));
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        string path = FirstEntryPath(tree, store);
+        Directory.CreateDirectory(path);
+        var r = Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--json"]);
+        Assert.Equal(1, r.Code);
+        Assert.Equal(1, JsonDocument.Parse(r.Out).RootElement.GetProperty("store_failures").GetInt32());
+        Directory.Delete(path);
+        Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64"]).Code); // repaired
+        Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
+    }
+
+    [Fact]
+    public void Build_DamagedEntryHeldByReader_WindowsFailsThenRepairs_PosixReplacesAtOnce()
+    {
+        // A damaged entry at a chunk's final path, held open by a reader that does not share delete. Windows cannot rename over
+        // it (ChunkStoreBusyException): the build reports the failure and a later build repairs it. On Linux/macOS rename(2)
+        // replaces it under the reader: the build succeeds at once and the reader keeps reading the old file.
+        string tree = NewTree();
+        string store = NewDir("store");
+        string path = FirstEntryPath(tree, store);
         File.WriteAllBytes(path, [1, 2, 3]);
-        using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
         {
             var r = Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--json"]);
             if (OperatingSystem.IsWindows())
@@ -866,6 +921,15 @@ public sealed partial class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTest
         }
         Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64"]).Code); // repaired
         Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
+    }
+
+    private string FirstEntryPath(string tree, string store)
+    {
+        JsonElement dry = Json(Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--dry-run", "--json"]));
+        string key = dry.GetProperty("would_encode")[0].GetProperty("key").GetString()!;
+        string path = new FileChunkStore(store).PathOf(new ChunkKey(key));
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        return path;
     }
 
     // ------------------------------------------------------------------------------------------------ JSON schemas

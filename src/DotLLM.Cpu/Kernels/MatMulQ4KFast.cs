@@ -78,6 +78,12 @@ public static unsafe partial class MatMul
             return;
         }
 
+        if (Q4KRlaActive)
+        {
+            for (int r = 0; r < 4; r++)   // #1927: row-lane arithmetic, the same bits as the 1-token and row-lane kernels
+                Q4KRlaRowTok4(groupBase + r * rowStride, q8k, q8RowBytes, superBlockCount, wStride, results + r, ldc);
+            return;
+        }
         for (int r = 0; r < 4; r++)
         {
             Q4KRowTok4(groupBase + r * rowStride, q8k, q8RowBytes, superBlockCount, wStride,

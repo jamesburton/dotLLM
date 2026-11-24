@@ -21,7 +21,12 @@ internal static class ChunkCacheCodes
     /// <summary>Inline and manifest placements in one request; it is served as unannotated.</summary>
     public const string ManifestConflict = "chunk_manifest_conflict";
 
-    /// <summary>The chat template altered the span's text (Task 11).</summary>
+    /// <summary>
+    /// The chat template altered the span's text (Task 11), or the tokenizer merges across one of its edges with the text next to
+    /// it. Chunks end in a newline, so a chunk followed by a newline-starting joiner (the Anthropic converter's <c>"\n"</c> join of
+    /// inline text blocks) is always altered: send such chunks as a manifest over one string message
+    /// (<c>docs/CHUNK_CACHE.md</c>, "Chunk edges and joining").
+    /// </summary>
     public const string TemplateAltered = "chunk_template_altered";
 
     /// <summary>Reserved (spec §5.3 item 6): chunk text is tokenised like plain content, so v1 never emits it.</summary>

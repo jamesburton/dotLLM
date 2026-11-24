@@ -199,6 +199,14 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
 
     public override int Execute(CommandContext context, Settings settings)
     {
+        // #1888, #1892: bench measured the default cache for a TurboQuant request while its reproduce line said tq. It now builds the same
+        // in-place cache serve does, or refuses (here before the load, or after it) - never a measurement on another cache.
+        if (DotLLM.Cli.Helpers.KvStorageCli.TurboQuantRefusal(DotLLM.Server.KvCommand.Bench, settings.KvQuantK, settings.KvQuantV,
+                device: settings.Device) is { } tqRefusal)
+        {
+            WriteError(settings, tqRefusal);
+            return 1;
+        }
         var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
         if (ggufPath is null)
             return 1;
@@ -357,8 +365,25 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             else AnsiConsole.MarkupLine($"[grey]{Markup.Escape(note)}[/]");
         }
 
+        // #1892: a TurboQuant request builds the same in-place cache serve builds (the model's own bench cache would measure F16 / F32).
+        var benchKv = DotLLM.Cli.Helpers.KvStorageCli.BuildKvConfig(kvRequest, 0, out string? tqMismatch);
+        if (benchKv.IsTurboQuantAny)
+        {
+            string? tqPostRefusal = DotLLM.Server.TurboQuantKv.PostLoadRefusal(benchKv, tqMismatch, DotLLM.Server.KvCommand.Bench, paged: false,
+                config, model, hasDraftModel: false, mtpWillAttach: false);
+            if (tqPostRefusal is not null)
+            {
+                WriteError(settings, tqPostRefusal);
+                model.Dispose();
+                vulkanDevice?.Dispose();
+                return 1;
+            }
+            var tqFactory = DotLLM.Server.TurboQuantKv.CreateFactory(model, benchKv);
+            kvFactory = size => tqFactory(config, size);
+        }
+
         // #967: apply --kv-quant-k/-v to a CUDA hybrid-dense model; warn (never silently ignore) elsewhere.
-        if (kvRequest.IsSpecified)
+        if (kvRequest.IsSpecified && !benchKv.IsTurboQuantAny)
         {
             var kvTarget = DotLLM.Cli.Helpers.KvStorageCli.Classify(model, vulkanDevice is not null);
             foreach (var w in DotLLM.Cli.Helpers.KvStorageCli.Warnings(kvRequest, kvTarget, config.Architecture.ToString(), backend, engineCacheHonoured: false))

@@ -12,6 +12,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// test's async flow) refuses before any driver call, so removing a check makes the constructor reach <c>cuMemAlloc</c> (no driver
 /// here: <see cref="DllNotFoundException"/>; on a CUDA box: an allocation that succeeds), and the test fails either way.
 /// </summary>
+[Collection(CudaCollection.Name)]
 public sealed class CudaAdmissionTests
 {
     private const long MiB = 1L << 20;
@@ -238,12 +239,12 @@ public sealed class CudaAdmissionTests
     [Fact]
     public void G3ServesOnlyTheF16Cache_SoAQuantizedFitChargesNoPlane()
     {
-        // #1850: q8_0 / q4_0 read in place, so G3's plane is never used over them. TurboQuant is unchanged: CreateKvCache gives it
-        // the f16 CudaKvCache (IsQuantized is false for it), which G3 serves.
+        // #1850: q8_0 / q4_0 read in place, so G3's plane is never used over them. TurboQuant is never served by G3 (#1888): its KV is
+        // codes read in place, not the f16 cache.
         Assert.True(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32)));
         Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0)));
         Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.Q4_0, KvCacheDType.Q4_0)));
-        Assert.True(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant)));
+        Assert.False(CudaTransformerModel.G3ServesKvCache(new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant)));
 
         // TwIL-8B-shaped q8_0 at the 1,024 chunk, as above: the 384 MiB plane is ~4,700 tokens of q8_0 window.
         var q8 = new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0);
@@ -254,6 +255,49 @@ public sealed class CudaAdmissionTests
             CudaTransformerModel.G3PlaneChargeBytes(CudaTransformerModel.G3ServesKvCache(q8), 1024, 32), perToken, native: 131_072);
         Assert.True(notCharged.MaxContext - charged.MaxContext >= 4096,
             $"q8_0 window {notCharged.MaxContext} without the plane vs {charged.MaxContext} with it");
+    }
+
+    /// <summary>
+    /// #1923: when the F16 flash prefill takes every prefill of 16+ rows (hd64 / hd128, GQA group up to 8, uniform geometry,
+    /// enabled, kernel loaded), G3 only ever sees shorter prefills, so the f16 context fit must not charge its 384 MiB plane:
+    /// that is ~2,500 tokens of f16 window on Qwen3-4B. Any shape the flash entry does not cover keeps the charge.
+    /// </summary>
+    [Fact]
+    public void F16FlashPrefillCoveringTheModel_RemovesTheG3PlaneCharge()
+    {
+        var f16 = new KvCacheConfig(KvCacheDType.F32, KvCacheDType.F32);
+        // The claim rests on G3's offset path never taking a prefill the flash entry would (it needs >= 32 rows, flash >= 16). With
+        // a lower offset minimum an uncharged offset plane of up to 384 MiB could be asked for (#1923 review M3).
+        Assert.True(CudaG3Attention.OffsetMinQueryRows >= CudaTransformerModel.KvqFlashPrefillMinRows,
+            $"G3 offset minimum {CudaG3Attention.OffsetMinQueryRows} < flash minimum {CudaTransformerModel.KvqFlashPrefillMinRows}");
+        bool Covers(bool enabled = true, bool uniform = true, bool loaded = true, int heads = 32, int kvHeads = 8, int headDim = 128)
+            => CudaTransformerModel.F16FlashPrefillCovers(enabled, uniform, loaded, heads, kvHeads, headDim);
+
+        Assert.True(Covers());                                  // Qwen3-4B
+        Assert.True(Covers(heads: 14, kvHeads: 2, headDim: 64)); // Qwen2.5-0.5B, group 7
+        Assert.False(Covers(enabled: false));                   // DOTLLM_CUDA_F16_FLASH_PREFILL=0
+        Assert.False(Covers(uniform: false));                   // Gemma-4 style per-layer geometry
+        Assert.False(Covers(loaded: false));                    // pre-Ampere / missing PTX
+        Assert.False(Covers(headDim: 256));
+        Assert.False(Covers(heads: 36, kvHeads: 4));            // group 9
+
+        Assert.False(CudaTransformerModel.G3PlaneCharged(f16, f16FlashCoversModel: true));
+        Assert.True(CudaTransformerModel.G3PlaneCharged(f16, f16FlashCoversModel: false));
+        Assert.False(CudaTransformerModel.G3PlaneCharged(new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0), false));
+
+        // What MeasureServingContextFit passes: G3PlaneChargeBytes(G3PlaneCharged(kv, covers) && g3MayRun, chunk, heads).
+        long Charge(bool covers) => CudaTransformerModel.G3PlaneChargeBytes(CudaTransformerModel.G3PlaneCharged(f16, covers), 1024, 32);
+        Assert.Equal(0, Charge(covers: true));
+        Assert.Equal(384 * MiB, Charge(covers: false));
+
+        var geom = KvGeometry.Uniform(36, 8, 128);   // Qwen3-4B
+        long perToken = CudaTransformerModel.DenseContextBytesPerToken(geom, f16, 150_000, chunkedPrefill: true);
+        var withPlane = CudaTransformerModel.FitDenseContext(6000 * MiB, 256 * MiB, 0, 100 * MiB, 400 * MiB, 0, Charge(false), perToken,
+            native: 262_144);
+        var withoutPlane = CudaTransformerModel.FitDenseContext(6000 * MiB, 256 * MiB, 0, 100 * MiB, 400 * MiB, 0, Charge(true), perToken,
+            native: 262_144);
+        Assert.True(withoutPlane.MaxContext - withPlane.MaxContext >= 2048,
+            $"f16 window {withoutPlane.MaxContext} without the plane vs {withPlane.MaxContext} with it");
     }
 
     [Fact]

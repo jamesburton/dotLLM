@@ -91,7 +91,8 @@ internal static class KernelSupport
     /// into <paramref name="descriptorSet"/>, starting at binding index 0.
     /// </summary>
     internal static unsafe void WriteBufferBindings(
-        VulkanDevice device, nint descriptorSet, ReadOnlySpan<nint> buffers, ReadOnlySpan<ulong> offsets = default)
+        VulkanDevice device, nint descriptorSet, ReadOnlySpan<nint> buffers, ReadOnlySpan<ulong> offsets = default,
+        int tailCount = 0, uint tailFirstBinding = 0)
     {
         int n = buffers.Length;
         Span<VkDescriptorBufferInfo> bufferInfos = stackalloc VkDescriptorBufferInfo[n];
@@ -114,7 +115,8 @@ internal static class KernelSupport
                 {
                     sType = VkStructureType.WriteDescriptorSet,
                     dstSet = descriptorSet,
-                    dstBinding = (uint)i,
+                    // The last tailCount buffers bind at fixed numbers from tailFirstBinding (TurboQuant KV operands, #1892).
+                    dstBinding = i >= n - tailCount ? tailFirstBinding + (uint)(i - (n - tailCount)) : (uint)i,
                     descriptorCount = 1,
                     descriptorType = VkDescriptorType.StorageBuffer,
                     pBufferInfo = (nint)(bufPtr + i),

@@ -35,7 +35,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 /// </remarks>
 public sealed class TransformerModelGemma3nForwardTests : IDisposable
 {
-    private const int HiddenSize = 16;
+    private const int HiddenSize = 128;  // HeadDim 32: the smallest head a q8_0 / q4_0 attention accepts
     private const int NumLayers = 3;
     private const int NumHeads = 4;
     private const int VocabSize = 8;
@@ -179,7 +179,64 @@ public sealed class TransformerModelGemma3nForwardTests : IDisposable
         }
     }
 
+    [Fact]
+    public void TurboQuant_IsRefusedUpFront_ForGemma3n()
+    {
+        // #1892 final review I2: the geometry is uniform, so Eligible said yes, and the first forward then threw from GetKeysRef. The host
+        // must say no, and the shared post-load refusal must turn that into a clear message before any cache is built.
+        string path = Path.Combine(_scratch, "gemma3n-tq.safetensors");
+        WriteFixture(path, seed: 5);
+        ModelConfig config = BuildConfig();
+        var tq = new KvCacheConfig(KvCacheDType.TurboQuant, KvCacheDType.TurboQuant, 0, 4);
+        using var sf = SafetensorsFile.Open(path);
+        using var model = TransformerModel.LoadFromSafetensors(sf, config);
+
+        Assert.True(TurboQuantInPlaceSupport.Eligible(tq, config));   // the geometry alone would accept: only the host rule refuses
+        Assert.False(model.SupportsInPlaceTurboQuant(tq));
+        string? reason = DotLLM.Server.TurboQuantKv.PostLoadRefusal(tq, null, DotLLM.Server.KvCommand.Run, paged: false, config, model,
+            hasDraftModel: false, mtpWillAttach: false);
+        Assert.NotNull(reason);
+        Assert.Contains("does not run in place", reason);
+    }
+
+    [Theory]
+    [InlineData(KvCacheDType.Q8_0)]
+    [InlineData(KvCacheDType.Q4_0)]
+    public void KvCacheDecode_QuantizedCache_MatchesCachelessForward(KvCacheDType kvType)
+    {
+        // Pre-existing bug found by the #1892 final review: RunGemma3nLayer attended every cache through AttendCachedF32 (GetKeysRef),
+        // and a QuantizedKvCache's GetKeysRef is empty (no window) - so a q8_0/q4_0 cache attended over a null pointer. It must now go
+        // through the quantized kernel like the other arms. Tolerance is the quantization error, far below an attention over nothing.
+        string path = Path.Combine(_scratch, "gemma3n-qkv.safetensors");
+        WriteFixture(path, seed: 17);
+        ModelConfig config = BuildConfig();
+
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int[] positions = [0, 1, 2, 3, 4];
+        int last = tokenIds.Length - 1;
+
+        using var sf = SafetensorsFile.Open(path);
+        using var model = TransformerModel.LoadFromSafetensors(sf, config);
+
+        float[] cachelessLast;
+        using (ITensor logits = model.Forward(tokenIds, positions, deviceId: -1))
+            cachelessLast = LastRow(logits, VocabSize);
+
+        float[] decodeLast;
+        using (var kv = new QuantizedKvCache(KvGeometry.FromConfig(config), 16, kvType, kvType, windowSize: 0))
+        {
+            using (model.Forward(tokenIds.AsSpan(0, last), positions.AsSpan(0, last), deviceId: -1, kvCache: kv)) { }
+            using ITensor logits = model.Forward(tokenIds.AsSpan(last, 1), positions.AsSpan(last, 1), deviceId: -1, kvCache: kv);
+            decodeLast = LastRow(logits, VocabSize);
+        }
+
+        float tol = kvType == KvCacheDType.Q8_0 ? 0.02f : 0.25f;
+        float maxDiff = MaxAbsDiff(cachelessLast, decodeLast);
+        Assert.True(maxDiff <= tol, $"{kvType}: max |cacheless - decode| = {maxDiff} (tol {tol})");
+    }
+
     // ───────────────────────── helpers ─────────────────────────
+
 
     private static unsafe float[] LastRow(ITensor logits, int vocab)
     {
@@ -215,7 +272,7 @@ public sealed class TransformerModelGemma3nForwardTests : IDisposable
             LaurelRank = LaurelRank,
             // Sparsity on layer 0 only — exercises GaussianTopK without forcing
             // every layer's gate through it.
-            ActivationSparsityPattern = new float[NumLayers] { 0.5f, 0f, 0f },
+            ActivationSparsityPattern = new float[NumLayers] { 0.95f, 0.95f, 0f },
         };
 
         return new ModelConfig

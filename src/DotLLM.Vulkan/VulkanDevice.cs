@@ -2380,6 +2380,42 @@ public sealed class VulkanDevice : IDisposable
         catch (Exception) { return string.Empty; }   // diagnostics must never mask the real failure
     }
 
+    private int? _computeUnits;
+    private bool _computeUnitsProbed;
+
+    /// <summary>
+    /// Compute units (AMD CUs, <c>VK_AMD_shader_core_properties</c>) or streaming multiprocessors (NVIDIA SMs,
+    /// <c>VK_NV_shader_sm_builtins</c>) of the device, or null when the driver reports neither (#1926: the v2 split-KV decode pass
+    /// sizes its grid on it). Diagnostic-grade: a properties query only, no extension is enabled.
+    /// </summary>
+    internal unsafe int? ComputeUnitCount
+    {
+        get
+        {
+            if (_computeUnitsProbed) return _computeUnits;
+            _computeUnitsProbed = true;
+            try
+            {
+                byte* buf = stackalloc byte[128];
+                new Span<byte>(buf, 128).Clear();
+                bool amd = HasDeviceExtension(_physicalDevice, "VK_AMD_shader_core_properties"u8);
+                bool nv = !amd && HasDeviceExtension(_physicalDevice, "VK_NV_shader_sm_builtins"u8);
+                if (!amd && !nv) return null;
+                // VkPhysicalDeviceShaderCorePropertiesAMD (1000185000): sType, pNext, shaderEngineCount@16, shaderArraysPerEngineCount@20,
+                // computeUnitsPerShaderArray@24, ... VkPhysicalDeviceShaderSMBuiltinsPropertiesNV (1000154001): shaderSMCount@16.
+                *(int*)buf = amd ? 1000185000 : 1000154001;
+                var p2 = default(VkPhysicalDeviceProperties2);
+                p2.sType = VkStructureType.PhysicalDeviceProperties2;
+                p2.pNext = (nint)buf;
+                VulkanApi.vkGetPhysicalDeviceProperties2(_physicalDevice, ref p2);
+                long n = amd ? (long)*(uint*)(buf + 16) * *(uint*)(buf + 20) * *(uint*)(buf + 24) : *(uint*)(buf + 16);
+                _computeUnits = n is > 0 and < 100_000 ? (int)n : null;
+            }
+            catch (Exception) { _computeUnits = null; }
+            return _computeUnits;
+        }
+    }
+
     /// <summary>The adapter LUID (<c>high &lt;&lt; 32 | low</c>) from <c>VkPhysicalDeviceIDProperties</c>, or null when the driver does not report a valid one.</summary>
     internal unsafe ulong? DeviceLuid()
     {
@@ -2910,6 +2946,7 @@ public sealed class VulkanDevice : IDisposable
             commandBufferCount = 1,
             pCommandBuffers = (nint)(&cmdBufLocal),
         };
+        Interop.ProfileCounters.Submits++;
         VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError("vkQueueSubmit SubmitCopyDeferred");
     }
 
@@ -3002,6 +3039,7 @@ public sealed class VulkanDevice : IDisposable
                 commandBufferCount = 1,
                 pCommandBuffers = (nint)(&cmdBuf),
             };
+            Interop.ProfileCounters.Submits++;
             VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError($"vkQueueSubmit {site}");
 
             nint fenceLocal = fence;
@@ -3719,6 +3757,7 @@ public sealed class VulkanDevice : IDisposable
                 commandBufferCount = 1,
                 pCommandBuffers = (nint)(&cmdBufLocal),
             };
+            Interop.ProfileCounters.Submits++;
             VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence).ThrowOnError("vkQueueSubmit SubmitContext");
 
             nint fenceLocal = _fence;
@@ -3810,6 +3849,7 @@ public sealed class VulkanDevice : IDisposable
                 commandBufferCount = 1,
                 pCommandBuffers = (nint)(&cmdBufLocal),
             };
+            Interop.ProfileCounters.Submits++;
             VulkanApi.vkQueueSubmit(_device._queue, 1, submit, fence: 0)
                 .ThrowOnError("vkQueueSubmit SplitSubmit");
 
@@ -3874,6 +3914,7 @@ public sealed class VulkanDevice : IDisposable
                 signalSemaphoreCount = 1,
                 pSignalSemaphores = (nint)(&semLocal),
             };
+            Interop.ProfileCounters.Submits++;
             VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
                 .ThrowOnError("vkQueueSubmit SubmitAndSignal");
         }
@@ -3920,6 +3961,7 @@ public sealed class VulkanDevice : IDisposable
                 signalSemaphoreCount = 1,
                 pSignalSemaphores = (nint)(&semLocal),
             };
+            Interop.ProfileCounters.Submits++;
             VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
                 .ThrowOnError("vkQueueSubmit SubmitAndSignalTimeline");
         }

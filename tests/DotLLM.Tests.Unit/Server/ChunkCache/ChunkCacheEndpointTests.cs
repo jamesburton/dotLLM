@@ -298,7 +298,7 @@ public sealed class ChunkCacheEndpointTests : IDisposable
         ctx.Request.Headers["X-API-Key"] = KeyB;
         var caller = ChunkCacheAuth.Resolve(ctx, server.State.Options.ChunkCache, out var failure);
         Assert.Equal(ChunkAuthFailure.None, failure);
-        Assert.Equal(new ChunkCaller(true, ChunkNamespace.ForApiKey(KeyB)) { IsAdmin = true }, caller);
+        Assert.Equal(new ChunkCaller(true, ChunkNamespace.ForApiKey(KeyB)) { IsAdmin = true, IsAdminKey = true }, caller);
         Assert.DoesNotContain(caller.Namespace, caller.ToString(), StringComparison.Ordinal);
 
         // Two X-API-Key values (HttpClient folds them into one line; a raw client can send two) are ambiguous: no key.
@@ -592,6 +592,17 @@ public sealed class ChunkCacheEndpointTests : IDisposable
         var ctx = new DefaultHttpContext();
         ctx.Request.Headers["X-API-Key"] = KeyC;
         Assert.Equal(ChunkNamespace.ForApiKey(KeyC), ChunkCacheAuth.Resolve(ctx, server.State.Options.ChunkCache, out _).Namespace);
+    }
+
+    [Fact]
+    public async Task Capabilities_ListLines512()
+    {
+        // Phase I Task 19: the wire accepts both text-first chunkers; nothing is auto-validated (quality is Phase I5's gate).
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, On());
+        var (_, body) = await server.SendAsync(HttpMethod.Get, "/v1/chunk-cache", null);
+        var got = JsonNode.Parse(body)!.AsObject();
+        Assert.Equal(["lines-512", "symbol-512"], got["wire_chunkers"]!.AsArray().Select(n => n!.GetValue<string>()));
+        Assert.Empty(got["auto_validated"]!.AsArray());
     }
 
     /// <summary>Ruling 52: <c>store</c> is always an object; <c>configured: false</c> without <c>--chunk-store</c>, absent with one.</summary>

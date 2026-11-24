@@ -20,10 +20,16 @@ public static class TernaryAdapterAttach
         private Action? _detach;
         private IDisposable? _owned;
 
-        internal Handle(Action detach, IDisposable owned, int circuits, string where)
+        internal Handle(Action detach, IDisposable owned, int circuits, string where, IReadOnlyList<string> contentDigests)
         {
-            _detach = detach; _owned = owned; CircuitCount = circuits; Where = where;
+            _detach = detach; _owned = owned; CircuitCount = circuits; Where = where; ContentDigests = contentDigests;
         }
+
+        /// <summary>
+        /// Per-package content digests (<see cref="NsAdapterPackage.ContentDigest"/>) of the packages that were loaded and attached, in
+        /// load order. Taken from the loaded packages themselves, so a file replaced on disk afterwards cannot change them (#1915).
+        /// </summary>
+        public IReadOnlyList<string> ContentDigests { get; }
 
         /// <summary>Number of ternary circuits attached.</summary>
         public int CircuitCount { get; }
@@ -73,19 +79,24 @@ public static class TernaryAdapterAttach
 
         if (model is IResidualModifierHost host)
         {
-            var hook = TernaryResidualHook.Load(paths);
+            var loaded = paths.SelectMany(NsAdapterGguf.LoadAny).ToList();   // loaded once: the digests describe exactly these packages
+            if (loaded.Count == 0) throw new ArgumentException("no adapter paths given");
+            var digests = loaded.Select(p => p.ContentDigest()).ToArray();
+            var hook = new TernaryResidualHook(loaded[0].Manifest.InputDimension);
             try
             {
+                foreach (var pkg in loaded) hook.Add(pkg);
                 hook.ValidateFor(config.HiddenSize, config.NumLayers);
                 host.ResidualModifier = hook;
             }
             catch { hook.Dispose(); throw; }
-            return new Handle(() => { if (ReferenceEquals(host.ResidualModifier, hook)) host.ResidualModifier = null; }, hook, hook.CircuitCount, "cpu");
+            return new Handle(() => { if (ReferenceEquals(host.ResidualModifier, hook)) host.ResidualModifier = null; }, hook, hook.CircuitCount, "cpu", digests);
         }
 
         var vk = (IVulkanResidualModifierHost)model;
         var packages = paths.SelectMany(NsAdapterGguf.LoadAny).ToList();
         if (packages.Count == 0) throw new ArgumentException("no adapter paths given");
+        var vkDigests = packages.Select(p => p.ContentDigest()).ToArray();
         var mod = VulkanTernaryResidualModifier.Create(vk.ResidualDevice, VulkanModelLoader.ResolveSpvDir(), packages);
         try
         {
@@ -93,6 +104,6 @@ public static class TernaryAdapterAttach
             vk.ResidualModifier = mod;
         }
         catch { mod.Dispose(); throw; }
-        return new Handle(() => { if (ReferenceEquals(vk.ResidualModifier, mod)) vk.ResidualModifier = null; }, mod, packages.Count, "vulkan");
+        return new Handle(() => { if (ReferenceEquals(vk.ResidualModifier, mod)) vk.ResidualModifier = null; }, mod, packages.Count, "vulkan", vkDigests);
     }
 }

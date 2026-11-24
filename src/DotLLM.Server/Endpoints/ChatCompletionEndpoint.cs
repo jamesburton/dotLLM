@@ -159,8 +159,10 @@ public static class ChatCompletionEndpoint
             toolChoice, tools, state.ToolCallParser, ref options, out bool forcedToolCall);
 
         // chunk_cache: locate, verify and look up the annotated spans in the prompt exactly as rendered. Read-only: the
-        // prompt, the options and the dispatch below are those of the unannotated request.
-        if (chunkCache?.Prepare(state, messages, messages.Length - engineMessages.Length, templateOptions, prompt) is { } chunkPlanError)
+        // prompt, the options and the dispatch below are those of the unannotated request. A per-request adapter changes the
+        // K/V, so it is part of the identity the chunks are looked up under (#1915); such a request never writes chunks.
+        if (chunkCache?.Prepare(state, messages, messages.Length - engineMessages.Length, templateOptions, prompt, admit: true,
+                requestAdapter: adapter) is { } chunkPlanError)
         {
             await WriteChunkCacheErrorAsync(httpContext, chunkPlanError, keepAlive);
             return;

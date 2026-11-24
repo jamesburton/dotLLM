@@ -22,7 +22,7 @@ namespace DotLLM.Models.Architectures;
 /// Full-attention layers occur every <see cref="GatedDeltaNetConfig.FullAttnInterval"/> steps
 /// (1-indexed), e.g. layers 4, 8, 12, … 40 for interval=4.
 /// </summary>
-public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotLLM.Core.Diagnostics.IResidualModifierHost
+public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotLLM.Core.Diagnostics.IResidualModifierHost, DotLLM.Core.Diagnostics.IHiddenStateTapHost
 {
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
     private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
@@ -96,6 +96,7 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
         Config = config;
         _gguf = gguf;
         _layers = layers;
+        _taps = new DotLLM.Core.Diagnostics.HiddenStateTapRegistry(layers.Length);
         _outputNormWeight = outputNormWeight;
         _tokenEmbedWeight = tokenEmbedWeight;
         _tokenEmbedQuantType = tokenEmbedQuantType;
@@ -933,6 +934,51 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
     /// </summary>
     public DotLLM.Core.Diagnostics.IResidualModifier? ResidualModifier { get; set; }
 
+    // ── Hidden-state taps (#1920) ─────────────────────────────────────────────
+    private readonly DotLLM.Core.Diagnostics.HiddenStateTapRegistry _taps;
+    private int _tapStep;       // forwards that ran with a tap attached
+    private int _tapSeqId;      // sequence index reported in samples (ForwardBatch sets it per request)
+    private DotLLM.Core.Diagnostics.ForwardAbortInfo _headAbort;   // set when a PreLmHead tap aborts inside RunOutputHead
+
+    /// <inheritdoc/>
+    public IDisposable RegisterTap(DotLLM.Core.Diagnostics.HiddenStateTapSubscription subscription, Action<DotLLM.Core.Diagnostics.HiddenStateSample> onSample)
+    {
+        ArgumentNullException.ThrowIfNull(onSample);
+        return _taps.Register(subscription, onSample, null);
+    }
+
+    /// <inheritdoc/>
+    public IDisposable RegisterAbortableTap(DotLLM.Core.Diagnostics.HiddenStateTapSubscription subscription,
+                                            Func<DotLLM.Core.Diagnostics.HiddenStateSample, DotLLM.Core.Diagnostics.HookResult> onSample)
+    {
+        ArgumentNullException.ThrowIfNull(onSample);
+        return _taps.Register(subscription, null, onSample);
+    }
+
+    /// <inheritdoc/>
+    public IDisposable RegisterAbortableTap(DotLLM.Core.Diagnostics.HiddenStateTapSubscription subscription,
+                                            Func<DotLLM.Core.Diagnostics.HiddenStateSample, DotLLM.Core.Diagnostics.HookResult> onSample,
+                                            DotLLM.Core.Attention.IKvCache cache)
+    {
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.ThrowIfCacheCannotAbort(cache);
+        return RegisterAbortableTap(subscription, onSample);
+    }
+
+    /// <inheritdoc/>
+    public bool TryForward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
+                           out ITensor? logits, out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+    {
+        logits = ForwardCoreTry(tokenIds, ReadOnlySpan<float>.Empty, positions, deviceId, kvCache, null,
+                                0, _layers.Length, Span<float>.Empty, null, false, out abort);
+        return logits is not null;
+    }
+
+    private bool DispatchTap(DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot taps, DotLLM.Core.Diagnostics.HookPoint point,
+                             int layer, float* rows, int rowCount, int rowOffset, ReadOnlySpan<int> positions,
+                             out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+        => taps.Dispatch(point, layer, new ReadOnlySpan<float>(rows, rowCount * Config.HiddenSize), rowCount, rowOffset,
+                         Config.HiddenSize, positions, _tapSeqId, _tapStep - 1, out abort);
+
     private void ApplyResidualModifier(DotLLM.Core.Diagnostics.IResidualModifier modifier, int layer, float* hidden, int seqLen)
     {
         if (modifier.AppliesTo(layer))
@@ -1108,17 +1154,17 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
 
         _state.EnsureCapacity(seqLen);
         hidden[..(seqLen * hiddenSize)].CopyTo(new Span<float>((float*)_state.HiddenState, seqLen * hiddenSize));
-        return RunOutputHead(seqLen, deviceId);
+        return RunOutputHead(seqLen, deviceId)!;
     }
 
     /// <summary>
     /// Final output norm (in place over <c>_state.HiddenState</c>) + LM-head GEMM, materialised into
     /// a freshly-allocated caller-owned logits tensor.
     /// </summary>
-    private ITensor RunOutputHead(
+    private ITensor? RunOutputHead(
         int seqLen, int deviceId,
         ReadOnlySpan<int> tokenIds = default, ReadOnlySpan<int> positions = default, IMtpState? mtpState = null,
-        bool lastRowOnly = false)
+        bool lastRowOnly = false, DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot? taps = null)
     {
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
@@ -1127,7 +1173,11 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
 
         // MTP capture reads every post-final-norm row, so only a head without capture may skip the other rows (#1485).
         bool captureMtp = _mtpHead is not null && mtpState is CpuMtpState;
-        int firstNorm = lastRowOnly && !captureMtp ? seqLen - 1 : 0;
+        // PreLmHead + TapRows.All means every trunk row of the forward on every backend (#1920 M-1), even when the head projects only the
+        // last one: such a tap forces the all-row norm (only while attached).
+        bool tapAllPre = taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1)
+                         && taps.WantsAllRows(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1);
+        int firstNorm = lastRowOnly && !captureMtp && !tapAllPre ? seqLen - 1 : 0;
         int headRows = lastRowOnly ? 1 : seqLen;
         float* headIn = hidden + (long)(seqLen - headRows) * hiddenSize;
 
@@ -1141,6 +1191,13 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
         }
         if (TensorDump.Enabled)
             TensorDump.Dump2D("result_norm", hidden, seqLen, hiddenSize);
+
+        // PreLmHead (#1920): the post-norm rows (Last: the last row; All: every trunk row, see tapAllPre above).
+        int preRows = tapAllPre ? seqLen : headRows;
+        if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1)
+            && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1,
+                            hidden + (long)(seqLen - preRows) * hiddenSize, preRows, seqLen - preRows, positions, out _headAbort))
+            return null;
 
         // The GEMM writes straight into the caller-owned result: no model-state logits buffer, no rows*V*4 copy (#1485).
         var result = UnmanagedTensor.Allocate(new TensorShape(headRows, vocabSize), DType.Float32, deviceId);
@@ -1164,13 +1221,85 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
     /// export the residual stream (<paramref name="hiddenOut"/> non-empty, returns
     /// <see langword="null"/>) or run the output head.
     /// </summary>
-    [SkipLocalsInit]
     private ITensor? ForwardCore(
         ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
         int deviceId, IKvCache? kvCache, IGdnState? gdnState,
         int firstLayer, int layerCount, Span<float> hiddenOut, IMtpState? mtpState = null,
         bool lastTokenLogitsOnly = false)
     {
+        var result = ForwardCoreTry(tokenIds, hiddenIn, positions, deviceId, kvCache, gdnState,
+                                    firstLayer, layerCount, hiddenOut, mtpState, lastTokenLogitsOnly, out var abort);
+        if (result is null && hiddenOut.IsEmpty)
+            throw new DotLLM.Core.Diagnostics.ForwardAbortedException(abort);
+        return result;
+    }
+
+    /// <summary>
+    /// <see cref="ForwardCore"/> without the exception: null with <paramref name="abort"/> when an abortable hidden-state tap aborted
+    /// the pass (KV and GDN state already restored). A layer window (hiddenIn / hiddenOut) never carries taps.
+    /// </summary>
+    private ITensor? ForwardCoreTry(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
+        int deviceId, IKvCache? kvCache, IGdnState? gdnState,
+        int firstLayer, int layerCount, Span<float> hiddenOut, IMtpState? mtpState,
+        bool lastTokenLogitsOnly, out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+    {
+        var taps = hiddenIn.IsEmpty && hiddenOut.IsEmpty ? _taps.Current : null;
+        if (taps is null)
+            return ForwardTrunk(tokenIds, hiddenIn, positions, deviceId, kvCache, gdnState, firstLayer, layerCount, hiddenOut,
+                                mtpState, lastTokenLogitsOnly, null, out abort);
+
+        DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddTapForward();
+        _tapStep++;
+        bool abortable = taps.HasAbortable;
+        int kvEntry = kvCache?.CurrentLength ?? -1;   // every tapped forward records it (free): a throwing callback must not leave KV half-advanced
+        if (abortable)
+        {
+            // Abortable: an abort must leave the model exactly as it was at entry. MTP state is updated after the trunk and is not
+            // checkpointed, so that combination is refused rather than corrupted (a read-only tap with MTP is fine on every backend).
+            if (mtpState is not null)
+                throw new NotSupportedException("An abortable hidden-state tap cannot be combined with an MTP state on this forward.");
+            kvEntry = DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
+        }
+        GdnStateCache target = gdnState as GdnStateCache ?? _gdnCache;
+        // Entry checkpoint: always for an abortable tap; for a read-only tap too (a throwing callback must leave recurrent state
+        // consistent with the rolled-back KV), except with an MTP state (not covered by a checkpoint).
+        PooledGdnCheckpoint? checkpoint = abortable || mtpState is null ? TakeGdnCheckpoint(target) : null;
+        if (abortable) DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
+        try
+        {
+            var result = ForwardTrunk(tokenIds, hiddenIn, positions, deviceId, kvCache, gdnState, firstLayer, layerCount, hiddenOut,
+                                      mtpState, lastTokenLogitsOnly, taps, out abort);
+            if (result is null)
+            {
+                if (kvCache is not null) kvCache.Rollback(kvEntry);
+                checkpoint?.Snapshot.CopyTo(target);
+                DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortedForward();
+            }
+            return result;
+        }
+        catch
+        {
+            if (kvCache is not null && kvEntry >= 0 && kvCache.CurrentLength > kvEntry)
+            {
+                try { kvCache.Rollback(kvEntry); }
+                catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException) { /* windowed read-only cache: best effort */ }
+            }
+            checkpoint?.Snapshot.CopyTo(target);
+            throw;
+        }
+        finally { checkpoint?.Dispose(); }
+    }
+
+    [SkipLocalsInit]
+    private ITensor? ForwardTrunk(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
+        int deviceId, IKvCache? kvCache, IGdnState? gdnState,
+        int firstLayer, int layerCount, Span<float> hiddenOut, IMtpState? mtpState,
+        bool lastTokenLogitsOnly, DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot? taps,
+        out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+    {
+        abort = default;
         // Resolve the GDN state: caller-supplied container preferred, model-owned
         // fallback for the single-seq Forward callers that pre-date the per-seq API.
         // The fallback is unsafe across multi-seq batched dispatch — that path is
@@ -1267,6 +1396,10 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
             hiddenIn[..(int)stateElems].CopyTo(new Span<float>(hidden, (int)stateElems));
         }
 
+        if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PostEmbedding, -1)
+            && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PostEmbedding, -1, hidden, seqLen, 0, positions, out abort))
+            return null;
+
         var kinds = _layout.LayerKind;
         var residualModifier = ResidualModifier;
         int endLayer = firstLayer + layerCount;
@@ -1337,6 +1470,9 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
             // PostLayer residual modifier (#1711): after layer L's output (absolute layer index, also inside a layer window).
             if (residualModifier is not null)
                 ApplyResidualModifier(residualModifier, layer, hidden, seqLen);
+            if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PostLayer, layer)
+                && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PostLayer, layer, hidden, seqLen, 0, positions, out abort))
+                return null;
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.l_out", hidden, seqLen, hiddenSize);
             if (DotLLM.Cpu.ActivationRangeProbe.On)
@@ -1345,6 +1481,10 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
                 DotLLM.Cpu.ActivationRangeProbe.Record(layer, "resid_out", hidden, (long)seqLen * hiddenSize);
             }
         }
+
+        if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreFinalNorm, -1)
+            && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PreFinalNorm, -1, hidden, seqLen, 0, positions, out abort))
+            return null;
 
         // Window mode: hand back the residual stream leaving the last executed layer and stop
         // short of the head — the caller either feeds it to the next window or, after the last
@@ -1355,8 +1495,10 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
             return null;
         }
 
-        return RunOutputHead(seqLen, deviceId, tokenIds, positions, mtpState,
-            lastRowOnly: lastTokenLogitsOnly && seqLen > 1);
+        var logits = RunOutputHead(seqLen, deviceId, tokenIds, positions, mtpState,
+            lastRowOnly: lastTokenLogitsOnly && seqLen > 1, taps);
+        if (logits is null) abort = _headAbort;
+        return logits;
     }
 
     /// <inheritdoc/>
@@ -1412,12 +1554,24 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
                     "(no Qwen3MoeHybrid LoRA path today). Re-issue the request without an adapter.");
         }
 
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.RefuseAbortableBatch(_taps.Current);
         var results = new ITensor[requests.Count];
-        for (int i = 0; i < requests.Count; i++)
+        int done = 0;
+        try
         {
-            var r = requests[i];
-            results[i] = ForwardCore(r.TokenIds.Span, ReadOnlySpan<float>.Empty, r.Positions.Span, deviceId, r.KvCache, r.GdnState,
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var r = requests[i];
+                _tapSeqId = i;
+                results[i] = ForwardCore(r.TokenIds.Span, ReadOnlySpan<float>.Empty, r.Positions.Span, deviceId, r.KvCache, r.GdnState,
                 firstLayer: 0, layerCount: _layers.Length, hiddenOut: Span<float>.Empty, null, r.LastTokenLogitsOnly)!;
+                done++;
+            }
+        }
+        catch
+        {
+            for (int d = 0; d < done; d++) results[d].Dispose();   // do not leak the completed requests' logits
+            throw;
         }
         return results;
     }
@@ -1835,6 +1989,9 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel, DotL
     /// <inheritdoc/>
     public void Dispose()
     {
+        // #1927: free this thread's CPU kernel scratch (attention tiles, split-KV partials, Q4_K row-lane tile); an owned pool trims its
+        // workers when it is disposed.
+        DotLLM.Cpu.Kernels.CpuKernelScratch.Trim(null);
         if (_ownsThreadPool)
             _threadPool?.Dispose();
         _state.Dispose();

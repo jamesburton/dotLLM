@@ -38,6 +38,14 @@ public enum VulkanKvStorage
 
     /// <summary>Mixed block KV (issue #1884): K in <see cref="Q4_0"/>, V in <see cref="Q8_0"/>.</summary>
     Q4_0K_Q8_0V = 5,
+
+    /// <summary>
+    /// TurboQuant on both sides (issue #1892): per-head-vector Lloyd-Max codes plus a norm, read in place in code space (the query is
+    /// rotated by <c>tq_rotate_q</c> and the output by <c>tq_rotate_o</c>). It has no element size or block size: rows are sized by the
+    /// TurboQuant layout, so <see cref="VulkanKvStorageExtensions.ElementBytes"/> and <see cref="VulkanKvStorageExtensions.RowBytes"/>
+    /// refuse it rather than guess. Its attention twins are the <c>_kvtq</c> shaders.
+    /// </summary>
+    Tq = 6,
 }
 
 /// <summary>Per-format facts the attention kernels and the KV cache share (issue #1102).</summary>
@@ -52,6 +60,32 @@ public static class VulkanKvStorageExtensions
         VulkanKvStorage.F16 => 2,
         _ => throw new ArgumentOutOfRangeException(nameof(storage)),
     };
+
+    /// <summary>The per-side format pair this storage denotes (the combinations are expressed as a pair, #1892).</summary>
+    /// <param name="storage">The storage format.</param>
+    /// <returns>The K and V side formats.</returns>
+    public static DotLLM.Core.Attention.KvFormatPair ToFormatPair(this VulkanKvStorage storage) => storage switch
+    {
+        VulkanKvStorage.F32 => DotLLM.Core.Attention.KvFormatPair.Both(DotLLM.Core.Attention.KvSideFormat.F32),
+        VulkanKvStorage.F16 => DotLLM.Core.Attention.KvFormatPair.Both(DotLLM.Core.Attention.KvSideFormat.F16),
+        VulkanKvStorage.Q8_0 => DotLLM.Core.Attention.KvFormatPair.Both(DotLLM.Core.Attention.KvSideFormat.Q8_0),
+        VulkanKvStorage.Q4_0 => DotLLM.Core.Attention.KvFormatPair.Both(DotLLM.Core.Attention.KvSideFormat.Q4_0),
+        VulkanKvStorage.Q8_0K_Q4_0V => new(DotLLM.Core.Attention.KvSideFormat.Q8_0, DotLLM.Core.Attention.KvSideFormat.Q4_0),
+        VulkanKvStorage.Q4_0K_Q8_0V => new(DotLLM.Core.Attention.KvSideFormat.Q4_0, DotLLM.Core.Attention.KvSideFormat.Q8_0),
+        VulkanKvStorage.Tq => DotLLM.Core.Attention.KvFormatPair.Both(DotLLM.Core.Attention.KvSideFormat.Tq),
+        _ => throw new ArgumentOutOfRangeException(nameof(storage)),
+    };
+
+    /// <summary>The storage a format pair maps onto, or throws when no Vulkan storage holds that combination.</summary>
+    /// <param name="pair">The K and V side formats.</param>
+    /// <returns>The matching storage.</returns>
+    /// <exception cref="NotSupportedException">The combination has no Vulkan storage (mixed TurboQuant is step 6).</exception>
+    public static VulkanKvStorage FromFormatPair(DotLLM.Core.Attention.KvFormatPair pair)
+    {
+        foreach (VulkanKvStorage st in Enum.GetValues<VulkanKvStorage>())
+            if (st.ToFormatPair() == pair) return st;
+        throw new NotSupportedException($"No Vulkan KV storage holds K={pair.K}, V={pair.V}.");
+    }
 
     /// <summary>Elements per Q8_0 KV block.</summary>
     public const int Q8BlockElements = 32;
@@ -132,6 +166,7 @@ public static class VulkanKvStorageExtensions
         VulkanKvStorage.Q4_0 => f32ShaderName + "_kvq4",
         VulkanKvStorage.Q8_0K_Q4_0V => f32ShaderName + "_kvq8q4",
         VulkanKvStorage.Q4_0K_Q8_0V => f32ShaderName + "_kvq4q8",
+        VulkanKvStorage.Tq => f32ShaderName + "_kvtq",   // #1892: the body with kv_load.glsl's KV_TQ loader
         _ => throw new ArgumentOutOfRangeException(nameof(storage)),
     };
 
@@ -187,7 +222,7 @@ public static class VulkanKvStorageExtensions
 /// model-level layer indices into slot indices; a value of <c>-1</c> indicates a
 /// non-attention layer and the cache rejects requests against that index.
 /// </remarks>
-public sealed class VulkanNemotronHKvCache : IKvCache
+public sealed class VulkanNemotronHKvCache : IKvCache, IKvLengthRollback
 {
     private readonly VulkanDevice _device;
     private readonly VulkanDevice.Buffer[] _keys;
@@ -359,6 +394,7 @@ public sealed class VulkanNemotronHKvCache : IKvCache
         if (maxLength > _growthLimit) return false;
         if (!_lazy && _attentionLayerCount > 0)
         {
+            if (!AdmitEagerGrowth(maxLength)) return false;
             try { GrowTo(maxLength); }
             catch (VulkanException e) when (e.ErrorCode is VulkanOutOfDeviceMemory or VulkanOutOfHostMemory)
             {
@@ -372,6 +408,29 @@ public sealed class VulkanNemotronHKvCache : IKvCache
 
         _maxSeqLen = maxLength;
         return true;
+    }
+
+    /// <summary>
+    /// Admission for an eager growth (issue #1919): the new K/V buffers must fit in the device's free resident capacity (capacity minus
+    /// this process's live bytes minus other processes' GPU memory) beside the reserve, BEFORE any buffer is allocated, so a refused growth
+    /// leaves the cache untouched. The refusal is printed with its numbers (never silent). Where the free figure cannot be read the
+    /// allocation attempt (and its out-of-memory catch) is the admission.
+    /// </summary>
+    private bool AdmitEagerGrowth(int newLength)
+    {
+        long perLayerNew = 2L * newLength * _kvStride * _elemBytes;
+        // Net growth once every layer is swapped, plus one layer's new buffers alive while its old ones are still held.
+        long required = 2L * _attentionLayerCount * (newLength - _allocLength) * _kvStride * _elemBytes + perLayerNew;
+        long capacity = _device.ResidentCapacityBytes();
+        long other = 0;
+        try { other = _device.ReadOtherProcessPressure()?.OtherBytes ?? 0; } catch (Exception) { /* diagnostics only */ }
+        long free = capacity - _device.ResidentLiveBytes() - other;
+        long reserve = Core.Configuration.DeviceMemoryBudget.ResolveReserveBytes(
+            Environment.GetEnvironmentVariable(Core.Configuration.DeviceMemoryBudget.ReserveEnvVar));
+        if (Core.Configuration.DeviceMemoryBudget.Fits(free, required, reserve)) return true;
+        Console.Error.WriteLine("[dotllm] ERROR: " + Core.Configuration.DeviceMemoryBudget.DescribeRefusal(
+            $"the KV cache grown to {newLength} positions", required, free, reserve));
+        return false;
     }
 
     /// <summary>
@@ -614,6 +673,10 @@ public sealed class VulkanNemotronHKvCache : IKvCache
             throw new ArgumentOutOfRangeException(nameof(length));
         _currentLength = length;
     }
+
+    /// <inheritdoc/>
+    /// <remarks>Every attention layer holds the full history; a cut only lowers the visible length and later writes overwrite the rows past it.</remarks>
+    public bool CanTruncateTo(int length) => (uint)length <= (uint)_currentLength;
 
     /// <summary>
     /// Device-to-device copy of the first <paramref name="length"/> positions into a new, independent cache sized exactly

@@ -58,6 +58,16 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     // split relative to the window start and do not care). The GQA flash sink twins (#1200) tile in 16 / 32 rows, which divide it.
     private const int KvTileRows = 256;
     private readonly VulkanDevice.Buffer? _moveScratch; // overlapping compaction moves stage through here (K then V half)
+
+    // TurboQuant storage (issue #1892): _keys / _values hold the packed codes (CodeUintsPerVec words per head vector plus one guard
+    // word per layer); these hold the rest. Null / default for every other storage. Nothing wider than codes + norms is ever stored.
+    private readonly VulkanDevice.Buffer[]? _keyNorms;
+    private readonly VulkanDevice.Buffer[]? _valueNorms;
+    private readonly VulkanDevice.Buffer? _tqCentroids;   // 2^mseBits F32, shared by K and V
+    private readonly VulkanDevice.Buffer? _tqSignsK;      // headDim F32 +-1 (K rotation)
+    private readonly VulkanDevice.Buffer? _tqSignsV;      // headDim F32 +-1 (V rotation; a different seed)
+    private readonly TurboQuantLayout _tqLayout;
+    private readonly float _tqInvSqrtD;
     private int _currentLength;
     private bool _disposed;
 
@@ -78,6 +88,11 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         {
             long bytes = _moveScratch?.Size ?? 0;
             for (int i = 0; i < _numLayers; i++) bytes += _keys[i].Size + _values[i].Size;
+            if (_keyNorms is not null)   // TurboQuant: norms and the constant buffers count too (#1892)
+            {
+                for (int i = 0; i < _numLayers; i++) bytes += _keyNorms[i].Size + _valueNorms![i].Size;
+                bytes += _tqCentroids!.Size + _tqSignsK!.Size + _tqSignsV!.Size;
+            }
             return bytes;
         }
     }
@@ -93,6 +108,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     {
         get
         {
+            if (_storage == VulkanKvStorage.Tq) return DeviceBytes;
             if (_rows is not null) return _rows.AllocatedBytes(i => _storage.KeyRowBytes(_kvStride[i]) + _storage.ValueRowBytes(_kvStride[i]));
             long total = 0;
             for (int i = 0; i < _numLayers; i++) total += _maxSeqLen * (_storage.KeyRowBytes(_kvStride[i]) + _storage.ValueRowBytes(_kvStride[i]));
@@ -161,12 +177,118 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     {
     }
 
+    /// <summary>
+    /// Creates an in-place TurboQuant cache (issue #1892): per layer, the packed codes and the norms of K and V in
+    /// <paramref name="layout"/>, plus the shared centroids and the two sign vectors. Rows are written by
+    /// <see cref="Kernels.TurboQuantEncodeF32Kernel"/> and read in place, in code space, by the <c>_kvtq</c> attention twins. The codec
+    /// constants come from the caller (the Vulkan project does not depend on the Engine codec). Uniform geometry; full-length rows on
+    /// every layer (no compact sliding-window ring). Bytes per cached position and layer:
+    /// <c>2 x numKvHeads x (4 x CodeUintsPerVec + NormBytes)</c>.
+    /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="numLayers">Layers.</param>
+    /// <param name="maxSeqLen">Positions per layer.</param>
+    /// <param name="layout">Code and norm layout (head dim a power of two at most 256; F16 norms unless a reference run).</param>
+    /// <param name="centroids">The <c>2^mseBits</c> centroids, already scaled by 1/sqrt(d).</param>
+    /// <param name="signsK">K rotation signs (+-1), <c>headDim</c> entries.</param>
+    /// <param name="signsV">V rotation signs, from a different seed than <paramref name="signsK"/>.</param>
+    /// <param name="invSqrtD">The codec's exact 1/sqrt(headDim).</param>
+    public VulkanKvCache(VulkanDevice device, int numLayers, int maxSeqLen, TurboQuantLayout layout,
+        ReadOnlySpan<float> centroids, ReadOnlySpan<float> signsK, ReadOnlySpan<float> signsV, float invSqrtD)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
+        if (maxSeqLen <= 0) throw new ArgumentOutOfRangeException(nameof(maxSeqLen));
+        if (layout.NumKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(layout));
+        layout = Kernels.TqKvTwin.Require(VulkanKvStorage.Tq, layout)!.Value;
+        if (centroids.Length != 1 << layout.MseBits)
+            throw new ArgumentException($"centroids must have 2^mseBits = {1 << layout.MseBits} entries.", nameof(centroids));
+        if (signsK.Length != layout.HeadDim || signsV.Length != layout.HeadDim)
+            throw new ArgumentException("signs must have headDim entries.", nameof(signsK));
+
+        _device = device;
+        _numLayers = numLayers;
+        _maxSeqLen = maxSeqLen;
+        _kvStride = BuildUniformStrides(numLayers, layout.NumKvHeads, layout.HeadDim);
+        _storage = VulkanKvStorage.Tq;
+        _elemBytes = 0;   // no element size: the host-staged element paths refuse TurboQuant
+        _tqLayout = layout;
+        _tqInvSqrtD = invSqrtD;
+        _keys = new VulkanDevice.Buffer[numLayers];
+        _values = new VulkanDevice.Buffer[numLayers];
+        _keyNorms = new VulkanDevice.Buffer[numLayers];
+        _valueNorms = new VulkanDevice.Buffer[numLayers];
+        long codeBytes = layout.CodeBytesPerLayer(maxSeqLen);   // includes the guard word of the straddle read
+        long normBytes = Kernels.TqKvTwin.NormBufferBytes((long)maxSeqLen * layout.NumKvHeads, layout.Norm);
+        try
+        {
+            for (int i = 0; i < numLayers; i++)
+            {
+                _keys[i] = device.AllocateDeviceLocal(codeBytes);
+                _values[i] = device.AllocateDeviceLocal(codeBytes);
+                _keyNorms[i] = device.AllocateDeviceLocal(normBytes);
+                _valueNorms[i] = device.AllocateDeviceLocal(normBytes);
+            }
+            _tqCentroids = device.Allocate((long)centroids.Length * sizeof(float));
+            _tqSignsK = device.Allocate((long)layout.HeadDim * sizeof(float));
+            _tqSignsV = device.Allocate((long)layout.HeadDim * sizeof(float));
+            device.Upload(centroids, _tqCentroids);
+            device.Upload(signsK, _tqSignsK);
+            device.Upload(signsV, _tqSignsV);
+        }
+        catch
+        {
+            // A Dispose that itself throws must not mask the allocation failure that got us here.
+            try { Dispose(); } catch { /* best effort: the original exception is the one the caller needs */ }
+            throw;
+        }
+    }
+
+    /// <summary>The TurboQuant layout of a <see cref="VulkanKvStorage.Tq"/> cache (issue #1892); null for every other storage.</summary>
+    public TurboQuantLayout? TurboQuantLayout => _storage == VulkanKvStorage.Tq ? _tqLayout : null;
+
+    /// <summary>The norm and centroid buffers a <c>_kvtq</c> attention twin binds for <paramref name="layerIndex"/>.</summary>
+    internal Kernels.TqKvOperands TqOperands(int layerIndex)
+    {
+        RequireTq();
+        return new(_keyNorms![layerIndex], _valueNorms![layerIndex], _tqCentroids!);
+    }
+
+    /// <summary>K rotation signs: the query is rotated with these before a twin scores it (<c>tq_rotate_q</c>).</summary>
+    internal VulkanDevice.Buffer TqSignsK { get { RequireTq(); return _tqSignsK!; } }
+
+    /// <summary>V rotation signs: the attention output is rotated back with these (<c>tq_rotate_o</c>).</summary>
+    internal VulkanDevice.Buffer TqSignsV { get { RequireTq(); return _tqSignsV!; } }
+
+    private void RequireTq()
+    {
+        if (_storage != VulkanKvStorage.Tq) throw new InvalidOperationException($"This KV cache stores {_storage}, not TurboQuant.");
+    }
+
+    /// <summary>Test hook: the stored code words of a layer side, <c>CodeUintsPerVec</c> per head vector.</summary>
+    internal void DownloadTqCodes(int layerIndex, bool values, Span<uint> destination)
+    {
+        RequireTq();
+        _device.Download((values ? _values : _keys)[layerIndex], System.Runtime.InteropServices.MemoryMarshal.Cast<uint, float>(destination));
+    }
+
+    /// <summary>Test hook: the stored norm bytes of a layer side, in the layout's norm format.</summary>
+    internal void DownloadTqNormBytes(int layerIndex, bool values, Span<byte> destination)
+    {
+        RequireTq();
+        var tmp = new float[(destination.Length + 3) / 4];
+        _device.Download((values ? _valueNorms! : _keyNorms!)[layerIndex], tmp.AsSpan());
+        MemoryMarshal.AsBytes(tmp.AsSpan())[..destination.Length].CopyTo(destination);
+    }
+
     private VulkanKvCache(VulkanDevice device, int[] kvStridePerLayer, int maxSeqLen, VulkanKvStorage storage, SlidingWindowRows? rows)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(kvStridePerLayer);
         if (kvStridePerLayer.Length == 0) throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer));
         if (maxSeqLen <= 0) throw new ArgumentOutOfRangeException(nameof(maxSeqLen));
+        if (storage == VulkanKvStorage.Tq)
+            throw new ArgumentException("A TurboQuant KV cache needs its layout and codec constants; use that constructor (#1892).", nameof(storage));
 
         _device = device;
         _numLayers = kvStridePerLayer.Length;
@@ -288,10 +410,30 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         Kernels.IVulkanKvF16Writer? f16Writer = null,
         VulkanDevice.Buffer? positionsDev = null,
         Kernels.IVulkanKvQ8Writer? q8Writer = null,
-        Kernels.IVulkanKvQ8Writer? q8ValueWriter = null)   // the V side's writer when K and V differ (mixed block formats, #1884)
+        Kernels.IVulkanKvQ8Writer? q8ValueWriter = null,   // the V side's writer when K and V differ (mixed block formats, #1884)
+        Kernels.TurboQuantEncodeF32Kernel? tqWriter = null)
     {
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
+
+        if (_storage == VulkanKvStorage.Tq)
+        {
+            // Encoded on the device, one workgroup per head vector, K and V with their own sign sets (#1892). Attention then reads these
+            // rows, the ones just written included, from the codes: there is no original-space copy to read instead.
+            if (tqWriter is null)
+                throw new InvalidOperationException("A TurboQuant KV cache is written by the encode kernel; pass the writer.");
+            int tqMax = ValidateAndFindMaxPos(positions, seqLen);
+            if (!IsContiguousAscending(positions))
+                throw new NotSupportedException(
+                    "A TurboQuant KV cache is written at contiguous positions only; the row-scatter writer (selective recompute, chunk-KV reuse) is step 4 of #1887.");
+            var l = _tqLayout;
+            tqWriter.Record(cmdBuf, kDev, _tqCentroids!, _tqSignsK!, _keys[layerIndex], _keyNorms![layerIndex],
+                seqLen, l.HeadDim, l.NumKvHeads, l.MseBits, l.CodeUintsPerVec, positions[0], _tqInvSqrtD, l.Norm);
+            tqWriter.Record(cmdBuf, vDev, _tqCentroids!, _tqSignsV!, _values[layerIndex], _valueNorms![layerIndex],
+                seqLen, l.HeadDim, l.NumKvHeads, l.MseBits, l.CodeUintsPerVec, positions[0], _tqInvSqrtD, l.Norm);
+            if (tqMax + 1 > _currentLength) _currentLength = tqMax + 1;
+            return;
+        }
 
         int rowBytes = _kvStride[layerIndex] * sizeof(float);
         int maxPos = ValidateAndFindMaxPos(positions, seqLen);
@@ -478,6 +620,13 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         Truncate(length);
     }
 
+    /// <inheritdoc/>
+    public bool SupportsAbortRollback => _rows is null;
+
+    /// <inheritdoc/>
+    public bool CanRollbackAfterAppend(int minPos, int maxPos) =>
+        _rows is null || _rows.CanTruncateToAfterAppend(_currentLength, minPos, maxPos);
+
     /// <summary>Resets the visible length. Used when starting a new sequence.</summary>
     public void Reset() => Truncate(0);
 
@@ -522,6 +671,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (maxLength <= _maxSeqLen) return true;
         if (_rows is not null) return false;
+        if (_storage == VulkanKvStorage.Tq) return false;   // growth of codes + norms is step 4 of #1887; a refusal is a prefix miss, never a wider copy
 
         long growth = 0, transit = 0;
         for (int i = 0; i < _numLayers; i++)
@@ -747,6 +897,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     {
         if ((uint)layerIndex >= (uint)_numLayers)
             throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        RequireNotTq("IngestFromHost");
         ThrowIfWindowed(layerIndex, "IngestFromHost");
         if (length <= 0)
             throw new ArgumentOutOfRangeException(nameof(length), "length must be positive.");
@@ -823,6 +974,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     {
         if ((uint)layerIndex >= (uint)_numLayers)
             throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        RequireNotTq("DownloadLayer");
         ThrowIfWindowed(layerIndex, "DownloadLayer");
         int count = _currentLength * _kvStride[layerIndex];
         if (count == 0) return;
@@ -847,6 +999,13 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     {
         if (_storage.IsBlockQuantized())
             throw new NotSupportedException($"VulkanKvCache {operation} has no {_storage} arm (prefix snapshots, handoff and host row access need F16 or F32 KV); the Q8_0 cache is read in place by the attention kernels only.");
+    }
+
+    // TurboQuant rows are codes + norms in code space: no host element transport, handoff or row copy exists for them yet (#1887 step 4).
+    private void RequireNotTq(string operation)
+    {
+        if (_storage == VulkanKvStorage.Tq)
+            throw new NotSupportedException($"VulkanKvCache.{operation} has no TurboQuant arm: the cache holds codes and norms, read in place by the attention kernels only.");
     }
 
     // The synchronous test/diagnostic UpdateDevice moves F32 rows only; the host-staged transports (handoff, ingest) convert for F16 (#1151).
@@ -917,6 +1076,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     public void CopyRowsFrom(VulkanKvCache source, int layerIndex, int srcStart, int dstStart, int count)
     {
         ArgumentNullException.ThrowIfNull(source);
+        RequireNotTq("CopyRowsFrom");
         if (!ReferenceEquals(source._device, _device)) throw new ArgumentException("Caches must share one VulkanDevice.", nameof(source));
         if (source._storage != _storage) throw new ArgumentException("Caches must share the element format.", nameof(source));
         long elems = CheckRowRange(layerIndex, dstStart, count, "CopyRowsFrom");
@@ -944,6 +1104,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         if (source is not VulkanKvCache src || ReferenceEquals(src, this) || src._disposed) return false;
         if (!ReferenceEquals(src._device, _device) || src._storage != _storage || src._numLayers != _numLayers) return false;
         if (_rows is not null || src._rows is not null) return false;
+        if (_storage == VulkanKvStorage.Tq) return false;   // seeding needs the seed / centroid fingerprint check: step 4 of #1887
         if (rows <= 0 || rows > src._currentLength || rows > _maxSeqLen) return false;
         for (int i = 0; i < _numLayers; i++)
             if (src._kvStride[i] != _kvStride[i]) return false;
@@ -969,6 +1130,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     private long CheckRowRange(int layerIndex, int startPosition, int count, string operation)
     {
         if ((uint)layerIndex >= (uint)_numLayers) throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        RequireNotTq(operation);
         ThrowIfWindowed(layerIndex, operation);
         if (startPosition < 0) throw new ArgumentOutOfRangeException(nameof(startPosition));
         if (count <= 0) throw new ArgumentOutOfRangeException(nameof(count), "count must be positive.");
@@ -1033,8 +1195,13 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         {
             _keys[i]?.Dispose();
             _values[i]?.Dispose();
+            _keyNorms?[i]?.Dispose();
+            _valueNorms?[i]?.Dispose();
         }
 
+        _tqCentroids?.Dispose();
+        _tqSignsK?.Dispose();
+        _tqSignsV?.Dispose();
         _moveScratch?.Dispose();
     }
 }

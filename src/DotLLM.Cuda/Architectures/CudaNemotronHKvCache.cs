@@ -19,7 +19,7 @@ namespace DotLLM.Cuda.Architectures;
 /// <c>positions[0]</c> — the only write pattern NemotronH's CPU/Vulkan hosts ever produce
 /// (prefill writes <c>[0, seqLen)</c>; decode writes one position). A non-contiguous call throws.
 /// </remarks>
-public sealed class CudaNemotronHKvCache : IKvCache
+public sealed class CudaNemotronHKvCache : IKvCache, IKvLengthRollback
 {
     private readonly nint[] _keys;   // per-slot device buffers, [maxSeqLen, kvStride] F32
     private readonly nint[] _values;
@@ -145,6 +145,9 @@ public sealed class CudaNemotronHKvCache : IKvCache
             throw new ArgumentOutOfRangeException(nameof(length));
         _currentLength = length;
     }
+
+    /// <inheritdoc/>
+    public bool CanTruncateTo(int length) => (uint)length <= (uint)_currentLength;
 
     /// <inheritdoc/>
     public void Update(ITensor keys, ITensor values, ReadOnlySpan<int> positions, int layerIndex)

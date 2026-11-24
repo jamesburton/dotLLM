@@ -1,4 +1,5 @@
 using DotLLM.ChunkReuse.Store;
+using DotLLM.Core.Identity;
 using DotLLM.Models.Gguf;
 
 namespace DotLLM.Server.ChunkCache;
@@ -7,8 +8,47 @@ namespace DotLLM.Server.ChunkCache;
 /// Per-server chunk-cache state: the (read-only) chunk store and the identity of the loaded model, computed once per model
 /// (single flight; a failure is cached too). Thread-safe. Holds no request data.
 /// </summary>
-internal sealed class ChunkCacheRuntime
+internal sealed class ChunkCacheRuntime : IDisposable
 {
+    private ChunkStoreService? _writer;
+
+    /// <summary>The store's sole writer (<c>--chunk-store-write</c>), once <see cref="StartWriter"/> ran; else null (read-only).</summary>
+    internal ChunkStoreService? Writer => Volatile.Read(ref _writer);
+
+    /// <summary>
+    /// Starts the sole writer for <paramref name="state"/>'s options at server startup (once; later calls return the running
+    /// one). Null when <c>--chunk-store-write</c> is off.
+    /// </summary>
+    /// <param name="state">The server.</param>
+    /// <param name="host">The model the worker encodes on; null = the server's own (<see cref="ServerChunkEncodeHost"/>).</param>
+    /// <returns>The writer or null.</returns>
+    /// <exception cref="InvalidServerOptionException">Another server owns the store, or it cannot be created.</exception>
+    internal ChunkStoreService? StartWriter(ServerState state, IChunkEncodeHost? host = null)
+    {
+        var options = state.Options.ChunkCache;
+        if (!options.Enabled || !options.StoreWrite)
+            return null;
+        lock (_storeGate)
+        {
+            return _writer ??= ChunkStoreService.Start(options, host ?? new ServerChunkEncodeHost(state));
+        }
+    }
+
+    private ChunkStoreService? _retired;
+
+    /// <summary>Whether a stopped writer's worker is still inside an encode (the model must not be freed under it).</summary>
+    internal bool WriterStillRunning => Volatile.Read(ref _retired) is { WorkerStopped: false };
+
+    /// <summary>Stops the writer (worker and ownership; see <see cref="ChunkStoreService.Dispose"/>).</summary>
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _writer, null) is { } writer)
+        {
+            writer.Dispose();
+            Volatile.Write(ref _retired, writer);
+        }
+    }
+
     private readonly object _storeGate = new();
     private readonly object _identityGate = new();
     private IChunkStore? _store;
@@ -23,7 +63,13 @@ internal sealed class ChunkCacheRuntime
     /// How long an <c>explain</c> body may take to arrive (<see cref="Endpoints.ChunkCacheEndpoint.ExplainBodyReadTimeoutSeconds"/>);
     /// a slower body is <c>408</c>. Settable for tests.
     /// </summary>
-    internal TimeSpan ExplainBodyReadTimeout { get; set; } = TimeSpan.FromSeconds(Endpoints.ChunkCacheEndpoint.ExplainBodyReadTimeoutSeconds);
+    internal TimeSpan ExplainBodyReadTimeout
+    {
+        get => _explainBodyReadTimeout ?? Endpoints.ChunkCacheEndpoint.BodyReadTimeout; // one deadline for every POST body unless a test set this one
+        set => _explainBodyReadTimeout = value;
+    }
+
+    private TimeSpan? _explainBodyReadTimeout;
 
     private int _explainBodyReadsInFlight;
     private int _inferenceCallerResolutions;
@@ -42,6 +88,27 @@ internal sealed class ChunkCacheRuntime
     internal void ExitExplainBodyRead() => Interlocked.Decrement(ref _explainBodyReadsInFlight);
 
     internal void CountInferenceCallerResolution() => Interlocked.Increment(ref _inferenceCallerResolutions);
+    /// <summary>Slots for concurrent <c>prewarm</c> / <c>evict</c> calls (<see cref="Endpoints.ChunkCacheEndpoint.MaxConcurrentWrites"/>).</summary>
+    internal SemaphoreSlim WriteGate { get; } = new(Endpoints.ChunkCacheEndpoint.MaxConcurrentWrites, Endpoints.ChunkCacheEndpoint.MaxConcurrentWrites);
+
+    private readonly HashSet<string> _writeNamespaces = new(StringComparer.Ordinal);
+
+    /// <summary>Takes the namespace's single write slot (one prewarm / evict call per namespace at a time); false when taken.</summary>
+    /// <param name="ns">The caller's namespace.</param>
+    /// <returns>Whether the slot was free.</returns>
+    internal bool TryEnterWriteSlot(string ns)
+    {
+        lock (_writeNamespaces)
+            return _writeNamespaces.Add(ns);
+    }
+
+    /// <summary>Releases the namespace's write slot.</summary>
+    /// <param name="ns">The caller's namespace.</param>
+    internal void LeaveWriteSlot(string ns)
+    {
+        lock (_writeNamespaces)
+            _writeNamespaces.Remove(ns);
+    }
 
     /// <summary>A store injected by the host or a test; wins over <c>--chunk-store</c>.</summary>
     internal IChunkStore? StoreOverride { get; set; }
@@ -118,7 +185,9 @@ internal sealed class ChunkCacheRuntime
             ServerModelIdentity identity;
             try
             {
-                identity = IdentityFactory(gguf, state.Config!, backend);
+                // The overlay and ternary adapters are applied to the loaded model (the encoder runs on it), so their content is
+                // part of its identity: a separate key space from the base model's and from any other overlay or adapter set (#1915).
+                identity = IdentityFactory(gguf, state.Config!, backend).WithModifiers(ServerModifiers(state));
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
@@ -129,6 +198,61 @@ internal sealed class ChunkCacheRuntime
             _identityKey = gguf;
             _identity = identity;
             return identity;
+        }
+    }
+
+    /// <summary>
+    /// The identity a request is looked up under: <see cref="IdentityFor(ServerState)"/>, plus the request's LoRA adapter folded in
+    /// when it names one (#1915). A LoRA request therefore never shares keys with base-model entries (no wrong hit), and the same
+    /// adapter content always lands on the same keys. An unsupported base identity stays unsupported.
+    /// </summary>
+    /// <param name="state">The server state.</param>
+    /// <param name="requestAdapter">The request's LoRA adapter, or null.</param>
+    /// <returns>The identity; never throws (a digest failure is an unsupported identity).</returns>
+    public ServerModelIdentity IdentityFor(ServerState state, DotLLM.Core.Lora.ILoraAdapter? requestAdapter)
+    {
+        var identity = IdentityFor(state);
+        if (requestAdapter is null || !identity.Supported)
+            return identity;
+        try
+        {
+            return identity.WithModifiers([(ModifierSetDigest.KindLora, "", ModifierSetDigest.OfLora(requestAdapter))]);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            ServerLog.Info($"chunk_cache: LoRA identity unavailable ({ex.GetType().Name}); annotations are ignored for this request");
+            return ServerModelIdentity.Unsupported("LoRA adapter identity unavailable");
+        }
+    }
+
+    /// <summary>
+    /// How long the store-wide figures of <c>GET /v1/chunk-cache</c> (a walk over every entry file) are reused. The route
+    /// has no slot and a keyless local caller may call it freely, so the walk must not run per request.
+    /// </summary>
+    internal TimeSpan StoreFiguresTtl { get; set; } = TimeSpan.FromSeconds(5);
+
+    private readonly Lock _figuresGate = new();
+    private (long Entries, long Bytes) _figures;
+    private long _figuresAtMs = long.MinValue;
+    private int _figureWalks;
+
+    /// <summary>Directory walks done for the store-wide figures (test observability).</summary>
+    internal int StoreFigureWalks => Volatile.Read(ref _figureWalks);
+
+    /// <summary>The store-wide figures, walked at most once per <see cref="StoreFiguresTtl"/> (one walk at a time).</summary>
+    /// <param name="walk">Counts the store's entry files and bytes.</param>
+    /// <returns>Entries and bytes, at most <see cref="StoreFiguresTtl"/> old.</returns>
+    internal (long Entries, long Bytes) StoreFigures(Func<(long Entries, long Bytes)> walk)
+    {
+        lock (_figuresGate)
+        {
+            long now = Environment.TickCount64;
+            if (_figuresAtMs != long.MinValue && StoreFiguresTtl > TimeSpan.Zero && now - _figuresAtMs < StoreFiguresTtl.TotalMilliseconds)
+                return _figures;
+            _figures = walk();
+            _figuresAtMs = now;
+            Interlocked.Increment(ref _figureWalks);
+            return _figures;
         }
     }
 
@@ -149,5 +273,22 @@ internal sealed class ChunkCacheRuntime
         if (state.CurrentGguf is null)
             return "no GGUF identity";
         return null;
+    }
+
+    /// <summary>
+    /// What changed the loaded weights without changing the base GGUF (<c>--tensor-overlay</c>, each <c>--ternary-adapter</c> package), as
+    /// (kind, id, content digest) from <see cref="ServerState.WeightModifiers"/>: digests taken at load time from the loaded bytes, so
+    /// nothing is read from disk here and a file replaced since load cannot change the identity (#1915). Ids are empty: content decides.
+    /// </summary>
+    /// <param name="state">The server state.</param>
+    /// <returns>The modifiers (empty for a base model).</returns>
+    /// <exception cref="InvalidOperationException">The options name an overlay or adapter but no digests were computed at load.</exception>
+    internal static IReadOnlyList<(string Kind, string Id, string ContentDigest)> ServerModifiers(ServerState state)
+    {
+        if (state.WeightModifiers is { } computed)
+            return computed;
+        if (state.Options.TensorOverlayPath is not null || state.Options.TernaryAdapterPaths is { Count: > 0 })
+            throw new InvalidOperationException("The overlay and adapter digests were not computed at load.");
+        return [];
     }
 }

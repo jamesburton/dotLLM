@@ -1,0 +1,965 @@
+using DotLLM.Core.Attention;
+using DotLLM.Core.Diagnostics;
+using DotLLM.Core.Models;
+using DotLLM.Core.Tensors;
+using DotLLM.Models.Gguf;
+using Xunit;
+
+namespace DotLLM.Tests.Unit.Diagnostics;
+
+/// <summary>One model of one family on one backend, plus what the suite needs around it (#1920).</summary>
+public abstract class HiddenStateTapFixture : IDisposable
+{
+    public abstract IModel Model { get; }
+    public IHiddenStateTapHost Host => (IHiddenStateTapHost)Model;
+    public abstract int NumLayers { get; }
+    public abstract int Hidden { get; }
+    public abstract int Vocab { get; }
+    /// <summary>Tokens that are valid for the model (ordinary ids, below the vocabulary).</summary>
+    public abstract int[] Prompt { get; }
+    /// <summary>True when the model carries recurrent state (hybrid families).</summary>
+    public bool IsRecurrent => Model.RequiresPerSequenceState;
+    /// <summary>True when <c>ForwardBatch</c> normally takes the packed matmul-fused loop that a tap must bypass.</summary>
+    public abstract bool ExpectsPackedBatchFallback { get; }
+    /// <summary>Whether bit-identical logits are expected with and without a tap (CPU: yes; a GPU may only promise tolerance).</summary>
+    public virtual bool BitExact => true;
+    /// <summary>
+    /// Whether <c>RegisterAbortableTap</c> is available for this model (a host whose abort cannot yet restore its recurrent state refuses it).
+    /// The abort tests skip when false.
+    /// </summary>
+    public virtual bool SupportsAbortableTaps => true;
+    /// <summary>
+    /// Managed bytes the calling thread allocates over 16 untapped decode forwards (after warm-up) on the merge base of #1932 (d1275eef),
+    /// measured by the same body (<c>MeasureDecode</c>) on that commit; null when not recorded for this host. The zero-overhead
+    /// test asserts equality, so any allocation added to the unattached path fails it.
+    /// </summary>
+    public virtual long? BaselineAllocBytesPer16Decodes => null;
+    /// <summary>A snapshot of the device-work census (Vulkan: dispatches, copies, barriers, descriptor writes and allocs, submits; CUDA: tap copies enqueued), or null.</summary>
+    public virtual long[]? DeviceCounters() => null;
+    /// <summary>The census delta over 16 untapped decode forwards at the merge base (same order as <see cref="DeviceCounters"/>); null when not recorded.</summary>
+    public virtual long[]? BaselineDeviceCountersPer16Decodes => null;
+    /// <summary>The model's <c>output_norm.weight</c> (F32 in every synthetic fixture), the oracle for the PreLmHead data.</summary>
+    public abstract float[] OutputNormWeight { get; }
+    /// <summary>The model's RMS-norm epsilon.</summary>
+    public abstract float NormEps { get; }
+    /// <summary>One row of the F32 token embedding table (the oracle for PostEmbedding row data).</summary>
+    public abstract float[] EmbeddingRow(int token);
+    /// <summary>Relative tolerance (of the largest reference magnitude) for a device-computed final norm against the host reference; F16 norm outputs widen it.</summary>
+    public virtual float NormRelTol => 2e-5f;
+    /// <summary>Relative tolerance for a device-staged embedding row against the F32 table (F16 residual storage widens it).</summary>
+    public virtual float EmbedRelTol => 1e-6f;
+
+    /// <summary>Reads <paramref name="width"/> floats of row <paramref name="row"/> of an F32 GGUF tensor.</summary>
+    protected static unsafe float[] ReadF32Row(GgufFile gguf, string name, int row, int width)
+    {
+        var d = gguf.TensorsByName[name];
+        if (d.QuantizationType != DotLLM.Core.Configuration.QuantizationType.F32)
+            throw new InvalidOperationException($"{name} is {d.QuantizationType}; the tap oracle needs F32.");
+        float* p = (float*)gguf.TensorDataPointer(name);
+        return new ReadOnlySpan<float>(p + (long)row * width, width).ToArray();
+    }
+
+    public abstract IKvCache NewKv(int maxLen = 96);
+    /// <summary>
+    /// A KV-cache of the type this backend would create for a sliding-window model (compact windows, window 8 on the even layers), or
+    /// <see langword="null"/> when the host has none (the windowed abort tests skip).
+    /// </summary>
+    public virtual IKvCache? NewWindowedKv(int maxLen) => null;
+    /// <summary>
+    /// A second host (owned and disposed by the fixture) over the same weights whose <see cref="ModelConfig"/> uses sliding-window
+    /// attention (window 8, pattern 2), or <see langword="null"/> when the host cannot build one.
+    /// </summary>
+    public virtual IHiddenStateTapHost? NewSlidingWindowConfigHost() => null;
+    /// <summary>Raw KV contents for the first <c>CurrentLength</c> rows, every layer that has KV, for byte comparison.</summary>
+    public abstract float[] KvBytes(IKvCache kv);
+    public abstract void Dispose();
+}
+
+/// <summary>
+/// The #1920 tap assertions, written once for every backend: a derived class supplies <see cref="Open"/>. CPU runs them here;
+/// Vulkan and CUDA derive from it when their hosts land. Families: attention-only Llama, GDN-hybrid dense, GDN-hybrid MoE.
+/// </summary>
+public abstract class HiddenStateTapBackendSuite
+{
+    public const string Llama = "llama", HybridDense = "hybrid-dense", MoeHybrid = "moe-hybrid";
+    public static TheoryData<string> Families => new() { Llama, HybridDense, MoeHybrid };
+
+    protected abstract HiddenStateTapFixture Open(string family);
+
+    /// <summary>The GDN-hybrid dense family with an MTP head (so a forward can carry an MTP state), or null when the host has none.</summary>
+    protected virtual HiddenStateTapFixture? OpenHybridDenseWithMtp() => null;
+
+    private sealed record Run(List<int> Tokens, List<float[]> Logits, IKvCache Kv);
+
+    private static float[] LastRow(ITensor t, int vocab)
+    {
+        var all = new float[vocab];
+        int rows = (int)(t.ElementCount / vocab);
+        unsafe
+        {
+            new ReadOnlySpan<float>((float*)t.DataPointer + (long)(rows - 1) * vocab, vocab).CopyTo(all);
+        }
+        return all;
+    }
+
+    private static int ArgMax(float[] v)
+    {
+        int b = 0;
+        for (int i = 1; i < v.Length; i++) if (v[i] > v[b]) b = i;
+        return b;
+    }
+
+    /// <summary>Prefill then <paramref name="steps"/> greedy steps; keeps every logits row.</summary>
+    private static Run Generate(HiddenStateTapFixture fx, int steps)
+    {
+        var kv = fx.NewKv();
+        var tokens = new List<int>();
+        var logits = new List<float[]>();
+        int[] cur = fx.Prompt;
+        int pos = 0;
+        for (int s = 0; s <= steps; s++)
+        {
+            var positions = new int[cur.Length];
+            for (int i = 0; i < cur.Length; i++) positions[i] = pos + i;
+            using var t = fx.Model.Forward(cur, positions, -1, kv);
+            var row = LastRow(t, fx.Vocab);
+            logits.Add(row);
+            int next = ArgMax(row);
+            tokens.Add(next);
+            pos += cur.Length;
+            cur = [next];
+        }
+        return new Run(tokens, logits, kv);
+    }
+
+    private static int[] DepthLayers(int n)
+    {
+        var set = new SortedSet<int>();
+        foreach (double f in new[] { 0.25, 0.5, 0.75, 1.0 })
+            set.Add(Math.Max(0, (int)Math.Ceiling(n * f) - 1));
+        return [.. set];
+    }
+
+    private static readonly HookPoint[] AllPoints =
+        [HookPoint.PostEmbedding, HookPoint.PostLayer, HookPoint.PreFinalNorm, HookPoint.PreLmHead];
+
+    /// <summary>20 greedy steps with a multi-depth tap are identical to the same run without it: tokens, logits, KV bytes.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void MultiLayerTap_DoesNotPerturb_TokensLogitsOrKv(string family)
+    {
+        using var plain = Open(family);
+        using var tapped = Open(family);
+        var a = Generate(plain, 20);
+
+        var seen = new List<(HookPoint Point, int Layer, int Row, int Pos, int Len)>();
+        int[] layers = DepthLayers(tapped.NumLayers);
+        HiddenStateTapRegistry.PathCounters.Reset();
+        List<int> bTokens; List<float[]> bLogits; float[] bKv;
+        using (tapped.Host.RegisterTap(new HiddenStateTapSubscription(layers, AllPoints),
+            s => seen.Add((s.Point, s.LayerIndex, s.RowIndex, s.TokenPosition, s.Data.Length))))
+        {
+            var b = Generate(tapped, 20);
+            bTokens = b.Tokens; bLogits = b.Logits; bKv = tapped.KvBytes(b.Kv);
+        }
+
+        Assert.Equal(a.Tokens, bTokens);
+        for (int i = 0; i < a.Logits.Count; i++)
+        {
+            if (plain.BitExact) Assert.True(a.Logits[i].AsSpan().SequenceEqual(bLogits[i]), $"logits differ at step {i}");
+            else Assert.All(a.Logits[i].Zip(bLogits[i]), p => Assert.InRange(p.First - p.Second, -1e-2f, 1e-2f));
+        }
+        if (plain.BitExact) Assert.True(plain.KvBytes(a.Kv).AsSpan().SequenceEqual(bKv), "KV bytes differ");
+
+        // 21 forwards (prefill + 20 decode); each delivers PostEmbedding + one PostLayer per subscribed layer + PreFinalNorm + PreLmHead.
+        int perForward = 1 + layers.Length + 1 + 1;
+        Assert.Equal(21 * perForward, seen.Count);
+        Assert.Equal(21, HiddenStateTapRegistry.PathCounters.TapForwards);
+        Assert.All(seen, s => Assert.Equal(tapped.Hidden, s.Len));
+        Assert.Equal(layers, seen.Where(s => s.Point == HookPoint.PostLayer).Select(s => s.Layer).Distinct().OrderBy(x => x).ToArray());
+        Assert.All(seen.Where(s => s.Point != HookPoint.PostLayer), s => Assert.Equal(-1, s.Layer));
+        // Rows default to Last: the prefill's last row is prompt.Length - 1; decode step k is at prompt.Length + k - 1.
+        int P = plain.Prompt.Length;
+        var prefill = seen.Take(perForward).ToList();
+        Assert.All(prefill, s => { Assert.Equal(P - 1, s.Row); Assert.Equal(P - 1, s.Pos); });
+        var decode = seen.Skip(perForward).Chunk(perForward).ToList();
+        for (int k = 0; k < decode.Count; k++)
+            Assert.All(decode[k], s => { Assert.Equal(0, s.Row); Assert.Equal(P + k, s.Pos); });
+        // Delivery order within one forward: embedding, layers ascending, pre-final-norm, pre-lm-head.
+        Assert.Equal(HookPoint.PostEmbedding, prefill[0].Point);
+        Assert.Equal(HookPoint.PreFinalNorm, prefill[^2].Point);
+        Assert.Equal(HookPoint.PreLmHead, prefill[^1].Point);
+    }
+
+    /// <summary>Rows All delivers one sample per row with the right positions; Last delivers only the final one. The final points agree where they must differ or match.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void Rows_LastVsAll_AndFinalPointsRelate(string family)
+    {
+        using var fx = Open(family);
+        int last = fx.NumLayers - 1;
+        var lastRows = new List<(HookPoint P, int Row, int Pos, float[] D)>();
+        var allRows = new List<(HookPoint P, int Row, int Pos, float[] D)>();
+        using var h1 = fx.Host.RegisterTap(new HiddenStateTapSubscription([last], AllPoints),
+            s => lastRows.Add((s.Point, s.RowIndex, s.TokenPosition, s.Data.ToArray())));
+        using var h2 = fx.Host.RegisterTap(new HiddenStateTapSubscription([last], AllPoints, TapRows.All),
+            s => allRows.Add((s.Point, s.RowIndex, s.TokenPosition, s.Data.ToArray())));
+        var prompt = fx.Prompt;
+        int[] positions = Enumerable.Range(0, prompt.Length).ToArray();
+        using var kv = fx.NewKv();
+        using (fx.Model.Forward(prompt, positions, -1, kv)) { }
+
+        int P = prompt.Length;
+        Assert.Equal(AllPoints.Length, lastRows.Count);
+        Assert.All(lastRows, r => { Assert.Equal(P - 1, r.Row); Assert.Equal(P - 1, r.Pos); });
+        foreach (var point in AllPoints)
+        {
+            var rows = allRows.Where(r => r.P == point).ToList();
+            Assert.Equal(P, rows.Count);
+            Assert.Equal(Enumerable.Range(0, P), rows.Select(r => r.Row));
+            Assert.Equal(positions, rows.Select(r => r.Pos));
+            // The Last tap's sample is the All tap's final row, bit for bit.
+            Assert.True(rows[^1].D.AsSpan().SequenceEqual(lastRows.Single(r => r.P == point).D));
+        }
+        var lastBy = lastRows.ToDictionary(r => r.P, r => r.D);
+        // PreFinalNorm is the residual leaving the last layer: the same row as PostLayer(last).
+        Assert.True(lastBy[HookPoint.PostLayer].AsSpan().SequenceEqual(lastBy[HookPoint.PreFinalNorm]));
+        // PreLmHead is post-norm: it must differ from the pre-norm residual, and be finite.
+        Assert.False(lastBy[HookPoint.PreLmHead].AsSpan().SequenceEqual(lastBy[HookPoint.PreFinalNorm]));
+        Assert.All(lastBy[HookPoint.PreLmHead], v => Assert.True(float.IsFinite(v)));
+        // The embedding row differs from the deep residual (a tap that always returned one buffer would not).
+        Assert.False(lastBy[HookPoint.PostEmbedding].AsSpan().SequenceEqual(lastBy[HookPoint.PostLayer]));
+    }
+
+    private static float[] RmsNormRef(float[] x, float[] w, float eps)
+    {
+        double ss = 0;
+        foreach (float v in x) ss += (double)v * v;
+        double scale = 1.0 / Math.Sqrt(ss / x.Length + eps);
+        var o = new float[x.Length];
+        for (int j = 0; j < x.Length; j++) o[j] = (float)(x[j] * scale * w[j]);
+        return o;
+    }
+
+    private static float MaxAbsDiff(float[] a, float[] b)
+    {
+        float m = 0;
+        for (int i = 0; i < a.Length; i++) m = Math.Max(m, MathF.Abs(a[i] - b[i]));
+        return m;
+    }
+
+    /// <summary>
+    /// I-5 / M-1: with TapRows.All on a forward whose head projects only the last row (lastTokenLogitsOnly), PreLmHead still delivers every
+    /// trunk row, and each row's DATA equals the host reference <c>rmsnorm(PreFinalNorm[r]) * output_norm.weight</c> to a bound scaled to the
+    /// hidden size and derived from a same-run control (the F32 float-versus-double reference gap); PostEmbedding row r is the token
+    /// embedding of token r. Every row is checked against its own oracle, so a staging-offset bug that repeats one row cannot pass. The
+    /// control arms (wrong weight, a repeated row, the un-normalised residual) must each exceed the bound, which proves the gate can fail.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void PreLmHeadAndEmbedding_AllRows_MatchHostReferences_ForEveryRow(string family)
+    {
+        using var fx = Open(family);
+        int last = fx.NumLayers - 1;
+        var pre = new List<float[]>(); var preNorm = new List<float[]>(); var emb = new List<float[]>();
+        var preRows = new List<int>();
+        using var h = fx.Host.RegisterTap(new HiddenStateTapSubscription([last], AllPoints, TapRows.All), s =>
+        {
+            if (s.Point == HookPoint.PreFinalNorm) preNorm.Add(s.Data.ToArray());
+            else if (s.Point == HookPoint.PreLmHead) { pre.Add(s.Data.ToArray()); preRows.Add(s.RowIndex); }
+            else if (s.Point == HookPoint.PostEmbedding) emb.Add(s.Data.ToArray());
+        });
+        var prompt = fx.Prompt;
+        int P = prompt.Length;
+        using var kv = fx.NewKv();
+        using (fx.Model.Forward(prompt, Enumerable.Range(0, P).ToArray(), -1, kv, null, null, lastTokenLogitsOnly: true)) { }
+
+        // M-1: one meaning on every backend: every trunk row, even though the head projects one.
+        Assert.Equal(P, pre.Count);
+        Assert.Equal(Enumerable.Range(0, P), preRows);
+        Assert.Equal(P, preNorm.Count);
+        Assert.Equal(P, emb.Count);
+
+        var w = fx.OutputNormWeight;
+        var refs = new List<float[]>();
+        float maxRef = 0, control = 0;
+        for (int r = 0; r < P; r++)
+        {
+            var reference = RmsNormRef(preNorm[r], w, fx.NormEps);
+            refs.Add(reference);
+            maxRef = Math.Max(maxRef, reference.Max(MathF.Abs));
+            // Control: the same reference computed in float arithmetic; its gap to the double reference is the instrument's own noise.
+            float ss = 0;
+            foreach (float v in preNorm[r]) ss += v * v;
+            float sc = 1f / MathF.Sqrt(ss / preNorm[r].Length + fx.NormEps);
+            var f32 = preNorm[r].Select((v, j) => v * sc * w[j]).ToArray();
+            control = Math.Max(control, MaxAbsDiff(f32, reference));
+        }
+        float tol = Math.Max(4 * control, fx.NormRelTol * maxRef);
+        // Sensitivity of the gate: each wrong implementation must sit clearly outside the bound.
+        float wrongWeight = 0, repeated = 0, unnormalised = 0;
+        for (int r = 0; r < P; r++)
+        {
+            wrongWeight = Math.Max(wrongWeight, MaxAbsDiff(RmsNormRef(preNorm[r], w.Select(v => v * 1.01f).ToArray(), fx.NormEps), refs[r]));
+            repeated = Math.Max(repeated, MaxAbsDiff(refs[(r + 1) % P], refs[r]));
+            unnormalised = Math.Max(unnormalised, MaxAbsDiff(preNorm[r], refs[r]));
+        }
+        Assert.True(wrongWeight > 2 * tol, $"the gate cannot see a 1% wrong weight: {wrongWeight} vs tolerance {tol}");
+        Assert.True(repeated > 2 * tol, "the gate cannot see a repeated row (rows are not distinct)");
+        Assert.True(unnormalised > 2 * tol, "the gate cannot see an un-normalised copy");
+
+        for (int r = 0; r < P; r++)
+        {
+            float d = MaxAbsDiff(pre[r], refs[r]);
+            Assert.True(d <= tol, $"PreLmHead row {r}: max |device - host reference| = {d} exceeds {tol} (hidden {fx.Hidden}, control {control})");
+            var e = fx.EmbeddingRow(prompt[r]);
+            float ed = MaxAbsDiff(emb[r], e);
+            float etol = fx.EmbedRelTol * e.Max(MathF.Abs) + 1e-7f;
+            Assert.True(ed <= etol, $"PostEmbedding row {r} is not the embedding of token {prompt[r]}: {ed} > {etol}");
+        }
+        // The embedding rows are pairwise distinct (they are for distinct tokens), so a repeated-row staging bug cannot pass the loop above.
+        for (int r = 1; r < P; r++)
+            if (prompt[r] != prompt[0]) Assert.True(MaxAbsDiff(emb[r], emb[0]) > 0, $"embedding rows 0 and {r} are identical");
+    }
+
+    /// <summary>A tap on layer L never fires for another layer, and a tap on nothing delivers nothing.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void Tap_FiresOnlyOnSubscribedLayers(string family)
+    {
+        using var fx = Open(family);
+        int target = fx.NumLayers / 2;
+        var seen = new List<int>();
+        using var h = fx.Host.RegisterTap(new HiddenStateTapSubscription([target], [HookPoint.PostLayer]), s => seen.Add(s.LayerIndex));
+        using var kv = fx.NewKv();
+        using (fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv)) { }
+        Assert.Equal([target], seen);
+    }
+
+    /// <summary>Two taps on different layers: each sees only its own (a single tap cannot tell a per-entry filter from a union filter).</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void TwoTaps_OnDifferentLayers_EachSeeOnlyTheirOwn(string family)
+    {
+        using var fx = Open(family);
+        var a = new List<int>(); var b = new List<int>();
+        using var ha = fx.Host.RegisterTap(new HiddenStateTapSubscription([0], [HookPoint.PostLayer]), s => a.Add(s.LayerIndex));
+        using var hb = fx.Host.RegisterTap(new HiddenStateTapSubscription([fx.NumLayers - 1], [HookPoint.PostLayer]), s => b.Add(s.LayerIndex));
+        using var kv = fx.NewKv();
+        using (fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv)) { }
+        Assert.Equal([0], a);
+        Assert.Equal([fx.NumLayers - 1], b);
+    }
+
+    private static (long Bytes, long[]? Counters) MeasureDecode(HiddenStateTapFixture fx, int steps)
+    {
+        // Device-work counters: the ORIGINAL deterministic sequence the merge-base counts were recorded with (prompt, 4 warm-up decodes at
+        // growing positions, one window of `steps` decodes). Counts are exact for a given sequence, so no robustness games here.
+        long[]? counters;
+        {
+            using var kv = fx.NewKv();
+            var prompt = fx.Prompt;
+            int pos = prompt.Length;
+            using (fx.Model.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, kv)) { }
+            int[] tok = [prompt[0]];
+            int[] p = new int[1];
+            for (int i = 0; i < 4; i++) { p[0] = pos++; using (fx.Model.Forward(tok, p, -1, kv)) { } }
+            var c0 = fx.DeviceCounters();
+            for (int i = 0; i < steps; i++) { p[0] = pos++; using (fx.Model.Forward(tok, p, -1, kv)) { } }
+            var c1 = fx.DeviceCounters();
+            counters = c0 is null || c1 is null ? null : c1.Zip(c0, (x, y) => x - y).ToArray();
+        }
+
+        // Managed allocation: robust to JIT/tiering order (a full-suite run on another machine once saw a different byte count than an
+        // isolated run). Warm up past the tier-1 promotion threshold (30 calls + the 100 ms tiering timer), pause so the background JIT
+        // installs, warm again, then measure THREE windows and keep the minimum: a real per-forward allocation raises every window, so
+        // the minimum equals the baseline when clean and exceeds it when an allocation is added; transient noise (a late tier-up, a pool
+        // refill) inflates a single window only. Every decode re-uses one position (Rollback after each) so a model with a 64-token maximum
+        // can run the long warm-up.
+        long best = long.MaxValue;
+        {
+            using var kv = fx.NewKv();
+            var prompt = fx.Prompt;
+            int pos0 = prompt.Length;
+            using (fx.Model.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, kv)) { }
+            int[] tok = [prompt[0]];
+            int[] p = new int[1];
+            for (int i = 0; i < 40; i++) { p[0] = pos0; kv.Rollback(pos0); using (fx.Model.Forward(tok, p, -1, kv)) { } }
+            Thread.Sleep(300);
+            for (int i = 0; i < 40; i++) { p[0] = pos0; kv.Rollback(pos0); using (fx.Model.Forward(tok, p, -1, kv)) { } }
+            for (int w = 0; w < 3; w++)
+            {
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                for (int i = 0; i < steps; i++) { p[0] = pos0; kv.Rollback(pos0); using (fx.Model.Forward(tok, p, -1, kv)) { } }
+                long bytes = GC.GetAllocatedBytesForCurrentThread() - before;
+                if (bytes < best) best = bytes;
+            }
+        }
+        return (best, counters);
+    }
+
+    /// <summary>
+    /// I-2: the zero-overhead guarantee against an ABSOLUTE baseline. Comparing a never-used registry with a registered-then-disposed
+    /// one cannot fail (both run the unattached branch, so an allocation or extra device work added to it shows on both sides). Here the
+    /// untapped decode must allocate exactly what the merge base allocated (recorded per fixture), and a GPU host must do exactly the
+    /// merge base's device work (dispatches, copies, barriers, descriptor traffic, queue submits and their fence waits; CUDA: zero tap
+    /// copies enqueued). Mutants: a <c>new object()</c> on the unattached path, an extra copy or submit there.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void Unattached_Decode_MatchesTheMergeBaseAllocationAndDeviceWork(string family)
+    {
+        using var fx = Open(family);
+        Skip.If(fx.BaselineAllocBytesPer16Decodes is null, "no merge-base baseline recorded for this host");
+        LeaveDetachedRegistry(fx);
+        var (bytes, counters) = MeasureDecode(fx, 16);
+        Assert.Equal(fx.BaselineAllocBytesPer16Decodes!.Value, bytes);
+        if (fx.BaselineDeviceCountersPer16Decodes is { } want)
+            Assert.Equal(want, counters);
+    }
+
+    private static void LeaveDetachedRegistry(HiddenStateTapFixture fx)
+    {
+        // Leave a registry that once held a tap: the detached state must cost nothing either.
+        fx.Host.RegisterTap(new HiddenStateTapSubscription(null, AllPoints), _ => { }).Dispose();
+    }
+
+    /// <summary>Disposed taps stop delivering; with no tap attached nothing is dispatched and no tap counter moves.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void Unattached_HasNoDispatch_NoCounters(string family)
+    {
+        using var never = Open(family);            // a registry that was never used
+        using var used = Open(family);             // a registry that had a tap and lost it
+        int calls = 0;
+        used.Host.RegisterTap(new HiddenStateTapSubscription(null, AllPoints), _ => calls++).Dispose();
+
+        HiddenStateTapRegistry.PathCounters.Reset();
+        MeasureDecode(never, 16);
+        MeasureDecode(used, 16);
+        Assert.Equal(0, calls);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.TapForwards);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.PackedBatchFallbacks);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortedForwards);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void DisposedTap_StopsDelivering(string family)
+    {
+        using var fx = Open(family);
+        int n = 0;
+        var h = fx.Host.RegisterTap(new HiddenStateTapSubscription(null, [HookPoint.PostEmbedding]), _ => n++);
+        using var kv = fx.NewKv();
+        using (fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv)) { }
+        Assert.Equal(1, n);
+        h.Dispose();
+        using (fx.Model.Forward([fx.Prompt[0]], [fx.Prompt.Length], -1, kv)) { }
+        Assert.Equal(1, n);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void Registration_Validates(string family)
+    {
+        using var fx = Open(family);
+        Assert.Throws<NotSupportedException>(() =>
+            fx.Host.RegisterTap(new HiddenStateTapSubscription(null, [HookPoint.PreAttention]), _ => { }));
+        Assert.Throws<NotSupportedException>(() =>
+            fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, [HookPoint.PostFfn]), _ => HookResult.Continue));
+        Assert.Throws<ArgumentException>(() =>
+            fx.Host.RegisterTap(new HiddenStateTapSubscription([fx.NumLayers], [HookPoint.PostLayer]), _ => { }));
+        Assert.Throws<ArgumentException>(() =>
+            fx.Host.RegisterTap(new HiddenStateTapSubscription(null, []), _ => { }));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void BufferProvider_ReceivesTheRow(string family)
+    {
+        using var fx = Open(family);
+        var mine = new float[fx.Hidden];
+        float[]? copy = null;
+        using var h = fx.Host.RegisterTap(
+            new HiddenStateTapSubscription(null, [HookPoint.PostEmbedding], TapRows.Last, _ => mine),
+            s => copy = s.Data.ToArray());
+        using var kv = fx.NewKv();
+        using (fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv)) { }
+        Assert.Equal(copy, mine);
+        Assert.Contains(mine, v => v != 0f);
+    }
+
+    // ── Abort ─────────────────────────────────────────────────────────────────
+
+    private sealed class Aborter(HookPoint point, int layer)
+    {
+        public bool Armed;
+        public int Hits;
+        public HookResult OnSample(HiddenStateSample s)
+        {
+            if (Armed && s.Point == point && s.LayerIndex == layer) { Hits++; return HookResult.AbortForward; }
+            return HookResult.Continue;
+        }
+    }
+
+    public static TheoryData<string, string> AbortCases()
+    {
+        var d = new TheoryData<string, string>();
+        foreach (var f in new[] { Llama, HybridDense, MoeHybrid })
+            foreach (var where in new[] { "last-layer", "embedding", "pre-lm-head" })
+                d.Add(f, where);
+        return d;
+    }
+
+    private static (HookPoint, int) AbortSite(string where, int numLayers) => where switch
+    {
+        "last-layer" => (HookPoint.PostLayer, numLayers - 1),
+        "embedding" => (HookPoint.PostEmbedding, -1),
+        _ => (HookPoint.PreLmHead, -1),
+    };
+
+    /// <summary>
+    /// An aborted decode forward returns false without throwing, rolls KV back, restores recurrent state (the abort at the last layer
+    /// happens after every GDN layer advanced it), and the next forward is bit-identical to a model that never ran the aborted one.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(AbortCases))]
+    public void Abort_TryForward_LeavesModelAsIfNeverStarted(string family, string where)
+    {
+        using var aborted = Open(family);
+        Skip.IfNot(aborted.SupportsAbortableTaps, "abortable taps are not available on this host");
+        using var control = Open(family);
+        var (point, layer) = AbortSite(where, aborted.NumLayers);
+        var sut = new Aborter(point, layer);
+        var kvA = aborted.NewKv();
+        var kvC = control.NewKv();
+        var prompt = aborted.Prompt;
+        int[] pp = Enumerable.Range(0, prompt.Length).ToArray();
+        using (aborted.Model.Forward(prompt, pp, -1, kvA)) { }
+        using (control.Model.Forward(prompt, pp, -1, kvC)) { }
+
+        using var h = aborted.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), sut.OnSample);
+        HiddenStateTapRegistry.PathCounters.Reset();
+        sut.Armed = true;
+        int[] tok = [prompt[1]];
+        int[] pos = [prompt.Length];
+        bool ok = aborted.Host.TryForward(tok, pos, -1, kvA, out var logits, out var abort);
+        Assert.False(ok);
+        Assert.Null(logits);
+        Assert.Equal(new ForwardAbortInfo(layer, point), abort);
+        Assert.Equal(1, sut.Hits);
+        Assert.Equal(prompt.Length, kvA.CurrentLength);
+        Assert.Equal(1, HiddenStateTapRegistry.PathCounters.AbortedForwards);
+        Assert.Equal(1, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
+
+        // The legacy entry point throws instead, with the same site.
+        var ex = Assert.Throws<ForwardAbortedException>(() => aborted.Model.Forward(tok, pos, -1, kvA));
+        Assert.Equal(layer, ex.Layer);
+        Assert.Equal(point, ex.Point);
+        Assert.Equal(prompt.Length, kvA.CurrentLength);
+
+        // Disarm and continue: three more steps must equal the control that never aborted anything.
+        sut.Armed = false;
+        for (int step = 0; step < 3; step++)
+        {
+            int[] t = [prompt[(step + 2) % prompt.Length]];
+            int[] p = [prompt.Length + step];
+            using var la = aborted.Model.Forward(t, p, -1, kvA);
+            using var lc = control.Model.Forward(t, p, -1, kvC);
+            Assert.True(LastRow(la, aborted.Vocab).AsSpan().SequenceEqual(LastRow(lc, control.Vocab)), $"logits differ at step {step}");
+        }
+        Assert.Equal(kvC.CurrentLength, kvA.CurrentLength);
+        Assert.True(control.KvBytes(kvC).AsSpan().SequenceEqual(aborted.KvBytes(kvA)), "KV bytes differ after abort");
+        kvA.Dispose(); kvC.Dispose();
+    }
+
+    /// <summary>An abort during a multi-token prefill leaves KV empty and the next full prefill equal to a fresh one.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void Abort_DuringPrefill_RollsBackToEmpty(string family)
+    {
+        using var aborted = Open(family);
+        Skip.IfNot(aborted.SupportsAbortableTaps, "abortable taps are not available on this host");
+        using var control = Open(family);
+        var sut = new Aborter(HookPoint.PostLayer, aborted.NumLayers - 1) { Armed = true };
+        using var h = aborted.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), sut.OnSample);
+        using var kvA = aborted.NewKv();
+        using var kvC = control.NewKv();
+        int[] pp = Enumerable.Range(0, aborted.Prompt.Length).ToArray();
+        Assert.False(aborted.Host.TryForward(aborted.Prompt, pp, -1, kvA, out _, out _));
+        Assert.Equal(0, kvA.CurrentLength);
+        sut.Armed = false;
+        using var la = aborted.Model.Forward(aborted.Prompt, pp, -1, kvA);
+        using var lc = control.Model.Forward(control.Prompt, pp, -1, kvC);
+        Assert.True(LastRow(la, aborted.Vocab).AsSpan().SequenceEqual(LastRow(lc, control.Vocab)));
+        Assert.True(control.KvBytes(kvC).AsSpan().SequenceEqual(aborted.KvBytes(kvA)));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void AbortableTap_ReturningReplace_IsRejected(string family)
+    {
+        using var fx = Open(family);
+        Skip.IfNot(fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+        using var h = fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, [HookPoint.PostEmbedding]),
+            _ => HookResult.Replace(new float[fx.Hidden]));
+        using var kv = fx.NewKv();
+        Assert.Throws<InvalidOperationException>(() => fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv));
+    }
+
+    /// <summary>
+    /// Ruling 3 (#1920): a windowed KV-cache (compact sliding-window layers) refuses an abortable tap at the FIRST abortable forward,
+    /// independent of its length and of whether this forward would compact: NotSupportedException naming the cache, before any KV,
+    /// recurrent or tap state is touched (the next forward equals a control that never saw the refused call).
+    /// </summary>
+    [SkippableFact]
+    public void Abort_WindowedCache_RefusedAtFirstAbortableForward_EvenContiguous_NoStateChange()
+    {
+        using var fx = Open(Llama);
+        Skip.IfNot(fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+        using var kvA = fx.NewWindowedKv(1024);
+        Skip.If(kvA is null, "no sliding-window cache on this host");
+        using var control = Open(Llama);
+        using var kvC = control.NewWindowedKv(1024)!;
+        int[] pp = Enumerable.Range(0, fx.Prompt.Length).ToArray();
+        using (fx.Model.Forward(fx.Prompt, pp, -1, kvA)) { }
+        using (control.Model.Forward(control.Prompt, pp, -1, kvC)) { }
+
+        var sut = new Aborter(HookPoint.PostLayer, fx.NumLayers - 1) { Armed = true };
+        using var h = fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), sut.OnSample);
+        HiddenStateTapRegistry.PathCounters.Reset();
+        // A contiguous decode step: with only 8 rows in a 1024-row cache nothing would compact, yet it is refused (not lazily).
+        var ex = Assert.Throws<NotSupportedException>(() => fx.Host.TryForward([fx.Prompt[1]], [fx.Prompt.Length], -1, kvA, out _, out _));
+        Assert.Contains(kvA!.GetType().Name, ex.Message);
+        Assert.Contains("sliding-window", ex.Message);
+        Assert.Equal(fx.Prompt.Length, kvA.CurrentLength);
+        Assert.Equal(0, sut.Hits);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortedForwards);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
+
+        sut.Armed = false;
+        h.Dispose();   // the refusal is per forward while an abortable tap is attached; detach to continue
+        int[] t = [fx.Prompt[2]];
+        int[] p = [fx.Prompt.Length];
+        using var la = fx.Model.Forward(t, p, -1, kvA);
+        using var lc = control.Model.Forward(t, p, -1, kvC);
+        Assert.True(LastRow(la, fx.Vocab).AsSpan().SequenceEqual(LastRow(lc, control.Vocab)), "logits differ after the refused forward");
+        Assert.Equal(kvC.CurrentLength, kvA.CurrentLength);
+    }
+
+    /// <summary>A read-only tap is fine on a windowed cache (only an abort needs the rollback).</summary>
+    [SkippableFact]
+    public void ReadOnlyTap_OnWindowedCache_Works()
+    {
+        using var fx = Open(Llama);
+        using var kv = fx.NewWindowedKv(1024);
+        Skip.If(kv is null, "no sliding-window cache on this host");
+        int n = 0;
+        using var h = fx.Host.RegisterTap(new HiddenStateTapSubscription(null, [HookPoint.PostEmbedding]), _ => n++);
+        using (fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv)) { }
+        Assert.Equal(1, n);
+    }
+
+    /// <summary>
+    /// Narrowed ruling (2026-11-23): a model whose config has sliding-window attention layers, running on a FULL-HISTORY cache (rows never
+    /// dropped), may use an abortable tap: registration (config and cache overload) succeeds, the abort fires across the window boundary,
+    /// KV is rolled back, and the next steps equal a control sliding-window model that never aborted.
+    /// </summary>
+    [SkippableFact]
+    public void Abort_SlidingWindowLayersOnFullHistoryCache_IsAllowed_AndRestoresState()
+    {
+        using var fx = Open(Llama);
+        var hostA = fx.NewSlidingWindowConfigHost();
+        Skip.If(hostA is null, "no sliding-window config model on this host");
+        var hostC = fx.NewSlidingWindowConfigHost()!;
+        var modelA = (IModel)hostA!; var modelC = (IModel)hostC;
+        using var kvA = fx.NewKv(); using var kvC = fx.NewKv();   // full history: the 8-row window is crossed once the prompt (8) grows
+        Assert.True(kvA.SupportsAbortRollback);
+        int[] pp = Enumerable.Range(0, fx.Prompt.Length).ToArray();
+        using (modelA.Forward(fx.Prompt, pp, -1, kvA)) { }
+        using (modelC.Forward(fx.Prompt, pp, -1, kvC)) { }
+
+        var sut = new Aborter(HookPoint.PostLayer, fx.NumLayers - 1);
+        using var h = hostA!.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), sut.OnSample, kvA);   // not refused
+        sut.Armed = true;
+        Assert.False(hostA.TryForward([fx.Prompt[1]], [fx.Prompt.Length], -1, kvA, out var lg, out var abort));
+        Assert.Null(lg);
+        Assert.Equal(new ForwardAbortInfo(fx.NumLayers - 1, HookPoint.PostLayer), abort);
+        Assert.Equal(1, sut.Hits);
+        Assert.Equal(fx.Prompt.Length, kvA.CurrentLength);
+        sut.Armed = false;
+        for (int step = 0; step < 3; step++)
+        {
+            int[] t = [fx.Prompt[(step + 2) % fx.Prompt.Length]];
+            int[] p = [fx.Prompt.Length + step];
+            using var la = modelA.Forward(t, p, -1, kvA);
+            using var lc = modelC.Forward(t, p, -1, kvC);
+            Assert.True(LastRow(la, fx.Vocab).AsSpan().SequenceEqual(LastRow(lc, fx.Vocab)), $"logits differ at step {step}");
+        }
+        Assert.True(fx.KvBytes(kvC).AsSpan().SequenceEqual(fx.KvBytes(kvA)), "KV bytes differ after abort");
+    }
+
+    /// <summary>
+    /// The cache-aware overload validates the cache kind at registration: a dropping (compact-window) cache is refused immediately,
+    /// naming the cache type and registering nothing; the plain overload still defers to the first abortable forward (covered above).
+    /// </summary>
+    [SkippableFact]
+    public void RegisterAbortableTap_CacheOverload_RefusesDroppingCache_UpFront_RegistersNothing()
+    {
+        using var fx = Open(Llama);
+        using var kv = fx.NewWindowedKv(1024);
+        Skip.If(kv is null, "no sliding-window cache on this host");
+        Assert.False(kv!.SupportsAbortRollback);
+        var ex = Assert.Throws<NotSupportedException>(() =>
+            fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), _ => HookResult.Continue, kv));
+        Assert.Contains(kv.GetType().Name, ex.Message);
+        // Nothing was registered: a forward on the windowed cache with no tap works and checkpoints nothing.
+        HiddenStateTapRegistry.PathCounters.Reset();
+        using (fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv)) { }
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.TapForwards);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
+        // A full-history cache is accepted by the same overload.
+        using var full = fx.NewKv();
+        if (fx.SupportsAbortableTaps)
+            fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), _ => HookResult.Continue, full).Dispose();
+    }
+
+    /// <summary>Read-only taps never checkpoint: only an abortable tap pays for entry state.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void ReadOnlyTap_TakesNoCheckpoint(string family)
+    {
+        using var fx = Open(family);
+        using var h = fx.Host.RegisterTap(new HiddenStateTapSubscription(null, AllPoints), _ => { });
+        using var kv = fx.NewKv();
+        HiddenStateTapRegistry.PathCounters.Reset();
+        using (fx.Model.Forward(fx.Prompt, Enumerable.Range(0, fx.Prompt.Length).ToArray(), -1, kv)) { }
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
+        Assert.Equal(1, HiddenStateTapRegistry.PathCounters.TapForwards);
+    }
+
+    /// <summary>
+    /// I-8: a read-only tap works on a forward that carries an MTP state, on every backend (it only reads; delivered after the capture),
+    /// and does not perturb the logits; an abortable tap with an MTP state is refused everywhere (a checkpoint cannot cover the MTP head).
+    /// </summary>
+    [SkippableFact]
+    public void ReadOnlyTap_WithMtpState_Works_AbortableTap_WithMtpState_IsRefused()
+    {
+        using var fx = OpenHybridDenseWithMtp();
+        Skip.If(fx is null, "no MTP hybrid-dense fixture on this host");
+        using var control = OpenHybridDenseWithMtp()!;
+        var mtp = fx!.Model.CreateMtpState(96);
+        var mtpC = control.Model.CreateMtpState(96);
+        Skip.If(mtp is null || mtpC is null, "the synthetic model carries no MTP head");
+        try
+        {
+            using var kvA = fx.NewKv(); using var kvC = control.NewKv();
+            int[] pp = Enumerable.Range(0, fx.Prompt.Length).ToArray();
+            int seen = 0;
+            using (var h = fx.Host.RegisterTap(new HiddenStateTapSubscription(null, [HookPoint.PostLayer, HookPoint.PreLmHead]), _ => seen++))
+            {
+                using var la = fx.Model.Forward(fx.Prompt, pp, -1, kvA, null, mtp);
+                using var lc = control.Model.Forward(control.Prompt, pp, -1, kvC, null, mtpC);
+                Assert.True(seen > 0, "the read-only tap delivered nothing alongside the MTP state");
+                var ra = LastRow(la, fx.Vocab); var rc = LastRow(lc, control.Vocab);
+                if (fx.BitExact) Assert.True(ra.AsSpan().SequenceEqual(rc), "logits differ with a read-only tap and an MTP state");
+                else Assert.All(ra.Zip(rc), q => Assert.InRange(q.First - q.Second, -1e-2f, 1e-2f));
+            }
+            Skip.IfNot(fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+            using var ha = fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, [HookPoint.PostLayer]), _ => HookResult.Continue);
+            int len = kvA.CurrentLength;
+            Assert.Throws<NotSupportedException>(() => fx.Model.Forward([fx.Prompt[1]], [fx.Prompt.Length], -1, kvA, null, mtp));
+            Assert.Equal(len, kvA.CurrentLength);
+        }
+        finally { (mtp as IDisposable)?.Dispose(); (mtpC as IDisposable)?.Dispose(); }
+    }
+
+    /// <summary>
+    /// I-7: while verify-row snapshots are pending (a read-only verify forward, before RestoreRecurrentStateToRow) an abortable forward is
+    /// refused up front: its entry checkpoint would commit the rejected draft rows. The restore afterwards still works and the next forward
+    /// equals a control that never saw the refused call.
+    /// </summary>
+    [SkippableFact]
+    public void AbortableTap_WhileVerifyRowsPending_IsRefused_AndRestoreToRowStillWorks()
+    {
+        using var fx = Open(HybridDense);
+        Skip.IfNot(fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+        Skip.IfNot(fx.Model.SupportsRecurrentRowSnapshots, "no read-only verify on this host/device");
+        using var control = Open(HybridDense);
+        using var kvA = fx.NewKv(); using var kvC = control.NewKv();
+        int P = fx.Prompt.Length;
+        int[] pp = Enumerable.Range(0, P).ToArray();
+        using (fx.Model.Forward(fx.Prompt, pp, -1, kvA)) { }
+        using (control.Model.Forward(control.Prompt, pp, -1, kvC)) { }
+        int[] draft = [fx.Prompt[1], fx.Prompt[2], fx.Prompt[3]];
+        int[] dpos = [P, P + 1, P + 2];
+        using (fx.Model.ForwardWithRecurrentSnapshots(draft, dpos, -1, kvA, null)) { }
+        using (control.Model.ForwardWithRecurrentSnapshots(draft, dpos, -1, kvC, null)) { }
+
+        using (var h = fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, [HookPoint.PostLayer]), _ => HookResult.Continue))
+        {
+            HiddenStateTapRegistry.PathCounters.Reset();
+            Assert.Throws<NotSupportedException>(() => fx.Model.Forward([fx.Prompt[4]], [P + 3], -1, kvA));
+            Assert.Equal(P + 3, kvA.CurrentLength);
+            Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
+        }
+
+        // Accept only the first draft row on both: rejected rows must not have been committed by the refused call.
+        kvA.Rollback(P + 1); kvC.Rollback(P + 1);
+        fx.Model.RestoreRecurrentStateToRow(0);
+        control.Model.RestoreRecurrentStateToRow(0);
+        using var la = fx.Model.Forward([fx.Prompt[5]], [P + 1], -1, kvA);
+        using var lc = control.Model.Forward([fx.Prompt[5]], [P + 1], -1, kvC);
+        var ra = LastRow(la, fx.Vocab); var rc = LastRow(lc, control.Vocab);
+        if (fx.BitExact) Assert.True(ra.AsSpan().SequenceEqual(rc), "logits differ: the refused abortable forward committed the pending rows");
+        else Assert.All(ra.Zip(rc), q => Assert.InRange(q.First - q.Second, -1e-2f, 1e-2f));
+    }
+
+    // ── ForwardBatch ──────────────────────────────────────────────────────────
+
+    /// <summary>The same two requests as <see cref="RunBatch"/>, each as its own single-request batch (the untapped per-sequence path).</summary>
+    private static IReadOnlyList<ITensor> RunSeqLoop(HiddenStateTapFixture fx, IKvCache k0, IKvCache k1, IModel m)
+    {
+        int n = fx.Prompt.Length;
+        var a = m.ForwardBatch([new SequenceForwardRequest { TokenIds = fx.Prompt, Positions = Enumerable.Range(0, n).ToArray(), KvCache = k0,
+            GdnState = m.CreateSequenceState() as IGdnState }], -1);
+        var b = m.ForwardBatch([new SequenceForwardRequest { TokenIds = fx.Prompt[..(n - 2)], Positions = Enumerable.Range(0, n - 2).ToArray(), KvCache = k1,
+            GdnState = m.CreateSequenceState() as IGdnState }], -1);
+        return [a[0], b[0]];
+    }
+
+    private static IReadOnlyList<ITensor> RunBatch(HiddenStateTapFixture fx, IKvCache k0, IKvCache k1, IModel m)
+    {
+        int n = fx.Prompt.Length;
+        var reqs = new[]
+        {
+            new SequenceForwardRequest { TokenIds = fx.Prompt, Positions = Enumerable.Range(0, n).ToArray(), KvCache = k0,
+                GdnState = m.CreateSequenceState() as IGdnState },
+            new SequenceForwardRequest { TokenIds = fx.Prompt[..(n - 2)], Positions = Enumerable.Range(0, n - 2).ToArray(), KvCache = k1,
+                GdnState = m.CreateSequenceState() as IGdnState },
+        };
+        return m.ForwardBatch(reqs, -1);
+    }
+
+    /// <summary>
+    /// I-6: an abortable tap inside ForwardBatch could abort request i after requests 0..i-1 committed, so it is refused up front on every
+    /// backend (NotSupportedException before any KV, recurrent or tap state changes). Read-only taps are unchanged (the test above).
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void AbortableTap_InForwardBatch_IsRefusedBeforeAnyStateChange(string family)
+    {
+        using var fx = Open(family);
+        Skip.IfNot(fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+        using var k0 = fx.NewKv(); using var k1 = fx.NewKv();
+        using var h = fx.Host.RegisterAbortableTap(new HiddenStateTapSubscription(null, AllPoints), _ => HookResult.Continue);
+        HiddenStateTapRegistry.PathCounters.Reset();
+        var ex = Assert.Throws<NotSupportedException>(() => RunBatch(fx, k0, k1, fx.Model));
+        Assert.Contains("ForwardBatch", ex.Message);
+        Assert.Equal(0, k0.CurrentLength);
+        Assert.Equal(0, k1.CurrentLength);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.TapForwards);
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.AbortCheckpoints);
+    }
+
+    // ── A throwing callback ───────────────────────────────────────────────────
+
+    public static TheoryData<string, bool> ThrowCases()
+    {
+        var d = new TheoryData<string, bool>();
+        foreach (var f in new[] { Llama, HybridDense, MoeHybrid })
+            foreach (bool abortable in new[] { false, true })
+                d.Add(f, abortable);
+        return d;
+    }
+
+    /// <summary>
+    /// I-1: a tap callback that throws at a mid layer (user observer, buffer provider, registry validation) leaves KV and recurrent state
+    /// as they were at forward entry on every backend: KV length restored, and the next steps are identical to a model that never ran the
+    /// failed forward (KV bytes too). Read-only and abortable taps both.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(ThrowCases))]
+    public void ThrowingCallback_MidLayer_RestoresKvAndRecurrentState(string family, bool abortable)
+    {
+        using var fx = Open(family);
+        Skip.If(abortable && !fx.SupportsAbortableTaps, "abortable taps are not available on this host");
+        using var control = Open(family);
+        using var kvA = fx.NewKv();
+        using var kvC = control.NewKv();
+        var prompt = fx.Prompt;
+        int[] pp = Enumerable.Range(0, prompt.Length).ToArray();
+        using (fx.Model.Forward(prompt, pp, -1, kvA)) { }
+        using (control.Model.Forward(prompt, pp, -1, kvC)) { }
+
+        int mid = fx.NumLayers / 2;
+        bool armed = true;
+        void Maybe(HiddenStateSample s)
+        {
+            if (armed && s.Point == HookPoint.PostLayer && s.LayerIndex == mid) throw new InvalidOperationException("boom");
+        }
+        var sub = new HiddenStateTapSubscription(null, [HookPoint.PostLayer]);
+        using var h = abortable
+            ? fx.Host.RegisterAbortableTap(sub, s => { Maybe(s); return HookResult.Continue; })
+            : fx.Host.RegisterTap(sub, Maybe);
+
+        int entry = kvA.CurrentLength;
+        var ex = Assert.Throws<InvalidOperationException>(() => fx.Model.Forward([prompt[1]], [prompt.Length], -1, kvA));
+        Assert.Equal("boom", ex.Message);
+        Assert.Equal(entry, kvA.CurrentLength);
+
+        armed = false;
+        for (int step = 0; step < 3; step++)
+        {
+            int[] t = [prompt[(step + 2) % prompt.Length]];
+            int[] p = [prompt.Length + step];
+            using var la = fx.Model.Forward(t, p, -1, kvA);
+            using var lc = control.Model.Forward(t, p, -1, kvC);
+            var ra = LastRow(la, fx.Vocab); var rc = LastRow(lc, control.Vocab);
+            if (fx.BitExact) Assert.True(ra.AsSpan().SequenceEqual(rc), $"logits differ at step {step} after the throwing callback");
+            else Assert.All(ra.Zip(rc), q => Assert.InRange(q.First - q.Second, -1e-2f, 1e-2f));
+        }
+        Assert.Equal(kvC.CurrentLength, kvA.CurrentLength);
+        if (fx.BitExact) Assert.True(control.KvBytes(kvC).AsSpan().SequenceEqual(fx.KvBytes(kvA)), "KV bytes differ after the throwing callback");
+    }
+
+    /// <summary>With a tap attached a multi-sequence ForwardBatch goes per sequence (counter on the packed model), each sequence reporting its own id.</summary>
+    [SkippableTheory]
+    [MemberData(nameof(Families))]
+    public void ForwardBatch_WithTap_FallsBackPerSequence(string family)
+    {
+        using var plain = Open(family);
+        using var tapped = Open(family);
+
+        using var a0 = plain.NewKv(); using var a1 = plain.NewKv();
+        using var b0 = tapped.NewKv(); using var b1 = tapped.NewKv();
+        HiddenStateTapRegistry.PathCounters.Reset();
+        foreach (var t in RunBatch(plain, a0, a1, plain.Model)) t.Dispose();   // untapped batch: the counter must stay 0
+        Assert.Equal(0, HiddenStateTapRegistry.PathCounters.PackedBatchFallbacks);
+        // I-4: the expected logits come from an untapped PER-SEQUENCE loop on a second plain model (same path as the tapped batch's
+        // per-sequence arm), so the comparison is bit-exact where the host is, with no tolerance and no fused-versus-per-sequence gap.
+        using var control = Open(family);
+        using var c0 = control.NewKv(); using var c1 = control.NewKv();
+        var expect = RunSeqLoop(control, c0, c1, control.Model);
+
+        var ids = new HashSet<int>();
+        using var h = tapped.Host.RegisterTap(new HiddenStateTapSubscription(null, [HookPoint.PostEmbedding]), s => ids.Add(s.SequenceId));
+        var got = RunBatch(tapped, b0, b1, tapped.Model);
+        Assert.Equal(tapped.ExpectsPackedBatchFallback ? 1 : 0, HiddenStateTapRegistry.PathCounters.PackedBatchFallbacks);
+        Assert.Equal([0, 1], ids.OrderBy(x => x));
+        for (int i = 0; i < 2; i++)
+        {
+            var e = LastRow(expect[i], plain.Vocab);
+            var g = LastRow(got[i], tapped.Vocab);
+            if (plain.BitExact) Assert.True(e.AsSpan().SequenceEqual(g), $"seq {i} logits differ from the untapped per-sequence loop");
+            else
+            {
+                Assert.All(e.Zip(g), p => Assert.InRange(p.First - p.Second, -1e-2f, 1e-2f));
+                Assert.Equal(ArgMax(e), ArgMax(g));
+            }
+        }
+        foreach (var t in expect) t.Dispose();
+        foreach (var t in got) t.Dispose();
+    }
+}

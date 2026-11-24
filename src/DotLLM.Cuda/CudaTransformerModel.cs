@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Numerics.Tensors;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Diagnostics;
 using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.Moe;
@@ -20,8 +21,11 @@ namespace DotLLM.Cuda;
 /// CUDA stream with no host synchronization until the final logits D2H transfer.
 /// Mirrors <see cref="TransformerModel"/> structure but uses cuBLAS GEMM/GEMV and custom PTX kernels.
 /// </summary>
-public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
+public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimitable, DotLLM.Core.Diagnostics.IHiddenStateTapHost, ICudaResidualModifierHost
 {
+    /// <summary>Optional PostLayer residual modifier (#1919): called after every layer of the eager forward; a set modifier bypasses the decode graphs. Null costs one branch per layer.</summary>
+    public ICudaResidualModifier? ResidualModifier { get; set; }
+
     private readonly CudaWeights _weights;
     private readonly CudaForwardState _state;
     private readonly CudaStream _stream;
@@ -61,6 +65,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     // (i, i + GlobalHeadDim/2), with the freq base over the full GlobalHeadDim.
     // Computed once in the ctor; mirror of TransformerModel's GetLayerRope.
     private readonly bool _isGemma4;
+    private bool _disposed;
     private readonly float _gemma4GlobalRopeTheta;
     private readonly int _gemma4GlobalRotatedPairs;
     private readonly float _gemma4FinalSoftcap;
@@ -119,6 +124,10 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     // pure square-causal global prefill at the prototype head shape (headDim 64). Otherwise
     // the dispatch falls through to G3, then attention_f16.
     private readonly CudaFlashAttention _flashAttention;
+
+    // #1922: split-KV tensor-core decode attention at depth (eager decode, f16 / q8_0 / q4_0 / TurboQuant in place).
+    private readonly CudaDenseDecodeV2 _denseDecodeV2;
+    internal CudaDenseDecodeV2 DenseDecodeV2 => _denseDecodeV2;
 
     /// <inheritdoc/>
     public ModelConfig Config { get; private set; }
@@ -578,6 +587,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
 
         _g3Attention = new CudaG3Attention(kernels);
         _flashAttention = new CudaFlashAttention(kernels);
+        _denseDecodeV2 = new CudaDenseDecodeV2(kernels, config.NumAttentionHeads, config.NumKvHeads, config.HeadDim);
         _useHighPrecisionForward = ShouldUseHighPrecisionForward(weights);
         // The gemma4 forward runs the F32 path and uses the host LM head (the tied
         // vocab x hidden table is too large to expand to F32 device scratch), so it
@@ -1204,7 +1214,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                            int deviceId, IKvCache? kvCache)
     {
         var r = ForwardInternal(tokenIds, positions, deviceId, kvCache,
-            suppressGraphCapture: false, deferredHostDest: 0)!;
+            suppressGraphCapture: false, deferredHostDest: 0)
+            ?? throw new DotLLM.Core.Diagnostics.ForwardAbortedException(_tapAbort);
         CudaMemTrace.Mark(tokenIds.Length > 1 ? "multi-token forward" : "decode forward");
         AfterMultiTokenForward(tokenIds.Length);
         return r;
@@ -1240,12 +1251,20 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// is responsible for synchronizing once after every sequence in the batch has been
     /// dispatched, then copying each pinned buffer into its own result tensor.
     /// </param>
-    private ITensor? ForwardInternal(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+    private ITensor? ForwardInternalCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, bool suppressGraphCapture, nint deferredHostDest)
     {
+        var ts = _tapTs;   // the plan of a tapped forward (set by ForwardInternal); null: untapped, one local null check per site
+        var tapAt = default(DotLLM.Core.Diagnostics.ForwardAbortInfo);
         bool isMla = _weights.MlaLayers is not null;
         bool isMoe = _weights.MoeLayers is not null;
         bool isBitNet = Config.Architecture == Architecture.BitNet;
+
+        // #1892: the MLA attention block runs on its own _mlaKvCache and never reads `kvCache`, so an in-place TurboQuant cache
+        // handed to an MLA model would be silently ignored (KV kept in F16). Refuse instead (MLA TurboQuant: #1899 / #1900).
+        if (isMla && kvCache is CudaTurboQuantInPlaceKvCache)
+            throw new NotSupportedException(
+                "TurboQuant KV is not supported on CUDA MLA models: the MLA attention keeps its own cache (#1899, #1900). Use q8_0/q4_0 or f16 KV.");
 
         // Gemma-4 (DiffusionGemma AR) — dedicated F32 forward. AR only (no KV cache
         // on CUDA yet; the cacheless path covers single-shot / short-context decode).
@@ -1281,7 +1300,13 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         // (speculative verify), and pure-quantized configs (windowCapacity == 0).
         // MLA / MoE are not graph-capable today (MoE has host-side bucketing; MLA's
         // absorbed kernel uses dynamic shmem) — they fall through to eager.
-        if (UseGraphCapture
+        // A tap needs the layer boundaries, which a graph launch does not have: a tapped forward runs the eager body (#1920).
+        if (ts is not null && TapWouldHaveUsedGraph(tokenIds, positions, kvCache, suppressGraphCapture, deferredHostDest, isMla, isMoe, isBitNet))
+        {
+            HiddenStateTapRegistry.PathCounters.AddCudaGraphBypassed();
+            CudaHiddenStateTaps.LogOnce("cuda-graph", "a hidden-state tap is attached: the CUDA decode graph is bypassed and the layer loop runs eagerly.");
+        }
+        if (ts is null && UseGraphCapture
             && !suppressGraphCapture        // #251: batched calls force the eager body — see doc comment above
             && tokenIds.Length == 1
             && _kernels.HasKvWriteKernel
@@ -1292,6 +1317,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
             // BitNet IS graph-capable (issue #212): CaptureDecodeGraph/CaptureDecodeGraphQuantized
             // now carry the same fp32Res-gated FP32 residual accumulation, Sub-LN, and ReLU² FFN
             // activation as this eager body, ported 1:1 from the branches below.
+            && ResidualModifier is null     // #1919: a graph replay never reaches the per-layer PostLayer call
             && _currentAdapter is null      // the captured body has no ApplyLoraDeltaDevice call, so an active adapter would be silently dropped on every decoded token
             // Issue #213/#218: the graph-friendly attention_f16_dyn kernel is measurably
             // slower than eager's attention_f16 at the same seq_kv (confirmed at the kernel
@@ -1315,19 +1341,28 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         // MoE decode graph (#1210): the eager body below, captured whole. Resident layers route on the device (#1182) and
         // CPU-expert layers run their CPU leg as a host-function node, so nothing in it waits for the host. Position-dependent
         // arguments come from device scalars; NoPE, sinks and sliding windows are the eager body's own.
-        if (!_moeGraphCapturing && !_moeGraphFailed && UseGraphCapture && MoeDecodeGraphEnabled
+        if (ts is null && !_moeGraphCapturing && !_moeGraphFailed && UseGraphCapture && MoeDecodeGraphEnabled
             && !suppressGraphCapture && deferredHostDest == 0 && tokenIds.Length == 1
-            && isMoe && !isMla && !ProfilingEnabled && _currentAdapter is null && DebugCaptureAttnLayer < 0
+            && isMoe && !isMla && !ProfilingEnabled && _currentAdapter is null && ResidualModifier is null && DebugCaptureAttnLayer < 0
             && kvCache is CudaKvCache moeKv && positions[0] == moeKv.CurrentLength
             && _kernels.HasFusedRopeKvWriteKernel && CanCaptureMoeDecode()
             && ForwardMoeDecodeGraph(tokenIds, positions, deviceId, moeKv) is { } graphLogits)
             return graphLogits;
+
+        // #1922 E2: a dense decode step the graphs above did not take (past GraphCaptureMaxDepth, pure-quantized or in-place
+        // TurboQuant KV) runs this eager body captured whole, re-captured every step and pushed with cuGraphExecUpdate.
+        if (ts is null && !_stepGraphCapturing && !_moeGraphCapturing   // #1920: a step graph replay never reaches the per-layer tap sites
+            && StepGraphEligible(tokenIds.Length, suppressGraphCapture, deferredHostDest, isMla, isMoe, kvCache, positions[0])
+            && ForwardStepGraph(tokenIds, positions, deviceId, kvCache!) is { } stepLogits)
+            return stepLogits;
+
         bool capturing = _moeGraphCapturing;
+        bool stepCapturing = _stepGraphCapturing;
 
         // #338: a single-token decode reaching here did NOT use graph replay, whatever
         // UseGraphCapture says. Counted so a test can tell "capture engaged" from "capture
         // was requested and silently declined".
-        if (tokenIds.Length == 1 && !capturing) EagerDecodeCount++;
+        if (tokenIds.Length == 1 && !capturing && !stepCapturing) EagerDecodeCount++;
 
         _context.MakeCurrent();
         int seqLen = tokenIds.Length;
@@ -1359,8 +1394,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
             CudaDriverApi.cuEventRecord(_evtStart, s).ThrowOnError();
         }
 
-        // 1. Upload tokenIds + positions to device (a captured MoE decode has them uploaded before each replay)
-        if (!capturing)
+        // 1. Upload tokenIds + positions to device (a captured MoE / step decode has them uploaded before each replay)
+        if (!capturing && !stepCapturing)
         {
             fixed (int* tokenPtr = tokenIds)
                 CudaDriverApi.cuMemcpyHtoD_v2(_state.TokenIdsDevice, (nint)tokenPtr,
@@ -1385,6 +1420,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                 _state.TokenIdsDevice, _state.HiddenState,
                 seqLen, hiddenSize, s);
         MarkProfile(ProfileCategory.Embed);
+        // Tap: the embedding, F16 and unscaled (a Flint stream is scaled only from layer 0's attention add on).
+        if (ts is not null && !ts.TapSite(HookPoint.PostEmbedding, -1, true, seqLen, _state.HiddenState, h, 1f, s, out tapAt))
+            return TapAborted(tapAt);
 
         // FP32 residual stream for BitNet (its residual magnitude exceeds FP16's ~65504 ceiling).
         bool fp32Res = _state.ResidualF32 != 0 && isBitNet;
@@ -1436,6 +1474,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
             CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.HiddenState, _state.Residual, (nuint)hiddenBytes, s).ThrowOnError();
         }
 
+        var residualModifier = ResidualModifier;
         for (int layer = 0; layer < numLayers; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
@@ -1637,10 +1676,14 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                 int seqKv = cudaKvCache.CurrentLength;
                 MarkProfile(ProfileCategory.KvUpdate);
 
-                _kernels.LaunchAttention(qPtr, cudaKvCache.GetKeysPtr(layer),
-                    cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim,
-                    positions[0], slidingWindow, s, lw.AttnSinksDevice);
+                // #1922: split-KV tensor-core decode at depth; otherwise the scalar attention_f16.
+                if (!_denseDecodeV2.TryRun(qPtr, cudaKvCache.GetKeysPtr(layer), cudaKvCache.GetValuesPtr(layer),
+                        KvCacheDType.F32, KvCacheDType.F32, _state.AttnOutput, seqLen, seqKv, positions[0], slidingWindow,
+                        lw.AttnSinksDevice, window: 0, numHeads, numKvHeads, headDim, s))
+                    _kernels.LaunchAttention(qPtr, cudaKvCache.GetKeysPtr(layer),
+                        cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
+                        seqLen, seqKv, numHeads, numKvHeads, headDim,
+                        positions[0], slidingWindow, s, lw.AttnSinksDevice);
             }
             else
             {
@@ -1663,7 +1706,8 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                 // pure square-causal global-attention prefill on an eligible device;
                 // otherwise the FP32 CUDA-core attention_f16. Same Q/K/V FP16 buffers and
                 // same row-major [seq, heads, headDim] output either way.
-                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset, bool offsetG3 = false)
+                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset, bool offsetG3 = false,
+                    bool f16Flash = true)
                 {
                     // Long-context prefill on GeForce Ampere → G-flash (fused mma.sync, fewer
                     // FLOPs + no score round-trip). Shorter prefill on Ampere → G3 (cuBLAS+
@@ -1679,6 +1723,12 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                             numHeads, numKvHeads, headDim))
                         _flashAttention.Run(qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, numHeads, numKvHeads, headDim, s);
+                    // #1923: the fused mma.sync flash prefill (the kvq kernel's F16 entry) for hd64 / hd128, cold or at an offset (a
+                    // later prefill chunk, a prefix-reuse suffix). No score plane: replaces G3's FP32 scores + F16 probs round trip.
+                    else if (f16Flash && UseF16FlashPrefill(EnableF16FlashPrefill, _kernels.HasAttentionFlashPrefillKvq(headDim, null, null),
+                                 seqLen, seqKv, positionOffset, slidingWindow, layerSinks != 0, numHeads, numKvHeads, headDim))
+                        _kernels.LaunchAttentionFlashPrefillKvq(qPtr, kBuf, vBuf, null, null, _state.AttnOutput,
+                            seqLen, seqKv, numHeads, numKvHeads, headDim, positionOffset, s);
                     // #1848: G3's score scratch is quadratic in the prompt and admitted against free VRAM (TryReserve); a
                     // prefill whose scratch does not fit runs attention_f16 below instead of spilling.
                     else if (layerSinks == 0
@@ -1710,7 +1760,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                         // Test-only oracle (#1850): the pre-#1850 path, dequant into a full-history FP16 scratch + DispatchAttention.
                         var (kCachePtr, vCachePtr) = cudaQKvCache.PrepareReferenceScratch(layer, s, _kernels);
                         MarkProfile(ProfileCategory.KvUpdate);
-                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0], f16Flash: false);   // keeps its pre-#1850 meaning
                     }
                     else
                     {
@@ -1731,6 +1781,16 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                     _kernels.LaunchAttention(qPtr, kCachePtr, vCachePtr, _state.AttnOutput,
                         seqLen, seqKv, numHeads, numKvHeads, headDim,
                         positions[0], slidingWindow, s, layerSinks);
+                }
+                else if (kvCache is CudaTurboQuantInPlaceKvCache tqInPlaceCache)
+                {
+                    // #1892 (CLAUDE.md rule 2): encode the current rows into codes, rotate Q into K code space, attend over the
+                    // cache only (current rows included, never the fresh K/V), rotate the output back with the V signs. The device-
+                    // scalar graphs never take this type; the step graph (#1922) captures this body as is, one capture per step.
+                    MarkProfile(ProfileCategory.KvUpdate);
+                    CudaTurboQuantInPlaceAttention.Run(_kernels, tqInPlaceCache, layer, qPtr, kPtr, vPtr, positions, seqLen,
+                        numHeads, numKvHeads, headDim, slidingWindow, layerSinks, _state.AttnOutput, s, EnableKvqFlashPrefill,
+                        _denseDecodeV2);
                 }
                 else if (kvCache is CudaKvCache cudaKvCache)
                 {
@@ -2023,7 +2083,42 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                     _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
                         seqLen * hiddenSize, s);
             }
+            if (residualModifier is not null && residualModifier.AppliesTo(layer))
+                ApplyResidualModifier(residualModifier, layer, numLayers, fp32Res, isMla, seqLen, hiddenSize, eps, resEps, s);
             MarkProfile(ProfileCategory.Norm);
+
+            // Tap: the residual leaving this layer. Layers before the last hold it in Residual (F16, or ResidualF32 for BitNet); the last
+            // layer's add wrote HiddenState. Flint carries it at resScale: the host multiplies by its reciprocal (a power of two, exact).
+            if (ts is not null)
+            {
+                bool last = layer == numLayers - 1;
+                nint src = fp32Res ? _state.ResidualF32 : (last ? _state.HiddenState : _state.Residual);
+                if (!ts.TapSite(HookPoint.PostLayer, layer, true, seqLen, src, fp32Res ? sizeof(float) : h,
+                        fp32Res ? 1f : 1f / resScale, s, out tapAt))
+                    return TapAborted(tapAt);
+            }
+        }
+
+        // Tap: PreFinalNorm is the residual leaving the last layer (the same rows as PostLayer(last)); the final norm below writes NormOutput,
+        // never the residual.
+        if (ts is not null)
+        {
+            bool resF32 = fp32Res && numLayers > 0;
+            if (!ts.TapSite(HookPoint.PreFinalNorm, -1, true, seqLen, resF32 ? _state.ResidualF32 : _state.HiddenState,
+                    resF32 ? sizeof(float) : h, resF32 || numLayers == 0 ? 1f : 1f / resScale, s, out tapAt))
+                return TapAborted(tapAt);
+            // PreLmHead with every row: a dedicated all-row final norm into NormOutput first (copied before the one-row norm overwrites row 0).
+            if (seqLen > 1 && ts.Wants(HookPoint.PreLmHead, -1) && ts.WantsAll(HookPoint.PreLmHead, -1))
+            {
+                if (resF32)
+                    _kernels.LaunchRmsNormF32InF16W(_state.ResidualF32, _weights.OutputNormWeight, _state.NormOutput,
+                        hiddenSize, eps, seqLen, s);
+                else
+                    _kernels.LaunchRmsNorm(_state.HiddenState, _weights.OutputNormWeight, _state.NormOutput,
+                        hiddenSize, numLayers > 0 ? resEps : eps, seqLen, s);
+                if (!ts.TapSite(HookPoint.PreLmHead, -1, true, seqLen, _state.NormOutput, h, 1f, s, out tapAt))
+                    return TapAborted(tapAt);
+            }
         }
 
         // 5. Final RmsNorm (last token only). For BitNet, read the FP32 residual directly so the
@@ -2041,6 +2136,10 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
                 hiddenSize, numLayers > 0 ? resEps : eps, 1, s);
         }
         MarkProfile(ProfileCategory.Norm);
+        // Tap: PreLmHead, one row (row 0 of NormOutput). An all-row tap already took its rows above.
+        if (ts is not null && !(seqLen > 1 && ts.Wants(HookPoint.PreLmHead, -1) && ts.WantsAll(HookPoint.PreLmHead, -1))
+            && !ts.TapSite(HookPoint.PreLmHead, -1, true, 1, _state.NormOutput, h, 1f, s, out tapAt))
+            return TapAborted(tapAt);
 
         // 6. LM head (last token only) → FP16 logits, then convert to FP32
         Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
@@ -2056,14 +2155,14 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
 
         // Decode CUDA-graph capture for this straight-through body is not used here;
         // dev's ForwardDecodeGraph early-return path handles graph replay separately.
-        if (seqLen == 1)
+        if (seqLen == 1 && !stepCapturing)
             DecodeGraphState = CudaDecodeGraphState.Off;
 
         // Capture dispatch-only time (all launches queued, before GPU wait).
         long dispatchEndTs = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
-        // A captured MoE decode ends at the F32 logits; the replay copies them out.
-        if (capturing)
+        // A captured MoE / step decode ends at the F32 logits; the replay copies them out.
+        if (capturing || stepCapturing)
             return null;
 
         // #251 batched-decode path: enqueue a genuinely async D2H copy into caller-owned
@@ -2130,6 +2229,11 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.LogitsF32,
             (nuint)(vocabSize * sizeof(float))).ThrowOnError();
 
+        if (ts is not null && !ts.Immediate)
+        {
+            try { ts.DeliverDeferred(); }   // the stream synchronize above ended the forward: every staged copy has landed
+            catch { result.Dispose(); throw; }
+        }
         return result;
     }
 
@@ -2222,6 +2326,7 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     {
         ArgumentNullException.ThrowIfNull(requests);
         if (requests.Count == 0) return Array.Empty<ITensor>();
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.RefuseAbortableBatch(_tapState?.Registry.Current);   // abort of request i would leave 0..i-1 committed (#1920 I-6)
         _context.MakeCurrent();
         if (requests.Count == 1)
         {
@@ -2239,6 +2344,11 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
             }
             return fallback;
         }
+
+        // A tap delivers after the stream synchronize that ends each forward, so every request runs its own synchronous forward
+        // instead of the deferred pinned-logits batch (one synchronize for the whole batch); the request index is the sample's sequence id.
+        if (_tapState?.Registry.Current is not null)
+            return ForwardBatchTapped(requests, deviceId);
 
         int vocabSize = Config.VocabSize;
         EnsureBatchPinnedHostBuffers(requests.Count, vocabSize);
@@ -2310,6 +2420,25 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         {
             _currentAdapter = null;
         }
+    }
+
+    /// <summary>
+    /// PostLayer hook of the eager forward (#1919). The layer's closing add is fused with the NEXT layer's attention RMSNorm, so after the
+    /// modifier edits the residual (the last layer's lands in HiddenState, a BitNet model's in ResidualF32) the next layer's normalised input
+    /// is recomputed from the modified residual; without that the perturbation would only reach the skip path.
+    /// </summary>
+    private void ApplyResidualModifier(ICudaResidualModifier modifier, int layer, int numLayers, bool fp32Res, bool isMla,
+        int seqLen, int hiddenSize, float eps, float resEps, nint s)
+    {
+        bool last = layer == numLayers - 1;
+        nint residual = fp32Res ? _state.ResidualF32 : last ? _state.HiddenState : _state.Residual;
+        modifier.Apply(residual, fp32Res ? CudaResidualDType.F32 : CudaResidualDType.F16, layer, seqLen, hiddenSize, s);
+        if (last || isMla) return;   // MLA's next layer norms the raw residual itself
+        ref readonly var nextLw = ref _weights.Layers[layer + 1];
+        if (fp32Res)
+            _kernels.LaunchRmsNormF32InF16W(_state.ResidualF32, nextLw.AttnNormWeight, _state.NormOutput, hiddenSize, eps, seqLen, s);
+        else
+            _kernels.LaunchRmsNorm(_state.Residual, nextLw.AttnNormWeight, _state.NormOutput, hiddenSize, resEps, seqLen, s);
     }
 
     /// <summary>
@@ -4730,6 +4859,46 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
 
     private static int s_kvqScalarPrefillLogged;
 
+    /// <summary>
+    /// Opt-out for the tensor-core flash prefill over F16 K/V (issue #1923): <c>DOTLLM_CUDA_F16_FLASH_PREFILL=0</c> sends the dense F16
+    /// cache's prefills back to G-flash / G3 / <c>attention_f16</c>. Read once; default on. Mutable so a test can pin the old arms.
+    /// </summary>
+    internal static bool EnableF16FlashPrefill =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_F16_FLASH_PREFILL") != "0";
+
+    /// <summary>
+    /// Whether an F16-K/V attention call (the dense <see cref="CudaKvCache"/>, the paged gather, or the uncached forward) takes the
+    /// F16 entry of <c>attention_flash_mma_prefill_kvq</c> (issue #1923): the <see cref="UseKvqFlashPrefill"/> conditions with no
+    /// FP16 window ring. Pure so it is testable without a GPU.
+    /// </summary>
+    internal static bool UseF16FlashPrefill(bool enabled, bool kernelLoaded, int seqLen, int seqKv, int positionOffset,
+        int slidingWindow, bool hasSinks, int numHeads, int numKvHeads, int headDim)
+        => UseKvqFlashPrefill(enabled, kernelLoaded, seqLen, seqKv, positionOffset, slidingWindow, hasSinks, window: 0,
+            numHeads, numKvHeads, headDim);
+
+    /// <summary>
+    /// Whether the F16 flash prefill (<see cref="UseF16FlashPrefill"/>) serves every prefill of at least
+    /// <see cref="KvqFlashPrefillMinRows"/> rows on this model, so G3 only ever sees shorter prefills (its plane is then at most
+    /// numHeads x 15^2 elements and needs no fixed charge in the context fit). Sliding-window and sink layers never reach G3 either.
+    /// </summary>
+    private bool F16FlashPrefillCoversModel
+        => F16FlashPrefillCovers(EnableF16FlashPrefill, Core.Attention.KvGeometry.FromConfig(Config).IsUniform,
+            _kernels.HasAttentionFlashPrefillKvq(Config.HeadDim, null, null),
+            Config.NumAttentionHeads, Config.NumKvHeads, Config.HeadDim);
+
+    /// <summary>Pure form of <see cref="F16FlashPrefillCoversModel"/> (testable without a GPU).</summary>
+    internal static bool F16FlashPrefillCovers(bool enabled, bool uniformGeometry, bool kernelLoaded,
+        int numHeads, int numKvHeads, int headDim)
+        => enabled && uniformGeometry && kernelLoaded
+        && CudaKernels.IsAttentionFlashPrefillKvqShape(numHeads, numKvHeads, headDim);
+
+    /// <summary>
+    /// Whether the dense context fit charges (and keeps) a G3 score plane for <paramref name="kv"/> (#1850, #1923): only when G3 can
+    /// serve the cache (<see cref="G3ServesKvCache"/>) and the F16 flash prefill does not already take every prefill G3 would.
+    /// </summary>
+    internal static bool G3PlaneCharged(KvCacheConfig kv, bool f16FlashCoversModel)
+        => G3ServesKvCache(kv) && !f16FlashCoversModel;
+
     /// <summary>The model's kernel set (tests: which optional kernels loaded on this device).</summary>
     internal CudaKernels Kernels => _kernels;
 
@@ -4766,6 +4935,12 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
             return;
         }
 
+        // #1922: split-KV tensor-core decode at depth over the quantized rows in place (pure quantized only: window == 0).
+        if (_denseDecodeV2.TryRun(qPtr, cache.GetQuantizedKeysPtr(layer), cache.GetQuantizedValuesPtr(layer),
+                cache.KeyDType, cache.ValueDType, _state.AttnOutput, seqLen, seqKv, positionOffset, slidingWindow, sinks, window,
+                numHeads, numKvHeads, headDim, s))
+            return;
+
         if (seqLen >= KvqFlashPrefillMinRows && Interlocked.Exchange(ref s_kvqScalarPrefillLogged, 1) == 0)
             Console.Error.WriteLine(
                 $"[dotLLM.Cuda] {cache.KeyDType}/{cache.ValueDType} KV prefill runs the scalar in-place attention_kvq kernel " +
@@ -4780,6 +4955,55 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     }
 
     /// <summary>
+    /// Whether <see cref="CreateKvCache(int, KvCacheConfig)"/> builds the in-place TurboQuant cache (#1892): TurboQuant on BOTH sides,
+    /// MSE stage only (no <c>tq*q</c>/QJL, step 5), a uniform geometry, and a head dim that is a power of two of at most 256. Every other
+    /// config, including mixed and V-only TurboQuant, keeps the behaviour it had before; none is routed here.
+    /// </summary>
+    internal static bool UsesInPlaceTurboQuant(KvCacheConfig kv, Core.Attention.KvGeometry geometry, int headDim)
+        => kv.KeyDType == KvCacheDType.TurboQuant && kv.ValueDType == KvCacheDType.TurboQuant
+        && !kv.TurboQuantUseQjl && geometry.IsUniform
+        && headDim > 0 && headDim <= 256 && (headDim & (headDim - 1)) == 0;
+
+    /// <summary>
+    /// The in-place TurboQuant kernels this host needs, all loaded: encode, the Q / O rotations and the code-space attention
+    /// (#1892). Pure over the four flags so a test can drive each one.
+    /// </summary>
+    /// <summary>
+    /// Whether this host's forward can run an in-place TurboQuant cache: not MLA (own latent cache), not the F32 Gemma-4 forward, and not
+    /// the F32 dense family (<c>ForwardGemmaF32</c>: Gemma 1/2, Olmo2, SmolLM3, non-fold Granite), which accepts only a <c>CudaKvCache</c> (#1892).
+    /// </summary>
+    internal static bool InPlaceTurboQuantHostServed(bool isMla, bool isGemma4, bool isGemmaFamily)
+        => !isMla && !isGemma4 && !isGemmaFamily;
+
+    internal static bool InPlaceTurboQuantKernelsLoaded(bool encode, bool rotateQ, bool rotateO, bool attention)
+        => encode && rotateQ && rotateO && attention;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// True when the request is both-side MSE TurboQuant on a geometry in-place TurboQuant serves
+    /// (<see cref="TurboQuantInPlaceSupport.Eligible"/>), this host is the dense F16 chain (not MLA, whose attention keeps its own
+    /// cache, nor the F32 Gemma-4 forward) and every kernel of the forward is loaded: a missing or stale PTX is a refusal here, at
+    /// startup, not an exception mid-forward.
+    /// </remarks>
+    public bool SupportsInPlaceTurboQuant(KvCacheConfig kv)
+        => TurboQuantInPlaceSupport.Eligible(kv, Config)
+           && InPlaceTurboQuantHostServed(_weights.MlaLayers is not null, _isGemma4, _isGemmaFamily)
+           && InPlaceTurboQuantKernelsLoaded(_kernels.TurboQuantF16Available, _kernels.TqRotateAvailable, _kernels.TqRotateOF16Available,
+               _kernels.HasAttentionKvTq);
+
+    private string DescribeInPlaceTurboQuantRefusal(KvCacheConfig kv)
+    {
+        if (kv.IsTurboQuantMixed) return $"TurboQuant KV must be used for both K and V (got K={kv.KeyDType}, V={kv.ValueDType}); mixed pairs arrive in #1895.";
+        if (kv.TurboQuantUseQjl) return "TurboQuant with QJL (tq*q) does not run on CUDA yet (#1894).";
+        if (kv.MixedPrecisionWindowSize > 0) return "TurboQuant KV has no original-space window: drop --cache-window.";
+        if (_weights.MlaLayers is not null) return "TurboQuant KV is not supported on CUDA MLA models: the MLA attention keeps its own cache (#1899, #1900).";
+        if (_isGemma4 || _isGemmaFamily) return "TurboQuant KV is not supported on this CUDA model's FP32 dense forward (Gemma family, Olmo2, SmolLM3, non-fold Granite): it accepts only the F16 cache (#1892, #1900).";
+        if (!TurboQuantInPlaceSupport.Eligible(kv, Config))
+            return $"TurboQuant KV needs a uniform KV width and a power-of-two head dim of at most {TurboQuantInPlaceSupport.MaxHeadDim} (#1897, #1898); this model has head dim {Config.HeadDim}.";
+        return "In-place TurboQuant KV needs turboquant.ptx, turboquant_rotate.ptx and attention_kvtq.ptx; one is missing or stale (#1892).";
+    }
+
+    /// <summary>
     /// Creates a KV-cache with optional quantization for this model.
     /// Returns <see cref="CudaQuantizedKvCache"/> when quantization is configured,
     /// otherwise a standard <see cref="CudaKvCache"/>.
@@ -4788,6 +5012,23 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     {
         _context.MakeCurrent();
         var geom = Core.Attention.KvGeometry.FromConfig(Config);
+        if (config.IsTurboQuantAny)
+        {
+            // #1892: a TurboQuant request is served in place or refused, never by the F16 cache below (which a request this host
+            // cannot run - mixed, V-only, QJL, an odd head dim, a missing kernel - used to reach, because IsQuantized excludes it).
+            if (!SupportsInPlaceTurboQuant(config))
+                throw new NotSupportedException(DescribeInPlaceTurboQuantRefusal(config));
+            // #1892: both-side TurboQuant (MSE stage) is stored as codes + norms and never decoded into a history. K and V
+            // rotations use independent seeds (V = seed ^ TurboQuantCodec.VSeedMask), as the scratch oracle and the CPU cache do.
+            var codecK = new Engine.KvCache.Codecs.TurboQuantCodec(Config.HeadDim, config.TurboQuantBits, config.TurboQuantSeed);
+            var codecV = new Engine.KvCache.Codecs.TurboQuantCodec(Config.HeadDim, config.TurboQuantBits, config.TurboQuantSeed ^ Engine.KvCache.Codecs.TurboQuantCodec.VSeedMask);
+            var tqCache = AdmitReleasingG3<CudaTurboQuantInPlaceKvCache>(() => new CudaTurboQuantInPlaceKvCache(
+                Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen, codecK.MseBits,
+                codecK.Centroids, codecK.RotationSigns, codecV.RotationSigns, codecK.InvSqrtD,
+                window: config.MixedPrecisionWindowSize, context: _context));
+            _spillMonitor.Check($"KV cache (in-place tq{config.TurboQuantBits}) allocated for {maxSeqLen} tokens");
+            return tqCache;
+        }
         Core.Attention.IKvCache cache = AdmitReleasingG3<Core.Attention.IKvCache>(() => config.IsQuantized
             ? new CudaQuantizedKvCache(geom, maxSeqLen, config, _context, inPlaceAttentionLoaded: _kernels.HasAttentionKvq)
             : new CudaKvCache(geom, maxSeqLen, _context));
@@ -4910,9 +5151,19 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <param name="kv">KV storage types.</param>
     /// <param name="activationBytesPerToken">Forward scratch bytes per token (<see cref="CudaForwardState.ActivationBytesPerToken"/>).</param>
     /// <param name="chunkedPrefill">Whether prefill is chunked (<c>--prefill-chunk-size</c>).</param>
+    /// <param name="headDim">The head dimension; required for TurboQuant, whose cost is its codes plus norms (#1892).</param>
     /// <returns>Bytes per token.</returns>
-    internal static long DenseContextBytesPerToken(KvGeometry geometry, KvCacheConfig kv, long activationBytesPerToken, bool chunkedPrefill)
+    internal static long DenseContextBytesPerToken(KvGeometry geometry, KvCacheConfig kv, long activationBytesPerToken, bool chunkedPrefill,
+        int headDim = 0)
     {
+        if (kv.IsTurboQuantAny)
+        {
+            // #1892: the in-place cache holds codes + norms, so that is what a token costs - not the F16 figure this used to charge.
+            if (headDim <= 0 || !geometry.IsUniform)
+                throw new ArgumentException("TurboQuant sizing needs the head dim and a uniform geometry.", nameof(headDim));
+            var layout = new TurboQuantLayout(headDim, geometry.UniformStride / headDim, kv.TurboQuantBits, TurboQuantLayout.DefaultNorm);
+            return layout.KvBytesPerPosition(geometry.LayerCount) + (chunkedPrefill ? 0 : activationBytesPerToken);
+        }
         bool blockQuant = kv.IsQuantized
             && kv.KeyDType is KvCacheDType.Q8_0 or KvCacheDType.Q4_0 or KvCacheDType.F32
             && kv.ValueDType is KvCacheDType.Q8_0 or KvCacheDType.Q4_0 or KvCacheDType.F32;
@@ -4934,7 +5185,9 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
         // #1850: a q8_0 / q4_0 cache reads in place (attention_kvq / the tensor-core kvq prefill), so G3's plane is never used
         // over it: free a plane warm-up left behind and charge none, instead of losing up to RetainedMaxElems x 6 B (384 MiB) of
         // window to it.
-        bool g3Serves = G3ServesKvCache(kv);
+        // #1923: likewise when the F16 flash prefill serves every prefill of 16+ rows (G3 then only sees shorter ones, whose plane
+        // is a few tens of KiB and admitted per prefill by TryReserve).
+        bool g3Serves = G3PlaneCharged(kv, F16FlashPrefillCoversModel);
         if (!g3Serves && _g3Attention.PlaneElems > 0)
         {
             _stream.Synchronize();   // the plane may still be read by queued work
@@ -4952,18 +5205,18 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
             CudaAdmission.QueryFreeBytes(), CudaAdmission.ReserveBytes, _state.PendingLazyScratchBytes, _state.SequenceBytes, chunkScratch,
             g3PlaneHeldBytes: _g3Attention.PlaneElems * CudaG3Attention.ScratchBytesPerElement,
             g3PlaneMaxBytes: G3PlaneChargeBytes(g3Serves && _g3Attention.MayRun, prefillChunkTokens, Config.NumAttentionHeads),
-            perTokenBytes: DenseContextBytesPerToken(KvGeometry.FromConfig(Config), kv, _state.ActivationBytesPerToken, chunked),
+            perTokenBytes: DenseContextBytesPerToken(KvGeometry.FromConfig(Config), kv, _state.ActivationBytesPerToken, chunked, Config.HeadDim),
             NativeMaxSequenceLength);
     }
 
     /// <summary>
     /// Whether attention over the dense cache <see cref="CreateKvCache(int, Core.Configuration.KvCacheConfig)"/> builds for <paramref name="kv"/> can take G3 (#1850):
-    /// q8_0 / q4_0 (<see cref="CudaQuantizedKvCache"/>) read in place and never do; everything else gets the f16
-    /// <see cref="CudaKvCache"/>, which does (TurboQuant included: <see cref="KvCacheConfig.IsQuantized"/> is false for it).
+    /// q8_0 / q4_0 (<see cref="CudaQuantizedKvCache"/>) read in place and never do; f16 / f32 get the f16 <see cref="CudaKvCache"/>,
+    /// which does. TurboQuant (either side) never does: its KV is codes, read in place (#1888, #1887), so it is never served by the f16 cache.
     /// </summary>
     /// <param name="kv">KV storage types.</param>
     /// <returns>Whether G3 may run over that cache.</returns>
-    internal static bool G3ServesKvCache(KvCacheConfig kv) => !kv.IsQuantized;
+    internal static bool G3ServesKvCache(KvCacheConfig kv) => !kv.IsQuantized && !kv.IsTurboQuantAny;
 
     /// <summary>
     /// G3 score-plane bytes the dense context fit charges as fixed (#1848 / #1862): 0 when G3 cannot run; otherwise the plane kept
@@ -5058,9 +5311,14 @@ public sealed unsafe class CudaTransformerModel : IModel, IContextLimitable
     /// <inheritdoc/>
     public void Dispose()
     {
+        if (_disposed) return;   // idempotent: a refusal path and a finally may both dispose (#1892)
+        _disposed = true;
         _context.MakeCurrent();
+        _tapState?.Dispose();   // after MakeCurrent: cuMemFreeHost needs the context
         CudaMemTrace.Dump("CudaTransformerModel.Dispose");
         ReportLaunchProfile();
+        DisposeStepGraph();          // the exec first: it was captured against the scratch below
+        _denseDecodeV2.Dispose();
         _cudaLora?.Dispose();
         DisposeDecodeGraph();
         DisposeMoeGraph();

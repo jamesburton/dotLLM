@@ -22,7 +22,7 @@ Terms:
 - **Accuracy bar:** KL(ref ‖ test) over the full vocabulary, gated on the **median** (or trimmed mean) plus the outlier
   rate (rows with KL > 1e-3 / 1e-2) and top-1 agreement. Mean KL is reported but not gated: massive-activation rows
   dominate it.
-- Evidence is cited as **E1–E14** (§5). `[lit]` marks a literature-only claim; `not measured (#n)` names the issue that
+- Evidence is cited as **E1–E21** (§5). `[lit]` marks a literature-only claim; `not measured (#n)` names the issue that
   will measure it.
 
 ---
@@ -179,7 +179,12 @@ keeps the output exact, so tune by acceptance × cost, not KL (#1095 measured no
 **RoPE.** Compute the angle in F32 (F64 for YaRN); GPUs compute sin/cos in-kernel (no table). CPU F32 tables are
 duplicated (64 MiB × 2 at 128k on Llama-8B); F16 tables from F32 angles are not measured (#1142).
 
-**Split partials.** *m*/*ℓ* stay F32 (a few KB); O partials and split-K slabs to F16 are not measured (#1144).
+**Split partials.** *m*/*ℓ* stay F32 (a few KB); split-K slabs to F16 are not measured (#1144). Split-KV O partials are F16
+on all three backends: CPU (E18), CUDA (below) and Vulkan's v2 grouped decode pass (E21).
+CUDA dense decode (#1922) stores its split-KV O partials **normalised** (o/ℓ, bounded by max|v|) in **F16** with *m*, *ℓ*
+F32 (James's ruling, 2026-11-20; the unnormalised form overflows F16 on a long split, guarded by a flat-score |V|≈20 32K test).
+Kernel level (RTX 3060, F64 oracle over F16 inputs): max |err| F16 partials vs F32 partials 2.9e-4 vs 2.9e-4 at short seqKv,
+1.3e-5 vs 1.1e-5 at 32K; no time difference. Teacher-forced on Qwen3-4B Q4_K_M, 800 decode steps at depth 6,000 (`CudaDenseDecodeQualityGateTests`, framework 2026-11-21), PPL change vs the scalar kernel for F16 / F32 partials: f16 KV -0.057% / -0.044%, q8_0 -0.061% / +0.114%, q4_0 +0.230% / -0.465%, tq4 -0.172% / -0.871%; mean KL vs scalar 6.5e-4 / 6.6e-4 (f16), 9.0e-4 / 9.0e-4 (q8_0), 2.71e-2 / 2.73e-2 (q4_0), 1.99e-2 / 2.16e-2 (tq4). F16 partials are indistinguishable from F32; the q4_0 / tq4 spread is quantized-KV drift digitisation, equal in both arms. Decision (James 2026-11-21, bench 2026-11-22): F16 normalised partials ship, default on together with the step decode graph; the F32-partial control entries were removed, and the scratch is F16 (Qwen3-4B / RTX 3060: about 25 KiB). Kill switches `DOTLLM_CUDA_DENSE_DECODE_V2=0` (kernel) and `DOTLLM_CUDA_STEP_GRAPH=0` (graph).
 
 ---
 
@@ -554,6 +559,202 @@ Guards: `QuantizerConventionSensitivityTests` (CPU, corpus sensitivity to each w
 `CudaQuantizerTieTests` (CUDA, Half corpus), `ActivationQuantizerTieTests` (Vulkan Q8_1, #1340). `i2_s_gemv.cu`'s per-tensor
 `quantize_f16_to_i8_absmax` is a different (per-token, W2A8) contract with its own oracle and is deliberately unchanged.
 
+### E17 - TurboQuant norms: per-head-vector norm storage format (#1892 task 1)
+
+Question: the in-place TurboQuant kernels read codes in place (rule 2), so the per-head-vector L2 norm is stored too. Which format below FP32 (rule 1)?
+Candidates: F16, BF16 (2 bytes), OCP FP8 E4M3 / E5M2, Log8 (1 byte; `TurboQuantNormCodec`, round-to-nearest-even, saturating, counted).
+Per-vector cost at hd 128: 16 code words x 4 B (4-bit) + norm; F32 norm = +4 B, 2-byte = +2 B, 1-byte = +1 B.
+
+Method (`tools/tq-norm-eval`, CPU, scratch-path `TurboQuantKvCache` with the norm round-tripped through the codec, n independent real wikitext-2 LF windows per
+cell (n is printed in each cell: 1 to 31, fewer where a 4B or 8K run was costly), KL on the last 128 positions, whose attention reads the whole ctx-long quantised history). The reference is the fp32 `SimpleKvCache`
+(there is no F16 `SimpleKvCache`; reference arms are the standing exception). **Cost = (KL(ref || tq, format norms) - KL(ref || tq, F32 norms)) / KL(ref || tq, F32 norms)**,
+paired per row; table cells are the mean over n independent windows and its standard error. Decision rule (set in the #1892 task plan, before the data; see Decision below for how it was applied): smallest format whose cost is < 10 % at every bit width on both models. Read cells with n=1 with care: their s.e. is about 10 % on the 4B model (and 2-4 % on the 0.5B), which is the size of the line being tested, so a single window cannot place a format on either side of it.
+
+**Noise floor.** Both models quantise activations to int8 (q8_0 / Q4_K weights), which digitises any tiny perturbation (see E16). Direct KL between two
+runs that differ only by a ~2^-12 relative norm jitter is 12-130 % of the tq-vs-ref KL, and the arm is deterministic (re-running the F32 arm gives 0.0). A
+harness-only **Null control** (F32 norms times 1 + u * 2^-12, u in [-1,1): never larger than F16's worst error 2^-11) measures that floor. A format whose
+cost is not separable from Null is at the instrument floor.
+
+
+Qwen2.5-0.5B-Instruct q8_0, ctx 2048: extra KL vs unquantised KV from the norm format, as % of the tq-vs-reference KL (mean +- s.e. over n windows)
+
+| bits | tq-vs-ref KL | F16 | Bf16 | Fp8E4M3 | Fp8E5M2 | Log8 | Null |
+|---|---|---|---|---|---|---|---|
+| 2 | 5.46 | -1% +-1 (n=8) | -1% +-3 (n=8) | +0% +-2 (n=1) | +1% +-2 (n=1) | +0% +-2 (n=1) | +1% +-2 (n=8) |
+| 3 | 3.19 | +1% +-2 (n=8) | +1% +-3 (n=8) | -0% +-3 (n=1) | -0% +-4 (n=1) | +10% +-3 (n=1) | -1% +-2 (n=8) |
+| 4 | 2.76 | +0% +-1 (n=8) | +5% +-3 (n=8) | +13% +-2 (n=1) | -6% +-4 (n=1) | +15% +-3 (n=1) | +1% +-1 (n=8) |
+| 8 | 0.0278 | +1% +-1 (n=31) | +15% +-13 (n=31) | +100% +-14 (n=1) | +943% +-116 (n=1) | +536% +-69 (n=1) | +3% +-2 (n=31) |
+
+Qwen2.5-0.5B-Instruct q8_0, ctx 8192: extra KL vs unquantised KV from the norm format, as % of the tq-vs-reference KL (mean +- s.e. over n windows)
+
+| bits | tq-vs-ref KL | F16 | Bf16 | Fp8E4M3 | Fp8E5M2 | Log8 | Null |
+|---|---|---|---|---|---|---|---|
+| 2 | 6.13 | -1% +-2 (n=1) | +4% +-2 (n=1) | +4% +-3 (n=1) | -1% +-2 (n=1) | +8% +-2 (n=1) | +5% +-2 (n=1) |
+| 3 | 4.92 | -3% +-3 (n=1) | -6% +-3 (n=1) | -2% +-3 (n=1) | -13% +-3 (n=1) | -2% +-3 (n=1) | +2% +-2 (n=1) |
+| 4 | 4.88 | -1% +-2 (n=1) | +2% +-2 (n=1) | -2% +-2 (n=1) | -5% +-2 (n=1) | -4% +-2 (n=1) | +1% +-1 (n=1) |
+| 8 | 0.0147 | +16% +-8 (n=1) | +14% +-15 (n=1) | +202% +-53 (n=1) | +1784% +-369 (n=1) | +633% +-111 (n=1) | +12% +-9 (n=1) |
+
+Qwen3-4B-Instruct-2507 Q4_K_M, ctx 2048: extra KL vs unquantised KV from the norm format, as % of the tq-vs-reference KL (mean +- s.e. over n windows)
+
+| bits | tq-vs-ref KL | F16 | Bf16 | Fp8E4M3 | Fp8E5M2 | Log8 | Null |
+|---|---|---|---|---|---|---|---|
+| 2 | 2 | -0% +-4 (n=1) | -6% +-3 (n=1) | -14% +-4 (n=1) | +3% +-4 (n=1) | -1% +-3 (n=1) | - |
+| 3 | 0.257 | +2% +-9 (n=1) | +8% +-9 (n=1) | +48% +-14 (n=1) | +78% +-18 (n=1) | +25% +-11 (n=1) | - |
+| 4 | 0.0837 | +4% +-10 (n=4) | +1% +-7 (n=4) | +5% +-15 (n=1) | +47% +-13 (n=1) | -2% +-9 (n=1) | -15% +-8 (n=4) |
+| 8 | 0.00356 | +9% +-9 (n=8) | +2% +-5 (n=8) | +627% +-104 (n=1) | +2042% +-216 (n=1) | +334% +-39 (n=1) | +11% +-4 (n=8) |
+
+Qwen3-4B-Instruct-2507 Q4_K_M, ctx 8192: extra KL vs unquantised KV from the norm format, as % of the tq-vs-reference KL (mean +- s.e. over n windows)
+
+| bits | tq-vs-ref KL | F16 | Bf16 | Fp8E4M3 | Fp8E5M2 | Log8 | Null |
+|---|---|---|---|---|---|---|---|
+| 4 | 0.077 | -1% +-10 (n=1) | - | - | - | - | -7% +-10 (n=1) |
+| 8 | 0.00382 | +15% +-10 (n=1) | - | - | - | - | +20% +-24 (n=1) |
+
+Greedy identity (256 tokens, 256-token prompt, vs the F32-norm arm, first divergence index): Qwen2.5-0.5B bits 8: F16 13, BF16 55, E4M3 55, E5M2 7, Log8 2, **Null 55**;
+Qwen3-4B bits 8: F16 37, BF16 11, **Null 15**; bits 4: F16 11, BF16 7. Every arm diverges early, the Null control included, so greedy identity cannot rank norm formats here.
+
+Findings.
+- **1-byte formats fail unambiguously.** At 8 bits the cost is E4M3 100-630 %, E5M2 940-2040 %, Log8 330-630 % on both models and both contexts, far above the floor;
+  they also fail at 3-4 bits on one model or the other (0.5B 4-bit: E4M3 +13 %, Log8 +15 %; 4B 3-bit: E4M3 +48 %, Log8 +25 %). The failing term is mantissa precision (E4M3 2^-4, E5M2 2^-3, Log8 a 3.7 % step), so a per-head scale or learned range would not fix it.
+- **F16 and BF16** both pass (< 10 %) at 2, 3 and 4 bits on both models. At 8 bits the cost reads 1 % +-1 (0.5B, 31 windows) and +9 % +-9 (4B, 8 windows) for F16, but the Null control
+  itself reads +3 % +-2 and +11 % +-4, and at 8K it reads +12 % / +20 %: **the 10 % line is below the instrument floor at 8 bits**, so neither can be certified by this KL, and F16 is not separable from Null.
+  BF16 reads +15 % +-13 (0.5B) / +2 % +-5 (4B); its 8x larger error (2^-8 vs 2^-11) is the reason to prefer F16 on first principles.
+- Saturation/underflow counters were 0 in every arm (norms sit well inside F16's [6.1e-5, 65504]).
+- Hazards: F16 saturates above 65504 and loses precision below 6.1e-5 (BF16 has neither); the codec clamps and counts, never emits Inf/NaN.
+
+Decision: **F16, chosen by controller ruling** (`TurboQuantLayout.DefaultNorm`). The rule gates only a fall back to FP32. The 1-byte formats are rejected on data.
+The 10% line at 8 bits cannot be resolved with this instrument (null control +3% to +20%), and F16 is not separable from that control; it has 8x less error than BF16.
+Follow-up: re-check F16 vs BF16 with a deterministic attention-output metric (per-layer relative error on captured K/V) instead of chaotic KL.
+
+### E18 - CPU split-KV decode partials, F16 vs F32 (#1927 E2c; James 2026-11-21: F16 partials, F32 max/sum, F32 control)
+
+Qwen3-4B Q4_K_M (32/8 heads, hd128), F32 `SimpleKvCache`, prefill 7,600 tokens once, then 768 teacher-forced decode steps per
+arm on the same cache (rolled back between arms), wikitext-2 LF corpus. Reference = the per-head tiled online-softmax decode
+(`DOTLLM_CPU_ATTN_SPLITKV=0`). Partials: 256-key ranges; per (range, head) the normalised output (F16 or F32) plus max and sum
+(F32 scalars, 8 B). `tools/tq-gate --mode splitkv`.
+
+| arm | KL mean | KL p99 | KL max | PPL (ref 9.4136) | top-1 | decode tok/s, 3 interleaved rounds |
+|---|---|---|---|---|---|---|
+| ref (tiled) | - | - | - | 9.4136 | - | 8.48 [8.48-8.49] |
+| split-KV, F16 partials | 2.58e-3 | 1.60e-2 | 4.75e-2 | 9.3614 (-0.55%) | 97.0% | 16.89 [16.72-17.09] |
+| split-KV, F32 partials | 2.58e-3 | 1.55e-2 | 7.98e-2 | 9.4442 (+0.33%) | 96.9% | 17.05 [16.84-17.10] |
+
+Kernel level (unit test, same shapes): |d| vs the tiled reference 1.6-2.2e-7 (F32 partials) and 2.7-8.0e-5 (F16 partials).
+
+The table above is **free-running teacher-forced**: each arm decodes on its own history, so the KL compounds and the two PPL
+deltas (opposite signs) only show that 768 steps cannot resolve +-0.5%. The **paired per-step** form (`--mode splitkv-paired`)
+runs every arm for step i on the reference history (rollback, reference last), and adds a **negative control**: a temporary,
+uncommitted build that rounds the partials to BF16 (7-bit mantissa, 16x the F16 rounding) before the F16 store.
+
+| arm (paired, 768 steps) | per-step KL mean | median | p99 | max | paired dNLL +- SE | PPL delta | top-1 |
+|---|---|---|---|---|---|---|---|
+| F32 partials (control) | 2.003e-3 | 1.046e-3 | 1.293e-2 | 2.53e-2 | -0.00109 +- 0.00304 | -0.11% | 97.9% |
+| F16 partials (shipped) | 2.036e-3 | 1.070e-3 | 1.299e-2 | 3.03e-2 | -0.00007 +- 0.00298 | -0.01% | 98.1% |
+| BF16 partials (negative control) | 2.135e-3 | 1.068e-3 | 1.426e-2 | 6.69e-2 | +0.00003 +- 0.00282 | +0.00% | 96.9% |
+
+Reading: the per-step KL orders BF16 > F16 > F32 as it must, but the instrument is **nearly saturated**: a 2e-7 change of
+reduction order (F32 arm) already costs 2.0e-3 per step (Q8_K activation rounding digitises it, see the "quantization digitises
+ULP drift" note), so the F16 rounding adds +1.6% to the mean KL and BF16 +6.6% (max 2.6x, top-1 -1.2 points). dNLL resolves
++-0.3% (1 SE) and sees none of them. Decision: **F16 partials, default on** (no measurable cost above the reorder floor; the
+kernel-level error is the sensitive instrument: 8e-5 absolute). The reorder floor itself (decode rows no longer equal prefill or
+verify rows past 2,048 keys, #530) is the accepted consequence of E2c: **James 2026-11-22**: past 2,048 keys CPU decode rows
+are not bit-identical to prefill / verify rows, so speculative / MTP greedy output can differ from plain greedy on CPU
+(`docs/SPECULATIVE.md`; `DOTLLM_CPU_ATTN_SPLITKV=0` restores exact identity).
+
+### E19 - CPU Q4_K row-lane GEMM accumulation order (#1927 E3d, default on, `DOTLLM_CPU_Q4K_ROWLANE=0` off)
+
+The row-lane kernel forms each (row, super-block) integer sum exactly and converts it to float once; the R4 kernel converts eight
+K-direction int32 lanes and sums them in float at the end. Same F32 accumulation across super-blocks, int32 integer stage.
+
+| measure | R4 (reference) | row-lane |
+|---|---|---|
+| max rel err vs float64, m 64 k 512 / m 40 k 2560 (unit test) | 2.0e-5 / 2.8e-5 | 1.5e-6 / 2.3e-5 |
+| Qwen3-4B Q4_K_M, 7,600-token chunk-512 prefill, last 768 rows: PPL | 7.4926 | 7.4971 (+0.06%) |
+| KL mean / median / p99 vs R4 | - | 3.11e-3 / 1.47e-3 / 2.08e-2 |
+| top-1 agreement | - | 99.1% |
+| 7,600-token whole-prompt prefill, tok/s (valid reps, interleaved) | 64.1 [58.7-67.1] (4) | 71.7 [69.4-81.2] (3), 1.12x |
+
+Reading: the row-lane form is closer to exact at kernel level; the model-level KL is the activation-quantization digitisation
+floor seen in E18 (any change of reduction order costs about 2-3e-3 here).
+
+**Batch invariance (James 2026-11-22: "if numerically exact we could consider the branch").** Every Q4_K kernel now follows the
+row-lane arithmetic ("RLA": exact int32 super-block sum, `acc = fma(d4*d8, (float)S, acc)`, `sm += (dmin*d8)*(float)mc`, result
+`acc - sm`): the 4-row decode dispatcher, the single-row tails, the 4-token R4 kernel, the row-major tiled GEMM and the row-lane
+GEMM (`MatMulQ4KRla.cs`, scalar oracle `Q4KRlaDot1Scalar`). A row's bits therefore never depend on the batch size or on what else
+shares the GEMM: n = 1 decode, ForwardBatch of 20 sequences, short chunks and long prefills agree bit for bit
+(`Q4KRowLaneTests.Row_IsBitIdentical_AcrossPathsBatchSizesAndPositions`,
+`TransformerModelForwardBatchTests.ForwardBatch_Q4KM_TwentyConcurrentDecodes_AreBitIdenticalToEachDecodedAlone`), so no
+single-sequence gate is needed. The 16-token threshold is a speed choice only. Hosts without AVX2 + SSE4.1 + FMA keep the R4
+arithmetic everywhere (also batch-invariant). `DOTLLM_CPU_Q4K_ROWLANE=0` restores the R4 arithmetic everywhere; R4 and RLA outputs
+differ from each other (by the KL above).
+
+**Decision (James 2026-11-23): ship batch-invariant, ungated.** pp512 1.22x, end-to-end decode 0.994x (unchanged within noise),
+the n = 1 GEMV microbench 13-19% slower; output never depends on server load. Numbers:
+
+Cost at n = 1 (2026-11-22, Strix, cpu-bench + gpu + cpu held, interleaved):
+
+| measure | R4 arithmetic (`=0`) | RLA (default) |
+|---|---|---|
+| Q4_K GEMV kernel, 14 threads, us/call, 4096x2560 / 12800x4096 / 9728x2560 (9 rounds) | 39.6 / 190.3 / 110.0 | 47.1 / 226.5 / 126.2 (1.13-1.19x slower) |
+| Qwen3-4B Q4_K_M decode tok/s, `bench -p 512 -n 128`, 5 interleaved reps each | 29.51 [29.20-29.64] | 29.32 [29.00-29.70] (0.994x: no change) |
+| same runs, pp512 tok/s | 188.7 [185.3-191.6] | 230.4 [227.8-242.7] (1.22x) |
+
+The per-super-block horizontal int sum costs the GEMV kernel 13-19%, invisible end to end (decode is bound elsewhere). A blocked
+eight-super-block reduction was tried and was no faster.
+
+### E20 - CUDA TurboQuant prefill rounding points (#1924; numbered E18 on dev, renumbered at the #1927 merge)
+
+The bit-specialised and staged tensor-core TQ prefill entries (`_tq{bits}`, `_tq{bits}_cpa`) keep the norm out of the tile. The rounding
+points therefore move against the legacy `_tqtq` entry, whose K / V operand is `half(n * c)`:
+- **K side:** the operand is `half(c)` and the norm is applied in F32 after the mma (`S = n_k * (q~ . c)`). This is one rounding fewer
+  than legacy.
+- **V side:** the V operand is `half(c)`, and the norm is folded into the P operand as `half(p * n_v)`.
+- **Softmax sum:** the sum keeps the raw F32 p.
+
+With F16 norms `half(p * n_v)` cannot overflow (p <= 1, n_v <= 65,504). BF16 norms above 65,504, reachable only through the direct
+cache API, could overflow it.
+
+Model-level evidence is `CudaTurboQuantPrefillDepthGate`. The new entries' mean KL to F16 KV must stay within legacy plus a measured
+1-ulp drift band; see KV_CACHE.md "TurboQuant" for the numbers.
+
+### E21 - Vulkan split-KV decode O partials, F16 vs F32 (#1926 E4; James 2026-11-21, bench-confirmed 2026-11-24)
+
+What ships: the v2 grouped split-KV decode pass (`attention_f32_splitkv_gqa_v2.glsl`, `PART_F16 = 1`) stores each split's O partial
+**normalised** by that split's running sum (o/ℓ, so |o| ≤ max|v|) as packed halves, two per word; `attention_f32_splitkv_merge.comp`
+(`PART_F16 = 1`) multiplies ℓ back in. The running max *m* and sum *ℓ* stay **F32** (`partMS`, 8 B per (head, split)). Default on;
+`DOTLLM_VULKAN_SPLITKV_PART=f32` is the control (un-normalised F32 partials, bit-identical to the pre-#1926 path). The per-query-head
+and v1 grouped passes (head dim > 128, wave32 hosts, `DOTLLM_VULKAN_SPLITKV_GQA2=0`) still store F32 partials.
+
+Kernel level (`SplitKvPartialF16Tests`, tolerance stated up front: 1e-3 of the output amplitude, the 2^-11 F16 step on a convex
+combination): f16 / q8_0 / q4_0 / tq3 / tq4 KV, sinks, sliding window, 14/2/64 to 96/8/128, seqKv 700-8,192: measured 1.5e-4 to
+6.8e-4; a |v| ≈ 3e4 equal-weight split does not overflow (the un-normalised form would). Speed: neutral (microbench 32K q4_0 0.238
+vs 0.236 ms, f16 0.601 vs 0.598; model 7.6K 0.995-1.013, 32K 0.98-1.05).
+
+Model level (`tools/tq-gate --mode decodedump` / `klcmp`: prefill, then 1,000 teacher-forced single-token decode steps through the
+split-KV path, full log-softmax rows; Qwen3-4B Q4_K_M, wikitext-2 LF; a = F32 partials, b = F16 partials; ref = f16 KV, F32 partials):
+
+| depth | KV | KL(a‖b) mean / max | PPL a → b | top-1 | KL(ref‖a) / KL(ref‖b) |
+|---|---|---|---|---|---|
+| 7.6K | f16 | 2.4e-7 / 8.8e-6 | 7.2185 → 7.2173 (-0.016%) | 1000/1000 | 0 / 2.4e-7 |
+| 32K | f16 | 3.9e-7 / 2.1e-5 | 12.3702 → 12.3685 (-0.014%) | 1000/1000 | 0 / 3.9e-7 |
+| 7.6K | q4_0 | 1.9e-2 / 1.27 | 7.2803 → 7.2487 (-0.435%) | 940/1000 | 0.0740 / 0.0700 |
+| 32K | q4_0 | 2.4e-2 / 0.43 | 13.1013 → 12.8607 (-1.836%) | 928/1000 | 0.1064 / 0.1057 |
+
+Reading: the f16-KV rows are the clean measure of the format (KL ≤ 4e-7, PPL ≤ 0.016%). On q4_0 KV the decode-time Q4_0 writer
+digitises any ULP-level attention change: the GROUP 4 vs 8 control (1-2 ULP, no format change) and the 256- vs 80-workgroup grid
+control produce the same band (KL 1.3-2.4e-2, PPL ±0.1-0.7% with both signs), and the F16 arm's distance to the f16-KV reference
+is never larger than the control's. Same conclusion as CUDA (#1922) and CPU (E18).
+
+Why not below F16: the live partials are about 80 KB per layer (32 heads x 10 splits x 128 x 2 B at the default grid) and F16 is
+already speed-neutral, so an 8-bit O partial (with a per-row scale) could buy no measurable time and would add the 8-bit rounding
+to every split. *m* / *ℓ* stay F32 (an F16 running max near 20 moves exp() weights by ~1%; `SplitKvPartialF16Tests` kills that
+mutant). Saturation: the store clamps to ±65,504; it is reachable only on the F32-KV module with |v| > 65,504 (F16 and quantized
+KV cannot exceed it), and `clamp(NaN)` is implementation-defined there.
+
+Residual F32 cost (inventory V5): the partial scratch is still **allocated** at the F32 bound shared with the per-query-head / v1
+passes, `numHeads x 256 x 256 x 4 B` = 8.4 MB at 32 query heads, one buffer for all layers; the v2 F16 pass uses about 0.66 MB of
+it. A separately sized F16 buffer when v2 is the only consumer is the follow-up.
+
 ## 6. Decision table: CLAUDE.md rule → evidence
 
 | CLAUDE.md rule (Precision & Expansion) | evidence | verdict |
@@ -565,7 +766,7 @@ Guards: `QuantizerConventionSensitivityTests` (CPU, corpus sensitivity to each w
 | 1. … recurrent-state updates, split-reduction combines | not measured | open → #1144 |
 | 1. Compute-bound GEMM: F16 accumulation where faster and KL-parity passes; promote every 64–256 for long K | RTX 3060: plain F16-acc 1.11–1.20× faster but fails on Bonsai (median 1.16e-4, 0.6% top-1 flips, grows 3.7× with K); **promote every 256: 6.3e-6** (E2). **Strix: F16-acc is not faster (1.00–1.01×)** and fails (1.6e-3, 65.8% of rows > 1e-3; Q4_0 max 0.106) (E11, E12). Arc: no F16 path is faster (0.60–0.68×) | **3060: yes, with promotion** (fused, #1132). **Strix, Arc: no** — F32 accumulation |
 | 1. Integer dot products accumulate int32 | CPU W8A8/W4A8 KL 1–2e-4 at per-32 scales (E4); CUDA W2A8 5.1e-5, better than F16-acc (E2); Vulkan MMVQ 1–3e-4 vs F32-in, 1.3–1.7× (Arc), 1.6× (Strix Q4_0); Arc MMQ prefill 34× (E12) | confirmed; per-32 activation scales preferred over per-256; Strix Q8_0 prefill is the F32-acc coopmat (#1150, E12b) |
-| 1. Stored F32 partials (split-K, split-KV) need sign-off | not measured | open → #1144 |
+| 1. Stored F32 partials (split-K, split-KV) need sign-off | F16 normalised split-KV O partials indistinguishable from F32 at model level: CPU (E18), CUDA (§4, #1922), Vulkan (E21) | **CPU: F16** (#1927); **CUDA: F16** (#1922); **Vulkan v2: F16** (#1926); *m*/*ℓ* F32 everywhere; split-K slabs open → #1144 |
 | (not a rule; a kernel extra) Q hi/lo split in Vulkan GQA prefill | dropping it: KL ≤ 1.5e-7 median, 1.67× attention, 1.46× a 128k tile (E9) | turn off by default → #1148 (user sign-off) |
 | 1. Model-declared FP32 state is evidence, not exemption | engines unanimous `[lit]`; no dotLLM measurement | open → #1144 |
 | 2. Kernels read quantized blocks directly | int8 tiers beat dequant tiers on every CPU (E1); W2A8 MMQ more accurate than dequant + F16 GEMM (E2); LM head packed: 2,425 → 170 MiB, PPL +0.03% (#1099); kvq prefill without the F16 scratch (#1094) | confirmed; remaining expansions in §7 |
@@ -591,11 +792,14 @@ PRs #1103, #1122, #1125, #1126.
 | C7 | CPU | MTP KV and hidden F32 | 32 MiB @4096 positions | **KV fixed** (#1141): F16 default (16 MiB), q8_0 (8.5), q4_0 (4.5) when the trunk cache is quantized; hidden stays F32 (#1144); `DOTLLM_CPU_MTP_KV=f32` reference arm | #1141 |
 | C8 | CPU | MLA KV, TurboQuant norms, MoE scatter F32 | per token | open | #1140 |
 | C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence (speculative verify: read-only scan + in-place replay of row inputs, no state copy at all, #1194) | sign-off pending | #1144 |
+| C10 | CPU | chunk store entries (`--chunk-store-write`, `chunkcache build --offline`): F32 K and V rows per layer on disk, encoded through `SimpleKvCache` into managed `float[]` per layer (`ChunkEncoder`) | L8B 256 KiB/token on disk and in the encode (one 512-token chunk: 128 MiB); Qwen3-4B 288 KiB/token | **signed-off temporary exception** (James, 2026-11-20, #1912): the format predates the writer and the chunk key carries the dtype, so a new format is a new cache line, not a migration; target F16 then q8_0 in native memory | #1913 |
+| C11 | CPU | blocked prefill attention: dense F32 K/V tile pack per worker | 256 KiB per worker at hd128, context-independent | **signed off** (James 2026-11-21, bounded F32 tile pack; follows cache dtype under #1107) | #1927 |
+| C12 | CPU | split-KV decode partials (output F16, max/sum F32 scalars), per forward thread; plus the per-worker F32 working set (scores `[H][256]`, accumulators `[H][hd]`) in the shared tile holder | partials `ceil(visible/256) x H x (2 hd + 8)` B, grown geometrically: 248 KiB at 7.6K, about 1.1 MiB at 32K, about 4.3 MiB at 128K (32 heads, hd128), about 8.6 MB at 64 heads and 128K. Working set `2 x max(H x 256, H x hd) x 4` B per worker (64 KiB at H = 32, 512 KiB at H = 256), per-tile and context-independent (design-note option (b), not the context-sized E2b matrix). Freed by `CpuKernelScratch.Trim` (model dispose, pool teardown) or at thread exit | **signed off** (James 2026-11-21: F16 partials, F32 running max/sum); evidence E18. F16 saturates at 65,504: assumes V activations below that | #1927 |
 | X1 | CPU | safetensors BF16 → F32 | L8B +16 GB; L1B +2.5 GB | open | #1143 (needs #1118) |
 | X2 | CPU | MLA-MoE routed experts → F32 | ≈57 GB on V2-Lite | open | #1140 |
 | X3 | CPU | MLA projections, shared / Granite-MoE experts → F32 | `Σ out·in·4` | open | #1140 |
 | X4 | CPU | R4 repack: second same-width copy | L8B Q4_K_M +4.9 GB | **fixed**: R4 is a zero-copy view; same kernels on the mmap rows, bit-identical, same speed | #1156 (from #1143) |
-| X5 | CPU | TurboQuant full-history F32 scratch | L8B @128k 1 GiB | open | #1139 |
+| X5 | CPU | TurboQuant full-history F32 scratch | L8B @128k 1 GiB | **fixed for the MSE stage** (#1892: `TurboQuantInPlaceKvCache` reads codes + F16 norms in place); the QJL form (`tq*q`) stays on the scratch cache until #1894 | #1139, #1892 |
 | X6 | CPU | dequant-rows prefill (Q4_0/Q4_1/Q5_1/IQ4_NL, BF16, F16, MXFP4, PQ2_0) | bounded `k·4` per worker | open (missing kernels) | #1119, #1118, #489 |
 | X7 | CPU | quantized-KV tile dequant per head, allocated per call | `tile·hd·8` per head call | open | #970, #1120 |
 | G1 | CUDA | F32 activation set for every model | L1B ≈587 MB @4096 | open | #1134 |
@@ -603,7 +807,7 @@ PRs #1103, #1122, #1125, #1126.
 | G3 | CUDA | hybrid forward state F32 (activations, GDN, logits `rows·V·4`) | logits 970 MiB @1024 rows; +486 MiB per 512-row window | open | #1138 (activations), #1137 (logits) |
 | G4 | CUDA | hybrid F32 K/V staging (tiers without flash/kvq) | B2 8 KiB/token | open | #1136 (siblings: #968) |
 | G5 | CUDA | MTP head KV F32, doubled on growth | B2 16,392 B/token | **fixed on dev** (#1095, PR #1126): 1,156 B/token at q4_0 | #979 (duplicate) |
-| G6 | CUDA | G3 attention F32 score matrix | 32 heads @4096 ≈3.2 GB | open | #1134 |
+| G6 | CUDA | G3 attention F32 score matrix | 32 heads @4096 ≈3.2 GB | **gone for dense f16-KV prefills on hd64 / hd128 (group <= 8, 16+ rows)**: they run the fused `attention_flash_mma_prefill_kvq` F16 entry, F32 statistics in registers, no plane (#1923). Open for other shapes (G3 square / offset) | #1134, #1923 |
 | G7 | CUDA | Nemotron-H KV F32; MLA latent / default MLA KV F32 | per token | open | #968 (Nemotron-H), #1140 (MLA) |
 | G8 | CUDA | Gemma F32 KV round-trip + activation scratch | `2·kvLen·kvStride·4` | open | #1134 |
 | G9 | CUDA | split-KV partials F32 | ≈0.8 MB | sign-off pending | #1144 |
@@ -611,7 +815,7 @@ PRs #1103, #1122, #1125, #1126.
 | GX1 | CUDA | prefill dequant → F16 scratch → cuBLAS | L1B 33.5 MB, 70B 470 MB + 2 B/weight traffic | hybrid PQ2_0 **fixed** (#1222: int8-mma W2A8 MMQ default on sm_80+); dense 2..8-row projections (verify / draft / short prefill) over Q2_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ4_NL **fixed** (#1316/#1375: rows4 `_c2..c8` dp4a GEMVs read the blocks in place; `DOTLLM_CUDA_KQUANT_SMALL_S_MAX=0` restores the scratch); dense `seqLen > 8` open | #1132 (hybrid PQ2_0), #1135 (dense) |
 | GX2 | CUDA | LM head > 8 rows → whole-head F16 | B2 2.54 GB | **fixed on dev** (#1099, PR #1125): 2,425 → 170 MiB | — |
 | GX2b | CUDA | multi-row LM head for non-PQ2_0 heads: tiled F16 dequant | ≤ max(layer scratch, 64 MiB) per tile | open (bounded, admitted) | #1136 |
-| GX3 | CUDA | quantized-KV full-history F16 scratch | stride 1024 @32k: 128 MB | hybrid **fixed on dev** (#1094, PR #1103); dense `CudaQuantizedKvCache` fixed (#1850, read in place); TurboQuant open | #1139 |
+| GX3 | CUDA | quantized-KV full-history F16 scratch | stride 1024 @32k: 128 MB | hybrid **fixed on dev** (#1094, PR #1103); dense `CudaQuantizedKvCache` fixed (#1850, read in place); TurboQuant dense fixed (#1892: `CudaTurboQuantInPlaceKvCache`, codes + F16 norms read in place); `tq*q` refused on CUDA (#1894) | #1139, #1892 |
 | GX4 | CUDA | hybrid KV F16 dequant scratch, remaining tiers | B2 4 KiB/token | open | #1136 |
 | GX5 | CUDA | load-time F16 copies (no GEMV kernel), embedding, dense LM head | Qwen3-8B embedding 1.16 GiB | open (gated) | #1135 |
 | GX6 | CUDA | Gemma `ProjectF32` quant → F16 → F32 | `4·maxProj` | open | #1135 |
@@ -620,11 +824,12 @@ PRs #1103, #1122, #1125, #1126.
 | V2 | Vulkan | hybrid KV F32 default | B2 128 KiB/token | **fixed on dev for B2** (#1102, PR #1122: F16 default, 64 KiB/token); q8_0 open | #1112 |
 | V3 | Vulkan | inter-kernel activations F32 | `4·seqLen·(3H+2q+2kv+3I)` | open | #1138, #677 |
 | V4 | Vulkan | MTP KV and hidden F32 | B2 8 → 4 KiB/token at F16, KL 3.4e-8 (E10b) | **KV fixed** (#1141): F16 via the trunk's convert kernel + `_kvf16` attention twins; Bonsai-2 greedy text identical, 159/192 drafts accepted both arms; q8_0 head follows once Vulkan has a quantized trunk cache; `DOTLLM_VULKAN_MTP_KV=f32` reference arm | #1141 |
-| V5 | Vulkan | split-KV partials, split-K slabs F32 | 5.24 MB per split-K | sign-off pending | #1144 |
+| V5 | Vulkan | split-KV partials, split-K slabs F32 | 5.24 MB per split-K | split-K slabs: sign-off pending. Split-KV O partials **F16 in the v2 decode pass** (#1926, E21; James 2026-11-21, bench-confirmed 2026-11-24); *m*/*ℓ* F32 (8 KB live, 64 KB allocated) | #1144, #1926 |
+| V5b | Vulkan | split-KV partial scratch still allocated at the F32 bound (shared with the per-query-head / v1 passes, which store F32) | `numHeads x 256 x 256 x 4` B = 8.4 MB at 32 heads, one buffer for all layers; v2 F16 uses ~0.66 MB of it | open: size an F16 buffer when v2 is the only consumer | #1926 |
 | V6 | Vulkan | logits `rows·V·4`; recurrent state; MLA KV; Q8_1 `(d,s)` and KV scales F32 | various | open | #1137, #1144, #1140, #1146 |
 | VX1 | Vulkan | token embedding → F32 for every type but Q8_0 | Qwen3.8-27B 4.85 GiB vs 682 MiB (Q4_K); Bolt 2 GiB vs 544 MiB (Q8_0) | **fixed for Nemotron-H and qwen35 dense** (#1174: Q8_0 / Q4_K / Q6_K / PQ2_0 gathered packed); dense `VulkanWeights` K-quants and `VulkanQwen3MoeHybrid` open | #919 |
 | VX2 | Vulkan | matrices outside `DeviceQuantTypeFor` → F32 | `m·k·4` | open | #921, #627 |
-| VX3 | Vulkan | quantized-KV / TurboQuant F32 full-history scratch | `2·maxSeq·stride·4` | open | #1139 (hybrid: #1112) |
+| VX3 | Vulkan | quantized-KV / TurboQuant F32 full-history scratch | `2·maxSeq·stride·4` | TurboQuant on the dense chain and Flint **fixed** (#1892, read in place); quantized-KV and hybrids open | #1139 (hybrid: #1112), #1892 |
 | VX4 | Vulkan | IQ1/2/3 (+ fallback NVFP4) prefill F16 scratch | L3B 50.3 MB + 4 B/weight traffic | **fixed for the dense and Nemotron-H hosts** (#1677: IQ1_S / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S decode inside the 128x128 coopmat tile, scratch never allocated; IQ2_XXS #1069, NVFP4 #1064); hybrid hosts open (#1149) | #1146 (#1064, #1069, #1677) |
 | VX5 | Vulkan | shared-expert / expert-bank F32 fallbacks; legacy MLA F32 | up to ≈265 GB if they fall through | open | #1140 |
 | F374 | Vulkan | 16-bit storage / `shaderFloat16` / `shaderInt8` never enabled | — | **fixed on dev** (972d5c53, PR #1122) | #374 |
@@ -658,7 +863,7 @@ New issues filed by this study: #1134–#1146 (inventory), #1148–#1151 (Vulkan
 |---|---|---|
 | F16/BF16 stored activations (all backends); residual-stream max |x| per model | rule 1 for the largest per-token store after KV | #1138 |
 | Recurrent state at 16 bits over ≥ 8k-token decodes; 16-bit snapshots | the one store that feeds back into itself (dense `qwen35` verify rows no longer store states at all, #1194: a 16-bit snapshot would break greedy identity, row inputs + replay do not) | #1144 |
-| Split-KV O partials / split-K slabs in F16 | small bytes, needs sign-off either way | #1144 |
+| Split-K slabs in F16 (split-KV O partials: measured, E18 / E21) | small bytes, needs sign-off either way | #1144 |
 | F16 RoPE tables at ≥ 32k | CPU table bytes | #1142 |
 | Vulkan F16 accumulation promoted every 256 K | the AMD Windows driver crashes compiling it; moot on Strix (F16-acc no faster) | — |
 | Vulkan hybrid KV in q8_0 / K8V4 / q4_0 | Strix/Arc long-context KV choice | #1112 |

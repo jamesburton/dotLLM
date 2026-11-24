@@ -850,6 +850,67 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    private static readonly string CachedSmolLmQ4KmPath =
+        TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q4_K_M.gguf"], null).Path ?? string.Empty;
+
+    /// <summary>
+    /// #1927 (James 2026-11-22): a sequence's output must not depend on server load. 20 concurrent one-token decodes through
+    /// <see cref="TransformerModel.ForwardBatch"/> pack 20 rows into each Q4_K GEMM, which takes the row-lane kernel (n >= 16); each
+    /// sequence decoded alone runs the n = 1 decode kernels. Both must give the same bits, because every Q4_K kernel follows the
+    /// row-lane arithmetic. The engagement assert proves the batched arm really ran the row-lane kernel.
+    /// </summary>
+    [SkippableFact]
+    public void ForwardBatch_Q4KM_TwentyConcurrentDecodes_AreBitIdenticalToEachDecodedAlone()
+    {
+        Skip.IfNot(File.Exists(CachedSmolLmQ4KmPath), $"SmolLM-135M Q4_K_M GGUF not cached at {CachedSmolLmQ4KmPath}");
+        Skip.IfNot(DotLLM.Cpu.Kernels.MatMul.Q4KRlaActive, "row-lane arithmetic off (DOTLLM_CPU_Q4K_ROWLANE=0 or no AVX2/FMA)");
+        using var gguf = GgufFile.Open(CachedSmolLmQ4KmPath);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = TransformerModel.LoadFromGguf(gguf, config);
+        const int seqs = 20;
+        var rng = new Random(1927);
+        int[][] prompts = Enumerable.Range(0, seqs).Select(_ => new[] { rng.Next(100, 4000), rng.Next(100, 4000), rng.Next(100, 4000) }).ToArray();
+        int[] next = Enumerable.Range(0, seqs).Select(_ => rng.Next(100, 4000)).ToArray();
+
+        var kvAlone = new SimpleKvCache[seqs];
+        var kvBatch = new SimpleKvCache[seqs];
+        try
+        {
+            for (int i = 0; i < seqs; i++)
+            {
+                kvAlone[i] = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, 64);
+                kvBatch[i] = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, 64);
+                using (model.Forward(prompts[i], [0, 1, 2], deviceId: -1, kvAlone[i])) { }
+                using (model.Forward(prompts[i], [0, 1, 2], deviceId: -1, kvBatch[i])) { }
+            }
+
+            var alone = new float[seqs][];
+            for (int i = 0; i < seqs; i++)
+            {
+                using ITensor l = model.Forward([next[i]], [3], deviceId: -1, kvAlone[i]);
+                alone[i] = CopyLogits(l);
+            }
+
+            var requests = Enumerable.Range(0, seqs)
+                .Select(i => new SequenceForwardRequest { TokenIds = new[] { next[i] }, Positions = new[] { 3 }, KvCache = kvBatch[i] }).ToArray();
+            long before = DotLLM.Cpu.Kernels.MatMul.t_q4kRowLaneCalls;
+            var results = model.ForwardBatch(requests, deviceId: -1);
+            long rowLaneGemms = DotLLM.Cpu.Kernels.MatMul.t_q4kRowLaneCalls - before;
+            try
+            {
+                Assert.True(rowLaneGemms > 0, "the batched decode never reached the row-lane kernel: the test cannot see a kernel switch");
+                for (int i = 0; i < seqs; i++)
+                    AssertBitEqual(alone[i], CopyLogits(results[i]), $"sequence {i} of {seqs} (row-lane GEMMs in the batch: {rowLaneGemms})");
+            }
+            finally { foreach (var t in results) t.Dispose(); }
+        }
+        finally
+        {
+            foreach (var c in kvAlone) c?.Dispose();
+            foreach (var c in kvBatch) c?.Dispose();
+        }
+    }
+
     private static float[] CopyLogits(ITensor logits)
     {
         int n = checked((int)logits.Shape.ElementCount);

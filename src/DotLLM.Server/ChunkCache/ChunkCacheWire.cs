@@ -23,9 +23,9 @@ internal static class ChunkCacheWire
 
     /// <summary>
     /// The text-first chunkers (spec §5.3 item 4) a span may name. A copy of <c>WireChunking.Eligible</c> in
-    /// <c>DotLLM.ChunkReuse</c> until the server references that assembly; <c>lines-512</c> joins it in a later task.
+    /// <c>DotLLM.ChunkReuse</c> until the server references that assembly (pinned equal by a test).
     /// </summary>
-    public static IReadOnlySet<string> WireChunkers { get; } = new HashSet<string>(StringComparer.Ordinal) { "symbol-512" };
+    public static IReadOnlySet<string> WireChunkers { get; } = new HashSet<string>(StringComparer.Ordinal) { "symbol-512", "lines-512" };
 }
 
 /// <summary>The requested reuse policy (spec §5.5). Only <see cref="Exact"/> and <see cref="Shadow"/> run in v1.</summary>
@@ -83,7 +83,20 @@ internal sealed record ChunkSpanRef(
     /// </summary>
     public int Index { get; init; } = -1;
 
-    // Never print the span text or its hash (spec 10: chunk content stays out of logs).
+    /// <summary>
+    /// <c>source.path</c> when the annotation carries one as a string (spec §5.2: provenance; Task 15 matches it against the
+    /// secrets deny-list before admitting a background encode, ruling 14). Null when absent.
+    /// </summary>
+    public string? SourcePath { get; init; }
+
+    /// <summary>
+    /// <c>source</c> was present but not an object, or its <c>path</c> not a string: the provenance cannot be checked against
+    /// the deny-list, so the chunk is never admitted for a background encode. The annotation itself is still accepted
+    /// (<c>source</c> never affects lookup).
+    /// </summary>
+    public bool SourceUnreadable { get; init; }
+
+    // Never print the span text, its hash or its source path (spec 10: chunk content stays out of logs).
     private bool PrintMembers(System.Text.StringBuilder builder)
     {
         builder.Append(System.Globalization.CultureInfo.InvariantCulture,
@@ -93,7 +106,11 @@ internal sealed record ChunkSpanRef(
 }
 
 /// <summary>A warning code and how many annotations (or requests, for request-level codes) it covers.</summary>
-internal sealed record ChunkWarning(string Code, int Count);
+internal sealed record ChunkWarning(string Code, int Count)
+{
+    /// <summary>A machine-readable cause (store-writer <c>chunk_store_unavailable</c> only), or null.</summary>
+    public string? Detail { get; init; }
+}
 
 /// <summary>
 /// Why one annotation was dropped. <see cref="Index"/> counts annotations in document order, inline first then

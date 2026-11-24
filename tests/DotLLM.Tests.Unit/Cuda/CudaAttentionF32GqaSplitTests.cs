@@ -267,12 +267,9 @@ public class CudaAttentionF32GqaSplitTests
         float[] v = RandomVec(rng, seqKv * kvElems);
 
         float[] cpuOut = new float[qElems];
-        unsafe
-        {
-            fixed (float* pq = q, pk = k, pv = v, pOut = cpuOut)
-                Attention.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
-                    positionOffset, pool: null, slidingWindowSize: null);
-        }
+        // Span overload = the per-head tiled CPU kernel. The pointer overload decodes past 2,048 keys with the split-KV kernel
+        // (#1927 E2c, F16 partials, not bit-identical), which is not the reference this test means.
+        Attention.Execute(q, k, v, cpuOut, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset);
 
         float[] gpuGqa = RunGqaSplit(kernels, stream, q, k, v, seqKv, numHeads, numKvHeads, headDim,
             positionOffset, kvSplit);
@@ -459,12 +456,7 @@ public class CudaAttentionF32GqaSplitTests
             Array.Copy(vAll, vSlice, seqKv * kvElems);
 
             float[] cpuOut = new float[qElems];
-            unsafe
-            {
-                fixed (float* pq = q, pk = kSlice, pv = vSlice, pOut = cpuOut)
-                    Attention.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
-                        positionOffset, pool: null, slidingWindowSize: null);
-            }
+            Attention.Execute(q, kSlice, vSlice, cpuOut, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset);   // tiled reference (#1927)
 
             int kvSplit = CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, maxSafeSplit);
             if (lastSplit >= 0 && kvSplit != lastSplit)

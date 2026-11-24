@@ -575,7 +575,23 @@ internal static class ChunkAnnotationParser
             return acc.Drop(index, id, ChunkCacheCodes.SpanInvalid, "not_carried", "the span is not where the converter put the part's text");
 
         bool noStore = Present(ch, "no_store", out var nsv) && nsv.ValueKind == JsonValueKind.True;
-        return new ChunkSpanRef(message, part, s, e, id, hash, chunker, stability == "volatile", noStore, spanText, engineSpan, inner) { Index = index };
+        // source is provenance only (spec 5.2): never a defect. Its path feeds the deny-list (Task 15); an unreadable source
+        // only blocks the background encode.
+        string? sourcePath = null;
+        bool sourceUnreadable = false;
+        if (Present(ch, "source", out var src))
+        {
+            if (src.ValueKind != JsonValueKind.Object)
+                sourceUnreadable = true;
+            else if (Present(src, "path", out var sp) && !TryString(sp, out sourcePath))
+                sourceUnreadable = true;
+        }
+        return new ChunkSpanRef(message, part, s, e, id, hash, chunker, stability == "volatile", noStore, spanText, engineSpan, inner)
+        {
+            Index = index,
+            SourcePath = sourcePath,
+            SourceUnreadable = sourceUnreadable,
+        };
     }
 
     /// <summary>A property that is present and not JSON <c>null</c> (null means "use the default").</summary>
