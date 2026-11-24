@@ -353,20 +353,31 @@ public abstract class HiddenStateTapBackendSuite
 
     private static (long Bytes, long[]? Counters) MeasureDecode(HiddenStateTapFixture fx, int steps)
     {
-        // Warm up (JIT, pools, first-use allocation) with the same shape, then measure N decode forwards on this thread.
+        // Robust to JIT/tiering order (a full-suite run on another machine once saw a different byte count than an isolated run):
+        // warm up past the tier-1 promotion threshold (30 calls + the 100 ms tiering timer), pause so the background JIT installs,
+        // warm again, then measure THREE windows and keep the minimum. A real per-forward allocation raises every window, so the
+        // minimum still equals the baseline when clean and exceeds it when an allocation is added; transient noise (a late tier-up,
+        // a pool refill) only inflates a single window.
         using var kv = fx.NewKv();
         var prompt = fx.Prompt;
-        int pos = prompt.Length;
+        int pos0 = prompt.Length;   // every decode re-uses this position (Rollback after each), so a model with a 64-token maximum can run the long warm-up
         using (fx.Model.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, kv)) { }
         int[] tok = [prompt[0]];
         int[] p = new int[1];
-        for (int i = 0; i < 4; i++) { p[0] = pos++; using (fx.Model.Forward(tok, p, -1, kv)) { } }
-        var c0 = fx.DeviceCounters();
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < steps; i++) { p[0] = pos++; using (fx.Model.Forward(tok, p, -1, kv)) { } }
-        long bytes = GC.GetAllocatedBytesForCurrentThread() - before;
-        var c1 = fx.DeviceCounters();
-        return (bytes, c0 is null || c1 is null ? null : c1.Zip(c0, (x, y) => x - y).ToArray());
+        for (int i = 0; i < 40; i++) { p[0] = pos0; kv.Rollback(pos0); using (fx.Model.Forward(tok, p, -1, kv)) { } }
+        Thread.Sleep(300);
+        for (int i = 0; i < 40; i++) { p[0] = pos0; kv.Rollback(pos0); using (fx.Model.Forward(tok, p, -1, kv)) { } }
+        long best = long.MaxValue; long[]? bestCounters = null;
+        for (int w = 0; w < 3; w++)
+        {
+            var c0 = fx.DeviceCounters();
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < steps; i++) { p[0] = pos0; kv.Rollback(pos0); using (fx.Model.Forward(tok, p, -1, kv)) { } }
+            long bytes = GC.GetAllocatedBytesForCurrentThread() - before;
+            var c1 = fx.DeviceCounters();
+            if (bytes < best) { best = bytes; bestCounters = c0 is null || c1 is null ? null : c1.Zip(c0, (x, y) => x - y).ToArray(); }
+        }
+        return (best, bestCounters);
     }
 
     /// <summary>
