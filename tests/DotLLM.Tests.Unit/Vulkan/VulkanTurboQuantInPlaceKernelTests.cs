@@ -152,7 +152,7 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
     /// F32 value (the head-dim-256 body's hi / lo tiles) passes <paramref name="coopmat"/> alone and is checked against its F32 kernel.
     /// </summary>
     private void Case(VulkanDevice device, string spvDir, TurboQuantLayout l, int seqQ, int seqKv, int numHeads,
-        Rec twin, Rec reference, Rec? f16Reference = null, bool coopmat = false)
+        Rec twin, Rec reference, Rec? f16Reference = null, bool coopmat = false, bool f16Partials = false)
     {
         int hd = l.HeadDim, kvHeads = l.NumKvHeads, bits = l.MseBits;
         var rng = new Random(0x1892 + bits * 131 + hd * 7 + seqQ * 3 + seqKv);
@@ -222,12 +222,16 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         // 1. Loader: same operands as the reference on the materialised code-space rows.
         float codeMax = refCode.Max(MathF.Abs), codeWorst = MaxAbsDiff(twinCode, refCode);
         float codeTol = cm ? 2e-3f : 1e-5f;
+        // #1926 E4: the split-KV v2 pass's default F16 O-partials round each split's normalized output to 2^-11; both kernels here use
+        // them, so the loader and oracle bounds widen to the stated 1e-3 of the amplitude (SplitKvPartialF16Tests).
+        if (f16Partials) codeTol = MathF.Max(codeTol, 1e-3f);
         Assert.True(codeMax > 1e-3f, "degenerate code-space reference");
         // 2. Oracle: in place == scratch-dequant path, same norm format. F32 arms differ only by the rounding of the two rotations and
         //    the dot / accumulate order, which grows with sqrt(seqKv * headDim); cooperative-matrix arms round K / V to F16 in different
         //    spaces (code space here, original space in the oracle's kernel), so they get the coopmat budget.
         float refMax = r.Max(MathF.Abs), worst = MaxAbsDiff(a, r);
         float tol = cm ? 1.5e-2f : 2f * 1.1920929e-7f * MathF.Sqrt((float)seqKv * hd);
+        if (f16Partials) tol = MathF.Max(tol, 1e-3f);
         double relOracle = RelL2(a, r);
         _out.WriteLine($"bits {bits} hd {hd} seqQ {seqQ} seqKv {seqKv}: loader {codeWorst / codeMax:E2} (tol {codeTol:E1}); oracle max {worst / refMax:E2} (tol {tol:E2}) relL2 {relOracle:E2}");
         Assert.True(codeWorst <= codeTol * codeMax + (cm ? 1e-5f : 0f),
@@ -394,9 +398,8 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         Assert.True(tq is not null, "no TurboQuant split-KV twin");
         f32.PreferGqa = gqa; tq!.PreferGqa = gqa;
         f32.PreferGqa2 = gqa2; tq.PreferGqa2 = gqa2;
-        // F32 partials (#1926 E4 control): these tests hold the LOADER to the scratch oracle at reduction-order tolerance; the F16
-        // partial format has its own stated-tolerance tests (SplitKvPartialF16Tests) and model gate.
-        f32.PreferPartF16 = false; tq.PreferPartF16 = false;
+        // #1926 E4: run every case on both partial formats. F32 partials hold the LOADER to the scratch oracle at reduction-order
+        // tolerance; the default F16 partials (v2 pass only) are held to the same oracle at the stated 1e-3 of the amplitude.
         Assert.Equal(f32.UsesGqa(heads, kvHeads, hd), tq.UsesGqa(heads, kvHeads, hd));        // same pass as the F32 kernel takes
         Assert.Equal(f32.UsesGqa2(heads, kvHeads, hd), tq.UsesGqa2(heads, kvHeads, hd));
         Skip.If(gqa && !f32.UsesGqa(heads, kvHeads, hd), "GQA-grouped split pass unavailable for this shape");
@@ -405,9 +408,15 @@ public sealed unsafe class VulkanTurboQuantInPlaceKernelTests
         using var bS = sinks ? Sinks(device, heads) : null;
         int pos = seqKv - 1, kvStart = window > 0 ? Math.Max(0, pos - window + 1) : 0;
         long before = tq.GqaDispatches;
-        Case(device, spvDir, l, 1, seqKv, heads,
-            (c, q, k, v, o, t) => tq.Record(c, q, k, v, o, 1, seqKv, heads, kvHeads, hd, positionOffset: pos, slidingWindow: window, sinks: bS, kvStart: kvStart, tq: t),
-            (c, q, k, v, o, _) => f32.Record(c, q, k, v, o, 1, seqKv, heads, kvHeads, hd, positionOffset: pos, slidingWindow: window, sinks: bS, kvStart: kvStart));
+        foreach (bool partF16 in gqa2 ? new[] { false, true } : new[] { false })
+        {
+            f32.PreferPartF16 = partF16; tq.PreferPartF16 = partF16;
+            Case(device, spvDir, l, 1, seqKv, heads,
+                (c, q, k, v, o, t) => tq.Record(c, q, k, v, o, 1, seqKv, heads, kvHeads, hd, positionOffset: pos, slidingWindow: window, sinks: bS, kvStart: kvStart, tq: t),
+                (c, q, k, v, o, _) => f32.Record(c, q, k, v, o, 1, seqKv, heads, kvHeads, hd, positionOffset: pos, slidingWindow: window, sinks: bS, kvStart: kvStart),
+                f16Partials: partF16);
+            Assert.Equal(partF16, tq.LastPartF16);
+        }
         Assert.Equal(gqa, tq.GqaDispatches > before);
     }
 

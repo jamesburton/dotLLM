@@ -666,6 +666,9 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         if (gqa2)
         {
             int group = Gqa2GroupFor(numHeads, numKvHeads);
+            // The shader drops heads silently if a sub-group exceeds the pipeline's GROUP (final review of #1926, M5).
+            System.Diagnostics.Debug.Assert(group >= (numHeads / numKvHeads + GqaSubGroups(numHeads, numKvHeads) - 1) / GqaSubGroups(numHeads, numKvHeads),
+                "v2 GROUP below the shape's sub-group size");
             partF16 = PreferPartF16 && _gqa2CanWriteF16;
             (splitPipeline, splitCache) = Gqa2PipelineFor(group, partF16);
             LastGqa2Group = group;

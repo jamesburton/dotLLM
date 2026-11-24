@@ -22,7 +22,7 @@ Terms:
 - **Accuracy bar:** KL(ref ‖ test) over the full vocabulary, gated on the **median** (or trimmed mean) plus the outlier
   rate (rows with KL > 1e-3 / 1e-2) and top-1 agreement. Mean KL is reported but not gated: massive-activation rows
   dominate it.
-- Evidence is cited as **E1–E14** (§5). `[lit]` marks a literature-only claim; `not measured (#n)` names the issue that
+- Evidence is cited as **E1–E21** (§5). `[lit]` marks a literature-only claim; `not measured (#n)` names the issue that
   will measure it.
 
 ---
@@ -179,7 +179,8 @@ keeps the output exact, so tune by acceptance × cost, not KL (#1095 measured no
 **RoPE.** Compute the angle in F32 (F64 for YaRN); GPUs compute sin/cos in-kernel (no table). CPU F32 tables are
 duplicated (64 MiB × 2 at 128k on Llama-8B); F16 tables from F32 angles are not measured (#1142).
 
-**Split partials.** *m*/*ℓ* stay F32 (a few KB); O partials and split-K slabs to F16 are not measured (#1144).
+**Split partials.** *m*/*ℓ* stay F32 (a few KB); split-K slabs to F16 are not measured (#1144). Split-KV O partials are F16
+on all three backends: CPU (E18), CUDA (below) and Vulkan's v2 grouped decode pass (E21).
 CUDA dense decode (#1922) stores its split-KV O partials **normalised** (o/ℓ, bounded by max|v|) in **F16** with *m*, *ℓ*
 F32 (James's ruling, 2026-11-20; the unnormalised form overflows F16 on a long split, guarded by a flat-score |V|≈20 32K test).
 Kernel level (RTX 3060, F64 oracle over F16 inputs): max |err| F16 partials vs F32 partials 2.9e-4 vs 2.9e-4 at short seqKv,
@@ -716,6 +717,44 @@ cache API, could overflow it.
 Model-level evidence is `CudaTurboQuantPrefillDepthGate`. The new entries' mean KL to F16 KV must stay within legacy plus a measured
 1-ulp drift band; see KV_CACHE.md "TurboQuant" for the numbers.
 
+### E21 - Vulkan split-KV decode O partials, F16 vs F32 (#1926 E4; James 2026-11-21, bench-confirmed 2026-11-24)
+
+What ships: the v2 grouped split-KV decode pass (`attention_f32_splitkv_gqa_v2.glsl`, `PART_F16 = 1`) stores each split's O partial
+**normalised** by that split's running sum (o/ℓ, so |o| ≤ max|v|) as packed halves, two per word; `attention_f32_splitkv_merge.comp`
+(`PART_F16 = 1`) multiplies ℓ back in. The running max *m* and sum *ℓ* stay **F32** (`partMS`, 8 B per (head, split)). Default on;
+`DOTLLM_VULKAN_SPLITKV_PART=f32` is the control (un-normalised F32 partials, bit-identical to the pre-#1926 path). The per-query-head
+and v1 grouped passes (head dim > 128, wave32 hosts, `DOTLLM_VULKAN_SPLITKV_GQA2=0`) still store F32 partials.
+
+Kernel level (`SplitKvPartialF16Tests`, tolerance stated up front: 1e-3 of the output amplitude, the 2^-11 F16 step on a convex
+combination): f16 / q8_0 / q4_0 / tq3 / tq4 KV, sinks, sliding window, 14/2/64 to 96/8/128, seqKv 700-8,192: measured 1.5e-4 to
+6.8e-4; a |v| ≈ 3e4 equal-weight split does not overflow (the un-normalised form would). Speed: neutral (microbench 32K q4_0 0.238
+vs 0.236 ms, f16 0.601 vs 0.598; model 7.6K 0.995-1.013, 32K 0.98-1.05).
+
+Model level (`tools/tq-gate --mode decodedump` / `klcmp`: prefill, then 1,000 teacher-forced single-token decode steps through the
+split-KV path, full log-softmax rows; Qwen3-4B Q4_K_M, wikitext-2 LF; a = F32 partials, b = F16 partials; ref = f16 KV, F32 partials):
+
+| depth | KV | KL(a‖b) mean / max | PPL a → b | top-1 | KL(ref‖a) / KL(ref‖b) |
+|---|---|---|---|---|---|
+| 7.6K | f16 | 2.4e-7 / 8.8e-6 | 7.2185 → 7.2173 (-0.016%) | 1000/1000 | 0 / 2.4e-7 |
+| 32K | f16 | 3.9e-7 / 2.1e-5 | 12.3702 → 12.3685 (-0.014%) | 1000/1000 | 0 / 3.9e-7 |
+| 7.6K | q4_0 | 1.9e-2 / 1.27 | 7.2803 → 7.2487 (-0.435%) | 940/1000 | 0.0740 / 0.0700 |
+| 32K | q4_0 | 2.4e-2 / 0.43 | 13.1013 → 12.8607 (-1.836%) | 928/1000 | 0.1064 / 0.1057 |
+
+Reading: the f16-KV rows are the clean measure of the format (KL ≤ 4e-7, PPL ≤ 0.016%). On q4_0 KV the decode-time Q4_0 writer
+digitises any ULP-level attention change: the GROUP 4 vs 8 control (1-2 ULP, no format change) and the 256- vs 80-workgroup grid
+control produce the same band (KL 1.3-2.4e-2, PPL ±0.1-0.7% with both signs), and the F16 arm's distance to the f16-KV reference
+is never larger than the control's. Same conclusion as CUDA (#1922) and CPU (E18).
+
+Why not below F16: the live partials are about 80 KB per layer (32 heads x 10 splits x 128 x 2 B at the default grid) and F16 is
+already speed-neutral, so an 8-bit O partial (with a per-row scale) could buy no measurable time and would add the 8-bit rounding
+to every split. *m* / *ℓ* stay F32 (an F16 running max near 20 moves exp() weights by ~1%; `SplitKvPartialF16Tests` kills that
+mutant). Saturation: the store clamps to ±65,504; it is reachable only on the F32-KV module with |v| > 65,504 (F16 and quantized
+KV cannot exceed it), and `clamp(NaN)` is implementation-defined there.
+
+Residual F32 cost (inventory V5): the partial scratch is still **allocated** at the F32 bound shared with the per-query-head / v1
+passes, `numHeads x 256 x 256 x 4 B` = 8.4 MB at 32 query heads, one buffer for all layers; the v2 F16 pass uses about 0.66 MB of
+it. A separately sized F16 buffer when v2 is the only consumer is the follow-up.
+
 ## 6. Decision table: CLAUDE.md rule → evidence
 
 | CLAUDE.md rule (Precision & Expansion) | evidence | verdict |
@@ -727,7 +766,7 @@ Model-level evidence is `CudaTurboQuantPrefillDepthGate`. The new entries' mean 
 | 1. … recurrent-state updates, split-reduction combines | not measured | open → #1144 |
 | 1. Compute-bound GEMM: F16 accumulation where faster and KL-parity passes; promote every 64–256 for long K | RTX 3060: plain F16-acc 1.11–1.20× faster but fails on Bonsai (median 1.16e-4, 0.6% top-1 flips, grows 3.7× with K); **promote every 256: 6.3e-6** (E2). **Strix: F16-acc is not faster (1.00–1.01×)** and fails (1.6e-3, 65.8% of rows > 1e-3; Q4_0 max 0.106) (E11, E12). Arc: no F16 path is faster (0.60–0.68×) | **3060: yes, with promotion** (fused, #1132). **Strix, Arc: no** — F32 accumulation |
 | 1. Integer dot products accumulate int32 | CPU W8A8/W4A8 KL 1–2e-4 at per-32 scales (E4); CUDA W2A8 5.1e-5, better than F16-acc (E2); Vulkan MMVQ 1–3e-4 vs F32-in, 1.3–1.7× (Arc), 1.6× (Strix Q4_0); Arc MMQ prefill 34× (E12) | confirmed; per-32 activation scales preferred over per-256; Strix Q8_0 prefill is the F32-acc coopmat (#1150, E12b) |
-| 1. Stored F32 partials (split-K, split-KV) need sign-off | CPU decode: F16 partial outputs indistinguishable from F32 at model level (E18) | **CPU: F16** (#1927); CUDA/Vulkan open → #1144 |
+| 1. Stored F32 partials (split-K, split-KV) need sign-off | F16 normalised split-KV O partials indistinguishable from F32 at model level: CPU (E18), CUDA (§4, #1922), Vulkan (E21) | **CPU: F16** (#1927); **CUDA: F16** (#1922); **Vulkan v2: F16** (#1926); *m*/*ℓ* F32 everywhere; split-K slabs open → #1144 |
 | (not a rule; a kernel extra) Q hi/lo split in Vulkan GQA prefill | dropping it: KL ≤ 1.5e-7 median, 1.67× attention, 1.46× a 128k tile (E9) | turn off by default → #1148 (user sign-off) |
 | 1. Model-declared FP32 state is evidence, not exemption | engines unanimous `[lit]`; no dotLLM measurement | open → #1144 |
 | 2. Kernels read quantized blocks directly | int8 tiers beat dequant tiers on every CPU (E1); W2A8 MMQ more accurate than dequant + F16 GEMM (E2); LM head packed: 2,425 → 170 MiB, PPL +0.03% (#1099); kvq prefill without the F16 scratch (#1094) | confirmed; remaining expansions in §7 |
@@ -785,7 +824,8 @@ PRs #1103, #1122, #1125, #1126.
 | V2 | Vulkan | hybrid KV F32 default | B2 128 KiB/token | **fixed on dev for B2** (#1102, PR #1122: F16 default, 64 KiB/token); q8_0 open | #1112 |
 | V3 | Vulkan | inter-kernel activations F32 | `4·seqLen·(3H+2q+2kv+3I)` | open | #1138, #677 |
 | V4 | Vulkan | MTP KV and hidden F32 | B2 8 → 4 KiB/token at F16, KL 3.4e-8 (E10b) | **KV fixed** (#1141): F16 via the trunk's convert kernel + `_kvf16` attention twins; Bonsai-2 greedy text identical, 159/192 drafts accepted both arms; q8_0 head follows once Vulkan has a quantized trunk cache; `DOTLLM_VULKAN_MTP_KV=f32` reference arm | #1141 |
-| V5 | Vulkan | split-KV partials, split-K slabs F32 | 5.24 MB per split-K | sign-off pending | #1144 |
+| V5 | Vulkan | split-KV partials, split-K slabs F32 | 5.24 MB per split-K | split-K slabs: sign-off pending. Split-KV O partials **F16 in the v2 decode pass** (#1926, E21; James 2026-11-21, bench-confirmed 2026-11-24); *m*/*ℓ* F32 (8 KB live, 64 KB allocated) | #1144, #1926 |
+| V5b | Vulkan | split-KV partial scratch still allocated at the F32 bound (shared with the per-query-head / v1 passes, which store F32) | `numHeads x 256 x 256 x 4` B = 8.4 MB at 32 heads, one buffer for all layers; v2 F16 uses ~0.66 MB of it | open: size an F16 buffer when v2 is the only consumer | #1926 |
 | V6 | Vulkan | logits `rows·V·4`; recurrent state; MLA KV; Q8_1 `(d,s)` and KV scales F32 | various | open | #1137, #1144, #1140, #1146 |
 | VX1 | Vulkan | token embedding → F32 for every type but Q8_0 | Qwen3.8-27B 4.85 GiB vs 682 MiB (Q4_K); Bolt 2 GiB vs 544 MiB (Q8_0) | **fixed for Nemotron-H and qwen35 dense** (#1174: Q8_0 / Q4_K / Q6_K / PQ2_0 gathered packed); dense `VulkanWeights` K-quants and `VulkanQwen3MoeHybrid` open | #919 |
 | VX2 | Vulkan | matrices outside `DeviceQuantTypeFor` → F32 | `m·k·4` | open | #921, #627 |
@@ -823,7 +863,7 @@ New issues filed by this study: #1134–#1146 (inventory), #1148–#1151 (Vulkan
 |---|---|---|
 | F16/BF16 stored activations (all backends); residual-stream max |x| per model | rule 1 for the largest per-token store after KV | #1138 |
 | Recurrent state at 16 bits over ≥ 8k-token decodes; 16-bit snapshots | the one store that feeds back into itself (dense `qwen35` verify rows no longer store states at all, #1194: a 16-bit snapshot would break greedy identity, row inputs + replay do not) | #1144 |
-| Split-KV O partials / split-K slabs in F16 | small bytes, needs sign-off either way | #1144 |
+| Split-K slabs in F16 (split-KV O partials: measured, E18 / E21) | small bytes, needs sign-off either way | #1144 |
 | F16 RoPE tables at ≥ 32k | CPU table bytes | #1142 |
 | Vulkan F16 accumulation promoted every 256 K | the AMD Windows driver crashes compiling it; moot on Strix (F16-acc no faster) | — |
 | Vulkan hybrid KV in q8_0 / K8V4 / q4_0 | Strix/Arc long-context KV choice | #1112 |

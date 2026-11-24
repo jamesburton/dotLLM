@@ -48,32 +48,34 @@ public sealed class Probe1926SplitKvV2ShaderInfoTests
             files.AddRange(Directory.GetFiles(extra, "*.spv").OrderBy(f => f, StringComparer.Ordinal));
 
         _out.WriteLine($"Device: {device.DeviceName}");
-        _out.WriteLine("| module | variant | GROUP | VGPR | SGPR | LDS used | scratch |");
-        _out.WriteLine("|---|---|---:|---:|---:|---:|---:|");
+        _out.WriteLine("| module | variant | GROUP | PART_F16 | VGPR | SGPR | LDS used | scratch |");
+        _out.WriteLine("|---|---|---:|---:|---:|---:|---:|---:|");
         foreach (string path in files)
         {
             string name = Path.GetFileNameWithoutExtension(path);
             if (!File.Exists(path)) { _out.WriteLine($"| {name} | missing | | | | | |"); continue; }
             TurboQuantLayout?[] layouts = name.Contains("kvtq", StringComparison.Ordinal)
-                ? [new TurboQuantLayout(128, 8, 3, TurboQuantLayout.DefaultNorm), new TurboQuantLayout(128, 8, 4, TurboQuantLayout.DefaultNorm)]
+                ? [new TurboQuantLayout(128, 8, 3, TurboQuantLayout.DefaultNorm), new TurboQuantLayout(128, 8, 4, TurboQuantLayout.DefaultNorm),
+                   new TurboQuantLayout(128, 8, 7, TurboQuantLayout.DefaultNorm), new TurboQuantLayout(128, 8, 8, TurboQuantLayout.DefaultNorm)]
                 : [null];
             using var module = VulkanModule.LoadFromFile(device, path);
             foreach (TurboQuantLayout? tq in layouts)
             {
-                foreach (uint? group in new uint?[] { null, 4u, 8u })
+                // (GROUP, PART_F16): the shipped default is the F16-partial epilogue (PART_F16 = 1, #1926 E4).
+                foreach ((uint? group, uint part) in new (uint?, uint)[] { (null, 0u), (4u, 0u), (8u, 0u), (4u, 1u), (8u, 1u) })
                 {
-                    ReadOnlySpan<uint> spec = group is { } g ? [g] : default;
+                    ReadOnlySpan<uint> spec = group is { } g ? [g, part] : default;
                     string variant = tq is { } l ? $"tq{l.MseBits}" : "-";
                     try
                     {
                         using ComputePipeline p = TqKvTwin.CreatePipeline(module, 5, SplitPushConstantBytes, tq, spec: spec);
                         var s = device.GetShaderStatisticsAmd(p.Pipeline);
-                        _out.WriteLine($"| {name} | {variant} | {(group?.ToString() ?? "unset")} | {s.resourceUsage.numUsedVgprs} | " +
+                        _out.WriteLine($"| {name} | {variant} | {(group?.ToString() ?? "unset")} | {part} | {s.resourceUsage.numUsedVgprs} | " +
                                        $"{s.resourceUsage.numUsedSgprs} | {s.resourceUsage.ldsUsageSizeInBytes} | {s.resourceUsage.scratchMemUsageInBytes} |");
                     }
                     catch (Exception ex)
                     {
-                        _out.WriteLine($"| {name} | {variant} | {group} | FAILED ({ex.GetType().Name}: {ex.Message}) | | | |");
+                        _out.WriteLine($"| {name} | {variant} | {group} | {part} | FAILED ({ex.GetType().Name}: {ex.Message}) | | | |");
                     }
                 }
             }

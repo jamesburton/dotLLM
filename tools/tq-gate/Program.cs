@@ -752,7 +752,9 @@ void DecodeDump()
         bw.Write(t[P + i + 1]);
         foreach (float x in r) bw.Write((float)(x - lse));
     }
-    Log($"decodedump: ctx {P}, {N} steps -> {outFile} (DOTLLM_VK_KV={Environment.GetEnvironmentVariable("DOTLLM_VK_KV") ?? "-"}, DOTLLM_VULKAN_SPLITKV_PART={Environment.GetEnvironmentVariable("DOTLLM_VULKAN_SPLITKV_PART") ?? "-"})");
+    static string E(string n) => $"{n}={Environment.GetEnvironmentVariable(n) ?? "-"}";
+    Log($"decodedump: ctx {P}, {N} steps -> {outFile} ({E("DOTLLM_VK_KV")}, {E("DOTLLM_VULKAN_SPLITKV_PART")}, {E("DOTLLM_VULKAN_SPLITKV_GROUP_SPEC")}, " +
+        $"{E("DOTLLM_VULKAN_SPLITKV_GQA2_TARGET_WG")}, {E("DOTLLM_VULKAN_SPLIT_TARGET_WG")}, {E("DOTLLM_VULKAN_SPLITKV_GQA2")})");
 }
 
 static void KlCompare(string fa, string fb, string? fref)

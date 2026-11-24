@@ -92,6 +92,15 @@ quantized-KV and TurboQuant caches (split-KV serves contiguous F32 caches only),
   `Attention.OverrideDecodeSplitKvOnThisThread(DecodeSplitKvPartials.Off)` (thread-scoped, no race with other tests):
   `MtpLongContextTests.MtpGreedy_AcrossGrowthAndTheOldCap_MatchesPlainGreedy` (prompts 4,095-4,097).
 
+## Vulkan: split-KV decode rows differ from verify rows (#1926)
+
+Vulkan one-row decode has taken the split-KV pass from about 17 visible keys onward since #345 (memory note
+`vulkan-splitkv-default-on-from-ctx17`), so its rows were never bit-identical to multi-row verify / prefill rows at depth. #1926 widens
+the gap a little: the v2 grouped pass now stores **F16** normalised O partials (`docs/PRECISION.md` E21: f16-KV KL 2-4e-7 against F32
+partials), and its grid and GROUP specialisation reorder F32 sums. Speculative / MTP greedy output on Vulkan can therefore differ from
+plain greedy at depth. `DOTLLM_VULKAN_SPLITKV_PART=f32` restores the previous partial format; it does not restore bit identity.
+Tests that assert spec == plain greedy on Vulkan must stay below the split threshold or compare distributions, not tokens.
+
 ## CPU: Q4_K rows are batch-invariant under the row-lane arithmetic (#1927 E3d)
 
 The CPU Q4_K GEMM takes the row-lane kernel (`MatMul.GemmQ4KRowLane8`: 8 output rows per SIMD lane set) for batches of 16 or more

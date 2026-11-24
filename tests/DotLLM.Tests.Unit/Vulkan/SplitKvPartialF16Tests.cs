@@ -88,27 +88,79 @@ public sealed class SplitKvPartialF16Tests
         Assert.True(worst <= Tolerance * amp, $"{label}: F16 partials differ from the F32 control by {worst / amp:E2} of the amplitude (limit {Tolerance:E0})");
     }
 
+    /// <summary>
+    /// The default-on F16 partials on the paths the shipped models take beyond plain causal decode (final review of #1926, I2): TurboQuant
+    /// (tq3 / tq4, codes read in place), gpt-oss attention sinks (the merge adds exp(sink - M) to the denominator), and a sliding window
+    /// (kvStart &gt; 0, so the splits cover a clipped span). Each runs the same kernel with F16 and F32 partials on the same buffers; the F32
+    /// arm is held to its oracle by VulkanTurboQuantInPlaceKernelTests / VulkanSinkSplitKvAttentionTests, so 1e-3 of the amplitude here
+    /// bounds the F16 arm against that oracle too.
+    /// </summary>
+    public static TheoryData<string, int, int, int, int, int> PathCases() => new()
+    {
+        { "tq4", 32, 8, 128, 4096, 0 },
+        { "tq3", 32, 8, 128, 2600, 0 },
+        { "tq4", 14, 2, 64, 1000, 0 },
+        { "sinks", 64, 8, 64, 700, 128 },     // gpt-oss geometry: sinks + sliding window
+        { "sinks", 32, 4, 128, 4000, 0 },     // Flint full layer with sinks
+        { "window", 32, 8, 128, 4097, 513 },  // sliding window only: kvStart = 3584
+    };
+
+    [SkippableTheory]
+    [MemberData(nameof(PathCases))]
+    public void F16Partials_TqSinksAndWindow_MatchF32Control(string path, int numHeads, int numKvHeads, int headDim, int seqKv, int window)
+    {
+        var rng = new Random(0x19266 + seqKv + numHeads + path.Length);
+        float[] q = Rand(rng, numHeads * headDim, 1.5f);
+        float[] k = Rand(rng, seqKv * numKvHeads * headDim, 0.5f), v = Rand(rng, seqKv * numKvHeads * headDim, 0.5f);
+        float[]? sinks = null;
+        if (path == "sinks")
+        {
+            sinks = new float[numHeads];
+            for (int h = 0; h < numHeads; h++) sinks[h] = 2f + (float)(rng.NextDouble() * 2 - 1);   // a sink that holds real softmax mass
+        }
+        int? tqBits = path switch { "tq4" => 4, "tq3" => 3, _ => null };
+        var (f16, f32) = RunBoth(tqBits is null ? VulkanKvStorage.F16 : VulkanKvStorage.Tq, numHeads, numKvHeads, headDim, seqKv, q, k, v,
+            window, sinks, tqBits, rng);
+        AssertClose(f16, f32, $"{path} {numHeads}/{numKvHeads}/{headDim} seqKv {seqKv} window {window}");
+    }
+
     private static (float[] F16, float[] F32) RunBoth(VulkanKvStorage storage, int numHeads, int numKvHeads, int headDim, int seqKv,
-        float[] q, float[] k, float[] v)
+        float[] q, float[] k, float[] v, int window = 0, float[]? sinks = null, int? tqBits = null, Random? rng = null)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
-        using var kern = VulkanSplitKvAttentionKernel.Create(device, spvDir, storage);
+        DotLLM.Core.Attention.TurboQuantLayout? l = tqBits is int bits
+            ? new DotLLM.Core.Attention.TurboQuantLayout(headDim, numKvHeads, bits, DotLLM.Core.Attention.TurboQuantLayout.DefaultNorm) : null;
+        using var kern = VulkanSplitKvAttentionKernel.Create(device, spvDir, storage, l, "");
         kern.PreferGqa = true;
         Skip.IfNot(kern.UsesGqa2(numHeads, numKvHeads, headDim), "v2 pass unavailable on this device");
-        Assert.True(VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads));
-        byte[] kb = SplitKvV2LoaderBitIdentityTests.Encode(storage.KeyFormat(), k), vb = SplitKvV2LoaderBitIdentityTests.Encode(storage.ValueFormat(), v);
+        int pos = seqKv - 1, kvStart = window > 0 ? Math.Max(0, pos - window + 1) : 0;
+        Assert.True(VulkanSplitKvAttentionKernel.WouldSplit(seqKv - kvStart, numHeads));
+        using var tq = l is { } tl ? TqFixture.Create(device, rng!, tl, seqKv) : null;
+        byte[] kb = tq is null ? SplitKvV2LoaderBitIdentityTests.Encode(storage.KeyFormat(), k) : [];
+        byte[] vb = tq is null ? SplitKvV2LoaderBitIdentityTests.Encode(storage.ValueFormat(), v) : [];
         using var bQ = device.Allocate(q.Length * 4L);
-        using var bK = device.Allocate(kb.Length);
-        using var bV = device.Allocate(vb.Length);
+        using var bK = tq is null ? device.Allocate(kb.Length) : null;
+        using var bV = tq is null ? device.Allocate(vb.Length) : null;
+        using var bS = sinks is null ? null : device.Allocate(sinks.Length * 4L);
         using var o16 = device.Allocate(q.Length * 4L);
         using var o32 = device.Allocate(q.Length * 4L);
-        device.Upload(q, bQ); device.Upload(kb, bK); device.Upload(vb, bV);
+        device.Upload(q, bQ);
+        if (bK is not null) { device.Upload(kb, bK); device.Upload(vb, bV!); }
+        if (bS is not null) device.Upload(sinks!, bS);
+        void Run(VulkanDevice.Buffer o)
+        {
+            using var ctx = device.CreateSubmitContext();
+            ctx.Begin();
+            kern.Record(ctx.CommandBuffer, bQ, tq?.K ?? bK!, tq?.V ?? bV!, o, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset: pos,
+                slidingWindow: window, sinks: bS, kvStart: kvStart, tq: tq?.Operands);
+            ctx.SubmitAndWait();
+        }
         kern.PreferPartF16 = true;
-        kern.Launch(bQ, bK, bV, o16, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1);
+        Run(o16);
         Assert.True(kern.LastPartF16, "the F16 partial pipeline was not bound");
         kern.PreferPartF16 = false;
-        kern.Launch(bQ, bK, bV, o32, 1, seqKv, numHeads, numKvHeads, headDim, seqKv - 1);
+        Run(o32);
         Assert.False(kern.LastPartF16);
         float[] a = new float[q.Length], b = new float[q.Length];
         device.Download(o16, a); device.Download(o32, b);

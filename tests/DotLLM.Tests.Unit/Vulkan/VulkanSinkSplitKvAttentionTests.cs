@@ -31,7 +31,6 @@ public sealed class VulkanSinkSplitKvAttentionTests
         using var device = VulkanDevice.Create();
         using var gpt = VulkanGptOssKernels.Create(device, spvDir);
         using var split = VulkanSplitKvAttentionKernel.Create(device, spvDir);
-        split.PreferPartF16 = false;   // #1926 E4: compared with the single-pass sink kernel at F32 tolerance; F16 partials: SplitKvPartialF16Tests
         split.PreferGqa = gqa;
         Skip.If(gqa && !split.UsesGqa(numHeads, numKvHeads, headDim), "GQA-grouped split pass unavailable");
         Assert.Equal(gqa, split.UsesGqa(numHeads, numKvHeads, headDim));
@@ -53,22 +52,32 @@ public sealed class VulkanSinkSplitKvAttentionTests
         using var splitOut = device.Allocate(q.Length * 4L);
         device.Upload(q, qB); device.Upload(k, kB); device.Upload(v, vB); device.Upload(sinks, sB);
 
-        using (var ctx = device.CreateSubmitContext())
+        // #1926 E4: both partial formats against the same single-pass sink oracle. F32 partials at the original 1e-4; the default F16
+        // partials (v2 grouped pass only) at the stated 1e-3 of the amplitude (SplitKvPartialF16Tests).
+        bool v2 = split.UsesGqa2(numHeads, numKvHeads, headDim);
+        foreach (bool partF16 in v2 ? new[] { false, true } : new[] { false })
         {
-            ctx.Begin();
-            gpt.RecordAttentionSinks(ctx.CommandBuffer, qB, kB, vB, refOut, sB, 1, seqKv, numHeads, numKvHeads, headDim, pos, window);
-            split.Record(ctx.CommandBuffer, qB, kB, vB, splitOut, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset: pos, slidingWindow: window,
-                sinks: sB, kvStart: kvStart);
-            ctx.SubmitAndWait();
+            split.PreferPartF16 = partF16;
+            using (var ctx = device.CreateSubmitContext())
+            {
+                ctx.Begin();
+                gpt.RecordAttentionSinks(ctx.CommandBuffer, qB, kB, vB, refOut, sB, 1, seqKv, numHeads, numKvHeads, headDim, pos, window);
+                split.Record(ctx.CommandBuffer, qB, kB, vB, splitOut, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset: pos, slidingWindow: window,
+                    sinks: sB, kvStart: kvStart);
+                ctx.SubmitAndWait();
+            }
+            Assert.Equal(partF16, split.LastPartF16);
+            float[] a = new float[q.Length], b = new float[q.Length];
+            device.Download(refOut, a);
+            device.Download(splitOut, b);
+            Assert.True(VulkanSplitKvAttentionKernel.WouldSplit(seqKv - kvStart, numHeads) || seqKv < 64, "case does not exercise a real split");
+            float maxAbs = a.Max(MathF.Abs);
+            Assert.True(maxAbs > 1e-3f, "reference degenerate");
+            float tol = partF16 ? 1e-3f : 1e-4f;
+            for (int i = 0; i < a.Length; i++)
+                Assert.True(MathF.Abs(a[i] - b[i]) <= tol * maxAbs + 1e-6f,
+                    $"i={i} (head {i / headDim}, {(partF16 ? "F16" : "F32")} partials): sink kernel {a[i]:G7} vs split+sink {b[i]:G7}");
         }
-        float[] a = new float[q.Length], b = new float[q.Length];
-        device.Download(refOut, a);
-        device.Download(splitOut, b);
-        Assert.True(VulkanSplitKvAttentionKernel.WouldSplit(seqKv - kvStart, numHeads) || seqKv < 64, "case does not exercise a real split");
-        float maxAbs = a.Max(MathF.Abs);
-        Assert.True(maxAbs > 1e-3f, "reference degenerate");
-        for (int i = 0; i < a.Length; i++)
-            Assert.True(MathF.Abs(a[i] - b[i]) <= 1e-4f * maxAbs + 1e-6f, $"i={i} (head {i / headDim}): sink kernel {a[i]:G7} vs split+sink {b[i]:G7}");
     }
 
     /// <summary>Control: the sink must matter (a sink-less split-KV launch differs from the sink kernel), so the comparison above cannot pass by ignoring sinks.</summary>
