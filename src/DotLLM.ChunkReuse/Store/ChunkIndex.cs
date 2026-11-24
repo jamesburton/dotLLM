@@ -1009,6 +1009,17 @@ public sealed partial class ChunkIndex
     // Per async flow (a test shortens it for itself only; a process-wide value raced between parallel test classes).
     private static readonly AsyncLocal<TimeSpan?> s_saveRetryBudget = new();
 
+    // Per async flow: signalled each time MoveWithRetry finds the destination held and is about to wait, so a test can synchronise
+    // on "the save is blocked on the reader" instead of sleeping for a wall-clock interval.
+    private static readonly AsyncLocal<Action?> s_moveRetried = new();
+
+    /// <summary>Test hook: called each time the final rename is refused and about to be retried.</summary>
+    internal static Action? MoveRetriedForTest
+    {
+        get => s_moveRetried.Value;
+        set => s_moveRetried.Value = value;
+    }
+
     private const int ErrorAccessDenied = unchecked((int)0x80070005);
     private const int ErrorSharingViolation = unchecked((int)0x80070020);
     private const int ErrorLockViolation = unchecked((int)0x80070021);
@@ -1032,6 +1043,7 @@ public sealed partial class ChunkIndex
                 if (sw.Elapsed >= SaveRetryBudget)
                     throw new IOException($"File '{full}' could not be replaced within {SaveRetryBudget.TotalSeconds:0.#} s "
                         + $"(sharing violation or access denied; e.g. a reader holds it open, or the file is read-only): {ex.Message}", ex);
+                MoveRetriedForTest?.Invoke();
                 Thread.Sleep(20);
             }
         }
