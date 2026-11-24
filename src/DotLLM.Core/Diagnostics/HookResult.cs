@@ -20,6 +20,16 @@ public abstract record HookResult
     /// <returns>A result that replaces the activation.</returns>
     public static HookResult Replace(float[] activation) => new ReplaceResult(activation);
 
+    /// <summary>
+    /// Stop the forward pass at this point (hidden-state taps only, #1920): the model rolls its KV-cache and
+    /// recurrent state back to their values at forward entry and skips the remaining layers and the LM head.
+    /// Valid only from an abortable tap registered through <see cref="IHiddenStateTapHost.RegisterAbortableTap(HiddenStateTapSubscription, Func{HiddenStateSample, HookResult})"/>.
+    /// </summary>
+    public static HookResult AbortForward { get; } = new AbortForwardResult();
+
+    /// <summary>Early-exit result (see <see cref="AbortForward"/>).</summary>
+    public sealed record AbortForwardResult : HookResult;
+
     /// <summary>Read-only pass-through result.</summary>
     public sealed record ContinueResult : HookResult;
 

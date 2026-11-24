@@ -56,7 +56,7 @@ namespace DotLLM.Vulkan;
 /// matching the CUDA return convention.
 /// </para>
 /// </remarks>
-public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IVulkanResidualModifierHost
+public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IVulkanResidualModifierHost, DotLLM.Core.Diagnostics.IHiddenStateTapHost
 {
     private readonly VulkanDevice _device;
     private readonly VulkanWeights _weights;
@@ -4401,6 +4401,17 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 || lw.AttnSinks is not null)
                 modelHasMlaOrMoe = true;
         }
+        // A hidden-state tap needs each sequence's own rows: the fused batched layer loop has no tap sites, so every sequence takes the
+        // per-sequence core (#1920).
+        var batchTaps = _tapState?.Registry.Current;
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.RefuseAbortableBatch(batchTaps);   // abort of request i would leave 0..i-1 committed (#1920 I-6)
+        bool tapped = batchTaps is not null;
+        if (tapped)
+        {
+            if (!modelHasMlaOrMoe)
+                { DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddPackedBatchFallback(); VulkanHiddenStateTaps.LogOnce("packed-batch", "a hidden-state tap is attached: ForwardBatch runs per sequence instead of the packed batch."); }
+            modelHasMlaOrMoe = true;
+        }
 
         // Build the simple / complex index lists. Preserve input order in the result.
         var simpleIdx = new List<int>(requests.Count);
@@ -4424,7 +4435,15 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         foreach (int i in complexIdx)
         {
             var r = requests[i];
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.Adapter);
+            if (tapped) _tapState!.SeqId = i;
+            try
+            {
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.Adapter);
+            }
+            finally
+            {
+                if (tapped) _tapState!.SeqId = 0;
+            }
         }
 
         // Fewer than 2 simple seqs: no batching benefit; just run through per-seq Forward.
@@ -4869,12 +4888,46 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+        => ForwardInner(tokenIds, positions, deviceId, kvCache)
+           ?? throw new DotLLM.Core.Diagnostics.ForwardAbortedException(_tapAbort);
+
+    /// <summary>
+    /// The single-sequence forward; <see langword="null"/> when an abortable hidden-state tap aborted it (#1920, <c>_tapAbort</c> says where).
+    /// With a tap attached, a throwing callback rolls the KV-cache back to its entry length and ends the tap plan, then rethrows (I-1).
+    /// </summary>
+    private ITensor? ForwardInner(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+    {
+        if (_tapState?.Registry.Current is null)
+            return ForwardInnerCore(tokenIds, positions, deviceId, kvCache);
+        int entry = kvCache?.CurrentLength ?? -1;
+        try { return ForwardInnerCore(tokenIds, positions, deviceId, kvCache); }
+        catch
+        {
+            RollbackKvAfterTapFailure(kvCache, entry);
+            _tapState?.End();
+            DpEnd();
+            if (_profActive) ProfEnd(tokenIds.Length);
+            throw;
+        }
+    }
+
+    private ITensor? ForwardInnerCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
     {
         if (tokenIds.Length != positions.Length)
             throw new ArgumentException("tokenIds and positions must have the same length.");
 
         int seqLen = tokenIds.Length;
         if (seqLen == 0) throw new ArgumentException("tokenIds must be non-empty.", nameof(tokenIds));
+
+        var tapState = _tapState;
+        var taps = tapState?.Registry.Current;   // read once: null (nothing attached) is the whole cost of an untapped forward
+        int tapKvEntry = -1;
+        DotLLM.Core.Diagnostics.ForwardAbortInfo tapAbortAt = default;
+        if (taps is not null)
+        {
+            GuardTapForward(seqLen);
+            if (taps.HasAbortable) tapKvEntry = TapKvCheckpoint(kvCache, positions);
+        }
 
         _fwdKvStorage = kvCache is VulkanKvCache { Storage: var kvs } && kvs != VulkanKvStorage.F32 ? kvs : VulkanKvStorage.F32;   // F16 and every block format (#1884)
         if (_fwdKvStorage == VulkanKvStorage.F16 && (_kvF16Writer is null || (_gptOss is null && _attentionKvF16 is null)))
@@ -4915,7 +4968,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         // A compact sliding-window cache (#1176) grows a ring that a long prefill chunk would overflow, here, before recording:
         // the grown buffers are new handles, so cached descriptor sets go stale exactly as on a scratch resize.
         bool kvRingGrown = kvCache is VulkanKvCache { HasCompactWindows: true } ringCache && ringCache.EnsureWindowCapacity(positions);
-        if (scratchResized || kvRingGrown)
+        bool tapStagingGrown = taps is not null && tapState!.Begin(taps, seqLen);
+        if (scratchResized || kvRingGrown || tapStagingGrown)
             InvalidateKernelCaches();
 
         // All-row logits (#564), opt-in: reuse the diffusion all-position head. Its logits buffer is
@@ -5061,6 +5115,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
 
         ProfSample("embed");
         DpStamp(cmdBuf, DpCatEmbed);
+
+        if (taps is not null && !TapAt(tapState!, taps, DotLLM.Core.Diagnostics.HookPoint.PostEmbedding, -1,
+                _state.HiddenState, seqLen - 1, ref cmdBuf, positions, out tapAbortAt))
+            return FinishTapAbort(tapState!, tapAbortAt, kvCache, tapKvEntry, seqLen);
 
         var residualModifier = ResidualModifier;
         for (int layer = 0; layer < Config.NumLayers; layer++)
@@ -5711,6 +5769,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
                 residualModifier.Record(cmdBuf, _state.HiddenState, _firstLayer + layer, seqLen, hiddenSize);
             }
 
+            if (taps is not null && !TapAt(tapState!, taps, DotLLM.Core.Diagnostics.HookPoint.PostLayer, layer,
+                    _state.HiddenState, seqLen - 1, ref cmdBuf, positions, out tapAbortAt))
+                return FinishTapAbort(tapState!, tapAbortAt, kvCache, tapKvEntry, seqLen);
+
             // COMPUTE→COMPUTE between layers — next iteration's first op is
             // the attention RMSNorm, which reads the freshly-rotated
             // HiddenState written by the add.
@@ -5754,6 +5816,22 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         //    runs in TRANSFER, so we need a compute→transfer barrier — a
         //    plain ComputeToComputeBarrier does NOT synchronise transfer
         //    reads against prior compute writes.
+        if (taps is not null)
+        {
+            if (!TapAt(tapState!, taps, DotLLM.Core.Diagnostics.HookPoint.PreFinalNorm, -1,
+                    _state.HiddenState, seqLen - 1, ref cmdBuf, positions, out tapAbortAt))
+                return FinishTapAbort(tapState!, tapAbortAt, kvCache, tapKvEntry, seqLen);
+            // PreLmHead with every row: a dedicated all-row final norm into the NormOutput scratch (the head below overwrites it).
+            if (tapState!.Rows(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1) > 1)
+            {
+                KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+                _rmsnorm.Record(cmdBuf, _state.HiddenState, _weights.OutputNormWeight, _state.NormOutput,
+                    rowCount: seqLen, n: hiddenSize, eps: eps);
+                if (!TapAt(tapState, taps, DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1,
+                        _state.NormOutput, 0, ref cmdBuf, positions, out tapAbortAt))
+                    return FinishTapAbort(tapState, tapAbortAt, kvCache, tapKvEntry, seqLen);
+            }
+        }
         long rowBytes = (long)hiddenSize * sizeof(float);
         long lastRowOffset = (long)(seqLen - 1) * rowBytes;
         BarrierComputeToTransfer(cmdBuf);
@@ -5764,6 +5842,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         _rmsnorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
             rowCount: 1, n: hiddenSize, eps: eps);
         BarrierComputeToCompute(cmdBuf);
+        if (taps is not null && tapState!.Rows(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1) == 1
+            && !TapAt(tapState, taps, DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1,
+                _state.NormOutput, 0, ref cmdBuf, positions, out tapAbortAt))
+            return FinishTapAbort(tapState, tapAbortAt, kvCache, tapKvEntry, seqLen);
 
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
             _state.NormOutput, _state.Logits,
@@ -5798,6 +5880,22 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
             // Mirrors the CPU TransformerModel.ApplyFinalLogitSoftcap; no-op
             // when Config.FinalLogitSoftcap is null or non-positive.
             ApplyFinalLogitSoftcapHost(dest);
+        }
+        if (taps is not null)
+        {
+            try
+            {
+                if (!tapState!.Immediate) tapState.DeliverDeferred(positions);
+            }
+            catch
+            {
+                result.Dispose();
+                throw;
+            }
+            finally
+            {
+                tapState!.End();
+            }
         }
         DpEnd();
         return result;
@@ -10649,6 +10747,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel, IV
         // ForwardBatch scratch — null when batched path was never invoked.
         _batchScratch?.Dispose();
 
+        _tapState?.Dispose();
         _g4mtp?.Dispose();
         _diffusionLogits?.Dispose();
         _diffusionScSig?.Dispose();

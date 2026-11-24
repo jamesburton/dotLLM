@@ -113,7 +113,7 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : ICloverBlock
                 kvCache.Rollback(startPosition);
         }
 
-        var logits = RunOutputHead(T, deviceId);
+        var logits = RunOutputHead(T, deviceId)!;
         MaskOutMaskToken(logits, T, clover.MaskTokenId, Config.VocabSize);
         return logits;
     }

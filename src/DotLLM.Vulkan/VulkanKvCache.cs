@@ -620,6 +620,13 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         Truncate(length);
     }
 
+    /// <inheritdoc/>
+    public bool SupportsAbortRollback => _rows is null;
+
+    /// <inheritdoc/>
+    public bool CanRollbackAfterAppend(int minPos, int maxPos) =>
+        _rows is null || _rows.CanTruncateToAfterAppend(_currentLength, minPos, maxPos);
+
     /// <summary>Resets the visible length. Used when starting a new sequence.</summary>
     public void Reset() => Truncate(0);
 

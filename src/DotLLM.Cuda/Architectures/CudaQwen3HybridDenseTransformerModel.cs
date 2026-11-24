@@ -39,7 +39,7 @@ namespace DotLLM.Cuda.Architectures;
 /// prefill dequant-then-cuBLAS-HGEMM path (seqLen &gt; 1) still stages through F16.
 /// </para>
 /// </remarks>
-public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel, IContextLimitable, IRecurrentPrefixSnapshotProvider, ICudaResidualModifierHost
+public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel, IContextLimitable, IRecurrentPrefixSnapshotProvider, DotLLM.Core.Diagnostics.IHiddenStateTapHost, ICudaResidualModifierHost
 {
     /// <summary>Optional PostLayer residual modifier (#1919): called on the F32 HiddenState after every layer's closing add; a set modifier bypasses the decode graph. Null costs one branch per layer.</summary>
     public ICudaResidualModifier? ResidualModifier { get; set; }
@@ -2102,6 +2102,12 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
                            IMtpState? mtpState)
+        => ForwardCoreTapped(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly, mtpState)
+           ?? throw new DotLLM.Core.Diagnostics.ForwardAbortedException(_tapAbort);
+
+    private ITensor? ForwardCoreInner(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
+                           IMtpState? mtpState)
     {
         // #1786: an uncached forward that starts at position 0 is a new sequence: drop the previous prompt's model-owned
         // GDN + conv state and its row snapshots first (mirrors the CPU host).
@@ -2114,17 +2120,19 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         finally { _dflashCall = null; }
     }
 
-    private ITensor ForwardCoreTiled(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+    private ITensor? ForwardCoreTiled(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
                            CudaMtpState? mtpCapture)
     {
         int chunk = PrefillChunkTokens;
         int total = tokenIds.Length;
+        // A tap that wants every row runs the prefill as one tile (its rows span the whole forward); a Last-row tap fires in the final tile only.
         if (chunk <= 0 || total <= chunk || kvCache is null || !lastTokenLogitsOnly
-            || _rowSnapshotRequestRows > 0)
+            || _rowSnapshotRequestRows > 0 || _tapTs is { AnyAllRows: true })
         {
+            _tapFinalTile = true;
             return ForwardTile(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly,
-                               mtpCapture, produceLogits: true)!;
+                               mtpCapture, produceLogits: true);
         }
 
         ITensor? logits = null;
@@ -2140,9 +2148,15 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
                 // because the capture and absorb live there (issue #1025), so it keeps it and its
                 // one-row logits are dropped when the next tile starts.
                 logits?.Dispose();
+                _tapFinalTile = isFinal;
                 logits = ForwardTile(tokenIds.Slice(offset, len), positions.Slice(offset, len),
                                      deviceId, kvCache, lastTokenLogitsOnly: true,
                                      mtpCapture, produceLogits: isFinal || mtpCapture is not null || _dflashCall is not null);
+                if (_tapAborted)
+                {
+                    logits?.Dispose();
+                    return null;
+                }
             }
             return logits!;
         }
@@ -2248,18 +2262,37 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("setup-embed");
 
         // #1222: a decode step or a short verify runs the whole layer loop as one graph launch.
-        bool graphed = seqLen <= MaxGraphRows && _dflashCall is null && ResidualModifier is null   // #1919: a graph replay never reaches the per-layer PostLayer call
+        // A tap needs the layer boundaries, which a graph launch does not have: the eager loop runs instead (#1920).
+        var ts = _tapTs;
+        var tapAt = default(DotLLM.Core.Diagnostics.ForwardAbortInfo);
+        if (ts is not null && seqLen <= MaxGraphRows && _dflashCall is null && DecodeGraphEligible)
+        {
+            _aheadValid = false;   // a graph captured ahead for the next step no longer matches the state this eager step leaves
+            DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddCudaGraphBypassed();
+            CudaHiddenStateTaps.LogOnce("cuda-graph", "a hidden-state tap is attached: the CUDA decode graph is bypassed and the layer loop runs eagerly.");
+        }
+        bool graphed = ts is null && seqLen <= MaxGraphRows && _dflashCall is null && ResidualModifier is null   // #1919: a graph replay never reaches the per-layer PostLayer call
             && TryForwardDecodeGraph(positions, hiddenSize, numHeads, numKvHeads, headDim, eps, kvCache);
         if (!graphed)
         {
             if (_dflashCall is not null) EnsureDFlashTapPinned(seqLen - DFlashTapFirst(seqLen));
+            nint hs = _state.HiddenState;
+            if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PostEmbedding, -1, _tapFinalTile, seqLen,
+                    hs, sizeof(float), 1f, streamH, out tapAt))
+                return TapAborted(tapAt);
             for (int layer = 0; layer < _layers.Length; layer++)
             {
                 if (_dflashCall is not null) QueueDFlashTap(layer, seqLen);
                 RunSingleLayerBody(layer, seqLen, positions, hiddenSize,
                     numHeads, numKvHeads, headDim, eps, kvCache);
+                if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PostLayer, layer, _tapFinalTile, seqLen,
+                        hs, sizeof(float), 1f, streamH, out tapAt))
+                    return TapAborted(tapAt);
             }
             if (_dflashCall is not null) QueueDFlashTap(_layers.Length, seqLen);
+            if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PreFinalNorm, -1, _tapFinalTile, seqLen,
+                    hs, sizeof(float), 1f, streamH, out tapAt))
+                return TapAborted(tapAt);
         }
 
         // Issue #492: every layer is now queued on the stream and the host has nothing to wait for
@@ -2323,11 +2356,19 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // capture is active. Normalise `normRows` rows, then project the last `logitsRows` of them
         // — the two are independent, so an MTP prefill can also skip the [seqLen, vocab] LM head.
         int normRows = mtpCapture is not null ? seqLen : logitsRows;
+        // A tap that wants every post-norm row (#1920) widens the in-place final norm to all rows, as an MTP capture does.
+        if (ts is not null && ts.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1)
+            && ts.WantsAll(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1))
+            normRows = seqLen;
         nint lastRowPtr = _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
         nint normInput = normRows == seqLen ? _state.HiddenState : lastRowPtr;
         _kernels.LaunchRmsNormF32(normInput, _outputNormDevice, normInput,
             hiddenSize, eps, normRows, streamH);
         nint lmHeadInput = logitsRows == seqLen ? _state.HiddenState : lastRowPtr;
+        // PreLmHead: the post-norm rows, before any Hadamard rotation the head applies (same place as the CPU host).
+        if (ts is not null && !ts.TapSite(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1, _tapFinalTile, seqLen,
+                _state.HiddenState, sizeof(float), 1f, streamH, out tapAt))
+            return TapAborted(tapAt);
 
         // MTP (issues #253, #469): the head consumes llama.cpp's `h_nextn` — the hidden state AFTER
         // output_norm. `normRows == seqLen` whenever a capture is active (issue #493), so every row
@@ -2369,6 +2410,11 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             AbsorbMtp(absorbHead, mtpCapture, tokenIds, positions);
         if (_dflashCall is not null)
             FinishDFlashTaps(positions);   // the logits copy above was synchronous: the taps have landed
+        if (ts is not null && !ts.Immediate)
+        {
+            try { ts.DeliverDeferred(); }   // the synchronize above ended the forward: every staged copy has landed
+            catch { result.Dispose(); throw; }
+        }
 
         return result;
     }
@@ -5338,6 +5384,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         _context.MakeCurrent();
         DisposeDecodeGraph();
         DisposeDFlash();
+        _tapState?.Dispose();
 
         for (int i = 0; i < _layers.Length; i++)
         {

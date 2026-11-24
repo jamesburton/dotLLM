@@ -143,6 +143,35 @@ public sealed class SlidingWindowRows
         return true;
     }
 
+    /// <summary>
+    /// True when the cache could still be cut back to <paramref name="length"/> after positions <paramref name="minPos"/>..<paramref name="maxPos"/>
+    /// are appended: evaluates the compaction <see cref="TryPlan"/> would make for each windowed slot (a conservative upper bound on its
+    /// new base, taking the first write position as the compaction start) without performing it. Abortable hidden-state taps (#1920)
+    /// call it with the entry length before any row is written.
+    /// </summary>
+    /// <param name="length">The length to cut back to (the length at forward entry).</param>
+    /// <param name="minPos">Lowest position about to be written.</param>
+    /// <param name="maxPos">Highest position about to be written.</param>
+    /// <returns>Whether the cut would still be possible after the append.</returns>
+    public bool CanTruncateToAfterAppend(int length, int minPos, int maxPos)
+    {
+        if (length == 0) return true;
+        for (int i = 0; i < _window.Length; i++)
+        {
+            int w = _window[i];
+            if (w == 0) continue;
+            int b = _base[i];
+            if (maxPos - b >= _capacity[i])
+            {
+                int newBase = Math.Max(b, minPos - (w - 1 + Margin));
+                newBase -= newBase % _baseAlignment;
+                b = Math.Max(b, newBase);
+            }
+            if (b > Math.Max(0, length - w + 1)) return false;
+        }
+        return true;
+    }
+
     /// <summary>Most rows a compaction keeps for <paramref name="layer"/> (0 for a full slot): the window, the margin and the alignment slack.</summary>
     /// <param name="layer">Slot index.</param>
     /// <returns>The row bound.</returns>

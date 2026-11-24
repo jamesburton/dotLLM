@@ -437,6 +437,22 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
     }
 
     /// <inheritdoc/>
+    public bool SupportsAbortRollback => _windowSize <= 0 && _rows is null;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// With a full-precision window, appending past the window evicts rows into quantized storage, after which a cut to the entry
+    /// length is wrong (see <see cref="CanTruncateTo"/>); compact sliding-window layers are judged by
+    /// <see cref="SlidingWindowRows.CanTruncateToAfterAppend"/>.
+    /// </remarks>
+    public bool CanRollbackAfterAppend(int minPos, int maxPos)
+    {
+        int newLength = Math.Max(_currentLength, maxPos + 1);
+        if (newLength > _currentLength && _windowSize > 0 && Math.Max(_quantizedLength, newLength - _windowSize) > 0) return false;
+        return _rows?.CanTruncateToAfterAppend(_currentLength, minPos, maxPos) ?? true;
+    }
+
+    /// <inheritdoc/>
     public void Rollback(int length)
     {
         if ((uint)length > (uint)_currentLength)

@@ -130,6 +130,13 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
         if (rows <= FuseMaxSeqLen || rows <= _allRowLogitsLimit || _rowSnapshotRequestRows > 0
             || kvCache is not VulkanNemotronHKvCache || FixedPrefillLayersPerSubmit != 0 || !FuseForwardEnabled)
             return null;
+        if (_tapSnap is not null)
+        {
+            // A tap sees whole forwards: row slices would deliver partial rows (#1920). Counted only where the split would have run.
+            DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddVulkanRowSliceBypassed();
+            VulkanHiddenStateTaps.LogOnce("row-slices", "a hidden-state tap is attached: the long-prefill row-slice split is bypassed (one whole forward).");
+            return null;
+        }
         int kvEnd = VulkanNemotronHKvCache.PositionsEnd(positions);
         int per = _submitBudget.RowsPerForward(rows, kvEnd, ParamsPerLayer, Config.NumAttentionHeads, Config.HeadDim);
         if (per >= rows) return null;

@@ -30,7 +30,7 @@ namespace DotLLM.Models.Architectures;
 /// MoE routing — and the corresponding per-model quant dispatch gaining a <c>PQ2_0</c> arm
 /// (Bonsai's ternary quant type; see <c>MatMul.PQ2S.cs</c>).
 /// </summary>
-public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, DotLLM.Core.Diagnostics.IResidualModifierHost
+public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, DotLLM.Core.Diagnostics.IResidualModifierHost, DotLLM.Core.Diagnostics.IHiddenStateTapHost
 {
     private readonly GgufFile? _gguf; // kept alive; null when built from prebuilt weights
     private readonly Qwen3HybridDenseLayerWeights[] _layers;
@@ -69,6 +69,49 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
     /// (decode, prefill, chunked prefill, batch, verify). Single-threaded per model instance.
     /// </summary>
     public DotLLM.Core.Diagnostics.IResidualModifier? ResidualModifier { get; set; }
+
+    // ── Hidden-state taps (#1920) ─────────────────────────────────────────────
+    private readonly DotLLM.Core.Diagnostics.HiddenStateTapRegistry _taps;
+    private int _tapStep;       // forwards that ran with a tap attached
+    private int _tapSeqId;      // sequence index reported in samples (ForwardBatch sets it per request)
+
+    /// <inheritdoc/>
+    public IDisposable RegisterTap(DotLLM.Core.Diagnostics.HiddenStateTapSubscription subscription, Action<DotLLM.Core.Diagnostics.HiddenStateSample> onSample)
+    {
+        ArgumentNullException.ThrowIfNull(onSample);
+        return _taps.Register(subscription, onSample, null);
+    }
+
+    /// <inheritdoc/>
+    public IDisposable RegisterAbortableTap(DotLLM.Core.Diagnostics.HiddenStateTapSubscription subscription,
+                                            Func<DotLLM.Core.Diagnostics.HiddenStateSample, DotLLM.Core.Diagnostics.HookResult> onSample)
+    {
+        ArgumentNullException.ThrowIfNull(onSample);
+        return _taps.Register(subscription, null, onSample);
+    }
+
+    /// <inheritdoc/>
+    public IDisposable RegisterAbortableTap(DotLLM.Core.Diagnostics.HiddenStateTapSubscription subscription,
+                                            Func<DotLLM.Core.Diagnostics.HiddenStateSample, DotLLM.Core.Diagnostics.HookResult> onSample,
+                                            DotLLM.Core.Attention.IKvCache cache)
+    {
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.ThrowIfCacheCannotAbort(cache);
+        return RegisterAbortableTap(subscription, onSample);
+    }
+
+    /// <inheritdoc/>
+    public bool TryForward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
+                           out ITensor? logits, out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+    {
+        logits = ForwardOrAbort(tokenIds, positions, deviceId, kvCache, null, null, false, out abort);
+        return logits is not null;
+    }
+
+    private unsafe bool DispatchTap(DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot taps, DotLLM.Core.Diagnostics.HookPoint point,
+                                    int layer, float* rows, int rowCount, int rowOffset, ReadOnlySpan<int> positions,
+                                    out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+        => taps.Dispatch(point, layer, new ReadOnlySpan<float>(rows, rowCount * Config.HiddenSize), rowCount, rowOffset,
+                         Config.HiddenSize, positions, _tapSeqId, _tapStep - 1, out abort);
 
     private unsafe void ApplyResidualModifier(DotLLM.Core.Diagnostics.IResidualModifier modifier, int layer, float* hidden, int seqLen)
     {
@@ -117,6 +160,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         Config = config;
         _gguf = gguf;
         _layers = layers;
+        _taps = new DotLLM.Core.Diagnostics.HiddenStateTapRegistry(layers.Length);
         _outputNormWeight = outputNormWeight;
         _mtpHead = mtpHead;
         _tokenEmbedWeight = tokenEmbedWeight;
@@ -1029,10 +1073,90 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         => Forward(tokenIds, positions, deviceId, kvCache, gdnState: null, mtpState, lastTokenLogitsOnly);
 
     /// <summary>The trunk implementation behind every public <c>Forward</c> overload on this class.</summary>
+    /// <exception cref="DotLLM.Core.Diagnostics.ForwardAbortedException">An abortable hidden-state tap aborted the pass (KV and recurrent state already restored).</exception>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState,
                            bool lastTokenLogitsOnly)
+        => ForwardOrAbort(tokenIds, positions, deviceId, kvCache, gdnState, mtpState, lastTokenLogitsOnly, out var abort)
+           ?? throw new DotLLM.Core.Diagnostics.ForwardAbortedException(abort);
+
+    /// <summary>Runs the trunk; null (with <paramref name="abort"/>) when an abortable tap aborted. One null check when no tap is attached.</summary>
+    private ITensor? ForwardOrAbort(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                    int deviceId, IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState,
+                                    bool lastTokenLogitsOnly, out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
     {
+        var taps = _taps.Current;
+        if (taps is null)
+            return ForwardTrunk(tokenIds, positions, deviceId, kvCache, gdnState, mtpState, lastTokenLogitsOnly, null, out abort);
+        return ForwardWithTaps(taps, tokenIds, positions, deviceId, kvCache, gdnState, mtpState, lastTokenLogitsOnly, out abort);
+    }
+
+    private ITensor? ForwardWithTaps(DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot taps,
+                                     ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                     int deviceId, IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState,
+                                     bool lastTokenLogitsOnly, out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+    {
+        DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddTapForward();
+        _tapStep++;
+        bool abortable = taps.HasAbortable;
+        int kvEntry = kvCache?.CurrentLength ?? -1;   // every tapped forward records it (free): a throwing callback must not leave KV half-advanced
+        GdnStateCache target = gdnState as GdnStateCache ?? _gdnCache;
+        if (abortable)
+        {
+            // Abortable: an abort must leave the model exactly as it was at entry. MTP/DFlash state is updated after the trunk and is not
+            // checkpointed, so that combination is refused rather than corrupted (a read-only tap with MTP is fine on every backend).
+            if (mtpState is not null)
+                throw new NotSupportedException("An abortable hidden-state tap cannot be combined with an MTP/DFlash state on this forward.");
+            // Pending verify-row snapshots (MTP/DFlash verify, before RestoreRecurrentStateToRow) must survive: refuse instead of committing them.
+            if (ReferenceEquals(target, _gdnCache) && _rowSnapshotValidRows > 0)
+                throw new NotSupportedException(
+                    "An abortable hidden-state tap cannot start while verify-row snapshots are pending (RestoreRecurrentStateToRow has not run): "
+                    + "the entry checkpoint would commit the rejected draft rows. Nothing was modified.");
+            kvEntry = DotLLM.Core.Diagnostics.AbortableTapKvGuard.Checkpoint(kvCache, positions);
+        }
+        // Entry checkpoint of the GDN state: always for an abortable tap; for a read-only tap too (so a throwing callback leaves
+        // recurrent state consistent with the rolled-back KV), except with an MTP state or pending verify rows, which a checkpoint
+        // cannot cover. Tapped forwards already leave the fused/graph paths, so one state copy per forward is the cheap side.
+        bool takeCkpt = abortable || (mtpState is null && !(ReferenceEquals(target, _gdnCache) && _rowSnapshotValidRows > 0));
+        PooledGdnCheckpoint? checkpoint = takeCkpt ? TakeGdnCheckpoint(target) : null;
+        if (abortable) DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortCheckpoint();
+        try
+        {
+            var result = ForwardTrunk(tokenIds, positions, deviceId, kvCache, gdnState, mtpState, lastTokenLogitsOnly, taps, out abort);
+            if (result is null)
+            {
+                if (kvCache is not null) kvCache.Rollback(kvEntry);
+                checkpoint?.Snapshot.CopyTo(target);
+                if (ReferenceEquals(target, _gdnCache)) _rowSnapshotValidRows = 0;
+                DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddAbortedForward();
+            }
+            return result;
+        }
+        catch
+        {
+            // A throwing tap callback (or any failure on the tapped path): restore KV and recurrent state to forward entry, rethrow.
+            if (kvCache is not null && kvEntry >= 0 && kvCache.CurrentLength > kvEntry)
+            {
+                try { kvCache.Rollback(kvEntry); }
+                catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException) { /* windowed read-only cache: best effort */ }
+            }
+            if (checkpoint is not null)
+            {
+                checkpoint.Snapshot.CopyTo(target);
+                if (ReferenceEquals(target, _gdnCache)) _rowSnapshotValidRows = 0;
+            }
+            throw;
+        }
+        finally { checkpoint?.Dispose(); }
+    }
+
+    private ITensor? ForwardTrunk(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                  int deviceId, IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState,
+                                  bool lastTokenLogitsOnly,
+                                  DotLLM.Core.Diagnostics.HiddenStateTapRegistry.Snapshot? taps,
+                                  out DotLLM.Core.Diagnostics.ForwardAbortInfo abort)
+    {
+        abort = default;
         // Resolve the GDN state: caller-supplied container preferred, model-owned
         // fallback for the single-seq Forward callers that pre-date the per-seq API.
         // The fallback is unsafe across multi-seq batched dispatch — that path is
@@ -1105,6 +1229,10 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         if (TensorDump.Enabled)
             TensorDump.Dump2D("token_embd", hidden, seqLen, hiddenSize);
 
+        if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PostEmbedding, -1)
+            && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PostEmbedding, -1, hidden, seqLen, 0, positions, out abort))
+            return null;
+
         var kinds = _layout.LayerKind;
         var residualModifier = ResidualModifier;
         // DFlash (#1175): the drafter conditions on these layers' inputs; only the rows its context ring can hold are kept.
@@ -1176,6 +1304,9 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
             // PostLayer residual modifier (#1711): same convention as TransformerModel (after layer L's output, GDN and attention layers alike).
             if (residualModifier is not null)
                 ApplyResidualModifier(residualModifier, layer, hidden, seqLen);
+            if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PostLayer, layer)
+                && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PostLayer, layer, hidden, seqLen, 0, positions, out abort))
+                return null;
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.l_out", hidden, seqLen, hiddenSize);
         }
@@ -1183,13 +1314,21 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         if (dflashTaps is not null)
             CaptureDFlashTaps(dflashTaps, _layers.Length, hidden, tapFirst, seqLen, hiddenSize);
 
+        if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreFinalNorm, -1)
+            && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PreFinalNorm, -1, hidden, seqLen, 0, positions, out abort))
+            return null;
+
         // Final output norm + logit projection. MTP capture reads every post-norm row, so only a head without capture
         // may skip the norm of the rows it will not project (#1485).
         bool lastOnly = lastTokenLogitsOnly && seqLen > 1;
         int headRows = lastOnly ? 1 : seqLen;
         CpuMtpState? mtpCapture = mtpState as CpuMtpState;
         bool captureMtp = mtpCapture is not null && _mtpHead is not null;
-        int firstNorm = lastOnly && !captureMtp ? seqLen - 1 : 0;
+        // PreLmHead + TapRows.All means every trunk row of the forward on every backend (#1920 M-1), even when the head projects only the
+        // last one: such a tap forces the all-row norm (only while attached).
+        bool tapAllPre = taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1)
+                         && taps.WantsAllRows(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1);
+        int firstNorm = lastOnly && !captureMtp && !tapAllPre ? seqLen - 1 : 0;
         for (int t = firstNorm; t < seqLen; t++)
         {
             RmsNorm.Execute(
@@ -1199,6 +1338,13 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         }
         if (TensorDump.Enabled)
             TensorDump.Dump2D("result_norm", hidden, seqLen, hiddenSize);
+
+        // PreLmHead (#1920): the post-norm rows (Last: the last row; All: every trunk row, see tapAllPre above).
+        int preRows = tapAllPre ? seqLen : headRows;
+        if (taps is not null && taps.Wants(DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1)
+            && !DispatchTap(taps, DotLLM.Core.Diagnostics.HookPoint.PreLmHead, -1,
+                            hidden + (long)(seqLen - preRows) * hiddenSize, preRows, seqLen - preRows, positions, out abort))
+            return null;
 
         // MTP (issues #253, #469): capture the POST-final-norm hidden state for every position —
         // llama.cpp's `h_nextn`, taken after output_norm and before the lm_head (and before the
@@ -1404,9 +1550,14 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
     public object? CheckpointRecurrentState()
     {
         CommitPendingRows();
+        return TakeGdnCheckpoint(_gdnCache);
+    }
+
+    private PooledGdnCheckpoint TakeGdnCheckpoint(GdnStateCache source)
+    {
         GdnStateCache snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null)
             ?? new GdnStateCache(_gdn, _gdnCache.NumGdnLayers);
-        _gdnCache.CopyTo(snapshot);
+        source.CopyTo(snapshot);
         return new PooledGdnCheckpoint(this, snapshot);
     }
 
@@ -1639,11 +1790,23 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
                     "Re-issue the request without an adapter.");
         }
 
+        DotLLM.Core.Diagnostics.AbortableTapKvGuard.RefuseAbortableBatch(_taps.Current);
         var results = new ITensor[requests.Count];
-        for (int i = 0; i < requests.Count; i++)
+        int done = 0;
+        try
         {
-            var r = requests[i];
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState, null, r.LastTokenLogitsOnly);
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var r = requests[i];
+                _tapSeqId = i;
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState, null, r.LastTokenLogitsOnly);
+                done++;
+            }
+        }
+        catch
+        {
+            for (int d = 0; d < done; d++) results[d].Dispose();   // do not leak the completed requests' logits
+            throw;
         }
         return results;
     }
