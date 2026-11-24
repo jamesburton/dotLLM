@@ -440,8 +440,8 @@ public sealed class ChunkStoreServerTests : IDisposable
     }
 
     /// <summary>
-    /// Re-review C1: a request naming a per-request LoRA adapter is not served base-model chunks. On the wire: a stored
-    /// chunk the same request hits without the adapter is ignored with <c>chunk_model_unsupported</c> (chat and explain), an
+    /// Re-review C1 (#1915): a request naming a per-request LoRA adapter is not served base-model chunks. On the wire: a stored
+    /// chunk the same request hits without the adapter is a miss under the adapter's identity (chat and explain), an
     /// unknown adapter is a 400 on both routes, and the refusal is per request (the next plain request hits again).
     /// </summary>
     [Fact]
@@ -465,15 +465,15 @@ public sealed class ChunkStoreServerTests : IDisposable
         Assert.Equal(200, status);
         var report = Report(adapted);
         Assert.Equal(0, report["chunks"]!["hit"]!.GetValue<int>());
-        Assert.Equal(1, report["chunks"]!["ignored"]!.GetValue<int>());
-        Assert.Equal(1, WarningCount(report, ChunkCacheCodes.ModelUnsupported));
+        Assert.Equal(1, report["chunks"]!["miss"]!.GetValue<int>()); // looked up under the adapter's own identity (#1915): a miss, not a refusal
+        Assert.Null(WarningCount(report, ChunkCacheCodes.ModelUnsupported));
 
         var (es, explained) = await server.PostAsync(ExplainRoute, Explain(WithAdapter(Body(Manifest("shadow")), "style")));
         Assert.Equal(200, es);
         var e = JsonNode.Parse(explained)!;
         Assert.Equal(0, e["counts"]!["hit"]!.GetValue<int>());
-        Assert.Equal(1, e["counts"]!["ignored"]!.GetValue<int>());
-        Assert.Contains(ChunkCacheCodes.ModelUnsupported, e["warnings"]!.AsArray().Select(w => w!.GetValue<string>()));
+        Assert.Equal(1, e["counts"]!["miss"]!.GetValue<int>());
+        Assert.DoesNotContain(ChunkCacheCodes.ModelUnsupported, e["warnings"]!.AsArray().Select(w => w!.GetValue<string>()));
         var (_, explainedPlain) = await server.PostAsync(ExplainRoute, Explain(Body(Manifest("shadow"))));
         Assert.Equal(1, JsonNode.Parse(explainedPlain)!["counts"]!["hit"]!.GetValue<int>()); // control: explain without it hits
 
@@ -497,7 +497,7 @@ public sealed class ChunkStoreServerTests : IDisposable
             Assert.Equal(200, status);
             Assert.Null(WarningCount(Report(body), ChunkCacheCodes.EncodeQueued));
             Assert.Null(WarningCount(Report(body), ChunkCacheCodes.EncodeSkipped));
-            Assert.Equal(1, WarningCount(Report(body), ChunkCacheCodes.ModelUnsupported));
+            Assert.Null(WarningCount(Report(body), ChunkCacheCodes.ModelUnsupported));
         }
         Assert.Equal(0, Writer(server).Sightings.Count);
 
