@@ -107,7 +107,8 @@ public sealed class CudaF16FlashPrefillTests
 
         bool g3 = CudaG3Attention.Enabled, flash = CudaFlashAttention.Enabled, f16Flash = CudaTransformerModel.EnableF16FlashPrefill;
         List<float[]> exact, fresh, g3Arm;
-        long flashLaunches, offsetRuns, scalarPrefills, g3OffsetRuns, exactScalar;
+        long flashLaunches, offsetRuns, scalarPrefills;
+        long? g3OffsetRuns, exactScalar;   // null = that arm came from the cache, so its launch counts are not re-checked
         try
         {
             CudaG3Attention.Enabled = false;
@@ -115,13 +116,13 @@ public sealed class CudaF16FlashPrefillTests
             CudaTransformerModel.EnableF16FlashPrefill = false;
             long e0 = CudaKernels.AttentionF16PrefillLaunches;
             exact = Cached("exact", prompt, () => Run(model, kv, prompt), out bool exactCached);
-            exactScalar = exactCached ? layers * forwards : CudaKernels.AttentionF16PrefillLaunches - e0;
+            exactScalar = exactCached ? null : CudaKernels.AttentionF16PrefillLaunches - e0;
 
             CudaG3Attention.Enabled = g3;
             CudaFlashAttention.Enabled = flash;
             long g0 = CudaG3Attention.OffsetRunCount;
             g3Arm = Cached("g3", prompt, () => Run(model, kv, prompt), out bool g3Cached);
-            g3OffsetRuns = g3Cached ? layers * Rows : CudaG3Attention.OffsetRunCount - g0;
+            g3OffsetRuns = g3Cached ? null : CudaG3Attention.OffsetRunCount - g0;
             if (exactCached || g3Cached) _out.WriteLine($"exact arm cached: {exactCached}, G3 arm cached: {g3Cached} (launch counts not re-checked)");
 
             CudaTransformerModel.EnableF16FlashPrefill = true;
@@ -147,7 +148,8 @@ public sealed class CudaF16FlashPrefillTests
         _out.WriteLine($"prompt {prompt.Length} tokens: prefix {prefix} in chunks of {Chunk}, then {Rows} windows of {Window}; " +
                        $"{forwards} forwards per arm");
         _out.WriteLine($"F16 flash launches {flashLaunches}, G3 offset runs {offsetRuns}, attention_f16 prefill launches {scalarPrefills}; " +
-                       $"G3 arm offset runs {g3OffsetRuns}; exact arm attention_f16 prefill launches {exactScalar}");
+                       $"G3 arm offset runs {g3OffsetRuns?.ToString() ?? "cached"}; exact arm attention_f16 prefill launches " +
+                       $"{exactScalar?.ToString() ?? "cached"}");
         _out.WriteLine($"KL(exact||flash) over the last {Rows} rows: median {Median(kl):E3} max {kl.Max():E3}; " +
                        $"KL(exact||G3) median {Median(klG3):E3} max {klG3.Max():E3}");
         _out.WriteLine($"first-token logprob: exact {lpExact:R}, flash {lpFresh:R}, G3 {LogProb(g3Arm[^1], next):R}; " +
@@ -175,23 +177,36 @@ public sealed class CudaF16FlashPrefillTests
         Assert.Equal(layers * forwards, flashLaunches);
         Assert.Equal(0, offsetRuns);
         Assert.Equal(0, scalarPrefills);
-        Assert.True(g3OffsetRuns >= layers * Rows, $"the G3 reference arm ran its offset path only {g3OffsetRuns} times");
-        Assert.True(exactScalar >= layers * forwards, $"the exact arm ran attention_f16 only {exactScalar} times");
+        if (g3OffsetRuns is { } g3Runs)
+            Assert.True(g3Runs >= layers * Rows, $"the G3 reference arm ran its offset path only {g3Runs} times");
+        if (exactScalar is { } exactRuns)
+            Assert.True(exactRuns >= layers * forwards, $"the exact arm ran attention_f16 only {exactRuns} times");
         Assert.True(Math.Abs(lpFresh - lpExact) < 0.01, $"first-token logprob moved {lpFresh - lpExact:R}");
         // James 2026-11-21: relative gate, median <= 1e-5 and max <= max(1e-3, 1.25 x G3 max), over the last 256 rows.
         Assert.True(Median(kl) <= 1e-5, $"median KL(exact||flash) {Median(kl)}");
         Assert.True(kl.Max() <= Math.Max(1e-3, 1.25 * klG3.Max()), $"max KL(exact||flash) {kl.Max()} vs G3 {klG3.Max()}");
     }
 
-    /// <summary>An arm that does not depend on the flash kernel, stored under DOTLLM_F16_FLASH_KL_CACHE (keyed by the prompt).</summary>
+    /// <summary>
+    /// Stable cache key (#1943 review I3): SHA-256 over the arm, the prompt token bytes, the GGUF's full path, size and last-write
+    /// time, and the row / window shape. (System.HashCode is seeded per process, so it never hit across runs.)
+    /// </summary>
+    private static string CacheKey(string arm, int[] prompt)
+    {
+        var gguf = new FileInfo(FindGguf()!);
+        using var sha = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+        sha.AppendData(System.Text.Encoding.UTF8.GetBytes($"{arm}|{gguf.FullName}|{gguf.Length}|{gguf.LastWriteTimeUtc.Ticks}|r{Rows}|w{Window}|"));
+        sha.AppendData(System.Runtime.InteropServices.MemoryMarshal.AsBytes(prompt.AsSpan()));
+        return Convert.ToHexString(sha.GetHashAndReset(), 0, 8).ToLowerInvariant();
+    }
+
+    /// <summary>An arm that does not depend on the flash kernel, stored under DOTLLM_F16_FLASH_KL_CACHE (keyed by <see cref="CacheKey"/>).</summary>
     private static List<float[]> Cached(string arm, int[] prompt, Func<List<float[]>> run, out bool hit)
     {
         hit = false;
         string? dir = Environment.GetEnvironmentVariable("DOTLLM_F16_FLASH_KL_CACHE");
         if (string.IsNullOrEmpty(dir)) return run();
-        var h = new System.HashCode();
-        foreach (int t in prompt) h.Add(t);
-        string path = Path.Combine(dir, $"qwen3-4b-{arm}-{prompt.Length}-{(uint)h.ToHashCode():x8}-r{Rows}.bin");
+        string path = Path.Combine(dir, $"qwen3-4b-{arm}-{prompt.Length}-{CacheKey(arm, prompt)}.bin");
         if (File.Exists(path))
         {
             using var br = new BinaryReader(File.OpenRead(path));

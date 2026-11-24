@@ -60,6 +60,10 @@ public sealed unsafe partial class CudaAttentionKvqTests
     public void FlashPrefillE4_VariantSweep()
     {
         var builds = LoadE4Builds();
+        // #1943 review I1: judge every build on its E4 body. Without this the occupancy choice hands some shapes (hd64 f16 group 7 on
+        // sm_86) to the _legacy twin and every mutant is inert there. Builds without twins (the pre-E4 base) are unaffected.
+        bool? savedOverride = CudaKernels.FlashPrefillKvqLegacyBodyOverride;
+        CudaKernels.FlashPrefillKvqLegacyBodyOverride = false;
         try
         {
             var failures = builds.ToDictionary(b => b.Name, _ => new List<string>());
@@ -131,6 +135,7 @@ public sealed unsafe partial class CudaAttentionKvqTests
         }
         finally
         {
+            CudaKernels.FlashPrefillKvqLegacyBodyOverride = savedOverride;
             foreach (var b in builds) b.Dispose();
         }
     }
@@ -215,7 +220,15 @@ public sealed unsafe partial class CudaAttentionKvqTests
         F16FlashCases().Select(c => new object[] { "F16", c[0], c[1], c[2], c[3], c[4] })
             .Concat(FlashCases().Select(c => new object[] { $"{c[0]}/{c[1]}", c[2], c[3], c[4], c[5], c[6] }))
             .Append(new object[] { "F16", 128, 28, 4, 1000, 291 })          // group 7 hd128 (Qwen2.5-7B shape)
-            .Append(new object[] { "Q8_0/Q4_0", 128, 28, 4, 33, 1024 });
+            .Append(new object[] { "Q8_0/Q4_0", 128, 28, 4, 33, 1024 })
+            // #1943 review I1: group 1 (MHA; E4 on every GPU, and one warp owns every staged row group) and hd64 at the groups that
+            // run E4 in production on sm_86 (4-5), plus hd64 group 8.
+            .Append(new object[] { "F16", 128, 32, 32, 33, 291 })
+            .Append(new object[] { "Q8_0/Q8_0", 128, 8, 8, 40, 4057 })
+            .Append(new object[] { "Q4_0/Q8_0", 64, 4, 4, 47, 2002 })
+            .Append(new object[] { "F16", 64, 16, 4, 1000, 291 })
+            .Append(new object[] { "Q8_0/Q8_0", 64, 20, 4, 45, 70 })          // hd64 group 5
+            .Append(new object[] { "F16", 64, 32, 4, 33, 0 });                 // hd64 group 8
 
     [SkippableTheory]
     [MemberData(nameof(E4BodyCases))]
@@ -267,5 +280,7 @@ public sealed unsafe partial class CudaAttentionKvqTests
         // hd128 F16 entry index = 1 * 5 + 4.
         Assert.False(_kernels.UseFlashPrefillKvqLegacy(9, 128, 4), "group 4 (Qwen3-4B) must run the E4 body");
         Assert.True(_kernels.UseFlashPrefillKvqLegacy(9, 128, 7), "group 7 hd128 fits 2 legacy blocks vs 1 E4 block per SM");
+        // The tie (1 vs 1 block per SM) must go to E4: pins `>` rather than `>=` (review M2).
+        Assert.False(_kernels.UseFlashPrefillKvqLegacy(9, 128, 8), "group 8 hd128 ties (1/1), so it must run the E4 body");
     }
 }
