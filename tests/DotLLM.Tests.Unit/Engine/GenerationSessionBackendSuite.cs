@@ -14,7 +14,7 @@ namespace DotLLM.Tests.Unit.Engine;
 /// <see cref="Open"/>: CPU always, Vulkan when a device is present, CUDA only where a CUDA GPU is (written, not run, on the
 /// Strix Halo dev box). Families: attention-only Llama, GDN-hybrid dense, GDN-hybrid MoE.
 /// </summary>
-public abstract class GenerationSessionBackendSuite
+public abstract partial class GenerationSessionBackendSuite
 {
     internal abstract GenerationSessionFixture Open(string family, int? headDim = null);
 

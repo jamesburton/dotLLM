@@ -1,7 +1,9 @@
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Constraints;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
+using DotLLM.Engine.Constraints;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.Engine;
@@ -16,7 +18,9 @@ public sealed partial class TextGenerator
     /// append observation tokens, roll back, all without re-prefilling the committed prefix.
     /// </summary>
     /// <param name="options">Sampling options (temperature, seed, penalties) and the per-segment <see cref="InferenceOptions.MaxTokens"/>.
-    /// <see cref="InferenceOptions.ResponseFormat"/> is not supported here. <see cref="InferenceOptions.RepeatGuardLimit"/> follows the plain generator
+    /// <see cref="InferenceOptions.ResponseFormat"/> (when not Text) builds the session's initial constraint exactly as <c>Generate</c> does
+    /// (JSON object, schema, regex, grammar); <see cref="GenerationSession.SetConstraint"/> replaces it later.
+    /// <see cref="InferenceOptions.RepeatGuardLimit"/> follows the plain generator
     /// (the limit-th identical sampled token in a row ends the segment, token kept, <see cref="FinishReason.Length"/>); the run survives pauses and
     /// rollback restores it, but an observation append or prefill ends it (intended: those tokens are supplied, not sampled).</param>
     /// <param name="provenanceTag">Identity of the weights, tokenizer, precision, modifiers and knowledge the session's cached state belongs to.</param>
@@ -43,8 +47,6 @@ public sealed partial class TextGenerator
         if (maxContextTokens > modelMax)
             throw new ArgumentOutOfRangeException(nameof(maxContextTokens), maxContextTokens, $"Exceeds the model's maximum sequence length of {modelMax}.");
         ThrowIfOptionsUnsupported(options);
-        if (options.ResponseFormat is not null and not ResponseFormat.Text)
-            throw new NotSupportedException("GenerationSession does not support options.ResponseFormat; constrain it with SetConstraint (issue #1921).");
         // Hold the generation gate across check + owner registration + state reset so a concurrent Generate cannot slip in between (#1931 review M-1).
         if (!_generationGate.Wait(0))
             throw new InvalidOperationException("A Generate call is running on this generator; open the session when it has finished.");
@@ -91,8 +93,9 @@ public sealed partial class TextGenerator
             int ceiling = maxContextTokens > 0 ? maxContextTokens : modelMax;
             kv = AllocateKvCache(size);
             if (recurrent) _model.ResetSequenceState();   // a previous request left model-owned state behind
+            IDecodingConstraint? initial = CreateResponseConstraint(options.ResponseFormat);
             return new GenerationSession(this, options, provenanceTag, currentProvenance, kv, ceiling,
-                checkpointBudgetBytes > 0 ? checkpointBudgetBytes : GenerationSession.DefaultCheckpointBudgetBytes);
+                checkpointBudgetBytes > 0 ? checkpointBudgetBytes : GenerationSession.DefaultCheckpointBudgetBytes, initial);
         }
         catch
         {

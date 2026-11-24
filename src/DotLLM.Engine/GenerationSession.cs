@@ -3,9 +3,11 @@ using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Engine.KvCache;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Constraints;
 using DotLLM.Core.Models;
 using DotLLM.Core.Sampling;
 using DotLLM.Core.Tensors;
+using DotLLM.Engine.Constraints;
 using DotLLM.Engine.Samplers;
 using DotLLM.Engine.Samplers.StopConditions;
 using DotLLM.Tokenizers;
@@ -57,6 +59,10 @@ public sealed class GenerationSession : IAsyncDisposable
     private bool _faulted;
     private readonly int _maxContext;    // hard KV capacity ceiling the session may grow to
     private readonly Func<CacheProvenanceTag>? _currentProvenance;
+    private IDecodingConstraint? _constraint;
+    private int _attachPos;                                   // position the active constraint was attached at (its parse state starts here)
+    private readonly List<(int Pos, int Token)> _sampled = new();   // tokens SAMPLED (not observed/prefilled) since attach, for exact rollback replay
+    private bool _constraintBroken;                           // an Advance threw after its token was committed: the parse state is stale
 
     /// <summary>Most boundary records (position, recurrent checkpoint, logits) a recurrent session keeps; the oldest are evicted.</summary>
     public const int MaxRollbackBoundaries = 16;
@@ -87,8 +93,10 @@ public sealed class GenerationSession : IAsyncDisposable
     }
 
     internal GenerationSession(TextGenerator owner, InferenceOptions options, CacheProvenanceTag tag,
-        Func<CacheProvenanceTag>? currentProvenance, IKvCache kv, int maxContext, long checkpointBudgetBytes)
+        Func<CacheProvenanceTag>? currentProvenance, IKvCache kv, int maxContext, long checkpointBudgetBytes, IDecodingConstraint? initialConstraint = null)
     {
+        _constraint = initialConstraint;
+        _attachPos = 0;
         _maxContext = Math.Max(maxContext, kv.MaxLength);
         _currentProvenance = currentProvenance;
         _owner = owner;
@@ -119,6 +127,38 @@ public sealed class GenerationSession : IAsyncDisposable
 
     /// <summary>Number of tokens committed to the session; equals the KV length at every pause.</summary>
     public int CurrentPosition => _position;
+
+    /// <summary>The constraint masking sampled tokens (null = unconstrained). Replaced by <see cref="SetConstraint"/>.</summary>
+    public IDecodingConstraint? ActiveConstraint => _constraint;
+
+    /// <summary>
+    /// Installs <paramref name="constraint"/> (null = unconstrained) for the tokens this session samples from now on. Legal at any pause
+    /// (between operations); throws <see cref="InvalidOperationException"/> while an operation is in flight, after a provenance change or when faulted,
+    /// and <see cref="ObjectDisposedException"/> after disposal.
+    /// <para>The session calls <see cref="IDecodingConstraint.Reset"/> on the supplied instance (so no parser state of an earlier use leaks) and
+    /// <b>takes ownership</b> of it: do not advance, reset or share it with another session or generator while it is active.
+    /// KV, recurrent state, boundary records and next-token logits are untouched, so nothing of the committed prefix is re-prefilled.</para>
+    /// <para>The constraint advances only on tokens the session samples and commits; prompt and observation tokens never advance it.
+    /// <see cref="RollbackTo"/> that discards tokens rebuilds the active constraint by exact replay of the tokens sampled since it was attached
+    /// (rule below), so the parse state always matches the retained tokens; call <see cref="SetConstraint"/> to attach a different one.</para>
+    /// <para>Rollback rule (exact): the session records the position the constraint was attached at and the tokens it sampled since. <c>RollbackTo(k)</c>
+    /// resets the constraint and re-advances it over exactly the sampled tokens at positions <c>[attachPos, k)</c>; observation and prefill tokens are never
+    /// re-advanced (they never were), and <c>k &lt;= attachPos</c> simply leaves it fresh. No forward pass is needed.</para>
+    /// <para>The session never disposes a constraint: the caller keeps ownership of its disposal; the session only resets it.</para>
+    /// </summary>
+    public void SetConstraint(IDecodingConstraint? constraint)
+    {
+        Begin();
+        try
+        {
+            constraint?.Reset();
+            _constraint = constraint;
+            _attachPos = _position;
+            _sampled.Clear();
+            _constraintBroken = false;
+        }
+        finally { End(); }
+    }
 
     /// <summary>The provenance the session's cached state was created under.</summary>
     public CacheProvenanceTag ProvenanceTag { get; }
@@ -229,8 +269,14 @@ public sealed class GenerationSession : IAsyncDisposable
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     if (!EnsureCapacity(_position + 1)) { finish = FinishReason.Length; break; }
+                    if (_constraintBroken)
+                        throw new InvalidOperationException("The active constraint failed to advance on a committed token and its state is stale; roll back to before that token or call SetConstraint again.");
+                    // Satisfied and permitting only EOS: nothing left to sample (TextGenerator stops here too).
+                    if (_constraint is not null && _owner.ConstraintIsTerminal(_constraint)) { finish = FinishReason.ConstraintComplete; break; }
 
                     _nextLogits.CopyTo(_sampleScratch, 0);
+                    if (_constraint is not null)
+                        TokenMaskApplier.Apply(_sampleScratch, _constraint.GetAllowedTokens());
                     int token = _pipeline.Sample(_sampleScratch, _committed);
                     generated.Add(token);
                     detok.Append(token);
@@ -248,8 +294,15 @@ public sealed class GenerationSession : IAsyncDisposable
                         break;
                     }
 
+                    int tokenPos = _position;
                     CommitAndForward(token);
                     if (_repeatGuard is not null) _runAt[_position] = _repeatGuard.State.Run;
+                    if (_constraint is not null)
+                    {
+                        _sampled.Add((tokenPos, token));
+                        try { _constraint.Advance(token); }
+                        catch { _constraintBroken = true; throw; }   // token is committed; refuse constrained sampling until rollback/SetConstraint repairs it
+                    }
                     if (result != StopResult.Continue)
                     {
                         finish = result == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
@@ -392,6 +445,7 @@ public sealed class GenerationSession : IAsyncDisposable
                 DropBoundariesAfter(-1);
                 _position = 0;
                 _logitsPos = -1;
+                RebuildConstraint(0);
                 _faulted = false;
                 return;
             }
@@ -405,6 +459,7 @@ public sealed class GenerationSession : IAsyncDisposable
                 _logitsPos = tokenPosition;
                 _position = tokenPosition;
                 DropBoundariesAfter(tokenPosition);
+                RebuildConstraint(tokenPosition);
                 return;
             }
 
@@ -424,6 +479,7 @@ public sealed class GenerationSession : IAsyncDisposable
                 // cleanly at last (KV length == position) with no next-token logits: append history[last] again, or roll back further.
                 _position = last;
                 _logitsPos = -1;
+                RebuildConstraint(last);
                 throw;
             }
             catch
@@ -432,6 +488,7 @@ public sealed class GenerationSession : IAsyncDisposable
                 throw;
             }
             _position = tokenPosition;
+            RebuildConstraint(tokenPosition);
         }
         finally { SyncGuard(); End(); }
     }
@@ -442,6 +499,24 @@ public sealed class GenerationSession : IAsyncDisposable
         if (_repeatGuard is null) return;
         int run = _position == 0 ? 0 : _runAt[_position];
         _repeatGuard.Restore(run == 0 ? -1 : _history[_position - 1], run);
+    }
+
+    /// <summary>
+    /// Puts the active constraint in the state it had at <paramref name="k"/>: reset, then re-advance over the tokens sampled in
+    /// <c>[attachPos, k)</c>. Later records are dropped; a rollback to or before the attach point leaves it fresh and moves the attach point down.
+    /// </summary>
+    private void RebuildConstraint(int k)
+    {
+        _sampled.RemoveAll(e => e.Pos >= k);
+        if (_attachPos > k) _attachPos = k;
+        _constraintBroken = false;
+        if (_constraint is null) return;
+        _constraint.Reset();
+        try
+        {
+            foreach (var (_, token) in _sampled) _constraint.Advance(token);
+        }
+        catch { _constraintBroken = true; }
     }
 
     // ── internals ───────────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ var seg = await s.GenerateUntilBoundaryAsync(stopCondition);     // seg.TokenIds
 await s.AppendObservationTokensAsync(observationIds);            // full-layer prefill, never sampled or constrained
 int top = s.NextTokenArgMax();                                    // raw model logits probe
 s.CopyNextLogits(buffer);
+s.SetConstraint(new JsonSchemaConstraint(tokenizer, schema));     // mask sampled tokens from now on; null detaches
 if (s.CanRollbackTo(k)) s.RollbackTo(k);
 ```
 
@@ -29,7 +30,7 @@ if (s.CanRollbackTo(k)) s.RollbackTo(k);
 - One operation at a time (a concurrent call throws `InvalidOperationException`). Operations complete synchronously; cancellation is
   checked per token and per prefill chunk. A failed or cancelled forward is undone to where it started when the cache and model can; otherwise
   the session is faulted and only `RollbackTo(0)` or disposal remain.
-- `options.ResponseFormat` is not supported on a session (constraints arrive with `SetConstraint`, #1921).
+- **Constraints** (#1921): `ActiveConstraint` / `SetConstraint(IDecodingConstraint?)` swap the decoding constraint at a pause without touching KV or recurrent state; `options.ResponseFormat` initialises it. See "Mid-Session Constraint Swapping" in [CONSTRAINED_DECODING.md](CONSTRAINED_DECODING.md). A complete constraint that permits only end-of-generation tokens ends a segment with `FinishReason.ConstraintComplete`. `RollbackTo(k)` resets the constraint and re-advances it over the tokens the session sampled in `[attachPos, k)` (observation tokens excluded), so a paused mid-document span survives rollback exactly; the session never disposes a constraint (caller owns it).
 - **Faulted sessions recover with `RollbackTo(0)`** (and `CanRollbackTo(0)`), which resets KV and recurrent state completely and clears the fault; every other operation throws until then, or disposal.
 - **A forward that restored itself is not a fault.** An exception implementing `DotLLM.Core.Models.IForwardStateRestored` ("thrown after the model restored KV and recurrent state to their values at forward entry") is rethrown with the session intact: no `Recover`, no fault. Mid-segment, the tokens committed before it stay committed (`CurrentPosition`) and `GenerateUntilBoundaryAsync` continues from there. In an attention rollback re-forward the KV cut is part of the rollback and cannot be undone, so the session sits cleanly one token short (KV length == position, no next-token logits): append that token again or roll back further.
 
@@ -40,8 +41,9 @@ if (s.CanRollbackTo(k)) s.RollbackTo(k);
 | Temperature, TopK, TopP, MinP, TopNSigma, Repetition/Frequency/Presence penalties, LogitBias, DRY*, Seed, GumbelSampling, SamplerSteps, LogitProcessors, IgnoreEos, MinTokens, ThinkingBudget | honoured (the shared `SamplerPipeline`; history is session-wide) |
 | MaxTokens | honoured, per segment |
 | StopSequences, ReasoningStopGate, StopSequencesUngated | honoured per segment (a match keeps its token, trims the text, `FinishReason.Stop`); stop strings cannot span a pause |
+| ResponseFormat | honoured: builds the initial constraint (same factory as `Generate`); `SetConstraint` swaps it later |
 | RepeatGuardLimit | honoured with the plain-generator semantics (#1291): null = `RepeatGuardStopCondition.DefaultLimit` (256), 0 disables, otherwise the limit-th identical SAMPLED token in a row ends the segment (token kept, `FinishReason.Length`). The run is session state: it survives pauses; an observation append (or prefill) ENDS it, **by design (James 2026-11-24: "an observation append ending the repeat-guard run is the intended behaviour")** (those tokens are externally supplied, not sampled, so the run is not carried across them even though the sampler history, being all committed tokens, includes them); `RollbackTo(k)` restores exactly the run that stood at position k (recorded per position). The guard sees every sampled token, including the one a segment's own stop condition ends on |
-| ResponseFormat, StopConditions, Logprobs, TopLogprobs | rejected with `NotSupportedException` at `CreateSession` (use `SetConstraint`, the per-call stop condition, `CopyNextLogits`) |
+| StopConditions, Logprobs, TopLogprobs | rejected with `NotSupportedException` at `CreateSession` (use the per-call stop condition, `CopyNextLogits`) |
 | GenerationPromptSuffix, SavePointPrefix, Threading | ignored (prefix-cache and threading knobs; a session bypasses the generator's prefix caches) |
 
 ## Capacity
