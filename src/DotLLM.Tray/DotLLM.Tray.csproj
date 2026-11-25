@@ -23,4 +23,7 @@
     <ProjectReference Include="..\DotLLM.Tray.Core\DotLLM.Tray.Core.csproj" />
   </ItemGroup>
 
+  <!-- THIRD-PARTY-NOTICES.txt in the publish output (and so in the tool package and release archives): #1964. -->
+  <Import Project="..\..\build\ThirdPartyNotices.targets" />
+
 </Project>
