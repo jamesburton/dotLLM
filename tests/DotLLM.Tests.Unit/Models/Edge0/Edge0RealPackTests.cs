@@ -1,5 +1,6 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Models.Edge0;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -7,49 +8,27 @@ namespace DotLLM.Tests.Unit.Models.Edge0;
 
 /// <summary>
 /// Checks against the real <c>Edge0/Edge0-145B-q3k</c> pack, read in place from the Hugging Face hub cache (or
-/// <c>DOTLLM_EDGE0_PACK_DIR</c>). Silently passes when the pack (or the files it needs) is absent: these are measurements on the real weights,
-/// not unit tests, and the download is 105 GB.
+/// <c>DOTLLM_EDGE0_PACK_DIR</c>). Reported as SKIPPED (with the paths probed) when the pack or a file it needs is absent: these are measurements on the real
+/// weights, not unit tests, and the download is 105 GB.
 /// </summary>
 public sealed class Edge0RealPackTests(ITestOutputHelper output)
 {
-    internal static string? FindPackDir()
-    {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_EDGE0_PACK_DIR");
-        if (!string.IsNullOrEmpty(env)) return Directory.Exists(env) ? env : null;
-        string hub = Environment.GetEnvironmentVariable("HF_HUB_CACHE")
-            ?? Path.Combine(Environment.GetEnvironmentVariable("HF_HOME") ?? Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface"), "hub");
-        string snaps = Path.Combine(hub, "models--Edge0--Edge0-145B-q3k", "snapshots");
-        if (!Directory.Exists(snaps)) return null;
-        return Directory.GetDirectories(snaps).OrderByDescending(d => Directory.GetLastWriteTimeUtc(d)).FirstOrDefault();
-    }
-
-    private static long LinkedLength(string path)
-    {
-        try
-        {
-            string p = File.ResolveLinkTarget(path, true)?.FullName ?? path;
-            return File.Exists(p) ? new FileInfo(p).Length : -1;
-        }
-        catch (IOException) { return -1; }   // absent, or a link whose blob is still downloading
-    }
-
-    /// <summary>The files this test class needs, complete (a partial HF download leaves <c>.incomplete</c> blobs, never a snapshot link).</summary>
-    private static string? CompletePack()
-    {
-        string? dir = FindPackDir();
-        if (dir is null) return null;
-        string[] need = ["native_experts.txt", "experts.bin", "labels.bin", "latent_dense_q8.bin", "index.txt", "dense.bin", "scales/l0.f32", "scales/l47.f32"];
-        return need.All(f => LinkedLength(Path.Combine(dir, f)) > 0) ? dir : null;
-    }
+    /// <summary>
+    /// The pack folder, through the shared fixture resolver (<c>DOTLLM_EDGE0_PACK_DIR</c>, the dotLLM model store, then the HF hub cache snapshot).
+    /// A snapshot only qualifies when every entry the tests read is present (a half-finished download leaves <c>.incomplete</c> blobs, no link).
+    /// </summary>
+    private static FixtureLocation Locate() => TestFixtureResolver.ResolveDirectory(
+        "DOTLLM_EDGE0_PACK_DIR", "Edge0", "Edge0-145B-q3k",
+        "native_experts.txt", "experts.bin", "labels.bin", "latent_dense_q8.bin", "index.txt", "dense.bin", "scales/l0.f32", "scales/l47.f32");
 
     private static double Rms(float[] v) => Math.Sqrt(v.Sum(x => (double)x * x) / v.Length);
 
-    [Fact]
+    [SkippableFact]
     public void RealPack_GeometryLabelsAndWeightsAreSane()
     {
-        string? dir = CompletePack();
-        if (dir is null) { output.WriteLine("Edge0 pack not complete locally: skipped."); return; }
+        var fixture = Locate();
+        Skip.IfNot(fixture.Found, fixture.SkipMessage("Edge0-145B-q3k pack (about 105 GB; experts.bin, labels.bin, latent_dense_q8.bin, dense.bin, scales/)"));
+        string dir = fixture.Path!;
         using var pack = Edge0Pack.Open(dir);
         Assert.Equal(48, pack.Layers);
         Assert.Equal(512, pack.Experts);
@@ -107,11 +86,12 @@ public sealed class Edge0RealPackTests(ITestOutputHelper output)
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RealPack_RoutedLatentMoe_MatchesOracle_AndRealDataDiscriminatesTheMutants()
     {
-        string? dir = CompletePack();
-        if (dir is null) { output.WriteLine("Edge0 pack not complete locally: skipped."); return; }
+        var fixture = Locate();
+        Skip.IfNot(fixture.Found, fixture.SkipMessage("Edge0-145B-q3k pack (about 105 GB; experts.bin, labels.bin, latent_dense_q8.bin, dense.bin, scales/)"));
+        string dir = fixture.Path!;
         using var pack = Edge0Pack.Open(dir);
         var rng = new Random(3);
         var x = new float[2560];
@@ -162,7 +142,7 @@ public sealed class Edge0RealPackTests(ITestOutputHelper output)
             Assert.Equal("4", p[2]);                     // BF16 raw
             long off = long.Parse(p[3], System.Globalization.CultureInfo.InvariantCulture), bytes = long.Parse(p[4], System.Globalization.CultureInfo.InvariantCulture);
             Assert.Equal(count * 2L, bytes);
-            string dense = File.ResolveLinkTarget(Path.Combine(dir, "dense.bin"), true)?.FullName ?? Path.Combine(dir, "dense.bin");
+            string dense = Path.Combine(dir, "dense.bin");
             using var fs = new FileStream(dense, FileMode.Open, FileAccess.Read, FileShare.Read);
             fs.Seek(off, SeekOrigin.Begin);
             var raw = new byte[bytes];

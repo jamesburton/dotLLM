@@ -31,11 +31,13 @@ public sealed unsafe class Edge0LatentMoeTests
         => (Random(SyntheticEdge0Pack.Experts * H, 11, 0.6f), Random(tokens * H, 12, 1f));
 
     [Theory]
-    [InlineData(false, true)]
-    [InlineData(true, true)]
-    [InlineData(false, false)]
-    public void Forward_MatchesIndependentOracle(bool q4Latent, bool withScales)
+    [InlineData(false, true, 1)]
+    [InlineData(true, true, 1)]
+    [InlineData(false, false, 1)]
+    [InlineData(false, true, 4)]   // pooled: Parallel.For over experts, pooled D/U GEMMs
+    public void Forward_MatchesIndependentOracle(bool q4Latent, bool withScales, int threads)
     {
+        using var pool = threads > 1 ? new DotLLM.Cpu.Threading.ComputeThreadPool(threads) : null;
         using var syn = new SyntheticEdge0Pack(q4Latent: q4Latent, withScales: withScales);
         using var pack = syn.Open();
         const int T = 5;
@@ -43,7 +45,7 @@ public sealed unsafe class Edge0LatentMoeTests
         for (int layer = 0; layer < pack.Layers; layer++)
         {
             var y = new float[T * H];
-            Edge0LatentMoe.Forward(pack, layer, router, K, normTopKProb: true, shared: null, x, y, T);
+            Edge0LatentMoe.Forward(pack, layer, router, K, normTopKProb: true, shared: null, x, y, T, pool);
             for (int t = 0; t < T; t++)
             {
                 var want = Edge0LatentMoeReference.Routed(pack, layer, router, K, x[(t * H)..((t + 1) * H)],

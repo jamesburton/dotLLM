@@ -111,9 +111,9 @@ public sealed unsafe class Edge0Pack : IDisposable
     public static Edge0Pack Open(string directory, int hidden = 2560, int expertFf = 640, bool preferLatentQ4 = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(directory);
-        string manifest = R(Path.Combine(directory, "native_experts.txt"));
-        string expertsPath = R(Path.Combine(directory, "experts.bin"));
-        string labelsPath = R(Path.Combine(directory, "labels.bin"));
+        string manifest = Path.Combine(directory, "native_experts.txt");
+        string expertsPath = Path.Combine(directory, "experts.bin");
+        string labelsPath = Path.Combine(directory, "labels.bin");
         foreach (string f in new[] { manifest, expertsPath, labelsPath })
             if (!File.Exists(f)) throw new InvalidDataException($"Edge0 pack file missing: {f}");
 
@@ -141,7 +141,7 @@ public sealed unsafe class Edge0Pack : IDisposable
         string scalesDir = Path.Combine(directory, "scales");
         bool hasScales = File.Exists(Path.Combine(scalesDir, "l0.f32"));
         int latent;
-        if (hasScales) latent = checked((int)(new FileInfo(R(Path.Combine(scalesDir, "l0.f32"))).Length / sizeof(float)));
+        if (hasScales) latent = checked((int)(LengthOf(Path.Combine(scalesDir, "l0.f32")) / sizeof(float)));
         else latent = SolveLatent(recBytes, expertFf);
         var guType = QuantizationType.Q3_K; var dType = QuantizationType.IQ4_NL;
         long guBytes = Dequantize.RowByteSize(latent, guType) * expertFf;
@@ -156,14 +156,14 @@ public sealed unsafe class Edge0Pack : IDisposable
         }
 
         // ── labels ──
-        long labelBytes = new FileInfo(labelsPath).Length;
+        long labelBytes = LengthOf(labelsPath);
         if (labelBytes % (4L * layers) != 0)
             throw new InvalidDataException($"labels.bin: {labelBytes} B is not int32 x {layers} layers x experts.");
         int experts = checked((int)(labelBytes / 4 / layers));
         for (int l = 0; l < layers; l++)
             if (rows[l].Offset != (long)l * experts * record)
                 throw new InvalidDataException($"native_experts.txt: layer {l} offset {rows[l].Offset} != {(long)l * experts * record}.");
-        long expertsLen = new FileInfo(expertsPath).Length;
+        long expertsLen = LengthOf(expertsPath);
         if (expertsLen != (long)layers * experts * record)
             throw new InvalidDataException($"experts.bin: {expertsLen} B != {layers} x {experts} x {record} = {(long)layers * experts * record}.");
         int[] labels = new int[layers * experts];
@@ -181,7 +181,7 @@ public sealed unsafe class Edge0Pack : IDisposable
             inv = new float[layers][];
             for (int l = 0; l < layers; l++)
             {
-                string p = R(Path.Combine(scalesDir, $"l{l}.f32"));
+                string p = Path.Combine(scalesDir, $"l{l}.f32");
                 if (!File.Exists(p)) throw new InvalidDataException($"scales: {p} is missing (all-or-none).");
                 byte[] sb = File.ReadAllBytes(p);
                 if (sb.Length != latent * sizeof(float))
@@ -195,12 +195,12 @@ public sealed unsafe class Edge0Pack : IDisposable
         }
 
         // ── latent dense: size decides the group count and cross-checks the format ──
-        string q8 = R(Path.Combine(directory, "latent_dense_q8.bin")), q4 = R(Path.Combine(directory, "latent_dense_q4.bin"));
+        string q8 = Path.Combine(directory, "latent_dense_q8.bin"), q4 = Path.Combine(directory, "latent_dense_q4.bin");
         string latentPath = preferLatentQ4 && File.Exists(q4) ? q4 : File.Exists(q8) ? q8 : File.Exists(q4) ? q4 : "";
         if (latentPath.Length == 0) throw new InvalidDataException("latent_dense_q8.bin / latent_dense_q4.bin missing.");
         var latentType = latentPath == q8 ? QuantizationType.Q8_0 : QuantizationType.Q4_0;
         long perGroup = ((long)latent * Dequantize.RowByteSize(hidden, latentType)) + ((long)hidden * Dequantize.RowByteSize(latent, latentType));
-        long latentLen = new FileInfo(latentPath).Length;
+        long latentLen = LengthOf(latentPath);
         if (latentLen % ((long)layers * perGroup) != 0)
             throw new InvalidDataException($"{Path.GetFileName(latentPath)}: {latentLen} B is not {layers} layers x groups x {perGroup} B.");
         int groups = checked((int)(latentLen / layers / perGroup));
@@ -224,11 +224,11 @@ public sealed unsafe class Edge0Pack : IDisposable
         }
     }
 
-    /// <summary>Follows file symlinks to the final target (an HF snapshot folder is made of links into <c>blobs/</c>); a plain path is returned unchanged.</summary>
-    private static string R(string path)
+    /// <summary>File length through an open handle: correct for a symlinked file (an HF snapshot entry), where <c>FileInfo.Length</c> may describe the link.</summary>
+    private static long LengthOf(string path)
     {
-        try { return File.ResolveLinkTarget(path, returnFinalTarget: true)?.FullName ?? path; }
-        catch (IOException) { return path; }
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        return fs.Length;
     }
 
     private static int SolveLatent(long recordBytes, int expertFf)

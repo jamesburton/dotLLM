@@ -77,21 +77,27 @@ public static unsafe class Edge0LatentMoe
 
             // Which groups does this chunk touch? Only those D/U are applied.
             ReadOnlySpan<int> labels = pack.Labels(layer);
-            var groupUsed = new bool[G];
-            for (int v = 0; v < V; v++) groupUsed[labels[assignExpert[v]]] = true;
+            Span<int> slotOf = stackalloc int[G];
+            slotOf.Fill(-1);
+            int used = 0;
+            for (int v = 0; v < V; v++)
+            {
+                int g = labels[assignExpert[v]];
+                if (slotOf[g] < 0) slotOf[g] = used++;
+            }
 
-            // ── D, then the column scale: xl[g][t] = (D_g x_t) * (1/s) ──
-            var xl = new float[G][];
+            // ── D, then the column scale: xl[g][t] = (D_g x_t) * (1/s), one T x L slab per used group ──
+            float[] xlBuf = rent.Floats(used * T * L);
             ReadOnlySpan<float> inv = pack.InverseColumnScale(layer);
             for (int g = 0; g < G; g++)
             {
-                if (!groupUsed[g]) continue;
-                xl[g] = rent.Floats(T * L);
-                fixed (float* xp = x) fixed (float* op = xl[g])
+                if (slotOf[g] < 0) continue;
+                Span<float> slab = xlBuf.AsSpan(slotOf[g] * T * L, T * L);
+                fixed (float* xp = x) fixed (float* op = slab)
                     GemmLatentDense(pack.D(layer, g), pack.LatentDenseType, xp, op, L, H, T, pool);
                 if (!inv.IsEmpty)
                     for (int t = 0; t < T; t++)
-                        TensorPrimitives.Multiply(xl[g].AsSpan(t * L, L), inv, xl[g].AsSpan(t * L, L));
+                        TensorPrimitives.Multiply(slab.Slice(t * L, L), inv, slab.Slice(t * L, L));
             }
 
             // ── virtual tokens: one (token, expert) pair per row, k' = 1; hidden' row = that expert's group latent ──
@@ -101,12 +107,12 @@ public static unsafe class Edge0LatentMoe
             for (int v = 0; v < V; v++)
             {
                 int e = assignExpert[v], g = labels[e], t = v / k;
-                xl[g].AsSpan(t * L, L).CopyTo(hidden.AsSpan(v * L, L));
+                xlBuf.AsSpan((slotOf[g] * T + t) * L, L).CopyTo(hidden.AsSpan(v * L, L));
                 vCursors[e]++;
             }
             int run = 0;
             for (int e = 0; e <= E; e++) { int c = vCursors[e]; vCursors[e] = run; run += c; }
-            var wr = new int[E];
+            Span<int> wr = E <= 1024 ? stackalloc int[E] : new int[E];
             for (int e = 0; e < E; e++) wr[e] = vCursors[e];
             for (int v = 0; v < V; v++) { int pos = wr[assignExpert[v]]++; vTokens[pos] = v; vSlots[pos] = 0; }
             int uc = 0;
@@ -129,7 +135,7 @@ public static unsafe class Edge0LatentMoe
             float[] tmp = rent.Floats(T * H);
             for (int g = 0; g < G; g++)
             {
-                if (!groupUsed[g]) continue;
+                if (slotOf[g] < 0) continue;
                 float[] z = rent.Floats(T * L);
                 Array.Clear(z, 0, T * L);
                 for (int t = 0; t < T; t++)

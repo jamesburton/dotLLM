@@ -123,7 +123,7 @@ silently run wrong; Strata refuses it too), a latent file whose size is not a wh
 - **Oracle**: the CPU forward is checked against an independent float64 reference (`Edge0LatentMoeReference`, written from the pseudo-code above, F32 activations, full dequantization of every
   touched weight) on synthetic packs with the real record layout (latent 256, ff 64, 3 groups). Mutants killed: label->group shift, wrong U group, wrong D group, 1/s replaced by s, colscale dropped,
   routing weights ignored, group sum missing experts, reader inverse stored as s, U offset, up bank offset, labels ignoring the layer. See the PR for the run.
-- **Colscale direction (the one residual risk).** The multiplier direction is taken from the Strata source (`xl *= 1/s`, `s` = the file value). Real-data evidence, measured 2026-11-25 on layers 0 and 5
+- **Colscale direction.** Strata's own loader reads exactly these files and multiplies by `1/s` (`xl *= 1/s`, `s` = the file value), so the source settles the convention; the real-data evidence below is supporting only, and an end-to-end comparison with Edge0's engine output is still pending. Measurements, measured 2026-11-25 on layers 0 and 5
   of the Q3_K pack with a numpy decoder independent of dotLLM: (a) the decoded gate/up column rms is proportional to `1/s` (corr of the logs -0.999, CV of `rms*s` 0.018 / 0.029), so the file
   and layer pairing is right; (b) treating Strata's convention (`A = G/s`) as the unscaled weight, the columns of `A` are negatively correlated with the magnitude of the matching latent
   coordinate `|D x|` (corr -0.42 / -0.32), as AWQ-style balancing predicts, whereas the opposite convention (`A = G*s`) shows no relation (+0.07 / +0.14). This favours the Strata convention but is
