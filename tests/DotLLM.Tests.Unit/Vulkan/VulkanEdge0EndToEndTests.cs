@@ -177,6 +177,50 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
         using var tg = GgufFile.Open(fx.Path!);
         var tok = GgufBpeTokenizerFactory.Load(tg.Metadata);
         var failures = new List<string>();
+        if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_SWEEP") is { Length: > 0 } sweepSpec)
+        {
+            // Latent-scratch storage sweep (#1981): "xl,z,uo;xl,z,uo;..." with each of f32|f16|bf16|q8 (simulated round trip in place; F32 accumulation everywhere).
+            int Fmt(string f) => f switch { "f16" => 1, "bf16" => 2, "q8" => 3, _ => 0 };
+            foreach (string cfg in sweepSpec.Split(';'))
+            {
+                var parts = cfg.Split(',');
+                VulkanQwen3MoeHybridTransformerModel.Edge0SimXl = Fmt(parts[0]);
+                VulkanQwen3MoeHybridTransformerModel.Edge0SimZ = Fmt(parts[1]);
+                VulkanQwen3MoeHybridTransformerModel.Edge0SimUo = Fmt(parts[2]);
+                var kls = new List<string>(); var gr = new List<string>(); double nllV = 0; int rowAg = 0, rowN = 0;
+                for (int i = 0; i < inputs.Length; i++)
+                {
+                    var r = Execute(vk, inputs[i], nll: i == 0, n => vk.TrySetAllRowLogitsLimit(n));
+                    var c = cpu[i];
+                    kls.Add(Kl(c.LastLogits, r.LastLogits).ToString("E1"));
+                    int ga = 0; for (int t = 0; t < GreedyTokens; t++) if (c.Greedy[t] == r.Greedy[t]) ga++;
+                    gr.Add($"{ga}/{GreedyTokens}");
+                    if (i == 0) { nllV = r.MeanNll; for (int t = 0; t < c.RowArgmax.Length; t++) if (c.RowArgmax[t] == r.RowArgmax[t]) rowAg++; rowN = c.RowArgmax.Length; }
+                }
+                vk.TrySetAllRowLogitsLimit(1);
+                var longIds2 = Enumerable.Range(0, 5).SelectMany(_ => inputs[0]).Take(512).ToArray();
+                var pf2 = new List<double>(); var dc2 = new List<double>();
+                for (int rep = 0; rep < 3; rep++)
+                {
+                    vk.ResetSequenceState();
+                    var swp = System.Diagnostics.Stopwatch.StartNew();
+                    using (vk.Forward(longIds2, Enumerable.Range(0, longIds2.Length).ToArray(), -1, null, true)) { }
+                    pf2.Add(longIds2.Length / swp.Elapsed.TotalSeconds);
+                }
+                for (int rep = 0; rep < 3; rep++)
+                {
+                    vk.ResetSequenceState();
+                    using (vk.Forward(inputs[1], Enumerable.Range(0, inputs[1].Length).ToArray(), -1, null, true)) { }
+                    int pos = inputs[1].Length;
+                    var swd = System.Diagnostics.Stopwatch.StartNew();
+                    for (int sIdx = 0; sIdx < 48; sIdx++) { using var lg = vk.Forward([13], [pos++], -1, null, true); }
+                    dc2.Add(48 / swd.Elapsed.TotalSeconds);
+                }
+                output.WriteLine($"SWEEP xl={parts[0]} z={parts[1]} uo={parts[2]}: NLL {nllV:F4} (cpu {cpu[0].MeanNll:F4}); KL {string.Join(" / ", kls)}; greedy {string.Join(" ", gr)}; row argmax {rowAg}/{rowN}; prefill {string.Join("/", pf2.Select(v => v.ToString("F0")))} tok/s; decode {string.Join("/", dc2.Select(v => v.ToString("F1")))} tok/s");
+            }
+            VulkanQwen3MoeHybridTransformerModel.Edge0SimXl = VulkanQwen3MoeHybridTransformerModel.Edge0SimZ = VulkanQwen3MoeHybridTransformerModel.Edge0SimUo = 0;
+            return;
+        }
         for (int i = 0; i < inputs.Length; i++)
         {
             var r = Execute(vk, inputs[i], nll: i == 0, n => vk.TrySetAllRowLogitsLimit(n));

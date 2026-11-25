@@ -13,6 +13,12 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
     /// <summary>Single-row decode skips the D / U groups no selected expert uses (<c>edge0_d_mmvq</c> / <c>edge0_u_mmvq</c>): identical numerics, fewer bytes. <c>DOTLLM_EDGE0_SKIP_GROUPS=0</c> (or setting this) restores the generic path (A/B).</summary>
     internal static bool Edge0SkipUnusedGroups { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_EDGE0_SKIP_GROUPS") != "0";
 
+    private static int ParseStore(string name) => Environment.GetEnvironmentVariable(name)?.ToLowerInvariant() switch { "f16" => 1, "bf16" => 2, "q8" => 3, _ => 0 };
+    /// <summary>Experiment (#1981): simulated storage format of the D output, the per-group z and the per-group U output (0 = F32, 1 = F16, 2 = BF16, 3 = Q8_0).</summary>
+    internal static int Edge0SimXl { get; set; } = ParseStore("DOTLLM_EDGE0_STORE_XL");
+    internal static int Edge0SimZ { get; set; } = ParseStore("DOTLLM_EDGE0_STORE_Z");
+    internal static int Edge0SimUo { get; set; } = ParseStore("DOTLLM_EDGE0_STORE_UO");
+
     /// <summary>Test hook: layers recorded on the group-skipping decode path.</summary>
     internal long Edge0SkipLayers { get; private set; }
 
@@ -90,6 +96,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
         else
             RecordMatmul(cmd, e0.D, e0.LatentDenseType, _state.NormOutput, _edge0Xl!, outputDim: G * L, inputDim: H, seqLen: T);
         KernelSupport.ComputeToComputeBarrier(cmd);
+        if (Edge0SimXl != 0) { k.RecordRoundTrip(cmd, _edge0Xl!, T * G * L, Edge0SimXl); KernelSupport.ComputeToComputeBarrier(cmd); }
         k.RecordGather(cmd, _edge0Xl!, _state.MoeTopkIndices, e0.Labels, e0.InverseScale, _state.MoeExpandedInput, L, G, topK, rows, E);
         KernelSupport.ComputeToComputeBarrier(cmd);
         MoeStage("edge0_d_gather");
@@ -142,6 +149,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
             Edge0SkipLayers++;
             k.RecordCombineAll(cmd, _state.MoeDownRows, _state.MoeTopkIndices, _state.MoeTopkWeights, e0.Labels, _edge0ZAll!, L, topK, E);
             KernelSupport.ComputeToComputeBarrier(cmd);
+            if (Edge0SimZ != 0) { k.RecordRoundTrip(cmd, _edge0ZAll!, G * L, Edge0SimZ); KernelSupport.ComputeToComputeBarrier(cmd); }
             _kernels.QuantizeQ8_1RowsActivations!.Record(cmd, _edge0ZAll!, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, n: G, k: L);
             KernelSupport.ComputeToComputeBarrier(cmd);
             k.RecordDecodeU(cmd, e0.U, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.NormOutput, _state.MoeTopkIndices, e0.Labels, H, L, topK, E);
@@ -152,10 +160,12 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
             for (int g = 0; g < G; g++)
                 k.RecordGroupCombine(cmd, _state.MoeDownRows, _state.MoeTopkIndices, _state.MoeTopkWeights, e0.Labels, _edge0Z![g], L, topK, g, T, E);
             KernelSupport.ComputeToComputeBarrier(cmd);
+            if (Edge0SimZ != 0) { for (int g = 0; g < G; g++) k.RecordRoundTrip(cmd, _edge0Z![g], T * L, Edge0SimZ); KernelSupport.ComputeToComputeBarrier(cmd); }
             for (int g = 0; g < G; g++)
             {
                 RecordMatmul(cmd, e0.U[g], e0.LatentDenseType, _edge0Z![g], _edge0Uo![g], outputDim: H, inputDim: L, seqLen: T);
-                KernelSupport.ComputeToComputeBarrier(cmd);   // a single-row Q8_0 / Q4_0 GEMV quantizes its input into the shared Q8_1 scratch
+                KernelSupport.ComputeToComputeBarrier(cmd);
+                if (Edge0SimUo != 0) { k.RecordRoundTrip(cmd, _edge0Uo![g], T * H, Edge0SimUo); KernelSupport.ComputeToComputeBarrier(cmd); }   // a single-row Q8_0 / Q4_0 GEMV quantizes its input into the shared Q8_1 scratch
             }
             k.RecordSum(cmd, _edge0Uo!, _state.NormOutput, T * H);
             KernelSupport.ComputeToComputeBarrier(cmd);

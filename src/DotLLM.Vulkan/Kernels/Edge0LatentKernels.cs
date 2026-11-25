@@ -55,7 +55,7 @@ public sealed class Edge0LatentKernels : IDisposable
     }
 
     private readonly Pipe _gather, _combine, _sum;
-    private Pipe? _decodeD, _decodeU, _combineAll;
+    private Pipe? _decodeD, _decodeU, _combineAll, _roundTrip;
 
     /// <summary>True when the single-row kernels that skip unused D/U groups exist (integer dot product, wave32, SPIR-V present).</summary>
     public bool HasDecodeKernels => _decodeD is not null && _decodeU is not null && _combineAll is not null;
@@ -88,6 +88,7 @@ public sealed class Edge0LatentKernels : IDisposable
                 k._decodeU = new Pipe(device, spvDir, "edge0_u_mmvq", 13, 5 * sizeof(uint), wave32: true);
                 k._combineAll = new Pipe(device, spvDir, "edge0_group_combine_all", 5, 3 * sizeof(uint));
             }
+            if (File.Exists(Path.Combine(spvDir, "edge0_roundtrip.spv"))) k._roundTrip = new Pipe(device, spvDir, "edge0_roundtrip", 1, 2 * sizeof(uint));
             k.IndexedQ3K = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.Q3_K);
             k.IndexedIq4Nl = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.IQ4_NL);
             if (MoeGroupedStridedCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.Q3_K) && MoeGroupedStridedCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.IQ4_NL))
@@ -103,7 +104,7 @@ public sealed class Edge0LatentKernels : IDisposable
     /// <summary>Drops cached descriptor sets (scratch buffers were re-allocated).</summary>
     internal void InvalidateDescriptorCache()
     {
-        _gather.Cache.Reset(); _combine.Cache.Reset(); _sum.Cache.Reset(); _decodeD?.Cache.Reset(); _decodeU?.Cache.Reset(); _combineAll?.Cache.Reset();
+        _gather.Cache.Reset(); _combine.Cache.Reset(); _sum.Cache.Reset(); _decodeD?.Cache.Reset(); _decodeU?.Cache.Reset(); _combineAll?.Cache.Reset(); _roundTrip?.Cache.Reset();
         IndexedQ3K?.InvalidateDescriptorCache(); IndexedIq4Nl?.InvalidateDescriptorCache(); GroupedQ3K?.InvalidateDescriptorCache(); GroupedIq4Nl?.InvalidateDescriptorCache();
     }
 
@@ -166,10 +167,14 @@ public sealed class Edge0LatentKernels : IDisposable
         _sum.Dispatch(cmd, b, [(uint)n], (uint)((n + 255) / 256), 1);
     }
 
+    /// <summary>Experiment: rounds the first <paramref name="n"/> floats of <paramref name="x"/> in place through a candidate storage format (1 = F16, 2 = BF16, 3 = Q8_0).</summary>
+    public void RecordRoundTrip(nint cmd, VulkanDevice.Buffer x, int n, int mode)
+        => (_roundTrip ?? throw new InvalidOperationException("edge0_roundtrip.spv missing")).Dispatch(cmd, [x.Handle], [(uint)n, (uint)mode], (uint)((n + 31) / 32), 1);
+
     /// <inheritdoc/>
     public void Dispose()
     {
-        _gather.Dispose(); _combine.Dispose(); _sum.Dispose(); _decodeD?.Dispose(); _decodeU?.Dispose(); _combineAll?.Dispose();
+        _gather.Dispose(); _combine.Dispose(); _sum.Dispose(); _decodeD?.Dispose(); _decodeU?.Dispose(); _combineAll?.Dispose(); _roundTrip?.Dispose();
         IndexedQ3K?.Dispose(); IndexedIq4Nl?.Dispose(); GroupedQ3K?.Dispose(); GroupedIq4Nl?.Dispose();
     }
 }

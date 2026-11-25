@@ -1,0 +1,41 @@
+#version 450
+// Edge0 latent scratch narrowing experiment (#1981, James's ruling 2026-11-25): rounds an F32 buffer IN PLACE through the candidate storage
+// format so the end-to-end parity of F16 / BF16 / Q8_0 storage can be measured before the real narrow buffers are built.
+//   mode 1 = F16, mode 2 = BF16 (round to nearest even), mode 3 = Q8_0 (blocks of 32 contiguous floats, F16 scale amax/127, int8 values).
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufX { float x[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+    uint mode;
+} pc;
+
+shared float sAmax[32];
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    float v = i < pc.n ? x[i] : 0.0;
+    float r = v;
+    if (pc.mode == 1u) {
+        r = unpackHalf2x16(packHalf2x16(vec2(v, 0.0))).x;
+    } else if (pc.mode == 2u) {
+        uint b = floatBitsToUint(v);
+        uint lsb = (b >> 16u) & 1u;
+        b = (b + 0x7FFFu + lsb) & 0xFFFF0000u;
+        r = uintBitsToFloat(b);
+    } else if (pc.mode == 3u) {
+        uint l = gl_LocalInvocationID.x;
+        sAmax[l] = abs(v);
+        barrier();
+        for (uint s = 16u; s > 0u; s >>= 1u) {
+            if (l < s) sAmax[l] = max(sAmax[l], sAmax[l + s]);
+            barrier();
+        }
+        float amax = sAmax[0];
+        float d = unpackHalf2x16(packHalf2x16(vec2(amax / 127.0, 0.0))).x;
+        float inv = d != 0.0 ? 1.0 / d : 0.0;
+        r = roundEven(v * inv) * d;
+    }
+    if (i < pc.n) x[i] = r;
+}
