@@ -572,7 +572,52 @@ struct Stage { uint sw0; uint sw1; uint qs2; uint qhb; uint ib; vec4 bv; };   //
 ''' + B_COMMIT)
 
 
-SHADERS = [IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_0, IQ1_M, Q4_0, Q4_1]
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# Q3_K (Edge0 G3, #1981): 110-byte super-blocks (hmask[32], qs[64], 16 six-bit scales, fp16 d), K-quant, NOT word aligned (every field offset is EVEN, so a
+# 16-byte span is one funnel shift from aligned words). The lane mapping is the dense matmul_q3_k_gemm_coopmat_128x128x4.comp staging: a 32-element sub-block
+# s (= half h * 4 + shift-group j) holds element h*128 + j*32 + p*16 + l; this thread owns part p = half_ (16 elements): 2 low bits in qs[h*32 + p*16 + l] at
+# bit 2j, the high bit in hmask[p*16 + l] bit (4h + j), scale index h*8 + j*2 + p; value = d * (scale - 32) * ((q2 | hbit << 2) - 4).
+Q3_K = dict(
+    name='q3_k', fmt='Q3_K', kreq='256', extra='',
+    layout='Bank layout: [E, M, K/256 super-blocks of 110 bytes]: hmask[32], qs[64] (2 low bits x 4 per byte), scales[12] (16 six-bit, biased by 32), fp16 d.\n// Sub-block s (32 elements) = half h*4 + shift group j; this thread decodes part p = half_ (16 elements): value = d * (scale - 32) * ((q2 | hbit << 2) - 4).',
+    body=READ4 + '''const uint Q3_K_BLOCK_BYTES = 110u;
+
+struct Stage { float scl; uint hj; uint qs[4]; uint hm[4]; vec4 bv; };   // scl: d * (scale6 - 32); hj: h * 4 + j; qs / hm: this thread's 16 bytes of each plane
+
+''' + LOAD_SIG + '''    st.scl = 0.0; st.hj = 0u;
+    for (uint i = 0u; i < 4u; i++) { st.qs[i] = 0u; st.hm[i] = 0u; }
+    if (rowValid) {
+        uint s = sb * 2u + blk;            // 32-element sub-block index along K
+        uint base = rowBase + (s >> 3u) * Q3_K_BLOCK_BYTES;
+        uint sub = s & 7u;
+        uint h = sub >> 2u;
+        uint jj = sub & 3u;
+        st.hj = sub;                       // h * 4 + j
+        float d = unpackHalf2x16(readHalfBits(base + 108u)).x;
+        uint si = h * 8u + jj * 2u + half_;            // 0..15 scale index
+        uint lowNib = (si < 8u) ? (readByte(base + 96u + si) & 0xFu) : ((readByte(base + 96u + si - 8u) >> 4u) & 0xFu);
+        uint hiBits = (readByte(base + 96u + 8u + (si & 3u)) >> ((si >> 2u) * 2u)) & 0x3u;
+        st.scl = d * float(int(lowNib | (hiBits << 4u)) - 32);
+        uint qo = base + 32u + h * 32u + half_ * 16u;
+        uint ho = base + half_ * 16u;
+        for (uint i = 0u; i < 4u; i++) { st.qs[i] = read4Bytes(qo + 4u * i); st.hm[i] = read4Bytes(ho + 4u * i); }
+    }
+''' + B_LOAD + '\n' + COMMIT_SIG + ZERO_A + '''        uint qShift = (st.hj & 3u) * 2u;
+        uint hShift = st.hj;
+        for (uint i = 0u; i < 4u; i++) {
+            uint qv = st.qs[i] >> qShift;
+            uint hv = st.hm[i] >> hShift;
+            for (uint jb = 0u; jb < 4u; jb++) {
+                uint q2 = (qv >> (jb * 8u)) & 3u;
+                uint hb = (hv >> (jb * 8u)) & 1u;
+                sharedA[aBase + i * 4u + jb] = float16_t(st.scl * float(int(q2 | (hb << 2u)) - 4));
+            }
+        }
+    }
+''' + B_COMMIT)
+
+SHADERS = [IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_0, IQ1_M, Q4_0, Q4_1, Q3_K]
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------

@@ -77,6 +77,9 @@ internal static class VulkanQwen3MoeMoeUpload
         QuantizationType.IQ1_M,
         // #1018: Q4_0 banks (LFM2.5-24B-A2B) stay packed: indexed MMVQ decode + grouped coopmat prefill, same 18-byte block as IQ4_NL.
         QuantizationType.Q4_0,
+        // Edge0 G3 (#1981): Q3_K banks (Edge0 gate/up experts, K = 1792 = 7 super-blocks) stay packed: indexed MMVQ decode + grouped coopmat prefill
+        // (MoeIqQuant.Q3_K). Needs K % 256 == 0 like every super-block IQ format (BankStaysPacked checks it through MoeIqFormats).
+        QuantizationType.Q3_K,
     };
 
     /// <summary>
