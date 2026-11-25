@@ -121,6 +121,8 @@ public class QuantFormatTests
             ["Q5_0"] = QuantFormat.Q5_0BlockBytes, ["Q5_1"] = QuantFormat.Q5_1BlockBytes,
             ["Q8_0"] = QuantFormat.Q8_0BlockBytes, ["Q8_1"] = QuantFormat.Q8_1BlockBytes,
             ["Q2K"] = QuantFormat.Q2_KBlockBytes, ["Q3K"] = QuantFormat.Q3_KBlockBytes,
+            // gen_moe_grouped_iq.py spells K-quants with the underscore (Q3_K_BLOCK_BYTES, #1981).
+            ["Q3_K"] = QuantFormat.Q3_KBlockBytes,
             ["Q4K"] = QuantFormat.Q4_KBlockBytes, ["Q5K"] = QuantFormat.Q5_KBlockBytes,
             ["Q6K"] = QuantFormat.Q6_KBlockBytes, ["Q8K"] = QuantFormat.Q8_KBlockBytes,
             ["IQ1_S"] = QuantFormat.IQ1_SBlockBytes, ["IQ2_XXS"] = QuantFormat.IQ2_XXSBlockBytes,
