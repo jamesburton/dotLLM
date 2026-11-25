@@ -440,7 +440,7 @@ public sealed class OlalaVulkanTests
             var tf = Rows(pre2, 1, c.Vocab);
             for (int j = 0; j < c.N; j++)
             {
-                if (j >= 10 && j <= 13)
+                if ((j >= 3 && j <= 5) || (j >= 10 && j <= 13))   // step 4: the F32-act / CPU q8 divergence; step 12: the BF16-act one
                 {
                     var top = tf.Select((v, i) => (v, i)).OrderByDescending(x => x.v).Take(2).ToArray();
                     var hf = c.Greedy.AsSpan(j * c.Vocab, c.Vocab).ToArray().Select((v, i) => (v, i)).OrderByDescending(x => x.v).Take(2).ToArray();

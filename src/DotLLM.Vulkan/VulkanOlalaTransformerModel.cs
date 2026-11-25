@@ -241,6 +241,10 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
             throw new NotSupportedException("Olala Vulkan Mamba step supports rank <= 8, state <= 128, angles <= min(64, state/2).");
         if (o.NumSignalHeads + o.NumNoiseHeads != 4 * o.NumNoiseHeads)
             throw new NotSupportedException("Olala Vulkan attention supports 4 query heads per kv head (3 signal + 1 noise).");
+        // olala_moe_route keeps the token row and the scores in fixed shared arrays (sx[4096], sig/scored[1024], chosen[16]).
+        if (config.HiddenSize > 4096 || o.ExpertCount > 1024 || o.ExpertUsedCount < 1 || o.ExpertUsedCount > 16 || o.ExpertUsedCount > o.ExpertCount)
+            throw new NotSupportedException($"Olala Vulkan router supports hidden <= 4096, experts <= 1024 and 1 <= top-k <= min(16, experts); got hidden {config.HiddenSize}, " +
+                                            $"experts {o.ExpertCount}, top-k {o.ExpertUsedCount}.");
 
         long bytes = 0;
         VulkanWeightImportPolicy.Reset();
@@ -291,7 +295,6 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
             var router = tensors[B("ffn_gate_inp.weight")];
             if (router.QuantizationType != QuantizationType.F32)
                 throw new NotSupportedException($"olala router {B("ffn_gate_inp.weight")} is {router.QuantizationType}; the contract keeps the router F32.");
-            var upD = tensors[B("ffn_up_exps.weight")]; var downD = tensors[B("ffn_down_exps.weight")];
             var up = Weight(B("ffn_up_exps.weight")); var down = Weight(B("ffn_down_exps.weight"));
             // Weight() reports Out = shape[1] (rows of ONE expert): that is what the MoE kernels index by.
             var layer = new Layer
@@ -306,7 +309,6 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
                 SharedUp = Weight(B("ffn_up_shexp.weight")), SharedDown = Weight(B("ffn_down_shexp.weight")),
                 UpExps = up, DownExps = down,
             };
-            _ = upD; _ = downD;
             if (layer.IsSsm)
             {
                 layer.SsmIn = Weight(B("ssm_in.weight")); layer.SsmInDyn = Weight(B("ssm_in_dyn.weight"));
