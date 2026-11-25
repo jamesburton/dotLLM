@@ -55,13 +55,15 @@ internal sealed unsafe class DirectWeightStore : IDisposable
     /// present</b>. Discrete GPUs keep staging by default (their weights must reach VRAM anyway). Read per call (tests toggle it).
     /// </summary>
     internal static bool EnabledFor(VulkanDevice device)
+        => Decide(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DIRECT_STORAGE"), OperatingSystem.IsWindows(),
+            device.PhysicalDeviceTypeValue == VkPhysicalDeviceType.IntegratedGpu, s_dllAvailable.Value);
+
+    /// <summary>The pure tri-state decision behind <see cref="EnabledFor"/> (testable without a device).</summary>
+    internal static bool Decide(string? env, bool windows, bool integrated, bool dllPresent)
     {
-        string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DIRECT_STORAGE");
-        if (string.Equals(v, "0", StringComparison.Ordinal)) return false;
-        if (string.Equals(v, "1", StringComparison.Ordinal)) return true;
-        return OperatingSystem.IsWindows()
-            && device.PhysicalDeviceTypeValue == VkPhysicalDeviceType.IntegratedGpu
-            && s_dllAvailable.Value;
+        if (string.Equals(env, "0", StringComparison.Ordinal)) return false;
+        if (string.Equals(env, "1", StringComparison.Ordinal)) return true;
+        return windows && integrated && dllPresent;
     }
 
     /// <summary>True when the default would apply but for a missing DLL: Windows, integrated device, tier not switched off.</summary>

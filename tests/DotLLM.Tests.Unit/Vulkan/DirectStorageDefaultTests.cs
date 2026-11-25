@@ -10,6 +10,18 @@ namespace DotLLM.Tests.Unit.Vulkan;
 [Collection("VulkanKernels")]
 public class DirectStorageDefaultTests(ITestOutputHelper output)
 {
+    /// <summary>The full decision table (no GPU): an explicit 0/1 wins; unset needs Windows AND an integrated device AND the DLL.</summary>
+    [Theory]
+    [InlineData("0", true, true, true, false)]    // explicit off beats everything
+    [InlineData("1", false, false, false, true)]  // explicit on beats everything (DLL permitting is checked later by the store)
+    [InlineData(null, true, true, true, true)]    // the new default
+    [InlineData(null, true, false, true, false)]  // discrete GPU: unchanged (staging)
+    [InlineData(null, true, true, false, false)]  // DLL missing: staging (+ warning)
+    [InlineData(null, false, true, true, false)]  // not Windows
+    [InlineData("", true, true, true, true)]      // empty = unset
+    public void Decide_TriState_Table(string? env, bool windows, bool integrated, bool dll, bool expected)
+        => Assert.Equal(expected, DirectWeightStore.Decide(env, windows, integrated, dll));
+
     /// <summary><c>DOTLLM_VULKAN_DIRECT_STORAGE</c> is tri-state: 0 never, 1 always, unset = integrated device + DLL present only.</summary>
     [SkippableFact]
     public void Enabled_IsTriState_AndDefaultsToIntegratedWithDll()

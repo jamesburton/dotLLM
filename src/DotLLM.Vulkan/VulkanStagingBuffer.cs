@@ -139,8 +139,13 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     /// <summary>True when this buffer was built for parallel streaming (more than the default two slots).</summary>
     public bool IsParallel => _slots.Length > SlotCount;
 
+    /// <summary>Live staging buffers. The #1991 refusal line is printed only when the outermost one closes, so a loader whose
+    /// per-layer helpers build and dispose their own staging inside its load (MoE banks) reports once, not once per layer.</summary>
+    private static int s_live;
+
     private VulkanStagingBuffer(VulkanDevice device, Slot?[] slots, long capacity)
     {
+        Interlocked.Increment(ref s_live);
         _device = device;
         _slots = slots;
         Capacity = capacity;
@@ -442,8 +447,13 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
         _disposed = true;
         WaitAll();
         DirectStorage.DirectWeightStore.TryGet(_device)?.Seal();   // #1304: end of load - reads landed, DirectStorage queue and ring freed
-        string dsWarn = VulkanWeightImportPolicy.DirectFallbackWarning(_device);   // #1994
-        if (dsWarn.Length > 0) Console.Error.WriteLine(dsWarn);
+        if (Interlocked.Decrement(ref s_live) == 0)
+        {
+            string refusal = VulkanWeightImportPolicy.RejectionWarning();   // #1991: a requested alias that was refused is never silent (reported once)
+            if (refusal.Length > 0) Console.Error.WriteLine(refusal);
+            string dsWarn = VulkanWeightImportPolicy.DirectFallbackWarning(_device);   // #1994: DirectStorage default fell back (reported once per load)
+            if (dsWarn.Length > 0) Console.Error.WriteLine(dsWarn);
+        }
         if (s_trace)
         {
             Console.Error.WriteLine(
