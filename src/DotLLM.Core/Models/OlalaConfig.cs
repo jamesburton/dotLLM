@@ -16,6 +16,9 @@ public enum OlalaStateStorage
 /// no environment variable, global setting or KV-cache option narrows it, and no other architecture reads it.
 /// </summary>
 /// <remarks>
+/// Scope: the user's 2026-11-25 sign-off covers the SSM matrix and the angle state; an explicit extension the same day (user ruling)
+/// puts the trapezoid carry and the token-shift last K/V under F32 too, until #1971 shows a narrower type is safe. HF keeps the
+/// trapezoid and token-shift state in the model dtype, so this is stricter than the reference.
 /// Evidence for F32: OVHcloud serve Olala with vLLM <c>--mamba-ssm-cache-dtype float32</c>; the OVH llama.cpp fork keeps the state
 /// F32 by default and documents that a reduced-precision state "degrades long generations into repetition loops". Covered buffers
 /// (per M layer, 7A1B geometry: 48 heads, headdim 64, d_state 128, MIMO rank 4, 32 rope angles):
