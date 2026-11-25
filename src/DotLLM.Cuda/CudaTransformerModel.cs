@@ -4162,7 +4162,9 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
         if (config.Architecture == Architecture.Ricursive)
             throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("CUDA"));
         if (config.Architecture == Architecture.Olala)
-            throw new NotSupportedException(OlalaConfig.UnsupportedMessage("CUDA"));
+            throw new NotSupportedException(
+                "The olala architecture (OVHcloud Olala) cannot run on the generic CudaTransformerModel: it has Mamba-3 MIMO and differential-TPA mixers, "
+                + "a geodesic residual and a latent sigmoid-router MoE. It runs through CudaModelLoader.CreateFromGguf (CudaOlalaTransformerModel, issue #1984).");
         if (config.Architecture == Architecture.GraniteMoe)
             throw new NotSupportedException(
                 "Architecture GraniteMoe (Granite-3.x MoE, GGUF granitemoe) is not supported on the CUDA backend: the "

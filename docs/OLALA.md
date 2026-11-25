@@ -206,3 +206,24 @@ Each row is a deliberately wrong implementation; all fail the oracle tests excep
 ## 7. Not done yet (tracked in #1969)
 Vulkan and CUDA forwards (both refuse with `OlalaConfig.UnsupportedMessage`), chunked/parallel prefill of the M layers, a factored TPA KV cache, prefix-cache/snapshot support,
 serving (chat template reasoning-effort, tool-call parser), `lazy` expert paging for small-RAM machines.
+
+## 8. CUDA forward (issue #1984, epic #1969)
+
+`CudaOlalaTransformerModel` (`src/DotLLM.Cuda/Architectures/`) with `native/kernels/olala.cu` -> `native/ptx/olala.ptx` (CUDA 12.8, `.version 8.7`). Reached through
+`CudaModelLoader.CreateFromGguf`; the generic `CudaTransformerModel` still refuses `olala` (it would run a different model). No change to Models or Core.
+
+**Precision contract (James, 2026-11-25).** Stored activations are **BF16** (`act_t`), accumulation F32 in registers, geodesic reductions and the angle wrap in double (as on the CPU).
+The recurrent state (SSM matrix, rotary phase, trapezoid K/V, token-shift K/V) is **F32**, sized from `OlalaStatePolicy` by the pure function `CudaOlalaStateLayout`
+(`CudaOlalaStateLayoutTests` runs without a GPU). Weights are read **quantized in place**: Q8_0, Q6_K, BF16 and the F32 router are dequantized in registers inside the dot
+loops (no activation quantisation at all, so the FP16-scale overflow of type-0 matmuls cannot occur). Router logits / sigmoid / top-6 / renormalised weights stay F32 in one
+fused kernel (near-tied experts, margins ~1e-5, must not see BF16 rounding); the 6 routing weights per token are the only F32 inter-kernel storage besides the state. Logits are F32 output.
+F32 activation storage is **not** shipped; it needs sign-off.
+
+**Kernels.** `olala_gemv_{q8_0,q6_k,bf16,f32}_{t1,t8}` (warp per row, 1 or 8 tokens per weight read; epilogues store / ReLU^2 / add), `olala_moe_up_*` / `olala_moe_down_*`
+(per (token, slot) indirect expert GEMV; down sums the 6 weighted experts in registers), `olala_route`, `olala_geodesic`, `olala_embed_*` (+L2 normalise),
+`olala_mamba3_mimo` (one block per head, SSM rows in registers across the tokens of a chunk), `olala_tpa_kv` / `olala_tpa_carry` / `olala_attn` (online softmax, soft cap,
+window) / `olala_attn_combine`. Limits (validated at load): N <= 128, P <= 64, R <= 4, head_dim <= 128, <= 16 experts per token. Prefill runs in chunks of 256 tokens
+(the recurrence and the K/V history continue across chunks; `Tiny_ChunkedPrefill_IsBitIdenticalToOneShot`). K/V history grows on demand (BF16, 6 KiB per token per V layer x 7) and is admitted against free VRAM, never spilled.
+
+**Known gaps.** Weight upload is `cuMemcpyHtoD` from the mmap (the same route as the other CUDA loaders; CLAUDE.md rule 3 direct route not added). No CUDA graph, no
+factored TPA cache, no per-sequence state / prefix cache (single model-owned sequence, like the CPU model), `--gpu-layers` cannot split this architecture.
