@@ -2477,6 +2477,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel, IVulk
         VulkanDevice.Buffer? postAttnNormWeight, int seqLen, int hidden, float eps, float blockCoresetTopP = 0f)
     {
         if (moeW.Edge0 is not null) { RecordEdge0MoeLayer(cmdBuf, moeW, seqLen); return; }   // Edge0 latent MoE (G3, #1981)
+        if (moeW.Edge0Mtp is not null) { RecordEdge0MtpMoeLayer(cmdBuf, moeW, seqLen); return; }   // Edge0 MTP head experts (G6, #1990)
         int interm = moeW.IntermediateSize;
         int numE = moeW.NumExperts;
         int topK = moeW.NumExpertsPerTok;
@@ -3513,6 +3514,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel, IVulk
         }
         FreeEdge0Scratch();
         _edge0Kernels?.Dispose();
+        _mtpPlanar?.Dispose();
         _moeUnitScale?.Dispose();
         _state.Dispose();
         _weights.Dispose();

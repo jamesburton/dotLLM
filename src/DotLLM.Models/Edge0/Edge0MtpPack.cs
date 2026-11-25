@@ -234,8 +234,9 @@ public sealed unsafe class Edge0MtpPack : IDisposable
     /// </summary>
     /// <param name="config">The trunk configuration (layer count, hidden width, head geometry).</param>
     /// <param name="ggmlExpertBanks">Include contiguous ggml expert banks (the CPU oracle).</param>
+    /// <param name="viewOwnsPack">Dispose this pack when the returned view is disposed.</param>
     /// <param name="trunk">The trunk (skeleton) file: its <c>token_embd</c> / <c>output</c> are registered in the view because the tensor contract lists them; the head loaders never read them.</param>
-    public GgufFile BuildHeadGguf(ModelConfig config, bool ggmlExpertBanks, GgufFile? trunk = null)
+    public GgufFile BuildHeadGguf(ModelConfig config, bool ggmlExpertBanks, GgufFile? trunk = null, bool viewOwnsPack = false)
     {
         int il = config.NumLayers, H = config.HiddenSize;
         if (H != Hidden) throw new InvalidDataException($"The Edge0 MTP head is built for hidden {Hidden}, the model has {H}.");
@@ -309,7 +310,7 @@ public sealed unsafe class Edge0MtpPack : IDisposable
             list.Add((b + "ffn_up_exps.weight", new TensorShape(H, ExpertFf, Experts), QuantizationType.Q2_0, u));
             list.Add((b + "ffn_down_exps.weight", new TensorShape(ExpertFf, H, Experts), QuantizationType.Q2_0, d));
         }
-        return GgufFile.CreateExternal(list, owner: null);
+        return GgufFile.CreateExternal(list, owner: viewOwnsPack ? this : null);
     }
 
     /// <inheritdoc/>

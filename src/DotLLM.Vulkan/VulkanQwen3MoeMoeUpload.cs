@@ -191,6 +191,9 @@ internal static class VulkanQwen3MoeMoeUpload
         /// <see cref="W3Bank"/> / <see cref="W2Bank"/> are the Q3_K / Q3_K / IQ4_NL split banks of the pack and <see cref="Gate"/> is the BF16 router (Edge0 G3, #1981).</summary>
         internal Edge0LayerBuffers? Edge0 { get; init; }
 
+        /// <summary>Edge0 MTP head experts (G6, #1990): the planar Q2_0 blobs of <c>mtp/experts.bin</c>, imported in place. When set, the three banks are this one buffer and the layer is recorded by <c>RecordEdge0MtpMoeLayer</c>.</summary>
+        internal Edge0MtpExperts? Edge0Mtp { get; init; }
+
         /// <summary>Decode-only raw Q8_0 copies of the shared gate / up projections (half the bytes of F16; aliases the mmap'd GGUF pages on UMA, so
         /// no extra residency). Null unless the source tensors are Q8_0 with K % 32 == 0 (<c>DOTLLM_VK_MOE_SHARED_Q8=0</c> disables).</summary>
         public VulkanDevice.Buffer? SharedGateQ8 { get; init; }
@@ -229,13 +232,14 @@ internal static class VulkanQwen3MoeMoeUpload
         {
             Gate.Dispose();
             W1Bank.Dispose();
-            if (Edge0 is null) { W2Bank.Dispose(); W3Bank.Dispose(); }   // an Edge0 layer's three banks are ONE record buffer
+            if (Edge0 is null && Edge0Mtp is null) { W2Bank.Dispose(); W3Bank.Dispose(); }   // an Edge0 layer's three banks are ONE record / blob buffer
             SharedGate?.Dispose(); SharedUp?.Dispose(); SharedDown?.Dispose();
             if (!ReferenceEquals(SharedGateQ8, SharedGate)) SharedGateQ8?.Dispose();
             if (!ReferenceEquals(SharedUpQ8, SharedUp)) SharedUpQ8?.Dispose();
             SharedExpertGate?.Dispose();
             SelectionBias?.Dispose();
             Edge0?.Dispose();
+            Edge0Mtp?.Dispose();
         }
     }
 
@@ -354,10 +358,11 @@ internal static class VulkanQwen3MoeMoeUpload
     /// <param name="expertSlots">Expert tiering (#939): when &gt; 0 the three routed banks are allocated for this many experts and left EMPTY (filled on demand by the tier); 0 = full resident banks.</param>
     /// <param name="sharedPackedDefault">Default for the packed Q8_0 shared-expert upload (#987) when <c>DOTLLM_VK_MOE_SHARED_PACKED</c> is unset: true for the Qwen3.6 hybrid loader, false for qwen4exp (prefill -4..5%).</param>
     /// <param name="edge0">Edge0 latent-MoE buffers (G3, #1981): the router and the three expert banks come from them instead of <paramref name="moe"/>.</param>
+    /// <param name="mtpExperts">Edge0 MTP head experts (G6, #1990): the routed banks are this planar blob buffer (Q2_0); the router and shared expert still come from <paramref name="moe"/>.</param>
     public static unsafe LayerBundle UploadLayer(
         VulkanDevice device, MoeLayerWeights moe, int hiddenSize,
         bool residentQuant = false, VulkanStagingBuffer? sharedStaging = null, VulkanBankPrealloc? prealloc = null, int expertSlots = 0, bool sharedPackedDefault = true,
-        Edge0LayerBuffers? edge0 = null)
+        Edge0LayerBuffers? edge0 = null, Edge0MtpExperts? mtpExperts = null)
     {
         int numE = moe.NumExperts;
         int interm = moe.IntermediateSize;
@@ -369,9 +374,9 @@ internal static class VulkanQwen3MoeMoeUpload
         // resident indexed-matmul kernel wired up (see s_ResidentQuantTypes)
         // are eligible; anything else falls back to F32 for that bank alone.
         bool integerDot = device.HasIntegerDotProduct;
-        QuantizationType w1Qt = edge0 is not null ? edge0.GateUpType : ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot);
-        QuantizationType w2Qt = edge0 is not null ? edge0.DownType : ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView, interm, integerDot);
-        QuantizationType w3Qt = edge0 is not null ? edge0.GateUpType : ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot);
+        QuantizationType w1Qt = mtpExperts is not null ? QuantizationType.Q2_0 : edge0 is not null ? edge0.GateUpType : ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot);
+        QuantizationType w2Qt = mtpExperts is not null ? QuantizationType.Q2_0 : edge0 is not null ? edge0.DownType : ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView, interm, integerDot);
+        QuantizationType w3Qt = mtpExperts is not null ? QuantizationType.Q2_0 : edge0 is not null ? edge0.GateUpType : ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot);
 
         // Bounded persistently-mapped staging (issue #147): banks stream through
         // it one expert slab (or chunk) at a time — the previous whole-bank
@@ -403,7 +408,11 @@ internal static class VulkanQwen3MoeMoeUpload
         //       buffer is at a fraction of the F32 size (quant-dependent).
         long tBanks = System.Diagnostics.Stopwatch.GetTimestamp();
         VulkanDevice.Buffer w1Bank, w2Bank, w3Bank;
-        if (edge0 is not null)
+        if (mtpExperts is not null)
+        {
+            w1Bank = mtpExperts.Blobs; w2Bank = mtpExperts.Blobs; w3Bank = mtpExperts.Blobs;
+        }
+        else if (edge0 is not null)
         {
             w1Bank = edge0.Records; w2Bank = edge0.Records; w3Bank = edge0.Records;   // one record array, three offsets (the strided kernels)
         }
@@ -509,6 +518,7 @@ internal static class VulkanQwen3MoeMoeUpload
             SelectionBias = moe.SigmoidGating && moe.SelectionBias is not null ? UploadFloatArray(device, staging, moe.SelectionBias) : null,
             WeightsScale = moe.WeightsScale,
             Edge0 = edge0,
+            Edge0Mtp = mtpExperts,
         };
     }
 

@@ -132,7 +132,27 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     /// </summary>
     /// <param name="headFile">An opened GGUF carrying the head; must outlive the model unless <paramref name="ownsFile"/>.</param>
     /// <param name="ownsFile">Dispose <paramref name="headFile"/> with the model.</param>
-    public void AttachMtpHead(GgufFile headFile, bool ownsFile = false)
+    public void AttachMtpHead(GgufFile headFile, bool ownsFile = false) => AttachMtpHead(headFile, ownsFile, edge0Head: null);
+
+    /// <summary>
+    /// Opens the Edge0 draft head in <paramref name="mtpDir"/> (<c>dense.txt</c> / <c>dense.bin</c> / <c>experts.bin</c> / <c>draft_vocab.bin</c>, G6 #1990), maps it in place (on UMA the
+    /// planar Q2_0 experts are imported, not copied) and attaches it through the ordinary head path; the model owns the pack.
+    /// </summary>
+    /// <param name="mtpDir">The <c>mtp</c> folder of the Edge0 model.</param>
+    public void AttachEdge0MtpHead(string mtpDir)
+    {
+        var pack = DotLLM.Models.Edge0.Edge0MtpPack.Open(mtpDir, Config.VocabSize,
+            importableViews: _device.HasExternalMemoryHost && !VulkanWeightImportPolicy.IsDisabled);
+        GgufFile? view = null;
+        try
+        {
+            view = pack.BuildHeadGguf(Config, ggmlExpertBanks: false, trunk: _gguf, viewOwnsPack: true);
+            AttachMtpHead(view, ownsFile: true, edge0Head: pack);
+        }
+        catch { if (view is not null) view.Dispose(); else pack.Dispose(); throw; }
+    }
+
+    private void AttachMtpHead(GgufFile headFile, bool ownsFile, DotLLM.Models.Edge0.Edge0MtpPack? edge0Head)
     {
         ArgumentNullException.ThrowIfNull(headFile);
         if (_mtp is not null) throw new InvalidOperationException("An MTP head is already attached.");
@@ -140,7 +160,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         if (_spvDir is null) throw new InvalidOperationException("The model was not built by BuildFromGguf (no SPIR-V directory).");
         var tensors = headFile.TensorsByName;
         var cfg = Qwen4ExpTensors.HeadConfig(Config, tensors);   // #1529: the head carries its own expert count
-        var problems = Qwen4ExpTensors.FindProblems(tensors, cfg, includeTrunk: false, includeMtp: true);
+        var problems = Qwen4ExpTensors.FindProblems(tensors, cfg, includeTrunk: false, includeMtp: true, skeleton: edge0Head is not null);
         if (problems.Count > 0)
             throw new InvalidDataException("qwen4exp MTP head tensor table does not match the contract: " +
                                            string.Join("; ", problems.Take(8)) + (problems.Count > 8 ? $"; (+{problems.Count - 8} more)" : ""));
@@ -163,6 +183,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 && kv.Value.Shape[0] % (target == QuantizationType.Q4_K ? 256 : 32) == 0)
                 requantSaving += bytes - Dequantize.RowByteSize(kv.Value.Shape[0], target) * rows;
         }
+        if (edge0Head is not null && !edge0Head.ImportableViews) headBytes += DotLLM.Models.Edge0.Edge0MtpPack.Experts * DotLLM.Models.Edge0.Edge0MtpPack.ExpertBlobBytes;   // copied, not imported
         long snapBytes = DefaultSnapshotBytes();
         // #900: the Q8_0 head (~3 GiB) is what keeps MTP off the 79 GiB UD-Q4_K_XL; its routed banks re-quantised to Q4_K / Q5_1 save ~0.9 GiB and run the
         // fused single-token MoE chain. Mode 0 = never, 1 (default) = whenever the banks are Q8_0, 2 = only when the native head does not fit.
@@ -187,7 +208,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 {
                     AttnNormWeight = [1f], PostAttnNormWeight = [1f], Gdn = null,
                     FullAttn = LoadAttention(b, headFile, tensors, nKv, Config.HeadDim),
-                    Moe = LoadMoe(il, headFile, tensors, cfg, owned, requantRoutedBanks: requant),
+                    Moe = LoadMoe(il, headFile, tensors, cfg, owned, requantRoutedBanks: requant, skipRoutedBanks: edge0Head is not null),
                 },
             };
             // A one-layer attention core: the head's block reuses the validated QSA / MoE kernels. Its embedding table and LM head are never
@@ -242,7 +263,15 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 enorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(_device, staging, F32(headFile, tensors, n + "enorm.weight", H));
                 hnorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(_device, staging, F32(headFile, tensors, n + "hnorm.weight", hcDim));
             }
-            moe = VulkanQwen3MoeMoeUpload.UploadLayer(_device, layers[0].Moe, H, residentQuant: true, sharedPackedDefault: false);
+            Edge0MtpExperts? mtpExperts = null;
+            if (edge0Head is not null)
+            {
+                core.Q4AttachMtpPlanar(MoeIndexedPlanarQ2MmvqKernel.TryCreate(_device, _spvDir)
+                    ?? throw new NotSupportedException("The Edge0 MTP head needs the planar Q2_0 MMVQ kernel (integer dot product, wave32)."));
+                using var expStaging = VulkanStagingBuffer.Create(_device, 64L << 20);
+                mtpExperts = Edge0MtpExperts.Upload(_device, expStaging, edge0Head);
+            }
+            moe = VulkanQwen3MoeMoeUpload.UploadLayer(_device, layers[0].Moe, H, residentQuant: true, sharedPackedDefault: false, mtpExperts: mtpExperts);
 
             long rowBytes = (long)hcDim * 4;
             VulkanDevice.Buffer Scratch(long bytes) { var x = _device.AllocateDeviceLocal(bytes); bufs.Add(x); return x; }

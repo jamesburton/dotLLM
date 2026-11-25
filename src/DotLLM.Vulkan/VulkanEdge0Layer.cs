@@ -4,6 +4,34 @@ using DotLLM.Models.Edge0;
 
 namespace DotLLM.Vulkan;
 
+/// <summary>The Edge0 MTP head's routed experts on the device (G6, #1990): <c>mtp/experts.bin</c>, 512 planar Q2_0 blobs, imported from the mapped file (or copied once when the import is refused).</summary>
+internal sealed class Edge0MtpExperts : IDisposable
+{
+    /// <summary>The blob array (<c>512 * Edge0MtpPack.ExpertBlobBytes</c> bytes).</summary>
+    public required VulkanDevice.Buffer Blobs { get; init; }
+
+    /// <summary>True when <see cref="Blobs"/> aliases the mapped pages (no copy).</summary>
+    public required bool Imported { get; init; }
+
+    /// <summary>Imports (UMA) or copies the head's expert blobs.</summary>
+    public static Edge0MtpExperts Upload(VulkanDevice device, VulkanStagingBuffer staging, DotLLM.Models.Edge0.Edge0MtpPack pack)
+    {
+        long bytes = DotLLM.Models.Edge0.Edge0MtpPack.Experts * DotLLM.Models.Edge0.Edge0MtpPack.ExpertBlobBytes;
+        bool imported = VulkanWeightImportPolicy.TryImport(device, pack.ExpertsPointer, bytes, out var buf);
+        if (!imported)
+        {
+            buf = device.AllocateDeviceLocal(bytes);
+            try { staging.UploadBytes(pack.ExpertsPointer, bytes, buf); staging.WaitAll(); }
+            catch { buf.Dispose(); throw; }
+            VulkanWeightImportPolicy.NoteStaged(pack.ExpertsPointer, bytes);
+        }
+        return new Edge0MtpExperts { Blobs = buf!, Imported = imported };
+    }
+
+    /// <inheritdoc/>
+    public void Dispose() => Blobs.Dispose();
+}
+
 /// <summary>
 /// Device buffers of one Edge0 latent-MoE layer (G3, #1981). The routed experts are split from the pack's fixed 1,630,720 B records into three
 /// contiguous per-layer banks (gate Q3_K, up Q3_K, down IQ4_NL) so the ordinary resident-bank kernels read them in place; D (all groups, one

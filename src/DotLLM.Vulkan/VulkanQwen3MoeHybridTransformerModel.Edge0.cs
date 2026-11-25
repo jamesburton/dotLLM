@@ -9,9 +9,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
     private VulkanDevice.Buffer? _edge0Xl, _edge0ZAll;
     private VulkanDevice.Buffer[]? _edge0Z, _edge0Uo;
     private int _edge0Rows;
+    private Kernels.MoeIndexedPlanarQ2MmvqKernel? _mtpPlanar;
 
     /// <summary>Single-row decode skips the D / U groups no selected expert uses (<c>edge0_d_mmvq</c> / <c>edge0_u_mmvq</c>): identical numerics, fewer bytes. <c>DOTLLM_EDGE0_SKIP_GROUPS=0</c> (or setting this) restores the generic path (A/B).</summary>
     internal static bool Edge0SkipUnusedGroups { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_EDGE0_SKIP_GROUPS") != "0";
+
+    /// <summary>Attaches the planar Q2_0 kernel the Edge0 MTP head's MoE layer is recorded with (G6, #1990). Owned by this core.</summary>
+    internal void Q4AttachMtpPlanar(Kernels.MoeIndexedPlanarQ2MmvqKernel kernel) { _mtpPlanar?.Dispose(); _mtpPlanar = kernel; }
 
     /// <summary>Test hook: layers recorded on the group-skipping decode path.</summary>
     internal long Edge0SkipLayers { get; private set; }
@@ -46,6 +50,41 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
 
     /// <summary>Device bytes of the Edge0 per-forward scratch (0 when not attached).</summary>
     internal long Edge0ScratchBytes => _edge0Xl is null ? 0 : _edge0Xl.Size + _edge0Z!.Sum(b => b.Size) + _edge0Uo!.Sum(b => b.Size);
+
+    /// <summary>
+    /// The MoE half of the Edge0 MTP head's block (G6, #1990): the generic routed-expert path (router, top-k softmax, broadcast, gate/up, SwiGLU, down, weighted scatter, sigmoid-gated
+    /// shared expert) with the three expert projections read in place from the planar Q2_0 blobs by <see cref="Kernels.MoeIndexedPlanarQ2MmvqKernel"/> (indexed for every row count:
+    /// the head runs one row per draft step and AbsorbChunk-row chunks for the prompt).
+    /// </summary>
+    private void RecordEdge0MtpMoeLayer(nint cmd, VulkanQwen3MoeMoeUpload.LayerBundle moeW, int T)
+    {
+        var k = _mtpPlanar ?? throw new InvalidOperationException("The planar Q2_0 kernel was not attached (Q4AttachMtpPlanar).");
+        int H = Config.HiddenSize, topK = moeW.NumExpertsPerTok, E = moeW.NumExperts, interm = moeW.IntermediateSize, rows = T * topK;
+        MoeStageBegin();
+        RecordCopyBufferRange(cmd, _state.NormOutput, _state.MoeSharedInput, 0, 0, (ulong)((long)T * H * sizeof(float)));
+        KernelSupport.ComputeTransferFullBarrier(cmd);
+        RecordMatmul(cmd, moeW.Gate, QuantizationType.F32, _state.NormOutput, _state.MoeRouterLogits, outputDim: E, inputDim: H, seqLen: T);
+        KernelSupport.ComputeToComputeBarrier(cmd);
+        _kernels.MoeTopkSoftmax.Record(cmd, _state.MoeRouterLogits, _state.MoeTopkIndices, _state.MoeTopkWeights, seqLen: T, numExperts: E, k: topK, normTopKProb: moeW.NormTopKProb);
+        KernelSupport.ComputeToComputeBarrier(cmd);
+        _kernels.MoeBroadcast.Record(cmd, _state.NormOutput, _state.MoeExpandedInput, seqLen: T, topK: topK, hidden: H);
+        KernelSupport.ComputeToComputeBarrier(cmd);
+        _kernels.QuantizeQ8_1RowsActivations!.Record(cmd, _state.MoeExpandedInput, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, n: rows, k: H);
+        KernelSupport.ComputeToComputeBarrier(cmd);
+        var blobs = moeW.Edge0Mtp!.Blobs;
+        k.Record(cmd, blobs, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeTopkIndices, _state.MoeGateInter, Kernels.PlanarQ2Projection.Gate, interm, H, rows, E);
+        k.Record(cmd, blobs, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeTopkIndices, _state.MoeUpInter, Kernels.PlanarQ2Projection.Up, interm, H, rows, E);
+        KernelSupport.ComputeToComputeBarrier(cmd);
+        _kernels.SwiGlu.Record(cmd, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter, n: rows * interm);
+        KernelSupport.ComputeToComputeBarrier(cmd);
+        _kernels.QuantizeQ8_1RowsActivations.Record(cmd, _state.MoeSiluInter, _state.MoeSiluInterXq, _state.MoeSiluInterXds, n: rows, k: interm);
+        KernelSupport.ComputeToComputeBarrier(cmd);
+        k.Record(cmd, blobs, _state.MoeSiluInterXq, _state.MoeSiluInterXds, _state.MoeTopkIndices, _state.MoeDownRows, Kernels.PlanarQ2Projection.Down, H, interm, rows, E);
+        KernelSupport.ComputeToComputeBarrier(cmd);
+        _kernels.MoeWeightedScatter.Record(cmd, _state.MoeDownRows, _state.MoeTopkWeights, _state.NormOutput, seqLen: T, topK: topK, hiddenSize: H);
+        KernelSupport.ComputeToComputeBarrier(cmd);
+        if (moeW.HasSharedExpert) RecordSharedExpert(cmd, moeW, postAttnNormWeight: null, T, H, Config.NormEpsilon);
+    }
 
     private void FreeEdge0Scratch()
     {

@@ -227,7 +227,7 @@ internal sealed class MoeGroupedStridedCoopmatKernel : IDisposable
 }
 
 /// <summary>Which projection of an Edge0 MTP expert blob a planar kernel call reads.</summary>
-internal enum PlanarQ2Projection
+public enum PlanarQ2Projection
 {
     /// <summary>Gate rows (the even rows of the interleaved gate/up planes).</summary>
     Gate,
