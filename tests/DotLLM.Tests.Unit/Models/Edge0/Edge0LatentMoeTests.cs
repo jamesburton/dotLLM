@@ -45,6 +45,7 @@ public sealed unsafe class Edge0LatentMoeTests
         for (int layer = 0; layer < pack.Layers; layer++)
         {
             var y = new float[T * H];
+            Array.Fill(y, float.NaN);   // y is "fully overwritten": a forward that accumulates into it instead must fail here
             Edge0LatentMoe.Forward(pack, layer, router, K, normTopKProb: true, shared: null, x, y, T, pool);
             for (int t = 0; t < T; t++)
             {

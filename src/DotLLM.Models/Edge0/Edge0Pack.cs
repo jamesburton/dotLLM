@@ -314,6 +314,7 @@ public sealed unsafe class Edge0Pack : IDisposable
 
     private void CheckLayer(int layer)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);   // the views are unmapped: a pointer would dangle
         if ((uint)layer >= (uint)Layers) throw new ArgumentOutOfRangeException(nameof(layer));
     }
 

@@ -138,7 +138,7 @@ public sealed class Edge0RealPackTests(ITestOutputHelper output)
         foreach (string line in File.ReadLines(Path.Combine(dir, "index.txt")))
         {
             var p = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (p.Length != 19 || p[0] != name) continue;
+            if (p.Length != 19 || !string.Equals(p[0], name, StringComparison.Ordinal)) continue;
             Assert.Equal("4", p[2]);                     // BF16 raw
             long off = long.Parse(p[3], System.Globalization.CultureInfo.InvariantCulture), bytes = long.Parse(p[4], System.Globalization.CultureInfo.InvariantCulture);
             Assert.Equal(count * 2L, bytes);

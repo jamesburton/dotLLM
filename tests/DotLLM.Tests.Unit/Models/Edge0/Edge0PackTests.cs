@@ -133,6 +133,18 @@ public sealed unsafe class Edge0PackTests
     }
 
     [Fact]
+    public void Accessors_ThrowAfterDispose()
+    {
+        using var syn = new SyntheticEdge0Pack();
+        var pack = syn.Open();
+        pack.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => pack.ExpertRecord(0, 0));
+        Assert.Throws<ObjectDisposedException>(() => pack.D(0, 0));
+        Assert.Throws<ObjectDisposedException>(() => pack.U(0, 0));
+        Assert.Throws<ObjectDisposedException>(() => pack.Labels(0).Length);
+    }
+
+    [Fact]
     public void Open_RefusesShortScaleVector()
     {
         using var syn = new SyntheticEdge0Pack();
