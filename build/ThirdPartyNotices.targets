@@ -26,6 +26,7 @@
     <ParameterGroup>
       <Packages ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
       <RuntimePacks ParameterType="Microsoft.Build.Framework.ITaskItem[]" />
+      <Frameworks ParameterType="Microsoft.Build.Framework.ITaskItem[]" />
       <PackageRoot ParameterType="System.String" Required="true" />
       <LicenseTemplateDir ParameterType="System.String" Required="true" />
       <Product ParameterType="System.String" Required="true" />
@@ -80,7 +81,18 @@
 
         sb.AppendLine("Components:");
         foreach (var p in packages) sb.AppendLine("  " + p.Id + " " + p.Version);
+        // The SDK resolves a runtime pack for every known framework of the RID (a win-x64 console app gets the Windows Desktop
+        // pack too); only the frameworks the app references are bundled, so list only those. A profile reference such as
+        // Microsoft.WindowsDesktop.App.WindowsForms names its framework only through its targeting pack (<framework>.Ref).
+        var referenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var f in Frameworks ?? new Microsoft.Build.Framework.ITaskItem[0])
+        {
+            referenced.Add(f.ItemSpec);
+            var tp = f.GetMetadata("TargetingPackName");
+            if (tp.EndsWith(".Ref", StringComparison.OrdinalIgnoreCase)) referenced.Add(tp.Substring(0, tp.Length - 4));
+        }
         var packs = (RuntimePacks ?? new Microsoft.Build.Framework.ITaskItem[0])
+            .Where(i => i.GetMetadata("FrameworkName").Length == 0 || referenced.Contains(i.GetMetadata("FrameworkName")))
             .Select(i => i.GetMetadata("PackageDirectory")).Where(d => d.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(d => d, StringComparer.OrdinalIgnoreCase).ToList();
         foreach (var d in packs) sb.AppendLine("  " + Path.GetFileName(Path.GetDirectoryName(d.TrimEnd('/', '\\'))) + " " + Path.GetFileName(d.TrimEnd('/', '\\')) + " (.NET runtime pack)");
@@ -184,6 +196,7 @@
     <DotLLMGenerateThirdPartyNotices
         Packages="@(RuntimeCopyLocalItems);@(NativeCopyLocalItems);@(ResourceCopyLocalItems)"
         RuntimePacks="@(ResolvedRuntimePack)"
+        Frameworks="@(ResolvedFrameworkReference)"
         PackageRoot="$(NuGetPackageRoot)"
         LicenseTemplateDir="$(MSBuildThisFileDirectory)licenses"
         Product="$(ThirdPartyNoticesProduct)"
