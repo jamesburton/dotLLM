@@ -2476,6 +2476,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel, IVulk
         nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW,
         VulkanDevice.Buffer? postAttnNormWeight, int seqLen, int hidden, float eps, float blockCoresetTopP = 0f)
     {
+        if (moeW.Edge0 is not null) { RecordEdge0MoeLayer(cmdBuf, moeW, seqLen); return; }   // Edge0 latent MoE (G3, #1981)
         int interm = moeW.IntermediateSize;
         int numE = moeW.NumExperts;
         int topK = moeW.NumExpertsPerTok;
@@ -3510,6 +3511,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel, IVulk
             _residentMoeBundles[i]?.Dispose();
             _residentMoeBundles[i] = null;
         }
+        FreeEdge0Scratch();
+        _edge0Kernels?.Dispose();
         _moeUnitScale?.Dispose();
         _state.Dispose();
         _weights.Dispose();
