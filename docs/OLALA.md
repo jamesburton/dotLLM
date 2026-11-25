@@ -256,3 +256,7 @@ Not equivalent (corrected in the #1988 review): leaving the K token shift unmask
 **Throughput** (Strix Halo, Vulkan, q8_0-safe2, warm, same session, 300-token chat prompt prefill then 48 greedy decode steps; UMA swing and a shared GPU make runs differ):
 BF16 activations prefill 180-307 tok/s, decode 27-31 tok/s; F32-activation control prefill 326-330, decode 30.3-30.4 (storage dtype is throughput-neutral within noise); bf16 GGUF prefill 289-296, decode 24.7-25.4.
 Levers not taken: split-KV attention (12 workgroups per decode token), 128-thread Mamba workgroups (48 workgroups of 64 lanes), fusing the geodesic into the following GEMV, a chunked prefill scan, the 36 x ~25 dispatches per token.
+
+**Mamba-3 step state in registers (#2001).** `olala_mamba3_step` (46% of 300-token prefill, 7.5 ms/call) read-modify-wrote the 32 KB F32 state of each head in global memory on every token. Each lane (one `p`) now holds its N-long
+state column in registers for the whole chunk (load once, store once; `N` and `R` are specialization constants so the loops unroll; loader requires head dim <= 64). Same F32 state, same arithmetic order. Same-session interleaved A/B
+(new/old/new/old, 3 warm rounds each): prefill 471-486 vs 315-324 tok/s (+49%), decode 31.6-31.8 vs 30.1 (neutral). Mutants killed by the tiny gates: state store dropped, state load dropped (decode gate only), alpha decay dropped, previous-K swap.
