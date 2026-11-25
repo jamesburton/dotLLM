@@ -304,7 +304,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 int recImported = e0.Count(b => b.RecordsImported), routerImported = e0.Count(b => b.RouterImported);
                 long recCopied = e0.Where(b => !b.RecordsImported).Sum(b => b.Experts * b.RecordBytes);
                 Console.Error.WriteLine($"[dotLLM] edge0 pack: expert records imported in place for {recImported}/{e0.Length} layers, BF16 routers for {routerImported}/{e0.Length}" +
-                                        (edge0Pack.ImportableViews ? "" : "; pack mapped READ-ONLY (could not open it for write), so no import was possible") + ".");
+                                        (edge0Pack.ImportableViews || !(device.HasExternalMemoryHost && !VulkanWeightImportPolicy.IsDisabled) ? ""
+                                            : "; pack mapped READ-ONLY (could not open it for write), so no import was possible") + ".");
                 if (recImported < e0.Length)
                     Console.Error.WriteLine($"[dotLLM] WARNING: edge0 expert records COPIED through host staging for {e0.Length - recImported} layers ({recCopied / (double)(1L << 30):F1} GiB, " +
                                             $"first reason: {e0.First(b => !b.RecordsImported).RecordsFallbackReason}); zero-copy needs a UMA device with VK_EXT_external_memory_host and a writable pack.");
