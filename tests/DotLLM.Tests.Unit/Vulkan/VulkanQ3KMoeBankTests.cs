@@ -145,7 +145,9 @@ public sealed class VulkanQ3KMoeBankTests
         double ss = 0, es = 0;
         for (int i = 0; i < control.Length; i++) { ss += control[i] * control[i]; double d = control[i] - actual[i]; es += d * d; }
         double rel = Math.Sqrt(es / ss);
-        Assert.True(rel < 0.03, $"Q3_K MMVQ vs F32-decoded control: relative RMS error {rel:G4} (int8 activations alone should stay below ~1%).");
+        // Measured on gfx1151 (PR #1982 review): 0.0034..0.0043 across these four cases. The bound is ~2.3x the worst case, not the 3% it was
+        // (7x headroom would let a mutant costing a few percent pass this arm).
+        Assert.True(rel < 0.01, $"Q3_K MMVQ vs F32-decoded control: relative RMS error {rel:G4} (measured 0.0034..0.0043 on gfx1151; int8 activations alone).");
     }
 
     [SkippableFact]
@@ -224,7 +226,8 @@ public sealed class VulkanQ3KMoeBankTests
         double[] r0 = RefDot(bank, expertOfRow, m, k, rows, 1, (r, i) => x[(long)r * k + i]);
         float maxAbs = (float)r0.Max(Math.Abs);
         Assert.True(maxAbs > 1e-3f, "reference output is degenerate (all ~0): the comparison would be vacuous.");
-        float tol = 6e-3f * maxAbs;
+        // F16 A/B operands: measured max |err| / maxAbs 2.6e-4..3.6e-4 on gfx1151 (PR #1982 review); 1.5e-3 is ~4x that (was 6e-3, ~17x).
+        float tol = 1.5e-3f * maxAbs;
         for (int i = 0; i < r0.Length; i++)
         {
             Assert.True(a[i] == b[i], $"idx {i} (row {i / m}, col {i % m}): legacy grid {a[i]:G9} != indirect {b[i]:G9}");
