@@ -65,7 +65,8 @@
         // Roslyn ships its notices as RTF: keep the text, drop the markup.
         Func<string, string> read = path =>
         {
-            var text = File.ReadAllText(path);
+            // Drop control characters: Roslyn's RTF ends in a NUL byte, which makes grep and editors treat the file as binary.
+            var text = Regex.Replace(File.ReadAllText(path), @"[\x00-\x08\x0B\x0E-\x1F\x7F]", "");
             if (!path.EndsWith(".rtf", StringComparison.OrdinalIgnoreCase)) return text.TrimEnd();
             text = Regex.Replace(text, @"\\par[d]?\b", "\n");
             text = Regex.Replace(text, @"\\'([0-9a-fA-F]{2})", m => ((char)Convert.ToInt32(m.Groups[1].Value, 16)).ToString());
