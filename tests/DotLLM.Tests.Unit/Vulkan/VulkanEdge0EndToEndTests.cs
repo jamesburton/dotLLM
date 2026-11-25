@@ -214,6 +214,19 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
             dec.Add(N / swd.Elapsed.TotalSeconds);
         }
         output.WriteLine($"SPEED prefill {longIds.Length} tok: {string.Join(" / ", pfs.Select(v => v.ToString("F0")))} tok/s; decode 48 tok: {string.Join(" / ", dec.Select(v => v.ToString("F1")))} tok/s; device live {device.LiveBytesTotal() / (double)(1L << 30):F2} GiB");
+        if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_STAGES") == "1")
+        {
+            // Stage profile of single-row decode (each stage ends in a submit + wait: totals overstate by the sync cost, the ranking is what matters).
+            VulkanQwen4ExpTransformerModel.StageProfile = true;
+            vk.ResetSequenceState();
+            using (vk.Forward(inputs[1], Enumerable.Range(0, inputs[1].Length).ToArray(), -1, null, true)) { }
+            vk.TakeStageTimes();
+            int pos2 = inputs[1].Length;
+            for (int sIdx = 0; sIdx < 16; sIdx++) { using var lg = vk.Forward([13], [pos2++], -1, null, true); }
+            foreach (var kv in vk.TakeStageTimes().OrderByDescending(k => k.Value).Take(24))
+                output.WriteLine($"STAGE {kv.Key}: {kv.Value / 16:F2} ms/token");
+            VulkanQwen4ExpTransformerModel.StageProfile = false;
+        }
         Assert.True(failures.Count == 0, string.Join("; ", failures));
     }
 
