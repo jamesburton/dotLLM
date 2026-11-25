@@ -170,6 +170,9 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
         using var vk = VulkanQwen4ExpTransformerModel.BuildFromGguf(device, gguf, GgufModelConfigExtractor.Extract(gguf.Metadata), spvDir);
         output.WriteLine($"vulkan load: {sw.Elapsed.TotalSeconds:F1} s; device live {device.LiveBytesTotal() / (double)(1L << 30):F2} GiB");
 
+        using var tg = GgufFile.Open(fx.Path!);
+        var tok = GgufBpeTokenizerFactory.Load(tg.Metadata);
+        var failures = new List<string>();
         for (int i = 0; i < inputs.Length; i++)
         {
             var r = Execute(vk, inputs[i], nll: i == 0, n => vk.TrySetAllRowLogitsLimit(n));
@@ -181,9 +184,90 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
             output.WriteLine($"input {i}: {inputs[i].Length} tok; KL(cpu||vk) last row {kl:E3}; row argmax agree {rowAgree}/{c.RowArgmax.Length}; " +
                              $"greedy agree {greedyAgree}/{GreedyTokens} (first divergence {(firstDiv < 0 ? "none" : firstDiv.ToString())}); " +
                              (i == 0 ? $"NLL cpu {c.MeanNll:F4} vk {r.MeanNll:F4}" : ""));
-            if (i == 0) Assert.True(Math.Abs(c.MeanNll - r.MeanNll) < 0.05, $"NLL cpu {c.MeanNll:F4} vs vulkan {r.MeanNll:F4}");
-            Assert.True(kl < 0.05, $"input {i}: KL {kl:E3}");
-            Assert.True(r.RowArgmax[^1] == c.RowArgmax[^1], $"input {i}: next-token argmax differs");
+            output.WriteLine($"  cpu text: {tok.Decode(c.Greedy).Replace("
+", "\n")}");
+            output.WriteLine($"  vk  text: {tok.Decode(r.Greedy).Replace("
+", "\n")}");
+            if (i == 0 && Math.Abs(c.MeanNll - r.MeanNll) >= 0.05) failures.Add($"NLL cpu {c.MeanNll:F4} vs vulkan {r.MeanNll:F4}");
+            if (kl >= 0.05) failures.Add($"input {i}: KL {kl:E3}");
+            if (r.RowArgmax[^1] != c.RowArgmax[^1]) failures.Add($"input {i}: next-token argmax differs");
+        }
+
+        // Speed (warm): prefill of the passage repeated to ~512 tokens, then single-token decode. Same session, after the parity forwards warmed every pipeline.
+        var longIds = Enumerable.Range(0, 5).SelectMany(_ => inputs[0]).Take(512).ToArray();
+        vk.TrySetAllRowLogitsLimit(1);
+        var pfs = new List<double>();
+        for (int rep = 0; rep < 3; rep++)
+        {
+            vk.ResetSequenceState();
+            var swp = System.Diagnostics.Stopwatch.StartNew();
+            using (vk.Forward(longIds, Enumerable.Range(0, longIds.Length).ToArray(), -1, null, true)) { }
+            pfs.Add(longIds.Length / swp.Elapsed.TotalSeconds);
+        }
+        var dec = new List<double>();
+        for (int rep = 0; rep < 3; rep++)
+        {
+            vk.ResetSequenceState();
+            using (vk.Forward(inputs[1], Enumerable.Range(0, inputs[1].Length).ToArray(), -1, null, true)) { }
+            int pos = inputs[1].Length, next = 13;
+            var swd = System.Diagnostics.Stopwatch.StartNew();
+            const int N = 48;
+            for (int sIdx = 0; sIdx < N; sIdx++) { using var lg = vk.Forward([next], [pos++], -1, null, true); }
+            dec.Add(N / swd.Elapsed.TotalSeconds);
+        }
+        output.WriteLine($"SPEED prefill {longIds.Length} tok: {string.Join(" / ", pfs.Select(v => v.ToString("F0")))} tok/s; decode 48 tok: {string.Join(" / ", dec.Select(v => v.ToString("F1")))} tok/s; device live {device.LiveBytesTotal() / (double)(1L << 30):F2} GiB");
+        Assert.True(failures.Count == 0, string.Join("; ", failures));
+    }
+
+    /// <summary>Per-layer divergence of the Vulkan residual stream from the CPU one (<c>DOTLLM_EDGE0_VK_E2E=trace</c>), on a short prompt (indexed MMVQ path) and a 40-token prefix (grouped coopmat path).</summary>
+    [SkippableFact]
+    public void Stage_LayerTrace()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_EDGE0_VK_E2E") == "trace", "DOTLLM_EDGE0_VK_E2E=trace (CPU then GPU; hold both locks)");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        var fx = Locate();
+        Skip.IfNot(fx.Found, fx.SkipMessage("Edge0-145B-q3k"));
+        var all = Inputs(fx.Path!);
+        int[][] cases = [all[3], all[0].AsSpan(0, 40).ToArray()];
+        var cpuTraces = new List<Dictionary<string, float[]>>();
+        {
+            var (model, gguf, _) = ModelLoader.LoadFromGguf(fx.Path!, DotLLM.Core.Configuration.ThreadingConfig.Auto);
+            using (gguf) using (model)
+            {
+                var cpu = (DotLLM.Models.Architectures.Qwen4ExpTransformerModel)model;
+                foreach (var ids in cases)
+                {
+                    var d = new Dictionary<string, float[]>();
+                    cpu.Trace = (n, data, r, c) => d[n] = data.ToArray();
+                    model.ResetSequenceState();
+                    using var _ = model.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), 0);
+                    cpuTraces.Add(d);
+                }
+            }
+        }
+        using var g2 = GgufFile.Open(fx.Path!);
+        using var device = VulkanDevice.Create();
+        using var vk = VulkanQwen4ExpTransformerModel.BuildFromGguf(device, g2, GgufModelConfigExtractor.Extract(g2.Metadata), spvDir);
+        int defaultMin = vk.MoeGroupedMinTokens;
+        for (int run = 0; run < cases.Length * 2; run++)
+        {
+            int k = run % cases.Length;
+            bool flipped = run >= cases.Length;   // second pass: the OTHER expert path (grouped coopmat F16 operands vs indexed MMVQ int8 activations)
+            vk.MoeGroupedMinTokens = flipped ? (cases[k].Length >= defaultMin ? 1_000_000 : 1) : defaultMin;
+            var d = new Dictionary<string, float[]>();
+            vk.Trace = (n, data, r, c) => d[n] = data;
+            vk.ResetSequenceState();
+            vk.TrySetAllRowLogitsLimit(cases[k].Length);
+            using var _ = vk.Forward(cases[k], Enumerable.Range(0, cases[k].Length).ToArray(), -1);
+            var sb = new System.Text.StringBuilder($"trace case {k} ({cases[k].Length} tokens, {(cases[k].Length >= vk.MoeGroupedMinTokens ? "grouped" : "indexed")} experts) rel-RMS(vk-cpu) per layer:");
+            for (int il = 0; il < 48; il++)
+            {
+                var a = cpuTraces[k][$"blk.{il}.l_out"]; var b = d[$"blk.{il}.l_out"];
+                double num = 0, den = 0;
+                for (int i = 0; i < a.Length; i++) { double e = a[i] - b[i]; num += e * e; den += (double)a[i] * a[i]; }
+                sb.Append($" {il}:{Math.Sqrt(num / den):E1}");
+            }
+            output.WriteLine(sb.ToString());
         }
     }
 }
