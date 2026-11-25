@@ -293,11 +293,21 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                         throw new NotSupportedException($"Edge0 router blk.{il}.ffn_gate_inp.weight is {routerDesc.QuantizationType}; the Vulkan path reads BF16.");
                     var e0Layer = Edge0LayerBuffers.Upload(device, e0Staging, edge0Pack, il, gguf.TensorDataPointer(routerDesc));
                     try { moeBundles.Add(VulkanQwen3MoeMoeUpload.UploadLayer(device, layers[il].Moe, config.HiddenSize, residentQuant: true, e0Staging, null, 0, false, e0Layer)); }
-                    catch { e0Layer.Dispose(); throw; }
+                    catch { e0Layer.Dispose(); e0Layer.Router.Dispose(); e0Layer.Records.Dispose(); throw; }   // UploadLayer took neither: the bundle never formed
                     if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal))
                         Console.Error.WriteLine($"[vulkan-load] edge0 layer {il}: live {VulkanQwen3MoeMoeUpload.LiveDeviceBytes(device) >> 20} MiB");
                 }
                 e0Staging.WaitAll();
+                // Rule 3 / zero-copy: say whether the 40 GB of records were imported in place. A refused import copies them (one contiguous buffer per layer) through
+                // the staging ring, a host bounce that must never pass unnoticed on a UMA device.
+                var e0 = moeBundles.Select(b => b.Edge0!).ToArray();
+                int recImported = e0.Count(b => b.RecordsImported), routerImported = e0.Count(b => b.RouterImported);
+                long recCopied = e0.Where(b => !b.RecordsImported).Sum(b => b.Experts * b.RecordBytes);
+                Console.Error.WriteLine($"[dotLLM] edge0 pack: expert records imported in place for {recImported}/{e0.Length} layers, BF16 routers for {routerImported}/{e0.Length}" +
+                                        (edge0Pack.ImportableViews ? "" : "; pack mapped READ-ONLY (could not open it for write), so no import was possible") + ".");
+                if (recImported < e0.Length)
+                    Console.Error.WriteLine($"[dotLLM] WARNING: edge0 expert records COPIED through host staging for {e0.Length - recImported} layers ({recCopied / (double)(1L << 30):F1} GiB, " +
+                                            $"first reason: {e0.First(b => !b.RecordsImported).RecordsFallbackReason}); zero-copy needs a UMA device with VK_EXT_external_memory_host and a writable pack.");
             }
             else
             VulkanQwen3MoeMoeUpload.UploadResidentLayers(device, layers.Select(l => (MoeLayerWeights?)l.Moe).ToArray(), config.HiddenSize,
