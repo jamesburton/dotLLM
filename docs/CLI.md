@@ -1316,7 +1316,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_VULKAN_HAZARD_BARRIERS` |  Hazard-scoped barriers (issue #144)  Legacy behaviour emitted a full-pipeline barrier after essentially every dispatch (~573/token on SmolLM decode), serialising the GPU so wall time = sum of op times. The hazard tracker repla... | `VulkanTransformerModel.cs` |
 | `DOTLLM_VULKAN_HAZARD_DEBUG` | Diagnostic (issue #144): DOTLLM_VULKAN_HAZARD_DEBUG=1 prints the first guards of the process with the buffer that forced each barrier. | `VulkanHazardTracker.cs` |
 | `DOTLLM_VULKAN_HAZARD_VALIDATE` | Debug aid: keep the tracker armed but force a barrier at every guard - legacy-equivalent ordering through the tracked code path. | `VulkanTransformerModel.cs` |
-| `DOTLLM_VULKAN_HOST_IMPORT_WRITABLE` | Whether a refused read-only import is retried through a shared writable alias view of the same file range (#1190, #1991). DOTLLM_VULKAN_HOST_IMPORT_WRITABLE: 0 = never, 1 = always (even on a discrete GPU), unset = on for an int... | `VulkanWeightImportPolicy.cs` |
+| `DOTLLM_VULKAN_HOST_IMPORT_WRITABLE` | Whether a refused read-only import is retried through a shared writable alias view of the same file range (#1190, #1991). DOTLLM_VULKAN_HOST_IMPORT_WRITABLE: 0 = never, 1 = always (even on a discrete GPU), unset = off (was prop... | `VulkanWeightImportPolicy.cs` |
 | `DOTLLM_VULKAN_HYBRID_PROFILE` | (not described in source) | `VulkanQwen3HybridDenseTransformerModel.Profiling.cs` |
 | `DOTLLM_VULKAN_HYBRID_PROFILE_MINSEQ` | (not described in source) | `VulkanQwen3HybridDenseTransformerModel.Profiling.cs` |
 | `DOTLLM_VULKAN_HYBRID_PROFILE_OUT` | (not described in source) | `VulkanQwen3HybridDenseTransformerModel.Profiling.cs` |

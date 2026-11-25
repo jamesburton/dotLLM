@@ -1083,7 +1083,7 @@ Loaders that never call `TryImport` are not changed by the flag: on Qwen3.6-35B-
 shared tensors import (191 tensors, 1.7 GiB; private WS 23.8 -> 21.9 GiB) but the routed-expert banks
 (`VulkanQwen3MoeMoeUpload`) always stage.
 
-Why it needed a guard (the file is open for write while aliased; #1991 adds a SHA-256 write guard test, `VulkanWeightImportWriteGuardTests`):
+Why it is opt-in (#1991 adds a SHA-256 write guard test, `VulkanWeightImportWriteGuardTests`, for the write risk below):
 
 - It opens the checkpoint **for write** (shared). A stray device write would reach the file on disk.
   Weight buffers are bound read-only in every shader, but nothing enforces that in Vulkan.

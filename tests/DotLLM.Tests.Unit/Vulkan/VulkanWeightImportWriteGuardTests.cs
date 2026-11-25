@@ -10,8 +10,9 @@ using DotLLM.Tests.Integration.Fixtures;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// #1991 write guard. The default UMA import maps the GGUF through a shared <b>writable</b> view (the driver refuses
-/// read-only pages; copy-on-write is accepted but privatises every page, so it costs what staging costs). Writable means a
+/// #1991 write guard. The opt-in UMA import (<c>DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1</c>; off by default) maps the GGUF
+/// through a shared <b>writable</b> view (the driver refuses read-only pages; copy-on-write is accepted but privatises every
+/// page, so it costs what staging costs). Writable means a
 /// stray device write would reach the checkpoint on disk, so this asserts the opposite on a real load: SHA-256 and
 /// last-write time of the file are unchanged after the import-engaged load plus prefill and decode.
 /// </summary>

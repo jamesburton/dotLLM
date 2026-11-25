@@ -84,12 +84,20 @@ internal static class VulkanWeightImportPolicy
     /// <summary>The first refusal's detail on the current load (empty when none).</summary>
     public static string FirstRejection { get; private set; } = string.Empty;
 
-    /// <summary>One warning line when imports were refused on this load, so a refusal is never silent (#1991); empty otherwise.</summary>
+    private static int s_reportedRejectedCount;
+
+    /// <summary>
+    /// One warning line when imports were refused since the last report, so a refusal is never silent (#1991); empty
+    /// otherwise. Consuming: it reports each count once, so the staging buffers that are created and disposed after the
+    /// load (per-layer MoE streaming, MTP heads, DFlash) or twice per load (<c>VulkanWeights</c>) do not reprint it.
+    /// </summary>
     public static string RejectionWarning()
-        => RejectedTensorCount == 0
-            ? string.Empty
-            : $"[dotllm] vulkan host import: {RejectedTensorCount} tensors / {RejectedBytes / (1024.0 * 1024.0):F1} MiB refused " +
-              $"(first: {FirstRejection}); staged through host memory instead. Set DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1 to silence.";
+    {
+        if (RejectedTensorCount == s_reportedRejectedCount) return string.Empty;
+        s_reportedRejectedCount = RejectedTensorCount;
+        return $"[dotllm] vulkan host import: {RejectedTensorCount} tensors / {RejectedBytes / (1024.0 * 1024.0):F1} MiB refused " +
+               $"(first: {FirstRejection}); staged through host memory instead. Set DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1 to silence.";
+    }
 
     private static readonly List<(nint Pointer, long Bytes)> s_stagedRanges = [];
 
@@ -197,6 +205,7 @@ internal static class VulkanWeightImportPolicy
         RejectedTensorCount = 0;
         RejectedBytes = 0;
         FirstRejection = string.Empty;
+        s_reportedRejectedCount = 0;
         LastFallbackReason = string.Empty;
         s_stagedRanges.Clear();
     }
@@ -268,8 +277,8 @@ internal static class VulkanWeightImportPolicy
         // #1190: amdvlk and the Arc driver both refuse read-only pages, which is how every GGUF is mapped. Retry from a
         // shared writable view of the same file range (no private pages). A copy-on-write view is also accepted but the
         // driver's write-lock privatises every page, so it costs what staging costs and is not tried.
-        // #1991: on by default for UMA. The file is opened shared-writable but nothing writes to it: weight buffers are bound
-        // read-only (VulkanWeightImportWriteGuardTests hashes the file around a load + decode).
+        // #1991: still opt-in (default-on measured -19% decode / -33% prefill, docs/GPU.md). When on, the file is opened
+        // shared-writable but nothing writes to it: weight buffers are bound read-only (VulkanWeightImportWriteGuardTests).
         string aliasFailure = string.Empty;
         if (wrapped is null && WritableAliasEnabled(device))
         {
@@ -295,9 +304,13 @@ internal static class VulkanWeightImportPolicy
                 ? aliasFailure
                 : $"import_rejected({Interop.HostVisibleBuffer.LastImportFailureStage}" +
                   $":{Interop.HostVisibleBuffer.LastImportFailureCode})";
-            RejectedTensorCount++;
-            RejectedBytes += bytes;
-            if (FirstRejection.Length == 0) FirstRejection = LastFallbackReason;
+            // A discrete GPU refuses by design (#507 not_integrated_gpu): that is policy, not a refusal worth a warning.
+            if (device.PhysicalDeviceTypeValue is Interop.VkPhysicalDeviceType.IntegratedGpu or Interop.VkPhysicalDeviceType.Cpu)
+            {
+                RejectedTensorCount++;
+                RejectedBytes += bytes;
+                if (FirstRejection.Length == 0) FirstRejection = LastFallbackReason;
+            }
             return false;
         }
 
