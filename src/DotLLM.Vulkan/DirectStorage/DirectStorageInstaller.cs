@@ -118,6 +118,10 @@ public static class DirectStorageInstaller
             File.Move(tmp, Path.Combine(target, name), overwrite: true);
         }
         File.WriteAllText(Path.Combine(target, "LICENSE.txt"), licenseText);
+        // #1994: record the acceptance itself (when, which package, which licence text), not just a copy of the licence.
+        File.WriteAllText(Path.Combine(target, "ACCEPTED.txt"),
+            $"accepted_utc={DateTime.UtcNow:O}\npackage=Microsoft.Direct3D.DirectStorage {PackageVersion}\npackage_sha256={PackageSha256}\n" +
+            $"license_sha256={Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(licenseText))).ToLowerInvariant()}\n");
         try { File.Delete(DeclinedMarkerPath); } catch (IOException) { }
         return target;
     }

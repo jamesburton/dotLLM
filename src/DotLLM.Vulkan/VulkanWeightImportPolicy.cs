@@ -378,8 +378,11 @@ internal static class VulkanWeightImportPolicy
         s_lastWarnedBytes = total;
         if (DirectStorage.DirectWeightStore.WouldBeDefaultButDllMissing(device))
             return $"[dotllm] DirectStorage is not installed: {(StagedBytes + BankStagedBytes) / (1024.0 * 1024.0):F0} MiB of weights were copied through host memory " +
-                   $"({StagedBytes / (1024.0 * 1024.0):F0} MiB tensors + {BankStagedBytes / (1024.0 * 1024.0):F0} MiB expert banks). Run `dotllm run` once in a terminal to be offered " +
-                   "Microsoft's DirectStorage (fetched from NuGet after you accept its licence), or place dstorage.dll next to dotllm / in DOTLLM_DIRECTSTORAGE_DIR.";
+                   $"({StagedBytes / (1024.0 * 1024.0):F0} MiB tensors + {BankStagedBytes / (1024.0 * 1024.0):F0} MiB expert banks). " +
+                   (File.Exists(DirectStorage.DirectStorageInstaller.DeclinedMarkerPath)
+                       ? $"You declined the download offer; delete {DirectStorage.DirectStorageInstaller.DeclinedMarkerPath} to be asked again, "
+                       : "Run `dotllm run` once in a terminal to be offered Microsoft's DirectStorage (fetched from NuGet after you accept its licence), ") +
+                   "or place dstorage.dll + dstoragecore.dll next to dotllm / in DOTLLM_DIRECTSTORAGE_DIR (DOTLLM_VULKAN_DIRECT_STORAGE=0 silences this).";
         if (DirectDeclinedCount > 0 && DirectStorage.DirectWeightStore.EnabledFor(device))
             return $"[dotllm] DirectStorage declined {DirectDeclinedCount} tensors / {DirectDeclinedBytes / (1024.0 * 1024.0):F0} MiB (first: {FirstDirectDecline}); " +
                    $"{(StagedBytes + BankStagedBytes) / (1024.0 * 1024.0):F0} MiB of weights were copied through host memory instead.";

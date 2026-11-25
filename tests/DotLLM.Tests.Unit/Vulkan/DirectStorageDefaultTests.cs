@@ -68,7 +68,7 @@ public class DirectStorageDefaultTests(ITestOutputHelper output)
             // Accepted: both DLLs and the licence land in the dotLLM-owned directory.
             string? installed = await DirectStorageInstaller.InstallAsync(_ => true);
             Assert.Equal(dir, installed);
-            foreach (string f in new[] { "dstorage.dll", "dstoragecore.dll", "LICENSE.txt" })
+            foreach (string f in new[] { "dstorage.dll", "dstoragecore.dll", "LICENSE.txt", "ACCEPTED.txt" })
             {
                 Assert.True(File.Exists(Path.Combine(dir, f)), f);
                 output.WriteLine($"{f}: {new FileInfo(Path.Combine(dir, f)).Length} bytes sha256={Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Path.Combine(dir, f))))[..16]}");
