@@ -837,7 +837,7 @@ Some variables are read at process start, others per model load - set them befor
 | `DOTLLM_URL` | `http://localhost:8080` | Server base URL for `ps` and `stop` when `--url` is absent. |
 | `DOTLLM_NO_PROMPT` | unset | `1` suppresses the first-run offer to install the DirectStorage runtime that `run`, `chat`, `bench` and `serve` make on Windows in an interactive terminal. |
 | `DOTLLM_DIRECTSTORAGE_DIR` | package folder | Directory holding the DirectStorage runtime DLLs. |
-| `DOTLLM_VULKAN_DIRECT_STORAGE` | off | `1` loads Vulkan weights straight from disk into device memory via DirectStorage (Windows, opt-in). |
+| `DOTLLM_VULKAN_DIRECT_STORAGE` | on (Windows UMA with `dstorage.dll`) | `0` disables; `1` forces DirectStorage weight loading (disk straight into device memory) on any device. |
 | `DOTLLM_HASH_CACHE_DIR` | `~/.dotllm/hash-cache` | Cache of file digests used to verify `--tensor-overlay` base hashes. |
 | `DOTLLM_GGUF_MAP_COW` | off | `1` maps GGUF files copy-on-write instead of read-only. |
 | `DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER` | off | `1` loads a GGUF whose tokenizer pre-type is unknown with the GPT-2 pipeline instead of refusing (tokenization may differ from the reference). |

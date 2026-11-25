@@ -17,6 +17,14 @@ internal static class DirectStoragePrompt
     {
         try
         {
+            if (NeedsInstall(args) && IsNonInteractive())
+            {
+                // #1994: DirectStorage is the default weight route on Windows UMA, so a missing DLL costs a host copy of every weight.
+                // Non-interactive runs (service, CI, redirected) are never prompted and never download: say how to fix it, once per run.
+                Console.Error.WriteLine("[dotllm] hint: DirectStorage (Microsoft) is not installed, so Vulkan weights are copied through host memory. " +
+                    "Run `dotllm run` once in a terminal to be offered the NuGet download (licence shown first), or put dstorage.dll next to dotllm / in DOTLLM_DIRECTSTORAGE_DIR.");
+                return;
+            }
             if (!ShouldOffer(args)) return;
 
             AnsiConsole.MarkupLine("[yellow]DirectStorage is not installed.[/] dotLLM can use Microsoft's DirectStorage to load model weights");
@@ -37,7 +45,7 @@ internal static class DirectStoragePrompt
                 return;
             }
             AnsiConsole.MarkupLine("[green]Installed[/] to " + Markup.Escape(dir) + ".");
-            AnsiConsole.MarkupLine("DirectStorage weight loading is still opt-in: set [blue]DOTLLM_VULKAN_DIRECT_STORAGE=1[/] to use it.");
+            AnsiConsole.MarkupLine("DirectStorage is now used automatically for Vulkan weight loading on integrated GPUs ([blue]DOTLLM_VULKAN_DIRECT_STORAGE=0[/] turns it off).");
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or PlatformNotSupportedException)
         {
@@ -46,15 +54,20 @@ internal static class DirectStoragePrompt
         }
     }
 
-    private static bool ShouldOffer(string[] args)
+    private static bool NeedsInstall(string[] args)
     {
         if (!DirectStorageInstaller.IsSupportedPlatform) return false;
         if (args.Length == 0 || !s_modelCommands.Contains(args[0])) return false;
-        if (Console.IsInputRedirected || Console.IsOutputRedirected || Console.IsErrorRedirected) return false;
-        if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_NO_PROMPT"), "1", StringComparison.Ordinal)) return false;
+        if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DIRECT_STORAGE"), "0", StringComparison.Ordinal)) return false;
         if (File.Exists(DirectStorageInstaller.DeclinedMarkerPath)) return false;
         return !DirectStorageInstaller.IsAvailable();
     }
+
+    private static bool IsNonInteractive()
+        => Console.IsInputRedirected || Console.IsOutputRedirected || Console.IsErrorRedirected
+           || string.Equals(Environment.GetEnvironmentVariable("DOTLLM_NO_PROMPT"), "1", StringComparison.Ordinal);
+
+    private static bool ShouldOffer(string[] args) => NeedsInstall(args) && !IsNonInteractive();
 
     private static bool ConfirmLicense(string licenseText)
     {

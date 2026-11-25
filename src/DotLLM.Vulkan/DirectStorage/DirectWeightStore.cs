@@ -24,7 +24,7 @@ namespace DotLLM.Vulkan.DirectStorage;
 /// cannot be created. The caller then stages as before. Reads are asynchronous; <see cref="WaitAll"/> (called by
 /// <see cref="VulkanStagingBuffer"/> at the end of each load) blocks until every read landed, and a failed read throws there.
 /// </para>
-/// <para>Opt-in with <c>DOTLLM_VULKAN_DIRECT_STORAGE=1</c> until the A/B on the shipping models has been recorded in #1304.</para>
+/// <para>Default on Windows UMA when <c>dstorage.dll</c> is present (#1994); see <see cref="EnabledFor"/>.</para>
 /// </remarks>
 internal sealed unsafe class DirectWeightStore : IDisposable
 {
@@ -46,9 +46,33 @@ internal sealed unsafe class DirectWeightStore : IDisposable
     internal static int StagingMiB { get; } =
         int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DS_STAGING_MIB"), out int v) && v is >= 4 and <= 2048 ? v : 64;
 
-    /// <summary>True when <c>DOTLLM_VULKAN_DIRECT_STORAGE=1</c>. Read per call (tests toggle it).</summary>
-    internal static bool Enabled =>
-        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DIRECT_STORAGE"), "1", StringComparison.Ordinal);
+    /// <summary>dstorage.dll found (cached: the per-tensor gate must be cheap).</summary>
+    private static readonly Lazy<bool> s_dllAvailable = new(DirectStorageInstaller.IsAvailable);
+
+    /// <summary>
+    /// Whether the DirectStorage tier runs for <paramref name="device"/> (#1994). <c>DOTLLM_VULKAN_DIRECT_STORAGE</c>: <c>0</c> = never,
+    /// <c>1</c> = always (any device, DLL permitting), unset = <b>on for an integrated (UMA) device on Windows when <c>dstorage.dll</c> is
+    /// present</b>. Discrete GPUs keep staging by default (their weights must reach VRAM anyway). Read per call (tests toggle it).
+    /// </summary>
+    internal static bool EnabledFor(VulkanDevice device)
+    {
+        string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DIRECT_STORAGE");
+        if (string.Equals(v, "0", StringComparison.Ordinal)) return false;
+        if (string.Equals(v, "1", StringComparison.Ordinal)) return true;
+        return OperatingSystem.IsWindows()
+            && device.PhysicalDeviceTypeValue == VkPhysicalDeviceType.IntegratedGpu
+            && s_dllAvailable.Value;
+    }
+
+    /// <summary>True when the default would apply but for a missing DLL: Windows, integrated device, tier not switched off.</summary>
+    internal static bool WouldBeDefaultButDllMissing(VulkanDevice device)
+    {
+        string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DIRECT_STORAGE");
+        if (v is "0" or "1") return false;
+        return OperatingSystem.IsWindows()
+            && device.PhysicalDeviceTypeValue == VkPhysicalDeviceType.IntegratedGpu
+            && DirectStorageInstaller.IsSupportedPlatform && !s_dllAvailable.Value;
+    }
 
     private static readonly object s_lock = new();
     private static readonly Dictionary<VulkanDevice, DirectWeightStore> s_byDevice = [];
