@@ -79,6 +79,7 @@ public sealed unsafe class CudaOlalaTransformerModel : IModel
     private long _weightBytes, _stateBytes, _historyBytes;
     private int _length;
     private bool _disposed;
+    private int _actBytes = CudaOlalaStateLayout.ActivationBytes;   // 2 (BF16); 4 only in the F32 measurement-control arm
     private readonly int _hidden, _vocab, _window;
     private readonly float _eps, _softcap;
     private readonly GpuSpillMonitor _spillMonitor = new(() => "CudaOlalaTransformerModel");
@@ -121,6 +122,16 @@ public sealed unsafe class CudaOlalaTransformerModel : IModel
 
     /// <summary>Loads an Olala GGUF (Q8_0 / Q6_K / BF16 / F32 tensors) onto a CUDA device. The GGUF must outlive the model.</summary>
     public static CudaOlalaTransformerModel LoadFromGguf(GgufFile gguf, ModelConfig config, int deviceId = 0, string? ptxDir = null)
+        => Load(gguf, config, deviceId, ptxDir, f32Activations: false);
+
+    /// <summary>
+    /// MEASUREMENT CONTROL ONLY (tests): the same forward with F32 stored activations (<c>olala_f32act.ptx</c>). Internal, never reached from the loader
+    /// or the CLI; F32 activation storage is not approved for the shipped path (it needs sign-off).
+    /// </summary>
+    internal static CudaOlalaTransformerModel LoadF32ActivationControl(GgufFile gguf, ModelConfig config, int deviceId = 0, string? ptxDir = null)
+        => Load(gguf, config, deviceId, ptxDir, f32Activations: true);
+
+    private static CudaOlalaTransformerModel Load(GgufFile gguf, ModelConfig config, int deviceId, string? ptxDir, bool f32Activations)
     {
         ArgumentNullException.ThrowIfNull(gguf); ArgumentNullException.ThrowIfNull(config);
         if (config.Architecture != Architecture.Olala || config.Olala is not { } o)
@@ -132,14 +143,15 @@ public sealed unsafe class CudaOlalaTransformerModel : IModel
             throw new InvalidDataException("olala tensor table does not match the model contract: " + string.Join("; ", problems.Take(8))
                                            + (problems.Count > 8 ? $"; (+{problems.Count - 8} more)" : ""));
         ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
-        if (!File.Exists(Path.Combine(ptxDir, "olala.ptx"))) throw new FileNotFoundException("CUDA Olala requires native/ptx/olala.ptx.");
+        string ptxName = f32Activations ? "olala_f32act.ptx" : "olala.ptx";
+        if (!File.Exists(Path.Combine(ptxDir, ptxName))) throw new FileNotFoundException($"CUDA Olala requires native/ptx/{ptxName}.");
 
         CudaContext? context = null; CudaStream? stream = null; CudaOlalaKernels? kernels = null; CudaOlalaTransformerModel? model = null;
         try
         {
             context = CudaContext.Create(deviceId); stream = CudaStream.Create();
-            kernels = new CudaOlalaKernels(ptxDir);
-            model = new CudaOlalaTransformerModel(config, context, stream, kernels);
+            kernels = new CudaOlalaKernels(ptxDir, f32Activations);
+            model = new CudaOlalaTransformerModel(config, context, stream, kernels) { _actBytes = f32Activations ? 4 : CudaOlalaStateLayout.ActivationBytes };
             model.Upload(gguf);
             return model;
         }
@@ -319,15 +331,15 @@ public sealed unsafe class CudaOlalaTransformerModel : IModel
         if (tokens <= b.Capacity) return;
         long cap = Math.Min(Math.Max(tokens, Math.Max(1024, b.Capacity * 2)), Config.MaxSequenceLength);
         cap = Math.Max(cap, tokens);
-        long kvW = (long)_o.NumNoiseHeads * Config.HeadDim, bytes = cap * kvW * CudaOlalaStateLayout.ActivationBytes;
+        long kvW = (long)_o.NumNoiseHeads * Config.HeadDim, bytes = cap * kvW * _actBytes;
         CudaDriverApi.cuMemGetInfo_v2(out nuint free, out _).ThrowOnError();
-        long extra = 2 * bytes - 2 * b.Capacity * kvW * CudaOlalaStateLayout.ActivationBytes;
-        if (extra + (b.Capacity > 0 ? 2 * b.Capacity * kvW * CudaOlalaStateLayout.ActivationBytes : 0) > (long)free)
+        long extra = 2 * bytes - 2 * b.Capacity * kvW * _actBytes;
+        if (extra + (b.Capacity > 0 ? 2 * b.Capacity * kvW * _actBytes : 0) > (long)free)
             throw new InvalidOperationException($"CUDA olala: the K/V history for {tokens} tokens does not fit in free VRAM ({(long)free / (1 << 20)} MiB free); K/V is never spilled to host memory.");
         nint nk = Alloc(bytes, false), nv = Alloc(bytes, false);
         if (b.Capacity > 0)
         {
-            long old = b.Capacity * kvW * CudaOlalaStateLayout.ActivationBytes;
+            long old = b.Capacity * kvW * _actBytes;
             CudaDriverApi.cuMemcpyDtoDAsync_v2(nk, b.KCache, (nuint)old, _stream.Handle).ThrowOnError();
             CudaDriverApi.cuMemcpyDtoDAsync_v2(nv, b.VCache, (nuint)old, _stream.Handle).ThrowOnError();
             _stream.Synchronize();
@@ -411,7 +423,7 @@ public sealed unsafe class CudaOlalaTransformerModel : IModel
     {
         int c = ids.Length, H = _hidden;
         nint s = _stream.Handle;
-        long act = CudaOlalaStateLayout.ActivationBytes;
+        long act = _actBytes;
         nint idDev = Scratch("ids", c * 4L);
         fixed (int* p = ids) CudaDriverApi.cuMemcpyHtoD_v2(idDev, (nint)p, (nuint)(c * 4)).ThrowOnError();
         nint res = Scratch("res", c * H * act), mix = Scratch("mix", c * H * act);
@@ -445,7 +457,7 @@ public sealed unsafe class CudaOlalaTransformerModel : IModel
     {
         int H = _hidden, Hs = _o.NumSsmHeads, P = _o.MambaHeadDim, N = _o.StateSize, R = _o.MimoRank, A = _o.NumRopeAngles;
         int ph = 2 * P + 3, dynW = 2 * R * N + A;
-        long act = CudaOlalaStateLayout.ActivationBytes; nint s = _stream.Handle;
+        long act = _actBytes; nint s = _stream.Handle;
         nint zxdt = Scratch("zxdt", c * (long)Hs * ph * act), dyn = Scratch("dyn", c * (long)dynW * act), y = Scratch("ssm_y", c * (long)Hs * P * act);
         _k.Gemv(b.SsmIn.Kind, b.SsmIn.Ptr, b.SsmIn.In, b.SsmIn.Out, x, zxdt, c, false, 0, 0, s);
         _k.Gemv(b.SsmInDyn.Kind, b.SsmInDyn.Ptr, b.SsmInDyn.In, b.SsmInDyn.Out, x, dyn, c, false, 0, 0, s);
@@ -459,7 +471,7 @@ public sealed unsafe class CudaOlalaTransformerModel : IModel
     {
         int hd = Config.HeadDim, nk = _o.NumNoiseHeads, nq = _o.NumSignalHeads + nk, rank = _o.TpaRank, group = nq / nk;
         int qW = nq * hd, gateW = _o.NumSignalHeads * hd;
-        long act = CudaOlalaStateLayout.ActivationBytes; nint s = _stream.Handle;
+        long act = _actBytes; nint s = _stream.Handle;
         EnsureHistory(b, (long)posBase + c);
         nint q = Scratch("q", c * (long)qW * act);
         nint ak = Scratch("ak", c * (long)nk * rank * act), av = Scratch("av", c * (long)nk * rank * act);
@@ -480,7 +492,7 @@ public sealed unsafe class CudaOlalaTransformerModel : IModel
     private void MoeLayer(MoeW m, nint x, nint y, int c)
     {
         int H = _hidden, E = _o.ExpertCount, K = _o.ExpertUsedCount, lat = _o.MoeLatentSize, ff = _o.ExpertFfLength, sff = m.SharedUp.Out;
-        long act = CudaOlalaStateLayout.ActivationBytes; nint s = _stream.Handle;
+        long act = _actBytes; nint s = _stream.Handle;
         nint idx = Scratch("route_idx", (long)c * K * 4), wts = Scratch("route_w", (long)c * K * 4);
         nint x0 = Scratch("x0", c * (long)lat * act), hid = Scratch("moe_hid", (long)c * K * ff * act), ylat = Scratch("ylat", c * (long)lat * act);
         nint routed = Scratch("routed", c * (long)H * act), sh = Scratch("shared_h", c * (long)sff * act);

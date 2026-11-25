@@ -141,8 +141,12 @@ public sealed class CudaOlalaParityTests
     }
 
     // ---- gates (measured; see the PR) ----
-    private const double HfKlGate = 3e-2;      // CUDA (BF16 activations) vs HF F32-query oracle, per row
-    private const double CpuKlGate = 3e-2;     // CUDA vs the in-process CPU reference, per row
+    // Measured clean (RTX 3060, 2026-11-25): worst KL 1.3e-5 vs HF, 1.5e-5 vs CPU, worst |dlogit| 1.7e-2. Gates sit just above those: the soft-cap
+    // mutant (KL 4.7e-3), the V-side token-shift mask mutant (2.6e-3) and the other logic mutants die; effects below the BF16 noise (K-side token shift,
+    // 1e-8) are gated by the F32-activation control arm below instead.
+    private const double HfKlGate = 5e-5;      // CUDA (BF16 activations) vs HF F32-query oracle, per row
+    private const double CpuKlGate = 5e-5;     // CUDA vs the in-process CPU reference, per row
+    private const double HfMaxAbsGate = 4e-2;  // |dlogit|
 
     [SkippableTheory]
     [InlineData("tiny")]
@@ -166,6 +170,7 @@ public sealed class CudaOlalaParityTests
         }
         _out.WriteLine($"{name}: prefill {c.L} rows worst KL {worstKl:E2}, worst |dlogit| {worstAbs:E2}, top-1 {same}/{c.L}");
         Assert.True(worstKl < HfKlGate, $"{name}: worst KL {worstKl:E3}");
+        Assert.True(worstAbs < HfMaxAbsGate, $"{name}: worst |dlogit| {worstAbs:E3}");
         Assert.True(same >= c.L - 1, $"{name}: top-1 {same}/{c.L}");
     }
 
@@ -207,6 +212,45 @@ public sealed class CudaOlalaParityTests
         Assert.True(worstDec < CpuKlGate, $"decode KL {worstDec:E3}");
         Assert.True(sameDec >= c.N - 2);
     }
+
+    /// <summary>
+    /// F32-activation CONTROL arm (<c>olala_f32act.ptx</c>, internal, measurement only; never the shipped storage): the same kernels with F32 stored
+    /// activations agree with the CPU reference at float-rounding level. This is what lets the suite see effects far below BF16 noise (a K-side token-shift
+    /// mask error is ~1e-8 in KL; the K RMSNorm cancels the uniform scale up to its eps) and what bounds the cost of BF16 storage.
+    /// </summary>
+    [SkippableFact]
+    public void Tiny_F32ActivationControl_MatchesCpuAtFloatLevel()
+    {
+        RequireTiny(out var c);
+        var (f, cfg) = OpenTiny();
+        using var _ = f;
+        using var cpu = Assert.IsType<OlalaTransformerModel>(ModelLoader.CreateCpuModelFromGguf(f, cfg));
+        using var ctl = CudaOlalaTransformerModel.LoadF32ActivationControl(f, cfg);
+        int[] pos = Enumerable.Range(0, c.L).ToArray();
+        using var a = cpu.Forward(c.Ids, pos, -1); using var b = ctl.Forward(c.Ids, pos, -1);
+        float[] ra = OlalaOracleData.Rows(a, c.L, c.Vocab), rb = OlalaOracleData.Rows(b, c.L, c.Vocab);
+        double worstKl = 0, worstAbs = 0;
+        for (int t = 0; t < c.L; t++)
+        {
+            worstKl = Math.Max(worstKl, OlalaOracleData.Kl(ra.AsSpan(t * c.Vocab, c.Vocab), rb.AsSpan(t * c.Vocab, c.Vocab)));
+            worstAbs = Math.Max(worstAbs, OlalaOracleData.MaxAbs(ra.AsSpan(t * c.Vocab, c.Vocab), rb.AsSpan(t * c.Vocab, c.Vocab)));
+        }
+        cpu.ResetSequenceState(); ctl.ResetSequenceState();
+        using (cpu.Forward(c.Ids, pos, -1, null, true)) { }
+        using (ctl.Forward(c.Ids, pos, -1, null, true)) { }
+        for (int j = 1; j < c.N; j++)
+        {
+            using var sa = cpu.Forward([c.GreedyIds[j - 1]], [c.L + j - 1], -1, null, true);
+            using var sb = ctl.Forward([c.GreedyIds[j - 1]], [c.L + j - 1], -1, null, true);
+            var xa = OlalaOracleData.Rows(sa, 1, c.Vocab); var xb = OlalaOracleData.Rows(sb, 1, c.Vocab);
+            worstKl = Math.Max(worstKl, OlalaOracleData.Kl(xa, xb)); worstAbs = Math.Max(worstAbs, OlalaOracleData.MaxAbs(xa, xb));
+        }
+        _out.WriteLine($"F32-activation control vs CPU: worst KL {worstKl:E2}, worst |dlogit| {worstAbs:E2}");
+        Assert.True(worstKl < ControlKlGate, $"control KL {worstKl:E3}");
+        Assert.True(worstAbs < ControlAbsGate, $"control |dlogit| {worstAbs:E3}");
+    }
+
+    private const double ControlKlGate = 1e-9, ControlAbsGate = 1e-4;   // Vulkan's control arm (OlalaVulkanTests) uses the same pair
 
     [SkippableFact]
     public void Tiny_GreedyContinuation_MatchesHf()

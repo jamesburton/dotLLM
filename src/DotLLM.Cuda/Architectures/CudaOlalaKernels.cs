@@ -24,9 +24,11 @@ internal sealed unsafe class CudaOlalaKernels : IDisposable
 
     private static readonly string[] Suffix = ["q8_0", "q6_k", "bf16", "f32"];
 
-    public CudaOlalaKernels(string ptxDir)
+    /// <param name="ptxDir">PTX directory.</param>
+    /// <param name="f32Activations">Diagnostic arm: load <c>olala_f32act.ptx</c> (F32 stored activations) instead of the shipped BF16 module.</param>
+    public CudaOlalaKernels(string ptxDir, bool f32Activations = false)
     {
-        _module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "olala.ptx"));
+        _module = CudaModule.LoadFromFile(Path.Combine(ptxDir, f32Activations ? "olala_f32act.ptx" : "olala.ptx"));
         try
         {
             for (int i = 0; i < 4; i++)

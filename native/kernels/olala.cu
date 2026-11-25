@@ -14,18 +14,29 @@
 #include <stdint.h>
 #include <math.h>
 
-typedef unsigned short act_t;   // BF16 bits
+typedef unsigned short bf16_t;   // BF16 bits (weights read as BF16, and the stored activations of the shipped build)
 
-__device__ __forceinline__ float bf2f(act_t v) { return __uint_as_float(((unsigned)v) << 16); }
-__device__ __forceinline__ act_t f2bf(float f)
+__device__ __forceinline__ float bf2f(bf16_t v) { return __uint_as_float(((unsigned)v) << 16); }
+__device__ __forceinline__ bf16_t f2bf(float f)
 {
     unsigned b = __float_as_uint(f);
-    if ((b & 0x7fffffffu) > 0x7f800000u) return (act_t)((b >> 16) | 0x40);   // NaN stays NaN
+    if ((b & 0x7fffffffu) > 0x7f800000u) return (bf16_t)((b >> 16) | 0x40);   // NaN stays NaN
     b += 0x7fffu + ((b >> 16) & 1u);                                          // round to nearest even
-    return (act_t)(b >> 16);
+    return (bf16_t)(b >> 16);
 }
+
+#ifdef OLALA_ACT_F32
+// MEASUREMENT CONTROL ONLY (olala_f32act.cu -> olala_f32act.ptx; internal test arm, unreachable from the loader / CLI): F32 activation
+// storage. It exists so the tests can gate the kernel logic at float-rounding level (a BF16 arm hides sub-1e-5 effects) and so the
+// BF16-vs-F32 cost is measurable for the sign-off decision. The shipped model never uses it.
+typedef float act_t;
+__device__ __forceinline__ float ldA(const act_t* p) { return *p; }
+__device__ __forceinline__ void stA(act_t* p, float v) { *p = v; }
+#else
+typedef unsigned short act_t;   // BF16 bits
 __device__ __forceinline__ float ldA(const act_t* p) { return bf2f(*p); }
 __device__ __forceinline__ void stA(act_t* p, float v) { *p = f2bf(v); }
+#endif
 
 __device__ __forceinline__ float warpSum(float v)
 {
@@ -376,7 +387,7 @@ __device__ __forceinline__ void embed_impl(const uint8_t* W, size_t rowBytes, co
             const uint8_t* b = row + (size_t)(i >> 5) * 34;
             v = __half2float(*reinterpret_cast<const __half*>(b)) * (float)reinterpret_cast<const signed char*>(b + 2)[i & 31];
         }
-        else if (WT == WT_BF16) v = bf2f(reinterpret_cast<const act_t*>(row)[i]);
+        else if (WT == WT_BF16) v = bf2f(reinterpret_cast<const bf16_t*>(row)[i]);
         else v = reinterpret_cast<const float*>(row)[i];
         srow[i] = v;
         ss += (double)v * (double)v;
