@@ -16,6 +16,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
     /// <summary>Test hook: layers recorded on the group-skipping decode path.</summary>
     internal long Edge0SkipLayers { get; private set; }
 
+    internal long Edge0SkipLayersCount => Edge0SkipLayers;
+
     /// <summary>Test hook: Edge0 latent-MoE layers recorded.</summary>
     internal long Edge0LayersRecorded { get; private set; }
 

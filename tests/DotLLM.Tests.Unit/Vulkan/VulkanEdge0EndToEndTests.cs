@@ -218,6 +218,51 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
             dec.Add(N / swd.Elapsed.TotalSeconds);
         }
         output.WriteLine($"SPEED prefill {longIds.Length} tok: {string.Join(" / ", pfs.Select(v => v.ToString("F0")))} tok/s; decode 48 tok: {string.Join(" / ", dec.Select(v => v.ToString("F1")))} tok/s; device live {device.LiveBytesTotal() / (double)(1L << 30):F2} GiB");
+        {
+            // Group skipping (decode D/U): identical numerics and the same-session speed A/B. Logits of 24 greedy decode steps are compared BITWISE skip-on vs skip-off.
+            bool saved = VulkanQwen3MoeHybridTransformerModel.Edge0SkipUnusedGroups;
+            float[][] RunDecode(bool skip)
+            {
+                VulkanQwen3MoeHybridTransformerModel.Edge0SkipUnusedGroups = skip;
+                vk.ResetSequenceState();
+                using (vk.Forward(inputs[1], Enumerable.Range(0, inputs[1].Length).ToArray(), -1, null, true)) { }
+                int pos = inputs[1].Length, next = 13;
+                var rows = new float[24][];
+                for (int sIdx = 0; sIdx < 24; sIdx++)
+                {
+                    using var lg = vk.Forward([next], [pos++], -1, null, true);
+                    int vocab = (int)lg.Shape[1];
+                    var row = new float[vocab];
+                    unsafe { new ReadOnlySpan<float>((void*)lg.DataPointer, vocab).CopyTo(row); }
+                    rows[sIdx] = row; next = Argmax(row);
+                }
+                return rows;
+            }
+            long layersBefore = vk.Edge0SkipLayersForTest;
+            var off = RunDecode(false);
+            long afterOff = vk.Edge0SkipLayersForTest;
+            var on = RunDecode(true);
+            long afterOn = vk.Edge0SkipLayersForTest;
+            int differing = 0;
+            for (int t = 0; t < off.Length; t++) for (int i = 0; i < off[t].Length; i++) if (!off[t][i].Equals(on[t][i])) differing++;
+            output.WriteLine($"SKIPCHECK 24 decode steps x vocab logits bitwise skip-off vs skip-on: {differing} differing values; skip path layers recorded off={afterOff - layersBefore} on={afterOn - afterOff}");
+            if (differing != 0) failures.Add($"group skipping changed {differing} logits");
+            if (afterOff != layersBefore || afterOn == afterOff) failures.Add("skip path did not run exactly when enabled");
+            var tOff = new List<double>(); var tOn = new List<double>();
+            for (int rep = 0; rep < 3; rep++)
+                foreach (bool skip in new[] { false, true })
+                {
+                    VulkanQwen3MoeHybridTransformerModel.Edge0SkipUnusedGroups = skip;
+                    vk.ResetSequenceState();
+                    using (vk.Forward(inputs[1], Enumerable.Range(0, inputs[1].Length).ToArray(), -1, null, true)) { }
+                    int pos = inputs[1].Length; const int N = 48;
+                    var swd = System.Diagnostics.Stopwatch.StartNew();
+                    for (int sIdx = 0; sIdx < N; sIdx++) { using var lg = vk.Forward([13], [pos++], -1, null, true); }
+                    (skip ? tOn : tOff).Add(N / swd.Elapsed.TotalSeconds);
+                }
+            output.WriteLine($"SKIPSPEED decode interleaved A/B, tok/s: skip-off {string.Join(" / ", tOff.Select(v => v.ToString("F1")))}; skip-on {string.Join(" / ", tOn.Select(v => v.ToString("F1")))}");
+            VulkanQwen3MoeHybridTransformerModel.Edge0SkipUnusedGroups = saved;
+        }
         if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_STAGES") == "1")
         {
             // Stage profile of single-row decode (each stage ends in a submit + wait: totals overstate by the sync cost, the ranking is what matters).

@@ -799,6 +799,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
     /// <summary>Test hook (#885): gated-residual reads recorded on the fused path.</summary>
     internal long GrFusedReads { get; private set; }
 
+    /// <summary>Test hook (Edge0 G3): Edge0 layers recorded on the group-skipping decode path.</summary>
+    internal long Edge0SkipLayersForTest => _core.Edge0SkipLayersCount;
+
     /// <summary>Test hook (#885): decode MoE layers that used the fused scatter + shared-gate add kernel.</summary>
     internal long CombineFusedLayers => _core.Q4CombineFusedLayers;
 
