@@ -27,6 +27,7 @@ public class DirectStorageDefaultTests(ITestOutputHelper output)
             Assert.Null(DirectStorageInstaller.FindDll(app, inst));
             // A bare name (what the default search path would resolve against the CWD) is refused outright, and a planted full path is not a valid image.
             Assert.False(DirectStorageInstaller.TryLoad("dstorage.dll", out _));
+            Assert.False(DirectStorageInstaller.TryLoad("kernel32.dll", out _));   // any bare name: only full paths are accepted
             Assert.False(DirectStorageInstaller.TryLoad(Path.Combine(cwd, "dstorage.dll"), out _));
             // The directories that ARE searched do work, app dir first.
             File.WriteAllText(Path.Combine(inst, "dstorage.dll"), "x"); File.WriteAllText(Path.Combine(inst, "dstoragecore.dll"), "x");
