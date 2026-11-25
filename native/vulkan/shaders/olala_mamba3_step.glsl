@@ -12,6 +12,12 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+// #2001: the F32 state column of lane p lives in REGISTERS for the whole chunk (loaded once, stored once) instead of being read-modify-written in
+// global memory on every token. N and R are specialization constants so the n / r loops unroll (no dynamically indexed private arrays).
+// Requires P <= 64 (one lane per p; checked by the loader). The arithmetic and its order are unchanged, so results are bit-identical.
+layout(constant_id = 0) const uint N_C = 128u;
+layout(constant_id = 1) const uint R_C = 4u;
+
 layout(set = 0, binding = 0, std430) readonly  buffer BufZ   { ACT_T zxdt[]; };   // [T, H*(2P+3)]
 layout(set = 0, binding = 1, std430) readonly  buffer BufDyn { ACT_T dyn[]; };    // [T, 2*R*N + A]
 layout(set = 0, binding = 2, std430) readonly  buffer BufPrm { float prm[]; };    // learned constants (layout below)
@@ -46,6 +52,11 @@ void main() {
          offMx = offD + H, offMz = offMx + H * R * P, offMo = offMz + H * R * P;
     uint stSsm = 0u, stAng = H * N * P, stK = stAng + H * A, stV = stK + R * H * N;
     uint half_ = N / 2u;
+
+    float sreg[N_C];
+    if (tid < P) {
+        [[unroll]] for (uint n = 0u; n < N_C; ++n) sreg[n] = st[stSsm + (h * N + n) * P + tid];
+    }
 
     for (uint t = 0u; t < pc.T; ++t) {
         uint zb = t * H * ph + h * ph;
@@ -102,26 +113,26 @@ void main() {
         barrier();
 
         float dSkip = prm[offD + h];
-        for (uint p = tid; p < P; p += 64u) {
+        if (tid < P) {
+            uint p = tid;
             float xp = actToF(zxdt[zb + P + p]), zp = actToF(zxdt[zb + p]);
             float vPrev = st[stV + h * P + p];
-            float xv[8], xs[8], o[8];   // R <= 8
-            for (uint r = 0u; r < R; ++r) {
+            float xv[R_C], xs[R_C], o[R_C];
+            [[unroll]] for (uint r = 0u; r < R_C; ++r) {
                 float mx = prm[offMx + (h * R + r) * P + p];
                 xv[r] = xp * mx;
                 xs[r] = vPrev * mx;
                 o[r] = 0.0;
             }
-            for (uint n = 0u; n < N; ++n) {
-                uint si = stSsm + (h * N + n) * P + p;
-                float s = st[si] * alpha;
-                for (uint r = 0u; r < R; ++r)
-                    s += xv[r] * gamma * sk[r * N + n] + xs[r] * beta * skp[r * N + n];
-                st[si] = s;
-                for (uint r = 0u; r < R; ++r) o[r] += s * sq[r * N + n];
+            [[unroll]] for (uint n = 0u; n < N_C; ++n) {
+                float s = sreg[n] * alpha;
+                [[unroll]] for (uint r = 0u; r < R_C; ++r)
+                    s += xv[r] * gamma * sk[r * N_C + n] + xs[r] * beta * skp[r * N_C + n];
+                sreg[n] = s;
+                [[unroll]] for (uint r = 0u; r < R_C; ++r) o[r] += s * sq[r * N_C + n];
             }
             float acc = 0.0;
-            for (uint r = 0u; r < R; ++r) {
+            for (uint r = 0u; r < R_C; ++r) {
                 float mz = prm[offMz + (h * R + r) * P + p];
                 float mo = prm[offMo + (h * R + r) * P + p];
                 acc += (o[r] + xv[r] * dSkip) * siluF(zp * mz) * mo;
@@ -136,5 +147,8 @@ void main() {
             st[stK + (r * H + h) * N + n] = sk[i];
         }
         barrier();
+    }
+    if (tid < P) {
+        [[unroll]] for (uint n = 0u; n < N_C; ++n) st[stSsm + (h * N + n) * P + tid] = sreg[n];
     }
 }
