@@ -10,6 +10,70 @@ namespace DotLLM.Tests.Unit.Vulkan;
 [Collection("VulkanKernels")]
 public class DirectStorageDefaultTests(ITestOutputHelper output)
 {
+    /// <summary>A dstorage.dll pair in the current directory alone is never found or loaded: only the app dir and the install dir are searched, by full path.</summary>
+    [SkippableFact]
+    public void Dll_InCurrentDirectory_IsNotUsed()
+    {
+        Skip.IfNot(DirectStorageInstaller.IsSupportedPlatform, "Windows x64/ARM64 only");
+        string root = Path.Combine(Path.GetTempPath(), "dotllm-dscwd-" + Guid.NewGuid().ToString("N")[..8]);
+        string cwd = Path.Combine(root, "cwd"), app = Path.Combine(root, "app"), inst = Path.Combine(root, "inst");
+        Directory.CreateDirectory(cwd); Directory.CreateDirectory(app); Directory.CreateDirectory(inst);
+        string old = Directory.GetCurrentDirectory();
+        try
+        {
+            File.WriteAllText(Path.Combine(cwd, "dstorage.dll"), "planted");
+            File.WriteAllText(Path.Combine(cwd, "dstoragecore.dll"), "planted");
+            Directory.SetCurrentDirectory(cwd);
+            Assert.Null(DirectStorageInstaller.FindDll(app, inst));
+            // A bare name (what the default search path would resolve against the CWD) is refused outright, and a planted full path is not a valid image.
+            Assert.False(DirectStorageInstaller.TryLoad("dstorage.dll", out _));
+            Assert.False(DirectStorageInstaller.TryLoad(Path.Combine(cwd, "dstorage.dll"), out _));
+            // The directories that ARE searched do work, app dir first.
+            File.WriteAllText(Path.Combine(inst, "dstorage.dll"), "x"); File.WriteAllText(Path.Combine(inst, "dstoragecore.dll"), "x");
+            Assert.Equal(Path.Combine(inst, "dstorage.dll"), DirectStorageInstaller.FindDll(app, inst));
+            File.WriteAllText(Path.Combine(app, "dstorage.dll"), "x"); File.WriteAllText(Path.Combine(app, "dstoragecore.dll"), "x");
+            Assert.Equal(Path.Combine(app, "dstorage.dll"), DirectStorageInstaller.FindDll(app, inst));
+        }
+        finally
+        {
+            Directory.SetCurrentDirectory(old);
+            try { Directory.Delete(root, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    /// <summary>The startup path prints no DirectStorage hint (it was false for CPU/CUDA/dGPU runs); the Vulkan integrated load owns that message.</summary>
+    [Fact]
+    public void Startup_NonInteractive_PrintsNoHint_EvenWhenDllMissing()
+    {
+        string? np = Environment.GetEnvironmentVariable("DOTLLM_NO_PROMPT");
+        var oldErr = Console.Error; var oldOut = Console.Out;
+        try
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_NO_PROMPT", "1");
+            var err = new StringWriter(); var o = new StringWriter();
+            Console.SetError(err); Console.SetOut(o);
+            foreach (string cmd in new[] { "run", "chat", "bench", "serve" })
+                DotLLM.Cli.Helpers.DirectStoragePrompt.OfferIfMissing([cmd, "model.gguf", "-d", "cpu"], dllMissing: true);
+            Assert.Equal(string.Empty, err.ToString());
+            Assert.DoesNotContain("DirectStorage", o.ToString());
+        }
+        finally { Console.SetError(oldErr); Console.SetOut(oldOut); Environment.SetEnvironmentVariable("DOTLLM_NO_PROMPT", np); }
+    }
+
+    /// <summary>The model-level copied-bytes ledger survives the per-loader <c>Reset()</c> (so the one warning per model load has the right total).</summary>
+    [Fact]
+    public void ModelLedger_SurvivesLoaderReset_AndSumsTensorsAndBanks()
+    {
+        VulkanWeightImportPolicy.BeginModelLoad();
+        VulkanWeightImportPolicy.NoteStaged(0, 100L << 20, "not_source_bytes");
+        VulkanWeightImportPolicy.Reset();                       // the next weights loader starts
+        VulkanWeightImportPolicy.NoteStaged(0, 50L << 20, "not_source_bytes");
+        VulkanWeightImportPolicy.NoteBankStaged(10L << 20);
+        Assert.Equal(160L << 20, VulkanWeightImportPolicy.ModelCopiedBytes);
+        VulkanWeightImportPolicy.BeginModelLoad();
+        Assert.Equal(0, VulkanWeightImportPolicy.ModelCopiedBytes);
+    }
+
     /// <summary>The full decision table (no GPU): an explicit 0/1 wins; unset needs Windows AND an integrated device AND the DLL.</summary>
     [Theory]
     [InlineData("0", true, true, true, false)]    // explicit off beats everything

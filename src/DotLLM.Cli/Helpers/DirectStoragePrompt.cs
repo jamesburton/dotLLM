@@ -13,19 +13,17 @@ internal static class DirectStoragePrompt
     private static readonly HashSet<string> s_modelCommands = new(StringComparer.OrdinalIgnoreCase) { "run", "chat", "bench", "serve" };
 
     /// <summary>Makes the offer when every condition holds; never throws and never blocks a non-interactive run.</summary>
-    public static void OfferIfMissing(string[] args)
+    public static void OfferIfMissing(string[] args) => OfferIfMissing(args, dllMissing: null);
+
+    /// <summary>Test seam: <paramref name="dllMissing"/> overrides the on-disk check.</summary>
+    internal static void OfferIfMissing(string[] args, bool? dllMissing)
     {
         try
         {
-            if (NeedsInstall(args) && IsNonInteractive())
-            {
-                // #1994: DirectStorage is the default weight route on Windows UMA, so a missing DLL costs a host copy of every weight.
-                // Non-interactive runs (service, CI, redirected) are never prompted and never download: say how to fix it, once per run.
-                Console.Error.WriteLine("[dotllm] hint: DirectStorage (Microsoft) is not installed, so Vulkan weights are copied through host memory. " +
-                    "Run `dotllm run` once in a terminal to be offered the NuGet download (licence shown first), or put dstorage.dll next to dotllm / in DOTLLM_DIRECTSTORAGE_DIR.");
-                return;
-            }
-            if (!ShouldOffer(args)) return;
+            // #1994: no startup hint for non-interactive runs. The device is only known after the load starts, and a hint at startup was
+            // false for CPU, CUDA and discrete-GPU runs. The Vulkan integrated-GPU load itself prints the "copied through host memory"
+            // warning (with how to install) when the DLL is missing: VulkanWeightImportPolicy.DirectFallbackWarning.
+            if (!ShouldOffer(args, dllMissing)) return;
 
             AnsiConsole.MarkupLine("[yellow]DirectStorage is not installed.[/] dotLLM can use Microsoft's DirectStorage to load model weights");
             AnsiConsole.MarkupLine("straight from disk into GPU memory (Vulkan, Windows) without an extra copy in system RAM.");
@@ -54,20 +52,20 @@ internal static class DirectStoragePrompt
         }
     }
 
-    private static bool NeedsInstall(string[] args)
+    private static bool NeedsInstall(string[] args, bool? dllMissing = null)
     {
         if (!DirectStorageInstaller.IsSupportedPlatform) return false;
         if (args.Length == 0 || !s_modelCommands.Contains(args[0])) return false;
         if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DIRECT_STORAGE"), "0", StringComparison.Ordinal)) return false;
         if (File.Exists(DirectStorageInstaller.DeclinedMarkerPath)) return false;
-        return !DirectStorageInstaller.IsAvailable();
+        return dllMissing ?? !DirectStorageInstaller.IsAvailable();
     }
 
     private static bool IsNonInteractive()
         => Console.IsInputRedirected || Console.IsOutputRedirected || Console.IsErrorRedirected
            || string.Equals(Environment.GetEnvironmentVariable("DOTLLM_NO_PROMPT"), "1", StringComparison.Ordinal);
 
-    private static bool ShouldOffer(string[] args) => NeedsInstall(args) && !IsNonInteractive();
+    private static bool ShouldOffer(string[] args, bool? dllMissing) => NeedsInstall(args, dllMissing) && !IsNonInteractive();
 
     private static bool ConfirmLicense(string licenseText)
     {

@@ -123,6 +123,18 @@ public static class VulkanModelLoader
         int nCpuMoeLayers = -1)
     {
         ArgumentNullException.ThrowIfNull(device);
+        VulkanWeightImportPolicy.BeginModelLoad();
+        var created = CreateFromGgufCore(device, gguf, config, spvDir, nCpuMoeLayers);
+        // #1994: one DirectStorage-fallback warning per model load (bytes copied through host memory), whatever number of loaders/staging buffers ran.
+        string dsWarn = VulkanWeightImportPolicy.EndModelLoad(device);
+        if (dsWarn.Length > 0) Console.Error.WriteLine(dsWarn);
+        return created;
+    }
+
+    private static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateFromGgufCore(
+        VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir, int nCpuMoeLayers)
+    {
+        ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(spvDir);

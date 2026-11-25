@@ -206,7 +206,6 @@ internal static class VulkanWeightImportPolicy
         DirectDeclinedBytes = 0;
         BankStagedBytes = 0;
         BankStagedCount = 0;
-        s_lastWarnedBytes = 0;
         StagedTensorCount = 0;
         StagedBytes = 0;
         RejectedTensorCount = 0;
@@ -332,8 +331,10 @@ internal static class VulkanWeightImportPolicy
         }
         DirectDeclinedCount++;
         DirectDeclinedBytes += bytes;
+        s_modelDeclinedCount++; s_modelDeclinedBytes += bytes;
         if (FirstDirectDecline.Length == 0)
             FirstDirectDecline = direct is null ? "unavailable:" + DirectStorage.DirectWeightStore.UnavailableReason(device) : direct.LastFallbackReason;
+        if (s_modelFirstDecline.Length == 0) s_modelFirstDecline = FirstDirectDecline.Length > 0 ? FirstDirectDecline : "declined";
         LastFallbackReason = "direct_storage:" + FirstDirectDecline;
         return false;
     }
@@ -354,7 +355,7 @@ internal static class VulkanWeightImportPolicy
         => !IsDisabled && DirectStorage.DirectWeightStore.EnabledFor(device) && DirectStorage.DirectWeightStore.For(device) is not null;
 
     /// <summary>Records a MoE expert bank that took the staging copy (its pages stay mapped: the CPU may still use them).</summary>
-    public static void NoteBankStaged(long bytes) { BankStagedBytes += bytes; BankStagedCount++; }
+    public static void NoteBankStaged(long bytes) { BankStagedBytes += bytes; BankStagedCount++; s_modelBankStagedBytes += bytes; }
 
     /// <summary>Expert-bank bytes copied through staging on the current load (#1994).</summary>
     public static long BankStagedBytes { get; private set; }
@@ -365,27 +366,42 @@ internal static class VulkanWeightImportPolicy
     /// <summary>Bytes of the tensors the DirectStorage tier declined on the current load.</summary>
     public static long DirectDeclinedBytes { get; private set; }
 
-    private static long s_lastWarnedBytes;
+    // Model-level ledger (#1994): unlike the per-loader ledger above, Reset() does not clear it, so a model whose weights are uploaded by
+    // several loaders / staging buffers (VulkanWeights twice, per-layer MoE streaming, MTP heads) still reports one total, once.
+    private static readonly bool s_traceStaged = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE") == "1";
+    private static long s_modelStagedBytes, s_modelBankStagedBytes, s_modelDeclinedBytes;
+    private static int s_modelDeclinedCount;
+    private static string s_modelFirstDecline = string.Empty;
+
+    /// <summary>Bytes copied through host memory since <see cref="BeginModelLoad"/> (tensors + expert banks); survives <see cref="Reset"/>.</summary>
+    internal static long ModelCopiedBytes => s_modelStagedBytes + s_modelBankStagedBytes;
+
+    /// <summary>Starts the model-level ledger; call once at the top of a model load (<c>VulkanModelLoader.CreateFromGguf</c>).</summary>
+    public static void BeginModelLoad()
+    {
+        s_modelStagedBytes = s_modelBankStagedBytes = s_modelDeclinedBytes = 0;
+        s_modelDeclinedCount = 0;
+        s_modelFirstDecline = string.Empty;
+    }
 
     /// <summary>
-    /// One warning line when the Windows UMA DirectStorage default could not be used and weights were copied through host memory instead,
-    /// stating the bytes copied and how to fix it (#1994); empty otherwise.
+    /// Ends the model load and returns the one warning line for it, when the Windows UMA DirectStorage default could not be used and weights
+    /// were copied through host memory instead (stating the total bytes copied and how to fix it, #1994); empty otherwise.
     /// </summary>
-    public static string DirectFallbackWarning(VulkanDevice device)
+    public static string EndModelLoad(VulkanDevice device)
     {
-        long total = StagedBytes + BankStagedBytes;
-        if (IsDisabled || total == 0 || total == s_lastWarnedBytes) return string.Empty;   // once per change: staging buffers dispose several times a load
-        s_lastWarnedBytes = total;
+        long total = s_modelStagedBytes + s_modelBankStagedBytes;
+        if (IsDisabled || total == 0) return string.Empty;
         if (DirectStorage.DirectWeightStore.WouldBeDefaultButDllMissing(device))
-            return $"[dotllm] DirectStorage is not installed: {(StagedBytes + BankStagedBytes) / (1024.0 * 1024.0):F0} MiB of weights were copied through host memory " +
-                   $"({StagedBytes / (1024.0 * 1024.0):F0} MiB tensors + {BankStagedBytes / (1024.0 * 1024.0):F0} MiB expert banks). " +
+            return $"[dotllm] DirectStorage is not installed: {total / (1024.0 * 1024.0):F0} MiB of weights were copied through host memory " +
+                   $"({s_modelStagedBytes / (1024.0 * 1024.0):F0} MiB tensors + {s_modelBankStagedBytes / (1024.0 * 1024.0):F0} MiB expert banks). " +
                    (File.Exists(DirectStorage.DirectStorageInstaller.DeclinedMarkerPath)
                        ? $"You declined the download offer; delete {DirectStorage.DirectStorageInstaller.DeclinedMarkerPath} to be asked again, "
                        : "Run `dotllm run` once in a terminal to be offered Microsoft's DirectStorage (fetched from NuGet after you accept its licence), ") +
                    "or place dstorage.dll + dstoragecore.dll next to dotllm / in DOTLLM_DIRECTSTORAGE_DIR (DOTLLM_VULKAN_DIRECT_STORAGE=0 silences this).";
-        if (DirectDeclinedCount > 0 && DirectStorage.DirectWeightStore.EnabledFor(device))
-            return $"[dotllm] DirectStorage declined {DirectDeclinedCount} tensors / {DirectDeclinedBytes / (1024.0 * 1024.0):F0} MiB (first: {FirstDirectDecline}); " +
-                   $"{(StagedBytes + BankStagedBytes) / (1024.0 * 1024.0):F0} MiB of weights were copied through host memory instead.";
+        if (s_modelDeclinedCount > 0 && DirectStorage.DirectWeightStore.EnabledFor(device))
+            return $"[dotllm] DirectStorage declined {s_modelDeclinedCount} tensors / {s_modelDeclinedBytes / (1024.0 * 1024.0):F0} MiB (first: {s_modelFirstDecline}); " +
+                   $"{total / (1024.0 * 1024.0):F0} MiB of weights were copied through host memory instead.";
         return string.Empty;
     }
 
@@ -412,7 +428,10 @@ internal static class VulkanWeightImportPolicy
     {
         ThrowIfHostOnly(srcPtr, sourceBytes);
         StagedTensorCount++;
-        if (sourceBytes > 0) StagedBytes += sourceBytes;
+        if (sourceBytes > 0) { StagedBytes += sourceBytes; s_modelStagedBytes += sourceBytes; }
+        if (s_traceStaged && sourceBytes >= (1L << 20))   // #1994: which tensors still stage, and why
+            Console.Error.WriteLine($"[vulkan-mem] staged {sourceBytes / (1024.0 * 1024.0):F1} MiB reason={reason ?? LastFallbackReason} " +
+                string.Join(" < ", Environment.StackTrace.Split(Environment.NewLine).Skip(2).Take(3).Select(l => l.Trim())));
         if (reason is not null) LastFallbackReason = reason;
         if (srcPtr != 0 && sourceBytes > 0)
             s_stagedRanges.Add((srcPtr, sourceBytes));

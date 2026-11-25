@@ -463,8 +463,6 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
         {
             string refusal = VulkanWeightImportPolicy.RejectionWarning();   // #1991: a requested alias that was refused is never silent (reported once)
             if (refusal.Length > 0) Console.Error.WriteLine(refusal);
-            string dsWarn = VulkanWeightImportPolicy.DirectFallbackWarning(_device);   // #1994: DirectStorage default fell back (reported once per load)
-            if (dsWarn.Length > 0) Console.Error.WriteLine(dsWarn);
         }
         if (s_trace)
         {
