@@ -95,7 +95,9 @@ public sealed class OlalaVulkanTests
         using var b = vk.Forward(c.Ids, pos, -1);
         var s = Compare(Rows(a, c.L, c.Vocab), Rows(b, c.L, c.Vocab), c.L, c.Vocab);
         _output.WriteLine($"f32Act={f32Act}: maxKL {s.MaxKl:E2} medKL {s.MedKl:E2} max|dlogit| {s.MaxAbs:E2} top1 {s.Top1}/{s.Rows}");
-        double klGate = f32Act ? 1e-6 : 2e-2, absGate = f32Act ? 1e-3 : 0.5;
+        // The F32-activation arm is float-rounding identical to the CPU (measured max KL 7e-14, max |dlogit| 1.1e-6), so it is gated near that
+        // floor: the K token-shift-unmasked-at-position-0 mutant (only RMSNorm's eps tells it apart) gives KL 1.4e-8 / |dlogit| 4.4e-4.
+        double klGate = f32Act ? 1e-9 : 2e-2, absGate = f32Act ? 1e-4 : 0.5;
         Assert.True(s.MaxKl < klGate, $"max KL {s.MaxKl:E3}");
         Assert.True(s.MaxAbs < absGate, $"max |dlogit| {s.MaxAbs:E3}");
         Assert.Equal(s.Rows, s.Top1);
@@ -273,6 +275,14 @@ public sealed class OlalaVulkanTests
                 Report($"{file} / {c.Name} BF16-act vs F32-act (same engine, same weights)", f32[i], bf[i], c.Vocab);
             }
             if (c.L <= 100) { Assert.True(r.Median < 0.05, $"median KL {r.Median:E2}"); Assert.True(r.Top1 >= 0.85 * r.Rows, $"top-1 {r.Top1}/{r.Rows}"); }
+            else
+            {
+                // The long chat prompt is the only case past 128 keys, i.e. the only one that exercises the cross-block online-softmax
+                // rescale of olala_tpa_attn. It is chaotic (docs/OLALA.md 5.1), so it is gated at its noise floor only. Measured: median
+                // 1.8e-2 / top-1 281 of 323 (q8_0-safe2), 1.1e-2 / 295 (bf16). The `acc *= corr` mutant gives 0.84-0.93 / 165 of 323.
+                Assert.True(r.Median < 0.1, $"long-prompt median KL {r.Median:E2}");
+                Assert.True(r.Top1 >= 0.75 * r.Rows, $"long-prompt top-1 {r.Top1}/{r.Rows}");
+            }
         }
     }
 
@@ -369,6 +379,59 @@ public sealed class OlalaVulkanTests
                 Assert.True(float.IsFinite(got[t * M + m]), $"non-finite at col {t} row {m}");
                 Assert.True(Math.Abs(got[t * M + m] - want) <= 1e-2 * Math.Abs(want) + 1e9, $"col {t} row {m}: {got[t * M + m]:E4} vs {want:E4}");
             }
+    }
+
+    /// <summary>
+    /// The in-place Q8_0 / Q6_K row decoders (<c>olala_wdot.glsl</c>, shared by the GEMV and both MoE kernels) on REAL rows of q8_0-safe2 against
+    /// <see cref="Dequantize"/> + a double dot product. The tiny oracle model is BF16, so without this test nothing but the loosely gated real-model
+    /// parity sees these decoders (a swapped Q6_K sub-block scale passed the whole suite). 1e9 is the ReLU^2 magnitude feeding ffn_down_exps (Q6_K).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("blk.0.ffn_down_exps.weight", 1f)]
+    [InlineData("blk.0.ffn_down_exps.weight", 1e9f)]
+    [InlineData("blk.0.ffn_up_exps.weight", 1f)]
+    [InlineData("blk.0.ssm_in.weight", 1f)]
+    public unsafe void QuantRowDecoders_OnRealSafe2Rows_MatchDequantizeReference(string tensor, float scale)
+    {
+        SkipUnlessGpu();
+        string? gguf = FindGguf("DOTLLM_OLALA_Q8_GGUF", "Olala-v1.0-mini-7A1B-q8_0-safe2.gguf"); Skip.If(gguf is null, "q8_0-safe2 not in the HF cache");
+        using var f = GgufFile.Open(gguf!);
+        var d = f.TensorsByName[tensor];
+        int K = (int)d.Shape[0];
+        const int M = 96, T = 3;
+        long rowBytes = Dequantize.RowByteSize(K, d.QuantizationType);
+        nint src = f.TensorDataPointer(d);
+        var w = new float[(long)M * K];
+        Dequantize.ToFloat32(src, (long)M * K, d.QuantizationType, w);
+        var rng = new Random(11);
+        var x = new float[T * K];
+        for (int i = 0; i < x.Length; i++) x[i] = FromBf16(Bf16((float)(rng.NextDouble() * 2 - 1) * scale));
+        using var dev = VulkanDevice.Create();
+        using var bw = dev.Allocate(rowBytes * M);
+        dev.Upload(new ReadOnlySpan<byte>((void*)src, checked((int)(rowBytes * M))), bw);   // M rows only, a test fixture
+        using var bx = UploadBf16(dev, x);
+        using var byf = dev.Allocate(T * M * 4); using var dummy = dev.Allocate(256);
+        string kname = "olala_gemv_" + (d.QuantizationType == QuantizationType.Q6_K ? "q6_k" : "q8_0");
+        using var k = new OlalaKernel(dev, SpvDir(), kname, 5, 4, [8u, 0u, 1u]);
+        using (var ctx = dev.CreateSubmitContext())
+        {
+            ctx.Begin();
+            k.Record(ctx.CommandBuffer, [bw, bx, dummy, dummy, byf], [(uint)M, (uint)K, (uint)T, 0u], M, 1, 1);
+            ctx.SubmitAndWait();
+        }
+        var got = new float[T * M]; dev.Download(byf, got);
+        double worstRel = 0;
+        for (int t = 0; t < T; t++)
+            for (int m = 0; m < M; m++)
+            {
+                double want = 0, mag = 0;
+                for (int i = 0; i < K; i++) { double p = (double)w[(long)m * K + i] * x[t * K + i]; want += p; mag += Math.Abs(p); }
+                double rel = Math.Abs(got[t * M + m] - want) / mag;
+                worstRel = Math.Max(worstRel, rel);
+                Assert.True(float.IsFinite(got[t * M + m]), $"non-finite at col {t} row {m}");
+                Assert.True(rel < 1e-5, $"{tensor} col {t} row {m}: {got[t * M + m]:E6} vs {want:E6} (|err| / sum|w x| = {rel:E2})");
+            }
+        _output.WriteLine($"{tensor} ({d.QuantizationType}, K {K}) x scale {scale:E0}: worst |err| / sum|w x| = {worstRel:E2}");
     }
 
     /// <summary>

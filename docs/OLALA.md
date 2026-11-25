@@ -239,7 +239,7 @@ The BF16 activation storage costs no more than the q8_0 weight noise already in 
 **The "capital" greedy divergence is a near tie, not a bug** (`Diag_GreedyDivergenceAttribution_Capital`, q8_0-safe2). At step 12 HF itself has top-1 374 vs top-2 1265 by a margin of **0.046** logits;
 Vulkan BF16-act has the same two tokens swapped by 0.047 (1265 ahead), the F32-activation control also picks 1265 (margin 0.153) and its free-running greedy diverges even EARLIER (token 4: 2038 vs 2550, step-4 near-tie
 introduced by the q8 weights). The bf16 GGUF on the same engine matches HF top-1 28 of 28 on this prompt. So the cause is q8_0 weight digitisation on a 0.05-logit tie, present in the F32-activation arm, not the BF16 storage.
-A CPU q8_0-safe2 greedy on the same prompt is pending (the cpu lock was held by another job); the F32-activation arm is bit-equivalent to the CPU on the tiny oracle (KL 7e-14).
+The CPU q8_0-safe2 greedy confirms it (see "Greedy attribution, closed" below); the F32-activation arm is bit-equivalent to the CPU on the tiny oracle (KL 7e-14).
 
 **Router.** The F32 `ffn_gate_inp` tensor is read in place (zero-copy import where the policy allows) and never narrowed. "BF16 routing weights" means the six per-token routing coefficients (the renormalised, x2.45 sigmoid scores), not the tensor.
 
@@ -247,7 +247,11 @@ A CPU q8_0-safe2 greedy on the same prompt is pending (the cpu lock was held by 
 scale 1/sqrt(d), no soft cap, window off by one, unclamped log, signal/noise swap, gate bias, kv-head mapping, V token shift unmasked at position 0, token-shift carry across batches,
 TPA not divided by rank, router bias dropped, no renormalisation, x2.45 dropped, ReLU for ReLU^2 (routed and shared), routing weight ignored, geodesic divisor, theta clamp, embedding not normalised,
 **SSM state truncated to bf16 each step (killed here by the strict F32-activation prefill gate; it survived the CPU oracle)**, **F16-overflow activation storage (killed only by the 1e12 / 1e14 kernel tests; the tiny model cannot see it)**.
-Equivalent mutant: masking only the K token shift at position 0 changes nothing, because the K RMSNorm cancels the per-head scalar (V masking is killed).
+Not equivalent (corrected in the #1988 review): leaving the K token shift unmasked at position 0 scales K by 1 - sigmoid(shift) there, which the K RMSNorm cancels only up to its eps (1e-6). It is measurable: tiny F32-act vs CPU max KL 7e-14 -> 1.4e-8, max |dlogit| 1e-6 -> 4.4e-4; real q8_0-safe2 median KL vs HF 1.4e-3 -> 4.4e-3 (capital), 2.3e-4 -> 9.3e-4 (code). It survived the original F32-act gate (KL 1e-6, |dlogit| 1e-3); that gate is now 1e-9 / 1e-4 and kills it (V masking was already killed).
+
+**Review additions (#1988).** Two further survivors were converted into kills. (1) Dropping the cross-block online-softmax rescale (`acc *= corr` in `olala_tpa_attn`) moved only the 323-token chat prompt, the one case past 128 keys (median KL 1.8e-2 -> 0.84, top-1 281 -> 165 of 323), and that prompt was ungated; it is now gated at median KL < 0.1 and top-1 >= 75%. (2) `QuantRowDecoders_OnRealSafe2Rows_MatchDequantizeReference` checks the in-place Q8_0 / Q6_K row decoders (shared by the GEMV and both MoE kernels; the tiny model is BF16 and never reaches them) on real safe2 rows at scale 1 and 1e9 against `Dequantize` + a double dot (measured 1e-8 to 7e-8 relative, gate 1e-5). A swapped Q6_K sub-block scale and a Q8_0 element-order mutant each fail only their own type. Untested: KV-cache growth past 1024 tokens (the device-copy path in `EnsureKvCapacity`).
+
+**Greedy attribution, closed (#1988 review).** The CPU q8_0-safe2 run diverges from HF at token 4 (2038 over 2550, margin 0.09; HF 2550 by 0.23), exactly like the F32-activation control (margin 0.03), and at step 12 also ranks 1265 above HF's 374. Both near-tie flips come from the q8_0 weights; BF16 activation storage keeps step 4 on HF's token.
 
 **Throughput** (Strix Halo, Vulkan, q8_0-safe2, warm, same session, 300-token chat prompt prefill then 48 greedy decode steps; UMA swing and a shared GPU make runs differ):
 BF16 activations prefill 180-307 tok/s, decode 27-31 tok/s; F32-activation control prefill 326-330, decode 30.3-30.4 (storage dtype is throughput-neutral within noise); bf16 GGUF prefill 289-296, decode 24.7-25.4.
