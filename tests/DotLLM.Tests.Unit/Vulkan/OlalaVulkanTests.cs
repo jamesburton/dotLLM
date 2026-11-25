@@ -384,7 +384,7 @@ public sealed class OlalaVulkanTests
     /// <summary>
     /// The in-place Q8_0 / Q6_K row decoders (<c>olala_wdot.glsl</c>, shared by the GEMV and both MoE kernels) on REAL rows of q8_0-safe2 against
     /// <see cref="Dequantize"/> + a double dot product. The tiny oracle model is BF16, so without this test nothing but the loosely gated real-model
-    /// parity sees these decoders (a swapped Q6_K sub-block scale passed the whole suite). 1e9 is the ReLU^2 magnitude feeding ffn_down_exps (Q6_K).
+    /// parity sees these decoders (it does catch a swapped Q6_K sub-block scale, but only through the minutes-long q8_0-safe2 run; this test catches it, and a Q8_0 element-order mutant, per type in seconds). 1e9 is the ReLU^2 magnitude feeding ffn_down_exps (Q6_K).
     /// </summary>
     [SkippableTheory]
     [InlineData("blk.0.ffn_down_exps.weight", 1f)]
@@ -450,6 +450,10 @@ public sealed class OlalaVulkanTests
         using var f = GgufFile.Open(gguf!);
         bool f32 = Environment.GetEnvironmentVariable("DOTLLM_OLALA_BENCH_F32ACT") == "1";
         using var vk = LoadVk(dev, f, f32);
+        // Rule 2/3 evidence: how the weights (routers included) reached the device on this load.
+        _output.WriteLine($"weights: imported {VulkanWeightImportPolicy.ImportedTensorCount} ({VulkanWeightImportPolicy.ImportedBytes / 1048576.0:F0} MiB), " +
+                          $"direct {VulkanWeightImportPolicy.DirectTensorCount}, staged {VulkanWeightImportPolicy.StagedTensorCount} " +
+                          $"({VulkanWeightImportPolicy.StagedBytes / 1048576.0:F0} MiB), last fallback '{VulkanWeightImportPolicy.LastFallbackReason}'");
         int[] pos = Enumerable.Range(0, c.L).ToArray();
         var pre = new List<double>(); var dec = new List<double>();
         for (int round = 0; round < 4; round++)
