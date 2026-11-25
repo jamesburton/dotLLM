@@ -111,9 +111,9 @@ public sealed unsafe class Edge0Pack : IDisposable
     public static Edge0Pack Open(string directory, int hidden = 2560, int expertFf = 640, bool preferLatentQ4 = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(directory);
-        string manifest = Path.Combine(directory, "native_experts.txt");
-        string expertsPath = Path.Combine(directory, "experts.bin");
-        string labelsPath = Path.Combine(directory, "labels.bin");
+        string manifest = R(Path.Combine(directory, "native_experts.txt"));
+        string expertsPath = R(Path.Combine(directory, "experts.bin"));
+        string labelsPath = R(Path.Combine(directory, "labels.bin"));
         foreach (string f in new[] { manifest, expertsPath, labelsPath })
             if (!File.Exists(f)) throw new InvalidDataException($"Edge0 pack file missing: {f}");
 
@@ -141,7 +141,7 @@ public sealed unsafe class Edge0Pack : IDisposable
         string scalesDir = Path.Combine(directory, "scales");
         bool hasScales = File.Exists(Path.Combine(scalesDir, "l0.f32"));
         int latent;
-        if (hasScales) latent = checked((int)(new FileInfo(Path.Combine(scalesDir, "l0.f32")).Length / sizeof(float)));
+        if (hasScales) latent = checked((int)(new FileInfo(R(Path.Combine(scalesDir, "l0.f32"))).Length / sizeof(float)));
         else latent = SolveLatent(recBytes, expertFf);
         var guType = QuantizationType.Q3_K; var dType = QuantizationType.IQ4_NL;
         long guBytes = Dequantize.RowByteSize(latent, guType) * expertFf;
@@ -181,7 +181,7 @@ public sealed unsafe class Edge0Pack : IDisposable
             inv = new float[layers][];
             for (int l = 0; l < layers; l++)
             {
-                string p = Path.Combine(scalesDir, $"l{l}.f32");
+                string p = R(Path.Combine(scalesDir, $"l{l}.f32"));
                 if (!File.Exists(p)) throw new InvalidDataException($"scales: {p} is missing (all-or-none).");
                 byte[] sb = File.ReadAllBytes(p);
                 if (sb.Length != latent * sizeof(float))
@@ -195,7 +195,7 @@ public sealed unsafe class Edge0Pack : IDisposable
         }
 
         // ── latent dense: size decides the group count and cross-checks the format ──
-        string q8 = Path.Combine(directory, "latent_dense_q8.bin"), q4 = Path.Combine(directory, "latent_dense_q4.bin");
+        string q8 = R(Path.Combine(directory, "latent_dense_q8.bin")), q4 = R(Path.Combine(directory, "latent_dense_q4.bin"));
         string latentPath = preferLatentQ4 && File.Exists(q4) ? q4 : File.Exists(q8) ? q8 : File.Exists(q4) ? q4 : "";
         if (latentPath.Length == 0) throw new InvalidDataException("latent_dense_q8.bin / latent_dense_q4.bin missing.");
         var latentType = latentPath == q8 ? QuantizationType.Q8_0 : QuantizationType.Q4_0;
@@ -222,6 +222,13 @@ public sealed unsafe class Edge0Pack : IDisposable
             foreach (var (m, v) in maps) { v.SafeMemoryMappedViewHandle.ReleasePointer(); v.Dispose(); m.Dispose(); }
             throw;
         }
+    }
+
+    /// <summary>Follows file symlinks to the final target (an HF snapshot folder is made of links into <c>blobs/</c>); a plain path is returned unchanged.</summary>
+    private static string R(string path)
+    {
+        try { return File.ResolveLinkTarget(path, returnFinalTarget: true)?.FullName ?? path; }
+        catch (IOException) { return path; }
     }
 
     private static int SolveLatent(long recordBytes, int expertFf)
