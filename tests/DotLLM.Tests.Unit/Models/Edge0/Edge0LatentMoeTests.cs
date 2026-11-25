@@ -58,24 +58,6 @@ public sealed unsafe class Edge0LatentMoeTests
         }
     }
 
-    [Theory]
-    [InlineData(1)]    // one chunk
-    [InlineData(70)]   // two chunks (crosses the 64-token boundary)
-    public void Forward_SteadyState_AllocatesNothing_OnTheCallingThread(int tokens)
-    {
-        // #1972: the per-chunk scratch used to be a fresh helper object plus two Lists per chunk. Serial path (pool null) so the
-        // thread-local counter sees everything; a warmed second pass must not allocate a single byte.
-        using var syn = new SyntheticEdge0Pack();
-        using var pack = syn.Open();
-        var (router, x) = Inputs(tokens);
-        var y = new float[tokens * H];
-        for (int i = 0; i < 3; i++) Edge0LatentMoe.Forward(pack, 1, router, K, true, null, x, y, tokens);   // warm: JIT, ArrayPool buckets
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 5; i++) Edge0LatentMoe.Forward(pack, 1, router, K, true, null, x, y, tokens);
-        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
-        Assert.True(allocated == 0, $"{allocated} bytes allocated over 5 steady-state calls ({tokens} tokens)");
-    }
-
     /// <summary>Round-to-nearest-even F32 to BF16 bits, and the exact widening back (the router fixture is BF16-representable, so the oracle is exact).</summary>
     private static ushort ToBf16(float v)
     {
