@@ -28,7 +28,13 @@ issued cannot change a result.
 | `DOTLLM_PLE_TOUCH_THREADS` | touch / cache-fill threads | min(8, cores) |
 | `DOTLLM_PLE_STATS=1` | sample the process page-fault counter around gathers (process-wide, cheap) | off |
 
-Formats: anything `Dequantize` handles (IQ4_NL, BF16, F16, F32, Q8_0 are covered by tests). Stats: `PleRowPrefetcher.Stats` /
+Formats: anything `Dequantize` handles (IQ4_NL, BF16, F16, F32, Q8_0 are covered by tests), plus **FP8 E4M3FN** (#1974): Edge0's
+`ple-fp8.gguf` is a GGUF `I8` tensor `[160, 320001536]` (160 B/row, 51.2 GB) of FP8 bytes with `general.architecture = strata-ple`,
+`strata.ple.format = f8_e4m3` and one table-wide F32 `strata.ple.scale` (1.9931793e-4 in the Edge0-145B-q3k file); `value = e4m3fn(byte) * scale`,
+the NaN codes `0x7F/0xFF` read as 0 (never present in a real table). `PleRowCodec` decodes it at the three gather sites; the table is not
+widened (a row is decoded into the caller's scratch; the row cache stores the raw 160 B). The GGUF reader accepts the raw `I8` container only for
+that declaration (the tensor-overlay container is the only other I8 use). Tests: `Qwen4ExpPleFp8Tests` (all 256 codes bit-exact vs a `Math.Pow`
+reference, literal OCP anchors, all gather sites with prefetch on/off, the real file's rows via a plain `FileStream`). Stats: `PleRowPrefetcher.Stats` /
 `Qwen4ExpTransformerModel.PleTableStats` (requests, rows, unique rows/pages, coalesced ranges, cache hits/misses, wait / worker /
 gather microseconds, gather faults, hint failures) and the `DotLLM.Ple` `Meter` (`dotllm.ple.rows`, `.unique_pages`, `.cache_hits`,
 `.cache_misses`, `.wait` (us), `.gather_faults`; observable counters, so zero cost without a listener).
