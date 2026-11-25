@@ -5,7 +5,9 @@ using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Unit.Models.Architectures;
+using DotLLM.Cpu.Kernels;
 using DotLLM.Vulkan;
+using DotLLM.Vulkan.Kernels;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -272,5 +274,140 @@ public sealed class OlalaVulkanTests
             }
             if (c.L <= 100) { Assert.True(r.Median < 0.05, $"median KL {r.Median:E2}"); Assert.True(r.Top1 >= 0.85 * r.Rows, $"top-1 {r.Top1}/{r.Rows}"); }
         }
+    }
+
+    // ───────────────────────── kernel-level tests (outlier magnitudes the tiny model cannot produce) ─────────────────────────
+
+    private static ushort Bf16(float v) => OlalaOps.ToBf16(v);
+    private static float FromBf16(ushort b) => OlalaOps.FromBf16(b);
+
+    private static VulkanDevice.Buffer UploadBf16(VulkanDevice dev, ReadOnlySpan<float> v)
+    {
+        var bits = new ushort[v.Length]; for (int i = 0; i < bits.Length; i++) bits[i] = Bf16(v[i]);
+        var b = dev.Allocate(Math.Max(16, bits.Length * 2));
+        dev.Upload(System.Runtime.InteropServices.MemoryMarshal.AsBytes<ushort>(bits), b);
+        return b;
+    }
+
+    private static float[] DownloadBf16(VulkanDevice dev, VulkanDevice.Buffer b, int count)
+    {
+        var raw = new float[(count + 1) / 2]; dev.Download(b, raw);
+        var u = System.Runtime.InteropServices.MemoryMarshal.Cast<float, ushort>(raw.AsSpan());
+        var r = new float[count]; for (int i = 0; i < count; i++) r[i] = FromBf16(u[i]); return r;
+    }
+
+    /// <summary>
+    /// The geodesic update fed mixer outputs of 1e12 (the real model reaches ~1e14): must agree with the CPU double-precision update and stay
+    /// finite. An F16-storage activation path turns every such value into inf/NaN, which the tiny model (no outliers) cannot show.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1e12f)]
+    [InlineData(1e14f)]
+    [InlineData(1f)]
+    public void GeodesicKernel_WithOutlierMixerOutput_MatchesCpuAndStaysFinite(float outlier)
+    {
+        SkipUnlessGpu();
+        using var dev = VulkanDevice.Create();
+        const int H = 1536, T = 3;
+        var rng = new Random(7);
+        var x = new float[T * H]; var g = new float[T * H];
+        for (int t = 0; t < T; t++)
+        {
+            double ss = 0; for (int i = 0; i < H; i++) { x[t * H + i] = (float)(rng.NextDouble() * 2 - 1); ss += x[t * H + i] * x[t * H + i]; }
+            for (int i = 0; i < H; i++) { x[t * H + i] = FromBf16(Bf16(x[t * H + i] / (float)Math.Sqrt(ss))); g[t * H + i] = FromBf16(Bf16((float)(rng.NextDouble() * 2 - 1) * outlier)); }
+        }
+        using var bx = UploadBf16(dev, x); using var bg = UploadBf16(dev, g);
+        using var k = new OlalaKernel(dev, SpvDir(), "olala_geodesic", 2, 4);
+        const float scale = 0.9f, bias = 0.05f; const int layer = 5;
+        using (var ctx = dev.CreateSubmitContext())
+        {
+            ctx.Begin();
+            k.Record(ctx.CommandBuffer, [bx, bg], [(uint)H, (uint)layer + 1, BitConverter.SingleToUInt32Bits(scale), BitConverter.SingleToUInt32Bits(bias)], T, 1, 1);
+            ctx.SubmitAndWait();
+        }
+        var got = DownloadBf16(dev, bx, T * H);
+        double worst = 0;
+        for (int t = 0; t < T; t++)
+        {
+            var want = new float[H];
+            OlalaOps.GeodesicUpdate(x.AsSpan(t * H, H), g.AsSpan(t * H, H), want, scale, bias, layer);
+            for (int i = 0; i < H; i++)
+            {
+                Assert.True(float.IsFinite(got[t * H + i]), $"non-finite output at token {t} element {i}");
+                worst = Math.Max(worst, Math.Abs(got[t * H + i] - want[i]));
+            }
+        }
+        _output.WriteLine($"outlier {outlier:E0}: max |GPU - CPU| = {worst:E2}");
+        Assert.True(worst < 2e-2, $"max |GPU - CPU| {worst:E2}");   // BF16 rounding of a unit vector is ~4e-3 per element
+    }
+
+    /// <summary>A BF16-weight GEMV with 1e12-scale BF16 activations (the ReLU^2 / mixer-output inputs of safe2) equals a double reference: no FP16 scale anywhere.</summary>
+    [SkippableFact]
+    public void GemvKernel_WithOutlierActivations_MatchesDoubleReference()
+    {
+        SkipUnlessGpu();
+        using var dev = VulkanDevice.Create();
+        const int M = 40, K = 256, T = 3;
+        var rng = new Random(3);
+        var w = new float[M * K]; var x = new float[T * K];
+        for (int i = 0; i < w.Length; i++) w[i] = FromBf16(Bf16((float)(rng.NextDouble() * 2 - 1)));
+        for (int i = 0; i < x.Length; i++) x[i] = FromBf16(Bf16((float)(rng.NextDouble() * 2 - 1) * 1e12f));
+        using var bw = UploadBf16(dev, w); using var bx = UploadBf16(dev, x);
+        using var by = dev.Allocate(T * M * 2 + 16); using var dummy = dev.Allocate(256);
+        using var k = new OlalaKernel(dev, SpvDir(), "olala_gemv_bf16", 5, 4, [8u, 0u, 0u]);
+        using (var ctx = dev.CreateSubmitContext())
+        {
+            ctx.Begin();
+            k.Record(ctx.CommandBuffer, [bw, bx, by, dummy, dummy], [(uint)M, (uint)K, (uint)T, 0u], M, 1, 1);
+            ctx.SubmitAndWait();
+        }
+        var got = DownloadBf16(dev, by, T * M);
+        for (int t = 0; t < T; t++)
+            for (int m = 0; m < M; m++)
+            {
+                double want = 0; for (int i = 0; i < K; i++) want += (double)w[m * K + i] * x[t * K + i];
+                Assert.True(float.IsFinite(got[t * M + m]), $"non-finite at col {t} row {m}");
+                Assert.True(Math.Abs(got[t * M + m] - want) <= 1e-2 * Math.Abs(want) + 1e9, $"col {t} row {m}: {got[t * M + m]:E4} vs {want:E4}");
+            }
+    }
+
+    /// <summary>
+    /// Warm same-session throughput (opt-in: <c>DOTLLM_OLALA_VK_BENCH=1</c>; hold the GPU lock, no CPU work alongside). Prefill = the 300-token chat
+    /// prompt, last-row logits; decode = greedy one-token steps. UMA timing swings ~40% between sessions, so only same-session ranges are quoted.
+    /// </summary>
+    [SkippableFact]
+    public void RealModel_Throughput_WarmRanges()
+    {
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_OLALA_VK_BENCH") != "1", "set DOTLLM_OLALA_VK_BENCH=1");
+        SkipUnlessGpu();
+        string file = Environment.GetEnvironmentVariable("DOTLLM_OLALA_BENCH_FILE") ?? "Olala-v1.0-mini-7A1B-q8_0-safe2.gguf";
+        string? gguf = FindGguf("DOTLLM_OLALA_Q8_GGUF", file); Skip.If(gguf is null, file + " not in the HF cache");
+        var c = OlalaOracleTests.LoadCase("real-strict-gguf-norms-chat")!;
+        using var dev = VulkanDevice.Create();
+        using var f = GgufFile.Open(gguf!);
+        bool f32 = Environment.GetEnvironmentVariable("DOTLLM_OLALA_BENCH_F32ACT") == "1";
+        using var vk = LoadVk(dev, f, f32);
+        int[] pos = Enumerable.Range(0, c.L).ToArray();
+        var pre = new List<double>(); var dec = new List<double>();
+        for (int round = 0; round < 4; round++)
+        {
+            vk.ResetSequenceState();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            using var p = vk.Forward(c.Ids, pos, -1, null, true);
+            double ms = sw.Elapsed.TotalMilliseconds;
+            int next = OlalaOracleTests.Argmax(Rows(p, 1, c.Vocab));
+            var steps = new List<double>();
+            for (int j = 0; j < 48; j++)
+            {
+                sw.Restart();
+                using var s = vk.Forward([next], [c.L + j], -1, null, true);
+                steps.Add(sw.Elapsed.TotalMilliseconds);
+                next = OlalaOracleTests.Argmax(Rows(s, 1, c.Vocab));
+            }
+            if (round == 0) { _output.WriteLine($"cold round: prefill {c.L / (ms / 1000):F0} tok/s ({ms:F0} ms), decode {1000 / steps.Average():F1} tok/s"); continue; }
+            pre.Add(c.L / (ms / 1000)); dec.Add(1000 / steps.Skip(4).Average());
+            _output.WriteLine($"warm round {round}: prefill {pre[^1]:F0} tok/s ({ms:F0} ms), decode {dec[^1]:F1} tok/s (median step {steps.OrderBy(x => x).ElementAt(steps.Count / 2):F1} ms)");
+        }
+        _output.WriteLine($"{file} act={(f32 ? "F32" : "BF16")}: warm prefill {pre.Min():F0}-{pre.Max():F0} tok/s, decode {dec.Min():F1}-{dec.Max():F1} tok/s");
     }
 }
