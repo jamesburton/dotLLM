@@ -358,7 +358,11 @@ jobs:
               continue
             fi
             for p in "${pkgs[@]}"; do
-              dotnet nuget push "$p" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+              # One refused package (e.g. an id the trusted-publishing policy does not cover) must not skip the others.
+              if ! dotnet nuget push "$p" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate; then
+                echo "::error::NuGet push of $p failed (for a new id, check the nuget.org trusted-publishing policy's package patterns)"
+                status=1
+              fi
             done
           done
           exit $status
