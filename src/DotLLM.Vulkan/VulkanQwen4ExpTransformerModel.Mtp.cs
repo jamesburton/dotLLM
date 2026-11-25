@@ -160,7 +160,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         if (_spvDir is null) throw new InvalidOperationException("The model was not built by BuildFromGguf (no SPIR-V directory).");
         var tensors = headFile.TensorsByName;
         var cfg = Qwen4ExpTensors.HeadConfig(Config, tensors);   // #1529: the head carries its own expert count
-        var problems = Qwen4ExpTensors.FindProblems(tensors, cfg, includeTrunk: false, includeMtp: true, skeleton: edge0Head is not null);
+        IReadOnlyList<string> problems = Qwen4ExpTensors.FindProblems(tensors, cfg, includeTrunk: false, includeMtp: true, skeleton: edge0Head is not null);
+        // "skeleton" drops the routed-expert tensors (read from the pack) but also expects the Edge0 skeleton's [embd, 1] spelling of the shared-expert gate; the head's is the stock [embd] (same bytes).
+        if (edge0Head is not null) problems = problems.Where(p => !p.Contains("ffn_gate_inp_shexp", StringComparison.Ordinal)).ToList();
         if (problems.Count > 0)
             throw new InvalidDataException("qwen4exp MTP head tensor table does not match the contract: " +
                                            string.Join("; ", problems.Take(8)) + (problems.Count > 8 ? $"; (+{problems.Count - 8} more)" : ""));
