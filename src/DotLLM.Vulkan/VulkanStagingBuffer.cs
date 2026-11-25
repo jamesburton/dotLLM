@@ -442,6 +442,8 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
         _disposed = true;
         WaitAll();
         DirectStorage.DirectWeightStore.TryGet(_device)?.Seal();   // #1304: end of load - reads landed, DirectStorage queue and ring freed
+        string refusal = VulkanWeightImportPolicy.RejectionWarning();   // #1991: a refused import is never silent
+        if (refusal.Length > 0) Console.Error.WriteLine(refusal);
         if (s_trace)
         {
             Console.Error.WriteLine(
