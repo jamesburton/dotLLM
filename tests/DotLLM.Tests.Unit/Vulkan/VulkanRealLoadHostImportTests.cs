@@ -91,7 +91,7 @@ public class VulkanRealLoadHostImportTests(ITestOutputHelper output)
             _output.WriteLine(ledger);
 
             if (GgufFile.MappingAccess == MemoryMappedFileAccess.CopyOnWrite
-                || VulkanWeightImportPolicy.WritableAliasEnabled(device))
+                || VulkanWeightImportPolicy.WritableAliasEnabled)
             {
                 // The modes in which the import is SUPPOSED to work (a read-only mapping imports through a
                 // shared writable alias view under DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1, #1190). This is the guard: if the

@@ -87,12 +87,12 @@ public class VulkanWeightImportWriteGuardTests(ITestOutputHelper output)
         {
             using var device = VulkanDevice.Create();
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE", "0");
-            Assert.False(VulkanWeightImportPolicy.WritableAliasEnabled(device));
+            Assert.False(VulkanWeightImportPolicy.WritableAliasEnabled);
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE", "1");
-            Assert.True(VulkanWeightImportPolicy.WritableAliasEnabled(device));
+            Assert.True(VulkanWeightImportPolicy.WritableAliasEnabled);
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE", null);
             Assert.False(
-                VulkanWeightImportPolicy.WritableAliasEnabled(device));   // unset = off
+                VulkanWeightImportPolicy.WritableAliasEnabled);   // unset = off
         }
         finally { Environment.SetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE", orig); }
     }

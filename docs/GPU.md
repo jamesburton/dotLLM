@@ -1098,7 +1098,7 @@ Why it is opt-in (#1991 adds a SHA-256 write guard test, `VulkanWeightImportWrit
 Mapping access the driver accepts (re-confirmed in the output of `VulkanHostImportMmapAccessModeTests`, which prints these verdicts but does not assert them): read-only refused
 (`vkAllocateMemory` -1000072003); copy-on-write accepted but privatises every page (no saving); shared read-write
 accepted and in place. `VulkanWeightImportWriteGuardTests` hashes the file around an imported load + prefill + decode.
-A refused import on an integrated device is counted and logged once per load, when the load's last staging buffer closes (`[dotllm] vulkan host import: N tensors / X MiB refused`); a discrete GPU's by-design #507 refusal is not counted.
+An import that was refused although the alias was requested (`DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1`, integrated device) is counted and logged once per load, when the load's last staging buffer closes (`[dotllm] vulkan host import: N tensors / X MiB refused`); a default load (alias not requested) prints nothing, and a discrete GPU's by-design #507 refusal is not counted.
 
 Penalty investigation, Llama-3.1-8B Q4_K_M, `bench -p 512 -n 64 -r 3`, same session, warm cache (decode tok/s / prefill tok/s):
 

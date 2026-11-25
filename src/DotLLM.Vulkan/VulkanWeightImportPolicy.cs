@@ -67,12 +67,15 @@ internal static class VulkanWeightImportPolicy
     /// integrated device, withdrawn after measurement)</b>. The driver refuses read-only GGUF pages (<c>vkAllocateMemory</c> -1000072003), so without
     /// the alias every tensor is copied through host memory (a CLAUDE.md rule-3 bounce). Read per call.
     /// </summary>
-    public static bool WritableAliasEnabled(VulkanDevice device)
+    public static bool WritableAliasEnabled
     {
+      get
+      {
         string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE");
         if (string.Equals(v, "0", StringComparison.Ordinal)) return false;
         if (string.Equals(v, "1", StringComparison.Ordinal)) return true;
         return false;   // #1991: opt-in. Default-on measured -19% decode / -33% prefill on dense Llama (see docs/GPU.md); DirectStorage is the neutral zero-copy route.
+      }
     }
 
     /// <summary>Tensors whose import was attempted and refused on the current load (they are then staged) (#1991).</summary>
@@ -280,12 +283,13 @@ internal static class VulkanWeightImportPolicy
         // #1991: still opt-in (default-on measured -19% decode / -33% prefill, docs/GPU.md). When on, the file is opened
         // shared-writable but nothing writes to it: weight buffers are bound read-only (VulkanWeightImportWriteGuardTests).
         string aliasFailure = string.Empty;
-        if (wrapped is null && WritableAliasEnabled(device))
+        bool aliasRequested = wrapped is null && WritableAliasEnabled;
+        if (aliasRequested)
         {
+            // TryMapImportAlias returns false (never a zero alias) when the range is not in an open read-only mapping, the GGUF is
+            // mapped copy-on-write, or the file cannot be opened for write.
             if (!Models.Gguf.GgufFile.TryMapImportAlias(srcPtr, bytes, writable: true, out nint alias))
-                aliasFailure = "alias_unavailable(range_not_in_mapping_or_cow_mode)";
-            else if (alias == 0)
-                aliasFailure = "alias_unavailable(file_not_openable_for_write)";
+                aliasFailure = "alias_unavailable(not_in_readonly_mapping_or_file_not_writable)";
             else
             {
                 wrapped = device.TryWrapHostVisible(alias, bytes);
@@ -304,8 +308,9 @@ internal static class VulkanWeightImportPolicy
                 ? aliasFailure
                 : $"import_rejected({Interop.HostVisibleBuffer.LastImportFailureStage}" +
                   $":{Interop.HostVisibleBuffer.LastImportFailureCode})";
-            // A discrete GPU refuses by design (#507 not_integrated_gpu): that is policy, not a refusal worth a warning.
-            if (device.PhysicalDeviceTypeValue is Interop.VkPhysicalDeviceType.IntegratedGpu or Interop.VkPhysicalDeviceType.Cpu)
+            // Warn only when the alias was requested (DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1) and still refused: the default path
+            // stays silent (#1995 reports DirectStorage fallbacks instead). A discrete GPU refuses by design (#507): policy, not a refusal.
+            if (aliasRequested && device.PhysicalDeviceTypeValue is Interop.VkPhysicalDeviceType.IntegratedGpu or Interop.VkPhysicalDeviceType.Cpu)
             {
                 RejectedTensorCount++;
                 RejectedBytes += bytes;
