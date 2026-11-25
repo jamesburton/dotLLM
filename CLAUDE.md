@@ -289,6 +289,7 @@ store** (#1279) — every model, whether pulled by the CLI or by a test, has one
 | dotLLM vs llama.cpp comparisons | [docs/COMPARISONS.md](docs/COMPARISONS.md) | Quoting or updating any cross-engine number: every figure sourced, with hardware, build hashes, ranges, caveats, needs-re-measure list |
 | Perplexity & llama.cpp comparison | [docs/PERPLEXITY.md](docs/PERPLEXITY.md) | Quality measurement, corpus fixtures, CRLF trap (#506) |
 | Precision | [docs/PRECISION.md](docs/PRECISION.md) | Storage/accumulator formats per op and device, KV formats, Keep-FP32 list, #1107 evidence and violation inventory |
+| OVHcloud Olala | [docs/OLALA.md](docs/OLALA.md) | Mamba-3 MIMO + differential TPA + latent MoE hybrid, safe2 quant, F32-state exception, oracle |
 | Edge0 pack format / latent MoE | [docs/EDGE0_PACK_FORMAT.md](docs/EDGE0_PACK_FORMAT.md) | Edge0-145B support: strata pack v3 files, expert record layout, D/U groups, Q3_K column scale (epic #1966) |
 | Embeddings (RAG) survey | [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) | Embedding models, `dotllm embed`, `/v1/embeddings`, encoder perf, quality gate |
 | Implementation roadmap | [docs/ROADMAP.md](docs/ROADMAP.md) | Planning, task sequencing |

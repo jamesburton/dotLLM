@@ -55,6 +55,12 @@ public static partial class HfConfigExtractor
 
         Architecture architecture = ResolveArchitecture(root);
 
+        // Olala (#1970): the HF checkpoint is custom_code with its own tensor names; only the converted GGUF is loadable (CPU).
+        if (architecture == Architecture.Olala)
+            throw new NotSupportedException(
+                "The olala architecture (OVHcloud Olala, HF OlalaForCausalLM) is not loadable from safetensors in dotLLM yet: use the GGUF "
+                + "(OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF) on the CPU backend. Tracked in https://github.com/jamesburton/dotLLM/issues/1969.");
+
         // Ripple (#1643): dedicated builder (hybrid layer_types, gated attention, value residual, FFN clamp, embed_scale null = folded).
         if (architecture == Architecture.Ricursive)
             return ExtractRicursive(root);
@@ -742,6 +748,9 @@ public static partial class HfConfigExtractor
             // ricursiveAI Ripple — `RicursiveForCausalLM` / `model_type=ricursive` (custom_code, #1643).
             (var a, _) when a is not null && a.Contains("ricursive") => Architecture.Ricursive,
             (_, "ricursive") => Architecture.Ricursive,
+            // OVHcloud Olala — `OlalaForCausalLM` / `model_type=olala` (custom_code, #1970): recognised so the failure is explicit; GGUF only for now.
+            (var a, _) when a is not null && a.Contains("olala") => Architecture.Olala,
+            (_, "olala") => Architecture.Olala,
             (var a, _) when a is not null && a.Contains("glm4moe") => Architecture.Glm4Moe,
             (_, "glm4_moe") => Architecture.Glm4Moe,
             // DeepSeek-V3 must be checked before V2 and before any Llama/Mistral

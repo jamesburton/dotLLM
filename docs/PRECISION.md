@@ -97,10 +97,16 @@ Only what the data proved. Everything here is **in registers or within a tile**,
 | what | status |
 |---|---|
 | Recurrent (GDN/SSM) carried state and its snapshots | not measured → **#1144** (engines unanimous on F32 `[lit]`; HF `mamba_ssm_dtype: float32` is evidence, not exemption) |
+| **Olala (OVHcloud) Mamba-3 recurrent state**: SSM matrix `h`, rotary phase, trapezoid K/V boundary, and the V-layer token-shift last K/V (`OlalaStatePolicy`; 7A1B: 1.5 MiB + 6 KiB + 96 KiB + 12 KiB per M layer, 44 MiB + 3 MiB per sequence) | **explicit exception, user sign-off 2026-11-25**, per architecture only (a compile-time constant of `Architecture.Olala`; no env var / global setting narrows it; `OlalaOracleTests.RecurrentState_IsF32_ByArchitecturePolicy` fails if the buffers are narrowed). Evidence for F32: OVH serve with vLLM `--mamba-ssm-cache-dtype float32`; the OVH llama.cpp fork keeps the state F32 and documents that a reduced-precision state "degrades long generations into repetition loops". Not measured by us → **#1971** (KL/PPL and long-generation greedy drift vs the F32-state reference, per sub-state). **Not precedent** for any other storage. **Extension 2026-11-25 (user ruling): token-shift last K/V and the trapezoid carry stay F32 too** (HF keeps them in the model dtype); guard test covers all of them. |
 | Split-KV *m*/*ℓ* (LSE) partials, split-K combine | not measured → **#1144** (an F16 LSE at magnitude 20 gives ≈1.6% weight error `[lit, derived]`) |
 | Sampled-row logits and the V-wide LSE | policy (4·V B per sampled row) → bounded to sampled rows by **#1137** |
 | RoPE angle `pos·θ` (F64 for the YaRN ramp) | compute only; F16 cos/sin tables not measured → **#1142** |
 | Residual stream of models that overflow F16 (BitNet) | per-model exception; measurement → **#1138**. Flint (3.5e4) instead carries an F16 stream scaled by 1/8 on CUDA (E13) |
+
+**Activation range exception (Olala, #1969):** the OVHcloud Olala activations are documented to reach ~1e14 (M-mixer outputs, the `attn_output` input) and ~1e9 (ReLU² of the experts,
+the `ffn_down_*` input), far beyond FP16's 65,504, and OVH's own recipe keeps exactly those tensors BF16/Q6_K (`q8_0-safe2`) because an FP16-scaled Q8_0 activation quantiser overflows to NaN. For this
+architecture FP16 activation storage, FP16 scratch and FP16 activation scales on those two paths are **not allowed on any backend** (CPU uses F32 activations; the #1138 F16-activation defaults do not apply;
+GPU ports keep BF16 there: it has the F32 exponent range, so F32 storage still needs sign-off under rule 1, and anything narrower than BF16 needs sign-off too). See `docs/OLALA.md` §3.
 
 **Not justified anywhere:** F32 weights, F32 KV, F32 MTP/draft KV, F32 inter-kernel activations (pending #1138), F32
 embedding tables.

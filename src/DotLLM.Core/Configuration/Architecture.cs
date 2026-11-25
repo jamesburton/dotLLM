@@ -551,5 +551,15 @@ public enum Architecture
     /// <see cref="DotLLM.Core.Models.ModelConfig.Ricursive"/>. Config + loader + tokenizer only (issue #1643): no forward pass yet,
     /// loaders refuse with <see cref="DotLLM.Core.Models.RicursiveConfig.UnsupportedMessage"/>.
     /// </summary>
-    Ricursive
+    Ricursive,
+
+    /// <summary>
+    /// OVHcloud Olala (llama.cpp <c>olala</c>, HF <c>OlalaForCausalLM</c> / <c>model_type=olala</c>; Olala-v1.0-mini-7A1B): a hybrid of
+    /// Mamba-3 MIMO mixers (<c>M</c>) and differential tensor-product attention (<c>V</c>, NOT MLA), a 256-expert latent MoE with a
+    /// shared expert in every block, no pre-norms (geodesic-rotation residual updates) and no final norm. Layer kinds come from
+    /// <see cref="DotLLM.Core.Models.OlalaConfig.LayerTypes"/>. Extra parameters live in
+    /// <see cref="DotLLM.Core.Models.ModelConfig.Olala"/>. The Mamba SSM recurrent state is F32 by per-architecture policy
+    /// (<see cref="DotLLM.Core.Models.OlalaStatePolicy"/>, issue #1971). See <c>docs/OLALA.md</c>.
+    /// </summary>
+    Olala
 }
