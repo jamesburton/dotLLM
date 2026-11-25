@@ -135,8 +135,13 @@ public static class CudaModelLoader
             case Architecture.Ricursive:
                 throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("CUDA"));
 
+            // OVHcloud Olala (#1984): dedicated CUDA forward (Mamba-3 MIMO + differential TPA + latent MoE + geodesic residual).
+            // The plain CudaTransformerModel still refuses it (RejectUnsupportedArchitecture): it would silently run a different model.
             case Architecture.Olala:
-                throw new NotSupportedException(OlalaConfig.UnsupportedMessage("CUDA"));
+            {
+                var olala = Architectures.CudaOlalaTransformerModel.LoadFromGguf(gguf, config, deviceId, ptxDir);
+                return (olala, size => olala.CreateKvCache(size));
+            }
 
             case Architecture.MiMoV2:
                 throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("CUDA"));
