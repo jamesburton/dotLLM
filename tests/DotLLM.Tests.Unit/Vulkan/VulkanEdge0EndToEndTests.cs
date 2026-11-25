@@ -254,9 +254,25 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
                              (i == 0 ? $"NLL cpu {c.MeanNll:F4} vk {r.MeanNll:F4}" : ""));
             output.WriteLine($"  cpu text: {tok.Decode(c.Greedy).Replace((char)10, (char)126)}");
             output.WriteLine($"  vk  text: {tok.Decode(r.Greedy).Replace((char)10, (char)126)}");
-            if (i == 0 && Math.Abs(c.MeanNll - r.MeanNll) >= 0.05) failures.Add($"NLL cpu {c.MeanNll:F4} vs vulkan {r.MeanNll:F4}");
             if (kl >= 0.05) failures.Add($"input {i}: KL {kl:E3}");
-            if (r.RowArgmax[^1] != c.RowArgmax[^1]) failures.Add($"input {i}: next-token argmax differs");
+            if (i == 0)
+            {
+                // The passage is a knife-edge for ANY narrow latent format (greedy flips at its first token or at token 19 for every F16 / Q8 variant measured, and its last prompt row
+                // is a near-tie between " In" and " The"), so it is gated teacher-forced over all of its rows instead (#1981, James's ruling 2026-11-25). Measured on the shipped F16 build
+                // (Strix Halo, real Edge0-145B-q3k, CPU reference edge0_rows_tf.bin): NLL 1.6877 (cpu 1.6897), mean row KL 4.13e-3, max row KL 6.06e-2, row argmax 102/106.
+                // The old F32 build measured NLL 1.7037, 4.30e-3, 4.82e-2, 102/106. Each gate has ~1.5x headroom on those.
+                if (Math.Abs(c.MeanNll - r.MeanNll) >= 0.02) failures.Add($"passage NLL cpu {c.MeanNll:F4} vs vulkan {r.MeanNll:F4} (gate |diff| < 0.02)");
+                var rk = RowKl(r.AllRows) ?? throw new InvalidOperationException("DOTLLM_EDGE0_ROWS_REF (the CPU teacher-forced all-row reference, written by Stage_CpuReference) is required for the passage gates");
+                if (rk.Mean >= 6.0e-3) failures.Add($"passage mean row KL {rk.Mean:E3} (gate < 6.0e-3)");
+                if (rk.Max >= 9.0e-2) failures.Add($"passage max row KL {rk.Max:E3} (gate < 9.0e-2)");
+                if (rowAgree < 100) failures.Add($"passage row argmax {rowAgree}/{c.RowArgmax.Length} (gate >= 100)");
+                output.WriteLine($"  passage teacher-forced: mean row KL {rk.Mean:E3}, max {rk.Max:E3}, row argmax {rowAgree}/{c.RowArgmax.Length}, top rows {LastRowKlTop}");
+            }
+            else
+            {
+                if (r.RowArgmax[^1] != c.RowArgmax[^1]) failures.Add($"input {i}: next-token argmax differs");
+                if (greedyAgree != GreedyTokens) failures.Add($"input {i}: greedy {greedyAgree}/{GreedyTokens}");
+            }
         }
 
         // Speed (warm): prefill of the passage repeated to ~512 tokens, then single-token decode. Same session, after the parity forwards warmed every pipeline.
