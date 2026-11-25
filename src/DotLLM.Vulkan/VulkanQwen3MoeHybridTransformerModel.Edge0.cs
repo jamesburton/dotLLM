@@ -19,7 +19,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
     /// </summary>
     internal void Q4AttachEdge0(Edge0LatentKernels kernels, int groups, int latent, int hidden, int rows)
     {
-        if (_kernels.QuantizeQ8_1RowsActivations is null || _kernels.MoeMmvqIq(QuantizationType.Q3_K) is null)
+        if (_kernels.QuantizeQ8_1RowsActivations is null || kernels.IndexedQ3K is null || kernels.IndexedIq4Nl is null)
             throw new NotSupportedException("The Edge0 Vulkan path needs integer-dot-product support (the Q3_K / IQ4_NL expert banks are read through the dp4a MMVQ kernels).");
         FreeEdge0Scratch();
         _edge0Kernels = kernels;
@@ -80,22 +80,43 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
         MoeStage("edge0_d_gather");
 
         // 3. experts at width L (gate/up K = L, down M = L); the result rows land in MoeDownRows [rows, L]
-        bool grouped = T >= GroupedMinTokens && GroupedKernelsFit(moeW, L, interm)
+        long stride = e0.RecordBytes, upOff = e0.GateUpBytes, downOff = 2 * e0.GateUpBytes;
+        var bank = e0.Records;
+        bool grouped = T >= GroupedMinTokens && k.GroupedQ3K is not null && k.GroupedIq4Nl is not null && _kernels.MoeBuildTileList is not null
             && _kernels.MoeExpertOffsets is not null && _kernels.MoeExpandGroupByExpert is not null && _kernels.MoeUngroupScatter is not null && (L % 256) == 0;
         if (grouped)
-            RecordGroupedExperts(cmd, moeW, T, L, interm, E, rows, fusedGlue: false, topK);
+        {
+            var gateK = k.GroupedQ3K!; var downK = k.GroupedIq4Nl!;
+            _kernels.MoeExpertOffsets!.Record(cmd, _state.MoeTopkIndices, _state.MoeGroupCounts, _state.MoeGroupOffsets, _state.MoeGroupCounters, rows: rows, numExperts: E);
+            KernelSupport.ComputeToComputeBarrier(cmd);
+            _kernels.MoeExpandGroupByExpert!.Record(cmd, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGroupOffsets,
+                _state.MoeGroupCounters, _state.MoeDownRows, _state.MoeGroupPerm, rows: rows, hidden: L, numExperts: E);
+            KernelSupport.ComputeToComputeBarrier(cmd);
+            _kernels.MoeBuildTileList!.Record(cmd, _state.MoeGroupOffsets, _state.MoeGroupDispatchArgs, E, gateK.MTiles(interm), downK.MTiles(L), tileRows: gateK.RowTile);
+            KernelSupport.ComputeToIndirectAndComputeBarrier(cmd);
+            gateK.RecordIndirect(cmd, bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeGateInter, _state.MoeGroupDispatchArgs, 0, interm, L, rows, E, stride, 0);
+            gateK.RecordIndirect(cmd, bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeUpInter, _state.MoeGroupDispatchArgs, 0, interm, L, rows, E, stride, upOff);
+            KernelSupport.ComputeToComputeBarrier(cmd);
+            _kernels.SwiGlu.Record(cmd, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter, n: rows * interm);
+            KernelSupport.ComputeToComputeBarrier(cmd);
+            downK.RecordIndirect(cmd, bank, _state.MoeSiluInter, _state.MoeGroupOffsets, _state.MoeExpandedInput, _state.MoeGroupDispatchArgs,
+                MoeBuildTileListKernel.ArgsStrideBytes, L, interm, rows, E, stride, downOff);
+            KernelSupport.ComputeToComputeBarrier(cmd);
+            _kernels.MoeUngroupScatter!.Record(cmd, _state.MoeExpandedInput, _state.MoeGroupPerm, _state.MoeDownRows, rows: rows, hidden: L);
+            KernelSupport.ComputeToComputeBarrier(cmd);
+        }
         else
         {
             _kernels.QuantizeQ8_1RowsActivations!.Record(cmd, _state.MoeExpandedInput, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, n: rows, k: L);
             KernelSupport.ComputeToComputeBarrier(cmd);
-            RecordGateUpBank(cmd, moeW.W1QuantType, moeW.W1Bank, _state.MoeGateInter, interm, L, rows, E);
-            RecordGateUpBank(cmd, moeW.W3QuantType, moeW.W3Bank, _state.MoeUpInter, interm, L, rows, E);
+            k.IndexedQ3K!.Record(cmd, bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeTopkIndices, _state.MoeGateInter, interm, L, rows, E, stride, 0);
+            k.IndexedQ3K.Record(cmd, bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeTopkIndices, _state.MoeUpInter, interm, L, rows, E, stride, upOff);
             KernelSupport.ComputeToComputeBarrier(cmd);
             _kernels.SwiGlu.Record(cmd, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter, n: rows * interm);
             KernelSupport.ComputeToComputeBarrier(cmd);
             _kernels.QuantizeQ8_1RowsActivations.Record(cmd, _state.MoeSiluInter, _state.MoeSiluInterXq, _state.MoeSiluInterXds, n: rows, k: interm);
             KernelSupport.ComputeToComputeBarrier(cmd);
-            RecordDownMmvq(cmd, moeW.W2QuantType, moeW, L, interm, rows, E);
+            k.IndexedIq4Nl!.Record(cmd, bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds, _state.MoeTopkIndices, _state.MoeDownRows, L, interm, rows, E, stride, downOff);
             KernelSupport.ComputeToComputeBarrier(cmd);
         }
         MoeStage("edge0_experts");

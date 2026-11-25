@@ -228,7 +228,8 @@ internal static class VulkanQwen3MoeMoeUpload
         public void Dispose()
         {
             Gate.Dispose();
-            W1Bank.Dispose(); W2Bank.Dispose(); W3Bank.Dispose();
+            W1Bank.Dispose();
+            if (Edge0 is null) { W2Bank.Dispose(); W3Bank.Dispose(); }   // an Edge0 layer's three banks are ONE record buffer
             SharedGate?.Dispose(); SharedUp?.Dispose(); SharedDown?.Dispose();
             if (!ReferenceEquals(SharedGateQ8, SharedGate)) SharedGateQ8?.Dispose();
             if (!ReferenceEquals(SharedUpQ8, SharedUp)) SharedUpQ8?.Dispose();
@@ -404,7 +405,7 @@ internal static class VulkanQwen3MoeMoeUpload
         VulkanDevice.Buffer w1Bank, w2Bank, w3Bank;
         if (edge0 is not null)
         {
-            w1Bank = edge0.GateBank; w2Bank = edge0.DownBank; w3Bank = edge0.UpBank;
+            w1Bank = edge0.Records; w2Bank = edge0.Records; w3Bank = edge0.Records;   // one record array, three offsets (the strided kernels)
         }
         else if (expertSlots > 0)
         {

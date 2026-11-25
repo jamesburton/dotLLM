@@ -132,7 +132,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         if (DotLLM.Models.Edge0.Edge0Model.IsSkeleton(gguf))
         {
             if (slots > 0) throw new NotSupportedException("Expert tiering is not available for Edge0 packs.");
-            (edge0Pack, pleFile) = DotLLM.Models.Edge0.Edge0Model.OpenSiblings(gguf, config);
+            (edge0Pack, pleFile) = DotLLM.Models.Edge0.Edge0Model.OpenSiblings(gguf, config, importableViews: device.HasExternalMemoryHost && !VulkanWeightImportPolicy.IsDisabled);
         }
         try
         {

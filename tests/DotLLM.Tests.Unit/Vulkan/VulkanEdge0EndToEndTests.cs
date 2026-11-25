@@ -169,6 +169,10 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
         var sw = System.Diagnostics.Stopwatch.StartNew();
         using var vk = VulkanQwen4ExpTransformerModel.BuildFromGguf(device, gguf, GgufModelConfigExtractor.Extract(gguf.Metadata), spvDir);
         output.WriteLine($"vulkan load: {sw.Elapsed.TotalSeconds:F1} s; device live {device.LiveBytesTotal() / (double)(1L << 30):F2} GiB");
+        {
+            var pr = System.Diagnostics.Process.GetCurrentProcess();
+            output.WriteLine($"LOADMEM peak working set {pr.PeakWorkingSet64 / (double)(1L << 30):F2} GiB, peak commit {pr.PeakPagedMemorySize64 / (double)(1L << 30):F2} GiB, working set now {pr.WorkingSet64 / (double)(1L << 30):F2} GiB, private now {pr.PrivateMemorySize64 / (double)(1L << 30):F2} GiB; host-import tensors {VulkanWeightImportPolicy.ImportedTensorCount}");
+        }
 
         using var tg = GgufFile.Open(fx.Path!);
         var tok = GgufBpeTokenizerFactory.Load(tg.Metadata);

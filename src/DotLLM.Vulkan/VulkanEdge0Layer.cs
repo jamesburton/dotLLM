@@ -13,12 +13,15 @@ internal sealed class Edge0LayerBuffers : IDisposable
 {
     /// <summary>BF16 router <c>[experts, hidden]</c> (owned by the bundle's <c>Gate</c>).</summary>
     public required VulkanDevice.Buffer Router { get; init; }
-    /// <summary>Gate bank <c>[experts, ff, latent]</c> Q3_K (owned by the bundle's <c>W1Bank</c>).</summary>
-    public required VulkanDevice.Buffer GateBank { get; init; }
-    /// <summary>Up bank, same layout as <see cref="GateBank"/> (owned by the bundle's <c>W3Bank</c>).</summary>
-    public required VulkanDevice.Buffer UpBank { get; init; }
-    /// <summary>Down bank <c>[experts, latent, ff]</c> IQ4_NL (owned by the bundle's <c>W2Bank</c>).</summary>
-    public required VulkanDevice.Buffer DownBank { get; init; }
+    /// <summary>The layer's expert records exactly as the pack stores them (<c>experts * RecordBytes</c> bytes of gate | up | down), imported from the mapped file or, when the import is
+    /// refused, copied contiguously. Owned by the bundle (its <c>W1Bank</c>, <c>W2Bank</c> and <c>W3Bank</c> are all this one buffer).</summary>
+    public required VulkanDevice.Buffer Records { get; init; }
+    /// <summary>True when <see cref="Records"/> aliases the mapped pack pages (no copy at all).</summary>
+    public required bool RecordsImported { get; init; }
+    /// <summary>Bytes of one expert record (the byte stride of every projection bank).</summary>
+    public required long RecordBytes { get; init; }
+    /// <summary>Bytes of one gate or up projection; up starts at this offset in a record, down at twice it.</summary>
+    public required long GateUpBytes { get; init; }
     /// <summary>D of all groups as one matrix <c>[groups * latent, hidden]</c> (group g = rows g*latent ..).</summary>
     public required VulkanDevice.Buffer D { get; init; }
     /// <summary>U per group <c>[hidden, latent]</c>.</summary>
@@ -51,14 +54,17 @@ internal sealed class Edge0LayerBuffers : IDisposable
             long gateBytes = pack.GateUpBytes, downBytes = pack.DownBytes, record = pack.ExpertRecordBytes;
             var router = Alloc((long)E * H * 2);
             staging.UploadBytes(routerBf16, (long)E * H * 2, router);
-            var gate = Alloc(gateBytes * E); var up = Alloc(gateBytes * E); var down = Alloc(downBytes * E);
-            nint g0 = pack.GateBank(layer), u0 = pack.UpBank(layer), d0 = pack.DownBank(layer);
-            for (int e = 0; e < E; e++)
+            // The records: imported in place from the mapped pack (UMA, shared writable view), else ONE contiguous copy (never split: the strided kernels read records).
+            long recBytes = (long)E * record;
+            nint rec0 = pack.GateBank(layer);
+            bool imported = VulkanWeightImportPolicy.TryImport(device, rec0, recBytes, out var recBuf);
+            if (!imported)
             {
-                staging.UploadBytes(g0 + (nint)(e * record), gateBytes, gate, e * gateBytes);
-                staging.UploadBytes(u0 + (nint)(e * record), gateBytes, up, e * gateBytes);
-                staging.UploadBytes(d0 + (nint)(e * record), downBytes, down, e * downBytes);
+                recBuf = device.AllocateDeviceLocal(recBytes);
+                staging.UploadBytes(rec0, recBytes, recBuf);
+                VulkanWeightImportPolicy.NoteStaged(rec0, recBytes);
             }
+            created.Add(recBuf!);
 
             var dBuf = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, pack.D(layer, 0), pack.LatentDenseType,
                 outputDim: G * L, inputDim: H, forceF32: false, out var dQt, out long dBytes);
@@ -86,9 +92,9 @@ internal sealed class Edge0LayerBuffers : IDisposable
             staging.WaitAll();
             return new Edge0LayerBuffers
             {
-                Router = router, GateBank = gate, UpBank = up, DownBank = down, D = dBuf, U = uBufs, Labels = labelBuf, InverseScale = invBuf,
+                Router = router, Records = recBuf!, RecordsImported = imported, RecordBytes = record, GateUpBytes = gateBytes, D = dBuf, U = uBufs, Labels = labelBuf, InverseScale = invBuf,
                 GateUpType = pack.GateUpType, DownType = pack.DownType, LatentDenseType = pack.LatentDenseType, Groups = G, Latent = L, Hidden = H, Experts = E,
-                Bytes = (long)E * H * 2 + gateBytes * E * 2 + downBytes * E + dBytes + uBytes + (long)E * 4 + (long)L * 4,
+                Bytes = (long)E * H * 2 + (imported ? 0 : recBytes) + dBytes + uBytes + (long)E * 4 + (long)L * 4,
             };
         }
         catch { foreach (var b in created) b.Dispose(); throw; }

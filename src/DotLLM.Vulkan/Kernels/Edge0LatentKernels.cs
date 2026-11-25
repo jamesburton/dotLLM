@@ -56,6 +56,15 @@ public sealed class Edge0LatentKernels : IDisposable
 
     private readonly Pipe _gather, _combine, _sum;
 
+    /// <summary>Record-strided indexed MMVQ for the Q3_K gate / up projections (null without integer dot product or its SPIR-V).</summary>
+    internal MoeIndexedStridedMmvqKernel? IndexedQ3K { get; private set; }
+    /// <summary>Record-strided indexed MMVQ for the IQ4_NL down projection.</summary>
+    internal MoeIndexedStridedMmvqKernel? IndexedIq4Nl { get; private set; }
+    /// <summary>Record-strided grouped coopmat for the Q3_K gate / up projections (null without cooperative matrices / wave64).</summary>
+    internal MoeGroupedStridedCoopmatKernel? GroupedQ3K { get; private set; }
+    /// <summary>Record-strided grouped coopmat for the IQ4_NL down projection.</summary>
+    internal MoeGroupedStridedCoopmatKernel? GroupedIq4Nl { get; private set; }
+
     private Edge0LatentKernels(Pipe gather, Pipe combine, Pipe sum) { _gather = gather; _combine = combine; _sum = sum; }
 
     /// <summary>Loads the three SPIR-V modules from <paramref name="spvDir"/>.</summary>
@@ -67,13 +76,27 @@ public sealed class Edge0LatentKernels : IDisposable
             g = new Pipe(device, spvDir, "edge0_latent_gather", 5, 5 * sizeof(uint));
             c = new Pipe(device, spvDir, "edge0_group_combine", 5, 5 * sizeof(uint));
             s = new Pipe(device, spvDir, "edge0_u_sum", 9, sizeof(uint));
-            return new Edge0LatentKernels(g, c, s);
+            var k = new Edge0LatentKernels(g, c, s)
+            {
+                IndexedQ3K = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.Q3_K),
+                IndexedIq4Nl = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.IQ4_NL),
+            };
+            if (MoeGroupedStridedCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.Q3_K) && MoeGroupedStridedCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.IQ4_NL))
+            {
+                k.GroupedQ3K = MoeGroupedStridedCoopmatKernel.Create(device, spvDir, MoeIqQuant.Q3_K);
+                k.GroupedIq4Nl = MoeGroupedStridedCoopmatKernel.Create(device, spvDir, MoeIqQuant.IQ4_NL);
+            }
+            return k;
         }
         catch { g?.Dispose(); c?.Dispose(); s?.Dispose(); throw; }
     }
 
     /// <summary>Drops cached descriptor sets (scratch buffers were re-allocated).</summary>
-    internal void InvalidateDescriptorCache() { _gather.Cache.Reset(); _combine.Cache.Reset(); _sum.Cache.Reset(); }
+    internal void InvalidateDescriptorCache()
+    {
+        _gather.Cache.Reset(); _combine.Cache.Reset(); _sum.Cache.Reset();
+        IndexedQ3K?.InvalidateDescriptorCache(); IndexedIq4Nl?.InvalidateDescriptorCache(); GroupedQ3K?.InvalidateDescriptorCache(); GroupedIq4Nl?.InvalidateDescriptorCache();
+    }
 
     /// <summary><c>out[v, c] = xl[v / k, labels[indices[v]], c] * inv[c]</c> for <paramref name="rows"/> = tokens * k rows.</summary>
     public void RecordGather(nint cmd, VulkanDevice.Buffer xl, VulkanDevice.Buffer indices, VulkanDevice.Buffer labels, VulkanDevice.Buffer inv,
@@ -107,5 +130,9 @@ public sealed class Edge0LatentKernels : IDisposable
     }
 
     /// <inheritdoc/>
-    public void Dispose() { _gather.Dispose(); _combine.Dispose(); _sum.Dispose(); }
+    public void Dispose()
+    {
+        _gather.Dispose(); _combine.Dispose(); _sum.Dispose();
+        IndexedQ3K?.Dispose(); IndexedIq4Nl?.Dispose(); GroupedQ3K?.Dispose(); GroupedIq4Nl?.Dispose();
+    }
 }
