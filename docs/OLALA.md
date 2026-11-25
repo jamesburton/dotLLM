@@ -161,10 +161,14 @@ continuations identical. Against HF as shipped: max |dlogit| ~2e-3, KL ~2e-7 (th
 |---|---|---|---|---|
 | "The capital of France is" (5) | 2.7e-7 / 5 of 5 | 1.05e-3 (one step, 0.7 logit) / 24 of 24 | 2.1e-7 | identical |
 | `def fibonacci(n):` docstring (13) | 1.5e-6 / 13 of 13 | 1.1e-4 / 24 of 24 | 7.8e-8 | identical |
-| chat template, "Say hello in French." (300) | 0.45 (worst row) / 297 of 300 | 8.0e-4 / 24 of 24 | 3.9e-5 | identical |
+| chat template, "Say hello in French." (300) | 5.7 (worst row) / 294 of 300 | 4.9e-5 / 24 of 24 | 2.8e-5 | identical |
 
-The isolated KL spikes (one decode step in "capital", a few rows of the 300-token prompt) are single rows; the hypothesis is an MoE top-6 flip between two near-tied
-experts under float reassociation (not verified row by row). The 300-token chat prompt is numerically chaotic even for HF: its own one-token-step path differs from its chunked
+(Chat row re-measured after the #1973 review's double-precision softplus; before it: 0.45 / 297 of 300, 8.0e-4, 3.9e-5. The short prompts did not move.)
+
+The isolated KL spikes are single rows caused by MoE top-6 flips between near-tied experts. **Verified on the "capital" decode step 8** (KL 1.06e-3, 0.71 logit)
+in the #1973 review. At that step the first selection that differs is block 29: HF picks expert 52 over 163 by a margin of 1.46e-5 in `sigmoid + exp_probs_b`;
+dotLLM picks 163. Blocks 30, 34 and 35 then differ as a consequence. Forcing only block 29's choice in HF (strict, GGUF norms) brings HF to KL 5.9e-7 against dotLLM, and
+blocks 30, 34 and 35 then match without being forced. Near-ties of 0 to 7e-7 in blocks 7-10 and 14 resolved the same way on both sides. The 300-token chat prompt is numerically chaotic even for HF: its own one-token-step path differs from its chunked
 forward by up to 2.9 logits (strict) / 5.7 (as shipped), because activation outliers of 1e9-1e14 amplify reassociation noise; it is gated at the noise floor (median KL, top-1) only.
 Against HF **as shipped** (bf16 query/attention output, exact `1 + w` gains instead of the GGUF's bf16-rounded ones): short prompts median KL 7e-6 .. 2e-5, top-1 and greedy identical;
 the 300-token prompt median KL 4.7e-3, top-1 274 of 300 (informational).
