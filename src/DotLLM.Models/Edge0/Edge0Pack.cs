@@ -5,6 +5,19 @@ using DotLLM.Cpu.Kernels;
 
 namespace DotLLM.Models.Edge0;
 
+/// <summary>Which factor <see cref="Edge0Pack.InverseColumnScale"/> returns (a diagnostic; production uses <see cref="Inverse"/>).</summary>
+public enum Edge0ColumnScaleMode
+{
+    /// <summary>The D output is multiplied by <c>1/s</c> (edge0-strata's convention; the default).</summary>
+    Inverse = 0,
+
+    /// <summary>Diagnostic: multiplied by <c>s</c> itself (the opposite direction).</summary>
+    Direct = 1,
+
+    /// <summary>Diagnostic: not scaled at all.</summary>
+    None = 2,
+}
+
 /// <summary>
 /// Reader for the Edge0 "strata pack v3" model folder (HF <c>Edge0/Edge0-145B-q3k</c> and siblings): the latent-MoE part of an
 /// Edge0 model that is NOT in the skeleton GGUF. Everything is mapped in place (read-only mmap); no weight is widened or copied.
@@ -27,6 +40,7 @@ public sealed unsafe class Edge0Pack : IDisposable
     private readonly List<(MemoryMappedFile Mmf, MemoryMappedViewAccessor View)> _maps = [];
     private readonly int[] _labels;
     private readonly float[][]? _inverseColScale;
+    private readonly float[][]? _colScale;
     private readonly nint _experts, _latent;
     private bool _disposed;
 
@@ -69,6 +83,13 @@ public sealed unsafe class Edge0Pack : IDisposable
     /// <summary>Bytes of one expert record (gate | up | down); also the byte stride between consecutive experts.</summary>
     public long ExpertRecordBytes { get; }
 
+    /// <summary>
+    /// Diagnostic switch (default <see cref="Edge0ColumnScaleMode.Inverse"/>, the semantics of edge0-strata): which factor
+    /// <see cref="InverseColumnScale"/> returns. Exists so the direction of the scale can be tested end to end on real weights
+    /// (teacher-forced NLL under each arm); production never sets it.
+    /// </summary>
+    public Edge0ColumnScaleMode ColumnScaleMode { get; set; } = Edge0ColumnScaleMode.Inverse;
+
     /// <summary>True when <c>scales/l{N}.f32</c> exist (the Q3_K build): gate/up rows are stored as <c>A*diag(s)</c>.</summary>
     public bool HasColumnScale => _inverseColScale is not null;
 
@@ -86,11 +107,11 @@ public sealed unsafe class Edge0Pack : IDisposable
 
     private Edge0Pack(string dir, int layers, int experts, int hidden, int latent, int expertFf, int groups,
         QuantizationType guType, QuantizationType dType, QuantizationType latentType, int[] labels, float[][]? invScale,
-        nint experts0, nint latent0)
+        nint experts0, nint latent0, float[][]? colScale)
     {
         Directory = dir; Layers = layers; Experts = experts; Hidden = hidden; Latent = latent; ExpertFf = expertFf; Groups = groups;
         GateUpType = guType; DownType = dType; LatentDenseType = latentType;
-        _labels = labels; _inverseColScale = invScale; _experts = experts0; _latent = latent0;
+        _labels = labels; _inverseColScale = invScale; _colScale = colScale; _experts = experts0; _latent = latent0;
         GateUpBytes = Dequantize.RowByteSize((long)latent, guType) * expertFf;
         DownBytes = Dequantize.RowByteSize(expertFf, dType) * latent;
         ExpertRecordBytes = 2 * GateUpBytes + DownBytes;
@@ -188,10 +209,11 @@ public sealed unsafe class Edge0Pack : IDisposable
         }
 
         // ── column scales: store 1/s (s <= 0 -> 1), the factor the D output is multiplied by ──
-        float[][]? inv = null;
+        float[][]? inv = null, rawScales = null;
         if (hasScales)
         {
             inv = new float[layers][];
+            rawScales = new float[layers][];
             for (int l = 0; l < layers; l++)
             {
                 string p = Path.Combine(scalesDir, $"l{l}.f32");
@@ -204,6 +226,7 @@ public sealed unsafe class Edge0Pack : IDisposable
                 var iv = new float[latent];
                 for (int i = 0; i < latent; i++) iv[i] = s[i] > 0f ? 1f / s[i] : 1f;
                 inv[l] = iv;
+                rawScales[l] = s;
             }
         }
 
@@ -226,7 +249,7 @@ public sealed unsafe class Edge0Pack : IDisposable
         {
             nint e0 = Map(expertsPath, maps), l0 = Map(latentPath, maps);
             var pack = new Edge0Pack(directory, layers, experts, hidden, latent, expertFf, groups, guType, dType, latentType,
-                labels, inv, e0, l0);
+                labels, inv, e0, l0, rawScales);
             pack._maps.AddRange(maps);
             return pack;
         }
@@ -294,12 +317,19 @@ public sealed unsafe class Edge0Pack : IDisposable
 
     /// <summary>
     /// <c>1/s</c> per latent column (<c>s &lt;= 0</c> maps to 1): the factor the D output is multiplied by before the gate/up projections.
-    /// Empty when the pack has no <c>scales/</c> folder.
+    /// Empty when the pack has no <c>scales/</c> folder. Under the diagnostic <see cref="ColumnScaleMode"/> it returns <c>s</c> itself
+    /// (<see cref="Edge0ColumnScaleMode.Direct"/>) or nothing (<see cref="Edge0ColumnScaleMode.None"/>).
     /// </summary>
     public ReadOnlySpan<float> InverseColumnScale(int layer)
     {
         CheckLayer(layer);
-        return _inverseColScale is null ? default : _inverseColScale[layer];
+        if (_inverseColScale is null) return default;
+        return ColumnScaleMode switch
+        {
+            Edge0ColumnScaleMode.Direct => _colScale![layer],
+            Edge0ColumnScaleMode.None => default,
+            _ => _inverseColScale[layer],
+        };
     }
 
     // ───────────────────────────── D / U ─────────────────────────────
