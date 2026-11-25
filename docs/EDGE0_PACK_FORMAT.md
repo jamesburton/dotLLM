@@ -132,7 +132,7 @@ from whether `l0.f32` happens to exist; #1972), a latent file whose size is not 
   on layers 0 and 31 with real weights, including a check that the real slice separates the mutants.
 - End to end (#1975): `dotllm run <snapshot>/model-skeleton.gguf --device cpu` finds `native_experts.txt`/`experts.bin`/... and `ple-fp8.gguf` beside the skeleton and runs the CPU `Qwen4ExpTransformerModel`
   (BF16 router and Q8_0 shared expert read in place). Greedy, thinking off: "The capital of France is **Paris**." and a correct `reverse_string`. CPU-only indicative speed on this Strix Halo box, 32 threads,
-  warm: prefill 4.4-5.6 tok/s, decode 1.3-1.9 tok/s. Not covered: NVFP4 tail, MTP head (G6), Vulkan/CUDA kernels (the Vulkan loader refuses a skeleton and says `--device cpu`).
+  warm: prefill 4.4-5.6 tok/s, decode 1.3-1.9 tok/s. Not covered: NVFP4 tail, MTP head (G6), CUDA kernels.
 - Chat template (G5): the skeleton embeds Qwen's template (`Edge0ChatTemplateTests`). Effort levels are `xhigh` (default), `medium`, `low`; `enable_thinking=false` pre-fills `<think>
 
 </think>
@@ -140,3 +140,12 @@ from whether `l0.f32` happens to exist; #1972), a latent file whose size is not 
 ` (that is the
   template's "none": `reasoning_effort: none` is refused by the template). Generation EOS is 248046 (`<|im_end|>`), not the PLE EOS 248044. `dotllm run` does not apply the template (no `--tools`): feed a
   rendered prompt with `--prompt-file`.
+
+## 10. Vulkan (G3, #1981)
+
+`dotllm run <snapshot>/model-skeleton.gguf --device vulkan` runs the pack on `VulkanQwen4ExpTransformerModel`; the model owns the opened pack and the FP8 file.
+
+- **Device layout.** Per layer the 512 fixed records are split at upload into three contiguous banks (gate Q3_K, up Q3_K, down IQ4_NL) so the ordinary resident-bank kernels read them in place (Q3_K added to `MoeIqQuant`: indexed MMVQ `moe_indexed_matmul_q3_k_mmvq`, grouped coopmat `moe_grouped_matmul_q3_k_coopmat_m64`). D is one Q8_0/Q4_0 matrix `[8*1792, 2560]`, U eight matrices `[2560, 1792]`, the router stays BF16 (`MatMulBf16`), labels and `1/s` are small buffers. Nothing is widened. 48.7 GiB live after load.
+- **Per layer** (`RecordEdge0MoeLayer`): router + top-k, D for all groups (one matmul), `edge0_latent_gather` (group row of each (token, expert), times `1/s`), experts at width 1792 (indexed MMVQ below the grouped threshold, grouped coopmat above), `edge0_group_combine` (weighted sum per group), U per group, `edge0_u_sum`, then the sigmoid-gated shared expert.
+- **PLE.** The FP8 table is read by the same CPU codec on the host path.
+

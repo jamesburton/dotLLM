@@ -184,10 +184,8 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
             output.WriteLine($"input {i}: {inputs[i].Length} tok; KL(cpu||vk) last row {kl:E3}; row argmax agree {rowAgree}/{c.RowArgmax.Length}; " +
                              $"greedy agree {greedyAgree}/{GreedyTokens} (first divergence {(firstDiv < 0 ? "none" : firstDiv.ToString())}); " +
                              (i == 0 ? $"NLL cpu {c.MeanNll:F4} vk {r.MeanNll:F4}" : ""));
-            output.WriteLine($"  cpu text: {tok.Decode(c.Greedy).Replace("
-", "\n")}");
-            output.WriteLine($"  vk  text: {tok.Decode(r.Greedy).Replace("
-", "\n")}");
+            output.WriteLine($"  cpu text: {tok.Decode(c.Greedy).Replace((char)10, (char)126)}");
+            output.WriteLine($"  vk  text: {tok.Decode(r.Greedy).Replace((char)10, (char)126)}");
             if (i == 0 && Math.Abs(c.MeanNll - r.MeanNll) >= 0.05) failures.Add($"NLL cpu {c.MeanNll:F4} vs vulkan {r.MeanNll:F4}");
             if (kl >= 0.05) failures.Add($"input {i}: KL {kl:E3}");
             if (r.RowArgmax[^1] != c.RowArgmax[^1]) failures.Add($"input {i}: next-token argmax differs");
