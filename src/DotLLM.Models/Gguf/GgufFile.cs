@@ -420,7 +420,8 @@ public sealed class GgufFile : IDisposable
             rawMetadata = GgufReader.ReadMetadata(reader, header);
             tensors = GgufReader.ReadTensorInfos(reader, header,
                 allowI8Container: rawMetadata.TryGetValue("general.architecture", out var archValue) && archValue.Value is string archName
-                                  && string.Equals(archName, TensorOverlay.OverlayArchitecture, StringComparison.Ordinal));
+                                  && (string.Equals(archName, TensorOverlay.OverlayArchitecture, StringComparison.Ordinal)
+                                      || Fp8PleTable.IsFp8Table(rawMetadata)));
             streamPositionAfterInfos = fs.Position;
             fileLength = fs.Length;
         }
