@@ -1059,7 +1059,7 @@ it privatises the page (a full copy, same cost as staging); only a shared writab
 place. So `DOTLLM_GGUF_MAP_COW=1` imports but saves nothing physical, and it charges commit for the
 whole file.
 
-**`DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1`** (opt-in): when an import from the read-only mapping is
+**`DOTLLM_VULKAN_HOST_IMPORT_WRITABLE`** (#1991: **default ON on UMA**, `0` disables, `1` forces it on a dGPU too; the measurements below predate the default): when an import from the read-only mapping is
 refused, `VulkanWeightImportPolicy.TryImport` retries through `GgufFile.TryMapImportAlias`, a shared
 writable view of the same file range (same page-cache pages as the read-only mapping). Real Flint
 Q4_1 (26 GB), 485/485 tensors imported, logits bit-identical to staging:
@@ -1083,7 +1083,7 @@ Loaders that never call `TryImport` are not changed by the flag: on Qwen3.6-35B-
 shared tensors import (191 tensors, 1.7 GiB; private WS 23.8 -> 21.9 GiB) but the routed-expert banks
 (`VulkanQwen3MoeMoeUpload`) always stage.
 
-Why it is opt-in:
+Why it needed a guard (the file is open for write while aliased; #1991 adds a SHA-256 write guard test, `VulkanWeightImportWriteGuardTests`):
 
 - It opens the checkpoint **for write** (shared). A stray device write would reach the file on disk.
   Weight buffers are bound read-only in every shader, but nothing enforces that in Vulkan.
@@ -1092,6 +1092,25 @@ Why it is opt-in:
   cannot open the file. `GgufFile` itself now opens with `FileShare.ReadWrite`, so dotLLM processes
   coexist.
 - The decode cost above. It is the memory-for-throughput trade #508 described, now measured.
+
+### #1991: writable-alias import is the UMA default (Strix 8060S, 2026-11-25)
+
+Mapping access the driver accepts (re-confirmed by `VulkanHostImportMmapAccessModeTests`): read-only refused
+(`vkAllocateMemory` -1000072003); copy-on-write accepted but privatises every page (no saving, so not used);
+shared read-write accepted and in place. So the mapping is a shared writable view and "never written" rests on
+shaders binding weights read-only plus `VulkanWeightImportWriteGuardTests`, which hashes the file around an imported
+load + prefill + decode. A refused import is counted and logged (`[dotllm] vulkan host import: N tensors / X MiB refused`)
+before the staging fallback.
+
+Same-session A/B (`bench -p 128 -n 64`, median of 3 reps, 2 runs per arm; "before" = `DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=0`):
+
+| model | staged MiB before -> after | device-local live MiB before -> after | load s | decode tok/s | pp tok/s |
+|---|---|---|---|---|---|
+| Llama-3.1-8B Q4_K_M | 4402 -> 0 (4684 aliased) | 6495 -> 2093 | 3.8 (warm) -> 2.7 | 38.0 -> 32.5 (-15%) | 969 -> 782 (-19%) |
+| Olala q8_0-safe2 | 6534 -> 0 (411 aliased) | 6651 -> 117 | 5.4-9.1 -> 3.1-10.8 (noisy) | 30.0 -> 29.0 (one run 20.9) | 302 -> 324 / 258 |
+| Qwen3.6-35B-A3B UD-Q4_K_M (MoE) | 2352 -> 515 (1837 aliased) | 22698 -> 20862 | 12.3 -> 9.0-27.8 | 48.3 -> 45.2 (-6%) | 767 -> 736 |
+
+The decode cost on dense models is the file-page penalty described above; the MoE routed-expert banks still stage.
 
 ### What the import actually buys, and costs
 
