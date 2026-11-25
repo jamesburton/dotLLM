@@ -479,6 +479,59 @@ public sealed class OlalaVulkanTests
     }
 
     /// <summary>
+    /// Split-submit per-stage profile (opt-in: <c>DOTLLM_OLALA_VK_PROFILE=1</c>; hold the GPU lock). Every stage is its own submit + fence wait, so each
+    /// mark carries a sync cost (measured here with an empty-stage probe is not available: pass <c>DOTLLM_OLALA_VK_SYNC_US</c>, default 50) that is subtracted
+    /// to give the "net" column. Prefill = the 300-token chat prompt (256 + 44 chunks); decode = 40 greedy steps.
+    /// </summary>
+    [SkippableFact]
+    public void RealModel_StageProfile()
+    {
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_OLALA_VK_PROFILE") != "1", "set DOTLLM_OLALA_VK_PROFILE=1");
+        SkipUnlessGpu();
+        string file = Environment.GetEnvironmentVariable("DOTLLM_OLALA_BENCH_FILE") ?? "Olala-v1.0-mini-7A1B-q8_0-safe2.gguf";
+        string? gguf = FindGguf("DOTLLM_OLALA_Q8_GGUF", file); Skip.If(gguf is null, file + " not in the HF cache");
+        var c = OlalaOracleTests.LoadCase("real-strict-gguf-norms-chat")!;
+        double syncUs = double.Parse(Environment.GetEnvironmentVariable("DOTLLM_OLALA_VK_SYNC_US") ?? "50", System.Globalization.CultureInfo.InvariantCulture);
+        using var dev = VulkanDevice.Create();
+        using var f = GgufFile.Open(gguf!);
+        using var vk = LoadVk(dev, f);
+        int[] pos = Enumerable.Range(0, c.L).ToArray();
+        // warm up (2 full rounds), then profile
+        int next = 0;
+        for (int w = 0; w < 2; w++)
+        {
+            vk.ResetSequenceState();
+            using var p0 = vk.Forward(c.Ids, pos, -1, null, true);
+            next = OlalaOracleTests.Argmax(Rows(p0, 1, c.Vocab));
+            for (int j = 0; j < 8; j++) { using var s0 = vk.Forward([next], [c.L + j], -1, null, true); next = OlalaOracleTests.Argmax(Rows(s0, 1, c.Vocab)); }
+        }
+        void Dump(string title, int tokens)
+        {
+            var prof = vk.StageProfile!;
+            double total = prof.Values.Sum(v => v.Ms), net = prof.Values.Sum(v => v.Ms - v.Count * syncUs / 1000.0);
+            _output.WriteLine($"== {title}: {total:F1} ms wall in marks, {net:F1} ms net of {prof.Values.Sum(v => v.Count)} syncs x {syncUs:F0} us");
+            foreach (var kv in prof.OrderByDescending(k => k.Value.Ms - k.Value.Count * syncUs / 1000.0))
+            {
+                double n = kv.Value.Ms - kv.Value.Count * syncUs / 1000.0;
+                _output.WriteLine($"  {kv.Key,-20} n={kv.Value.Count,4} net {n,8:F2} ms ({100 * n / net,5:F1}%)  {n / Math.Max(1, kv.Value.Count) * 1000,8:F0} us/call");
+            }
+        }
+        for (int round = 0; round < 3; round++)
+        {
+            vk.ResetSequenceState();
+            vk.StageProfile = new();
+            using var p = vk.Forward(c.Ids, pos, -1, null, true);
+            Dump($"prefill {c.L} tok (round {round})", c.L);
+            next = OlalaOracleTests.Argmax(Rows(p, 1, c.Vocab));
+            vk.StageProfile = new();
+            const int steps = 40;
+            for (int j = 0; j < steps; j++) { using var s = vk.Forward([next], [c.L + j], -1, null, true); next = OlalaOracleTests.Argmax(Rows(s, 1, c.Vocab)); }
+            Dump($"decode, {steps} steps summed (round {round}); per-step = /{steps}", steps);
+            vk.StageProfile = null;
+        }
+    }
+
+    /// <summary>
     /// Attribution of a greedy divergence (opt-in: <c>DOTLLM_OLALA_DIAG=1</c>; needs the gpu AND cpu locks): free-running greedy and teacher-forced
     /// top-2 margins of Vulkan BF16-act, Vulkan F32-act and the CPU model on the same q8_0-safe2 file, against the HF oracle.
     /// </summary>
