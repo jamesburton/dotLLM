@@ -121,6 +121,9 @@ per-architecture, tracked exception (`OlalaStatePolicy`, a compile-time constant
 OVH serve with vLLM `--mamba-ssm-cache-dtype float32`; the fork's own docs state a reduced-precision state "degrades long generations into repetition loops"
 (`OLALA_BF16_STATE=1` "not recommended", `OLALA_STATE_Q8=1` an unvalidated experiment). Covered buffers and their cost per sequence (7A1B):
 
+**Extension, user ruling 2026-11-25: the token-shift last K/V and the trapezoid carry (previous token's rotated K and raw x) are F32 as well, until #1971 shows a narrower type is safe.** HF keeps both in the model dtype (bf16 in the shipped checkpoint), so this is stricter than the reference stack; the OVH llama.cpp fork also keeps them F32 (bf16 K/V sections are opt-in and "not recommended"). The guard test covers all four buffer kinds plus the token-shift byte total.
+
+
 | buffer | shape | bytes / M layer | x 29 layers |
 |---|---|---|---|
 | SSM matrix `h` | 48 x 64 x 128 | 1,572,864 | 44.0 MiB |
