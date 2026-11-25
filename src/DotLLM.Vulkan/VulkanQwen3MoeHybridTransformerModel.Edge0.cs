@@ -6,9 +6,10 @@ namespace DotLLM.Vulkan;
 public sealed partial class VulkanQwen3MoeHybridTransformerModel
 {
     private Edge0LatentKernels? _edge0Kernels;
-    // The ONLY per-forward Edge0 scratch (James's rule-1 rulings, #1981): the D output for every group as F16 and ONE F16 slab of U partials. No F32 tensor is stored: the
-    // per-group z is written as Q8_1 blocks into the existing MoeExpandedInputXq/Xds, the U partials are summed into NormOutput (F32 accumulation) in ascending group order.
-    private VulkanDevice.Buffer? _edge0Xl, _edge0Uo;
+    // The ONLY per-forward Edge0 scratch (James's rule-1 rulings, #1981): the D output for every group as F16, ONE F16 slab of z (one group, more than 8 rows) and ONE F16 slab of U
+    // partials. No F32 tensor is stored: z for up to 8 rows is rounded to F16 and packed as Q8_1 into the existing MoeExpandedInputXq/Xds, the U partials are summed into NormOutput
+    // (F32 accumulation) in ascending group order.
+    private VulkanDevice.Buffer? _edge0Xl, _edge0Z, _edge0Uo;
     private int _edge0Rows;
 
     /// <summary>Single-row decode skips the D / U groups no selected expert uses (<c>edge0_d_mmvq</c> / <c>edge0_u_mmvq</c>): identical numerics, fewer bytes. <c>DOTLLM_EDGE0_SKIP_GROUPS=0</c> (or setting this) visits every group (A/B).</summary>
@@ -24,7 +25,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
 
     /// <summary>
     /// Attaches the Edge0 latent-MoE glue kernels and allocates their per-forward scratch for up to <paramref name="rows"/> rows: the D output for all groups
-    /// (F16, <c>rows * groups * latent * 2</c> bytes) and one group's U output (F16, <c>rows * hidden * 2</c> bytes). Call once, after the final planned row count is known;
+    /// (F16, <c>rows * groups * latent * 2</c> bytes) one group's z (F16, <c>rows * latent * 2</c> bytes) and one group's U output (F16, <c>rows * hidden * 2</c> bytes). Call once, after the final planned row count is known;
     /// the scratch is never grown while recording.
     /// </summary>
     internal void Q4AttachEdge0(Edge0LatentKernels kernels, int groups, int latent, int hidden, int rows)
@@ -39,16 +40,18 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
         _edge0Kernels = kernels;
         _edge0Rows = rows;
         _edge0Xl = _device.AllocateDeviceLocal((long)rows * groups * latent * sizeof(ushort));
+        _edge0Z = _device.AllocateDeviceLocal((long)rows * latent * sizeof(ushort));
         _edge0Uo = _device.AllocateDeviceLocal((long)rows * hidden * sizeof(ushort));
         kernels.InvalidateDescriptorCache();
     }
 
-    /// <summary>Device bytes of the Edge0 per-forward scratch (0 when not attached): the F16 D output and the F16 U slab. Nothing else (z lives in the shared Q8_1 scratch).</summary>
-    internal long Edge0ScratchBytes => (_edge0Xl?.Size ?? 0) + (_edge0Uo?.Size ?? 0);
+    /// <summary>Device bytes of the Edge0 per-forward scratch (0 when not attached): the F16 D output, one F16 z slab and one F16 U slab. Nothing else.</summary>
+    internal long Edge0ScratchBytes => (_edge0Xl?.Size ?? 0) + (_edge0Z?.Size ?? 0) + (_edge0Uo?.Size ?? 0);
 
     private void FreeEdge0Scratch()
     {
         _edge0Xl?.Dispose(); _edge0Xl = null;
+        _edge0Z?.Dispose(); _edge0Z = null;
         _edge0Uo?.Dispose(); _edge0Uo = null;
     }
 
@@ -146,7 +149,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
         }
         MoeStage("edge0_experts");
 
-        // 4. per-group weighted sum of the expert outputs (straight into Q8_1 blocks), U per group (F16 output), summed into NormOutput in ascending group order
+        // 4. per-group weighted sum of the expert outputs (z, F16), U per group (F16 output), summed into NormOutput in ascending group order
         if (T == 1)
         {
             if (skip) Edge0SkipLayers++;
@@ -160,13 +163,22 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
             bool small = k.MultiC16 is { } && SmallRowGemvEnabled && MatMulQ8_0MmvqMultiKernel.Accepts(T, L);
             for (int g = 0; g < G; g++)
             {
-                k.RecordGroupCombine(cmd, _state.MoeDownRows, _state.MoeTopkIndices, _state.MoeTopkWeights, e0.Labels, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, L, topK, g, T, E);
-                KernelSupport.ComputeToComputeBarrier(cmd);
-                if (small) k.MultiC16!.Record(cmd, e0.U[g], _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _edge0Uo!, m: H, k: L, n: T);
-                else k.RecordGemmU(cmd, e0.U[g], _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _edge0Uo!, H, L, T);
+                if (small)
+                {
+                    // 2..8 rows: z (rounded to F16) as Q8_1 blocks for the dp4a small-row MMVQ
+                    k.RecordGroupCombine(cmd, _state.MoeDownRows, _state.MoeTopkIndices, _state.MoeTopkWeights, e0.Labels, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, L, topK, g, T, E);
+                    KernelSupport.ComputeToComputeBarrier(cmd);
+                    k.MultiC16!.Record(cmd, e0.U[g], _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _edge0Uo!, m: H, k: L, n: T);
+                }
+                else
+                {
+                    k.RecordGroupCombineF16(cmd, _state.MoeDownRows, _state.MoeTopkIndices, _state.MoeTopkWeights, e0.Labels, _edge0Z!, L, topK, g, T, E);
+                    KernelSupport.ComputeToComputeBarrier(cmd);
+                    k.RecordGemmU(cmd, e0.U[g], _edge0Z!, _edge0Uo!, H, L, T);
+                }
                 KernelSupport.ComputeToComputeBarrier(cmd);
                 k.RecordUAcc(cmd, _edge0Uo!, _state.NormOutput, T * H, first: g == 0);
-                KernelSupport.ComputeToComputeBarrier(cmd);   // the next group's combine overwrites the Q8_1 scratch, its U overwrites the F16 slab
+                KernelSupport.ComputeToComputeBarrier(cmd);   // the next group's combine overwrites the z scratch, its U overwrites the F16 slab
             }
         }
         MoeStage("edge0_u");

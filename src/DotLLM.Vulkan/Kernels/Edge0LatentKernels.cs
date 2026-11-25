@@ -5,7 +5,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// <summary>
 /// The glue kernels of the Edge0 latent MoE (G3, #1981): the per-(token, expert) gather of the group latent row with the column scale
 /// (<c>edge0_latent_gather</c>, reads the F16 D output), the per-group routing-weighted sum of the expert outputs written as Q8_1 blocks
-/// (<c>edge0_group_combine</c>) and the ordered accumulation of the per-group F16 U outputs (<c>edge0_u_acc</c>). D and U themselves run on Q8_0
+/// (<c>edge0_group_combine</c>, or F16 for the GEMM path) and the ordered accumulation of the per-group F16 U outputs (<c>edge0_u_acc</c>). D and U themselves run on Q8_0
 /// kernels with F16 output (single-row MMVQ, small-row MMVQ, blocked coopmat GEMM; no F32 scratch exists); the experts through the Q3_K / IQ4_NL
 /// resident-bank kernels.
 /// </summary>
@@ -56,7 +56,7 @@ public sealed class Edge0LatentKernels : IDisposable
     }
 
     private readonly Pipe _gather, _combine, _acc;
-    private Pipe? _decodeD, _decodeU, _combineAll, _gemmD, _gemmU;
+    private Pipe? _decodeD, _decodeU, _combineAll, _combineF16, _gemmD, _gemmU;
     private MatMulQ8_0MmvqMultiKernel? _multiC16;
 
     /// <summary>True when the single-row kernels that skip unused D/U groups exist (integer dot product, wave32, SPIR-V present).</summary>
@@ -98,10 +98,12 @@ public sealed class Edge0LatentKernels : IDisposable
             }
             // The blocked coopmat GEMMs (F32-in / F16-out for D, Q8_1-in / F16-out for U) need wave64 + cooperative matrices, like the shipped blocked Q8_0 GEMM.
             if (device.HasCooperativeMatrix && device.SubgroupSize == 64
-                && File.Exists(Path.Combine(spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_c16.spv")) && File.Exists(Path.Combine(spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_xq_c16.spv")))
+                && File.Exists(Path.Combine(spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_c16.spv")) && File.Exists(Path.Combine(spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_hh.spv"))
+                && File.Exists(Path.Combine(spvDir, "edge0_group_combine_f16.spv")))
             {
                 k._gemmD = new Pipe(device, spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_c16", 3, 5 * sizeof(uint));
-                k._gemmU = new Pipe(device, spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_xq_c16", 4, 5 * sizeof(uint));
+                k._gemmU = new Pipe(device, spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_hh", 3, 5 * sizeof(uint));   // F16 in / F16 out (the shipped encoder GEMM)
+                k._combineF16 = new Pipe(device, spvDir, "edge0_group_combine_f16", 5, 5 * sizeof(uint));
             }
             k._multiC16 = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir, f16Output: true);
             k.IndexedQ3K = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.Q3_K);
@@ -119,7 +121,7 @@ public sealed class Edge0LatentKernels : IDisposable
     /// <summary>Drops cached descriptor sets (scratch buffers were re-allocated).</summary>
     internal void InvalidateDescriptorCache()
     {
-        _gather.Cache.Reset(); _combine.Cache.Reset(); _acc.Cache.Reset(); _decodeD?.Cache.Reset(); _decodeU?.Cache.Reset(); _combineAll?.Cache.Reset(); _gemmD?.Cache.Reset(); _gemmU?.Cache.Reset(); _multiC16?.InvalidateDescriptorCache();
+        _gather.Cache.Reset(); _combine.Cache.Reset(); _acc.Cache.Reset(); _decodeD?.Cache.Reset(); _decodeU?.Cache.Reset(); _combineAll?.Cache.Reset(); _combineF16?.Cache.Reset(); _gemmD?.Cache.Reset(); _gemmU?.Cache.Reset(); _multiC16?.InvalidateDescriptorCache();
         IndexedQ3K?.InvalidateDescriptorCache(); IndexedIq4Nl?.InvalidateDescriptorCache(); GroupedQ3K?.InvalidateDescriptorCache(); GroupedIq4Nl?.InvalidateDescriptorCache();
     }
 
@@ -135,7 +137,7 @@ public sealed class Edge0LatentKernels : IDisposable
     }
 
     /// <summary>
-    /// <c>z[t, c] = sum over the slots of token t whose expert is in group <paramref name="group"/> of w * down</c>, written as Q8_1 blocks: row t of
+    /// <c>z[t, c] = sum over the slots of token t whose expert is in group <paramref name="group"/> of w * down</c>, rounded to F16 and written as Q8_1 blocks (for the small-row MMVQ): row t of
     /// (<paramref name="xq"/> <c>[T, L/4]</c>, <paramref name="xds"/> <c>[T, L/32]</c>). <paramref name="latent"/> must be a multiple of 32.
     /// </summary>
     public void RecordGroupCombine(nint cmd, VulkanDevice.Buffer down, VulkanDevice.Buffer indices, VulkanDevice.Buffer weights, VulkanDevice.Buffer labels,
@@ -199,16 +201,29 @@ public sealed class Edge0LatentKernels : IDisposable
         p.Dispatch(cmd, [weights.Handle, b.Handle, c.Handle], GemmPush(m, k, n), (uint)((m + 127) / 128), (uint)((n + 127) / 128));
     }
 
-    /// <summary>U for any row count: <c>C[n, m] (F16) = Q8_1(xq, xds)[n, k] @ W_q8_0[m, k]^T</c>; the activation is dequantised (d * q) in the tile load.</summary>
-    public void RecordGemmU(nint cmd, VulkanDevice.Buffer weights, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds, VulkanDevice.Buffer c, int m, int k, int n)
+    /// <summary>
+    /// <c>z[t, c]</c> as F16 (F32 accumulate in slot order, one rounding at the store) for ONE group: the input of <see cref="RecordGemmU"/> for more than 8 rows. Same arithmetic as
+    /// <see cref="RecordGroupCombine"/> before its Q8_1 packing.
+    /// </summary>
+    public void RecordGroupCombineF16(nint cmd, VulkanDevice.Buffer down, VulkanDevice.Buffer indices, VulkanDevice.Buffer weights, VulkanDevice.Buffer labels,
+        VulkanDevice.Buffer z, int latent, int topK, int group, int tokens, int numExperts)
     {
-        var p = _gemmU ?? throw new NotSupportedException("The F16-output U GEMM needs cooperative matrices and wave64.");
+        var p = _combineF16 ?? throw new NotSupportedException("The F16 group combine is unavailable.");
+        if (down.Size < (long)tokens * topK * latent * 4) throw new ArgumentException("down too small.", nameof(down));
+        if (z.Size < (long)tokens * latent * 2) throw new ArgumentException("z (F16) too small.", nameof(z));
+        p.Dispatch(cmd, [down.Handle, indices.Handle, weights.Handle, labels.Handle, z.Handle],
+            [(uint)latent, (uint)topK, (uint)group, (uint)tokens, (uint)numExperts], (uint)((latent + 255) / 256), (uint)tokens);
+    }
+
+    /// <summary>U for any row count: <c>C[n, m] (F16) = z[n, k] (F16) @ W_q8_0[m, k]^T</c> on the blocked 128x128 coopmat GEMM (F16 in, F32 accumulate, one F16 rounding at the store).</summary>
+    public void RecordGemmU(nint cmd, VulkanDevice.Buffer weights, VulkanDevice.Buffer z, VulkanDevice.Buffer c, int m, int k, int n)
+    {
+        var p = _gemmU ?? throw new NotSupportedException("The F16 U GEMM needs cooperative matrices and wave64.");
         if (k % 32 != 0 || ((k / 32) & 1) != 0) throw new ArgumentException($"k={k} is not legal (multiple of 64).", nameof(k));
         if (weights.Size < (long)m * (k / 32) * 34) throw new ArgumentException("weights too small.", nameof(weights));
-        if (xq.Size < QuantizeQ8_1RowsKernel.PackedBytes(n, k)) throw new ArgumentException("xq too small.", nameof(xq));
-        if (xds.Size < QuantizeQ8_1RowsKernel.ScaleBytes(n, k)) throw new ArgumentException("xds too small.", nameof(xds));
+        if (z.Size < (long)n * k * 2) throw new ArgumentException("z (F16) too small.", nameof(z));
         if (c.Size < (long)n * m * 2) throw new ArgumentException("c (F16) too small.", nameof(c));
-        p.Dispatch(cmd, [weights.Handle, xq.Handle, xds.Handle, c.Handle], GemmPush(m, k, n), (uint)((m + 127) / 128), (uint)((n + 127) / 128));
+        p.Dispatch(cmd, [weights.Handle, z.Handle, c.Handle], GemmPush(m, k, n), (uint)((m + 127) / 128), (uint)((n + 127) / 128));
     }
 
     /// <summary><c>output = first ? float(u) : output + float(u)</c> over <paramref name="n"/> floats (ascending group order gives the F32 sum ((u0 + u1) + ...)).</summary>
@@ -222,7 +237,7 @@ public sealed class Edge0LatentKernels : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
-        _gather.Dispose(); _combine.Dispose(); _acc.Dispose(); _decodeD?.Dispose(); _decodeU?.Dispose(); _combineAll?.Dispose(); _gemmD?.Dispose(); _gemmU?.Dispose(); _multiC16?.Dispose();
+        _gather.Dispose(); _combine.Dispose(); _acc.Dispose(); _decodeD?.Dispose(); _decodeU?.Dispose(); _combineAll?.Dispose(); _combineF16?.Dispose(); _gemmD?.Dispose(); _gemmU?.Dispose(); _multiC16?.Dispose();
         IndexedQ3K?.Dispose(); IndexedIq4Nl?.Dispose(); GroupedQ3K?.Dispose(); GroupedIq4Nl?.Dispose();
     }
 }

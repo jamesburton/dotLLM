@@ -110,7 +110,7 @@ public sealed class VulkanEdge0LatentKernelTests
         Assert.NotEqual(a, (float)xl[((vv / K) * G + labels[idx[vv]]) * L]);
     }
 
-    /// <summary>Dyadic data so every product and sum is exact in F32 (no FMA ambiguity): the fused combine must then equal the CPU quantiser contract bit for bit.</summary>
+    /// <summary>Dyadic data so every product and sum is exact in F32 (no FMA ambiguity) but NOT representable in F16: z is rounded to F16 first, then the combine must equal the CPU Q8_1 quantiser contract bit for bit.</summary>
     [SkippableTheory]
     [InlineData(288, 4)]
     [InlineData(1792, 3)]
@@ -122,11 +122,11 @@ public sealed class VulkanEdge0LatentKernelTests
         int rows = T * K;
         var rng = new Random(0xE1 + L);
         int[] labels = Labels(rng);
-        float[] down = new float[rows * L]; for (int i = 0; i < down.Length; i++) down[i] = rng.Next(-64, 65) / 8f;
-        float[] w = new float[rows]; for (int i = 0; i < rows; i++) w[i] = rng.Next(0, 9) / 4f;
+        float[] down = new float[rows * L]; for (int i = 0; i < down.Length; i++) down[i] = rng.Next(-4096, 4097) / 1024f;
+        float[] w = new float[rows]; for (int i = 0; i < rows; i++) w[i] = rng.Next(0, 17) / 16f;
         int[] idx = new int[rows]; for (int i = 0; i < rows; i++) idx[i] = rng.Next(E);
         using var bDown = Up(device, down, out _); using var bIdx = Up(device, idx, out _); using var bW = Up(device, w, out _); using var bLab = Up(device, labels, out _);
-        int emptyCells = 0;
+        int emptyCells = 0, notF16Exact = 0;
         for (int g = 0; g < G; g++)
         {
             using var bXq = device.Allocate(QuantizeQ8_1RowsKernel.PackedBytes(T, L)); using var bXds = device.Allocate(QuantizeQ8_1RowsKernel.ScaleBytes(T, L));
@@ -144,7 +144,8 @@ public sealed class VulkanEdge0LatentKernelTests
                 {
                     float acc = 0;
                     for (int j = 0; j < K; j++) { int v = t * K + j; if (labels[idx[v]] == g) { acc += w[v] * down[v * L + c]; any = true; } }
-                    z[t * L + c] = acc;
+                    if ((float)(Half)acc != acc) notF16Exact++;
+                    z[t * L + c] = (float)(Half)acc;   // the combine rounds z to F16 before quantising
                 }
                 if (!any) emptyCells++;
             }
@@ -159,9 +160,10 @@ public sealed class VulkanEdge0LatentKernelTests
             if (g == 0) Assert.Contains(want.D, v => v > 0);   // the reference is not all zeros
         }
         Assert.True(emptyCells > 0, "fixture never produced a (token, group) pair without an expert: the zeroing path (d = 0, q = 0) is untested");
+        Assert.True(notF16Exact > 100, "fixture z values are all F16-exact: the F16 rounding is unobservable");
     }
 
-    /// <summary>Random data: the dequantised blocks must reproduce the C# group sums to within half a quantisation step (FMA contraction may move a sum by an ULP).</summary>
+    /// <summary>Random data: the dequantised blocks must reproduce the C# group sums to within half a quantisation step (FMA contraction may move a sum by an ULP) plus the F16 rounding of z.</summary>
     [SkippableFact]
     public void GroupCombine_RandomData_DequantisesToTheWeightedGroupSum()
     {
@@ -188,7 +190,7 @@ public sealed class VulkanEdge0LatentKernelTests
                     uint word = got.Xq[t * (L / 4) + c / 4];
                     int q = (sbyte)((word >> (8 * (c % 4))) & 0xFF);
                     float d = got.D[t * (L / 32) + c / 32];
-                    Assert.True(MathF.Abs(q * d - acc) <= 0.5001f * d + 1e-6f, $"g {g} t {t} c {c}: z {acc:G9} dequantised {q * d:G9} (d {d:G9})");
+                    Assert.True(MathF.Abs(q * d - acc) <= 0.5001f * d + 6e-4f * MathF.Abs(acc) + 1e-6f, $"g {g} t {t} c {c}: z {acc:G9} dequantised {q * d:G9} (d {d:G9})");
                 }
         }
     }
@@ -428,10 +430,48 @@ public sealed class VulkanEdge0LatentKernelTests
         Assert.Contains(Enumerable.Range(0, r.Length), i => (float)(Half)r[i] != r[i]);
     }
 
+    /// <summary>Same exact-arithmetic data as the Q8_1 combine test: the F16 combine must equal the F16-rounded group sum bit for bit, with exact zeros for a group no expert of the token is in.</summary>
+    [SkippableFact]
+    public void GroupCombineF16_IsTheGroupSumRoundedOnceToF16()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasCooperativeMatrix && device.SubgroupSize == 64, "needs wave64 cooperative matrices");
+        using var k = Edge0LatentKernels.Create(device, spvDir);
+        Skip.IfNot(k.HasNarrowPath, "narrow path unavailable");
+        const int L = 300, T = 5, rows = T * K;
+        var rng = new Random(0xEA);
+        int[] labels = Labels(rng);
+        float[] down = new float[rows * L]; for (int i = 0; i < down.Length; i++) down[i] = rng.Next(-4096, 4097) / 1024f;
+        float[] w = new float[rows]; for (int i = 0; i < rows; i++) w[i] = rng.Next(0, 17) / 16f;
+        int[] idx = new int[rows]; for (int i = 0; i < rows; i++) idx[i] = rng.Next(E);
+        using var bDown = Up(device, down, out _); using var bIdx = Up(device, idx, out _); using var bW = Up(device, w, out _); using var bLab = Up(device, labels, out _);
+        int empty = 0, notExact = 0;
+        for (int g = 0; g < G; g++)
+        {
+            using var bZ = device.Allocate(((long)T * L * 2 + 3) & ~3L);
+            using (var ctx = device.CreateSubmitContext()) { ctx.Begin(); k.RecordGroupCombineF16(ctx.CommandBuffer, bDown, bIdx, bW, bLab, bZ, L, K, g, T, E); ctx.SubmitAndWait(); }
+            ushort[] z = DownloadHalfBits(device, bZ, T * L);
+            for (int t = 0; t < T; t++)
+            {
+                bool any = false;
+                for (int c = 0; c < L; c++)
+                {
+                    float acc = 0;
+                    for (int j = 0; j < K; j++) { int v = t * K + j; if (labels[idx[v]] == g) { acc += w[v] * down[v * L + c]; any = true; } }
+                    if ((float)(Half)acc != acc) notExact++;
+                    Assert.True(z[t * L + c] == HalfBits(acc), $"g {g} t {t} c {c}: want {HalfBits(acc):X4} got {z[t * L + c]:X4} (z {acc:G9})");
+                }
+                if (!any) empty++;
+            }
+        }
+        Assert.True(empty > 0 && notExact > 100, "fixture does not exercise empty groups and F16 rounding");
+    }
+
     [SkippableTheory]
     [InlineData(200, 256, 150)]
     [InlineData(300, 192, 9)]
-    public void GemmU_Q8_1In_F16Out_IsTheBlockedF32GemmOnTheDequantisedActivationRoundedOnce(int m, int kk, int n)
+    public void GemmU_F16In_F16Out_IsTheBlockedF32GemmRoundedOnce(int m, int kk, int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
@@ -441,32 +481,23 @@ public sealed class VulkanEdge0LatentKernelTests
         var variant = Q8_0GemmCoopmatVariant.Blocked128x128x4;
         Skip.IfNot(variant.IsSupportedOn(device, spvDir), "blocked Q8_0 GEMM unavailable");
         using var refK = MatMulQ8_0GemmCoopmatKernel.Create(device, spvDir, variant);
-        using var qRows = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir)!;
         var rng = new Random(0xE7 + m);
         byte[] wq = RandomQ8Rows(rng, m, kk);
-        float[] z = new float[n * kk]; for (int i = 0; i < z.Length; i++) z[i] = (float)(rng.NextDouble() * 2 - 1);
+        var z = new Half[n * kk]; for (int i = 0; i < z.Length; i++) z[i] = (Half)(float)(rng.NextDouble() * 2 - 1);
+        float[] zf = z.Select(h => (float)h).ToArray();
         using var bW = device.Allocate((wq.Length + 3L) & ~3L); device.Upload(wq, bW);
-        using var bZ = Up(device, z, out _);
-        using var bXq = device.Allocate(QuantizeQ8_1RowsKernel.PackedBytes(n, kk)); using var bXds = device.Allocate(QuantizeQ8_1RowsKernel.ScaleBytes(n, kk));
-        using (var ctx = device.CreateSubmitContext()) { ctx.Begin(); qRows.Record(ctx.CommandBuffer, bZ, bXq, bXds, n, kk); ctx.SubmitAndWait(); }
-        // the dequantised activation d * q rounded ONCE to F16 (what the tile load stages), exactly representable so the F32 GEMM stages it unchanged
-        var q81 = DownloadQ81(device, bXq, bXds, n, kk);
-        float[] deq = new float[n * kk];
-        for (int i = 0; i < deq.Length; i++) { uint word = q81.Xq[i / 4]; deq[i] = (float)(Half)((double)(sbyte)((word >> (8 * (i % 4))) & 0xFF) * (double)q81.D[i / 32]); }
-        using var bDeq = Up(device, deq, out _);
+        using var bZ = Up(device, z, out _); using var bZf = Up(device, zf, out _);
         using var bRef = device.Allocate((long)n * m * 4); using var bC = device.Allocate(((long)n * m * 2 + 3) & ~3L);
         using (var ctx = device.CreateSubmitContext())
         {
             ctx.Begin();
-            refK.Record(ctx.CommandBuffer, bW, bDeq, bRef, m, kk, n);
-            k.RecordGemmU(ctx.CommandBuffer, bW, bXq, bXds, bC, m, kk, n);
+            refK.Record(ctx.CommandBuffer, bW, bZf, bRef, m, kk, n);
+            k.RecordGemmU(ctx.CommandBuffer, bW, bZ, bC, m, kk, n);
             ctx.SubmitAndWait();
         }
         float[] r = new float[n * m]; device.Download(bRef, r);
         ushort[] c = DownloadHalfBits(device, bC, n * m);
-        int bad = 0; float maxDiff = 0; int firstBad = -1;
-        for (int i = 0; i < r.Length; i++) if (c[i] != HalfBits(r[i])) { bad++; if (firstBad < 0) firstBad = i; maxDiff = MathF.Max(maxDiff, MathF.Abs((float)BitConverter.UInt16BitsToHalf(c[i]) - r[i])); }
-        Assert.True(bad == 0, $"{bad}/{r.Length} elements differ, first {firstBad} (row {firstBad / m} col {firstBad % m}), max |f16 - f32| {maxDiff:G4}");
+        for (int i = 0; i < r.Length; i++) Assert.True(c[i] == HalfBits(r[i]), $"i {i}: f16 {c[i]:X4} vs f32 rounded {HalfBits(r[i]):X4} ({r[i]:G9})");
         Assert.Contains(Enumerable.Range(0, r.Length), i => (float)(Half)r[i] != r[i]);
     }
 

@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 // Edge0 latent MoE (G3, #1981): routing-weighted sum of the expert down outputs of ONE D/U group, written straight into Q8_1 blocks.
 //
 //   z_g[t, c] = sum_{j < k, labels[indices[t*k+j]] == g} weights[t*k+j] * down[t*k+j, c]      (slot order j ascending, like the CPU oracle)
@@ -37,5 +38,6 @@ void main() {
         if (e < pc.numExperts && uint(labels[e]) == pc.g)
             acc += weights[v] * down[v * pc.L + c];
     }
+    acc = float(float16_t(acc));   // z is an F16 value (James's ruling, #1981); U's MMVQ then quantises that F16 value to Q8_1
     edge0PackQ81(acc, lane, t * (pc.L >> 2u) + b * 8u, t * (pc.L >> 5u) + b);
 }
