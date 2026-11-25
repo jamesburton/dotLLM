@@ -32,7 +32,7 @@ g_perp = g - (x.g / |x|^2) x;   R = |x|;  t = min(|g_perp| / R, pi/4)
 theta  = min((t * scale + bias) / (layer + 1), pi/4)          # scale, bias: 4 scalars per block (geo_mixer_*, geo_mlp_*)
 out    = x cos(theta) + (g_perp / |g_perp|) R sin(theta)
 ```
-Reductions run in double (`OlalaOps.GeodesicUpdate`): the M-mixer outputs reach ~1e14 (see §4).
+Reductions run in double (`OlalaOps.GeodesicUpdate`): the M-mixer outputs reach ~1e14 (see §3).
 
 ### M layer — Mamba-3 MIMO (`OlalaMamba3MimoFast`)
 H = 48 heads, P = 64, N = 128, R = 4 (MIMO rank), 32 rotary angle pairs, G = 1 group, no conv (`remove_conv`), trapezoid, data-dependent A.
@@ -43,7 +43,7 @@ H = 48 heads, P = 64, N = 128, R = 4 (MIMO rank), 32 rotary angle pairs, G = 1 g
   `cum += tanh(raw) * dt * pi` per head, pairs `(i, i + N/2)` for `i < 32`.
 - Recurrence per head: `h_t = alpha h_{t-1} + beta u_{t-1} + gamma u_t`, `u_t = sum_r k_{t,r} (x_t * MimoX_r)^T`;
   `o_r = h_t q_r + D (x_t * MimoX_r)`; `y = sum_r MimoO_r * o_r * silu(z * MimoZ_r)`. No post-gate norm.
-- State (F32, §3): `h[H][P][N]`, angle `[H][32]`, previous token's rotated K `[R][H][N]` and raw x `[H][P]`.
+- State (F32, §4): `h[H][P][N]`, angle `[H][32]`, previous token's rotated K `[R][H][N]` and raw x `[H][P]`.
 - Output `attn_output` (3072 -> 1536).
 
 ### V layer — differential tensor-product attention (not MLA)
@@ -109,7 +109,7 @@ files add `--imatrix` and the same two overrides. OVH report KLD vs bf16 of 0.00
 
 **Consequences for dotLLM (all backends).**
 - FP16 activation storage or an FP16 scale on the activation path is **not viable** for this model (ceiling 65,504 vs 1e9-1e14). Activations are F32 on
-  CPU; any GPU port must keep BF16/F32 on the mixer-output -> `attn_output` and ReLU^2 -> down paths (the fork forces `GGML_PREC_BF16` on every quantised matmul for this reason).
+  CPU; any GPU port must keep BF16 on the mixer-output -> `attn_output` and ReLU^2 -> down paths (BF16 has the F32 exponent range; F32 storage there still needs sign-off under precision rule 1) (the fork forces `GGML_PREC_BF16` on every quantised matmul for this reason).
   This is a sign-off item for the Vulkan/CUDA slices (their F16 activation defaults, #1138, do not apply here).
 - Weights are read in place (rule 2): BF16 tensors go through a row-streaming dequantise-and-dot with F32 activations, Q6_K through the Q8_K path, Q8_0 through
   the Q8_0 path (all q8_0 tensors of safe2 have bounded inputs).
@@ -147,7 +147,7 @@ so the GGUF carries bf16-rounded gains (error up to ~4e-3 per gain) that HF-from
 that conversion rounding (`--gguf`).
 
 Tiny model (`olala_oracle.py tiny`): 5 layers `MVMMV`, hidden 64, every 7A1B flag, a 5-token window with 12-token and 3-token prompts, BF16 GGUF; the unit tests compare
-all prefill rows and every teacher-forced decode step (KL, max|dlogit|, argmax) and the free-running greedy continuation. Mutation record: §5.1.
+all prefill rows and every teacher-forced decode step (KL, max|dlogit|, argmax) and the free-running greedy continuation. Mutation record: §5.2.
 
 
 ### 5.1 Measured parity (2026-11-25, Zen 5 CPU, F32 activations)
@@ -174,7 +174,7 @@ chat 0.15 / 281 of 323 (the long prompt amplifies the 8-bit noise). OVH's publis
 KLD run is the proper like-for-like measurement and is not done yet.
 
 ### 5.2 Mutation record (tiny oracle, `OlalaOracleTests`)
-Each row is a deliberately wrong implementation; all fail the oracle tests except the two noted.
+Each row is a deliberately wrong implementation; all fail the oracle tests except the one noted (the soft-cap mutant needed the tiny cap of 3.0 to die).
 
 | mutant | result |
 |---|---|

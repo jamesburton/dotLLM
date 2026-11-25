@@ -19,7 +19,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 /// <remarks>
 /// The fixture is deliberately sensitive: logits are compared row by row (KL and max-abs), prefill and one-token decode separately (decode
 /// is where the trapezoid carry, the token-shift carry and the scalable-softmax position live), and the greedy continuation must be identical.
-/// Mutation record (what each deliberately wrong implementation does to these tests) is in the PR body.
+/// Mutation record (what each deliberately wrong implementation does to these tests): docs/OLALA.md section 5.2.
 /// </remarks>
 public sealed class OlalaOracleTests
 {
@@ -218,24 +218,41 @@ public sealed class OlalaOracleTests
         Assert.Equal(3f, cfg.AttnLogitSoftcap);
     }
 
-    [SkippableFact]
+    [Fact]
     public void RecurrentState_IsF32_ByArchitecturePolicy()
     {
-        // #1971: the Mamba recurrent state is F32 (user sign-off 2026-11-25). The policy is a compile-time constant of the architecture and the
-        // allocation must follow it: this fails the day someone narrows the buffers without the #1971 evidence.
-        Assert.Equal(OlalaStateStorage.F32, OlalaStatePolicy.Ssm);
-        Assert.Equal(OlalaStateStorage.F32, OlalaStatePolicy.Angle);
-        Assert.Equal(OlalaStateStorage.F32, OlalaStatePolicy.Trapezoid);
-        Assert.Equal(OlalaStateStorage.F32, OlalaStatePolicy.TokenShift);
-        string? gguf = TinyGguf();
-        Skip.If(gguf is null, "tiny Olala oracle not generated");
-        using var file = GgufFile.Open(gguf!);
-        using var model = Load(file, out var cfg);
-        using var state = model.CreateState();
-        var o = cfg.Olala!;
-        Assert.Equal(OlalaStatePolicy.ElementBytes(OlalaStatePolicy.Ssm), state.SsmElementBytes);
-        long perLayer = ((long)o.NumSsmHeads * o.MambaHeadDim * o.StateSize + (long)o.NumSsmHeads * o.NumRopeAngles
-                         + (long)o.MimoRank * o.NumSsmHeads * o.StateSize + (long)o.NumSsmHeads * o.MambaHeadDim) * sizeof(float);
-        Assert.Equal(perLayer * o.SsmLayerCount, state.RecurrentBytes);
+        // #1971: the Mamba recurrent state is F32 (user sign-off 2026-11-25). The allocation must follow the policy: this fails the day someone
+        // narrows any of the buffers without the #1971 evidence. It builds the state from the 7A1B geometry directly (no generated fixture),
+        // so it runs in CI. Proven to fail (#1973 review) with the SSM matrix stored as packed bf16 (half the F32 elements); retyping a buffer
+        // (NativeBuffer<Half>/<ushort>) changes the per-element byte checks below and every Span<float> call site.
+        var o = new OlalaConfig
+        {
+            LayerTypes = "MMMMVMMMMVMMMMVMMMMVMMMMVMMMMVMMMMVM", SsmInner = 3072, StateSize = 128, GroupCount = 1, MambaHeadDim = 64, MimoRank = 4,
+            NumRopeAngles = 32, NumSignalHeads = 36, NumNoiseHeads = 12, TpaRank = 4, GateBias = 1.15f, ExpertCount = 256, ExpertUsedCount = 6,
+            ExpertFfLength = 768, SharedExpertFfLength = 1536, ExpertWeightsScale = 2.45f, MoeLatentSize = 384,
+        };
+        var cfg = new ModelConfig
+        {
+            Architecture = Architecture.Olala, VocabSize = 151936, HiddenSize = 1536, IntermediateSize = 0, NumLayers = 36,
+            NumAttentionHeads = 48, NumKvHeads = 12, HeadDim = 128, MaxSequenceLength = 100000, Olala = o,
+        };
+        int f32 = OlalaStatePolicy.ElementBytes(OlalaStateStorage.F32);
+        using var state = new OlalaSequenceState(o, cfg);
+        Assert.Equal(29, state.Ssm.Length); Assert.Equal(7, state.Attn.Length);
+        foreach (var s in state.Ssm)
+        {
+            Assert.Equal(OlalaStatePolicy.ElementBytes(OlalaStatePolicy.Ssm), (int)(s.Ssm.Bytes / s.Ssm.Count));
+            Assert.Equal(OlalaStatePolicy.ElementBytes(OlalaStatePolicy.Angle), (int)(s.Angle.Bytes / s.Angle.Count));
+            Assert.Equal(OlalaStatePolicy.ElementBytes(OlalaStatePolicy.Trapezoid), (int)(s.K.Bytes / s.K.Count));
+            Assert.Equal(OlalaStatePolicy.ElementBytes(OlalaStatePolicy.Trapezoid), (int)(s.V.Bytes / s.V.Count));
+        }
+        foreach (var a in state.Attn)
+        {
+            Assert.Equal(OlalaStatePolicy.ElementBytes(OlalaStatePolicy.TokenShift), (int)(a.LastK.Bytes / a.LastK.Count));
+            Assert.Equal(OlalaStatePolicy.ElementBytes(OlalaStatePolicy.TokenShift), (int)(a.LastV.Bytes / a.LastV.Count));
+        }
+        Assert.Equal(f32, state.SsmElementBytes);
+        // docs/OLALA.md section 4: 1,572,864 + 6,144 + 98,304 + 12,288 bytes per M layer.
+        Assert.Equal((1_572_864L + 6_144 + 98_304 + 12_288) * 29, state.RecurrentBytes);
     }
 }

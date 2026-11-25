@@ -106,7 +106,7 @@ Only what the data proved. Everything here is **in registers or within a tile**,
 **Activation range exception (Olala, #1969):** the OVHcloud Olala activations are documented to reach ~1e14 (M-mixer outputs, the `attn_output` input) and ~1e9 (ReLU² of the experts,
 the `ffn_down_*` input), far beyond FP16's 65,504, and OVH's own recipe keeps exactly those tensors BF16/Q6_K (`q8_0-safe2`) because an FP16-scaled Q8_0 activation quantiser overflows to NaN. For this
 architecture FP16 activation storage, FP16 scratch and FP16 activation scales on those two paths are **not allowed on any backend** (CPU uses F32 activations; the #1138 F16-activation defaults do not apply;
-GPU ports need BF16/F32 there and the user's sign-off for anything narrower). See `docs/OLALA.md` §3.
+GPU ports keep BF16 there: it has the F32 exponent range, so F32 storage still needs sign-off under rule 1, and anything narrower than BF16 needs sign-off too). See `docs/OLALA.md` §3.
 
 **Not justified anywhere:** F32 weights, F32 KV, F32 MTP/draft KV, F32 inter-kernel activations (pending #1138), F32
 embedding tables.

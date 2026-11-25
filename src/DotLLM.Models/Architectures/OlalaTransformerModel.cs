@@ -34,7 +34,7 @@ public sealed unsafe class OlalaTransformerModel : IModel
 
     private sealed class MoeWeights
     {
-        public required float[] Router;            // [E][hidden] F32
+        public required MatRef Router;             // [E][hidden], read in place from the mmap (F32 in the published GGUFs)
         public required float[] ExpertBias;        // [E]
         public required MatRef LatentDown, LatentUp, SharedUp, SharedDown;
         public required nint UpExps, DownExps;
@@ -148,7 +148,7 @@ public sealed unsafe class OlalaTransformerModel : IModel
             var upD = tensors[B("ffn_up_exps.weight")]; var downD = tensors[B("ffn_down_exps.weight")];
             var moe = new MoeWeights
             {
-                Router = F32(B("ffn_gate_inp.weight")),
+                Router = Mat(B("ffn_gate_inp.weight")),
                 ExpertBias = F32(B("exp_probs_b")),
                 LatentDown = Mat(B("ffn_latent_down.weight")),
                 LatentUp = Mat(B("ffn_latent_up.weight")),
@@ -523,11 +523,8 @@ public sealed unsafe class OlalaTransformerModel : IModel
         float[] selWeight = ArrayPool<float>.Shared.Rent(T * K);
         try
         {
-            // Router in F32 on the F32 residual.
-            fixed (float* wr = m.Router)
-            fixed (float* xp = x)
-            fixed (float* lp = logits)
-                MatMul.GemmF32(wr, xp, lp, E, H, T, _pool);
+            // Router on the F32 residual, weights read in place (F32 GGUF tensor -> GemmF32; no managed copy).
+            GemmSpan(m.Router, x.AsSpan(0, T * H), logits, T);
             Span<float> scored = stackalloc float[E];
             Span<float> sig = stackalloc float[E];
             for (int t = 0; t < T; t++)
@@ -571,42 +568,52 @@ public sealed unsafe class OlalaTransformerModel : IModel
     private void ExecuteExperts(MoeWeights m, float[] x0, float[] outLat, int[] selExpert, float[] selWeight, int T, int K, int E, int lat, int ff)
     {
         // Bucket (token, slot) assignments by expert so each expert runs one batched GEMM over its tokens.
-        int[] count = new int[E + 1];
-        for (int i = 0; i < T * K; i++) count[selExpert[i] + 1]++;
-        for (int e = 0; e < E; e++) count[e + 1] += count[e];
-        int[] cursor = (int[])count.Clone();
-        int[] tokenOf = new int[T * K]; float[] weightOf = new float[T * K];
-        for (int t = 0; t < T; t++)
-            for (int i = 0; i < K; i++)
-            {
-                int e = selExpert[t * K + i], at = cursor[e]++;
-                tokenOf[at] = t; weightOf[at] = selWeight[t * K + i];
-            }
-        for (int e = 0; e < E; e++)
+        // Pooled (zero-alloc hot path): rented arrays may be longer than asked, so every use below is bounded by E + 1 / T * K.
+        int[] count = ArrayPool<int>.Shared.Rent(E + 1), cursor = ArrayPool<int>.Shared.Rent(E + 1);
+        int[] tokenOf = ArrayPool<int>.Shared.Rent(T * K); float[] weightOf = ArrayPool<float>.Shared.Rent(T * K);
+        try
         {
-            int n = count[e + 1] - count[e], start = count[e];
-            if (n == 0) continue;
-            float[] xin = ArrayPool<float>.Shared.Rent(n * lat);
-            float[] h = ArrayPool<float>.Shared.Rent(n * ff);
-            float[] yo = ArrayPool<float>.Shared.Rent(n * lat);
-            try
+            Array.Clear(count, 0, E + 1);
+            for (int i = 0; i < T * K; i++) count[selExpert[i] + 1]++;
+            for (int e = 0; e < E; e++) count[e + 1] += count[e];
+            Array.Copy(count, cursor, E + 1);
+            for (int t = 0; t < T; t++)
+                for (int i = 0; i < K; i++)
+                {
+                    int e = selExpert[t * K + i], at = cursor[e]++;
+                    tokenOf[at] = t; weightOf[at] = selWeight[t * K + i];
+                }
+            for (int e = 0; e < E; e++)
             {
-                for (int i = 0; i < n; i++) x0.AsSpan(tokenOf[start + i] * lat, lat).CopyTo(xin.AsSpan(i * lat, lat));
-                fixed (float* xp = xin) fixed (float* hp = h) fixed (float* yp = yo)
+                int n = count[e + 1] - count[e], start = count[e];
+                if (n == 0) continue;
+                float[] xin = ArrayPool<float>.Shared.Rent(n * lat);
+                float[] h = ArrayPool<float>.Shared.Rent(n * ff);
+                float[] yo = ArrayPool<float>.Shared.Rent(n * lat);
+                try
                 {
-                    Gemm(m.UpExps + (nint)(e * m.UpExpertBytes), m.UpQt, xp, hp, ff, lat, n, _pool);
-                    ReluSquared(h.AsSpan(0, n * ff));
-                    Gemm(m.DownExps + (nint)(e * m.DownExpertBytes), m.DownQt, hp, yp, lat, ff, n, _pool);
+                    for (int i = 0; i < n; i++) x0.AsSpan(tokenOf[start + i] * lat, lat).CopyTo(xin.AsSpan(i * lat, lat));
+                    fixed (float* xp = xin) fixed (float* hp = h) fixed (float* yp = yo)
+                    {
+                        Gemm(m.UpExps + (nint)(e * m.UpExpertBytes), m.UpQt, xp, hp, ff, lat, n, _pool);
+                        ReluSquared(h.AsSpan(0, n * ff));
+                        Gemm(m.DownExps + (nint)(e * m.DownExpertBytes), m.DownQt, hp, yp, lat, ff, n, _pool);
+                    }
+                    for (int i = 0; i < n; i++)
+                    {
+                        float w = weightOf[start + i];
+                        var dst = outLat.AsSpan(tokenOf[start + i] * lat, lat);
+                        var src = yo.AsSpan(i * lat, lat);
+                        for (int c = 0; c < lat; c++) dst[c] += w * src[c];
+                    }
                 }
-                for (int i = 0; i < n; i++)
-                {
-                    float w = weightOf[start + i];
-                    var dst = outLat.AsSpan(tokenOf[start + i] * lat, lat);
-                    var src = yo.AsSpan(i * lat, lat);
-                    for (int c = 0; c < lat; c++) dst[c] += w * src[c];
-                }
+                finally { ArrayPool<float>.Shared.Return(xin); ArrayPool<float>.Shared.Return(h); ArrayPool<float>.Shared.Return(yo); }
             }
-            finally { ArrayPool<float>.Shared.Return(xin); ArrayPool<float>.Shared.Return(h); ArrayPool<float>.Shared.Return(yo); }
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(count); ArrayPool<int>.Shared.Return(cursor);
+            ArrayPool<int>.Shared.Return(tokenOf); ArrayPool<float>.Shared.Return(weightOf);
         }
     }
 
