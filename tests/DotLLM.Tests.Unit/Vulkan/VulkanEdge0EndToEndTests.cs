@@ -38,7 +38,7 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
     private static FixtureLocation Locate() => TestFixtureResolver.ResolveFile("DOTLLM_EDGE0_SKELETON", "Edge0", "Edge0-145B-q3k", "model-skeleton.gguf",
         "native_experts.txt", "experts.bin", "ple-fp8.gguf");
 
-    private sealed record Run(int[] Ids, int[] RowArgmax, double MeanNll, float[] LastLogits, int[] Greedy);
+    private sealed record Run(int[] Ids, int[] RowArgmax, double MeanNll, float[] LastLogits, int[] Greedy, float[]? AllRows = null);
 
     private static unsafe int Argmax(ReadOnlySpan<float> row) { int b = 0; for (int i = 1; i < row.Length; i++) if (row[i] > row[b]) b = i; return b; }
 
@@ -75,7 +75,7 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
             using var lg = model.Forward([next], [ids.Length + s], 0);
             next = Argmax(new ReadOnlySpan<float>((void*)lg.DataPointer, vocab));
         }
-        return new Run(ids.ToArray(), argmax, nll ? total / (rows - 1) : double.NaN, last, greedy);
+        return new Run(ids.ToArray(), argmax, nll ? total / (rows - 1) : double.NaN, last, greedy, nll ? l.ToArray() : null);
     }
 
     private static void Save(string path, List<Run> runs)
@@ -124,6 +124,22 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
         return kl;
     }
 
+    private static (double Mean, double Max, int Rows)? RowKl(float[]? vkRows)
+    {
+        if (vkRows is null || Environment.GetEnvironmentVariable("DOTLLM_EDGE0_ROWS_REF") is not { Length: > 0 } path || !File.Exists(path)) return null;
+        using var rd = new BinaryReader(File.OpenRead(path));
+        int rows = rd.ReadInt32(), vocab = rd.ReadInt32();
+        var cpuRows = new float[rows * vocab];
+        for (int i = 0; i < cpuRows.Length; i++) cpuRows[i] = rd.ReadSingle();
+        double sum = 0, max = 0;
+        for (int t = 0; t < rows; t++)
+        {
+            double kl = Kl(cpuRows.AsSpan(t * vocab, vocab).ToArray(), vkRows.AsSpan(t * vocab, vocab).ToArray());
+            sum += kl; max = Math.Max(max, kl);
+        }
+        return (sum / rows, max, rows);
+    }
+
     private static int[][] Inputs(string skeleton)
     {
         using var g = GgufFile.Open(skeleton);
@@ -151,6 +167,13 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
                 output.WriteLine($"cpu input {i}: {inputs[i].Length} tokens, nll {runs[^1].MeanNll:F4}, greedy {string.Join(' ', runs[^1].Greedy.Take(8))}");
             }
             Save(refPath, runs);
+            if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_ROWS_REF") is { Length: > 0 } rowsPath && runs[0].AllRows is { } all)
+            {
+                // Teacher-forced reference (#1981): the passage's logits at EVERY row, so a format can be ranked by mean per-row KL over ~106 rows rather than by 24 knife-edge greedy tokens.
+                using var rw = new BinaryWriter(File.Create(rowsPath));
+                rw.Write(runs[0].Ids.Length); rw.Write(all.Length / runs[0].Ids.Length);
+                foreach (float f in all) rw.Write(f);
+            }
         }
     }
 
@@ -179,15 +202,11 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
         var failures = new List<string>();
         if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_SWEEP") is { Length: > 0 } sweepSpec)
         {
-            // Latent-scratch storage sweep (#1981): "xl,z,uo;xl,z,uo;..." with each of f32|f16|bf16|q8 (simulated round trip in place; F32 accumulation everywhere).
-            int Fmt(string f) => f switch { "f16" => 1, "bf16" => 2, "q8" => 3, _ => 0 };
+            // Parity + speed report (#1981): runs the four inputs (NLL, last-row KL, greedy-24, row argmax, mean per-row KL when DOTLLM_EDGE0_ROWS_REF exists) and the prefill / decode speed
+            // once per ';'-separated label (the label is only printed; the kernels under test are whatever this build contains).
             foreach (string cfg in sweepSpec.Split(';'))
             {
-                var parts = cfg.Split(',');
-                VulkanQwen3MoeHybridTransformerModel.Edge0SimXl = Fmt(parts[0]);
-                VulkanQwen3MoeHybridTransformerModel.Edge0SimZ = Fmt(parts[1]);
-                VulkanQwen3MoeHybridTransformerModel.Edge0SimUo = Fmt(parts[2]);
-                var kls = new List<string>(); var gr = new List<string>(); double nllV = 0; int rowAg = 0, rowN = 0;
+                var kls = new List<string>(); var gr = new List<string>(); (double Mean, double Max, int Rows)? rowKl = null; double nllV = 0; int rowAg = 0, rowN = 0;
                 for (int i = 0; i < inputs.Length; i++)
                 {
                     var r = Execute(vk, inputs[i], nll: i == 0, n => vk.TrySetAllRowLogitsLimit(n));
@@ -195,7 +214,7 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
                     kls.Add(Kl(c.LastLogits, r.LastLogits).ToString("E1"));
                     int ga = 0; for (int t = 0; t < GreedyTokens; t++) if (c.Greedy[t] == r.Greedy[t]) ga++;
                     gr.Add($"{ga}/{GreedyTokens}");
-                    if (i == 0) { nllV = r.MeanNll; for (int t = 0; t < c.RowArgmax.Length; t++) if (c.RowArgmax[t] == r.RowArgmax[t]) rowAg++; rowN = c.RowArgmax.Length; }
+                    if (i == 0) { rowKl = RowKl(r.AllRows); nllV = r.MeanNll; for (int t = 0; t < c.RowArgmax.Length; t++) if (c.RowArgmax[t] == r.RowArgmax[t]) rowAg++; rowN = c.RowArgmax.Length; }
                 }
                 vk.TrySetAllRowLogitsLimit(1);
                 var longIds2 = Enumerable.Range(0, 5).SelectMany(_ => inputs[0]).Take(512).ToArray();
@@ -216,9 +235,8 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
                     for (int sIdx = 0; sIdx < 48; sIdx++) { using var lg = vk.Forward([13], [pos++], -1, null, true); }
                     dc2.Add(48 / swd.Elapsed.TotalSeconds);
                 }
-                output.WriteLine($"SWEEP xl={parts[0]} z={parts[1]} uo={parts[2]}: NLL {nllV:F4} (cpu {cpu[0].MeanNll:F4}); KL {string.Join(" / ", kls)}; greedy {string.Join(" ", gr)}; row argmax {rowAg}/{rowN}; prefill {string.Join("/", pf2.Select(v => v.ToString("F0")))} tok/s; decode {string.Join("/", dc2.Select(v => v.ToString("F1")))} tok/s");
+                output.WriteLine($"SWEEP {cfg}: scratch {vk.Edge0ScratchBytesForTest / 1048576.0:F1} MiB; device live {device.LiveBytesTotal() / (double)(1L << 30):F2} GiB; NLL {nllV:F4} (cpu {cpu[0].MeanNll:F4}); ROWKL {(rowKl is { } rk ? $"mean {rk.Mean:E3} max {rk.Max:E3} over {rk.Rows} rows" : "n/a")}; KL {string.Join(" / ", kls)}; greedy {string.Join(" ", gr)}; row argmax {rowAg}/{rowN}; prefill {string.Join("/", pf2.Select(v => v.ToString("F0")))} tok/s; decode {string.Join("/", dc2.Select(v => v.ToString("F1")))} tok/s");
             }
-            VulkanQwen3MoeHybridTransformerModel.Edge0SimXl = VulkanQwen3MoeHybridTransformerModel.Edge0SimZ = VulkanQwen3MoeHybridTransformerModel.Edge0SimUo = 0;
             return;
         }
         for (int i = 0; i < inputs.Length; i++)

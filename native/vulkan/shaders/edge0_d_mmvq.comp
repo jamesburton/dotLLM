@@ -1,4 +1,6 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_integer_dot_product        : require
 #extension GL_KHR_shader_subgroup_basic      : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -14,7 +16,7 @@ layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0, std430) readonly  buffer BufW      { uint  weight[]; };   // Q8_0 blob [G*L rows]
 layout(set = 0, binding = 1, std430) readonly  buffer BufXq     { uint  xq[]; };       // [K/4] packed int8 activations
 layout(set = 0, binding = 2, std430) readonly  buffer BufXds    { vec2  xds[]; };      // [K/32] (d_x, s_x)
-layout(set = 0, binding = 3, std430) writeonly buffer BufY      { float y[]; };        // [G*L]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY      { float16_t y[]; };    // [G*L], F16 (the F32 dp4a result rounded once at the store)
 layout(set = 0, binding = 4, std430) readonly  buffer BufIdx    { int   indices[]; };  // [topK] selected experts of the token
 layout(set = 0, binding = 5, std430) readonly  buffer BufLabels { int   labels[]; };   // [numExperts] group of each expert
 
@@ -25,6 +27,7 @@ layout(push_constant) uniform PushConstants {
     uint L;            // rows per group
     uint topK;
     uint numExperts;
+    uint noSkip;       // 1 = compute every group (the A/B arm: same arithmetic, more bytes)
 } pc;
 
 const uint UINT16_PER_BLOCK = 17u;
@@ -45,7 +48,7 @@ void main() {
         uint e = uint(indices[j]);
         if (e < pc.numExperts && uint(labels[e]) == g) used = true;
     }
-    if (!used) return;
+    if (!used && pc.noSkip == 0u) return;
 
     uint lane = gl_LocalInvocationID.x;
     uint blockInWindow = lane >> 2u;
@@ -81,5 +84,5 @@ void main() {
 
     float total = subgroupAdd(acc);
     if (subgroupElect())
-        y[m] = total;
+        y[m] = float16_t(total);
 }

@@ -1,0 +1,19 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+// Edge0 latent MoE (#1981): accumulates one group's U output into the layer output in ascending group order, F32 accumulation:
+//   first != 0: out[i] = float(u[i])        else: out[i] = out[i] + float(u[i])
+// so after groups 0..7 out = ((u0 + u1) + ... + u7), the sum the eight-slab kernel computed, with ONE F16 slab of U partials instead of eight F32 ones.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BU  { float16_t u[]; };
+layout(set = 0, binding = 1, std430) buffer BO { float outv[]; };
+
+layout(push_constant) uniform PushConstants { uint n; uint first; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float v = float(u[i]);
+    outv[i] = pc.first != 0u ? v : outv[i] + v;
+}
