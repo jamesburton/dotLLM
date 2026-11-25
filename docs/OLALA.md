@@ -256,3 +256,11 @@ Not equivalent (corrected in the #1988 review): leaving the K token shift unmask
 **Throughput** (Strix Halo, Vulkan, q8_0-safe2, warm, same session, 300-token chat prompt prefill then 48 greedy decode steps; UMA swing and a shared GPU make runs differ):
 BF16 activations prefill 180-307 tok/s, decode 27-31 tok/s; F32-activation control prefill 326-330, decode 30.3-30.4 (storage dtype is throughput-neutral within noise); bf16 GGUF prefill 289-296, decode 24.7-25.4.
 Levers not taken: split-KV attention (12 workgroups per decode token), 128-thread Mamba workgroups (48 workgroups of 64 lanes), fusing the geodesic into the following GEMV, a chunked prefill scan, the 36 x ~25 dispatches per token.
+
+**Stage profile and the router lever (#2000).** Opt-in `OlalaVulkanTests.RealModel_StageProfile` (`DOTLLM_OLALA_VK_PROFILE=1`) submits and waits after every stage (about 50 us sync per mark, subtracted).
+q8_0-safe2, Strix 8060S, warm. Decode net ~29 ms/step: **MoE router 51-54%** (430 us/call x 36), M out_proj 9%, mamba3_step 8%, tpa_attn 5%, ssm_in 5%, shared_down 5%, lm_head 4%.
+Prefill 300 tokens net ~943 ms: **mamba3_step 46%** (7.5 ms/call x 58), ssm_in GEMV 13%, moe up 8%, moe down 6%, V projection GEMVs 6%, route 5%, the rest under 4% each.
+The router was one 256-thread workgroup walking the 1.5 MB F32 router scalar-wise, one expert row at a time per subgroup (3.6 GB/s). It now reads the F32 router in place as vec4 (hidden % 4 == 0)
+with four expert rows in flight per subgroup; the scores still never leave shared memory (no new F32 storage). Same-session interleaved A/B (new/old/new/old, 3 warm rounds each): decode 50.3-53.1 vs 30.0-30.3 tok/s, prefill 328-335 vs 317-324.
+Router mutants (tiny gates): row index, vec4 component, killed; the E % 4 != 0 tail guard survives (tiny and real E are multiples of 4, untested).
+
