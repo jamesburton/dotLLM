@@ -877,7 +877,7 @@ Some variables are read at process start, others per model load - set them befor
 | `DOTLLM_VK_ALLOW_OVERCOMMIT` | off | `1` turns the pre-load refusal for a qwen4exp model that does not fit resident into a warning. |
 | `DOTLLM_VK_UMA_USABLE_FRACTION` | 0.64 | Fraction of system RAM treated as usable device memory on unified-memory Vulkan GPUs. |
 | `DOTLLM_VULKAN_STRICT_DEVICE_LOCAL` | by device | Whether an exhausted device-local heap is an error or falls back to host-visible memory. Unset: discrete GPUs error (#1849), integrated/UMA GPUs fall back. `1` errors on every device; `0` falls back on every device, discrete included. |
-| `DOTLLM_VULKAN_DISABLE_HOST_IMPORT` | off | `1` forces every weight tensor to be staged instead of imported zero-copy from the mapped file (the opt-out for the #1991 UMA default). |
+| `DOTLLM_VULKAN_DISABLE_HOST_IMPORT` | off | `1` forces every weight tensor to be staged instead of imported zero-copy from the mapped file. |
 | `DOTLLM_VULKAN_STAGING_MB` | 64 | Chunk size of the Vulkan upload staging buffer (1..4096). |
 | `DOTLLM_VK_MOE_RESIDENT`, `DOTLLM_VK_IQ_RESIDENT` | auto / on | Keep MoE expert banks (IQ banks) resident on the device; `=1` forces on, `=0` off. |
 | `DOTLLM_MOE_OFFLOAD`, `DOTLLM_MOE_CACHE_MIB`, `DOTLLM_MOE_CACHE_POLICY`, `DOTLLM_MOE_COLD`, `DOTLLM_MOE_CPU_THREADS`, `DOTLLM_CPU_MOE` (`=1`), `DOTLLM_N_CPU_MOE`, `DOTLLM_MOE_CALIBRATE` (`=1`), `DOTLLM_MOE_CTX` | per option | Environment fallbacks of `--moe-offload`, `--moe-cache-mib`, `--moe-cache-policy`, `--moe-cold`, `--moe-cpu-threads`, `--cpu-moe`, `--n-cpu-moe`, `--moe-calibrate`, `--ctx-size` ([MOE_OFFLOAD.md](MOE_OFFLOAD.md)). |

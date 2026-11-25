@@ -63,8 +63,8 @@ internal static class VulkanWeightImportPolicy
 
     /// <summary>
     /// Whether a refused read-only import is retried through a shared writable alias view of the same file range (#1190, #1991).
-    /// <c>DOTLLM_VULKAN_HOST_IMPORT_WRITABLE</c>: <c>0</c> = never, <c>1</c> = always (even on a discrete GPU), unset = <b>on for an
-    /// integrated (UMA) device only</b>. The driver refuses read-only GGUF pages (<c>vkAllocateMemory</c> -1000072003), so without
+    /// <c>DOTLLM_VULKAN_HOST_IMPORT_WRITABLE</c>: <c>0</c> = never, <c>1</c> = always (even on a discrete GPU), unset = <b>off (was proposed on for an
+    /// integrated device, withdrawn after measurement)</b>. The driver refuses read-only GGUF pages (<c>vkAllocateMemory</c> -1000072003), so without
     /// the alias every tensor is copied through host memory (a CLAUDE.md rule-3 bounce). Read per call.
     /// </summary>
     public static bool WritableAliasEnabled(VulkanDevice device)
@@ -72,7 +72,7 @@ internal static class VulkanWeightImportPolicy
         string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE");
         if (string.Equals(v, "0", StringComparison.Ordinal)) return false;
         if (string.Equals(v, "1", StringComparison.Ordinal)) return true;
-        return device.PhysicalDeviceTypeValue == Interop.VkPhysicalDeviceType.IntegratedGpu;
+        return false;   // #1991: opt-in. Default-on measured -19% decode / -33% prefill on dense Llama (see docs/GPU.md); DirectStorage is the neutral zero-copy route.
     }
 
     /// <summary>Tensors whose import was attempted and refused on the current load (they are then staged) (#1991).</summary>

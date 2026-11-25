@@ -49,7 +49,7 @@ public class VulkanWeightImportWriteGuardTests(ITestOutputHelper output)
         try
         {
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT", null);
-            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE", null);   // the default, not the opt-in
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE", "1");   // the opt-in (#1991: default stays off, see docs/GPU.md)
 
             string before = Hash(path!);
             DateTime mtime = File.GetLastWriteTimeUtc(path!);
@@ -60,7 +60,7 @@ public class VulkanWeightImportWriteGuardTests(ITestOutputHelper output)
                 using var model = VulkanTransformerModel.LoadFromGguf(device, gguf, config, spvDir);
                 output.WriteLine(VulkanWeightImportPolicy.Summary());
                 // Without this the hash proves nothing: the guard must run on the imported (writable-mapped) path.
-                Assert.True(VulkanWeightImportPolicy.ImportedTensorCount > 0, "default UMA load imported nothing: " + VulkanWeightImportPolicy.Summary());
+                Assert.True(VulkanWeightImportPolicy.ImportedTensorCount > 0, "opt-in UMA load imported nothing: " + VulkanWeightImportPolicy.Summary());
 
                 int[] ids = [1, 2, 3, 4, 5, 6, 7, 8];
                 using (ITensor p = model.Forward(ids, [0, 1, 2, 3, 4, 5, 6, 7], deviceId: -1)) { }
@@ -90,8 +90,8 @@ public class VulkanWeightImportWriteGuardTests(ITestOutputHelper output)
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE", "1");
             Assert.True(VulkanWeightImportPolicy.WritableAliasEnabled(device));
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE", null);
-            Assert.Equal(device.PhysicalDeviceTypeValue == VkPhysicalDeviceType.IntegratedGpu,
-                VulkanWeightImportPolicy.WritableAliasEnabled(device));
+            Assert.False(
+                VulkanWeightImportPolicy.WritableAliasEnabled(device));   // unset = off
         }
         finally { Environment.SetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE", orig); }
     }

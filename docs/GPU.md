@@ -1059,7 +1059,7 @@ it privatises the page (a full copy, same cost as staging); only a shared writab
 place. So `DOTLLM_GGUF_MAP_COW=1` imports but saves nothing physical, and it charges commit for the
 whole file.
 
-**`DOTLLM_VULKAN_HOST_IMPORT_WRITABLE`** (#1991: **default ON on UMA**, `0` disables, `1` forces it on a dGPU too; the measurements below predate the default): when an import from the read-only mapping is
+**`DOTLLM_VULKAN_HOST_IMPORT_WRITABLE`** (#1991: stays **opt-in**; `0` disables, `1` forces it on a dGPU too): when an import from the read-only mapping is
 refused, `VulkanWeightImportPolicy.TryImport` retries through `GgufFile.TryMapImportAlias`, a shared
 writable view of the same file range (same page-cache pages as the read-only mapping). Real Flint
 Q4_1 (26 GB), 485/485 tensors imported, logits bit-identical to staging:
@@ -1093,24 +1093,35 @@ Why it needed a guard (the file is open for write while aliased; #1991 adds a SH
   coexist.
 - The decode cost above. It is the memory-for-throughput trade #508 described, now measured.
 
-### #1991: writable-alias import is the UMA default (Strix 8060S, 2026-11-25)
+### #1991: why the writable-alias import is NOT the default (Strix 8060S, 2026-11-25)
 
 Mapping access the driver accepts (re-confirmed by `VulkanHostImportMmapAccessModeTests`): read-only refused
-(`vkAllocateMemory` -1000072003); copy-on-write accepted but privatises every page (no saving, so not used);
-shared read-write accepted and in place. So the mapping is a shared writable view and "never written" rests on
-shaders binding weights read-only plus `VulkanWeightImportWriteGuardTests`, which hashes the file around an imported
-load + prefill + decode. A refused import is counted and logged (`[dotllm] vulkan host import: N tensors / X MiB refused`)
-before the staging fallback.
+(`vkAllocateMemory` -1000072003); copy-on-write accepted but privatises every page (no saving); shared read-write
+accepted and in place. `VulkanWeightImportWriteGuardTests` hashes the file around an imported load + prefill + decode.
+A refused import is counted and logged (`[dotllm] vulkan host import: N tensors / X MiB refused`) before the staging fallback.
 
-Same-session A/B (`bench -p 128 -n 64`, median of 3 reps, 2 runs per arm; "before" = `DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=0`):
+Penalty investigation, Llama-3.1-8B Q4_K_M, `bench -p 512 -n 64 -r 3`, same session, warm cache (decode tok/s / prefill tok/s):
 
-| model | staged MiB before -> after | device-local live MiB before -> after | load s | decode tok/s | pp tok/s |
-|---|---|---|---|---|---|
-| Llama-3.1-8B Q4_K_M | 4402 -> 0 (4684 aliased) | 6495 -> 2093 | 3.8 (warm) -> 2.7 | 38.0 -> 32.5 (-15%) | 969 -> 782 (-19%) |
-| Olala q8_0-safe2 | 6534 -> 0 (411 aliased) | 6651 -> 117 | 5.4-9.1 -> 3.1-10.8 (noisy) | 30.0 -> 29.0 (one run 20.9) | 302 -> 324 / 258 |
-| Qwen3.6-35B-A3B UD-Q4_K_M (MoE) | 2352 -> 515 (1837 aliased) | 22698 -> 20862 | 12.3 -> 9.0-27.8 | 48.3 -> 45.2 (-6%) | 767 -> 736 |
+| arm | host bytes copied | decode | prefill | verdict |
+|---|---|---|---|---|
+| staging (`..._WRITABLE=0`) | 4402 MiB | 37.1-38.2 | 831-939 | baseline |
+| writable alias, type 1 (default pick) | 0 | 30.2-30.8 (-19%) | 561-572 (-33%) | penalty |
+| alias, HOST_ALLOCATION handle, type 1 / type 3 (HOST_CACHED) | 0 | 30.5 / 30.6 | 549 / 585 | no change: memory type is not the lever |
+| alias, types 5, 7 / foreign type 5 | n/a | refused (mask for a file view is 0x2 foreign, 0xA alloc = types 1,3 only) | | |
+| anonymous copy imported, 64 KiB aligned (bounce, diagnostic) | 4684 MiB | 33.9 | 711 | partial recovery |
+| anonymous copy imported, 2 MiB aligned (bounce, diagnostic) | 4684 MiB | 37.2 | 833 | full recovery |
+| partial mirror: stage attention (736 MiB) / lm_head (411 MiB) | 736 / 411 | 31.1 / 31.3 | 558 / 566 | nothing recovered |
+| partial mirror: stage all FFN + embed/head (3666 MiB) | 3666 | 34.8-35.3 | 892-907 | recovers ~prefill, ~85% decode, at 83% of the staging bytes |
+| **DirectStorage (#1304)** | **0** (direct to device-local heap) | **37.6-37.8** | **935** | **neutral, load 2.5-4.7 s** |
 
-The decode cost on dense models is the file-page penalty described above; the MoE routed-expert banks still stage.
+Findings:
+- **Memory type**: a file-backed view is only importable into heap-0 types 1 (uncached) and 3 (HOST_CACHED); device-local types are not offered. Type 3 changes nothing.
+- **Page layout is the cause**: the same bytes in anonymous memory recover fully when 2 MiB aligned (and only partly at 64 KiB), so the cost is the physical fragmentation / small fragments of page-cache pages (GPU TLB), not the memory type or the driver path. File views cannot be large-page mapped (`SEC_LARGE_PAGES` is pagefile-backed only; the account also lacks SeLockMemoryPrivilege), so there is no zero-copy fix on this route.
+- **Hot-tensor mirror does not work**: the penalty follows bytes read, not a hot subset (attention and head mirrors recover nothing; recovery needs the FFN bytes, which is 83% of the model).
+- **DirectStorage is the zero-copy route that is neutral** on Llama (37.7 / 935 vs staging 37.7 / 838-939) and on Qwen3.6 (42.2-42.9 / 1112-1124 vs staging 41.9-44.1 / 1095-1100), where the alias gives 39.4-40.0 / 931-1017. On Olala (noisy, 25-29 decode) staging 28.7-28.9, DS 24.7-26.8, alias 20.9-26.0.
+- **MoE routed-expert banks (20.8 GiB on Qwen3.6) still stage**: `UploadRoutedBankResidentQuant` copies the fused `[E,M,K]` tensor byte-for-byte, so the bank is one contiguous range of the GGUF and is a valid candidate for `TryImport`/`DirectWeightStore.TryLoad` (whole bank, below the 2 GiB allocation cap). Not implemented.
+
+Recommendation: keep the alias opt-in; make DirectStorage the Windows UMA default when `dstorage.dll` is present (it needs the offer-to-fetch flow, release artifacts cannot embed it), and route the MoE banks through it.
 
 ### What the import actually buys, and costs
 
