@@ -241,7 +241,7 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
             throw new NotSupportedException("Olala Vulkan Mamba step supports rank <= 8, state <= 128, angles <= min(64, state/2).");
         if (o.NumSignalHeads + o.NumNoiseHeads != 4 * o.NumNoiseHeads)
             throw new NotSupportedException("Olala Vulkan attention supports 4 query heads per kv head (3 signal + 1 noise).");
-        // olala_moe_route keeps the token row and the scores in fixed shared arrays (sx[4096], sig/scored[1024], chosen[16]).
+        // olala_moe_route keeps the token row and the scores in fixed shared arrays (sx4[1024] = 4096 floats read as vec4, sig/scored[1024], chosen[16]).
         if (config.HiddenSize > 4096 || config.HiddenSize % 4 != 0 || o.ExpertCount > 1024 || o.ExpertUsedCount < 1 || o.ExpertUsedCount > 16 || o.ExpertUsedCount > o.ExpertCount)
             throw new NotSupportedException($"Olala Vulkan router supports hidden <= 4096 (a multiple of 4: the F32 router is read as vec4), experts <= 1024 and 1 <= top-k <= min(16, experts); got hidden {config.HiddenSize}, " +
                                             $"experts {o.ExpertCount}, top-k {o.ExpertUsedCount}.");
