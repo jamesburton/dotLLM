@@ -887,3 +887,5 @@ New issues filed by this study: #1134–#1146 (inventory), #1148–#1151 (Vulkan
 | Weight-format quality (CPU Q4_0/Q4_K_M were requantized from Q8_0) | activation comparisons are unaffected | — |
 | FP8 / MXFP4 compute | no FP8 hardware on any target device; FP8 storage offers nothing over q8_0 | — |
 | Disk ↔ device transfer paths (rule 3) | outside this study | — |
+
+**Sign-off 2026-11-25 (James, #1984, CUDA Olala):** the MoE router's per-token routing weights (top-6 renormalised sigmoid scores, 6 x F32 = 24 B per token) are stored as F32 between the fused router kernel and the expert-down kernel. Near-tied experts (margins ~1e-5) must not see BF16 rounding. Scope: that one buffer on CUDA Olala; all other inter-kernel activations stay BF16.
