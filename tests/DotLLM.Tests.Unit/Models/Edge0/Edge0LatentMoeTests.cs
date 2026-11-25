@@ -58,6 +58,89 @@ public sealed unsafe class Edge0LatentMoeTests
         }
     }
 
+    [Theory]
+    [InlineData(1)]    // one chunk
+    [InlineData(70)]   // two chunks (crosses the 64-token boundary)
+    public void Forward_SteadyState_AllocatesNothing_OnTheCallingThread(int tokens)
+    {
+        // #1972: the per-chunk scratch used to be a fresh helper object plus two Lists per chunk. Serial path (pool null) so the
+        // thread-local counter sees everything; a warmed second pass must not allocate a single byte.
+        using var syn = new SyntheticEdge0Pack();
+        using var pack = syn.Open();
+        var (router, x) = Inputs(tokens);
+        var y = new float[tokens * H];
+        for (int i = 0; i < 3; i++) Edge0LatentMoe.Forward(pack, 1, router, K, true, null, x, y, tokens);   // warm: JIT, ArrayPool buckets
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 5; i++) Edge0LatentMoe.Forward(pack, 1, router, K, true, null, x, y, tokens);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.True(allocated == 0, $"{allocated} bytes allocated over 5 steady-state calls ({tokens} tokens)");
+    }
+
+    /// <summary>Round-to-nearest-even F32 to BF16 bits, and the exact widening back (the router fixture is BF16-representable, so the oracle is exact).</summary>
+    private static ushort ToBf16(float v)
+    {
+        uint b = BitConverter.SingleToUInt32Bits(v);
+        return (ushort)((b + 0x7FFFu + ((b >> 16) & 1u)) >> 16);
+    }
+
+    private static float FromBf16(ushort h) => BitConverter.UInt32BitsToSingle((uint)h << 16);
+
+    /// <summary>A native BF16 copy of an F32 router (stands in for the mapped GGUF tensor) and its exact F32 widening for the oracle.</summary>
+    private sealed class Bf16Router : IDisposable
+    {
+        public nint Ptr { get; }
+        public float[] Widened { get; }
+        public Bf16Router(float[] f32)
+        {
+            Widened = new float[f32.Length];
+            Ptr = (nint)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)(f32.Length * 2), 64);
+            var dst = new Span<ushort>((void*)Ptr, f32.Length);
+            for (int i = 0; i < f32.Length; i++) { dst[i] = ToBf16(f32[i]); Widened[i] = FromBf16(dst[i]); }
+        }
+        public void Dispose() => System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)Ptr);
+    }
+
+    [Theory]
+    [InlineData(1, 1)]
+    [InlineData(5, 1)]
+    [InlineData(70, 4)]   // two chunks, pooled router logits (GemmBf16 with a pool)
+    public void Bf16Router_ReadInPlace_MatchesOracleAndTheWidenedF32Path(int tokens, int threads)
+    {
+        using var pool = threads > 1 ? new DotLLM.Cpu.Threading.ComputeThreadPool(threads) : null;
+        using var syn = new SyntheticEdge0Pack();
+        using var pack = syn.Open();
+        var (routerF32, x) = Inputs(tokens);
+        using var bf = new Bf16Router(routerF32);
+        var viaBf16 = new float[tokens * H]; var viaF32 = new float[tokens * H];
+        Array.Fill(viaBf16, float.NaN);
+        Edge0LatentMoe.ForwardBf16Router(pack, 1, bf.Ptr, K, true, null, x, viaBf16, tokens, pool);
+        Edge0LatentMoe.Forward(pack, 1, bf.Widened, K, true, null, x, viaF32, tokens, pool);
+        // the oracle sees exactly the BF16 values (rounding of the fixture is not part of what is under test)
+        for (int t = 0; t < Math.Min(tokens, 6); t++)
+        {
+            var want = Edge0LatentMoeReference.Routed(pack, 1, bf.Widened, K, x[(t * H)..((t + 1) * H)],
+                syn.Labels[pack.Experts..(2 * pack.Experts)], syn.Scales[1], out _, out _);
+            Assert.True(RelL2(viaBf16[(t * H)..((t + 1) * H)], want) < 0.05, $"token {t}: BF16 router output differs from the oracle");
+        }
+        // Same routing decisions, so the same output up to the GEMM tile order of the logits: far tighter than the oracle bound.
+        Assert.True(RelL2(viaBf16, viaF32) < 1e-3, $"BF16-in-place vs widened F32 router: rel L2 {RelL2(viaBf16, viaF32):E3}");
+    }
+
+    [Fact]
+    public void Bf16Router_SteadyState_AllocatesNothing()
+    {
+        // The in-place read means no widened [experts][hidden] copy per call (here 16 x 64 x 4 B; on the real model 5.2 MB per layer).
+        using var syn = new SyntheticEdge0Pack();
+        using var pack = syn.Open();
+        var (routerF32, x) = Inputs(3);
+        using var bf = new Bf16Router(routerF32);
+        var y = new float[3 * H];
+        for (int i = 0; i < 3; i++) Edge0LatentMoe.ForwardBf16Router(pack, 0, bf.Ptr, K, true, null, x, y, 3);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 5; i++) Edge0LatentMoe.ForwardBf16Router(pack, 0, bf.Ptr, K, true, null, x, y, 3);
+        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+    }
+
     [Fact]
     public void Forward_IsChunkAndBatchInvariant()
     {

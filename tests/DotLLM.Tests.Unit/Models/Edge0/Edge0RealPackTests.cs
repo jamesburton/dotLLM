@@ -23,6 +23,14 @@ public sealed class Edge0RealPackTests(ITestOutputHelper output)
 
     private static double Rms(float[] v) => Math.Sqrt(v.Sum(x => (double)x * x) / v.Length);
 
+    /// <summary>Per layer: experts per D/U group and the first experts' labels, from the raw <c>labels.bin</c> (int32 LE [48][512]) of Edge0-145B-q3k.</summary>
+    private static readonly Dictionary<int, (int[] Hist, int[] Head)> ExpectedLabels = new()
+    {
+        [0] = ([25, 165, 33, 53, 25, 46, 67, 98], [1, 0, 1, 4, 2, 5, 1, 1, 1, 1, 1, 5, 1, 3, 1, 1]),
+        [23] = ([64, 64, 64, 64, 64, 64, 64, 64], [0, 0, 0, 0, 0, 0, 0, 0]),   // contiguous blocks of 64: label = expert / 64
+        [47] = ([84, 126, 23, 43, 24, 125, 33, 54], [1, 2, 6, 1, 1, 2, 5, 2]),
+    };
+
     [SkippableFact]
     public void RealPack_GeometryLabelsAndWeightsAreSane()
     {
@@ -43,7 +51,13 @@ public sealed class Edge0RealPackTests(ITestOutputHelper output)
             var hist = new int[8];
             foreach (int g in pack.Labels(l)) hist[g]++;
             output.WriteLine($"layer {l} experts per group: [{string.Join(", ", hist)}]");
-            Assert.Equal(512, hist.Sum());
+            // The old check here (hist.Sum() == 512) is a tautology: Open already refuses any label outside 0..7, so every expert is
+            // counted exactly once whatever the reader returns (a wrong layer offset, a wrong stride...). These are the exact histograms
+            // and leading labels read from the raw labels.bin by a separate Python script (struct.unpack of the file, no dotLLM code).
+            var (wantHist, wantHead) = ExpectedLabels[l];
+            Assert.Equal(wantHist, hist);
+            Assert.Equal(wantHead, pack.Labels(l)[..wantHead.Length].ToArray());
+            if (l == 23) for (int e = 0; e < 512; e++) Assert.Equal(e / 64, pack.Labels(l)[e]);
             var inv = pack.InverseColumnScale(l);
             output.WriteLine($"layer {l} 1/s: min {inv.ToArray().Min():G4} max {inv.ToArray().Max():G4}");
             Assert.All(inv.ToArray(), v => Assert.True(float.IsFinite(v) && v > 0));
