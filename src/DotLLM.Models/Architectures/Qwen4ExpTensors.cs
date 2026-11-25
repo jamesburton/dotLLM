@@ -227,7 +227,8 @@ public static class Qwen4ExpTensors
             yield return new Expected(Block(il, Suffix.FfnGateExps), [embd, ffExp, experts]);
             yield return new Expected(Block(il, Suffix.FfnUpExps), [embd, ffExp, experts]);
         }
-        yield return new Expected(Block(il, Suffix.FfnGateInpShexp), [embd]);
+        // the Edge0 skeleton writes the shared-expert sigmoid gate as [embd, 1] (same bytes as the stock [embd])
+        yield return new Expected(Block(il, Suffix.FfnGateInpShexp), skeleton ? [embd, 1] : [embd]);
         yield return new Expected(Block(il, Suffix.FfnGateShexp), [embd, ffShared]);
         yield return new Expected(Block(il, Suffix.FfnUpShexp), [embd, ffShared]);
         yield return new Expected(Block(il, Suffix.FfnDownShexp), [ffShared, embd]);
