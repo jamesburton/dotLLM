@@ -14,7 +14,10 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 // #2001: the F32 state column of lane p lives in REGISTERS for the whole chunk (loaded once, stored once) instead of being read-modify-written in
 // global memory on every token. N and R are specialization constants so the n / r loops unroll (no dynamically indexed private arrays).
-// Requires P <= 64 (one lane per p; checked by the loader). The arithmetic and its order are unchanged, so results are bit-identical.
+// Requires P <= 64 (one lane per p; checked by the loader). The source arithmetic and its order are unchanged, but the result is NOT bit-identical
+// to the per-token global form (measured, #2002/#2003 review: F32-act control vs the old shader KL <= 6e-6 on the real capital/code cases, quality
+// vs HF unchanged; most likely different FMA contraction once the loops unroll, not attributed). At N = 128, R = 4 the driver uses all 256 VGPRs
+// and spills 128-144 B per lane to scratch (VK_AMD_shader_info, gfx1151), so part of the column still round-trips memory; N = 16 does not spill.
 layout(constant_id = 0) const uint N_C = 128u;
 layout(constant_id = 1) const uint R_C = 4u;
 
