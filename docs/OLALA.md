@@ -1,6 +1,6 @@
 # Olala (OVHcloud) — architecture notes
 
-**Status:** CPU reference forward (issue #1970, epic #1969). Vulkan and CUDA refuse the architecture explicitly until their ports land.
+**Status:** CPU reference forward (issue #1970, epic #1969). CUDA runs it (section 8); Vulkan refuses until its port lands.
 Models: `OVHaiLLM/Olala-v1.0-mini-7A1B` (HF `model_type: olala`, `OlalaForCausalLM`, custom code) and the later translate / summarise / SFT /
 base variants that share the arch. GGUF: `OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF` (`general.architecture = olala`).
 
@@ -227,3 +227,29 @@ window) / `olala_attn_combine`. Limits (validated at load): N <= 128, P <= 64, R
 
 **Known gaps.** Weight upload is `cuMemcpyHtoD` from the mmap (the same route as the other CUDA loaders; CLAUDE.md rule 3 direct route not added). No CUDA graph, no
 factored TPA cache, no per-sequence state / prefix cache (single model-owned sequence, like the CPU model), `--gpu-layers` cannot split this architecture.
+
+### 8.1 Measured on the RTX 3060 (framework, 2026-11-25, PCIe x4)
+
+**Tiny HF oracle** (CUDA BF16 activations): worst KL vs HF 1.2e-5 (`tiny`) / 1.3e-5 (`tiny-hfbf16`), worst |dlogit| 1.7e-2, top-1 11/12 rows (the miss is a near tie), greedy identical over 10 tokens; vs the in-process CPU: prefill KL 1.2e-5, teacher-forced decode KL 1.5e-5, 9/9 top-1. Chunked prefill (chunk 1 / 3 / 5) is bit-identical to one shot.
+
+**F32-activation control arm** (`olala_f32act.ptx`, internal measurement control, never the default): same kernels with F32 stored activations (K/V still rounded to BF16, as the CPU does) vs the CPU: worst KL 3.5e-14, worst |dlogit| 9e-7. This is the float-rounding floor of the kernel logic and the reference for what BF16 storage costs on the tiny model (KL ~1e-5, 5 orders above it).
+
+**Real q8_0-safe2 vs the CPU forward** on the CPU PR's prompts (BF16 activations on CUDA, F32 on CPU):
+
+| prompt | prefill median KL / top-1 | teacher-forced decode median KL / top-1 | free-running greedy (24 tokens) |
+|---|---|---|---|
+| capital (5) | 5.9e-4 / 5 of 5 | 1.5e-3 / 22 of 23 | first divergence at token 4 |
+| code (13) | 4.8e-4 / 13 of 13 | 2.8e-5 / 23 of 23 | identical |
+| chat (300) | 2.2e-2 / 262 of 300 | 5.6e-4 / 23 of 23 | identical |
+
+The chat prompt is numerically chaotic even for HF (see 5.1); the CPU F32 path has 294 of 300 top-1 against HF there, the BF16-activation CUDA path 262 of 300 against the CPU. These two gaps (capital greedy divergence, chat prefill top-1) are the measured cost of BF16 activation storage: input for the F32-activation sign-off decision.
+
+**Throughput** (RTX 3060, PCIe x4, 300-token chat prompt, 5 repetitions after warm-up, unoptimised kernels, one logits D2H per step; framework is a shared box, treat as ranges): prefill 297-298 tok/s, decode 44.4-47.7 tok/s.
+
+### 8.2 Mutation record (CUDA tiny oracle, `CudaOlalaParityTests`)
+BF16 arm, tightened gates (KL < 5e-5, |dlogit| < 4e-2): **17 of 19 mutants killed.** Killed: trapezoid K carry dropped, trapezoid V carry dropped, angle not accumulated, window off by one,
+signal/noise heads swapped, router top-k without `exp_probs_b`, probabilities not renormalised, ReLU instead of ReLU^2, geodesic divisor `layer` instead of `layer + 1`, token-shift carry dropped,
+kv head `h % nk`, gate bias dropped, TPA not divided by rank, embedding not L2-normalised, scale `1/sqrt(d)`, soft cap removed (KL 4.7e-3), token shift not masked at position 0 on V (KL 2.6e-3).
+Survivors in the BF16 arm: (1) token shift not masked at position 0 on **K**: not equivalent (the K RMSNorm cancels the uniform scale only up to its eps), but its effect (KL 1.4e-8) is far below BF16 noise; the F32 control arm kills it (KL 1.35e-8 against the 1e-11 gate).
+(2) SSM state rounded to BF16 every step: below the tolerance on a 12-token sequence, the documented #1971 evidence gap.
+F32 control arm (gates KL < 1e-11, |dlogit| < 1e-5): the first five mutants run (trapezoid K carry, angle, V-side and K-side token-shift mask, soft cap) were all killed; the run was cut short when framework rebooted (see the PR), the rest of the control-arm set is not yet recorded.
