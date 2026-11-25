@@ -1095,10 +1095,10 @@ Why it is opt-in (#1991 adds a SHA-256 write guard test, `VulkanWeightImportWrit
 
 ### #1991: why the writable-alias import is NOT the default (Strix 8060S, 2026-11-25)
 
-Mapping access the driver accepts (re-confirmed by `VulkanHostImportMmapAccessModeTests`): read-only refused
+Mapping access the driver accepts (re-confirmed in the output of `VulkanHostImportMmapAccessModeTests`, which prints these verdicts but does not assert them): read-only refused
 (`vkAllocateMemory` -1000072003); copy-on-write accepted but privatises every page (no saving); shared read-write
 accepted and in place. `VulkanWeightImportWriteGuardTests` hashes the file around an imported load + prefill + decode.
-A refused import is counted and logged (`[dotllm] vulkan host import: N tensors / X MiB refused`) before the staging fallback.
+A refused import on an integrated device is counted and logged once per load, when the load's last staging buffer closes (`[dotllm] vulkan host import: N tensors / X MiB refused`); a discrete GPU's by-design #507 refusal is not counted.
 
 Penalty investigation, Llama-3.1-8B Q4_K_M, `bench -p 512 -n 64 -r 3`, same session, warm cache (decode tok/s / prefill tok/s):
 
@@ -1111,14 +1111,14 @@ Penalty investigation, Llama-3.1-8B Q4_K_M, `bench -p 512 -n 64 -r 3`, same sess
 | anonymous copy imported, 64 KiB aligned (bounce, diagnostic) | 4684 MiB | 33.9 | 711 | partial recovery |
 | anonymous copy imported, 2 MiB aligned (bounce, diagnostic) | 4684 MiB | 37.2 | 833 | full recovery |
 | partial mirror: stage attention (736 MiB) / lm_head (411 MiB) | 736 / 411 | 31.1 / 31.3 | 558 / 566 | nothing recovered |
-| partial mirror: stage all FFN + embed/head (3666 MiB) | 3666 | 34.8-35.3 | 892-907 | recovers ~prefill, ~85% decode, at 83% of the staging bytes |
+| partial mirror: stage all FFN + embed/head (3666 MiB) | 3666 | 34.8-35.3 | 892-907 | recovers ~prefill; decode reaches ~93% of staging (~63% of the penalty), at 83% of the staging bytes |
 | **DirectStorage (#1304)** | **0** (direct to device-local heap) | **37.6-37.8** | **935** | **neutral, load 2.5-4.7 s** |
 
 Findings:
 - **Memory type**: a file-backed view is only importable into heap-0 types 1 (uncached) and 3 (HOST_CACHED); device-local types are not offered. Type 3 changes nothing.
 - **Page layout is the cause**: the same bytes in anonymous memory recover fully when 2 MiB aligned (and only partly at 64 KiB), so the cost is the physical fragmentation / small fragments of page-cache pages (GPU TLB), not the memory type or the driver path. File views cannot be large-page mapped (`SEC_LARGE_PAGES` is pagefile-backed only; the account also lacks SeLockMemoryPrivilege), so there is no zero-copy fix on this route.
 - **Hot-tensor mirror does not work**: the penalty follows bytes read, not a hot subset (attention and head mirrors recover nothing; recovery needs the FFN bytes, which is 83% of the model).
-- **DirectStorage is the zero-copy route that is neutral** on Llama (37.7 / 935 vs staging 37.7 / 838-939) and on Qwen3.6 (42.2-42.9 / 1112-1124 vs staging 41.9-44.1 / 1095-1100), where the alias gives 39.4-40.0 / 931-1017. On Olala (noisy, 25-29 decode) staging 28.7-28.9, DS 24.7-26.8, alias 20.9-26.0.
+- **DirectStorage is the zero-copy route that is neutral** on Llama (37.7 / 935 vs staging 37.1-38.2 / 831-939) and on Qwen3.6 (42.2-42.9 / 1112-1124 vs staging 41.9-44.1 / 1095-1100), where the alias gives 39.4-40.0 / 931-1017. On Olala (noisy, 25-29 decode) staging 28.7-28.9, DS 24.7-26.8, alias 20.9-26.0: DS is **not** shown neutral there (below staging on every run). The Qwen3.6 and Olala figures have no table rows.
 - **MoE routed-expert banks (20.8 GiB on Qwen3.6) still stage**: `UploadRoutedBankResidentQuant` copies the fused `[E,M,K]` tensor byte-for-byte, so the bank is one contiguous range of the GGUF and is a valid candidate for `TryImport`/`DirectWeightStore.TryLoad` (whole bank, below the 2 GiB allocation cap). Not implemented.
 
 Recommendation: keep the alias opt-in; make DirectStorage the Windows UMA default when `dstorage.dll` is present (it needs the offer-to-fetch flow, release artifacts cannot embed it), and route the MoE banks through it.
