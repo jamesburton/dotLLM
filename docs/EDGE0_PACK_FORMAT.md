@@ -108,8 +108,9 @@ The group count is derived from the file size; `model.json` selects Q8 (`STRATA_
   the blob tails). The Q3_K build has no per-expert scales.
 - `model-skeleton.gguf`: 1079 tensors, standard `qwen4exp` names (`blk.N.hc_*`, `attn_*`, `ssm_*`, `ffn_gate_inp`, `ffn_*_shexp`, `indexer.*`, `ple_*` on layer 1, `output_hc_*`);
   no `ffn_*_exps`, no D/U, no PLE table.
-- `ple-fp8.gguf`: single tensor `per_layer_token_embd.weight`, GGUF type I8 (24), shape `[160, 320001536]`, bytes are FP8 E4M3FN, value = `e4m3fn(byte) * strata.ple.scale`
-  (NaN encodings 0x7F/0xFF read as 0). Not handled by this reader (G4).
+- `ple-fp8.gguf`: single tensor `per_layer_token_embd.weight`, GGUF type I8 (24), shape `[160, 320001536]`, metadata `general.architecture = strata-ple`, `strata.ple.format = f8_e4m3`,
+  `strata.ple.scale = 0.00019931793` (F32). The bytes are FP8 **E4M3FN** (Qwen's `F8_E4M3` shards copied verbatim by `tools/ple_fp8_pack.py`), value = `e4m3fn(byte) * scale`
+  (NaN encodings 0x7F/0xFF read as 0). **[file][src][test]** Decoded by `PleRowCodec` (G4, #1974), see `docs/QWEN4EXP_PLE_TABLE.md`.
 - `profile.bin`: `"STRP"`, `<5I version n_layers n_expert slots n_ranked>`, `n_ranked x <HH layer expert>`, then `int32 [48][512]` rank or -1. Not used here.
 - `mtp/`: full-width Q2_0 draft experts, not latent. Not handled (G6).
 
