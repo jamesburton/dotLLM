@@ -119,10 +119,17 @@ public sealed unsafe class Edge0Pack : IDisposable
 
         // ── native_experts.txt: "layer gu_type d_type offset blob_bytes" per layer ──
         var rows = new List<(int Layer, int Gu, int D, long Offset, long Bytes)>();
+        bool manifestNamesColscale = false;
         foreach (string raw in File.ReadLines(manifest))
         {
             string line = raw.Trim();
-            if (line.Length == 0 || line[0] == '#') continue;
+            if (line.Length == 0) continue;
+            if (line[0] == '#')
+            {
+                // The header ("... latent A-only, Q3_K gu + shared colscale ...") says the gate/up rows were stored as A*diag(s).
+                manifestNamesColscale |= line.Contains("colscale", StringComparison.OrdinalIgnoreCase);
+                continue;
+            }
             string[] p = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
             if (p.Length < 5) throw new InvalidDataException($"native_experts.txt: malformed row '{line}'");
             rows.Add((int.Parse(p[0], CultureInfo.InvariantCulture), int.Parse(p[1], CultureInfo.InvariantCulture),
@@ -140,6 +147,12 @@ public sealed unsafe class Edge0Pack : IDisposable
         // ── latent width: scales vector length, else derived from the record size ──
         string scalesDir = Path.Combine(directory, "scales");
         bool hasScales = File.Exists(Path.Combine(scalesDir, "l0.f32"));
+        // Decided by the manifest, not by what happens to be on disk: a pack whose manifest names the column scale but whose scales/ is
+        // absent (a partial download, a skipped folder) would otherwise load as an unscaled pack and run silently wrong (#1972).
+        if (manifestNamesColscale && !hasScales)
+            throw new InvalidDataException(
+                $"native_experts.txt names a shared column scale (gate/up rows are stored as A*diag(s)) but {Path.Combine(scalesDir, "l0.f32")} is missing: " +
+                "download the scales/ folder of the pack (a pack without it would run unscaled and produce wrong output).");
         int latent;
         if (hasScales) latent = checked((int)(LengthOf(Path.Combine(scalesDir, "l0.f32")) / sizeof(float)));
         else latent = SolveLatent(recBytes, expertFf);

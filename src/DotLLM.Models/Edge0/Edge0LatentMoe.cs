@@ -35,7 +35,7 @@ public static unsafe class Edge0LatentMoe
     private const int ChunkTokens = 64;
 
     /// <summary>
-    /// Runs the MoE half of <paramref name="layer"/> for <paramref name="tokens"/> rows.
+    /// Runs the MoE half of <paramref name="layer"/> for <paramref name="tokens"/> rows with an F32 router.
     /// </summary>
     /// <param name="pack">The opened pack.</param>
     /// <param name="layer">Layer index.</param>
@@ -51,106 +51,135 @@ public static unsafe class Edge0LatentMoe
         in SharedExpert? shared, ReadOnlySpan<float> x, Span<float> y, int tokens, ComputeThreadPool? pool = null)
     {
         ArgumentNullException.ThrowIfNull(pack);
+        if (router.Length < (long)pack.Experts * pack.Hidden) throw new ArgumentException("router too small.", nameof(router));
+        ForwardCore(pack, layer, router, 0, topK, normTopKProb, in shared, x, y, tokens, pool);
+    }
+
+    /// <summary>
+    /// Runs the MoE half of <paramref name="layer"/> with the router (<c>ffn_gate_inp.weight</c>, BF16 in the skeleton GGUF) read in place:
+    /// no F32 copy of the <c>[experts][hidden]</c> matrix is made.
+    /// </summary>
+    /// <param name="pack">The opened pack.</param>
+    /// <param name="layer">Layer index.</param>
+    /// <param name="routerBf16">Pointer to the BF16 router matrix <c>[experts][hidden]</c> (a mapped GGUF tensor).</param>
+    /// <param name="topK">Experts per token (10).</param>
+    /// <param name="normTopKProb">Renormalise the top-k probabilities (true for Edge0).</param>
+    /// <param name="shared">Shared expert, or null to skip it.</param>
+    /// <param name="x">Input <c>[tokens][hidden]</c>.</param>
+    /// <param name="y">Output <c>[tokens][hidden]</c>, fully overwritten.</param>
+    /// <param name="tokens">Row count.</param>
+    /// <param name="pool">Optional thread pool (router logits, D/U, expert GEMMs).</param>
+    public static void ForwardBf16Router(Edge0Pack pack, int layer, nint routerBf16, int topK, bool normTopKProb,
+        in SharedExpert? shared, ReadOnlySpan<float> x, Span<float> y, int tokens, ComputeThreadPool? pool = null)
+    {
+        ArgumentNullException.ThrowIfNull(pack);
+        if (routerBf16 == 0) throw new ArgumentNullException(nameof(routerBf16));
+        ForwardCore(pack, layer, default, routerBf16, topK, normTopKProb, in shared, x, y, tokens, pool);
+    }
+
+    private static void ForwardCore(Edge0Pack pack, int layer, ReadOnlySpan<float> routerF32, nint routerBf16, int topK, bool normTopKProb,
+        in SharedExpert? shared, ReadOnlySpan<float> x, Span<float> y, int tokens, ComputeThreadPool? pool)
+    {
         int H = pack.Hidden;
         if (x.Length < (long)tokens * H) throw new ArgumentException("x too small.", nameof(x));
         if (y.Length < (long)tokens * H) throw new ArgumentException("y too small.", nameof(y));
-        if (router.Length < (long)pack.Experts * H) throw new ArgumentException("router too small.", nameof(router));
-        for (int t0 = 0; t0 < tokens; t0 += ChunkTokens)
-        {
-            int tc = Math.Min(ChunkTokens, tokens - t0);
-            ForwardChunk(pack, layer, router, topK, normTopKProb, x.Slice(t0 * H, tc * H), y.Slice(t0 * H, tc * H), tc, pool);
-            if (shared is { } sh) AddShared(sh, H, x.Slice(t0 * H, tc * H), y.Slice(t0 * H, tc * H), tc, pool);
-        }
-    }
-
-    private static void ForwardChunk(Edge0Pack pack, int layer, ReadOnlySpan<float> router, int k, bool norm,
-        ReadOnlySpan<float> x, Span<float> y, int T, ComputeThreadPool? pool)
-    {
-        int H = pack.Hidden, L = pack.Latent, G = pack.Groups, E = pack.Experts, V = T * k;
-        var rent = new Rented();
+        if (tokens <= 0) return;
+        var scratch = new Scratch(pack, topK, Math.Min(ChunkTokens, tokens));
         try
         {
-            int[] assignExpert = rent.Ints(V), cursors = rent.Ints(E + 1), bucketTokens = rent.Ints(V), bucketSlots = rent.Ints(V),
-                unique = rent.Ints(Math.Min(E, V) + 1);
-            float[] assignWeight = rent.Floats(V);
-            MoeSwiGluMlp.Route(x, router, assignExpert, assignWeight, cursors, bucketTokens, bucketSlots, unique, E, k, H, T, norm);
-
-            // Which groups does this chunk touch? Only those D/U are applied.
-            ReadOnlySpan<int> labels = pack.Labels(layer);
-            Span<int> slotOf = stackalloc int[G];
-            slotOf.Fill(-1);
-            int used = 0;
-            for (int v = 0; v < V; v++)
+            for (int t0 = 0; t0 < tokens; t0 += ChunkTokens)
             {
-                int g = labels[assignExpert[v]];
-                if (slotOf[g] < 0) slotOf[g] = used++;
-            }
-
-            // ── D, then the column scale: xl[g][t] = (D_g x_t) * (1/s), one T x L slab per used group ──
-            float[] xlBuf = rent.Floats(used * T * L);
-            ReadOnlySpan<float> inv = pack.InverseColumnScale(layer);
-            for (int g = 0; g < G; g++)
-            {
-                if (slotOf[g] < 0) continue;
-                Span<float> slab = xlBuf.AsSpan(slotOf[g] * T * L, T * L);
-                fixed (float* xp = x) fixed (float* op = slab)
-                    GemmLatentDense(pack.D(layer, g), pack.LatentDenseType, xp, op, L, H, T, pool);
-                if (!inv.IsEmpty)
-                    for (int t = 0; t < T; t++)
-                        TensorPrimitives.Multiply(slab.Slice(t * L, L), inv, slab.Slice(t * L, L));
-            }
-
-            // ── virtual tokens: one (token, expert) pair per row, k' = 1; hidden' row = that expert's group latent ──
-            float[] hidden = rent.Floats(V * L), yv = rent.Floats(V * L);
-            int[] vCursors = rent.Ints(E + 1), vTokens = rent.Ints(V), vSlots = rent.Ints(V), vUnique = rent.Ints(Math.Min(E, V) + 1);
-            Array.Clear(vCursors, 0, E + 1);
-            for (int v = 0; v < V; v++)
-            {
-                int e = assignExpert[v], g = labels[e], t = v / k;
-                xlBuf.AsSpan((slotOf[g] * T + t) * L, L).CopyTo(hidden.AsSpan(v * L, L));
-                vCursors[e]++;
-            }
-            int run = 0;
-            for (int e = 0; e <= E; e++) { int c = vCursors[e]; vCursors[e] = run; run += c; }
-            Span<int> wr = E <= 1024 ? stackalloc int[E] : new int[E];
-            for (int e = 0; e < E; e++) wr[e] = vCursors[e];
-            for (int v = 0; v < V; v++) { int pos = wr[assignExpert[v]]++; vTokens[pos] = v; vSlots[pos] = 0; }
-            int uc = 0;
-            for (int e = 0; e < E; e++) if (vCursors[e + 1] > vCursors[e]) vUnique[uc++] = e;
-
-            long stride = pack.ExpertRecordBytes;
-            MoeSwiGluMlp.ExecuteRoutedFromAssignments(
-                hidden.AsSpan(0, V * L),
-                pack.GateBank(layer), pack.GateUpType, stride, ReadOnlySpan<nint>.Empty,
-                pack.UpBank(layer), pack.GateUpType, stride, ReadOnlySpan<nint>.Empty,
-                pack.DownBank(layer), pack.DownType, stride, ReadOnlySpan<nint>.Empty,
-                assignExpert.AsSpan(0, V), assignWeight.AsSpan(0, V), vCursors, vTokens, vSlots, vUnique, uc,
-                yv.AsSpan(0, V * L),
-                E, 1, L, pack.ExpertFf, V,
-                ReadOnlySpan<nint>.Empty, ReadOnlySpan<nint>.Empty, ReadOnlySpan<nint>.Empty, 0, ReadOnlySpan<float>.Empty,
-                loraAdapter: null, loraLayer: layer, threadPool: pool, packedLegacyExperts: true);
-
-            // ── z[g][t] = Σ_{j in group g} w_j · down_j h_j (the weight was applied by the kernel); out = Σ_g U_g z_g ──
-            y.Slice(0, T * H).Clear();
-            float[] tmp = rent.Floats(T * H);
-            for (int g = 0; g < G; g++)
-            {
-                if (slotOf[g] < 0) continue;
-                float[] z = rent.Floats(T * L);
-                Array.Clear(z, 0, T * L);
-                for (int t = 0; t < T; t++)
-                    for (int j = 0; j < k; j++)
-                    {
-                        int v = t * k + j;
-                        if (labels[assignExpert[v]] != g) continue;
-                        TensorPrimitives.Add(z.AsSpan(t * L, L), yv.AsSpan(v * L, L), z.AsSpan(t * L, L));
-                    }
-                fixed (float* zp = z) fixed (float* tp = tmp)
-                    GemmLatentDense(pack.U(layer, g), pack.LatentDenseType, zp, tp, H, L, T, pool);
-                TensorPrimitives.Add(y.Slice(0, T * H), tmp.AsSpan(0, T * H), y.Slice(0, T * H));
+                int tc = Math.Min(ChunkTokens, tokens - t0);
+                ForwardChunk(pack, layer, routerF32, routerBf16, topK, normTopKProb, ref scratch, x.Slice(t0 * H, tc * H), y.Slice(t0 * H, tc * H), tc, pool);
+                if (shared is { } sh) AddShared(sh, H, x.Slice(t0 * H, tc * H), y.Slice(t0 * H, tc * H), tc, pool);
             }
         }
-        finally { rent.Dispose(); }
+        finally { scratch.Dispose(); }
+    }
+
+    private static void ForwardChunk(Edge0Pack pack, int layer, ReadOnlySpan<float> routerF32, nint routerBf16, int k, bool norm,
+        ref Scratch s, ReadOnlySpan<float> x, Span<float> y, int T, ComputeThreadPool? pool)
+    {
+        int H = pack.Hidden, L = pack.Latent, G = pack.Groups, E = pack.Experts, V = T * k;
+        Span<int> assignExpert = s.AssignExpert.AsSpan(0, V), cursors = s.Cursors.AsSpan(0, E + 1), bucketTokens = s.BucketTokens.AsSpan(0, V),
+            bucketSlots = s.BucketSlots.AsSpan(0, V), unique = s.UniqueBuf.AsSpan(0, s.UniqueLen);
+        Span<float> assignWeight = s.AssignWeight.AsSpan(0, V);
+        MoeSwiGluMlp.Route(x, routerF32, assignExpert, assignWeight, cursors, bucketTokens, bucketSlots, unique, E, k, H, T, norm,
+            pool: pool, gateWeightsBf16: routerBf16);
+
+        // Which groups does this chunk touch? Only those D/U are applied.
+        ReadOnlySpan<int> labels = pack.Labels(layer);
+        Span<int> slotOf = stackalloc int[G];
+        slotOf.Fill(-1);
+        int used = 0;
+        for (int v = 0; v < V; v++)
+        {
+            int g = labels[assignExpert[v]];
+            if (slotOf[g] < 0) slotOf[g] = used++;
+        }
+
+        // ── D, then the column scale: xl[g][t] = (D_g x_t) * (1/s), one T x L slab per used group ──
+        float[] xlBuf = s.Xl;
+        ReadOnlySpan<float> inv = pack.InverseColumnScale(layer);
+        for (int g = 0; g < G; g++)
+        {
+            if (slotOf[g] < 0) continue;
+            Span<float> slab = xlBuf.AsSpan(slotOf[g] * T * L, T * L);
+            fixed (float* xp = x) fixed (float* op = slab)
+                GemmLatentDense(pack.D(layer, g), pack.LatentDenseType, xp, op, L, H, T, pool);
+            if (!inv.IsEmpty)
+                for (int t = 0; t < T; t++)
+                    TensorPrimitives.Multiply(slab.Slice(t * L, L), inv, slab.Slice(t * L, L));
+        }
+
+        // ── virtual tokens: one (token, expert) pair per row, k' = 1; hidden' row = that expert's group latent ──
+        float[] hidden = s.Hidden, yv = s.Yv;
+        int[] vCursors = s.VCursors, vTokens = s.VTokens, vSlots = s.VSlots, vUnique = s.VUniqueBuf;
+        Array.Clear(vCursors, 0, E + 1);
+        for (int v = 0; v < V; v++)
+        {
+            int e = assignExpert[v], g = labels[e], t = v / k;
+            xlBuf.AsSpan((slotOf[g] * T + t) * L, L).CopyTo(hidden.AsSpan(v * L, L));
+            vCursors[e]++;
+        }
+        int run = 0;
+        for (int e = 0; e <= E; e++) { int c = vCursors[e]; vCursors[e] = run; run += c; }
+        Span<int> wr = s.Wr.AsSpan(0, E);
+        for (int e = 0; e < E; e++) wr[e] = vCursors[e];
+        for (int v = 0; v < V; v++) { int pos = wr[assignExpert[v]]++; vTokens[pos] = v; vSlots[pos] = 0; }
+        int uc = 0;
+        for (int e = 0; e < E; e++) if (vCursors[e + 1] > vCursors[e]) vUnique[uc++] = e;
+
+        long stride = pack.ExpertRecordBytes;
+        MoeSwiGluMlp.ExecuteRoutedFromAssignments(
+            hidden.AsSpan(0, V * L),
+            pack.GateBank(layer), pack.GateUpType, stride, ReadOnlySpan<nint>.Empty,
+            pack.UpBank(layer), pack.GateUpType, stride, ReadOnlySpan<nint>.Empty,
+            pack.DownBank(layer), pack.DownType, stride, ReadOnlySpan<nint>.Empty,
+            assignExpert, assignWeight, vCursors, vTokens, vSlots, vUnique, uc,
+            yv.AsSpan(0, V * L),
+            E, 1, L, pack.ExpertFf, V,
+            ReadOnlySpan<nint>.Empty, ReadOnlySpan<nint>.Empty, ReadOnlySpan<nint>.Empty, 0, ReadOnlySpan<float>.Empty,
+            loraAdapter: null, loraLayer: layer, threadPool: pool, packedLegacyExperts: true);
+
+        // ── z[g][t] = Σ_{j in group g} w_j · down_j h_j (the weight was applied by the kernel); out = Σ_g U_g z_g ──
+        y.Slice(0, T * H).Clear();
+        float[] tmp = s.Tmp, z = s.Z;
+        for (int g = 0; g < G; g++)
+        {
+            if (slotOf[g] < 0) continue;
+            Array.Clear(z, 0, T * L);
+            for (int t = 0; t < T; t++)
+                for (int j = 0; j < k; j++)
+                {
+                    int v = t * k + j;
+                    if (labels[assignExpert[v]] != g) continue;
+                    TensorPrimitives.Add(z.AsSpan(t * L, L), yv.AsSpan(v * L, L), z.AsSpan(t * L, L));
+                }
+            fixed (float* zp = z) fixed (float* tp = tmp)
+                GemmLatentDense(pack.U(layer, g), pack.LatentDenseType, zp, tp, H, L, T, pool);
+            TensorPrimitives.Add(y.Slice(0, T * H), tmp.AsSpan(0, T * H), y.Slice(0, T * H));
+        }
     }
 
     private static void AddShared(in SharedExpert s, int H, ReadOnlySpan<float> x, Span<float> y, int T, ComputeThreadPool? pool)
@@ -197,16 +226,40 @@ public static unsafe class Edge0LatentMoe
         }
     }
 
-    private sealed class Rented : IDisposable
+    /// <summary>
+    /// Pooled per-call scratch (one rental per call, sized for the largest chunk and reused by every chunk). A struct of fixed fields, so the
+    /// steady state allocates nothing: no helper object and no lists.
+    /// </summary>
+    private struct Scratch : IDisposable
     {
-        private readonly List<int[]> _i = [];
-        private readonly List<float[]> _f = [];
-        public int[] Ints(int n) { var a = ArrayPool<int>.Shared.Rent(Math.Max(n, 1)); _i.Add(a); return a; }
-        public float[] Floats(int n) { var a = ArrayPool<float>.Shared.Rent(Math.Max(n, 1)); _f.Add(a); return a; }
-        public void Dispose()
+        public int[] AssignExpert, Cursors, BucketTokens, BucketSlots, UniqueBuf, VCursors, VTokens, VSlots, VUniqueBuf, Wr;
+        public float[] AssignWeight, Xl, Hidden, Yv, Tmp, Z;
+
+        /// <summary>Length of the leading prefix of <see cref="UniqueBuf"/> handed to the routing kernel.</summary>
+        public int UniqueLen;
+
+        public Scratch(Edge0Pack pack, int k, int maxTokens)
         {
-            foreach (var a in _i) ArrayPool<int>.Shared.Return(a);
-            foreach (var a in _f) ArrayPool<float>.Shared.Return(a);
+            int E = pack.Experts, L = pack.Latent, H = pack.Hidden, V = maxTokens * k, T = maxTokens;
+            UniqueLen = Math.Min(E, V) + 1;
+            AssignExpert = RentI(V); Cursors = RentI(E + 1); BucketTokens = RentI(V); BucketSlots = RentI(V);
+            UniqueBuf = RentI(UniqueLen);
+            VCursors = RentI(E + 1); VTokens = RentI(V); VSlots = RentI(V); VUniqueBuf = RentI(UniqueLen); Wr = RentI(E);
+            AssignWeight = RentF(V);
+            Xl = RentF(Math.Min(pack.Groups, V) * T * L);
+            Hidden = RentF(V * L); Yv = RentF(V * L); Tmp = RentF(T * H); Z = RentF(T * L);
+        }
+
+        private static int[] RentI(int n) => ArrayPool<int>.Shared.Rent(Math.Max(n, 1));
+        private static float[] RentF(int n) => ArrayPool<float>.Shared.Rent(Math.Max(n, 1));
+
+        public readonly void Dispose()
+        {
+            var ip = ArrayPool<int>.Shared;
+            ip.Return(AssignExpert); ip.Return(Cursors); ip.Return(BucketTokens); ip.Return(BucketSlots); ip.Return(UniqueBuf);
+            ip.Return(VCursors); ip.Return(VTokens); ip.Return(VSlots); ip.Return(VUniqueBuf); ip.Return(Wr);
+            var fp = ArrayPool<float>.Shared;
+            fp.Return(AssignWeight); fp.Return(Xl); fp.Return(Hidden); fp.Return(Yv); fp.Return(Tmp); fp.Return(Z);
         }
     }
 }

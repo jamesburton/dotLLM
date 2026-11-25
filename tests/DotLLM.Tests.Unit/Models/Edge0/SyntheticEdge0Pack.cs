@@ -19,7 +19,8 @@ internal sealed class SyntheticEdge0Pack : IDisposable
     public float[][] Scales { get; }
     public bool Q4Latent { get; }
 
-    public SyntheticEdge0Pack(int seed = 7, bool withScales = true, bool q4Latent = false, bool skewedLabels = true)
+    /// <param name="colscaleHeader">Whether the manifest header names the column scale; defaults to <paramref name="withScales"/> (a real pack names it exactly when it ships scales/).</param>
+    public SyntheticEdge0Pack(int seed = 7, bool withScales = true, bool q4Latent = false, bool skewedLabels = true, bool? colscaleHeader = null)
     {
         Q4Latent = q4Latent;
         Dir = Path.Combine(Path.GetTempPath(), "dotllm-edge0-" + Guid.NewGuid().ToString("N"));
@@ -30,7 +31,12 @@ internal sealed class SyntheticEdge0Pack : IDisposable
         long record = 2 * guRow * Ff + dnRow * Latent;
 
         // native_experts.txt
-        var manifest = new List<string> { "# strata native experts v6: latent A-only, Q3_K gu + shared colscale (synthetic)" };
+        var manifest = new List<string>
+        {
+            (colscaleHeader ?? withScales)
+                ? "# strata native experts v6: latent A-only, Q3_K gu + shared colscale (synthetic)"
+                : "# strata native experts v6: latent A-only, Q3_K gu (synthetic, unscaled)",
+        };
         for (int l = 0; l < Layers; l++)
             manifest.Add(string.Create(CultureInfo.InvariantCulture, $"{l} 11 20 {(long)l * Experts * record} {record}"));
         File.WriteAllLines(Path.Combine(Dir, "native_experts.txt"), manifest);

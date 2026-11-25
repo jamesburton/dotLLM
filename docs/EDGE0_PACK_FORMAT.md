@@ -116,7 +116,8 @@ The group count is derived from the file size; `model.json` selects Q8 (`STRATA_
 ## 8. What the reader refuses and why
 
 Truncated or oversized `experts.bin`, a manifest row that disagrees with the geometry, labels outside `0..G-1`, a short or missing `scales/lN.f32` (a half-scaled pack would
-silently run wrong; Strata refuses it too), a latent file whose size is not a whole number of layers x groups, and NVFP4 manifests.
+silently run wrong; Strata refuses it too), **a manifest whose header names the shared column scale (`... + shared colscale`) while `scales/` is missing** (decided from the manifest, not
+from whether `l0.f32` happens to exist; #1972), a latent file whose size is not a whole number of layers x groups, and NVFP4 manifests.
 
 ## 9. Validation status and open points
 
@@ -128,6 +129,6 @@ silently run wrong; Strata refuses it too), a latent file whose size is not a wh
   and layer pairing is right; (b) treating Strata's convention (`A = G/s`) as the unscaled weight, the columns of `A` are negatively correlated with the magnitude of the matching latent
   coordinate `|D x|` (corr -0.42 / -0.32), as AWQ-style balancing predicts, whereas the opposite convention (`A = G*s`) shows no relation (+0.07 / +0.14). This favours the Strata convention but is
   indirect; it cannot replace an end-to-end comparison with Edge0's own engine output (T5500, needs approval) once the full model runs here.
-- Real-pack checks (`Edge0RealPackTests`, skip when the pack is absent): geometry, label histograms, decoded rms of experts/D/U, the scale fingerprint above, and the routed forward against the oracle
+- Real-pack checks (`Edge0RealPackTests`, skip when the pack is absent): geometry, the exact label histograms of layers 0, 23 and 47 plus their leading labels (read from the raw file by a separate script; the earlier `Sum() == 512` check was a tautology), decoded rms of experts/D/U, the scale fingerprint above, and the routed forward against the oracle
   on layers 0 and 31 with real weights, including a check that the real slice separates the mutants.
 - Not covered: end-to-end model run (needs G4 FP8 PLE rows and the skeleton wiring), NVFP4 tail, Vulkan/CUDA kernels.

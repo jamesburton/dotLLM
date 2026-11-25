@@ -104,6 +104,32 @@ public sealed unsafe class Edge0PackTests
     }
 
     [Fact]
+    public void Open_RefusesManifestThatNamesColscale_WhenScalesFolderIsMissing()
+    {
+        // The manifest says the gate/up rows were stored as A*diag(s); without scales/ the pack would load unscaled and run wrong (#1972).
+        using var syn = new SyntheticEdge0Pack(withScales: false, colscaleHeader: true);
+        var ex = Assert.Throws<InvalidDataException>(() => syn.Open());
+        Assert.Contains("scales", ex.Message);
+    }
+
+    [Fact]
+    public void Open_RefusesManifestThatNamesColscale_WhenOnlyL0IsMissing()
+    {
+        // l0 absent but l1.. present must not be mistaken for "no scales" (the old probe looked at l0 only).
+        using var syn = new SyntheticEdge0Pack();
+        File.Delete(Path.Combine(syn.Dir, "scales", "l0.f32"));
+        Assert.Throws<InvalidDataException>(() => syn.Open());
+    }
+
+    [Fact]
+    public void Open_AcceptsAnUnscaledPack_WhenTheManifestDoesNotNameColscale()
+    {
+        using var syn = new SyntheticEdge0Pack(withScales: false, colscaleHeader: false);
+        using var pack = syn.Open();
+        Assert.False(pack.HasColumnScale);
+    }
+
+    [Fact]
     public void Open_RefusesTruncatedExperts()
     {
         using var syn = new SyntheticEdge0Pack();
