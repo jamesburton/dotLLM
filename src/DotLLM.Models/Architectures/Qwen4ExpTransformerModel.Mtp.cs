@@ -193,7 +193,7 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IMtpHeadAttachable
             Qwen4ExpGatedResidual.Write(res.AsSpan(0, row), y, gains, S, H, 1);
 
             GrRead(blk.FfnGr, res, xn, low, mix, h, gains, 1, wantInject: true);
-            ForwardMoe(blk.Moe, -1, h, y, 1);
+            ForwardMoe(blk.Moe!, -1, h, y, 1);
             Qwen4ExpGatedResidual.Write(res.AsSpan(0, row), y, gains, S, H, 1);
 
             res.AsSpan(0, row).CopyTo(st.PendingMutable);   // the next draft step's input residual (before the head mixer)

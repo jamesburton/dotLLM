@@ -125,11 +125,18 @@ from whether `l0.f32` happens to exist; #1972), a latent file whose size is not 
 - **Oracle**: the CPU forward is checked against an independent float64 reference (`Edge0LatentMoeReference`, written from the pseudo-code above, F32 activations, full dequantization of every
   touched weight) on synthetic packs with the real record layout (latent 256, ff 64, 3 groups). Mutants killed: label->group shift, wrong U group, wrong D group, 1/s replaced by s, colscale dropped,
   routing weights ignored, group sum missing experts, reader inverse stored as s, U offset, up bank offset, labels ignoring the layer. See the PR for the run.
-- **Colscale direction.** Strata's own loader reads exactly these files and multiplies by `1/s` (`xl *= 1/s`, `s` = the file value), so the source settles the convention; the real-data evidence below is supporting only, and an end-to-end comparison with Edge0's engine output is still pending. Measurements, measured 2026-11-25 on layers 0 and 5
-  of the Q3_K pack with a numpy decoder independent of dotLLM: (a) the decoded gate/up column rms is proportional to `1/s` (corr of the logs -0.999, CV of `rms*s` 0.018 / 0.029), so the file
-  and layer pairing is right; (b) treating Strata's convention (`A = G/s`) as the unscaled weight, the columns of `A` are negatively correlated with the magnitude of the matching latent
-  coordinate `|D x|` (corr -0.42 / -0.32), as AWQ-style balancing predicts, whereas the opposite convention (`A = G*s`) shows no relation (+0.07 / +0.14). This favours the Strata convention but is
-  indirect; it cannot replace an end-to-end comparison with Edge0's own engine output (T5500, needs approval) once the full model runs here.
+- **Colscale direction: CONFIRMED end to end (2026-11-25, #1975).** Teacher-forced mean NLL of a fixed 106-token passage on the real model through the full CPU path (skeleton + pack + FP8 PLE),
+  per `Edge0Pack.ColumnScaleMode` arm (`DOTLLM_EDGE0_COLSCALE`): `1/s` **1.69** (4.1 perplexity on a 192-token variant: NLL 1.41), `s` 13.38, none 12.63 (ln(vocab) = 12.4, i.e. chance). Only `xl *= 1/s` is a working
+  language model; both other arms are at chance level, so the test separates the arms by ~11 nats. `Edge0EndToEndTests` (opt-in, `DOTLLM_EDGE0_E2E=1`). (Confirmed by language-model quality, not by diffing against Edge0's own engine output; the decoded-weight evidence of stage 1 pointed the same way.)
 - Real-pack checks (`Edge0RealPackTests`, skip when the pack is absent): geometry, the exact label histograms of layers 0, 23 and 47 plus their leading labels (read from the raw file by a separate script; the earlier `Sum() == 512` check was a tautology), decoded rms of experts/D/U, the scale fingerprint above, and the routed forward against the oracle
   on layers 0 and 31 with real weights, including a check that the real slice separates the mutants.
-- Not covered: end-to-end model run (needs G4 FP8 PLE rows and the skeleton wiring), NVFP4 tail, Vulkan/CUDA kernels.
+- End to end (#1975): `dotllm run <snapshot>/model-skeleton.gguf --device cpu` finds `native_experts.txt`/`experts.bin`/... and `ple-fp8.gguf` beside the skeleton and runs the CPU `Qwen4ExpTransformerModel`
+  (BF16 router and Q8_0 shared expert read in place). Greedy, thinking off: "The capital of France is **Paris**." and a correct `reverse_string`. CPU-only indicative speed on this Strix Halo box, 32 threads,
+  warm: prefill 4.4-5.6 tok/s, decode 1.3-1.9 tok/s. Not covered: NVFP4 tail, MTP head (G6), Vulkan/CUDA kernels (the Vulkan loader refuses a skeleton and says `--device cpu`).
+- Chat template (G5): the skeleton embeds Qwen's template (`Edge0ChatTemplateTests`). Effort levels are `xhigh` (default), `medium`, `low`; `enable_thinking=false` pre-fills `<think>
+
+</think>
+
+` (that is the
+  template's "none": `reasoning_effort: none` is refused by the template). Generation EOS is 248046 (`<|im_end|>`), not the PLE EOS 248044. `dotllm run` does not apply the template (no `--tools`): feed a
+  rendered prompt with `--prompt-file`.

@@ -126,6 +126,10 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             || config.GdnConfig is null || config.Moe is null || config.HybridLayout is null)
             throw new ArgumentException("VulkanQwen4ExpTransformerModel requires a fully populated Architecture.Qwen4Exp configuration.", nameof(config));
         var tensors = gguf.TensorsByName;
+        if (DotLLM.Models.Edge0.Edge0Model.IsSkeleton(gguf))
+            throw new NotSupportedException(
+                "This GGUF is an Edge0 skeleton (no routed experts: the latent-MoE experts live in the strata pack beside it). " +
+                "Only the CPU backend runs Edge0 so far (CUDA/Vulkan latent-MoE kernels are not written): use --device cpu.");
         var problems = Qwen4ExpTensors.FindProblems(tensors, config, includeTrunk: true, includeMtp: false);
         if (problems.Count > 0)
             throw new InvalidDataException("qwen4exp tensor table does not match the model contract: " +
