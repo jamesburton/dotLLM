@@ -21,6 +21,9 @@ internal sealed class OlalaKernel : IDisposable
     /// <summary>Shader name (file stem), for diagnostics.</summary>
     public string Name { get; }
 
+    /// <summary>Raw <c>VkPipeline</c> handle, for diagnostics only (<see cref="VulkanDevice.GetShaderStatisticsAmd"/>).</summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
+
     /// <summary>Loads <paramref name="name"/>.spv from <paramref name="spvDir"/> and builds the pipeline.</summary>
     /// <param name="device">Device.</param>
     /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>

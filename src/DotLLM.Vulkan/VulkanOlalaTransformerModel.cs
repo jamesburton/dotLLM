@@ -111,6 +111,19 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
     /// <summary>Test/diagnostic hook: receives named intermediates (null = off). Setting it splits each block into several submissions.</summary>
     internal OlalaVkTraceSink? Trace { get; set; }
 
+    /// <summary>Test/diagnostic: post-compile VGPR / LDS / scratch (spill) bytes of every pipeline built so far (VK_AMD_shader_info; empty when the device lacks it).</summary>
+    internal IReadOnlyList<string> ShaderStatistics()
+    {
+        var lines = new List<string>();
+        if (!_device.HasShaderInfoAmd) return lines;
+        foreach (var k in _kernels.Values)
+        {
+            var st = _device.GetShaderStatisticsAmd(k.PipelineHandle);
+            lines.Add($"{k.Name}: vgprs {st.resourceUsage.numUsedVgprs}/{st.numAvailableVgprs}, lds {st.resourceUsage.ldsUsageSizeInBytes} B, scratch {st.resourceUsage.scratchMemUsageInBytes} B/lane, wg {st.computeWorkGroupSizeX}");
+        }
+        return lines;
+    }
+
     /// <summary>Activation storage element size in bytes (2 = BF16, the shipped configuration).</summary>
     internal int ActivationElementBytes => _actBytes;
 
@@ -237,7 +250,7 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
             throw new InvalidDataException("olala tensor table does not match the model contract: " + string.Join("; ", problems.Take(8)));
         if (config.HeadDim % 8 != 0 || config.HeadDim > 128)
             throw new NotSupportedException($"Olala Vulkan attention supports head_dim a multiple of 8 and <= 128, got {config.HeadDim}.");
-        if (o.MambaHeadDim > 64 || o.MimoRank > 8 || o.StateSize > 128 || o.NumRopeAngles > 64 || o.NumRopeAngles > o.StateSize / 2)
+        if (o.MambaHeadDim > 64 || o.MimoRank > 8 || o.StateSize > 128 || o.StateSize % 2 != 0 || o.NumRopeAngles > 64 || o.NumRopeAngles > o.StateSize / 2)
             throw new NotSupportedException("Olala Vulkan Mamba step supports head dim <= 64, rank <= 8, state <= 128, angles <= min(64, state/2).");
         if (o.NumSignalHeads + o.NumNoiseHeads != 4 * o.NumNoiseHeads)
             throw new NotSupportedException("Olala Vulkan attention supports 4 query heads per kv head (3 signal + 1 noise).");
