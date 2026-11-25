@@ -114,6 +114,7 @@ public sealed unsafe class OlalaTransformerModel : IModel
         if (config.Architecture != Architecture.Olala || config.Olala is not { } o)
             throw new ArgumentException("OlalaTransformerModel requires an Architecture.Olala configuration.", nameof(config));
         var tensors = gguf.TensorsByName;
+        Nvfp4Support.RejectUnappliedScales(tensors, consumedScales: null, "The olala loader"); // NVFP4 .scale tensors are not applied here: refuse
         var problems = OlalaTensors.FindProblems(tensors, config);
         if (problems.Count > 0)
             throw new InvalidDataException("olala tensor table does not match the model contract: " + string.Join("; ", problems.Take(8))
