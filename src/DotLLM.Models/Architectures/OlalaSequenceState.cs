@@ -140,6 +140,9 @@ public sealed class OlalaSequenceState : IDisposable
     /// <summary>Bytes of the recurrent (SSM + angle + trapezoid) state of the M layers only; constant in the sequence length.</summary>
     public long RecurrentBytes => Ssm.Sum(s => s.Bytes);
 
+    /// <summary>Bytes of the V layers' token-shift carry (last raw K and V), constant in the sequence length.</summary>
+    public long TokenShiftBytes => Attn.Sum(a => a.LastK.Bytes + a.LastV.Bytes);
+
     /// <summary>Size in bytes of one element of the SSM matrix (the policy; asserted by tests).</summary>
     internal int SsmElementBytes => (int)(Ssm.Length == 0 ? 0 : Ssm[0].Ssm.Bytes / Ssm[0].Ssm.Count);
 

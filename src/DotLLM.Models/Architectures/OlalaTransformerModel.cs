@@ -127,6 +127,8 @@ public sealed unsafe class OlalaTransformerModel : IModel
         float[] F32(string name)
         {
             var d = tensors[name];
+            if (d.QuantizationType != QuantizationType.F32)
+                throw new InvalidDataException($"olala tensor {name} is {d.QuantizationType}; the contract keeps it F32 (biases, norms, MIMO projections, router, scalars) - refusing a variant that quantised it.");
             long count = 1; for (int i = 0; i < d.Shape.Rank; i++) count *= d.Shape[i];
             var r = new float[count];
             Dequantize.ToFloat32(gguf.TensorDataPointer(d), count, d.QuantizationType, r);
@@ -357,7 +359,7 @@ public sealed unsafe class OlalaTransformerModel : IModel
             var s = st.Ssm[blk.Ordinal];
             for (int t = 0; t < T; t++)
                 OlalaOps.Mamba3MimoStep(_geo, blk.Mamba!, zxdt.AsSpan(t * inW, inW), dyn.AsSpan(t * dynW, dynW),
-                                        s.Ssm.Span, s.Angle.Span, s.K.Span, s.V.Span, y.AsSpan(t * yW, yW), parallel: _pool is not null);
+                                        s.Ssm.Span, s.Angle.Span, s.K.Span, s.V.Span, y.AsSpan(t * yW, yW), pool: _pool);
             Trace?.Invoke($"blk.{blk.Index}.ssm_y", y.AsSpan(0, T * yW), T, yW);
             GemmSpan(blk.MixerOut, y, mixOut, T);
         }

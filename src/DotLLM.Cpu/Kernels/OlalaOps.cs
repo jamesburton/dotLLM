@@ -165,10 +165,10 @@ public static class OlalaOps
     /// <param name="kState">Previous token's rotated K <c>[R][H][N]</c>, updated in place.</param>
     /// <param name="vState">Previous token's raw x <c>[H][P]</c>, updated in place.</param>
     /// <param name="y">Output <c>[H * P]</c> (head-major).</param>
-    /// <param name="parallel">Run heads in parallel.</param>
+    /// <param name="pool">Optional compute pool; heads are partitioned across its workers (no per-call allocation). Null runs serially.</param>
     public static void Mamba3MimoStep(in Mamba3Geometry g, Mamba3Params p, ReadOnlySpan<float> zxdt, ReadOnlySpan<float> dyn,
                                       Span<float> ssm, Span<float> angle, Span<float> kState, Span<float> vState,
-                                      Span<float> y, bool parallel = false)
+                                      Span<float> y, DotLLM.Cpu.Threading.ComputeThreadPool? pool = null)
     {
         int H = g.Heads, P = g.HeadDim, N = g.State, R = g.Rank, A = g.Angles, ph = g.PerHead;
         if (zxdt.Length < H * ph || dyn.Length < g.DynWidth || ssm.Length < g.SsmElements || angle.Length < H * A
@@ -184,39 +184,49 @@ public static class OlalaOps
         }
         for (int a = 0; a < A; a++) tanhA[a] = MathF.Tanh(dyn[2 * R * N + a]);
 
-        // Spans cannot be captured by lambdas: park the buffers in arrays-of-pointers for the parallel path.
         unsafe
         {
             fixed (float* zp = zxdt, bnp = bn, cnp = cn, tp = tanhA, sp = ssm, ap = angle, kp = kState, vp = vState, yp = y)
+            fixed (float* dtb = p.DtBias, dd = p.D, mx = p.MimoX, mz = p.MimoZ, mo = p.MimoO, bb = p.BBias, cb = p.CBias)
             {
-                var ctx = new StepCtx(g, p, zp, bnp, cnp, tp, sp, ap, kp, vp, yp);
-                if (parallel && H > 1)
-                    Parallel.For(0, H, h => HeadStep(in ctx, h));
+                var ctx = new StepCtx(g, zp, bnp, cnp, tp, sp, ap, kp, vp, yp, dtb, dd, mx, mz, mo, bb, cb);
+                if (pool is not null && pool.ThreadCount > 1 && H > 1)
+                    pool.Dispatch((nint)(&ctx), &HeadWorker);
                 else
                     for (int h = 0; h < H; h++) HeadStep(in ctx, h);
             }
         }
     }
 
-    private readonly unsafe struct StepCtx(Mamba3Geometry g, Mamba3Params p, float* zxdt, float* bn, float* cn, float* tanhA,
-                                           float* ssm, float* angle, float* kState, float* vState, float* y)
+    private readonly unsafe struct StepCtx(Mamba3Geometry g, float* zxdt, float* bn, float* cn, float* tanhA,
+                                           float* ssm, float* angle, float* kState, float* vState, float* y,
+                                           float* dtBias, float* d, float* mimoX, float* mimoZ, float* mimoO, float* bBias, float* cBias)
     {
         public readonly Mamba3Geometry G = g;
-        public readonly Mamba3Params P = p;
         public readonly float* Zxdt = zxdt, Bn = bn, Cn = cn, TanhA = tanhA, Ssm = ssm, Angle = angle, KState = kState, VState = vState, Y = y;
+        public readonly float* DtBias = dtBias, D = d, MimoX = mimoX, MimoZ = mimoZ, MimoO = mimoO, BBias = bBias, CBias = cBias;
+    }
+
+    private static unsafe void HeadWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref readonly var ctx = ref Unsafe.AsRef<StepCtx>((void*)ctxPtr);
+        int H = ctx.G.Heads;
+        int per = (H + threadCount - 1) / threadCount;
+        int start = threadIdx * per, end = Math.Min(H, start + per);
+        for (int h = start; h < end; h++) HeadStep(in ctx, h);
     }
 
     [SkipLocalsInit]
     private static unsafe void HeadStep(in StepCtx c, int h)
     {
-        var g = c.G; var par = c.P;
+        var g = c.G;
         int H = g.Heads, P = g.HeadDim, N = g.State, R = g.Rank, A = g.Angles;
         float* z = c.Zxdt + h * g.PerHead;
         float* x = z + P;
         float dtRaw = z[2 * P], aRaw = z[2 * P + 1], trapRaw = z[2 * P + 2];
 
         float decayRate = MathF.Min(-Softplus(aRaw), -AFloor);
-        float dt = Softplus(dtRaw + par.DtBias[h]);
+        float dt = Softplus(dtRaw + c.DtBias[h]);
         float trap = Sigmoid(trapRaw);
         float alpha = MathF.Exp(decayRate * dt);
         float beta = (1f - trap) * dt * alpha;
@@ -241,8 +251,8 @@ public static class OlalaOps
         {
             for (int n = 0; n < N; n++)
             {
-                q[r * N + n] = c.Cn[r * N + n] + par.CBias[(h * R + r) * N + n];
-                k[r * N + n] = c.Bn[r * N + n] + par.BBias[(h * R + r) * N + n];
+                q[r * N + n] = c.Cn[r * N + n] + c.CBias[(h * R + r) * N + n];
+                k[r * N + n] = c.Bn[r * N + n] + c.BBias[(h * R + r) * N + n];
             }
             for (int a = 0; a < A; a++)
             {
@@ -258,7 +268,7 @@ public static class OlalaOps
         for (int r = 0; r < R; r++)
             for (int n = 0; n < N; n++) kPrev[r * N + n] = c.KState[(r * H + h) * N + n];
 
-        float d = par.D[h];
+        float d = c.D[h];
         Span<float> o = stackalloc float[R], xv = stackalloc float[R], xs = stackalloc float[R];
         Span<float> coef = stackalloc float[N];
         for (int pIdx = 0; pIdx < P; pIdx++)
@@ -266,7 +276,7 @@ public static class OlalaOps
             float xp = x[pIdx], zp = z[pIdx], vPrev = c.VState[h * P + pIdx];
             for (int r = 0; r < R; r++)
             {
-                float mx = par.MimoX[(h * R + r) * P + pIdx];
+                float mx = c.MimoX[(h * R + r) * P + pIdx];
                 xv[r] = xp * mx;
                 xs[r] = vPrev * mx;
             }
@@ -296,8 +306,8 @@ public static class OlalaOps
             float acc = 0f;
             for (int r = 0; r < R; r++)
             {
-                float mz = par.MimoZ[(h * R + r) * P + pIdx];
-                float mo = par.MimoO[(h * R + r) * P + pIdx];
+                float mz = c.MimoZ[(h * R + r) * P + pIdx];
+                float mo = c.MimoO[(h * R + r) * P + pIdx];
                 acc += (o[r] + xv[r] * d) * Silu(zp * mz) * mo;
             }
             c.Y[h * P + pIdx] = acc;

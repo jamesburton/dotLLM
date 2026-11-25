@@ -30,7 +30,12 @@ public static partial class GgufModelConfigExtractor
             throw new InvalidDataException($"{arch}: key_length {headDim} != value_length {valueDim}.");
         float normEps = metadata.GetFloat32($"{arch}.attention.layer_norm_rms_epsilon");
         int window = RequiredPositiveU32(metadata, $"{arch}.attention.sliding_window");
-        float softcap = metadata.GetFloat32OrDefault($"{arch}.attn_logit_softcapping", 0f);
+        // Both keys are always written by the converter (gate_bias 0 when not zero-centred; the soft cap is part of the V-layer numerics): a file
+        // without them is an unknown variant, so refuse rather than silently run with 0 (no soft cap / no gate bias).
+        foreach (string req in new[] { $"{arch}.attn_logit_softcapping", $"{arch}.gate_bias" })
+            if (!metadata.ContainsKey(req))
+                throw new InvalidDataException($"Required GGUF key '{req}' is missing (olala).");
+        float softcap = metadata.GetFloat32($"{arch}.attn_logit_softcapping");
 
         string layerTypes = metadata.GetStringOrDefault($"{arch}.layer_types", null!) ?? "";
         if (layerTypes.Length != numLayers)
@@ -102,7 +107,7 @@ public static partial class GgufModelConfigExtractor
                 NumSignalHeads = signal,
                 NumNoiseHeads = noise,
                 TpaRank = RequiredPositiveU32(metadata, $"{arch}.tpa_rank"),
-                GateBias = metadata.GetFloat32OrDefault($"{arch}.gate_bias", 0f),
+                GateBias = metadata.GetFloat32($"{arch}.gate_bias"),
                 ExpertCount = RequiredPositiveU32(metadata, $"{arch}.expert_count"),
                 ExpertUsedCount = RequiredPositiveU32(metadata, $"{arch}.expert_used_count"),
                 ExpertFfLength = RequiredPositiveU32(metadata, $"{arch}.expert_feed_forward_length"),

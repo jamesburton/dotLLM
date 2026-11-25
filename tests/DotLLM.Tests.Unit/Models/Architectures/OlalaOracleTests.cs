@@ -189,6 +189,29 @@ public sealed class OlalaOracleTests
     }
 
     [SkippableFact]
+    public void ThreadedPool_MatchesHf_AndIsDeterministic()
+    {
+        string? gguf = TinyGguf(); var c = LoadCase("tiny");
+        Skip.If(gguf is null || c is null, "tiny Olala oracle not generated");
+        using var file = GgufFile.Open(gguf!);
+        var cfg = GgufModelConfigExtractor.Extract(file.Metadata);
+        using var model = Assert.IsType<OlalaTransformerModel>(ModelLoader.CreateCpuModelFromGguf(file, cfg, ThreadingConfig.Auto));
+        int[] pos = Enumerable.Range(0, c!.L).ToArray();
+        using var a = model.Forward(c.Ids, pos, -1);
+        float[] got = ToArray(a, c.L, c.Vocab);
+        for (int t = 0; t < c.L; t++)
+            Assert.True(Kl(c.Full.AsSpan(t * c.Vocab, c.Vocab), got.AsSpan(t * c.Vocab, c.Vocab)) < 1e-9, $"row {t}");
+        // decode steps through the pool path (T == 1 -> spin-wait dispatch)
+        model.ResetSequenceState();
+        using (model.Forward(c.Ids, pos, -1)) { }
+        for (int j = 1; j < c.N; j++)
+        {
+            using var step = model.Forward([c.GreedyIds[j - 1]], [c.L + j - 1], -1, null, lastTokenLogitsOnly: true);
+            Assert.True(Kl(c.Greedy.AsSpan(j * c.Vocab, c.Vocab), ToArray(step, 1, c.Vocab)) < 1e-9, $"step {j}");
+        }
+    }
+
+    [SkippableFact]
     public void PositionZero_RestartsTheSequenceState()
     {
         string? gguf = TinyGguf(); var c = LoadCase("tiny");
@@ -254,5 +277,8 @@ public sealed class OlalaOracleTests
         Assert.Equal(f32, state.SsmElementBytes);
         // docs/OLALA.md section 4: 1,572,864 + 6,144 + 98,304 + 12,288 bytes per M layer.
         Assert.Equal((1_572_864L + 6_144 + 98_304 + 12_288) * 29, state.RecurrentBytes);
+        // Token-shift carry (user ruling 2026-11-25: F32 too): 2 x 12 kv heads x 128 x 4 bytes per V layer = 12,288 x 7. Covers a halved/narrowed buffer.
+        Assert.Equal(12_288L * 7, state.TokenShiftBytes);
+        foreach (var a in state.Attn) { Assert.Equal(12 * 128, a.LastK.Count); Assert.Equal(12 * 128, a.LastV.Count); }
     }
 }
