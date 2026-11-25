@@ -1059,7 +1059,7 @@ it privatises the page (a full copy, same cost as staging); only a shared writab
 place. So `DOTLLM_GGUF_MAP_COW=1` imports but saves nothing physical, and it charges commit for the
 whole file.
 
-**`DOTLLM_VULKAN_HOST_IMPORT_WRITABLE`** (#1991: stays **opt-in**; `0` disables, `1` forces it on a dGPU too): when an import from the read-only mapping is
+**`DOTLLM_VULKAN_HOST_IMPORT_WRITABLE`** (#1991: stays **opt-in**; `0` disables, `1` enables; a dGPU still refuses the import, #507): when an import from the read-only mapping is
 refused, `VulkanWeightImportPolicy.TryImport` retries through `GgufFile.TryMapImportAlias`, a shared
 writable view of the same file range (same page-cache pages as the read-only mapping). Real Flint
 Q4_1 (26 GB), 485/485 tensors imported, logits bit-identical to staging:
