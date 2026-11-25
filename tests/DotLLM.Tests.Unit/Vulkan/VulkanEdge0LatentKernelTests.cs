@@ -118,4 +118,166 @@ public sealed class VulkanEdge0LatentKernelTests
         }
         foreach (var b in bufs) b.Dispose();
     }
+
+    // ───────────────────────── decode group skipping (G3 step 2a) ─────────────────────────
+
+    private static byte[] RandomQ8Rows(Random rng, int rows, int k)
+    {
+        int rowBytes = (k / 32) * 34;
+        var b = new byte[(long)rows * rowBytes];
+        rng.NextBytes(b);
+        for (long o = 0; o + 34 <= b.Length; o += 34)
+        {
+            ushort bits = BitConverter.HalfToUInt16Bits((Half)(0.002f + (float)rng.NextDouble() * 0.02f));
+            b[o] = (byte)bits; b[o + 1] = (byte)(bits >> 8);
+        }
+        return b;
+    }
+
+    /// <summary>K experts spread over exactly the given groups (so the other groups are unused).</summary>
+    private static int[] ExpertsInFewGroups(int[] labels, int[] groups)
+    {
+        var idx = new List<int>();
+        foreach (int g in groups) for (int e = 0; e < E && idx.Count < K; e++) if (labels[e] == g && !idx.Contains(e)) { idx.Add(e); break; }
+        for (int e = 0; idx.Count < K && e < E; e++) if (groups.Contains(labels[e]) && !idx.Contains(e)) idx.Add(e);
+        Assert.Equal(K, idx.Count);
+        return idx.ToArray();
+    }
+
+    [SkippableFact]
+    public void CombineAll_IsBitIdenticalToThePerGroupCombine()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var k = Edge0LatentKernels.Create(device, spvDir);
+        Skip.IfNot(k.HasDecodeKernels, "decode kernels unavailable");
+        const int L = 300;
+        var rng = new Random(0xE3);
+        int[] labels = Labels(rng);
+        int[] idx = ExpertsInFewGroups(labels, [1, 4, 6]);
+        float[] down = new float[K * L]; for (int i = 0; i < down.Length; i++) down[i] = (float)(rng.NextDouble() * 2 - 1);
+        float[] w = new float[K]; for (int i = 0; i < K; i++) w[i] = (float)rng.NextDouble();
+        using var bDown = Up(device, down, out _); using var bIdx = Up(device, idx, out _); using var bW = Up(device, w, out _); using var bLab = Up(device, labels, out _);
+        using var bAll = device.Allocate((long)G * L * 4);
+        using (var ctx = device.CreateSubmitContext()) { ctx.Begin(); k.RecordCombineAll(ctx.CommandBuffer, bDown, bIdx, bW, bLab, bAll, L, K, E); ctx.SubmitAndWait(); }
+        float[] all = new float[G * L]; device.Download(bAll, all);
+        for (int g = 0; g < G; g++)
+        {
+            using var bZ = device.Allocate((long)L * 4);
+            using (var ctx = device.CreateSubmitContext()) { ctx.Begin(); k.RecordGroupCombine(ctx.CommandBuffer, bDown, bIdx, bW, bLab, bZ, L, K, g, 1, E); ctx.SubmitAndWait(); }
+            float[] z = new float[L]; device.Download(bZ, z);
+            for (int c = 0; c < L; c++) Assert.True(z[c].Equals(all[g * L + c]), $"g {g} c {c}: per-group {z[c]:G9} vs all-groups {all[g * L + c]:G9}");
+            if (g is not (1 or 4 or 6)) Assert.All(z, v => Assert.Equal(0f, v));   // an unused group is exact zeros
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(1792, 100)]
+    [InlineData(224, 37)]      // 7 blocks: shorter than one 8-block window
+    public void DecodeU_SkippingUnusedGroups_IsBitIdenticalToTheGenericAllGroupsPath(int L, int H)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasIntegerDotProduct, "integer-dot-product unavailable.");
+        using var k = Edge0LatentKernels.Create(device, spvDir);
+        Skip.IfNot(k.HasDecodeKernels, "decode kernels unavailable");
+        using var q1 = QuantizeQ8_1Kernel.TryCreate(device, spvDir)!; using var qRows = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir)!;
+        using var mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir)!;
+        var rng = new Random(0xE4 + L);
+        int[] labels = Labels(rng);
+        int[] used = [0, 2, 5, 7];
+        int[] idx = ExpertsInFewGroups(labels, used);
+        var uBufs = new VulkanDevice.Buffer[G]; var zs = new float[G][];
+        for (int g = 0; g < G; g++)
+        {
+            byte[] u = RandomQ8Rows(rng, H, L);
+            uBufs[g] = device.Allocate((u.Length + 3L) & ~3L); device.Upload(u, uBufs[g]);
+            zs[g] = new float[L];
+            if (used.Contains(g)) for (int c = 0; c < L; c++) zs[g][c] = (float)(rng.NextDouble() * 2 - 1);   // unused groups stay exact zeros (what edge0_group_combine writes)
+        }
+        float[] zAll = zs.SelectMany(z => z).ToArray();
+        using var bIdx = Up(device, idx, out _); using var bLab = Up(device, labels, out _); using var bZAll = Up(device, zAll, out _);
+
+        // generic: per group quantise (single-row kernel) + dense Q8_0 MMVQ, then the eight-way sum
+        var parts = new VulkanDevice.Buffer[G];
+        for (int g = 0; g < G; g++)
+        {
+            using var bz = Up(device, zs[g], out _);
+            using var bxq = device.Allocate(QuantizeQ8_1Kernel.PackedBytes(L)); using var bxds = device.Allocate(QuantizeQ8_1Kernel.ScaleBytes(L));
+            parts[g] = device.Allocate((long)H * 4);
+            using (var ctx = device.CreateSubmitContext())
+            {
+                ctx.Begin();
+                q1.Record(ctx.CommandBuffer, bz, bxq, bxds, L);
+                KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+                mmvq.Record(ctx.CommandBuffer, uBufs[g], bxq, bxds, parts[g], H, L);
+                ctx.SubmitAndWait();
+            }
+            float[] part = new float[H]; device.Download(parts[g], part);
+            // a skipped group would have contributed zero: its partial is exactly 0 for every row
+            if (!used.Contains(g)) Assert.All(part, v => Assert.Equal(0f, v));
+        }
+        using var bGeneric = device.Allocate((long)H * 4);
+        using (var ctx = device.CreateSubmitContext()) { ctx.Begin(); k.RecordSum(ctx.CommandBuffer, parts, bGeneric, H); ctx.SubmitAndWait(); }
+
+        // fast: eight rows quantised together + one fused dispatch that skips the unused groups
+        using var bXq = device.Allocate(QuantizeQ8_1RowsKernel.PackedBytes(G, L)); using var bXds = device.Allocate(QuantizeQ8_1RowsKernel.ScaleBytes(G, L));
+        using var bFast = device.Allocate((long)H * 4);
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            qRows.Record(ctx.CommandBuffer, bZAll, bXq, bXds, G, L);
+            KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+            k.RecordDecodeU(ctx.CommandBuffer, uBufs, bXq, bXds, bFast, bIdx, bLab, H, L, K, E);
+            ctx.SubmitAndWait();
+        }
+        float[] a = new float[H], b = new float[H]; device.Download(bGeneric, a); device.Download(bFast, b);
+        Assert.True(a.Max(MathF.Abs) > 1e-3f, "reference degenerate");
+        for (int i = 0; i < H; i++) Assert.True(a[i].Equals(b[i]), $"row {i}: generic {a[i]:G9} vs skipping {b[i]:G9}");
+        // the fixture must make the skip observable: the used groups really are a strict subset
+        Assert.True(Enumerable.Range(0, G).Count(g => idx.Any(e => labels[e] == g)) < G);
+        foreach (var u in uBufs) u.Dispose();
+        foreach (var p in parts) p.Dispose();
+    }
+
+    [SkippableFact]
+    public void DecodeD_ComputesTheUsedGroupsBitIdenticallyAndLeavesTheOthersUntouched()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasIntegerDotProduct, "integer-dot-product unavailable.");
+        using var k = Edge0LatentKernels.Create(device, spvDir);
+        Skip.IfNot(k.HasDecodeKernels, "decode kernels unavailable");
+        using var q1 = QuantizeQ8_1Kernel.TryCreate(device, spvDir)!; using var mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir)!;
+        const int L = 160, H = 512;
+        var rng = new Random(0xE5);
+        int[] labels = Labels(rng);
+        int[] used = [1, 3, 4];
+        int[] idx = ExpertsInFewGroups(labels, used);
+        byte[] d = RandomQ8Rows(rng, G * L, H);
+        float[] x = new float[H]; for (int i = 0; i < H; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        using var bD = device.Allocate((d.Length + 3L) & ~3L); device.Upload(d, bD);
+        using var bx = Up(device, x, out _); using var bIdx = Up(device, idx, out _); using var bLab = Up(device, labels, out _);
+        using var bxq = device.Allocate(QuantizeQ8_1Kernel.PackedBytes(H)); using var bxds = device.Allocate(QuantizeQ8_1Kernel.ScaleBytes(H));
+        using var bRef = device.Allocate((long)G * L * 4); using var bFast = Up(device, Enumerable.Repeat(float.NaN, G * L).ToArray(), out _);
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            q1.Record(ctx.CommandBuffer, bx, bxq, bxds, H);
+            KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+            mmvq.Record(ctx.CommandBuffer, bD, bxq, bxds, bRef, G * L, H);
+            k.RecordDecodeD(ctx.CommandBuffer, bD, bxq, bxds, bFast, bIdx, bLab, G, L, H, K, E);
+            ctx.SubmitAndWait();
+        }
+        float[] r = new float[G * L], f = new float[G * L]; device.Download(bRef, r); device.Download(bFast, f);
+        int skipped = 0;
+        for (int row = 0; row < G * L; row++)
+        {
+            int g = row / L;
+            bool isUsed = idx.Any(e => labels[e] == g);
+            if (isUsed) Assert.True(r[row].Equals(f[row]), $"row {row} (group {g}): dense {r[row]:G9} vs skipping {f[row]:G9}");
+            else { Assert.True(float.IsNaN(f[row]), $"row {row} (unused group {g}) was written"); skipped++; }
+        }
+        Assert.True(skipped > 0, "no group was skipped: the fixture proves nothing");
+    }
 }

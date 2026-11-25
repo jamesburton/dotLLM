@@ -1,0 +1,110 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Edge0 latent MoE (G3, #1981), DECODE: out[r] = sum over the USED groups g (ascending) of U_g[r, :] . z_g, one workgroup (one wave32 subgroup) per output row.
+//
+// Per group the body is matmul_q8_0_mmvq.comp verbatim (same lane layout, dp4a math and subgroupAdd), so each group's partial is bit-identical to the dense
+// kernel's. The generic path computes all eight partials and adds them in ascending group order ((u0 + u1) + ... + u7) in edge0_u_sum; a group no selected expert
+// uses has z_g = 0 exactly (edge0_group_combine writes an exact zero when no slot matches), whose partial is exactly 0.0, and x + 0.0 == x, so skipping it
+// gives the same bits. The used-group test is uniform per workgroup.
+//
+// Activations: z of the eight groups quantised to Q8_1 as eight consecutive rows of L (xq[g * L/4 ..], xds[g * L/32 ..]). The eight U matrices are separate bindings.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufU0 { uint u0[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufU1 { uint u1[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufU2 { uint u2[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufU3 { uint u3[]; };
+layout(set = 0, binding = 4, std430) readonly  buffer BufU4 { uint u4[]; };
+layout(set = 0, binding = 5, std430) readonly  buffer BufU5 { uint u5[]; };
+layout(set = 0, binding = 6, std430) readonly  buffer BufU6 { uint u6[]; };
+layout(set = 0, binding = 7, std430) readonly  buffer BufU7 { uint u7[]; };
+layout(set = 0, binding = 8, std430) readonly  buffer BufXq  { uint xq[]; };
+layout(set = 0, binding = 9, std430) readonly  buffer BufXds { vec2 xds[]; };
+layout(set = 0, binding = 10, std430) writeonly buffer BufY  { float y[]; };       // [H]
+layout(set = 0, binding = 11, std430) readonly  buffer BufIdx    { int indices[]; };
+layout(set = 0, binding = 12, std430) readonly  buffer BufLabels { int labels[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint H;            // output rows
+    uint L;            // K of each U_g (multiple of 32)
+    uint blocksPerRow; // L / 32
+    uint topK;
+    uint numExperts;
+} pc;
+
+const uint UINT16_PER_BLOCK = 17u;
+const uint WINDOW_BLOCKS    = 8u;
+
+uint readWord(uint g, uint i) {
+    switch (g) {
+        case 0u: return u0[i];
+        case 1u: return u1[i];
+        case 2u: return u2[i];
+        case 3u: return u3[i];
+        case 4u: return u4[i];
+        case 5u: return u5[i];
+        case 6u: return u6[i];
+        default: return u7[i];
+    }
+}
+
+uint readU16(uint g, uint idx16) {
+    uint w = readWord(g, idx16 >> 1u);
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+bool groupUsed(uint g) {
+    for (uint j = 0u; j < pc.topK; j++) {
+        uint e = uint(indices[j]);
+        if (e < pc.numExperts && uint(labels[e]) == g) return true;
+    }
+    return false;
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.H) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 2u;
+    uint subInBlock    = lane & 3u;
+    uint qOff16        = 1u + 4u * subInBlock;
+    uint rowBase16 = r * pc.blocksPerRow * UINT16_PER_BLOCK;
+
+    float total = 0.0;
+    for (uint g = 0u; g < 8u; g++) {
+        if (!groupUsed(g)) continue;
+        uint xqBase  = g * (pc.L >> 2u);
+        uint xdsBase = g * (pc.L >> 5u);
+        float acc = 0.0;
+        for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+            uint blk = w0 + blockInWindow;
+            if (blk >= pc.blocksPerRow)
+                continue;
+
+            uint blkBase16 = rowBase16 + blk * UINT16_PER_BLOCK;
+            float dW = unpackHalf2x16(readU16(g, blkBase16)).x;
+            float dX = xds[xdsBase + blk].x;
+
+            uint qb = blkBase16 + qOff16;
+            uint w32a = readU16(g, qb)      | (readU16(g, qb + 1u) << 16u);
+            uint w32b = readU16(g, qb + 2u) | (readU16(g, qb + 3u) << 16u);
+
+            uint xbase = xqBase + blk * 8u + 2u * subInBlock;
+            uint xa = xq[xbase];
+            uint xb = xq[xbase + 1u];
+
+            int dotI = 0;
+            dotI = dotPacked4x8AccSatEXT(int(w32a), int(xa), dotI);
+            dotI = dotPacked4x8AccSatEXT(int(w32b), int(xb), dotI);
+
+            acc += (dW * dX) * float(dotI);
+        }
+        total += subgroupAdd(acc);
+    }
+    if (subgroupElect())
+        y[r] = total;
+}

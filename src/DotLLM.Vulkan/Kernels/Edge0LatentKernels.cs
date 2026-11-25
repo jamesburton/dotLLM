@@ -19,7 +19,7 @@ public sealed class Edge0LatentKernels : IDisposable
         public readonly int Buffers, PushBytes;
         private readonly VulkanDevice _device;
 
-        public Pipe(VulkanDevice device, string spvDir, string name, int buffers, int pushBytes)
+        public Pipe(VulkanDevice device, string spvDir, string name, int buffers, int pushBytes, bool wave32 = false)
         {
             _device = device; Buffers = buffers; PushBytes = pushBytes;
             string path = Path.Combine(spvDir, name + ".spv");
@@ -29,7 +29,7 @@ public sealed class Edge0LatentKernels : IDisposable
             {
                 Span<VkDescriptorBinding> b = stackalloc VkDescriptorBinding[buffers];
                 for (int i = 0; i < buffers; i++) b[i] = new VkDescriptorBinding((uint)i);
-                Pipeline = Module.CreateComputePipeline("main", b, (uint)pushBytes);
+                Pipeline = Module.CreateComputePipeline("main", b, (uint)pushBytes, requiredSubgroupSize: wave32 ? Wave32SubgroupControl.RequiredSubgroupSizeFor(device) : 0);
             }
             catch { Module.Dispose(); throw; }
             Pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)buffers);
@@ -55,6 +55,10 @@ public sealed class Edge0LatentKernels : IDisposable
     }
 
     private readonly Pipe _gather, _combine, _sum;
+    private Pipe? _decodeD, _decodeU, _combineAll;
+
+    /// <summary>True when the single-row kernels that skip unused D/U groups exist (integer dot product, wave32, SPIR-V present).</summary>
+    public bool HasDecodeKernels => _decodeD is not null && _decodeU is not null && _combineAll is not null;
 
     /// <summary>Record-strided indexed MMVQ for the Q3_K gate / up projections (null without integer dot product or its SPIR-V).</summary>
     internal MoeIndexedStridedMmvqKernel? IndexedQ3K { get; private set; }
@@ -76,11 +80,16 @@ public sealed class Edge0LatentKernels : IDisposable
             g = new Pipe(device, spvDir, "edge0_latent_gather", 5, 5 * sizeof(uint));
             c = new Pipe(device, spvDir, "edge0_group_combine", 5, 5 * sizeof(uint));
             s = new Pipe(device, spvDir, "edge0_u_sum", 9, sizeof(uint));
-            var k = new Edge0LatentKernels(g, c, s)
+            var k = new Edge0LatentKernels(g, c, s);
+            if (device.HasIntegerDotProduct && (Wave32SubgroupControl.RequiredSubgroupSizeFor(device) != 0 || device.SubgroupSize >= 32)
+                && File.Exists(Path.Combine(spvDir, "edge0_d_mmvq.spv")) && File.Exists(Path.Combine(spvDir, "edge0_u_mmvq.spv")) && File.Exists(Path.Combine(spvDir, "edge0_group_combine_all.spv")))
             {
-                IndexedQ3K = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.Q3_K),
-                IndexedIq4Nl = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.IQ4_NL),
-            };
+                k._decodeD = new Pipe(device, spvDir, "edge0_d_mmvq", 6, 6 * sizeof(uint), wave32: true);
+                k._decodeU = new Pipe(device, spvDir, "edge0_u_mmvq", 13, 5 * sizeof(uint), wave32: true);
+                k._combineAll = new Pipe(device, spvDir, "edge0_group_combine_all", 5, 3 * sizeof(uint));
+            }
+            k.IndexedQ3K = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.Q3_K);
+            k.IndexedIq4Nl = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.IQ4_NL);
             if (MoeGroupedStridedCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.Q3_K) && MoeGroupedStridedCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.IQ4_NL))
             {
                 k.GroupedQ3K = MoeGroupedStridedCoopmatKernel.Create(device, spvDir, MoeIqQuant.Q3_K);
@@ -94,7 +103,7 @@ public sealed class Edge0LatentKernels : IDisposable
     /// <summary>Drops cached descriptor sets (scratch buffers were re-allocated).</summary>
     internal void InvalidateDescriptorCache()
     {
-        _gather.Cache.Reset(); _combine.Cache.Reset(); _sum.Cache.Reset();
+        _gather.Cache.Reset(); _combine.Cache.Reset(); _sum.Cache.Reset(); _decodeD?.Cache.Reset(); _decodeU?.Cache.Reset(); _combineAll?.Cache.Reset();
         IndexedQ3K?.InvalidateDescriptorCache(); IndexedIq4Nl?.InvalidateDescriptorCache(); GroupedQ3K?.InvalidateDescriptorCache(); GroupedIq4Nl?.InvalidateDescriptorCache();
     }
 
@@ -119,6 +128,34 @@ public sealed class Edge0LatentKernels : IDisposable
             [(uint)latent, (uint)topK, (uint)group, (uint)tokens, (uint)numExperts], (uint)((latent + 255) / 256), (uint)tokens);
     }
 
+    /// <summary>
+    /// Single-row D: the Q8_0 matrix times the Q8_1 row already in <paramref name="xq"/> / <paramref name="xds"/>, computing only the groups some expert of <paramref name="indices"/> belongs to
+    /// (<c>edge0_d_mmvq</c>; the rows of an unused group are left untouched and never read).
+    /// </summary>
+    public void RecordDecodeD(nint cmd, VulkanDevice.Buffer d, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds, VulkanDevice.Buffer y, VulkanDevice.Buffer indices,
+        VulkanDevice.Buffer labels, int groups, int latent, int hidden, int topK, int numExperts)
+        => _decodeD!.Dispatch(cmd, [d.Handle, xq.Handle, xds.Handle, y.Handle, indices.Handle, labels.Handle],
+            [(uint)(groups * latent), (uint)hidden, (uint)(hidden / 32), (uint)latent, (uint)topK, (uint)numExperts], (uint)(groups * latent), 1);
+
+    /// <summary><see cref="RecordGroupCombine"/> for all eight groups of ONE token in a single dispatch: <c>z[g * latent + c]</c>.</summary>
+    public void RecordCombineAll(nint cmd, VulkanDevice.Buffer down, VulkanDevice.Buffer indices, VulkanDevice.Buffer weights, VulkanDevice.Buffer labels,
+        VulkanDevice.Buffer z, int latent, int topK, int numExperts)
+        => _combineAll!.Dispatch(cmd, [down.Handle, indices.Handle, weights.Handle, labels.Handle, z.Handle], [(uint)latent, (uint)topK, (uint)numExperts], (uint)((latent + 255) / 256), 1);
+
+    /// <summary>
+    /// Single-row U + group sum in one dispatch: <c>out[r] = sum over the used groups g (ascending) of U_g[r] . z_g</c> with z of the eight groups quantised as eight rows of
+    /// <paramref name="latent"/> in <paramref name="xq"/> / <paramref name="xds"/> (<c>edge0_u_mmvq</c>).
+    /// </summary>
+    public void RecordDecodeU(nint cmd, ReadOnlySpan<VulkanDevice.Buffer> u, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds, VulkanDevice.Buffer y, VulkanDevice.Buffer indices,
+        VulkanDevice.Buffer labels, int hidden, int latent, int topK, int numExperts)
+    {
+        if (u.Length != 8) throw new ArgumentException("Exactly eight group matrices.", nameof(u));
+        Span<nint> b = stackalloc nint[13];
+        for (int i = 0; i < 8; i++) b[i] = u[i].Handle;
+        b[8] = xq.Handle; b[9] = xds.Handle; b[10] = y.Handle; b[11] = indices.Handle; b[12] = labels.Handle;
+        _decodeU!.Dispatch(cmd, b, [(uint)hidden, (uint)latent, (uint)(latent / 32), (uint)topK, (uint)numExperts], (uint)hidden, 1);
+    }
+
     /// <summary><c>output = u[0] + ... + u[7]</c> over <paramref name="n"/> floats.</summary>
     public void RecordSum(nint cmd, ReadOnlySpan<VulkanDevice.Buffer> u, VulkanDevice.Buffer output, int n)
     {
@@ -132,7 +169,7 @@ public sealed class Edge0LatentKernels : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
-        _gather.Dispose(); _combine.Dispose(); _sum.Dispose();
+        _gather.Dispose(); _combine.Dispose(); _sum.Dispose(); _decodeD?.Dispose(); _decodeU?.Dispose(); _combineAll?.Dispose();
         IndexedQ3K?.Dispose(); IndexedIq4Nl?.Dispose(); GroupedQ3K?.Dispose(); GroupedIq4Nl?.Dispose();
     }
 }

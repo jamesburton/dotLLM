@@ -1,0 +1,85 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Edge0 latent MoE (G3, #1981), DECODE: D = [G * L, H] Q8_0 matrix times one Q8_1-quantised activation row, computing ONLY the groups some selected expert uses.
+//
+// Body = matmul_q8_0_mmvq.comp verbatim (same lane layout, same dp4a math, same reduction), so a computed row is bit-identical to the dense kernel's.
+// Extra: the workgroup of output row m belongs to group g = m / L; if none of the token's top-k experts has labels[expert] == g the workgroup returns
+// before touching any weight (the row is never read: edge0_latent_gather indexes xl only by the group of a selected expert). The test is uniform per workgroup.
+// Skipping unused groups removes ~(8 - used) / 8 of the D bytes at decode (about a third of them for top-10 over 8 groups).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW      { uint  weight[]; };   // Q8_0 blob [G*L rows]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq     { uint  xq[]; };       // [K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds    { vec2  xds[]; };      // [K/32] (d_x, s_x)
+layout(set = 0, binding = 3, std430) writeonly buffer BufY      { float y[]; };        // [G*L]
+layout(set = 0, binding = 4, std430) readonly  buffer BufIdx    { int   indices[]; };  // [topK] selected experts of the token
+layout(set = 0, binding = 5, std430) readonly  buffer BufLabels { int   labels[]; };   // [numExperts] group of each expert
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // G * L output rows
+    uint K;            // columns (multiple of 32)
+    uint blocksPerRow; // K / 32
+    uint L;            // rows per group
+    uint topK;
+    uint numExperts;
+} pc;
+
+const uint UINT16_PER_BLOCK = 17u;
+const uint WINDOW_BLOCKS    = 8u;
+
+uint readU16(uint idx16) {
+    uint w = weight[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint g = m / pc.L;
+    bool used = false;
+    for (uint j = 0u; j < pc.topK; j++) {
+        uint e = uint(indices[j]);
+        if (e < pc.numExperts && uint(labels[e]) == g) used = true;
+    }
+    if (!used) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 2u;
+    uint subInBlock    = lane & 3u;
+    uint qOff16        = 1u + 4u * subInBlock;
+
+    uint rowBase16 = m * pc.blocksPerRow * UINT16_PER_BLOCK;
+
+    float acc = 0.0;
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint blkBase16 = rowBase16 + blk * UINT16_PER_BLOCK;
+        float dW = unpackHalf2x16(readU16(blkBase16)).x;
+        float dX = xds[blk].x;
+
+        uint qb = blkBase16 + qOff16;
+        uint w32a = readU16(qb)      | (readU16(qb + 1u) << 16u);
+        uint w32b = readU16(qb + 2u) | (readU16(qb + 3u) << 16u);
+
+        uint xbase = blk * 8u + 2u * subInBlock;
+        uint xa = xq[xbase];
+        uint xb = xq[xbase + 1u];
+
+        int dotI = 0;
+        dotI = dotPacked4x8AccSatEXT(int(w32a), int(xa), dotI);
+        dotI = dotPacked4x8AccSatEXT(int(w32b), int(xb), dotI);
+
+        acc += (dW * dX) * float(dotI);
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[m] = total;
+}
