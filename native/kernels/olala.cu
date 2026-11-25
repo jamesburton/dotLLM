@@ -38,6 +38,10 @@ __device__ __forceinline__ float ldA(const act_t* p) { return bf2f(*p); }
 __device__ __forceinline__ void stA(act_t* p, float v) { *p = f2bf(v); }
 #endif
 
+// K/V history is BF16 by contract (HF casts K and V to bf16 too; the CPU reference stores BF16): in the F32 control arm it is rounded the same way,
+// so the control differs from the CPU only by float rounding.
+__device__ __forceinline__ void stKV(act_t* p, float v) { stA(p, bf2f(f2bf(v))); }
+
 __device__ __forceinline__ float warpSum(float v)
 {
 #pragma unroll
@@ -633,8 +637,8 @@ extern "C" __global__ void __launch_bounds__(128) olala_tpa_kv(
     float scl = 1.0f / rms;
     if (act)
     {
-        stA(kcache + (size_t)pos * kvW + (size_t)h * hd + d, kk * scl * kgain[d]);
-        stA(vcache + (size_t)pos * kvW + (size_t)h * hd + d, vv);
+        stKV(kcache + (size_t)pos * kvW + (size_t)h * hd + d, kk * scl * kgain[d]);
+        stKV(vcache + (size_t)pos * kvW + (size_t)h * hd + d, vv);
     }
 }
 

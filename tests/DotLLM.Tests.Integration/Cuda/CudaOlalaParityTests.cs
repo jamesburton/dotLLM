@@ -250,7 +250,7 @@ public sealed class CudaOlalaParityTests
         Assert.True(worstAbs < ControlAbsGate, $"control |dlogit| {worstAbs:E3}");
     }
 
-    private const double ControlKlGate = 1e-9, ControlAbsGate = 1e-4;   // Vulkan's control arm (OlalaVulkanTests) uses the same pair
+    private const double ControlKlGate = 1e-11, ControlAbsGate = 1e-5;   // measured clean: KL 3.5e-14, |dlogit| 9e-7 (Vulkan control arm: 7e-14)
 
     [SkippableFact]
     public void Tiny_GreedyContinuation_MatchesHf()
