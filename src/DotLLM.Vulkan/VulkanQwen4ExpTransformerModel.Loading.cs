@@ -142,6 +142,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                                            string.Join("; ", problems.Take(8)) + (problems.Count > 8 ? $"; (+{problems.Count - 8} more)" : ""));
         if (edge0Pack is not null && (!config.Moe!.NormTopKProb || config.Moe.NumExperts != edge0Pack.Experts))
             throw new InvalidDataException("Edge0 skeleton MoE configuration disagrees with the pack.");
+        // Refuse before ~52 GiB of uploads rather than at the first forward: the F16-output D / U kernels exist for a Q8_0 latent only (Q4_0 latent: follow-up #1997).
+        if (edge0Pack is not null && edge0Pack.LatentDenseType != QuantizationType.Q8_0)
+            throw new NotSupportedException($"The Vulkan Edge0 path has F16-output D / U kernels for a Q8_0 latent only, not {edge0Pack.LatentDenseType} (DOTLLM_EDGE0_LATENT=q4 packs run on the CPU; #1997).");
         if (q4.Ple is { } ple0 && ple0.Layers.Count > 1)
             throw new NotSupportedException("qwen4exp files carry one set of PLE hash constants; several PLE layers cannot be represented.");
 
