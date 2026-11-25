@@ -92,7 +92,7 @@ TINY = dict(
     hidden_size=64, num_hidden_layers=5, layers_config="MVMMV", vocab_size=96, mamba_headdim=16, mamba_d_state=16,
     mamba_mimo_dim=2, mamba_ngroups=1, head_dim=16, num_attention_heads=8, num_signal_heads_diff=6, tpa_rank=2,
     moe_num_routed_experts=8, moe_num_active_experts=3, moe_routed_input_dim=32, moe_routed_intermediate_size=32,
-    moe_shared_intermediate_size=48, slw_wsize=5, sliding_window_size=64, max_position_embeddings=128,
+    moe_shared_intermediate_size=48, slw_wsize=5, sliding_window_size=64, softcap_attn=3.0, max_position_embeddings=128,
     bos_token_id=1, eos_token_id=2, pad_token_id=0,
 )
 

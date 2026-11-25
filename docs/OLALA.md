@@ -1,0 +1,163 @@
+# Olala (OVHcloud) — architecture notes
+
+**Status:** CPU reference forward (issue #1970, epic #1969). Vulkan and CUDA refuse the architecture explicitly until their ports land.
+Models: `OVHaiLLM/Olala-v1.0-mini-7A1B` (HF `model_type: olala`, `OlalaForCausalLM`, custom code) and the later translate / summarise / SFT /
+base variants that share the arch. GGUF: `OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF` (`general.architecture = olala`).
+
+**Sources.** Semantics: HF `modeling_olala.py` (authoritative; `_mamba3_mimo_torch`, `_mamba3_step_torch`, `OlalaGeodesicNorm`,
+`OlalaDifferentialTensorProductAttentionV2`, `OlalaMoE`). GGUF layout and the converter's folds: the OVH llama.cpp fork
+(`OVHai-LLM/llama.cpp`, branch `olala-master`: `conversion/olala.py`, `src/models/olala.cpp`, `docs/olala.md`). Upstream llama.cpp,
+Ollama and LM Studio cannot load these files; the fork is the only GGUF reference implementation.
+
+## 1. Layer layout (7A1B)
+
+36 blocks, `olala.layer_types = MMMMVMMMMVMMMMVMMMMVMMMMVMMMMVMMMMVM` = **29 M + 7 V**. Hidden 1536, vocab 151936 (Qwen BPE, `pre: qwen2`),
+`context_length` 100000, tokenizer chat template embedded. **No final norm.** Token embeddings are **L2-normalised** (`normalize_embeddings_ngpt`),
+`output.weight` is untied. Every block has the same shape:
+
+```
+x_{in} (unit norm)
+  y = mixer(x_in)                      # no pre-norm: the mixer reads the raw residual
+  x   = geodesic_mixer(x_in, y)
+  y = MoE(x) + shared_expert(x)        # no post-mixer norm
+  x_out = geodesic_mlp(x, y)
+```
+
+### Geodesic residual (`OlalaGeodesicNorm`, `geodesic_update`)
+Rotation of the residual towards the orthogonal component of the update, so the residual norm stays 1 after every block (asserted in
+Debug builds):
+
+```
+g_perp = g - (x.g / |x|^2) x;   R = |x|;  t = min(|g_perp| / R, pi/4)
+theta  = min((t * scale + bias) / (layer + 1), pi/4)          # scale, bias: 4 scalars per block (geo_mixer_*, geo_mlp_*)
+out    = x cos(theta) + (g_perp / |g_perp|) R sin(theta)
+```
+Reductions run in double (`OlalaOps.GeodesicUpdate`): the M-mixer outputs reach ~1e14 (see §4).
+
+### M layer — Mamba-3 MIMO (`OlalaMamba3MimoFast`)
+H = 48 heads, P = 64, N = 128, R = 4 (MIMO rank), 32 rotary angle pairs, G = 1 group, no conv (`remove_conv`), trapezoid, data-dependent A.
+- `ssm_in` (1536 -> 48 x 131) is **per-head interleaved** `[z(64), x(64), dt, A, trap]`; `ssm_in_dyn` (1536 -> 1056) = `B[R][N]`, `C[R][N]`, 32 raw angles
+  (shared by all heads). With G = 1 the `(G r n)` and `(r G n)` layouts coincide, so no test on this model can discriminate them.
+- `A = min(-softplus(a), -1e-4)`, `dt = softplus(dt_raw + dt_bias)`, `trap = sigmoid`, `alpha = exp(A dt)`, `beta = (1 - trap) dt alpha`, `gamma = trap dt`.
+- B and C: RMSNorm over N (gain `ssm_b_norm`/`ssm_c_norm`, **already `1 + w`** in the GGUF), + per-head bias `[H][R][N]`, then rotated: angle
+  `cum += tanh(raw) * dt * pi` per head, pairs `(i, i + N/2)` for `i < 32`.
+- Recurrence per head: `h_t = alpha h_{t-1} + beta u_{t-1} + gamma u_t`, `u_t = sum_r k_{t,r} (x_t * MimoX_r)^T`;
+  `o_r = h_t q_r + D (x_t * MimoX_r)`; `y = sum_r MimoO_r * o_r * silu(z * MimoZ_r)`. No post-gate norm.
+- State (F32, §3): `h[H][P][N]`, angle `[H][32]`, previous token's rotated K `[R][H][N]` and raw x `[H][P]`.
+- Output `attn_output` (3072 -> 1536).
+
+### V layer — differential tensor-product attention (not MLA)
+48 query heads, 12 KV heads (= noise heads), head_dim 128, TPA rank 4, **no RoPE** (`rope_theta = 0`).
+- `K[h] = (A_k[h] @ B_k) / 4`, `V[h] = (A_v[h] @ B_v) / 4` with `A: 1536 -> 12 x 4`, `B: 1536 -> 4 x 128` (so K/V are 12 x 128 per token).
+- **Token shift** (position 0 masked): `K~ = a K_prev + (1 - a) K`, `a = sigmoid(shift_proj_k(x))` per KV head, same for V; `K_prev`/`V_prev`
+  are the previous token's **raw (pre-shift, pre-norm)** K and V.
+- `K~` and `Q` are RMS-normed per head (`attn_k_norm` / `attn_q_norm`, gain already `1 + w`). **Scalable softmax:**
+  `Q *= softmax_scaler[h] * log(min(pos + 1, window))` with `window = attention.sliding_window` (HF `slw_wsize`, 32768).
+- Scores `Q.K * (1/head_dim)` (completed-P scale, not `1/sqrt(d)`), soft cap `150 tanh(s/150)`, causal window of `window + 1` keys.
+- **Differential combine** per KV group (query heads `4g .. 4g+3`): heads 0..2 are signal, head 3 is noise;
+  `out[3g + s] = attn[4g + s] - sigmoid(lambda_proj(x)[g]) * attn[4g + 3]` -> 36 heads x 128.
+- Output gate `silu(attn_gate(x) + 1.15)` (elementwise, 4608), then `attn_output` (4608 -> 1536).
+- HF casts the query and the K/V to bf16 before the kernel and returns the attention output in bf16; dotLLM keeps the query and the output
+  F32 and stores K/V as BF16 (see §5).
+
+### MoE (every block, `OlalaMoE`)
+`logits = x W_router^T` (F32 router, `ffn_gate_inp`), `s = sigmoid(logits)`, **top-6 of `s + exp_probs_b`**, the selected *un-biased* `s`
+normalised to sum 1 (`+1e-20`) and multiplied by 2.45. Routed experts run in a **384-wide latent**: `z = ffn_latent_down(x)`;
+per expert `relu(W_up[e] z)^2` (768) then `W_down[e]` (384); weighted sum; `ffn_latent_up` back to 1536. Shared expert:
+`ffn_down_shexp(relu(ffn_up_shexp(x))^2)`. Result = routed + shared. ReLU^2 everywhere (no SwiGLU, no gate matrix).
+
+## 2. GGUF tensor map
+
+| GGUF | HF | shape (GGUF order) |
+|---|---|---|
+| `token_embd.weight`, `output.weight` | `model.embedding`, `lm_head` | 1536 x 151936 |
+| `blk.N.geo_{mixer,mlp}_{scale,bias}` | `geodesic_{mixer,mlp}.{scale,bias}` | 1 (F32) |
+| `blk.N.attn_output.weight` | `mixer_proj` | M: 3072 x 1536, V: 4608 x 1536 |
+| M: `ssm_in`, `ssm_in_dyn` | `mixer.in_proj`, `in_proj_dyn` | 1536 x 6288, 1536 x 1056 |
+| M: `ssm_b_norm`, `ssm_c_norm` (`.weight`) | `B_norm.norm`, `C_norm.norm` | 128 (F32, `1 + w`) |
+| M: `ssm_b_bias`, `ssm_c_bias` | `B_bias`, `C_bias` | 128 x 4 x 48 (F32) |
+| M: `ssm_dt_bias`, `ssm_d` | `dt_bias`, `D` | 48 |
+| M: `ssm_mimo_x`, `ssm_mimo_z`, `ssm_mimo_o` | `in_proj_mimo_x`, `_z`, `out_proj_mimo` | 64 x 4 x 48 (F32) |
+| V: `attn_q`, `attn_wa_k/v`, `attn_wb_k/v` | `c_q`, `W_A_k/v`, `W_B_k/v` | 1536 x 6144 / 48 / 512 |
+| V: `attn_shift_k/v`, `attn_lambda` | `shift_proj_k/v`, `lambda_proj` | 1536 x 12 |
+| V: `attn_gate` | block `gate_proj` | 1536 x 4608 |
+| V: `attn_q_norm`, `attn_k_norm`, `attn_softmax_scaler` | `q_norm.norm`, `k_norm.norm`, `softmax_scaler` | 128, 128, 48 (F32) |
+| `ffn_gate_inp.weight`, `exp_probs_b` | `moe_gate`, `expert_bias` | 1536 x 256, 256 (F32) |
+| `ffn_latent_down` / `ffn_latent_up` | `mlp.down_proj` / `up_proj` | 1536 x 384 / 384 x 1536 |
+| `ffn_up_exps` / `ffn_down_exps` | `experts.experts` / `output_experts` | 384 x 768 x 256 / 768 x 384 x 256 |
+| `ffn_up_shexp` / `ffn_down_shexp` | `shared_experts.fc_1` / `fc_2` | 1536 x 1536 |
+| `blk.N.ssm_m3_{bias,mxz,norms,misc}` | (none) | packed duplicates for the fork's GPU kernels — **ignored** |
+
+`OlalaTensors.FindProblems` checks every shape and rejects unknown tensors (cosnet branches, value embeddings, a final norm, skip-layer
+pruning, `layer_idx_map` variants all fail loudly instead of running a different model).
+
+## 3. Quantisation: `safe2`, and why
+
+`Olala-v1.0-mini-7A1B-q8_0-safe2.gguf` is produced by the fork's `llama-quantize` from the bf16 file:
+
+```
+--tensor-type attn_output=bf16  --tensor-type ffn_down_exps=q6_k  --tensor-type ffn_down_shexp=bf16
+--tensor-type ffn_latent_up=bf16 --tensor-type ffn_up_exps=q8_0   <file> q8_0
+```
+Everything else is Q8_0 (embeddings, lm_head, `ssm_in*`, attention projections, router is F32, `ffn_latent_down`, `ffn_up_shexp`); biases, MIMO
+projections, norms, geodesic scalars and the router are F32 and never quantised. The four protected tensors are exactly the ones whose
+**inputs are unbounded**: `attn_output` (M-mixer outputs reach ~1e14), `ffn_down_shexp` (ReLU^2 of the shared expert, ~1e9), `ffn_down_exps` (ReLU^2 of the routed
+experts, ~1e9, the one that stays quantised: Q6_K uses Q8_K activations with an F32 scale) and `ffn_latent_up`. Type-0 quants (Q8_0/Q5_0/Q4_0) quantise
+activations to Q8_0 **with an FP16 scale**, which overflows to NaN on those inputs; `ffn_up_exps` and `ffn_latent_up` have K = 384 which K-quants cannot encode,
+so llama-quantize silently falls back to type-0 for them — the reason for the explicit `ffn_up_exps=q8_0` / `ffn_latent_up=bf16` overrides. The 6/5-bit
+files add `--imatrix` and the same two overrides. OVH report KLD vs bf16 of 0.0040 (q8_0-safe2, 96.9% same top-1), 0.0106 (q6_k), 0.0194 (q5_k_m) and withdrew the Q4_K_M.
+
+**Consequences for dotLLM (all backends).**
+- FP16 activation storage or an FP16 scale on the activation path is **not viable** for this model (ceiling 65,504 vs 1e9-1e14). Activations are F32 on
+  CPU; any GPU port must keep BF16/F32 on the mixer-output -> `attn_output` and ReLU^2 -> down paths (the fork forces `GGML_PREC_BF16` on every quantised matmul for this reason).
+  This is a sign-off item for the Vulkan/CUDA slices (their F16 activation defaults, #1138, do not apply here).
+- Weights are read in place (rule 2): BF16 tensors go through a row-streaming dequantise-and-dot with F32 activations, Q6_K through the Q8_K path, Q8_0 through
+  the Q8_0 path (all q8_0 tensors of safe2 have bounded inputs).
+
+## 4. Precision policy: F32 recurrent state (tracked exception)
+
+CLAUDE.md precision rule 1 forbids FP32 storage on hot paths. For Olala the Mamba recurrent state is **F32 by explicit user sign-off (2026-11-25)**, as a
+per-architecture, tracked exception (`OlalaStatePolicy`, a compile-time constant of this arch; no env var or global setting narrows it):
+OVH serve with vLLM `--mamba-ssm-cache-dtype float32`; the fork's own docs state a reduced-precision state "degrades long generations into repetition loops"
+(`OLALA_BF16_STATE=1` "not recommended", `OLALA_STATE_Q8=1` an unvalidated experiment). Covered buffers and their cost per sequence (7A1B):
+
+| buffer | shape | bytes / M layer | x 29 layers |
+|---|---|---|---|
+| SSM matrix `h` | 48 x 64 x 128 | 1,572,864 | 44.0 MiB |
+| rotary phase | 48 x 32 | 6,144 | 174 KiB |
+| trapezoid K (rotated) | 4 x 48 x 128 | 98,304 | 2.7 MiB |
+| trapezoid V (raw x) | 48 x 64 | 12,288 | 348 KiB |
+| token-shift last K/V (per V layer, x 7) | 2 x 12 x 128 | 12,288 | 84 KiB |
+
+Evidence plan for a smaller dtype, and the exit criteria: issue #1971. Listed in `docs/PRECISION.md` (Keep-FP32 by policy). It is **not** precedent for any other
+storage: K/V history stays BF16 (HF casts K and V to bf16 too), activations F32 only because of the outliers above.
+
+## 5. Oracle and numerics (HF transformers, CPU)
+
+`scripts/olala-oracle/olala_oracle.py` runs HF `modeling_olala.py` on CPU (`OLALA_TORCH_MAMBA3=1` pure-PyTorch scan/step, eager attention, torch experts) and records
+full no-cache logits plus a greedy continuation produced through HF's *cache* (one-token step) path with explicit `position_ids`.
+HF quirks that matter when building an oracle: (a) `OlalaModel.forward` defaults `position_ids` to 0 on every cached step — pass them (the token shift and
+scalable softmax read them); (b) a 1-token prefill into an empty cache is treated as a decode step and crashes; (c) multi-token continuation with a cache
+restarts the SSM from zero, so chunked-prefill continuation cannot be oracle-tested against HF (the dotLLM state continues correctly).
+
+Two HF variants are recorded: **strict** (the query is not rounded to bf16) and **hf** (as shipped). Shipped HF rounds the query to bf16 and returns the attention output
+in bf16; this alone is ~1e-3 in logits (measured: it vanishes to 5e-7 when the same two casts are added to dotLLM). dotLLM computes the query and the attention output in F32,
+so the strict variant is the one a correct F32 engine matches to float rounding. The GGUF converter folds `1 + w` for B/C/Q/K norms **in the checkpoint dtype (bf16)**,
+so the GGUF carries bf16-rounded gains (error up to ~4e-3 per gain) that HF-from-safetensors does not have; the real-model oracle can patch HF's gains from the GGUF to isolate engine differences from
+that conversion rounding (`--gguf`).
+
+Tiny model (`olala_oracle.py tiny`): 5 layers `MVMMV`, hidden 64, every 7A1B flag, a 5-token window with 12-token and 3-token prompts, BF16 GGUF; the unit tests compare
+all prefill rows and every teacher-forced decode step (KL, max|dlogit|, argmax) and the free-running greedy continuation. Mutation record: PR #2000-series body / issue #1970.
+
+## 6. Differences from the existing code and what is reused
+
+| existing | Olala |
+|---|---|
+| `Mamba3*` (safetensors-first, canonical in_proj `[z, x, B, C, dt, A, trap, angles]`, F32 spans, `qk_pre_dot` + shifted-gamma chunk kernels) | per-head interleaved `ssm_in` + separate `ssm_in_dyn`, recurrence evaluated token by token (`OlalaOps.Mamba3MimoStep`); MIMO tensor shapes (`[H,R,P]`, `[H,R,N]`) match, so `Mamba3CanonicalSsd.ExecuteMimoStreaming` is the candidate for chunked prefill once its input layout is adapted (follow-up) |
+| MLA (`MlaConfig`, latent KV) | **Not MLA.** TPA factors are re-expanded to 12 x 128 K/V per token; the factored cache (12 x 4 + 4 x 128 per token vs 2 x 12 x 128) is a later memory optimisation (the fork's "2.6x less KV") |
+| qwen4exp latent MoE (`MoeSwiGluMlp`, softmax router) | sigmoid router + selection bias, renormalised x 2.45, ReLU^2 experts without a gate matrix, latent down/up around the routed bank |
+| pre-norm blocks, `final_norm` | none of either: geodesic rotation, unit-norm residual, lm_head straight on the residual |
+
+## 7. Not done yet (tracked in #1969)
+Vulkan and CUDA forwards (both refuse with `OlalaConfig.UnsupportedMessage`), chunked/parallel prefill of the M layers, a factored TPA KV cache, prefix-cache/snapshot support,
+serving (chat template reasoning-effort, tool-call parser), `lazy` expert paging for small-RAM machines.

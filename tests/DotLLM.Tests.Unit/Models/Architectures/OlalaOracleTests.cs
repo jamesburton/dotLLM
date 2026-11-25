@@ -215,7 +215,7 @@ public sealed class OlalaOracleTests
         Assert.Equal(2, o.NumNoiseHeads); Assert.Equal(6, o.NumSignalHeads);
         Assert.Equal(5, cfg.SlidingWindowSize);
         Assert.Null(cfg.PerLayerSlidingWindow);
-        Assert.Equal(150f, cfg.AttnLogitSoftcap);
+        Assert.Equal(3f, cfg.AttnLogitSoftcap);
     }
 
     [SkippableFact]
