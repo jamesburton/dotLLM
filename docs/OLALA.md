@@ -147,7 +147,45 @@ so the GGUF carries bf16-rounded gains (error up to ~4e-3 per gain) that HF-from
 that conversion rounding (`--gguf`).
 
 Tiny model (`olala_oracle.py tiny`): 5 layers `MVMMV`, hidden 64, every 7A1B flag, a 5-token window with 12-token and 3-token prompts, BF16 GGUF; the unit tests compare
-all prefill rows and every teacher-forced decode step (KL, max|dlogit|, argmax) and the free-running greedy continuation. Mutation record: PR #2000-series body / issue #1970.
+all prefill rows and every teacher-forced decode step (KL, max|dlogit|, argmax) and the free-running greedy continuation. Mutation record: §5.1.
+
+
+### 5.1 Measured parity (2026-11-25, Zen 5 CPU, F32 activations)
+
+**Tiny model** (strict oracle): every prefill row and every teacher-forced decode step agrees with HF to float rounding (max |dlogit| ~1e-6, KL ~1e-14), greedy
+continuations identical. Against HF as shipped: max |dlogit| ~2e-3, KL ~2e-7 (the bf16 query / attention-output casts; same argmax everywhere).
+
+**Real 7A1B, bf16 GGUF** vs HF float32 with the GGUF's own norm gains (`real-strict-gguf-norms`):
+
+| prompt | prefill rows (worst KL / top-1) | decode 24 steps teacher-forced (worst KL / top-1) | median KL | greedy 24 tokens |
+|---|---|---|---|---|
+| "The capital of France is" (5) | 2.7e-7 / 5 of 5 | 1.05e-3 (one step, 0.7 logit) / 24 of 24 | 2.1e-7 | identical |
+| `def fibonacci(n):` docstring (13) | 1.5e-6 / 13 of 13 | 1.1e-4 / 24 of 24 | 7.8e-8 | identical |
+| chat template, "Say hello in French." (300) | 0.45 (worst row) / 297 of 300 | 8.0e-4 / 24 of 24 | 3.9e-5 | identical |
+
+The isolated KL spikes (one decode step in "capital", a few rows of the 300-token prompt) are single rows; the hypothesis is an MoE top-6 flip between two near-tied
+experts under float reassociation (not verified row by row). The 300-token chat prompt is numerically chaotic even for HF: its own one-token-step path differs from its chunked
+forward by up to 2.9 logits (strict) / 5.7 (as shipped), because activation outliers of 1e9-1e14 amplify reassociation noise; it is gated at the noise floor (median KL, top-1) only.
+Against HF **as shipped** (bf16 query/attention output, exact `1 + w` gains instead of the GGUF's bf16-rounded ones): short prompts median KL 7e-6 .. 2e-5, top-1 and greedy identical;
+the 300-token prompt median KL 4.7e-3, top-1 274 of 300 (informational).
+
+**q8_0-safe2 vs bf16** (dotLLM CPU both sides, teacher-forced on the HF greedy tokens, no NaN anywhere): "capital" mean KL 8.2e-3 / top-1 26 of 28, "code" 1.8e-3 / 36 of 36,
+chat 0.15 / 281 of 323 (the long prompt amplifies the 8-bit noise). OVH's published numbers (16 wikitext chunks): KLD 0.0040, 96.9% same top-1 — consistent for the short prompts; a wikitext
+KLD run is the proper like-for-like measurement and is not done yet.
+
+### 5.2 Mutation record (tiny oracle, `OlalaOracleTests`)
+Each row is a deliberately wrong implementation; all fail the oracle tests except the two noted.
+
+| mutant | result |
+|---|---|
+| drop the `beta u_{t-1}` trapezoid carry; V-state not carried; angle not accumulated | killed |
+| fold zero-centred gamma twice; swap B/C norm gains | killed |
+| attention scale `1/sqrt(d)`; no soft cap; window off by one; `log(pos+1)` not clamped to the window | killed (soft cap needed a tiny cap of 3.0: at 150 the first oracle could not see it) |
+| swap signal/noise heads; kv head `h % n` instead of `h / group`; TPA not divided by rank; gate bias dropped | killed |
+| token shift: post-norm K carried; not masked at position 0 | killed |
+| routing: no `expert_bias` in top-k; probabilities not renormalised; ReLU instead of ReLU^2; shared expert dropped | killed |
+| embedding not L2-normalised; geodesic divisor `layer` instead of `layer + 1`; K cache perturbed by 1% | killed |
+| **SSM state rounded to bf16 every step** | **survived** — on a 12-token sequence the narrowing is below the tolerance. This is why #1971 needs long-generation evidence; the short oracle cannot decide the state dtype. |
 
 ## 6. Differences from the existing code and what is reused
 
