@@ -27,6 +27,7 @@
       <Packages ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
       <RuntimePacks ParameterType="Microsoft.Build.Framework.ITaskItem[]" />
       <Frameworks ParameterType="Microsoft.Build.Framework.ITaskItem[]" />
+      <SelfContained ParameterType="System.String" />
       <PackageRoot ParameterType="System.String" Required="true" />
       <LicenseTemplateDir ParameterType="System.String" Required="true" />
       <Product ParameterType="System.String" Required="true" />
@@ -95,6 +96,24 @@
             .Where(i => i.GetMetadata("FrameworkName").Length == 0 || referenced.Contains(i.GetMetadata("FrameworkName")))
             .Select(i => i.GetMetadata("PackageDirectory")).Where(d => d.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(d => d, StringComparer.OrdinalIgnoreCase).ToList();
+        // Fail closed: a self-contained publish bundles a runtime pack for every referenced framework, so a filter that drops
+        // one (an SDK that shapes these items differently) would silently omit the .NET runtime's notices.
+        if (string.Equals(SelfContained, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            var kept = new HashSet<string>((RuntimePacks ?? new Microsoft.Build.Framework.ITaskItem[0])
+                .Where(i => packs.Contains(i.GetMetadata("PackageDirectory"), StringComparer.OrdinalIgnoreCase))
+                .Select(i => i.GetMetadata("FrameworkName")), StringComparer.OrdinalIgnoreCase);
+            if (packs.Count == 0)
+                Log.LogError("Third-party notices: self-contained publish but no .NET runtime pack was resolved; the runtime's notices would be missing.");
+            foreach (var f in Frameworks ?? new Microsoft.Build.Framework.ITaskItem[0])
+            {
+                var tp = f.GetMetadata("TargetingPackName");
+                var name = f.GetMetadata("RuntimePackName").Length > 0 ? f.ItemSpec
+                    : tp.EndsWith(".Ref", StringComparison.OrdinalIgnoreCase) ? tp.Substring(0, tp.Length - 4) : null;
+                if (name != null && !kept.Contains(name))
+                    Log.LogError("Third-party notices: framework " + f.ItemSpec + " is bundled by this self-contained publish but no runtime pack for " + name + " was resolved.");
+            }
+        }
         foreach (var d in packs) sb.AppendLine("  " + Path.GetFileName(Path.GetDirectoryName(d.TrimEnd('/', '\\'))) + " " + Path.GetFileName(d.TrimEnd('/', '\\')) + " (.NET runtime pack)");
         sb.AppendLine();
 
@@ -197,6 +216,7 @@
         Packages="@(RuntimeCopyLocalItems);@(NativeCopyLocalItems);@(ResourceCopyLocalItems)"
         RuntimePacks="@(ResolvedRuntimePack)"
         Frameworks="@(ResolvedFrameworkReference)"
+        SelfContained="$(SelfContained)"
         PackageRoot="$(NuGetPackageRoot)"
         LicenseTemplateDir="$(MSBuildThisFileDirectory)licenses"
         Product="$(ThirdPartyNoticesProduct)"
