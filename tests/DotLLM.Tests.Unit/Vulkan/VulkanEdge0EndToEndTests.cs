@@ -124,6 +124,7 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
         return kl;
     }
 
+    private static string LastRowKlTop = "";
     private static (double Mean, double Max, int Rows)? RowKl(float[]? vkRows)
     {
         if (vkRows is null || Environment.GetEnvironmentVariable("DOTLLM_EDGE0_ROWS_REF") is not { Length: > 0 } path || !File.Exists(path)) return null;
@@ -131,12 +132,13 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
         int rows = rd.ReadInt32(), vocab = rd.ReadInt32();
         var cpuRows = new float[rows * vocab];
         for (int i = 0; i < cpuRows.Length; i++) cpuRows[i] = rd.ReadSingle();
-        double sum = 0, max = 0;
+        double sum = 0, max = 0; var per = new List<(int Row, double Kl)>();
         for (int t = 0; t < rows; t++)
         {
             double kl = Kl(cpuRows.AsSpan(t * vocab, vocab).ToArray(), vkRows.AsSpan(t * vocab, vocab).ToArray());
-            sum += kl; max = Math.Max(max, kl);
+            sum += kl; max = Math.Max(max, kl); per.Add((t, kl));
         }
+        LastRowKlTop = string.Join(" ", per.OrderByDescending(x => x.Kl).Take(6).Select(x => $"r{x.Row}:{x.Kl:E1}"));
         return (sum / rows, max, rows);
     }
 
@@ -235,7 +237,7 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
                     for (int sIdx = 0; sIdx < 48; sIdx++) { using var lg = vk.Forward([13], [pos++], -1, null, true); }
                     dc2.Add(48 / swd.Elapsed.TotalSeconds);
                 }
-                output.WriteLine($"SWEEP {cfg}: scratch {vk.Edge0ScratchBytesForTest / 1048576.0:F1} MiB; device live {device.LiveBytesTotal() / (double)(1L << 30):F2} GiB; NLL {nllV:F4} (cpu {cpu[0].MeanNll:F4}); ROWKL {(rowKl is { } rk ? $"mean {rk.Mean:E3} max {rk.Max:E3} over {rk.Rows} rows" : "n/a")}; KL {string.Join(" / ", kls)}; greedy {string.Join(" ", gr)}; row argmax {rowAg}/{rowN}; prefill {string.Join("/", pf2.Select(v => v.ToString("F0")))} tok/s; decode {string.Join("/", dc2.Select(v => v.ToString("F1")))} tok/s");
+                output.WriteLine($"SWEEP {cfg}: scratch {vk.Edge0ScratchBytesForTest / 1048576.0:F1} MiB; device live {device.LiveBytesTotal() / (double)(1L << 30):F2} GiB; NLL {nllV:F4} (cpu {cpu[0].MeanNll:F4}); ROWKL {(rowKl is { } rk ? $"mean {rk.Mean:E3} max {rk.Max:E3} over {rk.Rows} rows, top {LastRowKlTop}" : "n/a")}; KL {string.Join(" / ", kls)}; greedy {string.Join(" ", gr)}; row argmax {rowAg}/{rowN}; prefill {string.Join("/", pf2.Select(v => v.ToString("F0")))} tok/s; decode {string.Join("/", dc2.Select(v => v.ToString("F1")))} tok/s");
             }
             return;
         }
