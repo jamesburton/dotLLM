@@ -196,6 +196,9 @@ public static class VulkanModelLoader
             case Architecture.Ricursive:
                 throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("Vulkan"));
 
+            case Architecture.Olala:
+                throw new NotSupportedException(OlalaConfig.UnsupportedMessage("Vulkan"));
+
             case Architecture.Mamba3:
                 throw new NotSupportedException(
                     "Mamba-3 has no GGUF representation: no upstream 'mamba3' value for " +

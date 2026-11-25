@@ -1398,6 +1398,10 @@ internal sealed class TransformerWeights : IDisposable
             DotLLM.Core.Configuration.Architecture.Ricursive =>
                 "it has no forward pass yet (config + tensor census + tokenizer only, issue #1643): its value residual, separate sigmoid "
                 + "output gate, sandwich norms, NoPE full-attention layers and SwiGLU clamp are not implemented by the dense path",
+            DotLLM.Core.Configuration.Architecture.Olala =>
+                "it is a Mamba-3 MIMO / differential tensor-product-attention hybrid with a latent MoE and geodesic residuals "
+                + "(ssm_in/ssm_in_dyn/attn_wa_*/attn_wb_*/ffn_latent_* tensors, no attn_norm/ffn_norm); it has a dedicated CPU model "
+                + "(OlalaTransformerModel, issue #1970); Vulkan and CUDA ports are tracked in epic #1969 and refuse explicitly until they land",
             DotLLM.Core.Configuration.Architecture.Mamba3 =>
                 "Mamba-3 has no GGUF representation at all (no upstream 'mamba3' value for "
                 + "general.architecture and no GGUF tensor-naming convention) — it is "

@@ -135,6 +135,9 @@ public static class CudaModelLoader
             case Architecture.Ricursive:
                 throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("CUDA"));
 
+            case Architecture.Olala:
+                throw new NotSupportedException(OlalaConfig.UnsupportedMessage("CUDA"));
+
             case Architecture.MiMoV2:
                 throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("CUDA"));
 

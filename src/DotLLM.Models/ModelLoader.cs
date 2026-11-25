@@ -92,6 +92,8 @@ public static class ModelLoader
             // ricursive (#1643): census first (a wrong or mixed value-residual name / unknown tensor fails as invalid data), then refuse:
             // there is no forward pass yet (CPU #1644).
             Architecture.Ricursive => RefuseRicursive(gguf, config),
+            // OVHcloud Olala (#1970): CPU reference forward (Mamba-3 MIMO + differential TPA + latent MoE).
+            Architecture.Olala => OlalaTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
         };
     }
