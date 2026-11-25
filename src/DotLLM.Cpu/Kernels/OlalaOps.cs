@@ -20,10 +20,11 @@ public static class OlalaOps
     /// <summary>
     /// <c>log(1 + exp(x))</c> with PyTorch's linear threshold at 20. Evaluated in double (PyTorch uses <c>log1p(exp(x))</c>): in float,
     /// <c>1 + exp(x)</c> rounds away the small term, so <c>dt = softplus(dt_raw + dt_bias)</c> with Olala's <c>dt_bias</c> down to -8.6 lost
-    /// 1e-4..1e-1 relative precision, and returned exactly 0 below x = -17.
+    /// 1e-4..1e-1 relative precision, and returned exactly 0 below x = -17. Below -20 exp(x) itself is exact to ~exp(x)/2 relative, where
+    /// 1 + exp(x) in double would start losing digits.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static float Softplus(float x) => x > 20f ? x : x < -30f ? MathF.Exp(x) : (float)Math.Log(1.0 + Math.Exp(x));
+    public static float Softplus(float x) => x > 20f ? x : x < -20f ? MathF.Exp(x) : (float)Math.Log(1.0 + Math.Exp(x));
 
     /// <summary>Logistic sigmoid.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
