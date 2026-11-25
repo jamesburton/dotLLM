@@ -300,7 +300,8 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
                 GeoMixScale = F32(B("geo_mixer_scale"))[0], GeoMixBias = F32(B("geo_mixer_bias"))[0],
                 GeoMlpScale = F32(B("geo_mlp_scale"))[0], GeoMlpBias = F32(B("geo_mlp_bias"))[0],
                 MixerOut = Weight(B("attn_output.weight")),
-                RouterW = Floats(F32(B("ffn_gate_inp.weight"))), ExpertBias = Floats(F32(B("exp_probs_b"))),
+                /* F32 router read in place (zero-copy import where the policy allows), never narrowed */
+                RouterW = Weight(B("ffn_gate_inp.weight"), allowF32: true).Buf, ExpertBias = Floats(F32(B("exp_probs_b"))),
                 LatentDown = Weight(B("ffn_latent_down.weight")), LatentUp = Weight(B("ffn_latent_up.weight")),
                 SharedUp = Weight(B("ffn_up_shexp.weight")), SharedDown = Weight(B("ffn_down_shexp.weight")),
                 UpExps = up, DownExps = down,

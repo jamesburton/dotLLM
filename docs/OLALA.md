@@ -236,6 +236,13 @@ Real q8_0-safe2 (teacher-forced on the HF greedy tokens, vs HF float32 with the 
 
 The BF16 activation storage costs no more than the q8_0 weight noise already in the file (compare the CPU numbers of section 5.1); no NaN anywhere (the outlier tensors are the BF16 / Q6_K ones). The 300-token chat prompt is chaotic (section 5.1).
 
+**The "capital" greedy divergence is a near tie, not a bug** (`Diag_GreedyDivergenceAttribution_Capital`, q8_0-safe2). At step 12 HF itself has top-1 374 vs top-2 1265 by a margin of **0.046** logits;
+Vulkan BF16-act has the same two tokens swapped by 0.047 (1265 ahead), the F32-activation control also picks 1265 (margin 0.153) and its free-running greedy diverges even EARLIER (token 4: 2038 vs 2550, step-4 near-tie
+introduced by the q8 weights). The bf16 GGUF on the same engine matches HF top-1 28 of 28 on this prompt. So the cause is q8_0 weight digitisation on a 0.05-logit tie, present in the F32-activation arm, not the BF16 storage.
+A CPU q8_0-safe2 greedy on the same prompt is pending (the cpu lock was held by another job); the F32-activation arm is bit-equivalent to the CPU on the tiny oracle (KL 7e-14).
+
+**Router.** The F32 `ffn_gate_inp` tensor is read in place (zero-copy import where the policy allows) and never narrowed. "BF16 routing weights" means the six per-token routing coefficients (the renormalised, x2.45 sigmoid scores), not the tensor.
+
 **Mutants** (tiny oracle + kernel tests, `native/vulkan/shaders` edited, SPIR-V rebuilt, tests rerun): killed - trapezoid carry dropped, angle not accumulated, previous-x carry, dt bias,
 scale 1/sqrt(d), no soft cap, window off by one, unclamped log, signal/noise swap, gate bias, kv-head mapping, V token shift unmasked at position 0, token-shift carry across batches,
 TPA not divided by rank, router bias dropped, no renormalisation, x2.45 dropped, ReLU for ReLU^2 (routed and shared), routing weight ignored, geodesic divisor, theta clamp, embedding not normalised,

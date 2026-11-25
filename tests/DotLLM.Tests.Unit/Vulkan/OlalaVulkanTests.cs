@@ -410,4 +410,50 @@ public sealed class OlalaVulkanTests
         }
         _output.WriteLine($"{file} act={(f32 ? "F32" : "BF16")}: warm prefill {pre.Min():F0}-{pre.Max():F0} tok/s, decode {dec.Min():F1}-{dec.Max():F1} tok/s");
     }
+
+    /// <summary>
+    /// Attribution of a greedy divergence (opt-in: <c>DOTLLM_OLALA_DIAG=1</c>; needs the gpu AND cpu locks): free-running greedy and teacher-forced
+    /// top-2 margins of Vulkan BF16-act, Vulkan F32-act and the CPU model on the same q8_0-safe2 file, against the HF oracle.
+    /// </summary>
+    [SkippableFact]
+    public void Diag_GreedyDivergenceAttribution_Capital()
+    {
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_OLALA_DIAG") != "1", "set DOTLLM_OLALA_DIAG=1");
+        SkipUnlessGpu();
+        string? gguf = FindGguf("DOTLLM_OLALA_Q8_GGUF", "Olala-v1.0-mini-7A1B-q8_0-safe2.gguf"); Skip.If(gguf is null, "q8 not in cache");
+        var c = OlalaOracleTests.LoadCase("real-strict-gguf-norms-capital")!;
+        using var f = GgufFile.Open(gguf!);
+        int[] pos = Enumerable.Range(0, c.L).ToArray();
+
+        void Arm(string name, Func<int[], int[], bool, ITensor> fwd, Action reset)
+        {
+            reset();
+            using var pre = fwd(c.Ids, pos, true);
+            var gen = new List<int>(); var rows = new List<float[]> { Rows(pre, 1, c.Vocab) };
+            gen.Add(OlalaOracleTests.Argmax(rows[0]));
+            for (int j = 1; j < c.N; j++) { using var s = fwd([gen[^1]], [c.L + j - 1], true); var r = Rows(s, 1, c.Vocab); rows.Add(r); gen.Add(OlalaOracleTests.Argmax(r)); }
+            int first = Enumerable.Range(0, c.N).FirstOrDefault(i => gen[i] != c.GreedyIds[i], -1);
+            _output.WriteLine($"{name}: free-running greedy {(first < 0 ? "identical to HF" : $"first divergence at token {first} (HF {c.GreedyIds[first]}, got {gen[first]})")}");
+            // teacher-forced margins on the HF tokens
+            reset();
+            using var pre2 = fwd(c.Ids, pos, true);
+            var tf = Rows(pre2, 1, c.Vocab);
+            for (int j = 0; j < c.N; j++)
+            {
+                if (j >= 10 && j <= 13)
+                {
+                    var top = tf.Select((v, i) => (v, i)).OrderByDescending(x => x.v).Take(2).ToArray();
+                    var hf = c.Greedy.AsSpan(j * c.Vocab, c.Vocab).ToArray().Select((v, i) => (v, i)).OrderByDescending(x => x.v).Take(2).ToArray();
+                    _output.WriteLine($"  {name} step {j}: top1 {top[0].i} ({top[0].v:F3}) top2 {top[1].i} ({top[1].v:F3}) margin {top[0].v - top[1].v:F4} | HF top1 {hf[0].i} top2 {hf[1].i} margin {hf[0].v - hf[1].v:F4} | HF token {c.GreedyIds[j]}");
+                }
+                if (j + 1 < c.N) { using var s = fwd([c.GreedyIds[j]], [c.L + j], true); tf = Rows(s, 1, c.Vocab); }
+            }
+        }
+
+        using var dev = VulkanDevice.Create();
+        using (var vk = LoadVk(dev, f)) Arm("Vulkan BF16-act", (i, p, l) => vk.Forward(i, p, -1, null, l), vk.ResetSequenceState);
+        using (var vk32 = LoadVk(dev, f, f32Act: true)) Arm("Vulkan F32-act", (i, p, l) => vk32.Forward(i, p, -1, null, l), vk32.ResetSequenceState);
+        if (Environment.GetEnvironmentVariable("DOTLLM_OLALA_DIAG_CPU") == "1")   // needs the cpu lock
+        using (var cpu = LoadCpu(f)) Arm("CPU", (i, p, l) => cpu.Forward(i, p, -1, null, l), cpu.ResetSequenceState);
+    }
 }
