@@ -999,12 +999,14 @@ the head 1.0 GiB smaller. UD-IQ4_XS, K = 4: 1.17x -> 1.56x of plain decode (K = 
   fall-back in the first request; the next re-probe (up to 16 requests later) recovers it.
 - *A fall-back is a measurement (#2018).* The fall-back fires after 5 rounds, which commit about 9 tokens, and `RecordSegment` drops segments under
   `MinSampleTokens` (12); so the MTP arm stayed at n=0, and every later request (serve too) retried MTP, fell back again and paid the rounds again. The
-  controller now hands the gate the figure the fall-back was decided on (`MtpRoundController.RecordFallback`: the cost model's best-K ms per token, which
-  excludes the cold first round) as the MTP sample, so the arm is measured, the loser is only re-probed on the usual doubling schedule, and the request's
-  short MTP segment is not recorded a second time. A context-band verdict is kept: `MtpAdaptiveGate.ForContext(promptTokens)` returns this gate for prompts up
+  controller now hands the gate the figure the fall-back was decided on (`MtpRoundController.RecordFallback`: the cost model's best-K ms per token; the
+  cost model drops only the first round it ever sees as cold) as the MTP sample, so the arm is measured, the loser is only re-probed on the usual doubling
+  schedule, and the request's MTP segment is not recorded a second time (a late fall-back's segment averages in the rounds that won and would say MTP
+  wins). The estimate is provisional: the next real MTP segment replaces it rather than blending in, so a stalled first request (10x plain) costs one
+  re-probe interval, not nine re-probes stretched over about 2,900 requests by the back-off. A context-band verdict is kept: `MtpAdaptiveGate.ForContext(promptTokens)` returns this gate for prompts up
   to 512 tokens and a lazily created sibling (own arms, re-probe schedule and cost model) for each doubling above it, so a loss measured at 2.4K is
   remembered at 2.4K and not charged to short prompts. Early rounds are noisy: the K model has two cost samples at the configured K and an unmeasured-K
-  guess of `K + 1 + FixedRows` rows (Edge0 on Vulkan: K=1 round 98 ms, K=4 141 ms, so about 6 rows of fixed cost, not 1.5), and one rejected round makes
+  guess of `K + 1 + FixedRows` rows (Edge0 on Vulkan: K=1 round 98 ms, K=4 141 ms, so `FixedRows` is about 4.8, not 1.5), and one rejected round makes
   the best K 1 for the next round (`DOTLLM_MTP_TRACE=1` prints the first 8 rounds with K and the best K afterwards).
 - *Re-probing.* A losing arm is re-measured every 40 decisions; a clear loss (> 10 %) doubles the interval up to 640.
 - *serve attaches the head.* `serve` never attached the separate qwen4exp head (only `run` did), so the default-on serve path never speculated on this
