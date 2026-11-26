@@ -95,19 +95,31 @@
   <!-- An edit to an included .glsl leaves every dependent .spv stale (#2004): the per-.comp target below only compares a .comp with its own .spv.
        This target keys a stamp (under obj/) on the newest .glsl; when any header is newer than the stamp it recompiles EVERY shader (we do not
        track which .comp includes which header; unchanged shaders re-emit identical bytes under the pinned glslc, so the tree stays clean), then
-       touches the stamp. With a mismatched glslc nothing is written and the stamp is left alone, so the next build warns again instead of
-       silently treating the stale blobs as current. -->
+       touches the stamp. A follow-up could make this per-shader with glslc -MD depfiles.
+       A MISSING stamp (fresh clone / worktree / configuration, every CI run) only records the baseline: the tracked .spv are taken as current
+       and nothing is compiled. Recompiling there would cost ~2 min per obj/ and, in CI, would rewrite every tracked .spv with the pinned glslc
+       right before VulkanSpvFreshnessTests compares them, so that guard (#1364 / #1372) could never fail. The price: a header edited before the
+       first build of a fresh obj/ is not seen here; run -t:RegenerateVulkanShaders (or touch the header again) in that case.
+       With glslc missing or not the pin, a header edit warns and writes nothing; the stamp is left alone so the next build warns again. -->
   <Target Name="_CompileVulkanShadersAfterIncludeEdit"
           BeforeTargets="CompileVulkanShaders"
           DependsOnTargets="_DetectGlslc"
           Inputs="@(VulkanShaderInclude)"
           Outputs="$(IntermediateOutputPath)vulkan-include.stamp">
     <!-- Conditions sit on the tasks: a target Condition is evaluated before DependsOnTargets has set _GlslcMatchesPin. -->
-    <MakeDir Condition="'$(_GlslcMatchesPin)' == 'true'" Directories="$(SpvOutputDir);$(IntermediateOutputPath)" />
-    <Message Condition="'$(_GlslcMatchesPin)' == 'true'" Importance="high" Text="A shader header (.glsl) changed: recompiling every shader to SPIR-V" />
-    <Exec Condition="'$(_GlslcMatchesPin)' == 'true'" Command="glslc --target-env=$(VulkanTargetEnv) -O -o &quot;$(SpvOutputDir)/%(VulkanShader.Filename).spv&quot; &quot;%(VulkanShader.FullPath)&quot;"
+    <PropertyGroup>
+      <_VulkanIncludeStampExists Condition="Exists('$(IntermediateOutputPath)vulkan-include.stamp')">true</_VulkanIncludeStampExists>
+      <_VulkanIncludeRebuild Condition="'$(_VulkanIncludeStampExists)' == 'true' And '$(_GlslcMatchesPin)' == 'true'">true</_VulkanIncludeRebuild>
+    </PropertyGroup>
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <Touch Condition="'$(_VulkanIncludeStampExists)' != 'true'" Files="$(IntermediateOutputPath)vulkan-include.stamp" AlwaysCreate="true" />
+    <Warning Condition="'$(_VulkanIncludeStampExists)' == 'true' And '$(_GlslcMatchesPin)' != 'true'"
+             Text="A shader header (.glsl) changed but glslc is missing or not the pinned '$(_GlslcPin)' (native/vulkan/glslc.version): the .spv that include it were NOT rebuilt and may be stale (#2004). Install the pinned shaderc, or run -t:RegenerateVulkanShaders." />
+    <Message Condition="'$(_VulkanIncludeRebuild)' == 'true'" Importance="high" Text="A shader header (.glsl) changed: recompiling every shader to SPIR-V" />
+    <MakeDir Condition="'$(_VulkanIncludeRebuild)' == 'true'" Directories="$(SpvOutputDir)" />
+    <Exec Condition="'$(_VulkanIncludeRebuild)' == 'true'" Command="glslc --target-env=$(VulkanTargetEnv) -O -o &quot;$(SpvOutputDir)/%(VulkanShader.Filename).spv&quot; &quot;%(VulkanShader.FullPath)&quot;"
           StandardOutputImportance="low" />
-    <Touch Condition="'$(_GlslcMatchesPin)' == 'true'" Files="$(IntermediateOutputPath)vulkan-include.stamp" AlwaysCreate="true" />
+    <Touch Condition="'$(_VulkanIncludeRebuild)' == 'true'" Files="$(IntermediateOutputPath)vulkan-include.stamp" AlwaysCreate="true" />
   </Target>
 
   <!-- Incremental compile of stale .comp files. Writes only when glslc matches the pin. -->
