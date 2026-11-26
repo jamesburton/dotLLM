@@ -58,6 +58,7 @@ public sealed class Edge0LatentKernels : IDisposable
     private readonly Pipe _gather, _combine, _acc;
     private Pipe? _decodeD, _decodeU, _combineAll, _combineF16, _gemmD, _gemmU;
     private MatMulQ8_0MmvqMultiKernel? _multiC16;
+    private Edge0WideGemvKernel? _wideD, _wideU;
 
     /// <summary>True when the single-row kernels that skip unused D/U groups exist (integer dot product, wave32, SPIR-V present).</summary>
     public bool HasDecodeKernels => _decodeD is not null && _decodeU is not null && _combineAll is not null;
@@ -76,6 +77,11 @@ public sealed class Edge0LatentKernels : IDisposable
 
     /// <summary>F16-output small-row (2..8) MMVQ; null when unavailable (the GEMMs then serve those rows).</summary>
     internal MatMulQ8_0MmvqMultiKernel? MultiC16 => _multiC16;
+
+    /// <summary>F16-output wide GEMV for D at 9..16 rows (F32 in); null when unavailable (the GEMM then serves those rows).</summary>
+    internal Edge0WideGemvKernel? WideD => _wideD;
+    /// <summary>F16-in / F16-out wide GEMV for U at 9..16 rows; null when unavailable.</summary>
+    internal Edge0WideGemvKernel? WideU => _wideU;
 
     private Edge0LatentKernels(Pipe gather, Pipe combine, Pipe acc) { _gather = gather; _combine = combine; _acc = acc; }
 
@@ -106,6 +112,8 @@ public sealed class Edge0LatentKernels : IDisposable
                 k._combineF16 = new Pipe(device, spvDir, "edge0_group_combine_f16", 5, 5 * sizeof(uint));
             }
             k._multiC16 = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir, f16Output: true);
+            k._wideD = Edge0WideGemvKernel.TryCreate(device, spvDir, f16Input: false);
+            k._wideU = Edge0WideGemvKernel.TryCreate(device, spvDir, f16Input: true, rowsPerWorkgroup: 2);   // NR 2 beats 4 by 10-15% at U (#2004 bench); D stays at 4 (NR 2 is 1.7-2x slower there)
             k.IndexedQ3K = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.Q3_K);
             k.IndexedIq4Nl = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.IQ4_NL);
             if (MoeGroupedStridedCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.Q3_K) && MoeGroupedStridedCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.IQ4_NL))
@@ -121,7 +129,7 @@ public sealed class Edge0LatentKernels : IDisposable
     /// <summary>Drops cached descriptor sets (scratch buffers were re-allocated).</summary>
     internal void InvalidateDescriptorCache()
     {
-        _gather.Cache.Reset(); _combine.Cache.Reset(); _acc.Cache.Reset(); _decodeD?.Cache.Reset(); _decodeU?.Cache.Reset(); _combineAll?.Cache.Reset(); _combineF16?.Cache.Reset(); _gemmD?.Cache.Reset(); _gemmU?.Cache.Reset(); _multiC16?.InvalidateDescriptorCache();
+        _gather.Cache.Reset(); _combine.Cache.Reset(); _acc.Cache.Reset(); _decodeD?.Cache.Reset(); _decodeU?.Cache.Reset(); _combineAll?.Cache.Reset(); _combineF16?.Cache.Reset(); _gemmD?.Cache.Reset(); _gemmU?.Cache.Reset(); _multiC16?.InvalidateDescriptorCache(); _wideD?.InvalidateDescriptorCache(); _wideU?.InvalidateDescriptorCache();
         IndexedQ3K?.InvalidateDescriptorCache(); IndexedIq4Nl?.InvalidateDescriptorCache(); GroupedQ3K?.InvalidateDescriptorCache(); GroupedIq4Nl?.InvalidateDescriptorCache();
     }
 
@@ -237,7 +245,7 @@ public sealed class Edge0LatentKernels : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
-        _gather.Dispose(); _combine.Dispose(); _acc.Dispose(); _decodeD?.Dispose(); _decodeU?.Dispose(); _combineAll?.Dispose(); _combineF16?.Dispose(); _gemmD?.Dispose(); _gemmU?.Dispose(); _multiC16?.Dispose();
+        _gather.Dispose(); _combine.Dispose(); _acc.Dispose(); _decodeD?.Dispose(); _decodeU?.Dispose(); _combineAll?.Dispose(); _combineF16?.Dispose(); _gemmD?.Dispose(); _gemmU?.Dispose(); _multiC16?.Dispose(); _wideD?.Dispose(); _wideU?.Dispose();
         IndexedQ3K?.Dispose(); IndexedIq4Nl?.Dispose(); GroupedQ3K?.Dispose(); GroupedIq4Nl?.Dispose();
     }
 }

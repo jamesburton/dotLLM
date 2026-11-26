@@ -58,6 +58,9 @@
 
   <ItemGroup>
     <VulkanShader Include="$(VulkanShaderDir)\*.comp" />
+    <!-- Headers pulled in with #include (#2004). They are not compile units, so CompileVulkanShaders' per-.comp
+         Inputs/Outputs cannot see an edit to one; _CompileVulkanShadersAfterIncludeEdit below does. -->
+    <VulkanShaderInclude Include="$(VulkanShaderDir)\*.glsl" />
   </ItemGroup>
 
   <!-- glslc pin (#1364). SPIR-V bytes depend on the glslc version, so tracked .spv are only (re)written by the
@@ -87,6 +90,36 @@
       <_GlslcFirstLine Condition="'$(_GlslcAllLines)' != ''">$(_GlslcAllLines.Split('|')[0])</_GlslcFirstLine>
       <_GlslcMatchesPin Condition="'$(_GlslcExitCode)' == '0' And '$(_GlslcPin)' != '' And $(_GlslcFirstLine.StartsWith('$(_GlslcPin)'))">true</_GlslcMatchesPin>
     </PropertyGroup>
+  </Target>
+
+  <!-- An edit to an included .glsl leaves every dependent .spv stale (#2004): the per-.comp target below only compares a .comp with its own .spv.
+       This target keys a stamp (under obj/) on the newest .glsl; when any header is newer than the stamp it recompiles EVERY shader (we do not
+       track which .comp includes which header; unchanged shaders re-emit identical bytes under the pinned glslc, so the tree stays clean), then
+       touches the stamp. A follow-up could make this per-shader with glslc -MD depfiles.
+       A MISSING stamp (fresh clone / worktree / configuration, every CI run) only records the baseline: the tracked .spv are taken as current
+       and nothing is compiled. Recompiling there would cost ~2 min per obj/ and, in CI, would rewrite every tracked .spv with the pinned glslc
+       right before VulkanSpvFreshnessTests compares them, so that guard (#1364 / #1372) could never fail. The price: a header edited before the
+       first build of a fresh obj/ is not seen here; run -t:RegenerateVulkanShaders (or touch the header again) in that case.
+       With glslc missing or not the pin, a header edit warns and writes nothing; the stamp is left alone so the next build warns again. -->
+  <Target Name="_CompileVulkanShadersAfterIncludeEdit"
+          BeforeTargets="CompileVulkanShaders"
+          DependsOnTargets="_DetectGlslc"
+          Inputs="@(VulkanShaderInclude)"
+          Outputs="$(IntermediateOutputPath)vulkan-include.stamp">
+    <!-- Conditions sit on the tasks: a target Condition is evaluated before DependsOnTargets has set _GlslcMatchesPin. -->
+    <PropertyGroup>
+      <_VulkanIncludeStampExists Condition="Exists('$(IntermediateOutputPath)vulkan-include.stamp')">true</_VulkanIncludeStampExists>
+      <_VulkanIncludeRebuild Condition="'$(_VulkanIncludeStampExists)' == 'true' And '$(_GlslcMatchesPin)' == 'true'">true</_VulkanIncludeRebuild>
+    </PropertyGroup>
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <Touch Condition="'$(_VulkanIncludeStampExists)' != 'true'" Files="$(IntermediateOutputPath)vulkan-include.stamp" AlwaysCreate="true" />
+    <Warning Condition="'$(_VulkanIncludeStampExists)' == 'true' And '$(_GlslcMatchesPin)' != 'true'"
+             Text="A shader header (.glsl) changed but glslc is missing or not the pinned '$(_GlslcPin)' (native/vulkan/glslc.version): the .spv that include it were NOT rebuilt and may be stale (#2004). Install the pinned shaderc, or run -t:RegenerateVulkanShaders." />
+    <Message Condition="'$(_VulkanIncludeRebuild)' == 'true'" Importance="high" Text="A shader header (.glsl) changed: recompiling every shader to SPIR-V" />
+    <MakeDir Condition="'$(_VulkanIncludeRebuild)' == 'true'" Directories="$(SpvOutputDir)" />
+    <Exec Condition="'$(_VulkanIncludeRebuild)' == 'true'" Command="glslc --target-env=$(VulkanTargetEnv) -O -o &quot;$(SpvOutputDir)/%(VulkanShader.Filename).spv&quot; &quot;%(VulkanShader.FullPath)&quot;"
+          StandardOutputImportance="low" />
+    <Touch Condition="'$(_VulkanIncludeRebuild)' == 'true'" Files="$(IntermediateOutputPath)vulkan-include.stamp" AlwaysCreate="true" />
   </Target>
 
   <!-- Incremental compile of stale .comp files. Writes only when glslc matches the pin. -->
