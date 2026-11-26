@@ -267,7 +267,8 @@ internal static class VulkanQwen3MoeMoeUpload
         bool parallelUpload = !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PARALLEL_UPLOAD"), "0", StringComparison.Ordinal);
         using var upStaging = parallelUpload
             ? VulkanStagingBuffer.CreateParallel(device, VulkanStagingBuffer.ParallelSlotBytes, VulkanStagingBuffer.ParallelSlotCount) : null;
-        // #1994: with DirectStorage active the banks are read straight into their own heaps, so allocating them ahead would only waste device memory.
+        // DOTLLM_VULKAN_BANK_PREALLOC=0 allocates each layer's banks inline instead of ahead on background threads (#874). Off with DirectStorage active (#1994):
+        // the banks are then read straight into their own heaps, so allocating them ahead would only waste device memory.
         using var prealloc = parallelUpload && expertSlots == 0 && !VulkanWeightImportPolicy.DirectTierActive(device)
             && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_BANK_PREALLOC"), "0", StringComparison.Ordinal) ? new VulkanBankPrealloc(device) : null;
 

@@ -1067,7 +1067,6 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_EDGE0_COLSCALE` | Environment variable selecting the diagnostic column-scale arm (inverse \| direct \| none); unset = inverse. | `Edge0Model.cs` |
 | `DOTLLM_EDGE0_F32_ACT` | Diagnostic A/B (DOTLLM_EDGE0_F32_ACT=1): D, U and the shared expert dequantise their Q8_0 / Q4_0 weights and dot against the F32 activations instead of quantising the activations to int8 first. Slower; used to measure how much... | `Edge0LatentMoe.cs` |
 | `DOTLLM_EDGE0_LATENT` | (not described in source) | `Edge0Model.cs` |
-| `DOTLLM_EDGE0_MTP` | Env var that turns the Edge0 mtp/ folder auto-attach off (DOTLLM_EDGE0_MTP=0, #2014). An explicit --mtp-head still attaches. | `Qwen4ExpMtpHeadResolver.cs` |
 | `DOTLLM_EMBED_PAR_MIN` | Minimum batch size for one-sequence-per-core execution; below it a batch runs sequentially on the pooled kernels. Env DOTLLM_EMBED_PAR_MIN overrides (benchmarking). | `BertEncoderModel.cs` |
 | `DOTLLM_G4_PROF` | Env-gated (DOTLLM_G4_PROF=1) stopwatch buckets for the Gemma-4 CPU layer path. | `G4Prof.cs` |
 | `DOTLLM_I2S_CACHE` | Builds a BitNetI2SCacheContext for a BitNet checkpoint so repeated loads reuse the ternary I2_S packing instead of re-quantizing bf16 weights. The cache lives in a hidden .dotllm-i2s-cache folder beside the checkpoint and is ke... | `ModelLoader.cs` |
@@ -1277,7 +1276,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_VULKAN_533_GATE` | #533 vendor policy. The defect - coopmat P.V not reproducing the same accumulator for the 0 * v contributions of masked / padding columns - is an AMD implementation property: an RTX 3060 is exactly 0-differing at every KV lengt... | `VulkanFlashAttentionCoopmatKernel.cs` |
 | `DOTLLM_VULKAN_ATTN_PREFILL` | Environment variable: ref keeps ordinary prefill on the per-head flash kernel (#1548 A/B and oracle). | `VulkanTransformerModel.cs` |
 | `DOTLLM_VULKAN_ATTN_QPOS` | Environment variable: ref forces the reference per-query-position kernel (#1540 A/B and oracle). | `VulkanTransformerModel.cs` |
-| `DOTLLM_VULKAN_BANK_PREALLOC` | #1994: with DirectStorage active the banks are read straight into their own heaps, so allocating them ahead would only waste device memory. | `VulkanQwen3MoeMoeUpload.cs` |
+| `DOTLLM_VULKAN_BANK_PREALLOC` | DOTLLM_VULKAN_BANK_PREALLOC=0 allocates each layer's banks inline instead of ahead on background threads (#874). Off with DirectStorage active (#1994): the banks are then read straight into their own heaps, so allocating them a... | `VulkanQwen3MoeMoeUpload.cs` |
 | `DOTLLM_VULKAN_DECODE_PROFILE` | Legacy COMPUTE->TRANSFER blanket barrier - see BarrierComputeToCompute. | `VulkanTransformerModel.cs` |
 | `DOTLLM_VULKAN_DECODE_PROFILE_GPU` | DOTLLM_VULKAN_DECODE_PROFILE_GPU=1 additionally writes a BOTTOM_OF_PIPE timestamp at every op-category boundary (~300 queries/token on a 30-layer model) and reports per-category GPU time. Since every dispatch is barrier-seriali... | `VulkanTransformerModel.cs` |
 | `DOTLLM_VULKAN_DECODE_SPLIT_LAYER` | Default 8 (see sweep above). Was briefly 0 during #148: intermittent DEVICE_LOSTs turned out to be cumulative gfx1151 driver-state degradation after heavy load/dispose churn (24/24 clean across the splitxbarrier matrix once the... | `VulkanTransformerModel.cs` |
