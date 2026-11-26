@@ -587,7 +587,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     mtpHeadPath = DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead,
                         trunkBytes: model is DotLLM.Core.Models.IMtpHeadAttachable ? DotLLM.HuggingFace.ModelResolver.FileLength(resolvedPath) : -1);
                 }
-                catch (Exception ex) when (ex is not FileNotFoundException && (settings.MtpHead is null || ex is NotSupportedException))
+                catch (Exception ex) when (settings.MtpHead is null || ex is NotSupportedException)   // auto-detected: never fatal; explicit: only 'this model cannot take one' is
                 {
                     // An auto-detected head that cannot be attached (device memory, a mismatched file) must not take the run down: plain decode works.
                     Console.Error.WriteLine($"WARNING: MTP head not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");
@@ -999,7 +999,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
 
             if (!settings.Json && draftModel is null && !settings.NoMtp && model.SupportsMtp)
-                AnsiConsole.MarkupLine($"[dim]MTP self-speculative decoding: K={(settings.SpeculativeK == DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0 ? model.MtpPreferredDraftTokens : settings.SpeculativeK)} ({(mtpHeadPath is null ? "model carries an MTP head" : "head: " + Markup.Escape(System.IO.Path.GetFileName(mtpHeadPath)))}; disable with --no-mtp)[/]");
+                AnsiConsole.MarkupLine($"[dim]MTP self-speculative decoding: K={(settings.SpeculativeK == DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0 ? model.MtpPreferredDraftTokens : settings.SpeculativeK)} ({(mtpHeadPath is null ? "model carries an MTP head" : (System.IO.Directory.Exists(mtpHeadPath) ? "Edge0 head: " + Markup.Escape(mtpHeadPath) + "; adaptive gate on; DOTLLM_EDGE0_MTP=0 opts out" : "head: " + Markup.Escape(System.IO.Path.GetFileName(mtpHeadPath))))}; disable with --no-mtp)[/]");
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
                 draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,

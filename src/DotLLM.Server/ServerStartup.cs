@@ -1198,7 +1198,8 @@ public static class ServerStartup
     /// <summary>
     /// Attaches a separate MTP head GGUF (qwen4exp) to <paramref name="model"/>: an explicit <c>--mtp-head</c> always, an auto-detected sibling only when
     /// the trunk is big enough for self-speculation to beat plain decode (measured per quantisation, see <see cref="Qwen4ExpMtpHeadResolver"/>).
-    /// Failure to attach (no room on the device, bad tensor table) is reported and serving continues without speculation.
+    /// An auto-detected head that fails to attach (no room on the device, bad tensor table) is reported and serving continues without speculation;
+    /// an explicit <c>--mtp-head</c> that fails to load throws, so startup is refused (as <c>run</c>/<c>chat</c> do), except <see cref="NotSupportedException"/> (this model cannot take one).
     /// </summary>
     internal static void TryAttachSeparateMtpHead(IModel model, string resolvedPath, ServerOptions options)
     {
@@ -1217,10 +1218,10 @@ public static class ServerStartup
             string? headPath = options.MtpHeadPath;
             if (headPath is null)
             {
-                headPath = Qwen4ExpMtpHeadResolver.Find(resolvedPath);
+                headPath = Qwen4ExpMtpHeadResolver.FindAuto(model, resolvedPath);
                 if (headPath is null) return;
                 long trunk = ModelResolver.FileLength(resolvedPath);
-                if (!Qwen4ExpMtpHeadResolver.ShouldAutoAttach(trunk))
+                if (!Directory.Exists(headPath) && !Qwen4ExpMtpHeadResolver.ShouldAutoAttach(trunk))   // an Edge0 mtp/ folder skips the size rule (the skeleton is small)
                 {
                     Console.WriteLine($"[dotllm] MTP: head {Path.GetFileName(headPath)} found but not attached - a {trunk / (double)(1L << 30):F0} GiB trunk measures slower with " +
                                       "speculation than without (--mtp-head <path> forces it).");
@@ -1228,9 +1229,11 @@ public static class ServerStartup
                 }
             }
             Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, headPath);
-            Console.WriteLine($"[dotllm] MTP: attached head {Path.GetFileName(headPath)}.");
+            Console.WriteLine(Directory.Exists(headPath)
+                ? $"[dotllm] MTP: attached Edge0 head ({headPath}); the adaptive gate drafts only while acceptance pays ({Qwen4ExpMtpHeadResolver.Edge0EnvVar}=0 opts out)."
+                : $"[dotllm] MTP: attached head {Path.GetFileName(headPath)}.");
         }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
+        catch (Exception ex) when (ex is not OutOfMemoryException && (options.MtpHeadPath is null || ex is NotSupportedException))   // auto-detected: never fatal; explicit --mtp-head: only 'this model cannot take one' is (run/chat match)
         {
             Console.WriteLine($"[dotllm] MTP: head not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");
         }

@@ -27,7 +27,7 @@ namespace DotLLM.Vulkan;
 /// the verify path's greedy, never a draft's. On Vulkan the multi-row kernels are not bit-identical to the 1-row decode (KL 2e-3..1.4e-2,
 /// top-1 identical in the #876 measurements), so a near-tie can resolve differently from plain decode; that rate is measured, not assumed.</para>
 /// </remarks>
-public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAttachable
+public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IEdge0MtpHeadAttachable
 {
     /// <summary>Cells the head processes per command buffer when absorbing a trunk batch (bounds the head core's scratch).</summary>
     internal const int AbsorbChunk = 64;
