@@ -1,8 +1,9 @@
 // Row dot products against quantized weights read IN PLACE (never widened): Q8_0, Q6_K or BF16 rows times activation columns.
 // Included by the GEMV and MoE kernels. The includer defines WT_Q8_0 | WT_Q6_K | WT_BF16, WG_SIZE (= 64 lanes, one workgroup per output
-// row), a specialization constant NCOL (columns per dispatch of this routine), declares
+// row; Q8_0 GEMV: ROWS rows via WDOT_MULTIROW, #2006), a specialization constant NCOL (columns per dispatch of this routine), declares
 //   readonly buffer { uint weight[]; }   (binding 0)    the raw weight blob
 // and a function  float xAt(uint col, uint k)           activation element k of (the already clamped) column `col`.
+// X_LOAD8 (Q8_0 only): the includer also provides xLoad8(col, k0, out vec4, out vec4) = x[col, k0 .. k0 + 7], k0 % 8 == 0 (16-byte load).
 // Every weight is decoded once per lane and FMA'd against NCOL columns; accumulation is F32 (private array gAcc).
 
 #ifdef WDOT_MULTIROW

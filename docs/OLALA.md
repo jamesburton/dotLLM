@@ -219,7 +219,7 @@ place by the shader (Q8_0 / Q6_K / BF16; F32 router): no quantized-activation (F
 renormalisation run in one workgroup per token and never leave shared memory; only the expert ids and the BF16 routing weights are stored.
 `olala_*_f32act` shaders build the F32-activation-storage **reference arm** (a measurement control, `OlalaVulkanOptions.ActivationF32`, never the default).
 
-**Kernels.** `olala_gemv_{q8_0,q6_k,bf16}` (1 or 8 columns per workgroup, epilogue none / relu^2 / add, F32 logits out), `olala_embed_{q8_0,bf16}` (gather + L2),
+**Kernels.** `olala_gemv_{q8_0,q6_k,bf16}` (1 or 8 columns per workgroup, Q8_0 prefill 16 columns x 2 rows (#2006), epilogue none / relu^2 / add, F32 logits out), `olala_embed_{q8_0,bf16}` (gather + L2),
 `olala_geodesic`, `olala_mamba3_step` (one workgroup per head, loops over the chunk's tokens; B/C RMSNorm, bias, rotation, trapezoid recurrence, gated MIMO output),
 `olala_tpa_kv` (TPA reconstruction, token shift, K RMSNorm, BF16 cache store, F32 carry), `olala_tpa_attn` (scalable softmax, soft cap, window, online softmax,
 differential combine, silu gate; no score tensor in memory), `olala_moe_route`, `olala_moe_up` (relu^2) and `olala_moe_down` (routing-weighted sum) over the expert bank in place.

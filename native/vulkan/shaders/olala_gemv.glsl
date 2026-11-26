@@ -2,8 +2,9 @@
 //   y[col, m] = epilogue( sum_k W[m, k] * x[col, k] ),   x: [T, K] BF16 (or F32 in the reference arm), y: [T, M].
 // W is a raw Q8_0 / Q6_K / BF16 blob (selected by the including .comp). F32 accumulation; the activation is NEVER quantized (no FP16-scaled
 // Q8_1 path: the unbounded-input tensors of safe2 would overflow), so this kernel is valid for every Olala projection.
-// Dispatch: one 64-lane workgroup per output row (x + 32768 y, folded for M > 65535), z = column group of NCOL columns.
-// Specialization: 0 NCOL, 1 EPI (0 none, 1 relu^2, 2 add aux[col, m]), 2 OUTF32 (store F32 to yf instead of the activation type: logits).
+// Dispatch: one 64-lane workgroup per ROWS output rows (ROWS = 1 except Q8_0; x + 32768 y, folded for > 32768 groups), z = column group of NCOL columns.
+// Specialization: 0 NCOL, 1 EPI (0 none, 1 relu^2, 2 add aux[col, m]), 2 OUTF32 (store F32 to yf instead of the activation type: logits),
+//                 3 ROWS (Q8_0 only, #2006).
 #include "olala_common.glsl"
 
 #define WG_SIZE 64u
