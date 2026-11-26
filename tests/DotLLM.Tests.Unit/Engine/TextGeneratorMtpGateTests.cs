@@ -66,6 +66,44 @@ public sealed class TextGeneratorMtpGateTests : IDisposable
     }
 
     [Fact]
+    public void FallBackAtTheRoundFloor_LeavesAnMtpMeasurement_SoLaterRequestsStopRetryingMtp()
+    {
+        // #2018: the fall-back fires after MinRoundsForFallback rounds, which commit fewer tokens than the gate's MinSampleTokens, so the MTP arm
+        // was never recorded and every request retried MTP (and paid the rounds) again.
+        using var model = NewModel(draftRight: false, plainMs: 2, rowMs: 6, fixedMs: 6);
+        var gen = new TextGenerator(model, new Tok(), mtpEnabled: true, mtpAdaptive: true, speculativeCandidates: 3);
+        gen.MtpGate!.RecordSegment(usedMtp: false, decodeTokens: 40, decodeMs: 40 * 2.0);
+        var first = gen.Generate("p", Greedy(64));
+        Assert.True(first.Timings.SpeculativeDraftTokens > 0, "the first request must have tried MTP");
+        Assert.True(first.Timings.SpeculativeAcceptedTokens < MtpAdaptiveGate.MinSampleTokens, "premise: the fall-back segment is below the sample minimum");
+
+        Assert.True(gen.MtpGate.MtpMsPerToken > gen.MtpGate.PlainMsPerToken, "the measured loss must be recorded for the MTP arm");
+        for (int i = 0; i < 4; i++)
+            Assert.Equal(0, gen.Generate("p", Greedy(64)).Timings.SpeculativeDraftTokens);   // no per-request retry
+    }
+
+    [Fact]
+    public void ALossAtLongContext_IsNotChargedToShortPrompts()
+    {
+        var gate = new MtpAdaptiveGate(8L << 30);
+        var shortBand = gate.ForContext(80);
+        var longBand = gate.ForContext(2400);
+        Assert.Same(gate, shortBand);
+        Assert.NotSame(shortBand, longBand);
+        Assert.Same(longBand, gate.ForContext(3000));       // same doubling band
+        Assert.NotSame(longBand, gate.ForContext(9000));
+
+        longBand.RecordSegment(false, 40, 40 * 60.0);
+        longBand.RecordSegment(true, 40, 40 * 90.0);        // MTP loses at 2.4K
+        shortBand.RecordSegment(false, 40, 40 * 60.0);
+        shortBand.RecordSegment(true, 40, 40 * 35.0);       // and wins at 80 tokens
+        Assert.False(longBand.ShouldUseMtp(64));
+        Assert.True(shortBand.ShouldUseMtp(64));
+        gate.Reset();
+        Assert.Equal(0, longBand.PlainMsPerToken);
+    }
+
+    [Fact]
     public void ColdStart_LosingConfig_IsCaughtByTheRequestsOwnCalibration_NotAfterAFullRequest()
     {
         // No plain sample exists (first request of a process): before #820 nothing could say "MTP is slower", so a losing configuration ran the whole
