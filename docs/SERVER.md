@@ -433,6 +433,7 @@ disposed or different model.
 | `device` | the device the active model runs on (`cpu`, `vulkan`, `gpu:0`; the resolved one for `--device auto`); null when no model is ready (#1822) |
 | `device_fallback` / `device_fallback_reason` | `true` and the reason (failed devices, errors, the performance consequence) when `--device auto` fell back to the CPU after a faster device failed to load the model; `false` / null otherwise (#1822) |
 | `prefill_tokens_done` / `prefill_tokens_total` / `decode_tokens` | the **oldest** in-flight request's live progress (mirrors `requests[0]`); null when nothing is in flight (#1822) |
+| `settings_source` | present only when the server was started with `--auto` (#1902): a map from each tunable setting (`device`, `gpu_layers`, `moe_offload`, `cache_type_k`, `cache_type_v`, `paged`, `prefill_chunk_size`, `mtp`, `speculative_k`, `threads`, `decode_threads`, `expected_concurrency`, `ctx_size`) to where its value came from: `flag` (an explicit command-line flag), `auto` (a saved tuning result) or `default`. Omitted without `--auto` |
 | `requests` | every in-flight request, oldest first, or null: `request` (`req#N`), `phase` (`waiting`, `prefill`, `decode`), `elapsed_seconds`, `prompt_tokens`, `cached_tokens` (prefix-cache hits), `prefill_tokens_done` / `prefill_tokens_total` (computed tokens, hits excluded), `decode_tokens` (#1822) |
 
 **Live progress (#1822).** The counters move *during* the work, so a client can tell slow from wedged:

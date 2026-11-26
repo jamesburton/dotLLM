@@ -103,15 +103,17 @@ public sealed class OlalaVulkanTests
         Assert.Equal(s.Rows, s.Top1);
     }
 
-    [SkippableFact]
-    public void Tiny_Decode_TeacherForced_MatchesCpu_AndGreedyIdenticalToHf()
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]   // F32-activation control: the strict arm for decode (state carried token to token through the registers / state buffer)
+    public void Tiny_Decode_TeacherForced_MatchesCpu_AndGreedyIdenticalToHf(bool f32Act)
     {
         SkipUnlessGpu();
         string? path = TinyGguf(); Skip.If(path is null, "tiny Olala oracle not generated");
         var c = OlalaOracleTests.LoadCase("tiny")!;
         using var file = GgufFile.Open(path!);
         using var dev = VulkanDevice.Create();
-        using var vk = LoadVk(dev, file);
+        using var vk = LoadVk(dev, file, f32Act);
         using var cpu = LoadCpu(file);
         int[] pos = Enumerable.Range(0, c.L).ToArray();
         using (var p1 = cpu.Forward(c.Ids, pos, -1, null, true)) { }
@@ -132,7 +134,8 @@ public sealed class OlalaVulkanTests
             worst = Math.Max(worst, kl);
             Assert.Equal(OlalaOracleTests.Argmax(Rows(cs, 1, c.Vocab)), OlalaOracleTests.Argmax(vr));
         }
-        Assert.True(worst < 2e-2, $"worst decode KL {worst:E3}");
+        double klGate = f32Act ? 1e-9 : 2e-2;   // the F32-act arm tracks the CPU to the float-rounding floor (same gate as the prefill control)
+        Assert.True(worst < klGate, $"f32Act={f32Act}: worst decode KL {worst:E3}");
     }
 
     [SkippableFact]
@@ -541,6 +544,7 @@ public sealed class OlalaVulkanTests
             pre.Add(c.L / (ms / 1000)); dec.Add(1000 / steps.Skip(4).Average());
             _output.WriteLine($"warm round {round}: prefill {pre[^1]:F0} tok/s ({ms:F0} ms), decode {dec[^1]:F1} tok/s (median step {steps.OrderBy(x => x).ElementAt(steps.Count / 2):F1} ms)");
         }
+        foreach (var line in vk.ShaderStatistics()) _output.WriteLine("shader " + line);
         _output.WriteLine($"{file} act={(f32 ? "F32" : "BF16")}: warm prefill {pre.Min():F0}-{pre.Max():F0} tok/s, decode {dec.Min():F1}-{dec.Max():F1} tok/s");
     }
 

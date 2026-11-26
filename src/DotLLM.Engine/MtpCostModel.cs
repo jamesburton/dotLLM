@@ -293,7 +293,21 @@ public sealed class MtpRoundController
             return;
         }
         _roundsThisRequest++;
+        if (MtpAdaptiveGate.TraceEnabled && _roundsThisRequest <= MinRoundsForFallback + 3)
+            Console.Error.WriteLine($"[mtp] round {_roundsThisRequest}: K={k} emitted={emitted} {roundMs:F1} ms; best K now {_model.BestK(_configuredK).K}");
         _model.RecordRound(k, emitted - 1, roundMs);
+    }
+
+    /// <summary>
+    /// Hands the gate the figure a fall-back was decided on (the cost model's best-K ms per generated token) as this context band's MTP sample, so the
+    /// loss is remembered and later requests stop retrying MTP (#2018): the fall-back floor leaves too few tokens for the gate's own minimum sample.
+    /// </summary>
+    public void RecordFallback()
+    {
+        var (_, perTok) = _model.BestK(_configuredK);
+        _gate?.RecordFallback(perTok);
+        if (MtpAdaptiveGate.TraceEnabled)
+            Console.Error.WriteLine($"[mtp] fell back after {_roundsThisRequest} rounds: best-K MTP {perTok:F1} ms/token recorded as the MTP sample");
     }
 
     /// <summary>

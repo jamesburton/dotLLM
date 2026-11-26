@@ -9,6 +9,14 @@ namespace DotLLM.Server.Models;
 public sealed record ServerStatusResponse
 {
     /// <summary>
+    /// Where each tuned setting came from (<c>flag</c>, <c>auto</c> or <c>default</c>) when the server was started with <c>--auto</c> (#1902);
+    /// omitted otherwise. Nullable with no initializer, per the source-generation rule in CLAUDE.md.
+    /// </summary>
+    [JsonPropertyName("settings_source")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyDictionary<string, string>? SettingsSource { get; init; }
+
+    /// <summary>
     /// <c>loading</c> (a model load is in progress - wins over busy, since a load holds the lock), <c>busy</c> (a request holds the
     /// execution lock), <c>idle</c> (a model is ready and nothing holds the lock), or <c>no_model</c>.
     /// </summary>

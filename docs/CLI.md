@@ -16,6 +16,7 @@ equivalent, device selection, KV-cache sizing, and the environment variables the
 - [Model references](#model-references)
 - [Device selection](#device-selection)
 - [KV-cache sizing](#kv-cache-sizing)
+- [Auto-tuned settings (`--auto`)](#auto-tuned-settings---auto)
 - [Commands](#commands): [model](#dotllm-model) - [list](#dotllm-list) - [run](#dotllm-run) - [chat](#dotllm-chat) - [serve](#dotllm-serve) - [ps](#dotllm-ps) - [stop](#dotllm-stop) - [bench](#dotllm-bench) - [perplexity](#dotllm-perplexity) - [embed](#dotllm-embed) - [debug](#dotllm-debug-debug-builds-only)
 - [JSON output and exit codes](#json-output-and-exit-codes)
 - [Companion tool: chunkcache](#companion-tool-chunkcache)
@@ -152,6 +153,47 @@ and for recurrent/hybrid models `--prefix-snapshots`, `--prefix-snapshot-host-bu
 
 Environment equivalents of the format flags (an explicit flag wins): `DOTLLM_HYBRID_KV` (CUDA hybrid-dense: `f16|q8_0|q4_0|k8v4|k4v8`), `DOTLLM_VK_KV` (Vulkan: `f16`, `f32` for A/B),
 `DOTLLM_CUDA_KV_VMM=0` (CUDA hybrid: disable in-place KV growth), `DOTLLM_VK_QWEN4EXP_CONTEXT` and `DOTLLM_VK_QWEN4EXP_KV` (qwen4exp on Vulkan).
+
+## Auto-tuned settings (`--auto`)
+
+`--auto` on `run`, `chat`, `serve` and `bench` (#1902) applies the **saved tuning result** for this model, device and build: the placement and
+speed settings a measured search found best (device, GPU layers, MoE offload, KV format, paged or not, prefill chunk size, MTP, speculative K,
+threads, expected concurrency, context). `--auto-profile <name>` picks the profile (default `chat`; it is the only one so far).
+
+**It only reuses.** `--auto` never starts a search and never measures anything. The command that produces results, `dotllm tune`, is not in
+this release yet (#1902, slice 2); until then a result can only come from a tuning run of a later build.
+
+- **Where results live:** `~/.dotllm/tuning/<model-hash>/<scope>-<profile>.json` (`DOTLLM_TUNING_DIR` moves the root). `<model-hash>` is the
+  GGUF's SHA-256 (cached by path, size and mtime), `hf:<blob id>` for a file in the Hugging Face hub cache, or a digest of a safetensors
+  directory. `<scope>` is the device key (backend, PCI ids and GPU name, or the CPU model) for an explicit `--device`, or `auto-<machine key>`
+  for `--device auto`, whose result names the winning device; an explicit-device result is never found by `auto` or the reverse. Every file
+  carries a SHA-256 checksum of its content.
+- **The four outcomes**, printed as `auto: ...` lines (stderr with `--json`):
+
+  | Outcome | When | What runs |
+  |---|---|---|
+  | hit | the key matches and the run finished | the saved settings |
+  | stale | only a *stale-level* field differs: GPU driver or API version, OS build, dotLLM release, kernel files or kernel assemblies, .NET runtime, a `DOTLLM_*` tuning/A-B variable, the tuner protocol | the saved settings, plus a warning naming old and new values (for a variable, its name) and `dotllm tune ... --recheck` |
+  | partial | the tuning run stopped early | the saved settings, plus a warning and the `dotllm tune` command to finish |
+  | miss | no file, a damaged or hand-edited file (checksum), a different schema, model, model modifiers (overlay, ternary adapters, separate MTP or DFlash head), device, profile or KV quality budget | **today's defaults**, plus the exact `dotllm tune <model> --profile <p> [--device <d>]` command to run |
+
+- **Explicit flags win**, per setting. `--cache-type-k q8_0 --auto` keeps your K and takes the saved V. TurboQuant is the exception: a saved
+  `tq` pair is applied whole or not at all, so a flag on either side drops the saved pair (a mixed tq pair is refused, #1895).
+- **TurboQuant needs `--no-paged`**, so a saved TurboQuant result applies only to `run`, `chat`, `bench` or a single-user `serve`. A
+  multi-session `serve` drops it with a warning (tracked: it lifts when TurboQuant lands on the paged pools, #1893).
+- **Apply-time checks.** A saved placement is admitted only when its memory is bounded and fits now: its recorded peak host bytes against
+  free RAM and, for a GPU placement, its recorded peak device bytes against the device's free memory (on an integrated GPU device and host
+  share one pool, so their sum must fit free RAM and the device peak must fit the device-local heap). A result that did not record a peak,
+  or a dedicated device whose free memory cannot be read, is not admitted. If it is not admitted, **all** saved settings are dropped and the
+  defaults run, with the reason (and required and free bytes) in the warning; nothing spills. A setting this build refuses (for example a
+  TurboQuant request the current host cannot run in place) is dropped with its reason, never replaced by another one.
+- **Context.** The recorded peaks were measured at the result's tuned context, so they bound only that much. A served context above it, a
+  result without a tuned context, or a served context that is not known before load is not admitted, and the defaults run. The served context
+  is `--ctx-size` when given; otherwise the saved context on `serve`, prompt + deepest depth + generated tokens on `bench`, and the prompt's
+  UTF-8 bytes + `--max-tokens` + 256 on `run`. `chat` grows toward the model window, so it needs `--ctx-size` (or a saved context).
+- **Where each value came from** is reported on `GET /v1/status` (and so `/props` `activity`) as `settings_source`: `flag`, `auto` or `default`
+  per setting ([SERVER.md](SERVER.md#model-swaps-get-v1status-and-sse-keep-alive-1023)). Without `--auto` the field is absent and nothing changes.
+- `--auto` costs one store lookup before the model loads, and nothing at all when it is not given.
 
 ## Commands
 
@@ -354,6 +396,8 @@ Option groups: sampling (`--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-*`
 | Option | Default | Env | Description |
 |---|---|---|---|
 | `<model>` |  |  | Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF). |
+| `--auto` | off |  | Apply the saved tuning result for this model, device and build (device, GPU layers, KV format, prefill chunk, MTP, threads...). Explicit flags always win. On a miss it runs the defaults and prints the exact 'dotllm tune' command to run; a result that is stale (driver, build, runtime or DOTLLM_* override changed) is still applied, with a warning naming what changed and the 'dotllm tune --recheck' command. The saved placement must still fit free memory, or the defaults run (never spills). Never starts a search. See docs/CLI.md#auto-tuned-settings---auto. |
+| `--auto-profile` `<text>` | unset |  | With --auto: the tuning profile to look up (default chat). Only the built-in chat profile exists in this slice. |
 | `--cache-type-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache KEY storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-k where that exists (give only one; conflicting values are an error). Unset: the backend default - F32 in the contiguous CPU cache (run/chat), F16 in GPU caches, Q8_0 blocks in the paged CPU cache (pass f16 for BOTH K and V to keep F16 there). On the CUDA hybrid-dense model (Bonsai-2, Qwen3.5/3.6) f32 means 'not given' (DOTLLM_HYBRID_KV applies) and quantized KV needs numKvHeads*headDim % 32 == 0. 'run' and 'bench' warn when the model/backend cannot honour a format. TurboQuant (tq, tq1..tq8; pass the same value for -k and -v) is read in place, as codes plus norms with no decoded history, on the CPU, dense CUDA and Vulkan hosts for serve (--no-paged), run, chat and bench; hybrid, recurrent, MLA and pipeline hosts refuse it (#1887). The QJL form (trailing q) runs on the CPU only (#1894). Sizing: docs/CLI.md#kv-cache-sizing. |
 | `--cache-type-v` `<text>` | unset |  | KV-cache VALUE storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-v where that exists. K and V may differ (e.g. -k q8_0 -v q4_0), except TurboQuant, which must match on both sides. See --cache-type-k. |
 | `--cache-window` `<int>` | 0 |  | Mixed-precision window: the most recent N tokens stay in full precision, older tokens are quantized on eviction (0 = quantize everything). Only used when --cache-type-k/-v is q8_0 or q4_0; ignored by the hybrid-dense models, which store the whole KV in one format. Refused with TurboQuant, whose cache holds codes only. |
@@ -447,6 +491,8 @@ dotllm chat Qwen/Qwen3-0.6B-GGUF --tools @tools.json --tool-choice auto
 | Option | Default | Env | Description |
 |---|---|---|---|
 | `<model>` |  |  | Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF). |
+| `--auto` | off |  | Apply the saved tuning result for this model, device and build (device, GPU layers, KV format, prefill chunk, MTP, threads...). Explicit flags always win. On a miss it runs the defaults and prints the exact 'dotllm tune' command to run; a result that is stale (driver, build, runtime or DOTLLM_* override changed) is still applied, with a warning naming what changed and the 'dotllm tune --recheck' command. The saved placement must still fit free memory, or the defaults run (never spills). Never starts a search. See docs/CLI.md#auto-tuned-settings---auto. |
+| `--auto-profile` `<text>` | unset |  | With --auto: the tuning profile to look up (default chat). Only the built-in chat profile exists in this slice. |
 | `--cache-type-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache KEY storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-k where that exists (give only one; conflicting values are an error). Unset: the backend default - F32 in the contiguous CPU cache (run/chat), F16 in GPU caches, Q8_0 blocks in the paged CPU cache (pass f16 for BOTH K and V to keep F16 there). On the CUDA hybrid-dense model (Bonsai-2, Qwen3.5/3.6) f32 means 'not given' (DOTLLM_HYBRID_KV applies) and quantized KV needs numKvHeads*headDim % 32 == 0. 'run' and 'bench' warn when the model/backend cannot honour a format. TurboQuant (tq, tq1..tq8; pass the same value for -k and -v) is read in place, as codes plus norms with no decoded history, on the CPU, dense CUDA and Vulkan hosts for serve (--no-paged), run, chat and bench; hybrid, recurrent, MLA and pipeline hosts refuse it (#1887). The QJL form (trailing q) runs on the CPU only (#1894). Sizing: docs/CLI.md#kv-cache-sizing. |
 | `--cache-type-v` `<text>` | unset |  | KV-cache VALUE storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-v where that exists. K and V may differ (e.g. -k q8_0 -v q4_0), except TurboQuant, which must match on both sides. See --cache-type-k. |
 | `--cache-window` `<int>` | 0 |  | Mixed-precision window: the most recent N tokens stay in full precision, older tokens are quantized on eviction (0 = quantize everything). Only used when --cache-type-k/-v is q8_0 or q4_0; ignored by the hybrid-dense models, which store the whole KV in one format. Refused with TurboQuant, whose cache holds codes only. |
@@ -535,6 +581,8 @@ Notes on interplay:
 | `[model]` |  |  | Path to a GGUF file or HuggingFace repo ID. Omit to start without a model (load from UI). |
 | `--allow-lora-admin` | off |  | Enable the LoRA admin API: POST /v1/lora/load and DELETE /v1/lora/{name}. Off by default. |
 | `--allow-model-admin` | off |  | Enable the model-administration API (#454): POST /v1/models/unload, /pull, /enable, /disable and PUT /v1/settings. Off by default. |
+| `--auto` | off |  | Apply the saved tuning result for this model, device and build (device, GPU layers, KV format, prefill chunk, MTP, threads...). Explicit flags always win. On a miss it runs the defaults and prints the exact 'dotllm tune' command to run; a result that is stale (driver, build, runtime or DOTLLM_* override changed) is still applied, with a warning naming what changed and the 'dotllm tune --recheck' command. The saved placement must still fit free memory, or the defaults run (never spills). Never starts a search. See docs/CLI.md#auto-tuned-settings---auto. |
+| `--auto-profile` `<text>` | unset |  | With --auto: the tuning profile to look up (default chat). Only the built-in chat profile exists in this slice. |
 | `--auto-pull` | off |  | Download a missing Hugging Face model when a request names one (e.g. model "owner/repo:Q4_K_M"), like 'ollama run' does. Off by default: remote clients should not be able to start multi-gigabyte downloads. |
 | `--cache-type-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache KEY storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-k where that exists (give only one; conflicting values are an error). Unset: the backend default - F32 in the contiguous CPU cache (run/chat), F16 in GPU caches, Q8_0 blocks in the paged CPU cache (pass f16 for BOTH K and V to keep F16 there). On the CUDA hybrid-dense model (Bonsai-2, Qwen3.5/3.6) f32 means 'not given' (DOTLLM_HYBRID_KV applies) and quantized KV needs numKvHeads*headDim % 32 == 0. 'run' and 'bench' warn when the model/backend cannot honour a format. TurboQuant (tq, tq1..tq8; pass the same value for -k and -v) is read in place, as codes plus norms with no decoded history, on the CPU, dense CUDA and Vulkan hosts for serve (--no-paged), run, chat and bench; hybrid, recurrent, MLA and pipeline hosts refuse it (#1887). The QJL form (trailing q) runs on the CPU only (#1894). Sizing: docs/CLI.md#kv-cache-sizing. |
 | `--cache-type-v` `<text>` | unset |  | KV-cache VALUE storage: f32, f16, q8_0 or q4_0 (bytes/element 4, 2, 1.0625, 0.5625). Synonym of --kv-quant-v where that exists. K and V may differ (e.g. -k q8_0 -v q4_0), except TurboQuant, which must match on both sides. See --cache-type-k. |
@@ -664,6 +712,8 @@ dotllm bench QuantFactory/SmolLM-135M-GGUF --device vulkan --depth-list 512,2048
 | Option | Default | Env | Description |
 |---|---|---|---|
 | `<model>` |  |  | Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF). |
+| `--auto` | off |  | Apply the saved tuning result for this model, device and build (device, GPU layers, KV format, prefill chunk, MTP, threads...). Explicit flags always win. On a miss it runs the defaults and prints the exact 'dotllm tune' command to run; a result that is stale (driver, build, runtime or DOTLLM_* override changed) is still applied, with a warning naming what changed and the 'dotllm tune --recheck' command. The saved placement must still fit free memory, or the defaults run (never spills). Never starts a search. See docs/CLI.md#auto-tuned-settings---auto. |
+| `--auto-profile` `<text>` | unset |  | With --auto: the tuning profile to look up (default chat). Only the built-in chat profile exists in this slice. |
 | `--cpu-moe` | off | `DOTLLM_CPU_MOE` | Keep every MoE layer's routed experts on the CPU (llama.cpp --cpu-moe). CUDA nemotron_h_moe: never cached, always computed on the CPU; other CUDA MoE models (e.g. Flint): computed on the CPU from the mmap'd file; Vulkan Qwen3MoeHybrid (bench): as --n-cpu-moe with every layer. Env fallback: DOTLLM_CPU_MOE=1. |
 | `--ctx-size`, `--ctx` `<int>` | unset | `DOTLLM_MOE_CTX` | Context window in tokens (llama.cpp -c). For nemotron_h_moe it caps the model's context and is what the MoE expert-offload VRAM budget reserves KV cache for (default: the model's maximum context, e.g. 262144 for Nemotron 3.5 Bolt). Lower it to leave more VRAM for the expert cache. Env fallback: DOTLLM_MOE_CTX. |
 | `--decode-threads` `<int>` | 0 |  | Number of threads for decode. 0 = auto (caps at memory channel count). |
@@ -838,6 +888,7 @@ Some variables are read at process start, others per model load - set them befor
 | `DOTLLM_NO_PROMPT` | unset | `1` suppresses the first-run offer to install the DirectStorage runtime that `run`, `chat`, `bench` and `serve` make on Windows in an interactive terminal. |
 | `DOTLLM_DIRECTSTORAGE_DIR` | package folder | Directory holding the DirectStorage runtime DLLs. |
 | `DOTLLM_VULKAN_DIRECT_STORAGE` | on (Windows UMA with `dstorage.dll`) | `0` disables; `1` forces DirectStorage weight loading (disk straight into device memory) on any device. |
+| `DOTLLM_TUNING_DIR` | `~/.dotllm/tuning` | Root of the saved tuning results that `--auto` reads (#1902). |
 | `DOTLLM_HASH_CACHE_DIR` | `~/.dotllm/hash-cache` | Cache of file digests used to verify `--tensor-overlay` base hashes. |
 | `DOTLLM_GGUF_MAP_COW` | off | `1` maps GGUF files copy-on-write instead of read-only. |
 | `DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER` | off | `1` loads a GGUF whose tokenizer pre-type is unknown with the GPT-2 pipeline instead of refusing (tokenization may differ from the reference). |
@@ -854,7 +905,7 @@ Some variables are read at process start, others per model load - set them befor
 | `DOTLLM_VK_SCHEDULER_MAX_SEQS` | 8 | Concurrent sequences the Vulkan scheduler admits (each owns a device KV cache and state slot). |
 | `DOTLLM_SCHED_RECURRENT_PREFIX` | 4 | Recurrent prefix-snapshot entries kept by the scheduler for hybrid models; `0` disables. |
 | `DOTLLM_MTP_ADAPTIVE` | on | `0` turns the adaptive MTP gate off (MTP then engages whenever enabled). |
-| `DOTLLM_EDGE0_MTP` | on | `0` stops `run` / `chat` / `serve` auto-attaching the Edge0 MTP draft head from the `mtp/` folder beside `model-skeleton.gguf` (#2014). The head is attached behind the adaptive gate (`DOTLLM_MTP_ADAPTIVE`); one log line says when it attached. Measured (Strix Halo, under contention, relative): forced MTP (`DOTLLM_MTP_ADAPTIVE=0`) is ~1.6-1.8x plain at short context and slower than plain around 2.4K context, but the gate currently drops MTP after its first 5 rounds at every length, so auto-attach decodes at about plain speed (see #2014). `--mtp-head <mtp-dir>` attaches a folder explicitly. Needs about 0.65 GiB of device memory for the head plus verify snapshots; it is declined, with a warning, when the device has no room, and a malformed folder is skipped with a warning. |
+| `DOTLLM_EDGE0_MTP` | on | `0` stops `run` / `chat` / `serve` auto-attaching the Edge0 MTP draft head from the `mtp/` folder beside `model-skeleton.gguf` (#2014). The head is attached behind the adaptive gate (`DOTLLM_MTP_ADAPTIVE`); one log line says when it attached. Measured on Strix Halo after the adaptive-gate fix (#2020: a fall-back is now recorded so later requests stop retrying MTP, and the gate is per context band), decode tok/s: 39-token prompt auto 25.8-26.0 vs forced (`DOTLLM_MTP_ADAPTIVE=0`) 27.5-27.8 vs off 17.0 (about 1.5x plain); 2,166 tokens auto 21.3-21.4 / forced 21.9-22.1 / off 16.1-16.3; 6,114 tokens forced 19.2 / off 16.1. On a clean box auto never fell back at any context up to 6.1K (#2014). `--mtp-head <mtp-dir>` attaches a folder explicitly. Needs about 0.65 GiB of device memory for the head plus verify snapshots; it is declined, with a warning, when the device has no room, and a malformed folder is skipped with a warning. |
 | `DOTLLM_MTP_CALIBRATE` | on | `0` skips the MTP cold-start calibration rounds. |
 | `DOTLLM_GUMBEL_SAMPLING` | off | Position-seeded Gumbel-max sampling for every stochastic pipeline. |
 | `DOTLLM_EMBED_BATCH_WINDOW_MS` | 2 | Milliseconds the embedding endpoint waits to coalesce concurrent requests (0 = natural batching only). |
@@ -1100,6 +1151,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 
 | Variable | What the source says | Defined in |
 |---|---|---|
+| `DOTLLM_EDGE0_DRAFT_VOCAB` | Edge0 draft steps score only the pack's draft vocabulary (draft_vocab.bin, the LM head's Q8_0 rows read in place) instead of the full vocabulary (#2013). Verify is unchanged, so the text cannot change; only the drafts do. OPT-I... | `VulkanQwen4ExpTransformerModel.Mtp.cs` |
 | `DOTLLM_EDGE0_SKIP_GROUPS` | Single-row decode skips the D / U groups no selected expert uses (edge0_d_mmvq / edge0_u_mmvq): identical numerics, fewer bytes. DOTLLM_EDGE0_SKIP_GROUPS=0 (or setting this) visits every group (A/B). | `VulkanQwen3MoeHybridTransformerModel.Edge0.cs` |
 | `DOTLLM_EMBED_PACK` | True when documents can be packed into one embedding forward: the validated plain-causal decoder shape (Qwen3), the coopmat flash kernel serving the head dim, no window / soft-cap / sinks / distinct V dim, and row strides that... | `VulkanTransformerModel.cs` |
 | `DOTLLM_EMBED_PACK_TOKENS` | Token budget of one packed forward. Env DOTLLM_EMBED_PACK_TOKENS overrides (default 1024, as the decoder embedder). | `VulkanBertEncoderModel.cs` |

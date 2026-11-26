@@ -12,12 +12,32 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
     private VulkanDevice.Buffer? _edge0Xl, _edge0Z, _edge0Uo;
     private int _edge0Rows;
     private Kernels.MoeIndexedPlanarQ2MmvqKernel? _mtpPlanar;
+    private Kernels.MatMulQ8_0MmvqRowsKernel? _draftRows;
 
     /// <summary>Single-row decode skips the D / U groups no selected expert uses (<c>edge0_d_mmvq</c> / <c>edge0_u_mmvq</c>): identical numerics, fewer bytes. <c>DOTLLM_EDGE0_SKIP_GROUPS=0</c> (or setting this) visits every group (A/B).</summary>
     internal static bool Edge0SkipUnusedGroups { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_EDGE0_SKIP_GROUPS") != "0";
 
     /// <summary>Attaches the planar Q2_0 kernel the Edge0 MTP head's MoE layer is recorded with (G6, #1990). Owned by this core.</summary>
     internal void Q4AttachMtpPlanar(Kernels.MoeIndexedPlanarQ2MmvqKernel kernel) { _mtpPlanar?.Dispose(); _mtpPlanar = kernel; }
+
+    /// <summary>Attaches the Q8_0 row-subset GEMV the draft-vocab head is scored with (#2013). Owned by this core; false when the device lacks integer dot product or the SPIR-V.</summary>
+    internal bool Q4AttachDraftRows(string spvDir)
+    {
+        _draftRows ??= Kernels.MatMulQ8_0MmvqRowsKernel.TryCreate(_device, spvDir);
+        return _draftRows is not null && _kernels.MatMulQ8Mmvq is not null && _kernels.QuantizeQ8_1RowsActivations is not null;
+    }
+
+    /// <summary>
+    /// Records <c>y[i] = W_q8[rows[i]] . x</c> for the single decode row in <paramref name="input"/> (quantized to Q8_1 here): a Q8_0 matrix read in place at
+    /// the listed rows only (#2013). False when the kernels or scratch are unavailable (nothing recorded).
+    /// </summary>
+    internal bool Q4TryRecordMatmulRows(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer input, VulkanDevice.Buffer output, VulkanDevice.Buffer rows,
+        int m, int k, int weightRows)
+    {
+        if (_draftRows is null || !TryPrepareQ8Activations(cmdBuf, input, k)) return false;
+        _draftRows.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output, rows, m, k, weightRows);
+        return true;
+    }
 
     /// <summary>Test hook: layers recorded on the group-skipping decode path.</summary>
     internal long Edge0SkipLayers { get; private set; }

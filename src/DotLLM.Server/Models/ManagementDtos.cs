@@ -228,6 +228,41 @@ public sealed record DeviceInfoDto
     [JsonPropertyName("compute_capability")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ComputeCapability { get; init; }
+
+    /// <summary>PCI vendor id (GPU backends), when known. Part of the tuning-result device identity (#1902).</summary>
+    [JsonPropertyName("pci_vendor_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public uint? PciVendorId { get; init; }
+
+    /// <summary>PCI device id (Vulkan; CUDA through NVML), when known.</summary>
+    [JsonPropertyName("pci_device_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public uint? PciDeviceId { get; init; }
+
+    /// <summary>Driver version: the raw Vulkan <c>driverVersion</c>, or the NVIDIA driver version from NVML (e.g. <c>566.36</c>).</summary>
+    [JsonPropertyName("driver_version")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DriverVersion { get; init; }
+
+    /// <summary>True on an integrated (UMA) GPU, whose memory limit drifts and so stays out of the tuning key (#1902); null when unknown or not integrated.</summary>
+    [JsonPropertyName("is_integrated")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? IsIntegrated { get; init; }
+
+    /// <summary>Graphics API version: Vulkan <c>apiVersion</c> as <c>major.minor.patch</c>, or the CUDA version the driver supports (<c>cuDriverGetVersion</c>).</summary>
+    [JsonPropertyName("api_version")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ApiVersion { get; init; }
+
+    /// <summary>Vulkan <c>VkDriverId</c> (Vulkan 1.2+), when known.</summary>
+    [JsonPropertyName("driver_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DriverId { get; init; }
+
+    /// <summary>Vulkan <c>driverInfo</c>: the driver's own version string (Vulkan 1.2+), when known.</summary>
+    [JsonPropertyName("driver_info")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DriverInfo { get; init; }
 }
 
 // ───────────────────────────────── pull (#454) ─────────────────────────────────

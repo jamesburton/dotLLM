@@ -79,6 +79,10 @@ public static class DeviceEndpoint
             };
 
         var devices = new List<DeviceInfoDto>();
+        // cuDriverGetVersion is only the CUDA version the driver supports, which two driver releases can share; the NVML string is the
+        // driver itself. Both are stale-level parts of a tuning key (#1902).
+        string? cudaApi = DotLLM.Cuda.CudaDevice.TryGetDriverVersion()?.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        string? driver = DotLLM.Cuda.CudaMemoryInfo.TryGetDriverVersion();
         try
         {
             int count = DotLLM.Cuda.CudaDevice.GetDeviceCount();
@@ -95,6 +99,10 @@ public static class DeviceEndpoint
                         TotalMemoryBytes = d.TotalMemoryBytes,
                         FreeMemoryBytes = DotLLM.Cuda.CudaMemoryInfo.TryGet(i, out long free, out _) ? free : null,
                         ComputeCapability = d.ComputeCapability,
+                        PciVendorId = 0x10DE,
+                        PciDeviceId = DotLLM.Cuda.CudaMemoryInfo.TryGetPciDeviceId(i),
+                        DriverVersion = driver,
+                        ApiVersion = cudaApi,
                     });
                 }
                 catch
@@ -169,6 +177,13 @@ public static class DeviceEndpoint
                     DeviceString = $"vulkan:{d.Index}",
                     TotalMemoryBytes = d.DeviceLocalHeapBytes > 0 ? d.DeviceLocalHeapBytes : null,
                     IsDefault = d.IsDefault ? true : null,
+                    PciVendorId = d.VendorId,
+                    IsIntegrated = d.DeviceType == 1 ? true : null,
+                    PciDeviceId = d.DeviceId != 0 ? d.DeviceId : null,
+                    DriverVersion = d.DriverVersion != 0 ? d.DriverVersion.ToString(System.Globalization.CultureInfo.InvariantCulture) : null,
+                    ApiVersion = d.ApiVersion != 0 ? $"{d.ApiVersion >> 22}.{(d.ApiVersion >> 12) & 0x3FF}.{d.ApiVersion & 0xFFF}" : null,
+                    DriverId = d.DriverId != 0 ? d.DriverId.ToString(System.Globalization.CultureInfo.InvariantCulture) : null,
+                    DriverInfo = d.DriverInfo,
                 }).ToArray()
                 : [],
         };

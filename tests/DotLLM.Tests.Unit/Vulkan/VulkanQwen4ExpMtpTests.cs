@@ -258,6 +258,48 @@ public sealed class VulkanQwen4ExpMtpTests : IDisposable
         finally { Environment.SetEnvironmentVariable(Env, old); }
     }
 
+    /// <summary>
+    /// #2011 review: the chunked MTP absorption must equal ONE-SHOT absorption (not only hand chunking). Two rigs over the same weights: planned rows 16
+    /// (70 tokens -> 5 chunks, the head's carry/seed handed across each boundary) vs planned rows 128 (one forward, one absorb). Same cell count, and the
+    /// trunk logits agree to the chunked-prefill class (the GEMM row counts differ, so not bit-for-bit: ~4e-5 on this F32 rig) and the first draft adds no error of its own
+    /// on top of that (bounded by 2x the trunk drift; a wrong boundary carry measures far above it).
+    /// </summary>
+    [SkippableFact]
+    public void PrefillLongerThanPlannedRows_WithMtpState_MatchesOneShotAbsorption()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        const string Env = "DOTLLM_VK_PLANNED_ROWS";
+        string? old = Environment.GetEnvironmentVariable(Env);
+        int T = 70;
+        (float[] Last, float[] Draft, int Cells) Arm(string rows)
+        {
+            Environment.SetEnvironmentVariable(Env, rows);
+            var rig = Rig(spvDir, Q4eQuant.F32);
+            Assert.Equal(int.Parse(rows), rig.Vk.MaxRowsPerForward);
+            int[] ids = Prompt(T, 21, rig.Config.VocabSize);
+            rig.Vk.ResetSequenceState();
+            using var kv = rig.Vk.CreateKvCache(96);
+            using var st = (VulkanQwen4ExpMtpState)rig.Vk.CreateMtpState(96)!;
+            float[] last = Rows(rig.Vk.Forward(ids, Pos(T), -1, kv, null, st, true));
+            int cells = st.CellCount;   // before the draft step adds its own cell
+            Assert.Equal(T, st.CapturedRowCount);   // captured rows are indexed over the whole call, not the last chunk
+            float[] draft = Rows(rig.Vk.ForwardMtp(st, Argmax(last), T));
+            return (last, draft, cells);
+        }
+        try
+        {
+            var chunked = Arm("16");
+            var oneShot = Arm("128");
+            Assert.Equal(T - 1, oneShot.Cells);
+            Assert.Equal(oneShot.Cells, chunked.Cells);
+            float rl = RelL2(oneShot.Last, chunked.Last), rd = RelL2(oneShot.Draft, chunked.Draft);
+            _out.WriteLine($"one-shot vs chunked: last-logits relL2 {rl:E2}, first-draft relL2 {rd:E2}");
+            Assert.True(rl < 1e-4f, $"trunk logits: relL2 {rl:E2}");
+            Assert.True(rd <= Math.Max(1e-5f, 2 * rl), $"first draft: relL2 {rd:E2} (the head's chunked absorption must equal one-shot)");
+        }
+        finally { Environment.SetEnvironmentVariable(Env, old); }
+    }
+
     [SkippableFact]
     public void Rollback_DiscardsSpeculativeCells_AndRedoingThemIsDeterministic()
     {

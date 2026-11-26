@@ -997,6 +997,17 @@ the head 1.0 GiB smaller. UD-IQ4_XS, K = 4: 1.17x -> 1.56x of plain decode (K = 
   (ISTA IQ2_XS with the native Q8_0 head at K = 8, 0.9x) is handled by the controller picking a shorter K, not by the fall-back, so it neither gained nor lost
   from the calibration beyond noise. A stall in the first MTP rounds (measured once, while the box was building code: 700 ms per round) can trigger a spurious
   fall-back in the first request; the next re-probe (up to 16 requests later) recovers it.
+- *A fall-back is a measurement (#2018).* The fall-back fires after 5 rounds, which commit about 9 tokens, and `RecordSegment` drops segments under
+  `MinSampleTokens` (12); so the MTP arm stayed at n=0, and every later request (serve too) retried MTP, fell back again and paid the rounds again. The
+  controller now hands the gate the figure the fall-back was decided on (`MtpRoundController.RecordFallback`: the cost model's best-K ms per token; the
+  cost model drops only the first round it ever sees as cold) as the MTP sample, so the arm is measured, the loser is only re-probed on the usual doubling
+  schedule, and the request's MTP segment is not recorded a second time (a late fall-back's segment averages in the rounds that won and would say MTP
+  wins). The estimate is provisional: the next real MTP segment replaces it rather than blending in, so a stalled first request (10x plain) costs one
+  re-probe interval, not nine re-probes stretched over about 2,900 requests by the back-off. A context-band verdict is kept: `MtpAdaptiveGate.ForContext(promptTokens)` returns this gate for prompts up
+  to 512 tokens and a lazily created sibling (own arms, re-probe schedule and cost model) for each doubling above it, so a loss measured at 2.4K is
+  remembered at 2.4K and not charged to short prompts. Early rounds are noisy: the K model has two cost samples at the configured K and an unmeasured-K
+  guess of `K + 1 + FixedRows` rows (Edge0 on Vulkan: K=1 round 98 ms, K=4 141 ms, so `FixedRows` is about 4.8, not 1.5), and one rejected round makes
+  the best K 1 for the next round (`DOTLLM_MTP_TRACE=1` prints the first 8 rounds with K and the best K afterwards).
 - *Re-probing.* A losing arm is re-measured every 40 decisions; a clear loss (> 10 %) doubles the interval up to 640.
 - *serve attaches the head.* `serve` never attached the separate qwen4exp head (only `run` did), so the default-on serve path never speculated on this
   model. It now attaches an auto-detected `mtp-*.gguf` and logs the outcome; a head that does not fit the device is declined with the numbers and serving
@@ -1779,3 +1790,23 @@ The scheduler's host path was already position-seeded (`SamplerPipeline.Sample` 
 `SamplerPipeline.DeviceGumbelSpec` (inverse temperature + `GumbelFilter(TopK, MinP)`) generalises `DeviceGumbelInvTemperature`: any flat-options Gumbel pipeline with temperature, top-k and/or min-p and no logit processors / top-p / top-n-sigma is device-drawable. `gumbel_argmax_rows_f32.comp` now takes two parameter vectors per row (seed, index, 1/T, top-k, log min-p) and reproduces the host samplers exactly: top-k finds the k-th largest scaled value by a 32-step bisection on its order-preserving key, keeps everything strictly above it plus the FIRST `k - countAbove` ties in index order (`TopKSampler`), and min-p thresholds at `max + MathF.Log(minP)` computed in F32 (`MinPSampler`). Vocabularies up to 2^20. `IModel.SupportsDeviceGumbelFilter` + the `ForwardGumbelSampled(..., GumbelFilter, ...)` overload / `GumbelDraw.TopK,MinP` expose it; the scheduler and `MtpSpeculativeDecoder` use it when the model reports support.
 
 The dense qwen35 host draws in place. Gemma4 / generic dense (`VulkanTransformerModel`), Qwen4Exp, Qwen3-MoE-hybrid and Nemotron-H have no in-place LM-head hook, so they use `GumbelHostLogitsDrawer`: the host's own forward returns the logits, which are uploaded (a UMA host-to-device copy, ~1 MB per row, the one bounce this adds) and drawn by the same kernel. Measured on Llama-3.2-1B Q8_0 (`VulkanTransformerModel`, 128k vocab, scheduler, T=0.7, 64 tok, paired A/B alternating, 3 reps): pure temperature host -> device 109.7 -> 230.3 tok/s at 2 seqs and 132.6 -> 335.9 at 8 seqs. With top-k 40 + min-p 0.05 the host path is already cheap (it only draws noise for the survivors), so the device filter is a wash there: 225.5 -> 222.5 (2 seqs), 315.7 -> 329.4 (8 seqs); on Tev1-4B (dense qwen35, in place) 148.6 -> 166.8 tok/s at 8 seqs and 55.2 -> 53.3 at 2, MTP e2e unchanged (64.4 host vs 64.7 device median). Text is identical host vs device in every rep (also plain == MTP-device 9/9). The only unverified-on-real-model hosts are Gemma4-MTP, Qwen4Exp, Qwen3-MoE-hybrid and Nemotron-H themselves (shared drawer, covered by `VulkanGumbelHostLogitsDrawerTests` and the `VulkanTransformerModel` run).
+
+### Edge0 draft-vocabulary head (#2013, measured: opt-in, net slower)
+
+The Edge0 pack ships `mtp/draft_vocab.bin` (106,299 of 248,320 token ids, unsorted: base subset order, then appended ids). `DOTLLM_EDGE0_DRAFT_VOCAB=1` makes each Vulkan draft step score only those rows of the Q8_0 LM head and map the argmax back to the full vocabulary id. The rows are read in place by `matmul_q8_0_mmvq_rows.comp` (the Q8_0 MMVQ with an int32 row-id table; each subset row is bit-identical to the same row of the full GEMV); no weight is copied or widened, and the only extra device memory is the 425 KB id table and 425 KB compact logits. Verify is untouched, so every emitted token is still the verify argmax. `ForwardMtp` (full logit row) is unchanged.
+
+Measured on the Strix Halo (Edge0-145B-q3k, 4 prompts x 96 greedy tokens x 3 reps, subset and full interleaved in one session, reversed order on alternate reps):
+
+| | full vocabulary | draft vocabulary |
+|---|---|---|
+| LM-head bytes per draft step | 675.4 MB | 289.1 MB (+0.4 MB ids) |
+| draft step wall time | 14.7 / 14.6 ms (K=3 / K=4) | 13.6 / 13.6 ms |
+| acceptance K=3 | 65.9% | 59.2% |
+| acceptance K=4 | 66.2% | 55.7% |
+| tokens per verify round K=3 / K=4 | 2.98 / 3.66 | 2.78 / 3.25 |
+| decode tok/s incl. prefill K=3 | 8.6-10.0 | 8.4-9.8 |
+| decode tok/s incl. prefill K=4 | 8.8-12.9 | 8.2-11.6 |
+
+An audit run (every subset step also scores the full vocabulary) found the subset argmax equal to the full argmax in 89.8% of 471 steps; in the other 10.2% the full argmax is outside the subset (unreachable by construction), and in 0 steps was it inside the subset yet different. So the mapping is exact and the cost is the subset itself: the 1 ms saved per draft step is smaller than the acceptance it gives up (tok/s down roughly 5-9%), hence opt-in. Text was identical to full-vocabulary drafting in 12/12 runs per K even though the accept decisions differed in all of them (verify decides).
+
+The subset is not ours to get wrong: the pack's `draft_vocab.bin` is byte-identical (SHA-256 `b1e1d3a7...cb91`) to edge0-strata 0.1.40.3's shipped default `data/draft_vocab.bin`, and strata uses it the same way: on by default, draft logits over those rows of the trunk's `output.weight` (gathered into a compact copy rather than read in place), argmax over the subset, mapped back through the table, no full-vocabulary rescore; a token outside the subset is simply never drafted (`tools/draft_vocab.py` docstring, `src/core/mtp.cpp` `MtpDrafter::bind` / draft step). `STRATA_MTP_FULL_HEAD=1` is its full-head reference arm. Strata's case for the subset is VRAM and LM-head bandwidth on discrete GPUs; on this UMA box the head is ~1 ms of a ~14.7 ms draft step, so the acceptance it costs dominates.

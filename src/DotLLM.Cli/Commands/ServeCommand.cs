@@ -418,6 +418,16 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic'. Overrides the GGUF-derived value.")]
         public string? RopeScaling { get; set; }
 
+        /// <summary>Apply the saved tuning result (#1902).</summary>
+        [CommandOption("--auto")]
+        [Description(DotLLM.Cli.Helpers.AutoCli.Help)]
+        public bool Auto { get; set; }
+
+        /// <summary>Profile looked up by <c>--auto</c>.</summary>
+        [CommandOption("--auto-profile <NAME>")]
+        [Description(DotLLM.Cli.Helpers.AutoCli.ProfileHelp)]
+        public string? AutoProfile { get; set; }
+
         [CommandOption("--rope-freq-base")]
         [Description("RoPE base frequency (theta) override. Overrides the GGUF-derived value.")]
         public float? RopeFreqBase { get; set; }
@@ -619,6 +629,54 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         };
     }
 
+    /// <summary>
+    /// <see cref="BuildServerOptions"/> after applying the saved tuning result when <c>--auto</c> was given (#1902). With no <c>--auto</c>, or no
+    /// resolved model path, it is exactly <see cref="BuildServerOptions"/>. The one place <c>serve</c> consults the store.
+    /// </summary>
+    /// <param name="settings">The parsed settings; mutated with what the saved result chose.</param>
+    /// <param name="maxMessages">The resolved <c>--max-messages</c> cap.</param>
+    /// <param name="resolvedPath">The resolved model file, or null when none was given at startup.</param>
+    /// <returns>The options, with <see cref="ServerOptions.SettingSources"/> filled under <c>--auto</c>.</returns>
+    internal static ServerOptions BuildServerOptionsAuto(Settings settings, int? maxMessages, string? resolvedPath)
+    {
+        DotLLM.Server.Tuning.AutoApplied? applied = null;
+        if (settings.Auto && resolvedPath is not null)
+        {
+            applied = DotLLM.Cli.Helpers.AutoCli.Resolve(DotLLM.Server.Tuning.AutoCommand.Serve, settings.Model ?? "", resolvedPath,
+                settings.Device, settings.AutoProfile, settings.CtxSize is > 0 ? settings.CtxSize.Value : 0, DotLLM.Cli.Helpers.AutoCli.ServeSupported,
+                json: false, settings.TensorOverlay, settings.TernaryAdapterPaths, settings.MtpHead, settings.DFlash);
+            if (applied is not null) ApplyAuto(settings, applied.Applied);
+        }
+        var options = BuildServerOptions(settings, maxMessages);
+        return applied is null
+            ? options
+            : options with
+            {
+                AutoProfile = string.IsNullOrWhiteSpace(settings.AutoProfile) ? DotLLM.Server.Tuning.AutoEntry.DefaultProfile : settings.AutoProfile,
+                SettingSources = DotLLM.Cli.Helpers.AutoCli.SourceMap(applied),
+            };
+    }
+
+    /// <summary>Copies the settings a saved tuning result chose onto <paramref name="s"/>. A null member keeps the flag or default.</summary>
+    internal static void ApplyAuto(Settings s, DotLLM.Server.Tuning.TunedSettings t)
+    {
+        if (t.Device is not null) s.Device = t.Device;
+        if (t.GpuLayers is not null) s.GpuLayers = t.GpuLayers;
+        if (t.MoeOffload is not null) s.MoeOffload = t.MoeOffload;
+        if (t.MoeCacheMib is not null) s.MoeCacheMib = t.MoeCacheMib.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (t.NCpuMoe is not null) s.NCpuMoe = t.NCpuMoe;
+        if (t.CacheTypeK is not null) s.CacheTypeK = t.CacheTypeK;
+        if (t.CacheTypeV is not null) s.CacheTypeV = t.CacheTypeV;
+        if (t.Paged is not null) s.NoPaged = !t.Paged.Value;
+        if (t.PrefillChunkSize is not null) s.PrefillChunkSize = t.PrefillChunkSize;
+        if (t.MtpEnabled is not null) s.NoMtp = !t.MtpEnabled.Value;
+        if (t.SpeculativeK is not null) s.SpeculativeK = t.SpeculativeK.Value;
+        if (t.Threads is not null) s.Threads = t.Threads.Value;
+        if (t.DecodeThreads is not null) s.DecodeThreads = t.DecodeThreads.Value;
+        if (t.ExpectedConcurrency is not null) s.ExpectedConcurrency = t.ExpectedConcurrency.Value;
+        if (t.ContextSize is not null) s.CtxSize = t.ContextSize;
+    }
+
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
@@ -663,7 +721,19 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             return 1;
         }
 
-        var serverOptions = BuildServerOptions(settings, maxMessages);
+        // --auto (#1902): resolve the model first so its saved tuning result can be looked up before anything loads. Without --auto this is
+        // skipped entirely, so nothing below changes.
+        string? autoResolvedPath = null;
+        if (settings.Auto && !string.IsNullOrEmpty(settings.Model))
+        {
+            autoResolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
+            if (autoResolvedPath is null)
+                return 1;
+        }
+        else if (settings.Auto)
+            AnsiConsole.MarkupLine("[yellow]auto: no model given at startup, so there is nothing to look up; running the defaults[/]");
+
+        var serverOptions = BuildServerOptionsAuto(settings, maxMessages, autoResolvedPath);
 
         // --chunk-store-write: own the store BEFORE the model loads, so a second writer on the same directory fails in
         // seconds rather than after loading (and holding) a whole model; the writer started later uses this claim.
@@ -682,7 +752,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         if (!string.IsNullOrEmpty(settings.Model))
         {
             // Resolve and load model
-            var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
+            var resolvedPath = autoResolvedPath ?? GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
             if (resolvedPath is null)
                 return 1;
 

@@ -481,7 +481,13 @@ public sealed class VulkanDevice : IDisposable
     /// <param name="DeviceType">Vulkan <c>VkPhysicalDeviceType</c> value (1 integrated, 2 discrete, ...).</param>
     /// <param name="DeviceLocalHeapBytes">Size of the largest device-local heap (0 when none is reported). This is the heap size, not free memory.</param>
     /// <param name="IsDefault">True for the device a plain <see cref="Create()"/> (scoring plus the env overrides) would pick.</param>
-    public readonly record struct PhysicalDeviceInfo(int Index, string Name, uint VendorId, int DeviceType, long DeviceLocalHeapBytes, bool IsDefault);
+    /// <param name="DeviceId">PCI device id (0 when not reported); part of the tuning-result device identity (#1902).</param>
+    /// <param name="DriverVersion">Raw <c>VkPhysicalDeviceProperties::driverVersion</c> (vendor-encoded; 0 when not reported).</param>
+    /// <param name="ApiVersion">Raw <c>VkPhysicalDeviceProperties::apiVersion</c> (0 when not reported).</param>
+    /// <param name="DriverId"><c>VkPhysicalDeviceDriverProperties::driverID</c> (<c>VkDriverId</c>; 0 below Vulkan 1.2 or when not reported).</param>
+    /// <param name="DriverInfo"><c>VkPhysicalDeviceDriverProperties::driverInfo</c>, the driver's own version string (null when not reported).</param>
+    public readonly record struct PhysicalDeviceInfo(int Index, string Name, uint VendorId, int DeviceType, long DeviceLocalHeapBytes, bool IsDefault,
+        uint DeviceId = 0, uint DriverVersion = 0, uint ApiVersion = 0, uint DriverId = 0, string? DriverInfo = null);
 
     /// <summary>
     /// Lists every Vulkan physical device without creating a logical device (one short-lived instance, under the lifecycle write lock like
@@ -524,13 +530,43 @@ public sealed class VulkanDevice : IDisposable
                     ulong best = 0;
                     for (uint h = 0; h < mem.memoryHeapCount && h < 16; h++)
                         if ((heaps[h * 2 + 1] & 1u) != 0 && heaps[h * 2] > best) best = heaps[h * 2];   // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
-                    result[i] = new PhysicalDeviceInfo(i, ReadDeviceName(props), props.vendorID, props.deviceType, (long)best, i == defaultIndex);
+                    ProbeDriverProperties(devices[i], props.apiVersion, out uint driverId, out string? driverInfo);
+                    result[i] = new PhysicalDeviceInfo(i, ReadDeviceName(props), props.vendorID, props.deviceType, (long)best, i == defaultIndex,
+                        props.deviceID, props.driverVersion, props.apiVersion, driverId, driverInfo);
                 }
                 return result;
             }
             finally { VulkanApi.vkDestroyInstance(inst, 0); }
         }
         finally { s_lifecycleLock.ExitWriteLock(); }
+    }
+
+    /// <summary>
+    /// Reads <c>VkPhysicalDeviceDriverProperties</c> (Vulkan 1.2 core) through <c>vkGetPhysicalDeviceProperties2</c>: the driver id and the
+    /// driver's version string (#1902). Zero and null below 1.2 or on any failure; the caller treats them as "not reported".
+    /// </summary>
+    private static unsafe void ProbeDriverProperties(nint physical, uint apiVersion, out uint driverId, out string? driverInfo)
+    {
+        driverId = 0;
+        driverInfo = null;
+        if (VkApiMajor(apiVersion) < 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) < 2u)) return;
+        try
+        {
+            VkPhysicalDeviceDriverProperties drv = default;
+            drv.sType = VkStructureType.PhysicalDeviceDriverProperties;
+            VkPhysicalDeviceProperties2 props2 = default;
+            props2.sType = VkStructureType.PhysicalDeviceProperties2;
+            props2.pNext = (nint)(&drv);
+            VulkanApi.vkGetPhysicalDeviceProperties2(physical, ref props2);
+            driverId = drv.driverID;
+            string info = System.Text.Encoding.UTF8.GetString(drv.driverInfo, 256).Split('\0')[0].Trim();
+            driverInfo = info.Length > 0 ? info : null;
+        }
+        catch
+        {
+            driverId = 0;
+            driverInfo = null;
+        }
     }
 
     /// <summary>

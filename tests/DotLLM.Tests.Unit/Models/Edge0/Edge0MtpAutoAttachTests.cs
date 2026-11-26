@@ -3,6 +3,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
+using DotLLM.Server;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Models.Edge0;
@@ -29,9 +30,10 @@ public sealed class Edge0MtpAutoAttachTests : IDisposable
         public long ComputeMemoryBytes => 0;
         public bool HasMtpHead { get; private set; }
         public string? AttachedDir, AttachedFile;
+        public bool ThrowOnAttach;
         public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId) => throw new NotSupportedException();
         public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache) => throw new NotSupportedException();
-        public void AttachEdge0MtpHead(string mtpDir) { AttachedDir = mtpDir; HasMtpHead = true; }
+        public void AttachEdge0MtpHead(string mtpDir) { if (ThrowOnAttach) throw new InvalidOperationException("no device room"); AttachedDir = mtpDir; HasMtpHead = true; }
         public void AttachMtpHead(string path) { AttachedFile = path; HasMtpHead = true; }
         public void Dispose() { }
     }
@@ -105,6 +107,28 @@ public sealed class Edge0MtpAutoAttachTests : IDisposable
         Assert.Null(Qwen4ExpMtpHeadResolver.TryAttach(plain, Path.Combine(dir, "model-skeleton.gguf")));
         Assert.False(plain.HasMtpHead);
         Assert.Throws<NotSupportedException>(() => Qwen4ExpMtpHeadResolver.TryAttach(plain, Path.Combine(dir, "model-skeleton.gguf"), Path.Combine(dir, "mtp")));
+    }
+
+    [Fact]
+    public void Serve_ExplicitMtpHeadThatFailsToLoad_RefusesToStart_ButAnAutoDetectedOneNeverFails()
+    {
+        Environment.SetEnvironmentVariable(Qwen4ExpMtpHeadResolver.Edge0EnvVar, null);
+        string dir = Folder("serve");
+        string skel = Path.Combine(dir, "model-skeleton.gguf");
+
+        // explicit head that does not exist: serve must throw (as run/chat do), not log and carry on plain
+        var missing = new StubEdge0Model();
+        Assert.Throws<FileNotFoundException>(() => ServerStartup.TryAttachSeparateMtpHead(missing, skel,
+            new ServerOptions { Model = "x", MtpHeadPath = Path.Combine(dir, "nope.gguf") }));
+        // explicit folder whose attach fails: same
+        Assert.Throws<InvalidOperationException>(() => ServerStartup.TryAttachSeparateMtpHead(new StubEdge0Model { ThrowOnAttach = true }, skel,
+            new ServerOptions { Model = "x", MtpHeadPath = Path.Combine(dir, "mtp") }));
+        // auto-detected folder whose attach fails: logged, serving continues
+        var auto = new StubEdge0Model { ThrowOnAttach = true };
+        ServerStartup.TryAttachSeparateMtpHead(auto, skel, new ServerOptions { Model = "x" });
+        Assert.False(auto.HasMtpHead);
+        // explicit head on a model that cannot take a folder: 'this model cannot take one' stays non-fatal, as in run/chat
+        ServerStartup.TryAttachSeparateMtpHead(new PlainHeadModel(), skel, new ServerOptions { Model = "x", MtpHeadPath = Path.Combine(dir, "mtp") });
     }
 
     private sealed class PlainHeadModel : IModel, IMtpHeadAttachable
