@@ -152,6 +152,16 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         /// <summary>Effective warm-up rep count: <c>--warmup N</c> or 1 when unset.</summary>
         public int EffectiveWarmup => Warmup < 0 ? 1 : Warmup;
 
+        /// <summary>Apply the saved tuning result (#1902).</summary>
+        [CommandOption("--auto")]
+        [Description(DotLLM.Cli.Helpers.AutoCli.Help)]
+        public bool Auto { get; set; }
+
+        /// <summary>Profile looked up by <c>--auto</c>.</summary>
+        [CommandOption("--auto-profile <NAME>")]
+        [Description(DotLLM.Cli.Helpers.AutoCli.ProfileHelp)]
+        public string? AutoProfile { get; set; }
+
         public override ValidationResult Validate()
         {
             if (PromptTokens <= 0) return ValidationResult.Error("--prompt-tokens|-p must be positive.");
@@ -197,8 +207,42 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         }
     }
 
+    /// <summary>Copies the settings a saved tuning result chose onto <paramref name="s"/>. A null member keeps the flag or default.</summary>
+    /// <summary>
+    /// Upper bound on the context a bench run fills, for <c>--auto</c> admission (#1902): prompt + deepest depth + generated tokens + 8, the
+    /// same figure the MoE offload budget reserves for.
+    /// </summary>
+    internal static int BenchContextBound(Settings s)
+    {
+        int depth = s.Depth;
+        if (s.DepthList is not null && Settings.TryParseDepthList(s.DepthList, out var list, out _) && list is { Length: > 0 }) depth = Math.Max(depth, list[^1]);
+        return s.PromptTokens + depth + s.GenTokens + 8;
+    }
+
+    internal static void ApplyAuto(Settings s, DotLLM.Server.Tuning.TunedSettings t)
+    {
+        if (t.Device is not null) s.Device = t.Device;
+        if (t.CacheTypeK is not null) s.KvQuantK = t.CacheTypeK;
+        if (t.CacheTypeV is not null) s.KvQuantV = t.CacheTypeV;
+        if (t.Threads is not null) s.Threads = t.Threads.Value;
+        if (t.DecodeThreads is not null) s.DecodeThreads = t.DecodeThreads.Value;
+    }
+
     public override int Execute(CommandContext context, Settings settings)
     {
+        // --auto (#1902): resolve the model first so its saved tuning result can be looked up, then apply it BEFORE the flag checks below.
+        // Without --auto this is skipped and the order is unchanged.
+        string? autoGguf = null;
+        if (settings.Auto)
+        {
+            autoGguf = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            if (autoGguf is null)
+                return 1;
+            var applied = DotLLM.Cli.Helpers.AutoCli.Resolve(DotLLM.Server.Tuning.AutoCommand.Bench, settings.Model, autoGguf, settings.Device,
+                settings.AutoProfile, settings.CtxSize ?? BenchContextBound(settings), DotLLM.Cli.Helpers.AutoCli.BenchSupported, settings.Json);
+            if (applied is not null) ApplyAuto(settings, applied.Applied);
+        }
+
         // #1888, #1892: bench measured the default cache for a TurboQuant request while its reproduce line said tq. It now builds the same
         // in-place cache serve does, or refuses (here before the load, or after it) - never a measurement on another cache.
         if (DotLLM.Cli.Helpers.KvStorageCli.TurboQuantRefusal(DotLLM.Server.KvCommand.Bench, settings.KvQuantK, settings.KvQuantV,
@@ -207,7 +251,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             WriteError(settings, tqRefusal);
             return 1;
         }
-        var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+        var ggufPath = autoGguf ?? GgufFileResolver.Resolve(settings.Model, settings.Quant);
         if (ggufPath is null)
             return 1;
 

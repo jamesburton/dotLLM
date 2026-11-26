@@ -33,6 +33,8 @@ internal static class VkStructureType
     internal const int PhysicalDeviceProperties2 = 1000059001;
     internal const int PhysicalDeviceFeatures2 = 1000059000;
     internal const int PhysicalDeviceSubgroupProperties = 1000094000;
+    // Vulkan 1.2 core: VkPhysicalDeviceDriverProperties (driver id and info string; tuning-key driver identity, #1902).
+    internal const int PhysicalDeviceDriverProperties = 1000196000;
     // VK_KHR_cooperative_matrix extension structures.
     internal const int PhysicalDeviceCooperativeMatrixFeaturesKhr = 1000506000;
     internal const int CooperativeMatrixPropertiesKhr = 1000506001;
@@ -699,6 +701,19 @@ internal struct VkPhysicalDeviceSubgroupProperties
     internal uint supportedStages;       // VkShaderStageFlags bitmask
     internal uint supportedOperations;   // VkSubgroupFeatureFlags bitmask
     internal uint quadOperationsInAllStages; // VkBool32
+}
+
+// VkPhysicalDeviceDriverProperties — Vulkan 1.2 core (VK_KHR_driver_properties). Chained on VkPhysicalDeviceProperties2 to read the
+// driver id and the driver's own version string, which are the stale-level driver identity of a tuning result (#1902).
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPhysicalDeviceDriverProperties
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint driverID;                 // VkDriverId
+    internal fixed byte driverName[256];    // VK_MAX_DRIVER_NAME_SIZE
+    internal fixed byte driverInfo[256];    // VK_MAX_DRIVER_INFO_SIZE
+    internal uint conformanceVersion;       // VkConformanceVersion: four uint8
 }
 
 // VkPhysicalDeviceProperties2 — Vulkan 1.1 core. We only read the `sType`

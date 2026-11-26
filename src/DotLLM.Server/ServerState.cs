@@ -644,6 +644,7 @@ public sealed class ServerState : IDisposable
             PrefillTokensDone = first?.PrefillTokensDone,
             PrefillTokensTotal = first?.PrefillTokensTotal,
             DecodeTokens = first?.DecodeTokens,
+            SettingsSource = Options.SettingSources,
             Requests = requests.Count == 0 ? null : requests.Select(p => new Models.InFlightRequestStatus
             {
                 Request = p.Tag,

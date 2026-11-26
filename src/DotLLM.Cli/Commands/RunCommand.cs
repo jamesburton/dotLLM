@@ -394,6 +394,53 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [CommandOption(DotLLM.Cli.Helpers.TensorOverlayCli.SkipHashOption)]
         [Description(DotLLM.Cli.Helpers.TensorOverlayCli.SkipHashHelp)]
         public bool OverlaySkipBaseHash { get; set; }
+
+        /// <summary>Apply the saved tuning result (#1902).</summary>
+        [CommandOption("--auto")]
+        [Description(DotLLM.Cli.Helpers.AutoCli.Help)]
+        public bool Auto { get; set; }
+
+        /// <summary>Profile looked up by <c>--auto</c>.</summary>
+        [CommandOption("--auto-profile <NAME>")]
+        [Description(DotLLM.Cli.Helpers.AutoCli.ProfileHelp)]
+        public string? AutoProfile { get; set; }
+    }
+
+    /// <summary>Copies the settings a saved tuning result chose onto <paramref name="s"/>. A null member keeps the flag or default.</summary>
+    /// <summary>
+    /// Upper bound on the context a run fills, for <c>--auto</c> admission (#1902): the prompt's UTF-8 byte count (byte-level BPE and
+    /// byte-fallback SentencePiece never emit more tokens than bytes) plus <c>--max-tokens</c> plus 256 for BOS and a chat template.
+    /// 0 (unknown, so not admitted) when the prompt cannot be sized.
+    /// </summary>
+    internal static int RunContextBound(Settings s)
+    {
+        long promptBytes;
+        try
+        {
+            if (s.Prompt is not null) promptBytes = System.Text.Encoding.UTF8.GetByteCount(s.Prompt);
+            else if (s.PromptFile is not null && File.Exists(s.PromptFile)) promptBytes = new FileInfo(s.PromptFile).Length;
+            else return 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return 0; }
+        long bound = promptBytes + Math.Max(0, s.MaxTokens) + 256;
+        return bound > int.MaxValue ? 0 : (int)bound;
+    }
+
+    internal static void ApplyAuto(Settings s, DotLLM.Server.Tuning.TunedSettings t)
+    {
+        if (t.Device is not null) s.Device = t.Device;
+        if (t.GpuLayers is not null) s.GpuLayers = t.GpuLayers;
+        if (t.MoeOffload is not null) s.MoeOffload = t.MoeOffload;
+        if (t.MoeCacheMib is not null) s.MoeCacheMib = t.MoeCacheMib.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (t.NCpuMoe is not null) s.NCpuMoe = t.NCpuMoe;
+        if (t.CacheTypeK is not null) s.CacheTypeK = t.CacheTypeK;
+        if (t.CacheTypeV is not null) s.CacheTypeV = t.CacheTypeV;
+        if (t.Paged is not null) s.Paged = t.Paged.Value;
+        if (t.PrefillChunkSize is not null) s.PrefillChunkSize = t.PrefillChunkSize.Value;
+        if (t.MtpEnabled is not null) s.NoMtp = !t.MtpEnabled.Value;
+        if (t.SpeculativeK is not null) s.SpeculativeK = t.SpeculativeK.Value;
+        if (t.Threads is not null) s.Threads = t.Threads.Value;
+        if (t.DecodeThreads is not null) s.DecodeThreads = t.DecodeThreads.Value;
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -416,6 +463,22 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         {
             DeviceCli.PrintError(deviceError, settings.Json);
             return 1;
+        }
+
+        // --auto (#1902): resolve the model first so its saved tuning result can be looked up, then apply it BEFORE the flag checks below,
+        // so what --auto chose is validated like any flag. Without --auto this is skipped and the order is unchanged.
+        string? hfDir = null;
+        string? resolvedPath = null;
+        if (settings.Auto)
+        {
+            hfDir = TryResolveHfDirectory(settings.Model);
+            resolvedPath = hfDir ?? GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
+            if (resolvedPath is null)
+                return 1;
+            var applied = DotLLM.Cli.Helpers.AutoCli.Resolve(DotLLM.Server.Tuning.AutoCommand.Run, settings.Model, resolvedPath, settings.Device,
+                settings.AutoProfile, settings.CtxSize ?? RunContextBound(settings), DotLLM.Cli.Helpers.AutoCli.RunChatSupported, settings.Json, settings.TensorOverlay,
+                settings.TernaryAdapterPaths, settings.MtpHead, settings.DFlash);
+            if (applied is not null) ApplyAuto(settings, applied.Applied);
         }
         if (MoeOffloadCli.Validate(settings.MoeValues) is { } moeError)
         {
@@ -442,19 +505,20 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         // HuggingFace safetensors directory? (config.json + *.safetensors /
         // model.safetensors.index.json). Auto-detected; loads via the
         // safetensors path instead of GGUF. The GGUF path is unchanged.
-        string? hfDir = TryResolveHfDirectory(settings.Model);
-
-        string resolvedPath;
-        if (hfDir is not null)
+        if (resolvedPath is null)
         {
-            resolvedPath = hfDir;
-        }
-        else
-        {
-            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
-            if (ggufPath is null)
-                return 1;
-            resolvedPath = ggufPath;
+            hfDir = TryResolveHfDirectory(settings.Model);
+            if (hfDir is not null)
+            {
+                resolvedPath = hfDir;
+            }
+            else
+            {
+                var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
+                if (ggufPath is null)
+                    return 1;
+                resolvedPath = ggufPath;
+            }
         }
 
         string? mtpHeadPath = null;

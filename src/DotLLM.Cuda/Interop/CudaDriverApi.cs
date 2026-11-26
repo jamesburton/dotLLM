@@ -27,6 +27,10 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuDeviceGetCount(out int count);
 
+    /// <summary>The CUDA version the installed driver supports (e.g. 12040); a stale-level component of the tuning key (#1902).</summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuDriverGetVersion(out int driverVersion);
+
     [LibraryImport(LibName)]
     internal static partial int cuDeviceGetName(
         [MarshalAs(UnmanagedType.LPArray)] byte[] name, int len, int device);
