@@ -305,6 +305,7 @@ All development follows an issue-driven workflow.
 5. **One issue, one branch, one PR.** If scope grows, split into a new issue.
 6. **Read the relevant docs first.** Before starting, read docs listed in the Documentation Index for the module being implemented.
 7. **Keep README in sync.** When a PR completes a roadmap step, update `docs/ROADMAP.md` (add `:white_check_mark:` to the step) and `README.md` (bump the step count in the Roadmap table, e.g., "4/9" → "5/9"; when a phase completes change status to "Done"; add a News entry for significant milestones).
+8. **Keep the support matrix current.** When a PR adds a model architecture, or changes (adds, optimises, removes, breaks) its support on any device, update the Device support table in `docs/SUPPORTED_MODELS.md` in the same PR. The rules are in [AGENTS.md](AGENTS.md#keep-docssupported_modelsmd-current).
 
 ### Working through large pre-existing feature branches
 
