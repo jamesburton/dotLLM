@@ -293,6 +293,8 @@ public sealed class MtpRoundController
             return;
         }
         _roundsThisRequest++;
+        if (MtpAdaptiveGate.TraceEnabled && _roundsThisRequest <= MinRoundsForFallback + 3)
+            Console.Error.WriteLine($"[mtp] round {_roundsThisRequest}: K={k} emitted={emitted} {roundMs:F1} ms; best K now {_model.BestK(_configuredK).K}");
         _model.RecordRound(k, emitted - 1, roundMs);
     }
 
