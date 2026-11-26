@@ -106,13 +106,17 @@ input-dependent taps `sum_lag x[t-lag] * d[head][lag]` (`d` = `*_conv_proj . inp
 | attention / embedding / output matrices | Q8_0 | in place |
 | router `ffn_gate_inp` | F32 (1.2 MB/layer, 28 MB) | in place (`expert_router_f32`) |
 | norms, `*_res_query`, `*_conv`, `*_clip`, `attn_rel_bias`, `exp_probs_b` | F32 (~5 MB total) | in place; the converter forces these F32 (`tensor_force_quant`) |
-| loop controllers (`loop_msg_query`, `ctrl_down/gain/forget`) | **F32, 113.7 MB** | `Inkling2Options.LoopController`: F32 in place, or a load-time Q8_0 / F16 / BF16 copy (30.2 / 56.8 / 56.8 MB) — see results, **user ruling pending** |
+| loop controllers (`loop_msg_query`, `ctrl_down/gain/forget`) | **F32, 113.7 MB** | **BF16 by default** (user ruling 2026-11-26): converted once at load (56.8 MB). `Inkling2Options.LoopController` / `DOTLLM_INKLING2_LOOP_CONTROLLER` keep F32 (in place), Q8_0 and F16 as A/B overrides. `loop_msg_query` is widened to F32 per visit into native scratch (4 x 2304 floats) |
 | KV history | — | F16 (llama.cpp default KV type); K is L2-clipped to 22.6 and V RMS-normed, so the range is safe |
-| conv state | — | `Inkling2Options.ConvState` F32 / F16 / BF16 (3.8 MB at F32 for all 48 slots) |
-| activations | — | F32 transient scratch inside a forward call (the CPU kernels take F32 activations); nothing wider than the GGUF tensors is stored |
+| conv state | — | **BF16 by default** (user ruling 2026-11-26; F16 is ruled out and removed). F32 stays as an A/B override (`DOTLLM_INKLING2_CONV_STATE`); 3.8 MB at F32 for all 48 slots |
+| activations | — | F32 transient scratch inside a forward call (the CPU kernels take F32 activations), held in **native** 64-byte-aligned arenas (`Inkling2Scratch`; bump allocation, rewound per layer visit, pooled per model, freed on `Dispose`); nothing wider than the GGUF tensors is stored |
+
+**Known bounded expansion.** `loop_msg_query` is stored BF16 but widened to F32 per core visit (pass > 0) into native scratch for the depth-mix dot: 4 x 2304 x 4 B = 36,864 B transient per visit, 24 visits per call, never resident. Reading the BF16 rows directly in the dot is a follow-up.
+
+**Managed allocation (CLAUDE.md: no managed arrays for tensor data).** The first CPU reference allocated a fresh `new float[]` for almost every activation of every layer visit (48 visits per token), `ToArray()` on the residual queries, and a managed F32 copy of the loop message query per visit. Measured with `GC.GetTotalAllocatedBytes(precise: true)` on the NVFP4 file, warm, `Inkling2AllocationTests`: **before** 449.12 MB per 32-token prefill call and 15.98 MB (15,980,752 B) per decoded token; **after** 0.00 MB per prefill call and 104 B per decoded token (the returned logits tensor object). The test budget is 32 KB per decoded token; reintroducing one `new float[2304]` per layer visit measures 443,624 B per token and fails it (mutant killed). The test runs in a non-parallel collection because the measurement is process-wide.
 
 **Oracle.** llama.cpp b12780 CPU (`-dev none -ngl 0`; llama.cpp's Vulkan backend is not an oracle), model `Inkling-2-Mini-NVFP4.gguf`. Gate data in `~/.dotllm/test-cache/token-oracles/inkling2/`:
-`passage.txt` (866 tokens), `nvfp4-passage-c256*.kld` (`llama-perplexity --kl-divergence-base`, `-c 256`, 2 chunks, 254 scored positions, flash attention on/off),
+`passage.txt` (866 tokens), `nvfp4-wikitext-c1280-fa-off.kld` (1280-token windows, section 10), `nvfp4-passage-c256-fa-off-logscale-floor1.kld` (llama.cpp run with `--override-kv inkling2_loop.attention.log_scale_floor=int:1`, section 10), `nvfp4-passage-c256*.kld` (`llama-perplexity --kl-divergence-base`, `-c 256`, 2 chunks, 254 scored positions, flash attention on/off),
 `greedy-nvfp4*.json` (8 prompts x 48 greedy tokens with the oracle's own token ids and top-1/top-2 margins). **dotLLM is fed the oracle's token ids**, so tokenizer differences cannot contaminate the model KL.
 The KL file keeps log-probs as uint16 over `[max-16, max]`; floor ~1e-6.
 
@@ -131,29 +135,34 @@ neither a KL below ~4e-3 nor free-running greedy identity is a meaningful bar ag
 
 ## 10. Results (CPU reference vs llama.cpp b12780 CPU, `Inkling-2-Mini-NVFP4.gguf`, Strix Halo, 2026-11-26)
 
-Gate (`Inkling2RealModelTests`, 254 scored positions; dotLLM sub-chunks the prefill by 32 tokens, so carried KV/conv state is exercised; chunk size does not change the KL with F32 state):
+**Defaults since the user rulings of 2026-11-26: loop controller BF16, conv state BF16.** Gate (`Inkling2RealModelTests`, 254 scored positions; dotLLM sub-chunks the prefill by 32 tokens, so carried KV/conv state is exercised; chunk size does not change the KL with F32 state):
 
 | arm | mean KL | max KL | top-1 | teacher-forced greedy mismatches (of 384) |
 |---|---|---|---|---|
-| dotLLM vs llama.cpp `-fa off` (the F32-mask oracle; the gate) | **3.96e-3** | 6.6e-2 | 98.8% | 6 (0 of 345 at oracle margin >= 0.3; the six are at margins 0.015-0.141) |
+| **dotLLM, defaults (BF16 controller + BF16 conv state)** vs llama.cpp `-fa off` (the gate) | **4.10e-3** | 9.0e-2 | 98.8% | 2 (0 of 345 at margin >= 0.3; margins 0.032, 0.053); free-running prefixes 7/48/48/48/48/48/48/48 |
+| dotLLM, all-F32 A/B arm (`DOTLLM_INKLING2_LOOP_CONTROLLER=f32 DOTLLM_INKLING2_CONV_STATE=f32`; the pre-refactor configuration) | 3.96e-3 | 6.6e-2 | 98.8% | 6 (0 of 345 at margin >= 0.3; the six are at margins 0.015-0.141) |
 | dotLLM vs llama.cpp default (flash attention on) | 5.39e-3 | 3.1e-1 | 98.0% | — |
 | llama.cpp `-fa on` vs `-fa off` (its own noise floor) | 4.05e-3 | 1.9e-1 | 99.2% | greedy diverges on 2 of 8 prompts |
 
-Free-running greedy prefix identity vs the `-fa off` oracle (of 48 tokens, 8 prompts): 10 / 3 / 48 / 48 / 48 / 27 / 12 / 48; every divergence is at an oracle top-1/top-2 margin below 0.15.
+The all-F32 arm is bit-for-bit the pre-refactor result (mean KL 3.959e-3, max 6.589e-2, free-running prefixes below), i.e. the native-scratch refactor changed no numerics. Free-running greedy prefix identity of the all-F32 arm vs the `-fa off` oracle (of 48 tokens, 8 prompts): 10 / 3 / 48 / 48 / 48 / 27 / 12 / 48; every divergence is at an oracle top-1/top-2 margin below 0.15.
 
-**Mutants** (same gate, unmutated mean KL 3.96e-3; all killed except one that cannot be observed on this passage):
+**Mutants** (same gate; re-measured with the BF16 defaults, unmutated mean KL 4.10e-3; all killed):
 
 | mutant | mean KL | top-1 |
 |---|---|---|
-| 2 loop passes instead of 3 | 0.632 | 69.7% |
-| no final logit softcap | 2.310 | 98.8% (KL is the signal here: top-1 alone would miss it) |
-| attention sink = 0 | 0.378 | 73.6% |
-| no relative-position bias | 4.864 | 14.2% |
-| NVFP4 per-expert `.scale` ignored | 12.95 | 2.0% |
-| loop controllers off (no messages) | 1.019 | 64.6% |
-| **no log scaling** | 3.96e-3 (identical) | 98.8% — **survives**: the factor is exactly 1 below position 8191 and the passage has 256 tokens. Pinned at op level (`Inkling2OpsTests.LogScale_*`); a >8K-token oracle run would be needed to observe it end to end |
+| 2 loop passes instead of 3 | 0.635 | 69.7% |
+| no final logit softcap | 2.338 | 98.8% (KL is the signal here: top-1 alone would miss it) |
+| attention sink = 0 | 0.354 | 74.4% |
+| no relative-position bias | 4.876 | 13.8% |
+| NVFP4 per-expert `.scale` ignored | 13.33 | 1.6% |
+| loop controllers off (no messages) | 1.018 | 63.0% |
+| **no log scaling** (256-token passage, shipped floor 8192) | 3.96e-3 (identical) | 98.8% | survives this gate by construction: the factor is exactly 1 below position 8191; see the floor-1 test below |
 
-**Loop-controller storage (user ruling pending).** Same gate; bytes are the stored size of `loop_msg_query` + 12 layers x 4 x (`down` 4608x64, `gain` 64x2304, `forget` 64x2304):
+**Log scaling, end to end (floor overridden to 1).** The factor is `1 + 0.1 ln(max(1, (pos+1)/floor))`; with the shipped floor of 8192 it is exactly 1 below position 8191, but it does NOT need a run longer than 8K: llama.cpp can be run with `--override-kv inkling2_loop.attention.log_scale_floor=int:1` (oracle `nvfp4-passage-c256-fa-off-logscale-floor1.kld`) and dotLLM with `LogScaleFloor = 1`, which puts the scaling in play from position 1 of the 256-token passage. `Inkling2RealModelTests.LogScale_Floor1_MatchesOverriddenLlamaCpp`: correct (BF16 defaults) mean KL **4.52e-3** (max 6.6e-2, top-1 95.7%), the `NoLogScale` mutant **3.37e-2** (max 1.04, top-1 92.9%): killed (gate: correct < 8e-3, mutant >= 1.5e-2). The reviewer measured 5.26e-3 vs 3.48e-2 on the same oracle at `2e40d71e` with the F32 defaults.
+
+**Window / extent beyond 1024 (reviewer evidence).** Oracle `nvfp4-wikitext-c1280-fa-off.kld` (1280-token windows): mean KL **1.76e-3** below position 1024 and **1.59e-3** at or above it, so the 1024-key local window and the 1024-row relative-bias extent are exercised and agree with llama.cpp. Known gate limit: the one-key-wider-window mutant (1.69e-3) and the bias-clamp mutant (1.83e-3) survive against 1.59e-3 for the correct implementation; the gate cannot see them (tracked with the local KV ring in #2033).
+
+**Loop-controller storage (user ruling 2026-11-26: BF16 default; first table measured with F32 conv state, second with the BF16 conv-state default).** Same gate; bytes are the stored size of `loop_msg_query` + 12 layers x 4 x (`down` 4608x64, `gain` 64x2304, `forget` 64x2304):
 
 | storage | bytes | mean KL | max KL | top-1 | teacher-forced mismatches | free-running prefixes |
 |---|---|---|---|---|---|---|
@@ -162,8 +171,17 @@ Free-running greedy prefix identity vs the `-fa off` oracle (of 48 tokens, 8 pro
 | F16 | 56.8 MB | 3.55e-3 | 7.6e-2 | 98.4% | 5 | 10/18/48/48/48/27/12/48 |
 | BF16 | 56.8 MB | 3.37e-3 | 6.9e-2 | 99.2% | 4 | 10/18/48/48/48/27/48/48 |
 
+Re-measured with the BF16 conv-state default (2026-11-26, after the refactor):
+
+| storage | mean KL | max KL | top-1 | teacher-forced mismatches (confident) |
+|---|---|---|---|---|
+| F32 | 3.91e-3 | 1.12e-1 | 98.8% | 4 (0) |
+| Q8_0 | 3.94e-3 | 1.11e-1 | 99.6% | 4 (0) |
+| F16 | 4.21e-3 | 1.10e-1 | 99.2% | 3 (0) |
+| **BF16 (default)** | 4.10e-3 | 9.0e-2 | 98.8% | 2 (0) |
+
 The four are indistinguishable at this resolution (differences of 5e-4 in KL are below the oracle noise floor; no mismatch at a confident margin in any arm). Q8_0 saves 83.5 MB.
 
-**Conv-state storage** (3.8 MB at F32 for all 48 slots; the sweep is only meaningful because the harness carries state across calls): F32 3.96e-3 / max 6.6e-2; **BF16 3.91e-3 / max 0.11** (4 mismatches, 0 confident); **F16 5.65e-3 / max 0.24, top-1 97.6%** — F16 is visibly worse than BF16 (a value range the 5-bit exponent cannot hold), BF16 is on par with F32 on mean KL.
+**Conv-state storage** (3.8 MB at F32 for all 48 slots; the sweep is only meaningful because the harness carries state across calls): F32 3.96e-3 / max 6.6e-2; **BF16 3.91e-3 / max 0.11** (4 mismatches, 0 confident); **F16 5.65e-3 / max 0.24, top-1 97.6%** — F16 is visibly worse than BF16 (a value range the 5-bit exponent cannot hold), BF16 is on par with F32 on mean KL. With the loop controller at BF16 the conv-state arms are F32 3.37e-3 (4 mismatches) and BF16 4.10e-3 (2 mismatches), 0 confident in both.
 
-**Throughput** (32 threads, `cpu-bench` lock held, NVFP4 file, F32 conv state; one measurement, llama.cpp b12780 CPU measures ~10.5 tok/s decode on the same file): prefill 128 tokens 21.4 tok/s, decode 9.1 tok/s (110 ms/token). Not tuned: attention, depth mixing and the convs are scalar loops, MoE is bucketed per expert.
+**Throughput** (32 threads, `cpu-bench` lock held, NVFP4 file, F32 conv state; one measurement, llama.cpp b12780 CPU measures ~10.5 tok/s decode on the same file): prefill 128 tokens 21.4 tok/s, decode 9.1 tok/s (110 ms/token) before the refactor; 22.8 / 9.8 tok/s (102 ms/token) after, BF16 defaults. Not tuned: attention, depth mixing and the convs are scalar loops, MoE is bucketed per expert.
