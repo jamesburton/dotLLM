@@ -188,6 +188,9 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     {
         if (!device.HasIntegerDotProduct)
             return null;
+        // The shaders reduce with one wave32 subgroupAdd per cell: on a device whose subgroups are narrower (and cannot be pinned to 32) the sum is silently partial.
+        if (Wave32SubgroupControl.RequiredSubgroupSizeFor(device) == 0 && device.SubgroupSize < 32)
+            return null;
         // Q4_1 has no V1 shader (#1171), so it always takes V2.
         bool useV2 = quant == MoeIqQuant.Q4_1 || ((v2 ?? (V2Default && (quant != MoeIqQuant.Q4_0 || Q4_0V2Default))) && HasV2(quant));
         string path = Path.Combine(spvDir, ShaderName(quant, useV2) + ".spv");

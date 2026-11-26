@@ -187,6 +187,10 @@ internal static class VulkanQwen3MoeMoeUpload
         /// bytes of F32, and the F16 GEMV / coopmat paths), F32 with <c>DOTLLM_VK_MOE_SHARED_F16=0</c>.</summary>
         public QuantizationType SharedQuantType { get; }
 
+        /// <summary>Edge0 latent-MoE device buffers of this layer (D, U per group, labels, 1/s), or null for an ordinary MoE layer. When set, <see cref="W1Bank"/> /
+        /// <see cref="W3Bank"/> / <see cref="W2Bank"/> are the Q3_K / Q3_K / IQ4_NL split banks of the pack and <see cref="Gate"/> is the BF16 router (Edge0 G3, #1981).</summary>
+        internal Edge0LayerBuffers? Edge0 { get; init; }
+
         /// <summary>Decode-only raw Q8_0 copies of the shared gate / up projections (half the bytes of F16; aliases the mmap'd GGUF pages on UMA, so
         /// no extra residency). Null unless the source tensors are Q8_0 with K % 32 == 0 (<c>DOTLLM_VK_MOE_SHARED_Q8=0</c> disables).</summary>
         public VulkanDevice.Buffer? SharedGateQ8 { get; init; }
@@ -224,12 +228,14 @@ internal static class VulkanQwen3MoeMoeUpload
         public void Dispose()
         {
             Gate.Dispose();
-            W1Bank.Dispose(); W2Bank.Dispose(); W3Bank.Dispose();
+            W1Bank.Dispose();
+            if (Edge0 is null) { W2Bank.Dispose(); W3Bank.Dispose(); }   // an Edge0 layer's three banks are ONE record buffer
             SharedGate?.Dispose(); SharedUp?.Dispose(); SharedDown?.Dispose();
             if (!ReferenceEquals(SharedGateQ8, SharedGate)) SharedGateQ8?.Dispose();
             if (!ReferenceEquals(SharedUpQ8, SharedUp)) SharedUpQ8?.Dispose();
             SharedExpertGate?.Dispose();
             SelectionBias?.Dispose();
+            Edge0?.Dispose();
         }
     }
 
@@ -257,7 +263,8 @@ internal static class VulkanQwen3MoeMoeUpload
         bool parallelUpload = !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PARALLEL_UPLOAD"), "0", StringComparison.Ordinal);
         using var upStaging = parallelUpload
             ? VulkanStagingBuffer.CreateParallel(device, VulkanStagingBuffer.ParallelSlotBytes, VulkanStagingBuffer.ParallelSlotCount) : null;
-        using var prealloc = parallelUpload && expertSlots == 0
+        // #1994: with DirectStorage active the banks are read straight into their own heaps, so allocating them ahead would only waste device memory.
+        using var prealloc = parallelUpload && expertSlots == 0 && !VulkanWeightImportPolicy.DirectTierActive(device)
             && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_BANK_PREALLOC"), "0", StringComparison.Ordinal) ? new VulkanBankPrealloc(device) : null;
 
         const int AllocAhead = 2;
@@ -347,9 +354,11 @@ internal static class VulkanQwen3MoeMoeUpload
     /// <param name="prealloc">Optional pool of bank buffers allocated ahead on background threads; null = allocate inline (#874).</param>
     /// <param name="expertSlots">Expert tiering (#939): when &gt; 0 the three routed banks are allocated for this many experts and left EMPTY (filled on demand by the tier); 0 = full resident banks.</param>
     /// <param name="sharedPackedDefault">Default for the packed Q8_0 shared-expert upload (#987) when <c>DOTLLM_VK_MOE_SHARED_PACKED</c> is unset: true for the Qwen3.6 hybrid loader, false for qwen4exp (prefill -4..5%).</param>
+    /// <param name="edge0">Edge0 latent-MoE buffers (G3, #1981): the router and the three expert banks come from them instead of <paramref name="moe"/>.</param>
     public static unsafe LayerBundle UploadLayer(
         VulkanDevice device, MoeLayerWeights moe, int hiddenSize,
-        bool residentQuant = false, VulkanStagingBuffer? sharedStaging = null, VulkanBankPrealloc? prealloc = null, int expertSlots = 0, bool sharedPackedDefault = true)
+        bool residentQuant = false, VulkanStagingBuffer? sharedStaging = null, VulkanBankPrealloc? prealloc = null, int expertSlots = 0, bool sharedPackedDefault = true,
+        Edge0LayerBuffers? edge0 = null)
     {
         int numE = moe.NumExperts;
         int interm = moe.IntermediateSize;
@@ -361,9 +370,9 @@ internal static class VulkanQwen3MoeMoeUpload
         // resident indexed-matmul kernel wired up (see s_ResidentQuantTypes)
         // are eligible; anything else falls back to F32 for that bank alone.
         bool integerDot = device.HasIntegerDotProduct;
-        QuantizationType w1Qt = ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot);
-        QuantizationType w2Qt = ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView, interm, integerDot);
-        QuantizationType w3Qt = ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot);
+        QuantizationType w1Qt = edge0 is not null ? edge0.GateUpType : ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot);
+        QuantizationType w2Qt = edge0 is not null ? edge0.DownType : ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView, interm, integerDot);
+        QuantizationType w3Qt = edge0 is not null ? edge0.GateUpType : ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot);
 
         // Bounded persistently-mapped staging (issue #147): banks stream through
         // it one expert slab (or chunk) at a time — the previous whole-bank
@@ -377,8 +386,13 @@ internal static class VulkanQwen3MoeMoeUpload
         var staging = useShared ? sharedStaging! : ownStaging!;
 
         // ── Router gate ──────────────────────────────────────────────────────
-        var gate = device.AllocateDeviceLocal(gateBytes);
-        staging.UploadFloats(moe.Gate, gate);
+        VulkanDevice.Buffer gate;
+        if (edge0 is not null) gate = edge0.Router;   // BF16 router, uploaded by the Edge0 loader (read in place, never widened)
+        else
+        {
+            gate = device.AllocateDeviceLocal(gateBytes);
+            staging.UploadFloats(moe.Gate, gate);
+        }
 
         // ── Routed expert banks. Each bank independently takes one of two
         //    paths based on its own resolved quant type:
@@ -390,7 +404,11 @@ internal static class VulkanQwen3MoeMoeUpload
         //       buffer is at a fraction of the F32 size (quant-dependent).
         long tBanks = System.Diagnostics.Stopwatch.GetTimestamp();
         VulkanDevice.Buffer w1Bank, w2Bank, w3Bank;
-        if (expertSlots > 0)
+        if (edge0 is not null)
+        {
+            w1Bank = edge0.Records; w2Bank = edge0.Records; w3Bank = edge0.Records;   // one record array, three offsets (the strided kernels)
+        }
+        else if (expertSlots > 0)
         {
             // #939 tiered: the banks are slot pools, filled on demand from the file; nothing is read from (or touches) the routed-expert pages here.
             w1Bank = AllocateSlotBank(device, w1Qt, moe.GateExpsRawQt, 'G', expertSlots, interm, hiddenSize);
@@ -491,6 +509,7 @@ internal static class VulkanQwen3MoeMoeUpload
             SigmoidGating = moe.SigmoidGating,
             SelectionBias = moe.SigmoidGating && moe.SelectionBias is not null ? UploadFloatArray(device, staging, moe.SelectionBias) : null,
             WeightsScale = moe.WeightsScale,
+            Edge0 = edge0,
         };
     }
 
@@ -509,6 +528,15 @@ internal static class VulkanQwen3MoeMoeUpload
 
     private static VulkanDevice.Buffer AllocateSlotBank(VulkanDevice device, QuantizationType quantType, QuantizationType sourceQt, char kind, int slots, int mDim, int kDim)
         => device.AllocateDeviceLocal(slots * TieredExpertBytes(quantType, sourceQt, kind, mDim, kDim));
+
+    /// <summary>The raw GGUF pointer of routed bank <paramref name="kind"/> when its stored quant type is <paramref name="quantType"/>, else null.</summary>
+    private static nint? RawBankPointer(MoeLayerWeights moe, char kind, QuantizationType quantType) => kind switch
+    {
+        'G' when moe.GateExpsRawQt == quantType => moe.GateExpsRaw,
+        'D' when moe.DownExpsRawQt == quantType => moe.DownExpsRaw,
+        'U' when moe.UpExpsRawQt == quantType => moe.UpExpsRaw,
+        _ => null,
+    };
 
     /// <summary>
     /// Allocates and uploads ONE routed bank at its resolved quant type —
@@ -534,8 +562,14 @@ internal static class VulkanQwen3MoeMoeUpload
             long rowBytes = Dequantize.RowByteSize(kDim, quantType);
             long perExpertBytes = rowBytes * mDim;
             long bankBytes = (long)numE * perExpertBytes;
+            // #1994: the fused [E,M,K] bank is one contiguous byte-identical range of the GGUF, so DirectStorage can read it straight into a
+            // device-local heap (no host copy, no file-page import penalty #1991).
+            if (moe.HasRawQuantView && RawBankPointer(moe, kind, quantType) is { } rawSrc and not 0
+                && VulkanWeightImportPolicy.TryLoadDirect(device, rawSrc, bankBytes, out var direct))
+                return direct!;
             var bank = prealloc?.Take(bankBytes) ?? device.AllocateDeviceLocal(bankBytes);
             UploadRoutedBankResidentQuant(device, staging, moe, quantType, kind, bank, numE, perExpertBytes);
+            VulkanWeightImportPolicy.NoteBankStaged(bankBytes);
             return bank;
         }
     }

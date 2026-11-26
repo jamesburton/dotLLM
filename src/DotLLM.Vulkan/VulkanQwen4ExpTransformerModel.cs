@@ -105,6 +105,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
 
     /// <summary>Tiering counters on one line (hit rate, SSD bytes, stall split); null when not tiered.</summary>
     public string? ExpertTierSummary => _tier?.Describe();
+    /// <summary>Edge0 (G3, #1981): the strata pack and the FP8 n-gram file the skeleton was opened with; owned, disposed with the model. Null for a stock file.</summary>
+    private DotLLM.Models.Edge0.Edge0Pack? _edge0Pack;
+    private GgufFile? _edge0Ple;
     private readonly Qwen4ExpPleBranch? _ple;
     private readonly VulkanQwen4ExpPleGpu? _pleGpu;
     private readonly int _pleLayer;
@@ -796,6 +799,11 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
     /// <summary>Test hook (#885): gated-residual reads recorded on the fused path.</summary>
     internal long GrFusedReads { get; private set; }
 
+    /// <summary>Test hook (Edge0 G3): Edge0 layers recorded on the group-skipping decode path.</summary>
+    internal long Edge0SkipLayersForTest => _core.Edge0SkipLayersCount;
+    /// <summary>Test hook: bytes of the Edge0 per-forward scratch (F16 D output + F16 U slab).</summary>
+    internal long Edge0ScratchBytesForTest => _core.Edge0ScratchBytes;
+
     /// <summary>Test hook (#885): decode MoE layers that used the fused scatter + shared-gate add kernel.</summary>
     internal long CombineFusedLayers => _core.Q4CombineFusedLayers;
 
@@ -963,6 +971,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
         _defaultState.Dispose();
         foreach (var m in _moe) m.Dispose();
         _tier?.Dispose();
+        _edge0Pack?.Dispose();
+        _edge0Ple?.Dispose();
         foreach (var g in _attnGr) g.Dispose();
         foreach (var g in _ffnGr) g.Dispose();
         _headGr.Dispose();

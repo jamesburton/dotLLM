@@ -351,6 +351,72 @@ public sealed class OlalaVulkanTests
         Assert.True(worst < 2e-2, $"max |GPU - CPU| {worst:E2}");   // BF16 rounding of a unit vector is ~4e-3 per element
     }
 
+    /// <summary>
+    /// <c>olala_moe_route</c> with an expert count that is NOT a multiple of 4 (#2000 review). The router scores four experts per subgroup pass and
+    /// clamps / guards the last group; Olala (E = 256) and the tiny oracle (E = 8) never exercise that tail. The expert bias forces the LAST two
+    /// experts into every token's top-k (a margin of 5 against sigmoid scores in (0, 1)), so a guard that drops a tail expert changes the
+    /// selection, and the weights are compared to a double reference. E = 8 is the multiple-of-4 control; E = 3 is a single partial group.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(3, false)]
+    [InlineData(5, false)]
+    [InlineData(6, false)]
+    [InlineData(7, false)]
+    [InlineData(8, false)]
+    [InlineData(13, false)]
+    [InlineData(7, true)]
+    [InlineData(13, true)]
+    public void RouteKernel_ExpertCountNotMultipleOf4_MatchesDoubleReference(int E, bool f32Act)
+    {
+        SkipUnlessGpu();
+        using var dev = VulkanDevice.Create();
+        const int H = 64, T = 4, K = 3; const float scale = 2.45f;
+        var rng = new Random(11 + E);
+        var w = new float[E * H]; var x = new float[T * H]; var bias = new float[E];
+        for (int i = 0; i < w.Length; i++) w[i] = (float)(rng.NextDouble() * 2 - 1) * 0.3f;
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        if (!f32Act) for (int i = 0; i < x.Length; i++) x[i] = FromBf16(Bf16(x[i]));
+        for (int e = 0; e < E; e++) bias[e] = (float)(rng.NextDouble() * 0.01);
+        bias[E - 1] += 10f; bias[E - 2] += 5f;   // the tail experts must be chosen first and second
+        using var bw = dev.Allocate(w.Length * 4); dev.Upload(w, bw);
+        using var bb = dev.Allocate(Math.Max(16, E * 4)); dev.Upload(bias, bb);
+        using var bx = f32Act ? dev.Allocate(x.Length * 4) : UploadBf16(dev, x);
+        if (f32Act) dev.Upload(x, bx);
+        using var bsel = dev.Allocate(T * K * 4 + 16); using var bsw = dev.Allocate(T * K * 4 + 16);
+        using var k = new OlalaKernel(dev, SpvDir(), "olala_moe_route" + (f32Act ? "_f32act" : ""), 5, 4);
+        using (var ctx = dev.CreateSubmitContext())
+        {
+            ctx.Begin();
+            k.Record(ctx.CommandBuffer, [bw, bx, bb, bsel, bsw], [(uint)H, (uint)E, (uint)K, BitConverter.SingleToUInt32Bits(scale)], T, 1, 1);
+            ctx.SubmitAndWait();
+        }
+        var selRaw = new float[T * K]; dev.Download(bsel, selRaw);
+        var sel = System.Runtime.InteropServices.MemoryMarshal.Cast<float, uint>(selRaw.AsSpan()).ToArray();
+        float[] selW;
+        if (f32Act) { selW = new float[T * K]; dev.Download(bsw, selW); }
+        else selW = DownloadBf16(dev, bsw, T * K);
+        for (int t = 0; t < T; t++)
+        {
+            var sig = new double[E];
+            for (int e = 0; e < E; e++)
+            {
+                double a = 0; for (int i = 0; i < H; i++) a += (double)w[e * H + i] * x[t * H + i];
+                sig[e] = 1.0 / (1.0 + Math.Exp(-a));
+            }
+            int[] want = Enumerable.Range(0, E).OrderByDescending(e => sig[e] + bias[e]).ThenBy(e => e).Take(K).ToArray();
+            var ordered = Enumerable.Range(0, E).Select(e => sig[e] + bias[e]).OrderByDescending(v => v).ToArray();
+            Assert.True(K >= E || ordered[K - 1] - ordered[K] > 1e-4, $"token {t}: reference top-k is near-tied; pick another seed");
+            double sum = want.Sum(e => sig[e]);
+            for (int i = 0; i < K; i++)
+            {
+                Assert.True(want[i] == (int)sel[t * K + i], $"E={E} token {t} slot {i}: expert {sel[t * K + i]}, want {want[i]} (got [{string.Join(",", sel.Skip(t * K).Take(K))}], want [{string.Join(",", want)}])");
+                double ww = sig[want[i]] / (sum + 1e-20) * scale;
+                double tol = f32Act ? 1e-5 * ww : 8e-3 * ww;   // BF16 output: half an ulp is 2^-9 relative
+                Assert.True(Math.Abs(selW[t * K + i] - ww) <= tol, $"E={E} token {t} slot {i}: weight {selW[t * K + i]:R} vs {ww:R}");
+            }
+        }
+    }
+
     /// <summary>A BF16-weight GEMV with 1e12-scale BF16 activations (the ReLU^2 / mixer-output inputs of safe2) equals a double reference: no FP16 scale anywhere.</summary>
     [SkippableFact]
     public void GemvKernel_WithOutlierActivations_MatchesDoubleReference()
@@ -476,6 +542,59 @@ public sealed class OlalaVulkanTests
             _output.WriteLine($"warm round {round}: prefill {pre[^1]:F0} tok/s ({ms:F0} ms), decode {dec[^1]:F1} tok/s (median step {steps.OrderBy(x => x).ElementAt(steps.Count / 2):F1} ms)");
         }
         _output.WriteLine($"{file} act={(f32 ? "F32" : "BF16")}: warm prefill {pre.Min():F0}-{pre.Max():F0} tok/s, decode {dec.Min():F1}-{dec.Max():F1} tok/s");
+    }
+
+    /// <summary>
+    /// Split-submit per-stage profile (opt-in: <c>DOTLLM_OLALA_VK_PROFILE=1</c>; hold the GPU lock). Every stage is its own submit + fence wait, so each
+    /// mark carries a sync cost (measured here with an empty-stage probe is not available: pass <c>DOTLLM_OLALA_VK_SYNC_US</c>, default 50) that is subtracted
+    /// to give the "net" column. Prefill = the 300-token chat prompt (256 + 44 chunks); decode = 40 greedy steps.
+    /// </summary>
+    [SkippableFact]
+    public void RealModel_StageProfile()
+    {
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_OLALA_VK_PROFILE") != "1", "set DOTLLM_OLALA_VK_PROFILE=1");
+        SkipUnlessGpu();
+        string file = Environment.GetEnvironmentVariable("DOTLLM_OLALA_BENCH_FILE") ?? "Olala-v1.0-mini-7A1B-q8_0-safe2.gguf";
+        string? gguf = FindGguf("DOTLLM_OLALA_Q8_GGUF", file); Skip.If(gguf is null, file + " not in the HF cache");
+        var c = OlalaOracleTests.LoadCase("real-strict-gguf-norms-chat")!;
+        double syncUs = double.Parse(Environment.GetEnvironmentVariable("DOTLLM_OLALA_VK_SYNC_US") ?? "50", System.Globalization.CultureInfo.InvariantCulture);
+        using var dev = VulkanDevice.Create();
+        using var f = GgufFile.Open(gguf!);
+        using var vk = LoadVk(dev, f);
+        int[] pos = Enumerable.Range(0, c.L).ToArray();
+        // warm up (2 full rounds), then profile
+        int next = 0;
+        for (int w = 0; w < 2; w++)
+        {
+            vk.ResetSequenceState();
+            using var p0 = vk.Forward(c.Ids, pos, -1, null, true);
+            next = OlalaOracleTests.Argmax(Rows(p0, 1, c.Vocab));
+            for (int j = 0; j < 8; j++) { using var s0 = vk.Forward([next], [c.L + j], -1, null, true); next = OlalaOracleTests.Argmax(Rows(s0, 1, c.Vocab)); }
+        }
+        void Dump(string title, int tokens)
+        {
+            var prof = vk.StageProfile!;
+            double total = prof.Values.Sum(v => v.Ms), net = prof.Values.Sum(v => v.Ms - v.Count * syncUs / 1000.0);
+            _output.WriteLine($"== {title}: {total:F1} ms wall in marks, {net:F1} ms net of {prof.Values.Sum(v => v.Count)} syncs x {syncUs:F0} us");
+            foreach (var kv in prof.OrderByDescending(k => k.Value.Ms - k.Value.Count * syncUs / 1000.0))
+            {
+                double n = kv.Value.Ms - kv.Value.Count * syncUs / 1000.0;
+                _output.WriteLine($"  {kv.Key,-20} n={kv.Value.Count,4} net {n,8:F2} ms ({100 * n / net,5:F1}%)  {n / Math.Max(1, kv.Value.Count) * 1000,8:F0} us/call");
+            }
+        }
+        for (int round = 0; round < 3; round++)
+        {
+            vk.ResetSequenceState();
+            vk.StageProfile = new();
+            using var p = vk.Forward(c.Ids, pos, -1, null, true);
+            Dump($"prefill {c.L} tok (round {round})", c.L);
+            next = OlalaOracleTests.Argmax(Rows(p, 1, c.Vocab));
+            vk.StageProfile = new();
+            const int steps = 40;
+            for (int j = 0; j < steps; j++) { using var s = vk.Forward([next], [c.L + j], -1, null, true); next = OlalaOracleTests.Argmax(Rows(s, 1, c.Vocab)); }
+            Dump($"decode, {steps} steps summed (round {round}); per-step = /{steps}", steps);
+            vk.StageProfile = null;
+        }
     }
 
     /// <summary>

@@ -241,9 +241,9 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
             throw new NotSupportedException("Olala Vulkan Mamba step supports head dim <= 64, rank <= 8, state <= 128, angles <= min(64, state/2).");
         if (o.NumSignalHeads + o.NumNoiseHeads != 4 * o.NumNoiseHeads)
             throw new NotSupportedException("Olala Vulkan attention supports 4 query heads per kv head (3 signal + 1 noise).");
-        // olala_moe_route keeps the token row and the scores in fixed shared arrays (sx[4096], sig/scored[1024], chosen[16]).
-        if (config.HiddenSize > 4096 || o.ExpertCount > 1024 || o.ExpertUsedCount < 1 || o.ExpertUsedCount > 16 || o.ExpertUsedCount > o.ExpertCount)
-            throw new NotSupportedException($"Olala Vulkan router supports hidden <= 4096, experts <= 1024 and 1 <= top-k <= min(16, experts); got hidden {config.HiddenSize}, " +
+        // olala_moe_route keeps the token row and the scores in fixed shared arrays (sx4[1024] = 4096 floats read as vec4, sig/scored[1024], chosen[16]).
+        if (config.HiddenSize > 4096 || config.HiddenSize % 4 != 0 || o.ExpertCount > 1024 || o.ExpertUsedCount < 1 || o.ExpertUsedCount > 16 || o.ExpertUsedCount > o.ExpertCount)
+            throw new NotSupportedException($"Olala Vulkan router supports hidden <= 4096 (a multiple of 4: the F32 router is read as vec4), experts <= 1024 and 1 <= top-k <= min(16, experts); got hidden {config.HiddenSize}, " +
                                             $"experts {o.ExpertCount}, top-k {o.ExpertUsedCount}.");
 
         long bytes = 0;
@@ -442,6 +442,26 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
         Run(k, 1u << 0, [(uint)_hidden, (uint)layerIndex + 1, F(scale), F(bias)], (uint)T, 1, 1, x, g);
     }
 
+    /// <summary>
+    /// Opt-in split-submit stage profile (null = off, zero cost): when set, every <see cref="Sp"/> mark submits and waits, then adds the host
+    /// time since the previous mark to <c>label</c> -> (ms, count). Each mark costs one submit/fence sync (~50 us), so subtract that x count.
+    /// </summary>
+    internal Dictionary<string, (double Ms, int Count)>? StageProfile { get; set; }
+    private long _spT0;
+
+    private void Sp(string label)
+    {
+        if (StageProfile is null) return;
+        _submit.SubmitAndWait();
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        StageProfile.TryGetValue(label, out var v);
+        StageProfile[label] = (v.Ms + System.Diagnostics.Stopwatch.GetElapsedTime(_spT0, now).TotalMilliseconds, v.Count + 1);
+        _pendingW.Clear(); _pendingR.Clear();
+        _submit.Begin();
+        _cmd = _submit.CommandBuffer;
+        _spT0 = System.Diagnostics.Stopwatch.GetTimestamp();
+    }
+
     private void Flush()
     {
         _submit.SubmitAndWait();
@@ -523,9 +543,11 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
         _cmd = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(_cmd);
         _pendingW.Clear(); _pendingR.Clear();
+        _spT0 = System.Diagnostics.Stopwatch.GetTimestamp();
 
         var embK = Kernel("emb", "olala_embed_" + Wt(_embed.Qt), 3, 2);
         Run(embK, 1u << 2, [(uint)_hidden, (uint)_vocab], (uint)Tc, 1, 1, _embed.Buf, _ids, _res);
+        Sp("embed");
         TraceBuf("embed", _res, Tc, _hidden);
 
         foreach (var l in _layers)
@@ -534,10 +556,12 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
             else RecordAttention(l, Tc, basePos);
             TraceBuf($"blk.{l.Index}.mixer_out", _mix, Tc, _hidden);
             Geodesic(_res, _mix, Tc, l.Index, l.GeoMixScale, l.GeoMixBias);
+            Sp("geodesic");
             TraceBuf($"blk.{l.Index}.post_mixer", _res, Tc, _hidden);
             RecordMoe(l, Tc);
             TraceBuf($"blk.{l.Index}.mlp_out", _mix, Tc, _hidden);
             Geodesic(_res, _mix, Tc, l.Index, l.GeoMlpScale, l.GeoMlpBias);
+            Sp("geodesic");
             TraceBuf($"blk.{l.Index}.l_out", _res, Tc, _hidden);
         }
 
@@ -553,6 +577,7 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
             logits = _logits;
             long xOff = lastOnly ? (long)(Tc - 1) * _hidden : 0;
             Gemv(_output, _res, logits, logitRows, f32Out: true, xOff: xOff);
+            Sp("lm_head");
         }
         _submit.SubmitAndWait();
         if (logits is not null) _device.Download(logits, logitsDst);
@@ -561,13 +586,14 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
 
     private void RecordSsm(Layer l, int T)
     {
-        Gemv(l.SsmIn!, _res, _zxdt, T);
-        Gemv(l.SsmInDyn!, _res, _dyn, T);
+        Gemv(l.SsmIn!, _res, _zxdt, T); Sp("M ssm_in");
+        Gemv(l.SsmInDyn!, _res, _dyn, T); Sp("M ssm_in_dyn");
         var k = Kernel("mamba", "olala_mamba3_step", 5, 7, (uint)_N, (uint)_R);
         Run(k, (1u << 3) | (1u << 4), [(uint)T, (uint)_heads, (uint)_P, (uint)_N, (uint)_R, (uint)_A, F(_eps)], (uint)_heads, 1, 1,
             _zxdt, _dyn, l.Params!, l.SsmState!, _ssmY);
+        Sp("M mamba3_step");
         TraceBuf($"blk.{l.Index}.ssm_y", _ssmY, T, _heads * _P);
-        Gemv(l.MixerOut, _ssmY, _mix, T);
+        Gemv(l.MixerOut, _ssmY, _mix, T); Sp("M out_proj");
     }
 
     private void RecordAttention(Layer l, int T, int basePos)
@@ -578,16 +604,19 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
         Gemv(l.ShiftK!, _res, _sk, T); Gemv(l.ShiftV!, _res, _sv, T);
         Gemv(l.Lambda!, _res, _lam, T);
         Gemv(l.Gate!, _res, _gate, T);
+        Sp("V proj gemvs (9)");
         var kv = Kernel("tpakv", "olala_tpa_kv", 10, 7);
         uint[] pc0 = [(uint)T, (uint)basePos, (uint)_nk, (uint)_hd, (uint)_rank, 0u, F(_eps)];
         Run(kv, (1u << 8) | (1u << 9), pc0, (uint)_nk, (uint)T, 1, _ak, _av, _bk, _bv, _sk, _sv, l.KNorm!, l.LastKv!, l.KCache!, l.VCache!);
         uint[] pc1 = [(uint)T, (uint)basePos, (uint)_nk, (uint)_hd, (uint)_rank, 1u, F(_eps)];
         Run(kv, (1u << 7), pc1, (uint)_nk, 1, 1, _ak, _av, _bk, _bv, _sk, _sv, l.KNorm!, l.LastKv!, l.KCache!, l.VCache!);
+        Sp("V tpa_kv");
         var at = Kernel("tpaattn", "olala_tpa_attn", 8, 9);
         Run(at, 1u << 7, [(uint)T, (uint)basePos, (uint)_nk, (uint)_hd, (uint)_group, _window, F(_softcap), F(_o.GateBias), F(_eps)],
             (uint)_nk, (uint)T, 1, _q, l.KCache!, l.VCache!, _lam, _gate, l.QNorm!, l.Scaler!, _attnY);
+        Sp("V tpa_attn");
         TraceBuf($"blk.{l.Index}.attn_y", _attnY, T, _nk * _snr * _hd);
-        Gemv(l.MixerOut, _attnY, _mix, T);
+        Gemv(l.MixerOut, _attnY, _mix, T); Sp("V out_proj");
     }
 
     private void RecordMoe(Layer l, int T)
@@ -595,14 +624,17 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
         var route = Kernel("route", "olala_moe_route", 5, 4);
         Run(route, (1u << 3) | (1u << 4), [(uint)_hidden, (uint)_experts, (uint)_topk, F(_o.ExpertWeightsScale)], (uint)T, 1, 1,
             l.RouterW, _res, l.ExpertBias, _sel, _selW);
-        Gemv(l.LatentDown, _res, _x0, T);
+        Sp("moe route");
+        Gemv(l.LatentDown, _res, _x0, T); Sp("moe latent_down");
         var up = Kernel("moeup|" + Wt(l.UpExps.Qt), "olala_moe_up_" + Wt(l.UpExps.Qt), 4, 3);
         Run(up, 1u << 2, [(uint)_ff, (uint)_lat, (uint)_topk], (uint)_ff, (uint)(T * _topk), 1, l.UpExps.Buf, _x0, _h, _sel);
+        Sp("moe up_exps");
         var down = Kernel("moedown|" + Wt(l.DownExps.Qt), "olala_moe_down_" + Wt(l.DownExps.Qt), 5, 3);
         Run(down, 1u << 2, [(uint)_lat, (uint)_ff, (uint)_topk], (uint)_lat, (uint)T, 1, l.DownExps.Buf, _h, _routedLat, _sel, _selW);
-        Gemv(l.LatentUp, _routedLat, _routed, T);
-        Gemv(l.SharedUp, _res, _sh, T, epi: 1);
-        Gemv(l.SharedDown, _sh, _mix, T, epi: 2, aux: _routed);
+        Sp("moe down_exps");
+        Gemv(l.LatentUp, _routedLat, _routed, T); Sp("moe latent_up");
+        Gemv(l.SharedUp, _res, _sh, T, epi: 1); Sp("moe shared_up");
+        Gemv(l.SharedDown, _sh, _mix, T, epi: 2, aux: _routed); Sp("moe shared_down");
     }
 
     // ───────────────────────────── lifetime ─────────────────────────────
