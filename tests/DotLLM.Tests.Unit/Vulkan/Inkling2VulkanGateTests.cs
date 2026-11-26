@@ -90,6 +90,9 @@ public sealed class Inkling2VulkanGateTests
         _output.WriteLine($"KV now {vk.KvBytes / 1e6:F1} MB; per global position {vk.KvBytesPerPosition} B x {vk.GlobalSlots} global slots; local ring {vk.RingPositions} positions x {vk.LocalSlots} slots; conv {vk.ConvStateBytes / 1e6:F2} MB");
         Assert.True(s.Mean < 8e-3, $"mean KL {s.Mean:E3}");
         if (!kld.Contains("1280")) Assert.True(s.Top1 > 0.95, $"top-1 {s.Top1:P1}");
+        // Past the window the local rings wrap. Measured (#2036 review): F16 1.25x and q8_0 1.07x the below-1024 KL; an exact-1024 ring (a later token of a chunk
+        // overwriting a key an earlier one still reads) measures 2.75x and passes the mean-KL bound above, so the wrap is gated on its own.
+        if (kld.Contains("1280")) Assert.True(s.MeanHigh < 1.6 * s.MeanLow, $"KL past position 1024 {s.MeanHigh:E3} vs below {s.MeanLow:E3}: ring wrap?");
     }
 
     [SkippableTheory]
