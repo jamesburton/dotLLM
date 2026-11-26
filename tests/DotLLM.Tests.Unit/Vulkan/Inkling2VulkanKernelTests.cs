@@ -313,11 +313,26 @@ public sealed unsafe class Inkling2VulkanKernelTests : IDisposable
         Check("rel", wr, Down(br, wr.Length), 1e-5);
         var gotK = new byte[kb.Length]; var gotV = new byte[vb.Length];
         DownBytes(kc, gotK); DownBytes(vc, gotV);
-        // Compare the stored cache rows after decoding (a q8 scale / rounding or an F16 conversion error shows as a byte difference).
-        int bad = 0; for (int i = 0; i < kb.Length; i++) if (kb[i] != gotK[i]) bad++;
-        for (int i = 0; i < vb.Length; i++) if (vb[i] != gotV[i]) bad++;
-        _output.WriteLine($"cache bytes differing: {bad} of {kb.Length + vb.Length}");
-        Assert.True(bad <= (kb.Length + vb.Length) / 500, $"{bad} cache bytes differ");
+        // F16 rows: compare decoded halves (summation-order differences flip the last mantissa bit of ~8% of the values: a half ulp is 2^-10 relative).
+        // q8_0 rows: a rounding tie may move one int8 by 1; a wrong block scale, slot or sign differs in far more than 1% of the bytes.
+        int bad = 0, total = kb.Length + vb.Length;
+        if (kvq8 == 0)
+        {
+            foreach (var (want, got) in new[] { (kb, gotK), (vb, gotV) })
+                for (int i = 0; i < want.Length; i += 2)
+                {
+                    float a = (float)BitConverter.ToHalf(want, i), b = (float)BitConverter.ToHalf(got, i);
+                    if (Math.Abs(a - b) > 2e-3 * Math.Abs(a) + 1e-6) bad++;
+                }
+            total /= 2;
+        }
+        else
+        {
+            for (int i = 0; i < kb.Length; i++) if (kb[i] != gotK[i]) bad++;
+            for (int i = 0; i < vb.Length; i++) if (vb[i] != gotV[i]) bad++;
+        }
+        _output.WriteLine($"cache entries off: {bad} of {total}");
+        Assert.True(bad <= total / 100, $"{bad} of {total} cache entries differ");
     }
 
     private void DownBytes(VulkanDevice.Buffer b, byte[] dst)
@@ -391,5 +406,15 @@ public sealed unsafe class Inkling2VulkanKernelTests : IDisposable
         var y = Zero(want.Length * 4L);
         Dispatch(K($"inkling2_moe_down_{n}_f32act", 6, 3, scaled ? 1u : 0u), [(uint)H, (uint)ff, (uint)topk], (uint)H, (uint)T, 1, UpBytes(dn), Up(h), y, bsel, Up(selw), Up(dns));
         Check($"down {n}", want, Down(y, want.Length), 2e-4);
+    }
+
+    [SkippableFact]
+    public void Softcap_MatchesReference()
+    {
+        var x = Rand(1000, 90f);
+        var want = x.Select(v => (float)(30.0 * Math.Tanh(v / 30.0))).ToArray();
+        var b = Up(x);
+        Dispatch(K("inkling2_softcap", 1, 2), [1000u, F(30f)], 4, 1, 1, b);
+        Check("softcap", want, Down(b, 1000), 1e-5);
     }
 }
