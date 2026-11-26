@@ -1099,7 +1099,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 
 | Variable | What the source says | Defined in |
 |---|---|---|
-| `DOTLLM_EDGE0_DRAFT_VOCAB` | full vocabulary (#2013). Verify is unchanged, so the text cannot change; only the drafts do. OPT-IN (DOTLLM_EDGE0_DRAFT_VOCAB=1 at startup, or setting this): measured net slower, because the subset costs more acceptance than th... | `VulkanQwen4ExpTransformerModel.Mtp.cs` |
+| `DOTLLM_EDGE0_DRAFT_VOCAB` | Edge0 draft steps score only the pack's draft vocabulary (draft_vocab.bin, the LM head's Q8_0 rows read in place) instead of the full vocabulary (#2013). Verify is unchanged, so the text cannot change; only the drafts do. OPT-I... | `VulkanQwen4ExpTransformerModel.Mtp.cs` |
 | `DOTLLM_EDGE0_SKIP_GROUPS` | Single-row decode skips the D / U groups no selected expert uses (edge0_d_mmvq / edge0_u_mmvq): identical numerics, fewer bytes. DOTLLM_EDGE0_SKIP_GROUPS=0 (or setting this) visits every group (A/B). | `VulkanQwen3MoeHybridTransformerModel.Edge0.cs` |
 | `DOTLLM_EMBED_PACK` | True when documents can be packed into one embedding forward: the validated plain-causal decoder shape (Qwen3), the coopmat flash kernel serving the head dim, no window / soft-cap / sinks / distinct V dim, and row strides that... | `VulkanTransformerModel.cs` |
 | `DOTLLM_EMBED_PACK_TOKENS` | Token budget of one packed forward. Env DOTLLM_EMBED_PACK_TOKENS overrides (default 1024, as the decoder embedder). | `VulkanBertEncoderModel.cs` |
