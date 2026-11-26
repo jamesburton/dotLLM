@@ -44,9 +44,9 @@ public sealed class Inkling2RealModelTests
 
     private sealed record KlRef(int NCtx, int NVocab, int NChunk, int[] Tokens, string Path, long RowsOffset);
 
-    private static KlRef? LoadKlRef()
+    private static KlRef? LoadKlRef(string? file = null)
     {
-        string path = Path.Combine(OracleDir, Environment.GetEnvironmentVariable("DOTLLM_INKLING2_KLD") ?? "nvfp4-passage-c256-fa-off.kld");
+        string path = Path.Combine(OracleDir, file ?? Environment.GetEnvironmentVariable("DOTLLM_INKLING2_KLD") ?? "nvfp4-passage-c256-fa-off.kld");
         if (!File.Exists(path)) return null;
         using var f = File.OpenRead(path);
         using var br = new BinaryReader(f);
@@ -135,9 +135,10 @@ public sealed class Inkling2RealModelTests
         return (sum / n, max, (double)top / n, n);
     }
 
-    private static Inkling2TransformerModel Load(GgufFile file, Inkling2Options options, Inkling2Mutant mutant = Inkling2Mutant.None)
+    private static Inkling2TransformerModel Load(GgufFile file, Inkling2Options options, Inkling2Mutant mutant = Inkling2Mutant.None, int? logScaleFloor = null)
     {
         var cfg = GgufModelConfigExtractor.Extract(file.Metadata);
+        if (logScaleFloor is { } floor) cfg = cfg with { Inkling2 = cfg.Inkling2! with { LogScaleFloor = floor } };
         var m = Inkling2TransformerModel.LoadFromGguf(file, cfg, ThreadingConfig.Auto, options);
         m.Mutant = mutant;
         return m;
@@ -239,19 +240,37 @@ public sealed class Inkling2RealModelTests
     }
 
     /// <summary>
-    /// <c>NoLogScale</c> is deliberately NOT in the mutant theory: <c>1 + alpha*ln(max(1, (pos+1)/8192))</c> is exactly 1 below position 8191, so a
-    /// 256-token passage cannot observe it (measured: KL identical to the unmutated run, 3.959E-003). It is pinned at the op level instead
-    /// (<c>Inkling2OpsTests.LogScale_*</c>).
+    /// Log scaling end to end (<c>1 + alpha*ln(max(1, (pos+1)/floor))</c> on global layers' Q and relative-position bias). With the shipped floor (8192) the
+    /// factor is exactly 1 below position 8191, so a 256-token passage cannot see it; with the floor overridden to 1 it acts from position 1. The oracle is
+    /// llama.cpp CPU run with <c>--override-kv inkling2_loop.attention.log_scale_floor=int:1</c> (<c>nvfp4-passage-c256-fa-off-logscale-floor1.kld</c>).
+    /// Measured: correct 5.26e-3, <c>NoLogScale</c> 3.48e-2 (the unscaled model vs the scaled oracle).
     /// </summary>
     [SkippableTheory]
-    [InlineData("f16")]
+    [InlineData("None")]
+    [InlineData("NoLogScale")]
+    public void LogScale_Floor1_MatchesOverriddenLlamaCpp(string mutantName)
+    {
+        string? gguf = FindGguf(); var kl = LoadKlRef("nvfp4-passage-c256-fa-off-logscale-floor1.kld");
+        Skip.If(gguf is null, "Inkling-2-Mini-NVFP4.gguf not in the HF cache");
+        Skip.If(kl is null, "oracle file nvfp4-passage-c256-fa-off-logscale-floor1.kld missing");
+        using var file = GgufFile.Open(gguf!);
+        var mutant = Enum.Parse<Inkling2Mutant>(mutantName);
+        using var model = Load(file, new Inkling2Options(), mutant, logScaleFloor: 1);
+        var (mean, max, top1, n) = ScoreKl(model, kl!);
+        _output.WriteLine($"LOGSCALE floor=1 mutant {mutant}: KL mean {mean:E3} max {max:E3} top-1 {top1:P1} over {n}");
+        if (mutant == Inkling2Mutant.None) Assert.True(mean < 8e-3, $"log-scaled model vs the floor-1 oracle: mean KL {mean:E3} too high");
+        else Assert.True(mean >= 1.5e-2, $"mutant {mutant} survived the floor-1 gate: KL {mean:E3}");
+    }
+
+    [SkippableTheory]
+    [InlineData("f32")]
     [InlineData("bf16")]
     public void ConvStateStorage_Sweep(string storage)
     {
         string? gguf = FindGguf(); var kl = LoadKlRef();
         Skip.If(gguf is null, "Inkling-2-Mini-NVFP4.gguf not in the HF cache");
         Skip.If(kl is null, "oracle KL file missing");
-        var cs = storage == "f16" ? Inkling2ConvStateStorage.F16 : Inkling2ConvStateStorage.BF16;
+        var cs = storage == "f32" ? Inkling2ConvStateStorage.F32 : Inkling2ConvStateStorage.BF16;
         using var file = GgufFile.Open(gguf!);
         using var model = Load(file, new Inkling2Options(ConvState: cs));
         var (mean, max, top1, n) = ScoreKl(model, kl!);
@@ -288,6 +307,7 @@ public sealed class Inkling2RealModelTests
     }
 
     [SkippableTheory]
+    [InlineData("f32")]
     [InlineData("q8_0")]
     [InlineData("f16")]
     [InlineData("bf16")]
@@ -296,7 +316,7 @@ public sealed class Inkling2RealModelTests
         string? gguf = FindGguf(); var kl = LoadKlRef();
         Skip.If(gguf is null, "Inkling-2-Mini-NVFP4.gguf not in the HF cache");
         Skip.If(kl is null, "oracle file nvfp4-passage-c256.kld missing");
-        var qt = storage switch { "q8_0" => QuantizationType.Q8_0, "f16" => QuantizationType.F16, _ => QuantizationType.BF16 };
+        var qt = storage switch { "f32" => QuantizationType.F32, "q8_0" => QuantizationType.Q8_0, "f16" => QuantizationType.F16, _ => QuantizationType.BF16 };
         using var file = GgufFile.Open(gguf!);
         using var model = Load(file, new Inkling2Options(LoopController: qt));
         var (mean, max, top1, n) = ScoreKl(model, kl!);

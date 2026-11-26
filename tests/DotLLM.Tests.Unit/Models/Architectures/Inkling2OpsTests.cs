@@ -175,7 +175,7 @@ public sealed class Inkling2OpsTests
         int[] cuts = [3, 1, 3]; int at = 0;
         foreach (int n in cuts)
         {
-            st.Run(n, x.AsSpan(at * C, n * C), w, d is null ? default : d.AsSpan(at * heads * K, n * heads * K), heads, got.AsSpan(at * C, n * C));
+            st.Run(n, x.AsSpan(at * C, n * C), w, d is null ? default : d.AsSpan(at * heads * K, n * heads * K), heads, got.AsSpan(at * C, n * C), new float[st.ScratchFloats(n)]);
             at += n;
         }
         for (int i = 0; i < want.Length; i++) Assert.Equal(want[i], got[i], 1e-5);
@@ -190,7 +190,7 @@ public sealed class Inkling2OpsTests
         using (var st = new Inkling2ConvState(1, K, Inkling2ConvStateStorage.F32))
         {
             var o = new float[5];
-            st.Run(5, x, new float[] { 1f, 0f, 0f, 0f }, default, 1, o);
+            st.Run(5, x, new float[] { 1f, 0f, 0f, 0f }, default, 1, o, new float[st.ScratchFloats(5)]);
             double s = 1 / Math.Sqrt(K + 1);
             Assert.Equal(1 * s, o[0], 1e-6);                       // residual term only
             Assert.Equal(0, o[1], 1e-6); Assert.Equal(0, o[2], 1e-6);
@@ -199,7 +199,7 @@ public sealed class Inkling2OpsTests
         using (var st = new Inkling2ConvState(1, K, Inkling2ConvStateStorage.F32))
         {
             var o = new float[5];
-            st.Run(5, x, new float[4], new float[] { 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f }, 1, o);
+            st.Run(5, x, new float[4], new float[] { 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f }, 1, o, new float[st.ScratchFloats(5)]);
             // dynamic taps only on lag 3 (index 3 of every token's tap vector): the impulse reappears 3 tokens later; lag 0 would hit at t=0
             double s = 1.0 / 3.0;
             Assert.Equal(1 * s, o[0], 1e-6);
@@ -209,7 +209,6 @@ public sealed class Inkling2OpsTests
     }
 
     [Theory]
-    [InlineData(Inkling2ConvStateStorage.F16, 2e-3)]
     [InlineData(Inkling2ConvStateStorage.BF16, 1.6e-2)]
     public void ShortConv_NarrowState_StaysWithinStorageRounding(Inkling2ConvStateStorage storage, double tol)
     {
@@ -218,8 +217,8 @@ public sealed class Inkling2OpsTests
         var want = NaiveConv(x, T, C, w, K, null, 1);
         using var st = new Inkling2ConvState(C, K, storage);
         var got = new float[T * C];
-        st.Run(3, x.AsSpan(0, 3 * C), w, default, 1, got.AsSpan(0, 3 * C));
-        st.Run(3, x.AsSpan(3 * C, 3 * C), w, default, 1, got.AsSpan(3 * C, 3 * C));
+        st.Run(3, x.AsSpan(0, 3 * C), w, default, 1, got.AsSpan(0, 3 * C), new float[st.ScratchFloats(3)]);
+        st.Run(3, x.AsSpan(3 * C, 3 * C), w, default, 1, got.AsSpan(3 * C, 3 * C), new float[st.ScratchFloats(3)]);
         double worst = 0;
         for (int i = 0; i < want.Length; i++) worst = Math.Max(worst, Math.Abs(want[i] - got[i]));
         Assert.True(worst < tol, $"worst abs error {worst}");

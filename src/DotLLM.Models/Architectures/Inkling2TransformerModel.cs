@@ -1,4 +1,4 @@
-using System.Buffers;
+using System.Runtime.CompilerServices;
 using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
@@ -12,20 +12,20 @@ using DotLLM.Models.Gguf;
 namespace DotLLM.Models.Architectures;
 
 /// <summary>
-/// Load-time storage choices of <see cref="Inkling2TransformerModel"/> that the user rules on (issue #2026, epic #2025). The defaults are the
-/// GGUF's own storage so a plain load reproduces the file; the narrower variants exist to be measured (KL / greedy identity) first.
+/// Load-time storage choices of <see cref="Inkling2TransformerModel"/> that the user rules on (issue #2026, epic #2025). User rulings 2026-11-26: the loop controller and the conv state default to
+/// BF16 (converted once at load from the GGUF's F32); F32 stays as an A/B override only, and F16 conv state is ruled out.
 /// </summary>
 /// <param name="LoopController">
-/// Storage of the loop-controller weights (<c>loop_msg_query</c>, <c>loop_*_ctrl_down/gain/forget</c>; F32 in the GGUF, ~113 MB). F32 reads them in
-/// place; <see cref="QuantizationType.Q8_0"/>, <see cref="QuantizationType.F16"/> and <see cref="QuantizationType.BF16"/> make a smaller copy at load.
+/// Storage of the loop-controller weights (<c>loop_msg_query</c>, <c>loop_*_ctrl_down/gain/forget</c>; F32 in the GGUF, ~113 MB). Default <see cref="QuantizationType.BF16"/> is a load-time copy (56.8 MB); F32 reads them in
+/// place (A/B override); <see cref="QuantizationType.Q8_0"/>, <see cref="QuantizationType.F16"/> and <see cref="QuantizationType.BF16"/> make a smaller copy at load.
 /// </param>
 /// <param name="ConvState">Storage of the carried short-convolution inputs.</param>
 public sealed record Inkling2Options(
-    QuantizationType LoopController = QuantizationType.F32,
-    Inkling2ConvStateStorage ConvState = Inkling2ConvStateStorage.F32)
+    QuantizationType LoopController = QuantizationType.BF16,
+    Inkling2ConvStateStorage ConvState = Inkling2ConvStateStorage.BF16)
 {
     /// <summary>
-    /// Options from <c>DOTLLM_INKLING2_LOOP_CONTROLLER</c> (<c>f32|q8_0|f16|bf16</c>) and <c>DOTLLM_INKLING2_CONV_STATE</c> (<c>f32|f16|bf16</c>);
+    /// Options from <c>DOTLLM_INKLING2_LOOP_CONTROLLER</c> (<c>f32|q8_0|f16|bf16</c>) and <c>DOTLLM_INKLING2_CONV_STATE</c> (<c>f32|bf16</c>; F16 is ruled out);
     /// unset variables keep the defaults. Used by the measurement harness; a bad value throws rather than silently running the default.
     /// </summary>
     public static Inkling2Options FromEnvironment()
@@ -51,9 +51,8 @@ public sealed record Inkling2Options(
                 ConvState = cs.ToLowerInvariant() switch
                 {
                     "f32" => Inkling2ConvStateStorage.F32,
-                    "f16" => Inkling2ConvStateStorage.F16,
                     "bf16" => Inkling2ConvStateStorage.BF16,
-                    _ => throw new ArgumentException($"DOTLLM_INKLING2_CONV_STATE='{cs}': expected f32, f16 or bf16."),
+                    _ => throw new ArgumentException($"DOTLLM_INKLING2_CONV_STATE='{cs}': expected f32 or bf16."),
                 },
             };
         return o;
@@ -125,6 +124,7 @@ public sealed unsafe class Inkling2TransformerModel : IModel
     private readonly ComputeThreadPool? _pool;
     private readonly bool _ownsPool;
     private readonly List<nint> _owned = new();
+    private readonly Stack<Inkling2Scratch> _scratchPool = new();
     private readonly Inkling2SequenceState _defaultState;
     private long _narrowedBytes, _f32ControllerBytes;
 
@@ -362,17 +362,35 @@ public sealed unsafe class Inkling2TransformerModel : IModel
                 throw new ArgumentException($"inkling2 keeps its own sequence state: positions[{i}] = {positions[i]} but the state is at {state.Length + i}.");
         if (state.Length + T > Config.MaxSequenceLength)
             throw new ArgumentOutOfRangeException(nameof(positions), $"Sequence would exceed the context length {Config.MaxSequenceLength}.");
-        return ForwardBody(tokenIds, deviceId, state, lastTokenLogitsOnly);
+
+        Inkling2Scratch sc = RentScratch();
+        try { return ForwardBody(tokenIds, deviceId, state, lastTokenLogitsOnly, sc); }
+        finally { ReturnScratch(sc); }
     }
 
-    private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Inkling2SequenceState st, bool lastOnly)
+    private Inkling2Scratch RentScratch()
+    {
+        Inkling2Scratch? sc = null;
+        lock (_scratchPool) { if (_scratchPool.Count > 0) sc = _scratchPool.Pop(); }
+        sc ??= new Inkling2Scratch();
+        sc.Begin();
+        return sc;
+    }
+
+    private void ReturnScratch(Inkling2Scratch sc)
+    {
+        sc.End();
+        lock (_scratchPool) _scratchPool.Push(sc);
+    }
+
+    private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Inkling2SequenceState st, bool lastOnly, Inkling2Scratch sc)
     {
         int T = tokenIds.Length, H = _hidden;
         int pos0 = st.Length;
         _pool?.SetDispatchMode(T == 1 ? DispatchMode.SpinWait : DispatchMode.EventBased);
 
         // Token embeddings: Q8_0 rows dequantised one at a time into the activation buffer, then the gain-ed RMS norm (llama.cpp: tok_norm).
-        float[] cur = new float[T * H];
+        Span<float> cur = sc.Call.Alloc<float>(T * H);
         var embType = _gguf!.TensorsByName[Inkling2Tensors.TokenEmbd].QuantizationType;
         long rowBytes = Dequantize.RowByteSize(H, embType);
         for (int t = 0; t < T; t++)
@@ -380,55 +398,68 @@ public sealed unsafe class Inkling2TransformerModel : IModel
             int id = tokenIds[t];
             if ((uint)id >= (uint)_vocab)
                 throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token ID {id} at position {t} is out of range [0, {_vocab}).");
-            var row = cur.AsSpan(t * H, H);
+            var row = cur.Slice(t * H, H);
             Dequantize.ToFloat32(_tokenEmbed + (nint)(id * rowBytes), H, embType, row);
             Inkling2Ops.RmsNorm(row, _tokEmbNorm.Span, _eps, row);
         }
         Trace?.Invoke("embed", cur, T, H);
 
-        var blocks = new List<float[]>();   // RMS-normalised (gamma-free) block inputs, immutable once pushed (llama.cpp mix_stack cache)
+        var blocks = sc.Blocks;   // RMS-normalised (gamma-free) block inputs, immutable once pushed (llama.cpp mix_stack cache)
         int start = _c.LoopStart, end = _c.LoopEnd;
         int coreStart = _c.LoopPasses > 1 ? start : _nPhys;
 
-        for (int il = 0; il < coreStart; il++) cur = ForwardLayer(il, il, cur, blocks, null, null, T, pos0, st);
+        for (int il = 0; il < coreStart; il++) cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st);
 
         if (_c.LoopPasses > 1)
         {
-            float[] prelude = cur;
-            var preludeBlocks = new List<float[]>(blocks);
+            Span<float> prelude = sc.Call.Alloc<float>(T * H);   // every pass restarts from the prelude output and the prelude blocks
+            cur.CopyTo(prelude);
+            cur = prelude;
+            int preludeBlocks = blocks.Count;
             int core = end - start;
+            Span<float> bankOut = default;
             for (int pass = 0; pass < (Mutant == Inkling2Mutant.TwoPasses ? 2 : _c.LoopPasses); pass++)
             {
-                List<float[]>? bank = null; float[]? bankOut = null;
                 if (pass > 0)
                 {
                     // The bank of the previous pass: its blocks after the first core block, and its output (llama.cpp inkling2-loop.cpp).
-                    bank = blocks.GetRange(preludeBlocks.Count + 1, blocks.Count - preludeBlocks.Count - 1);
-                    bankOut = cur;
+                    var bank = sc.Bank;
+                    bank.Clear();
+                    for (int i = preludeBlocks + 1; i < blocks.Count; i++) bank.Add(blocks[i]);
+                    blocks.RemoveRange(preludeBlocks, blocks.Count - preludeBlocks);
+                    bankOut = sc.Call.Alloc<float>(T * H);
+                    cur.CopyTo(bankOut);
                     cur = prelude;
-                    blocks = new List<float[]>(preludeBlocks);
                 }
                 for (int ip = start; ip < end; ip++)
                 {
                     int slot = pass == 0 ? ip : _nPhys + (pass - 1) * core + (ip - start);
-                    float[]? messages = null;
+                    Span<float> messages = default;
                     LoopWeights? loop = null;
                     if (pass > 0)
                     {
                         loop = _layers[ip].Loop!;
-                        if (Mutant != Inkling2Mutant.NoControl) messages = DepthMix(bank!, bankOut!, MatRows(loop.MsgQuery), 4, T);
+                        sc.Msg.Reset();
+                        if (Mutant != Inkling2Mutant.NoControl)
+                        {
+                            // loop_msg_query is stored narrow (BF16 by default); the four query rows are widened into native scratch per visit.
+                            var q = sc.Msg.Alloc<float>(loop.MsgQuery.In * loop.MsgQuery.Out);
+                            Dequantize.ToFloat32(loop.MsgQuery.Ptr, q.Length, loop.MsgQuery.Qt, q);
+                            messages = DepthMix(sc, sc.Bank, bankOut, q, 4, T, sc.Msg);
+                        }
                     }
-                    cur = ForwardLayer(slot, ip, cur, blocks, messages, loop, T, pos0, st);
+                    cur = ForwardLayer(slot, ip, cur, sc, messages, loop, T, pos0, st);
                     Trace?.Invoke($"pass{pass}.l{ip}", cur, T, H);
                 }
             }
-            for (int il = end; il < _nPhys; il++) cur = ForwardLayer(il, il, cur, blocks, null, null, T, pos0, st);
+            for (int il = end; il < _nPhys; il++) cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st);
         }
 
         // Output: depth mix with output_res_query, gain-ed RMS norm, LM head (unpadded rows only), final logit softcap.
-        float[] mixed = DepthMix(blocks, cur, _outputResQuery.Span.ToArray(), 1, T);
+        sc.Msg.Reset();
+        Span<float> mixed = DepthMix(sc, blocks, cur, _outputResQuery.Span, 1, T, sc.Msg);
         for (int t = 0; t < T; t++)
-            Inkling2Ops.RmsNorm(mixed.AsSpan(t * H, H), _outputNorm.Span, _eps, mixed.AsSpan(t * H, H));
+            Inkling2Ops.RmsNorm(mixed.Slice(t * H, H), _outputNorm.Span, _eps, mixed.Slice(t * H, H));
         Trace?.Invoke("result_norm", mixed, T, H);
 
         int rows = lastOnly ? 1 : T;
@@ -445,42 +476,29 @@ public sealed unsafe class Inkling2TransformerModel : IModel
         return result;
     }
 
-    /// <summary>The rows of a (possibly narrowed) matrix as F32, for the small tensors that are used as dot-product queries.</summary>
-    private float[] MatRows(MatRef m)
-    {
-        long count = (long)m.In * m.Out;
-        var r = new float[count];
-        Dequantize.ToFloat32(m.Ptr, count, m.Qt, r);
-        return r;
-    }
-
     /// <summary>
     /// Depth mixing for T tokens (see <see cref="Inkling2Ops.DepthMixToken"/>): <paramref name="blocks"/> are already RMS-normalised, the
-    /// current state is normalised here. Returns <c>[T][nq][H]</c>.
+    /// current state is normalised here. Returns <c>[T][nq][H]</c> allocated from <paramref name="dst"/>.
     /// </summary>
-    private float[] DepthMix(List<float[]> blocks, float[] cur, float[] queries, int nq, int T)
+    private Span<float> DepthMix(Inkling2Scratch sc, List<nint> blocks, ReadOnlySpan<float> cur, ReadOnlySpan<float> queries, int nq, int T, Inkling2Arena dst)
     {
         int H = _hidden, count = blocks.Count + 1;
-        var output = new float[T * nq * H];
-        float[] states = ArrayPool<float>.Shared.Rent(count * H);
-        try
+        var output = dst.Alloc<float>(T * nq * H);
+        var states = sc.Layer.Alloc<float>(count * H);
+        for (int t = 0; t < T; t++)
         {
-            for (int t = 0; t < T; t++)
-            {
-                for (int b = 0; b < blocks.Count; b++) blocks[b].AsSpan(t * H, H).CopyTo(states.AsSpan(b * H, H));
-                Inkling2Ops.RmsNorm(cur.AsSpan(t * H, H), default, Inkling2Ops.MixEps, states.AsSpan(blocks.Count * H, H));
-                Inkling2Ops.DepthMixToken(states, count, queries, nq, H, output.AsSpan(t * nq * H, nq * H));
-            }
+            for (int b = 0; b < blocks.Count; b++) new ReadOnlySpan<float>((void*)blocks[b], T * H).Slice(t * H, H).CopyTo(states.Slice(b * H, H));
+            Inkling2Ops.RmsNorm(cur.Slice(t * H, H), default, Inkling2Ops.MixEps, states.Slice(blocks.Count * H, H));
+            Inkling2Ops.DepthMixToken(states, count, queries, nq, H, output.Slice(t * nq * H, nq * H));
         }
-        finally { ArrayPool<float>.Shared.Return(states); }
         return output;
     }
 
-    private float[] NormedCopy(float[] x, int T)
+    private Span<float> NormedCopy(ReadOnlySpan<float> x, int T, Inkling2Arena dst)
     {
         int H = _hidden;
-        var r = new float[T * H];
-        for (int t = 0; t < T; t++) Inkling2Ops.RmsNorm(x.AsSpan(t * H, H), default, Inkling2Ops.MixEps, r.AsSpan(t * H, H));
+        var r = dst.Alloc<float>(T * H);
+        for (int t = 0; t < T; t++) Inkling2Ops.RmsNorm(x.Slice(t * H, H), default, Inkling2Ops.MixEps, r.Slice(t * H, H));
         return r;
     }
 
@@ -489,165 +507,185 @@ public sealed unsafe class Inkling2TransformerModel : IModel
     /// <c>[rms(cur); rms(message)]</c>; <c>out = (cur - tanh(forget) * cur) + tanh(gain) * message</c>. <paramref name="msgs"/> is
     /// <c>[T][4][H]</c> and <paramref name="ctrl"/> selects the controller (Q, K, V, FFN).
     /// </summary>
-    private float[] Control(float[] cur, float[] msgs, LoopWeights loop, int ctrl, int T)
+    private Span<float> Control(Inkling2Scratch sc, ReadOnlySpan<float> cur, ReadOnlySpan<float> msgs, LoopWeights loop, int ctrl, int T)
     {
         int H = _hidden, rank = _c.LoopGateRank;
-        var gateIn = new float[T * 2 * H];
-        var msg = new float[T * H];
+        var a = sc.Layer;
+        var gateIn = a.Alloc<float>(T * 2 * H);
+        var msg = a.Alloc<float>(T * H);
         for (int t = 0; t < T; t++)
         {
-            msgs.AsSpan((t * 4 + ctrl) * H, H).CopyTo(msg.AsSpan(t * H, H));
-            Inkling2Ops.RmsNorm(cur.AsSpan(t * H, H), default, Inkling2Ops.MixEps, gateIn.AsSpan(t * 2 * H, H));
-            Inkling2Ops.RmsNorm(msg.AsSpan(t * H, H), default, Inkling2Ops.MixEps, gateIn.AsSpan(t * 2 * H + H, H));
+            msgs.Slice((t * 4 + ctrl) * H, H).CopyTo(msg.Slice(t * H, H));
+            Inkling2Ops.RmsNorm(cur.Slice(t * H, H), default, Inkling2Ops.MixEps, gateIn.Slice(t * 2 * H, H));
+            Inkling2Ops.RmsNorm(msg.Slice(t * H, H), default, Inkling2Ops.MixEps, gateIn.Slice(t * 2 * H + H, H));
         }
-        var gate = new float[T * rank];
+        var gate = a.Alloc<float>(T * rank);
         GemmSpan(loop.Down[ctrl], gateIn, gate, T);
-        var gainPre = new float[T * H];
-        var forgetPre = new float[T * H];
+        var gainPre = a.Alloc<float>(T * H);
+        var forgetPre = a.Alloc<float>(T * H);
         GemmSpan(loop.Gain[ctrl], gate, gainPre, T);
         GemmSpan(loop.Forget[ctrl], gate, forgetPre, T);
-        var o = new float[T * H];
+        var o = a.Alloc<float>(T * H);
         for (int t = 0; t < T; t++)
-            Inkling2Ops.ControlCombine(cur.AsSpan(t * H, H), msg.AsSpan(t * H, H), gainPre.AsSpan(t * H, H), forgetPre.AsSpan(t * H, H), o.AsSpan(t * H, H));
+            Inkling2Ops.ControlCombine(cur.Slice(t * H, H), msg.Slice(t * H, H), gainPre.Slice(t * H, H), forgetPre.Slice(t * H, H), o.Slice(t * H, H));
         return o;
     }
 
-    private float[] RmsNormRows(float[] x, F32Ref gamma, int T)
+    private Span<float> RmsNormRows(Inkling2Scratch sc, ReadOnlySpan<float> x, F32Ref gamma, int T)
     {
         int H = _hidden;
-        var r = new float[T * H];
-        for (int t = 0; t < T; t++) Inkling2Ops.RmsNorm(x.AsSpan(t * H, H), gamma.Span, _eps, r.AsSpan(t * H, H));
+        var r = sc.Layer.Alloc<float>(T * H);
+        for (int t = 0; t < T; t++) Inkling2Ops.RmsNorm(x.Slice(t * H, H), gamma.Span, _eps, r.Slice(t * H, H));
         return r;
     }
 
-    /// <summary>One transformer layer visit (llama.cpp <c>graph::build_layer</c>). Returns the layer output; appends to <paramref name="blocks"/> when this layer starts a new block.</summary>
-    private float[] ForwardLayer(int slot, int ip, float[] cur, List<float[]> blocks, float[]? messages, LoopWeights? loop, int T, int pos0, Inkling2SequenceState st)
+    /// <summary>One transformer layer visit (llama.cpp <c>graph::build_layer</c>). Returns the layer output (valid until two visits later); appends to the scratch block list when this layer starts a new block.</summary>
+    private Span<float> ForwardLayer(int slot, int ip, ReadOnlySpan<float> cur, Inkling2Scratch sc, ReadOnlySpan<float> messages, LoopWeights? loop, int T, int pos0, Inkling2SequenceState st)
     {
         var lw = _layers[ip];
         int H = _hidden, hd = _headDim, nh = _heads, nkv = _kvHeads, kvW = _kvW, qW = _qW;
-        float[] inpSA = cur;
         var ss = st.Slots[slot];
         ss.EnsureCapacity(pos0 + T);
+        var blocks = sc.Blocks;
+        var A = sc.Layer;
+        A.Reset();
+        var outArena = sc.Out[sc.Visit++ & 1];
+        outArena.Reset();
+        ReadOnlySpan<float> inpSA = cur;
 
         // Attention inputs: layer 0 reads the embedding; later layers mix the earlier blocks with cur using learned queries
         // (one for local layers, three — Q, K, V — for global ones).
-        float[][] inputs = [cur, cur, cur];
+        ReadOnlySpan<float> in0 = cur, in1 = cur, in2 = cur;
         if (ip > 0)
         {
             int nq = lw.Local ? 1 : 3;
-            float[] mixed = DepthMix(blocks, cur, lw.AttnResQuery.Span.ToArray(), nq, T);
-            for (int j = 0; j < 3; j++)
-            {
-                int q = lw.Local ? 0 : j;
-                var x = new float[T * H];
-                for (int t = 0; t < T; t++) mixed.AsSpan((t * nq + q) * H, H).CopyTo(x.AsSpan(t * H, H));
-                inputs[j] = x;
-            }
+            var mixed = DepthMix(sc, blocks, cur, lw.AttnResQuery.Span, nq, T, A);
+            in0 = PickQuery(A, mixed, lw.Local ? 0 : 0, nq, T);
+            in1 = PickQuery(A, mixed, lw.Local ? 0 : 1, nq, T);
+            in2 = PickQuery(A, mixed, lw.Local ? 0 : 2, nq, T);
         }
-        if (messages is not null)
-            for (int j = 0; j < 3; j++) inputs[j] = Control(inputs[j], messages, loop!, j, T);
+        if (!messages.IsEmpty)
+        {
+            in0 = Control(sc, in0, messages, loop!, 0, T);
+            in1 = Control(sc, in1, messages, loop!, 1, T);
+            in2 = Control(sc, in2, messages, loop!, 2, T);
+        }
 
-        if (lw.Local && messages is not null)
-            for (int j = 0; j < 3; j++) inputs[j] = RmsNormRows(inputs[j], lw.AttnNorm, T);
+        if (lw.Local && !messages.IsEmpty)
+        {
+            in0 = RmsNormRows(sc, in0, lw.AttnNorm, T);
+            in1 = RmsNormRows(sc, in1, lw.AttnNorm, T);
+            in2 = RmsNormRows(sc, in2, lw.AttnNorm, T);
+        }
         else if (lw.Local)
         {
-            var n = RmsNormRows(inputs[0], lw.AttnNorm, T);
-            inputs[0] = inputs[1] = inputs[2] = n;
+            in0 = in1 = in2 = RmsNormRows(sc, in0, lw.AttnNorm, T);
         }
         else
         {
-            inputs[0] = RmsNormRows(inputs[0], lw.QInpNorm, T);
-            inputs[1] = RmsNormRows(inputs[1], lw.KInpNorm, T);
-            inputs[2] = RmsNormRows(inputs[2], lw.VInpNorm, T);
+            in0 = RmsNormRows(sc, in0, lw.QInpNorm, T);
+            in1 = RmsNormRows(sc, in1, lw.KInpNorm, T);
+            in2 = RmsNormRows(sc, in2, lw.VInpNorm, T);
         }
 
         // ── self-attention ──
-        var q4 = new float[T * qW];
-        var kRaw = new float[T * kvW];
-        var vRaw = new float[T * kvW];
+        var q4 = A.Alloc<float>(T * qW);
+        var kRaw = A.Alloc<float>(T * kvW);
+        var vRaw = A.Alloc<float>(T * kvW);
         int relLen = _c.RelativeLength;
-        var rel = new float[T * relLen * nh];
-        var sink = new float[T * nh];
-        var gate = new float[T * qW];
-        GemmSpan(lw.Wq, inputs[0], q4, T);
-        GemmSpan(lw.Wk, inputs[1], kRaw, T);
-        GemmSpan(lw.Wv, inputs[2], vRaw, T);
-        GemmSpan(lw.Rel, inputs[0], rel, T);
-        GemmSpan(lw.Sink, inputs[0], sink, T);
-        GemmSpan(lw.Gate, inputs[0], gate, T);
-        if (Mutant == Inkling2Mutant.NoSink) Array.Clear(sink);
+        var rel = A.Alloc<float>(T * relLen * nh);
+        var sink = A.Alloc<float>(T * nh);
+        var gate = A.Alloc<float>(T * qW);
+        GemmSpan(lw.Wq, in0, q4, T);
+        GemmSpan(lw.Wk, in1, kRaw, T);
+        GemmSpan(lw.Wv, in2, vRaw, T);
+        GemmSpan(lw.Rel, in0, rel, T);
+        GemmSpan(lw.Sink, in0, sink, T);
+        GemmSpan(lw.Gate, in0, gate, T);
+        if (Mutant == Inkling2Mutant.NoSink) sink.Clear();
 
-        float[] kDyn = [], vDyn = [];
+        Span<float> kDyn = default, vDyn = default;
         if (!lw.Local)
         {
-            kDyn = new float[T * _c.ConvKernel * nkv];
-            vDyn = new float[T * _c.ConvKernel * nkv];
-            GemmSpan(lw.KConvProj, inputs[1], kDyn, T);
-            GemmSpan(lw.VConvProj, inputs[2], vDyn, T);
+            kDyn = A.Alloc<float>(T * _c.ConvKernel * nkv);
+            vDyn = A.Alloc<float>(T * _c.ConvKernel * nkv);
+            GemmSpan(lw.KConvProj, in1, kDyn, T);
+            GemmSpan(lw.VConvProj, in2, vDyn, T);
         }
-        ss.KConv.Run(T, kRaw, lw.KConv.Span, kDyn, nkv, kRaw);
-        ss.VConv.Run(T, vRaw, lw.VConv.Span, vDyn, nkv, vRaw);
+        var convScratch = A.Alloc<float>(Math.Max(ss.KConv.ScratchFloats(T), ss.AttnPostConv.ScratchFloats(T)));
+        ss.KConv.Run(T, kRaw, lw.KConv.Span, kDyn, nkv, kRaw, convScratch);
+        ss.VConv.Run(T, vRaw, lw.VConv.Span, vDyn, nkv, vRaw, convScratch);
 
         var qClip = lw.QClip.Span; var relClip = lw.RelClip.Span;
         for (int t = 0; t < T; t++)
         {
             for (int h = 0; h < nh; h++)
             {
-                Inkling2Ops.ClipL2(q4.AsSpan(t * qW + h * hd, hd), qClip.Slice(h * hd, hd), _c.QkClip);
-                Inkling2Ops.ClipL2(rel.AsSpan((t * nh + h) * relLen, relLen), relClip.Slice(h * relLen, relLen), _c.RelativeClip);
+                Inkling2Ops.ClipL2(q4.Slice(t * qW + h * hd, hd), qClip.Slice(h * hd, hd), _c.QkClip);
+                Inkling2Ops.ClipL2(rel.Slice((t * nh + h) * relLen, relLen), relClip.Slice(h * relLen, relLen), _c.RelativeClip);
             }
             for (int g = 0; g < nkv; g++)
             {
-                Inkling2Ops.ClipL2(kRaw.AsSpan(t * kvW + g * hd, hd), default, _c.QkClip);
-                Inkling2Ops.RmsNorm(vRaw.AsSpan(t * kvW + g * hd, hd), default, _eps, vRaw.AsSpan(t * kvW + g * hd, hd));
+                Inkling2Ops.ClipL2(kRaw.Slice(t * kvW + g * hd, hd), default, _c.QkClip);
+                Inkling2Ops.RmsNorm(vRaw.Slice(t * kvW + g * hd, hd), default, _eps, vRaw.Slice(t * kvW + g * hd, hd));
             }
-            if (Mutant == Inkling2Mutant.NoRelativeBias) rel.AsSpan(t * nh * relLen, nh * relLen).Clear();
+            if (Mutant == Inkling2Mutant.NoRelativeBias) rel.Slice(t * nh * relLen, nh * relLen).Clear();
             if (!lw.Local && Mutant != Inkling2Mutant.NoLogScale)
             {
                 float tau = Inkling2Ops.LogScale(pos0 + t, _c.LogScaleFloor, _c.LogScaleAlpha);
-                TensorPrimitives.Multiply(q4.AsSpan(t * qW, qW), tau, q4.AsSpan(t * qW, qW));
-                TensorPrimitives.Multiply(rel.AsSpan(t * nh * relLen, nh * relLen), tau, rel.AsSpan(t * nh * relLen, nh * relLen));
+                TensorPrimitives.Multiply(q4.Slice(t * qW, qW), tau, q4.Slice(t * qW, qW));
+                TensorPrimitives.Multiply(rel.Slice(t * nh * relLen, nh * relLen), tau, rel.Slice(t * nh * relLen, nh * relLen));
             }
-            ss.Store(pos0 + t, kRaw.AsSpan(t * kvW, kvW), vRaw.AsSpan(t * kvW, kvW));
+            ss.Store(pos0 + t, kRaw.Slice(t * kvW, kvW), vRaw.Slice(t * kvW, kvW));
         }
         Trace?.Invoke($"slot{slot}.Q", q4, T, qW);
         Trace?.Invoke($"slot{slot}.K", kRaw, T, kvW);
         Trace?.Invoke($"slot{slot}.V", vRaw, T, kvW);
 
-        var attn = new float[T * qW];
-        Attend(lw, ss, q4, rel, sink, attn, T, pos0);
+        var attn = A.Alloc<float>(T * qW);
+        Attend(lw, ss, A, q4, rel, sink, attn, T, pos0);
         for (int i = 0; i < attn.Length; i++) attn[i] *= Inkling2Ops.Sigmoid(gate[i]);
 
-        var attnOut = new float[T * H];
+        var attnOut = A.Alloc<float>(T * H);
         GemmSpan(lw.Wo, attn, attnOut, T);
-        ss.AttnPostConv.Run(T, attnOut, lw.PostConv.Span, default, 0, attnOut);
+        ss.AttnPostConv.Run(T, attnOut, lw.PostConv.Span, default, 0, attnOut, convScratch);
         Trace?.Invoke($"slot{slot}.attn_out", attnOut, T, H);
 
         // The first layer of each block starts a new residual stream (its input joins the mixed blocks); the others add the residual.
-        float[] ffnInp;
+        Span<float> ffnInp;
         if (ip % _c.AttnResBlockSize == 0)
         {
-            blocks.Add(NormedCopy(inpSA, T));
+            var nb = NormedCopy(inpSA, T, sc.Call);
+            blocks.Add((nint)Unsafe.AsPointer(ref MemoryMarshal.GetReference(nb)));
             ffnInp = attnOut;
         }
         else
         {
-            ffnInp = new float[T * H];
+            ffnInp = A.Alloc<float>(T * H);
             TensorPrimitives.Add(inpSA, attnOut, ffnInp);
         }
 
         // ── MoE ──
-        float[] m = DepthMix(blocks, ffnInp, lw.FfnResQuery.Span.ToArray(), 1, T);
-        if (messages is not null) m = Control(m, messages, loop!, 3, T);
-        m = RmsNormRows(m, lw.FfnNorm, T);
-        var moe = new float[T * H];
-        ForwardMoe(lw, m, moe, T);
-        ss.FfnPostConv.Run(T, moe, lw.FfnPostConv.Span, default, 0, moe);
+        var m = DepthMix(sc, blocks, ffnInp, lw.FfnResQuery.Span, 1, T, A);
+        if (!messages.IsEmpty) m = Control(sc, m, messages, loop!, 3, T);
+        m = RmsNormRows(sc, m, lw.FfnNorm, T);
+        var moe = A.Alloc<float>(T * H);
+        ForwardMoe(lw, A, m, moe, T);
+        ss.FfnPostConv.Run(T, moe, lw.FfnPostConv.Span, default, 0, moe, convScratch);
         Trace?.Invoke($"slot{slot}.ffn_out", moe, T, H);
 
-        var outp = new float[T * H];
+        var outp = outArena.Alloc<float>(T * H);
         TensorPrimitives.Add(ffnInp, moe, outp);
         return outp;
+    }
+
+    /// <summary>The <paramref name="q"/>-th query result of every token of a <c>[T][nq][H]</c> mix, as a contiguous <c>[T][H]</c> copy.</summary>
+    private Span<float> PickQuery(Inkling2Arena A, ReadOnlySpan<float> mixed, int q, int nq, int T)
+    {
+        int H = _hidden;
+        var x = A.Alloc<float>(T * H);
+        for (int t = 0; t < T; t++) mixed.Slice((t * nq + q) * H, H).CopyTo(x.Slice(t * H, H));
+        return x;
     }
 
     /// <summary>
@@ -655,63 +693,59 @@ public sealed unsafe class Inkling2TransformerModel : IModel
     /// <c>exp(l_k) / (1 + sum exp(l_k))</c> with <c>l_k = q.k * scale + bias(distance) - t</c>. Local layers see keys at distance &lt; window; global
     /// layers see every earlier key, with zero bias beyond the relative extent.
     /// </summary>
-    private void Attend(Layer lw, Inkling2SlotState ss, float[] q, float[] rel, float[] sink, float[] outp, int T, int pos0)
+    private void Attend(Layer lw, Inkling2SlotState ss, Inkling2Arena A, Span<float> q, ReadOnlySpan<float> rel, ReadOnlySpan<float> sink, Span<float> outp, int T, int pos0)
     {
         int hd = _headDim, nh = _heads, nkv = _kvHeads, qW = _qW, group = nh / nkv, relLen = _c.RelativeLength;
         float scale = 1f / MathF.Sqrt(hd);
         var relBias = lw.RelBias.Span;
         int maxKeys = lw.Local ? Math.Min(_c.SlidingWindow, pos0 + T) : pos0 + T;
-        float[] logits = ArrayPool<float>.Shared.Rent(nh * maxKeys);
-        float[] kRow = new float[hd], vRow = new float[hd];
-        try
+        Span<float> logits = A.Alloc<float>(nh * maxKeys);
+        Span<float> kRow = A.Alloc<float>(hd), vRow = A.Alloc<float>(hd);
+        for (int t = 0; t < T; t++)
         {
-            for (int t = 0; t < T; t++)
+            int p = pos0 + t;
+            int lo = lw.Local ? Math.Max(0, p - _c.SlidingWindow + 1) : 0;
+            int n = p - lo + 1;
+            for (int g = 0; g < nkv; g++)
             {
-                int p = pos0 + t;
-                int lo = lw.Local ? Math.Max(0, p - _c.SlidingWindow + 1) : 0;
-                int n = p - lo + 1;
-                for (int g = 0; g < nkv; g++)
+                for (int j = 0; j < n; j++)
                 {
-                    for (int j = 0; j < n; j++)
+                    ss.LoadK(lo + j, g, hd, kRow);
+                    int d = p - (lo + j);
+                    for (int s = 0; s < group; s++)
                     {
-                        ss.LoadK(lo + j, g, hd, kRow);
-                        int d = p - (lo + j);
-                        for (int s = 0; s < group; s++)
-                        {
-                            int h = g * group + s;
-                            float l = TensorPrimitives.Dot(q.AsSpan(t * qW + h * hd, hd), kRow) * scale
-                                      + Inkling2Ops.RelativeBias(relBias, lw.Extent, relLen, rel.AsSpan((t * nh + h) * relLen, relLen), d)
-                                      - sink[t * nh + h];
-                            logits[h * maxKeys + j] = l;
-                        }
+                        int h = g * group + s;
+                        float l = TensorPrimitives.Dot(q.Slice(t * qW + h * hd, hd), kRow) * scale
+                                  + Inkling2Ops.RelativeBias(relBias, lw.Extent, relLen, rel.Slice((t * nh + h) * relLen, relLen), d)
+                                  - sink[t * nh + h];
+                        logits[h * maxKeys + j] = l;
                     }
                 }
-                for (int h = 0; h < nh; h++)
+            }
+            for (int h = 0; h < nh; h++)
+            {
+                var l = logits.Slice(h * maxKeys, n);
+                float max = MathF.Max(TensorPrimitives.Max(l), 0f);          // the implicit zero sink joins the max and the sum
+                double sum = MathF.Exp(-max);
+                for (int j = 0; j < n; j++) { l[j] = MathF.Exp(l[j] - max); sum += l[j]; }
+                float inv = (float)(1.0 / sum);
+                for (int j = 0; j < n; j++) l[j] *= inv;
+            }
+            for (int g = 0; g < nkv; g++)
+            {
+                for (int s = 0; s < group; s++) outp.Slice(t * qW + (g * group + s) * hd, hd).Clear();
+                for (int j = 0; j < n; j++)
                 {
-                    var l = logits.AsSpan(h * maxKeys, n);
-                    float max = MathF.Max(TensorPrimitives.Max(l), 0f);          // the implicit zero sink joins the max and the sum
-                    double sum = MathF.Exp(-max);
-                    for (int j = 0; j < n; j++) { l[j] = MathF.Exp(l[j] - max); sum += l[j]; }
-                    float inv = (float)(1.0 / sum);
-                    for (int j = 0; j < n; j++) l[j] *= inv;
-                }
-                for (int g = 0; g < nkv; g++)
-                {
-                    for (int s = 0; s < group; s++) outp.AsSpan(t * qW + (g * group + s) * hd, hd).Clear();
-                    for (int j = 0; j < n; j++)
+                    ss.LoadV(lo + j, g, hd, vRow);
+                    for (int s = 0; s < group; s++)
                     {
-                        ss.LoadV(lo + j, g, hd, vRow);
-                        for (int s = 0; s < group; s++)
-                        {
-                            int h = g * group + s;
-                            var o = outp.AsSpan(t * qW + h * hd, hd);
-                            TensorPrimitives.MultiplyAdd(vRow, logits[h * maxKeys + j], o, o);
-                        }
+                        int h = g * group + s;
+                        var o = outp.Slice(t * qW + h * hd, hd);
+                        TensorPrimitives.MultiplyAdd(vRow, logits[h * maxKeys + j], o, o);
                     }
                 }
             }
         }
-        finally { ArrayPool<float>.Shared.Return(logits); }
     }
 
     // ───────────────────────────── MoE ─────────────────────────────
@@ -722,99 +756,82 @@ public sealed unsafe class Inkling2TransformerModel : IModel
     /// <c>expert_weights_scale</c>. Each expert is a merged gate_up bank (gate rows first) then SITU then <c>down</c>; NVFP4 banks carry a per-expert
     /// <c>.scale</c> that multiplies the matmul output (llama.cpp <c>build_lora_mm_id</c>).
     /// </summary>
-    private void ForwardMoe(Layer lw, float[] x, float[] y, int T)
+    private void ForwardMoe(Layer lw, Inkling2Arena A, ReadOnlySpan<float> x, Span<float> y, int T)
     {
         int H = _hidden, E = _c.ExpertCount, K = _c.ExpertUsedCount, ff = _c.ExpertFfLength;
-        float[] logits = ArrayPool<float>.Shared.Rent(T * E);
-        int[] selExpert = ArrayPool<int>.Shared.Rent(T * K);
-        float[] selWeight = ArrayPool<float>.Shared.Rent(T * K);
-        try
+        var logits = A.Alloc<float>(T * E);
+        var selExpert = A.Alloc<int>(T * K);
+        var selWeight = A.Alloc<float>(T * K);
+        GemmSpan(lw.Router, x.Slice(0, T * H), logits, T);
+        Span<float> scored = stackalloc float[E];
+        Span<float> sig = stackalloc float[E];
+        var bias = lw.ExpBias.Span;
+        for (int t = 0; t < T; t++)
         {
-            GemmSpan(lw.Router, x.AsSpan(0, T * H), logits, T);
-            Span<float> scored = stackalloc float[E];
-            Span<float> sig = stackalloc float[E];
-            var bias = lw.ExpBias.Span;
-            for (int t = 0; t < T; t++)
-            {
-                for (int e = 0; e < E; e++)
-                {
-                    sig[e] = Inkling2Ops.Sigmoid(logits[t * E + e]);
-                    scored[e] = sig[e] + bias[e];
-                }
-                SelectTopK(scored, K, selExpert.AsSpan(t * K, K));
-                float sum = 0f;
-                for (int i = 0; i < K; i++) sum += sig[selExpert[t * K + i]];
-                sum += 1e-20f;
-                for (int i = 0; i < K; i++)
-                    selWeight[t * K + i] = sig[selExpert[t * K + i]] / sum * _c.ExpertWeightsScale;
-            }
-            Array.Clear(y, 0, T * H);
-            ExecuteExperts(lw, x, y, selExpert, selWeight, T, K, E, H, ff);
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(logits); ArrayPool<int>.Shared.Return(selExpert); ArrayPool<float>.Shared.Return(selWeight);
-        }
-    }
-
-    private void ExecuteExperts(Layer lw, float[] x, float[] y, int[] selExpert, float[] selWeight, int T, int K, int E, int H, int ff)
-    {
-        // Bucket (token, slot) assignments by expert so each expert runs one batched GEMM over its tokens.
-        int[] count = ArrayPool<int>.Shared.Rent(E + 1), cursor = ArrayPool<int>.Shared.Rent(E + 1);
-        int[] tokenOf = ArrayPool<int>.Shared.Rent(T * K); float[] weightOf = ArrayPool<float>.Shared.Rent(T * K);
-        try
-        {
-            Array.Clear(count, 0, E + 1);
-            for (int i = 0; i < T * K; i++) count[selExpert[i] + 1]++;
-            for (int e = 0; e < E; e++) count[e + 1] += count[e];
-            Array.Copy(count, cursor, E + 1);
-            for (int t = 0; t < T; t++)
-                for (int i = 0; i < K; i++)
-                {
-                    int e = selExpert[t * K + i], at = cursor[e]++;
-                    tokenOf[at] = t; weightOf[at] = selWeight[t * K + i];
-                }
-            var guScale = Mutant == Inkling2Mutant.NoExpertScale ? default : lw.GateUpScale;
-            var dnScale = Mutant == Inkling2Mutant.NoExpertScale ? default : lw.DownScale;
-            float beta = _c.SituBeta, lb = _c.SituLinearBeta;
             for (int e = 0; e < E; e++)
             {
-                int n = count[e + 1] - count[e], start = count[e];
-                if (n == 0) continue;
-                float[] xin = ArrayPool<float>.Shared.Rent(n * H);
-                float[] gu = ArrayPool<float>.Shared.Rent(n * 2 * ff);
-                float[] act = ArrayPool<float>.Shared.Rent(n * ff);
-                float[] yo = ArrayPool<float>.Shared.Rent(n * H);
-                try
-                {
-                    for (int i = 0; i < n; i++) x.AsSpan(tokenOf[start + i] * H, H).CopyTo(xin.AsSpan(i * H, H));
-                    fixed (float* xp = xin) fixed (float* gp = gu) fixed (float* ap = act) fixed (float* yp = yo)
-                    {
-                        Gemm(lw.GateUp + (nint)(e * lw.GateUpExpertBytes), lw.GateUpQt, xp, gp, 2 * ff, H, n, _pool);
-                        if (!guScale.IsEmpty) TensorPrimitives.Multiply(gu.AsSpan(0, n * 2 * ff), guScale.Span[e], gu.AsSpan(0, n * 2 * ff));
-                        for (int i = 0; i < n; i++)
-                        {
-                            var row = gu.AsSpan(i * 2 * ff, 2 * ff);
-                            var a = act.AsSpan(i * ff, ff);
-                            for (int j = 0; j < ff; j++) a[j] = Inkling2Ops.Situ(row[j], row[ff + j], beta, lb);
-                        }
-                        Gemm(lw.Down + (nint)(e * lw.DownExpertBytes), lw.DownQt, ap, yp, H, ff, n, _pool);
-                        if (!dnScale.IsEmpty) TensorPrimitives.Multiply(yo.AsSpan(0, n * H), dnScale.Span[e], yo.AsSpan(0, n * H));
-                    }
-                    for (int i = 0; i < n; i++)
-                    {
-                        float w = weightOf[start + i];
-                        var dst = y.AsSpan(tokenOf[start + i] * H, H);
-                        TensorPrimitives.MultiplyAdd(yo.AsSpan(i * H, H), w, dst, dst);
-                    }
-                }
-                finally { ArrayPool<float>.Shared.Return(xin); ArrayPool<float>.Shared.Return(gu); ArrayPool<float>.Shared.Return(act); ArrayPool<float>.Shared.Return(yo); }
+                sig[e] = Inkling2Ops.Sigmoid(logits[t * E + e]);
+                scored[e] = sig[e] + bias[e];
             }
+            SelectTopK(scored, K, selExpert.Slice(t * K, K));
+            float sum = 0f;
+            for (int i = 0; i < K; i++) sum += sig[selExpert[t * K + i]];
+            sum += 1e-20f;
+            for (int i = 0; i < K; i++)
+                selWeight[t * K + i] = sig[selExpert[t * K + i]] / sum * _c.ExpertWeightsScale;
         }
-        finally
+        y.Slice(0, T * H).Clear();
+        ExecuteExperts(lw, A, x, y, selExpert, selWeight, T, K, E, H, ff);
+    }
+
+    private void ExecuteExperts(Layer lw, Inkling2Arena A, ReadOnlySpan<float> x, Span<float> y, ReadOnlySpan<int> selExpert, ReadOnlySpan<float> selWeight, int T, int K, int E, int H, int ff)
+    {
+        // Bucket (token, slot) assignments by expert so each expert runs one batched GEMM over its tokens.
+        var count = A.Alloc<int>(E + 1); var cursor = A.Alloc<int>(E + 1);
+        var tokenOf = A.Alloc<int>(T * K); var weightOf = A.Alloc<float>(T * K);
+        count.Clear();
+        for (int i = 0; i < T * K; i++) count[selExpert[i] + 1]++;
+        for (int e = 0; e < E; e++) count[e + 1] += count[e];
+        count.CopyTo(cursor);
+        for (int t = 0; t < T; t++)
+            for (int i = 0; i < K; i++)
+            {
+                int e = selExpert[t * K + i], at = cursor[e]++;
+                tokenOf[at] = t; weightOf[at] = selWeight[t * K + i];
+            }
+        var guScale = Mutant == Inkling2Mutant.NoExpertScale ? default : lw.GateUpScale;
+        var dnScale = Mutant == Inkling2Mutant.NoExpertScale ? default : lw.DownScale;
+        float beta = _c.SituBeta, lb = _c.SituLinearBeta;
+        int maxN = 0;
+        for (int e = 0; e < E; e++) maxN = Math.Max(maxN, count[e + 1] - count[e]);
+        var xin = A.Alloc<float>(maxN * H);
+        var gu = A.Alloc<float>(maxN * 2 * ff);
+        var act = A.Alloc<float>(maxN * ff);
+        var yo = A.Alloc<float>(maxN * H);
+        for (int e = 0; e < E; e++)
         {
-            ArrayPool<int>.Shared.Return(count); ArrayPool<int>.Shared.Return(cursor);
-            ArrayPool<int>.Shared.Return(tokenOf); ArrayPool<float>.Shared.Return(weightOf);
+            int n = count[e + 1] - count[e], start = count[e];
+            if (n == 0) continue;
+            for (int i = 0; i < n; i++) x.Slice(tokenOf[start + i] * H, H).CopyTo(xin.Slice(i * H, H));
+            fixed (float* xp = xin) fixed (float* gp = gu) fixed (float* ap = act) fixed (float* yp = yo)
+            {
+                Gemm(lw.GateUp + (nint)(e * lw.GateUpExpertBytes), lw.GateUpQt, xp, gp, 2 * ff, H, n, _pool);
+                if (!guScale.IsEmpty) TensorPrimitives.Multiply(gu.Slice(0, n * 2 * ff), guScale.Span[e], gu.Slice(0, n * 2 * ff));
+                for (int i = 0; i < n; i++)
+                {
+                    var row = gu.Slice(i * 2 * ff, 2 * ff);
+                    var a = act.Slice(i * ff, ff);
+                    for (int j = 0; j < ff; j++) a[j] = Inkling2Ops.Situ(row[j], row[ff + j], beta, lb);
+                }
+                Gemm(lw.Down + (nint)(e * lw.DownExpertBytes), lw.DownQt, ap, yp, H, ff, n, _pool);
+                if (!dnScale.IsEmpty) TensorPrimitives.Multiply(yo.Slice(0, n * H), dnScale.Span[e], yo.Slice(0, n * H));
+            }
+            for (int i = 0; i < n; i++)
+            {
+                float w = weightOf[start + i];
+                var dst = y.Slice(tokenOf[start + i] * H, H);
+                TensorPrimitives.MultiplyAdd(yo.Slice(i * H, H), w, dst, dst);
+            }
         }
     }
 
@@ -841,6 +858,7 @@ public sealed unsafe class Inkling2TransformerModel : IModel
         DotLLM.Cpu.Kernels.CpuKernelScratch.Trim(null);
         if (_ownsPool) _pool?.Dispose();
         _defaultState.Dispose();
+        lock (_scratchPool) { foreach (var sc in _scratchPool) sc.Dispose(); _scratchPool.Clear(); }
         foreach (var p in _owned) NativeMemory.AlignedFree((void*)p);
         _owned.Clear();
         GC.SuppressFinalize(this);

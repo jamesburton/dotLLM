@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -9,13 +8,10 @@ namespace DotLLM.Models.Architectures;
 /// <summary>Storage type of the carried short-convolution inputs (the recurrent state of Inkling 2).</summary>
 public enum Inkling2ConvStateStorage
 {
-    /// <summary>IEEE single precision (llama.cpp's recurrent-state type; the A/B reference arm).</summary>
+    /// <summary>IEEE single precision (llama.cpp's recurrent-state type; the A/B reference arm only).</summary>
     F32,
 
-    /// <summary>IEEE half precision.</summary>
-    F16,
-
-    /// <summary>bfloat16.</summary>
+    /// <summary>bfloat16 (the default; user ruling 2026-11-26: F16 is ruled out, its 5-bit exponent cannot hold the range, KL 5.65e-3 vs 3.91e-3).</summary>
     BF16,
 }
 
@@ -44,7 +40,6 @@ internal sealed class Inkling2ConvState : IDisposable
     private float Load(int i) => _storage switch
     {
         Inkling2ConvStateStorage.F32 => _f32!.Span[i],
-        Inkling2ConvStateStorage.F16 => (float)BitConverter.UInt16BitsToHalf(_u16!.Span[i]),
         _ => BitConverter.Int32BitsToSingle(_u16!.Span[i] << 16),
     };
 
@@ -53,7 +48,6 @@ internal sealed class Inkling2ConvState : IDisposable
         switch (_storage)
         {
             case Inkling2ConvStateStorage.F32: _f32!.Span[i] = v; break;
-            case Inkling2ConvStateStorage.F16: _u16!.Span[i] = BitConverter.HalfToUInt16Bits((Half)v); break;
             default: _u16!.Span[i] = ToBf16(v); break;
         }
     }
@@ -78,18 +72,19 @@ internal sealed class Inkling2ConvState : IDisposable
     /// <param name="dyn">Input-dependent taps <c>[tokens][heads][K]</c>, or empty.</param>
     /// <param name="heads">Head count of <paramref name="dyn"/> (channels are split evenly across heads).</param>
     /// <param name="output">Outputs <c>[tokens][channels]</c>; may alias <paramref name="input"/>.</param>
-    public void Run(int tokens, ReadOnlySpan<float> input, ReadOnlySpan<float> weight, ReadOnlySpan<float> dyn, int heads, Span<float> output)
+    /// <param name="scratch">At least <see cref="ScratchFloats"/> floats of caller-owned scratch (native; no allocation here).</param>
+    public void Run(int tokens, ReadOnlySpan<float> input, ReadOnlySpan<float> weight, ReadOnlySpan<float> dyn, int heads, Span<float> output, Span<float> scratch)
     {
         int C = _channels, K1 = _k1, K = K1 + 1;
         bool hasDyn = !dyn.IsEmpty;
         int rows = K1 + tokens;
-        float[] win = ArrayPool<float>.Shared.Rent(rows * C);
-        float[] res = ArrayPool<float>.Shared.Rent(tokens * C);
-        try
+        if (scratch.Length < ScratchFloats(tokens)) throw new ArgumentException("scratch too small.", nameof(scratch));
+        Span<float> win = scratch.Slice(0, rows * C);
+        Span<float> res = scratch.Slice(rows * C, tokens * C);
         {
             for (int k = 0; k < K1; k++)
                 for (int c = 0; c < C; c++) win[k * C + c] = Load(c * K1 + k);
-            input.Slice(0, tokens * C).CopyTo(win.AsSpan(K1 * C, tokens * C));
+            input.Slice(0, tokens * C).CopyTo(win.Slice(K1 * C, tokens * C));
 
             int perHead = hasDyn ? C / heads : 1;
             float scale = 1f / MathF.Sqrt((hasDyn ? 2 : 1) * K + 1);
@@ -111,14 +106,12 @@ internal sealed class Inkling2ConvState : IDisposable
 
             for (int k = 0; k < K1; k++)
                 for (int c = 0; c < C; c++) Store(c * K1 + k, win[(tokens + k) * C + c]);
-            res.AsSpan(0, tokens * C).CopyTo(output);
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(win);
-            ArrayPool<float>.Shared.Return(res);
+            res.Slice(0, tokens * C).CopyTo(output);
         }
     }
+
+    /// <summary>Scratch floats <see cref="Run"/> needs for <paramref name="tokens"/> tokens.</summary>
+    public int ScratchFloats(int tokens) => (_k1 + 2 * tokens) * _channels;
 
     public void Dispose() { _f32?.Dispose(); _u16?.Dispose(); }
 }
