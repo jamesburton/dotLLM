@@ -536,4 +536,70 @@ public sealed class VulkanEdge0LatentKernelTests
         for (int i = 0; i < r.Length; i++) Assert.True(c[i] == HalfBits(r[i]), $"i {i}: f16 {c[i]:X4} vs f32 rounded {HalfBits(r[i]):X4} ({r[i]:G9})");
         Assert.Contains(Enumerable.Range(0, r.Length), i => (float)(Half)r[i] != r[i]);
     }
+    // ----------------------- F16 wide GEMV (D / U at 9..16 rows, #2004) -----------------------
+
+    /// <summary>Scalar double reference of a Q8_0 matmul (block = fp16 scale + 32 int8).</summary>
+    private static double[] ScalarQ8Matmul(byte[] wq, float[] x, int m, int kk, int n)
+    {
+        var y = new double[n * m];
+        int bpr = kk / 32;
+        for (int c = 0; c < n; c++)
+            for (int r = 0; r < m; r++)
+            {
+                double acc = 0;
+                for (int b = 0; b < bpr; b++)
+                {
+                    long o = ((long)r * bpr + b) * 34;
+                    double d = (double)BitConverter.UInt16BitsToHalf((ushort)(wq[o] | (wq[o + 1] << 8)));
+                    double dot = 0;
+                    for (int i = 0; i < 32; i++) dot += (sbyte)wq[o + 2 + i] * (double)x[c * kk + b * 32 + i];
+                    acc += d * dot;
+                }
+                y[c * m + r] = acc;
+            }
+        return y;
+    }
+
+    /// <summary>D (F32 in) and U (F16 in) wide GEMVs: bit-identical to the F32 wide GEMV they derive from, rounded once to F16, and within F32-accumulation error of a scalar double reference.</summary>
+    [SkippableTheory]
+    [InlineData(false, 9)]
+    [InlineData(false, 12)]
+    [InlineData(false, 16)]
+    [InlineData(true, 9)]
+    [InlineData(true, 12)]
+    [InlineData(true, 16)]
+    public void WideGemv_F16Output_IsTheF32WideKernelRoundedOnce_AndMatchesAScalarReference(bool f16Input, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var wide = Edge0WideGemvKernel.TryCreate(device, spvDir, f16Input);
+        using var f32 = MatMulQ8_0GemvMultiKernel.TryCreate(device, spvDir);
+        Skip.If(wide is null || f32 is null, "wide GEMV unavailable");
+        const int m = 203, kk = 224;   // M not a multiple of NR (partial last workgroup), K not a multiple of the 64-lane window
+        var rng = new Random(0xE9 + n + (f16Input ? 100 : 0));
+        byte[] wq = RandomQ8Rows(rng, m, kk);
+        float[] x = new float[n * kk]; for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        if (f16Input) for (int i = 0; i < x.Length; i++) x[i] = (float)(Half)x[i];   // z is F16-valued, so the F32 kernel sees the same numbers
+        using var bW = device.Allocate((wq.Length + 3L) & ~3L); device.Upload(wq, bW);
+        using var bXf = Up(device, x, out _);
+        using var bXh = Up(device, x.Select(v => (Half)v).ToArray(), out _);
+        using var bRef = device.Allocate((long)n * m * 4); using var bC = device.Allocate(((long)n * m * 2 + 3) & ~3L);
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            f32!.Record(ctx.CommandBuffer, bW, bXf, bRef, m, kk, n);
+            wide!.Record(ctx.CommandBuffer, bW, f16Input ? bXh : bXf, bC, m, kk, n);
+            ctx.SubmitAndWait();
+        }
+        float[] r = new float[n * m]; device.Download(bRef, r);
+        ushort[] c = DownloadHalfBits(device, bC, n * m);
+        for (int i = 0; i < r.Length; i++) Assert.True(c[i] == HalfBits(r[i]), $"i {i} (col {i / m}, row {i % m}): f16 {c[i]:X4} vs f32 rounded {HalfBits(r[i]):X4} ({r[i]:G9})");
+        Assert.Contains(Enumerable.Range(0, r.Length), i => (float)(Half)r[i] != r[i]);
+        double[] sc = ScalarQ8Matmul(wq, x, m, kk, n);
+        for (int i = 0; i < sc.Length; i++)
+        {
+            float g = (float)BitConverter.UInt16BitsToHalf(c[i]);
+            Assert.True(Math.Abs(g - sc[i]) <= 2e-3 * Math.Max(1.0, Math.Abs(sc[i])) + 1e-3, $"i {i}: gpu {g} scalar {sc[i]}");
+        }
+    }
 }

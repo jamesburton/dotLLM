@@ -44,6 +44,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
 
     internal long Edge0SkipLayersCount => Edge0SkipLayers;
 
+    /// <summary>
+    /// The F16-output wide GEMVs serve D and U at 9..16 rows (#2004). Off (<c>DOTLLM_EDGE0_WIDE_GEMV=0</c>) sends those rows to the blocked coopmat GEMM, the
+    /// pre-#2004 behaviour (the A/B arm).
+    /// </summary>
+    internal static bool Edge0WideGemvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_EDGE0_WIDE_GEMV") != "0";
+
+    /// <summary>Test hook: D / U dispatches that ran on the F16 wide GEMV.</summary>
+    internal long Edge0WideDispatches { get; private set; }
+
     /// <summary>Test hook: Edge0 latent-MoE layers recorded.</summary>
     internal long Edge0LayersRecorded { get; private set; }
 
@@ -159,6 +168,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
             KernelSupport.ComputeToComputeBarrier(cmd);
             multi.Record(cmd, e0.D, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _edge0Xl!, m: G * L, k: H, n: T);
         }
+        else if (k.WideD is { } wideD && Edge0WideGemvEnabled && SmallRowGemvEnabled && SmallRowWideEnabled && Edge0WideGemvKernel.Accepts(T, H))
+        {
+            Edge0WideDispatches++;
+            wideD.Record(cmd, e0.D, _state.NormOutput, _edge0Xl!, m: G * L, k: H, n: T);   // 9..16 rows (#2004): F32 in, F16 out, no coopmat tile
+        }
         else
             k.RecordGemmD(cmd, e0.D, _state.NormOutput, _edge0Xl!, G * L, H, T);
         KernelSupport.ComputeToComputeBarrier(cmd);
@@ -220,6 +234,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
         else
         {
             bool small = k.MultiC16 is { } && SmallRowGemvEnabled && MatMulQ8_0MmvqMultiKernel.Accepts(T, L);
+            var wideU = Edge0WideGemvEnabled && SmallRowGemvEnabled && SmallRowWideEnabled && !small && Edge0WideGemvKernel.Accepts(T, L) ? k.WideU : null;
             for (int g = 0; g < G; g++)
             {
                 if (small)
@@ -233,7 +248,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
                 {
                     k.RecordGroupCombineF16(cmd, _state.MoeDownRows, _state.MoeTopkIndices, _state.MoeTopkWeights, e0.Labels, _edge0Z!, L, topK, g, T, E);
                     KernelSupport.ComputeToComputeBarrier(cmd);
-                    k.RecordGemmU(cmd, e0.U[g], _edge0Z!, _edge0Uo!, H, L, T);
+                    if (wideU is not null) { Edge0WideDispatches++; wideU.Record(cmd, e0.U[g], _edge0Z!, _edge0Uo!, m: H, k: L, n: T); }   // 9..16 rows (#2004): F16 z in, F16 out
+                    else k.RecordGemmU(cmd, e0.U[g], _edge0Z!, _edge0Uo!, H, L, T);
                 }
                 KernelSupport.ComputeToComputeBarrier(cmd);
                 k.RecordUAcc(cmd, _edge0Uo!, _state.NormOutput, T * H, first: g == 0);

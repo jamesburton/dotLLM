@@ -1,4 +1,5 @@
 using DotLLM.Core.Models;
+using DotLLM.Core.Tensors;
 using DotLLM.Models;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Integration.Fixtures;
@@ -48,11 +49,34 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
         allRows?.Invoke(ids.Length);
         var pos = new int[ids.Length];
         for (int i = 0; i < pos.Length; i++) pos[i] = i;
-        using var logits = model.Forward(ids, pos, 0);
-        int vocab = (int)logits.Shape[1];
-        int rows = (int)logits.Shape[0];
-        if (rows != ids.Length) throw new InvalidOperationException($"forward returned {rows} logit rows for {ids.Length} tokens (all-row logits unavailable)");
-        var l = new ReadOnlySpan<float>((void*)logits.DataPointer, rows * vocab);
+        // DOTLLM_EDGE0_CHUNK=n (#2004): feed the passage in n-row forwards so every layer's D / U / experts see n rows (9..16 is the F16 wide-GEMV shape); the logits of every row are kept.
+        int chunk = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_EDGE0_CHUNK"), out int ch) && ch > 0 ? ch : 0;
+        ITensor? logits = null;
+        int vocab, rows;
+        ReadOnlySpan<float> l;
+        if (chunk > 0 && ids.Length > chunk)
+        {
+            allRows?.Invoke(chunk);
+            var acc = new List<float>(); vocab = 0;
+            for (int s0 = 0; s0 < ids.Length; s0 += chunk)
+            {
+                int n = Math.Min(chunk, ids.Length - s0);
+                using var part = model.Forward(ids.Slice(s0, n), pos.AsSpan(s0, n), 0);
+                if ((int)part.Shape[0] != n) throw new InvalidOperationException($"chunk forward returned {part.Shape[0]} logit rows for {n} tokens");
+                vocab = (int)part.Shape[1];
+                acc.AddRange(new ReadOnlySpan<float>((void*)part.DataPointer, n * vocab));
+            }
+            rows = ids.Length;
+            l = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(acc);
+        }
+        else
+        {
+            logits = model.Forward(ids, pos, 0);
+            vocab = (int)logits.Shape[1];
+            rows = (int)logits.Shape[0];
+            if (rows != ids.Length) throw new InvalidOperationException($"forward returned {rows} logit rows for {ids.Length} tokens (all-row logits unavailable)");
+            l = new ReadOnlySpan<float>((void*)logits.DataPointer, rows * vocab);
+        }
         var argmax = new int[rows];
         double total = 0;
         for (int t = 0; t < rows; t++)
@@ -75,7 +99,9 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
             using var lg = model.Forward([next], [ids.Length + s], 0);
             next = Argmax(new ReadOnlySpan<float>((void*)lg.DataPointer, vocab));
         }
-        return new Run(ids.ToArray(), argmax, nll ? total / (rows - 1) : double.NaN, last, greedy, nll ? l.ToArray() : null);
+        var all = nll ? l.ToArray() : null;
+        logits?.Dispose();
+        return new Run(ids.ToArray(), argmax, nll ? total / (rows - 1) : double.NaN, last, greedy, all);
     }
 
     private static void Save(string path, List<Run> runs)

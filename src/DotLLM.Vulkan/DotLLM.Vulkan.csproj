@@ -58,6 +58,9 @@
 
   <ItemGroup>
     <VulkanShader Include="$(VulkanShaderDir)\*.comp" />
+    <!-- Headers pulled in with #include (#2004). They are not compile units, so CompileVulkanShaders' per-.comp
+         Inputs/Outputs cannot see an edit to one; _CompileVulkanShadersAfterIncludeEdit below does. -->
+    <VulkanShaderInclude Include="$(VulkanShaderDir)\*.glsl" />
   </ItemGroup>
 
   <!-- glslc pin (#1364). SPIR-V bytes depend on the glslc version, so tracked .spv are only (re)written by the
@@ -87,6 +90,24 @@
       <_GlslcFirstLine Condition="'$(_GlslcAllLines)' != ''">$(_GlslcAllLines.Split('|')[0])</_GlslcFirstLine>
       <_GlslcMatchesPin Condition="'$(_GlslcExitCode)' == '0' And '$(_GlslcPin)' != '' And $(_GlslcFirstLine.StartsWith('$(_GlslcPin)'))">true</_GlslcMatchesPin>
     </PropertyGroup>
+  </Target>
+
+  <!-- An edit to an included .glsl leaves every dependent .spv stale (#2004): the per-.comp target below only compares a .comp with its own .spv.
+       This target keys a stamp (under obj/) on the newest .glsl; when any header is newer than the stamp it recompiles EVERY shader (we do not
+       track which .comp includes which header; unchanged shaders re-emit identical bytes under the pinned glslc, so the tree stays clean), then
+       touches the stamp. With a mismatched glslc nothing is written and the stamp is left alone, so the next build warns again instead of
+       silently treating the stale blobs as current. -->
+  <Target Name="_CompileVulkanShadersAfterIncludeEdit"
+          BeforeTargets="CompileVulkanShaders"
+          DependsOnTargets="_DetectGlslc"
+          Inputs="@(VulkanShaderInclude)"
+          Outputs="$(IntermediateOutputPath)vulkan-include.stamp">
+    <!-- Conditions sit on the tasks: a target Condition is evaluated before DependsOnTargets has set _GlslcMatchesPin. -->
+    <MakeDir Condition="'$(_GlslcMatchesPin)' == 'true'" Directories="$(SpvOutputDir);$(IntermediateOutputPath)" />
+    <Message Condition="'$(_GlslcMatchesPin)' == 'true'" Importance="high" Text="A shader header (.glsl) changed: recompiling every shader to SPIR-V" />
+    <Exec Condition="'$(_GlslcMatchesPin)' == 'true'" Command="glslc --target-env=$(VulkanTargetEnv) -O -o &quot;$(SpvOutputDir)/%(VulkanShader.Filename).spv&quot; &quot;%(VulkanShader.FullPath)&quot;"
+          StandardOutputImportance="low" />
+    <Touch Condition="'$(_GlslcMatchesPin)' == 'true'" Files="$(IntermediateOutputPath)vulkan-include.stamp" AlwaysCreate="true" />
   </Target>
 
   <!-- Incremental compile of stale .comp files. Writes only when glslc matches the pin. -->
