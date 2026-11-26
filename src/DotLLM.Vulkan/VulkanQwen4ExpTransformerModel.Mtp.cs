@@ -45,8 +45,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     private float[]? _mtpLogits;
 
     /// <summary>
+    /// Edge0 draft steps score only the pack's draft vocabulary (<c>draft_vocab.bin</c>, the LM head's Q8_0 rows read in place) instead of the
     /// full vocabulary (#2013). Verify is unchanged, so the text cannot change; only the drafts do. OPT-IN (<c>DOTLLM_EDGE0_DRAFT_VOCAB=1</c> at startup, or setting this): measured net slower, because the subset costs more acceptance than the cheaper LM head saves (see docs/SPECULATIVE.md).
-    /// full vocabulary (#2013). Verify is unchanged, so the text cannot change; only the drafts do. <c>DOTLLM_EDGE0_DRAFT_VOCAB=0</c> at startup (or setting this) drafts over the full vocabulary (A/B).
     /// Applies to the arg-max draft path; <see cref="ForwardMtp"/> always returns the full logit row.
     /// </summary>
     public static bool Edge0DraftVocabEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_EDGE0_DRAFT_VOCAB") == "1";
@@ -319,10 +319,13 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 Pair = Scratch(AbsorbChunk * rowBytes), RFront = Scratch(AbsorbChunk * rowBytes), RWork = Scratch(AbsorbChunk * rowBytes),
                 Owned = owned, OwnedFile = ownsFile ? headFile : null,
             };
-            if (edge0Head is not null)
+            if (edge0Head is not null && edge0Head.DraftVocab.Length > 0)
             {
                 var w = _core.Q4Weights;
-                if (w.OutputDeviceQuantType == QuantizationType.Q8_0 && (w.OutputInputDim & 31) == 0 && _core.Q4AttachDraftRows(_spvDir))
+                // The pack checks the ids against the tokenizer vocabulary; the shader indexes LM-head rows unchecked, so bound them by the head's row count too.
+                if (edge0Head.DraftVocab.Max() >= w.OutputOutputDim)
+                    Console.Error.WriteLine($"[dotLLM] Edge0 draft vocabulary names a token beyond the LM head's {w.OutputOutputDim} rows; drafting over the full vocabulary.");
+                else if (w.OutputDeviceQuantType == QuantizationType.Q8_0 && (w.OutputInputDim & 31) == 0 && _core.Q4AttachDraftRows(_spvDir))
                 {
                     using var vstaging = VulkanStagingBuffer.Create(_device, 4L << 20);
                     head.DraftVocab = Edge0DraftVocabHead.Create(_device, vstaging, edge0Head.DraftVocab);
