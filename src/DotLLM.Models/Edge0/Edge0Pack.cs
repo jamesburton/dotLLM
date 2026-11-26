@@ -47,6 +47,9 @@ public sealed unsafe class Edge0Pack : IDisposable
     /// <summary>Pack directory.</summary>
     public string Directory { get; }
 
+    /// <summary>True when the expert and latent files are mapped as shared writable views a UMA driver can import in place (see <c>Open</c>).</summary>
+    public bool ImportableViews { get; private set; }
+
     /// <summary>Number of MoE layers.</summary>
     public int Layers { get; }
 
@@ -127,9 +130,12 @@ public sealed unsafe class Edge0Pack : IDisposable
     /// <param name="hidden">Model hidden width (the router width; <c>ModelConfig.HiddenSize</c>).</param>
     /// <param name="expertFf">Expert FFN width (<c>moe_intermediate_size</c>, 640).</param>
     /// <param name="preferLatentQ4">Open <c>latent_dense_q4.bin</c> instead of <c>latent_dense_q8.bin</c> when both exist.</param>
+    /// <param name="importableViews">Map <c>experts.bin</c> and the latent file as SHARED WRITABLE views (the file is opened for write with <c>FileShare.ReadWrite</c>; nothing is ever written) so a
+    /// UMA GPU driver can import the pages in place: amdvlk and the Arc driver refuse read-only pages and privatise copy-on-write ones (docs/GPU.md, #508/#1190). Falls back to read-only views
+    /// when the file cannot be opened for write; <see cref="ImportableViews"/> says which happened.</param>
     /// <exception cref="InvalidDataException">A file is missing or inconsistent with the geometry.</exception>
     /// <exception cref="NotSupportedException">The pack stores an expert type this reader does not handle (NVFP4 packs carry a 16-byte tail).</exception>
-    public static Edge0Pack Open(string directory, int hidden = 2560, int expertFf = 640, bool preferLatentQ4 = false)
+    public static Edge0Pack Open(string directory, int hidden = 2560, int expertFf = 640, bool preferLatentQ4 = false, bool importableViews = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(directory);
         string manifest = Path.Combine(directory, "native_experts.txt");
@@ -247,10 +253,12 @@ public sealed unsafe class Edge0Pack : IDisposable
         var maps = new List<(MemoryMappedFile, MemoryMappedViewAccessor)>();
         try
         {
-            nint e0 = Map(expertsPath, maps), l0 = Map(latentPath, maps);
+            bool writable = importableViews;
+            nint e0 = Map(expertsPath, maps, ref writable), l0 = Map(latentPath, maps, ref writable);
             var pack = new Edge0Pack(directory, layers, experts, hidden, latent, expertFf, groups, guType, dType, latentType,
                 labels, inv, e0, l0, rawScales);
             pack._maps.AddRange(maps);
+            pack.ImportableViews = writable;
             return pack;
         }
         catch
@@ -276,10 +284,21 @@ public sealed unsafe class Edge0Pack : IDisposable
         return checked((int)(recordBytes / denom * 256));
     }
 
-    private static nint Map(string path, List<(MemoryMappedFile, MemoryMappedViewAccessor)> maps)
+    private static nint Map(string path, List<(MemoryMappedFile, MemoryMappedViewAccessor)> maps, ref bool writable)
     {
-        var mmf = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-        var view = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        MemoryMappedFile? mmf = null;
+        if (writable)
+        {
+            try
+            {
+                // FileShare.ReadWrite: readers (the CPU path, other processes) stay valid alongside; nothing is written through the view.
+                var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+                mmf = MemoryMappedFile.CreateFromFile(fs, null, 0, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: false);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { writable = false; }
+        }
+        mmf ??= MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+        var view = mmf.CreateViewAccessor(0, 0, writable ? MemoryMappedFileAccess.ReadWrite : MemoryMappedFileAccess.Read);
         byte* p = null;
         view.SafeMemoryMappedViewHandle.AcquirePointer(ref p);
         maps.Add((mmf, view));

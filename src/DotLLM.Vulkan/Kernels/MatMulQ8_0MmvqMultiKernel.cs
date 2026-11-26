@@ -16,15 +16,16 @@ public sealed class MatMulQ8_0MmvqMultiKernel : IDisposable
     private const int PushConstantBytes = 4 * sizeof(uint);
 
     private readonly VulkanDevice _device;
+    private readonly bool _f16Output;
     private readonly VulkanModule _module;
     private readonly ComputePipeline?[] _pipelines = new ComputePipeline?[MaxColumns + 1];
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
-    private MatMulQ8_0MmvqMultiKernel(VulkanDevice device, VulkanModule module, nint pool, uint subgroup)
+    private MatMulQ8_0MmvqMultiKernel(VulkanDevice device, VulkanModule module, nint pool, uint subgroup, bool f16Output)
     {
-        _device = device; _module = module; _descriptorPool = pool;
+        _device = device; _f16Output = f16Output; _module = module; _descriptorPool = pool;
         for (int n = 2; n <= MaxColumns; n++)
             _pipelines[n] = module.CreateComputePipeline(
                 entryPoint: "main",
@@ -36,16 +37,19 @@ public sealed class MatMulQ8_0MmvqMultiKernel : IDisposable
     }
 
     /// <summary>Loads <c>matmul_q8_0_mmvq_multi.spv</c>; null when it is missing or the device has no integer dot product.</summary>
-    public static MatMulQ8_0MmvqMultiKernel? TryCreate(VulkanDevice device, string spvDir)
+    /// <param name="device">Device.</param>
+    /// <param name="spvDir">SPIR-V directory.</param>
+    /// <param name="f16Output">Load <c>matmul_q8_0_mmvq_multi_c16.spv</c>: same dp4a math, the F32 total is rounded once into a float16_t output (Edge0 latent scratch, #1981).</param>
+    public static MatMulQ8_0MmvqMultiKernel? TryCreate(VulkanDevice device, string spvDir, bool f16Output = false)
     {
         if (!device.HasIntegerDotProduct) return null;
-        string path = Path.Combine(spvDir, "matmul_q8_0_mmvq_multi.spv");
+        string path = Path.Combine(spvDir, f16Output ? "matmul_q8_0_mmvq_multi_c16.spv" : "matmul_q8_0_mmvq_multi.spv");
         if (!File.Exists(path)) return null;
         var module = VulkanModule.LoadFromFile(device, path);
         try
         {
             nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-            return new MatMulQ8_0MmvqMultiKernel(device, module, pool, Wave32SubgroupControl.RequiredSubgroupSizeFor(device));
+            return new MatMulQ8_0MmvqMultiKernel(device, module, pool, Wave32SubgroupControl.RequiredSubgroupSizeFor(device), f16Output);
         }
         catch { module.Dispose(); throw; }
     }
@@ -66,7 +70,7 @@ public sealed class MatMulQ8_0MmvqMultiKernel : IDisposable
         if (weightsQ8.Size < (long)m * rowBytes) throw new ArgumentException("Weights buffer too small.", nameof(weightsQ8));
         if (xq.Size < QuantizeQ8_1RowsKernel.PackedBytes(n, k)) throw new ArgumentException("Packed activation buffer too small.", nameof(xq));
         if (xds.Size < QuantizeQ8_1RowsKernel.ScaleBytes(n, k)) throw new ArgumentException("Activation scale buffer too small.", nameof(xds));
-        if (y.Size < (long)n * m * sizeof(float)) throw new ArgumentException("Output buffer too small.", nameof(y));
+        if (y.Size < (long)n * m * (_f16Output ? sizeof(ushort) : sizeof(float))) throw new ArgumentException("Output buffer too small.", nameof(y));
 
         Span<nint> buffers = stackalloc nint[4] { weightsQ8.Handle, xq.Handle, xds.Handle, y.Handle };
         nint set = _descriptorCache.GetOrCreate(buffers);
