@@ -251,7 +251,7 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
         if (config.HeadDim % 8 != 0 || config.HeadDim > 128)
             throw new NotSupportedException($"Olala Vulkan attention supports head_dim a multiple of 8 and <= 128, got {config.HeadDim}.");
         if (o.MambaHeadDim > 64 || o.MimoRank > 8 || o.StateSize > 128 || o.StateSize % 2 != 0 || o.NumRopeAngles > 64 || o.NumRopeAngles > o.StateSize / 2)
-            throw new NotSupportedException("Olala Vulkan Mamba step supports head dim <= 64, rank <= 8, state <= 128, angles <= min(64, state/2).");
+            throw new NotSupportedException($"Olala Vulkan Mamba step supports head dim <= 64, rank <= 8, an even state size <= 128 (the state column is split across two lanes), angles <= min(64, state/2); got head dim {o.MambaHeadDim}, rank {o.MimoRank}, state {o.StateSize}, angles {o.NumRopeAngles}.");
         if (o.NumSignalHeads + o.NumNoiseHeads != 4 * o.NumNoiseHeads)
             throw new NotSupportedException("Olala Vulkan attention supports 4 query heads per kv head (3 signal + 1 noise).");
         // olala_moe_route keeps the token row and the scores in fixed shared arrays (sx4[1024] = 4096 floats read as vec4, sig/scored[1024], chosen[16]).

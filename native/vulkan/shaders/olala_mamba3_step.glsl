@@ -19,7 +19,7 @@ const uint NT = 128u;   // threads: lane p = tid & 63 (P <= 64), state half = ti
 // to the per-token global form (measured, #2002/#2003 review: F32-act control vs the old shader KL <= 6e-6 on the real capital/code cases, quality
 // vs HF unchanged; most likely different FMA contraction once the loops unroll, not attributed). At N = 128, R = 4 the driver uses all 256 VGPRs
 // and spills 128-144 B per lane to scratch (VK_AMD_shader_info, gfx1151), so part of the column still round-trips memory; N = 16 does not spill.
-// #2004: to stop the spill each state column is split across TWO lanes (128-thread workgroup): lane p of half 0 owns n in [0, N/2), half 1 owns
+// #2005: to stop the spill each state column is split across TWO lanes (128-thread workgroup): lane p of half 0 owns n in [0, N/2), half 1 owns
 // [N/2, N); each accumulates its own partial o[r] and half 0 adds half 1's (through shared memory). N must be even.
 layout(constant_id = 0) const uint N_C = 128u;
 layout(constant_id = 1) const uint R_C = 4u;
@@ -64,8 +64,12 @@ void main() {
     uint lane = tid & 63u, hf = tid >> 6u;
     uint n0 = hf * NH;
     float sreg[NH];
+    // Previous token's raw x (the beta-term input) is carried in a register by BOTH halves: a per-token global read of st[stV] by half 1 would
+    // race half 0's write (barrier() orders workgroup memory only, not buffer memory). Loaded once, written back once.
+    float vPrev = 0.0;
     if (lane < P) {
         [[unroll]] for (uint n = 0u; n < NH; ++n) sreg[n] = st[stSsm + (h * N + n0 + n) * P + lane];
+        vPrev = st[stV + h * P + lane];
     }
 
     for (uint t = 0u; t < pc.T; ++t) {
@@ -128,7 +132,6 @@ void main() {
         uint p = lane;
         if (p < P) {
             xp = actToF(zxdt[zb + P + p]); zp = actToF(zxdt[zb + p]);
-            float vPrev = st[stV + h * P + p];
             [[unroll]] for (uint r = 0u; r < R_C; ++r) {
                 float mx = prm[offMx + (h * R + r) * P + p];
                 xv[r] = xp * mx;
@@ -155,8 +158,8 @@ void main() {
                 acc += ((o[r] + so[r * 64u + p]) + xv[r] * dSkip) * siluF(zp * mz) * mo;
             }
             yout[t * H * P + h * P + p] = fToAct(acc);
-            st[stV + h * P + p] = xp;   // this token's raw x feeds the next token's beta-term
         }
+        vPrev = xp;   // this token's raw x feeds the next token's beta-term (both halves; 0 on idle lanes, never stored)
         // This token's rotated K becomes the next token's "previous" (every lane finished reading skp above).
         barrier();
         for (uint i = tid; i < R * N; i += NT) {
@@ -167,5 +170,6 @@ void main() {
     }
     if (lane < P) {
         [[unroll]] for (uint n = 0u; n < NH; ++n) st[stSsm + (h * N + n0 + n) * P + lane] = sreg[n];
+        if (hf == 0u) st[stV + h * P + lane] = vPrev;
     }
 }
