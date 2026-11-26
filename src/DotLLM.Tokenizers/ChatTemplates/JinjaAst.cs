@@ -58,6 +58,9 @@ internal sealed record BinaryExpr(IExpression Left, BinaryOp Op, IExpression Rig
 
 internal sealed record UnaryExpr(UnaryOp Op, IExpression Operand) : IExpression;
 
+/// <summary>A <c>name=value</c> argument of a filter call (<c>tojson(sort_keys=true)</c>); only filters that read keywords look at the name.</summary>
+internal sealed record KwArgExpr(string Name, IExpression Value) : IExpression;
+
 internal sealed record FilterExpr(IExpression Input, string FilterName, IReadOnlyList<IExpression> Args) : IExpression;
 
 internal sealed record ConditionalExpr(IExpression TrueValue, IExpression Condition, IExpression FalseValue) : IExpression;

@@ -557,7 +557,7 @@ internal sealed class JinjaParser
                 if (CurrentIs(JinjaTokenType.LeftParen))
                 {
                     Advance();
-                    args = ParseArgList();
+                    args = ParseFilterArgList();
                     Expect(JinjaTokenType.RightParen);
                 }
 
@@ -713,6 +713,31 @@ internal sealed class JinjaParser
             default:
                 throw Error($"Expected expression, got {token.Type}");
         }
+    }
+
+    /// <summary>Filter arguments: like <see cref="ParseArgList"/>, but a <c>name=value</c> keeps its name (<see cref="KwArgExpr"/>).</summary>
+    private List<IExpression> ParseFilterArgList()
+    {
+        var args = new List<IExpression>();
+        if (CurrentIs(JinjaTokenType.RightParen))
+            return args;
+        while (true)
+        {
+            if (CurrentIs(JinjaTokenType.Identifier) && PeekIs(1, JinjaTokenType.Assign))
+            {
+                string name = (string)Current().Value!;
+                Advance(); Advance();
+                args.Add(new KwArgExpr(name, ParseExpression()));
+            }
+            else
+                args.Add(ParseExpression());
+            if (!CurrentIs(JinjaTokenType.Comma))
+                break;
+            Advance();
+            if (CurrentIs(JinjaTokenType.RightParen))
+                break; // trailing comma
+        }
+        return args;
     }
 
     private List<IExpression> ParseArgList()

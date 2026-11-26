@@ -269,7 +269,6 @@ public sealed class Inkling2OpsTests
         Assert.Equal(100, cfg.VocabSize);                    // logits width = tokenizer vocabulary
         Assert.Equal(104, cfg.Inkling2!.PaddedVocabSize);    // embedding / output rows
         Assert.Equal(3, cfg.Inkling2.LoopPasses);
-        Assert.Equal(6 + 2 * 6 + 0, cfg.Inkling2.CacheSlots(12) - 0 - 0 + 0 - 12 + 6 - 6 + 6 - 6 + 0);  // 12 + 2*6 = 24 cache slots
         Assert.Equal(24, cfg.Inkling2.CacheSlots(12));
         Assert.True(cfg.Inkling2.IsLocalLayer[0]); Assert.False(cfg.Inkling2.IsLocalLayer[5]);
     }

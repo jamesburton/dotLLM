@@ -128,3 +128,42 @@ neither a KL below ~4e-3 nor free-running greedy identity is a meaningful bar ag
   `target_layer_ids = [5, 23, 41, 48]` counted in **layer visits** (the target exposes the input of visit `n` and the final norm output as id 48: `res->t_layer_inp[visit]` in `inkling2-loop.cpp`). The CPU model keeps the trace hook points
   (`pass{n}.l{ip}`, `result_norm`) where those features would be tapped.
 - Vulkan / CUDA text decoders (NVFP4 expert kernels must read the blocks in place), optimisation, llama.cpp Vulkan comparison.
+
+## 10. Results (CPU reference vs llama.cpp b12780 CPU, `Inkling-2-Mini-NVFP4.gguf`, Strix Halo, 2026-11-26)
+
+Gate (`Inkling2RealModelTests`, 254 scored positions; dotLLM sub-chunks the prefill by 32 tokens, so carried KV/conv state is exercised; chunk size does not change the KL with F32 state):
+
+| arm | mean KL | max KL | top-1 | teacher-forced greedy mismatches (of 384) |
+|---|---|---|---|---|
+| dotLLM vs llama.cpp `-fa off` (the F32-mask oracle; the gate) | **3.96e-3** | 6.6e-2 | 98.8% | 6 (0 of 345 at oracle margin >= 0.3; the six are at margins 0.015-0.141) |
+| dotLLM vs llama.cpp default (flash attention on) | 5.39e-3 | 3.1e-1 | 98.0% | — |
+| llama.cpp `-fa on` vs `-fa off` (its own noise floor) | 4.05e-3 | 1.9e-1 | 99.2% | greedy diverges on 2 of 8 prompts |
+
+Free-running greedy prefix identity vs the `-fa off` oracle (of 48 tokens, 8 prompts): 10 / 3 / 48 / 48 / 48 / 27 / 12 / 48; every divergence is at an oracle top-1/top-2 margin below 0.15.
+
+**Mutants** (same gate, unmutated mean KL 3.96e-3; all killed except one that cannot be observed on this passage):
+
+| mutant | mean KL | top-1 |
+|---|---|---|
+| 2 loop passes instead of 3 | 0.632 | 69.7% |
+| no final logit softcap | 2.310 | 98.8% (KL is the signal here: top-1 alone would miss it) |
+| attention sink = 0 | 0.378 | 73.6% |
+| no relative-position bias | 4.864 | 14.2% |
+| NVFP4 per-expert `.scale` ignored | 12.95 | 2.0% |
+| loop controllers off (no messages) | 1.019 | 64.6% |
+| **no log scaling** | 3.96e-3 (identical) | 98.8% — **survives**: the factor is exactly 1 below position 8191 and the passage has 256 tokens. Pinned at op level (`Inkling2OpsTests.LogScale_*`); a >8K-token oracle run would be needed to observe it end to end |
+
+**Loop-controller storage (user ruling pending).** Same gate; bytes are the stored size of `loop_msg_query` + 12 layers x 4 x (`down` 4608x64, `gain` 64x2304, `forget` 64x2304):
+
+| storage | bytes | mean KL | max KL | top-1 | teacher-forced mismatches | free-running prefixes |
+|---|---|---|---|---|---|---|
+| F32 (GGUF, in place) | 113.7 MB | 3.96e-3 | 6.6e-2 | 98.8% | 6 | 10/3/48/48/48/27/12/48 |
+| Q8_0 | 30.2 MB | 3.52e-3 | 6.9e-2 | 98.8% | 6 | 7/3/48/48/48/27/48/48 |
+| F16 | 56.8 MB | 3.55e-3 | 7.6e-2 | 98.4% | 5 | 10/18/48/48/48/27/12/48 |
+| BF16 | 56.8 MB | 3.37e-3 | 6.9e-2 | 99.2% | 4 | 10/18/48/48/48/27/48/48 |
+
+The four are indistinguishable at this resolution (differences of 5e-4 in KL are below the oracle noise floor; no mismatch at a confident margin in any arm). Q8_0 saves 83.5 MB.
+
+**Conv-state storage** (3.8 MB at F32 for all 48 slots; the sweep is only meaningful because the harness carries state across calls): F32 3.96e-3 / max 6.6e-2; **BF16 3.91e-3 / max 0.11** (4 mismatches, 0 confident); **F16 5.65e-3 / max 0.24, top-1 97.6%** — F16 is visibly worse than BF16 (a value range the 5-bit exponent cannot hold), BF16 is on par with F32 on mean KL.
+
+**Throughput** (32 threads, `cpu-bench` lock held, NVFP4 file, F32 conv state; one measurement, llama.cpp b12780 CPU measures ~10.5 tok/s decode on the same file): prefill 128 tokens 21.4 tok/s, decode 9.1 tok/s (110 ms/token). Not tuned: attention, depth mixing and the convs are scalar loops, MoE is bucketed per expert.
