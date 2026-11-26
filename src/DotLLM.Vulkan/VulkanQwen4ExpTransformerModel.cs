@@ -505,6 +505,15 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
             }
         }
         catch { result?.Dispose(); last?.Dispose(); throw; }
+        if (mtp is not null)
+        {
+            // The last chunk's absorb left the captured rows (and the queued seed) indexed within that chunk: rebase them onto the whole call, so
+            // SeedFromCapturedRow / CapturedRowCount mean the same as after a one-shot forward (rows of earlier chunks are not kept and still refuse).
+            int a0 = (total - 1) / cap * cap;
+            mtp.CapturedFirst += a0;
+            mtp.CapturedTotal += a0;
+            if (mtp.PendingSeedRow >= 0) mtp.PendingSeedRow += a0;
+        }
         return wantAll ? result! : last!;
     }
 

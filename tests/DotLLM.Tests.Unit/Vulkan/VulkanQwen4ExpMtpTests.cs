@@ -282,6 +282,7 @@ public sealed class VulkanQwen4ExpMtpTests : IDisposable
             using var st = (VulkanQwen4ExpMtpState)rig.Vk.CreateMtpState(96)!;
             float[] last = Rows(rig.Vk.Forward(ids, Pos(T), -1, kv, null, st, true));
             int cells = st.CellCount;   // before the draft step adds its own cell
+            Assert.Equal(T, st.CapturedRowCount);   // captured rows are indexed over the whole call, not the last chunk
             float[] draft = Rows(rig.Vk.ForwardMtp(st, Argmax(last), T));
             return (last, draft, cells);
         }
