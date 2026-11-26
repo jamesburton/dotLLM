@@ -572,7 +572,7 @@ public sealed class VulkanEdge0LatentKernelTests
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
-        using var wide = Edge0WideGemvKernel.TryCreate(device, spvDir, f16Input);
+        using var wide = Edge0WideGemvKernel.TryCreate(device, spvDir, f16Input, rowsPerWorkgroup: f16Input ? 2 : 4);   // the production NR per variant
         using var f32 = MatMulQ8_0GemvMultiKernel.TryCreate(device, spvDir);
         Skip.If(wide is null || f32 is null, "wide GEMV unavailable");
         const int m = 203, kk = 224;   // M not a multiple of NR (partial last workgroup), K not a multiple of the 64-lane window

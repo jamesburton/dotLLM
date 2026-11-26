@@ -113,7 +113,7 @@ public sealed class Edge0LatentKernels : IDisposable
             }
             k._multiC16 = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir, f16Output: true);
             k._wideD = Edge0WideGemvKernel.TryCreate(device, spvDir, f16Input: false);
-            k._wideU = Edge0WideGemvKernel.TryCreate(device, spvDir, f16Input: true);
+            k._wideU = Edge0WideGemvKernel.TryCreate(device, spvDir, f16Input: true, rowsPerWorkgroup: 2);   // NR 2 beats 4 by 10-15% at U (#2004 bench); D stays at 4 (NR 2 is 1.7-2x slower there)
             k.IndexedQ3K = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.Q3_K);
             k.IndexedIq4Nl = MoeIndexedStridedMmvqKernel.TryCreate(device, spvDir, MoeIqQuant.IQ4_NL);
             if (MoeGroupedStridedCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.Q3_K) && MoeGroupedStridedCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.IQ4_NL))
