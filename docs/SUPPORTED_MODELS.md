@@ -51,8 +51,8 @@ draft model always runs on CPU. HIP is not rated here (see [HIP.md](HIP.md)). Pe
 | Model | Enum | CPU | CUDA | Vulkan | Notes |
 |---|---|---|---|---|---|
 | Meta Llama (also LLaDA) | `Llama` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA. Draft-model speculation, prompt lookup (CPU). Paged KV: CPU and CUDA, not Vulkan. Vulkan pipeline multi-GPU is library-only. CUDA prefill dequantizes most quants. CUDA draft speculation: `?` [1]. No MTP/DFlash. |
-| Mistral | `Mistral` | Highly-Optimised | Partially-Optimised | Partially-Optimised† | GQA, optional sliding window. No MTP/DFlash. CPU record is slow (ministral-3-14b, tg 0.94 tok/s). |
-| Phi | `Phi` | Highly-Optimised | Partially-Optimised | Partially-Optimised† | GQA. No real GGUF run found on CUDA or Vulkan (GPU evidence is safetensors, library path). CPU well behind llama.cpp in the recorded run. |
+| Mistral (GGUF `mistral` / `mistral3`, incl. Ministral-3) | `Mistral` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA, optional sliding window. Many Mistral-7B GGUFs declare `llama` and take the Llama row. CUDA refuses checkpoints with an attention temperature scale (Ministral-3). No MTP/DFlash. CPU and Vulkan records are ministral-3-14b on small hardware (Vulkan on Iris Xe) and are slow. |
+| Phi | `Phi` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA. Vulkan record is phi4-mini on Iris Xe ([perf matrix](../benchmarks/perf-matrix/results.csv)). No real GGUF run found on CUDA. CPU well behind llama.cpp in the recorded run. |
 | Qwen 2 / 2.5 / 3 (dense), incl. Qwen3-Embedding | `Qwen` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA, optional sliding window, QK-norm (Qwen3). CPU record is thin. No MTP/DFlash. |
 | DeepSeek (legacy, pre-V2) | `DeepSeek` | ? | ? | ? | Obsolete placeholder, untested. No backend loader was found refusing it, so it falls through to the dense host. Use V2/V3. |
 | DeepSeek-V2 (incl. GLM-4.7-Flash `deepseek2`) | `DeepSeekV2` | Partially-Optimised | Partially-Optimised | Partially-Optimised† | MLA + MoE. CPU expands Q/KV projections to F32. CUDA uses an expanded MLA cache and does not apply the YaRN ramp. Vulkan runs absorbed latent MLA when the K/V up-projections allow it, otherwise expanded F32. No pipeline multi-GPU. |
@@ -80,9 +80,9 @@ draft model always runs on CPU. HIP is not rated here (see [HIP.md](HIP.md)). Pe
 | Xiaomi MiMo-V2 / V2.5 / V2.6 | `MiMoV2` | Partially-Optimised† | None | Highly-Optimised | Sliding window + sinks, MoE, K/V head dims differ (CPU pads V to K width). MTP head ignored. |
 | Recursive Flint | `Flint` | Partially-Optimised† | Highly-Optimised | Highly-Optimised | Sliding + full (NoPE) layers, sinks, MoE. CUDA is Highly-Optimised for Q4_1, with CPU/GPU hybrid offload (needed on 12 GB). |
 | GLM-4.5 MoE (Air, REAP) | `Glm4Moe` | Partially-Optimised† | None | Highly-Optimised | GQA + MoE. No MTP. Vulkan decode behind llama.cpp. CPU: rejected as a draft model. |
-| Liquid LFM2 / LFM2-MoE | `Lfm2Moe` | Partially-Optimised† | Partially-Optimised | Highly-Optimised | Short-conv + GQA hybrid, MoE. LoRA on CPU only. No MTP/DFlash. CUDA evidence is synthetic. |
+| Liquid LFM2-MoE (GGUF `lfm2moe`) | `Lfm2Moe` | Partially-Optimised† | Partially-Optimised | Highly-Optimised | Short-conv + GQA hybrid, MoE. LoRA on CPU only. No MTP/DFlash. CUDA evidence is synthetic. |
 | Liquid LFM3 | `Lfm3` | Highly-Optimised | None | Highly-Optimised | Short-conv + sliding/global GQA. No recurrent snapshots on Vulkan. Draft / prompt-lookup speculation on CPU: `?` [3]. CPU prefill 0.28-0.41x llama.cpp. |
-| NVIDIA Ripple (ricursive) | `Ricursive` | None | None | None | Config and tokenizer only; no forward pass. |
+| ricursiveAI Ripple | `Ricursive` | None | None | None | Config and tokenizer only; no forward pass. |
 | OVHcloud Olala | `Olala` | Partially-Optimised† | None | Highly-Optimised | Mamba-3 MIMO + differential tensor-product attention + latent MoE. No MTP, paged KV or batching. CPU draft / prompt-lookup speculation: `?` [3]. |
 | Z.ai GLM-5.3-Flash (`glm5next`) | (none yet) | None | None | None | Planned. KDA linear attention + DSA sparse MLA. |
 | Gemma 4 MTP drafter | `Gemma4Assistant` | N/A | N/A | N/A (drafter) | Not a standalone model. Attaches to a Gemma 4 trunk on Vulkan only (limited validation); CPU and CUDA have no drafter support. Standalone CPU load is `?`. |
@@ -470,7 +470,7 @@ folded into the dense RoPE table on **CPU, Vulkan and CUDA** (angle = pos * thet
 Llama-3.2-1B Q8_0, ctx 4096, 3 chunks wikitext-2 LF: PPL 11.1899 (was 11.2205) vs llama.cpp CPU 11.1840.
 `mistral3.attention.temperature_scale` (Ministral-3) multiplies each post-RoPE query by
 `log(floor(pos / n_ctx_orig_yarn) + 1) * scale + 1` (`ModelConfig.AttnTemperatureAt`); implemented on CPU and
-Vulkan, **refused at load on CUDA** (needs a PTX rebuild on the CUDA box). Dense YaRN itself is still not applied on Vulkan.
+Vulkan, **refused at load on CUDA** (needs a PTX rebuild on the CUDA box). The generic Vulkan host still does not apply dense YaRN to these checkpoints (gpt-oss sets up its own YaRN table in `InitGptOss`).
 
 **No real-weight CUDA run yet.** All CUDA verification above is against
 synthetic fixtures. No `gpt-oss-20b-mxfp4.gguf` is present in
