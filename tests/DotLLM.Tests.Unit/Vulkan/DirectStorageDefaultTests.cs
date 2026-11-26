@@ -167,23 +167,31 @@ public class DirectStorageDefaultTests(ITestOutputHelper output)
         if (string.IsNullOrEmpty(model))
             model = DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path;
         Skip.If(model is null, "SmolLM-135M Q8_0 not found");
-        string cli = Path.Combine(AppContext.BaseDirectory, "DotLLM.Cli.exe");
-        Skip.IfNot(File.Exists(cli), "DotLLM.Cli.exe not in the test output");
+        Skip.IfNot(File.Exists(Path.Combine(AppContext.BaseDirectory, "DotLLM.Cli.exe")), "DotLLM.Cli.exe not in the test output");
 
-        string installDir = Path.Combine(Path.GetTempPath(), "dotllm-dsinst-" + Guid.NewGuid().ToString("N")[..8]);
-        Directory.CreateDirectory(installDir);
+        // The app directory is on the default DLL search path, so a copy of dstoragecore.dll there would mask the bug: run a copy of the CLI
+        // that has NO dstorage*.dll, with the pair only in a separate install directory and the CWD elsewhere (the CWD is searched too).
+        string root = Path.Combine(Path.GetTempPath(), "dotllm-dsinst-" + Guid.NewGuid().ToString("N")[..8]);
+        string appDir = Path.Combine(root, "app"), installDir = Path.Combine(root, "install"), cwd = Path.Combine(root, "cwd");
+        Directory.CreateDirectory(appDir); Directory.CreateDirectory(installDir); Directory.CreateDirectory(cwd);
         try
         {
+            foreach (string src in Directory.EnumerateFiles(AppContext.BaseDirectory, "*", SearchOption.AllDirectories))
+            {
+                if (Path.GetFileName(src).StartsWith("dstorage", StringComparison.OrdinalIgnoreCase)) continue;
+                string target = Path.Combine(appDir, Path.GetRelativePath(AppContext.BaseDirectory, src));
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                File.Copy(src, target);
+            }
             string srcDir = Path.GetDirectoryName(dll)!;
             File.Copy(Path.Combine(srcDir, "dstorage.dll"), Path.Combine(installDir, "dstorage.dll"));
             File.Copy(Path.Combine(srcDir, "dstoragecore.dll"), Path.Combine(installDir, "dstoragecore.dll"));
-            var psi = new System.Diagnostics.ProcessStartInfo(cli)
+            var psi = new System.Diagnostics.ProcessStartInfo(Path.Combine(appDir, "DotLLM.Cli.exe"))
             {
                 ArgumentList = { "run", model!, "-d", "vulkan", "-p", "Hello", "-n", "2", "-t", "0" },
-                RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, WorkingDirectory = installDir,
+                RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, WorkingDirectory = cwd,
             };
             psi.Environment["DOTLLM_DIRECTSTORAGE_DIR"] = installDir;
-            psi.Environment["DOTLLM_DIRECTSTORAGE_SKIP_APPDIR"] = "1";
             psi.Environment["DOTLLM_NO_PROMPT"] = "1";
             psi.Environment["DOTLLM_VULKAN_MEM_TRACE"] = "1";
             psi.Environment.Remove("DOTLLM_VULKAN_DIRECT_STORAGE");
@@ -201,6 +209,6 @@ public class DirectStorageDefaultTests(ITestOutputHelper output)
             Assert.Equal(0, int.Parse(m.Groups["s"].Value));
             Assert.DoesNotContain("DStorageGetFactory", log, StringComparison.Ordinal);
         }
-        finally { try { Directory.Delete(installDir, recursive: true); } catch (IOException) { } }
+        finally { try { Directory.Delete(root, recursive: true); } catch (IOException) { } }
     }
 }
