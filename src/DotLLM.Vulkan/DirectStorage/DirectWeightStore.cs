@@ -201,6 +201,24 @@ internal sealed unsafe class DirectWeightStore : IDisposable
         string? found = DirectStorageInstaller.FindDll();
         nint module = 0;
         // Full path, restricted search (own folder + System32): a dstorage.dll in the CWD or on PATH is never loaded.
+        // dstorage.dll does NOT import dstoragecore.dll: it LoadLibrary's it by bare name at DStorageGetFactory time, with the default search
+        // order. For a pair outside the application directory (the install dir after the NuGet fetch, DOTLLM_DIRECTSTORAGE_DIR) that fails and the
+        // factory returns E_NOTIMPL (0x80004001), so every tensor is declined (#1994 regression of the LoadLibraryEx change). Load the core by
+        // FULL PATH first, from the same directory: the later bare-name load then resolves to this already-mapped module, and no CWD/PATH search runs.
+        if (found is not null && !DirectStorageInstaller.PairVersionsMatch(Path.GetDirectoryName(found)!))
+        {
+            why = "dstorage_pair_version_mismatch";
+            return false;
+        }
+        if (found is not null)
+        {
+            string core = Path.Combine(Path.GetDirectoryName(found)!, "dstoragecore.dll");
+            if (!DirectStorageInstaller.TryLoad(core, out _))
+            {
+                why = "dstoragecore.dll_not_loadable";
+                return false;
+            }
+        }
         if (found is null || !DirectStorageInstaller.TryLoad(found, out module))
         {
             why = "dstorage.dll_not_found";
