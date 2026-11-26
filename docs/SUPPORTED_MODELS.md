@@ -51,7 +51,7 @@ draft model always runs on CPU. HIP is not rated here (see [HIP.md](HIP.md)). Pe
 | Model | Enum | CPU | CUDA | Vulkan | Notes |
 |---|---|---|---|---|---|
 | Meta Llama (also LLaDA) | `Llama` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA. Draft-model speculation, prompt lookup (CPU). Paged KV: CPU and CUDA, not Vulkan. Vulkan pipeline multi-GPU is library-only. CUDA prefill dequantizes most quants. CUDA draft speculation: `?` [1]. No MTP/DFlash. |
-| Mistral (GGUF `mistral` / `mistral3`, incl. Ministral-3) | `Mistral` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA, optional sliding window. Many Mistral-7B GGUFs declare `llama` and take the Llama row. CUDA refuses checkpoints with an attention temperature scale (Ministral-3). No MTP/DFlash. CPU and Vulkan records are ministral-3-14b on small hardware (Vulkan on Iris Xe) and are slow. |
+| Mistral (GGUF `mistral` / `mistral3`, incl. Ministral-3) | `Mistral` | Highly-Optimised | Partially-Optimised; Ministral-3: None | Highly-Optimised | GQA, optional sliding window. Many Mistral-7B GGUFs declare `llama` and take the Llama row. CUDA refuses checkpoints with an attention temperature scale (Ministral-3). No MTP/DFlash. CPU and Vulkan records are ministral-3-14b on small hardware (Vulkan on Iris Xe) and are slow. |
 | Phi | `Phi` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA. Vulkan record is phi4-mini on Iris Xe ([perf matrix](../benchmarks/perf-matrix/results.csv)). No real GGUF run found on CUDA. CPU well behind llama.cpp in the recorded run. |
 | Qwen 2 / 2.5 / 3 (dense), incl. Qwen3-Embedding | `Qwen` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA, optional sliding window, QK-norm (Qwen3). CPU record is thin. No MTP/DFlash. |
 | DeepSeek (legacy, pre-V2) | `DeepSeek` | ? | ? | ? | Obsolete placeholder, untested. No backend loader was found refusing it, so it falls through to the dense host. Use V2/V3. |
@@ -72,7 +72,7 @@ draft model always runs on CPU. HIP is not rated here (see [HIP.md](HIP.md)). Pe
 | Gemma 3n | `Gemma3n` | Basic | None | None | CPU safetensors only (no GGUF mapping), F32. Text only. CUDA has no implementation and no load refusal, so a library load is `?`. |
 | Gemma 4 (E2B / E4B / 26B) | `Gemma4` | Partially-Optimised | Basic | Highly-Optimised | Sliding window, shared KV, per-layer embeddings, MoE (26B). MTP drafter on Vulkan only. CPU dense PLE projections are F32. CUDA: only dense E2B/E4B usable; MoE has no KV cache. Vulkan record is dense E4B. |
 | DiffusionGemma | `DiffusionGemma` | Partially-Optimised | None | Partially-Optimised | Block (masked-canvas) diffusion. CUDA cannot run the non-causal mask. Vulkan is slow (0.29 tok/s on 26B). |
-| BitNet b1.58 | `BitNet` | Partially-Optimised† | Partially-Optimised | Highly-Optimised | Ternary I2_S, incl. ternary MoE. CUDA native decode, prefill dequantizes to F16. Vulkan figures are recorded in commit messages only. |
+| BitNet b1.58 | `BitNet` | Partially-Optimised† | Partially-Optimised | Highly-Optimised | Ternary I2_S, incl. ternary MoE. CUDA native decode, prefill dequantizes to F16. Vulkan record (gfx1151, BitNet 2B I2_S): pp512 ~278 to ~2230 tok/s, decode ~91 (1e3ca091). |
 | OpenAI gpt-oss | `GptOss` | Partially-Optimised | Basic | Highly-Optimised | Sliding/dense alternation, attention sinks, YaRN, MXFP4 MoE. CPU expert GEMV is per-token. CUDA dequantizes MXFP4 experts per call; synthetic evidence only. Vulkan record is prefill. |
 | IBM Granite (dense 3.x / 4.x) | `Granite` | Highly-Optimised | Partially-Optimised / Basic | Highly-Optimised | GQA with scalar multipliers. CUDA tier depends on the scalars: attention-only (e.g. TwIL-8B) takes the optimised path, full-scalar models the F32 forward. Vulkan deep decode is 0.41-0.87x llama.cpp; CPU prefill 0.45-0.66x. |
 | OLMo 2 | `Olmo2` | Partially-Optimised† | Basic | Partially-Optimised† | Whole-projection QK-norm. OLMo 3 is refused. |
@@ -80,7 +80,7 @@ draft model always runs on CPU. HIP is not rated here (see [HIP.md](HIP.md)). Pe
 | Xiaomi MiMo-V2 / V2.5 / V2.6 | `MiMoV2` | Partially-Optimised† | None | Highly-Optimised | Sliding window + sinks, MoE, K/V head dims differ (CPU pads V to K width). MTP head ignored. |
 | Recursive Flint | `Flint` | Partially-Optimised† | Highly-Optimised | Highly-Optimised | Sliding + full (NoPE) layers, sinks, MoE. CUDA is Highly-Optimised for Q4_1, with CPU/GPU hybrid offload (needed on 12 GB). |
 | GLM-4.5 MoE (Air, REAP) | `Glm4Moe` | Partially-Optimised† | None | Highly-Optimised | GQA + MoE. No MTP. Vulkan decode behind llama.cpp. CPU: rejected as a draft model. |
-| Liquid LFM2-MoE (GGUF `lfm2moe`) | `Lfm2Moe` | Partially-Optimised† | Partially-Optimised | Highly-Optimised | Short-conv + GQA hybrid, MoE. LoRA on CPU only. No MTP/DFlash. CUDA evidence is synthetic. |
+| Liquid LFM2-MoE (GGUF `lfm2moe`) | `Lfm2Moe` | Partially-Optimised† | Partially-Optimised | Highly-Optimised | Short-conv + GQA hybrid, MoE. Vulkan record (LFM2.5): tg 56 to 96, pp 1.0k to 2.0k tok/s (#1018, PR #1019). LoRA on CPU only. No MTP/DFlash. CUDA evidence is synthetic. |
 | Liquid LFM3 | `Lfm3` | Highly-Optimised | None | Highly-Optimised | Short-conv + sliding/global GQA. No recurrent snapshots on Vulkan. Draft / prompt-lookup speculation on CPU: `?` [3]. CPU prefill 0.28-0.41x llama.cpp. |
 | ricursiveAI Ripple | `Ricursive` | None | None | None | Config and tokenizer only; no forward pass. |
 | OVHcloud Olala | `Olala` | Partially-Optimised† | None | Highly-Optimised | Mamba-3 MIMO + differential tensor-product attention + latent MoE. No MTP, paged KV or batching. CPU draft / prompt-lookup speculation: `?` [3]. |
@@ -94,10 +94,10 @@ draft model always runs on CPU. HIP is not rated here (see [HIP.md](HIP.md)). Pe
 Suspected issues found by code reading, **not reproduced**:
 
 1. The dense CUDA host returns one row of logits (`CudaTransformerModel.MaxAllRowLogitsLength`), and draft-model
-   speculation does not appear to check that limit before reading one row per drafted token.
-2. For GGUF `qwen2moe`, the CPU quantized-expert path appears to load no shared-expert branch.
+   speculation does not appear to check that limit before reading one row per drafted token (#2030).
+2. For GGUF `qwen2moe`, the CPU quantized-expert path appears to load no shared-expert branch (#2031).
 3. Mamba-3, LFM3 and Olala have no recurrent-state checkpoint, and `SpeculativeDecoder` does not appear to guard
-   against them, so a rejected draft could leave state advanced.
+   against them, so a rejected draft could leave state advanced (#2032).
 
 ## Matrix
 
