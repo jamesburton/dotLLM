@@ -95,6 +95,8 @@ public sealed class MtpAdaptiveGate
     private double _plainMsPerToken, _mtpMsPerToken;
     private int _plainSamples, _mtpSamples;
     private int _sinceReprobe;
+    // True while the MTP arm holds only fall-back estimates (RecordFallback): the next real MTP segment replaces it instead of blending in.
+    private bool _mtpProvisional;
 
     /// <summary>
     /// Forgets every measurement (arms, re-probe schedule, cost model) and starts again from the size prior. The server calls this after its warm-up:
@@ -108,6 +110,7 @@ public sealed class MtpAdaptiveGate
             _plainMsPerToken = _mtpMsPerToken = 0;
             _plainSamples = _mtpSamples = 0;
             _sinceReprobe = 0;
+            _mtpProvisional = false;
             _reprobeEvery = ReprobeEvery;
             foreach (var b in _bands) b?.Reset();
         }
@@ -207,9 +210,12 @@ public sealed class MtpAdaptiveGate
     /// <see cref="RecordSegment"/> discarded that segment and the MTP arm stayed unmeasured. Every request then retried MTP, fell back again and paid
     /// the rounds again, forever (found on Edge0, #2018). The figure the controller decided on (the cost model's best-K ms per generated token, which
     /// excludes the cold first round) is the MTP sample instead.
+    /// <para>It is an estimate from a handful of rounds (one stall made one 700 ms), so it is provisional: the next real MTP segment
+    /// (<see cref="RecordSegment"/>) replaces it instead of blending in at the EMA weight. Blending would leave a 10x-plain estimate losing for nine
+    /// re-probes against real MTP at 0.6x plain, and the back-off would stretch those over some 2,900 requests.</para>
     /// </summary>
     /// <param name="msPerToken">The cost model's best predicted ms per generated token at the time of the fall-back.</param>
-    internal void RecordFallback(double msPerToken) => RecordSample(usedMtp: true, msPerToken);
+    internal void RecordFallback(double msPerToken) => RecordSample(usedMtp: true, msPerToken, provisional: true);
 
     /// <summary>True unless <c>DOTLLM_MTP_CALIBRATE</c> is <c>0</c>.</summary>
     public static bool CalibrationEnabled { get; } = Environment.GetEnvironmentVariable("DOTLLM_MTP_CALIBRATE") != "0";
@@ -230,14 +236,16 @@ public sealed class MtpAdaptiveGate
         RecordSample(usedMtp, decodeMs / decodeTokens);
     }
 
-    private void RecordSample(bool usedMtp, double perToken)
+    private void RecordSample(bool usedMtp, double perToken, bool provisional = false)
     {
         if (perToken <= 0) return;
         lock (_lock)
         {
             if (usedMtp)
             {
-                _mtpMsPerToken = _mtpSamples == 0 ? perToken : _mtpMsPerToken + Alpha * (perToken - _mtpMsPerToken);
+                bool replace = _mtpSamples == 0 || (_mtpProvisional && !provisional);
+                _mtpMsPerToken = replace ? perToken : _mtpMsPerToken + Alpha * (perToken - _mtpMsPerToken);
+                _mtpProvisional = provisional && (_mtpSamples == 0 || _mtpProvisional);
                 _mtpSamples++;
             }
             else

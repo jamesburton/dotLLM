@@ -75,7 +75,9 @@ public sealed class TextGeneratorMtpGateTests : IDisposable
         gen.MtpGate!.RecordSegment(usedMtp: false, decodeTokens: 40, decodeMs: 40 * 2.0);
         var first = gen.Generate("p", Greedy(64));
         Assert.True(first.Timings.SpeculativeDraftTokens > 0, "the first request must have tried MTP");
-        Assert.True(first.Timings.SpeculativeAcceptedTokens < MtpAdaptiveGate.MinSampleTokens, "premise: the fall-back segment is below the sample minimum");
+        // Committed MTP tokens = accepted drafts + one target token per round (accepted alone is always 0 with drafts that never match).
+        Assert.True(first.Timings.SpeculativeAcceptedTokens + first.Timings.SpeculativeSteps < MtpAdaptiveGate.MinSampleTokens,
+            "premise: the fall-back segment is below the sample minimum");
 
         Assert.True(gen.MtpGate.MtpMsPerToken > gen.MtpGate.PlainMsPerToken, "the measured loss must be recorded for the MTP arm");
         for (int i = 0; i < 4; i++)
@@ -101,6 +103,110 @@ public sealed class TextGeneratorMtpGateTests : IDisposable
         Assert.True(shortBand.ShouldUseMtp(64));
         gate.Reset();
         Assert.Equal(0, longBand.PlainMsPerToken);
+    }
+
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(512, 0)]
+    [InlineData(513, 1)]
+    [InlineData(1024, 1)]
+    [InlineData(1025, 2)]
+    [InlineData(2048, 2)]
+    [InlineData(2049, 3)]
+    [InlineData(16384, 5)]
+    [InlineData(16385, 6)]
+    [InlineData(int.MaxValue, MtpAdaptiveGate.ContextBands - 1)]
+    public void ContextBands_SplitAtEachDoublingAbove512(int promptTokens, int band)
+        => Assert.Equal(band, MtpAdaptiveGate.BandOf(promptTokens));
+
+    [Fact]
+    public void ALongContextBand_KeepsTheModelSizePrior()
+    {
+        // A band is a fresh gate: its first request must follow the same size prior as band 0 (a small model explores plain first).
+        Assert.False(new MtpAdaptiveGate(1L << 30).ForContext(2400).ShouldUseMtp(64));
+        Assert.True(new MtpAdaptiveGate(8L << 30).ForContext(2400).ShouldUseMtp(64));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ALongPromptFallBack_IsRecordedInItsOwnBand_AndShortPromptsStillTryMtp(bool streaming)
+    {
+        // Wiring of ForContext and RecordFallback into both decode loops: the loss of a 600-token prompt must land in band 1, not in the gate.
+        const int PromptTokens = 600;
+        using var model = new MtpSpeculativeDecoderTests.MockMtpModel(Next, t => (Next(t) + 4) % 14 + 2, supportsMtp: true)
+        {
+            ComputeMemoryBytes = 8L << 30,
+            MaxSequenceLength = 1024,
+            OnTrunkForward = rows => Spin(rows == 1 ? 2 : 6 + 6 * rows),
+            OnDraftStep = () => Spin(1),
+        };
+        var gen = new TextGenerator(model, new Tok(PromptTokens), mtpEnabled: true, mtpAdaptive: true, speculativeCandidates: 3);
+        var band = gen.MtpGate!.ForContext(PromptTokens);
+        Assert.NotSame(gen.MtpGate, band);
+        band.RecordSegment(usedMtp: false, decodeTokens: 40, decodeMs: 40 * 2.0);
+
+        InferenceTimings timings;
+        if (streaming)
+        {
+            InferenceTimings? last = null;
+            await foreach (var token in gen.GenerateStreamingTokensAsync("p", Greedy(64)))
+                last = token.Timings ?? last;
+            timings = last!.Value;
+        }
+        else
+            timings = gen.Generate("p", Greedy(64)).Timings;
+
+        Assert.True(timings.SpeculativeDraftTokens > 0, "the request must have tried MTP");
+        Assert.True(band.MtpMsPerToken > band.PlainMsPerToken, "the fall-back must be recorded in the prompt's own band");
+        Assert.Equal(0, gen.MtpGate.MtpMsPerToken);
+        Assert.Equal(0, gen.MtpGate.PlainMsPerToken);
+        Assert.True(gen.MtpGate.ShouldUseMtp(64), "short prompts are not charged the long prompt's loss");
+    }
+
+    [Fact]
+    public void AFallBackEstimate_IsReplacedByTheNextRealMtpSegment_NotBlendedIn()
+    {
+        // A fall-back sample is an estimate from a few rounds (a stall once made one 700 ms). Blended at the EMA weight, a 10x-plain estimate would
+        // keep losing for nine re-probes against real MTP at 0.6x plain, which the back-off stretches over about 2,900 requests.
+        var gate = new MtpAdaptiveGate(8L << 30);
+        gate.RecordSegment(usedMtp: false, decodeTokens: 40, decodeMs: 40 * 10.0);
+        gate.RecordFallback(100);
+        int decisions = 1;
+        while (!gate.ShouldUseMtp(64)) decisions++;
+        Assert.InRange(decisions, 1, MtpAdaptiveGate.ReprobeEvery);
+        gate.RecordSegment(usedMtp: true, decodeTokens: 40, decodeMs: 40 * 6.0);
+        Assert.Equal(6.0, gate.MtpMsPerToken, 6);
+        Assert.True(gate.ShouldUseMtp(64), "after one real segment MTP wins again");
+
+        // A measured arm is not overwritten: a later fall-back estimate blends, and so does the real segment after it.
+        gate.RecordFallback(100);
+        Assert.Equal(6.0 + 0.3 * 94.0, gate.MtpMsPerToken, 6);
+        gate.RecordSegment(usedMtp: true, decodeTokens: 40, decodeMs: 40 * 6.0);
+        Assert.True(gate.MtpMsPerToken > 6.0 + 1e-6, "a real sample replaces only a purely estimated arm");
+    }
+
+    [Fact]
+    public void ALateFallBack_RecordsOnlyTheFallBackFigure_NotTheRequestsEarlierFastRounds()
+    {
+        // Rounds win for 8 verifies (4 tokens for 17 ms against 20 ms per plain token), then cost 400 ms: the request falls back with ~36 MTP tokens
+        // committed. That segment's average (fast rounds included) says MTP wins, which would contradict the fall-back just taken.
+        int verifies = 0;
+        using var model = new MtpSpeculativeDecoderTests.MockMtpModel(Next, Next, supportsMtp: true)
+        {
+            ComputeMemoryBytes = 8L << 30,
+            OnTrunkForward = rows => Spin(rows == 1 ? 20 : ++verifies > 8 ? 400 : 6 + 2 * rows),
+            OnDraftStep = () => Spin(1),
+        };
+        var gen = new TextGenerator(model, new Tok(), mtpEnabled: true, mtpAdaptive: true, speculativeCandidates: 3);
+        gen.MtpGate!.RecordSegment(usedMtp: false, decodeTokens: 40, decodeMs: 40 * 20.0);
+        var resp = gen.Generate("p", Greedy(128));
+
+        Assert.True(resp.Timings.SpeculativeAcceptedTokens + resp.Timings.SpeculativeSteps >= MtpAdaptiveGate.MinSampleTokens,
+            "premise: the MTP segment is long enough to be a sample of its own");
+        Assert.True(model.TrunkForwardCount > 40, "premise: the request fell back to plain decode");
+        Assert.True(gen.MtpGate.MtpMsPerToken > gen.MtpGate.PlainMsPerToken, "the gate must keep the loss the request fell back on");
+        Assert.Matches(@"mtp [\d.,]+ ms/tok \(n=1\)", gen.MtpGate.Describe());
     }
 
     [Fact]
@@ -242,12 +348,13 @@ public sealed class TextGeneratorMtpGateTests : IDisposable
         Assert.True(gen.MtpGate.ShouldUseMtp(64), "after warm-up the first real request must follow the size prior (MTP first)");
     }
 
-    private sealed class Tok : ITokenizer
+    /// <param name="promptTokens">Length of every encoded prompt (the context-band tests need prompts above <see cref="MtpAdaptiveGate.ShortContextTokens"/>).</param>
+    private sealed class Tok(int promptTokens = 1) : ITokenizer
     {
         public int VocabSize => Vocab;
         public int BosTokenId => 1;
         public int EosTokenId => 15;
-        public int[] Encode(string text) => [3];
+        public int[] Encode(string text) => Enumerable.Repeat(3, promptTokens).ToArray();
         public string Decode(ReadOnlySpan<int> tokenIds)
         {
             var sb = new StringBuilder();
