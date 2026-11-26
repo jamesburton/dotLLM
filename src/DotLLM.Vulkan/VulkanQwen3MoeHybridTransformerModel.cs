@@ -3515,6 +3515,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel, IVulk
         FreeEdge0Scratch();
         _edge0Kernels?.Dispose();
         _mtpPlanar?.Dispose();
+        _draftRows?.Dispose();
         _moeUnitScale?.Dispose();
         _state.Dispose();
         _weights.Dispose();

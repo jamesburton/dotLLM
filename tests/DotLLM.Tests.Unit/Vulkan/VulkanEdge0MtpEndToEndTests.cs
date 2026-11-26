@@ -281,6 +281,47 @@ public sealed class VulkanEdge0MtpEndToEndTests(ITestOutputHelper output)
             if (acc == 0) failures.Add("long context: no draft accepted");
         }
 
+        // ── 2c. draft-vocab subset vs full-vocab drafting (#2013), interleaved in one session. DOTLLM_EDGE0_MTP_DRAFTVOCAB=1 (SPEED=0 skips the plain speed run after it) ──
+        if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_MTP_DRAFTVOCAB") == "1")
+        {
+            Assert.True(vk.HasDraftVocabSubset, "the Edge0 head attached no draft-vocab subset (LM head not Q8_0, or matmul_q8_0_mmvq_rows.spv missing)");
+            int nIds = (int)(new FileInfo(Path.Combine(Edge0MtpPack.Find(Path.GetDirectoryName(fx.Path!)!)!, "draft_vocab.bin")).Length / 4);
+            const int rowBytes = 2560 / 32 * 34;
+            output.WriteLine($"DRAFTVOCAB LM-head bytes per draft step: full {(long)V * rowBytes / 1e6:F1} MB ({V} rows), subset {(long)nIds * rowBytes / 1e6:F1} MB ({nIds} rows) + ids {nIds * 4 / 1e3:F0} KB; logits download {V * 4 / 1e3:F0} KB -> {nIds * 4 / 1e3:F0} KB");
+            Speculate(prompts[1], 16, 3);   // warm
+            foreach (int k in new[] { 3, 4 })
+            {
+                var steps = new double[2]; var ms = new double[2]; var tps = new List<double>[] { new(), new() };
+                int[] acc = new int[2], drafted = new int[2];
+                int identicalRuns = 0, sameDecisions = 0, sameDecisionsSameText = 0, runs = 0;
+                for (int rep = 0; rep < 3; rep++)
+                    for (int p = 0; p < prompts.Length; p++)
+                    {
+                        var res = new (List<int> T, List<int> R, double S)[2];
+                        for (int arm = 0; arm < 2; arm++)   // arm 0 = full vocabulary, arm 1 = subset; the order alternates per rep so neither owns the cold side
+                        {
+                            int a = (arm + rep) % 2;
+                            VulkanQwen4ExpTransformerModel.Edge0DraftVocabEnabled = a == 1;
+                            vk.ResetMtpTimings();
+                            var (t, per, secs) = Speculate(prompts[p], N, k);
+                            var tm = vk.MtpTimings;
+                            ms[a] += tm.DraftMs; steps[a] += tm.DraftSteps;
+                            acc[a] += per.Sum() - per.Count; drafted[a] += per.Count * k;
+                            tps[a].Add(N / secs);
+                            res[a] = (t, per, secs);
+                        }
+                        runs++;
+                        if (res[0].T.SequenceEqual(res[1].T)) identicalRuns++;
+                        if (res[0].R.SequenceEqual(res[1].R)) { sameDecisions++; if (res[0].T.SequenceEqual(res[1].T)) sameDecisionsSameText++; }
+                    }
+                VulkanQwen4ExpTransformerModel.Edge0DraftVocabEnabled = true;
+                string F(List<double> v) => $"{v.Min():F1}-{v.Max():F1} (mean {v.Average():F1})";
+                output.WriteLine($"DRAFTVOCAB K={k}: draft step {ms[0] / steps[0]:F2} ms full vs {ms[1] / steps[1]:F2} ms subset; acceptance {100.0 * acc[0] / drafted[0]:F1}% full vs {100.0 * acc[1] / drafted[1]:F1}% subset; " +
+                                 $"decode tok/s incl. prefill full {F(tps[0])} vs subset {F(tps[1])}; identical text {identicalRuns}/{runs}, identical accept decisions {sameDecisions}/{runs} of which identical text {sameDecisionsSameText}");
+                Assert.Equal(sameDecisions, sameDecisionsSameText);   // verify decides every token: the same decisions must give the same text
+            }
+        }
+
         // ── 3. speed, interleaved in one session (group skipping on); DOTLLM_EDGE0_MTP_SPEED=0 skips it ──
         if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_MTP_SPEED") == "0") { Assert.True(failures.Count == 0, string.Join("; ", failures)); return; }
         VulkanQwen3MoeHybridTransformerModel.Edge0SkipUnusedGroups = true;

@@ -44,6 +44,19 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
 
     private float[]? _mtpLogits;
 
+    /// <summary>
+    /// Edge0 draft steps score only the pack's draft vocabulary (<c>draft_vocab.bin</c>, 106,299 of 248,320 rows of the Q8_0 LM head, read in place) and map the argmax back to the
+    /// full vocabulary (#2013). Verify is unchanged, so the text cannot change; only the drafts do. <c>DOTLLM_EDGE0_DRAFT_VOCAB=0</c> at startup (or setting this) drafts over the full vocabulary (A/B).
+    /// Applies to the arg-max draft path; <see cref="ForwardMtp"/> always returns the full logit row.
+    /// </summary>
+    public static bool Edge0DraftVocabEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_EDGE0_DRAFT_VOCAB") != "0";
+
+    /// <summary>Test / proof hook: draft steps that scored the vocabulary subset.</summary>
+    internal long SubsetDraftSteps;
+
+    /// <summary>Whether an Edge0 draft-vocab subset is attached (regardless of <see cref="Edge0DraftVocabEnabled"/>).</summary>
+    internal bool HasDraftVocabSubset => _mtp?.DraftVocab is not null;
+
     /// <summary>Env var selecting the MTP <c>hnorm</c> convention: <c>stream</c> (default) or <c>joint</c> (same as the CPU oracle).</summary>
     public const string HnormEnvVar = Qwen4ExpTransformerModel.HnormEnvVar;
 
@@ -85,6 +98,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         public required VulkanDevice.Buffer E, A, HN, B, Pair, RFront, RWork;
         public required List<nint> Owned;
         public GgufFile? OwnedFile;
+        /// <summary>Edge0 draft-vocab subset (#2013); null when the pack's LM head is not a Q8_0 matrix the row kernel reads, or the kernel is missing.</summary>
+        public Edge0DraftVocabHead? DraftVocab;
         /// <summary>Layer index of the head's attention block inside <see cref="Core"/> (0 for the real head's one-layer core).</summary>
         public int AttnLayer;
         /// <summary>Stand-in head (benchmarking): core, MoE bundle and GR weights belong to the trunk and are not disposed here.</summary>
@@ -92,6 +107,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
 
         public void Dispose()
         {
+            DraftVocab?.Dispose();
             if (SharedWithTrunk)
             {
                 EhEmb.Dispose(); EhHid.Dispose(); Enorm.Dispose(); Hnorm.Dispose();
@@ -297,6 +313,15 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 Pair = Scratch(AbsorbChunk * rowBytes), RFront = Scratch(AbsorbChunk * rowBytes), RWork = Scratch(AbsorbChunk * rowBytes),
                 Owned = owned, OwnedFile = ownsFile ? headFile : null,
             };
+            if (edge0Head is not null)
+            {
+                var w = _core.Q4Weights;
+                if (w.OutputDeviceQuantType == QuantizationType.Q8_0 && (w.OutputInputDim & 31) == 0 && _core.Q4AttachDraftRows(_spvDir))
+                {
+                    using var vstaging = VulkanStagingBuffer.Create(_device, 4L << 20);
+                    head.DraftVocab = Edge0DraftVocabHead.Create(_device, vstaging, edge0Head.DraftVocab);
+                }
+            }
             // The head's absorb chunk and the trunk's embedding gather / GR plumbing both run AbsorbChunk rows: size the trunk scratch up front.
             EnsureScratch(AbsorbChunk);
             if (_core.Q4EnsureCapacity(AbsorbChunk)) { _gr.InvalidateDescriptorCache(); _groupRms.InvalidateDescriptorCache(); _sigmoidGate.InvalidateDescriptorCache(); }
@@ -680,9 +705,17 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         Barrier();
         if ((skip & 16) == 0) RecordGrRead(cmd, h.HeadGr, h.RWork, tst.NormOutput, 1, inject: false);
         var w0 = _core.Q4Weights;
+        var sub = logits.IsEmpty && Edge0DraftVocabEnabled ? h.DraftVocab : null;   // the full row is wanted (ForwardMtp) -> no subset
+        bool subset = false;
         if ((skip & 2) == 0)
-            _core.Q4RecordMatmul(cmd, w0.OutputWeight, w0.OutputDeviceQuantType, tst.NormOutput, tst.Logits,
-                outputDim: w0.OutputOutputDim, inputDim: w0.OutputInputDim, seqLen: 1);
+        {
+            if (sub is not null)
+                subset = _core.Q4TryRecordMatmulRows(cmd, w0.OutputWeight, tst.NormOutput, sub.Logits, sub.IdsBuffer,
+                    m: sub.Ids.Length, k: w0.OutputInputDim, weightRows: w0.OutputOutputDim);
+            if (!subset)
+                _core.Q4RecordMatmul(cmd, w0.OutputWeight, w0.OutputDeviceQuantType, tst.NormOutput, tst.Logits,
+                    outputDim: w0.OutputOutputDim, inputDim: w0.OutputInputDim, seqLen: 1);
+        }
         KernelSupport.ComputeToHostBarrier(cmd);
         long tSub = System.Diagnostics.Stopwatch.GetTimestamp();
         submit.SubmitAndWait();
@@ -690,10 +723,20 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         st.MarkCovered(position);
         DraftSteps++;
 
-        _mtpLogits ??= new float[_vocab];
-        _device.Download(tst.Logits, _mtpLogits);
-        if (!logits.IsEmpty) _mtpLogits.AsSpan().CopyTo(logits);
-        int top = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)_mtpLogits);
+        int top;
+        if (subset)
+        {
+            SubsetDraftSteps++;
+            _device.Download(sub!.Logits, sub.Host);
+            top = Edge0DraftVocabHead.ArgMax(sub.Host, sub.Ids);
+        }
+        else
+        {
+            _mtpLogits ??= new float[_vocab];
+            _device.Download(tst.Logits, _mtpLogits);
+            if (!logits.IsEmpty) _mtpLogits.AsSpan().CopyTo(logits);
+            top = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)_mtpLogits);
+        }
         long tPf = System.Diagnostics.Stopwatch.GetTimestamp();
         _dRecTicks += tSub - td0;
         _dSubTicks += tDl - tSub;
