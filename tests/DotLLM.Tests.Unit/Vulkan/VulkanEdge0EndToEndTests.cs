@@ -41,6 +41,8 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
 
     private sealed record Run(int[] Ids, int[] RowArgmax, double MeanNll, float[] LastLogits, int[] Greedy, float[]? AllRows = null);
 
+    private static string LastChunkedPassMs = "";
+
     private static unsafe int Argmax(ReadOnlySpan<float> row) { int b = 0; for (int i = 1; i < row.Length; i++) if (row[i] > row[b]) b = i; return b; }
 
     private static unsafe Run Execute(IModel model, ReadOnlySpan<int> ids, bool nll, Action<int>? allRows)
@@ -58,14 +60,26 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
         {
             allRows?.Invoke(chunk);
             var acc = new List<float>(); vocab = 0;
-            for (int s0 = 0; s0 < ids.Length; s0 += chunk)
+            // Three timed passes (the first also warms every pipeline); the logits kept are the last pass's. Wall time per whole passage, ms.
+            var ms = new List<double>(); var msOff = new List<double>(); bool savedWide = VulkanQwen3MoeHybridTransformerModel.Edge0WideGemvEnabled;
+            for (int rep = 0; rep < 7; rep++)
             {
-                int n = Math.Min(chunk, ids.Length - s0);
-                using var part = model.Forward(ids.Slice(s0, n), pos.AsSpan(s0, n), 0);
-                if ((int)part.Shape[0] != n) throw new InvalidOperationException($"chunk forward returned {part.Shape[0]} logit rows for {n} tokens");
-                vocab = (int)part.Shape[1];
-                acc.AddRange(new ReadOnlySpan<float>((void*)part.DataPointer, n * vocab));
+                bool on = rep % 2 == 0;   // on off on off on off on: same-session interleaved A/B, the kept logits are the last (on) pass
+                VulkanQwen3MoeHybridTransformerModel.Edge0WideGemvEnabled = on && savedWide;
+                model.ResetSequenceState(); acc.Clear();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int s0 = 0; s0 < ids.Length; s0 += chunk)
+                {
+                    int n = Math.Min(chunk, ids.Length - s0);
+                    using var part = model.Forward(ids.Slice(s0, n), pos.AsSpan(s0, n), 0);
+                    if ((int)part.Shape[0] != n) throw new InvalidOperationException($"chunk forward returned {part.Shape[0]} logit rows for {n} tokens");
+                    vocab = (int)part.Shape[1];
+                    acc.AddRange(new ReadOnlySpan<float>((void*)part.DataPointer, n * vocab));
+                }
+                (on ? ms : msOff).Add(sw.Elapsed.TotalMilliseconds);
             }
+            VulkanQwen3MoeHybridTransformerModel.Edge0WideGemvEnabled = savedWide;
+            LastChunkedPassMs = $"wide-on {string.Join(" / ", ms.Select(v => v.ToString("F0")))}; wide-off(GEMM) {string.Join(" / ", msOff.Select(v => v.ToString("F0")))}";
             rows = ids.Length;
             l = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(acc);
         }
@@ -292,6 +306,7 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
                 if (rk.Mean >= 6.0e-3) failures.Add($"passage mean row KL {rk.Mean:E3} (gate < 6.0e-3)");
                 if (rk.Max >= 9.0e-2) failures.Add($"passage max row KL {rk.Max:E3} (gate < 9.0e-2)");
                 if (rowAgree < 100) failures.Add($"passage row argmax {rowAgree}/{c.RowArgmax.Length} (gate >= 100)");
+                if (LastChunkedPassMs.Length > 0) output.WriteLine($"  CHUNKED passage {Environment.GetEnvironmentVariable("DOTLLM_EDGE0_CHUNK")} rows/forward, passage ms {LastChunkedPassMs}; wide dispatches so far {vk.Edge0WideDispatchesForTest}");
                 output.WriteLine($"  passage teacher-forced: mean row KL {rk.Mean:E3}, max {rk.Max:E3}, row argmax {rowAgree}/{c.RowArgmax.Length}, top rows {LastRowKlTop}");
             }
             else
