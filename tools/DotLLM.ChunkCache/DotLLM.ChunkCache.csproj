@@ -39,11 +39,14 @@
   <!-- The tool bundles DotLLM.ChunkCache.Client.dll, which is MIT: its licence travels with every copy (see NOTICE). -->
   <ItemGroup>
     <None Include="..\..\src\DotLLM.ChunkCache.Client\LICENSE" Pack="true" PackagePath="THIRD-PARTY-NOTICES/DotLLM.ChunkCache.Client" Visible="false" />
-    <None Include="..\..\NOTICE" Pack="true" PackagePath="\" Visible="false" />
+    <!-- NOTICE itself is packed into every package by the root Directory.Build.props. -->
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
   </ItemGroup>
+
+  <!-- THIRD-PARTY-NOTICES.txt in the publish output (and so in the tool package and release archives): #1964. -->
+  <Import Project="..\..\build\ThirdPartyNotices.targets" />
 
 </Project>

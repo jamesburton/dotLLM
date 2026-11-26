@@ -73,7 +73,24 @@ repo variable names: `CHUNKCACHE_TOOL_PACKAGE_ID` (the tool; also renames the pa
 `DOTLLM_TOOL_PACKAGE_ID`. Every push to `dev` creates a `0.3.0-dev.<n>` prerelease and publishes each package whose variable is
 set, so set the variables only once the PRs are merged. Run it with `dnx dotllm-chunkcache --prerelease -- mcp --help`.
 The tool bundles the MIT client, so its nupkg carries the client licence at `THIRD-PARTY-NOTICES/DotLLM.ChunkCache.Client/LICENSE`
-and the repository `NOTICE` (the client is the repository's one MIT exception). Other bundled dependencies' notices: #1964.
+and the repository `NOTICE` (the client is the repository's one MIT exception).
+
+**Third-party notices (#1964).** Every shipped executable carries a generated `THIRD-PARTY-NOTICES.txt`: the `dotllm` and
+`chunkcache` tool packages (in `tools/<tfm>/any/`), and the single-file, AOT and tray release archives (beside the executable;
+the tray's as `THIRD-PARTY-NOTICES-tray.txt`). `build/ThirdPartyNotices.targets`, imported by those three projects, writes it at
+publish time (a tool pack runs publish) from the NuGet packages actually copied into the output, each with its licence text
+and any notice files it ships, plus, for a self-contained publish, the .NET runtime packs' `LICENSE` and `THIRD-PARTY-NOTICES`.
+It is generated, not checked in, so a dependency bump cannot leave it stale. The build fails for a package whose licence it
+cannot reproduce: an expression other than MIT or Apache-2.0 with no licence file in the package. Add that licence's text
+under `build/licenses/` and map it in the targets. Library packages reference their dependencies rather than bundling them,
+so they carry no notices file. DirectStorage is not redistributed (`DotLLMBundleDirectStorage=false` in `release.yml`).
+
+Code ported or copied INTO dotLLM's own assemblies and kernels (`ptx/`, `spv/`) is not a package, so no generated list can
+find it: the repository `NOTICE` covers it, with the MIT licences of llama.cpp / ggml (including the PrismML fork) and
+tiktoken. `NOTICE` is packed into every nupkg (root `Directory.Build.props`), copied into every release archive, and appended
+to every generated `THIRD-PARTY-NOTICES.txt`. When porting from another upstream, add it to `NOTICE` with its licence. CI's
+Release build job packs both tools and publishes one self-contained CLI, so a notices failure shows on the PR, not first on the
+post-merge dev release.
 
 Availability checked on nuget.org on 2026-10-05:
 

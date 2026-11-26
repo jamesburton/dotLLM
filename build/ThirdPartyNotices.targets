@@ -1,0 +1,247 @@
+<Project>
+  <!--
+    THIRD-PARTY-NOTICES.txt for a shipped executable (#1964).
+
+    Imported by the projects whose output bundles third-party binaries: the dotllm CLI (dotnet tool + single-file
+    release archives), the chunkcache tool and the Windows tray. At publish time (which `dotnet pack` of a PackAsTool
+    project also runs) it writes THIRD-PARTY-NOTICES.txt into the publish output from what is actually copied there:
+      * every NuGet package with a runtime, native or resource asset in the output (RuntimeCopyLocalItems,
+        NativeCopyLocalItems, ResourceCopyLocalItems), with its licence text and any notice files it ships;
+      * for a self-contained publish, every runtime pack (the .NET runtime, ASP.NET Core, Windows Desktop), with the
+        LICENSE and THIRD-PARTY-NOTICES files the pack ships.
+    It is generated rather than checked in so it cannot go stale on a dependency bump, and it fails the build for a
+    package whose licence it cannot reproduce (an expression other than MIT / Apache-2.0 with no licence file in the
+    package): a missing notice is a licence violation, so it never degrades silently.
+    Our own projects (DotLLM.*) are not listed as packages: they are this repository (GPL-3.0-only; the MIT client is in NOTICE).
+    Code ported or copied INTO them (llama.cpp / ggml, tiktoken) is covered by the repository NOTICE, which is always appended.
+  -->
+
+  <PropertyGroup>
+    <ThirdPartyNoticesFileName Condition="'$(ThirdPartyNoticesFileName)' == ''">THIRD-PARTY-NOTICES.txt</ThirdPartyNoticesFileName>
+    <ThirdPartyNoticesProduct Condition="'$(ThirdPartyNoticesProduct)' == ''">$(ToolCommandName)</ThirdPartyNoticesProduct>
+    <ThirdPartyNoticesProduct Condition="'$(ThirdPartyNoticesProduct)' == ''">$(AssemblyName)</ThirdPartyNoticesProduct>
+  </PropertyGroup>
+
+  <UsingTask TaskName="DotLLMGenerateThirdPartyNotices" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Packages ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
+      <RuntimePacks ParameterType="Microsoft.Build.Framework.ITaskItem[]" />
+      <Frameworks ParameterType="Microsoft.Build.Framework.ITaskItem[]" />
+      <SelfContained ParameterType="System.String" />
+      <PackageRoot ParameterType="System.String" Required="true" />
+      <LicenseTemplateDir ParameterType="System.String" Required="true" />
+      <Product ParameterType="System.String" Required="true" />
+      <OutputFile ParameterType="System.String" Required="true" />
+      <RepositoryNotice ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.Collections.Generic" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Linq" />
+      <Using Namespace="System.Text" />
+      <Using Namespace="System.Text.RegularExpressions" />
+      <Using Namespace="System.Xml.Linq" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var rule = new string('=', 100);
+        var sb = new StringBuilder();
+        sb.AppendLine(Product + " - third-party notices");
+        sb.AppendLine();
+        sb.AppendLine(Product + " is part of dotLLM, licensed under GPL-3.0-only (see LICENSE and NOTICE in the repository).");
+        sb.AppendLine("It includes the third-party components below, each under its own licence, reproduced in full.");
+        sb.AppendLine();
+
+        var licenceFile = new Regex(@"^licen[cs]e(\.(txt|md))?$", RegexOptions.IgnoreCase);
+        var noticeFile = new Regex(@"^(third-?party-?notices|thirdpartynotices|notice)(\.(txt|md|rtf))?$", RegexOptions.IgnoreCase);
+
+        // Top-level files plus a notices/ folder (Microsoft.Build.Framework ships notices/THIRDPARTYNOTICES.txt).
+        Func<string, Regex, List<string>> find = (dir, re) =>
+        {
+            var found = Directory.GetFiles(dir).Where(f => re.IsMatch(Path.GetFileName(f))).ToList();
+            var sub = Path.Combine(dir, "notices");
+            if (Directory.Exists(sub)) found.AddRange(Directory.GetFiles(sub).Where(f => re.IsMatch(Path.GetFileName(f))));
+            found.Sort(StringComparer.OrdinalIgnoreCase);
+            return found;
+        };
+        // Roslyn ships its notices as RTF: keep the text, drop the markup.
+        Func<string, string> read = path =>
+        {
+            // Drop control characters: Roslyn's RTF ends in a NUL byte, which makes grep and editors treat the file as binary.
+            var text = Regex.Replace(File.ReadAllText(path), @"[\x00-\x08\x0B\x0E-\x1F\x7F]", "");
+            if (!path.EndsWith(".rtf", StringComparison.OrdinalIgnoreCase)) return text.TrimEnd();
+            text = Regex.Replace(text, @"\\par[d]?\b", "\n");
+            text = Regex.Replace(text, @"\\'([0-9a-fA-F]{2})", m => ((char)Convert.ToInt32(m.Groups[1].Value, 16)).ToString());
+            text = Regex.Replace(text, @"\{\\\*[^{}]*\}|\\[a-zA-Z]+-?\d* ?|[{}]", "");
+            return Regex.Replace(text, @"\n{3,}", "\n\n").Trim();
+        };
+
+        var packages = Packages
+            .Select(i => new { Id = i.GetMetadata("NuGetPackageId"), Version = i.GetMetadata("NuGetPackageVersion") })
+            .Where(p => p.Id.Length > 0 && p.Version.Length > 0)
+            .GroupBy(p => p.Id.ToLowerInvariant() + "/" + p.Version.ToLowerInvariant()).Select(g => g.First())
+            .OrderBy(p => p.Id, StringComparer.OrdinalIgnoreCase).ThenBy(p => p.Version, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        sb.AppendLine("Components:");
+        foreach (var p in packages) sb.AppendLine("  " + p.Id + " " + p.Version);
+        // The SDK resolves a runtime pack for every known framework of the RID (a win-x64 console app gets the Windows Desktop
+        // pack too); only the frameworks the app references are bundled, so list only those. A profile reference such as
+        // Microsoft.WindowsDesktop.App.WindowsForms names its framework only through its targeting pack (<framework>.Ref).
+        var referenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var f in Frameworks ?? new Microsoft.Build.Framework.ITaskItem[0])
+        {
+            referenced.Add(f.ItemSpec);
+            var tp = f.GetMetadata("TargetingPackName");
+            if (tp.EndsWith(".Ref", StringComparison.OrdinalIgnoreCase)) referenced.Add(tp.Substring(0, tp.Length - 4));
+        }
+        var packs = (RuntimePacks ?? new Microsoft.Build.Framework.ITaskItem[0])
+            .Where(i => i.GetMetadata("FrameworkName").Length == 0 || referenced.Contains(i.GetMetadata("FrameworkName")))
+            .Select(i => i.GetMetadata("PackageDirectory")).Where(d => d.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(d => d, StringComparer.OrdinalIgnoreCase).ToList();
+        // Fail closed: a self-contained publish bundles a runtime pack for every referenced framework, so a filter that drops
+        // one (an SDK that shapes these items differently) would silently omit the .NET runtime's notices.
+        if (string.Equals(SelfContained, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            var kept = new HashSet<string>((RuntimePacks ?? new Microsoft.Build.Framework.ITaskItem[0])
+                .Where(i => packs.Contains(i.GetMetadata("PackageDirectory"), StringComparer.OrdinalIgnoreCase))
+                .Select(i => i.GetMetadata("FrameworkName")), StringComparer.OrdinalIgnoreCase);
+            if (packs.Count == 0)
+                Log.LogError("Third-party notices: self-contained publish but no .NET runtime pack was resolved; the runtime's notices would be missing.");
+            foreach (var f in Frameworks ?? new Microsoft.Build.Framework.ITaskItem[0])
+            {
+                var tp = f.GetMetadata("TargetingPackName");
+                var name = f.GetMetadata("RuntimePackName").Length > 0 ? f.ItemSpec
+                    : tp.EndsWith(".Ref", StringComparison.OrdinalIgnoreCase) ? tp.Substring(0, tp.Length - 4) : null;
+                if (name != null && !kept.Contains(name))
+                    Log.LogError("Third-party notices: framework " + f.ItemSpec + " is bundled by this self-contained publish but no runtime pack for " + name + " was resolved.");
+            }
+        }
+        foreach (var d in packs) sb.AppendLine("  " + Path.GetFileName(Path.GetDirectoryName(d.TrimEnd('/', '\\'))) + " " + Path.GetFileName(d.TrimEnd('/', '\\')) + " (.NET runtime pack)");
+        sb.AppendLine();
+
+        foreach (var p in packages)
+        {
+            var dir = Path.Combine(PackageRoot, p.Id.ToLowerInvariant(), p.Version.ToLowerInvariant());
+            var nuspecPath = Path.Combine(dir, p.Id.ToLowerInvariant() + ".nuspec");
+            if (!File.Exists(nuspecPath))
+            {
+                Log.LogError("Third-party notices: no nuspec for " + p.Id + " " + p.Version + " at " + nuspecPath);
+                continue;
+            }
+            var meta = XDocument.Load(nuspecPath).Root.Elements().First(e => e.Name.LocalName == "metadata");
+            Func<string, XElement> el = n => meta.Elements().FirstOrDefault(e => e.Name.LocalName == n);
+            var licence = el("license");
+            var copyright = (el("copyright") != null ? el("copyright").Value : "").Trim();
+            var project = el("projectUrl") != null ? el("projectUrl").Value.Trim() : "";
+
+            sb.AppendLine(rule);
+            sb.AppendLine(p.Id + " " + p.Version);
+            if (licence != null) sb.AppendLine("License: " + licence.Value.Trim() + (licence.Attribute("type") != null && licence.Attribute("type").Value == "file" ? " (file)" : ""));
+            if (copyright.Length > 0) sb.AppendLine("Copyright: " + copyright);
+            if (project.Length > 0) sb.AppendLine("Project: " + project);
+            sb.AppendLine(rule);
+            sb.AppendLine();
+
+            string licenceText = null;
+            var shipped = find(dir, licenceFile).FirstOrDefault();
+            if (licence != null && licence.Attribute("type") != null && licence.Attribute("type").Value == "file")
+            {
+                var path = Path.Combine(dir, licence.Value.Trim().Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar));
+                if (File.Exists(path)) licenceText = read(path);
+            }
+            if (licenceText == null && shipped != null) licenceText = read(shipped);
+            if (licenceText == null && licence != null)
+            {
+                var expr = licence.Value.Trim();
+                var template = expr == "MIT" ? "MIT.txt" : expr == "Apache-2.0" ? "Apache-2.0.txt" : null;
+                if (template != null)
+                {
+                    licenceText = File.ReadAllText(Path.Combine(LicenseTemplateDir, template)).TrimEnd();
+                    var holder = copyright.Length == 0 ? "the " + p.Id + " authors"
+                        : Regex.Replace(copyright, @"^(copyright\s*)?(\(c\)|©)?\s*", "", RegexOptions.IgnoreCase);
+                    licenceText = licenceText.Replace("{COPYRIGHT}", holder);
+                }
+            }
+            if (licenceText == null)
+            {
+                Log.LogError("Third-party notices: cannot reproduce the licence of " + p.Id + " " + p.Version
+                    + " (" + (licence != null ? licence.Value.Trim() : "no <license> in the nuspec")
+                    + ", no licence file in the package). Add its text under build/licenses/ (see build/ThirdPartyNotices.targets).");
+                continue;
+            }
+            sb.AppendLine(licenceText);
+            sb.AppendLine();
+            foreach (var n in find(dir, noticeFile))
+            {
+                sb.AppendLine("--- " + p.Id + ": " + Path.GetFileName(n) + " ---");
+                sb.AppendLine(read(n));
+                sb.AppendLine();
+            }
+        }
+
+        foreach (var d in packs)
+        {
+            var name = Path.GetFileName(Path.GetDirectoryName(d.TrimEnd('/', '\\'))) + " " + Path.GetFileName(d.TrimEnd('/', '\\'));
+            var files = find(d, licenceFile).Concat(find(d, noticeFile)).ToList();
+            if (files.Count == 0)
+            {
+                Log.LogError("Third-party notices: runtime pack " + name + " ships no LICENSE or THIRD-PARTY-NOTICES at " + d);
+                continue;
+            }
+            sb.AppendLine(rule);
+            sb.AppendLine(name + " (.NET runtime pack, bundled by a self-contained publish)");
+            sb.AppendLine(rule);
+            sb.AppendLine();
+            foreach (var f in files)
+            {
+                sb.AppendLine("--- " + Path.GetFileName(f) + " ---");
+                sb.AppendLine(read(f));
+                sb.AppendLine();
+            }
+        }
+
+        // Code ported or copied into dotLLM's OWN binaries (llama.cpp / ggml, tiktoken): no package lists it, so the repository
+        // NOTICE, which carries those licences, is always appended. A missing NOTICE fails the build like any missing licence.
+        if (!File.Exists(RepositoryNotice))
+            Log.LogError("Third-party notices: the repository NOTICE (code from other projects in dotLLM's own sources) is missing at " + RepositoryNotice);
+        else
+        {
+            sb.AppendLine(rule);
+            sb.AppendLine("dotLLM repository NOTICE (code from other projects compiled into dotLLM's own binaries and kernels)");
+            sb.AppendLine(rule);
+            sb.AppendLine();
+            sb.AppendLine(read(RepositoryNotice));
+            sb.AppendLine();
+        }
+
+        if (Log.HasLoggedErrors) return false;
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(OutputFile)));
+        var content = sb.ToString().Replace("\r\n", "\n");
+        if (!File.Exists(OutputFile) || File.ReadAllText(OutputFile) != content)
+            File.WriteAllText(OutputFile, content, new UTF8Encoding(false));
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="DotLLMGenerateThirdPartyNotices" AfterTargets="ComputeResolvedFilesToPublishList">
+    <!-- Set here, not at evaluation: this file is imported from the project body, before the SDK defines IntermediateOutputPath. -->
+    <PropertyGroup>
+      <_ThirdPartyNoticesFile>$([System.IO.Path]::Combine($(MSBuildProjectDirectory), $(IntermediateOutputPath), $(ThirdPartyNoticesFileName)))</_ThirdPartyNoticesFile>
+    </PropertyGroup>
+    <DotLLMGenerateThirdPartyNotices
+        Packages="@(RuntimeCopyLocalItems);@(NativeCopyLocalItems);@(ResourceCopyLocalItems)"
+        RuntimePacks="@(ResolvedRuntimePack)"
+        Frameworks="@(ResolvedFrameworkReference)"
+        SelfContained="$(SelfContained)"
+        PackageRoot="$(NuGetPackageRoot)"
+        LicenseTemplateDir="$(MSBuildThisFileDirectory)licenses"
+        Product="$(ThirdPartyNoticesProduct)"
+        OutputFile="$(_ThirdPartyNoticesFile)"
+        RepositoryNotice="$(MSBuildThisFileDirectory)..\NOTICE" />
+    <ItemGroup>
+      <ResolvedFileToPublish Include="$(_ThirdPartyNoticesFile)" RelativePath="$(ThirdPartyNoticesFileName)"
+                             CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    </ItemGroup>
+  </Target>
+</Project>
