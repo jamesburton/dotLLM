@@ -195,10 +195,10 @@ public class DirectStorageDefaultTests(ITestOutputHelper output)
             string ledger = log.Split(Environment.NewLine).Last(l => l.Contains("host-import:", StringComparison.Ordinal));
             output.WriteLine(ledger);
             var m = System.Text.RegularExpressions.Regex.Match(ledger, @"(\d+) tensors / [\d.]+ MiB direct-storage.*?; (\d+) tensors / [\d.]+ MiB staged",
-                System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(2));
+                System.Text.RegularExpressions.RegexOptions.ExplicitCapture, TimeSpan.FromSeconds(2));
             Assert.True(m.Success, ledger);
-            Assert.True(int.Parse(m.Groups[1].Value) > 0, "DirectStorage read no tensors: " + ledger);
-            Assert.Equal(0, int.Parse(m.Groups[2].Value));
+            Assert.True(int.Parse(m.Groups["d"].Value) > 0, "DirectStorage read no tensors: " + ledger);
+            Assert.Equal(0, int.Parse(m.Groups["s"].Value));
             Assert.DoesNotContain("DStorageGetFactory", log, StringComparison.Ordinal);
         }
         finally { try { Directory.Delete(installDir, recursive: true); } catch (IOException) { } }
