@@ -61,6 +61,12 @@ public static partial class HfConfigExtractor
                 "The olala architecture (OVHcloud Olala, HF OlalaForCausalLM) is not loadable from safetensors in dotLLM yet: use the GGUF "
                 + "(OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF) on the CPU backend. Tracked in https://github.com/jamesburton/dotLLM/issues/1969.");
 
+        // Inkling 2 (#2026): the HF checkpoint nests the text config and ships ModelOpt-quantised expert tensors; only the converted GGUF is loadable (CPU).
+        if (architecture == Architecture.Inkling2)
+            throw new NotSupportedException(
+                "The inkling2 architecture (Thinking Machines Inkling 2, HF Inkling2LoopForConditionalGeneration) is not loadable from safetensors in dotLLM: use the GGUF "
+                + "(ggml-org/Inkling-2-Mini-GGUF) on the CPU backend. Tracked in https://github.com/jamesburton/dotLLM/issues/2025.");
+
         // Ripple (#1643): dedicated builder (hybrid layer_types, gated attention, value residual, FFN clamp, embed_scale null = folded).
         if (architecture == Architecture.Ricursive)
             return ExtractRicursive(root);
@@ -751,6 +757,9 @@ public static partial class HfConfigExtractor
             // OVHcloud Olala — `OlalaForCausalLM` / `model_type=olala` (custom_code, #1970): recognised so the failure is explicit; GGUF only for now.
             (var a, _) when a is not null && a.Contains("olala") => Architecture.Olala,
             (_, "olala") => Architecture.Olala,
+            // Thinking Machines Inkling 2 — `Inkling2LoopForConditionalGeneration` / `model_type=inkling2_loop` (#2026): recognised so the failure is explicit.
+            (var a, _) when a is not null && a.Contains("inkling2") => Architecture.Inkling2,
+            (_, "inkling2" or "inkling2_loop") => Architecture.Inkling2,
             (var a, _) when a is not null && a.Contains("glm4moe") => Architecture.Glm4Moe,
             (_, "glm4_moe") => Architecture.Glm4Moe,
             // DeepSeek-V3 must be checked before V2 and before any Llama/Mistral

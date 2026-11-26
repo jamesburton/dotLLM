@@ -358,6 +358,12 @@ public record ModelConfig
     public OlalaConfig? Olala { get; init; }
 
     /// <summary>
+    /// Inkling 2 parameters (loop, depth mixing, relative-position attention, short convs, SITU MoE); non-null only when
+    /// <see cref="Architecture"/> is <see cref="DotLLM.Core.Configuration.Architecture.Inkling2"/>. See <see cref="Inkling2Config"/>.
+    /// </summary>
+    public Inkling2Config? Inkling2 { get; init; }
+
+    /// <summary>
     /// Optional per-attention-type RoPE override for the FULL-attention layers
     /// (Gemma 4 / DiffusionGemma). When non-null, every layer flagged as a
     /// full-attention layer by <see cref="IsFullAttentionLayer(int)"/> applies

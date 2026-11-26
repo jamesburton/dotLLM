@@ -1,0 +1,367 @@
+[
+ {
+  "name": "user_only_default_effort",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ]
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 2 + 2?<|end_message|>"
+ },
+ {
+  "name": "system_then_user",
+  "context": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ]
+  },
+  "expected": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|>"
+ },
+ {
+  "name": "effort_low",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "reasoning_effort": "low"
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_none",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "reasoning_effort": "none"
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_max",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "reasoning_effort": "max"
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_numeric",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "reasoning_effort": 0.5
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.5<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_numeric_zero",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "reasoning_effort": 0.0
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_string_padded",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "reasoning_effort": " medium "
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_only_system_messages",
+  "context": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    }
+   ],
+   "reasoning_effort": "high"
+  },
+  "expected": "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+ },
+ {
+  "name": "effort_unknown",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "reasoning_effort": "wild"
+  },
+  "expectedError": "Unknown reasoning_effort: wild"
+ },
+ {
+  "name": "effort_out_of_range",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "reasoning_effort": 1.5
+  },
+  "expectedError": "reasoning_effort must be in [0.0, 0.99]"
+ },
+ {
+  "name": "multi_turn_reasoning",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!",
+     "reasoning_content": "greet"
+    },
+    {
+     "role": "user",
+     "content": "Again"
+    }
+   ]
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|><|content_thinking|>greet<|end_message|><|message_model|><|content_text|>Hello!<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Again<|end_message|>"
+ },
+ {
+  "name": "assistant_named",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!",
+     "name": "Ada"
+    },
+    {
+     "role": "user",
+     "content": "Again"
+    }
+   ]
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|>Ada<|content_text|>Hello!<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Again<|end_message|>"
+ },
+ {
+  "name": "tools_declared",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Météo ☃ lookup",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Météo ☃ lookup\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|>"
+ },
+ {
+  "name": "tool_call_roundtrip",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "days": 3,
+         "city": "Paris"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "sunny",
+     "tool_call_id": "c1"
+    },
+    {
+     "role": "user",
+     "content": "thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Météo ☃ lookup",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Météo ☃ lookup\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>sunny<|end_message|><|message_user|><|content_text|>thanks<|end_message|>"
+ },
+ {
+  "name": "tool_result_named",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    },
+    {
+     "role": "tool",
+     "content": "42",
+     "name": "calc"
+    }
+   ]
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_tool|>calc<|content_text|>42<|end_message|>"
+ },
+ {
+  "name": "content_parts_and_image",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Look:"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "x"
+       }
+      },
+      "tail"
+     ]
+    }
+   ]
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Look:<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>tail<|end_message|>"
+ },
+ {
+  "name": "audio_refused",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "input_audio",
+       "input_audio": {}
+      }
+     ]
+    }
+   ]
+  },
+  "expectedError": "Inkling 2 does not accept audio input"
+ },
+ {
+  "name": "unknown_role",
+  "context": {
+   "messages": [
+    {
+     "role": "developer",
+     "content": "x"
+    }
+   ]
+  },
+  "expectedError": "Unknown message role: developer"
+ },
+ {
+  "name": "unicode_and_whitespace",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "  café ☃ \n"
+    }
+   ]
+  },
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>  café ☃ \n<|end_message|>"
+ }
+]

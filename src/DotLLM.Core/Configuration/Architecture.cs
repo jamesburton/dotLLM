@@ -561,5 +561,15 @@ public enum Architecture
     /// <see cref="DotLLM.Core.Models.ModelConfig.Olala"/>. The Mamba SSM recurrent state is F32 by per-architecture policy
     /// (<see cref="DotLLM.Core.Models.OlalaStatePolicy"/>, issue #1971). See <c>docs/OLALA.md</c>.
     /// </summary>
-    Olala
+    Olala,
+
+    /// <summary>
+    /// Thinking Machines Inkling 2 (llama.cpp <c>inkling2</c> / <c>inkling2_loop</c>, HF <c>model_type=inkling2_loop</c>;
+    /// Inkling-2-Mini): a 24-layer MoE transformer with depth ("attention-residual") mixing of block outputs, local (sliding
+    /// window) and global layers that use a learned relative-position bias with per-query sinks instead of RoPE, gated attention,
+    /// short causal convolutions on K, V and both sub-layer outputs, a SITU-activated 128-expert sigmoid-routed MoE, and (for
+    /// <c>inkling2_loop</c>) a layer range that runs three times with shared weights and rank-64 cross-pass controllers. Extra
+    /// parameters live in <see cref="DotLLM.Core.Models.ModelConfig.Inkling2"/>. See <c>docs/INKLING2.md</c>.
+    /// </summary>
+    Inkling2
 }

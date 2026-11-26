@@ -138,6 +138,9 @@ public static class CudaModelLoader
             case Architecture.Olala:
                 throw new NotSupportedException(OlalaConfig.UnsupportedMessage("CUDA"));
 
+            case Architecture.Inkling2:
+                throw new NotSupportedException(Inkling2Config.UnsupportedMessage("CUDA"));
+
             case Architecture.MiMoV2:
                 throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("CUDA"));
 

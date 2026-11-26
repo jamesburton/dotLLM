@@ -96,6 +96,8 @@ public static class ModelLoader
             Architecture.Ricursive => RefuseRicursive(gguf, config),
             // OVHcloud Olala (#1970): CPU reference forward (Mamba-3 MIMO + differential TPA + latent MoE).
             Architecture.Olala => OlalaTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            // Thinking Machines Inkling 2 (#2026): CPU reference forward.
+            Architecture.Inkling2 => Inkling2TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
         };
     }

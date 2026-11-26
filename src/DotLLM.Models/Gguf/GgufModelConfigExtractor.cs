@@ -46,6 +46,10 @@ public static partial class GgufModelConfigExtractor
         if (architecture == Architecture.Olala)
             return BuildOlalaConfig(metadata, arch);
 
+        // Inkling 2 (#2026): looped MoE with depth mixing and relative-position attention; dedicated builder (per-layer arrays, no RoPE).
+        if (architecture == Architecture.Inkling2)
+            return BuildInkling2Config(metadata, arch);
+
         int hiddenSize = (int)metadata.GetUInt32($"{arch}.embedding_length");
         int numLayers = (int)metadata.GetUInt32($"{arch}.block_count");
         int numAttentionHeads = (int)metadata.GetUInt32($"{arch}.attention.head_count");
@@ -1264,6 +1268,8 @@ public static partial class GgufModelConfigExtractor
             "ricursive" => Architecture.Ricursive,
             // OVHcloud Olala-v1.0-mini-7A1B (OVH llama.cpp fork `olala`): Mamba-3 MIMO + differential TPA + latent MoE (#1970).
             "olala" => Architecture.Olala,
+            // Thinking Machines Inkling-2-Mini (llama.cpp `inkling2_loop`; plain `inkling2` is the same graph without the loop) (#2026).
+            "inkling2" or "inkling2_loop" => Architecture.Inkling2,
             "lfm2moe" => Architecture.Lfm2Moe,
             "lfm3" => Architecture.Lfm3,
             "nemotron_h" => Architecture.NemotronH,

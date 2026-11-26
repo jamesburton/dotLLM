@@ -43,7 +43,7 @@ public static class GpuOffloadPlanner
     {
         Architecture.NemotronH or Architecture.NemotronHMoe
             or Architecture.Qwen3MoeHybrid or Architecture.Qwen4Exp or Architecture.Mamba3 or Architecture.Lfm2Moe or Architecture.Lfm3
-            or Architecture.Glm4Moe or Architecture.Ricursive or Architecture.Olala => false,
+            or Architecture.Glm4Moe or Architecture.Ricursive or Architecture.Olala or Architecture.Inkling2 => false,
         _ => true,
     };
 

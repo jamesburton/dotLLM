@@ -41,6 +41,15 @@ internal sealed class JinjaEvaluator
         ["first"] = (input, _) => GetFirst(input),
         ["last"] = (input, _) => GetLast(input),
         ["string"] = (input, _) => Stringify(input),
+        // Jinja `float`: numbers widen; a string parses (invariant) or falls back to 0.0 like jinja2's default; anything else is 0.0.
+        ["float"] = (input, args) => input switch
+        {
+            double d => d,
+            int i => (double)i,
+            long l => (double)l,
+            string str when double.TryParse(str.Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v) => v,
+            _ => args.Count > 0 && args[0] is double dd ? dd : 0.0,
+        },
         ["list"] = (input, _) => input is IList list ? list : input is IEnumerable e ? ToList(e) : new List<object?> { input },
         ["items"] = (input, _) => GetDictItems(input),
         ["dictsort"] = (input, _) => DictSort(input),
@@ -392,10 +401,27 @@ internal sealed class JinjaEvaluator
         };
     }
 
+    /// <summary>An evaluated <c>name=value</c> filter argument.</summary>
+    private sealed record FilterKwArg(string Name, object? Value);
+
     private object? EvalFilter(FilterExpr expr)
     {
         var input = EvalExpr(expr.Input);
-        var args = expr.Args.Select(EvalExpr).ToList();
+        var raw = expr.Args.Select(a => a is KwArgExpr kw ? new FilterKwArg(kw.Name, EvalExpr(kw.Value)) : EvalExpr(a)).ToList();
+
+        // tojson / dictsort read keyword arguments (HF's `tojson(sort_keys=true, separators=(",", ":"))`, `dictsort(case_sensitive=true)`).
+        if (raw.Any(a => a is FilterKwArg))
+        {
+            var kwargs = raw.OfType<FilterKwArg>().ToDictionary(k => k.Name, k => k.Value);
+            var positional = raw.Where(a => a is not FilterKwArg).ToList();
+            if (expr.FilterName == "tojson")
+                return ToJsonWithOptions(input, kwargs, positional);
+            if (expr.FilterName == "dictsort")
+                return DictSort(input, kwargs.TryGetValue("case_sensitive", out var cs) && IsTruthy(cs));
+        }
+
+        // Any other filter keeps the historical behaviour: keyword names are ignored and values are positional.
+        var args = raw.Select(a => a is FilterKwArg k ? k.Value : a).ToList();
 
         if (Filters.TryGetValue(expr.FilterName, out var filter))
             return filter(input, args);
@@ -755,8 +781,9 @@ internal sealed class JinjaEvaluator
             return b ? "True" : "False";
         if (value is string s)
             return s;
+        // Invariant culture: a float literal such as Inkling 2's default `0.9` effort must not render as "0,9" on a de-DE / fr-FR host.
         if (value is int or double or long)
-            return value.ToString()!;
+            return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture)!;
         if (value is IList list)
             return "[" + string.Join(", ", list.Cast<object?>().Select(item => StringifyRepr(item))) + "]";
         if (value is Dictionary<string, object?> dict)
@@ -779,7 +806,7 @@ internal sealed class JinjaEvaluator
         if (value is int i)
             return i.ToString();
         if (value is double d)
-            return d.ToString("G");
+            return d.ToString("G", System.Globalization.CultureInfo.InvariantCulture);
         if (value is string s)
             return JsonQuoteString(s);
         if (value is Dictionary<string, object?> dict)
@@ -1070,12 +1097,73 @@ internal sealed class JinjaEvaluator
     }
 
     /// <summary>Jinja2 <c>dictsort</c>: (key, value) pairs ordered by key, case-insensitive (default).</summary>
-    private static object? DictSort(object? input)
+    private static object? DictSort(object? input, bool caseSensitive = false)
     {
         if (input is Dictionary<string, object?> dict)
-            return dict.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
+            return dict.OrderBy(kvp => kvp.Key, caseSensitive ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase)
                        .Select(kvp => (object?)new List<object?> { kvp.Key, kvp.Value }).ToList();
         return new List<object?>();
+    }
+
+    /// <summary>
+    /// <c>tojson</c> with Python <c>json.dumps</c> keyword semantics (HF's filter: <c>ensure_ascii=False</c>): <c>indent</c>, <c>separators=(item, key)</c>
+    /// and <c>sort_keys</c>. Without an indent the default separators are <c>", "</c> / <c>": "</c>; with an indent they are <c>","</c> / <c>": "</c>
+    /// and every item starts on its own line. Explicit separators are used verbatim.
+    /// </summary>
+    private static string ToJsonWithOptions(object? value, Dictionary<string, object?> kwargs, IReadOnlyList<object?> positional)
+    {
+        int indent = kwargs.TryGetValue("indent", out var ind) && ind is not null ? ToInt(ind) : positional.Count > 0 ? ToInt(positional[0]) : 0;
+        string itemSep = indent > 0 ? "," : ", ", keySep = ": ";
+        if (kwargs.TryGetValue("separators", out var sepObj) && sepObj is IList { Count: 2 } sep)
+        {
+            itemSep = Stringify(sep[0]); keySep = Stringify(sep[1]);
+        }
+        bool sortKeys = kwargs.TryGetValue("sort_keys", out var sk) && IsTruthy(sk);
+        var sb = new StringBuilder();
+        WriteJson(sb, value, indent, itemSep, keySep, sortKeys, 0);
+        return sb.ToString();
+    }
+
+    private static void WriteJson(StringBuilder sb, object? value, int indent, string itemSep, string keySep, bool sortKeys, int depth)
+    {
+        void NewLine(int d) { if (indent > 0) sb.Append('\n').Append(' ', indent * d); }
+        switch (value)
+        {
+            case Dictionary<string, object?> dict:
+            {
+                if (dict.Count == 0) { sb.Append("{}"); return; }
+                sb.Append('{');
+                bool first = true;
+                foreach (var kvp in sortKeys ? dict.OrderBy(k => k.Key, StringComparer.Ordinal) : dict.AsEnumerable())
+                {
+                    if (!first) sb.Append(itemSep);
+                    first = false;
+                    NewLine(depth + 1);
+                    sb.Append(JsonQuoteString(kvp.Key)).Append(keySep);
+                    WriteJson(sb, kvp.Value, indent, itemSep, keySep, sortKeys, depth + 1);
+                }
+                NewLine(depth);
+                sb.Append('}');
+                return;
+            }
+            case IList list when value is not string:
+            {
+                if (list.Count == 0) { sb.Append("[]"); return; }
+                sb.Append('[');
+                for (int i = 0; i < list.Count; i++)
+                {
+                    if (i > 0) sb.Append(itemSep);
+                    NewLine(depth + 1);
+                    WriteJson(sb, list[i], indent, itemSep, keySep, sortKeys, depth + 1);
+                }
+                NewLine(depth);
+                sb.Append(']');
+                return;
+            }
+            default:
+                sb.Append(ToJson(value));
+                return;
+        }
     }
 
     private static object? JoinFilter(object? input, IReadOnlyList<object?> args)

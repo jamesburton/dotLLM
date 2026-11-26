@@ -345,6 +345,16 @@ internal sealed class JinjaLexer
         while (_pos < _source.Length && char.IsDigit(_source[_pos]))
             Advance();
 
+        // Float literal (`0.9`): digits, a dot and at least one more digit. `1.foo` / `1..2` stay an int followed by punctuation.
+        if (_pos + 1 < _source.Length && _source[_pos] == '.' && char.IsDigit(_source[_pos + 1]))
+        {
+            Advance();
+            while (_pos < _source.Length && char.IsDigit(_source[_pos]))
+                Advance();
+            return new JinjaToken(JinjaTokenType.IntLiteral,
+                double.Parse(_source[start.._pos], System.Globalization.CultureInfo.InvariantCulture), startLine, startCol);
+        }
+
         string numStr = _source[start.._pos];
         return new JinjaToken(JinjaTokenType.IntLiteral, int.Parse(numStr), startLine, startCol);
     }
