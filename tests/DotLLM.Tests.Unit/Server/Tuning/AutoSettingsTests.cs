@@ -9,7 +9,7 @@ public sealed class AutoSettingsTests
     private const long GiB = 1L << 30;
     private const string Tune = "dotllm tune m.gguf --profile chat";
 
-    private static readonly PlacementAdmission Fits = (_, _) => (true, 0, 0);
+    private static readonly PlacementAdmission Fits = (_, _) => null;
     private static readonly SettingRefusal NoRefusal = _ => null;
     private static readonly AutoPolicy Run = new(AutoCommand.Run);
 
@@ -52,7 +52,7 @@ public sealed class AutoSettingsTests
     [Fact]
     public void TurboQuantPair_WithOneSideFlagged_IsDroppedWhole()
     {
-        var tq = new TunedSettings { CacheTypeK = "tq4", CacheTypeV = "tq4", Paged = false, Threads = 8 };
+        var tq = new TunedSettings { CacheTypeK = "tq4", CacheTypeV = "tq4", Paged = false, Threads = 8, TunedContext = 8192 };
         var a = Apply(Match(TuningMatchKind.Hit, tq), flags: ["cache_type_k"]);
         Assert.Null(a.Applied.CacheTypeV);
         Assert.Null(a.Applied.Paged);
@@ -71,7 +71,7 @@ public sealed class AutoSettingsTests
     [InlineData(AutoCommand.Serve, true, true)]      // single-user serve may use it
     public void TurboQuant_IsAppliedOnlyForRunChatBenchOrSingleUserServe(AutoCommand command, bool singleUser, bool applied)
     {
-        var tq = new TunedSettings { CacheTypeK = "tq4", CacheTypeV = "tq4", Paged = false };
+        var tq = new TunedSettings { CacheTypeK = "tq4", CacheTypeV = "tq4", Paged = false, TunedContext = 8192 };
         var a = Apply(Match(TuningMatchKind.Hit, tq), policy: new AutoPolicy(command, singleUser));
         Assert.Equal(applied, a.Applied.CacheTypeK == "tq4" && a.Applied.CacheTypeV == "tq4" && a.Applied.Paged == false);
         if (!applied) Assert.Contains(a.Warnings, w => w.Contains("--no-paged", StringComparison.Ordinal));
@@ -130,7 +130,8 @@ public sealed class AutoSettingsTests
     [Fact]
     public void PlacementThatNoLongerFits_FallsBackToDefaults_WithBytes()
     {
-        var a = Apply(Match(TuningMatchKind.Hit, Saved), flags: ["threads"], admit: (_, _) => (false, 10 * GiB, 6 * GiB));
+        var a = Apply(Match(TuningMatchKind.Hit, Saved), flags: ["threads"],
+                      admit: (_, _) => $"needs {AutoSettings.Format(10 * GiB)} of device memory, {AutoSettings.Format(6 * GiB)} free");
         Assert.All(a.Sources.Where(kv => kv.Key != "threads"), kv => Assert.Equal(SettingSource.Default, kv.Value));
         Assert.Equal(SettingSource.Flag, a.Sources["threads"]);
         Assert.Equal(new TunedSettings(), a.Applied);
@@ -142,21 +143,44 @@ public sealed class AutoSettingsTests
     [Fact]
     public void Admission_IsAskedAtTheServedContext_FlagBeatingSaved()
     {
-        var saved = Saved with { ContextSize = 16384 };
+        var saved = Saved with { ContextSize = 16384, TunedContext = 16384 };
         var seen = new List<int>();
-        PlacementAdmission spy = (_, ctx) => { seen.Add(ctx); return (true, 0, 0); };
+        PlacementAdmission spy = (_, ctx) => { seen.Add(ctx); return null; };
         AutoSettings.Apply(new HashSet<string>(), Match(TuningMatchKind.Hit, saved), Tune, 4096, spy, NoRefusal, Run);
         AutoSettings.Apply(new HashSet<string> { "ctx_size" }, Match(TuningMatchKind.Hit, saved), Tune, 4096, spy, NoRefusal, Run);
         Assert.Equal([16384, 4096], seen);
     }
 
     [Fact]
-    public void ServedContextAboveTuned_AppliesAndWarns()
+    public void ServedContextAboveTuned_IsNotAdmitted_DefaultsRun()
     {
-        var a = Apply(Match(TuningMatchKind.Hit, Saved), ctx: 32768);
-        Assert.Equal("q8_0", a.Applied.CacheTypeK);
-        Assert.Contains(a.Warnings, w => w.Contains("not measured at that depth", StringComparison.Ordinal));
+        // The recorded peak was measured at the tuned context (8192); it does not bound 32768, so nothing may be admitted.
+        int asked = 0;
+        var a = Apply(Match(TuningMatchKind.Hit, Saved), ctx: 32768, admit: (_, _) => { asked++; return null; });
+        Assert.Equal(new TunedSettings(), a.Applied);
+        Assert.All(a.Sources, kv => Assert.Equal(SettingSource.Default, kv.Value));
+        Assert.Contains(a.Warnings, w => w.Contains("above the tuned context 8192", StringComparison.Ordinal));
+        Assert.Equal(0, asked);
+        // At or below the tuned context it is admitted (the boundary is inclusive).
+        Assert.Equal("q8_0", Apply(Match(TuningMatchKind.Hit, Saved), ctx: 8192).Applied.CacheTypeK);
         Assert.Empty(Apply(Match(TuningMatchKind.Hit, Saved), ctx: 4096).Warnings);
+    }
+
+    [Fact]
+    public void ResultWithoutTunedContext_IsNotAdmitted()
+    {
+        var a = Apply(Match(TuningMatchKind.Hit, Saved with { TunedContext = null }), ctx: 0);
+        Assert.Equal(new TunedSettings(), a.Applied);
+        Assert.Contains(a.Warnings, w => w.Contains("does not record the context", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void NothingToApply_DoesNotAskAdmission()
+    {
+        int asked = 0;
+        var a = Apply(Match(TuningMatchKind.Hit, new TunedSettings { Threads = 8 }), flags: ["threads"], admit: (_, _) => { asked++; return "x"; });
+        Assert.Equal(0, asked);
+        Assert.Empty(a.Warnings);
     }
 
     [Fact]

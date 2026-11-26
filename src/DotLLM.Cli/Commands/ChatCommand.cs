@@ -420,7 +420,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             if (resolvedPath is null)
                 return 1;
             var applied = DotLLM.Cli.Helpers.AutoCli.Resolve(DotLLM.Server.Tuning.AutoCommand.Chat, settings.Model, resolvedPath, settings.Device,
-                settings.AutoProfile, 0, DotLLM.Cli.Helpers.AutoCli.RunChatSupported, json: false, mtpHead: settings.MtpHead, dflash: settings.DFlash);
+                settings.AutoProfile, settings.CtxSize ?? 0, DotLLM.Cli.Helpers.AutoCli.RunChatSupported, json: false, mtpHead: settings.MtpHead, dflash: settings.DFlash);
             if (applied is not null) ApplyAuto(settings, applied.Applied);
         }
         if (MoeOffloadCli.Validate(settings.MoeValues) is { } moeError)

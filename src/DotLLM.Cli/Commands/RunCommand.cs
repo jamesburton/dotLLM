@@ -457,7 +457,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             if (resolvedPath is null)
                 return 1;
             var applied = DotLLM.Cli.Helpers.AutoCli.Resolve(DotLLM.Server.Tuning.AutoCommand.Run, settings.Model, resolvedPath, settings.Device,
-                settings.AutoProfile, 0, DotLLM.Cli.Helpers.AutoCli.RunChatSupported, settings.Json, settings.TensorOverlay,
+                settings.AutoProfile, settings.CtxSize ?? 0, DotLLM.Cli.Helpers.AutoCli.RunChatSupported, settings.Json, settings.TensorOverlay,
                 settings.TernaryAdapterPaths, settings.MtpHead, settings.DFlash);
             if (applied is not null) ApplyAuto(settings, applied.Applied);
         }

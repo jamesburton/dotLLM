@@ -228,7 +228,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             if (autoGguf is null)
                 return 1;
             var applied = DotLLM.Cli.Helpers.AutoCli.Resolve(DotLLM.Server.Tuning.AutoCommand.Bench, settings.Model, autoGguf, settings.Device,
-                settings.AutoProfile, 0, DotLLM.Cli.Helpers.AutoCli.BenchSupported, settings.Json);
+                settings.AutoProfile, settings.CtxSize ?? 0, DotLLM.Cli.Helpers.AutoCli.BenchSupported, settings.Json);
             if (applied is not null) ApplyAuto(settings, applied.Applied);
         }
 

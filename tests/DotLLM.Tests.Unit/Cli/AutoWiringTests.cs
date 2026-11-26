@@ -42,8 +42,13 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
         AutoEntry.DefaultProfile, 0, new AutoPolicy(command), AutoCli.ServeSupported, DefaultPaged: command == AutoCommand.Serve);
 
     /// <summary>Saves a result for the tiny model on the CPU, keyed exactly as the commands will key their lookup.</summary>
-    private void SaveFor(TunedSettings settings, bool partial = false)
+    /// <param name="settings">The saved settings.</param>
+    /// <param name="partial">Mark the run incomplete.</param>
+    /// <param name="recordPeaks">Record the context and peak host bytes the tuner would have measured; without them nothing is admitted.</param>
+    private void SaveFor(TunedSettings settings, bool partial = false, bool recordPeaks = true)
     {
+        if (recordPeaks)
+            settings = settings with { TunedContext = settings.TunedContext ?? 4096, PeakHostBytes = settings.PeakHostBytes ?? (64L << 20) };
         var key = AutoEntry.BuildKey(Request(AutoCommand.Run, []));
         new TuningStore().Save(new TuningResult
         {
@@ -173,6 +178,18 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
         var (code, output) = RunCli("run", Model, "--auto", "-p", "ab", "--max-tokens", "2", "--device", "cpu");
         Assert.True(code == 0, output);
         Assert.Contains("dotllm tune", output);
+        Assert.DoesNotContain("K:Q", output);                     // default cache, nothing applied
+    }
+
+    [Fact]
+    public void Run_Auto_ResultWithoutRecordedPeak_IsNotAdmitted_DefaultsRun()
+    {
+        // Through the real AutoEntry.Admit: a result that never recorded its peak memory cannot be bounded, so it must not be applied.
+        SaveFor(new TunedSettings { CacheTypeK = "q8_0", CacheTypeV = "q8_0", TunedContext = 4096 }, recordPeaks: false);
+        var (code, output) = RunCli("run", Model, "--auto", "-p", "ab", "--max-tokens", "2", "--device", "cpu");
+        Assert.True(code == 0, output);
+        // The console wraps long lines, so compare with the line breaks removed.
+        Assert.Contains("does not record its peak host memory", output.Replace("\r", "").Replace("\n", ""));
         Assert.DoesNotContain("K:Q", output);                     // default cache, nothing applied
     }
 

@@ -41,13 +41,18 @@ public sealed record AutoApplied(TunedSettings Applied, IReadOnlyDictionary<stri
 /// <summary>Whether the current build can run a candidate's settings; null = yes, else the reason it cannot.</summary>
 public delegate string? SettingRefusal(TunedSettings candidate);
 
-/// <summary>Whether the saved placement is admitted against free memory now, at <paramref name="servedContext"/>.</summary>
-public delegate (bool Fits, long RequiredBytes, long FreeBytes) PlacementAdmission(TunedSettings candidate, int servedContext);
+/// <summary>
+/// Whether the saved placement is admitted against free memory now, at <paramref name="servedContext"/>: null when it is, else the reason it
+/// is not (with required and free bytes when both are known). A peak that was never recorded, or free memory that cannot be read, is a
+/// refusal, never an admission.
+/// </summary>
+public delegate string? PlacementAdmission(TunedSettings candidate, int servedContext);
 
 /// <summary>
 /// Applies a saved tuning result under the precedence rules (#1902): explicit flags win; a miss applies nothing; a saved TurboQuant pair is
 /// applied whole or not at all; a setting the build refuses is dropped, never substituted; and the saved placement must still fit free
-/// memory now, or every saved setting is dropped (no spill).
+/// memory now, or every saved setting is dropped (no spill). Admission only admits what the saved result bounds: its peak bytes were
+/// measured at <see cref="TunedSettings.TunedContext"/>, so a result without one, or a served context above it, is not admitted.
 /// </summary>
 public static class AutoSettings
 {
@@ -166,14 +171,20 @@ public static class AutoSettings
             }
 
         int context = explicitFlags.Contains("ctx_size") ? servedContext : c.ContextSize ?? servedContext;
-        var (fits, required, free) = admit(c, context);
-        if (!fits)
+        if (Present(c).Any(p => p.Value))
         {
-            c = new TunedSettings();
-            warnings.Add($"tuned placement needs {Format(required)}, {Format(free)} free; running the defaults");
+            // The recorded peaks bound memory only up to the context they were measured at (no spill: never admit an unbounded peak).
+            string? refused = c.TunedContext is not int tuned || tuned <= 0
+                ? "the saved result does not record the context its peak memory was measured at"
+                : context > tuned
+                    ? $"serving context {context} is above the tuned context {tuned}, so the recorded peak memory does not bound it"
+                    : admit(c, context);
+            if (refused is not null)
+            {
+                c = new TunedSettings();
+                warnings.Add($"tuned placement not admitted ({refused}); running the defaults");
+            }
         }
-        else if (c.TunedContext is int tuned && tuned > 0 && context > tuned)
-            warnings.Add($"serving context {context} is above the tuned context {tuned}; decode figures were not measured at that depth");
 
         foreach (var (name, value) in Present(c)) if (value) sources[name] = SettingSource.Auto;
         return new(c, sources, match, warnings, advice);
@@ -198,5 +209,6 @@ public static class AutoSettings
         yield return ("ctx_size", c.ContextSize is not null);
     }
 
-    private static string Format(long bytes) => $"{bytes / (1024.0 * 1024 * 1024):F2} GiB";
+    /// <summary>Bytes as GiB with two decimals.</summary>
+    internal static string Format(long bytes) => $"{bytes / (1024.0 * 1024 * 1024):F2} GiB";
 }

@@ -181,11 +181,14 @@ this release yet (#1902, slice 2); until then a result can only come from a tuni
   `tq` pair is applied whole or not at all, so a flag on either side drops the saved pair (a mixed tq pair is refused, #1895).
 - **TurboQuant needs `--no-paged`**, so a saved TurboQuant result applies only to `run`, `chat`, `bench` or a single-user `serve`. A
   multi-session `serve` drops it with a warning (tracked: it lifts when TurboQuant lands on the paged pools, #1893).
-- **Apply-time checks.** A saved placement is re-checked against free memory now: its recorded peak device bytes against the device's free
-  memory (an integrated GPU shares host RAM, so the host figure is used), and its peak host bytes against free RAM. If it no longer fits, **all**
-  saved settings are dropped and the defaults run, with the required and free bytes in the warning; nothing spills. A setting this build
-  refuses (for example a TurboQuant request the current host cannot run in place) is dropped with its reason, never replaced by another one.
-- **Context.** A result tuned at one context is applied at a larger served context with a warning that the figures were not measured at that depth.
+- **Apply-time checks.** A saved placement is admitted only when its memory is bounded and fits now: its recorded peak host bytes against
+  free RAM and, for a GPU placement, its recorded peak device bytes against the device's free memory (on an integrated GPU device and host
+  share one pool, so their sum must fit free RAM and the device peak must fit the device-local heap). A result that did not record a peak,
+  or a dedicated device whose free memory cannot be read, is not admitted. If it is not admitted, **all** saved settings are dropped and the
+  defaults run, with the reason (and required and free bytes) in the warning; nothing spills. A setting this build refuses (for example a
+  TurboQuant request the current host cannot run in place) is dropped with its reason, never replaced by another one.
+- **Context.** The recorded peaks were measured at the result's tuned context, so they bound only that much: a served context above it
+  (`--ctx-size`, or the saved context on `serve`), or a result without a tuned context, is not admitted and the defaults run.
 - **Where each value came from** is reported on `GET /v1/status` (and so `/props` `activity`) as `settings_source`: `flag`, `auto` or `default`
   per setting ([SERVER.md](SERVER.md#model-swaps-get-v1status-and-sse-keep-alive-1023)). Without `--auto` the field is absent and nothing changes.
 - `--auto` costs one store lookup before the model loads, and nothing at all when it is not given.

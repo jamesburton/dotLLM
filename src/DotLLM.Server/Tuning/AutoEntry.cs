@@ -52,7 +52,7 @@ public static class AutoEntry
         var explicitFlags = AutoSettings.ExplicitFlags(request.RawArgs);
         string tune = TuneCommand(request, explicitFlags);
         return AutoSettings.Apply(explicitFlags, match, tune, request.ServedContext,
-            (c, ctx) => Admit(c, ctx, request.Device, devices, hostFreeBytes),
+            (c, _) => Admit(c, request.Device, devices, hostFreeBytes),
             c => Refusal(c, request), request.Policy, request.Supported);
     }
 
@@ -122,28 +122,42 @@ public static class AutoEntry
     };
 
     /// <summary>
-    /// Re-admits the saved placement against free memory now (the no-spill rule): the recorded peak device bytes against the device's free
-    /// memory, and the recorded peak host bytes against free host RAM. A peak that was not recorded cannot be checked and admits; the
-    /// loader's own fit planning still applies at load.
+    /// Re-admits the saved placement against free memory now (the no-spill rule). It admits only what it can bound: the recorded peak host
+    /// bytes against free host RAM and, for a GPU placement, the recorded peak device bytes against the device's free memory. A peak that
+    /// was not recorded, or a dedicated device whose free memory cannot be read, is refused: a heap's total size is not free memory. On an
+    /// integrated GPU, device and host memory are one pool, so device plus host peaks must fit free host RAM (slice 2 records the two as
+    /// disjoint figures) and the device peak must fit the device-local heap. <see cref="AutoSettings.Apply"/> bounds the served context
+    /// against the tuned context before asking.
     /// </summary>
-    private static (bool Fits, long Required, long Free) Admit(TunedSettings c, int servedContext, DeviceSpec requested,
-                                                               DeviceListResponse? devices, Func<long> hostFree)
+    /// <returns>Null when admitted, else the reason.</returns>
+    internal static string? Admit(TunedSettings c, DeviceSpec requested, DeviceListResponse? devices, Func<long> hostFree)
     {
         DeviceSpec spec = c.Device is { } d && DeviceSpec.TryParse(d, out var s, out _) ? s : requested;
+        if (c.PeakHostBytes is not long host) return "the saved result does not record its peak host memory";
         long hostFreeNow = hostFree();
 
-        if (c.PeakDeviceBytes is long dev && spec.IsGpu)
+        if (spec.IsGpu)
         {
-            var (free, integrated) = DeviceFree(spec, devices);
-            // Integrated GPUs share host RAM: their "free" is the host figure.
-            long avail = integrated || free is null ? hostFreeNow : free.Value;
-            if (dev > avail) return (false, dev, avail);
+            if (c.PeakDeviceBytes is not long dev) return "the saved result does not record its peak device memory";
+            var (found, free, total, integrated) = DeviceMemory(spec, devices);
+            if (!found) return $"device {spec.Canonical} is not enumerated, so its free memory cannot be read";
+            if (integrated)
+            {
+                if (total is long heap && dev > heap)
+                    return $"needs {AutoSettings.Format(dev)} of device memory, the device-local heap is {AutoSettings.Format(heap)}";
+                if (dev + host > hostFreeNow)
+                    return $"needs {AutoSettings.Format(dev + host)} of shared device and host memory, {AutoSettings.Format(hostFreeNow)} free";
+                return null;
+            }
+            if (free is not long devFree)
+                return $"free memory on {spec.Canonical} cannot be read, so the recorded device peak ({AutoSettings.Format(dev)}) cannot be admitted";
+            if (dev > devFree) return $"needs {AutoSettings.Format(dev)} of device memory, {AutoSettings.Format(devFree)} free";
         }
-        if (c.PeakHostBytes is long host && host > hostFreeNow) return (false, host, hostFreeNow);
-        return (true, 0, 0);
+        if (host > hostFreeNow) return $"needs {AutoSettings.Format(host)} of host memory, {AutoSettings.Format(hostFreeNow)} free";
+        return null;
     }
 
-    private static (long? Free, bool Integrated) DeviceFree(DeviceSpec spec, DeviceListResponse? devices)
+    private static (bool Found, long? Free, long? Total, bool Integrated) DeviceMemory(DeviceSpec spec, DeviceListResponse? devices)
     {
         try
         {
@@ -153,12 +167,12 @@ public static class AutoEntry
             var dev = spec.Kind == DeviceKind.Vulkan && !spec.ExplicitIndex
                 ? list.FirstOrDefault(x => x.IsDefault == true) ?? list.FirstOrDefault()
                 : list.FirstOrDefault(x => x.Index == spec.Ordinal);
-            if (dev is null) return (null, false);
-            return (dev.FreeMemoryBytes ?? dev.TotalMemoryBytes, dev.IsIntegrated == true);
+            if (dev is null) return (false, null, null, false);
+            return (true, dev.FreeMemoryBytes, dev.TotalMemoryBytes, dev.IsIntegrated == true);
         }
         catch (Exception ex) when (ex is InvalidOperationException or DllNotFoundException)
         {
-            return (null, false);
+            return (false, null, null, false);
         }
     }
 
