@@ -126,14 +126,25 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             || config.GdnConfig is null || config.Moe is null || config.HybridLayout is null)
             throw new ArgumentException("VulkanQwen4ExpTransformerModel requires a fully populated Architecture.Qwen4Exp configuration.", nameof(config));
         var tensors = gguf.TensorsByName;
+        // Edge0 (G3, #1981): a skeleton GGUF has no routed experts; the strata pack and the FP8 n-gram table sit beside it. The model owns both.
+        DotLLM.Models.Edge0.Edge0Pack? edge0Pack = null;
+        GgufFile? pleFile = null;
         if (DotLLM.Models.Edge0.Edge0Model.IsSkeleton(gguf))
-            throw new NotSupportedException(
-                "This GGUF is an Edge0 skeleton (no routed experts: the latent-MoE experts live in the strata pack beside it). " +
-                "Only the CPU backend runs Edge0 so far (CUDA/Vulkan latent-MoE kernels are not written): use --device cpu.");
-        var problems = Qwen4ExpTensors.FindProblems(tensors, config, includeTrunk: true, includeMtp: false);
+        {
+            if (slots > 0) throw new NotSupportedException("Expert tiering is not available for Edge0 packs.");
+            (edge0Pack, pleFile) = DotLLM.Models.Edge0.Edge0Model.OpenSiblings(gguf, config, importableViews: device.HasExternalMemoryHost && !VulkanWeightImportPolicy.IsDisabled);
+        }
+        try
+        {
+        var problems = Qwen4ExpTensors.FindProblems(tensors, config, includeTrunk: true, includeMtp: false, skeleton: edge0Pack is not null);
         if (problems.Count > 0)
             throw new InvalidDataException("qwen4exp tensor table does not match the model contract: " +
                                            string.Join("; ", problems.Take(8)) + (problems.Count > 8 ? $"; (+{problems.Count - 8} more)" : ""));
+        if (edge0Pack is not null && (!config.Moe!.NormTopKProb || config.Moe.NumExperts != edge0Pack.Experts))
+            throw new InvalidDataException("Edge0 skeleton MoE configuration disagrees with the pack.");
+        // Refuse before ~52 GiB of uploads rather than at the first forward: the F16-output D / U kernels exist for a Q8_0 latent only (Q4_0 latent: follow-up #1997).
+        if (edge0Pack is not null && edge0Pack.LatentDenseType != QuantizationType.Q8_0)
+            throw new NotSupportedException($"The Vulkan Edge0 path has F16-output D / U kernels for a Q8_0 latent only, not {edge0Pack.LatentDenseType} (DOTLLM_EDGE0_LATENT=q4 packs run on the CPU; #1997).");
         if (q4.Ple is { } ple0 && ple0.Layers.Count > 1)
             throw new NotSupportedException("qwen4exp files carry one set of PLE hash constants; several PLE layers cannot be represented.");
 
@@ -156,6 +167,14 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         {
             var p = Qwen4ExpResidencyPlan.Create(tensors, config, residentCapacity, capacity, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
                 integerDot: device.HasIntegerDotProduct, kvElementBytes: KvStorage == VulkanKvStorage.F16 ? 2 : 4, rawKeysF16: IndexerRawF16, expertSlots: slots);
+            if (edge0Pack is not null)
+            {
+                // The skeleton table has no experts, D/U or n-gram table: add what the pack uploads (banks, BF16 router, D, U) and the host-only FP8 table.
+                long perLayer = (long)edge0Pack.Experts * edge0Pack.Hidden * 2 + (long)edge0Pack.Experts * edge0Pack.ExpertRecordBytes
+                    + edge0Pack.DLayerBytes + edge0Pack.ULayerBytes + (long)edge0Pack.Experts * 4 + (long)edge0Pack.Latent * 4;
+                var (_, pleRows, _) = DotLLM.Models.Gguf.Fp8PleTable.Open(pleFile!, config.Qwen4Exp!.Ple!.RowDim);
+                p = p with { DeviceWeightBytes = p.DeviceWeightBytes + perLayer * edge0Pack.Layers, HostOnlyBytes = p.HostOnlyBytes + pleRows * config.Qwen4Exp.Ple.RowDim };
+            }
             return pressure is not null ? p with { OtherProcessBytes = pressure.OtherBytes, OtherProcessDetail = pressure.DescribeCulprits() } : p;
         }
         var plan = MakePlan(kvCapacity);
@@ -185,7 +204,14 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
 
         // The n-gram table: registered host-only BEFORE any upload so no staging/import path can ever take it.
         (nint, long)? hostOnly = null;
-        if (tensors.TryGetValue(Qwen4ExpTensors.PerLayerTokenEmbd, out var tdesc))
+        if (edge0Pack is not null)
+        {
+            var (fp8Ptr, fp8Rows, _) = DotLLM.Models.Gguf.Fp8PleTable.Open(pleFile!, config.Qwen4Exp!.Ple!.RowDim);
+            long fp8Bytes = fp8Rows * config.Qwen4Exp.Ple.RowDim;
+            VulkanWeightImportPolicy.RegisterHostOnly(fp8Ptr, fp8Bytes);
+            hostOnly = (fp8Ptr, fp8Bytes);
+        }
+        else if (tensors.TryGetValue(Qwen4ExpTensors.PerLayerTokenEmbd, out var tdesc))
         {
             nint tptr = gguf.TensorDataPointer(tdesc);
             long tbytes = Dequantize.RowByteSize(tdesc.Shape[0], tdesc.QuantizationType) * tdesc.Shape[1];
@@ -216,7 +242,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             var phase = System.Diagnostics.Stopwatch.StartNew();
             var phases = new List<string>();
             void Mark(string what) { phases.Add($"{what}={phase.Elapsed.TotalSeconds:F1}s"); phase.Restart(); }
-            var layers = BuildHybridLayers(gguf, tensors, config, owned);
+            var layers = BuildHybridLayers(gguf, tensors, config, owned, edge0: edge0Pack is not null);
             Mark("hybridLayers");
             var embDesc = tensors[Qwen4ExpTensors.TokenEmbd];
             nint embPtr = gguf.TensorDataPointer(embDesc);
@@ -260,6 +286,34 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             // Routed experts are uploaded eagerly (resident): a model that cannot be resident was refused above, and the transient
             // per-forward upload path would be the 0.01 tok/s thrash class.
             // #874 parallel staging + banks allocated ahead; shared with the qwen35moe loader (#1224).
+            if (edge0Pack is not null)
+            {
+                using var e0Staging = VulkanStagingBuffer.CreateParallel(device, VulkanStagingBuffer.ParallelSlotBytes, VulkanStagingBuffer.ParallelSlotCount);
+                for (int il = 0; il < config.NumLayers; il++)
+                {
+                    var routerDesc = tensors[$"blk.{il}.ffn_gate_inp.weight"];
+                    if (routerDesc.QuantizationType != QuantizationType.BF16)
+                        throw new NotSupportedException($"Edge0 router blk.{il}.ffn_gate_inp.weight is {routerDesc.QuantizationType}; the Vulkan path reads BF16.");
+                    var e0Layer = Edge0LayerBuffers.Upload(device, e0Staging, edge0Pack, il, gguf.TensorDataPointer(routerDesc));
+                    try { moeBundles.Add(VulkanQwen3MoeMoeUpload.UploadLayer(device, layers[il].Moe, config.HiddenSize, residentQuant: true, e0Staging, null, 0, false, e0Layer)); }
+                    catch { e0Layer.Dispose(); e0Layer.Router.Dispose(); e0Layer.Records.Dispose(); throw; }   // UploadLayer took neither: the bundle never formed
+                    if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal))
+                        Console.Error.WriteLine($"[vulkan-load] edge0 layer {il}: live {VulkanQwen3MoeMoeUpload.LiveDeviceBytes(device) >> 20} MiB");
+                }
+                e0Staging.WaitAll();
+                // Rule 3 / zero-copy: say whether the 40 GB of records were imported in place. A refused import copies them (one contiguous buffer per layer) through
+                // the staging ring, a host bounce that must never pass unnoticed on a UMA device.
+                var e0 = moeBundles.Select(b => b.Edge0!).ToArray();
+                int recImported = e0.Count(b => b.RecordsImported), routerImported = e0.Count(b => b.RouterImported);
+                long recCopied = e0.Where(b => !b.RecordsImported).Sum(b => b.Experts * b.RecordBytes);
+                Console.Error.WriteLine($"[dotLLM] edge0 pack: expert records imported in place for {recImported}/{e0.Length} layers, BF16 routers for {routerImported}/{e0.Length}" +
+                                        (edge0Pack.ImportableViews || !(device.HasExternalMemoryHost && !VulkanWeightImportPolicy.IsDisabled) ? ""
+                                            : "; pack mapped READ-ONLY (could not open it for write), so no import was possible") + ".");
+                if (recImported < e0.Length)
+                    Console.Error.WriteLine($"[dotLLM] WARNING: edge0 expert records COPIED through host staging for {e0.Length - recImported} layers ({recCopied / (double)(1L << 30):F1} GiB, " +
+                                            $"first reason: {e0.First(b => !b.RecordsImported).RecordsFallbackReason}); zero-copy needs a UMA device with VK_EXT_external_memory_host and a writable pack.");
+            }
+            else
             VulkanQwen3MoeMoeUpload.UploadResidentLayers(device, layers.Select(l => (MoeLayerWeights?)l.Moe).ToArray(), config.HiddenSize,
                 (_, b) => moeBundles.Add(b), expertSlots: slots, sharedPackedDefault: false);
 
@@ -283,7 +337,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             if (q4.Ple is { } pc)
             {
                 pleLayer = pc.Layers[0];
-                ple = BuildPleBranch(gguf, tensors, config, q4, pc, pleLayer, owned);
+                ple = BuildPleBranch(gguf, tensors, config, q4, pc, pleLayer, owned, pleFile);
                 using var pleStaging = VulkanStagingBuffer.Create(device, 64L << 20);
                 pleGpu = VulkanQwen4ExpPleGpu.Upload(device, pleStaging, gguf, $"blk.{pleLayer}.ple_key.weight", $"blk.{pleLayer}.ple_value.weight",
                     q4.HyperConnectionCount * config.HiddenSize, Qwen4ExpResidencyPlan.PlannedRows(kvCapacity));
@@ -313,6 +367,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             model = new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
                 ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes, qsa, hostEmbedding, pleGpu);
             model._spvDir = spvDir;
+            if (edge0Pack is not null) { model._edge0Pack = edge0Pack; model._edge0Ple = pleFile; edge0Pack = null; pleFile = null; }   // the model owns them now
             if (slots > 0)
             {
                 model._tier = BuildExpertTier(device, gguf, config, moeBundles, slots);
@@ -341,6 +396,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                         device.LiveBytesTotal(), after?.OtherBytes ?? plan.OtherProcessBytes, plan.ReservedContextBytes, extraBytes);
                 long liveBeforeWiden = device.LiveBytesTotal();
                 model.SetPlannedRows(rows, why);
+                if (model._edge0Pack is { } ep)
+                {
+                    model._core.Q4AttachEdge0(Edge0LatentKernels.Create(device, spvDir), ep.Groups, ep.Latent, ep.Hidden, rows);
+                    Console.Error.WriteLine($"[dotLLM] edge0 latent-MoE scratch for {rows} rows: {model._core.Edge0ScratchBytes / (double)(1L << 20):F0} MiB; " +
+                                            $"{ep.Layers} layers x {ep.Experts} experts (Q3_K gate/up + IQ4_NL down resident, D/U {ep.LatentDenseType}).");
+                }
                 long widened = device.LiveBytesTotal() - liveBeforeWiden;
                 Console.Error.WriteLine($"[dotLLM] qwen4exp planned rows per forward: {rows} ({why}); base {plannedRows}-row scratch measured " +
                                         $"{scratchBaseBytes / (double)(1L << 20):F0} MiB" + (widened > 0 ? $", widening added {widened / (double)(1L << 20):F0} MiB" : "") + ".");
@@ -382,6 +443,13 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             core?.Dispose();
             foreach (nint p in owned) NativeMemory.AlignedFree((void*)p);
             if (hostOnly is { } h) VulkanWeightImportPolicy.UnregisterHostOnly(h.Item1);
+            throw;
+        }
+        }
+        catch
+        {
+            edge0Pack?.Dispose();
+            pleFile?.Dispose();
             throw;
         }
     }
@@ -435,7 +503,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     }
 
     private static Qwen3MoeLayerWeights[] BuildHybridLayers(GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t,
-        ModelConfig config, List<nint> owned)
+        ModelConfig config, List<nint> owned, bool edge0 = false)
     {
         var layout = config.HybridLayout!;
         var gdn = config.GdnConfig!.Value;
@@ -451,7 +519,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 PostAttnNormWeight = dummyNorm,
                 Gdn = isGdn ? LoadGdn(b, gguf, t, gdn) : null,
                 FullAttn = isGdn ? null : LoadAttention(b, gguf, t, layout.HeadCountKv[il], config.HeadDim),
-                Moe = LoadMoe(il, gguf, t, config, owned),
+                Moe = LoadMoe(il, gguf, t, config, owned, edge0: edge0),
             };
         }
         return layers;
@@ -501,7 +569,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     }
 
     private static MoeLayerWeights LoadMoe(int il, GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, ModelConfig config, List<nint> owned,
-        bool requantRoutedBanks = false)
+        bool requantRoutedBanks = false, bool edge0 = false)
     {
         var moe = config.Moe!;
         string p = $"blk.{il}.";
@@ -521,12 +589,14 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             return dst;
         }
 
-        var gateD = t[p + "ffn_gate_exps.weight"]; var upD = t[p + "ffn_up_exps.weight"]; var downD = t[p + "ffn_down_exps.weight"];
+        // Edge0 (G3, #1981): no routed-expert tensors here (they come from the pack) and the router stays BF16 on disk (uploaded raw by the Edge0 loader).
+        GgufTensorDescriptor gateD = default, upD = default, downD = default;
+        if (!edge0) { gateD = t[p + "ffn_gate_exps.weight"]; upD = t[p + "ffn_up_exps.weight"]; downD = t[p + "ffn_down_exps.weight"]; }
         var sg = t[p + "ffn_gate_shexp.weight"]; var su = t[p + "ffn_up_shexp.weight"]; var sd = t[p + "ffn_down_shexp.weight"];
         // #900: a smaller routed bank for the MTP head. Gate/up -> Q4_K (the fused decode chain and the multi-row MMVQ twin read it), down -> Q5_1
         // (K = the 640-wide intermediate is not a multiple of 256, so no K-quant fits; Q5_1 has a decode MMVQ). Draft quality only: the verify
         // forward decides every emitted token.
-        nint gateP = gguf.TensorDataPointer(gateD), upP = gguf.TensorDataPointer(upD), downP = gguf.TensorDataPointer(downD);
+        nint gateP = edge0 ? 0 : gguf.TensorDataPointer(gateD), upP = edge0 ? 0 : gguf.TensorDataPointer(upD), downP = edge0 ? 0 : gguf.TensorDataPointer(downD);
         QuantizationType gateQt = gateD.QuantizationType, upQt = upD.QuantizationType, downQt = downD.QuantizationType;
         if (requantRoutedBanks)
         {
@@ -535,7 +605,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             (downP, downQt) = RequantBank(downP, downQt, ne, hidden, inter, QuantizationType.Q5_1, owned);
         }
         return new MoeLayerWeights(
-            gate: F32(gguf, t, p + "ffn_gate_inp.weight", (long)ne * hidden),
+            gate: edge0 ? Array.Empty<float>() : F32(gguf, t, p + "ffn_gate_inp.weight", (long)ne * hidden),
             w1: new nint[ne], w2: new nint[ne], w3: new nint[ne],
             numExperts: ne, numExpertsPerTok: moe.NumExpertsPerTok, hiddenSize: hidden, intermediateSize: inter,
             normTopKProb: moe.NormTopKProb,
@@ -585,11 +655,14 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     /// dequantised to F32 once into host memory and run through the CPU GEMM. The table pointer is borrowed from the mmap and never copied.
     /// </summary>
     private static Qwen4ExpPleBranch BuildPleBranch(GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, ModelConfig config,
-        Qwen4ExpConfig q4, Qwen4ExpPleConfig ple, int layer, List<nint> owned)
+        Qwen4ExpConfig q4, Qwen4ExpPleConfig ple, int layer, List<nint> owned, GgufFile? fp8PleFile = null)
     {
         string b = $"blk.{layer}.";
         int hidden = config.HiddenSize, hc = q4.HyperConnectionCount, hcDim = hc * hidden;
-        var tdesc = t[Qwen4ExpTensors.PerLayerTokenEmbd];
+        // Edge0: the table is the FP8 E4M3FN file (I8 bytes + one table-wide scale), decoded row by row by the CPU codec; stock files carry it as a tensor.
+        nint tablePtr; QuantizationType tableQt; long tableRows; float tableScale = 0f;
+        if (fp8PleFile is not null) { (tablePtr, tableRows, tableScale) = DotLLM.Models.Gguf.Fp8PleTable.Open(fp8PleFile, ple.RowDim); tableQt = QuantizationType.I8; }
+        else { var tdesc = t[Qwen4ExpTensors.PerLayerTokenEmbd]; tablePtr = gguf.TensorDataPointer(tdesc); tableQt = tdesc.QuantizationType; tableRows = tdesc.Shape[1]; }
 
         Qwen4ExpProjection HostProj(string name)
         {
@@ -608,7 +681,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
 
         var convRaw = F32(gguf, t, b + "ple_conv1d.weight", (long)ple.ConvKernel * hcDim);   // [C][K] (K fastest)
         return new Qwen4ExpPleBranch(
-            gguf.TensorDataPointer(tdesc), tdesc.QuantizationType, tdesc.Shape[1], ple.RowDim,
+            tablePtr, tableQt, tableRows, ple.RowDim,
             ple.NgramSize, ple.HeadsPerNgram, ple.EosTokenId, ple.ConvKernel,
             ple.LayerMultipliers.Select(v => unchecked((long)v)).ToArray(),
             ple.HeadOffsets.Select(v => checked((long)v)).ToArray(),
@@ -616,7 +689,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             hc, hidden, config.NormEpsilon,
             F32(gguf, t, b + "ple_norm_key.weight", hcDim), F32(gguf, t, b + "ple_norm_query.weight", hcDim), F32(gguf, t, b + "ple_norm_conv.weight", hcDim),
             Qwen4ExpPle.TransposeConvWeight(convRaw, hcDim, ple.ConvKernel),
-            HostProj(b + "ple_key.weight"), HostProj(b + "ple_value.weight"));
+            HostProj(b + "ple_key.weight"), HostProj(b + "ple_value.weight"),
+            tableOptions: null, tableScale: tableScale);
     }
 
     /// <summary>

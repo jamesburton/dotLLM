@@ -57,8 +57,9 @@ public static class Edge0Model
     /// </summary>
     /// <param name="skeleton">The opened skeleton.</param>
     /// <param name="config">Its configuration.</param>
+    /// <param name="importableViews">Map the pack as shared writable views a UMA GPU driver can import in place (see <see cref="Edge0Pack.Open"/>).</param>
     /// <exception cref="FileNotFoundException">A sibling file is missing (the message names it and the file it was needed for).</exception>
-    public static (Edge0Pack Pack, GgufFile Ple) OpenSiblings(GgufFile skeleton, ModelConfig config)
+    public static (Edge0Pack Pack, GgufFile Ple) OpenSiblings(GgufFile skeleton, ModelConfig config, bool importableViews = false)
     {
         ArgumentNullException.ThrowIfNull(skeleton);
         ArgumentNullException.ThrowIfNull(config);
@@ -69,7 +70,7 @@ public static class Edge0Model
                 $"This GGUF has no routed experts (an Edge0 skeleton), so its pack and n-gram table must sit beside it, but {pleFile} is missing.", pleFile);
         var moe = config.Moe ?? throw new InvalidDataException("Edge0 skeleton has no MoE configuration.");
         bool q4 = string.Equals(Environment.GetEnvironmentVariable("DOTLLM_EDGE0_LATENT"), "q4", StringComparison.OrdinalIgnoreCase);
-        var pack = Edge0Pack.Open(dir, config.HiddenSize, moe.MoeIntermediateSize, preferLatentQ4: q4);
+        var pack = Edge0Pack.Open(dir, config.HiddenSize, moe.MoeIntermediateSize, preferLatentQ4: q4, importableViews: importableViews);
         try
         {
             pack.ColumnScaleMode = ColumnScaleModeFromEnvironment(Environment.GetEnvironmentVariable(ColumnScaleEnv));

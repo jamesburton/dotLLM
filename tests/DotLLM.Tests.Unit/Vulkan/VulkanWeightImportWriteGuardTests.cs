@@ -50,6 +50,7 @@ public class VulkanWeightImportWriteGuardTests(ITestOutputHelper output)
         try
         {
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT", null);
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DIRECT_STORAGE", "0");   // #1994: these tests characterise the mmap import path, not the DirectStorage default
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE", "1");   // the opt-in (#1991: default stays off, see docs/GPU.md)
 
             string before = Hash(path!);
@@ -74,6 +75,7 @@ public class VulkanWeightImportWriteGuardTests(ITestOutputHelper output)
         finally
         {
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT", origDisable);
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DIRECT_STORAGE", null);
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE", origWritable);
         }
     }

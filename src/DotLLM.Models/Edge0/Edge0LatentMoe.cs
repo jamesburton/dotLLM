@@ -216,8 +216,13 @@ public static unsafe class Edge0LatentMoe
     private static void GemmLatentDense(nint w, QuantizationType qt, float* b, float* c, int m, int k, int n, ComputeThreadPool? pool)
         => GemmAny(w, qt, b, c, m, k, n, pool);
 
+    /// <summary>Diagnostic A/B (<c>DOTLLM_EDGE0_F32_ACT=1</c>): D, U and the shared expert dequantise their Q8_0 / Q4_0 weights and dot against the F32 activations instead of
+    /// quantising the activations to int8 first. Slower; used to measure how much of a backend's disagreement with the CPU is the CPU's own activation quantisation (#1981).</summary>
+    private static readonly bool F32Activations = Environment.GetEnvironmentVariable("DOTLLM_EDGE0_F32_ACT") == "1";
+
     private static void GemmAny(nint w, QuantizationType qt, float* b, float* c, int m, int k, int n, ComputeThreadPool? pool)
     {
+        if (F32Activations) { MatMul.GemmDequantRows((byte*)w, qt, b, c, m, k, n, pool); return; }
         switch (qt)
         {
             case QuantizationType.Q8_0: MatMul.GemmQ8_0((byte*)w, b, c, m, k, n, pool, null); return;

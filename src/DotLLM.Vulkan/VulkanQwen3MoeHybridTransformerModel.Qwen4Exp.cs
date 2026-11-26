@@ -27,12 +27,12 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
         {
             throw new InvalidOperationException(Qwen4ExpResidencyPlan.ScratchGrowthMessage(seqLen, e.Message), e);
         }
-        if (resized) { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); }
+        if (resized) { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); _edge0Kernels?.InvalidateDescriptorCache(); }
         return resized;
     }
 
     /// <summary>Drops every cached descriptor set (call after re-creating buffers the caller feeds into this model's kernels).</summary>
-    internal void Q4InvalidateCaches() { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); }
+    internal void Q4InvalidateCaches() { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); _edge0Kernels?.InvalidateDescriptorCache(); }
 
     internal void Q4UploadPositions(ReadOnlySpan<int> positions) => UploadPositions(positions);
 
