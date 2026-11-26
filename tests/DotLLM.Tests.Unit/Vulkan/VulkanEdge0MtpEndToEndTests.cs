@@ -34,7 +34,8 @@ public sealed class VulkanEdge0MtpEndToEndTests(ITestOutputHelper output)
 
     private const int Chain = 3;
 
-    private const int PrefillChunk = 1024;
+    /// <summary>Long-context prompt length: past the 2048 planned rows, so the single-call prefill must chunk itself with the MTP head attached (#2011).</summary>
+    private const int LongTokens = 3200;
 
     private static FixtureLocation Locate() => TestFixtureResolver.ResolveFile("DOTLLM_EDGE0_SKELETON", "Edge0", "Edge0-145B-q3k", "model-skeleton.gguf",
         "native_experts.txt", "experts.bin", "ple-fp8.gguf", "mtp/dense.txt", "mtp/dense.bin", "mtp/experts.bin", "mtp/draft_vocab.bin");
@@ -192,12 +193,8 @@ public sealed class VulkanEdge0MtpEndToEndTests(ITestOutputHelper output)
             var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
             var gen = new List<int>();
             var t0 = System.Diagnostics.Stopwatch.StartNew();
-            for (int c = 0; c < prompt.Length; c += PrefillChunk)   // the Edge0 trunk forward takes at most 2048 rows (latent scratch)
-            {
-                int m = Math.Min(PrefillChunk, prompt.Length - c);
-                using var pf = vk.Forward(prompt.AsSpan(c, m), Pos(m, c), -1, kv, null, st, true);
-                if (c + m == prompt.Length) gen.Add(Argmax(Row(pf, pf.Shape[0] - 1)));
-            }
+            // ONE call for the whole prompt, however long: the model chunks it past its planned rows itself (#2011; this used to throw past 2048 rows with an MTP state).
+            using (var pf = vk.Forward(prompt, Pos(prompt.Length), -1, kv, null, st, true)) gen.Add(Argmax(Row(pf, pf.Shape[0] - 1)));
             var buf = new int[k + 1];
             var per = new List<int>();
             while (gen.Count < n)
@@ -220,12 +217,7 @@ public sealed class VulkanEdge0MtpEndToEndTests(ITestOutputHelper output)
             var mg = new List<(float, int)>();
             void Take(float[] row) { gen.Add(Argmax(row)); if (margins) mg.Add(Margin(row)); }
             var t0 = System.Diagnostics.Stopwatch.StartNew();
-            for (int c = 0; c < prompt.Length; c += PrefillChunk)
-            {
-                int m = Math.Min(PrefillChunk, prompt.Length - c);
-                using var pf = vk.Forward(prompt.AsSpan(c, m), Pos(m, c), -1, kv, true);
-                if (c + m == prompt.Length) Take(Row(pf, pf.Shape[0] - 1));
-            }
+            using (var pf = vk.Forward(prompt, Pos(prompt.Length), -1, kv, true)) Take(Row(pf, pf.Shape[0] - 1));
             while (gen.Count < n)
                 using (var lg = vk.Forward([gen[^1]], [prompt.Length + gen.Count - 1], -1, kv, true)) Take(Row(lg, 0));
             return (gen, t0.Elapsed.TotalSeconds, mg);
@@ -253,23 +245,23 @@ public sealed class VulkanEdge0MtpEndToEndTests(ITestOutputHelper output)
             output.WriteLine($"ACCEPTTOTAL K={k}: {accepted}/{drafted} drafts accepted ({100.0 * accepted / drafted:F1}%), {(double)tokens / rounds:F2} tokens per verify round, {same}/{prompts.Length} prompts identical to plain greedy");
         }
 
-        // ── 2b. long context (DOTLLM_EDGE0_MTP_LONG=1; =only skips sections 1-2): a ~2.3K-token prompt puts the head's own attention past the dense window (~2051 cells), so its
+        // ── 2b. long context (DOTLLM_EDGE0_MTP_LONG=1; =only skips sections 1-2): a ~3.2K-token prompt puts the head's own attention past the dense window (~2051 cells), so its
         // sparse indexer (the index_qk_proj q/k split) is live, and 256 speculative tokens exercise many reject/rollback rounds against plain greedy ──
         if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_MTP_LONG") is "1" or "only")
         {
-            // DOTLLM_EDGE0_MTP_LONG_TEXT = a UTF-8 text file (e.g. the wikitext corpus): its first ~2.3K tokens, so the continuation is not a copy of the prompt.
+            // DOTLLM_EDGE0_MTP_LONG_TEXT = a UTF-8 text file (e.g. the wikitext corpus): its first ~3.2K tokens, so the continuation is not a copy of the prompt.
             // Without it the two paragraph prompts alternate, and the repeated text makes acceptance trivially high (a rollback/indexer smoke only).
             int[] longPrompt;
             string? textPath = Environment.GetEnvironmentVariable("DOTLLM_EDGE0_MTP_LONG_TEXT");
             if (textPath is not null)
             {
                 var tok = GgufBpeTokenizerFactory.Load(gguf.Metadata);
-                longPrompt = tok.Encode(File.ReadAllText(textPath)[..12000]).ToArray()[..2300];
+                longPrompt = tok.Encode(File.ReadAllText(textPath)[..20000]).ToArray()[..LongTokens];
             }
             else
             {
                 var parts = new List<int>();
-                for (int r = 0; parts.Count < 2300; r++) parts.AddRange(r == 0 ? prompts[2] : prompts[2 + (r % 2)]);   // the two paragraph prompts, alternating
+                for (int r = 0; parts.Count < LongTokens; r++) parts.AddRange(r == 0 ? prompts[2] : prompts[2 + (r % 2)]);   // the two paragraph prompts, alternating
                 longPrompt = parts.ToArray();
             }
             const int NL = 256;
