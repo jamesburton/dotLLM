@@ -234,12 +234,12 @@ public sealed record DeviceInfoDto
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public uint? PciVendorId { get; init; }
 
-    /// <summary>PCI device id (Vulkan today), when known.</summary>
+    /// <summary>PCI device id (Vulkan; CUDA through NVML), when known.</summary>
     [JsonPropertyName("pci_device_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public uint? PciDeviceId { get; init; }
 
-    /// <summary>Driver version: the raw Vulkan <c>driverVersion</c>, or the CUDA driver's supported CUDA version (<c>cuDriverGetVersion</c>).</summary>
+    /// <summary>Driver version: the raw Vulkan <c>driverVersion</c>, or the NVIDIA driver version from NVML (e.g. <c>566.36</c>).</summary>
     [JsonPropertyName("driver_version")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? DriverVersion { get; init; }
@@ -249,10 +249,20 @@ public sealed record DeviceInfoDto
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? IsIntegrated { get; init; }
 
-    /// <summary>Graphics API version (Vulkan <c>apiVersion</c>, as <c>major.minor.patch</c>).</summary>
+    /// <summary>Graphics API version: Vulkan <c>apiVersion</c> as <c>major.minor.patch</c>, or the CUDA version the driver supports (<c>cuDriverGetVersion</c>).</summary>
     [JsonPropertyName("api_version")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ApiVersion { get; init; }
+
+    /// <summary>Vulkan <c>VkDriverId</c> (Vulkan 1.2+), when known.</summary>
+    [JsonPropertyName("driver_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DriverId { get; init; }
+
+    /// <summary>Vulkan <c>driverInfo</c>: the driver's own version string (Vulkan 1.2+), when known.</summary>
+    [JsonPropertyName("driver_info")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DriverInfo { get; init; }
 }
 
 // ───────────────────────────────── pull (#454) ─────────────────────────────────

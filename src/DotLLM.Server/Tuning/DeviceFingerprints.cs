@@ -57,6 +57,8 @@ public static class DeviceFingerprints
         // UMA devices report a heap whose size drifts with the system; it must not enter the key.
         DeviceMemoryBytes = d.IsIntegrated == true ? null : d.TotalMemoryBytes,
         DriverVersion = d.DriverVersion,
+        DriverId = d.DriverId,
+        DriverInfo = d.DriverInfo,
         ApiVersion = d.ApiVersion,
         OsBuild = Environment.OSVersion.VersionString,
     };
