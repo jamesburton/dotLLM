@@ -188,7 +188,8 @@ this release yet (#1902, slice 2); until then a result can only come from a tuni
   defaults run, with the reason (and required and free bytes) in the warning; nothing spills. A setting this build refuses (for example a
   TurboQuant request the current host cannot run in place) is dropped with its reason, never replaced by another one.
 - **Context.** The recorded peaks were measured at the result's tuned context, so they bound only that much: a served context above it
-  (`--ctx-size`, or the saved context on `serve`), or a result without a tuned context, is not admitted and the defaults run.
+  (`--ctx-size`, or the saved context on `serve`), a result without a tuned context, or a `serve` whose context is unknown before load
+  (no `--ctx-size` and no saved context, so the checkpoint window or a VRAM fit), is not admitted and the defaults run.
 - **Where each value came from** is reported on `GET /v1/status` (and so `/props` `activity`) as `settings_source`: `flag`, `auto` or `default`
   per setting ([SERVER.md](SERVER.md#model-swaps-get-v1status-and-sse-keep-alive-1023)). Without `--auto` the field is absent and nothing changes.
 - `--auto` costs one store lookup before the model loads, and nothing at all when it is not given.

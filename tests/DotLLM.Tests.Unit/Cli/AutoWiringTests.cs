@@ -48,7 +48,10 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     private void SaveFor(TunedSettings settings, bool partial = false, bool recordPeaks = true)
     {
         if (recordPeaks)
-            settings = settings with { TunedContext = settings.TunedContext ?? 4096, PeakHostBytes = settings.PeakHostBytes ?? (64L << 20) };
+            settings = settings with
+            {
+                TunedContext = settings.TunedContext ?? 4096, ContextSize = settings.ContextSize ?? 4096, PeakHostBytes = settings.PeakHostBytes ?? (64L << 20),
+            };
         var key = AutoEntry.BuildKey(Request(AutoCommand.Run, []));
         new TuningStore().Save(new TuningResult
         {

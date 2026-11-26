@@ -178,7 +178,10 @@ public static class AutoSettings
                 ? "the saved result does not record the context its peak memory was measured at"
                 : context > tuned
                     ? $"serving context {context} is above the tuned context {tuned}, so the recorded peak memory does not bound it"
-                    : admit(c, context);
+                    // serve with no --ctx-size and no saved context serves the checkpoint window (or a VRAM fit): unknown here, so unbounded.
+                    : context <= 0 && policy.Command == AutoCommand.Serve
+                        ? "the served context is not known before load (no --ctx-size and no saved context), so the recorded peak memory does not bound it"
+                        : admit(c, context);
             if (refused is not null)
             {
                 c = new TunedSettings();

@@ -167,6 +167,20 @@ public sealed class AutoSettingsTests
     }
 
     [Fact]
+    public void Serve_WithUnknownServedContext_IsNotAdmitted_UnlessTheResultSavedOne()
+    {
+        // serve without --ctx-size serves the checkpoint window, which is not known here: the peak at 8192 does not bound it.
+        var serve = new AutoPolicy(AutoCommand.Serve);
+        var a = Apply(Match(TuningMatchKind.Hit, Saved), policy: serve, ctx: 0);
+        Assert.Equal(new TunedSettings(), a.Applied);
+        Assert.Contains(a.Warnings, w => w.Contains("not known before load", StringComparison.Ordinal));
+        // a saved context within the tuned one makes the served context known, and it is admitted
+        Assert.Equal("q8_0", Apply(Match(TuningMatchKind.Hit, Saved with { ContextSize = 8192 }), policy: serve, ctx: 0).Applied.CacheTypeK);
+        // run sizes its own cache from prompt + max tokens: an unknown (0) context is admitted there
+        Assert.Equal("q8_0", Apply(Match(TuningMatchKind.Hit, Saved), ctx: 0).Applied.CacheTypeK);
+    }
+
+    [Fact]
     public void ResultWithoutTunedContext_IsNotAdmitted()
     {
         var a = Apply(Match(TuningMatchKind.Hit, Saved with { TunedContext = null }), ctx: 0);
