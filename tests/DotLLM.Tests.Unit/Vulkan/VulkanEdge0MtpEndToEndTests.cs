@@ -238,7 +238,7 @@ public sealed class VulkanEdge0MtpEndToEndTests(ITestOutputHelper output)
         }
 
         const int N = 96;
-        foreach (int k in onlyLong ? Array.Empty<int>() : new[] { 3, 4 })
+        foreach (int k in onlyLong || Environment.GetEnvironmentVariable("DOTLLM_EDGE0_MTP_AUDIT_ONLY") == "1" ? Array.Empty<int>() : new[] { 3, 4 })
         {
             int drafted = 0, accepted = 0, rounds = 0, tokens = 0, same = 0;
             for (int p = 0; p < prompts.Length; p++)
@@ -281,11 +281,25 @@ public sealed class VulkanEdge0MtpEndToEndTests(ITestOutputHelper output)
             if (acc == 0) failures.Add("long context: no draft accepted");
         }
 
+        // ── 2b'. audit (DOTLLM_EDGE0_MTP_AUDIT=1): every subset draft step also scores the full vocabulary; how often is the full argmax outside the subset? ──
+        if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_MTP_AUDIT") == "1")
+        {
+            VulkanQwen4ExpTransformerModel.DraftVocabAudit = true;
+            VulkanQwen4ExpTransformerModel.Edge0DraftVocabEnabled = true;
+            try
+            {
+                for (int p = 0; p < prompts.Length; p++) Speculate(prompts[p], N, 4);
+                output.WriteLine($"DRAFTAUDIT steps {vk.AuditSteps}: same token {vk.AuditAgree} ({100.0 * vk.AuditAgree / vk.AuditSteps:F1}%), full argmax outside the subset {vk.AuditFullTopOutsideSubset} ({100.0 * vk.AuditFullTopOutsideSubset / vk.AuditSteps:F1}%), full argmax inside but different {vk.AuditDisagreeInside}");
+            }
+            finally { VulkanQwen4ExpTransformerModel.DraftVocabAudit = false; }
+            if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_MTP_AUDIT_ONLY") == "1") return;
+        }
+
         // ── 2c. draft-vocab subset vs full-vocab drafting (#2013), interleaved in one session. DOTLLM_EDGE0_MTP_DRAFTVOCAB=1 (SPEED=0 skips the plain speed run after it) ──
         if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_MTP_DRAFTVOCAB") == "1")
         {
             Assert.True(vk.HasDraftVocabSubset, "the Edge0 head attached no draft-vocab subset (LM head not Q8_0, or matmul_q8_0_mmvq_rows.spv missing)");
-            int nIds = (int)(new FileInfo(Path.Combine(Edge0MtpPack.Find(Path.GetDirectoryName(fx.Path!)!)!, "draft_vocab.bin")).Length / 4);
+            int nIds = File.ReadAllBytes(Path.Combine(Edge0MtpPack.Find(Path.GetDirectoryName(fx.Path!)!)!, "draft_vocab.bin")).Length / 4;
             const int rowBytes = 2560 / 32 * 34;
             output.WriteLine($"DRAFTVOCAB LM-head bytes per draft step: full {(long)V * rowBytes / 1e6:F1} MB ({V} rows), subset {(long)nIds * rowBytes / 1e6:F1} MB ({nIds} rows) + ids {nIds * 4 / 1e3:F0} KB; logits download {V * 4 / 1e3:F0} KB -> {nIds * 4 / 1e3:F0} KB");
             Speculate(prompts[1], 16, 3);   // warm

@@ -45,11 +45,17 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     private float[]? _mtpLogits;
 
     /// <summary>
-    /// Edge0 draft steps score only the pack's draft vocabulary (<c>draft_vocab.bin</c>, 106,299 of 248,320 rows of the Q8_0 LM head, read in place) and map the argmax back to the
+    /// full vocabulary (#2013). Verify is unchanged, so the text cannot change; only the drafts do. OPT-IN (<c>DOTLLM_EDGE0_DRAFT_VOCAB=1</c> at startup, or setting this): measured net slower, because the subset costs more acceptance than the cheaper LM head saves (see docs/SPECULATIVE.md).
     /// full vocabulary (#2013). Verify is unchanged, so the text cannot change; only the drafts do. <c>DOTLLM_EDGE0_DRAFT_VOCAB=0</c> at startup (or setting this) drafts over the full vocabulary (A/B).
     /// Applies to the arg-max draft path; <see cref="ForwardMtp"/> always returns the full logit row.
     /// </summary>
-    public static bool Edge0DraftVocabEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_EDGE0_DRAFT_VOCAB") != "0";
+    public static bool Edge0DraftVocabEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_EDGE0_DRAFT_VOCAB") == "1";
+
+    /// <summary>Diagnostic (#2013): also score the full vocabulary on every subset step and count agreement; off by default (costs a full LM-head GEMV per step).</summary>
+    internal static bool DraftVocabAudit { get; set; }
+
+    /// <summary>Audit counters: steps, same token, full argmax outside the subset (unreachable by the subset), full argmax inside yet different (must be 0 except exact ties).</summary>
+    internal long AuditSteps, AuditAgree, AuditFullTopOutsideSubset, AuditDisagreeInside;
 
     /// <summary>Test / proof hook: draft steps that scored the vocabulary subset.</summary>
     internal long SubsetDraftSteps;
@@ -712,9 +718,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
             if (sub is not null)
                 subset = _core.Q4TryRecordMatmulRows(cmd, w0.OutputWeight, tst.NormOutput, sub.Logits, sub.IdsBuffer,
                     m: sub.Ids.Length, k: w0.OutputInputDim, weightRows: w0.OutputOutputDim);
-            if (!subset)
+            if (!subset || DraftVocabAudit)
+            {
+                if (subset) KernelSupport.ComputeToComputeBarrier(cmd);
                 _core.Q4RecordMatmul(cmd, w0.OutputWeight, w0.OutputDeviceQuantType, tst.NormOutput, tst.Logits,
                     outputDim: w0.OutputOutputDim, inputDim: w0.OutputInputDim, seqLen: 1);
+            }
         }
         KernelSupport.ComputeToHostBarrier(cmd);
         long tSub = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -729,6 +738,16 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
             SubsetDraftSteps++;
             _device.Download(sub!.Logits, sub.Host);
             top = Edge0DraftVocabHead.ArgMax(sub.Host, sub.Ids);
+            if (DraftVocabAudit)
+            {
+                _mtpLogits ??= new float[_vocab];
+                _device.Download(tst.Logits, _mtpLogits);
+                int fullTop = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)_mtpLogits);
+                AuditSteps++;
+                if (fullTop == top) AuditAgree++;
+                else if (Array.IndexOf(sub.Ids, fullTop) < 0) AuditFullTopOutsideSubset++;
+                else AuditDisagreeInside++;   // the full argmax IS in the subset yet the subset argmax differs: a bug (or an exact tie)
+            }
         }
         else
         {
