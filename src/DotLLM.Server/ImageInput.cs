@@ -57,6 +57,7 @@ public static class ImageInput
             {
                 holder.Encoder?.Dispose();
                 holder.Encoder = null;
+                // DOTLLM_MMPROJ: path of the vision projector GGUF for image input (default: the mmproj*.gguf next to the model file).
                 string? mmproj = Environment.GetEnvironmentVariable("DOTLLM_MMPROJ");
                 if (string.IsNullOrEmpty(mmproj)) mmproj = VisionSupport.FindMmproj(state.LoadedModelPath);
                 if (mmproj is null || !File.Exists(mmproj))

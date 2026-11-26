@@ -415,6 +415,7 @@ Option groups: sampling (`--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-*`
 | `--frequency-penalty` `<number>` | 0 |  | OpenAI-style frequency penalty: subtracted proportionally to occurrence count. 0 = disabled. |
 | `--gpu-layers` `<int>` | unset |  | CUDA layer placement: 'auto' (the largest number of leading layers whose weights, KV for the context and scratch fit in free VRAM; the rest run on the CPU), or N leading layers on the GPU and the rest on the CPU (0 = CPU only, 'all' or -1 = every layer). Omit for the device default: every layer with --device gpu, and with --device auto an automatic split when the model does not fit a CUDA device whole. Ignored on vulkan (whole model is device-resident). |
 | `--grammar` `<text>` | unset |  | GBNF grammar string or file path (prefixed with @) for grammar response format. |
+| `--image` `<text>` | unset |  | Image file (PNG or binary PPM) to include in the prompt; repeatable. Needs a vision model (Inkling 2) and its mmproj GGUF (--mmproj, or an mmproj*.gguf next to the model). The prompt is wrapped as one user turn: the images first, then the text. |
 | `--json` | off |  | Output result as a single JSON object (suppresses all formatted output). |
 | `--kv-quant-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache key storage: f16, q8_0, q4_0, or TurboQuant tq1..tq8 (both sides the same tq format). Synonym of --cache-type-k. For the CUDA hybrid-dense model (Bonsai-2 / qwen35) overrides DOTLLM_HYBRID_KV; quantized KV needs numKvHeads*headDim % 32 == 0. |
 | `--kv-quant-v` `<text>` | unset |  | KV-cache value storage: f16, q8_0, q4_0, or TurboQuant tq1..tq8 (both sides the same tq format). Synonym of --cache-type-v. See --kv-quant-k. |
@@ -424,6 +425,7 @@ Option groups: sampling (`--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-*`
 | `--lora` `<text>` | unset |  | Path to a PEFT LoRA adapter dir; repeatable to stack adapters, optional weight 'path=0.7'. Omit for base. |
 | `--max-tokens`, `-n` `<int>` | 128 |  | Maximum number of tokens to generate (default 128). Also sizes the KV cache for this run: prompt tokens + this value, capped at the model's context length. |
 | `--min-p` `<number>` | 0 |  | Min-P sampling threshold. 0 = disabled. |
+| `--mmproj` `<text>` | unset |  | Vision projector GGUF (mmproj) for --image. Default: the first mmproj*.gguf in the model's directory. |
 | `--moe-cache-mib` `<text>` | unset | `DOTLLM_MOE_CACHE_MIB` | VRAM expert-cache size in MiB when experts are offloaded; default 'auto' = the measured free-VRAM budget. Larger values are clamped to the budget. Env fallback: DOTLLM_MOE_CACHE_MIB. |
 | `--moe-cache-policy` `<text>` | unset | `DOTLLM_MOE_CACHE_POLICY` | Expert-cache replacement policy: 'slru' (default), 'lru' or 'lfu'. Env fallback: DOTLLM_MOE_CACHE_POLICY. |
 | `--moe-calibrate` | off | `DOTLLM_MOE_CALIBRATE` | Re-run the MoE offload cost calibration (PCIe bandwidth, sync latency, CPU time per expert) instead of reading the cached record in %LOCALAPPDATA%/dotllm/moe-calibration.json. Env fallback: DOTLLM_MOE_CALIBRATE=1. |
@@ -1121,6 +1123,8 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_EMBED_PAR_MIN` | Minimum batch size for one-sequence-per-core execution; below it a batch runs sequentially on the pooled kernels. Env DOTLLM_EMBED_PAR_MIN overrides (benchmarking). | `BertEncoderModel.cs` |
 | `DOTLLM_G4_PROF` | Env-gated (DOTLLM_G4_PROF=1) stopwatch buckets for the Gemma-4 CPU layer path. | `G4Prof.cs` |
 | `DOTLLM_I2S_CACHE` | Builds a BitNetI2SCacheContext for a BitNet checkpoint so repeated loads reuse the ternary I2_S packing instead of re-quantizing bf16 weights. The cache lives in a hidden .dotllm-i2s-cache folder beside the checkpoint and is ke... | `ModelLoader.cs` |
+| `DOTLLM_INKLING2_CONV_STATE` | (not described in source) | `Inkling2TransformerModel.cs` |
+| `DOTLLM_INKLING2_LOOP_CONTROLLER` | Options from DOTLLM_INKLING2_LOOP_CONTROLLER (f32\|q8_0\|f16\|bf16) and DOTLLM_INKLING2_CONV_STATE (f32\|bf16; F16 is ruled out); unset variables keep the defaults. Used by the measurement harness; a bad value throws rather tha... | `Inkling2TransformerModel.cs` |
 | `DOTLLM_LITTLEBIT_DENSE_CONTROL` | Loads a NanoQuant composite (issue #869) from a GGUF and registers it as a LittleBit-kind weight. A non-empty rowSplits splits the stacked output rows (attn_qkv) into one weight per entry. With DOTLLM_LITTLEBIT_DENSE_CONTROL=1... | `FactorizedWeights.cs` |
 | `DOTLLM_LORA_FORCE_Q8_PREQUANT` | Phase 4d.5 / Gap 2 - fast-path plumbing: when both base and adapter B are Q8_0 AND the caller pre-quantised x, we can route stage 1 through `MatMul.GemmQ8_0(preQuantizedInput=preQuantX)` and skip the activation-quant cost. The... | `LoraProjection.cs` |
 | `DOTLLM_MOE_LEGACY_PACKED` | (not described in source) | `Lfm2MoeTransformerModel.cs` |
@@ -1139,6 +1143,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 
 | Variable | What the source says | Defined in |
 |---|---|---|
+| `DOTLLM_MMPROJ` | DOTLLM_MMPROJ: path of the vision projector GGUF for image input (default: the mmproj*.gguf next to the model file). | `ImageInput.cs` |
 | `DOTLLM_VK_QWEN4EXP_QSA` | Issue #1324: qwen4exp on Vulkan sizes its K/V + indexer caches at load, so the serve options that decide the window are handed to it first: --ctx-size becomes the requested capacity (reduced to what fits the device) and the K/V... | `ServerStartup.cs` |
 
 #### Tray.Core

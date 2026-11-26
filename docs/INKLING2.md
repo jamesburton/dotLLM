@@ -126,7 +126,7 @@ neither a KL below ~4e-3 nor free-running greedy identity is a meaningful bar ag
 
 ## 9. Not in this slice
 
-- **Vision** (`mmproj-Inkling-2-Mini-Q8_0.gguf`, llama.cpp `tools/mtmd/models/inkling2v.cpp`): ViT of 23 layers, hidden 1024, 16 heads, patch 20, temporal patch 2, axial RoPE theta 1e4, exact GELU, merge 2, projector width 4096;
+- **Vision**: implemented on the CPU in issue #2035, see section 11 (Vulkan vision is a later slice).
   images enter the text stream as `<|content_image|><|unused_200054|>` placeholders whose embeddings are injected *without* `token_embd_norm` (llama.cpp: "do not normalize raw embeddings input"). The loader must accept an embedding-input forward.
 - **DSpark drafter** (`dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`): 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
   `target_layer_ids = [5, 23, 41, 48]` counted in **layer visits** (the target exposes the input of visit `n` and the final norm output as id 48: `res->t_layer_inp[visit]` in `inkling2-loop.cpp`). The CPU model keeps the trace hook points
@@ -185,3 +185,58 @@ The four are indistinguishable at this resolution (differences of 5e-4 in KL are
 **Conv-state storage** (3.8 MB at F32 for all 48 slots; the sweep is only meaningful because the harness carries state across calls): F32 3.96e-3 / max 6.6e-2; **BF16 3.91e-3 / max 0.11** (4 mismatches, 0 confident); **F16 5.65e-3 / max 0.24, top-1 97.6%** — F16 is visibly worse than BF16 (a value range the 5-bit exponent cannot hold), BF16 is on par with F32 on mean KL. With the loop controller at BF16 the conv-state arms are F32 3.37e-3 (4 mismatches) and BF16 4.10e-3 (2 mismatches), 0 confident in both.
 
 **Throughput** (32 threads, `cpu-bench` lock held, NVFP4 file, F32 conv state; one measurement, llama.cpp b12780 CPU measures ~10.5 tok/s decode on the same file): prefill 128 tokens 21.4 tok/s, decode 9.1 tok/s (110 ms/token) before the refactor; 22.8 / 9.8 tok/s (102 ms/token) after, BF16 defaults. Not tuned: attention, depth mixing and the convs are scalar loops, MoE is bucketed per expert.
+
+## 11. Vision (CPU, issue #2035)
+
+`mmproj-Inkling-2-Mini-Q8_0.gguf` (`general.architecture = clip`, projector `inkling2v`; llama.cpp b12780 `tools/mtmd/models/inkling2v.cpp`, `mtmd-graph.cpp` `build_vit`,
+`mtmd-image.cpp` `mtmd_image_preprocessor_inkling2v`). Code: `src/DotLLM.Models/Vision/` (`Inkling2VisionEncoder`, `Inkling2ImagePreprocessor`, `ImageDecoder`, `VisionSupport`),
+contracts in `src/DotLLM.Core/Vision/` (`IImageEncoder`, `ImageEmbeddings`, `IImageInputModel`, `ImagePlaceholders`).
+
+**Preprocessing.** No fixed-size resize: the image keeps its size and is padded right/bottom to a multiple of `patch_size * merge = 40`. The padded buffer starts at **-1.0 in raw pixel units**
+and is then normalised with `(v - 127.5) / 127.5` (mean = std = 0.5), so padding is -1.0078, not -1 (a reference quirk, kept). Over `4096 tokens * 1600 px` the reference resizes (bicubic); we
+area-average instead, so over-limit images are not parity-gated. Tokens = `(W/40) * (H/40)`.
+
+**Tower.** Patch conv 20x20x3 -> 1024 (F32, no bias; the temporal-2 kernel is already folded into one frame; the reference computes it through an **F16 im2col**, so normalised pixels are rounded to
+F16 first, replicated). The 32x32 position embeddings are interpolated with ggml's bilinear upscale (half-pixel centres, clamped, no antialias; used as-is at a 32x32 grid). CLS (`class_embd + class_position_embd`)
+is prepended at RoPE position (0, 0); patches are (x+1, y+1). LayerNorm (eps 1e-5, `pre_ln`, no post-LN), then 23 x [LN, QKV+bias, 2D RoPE theta 1e4 (head 64: dims 0-31 rotate adjacent pairs by the column position,
+dims 32-63 by the row position), full non-causal attention (scale 1/8), o-proj+bias, **LayerScale ls1**, residual, LN, up+bias, erf GELU, down+bias, **ls2**, residual]. CLS is dropped, patches are merged
+2x2 (a merged token is `[(2i,2j), (2i+1,2j), (2i,2j+1), (2i+1,2j+1)]`, x fastest, row-major over the merged grid), then `mm.1` (4096x4096, no bias), erf GELU, `mm.2` (4096 -> 2304, no bias).
+
+**Memory / precision.** Q8_0 matrices are read in place through the Q8_0 GEMM (never expanded). `patch_embd` (4.9 MB), `position_embd` (4 MB), biases and layer scales stay F32 in the file and are read in
+place (listed for sign-off, not converted). Activations are per-call F32 transients in native scratch (`Inkling2Arena`; a warm 640x640 encode allocates < 256 KB of managed memory,
+`Inkling2VisionAllocationTests`). The stored result is **F16** (`ImageEmbeddings`, `tokens x 2304 x 2` bytes: 69 KB for a 15-token image, 2 MB at 640x640, 19 MB at the 4096-token limit).
+Attention runs per (head, 16-query block) with a native score tile, so memory is O(N), not O(N^2).
+
+**Prompt side.** The template renders ONE `<|content_image|><|unused_200054|>` per image part; the engine widens the placeholder to the image's token count (HF `Inkling2Processor`) and
+`Inkling2TransformerModel.ForwardWithImages` replaces those positions' token embeddings with the image rows, **bypassing `token_embd_norm`** (llama.cpp: "do not normalize raw embeddings input").
+llama.cpp's mtmd feeds `<|content_image|>` as text, then the image rows (no end marker); the token streams are identical (verified: oracle chunk 1 ends `... 200000 200005`, no doubling).
+Attention over image tokens is causal (`mtmd_decode_use_non_causal` is false for inkling2v). A request with images reuses and retains no prefix cache (token ids alone cannot tell two images apart).
+
+**Plumbing.** `ChatMessage.ContentParts` (text / image_url) is rendered to the template as the OpenAI part list; `InferenceOptions.Images` + `ImagePlaceholderTokenId` carry the encoded images into
+`TextGenerator`; CLI `dotllm run --image <png|ppm> [--mmproj <gguf>]` (mmproj defaults to the `mmproj*.gguf` next to the model); server `/v1/chat/completions` accepts `image_url` parts
+(`data:` URIs only, projector next to the model or `DOTLLM_MMPROJ`, loaded on first use; the continuous-batch scheduler is bypassed for such requests). PNG (all colour types, non-interlaced) and binary
+PPM are decoded without dependencies; JPEG is refused by name. A backend plugs in by implementing `IImageEncoder` (host F16 output) and `IImageInputModel`.
+
+**Oracle.** `tools/inkling2-vision-oracle/`: `oracle.c` (a C program over `llama.dll` + `mtmd.dll` of b12780: `mtmd_tokenize` / `mtmd_encode_chunk` / `mtmd_get_output_embd`, then
+`mtmd_helper_eval_chunks` + greedy teacher forcing, `-fa off`, CPU; dumps the full F32 embeddings and the full-vocabulary logits of every step), `gen_inputs.py` (test images and prompts),
+`trim_trace.py` (trims `llama-mtmd-debug -p encode` dumps to per-checkpoint corner values + sums). Cached under `~/.dotllm/test-cache/token-oracles/inkling2/vision/`.
+
+**Results (CPU, vs llama.cpp b12780 CPU).**
+
+| gate | result |
+|---|---|
+| per-op checkpoints (`llama-mtmd-debug`, rainbow 80 = interpolated, 640 = identity), early stages | equal to the printed precision (<= 5e-5 = 4 decimals); later stages drift to ~1e-2 of the corner scale, tensor sums within 3e-4 of N*rms |
+| embeddings on the real path (F32 oracle vs our F16), relRMS / min row cosine | 190x110: 2.1e-2 / 0.9992; 80: 1.8e-2 / 0.9998; 640: 3.3e-2 / 0.9950 |
+| end-to-end teacher-forced KL of text logits (full vocabulary), 13 rows per image | 80: 1.8e-3; 190x110: 1.07e-2; 640: 9.6e-3; top-1 13/13 on all, 0 greedy mismatches of 12 (text-only floor on this model: 4e-3) |
+
+The embedding gap is a **noise floor, not an error**: perturbing our own input by ~1e-4 relative (F16 im2col rounding on/off) moves the embeddings by the same 2.1% relRMS, because 23 layers of Q8_0
+activation quantisation amplify boundary flips. So the embedding gate (relRMS < 6%, cosine > 0.99) catches gross errors only; the sharp gates are the early checkpoints and the end-to-end KL.
+
+**Mutants** (all in the committed tests; `Inkling2VisionMutant`, `Inkling2Mutant.NormalizeImageEmbeddings`). Checkpoint gate at n = 80: align_corners posemb, transposed posemb, row/col RoPE swapped, NEOX RoPE,
+merge order, no merge, no LayerScale, no CLS all killed (tanh GELU only marginally, pixel_shuffle rel 0.108 vs 0.08; it is separated by the op-level GELU test: erf error < 1e-6 vs 4.7e-4 for tanh).
+Embedding gate: BGR (relRMS 0.41) and pad = 0 after normalisation killed. End-to-end mean KL (gate 0.015): normalise image embeddings 0.53, NEOX RoPE 0.51, merge skipped 0.22, no LayerScale 1.72, no CLS 1.12,
+embeddings not injected 1.38, BGR 0.37, RoPE axes swapped 0.95, merge order 0.062, align_corners 0.032, transposed posemb 0.0195.
+
+**Known gate limits (survivors).** The reference's pad quirk (-1.0 raw vs 0.0 raw, a 0.0078 difference on pad pixels) and the F16 im2col rounding are below the 2% noise floor at the embedding level and are
+not separately gated (the early checkpoints pin the F16 rounding: patch_embd matches to 5e-5). Over-limit images (> 4096 tokens) use a different resize than the reference. The position-embedding mutants are only
+2-3x the end-to-end noise floor (sharp at the checkpoint gate).

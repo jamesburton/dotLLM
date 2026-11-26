@@ -145,8 +145,12 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
         Assert.True(s.Top1 >= s.Rows - 2, $"top-1 agreement {s.Top1}/{s.Rows}");
     }
 
-    /// <summary>Set from the unmutated scores (printed by the test above) with ~3x headroom, well below every mutant (see <see cref="Mutants_AreKilled"/>).</summary>
-    private const double Gate = 0.05;
+    /// <summary>
+    /// Unmutated mean KL: 1.8e-3 (80), 1.07e-2 (190x110), 9.6e-3 (640), against a 4e-3 text-only floor. The gate sits 1.4x above the worst of them: thin on
+    /// purpose, because the position-embedding mutants (3.2e-2 align_corners, 1.95e-2 transposed) are only 2-3x the floor end to end (they are sharp at
+    /// the checkpoint gate); every other mutant is 0.06 to 1.7.
+    /// </summary>
+    private const double Gate = 0.015;
 
     public static TheoryData<string> Mutants => new()
     {
