@@ -61,12 +61,46 @@ internal static class VulkanWeightImportPolicy
             Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT"),
             "1", StringComparison.Ordinal);
 
-    /// <summary><c>DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1</c>: import read-only GGUF ranges through a shared writable
-    /// alias view (#1190). Read per call.</summary>
-    public static bool WritableAliasEnabled =>
-        string.Equals(
-            Environment.GetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE"),
-            "1", StringComparison.Ordinal);
+    /// <summary>
+    /// Whether a refused read-only import is retried through a shared writable alias view of the same file range (#1190, #1991).
+    /// <c>DOTLLM_VULKAN_HOST_IMPORT_WRITABLE</c>: <c>0</c> = never, <c>1</c> = on (a discrete GPU still refuses the import, #507), unset = <b>off (was proposed on for an
+    /// integrated device, withdrawn after measurement)</b>. The driver refuses read-only GGUF pages (<c>vkAllocateMemory</c> -1000072003), so without
+    /// the alias every tensor is copied through host memory (a CLAUDE.md rule-3 bounce). Read per call.
+    /// </summary>
+    public static bool WritableAliasEnabled
+    {
+      get
+      {
+        string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE");
+        if (string.Equals(v, "0", StringComparison.Ordinal)) return false;
+        if (string.Equals(v, "1", StringComparison.Ordinal)) return true;
+        return false;   // #1991: opt-in. Default-on measured -19% decode / -33% prefill on dense Llama (see docs/GPU.md); DirectStorage is the neutral zero-copy route.
+      }
+    }
+
+    /// <summary>Tensors whose import was attempted and refused on the current load (they are then staged) (#1991).</summary>
+    public static int RejectedTensorCount { get; private set; }
+
+    /// <summary>Bytes of the tensors counted by <see cref="RejectedTensorCount"/>.</summary>
+    public static long RejectedBytes { get; private set; }
+
+    /// <summary>The first refusal's detail on the current load (empty when none).</summary>
+    public static string FirstRejection { get; private set; } = string.Empty;
+
+    private static int s_reportedRejectedCount;
+
+    /// <summary>
+    /// One warning line when imports were refused since the last report, so a refusal is never silent (#1991); empty
+    /// otherwise. Consuming: it reports each count once, so the staging buffers that are created and disposed after the
+    /// load (per-layer MoE streaming, MTP heads, DFlash) or twice per load (<c>VulkanWeights</c>) do not reprint it.
+    /// </summary>
+    public static string RejectionWarning()
+    {
+        if (RejectedTensorCount == s_reportedRejectedCount) return string.Empty;
+        s_reportedRejectedCount = RejectedTensorCount;
+        return $"[dotllm] vulkan host import: {RejectedTensorCount} tensors / {RejectedBytes / (1024.0 * 1024.0):F1} MiB refused " +
+               $"(first: {FirstRejection}); staged through host memory instead. Set DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1 to silence.";
+    }
 
     private static readonly List<(nint Pointer, long Bytes)> s_stagedRanges = [];
 
@@ -169,8 +203,15 @@ internal static class VulkanWeightImportPolicy
         DirectBytes = 0;
         FirstDirectDecline = string.Empty;
         DirectDeclinedCount = 0;
+        DirectDeclinedBytes = 0;
+        BankStagedBytes = 0;
+        BankStagedCount = 0;
         StagedTensorCount = 0;
         StagedBytes = 0;
+        RejectedTensorCount = 0;
+        RejectedBytes = 0;
+        FirstRejection = string.Empty;
+        s_reportedRejectedCount = 0;
         LastFallbackReason = string.Empty;
         s_stagedRanges.Clear();
     }
@@ -188,25 +229,9 @@ internal static class VulkanWeightImportPolicy
         buf = null;
         ThrowIfHostOnly(srcPtr, bytes);
 
-        // #1304: the fast tier. DirectStorage reads the tensor from the file straight into an imported D3D12 heap, i.e. into
-        // device-local memory: no page-cache or process-private duplicate, and device-local speed under weight reuse (file-backed
-        // host pages are ~2x slower). It is not an alias of the mmap, so it does not count as an import and does not block
-        // releasing the whole host mapping (#438). Anything it declines falls through to the paths below.
-        if (DirectStorage.DirectWeightStore.Enabled && !IsDisabled && bytes >= DirectMinTensorBytes)
-        {
-            var direct = DirectStorage.DirectWeightStore.For(device);
-            if (direct is not null && direct.TryLoad(srcPtr, bytes, out buf))
-            {
-                DirectTensorCount++;
-                DirectBytes += bytes;
-                LastFallbackReason = string.Empty;
-                return true;
-            }
-            DirectDeclinedCount++;
-            if (FirstDirectDecline.Length == 0)
-                FirstDirectDecline = direct is null ? "unavailable:" + DirectStorage.DirectWeightStore.UnavailableReason(device) : direct.LastFallbackReason;
-            LastFallbackReason = "direct_storage:" + FirstDirectDecline;
-        }
+        // #1304 / #1994: the fast tier (default on Windows UMA when dstorage.dll is present). Anything it declines falls through below.
+        if (TryDirect(device, srcPtr, bytes, out buf))
+            return true;
 
         // HasExternalMemoryHost also covers the #507 UMA gate indirectly: on a discrete
         // GPU the extension may be present but TrySelectHostImportMemoryType refuses, and
@@ -242,12 +267,22 @@ internal static class VulkanWeightImportPolicy
         // #1190: amdvlk and the Arc driver both refuse read-only pages, which is how every GGUF is mapped. Retry from a
         // shared writable view of the same file range (no private pages). A copy-on-write view is also accepted but the
         // driver's write-lock privatises every page, so it costs what staging costs and is not tried.
-        if (wrapped is null && WritableAliasEnabled
-            && Models.Gguf.GgufFile.TryMapImportAlias(srcPtr, bytes, writable: true, out nint alias))
+        // #1991: still opt-in (default-on measured -19% decode / -33% prefill, docs/GPU.md). When on, the file is opened
+        // shared-writable but nothing writes to it: weight buffers are bound read-only (VulkanWeightImportWriteGuardTests).
+        string aliasFailure = string.Empty;
+        bool aliasRequested = wrapped is null && WritableAliasEnabled;
+        if (aliasRequested)
         {
-            wrapped = device.TryWrapHostVisible(alias, bytes);
-            if (wrapped is null)
-                Models.Gguf.GgufFile.ReleaseImportAlias(alias);
+            // TryMapImportAlias returns false (never a zero alias) when the range is not in an open read-only mapping, the GGUF is
+            // mapped copy-on-write, or the file cannot be opened for write.
+            if (!Models.Gguf.GgufFile.TryMapImportAlias(srcPtr, bytes, writable: true, out nint alias))
+                aliasFailure = "alias_unavailable(not_in_readonly_mapping_or_file_not_writable)";
+            else
+            {
+                wrapped = device.TryWrapHostVisible(alias, bytes);
+                if (wrapped is null)
+                    Models.Gguf.GgufFile.ReleaseImportAlias(alias);
+            }
         }
 
         if (wrapped is null)
@@ -256,15 +291,118 @@ internal static class VulkanWeightImportPolicy
             // which Vulkan call refused and with what VkResult — because the whole
             // import was dead on the real load path for want of exactly this line:
             // synthetic-memory tests passed while every production tensor was refused.
-            LastFallbackReason =
-                $"import_rejected({Interop.HostVisibleBuffer.LastImportFailureStage}" +
-                $":{Interop.HostVisibleBuffer.LastImportFailureCode})";
+            LastFallbackReason = aliasFailure.Length > 0
+                ? aliasFailure
+                : $"import_rejected({Interop.HostVisibleBuffer.LastImportFailureStage}" +
+                  $":{Interop.HostVisibleBuffer.LastImportFailureCode})";
+            // Warn only when the alias was requested (DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1) and still refused: the default path
+            // stays silent (#1995 reports DirectStorage fallbacks instead). A discrete GPU refuses by design (#507): policy, not a refusal.
+            if (aliasRequested && device.PhysicalDeviceTypeValue is Interop.VkPhysicalDeviceType.IntegratedGpu or Interop.VkPhysicalDeviceType.Cpu)
+            {
+                RejectedTensorCount++;
+                RejectedBytes += bytes;
+                if (FirstRejection.Length == 0) FirstRejection = LastFallbackReason;
+            }
             return false;
         }
 
         NoteImported(bytes);
         buf = wrapped;
         return true;
+    }
+
+    /// <summary>
+    /// The DirectStorage tier (#1304, default on Windows UMA since #1994): reads the tensor from the file straight into an imported D3D12 heap, i.e.
+    /// into device-local memory (no page-cache or process-private duplicate, device-local speed under weight reuse; file-backed host pages
+    /// cost ~19% decode / ~33% prefill, #1991). Not an alias of the mmap, so it does not block releasing the whole host mapping (#438).
+    /// </summary>
+    private static bool TryDirect(VulkanDevice device, nint srcPtr, long bytes, out VulkanDevice.Buffer? buf)
+    {
+        buf = null;
+        if (IsDisabled || bytes < DirectMinTensorBytes || !DirectStorage.DirectWeightStore.EnabledFor(device))
+            return false;
+        var direct = DirectStorage.DirectWeightStore.For(device);
+        if (direct is not null && direct.TryLoad(srcPtr, bytes, out buf))
+        {
+            DirectTensorCount++;
+            DirectBytes += bytes;
+            LastFallbackReason = string.Empty;
+            return true;
+        }
+        DirectDeclinedCount++;
+        DirectDeclinedBytes += bytes;
+        s_modelDeclinedCount++; s_modelDeclinedBytes += bytes;
+        if (FirstDirectDecline.Length == 0)
+            FirstDirectDecline = direct is null ? "unavailable:" + DirectStorage.DirectWeightStore.UnavailableReason(device) : direct.LastFallbackReason;
+        if (s_modelFirstDecline.Length == 0) s_modelFirstDecline = FirstDirectDecline.Length > 0 ? FirstDirectDecline : "declined";
+        LastFallbackReason = "direct_storage:" + FirstDirectDecline;
+        return false;
+    }
+
+    /// <summary>
+    /// DirectStorage-only load for a contiguous source range that is not a single weight tensor, namely a fused MoE expert bank
+    /// (<c>[E,M,K]</c>, byte-identical to the device layout) (#1994). Never aliases the mmap (that route is slow, #1991). False means the
+    /// caller must stage and call <see cref="NoteBankStaged"/>.
+    /// </summary>
+    public static bool TryLoadDirect(VulkanDevice device, nint srcPtr, long bytes, out VulkanDevice.Buffer? buf)
+    {
+        ThrowIfHostOnly(srcPtr, bytes);
+        return TryDirect(device, srcPtr, bytes, out buf);
+    }
+
+    /// <summary>Whether <see cref="TryLoadDirect"/> can run for <paramref name="device"/> (callers skip device-side pre-allocation when it can).</summary>
+    public static bool DirectTierActive(VulkanDevice device)
+        => !IsDisabled && DirectStorage.DirectWeightStore.EnabledFor(device) && DirectStorage.DirectWeightStore.For(device) is not null;
+
+    /// <summary>Records a MoE expert bank that took the staging copy (its pages stay mapped: the CPU may still use them).</summary>
+    public static void NoteBankStaged(long bytes) { BankStagedBytes += bytes; BankStagedCount++; s_modelBankStagedBytes += bytes; }
+
+    /// <summary>Expert-bank bytes copied through staging on the current load (#1994).</summary>
+    public static long BankStagedBytes { get; private set; }
+
+    /// <summary>Expert banks copied through staging on the current load.</summary>
+    public static int BankStagedCount { get; private set; }
+
+    /// <summary>Bytes of the tensors the DirectStorage tier declined on the current load.</summary>
+    public static long DirectDeclinedBytes { get; private set; }
+
+    // Model-level ledger (#1994): unlike the per-loader ledger above, Reset() does not clear it, so a model whose weights are uploaded by
+    // several loaders / staging buffers (VulkanWeights twice, per-layer MoE streaming, MTP heads) still reports one total, once.
+    private static readonly bool s_traceStaged = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE") == "1";
+    private static long s_modelStagedBytes, s_modelBankStagedBytes, s_modelDeclinedBytes;
+    private static int s_modelDeclinedCount;
+    private static string s_modelFirstDecline = string.Empty;
+
+    /// <summary>Bytes copied through host memory since <see cref="BeginModelLoad"/> (tensors + expert banks); survives <see cref="Reset"/>.</summary>
+    internal static long ModelCopiedBytes => s_modelStagedBytes + s_modelBankStagedBytes;
+
+    /// <summary>Starts the model-level ledger; call once at the top of a model load (<c>VulkanModelLoader.CreateFromGguf</c>).</summary>
+    public static void BeginModelLoad()
+    {
+        s_modelStagedBytes = s_modelBankStagedBytes = s_modelDeclinedBytes = 0;
+        s_modelDeclinedCount = 0;
+        s_modelFirstDecline = string.Empty;
+    }
+
+    /// <summary>
+    /// Ends the model load and returns the one warning line for it, when the Windows UMA DirectStorage default could not be used and weights
+    /// were copied through host memory instead (stating the total bytes copied and how to fix it, #1994); empty otherwise.
+    /// </summary>
+    public static string EndModelLoad(VulkanDevice device)
+    {
+        long total = s_modelStagedBytes + s_modelBankStagedBytes;
+        if (IsDisabled || total == 0) return string.Empty;
+        if (DirectStorage.DirectWeightStore.WouldBeDefaultButDllMissing(device))
+            return $"[dotllm] DirectStorage is not installed: {total / (1024.0 * 1024.0):F0} MiB of weights were copied through host memory " +
+                   $"({s_modelStagedBytes / (1024.0 * 1024.0):F0} MiB tensors + {s_modelBankStagedBytes / (1024.0 * 1024.0):F0} MiB expert banks). " +
+                   (File.Exists(DirectStorage.DirectStorageInstaller.DeclinedMarkerPath)
+                       ? $"You declined the download offer; delete {DirectStorage.DirectStorageInstaller.DeclinedMarkerPath} to be asked again, "
+                       : "Run `dotllm run` once in a terminal to be offered Microsoft's DirectStorage (fetched from NuGet after you accept its licence), ") +
+                   "or place dstorage.dll + dstoragecore.dll next to dotllm / in DOTLLM_DIRECTSTORAGE_DIR (DOTLLM_VULKAN_DIRECT_STORAGE=0 silences this).";
+        if (s_modelDeclinedCount > 0 && DirectStorage.DirectWeightStore.EnabledFor(device))
+            return $"[dotllm] DirectStorage declined {s_modelDeclinedCount} tensors / {s_modelDeclinedBytes / (1024.0 * 1024.0):F0} MiB (first: {s_modelFirstDecline}); " +
+                   $"{total / (1024.0 * 1024.0):F0} MiB of weights were copied through host memory instead.";
+        return string.Empty;
     }
 
     /// <summary>
@@ -290,7 +428,10 @@ internal static class VulkanWeightImportPolicy
     {
         ThrowIfHostOnly(srcPtr, sourceBytes);
         StagedTensorCount++;
-        if (sourceBytes > 0) StagedBytes += sourceBytes;
+        if (sourceBytes > 0) { StagedBytes += sourceBytes; s_modelStagedBytes += sourceBytes; }
+        if (s_traceStaged && sourceBytes >= (1L << 20))   // #1994: which tensors still stage, and why
+            Console.Error.WriteLine($"[vulkan-mem] staged {sourceBytes / (1024.0 * 1024.0):F1} MiB reason={reason ?? LastFallbackReason} " +
+                string.Join(" < ", Environment.StackTrace.Split(Environment.NewLine).Skip(2).Take(3).Select(l => l.Trim())));
         if (reason is not null) LastFallbackReason = reason;
         if (srcPtr != 0 && sourceBytes > 0)
             s_stagedRanges.Add((srcPtr, sourceBytes));
@@ -302,6 +443,7 @@ internal static class VulkanWeightImportPolicy
            $"{DirectTensorCount} tensors / {DirectBytes / (1024.0 * 1024.0):F1} MiB direct-storage" +
            (DirectDeclinedCount > 0 ? $" ({DirectDeclinedCount} declined, first: {FirstDirectDecline})" : string.Empty) + "; " +
            $"{StagedTensorCount} tensors / {StagedBytes / (1024.0 * 1024.0):F1} MiB staged" +
+           (BankStagedCount > 0 ? $" + {BankStagedCount} expert banks / {BankStagedBytes / (1024.0 * 1024.0):F1} MiB staged" : string.Empty) +
            (LastFallbackReason.Length > 0 ? $" (last fallback: {LastFallbackReason})" : string.Empty) +
            $"; whole-mapping release {(MayReleaseWholeHostMapping ? "permitted" : "blocked")}";
 }

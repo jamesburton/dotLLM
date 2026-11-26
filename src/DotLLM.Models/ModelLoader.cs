@@ -85,15 +85,38 @@ public static class ModelLoader
             Architecture.Lfm3 => Lfm3TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.Qwen3HybridDense => Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             // CPU reference forward (#816): GR + GDN/QSA + 512-expert MoE + n-gram PLE.
-            Architecture.Qwen4Exp => Qwen4ExpTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            Architecture.Qwen4Exp => Edge0.Edge0Model.IsSkeleton(gguf)
+                ? LoadEdge0Cpu(gguf, config, effectiveThreading)
+                : Qwen4ExpTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             // glm4moe (#1599): CPU forward on the shared TransformerModel (GQA + QKV bias, partial NeoX RoPE, dense layer 0, sigmoid + exp_probs_b MoE
             // with an ungated shared expert, banks kept in the raw quant view). No NextN/MTP yet; GPU backends still refuse.
             Architecture.Glm4Moe => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             // ricursive (#1643): census first (a wrong or mixed value-residual name / unknown tensor fails as invalid data), then refuse:
             // there is no forward pass yet (CPU #1644).
             Architecture.Ricursive => RefuseRicursive(gguf, config),
+            // OVHcloud Olala (#1970): CPU reference forward (Mamba-3 MIMO + differential TPA + latent MoE).
+            Architecture.Olala => OlalaTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
         };
+    }
+
+    /// <summary>
+    /// An Edge0 skeleton GGUF (no routed experts): opens the pack and the FP8 n-gram table beside it and loads the latent-MoE CPU forward.
+    /// The model owns the pack and the table file; on a failure both are released.
+    /// </summary>
+    private static IModel LoadEdge0Cpu(GgufFile gguf, ModelConfig config, ThreadingConfig threading)
+    {
+        var (pack, ple) = Edge0.Edge0Model.OpenSiblings(gguf, config);
+        try
+        {
+            return Qwen4ExpTransformerModel.LoadEdge0(gguf, config, threading, pack, ple);
+        }
+        catch
+        {
+            pack.Dispose();
+            ple.Dispose();
+            throw;
+        }
     }
 
     private static IModel RefuseRicursive(GgufFile gguf, ModelConfig config)

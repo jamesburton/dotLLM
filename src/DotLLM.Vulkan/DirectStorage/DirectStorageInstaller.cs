@@ -42,30 +42,52 @@ public static class DirectStorageInstaller
     public static bool IsSupportedPlatform => OperatingSystem.IsWindows() && PackageArchFolder() is not null;
 
     /// <summary>
-    /// Path to a usable <c>dstorage.dll</c> (next to the assembly, or in <see cref="InstallDirectory"/>), or null.
-    /// A copy that is only on the system search path is not reported here; <see cref="IsAvailable"/> covers that.
+    /// Full path of a usable <c>dstorage.dll</c> (with <c>dstoragecore.dll</c> beside it), or null. Searched in this order only: the application
+    /// directory, then <see cref="InstallDirectory"/> (<c>DOTLLM_DIRECTSTORAGE_DIR</c> or <c>~/.dotllm/native/directstorage</c>). Never the current
+    /// directory or <c>PATH</c>: the DLL is loaded by full path (<see cref="TryLoad"/>), so a planted copy elsewhere cannot be picked up.
     /// </summary>
-    public static string? FindDll()
+    public static string? FindDll() => FindDll(AppContext.BaseDirectory, InstallDirectory);
+
+    /// <summary><see cref="FindDll()"/> with explicit directories (testable).</summary>
+    internal static string? FindDll(string? appDir, string? installDir)
     {
         if (!IsSupportedPlatform) return null;
-        string asmDir = AppContext.BaseDirectory; // Assembly.Location is empty in single-file apps (IL3000)
-        foreach (string? dir in new[] { asmDir, InstallDirectory })
+        foreach (string? dir in new[] { appDir, installDir })
         {
             if (string.IsNullOrEmpty(dir)) continue;
-            string candidate = Path.Combine(dir, "dstorage.dll");
+            string candidate = Path.GetFullPath(Path.Combine(dir, "dstorage.dll"));
             if (File.Exists(candidate) && File.Exists(Path.Combine(dir, "dstoragecore.dll"))) return candidate;
         }
         return null;
     }
 
-    /// <summary>True when <c>dstorage.dll</c> can be found anywhere the loader will look.</summary>
-    public static bool IsAvailable()
+    /// <summary>
+    /// False when <c>dstorage.dll</c> and <c>dstoragecore.dll</c> in <paramref name="dir"/> carry different file versions (a mixed pair makes
+    /// <c>DStorageGetFactory</c> fail). Unknown versions (no version resource) count as matching.
+    /// </summary>
+    internal static bool PairVersionsMatch(string dir)
     {
-        if (!IsSupportedPlatform) return false;
-        if (FindDll() is not null) return true;
-        if (!NativeLibrary.TryLoad("dstorage.dll", out nint module)) return false;
-        NativeLibrary.Free(module);
-        return true;
+        string? a = System.Diagnostics.FileVersionInfo.GetVersionInfo(Path.Combine(dir, "dstorage.dll")).FileVersion;
+        string? b = System.Diagnostics.FileVersionInfo.GetVersionInfo(Path.Combine(dir, "dstoragecore.dll")).FileVersion;
+        return string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b) || string.Equals(a, b, StringComparison.Ordinal);
+    }
+
+    /// <summary>True when <see cref="FindDll()"/> finds the DLL pair (no default-search-path probing).</summary>
+    public static bool IsAvailable() => FindDll() is not null;
+
+    private const uint LoadLibrarySearchDllLoadDir = 0x00000100;
+    private const uint LoadLibrarySearchSystem32 = 0x00000800;
+
+    /// <summary>
+    /// Loads <c>dstorage.dll</c> from <paramref name="fullPath"/> with <c>LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32</c>: its
+    /// own folder (so <c>dstoragecore.dll</c> resolves beside it) and System32, and nothing else (not the current directory, not <c>PATH</c>).
+    /// </summary>
+    internal static bool TryLoad(string fullPath, out nint module)
+    {
+        module = 0;
+        if (!OperatingSystem.IsWindows() || !Path.IsPathFullyQualified(fullPath)) return false;
+        module = D3dNative.LoadLibraryEx(fullPath, 0, LoadLibrarySearchDllLoadDir | LoadLibrarySearchSystem32);
+        return module != 0;
     }
 
     /// <summary>Marker recording that the user declined the offer, so it is made once.</summary>
@@ -118,6 +140,10 @@ public static class DirectStorageInstaller
             File.Move(tmp, Path.Combine(target, name), overwrite: true);
         }
         File.WriteAllText(Path.Combine(target, "LICENSE.txt"), licenseText);
+        // #1994: record the acceptance itself (when, which package, which licence text), not just a copy of the licence.
+        File.WriteAllText(Path.Combine(target, "ACCEPTED.txt"),
+            $"accepted_utc={DateTime.UtcNow:O}\npackage=Microsoft.Direct3D.DirectStorage {PackageVersion}\npackage_sha256={PackageSha256}\n" +
+            $"license_sha256={Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(licenseText))).ToLowerInvariant()}\n");
         try { File.Delete(DeclinedMarkerPath); } catch (IOException) { }
         return target;
     }

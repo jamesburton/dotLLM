@@ -2049,6 +2049,17 @@ public sealed class VulkanDevice : IDisposable
                 return null;
             }
 
+            // #1994: the DirectStorage heaps are device-local weight memory too, so they honour the same synthetic limit as
+            // AllocateInternal (DOTLLM_VULKAN_DEVICE_LOCAL_LIMIT_MIB / DOTLLM_VRAM_BUDGET_MB). Refusing here declines the tensor, which
+            // then stages through AllocateDeviceLocal and its logged fallback ladder instead of silently passing the limit.
+            if (_deviceLocalLimitBytes >= 0
+                && Interlocked.Read(ref _liveBytesByHeap[HeapOfType(typeIndex)]) + (long)req.size > _deviceLocalLimitBytes)
+            {
+                VulkanApi.vkDestroyBuffer(_device, buffer, 0);
+                reason = "device_local_limit";
+                return null;
+            }
+
             var import = new VkImportMemoryWin32HandleInfoKhr
             {
                 sType = StructImportMemoryWin32HandleInfoKhr,

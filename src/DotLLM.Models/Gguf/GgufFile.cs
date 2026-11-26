@@ -3,6 +3,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Tensors;
 
 namespace DotLLM.Models.Gguf;
 
@@ -70,6 +71,8 @@ public sealed class GgufFile : IDisposable
     private readonly Shard[] _shards;
     private readonly Dictionary<string, int>? _shardByTensor;
     private readonly nint _dataBasePointer;
+    private readonly Dictionary<string, nint>? _externalPointers;
+    private readonly IDisposable? _externalOwner;
     private bool _disposed;
 
     /// <summary>Parsed GGUF header (of the first shard when the file is a split set).</summary>
@@ -154,6 +157,9 @@ public sealed class GgufFile : IDisposable
     /// <exception cref="KeyNotFoundException">No tensor of that name exists.</exception>
     public nint TensorDataPointer(in GgufTensorDescriptor tensor)
     {
+        if (_externalPointers is not null)
+            return _externalPointers.TryGetValue(tensor.Name, out nint ext)
+                ? ext : throw new KeyNotFoundException($"GGUF tensor '{tensor.Name}' not found in the external tensor table.");
         if (_shardByTensor is null)
             return _dataBasePointer + (nint)tensor.DataOffset;
 
@@ -192,6 +198,41 @@ public sealed class GgufFile : IDisposable
         if (!TensorsByName.ContainsKey(tensorName))
             throw new KeyNotFoundException($"GGUF tensor '{tensorName}' not found.");
         return _shardByTensor is null ? 0 : _shardByTensor[tensorName];
+    }
+
+    private GgufFile(IReadOnlyList<GgufTensorDescriptor> tensors, Dictionary<string, nint> pointers, GgufMetadata metadata, IDisposable? owner)
+    {
+        Header = new GgufHeader(3, (ulong)tensors.Count, (ulong)metadata.Count);
+        Metadata = metadata;
+        Tensors = tensors;
+        TensorsByName = tensors.ToDictionary(t => t.Name, StringComparer.Ordinal);
+        _shardByTensor = null;
+        _shards = [];
+        ShardPaths = [];
+        _externalPointers = pointers;
+        _externalOwner = owner;
+    }
+
+    /// <summary>
+    /// A GGUF-shaped VIEW over tensors that live elsewhere (mapped files of another format): no file is opened, every tensor resolves to the pointer it
+    /// was registered with. Lets a loader written against <see cref="GgufFile"/> consume weights stored in a sidecar layout (the Edge0 MTP head, G6 #1990)
+    /// without converting or copying them. Data-offset based APIs (<see cref="GetTensorFileLocation"/>, the shard accessors) do not apply.
+    /// </summary>
+    /// <param name="tensors">Name, shape (<c>ne0</c> first), storage type and the address of the first byte of each tensor.</param>
+    /// <param name="owner">Disposed with the view (the mappings the pointers point into), or null.</param>
+    /// <returns>The view; the caller owns it.</returns>
+    public static GgufFile CreateExternal(IEnumerable<(string Name, TensorShape Shape, QuantizationType Type, nint Pointer)> tensors, IDisposable? owner = null)
+    {
+        ArgumentNullException.ThrowIfNull(tensors);
+        var list = new List<GgufTensorDescriptor>();
+        var ptrs = new Dictionary<string, nint>(StringComparer.Ordinal);
+        foreach (var (name, shape, type, ptr) in tensors)
+        {
+            if (ptr == 0) throw new ArgumentException($"external tensor '{name}' has a null pointer.", nameof(tensors));
+            if (!ptrs.TryAdd(name, ptr)) throw new ArgumentException($"external tensor '{name}' is registered twice.", nameof(tensors));
+            list.Add(new GgufTensorDescriptor(name, shape, type, 0UL));
+        }
+        return new GgufFile(list, ptrs, new GgufMetadata(new Dictionary<string, GgufMetadataValue>()), owner);
     }
 
     private GgufFile(
@@ -311,6 +352,7 @@ public sealed class GgufFile : IDisposable
 
         foreach (var shard in _shards)
             shard.Dispose();
+        _externalOwner?.Dispose();
     }
 
     /// <summary>
@@ -420,7 +462,8 @@ public sealed class GgufFile : IDisposable
             rawMetadata = GgufReader.ReadMetadata(reader, header);
             tensors = GgufReader.ReadTensorInfos(reader, header,
                 allowI8Container: rawMetadata.TryGetValue("general.architecture", out var archValue) && archValue.Value is string archName
-                                  && string.Equals(archName, TensorOverlay.OverlayArchitecture, StringComparison.Ordinal));
+                                  && (string.Equals(archName, TensorOverlay.OverlayArchitecture, StringComparison.Ordinal)
+                                      || Fp8PleTable.IsFp8Table(rawMetadata)));
             streamPositionAfterInfos = fs.Position;
             fileLength = fs.Length;
         }

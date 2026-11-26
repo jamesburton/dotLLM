@@ -100,7 +100,9 @@ public static class Qwen4ExpTensors
     /// <param name="config">A <see cref="Architecture.Qwen4Exp"/> configuration.</param>
     /// <param name="includeTrunk">Include the trunk blocks, the final head mixer and the n-gram table (false for a standalone MTP file).</param>
     /// <param name="includeMtp">Include the trailing MTP block (<c>blk.{NumLayers}.*</c>); requires <see cref="ModelConfig.NextnPredictLayers"/> &gt; 0.</param>
-    public static IEnumerable<Expected> Enumerate(ModelConfig config, bool includeTrunk = true, bool includeMtp = false)
+    /// <param name="skeleton">An Edge0 skeleton GGUF (<c>model-skeleton.gguf</c>): the routed experts (<c>ffn_{gate,up,down}_exps</c>) and the n-gram table live
+    /// in the strata pack / <c>ple-fp8.gguf</c>, so they are not expected here.</param>
+    public static IEnumerable<Expected> Enumerate(ModelConfig config, bool includeTrunk = true, bool includeMtp = false, bool skeleton = false)
     {
         ArgumentNullException.ThrowIfNull(config);
         if (config.Architecture != Architecture.Qwen4Exp || config.Qwen4Exp is not { } q4
@@ -124,14 +126,14 @@ public static class Qwen4ExpTensors
             yield return new Expected(OutputHcDown, [hcDim, lr]);
             yield return new Expected(OutputHcUp, [lr, hcDim]);
 
-            if (q4.Ple is { } ple)
+            if (q4.Ple is { } ple && !skeleton)
                 yield return new Expected(PerLayerTokenEmbd, [ple.RowDim, checked((long)ple.MinTableRows)], LastDimIsMinimum: true);
 
             for (int il = 0; il < config.NumLayers; il++)
             {
                 bool attention = layout.LayerKind[il] == HybridLayerKind.Attention;
                 bool hasPle = q4.Ple is { } p && p.Layers.Contains(il);
-                foreach (var e in BlockTensors(config, q4, gdn, moe, il, attention, hasPle))
+                foreach (var e in BlockTensors(config, q4, gdn, moe, il, attention, hasPle, skeleton))
                     yield return e;
             }
         }
@@ -140,7 +142,7 @@ public static class Qwen4ExpTensors
         {
             // The MTP block is a full-attention (QSA) block, never a GDN one; it has no PLE module.
             int il = config.NumLayers;
-            foreach (var e in BlockTensors(config, q4, gdn, moe, il, attention: true, hasPle: false))
+            foreach (var e in BlockTensors(config, q4, gdn, moe, il, attention: true, hasPle: false, skeleton))
                 yield return e;
 
             yield return new Expected(Block(il, Suffix.NextnEhProj), [2 * embd, embd]);
@@ -153,7 +155,7 @@ public static class Qwen4ExpTensors
     }
 
     private static IEnumerable<Expected> BlockTensors(
-        ModelConfig config, Qwen4ExpConfig q4, GatedDeltaNetConfig gdn, MoeConfig moe, int il, bool attention, bool hasPle)
+        ModelConfig config, Qwen4ExpConfig q4, GatedDeltaNetConfig gdn, MoeConfig moe, int il, bool attention, bool hasPle, bool skeleton = false)
     {
         long embd = config.HiddenSize;
         long hc = q4.HyperConnectionCount;
@@ -219,10 +221,14 @@ public static class Qwen4ExpTensors
         long ffShared = moe.SharedExpertIntermediateSize ?? ffExp;
         long experts = moe.NumExperts;
         yield return new Expected(Block(il, Suffix.FfnGateInp), [embd, experts]);
-        yield return new Expected(Block(il, Suffix.FfnDownExps), [ffExp, embd, experts]);
-        yield return new Expected(Block(il, Suffix.FfnGateExps), [embd, ffExp, experts]);
-        yield return new Expected(Block(il, Suffix.FfnUpExps), [embd, ffExp, experts]);
-        yield return new Expected(Block(il, Suffix.FfnGateInpShexp), [embd]);
+        if (!skeleton)
+        {
+            yield return new Expected(Block(il, Suffix.FfnDownExps), [ffExp, embd, experts]);
+            yield return new Expected(Block(il, Suffix.FfnGateExps), [embd, ffExp, experts]);
+            yield return new Expected(Block(il, Suffix.FfnUpExps), [embd, ffExp, experts]);
+        }
+        // the Edge0 skeleton writes the shared-expert sigmoid gate as [embd, 1] (same bytes as the stock [embd])
+        yield return new Expected(Block(il, Suffix.FfnGateInpShexp), skeleton ? [embd, 1] : [embd]);
         yield return new Expected(Block(il, Suffix.FfnGateShexp), [embd, ffShared]);
         yield return new Expected(Block(il, Suffix.FfnUpShexp), [embd, ffShared]);
         yield return new Expected(Block(il, Suffix.FfnDownShexp), [ffShared, embd]);
@@ -258,14 +264,16 @@ public static class Qwen4ExpTensors
     /// <param name="config">A Qwen4Exp configuration extracted from the same file.</param>
     /// <param name="includeTrunk">See <see cref="Enumerate"/>.</param>
     /// <param name="includeMtp">See <see cref="Enumerate"/>.</param>
+    /// <param name="skeleton">See <see cref="Enumerate"/>.</param>
     public static IReadOnlyList<string> FindProblems(
-        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, ModelConfig config, bool includeTrunk = true, bool includeMtp = false)
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, ModelConfig config, bool includeTrunk = true, bool includeMtp = false,
+        bool skeleton = false)
     {
         ArgumentNullException.ThrowIfNull(tensors);
         var problems = new List<string>();
         var known = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (Expected e in Enumerate(config, includeTrunk, includeMtp))
+        foreach (Expected e in Enumerate(config, includeTrunk, includeMtp, skeleton))
         {
             known.Add(e.Name);
             if (!tensors.TryGetValue(e.Name, out GgufTensorDescriptor actual))

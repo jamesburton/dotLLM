@@ -1,0 +1,56 @@
+// Shared helpers of the Olala (OVHcloud) Vulkan kernels (#1983). Included after `#version 450` and GL_GOOGLE_include_directive.
+//
+// Activation storage. Olala's activations reach 1e9..1e14 (docs/OLALA.md section 3), so F16 storage overflows; stored activations are BF16
+// (raw 16-bit words, `uint16_t`), which keeps the F32 exponent range. All arithmetic, accumulation and reductions happen in F32 registers /
+// shared memory; a value is rounded to BF16 exactly once, when it is stored to a global buffer. Defining ACT_F32 builds the F32-storage
+// REFERENCE arm (a test/measurement control for the precision sign-off; never selected by default).
+//
+// Recurrent state, the F32 gamma/bias vectors and the logits are always F32 (OlalaStatePolicy). The attention KV cache is always BF16.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#ifdef ACT_F32
+#define ACT_T float
+float actToF(float v) { return v; }
+float fToAct(float v) { return v; }
+#else
+#define ACT_T uint16_t
+float actToF(uint16_t v) { return uintBitsToFloat(uint(v) << 16); }
+// Round to nearest even; NaN stays NaN.
+uint16_t fToAct(float f) {
+    uint b = floatBitsToUint(f);
+    if ((b & 0x7fffffffu) > 0x7f800000u) return uint16_t((b >> 16) | 0x40u);
+    b += 0x7fffu + ((b >> 16) & 1u);
+    return uint16_t(b >> 16);
+}
+#endif
+
+float bf16ToF(uint16_t v) { return uintBitsToFloat(uint(v) << 16); }
+float bf16Lo(uint w) { return uintBitsToFloat(w << 16); }
+float bf16Hi(uint w) { return uintBitsToFloat(w & 0xFFFF0000u); }
+// Round to nearest even BF16 bits (KV cache is always BF16, in both activation arms).
+uint16_t fToBf16(float f) {
+    uint b = floatBitsToUint(f);
+    if ((b & 0x7fffffffu) > 0x7f800000u) return uint16_t((b >> 16) | 0x40u);
+    b += 0x7fffu + ((b >> 16) & 1u);
+    return uint16_t(b >> 16);
+}
+
+float sigmoidF(float x) { return 1.0 / (1.0 + exp(-x)); }
+float siluF(float x) { return x / (1.0 + exp(-x)); }
+
+// log(1 + u) for u in [0, 1] without the cancellation of log(1.0 + u) (Kahan): GLSL has no log1p.
+float log1pF(float u) {
+    float w = 1.0 + u;
+    return (w == 1.0) ? u : log(w) * (u / (w - 1.0));
+}
+// softplus with PyTorch's linear threshold at 20 (the CPU evaluates it in double; this is the F32 equivalent without losing the tail).
+float softplusF(float x) {
+    if (x > 20.0) return x;
+    float u = exp(-abs(x));
+    return max(x, 0.0) + log1pF(u);
+}

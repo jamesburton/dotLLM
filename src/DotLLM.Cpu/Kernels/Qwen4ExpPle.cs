@@ -217,17 +217,19 @@ public static unsafe class Qwen4ExpPle
     /// <param name="rowDim">Elements per row (160 on the released model).</param>
     /// <param name="rows">Row indices.</param>
     /// <param name="dest">Destination <c>[rows.Length * rowDim]</c>.</param>
+    /// <param name="fp8Scale">Table scale of an FP8 (<see cref="QuantizationType.I8"/>) table, see <see cref="PleRowCodec"/>; ignored for every other type.</param>
     public static void GatherRows(nint table, QuantizationType quantType, long tableRows, int rowDim,
-                                  ReadOnlySpan<long> rows, Span<float> dest)
+                                  ReadOnlySpan<long> rows, Span<float> dest, float fp8Scale = 0f)
     {
         if (dest.Length < (long)rows.Length * rowDim) throw new ArgumentException("dest too small.", nameof(dest));
+        PleRowCodec.Validate(quantType, fp8Scale);
         long rowBytes = Dequantize.RowByteSize(rowDim, quantType);
         for (int i = 0; i < rows.Length; i++)
         {
             long r = rows[i];
             if ((ulong)r >= (ulong)tableRows)
                 throw new ArgumentOutOfRangeException(nameof(rows), $"PLE row {r} outside table of {tableRows} rows.");
-            Dequantize.ToFloat32(table + (nint)(r * rowBytes), rowDim, quantType, dest.Slice(i * rowDim, rowDim));
+            PleRowCodec.Decode(table + (nint)(r * rowBytes), rowDim, quantType, fp8Scale, dest.Slice(i * rowDim, rowDim));
         }
     }
 
@@ -391,6 +393,7 @@ public sealed class Qwen4ExpPleBranch
 {
     private readonly nint _table;
     private readonly QuantizationType _tableQt;
+    private readonly float _tableScale;
     private readonly long _tableRows;
     private readonly int _rowDim;
     private readonly int _ngram, _headsPerNgram, _eos, _convKernel;
@@ -432,15 +435,17 @@ public sealed class Qwen4ExpPleBranch
     /// <param name="keyProj">Key projection (<c>numHeads*rowDim -&gt; hc*hidden</c>).</param>
     /// <param name="valueProj">Value projection (<c>numHeads*rowDim -&gt; hidden</c>).</param>
     /// <param name="tableOptions">Table prefetch / cache options (<c>null</c> = <see cref="PleTableOptions.FromEnvironment"/>).</param>
+    /// <param name="tableScale">Table scale of an FP8 (<see cref="QuantizationType.I8"/>) table (<c>strata.ple.scale</c>); ignored for every other type.</param>
     public Qwen4ExpPleBranch(nint table, QuantizationType tableQt, long tableRows, int rowDim,
                              int ngramSize, int headsPerNgram, int eosTokenId, int convKernel,
                              long[] multipliers, long[] headOffsets, long[] headVocabSizes,
                              int hcCount, int hiddenSize, float eps,
                              float[] normKey, float[] normQuery, float[] normConv, float[] convWeightTapMajor,
                              Qwen4ExpProjection keyProj, Qwen4ExpProjection valueProj,
-                             PleTableOptions? tableOptions = null)
+                             PleTableOptions? tableOptions = null, float tableScale = 0f)
     {
-        _table = table; _tableQt = tableQt; _tableRows = tableRows; _rowDim = rowDim;
+        PleRowCodec.Validate(tableQt, tableScale);
+        _table = table; _tableQt = tableQt; _tableRows = tableRows; _rowDim = rowDim; _tableScale = tableScale;
         _ngram = ngramSize; _headsPerNgram = headsPerNgram; _eos = eosTokenId; _convKernel = convKernel;
         _multipliers = multipliers; _offsets = headOffsets; _vocab = headVocabSizes;
         _hc = hcCount; _hidden = hiddenSize; _eps = eps;
@@ -452,7 +457,7 @@ public sealed class Qwen4ExpPleBranch
             throw new ArgumentException($"PLE table has {tableRows} rows, head ranges need {minRows}.");
         var opts = tableOptions ?? PleTableOptions.FromEnvironment();
         if (opts.NeedsService && table != 0)
-            _prefetcher = new PleRowPrefetcher(table, tableQt, tableRows, rowDim, opts);
+            _prefetcher = new PleRowPrefetcher(table, tableQt, tableRows, rowDim, opts, tableScale);
     }
 
     /// <summary>
@@ -529,7 +534,7 @@ public sealed class Qwen4ExpPleBranch
             if (_prefetcher is { } pf)
                 pf.Gather(pending, rows.AsSpan(0, T * numHeads), emb);
             else
-                Qwen4ExpPle.GatherRows(_table, _tableQt, _tableRows, _rowDim, rows.AsSpan(0, T * numHeads), emb);
+                Qwen4ExpPle.GatherRows(_table, _tableQt, _tableRows, _rowDim, rows.AsSpan(0, T * numHeads), emb, _tableScale);
         }
         finally { ArrayPool<long>.Shared.Return(rows); }
     }

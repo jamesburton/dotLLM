@@ -1051,14 +1051,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             {
                 modelWeightsBytes = gguf.IsSplit
                     ? gguf.DataSectionLength
-                    : new FileInfo(resolvedPath).Length - gguf.DataSectionOffset;
+                    : ResolvedFileLength(resolvedPath) - gguf.DataSectionOffset;
             }
             else
             {
                 // HF safetensors: sum the on-disk shard sizes in the directory.
                 modelWeightsBytes = Directory
                     .EnumerateFiles(resolvedPath, "*.safetensors", SearchOption.TopDirectoryOnly)
-                    .Sum(f => new FileInfo(f).Length);
+                    .Sum(f => ResolvedFileLength(f));
             }
             long computeBytes = model.ComputeMemoryBytes;
             int cacheSize = Math.Min(promptLen + settings.MaxTokens, config.MaxSequenceLength);
@@ -1253,6 +1253,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
 
         return 0;
+    }
+
+    /// <summary>File length following a symlink (HF snapshot entries are links to blobs; the link's own length is a few bytes) (#1991).</summary>
+    private static long ResolvedFileLength(string path)
+    {
+        var fi = new FileInfo(path);
+        return (fi.ResolveLinkTarget(returnFinalTarget: true) as FileInfo)?.Length ?? fi.Length;
     }
 
     private static string PerfLine(string label, double ms, int? tokens, double? tokPerSec)

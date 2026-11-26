@@ -38,6 +38,9 @@ internal static unsafe partial class D3dNative
     [LibraryImport("d3d12.dll")]
     internal static partial int D3D12CreateDevice(nint adapter, int minimumFeatureLevel, in Guid riid, out nint device);
 
+    [LibraryImport("kernel32.dll", EntryPoint = "LoadLibraryExW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    internal static partial nint LoadLibraryEx(string fileName, nint reserved, uint flags);
+
     [LibraryImport("kernel32.dll", EntryPoint = "CreateEventW")]
     internal static partial nint CreateEvent(nint attributes, int manualReset, int initialState, nint name);
 

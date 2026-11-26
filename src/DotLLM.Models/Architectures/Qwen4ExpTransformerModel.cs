@@ -8,6 +8,7 @@ using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cpu.Threading;
+using DotLLM.Models.Edge0;
 using DotLLM.Models.Gguf;
 
 namespace DotLLM.Models.Architectures;
@@ -49,9 +50,19 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
         public int QsaOrdinal = -1;
         public Qwen4ExpPleBranch? Ple;
         public int PleOrdinal = -1;
-        public required MoeLayerWeights Moe;
+        public MoeLayerWeights? Moe;
+        public Edge0LayerMoe? Edge0;
     }
 
+    /// <summary>The per-layer MoE inputs of an Edge0 latent-MoE layer that live in the skeleton GGUF: the BF16 router and the shared expert (all read in place).</summary>
+    private sealed class Edge0LayerMoe
+    {
+        public required nint RouterBf16;
+        public Edge0LatentMoe.SharedExpert Shared;
+    }
+
+    private Edge0Pack? _edge0Pack;   // Edge0 latent MoE (null for a stock qwen4exp file); owned: disposed with the model
+    private GgufFile? _pleFile;      // Edge0 FP8 n-gram table file; owned
     private readonly GgufFile? _gguf;
     private readonly Block[] _blocks;
     private readonly GrWeights _head;
@@ -171,8 +182,50 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
         }
     }
 
+    /// <summary>
+    /// Loads an Edge0 latent-MoE model (<c>Edge0/Edge0-145B-q3k</c>): the skeleton GGUF (everything but the routed experts, D/U and the
+    /// n-gram table), the strata pack (<see cref="Edge0Pack"/>: Q3_K/IQ4_NL experts and Q8/Q4 D/U, read in place) and the FP8 n-gram table
+    /// (<see cref="Fp8PleTable"/>). Nothing is widened or copied: every weight is a view of a mapped file.
+    /// </summary>
+    /// <param name="skeleton">The opened <c>model-skeleton.gguf</c>; must outlive the model (the model does not own it).</param>
+    /// <param name="config">Configuration extracted from <paramref name="skeleton"/>.</param>
+    /// <param name="threading">Threading configuration.</param>
+    /// <param name="pack">The opened strata pack. On success the model OWNS it (disposed with the model); on an exception the caller still owns it.</param>
+    /// <param name="pleFile">The opened <c>ple-fp8.gguf</c>. Ownership as for <paramref name="pack"/>.</param>
+    public static Qwen4ExpTransformerModel LoadEdge0(GgufFile skeleton, ModelConfig config, ThreadingConfig threading, Edge0Pack pack, GgufFile pleFile)
+    {
+        ArgumentNullException.ThrowIfNull(skeleton);
+        ArgumentNullException.ThrowIfNull(pack);
+        ArgumentNullException.ThrowIfNull(pleFile);
+        if (config.Architecture != DotLLM.Core.Configuration.Architecture.Qwen4Exp || config.Qwen4Exp is not { Ple: not null } || config.GdnConfig is null
+            || config.Moe is not { } moe || config.HybridLayout is null)
+            throw new ArgumentException("An Edge0 model needs a fully populated Architecture.Qwen4Exp configuration with a PLE module.", nameof(config));
+        if (pack.Layers != config.NumLayers || pack.Experts != moe.NumExperts || pack.Hidden != config.HiddenSize || pack.ExpertFf != moe.MoeIntermediateSize)
+            throw new InvalidDataException(
+                $"Edge0 pack ({pack.Layers} layers, {pack.Experts} experts, hidden {pack.Hidden}, ff {pack.ExpertFf}) does not match the skeleton " +
+                $"({config.NumLayers} layers, {moe.NumExperts} experts, hidden {config.HiddenSize}, ff {moe.MoeIntermediateSize}).");
+        var tensors = skeleton.TensorsByName;
+        var problems = Qwen4ExpTensors.FindProblems(tensors, config, includeTrunk: true, includeMtp: false, skeleton: true);
+        if (problems.Count > 0)
+            throw new InvalidDataException("Edge0 skeleton tensor table does not match the qwen4exp contract: " +
+                                           string.Join("; ", problems.Take(8)) + (problems.Count > 8 ? $"; (+{problems.Count - 8} more)" : ""));
+        var owned = new List<nint>();
+        try
+        {
+            var model = Build(config, config.Qwen4Exp!, skeleton, tensors, threading, owned, pack, pleFile);
+            model._edge0Pack = pack; model._pleFile = pleFile;
+            return model;
+        }
+        catch
+        {
+            foreach (nint p in owned) NativeMemory.AlignedFree((void*)p);
+            throw;
+        }
+    }
+
     private static Qwen4ExpTransformerModel Build(ModelConfig config, Qwen4ExpConfig q4, GgufFile gguf,
-        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, ThreadingConfig threading, List<nint> owned)
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, ThreadingConfig threading, List<nint> owned,
+        Edge0Pack? edge0 = null, GgufFile? pleFile = null)
     {
         int hidden = config.HiddenSize, hc = q4.HyperConnectionCount, hcDim = hc * hidden, lr = q4.HyperConnectionLowRank;
         var layout = config.HybridLayout!;
@@ -223,7 +276,8 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
             {
                 AttnGr = Gr(b, "hc_attn_norm.weight", "hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight"),
                 FfnGr = Gr(b, "hc_ffn_norm.weight", "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight"),
-                Moe = LoadMoe(il, gguf, tensors, config, owned),
+                Moe = edge0 is null ? LoadMoe(il, gguf, tensors, config, owned) : null,
+                Edge0 = edge0 is null ? null : LoadEdge0Moe(il, gguf, tensors, config),
             };
 
             if (layout.LayerKind[il] == HybridLayerKind.GatedDeltaNet)
@@ -241,11 +295,22 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
             {
                 // module index = position in the (ascending) layer list: selects this module's own hash constants (HF ple_layer_index)
                 int module = ple.Layers.ToList().IndexOf(il);
-                var tdesc = tensors[Qwen4ExpTensors.PerLayerTokenEmbd];
                 int rowDim = ple.RowDim;
+                // Stock file: the table is a tensor of the GGUF. Edge0: it is the FP8 file (I8 bytes, one table-wide scale), read in place.
+                nint tablePtr; QuantizationType tableQt; long tableRows; float tableScale = 0f;
+                if (pleFile is not null)
+                {
+                    (tablePtr, tableRows, tableScale) = Fp8PleTable.Open(pleFile, rowDim);
+                    tableQt = QuantizationType.I8;
+                }
+                else
+                {
+                    var tdesc = tensors[Qwen4ExpTensors.PerLayerTokenEmbd];
+                    tablePtr = gguf.TensorDataPointer(tdesc); tableQt = tdesc.QuantizationType; tableRows = tdesc.Shape[1];
+                }
                 var convRaw = F32(b + "ple_conv1d.weight", (long)ple.ConvKernel * hcDim);   // [C][K] (K fastest)
                 block.Ple = new Qwen4ExpPleBranch(
-                    gguf.TensorDataPointer(tdesc), tdesc.QuantizationType, tdesc.Shape[1], rowDim,
+                    tablePtr, tableQt, tableRows, rowDim,
                     ple.NgramSize, ple.HeadsPerNgram, ple.EosTokenId, ple.ConvKernel,
                     ple.MultipliersOf(module).Select(v => unchecked((long)v)).ToArray(),
                     ple.HeadOffsetsOf(module).Select(v => checked((long)v)).ToArray(),
@@ -253,7 +318,8 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
                     hc, hidden, config.NormEpsilon,
                     F32(b + "ple_norm_key.weight", hcDim), F32(b + "ple_norm_query.weight", hcDim), F32(b + "ple_norm_conv.weight", hcDim),
                     Qwen4ExpPle.TransposeConvWeight(convRaw, hcDim, ple.ConvKernel),
-                    Projection(Mat(b + "ple_key.weight"), pool), Projection(Mat(b + "ple_value.weight"), pool));
+                    Projection(Mat(b + "ple_key.weight"), pool), Projection(Mat(b + "ple_value.weight"), pool),
+                    tableOptions: null, tableScale: tableScale);
                 block.PleOrdinal = pleOrd++;
             }
             blocks[il] = block;
@@ -389,6 +455,32 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
             sharedUpRaw: [gguf.TensorDataPointer(su)], sharedUpRawQt: su.QuantizationType,
             sharedDownRaw: [gguf.TensorDataPointer(sd)], sharedDownRawQt: sd.QuantizationType);
         return layer;
+    }
+
+    /// <summary>
+    /// The skeleton half of an Edge0 latent-MoE layer: the BF16 router (<c>ffn_gate_inp</c>) and the Q8_0 shared expert stay raw views of
+    /// the mapped GGUF (no F32 copy: <see cref="LoadMoe"/> would widen both); only the 2560-float shared-expert sigmoid gate is copied.
+    /// </summary>
+    private static Edge0LayerMoe LoadEdge0Moe(int il, GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, ModelConfig config)
+    {
+        string p = $"blk.{il}.";
+        var moe = config.Moe!;
+        int hidden = config.HiddenSize, shared = moe.SharedExpertIntermediateSize ?? moe.MoeIntermediateSize;
+        var router = t[p + "ffn_gate_inp.weight"];
+        if (router.QuantizationType != QuantizationType.BF16)
+            throw new NotSupportedException($"Edge0 router blk.{il}.ffn_gate_inp.weight is {router.QuantizationType}; the in-place router kernel reads BF16.");
+        var sg = t[p + "ffn_gate_shexp.weight"]; var su = t[p + "ffn_up_shexp.weight"]; var sd = t[p + "ffn_down_shexp.weight"];
+        if (sg.QuantizationType != su.QuantizationType)
+            throw new NotSupportedException($"Edge0 shared expert gate ({sg.QuantizationType}) and up ({su.QuantizationType}) differ.");
+        var gateInp = t[p + "ffn_gate_inp_shexp.weight"];
+        var inputGate = new float[hidden];
+        Dequantize.ToFloat32(gguf.TensorDataPointer(gateInp), hidden, gateInp.QuantizationType, inputGate);
+        return new Edge0LayerMoe
+        {
+            RouterBf16 = gguf.TensorDataPointer(router),
+            Shared = new Edge0LatentMoe.SharedExpert(gguf.TensorDataPointer(sg), gguf.TensorDataPointer(su), gguf.TensorDataPointer(sd),
+                sg.QuantizationType, sd.QuantizationType, shared, inputGate),
+        };
     }
 
     // ───────────────────────────── projections ─────────────────────────────
@@ -654,7 +746,11 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
 
                 // ── MoE ──
                 GrRead(blk.FfnGr, res, xn, low, mix, h, gains, T, wantInject: true);
-                ForwardMoe(blk.Moe, il, h, y, T);
+                if (blk.Edge0 is { } e0)
+                    Edge0LatentMoe.ForwardBf16Router(_edge0Pack!, il, e0.RouterBf16, Config.Moe!.NumExpertsPerTok, Config.Moe.NormTopKProb, e0.Shared,
+                        h.AsSpan(0, T * H), y.AsSpan(0, T * H), T, _threadPool);
+                else
+                    ForwardMoe(blk.Moe!, il, h, y, T);
                 Qwen4ExpGatedResidual.Write(res.AsSpan(0, T * row), y, gains, S, H, T);
 
                 if (Trace is { } tr) tr($"blk.{il}.l_out", res.AsSpan(0, T * row), T, row);
@@ -1209,6 +1305,8 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
         if (_ownsPool) _threadPool?.Dispose();
         _defaultState.Dispose();
         foreach (var b in _blocks) b.Ple?.Prefetcher?.Dispose();
+        _edge0Pack?.Dispose();
+        _pleFile?.Dispose();
         _mtp?.OwnedFile?.Dispose();
         _spareCheckpoint?.Dispose();
         _rowBase?.Dispose(); _rowRecK.Dispose(); _rowRecG.Dispose(); _rowRecD.Dispose(); _rowSnapConv.Dispose();

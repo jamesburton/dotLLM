@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Globalization;
 using DotLLM.ChunkReuse.CodeCorpus;
 using DotLLM.ChunkReuse.SolutionScan;
 using Microsoft.CodeAnalysis;
@@ -286,20 +285,26 @@ public sealed class SolutionScannerHardeningTests : IDisposable
     }
 
     /// <summary>
-    /// Compiles a source generator whose <c>Initialize</c> sleeps for <paramref name="seconds"/> and returns the DLL path. Generators
-    /// named by a project's <c>Analyzer</c> items are loaded and run in THIS process when the project's compilation is made.
+    /// Compiles a source generator whose <c>Initialize</c> writes <paramref name="startedFile"/>, waits while
+    /// <paramref name="holdFile"/> exists (at most 5 minutes, so an abandoned run cannot spin forever), then writes
+    /// <paramref name="endedFile"/>, and returns the DLL path. Generators named by a project's <c>Analyzer</c> items are loaded and
+    /// run in THIS process when the project's compilation is made.
     /// </summary>
-    private string BuildSleepingGenerator(int seconds)
+    private string BuildHeldGenerator(string holdFile, string startedFile, string endedFile)
     {
-        string source = "using Microsoft.CodeAnalysis; [Generator] public sealed class SleepGen : IIncrementalGenerator { "
-            + "public void Initialize(IncrementalGeneratorInitializationContext context) { System.Threading.Thread.Sleep(" + seconds.ToString(CultureInfo.InvariantCulture) + "000); } }";
+        string source = "using Microsoft.CodeAnalysis; using System.IO; [Generator] public sealed class HeldGen : IIncrementalGenerator { "
+            + "public void Initialize(IncrementalGeneratorInitializationContext context) { "
+            + "File.WriteAllText(@\"" + startedFile + "\", \"\"); "
+            + "var limit = System.Diagnostics.Stopwatch.StartNew(); "
+            + "while (File.Exists(@\"" + holdFile + "\") && limit.Elapsed < System.TimeSpan.FromMinutes(5)) System.Threading.Thread.Sleep(50); "
+            + "File.WriteAllText(@\"" + endedFile + "\", \"\"); } }";
         string[] platform = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator);
-        var compilation = Microsoft.CodeAnalysis.CSharp.CSharpCompilation.Create("SleepGen",
+        var compilation = Microsoft.CodeAnalysis.CSharp.CSharpCompilation.Create("HeldGen",
             [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(source)],
             platform.Select(p => (MetadataReference)MetadataReference.CreateFromFile(p)),
             new Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
         Directory.CreateDirectory(_root);
-        string dll = Path.Combine(_root, "SleepGen.dll");
+        string dll = Path.Combine(_root, "HeldGen.dll");
         var emitted = compilation.Emit(dll);
         Assert.True(emitted.Success, string.Join("\n", emitted.Diagnostics));
         return dll;
@@ -310,22 +315,50 @@ public sealed class SolutionScannerHardeningTests : IDisposable
     [InlineData(true)]
     public async Task Scan_CancelledWhileASourceGeneratorRuns_ReturnsAtOnce(bool solution)
     {
-        // The design-time build is quick; the hold-up is the compilation, which runs the project's source generators.
-        string project = "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
-            + "<ItemGroup><Analyzer Include=\"" + BuildSleepingGenerator(25) + "\" /></ItemGroup></Project>";
-        string csproj = await WriteProjectAsync(project, ("A.cs", "class A { }\n"));
-        string entry = csproj;
-        if (solution)
+        // The design-time build is quick; the hold-up is the compilation, which runs the project's source generators. The generator is
+        // held until the test releases it, and the token is cancelled only once it is running, so the design-time build's duration (long
+        // on a loaded, ISA-capped CI runner: #1996) is not part of what is measured. A call that does not observe the token while the
+        // generator runs waits for the held generator and never returns: HangGuard fails it. No wall-clock bound.
+        Directory.CreateDirectory(_root);
+        string hold = Path.Combine(_root, "gen.hold"), started = Path.Combine(_root, "gen.started"), ended = Path.Combine(_root, "gen.ended");
+        File.WriteAllText(hold, "");
+        try
         {
-            entry = Path.Combine(_root, "S.slnx");
-            File.WriteAllText(entry, "<Solution><Project Path=\"P/P.csproj\" /></Solution>");
+            string project = "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+                + "<ItemGroup><Analyzer Include=\"" + BuildHeldGenerator(hold, started, ended) + "\" /></ItemGroup></Project>";
+            string csproj = await WriteProjectAsync(project, ("A.cs", "class A { }\n"));
+            string entry = csproj;
+            if (solution)
+            {
+                entry = Path.Combine(_root, "S.slnx");
+                File.WriteAllText(entry, "<Solution><Project Path=\"P/P.csproj\" /></Solution>");
+            }
+            using var cts = new CancellationTokenSource();
+            Task<Exception?> call = Record.ExceptionAsync(() => SolutionScanner.LoadAsync(entry, cts.Token));
+
+            using (var limit = new CancellationTokenSource(HangGuard.Limit))
+            {
+                try
+                {
+                    while (!File.Exists(started) && !call.IsCompleted) await Task.Delay(50, limit.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    Assert.Fail("the source generator never started");
+                }
+            }
+            Assert.True(File.Exists(started), "LoadAsync ended before the source generator ran (no generator in the compilation?)");
+            await cts.CancelAsync();
+
+            Exception? thrown = await HangGuard.ReturnsAsync(call, "LoadAsync");
+
+            Assert.IsAssignableFrom<OperationCanceledException>(thrown);
+            Assert.False(File.Exists(ended), "the call returned after the held source generator ended, so it waited for the generator");
         }
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-        var clock = Stopwatch.StartNew();
-
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SolutionScanner.LoadAsync(entry, cts.Token));
-
-        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(15), $"cancelled after 3 s, returned after {clock.Elapsed}");
+        finally
+        {
+            File.Delete(hold);
+        }
     }
 
     [Theory]

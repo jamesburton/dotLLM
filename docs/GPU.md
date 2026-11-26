@@ -1059,7 +1059,7 @@ it privatises the page (a full copy, same cost as staging); only a shared writab
 place. So `DOTLLM_GGUF_MAP_COW=1` imports but saves nothing physical, and it charges commit for the
 whole file.
 
-**`DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1`** (opt-in): when an import from the read-only mapping is
+**`DOTLLM_VULKAN_HOST_IMPORT_WRITABLE`** (#1991: stays **opt-in**; `0` disables, `1` enables; a dGPU still refuses the import, #507): when an import from the read-only mapping is
 refused, `VulkanWeightImportPolicy.TryImport` retries through `GgufFile.TryMapImportAlias`, a shared
 writable view of the same file range (same page-cache pages as the read-only mapping). Real Flint
 Q4_1 (26 GB), 485/485 tensors imported, logits bit-identical to staging:
@@ -1083,7 +1083,7 @@ Loaders that never call `TryImport` are not changed by the flag: on Qwen3.6-35B-
 shared tensors import (191 tensors, 1.7 GiB; private WS 23.8 -> 21.9 GiB) but the routed-expert banks
 (`VulkanQwen3MoeMoeUpload`) always stage.
 
-Why it is opt-in:
+Why it is opt-in (#1991 adds a SHA-256 write guard test, `VulkanWeightImportWriteGuardTests`, for the write risk below):
 
 - It opens the checkpoint **for write** (shared). A stray device write would reach the file on disk.
   Weight buffers are bound read-only in every shader, but nothing enforces that in Vulkan.
@@ -1092,6 +1092,36 @@ Why it is opt-in:
   cannot open the file. `GgufFile` itself now opens with `FileShare.ReadWrite`, so dotLLM processes
   coexist.
 - The decode cost above. It is the memory-for-throughput trade #508 described, now measured.
+
+### #1991: why the writable-alias import is NOT the default (Strix 8060S, 2026-11-25)
+
+Mapping access the driver accepts (re-confirmed in the output of `VulkanHostImportMmapAccessModeTests`, which prints these verdicts but does not assert them): read-only refused
+(`vkAllocateMemory` -1000072003); copy-on-write accepted but privatises every page (no saving); shared read-write
+accepted and in place. `VulkanWeightImportWriteGuardTests` hashes the file around an imported load + prefill + decode.
+An import that was refused although the alias was requested (`DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1`, integrated device) is counted and logged once per load, when the load's last staging buffer closes (`[dotllm] vulkan host import: N tensors / X MiB refused`); a default load (alias not requested) prints nothing, and a discrete GPU's by-design #507 refusal is not counted.
+
+Penalty investigation, Llama-3.1-8B Q4_K_M, `bench -p 512 -n 64 -r 3`, same session, warm cache (decode tok/s / prefill tok/s):
+
+| arm | host bytes copied | decode | prefill | verdict |
+|---|---|---|---|---|
+| staging (`..._WRITABLE=0`) | 4402 MiB | 37.1-38.2 | 831-939 | baseline |
+| writable alias, type 1 (default pick) | 0 | 30.2-30.8 (-19%) | 561-572 (-33%) | penalty |
+| alias, HOST_ALLOCATION handle, type 1 / type 3 (HOST_CACHED) | 0 | 30.5 / 30.6 | 549 / 585 | no change: memory type is not the lever |
+| alias, types 5, 7 / foreign type 5 | n/a | refused (mask for a file view is 0x2 foreign, 0xA alloc = types 1,3 only) | | |
+| anonymous copy imported, 64 KiB aligned (bounce, diagnostic) | 4684 MiB | 33.9 | 711 | partial recovery |
+| anonymous copy imported, 2 MiB aligned (bounce, diagnostic) | 4684 MiB | 37.2 | 833 | full recovery |
+| partial mirror: stage attention (736 MiB) / lm_head (411 MiB) | 736 / 411 | 31.1 / 31.3 | 558 / 566 | nothing recovered |
+| partial mirror: stage all FFN + embed/head (3666 MiB) | 3666 | 34.8-35.3 | 892-907 | recovers ~prefill; decode reaches ~93% of staging (~63% of the penalty), at 83% of the staging bytes |
+| **DirectStorage (#1304)** | **0** (direct to device-local heap) | **37.6-37.8** | **935** | **neutral, load 2.5-4.7 s** |
+
+Findings:
+- **Memory type**: a file-backed view is only importable into heap-0 types 1 (uncached) and 3 (HOST_CACHED); device-local types are not offered. Type 3 changes nothing.
+- **Page layout is the cause**: the same bytes in anonymous memory recover fully when 2 MiB aligned (and only partly at 64 KiB), so the cost is the physical fragmentation / small fragments of page-cache pages (GPU TLB), not the memory type or the driver path. File views cannot be large-page mapped (`SEC_LARGE_PAGES` is pagefile-backed only; the account also lacks SeLockMemoryPrivilege), so there is no zero-copy fix on this route.
+- **Hot-tensor mirror does not work**: the penalty follows bytes read, not a hot subset (attention and head mirrors recover nothing; recovery needs the FFN bytes, which is 83% of the model).
+- **DirectStorage is the zero-copy route that is neutral** on Llama (37.7 / 935 vs staging 37.1-38.2 / 831-939) and on Qwen3.6 (42.2-42.9 / 1112-1124 vs staging 41.9-44.1 / 1095-1100), where the alias gives 39.4-40.0 / 931-1017. On Olala (noisy, 25-29 decode) staging 28.7-28.9, DS 24.7-26.8, alias 20.9-26.0: DS is **not** shown neutral there (below staging on every run). The Qwen3.6 and Olala figures have no table rows.
+- **MoE routed-expert banks (20.8 GiB on Qwen3.6) still stage**: `UploadRoutedBankResidentQuant` copies the fused `[E,M,K]` tensor byte-for-byte, so the bank is one contiguous range of the GGUF and is a valid candidate for `TryImport`/`DirectWeightStore.TryLoad` (whole bank, below the 2 GiB allocation cap). Not implemented.
+
+Recommendation: keep the alias opt-in; make DirectStorage the Windows UMA default when `dstorage.dll` is present (it needs the offer-to-fetch flow, release artifacts cannot embed it), and route the MoE banks through it.
 
 ### What the import actually buys, and costs
 
@@ -1249,7 +1279,7 @@ The widened F32 token-embedding table of `Qwen3HybridDense` (`VulkanQwen3HybridD
 
 ## Windows DirectStorage weight load (Vulkan, #1304)
 
-`DOTLLM_VULKAN_DIRECT_STORAGE=1` (opt-in until the A/B is recorded) loads as-is weight tensors **from the GGUF file straight
+**Default on Windows UMA (#1994)** when `dstorage.dll` is present (`DOTLLM_VULKAN_DIRECT_STORAGE=0` opts out, `=1` forces it on any device; discrete GPUs keep staging by default). It loads as-is weight tensors **from the GGUF file straight
 into device-local memory**: DirectStorage reads the file range into a shared D3D12 default heap, and Vulkan imports that heap
 (`VK_KHR_external_memory_win32`, `D3D12_HEAP` handle type) as an ordinary device-local allocation. Tensors are sub-buffers of
 those heaps, like a `VulkanWeightArena` slab. Pure C#: hand-rolled COM vtable interop (`src/DotLLM.Vulkan/DirectStorage/`), no
@@ -1264,7 +1294,24 @@ packages and the CLI/Tray bundles contain no Microsoft binaries. To use the feat
 package to the host application, or copy the two DLLs next to the executable (the feature then accepts Microsoft's terms for you, as a
 developer/user). Anyone building their own bundle with the DLLs inside takes on section 2.b themselves.
 
-**Offer at startup.** On Windows x64/ARM64, when `dotllm run|chat|bench|serve` is started from an interactive terminal and `dstorage.dll` cannot be found, the CLI offers to fetch `Microsoft.Direct3D.DirectStorage 1.3.0` from NuGet (`DirectStorageInstaller`). It downloads the package, checks it against a pinned SHA-256, prints Microsoft's `LICENSE.txt`, and only after the user types `yes` extracts the two DLLs (plus the licence) to `~/.dotllm/native/directstorage/1.3.0/{arch}` (`DOTLLM_DIRECTSTORAGE_DIR` overrides the location). A "no" is remembered in `~/.dotllm/native/directstorage/declined`; `DOTLLM_NO_PROMPT=1` suppresses the offer, and redirected or non-interactive runs never see it. The installed copy is found automatically, but weight loading stays opt-in (`DOTLLM_VULKAN_DIRECT_STORAGE=1`).
+**Default A/B (#1994, Strix 8060S, `bench -p 512 -n 64 -r 3`, interleaved runs, "staging" = `DOTLLM_VULKAN_DIRECT_STORAGE=0`):**
+
+| model | host-copied MiB staging -> default | device live heap1 MiB | load s | decode tok/s | prefill tok/s | peak commit MiB |
+|---|---|---|---|---|---|---|
+| Llama-3.1-8B Q4_K_M (4 pairs) | 4402 -> 0 | 6589 -> 6620 | 4.0-5.5 -> 2.4-4.7 | 32.3-37.4 -> 34.4-37.0 | 699-1013 -> 897-1008 | 124-171 -> 123-204 |
+| Qwen3.6-35B-A3B UD-Q4_K_M (4 ABBA pairs, final review) | 21013 (2352 tensors + 18662 banks) -> 515 | 22892 -> 22901 | 12.6-23.3 -> 13.9-16.7 | 46.7-48.2 -> 47.1-48.6 | 1287-1355 -> 1310-1402 | see below |
+| Olala q8_0-safe2 (4 pairs) | 6534 -> 0.4 | 6651 -> 6750 | 5.5-9.1 -> 3.7-7.3 | 23.2-29.3 -> 25.3-28.9 | 258-315 -> 269-328 | 1751-1925 -> 718-734 |
+
+Greedy text (48 tokens, temp 0) is byte-identical between staging and the default on all three models. Qwen3.6: 20,499 MiB read directly
+(banks included), 515 MiB still staged. The default is within run noise on all three. An earlier 2-pair Qwen3.6 run read 1-5% lower prefill
+and ~2% lower decode; the 4-pair same-session re-measure has the default level or slightly ahead.
+
+Peak commit (process `PeakPagefileUsage`, kernel-tracked; device-local memory is not charged to it): Qwen3.6 staging **24330-24406 MiB ->
+DirectStorage 3918-3927 MiB** (the staging arm's 20 GiB peak is real host memory). The part DirectStorage itself adds scales with
+`DOTLLM_VULKAN_DS_STAGING_MIB`: 16 / 64 / 256 MiB gave 3748 / 3917 / 4681 MiB, about 4x the ring size. Llama `run`: 7732 -> 2601 MiB.
+The Llama/Olala "peak commit" column above was sampled differently (polled during the run) and is not comparable with these figures.
+
+**Offer at startup.** On Windows x64/ARM64, when `dotllm run|chat|bench|serve` is started from an interactive terminal and `dstorage.dll` cannot be found, the CLI offers to fetch `Microsoft.Direct3D.DirectStorage 1.3.0` from NuGet (`DirectStorageInstaller`). It downloads the package, checks it against a pinned SHA-256, prints Microsoft's `LICENSE.txt`, and only after the user types `yes` extracts the two DLLs (plus the licence) to `~/.dotllm/native/directstorage/1.3.0/{arch}` (`DOTLLM_DIRECTSTORAGE_DIR` overrides the location). A "no" is remembered in `~/.dotllm/native/directstorage/declined`; `DOTLLM_NO_PROMPT=1` suppresses the offer, and redirected or non-interactive runs never see it. The installed copy is found automatically, but weight loading uses it by default on integrated GPUs (#1994). Non-interactive runs (service, CI, the tray-launched server) are never prompted and never download: the CLI prints a one-line hint, and the load prints a warning with the bytes copied through host memory. Contiguous MoE expert banks (`[E,M,K]` ranges, `VulkanQwen3MoeMoeUpload`) go through the same tier (`TryLoadDirect`), skipping the device-side pre-allocation.
 
 Why it exists (#1250, spike `tools/d3d12-vk-import-spike`): importing the mmap'd file pages (read-only, copy-on-write or writable
 alias) cannot match device-local speed under weight reuse - file-backed host pages ran ~2x slower than device-local in a reuse
@@ -1273,7 +1320,7 @@ device-local speed, and the load leaves no process-private or page-cache duplica
 
 ```
 VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes)        (every weight loader goes through it)
-  └── DirectWeightStore.TryLoad            (first tier; >= 64 KiB; Windows + DOTLLM_VULKAN_DIRECT_STORAGE=1)
+  └── DirectWeightStore.TryLoad            (first tier; >= 64 KiB; Windows UMA + dstorage.dll, or DOTLLM_VULKAN_DIRECT_STORAGE=1)
         ├── GgufFile.TryResolveFileRange   srcPtr -> (file, offset)
         ├── place: tensors >= 16 MiB get an exactly-sized heap, smaller ones are first-fit into 128 MiB slabs
         ├── D3D12 CreateHeap(DEFAULT, SHARED) + placed buffer resource + CreateSharedHandle   (adapter matched by Vulkan LUID)

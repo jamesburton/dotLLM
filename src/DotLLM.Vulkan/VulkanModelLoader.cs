@@ -123,6 +123,18 @@ public static class VulkanModelLoader
         int nCpuMoeLayers = -1)
     {
         ArgumentNullException.ThrowIfNull(device);
+        VulkanWeightImportPolicy.BeginModelLoad();
+        var created = CreateFromGgufCore(device, gguf, config, spvDir, nCpuMoeLayers);
+        // #1994: one DirectStorage-fallback warning per model load (bytes copied through host memory), whatever number of loaders/staging buffers ran.
+        string dsWarn = VulkanWeightImportPolicy.EndModelLoad(device);
+        if (dsWarn.Length > 0) Console.Error.WriteLine(dsWarn);
+        return created;
+    }
+
+    private static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateFromGgufCore(
+        VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir, int nCpuMoeLayers)
+    {
+        ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(spvDir);
@@ -195,6 +207,14 @@ public static class VulkanModelLoader
 
             case Architecture.Ricursive:
                 throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("Vulkan"));
+
+            case Architecture.Olala:
+            {
+                // OVHcloud Olala (#1983): Mamba-3 MIMO + differential TPA + latent MoE; BF16 activations, F32 recurrent state, weights read in place.
+                // The model owns its sequence state (like the CPU model), so the engine KV cache is unused.
+                var olala = VulkanOlalaTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+                return (olala, size => olala.CreateKvCacheHandle(size));
+            }
 
             case Architecture.Mamba3:
                 throw new NotSupportedException(

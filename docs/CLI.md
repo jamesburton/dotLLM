@@ -369,7 +369,7 @@ dotllm list --json           # {"version":1,"models":[{repo,filename,quant,size_
 
 ### dotllm run
 
-One-shot generation: tokenizes the prompt (with the chat template where the model has one), generates up to `--max-tokens`, then prints the text and a summary
+One-shot generation: tokenizes the prompt as raw text (a plain completion; the chat template is applied only when `--tools` is given), generates up to `--max-tokens`, then prints the text and a summary
 (tokens, prefill/decode tokens per second, memory, KV size). Greedy unless `--temp` > 0. `--json` prints a single JSON object (text, usage, timings, memory, backend
 diagnostics) and sends everything else to stderr.
 
@@ -882,7 +882,7 @@ Some variables are read at process start, others per model load - set them befor
 | `DOTLLM_URL` | `http://localhost:8080` | Server base URL for `ps` and `stop` when `--url` is absent. |
 | `DOTLLM_NO_PROMPT` | unset | `1` suppresses the first-run offer to install the DirectStorage runtime that `run`, `chat`, `bench` and `serve` make on Windows in an interactive terminal. |
 | `DOTLLM_DIRECTSTORAGE_DIR` | package folder | Directory holding the DirectStorage runtime DLLs. |
-| `DOTLLM_VULKAN_DIRECT_STORAGE` | off | `1` loads Vulkan weights straight from disk into device memory via DirectStorage (Windows, opt-in). |
+| `DOTLLM_VULKAN_DIRECT_STORAGE` | on (Windows UMA with `dstorage.dll`) | `0` disables; `1` forces DirectStorage weight loading (disk straight into device memory) on any device. |
 | `DOTLLM_TUNING_DIR` | `~/.dotllm/tuning` | Root of the saved tuning results that `--auto` reads (#1902). |
 | `DOTLLM_HASH_CACHE_DIR` | `~/.dotllm/hash-cache` | Cache of file digests used to verify `--tensor-overlay` base hashes. |
 | `DOTLLM_GGUF_MAP_COW` | off | `1` maps GGUF files copy-on-write instead of read-only. |
@@ -1077,7 +1077,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_FORCE_DIRECT_GEMV` | Force direct GEMV path, disabling MMQ and MMVQ-Large variants. Useful for diagnostics to isolate dequant vs advanced GEMV kernels. Set environment variable DOTLLM_FORCE_DIRECT_GEMV=1 to enable. | `CudaKernels.cs` |
 | `DOTLLM_GDN_SCAN_APPROX_SPLIT4` | Opt-in (default OFF) env-var gate for LaunchGdnScanStepF32CoopSplit4. Enabling this trades away gdn_scan_step_f32's documented bit-exact CPU/GPU parity - the row-split reduction reassociates the retrieve/read accumulation (inde... | `CudaKernels.cs` |
 | `DOTLLM_GRAPH_MAX_DEPTH` | Issue #218: generalizes BitNetGraphCaptureMaxDepth's depth-ceiling mitigation to every graph-capable architecture, not just BitNet. #213/#217 found and fixed the regression for BitNet specifically; #218 confirmed via real-model... | `CudaTransformerModel.cs` |
-| `DOTLLM_HYBRID_DEBUG` | 4. Second residual add: hidden = residual + normOut. | `CudaQwen3HybridDenseTransformerModel.cs` |
+| `DOTLLM_HYBRID_DEBUG` | (not described in source) | `CudaQwen3HybridDenseTransformerModel.cs` |
 | `DOTLLM_HYBRID_KVQ_PER_ROW` | Issue #1068: per-row fused quantized-KV attention for short multi-row forwards. Default ON wherever the fused decode tier is on; DOTLLM_HYBRID_KVQ_PER_ROW=0 restores dequant-to-scratch for A/B measurement. | `CudaQwen3HybridDenseTransformerModel.cs` |
 | `DOTLLM_HYBRID_KV_FUSED` | (not described in source) | `CudaQwen3HybridDenseTransformerModel.cs` |
 | `DOTLLM_HYBRID_PROFILE` |  One-off category profiler (DOTLLM_HYBRID_PROFILE=1). Coarse (Stopwatch + per-mark Synchronize - the sync itself perturbs true pipelined timing, so this is for RELATIVE category comparison only, not absolute steady-state throug... | `CudaQwen3HybridDenseTransformerModel.cs` |
@@ -1109,6 +1109,8 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_DFLASH_TRACE` | DOTLLM_DFLASH_TRACE=1: per-request draft / inject wall time on stderr at dispose. | `DFlashMtpState.cs` |
 | `DOTLLM_DIAG_EMBED_NOISE` | DIAGNOSTIC (DOTLLM_DIAG_EMBED_NOISE=&lt;eps&gt;): multiplies every embedding element by 1 + eps*u, u in [-1,1] (fixed seed): the noise-injection floor probe (#1599). | `TransformerModel.cs` |
 | `DOTLLM_DIAG_F32ACT_ALL` | DIAGNOSTIC (DOTLLM_DIAG_F32ACT_ALL=1): every quantized dense projection runs dequantize-rows x F32 activations instead of the quantized-activation kernels (combine with DOTLLM_Q4E_DIAG_F32ACT=1 for the MoE banks). The F32-activ... | `TransformerModel.cs` |
+| `DOTLLM_EDGE0_COLSCALE` | Environment variable selecting the diagnostic column-scale arm (inverse \| direct \| none); unset = inverse. | `Edge0Model.cs` |
+| `DOTLLM_EDGE0_LATENT` | (not described in source) | `Edge0Model.cs` |
 | `DOTLLM_EMBED_PAR_MIN` | Minimum batch size for one-sequence-per-core execution; below it a batch runs sequentially on the pooled kernels. Env DOTLLM_EMBED_PAR_MIN overrides (benchmarking). | `BertEncoderModel.cs` |
 | `DOTLLM_G4_PROF` | Env-gated (DOTLLM_G4_PROF=1) stopwatch buckets for the Gemma-4 CPU layer path. | `G4Prof.cs` |
 | `DOTLLM_I2S_CACHE` | Builds a BitNetI2SCacheContext for a BitNet checkpoint so repeated loads reuse the ternary I2_S packing instead of re-quantizing bf16 weights. The cache lives in a hidden .dotllm-i2s-cache folder beside the checkpoint and is ke... | `ModelLoader.cs` |
@@ -1360,7 +1362,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_VULKAN_HAZARD_BARRIERS` |  Hazard-scoped barriers (issue #144)  Legacy behaviour emitted a full-pipeline barrier after essentially every dispatch (~573/token on SmolLM decode), serialising the GPU so wall time = sum of op times. The hazard tracker repla... | `VulkanTransformerModel.cs` |
 | `DOTLLM_VULKAN_HAZARD_DEBUG` | Diagnostic (issue #144): DOTLLM_VULKAN_HAZARD_DEBUG=1 prints the first guards of the process with the buffer that forced each barrier. | `VulkanHazardTracker.cs` |
 | `DOTLLM_VULKAN_HAZARD_VALIDATE` | Debug aid: keep the tracker armed but force a barrier at every guard - legacy-equivalent ordering through the tracked code path. | `VulkanTransformerModel.cs` |
-| `DOTLLM_VULKAN_HOST_IMPORT_WRITABLE` | DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1: import read-only GGUF ranges through a shared writable alias view (#1190). Read per call. | `VulkanWeightImportPolicy.cs` |
+| `DOTLLM_VULKAN_HOST_IMPORT_WRITABLE` | Whether a refused read-only import is retried through a shared writable alias view of the same file range (#1190, #1991). DOTLLM_VULKAN_HOST_IMPORT_WRITABLE: 0 = never, 1 = on (a discrete GPU still refuses the import, #507), un... | `VulkanWeightImportPolicy.cs` |
 | `DOTLLM_VULKAN_HYBRID_PROFILE` | (not described in source) | `VulkanQwen3HybridDenseTransformerModel.Profiling.cs` |
 | `DOTLLM_VULKAN_HYBRID_PROFILE_MINSEQ` | (not described in source) | `VulkanQwen3HybridDenseTransformerModel.Profiling.cs` |
 | `DOTLLM_VULKAN_HYBRID_PROFILE_OUT` | (not described in source) | `VulkanQwen3HybridDenseTransformerModel.Profiling.cs` |

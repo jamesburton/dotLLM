@@ -139,8 +139,13 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     /// <summary>True when this buffer was built for parallel streaming (more than the default two slots).</summary>
     public bool IsParallel => _slots.Length > SlotCount;
 
+    /// <summary>Live staging buffers. The #1991 refusal line is printed only when the outermost one closes, so a loader whose
+    /// per-layer helpers build and dispose their own staging inside its load (MoE banks) reports once, not once per layer.</summary>
+    private static int s_live;
+
     private VulkanStagingBuffer(VulkanDevice device, Slot?[] slots, long capacity)
     {
+        Interlocked.Increment(ref s_live);
         _device = device;
         _slots = slots;
         Capacity = capacity;
@@ -440,8 +445,25 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        WaitAll();
-        DirectStorage.DirectWeightStore.TryGet(_device)?.Seal();   // #1304: end of load - reads landed, DirectStorage queue and ring freed
+        try
+        {
+            WaitAll();
+            DirectStorage.DirectWeightStore.TryGet(_device)?.Seal();   // #1304: end of load - reads landed, DirectStorage queue and ring freed
+        }
+        catch
+        {
+            // #1994: a failed DirectStorage read throws from Seal (the weights are incomplete). Still release this buffer's slots and its
+            // s_live count, or every later load in the process (serve) would leak them and never report a refusal / fallback again.
+            Interlocked.Decrement(ref s_live);
+            for (int i = 0; i < _slots.Length; i++)
+                if (_slots[i] is { } failedSlot) DestroySlot(_device, failedSlot);
+            throw;
+        }
+        if (Interlocked.Decrement(ref s_live) == 0)
+        {
+            string refusal = VulkanWeightImportPolicy.RejectionWarning();   // #1991: a requested alias that was refused is never silent (reported once)
+            if (refusal.Length > 0) Console.Error.WriteLine(refusal);
+        }
         if (s_trace)
         {
             Console.Error.WriteLine(

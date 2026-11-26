@@ -1,0 +1,43 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Edge0 latent MoE (G3, #1981): routing-weighted sum of the expert down outputs of ONE D/U group, written straight into Q8_1 blocks.
+//
+//   z_g[t, c] = sum_{j < k, labels[indices[t*k+j]] == g} weights[t*k+j] * down[t*k+j, c]      (slot order j ascending, like the CPU oracle)
+//   (xq, xds)[t] = Q8_1(z_g[t, :])                                                              (same quantiser as quantize_q8_1_rows)
+//
+// One dispatch per group g (the push constant); a token with no expert in g gets exact zeros (d = 0, q = 0), so U_g z_g = 0 for it. The F32 z never exists in
+// memory: U (a Q8_0 matmul) quantises its input to Q8_1 anyway, so the combine hands it the blocks directly. One 32-thread workgroup per (Q8_1 block, token).
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufDown    { float down[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufIdx     { int   indices[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufWeights { float weights[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufLabels  { int   labels[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer BufXq      { uint  xq[]; };    // [T, L/4]
+layout(set = 0, binding = 5, std430) writeonly buffer BufXds     { vec2  xds[]; };   // [T, L/32]
+
+layout(push_constant) uniform PushConstants {
+    uint L;            // multiple of 32
+    uint K;
+    uint g;
+    uint T;
+    uint numExperts;
+} pc;
+
+#include "edge0_q81_pack.glsl"
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint b = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    uint c = b * 32u + lane;
+    float acc = 0.0;
+    for (uint j = 0u; j < pc.K; j++) {
+        uint v = t * pc.K + j;
+        uint e = uint(indices[v]);
+        if (e < pc.numExperts && uint(labels[e]) == pc.g)
+            acc += weights[v] * down[v * pc.L + c];
+    }
+    acc = float(float16_t(acc));   // z is an F16 value (James's ruling, #1981); U's MMVQ then quantises that F16 value to Q8_1
+    edge0PackQ81(acc, lane, t * (pc.L >> 2u) + b * 8u, t * (pc.L >> 5u) + b);
+}

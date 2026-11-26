@@ -42,6 +42,10 @@ public static partial class GgufModelConfigExtractor
         if (architecture == Architecture.Ricursive)
             return BuildRicursiveConfig(metadata, arch);
 
+        // Olala (#1970): Mamba-3 MIMO + differential TPA hybrid with a latent MoE per block; dedicated builder (per-layer letters, no RoPE).
+        if (architecture == Architecture.Olala)
+            return BuildOlalaConfig(metadata, arch);
+
         int hiddenSize = (int)metadata.GetUInt32($"{arch}.embedding_length");
         int numLayers = (int)metadata.GetUInt32($"{arch}.block_count");
         int numAttentionHeads = (int)metadata.GetUInt32($"{arch}.attention.head_count");
@@ -1258,6 +1262,8 @@ public static partial class GgufModelConfigExtractor
             "glm4moe" => Architecture.Glm4Moe,
             // ricursiveAI Ripple-65B (#1643): community llama.cpp ports + PR #31692.
             "ricursive" => Architecture.Ricursive,
+            // OVHcloud Olala-v1.0-mini-7A1B (OVH llama.cpp fork `olala`): Mamba-3 MIMO + differential TPA + latent MoE (#1970).
+            "olala" => Architecture.Olala,
             "lfm2moe" => Architecture.Lfm2Moe,
             "lfm3" => Architecture.Lfm3,
             "nemotron_h" => Architecture.NemotronH,

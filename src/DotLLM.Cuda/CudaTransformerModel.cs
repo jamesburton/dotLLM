@@ -4161,6 +4161,8 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
             throw new NotSupportedException(ModelConfig.Glm4MoeUnsupportedMessage("CUDA"));
         if (config.Architecture == Architecture.Ricursive)
             throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("CUDA"));
+        if (config.Architecture == Architecture.Olala)
+            throw new NotSupportedException(OlalaConfig.UnsupportedMessage("CUDA"));
         if (config.Architecture == Architecture.GraniteMoe)
             throw new NotSupportedException(
                 "Architecture GraniteMoe (Granite-3.x MoE, GGUF granitemoe) is not supported on the CUDA backend: the "

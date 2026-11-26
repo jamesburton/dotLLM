@@ -38,6 +38,7 @@ public sealed class DedicatedLoaderArchitectureRejectionTests
     [InlineData(Architecture.Qwen3MoeHybrid)]
     [InlineData(Architecture.Qwen3HybridDense)]
     [InlineData(Architecture.Mamba3)]
+    [InlineData(Architecture.Olala)]
     public void DedicatedLoaderArchitectures_AreRejectedWithAnActionableMessage(Architecture arch)
     {
         var ex = Assert.Throws<NotSupportedException>(

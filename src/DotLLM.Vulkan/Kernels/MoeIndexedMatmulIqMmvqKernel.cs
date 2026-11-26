@@ -28,6 +28,8 @@ public enum MoeIqQuant
     Q4_0,
     /// <summary>Q4_1 (issue #1171, Recursive Flint): 20 B / 32 elements (fp16 d, fp16 m, 16 nibble bytes), value = d * nibble + m. V2 shader only.</summary>
     Q4_1,
+    /// <summary>Q3_K (Edge0 G3, #1981): 110 B / 256 elements (hmask, qs, 16 six-bit scales, fp16 d), no codebook. Edge0 gate/up experts (K = 1792 = 7 super-blocks).</summary>
+    Q3_K,
 }
 
 /// <summary>Per-format facts shared by the indexed MMVQ and grouped coopmat IQ kernels (#823).</summary>
@@ -47,6 +49,7 @@ internal static class MoeIqFormats
         MoeIqQuant.IQ1_M => (QuantFormat.IQ1_MBlockBytes, QuantFormat.KQuantGroupSize),
         MoeIqQuant.Q4_0 => (QuantFormat.Q4_0BlockBytes, QuantFormat.LegacyGroupSize),
         MoeIqQuant.Q4_1 => (QuantFormat.Q4_1BlockBytes, QuantFormat.LegacyGroupSize),
+        MoeIqQuant.Q3_K => (QuantFormat.Q3_KBlockBytes, QuantFormat.KQuantGroupSize),
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 
@@ -64,6 +67,7 @@ internal static class MoeIqFormats
         QuantizationType.IQ1_M => MoeIqQuant.IQ1_M,
         QuantizationType.Q4_0 => MoeIqQuant.Q4_0,
         QuantizationType.Q4_1 => MoeIqQuant.Q4_1,
+        QuantizationType.Q3_K => MoeIqQuant.Q3_K,
         _ => null,
     };
 
@@ -168,6 +172,7 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
         MoeIqQuant.IQ1_M => "moe_indexed_matmul_iq1_m_mmvq",
         MoeIqQuant.Q4_0 => "moe_indexed_matmul_q4_0_mmvq",
         MoeIqQuant.Q4_1 => "moe_indexed_matmul_q4_1_mmvq",
+        MoeIqQuant.Q3_K => "moe_indexed_matmul_q3_k_mmvq",
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 
@@ -182,6 +187,9 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     internal static MoeIndexedMatmulIqMmvqKernel? TryCreate(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null, Iq2Codebooks? iq2Codebooks = null, Iq1Codebooks? iq1Codebooks = null, bool? v2 = null)
     {
         if (!device.HasIntegerDotProduct)
+            return null;
+        // The shaders reduce with one wave32 subgroupAdd per cell: on a device whose subgroups are narrower (and cannot be pinned to 32) the sum is silently partial.
+        if (Wave32SubgroupControl.RequiredSubgroupSizeFor(device) == 0 && device.SubgroupSize < 32)
             return null;
         // Q4_1 has no V1 shader (#1171), so it always takes V2.
         bool useV2 = quant == MoeIqQuant.Q4_1 || ((v2 ?? (V2Default && (quant != MoeIqQuant.Q4_0 || Q4_0V2Default))) && HasV2(quant));

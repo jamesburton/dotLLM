@@ -233,6 +233,11 @@ public static unsafe partial class MoeSwiGluMlp
     /// one shared expert subset before softmax/top-k (<see cref="ApplyBlockCoreset"/>). 0 (the default) = off; every causal caller passes
     /// nothing, so its routing is unchanged.
     /// </param>
+    /// <param name="gateWeightsBf16">
+    /// Optional router weight <c>[numExperts × hiddenSize]</c> stored as BF16, read in place by <see cref="MatMul.GemmBf16(nint, float*, float*, int, int, int, ComputeThreadPool?)"/>
+    /// (no F32 copy of the router is made). When non-zero it replaces <paramref name="gateWeights"/>, which may then be empty; everything after the
+    /// logits (softmax, top-k, buckets) is shared with the F32 path. 0 (the default) = use <paramref name="gateWeights"/>.
+    /// </param>
     /// <returns>Number of unique experts actually used (the valid prefix length of <paramref name="uniqueExperts"/>).</returns>
     public static int Route(
         ReadOnlySpan<float> hidden,
@@ -251,9 +256,12 @@ public static unsafe partial class MoeSwiGluMlp
         ReadOnlySpan<float> selectionBias = default,
         float weightsScale = 1.0f,
         ComputeThreadPool? pool = null,
-        float blockCoresetTopP = 0f)
+        float blockCoresetTopP = 0f,
+        nint gateWeightsBf16 = 0)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
+        if (gateWeightsBf16 == 0 && gateWeights.Length < (long)numExperts * hiddenSize)
+            throw new ArgumentException("gateWeights too small", nameof(gateWeights));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
             throw new ArgumentOutOfRangeException(nameof(numExpertsPerTok));
         if (!gateBias.IsEmpty && gateBias.Length < numExperts)
@@ -284,7 +292,12 @@ public static unsafe partial class MoeSwiGluMlp
             fixed (float* gateWPtr = gateWeights)
             fixed (float* logitsAllPtr = gateLogitsBuf)
             {
-                if (pool is not null && numExperts >= 64)
+                if (gateWeightsBf16 != 0)
+                {
+                    // BF16 router read in place; C[t][e] = hidden[t] . gate[e], the same [token][expert] layout as the F32 branches.
+                    MatMul.GemmBf16(gateWeightsBf16, hiddenPtr, logitsAllPtr, numExperts, hiddenSize, seqLen, pool);
+                }
+                else if (pool is not null && numExperts >= 64)
                 {
                     // #1159: the same per-(row, token) dot, split over expert rows; each worker reuses its rows across every
                     // token from cache instead of streaming the whole router once per token on one thread.
@@ -662,25 +675,9 @@ public static unsafe partial class MoeSwiGluMlp
                     // disjoint by construction, so no synchronisation is needed.
                     // Span<T> can't be captured by a closure, so copy the routing arrays
                     // into managed arrays the lambda can close over.
-                    int[] bucketCursorsArr = bucketCursors.ToArray();
-                    int[] bucketTokensArr = bucketTokens.ToArray();
-                    int[] bucketSlotsArr = bucketSlots.ToArray();
-                    int[] uniqueExpertsArr = uniqueExperts.Slice(0, uniqueExpertCount).ToArray();
-                    nint[] gateF32Arr = gateExpsF32Ptrs.ToArray();
-                    nint[] upF32Arr = upExpsF32Ptrs.ToArray();
-                    nint[] downF32Arr = downExpsF32Ptrs.ToArray();
-                    var ctxCopy = workerCtx;
-
-                    System.Threading.Tasks.Parallel.For(0, uniqueExpertCount, u =>
-                    {
-                        int e = uniqueExpertsArr[u];
-                        // Each Parallel.For iteration is independent — disjoint scatter rows.
-                        ProcessRoutedExpert(
-                            ctxCopy, e,
-                            bucketCursorsArr, bucketTokensArr, bucketSlotsArr,
-                            gateF32Arr, upF32Arr, downF32Arr,
-                            loraAdapter, loraLayer, threadPool: null);
-                    });
+                    ProcessExpertsParallel(
+                        workerCtx, bucketCursors, bucketTokens, bucketSlots, uniqueExperts, uniqueExpertCount,
+                        gateExpsF32Ptrs, upExpsF32Ptrs, downExpsF32Ptrs, loraAdapter, loraLayer);
                 }
             }
 
@@ -866,6 +863,43 @@ public static unsafe partial class MoeSwiGluMlp
     }
 
     /// <summary>
+    /// The threadless-pool expert fan-out (outer <see cref="System.Threading.Tasks.Parallel.For(int, int, Action{int})"/>). Lives in its own method
+    /// so the closure object (it captures <c>loraAdapter</c> / <c>loraLayer</c>, i.e. method parameters) is created only when this branch runs:
+    /// the C# compiler allocates a display class for captured parameters at the entry of the declaring method, which made every serial
+    /// call of <see cref="ExecuteRoutedFromAssignments"/> allocate 32 bytes.
+    /// </summary>
+    private static void ProcessExpertsParallel(
+        RoutedExpertWorkerCtx ctx,
+        ReadOnlySpan<int> bucketCursors, ReadOnlySpan<int> bucketTokens, ReadOnlySpan<int> bucketSlots,
+        ReadOnlySpan<int> uniqueExperts, int uniqueExpertCount,
+        ReadOnlySpan<nint> gateExpsF32Ptrs, ReadOnlySpan<nint> upExpsF32Ptrs, ReadOnlySpan<nint> downExpsF32Ptrs,
+        ILoraAdapter? loraAdapter, int loraLayer)
+    {
+        // Outer Parallel.For over touched experts. Inner GEMMs pass pool=null to avoid oversubscription. The per-(t,slot) scatter
+        // targets are disjoint by construction, so no synchronisation is needed. Span<T> can't be captured by a closure, so copy the
+        // routing arrays into managed arrays the lambda can close over.
+        int[] bucketCursorsArr = bucketCursors.ToArray();
+        int[] bucketTokensArr = bucketTokens.ToArray();
+        int[] bucketSlotsArr = bucketSlots.ToArray();
+        int[] uniqueExpertsArr = uniqueExperts.Slice(0, uniqueExpertCount).ToArray();
+        nint[] gateF32Arr = gateExpsF32Ptrs.ToArray();
+        nint[] upF32Arr = upExpsF32Ptrs.ToArray();
+        nint[] downF32Arr = downExpsF32Ptrs.ToArray();
+        var ctxCopy = ctx;
+
+        System.Threading.Tasks.Parallel.For(0, uniqueExpertCount, u =>
+        {
+            int e = uniqueExpertsArr[u];
+            // Each Parallel.For iteration is independent: disjoint scatter rows.
+            ProcessRoutedExpert(
+                ctxCopy, e,
+                bucketCursorsArr, bucketTokensArr, bucketSlotsArr,
+                gateF32Arr, upF32Arr, downF32Arr,
+                loraAdapter, loraLayer, threadPool: null);
+        });
+    }
+
+    /// <summary>
     /// Process one routed expert: gather assigned token rows, run gate/up/down GEMMs
     /// (quantized-direct when possible, F32 fallback otherwise), apply SwiGLU, and scatter
     /// the per-(token,slot) down output into the shared scatter table. Pure function in
@@ -977,10 +1011,14 @@ public static unsafe partial class MoeSwiGluMlp
                 if (ctx.UpScale is not null)
                     ScaleInPlace(upBatchPtr, (long)batch * intermediateSize, ctx.UpScale[e]);
 
-                ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "gate_proj"),
-                    batchInPtr, gateBatchPtr, batch, hiddenSize, intermediateSize);
-                ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "up_proj"),
-                    batchInPtr, upBatchPtr, batch, hiddenSize, intermediateSize);
+                // The projection name is a string built per call: only build it when an adapter is actually attached.
+                if (loraAdapter is not null)
+                {
+                    ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "gate_proj"),
+                        batchInPtr, gateBatchPtr, batch, hiddenSize, intermediateSize);
+                    ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "up_proj"),
+                        batchInPtr, upBatchPtr, batch, hiddenSize, intermediateSize);
+                }
 
                 CpuStageProf.E(10, _p0); _p0 = CpuStageProf.T();
                 // ── Per-row gate fuse (GeGLU for Gemma 4, SwiGLU otherwise) ──
@@ -1014,8 +1052,9 @@ public static unsafe partial class MoeSwiGluMlp
                     hiddenSize, intermediateSize, batch,
                     preQuantizedInput: null, threadPool, ctx.PackedLegacy);
 
-                ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "down_proj"),
-                    siluBatchPtr, downBatchPtr, batch, intermediateSize, hiddenSize);
+                if (loraAdapter is not null)
+                    ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "down_proj"),
+                        siluBatchPtr, downBatchPtr, batch, intermediateSize, hiddenSize);
 
                 CpuStageProf.E(12, _p0); _p0 = CpuStageProf.T();
                 // ── Scatter down rows to scatterDown[(t*k+slot)*H] ───────────

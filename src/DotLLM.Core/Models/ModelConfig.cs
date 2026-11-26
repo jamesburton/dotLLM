@@ -352,6 +352,12 @@ public record ModelConfig
     public RicursiveConfig? Ricursive { get; init; }
 
     /// <summary>
+    /// OVHcloud Olala parameters (Mamba-3 MIMO + differential TPA + latent MoE); non-null only when <see cref="Architecture"/> is
+    /// <see cref="DotLLM.Core.Configuration.Architecture.Olala"/>. See <see cref="OlalaConfig"/>.
+    /// </summary>
+    public OlalaConfig? Olala { get; init; }
+
+    /// <summary>
     /// Optional per-attention-type RoPE override for the FULL-attention layers
     /// (Gemma 4 / DiffusionGemma). When non-null, every layer flagged as a
     /// full-attention layer by <see cref="IsFullAttentionLayer(int)"/> applies

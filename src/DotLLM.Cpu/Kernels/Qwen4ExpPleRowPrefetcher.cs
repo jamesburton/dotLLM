@@ -163,6 +163,7 @@ public sealed unsafe class PleRowPrefetcher : IDisposable
 
     private readonly byte* _table;
     private readonly QuantizationType _qt;
+    private readonly float _fp8Scale;
     private readonly long _tableRows;
     private readonly int _rowDim;
     private readonly long _rowBytes;
@@ -179,8 +180,11 @@ public sealed unsafe class PleRowPrefetcher : IDisposable
     /// <param name="tableRows">Rows in the table.</param>
     /// <param name="rowDim">Elements per row.</param>
     /// <param name="options">Service options.</param>
-    public PleRowPrefetcher(nint table, QuantizationType quantType, long tableRows, int rowDim, PleTableOptions options)
+    /// <param name="fp8Scale">Table scale of an FP8 (<see cref="QuantizationType.I8"/>) table, see <see cref="PleRowCodec"/>; ignored for every other type.</param>
+    public PleRowPrefetcher(nint table, QuantizationType quantType, long tableRows, int rowDim, PleTableOptions options, float fp8Scale = 0f)
     {
+        PleRowCodec.Validate(quantType, fp8Scale);
+        _fp8Scale = fp8Scale;
         _table = (byte*)table; _qt = quantType; _tableRows = tableRows; _rowDim = rowDim; _opt = options;
         _rowBytes = Dequantize.RowByteSize(rowDim, quantType);
         _pageShift = BitOperations.Log2((uint)Environment.SystemPageSize);
@@ -254,7 +258,7 @@ public sealed unsafe class PleRowPrefetcher : IDisposable
         long f0 = _opt.CollectFaults ? ProcessFaults.Current() : 0;
         if (_cache is null)
         {
-            Qwen4ExpPle.GatherRows((nint)_table, _qt, _tableRows, _rowDim, rows, dest);
+            Qwen4ExpPle.GatherRows((nint)_table, _qt, _tableRows, _rowDim, rows, dest, _fp8Scale);
             Interlocked.Add(ref _misses, rows.Length);
             Interlocked.Add(ref PleTelemetry.CacheMisses, rows.Length);
         }
@@ -290,14 +294,14 @@ public sealed unsafe class PleRowPrefetcher : IDisposable
                 var d = dest.Slice(i * _rowDim, _rowDim);
                 if (cache.TryGet(r, out byte* slot))
                 {
-                    Dequantize.ToFloat32((nint)slot, _rowDim, _qt, d);
+                    PleRowCodec.Decode((nint)slot, _rowDim, _qt, _fp8Scale, d);
                     hits++;
                 }
                 else
                 {
                     // Read-through: dequantise from the mapping, then keep the raw row for the next time this token shows up.
                     byte* src = _table + r * _rowBytes;
-                    Dequantize.ToFloat32((nint)src, _rowDim, _qt, d);
+                    PleRowCodec.Decode((nint)src, _rowDim, _qt, _fp8Scale, d);
                     cache.Insert(r, src);
                     misses++;
                 }
