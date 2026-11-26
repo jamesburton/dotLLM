@@ -1217,10 +1217,10 @@ public static class ServerStartup
             string? headPath = options.MtpHeadPath;
             if (headPath is null)
             {
-                headPath = Qwen4ExpMtpHeadResolver.Find(resolvedPath);
+                headPath = Qwen4ExpMtpHeadResolver.FindAuto(model, resolvedPath);
                 if (headPath is null) return;
                 long trunk = ModelResolver.FileLength(resolvedPath);
-                if (!Qwen4ExpMtpHeadResolver.ShouldAutoAttach(trunk))
+                if (!Directory.Exists(headPath) && !Qwen4ExpMtpHeadResolver.ShouldAutoAttach(trunk))   // an Edge0 mtp/ folder skips the size rule (the skeleton is small)
                 {
                     Console.WriteLine($"[dotllm] MTP: head {Path.GetFileName(headPath)} found but not attached - a {trunk / (double)(1L << 30):F0} GiB trunk measures slower with " +
                                       "speculation than without (--mtp-head <path> forces it).");
@@ -1228,7 +1228,9 @@ public static class ServerStartup
                 }
             }
             Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, headPath);
-            Console.WriteLine($"[dotllm] MTP: attached head {Path.GetFileName(headPath)}.");
+            Console.WriteLine(Directory.Exists(headPath)
+                ? $"[dotllm] MTP: attached Edge0 head ({headPath}); the adaptive gate drafts only while acceptance pays ({Qwen4ExpMtpHeadResolver.Edge0EnvVar}=0 opts out)."
+                : $"[dotllm] MTP: attached head {Path.GetFileName(headPath)}.");
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {

@@ -35,6 +35,37 @@ public static class Qwen4ExpMtpHeadResolver
         return null;
     }
 
+    /// <summary>Env var that turns the Edge0 <c>mtp/</c> folder auto-attach off (<c>DOTLLM_EDGE0_MTP=0</c>, #2014). An explicit <c>--mtp-head</c> still attaches.</summary>
+    public const string Edge0EnvVar = "DOTLLM_EDGE0_MTP";
+
+    /// <summary>False when <c>DOTLLM_EDGE0_MTP=0</c>: an auto-detected Edge0 <c>mtp/</c> folder is then left alone.</summary>
+    public static bool Edge0AutoAttachEnabled => Environment.GetEnvironmentVariable(Edge0EnvVar) != "0";
+
+    /// <summary>
+    /// The Edge0 <c>mtp/</c> folder that sits next to <c>model-skeleton.gguf</c> (#2014): <paramref name="modelPath"/> is the skeleton file or its folder.
+    /// Null when the model is not an Edge0 skeleton or has no (complete) <c>mtp/</c> folder. Ignores <see cref="Edge0AutoAttachEnabled"/>.
+    /// </summary>
+    /// <param name="modelPath">Path of the model file or folder.</param>
+    public static string? FindEdge0Pack(string modelPath)
+    {
+        if (string.IsNullOrEmpty(modelPath)) return null;
+        string full = Path.GetFullPath(modelPath);
+        string? dir = Directory.Exists(full) ? full : Path.GetDirectoryName(full);
+        if (dir is null || !File.Exists(Path.Combine(dir, "model-skeleton.gguf"))) return null;
+        if (!Directory.Exists(full) && !string.Equals(Path.GetFileName(full), "model-skeleton.gguf", StringComparison.OrdinalIgnoreCase)) return null;
+        return Edge0.Edge0MtpPack.Find(dir);
+    }
+
+    /// <summary>
+    /// What an automatic attach would use for <paramref name="model"/>: the Edge0 <c>mtp/</c> folder when the model takes one, it sits beside the skeleton and
+    /// <see cref="Edge0AutoAttachEnabled"/>; else the <c>mtp-*.gguf</c> sibling (<see cref="Find"/>). Null when there is nothing to attach. No size rule is applied here.
+    /// </summary>
+    public static string? FindAuto(IModel model, string modelPath)
+    {
+        if (model is IEdge0MtpHeadAttachable && Edge0AutoAttachEnabled && FindEdge0Pack(modelPath) is { } pack) return pack;
+        return Find(modelPath);
+    }
+
     /// <summary>
     /// Smallest trunk (summed GGUF bytes) for which an auto-detected head is attached; 0 = every trunk. Before the 2..8-row GEMVs for the K-quant / IQ dense
     /// projections (#902) the ISTA GSQ-RCO files (37-44 GiB) lost to plain decode with the head (verify rows cost 100+ ms at 2 rows), so this was 50 GiB; with them
@@ -70,10 +101,24 @@ public static class Qwen4ExpMtpHeadResolver
         string? path = explicitPath;
         if (path is not null)
         {
+            if (Directory.Exists(path))
+            {
+                // an explicit Edge0 mtp/ folder
+                if (model is not IEdge0MtpHeadAttachable dirModel) throw new NotSupportedException($"{model.GetType().Name} cannot take an Edge0 MTP folder ({path}).");
+                dirModel.AttachEdge0MtpHead(path);
+                return path;
+            }
             if (!File.Exists(path)) throw new FileNotFoundException("MTP head GGUF not found.", path);
         }
         else
         {
+            // Edge0: the head is the mtp/ folder beside model-skeleton.gguf; the adaptive gate decides per request whether drafting pays,
+            // and the headroom check declines it when the device has no room. The trunk-size rule below does not apply (the skeleton is small).
+            if (model is IEdge0MtpHeadAttachable e0 && Edge0AutoAttachEnabled && FindEdge0Pack(modelPath) is { } pack)
+            {
+                e0.AttachEdge0MtpHead(pack);
+                return pack;
+            }
             if (trunkBytes >= 0 && !ShouldAutoAttach(trunkBytes)) return null;
             path = Find(modelPath);
             if (path is null) return null;

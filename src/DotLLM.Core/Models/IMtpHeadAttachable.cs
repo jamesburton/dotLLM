@@ -19,3 +19,14 @@ public interface IMtpHeadAttachable
     /// <param name="path">Path of the <c>mtp-*.gguf</c> file.</param>
     void AttachMtpHead(string path);
 }
+
+/// <summary>
+/// A model that can also take the Edge0 draft head, which ships as an <c>mtp/</c> FOLDER (<c>dense.txt</c> / <c>dense.bin</c> / <c>experts.bin</c> / <c>draft_vocab.bin</c>)
+/// beside <c>model-skeleton.gguf</c> rather than as a single GGUF (#1990). Implemented by the Vulkan qwen4exp model.
+/// </summary>
+public interface IEdge0MtpHeadAttachable : IMtpHeadAttachable
+{
+    /// <summary>Opens the <c>mtp</c> folder, attaches the head (planar experts imported in place where the driver allows) and takes ownership of it.</summary>
+    /// <param name="mtpDir">The Edge0 <c>mtp</c> folder.</param>
+    void AttachEdge0MtpHead(string mtpDir);
+}

@@ -483,8 +483,10 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                     // qwen4exp ships its MTP draft head as a separate GGUF (#820): attach the explicit or auto-detected sibling; plain decode if it cannot be attached.
                     try
                     {
-                        DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead,
+                        string? attachedHead = DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead,
                             trunkBytes: model is DotLLM.Core.Models.IMtpHeadAttachable ? DotLLM.HuggingFace.ModelResolver.FileLength(resolvedPath) : -1);
+                        if (attachedHead is not null && System.IO.Directory.Exists(attachedHead))
+                            Console.Error.WriteLine($"MTP: attached Edge0 head ({attachedHead}); the adaptive gate drafts only while acceptance pays ({DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.Edge0EnvVar}=0 opts out).");
                     }
                     catch (Exception ex) when (ex is not FileNotFoundException && (settings.MtpHead is null || ex is NotSupportedException))
                     {
