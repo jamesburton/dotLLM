@@ -229,11 +229,10 @@ public sealed class Inkling2OpsTests
 
     // ───────────── config ─────────────
 
-    private static Dictionary<string, GgufMetadataValue> ValidMeta(bool loop = true)
+    private static Dictionary<string, GgufMetadataValue> ValidMeta(bool loop = true, string a = "inkling2_loop")
     {
         GgufMetadataValue U(uint v) => new(GgufValueType.UInt32, v);
         GgufMetadataValue F(float v) => new(GgufValueType.Float32, v);
-        string a = "inkling2_loop";
         var d = new Dictionary<string, GgufMetadataValue>
         {
             ["general.architecture"] = new(GgufValueType.String, a),
@@ -276,9 +275,17 @@ public sealed class Inkling2OpsTests
     [Fact]
     public void Config_WithoutLoopKeys_IsASinglePass()
     {
-        var cfg = GgufModelConfigExtractor.Extract(new GgufMetadata(ValidMeta(loop: false)));
+        var cfg = GgufModelConfigExtractor.Extract(new GgufMetadata(ValidMeta(loop: false, a: "inkling2")));
         Assert.Equal(1, cfg.Inkling2!.LoopPasses);
         Assert.Equal(12, cfg.Inkling2.CacheSlots(12));
+    }
+
+    [Fact]
+    public void Config_LoopArchWithoutLoopKeys_IsRefused()
+    {
+        // inkling2_loop without loop.* would otherwise run one pass of a three-pass model (llama.cpp throws on the missing key).
+        var ex = Assert.Throws<InvalidDataException>(() => GgufModelConfigExtractor.Extract(new GgufMetadata(ValidMeta(loop: false))));
+        Assert.Contains("loop.count", ex.Message);
     }
 
     [Fact]

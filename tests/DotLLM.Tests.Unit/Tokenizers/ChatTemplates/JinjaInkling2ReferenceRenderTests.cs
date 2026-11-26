@@ -33,4 +33,21 @@ public class JinjaInkling2ReferenceRenderTests
         // an unknown effort must surface as an error, not as a plain "role: content" transcript
         Assert.ThrowsAny<Exception>(() => tpl.Apply([new ChatMessage { Role = "user", Content = "Hi" }], new ChatTemplateOptions { AddGenerationPrompt = false, ReasoningEffort = "wild" }));
     }
+
+    [Theory]
+    [InlineData("de-DE")]
+    [InlineData("fr-FR")]
+    public void ReasoningEffort_RendersWithADecimalPoint_UnderAnyCulture(string culture)
+    {
+        // Every Inkling prompt carries "Thinking effort level: 0.9"; a comma-decimal host must not change the tokens the model sees.
+        var saved = System.Globalization.CultureInfo.CurrentCulture;
+        try
+        {
+            System.Globalization.CultureInfo.CurrentCulture = new System.Globalization.CultureInfo(culture);
+            var tpl = new JinjaChatTemplate(ReferenceRenderCases.Fixture(Template), "", "");
+            string dflt = tpl.Apply([new ChatMessage { Role = "user", Content = "Hi" }], new ChatTemplateOptions { AddGenerationPrompt = false });
+            Assert.StartsWith("<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>", dflt, StringComparison.Ordinal);
+        }
+        finally { System.Globalization.CultureInfo.CurrentCulture = saved; }
+    }
 }

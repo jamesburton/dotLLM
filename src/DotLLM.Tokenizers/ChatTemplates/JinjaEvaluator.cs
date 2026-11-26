@@ -781,8 +781,9 @@ internal sealed class JinjaEvaluator
             return b ? "True" : "False";
         if (value is string s)
             return s;
+        // Invariant culture: a float literal such as Inkling 2's default `0.9` effort must not render as "0,9" on a de-DE / fr-FR host.
         if (value is int or double or long)
-            return value.ToString()!;
+            return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture)!;
         if (value is IList list)
             return "[" + string.Join(", ", list.Cast<object?>().Select(item => StringifyRepr(item))) + "]";
         if (value is Dictionary<string, object?> dict)
@@ -805,7 +806,7 @@ internal sealed class JinjaEvaluator
         if (value is int i)
             return i.ToString();
         if (value is double d)
-            return d.ToString("G");
+            return d.ToString("G", System.Globalization.CultureInfo.InvariantCulture);
         if (value is string s)
             return JsonQuoteString(s);
         if (value is Dictionary<string, object?> dict)

@@ -70,8 +70,11 @@ public static partial class GgufModelConfigExtractor
         if (used > experts)
             throw new InvalidDataException($"{arch}: expert_used_count {used} exceeds expert_count {experts}.");
 
-        // The loop keys exist only in inkling2_loop; a plain inkling2 file is the same graph with one pass.
+        // The loop keys exist only in inkling2_loop; a plain inkling2 file is the same graph with one pass. An inkling2_loop file
+        // without them is malformed (llama.cpp's get_key throws): refuse it rather than silently running one pass of a three-pass model.
         int loopStart = 0, loopEnd = 0, passes = 1, rank = 0;
+        if (arch == "inkling2_loop" && !metadata.ContainsKey($"{arch}.loop.count"))
+            throw new InvalidDataException($"{arch}: required GGUF key '{arch}.loop.count' is missing; an inkling2_loop file must declare its loop.");
         if (metadata.ContainsKey($"{arch}.loop.count"))
         {
             loopStart = RequiredPositiveU32(metadata, $"{arch}.loop.start");
