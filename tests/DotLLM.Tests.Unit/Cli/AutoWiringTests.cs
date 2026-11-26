@@ -148,6 +148,17 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
         Assert.Contains(applied.Warnings, w => w.Contains("paged", StringComparison.OrdinalIgnoreCase));
     }
 
+    /// <summary>
+    /// The console wraps long lines and re-emits ANSI styling at each break (seen on CI), so compare with the styling removed and every run of
+    /// whitespace, line breaks included, collapsed to one space.
+    /// </summary>
+    private static string Flat(string output)
+    {
+        var timeout = TimeSpan.FromSeconds(1);
+        string plain = System.Text.RegularExpressions.Regex.Replace(output, @"\u001b\[[0-9;]*m", "", System.Text.RegularExpressions.RegexOptions.None, timeout);
+        return System.Text.RegularExpressions.Regex.Replace(plain, @"\s+", " ", System.Text.RegularExpressions.RegexOptions.None, timeout);
+    }
+
     private (int Code, string Output) RunCli(params string[] args)
     {
         AutoCli.RawArgsOverride = args;
@@ -191,8 +202,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
         SaveFor(new TunedSettings { CacheTypeK = "q8_0", CacheTypeV = "q8_0", TunedContext = 4096 }, recordPeaks: false);
         var (code, output) = RunCli("run", Model, "--auto", "-p", "ab", "--max-tokens", "2", "--device", "cpu");
         Assert.True(code == 0, output);
-        // The console wraps long lines, so compare with the line breaks removed.
-        Assert.Contains("does not record its peak host memory", output.Replace("\r", "").Replace("\n", ""));
+        Assert.Contains("does not record its peak host memory", Flat(output));
         Assert.DoesNotContain("K:Q", output);                     // default cache, nothing applied
     }
 
@@ -231,7 +241,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
         var (code, output) = CliTurboQuantCommandTests.RunWithInput("ab\n/exit\n", args);
         Assert.True(code == 0, output);
         Assert.Contains("auto: settings from", output);
-        Assert.DoesNotContain("not admitted", output.Replace("\r", "").Replace("\n", ""));
+        Assert.DoesNotContain("not admitted", Flat(output));
     }
 
     [Fact]
@@ -242,7 +252,7 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
         AutoCli.RawArgsOverride = args;
         var (code, output) = CliTurboQuantCommandTests.RunWithInput("ab\n/exit\n", args);
         Assert.True(code == 0, output);
-        Assert.Contains("not known before load", output.Replace("\r", "").Replace("\n", ""));
+        Assert.Contains("not known before load", Flat(output));
     }
 
     [Fact]
