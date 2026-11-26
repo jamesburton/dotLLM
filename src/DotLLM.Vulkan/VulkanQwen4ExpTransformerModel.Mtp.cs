@@ -22,7 +22,7 @@ namespace DotLLM.Vulkan;
 /// QSA over the head's own dense K/V cells, GR-write, GR-read, MoE, GR-write, head mixer, the trunk's LM head. The block runs on a one-layer
 /// <see cref="VulkanQwen3MoeHybridTransformerModel"/> (same kernels, own scratch, own K/V), the residual plumbing on this class's.
 /// <c>eh_proj</c> is split once at load into its embedding and hidden halves (row-wise block copies of the Q8_0 matrix) so the front needs two
-/// plain matmuls and one add instead of a concatenation.</para>
+/// plain matmuls and one add instead of a concatenation (the Edge0 head, which ships the halves as <c>fc_embedding</c> / <c>fc_hidden</c>, uploads them in place).</para>
 /// <para><b>Exactness.</b> Every emitted token is the verify row's argmax (the decoder accepts a draft only when it equals it), so the output is
 /// the verify path's greedy, never a draft's. On Vulkan the multi-row kernels are not bit-identical to the 1-row decode (KL 2e-3..1.4e-2,
 /// top-1 identical in the #876 measurements), so a near-tie can resolve differently from plain decode; that rate is measured, not assumed.</para>
