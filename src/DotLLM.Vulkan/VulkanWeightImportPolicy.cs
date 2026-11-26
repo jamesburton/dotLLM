@@ -61,12 +61,46 @@ internal static class VulkanWeightImportPolicy
             Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT"),
             "1", StringComparison.Ordinal);
 
-    /// <summary><c>DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1</c>: import read-only GGUF ranges through a shared writable
-    /// alias view (#1190). Read per call.</summary>
-    public static bool WritableAliasEnabled =>
-        string.Equals(
-            Environment.GetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE"),
-            "1", StringComparison.Ordinal);
+    /// <summary>
+    /// Whether a refused read-only import is retried through a shared writable alias view of the same file range (#1190, #1991).
+    /// <c>DOTLLM_VULKAN_HOST_IMPORT_WRITABLE</c>: <c>0</c> = never, <c>1</c> = on (a discrete GPU still refuses the import, #507), unset = <b>off (was proposed on for an
+    /// integrated device, withdrawn after measurement)</b>. The driver refuses read-only GGUF pages (<c>vkAllocateMemory</c> -1000072003), so without
+    /// the alias every tensor is copied through host memory (a CLAUDE.md rule-3 bounce). Read per call.
+    /// </summary>
+    public static bool WritableAliasEnabled
+    {
+      get
+      {
+        string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE");
+        if (string.Equals(v, "0", StringComparison.Ordinal)) return false;
+        if (string.Equals(v, "1", StringComparison.Ordinal)) return true;
+        return false;   // #1991: opt-in. Default-on measured -19% decode / -33% prefill on dense Llama (see docs/GPU.md); DirectStorage is the neutral zero-copy route.
+      }
+    }
+
+    /// <summary>Tensors whose import was attempted and refused on the current load (they are then staged) (#1991).</summary>
+    public static int RejectedTensorCount { get; private set; }
+
+    /// <summary>Bytes of the tensors counted by <see cref="RejectedTensorCount"/>.</summary>
+    public static long RejectedBytes { get; private set; }
+
+    /// <summary>The first refusal's detail on the current load (empty when none).</summary>
+    public static string FirstRejection { get; private set; } = string.Empty;
+
+    private static int s_reportedRejectedCount;
+
+    /// <summary>
+    /// One warning line when imports were refused since the last report, so a refusal is never silent (#1991); empty
+    /// otherwise. Consuming: it reports each count once, so the staging buffers that are created and disposed after the
+    /// load (per-layer MoE streaming, MTP heads, DFlash) or twice per load (<c>VulkanWeights</c>) do not reprint it.
+    /// </summary>
+    public static string RejectionWarning()
+    {
+        if (RejectedTensorCount == s_reportedRejectedCount) return string.Empty;
+        s_reportedRejectedCount = RejectedTensorCount;
+        return $"[dotllm] vulkan host import: {RejectedTensorCount} tensors / {RejectedBytes / (1024.0 * 1024.0):F1} MiB refused " +
+               $"(first: {FirstRejection}); staged through host memory instead. Set DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1 to silence.";
+    }
 
     private static readonly List<(nint Pointer, long Bytes)> s_stagedRanges = [];
 
@@ -171,6 +205,10 @@ internal static class VulkanWeightImportPolicy
         DirectDeclinedCount = 0;
         StagedTensorCount = 0;
         StagedBytes = 0;
+        RejectedTensorCount = 0;
+        RejectedBytes = 0;
+        FirstRejection = string.Empty;
+        s_reportedRejectedCount = 0;
         LastFallbackReason = string.Empty;
         s_stagedRanges.Clear();
     }
@@ -242,12 +280,22 @@ internal static class VulkanWeightImportPolicy
         // #1190: amdvlk and the Arc driver both refuse read-only pages, which is how every GGUF is mapped. Retry from a
         // shared writable view of the same file range (no private pages). A copy-on-write view is also accepted but the
         // driver's write-lock privatises every page, so it costs what staging costs and is not tried.
-        if (wrapped is null && WritableAliasEnabled
-            && Models.Gguf.GgufFile.TryMapImportAlias(srcPtr, bytes, writable: true, out nint alias))
+        // #1991: still opt-in (default-on measured -19% decode / -33% prefill, docs/GPU.md). When on, the file is opened
+        // shared-writable but nothing writes to it: weight buffers are bound read-only (VulkanWeightImportWriteGuardTests).
+        string aliasFailure = string.Empty;
+        bool aliasRequested = wrapped is null && WritableAliasEnabled;
+        if (aliasRequested)
         {
-            wrapped = device.TryWrapHostVisible(alias, bytes);
-            if (wrapped is null)
-                Models.Gguf.GgufFile.ReleaseImportAlias(alias);
+            // TryMapImportAlias returns false (never a zero alias) when the range is not in an open read-only mapping, the GGUF is
+            // mapped copy-on-write, or the file cannot be opened for write.
+            if (!Models.Gguf.GgufFile.TryMapImportAlias(srcPtr, bytes, writable: true, out nint alias))
+                aliasFailure = "alias_unavailable(not_in_readonly_mapping_or_file_not_writable)";
+            else
+            {
+                wrapped = device.TryWrapHostVisible(alias, bytes);
+                if (wrapped is null)
+                    Models.Gguf.GgufFile.ReleaseImportAlias(alias);
+            }
         }
 
         if (wrapped is null)
@@ -256,9 +304,18 @@ internal static class VulkanWeightImportPolicy
             // which Vulkan call refused and with what VkResult — because the whole
             // import was dead on the real load path for want of exactly this line:
             // synthetic-memory tests passed while every production tensor was refused.
-            LastFallbackReason =
-                $"import_rejected({Interop.HostVisibleBuffer.LastImportFailureStage}" +
-                $":{Interop.HostVisibleBuffer.LastImportFailureCode})";
+            LastFallbackReason = aliasFailure.Length > 0
+                ? aliasFailure
+                : $"import_rejected({Interop.HostVisibleBuffer.LastImportFailureStage}" +
+                  $":{Interop.HostVisibleBuffer.LastImportFailureCode})";
+            // Warn only when the alias was requested (DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1) and still refused: the default path
+            // stays silent (#1995 reports DirectStorage fallbacks instead). A discrete GPU refuses by design (#507): policy, not a refusal.
+            if (aliasRequested && device.PhysicalDeviceTypeValue is Interop.VkPhysicalDeviceType.IntegratedGpu or Interop.VkPhysicalDeviceType.Cpu)
+            {
+                RejectedTensorCount++;
+                RejectedBytes += bytes;
+                if (FirstRejection.Length == 0) FirstRejection = LastFallbackReason;
+            }
             return false;
         }
 

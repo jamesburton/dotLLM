@@ -38,7 +38,7 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
     private static FixtureLocation Locate() => TestFixtureResolver.ResolveFile("DOTLLM_EDGE0_SKELETON", "Edge0", "Edge0-145B-q3k", "model-skeleton.gguf",
         "native_experts.txt", "experts.bin", "ple-fp8.gguf");
 
-    private sealed record Run(int[] Ids, int[] RowArgmax, double MeanNll, float[] LastLogits, int[] Greedy);
+    private sealed record Run(int[] Ids, int[] RowArgmax, double MeanNll, float[] LastLogits, int[] Greedy, float[]? AllRows = null);
 
     private static unsafe int Argmax(ReadOnlySpan<float> row) { int b = 0; for (int i = 1; i < row.Length; i++) if (row[i] > row[b]) b = i; return b; }
 
@@ -75,7 +75,7 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
             using var lg = model.Forward([next], [ids.Length + s], 0);
             next = Argmax(new ReadOnlySpan<float>((void*)lg.DataPointer, vocab));
         }
-        return new Run(ids.ToArray(), argmax, nll ? total / (rows - 1) : double.NaN, last, greedy);
+        return new Run(ids.ToArray(), argmax, nll ? total / (rows - 1) : double.NaN, last, greedy, nll ? l.ToArray() : null);
     }
 
     private static void Save(string path, List<Run> runs)
@@ -124,6 +124,24 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
         return kl;
     }
 
+    private static string LastRowKlTop = "";
+    private static (double Mean, double Max, int Rows)? RowKl(float[]? vkRows)
+    {
+        if (vkRows is null || Environment.GetEnvironmentVariable("DOTLLM_EDGE0_ROWS_REF") is not { Length: > 0 } path || !File.Exists(path)) return null;
+        using var rd = new BinaryReader(File.OpenRead(path));
+        int rows = rd.ReadInt32(), vocab = rd.ReadInt32();
+        var cpuRows = new float[rows * vocab];
+        for (int i = 0; i < cpuRows.Length; i++) cpuRows[i] = rd.ReadSingle();
+        double sum = 0, max = 0; var per = new List<(int Row, double Kl)>();
+        for (int t = 0; t < rows; t++)
+        {
+            double kl = Kl(cpuRows.AsSpan(t * vocab, vocab).ToArray(), vkRows.AsSpan(t * vocab, vocab).ToArray());
+            sum += kl; max = Math.Max(max, kl); per.Add((t, kl));
+        }
+        LastRowKlTop = string.Join(" ", per.OrderByDescending(x => x.Kl).Take(6).Select(x => $"r{x.Row}:{x.Kl:E1}"));
+        return (sum / rows, max, rows);
+    }
+
     private static int[][] Inputs(string skeleton)
     {
         using var g = GgufFile.Open(skeleton);
@@ -151,6 +169,13 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
                 output.WriteLine($"cpu input {i}: {inputs[i].Length} tokens, nll {runs[^1].MeanNll:F4}, greedy {string.Join(' ', runs[^1].Greedy.Take(8))}");
             }
             Save(refPath, runs);
+            if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_ROWS_REF") is { Length: > 0 } rowsPath && runs[0].AllRows is { } all)
+            {
+                // Teacher-forced reference (#1981): the passage's logits at EVERY row, so a format can be ranked by mean per-row KL over ~106 rows rather than by 24 knife-edge greedy tokens.
+                using var rw = new BinaryWriter(File.Create(rowsPath));
+                rw.Write(runs[0].Ids.Length); rw.Write(all.Length / runs[0].Ids.Length);
+                foreach (float f in all) rw.Write(f);
+            }
         }
     }
 
@@ -177,6 +202,45 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
         using var tg = GgufFile.Open(fx.Path!);
         var tok = GgufBpeTokenizerFactory.Load(tg.Metadata);
         var failures = new List<string>();
+        if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_SWEEP") is { Length: > 0 } sweepSpec)
+        {
+            // Parity + speed report (#1981): runs the four inputs (NLL, last-row KL, greedy-24, row argmax, mean per-row KL when DOTLLM_EDGE0_ROWS_REF exists) and the prefill / decode speed
+            // once per ';'-separated label (the label is only printed; the kernels under test are whatever this build contains).
+            foreach (string cfg in sweepSpec.Split(';'))
+            {
+                var kls = new List<string>(); var gr = new List<string>(); (double Mean, double Max, int Rows)? rowKl = null; double nllV = 0; int rowAg = 0, rowN = 0;
+                for (int i = 0; i < inputs.Length; i++)
+                {
+                    var r = Execute(vk, inputs[i], nll: i == 0, n => vk.TrySetAllRowLogitsLimit(n));
+                    var c = cpu[i];
+                    kls.Add(Kl(c.LastLogits, r.LastLogits).ToString("E1"));
+                    int ga = 0; for (int t = 0; t < GreedyTokens; t++) if (c.Greedy[t] == r.Greedy[t]) ga++;
+                    gr.Add($"{ga}/{GreedyTokens}");
+                    if (i == 0) { rowKl = RowKl(r.AllRows); nllV = r.MeanNll; for (int t = 0; t < c.RowArgmax.Length; t++) if (c.RowArgmax[t] == r.RowArgmax[t]) rowAg++; rowN = c.RowArgmax.Length; }
+                }
+                vk.TrySetAllRowLogitsLimit(1);
+                var longIds2 = Enumerable.Range(0, 5).SelectMany(_ => inputs[0]).Take(512).ToArray();
+                var pf2 = new List<double>(); var dc2 = new List<double>();
+                for (int rep = 0; rep < 3; rep++)
+                {
+                    vk.ResetSequenceState();
+                    var swp = System.Diagnostics.Stopwatch.StartNew();
+                    using (vk.Forward(longIds2, Enumerable.Range(0, longIds2.Length).ToArray(), -1, null, true)) { }
+                    pf2.Add(longIds2.Length / swp.Elapsed.TotalSeconds);
+                }
+                for (int rep = 0; rep < 3; rep++)
+                {
+                    vk.ResetSequenceState();
+                    using (vk.Forward(inputs[1], Enumerable.Range(0, inputs[1].Length).ToArray(), -1, null, true)) { }
+                    int pos = inputs[1].Length;
+                    var swd = System.Diagnostics.Stopwatch.StartNew();
+                    for (int sIdx = 0; sIdx < 48; sIdx++) { using var lg = vk.Forward([13], [pos++], -1, null, true); }
+                    dc2.Add(48 / swd.Elapsed.TotalSeconds);
+                }
+                output.WriteLine($"SWEEP {cfg}: scratch {vk.Edge0ScratchBytesForTest / 1048576.0:F1} MiB; device live {device.LiveBytesTotal() / (double)(1L << 30):F2} GiB; NLL {nllV:F4} (cpu {cpu[0].MeanNll:F4}); ROWKL {(rowKl is { } rk ? $"mean {rk.Mean:E3} max {rk.Max:E3} over {rk.Rows} rows, top {LastRowKlTop}" : "n/a")}; KL {string.Join(" / ", kls)}; greedy {string.Join(" ", gr)}; row argmax {rowAg}/{rowN}; prefill {string.Join("/", pf2.Select(v => v.ToString("F0")))} tok/s; decode {string.Join("/", dc2.Select(v => v.ToString("F1")))} tok/s");
+            }
+            return;
+        }
         for (int i = 0; i < inputs.Length; i++)
         {
             var r = Execute(vk, inputs[i], nll: i == 0, n => vk.TrySetAllRowLogitsLimit(n));
@@ -190,9 +254,25 @@ public sealed class VulkanEdge0EndToEndTests(ITestOutputHelper output)
                              (i == 0 ? $"NLL cpu {c.MeanNll:F4} vk {r.MeanNll:F4}" : ""));
             output.WriteLine($"  cpu text: {tok.Decode(c.Greedy).Replace((char)10, (char)126)}");
             output.WriteLine($"  vk  text: {tok.Decode(r.Greedy).Replace((char)10, (char)126)}");
-            if (i == 0 && Math.Abs(c.MeanNll - r.MeanNll) >= 0.05) failures.Add($"NLL cpu {c.MeanNll:F4} vs vulkan {r.MeanNll:F4}");
             if (kl >= 0.05) failures.Add($"input {i}: KL {kl:E3}");
-            if (r.RowArgmax[^1] != c.RowArgmax[^1]) failures.Add($"input {i}: next-token argmax differs");
+            if (i == 0)
+            {
+                // The passage is a knife-edge for ANY narrow latent format (greedy flips at its first token or at token 19 for every F16 / Q8 variant measured, and its last prompt row
+                // is a near-tie between " In" and " The"), so it is gated teacher-forced over all of its rows instead (#1981, James's ruling 2026-11-25). Measured on the shipped F16 build
+                // (Strix Halo, real Edge0-145B-q3k, CPU reference edge0_rows_tf.bin): NLL 1.6877 (cpu 1.6897), mean row KL 4.13e-3, max row KL 6.06e-2, row argmax 102/106.
+                // The old F32 build measured NLL 1.7037, 4.30e-3, 4.82e-2, 102/106. Each gate has ~1.5x headroom on those.
+                if (Math.Abs(c.MeanNll - r.MeanNll) >= 0.02) failures.Add($"passage NLL cpu {c.MeanNll:F4} vs vulkan {r.MeanNll:F4} (gate |diff| < 0.02)");
+                var rk = RowKl(r.AllRows) ?? throw new InvalidOperationException("DOTLLM_EDGE0_ROWS_REF (the CPU teacher-forced all-row reference, written by Stage_CpuReference) is required for the passage gates");
+                if (rk.Mean >= 6.0e-3) failures.Add($"passage mean row KL {rk.Mean:E3} (gate < 6.0e-3)");
+                if (rk.Max >= 9.0e-2) failures.Add($"passage max row KL {rk.Max:E3} (gate < 9.0e-2)");
+                if (rowAgree < 100) failures.Add($"passage row argmax {rowAgree}/{c.RowArgmax.Length} (gate >= 100)");
+                output.WriteLine($"  passage teacher-forced: mean row KL {rk.Mean:E3}, max {rk.Max:E3}, row argmax {rowAgree}/{c.RowArgmax.Length}, top rows {LastRowKlTop}");
+            }
+            else
+            {
+                if (r.RowArgmax[^1] != c.RowArgmax[^1]) failures.Add($"input {i}: next-token argmax differs");
+                if (greedyAgree != GreedyTokens) failures.Add($"input {i}: greedy {greedyAgree}/{GreedyTokens}");
+            }
         }
 
         // Speed (warm): prefill of the passage repeated to ~512 tokens, then single-token decode. Same session, after the parity forwards warmed every pipeline.

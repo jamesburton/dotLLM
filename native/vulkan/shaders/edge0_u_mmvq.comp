@@ -33,6 +33,7 @@ layout(push_constant) uniform PushConstants {
     uint blocksPerRow; // L / 32
     uint topK;
     uint numExperts;
+    uint noSkip;       // 1 = visit every group (A/B arm); an unused group's z is exactly 0 so its partial is exactly 0.0
 } pc;
 
 const uint UINT16_PER_BLOCK = 17u;
@@ -76,7 +77,7 @@ void main() {
 
     float total = 0.0;
     for (uint g = 0u; g < 8u; g++) {
-        if (!groupUsed(g)) continue;
+        if (pc.noSkip == 0u && !groupUsed(g)) continue;
         uint xqBase  = g * (pc.L >> 2u);
         uint xdsBase = g * (pc.L >> 5u);
         float acc = 0.0;

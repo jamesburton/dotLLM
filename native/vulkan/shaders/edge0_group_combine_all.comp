@@ -1,23 +1,28 @@
 #version 450
-// Edge0 latent MoE (G3, #1981), DECODE: edge0_group_combine for all eight groups in one dispatch (single token): z[g * L + c] = sum over the slots whose expert is
-// in group g of weights[j] * down[j, c], slot order ascending, exact 0.0 for a group with no slot. Per element the arithmetic is the per-group shader's.
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Edge0 latent MoE (G3, #1981), DECODE: edge0_group_combine for all eight groups in one dispatch (single token), written as Q8_1: row g of (xq, xds) is z_g,
+// exact zeros (d = 0, q = 0) for a group with no slot. Per element the arithmetic and the quantiser are the per-group shader's.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufDown    { float down[]; };
 layout(set = 0, binding = 1, std430) readonly  buffer BufIdx     { int   indices[]; };
 layout(set = 0, binding = 2, std430) readonly  buffer BufWeights { float weights[]; };
 layout(set = 0, binding = 3, std430) readonly  buffer BufLabels  { int   labels[]; };
-layout(set = 0, binding = 4, std430) writeonly buffer BufZ       { float z[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer BufXq      { uint  xq[]; };    // [8, L/4]
+layout(set = 0, binding = 5, std430) writeonly buffer BufXds     { vec2  xds[]; };   // [8, L/32]
 
 layout(push_constant) uniform PushConstants {
-    uint L;
+    uint L;            // multiple of 32
     uint K;
     uint numExperts;
 } pc;
 
+#include "edge0_q81_pack.glsl"
+
 void main() {
-    uint c = gl_GlobalInvocationID.x;
-    if (c >= pc.L) return;
+    uint lane = gl_LocalInvocationID.x;
+    uint b = gl_WorkGroupID.x;
+    uint c = b * 32u + lane;
     for (uint g = 0u; g < 8u; g++) {
         float acc = 0.0;
         for (uint j = 0u; j < pc.K; j++) {
@@ -25,6 +30,7 @@ void main() {
             if (e < pc.numExperts && uint(labels[e]) == g)
                 acc += weights[j] * down[j * pc.L + c];
         }
-        z[g * pc.L + c] = acc;
+        acc = float(float16_t(acc));   // z is an F16 value (James's ruling, #1981); U's MMVQ then quantises that F16 value to Q8_1
+        edge0PackQ81(acc, lane, g * (pc.L >> 2u) + b * 8u, g * (pc.L >> 5u) + b);
     }
 }

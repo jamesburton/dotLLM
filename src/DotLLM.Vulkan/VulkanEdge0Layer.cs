@@ -33,9 +33,9 @@ internal sealed class Edge0MtpExperts : IDisposable
 }
 
 /// <summary>
-/// Device buffers of one Edge0 latent-MoE layer (G3, #1981). The routed experts are split from the pack's fixed 1,630,720 B records into three
-/// contiguous per-layer banks (gate Q3_K, up Q3_K, down IQ4_NL) so the ordinary resident-bank kernels read them in place; D (all groups, one
-/// matrix) and U (one matrix per group) stay in their on-disk Q8_0 / Q4_0 blocks. Nothing is widened.
+/// Device buffers of one Edge0 latent-MoE layer (G3, #1981). The routed experts stay in the pack's fixed 1,630,720 B records (gate Q3_K | up Q3_K |
+/// down IQ4_NL), imported in place on UMA and read by the record-strided bank kernels; D (all groups, one matrix) and U (one matrix per group) stay in
+/// their on-disk Q8_0 / Q4_0 blocks. Nothing is widened.
 /// </summary>
 internal sealed class Edge0LayerBuffers : IDisposable
 {
@@ -46,6 +46,10 @@ internal sealed class Edge0LayerBuffers : IDisposable
     public required VulkanDevice.Buffer Records { get; init; }
     /// <summary>True when <see cref="Records"/> aliases the mapped pack pages (no copy at all).</summary>
     public required bool RecordsImported { get; init; }
+    /// <summary>Why the record import was refused (<see cref="VulkanWeightImportPolicy.LastFallbackReason"/>); empty when <see cref="RecordsImported"/>.</summary>
+    public string RecordsFallbackReason { get; init; } = string.Empty;
+    /// <summary>True when <see cref="Router"/> aliases the skeleton's mapped BF16 pages.</summary>
+    public bool RouterImported { get; init; }
     /// <summary>Bytes of one expert record (the byte stride of every projection bank).</summary>
     public required long RecordBytes { get; init; }
     /// <summary>Bytes of one gate or up projection; up starts at this offset in a record, down at twice it.</summary>
@@ -80,12 +84,21 @@ internal sealed class Edge0LayerBuffers : IDisposable
         try
         {
             long gateBytes = pack.GateUpBytes, downBytes = pack.DownBytes, record = pack.ExpertRecordBytes;
-            var router = Alloc((long)E * H * 2);
-            staging.UploadBytes(routerBf16, (long)E * H * 2, router);
+            // The router: the skeleton's BF16 bytes verbatim, so it is imported in place like any other GGUF tensor (rule 3); staged only when refused.
+            long routerBytes = (long)E * H * 2;
+            bool routerImported = VulkanWeightImportPolicy.TryImport(device, routerBf16, routerBytes, out var router);
+            if (routerImported) created.Add(router!);
+            else
+            {
+                router = Alloc(routerBytes);
+                staging.UploadBytes(routerBf16, routerBytes, router);
+                VulkanWeightImportPolicy.NoteStaged(routerBf16, routerBytes);
+            }
             // The records: imported in place from the mapped pack (UMA, shared writable view), else ONE contiguous copy (never split: the strided kernels read records).
             long recBytes = (long)E * record;
             nint rec0 = pack.GateBank(layer);
             bool imported = VulkanWeightImportPolicy.TryImport(device, rec0, recBytes, out var recBuf);
+            string recFallback = imported ? string.Empty : VulkanWeightImportPolicy.LastFallbackReason;
             if (!imported)
             {
                 recBuf = device.AllocateDeviceLocal(recBytes);
@@ -120,9 +133,9 @@ internal sealed class Edge0LayerBuffers : IDisposable
             staging.WaitAll();
             return new Edge0LayerBuffers
             {
-                Router = router, Records = recBuf!, RecordsImported = imported, RecordBytes = record, GateUpBytes = gateBytes, D = dBuf, U = uBufs, Labels = labelBuf, InverseScale = invBuf,
+                Router = router!, RouterImported = routerImported, Records = recBuf!, RecordsImported = imported, RecordsFallbackReason = recFallback, RecordBytes = record, GateUpBytes = gateBytes, D = dBuf, U = uBufs, Labels = labelBuf, InverseScale = invBuf,
                 GateUpType = pack.GateUpType, DownType = pack.DownType, LatentDenseType = pack.LatentDenseType, Groups = G, Latent = L, Hidden = H, Experts = E,
-                Bytes = (long)E * H * 2 + (imported ? 0 : recBytes) + dBytes + uBytes + (long)E * 4 + (long)L * 4,
+                Bytes = (routerImported ? 0 : routerBytes) + (imported ? 0 : recBytes) + dBytes + uBytes + (long)E * 4 + (long)L * 4,
             };
         }
         catch { foreach (var b in created) b.Dispose(); throw; }

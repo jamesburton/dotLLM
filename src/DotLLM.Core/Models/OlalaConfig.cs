@@ -124,6 +124,6 @@ public sealed record OlalaConfig
     /// <param name="backend">Backend name shown to the user.</param>
     /// <returns>The refusal message.</returns>
     public static string UnsupportedMessage(string backend)
-        => $"The olala architecture (OVHcloud Olala: Mamba-3 MIMO + differential TPA + latent MoE) has a CPU forward only; the {backend} backend is not implemented yet "
-         + "(epic https://github.com/jamesburton/dotLLM/issues/1969). Loading it through a generic loader would silently run a different model, so it is refused. Use the CPU backend.";
+        => $"The olala architecture (OVHcloud Olala: Mamba-3 MIMO + differential TPA + latent MoE) has CPU and Vulkan forwards only; the {backend} backend is not implemented yet "
+         + "(epic https://github.com/jamesburton/dotLLM/issues/1969). Loading it through a generic loader would silently run a different model, so it is refused. Use the CPU or Vulkan backend.";
 }

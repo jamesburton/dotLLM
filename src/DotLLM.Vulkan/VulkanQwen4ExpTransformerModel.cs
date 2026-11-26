@@ -801,6 +801,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
 
     /// <summary>Test hook (Edge0 G3): Edge0 layers recorded on the group-skipping decode path.</summary>
     internal long Edge0SkipLayersForTest => _core.Edge0SkipLayersCount;
+    /// <summary>Test hook: bytes of the Edge0 per-forward scratch (F16 D output + F16 U slab).</summary>
+    internal long Edge0ScratchBytesForTest => _core.Edge0ScratchBytes;
 
     /// <summary>Test hook (#885): decode MoE layers that used the fused scatter + shared-gate add kernel.</summary>
     internal long CombineFusedLayers => _core.Q4CombineFusedLayers;

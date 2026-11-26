@@ -197,7 +197,12 @@ public static class VulkanModelLoader
                 throw new NotSupportedException(RicursiveConfig.UnsupportedMessage("Vulkan"));
 
             case Architecture.Olala:
-                throw new NotSupportedException(OlalaConfig.UnsupportedMessage("Vulkan"));
+            {
+                // OVHcloud Olala (#1983): Mamba-3 MIMO + differential TPA + latent MoE; BF16 activations, F32 recurrent state, weights read in place.
+                // The model owns its sequence state (like the CPU model), so the engine KV cache is unused.
+                var olala = VulkanOlalaTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+                return (olala, size => olala.CreateKvCacheHandle(size));
+            }
 
             case Architecture.Mamba3:
                 throw new NotSupportedException(

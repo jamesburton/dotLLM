@@ -26,6 +26,8 @@ internal sealed class DebugGgufHeaderCommand : Command<DebugGgufHeaderCommand.Se
             return 1;
 
         var fileInfo = new FileInfo(resolvedPath);
+        // HF snapshot entries are symlinks to blobs: report the blob's size, not the link's (#1991).
+        long fileLength = (fileInfo.ResolveLinkTarget(returnFinalTarget: true) as FileInfo)?.Length ?? fileInfo.Length;
         using var gguf = GgufFile.Open(resolvedPath);
 
         AnsiConsole.Write(new Rule("[bold yellow]GGUF Header[/]").LeftJustified());
@@ -36,7 +38,7 @@ internal sealed class DebugGgufHeaderCommand : Command<DebugGgufHeaderCommand.Se
         table.AddColumn("Value");
 
         table.AddRow("File", fileInfo.Name);
-        table.AddRow("File size", FormatBytes(fileInfo.Length));
+        table.AddRow("File size", FormatBytes(fileLength));
         table.AddRow("Version", gguf.Header.Version.ToString());
         table.AddRow("Tensor count", gguf.Tensors.Count.ToString("N0")); // unified over all shards of a split set (Header is the first shard's)
         table.AddRow("Metadata KV count", gguf.Header.MetadataKvCount.ToString("N0"));
