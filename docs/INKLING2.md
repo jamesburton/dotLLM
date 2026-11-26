@@ -131,7 +131,7 @@ neither a KL below ~4e-3 nor free-running greedy identity is a meaningful bar ag
 - **DSpark drafter** (`dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`): 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
   `target_layer_ids = [5, 23, 41, 48]` counted in **layer visits** (the target exposes the input of visit `n` and the final norm output as id 48: `res->t_layer_inp[visit]` in `inkling2-loop.cpp`). The CPU model keeps the trace hook points
   (`pass{n}.l{ip}`, `result_norm`) where those features would be tapped.
-- Vulkan / CUDA text decoders (NVFP4 expert kernels must read the blocks in place), optimisation, llama.cpp Vulkan comparison.
+- CUDA text decoder (NVFP4 expert kernels must read the blocks in place), optimisation, llama.cpp Vulkan comparison. (The Vulkan text decoder landed in #2034, section 11.)
 
 ## 10. Results (CPU reference vs llama.cpp b12780 CPU, `Inkling-2-Mini-NVFP4.gguf`, Strix Halo, 2026-11-26)
 

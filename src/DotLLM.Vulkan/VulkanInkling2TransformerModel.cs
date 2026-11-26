@@ -310,6 +310,10 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
             throw new ArgumentException("VulkanInkling2TransformerModel requires an Architecture.Inkling2 configuration.", nameof(config));
         if (!device.HasSubgroupArithmetic)
             throw new NotSupportedException("The Inkling 2 Vulkan kernels need subgroup arithmetic (VK_KHR_shader_subgroup_arithmetic); this device does not report it.");
+        // inkling2_attn reduces each key's score over 16 lanes with subgroupShuffleXor (offsets 8..1), and wgSum keeps at most 32 subgroup partials:
+        // both need a subgroup of at least 16 lanes. 0 = the probe did not run (not a known-bad width).
+        if (device.SubgroupSize != 0 && device.SubgroupSize < 16)
+            throw new NotSupportedException($"The Inkling 2 Vulkan kernels need a subgroup of at least 16 lanes; this device reports {device.SubgroupSize}.");
         if (!device.NumericFeatures.StorageBuffer16BitAccess)
             throw new NotSupportedException("The Inkling 2 Vulkan kernels store BF16 activations through 16-bit storage buffer access; this device does not report storageBuffer16BitAccess.");
         if (config.HeadDim != 128 || config.NumAttentionHeads != 3 * config.NumKvHeads || c.RelativeLength != 16 || c.ConvKernel != 4 || config.HiddenSize > 4096
