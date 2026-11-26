@@ -183,7 +183,8 @@ internal static class TiktokenPreTokenizer
         "qwen2" or "deepseek-r1-qwen" or "kormo" or "f2llmv2" or "megrez"
             or "stablelm2" or "hunyuan" or "solar-open" => Qwen2Pipeline,
         "qwen35" => Qwen35Pipeline,
-        "gpt-4o" or "llama4" => Gpt4oPipeline,
+        // Inkling 2 (llama.cpp routes "inkling2" to GPT4O with ignore_merges = true and no BOS; #2026).
+        "gpt-4o" or "llama4" or "inkling2" => Gpt4oPipeline,
         "tekken" => TekkenPipeline,
         "glm4" or "glm5" or "chatglm-bpe" => ChatGlm4Pipeline,
         "flint" => FlintPipeline,

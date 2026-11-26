@@ -1402,6 +1402,9 @@ internal sealed class TransformerWeights : IDisposable
                 "it is a Mamba-3 MIMO / differential tensor-product-attention hybrid with a latent MoE and geodesic residuals "
                 + "(ssm_in/ssm_in_dyn/attn_wa_*/attn_wb_*/ffn_latent_* tensors, no attn_norm/ffn_norm); it has a dedicated CPU model "
                 + "(OlalaTransformerModel, issue #1970); Vulkan and CUDA ports are tracked in epic #1969 and refuse explicitly until they land",
+            DotLLM.Core.Configuration.Architecture.Inkling2 =>
+                "it is a looped MoE transformer with depth mixing, relative-position attention with sinks, short convolutions and SITU experts; "
+                + "it has a dedicated CPU model (Inkling2TransformerModel, issue #2026) and no GPU port yet",
             DotLLM.Core.Configuration.Architecture.Mamba3 =>
                 "Mamba-3 has no GGUF representation at all (no upstream 'mamba3' value for "
                 + "general.architecture and no GGUF tensor-naming convention) — it is "

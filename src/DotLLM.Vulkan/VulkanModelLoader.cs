@@ -216,6 +216,9 @@ public static class VulkanModelLoader
                 return (olala, size => olala.CreateKvCacheHandle(size));
             }
 
+            case Architecture.Inkling2:
+                throw new NotSupportedException(Inkling2Config.UnsupportedMessage("Vulkan"));
+
             case Architecture.Mamba3:
                 throw new NotSupportedException(
                     "Mamba-3 has no GGUF representation: no upstream 'mamba3' value for " +
