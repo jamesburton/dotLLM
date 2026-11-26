@@ -232,6 +232,10 @@ PPM are decoded without dependencies; JPEG is refused by name. A backend plugs i
 The embedding gap is a **noise floor, not an error**: perturbing our own input by ~1e-4 relative (F16 im2col rounding on/off) moves the embeddings by the same 2.1% relRMS, because 23 layers of Q8_0
 activation quantisation amplify boundary flips. So the embedding gate (relRMS < 6%, cosine > 0.99) catches gross errors only; the sharp gates are the early checkpoints and the end-to-end KL.
 
+**F32-weights control (PR #2037 review).** With the mmproj's Q8_0 matrices dequantised to an F32 GGUF, the Q8_0 activation quantisation disappears on both sides (ggml and
+`GemmF32`) and the gap collapses: relRMS 2.1e-4 (80) and 2.1e-4 (190x110), the F16 storage of our output. llama.cpp itself moves 1.9% when one input byte changes by 1 LSB (ours: 2.0%). So the 2%
+Q8_0 gap is the reference's own sensitivity, and no systematic error above ~2e-4 hides in it.
+
 **Mutants** (all in the committed tests; `Inkling2VisionMutant`, `Inkling2Mutant.NormalizeImageEmbeddings`). Checkpoint gate at n = 80: align_corners posemb, transposed posemb, row/col RoPE swapped, NEOX RoPE,
 merge order, no merge, no LayerScale, no CLS all killed (tanh GELU only marginally, pixel_shuffle rel 0.108 vs 0.08; it is separated by the op-level GELU test: erf error < 1e-6 vs 4.7e-4 for tanh).
 Embedding gate: BGR (relRMS 0.41) and pad = 0 after normalisation killed. End-to-end mean KL (gate 0.015): normalise image embeddings 0.53, NEOX RoPE 0.51, merge skipped 0.22, no LayerScale 1.72, no CLS 1.12,

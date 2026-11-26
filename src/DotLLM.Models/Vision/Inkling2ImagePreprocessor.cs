@@ -29,7 +29,7 @@ public static class Inkling2ImagePreprocessor
     private const int Align = PatchSize * Merge;
     private const long MaxPixels = (long)MaxTokens * Align * Align;
 
-    private static int AlignUp(int v) => (v + Align - 1) / Align * Align;
+    private static int AlignUp(int v) => (int)Math.Min(int.MaxValue / 2, ((long)v + Align - 1) / Align * Align);
 
     /// <summary>The padded size the image is encoded at, after the over-limit downscale if any.</summary>
     public static (int Width, int Height, int SrcWidth, int SrcHeight) PlanSize(int width, int height)
@@ -39,8 +39,9 @@ public static class Inkling2ImagePreprocessor
         if (tooLarge)
         {
             // calc_size_preserved_ratio: round to the grid, then bound by max_pixels preserving the aspect ratio.
-            int wBar = Math.Max(Align, (int)MathF.Round(width / (float)Align) * Align);
-            int hBar = Math.Max(Align, (int)MathF.Round(height / (float)Align) * Align);
+            // std::round (half away from zero), not MathF.Round's default half-to-even: the reference rounds 4020 / 40 = 100.5 up.
+            int wBar = Math.Max(Align, (int)MathF.Round(width / (float)Align, MidpointRounding.AwayFromZero) * Align);
+            int hBar = Math.Max(Align, (int)MathF.Round(height / (float)Align, MidpointRounding.AwayFromZero) * Align);
             if ((long)hBar * wBar > MaxPixels)
             {
                 float beta = MathF.Sqrt((float)height * width / MaxPixels);
@@ -49,6 +50,11 @@ public static class Inkling2ImagePreprocessor
             }
             sw = wBar; sh = hBar;
         }
+        // An extreme aspect ratio defeats the bound: the short side clamps to one cell and the long side keeps growing (a 2,000,000 x 1 image
+        // plans 90,000 tokens). The reference would encode it; this refuses it, because the ViT cost is quadratic in the token count.
+        long tokens = (long)(AlignUp(sw) / Align) * (AlignUp(sh) / Align);
+        if (tokens > MaxTokens)
+            throw new NotSupportedException($"image aspect ratio too extreme: {width}x{height} would need {tokens} image tokens (limit {MaxTokens}).");
         return (AlignUp(sw), AlignUp(sh), sw, sh);
     }
 

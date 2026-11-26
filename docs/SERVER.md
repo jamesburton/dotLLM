@@ -12,7 +12,9 @@ Primary chat endpoint. Accepts OpenAI-compatible request format.
 **Images (issue #2035).** `content` may be an array of parts: `{"type":"text","text":...}` and `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`
 (PNG or binary PPM; JPEG is rejected with 400 `invalid_image`; remote URLs are not fetched). Supported by vision models only (Inkling 2, CPU backend today); the vision
 projector is the `mmproj*.gguf` next to the model file (or `DOTLLM_MMPROJ`), loaded on the first image request. A request with images bypasses the continuous-batch scheduler and
-reuses/retains no prompt prefix cache. The prompt-length check does not yet count the image tokens (up to 4096 per image). See `docs/INKLING2.md` section 11.
+reuses/retains no prompt prefix cache. Untrusted-input bounds (checked before any encode): at most 16 images and 2^26 decoded pixels per request, 2^25 pixels / 65536 per side
+per image (refused from the PNG header, before allocating), one rendered placeholder per image, and the prompt widened by the images' token counts must fit the context
+(400 `context_length_exceeded`; `max_tokens` is clamped to what is left). Images cannot be combined with `lora_adapter` yet. See `docs/INKLING2.md` section 11.
 
 **Request body**:
 ```json

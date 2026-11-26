@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.IO.Compression;
 using DotLLM.Core.Vision;
 
@@ -8,8 +9,24 @@ namespace DotLLM.Models.Vision;
 /// dropped like <c>stbi_load(..., 3)</c> in llama.cpp mtmd). JPEG and other formats are not supported yet (no license-compatible decoder is
 /// vendored): callers get a <see cref="NotSupportedException"/> naming the format.
 /// </summary>
+/// <remarks>
+/// The input is untrusted (server <c>data:</c> URIs). Every size is validated before it is used: chunk lengths against the buffer, IHDR fields
+/// against the PNG specification, and the declared dimensions against <see cref="MaxPixels"/> / <see cref="MaxSide"/> <b>before</b> anything is
+/// allocated from them, so a few-KB file cannot declare a multi-GB image (a decompression bomb). Malformed input throws
+/// <see cref="InvalidDataException"/> (or <see cref="NotSupportedException"/> for valid but unsupported variants), never an index or overflow
+/// exception. Chunk CRCs are not verified (as <c>stb_image</c>); the zlib stream's own Adler-32 is checked by <see cref="ZLibStream"/>.
+/// </remarks>
 public static class ImageDecoder
 {
+    /// <summary>
+    /// Largest decoded image accepted, in pixels (2^25, about 33.5 MP: 8K UHD fits). The Inkling-2 encoder downsizes anything above 6.55 MP
+    /// anyway; this bounds the decode buffers (at most 8 bytes per pixel of filtered PNG rows plus 3 of RGB output).
+    /// </summary>
+    public const long MaxPixels = 1L << 25;
+
+    /// <summary>Largest accepted width or height in pixels.</summary>
+    public const int MaxSide = 1 << 16;
+
     /// <summary>Decodes <paramref name="data"/> (format sniffed from the magic bytes).</summary>
     public static DecodedImage Decode(ReadOnlySpan<byte> data)
     {
@@ -32,6 +49,14 @@ public static class ImageDecoder
         return Decode(Convert.FromBase64String(uri[(comma + 1)..]));
     }
 
+    /// <summary>Throws unless <paramref name="w"/> x <paramref name="h"/> is a positive size within <see cref="MaxSide"/> and <see cref="MaxPixels"/>.</summary>
+    public static void CheckDimensions(long w, long h)
+    {
+        if (w <= 0 || h <= 0) throw new InvalidDataException($"invalid image size {w}x{h}");
+        if (w > MaxSide || h > MaxSide || w * h > MaxPixels)
+            throw new InvalidDataException($"image too large: {w}x{h} (limit {MaxSide} per side and {MaxPixels} pixels)");
+    }
+
     private static DecodedImage DecodePpm(byte[] d)
     {
         int pos = 2;
@@ -42,14 +67,20 @@ public static class ImageDecoder
                 if (d[pos] == '#') while (pos < d.Length && d[pos] != '\n') pos++;
                 else pos++;
             }
-            int v = 0, n = 0;
-            while (pos < d.Length && d[pos] >= '0' && d[pos] <= '9') { v = checked(v * 10 + (d[pos] - '0')); pos++; n++; }
+            long v = 0; int n = 0;
+            while (pos < d.Length && d[pos] >= '0' && d[pos] <= '9')
+            {
+                v = v * 10 + (d[pos] - '0'); pos++; n++;
+                if (v > int.MaxValue) throw new InvalidDataException("PPM header value out of range");
+            }
             if (n == 0) throw new InvalidDataException("malformed PPM header");
-            return v;
+            return (int)v;
         }
         int w = ReadInt(), h = ReadInt(), max = ReadInt();
+        if (pos >= d.Length || !(d[pos] is (byte)' ' or (byte)'\n' or (byte)'\r' or (byte)'\t')) throw new InvalidDataException("malformed PPM header");
         pos++;   // single whitespace after the header
         if (max != 255) throw new NotSupportedException("only 8-bit PPM is supported");
+        CheckDimensions(w, h);
         long need = (long)w * h * 3;
         if (d.Length - pos < need) throw new InvalidDataException("truncated PPM");
         return new DecodedImage(w, h, d.AsSpan(pos, (int)need).ToArray());
@@ -57,42 +88,74 @@ public static class ImageDecoder
 
     private static DecodedImage DecodePng(byte[] d)
     {
+        if (d.Length < 8 || d[4] != 0x0D || d[5] != 0x0A || d[6] != 0x1A || d[7] != 0x0A) throw new InvalidDataException("bad PNG signature");
         int pos = 8;
-        int w = 0, h = 0, depth = 0, ctype = 0, interlace = 0;
+        int w = 0, h = 0, depth = 0, ctype = 0;
+        bool haveHeader = false, sawEnd = false;
         byte[]? palette = null;
         using var idat = new MemoryStream();
-        while (pos + 8 <= d.Length)
+        while (d.Length - pos >= 12)
         {
-            int len = (d[pos] << 24) | (d[pos + 1] << 16) | (d[pos + 2] << 8) | d[pos + 3];
-            string type = System.Text.Encoding.ASCII.GetString(d, pos + 4, 4);
+            uint ulen = BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(pos, 4));
+            if (ulen > int.MaxValue || ulen > (uint)(d.Length - pos - 12)) throw new InvalidDataException("PNG chunk length exceeds the data");
+            int len = (int)ulen;
+            var type = d.AsSpan(pos + 4, 4);
             var body = d.AsSpan(pos + 8, len);
             pos += 12 + len;
-            if (type == "IHDR")
+            if (type.SequenceEqual("IHDR"u8))
             {
-                w = (body[0] << 24) | (body[1] << 16) | (body[2] << 8) | body[3];
-                h = (body[4] << 24) | (body[5] << 16) | (body[6] << 8) | body[7];
-                depth = body[8]; ctype = body[9]; interlace = body[12];
+                if (haveHeader) throw new InvalidDataException("duplicate PNG IHDR");
+                if (len != 13) throw new InvalidDataException("bad PNG IHDR length");
+                uint uw = BinaryPrimitives.ReadUInt32BigEndian(body), uh = BinaryPrimitives.ReadUInt32BigEndian(body[4..]);
+                CheckDimensions(uw, uh);
+                w = (int)uw; h = (int)uh;
+                depth = body[8]; ctype = body[9];
+                bool depthOk = ctype switch
+                {
+                    0 => depth is 1 or 2 or 4 or 8 or 16,
+                    3 => depth is 1 or 2 or 4 or 8,
+                    2 or 4 or 6 => depth is 8 or 16,
+                    _ => throw new InvalidDataException("bad PNG colour type"),
+                };
+                if (!depthOk) throw new InvalidDataException($"bad PNG bit depth {depth} for colour type {ctype}");
+                if (body[10] != 0 || body[11] != 0) throw new InvalidDataException("bad PNG compression / filter method");
+                if (body[12] > 1) throw new InvalidDataException("bad PNG interlace method");
+                if (body[12] != 0) throw new NotSupportedException("interlaced PNG is not supported; re-save without interlacing.");
+                haveHeader = true;
             }
-            else if (type == "PLTE") palette = body.ToArray();
-            else if (type == "IDAT") idat.Write(body);
-            else if (type == "IEND") break;
+            else if (!haveHeader) throw new InvalidDataException("PNG does not start with IHDR");
+            else if (type.SequenceEqual("PLTE"u8))
+            {
+                if (len == 0 || len % 3 != 0 || len > 768) throw new InvalidDataException("bad PNG palette length");
+                palette = body.ToArray();
+            }
+            else if (type.SequenceEqual("IDAT"u8)) idat.Write(body);
+            else if (type.SequenceEqual("IEND"u8)) { sawEnd = true; break; }
         }
-        if (w <= 0 || h <= 0) throw new InvalidDataException("PNG without IHDR");
-        if (interlace != 0) throw new NotSupportedException("interlaced PNG is not supported; re-save without interlacing.");
-        int channels = ctype switch { 0 => 1, 2 => 3, 3 => 1, 4 => 2, 6 => 4, _ => throw new InvalidDataException("bad PNG colour type") };
+        if (!haveHeader) throw new InvalidDataException("PNG without IHDR");
+        if (!sawEnd && idat.Length == 0) throw new InvalidDataException("PNG without image data");
+        if (ctype == 3 && palette is null) throw new InvalidDataException("palette PNG without PLTE");
+        int channels = ctype switch { 0 => 1, 2 => 3, 3 => 1, 4 => 2, _ => 4 };
         int bitsPerPixel = channels * depth;
         int bpp = Math.Max(1, bitsPerPixel / 8);
-        long stride = ((long)w * bitsPerPixel + 7) / 8;
-        var raw = new byte[(stride + 1) * h];
+        long stride = ((long)w * bitsPerPixel + 7) / 8;   // <= 8 * MaxSide: fits an int
+        // Bounded by CheckDimensions: (stride + 1) * h <= 8 * MaxPixels + MaxSide, and rgb = 3 * MaxPixels bytes at most.
+        long rawBytes = (stride + 1) * h;
+        // Deflate cannot expand by more than ~1032:1, so a stream far shorter than that cannot hold the declared image: refuse it before the
+        // buffer is allocated (a header-only "bomb" would otherwise cost the full declared size per request).
+        if (rawBytes > idat.Length * 1032L + 1024) throw new InvalidDataException("truncated PNG image data");
+        var raw = new byte[rawBytes];
         idat.Position = 0;
-        using (var z = new ZLibStream(idat, CompressionMode.Decompress)) z.ReadExactly(raw);
+        using (var z = new ZLibStream(idat, CompressionMode.Decompress)) z.ReadExactly(raw);   // decompresses no more than the declared size
         var cur = new byte[stride];
         var prev = new byte[stride];
         var rgb = new byte[(long)w * h * 3];
         for (int y = 0; y < h; y++)
         {
-            int filter = raw[y * (stride + 1)];
-            var line = new ReadOnlySpan<byte>(raw, (int)(y * (stride + 1) + 1), (int)stride);
+            long rowStart = y * (stride + 1);
+            int filter = raw[rowStart];
+            if (filter > 4) throw new InvalidDataException("bad PNG filter");
+            var line = new ReadOnlySpan<byte>(raw, (int)(rowStart + 1), (int)stride);
             for (int i = 0; i < stride; i++)
             {
                 int a = i >= bpp ? cur[i - bpp] : 0, b = prev[i], c = i >= bpp ? prev[i - bpp] : 0;
@@ -103,13 +166,12 @@ public static class ImageDecoder
                     1 => x + a,
                     2 => x + b,
                     3 => x + ((a + b) >> 1),
-                    4 => x + Paeth(a, b, c),
-                    _ => throw new InvalidDataException("bad PNG filter"),
+                    _ => x + Paeth(a, b, c),
                 });
             }
             for (int x = 0; x < w; x++)
             {
-                int o = (y * w + x) * 3;
+                long o = ((long)y * w + x) * 3;
                 int Sample(int ch)
                 {
                     if (depth == 8) return cur[x * channels + ch];
@@ -125,7 +187,7 @@ public static class ImageDecoder
                     default:
                     {
                         int idx = Sample(0);
-                        if (palette is null || idx * 3 + 2 >= palette.Length) throw new InvalidDataException("bad PNG palette index");
+                        if (idx * 3 + 2 >= palette!.Length) throw new InvalidDataException("bad PNG palette index");
                         rgb[o] = palette[idx * 3]; rgb[o + 1] = palette[idx * 3 + 1]; rgb[o + 2] = palette[idx * 3 + 2];
                         break;
                     }

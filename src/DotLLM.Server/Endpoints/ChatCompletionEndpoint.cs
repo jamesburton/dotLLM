@@ -126,7 +126,7 @@ public static class ChatCompletionEndpoint
             request.MaxTokens ?? state.EffectiveSamplingDefaults.MaxTokens, thinkingBudget, state.Options.ReasoningAnswerReserve);
         var promptError = RequestValidator.ValidatePromptLength(
             prompt, state.Tokenizer!, state.Config!.MaxSequenceLength,
-            maxTokens, out int effectiveMaxTokens, out _);
+            maxTokens, out int effectiveMaxTokens, out int promptTokenCount);
         if (promptError is not null)
         {
             await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(promptError, param: "messages", code: "context_length_exceeded"), keepAlive);
@@ -176,14 +176,30 @@ public static class ChatCompletionEndpoint
         {
             try
             {
-                imageEmbeddings = await ImageInput.EncodeAsync(state, imageUrls, ct);
+                // A LoRA adapter would be silently dropped by the image prefill (IImageInputModel.ForwardWithImages takes none): refuse.
+                if (adapter is not null)
+                    throw new ImageInputException("Image input cannot be combined with a LoRA adapter yet.");
                 var placeholder = state.Tokenizer!.Encode(DotLLM.Models.Vision.VisionSupport.Inkling2ImageToken);
                 if (placeholder.Length != 1) throw new ImageInputException("The tokenizer does not define the image placeholder token.");
-                options = options with { Images = imageEmbeddings, ImagePlaceholderTokenId = placeholder[0] };
+                // Every image needs exactly one rendered placeholder (an image in a turn the template does not render would otherwise fail
+                // in the engine after the encode): checked on the rendered prompt before anything is decoded or encoded.
+                int renderedPlaceholders = 0;
+                foreach (int id in state.Tokenizer.Encode(prompt)) if (id == placeholder[0]) renderedPlaceholders++;
+                if (renderedPlaceholders != imageUrls.Count)
+                    throw new ImageInputException($"The chat template rendered {renderedPlaceholders} image placeholder(s) for {imageUrls.Count} image(s); images are only supported where the template places them.");
+                // The images widen the prompt (each placeholder becomes the image's token count): it must still fit the context with room for
+                // one generated token, checked before the encode (ImageInput), and max_tokens is clamped to what is left after the widening.
+                int ctx = state.Config!.MaxSequenceLength;
+                imageEmbeddings = await ImageInput.EncodeAsync(state, imageUrls, ctx - promptTokenCount - 1, ct);
+                long extra = 0;
+                foreach (var e in imageEmbeddings) extra += e.Tokens - 1;
+                int remaining = (int)Math.Max(1, ctx - promptTokenCount - extra);
+                options = options with { Images = imageEmbeddings, ImagePlaceholderTokenId = placeholder[0], MaxTokens = Math.Min(options.MaxTokens, remaining) };
             }
             catch (ImageInputException ex)
             {
-                await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(ex.Message, param: "messages", code: "invalid_image"), keepAlive);
+                if (imageEmbeddings is not null) foreach (var e in imageEmbeddings) e.Dispose();
+                await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(ex.Message, param: "messages", code: ex.Code), keepAlive);
                 return;
             }
         }
