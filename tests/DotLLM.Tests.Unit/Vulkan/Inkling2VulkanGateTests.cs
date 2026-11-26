@@ -142,6 +142,7 @@ public sealed class Inkling2VulkanGateTests
         var cfg = GgufModelConfigExtractor.Extract(file.Metadata);
         using var dev = VulkanDevice.Create();
         using var vk = Build(dev, file, cfg, new Inkling2VulkanOptions(false, Kv(kv), IntEnv("DOTLLM_INKLING2_VK_CHUNK", 128)));
+        _output.WriteLine("LOAD " + vk.WeightLoadReport);
         int[] prompt = r!.Tokens.AsSpan(0, 300).ToArray();
         for (int round = 0; round < 4; round++)
         {

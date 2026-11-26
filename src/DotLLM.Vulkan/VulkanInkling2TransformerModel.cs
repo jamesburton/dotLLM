@@ -156,6 +156,9 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
     /// <summary>Test/diagnostic hook: receives named intermediates (null = off). Setting it splits the forward into several submissions.</summary>
     internal Inkling2VkTraceSink? Trace { get; set; }
 
+    /// <summary>How the weights reached the device (DirectStorage / zero-copy import / staged host bounce), for the PR's direct-transfer evidence.</summary>
+    public string WeightLoadReport { get; private set; } = "";
+
     /// <summary>Bytes of the loop-controller matrices as stored on the device (BF16; the GGUF's F32 original is 113.7 MB).</summary>
     public long LoopControllerBytes => _controllerBytes;
 
@@ -420,7 +423,10 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
         }
 
         var tokNorm = F32(Inkling2Tensors.TokenEmbdNorm); var outNorm = F32(Inkling2Tensors.OutputNorm); var outRes = F32(Inkling2Tensors.OutputResQuery);
-        return new VulkanInkling2TransformerModel(device, spvDir, gguf, config, opt, layers, embed, output, tokNorm, outNorm, outRes, bytes, controllerBytes);
+        var model = new VulkanInkling2TransformerModel(device, spvDir, gguf, config, opt, layers, embed, output, tokNorm, outNorm, outRes, bytes, controllerBytes);
+        model.WeightLoadReport = $"direct(DirectStorage) {VulkanWeightImportPolicy.DirectTensorCount} tensors / {VulkanWeightImportPolicy.DirectBytes / 1e6:F1} MB; imported(zero-copy) {VulkanWeightImportPolicy.ImportedTensorCount} / {VulkanWeightImportPolicy.ImportedBytes / 1e6:F1} MB; " +
+                                 $"staged(host bounce) {VulkanWeightImportPolicy.StagedTensorCount} / {VulkanWeightImportPolicy.StagedBytes / 1e6:F1} MB; controller BF16 narrowing copies {controllerBytes / 1e6:F1} MB (always staged); last fallback: '{VulkanWeightImportPolicy.LastFallbackReason}'";
+        return model;
     }
 
     // ───────────────────────────── kernels & recording ─────────────────────────────
