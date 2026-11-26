@@ -237,8 +237,8 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
             throw new InvalidDataException("olala tensor table does not match the model contract: " + string.Join("; ", problems.Take(8)));
         if (config.HeadDim % 8 != 0 || config.HeadDim > 128)
             throw new NotSupportedException($"Olala Vulkan attention supports head_dim a multiple of 8 and <= 128, got {config.HeadDim}.");
-        if (o.MimoRank > 8 || o.StateSize > 128 || o.NumRopeAngles > 64 || o.NumRopeAngles > o.StateSize / 2)
-            throw new NotSupportedException("Olala Vulkan Mamba step supports rank <= 8, state <= 128, angles <= min(64, state/2).");
+        if (o.MambaHeadDim > 64 || o.MimoRank > 8 || o.StateSize > 128 || o.NumRopeAngles > 64 || o.NumRopeAngles > o.StateSize / 2)
+            throw new NotSupportedException("Olala Vulkan Mamba step supports head dim <= 64, rank <= 8, state <= 128, angles <= min(64, state/2).");
         if (o.NumSignalHeads + o.NumNoiseHeads != 4 * o.NumNoiseHeads)
             throw new NotSupportedException("Olala Vulkan attention supports 4 query heads per kv head (3 signal + 1 noise).");
         // olala_moe_route keeps the token row and the scores in fixed shared arrays (sx4[1024] = 4096 floats read as vec4, sig/scored[1024], chosen[16]).
@@ -588,7 +588,7 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
     {
         Gemv(l.SsmIn!, _res, _zxdt, T); Sp("M ssm_in");
         Gemv(l.SsmInDyn!, _res, _dyn, T); Sp("M ssm_in_dyn");
-        var k = Kernel("mamba", "olala_mamba3_step", 5, 7);
+        var k = Kernel("mamba", "olala_mamba3_step", 5, 7, (uint)_N, (uint)_R);
         Run(k, (1u << 3) | (1u << 4), [(uint)T, (uint)_heads, (uint)_P, (uint)_N, (uint)_R, (uint)_A, F(_eps)], (uint)_heads, 1, 1,
             _zxdt, _dyn, l.Params!, l.SsmState!, _ssmY);
         Sp("M mamba3_step");
