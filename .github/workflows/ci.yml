@@ -39,6 +39,27 @@ jobs:
       - name: Build
         run: dotnet build -c ${{ matrix.configuration }}
 
+      # (#1964) Third-party notices are generated at publish and FAIL the build for a bundled dependency whose licence they cannot
+      # reproduce. Release packs/publishes only after merge (release.yml), so exercise the same targets here: both tool packages
+      # (framework-dependent) and one self-contained CLI publish (adds the .NET runtime packs), then check the files shipped.
+      - name: Third-party notices (tool packs + self-contained publish)
+        if: matrix.configuration == 'Release'
+        run: |
+          set -euo pipefail
+          dotnet pack tools/DotLLM.ChunkCache -c Release --no-restore -o artifacts/ci-notices
+          dotnet pack src/DotLLM.Cli -c Release --no-restore -o artifacts/ci-notices
+          dotnet publish src/DotLLM.Cli/DotLLM.Cli.csproj -c Release -r linux-x64 --self-contained true -p:DebugType=none -o artifacts/ci-notices/linux-x64
+          # The listing is captured first: piping unzip into `grep -q` under pipefail fails on unzip's SIGPIPE.
+          for p in artifacts/ci-notices/dotllm-chunkcache.*.nupkg artifacts/ci-notices/DotLLM.Cli.*.nupkg; do
+            listing="$(unzip -Z1 "$p")"
+            grep -qx 'NOTICE' <<< "$listing" || { echo "::error::$p has no NOTICE"; exit 1; }
+            grep -qx 'tools/net10.0/any/THIRD-PARTY-NOTICES.txt' <<< "$listing" || { echo "::error::$p has no THIRD-PARTY-NOTICES.txt"; exit 1; }
+          done
+          grep -q 'microsoft.netcore.app.runtime.linux-x64' artifacts/ci-notices/linux-x64/THIRD-PARTY-NOTICES.txt \
+            || { echo "::error::the self-contained publish's notices do not list the .NET runtime pack"; exit 1; }
+          grep -q 'The ggml authors' artifacts/ci-notices/linux-x64/THIRD-PARTY-NOTICES.txt \
+            || { echo "::error::the notices do not carry the repository NOTICE (llama.cpp / ggml)"; exit 1; }
+
   unit-tests:
     name: Unit Tests
     needs: build

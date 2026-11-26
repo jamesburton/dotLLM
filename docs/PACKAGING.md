@@ -85,6 +85,13 @@ cannot reproduce: an expression other than MIT or Apache-2.0 with no licence fil
 under `build/licenses/` and map it in the targets. Library packages reference their dependencies rather than bundling them,
 so they carry no notices file. DirectStorage is not redistributed (`DotLLMBundleDirectStorage=false` in `release.yml`).
 
+Code ported or copied INTO dotLLM's own assemblies and kernels (`ptx/`, `spv/`) is not a package, so no generated list can
+find it: the repository `NOTICE` covers it, with the MIT licences of llama.cpp / ggml (including the PrismML fork) and
+tiktoken. `NOTICE` is packed into every nupkg (root `Directory.Build.props`), copied into every release archive, and appended
+to every generated `THIRD-PARTY-NOTICES.txt`. When porting from another upstream, add it to `NOTICE` with its licence. CI's
+Release build job packs both tools and publishes one self-contained CLI, so a notices failure shows on the PR, not first on the
+post-merge dev release.
+
 Availability checked on nuget.org on 2026-10-05:
 
 | Option | `dnx` invocation | Notes |

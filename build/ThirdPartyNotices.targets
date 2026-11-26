@@ -12,7 +12,8 @@
     It is generated rather than checked in so it cannot go stale on a dependency bump, and it fails the build for a
     package whose licence it cannot reproduce (an expression other than MIT / Apache-2.0 with no licence file in the
     package): a missing notice is a licence violation, so it never degrades silently.
-    Our own projects (DotLLM.*) are not listed: they are this repository (GPL-3.0-only; the MIT client is in NOTICE).
+    Our own projects (DotLLM.*) are not listed as packages: they are this repository (GPL-3.0-only; the MIT client is in NOTICE).
+    Code ported or copied INTO them (llama.cpp / ggml, tiktoken) is covered by the repository NOTICE, which is always appended.
   -->
 
   <PropertyGroup>
@@ -32,6 +33,7 @@
       <LicenseTemplateDir ParameterType="System.String" Required="true" />
       <Product ParameterType="System.String" Required="true" />
       <OutputFile ParameterType="System.String" Required="true" />
+      <RepositoryNotice ParameterType="System.String" Required="true" />
     </ParameterGroup>
     <Task>
       <Using Namespace="System" />
@@ -199,6 +201,20 @@
             }
         }
 
+        // Code ported or copied into dotLLM's OWN binaries (llama.cpp / ggml, tiktoken): no package lists it, so the repository
+        // NOTICE, which carries those licences, is always appended. A missing NOTICE fails the build like any missing licence.
+        if (!File.Exists(RepositoryNotice))
+            Log.LogError("Third-party notices: the repository NOTICE (code from other projects in dotLLM's own sources) is missing at " + RepositoryNotice);
+        else
+        {
+            sb.AppendLine(rule);
+            sb.AppendLine("dotLLM repository NOTICE (code from other projects compiled into dotLLM's own binaries and kernels)");
+            sb.AppendLine(rule);
+            sb.AppendLine();
+            sb.AppendLine(read(RepositoryNotice));
+            sb.AppendLine();
+        }
+
         if (Log.HasLoggedErrors) return false;
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(OutputFile)));
         var content = sb.ToString().Replace("\r\n", "\n");
@@ -221,7 +237,8 @@
         PackageRoot="$(NuGetPackageRoot)"
         LicenseTemplateDir="$(MSBuildThisFileDirectory)licenses"
         Product="$(ThirdPartyNoticesProduct)"
-        OutputFile="$(_ThirdPartyNoticesFile)" />
+        OutputFile="$(_ThirdPartyNoticesFile)"
+        RepositoryNotice="$(MSBuildThisFileDirectory)..\NOTICE" />
     <ItemGroup>
       <ResolvedFileToPublish Include="$(_ThirdPartyNoticesFile)" RelativePath="$(ThirdPartyNoticesFileName)"
                              CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
