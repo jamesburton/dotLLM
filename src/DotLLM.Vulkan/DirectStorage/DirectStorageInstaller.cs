@@ -46,7 +46,9 @@ public static class DirectStorageInstaller
     /// directory, then <see cref="InstallDirectory"/> (<c>DOTLLM_DIRECTSTORAGE_DIR</c> or <c>~/.dotllm/native/directstorage</c>). Never the current
     /// directory or <c>PATH</c>: the DLL is loaded by full path (<see cref="TryLoad"/>), so a planted copy elsewhere cannot be picked up.
     /// </summary>
-    public static string? FindDll() => FindDll(AppContext.BaseDirectory, InstallDirectory);
+    public static string? FindDll() => FindDll(
+        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_DIRECTSTORAGE_SKIP_APPDIR"), "1", StringComparison.Ordinal) ? null : AppContext.BaseDirectory,
+        InstallDirectory);   // SKIP_APPDIR=1: diagnostic/test knob, search only the install directory (reproduces the post-fetch layout)
 
     /// <summary><see cref="FindDll()"/> with explicit directories (testable).</summary>
     internal static string? FindDll(string? appDir, string? installDir)

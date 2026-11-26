@@ -146,4 +146,61 @@ public class DirectStorageDefaultTests(ITestOutputHelper output)
             try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch (IOException) { }
         }
     }
+
+    /// <summary>
+    /// Regression guard for the #1994 E_NOTIMPL bug: a real model load on an integrated GPU, with the DLL pair ONLY in the install directory
+    /// (app-dir search disabled, the layout after the NuGet fetch), must read tensors through DirectStorage and stage none. dstorage.dll loads
+    /// dstoragecore.dll by bare name at DStorageGetFactory time, so without a by-full-path preload the factory returns 0x80004001 and every tensor
+    /// is declined. Runs in a child process because the DLL modules are process-global. Skipped only when the DLL pair or a GPU/model is absent.
+    /// </summary>
+    [SkippableFact]
+    public void RealLoad_FromInstallDirOnly_ReadsTensorsThroughDirectStorage_AndStagesNone()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        Skip.IfNot(OperatingSystem.IsWindows(), "Windows only");
+        string? dll = DirectStorageInstaller.FindDll();
+        Skip.If(dll is null, "dstorage.dll pair not available");
+        using (var device = VulkanDevice.Create())
+            Skip.IfNot(device.HasExternalMemoryWin32 && device.PhysicalDeviceTypeValue == DotLLM.Vulkan.Interop.VkPhysicalDeviceType.IntegratedGpu,
+                "needs an integrated device with VK_KHR_external_memory_win32");
+        string? model = Environment.GetEnvironmentVariable("DOTLLM_SMOLLM_135M_Q8_0_GGUF");
+        if (string.IsNullOrEmpty(model))
+            model = DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path;
+        Skip.If(model is null, "SmolLM-135M Q8_0 not found");
+        string cli = Path.Combine(AppContext.BaseDirectory, "DotLLM.Cli.exe");
+        Skip.IfNot(File.Exists(cli), "DotLLM.Cli.exe not in the test output");
+
+        string installDir = Path.Combine(Path.GetTempPath(), "dotllm-dsinst-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(installDir);
+        try
+        {
+            string srcDir = Path.GetDirectoryName(dll)!;
+            File.Copy(Path.Combine(srcDir, "dstorage.dll"), Path.Combine(installDir, "dstorage.dll"));
+            File.Copy(Path.Combine(srcDir, "dstoragecore.dll"), Path.Combine(installDir, "dstoragecore.dll"));
+            var psi = new System.Diagnostics.ProcessStartInfo(cli)
+            {
+                ArgumentList = { "run", model!, "-d", "vulkan", "-p", "Hello", "-n", "2", "-t", "0" },
+                RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, WorkingDirectory = installDir,
+            };
+            psi.Environment["DOTLLM_DIRECTSTORAGE_DIR"] = installDir;
+            psi.Environment["DOTLLM_DIRECTSTORAGE_SKIP_APPDIR"] = "1";
+            psi.Environment["DOTLLM_NO_PROMPT"] = "1";
+            psi.Environment["DOTLLM_VULKAN_MEM_TRACE"] = "1";
+            psi.Environment.Remove("DOTLLM_VULKAN_DIRECT_STORAGE");
+            psi.Environment.Remove("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE");
+            using var p = System.Diagnostics.Process.Start(psi)!;
+            var err = p.StandardError.ReadToEndAsync(); var outp = p.StandardOutput.ReadToEndAsync();
+            Assert.True(p.WaitForExit(180_000), "child timed out");
+            string log = err.Result + outp.Result;
+            string ledger = log.Split(Environment.NewLine).Last(l => l.Contains("host-import:", StringComparison.Ordinal));
+            output.WriteLine(ledger);
+            var m = System.Text.RegularExpressions.Regex.Match(ledger, @"(\d+) tensors / [\d.]+ MiB direct-storage.*?; (\d+) tensors / [\d.]+ MiB staged",
+                System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(2));
+            Assert.True(m.Success, ledger);
+            Assert.True(int.Parse(m.Groups[1].Value) > 0, "DirectStorage read no tensors: " + ledger);
+            Assert.Equal(0, int.Parse(m.Groups[2].Value));
+            Assert.DoesNotContain("DStorageGetFactory", log, StringComparison.Ordinal);
+        }
+        finally { try { Directory.Delete(installDir, recursive: true); } catch (IOException) { } }
+    }
 }
