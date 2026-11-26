@@ -45,7 +45,15 @@ public sealed class MtpAdaptiveGate
     /// <summary>An arm slower than the winner by more than this ratio is "clearly losing": its re-probe interval doubles (a probe of a 0.8x arm costs a fifth of one request).</summary>
     public const double ClearLossRatio = 1.10;
 
+    /// <summary>Prompt lengths up to this many tokens use the gate itself (band 0); longer prompts get their own band per doubling (see <see cref="ForContext"/>).</summary>
+    public const int ShortContextTokens = 512;
+
+    /// <summary>Number of context bands (band 0 plus one per doubling of the prompt length above <see cref="ShortContextTokens"/>, the last one open-ended).</summary>
+    public const int ContextBands = 7;
+
     private readonly bool _tryMtpFirst;
+    private readonly long _modelBytes;
+    private readonly MtpAdaptiveGate?[] _bands = new MtpAdaptiveGate?[ContextBands];
     private readonly object _lock = new();
     private int _reprobeEvery = ReprobeEvery;
 
@@ -56,10 +64,39 @@ public sealed class MtpAdaptiveGate
     public MtpCostModel CostModel { get; } = new();
 
     /// <param name="modelBytes">Resident model size in bytes; selects which arm is explored first.</param>
-    public MtpAdaptiveGate(long modelBytes = long.MaxValue) => _tryMtpFirst = modelBytes >= MtpPriorMinModelBytes;
+    public MtpAdaptiveGate(long modelBytes = long.MaxValue)
+    {
+        _modelBytes = modelBytes;
+        _tryMtpFirst = modelBytes >= MtpPriorMinModelBytes;
+    }
+
+    /// <summary>Band index of a prompt of <paramref name="contextTokens"/> tokens: 0 up to <see cref="ShortContextTokens"/>, then one per doubling.</summary>
+    public static int BandOf(int contextTokens)
+    {
+        if (contextTokens <= ShortContextTokens) return 0;
+        int band = 1;
+        for (long limit = ShortContextTokens * 2L; contextTokens > limit && band < ContextBands - 1; limit *= 2) band++;
+        return band;
+    }
+
+    /// <summary>
+    /// The gate that owns the measurements for a prompt of <paramref name="contextTokens"/> tokens. MTP's break-even moves with context (Edge0-145B on
+    /// Vulkan: 1.6-1.8x plain at 50-100 tokens, slower than plain at 2.4K because acceptance falls and verify rows cost more), so one verdict per model
+    /// would be wrong at one end or the other. Band 0 (up to <see cref="ShortContextTokens"/> tokens) is this gate; every longer band is a lazily created
+    /// sibling with its own arms, re-probe schedule and <see cref="CostModel"/>, so a loss measured at 2.4K is remembered at 2.4K and never charged to
+    /// short prompts (and vice versa).
+    /// </summary>
+    public MtpAdaptiveGate ForContext(int contextTokens)
+    {
+        int band = BandOf(contextTokens);
+        if (band == 0) return this;
+        lock (_lock) return _bands[band] ??= new MtpAdaptiveGate(_modelBytes);
+    }
     private double _plainMsPerToken, _mtpMsPerToken;
     private int _plainSamples, _mtpSamples;
     private int _sinceReprobe;
+    // True while the MTP arm holds only fall-back estimates (RecordFallback): the next real MTP segment replaces it instead of blending in.
+    private bool _mtpProvisional;
 
     /// <summary>
     /// Forgets every measurement (arms, re-probe schedule, cost model) and starts again from the size prior. The server calls this after its warm-up:
@@ -73,7 +110,9 @@ public sealed class MtpAdaptiveGate
             _plainMsPerToken = _mtpMsPerToken = 0;
             _plainSamples = _mtpSamples = 0;
             _sinceReprobe = 0;
+            _mtpProvisional = false;
             _reprobeEvery = ReprobeEvery;
+            foreach (var b in _bands) b?.Reset();
         }
         CostModel.Reset();
     }
@@ -165,6 +204,19 @@ public sealed class MtpAdaptiveGate
         }
     }
 
+    /// <summary>
+    /// Records the measured loss of a request that dropped MTP mid-way (<see cref="MtpRoundController.ShouldFallBack"/>). The fall-back fires after
+    /// <see cref="MtpRoundController.MinRoundsForFallback"/> rounds, which commit about 9 tokens: fewer than <see cref="MinSampleTokens"/>, so
+    /// <see cref="RecordSegment"/> discarded that segment and the MTP arm stayed unmeasured. Every request then retried MTP, fell back again and paid
+    /// the rounds again, forever (found on Edge0, #2018). The figure the controller decided on (the cost model's best-K ms per generated token, which
+    /// excludes the cold first round) is the MTP sample instead.
+    /// <para>It is an estimate from a handful of rounds (one stall made one 700 ms), so it is provisional: the next real MTP segment
+    /// (<see cref="RecordSegment"/>) replaces it instead of blending in at the EMA weight. Blending would leave a 10x-plain estimate losing for nine
+    /// re-probes against real MTP at 0.6x plain, and the back-off would stretch those over some 2,900 requests.</para>
+    /// </summary>
+    /// <param name="msPerToken">The cost model's best predicted ms per generated token at the time of the fall-back.</param>
+    internal void RecordFallback(double msPerToken) => RecordSample(usedMtp: true, msPerToken, provisional: true);
+
     /// <summary>True unless <c>DOTLLM_MTP_CALIBRATE</c> is <c>0</c>.</summary>
     public static bool CalibrationEnabled { get; } = Environment.GetEnvironmentVariable("DOTLLM_MTP_CALIBRATE") != "0";
 
@@ -181,12 +233,19 @@ public sealed class MtpAdaptiveGate
         if (decodeTokens < MinSampleTokens || decodeMs <= 0)
             return;
 
-        double perToken = decodeMs / decodeTokens;
+        RecordSample(usedMtp, decodeMs / decodeTokens);
+    }
+
+    private void RecordSample(bool usedMtp, double perToken, bool provisional = false)
+    {
+        if (perToken <= 0) return;
         lock (_lock)
         {
             if (usedMtp)
             {
-                _mtpMsPerToken = _mtpSamples == 0 ? perToken : _mtpMsPerToken + Alpha * (perToken - _mtpMsPerToken);
+                bool replace = _mtpSamples == 0 || (_mtpProvisional && !provisional);
+                _mtpMsPerToken = replace ? perToken : _mtpMsPerToken + Alpha * (perToken - _mtpMsPerToken);
+                _mtpProvisional = provisional && (_mtpSamples == 0 || _mtpProvisional);
                 _mtpSamples++;
             }
             else

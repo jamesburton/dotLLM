@@ -586,17 +586,20 @@ public sealed class MtpSpeculativeDecoderTests
             HiddenSize = HiddenSize,
             IntermediateSize = HiddenSize * 4,
             HeadDim = HeadDim,
-            MaxSequenceLength = MaxSeqLen,
+            MaxSequenceLength = this.MaxSequenceLength,
             Architecture = Architecture.Llama,
         };
 
         public long ComputeMemoryBytes { get; init; }
 
+        /// <summary>Context length the mock reports (default 256); the context-band tests need prompts above 512 tokens.</summary>
+        public int MaxSequenceLength { get; init; } = MaxSeqLen;
+
         public void Dispose() { }
 
         public bool SupportsMtp => _supportsMtp;
 
-        public IMtpState? CreateMtpState() => CreateMtpState(MaxSeqLen);
+        public IMtpState? CreateMtpState() => CreateMtpState(MaxSequenceLength);
 
         public IMtpState? CreateMtpState(int maxSequenceLength) =>
             _supportsMtp ? new CpuMtpState(HiddenSize, MtpNumKvHeads, MtpHeadDim, maxSequenceLength) : null;

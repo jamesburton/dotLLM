@@ -473,7 +473,7 @@ public sealed partial class TextGenerator
         // MTP needs the whole sequence absorbed into its head from position 0 (issue #469). A
         // prefix-cache hit skips the cached prefix's forward, so it decodes with MTP only when the
         // snapshot kept the head state that absorbed that prefix (issue #1088).
-        var mtpGate = GateFor(pipeline.IsStochastic);
+        var mtpGate = GateFor(pipeline.IsStochastic)?.ForContext(promptLen);
         var resumedMtp = TakeResumedMtpState();
         bool useMtp = ShouldUseMtp(captureLogprobs) && (cachedTokenCount == 0 || resumedMtp is not null)
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
@@ -851,7 +851,7 @@ public sealed partial class TextGenerator
                         if (pos >= cacheSize) break;
 
                         // The measured MTP round cost per token is above plain decode's: finish this request on the plain loop below.
-                        if (mtpCtl is not null && mtpCtl.ShouldFallBack(mtpGate!.PlainMsPerToken)) { mtpFallbackStep = step; break; }
+                        if (mtpCtl is not null && mtpCtl.ShouldFallBack(mtpGate!.PlainMsPerToken)) { mtpFallbackStep = step; mtpCtl.RecordFallback(); break; }
 
                         int remaining = maxTokens - step;
                         int k = mtpCtl?.NextK(remaining) ?? Math.Min(_mtpCandidates, remaining);
@@ -1009,7 +1009,7 @@ public sealed partial class TextGenerator
                 prefillTicks * 1000.0 / Stopwatch.Frequency,
                 decodeTicks * 1000.0 / Stopwatch.Frequency,
                 finishReason);
-            RecordMtpGate(mtpGate, useMtp, generatedIds.Count, mtpTicks, mtpTokens, decodeTicks, samplerTicks);
+            RecordMtpGate(mtpGate, useMtp, generatedIds.Count, mtpTicks, mtpTokens, decodeTicks, samplerTicks, fellBack: mtpFallbackStep > 0);
             return BuildResponse(promptLen, generatedIds, finishReason,
                 prefillTicks, decodeTicks, samplerTicks, GetKvCacheBytes(kvCache), cachedTokenCount,
                 specDrafted, specAccepted, specSteps, logprobsList?.ToArray(),
@@ -1102,7 +1102,7 @@ public sealed partial class TextGenerator
         long kvBytes = GetKvCacheBytes(kvCache);
 
         // Hybrid mode: same gating as the non-streaming path, MTP on a prefix hit included (issue #1088).
-        var mtpGate = GateFor(pipeline.IsStochastic);
+        var mtpGate = GateFor(pipeline.IsStochastic)?.ForContext(promptLen);
         var resumedMtp = TakeResumedMtpState();
         bool useMtp = ShouldUseMtp(captureLogprobs) && (cachedTokenCount == 0 || resumedMtp is not null)
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
@@ -1125,6 +1125,7 @@ public sealed partial class TextGenerator
         long prefillTicks = 0;
         long decodeTicks = 0;
         long mtpTicks = 0; int mtpTokens = 0;   // MTP-segment wall ticks / committed tokens, for the adaptive gate (read in the finally)
+        int mtpFallbackStep = 0;                // > 0: the MTP rounds measured slower than plain decode; plain decode resumes at this step (#900)
         long samplerTicks = 0;
 
         try
@@ -1293,7 +1294,6 @@ public sealed partial class TextGenerator
             int specDrafted = 0, specAccepted = 0, specSteps = 0;
             bool useDraftSpec = _draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options);
             bool useLookupSpec = UsePromptLookup(useDraftSpec, useMtp, captureLogprobs, options);
-            int mtpFallbackStep = 0;                // > 0: the MTP rounds measured slower than plain decode; plain decode resumes at this step (#900)
 
             // Speculative decode disabled when logprobs requested — no per-position logit access.
             // Also disabled when sampling isn't effectively greedy (see Wave 8 / issue #121).
@@ -1416,7 +1416,7 @@ public sealed partial class TextGenerator
                         if (pos >= cacheSize) break;
 
                         // See the non-streaming loop: fall back to plain decode when MTP measures slower.
-                        if (mtpCtl is not null && mtpCtl.ShouldFallBack(mtpGate!.PlainMsPerToken)) { mtpFallbackStep = step; break; }
+                        if (mtpCtl is not null && mtpCtl.ShouldFallBack(mtpGate!.PlainMsPerToken)) { mtpFallbackStep = step; mtpCtl.RecordFallback(); break; }
 
                         int remaining = maxTokens - step;
                         int kk = mtpCtl?.NextK(remaining) ?? Math.Min(_mtpCandidates, remaining);
@@ -1587,7 +1587,7 @@ public sealed partial class TextGenerator
                 prefillTicks * 1000.0 / Stopwatch.Frequency,
                 decodeTicks * 1000.0 / Stopwatch.Frequency,
                 FinishReason.Length);
-            RecordMtpGate(mtpGate, useMtp, generatedIds.Count, mtpTicks, mtpTokens, decodeTicks, samplerTicks);
+            RecordMtpGate(mtpGate, useMtp, generatedIds.Count, mtpTicks, mtpTokens, decodeTicks, samplerTicks, fellBack: mtpFallbackStep > 0);
             DropRecurrentPrefixIfRequestFailed();
             ArrayPool<char>.Shared.Return(stopScratch);
             ReleaseRequestMtpState(mtpState);
@@ -2450,7 +2450,7 @@ public sealed partial class TextGenerator
     /// an MTP sample from its round wall time (the rounds already contain their sampling) and, when it fell back to plain decode mid-request, a plain
     /// sample from the tail.
     /// </summary>
-    private static void RecordMtpGate(MtpAdaptiveGate? gate, bool usedMtp, int generated, long mtpTicks, int mtpTokens, long decodeTicks, long samplerTicks)
+    private static void RecordMtpGate(MtpAdaptiveGate? gate, bool usedMtp, int generated, long mtpTicks, int mtpTokens, long decodeTicks, long samplerTicks, bool fellBack = false)
     {
         if (gate is null) return;
         if (MtpAdaptiveGate.TraceEnabled)
@@ -2460,7 +2460,9 @@ public sealed partial class TextGenerator
             gate.Record(false, generated, (decodeTicks + samplerTicks) * 1000.0 / Stopwatch.Frequency);
             return;
         }
-        gate.RecordSegment(true, mtpTokens, mtpTicks * 1000.0 / Stopwatch.Frequency);
+        // A fall-back already recorded the loss through the controller (RecordFallback); its short segment would be dropped or double-counted here.
+        if (!fellBack)
+            gate.RecordSegment(true, mtpTokens, mtpTicks * 1000.0 / Stopwatch.Frequency);
         int plainTokens = generated - 1 - mtpTokens;
         if (plainTokens > 0)
             gate.RecordSegment(false, plainTokens, (decodeTicks - mtpTicks + samplerTicks) * 1000.0 / Stopwatch.Frequency);
