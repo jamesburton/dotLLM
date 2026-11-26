@@ -569,7 +569,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     }
 
     private static MoeLayerWeights LoadMoe(int il, GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, ModelConfig config, List<nint> owned,
-        bool requantRoutedBanks = false, bool edge0 = false)
+        bool requantRoutedBanks = false, bool edge0 = false, bool skipRoutedBanks = false)
     {
         var moe = config.Moe!;
         string p = $"blk.{il}.";
@@ -591,12 +591,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
 
         // Edge0 (G3, #1981): no routed-expert tensors here (they come from the pack) and the router stays BF16 on disk (uploaded raw by the Edge0 loader).
         GgufTensorDescriptor gateD = default, upD = default, downD = default;
-        if (!edge0) { gateD = t[p + "ffn_gate_exps.weight"]; upD = t[p + "ffn_up_exps.weight"]; downD = t[p + "ffn_down_exps.weight"]; }
+        if (!edge0 && !skipRoutedBanks) { gateD = t[p + "ffn_gate_exps.weight"]; upD = t[p + "ffn_up_exps.weight"]; downD = t[p + "ffn_down_exps.weight"]; }
         var sg = t[p + "ffn_gate_shexp.weight"]; var su = t[p + "ffn_up_shexp.weight"]; var sd = t[p + "ffn_down_shexp.weight"];
         // #900: a smaller routed bank for the MTP head. Gate/up -> Q4_K (the fused decode chain and the multi-row MMVQ twin read it), down -> Q5_1
         // (K = the 640-wide intermediate is not a multiple of 256, so no K-quant fits; Q5_1 has a decode MMVQ). Draft quality only: the verify
         // forward decides every emitted token.
-        nint gateP = edge0 ? 0 : gguf.TensorDataPointer(gateD), upP = edge0 ? 0 : gguf.TensorDataPointer(upD), downP = edge0 ? 0 : gguf.TensorDataPointer(downD);
+        nint gateP = edge0 || skipRoutedBanks ? 0 : gguf.TensorDataPointer(gateD), upP = edge0 || skipRoutedBanks ? 0 : gguf.TensorDataPointer(upD), downP = edge0 || skipRoutedBanks ? 0 : gguf.TensorDataPointer(downD);
         QuantizationType gateQt = gateD.QuantizationType, upQt = upD.QuantizationType, downQt = downD.QuantizationType;
         if (requantRoutedBanks)
         {

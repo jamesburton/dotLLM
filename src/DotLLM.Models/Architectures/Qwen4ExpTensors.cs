@@ -142,7 +142,7 @@ public static class Qwen4ExpTensors
         {
             // The MTP block is a full-attention (QSA) block, never a GDN one; it has no PLE module.
             int il = config.NumLayers;
-            foreach (var e in BlockTensors(config, q4, gdn, moe, il, attention: true, hasPle: false))
+            foreach (var e in BlockTensors(config, q4, gdn, moe, il, attention: true, hasPle: false, skeleton))
                 yield return e;
 
             yield return new Expected(Block(il, Suffix.NextnEhProj), [2 * embd, embd]);
