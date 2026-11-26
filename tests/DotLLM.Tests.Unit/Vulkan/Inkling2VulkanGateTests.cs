@@ -72,6 +72,7 @@ public sealed class Inkling2VulkanGateTests
     [InlineData("nvfp4-passage-c256-fa-off-logscale-floor1.kld", "f16", false, 1)]
     [InlineData("nvfp4-wikitext-c1280-fa-off.kld", "f16", false, 0)]
     [InlineData("nvfp4-wikitext-c1280-fa-off.kld", "q8_0", false, 0)]
+    [InlineData("nvfp4-wikitext-c1280-fa-off.kld", "f16", true, 0)]
     public void Oracle_Gate(string kld, string kv, bool f32Act, int logFloor)
     {
         SkipUnlessGpu();
