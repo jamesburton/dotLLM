@@ -81,6 +81,7 @@ public class VulkanRealLoadHostImportTests(ITestOutputHelper output)
         try
         {
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT", null);
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DIRECT_STORAGE", "0");   // #1994: these tests characterise the mmap import path, not the DirectStorage default
 
             using var gguf = GgufFile.Open(path!);
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -128,6 +129,7 @@ public class VulkanRealLoadHostImportTests(ITestOutputHelper output)
         finally
         {
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT", originalDisable);
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DIRECT_STORAGE", null);
         }
     }
 }

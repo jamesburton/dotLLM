@@ -263,7 +263,8 @@ internal static class VulkanQwen3MoeMoeUpload
         bool parallelUpload = !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PARALLEL_UPLOAD"), "0", StringComparison.Ordinal);
         using var upStaging = parallelUpload
             ? VulkanStagingBuffer.CreateParallel(device, VulkanStagingBuffer.ParallelSlotBytes, VulkanStagingBuffer.ParallelSlotCount) : null;
-        using var prealloc = parallelUpload && expertSlots == 0
+        // #1994: with DirectStorage active the banks are read straight into their own heaps, so allocating them ahead would only waste device memory.
+        using var prealloc = parallelUpload && expertSlots == 0 && !VulkanWeightImportPolicy.DirectTierActive(device)
             && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_BANK_PREALLOC"), "0", StringComparison.Ordinal) ? new VulkanBankPrealloc(device) : null;
 
         const int AllocAhead = 2;
@@ -528,6 +529,15 @@ internal static class VulkanQwen3MoeMoeUpload
     private static VulkanDevice.Buffer AllocateSlotBank(VulkanDevice device, QuantizationType quantType, QuantizationType sourceQt, char kind, int slots, int mDim, int kDim)
         => device.AllocateDeviceLocal(slots * TieredExpertBytes(quantType, sourceQt, kind, mDim, kDim));
 
+    /// <summary>The raw GGUF pointer of routed bank <paramref name="kind"/> when its stored quant type is <paramref name="quantType"/>, else null.</summary>
+    private static nint? RawBankPointer(MoeLayerWeights moe, char kind, QuantizationType quantType) => kind switch
+    {
+        'G' when moe.GateExpsRawQt == quantType => moe.GateExpsRaw,
+        'D' when moe.DownExpsRawQt == quantType => moe.DownExpsRaw,
+        'U' when moe.UpExpsRawQt == quantType => moe.UpExpsRaw,
+        _ => null,
+    };
+
     /// <summary>
     /// Allocates and uploads ONE routed bank at its resolved quant type —
     /// either resident-quant raw bytes or an F32 dequant, chosen independently
@@ -552,8 +562,14 @@ internal static class VulkanQwen3MoeMoeUpload
             long rowBytes = Dequantize.RowByteSize(kDim, quantType);
             long perExpertBytes = rowBytes * mDim;
             long bankBytes = (long)numE * perExpertBytes;
+            // #1994: the fused [E,M,K] bank is one contiguous byte-identical range of the GGUF, so DirectStorage can read it straight into a
+            // device-local heap (no host copy, no file-page import penalty #1991).
+            if (moe.HasRawQuantView && RawBankPointer(moe, kind, quantType) is { } rawSrc and not 0
+                && VulkanWeightImportPolicy.TryLoadDirect(device, rawSrc, bankBytes, out var direct))
+                return direct!;
             var bank = prealloc?.Take(bankBytes) ?? device.AllocateDeviceLocal(bankBytes);
             UploadRoutedBankResidentQuant(device, staging, moe, quantType, kind, bank, numE, perExpertBytes);
+            VulkanWeightImportPolicy.NoteBankStaged(bankBytes);
             return bank;
         }
     }
