@@ -23,6 +23,8 @@ public sealed class Inkling2RealModelTests
     private readonly ITestOutputHelper _output;
     public Inkling2RealModelTests(ITestOutputHelper output) => _output = output;
 
+    internal static string OracleDirPath => OracleDir;
+
     private static string OracleDir => Environment.GetEnvironmentVariable("DOTLLM_INKLING2_ORACLE_DIR")
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotllm", "test-cache", "token-oracles", "inkling2");
 

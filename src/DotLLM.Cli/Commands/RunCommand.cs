@@ -36,6 +36,15 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [Description("Input prompt for generation. Required unless --prompt-file is given.")]
         public string? Prompt { get; set; }
 
+        [CommandOption("--image")]
+        [Description("Image file (PNG or binary PPM) to include in the prompt; repeatable. Needs a vision model (Inkling 2) and its mmproj GGUF " +
+                     "(--mmproj, or an mmproj*.gguf next to the model). The prompt is wrapped as one user turn: the images first, then the text.")]
+        public string[] Images { get; set; } = Array.Empty<string>();
+
+        [CommandOption("--mmproj")]
+        [Description("Vision projector GGUF (mmproj) for --image. Default: the first mmproj*.gguf in the model's directory.")]
+        public string? Mmproj { get; set; }
+
         [CommandOption("--prompt-file")]
         [Description("Read the prompt from a file instead of --prompt. " +
                      "A single trailing newline is stripped. Mutually exclusive with --prompt.")]
@@ -752,6 +761,47 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
         var toolChoice = ChatCommand.ParseToolChoice(settings.ToolChoiceStr, tools);
 
+        // Image input (#2035): encode the images, wrap the prompt as one chat turn of content parts (images first, then the text) through
+        // the model's own template; the engine widens each rendered placeholder to the image's token count.
+        List<DotLLM.Core.Vision.ImageEmbeddings>? imageEmbeddings = null;
+        if (settings.Images.Length > 0)
+        {
+            try
+            {
+                if (model is not DotLLM.Core.Vision.IImageInputModel)
+                    throw new NotSupportedException($"--image: the {config.Architecture} model does not accept image input (supported: Inkling 2 on the CPU backend).");
+                if (gguf is null) throw new NotSupportedException("--image needs a GGUF model with an embedded chat template.");
+                string? mmproj = settings.Mmproj ?? DotLLM.Models.Vision.VisionSupport.FindMmproj(resolvedPath!);
+                if (mmproj is null || !File.Exists(mmproj))
+                    throw new FileNotFoundException("--image: no vision projector found; pass --mmproj <mmproj-*.gguf> (or place it next to the model).");
+                var parts = new List<ChatContentPart>();
+                imageEmbeddings = new List<DotLLM.Core.Vision.ImageEmbeddings>();
+                using (var encoder = DotLLM.Models.Vision.VisionSupport.LoadEncoder(mmproj, threadingInfo))
+                {
+                    foreach (string path in settings.Images)
+                    {
+                        var img = DotLLM.Models.Vision.ImageDecoder.Load(path);
+                        imageEmbeddings.Add(encoder.Encode(img));
+                        parts.Add(new ChatContentPart { Type = "image_url", ImageUrl = "file:" + Path.GetFileName(path) });
+                    }
+                }
+                parts.Add(new ChatContentPart { Type = "text", Text = prompt });
+                var imageTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer, config.Architecture)
+                    ?? throw new NotSupportedException("--image: the model has no chat template that can place images.");
+                effectivePrompt = imageTemplate.Apply(
+                    new List<ChatMessage> { new() { Role = "user", Content = prompt, ContentParts = parts } },
+                    new ChatTemplateOptions { AddGenerationPrompt = true });
+            }
+            catch (Exception ex) when (ex is NotSupportedException or FileNotFoundException or InvalidDataException or IOException or ArgumentException)
+            {
+                if (settings.Json) Console.Error.WriteLine($"Error: {ex.Message}");
+                else AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+                if (imageEmbeddings is not null) foreach (var e in imageEmbeddings) e.Dispose();
+                model.Dispose(); gguf?.Dispose(); safetensorsSource?.Dispose();
+                return 1;
+            }
+        }
+
         // Build inference options from CLI flags
         var responseFormat = settings.ResponseFormat.ToLowerInvariant() switch
         {
@@ -800,7 +850,10 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             MaxTokens = settings.MaxTokens,
             Seed = settings.Seed,
             ResponseFormat = responseFormat,
-            Threading = threadingInfo
+            Threading = threadingInfo,
+            Images = imageEmbeddings,
+            ImagePlaceholderTokenId = imageEmbeddings is null ? null : tokenizer.Encode(DotLLM.Models.Vision.VisionSupport.Inkling2ImageToken) is { Length: 1 } ph ? ph[0]
+                : throw new InvalidOperationException("the tokenizer does not map the image placeholder to a single token")
         };
 
         if (!settings.Json)

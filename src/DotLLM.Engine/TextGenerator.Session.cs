@@ -109,7 +109,10 @@ public sealed partial class TextGenerator
     internal ITokenizer SessionTokenizer => _tokenizer;
 
     internal ITensor SessionForwardPrefill(int[] tokens, int start, int length, IKvCache kv, CancellationToken cancellationToken)
-        => ForwardPrefill(tokens, start, length, kv, adapter: null, cancellationToken: cancellationToken);
+    {
+        _requestImages = null;   // sessions carry no images (#2035)
+        return ForwardPrefill(tokens, start, length, kv, adapter: null, cancellationToken: cancellationToken);
+    }
 
     internal void ReleaseSession()
     {

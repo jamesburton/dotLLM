@@ -99,6 +99,20 @@ public sealed class JinjaChatTemplate : IChatTemplate
                 ["content"] = Guard(msg.Content, msg.Role == "assistant" ? _assistantExempt : null),
             };
 
+            if (msg.ContentParts is { Count: > 0 } parts)
+            {
+                // Multimodal turn (#2035): the template sees the OpenAI content-part list.
+                var list = new List<object?>();
+                foreach (var part in parts)
+                {
+                    var pd = new Dictionary<string, object?> { ["type"] = Guard(part.Type) };
+                    if (part.Text is not null) pd["text"] = Guard(part.Text);
+                    if (part.ImageUrl is not null) pd["image_url"] = new Dictionary<string, object?> { ["url"] = Guard(part.ImageUrl) };
+                    list.Add(pd);
+                }
+                dict["content"] = list;
+            }
+
             if (msg.ToolCalls is { Length: > 0 })
             {
                 var toolCalls = new List<object?>();

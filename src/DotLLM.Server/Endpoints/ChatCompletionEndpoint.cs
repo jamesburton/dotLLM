@@ -168,6 +168,26 @@ public static class ChatCompletionEndpoint
             return;
         }
 
+        // Image input (#2035): encode the request's images with the model's vision projector; the engine widens each rendered placeholder to the
+        // image's token count. A request with images bypasses the batch scheduler (it carries token ids only) and reuses no prefix.
+        System.Collections.Generic.List<DotLLM.Core.Vision.ImageEmbeddings>? imageEmbeddings = null;
+        var imageUrls = RequestConverter.ImageUrls(request.Messages);
+        if (imageUrls.Count > 0)
+        {
+            try
+            {
+                imageEmbeddings = await ImageInput.EncodeAsync(state, imageUrls, ct);
+                var placeholder = state.Tokenizer!.Encode(DotLLM.Models.Vision.VisionSupport.Inkling2ImageToken);
+                if (placeholder.Length != 1) throw new ImageInputException("The tokenizer does not define the image placeholder token.");
+                options = options with { Images = imageEmbeddings, ImagePlaceholderTokenId = placeholder[0] };
+            }
+            catch (ImageInputException ex)
+            {
+                await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(ex.Message, param: "messages", code: "invalid_image"), keepAlive);
+                return;
+            }
+        }
+
         // Diffusion routing: when the loaded model is a masked text-diffusion model, generation runs
         // through DiffusionTextGenerator (canvas denoising) instead of the autoregressive TextGenerator.
         // AR models leave DiffusionGenerator null and fall through to the unchanged path below.
@@ -195,12 +215,19 @@ public static class ChatCompletionEndpoint
             return;
         }
 
-        if (request.Stream)
-            await HandleStreamingAsync(request, state, httpContext, prompt, options,
-                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, forcedToolCall, keepAlive, chunkCache);
-        else
-            await HandleNonStreamingAsync(request, state, httpContext, prompt, options,
-                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, chunkCache);
+        try
+        {
+            if (request.Stream)
+                await HandleStreamingAsync(request, state, httpContext, prompt, options,
+                    requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, forcedToolCall, keepAlive, chunkCache);
+            else
+                await HandleNonStreamingAsync(request, state, httpContext, prompt, options,
+                    requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, chunkCache);
+        }
+        finally
+        {
+            if (imageEmbeddings is not null) foreach (var e in imageEmbeddings) e.Dispose();
+        }
     }
 
     /// <summary>A chat request rendered for the model: what generation and the chunk cache both work from.</summary>
@@ -280,7 +307,7 @@ public static class ChatCompletionEndpoint
         // Route through the continuous-batch scheduler when it's the right shape for it: no LoRA
         // adapter, no logprobs capture. Multiple concurrent requests pipeline through one model
         // dispatch per scheduler iteration.
-        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
+        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs && options.Images is null)
         {
             int[] promptIds = state.Tokenizer!.Encode(prompt);
             var inFlight = new Task<InferenceResponse>[choiceCount];
@@ -478,7 +505,7 @@ public static class ChatCompletionEndpoint
         ChunkCacheExchange? chunkCache = null)
     {
         // (#1266) Same routing as the non-streaming path: on the scheduler, with no gate or model lease.
-        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
+        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs && options.Images is null)
         {
             return WriteChatStreamAsync(
                 request, httpContext,
