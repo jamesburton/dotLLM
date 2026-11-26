@@ -437,13 +437,25 @@ public sealed unsafe class VulkanOlalaTransformerModel : IModel
 
     private static uint F(float f) => BitConverter.SingleToUInt32Bits(f);
 
+    /// <summary>Q8_0 prefill GEMV tile: columns (tokens) and output rows per workgroup. Internal so tests can pin the tile they exercise.</summary>
+    internal const int PrefillQ8Cols = 16, PrefillQ8Rows = 2;
+
     /// <summary><c>y[T, M] = epilogue(W[M, K] x[T, K])</c>; epi 0 none, 1 relu^2, 2 add <paramref name="aux"/>; <paramref name="f32Out"/> stores logits to F32.</summary>
     private void Gemv(Mat w, VulkanDevice.Buffer x, VulkanDevice.Buffer y, int T, int epi = 0, VulkanDevice.Buffer? aux = null, bool f32Out = false, long xOff = 0)
     {
-        int nc = T == 1 ? 1 : 8;
-        var k = Kernel($"gemv|{nc}|{epi}|{(f32Out ? 1 : 0)}|{Wt(w.Qt)}", "olala_gemv_" + Wt(w.Qt), 5, 4, (uint)nc, (uint)epi, f32Out ? 1u : 0u);
+        // Prefill tile (#2006): Q8_0 workgroups own 2 output rows x 16 columns (the activation reads dominated, so rows sharing one read of x paid
+        // off most; 4 rows x 8 columns is as fast, 16 columns x 4 rows spills); BF16 / Q6_K keep 1 row x 8 columns.
+        bool q8Tile = T > 1 && w.Qt == QuantizationType.Q8_0;
+        int nc = T == 1 ? 1 : q8Tile ? PrefillQ8Cols : 8;
+        // The shader reads the activation as 16-byte vectors (#2006): column 0 must start on an 8-element boundary.
+        if ((xOff & 7) != 0 || (w.In & 7) != 0) throw new InvalidOperationException($"olala gemv needs xOff and K to be multiples of 8 (xOff {xOff}, K {w.In}).");
+        int rows = q8Tile ? PrefillQ8Rows : 1;
+        var k = rows > 1
+            ? Kernel($"gemv|{nc}|{epi}|{(f32Out ? 1 : 0)}|{Wt(w.Qt)}|r{rows}", "olala_gemv_" + Wt(w.Qt), 5, 4, (uint)nc, (uint)epi, f32Out ? 1u : 0u, (uint)rows)
+            : Kernel($"gemv|{nc}|{epi}|{(f32Out ? 1 : 0)}|{Wt(w.Qt)}", "olala_gemv_" + Wt(w.Qt), 5, 4, (uint)nc, (uint)epi, f32Out ? 1u : 0u);
         uint M = (uint)w.Out;
-        uint gx = Math.Min(M, 32768u), gy = (M + 32767u) / 32768u, gz = (uint)((T + nc - 1) / nc);
+        uint groups = (M + (uint)rows - 1) / (uint)rows;
+        uint gx = Math.Min(groups, 32768u), gy = (groups + 32767u) / 32768u, gz = (uint)((T + nc - 1) / nc);
         var yAct = f32Out ? _dummy : y;
         var yf = f32Out ? y : _dummy;
         Run(k, (1u << 2) | (1u << 4), [M, (uint)w.In, (uint)T, (uint)xOff], gx, gy, gz, w.Buf, x, yAct, aux ?? _dummy, yf);

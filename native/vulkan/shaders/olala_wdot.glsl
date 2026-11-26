@@ -5,7 +5,12 @@
 // and a function  float xAt(uint col, uint k)           activation element k of (the already clamped) column `col`.
 // Every weight is decoded once per lane and FMA'd against NCOL columns; accumulation is F32 (private array gAcc).
 
-float gAcc[NCOL];
+#ifdef WDOT_MULTIROW
+const uint NACC = NCOL * ROWS;   // accumulator index: r * NCOL + cc
+#else
+const uint NACC = NCOL;
+#endif
+float gAcc[NACC];
 
 uint readU16(uint idx16) {
     uint w = weight[idx16 >> 1u];
@@ -39,14 +44,56 @@ void rowDot(uint row, uint K, uint lane, uint colBase, uint colLimit) {
         uint k0 = blk * 32u + sub * 8u;
         [[unroll]] for (uint cc = 0u; cc < NCOL; ++cc) {
             uint col = min(colBase + cc, colLimit);
+#ifdef X_LOAD8
+            vec4 xa, xb; xLoad8(col, k0, xa, xb);
+            float dq = wa.x * xa.x;
+            dq = fma(wa.y, xa.y, dq); dq = fma(wa.z, xa.z, dq); dq = fma(wa.w, xa.w, dq);
+            dq = fma(wb.x, xb.x, dq); dq = fma(wb.y, xb.y, dq);
+            dq = fma(wb.z, xb.z, dq); dq = fma(wb.w, xb.w, dq);
+#else
             float dq = wa.x * xAt(col, k0);
             dq = fma(wa.y, xAt(col, k0 + 1u), dq); dq = fma(wa.z, xAt(col, k0 + 2u), dq); dq = fma(wa.w, xAt(col, k0 + 3u), dq);
             dq = fma(wb.x, xAt(col, k0 + 4u), dq); dq = fma(wb.y, xAt(col, k0 + 5u), dq);
             dq = fma(wb.z, xAt(col, k0 + 6u), dq); dq = fma(wb.w, xAt(col, k0 + 7u), dq);
+#endif
             gAcc[cc] = fma(d, dq, gAcc[cc]);
         }
     }
 }
+#ifdef WDOT_MULTIROW
+// ROWS consecutive output rows per workgroup (#2006): the activation vectors are loaded once per lane and column and reused for every row, so
+// the (dominant) activation read traffic per output element falls by ROWS. Per (row, column) the arithmetic and its order are exactly rowDot's.
+// Rows past M are clamped to row M - 1 (computed, never stored).
+void rowDotRows(uint row0, uint M, uint K, uint lane, uint colBase, uint colLimit) {
+    uint bpr = K >> 5u;
+    uint blockInWindow = lane >> 2u;
+    uint sub = lane & 3u;
+    for (uint w0 = 0u; w0 < bpr; w0 += WG_SIZE / 4u) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= bpr) continue;
+        float dr[ROWS]; vec4 war[ROWS]; vec4 wbr[ROWS];
+        [[unroll]] for (uint r = 0u; r < ROWS; ++r) {
+            uint b16 = min(row0 + r, M - 1u) * bpr * 17u + blk * 17u;
+            dr[r] = unpackHalf2x16(readU16(b16)).x;
+            uint qb = b16 + 1u + 4u * sub;
+            war[r] = unpackS8(readU16(qb) | (readU16(qb + 1u) << 16u));
+            wbr[r] = unpackS8(readU16(qb + 2u) | (readU16(qb + 3u) << 16u));
+        }
+        uint k0 = blk * 32u + sub * 8u;
+        [[unroll]] for (uint cc = 0u; cc < NCOL; ++cc) {
+            uint col = min(colBase + cc, colLimit);
+            vec4 xa, xb; xLoad8(col, k0, xa, xb);
+            [[unroll]] for (uint r = 0u; r < ROWS; ++r) {
+                float dq = war[r].x * xa.x;
+                dq = fma(war[r].y, xa.y, dq); dq = fma(war[r].z, xa.z, dq); dq = fma(war[r].w, xa.w, dq);
+                dq = fma(wbr[r].x, xb.x, dq); dq = fma(wbr[r].y, xb.y, dq);
+                dq = fma(wbr[r].z, xb.z, dq); dq = fma(wbr[r].w, xb.w, dq);
+                gAcc[r * NCOL + cc] = fma(dr[r], dq, gAcc[r * NCOL + cc]);
+            }
+        }
+    }
+}
+#endif
 #elif defined(WT_Q6_K)
 // Super-block of 256 = 210 bytes = 105 uint16: ql[128] qh[64] scales[16] int8, fp16 d. Sixteen lanes per super-block, 16 outputs each
 // (layout derivation: matmul_q6_k_gemv_f32_coalesced.comp).
@@ -109,15 +156,15 @@ void rowDot(uint row, uint K, uint lane, uint colBase, uint colLimit) {
 #endif
 
 // Workgroup sum of one value per lane (subgroup add + shared pass); the result is valid in lane 0 only.
-shared float wdotPartials[NCOL][WG_SIZE];
-float gTot[NCOL];
+shared float wdotPartials[NACC][WG_SIZE];
+float gTot[NACC];
 void reduceAcc(uint lane) {
-    float sums[NCOL];
-    [[unroll]] for (uint cc = 0u; cc < NCOL; ++cc) sums[cc] = subgroupAdd(gAcc[cc]);
+    float sums[NACC];
+    [[unroll]] for (uint cc = 0u; cc < NACC; ++cc) sums[cc] = subgroupAdd(gAcc[cc]);
     if (subgroupElect())
-        [[unroll]] for (uint cc = 0u; cc < NCOL; ++cc) wdotPartials[cc][gl_SubgroupID] = sums[cc];
+        [[unroll]] for (uint cc = 0u; cc < NACC; ++cc) wdotPartials[cc][gl_SubgroupID] = sums[cc];
     barrier();
-    [[unroll]] for (uint cc = 0u; cc < NCOL; ++cc) {
+    [[unroll]] for (uint cc = 0u; cc < NACC; ++cc) {
         float tot = 0.0;
         if (lane == 0u)
             for (uint i = 0u; i < gl_NumSubgroups; i++) tot += wdotPartials[cc][i];

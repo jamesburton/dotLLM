@@ -504,6 +504,66 @@ public sealed class OlalaVulkanTests
     }
 
     /// <summary>
+    /// The multi-row / multi-column Q8_0 prefill tile (#2006: <c>ROWS</c> output rows x <c>NCOL</c> columns per workgroup, activations read as 16-byte vectors)
+    /// on REAL rows of q8_0-safe2 <c>ssm_in</c>. M = 97 is not a multiple of any tested ROWS (the clamped tail rows must not be stored) and T = 19 leaves a
+    /// partial column group. Checked (a) against <see cref="Dequantize"/> + a double dot at scale 1 and 1e9 and (b) BIT-IDENTICAL to the 1-row x 8-column
+    /// kernel (ROWS = 1: the same per-(row, column) FMA order as before #2006), in both activation arms. Mutants this must kill are listed in the PR.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(VulkanOlalaTransformerModel.PrefillQ8Cols, VulkanOlalaTransformerModel.PrefillQ8Rows, false, 1f)]
+    [InlineData(VulkanOlalaTransformerModel.PrefillQ8Cols, VulkanOlalaTransformerModel.PrefillQ8Rows, false, 1e9f)]
+    [InlineData(VulkanOlalaTransformerModel.PrefillQ8Cols, VulkanOlalaTransformerModel.PrefillQ8Rows, true, 1f)]
+    [InlineData(8, 4, false, 1f)]
+    [InlineData(16, 3, true, 1e9f)]
+    public unsafe void Q8PrefillTile_OnRealSafe2SsmIn_MatchesReferenceAndIsBitIdenticalToOneRowKernel(int cols, int rows, bool f32Act, float scale)
+    {
+        SkipUnlessGpu();
+        string? gguf = FindGguf("DOTLLM_OLALA_Q8_GGUF", "Olala-v1.0-mini-7A1B-q8_0-safe2.gguf"); Skip.If(gguf is null, "q8_0-safe2 not in the HF cache");
+        using var f = GgufFile.Open(gguf!);
+        var d = f.TensorsByName["blk.0.ssm_in.weight"];
+        int K = (int)d.Shape[0];
+        const int M = 97, T = 19;
+        long rowBytes = Dequantize.RowByteSize(K, d.QuantizationType);
+        nint src = f.TensorDataPointer(d);
+        var w = new float[(long)M * K];
+        Dequantize.ToFloat32(src, (long)M * K, d.QuantizationType, w);
+        var rng = new Random(23);
+        var x = new float[T * K];
+        for (int i = 0; i < x.Length; i++) { x[i] = (float)(rng.NextDouble() * 2 - 1) * scale; if (!f32Act) x[i] = FromBf16(Bf16(x[i])); }
+        using var dev = VulkanDevice.Create();
+        using var bw = dev.Allocate(rowBytes * M);
+        dev.Upload(new ReadOnlySpan<byte>((void*)src, checked((int)(rowBytes * M))), bw);
+        using var bx = f32Act ? dev.Allocate(x.Length * 4) : UploadBf16(dev, x);
+        if (f32Act) dev.Upload(x, bx);
+        using var dummy = dev.Allocate(256);
+        string kname = "olala_gemv_q8_0" + (f32Act ? "_f32act" : "");
+        float[] Run(uint[] spec, int rowsPerWg, int colsPerWg)
+        {
+            using var byf = dev.Allocate(T * M * 4);
+            using var k = new OlalaKernel(dev, SpvDir(), kname, 5, 4, spec);
+            using (var ctx = dev.CreateSubmitContext())
+            {
+                ctx.Begin();
+                k.Record(ctx.CommandBuffer, [bw, bx, dummy, dummy, byf], [(uint)M, (uint)K, (uint)T, 0u], (uint)((M + rowsPerWg - 1) / rowsPerWg), 1, (uint)((T + colsPerWg - 1) / colsPerWg));
+                ctx.SubmitAndWait();
+            }
+            var o = new float[T * M]; dev.Download(byf, o); return o;
+        }
+        var got = Run([(uint)cols, 0u, 1u, (uint)rows], rows, cols);
+        var one = Run([8u, 0u, 1u], 1, 8);
+        for (int t = 0; t < T; t++)
+            for (int m = 0; m < M; m++)
+            {
+                double want = 0, mag = 0;
+                for (int i = 0; i < K; i++) { double p = (double)w[(long)m * K + i] * x[t * K + i]; want += p; mag += Math.Abs(p); }
+                Assert.True(float.IsFinite(got[t * M + m]), $"non-finite at col {t} row {m}");
+                Assert.True(Math.Abs(got[t * M + m] - want) / mag < 1e-5, $"col {t} row {m}: {got[t * M + m]:E6} vs {want:E6}");
+                Assert.True(BitConverter.SingleToUInt32Bits(got[t * M + m]) == BitConverter.SingleToUInt32Bits(one[t * M + m]),
+                    $"col {t} row {m}: tile {got[t * M + m]:E9} != 1-row kernel {one[t * M + m]:E9}");
+            }
+    }
+
+    /// <summary>
     /// Warm same-session throughput (opt-in: <c>DOTLLM_OLALA_VK_BENCH=1</c>; hold the GPU lock, no CPU work alongside). Prefill = the 300-token chat
     /// prompt, last-row logits; decode = greedy one-token steps. UMA timing swings ~40% between sessions, so only same-session ranges are quoted.
     /// </summary>
