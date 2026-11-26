@@ -35,7 +35,7 @@ public sealed class VulkanEdge0MtpEndToEndTests(ITestOutputHelper output)
     private const int Chain = 3;
 
     private static FixtureLocation Locate() => TestFixtureResolver.ResolveFile("DOTLLM_EDGE0_SKELETON", "Edge0", "Edge0-145B-q3k", "model-skeleton.gguf",
-        "native_experts.txt", "experts.bin", "ple-fp8.gguf", "mtp/experts.bin");
+        "native_experts.txt", "experts.bin", "ple-fp8.gguf", "mtp/dense.txt", "mtp/dense.bin", "mtp/experts.bin", "mtp/draft_vocab.bin");
 
     private static int[] Pos(int n, int start = 0) => Enumerable.Range(start, n).ToArray();
 
@@ -46,6 +46,13 @@ public sealed class VulkanEdge0MtpEndToEndTests(ITestOutputHelper output)
     }
 
     private static int Argmax(ReadOnlySpan<float> v) { int b = 0; for (int i = 1; i < v.Length; i++) if (v[i] > v[b]) b = i; return b; }
+
+    private static (float Margin, int Second) Margin(ReadOnlySpan<float> v)
+    {
+        int a = Argmax(v), b = a == 0 ? 1 : 0;
+        for (int i = 0; i < v.Length; i++) if (i != a && v[i] > v[b]) b = i;
+        return (v[a] - v[b], b);
+    }
 
     private static int[][] Encode(string skeleton)
     {
@@ -194,16 +201,27 @@ public sealed class VulkanEdge0MtpEndToEndTests(ITestOutputHelper output)
             }
             return (gen, per, t0.Elapsed.TotalSeconds);
         }
-        (List<int> Tokens, double Seconds) Plain(int[] prompt, int n)
+        (List<int> Tokens, double Seconds) Plain(int[] prompt, int n) { var (t, s, _) = PlainWithMargins(prompt, n, margins: false); return (t, s); }
+        // margins[i] = top-1 minus top-2 logit of the plain decode at generated token i: where speculative output first differs, a near-tie says
+        // multi-row rounding picked the other token; a large margin would point at state (KV / recurrent rollback) instead.
+        (List<int> Tokens, double Seconds, List<(float Margin, int Second)> Margins) PlainWithMargins(int[] prompt, int n, bool margins)
         {
             vk.ResetSequenceState();
             using var kv = vk.CreateKvCache(prompt.Length + n + 16);
             var gen = new List<int>();
+            var mg = new List<(float, int)>();
+            void Take(float[] row) { gen.Add(Argmax(row)); if (margins) mg.Add(Margin(row)); }
             var t0 = System.Diagnostics.Stopwatch.StartNew();
-            using (var pf = vk.Forward(prompt, Pos(prompt.Length), -1, kv, true)) gen.Add(Argmax(Row(pf, pf.Shape[0] - 1)));
+            using (var pf = vk.Forward(prompt, Pos(prompt.Length), -1, kv, true)) Take(Row(pf, pf.Shape[0] - 1));
             while (gen.Count < n)
-                using (var lg = vk.Forward([gen[^1]], [prompt.Length + gen.Count - 1], -1, kv, true)) gen.Add(Argmax(Row(lg, 0)));
-            return (gen, t0.Elapsed.TotalSeconds);
+                using (var lg = vk.Forward([gen[^1]], [prompt.Length + gen.Count - 1], -1, kv, true)) Take(Row(lg, 0));
+            return (gen, t0.Elapsed.TotalSeconds, mg);
+        }
+        string Divergence(List<int> spec, List<int> plain, List<(float Margin, int Second)> mg, int n)
+        {
+            int d = Enumerable.Range(0, n).FirstOrDefault(i => spec[i] != plain[i], -1);
+            if (d < 0) return "identical";
+            return $"differs at {d}: plain {plain[d]} (margin {mg[d].Margin:F3} over its #2 {mg[d].Second}), spec {spec[d]}{(spec[d] == mg[d].Second ? " = plain's #2" : " NOT plain's #2")}";
         }
 
         const int N = 96;
@@ -213,16 +231,33 @@ public sealed class VulkanEdge0MtpEndToEndTests(ITestOutputHelper output)
             for (int p = 0; p < prompts.Length; p++)
             {
                 var (toks, per, _) = Speculate(prompts[p], N, k);
-                var (plain, _) = Plain(prompts[p], N);
+                var (plain, _, mg) = PlainWithMargins(prompts[p], N, margins: true);
                 rounds += per.Count; tokens += toks.Count; drafted += per.Count * k; accepted += per.Sum() - per.Count;
-                int firstDiv = Enumerable.Range(0, N).FirstOrDefault(i => toks[i] != plain[i], -1);
-                if (firstDiv < 0) same++;
-                output.WriteLine($"ACCEPT K={k} prompt {p}: {per.Count} rounds, {per.Sum()} tokens ({(double)per.Sum() / per.Count:F2}/round), spec == plain: {(firstDiv < 0 ? "identical" : "differs at " + firstDiv)}");
+                string div = Divergence(toks, plain, mg, N);
+                if (div == "identical") same++;
+                output.WriteLine($"ACCEPT K={k} prompt {p}: {per.Count} rounds, {per.Sum()} tokens ({(double)per.Sum() / per.Count:F2}/round), spec == plain: {div}");
             }
             output.WriteLine($"ACCEPTTOTAL K={k}: {accepted}/{drafted} drafts accepted ({100.0 * accepted / drafted:F1}%), {(double)tokens / rounds:F2} tokens per verify round, {same}/{prompts.Length} prompts identical to plain greedy");
         }
 
-        // ── 3. speed, interleaved in one session (group skipping on) ──
+        // ── 2b. long context (DOTLLM_EDGE0_MTP_LONG=1): a ~2.3K-token prompt puts the head's own attention past the dense window (~2051 cells), so its
+        // sparse indexer (the index_qk_proj q/k split) is live, and 256 speculative tokens exercise many reject/rollback rounds against plain greedy ──
+        if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_MTP_LONG") == "1")
+        {
+            var parts = new List<int>();
+            for (int r = 0; parts.Count < 2300; r++) parts.AddRange(r == 0 ? prompts[2] : prompts[2 + (r % 2)]);   // the two paragraph prompts, alternating
+            var longPrompt = parts.ToArray();
+            const int NL = 256;
+            var (toks, per, secs) = Speculate(longPrompt, NL, 4);
+            var (plain, psecs, mg) = PlainWithMargins(longPrompt, NL, margins: true);
+            int acc = per.Sum() - per.Count;
+            output.WriteLine($"LONG prompt {longPrompt.Length} tokens, {NL} generated, K=4: {acc}/{per.Count * 4} drafts accepted ({100.0 * acc / (per.Count * 4):F1}%), {(double)per.Sum() / per.Count:F2} tokens/round; " +
+                             $"{NL / secs:F1} vs plain {NL / psecs:F1} tok/s; spec == plain: {Divergence(toks, plain, mg, NL)}");
+            if (acc == 0) failures.Add("long context: no draft accepted");
+        }
+
+        // ── 3. speed, interleaved in one session (group skipping on); DOTLLM_EDGE0_MTP_SPEED=0 skips it ──
+        if (Environment.GetEnvironmentVariable("DOTLLM_EDGE0_MTP_SPEED") == "0") { Assert.True(failures.Count == 0, string.Join("; ", failures)); return; }
         VulkanQwen3MoeHybridTransformerModel.Edge0SkipUnusedGroups = true;
         var plainTps = new List<double>(); var k3 = new List<double>(); var k4 = new List<double>();
         Plain(prompts[1], 16); Speculate(prompts[1], 16, 3);   // warm both paths

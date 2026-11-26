@@ -80,7 +80,7 @@ public sealed unsafe class Edge0MtpPack : IDisposable
     /// <summary>True when <c>experts.bin</c> is a shared writable view a UMA driver can import in place.</summary>
     public bool ImportableViews { get; }
 
-    /// <summary>Token ids of the draft vocabulary (ascending in the shipped files).</summary>
+    /// <summary>Token ids of the draft vocabulary, in file order: unique but NOT sorted (edge0-strata draft_vocab.py keeps the base subset's order and appends added ids).</summary>
     public int[] DraftVocab { get; }
 
     /// <summary>The dense tensors by their Strata name (<c>self_attn.q_proj.weight</c>, ...).</summary>

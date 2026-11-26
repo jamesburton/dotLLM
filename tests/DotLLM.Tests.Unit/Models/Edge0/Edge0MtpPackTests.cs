@@ -99,6 +99,34 @@ public sealed class Edge0MtpPackTests(ITestOutputHelper output)
         Assert.Equal(pack.DraftVocab.Length, pack.DraftVocab.Distinct().Count());   // a set of token ids (not sorted: the file orders them by the generator's rank)
     }
 
+    /// <summary>
+    /// The fused <c>self_attn.indexer.index_qk_proj</c> (640 rows) is the 4 x 128 indexer QUERY rows first, then the 128 KEY rows. Sources: HF
+    /// <c>Qwen4ExpTextAttention</c>'s indexer does <c>torch.split(qk, [n_heads * D, D])</c> (Reference/gen_qsa.py, whose HF outputs Qwen4ExpQsaTests match), and
+    /// edge0-strata's trunk (metal/src/engine/window.cpp) binds the indexer q at the GEMV output's start and the k at <c>+512</c> floats. The Edge0 head only reads
+    /// the indexer beyond the dense window (~2051 cells), so no short end-to-end run can see a swapped split: this pins the view's two row slices.
+    /// </summary>
+    [SkippableFact]
+    public void RealHead_IndexerQkSplit_IsQueryRowsFirstThenKey()
+    {
+        var fx = Locate();
+        Skip.IfNot(fx.Found, fx.SkipMessage("Edge0-145B-q3k (mtp/)"));
+        using var skel = GgufFile.Open(fx.Path!);
+        var config = GgufModelConfigExtractor.Extract(skel.Metadata);
+        using var pack = Edge0MtpPack.Open(Edge0MtpPack.Find(Path.GetDirectoryName(fx.Path!)!)!, config.VocabSize);
+        using var view = pack.BuildHeadGguf(config, ggmlExpertBanks: false, trunk: skel);
+        var q4 = config.Qwen4Exp!;
+        int idxQ = q4.IndexerHeadCount * q4.IndexerKeyLength, idxK = q4.IndexerKeyLength, H = config.HiddenSize;
+        Assert.Equal(512, idxQ); Assert.Equal(128, idxK);
+        var fused = pack.Dense["self_attn.indexer.index_qk_proj.weight"];
+        Assert.Equal(idxQ + idxK, fused.Rows);
+        long rowBytes = (long)(H / 32) * 34;   // Q8_0
+        string b = $"blk.{config.NumLayers}.";
+        var q = view.TensorsByName[b + "indexer.q_proj.weight"]; var k = view.TensorsByName[b + "indexer.k_proj.weight"];
+        Assert.Equal(new[] { H, idxQ }, q.Shape.Dimensions.ToArray()); Assert.Equal(new[] { H, idxK }, k.Shape.Dimensions.ToArray());
+        Assert.Equal(fused.Pointer, view.TensorDataPointer(q));
+        Assert.Equal(fused.Pointer + (nint)(idxQ * rowBytes), view.TensorDataPointer(k));
+    }
+
     private static FixtureLocation Locate() => TestFixtureResolver.ResolveFile("DOTLLM_EDGE0_SKELETON", "Edge0", "Edge0-145B-q3k", "model-skeleton.gguf",
-        "native_experts.txt", "experts.bin", "ple-fp8.gguf", "mtp/experts.bin");
+        "native_experts.txt", "experts.bin", "ple-fp8.gguf", "mtp/dense.txt", "mtp/dense.bin", "mtp/experts.bin", "mtp/draft_vocab.bin");
 }

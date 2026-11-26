@@ -24,7 +24,7 @@ public sealed class VulkanEdge0MtpPlanarKernelTests
     public unsafe void Planar_IsBitIdenticalToTheContiguousKernelOnRelaidOutBanks(PlanarQ2Projection proj, int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
-        var fx = TestFixtureResolver.ResolveFile("DOTLLM_EDGE0_SKELETON", "Edge0", "Edge0-145B-q3k", "model-skeleton.gguf", "native_experts.txt", "experts.bin", "ple-fp8.gguf", "mtp/experts.bin");
+        var fx = TestFixtureResolver.ResolveFile("DOTLLM_EDGE0_SKELETON", "Edge0", "Edge0-145B-q3k", "model-skeleton.gguf", "native_experts.txt", "experts.bin", "ple-fp8.gguf", "mtp/dense.txt", "mtp/dense.bin", "mtp/experts.bin", "mtp/draft_vocab.bin");
         Skip.IfNot(fx.Found, fx.SkipMessage("Edge0-145B-q3k (mtp/)"));
         using var device = VulkanDevice.Create();
         Skip.IfNot(device.HasIntegerDotProduct, "integer-dot-product unavailable.");

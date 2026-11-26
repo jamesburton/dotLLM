@@ -162,7 +162,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         var cfg = Qwen4ExpTensors.HeadConfig(Config, tensors);   // #1529: the head carries its own expert count
         IReadOnlyList<string> problems = Qwen4ExpTensors.FindProblems(tensors, cfg, includeTrunk: false, includeMtp: true, skeleton: edge0Head is not null);
         // "skeleton" drops the routed-expert tensors (read from the pack) but also expects the Edge0 skeleton's [embd, 1] spelling of the shared-expert gate; the head's is the stock [embd] (same bytes).
-        if (edge0Head is not null) problems = problems.Where(p => !p.Contains("ffn_gate_inp_shexp", StringComparison.Ordinal)).ToList();
+        // Only that shape spelling is waived: a MISSING shared-expert gate (or any other problem) still fails the attach.
+        if (edge0Head is not null)
+            problems = problems.Where(p => !(p.Contains("ffn_gate_inp_shexp.weight' has shape [", StringComparison.Ordinal) && p.Contains("expected [" + Config.HiddenSize + ", 1]", StringComparison.Ordinal))).ToList();
         if (problems.Count > 0)
             throw new InvalidDataException("qwen4exp MTP head tensor table does not match the contract: " +
                                            string.Join("; ", problems.Take(8)) + (problems.Count > 8 ? $"; (+{problems.Count - 8} more)" : ""));
@@ -251,13 +253,22 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 long fullRow = Dequantize.RowByteSize(2 * H, eh.QuantizationType), halfRow = Dequantize.RowByteSize(H, eh.QuantizationType);
                 if (fullRow != 2 * halfRow)
                     throw new NotSupportedException($"nextn.eh_proj quant {eh.QuantizationType} cannot be split at the embedding/hidden boundary.");
-                nint src = headFile.TensorDataPointer(eh);
-                nint pe = (nint)NativeMemory.AlignedAlloc((nuint)(halfRow * H), 64), ph = (nint)NativeMemory.AlignedAlloc((nuint)(halfRow * H), 64);
-                owned.Add(pe); owned.Add(ph);
-                for (int o = 0; o < H; o++)
+                nint pe, ph;
+                if (edge0Head is not null && eh.QuantizationType == QuantizationType.Q8_0)
                 {
-                    Buffer.MemoryCopy((void*)(src + (nint)(o * fullRow)), (void*)(pe + (nint)(o * halfRow)), halfRow, halfRow);
-                    Buffer.MemoryCopy((void*)(src + (nint)(o * fullRow + halfRow)), (void*)(ph + (nint)(o * halfRow)), halfRow, halfRow);
+                    // The Edge0 head ships the two halves as separate matrices (fc_embedding / fc_hidden): read them in place instead of splitting the joined view copy.
+                    pe = edge0Head.Dense["fc_embedding.weight"].Pointer; ph = edge0Head.Dense["fc_hidden.weight"].Pointer;
+                }
+                else
+                {
+                    nint src = headFile.TensorDataPointer(eh);
+                    pe = (nint)NativeMemory.AlignedAlloc((nuint)(halfRow * H), 64); ph = (nint)NativeMemory.AlignedAlloc((nuint)(halfRow * H), 64);
+                    owned.Add(pe); owned.Add(ph);
+                    for (int o = 0; o < H; o++)
+                    {
+                        Buffer.MemoryCopy((void*)(src + (nint)(o * fullRow)), (void*)(pe + (nint)(o * halfRow)), halfRow, halfRow);
+                        Buffer.MemoryCopy((void*)(src + (nint)(o * fullRow + halfRow)), (void*)(ph + (nint)(o * halfRow)), halfRow, halfRow);
+                    }
                 }
                 ehEmb = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(_device, staging, pe, eh.QuantizationType, H, H, false, out embQt, out long b1);
                 ehHid = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(_device, staging, ph, eh.QuantizationType, H, H, false, out hidQt, out long b2);
