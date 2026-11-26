@@ -147,14 +147,28 @@ public class DirectStorageDefaultTests(ITestOutputHelper output)
         }
     }
 
+    /// <summary>The shipped pair (as found for the app) has matching file versions; a mixed pair is refused before loading.</summary>
+    [SkippableFact]
+    public void FoundPair_HasMatchingVersions()
+    {
+        string? dll = DirectStorageInstaller.FindDll();
+        Skip.If(dll is null, "dstorage.dll pair not available");
+        string dir = Path.GetDirectoryName(dll)!;
+        Assert.True(DirectStorageInstaller.PairVersionsMatch(dir));
+        output.WriteLine(System.Diagnostics.FileVersionInfo.GetVersionInfo(dll!).FileVersion
+            + " / " + System.Diagnostics.FileVersionInfo.GetVersionInfo(Path.Combine(dir, "dstoragecore.dll")).FileVersion);
+    }
+
     /// <summary>
     /// Regression guard for the #1994 E_NOTIMPL bug: a real model load on an integrated GPU, with the DLL pair ONLY in the install directory
     /// (app-dir search disabled, the layout after the NuGet fetch), must read tensors through DirectStorage and stage none. dstorage.dll loads
     /// dstoragecore.dll by bare name at DStorageGetFactory time, so without a by-full-path preload the factory returns 0x80004001 and every tensor
     /// is declined. Runs in a child process because the DLL modules are process-global. Skipped only when the DLL pair or a GPU/model is absent.
     /// </summary>
-    [SkippableFact]
-    public void RealLoad_FromInstallDirOnly_ReadsTensorsThroughDirectStorage_AndStagesNone()
+    [SkippableTheory]
+    [InlineData(false)]   // apphost, pair only in the install dir (post-NuGet-fetch layout)
+    [InlineData(true)]    // `dotnet DotLLM.Cli.dll` (also `dotnet run`, the test host): pair next to the CLI, but the process exe is dotnet.exe, so the app dir is NOT on the default search path
+    public void RealLoad_ReadsTensorsThroughDirectStorage_AndStagesNone(bool viaDotnetHost)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
         Skip.IfNot(OperatingSystem.IsWindows(), "Windows only");
@@ -178,7 +192,9 @@ public class DirectStorageDefaultTests(ITestOutputHelper output)
         {
             foreach (string src in Directory.EnumerateFiles(AppContext.BaseDirectory, "*", SearchOption.AllDirectories))
             {
-                if (Path.GetFileName(src).StartsWith("dstorage", StringComparison.OrdinalIgnoreCase)) continue;
+                // apphost case: the pair lives only in installDir. dotnet-host case: the pair stays next to the CLI (the failing layout reported from a
+                // worktree CLI started as `dotnet DotLLM.Cli.dll`: FindDll finds it, but dstoragecore.dll's bare-name load searches dotnet.exe's folder).
+                if (!viaDotnetHost && Path.GetFileName(src).StartsWith("dstorage", StringComparison.OrdinalIgnoreCase)) continue;
                 string target = Path.Combine(appDir, Path.GetRelativePath(AppContext.BaseDirectory, src));
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
                 File.Copy(src, target);
@@ -186,12 +202,14 @@ public class DirectStorageDefaultTests(ITestOutputHelper output)
             string srcDir = Path.GetDirectoryName(dll)!;
             File.Copy(Path.Combine(srcDir, "dstorage.dll"), Path.Combine(installDir, "dstorage.dll"));
             File.Copy(Path.Combine(srcDir, "dstoragecore.dll"), Path.Combine(installDir, "dstoragecore.dll"));
-            var psi = new System.Diagnostics.ProcessStartInfo(Path.Combine(appDir, "DotLLM.Cli.exe"))
+            var psi = new System.Diagnostics.ProcessStartInfo(viaDotnetHost ? "dotnet" : Path.Combine(appDir, "DotLLM.Cli.exe"))
             {
-                ArgumentList = { "run", model!, "-d", "vulkan", "-p", "Hello", "-n", "2", "-t", "0" },
                 RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, WorkingDirectory = cwd,
             };
-            psi.Environment["DOTLLM_DIRECTSTORAGE_DIR"] = installDir;
+            if (viaDotnetHost) psi.ArgumentList.Add(Path.Combine(appDir, "DotLLM.Cli.dll"));
+            foreach (string a in new[] { "run", model!, "-d", "vulkan", "-p", "Hello", "-n", "2", "-t", "0" }) psi.ArgumentList.Add(a);
+            if (viaDotnetHost) psi.Environment.Remove("DOTLLM_DIRECTSTORAGE_DIR");
+            else psi.Environment["DOTLLM_DIRECTSTORAGE_DIR"] = installDir;
             psi.Environment["DOTLLM_NO_PROMPT"] = "1";
             psi.Environment["DOTLLM_VULKAN_MEM_TRACE"] = "1";
             psi.Environment.Remove("DOTLLM_VULKAN_DIRECT_STORAGE");

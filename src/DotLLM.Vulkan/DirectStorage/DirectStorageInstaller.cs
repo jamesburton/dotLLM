@@ -61,6 +61,17 @@ public static class DirectStorageInstaller
         return null;
     }
 
+    /// <summary>
+    /// False when <c>dstorage.dll</c> and <c>dstoragecore.dll</c> in <paramref name="dir"/> carry different file versions (a mixed pair makes
+    /// <c>DStorageGetFactory</c> fail). Unknown versions (no version resource) count as matching.
+    /// </summary>
+    internal static bool PairVersionsMatch(string dir)
+    {
+        string? a = System.Diagnostics.FileVersionInfo.GetVersionInfo(Path.Combine(dir, "dstorage.dll")).FileVersion;
+        string? b = System.Diagnostics.FileVersionInfo.GetVersionInfo(Path.Combine(dir, "dstoragecore.dll")).FileVersion;
+        return string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b) || string.Equals(a, b, StringComparison.Ordinal);
+    }
+
     /// <summary>True when <see cref="FindDll()"/> finds the DLL pair (no default-search-path probing).</summary>
     public static bool IsAvailable() => FindDll() is not null;
 
