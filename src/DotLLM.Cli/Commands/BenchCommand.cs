@@ -208,6 +208,17 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
     }
 
     /// <summary>Copies the settings a saved tuning result chose onto <paramref name="s"/>. A null member keeps the flag or default.</summary>
+    /// <summary>
+    /// Upper bound on the context a bench run fills, for <c>--auto</c> admission (#1902): prompt + deepest depth + generated tokens + 8, the
+    /// same figure the MoE offload budget reserves for.
+    /// </summary>
+    internal static int BenchContextBound(Settings s)
+    {
+        int depth = s.Depth;
+        if (s.DepthList is not null && Settings.TryParseDepthList(s.DepthList, out var list, out _) && list is { Length: > 0 }) depth = Math.Max(depth, list[^1]);
+        return s.PromptTokens + depth + s.GenTokens + 8;
+    }
+
     internal static void ApplyAuto(Settings s, DotLLM.Server.Tuning.TunedSettings t)
     {
         if (t.Device is not null) s.Device = t.Device;
@@ -228,7 +239,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             if (autoGguf is null)
                 return 1;
             var applied = DotLLM.Cli.Helpers.AutoCli.Resolve(DotLLM.Server.Tuning.AutoCommand.Bench, settings.Model, autoGguf, settings.Device,
-                settings.AutoProfile, settings.CtxSize ?? 0, DotLLM.Cli.Helpers.AutoCli.BenchSupported, settings.Json);
+                settings.AutoProfile, settings.CtxSize ?? BenchContextBound(settings), DotLLM.Cli.Helpers.AutoCli.BenchSupported, settings.Json);
             if (applied is not null) ApplyAuto(settings, applied.Applied);
         }
 

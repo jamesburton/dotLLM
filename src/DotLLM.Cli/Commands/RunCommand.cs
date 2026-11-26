@@ -407,6 +407,25 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
     }
 
     /// <summary>Copies the settings a saved tuning result chose onto <paramref name="s"/>. A null member keeps the flag or default.</summary>
+    /// <summary>
+    /// Upper bound on the context a run fills, for <c>--auto</c> admission (#1902): the prompt's UTF-8 byte count (byte-level BPE and
+    /// byte-fallback SentencePiece never emit more tokens than bytes) plus <c>--max-tokens</c> plus 256 for BOS and a chat template.
+    /// 0 (unknown, so not admitted) when the prompt cannot be sized.
+    /// </summary>
+    internal static int RunContextBound(Settings s)
+    {
+        long promptBytes;
+        try
+        {
+            if (s.Prompt is not null) promptBytes = System.Text.Encoding.UTF8.GetByteCount(s.Prompt);
+            else if (s.PromptFile is not null && File.Exists(s.PromptFile)) promptBytes = new FileInfo(s.PromptFile).Length;
+            else return 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return 0; }
+        long bound = promptBytes + Math.Max(0, s.MaxTokens) + 256;
+        return bound > int.MaxValue ? 0 : (int)bound;
+    }
+
     internal static void ApplyAuto(Settings s, DotLLM.Server.Tuning.TunedSettings t)
     {
         if (t.Device is not null) s.Device = t.Device;
@@ -457,7 +476,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             if (resolvedPath is null)
                 return 1;
             var applied = DotLLM.Cli.Helpers.AutoCli.Resolve(DotLLM.Server.Tuning.AutoCommand.Run, settings.Model, resolvedPath, settings.Device,
-                settings.AutoProfile, settings.CtxSize ?? 0, DotLLM.Cli.Helpers.AutoCli.RunChatSupported, settings.Json, settings.TensorOverlay,
+                settings.AutoProfile, settings.CtxSize ?? RunContextBound(settings), DotLLM.Cli.Helpers.AutoCli.RunChatSupported, settings.Json, settings.TensorOverlay,
                 settings.TernaryAdapterPaths, settings.MtpHead, settings.DFlash);
             if (applied is not null) ApplyAuto(settings, applied.Applied);
         }

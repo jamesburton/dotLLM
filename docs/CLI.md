@@ -187,9 +187,10 @@ this release yet (#1902, slice 2); until then a result can only come from a tuni
   or a dedicated device whose free memory cannot be read, is not admitted. If it is not admitted, **all** saved settings are dropped and the
   defaults run, with the reason (and required and free bytes) in the warning; nothing spills. A setting this build refuses (for example a
   TurboQuant request the current host cannot run in place) is dropped with its reason, never replaced by another one.
-- **Context.** The recorded peaks were measured at the result's tuned context, so they bound only that much: a served context above it
-  (`--ctx-size`, or the saved context on `serve`), a result without a tuned context, or a `serve` whose context is unknown before load
-  (no `--ctx-size` and no saved context, so the checkpoint window or a VRAM fit), is not admitted and the defaults run.
+- **Context.** The recorded peaks were measured at the result's tuned context, so they bound only that much. A served context above it, a
+  result without a tuned context, or a served context that is not known before load is not admitted, and the defaults run. The served context
+  is `--ctx-size` when given; otherwise the saved context on `serve`, prompt + deepest depth + generated tokens on `bench`, and the prompt's
+  UTF-8 bytes + `--max-tokens` + 256 on `run`. `chat` grows toward the model window, so it needs `--ctx-size` (or a saved context).
 - **Where each value came from** is reported on `GET /v1/status` (and so `/props` `activity`) as `settings_source`: `flag`, `auto` or `default`
   per setting ([SERVER.md](SERVER.md#model-swaps-get-v1status-and-sse-keep-alive-1023)). Without `--auto` the field is absent and nothing changes.
 - `--auto` costs one store lookup before the model loads, and nothing at all when it is not given.

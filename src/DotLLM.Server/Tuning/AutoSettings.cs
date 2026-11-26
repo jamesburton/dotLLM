@@ -178,8 +178,9 @@ public static class AutoSettings
                 ? "the saved result does not record the context its peak memory was measured at"
                 : context > tuned
                     ? $"serving context {context} is above the tuned context {tuned}, so the recorded peak memory does not bound it"
-                    // serve with no --ctx-size and no saved context serves the checkpoint window (or a VRAM fit): unknown here, so unbounded.
-                    : context <= 0 && policy.Command == AutoCommand.Serve
+                    // An unknown context is unbounded: serve without --ctx-size serves the checkpoint window (or a VRAM fit), and chat grows
+                    // toward the model window. run and bench pass an upper bound computed from their own flags.
+                    : context <= 0
                         ? "the served context is not known before load (no --ctx-size and no saved context), so the recorded peak memory does not bound it"
                         : admit(c, context);
             if (refused is not null)

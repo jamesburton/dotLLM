@@ -225,10 +225,31 @@ public sealed class AutoWiringTests : IClassFixture<PrefixCacheFailedRequestTest
     public void Chat_Auto_AppliesSavedResult()
     {
         SaveFor(new TunedSettings { CacheTypeK = "q8_0", CacheTypeV = "q8_0" });
-        string[] args = ["chat", Model, "--auto", "--device", "cpu", "--max-tokens", "2"];
+        // chat grows toward the model window, so its served context is only known from --ctx-size.
+        string[] args = ["chat", Model, "--auto", "--device", "cpu", "--max-tokens", "2", "--ctx-size", "512"];
         AutoCli.RawArgsOverride = args;
         var (code, output) = CliTurboQuantCommandTests.RunWithInput("ab\n/exit\n", args);
         Assert.True(code == 0, output);
         Assert.Contains("auto: settings from", output);
+        Assert.DoesNotContain("not admitted", output.Replace("\r", "").Replace("\n", ""));
+    }
+
+    [Fact]
+    public void Chat_Auto_WithoutCtxSize_IsNotAdmitted()
+    {
+        SaveFor(new TunedSettings { CacheTypeK = "q8_0", CacheTypeV = "q8_0" });
+        string[] args = ["chat", Model, "--auto", "--device", "cpu", "--max-tokens", "2"];
+        AutoCli.RawArgsOverride = args;
+        var (code, output) = CliTurboQuantCommandTests.RunWithInput("ab\n/exit\n", args);
+        Assert.True(code == 0, output);
+        Assert.Contains("not known before load", output.Replace("\r", "").Replace("\n", ""));
+    }
+
+    [Fact]
+    public void RunAndBench_ContextBounds_ComeFromTheirFlags()
+    {
+        Assert.Equal(8 + 64 + 2 + 8, BenchCommand.BenchContextBound(new BenchCommand.Settings { PromptTokens = 8, GenTokens = 2, DepthList = "0,16,64" }));
+        Assert.Equal(3 + 5 + 256, RunCommand.RunContextBound(new RunCommand.Settings { Prompt = "abc", MaxTokens = 5 }));
+        Assert.Equal(0, RunCommand.RunContextBound(new RunCommand.Settings { MaxTokens = 5 }));   // no prompt: unknown, not admitted
     }
 }

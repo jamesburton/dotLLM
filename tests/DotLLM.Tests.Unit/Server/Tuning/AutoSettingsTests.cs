@@ -167,7 +167,7 @@ public sealed class AutoSettingsTests
     }
 
     [Fact]
-    public void Serve_WithUnknownServedContext_IsNotAdmitted_UnlessTheResultSavedOne()
+    public void UnknownServedContext_IsNotAdmitted_UnlessTheResultSavedOne()
     {
         // serve without --ctx-size serves the checkpoint window, which is not known here: the peak at 8192 does not bound it.
         var serve = new AutoPolicy(AutoCommand.Serve);
@@ -176,8 +176,9 @@ public sealed class AutoSettingsTests
         Assert.Contains(a.Warnings, w => w.Contains("not known before load", StringComparison.Ordinal));
         // a saved context within the tuned one makes the served context known, and it is admitted
         Assert.Equal("q8_0", Apply(Match(TuningMatchKind.Hit, Saved with { ContextSize = 8192 }), policy: serve, ctx: 0).Applied.CacheTypeK);
-        // run sizes its own cache from prompt + max tokens: an unknown (0) context is admitted there
-        Assert.Equal("q8_0", Apply(Match(TuningMatchKind.Hit, Saved), ctx: 0).Applied.CacheTypeK);
+        // the same on every command: run and bench pass a computed bound, chat needs --ctx-size; 0 is never admitted
+        Assert.Equal(new TunedSettings(), Apply(Match(TuningMatchKind.Hit, Saved), ctx: 0).Applied);
+        Assert.Equal(new TunedSettings(), Apply(Match(TuningMatchKind.Hit, Saved), policy: new AutoPolicy(AutoCommand.Chat), ctx: 0).Applied);
     }
 
     [Fact]
@@ -201,7 +202,7 @@ public sealed class AutoSettingsTests
     public void UnsupportedSettings_AreIgnored_NotReportedAsAuto()
     {
         var supported = new HashSet<string> { "threads" };
-        var a = AutoSettings.Apply(new HashSet<string>(), Match(TuningMatchKind.Hit, Saved), Tune, 0, Fits, NoRefusal, Run, supported);
+        var a = AutoSettings.Apply(new HashSet<string>(), Match(TuningMatchKind.Hit, Saved), Tune, 4096, Fits, NoRefusal, Run, supported);
         Assert.Equal(8, a.Applied.Threads);
         Assert.Null(a.Applied.CacheTypeK);
         Assert.Equal(SettingSource.Default, a.Sources["cache_type_k"]);
