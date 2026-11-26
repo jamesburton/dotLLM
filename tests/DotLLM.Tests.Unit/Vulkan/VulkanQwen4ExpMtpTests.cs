@@ -199,6 +199,65 @@ public sealed class VulkanQwen4ExpMtpTests : IDisposable
         Assert.True(RelL2(atLast, atPrev) > 1e-3f, "the draft must depend on which trunk residual it is seeded with");
     }
 
+    /// <summary>
+    /// #2011: a prefill longer than the planned rows, with an MTP state attached, used to skip the model's own chunking (Edge0's latent scratch then threw).
+    /// The planned rows are forced down to 16 so 70 tokens straddle several chunks; the single call must match the same chunks fed by hand
+    /// (bit-for-bit: identical command streams), keep the MTP cells / captured rows consistent, and leave a draft step equal to the hand-chunked one.
+    /// </summary>
+    [SkippableFact]
+    public void PrefillLongerThanPlannedRows_WithMtpState_IsChunked_AndMatchesHandChunking()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        const string Env = "DOTLLM_VK_PLANNED_ROWS";
+        string? old = Environment.GetEnvironmentVariable(Env);
+        Environment.SetEnvironmentVariable(Env, "16");
+        try
+        {
+            var rig = Rig(spvDir, Q4eQuant.F32);
+            Assert.Equal(16, rig.Vk.MaxRowsPerForward);
+            int V = rig.Config.VocabSize, T = 70;
+            int[] ids = Prompt(T, 21, V);
+
+            // arm A: one call
+            rig.Vk.ResetSequenceState();
+            using var kvA = rig.Vk.CreateKvCache(96);
+            using var stA = (VulkanQwen4ExpMtpState)rig.Vk.CreateMtpState(96)!;
+            long absBefore = rig.Vk.AbsorbedCells;
+            float[] lastA = Rows(rig.Vk.Forward(ids, Pos(T), -1, kvA, null, stA, true));
+            Assert.Equal(T - 1, rig.Vk.AbsorbedCells - absBefore);   // path counter: every cell was absorbed, once
+            Assert.Equal(T, stA.CurrentLength);
+            Assert.Equal(T - 1, stA.CellCount);
+            float[] draftA = Rows(rig.Vk.ForwardMtp(stA, Argmax(lastA), T));
+
+            // arm B: the same 16-row chunks by hand
+            rig.Vk.ResetSequenceState();
+            using var kvB = rig.Vk.CreateKvCache(96);
+            using var stB = (VulkanQwen4ExpMtpState)rig.Vk.CreateMtpState(96)!;
+            float[] lastB = [];
+            for (int c = 0; c < T; c += 16)
+            {
+                int m = Math.Min(16, T - c);
+                lastB = Rows(rig.Vk.Forward(ids.AsSpan(c, m), Pos(m, c), -1, kvB, null, stB, true));
+            }
+            Assert.Equal(lastB, lastA);
+            Assert.Equal(T - 1, stB.CellCount);
+            float[] draftB = Rows(rig.Vk.ForwardMtp(stB, Argmax(lastB), T));
+            Assert.Equal(stB.CellCount, stA.CellCount);
+            Assert.Equal(draftB, draftA);
+
+            // sensitivity: a prompt whose first chunk differs must draft differently (the equality above is not blind to the early chunks)
+            int[] other = (int[])ids.Clone();
+            for (int i = 0; i < 16; i++) other[i] = (other[i] + 7 - 6) % (V - 6) + 6;
+            rig.Vk.ResetSequenceState();
+            using var kvC = rig.Vk.CreateKvCache(96);
+            using var stC = (VulkanQwen4ExpMtpState)rig.Vk.CreateMtpState(96)!;
+            using (rig.Vk.Forward(other, Pos(T), -1, kvC, null, stC, true)) { }
+            float[] draftC = Rows(rig.Vk.ForwardMtp(stC, Argmax(lastA), T));
+            Assert.True(RelL2(draftA, draftC) > 1e-4f, "the draft must depend on the early chunks");
+        }
+        finally { Environment.SetEnvironmentVariable(Env, old); }
+    }
+
     [SkippableFact]
     public void Rollback_DiscardsSpeculativeCells_AndRedoingThemIsDeterministic()
     {

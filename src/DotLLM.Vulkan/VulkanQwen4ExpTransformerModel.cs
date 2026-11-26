@@ -483,7 +483,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
     }
 
     private ITensor ForwardChunked(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, VulkanQwen4ExpSequenceState state,
-                                   IKvCache? kvCache, bool lastTokenLogitsOnly, bool allRows, int cap)
+                                   IKvCache? kvCache, bool lastTokenLogitsOnly, bool allRows, int cap, VulkanQwen4ExpMtpState? mtp = null)
     {
         int total = tokenIds.Length;
         bool wantAll = allRows || (!lastTokenLogitsOnly && total <= _allRowLogitsLimit);
@@ -495,7 +495,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
             {
                 int n = Math.Min(cap, total - a);
                 var part = ForwardCore(tokenIds.Slice(a, n), positions.Slice(a, n), deviceId, state, kvCache, lastTokenLogitsOnly: !wantAll,
-                    mtp: null, snapRows: 0, allRows: wantAll);
+                    mtp: mtp, snapRows: 0, allRows: wantAll);   // each chunk absorbs into the MTP head as its own batch (carry/seed chain across calls, #2011)
                 if (wantAll)
                 {
                     using (part)
@@ -512,8 +512,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
                                 IKvCache? kvCache, bool lastTokenLogitsOnly, VulkanQwen4ExpMtpState? mtp = null, int snapRows = 0, bool allRows = false)
     {
         ArgumentNullException.ThrowIfNull(state);
-        if (mtp is null && snapRows == 0 && tokenIds.Length > MaxRowsPerForward && tokenIds.Length == positions.Length)
-            return ForwardChunked(tokenIds, positions, deviceId, state, kvCache, lastTokenLogitsOnly, allRows, MaxRowsPerForward);
+        if (snapRows == 0 && tokenIds.Length > MaxRowsPerForward && tokenIds.Length == positions.Length)
+            return ForwardChunked(tokenIds, positions, deviceId, state, kvCache, lastTokenLogitsOnly, allRows, MaxRowsPerForward, mtp);
         if (snapRows > 0 && !ReferenceEquals(state, _defaultState))
             throw new InvalidOperationException("Row snapshots are only recorded on the model-owned state.");
         VulkanNemotronHKvCache kv;
