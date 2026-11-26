@@ -194,7 +194,7 @@ public class DirectStorageDefaultTests(ITestOutputHelper output)
             string log = err.Result + outp.Result;
             string ledger = log.Split(Environment.NewLine).Last(l => l.Contains("host-import:", StringComparison.Ordinal));
             output.WriteLine(ledger);
-            var m = System.Text.RegularExpressions.Regex.Match(ledger, @"(\d+) tensors / [\d.]+ MiB direct-storage.*?; (\d+) tensors / [\d.]+ MiB staged",
+            var m = System.Text.RegularExpressions.Regex.Match(ledger, @"(?<d>\d+) tensors / [\d.]+ MiB direct-storage.*?; (?<s>\d+) tensors / [\d.]+ MiB staged",
                 System.Text.RegularExpressions.RegexOptions.ExplicitCapture, TimeSpan.FromSeconds(2));
             Assert.True(m.Success, ledger);
             Assert.True(int.Parse(m.Groups["d"].Value) > 0, "DirectStorage read no tensors: " + ledger);
