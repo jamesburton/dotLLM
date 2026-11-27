@@ -117,7 +117,7 @@ public sealed class Inkling2VulkanDSparkTests : IClassFixture<VkInklingFixture>
         try
         {
             m.RestoreRecurrentStateToRow(keep);
-            if (mutant == DSparkTargetMutant.SkipRestore) m.ForceLengthForTests(prompt.Length + keep + 1);   // the KV length rewinds either way; only the conv state is skipped
+            if (mutant != DSparkTargetMutant.None) m.ForceLengthForTests(prompt.Length + keep + 1);   // the KV length rewinds either way; only the conv state differs
         }
         finally { m.TargetMutant = DSparkTargetMutant.None; }
         using var t = m.Forward([777], [prompt.Length + keep + 1], -1, null, lastTokenLogitsOnly: true);
@@ -189,9 +189,9 @@ public sealed class Inkling2VulkanDSparkTests : IClassFixture<VkInklingFixture>
         for (int i = 0; i < k; i++)
         {
             var row = st.DraftLogits(p + i).ToArray();
-            var idx = Enumerable.Range(0, row.Length).ToArray();
-            Array.Sort((float[])row.Clone(), idx);
-            foreach (int t in idx.TakeLast(16).Reverse()) { sig.Add(row[t]); sig.Add(t); }
+            // top 16 by (logit desc, id asc): a stable order, so exact ties (a softcap-saturated 30.0) cannot reorder the fingerprint between two runs
+            var top = Enumerable.Range(0, row.Length).OrderByDescending(t => row[t]).ThenBy(t => t).Take(16);
+            foreach (int t in top) { sig.Add(row[t]); sig.Add(t); }
         }
         return sig.ToArray();
     }
@@ -329,7 +329,53 @@ public sealed class Inkling2VulkanDSparkTests : IClassFixture<VkInklingFixture>
         var m = Model();
         using var st = (VulkanInkling2DSparkState)m.CreateMtpState()!;
         long perPos = 3L * 2 * 8 * 128 * 2;
-        _out.WriteLine($"drafter weights + scratch {m.DSparkBytes / 1048576.0:F1} MiB; fresh state K/V {st.KvBytes / 1024.0:F0} KiB (2 ring layers x {st.RingPositions} positions + the global layer's first 1024), steady-state {(2L * 8 * 128 * 2 * 2) / 1024} KiB per position (was {perPos / 1024} KiB)");
+        _out.WriteLine($"drafter weights + scratch {m.DSparkBytes / 1048576.0:F1} MiB; fresh state K/V {st.KvBytes / 1024.0:F0} KiB (2 ring layers x {st.RingPositions} positions + the global layer's first 1024), steady-state {(8L * 128 * 2 * 2) / 1024} KiB per position (was {perPos / 1024} KiB)");
         _out.WriteLine($"at 2K context {((long)st.RingPositions * 2 * 2 * 2 * 8 * 128 + 2048L * 8 * 128 * 2 * 2) / 1024} KiB, at 100K {((long)st.RingPositions * 2 * 2 * 2 * 8 * 128 + 100000L * 8 * 128 * 2 * 2) / 1048576} MiB (old layout {100000L * perPos / 1048576} MiB)");
+    }
+
+    /// <summary>Two identical prefills must leave bit-identical K/V, f_rnn ring and drafts (guards the race of rows r and r + 16 writing the same f_rnn slot in one dispatch, found while testing #2060).</summary>
+    [SkippableFact]
+    public void TwoIdenticalPrefills_GiveBitIdenticalContextRingAndDrafts()
+    {
+        var m = Model();
+        var rng = new Random(2060);
+        int[] tokens = Enumerable.Range(0, 1330).Select(_ => rng.Next(1000, 120000)).ToArray();
+        float[] Down(VulkanInkling2DSparkState st, int layer, bool v)
+        {
+            var b = v ? st.V[layer] : st.K[layer];
+            var raw = new float[b.Size / 4];
+            m.DeviceForTests.Download(b, raw);
+            return raw;
+        }
+        var kvs = new List<float[][]>(); var drafts = new List<float[]>(); var frnnSums = new List<double>();
+        for (int rep = 0; rep < 3; rep++)
+        {
+            m.ResetSequenceState();
+            using var st = (VulkanInkling2DSparkState)m.CreateMtpState()!;
+            int p = 0;
+            while (p < 1300) { int n = Math.Min(64, 1300 - p); using (m.Forward(tokens[p..(p + n)], Enumerable.Range(p, n).ToArray(), -1, null, null, st, true)) { } p += n; }
+            kvs.Add(Enumerable.Range(0, 3).SelectMany(l => new[] { Down(st, l, false), Down(st, l, true) }).ToArray());
+            var d1 = new float[3]; var sigs = new List<float>();
+            for (int k = 0; k < 2; k++)
+            {
+                st.Rollback(1300);
+                for (int i = 0; i < 3; i++) st.NextDraft(tokens[1300], 1300 + i);
+                sigs.AddRange(Signature(st, 1300, 3));
+            }
+            drafts.Add(sigs.ToArray());
+            var fr = new float[st.Frnn.Size / 4]; m.DeviceForTests.Download(st.Frnn, fr);
+            frnnSums.Add(fr.Sum(x => (double)BitConverter.SingleToInt32Bits(x)));
+            _out.WriteLine($"rep {rep}: frnn checksum {fr.Sum(x => (double)BitConverter.SingleToInt32Bits(x)):E6}; first draft top: id {sigs[1]} logit {sigs[0]}");
+        }
+        for (int i = 0; i < 6; i++)
+        {
+            int diff = 0; for (int j = 0; j < kvs[0][i].Length; j++) if (BitConverter.SingleToInt32Bits(kvs[0][i][j]) != BitConverter.SingleToInt32Bits(kvs[1][i][j]) || BitConverter.SingleToInt32Bits(kvs[0][i][j]) != BitConverter.SingleToInt32Bits(kvs[2][i][j])) diff++;
+            _out.WriteLine($"{(i % 2 == 0 ? "K" : "V")} layer {i / 2}: {diff} of {kvs[0][i].Length} words differ between two identical prefills");
+            Assert.Equal(0, diff);
+        }
+        Assert.True(frnnSums.Distinct().Count() == 1, "the f_rnn ring differs between two identical prefills (a race in the ring store)");
+        int dd = 0; for (int j = 0; j < drafts[0].Length; j++) if (drafts[0][j] != drafts[1][j] || drafts[0][j] != drafts[2][j]) dd++;
+        Assert.Equal(0, dd);
+        _out.WriteLine($"draft signatures differing between two prefills: {dd} of {drafts[0].Length}; within one prefill, draft run 1 vs 2: {Enumerable.Range(0, drafts[0].Length / 2).Count(j => drafts[0][j] != drafts[0][j + drafts[0].Length / 2])}");
     }
 }

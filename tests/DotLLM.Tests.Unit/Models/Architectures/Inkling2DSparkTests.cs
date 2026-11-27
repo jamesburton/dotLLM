@@ -264,10 +264,9 @@ public sealed class Inkling2DSparkTests : IClassFixture<DSparkFixture>
         for (int i = 0; i < k; i++)
         {
             var row = st.DraftLogits(p + i).ToArray();
-            var idx = Enumerable.Range(0, row.Length).ToArray();
-            Array.Sort(row.AsSpan().ToArray(), idx);   // ascending by logit, idx follows
-            var top = idx.TakeLast(16).Reverse().ToArray();
-            foreach (int t in top) { sig.Add(st.DraftLogits(p + i)[t]); sig.Add(t); }
+            // top 16 by (logit desc, id asc): a stable order, so exact ties (a softcap-saturated 30.0) cannot reorder the fingerprint between two runs
+            var top = Enumerable.Range(0, row.Length).OrderByDescending(t => row[t]).ThenBy(t => t).Take(16);
+            foreach (int t in top) { sig.Add(row[t]); sig.Add(t); }
         }
         return sig.ToArray();
     }

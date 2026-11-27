@@ -25,6 +25,8 @@ layout(push_constant) uniform PushConstants {
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint r = gl_WorkGroupID.x;
+    // MODE 1: rows r and r + 16 share a ring slot; only the LAST row of each slot is stored (same result as writing in order, but race-free).
+    if (MODE == 1u && r + 16u < gl_NumWorkGroups.x) return;
     uint tb = r * 4u * pc.H;
     float m0 = mixw[0], m1 = mixw[1], m2 = mixw[2], m3 = mixw[3];
     float ss = 0.0;

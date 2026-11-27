@@ -32,9 +32,11 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
 
     private VulkanDevice Dev { get { Skip.If(_dev is null, "No Vulkan device"); return _dev!; } }
 
-    private OlalaKernel K(string name, int buffers, int pushWords, params uint[] spec)
+    private OlalaKernel K(string name, int buffers, int pushWords, params uint[] spec) => KIn(null, name, buffers, pushWords, spec);
+
+    private OlalaKernel KIn(string? dirOverride, string name, int buffers, int pushWords, params uint[] spec)
     {
-        string dir = !string.IsNullOrEmpty(_ovr) && File.Exists(Path.Combine(_ovr, name + ".spv")) ? _ovr : _spv;
+        string dir = dirOverride ?? (!string.IsNullOrEmpty(_ovr) && File.Exists(Path.Combine(_ovr, name + ".spv")) ? _ovr : _spv);
         return new OlalaKernel(Dev, dir, name, buffers, pushWords, spec);
     }
 
@@ -48,8 +50,8 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
     private VulkanDevice.Buffer UpBf16(float[] a) => UpBytes(MemoryMarshal.AsBytes(a.Select(Inkling2ConvState.ToBf16).ToArray().AsSpan()).ToArray());
     private VulkanDevice.Buffer UpF16(float[] a) => UpBytes(MemoryMarshal.AsBytes(a.Select(x => BitConverter.HalfToUInt16Bits((Half)x)).ToArray().AsSpan()).ToArray());
     private VulkanDevice.Buffer Zero(long bytes) { var b = Dev.AllocateDeviceLocal(Math.Max(16, (bytes + 3) / 4 * 4)); Dev.FillBufferSynchronous(b, 0); return b; }
-    private float[] DownBf16(VulkanDevice.Buffer b, int n) { var raw = new float[(n + 1) / 2 + 1]; Dev.Download(b, raw); var u = MemoryMarshal.Cast<float, ushort>(raw.AsSpan()); var r = new float[n]; for (int i = 0; i < n; i++) r[i] = BfBits(u[i]); return r; }
-    private float[] DownF16(VulkanDevice.Buffer b, int n) { var raw = new float[(n + 1) / 2 + 1]; Dev.Download(b, raw); var u = MemoryMarshal.Cast<float, ushort>(raw.AsSpan()); var r = new float[n]; for (int i = 0; i < n; i++) r[i] = (float)BitConverter.UInt16BitsToHalf(u[i]); return r; }
+    private float[] DownBf16(VulkanDevice.Buffer b, int n) { var raw = new float[(n + 1) / 2]; Dev.Download(b, raw); var u = MemoryMarshal.Cast<float, ushort>(raw.AsSpan()); var r = new float[n]; for (int i = 0; i < n; i++) r[i] = BfBits(u[i]); return r; }
+    private float[] DownF16(VulkanDevice.Buffer b, int n) { var raw = new float[(n + 1) / 2]; Dev.Download(b, raw); var u = MemoryMarshal.Cast<float, ushort>(raw.AsSpan()); var r = new float[n]; for (int i = 0; i < n; i++) r[i] = (float)BitConverter.UInt16BitsToHalf(u[i]); return r; }
     private float[] DownF(VulkanDevice.Buffer b, int n) { var r = new float[n]; Dev.Download(b, r); return r; }
 
     private readonly record struct Step(OlalaKernel Kernel, uint[] Push, uint Gx, uint Gy, uint Gz, VulkanDevice.Buffer[] Bufs);
@@ -116,7 +118,7 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
     [InlineData(1u)]
     public void CtxMix_MatchesReference(uint mode)
     {
-        int H = 2304, rows = 3, posBase = 14;
+        int H = 2304, rows = mode == 1 ? 45 : 3, posBase = 14;
         var taps = Rand(rows * 4 * H, 4).Select(Bf).ToArray();
         var mix = new float[] { 0.1f, 0.2f, 0.3f, 0.4f };
         var gamma = Rand(H).Select(x => 1 + x).ToArray();
@@ -135,8 +137,8 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
             var ring = DownF16(y, 16 * H);
             var got = new float[rows * H];
             for (int r = 0; r < rows; r++) Array.Copy(ring, ((posBase + r) % 16) * H, got, r * H, H);
-            Check("ctxmix f16 ring", want, got, 2e-3);
-            Assert.All(ring.Take(((posBase + 2) % 16 == 0 ? 1 : 0) * H), v => Assert.Equal(0f, v));
+            // rows r and r + 16 share a slot: the slot holds the LAST row written, so only the last 16 rows can be read back
+            Check("ctxmix f16 ring", want.AsSpan((rows - 16) * H).ToArray(), got.AsSpan((rows - 16) * H).ToArray(), 2e-3);
         }
     }
 
@@ -310,7 +312,7 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
         int shortRing = ring - 1;
         // Rebuild the cache at the short ring size, as the injection would: every position of the window, then the rows written ahead.
         var k2 = new float[shortRing * 8 * 128]; var v2 = new float[shortRing * 8 * 128];
-        for (int p = lo; p < pos0 + 3; p++)
+        for (int p = lo; p < pos0 + 4; p++)
         {
             int srcSlot = p % ring, dstSlot = p % shortRing;
             bool ahead = p >= pos0;   // rows written ahead hold different data
@@ -454,5 +456,90 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
         for (int i = 1; i < n; i++) worst = Math.Max(worst, Check($"mutant col {i}", refCols[i], r.Cols[i], 0, soft: true));
         _output.WriteLine($"mutant noState={noState} capFirst={capFirst}: worst normalised logit error {worst:E2}");
         Assert.True(worst > 0.05, "the mutant must be visible");
+    }
+
+    // ----- #2065: the conv rounds its in-batch history exactly like Inkling2ConvState.Run -----
+
+    private static string ShadersDir()
+    {
+        string d = AppContext.BaseDirectory;
+        for (int i = 0; i < 10 && d is not null; i++, d = Path.GetDirectoryName(d)!)
+            if (Directory.Exists(Path.Combine(d, "native", "vulkan", "shaders"))) return Path.Combine(d, "native", "vulkan", "shaders");
+        throw new DirectoryNotFoundException("native/vulkan/shaders");
+    }
+
+    /// <summary>Compiles the F32-activation conv shader with its source text edited (a mutant), into a fresh directory; null when glslc is unavailable.</summary>
+    private static string? CompileConvMutant(string find, string replace)
+    {
+        string src = File.ReadAllText(Path.Combine(ShadersDir(), "inkling2_conv.glsl"));
+        Assert.Contains(find, src);
+        string dir = Path.Combine(Path.GetTempPath(), "conv-mutant-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "inkling2_conv.glsl"), src.Replace(find, replace));
+        File.WriteAllText(Path.Combine(dir, "inkling2_conv_f32act.comp"), "#version 450\n#extension GL_GOOGLE_include_directive : require\n#define ACT_F32 1\n#include \"inkling2_conv.glsl\"\n");
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("glslc", $"--target-env=vulkan1.2 -O -I \"{ShadersDir()}\" -o \"{Path.Combine(dir, "inkling2_conv_f32act.spv")}\" \"{Path.Combine(dir, "inkling2_conv_f32act.comp")}\"")
+            { RedirectStandardError = true, UseShellExecute = false };
+            using var pr = System.Diagnostics.Process.Start(psi)!;
+            string err = pr.StandardError.ReadToEnd();
+            pr.WaitForExit();
+            Assert.True(pr.ExitCode == 0, err);
+            return dir;
+        }
+        catch (System.ComponentModel.Win32Exception) { return null; }
+    }
+
+    private (float[] y8, float[] y1, byte[] st8, byte[] st1) ConvEightVsSingles(string? dir, bool dyn)
+    {
+        int C = 300, T = 8, heads = 3;
+        var x = Rand(T * C, 3f);                 // F32 activations that are NOT BF16-exact (the reference arm)
+        var w = Rand(C * 4);
+        var dynv = Rand(T * heads * 4);
+        var st0 = Zero(C * 3 * 2L);
+        var y8b = Zero(T * C * 4L);
+        var xb = UpF(x); var wb = UpF(w); var db = UpF(dynv);
+        uint dy = dyn ? 1u : 0u;
+        Run(new Step(KIn(dir, "inkling2_conv_f32act", 7, 6, dy, 0, 0), [(uint)C, (uint)T, (uint)heads, 0, 0, 0], (uint)((C + 63) / 64), 1, 1, [xb, wb, db, st0, db, y8b, db]));
+        var y8 = DownF(y8b, T * C);
+        var st8 = new float[(C * 3 * 2 + 3) / 4]; Dev.Download(st0, st8);
+
+        var st1b = Zero(C * 3 * 2L);
+        var y1 = new float[T * C];
+        for (int t = 0; t < T; t++)
+        {
+            var yb = Zero(C * 4L);
+            var dyn1 = UpF(dynv.AsSpan(t * heads * 4, heads * 4).ToArray());
+            Run(new Step(KIn(dir, "inkling2_conv_f32act", 7, 6, dy, 0, 0), [(uint)C, 1, (uint)heads, 0, 0, 0], (uint)((C + 63) / 64), 1, 1, [UpF(x.AsSpan(t * C, C).ToArray()), wb, dyn1, st1b, dyn1, yb, dyn1]));
+            Array.Copy(DownF(yb, C), 0, y1, t * C, C);
+        }
+        var s1 = new float[(C * 3 * 2 + 3) / 4]; Dev.Download(st1b, s1);
+        return (y8, y1, MemoryMarshal.AsBytes(st8.AsSpan()).ToArray(), MemoryMarshal.AsBytes(s1.AsSpan()).ToArray());
+    }
+
+    /// <summary>An 8-row conv forward equals 8 single-row forwards BIT FOR BIT in the F32-activation reference arm too (#2065), with and without dynamic taps.</summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Conv_EightRows_EqualEightSingleRows_BitForBit(bool dyn)
+    {
+        var (y8, y1, st8, st1) = ConvEightVsSingles(null, dyn);
+        for (int i = 0; i < y8.Length; i++) Assert.True(BitConverter.SingleToInt32Bits(y8[i]) == BitConverter.SingleToInt32Bits(y1[i]), $"dyn={dyn}: element {i} differs ({y8[i]} vs {y1[i]})");
+        Assert.True(st8.AsSpan().SequenceEqual(st1), "carried state differs");
+    }
+
+    /// <summary>Mutant: the in-batch history is NOT rounded (the shader before #2065); the 8-row forward must then differ from the single-row forwards.</summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Conv_WithoutInBatchRounding_Mutant_IsCaught(bool dyn)
+    {
+        string? dir = CompileConvMutant("s2 = bf16ToF(fToBf16(x));", "s2 = x;");
+        Skip.If(dir is null, "glslc not on PATH");
+        var (y8, y1, _, _) = ConvEightVsSingles(dir, dyn);
+        int differ = 0;
+        for (int i = 0; i < y8.Length; i++) if (BitConverter.SingleToInt32Bits(y8[i]) != BitConverter.SingleToInt32Bits(y1[i])) differ++;
+        _output.WriteLine($"mutant (history unrounded), dyn={dyn}: {differ} of {y8.Length} outputs differ from the single-row forwards");
+        Assert.True(differ > 0, "the unrounded-history mutant survived");
     }
 }
