@@ -12,9 +12,12 @@ Primary chat endpoint. Accepts OpenAI-compatible request format.
 **Images (issue #2035).** `content` may be an array of parts: `{"type":"text","text":...}` and `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`
 (PNG or binary PPM; JPEG is rejected with 400 `invalid_image`; remote URLs are not fetched). Supported by vision models only (Inkling 2, CPU backend today); the vision
 projector is the `mmproj*.gguf` next to the model file (or `DOTLLM_MMPROJ`), loaded on the first image request. A request with images bypasses the continuous-batch scheduler and
-reuses/retains no prompt prefix cache. Untrusted-input bounds (checked before any encode): at most 16 images and 2^26 decoded pixels per request, 2^25 pixels / 65536 per side
-per image (refused from the PNG header, before allocating), one rendered placeholder per image, and the prompt widened by the images' token counts must fit the context
-(400 `context_length_exceeded`; `max_tokens` is clamped to what is left). Images cannot be combined with `lora_adapter` yet. See `docs/INKLING2.md` section 11.
+reuses/retains no prompt prefix cache. A text part may carry a `chunk` annotation (see the chunk-cache section). Untrusted-input bounds (checked before any encode) are
+**configurable**; defaults: 16 images per request (`--max-images`, `DOTLLM_IMAGE_MAX_IMAGES`), 2^26 decoded pixels per request (`--max-request-image-pixels`, `DOTLLM_IMAGE_MAX_REQUEST_PIXELS`),
+2^25 pixels per image (`--max-image-pixels`, `DOTLLM_IMAGE_MAX_PIXELS`) and 65536 per side (`--max-image-side`, `DOTLLM_IMAGE_MAX_SIDE`), refused from the PNG header before allocating; a PNG
+stream too short for its declared size is refused (the deflate-ratio bound); one rendered placeholder per image; and the prompt widened by the images' token counts must fit the context
+(400 `context_length_exceeded`; `max_tokens` is clamped to what is left, after the thinking-budget reserve). An image needing more than 4,096 image tokens is **refused** (400) by default;
+`--image-over-limit downscale` (`DOTLLM_IMAGE_OVER_LIMIT=downscale`) resizes it to fit with llama.cpp's bicubic instead. Images cannot be combined with `lora_adapter` (400). See `docs/INKLING2.md` section 12.
 
 **Request body**:
 ```json
@@ -75,7 +78,7 @@ annotations are validated and run under `exact` (default) or `shadow`: the outpu
 request, and the response gains a `chunk_cache` report (blocking response; the finish-reason chunk when streaming) and
 `timings.chunk_n` / `chunk_recomputed_n` (0). `balanced` / `fast` / `auto` are served `exact` with a reason. With the
 flag off it is ignored like any unknown field, so an annotated body behaves byte for byte like the plain one. On this surface a span
-addresses a message's string `content` through the manifest; array `content` stays a 400. Store lookups use the caller's
+addresses a message's string `content` through the manifest (`part: 0`), or a `text` part of array `content` (manifest `at.part` is the index in the array, or an inline `chunk` on the part; ruling 19, which refused array content, was superseded on 2026-11-27, #2035). Store lookups use the caller's
 server-assigned namespace (its `--chunk-cache-api-keys` key, or the default for a local caller); a caller the chunk-cache
 control plane would refuse is still served, but with no store lookups, and `report: "per_chunk"` adds per-chunk status
 only for an authenticated caller ([Chunk-cache authentication](#chunk-cache-authentication-opt-in)). The control plane,

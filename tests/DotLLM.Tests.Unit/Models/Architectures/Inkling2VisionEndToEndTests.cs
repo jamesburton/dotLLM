@@ -167,16 +167,69 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
     }
 
     /// <summary>
-    /// Review finding: the chunk-relative-index mutant of <c>TryImageRow</c> (image rows looked up by the position inside the chunk instead of the absolute position)
-    /// was killed only by rainbow640. The prefill here runs in chunks of 5 and 7 tokens, so the image rows of the small images straddle chunk boundaries at
-    /// offsets that differ from the 32-token reference run; the final-position logits must not depend on the chunk size (KL below 1e-3, text-only
-    /// chunk-size noise is about 1e-5), on two images of different size and padding.
+    /// Review finding: the chunk-relative-index mutant of <c>TryImageRow</c> (image rows looked up by the position inside the chunk instead of the absolute
+    /// position) was killed only by rainbow640. This is the exact, noise-free check on two more images: prefill in chunks of 4, 5 and 7 tokens (the image rows
+    /// straddle chunk boundaries at offsets different from the 32-token run) and compare the <c>embed</c> trace of every chunk with the rows it must hold: an
+    /// image position holds the encoder's row (F16 to F32, no norm), a text position the RMS-normalised token embedding (the other chunking's rows).
     /// </summary>
     [SkippableTheory]
     [InlineData("rainbow80", 5)]
     [InlineData("rainbow190x110", 7)]
     [InlineData("rainbow190x110", 4)]
-    public void ChunkedPrefill_ImageRows_AreChunkSizeInvariant(string name, int chunk)
+    public void ChunkedPrefill_ImageRows_AreAddressedByAbsolutePosition(string name, int chunk)
+    {
+        var o = LoadOracle(name);
+        Skip.If(o is null, "vision oracle not generated");
+        var (model, enc) = Models();
+        using var emb = enc.Encode(o!.Image);
+        var prompt = o.Before.Concat(Enumerable.Repeat(200054, emb.Tokens)).Concat(o.After).ToArray();
+        var spans = new[] { new ImageSpan(o.Before.Length, emb) };
+        int H = model.Config.HiddenSize;
+
+        float[] Embeds(int ch)
+        {
+            var all = new float[prompt.Length * H];
+            int at = 0;
+            model.Trace = (n, data, rows, cols) =>
+            {
+                if (n == "embed") { data.CopyTo(all.AsSpan(at * H, rows * cols)); }
+            };
+            try
+            {
+                var state = model.CreateState();
+                for (at = 0; at < prompt.Length; at += ch)
+                {
+                    int len = Math.Min(ch, prompt.Length - at);
+                    using var t = model.ForwardWithImagesAndState(prompt.AsSpan(at, len), Enumerable.Range(at, len).ToArray(), -1, state, spans, lastTokenLogitsOnly: true);
+                }
+            }
+            finally { model.Trace = null; }
+            return all;
+        }
+        var reference = Embeds(prompt.Length);   // one chunk: no boundary at all
+        var chunked = Embeds(chunk);
+        Assert.Equal(reference, chunked);        // identical, bit for bit, at every position
+        var row = new float[H];
+        for (int i = 0; i < emb.Tokens; i++)
+        {
+            emb.ReadRow(i, row);
+            Assert.Equal(row, chunked.AsSpan((o.Before.Length + i) * H, H).ToArray());   // image positions hold the encoder rows, not token rows
+        }
+        Assert.NotEqual(chunked.AsSpan(0, H).ToArray(), chunked.AsSpan(o.Before.Length * H, H).ToArray());
+    }
+
+    /// <summary>
+    /// MEASUREMENT (an open finding, not a gate): how much the final-position logits of an IMAGE prompt depend on the prefill chunk size, against the text-only
+    /// control (the same prompt with the placeholder token's own embedding instead of the image rows) chunked the same way. The text control is chunk-size
+    /// invariant (KL 3e-5 to 2e-4); the image prompt is not (KL 2e-3 to 1.3e-1, same top-1). The embedding rows are identical (see the exact test), so the
+    /// difference arises downstream, plausibly from the large-norm image rows making the Q8_0 activation quantisation sensitive to summation-order drift
+    /// between the GEMV / GEMM paths; unresolved, reported to the user.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("rainbow80", 5)]
+    [InlineData("rainbow190x110", 7)]
+    [InlineData("rainbow190x110", 4)]
+    public void Report_ChunkSizeDependenceOfImagePrefill(string name, int chunk)
     {
         var o = LoadOracle(name);
         Skip.If(o is null, "vision oracle not generated");
@@ -184,9 +237,22 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
         var reference = RunRows(o!, model, enc).Rows[0];
         var chunked = RunRows(o!, model, enc, chunk: chunk).Rows[0];
         var (kl, same) = FullKl(reference, chunked);
-        _output.WriteLine($"{name} chunk {chunk}: KL vs chunk 32 {kl:E2}, same top-1 {same}");
-        Assert.True(same);
-        Assert.True(kl < 1e-3, $"chunk {chunk} changed the final logits (KL {kl:E2}): image rows are not addressed by absolute position");
+        float[] TextLast(int ch)
+        {
+            var prompt = o!.Before.Concat(Enumerable.Repeat(200054, o.ImageTokens)).Concat(o.After).ToArray();
+            var state = model.CreateState();
+            float[] last = [];
+            for (int at = 0; at < prompt.Length; at += ch)
+            {
+                int len = Math.Min(ch, prompt.Length - at);
+                using var t = model.ForwardWithState(prompt.AsSpan(at, len), Enumerable.Range(at, len).ToArray(), -1, state, lastTokenLogitsOnly: true);
+                if (at + len == prompt.Length) last = Row(t, 0, model.Config.VocabSize);
+            }
+            return last;
+        }
+        var (controlKl, _) = FullKl(TextLast(32), TextLast(chunk));
+        _output.WriteLine($"{name} chunk {chunk}: image KL vs chunk 32 {kl:E2} (same top-1 {same}); text-only control KL {controlKl:E2}");
+        Assert.True(same, "the top-1 token must not depend on the chunk size");
     }
 
     /// <summary>

@@ -28,6 +28,7 @@ public sealed class Inkling2VisionAllocationTests
         Skip.If(!File.Exists(ppm), "vision oracle images not generated");
         var image = ImageDecoder.Load(ppm);
         using var enc = Inkling2VisionEncoder.Load(mm!, new ThreadingConfig(8));
+        enc.ScratchKeepBytes = long.MaxValue;   // this test is about warm managed allocation: keep the scratch resident (the default releases above 128 MB)
         for (int i = 0; i < 2; i++) enc.Encode(image).Dispose();   // JIT, scratch growth, kernel scratch
 
         GC.Collect(); GC.WaitForPendingFinalizers();
