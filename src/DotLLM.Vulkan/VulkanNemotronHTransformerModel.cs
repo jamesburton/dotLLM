@@ -1797,17 +1797,12 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
         MoeGroupedMatmulKQuantCoopmatKernel? Cm4, MoeGroupedMatmulKQuantCoopmatKernel? Cm5, MoeGroupedMatmulKQuantCoopmatKernel? Cm6);
 
     /// <summary>
-    /// Creates the expert-grouped prefill kernels (#1046), mirroring the Qwen3-MoE host's set (#637 / #691 / #986): the shared glue, the dp4a
-    /// MMQ grouped kernels (Q4_K / Q5_K, Q8_1 activations, needs integer dot product) and the coopmat grouped kernels (Q4_K / Q5_K / Q6_K, F16
-    /// activations, needs cooperative matrices). Anything missing stays null and the layers it would serve keep the indexed path.
-    /// </summary>
-    /// <summary>
     /// #2041: <c>DOTLLM_VK_NEMOTRON_MOE_CM1_TILE</c> = 32 / 64 pins the token-row tile of the grouped int8-coopmat expert GEMMs;
     /// unset or "auto" picks it per batch from the mean routed rows per expert (<see cref="SelectCm1RowTile"/>).
     /// </summary>
     private static readonly int Cm1RowTileOverride = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_MOE_CM1_TILE"), out int t) && t is 32 or 64 ? t : 0;
 
-    /// <summary>The 16- and 32-row-tile grouped int8-coopmat kernels for every bank type the 64-row ones serve; entries missing when the SPIR-V is absent.</summary>
+    /// <summary>The 32-row-tile grouped int8-coopmat kernels for every bank type the 64-row ones serve; entries missing when the SPIR-V is absent.</summary>
     private static Dictionary<(QuantizationType, int), MatMulMmqCm1Kernel> CreateNarrowCm1(VulkanDevice device, string spvDir)
     {
         var map = new Dictionary<(QuantizationType, int), MatMulMmqCm1Kernel>();
@@ -1835,6 +1830,11 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
     /// <summary>Measured on Nemotron 3.5 Lightning (#2041): 32 beats 64 by 13% at 6 rows/expert (pp128), ties at 24 (pp512); 16 loses at both.</summary>
     private const int Cm1Tile32MaxMeanRows = 40;
 
+    /// <summary>
+    /// Creates the expert-grouped prefill kernels (#1046), mirroring the Qwen3-MoE host's set (#637 / #691 / #986): the shared glue, the dp4a
+    /// MMQ grouped kernels (Q4_K / Q5_K, Q8_1 activations, needs integer dot product) and the coopmat grouped kernels (Q4_K / Q5_K / Q6_K, F16
+    /// activations, needs cooperative matrices). Anything missing stays null and the layers it would serve keep the indexed path.
+    /// </summary>
     private static GroupedMoeKernels CreateGroupedMoeKernels(VulkanDevice device, string spvDir, bool dp4a)
     {
         if (!MoeExpandGatherGroupF32Kernel.IsSupportedOn(spvDir) || !MoeWeightedScatterGroupedF32Kernel.IsSupportedOn(spvDir))

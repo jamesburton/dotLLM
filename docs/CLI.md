@@ -1235,6 +1235,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_VK_NEMOTRON_GEMV_ROWS` | Environment override of the exact GEMVs' rows per workgroup, decode,verify (tuning A/B; e.g. 2,4). | `VulkanNemotronHTransformerModel.DFlash.cs` |
 | `DOTLLM_VK_NEMOTRON_KQUANT_NR` | (not described in source) | `VulkanNemotronHTransformerModel.DFlash.cs` |
 | `DOTLLM_VK_NEMOTRON_KQUANT_ROWS` | #1459: per-n NR for the legacy-quant / Q8_0 kernels (Nano Q4_K_M sweep); an explicit DOTLLM_VK_NEMOTRON_GEMV_ROWS wins. | `VulkanNemotronHTransformerModel.DFlash.cs` |
+| `DOTLLM_VK_NEMOTRON_MOE_CM1_TILE` | #2041: DOTLLM_VK_NEMOTRON_MOE_CM1_TILE = 32 / 64 pins the token-row tile of the grouped int8-coopmat expert GEMMs; unset or "auto" picks it per batch from the mean routed rows per expert (SelectCm1RowTile). | `VulkanNemotronHTransformerModel.cs` |
 | `DOTLLM_VK_NEMOTRON_MOE_GROUPED` | DOTLLM_VK_NEMOTRON_MOE_GROUPED=0 keeps every routed layer on the indexed (per-row) expert kernels (#1046). | `VulkanNemotronHTransformerModel.cs` |
 | `DOTLLM_VK_NEMOTRON_MOE_GROUPED_MIN_TOKENS` | Smallest batch that takes the grouped prefill; below it the indexed MMVQ wins (same threshold as the Qwen3-MoE host). | `VulkanNemotronHTransformerModel.cs` |
 | `DOTLLM_VK_NEMOTRON_MOE_MMVQ` | DOTLLM_VK_NEMOTRON_MOE_MMVQ=0 routes the routed experts through the F32-activation indexed kernels (exact reference arm) instead of dp4a MMVQ. | `VulkanNemotronHTransformerModel.cs` |

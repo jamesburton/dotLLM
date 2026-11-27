@@ -166,7 +166,6 @@ public sealed class VulkanMatMulMmqCm1KernelTests(ITestOutputHelper output)
         Assert.True(worst <= 2e-4 * scale + 1e-5, $"max |ref - grouped mmq_cm1| = {worst:E3} against max |ref| {scale:E3}");
     }
 
-    /// <summary>Opt-in (<c>DOTLLM_GEMM_SHAPE_PROBE=1</c>): steady-state TFLOP/s of the int8-coopmat GEMM (+ its Q8_1 quantize) vs the F16 coopmat GEMM at the Qwen3.8-27B prefill shapes.</summary>
     /// <summary>
     /// #2041: the 32-row-token-tile grouped kernel computes the same bits as the 64-row one. Each output row is an independent int32 dot per 32-block, so only
     /// the tiling differs. Covers the dense 3-D grid and the GPU tile list built with 32-row tiles; a tile list built with 64-row tiles for the 32-row kernel
@@ -255,6 +254,22 @@ public sealed class VulkanMatMulMmqCm1KernelTests(ITestOutputHelper output)
         Assert.True(mispairedDiff > 0, "negative control: a 64-row tile list driving the 32-row kernel must skip rows, or this test cannot see a tiling error.");
     }
 
+    /// <summary>
+    /// #2041: the row-tile policy boundary. 32-row tiles up to a mean of 40 routed rows per expert (integer mean), 64 above. Output is bit-identical
+    /// either way, so only this test can see a moved boundary (e.g. <c>&lt;=</c> turned into <c>&lt;</c>).
+    /// </summary>
+    [SkippableFact]
+    public void SelectCm1RowTile_Boundary()
+    {
+        Skip.IfNot(string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_MOE_CM1_TILE")), "DOTLLM_VK_NEMOTRON_MOE_CM1_TILE pins the tile.");
+        Assert.Equal(32, VulkanNemotronHTransformerModel.SelectCm1RowTile(rows: 128 * 6, numExperts: 128));      // pp128, Nano geometry: 6 rows/expert
+        Assert.Equal(32, VulkanNemotronHTransformerModel.SelectCm1RowTile(rows: 40 * 128, numExperts: 128));     // mean exactly 40
+        Assert.Equal(32, VulkanNemotronHTransformerModel.SelectCm1RowTile(rows: 41 * 128 - 1, numExperts: 128)); // floor(mean) still 40
+        Assert.Equal(64, VulkanNemotronHTransformerModel.SelectCm1RowTile(rows: 41 * 128, numExperts: 128));     // mean 41
+        Assert.Equal(64, VulkanNemotronHTransformerModel.SelectCm1RowTile(rows: 4096 * 6, numExperts: 128));
+    }
+
+    /// <summary>Opt-in (<c>DOTLLM_GEMM_SHAPE_PROBE=1</c>): steady-state TFLOP/s of the int8-coopmat GEMM (+ its Q8_1 quantize) vs the F16 coopmat GEMM at the Qwen3.8-27B prefill shapes.</summary>
     [SkippableFact]
     public void Probe_Qwen38Shapes()
     {
