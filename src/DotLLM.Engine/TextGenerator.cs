@@ -36,6 +36,7 @@ public sealed partial class TextGenerator
     private readonly PromptLookupOptions? _promptLookup;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _draftKvCacheFactory;
     private readonly int _speculativeCandidates;
+    private bool _warnedDraftUnsupported;
     private readonly int _mtpCandidates;   // MTP depth: the model's preferred K when the caller kept the library default
     private readonly bool _mtpEnabled;
     private readonly HybridPrefillDecodeStrategy? _hybridStrategy;
@@ -737,7 +738,7 @@ public sealed partial class TextGenerator
             }
 
             int specDrafted = 0, specAccepted = 0, specSteps = 0;
-            bool useDraftSpec = _draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options);
+            bool useDraftSpec = UseDraftSpec(captureLogprobs, options);
             bool useLookupSpec = UsePromptLookup(useDraftSpec, useMtp, captureLogprobs, options);
             int mtpFallbackStep = 0;                // > 0: the MTP rounds measured slower than plain decode; plain decode resumes at this step (#900)
             long mtpTicks = 0; int mtpTokens = 0;   // MTP-segment wall ticks / committed tokens, for the adaptive gate
@@ -752,7 +753,7 @@ public sealed partial class TextGenerator
                     greedy: true, seed: options.Seed);
                 Core.Attention.IKvCache? draftKvCache = useDraftSpec ? AllocateDraftKvCache(cacheSize) : null;
                 PromptLookupDrafter? lookup = useLookupSpec ? CreatePromptLookupDrafter(promptIds, generatedIds, cacheSize) : null;
-                int specK = lookup is null ? _speculativeCandidates : Math.Min(_promptLookup!.DraftTokens, _model.MaxAllRowLogitsLength - 1);
+                int specK = Math.Min(lookup is null ? _speculativeCandidates : _promptLookup!.DraftTokens, _model.MaxAllRowLogitsLength - 1);
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(specK + 1);
                 try
                 {
@@ -1295,7 +1296,7 @@ public sealed partial class TextGenerator
             }
 
             int specDrafted = 0, specAccepted = 0, specSteps = 0;
-            bool useDraftSpec = _draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options);
+            bool useDraftSpec = UseDraftSpec(captureLogprobs, options);
             bool useLookupSpec = UsePromptLookup(useDraftSpec, useMtp, captureLogprobs, options);
 
             // Speculative decode disabled when logprobs requested — no per-position logit access.
@@ -1307,7 +1308,7 @@ public sealed partial class TextGenerator
                     greedy: true, seed: options.Seed);
                 Core.Attention.IKvCache? draftKvCache = useDraftSpec ? AllocateDraftKvCache(cacheSize) : null;
                 PromptLookupDrafter? lookup = useLookupSpec ? CreatePromptLookupDrafter(promptIds, generatedIds, cacheSize) : null;
-                int specK = lookup is null ? _speculativeCandidates : Math.Min(_promptLookup!.DraftTokens, _model.MaxAllRowLogitsLength - 1);
+                int specK = Math.Min(lookup is null ? _speculativeCandidates : _promptLookup!.DraftTokens, _model.MaxAllRowLogitsLength - 1);
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(specK + 1);
                 try
                 {
@@ -1925,6 +1926,24 @@ public sealed partial class TextGenerator
     private static bool IsEffectivelyGreedy(DotLLM.Core.Configuration.InferenceOptions options)
         => options.Temperature <= 0f && options.RepetitionPenalty == 1.0f
            && !options.IgnoreEos && options.MinTokens <= 0;   // #1345: the mask changes the argmax; a raw-argmax verify would not see it
+
+    // Draft-model speculation is greedy-only and, like prompt lookup, needs a verify forward that returns every row's logits:
+    // widened here where the backend allows it. A last-row-only target (the dense CUDA host) decodes without the draft (#2030).
+    private bool UseDraftSpec(bool captureLogprobs, DotLLM.Core.Configuration.InferenceOptions options)
+    {
+        if (_draftModel is null || captureLogprobs || !IsEffectivelyGreedy(options))
+            return false;
+        _model.TrySetAllRowLogitsLimit(_speculativeCandidates + 1);
+        if (_model.MaxAllRowLogitsLength > 1)
+            return true;
+        if (!_warnedDraftUnsupported)
+        {
+            _warnedDraftUnsupported = true;
+            Console.Error.WriteLine($"[spec] draft model ignored: {_model.GetType().Name} returns only the last row of logits; " +
+                "decoding without speculation.");
+        }
+        return false;
+    }
 
     // Prompt lookup (#1293) is the fallback draft source: a draft model or an MTP round takes priority. It shares the draft-model
     // path's greedy gate, since its drafts carry no probabilities for sampled acceptance. It also needs a verify forward that

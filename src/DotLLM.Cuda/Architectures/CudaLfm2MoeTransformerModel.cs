@@ -213,6 +213,9 @@ public sealed unsafe class CudaLfm2MoeTransformerModel : IModel
             CudaDriverApi.cuMemsetD8_v2(l.ConvState, 0, (nuint)((long)(Config.ShortConvCacheLength - 1) * Config.HiddenSize * 4)).ThrowOnError();
     }
     /// <inheritdoc/>
+    public int MaxAllRowLogitsLength => Math.Max(1, _allRowLogitsLimit);
+
+    /// <inheritdoc/>
     public bool TrySetAllRowLogitsLimit(int maxSeqLen) { _allRowLogitsLimit = Math.Max(_allRowLogitsLimit, maxSeqLen); return true; }
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId) => Forward(tokenIds, positions, deviceId, null);
