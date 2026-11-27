@@ -217,7 +217,12 @@ public static class VulkanModelLoader
             }
 
             case Architecture.Inkling2:
-                throw new NotSupportedException(Inkling2Config.UnsupportedMessage("Vulkan"));
+            {
+                // Thinking Machines Inkling 2 (#2034): looped MoE, depth mixing, relative-position attention. BF16 activations, F16 (or q8_0) ring/linear KV,
+                // NVFP4 / Q8_0 weights read in place. The model owns its sequence state (KV + conv state), so the engine KV cache is unused.
+                var inkling = VulkanInkling2TransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+                return (inkling, size => inkling.CreateKvCacheHandle(size));
+            }
 
             case Architecture.Mamba3:
                 throw new NotSupportedException(
