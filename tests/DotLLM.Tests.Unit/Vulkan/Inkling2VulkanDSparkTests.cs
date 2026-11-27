@@ -154,10 +154,10 @@ public sealed class Inkling2VulkanDSparkTests : IClassFixture<VkInklingFixture>
 
     // ───────────── probes (teacher-forced drafts) ─────────────
 
-    private (int[][] Drafts, float[][] Sig) Probe(VulkanInkling2TransformerModel m, int[] tokens, int firstProbe, int stride, int k, int chunk, int ring = 0, DSparkMutant[]? draftMutants = null)
+    private (int[][] Drafts, float[][] Sig) Probe(VulkanInkling2TransformerModel m, int[] tokens, int firstProbe, int stride, int k, int chunk, int ring = 0, DSparkMutant[]? draftMutants = null, int globalInitial = 0)
     {
         m.ResetSequenceState();
-        using var st = ring > 0 ? m.CreateDSparkState(ring) : (VulkanInkling2DSparkState)m.CreateMtpState()!;
+        using var st = ring > 0 || globalInitial > 0 ? m.CreateDSparkState(ring > 0 ? ring : m.RingPositionsFor(), globalInitial) : (VulkanInkling2DSparkState)m.CreateMtpState()!;
         var all = new[] { DSparkMutant.None }.Concat(draftMutants ?? []).ToArray();
         var drafts = new List<int[]>(); var sigs = new List<float[]>();
         int p = 0;
@@ -377,5 +377,38 @@ public sealed class Inkling2VulkanDSparkTests : IClassFixture<VkInklingFixture>
         int dd = 0; for (int j = 0; j < drafts[0].Length; j++) if (drafts[0][j] != drafts[1][j] || drafts[0][j] != drafts[2][j]) dd++;
         Assert.Equal(0, dd);
         _out.WriteLine($"draft signatures differing between two prefills: {dd} of {drafts[0].Length}; within one prefill, draft run 1 vs 2: {Enumerable.Range(0, drafts[0].Length / 2).Count(j => drafts[0][j] != drafts[0][j + drafts[0].Length / 2])}");
+    }
+
+    /// <summary>
+    /// The global layer's buffer doubles on demand from 1,024 positions with a device-side copy of the history: a state that starts at 4,096 positions (no growth) and one that grows 1024 -> 2048 -> 4096
+    /// must draft identically at ~4000 tokens, and refused admission turns the state unusable (anchor repeated, no exception, no spill).
+    /// </summary>
+    [SkippableFact]
+    public void GlobalLayerGrowth_CopiesHistory_AndRefusedAdmissionDegradesWithoutThrowing()
+    {
+        var m = Model();
+        var rng = new Random(2061);
+        int[] tokens = Enumerable.Range(0, 4030).Select(_ => rng.Next(1000, 120000)).ToArray();
+        var (_, grown) = Probe(m, tokens, 4000, 10, 3, 64);
+        var (_, preset) = Probe(m, tokens, 4000, 10, 3, 64, 0, null, globalInitial: 4096);
+        double diff = MaxDiff(grown, preset);
+        _out.WriteLine($"global layer grown 1024 -> 4096 vs preset 4096 at ~4000 tokens: max |draft logit diff| {diff:E2}");
+        Assert.True(diff == 0, "growing the global K/V buffer must not change the drafts");
+
+        var seq = ShortSequence();
+        m.ResetSequenceState();
+        VulkanKvCache.GrowthAdmissionOverride = (_, _) => false;
+        try
+        {
+            using var st = (VulkanInkling2DSparkState)m.CreateMtpState()!;
+            // 2,000 tokens: the global layer must grow past its first 1,024 positions, which is refused.
+            int[] big = Enumerable.Range(0, 2000).Select(_ => rng.Next(1000, 120000)).ToArray();
+            int p = 0;
+            while (p < big.Length) { int n = Math.Min(128, big.Length - p); using (m.Forward(big[p..(p + n)], Enumerable.Range(p, n).ToArray(), -1, null, null, st, true)) { } p += n; }
+            Assert.True(st.Unusable, "a refused growth must mark the drafter unusable");
+            Assert.Equal(777, st.NextDraft(777, big.Length));   // the anchor repeated, no exception
+        }
+        finally { VulkanKvCache.GrowthAdmissionOverride = null; m.ResetSequenceState(); }
+        _ = seq;
     }
 }

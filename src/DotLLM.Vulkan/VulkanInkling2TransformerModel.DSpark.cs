@@ -161,8 +161,8 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
     internal int RingPositionsFor() => (_dsd?.Spec.Window ?? 1025) + _chunk;
 
     /// <summary>Opens a state with an explicit ring size (tests: the one-row-too-short mutant).</summary>
-    internal VulkanInkling2DSparkState CreateDSparkState(int ringPositions)
-        => new(this, ringPositions);
+    internal VulkanInkling2DSparkState CreateDSparkState(int ringPositions, int globalInitialPositions = 0)
+        => new(this, ringPositions, globalInitialPositions);
 
     private VulkanInkling2DSparkState? AsState(IMtpState? s)
         => s is null ? null : s as VulkanInkling2DSparkState ?? throw new NotSupportedException($"{nameof(VulkanInkling2TransformerModel)} drafts only with DSpark states.");
@@ -544,7 +544,7 @@ internal sealed class VulkanInkling2DSparkState : IMtpState
     internal bool Unusable { get; private set; }
     internal string? UnusableReason { get; private set; }
 
-    internal VulkanInkling2DSparkState(VulkanInkling2TransformerModel m, int ringPositions)
+    internal VulkanInkling2DSparkState(VulkanInkling2TransformerModel m, int ringPositions, int globalInitialPositions = 0)
     {
         _m = m;
         _spec = m.DSparkSpec ?? throw new InvalidOperationException("No DSpark drafter attached.");
@@ -558,7 +558,7 @@ internal sealed class VulkanInkling2DSparkState : IMtpState
         {
             for (int i = 0; i < K.Length; i++)
             {
-                int cap = _spec.Local[i] ? ringPositions : Math.Min(m.Config.MaxSequenceLength, 1024);
+                int cap = _spec.Local[i] ? ringPositions : Math.Min(m.Config.MaxSequenceLength, globalInitialPositions > 0 ? globalInitialPositions : 1024);
                 K[i] = dev.AllocateDeviceLocal((long)cap * _kvDim * 2); V[i] = dev.AllocateDeviceLocal((long)cap * _kvDim * 2); Capacity[i] = cap;
             }
             Frnn = dev.AllocateDeviceLocal(16L * _spec.Hidden * 2);
