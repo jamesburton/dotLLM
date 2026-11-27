@@ -145,9 +145,9 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
     }
 
     /// <summary>Runs the image prompt then teacher-forces the oracle's continuation, scoring every row.</summary>
-    private Score Run(Oracle o, Inkling2TransformerModel model, Inkling2VisionEncoder encoder, int? placeholder = null)
+    private Score Run(Oracle o, Inkling2TransformerModel model, Inkling2VisionEncoder encoder, int? placeholder = null, int chunk = 32)
     {
-        var (rows, mism) = RunRows(o, model, encoder, placeholder);
+        var (rows, mism) = RunRows(o, model, encoder, placeholder, chunk);
         return ScoreRows(o, rows, mism);
     }
 
@@ -219,17 +219,16 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
     }
 
     /// <summary>
-    /// MEASUREMENT (an open finding, not a gate): how much the final-position logits of an IMAGE prompt depend on the prefill chunk size, against the text-only
-    /// control (the same prompt with the placeholder token's own embedding instead of the image rows) chunked the same way. The text control is chunk-size
-    /// invariant (KL 3e-5 to 2e-4); the image prompt is not (KL 2e-3 to 1.3e-1, same top-1). The embedding rows are identical (see the exact test), so the
-    /// difference arises downstream, plausibly from the large-norm image rows making the Q8_0 activation quantisation sensitive to summation-order drift
-    /// between the GEMV / GEMM paths; unresolved, reported to the user.
+    /// Gate: the final-position logits of an IMAGE prompt do not depend on the prefill chunk size. Before the conv-history fix (#2039 commit 4f01904d: in-batch
+    /// conv history was not rounded to the BF16 state type while the stored state is, so N-row forwards differed from N single-row forwards) the KL against the
+    /// 32-token run was 1.9e-3 (chunk 5, image 80), 5.5e-2 (chunk 7) and 1.3e-1 (chunk 4) on 190x110, while the text-only control (no image rows) was 3e-5 to
+    /// 2e-4: the image rows' large norms exposed the rounding at every chunk boundary. After it both are exactly 0. Gate: below 1e-5.
     /// </summary>
     [SkippableTheory]
     [InlineData("rainbow80", 5)]
     [InlineData("rainbow190x110", 7)]
     [InlineData("rainbow190x110", 4)]
-    public void Report_ChunkSizeDependenceOfImagePrefill(string name, int chunk)
+    public void ChunkedPrefill_ImageLogits_AreChunkSizeInvariant(string name, int chunk)
     {
         var o = LoadOracle(name);
         Skip.If(o is null, "vision oracle not generated");
@@ -253,6 +252,27 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
         var (controlKl, _) = FullKl(TextLast(32), TextLast(chunk));
         _output.WriteLine($"{name} chunk {chunk}: image KL vs chunk 32 {kl:E2} (same top-1 {same}); text-only control KL {controlKl:E2}");
         Assert.True(same, "the top-1 token must not depend on the chunk size");
+        Assert.True(kl < 1e-5, $"chunk {chunk} moved the image prompt logits by KL {kl:E2} (text-only control {controlKl:E2})");
+    }
+
+    /// <summary>
+    /// Gate: the engine's default prefill (<c>--prefill-chunk-size 0</c>: the whole prompt in one pass, and how mtmd evaluates the oracle) against llama.cpp,
+    /// on the three images, with the same bound as the 32-token gate. Measured after the conv-history fix: identical to the 32-token run to the printed digits
+    /// (mean KL 2.45e-3 / 4.43e-3 / 5.18e-3).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("rainbow80")]
+    [InlineData("rainbow190x110")]
+    [InlineData("rainbow640")]
+    public void ImagePrompt_SinglePassPrefill_MatchesLlamaCpp(string name)
+    {
+        var o = LoadOracle(name);
+        Skip.If(o is null, "vision oracle (vision/<name>/logits.f32) not generated");
+        var (model, enc) = Models();
+        var s = Run(o!, model, enc, chunk: 100_000);
+        _output.WriteLine($"{name} single pass: mean KL {s.MeanKl:E2}, max KL {s.MaxKl:E2}, top-1 {s.Top1}/{s.Rows}, greedy mismatches {s.GreedyMismatch}");
+        Assert.True(s.MeanKl < Gate, $"mean KL {s.MeanKl:E2} (gate {Gate:E1})");
+        Assert.True(s.Top1 >= s.Rows - 2, $"top-1 agreement {s.Top1}/{s.Rows}");
     }
 
     /// <summary>

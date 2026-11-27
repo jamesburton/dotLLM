@@ -277,26 +277,28 @@ parameter, the engine refuses an adapter with images and does not run MTP for an
 | F16 | 2.12e-4 / 2.08e-4 | 2.1e-5 / 1.7e-5 | 2.03e-2 / 2.18e-2 / 3.28e-2 | 1.8e-2 / 2.2e-2 / 3.2e-2 |
 | BF16 | 2.12e-4 / 2.08e-4 | 2.2e-5 / 1.8e-5 | 1.79e-2 / 2.42e-2 / 3.49e-2 | 1.7e-2 / 2.6e-2 / 3.3e-2 |
 
-End-to-end teacher-forced KL of the text logits (13 rows per image, shipped Q8_0 mmproj, mean KL vs llama.cpp / mean KL vs our own F32 arm / top-1 / greedy mismatches):
+End-to-end teacher-forced KL of the text logits (13 rows per image, shipped Q8_0 mmproj, **after the conv-history fix**; mean KL vs llama.cpp / mean KL vs our own F32 arm / top-1 / greedy mismatches):
 
 | image | F32 | F16 | BF16 |
 |---|---|---|---|
-| 80 | 1.82e-3 / - / 13/13 / 0 | 3.44e-3 / 1.78e-3 / 13/13 / 0 | 5.01e-3 / 2.63e-3 / 13/13 / 0 |
-| 190x110 | 1.07e-2 / - / 13/13 / 0 | 4.49e-3 / 6.24e-3 / 13/13 / 0 | 3.22e-3 / 6.13e-3 / 13/13 / 0 |
-| 640 | 9.60e-3 / - / 13/13 / 0 | 6.70e-3 / 4.83e-3 / 13/13 / 0 | 3.40e-3 / 9.25e-3 / 12/13 / 1 |
+| 80 | 2.45e-3 / - / 13/13 / 0 | 6.48e-3 / 3.89e-3 / 13/13 / 0 | 3.40e-3 / 2.35e-3 / 13/13 / 0 |
+| 190x110 | 4.43e-3 / - / 13/13 / 0 | 3.60e-3 / 2.56e-3 / 13/13 / 0 | 2.59e-3 / 4.90e-3 / 13/13 / 0 |
+| 640 | 5.18e-3 / - / 13/13 / 0 | 4.76e-3 / 3.79e-3 / 12/13 / 1 | 2.58e-3 / 3.61e-3 / 13/13 / 0 |
+
+(Before the fix, with the chunk-boundary error in every number: F32 1.82e-3 / 1.07e-2 / 9.60e-3, F16 3.44e-3 / 4.49e-3 / 6.70e-3, BF16 5.01e-3 / 3.22e-3 / 3.40e-3, one BF16 mismatch on 640.)
 
 Reading: on the F32-weights control (the sharp one: the Q8_0 activation noise of the reference is gone) both arms move the embeddings by about 2e-5 relRMS, a tenth of the 2.1e-4 that
-the F16 storage of our own output already costs, and the gap to llama.cpp does not change at the printed precision. On the shipped mmproj the arms are inside the 2% noise floor (the arm-vs-arm
-relRMS equals the gap to llama.cpp); the end-to-end KL does not order the arms (F16 and BF16 are lower than F32 on two of three images). The one visible flip is BF16 on 640 (one top-1 and one greedy mismatch of 13/12 rows,
-mean KL 3.4e-3, the lowest of the three arms on that image). Memory saved: 4.45 MB. Tests: `Inkling2VisionEmbedPrecisionTests.Report_EmbedPrecisionArms_Embeddings`,
+the F16 storage of our own output already costs, and the gap to llama.cpp does not change at the printed precision. On the shipped mmproj the arms are inside the 2% embedding noise floor and the end-to-end KL (now free of chunk-boundary error)
+still does not order them: F16 and BF16 are below F32 on two or three of the images, and the arm-vs-F32 KL (2e-3 to 5e-3) is the size of the F32 arm's own gap to llama.cpp. The single visible flip moved from BF16 (before the fix) to F16 (after), on 640:
+it is noise, not an arm effect. Memory saved: 4.45 MB. Tests: `Inkling2VisionEmbedPrecisionTests.Report_EmbedPrecisionArms_Embeddings`,
 `Inkling2VisionEndToEndTests.Report_EmbedPrecisionArms_EndToEndKl`; the control files live next to the oracles in `~/.dotllm/test-cache/token-oracles/inkling2/vision-f32-control/`.
 
-**Open finding: chunked prefill of an image prompt.** Image rows are injected by absolute position and the `embed` trace of every chunk is bit-identical across chunk sizes
-(`ChunkedPrefill_ImageRows_AreAddressedByAbsolutePosition`), yet the final-position logits of an image prompt depend on the prefill chunk size (KL vs the 32-token run: 1.9e-3 at 5 tokens on the 80 image,
-5.5e-2 at 7 and 1.3e-1 at 4 on 190x110, same top-1) while the same prompt without the image rows is chunk-size invariant (KL 3e-5 to 2e-4). Cause not established. The summation-order explanation does not fit (chunks of 4 to 32 all take the GEMM path, Q8_0 activation quantisation is per row, the text control moves by 1e-5), so the suspect is state
-carried across a chunk boundary at reduced precision (the conv state is BF16 by default; image rows skip `token_embd_norm`, so their norms and boundary rounding errors are large). To test: run `Report_ChunkingVsOracle` and
-`Report_ChunkSizeDependenceOfImagePrefill` with `DOTLLM_INKLING2_CONV_STATE=f32`; **not run** (the cpu-bench lock was held by another agent for the rest of the session). Not fixed here. Every end-to-end KL in this section was measured
-at 32-token chunks (the oracle gates), so it includes any boundary error, and the engine default (`--prefill-chunk-size 0`, one pass) is not gated against llama.cpp: `Report_ChunkingVsOracle` measures both.
+**Chunked prefill of an image prompt (found in review of #2037, fixed by #2039 commit 4f01904d).** Before the fix the final-position logits of an image prompt depended on the prefill chunk size (KL vs the 32-token run
+1.9e-3 at 5 tokens on the 80 image, 5.5e-2 at 7 and 1.3e-1 at 4 on 190x110, same top-1) although the `embed` trace was bit-identical across chunk sizes and the text-only control moved only 3e-5 to 2e-4. Root cause (found by the
+DSpark agent, #2039): the in-batch conv history was not rounded to the BF16 state type while the stored state is, so N-row forwards differed from N single-row forwards; image rows skip `token_embd_norm`, so their large norms made the
+boundary rounding visible. With the fix cherry-picked: image KL vs the 32-token run is exactly 0 at chunks 4, 5 and 7 (gate `ChunkedPrefill_ImageLogits_AreChunkSizeInvariant`, < 1e-5), also with `DOTLLM_INKLING2_CONV_STATE=f32`, and the
+whole prompt in one pass (the engine default) equals the 32-token run (`ImagePrompt_SinglePassPrefill_MatchesLlamaCpp`). End-to-end mean KL vs llama.cpp after the fix, F32 arm: 2.45e-3 / 4.43e-3 / 5.18e-3 (80 / 190x110 / 640; before 1.82e-3 / 1.07e-2 / 9.60e-3);
+with an F32 conv state 5.75e-3 / 1.87e-3 / 6.71e-3 (no better: the remaining gap is the reference's own Q8_0 activation noise, not state precision).
 
 **Oracle.** `tools/inkling2-vision-oracle/`: `oracle.c` (a C program over `llama.dll` + `mtmd.dll` of b12780: `mtmd_tokenize` / `mtmd_encode_chunk` / `mtmd_get_output_embd`, then
 `mtmd_helper_eval_chunks` + greedy teacher forcing, `-fa off`, CPU; dumps the full F32 embeddings and the full-vocabulary logits of every step), `gen_inputs.py` (test images and prompts),
