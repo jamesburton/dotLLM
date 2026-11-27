@@ -141,11 +141,12 @@ public sealed class DirectWeightStoreTests(ITestOutputHelper output)
                 loaded.Add((data, buf!));
             }
             long d3dBefore = store!.D3d12LocalUsageBytes();
+            int heapsBefore = DirectWeightStore.LiveD3d12Heaps;
+            Assert.True(heapsBefore >= 2, "expected a slab heap and a dedicated heap to be live on the D3D12 side");
             store.Seal();   // waits for the reads, then drops every D3D12 heap + resource
-            long d3dAfter = store.D3d12LocalUsageBytes();
-            _output.WriteLine($"D3D12 local usage {d3dBefore >> 20} -> {d3dAfter >> 20} MiB");
-            Assert.True(d3dBefore - d3dAfter >= (long)(a.Length + c.Length) / 2,
-                "Seal did not give back the D3D12-side charge of the loaded heaps");
+            _output.WriteLine($"D3D12 local usage {d3dBefore >> 20} -> {store.D3d12LocalUsageBytes() >> 20} MiB; live D3D12 heaps {heapsBefore} -> {DirectWeightStore.LiveD3d12Heaps}");
+            Assert.True(DirectWeightStore.LiveD3d12Heaps <= heapsBefore - 2,
+                "Seal did not release the D3D12 side of the loaded heaps (each stays charged twice: D3D12 + Vulkan import)");
 
             foreach (var (data, buf) in loaded)
             {

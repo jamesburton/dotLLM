@@ -131,12 +131,18 @@ internal sealed unsafe class DirectWeightStore : IDisposable
         public void ReleaseD3d()
         {
             nint r = Resource, h = D3dHeap;
+            if (h != 0) Interlocked.Decrement(ref s_liveD3dHeaps);
             Resource = 0;
             D3dHeap = 0;
             ComVtbl.Release(r);
             ComVtbl.Release(h);
         }
     }
+
+    private static int s_liveD3dHeaps;
+
+    /// <summary>D3D12 heap objects currently held by any store (created minus released). Tests and diagnostics.</summary>
+    internal static int LiveD3d12Heaps => Volatile.Read(ref s_liveD3dHeaps);
 
     /// <summary>
     /// D3D12 "local" usage fraction (of the DXGI budget) that DirectStorage heaps may not push the process past,
@@ -476,6 +482,7 @@ internal sealed unsafe class DirectWeightStore : IDisposable
             if (s_trace && _heaps.Count is 0 or 1 or 2 or 3) Console.Error.WriteLine($"[ds-mem] stage after vk import: {Diagnose()}");
             if (slab is null) return null;
 
+            Interlocked.Increment(ref s_liveD3dHeaps);
             slab.AddSlabRef(); // this store's reference, released by Seal / Dispose
             var heap = new Heap { D3dHeap = d3dHeap, Resource = resource, Slab = slab, Dedicated = dedicated };
             slab.FreeHook = heap.ReleaseD3d; // no-op when the heap was already retired after its reads landed
