@@ -96,8 +96,11 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
 
     internal sealed record Score(double MeanKl, double MaxKl, int Top1, int Rows, int GreedyMismatch);
 
-    /// <summary>Runs the image prompt then teacher-forces the oracle's continuation, scoring every row.</summary>
-    private Score Run(Oracle o, Inkling2TransformerModel model, Inkling2VisionEncoder encoder, int? placeholder = null)
+    /// <summary>
+    /// Runs the image prompt then teacher-forces the oracle's continuation; returns our full-vocabulary logits of every scored row (the prompt's last
+    /// position, then one per continuation token) and how many greedy picks differ from the oracle's continuation.
+    /// </summary>
+    private (float[][] Rows, int GreedyMismatch) RunRows(Oracle o, Inkling2TransformerModel model, Inkling2VisionEncoder encoder, int? placeholder = null)
     {
         int ph = placeholder ?? 200054;   // <|unused_200054|>: only the ids' count matters, the embeddings replace them
         using var emb = encoder.Encode(o.Image);
@@ -105,8 +108,8 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
         var prompt = o.Before.Concat(Enumerable.Repeat(ph, emb.Tokens)).Concat(o.After).ToArray();
         var spans = new[] { new ImageSpan(o.Before.Length, emb) };
         var state = model.CreateState();
-        int V = o.NVocab;
-        double sum = 0, max = 0; int top = 0, mism = 0, rows = o.Gen.Length + 1;
+        int V = o.NVocab, mism = 0;
+        var rows = new List<float[]>();
         // Prefill in 32-token calls (positions continue the state), like the text gate, so carried KV/conv state is exercised.
         float[] ours = [];
         for (int at = 0; at < prompt.Length; at += 32)
@@ -115,10 +118,9 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
             using var t = model.ForwardWithImagesAndState(prompt.AsSpan(at, len), Enumerable.Range(at, len).ToArray(), -1, state, spans, lastTokenLogitsOnly: true);
             if (at + len == prompt.Length) ours = Row(t, 0, model.Config.VocabSize);
         }
-        for (int r = 0; r < rows; r++)
+        for (int r = 0; r < o.Gen.Length + 1; r++)
         {
-            var (kl, same) = FullKl(o.Logits.AsSpan(r * V, V), ours);
-            sum += kl; max = Math.Max(max, kl); if (same) top++;
+            rows.Add(ours);
             if (r < o.Gen.Length)
             {
                 int arg = 0; for (int i = 1; i < V; i++) if (ours[i] > ours[arg]) arg = i;
@@ -127,7 +129,26 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
                 ours = Row(step, 0, model.Config.VocabSize);
             }
         }
-        return new Score(sum / rows, max, top, rows, mism);
+        return ([.. rows], mism);
+    }
+
+    private static Score ScoreRows(Oracle o, float[][] rows, int mism)
+    {
+        int V = o.NVocab;
+        double sum = 0, max = 0; int top = 0;
+        for (int r = 0; r < rows.Length; r++)
+        {
+            var (kl, same) = FullKl(o.Logits.AsSpan(r * V, V), rows[r]);
+            sum += kl; max = Math.Max(max, kl); if (same) top++;
+        }
+        return new Score(sum / rows.Length, max, top, rows.Length, mism);
+    }
+
+    /// <summary>Runs the image prompt then teacher-forces the oracle's continuation, scoring every row.</summary>
+    private Score Run(Oracle o, Inkling2TransformerModel model, Inkling2VisionEncoder encoder, int? placeholder = null)
+    {
+        var (rows, mism) = RunRows(o, model, encoder, placeholder);
+        return ScoreRows(o, rows, mism);
     }
 
     [SkippableTheory]
@@ -143,6 +164,43 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
         _output.WriteLine($"{name}: mean KL {s.MeanKl:E2}, max KL {s.MaxKl:E2}, top-1 {s.Top1}/{s.Rows}, teacher-forced greedy mismatches {s.GreedyMismatch}/{o!.Gen.Length}");
         Assert.True(s.MeanKl < Gate, $"mean KL {s.MeanKl:E2} over {s.Rows} positions (gate {Gate:E1})");
         Assert.True(s.Top1 >= s.Rows - 2, $"top-1 agreement {s.Top1}/{s.Rows}");
+    }
+
+    /// <summary>
+    /// The measurement for the user's decision on <c>patch_embd</c> / <c>position_embd</c> storage (docs/INKLING2.md "Embedding precision"): the end-to-end
+    /// teacher-forced KL of the text logits on the three test images for each arm (F32 = as stored, F16, BF16), against llama.cpp's logits and against our
+    /// own F32 arm (which isolates the arm from the reference's noise). Asserts only that the arms differ (a no-op conversion would be identical) and that the
+    /// shipped gate still passes for the arm under test; the table is the output.
+    /// </summary>
+    [SkippableFact]
+    public void Report_EmbedPrecisionArms_EndToEndKl()
+    {
+        var (model, _) = Models();
+        string mm = Inkling2VisionFixtures.FindMmproj()!;
+        var lines = new List<string> { "image | arm | mean KL vs llama.cpp | max KL | top-1 | greedy mismatches | mean KL vs our F32 arm | max KL vs F32 arm" };
+        foreach (string name in new[] { "rainbow80", "rainbow190x110", "rainbow640" })
+        {
+            var o = LoadOracle(name);
+            Skip.If(o is null, "vision oracle not generated");
+            float[][]? baseline = null;
+            foreach (var arm in new[] { VisionEmbedPrecision.F32, VisionEmbedPrecision.F16, VisionEmbedPrecision.BF16 })
+            {
+                using var enc = Inkling2VisionEncoder.Load(mm, ThreadingConfig.Auto, embedPrecision: arm);
+                var (rows, mism) = RunRows(o!, model, enc);
+                baseline ??= rows;
+                var s = ScoreRows(o!, rows, mism);
+                double self = 0, selfMax = 0;
+                for (int r = 0; r < rows.Length; r++)
+                {
+                    var (kl, _) = FullKl(baseline[r], rows[r]);
+                    self += kl; selfMax = Math.Max(selfMax, kl);
+                }
+                lines.Add($"{name,-14} | {arm,-4} | {s.MeanKl:E2} | {s.MaxKl:E2} | {s.Top1}/{s.Rows} | {s.GreedyMismatch}/{o!.Gen.Length} | {self / rows.Length:E2} | {selfMax:E2}");
+                Assert.True(s.MeanKl < Gate, $"{name} {arm}: mean KL {s.MeanKl:E2} over the gate {Gate:E1}");
+                if (arm != VisionEmbedPrecision.F32) Assert.True(self > 0, $"{name} {arm}: identical to the F32 arm, the conversion did nothing");
+            }
+        }
+        foreach (string l in lines) _output.WriteLine(l);
     }
 
     /// <summary>

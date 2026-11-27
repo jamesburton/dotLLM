@@ -92,6 +92,9 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
     /// </summary>
     internal long ScratchKeepBytes { get; set; } = 128L << 20;
 
+    /// <summary>Native scratch bytes the last call needed at its peak (before <see cref="ScratchKeepBytes"/> released it).</summary>
+    internal long LastPeakScratchBytes { get; private set; }
+
     /// <summary>Storage format of the patch and position embeddings in force.</summary>
     public VisionEmbedPrecision EmbedPrecision => _embedPrecision;
 
@@ -245,7 +248,7 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
                 Inkling2ImagePreprocessor.Normalize(image, hwc, swapRgb: SwapRgb, overLimit: _overLimit);
                 return RunLocked(hwc, w, h, image.ContentHash, cancellationToken);
             }
-            finally { _arena.Trim(ScratchKeepBytes); }
+            finally { LastPeakScratchBytes = _arena.Capacity; _arena.Trim(ScratchKeepBytes); }
         }
     }
 
@@ -264,7 +267,7 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
                 hwc.CopyTo(copy);
                 return RunLocked(copy, width, height, contentHash, default);
             }
-            finally { _arena.Trim(ScratchKeepBytes); }
+            finally { LastPeakScratchBytes = _arena.Capacity; _arena.Trim(ScratchKeepBytes); }
         }
     }
 

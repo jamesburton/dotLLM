@@ -13,6 +13,9 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 /// </summary>
 public sealed class Inkling2VisionLimitsTests
 {
+    private readonly Xunit.Abstractions.ITestOutputHelper _output;
+    public Inkling2VisionLimitsTests(Xunit.Abstractions.ITestOutputHelper output) => _output = output;
+
     private static byte[] Ppm(int w, int h) => [.. System.Text.Encoding.ASCII.GetBytes($"P6\n{w} {h}\n255\n"), .. new byte[checked(w * h * 3)]];
 
     private static string Uri(byte[] ppm) => "data:image/x-portable-pixmap;base64," + Convert.ToBase64String(ppm);
@@ -197,5 +200,52 @@ public sealed class Inkling2VisionLimitsTests
     public void ImageLimits_OverLimitEnum_HasExactlyTheTwoPolicies()
     {
         Assert.Equal(["Refuse", "Downscale"], Enum.GetNames<ImageOverLimit>());
+    }
+
+    // ───────────── real mmproj: the policy reaches the encoder, and the scratch is released ─────────────
+
+    /// <summary>
+    /// The encoder's token count follows the policy it was loaded with: refuse throws for a 4,225-token image, downscale plans it within the limit.
+    /// Kills: an encoder that ignores the policy (the L6 mutant, <c>CountTokens</c> without the policy argument).
+    /// </summary>
+    [SkippableFact]
+    public void Encoder_FollowsThePolicyItWasLoadedWith()
+    {
+        string? mm = Inkling2VisionFixtures.FindMmproj();
+        Skip.If(mm is null, "mmproj-Inkling-2-Mini-Q8_0.gguf not in the HF cache");
+        using var refuse = Inkling2VisionEncoder.Load(mm!, new DotLLM.Core.Configuration.ThreadingConfig(2));
+        using var downscale = Inkling2VisionEncoder.Load(mm!, new DotLLM.Core.Configuration.ThreadingConfig(2), ImageOverLimit.Downscale);
+        Assert.Throws<NotSupportedException>(() => refuse.CountTokens(2600, 2600));
+        Assert.InRange(downscale.CountTokens(2600, 2600), 1, 4096);
+        Assert.Equal(4096, refuse.CountTokens(2560, 2560));
+        Assert.Equal(4096, downscale.CountTokens(2560, 2560));
+        // the server path: ImageInput reports the refusal as a 400 with the way out, before any encode
+        var imgs = new List<DecodedImage> { new(2600, 2600, new byte[2600 * 2600 * 3]) };
+        var ex = Assert.Throws<ImageInputException>(() => ImageInput.CheckTokenBudget(refuse, imgs, 1_000_000));
+        Assert.Contains("downscale", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(4095, ImageInput.CheckTokenBudget(downscale, [new(2560, 2560, new byte[2560 * 2560 * 3])], 1_000_000));   // 4096 tokens add 4095 positions
+    }
+
+    /// <summary>
+    /// Review finding: the F32 activation scratch of a 4,096-token image (about 1 GB) was held for the life of the encoder. After the call it is released down to
+    /// <c>ScratchKeepBytes</c> (128 MB). Kills: no trim (the scratch stays at its peak). Real encode of a 2560x2560 noise image: slow (tens of seconds).
+    /// </summary>
+    [SkippableFact]
+    public void BigImageScratch_IsReleasedAfterTheEncode()
+    {
+        string? mm = Inkling2VisionFixtures.FindMmproj();
+        Skip.If(mm is null, "mmproj-Inkling-2-Mini-Q8_0.gguf not in the HF cache");
+        var rgb = new byte[2560 * 2560 * 3];
+        new Random(3).NextBytes(rgb);
+        using var enc = Inkling2VisionEncoder.Load(mm!, DotLLM.Core.Configuration.ThreadingConfig.Auto);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using (var e = enc.Encode(new DecodedImage(2560, 2560, rgb))) Assert.Equal(4096, e.Tokens);
+        sw.Stop();
+        _output.WriteLine($"4096-token encode {sw.Elapsed.TotalSeconds:F1} s; scratch peak {enc.LastPeakScratchBytes / 1e6:F0} MB, held after {enc.ScratchBytes / 1e6:F0} MB");
+        Assert.True(enc.LastPeakScratchBytes > 500L << 20, $"peak {enc.LastPeakScratchBytes} bytes: the test image no longer exercises the large case");
+        Assert.True(enc.ScratchBytes <= enc.ScratchKeepBytes, $"{enc.ScratchBytes} bytes of scratch held after the call (keep {enc.ScratchKeepBytes})");
+        // a small image after it still encodes and keeps its (small) scratch warm
+        using (var small = enc.Encode(new DecodedImage(80, 80, new byte[80 * 80 * 3]))) Assert.Equal(4, small.Tokens);
+        Assert.InRange(enc.ScratchBytes, 1, enc.ScratchKeepBytes);
     }
 }
