@@ -534,7 +534,7 @@ internal sealed unsafe class DirectWeightStore : IDisposable
         if (!_budgetWarned)
         {
             _budgetWarned = true;
-            Console.Error.WriteLine($"[directstorage] declining further DirectStorage heaps: {why}. Remaining weights take the staged path (host copy through the {StagingMiB} MiB-class staging ring).");
+            Console.Error.WriteLine($"[directstorage] declining further DirectStorage heaps: {why}. Remaining weights take the staged path (host copy through the Vulkan staging ring; page-cache read, so no zero-copy).");
         }
         return false;
     }
