@@ -256,6 +256,29 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
     }
 
     /// <summary>
+    /// MEASUREMENT: the end-to-end KL vs llama.cpp at 32-token chunks (what every gate uses) and with the whole prompt in one pass (the engine's default
+    /// <c>--prefill-chunk-size 0</c>, and how mtmd evaluates the oracle). Run it with and without <c>DOTLLM_INKLING2_CONV_STATE=f32</c> to see whether chunk
+    /// boundaries cost anything (the conv state carried between chunks is BF16 by default).
+    /// </summary>
+    [SkippableFact]
+    public void Report_ChunkingVsOracle()
+    {
+        var (model, enc) = Models();
+        string conv = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_CONV_STATE") ?? "(default bf16)";
+        foreach (string name in new[] { "rainbow80", "rainbow190x110", "rainbow640" })
+        {
+            var o = LoadOracle(name);
+            Skip.If(o is null, "vision oracle not generated");
+            foreach (int chunk in new[] { 32, 100_000 })
+            {
+                var (rows, mism) = RunRows(o!, model, enc, chunk: chunk);
+                var s = ScoreRows(o!, rows, mism);
+                _output.WriteLine($"conv_state={conv} {name} chunk {(chunk == 100_000 ? "whole prompt" : chunk.ToString())}: mean KL {s.MeanKl:E2}, max KL {s.MaxKl:E2}, top-1 {s.Top1}/{s.Rows}, greedy mismatches {s.GreedyMismatch}");
+            }
+        }
+    }
+
+    /// <summary>
     /// The measurement for the user's decision on <c>patch_embd</c> / <c>position_embd</c> storage (docs/INKLING2.md "Embedding precision"): the end-to-end
     /// teacher-forced KL of the text logits on the three test images for each arm (F32 = as stored, F16, BF16), against llama.cpp's logits and against our
     /// own F32 arm (which isolates the arm from the reference's noise). Asserts only that the arms differ (a no-op conversion would be identical) and that the
