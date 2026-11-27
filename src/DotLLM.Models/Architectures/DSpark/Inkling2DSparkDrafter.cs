@@ -80,6 +80,12 @@ internal sealed unsafe class Inkling2DSparkDrafter : IDisposable
     internal DSparkMutant Mutant { get; set; }
 
     private const int InjectChunk = 64;
+
+    /// <summary>Rows one injection call writes at most (the ring slack of the windowed layers' context K/V).</summary>
+    internal const int InjectChunkRows = InjectChunk;
+
+    /// <summary>True for the sliding-window layers (the ones whose context K/V is a ring).</summary>
+    internal bool IsLocalLayer(int layer) => _layers[layer].Local;
     private readonly NativeBuffer<float> _x, _norm, _q, _k, _v, _attn, _o, _gate, _up, _hid, _logits, _bias, _feat, _mix, _tmpK, _tmpV, _taps32, _joinIn, _jp, _w1Row;
 
     /// <summary>Drafts per round (cap), <c>DOTLLM_DSPARK_DRAFT</c> or 3 (the value llama.cpp's docs use for Inkling 2).</summary>
@@ -465,7 +471,7 @@ internal sealed unsafe class Inkling2DSparkDrafter : IDisposable
     {
         public float* Q, K, V, Out;
         public Half* RingK, RingV;
-        public int Lo, Pos0, B, Heads, KvHeads, HeadDim, KvDim;
+        public int Lo, Pos0, B, Heads, KvHeads, HeadDim, KvDim, Ring;
         public float Scale;
     }
 
@@ -479,7 +485,7 @@ internal sealed unsafe class Inkling2DSparkDrafter : IDisposable
         {
             Q = _q.Ptr, K = _k.Ptr, V = _v.Ptr, Out = _attn.Ptr,
             RingK = state.Keys(layer), RingV = state.Values(layer),
-            Lo = lo, Pos0 = pos0, B = b, Heads = NumHeads, KvHeads = NumKvHeads, HeadDim = HeadDim, KvDim = NumKvHeads * HeadDim,
+            Ring = state.RingFor(layer), Lo = lo, Pos0 = pos0, B = b, Heads = NumHeads, KvHeads = NumKvHeads, HeadDim = HeadDim, KvDim = NumKvHeads * HeadDim,
             Scale = 1f / MathF.Sqrt(HeadDim),
         };
         if (_pool is null) { for (int hh = 0; hh < ctx.Heads; hh++) AttendHead(&ctx, hh); return; }
@@ -493,6 +499,9 @@ internal sealed unsafe class Inkling2DSparkDrafter : IDisposable
         for (int hh = s; hh < e; hh++) AttendHead(c, hh);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int SlotOf(AttendCtx* c, int pos) => c->Ring == 0 ? pos : pos % c->Ring;
+
     [SkipLocalsInit]
     private static void AttendHead(AttendCtx* c, int head)
     {
@@ -504,7 +513,7 @@ internal sealed unsafe class Inkling2DSparkDrafter : IDisposable
             Span<float> kf = stackalloc float[d];
             for (int j = 0; j < nCtx; j++)
             {
-                TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(c->RingK + (long)(c->Lo + j) * kvStride + kvh * d, d), kf);
+                TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(c->RingK + (long)SlotOf(c, c->Lo + j) * kvStride + kvh * d, d), kf);
                 for (int i = 0; i < b; i++)
                     scores[(long)i * nKeys + j] = TensorPrimitives.Dot(new ReadOnlySpan<float>(c->Q + (long)i * qStride + head * d, d), kf) * c->Scale;
             }
@@ -531,7 +540,7 @@ internal sealed unsafe class Inkling2DSparkDrafter : IDisposable
                 ReadOnlySpan<float> vr;
                 if (j < nCtx)
                 {
-                    TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(c->RingV + (long)(c->Lo + j) * kvStride + kvh * d, d), vf);
+                    TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(c->RingV + (long)SlotOf(c, c->Lo + j) * kvStride + kvh * d, d), vf);
                     vr = new ReadOnlySpan<float>(vfp, d);
                 }
                 else vr = new ReadOnlySpan<float>(c->V + (long)(j - nCtx) * kvStride + kvh * d, d);

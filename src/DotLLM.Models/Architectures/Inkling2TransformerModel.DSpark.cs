@@ -12,7 +12,7 @@ namespace DotLLM.Models.Architectures;
 /// so the unmodified <c>MtpSpeculativeDecoder</c> verifies its drafts. The verify forward is row-count invariant (bit-identical to single-row decoding)
 /// and, with <see cref="ForwardWithRecurrentSnapshots"/>, records the short-conv windows so a rejection rewinds the recurrent state without a replay.
 /// </summary>
-public sealed unsafe partial class Inkling2TransformerModel : IDFlashDraftAttachable, IInkling2DSparkTarget
+public sealed unsafe partial class Inkling2TransformerModel : IInkling2DSparkHost, IInkling2DSparkTarget
 {
     private Inkling2DSparkDrafter? _dspark;
     private int _recordedPos0;
@@ -39,7 +39,7 @@ public sealed unsafe partial class Inkling2TransformerModel : IDFlashDraftAttach
     internal Inkling2SequenceState DefaultState => _defaultState;
 
     /// <summary>Opens a DSpark state for the attached drafter (a test handle; the engine goes through <see cref="CreateMtpState(int)"/>).</summary>
-    internal Inkling2DSparkState CreateDSparkState() => new(_dspark ?? throw new InvalidOperationException("No DSpark drafter attached."), LayerVisits);
+    internal Inkling2DSparkState CreateDSparkState(int ringPositions = 0) => new(_dspark ?? throw new InvalidOperationException("No DSpark drafter attached."), LayerVisits, ringPositions);
 
     /// <inheritdoc/>
     public bool SupportsMtp => _dspark is not null;

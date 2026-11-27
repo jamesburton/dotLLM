@@ -1204,7 +1204,7 @@ public static class ServerStartup
     /// </summary>
     internal static void TryAttachSeparateMtpHead(IModel model, string resolvedPath, ServerOptions options)
     {
-        if (model is Inkling2TransformerModel || options.DSparkPath is not null)
+        if (model is DotLLM.Models.Architectures.DSpark.IInkling2DSparkHost || options.DSparkPath is not null)
         {
             // Inkling 2 DSpark drafter (#2039): an explicit --dspark that cannot attach refuses to start; an auto-detected sibling is logged and ignored.
             try

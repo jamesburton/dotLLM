@@ -71,7 +71,7 @@ public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2K
 /// <para>The model owns its sequence state like the CPU model: positions must continue it, and a call at position 0 restarts it. One command buffer per chunk
 /// of <see cref="Inkling2VulkanOptions.MaxChunk"/> tokens.</para>
 /// </remarks>
-public sealed unsafe class VulkanInkling2TransformerModel : IModel
+public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, DotLLM.Models.Architectures.DSpark.IInkling2DSparkHost
 {
     private sealed class Mat
     {
@@ -531,10 +531,14 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
         Run(kout, 1u << 5, [(uint)_H, (uint)curOff, (uint)msgOff, F(_eps)], (uint)T, 1, 1, cur, _msg, _gainPre, _forgetPre, gamma, dst);
     }
 
-    private void Conv(VulkanDevice.Buffer x, VulkanDevice.Buffer w, VulkanDevice.Buffer? dyn, VulkanDevice.Buffer state, VulkanDevice.Buffer? add, VulkanDevice.Buffer y, int channels, int T)
+    // snapOff >= 0: also record the verify window (old state + the T inputs, BF16) at that element offset of the snapshot buffer (row snapshots, #2046). The snapshot
+    // buffer is bound as a read (not tracked as a write): every conv writes its own disjoint region and nothing reads it inside the forward.
+    private void Conv(VulkanDevice.Buffer x, VulkanDevice.Buffer w, VulkanDevice.Buffer? dyn, VulkanDevice.Buffer state, VulkanDevice.Buffer? add, VulkanDevice.Buffer y, int channels, int T, long snapOff = -1)
     {
-        var k = Kernel($"conv|{(dyn is null ? 0 : 1)}|{(add is null ? 0 : 1)}", "inkling2_conv", 6, 5, true, dyn is null ? 0u : 1u, add is null ? 0u : 1u);
-        Run(k, (1u << 3) | (1u << 5), [(uint)channels, (uint)T, (uint)_nkv, 0u, 0u], (uint)((channels + 63) / 64), 1, 1, x, w, dyn ?? _dummy, state, add ?? _dummy, y);
+        bool snap = snapOff >= 0;
+        var k = Kernel($"conv|{(dyn is null ? 0 : 1)}|{(add is null ? 0 : 1)}|{(snap ? 1 : 0)}", "inkling2_conv", 7, 6, true, dyn is null ? 0u : 1u, add is null ? 0u : 1u, snap ? 1u : 0u);
+        Run(k, (1u << 3) | (1u << 5), [(uint)channels, (uint)T, (uint)_nkv, 0u, 0u, snap ? (uint)snapOff : 0u], (uint)((channels + 63) / 64), 1, 1,
+            x, w, dyn ?? _dummy, state, add ?? _dummy, y, snap ? _snapBuf! : _dummy);
     }
 
     // ───────────────────────────── trace / flush ─────────────────────────────
@@ -586,11 +590,14 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
         => ForwardCore(tokenIds, positions, deviceId, lastTokenLogitsOnly);
 
-    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, bool lastOnly)
+    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, bool lastOnly, VulkanInkling2DSparkState? ds = null, bool recordRows = false)
     {
         int T = tokenIds.Length;
         if (T == 0 || T != positions.Length) throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
-        if (positions[0] == 0 && _length != 0) ResetSequenceState();
+        if (_rollbackPending)
+            throw new InvalidOperationException("inkling2: the KV cache was rolled back into a recorded verify but RestoreRecurrentStateToRow was not called; the conv state is ahead of the committed text.");
+        if (positions[0] == 0 && _length != 0) { ResetSequenceState(); ds?.Rollback(0); }
+        _recRows = 0;   // a recorded verify is valid only until the next forward
         for (int i = 0; i < T; i++)
             if (positions[i] != _length + i)
                 throw new ArgumentException($"inkling2 keeps its own sequence state: positions[{i}] = {positions[i]} but the state is at {_length + i}.");
@@ -605,6 +612,10 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
         int rows = lastOnly ? 1 : T;
         var result = UnmanagedTensor.Allocate(new TensorShape(rows, _vocab), DType.Float32, deviceId);
         var dst = new Span<float>((void*)result.DataPointer, rows * _vocab);
+        _tapState = ds is { Unusable: false } ? ds : null;
+        if (_tapState is not null && !_tapState.PrepareFor(_length, T)) _tapState = null;
+        if (recordRows) PrepareSnapshots(T);
+        _recordSnap = recordRows;
         try
         {
             for (int c0 = 0; c0 < T; c0 += _chunk)
@@ -616,6 +627,8 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
             }
         }
         catch { result.Dispose(); throw; }
+        finally { _tapState = null; _recordSnap = false; }
+        if (recordRows) { _recPos0 = _length; _recRows = T; _recR = T; }
         _length += T;
         return result;
     }
@@ -640,9 +653,11 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
         int start = _c.LoopStart, end = _c.LoopEnd, passes = _c.LoopPasses;
         int coreStart = passes > 1 ? start : _nPhys;
         var cur = _x0;
+        int visit = 0;
 
         for (int il = 0; il < coreStart; il++)
         {
+            TapVisit(TargetMutant == DSparkTargetMutant.TapEarlyPrelude ? visit + 1 : TargetMutant == DSparkTargetMutant.TapLate ? visit - 1 : visit, cur, Tc); visit++;
             // The last prelude layer's output is the start state of every pass: keep it in its own buffer.
             var outBuf = passes > 1 && il == coreStart - 1 ? _pre : PickOther(cur);
             RecordLayer(il, il, cur, outBuf, null, Tc, basePos, stack, ref nextSlot);
@@ -676,6 +691,7 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
                         loop = _layers[ip].Loop!;
                         Mix(bank, bankOut!, 0, loop.MsgQuery, queryBf16: true, 4, Tc, _msg);
                     }
+                    TapVisit(TargetMutant == DSparkTargetMutant.TapBySlot ? slot : TargetMutant == DSparkTargetMutant.TapLate ? visit - 1 : visit, cur, Tc); visit++;
                     // The output of the last core layer of a pass (except the final pass) is the next pass's bank state: its own buffer.
                     VulkanDevice.Buffer outBuf = ip == end - 1 && pass < passes - 1 ? (pass == 0 ? _bank0 : _bank1) : PickOther(cur);
                     if (ReferenceEquals(outBuf, cur)) outBuf = PickOther(cur);
@@ -687,6 +703,7 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
             // bankOut for pass p+1 is the buffer pass p ended in; bank0 / bank1 alternate so the previous pass's bank survives its successor's layers.
             for (int il = end; il < _nPhys; il++)
             {
+                TapVisit(TargetMutant == DSparkTargetMutant.TapLate ? visit - 1 : visit, cur, Tc); visit++;
                 var outBuf = PickOther(cur);
                 RecordLayer(il, il, cur, outBuf, null, Tc, basePos, stack, ref nextSlot);
                 cur = outBuf;
@@ -698,6 +715,11 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
         Mix(stack, cur, 0, _outputResQuery, queryBf16: false, 1, Tc, _mixed2);
         Rms(_mixed2, 0, _outputNorm, _n0, 0, Tc, _eps);
         TraceBuf("result_norm", _n0, Tc, H);
+        if (_tapState is { } tapSt)
+        {
+            TapVisit(visit, TargetMutant == DSparkTargetMutant.TapPreNorm ? cur : _n0, Tc);   // the last visit id: the final normed output of every row
+            RecordInject(tapSt, Tc, basePos);
+        }
 
         VulkanDevice.Buffer? logits = null;
         if (logitRows > 0)
@@ -768,8 +790,8 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
         Gemv(lw.Wq, n0, _q, T); Gemv(lw.Wk, n1, _kRaw, T); Gemv(lw.Wv, n2, _vRaw, T);
         Gemv(lw.Rel, n0, _rel, T); Gemv(lw.Sink, n0, _sink, T); Gemv(lw.Gate, n0, _gateB, T);
         if (!lw.Local) { Gemv(lw.KConvProj!, n1, _kDyn, T); Gemv(lw.VConvProj!, n2, _vDyn, T); }
-        Conv(_kRaw, lw.KConv, lw.Local ? null : _kDyn, ss.KConv, null, _kc, _kvW, T);
-        Conv(_vRaw, lw.VConv, lw.Local ? null : _vDyn, ss.VConv, null, _vc, _kvW, T);
+        Conv(_kRaw, lw.KConv, lw.Local ? null : _kDyn, ss.KConv, null, _kc, _kvW, T, SnapOffset(slotIx, 0));
+        Conv(_vRaw, lw.VConv, lw.Local ? null : _vDyn, ss.VConv, null, _vc, _kvW, T, SnapOffset(slotIx, 1));
 
         bool kvq8 = _opt.Kv == Inkling2KvFormat.Q8_0;
         uint ringCap = lw.Local ? (uint)_ringCap : 0u;
@@ -786,14 +808,14 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
         // The first layer of each block starts a new residual stream (its input joins the mixed blocks); the others add the residual (fused into the conv).
         if (ip % _c.AttnResBlockSize == 0)
         {
-            Conv(_attnOut, lw.PostConv, null, ss.AttnConv, null, _ffnInp, H, T);
+            Conv(_attnOut, lw.PostConv, null, ss.AttnConv, null, _ffnInp, H, T, SnapOffset(slotIx, 2));
             int slotId = nextSlot++;
             Rms(cur, 0, null, _blk, (long)slotId * _chunk * H, T, 1e-6f);
             stack.Add(slotId);
         }
         else
         {
-            Conv(_attnOut, lw.PostConv, null, ss.AttnConv, cur, _ffnInp, H, T);
+            Conv(_attnOut, lw.PostConv, null, ss.AttnConv, cur, _ffnInp, H, T, SnapOffset(slotIx, 2));
         }
 
         // ── MoE ──
@@ -810,7 +832,7 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
         var down = Kernel($"moedown|{dt}|{(lw.DownScale is null ? 0 : 1)}", "inkling2_moe_down_" + dt, 6, 3, true, lw.DownScale is null ? 0u : 1u);
         Run(down, 1u << 2, [(uint)H, (uint)_ff, (uint)_topk], (uint)H, (uint)T, 1, lw.Down, _h, _moe, _sel, _selW, lw.DownScale ?? _dummy);
 
-        Conv(_moe, lw.FfnPostConv, null, ss.FfnConv, _ffnInp, outBuf, H, T);
+        Conv(_moe, lw.FfnPostConv, null, ss.FfnConv, _ffnInp, outBuf, H, T, SnapOffset(slotIx, 3));
     }
 
     // ───────────────────────────── lifetime ─────────────────────────────
@@ -831,7 +853,11 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
         public TensorRef GetValuesRef(int layerIndex) => throw new NotSupportedException("inkling2 owns its K/V state.");
         public void Rollback(int length)
         {
-            if (length != model._length) throw new NotSupportedException("inkling2 cannot roll its recurrent conv state back (prefix snapshots are not implemented).");
+            if (length == model._length) return;
+            // A speculative verify rolls the KV back to the committed end BEFORE it restores the recurrent state (MtpSpeculativeDecoder): allowed only inside the rows of
+            // the last ForwardWithRecurrentSnapshots, and the next forward then refuses until RestoreRecurrentStateToRow has put the conv windows back.
+            if (model._recRows > 0 && length > model._recPos0 && length < model._length && length <= model._recPos0 + model._recRows) { model._rollbackPending = true; return; }
+            throw new NotSupportedException("inkling2 cannot roll its recurrent conv state back (no recorded verify covers that position).");
         }
         public bool CanRollbackAfterAppend(int minPos, int maxPos) => false;
         public bool SupportsAbortRollback => false;
@@ -843,6 +869,7 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
     {
         foreach (var k in _kernels.Values) k.Dispose();
         _kernels.Clear();
+        DisposeDSpark();
         _submit.Dispose();
         _logits?.Dispose();
         foreach (var b in _owned) b.Dispose();
