@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
+using DotLLM.Models.Architectures.DSpark;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;

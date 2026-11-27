@@ -139,6 +139,8 @@ internal sealed unsafe class Inkling2DSparkState : IMtpState, IInkling2Tap
             _taps = (Half*)NativeMemory.AlignedAlloc((nuint)((long)rows * _drafter.TapRowWidth * sizeof(ushort)), 64);
             _tapRowCapacity = rows;
         }
+        // A tap slot that a forward never fills must read as zeros, not as whatever the allocation held.
+        new Span<Half>(_taps, checked(rows * _drafter.TapRowWidth)).Clear();
         return _taps;
     }
 

@@ -1115,12 +1115,16 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_DFLASH_TRACE` | DOTLLM_DFLASH_TRACE=1: per-request draft / inject wall time on stderr at dispose. | `DFlashMtpState.cs` |
 | `DOTLLM_DIAG_EMBED_NOISE` | DIAGNOSTIC (DOTLLM_DIAG_EMBED_NOISE=&lt;eps&gt;): multiplies every embedding element by 1 + eps*u, u in [-1,1] (fixed seed): the noise-injection floor probe (#1599). | `TransformerModel.cs` |
 | `DOTLLM_DIAG_F32ACT_ALL` | DIAGNOSTIC (DOTLLM_DIAG_F32ACT_ALL=1): every quantized dense projection runs dequantize-rows x F32 activations instead of the quantized-activation kernels (combine with DOTLLM_Q4E_DIAG_F32ACT=1 for the MoE banks). The F32-activ... | `TransformerModel.cs` |
+| `DOTLLM_DSPARK` | Env var that turns the sibling auto-attach off (DOTLLM_DSPARK=0); an explicit --dspark still attaches. | `Inkling2DSparkResolver.cs` |
+| `DOTLLM_DSPARK_DRAFT` | Drafts per round (cap), DOTLLM_DSPARK_DRAFT or 3 (the value llama.cpp's docs use for Inkling 2). | `Inkling2DSparkDrafter.cs` |
 | `DOTLLM_EDGE0_COLSCALE` | Environment variable selecting the diagnostic column-scale arm (inverse \| direct \| none); unset = inverse. | `Edge0Model.cs` |
 | `DOTLLM_EDGE0_F32_ACT` | Diagnostic A/B (DOTLLM_EDGE0_F32_ACT=1): D, U and the shared expert dequantise their Q8_0 / Q4_0 weights and dot against the F32 activations instead of quantising the activations to int8 first. Slower; used to measure how much... | `Edge0LatentMoe.cs` |
 | `DOTLLM_EDGE0_LATENT` | (not described in source) | `Edge0Model.cs` |
 | `DOTLLM_EMBED_PAR_MIN` | Minimum batch size for one-sequence-per-core execution; below it a batch runs sequentially on the pooled kernels. Env DOTLLM_EMBED_PAR_MIN overrides (benchmarking). | `BertEncoderModel.cs` |
 | `DOTLLM_G4_PROF` | Env-gated (DOTLLM_G4_PROF=1) stopwatch buckets for the Gemma-4 CPU layer path. | `G4Prof.cs` |
 | `DOTLLM_I2S_CACHE` | Builds a BitNetI2SCacheContext for a BitNet checkpoint so repeated loads reuse the ternary I2_S packing instead of re-quantizing bf16 weights. The cache lives in a hidden .dotllm-i2s-cache folder beside the checkpoint and is ke... | `ModelLoader.cs` |
+| `DOTLLM_INKLING2_CONV_STATE` | (not described in source) | `Inkling2TransformerModel.cs` |
+| `DOTLLM_INKLING2_LOOP_CONTROLLER` | Options from DOTLLM_INKLING2_LOOP_CONTROLLER (f32\|q8_0\|f16\|bf16) and DOTLLM_INKLING2_CONV_STATE (f32\|bf16; F16 is ruled out); unset variables keep the defaults. Used by the measurement harness; a bad value throws rather tha... | `Inkling2TransformerModel.cs` |
 | `DOTLLM_LITTLEBIT_DENSE_CONTROL` | Loads a NanoQuant composite (issue #869) from a GGUF and registers it as a LittleBit-kind weight. A non-empty rowSplits splits the stacked output rows (attn_qkv) into one weight per entry. With DOTLLM_LITTLEBIT_DENSE_CONTROL=1... | `FactorizedWeights.cs` |
 | `DOTLLM_LORA_FORCE_Q8_PREQUANT` | Phase 4d.5 / Gap 2 - fast-path plumbing: when both base and adapter B are Q8_0 AND the caller pre-quantised x, we can route stage 1 through `MatMul.GemmQ8_0(preQuantizedInput=preQuantX)` and skip the activation-quant cost. The... | `LoraProjection.cs` |
 | `DOTLLM_MOE_LEGACY_PACKED` | (not described in source) | `Lfm2MoeTransformerModel.cs` |
@@ -1157,6 +1161,9 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_EMBED_PACK` | True when documents can be packed into one embedding forward: the validated plain-causal decoder shape (Qwen3), the coopmat flash kernel serving the head dim, no window / soft-cap / sinks / distinct V dim, and row strides that... | `VulkanTransformerModel.cs` |
 | `DOTLLM_EMBED_PACK_TOKENS` | Token budget of one packed forward. Env DOTLLM_EMBED_PACK_TOKENS overrides (default 1024, as the decoder embedder). | `VulkanBertEncoderModel.cs` |
 | `DOTLLM_GPTOSS_DEBUG_OFF` | MiMo-V2 (#955): sink-attention kernels (shared with gpt-oss) and the attention-output compaction kernel. Refuses to run a model whose sliding layers lack their attention sinks (silently dropping them would be wrong logits). | `VulkanTransformerModel.cs` |
+| `DOTLLM_INKLING2_KV` | Options from DOTLLM_INKLING2_KV (f16\|q8_0); unset keeps the defaults, a bad value throws. | `VulkanInkling2TransformerModel.cs` |
+| `DOTLLM_INKLING2_SPV_OVERRIDE` | (not described in source) | `VulkanInkling2TransformerModel.cs` |
+| `DOTLLM_INKLING2_VK_CHUNK` | (not described in source) | `VulkanInkling2TransformerModel.cs` |
 | `DOTLLM_MTP_HEADROOM_CANARY` | Test hook / switch for the second-device canary (see VulkanHeadroomCanary). Env DOTLLM_MTP_HEADROOM_CANARY=0 turns it off, leaving only the arithmetic estimate. | `VulkanQwen4ExpTransformerModel.Mtp.cs` |
 | `DOTLLM_MTP_HEADROOM_EXTRA_MIB` | DOTLLM_MTP_HEADROOM_EXTRA_MIB is a diagnostic: it asks the probe for that much more, which makes "the head does not fit" reproducible on demand (a competing process only takes memory from this one when it arrives AFTER the load... | `VulkanQwen4ExpTransformerModel.Mtp.cs` |
 | `DOTLLM_MTP_HEAD_REQUANT` | Env DOTLLM_MTP_HEAD_REQUANT: 0 = keep the head's native routed-bank quantisation, 1 (default) = re-quantise a Q8_0 head's routed banks (Q4_K gate/up, Q5_1 down), 2 = only when the native head does not fit the device. Measured o... | `VulkanQwen4ExpTransformerModel.Mtp.cs` |
