@@ -26,10 +26,11 @@ public sealed class Inkling2VulkanVisionTests : IDisposable
     private VulkanDevice? _dev;
     private VulkanInkling2TransformerModel? _model;
     private Inkling2VisionEncoder? _encoder;
+    private VulkanInkling2VisionEncoder? _vkEncoder;
 
     public Inkling2VulkanVisionTests(ITestOutputHelper output) => _output = output;
 
-    public void Dispose() { _encoder?.Dispose(); _model?.Dispose(); _dev?.Dispose(); _file?.Dispose(); }
+    public void Dispose() { _vkEncoder?.Dispose(); _encoder?.Dispose(); _model?.Dispose(); _dev?.Dispose(); _file?.Dispose(); }
 
     private (VulkanInkling2TransformerModel Model, Inkling2VisionEncoder Encoder) Models()
     {
@@ -236,5 +237,107 @@ public sealed class Inkling2VulkanVisionTests : IDisposable
         model.ResetSequenceState();
         using var c = model.ForwardWithImages(ids, pos, -1, [], null, true);
         Assert.Equal(la, Row(c, 0, model.Config.VocabSize));
+    }
+
+    // ───────────── part B: the Vulkan ViT encoder feeding the Vulkan text model ─────────────
+
+    private VulkanInkling2VisionEncoder VkEncoder()
+    {
+        Models();   // device + model (skips when unavailable)
+        return _vkEncoder ??= VulkanInkling2VisionEncoder.Load(_dev!, Inkling2VisionFixtures.FindMmproj()!, Inkling2VulkanTests.SpvDir());
+    }
+
+    /// <summary>Teacher-forced KL of the text logits after an image prompt encoded ON THE GPU, against llama.cpp (gate 0.015; CPU encoder + Vulkan text: 4.9e-3 to 6.6e-3 in section 12a).</summary>
+    [SkippableTheory]
+    [InlineData("rainbow80")]
+    [InlineData("rainbow190x110")]
+    [InlineData("rainbow640")]
+    public void VulkanEncoder_ImagePrompt_Logits_MatchLlamaCpp(string name)
+    {
+        var o = Inkling2VisionEndToEndTests.LoadOracle(name);
+        Skip.If(o is null, "vision oracle not generated");
+        var (model, _) = Models();
+        using var emb = VkEncoder().Encode(o!.Image);
+        Assert.Equal(o.ImageTokens, emb.Tokens);
+        var (rows, mism, _) = RunRows(o, model, emb, 32);
+        var s = Score(o, rows);
+        _output.WriteLine($"{name} (Vulkan ViT + Vulkan text): mean KL {s.Mean:E2}, max KL {s.Max:E2}, top-1 {s.Top1}/{rows.Length}, teacher-forced greedy mismatches {mism}/{o.Gen.Length}");
+        Assert.True(s.Mean < Gate, $"mean KL {s.Mean:E2} (gate {Gate:E1})");
+        Assert.True(s.Top1 >= rows.Length - 2, $"top-1 agreement {s.Top1}/{rows.Length}");
+    }
+
+    [SkippableTheory]
+    [InlineData("rainbow80")]
+    [InlineData("rainbow190x110")]
+    [InlineData("rainbow640")]
+    public void VulkanEncoder_SinglePassPrefill_MatchesLlamaCpp(string name)
+    {
+        var o = Inkling2VisionEndToEndTests.LoadOracle(name);
+        Skip.If(o is null, "vision oracle not generated");
+        var (model, _) = Models();
+        using var emb = VkEncoder().Encode(o!.Image);
+        var (rows, mism, secs) = RunRows(o, model, emb, 100_000);
+        var s = Score(o, rows);
+        _output.WriteLine($"{name} (Vulkan ViT) single pass: mean KL {s.Mean:E2}, max KL {s.Max:E2}, top-1 {s.Top1}/{rows.Length}, greedy mismatches {mism}; prefill {secs:F2} s");
+        Assert.True(s.Mean < Gate, $"mean KL {s.Mean:E2} (gate {Gate:E1})");
+        Assert.True(s.Top1 >= rows.Length - 2, $"top-1 agreement {s.Top1}/{rows.Length}");
+    }
+
+    /// <summary>Chunk-size invariance with Vulkan-encoded embeddings: image-prompt logits KL vs the 32-token run must be 0 (the CPU is 0 after the conv fix).</summary>
+    [SkippableTheory]
+    [InlineData("rainbow80", 5)]
+    [InlineData("rainbow190x110", 7)]
+    [InlineData("rainbow190x110", 4)]
+    public void VulkanEncoder_ChunkedPrefill_ImageLogits_AreChunkSizeInvariant(string name, int chunk)
+    {
+        var o = Inkling2VisionEndToEndTests.LoadOracle(name);
+        Skip.If(o is null, "vision oracle not generated");
+        var (model, _) = Models();
+        using var emb = VkEncoder().Encode(o!.Image);
+        var reference = RunRows(o, model, emb, 32).Rows[0];
+        var chunked = RunRows(o, model, emb, chunk).Rows[0];
+        var (kl, same) = Inkling2VisionEndToEndTests.FullKl(reference, chunked);
+        _output.WriteLine($"{name} chunk {chunk}: image KL vs chunk 32 {kl:E2} (same top-1 {same})");
+        Assert.True(same);
+        Assert.True(kl < 1e-5, $"chunk {chunk} moved the image prompt logits by KL {kl:E2}");
+    }
+
+    /// <summary>
+    /// Time to first token, Vulkan encoder vs CPU encoder, text model on Vulkan in both: TTFT = encode + whole-prompt prefill (+ greedy pick). The CPU encode times are the cached wall times of
+    /// <c>CpuCache_Populate</c> (the CPU and the iGPU are never busy together); the prefill is measured here (warm, best of runs) and shared by both columns.
+    /// </summary>
+    [SkippableFact]
+    public void Ttft_VulkanEncoderVsCpuEncoder()
+    {
+        string tf = Path.Combine(Inkling2VulkanVisionEncoderTests.CacheDir, "cpu_times.txt");
+        Skip.IfNot(File.Exists(tf), "CPU cache not populated");
+        var cpuTimes = File.ReadAllLines(tf).Select(l => l.Split(' ')).Where(p => p[0] == "cpu_bf16").ToDictionary(p => p[1], p => double.Parse(p[3], System.Globalization.CultureInfo.InvariantCulture));
+        var (model, _) = Models();
+        var enc = VkEncoder();
+        var template = Inkling2VisionEndToEndTests.LoadOracle("rainbow80");
+        Skip.If(template is null, "vision oracle not generated");
+        foreach (string name in new[] { "rainbow80", "rainbow190x110", "rainbow640", "noise2560" })
+        {
+            var image = Inkling2VulkanVisionEncoderTests.LoadImage(name);
+            var o = name == "noise2560" ? template! : Inkling2VisionEndToEndTests.LoadOracle(name)!;
+            using (var warm = enc.Encode(image)) { }
+            double bestEnc = double.MaxValue, bestPrefill = double.MaxValue; int tokens = 0, promptLen = 0;
+            for (int rep = 0; rep < (name == "noise2560" ? 1 : 2); rep++)
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                using var emb = enc.Encode(image);
+                double e = sw.Elapsed.TotalSeconds;
+                tokens = emb.Tokens;
+                var prompt = o.Before.Concat(Enumerable.Repeat(200054, emb.Tokens)).Concat(o.After).ToArray(); promptLen = prompt.Length;
+                model.ResetSequenceState();
+                sw.Restart();
+                using var t = model.ForwardWithImages(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, [new ImageSpan(o.Before.Length, emb)], null, lastTokenLogitsOnly: true);
+                _ = Row(t, 0, model.Config.VocabSize);
+                double pf = sw.Elapsed.TotalSeconds;
+                bestEnc = Math.Min(bestEnc, e); bestPrefill = Math.Min(bestPrefill, pf);
+            }
+            double cpu = cpuTimes.TryGetValue(name, out var c) ? c : double.NaN;
+            _output.WriteLine($"TTFT {name}: {tokens} image tokens, prompt {promptLen}; encode Vulkan {bestEnc:F3} s vs CPU {cpu:F3} s; prefill+first token {bestPrefill:F2} s; TTFT Vulkan encoder {bestEnc + bestPrefill:F2} s vs CPU encoder {cpu + bestPrefill:F2} s");
+        }
     }
 }
