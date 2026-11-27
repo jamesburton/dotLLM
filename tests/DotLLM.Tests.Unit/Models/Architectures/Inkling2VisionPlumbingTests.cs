@@ -328,4 +328,118 @@ public sealed class Inkling2VisionPlumbingTests
         Assert.Throws<ArgumentException>(() => gen.Generate("3 4", new InferenceOptions { MaxTokens = 1, Images = [emb], ImagePlaceholderTokenId = 9 }));
         Assert.Throws<ArgumentException>(() => gen.Generate("3 9", new InferenceOptions { MaxTokens = 1, Images = [emb] }));
     }
+
+    /// <summary>
+    /// Review finding: the surviving mutant removed the image early return in <c>ResolveKvCache</c>. Nothing could expose it because an image request stores no
+    /// prefix, so there was never anything to hit. Here a TEXT request with exactly the widened token ids (the placeholder repeated as plain tokens) is cached
+    /// first; an image request with the same ids must still prefill the whole prompt from position 0 (without the early return the prefix cache would serve
+    /// the text request's KV, i.e. another input's, and the model would see only the tail), and must leave the cache as it found it.
+    /// </summary>
+    [Fact]
+    public void ImageRequest_NeverHitsAPrefixCachedByATextRequestWithTheSameIds()
+    {
+        var model = new ImageStubModel();
+        var prefixCache = new PrefixCache(4);
+        var gen = new TextGenerator(model, new WordTokenizer(), kvCacheFactory: (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg, false), size),
+            prefixCache: prefixCache);
+        // the text request: the exact ids the image request widens to (2 + 3 image tokens at the placeholder 9)
+        gen.Generate("3 9 9 4 9 9 9 6", new InferenceOptions { MaxTokens = 1, Temperature = 0 });
+        int entries = prefixCache.EntryCount;
+        Assert.True(entries > 0, "the control request must have populated the prefix cache (otherwise the test cannot see a hit)");
+        Assert.Empty(model.ImageCalls);
+
+        using var emb1 = new ImageEmbeddings(2, 1, 8, "a");
+        using var emb2 = new ImageEmbeddings(3, 1, 8, "b");
+        gen.Generate("3 9 4 9 6", new InferenceOptions { MaxTokens = 1, Temperature = 0, Images = [emb1, emb2], ImagePlaceholderTokenId = 9 });
+        var call = Assert.Single(model.ImageCalls);
+        Assert.Equal(new[] { 3, 9, 9, 4, 9, 9, 9, 6 }, call.Tokens);          // the whole prompt, not a suffix after a cache hit
+        Assert.Equal(Enumerable.Range(0, 8).ToArray(), call.Positions);        // from position 0
+        Assert.Equal(entries, prefixCache.EntryCount);                          // nothing stored either
+    }
+
+    /// <summary>
+    /// A second chunked-prefill image test (review: the chunk-relative-index mutant of <c>TryImageRow</c> was killed only by rainbow640). With a chunk size
+    /// of 3 the two images straddle several chunk boundaries at different offsets; every chunk must carry contiguous absolute positions and the SAME absolute
+    /// spans, so a model indexing image rows by <c>position - span.Start</c> never sees a chunk-relative index. The real CPU model is gated by
+    /// <c>ChunkedPrefill_ImageRows_AreChunkSizeInvariant</c> (end-to-end test class).
+    /// </summary>
+    [Fact]
+    public void ChunkedPrefill_PassesContiguousAbsolutePositionsAndTheSameSpansToEveryChunk()
+    {
+        var model = new ImageStubModel();
+        var gen = new TextGenerator(model, new WordTokenizer(), kvCacheFactory: (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg, false), size),
+            prefillChunkSize: 3);
+        using var emb1 = new ImageEmbeddings(2, 1, 8, "a");     // 2 tokens
+        using var emb2 = new ImageEmbeddings(4, 1, 8, "b");     // 4 tokens
+        gen.Generate("3 9 4 5 9 6 7", new InferenceOptions { MaxTokens = 1, Temperature = 0, Images = [emb1, emb2], ImagePlaceholderTokenId = 9 });
+        // expanded: 3 9 9 4 5 9 9 9 9 6 7 (11 tokens); images at 1..2 and 5..8
+        Assert.True(model.ImageCalls.Count >= 4, $"expected the 11-token prompt in chunks of 3, got {model.ImageCalls.Count} call(s)");
+        int expectedStart = 0;
+        foreach (var call in model.ImageCalls)
+        {
+            Assert.InRange(call.Tokens.Length, 1, 3);
+            Assert.Equal(Enumerable.Range(expectedStart, call.Tokens.Length).ToArray(), call.Positions);
+            expectedStart += call.Tokens.Length;
+            Assert.Equal([1, 5], call.Spans.Select(s => s.Start).ToArray());     // absolute, identical in every chunk
+            Assert.Equal([2, 4], call.Spans.Select(s => s.Embeddings.Tokens).ToArray());
+        }
+        Assert.Equal(11, expectedStart);
+        Assert.Equal(model.ImageCalls.Count, model.ImageCallKvCaches.Count);
+        Assert.Single(model.ImageCallKvCaches.Distinct());                        // one KV cache for the whole chunked prefill
+    }
+
+    /// <summary>The engine refuses a LoRA adapter together with images (review: the image prefill silently dropped it).</summary>
+    [Fact]
+    public void Generator_RefusesAnAdapterTogetherWithImages()
+    {
+        var gen = new TextGenerator(new ImageStubModel(), new WordTokenizer(), kvCacheFactory: (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg, false), size));
+        using var emb = new ImageEmbeddings(1, 1, 8, "h");
+        var adapter = new StubAdapter();
+        var ex = Assert.Throws<NotSupportedException>(() => gen.Generate("3 9", new InferenceOptions { MaxTokens = 1, Images = [emb], ImagePlaceholderTokenId = 9 }, adapter: adapter));
+        Assert.Contains("LoRA", ex.Message, StringComparison.Ordinal);
+        // control: the same request without the adapter runs
+        Assert.NotNull(gen.Generate("3 9", new InferenceOptions { MaxTokens = 1, Images = [emb], ImagePlaceholderTokenId = 9 }));
+    }
+
+    private sealed class StubAdapter : DotLLM.Core.Lora.ILoraAdapter
+    {
+        public string Name => "stub";
+        public int Rank => 1;
+        public float Alpha => 1;
+        public IReadOnlyList<string> TargetModules => [];
+        public DotLLM.Core.Lora.LoraLayerWeights? GetLayerWeights(int layerIndex, string projName, DotLLM.Core.Lora.LoraRegion region = DotLLM.Core.Lora.LoraRegion.Any) => null;
+        public bool IsCompatible(ModelConfig baseConfig) => true;
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// Review finding: <c>max_tokens</c> clamped to the context left after the images widen the prompt, with a thinking budget. The clamp runs after the
+    /// budget raised <c>max_tokens</c> to budget + reserve, bounds that raised value, never goes below 1, and carries the budget through unchanged (as the
+    /// text path's context check does). Kills: clamping the raw request value instead of the raised one (then 9,192 would survive), dropping the budget, and
+    /// a clamp that can exceed what is left.
+    /// </summary>
+    [Fact]
+    public void ImageClamp_BoundsTheBudgetRaisedMaxTokens_AndKeepsTheBudget()
+    {
+        using var emb = new ImageEmbeddings(10, 10, 8, "big");                   // 100 tokens: adds 99 positions
+        const int ctx = 2000, prompt = 1000;
+        int raised = DotLLM.Server.ReasoningSupport.WithAnswerReserve(64, 1000, 8192);   // thinking budget 1000 + reserve 8192
+        Assert.Equal(9192, raised);
+        var budget = new ThinkingBudget(1000, "<think>", "</think>", true, null);
+        var options = new InferenceOptions { MaxTokens = raised, ThinkingBudget = budget };
+
+        var clamped = DotLLM.Server.ImageInput.WithImages(options, [emb], 9, ctx, prompt);
+        Assert.Equal(ctx - prompt - 99, clamped.MaxTokens);                         // 901 positions left
+        Assert.Same(budget, clamped.ThinkingBudget);
+        Assert.Equal(9, clamped.ImagePlaceholderTokenId);
+        Assert.Same(emb, Assert.Single(clamped.Images!));
+
+        // plenty of room: the requested (raised) value stays
+        Assert.Equal(9192, DotLLM.Server.ImageInput.WithImages(options, [emb], 9, 100_000, prompt).MaxTokens);
+        // a smaller request than the room is never raised
+        Assert.Equal(50, DotLLM.Server.ImageInput.WithImages(options with { MaxTokens = 50 }, [emb], 9, ctx, prompt).MaxTokens);
+        // no room at all: one token, never zero or negative
+        Assert.Equal(1, DotLLM.Server.ImageInput.WithImages(options, [emb], 9, prompt + 99, prompt).MaxTokens);
+        Assert.Equal(1, DotLLM.Server.ImageInput.WithImages(options, [emb], 9, 10, prompt).MaxTokens);
+    }
 }

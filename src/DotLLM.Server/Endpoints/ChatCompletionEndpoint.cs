@@ -191,10 +191,7 @@ public static class ChatCompletionEndpoint
                 // one generated token, checked before the encode (ImageInput), and max_tokens is clamped to what is left after the widening.
                 int ctx = state.Config!.MaxSequenceLength;
                 imageEmbeddings = await ImageInput.EncodeAsync(state, imageUrls, ctx - promptTokenCount - 1, ct);
-                long extra = 0;
-                foreach (var e in imageEmbeddings) extra += e.Tokens - 1;
-                int remaining = (int)Math.Max(1, ctx - promptTokenCount - extra);
-                options = options with { Images = imageEmbeddings, ImagePlaceholderTokenId = placeholder[0], MaxTokens = Math.Min(options.MaxTokens, remaining) };
+                options = ImageInput.WithImages(options, imageEmbeddings, placeholder[0], ctx, promptTokenCount);
             }
             catch (ImageInputException ex)
             {

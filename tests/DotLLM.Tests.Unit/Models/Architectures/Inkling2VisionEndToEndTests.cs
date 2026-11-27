@@ -100,7 +100,7 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
     /// Runs the image prompt then teacher-forces the oracle's continuation; returns our full-vocabulary logits of every scored row (the prompt's last
     /// position, then one per continuation token) and how many greedy picks differ from the oracle's continuation.
     /// </summary>
-    private (float[][] Rows, int GreedyMismatch) RunRows(Oracle o, Inkling2TransformerModel model, Inkling2VisionEncoder encoder, int? placeholder = null)
+    private (float[][] Rows, int GreedyMismatch) RunRows(Oracle o, Inkling2TransformerModel model, Inkling2VisionEncoder encoder, int? placeholder = null, int chunk = 32)
     {
         int ph = placeholder ?? 200054;   // <|unused_200054|>: only the ids' count matters, the embeddings replace them
         using var emb = encoder.Encode(o.Image);
@@ -112,9 +112,9 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
         var rows = new List<float[]>();
         // Prefill in 32-token calls (positions continue the state), like the text gate, so carried KV/conv state is exercised.
         float[] ours = [];
-        for (int at = 0; at < prompt.Length; at += 32)
+        for (int at = 0; at < prompt.Length; at += chunk)
         {
-            int len = Math.Min(32, prompt.Length - at);
+            int len = Math.Min(chunk, prompt.Length - at);
             using var t = model.ForwardWithImagesAndState(prompt.AsSpan(at, len), Enumerable.Range(at, len).ToArray(), -1, state, spans, lastTokenLogitsOnly: true);
             if (at + len == prompt.Length) ours = Row(t, 0, model.Config.VocabSize);
         }
@@ -164,6 +164,29 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
         _output.WriteLine($"{name}: mean KL {s.MeanKl:E2}, max KL {s.MaxKl:E2}, top-1 {s.Top1}/{s.Rows}, teacher-forced greedy mismatches {s.GreedyMismatch}/{o!.Gen.Length}");
         Assert.True(s.MeanKl < Gate, $"mean KL {s.MeanKl:E2} over {s.Rows} positions (gate {Gate:E1})");
         Assert.True(s.Top1 >= s.Rows - 2, $"top-1 agreement {s.Top1}/{s.Rows}");
+    }
+
+    /// <summary>
+    /// Review finding: the chunk-relative-index mutant of <c>TryImageRow</c> (image rows looked up by the position inside the chunk instead of the absolute position)
+    /// was killed only by rainbow640. The prefill here runs in chunks of 5 and 7 tokens, so the image rows of the small images straddle chunk boundaries at
+    /// offsets that differ from the 32-token reference run; the final-position logits must not depend on the chunk size (KL below 1e-3, text-only
+    /// chunk-size noise is about 1e-5), on two images of different size and padding.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("rainbow80", 5)]
+    [InlineData("rainbow190x110", 7)]
+    [InlineData("rainbow190x110", 4)]
+    public void ChunkedPrefill_ImageRows_AreChunkSizeInvariant(string name, int chunk)
+    {
+        var o = LoadOracle(name);
+        Skip.If(o is null, "vision oracle not generated");
+        var (model, enc) = Models();
+        var reference = RunRows(o!, model, enc).Rows[0];
+        var chunked = RunRows(o!, model, enc, chunk: chunk).Rows[0];
+        var (kl, same) = FullKl(reference, chunked);
+        _output.WriteLine($"{name} chunk {chunk}: KL vs chunk 32 {kl:E2}, same top-1 {same}");
+        Assert.True(same);
+        Assert.True(kl < 1e-3, $"chunk {chunk} changed the final logits (KL {kl:E2}): image rows are not addressed by absolute position");
     }
 
     /// <summary>

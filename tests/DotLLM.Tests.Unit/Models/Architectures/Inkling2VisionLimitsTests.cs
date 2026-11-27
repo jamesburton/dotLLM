@@ -228,24 +228,25 @@ public sealed class Inkling2VisionLimitsTests
 
     /// <summary>
     /// Review finding: the F32 activation scratch of a 4,096-token image (about 1 GB) was held for the life of the encoder. After the call it is released down to
-    /// <c>ScratchKeepBytes</c> (128 MB). Kills: no trim (the scratch stays at its peak). Real encode of a 2560x2560 noise image: slow (tens of seconds).
+    /// <c>ScratchKeepBytes</c> (128 MB). Kills: no trim (the scratch stays at its peak). Measured once on a 2560x2560 noise image (4,096 tokens: 425.9 s while another agent held the CPU, scratch peak 2,517 MB, 0 held after); this test uses 640x640 with a 32 MB keep so it stays fast.
     /// </summary>
     [SkippableFact]
     public void BigImageScratch_IsReleasedAfterTheEncode()
     {
         string? mm = Inkling2VisionFixtures.FindMmproj();
         Skip.If(mm is null, "mmproj-Inkling-2-Mini-Q8_0.gguf not in the HF cache");
-        var rgb = new byte[2560 * 2560 * 3];
+        var rgb = new byte[640 * 640 * 3];
         new Random(3).NextBytes(rgb);
         using var enc = Inkling2VisionEncoder.Load(mm!, DotLLM.Core.Configuration.ThreadingConfig.Auto);
+        enc.ScratchKeepBytes = 32L << 20;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        using (var e = enc.Encode(new DecodedImage(2560, 2560, rgb))) Assert.Equal(4096, e.Tokens);
+        using (var e = enc.Encode(new DecodedImage(640, 640, rgb))) Assert.Equal(256, e.Tokens);
         sw.Stop();
-        _output.WriteLine($"4096-token encode {sw.Elapsed.TotalSeconds:F1} s; scratch peak {enc.LastPeakScratchBytes / 1e6:F0} MB, held after {enc.ScratchBytes / 1e6:F0} MB");
-        Assert.True(enc.LastPeakScratchBytes > 500L << 20, $"peak {enc.LastPeakScratchBytes} bytes: the test image no longer exercises the large case");
+        _output.WriteLine($"256-token encode {sw.Elapsed.TotalSeconds:F1} s; scratch peak {enc.LastPeakScratchBytes / 1e6:F0} MB, held after {enc.ScratchBytes / 1e6:F0} MB");
+        Assert.True(enc.LastPeakScratchBytes > 64L << 20, $"peak {enc.LastPeakScratchBytes} bytes: the test image no longer exercises the large case");
         Assert.True(enc.ScratchBytes <= enc.ScratchKeepBytes, $"{enc.ScratchBytes} bytes of scratch held after the call (keep {enc.ScratchKeepBytes})");
         // a small image after it still encodes and keeps its (small) scratch warm
         using (var small = enc.Encode(new DecodedImage(80, 80, new byte[80 * 80 * 3]))) Assert.Equal(4, small.Tokens);
-        Assert.InRange(enc.ScratchBytes, 1, enc.ScratchKeepBytes);
+        Assert.InRange(enc.ScratchBytes, 1, enc.ScratchKeepBytes);   // 80x80 needs less than the keep: stays warm
     }
 }

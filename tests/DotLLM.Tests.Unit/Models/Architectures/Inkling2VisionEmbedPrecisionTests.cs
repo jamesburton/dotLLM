@@ -122,7 +122,7 @@ public sealed class Inkling2VisionEmbedPrecisionTests
                 string c = "n/a", cSelf = "n/a";
                 if (controlResults.TryGetValue((arm, name), out var cm))
                 {
-                    string f = Path.Combine(ControlDir, $"d32_{name}.f32");
+                    string f = Path.Combine(ControlDir, $"llamacpp_f32_{name}.f32");
                     if (File.Exists(f)) c = RelRms(cm, ReadF32(f)).ToString("E2");
                     cSelf = RelRms(cm, controlResults[(VisionEmbedPrecision.F32, name)]).ToString("E2");
                 }
@@ -138,9 +138,9 @@ public sealed class Inkling2VisionEmbedPrecisionTests
         {
             Assert.NotEqual(controlResults[(VisionEmbedPrecision.F32, name)], controlResults[(VisionEmbedPrecision.F16, name)]);
             Assert.NotEqual(controlResults[(VisionEmbedPrecision.F16, name)], controlResults[(VisionEmbedPrecision.BF16, name)]);
-            double floor = RelRms(controlResults[(VisionEmbedPrecision.F32, name)], ReadF32(Path.Combine(ControlDir, $"d32_{name}.f32")));
+            double floor = RelRms(controlResults[(VisionEmbedPrecision.F32, name)], ReadF32(Path.Combine(ControlDir, $"llamacpp_f32_{name}.f32")));
             Assert.True(floor < 5e-4, $"{name}: F32 arm on the F32-weights control is {floor:E2} from llama.cpp (the reviewer measured 2.1e-4)");
-            double f16 = RelRms(controlResults[(VisionEmbedPrecision.F16, name)], ReadF32(Path.Combine(ControlDir, $"d32_{name}.f32")));
+            double f16 = RelRms(controlResults[(VisionEmbedPrecision.F16, name)], ReadF32(Path.Combine(ControlDir, $"llamacpp_f32_{name}.f32")));
             Assert.True(f16 < 10 * 2.1e-4 + 1e-3, $"{name}: the F16 arm moved the embeddings by {f16:E2}");
         }
     }

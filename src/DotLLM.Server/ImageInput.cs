@@ -97,6 +97,26 @@ public static class ImageInput
         return (int)extra;
     }
 
+    /// <summary>
+    /// The inference options of an image request: the encoded images and the placeholder token, with <c>MaxTokens</c> clamped to what the context has left
+    /// after each placeholder widens to its image's token count. It runs AFTER the thinking-budget answer reserve has raised <c>MaxTokens</c>
+    /// (<c>ReasoningSupport.WithAnswerReserve</c>) and after <c>ThinkingBudget</c> was attached, so the clamp bounds the reserve-raised value exactly as the context
+    /// check bounds a text request, and the budget is carried through untouched (the context window caps the answer, never the budget).
+    /// </summary>
+    /// <param name="options">The options built for the text of the request.</param>
+    /// <param name="images">The encoded images, in prompt order.</param>
+    /// <param name="placeholderTokenId">The chat template's image placeholder token.</param>
+    /// <param name="contextLength">The model's context length.</param>
+    /// <param name="promptTokenCount">The prompt's token count before the placeholders widen.</param>
+    internal static DotLLM.Core.Configuration.InferenceOptions WithImages(DotLLM.Core.Configuration.InferenceOptions options,
+        IReadOnlyList<ImageEmbeddings> images, int placeholderTokenId, int contextLength, int promptTokenCount)
+    {
+        long extra = 0;
+        foreach (var e in images) extra += e.Tokens - 1;
+        int remaining = (int)Math.Clamp(contextLength - promptTokenCount - extra, 1, int.MaxValue);
+        return options with { Images = images, ImagePlaceholderTokenId = placeholderTokenId, MaxTokens = Math.Min(options.MaxTokens, remaining) };
+    }
+
     private static List<ImageEmbeddings> Encode(ServerState state, IReadOnlyList<string> urls, int extraTokenBudget, CancellationToken ct)
     {
         if (state.Model is not IImageInputModel)
