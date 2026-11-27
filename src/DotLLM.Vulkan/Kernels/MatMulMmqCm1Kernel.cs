@@ -61,10 +61,12 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
         => qt is QuantizationType.Q8_0 or QuantizationType.Q5_0 or QuantizationType.Q4_K or QuantizationType.Q4_1 or QuantizationType.Q4_0
             or QuantizationType.Q5_1;
 
-    private static string SpvName(QuantizationType qt, bool grouped)
+    private static string SpvName(QuantizationType qt, bool grouped, int rowTile = RowTile)
     {
         string q = qt switch { QuantizationType.Q8_0 => "q8_0", QuantizationType.Q5_0 => "q5_0", QuantizationType.Q4_1 => "q4_1", QuantizationType.Q4_0 => "q4_0", QuantizationType.Q5_1 => "q5_1", _ => "q4_k" };
-        return grouped ? $"moe_grouped_{q}_mmq_cm1.spv" : $"matmul_{q}_mmq_cm1.spv";
+        if (rowTile != RowTile && (!grouped || rowTile is not (16 or 32)))
+            throw new ArgumentOutOfRangeException(nameof(rowTile), rowTile, "Only the grouped form has 16- and 32-row tile variants (#2041).");
+        return grouped ? (rowTile == RowTile ? $"moe_grouped_{q}_mmq_cm1.spv" : $"moe_grouped_{q}_mmq_cm1_bn{rowTile}.spv") : $"matmul_{q}_mmq_cm1.spv";
     }
 
     /// <summary>
@@ -75,8 +77,9 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
     /// <param name="spvDir">Directory holding the compiled shaders.</param>
     /// <param name="quant">Weight format.</param>
     /// <param name="grouped">The MoE expert-grouped form.</param>
+    /// <param name="rowTile">Token rows per tile of the grouped form (64, 32 or 16).</param>
     /// <returns><see langword="true"/> when <see cref="TryCreate"/> would succeed.</returns>
-    public static bool IsSupportedOn(VulkanDevice device, string spvDir, QuantizationType quant, bool grouped = false)
+    public static bool IsSupportedOn(VulkanDevice device, string spvDir, QuantizationType quant, bool grouped = false, int rowTile = RowTile)
         => Enabled && IsSupportedQuant(quant)
             && device.VendorId == AmdVendorId
             && device.HasCooperativeMatrix
@@ -85,23 +88,24 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
                 p.MSize == 16 && p.NSize == 16 && p.KSize == 16 && p.Scope == VkScopeKhr.Subgroup
                 && p.AType == VkComponentTypeKhr.Sint8 && p.BType == VkComponentTypeKhr.Sint8
                 && p.CType == VkComponentTypeKhr.Sint32 && p.ResultType == VkComponentTypeKhr.Sint32)
-            && File.Exists(Path.Combine(spvDir, SpvName(quant, grouped)));
+            && File.Exists(Path.Combine(spvDir, SpvName(quant, grouped, rowTile)));
 
     /// <summary>Creates the kernel, or returns <see langword="null"/> when <see cref="IsSupportedOn"/> is false.</summary>
     /// <param name="device">The device.</param>
     /// <param name="spvDir">Directory holding the compiled shaders.</param>
     /// <param name="quant">Weight format (Q8_0, Q5_0, Q4_K or Q4_1).</param>
     /// <param name="grouped">The MoE expert-grouped form.</param>
+    /// <param name="rowTile">Token rows per workgroup tile of the grouped form: 64 (default), 32 or 16 (#2041: for batches with few rows per expert).</param>
     /// <returns>The kernel, or <see langword="null"/>.</returns>
-    public static MatMulMmqCm1Kernel? TryCreate(VulkanDevice device, string spvDir, QuantizationType quant, bool grouped = false)
+    public static MatMulMmqCm1Kernel? TryCreate(VulkanDevice device, string spvDir, QuantizationType quant, bool grouped = false, int rowTile = RowTile)
     {
-        if (!IsSupportedOn(device, spvDir, quant, grouped) || !LayoutValidated(device, spvDir)) return null;
-        return CreateCore(device, spvDir, quant, grouped);
+        if (!IsSupportedOn(device, spvDir, quant, grouped, rowTile) || !LayoutValidated(device, spvDir)) return null;
+        return CreateCore(device, spvDir, quant, grouped, rowTile);
     }
 
-    private static MatMulMmqCm1Kernel CreateCore(VulkanDevice device, string spvDir, QuantizationType quant, bool grouped)
+    private static MatMulMmqCm1Kernel CreateCore(VulkanDevice device, string spvDir, QuantizationType quant, bool grouped, int rowTile = RowTile)
     {
-        var module = VulkanModule.LoadFromFile(device, Path.Combine(spvDir, SpvName(quant, grouped)));
+        var module = VulkanModule.LoadFromFile(device, Path.Combine(spvDir, SpvName(quant, grouped, rowTile)));
         int bufferCount = grouped ? 5 : 4;
         ComputePipeline pipeline;
         try
@@ -117,7 +121,7 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
         }
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)bufferCount);
         // matmul_q4_1_mmq_cm1 is compiled with a 64 x 128 tile (#1235); every other form uses 64 x 64.
-        int tileN = quant == QuantizationType.Q4_1 && !grouped ? 2 * Tile : Tile;
+        int tileN = quant == QuantizationType.Q4_1 && !grouped ? 2 * Tile : grouped ? rowTile : Tile;
         return new MatMulMmqCm1Kernel(device, module, pipeline, pool, quant, grouped, tileN);
     }
 
@@ -196,6 +200,9 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
     /// <param name="k">Contraction length.</param>
     /// <returns><see langword="true"/> for K in whole 32-element blocks (whole 256-element super-blocks for Q4_K).</returns>
     public bool SupportsK(int k) => k > 0 && k % KGranularity == 0 && (_quant != QuantizationType.Q4_K || k % 256 == 0);
+
+    /// <summary>Token rows per workgroup tile of this kernel's grouped form (the row tile its tile list must be built with).</summary>
+    public int GroupedRowTile => _tileN;
 
     /// <summary>Weight-row tiles of an <paramref name="m"/>-row weight (the x extent of the grid).</summary>
     /// <param name="m">Weight rows.</param>
@@ -289,7 +296,7 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
         Validate(bank, xq, xds, output, m, k, rows, numExperts);
         Bind(cmdBuf, [bank.Handle, xq.Handle, xds.Handle, output.Handle, offsets.Handle], m, k, rows, numExperts, tileList: 0);
         int rowTiles = maxRowsPerExpert > 0 ? Math.Min(maxRowsPerExpert, rows) : rows;
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)MTiles(m), (uint)((rowTiles + Tile - 1) / Tile), (uint)numExperts);
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)MTiles(m), (uint)((rowTiles + _tileN - 1) / _tileN), (uint)numExperts);
     }
 
     private void Validate(VulkanDevice.Buffer weights, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds, VulkanDevice.Buffer output,
