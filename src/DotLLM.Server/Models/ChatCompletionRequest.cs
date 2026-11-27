@@ -326,8 +326,9 @@ public sealed record ChatMessageDto
     [JsonPropertyName("role")]
     public required string Role { get; init; }
 
+    /// <summary>String, or an array of content parts (text / image_url, issue #2035); converts implicitly to and from string.</summary>
     [JsonPropertyName("content")]
-    public string? Content { get; init; }
+    public MessageContent? Content { get; init; }
 
     [JsonPropertyName("tool_calls")]
     public ToolCallDto[]? ToolCalls { get; init; }

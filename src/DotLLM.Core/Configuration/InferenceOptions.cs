@@ -162,6 +162,16 @@ public record InferenceOptions
     public string? GenerationPromptSuffix { get; init; }
 
     /// <summary>
+    /// Encoded images of this prompt, in prompt order (issue #2035). Each consumes one occurrence of <see cref="ImagePlaceholderTokenId"/> in the
+    /// rendered prompt and is widened to its token count; the model must implement <see cref="DotLLM.Core.Vision.IImageInputModel"/>. A request with
+    /// images reuses and retains no prefix cache. Null for text-only requests (nullable, not an initialised <c>init</c>: JSON source generation).
+    /// </summary>
+    public IReadOnlyList<DotLLM.Core.Vision.ImageEmbeddings>? Images { get; init; }
+
+    /// <summary>Token id of the chat template's image placeholder (Inkling 2: <c>&lt;|unused_200054|&gt;</c>). Required when <see cref="Images"/> is set.</summary>
+    public int? ImagePlaceholderTokenId { get; init; }
+
+    /// <summary>
     /// The prompt text up to the start of the request's last non-assistant message's content (a user message, or the tool result
     /// an agent loop ends with), its role header included (the chat template's render of everything before it), or
     /// <see langword="null"/> when unknown. The prefix caches use it as the conversation's

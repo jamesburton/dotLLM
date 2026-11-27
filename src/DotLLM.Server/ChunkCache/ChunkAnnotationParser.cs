@@ -14,8 +14,10 @@ namespace DotLLM.Server.ChunkCache;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Surfaces (ruling 19).</b> OpenAI: string <c>content</c> only, through the manifest (<c>part: 0</c>); array
-/// content never reaches the parser (model binding refuses it). Anthropic: an inline <c>chunk</c> on a <c>text</c> block
+/// <b>Surfaces (ruling 19, superseded 2026-11-27, #2035).</b> OpenAI: string <c>content</c> through the manifest
+/// (<c>part: 0</c>), and array content (text / image_url parts): an inline <c>chunk</c> on a text part, or the manifest with
+/// <c>at.part</c> the index in the content array. The engine joins the text parts with no separator
+/// (<see cref="MessageContent.Text"/>), so a part's offset is the length of the earlier text parts. Anthropic: an inline <c>chunk</c> on a <c>text</c> block
 /// (also on a text block inside a <c>tool_result</c>'s content array) and the manifest (a top-level <c>text</c> block,
 /// or a <c>tool_result</c> with string content). Engine positions come from
 /// <see cref="AnthropicConverter"/> itself (<see cref="AnthropicTextOrigins"/>), so the <c>'\n'</c> joins and the
@@ -63,8 +65,8 @@ internal static class ChunkAnnotationParser
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(ns);
-        if (!options.Enabled || IsAbsent(request.ChunkCache))
-            return null; // an inline `chunk` cannot occur on this surface (string content only)
+        if (!options.Enabled || !HasAnnotation(request))
+            return null;
         if (request.Messages is null || Array.IndexOf(request.Messages, null) >= 0)
             return null;
 
@@ -72,8 +74,7 @@ internal static class ChunkAnnotationParser
         for (int i = 0; i < wire.Length; i++)
         {
             var dto = request.Messages[i];
-            wire[i] = new WireMessage(dto.Role ?? "",
-                dto.Content is null ? [] : [new WirePart(true, dto.Content, null, i, 0)]);
+            wire[i] = new WireMessage(dto.Role ?? "", OpenAiParts(dto.Content, i));
         }
         return ParseCore(wire, RequestConverter.ToMessages(request.Messages), request.ChunkCache, options, ns);
     }
@@ -105,13 +106,51 @@ internal static class ChunkAnnotationParser
     }
 
     /// <summary>
-    /// Whether an OpenAI request carries any chunk annotation (a non-null <c>chunk_cache</c>; inline annotations cannot occur
-    /// on this surface). Allocation-free: callers check it before resolving the caller, so an unannotated request never
+    /// Whether an OpenAI request carries any chunk annotation (a non-null <c>chunk_cache</c>, or an inline <c>chunk</c> on a part of
+    /// array content). Allocation-free: callers check it before resolving the caller, so an unannotated request never
     /// pays for a key lookup or hash.
     /// </summary>
     /// <param name="request">The bound request.</param>
     /// <returns>False when <see cref="Parse(ChatCompletionRequest, ChunkCacheOptions, string)"/> would return null for want of an annotation.</returns>
-    public static bool HasAnnotation(ChatCompletionRequest request) => !IsAbsent(request.ChunkCache);
+    public static bool HasAnnotation(ChatCompletionRequest request) =>
+        !IsAbsent(request.ChunkCache)
+        || (request.Messages is { } messages && HasInlineChunk(messages));
+
+    private static bool HasInlineChunk(ChatMessageDto?[] messages)
+    {
+        foreach (var msg in messages)
+            if (msg?.Content?.Parts is { } parts)
+                foreach (var part in parts)
+                    if (part.Chunk is not null)
+                        return true;
+        return false;
+    }
+
+    /// <summary>The wire parts of an OpenAI message: string content is part 0; array content is one part per array element.</summary>
+    private static List<WirePart> OpenAiParts(MessageContent? content, int message)
+    {
+        var result = new List<WirePart>();
+        if (content is null)
+            return result;
+        if (content.Parts is not { } parts)
+        {
+            result.Add(new WirePart(true, content.Text, null, message, 0));
+            return result;
+        }
+        int offset = 0; // the engine content is the text parts joined with no separator
+        foreach (var part in parts)
+        {
+            if (part.Type == "text")
+            {
+                string text = part.Text ?? "";
+                result.Add(new WirePart(true, text, part.Chunk, message, offset));
+                offset += text.Length;
+            }
+            else
+                result.Add(new WirePart(false, null, part.Chunk, -1, 0));
+        }
+        return result;
+    }
 
     /// <summary>Whether an Anthropic request carries any chunk annotation (<c>chunk_cache</c> or an inline <c>chunk</c>). Allocation-free.</summary>
     /// <param name="request">The bound request.</param>

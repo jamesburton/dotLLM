@@ -34,13 +34,23 @@ public static class RequestConverter
             result[i] = new ChatMessage
             {
                 Role = d.Role,
-                Content = d.Content ?? "",
-                ToolCalls = toolCalls,
+                Content = d.Content?.Text ?? "",
+                ContentParts = d.Content?.Parts is { } cp && cp.Any(x => x.Type == "image_url")
+                    ? cp.Select(x => new ChatContentPart { Type = x.Type, Text = x.Text, ImageUrl = x.ImageUrl }).ToArray() : null,                ToolCalls = toolCalls,
                 ToolCallId = d.ToolCallId,
                 ReasoningContent = d.ReasoningContent ?? d.Reasoning,
             };
         }
         return result;
+    }
+
+    /// <summary>The <c>image_url</c> URLs of all messages, in prompt order (one per rendered image placeholder).</summary>
+    public static List<string> ImageUrls(ChatMessageDto[] dtos)
+    {
+        var urls = new List<string>();
+        foreach (var d in dtos)
+            if (d.Content?.Parts is not null) urls.AddRange(d.Content.ImageUrls);
+        return urls;
     }
 
     /// <summary>

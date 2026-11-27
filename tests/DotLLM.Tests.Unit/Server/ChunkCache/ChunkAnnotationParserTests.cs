@@ -51,8 +51,8 @@ public sealed class ChunkAnnotationParserTests
     /// <summary>
     /// Every request fixture, read in the contract's own serialised-message model (string content = part 0, arrays
     /// index their parts), gives exactly <c>expected.json</c>'s non-strict warnings, strict error, accepted span ids
-    /// and defect list. The array-content shape is not an OpenAI v1 body (ruling 19), so the parser's core is fed
-    /// directly; <see cref="Fixtures_ThroughTheAnthropicSurface_MatchExpected"/> runs the same requests end to end.
+    /// and defect list. The fixtures are fed to the parser's core directly (they were written while ruling 19 kept array content off the OpenAI surface;
+    /// it was superseded 2026-11-27, #2035, see <c>ChunkCacheOpenAiPartsTests</c>); <see cref="Fixtures_ThroughTheAnthropicSurface_MatchExpected"/> runs the same requests end to end.
     /// </summary>
     [Theory]
     [MemberData(nameof(RequestFixtures))]

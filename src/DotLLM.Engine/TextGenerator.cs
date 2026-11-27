@@ -104,6 +104,7 @@ public sealed partial class TextGenerator
     private readonly bool _extraCheckpoints;
     private long _recurrentTokenClock;        // prompt tokens the single slot has been asked about: the own-length clock
     private long _legacyPrefixProtected;      // single-slot requests that ran cold to protect an unexpired conversation
+    private IReadOnlyList<DotLLM.Core.Vision.ImageSpan>? _requestImages;   // image spans of the running request (#2035); null when it has none. Such a request reuses and stores no prefix
     private int _requestSavePoint = -1;       // the running request's save point (start of its last user message), or -1
     private bool _lastLookupProtected;        // the most recent request was a protected miss (telemetry)
 
@@ -405,6 +406,7 @@ public sealed partial class TextGenerator
         options ??= new InferenceOptions();
 
         int[] promptIds = _tokenizer.Encode(prompt);
+        promptIds = ExpandImagePlaceholders(promptIds, options, adapter);
         int promptLen = promptIds.Length;
         int maxTokens = options.MaxTokens;
         int vocabSize = _model.Config.VocabSize;
@@ -1048,6 +1050,7 @@ public sealed partial class TextGenerator
         options ??= new InferenceOptions();
 
         int[] promptIds = _tokenizer.Encode(prompt);
+        promptIds = ExpandImagePlaceholders(promptIds, options, adapter);
         int promptLen = promptIds.Length;
         int maxTokens = options.MaxTokens;
         int vocabSize = _model.Config.VocabSize;
@@ -1634,6 +1637,13 @@ public sealed partial class TextGenerator
         _lastLookupProtected = false;
         LastPrefixCacheTier = null; LastPrefixRestoreMilliseconds = 0;
         if (adapter is not null) ClearRecurrentPrefixCacheCore();
+        // A request carrying images (#2035) reuses no prefix: the cached tokens' ids are identical for different images (same placeholder), so a
+        // token-keyed hit would serve another image's KV. It starts from fresh state and stores nothing (StoreInPrefixCache).
+        if (_requestImages is not null)
+        {
+            if (_model.RequiresPerSequenceState) _model.ResetSequenceState();
+            return (AllocateKvCache(Math.Min(promptLen + maxTokens, _model.Config.MaxSequenceLength)), 0, true);
+        }
         // The conversation's save point (issue #1654), used by the agent-aware policy only: a recurrent model checkpoints there,
         // and a stored entry remembers it as the line below which a later request still belongs to the same conversation.
         if (_recurrentPolicy == PrefixCachePolicy.Agent || _prefixCache?.Policy == PrefixCachePolicy.Agent)
@@ -1804,6 +1814,7 @@ public sealed partial class TextGenerator
     {
         // Every normal end of a request passes through here (before its terminal token is yielded): the request succeeded.
         _recurrentPrefixRequestPending = false;
+        if (_requestImages is not null) return;   // image requests are never retained (see ResolveKvCache)
 
         // Recurrent models never reuse a KV-only prefix (see ResolveKvCache): nothing to store. The agent-aware single slot does
         // checkpoint the state at the end of the reply, so the next turn skips the reply too (issue #1654).
@@ -2471,7 +2482,31 @@ public sealed partial class TextGenerator
     // Sampled requests speculate too (#900): the decoder does exact speculative sampling against the prepared distribution. Logprob capture still
     // opts out (no per-position logits to read back).
     private bool ShouldUseMtp(bool captureLogprobs)
-        => _mtpEnabled && _draftModel is null && _model.SupportsMtp && !captureLogprobs;
+        => _mtpEnabled && _draftModel is null && _model.SupportsMtp && !captureLogprobs
+           && _requestImages is null;   // the image prefill carries no MTP state (IImageInputModel.ForwardWithImages), so MTP would draft from a stale head
+
+    /// <summary>
+    /// Expands the chat template's image placeholders (issue #2035): each of <see cref="InferenceOptions.Images"/> consumes one occurrence of
+    /// <see cref="InferenceOptions.ImagePlaceholderTokenId"/> in the encoded prompt and widens it to the image's token count; the resulting
+    /// <see cref="_requestImages"/> spans are what the prefill feeds to <see cref="DotLLM.Core.Vision.IImageInputModel"/>.
+    /// </summary>
+    private int[] ExpandImagePlaceholders(int[] promptIds, InferenceOptions options, ILoraAdapter? adapter)
+    {
+        _requestImages = null;
+        if (options.Images is not { Count: > 0 } images) return promptIds;
+        // IImageInputModel.ForwardWithImages takes no adapter, so the image prefill would silently run the BASE model (user review of #2037).
+        if (adapter is not null)
+            throw new NotSupportedException("Image input cannot be combined with a LoRA adapter: the image prefill would not apply it.");
+        if (_model is not DotLLM.Core.Vision.IImageInputModel)
+            throw new NotSupportedException($"The loaded model ({_model.Config.Architecture}) does not accept image input.");
+        if (options.ImagePlaceholderTokenId is not { } placeholder)
+            throw new ArgumentException("InferenceOptions.Images requires ImagePlaceholderTokenId.", nameof(options));
+        var (expanded, starts) = DotLLM.Core.Vision.ImagePlaceholders.Expand(promptIds, placeholder, images.Select(i => i.Tokens).ToArray());
+        var spans = new List<DotLLM.Core.Vision.ImageSpan>(images.Count);
+        for (int i = 0; i < images.Count; i++) spans.Add(new DotLLM.Core.Vision.ImageSpan(starts[i], images[i]));
+        _requestImages = spans;
+        return expanded;
+    }
 
     /// <summary>
     /// Runs the prompt-suffix prefill forward pass(es) against <paramref name="kvCache"/>.
@@ -2532,8 +2567,10 @@ public sealed partial class TextGenerator
                 // chunk only the final row is read. So opt in to last-row-only logits. Models that
                 // ignore the hint keep returning [len, vocab] and both call sites index
                 // Shape[0]-1, so the behaviour is unchanged for them.
-                logits = _model.Forward(promptIds.AsSpan(prefillStart + offset, len), positions,
-                    deviceId: -1, kvCache, adapter, mtpState, lastTokenLogitsOnly: true);
+                logits = _requestImages is not null && _model is DotLLM.Core.Vision.IImageInputModel imageModel
+                    ? imageModel.ForwardWithImages(promptIds.AsSpan(prefillStart + offset, len), positions, -1, _requestImages, kvCache, lastTokenLogitsOnly: true)
+                    : _model.Forward(promptIds.AsSpan(prefillStart + offset, len), positions,
+                        deviceId: -1, kvCache, adapter, mtpState, lastTokenLogitsOnly: true);
                 offset += len;
 
                 // Forward returned host logits, so the device has finished this chunk: count completed work, not queued.

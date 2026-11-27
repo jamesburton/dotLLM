@@ -5,6 +5,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
+using DotLLM.Core.Vision;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cpu.Threading;
 using DotLLM.Models.Gguf;
@@ -63,6 +64,8 @@ public sealed record Inkling2Options(
 internal enum Inkling2Mutant
 {
     None, TwoPasses, NoFinalSoftcap, NoSink, NoRelativeBias, NoLogScale, NoExpertScale, NoControl,
+    /// <summary>Image embeddings go through <c>token_embd_norm</c> like token rows (they must bypass it).</summary>
+    NormalizeImageEmbeddings,
 }
 
 /// <summary>Receives <c>(name, data, rows, cols)</c> tensors from <see cref="Inkling2TransformerModel"/>'s trace hook (tests / bisection).</summary>
@@ -80,7 +83,7 @@ internal delegate void Inkling2TraceSink(string name, ReadOnlySpan<float> data, 
 /// <para>The model owns its sequence state (KV + conv state per cache slot); positions must continue it (<c>positions[i] == state.Length + i</c>)
 /// and a call at position 0 restarts it. An external <see cref="IKvCache"/> is ignored.</para>
 /// </remarks>
-public sealed unsafe class Inkling2TransformerModel : IModel
+public sealed unsafe class Inkling2TransformerModel : IModel, IImageInputModel
 {
     private readonly record struct MatRef(nint Ptr, QuantizationType Qt, int In, int Out);
 
@@ -351,7 +354,26 @@ public sealed unsafe class Inkling2TransformerModel : IModel
     public ITensor ForwardWithState(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, Inkling2SequenceState state, bool lastTokenLogitsOnly = false)
         => ForwardCore(tokenIds, positions, deviceId, state, lastTokenLogitsOnly);
 
-    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, Inkling2SequenceState state, bool lastTokenLogitsOnly)
+    /// <summary>
+    /// Forward with image embeddings (issue #2035): the rows of every <see cref="ImageSpan"/> replace the token embeddings at the positions they
+    /// cover and bypass <c>token_embd_norm</c> (llama.cpp: "do not normalize raw embeddings input"); the token ids there are ignored. Spans are in
+    /// absolute sequence positions, so a chunked prefill can pass the same list for every chunk.
+    /// </summary>
+    /// <param name="tokenIds">Token ids of this chunk.</param>
+    /// <param name="positions">Absolute positions.</param>
+    /// <param name="deviceId">Device id.</param>
+    /// <param name="images">Image spans (absolute positions).</param>
+    /// <param name="kvCache">Ignored: this model owns its sequence state (like <c>Forward</c>'s <c>kvCache</c>).</param>
+    /// <param name="lastTokenLogitsOnly">Return only the last row's logits.</param>
+    public ITensor ForwardWithImages(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IReadOnlyList<ImageSpan> images, IKvCache? kvCache, bool lastTokenLogitsOnly)
+        => ForwardCore(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly, images);
+
+    /// <summary><see cref="ForwardWithImages"/> on an explicit sequence state (tests, multi-sequence callers).</summary>
+    public ITensor ForwardWithImagesAndState(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, Inkling2SequenceState state, IReadOnlyList<ImageSpan> images, bool lastTokenLogitsOnly)
+        => ForwardCore(tokenIds, positions, deviceId, state, lastTokenLogitsOnly, images);
+
+    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, Inkling2SequenceState state, bool lastTokenLogitsOnly,
+        IReadOnlyList<ImageSpan>? images = null)
     {
         ArgumentNullException.ThrowIfNull(state);
         int T = tokenIds.Length;
@@ -364,8 +386,23 @@ public sealed unsafe class Inkling2TransformerModel : IModel
             throw new ArgumentOutOfRangeException(nameof(positions), $"Sequence would exceed the context length {Config.MaxSequenceLength}.");
 
         Inkling2Scratch sc = RentScratch();
-        try { return ForwardBody(tokenIds, deviceId, state, lastTokenLogitsOnly, sc); }
+        try { return ForwardBody(tokenIds, deviceId, state, lastTokenLogitsOnly, sc, images); }
         finally { ReturnScratch(sc); }
+    }
+
+    private bool TryImageRow(IReadOnlyList<ImageSpan> images, int position, Span<float> dest)
+    {
+        for (int i = 0; i < images.Count; i++)
+        {
+            var sp = images[i];
+            if (position < sp.Start || position >= sp.End) continue;
+            if (sp.Embeddings.Dimension != _hidden)
+                throw new ArgumentException($"image embeddings are {sp.Embeddings.Dimension}-wide, the model hidden size is {_hidden}.", nameof(images));
+            sp.Embeddings.ReadRow(position - sp.Start, dest);
+            if (Mutant == Inkling2Mutant.NormalizeImageEmbeddings) Inkling2Ops.RmsNorm(dest, _tokEmbNorm.Span, _eps, dest);
+            return true;
+        }
+        return false;
     }
 
     private Inkling2Scratch RentScratch()
@@ -383,7 +420,7 @@ public sealed unsafe class Inkling2TransformerModel : IModel
         lock (_scratchPool) _scratchPool.Push(sc);
     }
 
-    private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Inkling2SequenceState st, bool lastOnly, Inkling2Scratch sc)
+    private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Inkling2SequenceState st, bool lastOnly, Inkling2Scratch sc, IReadOnlyList<ImageSpan>? images = null)
     {
         int T = tokenIds.Length, H = _hidden;
         int pos0 = st.Length;
@@ -395,6 +432,7 @@ public sealed unsafe class Inkling2TransformerModel : IModel
         long rowBytes = Dequantize.RowByteSize(H, embType);
         for (int t = 0; t < T; t++)
         {
+            if (images is { Count: > 0 } && TryImageRow(images, pos0 + t, cur.Slice(t * H, H))) continue;   // image rows skip the norm
             int id = tokenIds[t];
             if ((uint)id >= (uint)_vocab)
                 throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token ID {id} at position {t} is out of range [0, {_vocab}).");

@@ -415,6 +415,8 @@ Option groups: sampling (`--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-*`
 | `--frequency-penalty` `<number>` | 0 |  | OpenAI-style frequency penalty: subtracted proportionally to occurrence count. 0 = disabled. |
 | `--gpu-layers` `<int>` | unset |  | CUDA layer placement: 'auto' (the largest number of leading layers whose weights, KV for the context and scratch fit in free VRAM; the rest run on the CPU), or N leading layers on the GPU and the rest on the CPU (0 = CPU only, 'all' or -1 = every layer). Omit for the device default: every layer with --device gpu, and with --device auto an automatic split when the model does not fit a CUDA device whole. Ignored on vulkan (whole model is device-resident). |
 | `--grammar` `<text>` | unset |  | GBNF grammar string or file path (prefixed with @) for grammar response format. |
+| `--image` `<text>` | unset |  | Image file (PNG or binary PPM) to include in the prompt; repeatable. Needs a vision model (Inkling 2) and its mmproj GGUF (--mmproj, or an mmproj*.gguf next to the model). The prompt is wrapped as one user turn: the images first, then the text. |
+| `--image-over-limit` `<text>` | unset | `DOTLLM_IMAGE_OVER_LIMIT` | What to do with an --image that needs more image tokens than the model allows (Inkling 2: 4096): 'refuse' (default) stops with an error; 'downscale' resizes it to fit with a bicubic filter, as llama.cpp does. Default: refuse. Falls back to DOTLLM_IMAGE_OVER_LIMIT. The other image bounds are the DOTLLM_IMAGE_* variables (docs/CLI.md). |
 | `--json` | off |  | Output result as a single JSON object (suppresses all formatted output). |
 | `--kv-quant-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache key storage: f16, q8_0, q4_0, or TurboQuant tq1..tq8 (both sides the same tq format). Synonym of --cache-type-k. For the CUDA hybrid-dense model (Bonsai-2 / qwen35) overrides DOTLLM_HYBRID_KV; quantized KV needs numKvHeads*headDim % 32 == 0. |
 | `--kv-quant-v` `<text>` | unset |  | KV-cache value storage: f16, q8_0, q4_0, or TurboQuant tq1..tq8 (both sides the same tq format). Synonym of --cache-type-v. See --kv-quant-k. |
@@ -424,6 +426,7 @@ Option groups: sampling (`--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-*`
 | `--lora` `<text>` | unset |  | Path to a PEFT LoRA adapter dir; repeatable to stack adapters, optional weight 'path=0.7'. Omit for base. |
 | `--max-tokens`, `-n` `<int>` | 128 |  | Maximum number of tokens to generate (default 128). Also sizes the KV cache for this run: prompt tokens + this value, capped at the model's context length. |
 | `--min-p` `<number>` | 0 |  | Min-P sampling threshold. 0 = disabled. |
+| `--mmproj` `<text>` | unset |  | Vision projector GGUF (mmproj) for --image. Default: the first mmproj*.gguf in the model's directory. |
 | `--moe-cache-mib` `<text>` | unset | `DOTLLM_MOE_CACHE_MIB` | VRAM expert-cache size in MiB when experts are offloaded; default 'auto' = the measured free-VRAM budget. Larger values are clamped to the budget. Env fallback: DOTLLM_MOE_CACHE_MIB. |
 | `--moe-cache-policy` `<text>` | unset | `DOTLLM_MOE_CACHE_POLICY` | Expert-cache replacement policy: 'slru' (default), 'lru' or 'lfu'. Env fallback: DOTLLM_MOE_CACHE_POLICY. |
 | `--moe-calibrate` | off | `DOTLLM_MOE_CALIBRATE` | Re-run the MoE offload cost calibration (PCIe bandwidth, sync latency, CPU time per expert) instead of reading the cached record in %LOCALAPPDATA%/dotllm/moe-calibration.json. Env fallback: DOTLLM_MOE_CALIBRATE=1. |
@@ -605,12 +608,17 @@ Notes on interplay:
 | `--expected-concurrency` `<int>` | 0 | `DOTLLM_VK_SCHEDULER` | Expected number of concurrently decoding requests. At 5 or more, Vulkan hybrid models serve through the continuous-batch scheduler (measured +73% aggregate decode throughput at 8 concurrent on Tev1-4B; parity at 4 or fewer). At 5 or more, default-on MTP is dropped for the model. 0 (default) keeps the serial per-request path. DOTLLM_VK_SCHEDULER=0\|1 overrides. |
 | `--gpu-layers` `<int>` | unset |  | CUDA layer placement: 'auto' (the largest number of leading layers whose weights, KV for the context and scratch fit in free VRAM; the rest run on the CPU), or N leading layers on the GPU and the rest on the CPU (0 = CPU only, 'all' or -1 = every layer). Omit for the device default: every layer with --device gpu, and with --device auto an automatic split when the model does not fit a CUDA device whole. Ignored on vulkan (whole model is device-resident). |
 | `--host` `<text>` | `localhost` |  | Address to bind (default localhost = loopback only). Use 0.0.0.0 to serve the network - the inference endpoints are unauthenticated, so pair that with a firewall or reverse proxy. /metrics is on by default for loopback binds only. |
+| `--image-over-limit` `<text>` | unset | `DOTLLM_IMAGE_OVER_LIMIT` | Image input: what to do with an image that needs more image tokens than the model allows (Inkling 2: 4096). 'refuse' (default) answers 400; 'downscale' resizes it to fit with a bicubic filter, as llama.cpp does. Falls back to DOTLLM_IMAGE_OVER_LIMIT. |
 | `--keep-alive` `<number>` | 300 |  | Idle-unload timeout in seconds (ollama parity). Default 300 (5 min); 0 = unload after every request; negative = never unload. A model profile's keep_alive overrides it for that model. |
 | `--kv-quant-k` `<text>` | unset | `DOTLLM_HYBRID_KV` | KV-cache key storage: f16, q8_0, q4_0, or TurboQuant tq1..tq8 (both sides the same tq format). Synonym of --cache-type-k. For the CUDA hybrid-dense model (Bonsai-2 / qwen35) overrides DOTLLM_HYBRID_KV; quantized KV needs numKvHeads*headDim % 32 == 0. |
 | `--kv-quant-v` `<text>` | unset |  | KV-cache value storage: f16, q8_0, q4_0, or TurboQuant tq1..tq8 (both sides the same tq format). Synonym of --cache-type-v. See --kv-quant-k. |
 | `--lookup-draft` `<int>` | 8 |  | Maximum drafts per prompt-lookup round. Default 8. |
 | `--lookup-ngram` `<int>` | 6 |  | Longest context suffix (tokens) prompt lookup matches; shorter matches down to 2 tokens are used when it does not recur. Default 6. |
+| `--max-image-pixels` `<int>` | unset | `DOTLLM_IMAGE_MAX_PIXELS` | Image input: most decoded pixels in one image. Default 33554432 (2^25, 8K UHD fits). Falls back to DOTLLM_IMAGE_MAX_PIXELS. |
+| `--max-image-side` `<int>` | unset | `DOTLLM_IMAGE_MAX_SIDE` | Image input: longest accepted image side in pixels. Default 65536. Falls back to DOTLLM_IMAGE_MAX_SIDE. |
+| `--max-images` `<int>` | unset | `DOTLLM_IMAGE_MAX_IMAGES` | Image input (vision models): most images one chat request may carry. Default 16. Falls back to DOTLLM_IMAGE_MAX_IMAGES; the flag wins. |
 | `--max-messages` `<int>` | unset | `DOTLLM_MAX_MESSAGES` | Maximum messages accepted per chat request on /v1/chat/completions and /v1/messages. Default 8192; 0 = unlimited. Falls back to the DOTLLM_MAX_MESSAGES environment variable; the flag wins. The prompt-length-vs-context check still applies. |
+| `--max-request-image-pixels` `<int>` | unset | `DOTLLM_IMAGE_MAX_REQUEST_PIXELS` | Image input: most decoded pixels all images of one request may hold. Default 67108864 (2^26). Falls back to DOTLLM_IMAGE_MAX_REQUEST_PIXELS. |
 | `--max-resident-models` `<int>` | 1 |  | Maximum number of models kept loaded at once, counting the active one. Default 1 = classic single-model hot-swap (loading another model unloads the current one). Above 1, earlier models stay resident (instant switching) and, when a load would exceed the count or --resident-memory-budget, the least recently used ones are evicted first. |
 | `--metrics` | off |  | Serve Prometheus metrics at GET /metrics on any bind. Default: on for loopback binds only. |
 | `--moe-cache-mib` `<text>` | unset | `DOTLLM_MOE_CACHE_MIB` | VRAM expert-cache size in MiB when experts are offloaded; default 'auto' = the measured free-VRAM budget. Larger values are clamped to the budget. Env fallback: DOTLLM_MOE_CACHE_MIB. |
@@ -1121,6 +1129,8 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_EMBED_PAR_MIN` | Minimum batch size for one-sequence-per-core execution; below it a batch runs sequentially on the pooled kernels. Env DOTLLM_EMBED_PAR_MIN overrides (benchmarking). | `BertEncoderModel.cs` |
 | `DOTLLM_G4_PROF` | Env-gated (DOTLLM_G4_PROF=1) stopwatch buckets for the Gemma-4 CPU layer path. | `G4Prof.cs` |
 | `DOTLLM_I2S_CACHE` | Builds a BitNetI2SCacheContext for a BitNet checkpoint so repeated loads reuse the ternary I2_S packing instead of re-quantizing bf16 weights. The cache lives in a hidden .dotllm-i2s-cache folder beside the checkpoint and is ke... | `ModelLoader.cs` |
+| `DOTLLM_INKLING2_CONV_STATE` | (not described in source) | `Inkling2TransformerModel.cs` |
+| `DOTLLM_INKLING2_LOOP_CONTROLLER` | Options from DOTLLM_INKLING2_LOOP_CONTROLLER (f32\|q8_0\|f16\|bf16) and DOTLLM_INKLING2_CONV_STATE (f32\|bf16; F16 is ruled out); unset variables keep the defaults. Used by the measurement harness; a bad value throws rather tha... | `Inkling2TransformerModel.cs` |
 | `DOTLLM_LITTLEBIT_DENSE_CONTROL` | Loads a NanoQuant composite (issue #869) from a GGUF and registers it as a LittleBit-kind weight. A non-empty rowSplits splits the stacked output rows (attn_qkv) into one weight per entry. With DOTLLM_LITTLEBIT_DENSE_CONTROL=1... | `FactorizedWeights.cs` |
 | `DOTLLM_LORA_FORCE_Q8_PREQUANT` | Phase 4d.5 / Gap 2 - fast-path plumbing: when both base and adapter B are Q8_0 AND the caller pre-quantised x, we can route stage 1 through `MatMul.GemmQ8_0(preQuantizedInput=preQuantX)` and skip the activation-quant cost. The... | `LoraProjection.cs` |
 | `DOTLLM_MOE_LEGACY_PACKED` | (not described in source) | `Lfm2MoeTransformerModel.cs` |
@@ -1134,11 +1144,13 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_TRACE_LAYERS` | Opt-in diagnostic tracing for Nemotron-H forward pass. All checks are gated on environment variables read once at process startup, so when diagnostics are disabled the overhead is a single predictable branch per layer and no st... | `NemotronHDiagnostics.cs` |
 | `DOTLLM_TRACE_SSM` | Opt-in diagnostic tracing for Nemotron-H forward pass. All checks are gated on environment variables read once at process startup, so when diagnostics are disabled the overhead is a single predictable branch per layer and no st... | `NemotronHDiagnostics.cs` |
 | `DOTLLM_TRACE_SSM_LAYER` | (not described in source) | `NemotronHDiagnostics.cs` |
+| `DOTLLM_VISION_EMBD_PRECISION` | Environment variable that selects the VisionEmbedPrecision of patch_embd / position_embd when the caller does not (f32, f16, bf16; default bf16). | `Inkling2VisionEncoder.cs` |
 
 #### Server
 
 | Variable | What the source says | Defined in |
 |---|---|---|
+| `DOTLLM_MMPROJ` | DOTLLM_MMPROJ: path of the vision projector GGUF for image input (default: the mmproj*.gguf next to the model file). | `ImageInput.cs` |
 | `DOTLLM_VK_QWEN4EXP_QSA` | Issue #1324: qwen4exp on Vulkan sizes its K/V + indexer caches at load, so the serve options that decide the window are handed to it first: --ctx-size becomes the requested capacity (reduced to what fits the device) and the K/V... | `ServerStartup.cs` |
 
 #### Tray.Core
@@ -1157,6 +1169,9 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_EMBED_PACK` | True when documents can be packed into one embedding forward: the validated plain-causal decoder shape (Qwen3), the coopmat flash kernel serving the head dim, no window / soft-cap / sinks / distinct V dim, and row strides that... | `VulkanTransformerModel.cs` |
 | `DOTLLM_EMBED_PACK_TOKENS` | Token budget of one packed forward. Env DOTLLM_EMBED_PACK_TOKENS overrides (default 1024, as the decoder embedder). | `VulkanBertEncoderModel.cs` |
 | `DOTLLM_GPTOSS_DEBUG_OFF` | MiMo-V2 (#955): sink-attention kernels (shared with gpt-oss) and the attention-output compaction kernel. Refuses to run a model whose sliding layers lack their attention sinks (silently dropping them would be wrong logits). | `VulkanTransformerModel.cs` |
+| `DOTLLM_INKLING2_KV` | Options from DOTLLM_INKLING2_KV (f16\|q8_0); unset keeps the defaults, a bad value throws. | `VulkanInkling2TransformerModel.cs` |
+| `DOTLLM_INKLING2_SPV_OVERRIDE` | (not described in source) | `VulkanInkling2TransformerModel.cs` |
+| `DOTLLM_INKLING2_VK_CHUNK` | (not described in source) | `VulkanInkling2TransformerModel.cs` |
 | `DOTLLM_MTP_HEADROOM_CANARY` | Test hook / switch for the second-device canary (see VulkanHeadroomCanary). Env DOTLLM_MTP_HEADROOM_CANARY=0 turns it off, leaving only the arithmetic estimate. | `VulkanQwen4ExpTransformerModel.Mtp.cs` |
 | `DOTLLM_MTP_HEADROOM_EXTRA_MIB` | DOTLLM_MTP_HEADROOM_EXTRA_MIB is a diagnostic: it asks the probe for that much more, which makes "the head does not fit" reproducible on demand (a competing process only takes memory from this one when it arrives AFTER the load... | `VulkanQwen4ExpTransformerModel.Mtp.cs` |
 | `DOTLLM_MTP_HEAD_REQUANT` | Env DOTLLM_MTP_HEAD_REQUANT: 0 = keep the head's native routed-bank quantisation, 1 (default) = re-quantise a Q8_0 head's routed banks (Q4_K gate/up, Q5_1 down), 2 = only when the native head does not fit the device. Measured o... | `VulkanQwen4ExpTransformerModel.Mtp.cs` |

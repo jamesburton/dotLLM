@@ -38,7 +38,8 @@ a strict-mode defect is returned there (see "Execution" below for the error shap
 
 | surface | placement | addresses |
 |---|---|---|
-| OpenAI `/v1/chat/completions` | manifest `chunk_cache.chunks[]`, `at: {message, part: 0[, start, end]}` | a message's **string** `content`. Array content stays the binding 400 with the flag on (general array support is a separate issue). A `chunk` field on a message object is an unknown field, ignored |
+| OpenAI `/v1/chat/completions` | manifest `chunk_cache.chunks[]`, `at: {message, part[, start, end]}` | string `content` (`part: 0`), or array content: `part` is the index in the content array, and only a `text` part is addressable (an `image_url` part is `chunk_span_invalid`, `non_text`). Ruling 19 (array content refused) was **superseded 2026-11-27** (#2035) |
+| OpenAI | inline `chunk` on a `text` part of array content | that part's text, same semantics as the Anthropic inline form. With the flag off the `chunk` is ignored. A `chunk` field on a message object is an unknown field, ignored |
 | Anthropic `/v1/messages` | inline `chunk` on a `text` block, or on a text block inside a `tool_result`'s content array | that block's text |
 | Anthropic | manifest, `at: {message, part[, start, end]}` | a top-level `text` block, string message content (`part: 0`), or a `tool_result` with **string** content. A `tool_result` with array content, `tool_use`, `thinking`: not a text part (`chunk_span_invalid`); its inner blocks are reachable inline only |
 
@@ -808,16 +809,17 @@ Templates are the GGUF `tokenizer.chat_template` of `bartowski/Qwen_Qwen3-4B-Ins
 
 | surface | behaviour | evidence |
 |---|---|---|
-| OpenAI `/v1/chat/completions` | `messages[i].content` is a string only. An array of content parts fails model binding: **400 with an empty body** (no OpenAI error envelope); the handler never runs. | `ChatMessageDto.Content` is `string?` (`Models/ChatCompletionRequest.cs`) |
+| OpenAI `/v1/chat/completions` | `messages[i].content` is a string or an array of `text` / `image_url` parts. The text parts are joined with **no separator** (`MessageContent.Text`), so a text part's offset in the engine message is the length of the earlier text parts (an image part adds nothing). Until 2026-11-27 an array failed model binding (400, empty body, ruling 19). | `MessageContent` (`Models/MessageContent.cs`); `ServerPinTests.OpenAi_ArrayContent_*`, `ChunkCacheOpenAiPartsTests` |
 | Anthropic `/v1/messages`, `count_tokens` | `text` blocks of one message are joined with **one `'\n'`** before the template sees them. The separator is written only once text has accumulated: `["", "b"]` → `b`, `["a", "", "b"]` → `a\n\nb`. | `AnthropicConverter.AppendMessage` |
 | Anthropic `tool_result` | Ends the current turn: text before it becomes its own message, the result becomes a `tool` message (array content joined with `'\n'`), text after it starts a new message. An Anthropic (message, block) index does not map 1:1 onto the rendered messages. | `AnthropicConverter.FlushPending`, `ConcatTextBlocks` |
 | Anthropic `system` array | Joined with `'\n'`. | `AnthropicConverter.ExtractText` |
 
 Consequences for span location (spec §5.3 item 5):
 
-- On the OpenAI surface only part 0 exists, and the inline `chunk` placement on a text part cannot be sent at all. A
-  manifest span (`at: {message, part: 0, start, end}`) on string content is the only OpenAI placement that reaches the
-  server today.
+- On the OpenAI surface string content is part 0; array content has one part per element, and both placements reach the server
+  (inline `chunk` on a text part, manifest `at.part`). A multimodal message (an `image_url` part) renders its parts, not the joined
+  string, so the locator writes its sentinels into the parts (`ChunkSpanLocator.SubstituteParts`). The prefix cache is bypassed for
+  such a request, so its chunk plan is a report only.
 - On the Anthropic surface a part's offset in the flattened message is the length of the earlier parts plus one `'\n'`
   before each part except while the accumulated text is still empty (see the empty-block rule above). The separator is outside every span, so a span covering a
   whole part is not altered by the join.
@@ -862,7 +864,7 @@ text contains a special spelling is ignored (`chunk_special_tokens`), or chunk t
 |---|---|---|
 | unknown top-level field (`chunk_cache`) | ignored; rendered prompt unchanged | ignored; rendered prompt and token count unchanged |
 | unknown field on a message object (`chunk`) | ignored | (not a convention placement) |
-| unknown field on a `text` part / block (`chunk`, `cache_control`) | unreachable: array content is a 400 | ignored; validation inspects only `type` |
+| unknown field on a `text` part / block (`chunk`, `cache_control`) | `chunk` is read (inline placement); other fields ignored | ignored; validation inspects only `type` |
 | unknown content block **type** | n/a | **400 `invalid_request_error`**, `messages[i].content[j].type: unsupported content block type '<t>'` (#449) |
 | blocks inside a `tool_result`'s content array | n/a | **not type-checked**: any block with a string `text` is joined in, whatever its type; any other block is dropped silently |
 
