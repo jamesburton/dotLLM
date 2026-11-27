@@ -50,7 +50,7 @@ draft model always runs on CPU. HIP is not rated here (see [HIP.md](HIP.md)). Pe
 
 | Model | Enum | CPU | CUDA | Vulkan | Notes |
 |---|---|---|---|---|---|
-| Meta Llama (also LLaDA) | `Llama` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA. Draft-model speculation, prompt lookup (CPU). Paged KV: CPU and CUDA, not Vulkan. Vulkan pipeline multi-GPU is library-only. CUDA prefill dequantizes most quants. CUDA ignores a draft model and decodes plain [1]. Vulkan draft speculation: `?`. No MTP/DFlash. |
+| Meta Llama (also LLaDA) | `Llama` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA. Draft-model speculation, prompt lookup (CPU). Paged KV: CPU and CUDA, not Vulkan. Vulkan pipeline multi-GPU is library-only. CUDA prefill dequantizes most quants. CUDA ignores a draft model and decodes plain [1]. Vulkan draft speculation: greedy text matches plain decode (Llama-3.2-1B Q8_0, Strix, #2030). No MTP/DFlash. |
 | Mistral (GGUF `mistral` / `mistral3`, incl. Ministral-3) | `Mistral` | Highly-Optimised | Partially-Optimised; Ministral-3: None | Highly-Optimised | GQA, optional sliding window. Many Mistral-7B GGUFs declare `llama` and take the Llama row. CUDA refuses checkpoints with an attention temperature scale (Ministral-3). No MTP/DFlash. CPU and Vulkan records are ministral-3-14b on small hardware (Vulkan on Iris Xe) and are slow. |
 | Phi | `Phi` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA. Vulkan record is phi4-mini on Iris Xe ([perf matrix](../benchmarks/perf-matrix/results.csv)). No real GGUF run found on CUDA. CPU well behind llama.cpp in the recorded run. |
 | Qwen 2 / 2.5 / 3 (dense), incl. Qwen3-Embedding | `Qwen` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA, optional sliding window, QK-norm (Qwen3). CPU record is thin. No MTP/DFlash. |
@@ -97,7 +97,8 @@ Notes on issues found by code reading. Only note 1 has been reproduced (and is f
 
 1. Fixed (#2030): draft-model speculation read one logit row per drafted token from targets that return only the last
    row. It now requires `MaxAllRowLogitsLength` > 1, like prompt lookup; otherwise (dense CUDA, Mamba-3, the CUDA
-   pipeline and the CUDA hybrid hosts) the draft model is ignored with a warning and decode is plain.
+   pipeline and the CUDA hybrid hosts) the draft model is ignored with a warning and decode is plain. The dense Vulkan host, which over-read the same way (it crashed),
+   now widens its row limit.
 2. For GGUF `qwen2moe`, the CPU quantized-expert path appears to load no shared-expert branch (#2031).
 3. Mamba-3, LFM3 and Olala have no recurrent-state checkpoint, and `SpeculativeDecoder` does not appear to guard
    against them, so a rejected draft could leave state advanced (#2032).
