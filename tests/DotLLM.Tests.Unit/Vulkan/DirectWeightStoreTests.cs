@@ -113,6 +113,65 @@ public sealed class DirectWeightStoreTests(ITestOutputHelper output)
         finally { File.Delete(path); }
     }
 
+    /// <summary>
+    /// #2044: a shared heap is charged by D3D12 AND by Vulkan's import of it, which removed the device at ~85 GiB of D3D12 "local"
+    /// usage (a 49 GiB model, 2x). The D3D12 side is dropped once the reads landed, so the weights must stay valid and byte-identical
+    /// after <see cref="DirectWeightStore.Seal"/> (dedicated heap and slab heap both), with the D3D12 heap objects already gone.
+    /// </summary>
+    [SkippableFact]
+    public void Seal_ReleasesD3d12Side_WeightsStayByteIdentical()
+    {
+        Skip.IfNot(OperatingSystem.IsWindows(), "DirectStorage is Windows-only.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasExternalMemoryWin32, "VK_KHR_external_memory_win32 absent.");
+        var store = DirectWeightStore.For(device);
+        Skip.If(store is null, "DirectStorage unavailable: " + DirectWeightStore.UnavailableReason(device));
+
+        byte[] a = RandomBytes(1 << 20, seed: 21);   // slab heap
+        byte[] c = RandomBytes(20 << 20, seed: 23);  // dedicated heap
+        string path = WriteGguf(("a", a), ("c", c));
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            var loaded = new List<(byte[] Data, VulkanDevice.Buffer Buf)>();
+            foreach (var (name, data) in new[] { ("a", a), ("c", c) })
+            {
+                Assert.True(store!.TryLoad(gguf.TensorDataPointer(gguf.TensorsByName[name]), data.Length, out var buf), store.LastFallbackReason);
+                loaded.Add((data, buf!));
+            }
+            long d3dBefore = store!.D3d12LocalUsageBytes();
+            store.Seal();   // waits for the reads, then drops every D3D12 heap + resource
+            long d3dAfter = store.D3d12LocalUsageBytes();
+            _output.WriteLine($"D3D12 local usage {d3dBefore >> 20} -> {d3dAfter >> 20} MiB");
+            Assert.True(d3dBefore - d3dAfter >= (long)(a.Length + c.Length) / 2,
+                "Seal did not give back the D3D12-side charge of the loaded heaps");
+
+            foreach (var (data, buf) in loaded)
+            {
+                var floats = new float[data.Length / 4];
+                device.Download(buf, floats);
+                byte[] back = new byte[floats.Length * 4];
+                Buffer.BlockCopy(floats, 0, back, 0, back.Length);
+                Assert.True(data.AsSpan(0, back.Length).SequenceEqual(back), "weights changed after the D3D12 side was released");
+                buf.Dispose();
+            }
+        }
+        finally { File.Delete(path); }
+    }
+
+    /// <summary>
+    /// #2044 admission rule. The first row is the measured failure: D3D12 local usage 85114 MiB of a 103727 MiB budget when the 886 MiB
+    /// expert bank was refused. The second row pins the 2x charge (heap + Vulkan import): a 1x projection (60000) would admit it.
+    /// </summary>
+    [Theory]
+    [InlineData(85114L, 103727L, 886L, false)]
+    [InlineData(40000L, 103727L, 20000L, false)]
+    [InlineData(30000L, 103727L, 20000L, true)]
+    [InlineData(50000L, 0L, 99999L, true)]
+    public void AdmitHeap_ChargesBothSidesAndRefusesPastTheFraction(long usageMiB, long budgetMiB, long heapMiB, bool expected)
+        => Assert.Equal(expected, DirectWeightStore.AdmitHeap(usageMiB << 20, budgetMiB << 20, heapMiB << 20, 0.75));
+
     /// <summary>Anything that is not file-backed GGUF data is declined with a reason, never an exception.</summary>
     [SkippableFact]
     public void TryLoad_DeclinesNonFileBackedPointer()

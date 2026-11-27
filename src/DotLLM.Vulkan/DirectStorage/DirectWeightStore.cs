@@ -126,18 +126,52 @@ internal sealed unsafe class DirectWeightStore : IDisposable
         public required VulkanDevice.Buffer Slab;
         public long Used;
         public bool Dedicated;
+
+        /// <summary>Drops the D3D12 heap + resource (idempotent). Vulkan's import holds its own reference to the allocation.</summary>
+        public void ReleaseD3d()
+        {
+            nint r = Resource, h = D3dHeap;
+            Resource = 0;
+            D3dHeap = 0;
+            ComVtbl.Release(r);
+            ComVtbl.Release(h);
+        }
     }
+
+    /// <summary>
+    /// D3D12 "local" usage fraction (of the DXGI budget) that DirectStorage heaps may not push the process past,
+    /// <c>DOTLLM_VULKAN_DS_BUDGET_PCT</c> (default 75). Measured on Strix Halo (#2044): the device is removed at
+    /// ~85 GiB of a 101 GiB budget (84%), so the margin is deliberately generous.
+    /// </summary>
+    internal static double BudgetFraction { get; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DS_BUDGET_PCT"), out int pct) && pct is >= 10 and <= 100 ? pct / 100.0 : 0.75;
+
+    /// <summary>Bytes enqueued since the last drain; at <see cref="RetireEveryBytes"/> the next heap drains and retires the D3D12 side of the finished ones.</summary>
+    internal static long RetireEveryBytes { get; } =
+        (long.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DS_RETIRE_MIB"), out long rm) && rm is >= 64 and <= 65536 ? rm : 2048) << 20;
+
+    /// <summary>
+    /// The admission rule (#2044), pure so it is testable without a device: may a heap of <paramref name="heapBytes"/> be created
+    /// given D3D12's <paramref name="currentUsage"/> and <paramref name="budget"/>? While a heap is live on both sides (the D3D12
+    /// heap and the Vulkan import of it are each charged) it costs <b>twice</b> its size, so the projection is
+    /// <c>usage + 2 x heap</c>. An unknown budget (0) admits.
+    /// </summary>
+    internal static bool AdmitHeap(long currentUsage, long budget, long heapBytes, double fraction)
+        => budget <= 0 || currentUsage + 2 * heapBytes <= (long)(budget * fraction);
 
     private readonly VulkanDevice _device;
     private readonly Dictionary<string, nint> _files = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<Heap> _heaps = [];
     private nint _d3dDevice;
+    private nint _adapter;
     private nint _fence;
     private nint _event;
     private ulong _fenceValue;
     private nint _dsFactory;
     private nint _dsQueue;
     private int _pendingRequests;
+    private long _inflightBytes;
+    private bool _budgetWarned;
     private bool _disposed;
 
     /// <summary>Why the store is unusable on this device (empty when usable).</summary>
@@ -172,6 +206,8 @@ internal sealed unsafe class DirectWeightStore : IDisposable
                 {
                     hr = D3dNative.D3D12CreateDevice(adapter, D3dNative.D3D_FEATURE_LEVEL_11_0, D3dNative.IidD3D12Device, out _d3dDevice);
                     if (hr < 0) { FailureReason = $"D3D12CreateDevice(0x{hr:X8})"; return; }
+                    _adapter = adapter; // kept for QueryVideoMemoryInfo; released in ReleaseDevice
+                    adapter = 0;
                 }
                 finally { ComVtbl.Release(adapter); }
             }
@@ -294,11 +330,14 @@ internal sealed unsafe class DirectWeightStore : IDisposable
             };
             DStorageNative.EnqueueRequest(_dsQueue, req);
             _pendingRequests++;
+            _inflightBytes += chunk;
             remaining -= chunk;
             fileCursor += chunk;
             destCursor += chunk;
         }
         DStorageNative.Submit(_dsQueue);
+        if (s_trace && D3dNative.GetDeviceRemovedReason(_d3dDevice) != 0)
+            Console.Error.WriteLine($"[ds-mem] DEVICE REMOVED right after enqueue of {bytes >> 20} MiB: {Diagnose()}");
 
         LoadedTensorCount++;
         LoadedBytes += bytes;
@@ -409,6 +448,8 @@ internal sealed unsafe class DirectWeightStore : IDisposable
     private Heap? OpenHeap(long bytes, bool dedicated, out string why)
     {
         why = string.Empty;
+        if (_inflightBytes >= RetireEveryBytes) DrainAndRetire();
+        if (!AdmitAgainstBudget(bytes, out why)) return null;
         var desc = new D3dNative.HeapDesc
         {
             SizeInBytes = (ulong)bytes,
@@ -417,28 +458,27 @@ internal sealed unsafe class DirectWeightStore : IDisposable
             Flags = D3dNative.HeapFlagShared | D3dNative.HeapFlagAllowOnlyBuffers,
         };
         int hr = D3dNative.CreateHeap(_d3dDevice, desc, out nint d3dHeap);
-        if (hr < 0) { why = $"CreateHeap(0x{hr:X8})"; return null; }
+        if (hr < 0) { why = $"CreateHeap(0x{hr:X8}; {Diagnose()})"; return null; }
+        if (s_trace && (_heaps.Count & 15) == 0) Console.Error.WriteLine($"[ds-mem] heaps={_heaps.Count} +{bytes >> 20} MiB; {Diagnose()}");
 
         nint resource = 0, sharedHandle = 0;
         VulkanDevice.Buffer? slab = null;
         try
         {
+            if (s_trace && _heaps.Count is 0 or 1 or 2 or 3) Console.Error.WriteLine($"[ds-mem] stage after CreateHeap {bytes >> 20} MiB: {Diagnose()}");
             hr = D3dNative.CreateBufferResource(_d3dDevice, d3dHeap, 0, (ulong)bytes, out resource);
-            if (hr < 0) { why = $"CreatePlacedResource(0x{hr:X8})"; return null; }
+            if (hr < 0) { why = $"CreatePlacedResource(0x{hr:X8}; {Diagnose()})"; return null; }
             hr = D3dNative.CreateSharedHandle(_d3dDevice, d3dHeap, out sharedHandle);
             if (hr < 0) { why = $"CreateSharedHandle(0x{hr:X8})"; return null; }
 
+            if (s_trace && _heaps.Count is 0 or 1 or 2 or 3) Console.Error.WriteLine($"[ds-mem] stage after shared handle: {Diagnose()}");
             slab = _device.TryImportD3D12Heap(sharedHandle, bytes, out why);
+            if (s_trace && _heaps.Count is 0 or 1 or 2 or 3) Console.Error.WriteLine($"[ds-mem] stage after vk import: {Diagnose()}");
             if (slab is null) return null;
 
-            nint capturedHeap = d3dHeap, capturedResource = resource;
-            slab.FreeHook = () =>
-            {
-                ComVtbl.Release(capturedResource);
-                ComVtbl.Release(capturedHeap);
-            };
             slab.AddSlabRef(); // this store's reference, released by Seal / Dispose
             var heap = new Heap { D3dHeap = d3dHeap, Resource = resource, Slab = slab, Dedicated = dedicated };
+            slab.FreeHook = heap.ReleaseD3d; // no-op when the heap was already retired after its reads landed
             _heaps.Add(heap);
             d3dHeap = 0;
             resource = 0;
@@ -455,7 +495,56 @@ internal sealed unsafe class DirectWeightStore : IDisposable
         }
     }
 
+    private static readonly bool s_trace = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE") == "1";
+
+    /// <summary>D3D12's current "local" usage of this process on the adapter (bytes), 0 when unknown. Tests and diagnostics.</summary>
+    internal long D3d12LocalUsageBytes()
+        => _adapter != 0 && D3dNative.QueryVideoMemoryInfo(_adapter, false, out var i) >= 0 ? (long)i.CurrentUsage : 0;
+
+    /// <summary>"removed=0x.. local usage/budget MiB, nonlocal usage/budget MiB, ds-live MiB": what D3D12 itself thinks (diagnostics).</summary>
+    internal string Diagnose()
+    {
+        if (_d3dDevice == 0 || _adapter == 0) return "no_device";
+        int removed = D3dNative.GetDeviceRemovedReason(_d3dDevice);
+        int lhr = D3dNative.QueryVideoMemoryInfo(_adapter, false, out var l);
+        string local = lhr >= 0 ? $"local {l.CurrentUsage >> 20}/{l.Budget >> 20} MiB (avail-for-reservation {l.AvailableForReservation >> 20})" : $"local n/a(0x{lhr:X8})";
+        int nhr = D3dNative.QueryVideoMemoryInfo(_adapter, true, out var n);
+        string non = nhr >= 0 ? $"nonlocal {n.CurrentUsage >> 20}/{n.Budget >> 20} MiB" : $"nonlocal n/a(0x{nhr:X8})";
+        D3dNative.GetAdapterMemory(_adapter, out long ded, out long shr);
+        return $"removed=0x{removed:X8}, adapter dedicated {ded >> 20} MiB shared {shr >> 20} MiB, {local}, {non}, heaps={_heaps.Count}, ds_loaded={LoadedBytes >> 20} MiB";
+    }
+
+    /// <summary>Checks D3D12's own usage/budget (what the OS acts on) before a heap is created; retires finished heaps once if over.</summary>
+    private bool AdmitAgainstBudget(long bytes, out string why)
+    {
+        why = string.Empty;
+        if (_adapter == 0 || D3dNative.QueryVideoMemoryInfo(_adapter, false, out var info) < 0) return true;
+        if (AdmitHeap((long)info.CurrentUsage, (long)info.Budget, bytes, BudgetFraction)) return true;
+        DrainAndRetire(); // finished heaps give back their D3D12-side charge
+        if (D3dNative.QueryVideoMemoryInfo(_adapter, false, out info) < 0
+            || AdmitHeap((long)info.CurrentUsage, (long)info.Budget, bytes, BudgetFraction)) return true;
+        why = $"d3d12_budget(usage {info.CurrentUsage >> 20} MiB + 2 x {bytes >> 20} MiB exceeds {(int)(BudgetFraction * 100)}% of {info.Budget >> 20} MiB)";
+        if (!_budgetWarned)
+        {
+            _budgetWarned = true;
+            Console.Error.WriteLine($"[directstorage] declining further DirectStorage heaps: {why}. Remaining weights take the staged path (host copy through the {StagingMiB} MiB-class staging ring).");
+        }
+        return false;
+    }
+
     private static long AlignUp(long value, long alignment) => (value + alignment - 1) / alignment * alignment;
+
+    /// <summary>
+    /// Waits for every enqueued read, then drops the D3D12 side (heap + resource) of every dedicated heap: its reads have landed and
+    /// Vulkan's import keeps the allocation alive, so the second charge (#2044: D3D12 and Vulkan each count a shared heap) goes away.
+    /// Only called between tensors, never while a tensor's requests are still being enqueued. Open slabs stay until <see cref="Seal"/>.
+    /// </summary>
+    private void DrainAndRetire()
+    {
+        WaitAll();
+        foreach (var h in _heaps)
+            if (h.Dedicated) h.ReleaseD3d();
+    }
 
     private void DrainQueue()
     {
@@ -480,6 +569,7 @@ internal sealed unsafe class DirectWeightStore : IDisposable
             D3dNative.WaitForSingleObject(_event, 0xFFFFFFFF);
         }
         _pendingRequests = 0;
+        _inflightBytes = 0;
 
         byte* record = stackalloc byte[DStorageNative.ErrorRecordSize];
         new Span<byte>(record, DStorageNative.ErrorRecordSize).Clear();
@@ -506,7 +596,12 @@ internal sealed unsafe class DirectWeightStore : IDisposable
     /// </summary>
     internal void Seal()
     {
-        try { WaitAll(); }
+        try
+        {
+            WaitAll();
+            foreach (var h in _heaps) h.ReleaseD3d(); // every read landed; Vulkan owns the memory from here
+            if (s_trace) Console.Error.WriteLine($"[ds-mem] seal: {Diagnose()}");
+        }
         finally
         {
             foreach (var f in _files.Values) DStorageNative.CloseFile(f);
@@ -526,6 +621,7 @@ internal sealed unsafe class DirectWeightStore : IDisposable
         if (_event != 0) { D3dNative.CloseHandle(_event); _event = 0; }
         ComVtbl.Release(_fence); _fence = 0;
         ComVtbl.Release(_d3dDevice); _d3dDevice = 0;
+        ComVtbl.Release(_adapter); _adapter = 0;
     }
 
     /// <inheritdoc/>
