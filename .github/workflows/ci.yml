@@ -113,8 +113,6 @@ jobs:
       # The MIT client package has no DotLLM.* project references, so its tests are a separate project.
       # The Overhead benchmark test is Release-only/Category=Benchmark and stays out of CI.
       - name: Chunk-cache client tests
-        env:
-          DOTLLM_CI_RETRY_DEMO: always   # TEMPORARY demo (#2052); removed before merge
         run: python3 scripts/ci/test-retry.py --label chunkcache-client -- dotnet test tests/DotLLM.ChunkCache.Client.Tests/ -c Release --filter "Category!=Benchmark" --blame-hang-timeout 5m
 
       # The freshness test is a SkippableFact, and the full run above only prints totals: assert here that it really ran.
