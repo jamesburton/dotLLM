@@ -88,7 +88,7 @@ public sealed record Inkling2Config
     /// <param name="backend">Backend name shown to the user.</param>
     /// <returns>The refusal message.</returns>
     public static string UnsupportedMessage(string backend)
-        => $"The inkling2 architecture (Thinking Machines Inkling 2: looped MoE with depth mixing and relative-position attention) has a CPU reference forward only; "
+        => $"The inkling2 architecture (Thinking Machines Inkling 2: looped MoE with depth mixing and relative-position attention) runs on the CPU reference and Vulkan backends only; "
          + $"the {backend} backend is not implemented yet (epic https://github.com/jamesburton/dotLLM/issues/2025). Loading it through a generic loader would silently "
-         + "run a different model, so it is refused. Use the CPU backend.";
+         + "run a different model, so it is refused. Use the CPU or Vulkan backend.";
 }

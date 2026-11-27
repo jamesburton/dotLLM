@@ -25,7 +25,7 @@ public sealed class Inkling2RealModelTests
 
     internal static string OracleDirPath => OracleDir;
 
-    private static string OracleDir => Environment.GetEnvironmentVariable("DOTLLM_INKLING2_ORACLE_DIR")
+    internal static string OracleDir => Environment.GetEnvironmentVariable("DOTLLM_INKLING2_ORACLE_DIR")
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotllm", "test-cache", "token-oracles", "inkling2");
 
     internal static string? FindGguf()
@@ -44,9 +44,9 @@ public sealed class Inkling2RealModelTests
         return null;
     }
 
-    private sealed record KlRef(int NCtx, int NVocab, int NChunk, int[] Tokens, string Path, long RowsOffset);
+    internal sealed record KlRef(int NCtx, int NVocab, int NChunk, int[] Tokens, string Path, long RowsOffset);
 
-    private static KlRef? LoadKlRef(string? file = null)
+    internal static KlRef? LoadKlRef(string? file = null)
     {
         string path = Path.Combine(OracleDir, file ?? Environment.GetEnvironmentVariable("DOTLLM_INKLING2_KLD") ?? "nvfp4-passage-c256-fa-off.kld");
         if (!File.Exists(path)) return null;
@@ -60,7 +60,7 @@ public sealed class Inkling2RealModelTests
     }
 
     /// <summary>Per-position log-probabilities of the base (oracle) model for one chunk: <c>[nScored][nVocab]</c>, floor-clamped like llama.cpp.</summary>
-    private static float[][] ReadChunk(KlRef r, int chunk)
+    internal static float[][] ReadChunk(KlRef r, int chunk)
     {
         int first = r.NCtx / 2, nScored = r.NCtx - 1 - first;
         int nv = 2 * ((r.NVocab + 1) / 2) + 4;                 // uint16 slots per row (llama.cpp layout)
@@ -201,7 +201,7 @@ public sealed class Inkling2RealModelTests
         return new GreedyScore(prefix.ToArray(), steps, mismatch, mismatchConf, confident);
     }
 
-    private static int ArgMax(float[] v) { int b = 0; for (int i = 1; i < v.Length; i++) if (v[i] > v[b]) b = i; return b; }
+    internal static int ArgMax(float[] v) { int b = 0; for (int i = 1; i < v.Length; i++) if (v[i] > v[b]) b = i; return b; }
 
     [SkippableFact]
     public void Nvfp4_MatchesLlamaCppCpu_KlAndGreedy()

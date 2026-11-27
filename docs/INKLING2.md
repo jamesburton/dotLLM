@@ -1,6 +1,6 @@
 # Inkling 2 (Thinking Machines) — architecture notes
 
-**Status:** CPU reference forward (issue #2026, epic #2025). Vulkan, CUDA, the vision tower and the DSpark drafter are later slices (section 9).
+**Status:** CPU reference forward (issue #2026) and Vulkan text decoder (issue #2034, section 11), epic #2025. CUDA, the vision tower and the DSpark drafter are later slices (section 9).
 Model: `thinkingmachines/Inkling-2-Mini` (HF `model_type: inkling2_loop`, `Inkling2LoopForConditionalGeneration`, Apache-2.0, 2026-11-20).
 GGUF: `ggml-org/Inkling-2-Mini-GGUF` (`general.architecture = inkling2_loop`; a plain `inkling2` file is the same graph with one pass).
 
@@ -131,7 +131,7 @@ neither a KL below ~4e-3 nor free-running greedy identity is a meaningful bar ag
 - **DSpark drafter** (`dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`): 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
   `target_layer_ids = [5, 23, 41, 48]` counted in **layer visits** (the target exposes the input of visit `n` and the final norm output as id 48: `res->t_layer_inp[visit]` in `inkling2-loop.cpp`). The CPU model keeps the trace hook points
   (`pass{n}.l{ip}`, `result_norm`) where those features would be tapped.
-- Vulkan / CUDA text decoders (NVFP4 expert kernels must read the blocks in place), optimisation, llama.cpp Vulkan comparison.
+- CUDA text decoder (NVFP4 expert kernels must read the blocks in place), optimisation, llama.cpp Vulkan comparison. (The Vulkan text decoder landed in #2034, section 11.)
 
 ## 10. Results (CPU reference vs llama.cpp b12780 CPU, `Inkling-2-Mini-NVFP4.gguf`, Strix Halo, 2026-11-26)
 
@@ -186,7 +186,44 @@ The four are indistinguishable at this resolution (differences of 5e-4 in KL are
 
 **Throughput** (32 threads, `cpu-bench` lock held, NVFP4 file, F32 conv state; one measurement, llama.cpp b12780 CPU measures ~10.5 tok/s decode on the same file): prefill 128 tokens 21.4 tok/s, decode 9.1 tok/s (110 ms/token) before the refactor; 22.8 / 9.8 tok/s (102 ms/token) after, BF16 defaults. Not tuned: attention, depth mixing and the convs are scalar loops, MoE is bucketed per expert.
 
-## 11. Vision (CPU, issue #2035)
+## 11. Vulkan forward (issue #2034)
+
+`VulkanInkling2TransformerModel` + `native/vulkan/shaders/inkling2_*.glsl` (wrappers from `native/vulkan/gen_inkling2_wrappers.py`; the dense projections, the router and the
+LM head reuse `olala_gemv_{q8_0,bf16}` and `olala_moe_route`). One command buffer per chunk of 128 tokens; the model owns its sequence state like the CPU model.
+
+**Precision (user rulings 2026-11-26).** Activations BF16 (rounded once per store, F32 in registers / shared memory: norms, softmax, attention sums, the cross-key-group
+combine in shared memory). KV F16 (`Inkling2VulkanOptions.Kv`, `DOTLLM_INKLING2_KV=q8_0` for the q8_0 evaluation). Conv state BF16, loop-controller matrices BF16 (57 MB, converted once at load).
+`_f32act` shaders build the F32-activation reference arm (a control, never the default). No split-KV, hence no stored F32 partials. The only F32 on the device are the GGUF's own F32 weight
+vectors (norm gains, depth queries, clips, conv taps, router, expert scales: ~33 MB, uploaded verbatim) and the logits.
+
+**In place, no expansion.** NVFP4 expert banks (layers 0-19, with the per-expert `.scale` applied to the matmul output) and Q8_0 banks (20-23) are decoded in registers by
+`inkling2_moe_gate_up_{nvfp4,q8_0}` (gate row j and up row ff+j in one workgroup, scale, SITU, one BF16 store) and `inkling2_moe_down_{nvfp4,q8_0}` (scale, then routing weight, summed over the 8 slots).
+Existing NVFP4 kernels were not reused: `moe_indexed_matmul_nvfp4_f32` takes F32 activations and `matmul_nvfp4_mmvq` Q8_1-quantised activations, neither fits the BF16 ruling. One workgroup per (row, token-slot pair),
+so decode and prefill share the kernel; an expert-grouped prefill GEMM is slice 5.
+Weights load through the existing path: on the Strix box 250 tensors / 17,497 MB went DirectStorage (no host bounce); 338 small tensors (5.4 MB: the F32 vectors) are staged, plus the 56.8 MB BF16 controller copy
+(a narrowing transcode through a transient native buffer, then staged). Reported by `WeightLoadReport`.
+
+**KV.** Position-major `[position][kv head][128]`. Local slots (40 of 48) are a ring of `window + MaxChunk` = 1024 + 128 = 1152 positions, flat in the sequence length: a chunk of T tokens writes all its K/V before attending,
+so a ring of exactly 1024 positions would let a later token overwrite a key an earlier token of the same chunk still reads (`window + T - 1` slots are needed). Global slots (8 of 48) are linear and double from 1024 positions
+(context length is 1,048,576). Bytes: F16 4,096 B per token per global slot (32,768 B per token over 8 slots), q8_0 2,176 B (17,408 B); local rings 40 x 1152 x 4,096 B = 189 MB (F16) / 100 MB (q8_0); conv state 1.92 MB.
+
+**Gates** (`Inkling2VulkanGateTests`, vs the same llama.cpp b12780 CPU `-fa off` oracles as the CPU reference; chunk 128, 32-token sub-chunks):
+
+| gate | CPU reference | Vulkan F16 KV | Vulkan q8_0 KV |
+|---|---|---|---|
+| passage, mean KL / top-1 | 4.10e-3 / 98.8% | **3.61e-3** / 98.8% | 4.53e-3 / 97.6% |
+| passage, F32-activation control | 3.96e-3 (F32 CPU arm) | 3.12e-3 | |
+| floor-1 log scale | 4.52e-3 | **4.31e-3** / 97.2% | |
+| 1280-token windows, pos < 1024 / >= 1024 | 1.76e-3 / 1.59e-3 | **1.61e-3 / 2.01e-3** | 2.16e-3 / 2.32e-3 |
+| teacher-forced mismatches (confident) | 2/384 (0) | 3/384 (0) | 6/384 (0) |
+
+The 1280 run was repeated with chunk 100 / sub-chunk 97 (not dividing 1024): identical (1.768e-3). Vulkan vs the CPU reference on the same ids, first prompt: F32-activation arm mean KL 2.0e-4 (the residual is the CPU's own activation quantisation), BF16 arm below the oracle noise floor.
+Op-level parity (`Inkling2VulkanKernelTests`): every new shader against a double reference built from `Inkling2Ops` / `Inkling2ConvState` / `Dequantize`; 37 mutants applied to a scratch copy of the shaders (tracked `.spv` untouched, loaded via `DOTLLM_INKLING2_SPV_OVERRIDE`): 36 killed, 1 equivalent (initialising the attention max at -inf instead of 0 is shift-invariant).
+
+**Throughput** (Strix 8060S, `Inkling-2-Mini-NVFP4.gguf`, 300-token prefill then 32 decode steps, 3 warm rounds after a warm-up, not tuned): F16 KV prefill 81-95 tok/s, decode 26.5-28.8 tok/s; q8_0 KV prefill 68-88, decode 25.4-28.5. llama.cpp b12780 (CPU-only build: `llama-bench -dev none`, 16 threads, run back-to-back, same file): pp300 48.3 +- 0.3, tg32 13.9 +- 0.2 tok/s. The b12780 build has no Vulkan backend.
+dotLLM CPU reference: 22.8 / 9.8 tok/s. Levers for slice 5: ~1,900 dispatches per decoded token (controllers are 5 dispatches each x 4 x 24 core visits), expert-grouped prefill, split-submit profiling, dp4a MMVQ for NVFP4.
+
+## 12. Vision (CPU, issue #2035)
 
 `mmproj-Inkling-2-Mini-Q8_0.gguf` (`general.architecture = clip`, projector `inkling2v`; llama.cpp b12780 `tools/mtmd/models/inkling2v.cpp`, `mtmd-graph.cpp` `build_vit`,
 `mtmd-image.cpp` `mtmd_image_preprocessor_inkling2v`). Code: `src/DotLLM.Models/Vision/` (`Inkling2VisionEncoder`, `Inkling2ImagePreprocessor`, `ImageDecoder`, `VisionSupport`),
