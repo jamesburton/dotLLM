@@ -57,3 +57,15 @@ public interface IImageInputModel
     ITensor ForwardWithImages(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IReadOnlyList<ImageSpan> images,
         DotLLM.Core.Attention.IKvCache? kvCache, bool lastTokenLogitsOnly);
 }
+
+/// <summary>
+/// A model that can build the image encoder for its own device: the Vulkan Inkling 2 model returns the Vulkan ViT (<c>VulkanInkling2VisionEncoder</c>) so the vision tower runs on the
+/// GPU the text model runs on. Callers (CLI, server) prefer it over the CPU encoder; <c>DOTLLM_VISION_DEVICE=cpu</c> forces the CPU encoder (issue #2062).
+/// </summary>
+public interface IImageEncoderProvider
+{
+    /// <summary>Builds the encoder for <paramref name="mmprojPath"/> on the model's device. The caller owns (disposes) it.</summary>
+    /// <param name="mmprojPath">The projector GGUF.</param>
+    /// <param name="overLimit">What happens to an image over the token limit.</param>
+    IImageEncoder CreateImageEncoder(string mmprojPath, ImageOverLimit overLimit);
+}

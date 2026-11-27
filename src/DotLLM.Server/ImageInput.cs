@@ -136,7 +136,7 @@ public static class ImageInput
                 if (string.IsNullOrEmpty(mmproj)) mmproj = VisionSupport.FindMmproj(state.LoadedModelPath);
                 if (mmproj is null || !File.Exists(mmproj))
                     throw new ImageInputException("This model has no vision projector: place its mmproj*.gguf next to the model file (or set DOTLLM_MMPROJ).");
-                try { holder.Encoder = VisionSupport.LoadEncoder(mmproj, new ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads), limits.OverLimit); }
+                try { holder.Encoder = VisionSupport.LoadEncoderFor(state.Model, mmproj, new ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads), limits.OverLimit); }
                 catch (NotSupportedException ex) { throw new ImageInputException(ex.Message); }
                 holder.EncoderFor = state.LoadedModelPath;
                 holder.OverLimit = limits.OverLimit;

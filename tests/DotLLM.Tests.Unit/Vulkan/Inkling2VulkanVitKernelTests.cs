@@ -313,4 +313,31 @@ public sealed unsafe class Inkling2VulkanVitKernelTests : IDisposable
         Dispatch(K("vit_cls", 3, 0), [], 4, 1, 1, UpF32(c), UpF32(p), x);
         Check("cls", want, DownF(DownU16(x, 1024)), 1e-2);
     }
+
+    /// <summary>
+    /// The erf GELU against the tanh approximation, which differs by at most 4.7e-4 absolute (invisible through BF16 outputs of order one) but by up to 10% RELATIVE in the negative tail
+    /// (gelu(-3): erf -4.05e-3, tanh -3.66e-3). Zero weights make the GEMM output exactly the bias, so the epilogue is evaluated at chosen points; the check is relative.
+    /// </summary>
+    [SkippableFact]
+    public void Gelu_IsErfNotTanh_InTheNegativeTail()
+    {
+        int M = 64, Kd = 32, T = 4;
+        var q = Quant(new float[M * Kd], M, Kd, out _);
+        var bias = new float[M];
+        for (int m = 0; m < M; m++) bias[m] = -3.5f + 6.5f * m / (M - 1);   // [-3.5, 3]
+        var x = RandBf(T * Kd);
+        var y = Zero(T * M * 2L);
+        Dispatch(K("vit_gemm_q8", 7, 7, 1u, 0u), [(uint)M, (uint)Kd, (uint)T, (uint)Kd, 0, 0, 0], 1, 1, 1, UpBytes(q), UpU16(ToBf(x)), y, UpF32(bias), Dummy(), Dummy(), Dummy());
+        var got = DownF(DownU16(y, T * M));
+        double worst = 0;
+        for (int t = 0; t < T; t++)
+            for (int m = 0; m < M; m++)
+            {
+                double want = Gelu(bias[m]);
+                if (Math.Abs(want) < 1e-9) continue;
+                worst = Math.Max(worst, Math.Abs(got[t * M + m] - want) / Math.Abs(want));
+            }
+        _output.WriteLine($"gelu tail: worst relative error {worst:E2} (BF16 store rounds to 3.9e-3)");
+        Assert.True(worst < 1.2e-2, $"GELU relative error {worst:E2}: not the erf form");
+    }
 }

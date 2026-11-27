@@ -340,4 +340,32 @@ public sealed class Inkling2VulkanVisionTests : IDisposable
             _output.WriteLine($"TTFT {name}: {tokens} image tokens, prompt {promptLen}; encode Vulkan {bestEnc:F3} s vs CPU {cpu:F3} s; prefill+first token {bestPrefill:F2} s; TTFT Vulkan encoder {bestEnc + bestPrefill:F2} s vs CPU encoder {cpu + bestPrefill:F2} s");
         }
     }
+
+    /// <summary>
+    /// MEASUREMENT: the floor for any encoder that does not replicate llama.cpp's Q8_0 ACTIVATION quantisation. The same Vulkan text model, fed the cached embeddings of the CPU encoder on the F32-weights
+    /// control (same weight values, F32 activations: the exact tower, no activation noise), scored against the llama.cpp logits. Compare with the shipping CPU encoder (which shares the reference's Q8_0
+    /// activation rounding, hence its low KL) and with the Vulkan encoder (BF16 activations, no activation quantisation).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("rainbow80")]
+    [InlineData("rainbow190x110")]
+    [InlineData("rainbow640")]
+    public void Report_ExactTowerEmbeddings_KlFloor(string name)
+    {
+        string f = Path.Combine(Inkling2VulkanVisionEncoderTests.CacheDir, $"cpu_ctrl_f32_{name}.f32");
+        Skip.IfNot(File.Exists(f), "CPU cache not populated");
+        var o = Inkling2VisionEndToEndTests.LoadOracle(name);
+        Skip.If(o is null, "vision oracle not generated");
+        var (model, _) = Models();
+        var bytes = File.ReadAllBytes(f);
+        var vals = new float[bytes.Length / 4];
+        Buffer.BlockCopy(bytes, 0, vals, 0, bytes.Length);
+        int gwTok = (o!.Image.Width + 39) / 40, ghTok = (o.Image.Height + 39) / 40;
+        Assert.Equal(gwTok * ghTok * 2304, vals.Length);
+        using var emb = new ImageEmbeddings(gwTok, ghTok, 2304, "ctrl");
+        for (int i = 0; i < vals.Length; i++) emb.Rows[i] = (Half)vals[i];
+        var (rows, mism, _) = RunRows(o, model, emb, 32);
+        var s = Score(o, rows);
+        _output.WriteLine($"{name} (exact-tower embeddings from the F32 control, Vulkan text): mean KL {s.Mean:E2}, max KL {s.Max:E2}, top-1 {s.Top1}/{rows.Length}, greedy mismatches {mism}");
+    }
 }

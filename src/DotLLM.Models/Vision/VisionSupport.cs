@@ -21,6 +21,20 @@ public static class VisionSupport
         return Directory.EnumerateFiles(dir, "mmproj*.gguf").OrderBy(p => p, StringComparer.OrdinalIgnoreCase).FirstOrDefault();
     }
 
+    /// <summary>Environment variable that forces the CPU vision encoder even when the model can build a device encoder (<c>cpu</c>).</summary>
+    public const string DeviceEnvVar = "DOTLLM_VISION_DEVICE";
+
+    /// <summary>
+    /// The encoder for <paramref name="model"/>: the model's own device encoder when it provides one (<see cref="IImageEncoderProvider"/>: the Vulkan Inkling 2 model's Vulkan ViT, issue #2062),
+    /// unless <c>DOTLLM_VISION_DEVICE=cpu</c>; otherwise the CPU encoder (<see cref="LoadEncoder"/>).
+    /// </summary>
+    public static IImageEncoder LoadEncoderFor(object? model, string mmprojPath, ThreadingConfig threading, ImageOverLimit overLimit = ImageOverLimit.Refuse)
+    {
+        bool cpu = string.Equals(Environment.GetEnvironmentVariable(DeviceEnvVar)?.Trim(), "cpu", StringComparison.OrdinalIgnoreCase);
+        if (!cpu && model is IImageEncoderProvider provider) return provider.CreateImageEncoder(mmprojPath, overLimit);
+        return LoadEncoder(mmprojPath, threading, overLimit);
+    }
+
     /// <summary>Opens <paramref name="mmprojPath"/> and builds the CPU encoder its projector type needs.</summary>
     /// <exception cref="NotSupportedException">The projector type has no encoder yet.</exception>
     /// <param name="mmprojPath">The projector GGUF.</param>

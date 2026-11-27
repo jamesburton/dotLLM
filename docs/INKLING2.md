@@ -126,7 +126,7 @@ neither a KL below ~4e-3 nor free-running greedy identity is a meaningful bar ag
 
 ## 9. Not in this slice
 
-- **Vision**: implemented on the CPU in issue #2035 (section 12); the Vulkan text model accepts image embeddings since #2062 (section 12a; the Vulkan ViT encoder is the second half of #2062).
+- **Vision**: implemented on the CPU in issue #2035 (section 12); the Vulkan text model accepts image embeddings since #2062 (section 12a) and the Vulkan ViT encoder runs the tower on the GPU (section 12b, both #2062).
   images enter the text stream as `<|content_image|><|unused_200054|>` placeholders whose embeddings are injected *without* `token_embd_norm` (llama.cpp: "do not normalize raw embeddings input"). The loader must accept an embedding-input forward.
 - **DSpark drafter**: implemented on the CPU in issue #2039, see sections 13-15 (the Vulkan drafter is #2046). `dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`: 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
   `target_layer_ids = [5, 23, 41, 48]` counted in **layer visits** (the target exposes the input of visit `n` and the final norm output as id 48: `res->t_layer_inp[visit]` in `inkling2-loop.cpp`). The CPU model keeps the trace hook points
@@ -377,6 +377,88 @@ Chunk-size invariance: image-prompt logits KL vs the 32-token run is exactly 0 a
 **Mutants** (committed first; mutated copies of the shader loaded through `DOTLLM_INKLING2_SPV_OVERRIDE`, tracked `.spv` untouched), each run against the op-level test `EmbedRows_OverwritesSelectedTokens` (both arms)
 and the model-level addressing test on the 80 image at chunk 5: row index = token index (not the selector), F16 halves swapped, sentinel ignored (every token overwritten), no-op shader, row stride off by 2.
 5 of 5 killed at both levels.
+
+## 12b. Vision on Vulkan, part B: the Vulkan ViT encoder (issue #2062)
+
+`VulkanInkling2VisionEncoder` (`src/DotLLM.Vulkan/`) runs the whole tower and projector on the GPU: `IImageEncoder`, output the same host F16 `ImageEmbeddings`. The Vulkan text model builds it for its own device
+(`IImageEncoderProvider.CreateImageEncoder`); CLI `run --image` and the server pick it through `VisionSupport.LoadEncoderFor` (`DOTLLM_VISION_DEVICE=cpu` forces the CPU encoder). Verified end to end with
+`dotllm run <gguf> --device vulkan:0 --image rainbow640.ppm`: a coherent description of the image, prefill 282 tokens in 2.9 s.
+
+**Kernels** (`native/vulkan/shaders/vit_*.comp`, `.spv` committed; the DSpark agent's `inkling2_conv` shader is untouched):
+`vit_patch_embd` (F16-rounded pixels gathered per patch x `patch_embd`, plus the bilinear position embedding, fused, one BF16 store into the residual stream at row `posOff`),
+`vit_cls`, `vit_layernorm` (BF16 in/out, F32 statistics), `vit_gemm_q8` (Q8_0 weights, one 34-byte block per weight row per K step decoded into shared memory inside the tile load, BF16 X and Y, F32 accumulators in registers;
+epilogues: bias / bias+erf GELU / `Y += ls * (bias + acc)` in place on the residual stream / bias + 2D RoPE of adjacent pairs from an F16 cos/sin table / GELU / F16 store; the 2x2 merge is the activation addressing of the `mm.1` GEMM),
+`vit_attn` (flash-style: 16 queries x one head per workgroup, keys streamed in tiles of 32 through shared memory with an online softmax; **no score matrix of any precision is stored**; scores, running max/sum and the accumulator
+live in registers and shared memory only). A long sequence is several submits: the attention is dispatched in 2,048-query chunks and the submit is flushed per chunk and per layer above 2,048 positions (a single
+16k-query dispatch would outlive the GPU watchdog; the 4,096-token image ran with no watchdog event).
+
+**Precision / expansion.** BF16 activations (user ruling); Q8_0 matrices imported in place through `VulkanWeightImportPolicy` (the same zero-copy / DirectStorage route as the text model, nothing expanded: no F16/F32 copy of any matrix);
+`patch_embd` / `position_embd` BF16 by default (converted once at load through a transient native buffer, 4.55 MB resident; `DOTLLM_VISION_EMBD_PRECISION=f16` 4.55 MB, `f32` 9.11 MB read in place; the three arms agree to
+the printed digits on the embedding gates); biases, LayerNorm gains and LayerScale vectors stay F32 as in the file. The RoPE table is F16 (`npos x 128` bytes: 2.1 MB at 16,385 positions), the image pixels are held as F16
+(`W x H x 3 x 2` bytes: 39 MB at the 4,096-token limit; the reference rounds them to F16 anyway). The tower's activation scratch is BF16: peak 0.4 / 1.5 / 24.8 / 395.9 MB for the 4 / 15 / 256 / 4,096-token images,
+released after the call when above 128 MB (`ScratchKeepBytes`). Resident weights 341.3 MB (BF16 embeddings), 345.9 MB (F32 arm). Transients that are not weights: the host F32 normalised image (78 MB at the limit) and its F16 copy are freed
+after the upload, and the pixel upload stages through a transient host-visible buffer of the same size (input data, not weights).
+
+**Embedding gates** (`Inkling2VulkanVisionEncoderTests.Embeddings_MatchReferences`; CPU references cached by `CpuCache_Populate` so the CPU and the iGPU never run together). relRMS of our F16 output:
+
+| image | Vulkan vs CPU encoder on the F32 control (exact tower) | vs llama.cpp Q8_0 | vs llama.cpp F32 control | CPU shipping vs the same F32 control | CPU shipping vs llama.cpp Q8_0 (section 12) | min row cosine vs control |
+|---|---|---|---|---|---|---|
+| 80 | 1.73e-2 | 2.36e-2 | 1.73e-2 | 1.51e-2 | 1.8e-2 | 0.9997 |
+| 190x110 | 1.81e-2 | 3.47e-2 | 1.81e-2 | 2.54e-2 | 2.4e-2 | 0.9995 |
+| 640 | 4.11e-2 | 7.02e-2 | n/a | 6.45e-2 | 3.5e-2 | 0.976 |
+
+The CPU reached 2.1e-4 against llama.cpp on the F32 control; the Vulkan encoder reaches **1.7e-2** (80, 190x110). That is not a defect of one kernel: it is the BF16 activation ruling. Layer by layer against the CPU
+control (`Report_LayerwiseDivergenceFromF32Control`): embeddings 1.7e-3 (one BF16 rounding), then a gradual growth, 80 image 4.2e-3 after layer 0, 8.3e-3 at the output; 640 image 5.4e-3 after layer 0, 1.4e-2 (layer 5),
+2.0e-2 (11), 3.3e-2 (17), 4.8e-2 (22). No step anywhere. Longer sequences grow it faster (1,025 keys in every softmax). The F16 RoPE table was not isolated as a contributor. The gates are
+relRMS < 6e-2 vs the control, min row cosine > 0.97, relRMS < 9e-2 vs llama.cpp Q8_0: they catch gross errors; the sharp gates are the op-level tests and the end-to-end KL.
+
+**End to end** (Vulkan encoder + Vulkan text model, vs the same llama.cpp oracles, teacher-forced over 13 rows; gate 0.015):
+
+| image | Vulkan encoder: mean KL / max KL / top-1 / greedy mismatches | CPU encoder + Vulkan text (12a) | exact-tower embeddings (CPU F32 control) + Vulkan text |
+|---|---|---|---|
+| 80 | 3.67e-3 / 1.13e-2 / 12/13 / 1 | 4.85e-3 | 2.48e-3 (12/13, 1 mismatch) |
+| 190x110 | 3.22e-3 / 1.09e-2 / 13/13 / 0 | 6.62e-3 | 5.01e-3 |
+| 640 | **1.04e-2** / 3.88e-2 / 13/13 / 0 | 5.41e-3 | 1.32e-2 |
+
+The 640 figure is 70% of the gate. It is the reference, not the encoder: feeding the **exact** tower's embeddings (no activation noise at all) gives 1.32e-2, worse than ours. The shipping CPU encoder scores lower because
+it quantises activations to Q8_0 exactly like the llama.cpp oracle does, so it shares the oracle's noise; the Vulkan encoder, which never quantises activations, cannot and should not. Single-pass prefill equals the 32-token run to the printed
+digits; image-prompt logits KL vs the 32-token run is exactly 0 at chunks 4, 5 and 7 (`VulkanEncoder_ChunkedPrefill_ImageLogits_AreChunkSizeInvariant`).
+
+**Performance** (Strix 8060S, warm, single process, the Vulkan figures include preprocessing, pixel upload and the F16 download; CPU = the shipping BF16 encoder, 16 threads, cached wall times, run alone under the cpu-bench lock):
+
+| image | image tokens | Vulkan encode | CPU encode | speedup | prefill + first token (Vulkan text) | TTFT Vulkan encoder | TTFT CPU encoder |
+|---|---|---|---|---|---|---|---|
+| 80 | 4 | 18.7 ms | 57 ms | 3.1x | 0.36 s | 0.37 s | 0.41 s |
+| 190x110 | 15 | 21.2 ms | 109 ms | 5.1x | 0.46 s | 0.48 s | 0.57 s |
+| 640 | 256 | 249 ms (211 ms in the TTFT run) | 1,075 ms | 4.3x | 3.17 s | 3.38 s | 4.24 s |
+| 2560x2560 noise | 4,096 | 38.2 s (30.6 s in the TTFT run) | 650.5 s | 17x | 46.4 s | 77.0 s | 696.9 s |
+
+TTFT = encode + whole-prompt prefill + first logits; the CPU column adds the cached CPU encode time to the same measured Vulkan prefill (the two never ran together). Run-to-run spread on the large image is ~20% (another agent
+shares the iGPU between lock holders; this is not a tuned figure). Where the time goes at 4,096 tokens: 25 TFLOP of attention and 9.5 TFLOP of GEMMs in ~30-38 s, about 1 TFLOP/s overall; both the attention kernel (scalar FMAs, two
+shared-memory reads per FMA) and the GEMM (64x64 tile, scalar) are untuned. Levers: coopmat tiles for the GEMM (section 11 / the Q5_0 / Q4_K coopmat templates), a 32-query register-tiled attention.
+
+**Op-level parity and mutants** (`Inkling2VulkanVitKernelTests`, 17 tests, double-precision references written independently of the shaders; mutated shader copies compiled to a scratch directory and loaded through
+`DOTLLM_INKLING2_SPV_OVERRIDE`, tracked `.spv` untouched; committed before mutating). Each mutant ran against the kernel tests and the embedding gate (7 cases: 3 images x arms):
+
+| mutant (shader) | kernel tests failed | embedding-gate cases failed |
+|---|---|---|
+| posemb `align_corners` (vit_patch_embd) | 4 | 6 (the 640 image sits on the 32x32 table, where align_corners is the identity: it cannot fail there) |
+| posemb transposed (vit_patch_embd) | 5 | 4 |
+| posemb not added (vit_patch_embd) | 5 | 7 |
+| RoPE axes swapped (vit_gemm_q8) | 1 | 7 |
+| RoPE not applied (vit_gemm_q8) | 1 | 7 |
+| merge order (vit_gemm_q8) | 1 | 7 |
+| merge skipped (vit_gemm_q8) | 1 | 7 |
+| no LayerScale (vit_gemm_q8) | 1 | 7 |
+| no bias (vit_gemm_q8) | 4 | 7 |
+| tanh GELU (vit_gemm_q8) | 1 (`Gelu_IsErfNotTanh_InTheNegativeTail`) | 0 |
+| attention scale 1 instead of 1/8 | 2 | 7 |
+| attention key tail unmasked | 1 | 4 |
+| CLS row zero | 1 | 7 |
+| LayerNorm without beta | 1 | 7 |
+
+The tanh-GELU mutant **survived** the first draft of the kernel tests and the embedding gate (4.7e-4 absolute is invisible through BF16 and 6e-2 relRMS, as in the CPU section); it is killed by a dedicated test that evaluates the
+epilogue at chosen points in the negative tail (zero weights, biases from -3.5 to 3), where tanh and erf differ by up to 25% relative (erf: 3.5e-3 error from BF16 only).
 
 ## 13. DSpark drafter (issue #2039)
 
