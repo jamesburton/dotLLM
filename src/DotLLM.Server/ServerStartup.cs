@@ -1041,6 +1041,7 @@ public static class ServerStartup
             TryAttachSeparateMtpHead(model, resolvedPath, options);
         int mtpK = options.SpeculativeCandidates == TextGenerator.DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0
             ? model.MtpPreferredDraftTokens : options.SpeculativeCandidates;
+        mtpK = Math.Min(mtpK, model.MtpMaxDraftTokens);
         var mtpDecision = DecideMtp(options, model.SupportsMtp, draftModel is not null, concurrencyOverMtp, schedulerAvailable, mtpK);
         bool mtpActive = mtpDecision.Active;
         if (mtpDecision.Message is { } mtpMsg)
@@ -1203,6 +1204,20 @@ public static class ServerStartup
     /// </summary>
     internal static void TryAttachSeparateMtpHead(IModel model, string resolvedPath, ServerOptions options)
     {
+        if (model is Inkling2TransformerModel || options.DSparkPath is not null)
+        {
+            // Inkling 2 DSpark drafter (#2039): an explicit --dspark that cannot attach refuses to start; an auto-detected sibling is logged and ignored.
+            try
+            {
+                string? attached = DotLLM.Models.Architectures.DSpark.Inkling2DSparkResolver.TryAttach(model, resolvedPath, options.DSparkPath);
+                if (attached is not null) Console.WriteLine($"[dotllm] DSpark: attached drafter {Path.GetFileName(attached)}; the adaptive gate drafts only while acceptance pays (DOTLLM_DSPARK=0 opts out).");
+            }
+            catch (Exception ex) when (options.DSparkPath is null)
+            {
+                Console.Error.WriteLine($"[dotllm] WARNING: DSpark drafter not attached ({ex.GetType().Name}: {ex.Message}); serving without speculation.");
+            }
+            return;
+        }
         if (options.DFlashPath is { } dflashPath)
         {
             // An explicit drafter is the user's choice: failing to attach it fails startup rather than silently decoding plain.

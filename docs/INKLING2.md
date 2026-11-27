@@ -1,6 +1,6 @@
 # Inkling 2 (Thinking Machines) — architecture notes
 
-**Status:** CPU reference forward (issue #2026) and Vulkan text decoder (issue #2034, section 11), epic #2025. CUDA, the vision tower and the DSpark drafter are later slices (section 9).
+**Status:** CPU reference forward (issue #2026), Vulkan text decoder (issue #2034, section 11) and the CPU DSpark drafter (issue #2039, sections 13-15), epic #2025. The CPU vision tower is section 12 (issue #2035). CUDA, Vulkan vision and the Vulkan drafter (#2046) are later slices (section 9).
 Model: `thinkingmachines/Inkling-2-Mini` (HF `model_type: inkling2_loop`, `Inkling2LoopForConditionalGeneration`, Apache-2.0, 2026-11-20).
 GGUF: `ggml-org/Inkling-2-Mini-GGUF` (`general.architecture = inkling2_loop`; a plain `inkling2` file is the same graph with one pass).
 
@@ -128,7 +128,7 @@ neither a KL below ~4e-3 nor free-running greedy identity is a meaningful bar ag
 
 - **Vision**: implemented on the CPU in issue #2035, see section 12 (Vulkan vision is a later slice).
   images enter the text stream as `<|content_image|><|unused_200054|>` placeholders whose embeddings are injected *without* `token_embd_norm` (llama.cpp: "do not normalize raw embeddings input"). The loader must accept an embedding-input forward.
-- **DSpark drafter** (`dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`): 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
+- **DSpark drafter**: implemented on the CPU in issue #2039, see sections 13-15 (the Vulkan drafter is #2046). `dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`: 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
   `target_layer_ids = [5, 23, 41, 48]` counted in **layer visits** (the target exposes the input of visit `n` and the final norm output as id 48: `res->t_layer_inp[visit]` in `inkling2-loop.cpp`). The CPU model keeps the trace hook points
   (`pass{n}.l{ip}`, `result_norm`) where those features would be tapped.
 - CUDA text decoder (NVFP4 expert kernels must read the blocks in place), optimisation, llama.cpp Vulkan comparison. (The Vulkan text decoder landed in #2034, section 11.)
@@ -337,3 +337,67 @@ embeddings not injected 1.38, BGR 0.37, RoPE axes swapped 0.95, merge order 0.06
 **Known gate limits (survivors).** The reference's pad quirk (-1.0 raw vs 0.0 raw, a 0.0078 difference on pad pixels) and the F16 im2col rounding are below the 2% noise floor at the embedding level and are
 not separately gated (the early checkpoints pin the F16 rounding: patch_embd matches to 5e-5). Over-limit images (> 4096 tokens, downscale policy) use a port of the reference resize gated against Pillow, not against an llama.cpp encode of such an image. The position-embedding mutants are only
 2-3x the end-to-end noise floor (sharp at the checkpoint gate).
+
+## 13. DSpark drafter (issue #2039)
+
+The drafter is `unsloth/Inkling-2-Mini-GGUF` `dspark-Inkling-2-Mini-Q8_0.gguf` (504 MB, `general.architecture = dflash`, 58 tensors). `mtp.safetensors` is **not** needed: the GGUF already carries the converter's folds (`markov_w2 = unembed @ hidden_out`, softmaxed `ctx_mix`, the replicated `mask_embd`).
+
+**Sources.** llama.cpp (master; `llama-server` b12780 supports `--spec-type draft-dspark`): `src/models/dspark.cpp` (`build_dspark_markov_head`, `graph_dspark`), `src/models/dflash.cpp` (`build_inject_ctx_mix`, `graph_base::build_layers`, the shared embedding and lm-head), `common/speculative.cpp` (`common_speculative_impl_draft_dflash` / `_draft_dspark`: what is injected, what the block holds, the `f_rnn` ring), `src/models/inkling2-loop.cpp` and `inkling2.cpp` (`res->t_layer_inp[visit]`, the target features), `conversion/inkling2.py` (`Inkling2DSparkModel`), `docs/speculative.md`. Bench card: `hf://datasets/pratikgx/inkling-2-mini-dspark-m5-pro-mac-mini-bench` (README only).
+
+**Config** (`mtp_config`, GGUF `dflash.*`): 3 layers, hidden 2304, 24 heads / 8 KV heads, head_dim 128, intermediate 9216, RoPE NeoX theta 1e6, RMS eps 1e-6, `sliding_window = 1025`, pattern `[local, GLOBAL, local]` (layers 0 and 2 windowed, layer 1 global), `block_size = 8`, `sample_from_anchor = false`, no confidence head, `has_markov_context = true` (`rnn_hidden`), rank 256, `final_logit_softcapping = 30`.
+
+**Target features (what is captured, and when).** `target_layers = [5, 23, 41, 48]` count **layer visits** in execution order (48 per token: prelude 0-5, then 3 passes over core 6-17, then 18-23). The feature of id `v` is the **input** of visit `v` (`t_layer_inp[visit] = cur`, taken before the visit's layer is built): visit 5 is the input of prelude layer 5; visit 23 is the input of pass-1 layer 11 (cache slot 29, not 23); visit 41 is the input of pass-2 layer 17 (cache slot 41 only by numbering coincidence for this id; tapping by slot is a mutant); id 48 is not a layer input but the final normed output (after `mix(output_res_query)` and `output_norm`, before the LM head). Each target position yields one row per tap, held as F16.
+
+**Context injection** (`build_inject_ctx_mix`; per injected position `p`, per drafter layer `l`): `m = sum_k ctx_mix_l[k] * tap_k` (the converter already applied the softmax), `n = rms(m) * ctx_norm_l`, `K = attn_k_ctx_l . n`, `V = attn_v_ctx_l . n`. K gets a per-head RMSNorm (`attn_k_ctx_norm`) then RoPE at `p`; V gets neither. K/V are stored F16 in the layer's context cache. The Markov head's `f_rnn(p) = rms(sum_k markov_ctx_mix[k] * tap_k) * markov_ctx_norm` is kept per position.
+
+**Block.** A round with `n` drafts decodes `n + 1` rows (not always 8; attention is non-causal, so the drafts depend on `n`): row 0 is the **anchor** (the last committed token, at position `pos0`, not yet seen by the target), rows 1..n are `mask_embd` rows (positions `pos0 + i`). Embedding: the anchor is the target's raw `token_embd` row through the drafter's own `token_embd_norm` (the target's embedding path already applies its norm, so reusing it would norm twice); mask rows are `mask_embd` as stored (no norm, no embedding scale). Per layer (Qwen3-like): `rms(x) * attn_norm`, `attn_q/k/v`, per-head RMSNorm `attn_q_norm` / `attn_k_norm`, RoPE (NeoX, position `pos0 + i`), attention (scale `1/sqrt(128)`, no sinks), `attn_output`, `+x`, `rms * ffn_norm`, SwiGLU, down, `+x`. The block's K/V pass through the F16 cache (llama.cpp writes them there before attending). **Block-uniform mask** (`block_uniform = true`): every block row uses the mask row of the anchor. Context keys are positions `< pos0`; a windowed layer (n_swa 1025) sees `pos0 - 1024 .. pos0 - 1`, the global layer sees all; every block row sees every block key (non-causal). A key at distance over 1024 from the anchor is invisible to every row, including row `n`, which a per-query window would show.
+
+**Head.** `hidden_i = rms(x_i) * output_norm` for rows `i = 1..n`; `base_i = lm_head(hidden_i)` with the **target's** Q8_0 head over the 200,058 unpadded rows, **uncapped**. Then, with `state = 0` and `prev = anchor`, for `i = 1..n`:
+
+```
+joint = joint_proj . [ state(256) | markov_w1[prev](256) | hidden_i(2304) | f_rnn(pos0 - 1)(2304) ] + joint_proj.bias     # 5120 -> 768
+gate = sigmoid(joint[0:256]);  cand = tanh(joint[256:512]);  markov = tanh(joint[512:768])
+state = gate * state + (1 - gate) * cand
+bias = markov_w2 . markov + markov_w2.bias                                                                              # [200058]
+col_i = 30 * tanh((base_i + bias) / 30)          # softcap AFTER the bias (softcap_after_bias = true)
+prev = argmax(col_i)                             # greedy; the draft token of position pos0 + i
+```
+
+`f_rnn` is the feature of the position **before** the anchor (`pos0 - 1`, the last token the target processed); without it llama.cpp does not draft. `markov_w1`, `markov_w2` and `joint_proj` are BF16 and read in place.
+
+**Verification.** None of its own: llama.cpp (`common/speculative.cpp`) hands the `n` tokens to the ordinary speculative verifier (the target decodes `[last, d1..dn]`, greedy acceptance against the target argmax). dotLLM reuses the unmodified `MtpSpeculativeDecoder` (the drafter sits behind `IDFlashDraftAttachable` / `IMtpState`), its adaptive gate and its rollback. After a rejection the target's recurrent state must rewind: the short-conv windows of the 48 slots (`ForwardWithRecurrentSnapshots` / `RestoreRecurrentStateToRow`, section 14); the KV rows past the accepted one are simply overwritten.
+
+**Expected acceptance and speed (card).** Unsloth `llama-server` b12649, M5 Pro (Metal), IQ4_NL, `--spec-draft-n-max 5`: a repetitive continuation prompt 92.9% acceptance, 70.0 vs 23.3 tok/s (3.0x); a short code prompt 55.5%, 48.9 vs 34.3 tok/s; the "fair check" of three distinct greedy prompts 26.8% to 55.5% acceptance and **32.5 vs 33.4 tok/s (about 1.0x)**; sampled prompts (temp 0.7) 18-34% acceptance and a loss. Greedy text matched plain decoding on only 1 of 3 fair-check prompts (llama.cpp's own batch-vs-single numerics, section 14). llama.cpp's docs use `--spec-draft-n-max 3`.
+
+## 14. Speculative verify needs a row-count-invariant target (issue #2039)
+
+Greedy identity "by construction" only holds if an N-row forward equals N single-row forwards. Measured on the NVFP4 model (20-token prefix, then 8 rows against 8 single-row forwards; `Inkling2RowInvarianceTests`):
+
+- **Before:** row 0 identical; rows 1-7 differed in 200,056-200,058 of 200,058 logits, max |diff| 0.91. Cause: `Inkling2ConvState.Run` read the in-batch history (the inputs of rows `t-1..t-3`) as exact F32, while sequential decoding reads them back out of the BF16 state.
+- **Fix:** the in-batch history is rounded to the state type (BF16) exactly as `Store` does; only the current input stays exact. After it the two paths are **bit-identical on all 8 rows** (the NVFP4/Q8_0 GEMMs, the MoE and the F16-KV attention were already row-count invariant). This changes chunked-prefill numerics slightly, in the direction of decoding; the slice-1 KL gate is re-reported in section 15.
+- This also explains why llama.cpp's greedy DSpark output differs from its plain output on the bench card; dotLLM does not have that problem.
+
+**Rewinding the recurrent state.** `ForwardWithRecurrentSnapshots` records, for each of the 48 x 4 conv states, the window `[old state ; the inputs]` of the verify call in the state's own storage type (BF16: lossless, the window is BF16-exact). `RestoreRecurrentStateToRow(r)` stores rows `r+1 .. r+3` of it back and sets the sequence length to `pos0 + r + 1`. Cost: `(3 + rows) x 6656 channels x 48 slots x 2 B` = 7 MB at 8 rows, transient.
+
+## 15. DSpark results (CPU, Strix Halo, NVFP4 target + Q8_0 drafter, 2026-11-27)
+
+**Slice-1 KL gate with the conv-history fix** (`Inkling2RealModelTests`, 254 scored positions, defaults BF16 controller + BF16 conv state, vs llama.cpp `-fa off`): mean KL **4.053e-3** (was 4.10e-3), max 1.20e-1 (was 9.0e-2), top-1 97.6% (was 98.8%, three positions of 254), teacher-forced greedy mismatches 5/384 (**0/345 at oracle margin >= 0.3**, the gate's bar; the five are at margins 0.016-0.108). The mean did not move (the in-batch rounding makes chunked prefill agree with decoding instead of the unrounded batch path); max and top-1 move by single positions, inside llama.cpp's own flash-attention noise (4.05e-3 mean, 1.9e-1 max). The stored conv state is still BF16.
+
+**Greedy identity** (`GreedySpeculative_EqualsPlainGreedy_OnEightPrompts`, the 8 oracle prompts x 40 tokens, K = 3, the unmodified `MtpSpeculativeDecoder`, row snapshots): **8/8 identical, 40/40 tokens each**. 167 rounds, 1.90 tokens/round, draft acceptance **30.9%** (per prompt 7%-75%). llama.cpp b12780 on the same prompts (K = 3, 48 tokens): 174 of 574 drafts accepted = **30.3%**.
+
+**Draft parity vs llama.cpp** (`Drafts_MatchLlamaCppDsparkOracle`; oracle `dspark-oracle-k3.json` built from `llama-server -md dspark-... --spec-type draft-dspark --spec-draft-n-max 3 -dev none -devd none -v`; dotLLM is teacher-forced on llama.cpp's committed tokens and drafts at each round's reconstructed anchor): top-1 agreement **570/594 = 96.0%** (position 1: 98.5%), 183 of 198 whole rounds identical, mean |p diff| at position 1 0.0147 (p = softmax over the sampler's top 10). The residue is the target-feature noise floor (KL 4e-3) compounding along the Markov chain.
+
+**Mutants** (each must change the drafts on real data; `Inkling2DSparkTests`, `Inkling2RowInvarianceTests`): killed: taps by cache slot instead of visit, taps one visit early (prelude only), taps one visit late (every loop), visit 48 before the output norm, `ctx_mix` softmaxed twice, anchor not normed, anchor normed twice, Markov state reset each step, softcap before the bias, `f_rnn` of the wrong position, layers 0/2 not windowed (`AllLayersGlobal`), per-query window instead of the anchor's (`PerQueryWindow`), skipped `RestoreRecurrentStateToRow` (restore test), unrounded in-batch conv history (row-invariance test, pre-fix). **Survivor:** the global layer 1 windowed too (`AllLayersLocal`): at 1300 tokens of random context its output is bit-identical, because that layer's softmax is so peaked on the anchor/recent keys that keys past 1024 positions carry exactly zero float weight. Recorded as a finding; the window of layer 1 is unobservable on this data.
+
+**Allocation:** a warm draft (K = 7) allocates 0 managed bytes (`DraftHotPath_AllocatesNoManagedTensorMemory`); the drafter's activations and logits are native scratch.
+
+**CPU speed (net slower; the gate keeps it off).** `dotllm run --device cpu -t 0 -n 64`, one process per run (Release build, `cpu-bench` lock, a fresh lock per run), decode tok/s:
+
+| context | off (`--no-mtp`) | auto (default) | forced (`DOTLLM_MTP_ADAPTIVE=0`) | forced / off | tokens/round | drafter ms | verify ms (K+1 = 4 rows) |
+|---|---|---|---|---|---|---|---|
+| short (28 prompt tokens) | 9.79 | 9.61 (plain) | 6.32 / 6.55 | 0.65-0.67x | 2.81 | 27 | 362 |
+| long (8.3 KB of markdown, about 2-3K tokens) | 5.36 | 5.35 (plain) | 3.17 | 0.59x | 1.88 | 28 | 615 |
+
+The drafter is cheap (27 ms); the verify is not: a 4-row verify of a 128-expert top-8 MoE costs 3.5x a single decode on this bandwidth-bound box (362 ms vs about 102 ms), so even 2.8 tokens per round loses (139 vs 102 ms/token). This is the pratikgx card's "about 1.0x" on distinct prompts, a little worse here. **Adaptive gate:** the model is not "large" by the gate's resident-size prior (`ComputeMemoryBytes` is the state, not the mmapped weights), so a single `run` decides plain, which is why auto equals off. Over six requests through `dotllm serve` with an auto-detected `dspark-*.gguf` (hard-linked beside the target) the gate tried MTP once, measured 237.7 ms/token against 95-118 ms plain, fell back after 5 rounds and stayed on plain for the following requests. Draft width: `DOTLLM_DSPARK_DRAFT` (default 3).
+
+**Precision.** Weights Q8_0 / BF16 read in place; the context K/V is F16 (12 KiB per position for 3 layers, no F32 anywhere stored); `f_rnn` rows F16; tap rows F16; activations are native scratch, F32 only within a call (as the CPU reference). The Markov recurrent state (256 floats, 1 KiB) is an F32 in-call accumulator on the stack, never stored across calls; a BF16/8-bit evaluation of it has **not** been done (open item for sign-off). The recorded conv-snapshot window is BF16.

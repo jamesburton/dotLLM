@@ -225,6 +225,12 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
                      "directory and the one above it (a head that does not fit the device is declined with a startup message and serving continues without it).")]
         public string? MtpHead { get; set; }
 
+        /// <summary>Inkling 2 DSpark drafter GGUF (issue #2039).</summary>
+        [CommandOption("--dspark")]
+        [Description("Path of the Inkling 2 DSpark drafter GGUF (dspark-Inkling-2-Mini-Q8_0.gguf). It takes the MTP slot behind the adaptive gate. Default: a dspark-*.gguf beside the model is auto-attached " +
+                     "(an environment switch opts it out, see the environment table); an explicit path that cannot be attached refuses to start, an auto-detected one is logged and ignored.")]
+        public string? DSpark { get; set; }
+
         /// <summary>DFlash / DFlash2 drafter GGUF (issue #1175).</summary>
         [CommandOption("--dflash")]
         [Description("Path of a DFlash / DFlash2 drafter GGUF (arch 'dflash'). It takes the MTP slot; qwen35 targets on CPU, CUDA or Vulkan (drafter on the CPU).")]
@@ -598,6 +604,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             MtpExplicit = settings.Mtp && !settings.NoMtp,
             MtpHeadPath = settings.MtpHead,
             DFlashPath = settings.DFlash,
+            DSparkPath = settings.DSpark,
             ReasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(settings.ReasoningFormat),
             ReasoningBudget = Math.Max(-1, settings.ReasoningBudget),
             ReasoningBudgetMessage = settings.ReasoningBudgetMessage,

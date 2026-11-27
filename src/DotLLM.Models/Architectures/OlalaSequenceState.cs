@@ -19,6 +19,7 @@ internal sealed unsafe class NativeBuffer<T> : IDisposable where T : unmanaged
         new Span<T>(_ptr, checked((int)_count)).Clear();
     }
 
+    public T* Ptr => _ptr;
     public long Count => _count;
     public long Bytes => _count * sizeof(T);
     public Span<T> Span => new(_ptr, checked((int)_count));

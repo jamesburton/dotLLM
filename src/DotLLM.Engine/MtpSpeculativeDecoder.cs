@@ -71,6 +71,9 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
     internal bool UseRecurrentRowSnapshots { get; set; } =
         Environment.GetEnvironmentVariable(DisableRowSnapshotsEnvVar) != "0";
 
+    /// <summary>Cap K at <see cref="IModel.MtpMaxDraftTokens"/> (always on; the mutant tests turn it off to show that a K above a block drafter's width fails).</summary>
+    internal bool ApplyDraftCap { get; set; } = true;
+
     /// <summary>Env switch that forces full-logits draft steps even on models with a native draft argmax.</summary>
     internal const string DisableDraftArgMaxEnvVar = "DOTLLM_MTP_DRAFT_ARGMAX";
 
@@ -174,7 +177,7 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
         // The verify forward writes positions position..position+k, so k is bounded by the target
         // KV-cache (the MTP state is sized for the whole sequence by the caller).
         int maxPos = kvCacheTarget.MaxLength;
-        int k = Math.Min(numCandidates, maxPos - position - 1);
+        int k = Math.Min(Math.Min(numCandidates, ApplyDraftCap ? targetModel.MtpMaxDraftTokens : int.MaxValue), maxPos - position - 1);   // a block drafter has no draft past its width
         if (k < 0 || (k == 0 && !(allowZeroDraft && numCandidates == 0)))
             return default;
 

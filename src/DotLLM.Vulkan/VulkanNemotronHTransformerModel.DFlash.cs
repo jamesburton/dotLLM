@@ -107,6 +107,9 @@ public sealed partial class VulkanNemotronHTransformerModel : IDFlashDraftAttach
     /// <summary>Draft tokens per round: the block's drafts, capped by <c>DOTLLM_DFLASH_DRAFT</c> when set.</summary>
     public int MtpPreferredDraftTokens => _dflash is null ? 0 : _dflash.DraftTokensPerRound;
 
+    /// <inheritdoc/>
+    public int MtpMaxDraftTokens => _dflash is null ? int.MaxValue : _dflash.DraftTokensPerRound;
+
     /// <summary>With a drafter attached the adaptive gate tries speculation first (#1223): a verify of K+1 rows reads each weight once.</summary>
     public long MtpGatePriorBytes => _dflash is not null ? long.MaxValue : ComputeMemoryBytes;
 

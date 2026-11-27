@@ -42,6 +42,9 @@ public sealed unsafe partial class NemotronHTransformerModel : IDFlashDraftAttac
     public int MtpPreferredDraftTokens => _dflash is null ? 0 : _dflash.DraftTokensPerRound;
 
     /// <inheritdoc/>
+    public int MtpMaxDraftTokens => _dflash is null ? int.MaxValue : _dflash.DraftTokensPerRound;
+
+    /// <inheritdoc/>
     public IMtpState? CreateMtpState() => _dflash is null ? null : new DFlashMtpState(_dflash);
 
     /// <inheritdoc/>
