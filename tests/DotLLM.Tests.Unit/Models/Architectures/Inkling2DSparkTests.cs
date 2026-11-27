@@ -347,6 +347,63 @@ public sealed class Inkling2DSparkTests : IClassFixture<DSparkFixture>
         }
     }
 
+    /// <summary>
+    /// Draft parity against llama.cpp b12780 <c>llama-server --spec-type draft-dspark --spec-draft-n-max 3 -dev none -devd none</c> (issue #2039): the oracle file
+    /// <c>dspark-oracle-k3.json</c> holds, per greedy prompt, the committed tokens and every round's draft top-3 candidates (llama.cpp's verbose "draft candidate"
+    /// lines, p = softmax over the sampler's top 10). dotLLM is teacher-forced on the oracle's committed tokens and drafts at each round's anchor.
+    /// </summary>
+    [SkippableFact]
+    public void Drafts_MatchLlamaCppDsparkOracle()
+    {
+        var m = Model();
+        string path = Path.Combine(Inkling2RealModelTests.OracleDir, "dspark-oracle-k3.json");
+        Skip.If(!File.Exists(path), "dspark-oracle-k3.json missing (see docs/INKLING2.md section 12)");
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        int total = 0, hit = 0, pos1 = 0, pos1Hit = 0, rounds = 0, roundsAllHit = 0;
+        double pDiff = 0; int pN = 0;
+        foreach (var prop in doc.RootElement.EnumerateObject())
+        {
+            int[] prompt = prop.Value.GetProperty("prompt_ids").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            int[] T = prop.Value.GetProperty("tokens").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            var rs = prop.Value.GetProperty("rounds").EnumerateArray().ToList();
+            m.ResetSequenceState();
+            using var st = m.CreateDSparkState();
+            using (m.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, null, null, st, true)) { }
+            int fed = 0;   // tokens of T forwarded so far
+            foreach (var r in rs)
+            {
+                int a = r.GetProperty("anchor").GetInt32();
+                while (fed < a)
+                {
+                    using (m.Forward([T[fed]], [prompt.Length + fed], -1, null, null, st, true)) { }
+                    fed++;
+                }
+                var cands = r.GetProperty("drafts").EnumerateArray().Select(d => d.EnumerateArray().Select(c => (Id: c[0].GetInt32(), P: c[1].GetDouble())).ToArray()).ToArray();
+                int k = cands.Length;
+                int[] mine = new int[k];
+                for (int i = 0; i < k; i++) mine[i] = st.NextDraft(m, T[a], prompt.Length + a + i, k);
+                bool all = true;
+                for (int i = 0; i < k; i++)
+                {
+                    total++; bool ok = mine[i] == cands[i][0].Id; if (ok) hit++; else all = false;
+                    if (i == 0)
+                    {
+                        pos1++; if (ok) pos1Hit++;
+                        // llama.cpp's p is the softmax of the draft logits over the sampler's top 10
+                        var row = st.DraftLogits(prompt.Length + a);
+                        var top = row.ToArray().Select((v, id) => (v, id)).OrderByDescending(x => x.v).Take(10).ToArray();
+                        double z = top.Sum(x => Math.Exp(x.v - top[0].v));
+                        if (ok) { pDiff += Math.Abs(1.0 / z - cands[0][0].P); pN++; }
+                    }
+                }
+                rounds++; if (all) roundsAllHit++;
+            }
+        }
+        _out.WriteLine($"draft top-1 agreement with llama.cpp: {hit}/{total} = {(double)hit / total:P1} (position 1: {(double)pos1Hit / pos1:P1}); whole rounds identical {roundsAllHit}/{rounds}; mean |p diff| at position 1 {(pN == 0 ? 0 : pDiff / pN):F4}");
+        Assert.True((double)hit / total > 0.85, $"draft top-1 agreement {(double)hit / total:P1} with the llama.cpp oracle is too low");
+        Assert.True(pN == 0 || pDiff / pN < 0.05, $"mean |p diff| {pDiff / pN:F4}");
+    }
+
     [SkippableFact]
     public void DraftHotPath_AllocatesNoManagedTensorMemory()
     {
