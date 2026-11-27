@@ -1513,11 +1513,11 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
         public MatMulMmqCm1Kernel? GroupedCm1Q5_0 { get; init; }
         public MatMulMmqCm1Kernel? GroupedCm1Q4_K { get; init; }
 
-        /// <summary>The 16- and 32-row-tile twins of the grouped int8-coopmat kernels (#2041), keyed by (bank type, row tile); empty when unavailable.</summary>
+        /// <summary>The 32-row-tile twins of the grouped int8-coopmat kernels (#2041), keyed by (bank type, row tile); empty when unavailable.</summary>
         public IReadOnlyDictionary<(QuantizationType, int), MatMulMmqCm1Kernel> GroupedCm1Narrow { get; init; }
             = new Dictionary<(QuantizationType, int), MatMulMmqCm1Kernel>();
 
-        /// <summary>The int8-coopmat grouped kernel for a bank of type <paramref name="qt"/> with <paramref name="rowTile"/> token rows per tile (64, 32 or 16), or null.</summary>
+        /// <summary>The int8-coopmat grouped kernel for a bank of type <paramref name="qt"/> with <paramref name="rowTile"/> token rows per tile (64 or 32), or null.</summary>
         public MatMulMmqCm1Kernel? GroupedCm1(QuantizationType qt, int rowTile = MatMulMmqCm1Kernel.RowTile)
         {
             if (rowTile != MatMulMmqCm1Kernel.RowTile)
@@ -1745,10 +1745,10 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
         public static long GroupedCoopmat;
         /// <summary>Routed layers run on the int8-coopmat grouped prefill (#1226).</summary>
         public static long GroupedCm1;
-        /// <summary>Grouped int8-coopmat layers per token-row tile (#2041): 64, 32, 16.</summary>
-        public static long Cm1Tile64, Cm1Tile32, Cm1Tile16;
+        /// <summary>Grouped int8-coopmat layers per token-row tile (#2041): 64, 32.</summary>
+        public static long Cm1Tile64, Cm1Tile32;
         internal static void RecordCm1RowTile(int rowTile)
-            => Interlocked.Increment(ref rowTile == 16 ? ref Cm1Tile16 : ref rowTile == 32 ? ref Cm1Tile32 : ref Cm1Tile64);
+            => Interlocked.Increment(ref rowTile == 32 ? ref Cm1Tile32 : ref Cm1Tile64);
         /// <summary>Up projections run on the xDiv broadcast MMVQ (#1049), one-row and multi-row kernels.</summary>
         public static long XDivUp;
         /// <summary>Up projections run on the multi-row Q4_K MMVQ (#1049).</summary>
@@ -1765,7 +1765,7 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
             Interlocked.Exchange(ref XDivUp, 0); Interlocked.Exchange(ref MultiRowUp, 0); Interlocked.Exchange(ref MultiRowDown, 0);
             Interlocked.Exchange(ref Mmvq, 0); Interlocked.Exchange(ref F32Indexed, 0);
             Interlocked.Exchange(ref GroupedMmq, 0); Interlocked.Exchange(ref GroupedCoopmat, 0); Interlocked.Exchange(ref GroupedCm1, 0);
-            Interlocked.Exchange(ref Cm1Tile64, 0); Interlocked.Exchange(ref Cm1Tile32, 0); Interlocked.Exchange(ref Cm1Tile16, 0);
+            Interlocked.Exchange(ref Cm1Tile64, 0); Interlocked.Exchange(ref Cm1Tile32, 0);
         }
     }
 
@@ -1802,17 +1802,17 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
     /// activations, needs cooperative matrices). Anything missing stays null and the layers it would serve keep the indexed path.
     /// </summary>
     /// <summary>
-    /// #2041: <c>DOTLLM_VK_NEMOTRON_MOE_CM1_TILE</c> = 16 / 32 / 64 pins the token-row tile of the grouped int8-coopmat expert GEMMs;
+    /// #2041: <c>DOTLLM_VK_NEMOTRON_MOE_CM1_TILE</c> = 32 / 64 pins the token-row tile of the grouped int8-coopmat expert GEMMs;
     /// unset or "auto" picks it per batch from the mean routed rows per expert (<see cref="SelectCm1RowTile"/>).
     /// </summary>
-    private static readonly int Cm1RowTileOverride = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_MOE_CM1_TILE"), out int t) && t is 16 or 32 or 64 ? t : 0;
+    private static readonly int Cm1RowTileOverride = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_MOE_CM1_TILE"), out int t) && t is 32 or 64 ? t : 0;
 
     /// <summary>The 16- and 32-row-tile grouped int8-coopmat kernels for every bank type the 64-row ones serve; entries missing when the SPIR-V is absent.</summary>
     private static Dictionary<(QuantizationType, int), MatMulMmqCm1Kernel> CreateNarrowCm1(VulkanDevice device, string spvDir)
     {
         var map = new Dictionary<(QuantizationType, int), MatMulMmqCm1Kernel>();
         foreach (var qt in new[] { QuantizationType.Q8_0, QuantizationType.Q5_0, QuantizationType.Q4_K })
-            foreach (int rt in new[] { 32, 16 })
+            foreach (int rt in new[] { 32 })
                 if (MatMulMmqCm1Kernel.TryCreate(device, spvDir, qt, grouped: true, rowTile: rt) is { } kernel)
                     map[(qt, rt)] = kernel;
         return map;
@@ -1820,19 +1820,19 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
 
     /// <summary>
     /// Token-row tile for the grouped int8-coopmat GEMMs: a 64-row tile over an expert that holds 24 rows is two thirds padding, so batches with a
-    /// small mean of <c>seqLen * topK / numExperts</c> rows per expert use 32- or 16-row tiles (same arithmetic per row, so bit-identical output).
+    /// small mean of <c>seqLen * topK / numExperts</c> rows per expert use 32-row tiles (same arithmetic per row, so bit-identical output).
     /// </summary>
     /// <param name="rows">Routed (token, slot) rows.</param>
     /// <param name="numExperts">Experts in the layer.</param>
-    /// <returns>16, 32 or 64.</returns>
+    /// <returns>32 or 64.</returns>
     internal static int SelectCm1RowTile(int rows, int numExperts)
     {
         if (Cm1RowTileOverride != 0) return Cm1RowTileOverride;
         int mean = rows / Math.Max(1, numExperts);
-        return mean <= Cm1Tile16MaxMeanRows ? 16 : mean <= Cm1Tile32MaxMeanRows ? 32 : 64;
+        return mean <= Cm1Tile32MaxMeanRows ? 32 : 64;
     }
 
-    private const int Cm1Tile16MaxMeanRows = 8;
+    /// <summary>Measured on Nemotron 3.5 Lightning (#2041): 32 beats 64 by 13% at 6 rows/expert (pp128), ties at 24 (pp512); 16 loses at both.</summary>
     private const int Cm1Tile32MaxMeanRows = 40;
 
     private static GroupedMoeKernels CreateGroupedMoeKernels(VulkanDevice device, string spvDir, bool dp4a)

@@ -64,8 +64,8 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
     private static string SpvName(QuantizationType qt, bool grouped, int rowTile = RowTile)
     {
         string q = qt switch { QuantizationType.Q8_0 => "q8_0", QuantizationType.Q5_0 => "q5_0", QuantizationType.Q4_1 => "q4_1", QuantizationType.Q4_0 => "q4_0", QuantizationType.Q5_1 => "q5_1", _ => "q4_k" };
-        if (rowTile != RowTile && (!grouped || rowTile is not (16 or 32)))
-            throw new ArgumentOutOfRangeException(nameof(rowTile), rowTile, "Only the grouped form has 16- and 32-row tile variants (#2041).");
+        if (rowTile != RowTile && (!grouped || rowTile != 32))
+            throw new ArgumentOutOfRangeException(nameof(rowTile), rowTile, "Only the grouped form has a 32-row tile variant (#2041).");
         return grouped ? (rowTile == RowTile ? $"moe_grouped_{q}_mmq_cm1.spv" : $"moe_grouped_{q}_mmq_cm1_bn{rowTile}.spv") : $"matmul_{q}_mmq_cm1.spv";
     }
 
@@ -77,7 +77,7 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
     /// <param name="spvDir">Directory holding the compiled shaders.</param>
     /// <param name="quant">Weight format.</param>
     /// <param name="grouped">The MoE expert-grouped form.</param>
-    /// <param name="rowTile">Token rows per tile of the grouped form (64, 32 or 16).</param>
+    /// <param name="rowTile">Token rows per tile of the grouped form (64 or 32).</param>
     /// <returns><see langword="true"/> when <see cref="TryCreate"/> would succeed.</returns>
     public static bool IsSupportedOn(VulkanDevice device, string spvDir, QuantizationType quant, bool grouped = false, int rowTile = RowTile)
         => Enabled && IsSupportedQuant(quant)
@@ -95,7 +95,7 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
     /// <param name="spvDir">Directory holding the compiled shaders.</param>
     /// <param name="quant">Weight format (Q8_0, Q5_0, Q4_K or Q4_1).</param>
     /// <param name="grouped">The MoE expert-grouped form.</param>
-    /// <param name="rowTile">Token rows per workgroup tile of the grouped form: 64 (default), 32 or 16 (#2041: for batches with few rows per expert).</param>
+    /// <param name="rowTile">Token rows per workgroup tile of the grouped form: 64 (default) or 32 (#2041: for batches with few rows per expert).</param>
     /// <returns>The kernel, or <see langword="null"/>.</returns>
     public static MatMulMmqCm1Kernel? TryCreate(VulkanDevice device, string spvDir, QuantizationType quant, bool grouped = false, int rowTile = RowTile)
     {

@@ -167,6 +167,94 @@ public sealed class VulkanMatMulMmqCm1KernelTests(ITestOutputHelper output)
     }
 
     /// <summary>Opt-in (<c>DOTLLM_GEMM_SHAPE_PROBE=1</c>): steady-state TFLOP/s of the int8-coopmat GEMM (+ its Q8_1 quantize) vs the F16 coopmat GEMM at the Qwen3.8-27B prefill shapes.</summary>
+    /// <summary>
+    /// #2041: the 32-row-token-tile grouped kernel computes the same bits as the 64-row one. Each output row is an independent int32 dot per 32-block, so only
+    /// the tiling differs. Covers the dense 3-D grid and the GPU tile list built with 32-row tiles; a tile list built with 64-row tiles for the 32-row kernel
+    /// (the wrong pairing) is run as the negative control and must NOT match, proving the comparison can see a tiling error.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(QuantizationType.Q5_0, 200, 416)]
+    [InlineData(QuantizationType.Q8_0, 136, 256)]
+    [InlineData(QuantizationType.Q4_K, 72, 512)]
+    public void Grouped32RowTile_IsBitIdenticalToGrouped64(QuantizationType qt, int m, int k)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var k64 = MatMulMmqCm1Kernel.TryCreate(device, spvDir, qt, grouped: true);
+        using var k32 = MatMulMmqCm1Kernel.TryCreate(device, spvDir, qt, grouped: true, rowTile: 32);
+        Skip.If(k64 is null || k32 is null, "int8-coopmat MMQ needs AMD + Sint8 16x16x16 coopmat + wave32 pinning.");
+        Skip.IfNot(MoeBuildTileListKernel.IsSupportedOn(spvDir), "moe_build_tile_list.spv missing.");
+        Assert.Equal(32, k32!.GroupedRowTile);
+        Assert.Equal(64, k64!.GroupedRowTile);
+        using var quant = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir) ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
+        using var build = MoeBuildTileListKernel.Create(device, spvDir);
+
+        int[] counts = [0, 7, 70, 1, 3, 33, 64, 65, 32];
+        int e = counts.Length, rows = counts.Sum();
+        uint[] offsets = new uint[e + 1];
+        for (int i = 0; i < e; i++) offsets[i + 1] = offsets[i] + (uint)counts[i];
+        var rng = new Random(2041 + m + k);
+        float[] w = new float[e * m * k];
+        for (int i = 0; i < w.Length; i++) w[i] = (float)(rng.NextDouble() * 2 - 1) * 0.1f;
+        float[] b = new float[rows * k];
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+        byte[] wq = qt == QuantizationType.Q4_K ? Q4KFixture.QuantizeRows(w, e * m, k) : QuantizeRows(w, e * m, k, qt);
+
+        using var bufW = device.Allocate((wq.Length + 3) & ~3);
+        using var bufB = device.Allocate((long)rows * k * sizeof(float));
+        using var bufXq = device.Allocate(QuantizeQ8_1RowsKernel.PackedBytes(rows, k));
+        using var bufXds = device.Allocate(QuantizeQ8_1RowsKernel.ScaleBytes(rows, k));
+        using var bufOff = device.Allocate((e + 1) * sizeof(uint));
+        using var bufTiles = device.AllocateDeviceLocal(MoeBuildTileListKernel.OffsetsBufferUints(e, rows) * sizeof(uint));
+        using var bufArgs = device.AllocateDeviceLocal(2 * MoeBuildTileListKernel.ArgsStrideBytes);
+        device.Upload(wq, bufW);
+        device.Upload(b, bufB);
+        device.Upload(MemoryMarshal.AsBytes<uint>(offsets), bufOff);
+        device.Upload(MemoryMarshal.AsBytes<uint>(offsets), bufTiles);
+
+        float[] Run(Action<nint, VulkanDevice.Buffer> record)
+        {
+            using var bufC = device.Allocate((long)rows * m * sizeof(float));
+            device.Upload(new float[rows * m], bufC);
+            using var ctx = device.CreateSubmitContext();
+            ctx.Begin();
+            quant.Record(ctx.CommandBuffer, bufB, bufXq, bufXds, rows, k);
+            KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+            record(ctx.CommandBuffer, bufC);
+            ctx.SubmitAndWait();
+            float[] c = new float[rows * m];
+            device.Download(bufC, c);
+            return c;
+        }
+
+        float[] reference = Run((cmd, c) => k64.RecordGrouped(cmd, bufW, bufXq, bufXds, bufOff, c, m, k, rows, e, maxRowsPerExpert: counts.Max()));
+        float[] grid32 = Run((cmd, c) => k32.RecordGrouped(cmd, bufW, bufXq, bufXds, bufOff, c, m, k, rows, e, maxRowsPerExpert: counts.Max()));
+        float[] listed32 = Run((cmd, c) =>
+        {
+            build.Record(cmd, bufTiles, bufArgs, e, k32.MTiles(m), k32.MTiles(m), tileRows: 32);
+            KernelSupport.ComputeToIndirectAndComputeBarrier(cmd);
+            k32.RecordGroupedIndirect(cmd, bufW, bufXq, bufXds, bufTiles, c, bufArgs, 0, m, k, rows, e);
+        });
+        float[] mispaired = Run((cmd, c) =>
+        {
+            build.Record(cmd, bufTiles, bufArgs, e, k32.MTiles(m), k32.MTiles(m), tileRows: 64);   // wrong: 64-row list for the 32-row kernel
+            KernelSupport.ComputeToIndirectAndComputeBarrier(cmd);
+            k32.RecordGroupedIndirect(cmd, bufW, bufXq, bufXds, bufTiles, c, bufArgs, 0, m, k, rows, e);
+        });
+
+        int gridDiff = 0, listDiff = 0, mispairedDiff = 0;
+        for (int i = 0; i < reference.Length; i++)
+        {
+            if (BitConverter.SingleToInt32Bits(reference[i]) != BitConverter.SingleToInt32Bits(grid32[i])) gridDiff++;
+            if (BitConverter.SingleToInt32Bits(reference[i]) != BitConverter.SingleToInt32Bits(listed32[i])) listDiff++;
+            if (BitConverter.SingleToInt32Bits(reference[i]) != BitConverter.SingleToInt32Bits(mispaired[i])) mispairedDiff++;
+        }
+        output.WriteLine($"{qt} m={m} k={k} rows={rows}: 32-row grid diff={gridDiff}, 32-row tile list diff={listDiff}, mispaired control diff={mispairedDiff} of {reference.Length}");
+        Assert.Equal(0, gridDiff);
+        Assert.Equal(0, listDiff);
+        Assert.True(mispairedDiff > 0, "negative control: a 64-row tile list driving the 32-row kernel must skip rows, or this test cannot see a tiling error.");
+    }
+
     [SkippableFact]
     public void Probe_Qwen38Shapes()
     {
