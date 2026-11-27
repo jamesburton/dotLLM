@@ -293,8 +293,10 @@ mean KL 3.4e-3, the lowest of the three arms on that image). Memory saved: 4.45 
 
 **Open finding: chunked prefill of an image prompt.** Image rows are injected by absolute position and the `embed` trace of every chunk is bit-identical across chunk sizes
 (`ChunkedPrefill_ImageRows_AreAddressedByAbsolutePosition`), yet the final-position logits of an image prompt depend on the prefill chunk size (KL vs the 32-token run: 1.9e-3 at 5 tokens on the 80 image,
-5.5e-2 at 7 and 1.3e-1 at 4 on 190x110, same top-1) while the same prompt without the image rows is chunk-size invariant (KL 3e-5 to 2e-4). Cause not established (suspected: Q8_0 activation quantisation
-amplifying GEMV/GEMM summation-order drift on the large-norm image rows). Not fixed here; the oracle gates use 32-token chunks (`Report_ChunkSizeDependenceOfImagePrefill`).
+5.5e-2 at 7 and 1.3e-1 at 4 on 190x110, same top-1) while the same prompt without the image rows is chunk-size invariant (KL 3e-5 to 2e-4). Cause not established. The summation-order explanation does not fit (chunks of 4 to 32 all take the GEMM path, Q8_0 activation quantisation is per row, the text control moves by 1e-5), so the suspect is state
+carried across a chunk boundary at reduced precision (the conv state is BF16 by default; image rows skip `token_embd_norm`, so their norms and boundary rounding errors are large). To test: run `Report_ChunkingVsOracle` and
+`Report_ChunkSizeDependenceOfImagePrefill` with `DOTLLM_INKLING2_CONV_STATE=f32`; **not run** (the cpu-bench lock was held by another agent for the rest of the session). Not fixed here. Every end-to-end KL in this section was measured
+at 32-token chunks (the oracle gates), so it includes any boundary error, and the engine default (`--prefill-chunk-size 0`, one pass) is not gated against llama.cpp: `Report_ChunkingVsOracle` measures both.
 
 **Oracle.** `tools/inkling2-vision-oracle/`: `oracle.c` (a C program over `llama.dll` + `mtmd.dll` of b12780: `mtmd_tokenize` / `mtmd_encode_chunk` / `mtmd_get_output_embd`, then
 `mtmd_helper_eval_chunks` + greedy teacher forcing, `-fa off`, CPU; dumps the full F32 embeddings and the full-vocabulary logits of every step), `gen_inputs.py` (test images and prompts),
