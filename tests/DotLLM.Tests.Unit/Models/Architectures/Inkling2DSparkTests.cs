@@ -357,7 +357,7 @@ public sealed class Inkling2DSparkTests : IClassFixture<DSparkFixture>
     {
         var m = Model();
         string path = Path.Combine(Inkling2RealModelTests.OracleDir, "dspark-oracle-k3.json");
-        Skip.If(!File.Exists(path), "dspark-oracle-k3.json missing (see docs/INKLING2.md section 12)");
+        Skip.If(!File.Exists(path), "dspark-oracle-k3.json missing (see docs/INKLING2.md section 13)");
         using var doc = JsonDocument.Parse(File.ReadAllText(path));
         int total = 0, hit = 0, pos1 = 0, pos1Hit = 0, rounds = 0, roundsAllHit = 0;
         double pDiff = 0; int pN = 0;

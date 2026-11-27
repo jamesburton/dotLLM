@@ -1,6 +1,6 @@
 # Inkling 2 (Thinking Machines) — architecture notes
 
-**Status:** CPU reference forward (issue #2026), Vulkan text decoder (issue #2034, section 11) and the CPU DSpark drafter (issue #2039, sections 13-15), epic #2025. CUDA, the vision tower and the Vulkan drafter (#2046) are later slices (section 9).
+**Status:** CPU reference forward (issue #2026), Vulkan text decoder (issue #2034, section 11) and the CPU DSpark drafter (issue #2039, sections 13-15), epic #2025. The CPU vision tower is section 12 (issue #2035). CUDA, Vulkan vision and the Vulkan drafter (#2046) are later slices (section 9).
 Model: `thinkingmachines/Inkling-2-Mini` (HF `model_type: inkling2_loop`, `Inkling2LoopForConditionalGeneration`, Apache-2.0, 2026-11-20).
 GGUF: `ggml-org/Inkling-2-Mini-GGUF` (`general.architecture = inkling2_loop`; a plain `inkling2` file is the same graph with one pass).
 
@@ -128,7 +128,7 @@ neither a KL below ~4e-3 nor free-running greedy identity is a meaningful bar ag
 
 - **Vision**: implemented on the CPU in issue #2035, see section 12 (Vulkan vision is a later slice).
   images enter the text stream as `<|content_image|><|unused_200054|>` placeholders whose embeddings are injected *without* `token_embd_norm` (llama.cpp: "do not normalize raw embeddings input"). The loader must accept an embedding-input forward.
-- **DSpark drafter** (`dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`): 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
+- **DSpark drafter**: implemented on the CPU in issue #2039, see sections 13-15 (the Vulkan drafter is #2046). `dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`: 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
   `target_layer_ids = [5, 23, 41, 48]` counted in **layer visits** (the target exposes the input of visit `n` and the final norm output as id 48: `res->t_layer_inp[visit]` in `inkling2-loop.cpp`). The CPU model keeps the trace hook points
   (`pass{n}.l{ip}`, `result_norm`) where those features would be tapped.
 - CUDA text decoder (NVFP4 expert kernels must read the blocks in place), optimisation, llama.cpp Vulkan comparison. (The Vulkan text decoder landed in #2034, section 11.)

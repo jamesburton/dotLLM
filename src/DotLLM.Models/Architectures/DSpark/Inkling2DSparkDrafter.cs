@@ -23,7 +23,7 @@ internal unsafe interface IInkling2DSparkTarget
 
 /// <summary>
 /// The Inkling 2 DSpark drafter (llama.cpp <c>dflash</c> GGUF with a Markov head, <c>rnn_hidden</c> variant), issue #2039. Semantics:
-/// <c>src/models/dspark.cpp</c>, <c>dflash.cpp</c>, <c>common/speculative.cpp</c> and <c>conversion/inkling2.py</c> (see <c>docs/INKLING2.md</c> section 12).
+/// <c>src/models/dspark.cpp</c>, <c>dflash.cpp</c>, <c>common/speculative.cpp</c> and <c>conversion/inkling2.py</c> (see <c>docs/INKLING2.md</c> section 13).
 /// </summary>
 /// <remarks>
 /// Weights stay in their stored types (Q8_0 projections, BF16 Markov/joint matrices) and are read in place. All activations are native scratch, F32 only
