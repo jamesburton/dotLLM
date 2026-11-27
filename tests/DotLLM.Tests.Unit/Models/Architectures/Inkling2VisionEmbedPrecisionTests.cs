@@ -41,10 +41,28 @@ public sealed class Inkling2VisionEmbedPrecisionTests
         Assert.True((nan & 0x7F80) == 0x7F80 && (nan & 0x007F) != 0, "NaN stays a NaN (not rounded into an infinity)");
     }
 
+    /// <summary>
+    /// The default is BF16 end to end (user ruling 2026-11-27): the constant, an unset environment, and an encoder loaded with no precision argument. Kills: a
+    /// default flipped back to F32 (constant, env fallback, or the encoder ignoring the default).
+    /// </summary>
+    [SkippableFact]
+    public void Default_IsBf16_OnAnEncoderLoadedWithoutAnArgument()
+    {
+        Assert.Equal(VisionEmbedPrecision.BF16, Inkling2VisionEncoder.DefaultEmbedPrecision);
+        string? mm = Inkling2VisionFixtures.FindMmproj();
+        Skip.If(mm is null, "mmproj-Inkling-2-Mini-Q8_0.gguf not in the HF cache");
+        Skip.If(Environment.GetEnvironmentVariable(Inkling2VisionEncoder.EmbedPrecisionEnvVar) is { Length: > 0 }, "the precision variable is set");
+        using var enc = Inkling2VisionEncoder.Load(mm!, new ThreadingConfig(2));
+        Assert.Equal(VisionEmbedPrecision.BF16, enc.EmbedPrecision);
+        using var f32 = Inkling2VisionEncoder.Load(mm!, new ThreadingConfig(2), embedPrecision: VisionEmbedPrecision.F32);
+        Assert.Equal(VisionEmbedPrecision.F32, f32.EmbedPrecision);
+    }
+
     [Fact]
     public void EmbedPrecisionEnvironment_ParsesTheThreeArms_AndRejectsTypos()
     {
-        Assert.Equal(VisionEmbedPrecision.F32, Inkling2VisionEncoder.EmbedPrecisionFromEnvironment(_ => null));
+        Assert.Equal(VisionEmbedPrecision.BF16, Inkling2VisionEncoder.EmbedPrecisionFromEnvironment(_ => null));   // the default (ruling 2026-11-27)
+        Assert.Equal(VisionEmbedPrecision.F32, Inkling2VisionEncoder.EmbedPrecisionFromEnvironment(_ => "f32"));
         Assert.Equal(VisionEmbedPrecision.F16, Inkling2VisionEncoder.EmbedPrecisionFromEnvironment(_ => "F16"));
         Assert.Equal(VisionEmbedPrecision.BF16, Inkling2VisionEncoder.EmbedPrecisionFromEnvironment(_ => " bf16 "));
         Assert.Throws<ArgumentException>(() => Inkling2VisionEncoder.EmbedPrecisionFromEnvironment(_ => "fp8"));

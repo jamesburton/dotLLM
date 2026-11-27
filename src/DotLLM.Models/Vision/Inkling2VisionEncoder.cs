@@ -38,11 +38,11 @@ public enum Inkling2VisionMutant
 /// <summary>Storage format of the two large F32 tensors of the mmproj that are not quantized: <c>v.patch_embd.weight</c> and <c>v.position_embd.weight</c>.</summary>
 public enum VisionEmbedPrecision
 {
-    /// <summary>As stored in the GGUF (F32, read in place). The default until the user rules on the evaluation (docs/INKLING2.md).</summary>
+    /// <summary>As stored in the GGUF (F32, read in place). An A/B arm.</summary>
     F32,
     /// <summary>Converted once at load to IEEE half (the F16 GEMM reads it directly).</summary>
     F16,
-    /// <summary>Converted once at load to bfloat16 (round to nearest even; the BF16 GEMM reads it directly).</summary>
+    /// <summary>Converted once at load to bfloat16 (round to nearest even; the BF16 GEMM reads it directly). The default.</summary>
     BF16,
 }
 
@@ -98,11 +98,14 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
     /// <summary>Storage format of the patch and position embeddings in force.</summary>
     public VisionEmbedPrecision EmbedPrecision => _embedPrecision;
 
-    /// <summary>Reads <see cref="EmbedPrecisionEnvVar"/>; unset means F32. A malformed value is an error (a typo must not silently run the other arm).</summary>
+    /// <summary>The default storage of <c>patch_embd</c> / <c>position_embd</c>: BF16 (user ruling 2026-11-27, after the F32 / F16 / BF16 evaluation in docs/INKLING2.md); F32 and F16 are A/B arms.</summary>
+    public const VisionEmbedPrecision DefaultEmbedPrecision = VisionEmbedPrecision.BF16;
+
+    /// <summary>Reads <see cref="EmbedPrecisionEnvVar"/>; unset means <see cref="DefaultEmbedPrecision"/> (BF16). A malformed value is an error (a typo must not silently run the other arm).</summary>
     public static VisionEmbedPrecision EmbedPrecisionFromEnvironment(Func<string, string?>? env = null)
     {
         string? text = (env ?? Environment.GetEnvironmentVariable)(EmbedPrecisionEnvVar);
-        if (string.IsNullOrWhiteSpace(text)) return VisionEmbedPrecision.F32;
+        if (string.IsNullOrWhiteSpace(text)) return DefaultEmbedPrecision;
         return text.Trim().ToLowerInvariant() switch
         {
             "f32" => VisionEmbedPrecision.F32,
