@@ -26,7 +26,8 @@ The tray reads `https://api.github.com/repos/jamesburton/dotLLM/releases` by def
 `dev-version` needs `build`, `unit-tests` and `integration-tests` to be green, so an unretried flaky test used to mean no
 `v0.3.0-dev.N` release and no NuGet push for that SHA (7 of 75 dev pushes in two weeks). Policy (chosen 2026-11-27): **every
 `dotnet test` step in `ci.yml` (unit, chunk-cache client, the AVX-off and `DOTLLM_CPU_ISA` legs, and integration) runs through
-`scripts/ci/test-retry.py`, which retries failed tests once**, on PR runs as well as `dev` pushes.
+`scripts/ci/test-retry.py`, which retries failed tests once**, on PR runs as well as `dev` pushes. The one exception is the
+deterministic `.spv` freshness check, which greps its own `dotnet test` output and is not a flake candidate.
 
 - **Mechanism.** The test projects are xUnit v2 on VSTest, so there is no Microsoft.Testing.Platform retry extension. The script runs
   `dotnet test` with the TRX logger, parses the failed tests from the TRX, and reruns only those (`--no-build`, original `--filter`
@@ -38,10 +39,13 @@ The tray reads `https://api.github.com/repos/jamesburton/dotLLM/releases` by def
   a flake). One retry only; a test that fails twice fails the job, and `dev-version`'s `needs:` is unchanged.
 - **Visibility.** Each retry is logged with test names and the first-attempt failure message, raises a `::warning` annotation, and
   adds a section to the job summary headed "PASSED ON RETRY" (or "FAILED AFTER RETRY"). Names matching `scripts/ci/known-flakes.tsv`
-  link to their tracking issue (#1985, #2049, #2050, #2051, #1696, #1737); add a line there when a new flake is filed. The
-  link list never influences whether a test is retried.
+  link to their tracking issue (#1985, #2049, #2050, #2051, #1696, #1737); add a line there (one `Class\.Method` per row) when a
+  new flake is filed. On a host crash, which names no test, the patterns are matched against the crash output instead (#2050's
+  `CountdownEvent` underflow). The link list never influences whether a test is retried.
 - **Diagnostics (#2055).** Runs use `--blame-crash`; the TRX files of both attempts and any crash sequence/dump are uploaded as
-  the `test-results-unit` / `test-results-integration` artifact when the job fails.
+  the `test-results-unit` / `test-results-integration` artifact when the job fails **or a retry rescued it** (the script sets
+  `TEST_RETRIED`), so a flake's first-attempt evidence survives a green run. The unit job's limit is 60 min (about 27 normally) so a
+  hang plus a whole-project retry fits.
 - A green run with a "passed on retry" banner is a signal to fix or track the flake, not to ignore it.
 
 ## Verifying a download

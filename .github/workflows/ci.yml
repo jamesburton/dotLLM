@@ -64,7 +64,8 @@ jobs:
     name: Unit Tests
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # ~27 min normally; 60 leaves room for a hang (5 min blame-hang) plus a whole-project retry (#2052).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -150,9 +151,10 @@ jobs:
           done
           exit $fail
 
-      # TRX results of both attempts plus --blame-crash sequences/dumps (#2052, #2055).
+      # TRX results of both attempts plus --blame-crash sequences/dumps (#2052, #2055). Also uploaded when a retry rescued
+      # the job (test-retry.py sets TEST_RETRIED), so a flake's first-attempt TRX and a crash dump are not lost on a green run.
       - name: Upload test results
-        if: failure() || cancelled()
+        if: failure() || cancelled() || env.TEST_RETRIED == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: test-results-unit
@@ -267,9 +269,10 @@ jobs:
           path: ~/.dotllm/test-cache
           key: dotllm-test-models-${{ steps.fixtures.outputs.hash }}-${{ steps.inventory.outputs.present }}
 
-      # TRX results of both attempts plus --blame-crash sequences/dumps (#2052, #2055).
+      # TRX results of both attempts plus --blame-crash sequences/dumps (#2052, #2055). Also uploaded when a retry rescued
+      # the job (test-retry.py sets TEST_RETRIED), so a flake's first-attempt TRX and a crash dump are not lost on a green run.
       - name: Upload test results
-        if: failure() || cancelled()
+        if: failure() || cancelled() || env.TEST_RETRIED == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: test-results-integration

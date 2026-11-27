@@ -137,6 +137,11 @@ def main():
     if "--no-build" not in retry_cmd:
         retry_cmd.append("--no-build")  # attempt 1 built it; a build is never retried
 
+    gh_env = os.environ.get("GITHUB_ENV")
+    if gh_env:  # keeps the TRX/blame artifact when a retry rescues the job (the upload step checks it)
+        with open(gh_env, "a", encoding="utf-8") as fh:
+            fh.write("TEST_RETRIED=true\n")
+
     md = [f"### Test retry: `{a.label}`", "", f"Attempt 1 failed ({reason}); retrying once: {mode}.", ""]
     print(f"::warning title=Test retry ({a.label})::attempt 1 failed ({reason}); retrying once: {mode}")
     for k in failed:
@@ -145,6 +150,13 @@ def main():
         md.append(f"- `{k}` - {flake_link(k, flakes)}\n  <details><summary>first-attempt failure</summary>\n\n  ```\n  {trunc(first)}\n  ```\n  </details>")
     if not failed:
         md.append("- no individual test names available (host crash); see the blame/crash artifact")
+    if crashed or res1 is None:
+        # A host crash names no test, so match the known-flake patterns against the crash output instead (e.g. #2050).
+        for rx, issue, label in flakes:
+            if rx.search(out1):
+                link = f"[#{issue}](https://github.com/jamesburton/dotLLM/issues/{issue}) ({label})"
+                print(f"  attempt-1 output matches known flake {link}")
+                md.append(f"- attempt-1 output matches {link}")
 
     rc2, _ = run(with_logging(retry_cmd, d2, f"{a.label}-attempt2.trx"), f"{a.label} retry")
     res2 = parse_trx(d2) or {}

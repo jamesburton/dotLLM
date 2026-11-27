@@ -1,8 +1,12 @@
-# regex (matched against the test's fully qualified name)<TAB>issue number<TAB>short label
+# regex (matched against the test's ClassName.Method key; on a host crash, against the crash output)<TAB>issue number<TAB>short label
 # Used only to LINK a retried test to its tracking issue in the CI job summary (#2052). It never decides whether to retry.
-Edge0	1985	Edge0 steady-state allocation
-ComputeThreadPool	2050	ComputeThreadPool CountdownEvent underflow (host crash)
-SolutionScanner.*Cancel	2049	SolutionScanner cancellation
-SolutionScanner.*Timeout	1737	SolutionScanner option timeout
-PullManager|QuietPeriod|ChunkCacheMcp|StalledClient	2051	timing flakes
-PriorityConcurrencyGate	1696	PriorityConcurrencyGate FIFO
+# Keep each pattern to one Class\.Method: a bare class or prefix links unrelated failures to the wrong issue.
+Edge0LatentMoeAllocationTests\.Forward_SteadyState_AllocatesNothing_OnTheCallingThread	1985	Edge0 steady-state allocation
+CountdownEvent.*below zero|ComputeThreadPool\.WorkerLoop	2050	ComputeThreadPool CountdownEvent underflow (host crash)
+SolutionScannerHardeningTests\.Scan_CancelledWhileASourceGeneratorRuns_ReturnsAtOnce	2049	SolutionScanner cancellation
+SolutionScannerHardeningTests\.Scan_OptionTimeout_EndsAHungDesignTimeBuildWithATimeoutException	1737	SolutionScanner option timeout
+ModelPullHubCacheTests\.PullManager_RunsJobToCompletion_AndReportsProgress	2051	PullManager timing flake
+ChunkStoreHardeningTests\.QuietPeriod_ShortIdleGaps_NoEncode	2051	QuietPeriod timing flake
+ChunkCacheMcpTests\.Build_DefaultIsIndexOnly	2051	ChunkCacheMcp no-active-test flake
+ContinuousBatchSchedulerServiceTests\.SchedulerStream_CompletionsEndpoint_StalledClient_DoesNotBlockBatchedRequests	2051	StalledClient scheduler timing flake
+PriorityConcurrencyGateTests\.Acquire_SamePriority_PreservesFifoOrder	1696	PriorityConcurrencyGate FIFO
