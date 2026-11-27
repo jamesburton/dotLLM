@@ -126,7 +126,7 @@ neither a KL below ~4e-3 nor free-running greedy identity is a meaningful bar ag
 
 ## 9. Not in this slice
 
-- **Vision**: implemented on the CPU in issue #2035, see section 12 (Vulkan vision is a later slice).
+- **Vision**: implemented on the CPU in issue #2035 (section 12); the Vulkan text model accepts image embeddings since #2062 (section 12a; the Vulkan ViT encoder is the second half of #2062).
   images enter the text stream as `<|content_image|><|unused_200054|>` placeholders whose embeddings are injected *without* `token_embd_norm` (llama.cpp: "do not normalize raw embeddings input"). The loader must accept an embedding-input forward.
 - **DSpark drafter**: implemented on the CPU in issue #2039, see sections 13-15 (the Vulkan drafter is #2046). `dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`: 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
   `target_layer_ids = [5, 23, 41, 48]` counted in **layer visits** (the target exposes the input of visit `n` and the final norm output as id 48: `res->t_layer_inp[visit]` in `inkling2-loop.cpp`). The CPU model keeps the trace hook points
@@ -337,6 +337,46 @@ embeddings not injected 1.38, BGR 0.37, RoPE axes swapped 0.95, merge order 0.06
 **Known gate limits (survivors).** The reference's pad quirk (-1.0 raw vs 0.0 raw, a 0.0078 difference on pad pixels) and the F16 im2col rounding are below the 2% noise floor at the embedding level and are
 not separately gated (the early checkpoints pin the F16 rounding: patch_embd matches to 5e-5). Over-limit images (> 4096 tokens, downscale policy) use a port of the reference resize gated against Pillow, not against an llama.cpp encode of such an image. The position-embedding mutants are only
 2-3x the end-to-end noise floor (sharp at the checkpoint gate).
+
+## 12a. Vision on Vulkan, part A: the Vulkan text model takes image embeddings (issue #2062)
+
+`VulkanInkling2TransformerModel` implements `IImageInputModel` (the CPU `Inkling2VisionEncoder` still produces the F16 `ImageEmbeddings`; the Vulkan ViT is part B).
+Per prefill chunk the model gathers the F16 rows of the chunk's image positions into a compact host staging buffer, uploads it with a per-token selector (`0xFFFFFFFF` = token row), and after
+`inkling2_embed` runs one more dispatch, `inkling2_embed_rows` (`native/vulkan/shaders/inkling2_embed_rows.glsl`): selected tokens' rows are overwritten with the F16 row rounded once to the BF16 activation
+type, so image rows bypass `token_embd_norm` exactly like the CPU. A chunk with no image position runs the unchanged text path (no extra dispatch); decode never carries images. Spans are in absolute positions, so
+chunked prefill passes the same list for every chunk. LoRA with images stays refused by the engine, CLI and server; the engine does not run MTP/DSpark for an image request.
+
+**Byte costs** (allocated on the first image prefill only): `_imgRows` `chunk x 2304 x 2` = 589,824 B and `_imgSel` 512 B of host-visible device memory (chunk 128), plus the same rows as reused host staging
+(one `ushort[chunk x 2304]`, 590 KB, allocated once). No F32 is stored: the F16 payload is copied, never widened on the host. The image embeddings themselves stay the encoder's F16 (`tokens x 2304 x 2`).
+
+**Gates** (`Inkling2VulkanVisionTests`, CPU encoder with the BF16 default + Vulkan text model, vs the same llama.cpp b12780 oracles, `Inkling2VulkanOptions` defaults: BF16 activations, F16 KV). Teacher-forced mean KL of the text logits, 13 rows per image:
+
+| image | Vulkan (32-token calls = one pass) | max KL | top-1 | greedy mismatches | CPU reference (section 12) |
+|---|---|---|---|---|---|
+| 80 | 4.85e-3 | 1.46e-2 | 13/13 | 0 | 3.40e-3 |
+| 190x110 | 6.62e-3 | 2.22e-2 | 13/13 | 0 | 2.59e-3 |
+| 640 | 5.41e-3 | 2.56e-2 | 13/13 | 0 | 2.58e-3 |
+
+All under the 0.015 gate. The Vulkan numbers sit above the CPU's by 1.4e-3 to 4e-3. Decomposition (review of #2063, same oracles, mean KL x1e-3; "CPU, BF16 rows" feeds the CPU model
+the encoder rows pre-rounded to BF16, "Vulkan F32 act" is the `_f32act` storage arm):
+
+| image | CPU (F16 rows) | CPU, BF16 rows | Vulkan F32 act | Vulkan BF16 (shipped) |
+|---|---|---|---|---|
+| 80 | 3.40 | 8.24 | 2.72 | 4.85 |
+| 190x110 | 2.59 | 3.39 | 3.84 | 6.62 |
+| 640 | 2.58 | 2.30 | 3.49 | 5.41 |
+
+The F32-activation arm, whose `embed` trace equals the CPU's bit for bit at the image rows, is within -0.7e-3..+1.3e-3 of the CPU, so the injection and addressing add no error.
+The gap is the BF16 activation storage: it costs image prompts +1.9e-3 to +2.8e-3 over the F32 arm, against +0.5e-3 on the text passage gate (3.12e-3 vs 3.61e-3). Rounding only the
+image rows to BF16 moves the CPU's KL by -0.3e-3 to +4.8e-3, so a single input rounding already swings this 13-row measurement by a few e-3. The F16 encoder output is shared with the CPU, so the
+F16 -> BF16 double rounding is not a Vulkan-only cost. A wider residual for image prompts would need the precision-rule sign-off (CLAUDE.md rule 1).
+Single-pass prefill equals the 32-token run to the printed digits (the 80 image fits one 128-token chunk; 640 spans three).
+Chunk-size invariance: image-prompt logits KL vs the 32-token run is exactly 0 at chunks 4, 5 and 7 (gate < 1e-5), and the `embed` trace is bit-identical across chunkings with image positions equal to BF16(F16 row)
+(`ChunkedPrefill_ImageRows_AreAddressedByAbsolutePosition`). Prefill of the image prompt (Vulkan, excluding the CPU encode): 32 tokens 0.36 s, 43 tokens 0.52 s, 284 tokens 2.89 s (warm-up included, single run, not a benchmark).
+
+**Mutants** (committed first; mutated copies of the shader loaded through `DOTLLM_INKLING2_SPV_OVERRIDE`, tracked `.spv` untouched), each run against the op-level test `EmbedRows_OverwritesSelectedTokens` (both arms)
+and the model-level addressing test on the 80 image at chunk 5: row index = token index (not the selector), F16 halves swapped, sentinel ignored (every token overwritten), no-op shader, row stride off by 2.
+5 of 5 killed at both levels.
 
 ## 13. DSpark drafter (issue #2039)
 
