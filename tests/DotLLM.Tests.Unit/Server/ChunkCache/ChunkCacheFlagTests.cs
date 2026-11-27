@@ -128,8 +128,8 @@ public sealed class ChunkCacheOptionsTests
 
 /// <summary>
 /// Flag off: an annotated body behaves byte for byte like the same body without annotations, over real HTTP, for
-/// valid, defective, strict and malformed annotations alike. OpenAI array content stays the binding 400 with the flag
-/// on and off (ruling 19). Same harness as <see cref="ServerPinHttpTests"/>: a 1-token context makes every chat request
+/// valid, defective, strict and malformed annotations alike. OpenAI array content binds with the flag
+/// on and off (ruling 19, which kept it a 400, was superseded 2026-11-27, #2035). Same harness as <see cref="ServerPinHttpTests"/>: a 1-token context makes every chat request
 /// that reaches the handler stop at the prompt-length 400, whose body carries the prompt's token count.
 /// </summary>
 public sealed class ChunkCacheFlagHttpTests : IAsyncLifetime

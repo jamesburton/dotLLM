@@ -187,4 +187,22 @@ public sealed class Inkling2VisionUntrustedInputTests
         var ex = Assert.Throws<ImageInputException>(() => ImageInput.CheckTokenBudget(new FixedEncoder(100), imgs, 197));
         Assert.Equal("context_length_exceeded", ex.Code);
     }
+    /// <summary>
+    /// The limits are operator-configurable up to <c>int.MaxValue</c> per side and <c>long.MaxValue</c> pixels (#2035). Under such raised limits the
+    /// size arithmetic of a hostile header must not wrap: <c>(stride + 1) * h</c> for a 2^31 - 1 square RGBA16 PNG is about 3.7e19, past
+    /// <c>long.MaxValue</c>, and <c>w * h * 3</c> (1.4e19) wraps negative, which slipped past the <c>Array.MaxLength</c> guard before the review fix.
+    /// Only <see cref="InvalidDataException"/> is allowed (the decoder's contract), never an overflow or index exception.
+    /// </summary>
+    [Theory]
+    [InlineData(int.MaxValue, int.MaxValue, 16, 6)]
+    [InlineData(int.MaxValue, int.MaxValue, 8, 2)]
+    [InlineData(2_000_000_000, 1_900_000_000, 16, 6)]
+    public void RaisedLimits_HugeDeclaredSize_IsRefusedWithoutOverflow(int w, int h, int depth, int ctype)
+    {
+        var limits = new ImageLimits { MaxSidePerImage = int.MaxValue, MaxPixelsPerImage = long.MaxValue, MaxDecodedPixelsPerRequest = long.MaxValue };
+        byte[] png = Png(w, h, depth, ctype, new byte[64]);
+        Assert.Throws<InvalidDataException>(() => ImageDecoder.Decode(png, limits));
+        var ppm = System.Text.Encoding.ASCII.GetBytes($"P6\n{w} {h}\n255\n").Concat(new byte[64]).ToArray();
+        Assert.Throws<InvalidDataException>(() => ImageDecoder.Decode(ppm, limits));
+    }
 }

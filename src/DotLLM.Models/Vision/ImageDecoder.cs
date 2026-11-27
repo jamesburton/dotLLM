@@ -83,7 +83,8 @@ public static class ImageDecoder
         pos++;   // single whitespace after the header
         if (max != 255) throw new NotSupportedException("only 8-bit PPM is supported");
         CheckDimensions(w, h, limits);
-        if ((long)w * h * 3 > Array.MaxLength) throw new InvalidDataException($"image too large for the decoder: {w}x{h}");
+        // w, h <= int.MaxValue so w * h cannot wrap, but w * h * 3 can under raised limits: divide instead of multiplying.
+        if ((long)w * h > Array.MaxLength / 3) throw new InvalidDataException($"image too large for the decoder: {w}x{h}");
         long need = (long)w * h * 3;
         if (d.Length - pos < need) throw new InvalidDataException("truncated PPM");
         return new DecodedImage(w, h, d.AsSpan(pos, (int)need).ToArray());
@@ -141,11 +142,13 @@ public static class ImageDecoder
         int channels = ctype switch { 0 => 1, 2 => 3, 3 => 1, 4 => 2, _ => 4 };
         int bitsPerPixel = channels * depth;
         int bpp = Math.Max(1, bitsPerPixel / 8);
-        long stride = ((long)w * bitsPerPixel + 7) / 8;   // <= 8 * the side limit: fits an int for any side below 2^28
-        // Bounded by CheckDimensions: (stride + 1) * h <= 8 * the pixel limit + the side limit, and rgb = 3 * the pixel limit bytes at most.
+        // A raised pixel limit must not reach managed array limits: refuse instead of overflowing. Checked BEFORE any product that can wrap: the limits
+        // allow sides up to int.MaxValue, so w * h (< 2^62) is exact but w * h * 3 and (stride + 1) * h are not (review of #2037).
+        if ((long)w * h > Array.MaxLength / 3) throw new InvalidDataException($"image too large for the decoder: {w}x{h}");
+        long stride = ((long)w * bitsPerPixel + 7) / 8;   // <= 8 * w + 1
+        // Now w * h < 2^30, so (stride + 1) * h <= 8 * w * h + 2 * h cannot wrap; rgb = 3 * w * h bytes fits an array.
         long rawBytes = (stride + 1) * h;
-        // A raised pixel limit must not reach managed array limits: refuse instead of overflowing an int index later.
-        if (rawBytes > Array.MaxLength || (long)w * h * 3 > Array.MaxLength) throw new InvalidDataException($"image too large for the decoder: {w}x{h}");
+        if (rawBytes > Array.MaxLength) throw new InvalidDataException($"image too large for the decoder: {w}x{h}");
         // Deflate cannot expand by more than ~1032:1, so a stream far shorter than that cannot hold the declared image: refuse it before the
         // buffer is allocated (a header-only "bomb" would otherwise cost the full declared size per request).
         if (rawBytes > idat.Length * 1032L + 1024) throw new InvalidDataException("truncated PNG image data");

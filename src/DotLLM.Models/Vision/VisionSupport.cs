@@ -26,7 +26,7 @@ public static class VisionSupport
     /// <param name="mmprojPath">The projector GGUF.</param>
     /// <param name="threading">Thread configuration.</param>
     /// <param name="overLimit">What happens to an image over the token limit (default: refuse).</param>
-    /// <param name="embedPrecision">Storage format of the patch / position embeddings; null reads <c>DOTLLM_VISION_EMBD_PRECISION</c> (default F32).</param>
+    /// <param name="embedPrecision">Storage format of the patch / position embeddings; null reads <c>DOTLLM_VISION_EMBD_PRECISION</c> (default BF16, <see cref="Inkling2VisionEncoder.DefaultEmbedPrecision"/>).</param>
     public static IImageEncoder LoadEncoder(string mmprojPath, ThreadingConfig threading,
         ImageOverLimit overLimit = ImageOverLimit.Refuse, VisionEmbedPrecision? embedPrecision = null)
     {
