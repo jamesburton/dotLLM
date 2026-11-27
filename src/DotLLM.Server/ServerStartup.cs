@@ -1041,6 +1041,7 @@ public static class ServerStartup
             TryAttachSeparateMtpHead(model, resolvedPath, options);
         int mtpK = options.SpeculativeCandidates == TextGenerator.DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0
             ? model.MtpPreferredDraftTokens : options.SpeculativeCandidates;
+        mtpK = Math.Min(mtpK, model.MtpMaxDraftTokens);
         var mtpDecision = DecideMtp(options, model.SupportsMtp, draftModel is not null, concurrencyOverMtp, schedulerAvailable, mtpK);
         bool mtpActive = mtpDecision.Active;
         if (mtpDecision.Message is { } mtpMsg)

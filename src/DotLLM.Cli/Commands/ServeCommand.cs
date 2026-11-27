@@ -228,7 +228,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         /// <summary>Inkling 2 DSpark drafter GGUF (issue #2039).</summary>
         [CommandOption("--dspark")]
         [Description("Path of the Inkling 2 DSpark drafter GGUF (dspark-Inkling-2-Mini-Q8_0.gguf). It takes the MTP slot behind the adaptive gate. Default: a dspark-*.gguf beside the model is auto-attached " +
-                     "(DOTLLM_DSPARK=0 opts out); an explicit path that cannot be attached refuses to start, an auto-detected one is logged and ignored.")]
+                     "(an environment switch opts it out, see the environment table); an explicit path that cannot be attached refuses to start, an auto-detected one is logged and ignored.")]
         public string? DSpark { get; set; }
 
         /// <summary>DFlash / DFlash2 drafter GGUF (issue #1175).</summary>

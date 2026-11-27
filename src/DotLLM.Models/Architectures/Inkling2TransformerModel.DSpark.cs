@@ -48,6 +48,9 @@ public sealed unsafe partial class Inkling2TransformerModel : IDFlashDraftAttach
     public int MtpPreferredDraftTokens => _dspark?.DraftTokensPerRound ?? 0;
 
     /// <inheritdoc/>
+    public int MtpMaxDraftTokens => _dspark?.DraftTokensPerRound ?? int.MaxValue;
+
+    /// <inheritdoc/>
     public IMtpState? CreateMtpState() => _dspark is null ? null : CreateDSparkState();
 
     /// <inheritdoc/>

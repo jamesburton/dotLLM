@@ -33,6 +33,9 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IDFlashDra
     public int MtpPreferredDraftTokens => _dflash is null ? 0 : _dflash.DraftTokensPerRound;
 
     /// <inheritdoc/>
+    public int MtpMaxDraftTokens => _dflash is null ? int.MaxValue : _dflash.DraftTokensPerRound;
+
+    /// <inheritdoc/>
     public bool SupportsMtpArgMax => _dflash is not null;
 
     /// <inheritdoc/>

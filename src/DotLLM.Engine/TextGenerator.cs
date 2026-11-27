@@ -290,6 +290,11 @@ public sealed partial class TextGenerator
         _speculativeCandidates = speculativeCandidates;
         _mtpCandidates = speculativeCandidates == DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0
             ? Math.Min(model.MtpPreferredDraftTokens, MtpCostModel.MaxK) : speculativeCandidates;
+        if (model.SupportsMtp && _mtpCandidates > model.MtpMaxDraftTokens)
+        {
+            Console.Error.WriteLine($"[mtp] K={_mtpCandidates} exceeds the {model.MtpMaxDraftTokens} drafts this model's drafter produces per round; using K={model.MtpMaxDraftTokens}.");
+            _mtpCandidates = model.MtpMaxDraftTokens;
+        }
         _mtpEnabled = mtpEnabled;
         _hybridStrategy = hybridStrategy;
         _prefillChunkSize = prefillChunkSize;

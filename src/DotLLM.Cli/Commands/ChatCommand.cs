@@ -318,7 +318,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [CommandOption("--dspark")]
         [Description("Path of the Inkling 2 DSpark drafter GGUF (dspark-Inkling-2-Mini-Q8_0.gguf, unsloth/Inkling-2-Mini-GGUF). It takes the MTP slot: drafts are verified by the " +
                      "MTP speculative decoder behind the adaptive gate, greedy output is identical to plain decode. Default: a dspark-*.gguf beside the model is auto-attached " +
-                     "(DOTLLM_DSPARK=0 opts out); an explicit path that cannot be attached stops the run, an auto-detected one is logged and ignored. inkling2 models on the CPU.")]
+                     "(an environment switch opts it out, see the environment table); an explicit path that cannot be attached stops the run, an auto-detected one is logged and ignored. inkling2 models on the CPU.")]
         public string? DSpark { get; set; }
 
         /// <summary>DFlash / DFlash2 block-diffusion drafter GGUF (issue #1175).</summary>

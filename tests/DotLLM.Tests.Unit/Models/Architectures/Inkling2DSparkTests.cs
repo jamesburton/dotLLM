@@ -107,13 +107,13 @@ public sealed class Inkling2DSparkTests : IClassFixture<DSparkFixture>
         public double AcceptRate => Drafted == 0 ? 0 : (double)(Emitted - Rounds) / Drafted;
     }
 
-    private (int[] Tokens, SpecStats Stats) Spec(Inkling2TransformerModel m, int[] prompt, int n, int k, bool rowSnapshots = true)
+    private (int[] Tokens, SpecStats Stats) Spec(Inkling2TransformerModel m, int[] prompt, int n, int k, bool rowSnapshots = true, bool applyCap = true)
     {
         int V = m.Config.VocabSize;
         m.ResetSequenceState();
         using var mtp = m.CreateMtpState()!;
         using var kv = new SimpleKvCache(1, 1, 1, prompt.Length + n + 32);
-        var decoder = new MtpSpeculativeDecoder(greedy: true) { UseRecurrentRowSnapshots = rowSnapshots };
+        var decoder = new MtpSpeculativeDecoder(greedy: true) { UseRecurrentRowSnapshots = rowSnapshots, ApplyDraftCap = applyCap };
         var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
         var gen = new List<int>();
         using (var pre = m.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, kv, null, mtp, true))
@@ -151,6 +151,24 @@ public sealed class Inkling2DSparkTests : IClassFixture<DSparkFixture>
         }
         _out.WriteLine($"TOTAL K=3: rounds {rounds}, tokens/round {(double)emitted / rounds:F2}, acceptance {(double)(emitted - rounds) / Math.Max(1, drafted):P1}");
         Assert.True(bad.Count == 0, string.Join("; ", bad));
+    }
+
+    /// <summary>
+    /// A K above the drafter's width (<c>--draft-tokens 5</c> against the default 3 drafts per round) used to throw "DSpark draft step ... has no block" (#2039 review):
+    /// it is now capped at <see cref="IModel.MtpMaxDraftTokens"/> and the output stays identical to plain greedy; with the cap removed (mutant) the round throws.
+    /// </summary>
+    [SkippableFact]
+    public void KAboveTheDrafterWidth_IsCapped_IdenticalToPlain_AndWithoutTheCapFails()
+    {
+        var m = Model();
+        var (_, prompt, _) = GreedyPrompts().First(x => x.Name == "code");
+        const int n = 24;
+        Assert.Equal(3, m.MtpMaxDraftTokens);
+        var plain = Plain(m, prompt, n);
+        var (spec, st) = Spec(m, prompt, n, k: 5);
+        _out.WriteLine($"K=5 capped to {m.MtpMaxDraftTokens}: rounds {st.Rounds}, tokens/round {st.TokensPerRound:F2}, acceptance {st.AcceptRate:P0}");
+        Assert.Equal(plain, spec);
+        Assert.Throws<InvalidOperationException>(() => Spec(m, prompt, n, k: 5, applyCap: false));
     }
 
     [SkippableFact]
@@ -290,7 +308,7 @@ public sealed class Inkling2DSparkTests : IClassFixture<DSparkFixture>
         Assert.True(a0 > 0.10, "baseline drafts agree with the target's continuation on almost nothing");
 
         var results = new List<string>();
-        foreach (var mutant in new[] { Inkling2Mutant.TapBySlot, Inkling2Mutant.TapOffByOne, Inkling2Mutant.TapPreNorm })
+        foreach (var mutant in new[] { Inkling2Mutant.TapBySlot, Inkling2Mutant.TapEarlyPrelude, Inkling2Mutant.TapLate, Inkling2Mutant.TapPreNorm })
         {
             m.Mutant = mutant;
             try

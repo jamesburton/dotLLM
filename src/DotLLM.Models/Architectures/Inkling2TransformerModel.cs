@@ -67,8 +67,10 @@ internal enum Inkling2Mutant
     None, TwoPasses, NoFinalSoftcap, NoSink, NoRelativeBias, NoLogScale, NoExpertScale, NoControl,
     /// <summary>DSpark taps keyed by cache slot instead of layer visit (#2039).</summary>
     TapBySlot,
-    /// <summary>DSpark taps one visit late (the layer OUTPUT instead of its input).</summary>
-    TapOffByOne,
+    /// <summary>DSpark taps one visit EARLY in the prelude only (tap id v receives the input of visit v - 1).</summary>
+    TapEarlyPrelude,
+    /// <summary>DSpark taps one visit LATE in every loop (tap id v receives the input of visit v + 1, i.e. the output of layer v).</summary>
+    TapLate,
     /// <summary>Visit 48 tapped before the output norm.</summary>
     TapPreNorm,
     /// <summary>A rejected speculative round leaves the recurrent state advanced (RestoreRecurrentStateToRow is a no-op).</summary>
@@ -464,7 +466,7 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
         int start = _c.LoopStart, end = _c.LoopEnd;
         int coreStart = _c.LoopPasses > 1 ? start : _nPhys;
 
-        for (int il = 0; il < coreStart; il++) { tap?.Capture(Mutant == Inkling2Mutant.TapOffByOne ? visit + 1 : visit, cur, T); visit++; cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
+        for (int il = 0; il < coreStart; il++) { tap?.Capture(Mutant == Inkling2Mutant.TapEarlyPrelude ? visit + 1 : Mutant == Inkling2Mutant.TapLate ? visit - 1 : visit, cur, T); visit++; cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
 
         if (_c.LoopPasses > 1)
         {
@@ -504,12 +506,12 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
                             messages = DepthMix(sc, sc.Bank, bankOut, q, 4, T, sc.Msg);
                         }
                     }
-                    tap?.Capture(Mutant == Inkling2Mutant.TapBySlot ? slot : visit, cur, T); visit++;
+                    tap?.Capture(Mutant == Inkling2Mutant.TapBySlot ? slot : Mutant == Inkling2Mutant.TapLate ? visit - 1 : visit, cur, T); visit++;
                     cur = ForwardLayer(slot, ip, cur, sc, messages, loop, T, pos0, st);
                     Trace?.Invoke($"pass{pass}.l{ip}", cur, T, H);
                 }
             }
-            for (int il = end; il < _nPhys; il++) { tap?.Capture(visit++, cur, T); cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
+            for (int il = end; il < _nPhys; il++) { tap?.Capture(Mutant == Inkling2Mutant.TapLate ? visit - 1 : visit, cur, T); visit++; cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
         }
 
         // Output: depth mix with output_res_query, gain-ed RMS norm, LM head (unpadded rows only), final logit softcap.
