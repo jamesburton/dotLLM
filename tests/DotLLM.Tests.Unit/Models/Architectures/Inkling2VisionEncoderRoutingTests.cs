@@ -23,6 +23,12 @@ public sealed class Inkling2VisionEncoderRoutingTests
         public IImageEncoder CreateImageEncoder(string mmprojPath, ImageOverLimit overLimit) { Path = mmprojPath; return new StubEncoder(); }
     }
 
+    private sealed class DecliningProviderModel : IImageEncoderProvider
+    {
+        public bool Asked;
+        public IImageEncoder CreateImageEncoder(string mmprojPath, ImageOverLimit overLimit) { Asked = true; throw new NotSupportedException("declined (test)"); }
+    }
+
     private static T WithDevice<T>(string? value, Func<T> body)
     {
         string? old = Environment.GetEnvironmentVariable(VisionSupport.DeviceEnvVar);
@@ -47,6 +53,16 @@ public sealed class Inkling2VisionEncoderRoutingTests
         // The CPU path opens the file: a missing one is the evidence that the provider was NOT asked.
         Assert.ThrowsAny<IOException>(() => WithDevice<IImageEncoder>("cpu", () => VisionSupport.LoadEncoderFor(model, "does-not-exist-mmproj.gguf", new ThreadingConfig(1))));
         Assert.Null(model.Path);
+    }
+
+    [Fact]
+    public void ProviderThatDeclines_FallsBackToTheCpuEncoder()
+    {
+        // A device encoder that refuses the mmproj or the device (NotSupportedException: e.g. a non-Q8_0 mmproj on the Vulkan ViT) must not cost the model its image input:
+        // the CPU encoder is tried next (it opens the file: the missing one is the evidence), instead of the provider's NotSupportedException reaching the caller.
+        var model = new DecliningProviderModel();
+        Assert.ThrowsAny<IOException>(() => WithDevice<IImageEncoder>(null, () => VisionSupport.LoadEncoderFor(model, "does-not-exist-mmproj.gguf", new ThreadingConfig(1))));
+        Assert.True(model.Asked);
     }
 
     [Fact]

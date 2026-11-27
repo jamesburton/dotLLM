@@ -31,7 +31,13 @@ public static class VisionSupport
     public static IImageEncoder LoadEncoderFor(object? model, string mmprojPath, ThreadingConfig threading, ImageOverLimit overLimit = ImageOverLimit.Refuse)
     {
         bool cpu = string.Equals(Environment.GetEnvironmentVariable(DeviceEnvVar)?.Trim(), "cpu", StringComparison.OrdinalIgnoreCase);
-        if (!cpu && model is IImageEncoderProvider provider) return provider.CreateImageEncoder(mmprojPath, overLimit);
+        if (!cpu && model is IImageEncoderProvider provider)
+        {
+            // A device encoder covers a narrower contract than the CPU one (the Vulkan ViT reads Q8_0 matrices only and needs subgroup arithmetic / 16-bit storage);
+            // an mmproj or device it declines still gets the CPU encoder, as before the device encoder existed, rather than losing image input.
+            try { return provider.CreateImageEncoder(mmprojPath, overLimit); }
+            catch (NotSupportedException ex) { Console.Error.WriteLine($"[vision] device encoder declined ({ex.Message}); using the CPU encoder."); }
+        }
         return LoadEncoder(mmprojPath, threading, overLimit);
     }
 

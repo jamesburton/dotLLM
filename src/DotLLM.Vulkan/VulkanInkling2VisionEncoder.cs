@@ -84,7 +84,11 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
 
     /// <summary>Opens <paramref name="mmprojPath"/> and loads the encoder onto <paramref name="device"/>.</summary>
     public static VulkanInkling2VisionEncoder Load(VulkanDevice device, string mmprojPath, string spvDir, ImageOverLimit overLimit = ImageOverLimit.Refuse, VisionEmbedPrecision? embedPrecision = null)
-        => Load(device, GgufFile.Open(mmprojPath), spvDir, ownsGguf: true, overLimit, embedPrecision);
+    {
+        var gguf = GgufFile.Open(mmprojPath);
+        try { return Load(device, gguf, spvDir, ownsGguf: true, overLimit, embedPrecision); }
+        catch { gguf.Dispose(); throw; }   // a refused mmproj / device must not leak the mapping (the caller may fall back to the CPU encoder)
+    }
 
     /// <summary>Loads from an opened mmproj GGUF (which must outlive the encoder: Q8_0 weights are imported in place).</summary>
     public static VulkanInkling2VisionEncoder Load(VulkanDevice device, GgufFile gguf, string spvDir, bool ownsGguf = false, ImageOverLimit overLimit = ImageOverLimit.Refuse, VisionEmbedPrecision? embedPrecision = null)
@@ -118,75 +122,86 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
 
         _dummy = Own(device.AllocateDeviceLocal(256));
         _submit = device.CreateSubmitContext();
-        using var staging = VulkanStagingBuffer.Create(device, 64L * 1024 * 1024);
+        try
+        {
+            using var staging = VulkanStagingBuffer.Create(device, 64L * 1024 * 1024);
 
-        VulkanDevice.Buffer F32(string n)
-        {
-            if (!t.TryGetValue(n, out var d)) throw new InvalidDataException($"mmproj tensor {n} missing");
-            if (d.QuantizationType != QuantizationType.F32) throw new InvalidDataException($"{n} is {d.QuantizationType}; the vision contract keeps it F32");
-            long cnt = 1; for (int i = 0; i < d.Shape.Rank; i++) cnt *= d.Shape[i];
-            var b = VulkanQwen3MoeHybridWeights.UploadRawQuantMatrix(device, staging, gguf.TensorDataPointer(d), QuantizationType.F32, 1, checked((int)cnt), out long up);
-            _weightBytes += up;
-            return Own(b);
-        }
-        Mat M(string n)
-        {
-            if (!t.TryGetValue(n, out var d)) throw new InvalidDataException($"mmproj tensor {n} missing");
-            if (d.QuantizationType != QuantizationType.Q8_0)
-                throw new NotSupportedException($"{n} is {d.QuantizationType}; the Vulkan vision tower reads Q8_0 matrices in place and refuses to widen anything else (CLAUDE.md precision rule 2).");
-            int inDim = (int)d.Shape[0], outDim = (int)d.Shape[1];
-            if (inDim % 32 != 0) throw new NotSupportedException($"{n}: K = {inDim} is not a multiple of 32");
-            var b = VulkanQwen3MoeHybridWeights.UploadRawQuantMatrix(device, staging, gguf.TensorDataPointer(d), QuantizationType.Q8_0, outDim, inDim, out long up);
-            _weightBytes += up;
-            return new Mat { Buf = Own(b), In = inDim, Out = outDim };
-        }
-        // patch_embd / position_embd: F32 in the file; F16 / BF16 are converted once through a transient native buffer (the only copy), F32 is read in place.
-        VulkanDevice.Buffer Embed(string n)
-        {
-            var d = t[n];
-            if (d.QuantizationType != QuantizationType.F32) throw new InvalidDataException($"{n} is {d.QuantizationType}; the vision contract keeps it F32");
-            long cnt = 1; for (int i = 0; i < d.Shape.Rank; i++) cnt *= d.Shape[i];
-            if (embedPrecision == VisionEmbedPrecision.F32)
+            VulkanDevice.Buffer F32(string n)
             {
+                if (!t.TryGetValue(n, out var d)) throw new InvalidDataException($"mmproj tensor {n} missing");
+                if (d.QuantizationType != QuantizationType.F32) throw new InvalidDataException($"{n} is {d.QuantizationType}; the vision contract keeps it F32");
+                long cnt = 1; for (int i = 0; i < d.Shape.Rank; i++) cnt *= d.Shape[i];
                 var b = VulkanQwen3MoeHybridWeights.UploadRawQuantMatrix(device, staging, gguf.TensorDataPointer(d), QuantizationType.F32, 1, checked((int)cnt), out long up);
-                _weightBytes += up; EmbedBytes += up;
+                _weightBytes += up;
                 return Own(b);
             }
-            long nb = cnt * 2;
-            nint tmp = (nint)NativeMemory.AlignedAlloc((nuint)nb, 64);
-            try
+            Mat M(string n)
             {
-                var src = new ReadOnlySpan<float>((void*)gguf.TensorDataPointer(d), checked((int)cnt));
-                var dst = new Span<ushort>((void*)tmp, checked((int)cnt));
-                if (embedPrecision == VisionEmbedPrecision.F16) for (int i = 0; i < dst.Length; i++) dst[i] = BitConverter.HalfToUInt16Bits((Half)src[i]);
-                else for (int i = 0; i < dst.Length; i++) dst[i] = Bf16(src[i]);
-                var buf = device.AllocateDeviceLocal(nb);
-                staging.UploadBytes(tmp, nb, buf);
-                _weightBytes += nb; EmbedBytes += nb;
-                return Own(buf);
+                if (!t.TryGetValue(n, out var d)) throw new InvalidDataException($"mmproj tensor {n} missing");
+                if (d.QuantizationType != QuantizationType.Q8_0)
+                    throw new NotSupportedException($"{n} is {d.QuantizationType}; the Vulkan vision tower reads Q8_0 matrices in place and refuses to widen anything else (CLAUDE.md precision rule 2).");
+                int inDim = (int)d.Shape[0], outDim = (int)d.Shape[1];
+                if (inDim % 32 != 0) throw new NotSupportedException($"{n}: K = {inDim} is not a multiple of 32");
+                var b = VulkanQwen3MoeHybridWeights.UploadRawQuantMatrix(device, staging, gguf.TensorDataPointer(d), QuantizationType.Q8_0, outDim, inDim, out long up);
+                _weightBytes += up;
+                return new Mat { Buf = Own(b), In = inDim, Out = outDim };
             }
-            finally { NativeMemory.AlignedFree((void*)tmp); }
-        }
-
-        _patchW = Embed("v.patch_embd.weight"); _posW = Embed("v.position_embd.weight");
-        _cls = F32("v.class_embd"); _clsPos = F32("v.class_position_embd.weight");
-        _preLnW = F32("v.pre_ln.weight"); _preLnB = F32("v.pre_ln.bias");
-        _blocks = new Block[_nLayer];
-        for (int il = 0; il < _nLayer; il++)
-        {
-            string B(string s) => $"v.blk.{il}.{s}";
-            _blocks[il] = new Block
+            // patch_embd / position_embd: F32 in the file; F16 / BF16 are converted once through a transient native buffer (the only copy), F32 is read in place.
+            VulkanDevice.Buffer Embed(string n)
             {
-                Ln1W = F32(B("ln1.weight")), Ln1B = F32(B("ln1.bias")), Ln2W = F32(B("ln2.weight")), Ln2B = F32(B("ln2.bias")),
-                Ls1 = F32(B("ls1.weight")), Ls2 = F32(B("ls2.weight")),
-                QB = F32(B("attn_q.bias")), KB = F32(B("attn_k.bias")), VB = F32(B("attn_v.bias")), OB = F32(B("attn_out.bias")),
-                UpB = F32(B("ffn_up.bias")), DownB = F32(B("ffn_down.bias")),
-                Q = M(B("attn_q.weight")), K = M(B("attn_k.weight")), V = M(B("attn_v.weight")), O = M(B("attn_out.weight")),
-                Up = M(B("ffn_up.weight")), Down = M(B("ffn_down.weight")),
-            };
+                var d = t[n];
+                if (d.QuantizationType != QuantizationType.F32) throw new InvalidDataException($"{n} is {d.QuantizationType}; the vision contract keeps it F32");
+                long cnt = 1; for (int i = 0; i < d.Shape.Rank; i++) cnt *= d.Shape[i];
+                if (embedPrecision == VisionEmbedPrecision.F32)
+                {
+                    var b = VulkanQwen3MoeHybridWeights.UploadRawQuantMatrix(device, staging, gguf.TensorDataPointer(d), QuantizationType.F32, 1, checked((int)cnt), out long up);
+                    _weightBytes += up; EmbedBytes += up;
+                    return Own(b);
+                }
+                long nb = cnt * 2;
+                nint tmp = (nint)NativeMemory.AlignedAlloc((nuint)nb, 64);
+                try
+                {
+                    var src = new ReadOnlySpan<float>((void*)gguf.TensorDataPointer(d), checked((int)cnt));
+                    var dst = new Span<ushort>((void*)tmp, checked((int)cnt));
+                    if (embedPrecision == VisionEmbedPrecision.F16) for (int i = 0; i < dst.Length; i++) dst[i] = BitConverter.HalfToUInt16Bits((Half)src[i]);
+                    else for (int i = 0; i < dst.Length; i++) dst[i] = Bf16(src[i]);
+                    var buf = device.AllocateDeviceLocal(nb);
+                    staging.UploadBytes(tmp, nb, buf);
+                    _weightBytes += nb; EmbedBytes += nb;
+                    return Own(buf);
+                }
+                finally { NativeMemory.AlignedFree((void*)tmp); }
+            }
+
+            _patchW = Embed("v.patch_embd.weight"); _posW = Embed("v.position_embd.weight");
+            _cls = F32("v.class_embd"); _clsPos = F32("v.class_position_embd.weight");
+            _preLnW = F32("v.pre_ln.weight"); _preLnB = F32("v.pre_ln.bias");
+            _blocks = new Block[_nLayer];
+            for (int il = 0; il < _nLayer; il++)
+            {
+                string B(string s) => $"v.blk.{il}.{s}";
+                _blocks[il] = new Block
+                {
+                    Ln1W = F32(B("ln1.weight")), Ln1B = F32(B("ln1.bias")), Ln2W = F32(B("ln2.weight")), Ln2B = F32(B("ln2.bias")),
+                    Ls1 = F32(B("ls1.weight")), Ls2 = F32(B("ls2.weight")),
+                    QB = F32(B("attn_q.bias")), KB = F32(B("attn_k.bias")), VB = F32(B("attn_v.bias")), OB = F32(B("attn_out.bias")),
+                    UpB = F32(B("ffn_up.bias")), DownB = F32(B("ffn_down.bias")),
+                    Q = M(B("attn_q.weight")), K = M(B("attn_k.weight")), V = M(B("attn_v.weight")), O = M(B("attn_out.weight")),
+                    Up = M(B("ffn_up.weight")), Down = M(B("ffn_down.weight")),
+                };
+            }
+            _mm1 = M("mm.1.weight"); _mm2 = M("mm.2.weight");
+            if (_mm1.In != 4 * E || _mm1.Out != 4096 || _mm2.In != 4096 || _mm2.Out != _outDim) throw new NotSupportedException("unexpected inkling2v projector geometry");
         }
-        _mm1 = M("mm.1.weight"); _mm2 = M("mm.2.weight");
-        if (_mm1.In != 4 * E || _mm1.Out != 4096 || _mm2.In != 4096 || _mm2.Out != _outDim) throw new NotSupportedException("unexpected inkling2v projector geometry");
+        catch
+        {
+            // a matrix refused part-way (e.g. an F16 mmproj) must not leak the device buffers already uploaded
+            _submit.Dispose();
+            foreach (var b in _owned) b.Dispose();
+            _owned.Clear();
+            throw;
+        }
     }
 
     private VulkanDevice.Buffer Own(VulkanDevice.Buffer b) { _owned.Add(b); return b; }
