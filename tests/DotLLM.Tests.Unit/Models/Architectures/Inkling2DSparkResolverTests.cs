@@ -33,4 +33,35 @@ public sealed class Inkling2DSparkResolverTests : IDisposable
         Assert.False(Inkling2DSparkDrafter.IsDSparkFile(f));
         Assert.False(Inkling2DSparkDrafter.IsDSparkFile(Path.Combine(_dir, "missing.gguf")));
     }
+
+    /// <summary>
+    /// Review of #2057: an explicit <c>--dspark</c> on a model that cannot take it (any model but the CPU Inkling 2 one, e.g. the Vulkan Inkling 2 model
+    /// under <c>--device auto</c>) refuses to start instead of being ignored (#2017's explicit-path rule); without the flag that model is left alone.
+    /// Kills: serve's <c>TryAttachSeparateMtpHead</c> consulting <c>DSparkPath</c> only for the CPU Inkling 2 model (the explicit path was then dropped silently).
+    /// </summary>
+    [Fact]
+    public void ExplicitPath_OnAModelThatCannotTakeIt_RefusesToStart()
+    {
+        using var model = new PlainModel();
+        string draft = Path.Combine(_dir, "dspark-x.gguf");
+        File.WriteAllBytes(draft, [1]);
+        Assert.Throws<NotSupportedException>(() => Inkling2DSparkResolver.TryAttach(model, _dir, draft));
+        Assert.Null(Inkling2DSparkResolver.TryAttach(model, _dir));   // auto-detect: other models are left alone
+        Assert.Throws<NotSupportedException>(() => DotLLM.Server.ServerStartup.TryAttachSeparateMtpHead(model, Path.Combine(_dir, "m.gguf"),
+            new DotLLM.Server.ServerOptions { Model = "x", DSparkPath = draft }));
+        DotLLM.Server.ServerStartup.TryAttachSeparateMtpHead(model, Path.Combine(_dir, "m.gguf"), new DotLLM.Server.ServerOptions { Model = "x" });   // no flag: no-op
+    }
+
+    private sealed class PlainModel : DotLLM.Core.Models.IModel
+    {
+        public DotLLM.Core.Models.ModelConfig Config { get; } = new()
+        {
+            VocabSize = 8, NumLayers = 1, NumAttentionHeads = 1, NumKvHeads = 1, HiddenSize = 4, IntermediateSize = 8, HeadDim = 4, MaxSequenceLength = 16,
+            Architecture = DotLLM.Core.Configuration.Architecture.Llama,
+        };
+        public long ComputeMemoryBytes => 0;
+        public DotLLM.Core.Tensors.ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d) => throw new NotSupportedException();
+        public DotLLM.Core.Tensors.ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, DotLLM.Core.Attention.IKvCache? kv) => throw new NotSupportedException();
+        public void Dispose() { }
+    }
 }

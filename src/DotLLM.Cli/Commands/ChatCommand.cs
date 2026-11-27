@@ -529,7 +529,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                         throw new NotSupportedException($"--dflash: {model.GetType().Name} cannot drive a DFlash drafter (qwen35 targets on CPU, CUDA or Vulkan only for now).");
                     dflashTarget.AttachDFlashDrafter(settings.DFlash);
                 }
-                else if (!settings.NoMtp && model is DotLLM.Models.Architectures.Inkling2TransformerModel)
+                else if (!settings.NoMtp && (settings.DSpark is not null || model is DotLLM.Models.Architectures.Inkling2TransformerModel))
                 {
                     // Inkling 2 DSpark drafter (#2039): explicit --dspark is fatal on failure, an auto-detected sibling is logged and ignored.
                     try { DotLLM.Models.Architectures.DSpark.Inkling2DSparkResolver.TryAttach(model, resolvedPath, settings.DSpark); }
