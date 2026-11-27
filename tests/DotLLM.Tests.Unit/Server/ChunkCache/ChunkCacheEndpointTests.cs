@@ -388,7 +388,8 @@ public sealed class ChunkCacheEndpointTests : IDisposable
     /// <summary>
     /// Explain takes <c>{"request": ...}</c> only: a hash list, an extra field, a non-object, a non-JSON body or an invalid
     /// chat body is 400 invalid_request_error (never a 500); a strict request's defect is the same error the chat endpoint
-    /// gives.
+    /// gives. (A request with OpenAI array content used to be in this list: ruling 19 was superseded on 2026-11-27, #2035, see
+    /// <see cref="Explain_OpenAiArrayContent_IsAccepted"/>.)
     /// </summary>
     [Fact]
     public async Task Explain_HashListBody_Rejected()
@@ -405,7 +406,6 @@ public sealed class ChunkCacheEndpointTests : IDisposable
             "not json",
             "",
             """{"request":"hello"}""",
-            """{"request":{"messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]}}""",
             """{"request":{"messages":"nope"}}""",
             """{"request":{}}""",
         ];
@@ -427,6 +427,75 @@ public sealed class ChunkCacheEndpointTests : IDisposable
         // No annotation: nothing to explain, not an error.
         var plain = JsonNode.Parse((await server.SendAsync(HttpMethod.Post, "/v1/chunk-cache/explain", ExplainBody(null))).Body)!;
         Assert.Equal(0, plain["counts"]!["annotated"]!.GetValue<int>());
+    }
+
+    /// <summary>
+    /// OpenAI array content through explain (ruling 19 superseded 2026-11-27, #2035; the 4th of the four pins). The user message is split
+    /// into three text parts: the middle one is exactly <see cref="ChunkA"/>, which is in the store, so a span on it is a <c>hit</c>.
+    /// Both placements reach it: the inline <c>chunk</c> on the part, and the manifest with <c>at.part: 1</c>. A third span sits in part 2 at
+    /// a non-zero start (a different part, a byte offset inside it). A parser that drops the part's <c>chunk</c> reports 0 annotated; one that
+    /// mis-places the engine offset of a later part loses the hit.
+    /// </summary>
+    [Fact]
+    public async Task Explain_OpenAiArrayContent_IsAccepted()
+    {
+        string root = NewStore();
+        await using var server = await ChunkCacheTestServer.StartAsync(_model, On(root));
+        PutChunkA(server, root, ChunkNamespace.Default);
+        string part0 = "Read these files.\n// A.cs\n";
+        string part2 = "// B.cs\n" + ChunkB + "What does Add return?";
+
+        JsonNode Body(JsonObject? chunkOnPart1, JsonObject? cc)
+        {
+            var p1 = new JsonObject { ["type"] = "text", ["text"] = ChunkA };
+            if (chunkOnPart1 is not null)
+                p1["chunk"] = chunkOnPart1;
+            var request = new JsonObject
+            {
+                ["messages"] = new JsonArray(
+                    new JsonObject { ["role"] = "system", ["content"] = "You are terse." },
+                    new JsonObject
+                    {
+                        ["role"] = "user",
+                        ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = part0 }, p1, new JsonObject { ["type"] = "text", ["text"] = part2 }),
+                    }),
+                ["max_tokens"] = 6,
+            };
+            if (cc is not null)
+                request["chunk_cache"] = cc;
+            return new JsonObject { ["request"] = request };
+        }
+
+        var inline = new JsonObject { ["v"] = 1, ["id"] = "a", ["hash"] = ChunkAnnotationParserTests.Sha(ChunkA) };
+        var (st1, b1) = await server.SendAsync(HttpMethod.Post, "/v1/chunk-cache/explain", Body(inline, new JsonObject { ["v"] = 1, ["policy"] = "exact" }).ToJsonString());
+        Assert.Equal(200, st1);
+        var inlineExplain = JsonNode.Parse(b1)!;
+        Assert.Equal(1, inlineExplain["counts"]!["annotated"]!.GetValue<int>());
+        Assert.Equal("hit", Status(inlineExplain, "a"));
+
+        var manifest = new JsonObject
+        {
+            ["v"] = 1,
+            ["policy"] = "exact",
+            ["chunks"] = new JsonArray(
+                new JsonObject { ["id"] = "a", ["hash"] = ChunkAnnotationParserTests.Sha(ChunkA), ["at"] = new JsonObject { ["message"] = 1, ["part"] = 1 } },
+                new JsonObject
+                {
+                    ["id"] = "b",
+                    ["hash"] = ChunkAnnotationParserTests.Sha(ChunkB),
+                    ["at"] = new JsonObject
+                    {
+                        ["message"] = 1, ["part"] = 2,
+                        ["start"] = Encoding.UTF8.GetByteCount("// B.cs\n"), ["end"] = Encoding.UTF8.GetByteCount("// B.cs\n" + ChunkB),
+                    },
+                }),
+        };
+        var (st2, b2) = await server.SendAsync(HttpMethod.Post, "/v1/chunk-cache/explain", Body(null, manifest).ToJsonString());
+        Assert.Equal(200, st2);
+        var manifestExplain = JsonNode.Parse(b2)!;
+        Assert.Equal(2, manifestExplain["counts"]!["annotated"]!.GetValue<int>());
+        Assert.Equal("hit", Status(manifestExplain, "a"));
+        Assert.Equal("miss", Status(manifestExplain, "b")); // located (not ignored), but not in the store
     }
 
     // ------------------------------------------------------------------------------------------------ privacy

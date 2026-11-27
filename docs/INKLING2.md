@@ -126,7 +126,7 @@ neither a KL below ~4e-3 nor free-running greedy identity is a meaningful bar ag
 
 ## 9. Not in this slice
 
-- **Vision**: implemented on the CPU in issue #2035, see section 11 (Vulkan vision is a later slice).
+- **Vision**: implemented on the CPU in issue #2035, see section 12 (Vulkan vision is a later slice).
   images enter the text stream as `<|content_image|><|unused_200054|>` placeholders whose embeddings are injected *without* `token_embd_norm` (llama.cpp: "do not normalize raw embeddings input"). The loader must accept an embedding-input forward.
 - **DSpark drafter** (`dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`): 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
   `target_layer_ids = [5, 23, 41, 48]` counted in **layer visits** (the target exposes the input of visit `n` and the final norm output as id 48: `res->t_layer_inp[visit]` in `inkling2-loop.cpp`). The CPU model keeps the trace hook points

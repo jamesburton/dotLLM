@@ -8,7 +8,13 @@ namespace DotLLM.Server.Models;
 /// <param name="Type"><c>"text"</c> or <c>"image_url"</c>.</param>
 /// <param name="Text">The text of a text part.</param>
 /// <param name="ImageUrl">The <c>image_url.url</c> of an image part (a <c>data:</c> URI).</param>
-public sealed record MessageContentPart(string Type, string? Text, string? ImageUrl);
+/// <param name="Chunk">
+/// The part's inline <c>chunk</c> annotation (chunk-cache, docs/CHUNK_CACHE.md), the raw JSON object; null when absent. Read by
+/// <c>ChunkAnnotationParser</c> with the same semantics as the Anthropic inline placement. Kept raw (a cloned element) so a malformed annotation
+/// is that annotation's defect, not a binding failure. Not a DTO property: this type is read by <see cref="MessageContentConverter"/>, so the
+/// source-generator initializer rule (CLAUDE.md, JSON DTO Rules) does not apply.
+/// </param>
+public sealed record MessageContentPart(string Type, string? Text, string? ImageUrl, JsonElement? Chunk = null);
 
 /// <summary>
 /// OpenAI message content: a plain string, or an array of content parts (text and images). Reads either; <see cref="Text"/> is the string form
@@ -65,7 +71,7 @@ public sealed class MessageContentConverter : JsonConverter<MessageContent>
             switch (type)
             {
                 case "text":
-                    parts.Add(new MessageContentPart("text", e.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.String ? tx.GetString() : "", null));
+                    parts.Add(new MessageContentPart("text", e.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.String ? tx.GetString() : "", null, ChunkOf(e)));
                     break;
                 case "image_url":
                 {
@@ -73,7 +79,7 @@ public sealed class MessageContentConverter : JsonConverter<MessageContent>
                     string? url = iu.ValueKind == JsonValueKind.String ? iu.GetString()
                         : iu.TryGetProperty("url", out var u) && u.ValueKind == JsonValueKind.String ? u.GetString() : null;
                     if (url is null) throw new JsonException("image_url part without a url");
-                    parts.Add(new MessageContentPart("image_url", null, url));
+                    parts.Add(new MessageContentPart("image_url", null, url, ChunkOf(e)));
                     break;
                 }
                 default:
@@ -82,6 +88,9 @@ public sealed class MessageContentConverter : JsonConverter<MessageContent>
         }
         return new MessageContent(parts);
     }
+
+    private static JsonElement? ChunkOf(JsonElement part) =>
+        part.TryGetProperty("chunk", out var c) && c.ValueKind != JsonValueKind.Null ? c.Clone() : null;
 
     /// <inheritdoc/>
     public override void Write(Utf8JsonWriter writer, MessageContent value, JsonSerializerOptions options)
@@ -94,6 +103,7 @@ public sealed class MessageContentConverter : JsonConverter<MessageContent>
             writer.WriteString("type", p.Type);
             if (p.Type == "text") writer.WriteString("text", p.Text);
             else { writer.WriteStartObject("image_url"); writer.WriteString("url", p.ImageUrl); writer.WriteEndObject(); }
+            if (p.Chunk is { } chunk) { writer.WritePropertyName("chunk"); chunk.WriteTo(writer); }
             writer.WriteEndObject();
         }
         writer.WriteEndArray();
