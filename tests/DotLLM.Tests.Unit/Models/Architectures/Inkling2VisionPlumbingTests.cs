@@ -442,4 +442,32 @@ public sealed class Inkling2VisionPlumbingTests
         Assert.Equal(1, DotLLM.Server.ImageInput.WithImages(options, [emb], 9, prompt + 99, prompt).MaxTokens);
         Assert.Equal(1, DotLLM.Server.ImageInput.WithImages(options, [emb], 9, 10, prompt).MaxTokens);
     }
+    /// <summary>
+    /// The server's <c>--image-over-limit</c> reaches the encoder it loads (review of #2037). <c>ImageInput</c> builds the encoder from
+    /// <see cref="ServerOptions.ImageLimits"/>, caches it, and must rebuild it when the policy changes. A 2600x2600 image (4,225 tokens) is refused under
+    /// <c>refuse</c> and planned under <c>downscale</c>; a 10-token budget makes the planned image a context-length refusal, so nothing is encoded.
+    /// Kills: <c>ImageInput.Encode</c> not passing the policy to <c>LoadEncoder</c>, and the cached encoder not keyed by the policy.
+    /// </summary>
+    [SkippableFact]
+    public async Task ServerEncode_FollowsTheConfiguredOverLimitPolicy()
+    {
+        string? mm = Inkling2VisionFixtures.FindMmproj();
+        Skip.If(mm is null, "mmproj-Inkling-2-Mini-Q8_0.gguf not in the HF cache");
+        string? envMmproj = Environment.GetEnvironmentVariable("DOTLLM_MMPROJ");
+        Skip.If(!string.IsNullOrEmpty(envMmproj) && !File.Exists(envMmproj), "DOTLLM_MMPROJ names a missing file");
+        string uri = "data:image/png;base64," + Convert.ToBase64String(MakePng(2600, 2600, new byte[2600 * 2600 * 3]));
+        using var state = new DotLLM.Server.ServerState
+        {
+            Options = new DotLLM.Server.ServerOptions { Model = "", ImageLimits = new ImageLimits { OverLimit = ImageOverLimit.Downscale } },
+            Model = new ImageStubModel(),
+            LoadedModelPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(mm!))!, "model-next-to-the-mmproj.gguf"),
+        };
+        var down = await Assert.ThrowsAsync<DotLLM.Server.ImageInputException>(() => DotLLM.Server.ImageInput.EncodeAsync(state, [uri], 10, default));
+        Assert.Equal("context_length_exceeded", down.Code);   // planned within 4,096 tokens: only the budget refuses it
+
+        state.Options = state.Options with { ImageLimits = ImageLimits.Default };   // refuse: the cached downscale encoder must not be reused
+        var refused = await Assert.ThrowsAsync<DotLLM.Server.ImageInputException>(() => DotLLM.Server.ImageInput.EncodeAsync(state, [uri], 10, default));
+        Assert.NotEqual("context_length_exceeded", refused.Code);
+        Assert.Contains("downscale", refused.Message, StringComparison.Ordinal);
+    }
 }
