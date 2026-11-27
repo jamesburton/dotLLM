@@ -94,7 +94,7 @@ public sealed class ServerPinTests
     private static BpeTokenizer PlainTok => Vocab.Value.Plain;
     private static int Id(string spelling) => Vocab.Value.Ids[spelling];
 
-    private static GgufMetadata Metadata(string template)
+    internal static GgufMetadata Metadata(string template)
     {
         var data = new GgufTestData(version: 3);
         data.AddString("tokenizer.chat_template", template);
@@ -103,6 +103,10 @@ public sealed class ServerPinTests
         var header = GgufReader.ReadHeader(reader);
         return new GgufMetadata(GgufReader.ReadMetadata(reader, header));
     }
+
+    /// <summary>A template given as text (not a fixture name), built like <see cref="ServerTemplate"/>.</summary>
+    internal static JinjaChatTemplate ServerTemplateFromText(string template)
+        => GgufChatTemplateFactory.TryCreate(Metadata(template), Tok, Architecture.Llama)!;
 
     /// <summary>The template exactly as <c>ServerStartup</c> builds it: GGUF factory, model tokenizer as the #1339 guard.</summary>
     internal static JinjaChatTemplate ServerTemplate(string fixture)
@@ -202,15 +206,23 @@ public sealed class ServerPinTests
     }
 
     /// <summary>
-    /// OpenAI <c>messages[i].content</c> is a <c>string?</c> on the DTO: an array of content parts does not deserialize.
-    /// Over HTTP this is a 400 from model binding (see <see cref="ServerPinHttpTests"/>). Spec assumption was "accepted,
-    /// parts joined with no separator".
+    /// OpenAI <c>messages[i].content</c> is a string OR an array of content parts. History: this pin said an array failed model
+    /// binding (the original spec assumption was "accepted, parts joined with no separator"); ruling 19 kept that refusal.
+    /// <b>Ruling 19 was superseded by the user on 2026-11-27 (#2035, epic #2025):</b> arrays are accepted, the text parts are joined
+    /// with no separator into the engine message (so the spec's original assumption holds), and a <c>chunk</c> on a part is kept
+    /// (not dropped). Deserialized through the source-generated <c>ServerJsonContext</c>.
     /// </summary>
     [Fact]
-    public void OpenAi_ArrayContent_DoesNotDeserialize()
+    public void OpenAi_ArrayContent_Deserializes_PartsJoinedWithNoSeparator_ChunkKept()
     {
-        const string body = """{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}""";
-        Assert.Throws<JsonException>(() => ParseOpenAi(body));
+        const string body = """{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b","chunk":{"v":1,"id":"x"}}]}]}""";
+        var request = ParseOpenAi(body);
+        var content = request.Messages[0].Content!;
+        Assert.Equal(2, content.Parts!.Count);
+        Assert.Equal("ab", content.Text);
+        Assert.Equal("ab", RequestConverter.ToMessages(request.Messages)[0].Content);
+        Assert.Null(content.Parts[0].Chunk);
+        Assert.Equal("x", content.Parts[1].Chunk!.Value.GetProperty("id").GetString());
     }
 
     /// <summary>
@@ -531,16 +543,19 @@ public sealed class ServerPinHttpTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// OpenAI chat with array <c>content</c>: refused by model binding with a bare 400 and an EMPTY body (no OpenAI error
-    /// envelope) — the handler never runs. Inline <c>chunk</c> on an OpenAI text part is therefore unreachable today.
+    /// OpenAI chat with array <c>content</c>. Ruling 19 (superseded 2026-11-27, #2035) used to pin a bare 400 with an EMPTY body from
+    /// model binding. Now the body binds and reaches the handler, and the rendered prompt is exactly that of the same text as one string
+    /// (the parts are joined with no separator); the 1-token context turns it into the handler's context-length 400, whose token count is the oracle.
     /// </summary>
     [Fact]
-    public async Task OpenAi_ArrayContent_Is400FromBinding_EmptyBody()
+    public async Task OpenAi_ArrayContent_ReachesTheHandler_SamePromptAsJoinedString()
     {
-        var (status, text) = await PostAsync("/v1/chat/completions",
+        int array = await ChatPromptTokensAsync(
             """{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b","chunk":{"v":1}}]}]}""");
-        Assert.Equal(HttpStatusCode.BadRequest, status);
-        Assert.Equal("", text);
+        int joined = await ChatPromptTokensAsync("""{"messages":[{"role":"user","content":"ab"}]}""");
+        int separated = await ChatPromptTokensAsync("""{"messages":[{"role":"user","content":"a\nb"}]}""");
+        Assert.Equal(joined, array);
+        Assert.NotEqual(separated, array); // control: a separator would change the token count
     }
 
     /// <summary>Control for the test above: string content with unknown fields reaches the handler and renders the same prompt.</summary>

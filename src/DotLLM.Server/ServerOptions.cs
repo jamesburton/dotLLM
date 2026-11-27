@@ -307,6 +307,14 @@ public sealed record ServerOptions
     /// <summary>Where each tuned setting came from under <c>--auto</c> (<c>flag</c>, <c>auto</c>, <c>default</c>); null without <c>--auto</c>.</summary>
     public IReadOnlyDictionary<string, string>? SettingSources { get; init; }
 
+    /// <summary>
+    /// Bounds on image input of <c>/v1/chat/completions</c> (issue #2035; user ruling 2026-11-27): image count, decoded pixels per request and per image,
+    /// side length, and whether an image needing more image tokens than the model allows is refused (default) or downscaled. Set with
+    /// <c>--max-images</c>, <c>--max-request-image-pixels</c>, <c>--max-image-pixels</c>, <c>--max-image-side</c>, <c>--image-over-limit</c> or the
+    /// <c>DOTLLM_IMAGE_*</c> variables (<see cref="DotLLM.Core.Vision.ImageLimits.Resolve"/>); the flag wins.
+    /// </summary>
+    public DotLLM.Core.Vision.ImageLimits ImageLimits { get; init; } = DotLLM.Core.Vision.ImageLimits.Default;
+
     /// <summary>Default for <see cref="EffectiveMaxMessages"/> when <see cref="MaxMessages"/> is unset.</summary>
     public const int DefaultMaxMessages = 8192;
 
@@ -545,6 +553,9 @@ public sealed record ServerOptions
         bool? metrics = null;
         bool allowLoraAdmin = false;
         int? maxMessagesCli = null;
+        int? maxImagesCli = null, maxImageSideCli = null;
+        long? maxRequestImagePixelsCli = null, maxImagePixelsCli = null;
+        string? imageOverLimitCli = null;
         string? tensorOverlay = null;
         bool overlaySkipBaseHash = false;
         int promptCacheStep = 0;
@@ -710,6 +721,16 @@ public sealed record ServerOptions
                     chunkStoreNamespaceBudget = next ?? throw new ArgumentException("--chunk-store-namespace-budget requires a byte size."); i++; break;
                 case "--max-messages":
                     maxMessagesCli = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--max-images":
+                    maxImagesCli = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--max-request-image-pixels":
+                    maxRequestImagePixelsCli = long.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--max-image-pixels":
+                    maxImagePixelsCli = long.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--max-image-side":
+                    maxImageSideCli = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--image-over-limit":
+                    imageOverLimitCli = next ?? throw new ArgumentException("--image-over-limit requires 'refuse' or 'downscale'."); i++; break;
                 default:
                     // Positional: treat as model if not set
                     if (model is null && !arg.StartsWith('-'))
@@ -789,6 +810,7 @@ public sealed record ServerOptions
             ChunkCache = DotLLM.Server.ChunkCache.ChunkCacheOptions.Create(chunkCache, chunkCacheMaxChunks, chunkStore, chunkCacheApiKeys, chunkCacheAllowShortKeys,
                 chunkStoreWrite, chunkStoreBudget, chunkStoreIndexOnly, chunkStoreNamespaceBudget),
             MaxMessages = ResolveMaxMessages(maxMessagesCli, Environment.GetEnvironmentVariable(MaxMessagesEnvVar)),
+            ImageLimits = DotLLM.Core.Vision.ImageLimits.Resolve(maxImagesCli, maxRequestImagePixelsCli, maxImagePixelsCli, maxImageSideCli, imageOverLimitCli),
             ModelId = modelId,
             RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,
                 yarnOrigCtx, yarnAttnFactor, yarnBetaFast, yarnBetaSlow),

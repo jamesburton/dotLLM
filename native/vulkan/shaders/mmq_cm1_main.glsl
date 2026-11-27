@@ -14,7 +14,7 @@
 //
 // MMQ_GROUPED (MoE expert-grouped prefill): the weight buffer is a bank [E, M, K]; the activation rows are packed in expert order
 // (offsets[e] .. offsets[e+1], moe_expand_gather_group_q8_1) and the output rows are packed the same way. Workgroup x is the M tile,
-// y a tile index into the work list moe_build_tile_list wrote after the offsets (tileRows = 64), or (tileList == 0) y = row tile,
+// y a tile index into the work list moe_build_tile_list wrote after the offsets (tileRows = BN: 64, or 32 for the *_bn32 wrappers), or (tileList == 0) y = row tile,
 // z = expert. No L2 swizzle there: one expert's rows rarely span more than one token tile.
 //
 // Geometry: BM = BN = 64, two wave64 subgroups (128 threads) each owning a 32x64 warp tile = 2x4 16x16 fragments, BK = 32 (one quant

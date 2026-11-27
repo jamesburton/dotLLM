@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 using DotLLM.Tokenizers;
 
@@ -265,20 +266,58 @@ internal static class ChunkSpanLocator
         foreach (var (m, list) in byMessage)
         {
             string content = messages[m].Content;
-            StringBuilder? sb = null;
-            int at = 0;
+            var replaced = new List<(int Start, int End, string With)>();
             foreach (int k in list)
+                if (state[k] == State.Candidate)
+                    replaced.Add((spans[k].Engine.StartChar, spans[k].Engine.EndChar, Sentinel(prefix, k)));
+            if (replaced.Count == 0)
+                continue;
+            copy[m] = messages[m] with
             {
-                if (state[k] != State.Candidate)
-                    continue;
-                sb ??= new StringBuilder(content.Length + 64);
-                sb.Append(content, at, spans[k].Engine.StartChar - at).Append(Sentinel(prefix, k));
-                at = spans[k].Engine.EndChar;
-            }
-            if (sb is not null)
-                copy[m] = messages[m] with { Content = sb.Append(content, at, content.Length - at).ToString() };
+                Content = Substitute(content, 0, content.Length, replaced),
+                // A multimodal message renders its parts, not Content (#2035): the sentinels must be in the parts the template sees.
+                ContentParts = messages[m].ContentParts is { } parts ? SubstituteParts(parts, replaced) : null,
+            };
         }
         return copy;
+    }
+
+    /// <summary>The text of <paramref name="content"/>[<paramref name="from"/>..<paramref name="to"/>) with the (sorted, in-range) spans replaced.</summary>
+    private static string Substitute(string content, int from, int to, List<(int Start, int End, string With)> spans)
+    {
+        var sb = new StringBuilder(to - from + 64);
+        int at = from;
+        foreach (var (start, end, with) in spans)
+        {
+            if (start < from || end > to)
+                continue;
+            sb.Append(content, at, start - at).Append(with);
+            at = end;
+        }
+        return sb.Append(content, at, to - at).ToString();
+    }
+
+    /// <summary>
+    /// The content parts with the spans replaced. <c>Content</c> is the text parts joined with no separator, so a span's engine offsets
+    /// are positions in that concatenation; the parser never lets a span cross a part.
+    /// </summary>
+    private static IReadOnlyList<ChatContentPart> SubstituteParts(IReadOnlyList<ChatContentPart> parts, List<(int Start, int End, string With)> spans)
+    {
+        var result = new ChatContentPart[parts.Count];
+        int offset = 0;
+        for (int i = 0; i < parts.Count; i++)
+        {
+            var part = parts[i];
+            if (part.Type == "text" && part.Text is { } text)
+            {
+                result[i] = part with { Text = Substitute(text, 0, text.Length, [.. spans.Where(sp => sp.Start >= offset && sp.End <= offset + text.Length)
+                    .Select(sp => (sp.Start - offset, sp.End - offset, sp.With))]) };
+                offset += text.Length;
+            }
+            else
+                result[i] = part;
+        }
+        return result;
     }
 
     /// <summary>Records each candidate's sentinel position in <paramref name="s"/>; a sentinel seen twice is -2 (broken).</summary>

@@ -100,9 +100,9 @@ public sealed unsafe partial class Inkling2TransformerModel : IDFlashDraftAttach
     private ITensor ForwardWithMtp(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IMtpState? mtpState, bool lastTokenLogitsOnly, bool recordRows)
     {
         if (mtpState is not Inkling2DSparkState s)
-            return ForwardCore(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly, tap: null, recordRows);
+            return ForwardCore(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly, images: null, tap: null, recordRows: recordRows);
         s.EnsureTapRows(tokenIds.Length);
-        var logits = ForwardCore(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly, tap: s, recordRows);
+        var logits = ForwardCore(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly, images: null, tap: s, recordRows: recordRows);
         s.InjectCaptured(positions);
         s.TrimTapRows();
         return logits;

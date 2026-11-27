@@ -145,6 +145,7 @@ public sealed partial class TextGenerator
             void Prefill(int[] ids, Core.Attention.IKvCache kv)
             {
                 long t0 = Stopwatch.GetTimestamp();
+                _requestImages = null;
                 ForwardPrefill(ids, 0, ids.Length, kv, adapter: null, cancellationToken: cancellationToken).Dispose();
                 decodeStart = Stopwatch.GetTimestamp();
                 prefillTicks = decodeStart - t0;

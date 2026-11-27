@@ -126,7 +126,7 @@ public static class ChatCompletionEndpoint
             request.MaxTokens ?? state.EffectiveSamplingDefaults.MaxTokens, thinkingBudget, state.Options.ReasoningAnswerReserve);
         var promptError = RequestValidator.ValidatePromptLength(
             prompt, state.Tokenizer!, state.Config!.MaxSequenceLength,
-            maxTokens, out int effectiveMaxTokens, out _);
+            maxTokens, out int effectiveMaxTokens, out int promptTokenCount);
         if (promptError is not null)
         {
             await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(promptError, param: "messages", code: "context_length_exceeded"), keepAlive);
@@ -168,6 +168,39 @@ public static class ChatCompletionEndpoint
             return;
         }
 
+        // Image input (#2035): encode the request's images with the model's vision projector; the engine widens each rendered placeholder to the
+        // image's token count. A request with images bypasses the batch scheduler (it carries token ids only) and reuses no prefix.
+        System.Collections.Generic.List<DotLLM.Core.Vision.ImageEmbeddings>? imageEmbeddings = null;
+        var imageUrls = RequestConverter.ImageUrls(request.Messages);
+        if (imageUrls.Count > 0)
+        {
+            try
+            {
+                // A LoRA adapter would be silently dropped by the image prefill (IImageInputModel.ForwardWithImages takes none): refuse.
+                if (adapter is not null)
+                    throw new ImageInputException("Image input cannot be combined with a LoRA adapter yet.");
+                var placeholder = state.Tokenizer!.Encode(DotLLM.Models.Vision.VisionSupport.Inkling2ImageToken);
+                if (placeholder.Length != 1) throw new ImageInputException("The tokenizer does not define the image placeholder token.");
+                // Every image needs exactly one rendered placeholder (an image in a turn the template does not render would otherwise fail
+                // in the engine after the encode): checked on the rendered prompt before anything is decoded or encoded.
+                int renderedPlaceholders = 0;
+                foreach (int id in state.Tokenizer.Encode(prompt)) if (id == placeholder[0]) renderedPlaceholders++;
+                if (renderedPlaceholders != imageUrls.Count)
+                    throw new ImageInputException($"The chat template rendered {renderedPlaceholders} image placeholder(s) for {imageUrls.Count} image(s); images are only supported where the template places them.");
+                // The images widen the prompt (each placeholder becomes the image's token count): it must still fit the context with room for
+                // one generated token, checked before the encode (ImageInput), and max_tokens is clamped to what is left after the widening.
+                int ctx = state.Config!.MaxSequenceLength;
+                imageEmbeddings = await ImageInput.EncodeAsync(state, imageUrls, ctx - promptTokenCount - 1, ct);
+                options = ImageInput.WithImages(options, imageEmbeddings, placeholder[0], ctx, promptTokenCount);
+            }
+            catch (ImageInputException ex)
+            {
+                if (imageEmbeddings is not null) foreach (var e in imageEmbeddings) e.Dispose();
+                await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(ex.Message, param: "messages", code: ex.Code), keepAlive);
+                return;
+            }
+        }
+
         // Diffusion routing: when the loaded model is a masked text-diffusion model, generation runs
         // through DiffusionTextGenerator (canvas denoising) instead of the autoregressive TextGenerator.
         // AR models leave DiffusionGenerator null and fall through to the unchanged path below.
@@ -195,12 +228,19 @@ public static class ChatCompletionEndpoint
             return;
         }
 
-        if (request.Stream)
-            await HandleStreamingAsync(request, state, httpContext, prompt, options,
-                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, forcedToolCall, keepAlive, chunkCache);
-        else
-            await HandleNonStreamingAsync(request, state, httpContext, prompt, options,
-                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, chunkCache);
+        try
+        {
+            if (request.Stream)
+                await HandleStreamingAsync(request, state, httpContext, prompt, options,
+                    requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, forcedToolCall, keepAlive, chunkCache);
+            else
+                await HandleNonStreamingAsync(request, state, httpContext, prompt, options,
+                    requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, chunkCache);
+        }
+        finally
+        {
+            if (imageEmbeddings is not null) foreach (var e in imageEmbeddings) e.Dispose();
+        }
     }
 
     /// <summary>A chat request rendered for the model: what generation and the chunk cache both work from.</summary>
@@ -280,7 +320,7 @@ public static class ChatCompletionEndpoint
         // Route through the continuous-batch scheduler when it's the right shape for it: no LoRA
         // adapter, no logprobs capture. Multiple concurrent requests pipeline through one model
         // dispatch per scheduler iteration.
-        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
+        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs && options.Images is null)
         {
             int[] promptIds = state.Tokenizer!.Encode(prompt);
             var inFlight = new Task<InferenceResponse>[choiceCount];
@@ -478,7 +518,7 @@ public static class ChatCompletionEndpoint
         ChunkCacheExchange? chunkCache = null)
     {
         // (#1266) Same routing as the non-streaming path: on the scheduler, with no gate or model lease.
-        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
+        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs && options.Images is null)
         {
             return WriteChatStreamAsync(
                 request, httpContext,

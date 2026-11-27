@@ -128,8 +128,8 @@ public sealed class ChunkCacheOptionsTests
 
 /// <summary>
 /// Flag off: an annotated body behaves byte for byte like the same body without annotations, over real HTTP, for
-/// valid, defective, strict and malformed annotations alike. OpenAI array content stays the binding 400 with the flag
-/// on and off (ruling 19). Same harness as <see cref="ServerPinHttpTests"/>: a 1-token context makes every chat request
+/// valid, defective, strict and malformed annotations alike. OpenAI array content binds with the flag
+/// on and off (ruling 19, which kept it a 400, was superseded 2026-11-27, #2035). Same harness as <see cref="ServerPinHttpTests"/>: a 1-token context makes every chat request
 /// that reaches the handler stop at the prompt-length 400, whose body carries the prompt's token count.
 /// </summary>
 public sealed class ChunkCacheFlagHttpTests : IAsyncLifetime
@@ -230,19 +230,38 @@ public sealed class ChunkCacheFlagHttpTests : IAsyncLifetime
         }
     }
 
-    /// <summary>Ruling 19: OpenAI array content is the same bare 400 (empty body) with the flag on as with it off.</summary>
+    /// <summary>
+    /// OpenAI array content (ruling 19 superseded 2026-11-27, #2035). It used to be the same bare 400 (empty body) with the flag on and off.
+    /// Now it binds on both servers. Flag off: the inline <c>chunk</c> is ignored, the body is byte for byte the unannotated array's answer.
+    /// Flag on: the part's <c>chunk</c> is honoured, shown by strict mode: a hash that does not match the part's text is the chunk-cache 400
+    /// (<c>chunk_hash_mismatch</c>) there, while the matching hash goes on to the same context-length 400 as flag off.
+    /// </summary>
     [Fact]
-    public async Task OpenAi_ArrayContent_StillThe400_FlagOnAndOff()
+    public async Task OpenAi_ArrayContent_Accepted_ChunkHonouredOnlyWithFlagOn()
     {
-        string body = $$$"""
-            {"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"hello world","chunk":{"v":1,"id":"x","hash":"{{{BodyHash}}}"}}]}],
-             "chunk_cache":{"v":1}}
+        string Body(string hash, string strict) => $$$"""
+            {"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"hello world","chunk":{"v":1,"id":"x","hash":"{{{hash}}}"}}]}],
+             "chunk_cache":{"v":1{{{strict}}}}}
             """;
-        foreach (var http in new[] { Off, OnServer })
-        {
-            var (status, text) = await PostAsync(http, "/v1/chat/completions", body);
-            Assert.Equal(HttpStatusCode.BadRequest, status);
-            Assert.Equal("", text);
-        }
+        const string unannotated = """{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"hello world"}]}]}""";
+
+        var plainOff = await PostAsync(Off, "/v1/chat/completions", unannotated);
+        Assert.Equal(HttpStatusCode.BadRequest, plainOff.Status);
+        Assert.Contains("context_length_exceeded", plainOff.Body, StringComparison.Ordinal);
+
+        // Flag off: every annotated variant is the unannotated answer (the chunk is not read).
+        foreach (string strict in new[] { "", ",\"strict\":true" })
+            foreach (string hash in new[] { BodyHash, "sha256:00" })
+                Assert.Equal(plainOff, await PostAsync(Off, "/v1/chat/completions", Body(hash, strict)));
+
+        // Flag on, strict, wrong hash: the annotation was read and refused with its own code.
+        var bad = await PostAsync(OnServer, "/v1/chat/completions", Body("sha256:00", ",\"strict\":true"));
+        Assert.Equal(HttpStatusCode.BadRequest, bad.Status);
+        Assert.Contains("chunk_hash_mismatch", bad.Body, StringComparison.Ordinal);
+
+        // Flag on, strict, right hash: accepted, then the same handler 400 as the unannotated body.
+        var good = await PostAsync(OnServer, "/v1/chat/completions", Body(BodyHash, ",\"strict\":true"));
+        Assert.Equal(HttpStatusCode.BadRequest, good.Status);
+        Assert.Contains("context_length_exceeded", good.Body, StringComparison.Ordinal);
     }
 }
