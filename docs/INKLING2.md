@@ -222,3 +222,44 @@ Op-level parity (`Inkling2VulkanKernelTests`): every new shader against a double
 
 **Throughput** (Strix 8060S, `Inkling-2-Mini-NVFP4.gguf`, 300-token prefill then 32 decode steps, 3 warm rounds after a warm-up, not tuned): F16 KV prefill 81-95 tok/s, decode 26.5-28.8 tok/s; q8_0 KV prefill 68-88, decode 25.4-28.5. llama.cpp b12780 (CPU-only build: `llama-bench -dev none`, 16 threads, run back-to-back, same file): pp300 48.3 +- 0.3, tg32 13.9 +- 0.2 tok/s. The b12780 build has no Vulkan backend.
 dotLLM CPU reference: 22.8 / 9.8 tok/s. Levers for slice 5: ~1,900 dispatches per decoded token (controllers are 5 dispatches each x 4 x 24 core visits), expert-grouped prefill, split-submit profiling, dp4a MMVQ for NVFP4.
+
+## 12. DSpark drafter (issue #2039)
+
+The drafter is `unsloth/Inkling-2-Mini-GGUF` `dspark-Inkling-2-Mini-Q8_0.gguf` (504 MB, `general.architecture = dflash`, 58 tensors). `mtp.safetensors` is **not** needed: the GGUF already carries the converter's folds (`markov_w2 = unembed @ hidden_out`, softmaxed `ctx_mix`, the replicated `mask_embd`).
+
+**Sources.** llama.cpp (master; `llama-server` b12780 supports `--spec-type draft-dspark`): `src/models/dspark.cpp` (`build_dspark_markov_head`, `graph_dspark`), `src/models/dflash.cpp` (`build_inject_ctx_mix`, `graph_base::build_layers`, the shared embedding and lm-head), `common/speculative.cpp` (`common_speculative_impl_draft_dflash` / `_draft_dspark`: what is injected, what the block holds, the `f_rnn` ring), `src/models/inkling2-loop.cpp` and `inkling2.cpp` (`res->t_layer_inp[visit]`, the target features), `conversion/inkling2.py` (`Inkling2DSparkModel`), `docs/speculative.md`. Bench card: `hf://datasets/pratikgx/inkling-2-mini-dspark-m5-pro-mac-mini-bench` (README only).
+
+**Config** (`mtp_config`, GGUF `dflash.*`): 3 layers, hidden 2304, 24 heads / 8 KV heads, head_dim 128, intermediate 9216, RoPE NeoX theta 1e6, RMS eps 1e-6, `sliding_window = 1025`, pattern `[local, GLOBAL, local]` (layers 0 and 2 windowed, layer 1 global), `block_size = 8`, `sample_from_anchor = false`, no confidence head, `has_markov_context = true` (`rnn_hidden`), rank 256, `final_logit_softcapping = 30`.
+
+**Target features (what is captured, and when).** `target_layers = [5, 23, 41, 48]` count **layer visits** in execution order (48 per token: prelude 0-5, then 3 passes over core 6-17, then 18-23). The feature of id `v` is the **input** of visit `v` (`t_layer_inp[visit] = cur`, taken before the visit's layer is built): visit 5 is the input of prelude layer 5; visit 23 is the input of pass-1 layer 11 (cache slot 29, not 23); visit 41 is the input of pass-2 layer 17 (cache slot 41 only by numbering coincidence for this id; tapping by slot is a mutant); id 48 is not a layer input but the final normed output (after `mix(output_res_query)` and `output_norm`, before the LM head). Each target position yields one row per tap, held as F16.
+
+**Context injection** (`build_inject_ctx_mix`; per injected position `p`, per drafter layer `l`): `m = sum_k ctx_mix_l[k] * tap_k` (the converter already applied the softmax), `n = rms(m) * ctx_norm_l`, `K = attn_k_ctx_l . n`, `V = attn_v_ctx_l . n`. K gets a per-head RMSNorm (`attn_k_ctx_norm`) then RoPE at `p`; V gets neither. K/V are stored F16 in the layer's context cache. The Markov head's `f_rnn(p) = rms(sum_k markov_ctx_mix[k] * tap_k) * markov_ctx_norm` is kept per position.
+
+**Block.** A round with `n` drafts decodes `n + 1` rows (not always 8; attention is non-causal, so the drafts depend on `n`): row 0 is the **anchor** (the last committed token, at position `pos0`, not yet seen by the target), rows 1..n are `mask_embd` rows (positions `pos0 + i`). Embedding: the anchor is the target's raw `token_embd` row through the drafter's own `token_embd_norm` (the target's embedding path already applies its norm, so reusing it would norm twice); mask rows are `mask_embd` as stored (no norm, no embedding scale). Per layer (Qwen3-like): `rms(x) * attn_norm`, `attn_q/k/v`, per-head RMSNorm `attn_q_norm` / `attn_k_norm`, RoPE (NeoX, position `pos0 + i`), attention (scale `1/sqrt(128)`, no sinks), `attn_output`, `+x`, `rms * ffn_norm`, SwiGLU, down, `+x`. The block's K/V pass through the F16 cache (llama.cpp writes them there before attending). **Block-uniform mask** (`block_uniform = true`): every block row uses the mask row of the anchor. Context keys are positions `< pos0`; a windowed layer (n_swa 1025) sees `pos0 - 1024 .. pos0 - 1`, the global layer sees all; every block row sees every block key (non-causal). A key at distance over 1024 from the anchor is invisible to every row, including row `n`, which a per-query window would show.
+
+**Head.** `hidden_i = rms(x_i) * output_norm` for rows `i = 1..n`; `base_i = lm_head(hidden_i)` with the **target's** Q8_0 head over the 200,058 unpadded rows, **uncapped**. Then, with `state = 0` and `prev = anchor`, for `i = 1..n`:
+
+```
+joint = joint_proj . [ state(256) | markov_w1[prev](256) | hidden_i(2304) | f_rnn(pos0 - 1)(2304) ] + joint_proj.bias     # 5120 -> 768
+gate = sigmoid(joint[0:256]);  cand = tanh(joint[256:512]);  markov = tanh(joint[512:768])
+state = gate * state + (1 - gate) * cand
+bias = markov_w2 . markov + markov_w2.bias                                                                              # [200058]
+col_i = 30 * tanh((base_i + bias) / 30)          # softcap AFTER the bias (softcap_after_bias = true)
+prev = argmax(col_i)                             # greedy; the draft token of position pos0 + i
+```
+
+`f_rnn` is the feature of the position **before** the anchor (`pos0 - 1`, the last token the target processed); without it llama.cpp does not draft. `markov_w1`, `markov_w2` and `joint_proj` are BF16 and read in place.
+
+**Verification.** None of its own: llama.cpp (`common/speculative.cpp`) hands the `n` tokens to the ordinary speculative verifier (the target decodes `[last, d1..dn]`, greedy acceptance against the target argmax). dotLLM reuses the unmodified `MtpSpeculativeDecoder` (the drafter sits behind `IDFlashDraftAttachable` / `IMtpState`), its adaptive gate and its rollback. After a rejection the target's recurrent state must rewind: the short-conv windows of the 48 slots (`ForwardWithRecurrentSnapshots` / `RestoreRecurrentStateToRow`, section 13); the KV rows past the accepted one are simply overwritten.
+
+**Expected acceptance and speed (card).** Unsloth `llama-server` b12649, M5 Pro (Metal), IQ4_NL, `--spec-draft-n-max 5`: a repetitive continuation prompt 92.9% acceptance, 70.0 vs 23.3 tok/s (3.0x); a short code prompt 55.5%, 48.9 vs 34.3 tok/s; the "fair check" of three distinct greedy prompts 26.8% to 55.5% acceptance and **32.5 vs 33.4 tok/s (about 1.0x)**; sampled prompts (temp 0.7) 18-34% acceptance and a loss. Greedy text matched plain decoding on only 1 of 3 fair-check prompts (llama.cpp's own batch-vs-single numerics, section 13). llama.cpp's docs use `--spec-draft-n-max 3`.
+
+## 13. Speculative verify needs a row-count-invariant target (issue #2039)
+
+Greedy identity "by construction" only holds if an N-row forward equals N single-row forwards. Measured on the NVFP4 model (20-token prefix, then 8 rows against 8 single-row forwards; `Inkling2RowInvarianceTests`):
+
+- **Before:** row 0 identical; rows 1-7 differed in 200,056-200,058 of 200,058 logits, max |diff| 0.91. Cause: `Inkling2ConvState.Run` read the in-batch history (the inputs of rows `t-1..t-3`) as exact F32, while sequential decoding reads them back out of the BF16 state.
+- **Fix:** the in-batch history is rounded to the state type (BF16) exactly as `Store` does; only the current input stays exact. After it the two paths are **bit-identical on all 8 rows** (the NVFP4/Q8_0 GEMMs, the MoE and the F16-KV attention were already row-count invariant). This changes chunked-prefill numerics slightly, in the direction of decoding; the slice-1 KL gate is re-reported in section 14.
+- This also explains why llama.cpp's greedy DSpark output differs from its plain output on the bench card; dotLLM does not have that problem.
+
+**Rewinding the recurrent state.** `ForwardWithRecurrentSnapshots` records, for each of the 48 x 4 conv states, the window `[old state ; the inputs]` of the verify call in the state's own storage type (BF16: lossless, the window is BF16-exact). `RestoreRecurrentStateToRow(r)` stores rows `r+1 .. r+3` of it back and sets the sequence length to `pos0 + r + 1`. Cost: `(3 + rows) x 6656 channels x 48 slots x 2 B` = 7 MB at 8 rows, transient.

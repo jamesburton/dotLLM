@@ -356,6 +356,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                      "Ignored for models whose GGUF embeds the head.")]
         public string? MtpHead { get; set; }
 
+        /// <summary>Inkling 2 DSpark drafter GGUF (issue #2039).</summary>
+        [CommandOption("--dspark")]
+        [Description("Path of the Inkling 2 DSpark drafter GGUF (dspark-Inkling-2-Mini-Q8_0.gguf, unsloth/Inkling-2-Mini-GGUF). It takes the MTP slot: drafts are verified by the " +
+                     "MTP speculative decoder behind the adaptive gate, greedy output is identical to plain decode. Default: a dspark-*.gguf beside the model is auto-attached " +
+                     "(DOTLLM_DSPARK=0 opts out); an explicit path that cannot be attached stops the run, an auto-detected one is logged and ignored. inkling2 models on the CPU.")]
+        public string? DSpark { get; set; }
+
         /// <summary>DFlash / DFlash2 block-diffusion drafter GGUF (issue #1175).</summary>
         [CommandOption("--dflash")]
         [Description("Path of a DFlash / DFlash2 drafter GGUF (arch 'dflash', e.g. z-lab/Qwen3.8-27B-DFlash2-GGUF). It takes the MTP slot: drafts are verified by the " +
@@ -578,6 +585,15 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 if (model is not DotLLM.Core.Models.IDFlashDraftAttachable dflashTarget)
                     throw new NotSupportedException($"--dflash: {model.GetType().Name} cannot drive a DFlash drafter (qwen35 targets on CPU, CUDA or Vulkan only for now).");
                 dflashTarget.AttachDFlashDrafter(settings.DFlash);
+            }
+            else if (!settings.NoMtp && model is DotLLM.Models.Architectures.Inkling2TransformerModel)
+            {
+                // Inkling 2 DSpark drafter (#2039): explicit --dspark is fatal on failure, an auto-detected sibling is logged and ignored.
+                try { mtpHeadPath = DotLLM.Models.Architectures.DSpark.Inkling2DSparkResolver.TryAttach(model, resolvedPath, settings.DSpark); }
+                catch (Exception ex) when (settings.DSpark is null)
+                {
+                    Console.Error.WriteLine($"WARNING: DSpark drafter not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");
+                }
             }
             else if (!settings.NoMtp)
             {

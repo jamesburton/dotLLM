@@ -63,6 +63,14 @@ public sealed record Inkling2Options(
 internal enum Inkling2Mutant
 {
     None, TwoPasses, NoFinalSoftcap, NoSink, NoRelativeBias, NoLogScale, NoExpertScale, NoControl,
+    /// <summary>DSpark taps keyed by cache slot instead of layer visit (#2039).</summary>
+    TapBySlot,
+    /// <summary>DSpark taps one visit late (the layer OUTPUT instead of its input).</summary>
+    TapOffByOne,
+    /// <summary>Visit 48 tapped before the output norm.</summary>
+    TapPreNorm,
+    /// <summary>A rejected speculative round leaves the recurrent state advanced (RestoreRecurrentStateToRow is a no-op).</summary>
+    SkipRestore,
 }
 
 /// <summary>Receives <c>(name, data, rows, cols)</c> tensors from <see cref="Inkling2TransformerModel"/>'s trace hook (tests / bisection).</summary>
@@ -80,7 +88,7 @@ internal delegate void Inkling2TraceSink(string name, ReadOnlySpan<float> data, 
 /// <para>The model owns its sequence state (KV + conv state per cache slot); positions must continue it (<c>positions[i] == state.Length + i</c>)
 /// and a call at position 0 restarts it. An external <see cref="IKvCache"/> is ignored.</para>
 /// </remarks>
-public sealed unsafe class Inkling2TransformerModel : IModel
+public sealed unsafe partial class Inkling2TransformerModel : IModel
 {
     private readonly record struct MatRef(nint Ptr, QuantizationType Qt, int In, int Out);
 
@@ -321,6 +329,8 @@ public sealed unsafe class Inkling2TransformerModel : IModel
     }
 
     /// <summary><c>c[t, i] = dot(W[i, :], b[t, :])</c>; every weight type is read in place (no expansion): quantized and BF16 weights through their GEMMs.</summary>
+    internal static void GemmPublic(nint weights, QuantizationType qt, float* b, float* c, int m, int k, int n, ComputeThreadPool? pool) => Gemm(weights, qt, b, c, m, k, n, pool);
+
     private static void Gemm(nint weights, QuantizationType qt, float* b, float* c, int m, int k, int n, ComputeThreadPool? pool)
     {
         switch (qt)
@@ -351,7 +361,8 @@ public sealed unsafe class Inkling2TransformerModel : IModel
     public ITensor ForwardWithState(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, Inkling2SequenceState state, bool lastTokenLogitsOnly = false)
         => ForwardCore(tokenIds, positions, deviceId, state, lastTokenLogitsOnly);
 
-    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, Inkling2SequenceState state, bool lastTokenLogitsOnly)
+    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, Inkling2SequenceState state, bool lastTokenLogitsOnly,
+                                IInkling2Tap? tap = null, bool recordRows = false)
     {
         ArgumentNullException.ThrowIfNull(state);
         int T = tokenIds.Length;
@@ -364,8 +375,14 @@ public sealed unsafe class Inkling2TransformerModel : IModel
             throw new ArgumentOutOfRangeException(nameof(positions), $"Sequence would exceed the context length {Config.MaxSequenceLength}.");
 
         Inkling2Scratch sc = RentScratch();
-        try { return ForwardBody(tokenIds, deviceId, state, lastTokenLogitsOnly, sc); }
-        finally { ReturnScratch(sc); }
+        int posStart = state.Length;
+        try
+        {
+            state.RecordRows = recordRows;
+            if (recordRows) _recordedPos0 = posStart;
+            return ForwardBody(tokenIds, deviceId, state, lastTokenLogitsOnly, sc, tap);
+        }
+        finally { state.RecordRows = false; ReturnScratch(sc); }
     }
 
     private Inkling2Scratch RentScratch()
@@ -383,8 +400,9 @@ public sealed unsafe class Inkling2TransformerModel : IModel
         lock (_scratchPool) _scratchPool.Push(sc);
     }
 
-    private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Inkling2SequenceState st, bool lastOnly, Inkling2Scratch sc)
+    private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Inkling2SequenceState st, bool lastOnly, Inkling2Scratch sc, IInkling2Tap? tap)
     {
+        int visit = 0;
         int T = tokenIds.Length, H = _hidden;
         int pos0 = st.Length;
         _pool?.SetDispatchMode(T == 1 ? DispatchMode.SpinWait : DispatchMode.EventBased);
@@ -408,7 +426,7 @@ public sealed unsafe class Inkling2TransformerModel : IModel
         int start = _c.LoopStart, end = _c.LoopEnd;
         int coreStart = _c.LoopPasses > 1 ? start : _nPhys;
 
-        for (int il = 0; il < coreStart; il++) cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st);
+        for (int il = 0; il < coreStart; il++) { tap?.Capture(Mutant == Inkling2Mutant.TapOffByOne ? visit + 1 : visit, cur, T); visit++; cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
 
         if (_c.LoopPasses > 1)
         {
@@ -448,11 +466,12 @@ public sealed unsafe class Inkling2TransformerModel : IModel
                             messages = DepthMix(sc, sc.Bank, bankOut, q, 4, T, sc.Msg);
                         }
                     }
+                    tap?.Capture(Mutant == Inkling2Mutant.TapBySlot ? slot : visit, cur, T); visit++;
                     cur = ForwardLayer(slot, ip, cur, sc, messages, loop, T, pos0, st);
                     Trace?.Invoke($"pass{pass}.l{ip}", cur, T, H);
                 }
             }
-            for (int il = end; il < _nPhys; il++) cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st);
+            for (int il = end; il < _nPhys; il++) { tap?.Capture(visit++, cur, T); cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
         }
 
         // Output: depth mix with output_res_query, gain-ed RMS norm, LM head (unpadded rows only), final logit softcap.
@@ -461,6 +480,7 @@ public sealed unsafe class Inkling2TransformerModel : IModel
         for (int t = 0; t < T; t++)
             Inkling2Ops.RmsNorm(mixed.Slice(t * H, H), _outputNorm.Span, _eps, mixed.Slice(t * H, H));
         Trace?.Invoke("result_norm", mixed, T, H);
+        tap?.Capture(visit++, Mutant == Inkling2Mutant.TapPreNorm ? cur : mixed, T);   // visit 48: the final normed output of every row
 
         int rows = lastOnly ? 1 : T;
         int firstRow = T - rows;
@@ -855,6 +875,7 @@ public sealed unsafe class Inkling2TransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _dspark?.Dispose();
         DotLLM.Cpu.Kernels.CpuKernelScratch.Trim(null);
         if (_ownsPool) _pool?.Dispose();
         _defaultState.Dispose();
