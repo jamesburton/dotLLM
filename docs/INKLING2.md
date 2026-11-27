@@ -1,6 +1,6 @@
 # Inkling 2 (Thinking Machines) — architecture notes
 
-**Status:** CPU reference forward (issue #2026) and Vulkan text decoder (issue #2034, section 11), epic #2025. CUDA, the vision tower and the DSpark drafter are later slices (section 9).
+**Status:** CPU reference forward (issue #2026), Vulkan text decoder (issue #2034, section 11) and the CPU DSpark drafter (issue #2039, sections 12-14), epic #2025. CUDA, the vision tower and the Vulkan drafter (#2046) are later slices (section 9).
 Model: `thinkingmachines/Inkling-2-Mini` (HF `model_type: inkling2_loop`, `Inkling2LoopForConditionalGeneration`, Apache-2.0, 2026-11-20).
 GGUF: `ggml-org/Inkling-2-Mini-GGUF` (`general.architecture = inkling2_loop`; a plain `inkling2` file is the same graph with one pass).
 
@@ -263,3 +263,26 @@ Greedy identity "by construction" only holds if an N-row forward equals N single
 - This also explains why llama.cpp's greedy DSpark output differs from its plain output on the bench card; dotLLM does not have that problem.
 
 **Rewinding the recurrent state.** `ForwardWithRecurrentSnapshots` records, for each of the 48 x 4 conv states, the window `[old state ; the inputs]` of the verify call in the state's own storage type (BF16: lossless, the window is BF16-exact). `RestoreRecurrentStateToRow(r)` stores rows `r+1 .. r+3` of it back and sets the sequence length to `pos0 + r + 1`. Cost: `(3 + rows) x 6656 channels x 48 slots x 2 B` = 7 MB at 8 rows, transient.
+
+## 14. DSpark results (CPU, Strix Halo, NVFP4 target + Q8_0 drafter, 2026-11-27)
+
+**Slice-1 KL gate with the conv-history fix** (`Inkling2RealModelTests`, 254 scored positions, defaults BF16 controller + BF16 conv state, vs llama.cpp `-fa off`): mean KL **4.053e-3** (was 4.10e-3), max 1.20e-1 (was 9.0e-2), top-1 97.6% (was 98.8%, three positions of 254), teacher-forced greedy mismatches 5/384 (**0/345 at oracle margin >= 0.3**, the gate's bar; the five are at margins 0.016-0.108). The mean did not move (the in-batch rounding makes chunked prefill agree with decoding instead of the unrounded batch path); max and top-1 move by single positions, inside llama.cpp's own flash-attention noise (4.05e-3 mean, 1.9e-1 max). The stored conv state is still BF16.
+
+**Greedy identity** (`GreedySpeculative_EqualsPlainGreedy_OnEightPrompts`, the 8 oracle prompts x 40 tokens, K = 3, the unmodified `MtpSpeculativeDecoder`, row snapshots): **8/8 identical, 40/40 tokens each**. 167 rounds, 1.90 tokens/round, draft acceptance **30.9%** (per prompt 7%-75%). llama.cpp b12780 on the same prompts (K = 3, 48 tokens): 174 of 574 drafts accepted = **30.3%**.
+
+**Draft parity vs llama.cpp** (`Drafts_MatchLlamaCppDsparkOracle`; oracle `dspark-oracle-k3.json` built from `llama-server -md dspark-... --spec-type draft-dspark --spec-draft-n-max 3 -dev none -devd none -v`; dotLLM is teacher-forced on llama.cpp's committed tokens and drafts at each round's reconstructed anchor): top-1 agreement **570/594 = 96.0%** (position 1: 98.5%), 183 of 198 whole rounds identical, mean |p diff| at position 1 0.0147 (p = softmax over the sampler's top 10). The residue is the target-feature noise floor (KL 4e-3) compounding along the Markov chain.
+
+**Mutants** (each must change the drafts on real data; `Inkling2DSparkTests`, `Inkling2RowInvarianceTests`): killed: taps by cache slot instead of visit, taps one visit late, visit 48 before the output norm, `ctx_mix` softmaxed twice, anchor not normed, anchor normed twice, Markov state reset each step, softcap before the bias, `f_rnn` of the wrong position, layers 0/2 not windowed (`AllLayersGlobal`), per-query window instead of the anchor's (`PerQueryWindow`), skipped `RestoreRecurrentStateToRow` (restore test), unrounded in-batch conv history (row-invariance test, pre-fix). **Survivor:** the global layer 1 windowed too (`AllLayersLocal`): at 1300 tokens of random context its output is bit-identical, because that layer's softmax is so peaked on the anchor/recent keys that keys past 1024 positions carry exactly zero float weight. Recorded as a finding; the window of layer 1 is unobservable on this data.
+
+**Allocation:** a warm draft (K = 7) allocates 0 managed bytes (`DraftHotPath_AllocatesNoManagedTensorMemory`); the drafter's activations and logits are native scratch.
+
+**CPU speed (net slower; the gate keeps it off).** `dotllm run --device cpu -t 0 -n 64`, one process per run (Release build, `cpu-bench` lock, a fresh lock per run), decode tok/s:
+
+| context | off (`--no-mtp`) | auto (default) | forced (`DOTLLM_MTP_ADAPTIVE=0`) | forced / off | tokens/round | drafter ms | verify ms (K+1 = 4 rows) |
+|---|---|---|---|---|---|---|---|
+| short (28 prompt tokens) | 9.79 | 9.61 (plain) | 6.32 / 6.55 | 0.65-0.67x | 2.81 | 27 | 362 |
+| long (8.3 KB of markdown, about 2-3K tokens) | 5.36 | 5.35 (plain) | 3.17 | 0.59x | 1.88 | 28 | 615 |
+
+The drafter is cheap (27 ms); the verify is not: a 4-row verify of a 128-expert top-8 MoE costs 3.5x a single decode on this bandwidth-bound box (362 ms vs about 102 ms), so even 2.8 tokens per round loses (139 vs 102 ms/token). This is the pratikgx card's "about 1.0x" on distinct prompts, a little worse here. **Adaptive gate:** the model is not "large" by the gate's resident-size prior (`ComputeMemoryBytes` is the state, not the mmapped weights), so a single `run` decides plain, which is why auto equals off. Over six requests through `dotllm serve` with an auto-detected `dspark-*.gguf` (hard-linked beside the target) the gate tried MTP once, measured 237.7 ms/token against 95-118 ms plain, fell back after 5 rounds and stayed on plain for the following requests. Draft width: `DOTLLM_DSPARK_DRAFT` (default 3).
+
+**Precision.** Weights Q8_0 / BF16 read in place; the context K/V is F16 (12 KiB per position for 3 layers, no F32 anywhere stored); `f_rnn` rows F16; tap rows F16; activations are native scratch, F32 only within a call (as the CPU reference). The Markov recurrent state (256 floats, 1 KiB) is an F32 in-call accumulator on the stack, never stored across calls; a BF16/8-bit evaluation of it has **not** been done (open item for sign-off). The recorded conv-snapshot window is BF16.
