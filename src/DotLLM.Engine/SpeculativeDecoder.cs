@@ -142,8 +142,20 @@ public sealed class SpeculativeDecoder : ISpeculativeDecoder
                     generatedIds.RemoveRange(originalGenCount, generatedIds.Count - originalGenCount);
             }
 
-            return Verify(targetModel, kvCacheTarget, kvCacheDraft, constraint, lastToken, position, maxPos,
-                targetVocabSize, sharedVocab, draftTokens.AsSpan(0, k), draftProbsFlat, draftTicks, outputBuffer);
+            SpeculativeResult result = Verify(targetModel, kvCacheTarget, kvCacheDraft, constraint, lastToken, position,
+                maxPos, targetVocabSize, sharedVocab, draftTokens.AsSpan(0, k), draftProbsFlat, draftTicks, outputBuffer);
+
+            // The draft phase forwards each token to predict the next one, so the last draft is never forwarded. When all K
+            // are accepted and a bonus token follows, that draft is part of the history: forward it now, or the next round
+            // writes past a never-written row of the draft KV-cache and its drafts are garbage from then on (#2064).
+            if (result.AcceptedCount == k + 1)
+            {
+                long catchUpStart = Stopwatch.GetTimestamp();
+                using ITensor _ = draftModel.Forward([draftTokens[k - 1]], [position + k], deviceId: -1, kvCacheDraft);
+                result = result with { DraftTicks = result.DraftTicks + (Stopwatch.GetTimestamp() - catchUpStart) };
+            }
+
+            return result;
         }
         finally
         {
