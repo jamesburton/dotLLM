@@ -11,6 +11,7 @@ SHADERS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
 
 BODIES = {
     "embed": [None],
+    "embed_rows": [None],
     "rmsnorm": [None],
     "mix": [None],
     "ctrl_in": [None],

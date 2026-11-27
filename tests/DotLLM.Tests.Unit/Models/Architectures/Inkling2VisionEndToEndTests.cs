@@ -27,9 +27,9 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
 
     public void Dispose() { _defaultEncoder?.Dispose(); _encoder?.Dispose(); _model?.Dispose(); _file?.Dispose(); }
 
-    private sealed record Oracle(DecodedImage Image, int[] Before, int[] After, int ImageTokens, int[] Gen, float[] Logits, int NVocab);
+    internal sealed record Oracle(DecodedImage Image, int[] Before, int[] After, int ImageTokens, int[] Gen, float[] Logits, int NVocab);
 
-    private static Oracle? LoadOracle(string name)
+    internal static Oracle? LoadOracle(string name)
     {
         string dir = Path.Combine(Inkling2VisionFixtures.OracleDir, name);
         string meta = Path.Combine(dir, "meta.txt"), ppm = Path.Combine(dir, "image.ppm"), lg = Path.Combine(dir, "logits.f32");

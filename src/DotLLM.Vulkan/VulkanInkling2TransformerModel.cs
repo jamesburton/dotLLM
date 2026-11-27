@@ -3,6 +3,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
+using DotLLM.Core.Vision;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
@@ -71,7 +72,7 @@ public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2K
 /// <para>The model owns its sequence state like the CPU model: positions must continue it, and a call at position 0 restarts it. One command buffer per chunk
 /// of <see cref="Inkling2VulkanOptions.MaxChunk"/> tokens.</para>
 /// </remarks>
-public sealed unsafe class VulkanInkling2TransformerModel : IModel
+public sealed unsafe class VulkanInkling2TransformerModel : IModel, IImageInputModel
 {
     private sealed class Mat
     {
@@ -134,6 +135,10 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
     private VulkanDevice.Buffer _attn = null!, _attnOut = null!, _ffnInp = null!, _mn = null!, _moe = null!, _h = null!, _sel = null!, _selW = null!, _ids = null!;
     private VulkanDevice.Buffer? _logits;
     private long _logitsBytes;
+    // image-embedding injection (#2062), allocated on the first image prefill: F16 rows of the chunk's image positions (compact) and the per-token row selector.
+    private VulkanDevice.Buffer? _imgRows, _imgSel;
+    private ushort[]? _imgRowsHost;
+    private uint[]? _imgSelHost;
 
     private readonly HashSet<nint> _pendingW = new(), _pendingR = new();
     private nint _cmd;
@@ -586,7 +591,23 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
         => ForwardCore(tokenIds, positions, deviceId, lastTokenLogitsOnly);
 
-    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, bool lastOnly)
+    /// <summary>
+    /// Forward with image embeddings (issue #2062): the F16 rows of every <see cref="ImageSpan"/> replace the token embeddings at the positions they cover and
+    /// bypass <c>token_embd_norm</c> (the <c>inkling2_embed_rows</c> kernel rounds them once to the BF16 activation type, after the token-embedding kernel has run);
+    /// the token ids there are ignored. Spans are in absolute sequence positions, so a chunked prefill passes the same list for every chunk. The model owns its sequence
+    /// state, so <paramref name="kvCache"/> is only the engine's handle and is not read. There is no LoRA or MTP/DSpark state: the callers refuse an adapter with images
+    /// and the engine does not draft for an image request.
+    /// </summary>
+    public ITensor ForwardWithImages(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IReadOnlyList<ImageSpan> images, IKvCache? kvCache, bool lastTokenLogitsOnly)
+    {
+        ArgumentNullException.ThrowIfNull(images);
+        for (int i = 0; i < images.Count; i++)
+            if (images[i].Embeddings.Dimension != _H)
+                throw new ArgumentException($"image embeddings are {images[i].Embeddings.Dimension}-wide, the model hidden size is {_H}.", nameof(images));
+        return ForwardCore(tokenIds, positions, deviceId, lastTokenLogitsOnly, images);
+    }
+
+    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, bool lastOnly, IReadOnlyList<ImageSpan>? images = null)
     {
         int T = tokenIds.Length;
         if (T == 0 || T != positions.Length) throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
@@ -612,7 +633,7 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
                 int Tc = Math.Min(_chunk, T - c0);
                 bool lastChunk = c0 + Tc == T;
                 int wantRows = lastOnly ? (lastChunk ? 1 : 0) : Tc;
-                RunChunk(tokenIds.Slice(c0, Tc), _length + c0, wantRows, lastOnly, dst.Slice(lastOnly ? 0 : c0 * _vocab, wantRows * _vocab));
+                RunChunk(tokenIds.Slice(c0, Tc), _length + c0, wantRows, lastOnly, dst.Slice(lastOnly ? 0 : c0 * _vocab, wantRows * _vocab), images);
             }
         }
         catch { result.Dispose(); throw; }
@@ -620,12 +641,48 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
         return result;
     }
 
+    /// <summary>
+    /// Gathers the F16 rows of the image positions inside <c>[basePos, basePos + Tc)</c> into a compact host staging buffer and uploads it with the per-token
+    /// selector (0xFFFFFFFF = token row). Returns false when no position of the chunk is an image position (the chunk then runs the unchanged text path).
+    /// </summary>
+    private bool StageImageRows(IReadOnlyList<ImageSpan> images, int basePos, int Tc)
+    {
+        int H = _H;
+        _imgSelHost ??= new uint[_chunk];
+        _imgRowsHost ??= new ushort[(long)_chunk * H];   // reused host staging (the encoder's F16 payload is copied, never widened)
+        int n = 0;
+        for (int t = 0; t < Tc; t++)
+        {
+            _imgSelHost[t] = 0xFFFFFFFFu;
+            int pos = basePos + t;
+            for (int i = 0; i < images.Count; i++)
+            {
+                var sp = images[i];
+                if (pos < sp.Start || pos >= sp.End) continue;
+                MemoryMarshal.Cast<Half, ushort>(sp.Embeddings.Rows.Slice((pos - sp.Start) * H, H)).CopyTo(_imgRowsHost.AsSpan(n * H, H));
+                _imgSelHost[t] = (uint)n++;
+                break;
+            }
+        }
+        if (n == 0) return false;
+        if (_imgRows is null)
+        {
+            _imgRows = Own(_device.Allocate((long)_chunk * H * 2));
+            _imgSel = Own(_device.Allocate(Math.Max(16, (long)_chunk * 4)));
+            _deviceBytes += _imgRows.Size + _imgSel.Size;
+        }
+        _device.Upload(MemoryMarshal.AsBytes(_imgRowsHost.AsSpan(0, n * H)), _imgRows);
+        _device.Upload(MemoryMarshal.AsBytes(_imgSelHost.AsSpan(0, Tc)), _imgSel!);
+        return true;
+    }
+
     private VulkanDevice.Buffer PickOther(VulkanDevice.Buffer cur) => ReferenceEquals(cur, _x0) ? _x1 : _x0;
 
-    private void RunChunk(ReadOnlySpan<int> ids, int basePos, int logitRows, bool lastOnly, Span<float> logitsDst)
+    private void RunChunk(ReadOnlySpan<int> ids, int basePos, int logitRows, bool lastOnly, Span<float> logitsDst, IReadOnlyList<ImageSpan>? images = null)
     {
         int Tc = ids.Length, H = _H;
         _device.Upload(MemoryMarshal.AsBytes(ids), _ids);
+        bool hasImageRows = images is { Count: > 0 } && StageImageRows(images, basePos, Tc);
         _submit.Begin();
         _cmd = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(_cmd);
@@ -633,6 +690,11 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel
 
         var embK = Kernel("emb", "inkling2_embed", 4, 3);
         Run(embK, 1u << 3, [(uint)H, (uint)_vocab, F(_eps)], (uint)Tc, 1, 1, _embedMat.Buf, _ids, _tokEmbNorm, _x0);
+        if (hasImageRows)
+        {
+            var rowsK = Kernel("embrows", "inkling2_embed_rows", 3, 1);
+            Run(rowsK, 1u << 2, [(uint)H], (uint)Tc, 1, 1, _imgRows!, _imgSel!, _x0);
+        }
         TraceBuf("embed", _x0, Tc, H);
 
         var stack = new List<int>();
