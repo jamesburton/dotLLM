@@ -46,7 +46,7 @@ internal sealed record Inkling2DSparkSpec(
         int[] visits = ReadInts(md, "dflash.target_layers");
         if (visits.Length < 2 || visits[^1] != targetVisits)
             throw new InvalidOperationException($"Drafter target_layers {string.Join(",", visits)} must end at the target's {targetVisits} layer visits (the final normed output).");
-        bool[] swa = ReadBools(md, "dflash.sliding_window_pattern", nLayer);
+        bool[] swa = ReadBools(md, "dflash.attention.sliding_window_pattern", nLayer);
         for (int i = 0; i < nLayer; i++)
             foreach (string bad in new[] { "attn_post_norm", "ffn_post_norm", "layer_output_scale", "rope_freqs", "attn_sinks" })
                 if (t.ContainsKey($"blk.{i}.{bad}.weight")) throw new NotSupportedException($"Drafter tensor blk.{i}.{bad} is not supported.");
@@ -72,7 +72,8 @@ internal sealed record Inkling2DSparkSpec(
 
     private static bool[] ReadBools(GgufMetadata md, string key, int n)
     {
-        if (!md.TryGetValue(key, out var v)) { var all = new bool[n]; Array.Fill(all, true); return all; }
+        // A missing pattern must not default to "every layer windowed" (the key was misspelled once, #2046: the global layer 1 was then windowed on both backends).
+        if (!md.TryGetValue(key, out var v)) throw new InvalidOperationException($"Drafter GGUF has no '{key}'.");
         bool[] r = v.Value switch
         {
             bool[] a => a,

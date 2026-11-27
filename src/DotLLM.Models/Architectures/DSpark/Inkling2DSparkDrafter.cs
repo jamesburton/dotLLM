@@ -143,7 +143,7 @@ internal sealed unsafe class Inkling2DSparkDrafter : IDisposable
         TargetVisits = ReadInts(md, "dflash.target_layers");
         if (TargetVisits.Length < 2 || TargetVisits[^1] != targetVisits)
             throw new InvalidOperationException($"Drafter target_layers {string.Join(",", TargetVisits)} must end at the target's {targetVisits} layer visits (the final normed output).");
-        bool[] swa = ReadBools(md, "dflash.sliding_window_pattern", nLayer);
+        bool[] swa = ReadBools(md, "dflash.attention.sliding_window_pattern", nLayer);
         _vocab = targetVocab;
 
         _invFreq = new float[HeadDim / 2];
@@ -233,7 +233,8 @@ internal sealed unsafe class Inkling2DSparkDrafter : IDisposable
 
     private static bool[] ReadBools(GgufMetadata md, string key, int n)
     {
-        if (!md.TryGetValue(key, out var v)) { var all = new bool[n]; Array.Fill(all, true); return all; }
+        // A missing pattern must not default to "every layer windowed" (the key was misspelled once, #2046: the global layer 1 was then windowed on both backends).
+        if (!md.TryGetValue(key, out var v)) throw new InvalidOperationException($"Drafter GGUF has no '{key}'.");
         bool[] r = v.Value switch
         {
             bool[] a => a,
