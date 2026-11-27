@@ -152,7 +152,10 @@ internal sealed unsafe class DirectWeightStore : IDisposable
     internal static double BudgetFraction { get; } =
         int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DS_BUDGET_PCT"), out int pct) && pct is >= 10 and <= 100 ? pct / 100.0 : 0.75;
 
-    /// <summary>Bytes enqueued since the last drain; at <see cref="RetireEveryBytes"/> the next heap drains and retires the D3D12 side of the finished ones.</summary>
+    /// <summary>
+    /// Retire window, <c>DOTLLM_VULKAN_DS_RETIRE_MIB</c> (default 2048, range 64..65536): once this many bytes of reads were enqueued since
+    /// the last drain, the next heap first drains and releases the D3D12 side of the finished dedicated heaps (#2044).
+    /// </summary>
     internal static long RetireEveryBytes { get; } =
         (long.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DS_RETIRE_MIB"), out long rm) && rm is >= 64 and <= 65536 ? rm : 2048) << 20;
 
