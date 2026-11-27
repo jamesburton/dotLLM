@@ -83,7 +83,7 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
     private readonly VisionEmbedPrecision _embedPrecision;
     private nint _patchConv, _posConv;   // converted copies (native) when _embedPrecision != F32; the F32 file pointers stay for the sizes
 
-    /// <summary>Environment variable that selects the <see cref="VisionEmbedPrecision"/> when the caller does not (<c>f32</c>, <c>f16</c>, <c>bf16</c>).</summary>
+    /// <summary>Environment variable that selects the <see cref="VisionEmbedPrecision"/> of patch_embd / position_embd when the caller does not (f32, f16, bf16; default bf16).</summary>
     public const string EmbedPrecisionEnvVar = "DOTLLM_VISION_EMBD_PRECISION";
 
     /// <summary>

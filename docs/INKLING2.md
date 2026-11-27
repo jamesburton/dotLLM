@@ -242,9 +242,9 @@ dims 32-63 by the row position), full non-causal attention (scale 1/8), o-proj+b
 2x2 (a merged token is `[(2i,2j), (2i+1,2j), (2i,2j+1), (2i+1,2j+1)]`, x fastest, row-major over the merged grid), then `mm.1` (4096x4096, no bias), erf GELU, `mm.2` (4096 -> 2304, no bias).
 
 **Memory / precision.** Q8_0 matrices are read in place through the Q8_0 GEMM (never expanded). `patch_embd` (4.9 MB), `position_embd` (4 MB), biases and layer scales are F32 in the file. **Biases and layer scales stay F32** (tiny vectors, read in place).
-`patch_embd` and `position_embd` are an A/B arm (user ruling 2026-11-27): `DOTLLM_VISION_EMBD_PRECISION=f32|f16|bf16` (or `Inkling2VisionEncoder.Load(..., embedPrecision)`)
+`patch_embd` and `position_embd` are an A/B arm (user ruling 2026-11-27): `DOTLLM_VISION_EMBD_PRECISION=f32|f16|bf16` (or `Inkling2VisionEncoder.Load(..., embedPrecision)`, default `bf16`)
 converts them once at load to F16 or BF16 (2.45 + 2.0 MB resident instead of reading 4.9 + 4.0 MB F32; the GEMM reads them directly, `position_embd` is converted in registers per
-element). **The default stays F32 until the user rules** (table below). Activations are per-call F32 transients in native scratch (`Inkling2Arena`; a warm 640x640 encode allocates 48 managed bytes,
+element). **The default is BF16** (user ruling 2026-11-27, after the table below); F32 and F16 are the A/B arms. Activations are per-call F32 transients in native scratch (`Inkling2Arena`; a warm 640x640 encode allocates 48 managed bytes,
 `Inkling2VisionAllocationTests`). The scratch is **released after each call down to 128 MB** (review of #2037: a 4,096-token image needs a 2,517 MB working set, which used to stay
 resident for the life of the encoder; measured on a 2560x2560 noise image: peak 2,517 MB, 0 held after the call, 425.9 s encode while another agent held the CPU;
 `Inkling2VisionLimitsTests.BigImageScratch_IsReleasedAfterTheEncode` pins the release on a 256-token image with a 32 MB keep). The stored result is **F16** (`ImageEmbeddings`, `tokens x 2304 x 2` bytes: 69 KB for a 15-token image, 2 MB at 640x640, 19 MB at the 4096-token limit).
@@ -269,7 +269,7 @@ PPM are decoded without dependencies; JPEG is refused by name. A backend plugs i
 `ForwardWithImages` takes the engine's `IKvCache` (review of #2037), so a model with an external KV handle (the Vulkan Inkling 2 model's `Inkling2KvHandle`) can implement it; there is no LoRA or MTP
 parameter, the engine refuses an adapter with images and does not run MTP for an image request. Chunk-cache annotations (`chunk` on a text part, `at.part`) are supported on array content (docs/CHUNK_CACHE.md).
 
-**Embedding precision (PR #2037, F32 vs F16 vs BF16 for `patch_embd` / `position_embd`; default F32, for the user to rule).** relRMS of our F16 output embeddings:
+**Embedding precision (PR #2037, F32 vs F16 vs BF16 for `patch_embd` / `position_embd`; the user ruled BF16 the default on 2026-11-27).** relRMS of our F16 output embeddings:
 
 | arm | control: F32-weights mmproj vs llama.cpp (80 / 190x110) | control: vs our F32 arm | shipped Q8_0 vs llama.cpp (80 / 190x110 / 640) | shipped vs our F32 arm |
 |---|---|---|---|---|
@@ -292,6 +292,10 @@ the F16 storage of our own output already costs, and the gap to llama.cpp does n
 still does not order them: F16 and BF16 are below F32 on two or three of the images, and the arm-vs-F32 KL (2e-3 to 5e-3) is the size of the F32 arm's own gap to llama.cpp. The single visible flip moved from BF16 (before the fix) to F16 (after), on 640:
 it is noise, not an arm effect. Memory saved: 4.45 MB. Tests: `Inkling2VisionEmbedPrecisionTests.Report_EmbedPrecisionArms_Embeddings`,
 `Inkling2VisionEndToEndTests.Report_EmbedPrecisionArms_EndToEndKl`; the control files live next to the oracles in `~/.dotllm/test-cache/token-oracles/inkling2/vision-f32-control/`.
+
+**Gates under the BF16 default.** The checkpoint and mutant gates (4-decimal early stages, marginal mutants) were calibrated on F32 and stay pinned to the F32 arm (`LoadEncoder()` / `Models()`); with BF16 the embedding cosine on 640
+drops from 0.995 to 0.979 (relRMS 3.5e-2), tanh GELU stops being separable at the checkpoint gate (relRMS 2.57e-2 vs 2.42e-2) and the transposed-posemb mutant lands at KL 1.48e-2 against the 1.5e-2 end-to-end gate. The shipping default has its own gates:
+`Embeddings_MatchLlamaCpp_UnderTheDefaultBf16` (relRMS < 6%, cosine > 0.97), and the end-to-end, single-pass and chunk-invariance tests run on the default encoder. `Default_IsBf16_OnAnEncoderLoadedWithoutAnArgument` pins the default.
 
 **Chunked prefill of an image prompt (found in review of #2037, fixed by #2039 commit 4f01904d).** Before the fix the final-position logits of an image prompt depended on the prefill chunk size (KL vs the 32-token run
 1.9e-3 at 5 tokens on the 80 image, 5.5e-2 at 7 and 1.3e-1 at 4 on 190x110, same top-1) although the `embed` trace was bit-identical across chunk sizes and the text-only control moved only 3e-5 to 2e-4. Root cause (found by the
