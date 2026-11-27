@@ -1,0 +1,8 @@
+# regex (matched against the test's fully qualified name)<TAB>issue number<TAB>short label
+# Used only to LINK a retried test to its tracking issue in the CI job summary (#2052). It never decides whether to retry.
+Edge0	1985	Edge0 steady-state allocation
+ComputeThreadPool	2050	ComputeThreadPool CountdownEvent underflow (host crash)
+SolutionScanner.*Cancel	2049	SolutionScanner cancellation
+SolutionScanner.*Timeout	1737	SolutionScanner option timeout
+PullManager|QuietPeriod|ChunkCacheMcp|StalledClient	2051	timing flakes
+PriorityConcurrencyGate	1696	PriorityConcurrencyGate FIFO
