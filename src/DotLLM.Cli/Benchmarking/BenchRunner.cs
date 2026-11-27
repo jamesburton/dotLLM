@@ -100,6 +100,8 @@ public static class BenchRunner
             Warmup = warmupReps > 0 ? all[0] : null,
             Reps = warmupReps > 0 ? BenchStats.DiscardWarmup(all, warmupReps) : all,
             LoadMs = loadMs,
+            DirectStorageDeclinedTensors = DotLLM.Vulkan.VulkanWeightImportPolicy.ModelDirectDeclinedTensors,
+            HostStagedBytes = DotLLM.Vulkan.VulkanWeightImportPolicy.ModelHostStagedBytes,
             PromptTokens = promptTokens.Length,
             DecodeTokens = decodeTokens,
             Depth = depth,

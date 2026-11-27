@@ -183,7 +183,6 @@ internal sealed unsafe class DirectWeightStore : IDisposable
     private nint _dsQueue;
     private int _pendingRequests;
     private long _inflightBytes;
-    private bool _budgetWarned;
     private bool _disposed;
 
     /// <summary>Why the store is unusable on this device (empty when usable).</summary>
@@ -477,15 +476,11 @@ internal sealed unsafe class DirectWeightStore : IDisposable
         VulkanDevice.Buffer? slab = null;
         try
         {
-            if (s_trace && _heaps.Count is 0 or 1 or 2 or 3) Console.Error.WriteLine($"[ds-mem] stage after CreateHeap {bytes >> 20} MiB: {Diagnose()}");
             hr = D3dNative.CreateBufferResource(_d3dDevice, d3dHeap, 0, (ulong)bytes, out resource);
             if (hr < 0) { why = $"CreatePlacedResource(0x{hr:X8}; {Diagnose()})"; return null; }
             hr = D3dNative.CreateSharedHandle(_d3dDevice, d3dHeap, out sharedHandle);
             if (hr < 0) { why = $"CreateSharedHandle(0x{hr:X8})"; return null; }
-
-            if (s_trace && _heaps.Count is 0 or 1 or 2 or 3) Console.Error.WriteLine($"[ds-mem] stage after shared handle: {Diagnose()}");
             slab = _device.TryImportD3D12Heap(sharedHandle, bytes, out why);
-            if (s_trace && _heaps.Count is 0 or 1 or 2 or 3) Console.Error.WriteLine($"[ds-mem] stage after vk import: {Diagnose()}");
             if (slab is null) return null;
 
             Interlocked.Increment(ref s_liveD3dHeaps);
@@ -537,11 +532,7 @@ internal sealed unsafe class DirectWeightStore : IDisposable
         if (D3dNative.QueryVideoMemoryInfo(_adapter, false, out info) < 0
             || AdmitHeap((long)info.CurrentUsage, (long)info.Budget, bytes, BudgetFraction)) return true;
         why = $"d3d12_budget(usage {info.CurrentUsage >> 20} MiB + 2 x {bytes >> 20} MiB exceeds {(int)(BudgetFraction * 100)}% of {info.Budget >> 20} MiB)";
-        if (!_budgetWarned)
-        {
-            _budgetWarned = true;
-            Console.Error.WriteLine($"[directstorage] declining further DirectStorage heaps: {why}. Remaining weights take the staged path (host copy through the Vulkan staging ring; page-cache read, so no zero-copy).");
-        }
+        // No per-store warning here: the declined tensors are counted in the model ledger and VulkanModelLoader prints ONE warning per load (#2044).
         return false;
     }
 
