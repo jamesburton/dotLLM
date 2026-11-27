@@ -64,7 +64,8 @@ jobs:
     name: Unit Tests
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # ~27 min normally; 60 leaves room for a hang (5 min blame-hang) plus a whole-project retry (#2052).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -108,12 +109,12 @@ jobs:
           case "$got" in "$pin"*) ;; *) echo "::error::glslc '$got' is not the pinned '$pin' (native/vulkan/glslc.version); VulkanSpvFreshnessTests would skip"; exit 1 ;; esac
 
       - name: Unit Tests
-        run: dotnet test tests/DotLLM.Tests.Unit/ -c Release --filter "Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
+        run: python3 scripts/ci/test-retry.py --label unit -- dotnet test tests/DotLLM.Tests.Unit/ -c Release --filter "Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
 
       # The MIT client package has no DotLLM.* project references, so its tests are a separate project.
       # The Overhead benchmark test is Release-only/Category=Benchmark and stays out of CI.
       - name: Chunk-cache client tests
-        run: dotnet test tests/DotLLM.ChunkCache.Client.Tests/ -c Release --filter "Category!=Benchmark" --blame-hang-timeout 5m
+        run: python3 scripts/ci/test-retry.py --label chunkcache-client -- dotnet test tests/DotLLM.ChunkCache.Client.Tests/ -c Release --filter "Category!=Benchmark" --blame-hang-timeout 5m
 
       # The freshness test is a SkippableFact, and the full run above only prints totals: assert here that it really ran.
       - name: Tracked .spv freshness actually ran (not skipped)
@@ -135,7 +136,7 @@ jobs:
           # .NET 10 groups AVX-512 F/BW/CD/DQ/VL under one knob; DOTNET_EnableAVX512F alone is ignored there (#1623, measured on 10.0.11).
           # EnableAVX=0 already implies it - this is explicit, not load-bearing.
           DOTNET_EnableAVX512: "0"
-        run: dotnet test tests/DotLLM.Tests.Unit/ -c Release --no-build --filter "FullyQualifiedName!~DotLLM.Tests.Unit.Vulkan&Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
+        run: python3 scripts/ci/test-retry.py --label unit-noavx -- dotnet test tests/DotLLM.Tests.Unit/ -c Release --no-build --filter "FullyQualifiedName!~DotLLM.Tests.Unit.Vulkan&Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
 
       # DOTLLM_CPU_ISA (src/DotLLM.Cpu/CpuFeatures.cs, docs/CPU_FEATURE_GATING.md) caps the highest tier dotLLM dispatches to, on a
       # runner that has everything: scalar = no SIMD intrinsics at all, v128 = SSSE3/SSE4.1 only, avx2 = no AVX-512.
@@ -145,10 +146,21 @@ jobs:
           fail=0
           for isa in scalar v128 avx2; do
             echo "::group::DOTLLM_CPU_ISA=$isa"
-            DOTLLM_CPU_ISA=$isa dotnet test tests/DotLLM.Tests.Unit/ -c Release --no-build --filter "FullyQualifiedName!~DotLLM.Tests.Unit.Vulkan&Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m || fail=1
+            DOTLLM_CPU_ISA=$isa python3 scripts/ci/test-retry.py --label "unit-isa-$isa" -- dotnet test tests/DotLLM.Tests.Unit/ -c Release --no-build --filter "FullyQualifiedName!~DotLLM.Tests.Unit.Vulkan&Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m || fail=1
             echo "::endgroup::"
           done
           exit $fail
+
+      # TRX results of both attempts plus --blame-crash sequences/dumps (#2052, #2055). Also uploaded when a retry rescued
+      # the job (test-retry.py sets TEST_RETRIED), so a flake's first-attempt TRX and a crash dump are not lost on a green run.
+      - name: Upload test results
+        if: failure() || cancelled() || env.TEST_RETRIED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-unit
+          path: ${{ runner.temp }}/test-results
+          if-no-files-found: ignore
+          retention-days: 7
 
   integration-tests:
     name: Integration Tests
@@ -218,7 +230,7 @@ jobs:
             dotllm-test-models-
 
       - name: Integration Tests
-        run: dotnet test tests/DotLLM.Tests.Integration/ -c Release --blame-hang-timeout 5m
+        run: python3 scripts/ci/test-retry.py --label integration -- dotnet test tests/DotLLM.Tests.Integration/ -c Release --blame-hang-timeout 5m
 
       - name: Inventory cached test models
         id: inventory
@@ -256,6 +268,17 @@ jobs:
         with:
           path: ~/.dotllm/test-cache
           key: dotllm-test-models-${{ steps.fixtures.outputs.hash }}-${{ steps.inventory.outputs.present }}
+
+      # TRX results of both attempts plus --blame-crash sequences/dumps (#2052, #2055). Also uploaded when a retry rescued
+      # the job (test-retry.py sets TEST_RETRIED), so a flake's first-attempt TRX and a crash dump are not lost on a green run.
+      - name: Upload test results
+        if: failure() || cancelled() || env.TEST_RETRIED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-integration
+          path: ${{ runner.temp }}/test-results
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ---- Fork dev channel ---------------------------------------------------------------------------------------------------------
   # Every push to `dev` that passes the jobs above publishes a prerelease `v<DEV_BASE_VERSION>-dev.<commit count>` through the same

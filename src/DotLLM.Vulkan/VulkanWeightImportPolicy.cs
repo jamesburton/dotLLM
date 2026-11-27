@@ -331,10 +331,9 @@ internal static class VulkanWeightImportPolicy
         }
         DirectDeclinedCount++;
         DirectDeclinedBytes += bytes;
-        s_modelDeclinedCount++; s_modelDeclinedBytes += bytes;
         if (FirstDirectDecline.Length == 0)
             FirstDirectDecline = direct is null ? "unavailable:" + DirectStorage.DirectWeightStore.UnavailableReason(device) : direct.LastFallbackReason;
-        if (s_modelFirstDecline.Length == 0) s_modelFirstDecline = FirstDirectDecline.Length > 0 ? FirstDirectDecline : "declined";
+        NoteDirectDeclined(bytes, FirstDirectDecline);
         LastFallbackReason = "direct_storage:" + FirstDirectDecline;
         return false;
     }
@@ -376,6 +375,19 @@ internal static class VulkanWeightImportPolicy
     /// <summary>Bytes copied through host memory since <see cref="BeginModelLoad"/> (tensors + expert banks); survives <see cref="Reset"/>.</summary>
     internal static long ModelCopiedBytes => s_modelStagedBytes + s_modelBankStagedBytes;
 
+    /// <summary>Tensors the DirectStorage tier declined during the most recent model load (#2044); a load-summary / bench field.</summary>
+    public static int ModelDirectDeclinedTensors => s_modelDeclinedCount;
+
+    /// <summary>Bytes copied through host memory during the most recent model load (#2044); a load-summary / bench field.</summary>
+    public static long ModelHostStagedBytes => ModelCopiedBytes;
+
+    /// <summary>Records one tensor the DirectStorage tier declined, in the model-level ledger (#2044).</summary>
+    internal static void NoteDirectDeclined(long bytes, string reason)
+    {
+        s_modelDeclinedCount++; s_modelDeclinedBytes += bytes;
+        if (s_modelFirstDecline.Length == 0) s_modelFirstDecline = reason.Length > 0 ? reason : "declined";
+    }
+
     /// <summary>Starts the model-level ledger; call once at the top of a model load (<c>VulkanModelLoader.CreateFromGguf</c>).</summary>
     public static void BeginModelLoad()
     {
@@ -389,19 +401,28 @@ internal static class VulkanWeightImportPolicy
     /// were copied through host memory instead (stating the total bytes copied and how to fix it, #1994); empty otherwise.
     /// </summary>
     public static string EndModelLoad(VulkanDevice device)
+        => BuildLoadWarning(IsDisabled, DirectStorage.DirectWeightStore.WouldBeDefaultButDllMissing(device),
+            s_modelDeclinedCount > 0 && DirectStorage.DirectWeightStore.EnabledFor(device));
+
+    /// <summary>The warning text for the current model ledger; pure over the three device/environment facts so it is testable without a GPU.</summary>
+    internal static string BuildLoadWarning(bool disabled, bool dllMissing, bool declinedAndEnabled)
     {
         long total = s_modelStagedBytes + s_modelBankStagedBytes;
-        if (IsDisabled || total == 0) return string.Empty;
-        if (DirectStorage.DirectWeightStore.WouldBeDefaultButDllMissing(device))
+        if (disabled || total == 0) return string.Empty;
+        if (dllMissing)
             return $"[dotllm] DirectStorage is not installed: {total / (1024.0 * 1024.0):F0} MiB of weights were copied through host memory " +
                    $"({s_modelStagedBytes / (1024.0 * 1024.0):F0} MiB tensors + {s_modelBankStagedBytes / (1024.0 * 1024.0):F0} MiB expert banks). " +
                    (File.Exists(DirectStorage.DirectStorageInstaller.DeclinedMarkerPath)
                        ? $"You declined the download offer; delete {DirectStorage.DirectStorageInstaller.DeclinedMarkerPath} to be asked again, "
                        : "Run `dotllm run` once in a terminal to be offered Microsoft's DirectStorage (fetched from NuGet after you accept its licence), ") +
                    "or place dstorage.dll + dstoragecore.dll next to dotllm / in DOTLLM_DIRECTSTORAGE_DIR (DOTLLM_VULKAN_DIRECT_STORAGE=0 silences this).";
-        if (s_modelDeclinedCount > 0 && DirectStorage.DirectWeightStore.EnabledFor(device))
-            return $"[dotllm] DirectStorage declined {s_modelDeclinedCount} tensors / {s_modelDeclinedBytes / (1024.0 * 1024.0):F0} MiB (first: {s_modelFirstDecline}); " +
-                   $"{total / (1024.0 * 1024.0):F0} MiB of weights were copied through host memory instead.";
+        if (declinedAndEnabled)
+            return $"[dotllm] WARNING: DirectStorage declined {s_modelDeclinedCount} tensors ({s_modelDeclinedBytes / (1024.0 * 1024.0):F0} MiB); " +
+                   $"{total / (1024.0 * 1024.0):F0} MiB of weights were staged through host memory instead (an extra copy, CLAUDE.md rule 3). " +
+                   $"Reason (first): {s_modelFirstDecline}." +
+                   (s_modelFirstDecline.StartsWith("d3d12_budget", StringComparison.Ordinal)
+                       ? " Raise DOTLLM_VULKAN_DS_BUDGET_PCT (default 75; the device is removed near 84%) to keep more weights on the direct path."
+                       : string.Empty);
         return string.Empty;
     }
 

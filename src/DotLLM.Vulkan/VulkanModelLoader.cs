@@ -98,6 +98,12 @@ public static class VulkanModelLoader
         GgufFile gguf, ModelConfig config, int? physicalIndex, int nCpuMoeLayers = -1)
         => CreateFromGguf(physicalIndex is int i ? GetDevice(i) : SharedDevice, gguf, config, ResolveSpvDir(), nCpuMoeLayers);
 
+    /// <summary>Tensors the DirectStorage tier declined during the most recent model load (#2044); 0 when none or off Vulkan.</summary>
+    public static int LastLoadDirectStorageDeclinedTensors => VulkanWeightImportPolicy.ModelDirectDeclinedTensors;
+
+    /// <summary>Bytes copied through host memory during the most recent model load (#2044).</summary>
+    public static long LastLoadHostStagedBytes => VulkanWeightImportPolicy.ModelHostStagedBytes;
+
     /// <summary>
     /// Creates the architecture-appropriate Vulkan model for <paramref name="gguf"/>.
     /// </summary>

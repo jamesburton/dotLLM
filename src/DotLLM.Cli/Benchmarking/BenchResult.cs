@@ -34,6 +34,12 @@ public sealed class BenchResult
     /// <summary>Model load wall time in milliseconds — excluded from every repetition.</summary>
     public required double LoadMs { get; init; }
 
+    /// <summary>Tensors the Vulkan DirectStorage tier declined during the model load (#2044); 0 on other backends.</summary>
+    public int DirectStorageDeclinedTensors { get; init; }
+
+    /// <summary>Bytes copied through host memory during the Vulkan model load (#2044); 0 on other backends.</summary>
+    public long HostStagedBytes { get; init; }
+
     /// <summary>Actual prompt token count per repetition.</summary>
     public required int PromptTokens { get; init; }
 
