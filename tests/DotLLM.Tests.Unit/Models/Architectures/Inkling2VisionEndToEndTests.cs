@@ -25,7 +25,7 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
 
     public Inkling2VisionEndToEndTests(ITestOutputHelper output) => _output = output;
 
-    public void Dispose() { _encoder?.Dispose(); _model?.Dispose(); _file?.Dispose(); }
+    public void Dispose() { _defaultEncoder?.Dispose(); _encoder?.Dispose(); _model?.Dispose(); _file?.Dispose(); }
 
     private sealed record Oracle(DecodedImage Image, int[] Before, int[] After, int ImageTokens, int[] Gen, float[] Logits, int NVocab);
 
@@ -49,6 +49,17 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
         return new Oracle(ImageDecoder.Load(ppm), before!, after!, imageTokens, gen!, f, nVocab);
     }
 
+    private Inkling2VisionEncoder? _defaultEncoder;
+
+    /// <summary>The model with an encoder in the SHIPPING configuration (default patch/position embedding storage, BF16 since the 2026-11-27 ruling).</summary>
+    private (Inkling2TransformerModel Model, Inkling2VisionEncoder Encoder) ModelsDefault()
+    {
+        var (model, _) = Models();
+        _defaultEncoder ??= Inkling2VisionEncoder.Load(Inkling2VisionFixtures.FindMmproj()!, ThreadingConfig.Auto);
+        Assert.Equal(Inkling2VisionEncoder.DefaultEmbedPrecision, _defaultEncoder.EmbedPrecision);
+        return (model, _defaultEncoder);
+    }
+
     private (Inkling2TransformerModel Model, Inkling2VisionEncoder Encoder) Models()
     {
         string? gguf = Inkling2RealModelTests.FindGguf();
@@ -60,7 +71,7 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
             _file = GgufFile.Open(gguf!);
             var cfg = GgufModelConfigExtractor.Extract(_file.Metadata);
             _model = Inkling2TransformerModel.LoadFromGguf(_file, cfg, ThreadingConfig.Auto, Inkling2Options.FromEnvironment());
-            _encoder = Inkling2VisionEncoder.Load(mm!, ThreadingConfig.Auto);
+            _encoder = Inkling2VisionEncoder.Load(mm!, ThreadingConfig.Auto, embedPrecision: VisionEmbedPrecision.F32);   // the sharp arm: mutant gates and A/B baselines
         }
         return (_model, _encoder!);
     }
@@ -159,7 +170,7 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
     {
         var o = LoadOracle(name);
         Skip.If(o is null, "vision oracle (vision/<name>/logits.f32) not generated");
-        var (model, enc) = Models();
+        var (model, enc) = ModelsDefault();
         var s = Run(o!, model, enc);
         _output.WriteLine($"{name}: mean KL {s.MeanKl:E2}, max KL {s.MaxKl:E2}, top-1 {s.Top1}/{s.Rows}, teacher-forced greedy mismatches {s.GreedyMismatch}/{o!.Gen.Length}");
         Assert.True(s.MeanKl < Gate, $"mean KL {s.MeanKl:E2} over {s.Rows} positions (gate {Gate:E1})");
@@ -180,7 +191,7 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
     {
         var o = LoadOracle(name);
         Skip.If(o is null, "vision oracle not generated");
-        var (model, enc) = Models();
+        var (model, enc) = ModelsDefault();
         using var emb = enc.Encode(o!.Image);
         var prompt = o.Before.Concat(Enumerable.Repeat(200054, emb.Tokens)).Concat(o.After).ToArray();
         var spans = new[] { new ImageSpan(o.Before.Length, emb) };
@@ -232,7 +243,7 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
     {
         var o = LoadOracle(name);
         Skip.If(o is null, "vision oracle not generated");
-        var (model, enc) = Models();
+        var (model, enc) = ModelsDefault();
         var reference = RunRows(o!, model, enc).Rows[0];
         var chunked = RunRows(o!, model, enc, chunk: chunk).Rows[0];
         var (kl, same) = FullKl(reference, chunked);
@@ -268,7 +279,7 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
     {
         var o = LoadOracle(name);
         Skip.If(o is null, "vision oracle (vision/<name>/logits.f32) not generated");
-        var (model, enc) = Models();
+        var (model, enc) = ModelsDefault();
         var s = Run(o!, model, enc, chunk: 100_000);
         _output.WriteLine($"{name} single pass: mean KL {s.MeanKl:E2}, max KL {s.MaxKl:E2}, top-1 {s.Top1}/{s.Rows}, greedy mismatches {s.GreedyMismatch}");
         Assert.True(s.MeanKl < Gate, $"mean KL {s.MeanKl:E2} (gate {Gate:E1})");
@@ -283,7 +294,7 @@ public sealed class Inkling2VisionEndToEndTests : IDisposable
     [SkippableFact]
     public void Report_ChunkingVsOracle()
     {
-        var (model, enc) = Models();
+        var (model, enc) = ModelsDefault();
         string conv = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_CONV_STATE") ?? "(default bf16)";
         foreach (string name in new[] { "rainbow80", "rainbow190x110", "rainbow640" })
         {

@@ -19,11 +19,17 @@ public sealed class Inkling2VisionTests
     private static readonly string[] EarlyStages =
         ["patch_embd", "posemb_interp", "embeddings", "pre_ln", "layer_inp_normed-0", "Qcur_pos-0", "Kcur_pos-0", "Vcur-0"];
 
-    private static Inkling2VisionEncoder LoadEncoder()
+    /// <summary>
+    /// The SHARP configuration: patch/position embeddings F32 as stored. The checkpoint and mutant gates (4-decimal early stages, marginal mutants such as tanh GELU)
+    /// were calibrated there and exist to catch implementation bugs; the BF16 default (user ruling 2026-11-27) adds noise of its own that they would
+    /// mistake for a bug or let a marginal mutant hide in. The shipping default is gated separately (<see cref="Embeddings_MatchLlamaCpp_UnderTheDefaultBf16"/>
+    /// and the end-to-end tests).
+    /// </summary>
+    private static Inkling2VisionEncoder LoadEncoder(VisionEmbedPrecision precision = VisionEmbedPrecision.F32)
     {
         string? mm = Inkling2VisionFixtures.FindMmproj();
         Skip.If(mm is null, "mmproj-Inkling-2-Mini-Q8_0.gguf not in the HF cache");
-        return Inkling2VisionEncoder.Load(mm!, new ThreadingConfig(8));
+        return Inkling2VisionEncoder.Load(mm!, new ThreadingConfig(8), embedPrecision: precision);
     }
 
     /// <summary>
@@ -143,6 +149,29 @@ public sealed class Inkling2VisionTests
         var d = CompareEmbeddings(got, o.Embd, o.Dim);
         _output.WriteLine($"{name}: relRMS {d.RelRms:E2}, min cosine {d.MinCosine:F5}, max abs {d.MaxAbs:E2}, {got.Bytes} F16 bytes");
         Assert.True(EmbeddingsPass(d), $"relRMS {d.RelRms:E2}, min cosine {d.MinCosine:F5}");
+    }
+
+    /// <summary>
+    /// The shipping default (BF16 patch/position embeddings) against the same llama.cpp embeddings, with the bound the F32 gate has for relRMS (6%) and a cosine bound
+    /// of 0.97 instead of 0.99: BF16 on 640 measures relRMS 3.5e-2 / min cosine 0.979 (F32 3.3e-2 / 0.995), the 2% Q8_0 noise floor plus the BF16 rounding.
+    /// Gross errors (every mutant is above 18% relRMS) still fail.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("rainbow190x110")]
+    [InlineData("rainbow80")]
+    [InlineData("rainbow640")]
+    public void Embeddings_MatchLlamaCpp_UnderTheDefaultBf16(string name)
+    {
+        var o = LoadEmbd(name);
+        Skip.If(o is null, "embedding oracle (vision/<name>/embd.f32) not generated");
+        string? mm = Inkling2VisionFixtures.FindMmproj();
+        Skip.If(mm is null, "mmproj not available");
+        using var enc = Inkling2VisionEncoder.Load(mm!, new ThreadingConfig(8));
+        Assert.Equal(VisionEmbedPrecision.BF16, enc.EmbedPrecision);
+        using var got = enc.Encode(o!.Image);
+        var d = CompareEmbeddings(got, o.Embd, o.Dim);
+        _output.WriteLine($"{name} (BF16 default): relRMS {d.RelRms:E2}, min cosine {d.MinCosine:F5}");
+        Assert.True(d.RelRms < 0.06 && d.MinCosine > 0.97, $"relRMS {d.RelRms:E2}, min cosine {d.MinCosine:F5}");
     }
 
     public enum PreprocMutant { Bgr, PadNormalizedZero }
