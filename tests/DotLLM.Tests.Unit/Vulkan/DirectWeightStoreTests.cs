@@ -162,6 +162,57 @@ public sealed class DirectWeightStoreTests(ITestOutputHelper output)
     }
 
     /// <summary>
+    /// #2044: the fix that matters for a large model is the retire DURING the load. Bolt failed at heap ~#241, long before Seal. Once
+    /// the retire window is passed, the next heap must first wait for the reads and then drop the D3D12 side of the finished dedicated
+    /// heaps. So at most the last heap is still live on the D3D12 side before Seal, and every weight reads back byte-identical.
+    /// Mutants: deleting the release loop in DrainAndRetire leaves all 6 heaps live; releasing before WaitAll corrupts the weights.
+    /// </summary>
+    [SkippableFact]
+    public void MidLoadRetire_ReleasesFinishedHeapsBeforeSeal_WeightsStayByteIdentical()
+    {
+        Skip.IfNot(OperatingSystem.IsWindows(), "DirectStorage is Windows-only.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasExternalMemoryWin32, "VK_KHR_external_memory_win32 absent.");
+        var store = DirectWeightStore.For(device);
+        Skip.If(store is null, "DirectStorage unavailable: " + DirectWeightStore.UnavailableReason(device));
+        store!.RetireWindowBytes = 16L << 20; // every 24 MiB tensor passes the window, so each new heap retires the previous ones
+
+        var tensors = Enumerable.Range(0, 6).Select(i => ($"t{i}", RandomBytes(24 << 20, seed: 100 + i))).ToArray();
+        string path = WriteGguf(tensors);
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            int live0 = DirectWeightStore.LiveD3d12Heaps;
+            var loaded = new List<(byte[] Data, VulkanDevice.Buffer Buf)>();
+            foreach (var (name, data) in tensors)
+            {
+                Assert.True(store.TryLoad(gguf.TensorDataPointer(gguf.TensorsByName[name]), data.Length, out var buf), store.LastFallbackReason);
+                loaded.Add((data, buf!));
+            }
+            int liveBeforeSeal = DirectWeightStore.LiveD3d12Heaps - live0;
+            store.Seal();
+            _output.WriteLine($"live D3D12 heaps before Seal: {liveBeforeSeal} of {tensors.Length}");
+            Assert.True(liveBeforeSeal <= 1, $"{liveBeforeSeal} of {tensors.Length} D3D12 heaps still live before Seal: the mid-load retire did not run");
+
+            foreach (var (data, buf) in loaded)
+            {
+                var floats = new float[data.Length / 4];
+                device.Download(buf, floats);
+                byte[] back = new byte[floats.Length * 4];
+                Buffer.BlockCopy(floats, 0, back, 0, back.Length);
+                Assert.True(data.AsSpan(0, back.Length).SequenceEqual(back), "weights changed after the mid-load retire");
+                buf.Dispose();
+            }
+        }
+        finally
+        {
+            store.Seal(); // closes the DirectStorage file handle even when an assertion fired, so the delete below cannot mask it
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
     /// #2044 admission rule. The first row is the measured failure: D3D12 local usage 85114 MiB of a 103727 MiB budget when the 886 MiB
     /// expert bank was refused. The second row pins the 2x charge (heap + Vulkan import): a 1x projection (60000) would admit it.
     /// </summary>

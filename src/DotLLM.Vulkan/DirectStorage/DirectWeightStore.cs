@@ -168,6 +168,9 @@ internal sealed unsafe class DirectWeightStore : IDisposable
     internal static bool AdmitHeap(long currentUsage, long budget, long heapBytes, double fraction)
         => budget <= 0 || currentUsage + 2 * heapBytes <= (long)(budget * fraction);
 
+    /// <summary>This store's retire window (bytes); starts at <see cref="RetireEveryBytes"/>. Tests shrink it so the mid-load retire runs on small data.</summary>
+    internal long RetireWindowBytes { get; set; } = RetireEveryBytes;
+
     private readonly VulkanDevice _device;
     private readonly Dictionary<string, nint> _files = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<Heap> _heaps = [];
@@ -457,7 +460,7 @@ internal sealed unsafe class DirectWeightStore : IDisposable
     private Heap? OpenHeap(long bytes, bool dedicated, out string why)
     {
         why = string.Empty;
-        if (_inflightBytes >= RetireEveryBytes) DrainAndRetire();
+        if (_inflightBytes >= RetireWindowBytes) DrainAndRetire();
         if (!AdmitAgainstBudget(bytes, out why)) return null;
         var desc = new D3dNative.HeapDesc
         {
