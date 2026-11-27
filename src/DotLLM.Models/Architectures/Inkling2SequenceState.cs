@@ -35,6 +35,9 @@ internal sealed class Inkling2ConvState : IDisposable
 
     public long Bytes => _f32?.Bytes ?? _u16!.Bytes;
 
+    /// <summary>Test switch (mutant): false restores the pre-#2039 behaviour where in-batch history is read unrounded.</summary>
+    internal static bool RoundInBatchHistory { get; set; } = true;
+
     public void Reset() { _f32?.Clear(); _u16?.Clear(); }
 
     private float Load(int i) => _storage switch
@@ -85,6 +88,10 @@ internal sealed class Inkling2ConvState : IDisposable
             for (int k = 0; k < K1; k++)
                 for (int c = 0; c < C; c++) win[k * C + c] = Load(c * K1 + k);
             input.Slice(0, tokens * C).CopyTo(win.Slice(K1 * C, tokens * C));
+            // Sequential decode reads every EARLIER input back out of the (BF16-rounded) state; only the current input is exact. Round the in-batch
+            // history the same way so an N-row forward equals N single-row forwards bit for bit (speculative verify, #2039).
+            if (_storage == Inkling2ConvStateStorage.BF16 && RoundInBatchHistory)
+                for (int i = K1 * C; i < win.Length; i++) win[i] = BitConverter.Int32BitsToSingle(ToBf16(win[i]) << 16);
 
             int perHead = hasDyn ? C / heads : 1;
             float scale = 1f / MathF.Sqrt((hasDyn ? 2 : 1) * K + 1);
@@ -94,13 +101,13 @@ internal sealed class Inkling2ConvState : IDisposable
                 {
                     float acc = 0f;
                     var w = weight.Slice(c * K, K);
-                    for (int i = 0; i < K; i++) acc += win[(t + i) * C + c] * w[i];
+                    for (int i = 0; i < K; i++) acc += (i == K1 ? input[t * C + c] : win[(t + i) * C + c]) * w[i];
                     if (hasDyn)
                     {
                         var d = dyn.Slice(t * heads * K + (c / perHead) * K, K);
-                        for (int lag = 0; lag < K; lag++) acc += win[(t + K - 1 - lag) * C + c] * d[lag];
+                        for (int lag = 0; lag < K; lag++) acc += (lag == 0 ? input[t * C + c] : win[(t + K - 1 - lag) * C + c]) * d[lag];
                     }
-                    res[t * C + c] = (win[(t + K1) * C + c] + acc) * scale;
+                    res[t * C + c] = (input[t * C + c] + acc) * scale;
                 }
             }
 
