@@ -357,8 +357,20 @@ chunked prefill passes the same list for every chunk. LoRA with images stays ref
 | 190x110 | 6.62e-3 | 2.22e-2 | 13/13 | 0 | 2.59e-3 |
 | 640 | 5.41e-3 | 2.56e-2 | 13/13 | 0 | 2.58e-3 |
 
-All under the 0.015 gate. The Vulkan numbers sit above the CPU's by 1.4e-3 to 4e-3; the text-only floor is the same order (Vulkan 3.6e-3 vs CPU 4.1e-3 on the passage gate, section 11), and the BF16 activations on
-the image rows (norm 100s, rounded once) are an extra rounding the CPU reference does not take, so this was not chased further. Single-pass prefill equals the 32-token run to the printed digits (the 80 image fits one 128-token chunk; 640 spans three).
+All under the 0.015 gate. The Vulkan numbers sit above the CPU's by 1.4e-3 to 4e-3. Decomposition (review of #2063, same oracles, mean KL x1e-3; "CPU, BF16 rows" feeds the CPU model
+the encoder rows pre-rounded to BF16, "Vulkan F32 act" is the `_f32act` storage arm):
+
+| image | CPU (F16 rows) | CPU, BF16 rows | Vulkan F32 act | Vulkan BF16 (shipped) |
+|---|---|---|---|---|
+| 80 | 3.40 | 8.24 | 2.72 | 4.85 |
+| 190x110 | 2.59 | 3.39 | 3.84 | 6.62 |
+| 640 | 2.58 | 2.30 | 3.49 | 5.41 |
+
+The F32-activation arm, whose `embed` trace equals the CPU's bit for bit at the image rows, is within -0.7e-3..+1.3e-3 of the CPU, so the injection and addressing add no error.
+The gap is the BF16 activation storage: it costs image prompts +1.9e-3 to +2.8e-3 over the F32 arm, against +0.5e-3 on the text passage gate (3.12e-3 vs 3.61e-3). Rounding only the
+image rows to BF16 moves the CPU's KL by -0.3e-3 to +4.8e-3, so a single input rounding already swings this 13-row measurement by a few e-3. The F16 encoder output is shared with the CPU, so the
+F16 -> BF16 double rounding is not a Vulkan-only cost. A wider residual for image prompts would need the precision-rule sign-off (CLAUDE.md rule 1).
+Single-pass prefill equals the 32-token run to the printed digits (the 80 image fits one 128-token chunk; 640 spans three).
 Chunk-size invariance: image-prompt logits KL vs the 32-token run is exactly 0 at chunks 4, 5 and 7 (gate < 1e-5), and the `embed` trace is bit-identical across chunkings with image positions equal to BF16(F16 row)
 (`ChunkedPrefill_ImageRows_AreAddressedByAbsolutePosition`). Prefill of the image prompt (Vulkan, excluding the CPU encode): 32 tokens 0.36 s, 43 tokens 0.52 s, 284 tokens 2.89 s (warm-up included, single run, not a benchmark).
 

@@ -47,8 +47,9 @@ public interface IImageInputModel
     /// <param name="images">Image spans in absolute sequence positions (the same list for every chunk of a chunked prefill).</param>
     /// <param name="kvCache">
     /// The KV cache (or external KV handle) the engine allocated for this request, the same object it passes to <c>IModel.Forward</c>. A model that
-    /// keeps its own sequence state may ignore it (the CPU Inkling 2 model does); one that stores K/V through the handle (the Vulkan Inkling 2 model's
-    /// <c>CreateKvCacheHandle</c> / <c>Inkling2KvHandle</c>) writes the image rows' K/V into it. Added in review of #2035 so the interface is not CPU-only.
+    /// keeps its own sequence state may ignore it (the CPU and Vulkan Inkling 2 models both do: the Vulkan model's <c>Inkling2KvHandle</c> only reports
+    /// the length of the state the model owns); a model that stores K/V through the handle writes the image rows' K/V into it. Added in review of #2035
+    /// so the interface is not CPU-only.
     /// There is no LoRA adapter or MTP state parameter: the callers refuse an adapter together with images (server, CLI and engine), because a prefill
     /// that silently dropped it would answer from the base model.
     /// </param>
