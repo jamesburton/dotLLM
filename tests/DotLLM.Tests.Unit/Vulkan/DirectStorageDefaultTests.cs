@@ -75,6 +75,32 @@ public class DirectStorageDefaultTests(ITestOutputHelper output)
         Assert.Equal(0, VulkanWeightImportPolicy.ModelCopiedBytes);
     }
 
+    /// <summary>#2044: a budget-declined load yields one prominent warning (reason, count, host-staged bytes, env knob) and the summary fields; a new load resets them.</summary>
+    [Fact]
+    public void BudgetDecline_ProducesWarning_AndSummaryFields_ResetPerLoad()
+    {
+        VulkanWeightImportPolicy.BeginModelLoad();
+        const string why = "d3d12_budget(usage 70000 MiB + 2 x 4096 MiB exceeds 75% of 100000 MiB)";
+        VulkanWeightImportPolicy.NoteDirectDeclined(300L << 20, why);
+        VulkanWeightImportPolicy.NoteStaged(0, 300L << 20, "direct_storage:" + why);
+        VulkanWeightImportPolicy.NoteDirectDeclined(200L << 20, why);
+        VulkanWeightImportPolicy.NoteStaged(0, 200L << 20, "direct_storage:" + why);
+
+        Assert.Equal(2, VulkanWeightImportPolicy.ModelDirectDeclinedTensors);
+        Assert.Equal(500L << 20, VulkanWeightImportPolicy.ModelHostStagedBytes);
+        string w = VulkanWeightImportPolicy.BuildLoadWarning(disabled: false, dllMissing: false, declinedAndEnabled: true);
+        Assert.Contains("WARNING", w);
+        Assert.Contains(why, w);
+        Assert.Contains("declined 2 tensors", w);
+        Assert.Contains("500 MiB", w);
+        Assert.Contains("DOTLLM_VULKAN_DS_BUDGET_PCT", w);
+
+        VulkanWeightImportPolicy.BeginModelLoad();
+        Assert.Equal(0, VulkanWeightImportPolicy.ModelDirectDeclinedTensors);
+        Assert.Equal(0, VulkanWeightImportPolicy.ModelHostStagedBytes);
+        Assert.Equal(string.Empty, VulkanWeightImportPolicy.BuildLoadWarning(false, false, true));
+    }
+
     /// <summary>The full decision table (no GPU): an explicit 0/1 wins; unset needs Windows AND an integrated device AND the DLL.</summary>
     [Theory]
     [InlineData("0", true, true, true, false)]    // explicit off beats everything

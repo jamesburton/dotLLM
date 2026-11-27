@@ -1333,6 +1333,22 @@ VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes)        (every weight l
 - **Fallbacks, never errors:** not Windows, no `VK_KHR_external_memory_win32`, `dstorage.dll` missing, adapter/LUID not matched,
   file held open for write elsewhere (sharing violation), heap creation fails, tensor repacked/converted (those never reach
   `TryImport`). `DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1` also disables the tier.
+- **Double charge and the large-model limit (#2044):** a shared heap is charged twice while both sides hold it: once as the D3D12
+  heap and once as Vulkan's import of it (measured on Strix Halo: D3D12 `QueryVideoMemoryInfo` local usage 85 GiB for 42 GiB of
+  heaps). The D3D12 device is removed (`0x887A0007` DEVICE_RESET, seen as `CreateHeap/CreatePlacedResource 0x887A0005`, then
+  Vulkan `OUT_OF_DEVICE_MEMORY`) at ~85 GiB of a 101 GiB budget, which a 49 GiB model (Nemotron-3.5-Bolt 74B Q4_K_M) hit twice
+  over by heap #241. Two measures: (1) the D3D12 heap + resource of a dedicated heap are released once its reads landed (every
+  `DOTLLM_VULKAN_DS_RETIRE_MIB`, default 2048, and for everything at `Seal`; Vulkan's import keeps the allocation alive), so steady
+  state is 1x and the peak is one retire window; (2) before each heap, D3D12 usage + 2 x heap must stay within
+  `DOTLLM_VULKAN_DS_BUDGET_PCT` (default 75) of the DXGI budget, otherwise the tensor is declined with
+  `d3d12_budget(...)`, and it takes the staged path (page-cache read through the 2 x 32 MiB
+  Vulkan staging ring: a host copy, not zero-copy; Bolt measured 90.6 s vs 33-35 s direct). Bolt 49.3 GiB now loads fully direct in
+  33-35 s with D3D12 usage 49.9 GiB at seal (was: device removed after 40-43 GiB, twice).
+- **Declined tensors warn loudly (#2044, rule-3 sign-off 2026-11-27):** the staged fallback copies through host RAM, allowed only
+  when the budget admission declines a heap. Each model load prints ONE `[dotllm] WARNING: DirectStorage declined N tensors (X MiB); Y MiB of
+  weights were staged through host memory ... Reason (first): d3d12_budget(usage .. + 2 x .. exceeds P% of .. MiB). Raise
+  DOTLLM_VULKAN_DS_BUDGET_PCT ...` line at warning level (no trace env needed; the ledger is reset per load). `dotllm bench --json` carries
+  `direct_storage_declined_tensors` and `host_staged_bytes` (0 off Vulkan). Bolt does not take this path by default.
 - **One host buffer:** DirectStorage's own bounded staging ring (`DOTLLM_VULKAN_DS_STAGING_MIB`, default 64), created per load and
   freed at `Seal`. Signed off by the user on 2026-10-26.
 - **Load log:** `DOTLLM_VULKAN_MEM_TRACE=1` prints `N tensors / X MiB direct-storage (M declined, first: reason)` next to the

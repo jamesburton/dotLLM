@@ -58,7 +58,7 @@ internal static unsafe partial class D3dNative
     internal static int EnumAdapterByLuid(nint factory, ulong luid, out nint adapter)
     {
         nint a = 0;
-        fixed (Guid* iid = &IidAdapter)
+        fixed (Guid* iid = &IidAdapter3)
         {
             // LUID is an 8-byte struct: passed by value in one register on x64.
             int hr = ((delegate* unmanaged[Stdcall]<nint, ulong, Guid*, nint*, int>)ComVtbl.Slot(factory, FactoryEnumAdapterByLuid))
@@ -69,6 +69,44 @@ internal static unsafe partial class D3dNative
     }
 
     internal static readonly Guid IidAdapter = new("2411e7e1-12ac-4ccf-bd14-9798e8534dc0"); // IDXGIAdapter
+    internal static readonly Guid IidAdapter3 = new("645967a4-1392-4310-a798-8053ce3e93fd"); // IDXGIAdapter3
+
+    /// <summary>DXGI_QUERY_VIDEO_MEMORY_INFO (32 bytes).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct VideoMemoryInfo
+    {
+        public ulong Budget;
+        public ulong CurrentUsage;
+        public ulong AvailableForReservation;
+        public ulong CurrentReservation;
+    }
+
+    private const int Adapter3QueryVideoMemoryInfo = 14, DeviceGetDeviceRemovedReason = 37;
+
+    /// <summary><c>IDXGIAdapter3::QueryVideoMemoryInfo</c> for node 0; <paramref name="nonLocal"/> selects the NON_LOCAL (system) segment group.</summary>
+    internal static int QueryVideoMemoryInfo(nint adapter3, bool nonLocal, out VideoMemoryInfo info)
+    {
+        VideoMemoryInfo i = default;
+        int hr = ((delegate* unmanaged[Stdcall]<nint, uint, int, VideoMemoryInfo*, int>)ComVtbl.Slot(adapter3, Adapter3QueryVideoMemoryInfo))
+            (adapter3, 0, nonLocal ? 1 : 0, &i);
+        info = i;
+        return hr;
+    }
+
+    /// <summary><c>IDXGIAdapter::GetDesc</c> sizes: dedicated video memory, shared system memory (bytes).</summary>
+    internal static int GetAdapterMemory(nint adapter, out long dedicated, out long shared)
+    {
+        byte* desc = stackalloc byte[304];
+        new Span<byte>(desc, 304).Clear();
+        int hr = ((delegate* unmanaged[Stdcall]<nint, byte*, int>)ComVtbl.Slot(adapter, 8))(adapter, desc);
+        dedicated = *(long*)(desc + 272);
+        shared = *(long*)(desc + 288);
+        return hr;
+    }
+
+    /// <summary><c>ID3D12Device::GetDeviceRemovedReason</c>: S_OK while the device is alive.</summary>
+    internal static int GetDeviceRemovedReason(nint device)
+        => ((delegate* unmanaged[Stdcall]<nint, int>)ComVtbl.Slot(device, DeviceGetDeviceRemovedReason))(device);
 
     // ---- ID3D12Device ----
     private const int DeviceCreateHeap = 28, DeviceCreatePlacedResource = 29, DeviceCreateSharedHandle = 31, DeviceCreateFence = 36;

@@ -597,6 +597,8 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         Host = host,
         Commit = commit,
         LoadMs = Math.Round(result.LoadMs, 1),
+        DirectStorageDeclinedTensors = result.DirectStorageDeclinedTensors,
+        HostStagedBytes = result.HostStagedBytes,
         PromptTokens = result.PromptTokens,
         DecodeTokens = result.DecodeTokens,
         Depth = result.Depth,
