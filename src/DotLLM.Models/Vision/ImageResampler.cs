@@ -10,7 +10,10 @@ namespace DotLLM.Models.Vision;
 internal static class ImageResampler
 {
     private const int PrecisionBits = 32 - 8 - 2;   // 8-bit pixels, 2 bits of accumulation headroom
-    private const int MaxTarget = 65536;
+    // Largest target side. A downscale plan is bounded by its token count, not by the source side: one side clamps to a single 40-px cell and the
+    // other may reach MaxTokens * 40 = 163,840 px (e.g. 300000x80 under a raised --max-image-side plans 156760x40). The bound must admit every
+    // plan, or the encode throws ArgumentOutOfRangeException after the token check passed (a 500 on the server; review of #2037).
+    internal const int MaxTarget = 1 << 18;
 
     /// <summary>Resizes interleaved RGB <paramref name="src"/> (<c>sw x sh</c>) to <c>tw x th</c>.</summary>
     public static byte[] ResizeBicubic(byte[] src, int sw, int sh, int tw, int th)

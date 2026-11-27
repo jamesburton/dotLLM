@@ -195,6 +195,25 @@ public sealed class Inkling2VisionLimitsTests
         Assert.Equal(sha256, Convert.ToHexStringLower(SHA256.HashData(dst)));
     }
 
+    /// <summary>
+    /// Review of #2037: every downscale plan must be one the resampler accepts. A long thin image (only admissible under a raised
+    /// <c>--max-image-side</c>) plans one 40-px row and a long side up to <c>MaxTokens * 40</c>; with the resampler capped at 65,536 px the token check
+    /// passed and the encode threw <see cref="ArgumentOutOfRangeException"/> (a 500). The plan's largest possible side is within the resampler's bound,
+    /// and the 300000x80 case normalises end to end.
+    /// </summary>
+    [Fact]
+    public void Downscale_LongThinImage_PlanIsAcceptedByTheResampler()
+    {
+        Assert.True(Inkling2ImagePreprocessor.MaxTokens * 40 <= ImageResampler.MaxTarget);
+        const int sw = 300_000, sh = 80;
+        var (w, h, tw, th) = Inkling2ImagePreprocessor.PlanSize(sw, sh, ImageOverLimit.Downscale);
+        Assert.True(tw > 65536, $"planned {tw}x{th}: no longer exercises the case");
+        var img = new DecodedImage(sw, sh, new byte[(long)sw * sh * 3]);
+        var buf = new float[(long)w * h * 3];
+        Inkling2ImagePreprocessor.Normalize(img, buf, overLimit: ImageOverLimit.Downscale);
+        Assert.Equal(-1f, buf[0]);   // black source pixel, normalised
+    }
+
     /// <summary>The preprocessor is the only place the policy is decided: the encoder's token count follows it (see also the real-model test).</summary>
     [Fact]
     public void ImageLimits_OverLimitEnum_HasExactlyTheTwoPolicies()
