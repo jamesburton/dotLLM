@@ -43,7 +43,7 @@ public sealed class Inkling2VisionPlumbingTests
     {
         foreach (var (w, h) in new[] { (4000, 4000), (8000, 600), (600, 9000) })
         {
-            int tokens = Inkling2ImagePreprocessor.CountTokens(w, h);
+            int tokens = Inkling2ImagePreprocessor.CountTokens(w, h, ImageOverLimit.Downscale);   // refuse is the default since the 2026-11-27 ruling
             Assert.InRange(tokens, 1, Inkling2ImagePreprocessor.MaxTokens);
         }
         // below the limit nothing is resized: 2500 x 2500 is 63 x 63 = 3969 tokens
@@ -241,6 +241,7 @@ public sealed class Inkling2VisionPlumbingTests
     {
         public const int Vocab = 32, HeadDim = 4;
         public readonly List<(int[] Tokens, int[] Positions, ImageSpan[] Spans)> ImageCalls = [];
+        public readonly List<IKvCache?> ImageCallKvCaches = [];
         public int PlainForwards;
         public ModelConfig Config { get; } = new()
         {
@@ -259,9 +260,11 @@ public sealed class Inkling2VisionPlumbingTests
         }
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d) => throw new NotSupportedException();
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv) { PlainForwards++; Touch(kv, t, p); return Logits(t.Length); }
-        public ITensor ForwardWithImages(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IReadOnlyList<ImageSpan> images, bool last)
+        public ITensor ForwardWithImages(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IReadOnlyList<ImageSpan> images, IKvCache? kv, bool last)
         {
             ImageCalls.Add((t.ToArray(), p.ToArray(), images.ToArray()));
+            ImageCallKvCaches.Add(kv);
+            Touch(kv, t, p);   // an external-KV model (the Vulkan Inkling 2 model's Inkling2KvHandle) stores the image rows' K/V through the handle
             return Logits(t.Length);
         }
         private static unsafe void Touch(IKvCache? kv, ReadOnlySpan<int> t, ReadOnlySpan<int> p)
@@ -304,6 +307,11 @@ public sealed class Inkling2VisionPlumbingTests
         Assert.Equal([1, 4], call.Spans.Select(s => s.Start).ToArray());
         Assert.Equal([2, 3], call.Spans.Select(s => s.Embeddings.Tokens).ToArray());
         Assert.Equal(8, r.PromptTokenCount);
+        // the engine hands the image prefill the KV cache it allocated (review of #2037: ForwardWithImages had no KV parameter, so an external-KV
+        // model such as the Vulkan Inkling 2 model could not implement IImageInputModel); the stub stores the rows' K/V through it
+        var kv = Assert.Single(model.ImageCallKvCaches);
+        Assert.NotNull(kv);
+        Assert.IsType<SimpleKvCache>(kv);
         // a second request with the SAME token ids but other images must not reuse anything: both prefill the full prompt through the image path
         using var other = new ImageEmbeddings(2, 1, 8, "other");
         gen.Generate("3 9 4 9 6", new InferenceOptions { MaxTokens = 2, Temperature = 0, Images = [other, emb2], ImagePlaceholderTokenId = 9 });

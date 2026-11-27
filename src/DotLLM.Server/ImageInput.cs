@@ -17,23 +17,19 @@ public sealed class ImageInputException(string message, string code = "invalid_i
 /// is found next to the model GGUF (or named by <c>DOTLLM_MMPROJ</c>) and loaded on the first image request.
 /// </summary>
 /// <remarks>
-/// The images are untrusted. Before anything expensive runs, the request is bounded: at most <see cref="MaxImagesPerRequest"/> images and
-/// <see cref="MaxDecodedPixelsPerRequest"/> decoded pixels, and the widened prompt (each image's token count, from
+/// The images are untrusted. Before anything expensive runs, the request is bounded by <see cref="ImageLimits"/> (configurable through
+/// <see cref="ServerOptions.ImageLimits"/>: image count, decoded pixels per request and per image, side length, and whether an image over the token
+/// limit is refused or downscaled), and the widened prompt (each image's token count, from
 /// <see cref="IImageEncoder.CountTokens"/>, which costs nothing) must fit the context. Only then are the images encoded.
 /// </remarks>
 public static class ImageInput
 {
-    /// <summary>Most images one request may carry.</summary>
-    public const int MaxImagesPerRequest = 16;
-
-    /// <summary>Most decoded pixels one request may hold at once (2^26: two 8K frames, or many ordinary photos).</summary>
-    public const long MaxDecodedPixelsPerRequest = 1L << 26;
-
     private sealed class Holder
     {
         public readonly object Lock = new();
         public IImageEncoder? Encoder;
         public string? EncoderFor;
+        public ImageOverLimit OverLimit;
     }
 
     private static readonly ConditionalWeakTable<ServerState, Holder> s_holders = new();
@@ -55,10 +51,11 @@ public static class ImageInput
 
     /// <summary>Decodes the request's images under the per-request bounds (no model needed).</summary>
     /// <exception cref="ImageInputException">Too many images, too many pixels, or an image is not a usable <c>data:</c> URI.</exception>
-    internal static List<DecodedImage> DecodeAll(IReadOnlyList<string> urls)
+    internal static List<DecodedImage> DecodeAll(IReadOnlyList<string> urls, ImageLimits? limits = null)
     {
-        if (urls.Count > MaxImagesPerRequest)
-            throw new ImageInputException($"Too many images: {urls.Count} (at most {MaxImagesPerRequest} per request).");
+        limits ??= ImageLimits.Default;
+        if (urls.Count > limits.MaxImagesPerRequest)
+            throw new ImageInputException($"Too many images: {urls.Count} (at most {limits.MaxImagesPerRequest} per request; raise it with --max-images or {ImageLimits.MaxImagesEnvVar}).");
         var decoded = new List<DecodedImage>(urls.Count);
         long pixels = 0;
         foreach (string url in urls)
@@ -66,15 +63,15 @@ public static class ImageInput
             if (!url.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
                 throw new ImageInputException("Only base64 data: URIs are accepted as image_url (remote URLs are not fetched by the server).");
             DecodedImage img;
-            try { img = ImageDecoder.DecodeDataUri(url); }
+            try { img = ImageDecoder.DecodeDataUri(url, limits); }
             catch (Exception ex) when (ex is not OperationCanceledException and not OutOfMemoryException)
             {
                 // The decoder is pure: whatever it throws on attacker-supplied bytes is the client's error, never a 500.
                 throw new ImageInputException("Unusable image: " + ex.Message);
             }
             pixels += (long)img.Width * img.Height;
-            if (pixels > MaxDecodedPixelsPerRequest)
-                throw new ImageInputException($"The request's images hold more than {MaxDecodedPixelsPerRequest} pixels in total.");
+            if (pixels > limits.MaxDecodedPixelsPerRequest)
+                throw new ImageInputException($"The request's images hold more than {limits.MaxDecodedPixelsPerRequest} pixels in total (raise it with --max-request-image-pixels or {ImageLimits.MaxRequestPixelsEnvVar}).");
             decoded.Add(img);
         }
         return decoded;
@@ -104,12 +101,13 @@ public static class ImageInput
     {
         if (state.Model is not IImageInputModel)
             throw new ImageInputException($"The loaded model ({state.Config?.Architecture}) does not accept image input.");
-        var decoded = DecodeAll(urls);
+        var limits = state.Options.ImageLimits;
+        var decoded = DecodeAll(urls, limits);
 
         var holder = s_holders.GetOrCreateValue(state);
         lock (holder.Lock)
         {
-            if (holder.Encoder is null || holder.EncoderFor != state.LoadedModelPath)
+            if (holder.Encoder is null || holder.EncoderFor != state.LoadedModelPath || holder.OverLimit != limits.OverLimit)
             {
                 holder.Encoder?.Dispose();
                 holder.Encoder = null;
@@ -118,9 +116,10 @@ public static class ImageInput
                 if (string.IsNullOrEmpty(mmproj)) mmproj = VisionSupport.FindMmproj(state.LoadedModelPath);
                 if (mmproj is null || !File.Exists(mmproj))
                     throw new ImageInputException("This model has no vision projector: place its mmproj*.gguf next to the model file (or set DOTLLM_MMPROJ).");
-                try { holder.Encoder = VisionSupport.LoadEncoder(mmproj, new ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads)); }
+                try { holder.Encoder = VisionSupport.LoadEncoder(mmproj, new ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads), limits.OverLimit); }
                 catch (NotSupportedException ex) { throw new ImageInputException(ex.Message); }
                 holder.EncoderFor = state.LoadedModelPath;
+                holder.OverLimit = limits.OverLimit;
             }
             CheckTokenBudget(holder.Encoder, decoded, extraTokenBudget);
             var result = new List<ImageEmbeddings>(decoded.Count);

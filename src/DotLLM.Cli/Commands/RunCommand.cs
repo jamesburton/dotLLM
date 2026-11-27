@@ -41,6 +41,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                      "(--mmproj, or an mmproj*.gguf next to the model). The prompt is wrapped as one user turn: the images first, then the text.")]
         public string[] Images { get; set; } = Array.Empty<string>();
 
+        [CommandOption("--image-over-limit")]
+        [Description("What to do with an --image that needs more image tokens than the model allows (Inkling 2: 4096): 'refuse' (default) stops with an error; " +
+                     "'downscale' resizes it to fit with a bicubic filter, as llama.cpp does. Default: refuse. Falls back to DOTLLM_IMAGE_OVER_LIMIT. " +
+                     "The other image bounds are the DOTLLM_IMAGE_* variables (docs/CLI.md).")]
+        public string? ImageOverLimit { get; set; }
+
+        /// <summary>Vision projector GGUF for <c>--image</c>.</summary>
         [CommandOption("--mmproj")]
         [Description("Vision projector GGUF (mmproj) for --image. Default: the first mmproj*.gguf in the model's directory.")]
         public string? Mmproj { get; set; }
@@ -771,16 +778,21 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 if (model is not DotLLM.Core.Vision.IImageInputModel)
                     throw new NotSupportedException($"--image: the {config.Architecture} model does not accept image input (supported: Inkling 2 on the CPU backend).");
                 if (gguf is null) throw new NotSupportedException("--image needs a GGUF model with an embedded chat template.");
+                // The image prefill (IImageInputModel.ForwardWithImages) takes no adapter and would silently run the base model: refuse, as the server does.
+                if (loraAdapter is not null) throw new NotSupportedException("--image cannot be combined with --lora: the image prefill would not apply the adapter.");
+                var imageLimits = DotLLM.Core.Vision.ImageLimits.Resolve(overLimit: settings.ImageOverLimit);
+                if (settings.Images.Length > imageLimits.MaxImagesPerRequest)
+                    throw new NotSupportedException($"--image: {settings.Images.Length} images given, at most {imageLimits.MaxImagesPerRequest} are accepted (DOTLLM_IMAGE_MAX_IMAGES).");
                 string? mmproj = settings.Mmproj ?? DotLLM.Models.Vision.VisionSupport.FindMmproj(resolvedPath!);
                 if (mmproj is null || !File.Exists(mmproj))
                     throw new FileNotFoundException("--image: no vision projector found; pass --mmproj <mmproj-*.gguf> (or place it next to the model).");
                 var parts = new List<ChatContentPart>();
                 imageEmbeddings = new List<DotLLM.Core.Vision.ImageEmbeddings>();
-                using (var encoder = DotLLM.Models.Vision.VisionSupport.LoadEncoder(mmproj, threadingInfo))
+                using (var encoder = DotLLM.Models.Vision.VisionSupport.LoadEncoder(mmproj, threadingInfo, imageLimits.OverLimit))
                 {
                     foreach (string path in settings.Images)
                     {
-                        var img = DotLLM.Models.Vision.ImageDecoder.Load(path);
+                        var img = DotLLM.Models.Vision.ImageDecoder.Load(path, imageLimits);
                         imageEmbeddings.Add(encoder.Encode(img));
                         parts.Add(new ChatContentPart { Type = "image_url", ImageUrl = "file:" + Path.GetFileName(path) });
                     }

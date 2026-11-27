@@ -359,7 +359,13 @@ public sealed unsafe class Inkling2TransformerModel : IModel, IImageInputModel
     /// cover and bypass <c>token_embd_norm</c> (llama.cpp: "do not normalize raw embeddings input"); the token ids there are ignored. Spans are in
     /// absolute sequence positions, so a chunked prefill can pass the same list for every chunk.
     /// </summary>
-    public ITensor ForwardWithImages(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IReadOnlyList<ImageSpan> images, bool lastTokenLogitsOnly)
+    /// <param name="tokenIds">Token ids of this chunk.</param>
+    /// <param name="positions">Absolute positions.</param>
+    /// <param name="deviceId">Device id.</param>
+    /// <param name="images">Image spans (absolute positions).</param>
+    /// <param name="kvCache">Ignored: this model owns its sequence state (like <c>Forward</c>'s <c>kvCache</c>).</param>
+    /// <param name="lastTokenLogitsOnly">Return only the last row's logits.</param>
+    public ITensor ForwardWithImages(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IReadOnlyList<ImageSpan> images, IKvCache? kvCache, bool lastTokenLogitsOnly)
         => ForwardCore(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly, images);
 
     /// <summary><see cref="ForwardWithImages"/> on an explicit sequence state (tests, multi-sequence callers).</summary>

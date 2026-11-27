@@ -406,7 +406,7 @@ public sealed partial class TextGenerator
         options ??= new InferenceOptions();
 
         int[] promptIds = _tokenizer.Encode(prompt);
-        promptIds = ExpandImagePlaceholders(promptIds, options);
+        promptIds = ExpandImagePlaceholders(promptIds, options, adapter);
         int promptLen = promptIds.Length;
         int maxTokens = options.MaxTokens;
         int vocabSize = _model.Config.VocabSize;
@@ -1050,7 +1050,7 @@ public sealed partial class TextGenerator
         options ??= new InferenceOptions();
 
         int[] promptIds = _tokenizer.Encode(prompt);
-        promptIds = ExpandImagePlaceholders(promptIds, options);
+        promptIds = ExpandImagePlaceholders(promptIds, options, adapter);
         int promptLen = promptIds.Length;
         int maxTokens = options.MaxTokens;
         int vocabSize = _model.Config.VocabSize;
@@ -2482,17 +2482,21 @@ public sealed partial class TextGenerator
     // Sampled requests speculate too (#900): the decoder does exact speculative sampling against the prepared distribution. Logprob capture still
     // opts out (no per-position logits to read back).
     private bool ShouldUseMtp(bool captureLogprobs)
-        => _mtpEnabled && _draftModel is null && _model.SupportsMtp && !captureLogprobs;
+        => _mtpEnabled && _draftModel is null && _model.SupportsMtp && !captureLogprobs
+           && _requestImages is null;   // the image prefill carries no MTP state (IImageInputModel.ForwardWithImages), so MTP would draft from a stale head
 
     /// <summary>
     /// Expands the chat template's image placeholders (issue #2035): each of <see cref="InferenceOptions.Images"/> consumes one occurrence of
     /// <see cref="InferenceOptions.ImagePlaceholderTokenId"/> in the encoded prompt and widens it to the image's token count; the resulting
     /// <see cref="_requestImages"/> spans are what the prefill feeds to <see cref="DotLLM.Core.Vision.IImageInputModel"/>.
     /// </summary>
-    private int[] ExpandImagePlaceholders(int[] promptIds, InferenceOptions options)
+    private int[] ExpandImagePlaceholders(int[] promptIds, InferenceOptions options, ILoraAdapter? adapter)
     {
         _requestImages = null;
         if (options.Images is not { Count: > 0 } images) return promptIds;
+        // IImageInputModel.ForwardWithImages takes no adapter, so the image prefill would silently run the BASE model (user review of #2037).
+        if (adapter is not null)
+            throw new NotSupportedException("Image input cannot be combined with a LoRA adapter: the image prefill would not apply it.");
         if (_model is not DotLLM.Core.Vision.IImageInputModel)
             throw new NotSupportedException($"The loaded model ({_model.Config.Architecture}) does not accept image input.");
         if (options.ImagePlaceholderTokenId is not { } placeholder)
@@ -2564,7 +2568,7 @@ public sealed partial class TextGenerator
                 // ignore the hint keep returning [len, vocab] and both call sites index
                 // Shape[0]-1, so the behaviour is unchanged for them.
                 logits = _requestImages is not null && _model is DotLLM.Core.Vision.IImageInputModel imageModel
-                    ? imageModel.ForwardWithImages(promptIds.AsSpan(prefillStart + offset, len), positions, -1, _requestImages, lastTokenLogitsOnly: true)
+                    ? imageModel.ForwardWithImages(promptIds.AsSpan(prefillStart + offset, len), positions, -1, _requestImages, kvCache, lastTokenLogitsOnly: true)
                     : _model.Forward(promptIds.AsSpan(prefillStart + offset, len), positions,
                         deviceId: -1, kvCache, adapter, mtpState, lastTokenLogitsOnly: true);
                 offset += len;

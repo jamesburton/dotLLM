@@ -136,9 +136,9 @@ public sealed class Inkling2VisionUntrustedInputTests
     [Fact]
     public void ExtremeAspectRatio_IsRefusedInsteadOfPlanningUnboundedTokens()
     {
-        Assert.Throws<NotSupportedException>(() => Inkling2ImagePreprocessor.CountTokens(1_000_000, 1));
-        Assert.Throws<NotSupportedException>(() => Inkling2ImagePreprocessor.CountTokens(40, 4_000_000));
-        Assert.InRange(Inkling2ImagePreprocessor.CountTokens(65536, 400), 1, Inkling2ImagePreprocessor.MaxTokens);
+        Assert.Throws<NotSupportedException>(() => Inkling2ImagePreprocessor.CountTokens(1_000_000, 1, ImageOverLimit.Downscale));
+        Assert.Throws<NotSupportedException>(() => Inkling2ImagePreprocessor.CountTokens(40, 4_000_000, ImageOverLimit.Downscale));
+        Assert.InRange(Inkling2ImagePreprocessor.CountTokens(65536, 400, ImageOverLimit.Downscale), 1, Inkling2ImagePreprocessor.MaxTokens);
     }
 
     /// <summary>
@@ -149,8 +149,8 @@ public sealed class Inkling2VisionUntrustedInputTests
     [Fact]
     public void OverLimitRounding_IsHalfAwayFromZero_LikeTheReference()
     {
-        Assert.Equal(27 * 147, Inkling2ImagePreprocessor.CountTokens(1100, 5860));
-        var (w, h, _, _) = Inkling2ImagePreprocessor.PlanSize(1100, 5860);
+        Assert.Equal(27 * 147, Inkling2ImagePreprocessor.CountTokens(1100, 5860, ImageOverLimit.Downscale));
+        var (w, h, _, _) = Inkling2ImagePreprocessor.PlanSize(1100, 5860, ImageOverLimit.Downscale);
         Assert.Equal((1080, 5880), (w, h));
     }
 
@@ -160,7 +160,7 @@ public sealed class Inkling2VisionUntrustedInputTests
         string Uri(byte[] b) => "data:image/png;base64," + Convert.ToBase64String(b);
         var small = Uri(Corpus()[0]);
         Assert.Equal(2, ImageInput.DecodeAll([small, small]).Count);
-        Assert.Throws<ImageInputException>(() => ImageInput.DecodeAll(Enumerable.Repeat(small, ImageInput.MaxImagesPerRequest + 1).ToList()));
+        Assert.Throws<ImageInputException>(() => ImageInput.DecodeAll(Enumerable.Repeat(small, ImageLimits.Default.MaxImagesPerRequest + 1).ToList()));
         Assert.Throws<ImageInputException>(() => ImageInput.DecodeAll(["https://example.com/a.png"]));
         Assert.Throws<ImageInputException>(() => ImageInput.DecodeAll(["data:image/png;base64,!!!notbase64"]));
         Assert.Throws<ImageInputException>(() => ImageInput.DecodeAll([Uri(Png(65535, 65535, 8, 2, new byte[16]))]));

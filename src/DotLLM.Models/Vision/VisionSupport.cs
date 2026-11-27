@@ -23,13 +23,18 @@ public static class VisionSupport
 
     /// <summary>Opens <paramref name="mmprojPath"/> and builds the CPU encoder its projector type needs.</summary>
     /// <exception cref="NotSupportedException">The projector type has no encoder yet.</exception>
-    public static IImageEncoder LoadEncoder(string mmprojPath, ThreadingConfig threading)
+    /// <param name="mmprojPath">The projector GGUF.</param>
+    /// <param name="threading">Thread configuration.</param>
+    /// <param name="overLimit">What happens to an image over the token limit (default: refuse).</param>
+    /// <param name="embedPrecision">Storage format of the patch / position embeddings; null reads <c>DOTLLM_VISION_EMBD_PRECISION</c> (default F32).</param>
+    public static IImageEncoder LoadEncoder(string mmprojPath, ThreadingConfig threading,
+        ImageOverLimit overLimit = ImageOverLimit.Refuse, VisionEmbedPrecision? embedPrecision = null)
     {
         var gguf = GgufFile.Open(mmprojPath);
         try
         {
             string projector = gguf.Metadata.GetStringOrDefault("clip.vision.projector_type");
-            if (projector == "inkling2v") return Inkling2VisionEncoder.Load(gguf, threading, ownsGguf: true);
+            if (projector == "inkling2v") return Inkling2VisionEncoder.Load(gguf, threading, ownsGguf: true, overLimit, embedPrecision);
             throw new NotSupportedException($"mmproj projector type '{projector}' is not supported (supported: inkling2v).");
         }
         catch

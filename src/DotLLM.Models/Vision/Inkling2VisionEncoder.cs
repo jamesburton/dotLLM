@@ -1,5 +1,6 @@
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Vision;
 using DotLLM.Cpu.Kernels;
@@ -32,6 +33,17 @@ public enum Inkling2VisionMutant
     GeluTanh,
     /// <summary>The CLS token is not prepended (patches start at position 0).</summary>
     NoCls,
+}
+
+/// <summary>Storage format of the two large F32 tensors of the mmproj that are not quantized: <c>v.patch_embd.weight</c> and <c>v.position_embd.weight</c>.</summary>
+public enum VisionEmbedPrecision
+{
+    /// <summary>As stored in the GGUF (F32, read in place). The default until the user rules on the evaluation (docs/INKLING2.md).</summary>
+    F32,
+    /// <summary>Converted once at load to IEEE half (the F16 GEMM reads it directly).</summary>
+    F16,
+    /// <summary>Converted once at load to bfloat16 (round to nearest even; the BF16 GEMM reads it directly).</summary>
+    BF16,
 }
 
 /// <summary>
@@ -67,6 +79,35 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
     private readonly float _eps;
     private readonly Inkling2Arena _arena = new();
     private readonly object _lock = new();
+    private readonly ImageOverLimit _overLimit;
+    private readonly VisionEmbedPrecision _embedPrecision;
+    private nint _patchConv, _posConv;   // converted copies (native) when _embedPrecision != F32; the F32 file pointers stay for the sizes
+
+    /// <summary>Environment variable that selects the <see cref="VisionEmbedPrecision"/> when the caller does not (<c>f32</c>, <c>f16</c>, <c>bf16</c>).</summary>
+    public const string EmbedPrecisionEnvVar = "DOTLLM_VISION_EMBD_PRECISION";
+
+    /// <summary>
+    /// Native scratch kept resident after a call (default 128 MB). A larger working set (a 4,096-token image holds about 1 GB of F32 activations) is
+    /// released when the call ends, so one big image does not pin its scratch for the life of the server; the next call regrows it.
+    /// </summary>
+    internal long ScratchKeepBytes { get; set; } = 128L << 20;
+
+    /// <summary>Storage format of the patch and position embeddings in force.</summary>
+    public VisionEmbedPrecision EmbedPrecision => _embedPrecision;
+
+    /// <summary>Reads <see cref="EmbedPrecisionEnvVar"/>; unset means F32. A malformed value is an error (a typo must not silently run the other arm).</summary>
+    public static VisionEmbedPrecision EmbedPrecisionFromEnvironment(Func<string, string?>? env = null)
+    {
+        string? text = (env ?? Environment.GetEnvironmentVariable)(EmbedPrecisionEnvVar);
+        if (string.IsNullOrWhiteSpace(text)) return VisionEmbedPrecision.F32;
+        return text.Trim().ToLowerInvariant() switch
+        {
+            "f32" => VisionEmbedPrecision.F32,
+            "f16" => VisionEmbedPrecision.F16,
+            "bf16" => VisionEmbedPrecision.BF16,
+            _ => throw new ArgumentException($"{EmbedPrecisionEnvVar} must be f32, f16 or bf16, got '{text}'."),
+        };
+    }
 
     /// <summary>Test seam: deliberately wrong behaviour.</summary>
     internal Inkling2VisionMutant Mutant { get; set; }
@@ -81,11 +122,13 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
     public int EmbeddingDimension => _outDim;
 
     /// <summary>Opens <paramref name="mmprojPath"/> and loads the encoder.</summary>
-    public static Inkling2VisionEncoder Load(string mmprojPath, ThreadingConfig threading)
-        => Load(GgufFile.Open(mmprojPath), threading, ownsGguf: true);
+    public static Inkling2VisionEncoder Load(string mmprojPath, ThreadingConfig threading,
+        ImageOverLimit overLimit = ImageOverLimit.Refuse, VisionEmbedPrecision? embedPrecision = null)
+        => Load(GgufFile.Open(mmprojPath), threading, ownsGguf: true, overLimit, embedPrecision);
 
     /// <summary>Loads from an opened mmproj GGUF.</summary>
-    public static Inkling2VisionEncoder Load(GgufFile gguf, ThreadingConfig threading, bool ownsGguf = false)
+    public static Inkling2VisionEncoder Load(GgufFile gguf, ThreadingConfig threading, bool ownsGguf = false,
+        ImageOverLimit overLimit = ImageOverLimit.Refuse, VisionEmbedPrecision? embedPrecision = null)
     {
         var md = gguf.Metadata;
         if (md.GetStringOrDefault("general.architecture") != "clip" || md.GetStringOrDefault("clip.vision.projector_type") != "inkling2v")
@@ -93,12 +136,12 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
         if (md.GetUInt32("clip.vision.patch_size") != Inkling2ImagePreprocessor.PatchSize
             || md.GetUInt32("clip.vision.spatial_merge_size") != Inkling2ImagePreprocessor.Merge)
             throw new NotSupportedException("inkling2v mmproj with a patch size / merge other than 20 / 2 is not supported");
-        return new Inkling2VisionEncoder(gguf, ownsGguf, threading);
+        return new Inkling2VisionEncoder(gguf, ownsGguf, threading, overLimit, embedPrecision ?? EmbedPrecisionFromEnvironment());
     }
 
-    private Inkling2VisionEncoder(GgufFile gguf, bool ownsGguf, ThreadingConfig threading)
+    private Inkling2VisionEncoder(GgufFile gguf, bool ownsGguf, ThreadingConfig threading, ImageOverLimit overLimit, VisionEmbedPrecision embedPrecision)
     {
-        _gguf = gguf; _ownsGguf = ownsGguf;
+        _gguf = gguf; _ownsGguf = ownsGguf; _overLimit = overLimit; _embedPrecision = embedPrecision;
         var md = gguf.Metadata;
         _nLayer = (int)md.GetUInt32("clip.vision.block_count");
         _hidden = (int)md.GetUInt32("clip.vision.embedding_length");
@@ -147,10 +190,46 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
         _mm1 = M("mm.1.weight"); _mm2 = M("mm.2.weight");
         if (t.ContainsKey("mm.1.bias") || t.ContainsKey("mm.2.bias")) throw new NotSupportedException("projector biases are not part of this checkpoint's contract");
         _pool = threading.IsParallel ? new ComputeThreadPool(threading.EffectiveThreadCount) : null;
+        if (_embedPrecision != VisionEmbedPrecision.F32)
+        {
+            // One-time conversion at load (user ruling 2026-11-27): the F16 / BF16 copies replace the F32 tensors in every kernel; the F32
+            // file pages are never touched again. 2 bytes per element instead of 4.
+            _patchConv = Convert(_patchW, (long)_hidden * 3 * Inkling2ImagePreprocessor.PatchSize * Inkling2ImagePreprocessor.PatchSize, _embedPrecision);
+            _posConv = Convert(_posemb, (long)_gridPos * _gridPos * _hidden, _embedPrecision);
+        }
     }
 
+    private static nint Convert(nint f32, long count, VisionEmbedPrecision to)
+    {
+        var dst = (ushort*)NativeMemory.AlignedAlloc((nuint)(count * 2), 64);
+        var src = (float*)f32;
+        if (to == VisionEmbedPrecision.F16)
+            for (long i = 0; i < count; i++) dst[i] = BitConverter.HalfToUInt16Bits((Half)src[i]);
+        else
+            for (long i = 0; i < count; i++) dst[i] = FloatToBf16(src[i]);
+        return (nint)dst;
+    }
+
+    /// <summary>Round-to-nearest-even float to bfloat16 bits (finite values; NaN keeps a quiet NaN).</summary>
+    internal static ushort FloatToBf16(float f)
+    {
+        uint bits = BitConverter.SingleToUInt32Bits(f);
+        if (float.IsNaN(f)) return (ushort)((bits >> 16) | 0x0040);
+        bits += 0x7FFFu + ((bits >> 16) & 1u);
+        return (ushort)(bits >> 16);
+    }
+
+    /// <summary>Element <paramref name="i"/> of the position-embedding table in whatever format it is stored.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private float PosAt(long i) => _embedPrecision switch
+    {
+        VisionEmbedPrecision.F16 => (float)BitConverter.UInt16BitsToHalf(((ushort*)_posConv)[i]),
+        VisionEmbedPrecision.BF16 => BitConverter.UInt32BitsToSingle((uint)((ushort*)_posConv)[i] << 16),
+        _ => ((float*)_posemb)[i],
+    };
+
     /// <inheritdoc/>
-    public int CountTokens(int width, int height) => Inkling2ImagePreprocessor.CountTokens(width, height);
+    public int CountTokens(int width, int height) => Inkling2ImagePreprocessor.CountTokens(width, height, _overLimit);
 
     /// <inheritdoc/>
     public ImageEmbeddings Encode(DecodedImage image, CancellationToken cancellationToken = default)
@@ -158,11 +237,15 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
         ArgumentNullException.ThrowIfNull(image);
         lock (_lock)
         {
-            _arena.Reset();
-            var (w, h, _, _) = Inkling2ImagePreprocessor.PlanSize(image.Width, image.Height);
-            var hwc = _arena.Alloc<float>(w * h * 3);
-            Inkling2ImagePreprocessor.Normalize(image, hwc, swapRgb: SwapRgb);
-            return RunLocked(hwc, w, h, image.ContentHash, cancellationToken);
+            try
+            {
+                _arena.Reset();
+                var (w, h, _, _) = Inkling2ImagePreprocessor.PlanSize(image.Width, image.Height, _overLimit);
+                var hwc = _arena.Alloc<float>(w * h * 3);
+                Inkling2ImagePreprocessor.Normalize(image, hwc, swapRgb: SwapRgb, overLimit: _overLimit);
+                return RunLocked(hwc, w, h, image.ContentHash, cancellationToken);
+            }
+            finally { _arena.Trim(ScratchKeepBytes); }
         }
     }
 
@@ -174,10 +257,14 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
     {
         lock (_lock)
         {
-            _arena.Reset();
-            var copy = _arena.Alloc<float>(hwc.Length);
-            hwc.CopyTo(copy);
-            return RunLocked(copy, width, height, contentHash, default);
+            try
+            {
+                _arena.Reset();
+                var copy = _arena.Alloc<float>(hwc.Length);
+                hwc.CopyTo(copy);
+                return RunLocked(copy, width, height, contentHash, default);
+            }
+            finally { _arena.Trim(ScratchKeepBytes); }
         }
     }
 
@@ -204,7 +291,14 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
         }
         var patchEmb = _arena.Alloc<float>(n * E);
         fixed (float* a = patches) fixed (float* c = patchEmb)
-            MatMul.GemmF32((float*)_patchW, a, c, E, 3 * P * P, n, _pool);
+        {
+            switch (_embedPrecision)
+            {
+                case VisionEmbedPrecision.F16: MatMul.GemmF16(_patchConv, a, c, E, 3 * P * P, n, _pool); break;
+                case VisionEmbedPrecision.BF16: MatMul.GemmBf16(_patchConv, a, c, E, 3 * P * P, n, _pool); break;
+                default: MatMul.GemmF32((float*)_patchW, a, c, E, 3 * P * P, n, _pool); break;
+            }
+        }
         Trace?.Invoke("patch_embd", patchEmb, n, E);
 
         // 2. position embeddings (bilinear to the patch grid), CLS, add.
@@ -227,13 +321,17 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
         var clsPos = new ReadOnlySpan<float>((void*)_clsPos, E);
         if (cls)
             for (int c = 0; c < E; c++) x[c] = clsRow[c] + clsPos[c];
-        var rawPos = new ReadOnlySpan<float>((void*)_posemb, _gridPos * _gridPos * E);
         for (int p = 0; p < n; p++)
         {
             var dst = x.Slice((p + posOff) * E, E);
             var src = patchEmb.Slice(p * E, E);
-            var pe = interp ? posRows.Slice(p * E, E) : rawPos.Slice(p * E, E);
-            for (int c = 0; c < E; c++) dst[c] = src[c] + pe[c];
+            if (interp)
+            {
+                var pe = posRows.Slice(p * E, E);
+                for (int c = 0; c < E; c++) dst[c] = src[c] + pe[c];
+            }
+            else
+                for (int c = 0; c < E; c++) dst[c] = src[c] + PosAt((long)p * E + c);   // un-interpolated: the table row of this patch
         }
         Trace?.Invoke("embeddings", x, npos, E);
 
@@ -440,7 +538,7 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
             sf0 = width > 1 && ns > 1 ? (float)(width - 1) / (ns - 1) : sf0;
             sf1 = height > 1 && ns > 1 ? (float)(height - 1) / (ns - 1) : sf1;
         }
-        var src = new ReadOnlySpan<float>((void*)_posemb, ns * ns * _hidden);   // src[(b * ns + a) * E + c]; position index = y * ns + x
+        // src[(b * ns + a) * E + c]; position index = y * ns + x (PosAt reads the stored format)
         for (int c = 0; c < _hidden; c++)
             for (int y = 0; y < height; y++)
             {
@@ -456,7 +554,7 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
                     float dx = Math.Max(0f, Math.Min(fx - x0, 1f));
                     
                     int Idx(int px, int py) => transposed ? (px * ns + py) * _hidden + c : (py * ns + px) * _hidden + c;
-                    float a = src[Idx(x0, y0)], b = src[Idx(x1, y0)], cc = src[Idx(x0, y1)], d = src[Idx(x1, y1)];
+                    float a = PosAt(Idx(x0, y0)), b = PosAt(Idx(x1, y0)), cc = PosAt(Idx(x0, y1)), d = PosAt(Idx(x1, y1));
                     dst[(c * height + y) * width + xx] = a * (1 - dx) * (1 - dy) + b * dx * (1 - dy) + cc * (1 - dx) * dy + d * dx * dy;
                 }
             }
@@ -626,6 +724,9 @@ public sealed unsafe class Inkling2VisionEncoder : IImageEncoder
     {
         _pool?.Dispose();
         _arena.Dispose();
+        if (_patchConv != 0) NativeMemory.AlignedFree((void*)_patchConv);
+        if (_posConv != 0) NativeMemory.AlignedFree((void*)_posConv);
+        _patchConv = _posConv = 0;
         if (_ownsGguf) _gguf.Dispose();
     }
 }

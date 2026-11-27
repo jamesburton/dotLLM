@@ -11,7 +11,7 @@ namespace DotLLM.Models.Vision;
 /// </summary>
 /// <remarks>
 /// The input is untrusted (server <c>data:</c> URIs). Every size is validated before it is used: chunk lengths against the buffer, IHDR fields
-/// against the PNG specification, and the declared dimensions against <see cref="MaxPixels"/> / <see cref="MaxSide"/> <b>before</b> anything is
+/// against the PNG specification, and the declared dimensions against <see cref="ImageLimits"/> (<see cref="MaxPixels"/> / <see cref="MaxSide"/> by default) <b>before</b> anything is
 /// allocated from them, so a few-KB file cannot declare a multi-GB image (a decompression bomb). Malformed input throws
 /// <see cref="InvalidDataException"/> (or <see cref="NotSupportedException"/> for valid but unsupported variants), never an index or overflow
 /// exception. Chunk CRCs are not verified (as <c>stb_image</c>); the zlib stream's own Adler-32 is checked by <see cref="ZLibStream"/>.
@@ -19,45 +19,47 @@ namespace DotLLM.Models.Vision;
 public static class ImageDecoder
 {
     /// <summary>
-    /// Largest decoded image accepted, in pixels (2^25, about 33.5 MP: 8K UHD fits). The Inkling-2 encoder downsizes anything above 6.55 MP
-    /// anyway; this bounds the decode buffers (at most 8 bytes per pixel of filtered PNG rows plus 3 of RGB output).
+    /// Default for the largest decoded image accepted, in pixels (2^25, about 33.5 MP: 8K UHD fits); configurable through
+    /// <see cref="ImageLimits.MaxPixelsPerImage"/>. It bounds the decode buffers (at most 8 bytes per pixel of filtered PNG rows plus 3 of RGB output).
     /// </summary>
     public const long MaxPixels = 1L << 25;
 
-    /// <summary>Largest accepted width or height in pixels.</summary>
+    /// <summary>Default for the largest accepted width or height in pixels (configurable through <see cref="ImageLimits.MaxSidePerImage"/>).</summary>
     public const int MaxSide = 1 << 16;
 
-    /// <summary>Decodes <paramref name="data"/> (format sniffed from the magic bytes).</summary>
-    public static DecodedImage Decode(ReadOnlySpan<byte> data)
+    /// <summary>Decodes <paramref name="data"/> (format sniffed from the magic bytes) within <paramref name="limits"/> (default: <see cref="ImageLimits.Default"/>).</summary>
+    public static DecodedImage Decode(ReadOnlySpan<byte> data, ImageLimits? limits = null)
     {
-        if (data.Length >= 8 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') return DecodePng(data.ToArray());
-        if (data.Length >= 2 && data[0] == 'P' && data[1] == '6') return DecodePpm(data.ToArray());
+        limits ??= ImageLimits.Default;
+        if (data.Length >= 8 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') return DecodePng(data.ToArray(), limits);
+        if (data.Length >= 2 && data[0] == 'P' && data[1] == '6') return DecodePpm(data.ToArray(), limits);
         if (data.Length >= 3 && data[0] == 0xFF && data[1] == 0xD8) throw new NotSupportedException("JPEG images are not supported yet; convert to PNG or PPM.");
         throw new NotSupportedException("unsupported image format (supported: PNG, binary PPM P6).");
     }
 
     /// <summary>Reads and decodes an image file.</summary>
-    public static DecodedImage Load(string path) => Decode(File.ReadAllBytes(path));
+    public static DecodedImage Load(string path, ImageLimits? limits = null) => Decode(File.ReadAllBytes(path), limits);
 
     /// <summary>Decodes a <c>data:</c> URI (<c>data:image/png;base64,...</c>).</summary>
-    public static DecodedImage DecodeDataUri(string uri)
+    public static DecodedImage DecodeDataUri(string uri, ImageLimits? limits = null)
     {
         if (!uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("not a data URI", nameof(uri));
         int comma = uri.IndexOf(',');
         if (comma < 0 || !uri.AsSpan(0, comma).Contains(";base64", StringComparison.OrdinalIgnoreCase))
             throw new NotSupportedException("only base64 data URIs are supported for images");
-        return Decode(Convert.FromBase64String(uri[(comma + 1)..]));
+        return Decode(Convert.FromBase64String(uri[(comma + 1)..]), limits);
     }
 
-    /// <summary>Throws unless <paramref name="w"/> x <paramref name="h"/> is a positive size within <see cref="MaxSide"/> and <see cref="MaxPixels"/>.</summary>
-    public static void CheckDimensions(long w, long h)
+    /// <summary>Throws unless <paramref name="w"/> x <paramref name="h"/> is a positive size within the side and pixel limits (default: <see cref="MaxSide"/> and <see cref="MaxPixels"/>).</summary>
+    public static void CheckDimensions(long w, long h, ImageLimits? limits = null)
     {
+        limits ??= ImageLimits.Default;
         if (w <= 0 || h <= 0) throw new InvalidDataException($"invalid image size {w}x{h}");
-        if (w > MaxSide || h > MaxSide || w * h > MaxPixels)
-            throw new InvalidDataException($"image too large: {w}x{h} (limit {MaxSide} per side and {MaxPixels} pixels)");
+        if (w > limits.MaxSidePerImage || h > limits.MaxSidePerImage || w * h > limits.MaxPixelsPerImage)
+            throw new InvalidDataException($"image too large: {w}x{h} (limit {limits.MaxSidePerImage} per side and {limits.MaxPixelsPerImage} pixels)");
     }
 
-    private static DecodedImage DecodePpm(byte[] d)
+    private static DecodedImage DecodePpm(byte[] d, ImageLimits limits)
     {
         int pos = 2;
         int ReadInt()
@@ -80,13 +82,14 @@ public static class ImageDecoder
         if (pos >= d.Length || !(d[pos] is (byte)' ' or (byte)'\n' or (byte)'\r' or (byte)'\t')) throw new InvalidDataException("malformed PPM header");
         pos++;   // single whitespace after the header
         if (max != 255) throw new NotSupportedException("only 8-bit PPM is supported");
-        CheckDimensions(w, h);
+        CheckDimensions(w, h, limits);
+        if ((long)w * h * 3 > Array.MaxLength) throw new InvalidDataException($"image too large for the decoder: {w}x{h}");
         long need = (long)w * h * 3;
         if (d.Length - pos < need) throw new InvalidDataException("truncated PPM");
         return new DecodedImage(w, h, d.AsSpan(pos, (int)need).ToArray());
     }
 
-    private static DecodedImage DecodePng(byte[] d)
+    private static DecodedImage DecodePng(byte[] d, ImageLimits limits)
     {
         if (d.Length < 8 || d[4] != 0x0D || d[5] != 0x0A || d[6] != 0x1A || d[7] != 0x0A) throw new InvalidDataException("bad PNG signature");
         int pos = 8;
@@ -107,7 +110,7 @@ public static class ImageDecoder
                 if (haveHeader) throw new InvalidDataException("duplicate PNG IHDR");
                 if (len != 13) throw new InvalidDataException("bad PNG IHDR length");
                 uint uw = BinaryPrimitives.ReadUInt32BigEndian(body), uh = BinaryPrimitives.ReadUInt32BigEndian(body[4..]);
-                CheckDimensions(uw, uh);
+                CheckDimensions(uw, uh, limits);
                 w = (int)uw; h = (int)uh;
                 depth = body[8]; ctype = body[9];
                 bool depthOk = ctype switch
@@ -138,9 +141,11 @@ public static class ImageDecoder
         int channels = ctype switch { 0 => 1, 2 => 3, 3 => 1, 4 => 2, _ => 4 };
         int bitsPerPixel = channels * depth;
         int bpp = Math.Max(1, bitsPerPixel / 8);
-        long stride = ((long)w * bitsPerPixel + 7) / 8;   // <= 8 * MaxSide: fits an int
-        // Bounded by CheckDimensions: (stride + 1) * h <= 8 * MaxPixels + MaxSide, and rgb = 3 * MaxPixels bytes at most.
+        long stride = ((long)w * bitsPerPixel + 7) / 8;   // <= 8 * the side limit: fits an int for any side below 2^28
+        // Bounded by CheckDimensions: (stride + 1) * h <= 8 * the pixel limit + the side limit, and rgb = 3 * the pixel limit bytes at most.
         long rawBytes = (stride + 1) * h;
+        // A raised pixel limit must not reach managed array limits: refuse instead of overflowing an int index later.
+        if (rawBytes > Array.MaxLength || (long)w * h * 3 > Array.MaxLength) throw new InvalidDataException($"image too large for the decoder: {w}x{h}");
         // Deflate cannot expand by more than ~1032:1, so a stream far shorter than that cannot hold the declared image: refuse it before the
         // buffer is allocated (a header-only "bomb" would otherwise cost the full declared size per request).
         if (rawBytes > idat.Length * 1032L + 1024) throw new InvalidDataException("truncated PNG image data");

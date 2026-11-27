@@ -272,6 +272,32 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
                      "Falls back to the DOTLLM_MAX_MESSAGES environment variable; the flag wins. The prompt-length-vs-context check still applies.")]
         public int? MaxMessages { get; set; }
 
+        /// <summary>Image input: most images per request (#2035).</summary>
+        [CommandOption("--max-images")]
+        [Description("Image input (vision models): most images one chat request may carry. Default 16. Falls back to DOTLLM_IMAGE_MAX_IMAGES; the flag wins.")]
+        public int? MaxImages { get; set; }
+
+        /// <summary>Image input: decoded pixels per request (#2035).</summary>
+        [CommandOption("--max-request-image-pixels")]
+        [Description("Image input: most decoded pixels all images of one request may hold. Default 67108864 (2^26). Falls back to DOTLLM_IMAGE_MAX_REQUEST_PIXELS.")]
+        public long? MaxRequestImagePixels { get; set; }
+
+        /// <summary>Image input: decoded pixels per image (#2035).</summary>
+        [CommandOption("--max-image-pixels")]
+        [Description("Image input: most decoded pixels in one image. Default 33554432 (2^25, 8K UHD fits). Falls back to DOTLLM_IMAGE_MAX_PIXELS.")]
+        public long? MaxImagePixels { get; set; }
+
+        /// <summary>Image input: longest side (#2035).</summary>
+        [CommandOption("--max-image-side")]
+        [Description("Image input: longest accepted image side in pixels. Default 65536. Falls back to DOTLLM_IMAGE_MAX_SIDE.")]
+        public int? MaxImageSide { get; set; }
+
+        /// <summary>Image input: policy for an image over the model's image-token limit (#2035).</summary>
+        [CommandOption("--image-over-limit")]
+        [Description("Image input: what to do with an image that needs more image tokens than the model allows (Inkling 2: 4096). " +
+                     "'refuse' (default) answers 400; 'downscale' resizes it to fit with a bicubic filter, as llama.cpp does. Falls back to DOTLLM_IMAGE_OVER_LIMIT.")]
+        public string? ImageOverLimit { get; set; }
+
         /// <summary>Download a missing Hugging Face model when a request or load names one.</summary>
         [CommandOption("--auto-pull")]
         [Description("Download a missing Hugging Face model when a request names one (e.g. model \"owner/repo:Q4_K_M\"), like 'ollama run' does. " +
@@ -524,6 +550,11 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         public int RateLimitConcurrency { get; set; }
     }
 
+    /// <summary>The image limits of a <c>serve</c> invocation: the flags, else <c>DOTLLM_IMAGE_*</c>, else the defaults. Throws <see cref="ArgumentException"/> on a malformed value.</summary>
+    internal static DotLLM.Core.Vision.ImageLimits ResolveImageLimits(Settings settings, Func<string, string?>? env = null)
+        => DotLLM.Core.Vision.ImageLimits.Resolve(settings.MaxImages, settings.MaxRequestImagePixels, settings.MaxImagePixels, settings.MaxImageSide,
+            settings.ImageOverLimit, env);
+
     /// <summary>
     /// The <see cref="ServerOptions"/> a <c>serve</c> invocation runs with, from its parsed settings (pure, so a test can check what
     /// reaches the server, e.g. that an omitted <c>--prefill-chunk-size</c> stays null so the backend default applies, #1862).
@@ -535,6 +566,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         => new ServerOptions
         {
             MaxMessages = maxMessages,
+            ImageLimits = ResolveImageLimits(settings),
             Model = settings.Model ?? "",
             ExpectedConcurrency = settings.ExpectedConcurrency,
             AutoPull = settings.AutoPull,
@@ -714,6 +746,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         {
             maxMessages = ServerOptions.ResolveMaxMessages(
                 settings.MaxMessages, Environment.GetEnvironmentVariable(ServerOptions.MaxMessagesEnvVar));
+            _ = ResolveImageLimits(settings);   // a malformed --max-images / DOTLLM_IMAGE_* value fails here, not at the first image request
         }
         catch (ArgumentException ex)
         {
