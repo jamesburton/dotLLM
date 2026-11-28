@@ -115,6 +115,47 @@ public sealed class Inkling2F16RoundingTests : IDisposable
         Assert.True(sub > 10_000 && over > 100 && nan > 10, "the fixture misses a class (subnormal / overflow / NaN)");
     }
 
+    /// <summary>
+    /// The final softcap runs on the logits BEFORE the host's non-finite guard (<c>CheckLogitsFinite</c>, the runtime gate of the F16 default), so it must pass NaN and infinities through:
+    /// <c>tanh(clamp(x / cap, -20, 20))</c> turned +-inf into +-cap and (AMD min/max drop a NaN operand) NaN into a finite value, which made the guard blind to a real F16 overflow.
+    /// Mutant: the previous shader (load it through <c>DOTLLM_INKLING2_SPV_OVERRIDE</c>) fails this test. Finite logits keep the softcap.
+    /// </summary>
+    [SkippableFact]
+    public void Softcap_PassesNonFiniteThrough_ForTheF16Guard()
+    {
+        Skip.If(_dev is null, "No Vulkan device");
+        var dev = _dev!;
+        float[] x = [float.NaN, float.PositiveInfinity, float.NegativeInfinity, -float.NaN, 0f, 1f, -1f, 29.5f, 100f, -1e30f, 3.4028235e38f];
+        const float cap = 30f;
+        string dir = !string.IsNullOrEmpty(_ovr) && File.Exists(Path.Combine(_ovr, "inkling2_softcap.spv")) ? _ovr : _spv;
+        using var k = new OlalaKernel(dev, dir, "inkling2_softcap", 1, 2);
+        var buf = dev.AllocateDeviceLocal(x.Length * 4L);
+        try
+        {
+            dev.Upload(MemoryMarshal.AsBytes(x.AsSpan()), buf);
+            using (var sub = dev.CreateSubmitContext())
+            {
+                sub.Begin();
+                KernelSupport.HostToComputeBarrier(sub.CommandBuffer);
+                k.Record(sub.CommandBuffer, [buf], [(uint)x.Length, BitConverter.SingleToUInt32Bits(cap)], 1, 1, 1);
+                sub.SubmitAndWait();
+            }
+            var y = new float[x.Length]; dev.Download(buf, y);
+            _output.WriteLine(string.Join(", ", x.Zip(y, (a, b) => $"{a} -> {b}")));
+            for (int i = 0; i < x.Length; i++)
+            {
+                if (float.IsNaN(x[i])) Assert.True(float.IsNaN(y[i]), $"softcap({x[i]}) = {y[i]}: a NaN logit must reach the host guard");
+                else if (float.IsInfinity(x[i])) Assert.Equal(x[i], y[i]);
+                else
+                {
+                    float want = cap * MathF.Tanh(Math.Clamp(x[i] / cap, -20f, 20f));
+                    Assert.True(MathF.Abs(y[i] - want) <= 1e-5f * cap, $"softcap({x[i]}) = {y[i]}, want {want}");
+                }
+            }
+        }
+        finally { buf.Dispose(); }
+    }
+
     /// <summary>The BF16 twin (the shipped default) against its definition, so the probe harness itself is shown to be sensitive in both directions.</summary>
     [SkippableFact]
     public void Bf16Store_MatchesRneDefinition()
