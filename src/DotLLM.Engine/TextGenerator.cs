@@ -482,7 +482,7 @@ public sealed partial class TextGenerator
         // snapshot kept the head state that absorbed that prefix (issue #1088).
         var mtpGate = GateFor(pipeline.IsStochastic)?.ForContext(promptLen);
         var resumedMtp = TakeResumedMtpState();
-        bool useMtp = ShouldUseMtp(captureLogprobs) && (cachedTokenCount == 0 || resumedMtp is not null)
+        bool useMtp = ShouldUseMtp(captureLogprobs, (int)Math.Min((long)promptLen + maxTokens, int.MaxValue)) && (cachedTokenCount == 0 || resumedMtp is not null)
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
         if (useMtp)
@@ -1112,7 +1112,7 @@ public sealed partial class TextGenerator
         // Hybrid mode: same gating as the non-streaming path, MTP on a prefix hit included (issue #1088).
         var mtpGate = GateFor(pipeline.IsStochastic)?.ForContext(promptLen);
         var resumedMtp = TakeResumedMtpState();
-        bool useMtp = ShouldUseMtp(captureLogprobs) && (cachedTokenCount == 0 || resumedMtp is not null)
+        bool useMtp = ShouldUseMtp(captureLogprobs, (int)Math.Min((long)promptLen + maxTokens, int.MaxValue)) && (cachedTokenCount == 0 || resumedMtp is not null)
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
         if (useMtp)
@@ -2486,8 +2486,9 @@ public sealed partial class TextGenerator
 
     // Sampled requests speculate too (#900): the decoder does exact speculative sampling against the prepared distribution. Logprob capture still
     // opts out (no per-position logits to read back).
-    private bool ShouldUseMtp(bool captureLogprobs)
-        => _mtpEnabled && _draftModel is null && _model.SupportsMtp && !captureLogprobs
+    private bool ShouldUseMtp(bool captureLogprobs, int contextTokens)
+        => _mtpEnabled && _draftModel is null && !captureLogprobs
+           && (_model is IContextGatedMtp gated ? gated.PrepareMtpFor(contextTokens) : _model.SupportsMtp)   // a context-gated drafter (Vulkan DSpark) attaches here, above its threshold only
            && _requestImages is null;   // the image prefill carries no MTP state (IImageInputModel.ForwardWithImages), so MTP would draft from a stale head
 
     /// <summary>

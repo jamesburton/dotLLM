@@ -44,8 +44,61 @@ internal enum DSparkTargetMutant
 /// <para><b>Windowed context K/V (#2060).</b> Drafter layers 0 and 2 are sliding-window layers: they keep a ring of <c>window + MaxChunk</c> positions (1025 + 128), flat in the
 /// sequence length. Global layer 1 keeps the whole context in a buffer that doubles on demand, admitted against free device memory (never spilled).</para>
 /// </remarks>
-public sealed unsafe partial class VulkanInkling2TransformerModel
+public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGatedMtp
 {
+    // ── lazy attach (issue #2046, James 2026-11-28: the drafter never won below several thousand tokens, so an auto-detected one is attached per request above a context threshold) ──
+    private string? _deferredPath;
+    private bool _dsparkForced;
+    private int? _minContextOverride;
+    private readonly object _attachLock = new();
+
+    /// <summary>Env var of the context threshold (prompt + generation budget, tokens) from which an auto-detected drafter is attached; <c>0</c> = every request, <c>off</c> = never (opt-in through <c>--dspark</c> only).</summary>
+    public const string MinContextEnvVar = "DOTLLM_DSPARK_MIN_CONTEXT";
+
+    /// <summary>Default of <see cref="DSparkMinContext"/>.</summary>
+    public const int DefaultMinContext = int.MaxValue;
+
+    /// <summary>Context (prompt + generation budget, tokens) from which an auto-detected drafter attaches; settable (tests, embedders), else <see cref="MinContextEnvVar"/>, else <see cref="DefaultMinContext"/>.</summary>
+    public int DSparkMinContext
+    {
+        get
+        {
+            if (_minContextOverride is { } o) return o;
+            return DSparkAttachPolicy.ParseMinContext(Environment.GetEnvironmentVariable(MinContextEnvVar), DefaultMinContext);
+        }
+        set => _minContextOverride = value;
+    }
+
+    /// <inheritdoc/>
+    public bool DefersAutoAttach => true;
+
+    /// <inheritdoc/>
+    public void DeferAutoAttach(string path) { lock (_attachLock) _deferredPath = path; }
+
+    /// <inheritdoc/>
+    public (string Path, int MinContext)? DeferredDrafter => _deferredPath is { } p && _dsd is null ? (p, DSparkMinContext) : null;
+
+    /// <inheritdoc/>
+    public bool PrepareMtpFor(int contextTokens)
+    {
+        lock (_attachLock)
+        {
+            if (_dsd is null)
+            {
+                if (_deferredPath is not { } path || !DSparkAttachPolicy.ShouldAttach(true, contextTokens, DSparkMinContext)) return false;
+                try { AttachCore(path); }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                    Console.Error.WriteLine($"[dspark] WARNING: drafter not attached ({e.GetType().Name}: {e.Message}); decoding without speculation.");
+                    _deferredPath = null;
+                    return false;
+                }
+                Console.Error.WriteLine($"[dspark] drafter attached for a context of {contextTokens} tokens (threshold {DSparkMinContext}).");
+            }
+            return DSparkAttachPolicy.MayUse(_dsparkForced, contextTokens, DSparkMinContext);
+        }
+    }
+
     // ── target-side state ──
     private VulkanDevice.Buffer? _snapBuf;
     private int _snapCapRows, _snapR;
@@ -208,6 +261,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
         public required int[] SlotOfVisit;
         public required VulkanDevice.Buffer OutNorm, TokNorm, FrnnMix, FrnnNorm, W1, W2, Joint, JointBias, Mask, RopeTab;
         public VulkanDevice.Buffer? W2Bias;
+        public bool LogitsF16;   // drafter logits stored as F16 (2 B per element) instead of F32
         public VulkanDevice.Buffer Taps = null!, Feat = null!, KTmp = null!, VTmp = null!, X = null!, Nrm = null!, O = null!, Q = null!, Q2 = null!, K = null!, V = null!,
             KBlk = null!, VBlk = null!, AttnO = null!, Gate = null!, Up = null!, Hid = null!, Logits = null!, Pre = null!, C2 = null!, Part = null!, Tok = null!;
         public readonly List<VulkanDevice.Buffer> Owned = new();
@@ -232,6 +286,16 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
 
     /// <inheritdoc/>
     public void AttachDFlashDrafter(string path)
+    {
+        lock (_attachLock)
+        {
+            if (_dsd is null) AttachCore(path);
+            else throw new InvalidOperationException("A DSpark drafter is already attached.");
+            _dsparkForced = true;   // an explicit attach (--dspark) forces the drafter on at every context length
+        }
+    }
+
+    private void AttachCore(string path)
     {
         if (_dsd is not null) throw new InvalidOperationException("A DSpark drafter is already attached.");
         if (_opt.ActivationF32) throw new NotSupportedException("The DSpark drafter runs BF16 activations; the F32-activation reference arm is not supported.");
@@ -339,7 +403,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
             {
                 Spec = sp, File = file, Layers = layers, SlotOfVisit = SlotsFor(sp, LayerVisits),
                 OutNorm = outNorm, TokNorm = tokNorm, FrnnMix = frnnMix, FrnnNorm = frnnNorm, W1 = w1.Buf, W2 = w2.Buf, Joint = joint.Buf, JointBias = jointBias, Mask = mask, RopeTab = ropeTab,
-                W2Bias = w2Bias,
+                W2Bias = w2Bias, LogitsF16 = DraftLogitsF16FromEnv(),
             };
             long scratch = 0;
             VulkanDevice.Buffer S(long bytes2, bool host = false)
@@ -354,7 +418,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
             d.Q = S((long)B * qDim * bf); d.Q2 = S((long)B * qDim * bf); d.K = S((long)B * kvDim * bf); d.V = S((long)B * kvDim * bf);
             d.KBlk = S((long)B * kvDim * 2); d.VBlk = S((long)B * kvDim * 2); d.AttnO = S((long)B * qDim * bf);
             d.Gate = S((long)B * sp.Ffn * bf); d.Up = S((long)B * sp.Ffn * bf); d.Hid = S((long)B * _H * bf);
-            d.Logits = S((long)(B - 1) * _vocab * 4, host: true);
+            d.Logits = S((long)(B - 1) * _vocab * (d.LogitsF16 ? 2 : 4), host: true);
             d.Pre = S((long)B * 768 * bf); d.C2 = S(sp.Rank * bf);
             d.Parts = (_vocab + 31) / 32;
             d.Part = S((long)d.Parts * 8);
@@ -486,12 +550,12 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
 
         // Rows 1..n: output_norm -> hidden_i, and the target LM head -> UNCAPPED base logits (F32, like the target's own).
         Rms(d.X, H, d.OutNorm, d.Hid, 0, n, sp.Eps);
-        Gemv(_output, d.Hid, d.Logits, n, 0, f32Out: true);
+        Gemv(_output, d.Hid, d.Logits, n, 0, f32Out: !d.LogitsF16, f16Out: d.LogitsF16);
 
         var pre = Kernel("ds_mpre", "inkling2_dspark_markov_pre", 5, 4, false);
         Run(pre, 1u << 4, [(uint)H, (uint)sp.Rank, (uint)n, (uint)(fpos % 16)], 768, 1, 1, d.Joint, d.Hid, st.Frnn, d.JointBias, d.Pre);
         var step = Kernel("ds_mstep", "inkling2_dspark_markov_step", 5, 5, false);
-        var logits = Kernel("ds_mlog", "inkling2_dspark_markov_logits", 5, 4, false);
+        var logits = Kernel(d.LogitsF16 ? "ds_mlog16" : "ds_mlog", d.LogitsF16 ? "inkling2_dspark_markov_logits_f16" : "inkling2_dspark_markov_logits", 5, 4, false);
         var amax = Kernel("ds_amax", "inkling2_dspark_argmax", 2, 2, false);
         for (int i = 1; i <= n; i++)
         {
@@ -514,10 +578,50 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
     /// <summary>The softcapped logits rows <c>[n, vocab]</c> of the last <see cref="DraftBlock"/> (a download; only the non-greedy path asks).</summary>
     internal float[] DownloadDraftLogits(int rows)
     {
-        var all = new float[(long)rows * _vocab];
-        _device.Download(_dsd!.Logits, all);
-        return all;
+        long n = (long)rows * _vocab;
+        if (!_dsd!.LogitsF16)
+        {
+            var all = new float[n];
+            _device.Download(_dsd.Logits, all);
+            return all;
+        }
+        var raw = new float[(n + 1) / 2];
+        _device.Download(_dsd.Logits, raw);
+        var bits = MemoryMarshal.Cast<float, ushort>(raw.AsSpan());
+        var res = new float[n];
+        for (long i = 0; i < n; i++) res[i] = (float)BitConverter.UInt16BitsToHalf(bits[(int)i]);
+        return res;
     }
+
+    /// <summary>Drafter logits storage: <c>DOTLLM_DSPARK_LOGITS=f32|f16</c>, default F16 (#2046: measured argmax-identical to F32 on the oracle rounds, see docs/INKLING2.md section 16).</summary>
+    private static bool DraftLogitsF16FromEnv()
+    {
+        string? e = Environment.GetEnvironmentVariable("DOTLLM_DSPARK_LOGITS");
+        if (string.IsNullOrEmpty(e)) return false;
+        return e.ToLowerInvariant() switch { "f16" => true, "f32" => false, _ => throw new ArgumentException($"DOTLLM_DSPARK_LOGITS='{e}': expected f16 or f32.") };
+    }
+
+    /// <summary>True when the drafter's logits are stored as F16.</summary>
+    internal bool DraftLogitsF16 => _dsd?.LogitsF16 ?? DraftLogitsF16FromEnv();
+
+    /// <summary>Test/A-B hook: re-creates the drafter's logits buffer in the other storage format (the drafter must be idle).</summary>
+    internal void SetDraftLogitsF16(bool f16)
+    {
+        var d = _dsd ?? throw new InvalidOperationException("No DSpark drafter attached.");
+        if (d.LogitsF16 == f16) return;
+        d.Owned.Remove(d.Logits);
+        d.Logits.Dispose();
+        d.Bytes -= (long)(d.Spec.BlockSize - 1) * _vocab * (d.LogitsF16 ? 2 : 4);
+        _deviceBytes -= (long)(d.Spec.BlockSize - 1) * _vocab * (d.LogitsF16 ? 2 : 4);
+        d.LogitsF16 = f16;
+        long nb = (long)(d.Spec.BlockSize - 1) * _vocab * (f16 ? 2 : 4);
+        d.Logits = _device.Allocate(nb);
+        d.Owned.Add(d.Logits);
+        d.Bytes += nb; _deviceBytes += nb;
+    }
+
+    /// <summary>Bytes of the drafter's logits buffer.</summary>
+    internal long DraftLogitsBytes => _dsd?.Logits.Size ?? 0;
 
     internal VulkanDevice.Buffer? DSparkFrnnBuffer(VulkanInkling2DSparkState st) => st.Frnn;
 }

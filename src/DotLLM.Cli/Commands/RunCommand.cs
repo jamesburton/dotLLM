@@ -605,7 +605,12 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             else if (!settings.NoMtp && (settings.DSpark is not null || model is DotLLM.Models.Architectures.DSpark.IInkling2DSparkHost))
             {
                 // Inkling 2 DSpark drafter (#2039): explicit --dspark is fatal on failure, an auto-detected sibling is logged and ignored.
-                try { mtpHeadPath = DotLLM.Models.Architectures.DSpark.Inkling2DSparkResolver.TryAttach(model, resolvedPath, settings.DSpark); }
+                try
+                {
+                    mtpHeadPath = DotLLM.Models.Architectures.DSpark.Inkling2DSparkResolver.TryAttach(model, resolvedPath, settings.DSpark);
+                    if (mtpHeadPath is not null && model is DotLLM.Models.Architectures.DSpark.IInkling2DSparkHost { DeferredDrafter: { } deferred })
+                        Console.Error.WriteLine($"[dspark] drafter {Path.GetFileName(mtpHeadPath)} found; it attaches only when prompt + max tokens reach {(deferred.MinContext == int.MaxValue ? "never (opt-in with --dspark)" : deferred.MinContext + " tokens")} (DOTLLM_DSPARK_MIN_CONTEXT).");
+                }
                 catch (Exception ex) when (settings.DSpark is null)
                 {
                     Console.Error.WriteLine($"WARNING: DSpark drafter not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");

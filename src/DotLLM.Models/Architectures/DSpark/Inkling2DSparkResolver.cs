@@ -60,6 +60,11 @@ public static class Inkling2DSparkResolver
             if (path is null) return null;
         }
         else if (!File.Exists(path)) throw new FileNotFoundException("DSpark drafter GGUF not found.", path);
+        if (explicitPath is null && target.DefersAutoAttach)
+        {
+            target.DeferAutoAttach(path);   // attached per request above a context threshold; nothing is allocated now (#2046)
+            return path;
+        }
         target.AttachDFlashDrafter(path);
         return path;
     }

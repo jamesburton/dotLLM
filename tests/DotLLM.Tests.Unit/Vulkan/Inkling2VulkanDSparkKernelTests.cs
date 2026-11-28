@@ -385,7 +385,7 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
 
     private sealed record MarkovRun(int[] Tokens, float[][] Cols, MarkovRef M, float[] Hid, float[] Frnn, float[][] BaseL, int Anchor);
 
-    private MarkovRun RunMarkov(int n, int V, bool noStateMutantGpu = false, bool capFirstGpu = false)
+    private MarkovRun RunMarkov(int n, int V, bool noStateMutantGpu = false, bool capFirstGpu = false, bool logitsF16 = false)
     {
         int H = 2304, R = 256, stride = 2 * R + 2 * H;
         var m = new MarkovRef { H = H, V = V };
@@ -401,7 +401,9 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
 
         var tok = Dev.Allocate(64);
         Dev.Upload(MemoryMarshal.AsBytes(new ReadOnlySpan<int>([anchor])), tok);
-        var logits = UpF(baseL.SelectMany(x => x).ToArray());
+        var baseFlat = baseL.SelectMany(x => x).ToArray();
+        if (logitsF16) for (int i = 0; i < baseFlat.Length; i++) { baseFlat[i] = (float)(Half)baseFlat[i]; baseL[i / V][i % V] = baseFlat[i]; }   // the GPU's base logits are the F16-rounded GEMV outputs
+        var logits = logitsF16 ? UpF16(baseFlat) : UpF(baseFlat);
         var jb = UpBf16(m.J); var hb = UpBf16(hid); var fb = UpF16(frnnRing); var jbias = UpF(m.Jb);
         var pre = Zero(n * 768 * 2L); var w1 = UpBf16(m.W1); var w2 = UpBf16(m.W2); var b2 = UpF(m.B2); var c2 = Zero(256 * 2);
         int parts = (V + 31) / 32;
@@ -410,13 +412,13 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
         for (int i = 1; i <= n; i++)
         {
             steps.Add(new(K("inkling2_dspark_markov_step", 5, 5), [(uint)H, (uint)R, (uint)i, (uint)V, noStateMutantGpu ? (uint)i : 1u], 1, 1, 1, [jb, w1, pre, tok, c2]));
-            steps.Add(new(K("inkling2_dspark_markov_logits", 5, 4), [(uint)V, (uint)((long)(i - 1) * V), 1u, F(capFirstGpu ? 0f : cap)], (uint)parts, 1, 1, [logits, w2, b2, c2, part]));
+            steps.Add(new(K(logitsF16 ? "inkling2_dspark_markov_logits_f16" : "inkling2_dspark_markov_logits", 5, 4), [(uint)V, (uint)((long)(i - 1) * V), 1u, F(capFirstGpu ? 0f : cap)], (uint)parts, 1, 1, [logits, w2, b2, c2, part]));
             steps.Add(new(K("inkling2_dspark_argmax", 2, 2), [(uint)parts, (uint)i], 1, 1, 1, [part, tok]));
         }
         Run(steps.ToArray());
         var ids = new float[8]; Dev.Download(tok, ids);
         var gotTok = MemoryMarshal.Cast<float, int>(ids.AsSpan()).Slice(1, n).ToArray();
-        var all = DownF(logits, n * V);
+        var all = logitsF16 ? DownF16(logits, n * V) : DownF(logits, n * V);
         var cols = Enumerable.Range(0, n).Select(r => all.AsSpan(r * V, V).ToArray()).ToArray();
         return new MarkovRun(gotTok, cols, m, hid, frnn, baseL, anchor);
     }
@@ -541,5 +543,25 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
         for (int i = 0; i < y8.Length; i++) if (BitConverter.SingleToInt32Bits(y8[i]) != BitConverter.SingleToInt32Bits(y1[i])) differ++;
         _output.WriteLine($"mutant (history unrounded), dyn={dyn}: {differ} of {y8.Length} outputs differ from the single-row forwards");
         Assert.True(differ > 0, "the unrounded-history mutant survived");
+    }
+
+    /// <summary>The F16-logits Markov pass (base logits stored as F16, softcapped columns written back as F16) against the double reference walk: error at F16 resolution, the token chain equals the reference chain except at near-ties.</summary>
+    [SkippableTheory]
+    [InlineData(3, 1000)]
+    [InlineData(7, 777)]
+    public void MarkovHead_F16Logits_MatchesReferenceWalk(int n, int V)
+    {
+        var r = RunMarkov(n, V, logitsF16: true);
+        var (refTok, refCols) = RefWalk(r.M, r.Hid, r.Frnn, [r.Anchor], n, 30f, r.BaseL);
+        double worst = 0;
+        for (int i = 0; i < n; i++) worst = Math.Max(worst, Check($"markov f16 col {i}", refCols[i], r.Cols[i], 0.05, soft: true));
+        _output.WriteLine($"tokens gpu [{string.Join(",", r.Tokens)}] ref [{string.Join(",", refTok)}]");
+        Assert.True(worst < 0.01, $"worst normalised error {worst:E2} (F16 storage is about 5e-4 relative)");
+        for (int i = 0; i < n; i++)
+        {
+            var sorted = refCols[i].OrderByDescending(x => x).Take(2).ToArray();
+            if (sorted[0] - sorted[1] > 0.05 && r.Tokens[i] != refTok[i]) Assert.Equal(refTok[i], r.Tokens[i]);
+            if (r.Tokens[i] != refTok[i]) break;
+        }
     }
 }

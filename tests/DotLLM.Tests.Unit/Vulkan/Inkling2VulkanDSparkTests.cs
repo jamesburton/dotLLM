@@ -441,4 +441,181 @@ public sealed class Inkling2VulkanDSparkTests : IClassFixture<VkInklingFixture>
         }
         finally { VulkanKvCache.GrowthAdmissionOverride = null; m.ResetSequenceState(); }
     }
+
+    // ───────────── F16 drafter logits arm (issue #2046, James 2026-11-28) ─────────────
+
+    [SkippableFact]
+    public void ExplicitAttach_ForcesTheDrafterAtEveryContext()
+    {
+        var m = Model();   // attached through AttachDFlashDrafter = the --dspark path
+        m.DSparkMinContext = 100000;
+        try { Assert.True(m.PrepareMtpFor(1)); Assert.True(m.PrepareMtpFor(50)); }
+        finally { m.DSparkMinContext = int.MaxValue; }
+    }
+
+    private (List<int> Mine, List<int> Oracle, int Rounds, List<bool> RoundAll) OracleDrafts(VulkanInkling2TransformerModel m)
+    {
+        string path = Path.Combine(Inkling2RealModelTests.OracleDir, "dspark-oracle-k3.json");
+        Skip.If(!File.Exists(path), "dspark-oracle-k3.json missing");
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        var mine = new List<int>(); var oracle = new List<int>(); var roundAll = new List<bool>();
+        foreach (var prop in doc.RootElement.EnumerateObject())
+        {
+            int[] prompt = prop.Value.GetProperty("prompt_ids").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            int[] T = prop.Value.GetProperty("tokens").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            m.ResetSequenceState();
+            using var st = (VulkanInkling2DSparkState)m.CreateMtpState()!;
+            using (m.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, null, null, st, true)) { }
+            int fed = 0;
+            foreach (var r in prop.Value.GetProperty("rounds").EnumerateArray())
+            {
+                int a = r.GetProperty("anchor").GetInt32();
+                while (fed < a) { using (m.Forward([T[fed]], [prompt.Length + fed], -1, null, null, st, true)) { } fed++; }
+                var cands = r.GetProperty("drafts").EnumerateArray().Select(d => d.EnumerateArray().Select(c => c[0].GetInt32()).First()).ToArray();
+                bool all = true;
+                for (int i = 0; i < cands.Length; i++)
+                {
+                    int d = st.NextDraft(T[a], prompt.Length + a + i);
+                    mine.Add(d); oracle.Add(cands[i]); if (d != cands[i]) all = false;
+                }
+                roundAll.Add(all);
+            }
+        }
+        return (mine, oracle, roundAll.Count, roundAll);
+    }
+
+    /// <summary>
+    /// F16 vs F32 drafter logits on the 198 llama.cpp oracle rounds (594 draft tokens, teacher-forced) and on the 8 greedy prompts through the real decoder: draft agreement between the arms,
+    /// each arm against llama.cpp, greedy identity with plain decoding, acceptance and tokens per round. The Markov head updates the logits in place, so its walk (which depends only on the
+    /// argmax chain) is covered by the draft tokens.
+    /// </summary>
+    [SkippableFact]
+    public void F16Logits_DraftsAndGreedyIdentity_VersusF32()
+    {
+        var m = Model();
+        bool was = m.DraftLogitsF16;
+        try
+        {
+            m.SetDraftLogitsF16(false);
+            var f32 = OracleDrafts(m);
+            m.SetDraftLogitsF16(true);
+            var f16 = OracleDrafts(m);
+            int n = f32.Mine.Count, same = 0, hit32 = 0, hit16 = 0, roundsSame = 0;
+            for (int i = 0; i < n; i++) { if (f32.Mine[i] == f16.Mine[i]) same++; if (f32.Mine[i] == f32.Oracle[i]) hit32++; if (f16.Mine[i] == f16.Oracle[i]) hit16++; }
+            for (int r = 0; r < f32.Rounds; r++)
+            {
+                bool eq = true; for (int i = 0; i < 3; i++) if (f32.Mine[r * 3 + i] != f16.Mine[r * 3 + i]) eq = false;
+                if (eq) roundsSame++;
+            }
+            _out.WriteLine($"oracle rounds: F16 drafts equal F32 drafts on {same}/{n} tokens, {roundsSame}/{f32.Rounds} rounds; vs llama.cpp top-1: F32 {hit32}/{n} = {(double)hit32 / n:P1}, F16 {hit16}/{n} = {(double)hit16 / n:P1}");
+
+            var prompts = Inkling2DSparkTests.GreedyPrompts();
+            foreach (bool f in new[] { false, true })
+            {
+                m.SetDraftLogitsF16(f);
+                int rounds = 0, emitted = 0, drafted = 0; var bad = new List<string>();
+                foreach (var (name, prompt, _) in prompts)
+                {
+                    var plain = Plain(m, prompt, 40);
+                    var (spec, st) = Spec(m, prompt, 40, 3);
+                    rounds += st.Rounds; emitted += st.Emitted; drafted += st.Drafted;
+                    if (!plain.AsSpan().SequenceEqual(spec)) bad.Add(name);
+                }
+                _out.WriteLine($"{(f ? "F16" : "F32")} logits: greedy identity {(bad.Count == 0 ? "8/8" : string.Join(",", bad))}; {rounds} rounds, {(double)emitted / rounds:F3} tokens/round, acceptance {(double)(emitted - rounds) / Math.Max(1, drafted):P1}");
+                Assert.Empty(bad);
+            }
+            Assert.True(f16.Mine.Count == n);
+            Assert.True((double)same / n > 0.99, $"F16 drafts agree with F32 on {(double)same / n:P2} of the tokens");
+        }
+        finally { m.SetDraftLogitsF16(was); }
+    }
+
+    /// <summary>Column-level: the softcapped F16 logits against the F32 ones at probe positions: max error, argmax agreement per row, and how close the runner-up is where they disagree.</summary>
+    [SkippableFact]
+    public void F16Logits_ColumnsAndArgmax_VersusF32_OnProbes()
+    {
+        var m = Model();
+        bool was = m.DraftLogitsF16;
+        var seq = ShortSequence();
+        int V = m.Config.VocabSize;
+        try
+        {
+            var recs = new Dictionary<bool, List<(int[] Tokens, float[] Cols)>>();
+            foreach (bool f in new[] { false, true })
+            {
+                m.SetDraftLogitsF16(f);
+                m.ResetSequenceState();
+                using var st = (VulkanInkling2DSparkState)m.CreateMtpState()!;
+                var list = new List<(int[], float[])>();
+                int p = 0;
+                while (p < seq.Length)
+                {
+                    int next = p < 5 ? 5 - p : 1;
+                    using (m.Forward(seq[p..(p + next)], Enumerable.Range(p, next).ToArray(), -1, null, null, st, true)) { }
+                    p += next;
+                    if (p >= 5 && p < seq.Length)
+                    {
+                        var d = new int[3];
+                        for (int i = 0; i < 3; i++) d[i] = st.NextDraft(seq[p], p + i);
+                        list.Add((d, m.DownloadDraftLogits(3)));
+                    }
+                }
+                recs[f] = list;
+            }
+            int rows = 0, agree = 0, close = 0; double maxErr = 0, sumErr = 0; long cnt = 0;
+            for (int r = 0; r < recs[false].Count; r++)
+                for (int i = 0; i < 3; i++)
+                {
+                    rows++;
+                    var a = recs[false][r].Cols.AsSpan(i * V, V); var b = recs[true][r].Cols.AsSpan(i * V, V);
+                    int ia = System.Numerics.Tensors.TensorPrimitives.IndexOfMax(a), ib = System.Numerics.Tensors.TensorPrimitives.IndexOfMax(b);
+                    if (ia == ib) agree++;
+                    else { float top = a[ia]; float second = float.MinValue; for (int j = 0; j < V; j++) if (j != ia && a[j] > second) second = a[j]; if (top - second < 0.05f) close++; _out.WriteLine($"row disagreement: F32 argmax {ia} ({top:F4}) vs F16 argmax {ib}; F32 margin {top - second:F4}"); }
+                    for (int j = 0; j < V; j += 7) { double e = Math.Abs(a[j] - b[j]); maxErr = Math.Max(maxErr, e); sumErr += e; cnt++; }
+                }
+            _out.WriteLine($"probes: {rows} rows, argmax agreement {agree}/{rows}, max |F16 - F32| over sampled columns {maxErr:E2}, mean {sumErr / cnt:E2}; disagreements with an F32 margin < 0.05: {close}");
+            Assert.True((double)agree / rows > 0.99, $"argmax agreement {agree}/{rows}");
+        }
+        finally { m.SetDraftLogitsF16(was); }
+    }
+
+    /// <summary>Drafter wall time per draft (K = 3, ~1.3K tokens of context, submit included) and the constrained-round download, F32 vs F16, interleaved.</summary>
+    [SkippableFact]
+    public void Report_DrafterMsAndConstrainedDownload_F32VsF16()
+    {
+        var m = Model();
+        bool was = m.DraftLogitsF16;
+        var rng = new Random(77);
+        int[] tokens = Enumerable.Range(0, 1330).Select(_ => rng.Next(1000, 120000)).ToArray();
+        try
+        {
+            m.ResetSequenceState();
+            using var st = (VulkanInkling2DSparkState)m.CreateMtpState()!;
+            int p = 0;
+            while (p < 1300) { int n = Math.Min(128, 1300 - p); using (m.Forward(tokens[p..(p + n)], Enumerable.Range(p, n).ToArray(), -1, null, null, st, true)) { } p += n; }
+            var draft = new Dictionary<bool, List<double>> { [false] = new(), [true] = new() };
+            var dl = new Dictionary<bool, List<double>> { [false] = new(), [true] = new() };
+            foreach (bool f in new[] { false, true, true, false, false, true })   // interleaved, mirrored
+            {
+                m.SetDraftLogitsF16(f);
+                for (int w = 0; w < 6; w++) { st.Rollback(1300); st.NextDraft(tokens[1300], 1300); }
+                for (int k = 0; k < 30; k++)
+                {
+                    st.Rollback(1300);
+                    long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    st.NextDraft(tokens[1300], 1300);
+                    long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    draft[f].Add((t1 - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                    long d0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    var rows = m.DownloadDraftLogits(3);
+                    long d1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    dl[f].Add((d1 - d0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                    GC.KeepAlive(rows);
+                }
+            }
+            double Med(List<double> l) { var s = l.OrderBy(x => x).ToArray(); return s[s.Length / 2]; }
+            _out.WriteLine($"draft (K=3) median ms: F32 {Med(draft[false]):F2}, F16 {Med(draft[true]):F2}; constrained-round logits download (3 rows) median ms: F32 {Med(dl[false]):F2}, F16 {Med(dl[true]):F2}; logits buffer bytes F32 {(long)(m.DSparkSpec!.BlockSize - 1) * m.Config.VocabSize * 4}, F16 {(long)(m.DSparkSpec!.BlockSize - 1) * m.Config.VocabSize * 2}");
+        }
+        finally { m.SetDraftLogitsF16(was); }
+    }
 }

@@ -1,0 +1,4 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#define LOGITS_F16 1
+#include "inkling2_dspark_markov_logits.glsl"
