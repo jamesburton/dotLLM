@@ -304,11 +304,11 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     /// Anything else goes through <see cref="UploadProjectionMatrix"/> unchanged.
     /// </summary>
     private static unsafe VulkanDevice.Buffer UploadGdnGateProjection(
-        VulkanDevice device, VulkanStagingBuffer staging, nint src, QuantizationType qt, int outputDim, int inputDim,
+        VulkanDevice device, VulkanStagingBuffer staging, nint src, QuantizationType qt, int outputDim, int inputDim, bool allowNarrow,
         out QuantizationType deviceQt, out long uploadedBytes)
     {
         long count = (long)outputDim * inputDim;
-        if (qt == QuantizationType.F32 && (inputDim & 1) == 0 && Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_GATE_BF16_NARROW") != "0")
+        if (allowNarrow && qt == QuantizationType.F32 && (inputDim & 1) == 0 && Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_GATE_BF16_NARROW") != "0")
         {
             uint* words = (uint*)src;
             bool exact = true;
@@ -345,10 +345,13 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
             gdnW.GateOutputDim, gdnW.GateInputDim, forceF32: false, out var gateQt, out long gateBytes);
         // Bonsai 2.5 declares ssm_alpha/ssm_beta F32 where Bonsai 2 declared BF16; every value is exactly BF16-representable (checked at upload),
         // so the device copy is narrowed to BF16 losslessly (half the bytes, the same kernels as Bonsai 2, zero numeric change; #2072).
+        // PTQ1_0 trunks are excluded: a Vulkan PTQ1_0 prefill with BF16 GDN gates at n >= 128 ends in VK_ERROR_DEVICE_LOST (reproduced on the
+        // Bonsai 2 PTQ1_0 file too, which declares BF16 gates; ctx 64 is fine, F32 gates are fine), so narrowing there would only expose it.
+        bool narrowGates = gdnW.QkvQuantType != QuantizationType.PTQ1_0;
         var alpha = UploadGdnGateProjection(device, staging, gdnW.AlphaWeight, gdnW.AlphaQuantType,
-            gdnW.AlphaOutputDim, gdnW.AlphaInputDim, out var alphaQt, out long alphaBytes);
+            gdnW.AlphaOutputDim, gdnW.AlphaInputDim, narrowGates, out var alphaQt, out long alphaBytes);
         var beta = UploadGdnGateProjection(device, staging, gdnW.BetaWeight, gdnW.BetaQuantType,
-            gdnW.BetaOutputDim, gdnW.BetaInputDim, out var betaQt, out long betaBytes);
+            gdnW.BetaOutputDim, gdnW.BetaInputDim, narrowGates, out var betaQt, out long betaBytes);
         var conv1dWeight = UploadFloatArray(device, staging, gdnW.Conv1dWeight);
         var conv1dBias = UploadFloatArray(device, staging, gdnW.Conv1dBias);
         var ssmNorm = UploadFloatArray(device, staging, gdnW.SsmNormWeight);
