@@ -4852,6 +4852,14 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             return;
         }
 
+        // #2074: upstream ggml Q2_0 (Ternary-Bonsai-2.5 Q2_0 file): 1..8 rows read the packed blocks in place. Wider batches fall through to the
+        // bounded dequant + cuBLAS path below (LaunchDequantToF16 has a Q2_0 arm); that expansion is demand-sized, grow-only F16 scratch, see #495 / #1107.
+        if (qt == QuantizationType.Q2_0 && seqLen <= CudaKernels.Q2_0GemvMaxCols && (k % 64) == 0)
+        {
+            _kernels.LaunchQ2_0GemvF32(weight, x, y, m, k, seqLen, streamH);
+            return;
+        }
+
         // #482: 2..8 token rows (an MTP / speculative verify, a short prefill) read the packed PQ2_0
         // weights once for all rows instead of dequantizing the whole matrix to F16 for cuBLAS below.
         if (qt == QuantizationType.PQ2_0 && CudaSmallSGemvDispatch.Covers(seqLen)
@@ -4956,7 +4964,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     private void GemmLmHead(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen)
     {
-        if (seqLen == 1 || qt == QuantizationType.F32 || CudaWideProjection.BoundedLmHeadOverride == false)
+        if (seqLen == 1 || qt == QuantizationType.F32 || CudaWideProjection.BoundedLmHeadOverride == false
+            || (qt == QuantizationType.Q2_0 && seqLen <= CudaKernels.Q2_0GemvMaxCols))   // #2074: packed GEMV, no head expansion
         {
             Gemm(weight, qt, x, y, m, k, seqLen);
             return;
