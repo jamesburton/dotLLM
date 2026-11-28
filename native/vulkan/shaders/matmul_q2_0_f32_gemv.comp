@@ -5,7 +5,7 @@
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };  // Q2_0 blob, 4-byte indexable
-layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };       // [K]
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { vec4  x4[]; };      // [K] viewed as vec4 (K is a multiple of 64)
 layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };       // [M]
 
 layout(push_constant) uniform PushConstants {
@@ -67,22 +67,25 @@ void main() {
 
     float acc = 0.0;
 
-    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+    // One thread per 16-element code word (4 words per 64-element block): consecutive threads read consecutive 4-byte words of the packed row
+    // and consecutive 64-byte runs of x (as vec4), so both streams are coalesced; the block scale is a broadcast re-read by the 4 sibling threads.
+    uint words = pc.blocksPerRow * 4u;
+    for (uint t = tid; t < words; t += threads) {
+        uint b = t >> 2u;
+        uint w = t & 3u;
         uint blockByteBase = rowByteBase + b * Q2_0_BLOCK_BYTES;
         float d = readHalf(blockByteBase);
-        uint qsBase = blockByteBase + 2u;
+        uint cur = read4Bytes(blockByteBase + 2u + w * 4u);
+        uint x4Base = (b * Q2_0_GROUP_SIZE + w * 16u) >> 2u;   // vec4 index of element 64*b + 16*w
 
-        uint xBase = b * Q2_0_GROUP_SIZE;
-
-        // 16 qs bytes read as 4 words; word w holds bytes [4w..4w+3] = elements [16w..16w+15], 4 two-bit codes per byte, element
-        // 4*byte + i in bits 2i (least significant first). code - 1 is -1, 0, +1 or +2.
+        // word holds elements [16w..16w+15] of the block, 2 bits each, element i in bits 2i (least significant first); value d * (code - 1).
         float sum = 0.0;
-        for (uint w = 0u; w < 4u; w++) {
-            uint cur = read4Bytes(qsBase + w * 4u);
-            uint e = w * 16u;
-            for (uint i = 0u; i < 16u; i++) {
-                sum += x[xBase + e + i] * float(int((cur >> (2u * i)) & 3u) - 1);
-            }
+        for (uint j = 0u; j < 4u; j++) {
+            vec4 xv = x4[x4Base + j];
+            sum += xv.x * float(int((cur >> (8u * j      )) & 3u) - 1)
+                 + xv.y * float(int((cur >> (8u * j + 2u)) & 3u) - 1)
+                 + xv.z * float(int((cur >> (8u * j + 4u)) & 3u) - 1)
+                 + xv.w * float(int((cur >> (8u * j + 6u)) & 3u) - 1);
         }
         acc += d * sum;
     }

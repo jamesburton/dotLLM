@@ -178,6 +178,31 @@ fast paths never noticed the distinction). dotLLM's ragged-K support (CPU: `MatM
 in `native/kernels/`) is a scalar, correctness-first fallback reached only when `k % 128 != 0` — the
 aligned SIMD/uint4 fast paths are untouched.
 
+### Q2_0 (upstream ggml, GGUF type 42, issue #2074)
+
+Stock llama.cpp's 2-bit type (b11556+; the format of `Ternary-Bonsai-2.5-27B-Q2_0-mtp.gguf`, which is Bonsai's ternary weights in the Hadamard-folded basis).
+
+```
+Row-major W[m,k], k % 64 == 0. Block = 18 bytes per 64 elements: fp16 d, then qs[16].
+Element j of a block: code = (qs[j/4] >> 2*(j%4)) & 3     (least significant bits first, 4 consecutive elements per byte)
+Dequantize: val = (code - 1) * d        codes 0..3 = -d, 0, +d, +2d   (the +2d code is legal; Bonsai tensors never use it)
+```
+
+**Type id 42 is shared with `PQ2_0`.** The reader tells them apart by the tensor's on-disk extent (`GgufReader.ReclassifyUpstreamQ2_0`):
+a tensor whose extent only fits the 2.25 bpw layout is relabelled `QuantizationType.Q2_0` (internal id 242). The extent differs by `n/64` bytes, so a tensor of fewer than 2048 elements is
+ambiguous and stays `PQ2_0`; every projection, `token_embd` and `output` of the Bonsai 2.5 file is far above that (402 type-42 tensors, all relabelled).
+
+Reference: llama.cpp b12780 `ggml_vec_dot_q2_0_q8_0_generic` (`vec_dot_type = Q8_0`, one Q2_0 block against two Q8_0 blocks). Support per backend (all read the blocks in place, nothing is widened):
+
+| backend | decode | prefill | notes |
+|---|---|---|---|
+| CPU | `MatMul.GemvQ2_0`: Q8_0 activation, AVX2 `vpmaddubsw` (`sum((q-1)*y) = sum(q*y) - sum(y)`), scalar reference `VecDotQ2_0Q8_0Scalar` | `MatMul.GemmQ2_0` (same kernel per column) | integer sums per Q8_0 block and the float combine order are ggml's, so AVX2 equals scalar exactly |
+| Vulkan | `matmul_q2_0_f32_gemv` (F32 activation, one thread per 16-element code word, vec4 x loads) | `matmul_q2_0_f32_gemm_coopmat_128x128x4` (wave64 coopmat; the template's BK=32 chunk is half a block), tiled F32 `matmul_q2_0_f32_gemm` without coopmat | `q2_0_embed_gather_f32` keeps `token_embd` packed (5.08 GB widened is over `maxStorageBufferRange`). Both hybrid hosts carry the dispatch arm (`VulkanHybridKeepPackedDispatchTests`). The 2-8 row MTP verify shapes use the GEMM; there is no multi-column GEMV yet |
+| CUDA | `q2_0_gemv_f32io` (1..8 columns, F32 in/out) | `dequant_q2_0_f16` + cuBLAS: a bounded, demand-sized F16 scratch of at most `m*k*2` bytes per projection (178 MiB for the 17408x5120 FFN), the same #495 expansion the other non-PQ2_0 types use; the LM head goes through the row-tiled path | **build-verified only**: no NVIDIA GPU was reachable (framework's RTX 3060 is absent, T5500 offline), so `CudaQ2_0Tests` skip. An in-place prefill GEMM (dp4a MMQ on Q8_1 activations) is the open gap |
+
+Parity against stock llama.cpp b12780 (CPU, `-dev none`) on the shared token ids of `wiki.test.lf.raw`, 4 windows of 512, 1020 scored tokens (`scripts/kld_compare.py`): dotLLM CPU top-1 99.80 %, mean KL 1.26e-3, PPL 10.9637 vs 10.9641;
+Vulkan top-1 99.80 %, mean KL 1.17e-3, PPL 10.9783 (+0.13 %). Greedy text is identical to llama.cpp for 28 and 96 generated tokens on both backends.
+
 ### TERN_B64_F16 (ternary, 2.25 bits/weight, dotLLM-private type 243, issue #1706)
 
 Per-64-column FP16-scaled ternary weights, used by tensor overlays (below). Not a ggml type: the id 243 exists only in dotLLM overlay GGUFs.
@@ -385,6 +410,7 @@ The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with
 | IQ1_S | ✓ | ✓ | — | IQ-family — smallest GGUF quant (~1.5-1.7 bpw) |
 | I2_S | ✓ | ✓ | ✓ (`MatMulI2SGemmF32Kernel`) | BitNet b1.58 ternary |
 | PQ2_0 | ✓ | ✓ | ✓ (`MatMulPQ2_0GemmF32Kernel`) | PrismML ternary + per-group scale |
+| Q2_0 (upstream ggml) | ✓ (`matmul_q2_0_f32_gemv`) | ✓ (tiled F32) | ✓ (`MatMulQ4_0GemmCoopmatKernel`, `quant: Q2_0`, wave64) | #2074, 18 B / 64, codes -1,0,+1,+2; hybrid loader (`VulkanQwen3MoeHybridWeights.KeepQ2_0`) only, not `VulkanWeights` |
 | PTQ1_0 | ✓ | ✓ (untiled) | — | PrismML dense base-3 trits, 28 B / 128 (1.75 bpw), scale last; CPU + Vulkan only, CUDA refuses at load (#1280) |
 | Q4_0 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (`MatMulQ4_0GemmCoopmatKernel`, wave64) | #1018 |
 | Q4_1 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (same classes, `quant: Q4_1`, wave64) | #1171 (Recursive Flint's official file) |
