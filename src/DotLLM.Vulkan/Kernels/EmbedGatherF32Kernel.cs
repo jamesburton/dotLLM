@@ -52,6 +52,7 @@ public sealed class EmbedGatherF32Kernel : IDisposable
     {
         QuantizationType.Q8_0 => ("q8_0_embed_gather_f32.spv", 32),
         QuantizationType.Q5_0 => ("q5_0_embed_gather_f32.spv", 32),   // #1225: Nemotron-3.5 Lightning
+        QuantizationType.Q2_0 => ("q2_0_embed_gather_f32.spv", 64),   // #2074: upstream ggml Q2_0 (Ternary-Bonsai-2.5 Q2_0 file)
         QuantizationType.PQ2_0 => ("pq2_0_embed_gather_f32.spv", 128),
         QuantizationType.PTQ1_0 => ("ptq1_0_embed_gather_f32.spv", 128),   // #1280
         QuantizationType.Q4_K => ("q4_k_embed_gather_f32.spv", 256),

@@ -1,0 +1,98 @@
+#version 450
+// Upstream ggml Q2_0 (issue #2074): derived from matmul_q4_0_f32_gemv.comp. Block = 18 bytes per 64 elements: fp16 d, then qs[16];
+// element j is code (qs[j/4] >> 2*(j%4)) & 3 and value = d * (code - 1), so codes 0..3 are -d, 0, +d, +2d. Weights are read packed, never widened.
+// y[m] = sum_k W_q2_0[m, k] * x[k]; one workgroup per output row, 128 threads stride across 64-element blocks, shared-memory tree reduce.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };  // Q2_0 blob, 4-byte indexable
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };       // [K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // number of output rows
+    uint K;             // columns (must be a multiple of 64)
+    uint blocksPerRow;  // = K / 64
+    uint rowUints;      // per-row uint stride bound (rounded up)
+} pc;
+
+const uint Q2_0_BLOCK_BYTES = 18u;
+const uint Q2_0_GROUP_SIZE  = 64u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// Read 4 consecutive bytes at `absByteOff` as a little-endian packed uint,
+// funnelling across the word boundary when the offset is not 4-aligned (the
+// 18-byte Q2_0 block puts the qs region at offset 2, which is 0- or 2-mod-4
+// on alternate blocks). One storage load replaces four byte-wise readByte
+// calls — the qs region was previously read 16 bytes/block, reloading each
+// shared word four times.
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * Q2_0_BLOCK_BYTES;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * Q2_0_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+        uint qsBase = blockByteBase + 2u;
+
+        uint xBase = b * Q2_0_GROUP_SIZE;
+
+        // 16 qs bytes read as 4 words; word w holds bytes [4w..4w+3] = elements [16w..16w+15], 4 two-bit codes per byte, element
+        // 4*byte + i in bits 2i (least significant first). code - 1 is -1, 0, +1 or +2.
+        float sum = 0.0;
+        for (uint w = 0u; w < 4u; w++) {
+            uint cur = read4Bytes(qsBase + w * 4u);
+            uint e = w * 16u;
+            for (uint i = 0u; i < 16u; i++) {
+                sum += x[xBase + e + i] * float(int((cur >> (2u * i)) & 3u) - 1);
+            }
+        }
+        acc += d * sum;
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
