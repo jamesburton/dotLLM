@@ -1,0 +1,129 @@
+#version 450
+// Inkling 2 vision tower (issue #2062, part B): Y[t, m] = epi( sum_k W[m, k] * X[t, k] ) with W a Q8_0 matrix read IN PLACE (each 34-byte block is decoded into
+// shared memory inside the tile load; nothing is expanded in global memory), X and Y BF16 activations, F32 accumulation (registers), one BF16 rounding on the store.
+// 64 (M) x 64 (tokens) tile, K step 32 = one Q8_0 block per weight row, 256 threads, each a 4 x 4 register tile.
+//   EPI 0: bias            1: gelu(bias + acc)       2: Y += ls * (bias + acc)  (residual stream, in place)
+//   EPI 3: bias, then 2D RoPE of adjacent pairs (F16 cos/sin table)             4: gelu(acc) (no bias)        5: acc, stored as F16 (the image embeddings)
+//   MERGE 1: X row t is the 2x2 patch merge [(2i,2j),(2i+1,2j),(2i,2j+1),(2i+1,2j+1)] of the patch rows of X (token t = j*mw + i); the rows are 1024 wide.
+#extension GL_GOOGLE_include_directive : require
+#include "olala_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint EPI = 0u;
+layout(constant_id = 1) const uint MERGE = 0u;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufW { uint weight[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BufX { uvec4 xin4[]; };
+layout(set = 0, binding = 2, std430) buffer BufY { ACT_T yout[]; };
+layout(set = 0, binding = 3, std430) readonly buffer BufB { float bias[]; };
+layout(set = 0, binding = 4, std430) readonly buffer BufL { float lscale[]; };
+layout(set = 0, binding = 5, std430) readonly buffer BufR { uint16_t rope[]; };   // F16 [t][64]: cos_w[16] sin_w[16] cos_h[16] sin_h[16]
+layout(set = 0, binding = 6, std430) writeonly buffer BufH { uint16_t yh[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M; uint K; uint T; uint xStride; uint mw; uint gw; uint posOff;
+} pc;
+
+shared vec4 sW[32][16];
+shared vec4 sX[32][16];
+
+uint halfAt(uint h) { uint w = weight[h >> 1u]; return ((h & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u); }
+
+float erfF(float x) {
+    float ax = abs(x);
+    float t = 1.0 / (1.0 + 0.3275911 * ax);
+    float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-ax * ax);
+    return x < 0.0 ? -y : y;
+}
+float geluF(float x) { return 0.5 * x * (1.0 + erfF(x * 0.70710678118654752440)); }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint m0 = gl_WorkGroupID.x * 64u, t0 = gl_WorkGroupID.y * 64u;
+    uint tx = tid & 15u, ty = tid >> 4u;
+    uint lr = tid >> 2u, lp = tid & 3u;           // load row (weight row / token) and 8-element part
+    uint nb = pc.K >> 5u;
+    float acc[4][4];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) acc[i][j] = 0.0;
+
+    uint tok = t0 + lr;
+    uint mjj = 0u, mii = 0u;
+    if (MERGE == 1u) { mjj = tok / pc.mw; mii = tok - mjj * pc.mw; }
+
+    for (uint kb = 0u; kb < nb; ++kb) {
+        // weight tile: row m0+lr, block kb, quants 8*lp .. 8*lp+7
+        uint m = m0 + lr;
+        float d = 0.0; uint q[4] = uint[4](0u, 0u, 0u, 0u);
+        if (m < pc.M) {
+            uint h0 = (m * nb + kb) * 17u;
+            d = unpackHalf2x16(halfAt(h0)).x;
+            for (uint e = 0u; e < 4u; ++e) q[e] = halfAt(h0 + 1u + lp * 4u + e);
+        }
+        for (uint e = 0u; e < 4u; ++e) {
+            float v0 = d * float(int((q[e] & 0xFFu) ^ 0x80u) - 128);
+            float v1 = d * float(int(((q[e] >> 8u) & 0xFFu) ^ 0x80u) - 128);
+            uint k0 = lp * 8u + e * 2u;
+            sW[k0][lr >> 2u][lr & 3u] = v0;
+            sW[k0 + 1u][lr >> 2u][lr & 3u] = v1;
+        }
+        // activation tile: token t0+lr, k = 32*kb + 8*lp .. +7 (one 16-byte load)
+        uvec4 u = uvec4(0u);
+        if (tok < pc.T) {
+            uint k = kb * 32u + lp * 8u;
+            uint elem;
+            if (MERGE == 1u) {
+                uint quad = k >> 10u;
+                uint px = 2u * mii + (quad & 1u), py = 2u * mjj + (quad >> 1u);
+                elem = (py * pc.gw + px + pc.posOff) * 1024u + (k & 1023u);
+            } else {
+                elem = tok * pc.xStride + k;
+            }
+            u = xin4[elem >> 3u];
+        }
+        uint kk = lp * 8u;
+        uint r4 = lr >> 2u, rc = lr & 3u;
+        sX[kk + 0u][r4][rc] = bf16Lo(u.x); sX[kk + 1u][r4][rc] = bf16Hi(u.x);
+        sX[kk + 2u][r4][rc] = bf16Lo(u.y); sX[kk + 3u][r4][rc] = bf16Hi(u.y);
+        sX[kk + 4u][r4][rc] = bf16Lo(u.z); sX[kk + 5u][r4][rc] = bf16Hi(u.z);
+        sX[kk + 6u][r4][rc] = bf16Lo(u.w); sX[kk + 7u][r4][rc] = bf16Hi(u.w);
+        barrier();
+        for (uint k = 0u; k < 32u; ++k) {
+            vec4 w = sW[k][tx];
+            vec4 x = sX[k][ty];
+            for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) acc[i][j] = fma(x[i], w[j], acc[i][j]);
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        uint t = t0 + ty * 4u + i;
+        if (t >= pc.T) continue;
+        uint mb = m0 + tx * 4u;
+        if (mb >= pc.M) continue;
+        float v[4];
+        for (uint j = 0u; j < 4u; ++j) {
+            float a = acc[i][j];
+            if (EPI <= 3u) a += bias[mb + j];
+            v[j] = a;
+        }
+        if (EPI == 1u || EPI == 4u) for (uint j = 0u; j < 4u; ++j) v[j] = geluF(v[j]);
+        if (EPI == 3u) {
+            uint dd = mb & 63u;                        // multiple of 4: two adjacent pairs
+            uint half_ = dd >> 5u;
+            for (uint pr = 0u; pr < 2u; ++pr) {
+                uint idx = (dd & 31u) / 2u + pr;       // frequency index 0..15
+                uint base = t * 64u + half_ * 32u + idx;
+                float c = unpackHalf2x16(uint(rope[base])).x, s = unpackHalf2x16(uint(rope[base + 16u])).x;
+                float x0 = v[pr * 2u], x1 = v[pr * 2u + 1u];
+                v[pr * 2u] = x0 * c - x1 * s;
+                v[pr * 2u + 1u] = x0 * s + x1 * c;
+            }
+        }
+        for (uint j = 0u; j < 4u; ++j) {
+            uint o = t * pc.M + mb + j;
+            if (EPI == 2u) yout[o] = fToAct(actToF(yout[o]) + lscale[mb + j] * v[j]);
+            else if (EPI == 5u) yh[o] = uint16_t(packHalf2x16(vec2(v[j], 0.0)) & 0xFFFFu);
+            else yout[o] = fToAct(v[j]);
+        }
+    }
+}

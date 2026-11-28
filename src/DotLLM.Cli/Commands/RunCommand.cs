@@ -804,7 +804,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     throw new FileNotFoundException("--image: no vision projector found; pass --mmproj <mmproj-*.gguf> (or place it next to the model).");
                 var parts = new List<ChatContentPart>();
                 imageEmbeddings = new List<DotLLM.Core.Vision.ImageEmbeddings>();
-                using (var encoder = DotLLM.Models.Vision.VisionSupport.LoadEncoder(mmproj, threadingInfo, imageLimits.OverLimit))
+                using (var encoder = DotLLM.Models.Vision.VisionSupport.LoadEncoderFor(model, mmproj, threadingInfo, imageLimits.OverLimit))
                 {
                     foreach (string path in settings.Images)
                     {

@@ -72,7 +72,7 @@ public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2K
 /// <para>The model owns its sequence state like the CPU model: positions must continue it, and a call at position 0 restarts it. One command buffer per chunk
 /// of <see cref="Inkling2VulkanOptions.MaxChunk"/> tokens.</para>
 /// </remarks>
-public sealed unsafe class VulkanInkling2TransformerModel : IModel, IImageInputModel
+public sealed unsafe class VulkanInkling2TransformerModel : IModel, IImageInputModel, IImageEncoderProvider
 {
     private sealed class Mat
     {
@@ -590,6 +590,10 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel, IImageInputM
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
         => ForwardCore(tokenIds, positions, deviceId, lastTokenLogitsOnly);
+
+    /// <summary>Builds the Vulkan ViT encoder (#2062 part B) on this model's device; <c>DOTLLM_VISION_DEVICE=cpu</c> is handled by the callers.</summary>
+    public IImageEncoder CreateImageEncoder(string mmprojPath, ImageOverLimit overLimit)
+        => VulkanInkling2VisionEncoder.Load(_device, mmprojPath, _spvDir, overLimit);
 
     /// <summary>
     /// Forward with image embeddings (issue #2062): the F16 rows of every <see cref="ImageSpan"/> replace the token embeddings at the positions they cover and
