@@ -1,0 +1,74 @@
+#version 450
+// Upstream ggml Q2_0 token-embedding gather + dequantize (issue #2074: Ternary-Bonsai-2.5 Q2_0 file, token_embd [5120, 248320] is 5.08 GB widened,
+// over maxStorageBufferRange, 1.5 GB packed). Same contract as q5_0_embed_gather_f32.comp; 18-byte blocks of 64 elements:
+//   bytes [0..1] fp16 d, [2..17] qs: element j = code (qs[j/4] >> 2*(j%4)) & 3, value = (code - 1) * d (bit-identical to the CPU DequantizeQ2_0).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  src[]; };  // Q2_0 table
+layout(set = 0, binding = 1, std430) readonly  buffer BufIds { int   ids[]; };  // [nTokens]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY   { float dst[]; };  // [nTokens*hidden]
+
+layout(push_constant) uniform PushConstants {
+    uint nTokens;      // number of tokens to gather
+    uint hidden;       // row length in elements (multiple of 64)
+    uint blocksPerRow; // = hidden / 64
+    uint vocabSize;    // row-count bound (defensive clamp)
+} pc;
+
+const uint Q2_0_BLOCK_BYTES = 18u;
+const uint Q2_0_GROUP_SIZE  = 64u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// fp16 read at an arbitrary (possibly 2-mod-4) byte offset.
+float readHalf(uint absByteOff) {
+    uint alignedIdx  = absByteOff >> 2u;
+    uint byteInWord  = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// 32-bit read at an arbitrary byte offset.
+uint readWord(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    if (byteInWord == 0u) return src[alignedIdx];
+    uint sh = byteInWord * 8u;
+    return (src[alignedIdx] >> sh) | (src[alignedIdx + 1u] << (32u - sh));
+}
+
+void main() {
+    uint t = gl_WorkGroupID.y;
+    if (t >= pc.nTokens) return;
+
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.hidden) return;
+
+    // Token ids are host-validated before recording; the clamp is a defensive second gate.
+    uint row = uint(ids[t]);
+    if (row >= pc.vocabSize) row = 0u;
+
+    uint rowBase   = row * pc.blocksPerRow * Q2_0_BLOCK_BYTES;
+    uint block     = c / Q2_0_GROUP_SIZE;
+    uint lane      = c - block * Q2_0_GROUP_SIZE;
+    uint blockBase = rowBase + block * Q2_0_BLOCK_BYTES;
+
+    float d  = readHalf(blockBase);
+    uint  qb = readByte(blockBase + 2u + (lane >> 2u));
+    uint  q  = (qb >> ((lane & 3u) * 2u)) & 3u;
+
+    precise float v = float(int(q) - 1) * d;
+    dst[t * pc.hidden + c] = v;
+}
