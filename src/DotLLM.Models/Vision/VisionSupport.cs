@@ -71,8 +71,10 @@ public static class VisionSupport
         try
         {
             string projector = gguf.Metadata.GetStringOrDefault("clip.vision.projector_type");
+            if (projector.Length == 0) projector = gguf.Metadata.GetStringOrDefault("clip.projector_type");
             if (projector == "inkling2v") return Inkling2VisionEncoder.Load(gguf, threading, ownsGguf: true, overLimit, embedPrecision);
-            throw new NotSupportedException($"mmproj projector type '{projector}' is not supported (supported: inkling2v).");
+            if (projector == "qwen3vl_merger") return QwenVlVisionEncoder.Load(gguf, threading, ownsGguf: true, overLimit, embedPrecision);
+            throw new NotSupportedException($"mmproj projector type '{projector}' is not supported (supported: inkling2v, qwen3vl_merger).");
         }
         catch
         {
