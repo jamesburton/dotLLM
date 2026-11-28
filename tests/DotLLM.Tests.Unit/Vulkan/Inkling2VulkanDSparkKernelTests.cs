@@ -35,7 +35,7 @@ public unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
 
     private VulkanDevice Dev { get { Skip.If(_dev is null, "No Vulkan device"); return _dev!; } }
 
-    private static readonly HashSet<string> ActTwins = ["inkling2_dspark_eltwise", "inkling2_dspark_ctxmix", "inkling2_dspark_headnorm", "inkling2_dspark_attn", "inkling2_dspark_markov_pre", "inkling2_dspark_markov_step"];
+    private static readonly HashSet<string> ActTwins = ["inkling2_dspark_eltwise", "inkling2_dspark_ctxmix", "inkling2_dspark_headnorm", "inkling2_dspark_attn", "inkling2_dspark_markov_pre", "inkling2_dspark_markov_step", "inkling2_dspark_markov_logits", "inkling2_dspark_markov_logits_f16"];
 
     private OlalaKernel K(string name, int buffers, int pushWords, params uint[] spec) => KIn(null, F16Act && ActTwins.Contains(name) ? name + "_f16act" : name, buffers, pushWords, spec);
 
