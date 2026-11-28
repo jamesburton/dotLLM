@@ -273,11 +273,11 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel, IImageInputM
             case 12: return ref _gateIn; case 13: return ref _g64; case 14: return ref _gainPre; case 15: return ref _forgetPre; case 16: return ref _q; case 17: return ref _kRaw;
             case 18: return ref _vRaw; case 19: return ref _kc; case 20: return ref _vc; case 21: return ref _rel; case 22: return ref _sink; case 23: return ref _gateB;
             case 24: return ref _kDyn; case 25: return ref _vDyn; case 26: return ref _attn; case 27: return ref _attnOut; case 28: return ref _ffnInp; case 29: return ref _mn;
-            case 30: return ref _moe; case 31: return ref _h; case 32: return ref _sel; case 33: return ref _selW; case 34: return ref _ids;
+            case 30: return ref _moe; case 31: return ref _h; case 32: return ref _selW;   // _sel (int ids) and _ids (token ids) are not activation-typed: shared by every set
             default: throw new ArgumentOutOfRangeException(nameof(i));
         }
     }
-    private const int ScratchFieldCount = 35;
+    private const int ScratchFieldCount = 33;
 
     /// <summary>Makes <paramref name="f"/> the activation format of the following chunk: swaps in that format's scratch set (building it on first use) and kernel family.</summary>
     private void UseActivationFormat(Inkling2ActFormat f)
@@ -324,9 +324,9 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel, IImageInputM
         _kDyn = Scratch((long)T * _c.ConvKernel * _nkv); _vDyn = Scratch((long)T * _c.ConvKernel * _nkv);
         _attn = Scratch((long)T * _qW); _attnOut = Scratch((long)T * H); _ffnInp = Scratch((long)T * H); _mn = Scratch((long)T * H); _moe = Scratch((long)T * H);
         _h = Scratch((long)T * _topk * _ff);
-        _sel = Own(_device.AllocateDeviceLocal(Math.Max(16, (long)T * _topk * 4))); _deviceBytes += _sel.Size;
+        if (_sel is null) { _sel = Own(_device.AllocateDeviceLocal(Math.Max(16, (long)T * _topk * 4))); _deviceBytes += _sel.Size; }
         _selW = Scratch((long)T * _topk);
-        _ids = Own(_device.Allocate(Math.Max(16, (long)T * 4)));
+        _ids ??= Own(_device.Allocate(Math.Max(16, (long)T * 4)));
     }
 
     private void AllocateSlots()

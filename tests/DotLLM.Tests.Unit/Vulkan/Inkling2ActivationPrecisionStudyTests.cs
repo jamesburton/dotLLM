@@ -146,39 +146,116 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
         _ => throw new ArgumentException(arm),
     };
 
+    // ───────────────────────────── noise-free metric ─────────────────────────────
+    // The 13-row oracle KL swings by a few 1e-3 on a single input rounding (docs 12a), more than the arms differ. The ranking metric is therefore the KL of each arm against
+    // the F32-activation arm of the SAME engine over every prompt row (before the image / image rows / after the image): no oracle noise, only the storage format.
+
+    private static float[][] PromptRows(Inkling2VisionEndToEndTests.Oracle o, ImageEmbeddings emb, Func<int[], int[], IReadOnlyList<ImageSpan>, ITensor> fwdAll, Action reset, int V)
+    {
+        var prompt = o.Before.Concat(Enumerable.Repeat(200054, emb.Tokens)).Concat(o.After).ToArray();
+        var spans = new[] { new ImageSpan(o.Before.Length, emb) };
+        var rows = new float[prompt.Length][];
+        reset();
+        for (int at = 0; at < prompt.Length; at += 32)
+        {
+            int len = Math.Min(32, prompt.Length - at);
+            using var t = fwdAll(prompt[at..(at + len)], Enumerable.Range(at, len).ToArray(), spans);
+            for (int r = 0; r < len; r++) rows[at + r] = Row(t, r, V);
+        }
+        return rows;
+    }
+
+    private static string NoiseFree(float[][] reference, float[][] got, int b0, int b1)
+    {
+        double kb = 0, ki = 0, ka = 0;
+        for (int r = 0; r < reference.Length; r++)
+        {
+            double kl = Inkling2VisionEndToEndTests.FullKl(reference[r], got[r]).Kl;
+            if (r < b0) kb += kl; else if (r < b1) ki += kl; else ka += kl;
+        }
+        int n = reference.Length;
+        return $"vs-F32 KL x1e-3: before {kb / Math.Max(1, b0) * 1e3:F3}, image {ki / (b1 - b0) * 1e3:F3}, after {ka / Math.Max(1, n - b1) * 1e3:F3}, all {(kb + ki + ka) / n * 1e3:F3}";
+    }
+
+    private static float[][] TextRows(int V, Func<int[], int[], ITensor> fwdAll, Action reset)
+    {
+        var r = Inkling2RealModelTests.LoadKlRef(Passage)!;
+        int first = r.NCtx / 2;
+        var ids = r.Tokens.AsSpan(0, r.NCtx).ToArray();
+        reset();
+        var rows = new float[r.NCtx][];
+        for (int at = 0; at < r.NCtx; at += 32)
+        {
+            int len = Math.Min(32, r.NCtx - at);
+            using var part = fwdAll(ids[at..(at + len)], Enumerable.Range(at, len).ToArray());
+            for (int k = 0; k < len; k++) if (at + k >= first) rows[at + k] = Row(part, k, V);
+        }
+        return rows.Skip(first).Take(r.NCtx - 1 - first).ToArray();
+    }
+
+    private static string NoiseFreeText(float[][] reference, float[][] got)
+    {
+        double s = 0; for (int i = 0; i < reference.Length; i++) s += Inkling2VisionEndToEndTests.FullKl(reference[i], got[i]).Kl;
+        return $"vs-F32 KL x1e-3 {s / reference.Length * 1e3:F3} over {reference.Length} rows";
+    }
+
     // ───────────────────────────── GPU: LLM arms ─────────────────────────────
 
-    /// <summary>KL of each Vulkan activation arm on the 3 images (CPU encoder, shipping BF16 embeddings, 32-token calls) and the text passage gate with greedy identity.</summary>
-    [SkippableTheory]
-    [InlineData("bf16")]
-    [InlineData("f16")]
-    [InlineData("f32")]
-    [InlineData("bf16+f32img")]
-    public void Llm_Arm_Kl(string arm)
+    /// <summary>
+    /// KL of each Vulkan activation arm on the 3 images (CPU encoder, shipping BF16 embeddings, 32-token calls) and the text passage with greedy identity: against the llama.cpp oracle (absolute) and
+    /// against this engine's F32 arm (noise-free). The F32 arm runs first and is the reference. Also proves the per-chunk F32 switch: rainbow80 prefill under bf16+f32img is bit-identical to f32.
+    /// </summary>
+    [SkippableFact]
+    public void Llm_Arms_Kl()
     {
         Gate();
         Skip.IfNot(VulkanDevice.IsAvailable(), "no vulkan");
         string? gguf = Inkling2RealModelTests.FindGguf(); Skip.If(gguf is null);
         string? mm = Inkling2VisionFixtures.FindMmproj(); Skip.If(mm is null);
+        string[] arms = (Environment.GetEnvironmentVariable("DOTLLM_INK_PREC_ARMS") ?? "f32,bf16,f16,bf16+f32img").Split(',');
         using var file = GgufFile.Open(gguf!);
         var cfg = GgufModelConfigExtractor.Extract(file.Metadata);
+        int V = cfg.VocabSize;
         using var enc = Inkling2VisionEncoder.Load(mm!, ThreadingConfig.Auto);
+        var embs = Images.ToDictionary(n => n, n => enc.Encode(Inkling2VisionEndToEndTests.LoadOracle(n)!.Image));
+        var refImg = new Dictionary<string, float[][]>(); float[][]? refText = null; float[]? refLast80 = null;
         using var dev = VulkanDevice.Create();
-        using var vk = VulkanInkling2TransformerModel.BuildFromGguf(dev, file, cfg, Inkling2VulkanTests.SpvDir(), Arm(arm));
-        foreach (string name in Images)
+        try
         {
-            var o = Inkling2VisionEndToEndTests.LoadOracle(name); Skip.If(o is null);
-            using var emb = enc.Encode(o!.Image);
-            var s = ImageKl(o, (i, p, sp) => vk.ForwardWithImages(i, p, -1, sp, null, true), vk.ResetSequenceState, emb);
-            Log($"LLMKL arm={arm} {name}: {s}; scratch bf16 {vk.ActivationScratchBytes(Inkling2ActFormat.Bf16) / 1e6:F1} MB f16 {vk.ActivationScratchBytes(Inkling2ActFormat.F16) / 1e6:F1} MB f32 {vk.ActivationScratchBytes(Inkling2ActFormat.F32) / 1e6:F1} MB");
+            foreach (string arm in arms)
+            {
+                using var vk = VulkanInkling2TransformerModel.BuildFromGguf(dev, file, cfg, Inkling2VulkanTests.SpvDir(), Arm(arm));
+                if (arm == arms[0]) Log($"LLMLOAD {vk.WeightLoadReport}");
+                foreach (string name in Images)
+                {
+                    var o = Inkling2VisionEndToEndTests.LoadOracle(name)!;
+                    var emb = embs[name];
+                    var s = ImageKl(o, (i, p, sp) => vk.ForwardWithImages(i, p, -1, sp, null, true), vk.ResetSequenceState, emb);
+                    var rows = PromptRows(o, emb, (i, p, sp) => vk.ForwardWithImages(i, p, -1, sp, null, false), vk.ResetSequenceState, V);
+                    if (arm == "f32") refImg[name] = rows;
+                    string nf = refImg.TryGetValue(name, out var rf) ? NoiseFree(rf, rows, o.Before.Length, o.Before.Length + emb.Tokens) : "no f32 reference yet";
+                    Log($"LLMKL arm={arm} {name}: oracle {s}; {nf}");
+                }
+                {   // single-pass (128-token chunks) last-row logits of rainbow80: the per-chunk switch must reproduce the f32 arm exactly
+                    var o = Inkling2VisionEndToEndTests.LoadOracle("rainbow80")!; var emb = embs["rainbow80"];
+                    var prompt = o.Before.Concat(Enumerable.Repeat(200054, emb.Tokens)).Concat(o.After).ToArray();
+                    vk.ResetSequenceState();
+                    using var t = vk.ForwardWithImages(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, [new ImageSpan(o.Before.Length, emb)], null, true);
+                    var last = Row(t, 0, V);
+                    if (arm == "f32") refLast80 = last;
+                    else if (refLast80 is not null) Log($"LLMIDENT arm={arm} rainbow80 single-pass last-row logits bit-identical to f32: {last.AsSpan().SequenceEqual(refLast80)}; max |diff| {last.Zip(refLast80, (a, b) => Math.Abs(a - b)).Max():E2}");
+                }
+                if (arm != "bf16+f32img")   // no image rows in the text gate: identical to bf16 by construction
+                {
+                    var (kl, mc, conf) = TextGate(V, (i, p) => vk.Forward(i, p, -1), (i, p) => vk.Forward(i, p, -1, null, true), vk.ResetSequenceState, greedy: true);
+                    var tr = TextRows(V, (i, p) => vk.Forward(i, p, -1), vk.ResetSequenceState);
+                    if (arm == "f32") refText = tr;
+                    Log($"LLMKL arm={arm} text-passage: oracle {kl}; greedy confident-mismatches {mc}/{conf}; {(refText is null ? "no f32 reference yet" : NoiseFreeText(refText, tr))}");
+                }
+                Log($"LLMMEM arm={arm}: ComputeMemoryBytes {vk.ComputeMemoryBytes / 1e6:F1} MB; activation scratch bf16 {vk.ActivationScratchBytes(Inkling2ActFormat.Bf16) / 1e6:F1} MB, f16 {vk.ActivationScratchBytes(Inkling2ActFormat.F16) / 1e6:F1} MB, f32 {vk.ActivationScratchBytes(Inkling2ActFormat.F32) / 1e6:F1} MB (chunk 128, hidden 2304)");
+            }
         }
-        if (arm != "bf16+f32img")   // no image rows in the text gate: identical to bf16 by construction
-        {
-            var (kl, mc, conf) = TextGate(cfg.VocabSize,
-                (i, p) => vk.Forward(i, p, -1), (i, p) => vk.Forward(i, p, -1, null, true), vk.ResetSequenceState, greedy: true);
-            Log($"LLMKL arm={arm} text-passage: {kl}; greedy confident-mismatches {mc}/{conf}");
-        }
-        Log($"LLMMEM arm={arm}: ComputeMemoryBytes {vk.ComputeMemoryBytes / 1e6:F1} MB (weights + scratch + KV + conv)");
+        finally { foreach (var e in embs.Values) e.Dispose(); }
     }
 
     // ───────────────────────────── GPU: LLM performance ─────────────────────────────
@@ -204,7 +281,7 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
         var prompt = o.Before.Concat(Enumerable.Repeat(200054, emb.Tokens)).Concat(o.After).ToArray();
         var spans = new[] { new ImageSpan(o.Before.Length, emb) };
         int[] text = r!.Tokens.AsSpan(0, 300).ToArray();
-        string[] arms = ["bf16", "f16", "f32", "bf16+f32img"];
+        string[] arms = (Environment.GetEnvironmentVariable("DOTLLM_INK_PREC_PERF_ARMS") ?? "bf16,f16,f32,bf16+f32img").Split(',');
         using var dev = VulkanDevice.Create();
         var models = arms.ToDictionary(a => a, a => VulkanInkling2TransformerModel.BuildFromGguf(dev, file, cfg, Inkling2VulkanTests.SpvDir(), Arm(a)));
         try
@@ -272,8 +349,9 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
     private static Inkling2TransformerModel LoadCpu(GgufFile file, ModelConfig cfg) => Inkling2TransformerModel.LoadFromGguf(file, cfg, ThreadingConfig.Auto);
 
     /// <summary>
-    /// CPU simulation of the storage formats at the Vulkan forward's store points (docs/INKLING2.md 12c): KL on the 3 images and the text passage, for every arm of
-    /// DOTLLM_INK_PREC_SIM; also prints the max |activation| per point and per residual-stream layer for the F32 (stats only) arm. CPU only: hold the cpu-bench lock.
+    /// CPU simulation of the storage formats at the Vulkan forward's store points (docs/INKLING2.md 12c): oracle KL and noise-free KL (vs the simulation's own F32 run) on the 3 images and the text passage,
+    /// for every arm of DOTLLM_INK_PREC_SIM; the "f32" arm (stats only) also prints the max |activation| per point and per residual-stream layer. CPU only: hold the cpu-bench lock.
+    /// Validation: the "bf16" / "f16" rows must agree with the GPU arms of <see cref="Llm_Arms_Kl"/> (same noise-free metric), else a store point is misplaced.
     /// </summary>
     [SkippableFact]
     public void Cpu_Sim_Arms()
@@ -283,10 +361,11 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
         string? mm = Inkling2VisionFixtures.FindMmproj(); Skip.If(mm is null);
         using var file = GgufFile.Open(gguf!);
         var cfg = GgufModelConfigExtractor.Extract(file.Metadata);
+        int V = cfg.VocabSize;
         using var enc = Inkling2VisionEncoder.Load(mm!, ThreadingConfig.Auto);
         using var cpu = LoadCpu(file, cfg);
-        var embs = new Dictionary<string, ImageEmbeddings>();
-        foreach (string n in Images) embs[n] = enc.Encode(Inkling2VisionEndToEndTests.LoadOracle(n)!.Image);
+        var embs = Images.ToDictionary(n => n, n => enc.Encode(Inkling2VisionEndToEndTests.LoadOracle(n)!.Image));
+        var refImg = new Dictionary<string, float[][]>(); float[][]? refText = null;
         try
         {
             foreach (string arm in SimArms)
@@ -295,20 +374,29 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
                 foreach (string name in Images)
                 {
                     var o = Inkling2VisionEndToEndTests.LoadOracle(name)!;
-                    var sim = MakeSim(arm, o.Before.Length, o.Before.Length + embs[name].Tokens);
+                    var emb = embs[name];
+                    var sim = MakeSim(arm, o.Before.Length, o.Before.Length + emb.Tokens);
                     cpu.Sim = sim;
-                    var s = ImageKl(o, (i, p, sp) => cpu.ForwardWithImages(i, p, -1, sp, null, true), cpu.ResetSequenceState, embs[name]);
+                    var s = ImageKl(o, (i, p, sp) => cpu.ForwardWithImages(i, p, -1, sp, null, true), cpu.ResetSequenceState, emb);
+                    var simAll = MakeSim(arm, o.Before.Length, o.Before.Length + emb.Tokens);
+                    cpu.Sim = simAll;
+                    var rows = PromptRows(o, emb, (i, p, sp) => cpu.ForwardWithImages(i, p, -1, sp, null, false), cpu.ResetSequenceState, V);
                     cpu.Sim = null;
-                    Log($"CPUSIM arm={arm} {name}: {s}");
-                    allStats.Add((name, sim));
+                    if (arm == "f32") refImg[name] = rows;
+                    Log($"CPUSIM arm={arm} {name}: oracle {s}; {(refImg.TryGetValue(name, out var rf) ? NoiseFree(rf, rows, o.Before.Length, o.Before.Length + emb.Tokens) : "no f32 reference yet")}");
+                    allStats.Add((name, simAll));
                 }
                 {
                     var sim = MakeSim(arm, int.MaxValue, int.MaxValue);
                     cpu.Sim = sim;
-                    var (kl, mc, conf) = TextGate(cfg.VocabSize, (i, p) => cpu.Forward(i, p, -1), (i, p) => cpu.Forward(i, p, -1, null, true), cpu.ResetSequenceState, greedy: false);
+                    var (kl, _, _) = TextGate(V, (i, p) => cpu.Forward(i, p, -1), (i, p) => cpu.Forward(i, p, -1, null, true), cpu.ResetSequenceState, greedy: false);
+                    var sim2 = MakeSim(arm, int.MaxValue, int.MaxValue);
+                    cpu.Sim = sim2;
+                    var tr = TextRows(V, (i, p) => cpu.Forward(i, p, -1), cpu.ResetSequenceState);
                     cpu.Sim = null;
-                    Log($"CPUSIM arm={arm} text-passage: {kl}");
-                    allStats.Add(("text", sim));
+                    if (arm == "f32") refText = tr;
+                    Log($"CPUSIM arm={arm} text-passage: oracle {kl}; {(refText is null ? "no f32 reference yet" : NoiseFreeText(refText, tr))}");
+                    allStats.Add(("text", sim2));
                 }
                 if (arm == "f32") DumpStats(allStats);
             }
@@ -333,12 +421,23 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
 
     // ───────────────────────────── GPU: the vision tower ─────────────────────────────
 
+    private static readonly (string Name, Inkling2ActFormat Act, bool Rope)[] VitArms =
+    [
+        ("bf16", Inkling2ActFormat.Bf16, false), ("bf16+rope32", Inkling2ActFormat.Bf16, true),
+        ("f16", Inkling2ActFormat.F16, false), ("f16+rope32", Inkling2ActFormat.F16, true),
+        ("f32", Inkling2ActFormat.F32, false), ("f32+rope32", Inkling2ActFormat.F32, true),
+    ];
+
+    private static float[] ReadF32(string path) { var b = File.ReadAllBytes(path); var f = new float[b.Length / 4]; Buffer.BlockCopy(b, 0, f, 0, b.Length); return f; }
+
+    private static DecodedImage VitImage(string name) => name == "noise2560" ? Inkling2VulkanVisionEncoderTests.Noise(2560) : Inkling2VisionEndToEndTests.LoadOracle(name)!.Image;
+
     /// <summary>
-    /// ViT arms (BF16 shipped, F16, F32, each with the F16 / F32 RoPE table): embedding relRMS against the CPU F32-control encoder (cached by the ViT tests) and llama.cpp's F32 control, end-to-end KL
-    /// through the (BF16, shipped) Vulkan text model, encode time interleaved with warm-up, scratch bytes; the 2560x2560 noise image gives the 4,096-token time / scratch (relRMS vs the CPU shipping encoder).
+    /// ViT accuracy per arm: embedding relRMS against the CPU F32-control encoder (cached by the ViT tests) and llama.cpp's F32 control, end-to-end KL through the (BF16, shipped) Vulkan text model, non-finite count,
+    /// peak scratch. The shipped BF16 vit_gemm_q8.spv is byte-identical to the study GEMM built without defines, so the "+rope32" arms isolate the RoPE table alone.
     /// </summary>
     [SkippableFact]
-    public void Vit_Arms()
+    public void Vit_Accuracy()
     {
         Gate();
         Skip.IfNot(VulkanDevice.IsAvailable(), "no vulkan");
@@ -351,37 +450,37 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
         using var venc = VulkanInkling2VisionEncoder.Load(dev, mm!, Inkling2VulkanTests.SpvDir());
         string cache = Inkling2VulkanVisionEncoderTests.CacheDir;
         string ctrlDir = Path.GetFullPath(Path.Combine(Inkling2VisionFixtures.OracleDir, "..", "vision-f32-control"));
-        float[] Read(string path) { var b = File.ReadAllBytes(path); var f = new float[b.Length / 4]; Buffer.BlockCopy(b, 0, f, 0, b.Length); return f; }
-        (string Name, Inkling2ActFormat Act, bool Rope)[] arms =
-        [
-            ("bf16", Inkling2ActFormat.Bf16, false), ("bf16+rope32", Inkling2ActFormat.Bf16, true),
-            ("f16", Inkling2ActFormat.F16, false), ("f16+rope32", Inkling2ActFormat.F16, true),
-            ("f32", Inkling2ActFormat.F32, false), ("f32+rope32", Inkling2ActFormat.F32, true),
-        ];
-        void Set((string Name, Inkling2ActFormat Act, bool Rope) a) { venc.ActFormat = a.Act; venc.RopeF32 = a.Rope; }
-
-        // accuracy + end-to-end KL per arm and image
-        foreach (var a in arms)
+        foreach (var a in VitArms)
         {
-            Set(a);
+            venc.ActFormat = a.Act; venc.RopeF32 = a.Rope;
             foreach (string name in Images)
             {
                 var o = Inkling2VisionEndToEndTests.LoadOracle(name)!;
                 using var e = venc.Encode(o.Image);
                 var got = Inkling2VulkanVisionEncoderTests.Floats(e);
                 int bad = got.Count(v => !float.IsFinite(v));
-                double vsCtrl = Inkling2VulkanVisionEncoderTests.RelRms(got, Read(Path.Combine(cache, $"cpu_ctrl_f32_{name}.f32")));
+                double vsCtrl = Inkling2VulkanVisionEncoderTests.RelRms(got, ReadF32(Path.Combine(cache, $"cpu_ctrl_f32_{name}.f32")));
                 string f32c = Path.Combine(ctrlDir, $"llamacpp_f32_{name}.f32");
-                string vsLl = File.Exists(f32c) ? Inkling2VulkanVisionEncoderTests.RelRms(got, Read(f32c)).ToString("E2") : "n/a";
+                string vsLl = File.Exists(f32c) ? Inkling2VulkanVisionEncoderTests.RelRms(got, ReadF32(f32c)).ToString("E2") : "n/a";
                 var s = ImageKl(o, (i, p, sp) => vk.ForwardWithImages(i, p, -1, sp, null, true), vk.ResetSequenceState, e);
-                Log($"VITARM arm={a.Name} {name}: relRMS vs CPU-F32-control {vsCtrl:E2}; vs llama.cpp-F32-control {vsLl}; non-finite {bad}; E2E {s}; peak scratch {venc.LastPeakScratchBytes / 1e6:F1} MB");
+                Log($"VITARM arm={a.Name} {name}: relRMS vs CPU-F32-control {vsCtrl:E2}; vs llama.cpp-F32-control {vsLl}; non-finite {bad}; E2E oracle {s}; peak scratch {venc.LastPeakScratchBytes / 1e6:F1} MB");
             }
         }
-        // max |activation| per ViT stage (F32 arm, traced)
-        Set(arms[4]);
-        foreach (string name in new[] { "rainbow80", "rainbow190x110", "rainbow640", "noise2560" })
+    }
+
+    /// <summary>Max |activation| per ViT stage (F32 arm, traced) on the 3 images and the 4,096-token noise image; per-layer residual maxima.</summary>
+    [SkippableFact]
+    public void Vit_MaxActivations()
+    {
+        Gate();
+        Skip.IfNot(VulkanDevice.IsAvailable(), "no vulkan");
+        string? mm = Inkling2VisionFixtures.FindMmproj(); Skip.If(mm is null);
+        using var dev = VulkanDevice.Create();
+        using var venc = VulkanInkling2VisionEncoder.Load(dev, mm!, Inkling2VulkanTests.SpvDir());
+        venc.ActFormat = Inkling2ActFormat.F32;
+        string[] names = (Environment.GetEnvironmentVariable("DOTLLM_INK_PREC_VIT_IMAGES") ?? "rainbow80,rainbow190x110,rainbow640,noise2560").Split(',');
+        foreach (string name in names)
         {
-            var img = name == "noise2560" ? Inkling2VulkanVisionEncoderTests.Noise(2560) : Inkling2VisionEndToEndTests.LoadOracle(name)!.Image;
             var mx = new Dictionary<string, float>(); var resid = new List<float>();
             venc.Trace = (n, d, r, c) =>
             {
@@ -390,40 +489,64 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
                 mx[stage] = mx.TryGetValue(stage, out float old) ? Math.Max(old, m) : m;
                 if (n.StartsWith("layer_out-")) resid.Add(m);
             };
-            using (venc.Encode(img)) { }
+            using (venc.Encode(VitImage(name))) { }
             venc.Trace = null;
             Log($"VITMAX {name}: " + string.Join(", ", mx.Select(kv => $"{kv.Key} {kv.Value:G4}")));
             Log($"VITRESID {name}: layer_out max per layer " + string.Join(" ", resid.Select(v => v.ToString("G4"))));
         }
-        // timing, interleaved, per arm, on 4 images
-        Set(arms[0]);
+    }
+
+    /// <summary>Encode time per arm, interleaved with a warm-up (DOTLLM_INK_PREC_VIT_IMAGES, DOTLLM_INK_PREC_ROUNDS); peak scratch per arm. 4,096-token noise image: 30-38 s per encode, so give it its own run.</summary>
+    [SkippableFact]
+    public void Vit_Time()
+    {
+        Gate();
+        Skip.IfNot(VulkanDevice.IsAvailable(), "no vulkan");
+        string? mm = Inkling2VisionFixtures.FindMmproj(); Skip.If(mm is null);
+        using var dev = VulkanDevice.Create();
+        using var venc = VulkanInkling2VisionEncoder.Load(dev, mm!, Inkling2VulkanTests.SpvDir());
         int rounds = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_INK_PREC_ROUNDS"), out int rr) ? rr : 5;
-        var timed = arms.Where(a => !a.Rope || a.Act == Inkling2ActFormat.Bf16).ToArray();   // F16 / F32 table variants cost the same as the plain arms
-        foreach (string name in new[] { "rainbow80", "rainbow190x110", "rainbow640", "noise2560" })
+        string[] names = (Environment.GetEnvironmentVariable("DOTLLM_INK_PREC_VIT_IMAGES") ?? "rainbow80,rainbow190x110,rainbow640").Split(',');
+        var timed = VitArms.Where(a => !a.Rope || a.Act == Inkling2ActFormat.Bf16).ToArray();   // the F16 / F32 table variants cost the same as the plain arms
+        foreach (string name in names)
         {
-            var img = name == "noise2560" ? Inkling2VulkanVisionEncoderTests.Noise(2560) : Inkling2VisionEndToEndTests.LoadOracle(name)!.Image;
-            int r = name == "noise2560" ? Math.Min(rounds, 3) : rounds;
+            var img = VitImage(name);
+            int r = name == "noise2560" ? Math.Min(rounds, 2) : rounds;
             var times = timed.ToDictionary(a => a.Name, _ => new List<double>());
+            var gpu = timed.ToDictionary(a => a.Name, _ => new List<double>());
             var scratch = timed.ToDictionary(a => a.Name, _ => 0L);
             for (int round = 0; round <= r; round++)
                 foreach (var a in (round % 2 == 0 ? timed : timed.Reverse().ToArray()))
                 {
-                    Set(a);
+                    venc.ActFormat = a.Act; venc.RopeF32 = a.Rope;
                     var sw = Stopwatch.StartNew();
                     using (venc.Encode(img)) { }
-                    double wall = sw.Elapsed.TotalSeconds;
-                    if (round > 0) times[a.Name].Add(wall);
+                    if (round > 0) { times[a.Name].Add(sw.Elapsed.TotalSeconds); gpu[a.Name].Add(venc.LastGpuSeconds); }
                     scratch[a.Name] = Math.Max(scratch[a.Name], venc.LastPeakScratchBytes);
                 }
             foreach (var a in timed)
-                Log($"VITTIME arm={a.Name} {name}: encode s {times[a.Name].Min():F3}-{times[a.Name].Max():F3} (median {times[a.Name].OrderBy(x => x).ElementAt(times[a.Name].Count / 2):F3}); peak scratch {scratch[a.Name] / 1e6:F1} MB");
+                Log($"VITTIME arm={a.Name} {name}: encode wall s {times[a.Name].Min():F3}-{times[a.Name].Max():F3} (median {times[a.Name].OrderBy(x => x).ElementAt(times[a.Name].Count / 2):F3}); GPU part median {gpu[a.Name].OrderBy(x => x).ElementAt(gpu[a.Name].Count / 2):F3}; peak scratch {scratch[a.Name] / 1e6:F1} MB");
         }
-        // 4096-token relRMS vs the CPU shipping encoder (no F32-control cache for it)
-        string cpuNoise = Path.Combine(cache, "cpu_bf16_noise2560.f32");
-        if (File.Exists(cpuNoise))
+    }
+
+    /// <summary>4,096-token noise image: relRMS of each arm against the CPU shipping encoder (cached) and the non-finite count (F16 overflow shows here first).</summary>
+    [SkippableFact]
+    public void Vit_Noise4096_Accuracy()
+    {
+        Gate();
+        Skip.IfNot(VulkanDevice.IsAvailable(), "no vulkan");
+        string? mm = Inkling2VisionFixtures.FindMmproj(); Skip.If(mm is null);
+        string cpuNoise = Path.Combine(Inkling2VulkanVisionEncoderTests.CacheDir, "cpu_bf16_noise2560.f32");
+        Skip.IfNot(File.Exists(cpuNoise), "cpu_bf16_noise2560.f32 not cached");
+        var cpuRef = ReadF32(cpuNoise);
+        using var dev = VulkanDevice.Create();
+        using var venc = VulkanInkling2VisionEncoder.Load(dev, mm!, Inkling2VulkanTests.SpvDir());
+        foreach (var a in VitArms.Where(a => !a.Rope))
         {
-            var cpuRef = Read(cpuNoise);
-            foreach (var a in arms.Where(a => !a.Rope)) { Set(a); using var e = venc.Encode(Inkling2VulkanVisionEncoderTests.Noise(2560)); Log($"VITNOISE arm={a.Name}: relRMS vs CPU shipping encoder {Inkling2VulkanVisionEncoderTests.RelRms(Inkling2VulkanVisionEncoderTests.Floats(e), cpuRef):E2}; non-finite {Inkling2VulkanVisionEncoderTests.Floats(e).Count(v => !float.IsFinite(v))}"); }
+            venc.ActFormat = a.Act; venc.RopeF32 = a.Rope;
+            using var e = venc.Encode(Inkling2VulkanVisionEncoderTests.Noise(2560));
+            var f = Inkling2VulkanVisionEncoderTests.Floats(e);
+            Log($"VITNOISE arm={a.Name}: relRMS vs CPU shipping encoder {Inkling2VulkanVisionEncoderTests.RelRms(f, cpuRef):E2}; non-finite {f.Count(v => !float.IsFinite(v))}; peak scratch {venc.LastPeakScratchBytes / 1e6:F1} MB");
         }
     }
 }
