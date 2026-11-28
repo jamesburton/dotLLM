@@ -14,7 +14,7 @@ layout(set = 0, binding = 0, std430)          buffer BufBase { float base[]; }; 
 #endif
 layout(set = 0, binding = 1, std430) readonly  buffer BufW2   { uint w2w[]; };           // [vocab][R] BF16 pairs
 layout(set = 0, binding = 2, std430) readonly  buffer BufB2   { float b2[]; };           // [vocab]
-layout(set = 0, binding = 3, std430) readonly  buffer BufC    { uint16_t c2[]; };        // [R] BF16
+layout(set = 0, binding = 3, std430) readonly  buffer BufC    { ACT_T c2[]; };           // [R] activation type
 layout(set = 0, binding = 4, std430) writeonly buffer BufPart { vec2 part[]; };          // [wgs] (value, bit-cast index)
 
 layout(push_constant) uniform PushConstants {
@@ -32,7 +32,7 @@ void main() {
     uint t = gl_LocalInvocationID.x;
     uint lane = t & 31u, rg = t >> 5;
     float cv[8];
-    for (uint i = 0u; i < 8u; ++i) cv[i] = bf16ToF(c2[lane * 8u + i]);
+    for (uint i = 0u; i < 8u; ++i) cv[i] = actToF(c2[lane * 8u + i]);
     float wgBestV = -3.0e38; uint wgBestI = 0xFFFFFFFFu;
     for (uint it = 0u; it < 4u; ++it) {
         uint v = gl_WorkGroupID.x * 32u + it * 8u + rg;

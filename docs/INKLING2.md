@@ -474,7 +474,195 @@ grid into native memory (`RopeTable_IsBuiltOncePerGrid`), not as a managed array
 
 **Staged conversion (rule 3).** The one-time BF16 (or F16) conversion of `patch_embd` / `position_embd` (4.55 MB) reads the mapped F32 tensor on the host, converts into a transient native buffer and uploads it through the
 staging buffer: a host bounce (read, convert, copy) of 4.55 MB at load. It is not the direct route (no DirectStorage / zero-copy import of the F32 pages can produce a converted tensor); the F32 arm takes the normal weight-import route (zero-copy or DirectStorage where the policy allows)
-(9.11 MB resident). Awaiting the user's ruling on this note.
+(9.11 MB resident). **Signed off by the user, 2026-11-28** (CLAUDE.md rule 3: the 4.55 MB host-staged BF16/F16 conversion of `patch_embd` / `position_embd` is accepted as a bounded one-time load cost; ruling given with the F16-activation decision, #2075).
+
+## 12c. Activation storage precision study for image prompts (epic #2025; F16 became the default in #2075, see the decision below)
+
+Question (user, 2026-11-27): BF16 activation storage costs image prompts about 2-3e-3 KL (0.5e-3 on text); would F16, or a targeted F32, do better, and at what cost? The study itself changed no default (the arms were opt-in);
+the decision it led to is recorded after the recommendation. Hardware: Strix Halo iGPU, NVFP4 target, F16 KV, 128-token chunks, same oracles as 12a. Raw log: `.docs/ink-prec-results.txt`.
+
+**Arms** (all accumulate in F32; only the stored scratch format differs): `DOTLLM_INKLING2_ACT=bf16|f16|f32` (text model; `_f16act` / `_f32act` shaders, `ACT_F16` in `olala_common.glsl`: RNE, overflow to inf),
+`DOTLLM_INKLING2_ACT_F32_IMAGE_CHUNKS=1` (a chunk that carries image rows runs on a second, F32 scratch set; text chunks and decode stay BF16; nothing activation-typed is carried between chunks),
+`DOTLLM_VISION_ACT=bf16|f16|f32` and `DOTLLM_VISION_ROPE_F32=1` (ViT; study shaders built by `native/vulkan/build_study_arms.sh`). Per-chunk switch proven: rainbow80 single-pass last-row logits are bit-identical to the F32 arm.
+The BF16 `.spv` are byte-identical to before (checked with `cmp`).
+
+**Metric.** The oracle KL (13 rows) swings by a few 1e-3 on a single input rounding (12a), as much as the arms differ, and the llama.cpp oracle carries its own Q8_0 mmproj noise. The ranking metric is
+NF13: mean KL of the arm against this engine's F32 arm over the same 13 rows (no oracle noise). Oracle KL is kept as the absolute gate.
+
+| text model arm | oracle KL x1e-3 80 / 190x110 / 640 | NF13 x1e-3 80 / 190x110 / 640 (mean) | text passage: oracle KL, vs-F32 (127 rows), top-1, greedy mism (confident) | scratch (chunk 128, H 2304) |
+|---|---|---|---|---|
+| BF16 (shipped) | 4.85 / 6.62 / 5.41 | 2.04 / 6.13 / 4.53 (4.23) | 3.61, 2.11, 251/254, 3/384 (0/345) | 24.8 MB |
+| F16 | 2.53 / 2.31 / 6.11 | 0.04 / 0.91 / 2.80 (1.25) | 3.47, 1.64, 250/254, 6/384 (0/345) | 24.8 MB |
+| F32 | 2.72 / 3.84 / 3.49 | 0 (reference) | 3.12, 0, 251/254, 5/384 (0/345) | 49.6 MB |
+| BF16 + F32 image chunks | 2.52 / 2.94 / 3.30 | 0.67 / 1.64 / 0.15 (0.82) | = BF16 (no image rows) | 24.8 + 49.6 = 74.4 MB (second set allocated on the first image prefill) |
+
+Image-chunk F32 is not exactly F32 (NF13 0.82, not 0) because the decode rows and text-only chunks after the image still run BF16. All image gates pass 13/13 top-1, 0 greedy mismatches in every arm.
+Stored state: none besides scratch (KV stays F16, conv state BF16). Model total 17,808.7 MB (BF16 / F16), 17,833.5 MB (F32), 17,858.3 MB (BF16 + F32 image chunks).
+
+**Overflow.** Max |activation| per store point (CPU F32 trace of the same graph, 3 images + the 256-token passage; `Inkling2ActSim` stats): residual stream (`layer_out`) 453 (image 640; passage 370), `ffnInp` 386, block copies 36.6,
+embedding 37.7, MoE output 108, post-norm 170, `V` after conv 269, SITU 62, everything else <= 51. Margin to F16's 65,504: 145x on the residual stream. F16 overflow count 0 in every point; non-zero values below the F16 normal range:
+<= 0.53% (attention output), 0.15% (SITU), <= 0.02% elsewhere; flushed to zero <= 0.004%. The F16 GPU arm produced no non-finite value on any prompt. Olala-style 1e9..1e14 ranges are absent here. Evidence is 4 prompts: a long-context / other-content sweep is advisable before a default flip.
+
+**Vision tower** (Vulkan ViT, Q8_0 weights, arms on the same encoder; reference = CPU encoder on the F32-weights control, cached by the ViT tests; the 4,096-token noise image has no control, so it is vs the CPU shipping encoder):
+
+| ViT arm | relRMS 80 | 190x110 | 640 | 4096-token | encode s 80 / 190x110 / 640 / 4096 | peak scratch MB 80 / 190x110 / 640 / 4096 |
+|---|---|---|---|---|---|---|
+| BF16 (shipped) | 1.73e-2 | 1.81e-2 | 4.11e-2 | 1.13e-2 | 0.024 / 0.027 / 0.240 / 33.3-33.6 | 0.4 / 1.5 / 24.8 / 395.9 |
+| F16 | 1.66e-3 | 2.31e-3 | 5.22e-3 | 7.35e-3 | 0.028 / 0.030 / 0.251 / 33.6 | 0.4 / 1.5 / 24.8 / 395.9 |
+| F32 | 5.2e-4 | 5.6e-4 | 8.2e-4 | 7.27e-3 | 0.019 / 0.021 / 0.245 / 34.0-34.8 | 0.8 / 2.7 / 45.8 / 731.4 |
+
+(Encode times are medians of 5 interleaved rounds after a warm-up round, 2 for 4,096 tokens; the small images are within timer noise of each other. vs llama.cpp's F32 control, 80 and 190x110: BF16 1.73e-2 / 1.81e-2, F16 1.65e-3 / 2.30e-3, F32 4.5e-4 / 5.1e-4.)
+Max |activation| per ViT stage (F32 trace): residual `layer_out` 49.2 (4,096-token noise 44.8), embeddings 32.5, `hid` (GELU) 42.4, pre_ln 14.8 (34.4 on noise), Q 12.5, K 18.3, V 10.0, attention 10.0: 1,300x margin to F16.
+End-to-end oracle KL through the shipped text model, 80 / 190x110 / 640 (x1e-3): BF16 3.67 / 3.22 / 10.40, F16 2.63 / 3.23 / 11.38, F32 2.61 / 3.14 / 13.15. These do NOT improve with ViT precision: the llama.cpp oracle embeddings are
+themselves Q8_0-mmproj-noisy (2% vs the F32 control), so oracle KL cannot rank ViT arms; rank them by relRMS against the F32 control.
+**RoPE table.** An F32 instead of F16 table changes relRMS by under 3% for BF16 and F16 activations (BF16 1.73 -> 1.74, 1.81 -> 1.69, 4.11 -> 4.08 e-2; F16 1.66 -> 1.69, 2.31 -> 2.32, 5.22 -> 5.17 e-3) and only shows at the F32 floor
+(5.2 / 5.6 / 8.2e-4 -> 5.0 / 5.1 / 5.1e-4): the F16 table is not part of the BF16 gap; the BF16 activation storage is. (The BF16 study GEMM is byte-identical to the shipped `vit_gemm_q8.spv`, so this isolates the table alone.)
+
+**Performance** (same-session interleaved, pairwise bf16 vs arm because every model instance loads its own 17.5 GB via DirectStorage; 5 rounds after a warm-up round, direction alternated; medians, ranges in the log):
+prefill of 300 text tokens 68-71 tok/s in every arm (range 39-87), decode 19.7-21.5 tok/s in every arm (range 12-29), the 640-image prompt (284 tokens) prefill 3.8-4.4 s in every arm (range 3.3-6.5). The box was noisy (2x
+swings between rounds); no arm is separable from BF16 on speed. TTFT for an image prompt = encode (0.24-0.25 s for 640 on Vulkan) + prefill (about 3.8 s); the arms move neither.
+
+**CPU simulation of mixed placements (options a and c): NOT validated, no finding.** `Inkling2ActSim` (a hook in the CPU reference, not in the shipped tree, see the decision below) rounds the CPU reference at the Vulkan store points (residual stream only in F32; F32 for the first N layer visits; image rows
+in F32). Its BF16 / F16 numbers disagree with the real GPU arms (NF13 BF16 5.7 / 3.9 / 3.6 vs GPU 2.0 / 6.1 / 4.5; text vs-F32 3.9 vs 2.1; F16 text 3.4 vs GPU 1.6), because the CPU NVFP4 / Q8_0 GEMMs quantise their activation input to Q8_0
+(`GemmNvfp4(..., preQuantizedInput)`), a noise the GPU kernels do not have, and any sub-ULP change re-rolls those 8-bit digits. The simulation's noise floor (3-4e-3) swamps the 0.5-3e-3 effects, so its residual-only and first-N
+rows (in the log) must not be used. A real GPU arm for those would need mixed-format shaders (the depth-mix kernel reads blocks and the current state together): not built.
+
+**Recommendation.**
+1. F16 beats BF16 for image prompts at equal bytes and equal speed: NF13 4.23 -> 1.25e-3 (3.4x) on the text model, text passage vs-F32 2.11 -> 1.64e-3, ViT embedding error 10x lower (relRMS 1.7e-2 -> 1.7e-3). Oracle KL on the text model:
+   2.53 / 2.31 / 6.11 vs 4.85 / 6.62 / 5.41 (the 640 oracle number is noise-level worse; NF13 is better on all three). It is overflow-safe on everything measured (145x margin on the LLM residual, 1,300x on the ViT). F16 is within precision rule 1 (FP16/BF16 widest default). Switching is the user's decision; before a default flip, sweep long-context prompts and the DSpark drafter taps for overflow.
+2. F32 is not "far higher" than F16 here (F32 oracle 2.7 / 3.8 / 3.5 vs F16 2.5 / 2.3 / 6.1, within the 13-row noise), so with F16 no F32 exception is needed. If BF16 stays: the targeted option is F32 for image-carrying prefill chunks: oracle KL 2.52 / 2.94 / 3.30 (the F32 level), NF13 0.82e-3, cost one extra 49.6 MB scratch set (0.28% of the 17.8 GB resident, allocated on the first image prefill only, no stored state, no measurable speed cost); only the image prefill pays it, decode and text stay BF16. The ViT keeps its own choice: F16 ViT activations cost nothing extra (396 MB at 4,096 tokens) while F32 doubles it to 731 MB for no end-to-end gain.
+
+**Decision (user, 2026-11-28, #2075): F16 is the default activation storage format of the Inkling-2 Vulkan text model and the Vulkan ViT**, after the safety gate below. BF16 stays selectable:
+`DOTLLM_INKLING2_ACT=bf16` (text model), `DOTLLM_VISION_ACT=bf16` (ViT); `f32` remains the measurement arm (CLAUDE.md precision rule 1). The rule-3 sign-off for the 4.55 MB host-staged
+`patch_embd` / `position_embd` conversion is recorded in 12b. The study-only paths stay under their env flags (`DOTLLM_INKLING2_ACT_F32_IMAGE_CHUNKS`, `DOTLLM_VISION_ROPE_F32`, the `_f32act` shaders); the CPU
+storage-format simulation (`Inkling2ActSim`, a hook in the CPU reference) is not shipped, it lives in the history of branch `study/inkling2-act-precision` (commit `ba695dc6` and its parents).
+
+**Gate 1, the rounding routine (`Inkling2F16RoundingTests`).** `fToAct` / `actToF` of `olala_common.glsl` (`ACT_F16`) against .NET `Half` over 2,754,638 inputs: 63,587 exact RNE ties (every midpoint of the half grid, both signs,
+plus the 65,520 overflow tie, and the F32 ULPs either side), 1,350,581 in the subnormal range, 656,620 at or past the overflow boundary, 5,829 NaNs, infinities, zeros, F32 denormals, every exponent, and 2.5 M random F32 bit
+patterns. 0 store mismatches, 0 decode mismatches. Five mutants (shader copies loaded through `DOTLLM_INKLING2_SPV_OVERRIDE`) all die: truncation instead of RNE (441,987 mismatches, first at 0x33000001 = 2.98e-8: 0x0000 vs 0x0001),
+ties rounded up (30,785), subnormal ties rounded up (1,030), the overflow branch moved from 65,520 to 0x47A00000 (1,452), NaN mapped to the largest finite half (5,829). (Moving the branch only to 0x47800000 is an equivalent
+mutant: the rounding carry already yields infinity for 65,520..65,535.) The BF16 twin passes its own definition.
+
+**Gate 3, the guard.** *Text model:* the logits of every chunk that returns them are checked after the download (`TensorPrimitives.SumOfMagnitudes`, vectorised, NaN / +-inf propagate): non-finite throws
+`InvalidOperationException` naming `DOTLLM_INKLING2_ACT=bf16`. It fails loudly instead of falling back because a chunk has already advanced the K/V ring and the conv state, so it cannot be re-run in BF16.
+An overflowing F16 store makes the hidden state NaN within the chunk and K/V, conv state and attention carry it to every later chunk, so the last chunk of a prefill and every decode step expose it. Cost: 58.5 to 85.9 us per
+200,058-float logits row (measured, two runs), about 0.2% of a ~50 ms decode step, once per prefill. *ViT:* the encoder is stateless, so a non-finite F16 embedding re-encodes that image in BF16 (`Bf16Fallbacks` counts them, 0 in every
+measured run); the result then equals a plain BF16 encode (tested). Cost: one pass over `[n/4][2304]` halves per encode (2.4 M at 4,096 tokens, a few ms against 33 s; not separately measured). BF16 has no guard.
+Tests: `Guard_NonFiniteLogits_ThrowLoudlyOnF16_AndCostIsNegligible`, `Guard_Vit_NonFiniteF16_RecomputesInBf16`.
+
+**Gate 2, overflow sweep** (F16 GPU arm: every logit of every row of every 128-token chunk finite; `Inkling2F16GateTests`, opt-in `DOTLLM_INK_F16_SWEEP=1`):
+
+| prompt | rows x logits checked | non-finite | max abs logit (cap 30) |
+|---|---|---|---|
+| wikitext text, 16,640 tokens (global K/V 1,262 MB, 271 s) | 16,640 x 200,058 | 0 | 29.95 |
+| 5 images (4 + 15 + 256 + 15 + 4 image tokens), 434 tokens | 434 x 200,058 | 0 | 29.48 |
+| 3 images + passage + greedy gates (12c above, 4 prompts) | | 0 | |
+
+Max |activation| per store point (CPU F32 trace of the same graph; margin = 65,504 / max):
+
+| store point | max \|x\| (3 images + passage) | margin to 65,504 | non-zero values below the F16 normal range | F16 overflows |
+|---|---|---|---|---|
+| `layer_out` | 452.9 | 145x | 0.011% | 0 |
+| `ffnInp` | 385.9 | 170x | 0.021% | 0 |
+| `vc` | 269.4 | 243x | 0.008% | 0 |
+| `norm` | 169.8 | 386x | 0.010% | 0 |
+| `moe` | 107.8 | 608x | 0.005% | 0 |
+| `situ` | 62.4 | 1,050x | 0.150% | 0 |
+| `kc` | 50.78 | 1,290x | 0.003% | 0 |
+| `embed` | 37.71 | 1,737x | 0.019% | 0 |
+| `ctrl_in` | 36.78 | 1,781x | 0.011% | 0 |
+| `msg` | 36.78 | 1,781x | 0.012% | 0 |
+| `blk` | 36.64 | 1,788x | 0.007% | 0 |
+| `mix` | 34.89 | 1,877x | 0.011% | 0 |
+| `vraw` | 33.22 | 1,972x | 0.007% | 0 |
+| `vdyn` | 26.17 | 2,503x | 0.004% | 0 |
+| `rel` | 24.51 | 2,673x | 0.004% | 0 |
+| `q_clip` | 22.04 | 2,973x | 0.008% | 0 |
+| `ctrl_gain` | 20.15 | 3,251x | 0.003% | 0 |
+| `ctrl_forget` | 18.4 | 3,559x | 0.004% | 0 |
+| `gateB` | 18.14 | 3,611x | 0.002% | 0 |
+| `sink` | 18.1 | 3,619x | 0.000% | 0 |
+| `kraw` | 14 | 4,679x | 0.005% | 0 |
+| `kdyn` | 13.22 | 4,953x | 0.006% | 0 |
+| `q` | 12.44 | 5,264x | 0.007% | 0 |
+| `ctrl_g` | 10.84 | 6,044x | 0.008% | 0 |
+| `attn` | 10.3 | 6,358x | 0.531% | 0 |
+| `rel_clip` | 7.985 | 8,204x | 0.016% | 0 |
+| `selw` | 7.862 | 8,331x | 0.000% | 0 |
+| `attn_o` | 3.223 | 20,322x | 0.045% | 0 |
+
+Long-context and multi-image census (CPU F32 trace of the same graph, 434-token 5-image prompt and a 16,640-token wikitext prompt; stats only, 2,481 s on the CPU reference), the same store points:
+
+| store point | 5 images (434 tok) | 16,640-token text | max of the two | margin to 65,504 | below-normal share | overflows |
+|---|---|---|---|---|---|---|
+| `layer_out` | 456.4 | 473.2 | 473.2 | 138x | 0.011% | 0 |
+| `ffnInp` | 388.4 | 298.7 | 388.4 | 169x | 0.020% | 0 |
+| `vc` | 214.1 | 102.5 | 214.1 | 306x | 0.008% | 0 |
+| `norm` | 171.4 | 168.8 | 171.4 | 382x | 0.010% | 0 |
+| `moe` | 107.8 | 133.2 | 133.2 | 492x | 0.006% | 0 |
+| `kc` | 50.32 | 62.96 | 62.96 | 1,040x | 0.003% | 0 |
+| `situ` | 62.4 | 62.28 | 62.4 | 1,050x | 0.152% | 0 |
+| `embed` | 37.71 | 38.01 | 38.01 | 1,723x | 0.001% | 0 |
+| `ctrl_in` | 36.74 | 37.3 | 37.3 | 1,756x | 0.011% | 0 |
+| `msg` | 36.74 | 37.3 | 37.3 | 1,756x | 0.012% | 0 |
+| `blk` | 36.45 | 35.66 | 36.45 | 1,797x | 0.007% | 0 |
+| `mix` | 34.65 | 36.04 | 36.04 | 1,818x | 0.011% | 0 |
+| `vraw` | 28.11 | 20.17 | 28.11 | 2,330x | 0.007% | 0 |
+| `rel` | 24.51 | 15.7 | 24.51 | 2,673x | 0.004% | 0 |
+| `q_clip` | 22.05 | 22.97 | 22.97 | 2,852x | 0.008% | 0 |
+| `vdyn` | 21.88 | 20.11 | 21.88 | 2,994x | 0.004% | 0 |
+| `ctrl_gain` | 20.15 | 20.04 | 20.15 | 3,251x | 0.002% | 0 |
+| `ctrl_forget` | 18.4 | 17.65 | 18.4 | 3,559x | 0.004% | 0 |
+| `gateB` | 17.87 | 18.14 | 18.14 | 3,611x | 0.003% | 0 |
+| `sink` | 16.77 | 17.79 | 17.79 | 3,683x | 0.001% | 0 |
+| `kraw` | 13.17 | 15.68 | 15.68 | 4,177x | 0.005% | 0 |
+| `kdyn` | 13.3 | 14.02 | 14.02 | 4,674x | 0.005% | 0 |
+| `q` | 13.06 | 13 | 13.06 | 5,016x | 0.006% | 0 |
+| `ctrl_g` | 10.16 | 11.38 | 11.38 | 5,755x | 0.008% | 0 |
+| `attn` | 10.3 | 10.17 | 10.3 | 6,358x | 0.149% | 0 |
+| `rel_clip` | 7.984 | 8.54 | 8.54 | 7,670x | 0.016% | 0 |
+| `selw` | 7.831 | 7.984 | 7.984 | 8,204x | 0.000% | 0 |
+| `attn_o` | 3.046 | 4.295 | 4.295 | 15,252x | 0.041% | 0 |
+
+The residual-stream maxima per layer visit are in the raw log. The largest value anywhere is 473 (`layer_out`, 16K text): margin 138x. **DSpark tap rows** (the `IInkling2Tap` rows the drafter stores as 16-bit activations, max |value| per visit): visit 5: 345 (images) / 275 (16K text); visit 23: 199 / 174; visit 41: 91 / 92; visit 48 (final normed output): 171 / 169: the largest is 345, 190x below F16's ceiling. The drafter's own stored activations (a 3-layer Qwen3-like block fed by RMS-normalised mixes of those taps) were not instrumented; an F16 overflow there could only produce bad drafts (lower acceptance), never a wrong token, because the target verifies every draft, so the drafter is deliberately not guarded; the measured draft agreement of 96.0% (below) shows no degradation.
+
+
+**Regression runs with F16 as the default, on the final head** (dev merged in, #2065's conv history rounding included; Strix, functional runs):
+- Op-level kernel tests 37/37 (`Conv_CarriedState_MatchesReference` passes now); ViT encoder suite 15 passed, 3 skipped; **vision suite 28/28, including every `ChunkedPrefill_*` chunk-invariance case (KL vs the 32-token run exactly 0)**, without any override shader;
+  Vulkan row invariance + DSpark threshold tests 18/18; Vulkan DSpark model tests 12/12; Vulkan KL gates 9/9 (below).
+- Vulkan KL gates (mean KL x1e-3, 32-token calls, vs llama.cpp `-fa off`): passage F16 KV 5.338, q8_0 KV 3.450 (the earlier pre-merge read was 3.469 / 4.944), wikitext c1280 F16 KV 1.789 (position < 1024 1.519, >= 1024 2.195), q8_0 1.924, F32-act arm 1.777; greedy teacher-forced 6/384 with 0/345 at oracle margin >= 0.3 for both KV formats. The passage movement is NOT noise: see "Same-head A/B" below.
+- Rounding test 2/2 and 5/5 mutants dead, guard tests 3/3 (the two sweeps are opt-in), unchanged.
+- Known unrelated failure: `Probe533VulkanKvBisectTests` (a Llama-3.2-1B probe).
+
+**The DSpark drafter on F16 activations (#2067, ported in #2075).** The drafter's own shaders read and write activation words (taps, ctx-mix input, the block rows, Q/attention output, the Markov pre-activations); they were hard-wired to BF16 while the shared helpers
+(`Gemv`, `Rms`, the embedding kernel) follow the target's format, so an F16 target would have mixed formats silently. Port: the seven activation-typed bodies (`inkling2_dspark_{attn,ctxmix,eltwise,headnorm,markov_pre,markov_step,markov_logits}`) read and write
+`ACT_T` through `actToF` / `fToAct` (weights keep their BF16 decode), each with an `_f16act` twin (`gen_dspark_wrappers.py`; `olala_gemv_q8_0_f16out_f16act` for the F16-logits arm); `mask_embd` rows are stored in the activation format; the taps copy is
+format-agnostic. The BF16 `.spv` are byte-identical except `markov_pre` / `markov_step` (the same math, different SPIR-V ids after the weight and activation decoders stopped sharing one function). **Format guard:** `DSparkDrafter.Format` records the target's base format at attach; the
+tap copy, the context injection and the draft block throw `InvalidOperationException` if the target's current scratch is in another format (the opt-in F32 image-chunk set), so a mismatch can never decode garbage. The F32 measurement arm stays refused at attach.
+- *Tests:* the op-level DSpark kernel tests run in both formats (`Inkling2VulkanDSparkKernelTests`, 32 BF16 tests, and its `...F16ActTests` twin, 32 F16 tests; 64/64 pass).
+- *Mutants* (a BF16 shader under F16 words, loaded through `DOTLLM_INKLING2_SPV_OVERRIDE`; failed tests of the F16 twin, baseline 0): ctx-mix 2, eltwise 2, head-norm 8, attention 8, Markov pre 5, Markov step 5, Markov logits 5 all die. At model level, with all six reading BF16:
+  `Drafts_MatchLlamaCppDsparkOracle` falls from 96.0% to **0.0%** top-1 agreement. (Greedy identity alone would not have caught it: the target verifies every draft, so a garbage drafter only collapses the acceptance.)
+- *F16-activation drafter results* (`Inkling2VulkanDSparkTests`, F16 default): draft top-1 agreement with llama.cpp **570/594 = 96.0%** (594 drafts, whole rounds identical 185/198), F16-logits drafts equal F32-logits drafts on 594/594 tokens; greedy identity 8 prompts x 40 tokens **8/8 identical**, K = 3: 168 rounds,
+  **1.89 tokens/round, acceptance 30.6%** (per prompt 1.18 to 3.08; the CPU reference measured 1.90 / 30.9%).
+**Same-head A/B on the final head (BF16 / F16 / F32 activations; `Llm_Arms_Kl`, dev with #2065 merged, softcap fix included).** Oracle KL x1e-3 (llama.cpp); NF13 / "vs-F32" = KL against this engine's F32 arm (no oracle noise):
+
+| arm | image oracle KL 80 / 190x110 / 640 | image NF13 mean (80 / 190x110 / 640) | passage (254 rows): oracle, vs-F32 | wikitext c1280 (639 rows): oracle, vs-F32 |
+|---|---|---|---|---|
+| F32 | 2.01 / 4.70 / 3.21 | 0 | 3.29, 0 | 1.78, 0 |
+| BF16 | 4.85 / 6.62 / 5.35 | 5.03 (2.09 / 7.46 / 5.53) | 4.12, 2.26 | 1.80, 1.23 |
+| **F16 (default)** | 2.04 / 4.31 / 4.32 | **0.90** (0.11 / 1.21 / 1.39) | 5.34, 4.59 | 1.79, 0.83 |
+
+F16 is clearly better than BF16 on image prompts (NF13 5.6x lower) and on the 639-row wikitext window (vs-F32 0.83 against 1.23). **On the 254-row passage it is worse than BF16** (vs-F32 4.59 against 2.26; oracle 5.34 against 4.12), a regression from the pre-merge head
+(F16 3.47, BF16 3.61). Isolation: the same F16 run with the conv in-batch history left unrounded (the pre-#2065 shader, override) gives passage 3.47 / vs-F32 1.90 and wikitext 1.73 / 0.81, so the whole passage rise is the BF16 rounding of the conv history that #2065 added (the conv state is BF16 by ruling; under BF16 activations the
+rounding is a no-op, under F16 it is a real F16 -> BF16 step, and under F32 it moves that arm's own KL by +0.2e-3). It is a few tail rows (max KL 0.107 vs 0.102 for BF16; mean over 127 scored rows), absent on the 639-row window (+0.06e-3) and on the images. It does not fail any gate (< 8e-3, top-1 251/254, greedy 0 confident mismatches).
+Row/chunk invariance requires the rounding, so it cannot simply be dropped; an F16 conv state is ruled out. Open decision for the owner, with the data above.
+
+**Softcap and the guard (review finding, fixed).** `inkling2_softcap` ran before the finite check and mapped +-inf (and NaN on AMD) to +-30, so the text guard could not see a real overflow, and my guard test poisoned the logits after the softcap. The softcap now passes non-finite values through (`Softcap_PassesNonFiniteThrough_ForTheF16Guard`; the old shader fails it).
+A real-overflow arm drives the model itself (`Guard_RealF16Overflow_ThrowsOnTheFirstForward_AndBf16DoesNot`: the token-embedding gain x1e6 through a test seam, F16 throws the BF16-switch error on the first forward, BF16 does not); the override mutant that stores `x*1e6` in the F16 embed kernel throws the same error. **Gate 2 restated:** the earlier "0 non-finite" sweep column was blind (the softcap hid overflow); the evidence
+that holds is max |activation| (473, 138x margin) and the sweeps re-run on the fixed head: 16,640 tokens: 0 non-finite, max |logit| 29.96; 5 images (434 tokens): 0 non-finite, max |logit| 29.69; the guard now fires on a real overflow, so these zeros mean something. Guard cost 59-89 us per logit row: about 1.2 s over a 16K all-logits prefill (16,640 rows), negligible per decode step; no opt-out.
+The ViT recomputes in BF16 and throws if the BF16 result is non-finite too; the drafter format guard runs before the command buffer opens.
+**Drafter A/B, F16 vs BF16 activations** (same session, interleaved F16, BF16, F16, BF16; `Report_DrafterMsAndConstrainedDownload_F32VsF16`, both locks held): median ms of a K = 3 draft, F32-logits / F16-logits arm: F16 activations 11.61 / 11.88 and 10.86 / 11.46, BF16 activations 12.14 / 11.84 and 11.75 / 11.63 (no difference beyond about 0.6 ms); the constrained-round 3-row logits download is 19.1 to 19.6 ms (F32) against 6.9 to 8.1 ms (F16 logits) in every run. Quality, one run each: F16 activations 570/594 = 96.0% draft agreement with llama.cpp, 168 rounds, 1.89 tokens/round, 30.6% acceptance; BF16 activations 568/594 = 95.6%, 164 rounds, 1.93 tokens/round, 31.8% (a difference of two drafts and four rounds); greedy identity 8/8 identical at 40 tokens in both.
+
 
 ## 13. DSpark drafter (issue #2039)
 

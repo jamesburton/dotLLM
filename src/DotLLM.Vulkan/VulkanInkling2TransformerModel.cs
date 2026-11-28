@@ -25,6 +25,22 @@ public enum Inkling2KvFormat
     Q8_0,
 }
 
+/// <summary>
+/// Storage format of the Inkling 2 Vulkan activations (stored scratch buffers; accumulation is F32 in every arm). F16 is the default since #2075 (user ruling 2026-11-28 after the
+/// activation-precision study, docs/INKLING2.md 12c); BF16 stays selectable with <c>DOTLLM_INKLING2_ACT=bf16</c>.
+/// </summary>
+public enum Inkling2ActFormat
+{
+    /// <summary>bfloat16 (the default of #2034 / #2062, user ruling 2026-11-26): selectable, full F32 exponent range.</summary>
+    Bf16,
+
+    /// <summary>IEEE half (the default since #2075): 10-bit mantissa; overflows to infinity above 65,504 (the largest measured activation is 453). A non-finite logit throws, see the model remarks.</summary>
+    F16,
+
+    /// <summary>F32: measurement arm / control (CLAUDE.md precision rule 1 sign-off needed to ship).</summary>
+    F32,
+}
+
 /// <summary>Switches of the Inkling 2 Vulkan forward. The defaults are the shipped configuration.</summary>
 /// <param name="ActivationF32">
 /// Build the F32-activation-STORAGE reference arm (the <c>_f32act</c> shaders): a control that is compared against the CPU reference without llama.cpp's noise,
@@ -32,8 +48,16 @@ public enum Inkling2KvFormat
 /// </param>
 /// <param name="Kv">K/V cache format.</param>
 /// <param name="MaxChunk">Tokens per submission (prefill chunk). Local layers keep a ring of <c>window + MaxChunk</c> positions (see remarks of the model).</param>
-public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2KvFormat Kv = Inkling2KvFormat.F16, int MaxChunk = 128)
+/// <param name="ActivationF16">Store activations as F16 (the <c>_f16act</c> shaders; the default since #2075, <c>false</c> = BF16). Ignored when <paramref name="ActivationF32"/> is set.</param>
+/// <param name="F32ImageChunks">
+/// Opt-in: a prefill chunk that carries image rows runs with F32 activation scratch (a second scratch set, allocated on the first such chunk) while text chunks and decode keep the base format.
+/// Nothing activation-typed is carried between chunks (the conv state is BF16 in every arm, the KV is F16), so the switch is per chunk.
+/// </param>
+public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2KvFormat Kv = Inkling2KvFormat.F16, int MaxChunk = 128, bool ActivationF16 = true, bool F32ImageChunks = false)
 {
+    /// <summary>The base activation storage format of this configuration.</summary>
+    public Inkling2ActFormat BaseAct => ActivationF32 ? Inkling2ActFormat.F32 : ActivationF16 ? Inkling2ActFormat.F16 : Inkling2ActFormat.Bf16;
+
     /// <summary>Options from <c>DOTLLM_INKLING2_KV</c> (<c>f16|q8_0</c>); unset keeps the defaults, a bad value throws.</summary>
     public static Inkling2VulkanOptions FromEnvironment()
     {
@@ -51,6 +75,18 @@ public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2K
             };
         string? ch = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_VK_CHUNK");
         if (!string.IsNullOrEmpty(ch)) o = o with { MaxChunk = int.Parse(ch) };
+        // DOTLLM_INKLING2_ACT=f16|bf16|f32: activation storage format of the Vulkan text model and its DSpark drafter (default f16 since #2075; bf16 = the previous default; f32 = measurement arm, not for the drafter).
+        string? act = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_ACT");
+        if (!string.IsNullOrEmpty(act))
+            o = act.ToLowerInvariant() switch
+            {
+                "f16" => o with { ActivationF16 = true },
+                "bf16" => o with { ActivationF16 = false },
+                "f32" => o with { ActivationF32 = true },
+                _ => throw new ArgumentException($"DOTLLM_INKLING2_ACT='{act}': expected f16, bf16 or f32."),
+            };
+        // DOTLLM_INKLING2_ACT_F32_IMAGE_CHUNKS=1: prefill chunks that carry image rows run on an F32 scratch set (+49.6 MB at chunk 128, allocated on the first such chunk); text chunks and decode keep the base format.
+        if (Environment.GetEnvironmentVariable("DOTLLM_INKLING2_ACT_F32_IMAGE_CHUNKS") == "1") o = o with { F32ImageChunks = true };
         return o;
     }
 }
@@ -60,7 +96,8 @@ public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2K
 /// <see cref="Inkling2TransformerModel"/>; layer-by-layer semantics and the oracle in <c>docs/INKLING2.md</c>.
 /// </summary>
 /// <remarks>
-/// <para><b>Precision (user rulings 2026-11-26).</b> Stored activations are BF16 and every kernel accumulates and reduces in F32 registers / shared memory,
+/// <para><b>Precision (user rulings 2026-11-26 and 2026-11-28).</b> Stored activations are F16 since #2075 (BF16 was the first ruling; <c>DOTLLM_INKLING2_ACT=bf16</c> restores it; the largest activation measured
+/// is 453 against F16's 65,504, docs/INKLING2.md 12c, and a non-finite logit throws, see <see cref="Inkling2ActFormat"/>) and every kernel accumulates and reduces in F32 registers / shared memory,
 /// rounding once on store. KV is F16 (q8_0 evaluated, <see cref="Inkling2KvFormat"/>); the short-conv state is BF16; the loop-controller matrices are BF16
 /// (converted once at load from the GGUF's F32: 57 MB). Quantized weights run quantized: NVFP4 expert banks (with their per-expert F32 scale) and Q8_0 matrices
 /// are read in place by the kernels (decoded in registers); the router, norm gains, queries, clips and conv taps are the GGUF's own F32 vectors, uploaded
@@ -135,6 +172,10 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
     private VulkanDevice.Buffer _attn = null!, _attnOut = null!, _ffnInp = null!, _mn = null!, _moe = null!, _h = null!, _sel = null!, _selW = null!, _ids = null!;
     private VulkanDevice.Buffer? _logits;
     private long _logitsBytes;
+    // activation format of the scratch currently in use; sets of the other formats are kept once built (F32ImageChunks switches per chunk)
+    private Inkling2ActFormat _act;
+    private readonly Dictionary<Inkling2ActFormat, VulkanDevice.Buffer[]> _scratchSets = new();
+    private readonly Dictionary<Inkling2ActFormat, long> _scratchSetBytes = new();
     // image-embedding injection (#2062), allocated on the first image prefill: F16 rows of the chunk's image positions (compact) and the per-token row selector.
     private VulkanDevice.Buffer? _imgRows, _imgSel;
     private ushort[]? _imgRowsHost;
@@ -196,7 +237,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
         _spvOverride = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_SPV_OVERRIDE");
         _c = config.Inkling2!;
         _H = config.HiddenSize; _vocab = config.VocabSize; _nh = config.NumAttentionHeads; _nkv = config.NumKvHeads; _hd = config.HeadDim;
-        _nPhys = config.NumLayers; _eps = config.NormEpsilon; _chunk = Math.Max(1, opt.MaxChunk);
+        _nPhys = config.NumLayers; _eps = config.NormEpsilon; _chunk = Math.Max(1, opt.MaxChunk); _act = opt.BaseAct;
         _ff = _c.ExpertFfLength; _topk = _c.ExpertUsedCount; _experts = _c.ExpertCount; _qW = _nh * _hd; _kvW = _nkv * _hd; _relLen = _c.RelativeLength;
         _ringCap = _c.SlidingWindow + _chunk;
         _weightBytes = weightBytes; _controllerBytes = controllerBytes; _deviceBytes = weightBytes;
@@ -212,13 +253,48 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
 
     private VulkanDevice.Buffer Scratch(long elements)
     {
-        int actBytes = _opt.ActivationF32 ? 4 : 2;
-        var b = Own(_device.AllocateDeviceLocal(Math.Max(16, elements * actBytes)));
+        var b = Own(_device.AllocateDeviceLocal(Math.Max(16, elements * ActBytes)));
         _deviceBytes += b.Size;
         return b;
     }
 
-    private int ActBytes => _opt.ActivationF32 ? 4 : 2;
+    private int ActBytes => _act == Inkling2ActFormat.F32 ? 4 : 2;
+
+    /// <summary>Kernel-name suffix of the current activation format (empty = BF16).</summary>
+    private string ActSuffix => _act switch { Inkling2ActFormat.F32 => "_f32act", Inkling2ActFormat.F16 => "_f16act", _ => "" };
+
+    /// <summary>Device bytes of the activation scratch of one format (0 until that set is built).</summary>
+    public long ActivationScratchBytes(Inkling2ActFormat f) => _scratchSetBytes.TryGetValue(f, out long b) ? b : 0;
+
+    /// <summary>The activation format of the scratch of the last chunk.</summary>
+    public Inkling2ActFormat CurrentActivationFormat => _act;
+
+    private ref VulkanDevice.Buffer ScratchField(int i)
+    {
+        switch (i)
+        {
+            case 0: return ref _x0; case 1: return ref _x1; case 2: return ref _pre; case 3: return ref _bank0; case 4: return ref _bank1; case 5: return ref _blk;
+            case 6: return ref _mixed; case 7: return ref _mixed2; case 8: return ref _msg; case 9: return ref _n0; case 10: return ref _n1; case 11: return ref _n2;
+            case 12: return ref _gateIn; case 13: return ref _g64; case 14: return ref _gainPre; case 15: return ref _forgetPre; case 16: return ref _q; case 17: return ref _kRaw;
+            case 18: return ref _vRaw; case 19: return ref _kc; case 20: return ref _vc; case 21: return ref _rel; case 22: return ref _sink; case 23: return ref _gateB;
+            case 24: return ref _kDyn; case 25: return ref _vDyn; case 26: return ref _attn; case 27: return ref _attnOut; case 28: return ref _ffnInp; case 29: return ref _mn;
+            case 30: return ref _moe; case 31: return ref _h; case 32: return ref _selW;   // _sel (int ids) and _ids (token ids) are not activation-typed: shared by every set
+            default: throw new ArgumentOutOfRangeException(nameof(i));
+        }
+    }
+    private const int ScratchFieldCount = 33;
+
+    /// <summary>Makes <paramref name="f"/> the activation format of the following chunk: swaps in that format's scratch set (building it on first use) and kernel family.</summary>
+    private void UseActivationFormat(Inkling2ActFormat f)
+    {
+        if (f == _act) return;
+        var cur = new VulkanDevice.Buffer[ScratchFieldCount];
+        for (int i = 0; i < ScratchFieldCount; i++) cur[i] = ScratchField(i);
+        _scratchSets[_act] = cur;
+        _act = f;
+        if (_scratchSets.TryGetValue(f, out var set)) { for (int i = 0; i < ScratchFieldCount; i++) ScratchField(i) = set[i]; }
+        else AllocateScratch();
+    }
 
     private int CountBlockSlots()
     {
@@ -236,6 +312,13 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
 
     private void AllocateScratch()
     {
+        long before = _deviceBytes;
+        AllocateScratchBuffers();
+        _scratchSetBytes[_act] = _deviceBytes - before;
+    }
+
+    private void AllocateScratchBuffers()
+    {
         int T = _chunk, H = _H;
         _x0 = Scratch((long)T * H); _x1 = Scratch((long)T * H); _pre = Scratch((long)T * H); _bank0 = Scratch((long)T * H); _bank1 = Scratch((long)T * H);
         _blk = Scratch((long)_maxBlocks * T * H); _mixed = Scratch(3L * T * H); _mixed2 = Scratch((long)T * H); _msg = Scratch(4L * T * H);
@@ -246,9 +329,9 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
         _kDyn = Scratch((long)T * _c.ConvKernel * _nkv); _vDyn = Scratch((long)T * _c.ConvKernel * _nkv);
         _attn = Scratch((long)T * _qW); _attnOut = Scratch((long)T * H); _ffnInp = Scratch((long)T * H); _mn = Scratch((long)T * H); _moe = Scratch((long)T * H);
         _h = Scratch((long)T * _topk * _ff);
-        _sel = Own(_device.AllocateDeviceLocal(Math.Max(16, (long)T * _topk * 4))); _deviceBytes += _sel.Size;
+        if (_sel is null) { _sel = Own(_device.AllocateDeviceLocal(Math.Max(16, (long)T * _topk * 4))); _deviceBytes += _sel.Size; }
         _selW = Scratch((long)T * _topk);
-        _ids = Own(_device.Allocate(Math.Max(16, (long)T * 4)));
+        _ids ??= Own(_device.Allocate(Math.Max(16, (long)T * 4)));
     }
 
     private void AllocateSlots()
@@ -443,7 +526,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
 
     private OlalaKernel Kernel(string key, string name, int buffers, int pushWords, bool hasF32Twin = true, params uint[] spec)
     {
-        string full = name + (_opt.ActivationF32 && hasF32Twin ? "_f32act" : "");
+        string full = name + (hasF32Twin ? ActSuffix : "");
         string k = key + "|" + full;
         if (!_kernels.TryGetValue(k, out var kern))
         {
@@ -492,7 +575,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
     /// <summary><c>y[T, M] = W[M, K] x[T, K]</c> through the Olala GEMV (Q8_0 or BF16 weights read in place, BF16 activations, F32 accumulation); <paramref name="f32Out"/> stores F32 logits.</summary>
     private void Gemv(Mat w, VulkanDevice.Buffer x, VulkanDevice.Buffer y, int T, long xOff = 0, bool f32Out = false, bool f16Out = false)
     {
-        if (f16Out && (f32Out || w.Qt != QuantizationType.Q8_0 || _opt.ActivationF32)) throw new NotSupportedException("The F16-output GEMV exists for Q8_0 weights and BF16 activations only (the DSpark drafter's logits arm).");
+        if (f16Out && (f32Out || w.Qt != QuantizationType.Q8_0 || _act == Inkling2ActFormat.F32)) throw new NotSupportedException("The F16-output GEMV exists for Q8_0 weights and BF16 / F16 activations only (the DSpark drafter's logits arm).");
         string kn = "olala_gemv_" + Wt(w.Qt) + (f16Out ? "_f16out" : "");
         string f16k = f16Out ? "h" : "";
         bool q8Tile = T > 1 && w.Qt == QuantizationType.Q8_0;
@@ -500,8 +583,8 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
         if ((xOff & 7) != 0 || (w.In & 7) != 0) throw new InvalidOperationException($"inkling2 gemv needs xOff and K to be multiples of 8 (xOff {xOff}, K {w.In}).");
         int rows = q8Tile ? PrefillQ8Rows : 1;
         var k = rows > 1
-            ? Kernel($"gemv|{nc}|{(f32Out ? 1 : 0)}|{Wt(w.Qt)}{f16k}|r{rows}", kn, 5, 4, !f16Out, (uint)nc, 0u, f32Out ? 1u : 0u, (uint)rows)
-            : Kernel($"gemv|{nc}|{(f32Out ? 1 : 0)}|{Wt(w.Qt)}{f16k}", kn, 5, 4, !f16Out, (uint)nc, 0u, f32Out ? 1u : 0u);
+            ? Kernel($"gemv|{nc}|{(f32Out ? 1 : 0)}|{Wt(w.Qt)}{f16k}|r{rows}", kn, 5, 4, true, (uint)nc, 0u, f32Out ? 1u : 0u, (uint)rows)
+            : Kernel($"gemv|{nc}|{(f32Out ? 1 : 0)}|{Wt(w.Qt)}{f16k}", kn, 5, 4, true, (uint)nc, 0u, f32Out ? 1u : 0u);
         uint M = (uint)w.Out;
         uint groups = (M + (uint)rows - 1) / (uint)rows;
         uint gx = Math.Min(groups, 32768u), gy = (groups + 32767u) / 32768u, gz = (uint)((T + nc - 1) / nc);
@@ -574,7 +657,10 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
         var raw = new float[(total + 1) / 2];
         _device.Download(b, raw);
         var u = MemoryMarshal.Cast<float, ushort>(raw.AsSpan());
-        for (long i = 0; i < count; i++) res[i] = BitConverter.UInt32BitsToSingle((uint)u[(int)(elemOffset + i)] << 16);
+        if (_act == Inkling2ActFormat.F16)
+            for (long i = 0; i < count; i++) res[i] = (float)BitConverter.UInt16BitsToHalf(u[(int)(elemOffset + i)]);
+        else
+            for (long i = 0; i < count; i++) res[i] = BitConverter.UInt32BitsToSingle((uint)u[(int)(elemOffset + i)] << 16);
         return res;
     }
 
@@ -699,6 +785,36 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
         return true;
     }
 
+    /// <summary>
+    /// Test seam for a REAL F16 overflow (#2075): multiplies the token-embedding gain (<c>token_embd_norm.weight</c>, F32) by <paramref name="scale"/>, so every embedding row, hence the residual stream, is scaled
+    /// and an F16 store overflows to infinity inside the forward (no logits are poisoned by hand). Irreversible for this model instance.
+    /// </summary>
+    internal void ScaleEmbeddingGainForTest(float scale)
+    {
+        var d = _gguf.TensorsByName[Inkling2Tensors.TokenEmbdNorm];
+        var g = new float[_H];
+        new ReadOnlySpan<float>((void*)_gguf.TensorDataPointer(d), _H).CopyTo(g);
+        for (int i = 0; i < g.Length; i++) g[i] *= scale;
+        _device.Upload(g, _tokEmbNorm);
+    }
+
+    /// <summary>Test seam: runs on the downloaded logits of an F16 chunk just before the finite check (poisons them to prove the guard fires).</summary>
+    internal Action<Span<float>>? BeforeFiniteCheck { get; set; }
+
+    /// <summary>
+    /// Runtime guard of the F16 activation default (#2075): the downloaded logits must be finite. An F16 store that overflowed (|x| &gt; 65,504 becomes infinity; the largest activation measured is 453) turns the
+    /// hidden state into NaN within the chunk, and the K/V, conv state and attention carry it to every later chunk, so the logits of the last chunk of a prefill and of every decode step expose it. The model
+    /// owns recurrent state that a failed chunk has already advanced, so it cannot re-run the chunk in BF16: it fails loudly instead. Cost: one vectorised pass over the logits that were just downloaded
+    /// (200,058 floats per row; measured in <c>Inkling2F16GateTests</c>).
+    /// </summary>
+    private void CheckLogitsFinite(Span<float> logits)
+    {
+        BeforeFiniteCheck?.Invoke(logits);
+        if (!float.IsFinite(System.Numerics.Tensors.TensorPrimitives.SumOfMagnitudes((ReadOnlySpan<float>)logits)))
+            throw new InvalidOperationException("inkling2 Vulkan: non-finite logits with F16 activation storage (an F16 store overflowed past 65,504, or NaN). The sequence state is no longer valid; " +
+                                                "rerun with DOTLLM_INKLING2_ACT=bf16 (full F32 exponent range) and report the prompt.");
+    }
+
     private VulkanDevice.Buffer PickOther(VulkanDevice.Buffer cur) => ReferenceEquals(cur, _x0) ? _x1 : _x0;
 
     private void RunChunk(ReadOnlySpan<int> ids, int basePos, int logitRows, bool lastOnly, Span<float> logitsDst, IReadOnlyList<ImageSpan>? images = null)
@@ -706,6 +822,9 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
         int Tc = ids.Length, H = _H;
         _device.Upload(MemoryMarshal.AsBytes(ids), _ids);
         bool hasImageRows = images is { Count: > 0 } && StageImageRows(images, basePos, Tc);
+        UseActivationFormat(_opt.F32ImageChunks && hasImageRows ? Inkling2ActFormat.F32 : _opt.BaseAct);
+        // A drafter that is capturing taps must see its own format: refuse before the command buffer is opened, so the throw leaves nothing recorded (#2075 format guard).
+        if (_tapState is not null && _dsd is { } drafter) RequireDrafterFormat(drafter, "target chunk");
         _submit.Begin();
         _cmd = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(_cmd);
@@ -814,7 +933,11 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
             }
         }
         _submit.SubmitAndWait();
-        if (logits is not null) _device.Download(logits, logitsDst);
+        if (logits is not null)
+        {
+            _device.Download(logits, logitsDst);
+            if (_act == Inkling2ActFormat.F16) CheckLogitsFinite(logitsDst);
+        }
         _pendingW.Clear(); _pendingR.Clear();
     }
 

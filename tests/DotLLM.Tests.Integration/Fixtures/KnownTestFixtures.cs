@@ -53,14 +53,14 @@ internal static class KnownTestFixtures
     public const string Qwen2_5_0_5BDescription = "Qwen2.5-0.5B-Instruct Q8_0 GGUF (tokenizer.ggml.pre = qwen2)";
 
     /// <summary>
-    /// Ternary-Bonsai-2-27B, PQ2_0 — <c>prism-ml/Ternary-Bonsai-2-27B-gguf</c>.
+    /// Ternary-Bonsai-2.5-27B, PQ2_0 (with the official MTP head) — <c>prism-ml/Ternary-Bonsai-2.5-27B-GGUF</c>.
     /// Carries <c>tokenizer.ggml.pre = qwen35</c> (#397).
     /// </summary>
     public static FixtureLocation TernaryBonsai27B_Q2_0 => TestFixtureResolver.ResolveFile(
         "DOTLLM_BONSAI_PQ2_0_GGUF",
         "prism-ml",
-        "Ternary-Bonsai-2-27B-gguf",
-        "Ternary-Bonsai-2-27B-PQ2_0.gguf");
+        "Ternary-Bonsai-2.5-27B-GGUF",
+        "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf");
 
     /// <summary>
     /// Ternary-Bonsai-2-2B, PQ2_0 (~0.52 GB) — <c>prism-ml/Ternary-Bonsai-2-2B-gguf</c>, the
@@ -86,7 +86,7 @@ internal static class KnownTestFixtures
         "Ternary-Bonsai-2-2B-PTQ1_0.gguf");
 
     /// <summary>Human-readable name for <see cref="TernaryBonsai27B_Q2_0"/> skip messages.</summary>
-    public const string TernaryBonsai27BDescription = "Ternary-Bonsai-2-27B PQ2_0 GGUF (tokenizer.ggml.pre = qwen35)";
+    public const string TernaryBonsai27BDescription = "Ternary-Bonsai-2.5-27B PQ2_0-mtp GGUF (tokenizer.ggml.pre = qwen35)";
 
     /// <summary>
     /// NVIDIA Nemotron 3.5 Lightning 30B-A3B, Q4_K_M (~25 GB, <c>nemotron_h_moe</c>; Q5_0 / Q8_0 expert banks) — the ollama

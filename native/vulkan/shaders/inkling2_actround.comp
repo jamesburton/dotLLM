@@ -1,0 +1,4 @@
+#version 450
+// BF16 twin of the rounding probe (reference: the shipped default rounding).
+#extension GL_GOOGLE_include_directive : require
+#include "inkling2_actround.glsl"

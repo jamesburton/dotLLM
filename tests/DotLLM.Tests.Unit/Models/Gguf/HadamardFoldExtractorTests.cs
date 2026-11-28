@@ -13,7 +13,7 @@ namespace DotLLM.Tests.Unit.Models.Gguf;
 /// </summary>
 /// <remarks>
 /// The expected set is the one dumped from the real
-/// <c>prism-ml/Ternary-Bonsai-2-27B-gguf</c> PQ2_0 file: 401 names over 64 blocks with
+/// <c>prism-ml/Ternary-Bonsai-2.5-27B-GGUF</c> PQ2_0 file: 401 names over 64 blocks with
 /// <c>full_attention_interval = 4</c>.
 /// </remarks>
 public sealed class HadamardFoldExtractorTests

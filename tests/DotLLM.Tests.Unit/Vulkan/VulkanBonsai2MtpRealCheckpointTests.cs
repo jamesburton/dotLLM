@@ -15,7 +15,7 @@ using DotLLM.Tests.Integration.Fixtures;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// Vulkan MTP against the <b>real</b> <c>Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0</c> checkpoint —
+/// Vulkan MTP against the <b>real</b> <c>Ternary-Bonsai-2.5-27B-PQ2_0-mtp</c> checkpoint —
 /// issue #435, acceptance criteria 2 and 4.
 /// </summary>
 /// <remarks>
@@ -27,7 +27,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// (Hadamard-<i>latent</i>) and <c>output.weight</c> (Hadamard-<i>folded</i>). Those two rotations
 /// are the ones the CPU reference was missing entirely, and fixing them took CPU draft acceptance
 /// from ~0% to ~35% on this checkpoint. <b>Nothing except this test exercises them on Vulkan.</b>
-/// Its PQ2_0 trunk and Q8_0 MTP block are also the only place the MTP host dispatches a quantized
+/// Its PQ2_0 trunk and Q4_0 MTP block (the official 2.5 head; the community heads were Q8_0) are also the only place the MTP host dispatches a quantized
 /// matmul at all.
 /// </para>
 /// <para>
@@ -58,7 +58,7 @@ public sealed class VulkanBonsai2MtpRealCheckpointTests
     public VulkanBonsai2MtpRealCheckpointTests(ITestOutputHelper output) => _out = output;
 
     private static string? FindCheckpoint() =>
-        TestFixtureResolver.ResolveFile("DOTLLM_BONSAI2_MTP_GGUF", "ProCreations", "Ternary-Bonsai-2-27B-MTP", "*MTP*.gguf").Path;
+        TestFixtureResolver.ResolveFile("DOTLLM_BONSAI2_MTP_GGUF", "prism-ml", "Ternary-Bonsai-2.5-27B-GGUF", "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf").Path;
 
     /// <summary>
     /// Acceptance criterion 2: the same draft tokens, from the same checkpoint, at the same

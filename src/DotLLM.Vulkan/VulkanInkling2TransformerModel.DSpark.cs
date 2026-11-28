@@ -37,9 +37,9 @@ internal enum DSparkTargetMutant
 /// The drafter takes the model's MTP slot, so the unmodified <c>MtpSpeculativeDecoder</c>, the adaptive gate and streaming verify its drafts.
 /// </summary>
 /// <remarks>
-/// <para><b>Precision (user rulings 2026-11-26/27).</b> Everything the drafter stores is BF16 (activations, taps, the Markov pre-activations) or F16 (context K/V, the <c>f_rnn</c> ring);
+/// <para><b>Precision (user rulings 2026-11-26/27/28).</b> Everything the drafter stores is in the target's activation format (BF16 or F16 since #2075: activations, taps, the Markov pre-activations) or F16 (context K/V, the <c>f_rnn</c> ring);
 /// Q8_0 / BF16 weights are read in place. F32 is only an in-register / shared-memory accumulator. The Markov recurrent state is never stored: each walk step replays the
-/// earlier steps from the stored BF16 pre-activations and token ids inside one workgroup. The only stored F32 are the drafter's logits (the same class as the target's logits;
+/// earlier steps from the stored pre-activations and token ids inside one workgroup. The only stored F32 are the drafter's logits (the same class as the target's logits;
 /// <c>(block - 1) x vocab x 4</c> bytes), the 8-byte-per-workgroup argmax partials and the F32 weight vectors (norm gains, mix, bias) uploaded verbatim.</para>
 /// <para><b>Windowed context K/V (#2060).</b> Drafter layers 0 and 2 are sliding-window layers: they keep a ring of <c>window + MaxChunk</c> positions (1025 + 128), flat in the
 /// sequence length. Global layer 1 keeps the whole context in a buffer that doubles on demand, admitted against free device memory (never spilled).</para>
@@ -267,6 +267,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
         public required VulkanDevice.Buffer OutNorm, TokNorm, FrnnMix, FrnnNorm, W1, W2, Joint, JointBias, Mask, RopeTab;
         public VulkanDevice.Buffer? W2Bias;
         public bool LogitsF16;   // drafter logits stored as F16 (2 B per element) instead of F32
+        public Inkling2ActFormat Format;   // the activation format the drafter's buffers and mask rows were built for (the target's base format at attach, #2075)
         public VulkanDevice.Buffer Taps = null!, Feat = null!, KTmp = null!, VTmp = null!, X = null!, Nrm = null!, O = null!, Q = null!, Q2 = null!, K = null!, V = null!,
             KBlk = null!, VBlk = null!, AttnO = null!, Gate = null!, Up = null!, Hid = null!, Logits = null!, Pre = null!, C2 = null!, Part = null!, Tok = null!;
         public readonly List<VulkanDevice.Buffer> Owned = new();
@@ -303,7 +304,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
     private void AttachCore(string path)
     {
         if (_dsd is not null) throw new InvalidOperationException("A DSpark drafter is already attached.");
-        if (_opt.ActivationF32) throw new NotSupportedException("The DSpark drafter runs BF16 activations; the F32-activation reference arm is not supported.");
+        if (_opt.ActivationF32) throw new NotSupportedException("The DSpark drafter runs on BF16 or F16 activations (its own shaders have a twin per format); the F32-activation measurement arm is not supported.");
         var file = GgufFile.Open(path);
         try { _dsd = BuildDrafter(file, path); }
         catch { file.Dispose(); throw; }
@@ -379,13 +380,14 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
             var jointBias = Vec("joint_proj.bias", 3 * sp.Rank);
             VulkanDevice.Buffer? w2Bias = sp.HasW2Bias ? Vec("markov_w2.bias", _vocab) : null;
 
-            // mask_embd (a [H, rows] F32 weight in the file) is the block rows' INPUT activation: stored once as BF16, copied into the block with no further arithmetic.
+            // mask_embd (a [H, rows] F32 weight in the file) is the block rows' INPUT activation: stored once in the activation format (BF16 or F16), copied into the block with no further arithmetic.
             var maskD = tensors["mask_embd.weight"];
             int maskCount = (B - 1) * _H;
             var maskF = new float[sp.MaskRows * _H];
             Dequantize.ToFloat32(file.TensorDataPointer(maskD), maskF.Length, maskD.QuantizationType, maskF);
             var maskBits = new ushort[maskCount];
-            for (int i = 0; i < maskCount; i++) maskBits[i] = Inkling2ConvState.ToBf16(maskF[i]);
+            bool actF16 = _opt.BaseAct == Inkling2ActFormat.F16;
+            for (int i = 0; i < maskCount; i++) maskBits[i] = actF16 ? BitConverter.HalfToUInt16Bits((Half)maskF[i]) : Inkling2ConvState.ToBf16(maskF[i]);
             VulkanDevice.Buffer mask;
             fixed (ushort* mp = maskBits)
             {
@@ -408,7 +410,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
             {
                 Spec = sp, File = file, Layers = layers, SlotOfVisit = SlotsFor(sp, LayerVisits),
                 OutNorm = outNorm, TokNorm = tokNorm, FrnnMix = frnnMix, FrnnNorm = frnnNorm, W1 = w1.Buf, W2 = w2.Buf, Joint = joint.Buf, JointBias = jointBias, Mask = mask, RopeTab = ropeTab,
-                W2Bias = w2Bias, LogitsF16 = DraftLogitsF16FromEnv(),
+                W2Bias = w2Bias, LogitsF16 = DraftLogitsF16FromEnv(), Format = _opt.BaseAct,
             };
             long scratch = 0;
             VulkanDevice.Buffer S(long bytes2, bool host = false)
@@ -450,9 +452,21 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
 
     // ───────────────────────────── taps and context injection (recorded into the target's command buffer) ─────────────────────────────
 
+    /// <summary>
+    /// Format guard (#2075): the drafter's shaders read and write activation words in the format it was built for. If the target's current scratch is in another format (the opt-in F32 image-chunk
+    /// set, or any future mismatch) its taps and rows would be decoded as garbage without an error, so every drafter entry point refuses instead.
+    /// </summary>
+    private void RequireDrafterFormat(DSparkDrafter d, string what)
+    {
+        if (d.Format != _act)
+            throw new InvalidOperationException($"DSpark drafter {what}: the drafter was built for {d.Format} activations but the target's scratch is {_act}; the drafter would decode the target's activation words with the wrong format. " +
+                                                "Drafter requests must run in the base activation format (the engine does not draft for image requests).");
+    }
+
     private void TapVisit(int id, VulkanDevice.Buffer src, int rows)
     {
         if (_tapState is null || _dsd is not { } d) return;
+        RequireDrafterFormat(d, "tap copy");
         if ((uint)id >= (uint)d.SlotOfVisit.Length) return;
         int slot = d.SlotOfVisit[id];
         if (slot < 0) return;
@@ -463,19 +477,19 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
     private void HeadNorm(VulkanDevice.Buffer src, VulkanDevice.Buffer? gamma, bool norm, bool rope, bool f16, int heads, int rows, int posBase, int slotBase, int ringCap, long outOff,
                           VulkanDevice.Buffer dst, float eps)
     {
-        var k = Kernel($"ds_hn|{(norm ? 1 : 0)}|{(rope ? 1 : 0)}|{(f16 ? 1 : 0)}", "inkling2_dspark_headnorm", 4, 7, false, norm ? 1u : 0u, rope ? 1u : 0u, f16 ? 1u : 0u);
+        var k = Kernel($"ds_hn|{(norm ? 1 : 0)}|{(rope ? 1 : 0)}|{(f16 ? 1 : 0)}", "inkling2_dspark_headnorm", 4, 7, true, norm ? 1u : 0u, rope ? 1u : 0u, f16 ? 1u : 0u);
         Run(k, 1u << 3, [(uint)heads, (uint)posBase, (uint)slotBase, (uint)ringCap, (uint)outOff, 0u, F(eps)], (uint)heads, (uint)rows, 1, src, gamma ?? _dummy, _dsd!.RopeTab, dst);
     }
 
     private void CtxMix(VulkanDevice.Buffer mix, VulkanDevice.Buffer gamma, int rows, int posBase, bool frnn, VulkanDevice.Buffer dst, float eps)
     {
-        var k = Kernel($"ds_cm|{(frnn ? 1 : 0)}", "inkling2_dspark_ctxmix", 4, 3, false, frnn ? 1u : 0u);
+        var k = Kernel($"ds_cm|{(frnn ? 1 : 0)}", "inkling2_dspark_ctxmix", 4, 3, true, frnn ? 1u : 0u);
         Run(k, 1u << 3, [(uint)_H, (uint)posBase, F(eps)], (uint)rows, 1, 1, _dsd!.Taps, mix, gamma, dst);
     }
 
     private void Eltwise(int mode, VulkanDevice.Buffer a, VulkanDevice.Buffer b, long n)
     {
-        var k = Kernel($"ds_el|{mode}", "inkling2_dspark_eltwise", 2, 1, false, (uint)mode);
+        var k = Kernel($"ds_el|{mode}", "inkling2_dspark_eltwise", 2, 1, true, (uint)mode);
         Run(k, 1u << 0, [(uint)n], (uint)((n + 255) / 256), 1, 1, a, b);
     }
 
@@ -487,6 +501,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
     private void RecordInject(VulkanInkling2DSparkState st, int rows, int basePos)
     {
         var d = _dsd!; var sp = d.Spec;
+        RequireDrafterFormat(d, "context injection");
         CtxMix(d.FrnnMix, d.FrnnNorm, rows, basePos, frnn: true, st.Frnn, sp.Eps);
         for (int li = 0; li < d.Layers.Length; li++)
         {
@@ -511,6 +526,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
     internal bool DraftBlock(VulkanInkling2DSparkState st, int anchor, int pos0, int n, Span<int> tokens)
     {
         var d = _dsd!; var sp = d.Spec;
+        RequireDrafterFormat(d, "draft block");
         int b = n + 1, H = _H, qDim = sp.Heads * sp.HeadDim, kvDim = sp.KvHeads * sp.HeadDim;
         if ((uint)anchor >= (uint)_vocab) throw new ArgumentOutOfRangeException(nameof(anchor));
         int fpos = DrafterMutant == DSparkMutant.FrnnWrongPos ? pos0 - 2 : pos0 - 1;
@@ -528,7 +544,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
         var cp = Kernel("ds_copy", "inkling2_dspark_copy", 2, 6, false);
         Run(cp, 1u << 1, [(uint)H, (uint)n, 0u, (uint)H, (uint)H, (uint)H], (uint)((H + 255) / 256), (uint)n, 1, d.Mask, d.X);
 
-        var attn = Kernel("ds_attn", "inkling2_dspark_attn", 6, 7, false);
+        var attn = Kernel("ds_attn", "inkling2_dspark_attn", 6, 7, true);
         for (int li = 0; li < d.Layers.Length; li++)
         {
             var l = d.Layers[li];
@@ -557,10 +573,10 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
         Rms(d.X, H, d.OutNorm, d.Hid, 0, n, sp.Eps);
         Gemv(_output, d.Hid, d.Logits, n, 0, f32Out: !d.LogitsF16, f16Out: d.LogitsF16);
 
-        var pre = Kernel("ds_mpre", "inkling2_dspark_markov_pre", 5, 4, false);
+        var pre = Kernel("ds_mpre", "inkling2_dspark_markov_pre", 5, 4, true);
         Run(pre, 1u << 4, [(uint)H, (uint)sp.Rank, (uint)n, (uint)(fpos % 16)], 768, 1, 1, d.Joint, d.Hid, st.Frnn, d.JointBias, d.Pre);
-        var step = Kernel("ds_mstep", "inkling2_dspark_markov_step", 5, 5, false);
-        var logits = Kernel(d.LogitsF16 ? "ds_mlog16" : "ds_mlog", d.LogitsF16 ? "inkling2_dspark_markov_logits_f16" : "inkling2_dspark_markov_logits", 5, 4, false);
+        var step = Kernel("ds_mstep", "inkling2_dspark_markov_step", 5, 5, true);
+        var logits = Kernel(d.LogitsF16 ? "ds_mlog16" : "ds_mlog", d.LogitsF16 ? "inkling2_dspark_markov_logits_f16" : "inkling2_dspark_markov_logits", 5, 4, true);
         var amax = Kernel("ds_amax", "inkling2_dspark_argmax", 2, 2, false);
         for (int i = 1; i <= n; i++)
         {

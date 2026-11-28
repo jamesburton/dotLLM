@@ -1,0 +1,6 @@
+#version 450
+// Op-level probe of the activation rounding routines of olala_common.glsl (activation-precision study, epic #2025, #2075): outp[i] = fToAct(bits[i]) and rt[i] = actToF(outp[i]).
+// Test-only kernel: the F16 arm is compared with .NET Half over RNE ties, subnormals, the overflow boundary and NaN (Inkling2F16RoundingTests).
+#extension GL_GOOGLE_include_directive : require
+#define ACT_F16 1
+#include "inkling2_actround.glsl"

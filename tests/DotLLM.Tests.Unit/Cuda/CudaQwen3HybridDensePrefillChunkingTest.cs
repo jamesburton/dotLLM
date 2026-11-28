@@ -42,7 +42,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 public class CudaQwen3HybridDensePrefillChunkingTest
 {
     private const string ModelPathEnvVar = "DOTLLM_BONSAI_PQ2_0_GGUF";
-    private const string FileName = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
+    private const string FileName = "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf";
     private const int SliceLen = 64;
     private const int SeqLen = 40;
     private const int TileTokens = 8;   // 40 tokens => 5 tiles
@@ -151,7 +151,7 @@ public class CudaQwen3HybridDensePrefillChunkingTest
         string? path = ResolveFixturePath();
         Skip.If(path is null,
             $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}, or place {FileName} under "
-            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
+            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2.5-27B-GGUF/.");
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir is null, "PTX files not found");
 
