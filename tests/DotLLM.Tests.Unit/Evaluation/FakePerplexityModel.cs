@@ -11,12 +11,15 @@ internal sealed class FakePerplexityModel : IPerplexityModel, IDisposable
 {
     private readonly Func<int, int, float[]> _rowFactory;   // (absolutePosition, vocabSize) => logits
     private readonly List<int[]> _forwardCalls = [];
+    // A host that returns every row for a short batch while not scoring single-pass (a bounded all-row limit, #2030).
+    private readonly bool _multiRowAnyway;
     private readonly List<UnmanagedTensor> _issued = [];
 
     public FakePerplexityModel(
         int vocabSize, int maxContextLength, bool returnsAllRows,
-        Func<int, int, float[]> rowFactory)
+        Func<int, int, float[]> rowFactory, bool multiRowAnyway = false)
     {
+        _multiRowAnyway = multiRowAnyway;
         VocabSize = vocabSize;
         MaxContextLength = maxContextLength;
         ReturnsAllRows = returnsAllRows;
@@ -34,8 +37,8 @@ internal sealed class FakePerplexityModel : IPerplexityModel, IDisposable
     {
         _forwardCalls.Add(tokens.ToArray());
 
-        int rows = ReturnsAllRows ? tokens.Length : 1;
-        int firstRow = ReturnsAllRows ? 0 : tokens.Length - 1;
+        int rows = ReturnsAllRows || _multiRowAnyway ? tokens.Length : 1;
+        int firstRow = tokens.Length - rows;
         var tensor = UnmanagedTensor.Allocate(new TensorShape(rows, VocabSize), DType.Float32);
 
         var dest = new Span<float>((void*)tensor.DataPointer, rows * VocabSize);

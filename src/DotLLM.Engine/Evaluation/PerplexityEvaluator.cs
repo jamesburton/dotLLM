@@ -106,6 +106,11 @@ public static class PerplexityEvaluator
             ? TeacherForcedSinglePass(model, tokens, context)
             : TeacherForcedGrowingPrefix(model, tokens, context);
 
+    // The row that predicts the next token. A "last row only" backend may still return every row of a short batch (a bounded
+    // all-row limit, #2030), so index by the tensor's size rather than assuming it holds one row.
+    private static unsafe ReadOnlySpan<float> LastRow(ITensor logits, int vocab)
+        => new((void*)(logits.DataPointer + (nint)((logits.Shape.ElementCount / vocab - 1) * vocab * sizeof(float))), vocab);
+
     // Backend returns only the final row, so each target needs its own prefill over the growing
     // prefix. O(n^2) in forward passes — unavoidable, and the reason the CUDA harnesses that
     // originated this methodology carry a stride.
@@ -124,8 +129,7 @@ public static class PerplexityEvaluator
             // previous prefix left in the model must go — see IPerplexityModel.ResetState (#261).
             model.ResetState();
             using ITensor logits = model.Forward(tokens[..prefix], positions.AsSpan(0, prefix));
-            var row = new ReadOnlySpan<float>((void*)logits.DataPointer, vocab);
-            accumulator.Add(-LogProb.OfTarget(row, tokens[prefix]));
+            accumulator.Add(-LogProb.OfTarget(LastRow(logits, vocab), tokens[prefix]));
         }
 
         return Summarize(accumulator, windows: accumulator.Count);
@@ -204,8 +208,7 @@ public static class PerplexityEvaluator
                 {
                     model.ResetState();
                     using ITensor lastRow = model.Forward(window[..(t - start)], positions.AsSpan(0, t - start));
-                    var rowSpan = new ReadOnlySpan<float>((void*)lastRow.DataPointer, vocab);
-                    double nll = -LogProb.OfTarget(rowSpan, tokens[t]);
+                    double nll = -LogProb.OfTarget(LastRow(lastRow, vocab), tokens[t]);
                     gpNll += nll;
                     gpScored++;
                     accumulator.Add(nll);

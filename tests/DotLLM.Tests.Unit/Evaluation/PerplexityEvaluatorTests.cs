@@ -48,8 +48,10 @@ public sealed class PerplexityEvaluatorTests
         Assert.Equal(result.Perplexity, Math.Exp(result.MeanNegativeLogLikelihood), 9);
     }
 
-    [Fact]
-    public void TeacherForced_LastRowOnlyBackend_MatchesAllRowsBackendExactly()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TeacherForced_LastRowOnlyBackend_MatchesAllRowsBackendExactly(bool multiRowAnyway)
     {
         // Position-dependent but deterministic logits, so a wrong row/position mapping shows up.
         static float[] Rows(int position, int vocab)
@@ -60,7 +62,7 @@ public sealed class PerplexityEvaluatorTests
         }
 
         using var allRows = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, Rows);
-        using var lastRow = new FakePerplexityModel(Vocab, 64, returnsAllRows: false, Rows);
+        using var lastRow = new FakePerplexityModel(Vocab, 64, returnsAllRows: false, Rows, multiRowAnyway);
         var options = new PerplexityOptions(PerplexityMode.TeacherForced, 32, 32);
 
         var a = PerplexityEvaluator.Evaluate(allRows, Tokens, options);
@@ -159,8 +161,10 @@ public sealed class PerplexityEvaluatorTests
             $"expected confident predictions, got mean NLL {result.MeanNegativeLogLikelihood}");
     }
 
-    [Fact]
-    public void SlidingWindow_LastRowOnlyBackend_MatchesAllRowsBackendAndReplaysOnlyScoredHalf()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SlidingWindow_LastRowOnlyBackend_MatchesAllRowsBackendAndReplaysOnlyScoredHalf(bool multiRowAnyway)
     {
         // #793: last-row-only backends (Vulkan hybrids) score a window by re-prefilling the growing prefix.
         static float[] Rows(int position, int vocab)
@@ -175,7 +179,7 @@ public sealed class PerplexityEvaluatorTests
         var options = new PerplexityOptions(PerplexityMode.SlidingWindow, 16, Stride: 16, UnscoredPrefix: 9);
 
         using var allRows = new FakePerplexityModel(Vocab, 16, returnsAllRows: true, Rows);
-        using var lastRow = new FakePerplexityModel(Vocab, 16, returnsAllRows: false, Rows);
+        using var lastRow = new FakePerplexityModel(Vocab, 16, returnsAllRows: false, Rows, multiRowAnyway);
         var a = PerplexityEvaluator.Evaluate(allRows, tokens, options);
         var b = PerplexityEvaluator.Evaluate(lastRow, tokens, options);
 
