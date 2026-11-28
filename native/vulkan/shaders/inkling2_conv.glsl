@@ -53,7 +53,7 @@ void main() {
         if (ADD == 1u) y += actToF(addv[pc.addOff + t * pc.C + c]);
         yout[t * pc.C + c] = fToAct(y);
         // Sequential decoding reads every EARLIER input back out of the BF16 state: round the in-batch history the same way (Inkling2ConvState.Run, #2039), so an N-row
-        // forward equals N single-row forwards bit for bit. A no-op in the BF16-activation arm (x is already BF16), the fix in the F32-activation reference arm (#2065).
+        // forward equals N single-row forwards bit for bit. A no-op in the BF16-activation arm (x is already BF16); a real F16 -> BF16 rounding step in the F16 default (#2075) and the F32 reference arm (#2065).
         s0 = s1; s1 = s2; s2 = bf16ToF(fToBf16(x));
     }
     st[c * 3u] = fToBf16(s0); st[c * 3u + 1u] = fToBf16(s1); st[c * 3u + 2u] = fToBf16(s2);

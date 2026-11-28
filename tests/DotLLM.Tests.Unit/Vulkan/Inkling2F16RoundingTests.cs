@@ -156,7 +156,7 @@ public sealed class Inkling2F16RoundingTests : IDisposable
         finally { buf.Dispose(); }
     }
 
-    /// <summary>The BF16 twin (the shipped default) against its definition, so the probe harness itself is shown to be sensitive in both directions.</summary>
+    /// <summary>The BF16 twin (the selectable previous default) against its definition, so the probe harness itself is shown to be sensitive in both directions.</summary>
     [SkippableFact]
     public void Bf16Store_MatchesRneDefinition()
     {

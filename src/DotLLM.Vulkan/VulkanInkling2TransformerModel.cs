@@ -75,8 +75,7 @@ public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2K
             };
         string? ch = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_VK_CHUNK");
         if (!string.IsNullOrEmpty(ch)) o = o with { MaxChunk = int.Parse(ch) };
-        // DOTLLM_INKLING2_ACT=f16|bf16|f32 selects the activation storage format (default f16 since #2075; bf16 = the previous default; f32 = measurement arm, CLAUDE.md precision rule 1).
-        // DOTLLM_INKLING2_ACT_F32_IMAGE_CHUNKS=1 additionally runs prefill chunks that carry image rows on an F32 scratch set (+49.6 MB, allocated on the first image chunk).
+        // DOTLLM_INKLING2_ACT=f16|bf16|f32: activation storage format of the Vulkan text model and its DSpark drafter (default f16 since #2075; bf16 = the previous default; f32 = measurement arm, not for the drafter).
         string? act = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_ACT");
         if (!string.IsNullOrEmpty(act))
             o = act.ToLowerInvariant() switch
@@ -786,6 +785,19 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
         return true;
     }
 
+    /// <summary>
+    /// Test seam for a REAL F16 overflow (#2075): multiplies the token-embedding gain (<c>token_embd_norm.weight</c>, F32) by <paramref name="scale"/>, so every embedding row, hence the residual stream, is scaled
+    /// and an F16 store overflows to infinity inside the forward (no logits are poisoned by hand). Irreversible for this model instance.
+    /// </summary>
+    internal void ScaleEmbeddingGainForTest(float scale)
+    {
+        var d = _gguf.TensorsByName[Inkling2Tensors.TokenEmbdNorm];
+        var g = new float[_H];
+        new ReadOnlySpan<float>((void*)_gguf.TensorDataPointer(d), _H).CopyTo(g);
+        for (int i = 0; i < g.Length; i++) g[i] *= scale;
+        _device.Upload(g, _tokEmbNorm);
+    }
+
     /// <summary>Test seam: runs on the downloaded logits of an F16 chunk just before the finite check (poisons them to prove the guard fires).</summary>
     internal Action<Span<float>>? BeforeFiniteCheck { get; set; }
 
@@ -811,6 +823,8 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
         _device.Upload(MemoryMarshal.AsBytes(ids), _ids);
         bool hasImageRows = images is { Count: > 0 } && StageImageRows(images, basePos, Tc);
         UseActivationFormat(_opt.F32ImageChunks && hasImageRows ? Inkling2ActFormat.F32 : _opt.BaseAct);
+        // A drafter that is capturing taps must see its own format: refuse before the command buffer is opened, so the throw leaves nothing recorded (#2075 format guard).
+        if (_tapState is not null && _dsd is { } drafter) RequireDrafterFormat(drafter, "target chunk");
         _submit.Begin();
         _cmd = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(_cmd);

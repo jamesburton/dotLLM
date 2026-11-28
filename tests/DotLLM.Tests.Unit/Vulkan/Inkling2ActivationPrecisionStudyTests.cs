@@ -37,7 +37,8 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
     }
 
     private static readonly string[] Images = ["rainbow80", "rainbow190x110", "rainbow640"];
-    private const string Passage = "nvfp4-passage-c256-fa-off.kld";
+    /// <summary>The text oracle of the gate: the 256-token passage by default, or <c>DOTLLM_INK_PREC_KLD</c> (for example <c>nvfp4-wikitext-c1280-fa-off.kld</c>).</summary>
+    private static string Passage => Environment.GetEnvironmentVariable("DOTLLM_INK_PREC_KLD") is { Length: > 0 } f ? f : "nvfp4-passage-c256-fa-off.kld";
 
     private static unsafe float[] Row(ITensor t, int row, int vocab)
     {
@@ -235,7 +236,7 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
             {
                 using var vk = VulkanInkling2TransformerModel.BuildFromGguf(dev, file, cfg, Inkling2VulkanTests.SpvDir(), Arm(arm));
                 if (arm == arms[0]) Log($"LLMLOAD {vk.WeightLoadReport}");
-                foreach (string name in Images)
+                foreach (string name in Environment.GetEnvironmentVariable("DOTLLM_INK_PREC_NOIMG") == "1" ? Array.Empty<string>() : Images)
                 {
                     var o = Inkling2VisionEndToEndTests.LoadOracle(name)!;
                     var emb = embs[name];

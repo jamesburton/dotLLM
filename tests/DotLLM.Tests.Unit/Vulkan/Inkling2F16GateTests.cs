@@ -109,6 +109,48 @@ public sealed class Inkling2F16GateTests : IDisposable
         Log($"F16GUARD vit: poisoned F16 result recomputed in BF16 (fallbacks 1); F16 vs BF16 encode relRMS {d:E2}");
     }
 
+    /// <summary>
+    /// A REAL F16 overflow, not poisoned logits: the token-embedding gain is scaled by 1e6, so the embedding rows (about 38 at most) become ~4e7, F16 stores them as infinity and the forward turns NaN / inf by itself. The first forward must
+    /// throw the BF16-switch error (this arm is what the old softcap, which mapped NaN / inf to +-30 before the guard saw them, failed), while BF16 (full exponent range, no guard) runs the same scaled model without throwing.
+    /// </summary>
+    [SkippableFact]
+    public void Guard_RealF16Overflow_ThrowsOnTheFirstForward_AndBf16DoesNot()
+    {
+        SkipUnlessGpu();
+        string? gguf = Inkling2RealModelTests.FindGguf(); Skip.If(gguf is null, "Inkling-2-Mini-NVFP4.gguf not in the HF cache");
+        using var file = GgufFile.Open(gguf!);
+        var cfg = GgufModelConfigExtractor.Extract(file.Metadata);
+        using var dev = VulkanDevice.Create();
+        int[] ids = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000];
+        using (var f16 = VulkanInkling2TransformerModel.BuildFromGguf(dev, file, cfg, Inkling2VulkanTests.SpvDir(), new Inkling2VulkanOptions()))
+        {
+            using (f16.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), -1, null, true)) { }   // unscaled: clean
+            f16.ScaleEmbeddingGainForTest(1e6f);
+            f16.ResetSequenceState();
+            var ex = Assert.Throws<InvalidOperationException>(() => { using var t = f16.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), -1, null, true); });
+            Assert.Contains("DOTLLM_INKLING2_ACT=bf16", ex.Message);
+        }
+        using var bf = VulkanInkling2TransformerModel.BuildFromGguf(dev, file, cfg, Inkling2VulkanTests.SpvDir(), new Inkling2VulkanOptions(ActivationF16: false));
+        bf.ScaleEmbeddingGainForTest(1e6f);
+        using (bf.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), -1, null, true)) { }   // no throw
+        Log("F16GUARD real overflow: embedding gain x1e6 -> the F16 forward throws the BF16-switch error on its first call; BF16 runs the same model without error");
+    }
+
+    /// <summary>The ViT's BF16 re-encode is checked too: if it is non-finite as well the encoder throws instead of returning NaN embeddings.</summary>
+    [SkippableFact]
+    public void Guard_Vit_BothFormatsNonFinite_Throws()
+    {
+        SkipUnlessGpu();
+        string? mm = Inkling2VisionFixtures.FindMmproj(); Skip.If(mm is null, "mmproj not in the HF cache");
+        var o = Inkling2VisionEndToEndTests.LoadOracle("rainbow80"); Skip.If(o is null, "vision oracle missing");
+        using var dev = VulkanDevice.Create();
+        using var enc = VulkanInkling2VisionEncoder.Load(dev, mm!, Inkling2VulkanTests.SpvDir());
+        enc.AfterDownload = r => r[3] = Half.PositiveInfinity;
+        enc.AfterFallbackDownload = r => r[3] = Half.NaN;
+        Assert.Throws<InvalidOperationException>(() => { using var e = enc.Encode(o!.Image); });
+        Assert.Equal(1, enc.Bf16Fallbacks);
+    }
+
     private static int[] LongPrompt(GgufFile file, int tokens)
     {
         string corpus = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotllm", "test-cache", "corpora", "wikitext-2-raw", "wiki.test.lf.raw");

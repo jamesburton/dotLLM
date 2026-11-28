@@ -81,6 +81,9 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
     /// <summary>Test seam: runs on the downloaded embeddings just before the finite check (poisons them to prove the guard's BF16 fallback).</summary>
     internal Action<Span<Half>>? AfterDownload { get; set; }
 
+    /// <summary>Test seam: runs on the BF16 fallback's downloaded embeddings (poisons them to prove the second check throws).</summary>
+    internal Action<Span<Half>>? AfterFallbackDownload { get; set; }
+
     /// <summary>Number of encodes whose F16 result was non-finite and was recomputed in BF16 (the runtime guard; 0 in every measured run).</summary>
     public int Bf16Fallbacks { get; private set; }
     private bool _ropeF32;
@@ -444,6 +447,10 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
                             _device.Download(_out, MemoryMarshal.Cast<Half, float>(result.Rows));
                         }
                         finally { _act = Inkling2ActFormat.F16; }
+                        AfterFallbackDownload?.Invoke(result.Rows);
+                        // The BF16 result has the full F32 exponent range: if it is non-finite too the input or the weights are broken, and NaN embeddings must not reach the text model.
+                        if (!AllFinite(result.Rows))
+                            throw new InvalidOperationException("inkling2 Vulkan vision tower: the embeddings are non-finite in F16 and again in the BF16 fallback; the image or the mmproj is not usable.");
                     }
                     return result;
                 }

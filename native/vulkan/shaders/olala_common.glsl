@@ -18,8 +18,8 @@
 float actToF(float v) { return v; }
 float fToAct(float v) { return v; }
 #elif defined(ACT_F16)
-// F16-activation-storage MEASUREMENT arm (Inkling 2 activation-precision study, epic #2025): IEEE half, round to nearest even, overflow -> +-inf (NOT saturated), so a
-// run that overflows is visible. Never selected by default; Olala must not use it (its activations reach 1e9..1e14).
+// F16 activation storage (the Inkling 2 default since #2075, epic #2025): IEEE half, round to nearest even, overflow -> +-inf (NOT saturated), so an overflow is visible
+// to the host guards. Olala must not use it (its activations reach 1e9..1e14).
 #define ACT_T uint16_t
 float actToF(uint16_t v) { return unpackHalf2x16(uint(v)).x; }
 uint16_t fToAct(float f) {
