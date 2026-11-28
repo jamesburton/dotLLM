@@ -300,7 +300,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
 
     /// <summary>
     /// Uploads a GDN alpha/beta gate projection. An F32 source whose every value is exactly representable in BF16 (the low 16 bits of each
-    /// word are zero, as in Bonsai 2.5's F32-declared tensors that were BF16 in Bonsai 2) is uploaded as BF16: lossless, half the bytes.
+    /// word are zero, as in Bonsai 2.5's F32-declared tensors that were BF16 in Bonsai 2) is uploaded as BF16: lossless per request, half the bytes. OPT-IN (DOTLLM_VK_GDN_GATE_BF16_NARROW=1): the BF16 gate GEMM is not batch-invariant against the F32 route (VulkanQwen3HybridDenseForwardBatchTests.ForwardBatchFused_SameGemmRoute fails at 9e-3), and the saving is 45 MiB.
     /// Anything else goes through <see cref="UploadProjectionMatrix"/> unchanged.
     /// </summary>
     private static unsafe VulkanDevice.Buffer UploadGdnGateProjection(
@@ -308,7 +308,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         out QuantizationType deviceQt, out long uploadedBytes)
     {
         long count = (long)outputDim * inputDim;
-        if (allowNarrow && qt == QuantizationType.F32 && (inputDim & 1) == 0 && Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_GATE_BF16_NARROW") != "0")
+        if (allowNarrow && qt == QuantizationType.F32 && (inputDim & 1) == 0 && Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_GATE_BF16_NARROW") == "1")
         {
             uint* words = (uint*)src;
             bool exact = true;
@@ -344,7 +344,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         var gate = UploadProjectionMatrix(device, staging, gdnW.GateWeight, gdnW.GateQuantType,
             gdnW.GateOutputDim, gdnW.GateInputDim, forceF32: false, out var gateQt, out long gateBytes);
         // Bonsai 2.5 declares ssm_alpha/ssm_beta F32 where Bonsai 2 declared BF16; every value is exactly BF16-representable (checked at upload),
-        // so the device copy is narrowed to BF16 losslessly (half the bytes, the same kernels as Bonsai 2, zero numeric change; #2072).
+        // so an opt-in (DOTLLM_VK_GDN_GATE_BF16_NARROW=1) narrows the device copy to BF16 (half the bytes, the kernels Bonsai 2 used). Off by default: see UploadGdnGateProjection (#2072).
         // PTQ1_0 trunks are excluded (known issue #2081): a Vulkan PTQ1_0 prefill with BF16 GDN gates at n >= 128 ends in VK_ERROR_DEVICE_LOST (reproduced on the
         // Bonsai 2 PTQ1_0 file too, which declares BF16 gates; ctx 64 is fine, F32 gates are fine), so narrowing there would only expose it.
         bool narrowGates = gdnW.QkvQuantType != QuantizationType.PTQ1_0;
