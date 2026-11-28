@@ -1217,13 +1217,15 @@ public static class ServerStartup
     /// </summary>
     internal static void TryAttachSeparateMtpHead(IModel model, string resolvedPath, ServerOptions options)
     {
-        if (model is Inkling2TransformerModel || options.DSparkPath is not null)
+        if (model is DotLLM.Models.Architectures.DSpark.IInkling2DSparkHost || options.DSparkPath is not null)
         {
             // Inkling 2 DSpark drafter (#2039): an explicit --dspark that cannot attach refuses to start; an auto-detected sibling is logged and ignored.
             try
             {
                 string? attached = DotLLM.Models.Architectures.DSpark.Inkling2DSparkResolver.TryAttach(model, resolvedPath, options.DSparkPath);
-                if (attached is not null) Console.WriteLine($"[dotllm] DSpark: attached drafter {Path.GetFileName(attached)}; the adaptive gate drafts only while acceptance pays (DOTLLM_DSPARK=0 opts out).");
+                if (attached is not null && model is DotLLM.Models.Architectures.DSpark.IInkling2DSparkHost { DeferredDrafter: { } deferred })
+                    Console.WriteLine($"[dotllm] DSpark: found drafter {Path.GetFileName(attached)}; it attaches (about 0.5 GB) only for requests whose prompt + max tokens reach {(deferred.MinContext == int.MaxValue ? "never (opt-in with --dspark)" : deferred.MinContext + " tokens")} (DOTLLM_DSPARK_MIN_CONTEXT, DOTLLM_DSPARK=0 opts out).");
+                else if (attached is not null) Console.WriteLine($"[dotllm] DSpark: attached drafter {Path.GetFileName(attached)}; the adaptive gate drafts only while acceptance pays (DOTLLM_DSPARK=0 opts out).");
             }
             catch (Exception ex) when (options.DSparkPath is null)
             {

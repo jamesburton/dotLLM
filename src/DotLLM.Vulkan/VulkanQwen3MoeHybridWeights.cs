@@ -418,6 +418,10 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     // to die with VK_ERROR_OUT_OF_DEVICE_MEMORY on a heap that looked empty
     // (.docs/BONSAI2_27B_SUPPORT.md). Keeping it packed is not an optimisation here, it is the
     // difference between loading and not loading.
+    // Upstream ggml Q2_0 (#2074: Ternary-Bonsai-2.5 Q2_0 file): 18 bytes per 64 weights, codes -1/0/+1/+2 times an fp16 block scale. Same argument as
+    // PQ2_0: 2.25 bpw packed against 32 widened, so keeping it packed is the difference between loading and not. K % 64 == 0.
+    private static bool KeepQ2_0(QuantizationType qt, int k) => qt == QuantizationType.Q2_0 && (k % 64) == 0;
+
     private static bool KeepPQ2_0(QuantizationType qt, int k) => qt == QuantizationType.PQ2_0 && (k % 128) == 0;
 
     // PTQ1_0 packs the same 128 weights into 28 bytes (1.75 bpw) — the same argument as PQ2_0
@@ -436,7 +440,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         || KeepIq3Xxs(qt, k) || KeepIq3S(qt, k)
         || KeepQ5_0(qt, k, legacyPacked ?? LegacyPackedEnabled) || KeepQ5_1(qt, k, legacyPacked ?? LegacyPackedEnabled)
         || KeepQ4_0(qt, k, legacyPacked ?? LegacyPackedEnabled) || KeepQ4_1(qt, k, legacyPacked ?? LegacyPackedEnabled)
-        || KeepF16(qt, k) || KeepBf16(qt, k) || KeepPQ2_0(qt, k) || KeepPTQ1_0(qt, k);
+        || KeepF16(qt, k) || KeepBf16(qt, k) || KeepPQ2_0(qt, k) || KeepPTQ1_0(qt, k) || KeepQ2_0(qt, k);
 
     /// <summary>
     /// The on-device storage type this loader gives a <paramref name="qt"/> projection whose contraction axis is <paramref name="k"/>:
@@ -470,6 +474,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         if (KeepBf16(qt, k)) return QuantizationType.BF16;
         if (KeepPQ2_0(qt, k)) return QuantizationType.PQ2_0;
         if (KeepPTQ1_0(qt, k)) return QuantizationType.PTQ1_0;
+        if (KeepQ2_0(qt, k)) return QuantizationType.Q2_0;
         return QuantizationType.F32;
     }
 

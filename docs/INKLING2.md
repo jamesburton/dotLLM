@@ -1,6 +1,6 @@
 # Inkling 2 (Thinking Machines) — architecture notes
 
-**Status:** CPU reference forward (issue #2026), Vulkan text decoder (issue #2034, section 11) and the CPU DSpark drafter (issue #2039, sections 13-15), epic #2025. The CPU vision tower is section 12 (issue #2035). CUDA, Vulkan vision and the Vulkan drafter (#2046) are later slices (section 9).
+**Status:** CPU reference forward (issue #2026), Vulkan text decoder (issue #2034, section 11), the CPU DSpark drafter (issue #2039, sections 13-15) and the Vulkan DSpark drafter (issue #2046, section 16), epic #2025. The CPU vision tower is section 12 (issue #2035). CUDA and Vulkan vision are later slices (section 9).
 Model: `thinkingmachines/Inkling-2-Mini` (HF `model_type: inkling2_loop`, `Inkling2LoopForConditionalGeneration`, Apache-2.0, 2026-11-20).
 GGUF: `ggml-org/Inkling-2-Mini-GGUF` (`general.architecture = inkling2_loop`; a plain `inkling2` file is the same graph with one pass).
 
@@ -126,9 +126,9 @@ neither a KL below ~4e-3 nor free-running greedy identity is a meaningful bar ag
 
 ## 9. Not in this slice
 
-- **Vision**: implemented on the CPU in issue #2035 (section 12); the Vulkan text model accepts image embeddings since #2062 (section 12a; the Vulkan ViT encoder is the second half of #2062).
+- **Vision**: implemented on the CPU in issue #2035 (section 12); the Vulkan text model accepts image embeddings since #2062 (section 12a) and the Vulkan ViT encoder runs the tower on the GPU (section 12b, both #2062).
   images enter the text stream as `<|content_image|><|unused_200054|>` placeholders whose embeddings are injected *without* `token_embd_norm` (llama.cpp: "do not normalize raw embeddings input"). The loader must accept an embedding-input forward.
-- **DSpark drafter**: implemented on the CPU in issue #2039, see sections 13-15 (the Vulkan drafter is #2046). `dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`: 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
+- **DSpark drafter**: implemented on the CPU in issue #2039, see sections 13-15; the Vulkan drafter (#2046) is section 16. `dspark-Inkling-2-Mini-Q8_0.gguf`, `arch = dflash`: 3 layers (intermediate 9216, local layers 0 and 2), block size 8, a Markov head (`markov_rank 256`, `rnn_hidden`, a folded `markov_w2 = unembed @ hidden_out`),
   `target_layer_ids = [5, 23, 41, 48]` counted in **layer visits** (the target exposes the input of visit `n` and the final norm output as id 48: `res->t_layer_inp[visit]` in `inkling2-loop.cpp`). The CPU model keeps the trace hook points
   (`pass{n}.l{ip}`, `result_norm`) where those features would be tapped.
 - CUDA text decoder (NVFP4 expert kernels must read the blocks in place), optimisation, llama.cpp Vulkan comparison. (The Vulkan text decoder landed in #2034, section 11.)
@@ -378,6 +378,104 @@ Chunk-size invariance: image-prompt logits KL vs the 32-token run is exactly 0 a
 and the model-level addressing test on the 80 image at chunk 5: row index = token index (not the selector), F16 halves swapped, sentinel ignored (every token overwritten), no-op shader, row stride off by 2.
 5 of 5 killed at both levels.
 
+## 12b. Vision on Vulkan, part B: the Vulkan ViT encoder (issue #2062)
+
+`VulkanInkling2VisionEncoder` (`src/DotLLM.Vulkan/`) runs the whole tower and projector on the GPU: `IImageEncoder`, output the same host F16 `ImageEmbeddings`. The Vulkan text model builds it for its own device
+(`IImageEncoderProvider.CreateImageEncoder`); CLI `run --image` and the server pick it through `VisionSupport.LoadEncoderFor` (`DOTLLM_VISION_DEVICE=cpu` forces the CPU encoder). Verified end to end with
+`dotllm run <gguf> --device vulkan:0 --image rainbow640.ppm`: a coherent description of the image, prefill 282 tokens in 2.9 s.
+
+**Kernels** (`native/vulkan/shaders/vit_*.comp`, `.spv` committed; the DSpark agent's `inkling2_conv` shader is untouched):
+`vit_patch_embd` (F16-rounded pixels gathered per patch x `patch_embd`, plus the bilinear position embedding, fused, one BF16 store into the residual stream at row `posOff`),
+`vit_cls`, `vit_layernorm` (BF16 in/out, F32 statistics), `vit_gemm_q8` (Q8_0 weights, one 34-byte block per weight row per K step decoded into shared memory inside the tile load, BF16 X and Y, F32 accumulators in registers;
+epilogues: bias / bias+erf GELU / `Y += ls * (bias + acc)` in place on the residual stream / bias + 2D RoPE of adjacent pairs from an F16 cos/sin table / GELU / F16 store; the 2x2 merge is the activation addressing of the `mm.1` GEMM),
+`vit_attn` (flash-style: 16 queries x one head per workgroup, keys streamed in tiles of 32 through shared memory with an online softmax; **no score matrix of any precision is stored**; scores, running max/sum and the accumulator
+live in registers and shared memory only). A long sequence is several submits: the attention is dispatched in 2,048-query chunks and the submit is flushed per chunk and per layer above 2,048 positions (a single
+16k-query dispatch would outlive the GPU watchdog; the 4,096-token image ran with no watchdog event).
+
+**Precision / expansion.** BF16 activations (user ruling); Q8_0 matrices imported in place through `VulkanWeightImportPolicy` (the same zero-copy / DirectStorage route as the text model, nothing expanded: no F16/F32 copy of any matrix);
+`patch_embd` / `position_embd` BF16 by default (converted once at load through a transient native buffer, 4.55 MB resident; `DOTLLM_VISION_EMBD_PRECISION=f16` 4.55 MB, `f32` 9.11 MB read in place; the three arms agree to
+the printed digits on the embedding gates); biases, LayerNorm gains and LayerScale vectors stay F32 as in the file. The RoPE table is F16 (`npos x 128` bytes: 2.1 MB at 16,385 positions), the image pixels are held as F16
+(`W x H x 3 x 2` bytes: 39 MB at the 4,096-token limit; the reference rounds them to F16 anyway). The tower's activation scratch is BF16: peak 0.4 / 1.5 / 24.8 / 395.9 MB for the 4 / 15 / 256 / 4,096-token images,
+released after the call when above 128 MB (`ScratchKeepBytes`). Resident weights 341.3 MB (BF16 embeddings), 345.9 MB (F32 arm). Transients that are not weights: the host F32 normalised image (78 MB at the limit) and its F16 copy are freed
+after the upload, and the pixel upload stages through a transient host-visible buffer of the same size (input data, not weights).
+
+**Embedding gates** (`Inkling2VulkanVisionEncoderTests.Embeddings_MatchReferences`; CPU references cached by `CpuCache_Populate` so the CPU and the iGPU never run together). relRMS of our F16 output:
+
+| image | Vulkan vs CPU encoder on the F32 control (exact tower) | vs llama.cpp Q8_0 | vs llama.cpp F32 control | CPU shipping vs the same F32 control | CPU shipping vs llama.cpp Q8_0 (section 12) | min row cosine vs control |
+|---|---|---|---|---|---|---|
+| 80 | 1.73e-2 | 2.36e-2 | 1.73e-2 | 1.51e-2 | 1.8e-2 | 0.9997 |
+| 190x110 | 1.81e-2 | 3.47e-2 | 1.81e-2 | 2.54e-2 | 2.4e-2 | 0.9995 |
+| 640 | 4.11e-2 | 7.02e-2 | n/a | 6.45e-2 | 3.5e-2 | 0.976 |
+
+The CPU reached 2.1e-4 against llama.cpp on the F32 control; the Vulkan encoder reaches **1.7e-2** (80, 190x110). That is not a defect of one kernel: it is the BF16 activation ruling. Layer by layer against the CPU
+control (`Report_LayerwiseDivergenceFromF32Control`): embeddings 1.7e-3 (one BF16 rounding), then a gradual growth, 80 image 4.2e-3 after layer 0, 8.3e-3 at the output; 640 image 5.4e-3 after layer 0, 1.4e-2 (layer 5),
+2.0e-2 (11), 3.3e-2 (17), 4.8e-2 (22). No step anywhere. Longer sequences grow it faster (1,025 keys in every softmax). The F16 RoPE table was not isolated as a contributor. The gates are
+relRMS < 6e-2 vs the control, min row cosine > 0.97, relRMS < 9e-2 vs llama.cpp Q8_0: they catch gross errors; the sharp gates are the op-level tests and the end-to-end KL.
+
+**End to end** (Vulkan encoder + Vulkan text model, vs the same llama.cpp oracles, teacher-forced over 13 rows; gate 0.015):
+
+| image | Vulkan encoder: mean KL / max KL / top-1 / greedy mismatches | CPU encoder + Vulkan text (12a) | exact-tower embeddings (CPU F32 control) + Vulkan text |
+|---|---|---|---|
+| 80 | 3.67e-3 / 1.13e-2 / 12/13 / 1 | 4.85e-3 | 2.48e-3 (12/13, 1 mismatch) |
+| 190x110 | 3.22e-3 / 1.09e-2 / 13/13 / 0 | 6.62e-3 | 5.01e-3 |
+| 640 | **1.04e-2** / 3.88e-2 / 13/13 / 0 | 5.41e-3 | 1.32e-2 |
+
+The 640 figure is 70% of the gate. It is the reference, not the encoder: feeding the **exact** tower's embeddings (no activation noise at all) gives 1.32e-2, worse than ours. The shipping CPU encoder scores lower because
+it quantises activations to Q8_0 exactly like the llama.cpp oracle does, so it shares the oracle's noise; the Vulkan encoder, which never quantises activations, cannot and should not. Single-pass prefill equals the 32-token run to the printed
+digits; image-prompt logits KL vs the 32-token run is exactly 0 at chunks 4, 5 and 7 (`VulkanEncoder_ChunkedPrefill_ImageLogits_AreChunkSizeInvariant`).
+
+**Performance** (Strix 8060S, warm, single process, the Vulkan figures include preprocessing, pixel upload and the F16 download; CPU = the shipping BF16 encoder, 16 threads, cached wall times, run alone under the cpu-bench lock):
+
+| image | image tokens | Vulkan encode | CPU encode | speedup | prefill + first token (Vulkan text) | TTFT Vulkan encoder | TTFT CPU encoder |
+|---|---|---|---|---|---|---|---|
+| 80 | 4 | 18.7 ms | 57 ms | 3.1x | 0.36 s | 0.37 s | 0.41 s |
+| 190x110 | 15 | 21.2 ms | 109 ms | 5.1x | 0.46 s | 0.48 s | 0.57 s |
+| 640 | 256 | 249 ms (211 ms in the TTFT run) | 1,075 ms | 4.3x | 3.17 s | 3.38 s | 4.24 s |
+| 2560x2560 noise | 4,096 | 38.2 s (30.6 s in the TTFT run) | 650.5 s | 17x | 46.4 s | 77.0 s | 696.9 s |
+
+TTFT = encode + whole-prompt prefill + first logits; the CPU column adds the cached CPU encode time to the same measured Vulkan prefill (the two never ran together). Run-to-run spread on the large image is ~20% (another agent
+shares the iGPU between lock holders; this is not a tuned figure). Where the time goes at 4,096 tokens: 25 TFLOP of attention and 9.5 TFLOP of GEMMs in ~30-38 s, about 1 TFLOP/s overall; both the attention kernel (scalar FMAs, two
+shared-memory reads per FMA) and the GEMM (64x64 tile, scalar) are untuned. Levers: coopmat tiles for the GEMM (section 11 / the Q5_0 / Q4_K coopmat templates), a 32-query register-tiled attention.
+
+**Op-level parity and mutants** (`Inkling2VulkanVitKernelTests`, 17 tests, double-precision references written independently of the shaders; mutated shader copies compiled to a scratch directory and loaded through
+`DOTLLM_INKLING2_SPV_OVERRIDE`, tracked `.spv` untouched; committed before mutating). Each mutant ran against the kernel tests and the embedding gate (7 cases: 3 images x arms):
+
+| mutant (shader) | kernel tests failed | embedding-gate cases failed |
+|---|---|---|
+| posemb `align_corners` (vit_patch_embd) | 4 | 6 (the 640 image sits on the 32x32 table, where align_corners is the identity: it cannot fail there) |
+| posemb transposed (vit_patch_embd) | 5 | 4 |
+| posemb not added (vit_patch_embd) | 5 | 7 |
+| RoPE axes swapped (vit_gemm_q8) | 1 | 7 |
+| RoPE not applied (vit_gemm_q8) | 1 | 7 |
+| merge order (vit_gemm_q8) | 1 | 7 |
+| merge skipped (vit_gemm_q8) | 1 | 7 |
+| no LayerScale (vit_gemm_q8) | 1 | 7 |
+| no bias (vit_gemm_q8) | 4 | 7 |
+| tanh GELU (vit_gemm_q8) | 1 (`Gelu_IsErfNotTanh_InTheNegativeTail`) | 0 |
+| attention scale 1 instead of 1/8 | 2 | 7 |
+| attention key tail unmasked | 1 | 4 |
+| CLS row zero | 1 | 7 |
+| LayerNorm without beta | 1 | 7 |
+
+The tanh-GELU mutant **survived** the first draft of the kernel tests and the embedding gate (4.7e-4 absolute is invisible through BF16 and 6e-2 relRMS, as in the CPU section); it is killed by a dedicated test that evaluates the
+epilogue at chosen points in the negative tail (zero weights, biases from -3.5 to 3), where tanh and erf differ by up to 25% relative (erf: 3.5e-3 error from BF16 only).
+
+**Several threads on one device (issue #2068).** The server encodes an image on a `Task.Run` worker outside the request gate, so a Vulkan encode can submit while another request's text forward runs on the same
+`VulkanDevice`. Vulkan requires external synchronisation of `vkQueueSubmit` on the shared queue, of a `VkCommandPool` and every command buffer recorded from it, and the device-wide hazard tracker
+(`ActiveHazards`, set by a forward and nulled by every `Begin` / submit) assumed single-threaded recording. Fixed at the device, so it holds for every path (scheduler, MTP, DSpark drafter, warm-up, load-time uploads):
+every `vkQueueSubmit` goes through one `QueueSubmit` under a queue lock (held for the submit call, never across the fence wait); each `SubmitContext`, staging command buffer and one-shot copy owns a private command
+pool (the shared device pool is no longer recorded into); `ActiveHazards` is armed, seen and disarmed only by the arming thread (another thread's dispatches fall back to explicit barriers).
+Cost: **1.00 `vkQueueSubmit` per decoded token** (measured over 32 decode steps, 32.5 ms/token) and an uncontended lock of 10.5 ns: 10 ns per token, 3e-7 of a decode step. Tests (`VulkanDeviceConcurrencyTests` and
+`ConcurrentImageEncodeAndTextDecode_OnOneDevice_MatchTheirSerialRuns`: 150 image encodes beside 3 x 25 text steps; tokens and embeddings bit-identical to the serial runs, never more than one thread inside `vkQueueSubmit`).
+Mutants: the queue lock removed: 4 threads inside `vkQueueSubmit` at once, the driver raised errors in the submitting threads (2 unit tests fail) and the model-level test **deadlocked the device** (it now fails by timeout after 180 s);
+the shared plain hazard slot restored: `HazardTracker_ArmedOnOneThread_SurvivesAnotherThreadsSubmit_AndIsInvisibleToIt` fails (the model-level test cannot see it: the Vulkan ViT records through `OlalaKernel`, which has no tracker).
+The private-pool change has no discriminating test (a shared pool race is undefined behaviour that did not show on this driver); it is covered by reasoning, not by a failing mutant. The RoPE table is now built once per
+grid into native memory (`RopeTable_IsBuiltOncePerGrid`), not as a managed array per call. `DOTLLM_VISION_DEVICE` accepts `cpu`, `auto`, `gpu`, `device`; anything else is an error.
+
+**Staged conversion (rule 3).** The one-time BF16 (or F16) conversion of `patch_embd` / `position_embd` (4.55 MB) reads the mapped F32 tensor on the host, converts into a transient native buffer and uploads it through the
+staging buffer: a host bounce (read, convert, copy) of 4.55 MB at load. It is not the direct route (no DirectStorage / zero-copy import of the F32 pages can produce a converted tensor); the F32 arm takes the normal weight-import route (zero-copy or DirectStorage where the policy allows)
+(9.11 MB resident). Awaiting the user's ruling on this note.
+
 ## 13. DSpark drafter (issue #2039)
 
 The drafter is `unsloth/Inkling-2-Mini-GGUF` `dspark-Inkling-2-Mini-Q8_0.gguf` (504 MB, `general.architecture = dflash`, 58 tensors). `mtp.safetensors` is **not** needed: the GGUF already carries the converter's folds (`markov_w2 = unembed @ hidden_out`, softmaxed `ctx_mix`, the replicated `mask_embd`).
@@ -427,7 +525,7 @@ Greedy identity "by construction" only holds if an N-row forward equals N single
 
 **Draft parity vs llama.cpp** (`Drafts_MatchLlamaCppDsparkOracle`; oracle `dspark-oracle-k3.json` built from `llama-server -md dspark-... --spec-type draft-dspark --spec-draft-n-max 3 -dev none -devd none -v`; dotLLM is teacher-forced on llama.cpp's committed tokens and drafts at each round's reconstructed anchor): top-1 agreement **570/594 = 96.0%** (position 1: 98.5%), 183 of 198 whole rounds identical, mean |p diff| at position 1 0.0147 (p = softmax over the sampler's top 10). The residue is the target-feature noise floor (KL 4e-3) compounding along the Markov chain.
 
-**Mutants** (each must change the drafts on real data; `Inkling2DSparkTests`, `Inkling2RowInvarianceTests`): killed: taps by cache slot instead of visit, taps one visit early (prelude only), taps one visit late (every loop), visit 48 before the output norm, `ctx_mix` softmaxed twice, anchor not normed, anchor normed twice, Markov state reset each step, softcap before the bias, `f_rnn` of the wrong position, layers 0/2 not windowed (`AllLayersGlobal`), per-query window instead of the anchor's (`PerQueryWindow`), skipped `RestoreRecurrentStateToRow` (restore test), unrounded in-batch conv history (row-invariance test, pre-fix). **Survivor:** the global layer 1 windowed too (`AllLayersLocal`): at 1300 tokens of random context its output is bit-identical, because that layer's softmax is so peaked on the anchor/recent keys that keys past 1024 positions carry exactly zero float weight. Recorded as a finding; the window of layer 1 is unobservable on this data.
+**Mutants** (each must change the drafts on real data; `Inkling2DSparkTests`, `Inkling2RowInvarianceTests`): killed: taps by cache slot instead of visit, taps one visit early (prelude only), taps one visit late (every loop), visit 48 before the output norm, `ctx_mix` softmaxed twice, anchor not normed, anchor normed twice, Markov state reset each step, softcap before the bias, `f_rnn` of the wrong position, layers 0/2 not windowed (`AllLayersGlobal`), per-query window instead of the anchor's (`PerQueryWindow`), skipped `RestoreRecurrentStateToRow` (restore test), unrounded in-batch conv history (row-invariance test, pre-fix). **Correction (#2046):** this section first recorded `AllLayersLocal` (the global layer 1 windowed too) as a survivor, 'bit-identical because layer 1's softmax is peaked'. That was an artefact: the drafter read `dflash.sliding_window_pattern`, the key is `dflash.attention.sliding_window_pattern`, a missing key defaulted to 'every layer windowed', so layer 1 WAS windowed on both backends and the mutant changed nothing. The key is fixed (and a missing pattern now throws): layer 1 is global, `AllLayersLocal` is **killed** (max |draft logit diff| 1.45e5 at ~1300 tokens of random context, with `AllLayersGlobal` 1.45e5 and `PerQueryWindow` 9.0e4), and the CPU numbers above did not move (identity 8/8, 30.9% acceptance, oracle 570/594 = 96.0%): the prompts are shorter than the window, so layer 1 never saw a key past 1024 positions.
 
 **Allocation:** a warm draft (K = 7) allocates 0 managed bytes (`DraftHotPath_AllocatesNoManagedTensorMemory`); the drafter's activations and logits are native scratch.
 
@@ -440,4 +538,90 @@ Greedy identity "by construction" only holds if an N-row forward equals N single
 
 The drafter is cheap (27 ms); the verify is not: a 4-row verify of a 128-expert top-8 MoE costs 3.5x a single decode on this bandwidth-bound box (362 ms vs about 102 ms), so even 2.8 tokens per round loses (139 vs 102 ms/token). This is the pratikgx card's "about 1.0x" on distinct prompts, a little worse here. **Adaptive gate:** the model is not "large" by the gate's resident-size prior (`ComputeMemoryBytes` is the state, not the mmapped weights), so a single `run` decides plain, which is why auto equals off. Over six requests through `dotllm serve` with an auto-detected `dspark-*.gguf` (hard-linked beside the target) the gate tried MTP once, measured 237.7 ms/token against 95-118 ms plain, fell back after 5 rounds and stayed on plain for the following requests. Draft width: `DOTLLM_DSPARK_DRAFT` (default 3).
 
-**Precision.** Weights Q8_0 / BF16 read in place; the context K/V is F16 (12 KiB per position for 3 layers, no F32 anywhere stored); `f_rnn` rows F16; tap rows F16; activations are native scratch, F32 only within a call (as the CPU reference). The Markov recurrent state (256 floats, 1 KiB) is an F32 in-call accumulator on the stack, never stored across calls; a BF16/8-bit evaluation of it has **not** been done (open item for sign-off). The recorded conv-snapshot window is BF16.
+**Precision.** Weights Q8_0 / BF16 read in place; the context K/V is F16 (windowed since #2060, section 16: 4 KiB per position plus a fixed ring; it was 12 KiB per position for 3 layers; no F32 anywhere stored); `f_rnn` rows F16; tap rows F16; activations are native scratch, F32 only within a call (as the CPU reference). The Markov recurrent state (256 floats, 1 KiB) is an F32 in-call accumulator on the stack, never stored across calls; a BF16/8-bit evaluation of it has **not** been done (open item for sign-off). The recorded conv-snapshot window is BF16.
+
+## 16. DSpark drafter on Vulkan (issue #2046, windowed context K/V #2060, conv fix #2065)
+
+`VulkanInkling2TransformerModel` (partial, `VulkanInkling2TransformerModel.DSpark.cs`) implements `IInkling2DSparkHost`: the resolver, `run`, `chat` and `serve` attach the drafter to it exactly as to the CPU model (`--dspark`, or an auto-detected `dspark-*.gguf` beside the target;
+an explicit path that cannot attach refuses to start, an auto-detected one is logged and ignored). `SupportsMtp` is true only while a drafter is attached; the unmodified `MtpSpeculativeDecoder`, the adaptive gate and the `MtpMaxDraftTokens` cap are reused. The CPU drafter class is **not** instantiated
+on this path (its constructor allocates host F32 scratch); the GGUF validation both backends share lives in `Inkling2DSparkSpec`. `VulkanDFlashBackend` (F32 scratch) is not reused and Qwen DFlash is untouched.
+
+**Target hooks.** Taps at layer visits 5 / 23 / 41 (the INPUT of the visit, recorded before the layer) and 48 (the final normed output) are copied into a chunk-sized BF16 buffer `[128][4][H]` inside the same command buffer as the chunk, then
+injected on the device (`inkling2_dspark_ctxmix`, K/V projections through `olala_gemv_q8_0`, `inkling2_dspark_headnorm`: per-head RMSNorm + NeoX RoPE + F16 store). Row snapshots: `inkling2_conv` (spec constant `SNAP`) writes the verify window `[old state (3 rows); the T inputs]` as BF16 for all
+4 convs of all 48 slots (`ForwardWithRecurrentSnapshots`); `RestoreRecurrentStateToRow(r)` (`inkling2_conv_restore`) copies rows `r+1..r+3` back, covers slots 24..47 (the pass-2/3 core slots) and sets the length to `pos0 + r + 1`. The engine rolls the KV handle back BEFORE restoring
+the recurrent state, so `Inkling2KvHandle.Rollback` now accepts a position inside the last recorded verify (it marks the model "restore pending" and the next forward refuses until `RestoreRecurrentStateToRow` ran) and still throws for any other rollback.
+
+**Row invariance.** An N-row forward equals N single-row forwards **bit for bit** on the Vulkan target (2, 4, 8 rows over a 20-token prefix, all 200,058 logits; `Inkling2VulkanRowInvarianceTests`): the default BF16 conv is invariant by construction (its inputs are BF16-exact),
+and the Q8_0 / NVFP4 GEMVs already reduced in the same order for 1 and N rows. The **F32-activation reference arm was not** (#2065: the conv shader did not round in-batch history to BF16 as `Inkling2ConvState.Run` does since #2039, which also made `Inkling2VulkanKernelTests.Conv_CarriedState_MatchesReference`
+fail by 2e-3 to 3e-3 on dev). Fixed in `inkling2_conv.glsl` (`s2 = bf16(x)`: a no-op for BF16 activations). Tests: `Conv_EightRows_EqualEightSingleRows_BitForBit` (dyn / no dyn) and the mutant that removes the rounding (2099 and 2100 of 2400 outputs differ).
+
+**Drafter kernels** (all `inkling2_dspark_*`, BF16 activations, F16 context K/V, weights read in place, F32 only in registers / shared memory): `copy`, `ctxmix` (tap mix + RMS, also the F16 `f_rnn` ring), `headnorm` (per-head norm, RoPE with a hi/lo split of `theta^(-2i/128)/(2 pi)` and an fma-recovered product so the angle is exact at any position, F16 ring or linear store),
+`attn` (non-causal block attention, one workgroup per KV head, online softmax over 64-key tiles, ring or linear F16 K/V + the block's own F16 K/V), `eltwise` (residual add, SwiGLU), `markov_pre` / `markov_step` / `markov_logits` / `argmax` (the Markov head). Anchor row: `inkling2_embed` with the DRAFTER's `token_embd_norm` gain; mask rows: BF16 copy of `mask_embd` (converted once at load); LM head: the target's `olala_gemv_q8_0` over rows 1..n.
+
+**Markov state (no stored F32).** The 256-float recurrent state is never stored across dispatches. Each walk step runs one workgroup that **replays steps 1..i in shared memory** from the stored BF16 state-independent pre-activations (`markov_pre`: `joint_bias + J[:, 512:] . [hidden_i ; f_rnn]`) and the stored token ids (`tok`), K <= 7 so at most 7 x 3 x 512 MACs per thread; it emits `tanh(c2)` as BF16 for the `markov_w2` pass, which adds the base logit and the bias, applies the softcap AFTER the bias, writes the row back and reduces to a per-workgroup argmax; a second dispatch reduces the 6,252 partials to the token id the next step reads. The whole draft (embed, 3 layers, head, walk) is ONE command buffer; only the n token ids come back.
+Because nothing F32 crosses a dispatch, the "evaluate 8-bit / F16 / BF16 before F32" question for the Markov state is moot: there is no stored state to narrow. The stored values are the BF16 pre-activations (`[rows][768]`, 12 KiB at 8 rows), the BF16 `tanh(c2)` (512 B) and the token ids.
+
+**Stored-F32 inventory (for sign-off).** (1) The drafter's logits `[(block - 1) x vocab]`, **F16 by default since #2046's review (2.8 MiB; `DOTLLM_DSPARK_LOGITS=f32` is the 5.6 MiB A/B arm, see the F16 table below)**, formerly F32 = 5.6 MiB allocated (2.4 MiB used at K = 3): the same pattern as the target's own logits (both are `VulkanDevice.Allocate`, host-visible F32, written by the LM-head GEMV; the drafter's Markov pass then updates its rows in place; no device-local F32 store on a hot path) (the head output must be F32 for the softcap + argmax; fusing the head into the Markov pass would read the 490 MB Q8_0 head once PER STEP instead of once (about 2.5 ms each at 196 GB/s), so it was not built).
+(2) 8 B per workgroup of argmax partials (50 KB). (3) The GGUF's F32 weight vectors (norm gains, `ctx_mix`, `markov_w2.bias` 0.8 MB, `joint_proj.bias`), uploaded verbatim, and the 512 B RoPE table. No F32 activation, KV, tap or recurrent-state storage.
+
+**Context K/V (#2060).** Layers 0 and 2 keep a ring of `window + MaxChunk` = 1025 + 128 = 1153 positions (4.7 MB per layer for K and V, flat in the sequence length); the global layer 1 keeps the whole context in a buffer that starts at 1,024 positions and doubles, **admitted** through `VulkanKvCache.AdmitGrowth` (usable capacity minus resident bytes minus other processes). When the growth is refused the state logs once, turns unusable and drafts the anchor repeated (the verify rejects it, the gate switches speculation off); it never throws and never spills.
+Steady state: **4 KiB per position** (the global layer's K+V) instead of 12 KiB, plus the 9.2 MB ring: 17 MB at 2K tokens, 399 MiB at 100K tokens (the unbounded layout: 1,171 MiB). The minimum ring is `1024 + K` (a rejected verify may have written K rows ahead of the committed end); the shipped 1153 leaves 125 rows of slack, so a ring one row below the minimum is the mutant.
+The CPU drafter got the same design (`Inkling2DSparkState`: ring `window + InjectChunk` = 1089, admitted global growth against `GC.GetGCMemoryInfo().TotalAvailableMemoryBytes - WorkingSet - 512 MiB`; K/V per position 12 -> 4 KiB, plus a fixed 8.5 MB ring. The global buffer doubles from 256 positions, so the saving shows above ~1.4K tokens: 16.5 MiB resident at 1,330 tokens (15.6 MiB in the old layout, the doubled capacity is 2,048 positions), 24.5 MiB at 4,030 (47.2 MiB old). CPU gates after the key fix: greedy identity 8/8 x 40 (167 rounds, 1.90 tokens/round, 30.9%), oracle 570/594 = 96.0% (position 1 98.5%, 183/198 rounds), ring 1089 vs 8192 bit-identical at 1,330 and 4,030 tokens, a ring of 1023 changes the drafts, refused admission degrades without throwing).
+
+**Correctness (Strix, NVFP4 target + Q8_0 drafter, 2026-11-27).**
+
+| gate | result |
+|---|---|
+| greedy identity, 8 oracle prompts x 40 tokens, K = 3, unmodified `MtpSpeculativeDecoder` + row snapshots + the Vulkan KV handle | **8/8 identical, 40/40 each**; 164 rounds, 1.93 tokens/round, draft acceptance **31.8%** (per prompt 7% to 75%; CPU 30.9%, llama.cpp 30.3%) |
+| draft parity vs llama.cpp `dspark-oracle-k3.json` | top-1 **568/594 = 95.6%** (position 1: 99.0%), 181 of 198 rounds identical (CPU 96.0%, 98.5%, 183) |
+| snapshot restore vs sequential decoding | next-token logits **bit-identical** (rows kept 0..2 of 6) across all 48 slots; mutants skipped restore, restore to row + 1, pass-0-only restore: all killed |
+| ring 1153 vs an unbounded ring (8192), drafts at ~1300 and ~4000 tokens of random context | **bit-identical** (max logit diff 0); a ring of 1023 changes them (8.8e4 / 1.2e5 in the id-weighted fingerprint) |
+| global layer 1 (global since the key fix): ring/global growth 1024 -> 4096 vs a preset 4096 buffer, ~4000 tokens | bit-identical (max logit diff 0); refused admission -> unusable, anchor drafts, no exception |
+| two identical prefills | bit-identical K/V, `f_rnn` ring and drafts (this found a race: rows r and r + 16 of one chunk wrote the same `f_rnn` slot concurrently; fixed by letting only the last row of each slot store) |
+| Vulkan target KL gates (`Inkling2VulkanGateTests`, `Inkling2VulkanTests`) after the conv / snapshot edits | all pass; final-code run of `Inkling2VulkanDSparkTests` + `Inkling2VulkanRowInvarianceTests` + `Inkling2VulkanGateTests`: 23/23 (one failure, the unusable-state throw above, fixed and rerun) |
+
+**Mutants** (each must change the drafts on real data or fail an op-level test; `Inkling2VulkanDSparkTests`, `Inkling2VulkanDSparkKernelTests`): killed: taps by cache slot, taps one visit early (prelude), taps one visit late, visit 48 before the output norm, Markov state reset each step (logits and the op test), softcap before the bias (logits and the op test), `f_rnn` of the wrong position, per-query window instead of the anchor's, ring one row too short
+(op-level attention test on constructed data where the oldest visible key decides the output: dropping it moves the output by 10.0, a ring one slot below the minimum by > 0.5; end to end 8.8e4 / 1.2e5), skipped / row+1 / pass-0-only restore, conv history unrounded. `AllLayersLocal` (the global layer windowed too) is **killed** on Vulkan after the pattern-key fix (max |draft logit diff| 1.14e5 at ~1300 tokens; the pre-fix 'survivor' on both backends was the misspelled-key artefact, section 15). Refused global-layer admission turns the state unusable and every later `NextDraft` answers the anchor (a first version threw at the position the stopped state no longer tracked; found by the test and fixed).
+Not ported: the CPU's anchor-not-normed / anchor-normed-twice / `ctx_mix`-softmaxed-twice mutants (they act inside fused kernels or at weight load; the CPU tests still gate those semantics, and the Vulkan drafts agree with llama.cpp to 95.6%).
+
+**Byte costs** (this PR): drafter weights + scratch 478.5 MiB device (504 MB file, read in place; imported zero-copy where the policy allows), conv snapshots 7.0 MB (8 rows x 48 slots x 6,656 channels x 2 B, grown on demand, only after the first `ForwardWithRecurrentSnapshots`), tap buffer 2.4 MB, drafter logits 5.6 MiB, state K/V as above.
+
+**Speed (Strix 8060S, NVFP4 target, `run -t 0 -n 64`, `--device vulkan`, final code incl. the pattern-key fix; GPU lock held; one warm-up run discarded, then every configuration twice, once in forward and once in reverse order, so drift shows as forward/reverse disagreement; tok/s of the decode phase).**
+
+| context | off (`--no-mtp`) | auto | forced (`DOTLLM_MTP_ADAPTIVE=0`) | forced / off | tokens / round | drafter ms | 4-row verify ms | 1-row decode ms |
+|---|---|---|---|---|---|---|---|---|
+| 23 prompt tokens | 30.58 / 30.13 | 27.29 / 27.07 (gate fell back after 5 rounds: 38.0 vs 33.8-34.5 ms/token) | 19.93 / 19.64 | **0.65x** | 1.88-1.94 | 9.6-10.4 | 86.0-87.5 | 32.7 |
+| 2,628 prompt tokens (7 KB of this doc) | 25.80 / 25.67 | 24.84 / 24.22 (stayed on MTP 19 rounds, then fell back: 42.5 vs 37.9 ms/token) | 24.54 / 25.45 | **0.97x** | **3.06** | 12.5-16.2 | 97.9-98.1 | 38.9 |
+
+**What moved with the pattern-key fix (layer 1 now global).** Correctness did not: identity 8/8 x 40 with the same 164 rounds / 1.93 tokens per round / 31.8%, oracle parity 568/594 = 95.6% (position 1 99.0%), the same, because those prompts are shorter than the window. At 2.6K tokens of context the
+drafts got better: 3.06 tokens per round against 2.69 with layer 1 windowed, and forced / off went from 0.86x (22.60 vs 26.23 tok/s) to 0.97x. Short context is unchanged (0.65x against 0.66x). The earlier table (layer 1 windowed, two sessions: forced 0.57x then 0.66x short, 0.89x then 0.86x long) is superseded.
+
+**The drafter is net slower or at best break-even on Vulkan, and the gate keeps it off** (CPU: 0.6x). The verify is the cost: a 4-row forward of a 128-expert top-8 MoE reads about 3x the expert weights of a single row, 86-98 ms against 33-39 ms for one decode: **2.6x**. Break-even needs
+`(drafter + verify) / plain ms` tokens per round: (10 + 87) / 32.7 = **3.0** at short context and (14 + 98) / 38.9 = **2.9** at long context, against 1.9 measured on distinct prompts and 3.06 on a prompt that echoes its own text (that is the 0.97x: a round of 112-116 ms for 3.06 tokens is 36.6-37.9 ms per token against 38.9 plain, within the 3% noise of the wall-clock figure). A repetitive continuation (92.9% acceptance on the pratikgx card) is where it wins. The levers, in order: the small-row MoE verify (two rows should cost about 1.1x), then the drafter (10-16 ms against about 6 ms of weight traffic: about 1.1 GB per round at 190 GB/s; the walk's single-workgroup step kernel and the serial argmax levels are the visible waste).
+The prefill cost of the drafter's injection is about 1 s on 2,628 tokens (3%).
+**Context threshold (James, 2026-11-28).** The drafter never won below ~8K tokens, so the Vulkan model no longer attaches an auto-detected drafter at load: `DeferAutoAttach` only remembers the path, and each request asks `IContextGatedMtp.PrepareMtpFor(prompt tokens + max tokens)`; at or above `DOTLLM_DSPARK_MIN_CONTEXT` (default **12288**, `0` = always, `off` = never) the drafter is attached (about 0.5 GB, plus the adaptive gate's calibration rounds), below it nothing is allocated and the request decodes plainly. An explicit `--dspark` attaches at load and forces it on at every length; the adaptive gate stays active once attached.
+Measured on the Strix iGPU (`run -t 0 -n 64`, one warm-up discarded, each context off/forced/forced/off = forward then reverse, GPU lock held; decode tok/s of the 64 generated tokens after a prefill of the stated size):
+
+| prompt tokens | off | forced (`DOTLLM_MTP_ADAPTIVE=0`) | forced / off | tokens/round | drafter ms | 4-row verify ms |
+|---|---|---|---|---|---|---|
+| 4,039 | 25.76 / 25.45 | 16.69 / 17.66 | **0.67x** | 1.9-2.0 | 12.9-25.3 | 97-102 |
+| 8,021 | 21.81 / 17.61 | 19.17 / 16.35 | **0.90x** (0.88 fwd, 0.93 rev) | 2.62 | 16.5-19.6 | 105-119 |
+| 11,903 | 23.16 (+ one run disturbed by another job, see below) | 23.98 / 23.21 | **~1.0x** (1.04 / 1.00 against the one clean off run) | 2.94 | 17.4-19.4 | 109-113 |
+| 15,771 | 13.49 / 12.94 | 19.08 / 18.96 | **1.44x** | 3.25 | 25.0-26.1 | 136-141 |
+
+The 8K pair drifted between its forward and reverse halves (every reverse number is 10-20% lower, prefill included), so read it as 0.9x. 12K was measured later in a window where another agent's CPU job (`cpu-bench`, #2072) started halfway: the three runs before it are clean (off 23.16, forced 23.98 and 23.21 tok/s), the fourth (off, reverse) and the two default-threshold runs after it were disturbed (13.4 tok/s plain, 12.9 at 4K: prefill 57 instead of 85 tok/s) and are NOT used. So 12K is parity, not a loss, and the default stays **12288** (the gate stays active, so a parity-to-small-win region costs only its few calibration rounds). Plain decode falls from 25.6 to 13.2 tok/s between 4K and 16K (global attention grows with the context) while the verify grows less, which is where the drafter starts to pay: 0.67x at 4K, 0.90x at 8K, ~1.0x at 12K, 1.44x at 16K. The default-threshold CLI path itself was verified functionally in the disturbed window (timings discarded): at 4,039 tokens the log shows the drafter found and no attach and a plain run; at 15,835 tokens it attaches ("threshold 12288"), calibrates and the gate takes over. Not measured: contexts above 16K.
+
+**F16 drafter logits (James 2026-11-28, instead of F32).** The LM-head GEMV writes F16 (`olala_gemv_q8_0_f16out`, an `OUT_F16` define in `olala_gemv.glsl`; the existing .spv are byte-identical) and `inkling2_dspark_markov_logits_f16` reads the F16 base logit, adds the bias and the softcap in F32 registers, writes the capped column back as F16 and takes the argmax on the unrounded F32 value. The target model's logits are unchanged.
+
+| measure | F32 | F16 |
+|---|---|---|
+| logits buffer (block 8, vocab 200,058) | 5,601,624 B | 2,800,812 B |
+| draft tokens on the 198 llama.cpp oracle rounds (594), F16 vs F32 | | **594/594 identical** (198/198 rounds) |
+| top-1 vs llama.cpp on those rounds | 568/594 = 95.6% | 568/594 = 95.6% |
+| argmax per drafted row on 177 probe rows (the short "history" prompt, every position) | | 177/177 identical; max column error 2.6e-2 (one F16 step at 16-32), mean 6.1e-3 |
+| greedy identity, 8 prompts x 40, K = 3 | 8/8, 164 rounds, 1.933 tokens/round, 31.8% | 8/8, 164 rounds, 1.933 tokens/round, 31.8% |
+| drafter wall time per K = 3 draft (median of 90, ~1.3K context, interleaved) | 11.55 ms | 11.55 ms |
+| constrained-round download of 3 logits rows (host float[] incl. the F16 -> F32 conversion) | 19.0 ms | **6.7 ms** |
+| op level, `MarkovHead_F16Logits_MatchesReferenceWalk` (n = 3, 7) | | worst normalised error 8.6e-4 (F16 storage), chain equals the double reference |
+
+The Markov head updates the logits in place, but each row is read once (the walk depends on the argmax chain only, never on a stored column), so the F16 rounding of the base logit can only change a token through a near-tie; there were none in 594 + 177 rows. F16 is therefore the default. **Can the parity test fail?** Two coarser stores were substituted into the base-logit read of `inkling2_dspark_markov_logits_f16` (shader copies loaded through `DOTLLM_INKLING2_SPV_OVERRIDE`, tracked `.spv` untouched): (a) a 4-bit mantissa: oracle drafts 568/594 equal to F32 (92.6% vs llama.cpp), probes 172/177, max column error 10.9: both tests fail, also with the original thresholds; (b) a BF16 truncation (7-bit mantissa, steps of 0.06 at |x| 16-32): oracle drafts 589/594 equal, probes 176/177, max column error 7.2, mean 2.4e-2, greedy identity still 8/8. **The first version of the tests passed (b)** (bounds of 'agreement > 0.99'), which is a finding: argmax agreement on 594 + 177 rows is too coarse to tell F16 from BF16-truncated. The tests now require 594/594 equal draft tokens and a column error bound (max < 0.05, mean < 0.01; F16 measures 2.6e-2 and 6.1e-3), and both fail (b). Not evaluated as arms of their own: BF16 logits and 8-bit logits.

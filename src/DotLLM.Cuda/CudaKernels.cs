@@ -194,6 +194,10 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly CudaModule _dequantI2sModule;
     private readonly CudaModule _pq2_0GemvModule;
     private readonly CudaModule _dequantPQ2_0Module;
+    // #2074: upstream ggml Q2_0 packed GEMV (native/kernels/q2_0_gemv.cu); the F16 dequant for it lives in dequant.cu.
+    private readonly CudaModule _q2_0GemvModule;
+    private readonly nint _q2_0GemvF32IoFunc;
+    private readonly nint _dequantQ2_0Func;
     private readonly CudaModule _pq2_0RepackModule;
     private readonly CudaModule _relu2Module;
     private readonly CudaModule _relu2F32Module;
@@ -701,7 +705,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         "attention_f32.ptx", "swiglu_f32.ptx", "bias_add_f32.ptx", "per_head_rmsnorm_f32.ptx",
         "rmsnorm_f32.ptx", "quantized_gemv_f32in.ptx", "i2_s_gemv.ptx", "dequant_i2_s.ptx",
         "pq2_0_gemv.ptx", "dequant_pq2_0.ptx", "pq2_0_repack.ptx", "relu2.ptx", "relu2_f32.ptx",
-        "relu2_glu_rmsnorm.ptx", "fused_add_rmsnorm_f32res.ptx", "nemotron_moe.ptx",
+        "relu2_glu_rmsnorm.ptx", "fused_add_rmsnorm_f32res.ptx", "nemotron_moe.ptx", "q2_0_gemv.ptx",
     ];
 
     /// <summary>
@@ -798,6 +802,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         _dequantI2sModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "dequant_i2_s.ptx"));
         _pq2_0GemvModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "pq2_0_gemv.ptx"));
         _dequantPQ2_0Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "dequant_pq2_0.ptx"));
+        _q2_0GemvModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "q2_0_gemv.ptx"));
         _pq2_0RepackModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "pq2_0_repack.ptx"));
         _relu2Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2.ptx"));
         _relu2F32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_f32.ptx"));
@@ -1127,6 +1132,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
         _pq2_0GemvF32IoSmallFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f32io_small");
         _pq2_0Gemv2F32IoSmallFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f32io_small");
         _dequantPQ2_0F16Func = _dequantPQ2_0Module.GetFunction("dequant_pq2_0_f16");
+        _q2_0GemvF32IoFunc = _q2_0GemvModule.GetFunction("q2_0_gemv_f32io");
+        _dequantQ2_0Func = _dequantModule.GetFunction("dequant_q2_0_f16");
         _pq2_0RepackSplitF16Func = _pq2_0RepackModule.GetFunction("pq2_0_repack_split_f16");
         _relu2Func = _relu2Module.GetFunction("relu2_f16");
         _relu2F32Func = _relu2F32Module.GetFunction("relu2_f32");
@@ -2677,6 +2684,25 @@ public sealed unsafe partial class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchKernel(func,
                 grid, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Widest column count of <see cref="LaunchQ2_0GemvF32"/>.</summary>
+    public const int Q2_0GemvMaxCols = 8;
+
+    /// <summary>
+    /// Upstream ggml Q2_0 packed GEMV (#2074): <c>y[c, row] = sum_k W[row, k] * x[c, k]</c> for <paramref name="cols"/> (1..<see cref="Q2_0GemvMaxCols"/>)
+    /// F32 activation rows, F32 out, F32 accumulate; the weight is read in place (18 B per 64 elements), one warp per output row.
+    /// <paramref name="k"/> must be a multiple of 64.
+    /// </summary>
+    public void LaunchQ2_0GemvF32(nint quantWeight, nint xF32, nint yF32, int n, int k, int cols, nint stream)
+    {
+        if ((k % 64) != 0) throw new ArgumentException($"Q2_0 k must be a multiple of 64, got {k}", nameof(k));
+        if (cols < 1 || cols > Q2_0GemvMaxCols) throw new ArgumentOutOfRangeException(nameof(cols), cols, "1..8 columns");
+        nint wArg = quantWeight, xArg = xF32, yArg = yF32;
+        int nArg = n, kArg = k, cArg = cols;
+        void** args = stackalloc void*[] { &wArg, &xArg, &yArg, &nArg, &kArg, &cArg };
+        uint grid = (uint)Math.Max(1, (n + 7) / 8);   // 8 warps (one row each) per 256-thread block
+        CudaDriverApi.cuLaunchKernel(_q2_0GemvF32IoFunc, grid, 1, 1, 256, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>
@@ -7913,6 +7939,19 @@ public sealed unsafe partial class CudaKernels : IDisposable
                 return;
             }
 
+            case QuantizationType.Q2_0:
+            {
+                // #2074: upstream ggml Q2_0, 64 elements per block, 4 blocks per 256-thread CUDA block.
+                int totalBlocks = totalElements / 64;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                uint gridDim = (uint)Math.Max(1, Math.Min((totalBlocks + 3) / 4, MaxDequantGridSize));
+                CudaDriverApi.cuLaunchKernel(_dequantQ2_0Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
             case QuantizationType.Q4_0:
             {
                 int totalBlocks = totalElements / 32;
@@ -8998,6 +9037,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         _dequantI2sModule.Dispose();
         _pq2_0GemvModule.Dispose();
         _dequantPQ2_0Module.Dispose();
+        _q2_0GemvModule.Dispose();
         _pq2_0RepackModule.Dispose();
         _relu2Module.Dispose();
         _relu2F32Module.Dispose();

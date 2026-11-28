@@ -1,0 +1,26 @@
+#version 450
+// DSpark helper (issue #2046): strided BF16 row copy dst[dstOff + r * dstStride + c] = src[srcOff + r * srcStride + c], c < W, r < rows.
+// Used for the target taps (a layer-input row into its tap slot) and the drafter's mask rows. BF16 words are copied verbatim (no arithmetic).
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufS { uint16_t src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufD { uint16_t dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint W;
+    uint rows;
+    uint srcOff;
+    uint srcStride;
+    uint dstOff;
+    uint dstStride;
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    uint r = gl_WorkGroupID.y;
+    if (c >= pc.W || r >= pc.rows) return;
+    dst[pc.dstOff + r * pc.dstStride + c] = src[pc.srcOff + r * pc.srcStride + c];
+}

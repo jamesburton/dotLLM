@@ -483,7 +483,8 @@ public sealed partial class TextGenerator
         // snapshot kept the head state that absorbed that prefix (issue #1088).
         var mtpGate = GateFor(pipeline.IsStochastic)?.ForContext(promptLen);
         var resumedMtp = TakeResumedMtpState();
-        bool useMtp = ShouldUseMtp(captureLogprobs) && (cachedTokenCount == 0 || resumedMtp is not null)
+        // The prefix-hit condition goes first: a context-gated drafter (IContextGatedMtp) attaches inside ShouldUseMtp, and a hit without a resumed head cannot speculate anyway.
+        bool useMtp = (cachedTokenCount == 0 || resumedMtp is not null) && ShouldUseMtp(captureLogprobs, (int)Math.Min((long)promptLen + maxTokens, int.MaxValue))
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
         if (useMtp)
@@ -1113,7 +1114,8 @@ public sealed partial class TextGenerator
         // Hybrid mode: same gating as the non-streaming path, MTP on a prefix hit included (issue #1088).
         var mtpGate = GateFor(pipeline.IsStochastic)?.ForContext(promptLen);
         var resumedMtp = TakeResumedMtpState();
-        bool useMtp = ShouldUseMtp(captureLogprobs) && (cachedTokenCount == 0 || resumedMtp is not null)
+        // The prefix-hit condition goes first: a context-gated drafter (IContextGatedMtp) attaches inside ShouldUseMtp, and a hit without a resumed head cannot speculate anyway.
+        bool useMtp = (cachedTokenCount == 0 || resumedMtp is not null) && ShouldUseMtp(captureLogprobs, (int)Math.Min((long)promptLen + maxTokens, int.MaxValue))
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
         if (useMtp)
@@ -2505,9 +2507,10 @@ public sealed partial class TextGenerator
 
     // Sampled requests speculate too (#900): the decoder does exact speculative sampling against the prepared distribution. Logprob capture still
     // opts out (no per-position logits to read back).
-    private bool ShouldUseMtp(bool captureLogprobs)
-        => _mtpEnabled && _draftModel is null && _model.SupportsMtp && !captureLogprobs
-           && _requestImages is null;   // the image prefill carries no MTP state (IImageInputModel.ForwardWithImages), so MTP would draft from a stale head
+    private bool ShouldUseMtp(bool captureLogprobs, int contextTokens)
+        => _mtpEnabled && _draftModel is null && !captureLogprobs
+           && _requestImages is null   // the image prefill carries no MTP state (IImageInputModel.ForwardWithImages), so MTP would draft from a stale head
+           && (_model is IContextGatedMtp gated ? gated.PrepareMtpFor(contextTokens) : _model.SupportsMtp);   // last: a context-gated drafter (Vulkan DSpark) attaches here, above its threshold only
 
     /// <summary>
     /// Expands the chat template's image placeholders (issue #2035): each of <see cref="InferenceOptions.Images"/> consumes one occurrence of

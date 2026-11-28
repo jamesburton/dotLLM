@@ -1,0 +1,6 @@
+#version 450
+// Hand-written wrapper (issue #2046): olala_gemv_q8_0 with the output stored as F16 bits (the DSpark drafter's F16 logits arm). BF16 activations.
+#extension GL_GOOGLE_include_directive : require
+#define WT_Q8_0 1
+#define OUT_F16 1
+#include "olala_gemv.glsl"

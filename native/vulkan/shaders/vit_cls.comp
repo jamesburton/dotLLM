@@ -1,0 +1,14 @@
+#version 450
+// Inkling 2 vision tower (issue #2062, part B): the CLS row, x[0, :] = bf16(class_embd + class_position_embd) (both F32 in the GGUF).
+#extension GL_GOOGLE_include_directive : require
+#include "olala_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer BufC { float cls[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BufP { float clsPos[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufX { ACT_T xout[]; };
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c < 1024u) xout[c] = fToAct(cls[c] + clsPos[c]);
+}

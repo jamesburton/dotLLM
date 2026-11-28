@@ -3073,6 +3073,19 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
                     (_kernels.MatMulQ4_0Gemm ?? throw new InvalidOperationException("Q4_0 weights are device-resident but the Q4_0 GEMM kernel was not created."))
                         .Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
+            case QuantizationType.Q2_0:
+                // #2074: upstream ggml Q2_0 (18 B per 64 weights; kept packed by VulkanQwen3MoeHybridWeights.KeepQ2_0). F32-in GEMV for decode, the 128x128x4
+                // coopmat GEMM for prefill where the device has it, else the tiled F32 GEMM. Weights are read packed; nothing is widened.
+                if (_kernels.MatMulQ2_0Gemv is null || _kernels.MatMulQ2_0Gemm is null)
+                    throw new InvalidOperationException("Q2_0 weights are device-resident but the Q2_0 kernels were not created.");
+                LegacyQuantDispatchCount++;
+                if (seqLen == 1)
+                    _kernels.MatMulQ2_0Gemv.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ2_0GemmCoopmat is not null)
+                    _kernels.MatMulQ2_0GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                else
+                    _kernels.MatMulQ2_0Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
             case QuantizationType.Q4_1:
                 if (_kernels.MatMulQ4_1Gemv is null || _kernels.MatMulQ4_1Gemm is null)
                     throw new InvalidOperationException("Q4_1 weights are device-resident but the Q4_1 kernels were not created.");

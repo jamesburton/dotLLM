@@ -138,7 +138,7 @@ public class QuantFormatTests
         {
             ("q8_0", QuantFormat.Q8_0BlockBytes), ("q8_1", QuantFormat.Q8_1BlockBytes),
             ("q5_0", QuantFormat.Q5_0BlockBytes), ("q5_1", QuantFormat.Q5_1BlockBytes),
-            ("q4_0", QuantFormat.Q4_0BlockBytes), ("q4_1", QuantFormat.Q4_1BlockBytes),
+            ("q4_0", QuantFormat.Q4_0BlockBytes), ("q4_1", QuantFormat.Q4_1BlockBytes), ("q2_0", QuantFormat.Q2_0BlockBytes),
             ("iq4_nl", QuantFormat.IQ4_NLBlockBytes), ("mxfp4", QuantFormat.Mxfp4BlockBytes),
             ("iq2_xxs", QuantFormat.IQ2_XXSBlockBytes), ("iq2_xs", QuantFormat.IQ2_XSBlockBytes), ("iq1_m", QuantFormat.IQ1_MBlockBytes),
         };

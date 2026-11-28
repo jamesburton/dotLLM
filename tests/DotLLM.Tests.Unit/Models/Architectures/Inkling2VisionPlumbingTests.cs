@@ -452,6 +452,63 @@ public sealed class Inkling2VisionPlumbingTests
         Assert.Equal(1, model.MtpStatesCreated);
     }
 
+    /// <summary>An MTP model whose drafter is context-gated (<see cref="IContextGatedMtp"/>, the Vulkan Inkling 2 DSpark host, #2046): records every context it is asked about.</summary>
+    private sealed class GatedMtpStubModel(int threshold) : IModel, IImageInputModel, IContextGatedMtp
+    {
+        private readonly ImageStubModel _inner = new();
+        public readonly List<int> Asked = [];
+        public int MtpStatesCreated;
+        public ModelConfig Config => _inner.Config;
+        public long ComputeMemoryBytes => 0;
+        public bool SupportsMtp => true;   // true on purpose: an engine that bypasses PrepareMtpFor and reads SupportsMtp speculates below the threshold
+        public bool PrepareMtpFor(int contextTokens) { Asked.Add(contextTokens); return contextTokens >= threshold; }
+        public IMtpState? CreateMtpState() { MtpStatesCreated++; return new StubMtpState(); }
+        public IMtpState? CreateMtpState(int maxSequenceLength) => CreateMtpState();
+        public unsafe ITensor ForwardMtp(IMtpState state, int tokenId, int position)
+        {
+            var t = UnmanagedTensor.Allocate(new TensorShape(1, ImageStubModel.Vocab), DType.Float32, -1);
+            float* p = (float*)t.DataPointer;
+            for (int i = 0; i < ImageStubModel.Vocab; i++) p[i] = i == 5 ? 10f : -10f;   // drafts the token the trunk predicts
+            return t;
+        }
+        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d) => throw new NotSupportedException();
+        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv) => _inner.Forward(t, p, d, kv);
+        public ITensor ForwardWithImages(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IReadOnlyList<ImageSpan> images, IKvCache? kv, bool last)
+            => _inner.ForwardWithImages(t, p, d, images, kv, last);
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// Review of #2067 (context-threshold attach, #2046): <c>TextGenerator</c> asks a context-gated model per request with prompt tokens + max tokens, speculates only when
+    /// it says yes, and never asks for an image request (which cannot speculate, so it must not attach a drafter). The threshold sits strictly between the prompt and
+    /// prompt + max tokens, so passing the prompt length alone fails the at-threshold arm.
+    /// Kills: reading <c>SupportsMtp</c> instead of <c>PrepareMtpFor</c> (the below arm opens a state); passing the prompt length only (the at arm opens none);
+    /// asking before the image check (the image arm records a call).
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ContextGatedMtp_IsAskedWithPromptPlusMaxTokens_AndOnlyForTextRequests(bool atThreshold)
+    {
+        const int maxTokens = 4;
+        int promptLen = new TextGenerator(new ImageStubModel(), new WordTokenizer(), kvCacheFactory: (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg, false), size))
+            .Generate("3 4 6", new InferenceOptions { MaxTokens = 1, Temperature = 0 }).PromptTokenCount;
+        int threshold = promptLen + maxTokens + (atThreshold ? 0 : 1);
+        Assert.True(threshold > promptLen);
+        var model = new GatedMtpStubModel(threshold);
+        var gen = new TextGenerator(model, new WordTokenizer(), kvCacheFactory: (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg, false), size),
+            mtpEnabled: true);
+
+        using var emb = new ImageEmbeddings(2, 1, 8, "img");
+        gen.Generate("3 9 4", new InferenceOptions { MaxTokens = maxTokens, Temperature = 0, Images = [emb], ImagePlaceholderTokenId = 9 });
+        Assert.Empty(model.Asked);
+        Assert.Equal(0, model.MtpStatesCreated);
+
+        gen.Generate("3 4 6", new InferenceOptions { MaxTokens = maxTokens, Temperature = 0 });
+        Assert.Equal([promptLen + maxTokens], model.Asked);
+        Assert.Equal(atThreshold ? 1 : 0, model.MtpStatesCreated);
+    }
+
     private sealed class StubAdapter : DotLLM.Core.Lora.ILoraAdapter
     {
         public string Name => "stub";

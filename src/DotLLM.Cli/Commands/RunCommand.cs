@@ -376,7 +376,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [CommandOption("--dspark")]
         [Description("Path of the Inkling 2 DSpark drafter GGUF (dspark-Inkling-2-Mini-Q8_0.gguf, unsloth/Inkling-2-Mini-GGUF). It takes the MTP slot: drafts are verified by the " +
                      "MTP speculative decoder behind the adaptive gate, greedy output is identical to plain decode. Default: a dspark-*.gguf beside the model is auto-attached " +
-                     "(an environment switch opts it out, see the environment table); an explicit path that cannot be attached stops the run, an auto-detected one is logged and ignored. inkling2 models on the CPU.")]
+                     "(an environment switch opts it out, see the environment table); an explicit path that cannot be attached stops the run, an auto-detected one is logged and ignored. inkling2 models on the CPU and on Vulkan (on Vulkan an auto-detected drafter attaches lazily above `DOTLLM_DSPARK_MIN_CONTEXT` tokens; an explicit path is always on).")]
         public string? DSpark { get; set; }
 
         /// <summary>DFlash / DFlash2 block-diffusion drafter GGUF (issue #1175).</summary>
@@ -602,10 +602,15 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     throw new NotSupportedException($"--dflash: {model.GetType().Name} cannot drive a DFlash drafter (qwen35 targets on CPU, CUDA or Vulkan only for now).");
                 dflashTarget.AttachDFlashDrafter(settings.DFlash);
             }
-            else if (!settings.NoMtp && (settings.DSpark is not null || model is DotLLM.Models.Architectures.Inkling2TransformerModel))
+            else if (!settings.NoMtp && (settings.DSpark is not null || model is DotLLM.Models.Architectures.DSpark.IInkling2DSparkHost))
             {
                 // Inkling 2 DSpark drafter (#2039): explicit --dspark is fatal on failure, an auto-detected sibling is logged and ignored.
-                try { mtpHeadPath = DotLLM.Models.Architectures.DSpark.Inkling2DSparkResolver.TryAttach(model, resolvedPath, settings.DSpark); }
+                try
+                {
+                    mtpHeadPath = DotLLM.Models.Architectures.DSpark.Inkling2DSparkResolver.TryAttach(model, resolvedPath, settings.DSpark);
+                    if (mtpHeadPath is not null && model is DotLLM.Models.Architectures.DSpark.IInkling2DSparkHost { DeferredDrafter: { } deferred })
+                        Console.Error.WriteLine($"[dspark] drafter {Path.GetFileName(mtpHeadPath)} found; it attaches only when prompt + max tokens reach {(deferred.MinContext == int.MaxValue ? "never (opt-in with --dspark)" : deferred.MinContext + " tokens")} (DOTLLM_DSPARK_MIN_CONTEXT).");
+                }
                 catch (Exception ex) when (settings.DSpark is null)
                 {
                     Console.Error.WriteLine($"WARNING: DSpark drafter not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");
@@ -804,7 +809,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     throw new FileNotFoundException("--image: no vision projector found; pass --mmproj <mmproj-*.gguf> (or place it next to the model).");
                 var parts = new List<ChatContentPart>();
                 imageEmbeddings = new List<DotLLM.Core.Vision.ImageEmbeddings>();
-                using (var encoder = DotLLM.Models.Vision.VisionSupport.LoadEncoder(mmproj, threadingInfo, imageLimits.OverLimit))
+                using (var encoder = DotLLM.Models.Vision.VisionSupport.LoadEncoderFor(model, mmproj, threadingInfo, imageLimits.OverLimit))
                 {
                     foreach (string path in settings.Images)
                     {

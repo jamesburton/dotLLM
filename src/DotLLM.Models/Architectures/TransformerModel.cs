@@ -4558,6 +4558,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
             MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.TERN_B64_F16)
             TernB64F16.GemvQ8((byte*)weights, x, y, m, k, _threadPool);   // overlay ternary (#1706): packed blocks, int8 activations
+        else if (qt == QuantizationType.Q2_0)
+            MatMul.GemvQ2_0((byte*)weights, x, y, m, k, _threadPool);   // upstream ggml Q2_0 x Q8_0, packed (#2074)
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemvPQ2_0((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.PTQ1_0)
@@ -4624,6 +4626,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel, DotLLM.Co
             MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.TERN_B64_F16)
             TernB64F16.GemmQ8((byte*)weights, b, c, m, k, n, _threadPool);   // overlay ternary (#1706)
+        else if (qt == QuantizationType.Q2_0)
+            MatMul.GemmQ2_0((byte*)weights, b, c, m, k, n, _threadPool);   // (#2074)
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.PTQ1_0)

@@ -250,6 +250,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQ4_0MmvqKernel? MatMulQ4_1Mmvq { get; private set; }
     /// <summary>Dense Q4_1 128x128x4 coopmat prefill GEMM (#921); null without cooperative matrices / wave64.</summary>
     public MatMulQ4_0GemmCoopmatKernel? MatMulQ4_1GemmCoopmat { get; private set; }
+    // #2074: upstream ggml Q2_0 (18 B per 64 elements; the Q4_0 kernel classes' Q2_0 variants): F32-in GEMV, tiled GEMM, 128x128x4 coopmat GEMM.
+    /// <summary>Dense Q2_0 F32-in decode GEMV (#2074).</summary>
+    public MatMulQ4_0GemvF32Kernel? MatMulQ2_0Gemv { get; private set; }
+    /// <summary>Dense Q2_0 tiled F32-in prefill GEMM (#2074).</summary>
+    public MatMulQ4_0GemmF32Kernel? MatMulQ2_0Gemm { get; private set; }
+    /// <summary>Dense Q2_0 128x128x4 coopmat prefill GEMM (#2074); null without cooperative matrices / wave64.</summary>
+    public MatMulQ4_0GemmCoopmatKernel? MatMulQ2_0GemmCoopmat { get; private set; }
     /// <summary>Dense Q5_0 F32-in decode GEMV (#921).</summary>
     public MatMulQ5_0GemvF32Kernel? MatMulQ5_0Gemv { get; private set; }
     /// <summary>Dense Q5_0 tiled F32-in prefill GEMM (#921).</summary>
@@ -1044,6 +1051,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             if (MatMulQ4_0GemmCoopmatKernel.IsSupportedOn(device, spvDir, QuantizationType.Q4_1))
                 kernels.MatMulQ4_1GemmCoopmat = MatMulQ4_0GemmCoopmatKernel.Create(device, spvDir, QuantizationType.Q4_1);
         }
+        if (File.Exists(Path.Combine(spvDir, "matmul_q2_0_f32_gemv.spv")) && File.Exists(Path.Combine(spvDir, "matmul_q2_0_f32_gemm.spv")))
+        {
+            kernels.MatMulQ2_0Gemv = MatMulQ4_0GemvF32Kernel.Create(device, spvDir, QuantizationType.Q2_0);
+            kernels.MatMulQ2_0Gemm = MatMulQ4_0GemmF32Kernel.Create(device, spvDir, QuantizationType.Q2_0);
+            if (MatMulQ4_0GemmCoopmatKernel.IsSupportedOn(device, spvDir, QuantizationType.Q2_0))
+                kernels.MatMulQ2_0GemmCoopmat = MatMulQ4_0GemmCoopmatKernel.Create(device, spvDir, QuantizationType.Q2_0);
+        }
         if (File.Exists(Path.Combine(spvDir, "matmul_q5_0_f32_gemv.spv")) && File.Exists(Path.Combine(spvDir, "matmul_q5_0_f32_gemm.spv")))
         {
             kernels.MatMulQ5_0Gemv = MatMulQ5_0GemvF32Kernel.Create(device, spvDir);
@@ -1202,6 +1216,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ4_0GemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ4_0Gemm?.InvalidateDescriptorCache();
         MatMulQ4_0Gemv?.InvalidateDescriptorCache();
+        MatMulQ2_0Gemv?.InvalidateDescriptorCache(); MatMulQ2_0Gemm?.InvalidateDescriptorCache(); MatMulQ2_0GemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ4_1Gemv?.InvalidateDescriptorCache(); MatMulQ4_1Gemm?.InvalidateDescriptorCache(); MatMulQ4_1Mmvq?.InvalidateDescriptorCache(); MatMulQ4_1GemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ5_0Gemv?.InvalidateDescriptorCache(); MatMulQ5_0Gemm?.InvalidateDescriptorCache(); MatMulQ5_0GemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ5_1Gemv?.InvalidateDescriptorCache(); MatMulQ5_1Gemm?.InvalidateDescriptorCache();
@@ -1217,6 +1232,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         YarnRope?.Dispose();
         MatMulQ4_0Gemm?.Dispose();
         MatMulQ4_0Gemv?.Dispose();
+        MatMulQ2_0Gemv?.Dispose(); MatMulQ2_0Gemm?.Dispose(); MatMulQ2_0GemmCoopmat?.Dispose();
         MatMulQ4_1Gemv?.Dispose(); MatMulQ4_1Gemm?.Dispose(); MatMulQ4_1Mmvq?.Dispose(); MatMulQ4_1GemmCoopmat?.Dispose();
         MatMulQ5_0Gemv?.Dispose(); MatMulQ5_0Gemm?.Dispose(); MatMulQ5_0GemmCoopmat?.Dispose();
         MatMulQ5_1Gemv?.Dispose(); MatMulQ5_1Gemm?.Dispose();
