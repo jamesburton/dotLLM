@@ -17,6 +17,21 @@
 #define ACT_T float
 float actToF(float v) { return v; }
 float fToAct(float v) { return v; }
+#elif defined(ACT_F16)
+// F16-activation-storage MEASUREMENT arm (Inkling 2 activation-precision study, epic #2025): IEEE half, round to nearest even, overflow -> +-inf (NOT saturated), so a
+// run that overflows is visible. Never selected by default; Olala must not use it (its activations reach 1e9..1e14).
+#define ACT_T uint16_t
+float actToF(uint16_t v) { return unpackHalf2x16(uint(v)).x; }
+uint16_t fToAct(float f) {
+    uint b = floatBitsToUint(f);
+    uint sg = (b >> 16) & 0x8000u;
+    uint a = b & 0x7fffffffu;
+    if (a > 0x7f800000u) return uint16_t(sg | 0x7e00u);                  // NaN
+    if (a >= 0x477ff000u) return uint16_t(sg | 0x7c00u);                 // >= 65520 rounds to inf (also +-inf)
+    if (a < 0x38800000u) return uint16_t(sg | uint(roundEven(abs(f) * 16777216.0)));   // subnormal half: k * 2^-24; a carry into 0x400 is the smallest normal
+    uint r = a + 0xfffu + ((a >> 13u) & 1u);
+    return uint16_t(sg | ((r - 0x38000000u) >> 13u));
+}
 #else
 #define ACT_T uint16_t
 float actToF(uint16_t v) { return uintBitsToFloat(uint(v) << 16); }
@@ -32,6 +47,14 @@ uint16_t fToAct(float f) {
 float bf16ToF(uint16_t v) { return uintBitsToFloat(uint(v) << 16); }
 float bf16Lo(uint w) { return uintBitsToFloat(w << 16); }
 float bf16Hi(uint w) { return uintBitsToFloat(w & 0xFFFF0000u); }
+// Two packed activations of a 32-bit word (low / high half): the vectorised x loads of the GEMV / MoE kernels.
+#ifdef ACT_F16
+float actWordLo(uint w) { return unpackHalf2x16(w).x; }
+float actWordHi(uint w) { return unpackHalf2x16(w).y; }
+#else
+#define actWordLo bf16Lo   // the very functions of the BF16 weight decode: the BF16 arm's SPIR-V stays byte-identical
+#define actWordHi bf16Hi
+#endif
 // Round to nearest even BF16 bits (KV cache is always BF16, in both activation arms).
 uint16_t fToBf16(float f) {
     uint b = floatBitsToUint(f);

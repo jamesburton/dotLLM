@@ -35,12 +35,12 @@ void xLoad8(uint col, uint k0, out vec4 a, out vec4 b) { uint i = (gXRow * pc.K 
 float xAt(uint col, uint k) {
     uint i = gXRow * pc.K + k;
     uint w = xin4[i >> 3u][(i >> 1u) & 3u];
-    return ((i & 1u) == 0u) ? bf16Lo(w) : bf16Hi(w);
+    return ((i & 1u) == 0u) ? actWordLo(w) : actWordHi(w);
 }
 void xLoad8(uint col, uint k0, out vec4 a, out vec4 b) {
     uvec4 u = xin4[(gXRow * pc.K + k0) >> 3u];
-    a = vec4(bf16Lo(u.x), bf16Hi(u.x), bf16Lo(u.y), bf16Hi(u.y));
-    b = vec4(bf16Lo(u.z), bf16Hi(u.z), bf16Lo(u.w), bf16Hi(u.w));
+    a = vec4(actWordLo(u.x), actWordHi(u.x), actWordLo(u.y), actWordHi(u.y));
+    b = vec4(actWordLo(u.z), actWordHi(u.z), actWordLo(u.w), actWordHi(u.w));
 }
 #endif
 #define X_LOAD8 1
