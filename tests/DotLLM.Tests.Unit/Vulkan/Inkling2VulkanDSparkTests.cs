@@ -525,7 +525,8 @@ public sealed class Inkling2VulkanDSparkTests : IClassFixture<VkInklingFixture>
                 Assert.Empty(bad);
             }
             Assert.True(f16.Mine.Count == n);
-            Assert.True((double)same / n > 0.99, $"F16 drafts agree with F32 on {(double)same / n:P2} of the tokens");
+            // Exact: the F16 arm measured 594/594. A BF16-truncated base logit (the mutant of the #2067 review) gives 589/594, which a ">0.99" bound let through.
+            Assert.True(same == n, $"F16 drafts differ from F32 on {n - same} of {n} tokens ({roundsSame}/{f32.Rounds} rounds identical)");
         }
         finally { m.SetDraftLogitsF16(was); }
     }
@@ -574,6 +575,9 @@ public sealed class Inkling2VulkanDSparkTests : IClassFixture<VkInklingFixture>
                     for (int j = 0; j < V; j += 7) { double e = Math.Abs(a[j] - b[j]); maxErr = Math.Max(maxErr, e); sumErr += e; cnt++; }
                 }
             _out.WriteLine($"probes: {rows} rows, argmax agreement {agree}/{rows}, max |F16 - F32| over sampled columns {maxErr:E2}, mean {sumErr / cnt:E2}; disagreements with an F32 margin < 0.05: {close}");
+            // F16 storage error is at most one F16 step at |x| 16-32 (0.0156) per rounding: measured max 2.6e-2. A BF16-truncated base logit measured max 7.2 and mean 2.4e-2 (4x the F16 mean).
+            Assert.True(maxErr < 0.05, $"max |F16 - F32| {maxErr:E2} over the sampled columns");
+            Assert.True(sumErr / cnt < 0.01, $"mean |F16 - F32| {sumErr / cnt:E2}");
             Assert.True((double)agree / rows > 0.99, $"argmax agreement {agree}/{rows}");
         }
         finally { m.SetDraftLogitsF16(was); }
