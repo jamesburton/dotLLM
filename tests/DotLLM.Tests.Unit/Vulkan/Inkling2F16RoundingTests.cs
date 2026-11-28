@@ -108,10 +108,11 @@ public sealed class Inkling2F16RoundingTests : IDisposable
             }
         }
         _output.WriteLine($"{bits.Length} inputs ({ties} exact RNE ties, {sub} subnormal-range, {over} overflow-range, {nan} NaN): {badStore} store mismatches, {badDecode} decode mismatches. {first}");
-        Assert.True(ties > 100_000, $"the fixture holds only {ties} exact ties");
-        Assert.True(sub > 10_000 && over > 100 && nan > 10, "the fixture misses a class (subnormal / overflow / NaN)");
         Assert.True(badStore == 0, $"{badStore} F16 stores differ from .NET Half; first: {first}");
         Assert.Equal(0, badDecode);
+        // the fixture must contain every class it claims to cover (checked after the comparison so a mutant dies on the mismatch, not on the census)
+        Assert.True(ties > 60_000, $"the fixture holds only {ties} exact ties");   // 31,743 ties per sign between adjacent finite halves, plus the 65,520 overflow tie
+        Assert.True(sub > 10_000 && over > 100 && nan > 10, "the fixture misses a class (subnormal / overflow / NaN)");
     }
 
     /// <summary>The BF16 twin (the shipped default) against its definition, so the probe harness itself is shown to be sensitive in both directions.</summary>

@@ -137,9 +137,11 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
     {
         _device = device; _gguf = gguf; _spvDir = spvDir; _ownsGguf = ownsGguf; _overLimit = overLimit; _embedPrecision = embedPrecision;
         _spvOverride = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_SPV_OVERRIDE");
+        // DOTLLM_VISION_ACT=f16|bf16|f32: ViT activation storage format (default f16 since #2075; bf16 = the previous default; f32 = measurement arm).
         string? actEnv = Environment.GetEnvironmentVariable("DOTLLM_VISION_ACT");
         if (!string.IsNullOrEmpty(actEnv))
             _act = actEnv.ToLowerInvariant() switch { "bf16" => Inkling2ActFormat.Bf16, "f16" => Inkling2ActFormat.F16, "f32" => Inkling2ActFormat.F32, _ => throw new ArgumentException($"DOTLLM_VISION_ACT='{actEnv}': expected bf16, f16 or f32.") };
+        // DOTLLM_VISION_ROPE_F32=1: measurement arm, RoPE cos/sin table in F32 instead of F16 (the F16 table is not part of the BF16 gap, docs/INKLING2.md 12c).
         _ropeF32 = Environment.GetEnvironmentVariable("DOTLLM_VISION_ROPE_F32") == "1";
         var md = gguf.Metadata;
         _nLayer = (int)md.GetUInt32("clip.vision.block_count");

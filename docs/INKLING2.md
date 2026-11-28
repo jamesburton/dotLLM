@@ -474,7 +474,7 @@ grid into native memory (`RopeTable_IsBuiltOncePerGrid`), not as a managed array
 
 **Staged conversion (rule 3).** The one-time BF16 (or F16) conversion of `patch_embd` / `position_embd` (4.55 MB) reads the mapped F32 tensor on the host, converts into a transient native buffer and uploads it through the
 staging buffer: a host bounce (read, convert, copy) of 4.55 MB at load. It is not the direct route (no DirectStorage / zero-copy import of the F32 pages can produce a converted tensor); the F32 arm takes the normal weight-import route (zero-copy or DirectStorage where the policy allows)
-(9.11 MB resident). Awaiting the user's ruling on this note.
+(9.11 MB resident). **Signed off by the user, 2026-11-28** (CLAUDE.md rule 3: the 4.55 MB host-staged BF16/F16 conversion of `patch_embd` / `position_embd` is accepted as a bounded one-time load cost; ruling given with the F16-activation decision, #2075).
 
 ## 12c. Activation storage precision study for image prompts (epic #2025; measurement arms, opt-in, no default change)
 

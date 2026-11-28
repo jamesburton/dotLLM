@@ -86,6 +86,7 @@ public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2K
                 "f32" => o with { ActivationF32 = true },
                 _ => throw new ArgumentException($"DOTLLM_INKLING2_ACT='{act}': expected f16, bf16 or f32."),
             };
+        // DOTLLM_INKLING2_ACT_F32_IMAGE_CHUNKS=1: prefill chunks that carry image rows run on an F32 scratch set (+49.6 MB at chunk 128, allocated on the first such chunk); text chunks and decode keep the base format.
         if (Environment.GetEnvironmentVariable("DOTLLM_INKLING2_ACT_F32_IMAGE_CHUNKS") == "1") o = o with { F32ImageChunks = true };
         return o;
     }
