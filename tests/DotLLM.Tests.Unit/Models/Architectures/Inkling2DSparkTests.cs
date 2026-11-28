@@ -264,10 +264,9 @@ public sealed class Inkling2DSparkTests : IClassFixture<DSparkFixture>
         for (int i = 0; i < k; i++)
         {
             var row = st.DraftLogits(p + i).ToArray();
-            var idx = Enumerable.Range(0, row.Length).ToArray();
-            Array.Sort(row.AsSpan().ToArray(), idx);   // ascending by logit, idx follows
-            var top = idx.TakeLast(16).Reverse().ToArray();
-            foreach (int t in top) { sig.Add(st.DraftLogits(p + i)[t]); sig.Add(t); }
+            // top 16 by (logit desc, id asc): a stable order, so exact ties (a softcap-saturated 30.0) cannot reorder the fingerprint between two runs
+            var top = Enumerable.Range(0, row.Length).OrderByDescending(t => row[t]).ThenBy(t => t).Take(16);
+            foreach (int t in top) { sig.Add(row[t]); sig.Add(t); }
         }
         return sig.ToArray();
     }
@@ -439,5 +438,74 @@ public sealed class Inkling2DSparkTests : IClassFixture<DSparkFixture>
         long per = (GC.GetTotalAllocatedBytes(precise: true) - a0) / n;
         _out.WriteLine($"managed allocation per draft (K=7): {per} B");
         Assert.True(per < 16 * 1024, $"a draft allocated {per} managed bytes");
+    }
+
+    // ----- #2060: windowed context K/V -----
+
+    private (int[][] Drafts, float[][] Sig, long KvBytes) ProbeRing(Inkling2TransformerModel m, int[] tokens, int firstProbe, int stride, int k, int chunk, int ring)
+    {
+        m.ResetSequenceState();
+        using var st = m.CreateDSparkState(ring);
+        var drafts = new List<int[]>(); var sigs = new List<float[]>();
+        int p = 0;
+        while (p < tokens.Length)
+        {
+            int next = p < firstProbe ? Math.Min(chunk, firstProbe - p) : 1;
+            using (m.Forward(tokens[p..(p + next)], Enumerable.Range(p, next).ToArray(), -1, null, null, st, true)) { }
+            p += next;
+            if (p >= firstProbe && (p - firstProbe) % stride == 0 && p < tokens.Length)
+            {
+                var d = new int[k];
+                for (int i = 0; i < k; i++) d[i] = st.NextDraft(m, tokens[p], p + i, k);
+                drafts.Add(d); sigs.Add(Signature(st, p, k));
+            }
+        }
+        return (drafts.ToArray(), sigs.ToArray(), st.KvBytes);
+    }
+
+    /// <summary>
+    /// #2060: the windowed ring (window + chunk slack) reproduces the unbounded-ring drafts exactly at 1300 and 4000 tokens of context, resident K/V per position drops from
+    /// 12 KiB to 4 KiB (+ a fixed ring), and a ring one row below the 1024-key window changes the drafts (the mutant).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1330, 1300)]
+    [InlineData(4030, 4000)]
+    public void WindowedRing_DraftsEqualUnbounded_AndAShortRingChangesThem(int length, int first)
+    {
+        var m = Model();
+        var rng = new Random(2060);
+        int[] tokens = Enumerable.Range(0, length).Select(_ => rng.Next(1000, 120000)).ToArray();
+        const int k = 3;
+        var (_, sRing, bytesRing) = ProbeRing(m, tokens, first, 10, k, 64, 0);
+        var (_, sBig, bytesBig) = ProbeRing(m, tokens, first, 10, k, 64, 8192);
+        double eq = MaxDiff(sRing, sBig);
+        _out.WriteLine($"ring {m.DSparkDrafter!.Window + Inkling2DSparkDrafter.InjectChunkRows} vs unbounded 8192 at ~{first} tokens: max |draft logit diff| {eq:E2}; resident K/V {bytesRing / 1024} KiB (ring) vs {bytesBig / 1024} KiB (8192-position rings); " +
+                       $"the old unbounded layout held {length * 12L} KiB at this length");
+        Assert.True(eq == 0, "the windowed ring must reproduce the unbounded drafts exactly");
+        var (_, sShort, _) = ProbeRing(m, tokens, first, 10, k, 64, 1023);
+        double shortDiff = MaxDiff(sBig, sShort);
+        _out.WriteLine($"ring 1023 (one row below the 1024-key window): max |draft logit diff| {shortDiff:E2}");
+        Assert.True(shortDiff > 0, "a ring one row too short must change the drafts");
+    }
+
+    /// <summary>The global layer's growth is admitted against free memory: when it is refused the state turns unusable, logs, drafts the anchor repeated and never throws.</summary>
+    [SkippableFact]
+    public void GlobalLayerGrowth_IsAdmitted_AndRefusalDegradesWithoutThrowing()
+    {
+        var m = Model();
+        var seq = ShortSequence(m);
+        m.ResetSequenceState();
+        using var st = m.CreateDSparkState();
+        Inkling2DSparkState.AdmissionOverride = _ => false;
+        try
+        {
+            using (m.Forward(seq, Enumerable.Range(0, seq.Length).ToArray(), -1, null, null, st, true)) { }
+            Assert.True(st.Unusable);
+            Assert.Equal(1234, st.NextDraft(m, 1234, seq.Length, 3));   // the anchor repeated
+            st.Rollback(seq.Length);   // the decoder rolls back to every round's anchor
+            using (var row = m.ForwardMtp(st, 1234, seq.Length))   // the constrained-draft path: a defined row, argmax = the anchor
+                unsafe { Assert.Equal(1234, System.Numerics.Tensors.TensorPrimitives.IndexOfMax(new ReadOnlySpan<float>((void*)row.DataPointer, m.Config.VocabSize))); }
+        }
+        finally { Inkling2DSparkState.AdmissionOverride = null; }
     }
 }
