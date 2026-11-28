@@ -64,4 +64,44 @@ public sealed class Inkling2DSparkResolverTests : IDisposable
         public DotLLM.Core.Tensors.ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, DotLLM.Core.Attention.IKvCache? kv) => throw new NotSupportedException();
         public void Dispose() { }
     }
+
+    /// <summary>
+    /// #2046: the resolver, the CLI and the server key on <see cref="IInkling2DSparkHost"/>, not on the CPU model class, so the Vulkan Inkling 2 model (or any backend implementing the
+    /// marker) takes an auto-detected sibling and an explicit path. Kills: a resolver that type-checks <c>Inkling2TransformerModel</c> (the Vulkan model was then refused or skipped).
+    /// </summary>
+    [Fact]
+    public void AnyHostImplementingTheMarker_TakesTheDrafter_AutoAndExplicit()
+    {
+        string model = Path.Combine(_dir, "Inkling-2-Mini-NVFP4.gguf");
+        File.WriteAllBytes(model, [1]);
+        string draft = Path.Combine(_dir, "dspark-x.gguf");
+        File.WriteAllBytes(draft, [1]);
+        using var auto = new FakeHost();
+        Assert.Equal(draft, Inkling2DSparkResolver.TryAttach(auto, model));
+        Assert.Equal(draft, auto.Attached);
+        using var explicitHost = new FakeHost();
+        Assert.Equal(draft, Inkling2DSparkResolver.TryAttach(explicitHost, model, draft));
+        using var already = new FakeHost { Attached = "x" };
+        Assert.Null(Inkling2DSparkResolver.TryAttach(already, model));                                               // auto: an attached drafter is left alone
+        Assert.Throws<NotSupportedException>(() => Inkling2DSparkResolver.TryAttach(already, model, draft));         // explicit: refuses
+        using var viaServer = new FakeHost();
+        DotLLM.Server.ServerStartup.TryAttachSeparateMtpHead(viaServer, model, new DotLLM.Server.ServerOptions { Model = "x", DSparkPath = draft });
+        Assert.Equal(draft, viaServer.Attached);
+    }
+
+    private sealed class FakeHost : DotLLM.Core.Models.IModel, IInkling2DSparkHost
+    {
+        public string? Attached { get; set; }
+        public bool HasDFlashDrafter => Attached is not null;
+        public void AttachDFlashDrafter(string path) => Attached = path;
+        public DotLLM.Core.Models.ModelConfig Config { get; } = new()
+        {
+            VocabSize = 8, NumLayers = 1, NumAttentionHeads = 1, NumKvHeads = 1, HiddenSize = 4, IntermediateSize = 8, HeadDim = 4, MaxSequenceLength = 16,
+            Architecture = DotLLM.Core.Configuration.Architecture.Inkling2,
+        };
+        public long ComputeMemoryBytes => 0;
+        public DotLLM.Core.Tensors.ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d) => throw new NotSupportedException();
+        public DotLLM.Core.Tensors.ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, DotLLM.Core.Attention.IKvCache? kv) => throw new NotSupportedException();
+        public void Dispose() { }
+    }
 }

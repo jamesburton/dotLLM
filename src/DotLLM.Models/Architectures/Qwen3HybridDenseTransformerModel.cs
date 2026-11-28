@@ -2617,6 +2617,9 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         // this arm is on the hot path for every layer, not an edge case.
         switch (qt)
         {
+            case QuantizationType.Q2_0:
+                MatMul.GemmQ2_0((byte*)weights, b, c, m, k, n, _threadPool);   // upstream ggml Q2_0 x Q8_0, packed (#2074)
+                return;
             case QuantizationType.PQ2_0:
                 MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
                 return;

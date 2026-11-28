@@ -47,7 +47,7 @@ public static class Inkling2DSparkResolver
     /// <exception cref="NotSupportedException">An explicit path was given for a model that cannot take it, or the file is not an Inkling 2 DSpark drafter.</exception>
     public static string? TryAttach(IModel model, string modelPath, string? explicitPath = null)
     {
-        if (model is not IDFlashDraftAttachable target || target.HasDFlashDrafter || model is not Inkling2TransformerModel)
+        if (model is not IInkling2DSparkHost target || target.HasDFlashDrafter)
         {
             if (explicitPath is not null) throw new NotSupportedException($"--dspark: {model.GetType().Name} cannot take an Inkling 2 DSpark drafter.");
             return null;
@@ -60,6 +60,11 @@ public static class Inkling2DSparkResolver
             if (path is null) return null;
         }
         else if (!File.Exists(path)) throw new FileNotFoundException("DSpark drafter GGUF not found.", path);
+        if (explicitPath is null && target.DefersAutoAttach)
+        {
+            target.DeferAutoAttach(path);   // attached per request above a context threshold; nothing is allocated now (#2046)
+            return path;
+        }
         target.AttachDFlashDrafter(path);
         return path;
     }

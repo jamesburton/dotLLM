@@ -75,6 +75,31 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q4_0_f16(
     }
 }
 
+// ── Q2_0 (upstream ggml, #2074): 18 bytes per 64 values ──────────────
+// struct block_q2_0 { half d; uint8_t qs[16]; };  element j = code (qs[j/4] >> 2*(j%4)) & 3; value = d * (code - 1).
+#define Q2_0_BLOCK_SIZE 64
+#define Q2_0_BLOCK_BYTES 18
+
+extern "C" __global__ void __launch_bounds__(256) dequant_q2_0_f16(
+    const uint8_t* __restrict__ src,
+    half* __restrict__ dst,
+    const int total_blocks)
+{
+    // 64 lanes per block: two warps cooperate on one block.
+    int lane = threadIdx.x % Q2_0_BLOCK_SIZE;
+    int groups_per_cta = blockDim.x / Q2_0_BLOCK_SIZE;
+    int start_block = blockIdx.x * groups_per_cta + threadIdx.x / Q2_0_BLOCK_SIZE;
+    int stride = gridDim.x * groups_per_cta;
+
+    for (int block_idx = start_block; block_idx < total_blocks; block_idx += stride)
+    {
+        const uint8_t* block = src + (size_t)block_idx * Q2_0_BLOCK_BYTES;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        int code = (block[2 + (lane >> 2)] >> ((lane & 3) * 2)) & 3;
+        dst[(size_t)block_idx * Q2_0_BLOCK_SIZE + lane] = __float2half(d * (float)(code - 1));
+    }
+}
+
 // ── Q5_0: 22 bytes per 32 values ────────────────────────────────────
 // struct block_q5_0 { half d; uint32_t qh; uint8_t qs[16]; };
 #define Q5_0_BLOCK_SIZE 32

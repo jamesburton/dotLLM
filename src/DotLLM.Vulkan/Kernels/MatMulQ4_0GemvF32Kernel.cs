@@ -41,13 +41,17 @@ public sealed class MatMulQ4_0GemvF32Kernel : IDisposable
     /// <see cref="QuantizationType.Q4_1"/> (20 B blocks, issue #1171: same kernel shape, value <c>d * nibble + m</c>).</summary>
     public QuantizationType Quant { get; private init; } = QuantizationType.Q4_0;
 
-    private int BlockBytes => Quant == QuantizationType.Q4_1 ? QuantFormat.Q4_1BlockBytes : QuantFormat.Q4_0BlockBytes;
+    /// <summary>Elements per block of <see cref="Quant"/>: 64 for upstream Q2_0 (#2074), 32 for the other legacy formats.</summary>
+    private int GroupSize => Quant == QuantizationType.Q2_0 ? QuantFormat.Q2_0GroupSize : Q4_0GroupSize;
+
+    private int BlockBytes => Quant switch { QuantizationType.Q4_1 => QuantFormat.Q4_1BlockBytes, QuantizationType.Q2_0 => QuantFormat.Q2_0BlockBytes, _ => QuantFormat.Q4_0BlockBytes };
 
     private static string ShaderFor(string q4_0Name, QuantizationType quant) => quant switch
     {
         QuantizationType.Q4_0 => q4_0Name,
         QuantizationType.Q4_1 => q4_0Name.Replace("q4_0", "q4_1", StringComparison.Ordinal),
-        _ => throw new ArgumentOutOfRangeException(nameof(quant), quant, "Only Q4_0 and Q4_1 are served by this kernel."),
+        QuantizationType.Q2_0 => q4_0Name.Replace("q4_0", "q2_0", StringComparison.Ordinal),   // #2074: upstream ggml Q2_0 (64-element blocks)
+        _ => throw new ArgumentOutOfRangeException(nameof(quant), quant, "Only Q4_0, Q4_1 and Q2_0 are served by this kernel."),
     };
 
     private MatMulQ4_0GemvF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
@@ -116,10 +120,10 @@ public sealed class MatMulQ4_0GemvF32Kernel : IDisposable
     {
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
-        if ((k % Q4_0GroupSize) != 0)
-            throw new ArgumentException($"k must be a multiple of {Q4_0GroupSize}, got {k}", nameof(k));
+        if ((k % GroupSize) != 0)
+            throw new ArgumentException($"k must be a multiple of {GroupSize}, got {k}", nameof(k));
 
-        int blocksPerRow = k / Q4_0GroupSize;
+        int blocksPerRow = k / GroupSize;
         long rowBytes = (long)blocksPerRow * BlockBytes;
         // 18 is not divisible by 4 — every block pair (36 bytes) is aligned, but a single
         // block crosses a uint boundary. rowUints rounds up to cover safe straddle reads.
