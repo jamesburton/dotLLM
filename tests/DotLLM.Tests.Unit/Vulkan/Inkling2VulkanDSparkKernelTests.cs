@@ -342,7 +342,7 @@ public unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
     }
 
     /// <summary>Double reference of <c>MarkovWalk</c> over the GPU's BF16 weights and BF16-rounded pre-activations; returns tokens and the softcapped logits rows.</summary>
-    private static (int[] tokens, float[][] cols) RefWalk(MarkovRef m, float[] hid, float[] frnn, int[] anchorAndNone, int n, float cap, float[][] baseLogits, bool noState = false, bool capFirst = false)
+    private (int[] tokens, float[][] cols) RefWalk(MarkovRef m, float[] hid, float[] frnn, int[] anchorAndNone, int n, float cap, float[][] baseLogits, bool noState = false, bool capFirst = false)
     {
         int H = m.H, R = m.R, V = m.V, stride = 2 * R + 2 * H;
         var pre = new float[n][];
