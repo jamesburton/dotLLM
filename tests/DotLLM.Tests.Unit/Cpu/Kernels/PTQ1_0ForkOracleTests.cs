@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Cpu.Kernels;
@@ -21,8 +22,8 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 /// <list type="bullet">
 /// <item>the fork's built <c>ggml-base.dll</c>, which exports the reference routine —
 /// <c>DOTLLM_PRISM_GGML_DIR</c>, else <c>C:\Development\prism-llama.cpp\build\bin\Release</c>;</item>
-/// <item>the GGUF itself — <c>DOTLLM_BONSAI_PTQ1_0_GGUF</c>, else the HF hub cache, else
-/// <c>~/.dotllm/{models,test-cache}/PrismML/Ternary-Bonsai-2.5-27B-GGUF/</c>.</item>
+/// <item>the GGUF itself — <c>DOTLLM_BONSAI_PTQ1_0_GGUF</c>, else <c>prism-ml/Ternary-Bonsai-2.5-27B-GGUF</c>
+/// through <see cref="TestFixtureResolver"/> (model store, legacy test-cache, HF hub cache).</item>
 /// </list>
 /// </summary>
 public sealed class PTQ1_0ForkOracleTests
@@ -182,25 +183,8 @@ public sealed class PTQ1_0ForkOracleTests
     private const string Pq2ModelPathEnvVar = "DOTLLM_BONSAI_2_PQ2_0_GGUF";
     private const string Pq2FileName = "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf";
 
-    private static string? ResolvePq2_0FixturePath()
-    {
-        string? envPath = Environment.GetEnvironmentVariable(Pq2ModelPathEnvVar);
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string hub = Path.Combine(home, ".cache", "huggingface", "hub",
-            "models--prism-ml--Ternary-Bonsai-2.5-27B-GGUF", "snapshots");
-        if (Directory.Exists(hub))
-            foreach (string snapshot in Directory.EnumerateDirectories(hub))
-            {
-                string candidate = Path.Combine(snapshot, Pq2FileName);
-                if (File.Exists(candidate))
-                    return candidate;
-            }
-
-        return null;
-    }
+    private static string? ResolvePq2_0FixturePath() => TestFixtureResolver.ResolveFile(
+        [Pq2ModelPathEnvVar, "DOTLLM_BONSAI_PQ2_0_GGUF"], "prism-ml", "Ternary-Bonsai-2.5-27B-GGUF", [Pq2FileName], extraDirectories: null).Path;
 
     private static string? ResolveGgmlDir()
     {
@@ -211,33 +195,6 @@ public sealed class PTQ1_0ForkOracleTests
         return File.Exists(Path.Combine(DefaultGgmlDir, "ggml-base.dll")) ? DefaultGgmlDir : null;
     }
 
-    internal static string? ResolveFixturePath()
-    {
-        string? envPath = Environment.GetEnvironmentVariable(ModelPathEnvVar);
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "PrismML", "Ternary-Bonsai-2.5-27B-GGUF", FileName),
-            Path.Combine(home, ".dotllm", "test-cache", "PrismML", "Ternary-Bonsai-2.5-27B-GGUF", FileName),
-        ];
-        foreach (string candidate in candidates)
-            if (File.Exists(candidate))
-                return candidate;
-
-        // The HF hub cache, where `hf download` puts it: blobs are reached through snapshots/*/.
-        string hub = Path.Combine(home, ".cache", "huggingface", "hub",
-            "models--prism-ml--Ternary-Bonsai-2.5-27B-GGUF", "snapshots");
-        if (Directory.Exists(hub))
-            foreach (string snapshot in Directory.EnumerateDirectories(hub))
-            {
-                string candidate = Path.Combine(snapshot, FileName);
-                if (File.Exists(candidate))
-                    return candidate;
-            }
-
-        return null;
-    }
+    internal static string? ResolveFixturePath() =>
+        TestFixtureResolver.ResolveFile(ModelPathEnvVar, "prism-ml", "Ternary-Bonsai-2.5-27B-GGUF", FileName).Path;
 }
