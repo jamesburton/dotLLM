@@ -115,6 +115,45 @@ public sealed class RoPERotation
             _cos.AsSpan(0, positions.Length * half), _sin.AsSpan(0, positions.Length * half), ropeType);
     }
 
+    /// <summary>
+    /// Multimodal (M-RoPE) rotation of Q and K in place, NeoX pairing: pair <c>j</c> is rotated by the angle of axis
+    /// <paramref name="axisPerPair"/>[j] (0 = t, 1 = y, 2 = x, 3 = none/0), i.e. <c>pos_axis * invFreq[j]</c>. With three equal axes it is
+    /// exactly <see cref="Apply"/>. Does not touch the row cache used by <see cref="Apply"/>.
+    /// </summary>
+    /// <param name="q">Query rows <c>[seqLen, numHeads * headDim]</c>.</param>
+    /// <param name="k">Key rows <c>[seqLen, numKvHeads * headDim]</c>.</param>
+    /// <param name="posT">Temporal logical position per row.</param>
+    /// <param name="posY">Height logical position per row.</param>
+    /// <param name="posX">Width logical position per row.</param>
+    /// <param name="axisPerPair">Axis of each of the <c>ropeDim / 2</c> pairs (<see cref="DotLLM.Core.Vision.MropePositions.AxisPerPair"/>).</param>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="numKvHeads">Key heads.</param>
+    /// <param name="headDim">Head width.</param>
+    public void ApplyMrope(Span<float> q, Span<float> k, ReadOnlySpan<int> posT, ReadOnlySpan<int> posY, ReadOnlySpan<int> posX,
+        ReadOnlySpan<byte> axisPerPair, int numHeads, int numKvHeads, int headDim)
+    {
+        int half = _invFreq.Length;
+        if (axisPerPair.Length != half) throw new ArgumentException($"axisPerPair must have {half} entries.", nameof(axisPerPair));
+        int n = posT.Length;
+        if (posY.Length != n || posX.Length != n) throw new ArgumentException("the three position axes must have the same length.");
+        var cos = new float[n * half];
+        var sin = new float[n * half];
+        for (int t = 0; t < n; t++)
+        {
+            int row = t * half;
+            for (int i = 0; i < half; i++)
+            {
+                float pos = axisPerPair[i] switch { 0 => posT[t], 1 => posY[t], 2 => posX[t], _ => 0 };
+                float angle = pos * _invFreq[i];
+                cos[row + i] = _scaled ? PortableMath.Cos(angle) * Mscale : PortableMath.Cos(angle);
+                sin[row + i] = _scaled ? PortableMath.Sin(angle) * Mscale : PortableMath.Sin(angle);
+            }
+        }
+        var rowIndex = new int[n];
+        for (int i = 0; i < n; i++) rowIndex[i] = i;
+        RoPE.Execute(q, k, rowIndex, numHeads, numKvHeads, headDim, RopeDim, cos, sin, RoPEType.NeoX);
+    }
+
     private void EnsureRows(ReadOnlySpan<int> positions)
     {
         int n = positions.Length;

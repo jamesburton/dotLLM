@@ -1232,6 +1232,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         float* attnOut = (float*)_state.AttnOutput;
 
         EmbedTokens(tokenIds, hidden, hiddenSize);
+        PrepareVision(positions, kvCache, hidden, hiddenSize);   // #2073: image rows + the rope mode (plain / delta-shifted / M-RoPE)
 
         if (TensorDump.Enabled)
             TensorDump.Dump2D("token_embd", hidden, seqLen, hiddenSize);
@@ -2152,11 +2153,11 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
         //    synthetic CPU↔CUDA parity fixture in CudaQwen3MoeHybridParityTests.cs (shared attention
         //    implementation).
         int kvStride = numKvHeads * headDim;
-        _rope.Apply(
+        ApplyAttentionRope(
             new Span<float>(q, seqLen * qElems),
             new Span<float>(k, seqLen * kvStride),
             positions,
-            numHeads, numKvHeads, headDim, RoPEType.NeoX);
+            numHeads, numKvHeads, headDim);
         if (TensorDump.Enabled)
         {
             TensorDump.Dump2D($"blk.{layer}.fa_q_postrope", q, seqLen, qElems);
