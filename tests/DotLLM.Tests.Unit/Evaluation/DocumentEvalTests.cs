@@ -21,8 +21,8 @@ public sealed class DocumentEvalTests
         return row;
     }
 
-    private static FakePerplexityModel Model(bool allRows = true, int context = 64)
-        => new(Vocab, context, allRows, Row);
+    private static FakePerplexityModel Model(bool allRows = true, int context = 64, bool multiRowAnyway = false)
+        => new(Vocab, context, allRows, Row, multiRowAnyway);
 
     // Independent oracle: probabilities by plain (unshifted) softmax, which is exact at |logit| <= 3.
     private static double OracleNll(int[] seq)
@@ -151,11 +151,13 @@ public sealed class DocumentEvalTests
         Assert.Equal(Math.Log(2), -DocumentScoring.TargetLogProb([1000f, 1000f], 0), 12);
     }
 
-    [Fact]
-    public void Nll_LastRowOnlyBackend_MatchesAllRowsBackend()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Nll_LastRowOnlyBackend_MatchesAllRowsBackend(bool multiRowAnyway)
     {
         using var allRows = Model(allRows: true);
-        using var lastRow = Model(allRows: false);
+        using var lastRow = Model(allRows: false, multiRowAnyway: multiRowAnyway);
         int[] doc = Doc(12, 5);
         var a = DocumentEvaluator.Run(allRows, [doc], default, new StringWriter());
         var b = DocumentEvaluator.Run(lastRow, [doc], default, new StringWriter());

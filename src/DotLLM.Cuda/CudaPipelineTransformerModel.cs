@@ -212,6 +212,10 @@ public sealed unsafe class CudaPipelineTransformerModel : IModel
     }
 
     /// <inheritdoc/>
+    /// <remarks>Every forward returns the last position's row alone (#2030).</remarks>
+    public int MaxAllRowLogitsLength => 1;
+
+    /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
         => Forward(tokenIds, positions, deviceId, kvCache: null);
 

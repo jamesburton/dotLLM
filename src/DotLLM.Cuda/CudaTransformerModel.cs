@@ -296,10 +296,46 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
         => seqLen == 1 && layerSinks == 0 && enabled && hasKernel;
 
     /// <summary>
-    /// Every forward returns the last row's logits only (the LM head runs on one row), so a multi-token verify cannot be
-    /// checked row by row. Declared so speculative callers (prompt lookup, #1293) see it instead of reading past the buffer.
+    /// Most rows one forward projects through the LM head. Each row is its own in-place GEMV: a batched projection of a quantized
+    /// LM head would expand the whole vocab x hidden matrix into a scratch sized for layer projections (#1099).
     /// </summary>
-    public int MaxAllRowLogitsLength => 1;
+    internal const int MaxLogitRows = 8;
+
+    private int _allRowLogitsLimit = 1;
+    private nint _rowLogitsF16;     // [MaxLogitRows, vocab] F16, allocated by the first multi-row forward
+    private bool _lastLogitsOnly;
+
+    /// <summary>
+    /// Longest forward that returns a logit row per token: 1 until a caller widens it with
+    /// <see cref="TrySetAllRowLogitsLimit"/> (speculative verification, #2030). Longer forwards return the last row only.
+    /// </summary>
+    public int MaxAllRowLogitsLength => _allRowLogitsLimit;
+
+    /// <summary>
+    /// Raises <see cref="MaxAllRowLogitsLength"/> to <paramref name="maxSeqLen"/>, capped at <see cref="MaxLogitRows"/>.
+    /// False on the Gemma forwards, which project one row, and on MLA models: the MLA attention appends to its own K/V cache,
+    /// which speculation cannot roll back, so a rejected draft would stay in the history.
+    /// </summary>
+    /// <param name="maxSeqLen">Rows the caller wants back from one forward.</param>
+    /// <returns>True when a forward of <paramref name="maxSeqLen"/> tokens now returns every row.</returns>
+    public bool TrySetAllRowLogitsLimit(int maxSeqLen)
+    {
+        if (_isGemma4 || _isGemmaFamily || _weights.MlaLayers is not null) return false;
+        _allRowLogitsLimit = Math.Max(_allRowLogitsLimit, Math.Min(maxSeqLen, MaxLogitRows));
+        return maxSeqLen <= _allRowLogitsLimit;
+    }
+
+    /// <summary>
+    /// As the four-argument forward, but <paramref name="lastTokenLogitsOnly"/> keeps the result at one row even within the
+    /// all-row limit (prefill reads nothing else).
+    /// </summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
+                           bool lastTokenLogitsOnly)
+    {
+        _lastLogitsOnly = lastTokenLogitsOnly;
+        try { return Forward(tokenIds, positions, deviceId, kvCache); }
+        finally { _lastLogitsOnly = false; }
+    }
 
     /// <summary>
     /// Power of two the F16 residual stream is carried at on architectures whose residual nears the F16 range (Flint, #1191):
@@ -2121,33 +2157,45 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
             }
         }
 
-        // 5. Final RmsNorm (last token only). For BitNet, read the FP32 residual directly so the
-        // large final residual is never truncated to FP16.
+        // 5. Final RmsNorm over the rows the LM head projects: the last token, or every token of a short forward when a
+        // speculative caller widened the all-row limit (#2030). Captured and deferred forwards are single-row. For BitNet, read
+        // the FP32 residual directly so the large final residual is never truncated to FP16.
+        int logitRows = !_lastLogitsOnly && deferredHostDest == 0 && !capturing && !stepCapturing
+            && seqLen > 1 && seqLen <= _allRowLogitsLimit ? seqLen : 1;
         if (fp32Res && numLayers > 0)
         {
-            nint lastResF32 = _state.ResidualF32 + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
+            nint lastResF32 = _state.ResidualF32 + (nint)((long)(seqLen - logitRows) * hiddenSize * sizeof(float));
             _kernels.LaunchRmsNormF32InF16W(lastResF32, _weights.OutputNormWeight, _state.NormOutput,
-                hiddenSize, eps, 1, s);
+                hiddenSize, eps, logitRows, s);
         }
         else
         {
-            nint lastHidden = _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * h);
+            nint lastHidden = _state.HiddenState + (nint)((long)(seqLen - logitRows) * hiddenSize * h);
             _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
-                hiddenSize, numLayers > 0 ? resEps : eps, 1, s);
+                hiddenSize, numLayers > 0 ? resEps : eps, logitRows, s);
         }
         MarkProfile(ProfileCategory.Norm);
-        // Tap: PreLmHead, one row (row 0 of NormOutput). An all-row tap already took its rows above.
+        // Tap: PreLmHead, one row: the last token's. An all-row tap already took its rows above.
         if (ts is not null && !(seqLen > 1 && ts.Wants(HookPoint.PreLmHead, -1) && ts.WantsAll(HookPoint.PreLmHead, -1))
-            && !ts.TapSite(HookPoint.PreLmHead, -1, true, 1, _state.NormOutput, h, 1f, s, out tapAt))
+            && !ts.TapSite(HookPoint.PreLmHead, -1, true, 1,
+                _state.NormOutput + (nint)((long)(logitRows - 1) * hiddenSize * h), h, 1f, s, out tapAt))
             return TapAborted(tapAt);
 
-        // 6. LM head (last token only) → FP16 logits, then convert to FP32
-        Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
-            _state.NormOutput, _state.LogitsF16,
-            _weights.OutputOutputDim, _weights.OutputInputDim, 1);
+        // 6. LM head -> FP16 logits. One row is converted to FP32 on the device; several are downloaded as FP16 and widened on
+        // the host, so no wider device store is added.
+        if (logitRows > 1 && _rowLogitsF16 == 0)
+            CudaDriverApi.cuMemAlloc_v2(out _rowLogitsF16, (nuint)((long)MaxLogitRows * vocabSize * h)).ThrowOnError();
+        for (int row = 0; row < logitRows; row++)
+        {
+            nint rowOut = logitRows == 1 ? _state.LogitsF16 : _rowLogitsF16 + (nint)((long)row * vocabSize * h);
+            Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
+                _state.NormOutput + (nint)((long)row * hiddenSize * h), rowOut,
+                _weights.OutputOutputDim, _weights.OutputInputDim, 1);
+        }
         MarkProfile(ProfileCategory.LmHead);
 
-        _kernels.LaunchConvertF16ToF32(_state.LogitsF16, _state.LogitsF32, vocabSize, s);
+        if (logitRows == 1)
+            _kernels.LaunchConvertF16ToF32(_state.LogitsF16, _state.LogitsF32, vocabSize, s);
         MarkProfile(ProfileCategory.Convert);
 
         if (ProfilingEnabled)
@@ -2223,11 +2271,14 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
             }
         }
 
-        // 8. D2H copy FP32 logits to CPU UnmanagedTensor
-        var shape = new TensorShape(1, vocabSize);
+        // 8. D2H copy of the logits to a CPU UnmanagedTensor
+        var shape = new TensorShape(logitRows, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
-        CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.LogitsF32,
-            (nuint)(vocabSize * sizeof(float))).ThrowOnError();
+        if (logitRows == 1)
+            CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.LogitsF32,
+                (nuint)(vocabSize * sizeof(float))).ThrowOnError();
+        else
+            DownloadRowLogits(result.DataPointer, logitRows * vocabSize);
 
         if (ts is not null && !ts.Immediate)
         {
@@ -4578,6 +4629,22 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
             seqLen, inputDim, outputDim, s);
     }
 
+    /// <summary>Downloads the first <paramref name="count"/> FP16 values of the multi-row logits and widens them into <paramref name="destination"/>.</summary>
+    private unsafe void DownloadRowLogits(nint destination, int count)
+    {
+        Half[] half = System.Buffers.ArrayPool<Half>.Shared.Rent(count);
+        try
+        {
+            fixed (Half* source = half)
+                CudaDriverApi.cuMemcpyDtoH_v2((nint)source, _rowLogitsF16, (nuint)((long)count * sizeof(ushort))).ThrowOnError();
+            System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(half.AsSpan(0, count), new Span<float>((void*)destination, count));
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<Half>.Shared.Return(half);
+        }
+    }
+
     /// <summary>
     /// Dispatches projection as batched-MMQ / cuBLAS HGEMM (prefill) or quantized/cuBLAS GEMV
     /// (decode). Prefill (seqLen &gt; 1) uses the dp4a-batched-MMQ kernel for Q4_K weights once
@@ -5382,6 +5449,7 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
         _mlaKvCache?.Dispose();
         _moeScratch?.Dispose();
         _moeHost?.Dispose();
+        if (_rowLogitsF16 != 0) { CudaDriverApi.cuMemFree_v2(_rowLogitsF16); _rowLogitsF16 = 0; }
         _g3Attention.Dispose();
         _spillMonitor.Dispose();
         _state.Dispose();

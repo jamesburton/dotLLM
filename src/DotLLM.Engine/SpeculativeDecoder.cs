@@ -142,8 +142,20 @@ public sealed class SpeculativeDecoder : ISpeculativeDecoder
                     generatedIds.RemoveRange(originalGenCount, generatedIds.Count - originalGenCount);
             }
 
-            return Verify(targetModel, kvCacheTarget, kvCacheDraft, constraint, lastToken, position, maxPos,
-                targetVocabSize, sharedVocab, draftTokens.AsSpan(0, k), draftProbsFlat, draftTicks, outputBuffer);
+            SpeculativeResult result = Verify(targetModel, kvCacheTarget, kvCacheDraft, constraint, lastToken, position,
+                maxPos, targetVocabSize, sharedVocab, draftTokens.AsSpan(0, k), draftProbsFlat, draftTicks, outputBuffer);
+
+            // The draft phase forwards each token to predict the next one, so the last draft is never forwarded. When all K
+            // are accepted and a bonus token follows, that draft is part of the history: forward it now, or the next round
+            // writes past a never-written row of the draft KV-cache and its drafts are garbage from then on (#2064).
+            if (result.AcceptedCount == k + 1)
+            {
+                long catchUpStart = Stopwatch.GetTimestamp();
+                using ITensor _ = draftModel.Forward([draftTokens[k - 1]], [position + k], deviceId: -1, kvCacheDraft);
+                result = result with { DraftTicks = result.DraftTicks + (Stopwatch.GetTimestamp() - catchUpStart) };
+            }
+
+            return result;
         }
         finally
         {
@@ -248,6 +260,12 @@ public sealed class SpeculativeDecoder : ISpeculativeDecoder
         if (actualVerifyLen < 1)
             return default;
 
+        // Issue #2030: acceptance reads one logit row per forwarded token. Refuse a last-row-only target before the forward,
+        // while its cache and recurrent state are still untouched.
+        if (targetModel.MaxAllRowLogitsLength < actualVerifyLen)
+            throw OneRowTarget(targetModel, actualVerifyLen,
+                $"declares MaxAllRowLogitsLength = {targetModel.MaxAllRowLogitsLength}");
+
         // Issue #287: the verify forward below advances the target model's recurrent (GDN)
         // trunk state — if it has one — for EVERY token in the batch, before we know which of
         // them will end up accepted. Position-indexed KV-cache tolerates this fine (rolled back
@@ -264,6 +282,10 @@ public sealed class SpeculativeDecoder : ISpeculativeDecoder
             verifyPositions.Slice(0, actualVerifyLen),
             deviceId: -1, kvCacheTarget);
         verifyTicks = Stopwatch.GetTimestamp() - verifyStart;
+
+        // A target can return fewer rows than it declares; reading them anyway runs past the tensor (#2030).
+        if (targetLogits.Shape.ElementCount < (long)actualVerifyLen * targetVocabSize)
+            throw OneRowTarget(targetModel, actualVerifyLen, $"returned logits of shape {targetLogits.Shape}");
 
         // ── Accept/Reject Phase ──
         int acceptedCount = 0;
@@ -372,6 +394,10 @@ public sealed class SpeculativeDecoder : ISpeculativeDecoder
             outputBuffer, gdnCheckpoint, rejected: false);
         return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k);
     }
+
+    private static InvalidOperationException OneRowTarget(IModel targetModel, int rows, string why)
+        => new($"Speculative verification needs a logit row for each of {rows} tokens, but " +
+               $"{targetModel.GetType().Name} {why}. Decode this model without speculation.");
 
     /// <summary>
     /// Samples from the corrected distribution: normalize(max(0, p[i] - q[i])).

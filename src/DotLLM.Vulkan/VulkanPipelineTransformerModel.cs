@@ -180,6 +180,13 @@ public sealed unsafe class VulkanPipelineTransformerModel : IModel
     }
 
     /// <inheritdoc/>
+    /// <remarks>Stage 1 runs the LM head, so its row limit is the pipeline's (#2030).</remarks>
+    public int MaxAllRowLogitsLength => _stage1.MaxAllRowLogitsLength;
+
+    /// <inheritdoc/>
+    public bool TrySetAllRowLogitsLimit(int maxSeqLen) => _stage1.TrySetAllRowLogitsLimit(maxSeqLen);
+
+    /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
         => Forward(tokenIds, positions, deviceId, kvCache: null);
 

@@ -36,6 +36,8 @@ public sealed partial class TextGenerator
     private readonly PromptLookupOptions? _promptLookup;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _draftKvCacheFactory;
     private readonly int _speculativeCandidates;
+    private bool _warnedDraftUnsupported;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _reportedSpeculationBlockers = new();
     private readonly int _mtpCandidates;   // MTP depth: the model's preferred K when the caller kept the library default
     private readonly bool _mtpEnabled;
     private readonly HybridPrefillDecodeStrategy? _hybridStrategy;
@@ -743,8 +745,8 @@ public sealed partial class TextGenerator
             }
 
             int specDrafted = 0, specAccepted = 0, specSteps = 0;
-            bool useDraftSpec = _draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options);
-            bool useLookupSpec = UsePromptLookup(useDraftSpec, useMtp, captureLogprobs, options);
+            bool useDraftSpec = UseDraftSpec(captureLogprobs, options, kvCache, adapter);
+            bool useLookupSpec = UsePromptLookup(useDraftSpec, useMtp, captureLogprobs, options, kvCache, adapter);
             int mtpFallbackStep = 0;                // > 0: the MTP rounds measured slower than plain decode; plain decode resumes at this step (#900)
             long mtpTicks = 0; int mtpTokens = 0;   // MTP-segment wall ticks / committed tokens, for the adaptive gate
 
@@ -758,7 +760,7 @@ public sealed partial class TextGenerator
                     greedy: true, seed: options.Seed);
                 Core.Attention.IKvCache? draftKvCache = useDraftSpec ? AllocateDraftKvCache(cacheSize) : null;
                 PromptLookupDrafter? lookup = useLookupSpec ? CreatePromptLookupDrafter(promptIds, generatedIds, cacheSize) : null;
-                int specK = lookup is null ? _speculativeCandidates : Math.Min(_promptLookup!.DraftTokens, _model.MaxAllRowLogitsLength - 1);
+                int specK = Math.Min(lookup is null ? _speculativeCandidates : _promptLookup!.DraftTokens, _model.MaxAllRowLogitsLength - 1);
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(specK + 1);
                 try
                 {
@@ -1302,8 +1304,8 @@ public sealed partial class TextGenerator
             }
 
             int specDrafted = 0, specAccepted = 0, specSteps = 0;
-            bool useDraftSpec = _draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options);
-            bool useLookupSpec = UsePromptLookup(useDraftSpec, useMtp, captureLogprobs, options);
+            bool useDraftSpec = UseDraftSpec(captureLogprobs, options, kvCache, adapter);
+            bool useLookupSpec = UsePromptLookup(useDraftSpec, useMtp, captureLogprobs, options, kvCache, adapter);
 
             // Speculative decode disabled when logprobs requested — no per-position logit access.
             // Also disabled when sampling isn't effectively greedy (see Wave 8 / issue #121).
@@ -1314,7 +1316,7 @@ public sealed partial class TextGenerator
                     greedy: true, seed: options.Seed);
                 Core.Attention.IKvCache? draftKvCache = useDraftSpec ? AllocateDraftKvCache(cacheSize) : null;
                 PromptLookupDrafter? lookup = useLookupSpec ? CreatePromptLookupDrafter(promptIds, generatedIds, cacheSize) : null;
-                int specK = lookup is null ? _speculativeCandidates : Math.Min(_promptLookup!.DraftTokens, _model.MaxAllRowLogitsLength - 1);
+                int specK = Math.Min(lookup is null ? _speculativeCandidates : _promptLookup!.DraftTokens, _model.MaxAllRowLogitsLength - 1);
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(specK + 1);
                 try
                 {
@@ -1933,12 +1935,44 @@ public sealed partial class TextGenerator
         => options.Temperature <= 0f && options.RepetitionPenalty == 1.0f
            && !options.IgnoreEos && options.MinTokens <= 0;   // #1345: the mask changes the argmax; a raw-argmax verify would not see it
 
+    // Where rollback or the adapter cannot be honoured, decode plain: said once per distinct reason (#2030).
+    private bool SpeculationBlocked(string source, Core.Attention.IKvCache kvCache, ILoraAdapter? adapter)
+    {
+        if (SpeculationSupport.RequestBlocker(_model, kvCache, adapter is not null) is not { } reason)
+            return false;
+        if (_reportedSpeculationBlockers.TryAdd($"{source}: {reason}", true))
+            Console.Error.WriteLine($"[spec] {source} ignored: {reason}; decoding without speculation.");
+        return true;
+    }
+
+    // Draft-model speculation is greedy-only and, like prompt lookup, needs a verify forward that returns every row's logits:
+    // widened here where the backend allows it. A last-row-only target (the dense CUDA host) decodes without the draft (#2030).
+    private bool UseDraftSpec(bool captureLogprobs, DotLLM.Core.Configuration.InferenceOptions options,
+        Core.Attention.IKvCache kvCache, ILoraAdapter? adapter)
+    {
+        if (_draftModel is null || captureLogprobs || !IsEffectivelyGreedy(options)
+            || SpeculationBlocked("draft model", kvCache, adapter))
+            return false;
+        _model.TrySetAllRowLogitsLimit(_speculativeCandidates + 1);
+        if (_model.MaxAllRowLogitsLength > 1)
+            return true;
+        if (!_warnedDraftUnsupported)
+        {
+            _warnedDraftUnsupported = true;
+            Console.Error.WriteLine($"[spec] draft model ignored: {_model.GetType().Name} returns only the last row of logits; " +
+                "decoding without speculation.");
+        }
+        return false;
+    }
+
     // Prompt lookup (#1293) is the fallback draft source: a draft model or an MTP round takes priority. It shares the draft-model
     // path's greedy gate, since its drafts carry no probabilities for sampled acceptance. It also needs a verify forward that
     // returns every row's logits: widened here where the backend allows it, off where it never can (last-row-only backends).
-    private bool UsePromptLookup(bool useDraftSpec, bool useMtp, bool captureLogprobs, DotLLM.Core.Configuration.InferenceOptions options)
+    private bool UsePromptLookup(bool useDraftSpec, bool useMtp, bool captureLogprobs, DotLLM.Core.Configuration.InferenceOptions options,
+        Core.Attention.IKvCache kvCache, ILoraAdapter? adapter)
     {
-        if (_promptLookup is null || useDraftSpec || useMtp || captureLogprobs || !IsEffectivelyGreedy(options))
+        if (_promptLookup is null || useDraftSpec || useMtp || captureLogprobs || !IsEffectivelyGreedy(options)
+            || SpeculationBlocked("prompt lookup", kvCache, adapter))
             return false;
         _model.TrySetAllRowLogitsLimit(_promptLookup.DraftTokens + 1);
         return _model.MaxAllRowLogitsLength > 1;

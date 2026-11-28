@@ -95,7 +95,9 @@ public static class DocumentEvaluator
                     {
                         model.ResetState();
                         using ITensor last = model.Forward(seq.AsSpan(0, i + 1), positions.AsSpan(0, i + 1));
-                        var row = new ReadOnlySpan<float>((void*)last.DataPointer, vocab);
+                        // The last row: a bounded all-row host returns every row of a short prefix (#2030).
+                        var row = new ReadOnlySpan<float>(
+                            (void*)(last.DataPointer + (nint)((last.Shape.ElementCount / vocab - 1) * vocab * sizeof(float))), vocab);
                         nll -= DocumentScoring.TargetLogProb(row, seq[i + 1]);
                         if (reference is not null) kl += reference.Kl(i, row);
                     }

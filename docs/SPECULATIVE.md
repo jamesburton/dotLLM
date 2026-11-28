@@ -293,6 +293,15 @@ can also be bound from `appsettings.json` by a host that binds `ServerOptions` f
 configuration. Vocabulary compatibility (above) is validated at startup with a clear error
 on all three surfaces.
 
+**When speculation is refused** (`SpeculationSupport`, draft models and prompt lookup; #2030): a recurrent target with no
+state checkpoint, a request with a LoRA adapter (the speculative forwards do not apply it), and a quantized KV-cache with
+an FP16 window (`--cache-window`; rows that left the window cannot be restored). Each decodes plain and says why.
+
+**Where the draft runs** (`DraftModelLoader`, shared by `run`, `chat` and `serve`; #2064): on the target's device (CPU, the
+same Vulkan device, or the same CUDA ordinal). It runs on the CPU, with a warning, when it is not a dense-host architecture,
+when it is an MLA model on CUDA, or when loading it on the GPU fails. A target that cannot verify drafts loads no draft at all. A draft the size of the
+target cannot be faster than plain decode, because it costs one forward per output token; use a much smaller one.
+
 Note: when a draft model is configured, `serve` uses the single-request `TextGenerator`
 path — the continuous-batch scheduler does not support draft models yet and is not started.
 
@@ -317,10 +326,10 @@ plain step, with no recurrent checkpoint.
   and confirms each by comparing tokens, so bucket collisions never match. Buffers are pooled and sized once to the KV
   capacity; the decode loop allocates nothing.
 - **When it engages**: greedy requests with no logprobs, no draft model and no MTP round (both take priority), on a backend
-  whose verify forward returns every row's logits (`IModel.MaxAllRowLogitsLength > 1` after `TrySetAllRowLogitsLimit`). The
-  dense CUDA model (`CudaTransformerModel`) computes the LM head on the last row only, so lookup stays off there; its
-  hybrid models, CPU and Vulkan qualify. `serve` takes the continuous-batch scheduler offline while it is on, as for a draft
-  model. Settings: `ServerOptions.PromptLookup`; per-request override not yet.
+  whose verify forward returns every row's logits (`IModel.MaxAllRowLogitsLength > 1` after `TrySetAllRowLogitsLimit`). CPU,
+  Vulkan and the dense CUDA model qualify. Dense CUDA widens to at most 8 rows, projecting each with its own in-place GEMV
+  (#2030); its Gemma forwards, its MLA models (their K/V cache cannot be rolled back), the CUDA pipeline, the CUDA hybrid
+  hosts and Mamba-3 return one row, so lookup and draft models stay off there. `serve` takes the continuous-batch scheduler offline while it is on, as for a draft model. Settings: `ServerOptions.PromptLookup`; per-request override not yet.
 - **Stats**: `speculative_draft_tokens` / `speculative_accepted_tokens` count drafts and accepted drafts only (the round's
   bonus/correction token is the target's own); this now holds for the draft-model loop too.
 

@@ -818,6 +818,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         // Load speculative draft model if requested (mirrors `dotllm run` wiring).
         IModel? draftModel = null;
+        Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? draftKvFactory = null;
         GgufFile? draftGguf = null;
         if (!string.IsNullOrEmpty(settings.SpeculativeModel))
         {
@@ -846,13 +847,18 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 return 1;
             }
 
-            draftModel = TransformerModel.LoadFromGguf(draftGguf, draftConfig,
-                new ThreadingConfig(settings.Threads, settings.DecodeThreads));
-            AnsiConsole.MarkupLine($"[dim]Speculative decoding: K={settings.SpeculativeK}, draft={Path.GetFileName(draftPath)}[/]");
+            // #2064: the draft goes on the target's device; a target that cannot verify drafts loads none.
+            var draft = DotLLM.Server.DraftModelLoader.Load(model!, deviceOutcome.Resolved, draftGguf, draftConfig, settings.SpeculativeK,
+                new ThreadingConfig(settings.Threads, settings.DecodeThreads),
+                message => AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(message)}[/]"));
+            draftModel = draft?.Model;
+            draftKvFactory = draft?.KvCacheFactory;
+            if (draft is not null)
+                AnsiConsole.MarkupLine($"[dim]Speculative decoding: K={settings.SpeculativeK}, draft={Path.GetFileName(draftPath)} on {draft.Device}[/]");
         }
 
         var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache,
-            draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
+            draftModel: draftModel, draftKvCacheFactory: draftKvFactory, speculativeCandidates: settings.SpeculativeK,
             mtpEnabled: !settings.NoMtp, mtpAdaptive: true, recurrentPrefixCache: !settings.NoPromptCache,
             // #1851: a GPU/CPU split prefills in chunks (1024 unless --prefill-chunk-size), the scratch it was planned for.
             prefillChunkSize: model is DotLLM.Cuda.HybridTransformerModel
