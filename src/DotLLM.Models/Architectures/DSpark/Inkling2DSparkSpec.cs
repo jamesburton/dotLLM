@@ -57,6 +57,19 @@ internal sealed record Inkling2DSparkSpec(
         return new Inkling2DSparkSpec(hidden, nLayer, heads, kvHeads, headDim, ffn, eps, block, window, softcap, theta, visits, swa, rank, targetVocab, maskRows, t.ContainsKey("markov_w2.bias"));
     }
 
+    /// <summary>
+    /// The <c>ForwardMtp</c> answer of a state that cannot draft (no admitted context): a <c>[1, vocab]</c> F32 row that is 0 at the anchor and <see cref="float.MinValue"/>
+    /// elsewhere, so the (constrained) draft argmax picks the anchor repeated, as <c>ForwardMtpArgMax</c> does. The verify rejects it; correctness is unaffected.
+    /// </summary>
+    internal static unsafe DotLLM.Core.Tensors.ITensor AnchorLogits(int anchor, int vocab)
+    {
+        var t = DotLLM.Core.Tensors.UnmanagedTensor.Allocate(new DotLLM.Core.Tensors.TensorShape(1, vocab), DotLLM.Core.Tensors.DType.Float32, -1);
+        var row = new Span<float>((void*)t.DataPointer, vocab);
+        row.Fill(float.MinValue);
+        if ((uint)anchor < (uint)vocab) row[anchor] = 0f;
+        return t;
+    }
+
     private static int[] ReadInts(GgufMetadata md, string key)
     {
         if (!md.TryGetValue(key, out var v)) throw new InvalidOperationException($"Drafter GGUF has no '{key}'.");

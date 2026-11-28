@@ -71,6 +71,7 @@ public sealed unsafe partial class Inkling2TransformerModel : IInkling2DSparkHos
     {
         if (state is not Inkling2DSparkState s) throw new NotSupportedException($"{nameof(Inkling2TransformerModel)} drafts only with DSpark states.");
         s.NextDraft(this, tokenId, position, s.Drafter.DraftTokensPerRound);
+        if (s.Unusable) return Inkling2DSparkSpec.AnchorLogits(tokenId, Config.VocabSize);   // no block was drafted: a defined row whose argmax is the anchor (#2046 review)
         var row = s.DraftLogits(position);
         var result = UnmanagedTensor.Allocate(new TensorShape(1, row.Length), DType.Float32, -1);
         row.CopyTo(new Span<float>((void*)result.DataPointer, row.Length));

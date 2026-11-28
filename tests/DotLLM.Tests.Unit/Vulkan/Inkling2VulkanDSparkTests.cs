@@ -411,4 +411,34 @@ public sealed class Inkling2VulkanDSparkTests : IClassFixture<VkInklingFixture>
         finally { VulkanKvCache.GrowthAdmissionOverride = null; m.ResetSequenceState(); }
         _ = seq;
     }
+    /// <summary>
+    /// Review of #2046: a state whose global-layer growth was refused stops injecting, so its length lags the target's. The decoder still rolls it back to every round's
+    /// anchor (<c>MtpSpeculativeDecoder</c> calls <c>mtpState.Rollback(position)</c> after the draft steps), and the constrained path asks <c>ForwardMtp</c> for logits.
+    /// Both must degrade (anchor drafts, rejected by the verify) and the output must still equal plain greedy decoding.
+    /// </summary>
+    [SkippableFact]
+    public void RefusedAdmission_ThroughTheDecoder_NeverThrows_AndKeepsGreedyIdentity()
+    {
+        var m = Model();
+        int V = m.Config.VocabSize;
+        var rng = new Random(2067);
+        int[] prompt = Enumerable.Range(0, 1100).Select(_ => rng.Next(1000, 120000)).ToArray();   // past the global layer's first 1,024 positions
+        const int n = 8;
+        var plain = Plain(m, prompt, n);
+        VulkanKvCache.GrowthAdmissionOverride = (_, _) => false;
+        try
+        {
+            var (spec, stats) = Spec(m, prompt, n, k: 3);
+            _out.WriteLine($"refused admission: {stats.Rounds} rounds, {stats.Drafted} drafts, spec [{string.Join(",", spec)}] plain [{string.Join(",", plain)}]");
+            Assert.Equal(plain, spec);
+
+            m.ResetSequenceState();
+            using var st = (VulkanInkling2DSparkState)m.CreateMtpState()!;
+            using (m.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, null, null, st, true)) { }
+            Assert.True(st.Unusable);
+            using (var row = m.ForwardMtp(st, 777, prompt.Length)) Assert.Equal(777, ArgMax(LastRow(row, V)));
+            st.Rollback(prompt.Length);   // past the state's own (lagging) length: must not throw
+        }
+        finally { VulkanKvCache.GrowthAdmissionOverride = null; m.ResetSequenceState(); }
+    }
 }

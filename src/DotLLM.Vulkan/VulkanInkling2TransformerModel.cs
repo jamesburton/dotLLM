@@ -299,6 +299,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
             _device.FillBufferSynchronous(s.AttnConv, 0); _device.FillBufferSynchronous(s.FfnConv, 0);
         }
         _length = 0;
+        _rollbackPending = false; _recRows = 0;
     }
 
     // ───────────────────────────── loading ─────────────────────────────
@@ -616,9 +617,10 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
     {
         int T = tokenIds.Length;
         if (T == 0 || T != positions.Length) throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
+        // A restart first: it clears a restore left pending by an aborted round, so one failed request cannot wedge every later one.
+        if (positions[0] == 0 && (_length != 0 || _rollbackPending)) { ResetSequenceState(); ds?.Rollback(0); }
         if (_rollbackPending)
             throw new InvalidOperationException("inkling2: the KV cache was rolled back into a recorded verify but RestoreRecurrentStateToRow was not called; the conv state is ahead of the committed text.");
-        if (positions[0] == 0 && _length != 0) { ResetSequenceState(); ds?.Rollback(0); }
         _recRows = 0;   // a recorded verify is valid only until the next forward
         for (int i = 0; i < T; i++)
             if (positions[i] != _length + i)

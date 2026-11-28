@@ -225,8 +225,7 @@ internal sealed unsafe class Inkling2DSparkState : IMtpState, IInkling2Tap
         if (position == _length)
         {
             _draftCount = Math.Clamp(draftTokens, 1, _draft.Length);
-            if (Unusable) Array.Fill(_draft, tokenId);   // no admitted context: the anchor repeated (rejected by the verify; correctness is unaffected)
-            else _drafter.Draft(this, target, tokenId, position, _draft.AsSpan(0, _draftCount));
+            _drafter.Draft(this, target, tokenId, position, _draft.AsSpan(0, _draftCount));
             _draftStart = position;
             return _draft[0];
         }

@@ -184,6 +184,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
     {
         var s = AsState(state) ?? throw new ArgumentNullException(nameof(state));
         s.NextDraft(tokenId, position);
+        if (s.Unusable) return Inkling2DSparkSpec.AnchorLogits(tokenId, _vocab);   // no block was drafted: a defined row whose argmax is the anchor (#2046 review)
         var row = s.DraftLogits(position);
         var result = UnmanagedTensor.Allocate(new TensorShape(1, row.Length), DType.Float32, -1);
         row.CopyTo(new Span<float>((void*)result.DataPointer, row.Length));
@@ -340,12 +341,11 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
                 OutNorm = outNorm, TokNorm = tokNorm, FrnnMix = frnnMix, FrnnNorm = frnnNorm, W1 = w1.Buf, W2 = w2.Buf, Joint = joint.Buf, JointBias = jointBias, Mask = mask, RopeTab = ropeTab,
                 W2Bias = w2Bias,
             };
-            d.Owned.AddRange(owned);
             long scratch = 0;
             VulkanDevice.Buffer S(long bytes2, bool host = false)
             {
-                var b = host ? _device.Allocate(Math.Max(16, bytes2)) : _device.AllocateDeviceLocal(Math.Max(16, bytes2));
-                d.Owned.Add(b); scratch += b.Size;
+                var b = Keep(host ? _device.Allocate(Math.Max(16, bytes2)) : _device.AllocateDeviceLocal(Math.Max(16, bytes2)));   // in `owned`: a later failure frees it too
+                scratch += b.Size;
                 return b;
             }
             long bf = 2;
@@ -359,6 +359,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
             d.Parts = (_vocab + 31) / 32;
             d.Part = S((long)d.Parts * 8);
             d.Tok = S(64, host: true);
+            d.Owned.AddRange(owned);
             d.Bytes = bytes + scratch;
             _deviceBytes += d.Bytes;
             return d;
@@ -587,6 +588,8 @@ internal sealed class VulkanInkling2DSparkState : IMtpState
     /// <inheritdoc/>
     public void Rollback(int length)
     {
+        // An unusable state stopped injecting, so its length lags the target's; the decoder still rolls it back to the round's anchor every round (#2046 review).
+        if (Unusable) { _draftStart = -1; if (length >= 0 && length < _length) _length = length; return; }
         if (length < 0 || length > _length) throw new ArgumentOutOfRangeException(nameof(length));
         _length = length;
         _draftStart = -1;

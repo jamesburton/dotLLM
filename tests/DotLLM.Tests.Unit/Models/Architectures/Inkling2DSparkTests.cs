@@ -502,6 +502,9 @@ public sealed class Inkling2DSparkTests : IClassFixture<DSparkFixture>
             using (m.Forward(seq, Enumerable.Range(0, seq.Length).ToArray(), -1, null, null, st, true)) { }
             Assert.True(st.Unusable);
             Assert.Equal(1234, st.NextDraft(m, 1234, seq.Length, 3));   // the anchor repeated
+            st.Rollback(seq.Length);   // the decoder rolls back to every round's anchor
+            using (var row = m.ForwardMtp(st, 1234, seq.Length))   // the constrained-draft path: a defined row, argmax = the anchor
+                unsafe { Assert.Equal(1234, System.Numerics.Tensors.TensorPrimitives.IndexOfMax(new ReadOnlySpan<float>((void*)row.DataPointer, m.Config.VocabSize))); }
         }
         finally { Inkling2DSparkState.AdmissionOverride = null; }
     }
