@@ -102,7 +102,7 @@ public static unsafe partial class MatMul
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float VecDotQ2_0Q8_0(byte* w, byte* q8, int blocks)
-        => Avx2.IsSupported ? VecDotQ2_0Q8_0Avx2(w, q8, blocks) : VecDotQ2_0Q8_0Scalar(w, q8, blocks);
+        => CpuFeatures.Avx2 ? VecDotQ2_0Q8_0Avx2(w, q8, blocks) : VecDotQ2_0Q8_0Scalar(w, q8, blocks);
 
     private struct Q2_0Ctx
     {
