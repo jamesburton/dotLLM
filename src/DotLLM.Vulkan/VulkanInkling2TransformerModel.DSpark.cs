@@ -73,7 +73,11 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
     public bool DefersAutoAttach => true;
 
     /// <inheritdoc/>
-    public void DeferAutoAttach(string path) { lock (_attachLock) _deferredPath = path; }
+    public void DeferAutoAttach(string path)
+    {
+        _ = DSparkMinContext;   // a malformed DOTLLM_DSPARK_MIN_CONTEXT fails here (the resolver's caller logs it and serves plain), never later inside every request
+        lock (_attachLock) _deferredPath = path;
+    }
 
     /// <inheritdoc/>
     public (string Path, int MinContext)? DeferredDrafter => _deferredPath is { } p && _dsd is null ? (p, DSparkMinContext) : null;
@@ -83,6 +87,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
     {
         lock (_attachLock)
         {
+            if (_dsparkForced) return true;   // explicit --dspark: on at every length, and the threshold env var is never parsed
             if (_dsd is null)
             {
                 if (_deferredPath is not { } path || !DSparkAttachPolicy.ShouldAttach(true, contextTokens, DSparkMinContext)) return false;
