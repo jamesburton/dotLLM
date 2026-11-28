@@ -68,4 +68,20 @@ public sealed class Inkling2VisionEncoderRoutingTests
     [Fact]
     public void ModelWithoutAProvider_UsesTheCpuEncoder()
         => Assert.ThrowsAny<IOException>(() => WithDevice<IImageEncoder>(null, () => VisionSupport.LoadEncoderFor(new object(), "does-not-exist-mmproj.gguf", new ThreadingConfig(1))));
+
+    [Fact]
+    public void DeviceEnvironment_ParsesTheValues_AndRejectsTypos()
+    {
+        Assert.False(VisionSupport.ForceCpuFromEnvironment(_ => null));
+        Assert.False(VisionSupport.ForceCpuFromEnvironment(_ => " "));
+        Assert.False(VisionSupport.ForceCpuFromEnvironment(_ => "auto"));
+        Assert.False(VisionSupport.ForceCpuFromEnvironment(_ => "GPU"));
+        Assert.True(VisionSupport.ForceCpuFromEnvironment(_ => " CPU "));
+        var ex = Assert.Throws<ArgumentException>(() => VisionSupport.ForceCpuFromEnvironment(_ => "vulkan"));
+        Assert.Contains("DOTLLM_VISION_DEVICE", ex.Message);
+    }
+
+    [Fact]
+    public void MalformedDeviceValue_FailsLoadEncoderFor_InsteadOfBeingIgnored()
+        => Assert.Throws<ArgumentException>(() => WithDevice<IImageEncoder>("cpuu", () => VisionSupport.LoadEncoderFor(new ProviderModel(), "x.gguf", new ThreadingConfig(1))));
 }

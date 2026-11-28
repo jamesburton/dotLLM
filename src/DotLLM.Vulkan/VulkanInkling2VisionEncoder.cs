@@ -228,7 +228,37 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
         _scratch.Clear();
         _pix = _rope = _x = _xn = _q = _k = _v = _att = _hid = _out = null!;
         _npos = 0; _pixCap = 0; _outCap = 0;
+        _ropeOnDevice = (0, 0);
     }
+
+    // RoPE tables depend only on the patch grid width and the position count: built once per grid into native memory (npos x 128 bytes, F16) and kept (a handful of grids, evicted
+    // oldest-first), and not re-uploaded while the device scratch still holds the same grid. No managed array per call.
+    private readonly Dictionary<(int Gw, int Npos), nint> _ropeTables = new();
+    private readonly Queue<(int Gw, int Npos)> _ropeOrder = new();
+    private (int Gw, int Npos) _ropeOnDevice;
+    private const int MaxCachedRopeGrids = 8;
+
+    private void UploadRopeTable(int gw, int npos)
+    {
+        if (_ropeOnDevice == (gw, npos)) return;
+        if (!_ropeTables.TryGetValue((gw, npos), out nint tab))
+        {
+            if (_ropeTables.Count >= MaxCachedRopeGrids)
+            {
+                var old = _ropeOrder.Dequeue();
+                NativeMemory.AlignedFree((void*)_ropeTables[old]);
+                _ropeTables.Remove(old);
+            }
+            tab = (nint)NativeMemory.AlignedAlloc((nuint)((long)npos * 128), 64);
+            FillRopeTable(new Span<ushort>((void*)tab, npos * 64), gw, npos);
+            _ropeTables[(gw, npos)] = tab; _ropeOrder.Enqueue((gw, npos));
+        }
+        _device.Upload(new ReadOnlySpan<byte>((void*)tab, npos * 128), _rope);
+        _ropeOnDevice = (gw, npos);
+    }
+
+    /// <summary>Number of RoPE tables currently cached (test seam).</summary>
+    internal int CachedRopeTables => _ropeTables.Count;
 
     private long ScratchBytes() => _scratch.Sum(b => b.Size);
 
@@ -355,7 +385,7 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
                 try
                 {
                     _device.Upload(halfPixels, _pix);
-                    _device.Upload(MemoryMarshal.AsBytes(BuildRopeTable(gw, npos).AsSpan()), _rope);
+                    UploadRopeTable(gw, npos);
                     Begin();
                     RecordTower(W, gw, gh, n, npos, nm, mw, ct);
                     _submit.SubmitAndWait();
@@ -422,6 +452,12 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
     internal static ushort[] BuildRopeTable(int gw, int npos)
     {
         var tab = new ushort[(long)npos * 64];
+        FillRopeTable(tab, gw, npos);
+        return tab;
+    }
+
+    private static void FillRopeTable(Span<ushort> tab, int gw, int npos)
+    {
         float thetaScale = MathF.Pow(10000.0f, -2.0f / 32);
         for (int t = 0; t < npos; t++)
         {
@@ -435,7 +471,6 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
                 tw *= thetaScale; th *= thetaScale;
             }
         }
-        return tab;
     }
 
     /// <inheritdoc/>
@@ -445,6 +480,8 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
         _kernels.Clear();
         _submit.Dispose();
         ReleaseScratch();
+        foreach (var t in _ropeTables.Values) NativeMemory.AlignedFree((void*)t);
+        _ropeTables.Clear(); _ropeOrder.Clear();
         foreach (var b in _owned) b.Dispose();
         _owned.Clear();
         if (_ownsGguf) _gguf.Dispose();

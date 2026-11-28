@@ -368,4 +368,87 @@ public sealed class Inkling2VulkanVisionTests : IDisposable
         var s = Score(o, rows);
         _output.WriteLine($"{name} (exact-tower embeddings from the F32 control, Vulkan text): mean KL {s.Mean:E2}, max KL {s.Max:E2}, top-1 {s.Top1}/{rows.Length}, greedy mismatches {mism}");
     }
+
+    /// <summary>
+    /// Issue #2068: the image encode of one request runs on a worker thread while another request's text forward runs on the same device. A text decode loop and a loop of image encodes run on
+    /// two threads against one Vulkan device (with the queue-submit window widened so an unsynchronised submit cannot hide); the text tokens and the embeddings must equal their serial runs bit for
+    /// bit, and no two threads may ever be inside <c>vkQueueSubmit</c> together.
+    /// </summary>
+    [SkippableFact]
+    public void ConcurrentImageEncodeAndTextDecode_OnOneDevice_MatchTheirSerialRuns()
+    {
+        var (model, _) = Models();
+        var enc = VkEncoder();
+        var image = Inkling2VisionEndToEndTests.LoadOracle("rainbow80")!.Image;
+        int V = model.Config.VocabSize;
+        int[] prompt = Enumerable.Range(1000, 40).ToArray();
+
+        int[] DecodeTokens()
+        {
+            model.ResetSequenceState();
+            var toks = new List<int>();
+            using (var t = model.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, null, true)) toks.Add(ArgMax(Row(t, 0, V)));
+            for (int i = 0; i < 24; i++)
+            {
+                using var t = model.Forward([toks[^1]], [prompt.Length + i], -1, null, true);
+                toks.Add(ArgMax(Row(t, 0, V)));
+            }
+            return [.. toks];
+        }
+        static int ArgMax(float[] a) { int b = 0; for (int i = 1; i < a.Length; i++) if (a[i] > a[b]) b = i; return b; }
+
+        var serialTokens = DecodeTokens();
+        float[] serialEmb;
+        using (var e0 = enc.Encode(image)) serialEmb = Inkling2VulkanVisionEncoderTests.Floats(e0);
+
+        _dev!.QueueSubmitWindowHook = () => Thread.Sleep(0);   // widen the submit critical section
+        var errors = new List<Exception>();
+        var concurrentTokens = new List<int[]>(); int encodes = 0, badEmbeddings = 0;
+        using var go = new ManualResetEventSlim();
+        var text = new Thread(() => { try { go.Wait(); for (int r = 0; r < 3; r++) concurrentTokens.Add(DecodeTokens()); } catch (Exception e) { lock (errors) errors.Add(e); } });
+        var vision = new Thread(() =>
+        {
+            try
+            {
+                go.Wait();
+                while (text.IsAlive || encodes < 20)
+                {
+                    using var e = enc.Encode(image);
+                    if (!Inkling2VulkanVisionEncoderTests.Floats(e).AsSpan().SequenceEqual(serialEmb)) Interlocked.Increment(ref badEmbeddings);
+                    encodes++;
+                }
+            }
+            catch (Exception e) { lock (errors) errors.Add(e); }
+        });
+        text.Start(); vision.Start(); go.Set(); text.Join(); vision.Join();
+        _output.WriteLine($"{encodes} image encodes ran beside 3 x 25 text steps; max threads inside vkQueueSubmit {_dev.MaxConcurrentQueueSubmits}; embeddings differing from the serial run {badEmbeddings}");
+        _dev.QueueSubmitWindowHook = null;
+        Assert.Empty(errors);
+        Assert.Equal(1, _dev.MaxConcurrentQueueSubmits);
+        Assert.Equal(0, badEmbeddings);
+        foreach (var t in concurrentTokens) Assert.Equal(serialTokens, t);
+    }
+
+    /// <summary>Submits per decoded token and the cost of the submit lock (issue #2068 asked whether a per-submit lock is measurable on decode).</summary>
+    [SkippableFact]
+    public void Report_SubmitsPerDecodeToken_AndUncontendedLockCost()
+    {
+        var (model, _) = Models();
+        int V = model.Config.VocabSize;
+        int[] prompt = Enumerable.Range(1000, 40).ToArray();
+        model.ResetSequenceState();
+        using (var t = model.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, null, true)) { }
+        long before = DotLLM.Vulkan.Interop.ProfileCounters.Submits;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        int steps = 32;
+        for (int i = 0; i < steps; i++) { using var t = model.Forward([1000 + i], [prompt.Length + i], -1, null, true); }
+        double msPerToken = sw.Elapsed.TotalMilliseconds / steps;
+        double submits = (DotLLM.Vulkan.Interop.ProfileCounters.Submits - before) / (double)steps;
+        var gate = new object(); long x = 0;
+        const int n = 10_000_000;
+        sw.Restart();
+        for (int i = 0; i < n; i++) lock (gate) x++;
+        double nsPerLock = sw.Elapsed.TotalMilliseconds * 1e6 / n;
+        _output.WriteLine($"decode: {msPerToken:F1} ms/token, {submits:F2} vkQueueSubmit per token; uncontended lock {nsPerLock:F1} ns; cost per token {submits * nsPerLock:F0} ns = {submits * nsPerLock / (msPerToken * 1e6):P5} of a decode step (x={x})");
+    }
 }

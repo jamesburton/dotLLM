@@ -243,4 +243,18 @@ public sealed class Inkling2VulkanVisionEncoderTests : IDisposable
         using var r = vk.Encode(LoadImage(name));
         foreach (var l in lines) _output.WriteLine($"{name} {l}");
     }
+
+    /// <summary>The RoPE table is built once per patch grid (native memory, not a managed array per call) and not re-uploaded while the scratch holds it.</summary>
+    [SkippableFact]
+    public void RopeTable_IsBuiltOncePerGrid()
+    {
+        using var enc = Load();
+        using (var a = enc.Encode(LoadImage("rainbow80"))) { }
+        using (var b = enc.Encode(LoadImage("rainbow80"))) { }
+        Assert.Equal(1, enc.CachedRopeTables);
+        using (var c = enc.Encode(LoadImage("rainbow190x110"))) { }
+        Assert.Equal(2, enc.CachedRopeTables);
+        using (var d = enc.Encode(LoadImage("rainbow80"))) { }
+        Assert.Equal(2, enc.CachedRopeTables);
+    }
 }

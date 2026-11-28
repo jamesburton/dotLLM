@@ -30,7 +30,7 @@ public static class VisionSupport
     /// </summary>
     public static IImageEncoder LoadEncoderFor(object? model, string mmprojPath, ThreadingConfig threading, ImageOverLimit overLimit = ImageOverLimit.Refuse)
     {
-        bool cpu = string.Equals(Environment.GetEnvironmentVariable(DeviceEnvVar)?.Trim(), "cpu", StringComparison.OrdinalIgnoreCase);
+        bool cpu = ForceCpuFromEnvironment();
         if (!cpu && model is IImageEncoderProvider provider)
         {
             // A device encoder covers a narrower contract than the CPU one (the Vulkan ViT reads Q8_0 matrices only and needs subgroup arithmetic / 16-bit storage);
@@ -39,6 +39,23 @@ public static class VisionSupport
             catch (NotSupportedException ex) { Console.Error.WriteLine($"[vision] device encoder declined ({ex.Message}); using the CPU encoder."); }
         }
         return LoadEncoder(mmprojPath, threading, overLimit);
+    }
+
+    /// <summary>
+    /// Reads <see cref="DeviceEnvVar"/>: <c>cpu</c> forces the CPU encoder; unset, empty, <c>auto</c>, <c>gpu</c> or <c>device</c> use the model's own device encoder when it has one.
+    /// Anything else is an error (a typo must not silently run the other encoder, as for <c>DOTLLM_VISION_EMBD_PRECISION</c>).
+    /// </summary>
+    /// <exception cref="ArgumentException">An unrecognised value.</exception>
+    public static bool ForceCpuFromEnvironment(Func<string, string?>? env = null)
+    {
+        string? text = (env ?? Environment.GetEnvironmentVariable)(DeviceEnvVar)?.Trim();
+        if (string.IsNullOrEmpty(text)) return false;
+        return text.ToLowerInvariant() switch
+        {
+            "cpu" => true,
+            "auto" or "gpu" or "device" => false,
+            _ => throw new ArgumentException($"{DeviceEnvVar} must be cpu, auto, gpu or device, got '{text}'."),
+        };
     }
 
     /// <summary>Opens <paramref name="mmprojPath"/> and builds the CPU encoder its projector type needs.</summary>
