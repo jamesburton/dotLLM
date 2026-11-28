@@ -160,9 +160,6 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
     /// <summary>Test/diagnostic hook: receives named intermediates (null = off, zero cost).</summary>
     internal Inkling2TraceSink? Trace { get; set; }
 
-    /// <summary>Test / measurement hook (activation-precision study): rounds the activations at the Vulkan forward's storage points and records ranges. Null = off (one null check per point).</summary>
-    internal Inkling2ActSim? Sim { get; set; }
-
     private Inkling2TransformerModel(ModelConfig config, GgufFile? gguf, Layer[] layers, nint tokenEmbed, MatRef output,
                                      F32Ref tokEmbNorm, F32Ref outputNorm, F32Ref outputResQuery, Inkling2Options options,
                                      ComputeThreadPool? pool, bool ownsPool, List<nint> owned, long narrowedBytes, long f32ControllerBytes)
@@ -444,11 +441,9 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
 
     private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Inkling2SequenceState st, bool lastOnly, Inkling2Scratch sc, IReadOnlyList<ImageSpan>? images = null, IInkling2Tap? tap = null)
     {
-        tap ??= Sim;
         int visit = 0;
         int T = tokenIds.Length, H = _hidden;
         int pos0 = st.Length;
-        if (Sim is { } sim0) { sim0.Pos0 = pos0; sim0.Visit = -1; }
         _pool?.SetDispatchMode(T == 1 ? DispatchMode.SpinWait : DispatchMode.EventBased);
 
         // Token embeddings: Q8_0 rows dequantised one at a time into the activation buffer, then the gain-ed RMS norm (llama.cpp: tok_norm).
@@ -465,14 +460,13 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
             Dequantize.ToFloat32(_tokenEmbed + (nint)(id * rowBytes), H, embType, row);
             Inkling2Ops.RmsNorm(row, _tokEmbNorm.Span, _eps, row);
         }
-        Sim?.Apply("embed", cur, H, 1);
         Trace?.Invoke("embed", cur, T, H);
 
         var blocks = sc.Blocks;   // RMS-normalised (gamma-free) block inputs, immutable once pushed (llama.cpp mix_stack cache)
         int start = _c.LoopStart, end = _c.LoopEnd;
         int coreStart = _c.LoopPasses > 1 ? start : _nPhys;
 
-        for (int il = 0; il < coreStart; il++) { if (Sim != null) Sim.Visit = visit; tap?.Capture(Mutant == Inkling2Mutant.TapEarlyPrelude ? visit + 1 : Mutant == Inkling2Mutant.TapLate ? visit - 1 : visit, cur, T); visit++; cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
+        for (int il = 0; il < coreStart; il++) { tap?.Capture(Mutant == Inkling2Mutant.TapEarlyPrelude ? visit + 1 : Mutant == Inkling2Mutant.TapLate ? visit - 1 : visit, cur, T); visit++; cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
 
         if (_c.LoopPasses > 1)
         {
@@ -497,7 +491,6 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
                 }
                 for (int ip = start; ip < end; ip++)
                 {
-                    if (Sim != null) Sim.Visit = visit;
                     int slot = pass == 0 ? ip : _nPhys + (pass - 1) * core + (ip - start);
                     Span<float> messages = default;
                     LoopWeights? loop = null;
@@ -511,7 +504,6 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
                             var q = sc.Msg.Alloc<float>(loop.MsgQuery.In * loop.MsgQuery.Out);
                             Dequantize.ToFloat32(loop.MsgQuery.Ptr, q.Length, loop.MsgQuery.Qt, q);
                             messages = DepthMix(sc, sc.Bank, bankOut, q, 4, T, sc.Msg);
-                            Sim?.Apply("msg", messages, H, 4);
                         }
                     }
                     tap?.Capture(Mutant == Inkling2Mutant.TapBySlot ? slot : Mutant == Inkling2Mutant.TapLate ? visit - 1 : visit, cur, T); visit++;
@@ -519,17 +511,14 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
                     Trace?.Invoke($"pass{pass}.l{ip}", cur, T, H);
                 }
             }
-            for (int il = end; il < _nPhys; il++) { if (Sim != null) Sim.Visit = visit; tap?.Capture(Mutant == Inkling2Mutant.TapLate ? visit - 1 : visit, cur, T); visit++; cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
+            for (int il = end; il < _nPhys; il++) { tap?.Capture(Mutant == Inkling2Mutant.TapLate ? visit - 1 : visit, cur, T); visit++; cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
         }
 
         // Output: depth mix with output_res_query, gain-ed RMS norm, LM head (unpadded rows only), final logit softcap.
         sc.Msg.Reset();
-        if (Sim != null) Sim.Visit = visit;
         Span<float> mixed = DepthMix(sc, blocks, cur, _outputResQuery.Span, 1, T, sc.Msg);
-        Sim?.Apply("mix", mixed, H, 1);
         for (int t = 0; t < T; t++)
             Inkling2Ops.RmsNorm(mixed.Slice(t * H, H), _outputNorm.Span, _eps, mixed.Slice(t * H, H));
-        Sim?.Apply("norm", mixed, H, 1);
         Trace?.Invoke("result_norm", mixed, T, H);
         tap?.Capture(visit++, Mutant == Inkling2Mutant.TapPreNorm ? cur : mixed, T);   // visit 48: the final normed output of every row
 
@@ -590,15 +579,12 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
             Inkling2Ops.RmsNorm(cur.Slice(t * H, H), default, Inkling2Ops.MixEps, gateIn.Slice(t * 2 * H, H));
             Inkling2Ops.RmsNorm(msg.Slice(t * H, H), default, Inkling2Ops.MixEps, gateIn.Slice(t * 2 * H + H, H));
         }
-        Sim?.Apply("ctrl_in", gateIn, 2 * H, 1);
         var gate = a.Alloc<float>(T * rank);
         GemmSpan(loop.Down[ctrl], gateIn, gate, T);
-        Sim?.Apply("ctrl_g", gate, rank, 1);
         var gainPre = a.Alloc<float>(T * H);
         var forgetPre = a.Alloc<float>(T * H);
         GemmSpan(loop.Gain[ctrl], gate, gainPre, T);
         GemmSpan(loop.Forget[ctrl], gate, forgetPre, T);
-        Sim?.Apply("ctrl_gain", gainPre, H, 1); Sim?.Apply("ctrl_forget", forgetPre, H, 1);
         var o = a.Alloc<float>(T * H);
         for (int t = 0; t < T; t++)
             Inkling2Ops.ControlCombine(cur.Slice(t * H, H), msg.Slice(t * H, H), gainPre.Slice(t * H, H), forgetPre.Slice(t * H, H), o.Slice(t * H, H));
@@ -610,7 +596,6 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
         int H = _hidden;
         var r = sc.Layer.Alloc<float>(T * H);
         for (int t = 0; t < T; t++) Inkling2Ops.RmsNorm(x.Slice(t * H, H), gamma.Span, _eps, r.Slice(t * H, H));
-        Sim?.Apply("norm", r, H, 1);
         return r;
     }
 
@@ -635,7 +620,6 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
         {
             int nq = lw.Local ? 1 : 3;
             var mixed = DepthMix(sc, blocks, cur, lw.AttnResQuery.Span, nq, T, A);
-            Sim?.Apply("mix", mixed, H, nq);
             in0 = PickQuery(A, mixed, lw.Local ? 0 : 0, nq, T);
             in1 = PickQuery(A, mixed, lw.Local ? 0 : 1, nq, T);
             in2 = PickQuery(A, mixed, lw.Local ? 0 : 2, nq, T);
@@ -679,11 +663,6 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
         GemmSpan(lw.Sink, in0, sink, T);
         GemmSpan(lw.Gate, in0, gate, T);
         if (Mutant == Inkling2Mutant.NoSink) sink.Clear();
-        if (Sim is { } simA)
-        {
-            simA.Apply("q", q4, qW, 1); simA.Apply("kraw", kRaw, kvW, 1); simA.Apply("vraw", vRaw, kvW, 1); simA.Apply("rel", rel, nh * relLen, 1);
-            simA.Apply("sink", sink, nh, 1); simA.Apply("gateB", gate, qW, 1);
-        }
 
         Span<float> kDyn = default, vDyn = default;
         if (!lw.Local)
@@ -692,12 +671,10 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
             vDyn = A.Alloc<float>(T * _c.ConvKernel * nkv);
             GemmSpan(lw.KConvProj, in1, kDyn, T);
             GemmSpan(lw.VConvProj, in2, vDyn, T);
-            Sim?.Apply("kdyn", kDyn, _c.ConvKernel * nkv, 1); Sim?.Apply("vdyn", vDyn, _c.ConvKernel * nkv, 1);
         }
         var convScratch = A.Alloc<float>(Math.Max(ss.KConv.ScratchFloats(T), ss.AttnPostConv.ScratchFloats(T)));
         ss.KConv.Run(T, kRaw, lw.KConv.Span, kDyn, nkv, kRaw, convScratch);
         ss.VConv.Run(T, vRaw, lw.VConv.Span, vDyn, nkv, vRaw, convScratch);
-        if (Sim is { } simB) { simB.Apply("kc", kRaw, kvW, 1); simB.Apply("vc", vRaw, kvW, 1); }
 
         var qClip = lw.QClip.Span; var relClip = lw.RelClip.Span;
         for (int t = 0; t < T; t++)
@@ -721,7 +698,6 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
             }
             ss.Store(pos0 + t, kRaw.Slice(t * kvW, kvW), vRaw.Slice(t * kvW, kvW));
         }
-        if (Sim is { } simC) { simC.Apply("q_clip", q4, qW, 1); simC.Apply("rel_clip", rel, nh * relLen, 1); }
         Trace?.Invoke($"slot{slot}.Q", q4, T, qW);
         Trace?.Invoke($"slot{slot}.K", kRaw, T, kvW);
         Trace?.Invoke($"slot{slot}.V", vRaw, T, kvW);
@@ -729,11 +705,9 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
         var attn = A.Alloc<float>(T * qW);
         Attend(lw, ss, A, q4, rel, sink, attn, T, pos0);
         for (int i = 0; i < attn.Length; i++) attn[i] *= Inkling2Ops.Sigmoid(gate[i]);
-        Sim?.Apply("attn", attn, qW, 1);
 
         var attnOut = A.Alloc<float>(T * H);
         GemmSpan(lw.Wo, attn, attnOut, T);
-        Sim?.Apply("attn_o", attnOut, H, 1);
         ss.AttnPostConv.Run(T, attnOut, lw.PostConv.Span, default, 0, attnOut, convScratch);
         Trace?.Invoke($"slot{slot}.attn_out", attnOut, T, H);
 
@@ -742,32 +716,26 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
         if (ip % _c.AttnResBlockSize == 0)
         {
             var nb = NormedCopy(inpSA, T, sc.Call);
-            Sim?.Apply("blk", nb, H, 1);
             blocks.Add((nint)Unsafe.AsPointer(ref MemoryMarshal.GetReference(nb)));
             ffnInp = attnOut;
-            Sim?.Apply("ffnInp", ffnInp, H, 1);
         }
         else
         {
             ffnInp = A.Alloc<float>(T * H);
             TensorPrimitives.Add(inpSA, attnOut, ffnInp);
-            Sim?.Apply("ffnInp", ffnInp, H, 1);
         }
 
         // ── MoE ──
         var m = DepthMix(sc, blocks, ffnInp, lw.FfnResQuery.Span, 1, T, A);
-        Sim?.Apply("mix", m, H, 1);
         if (!messages.IsEmpty) m = Control(sc, m, messages, loop!, 3, T);
         m = RmsNormRows(sc, m, lw.FfnNorm, T);
         var moe = A.Alloc<float>(T * H);
         ForwardMoe(lw, A, m, moe, T);
-        Sim?.Apply("moe", moe, H, 1);
         ss.FfnPostConv.Run(T, moe, lw.FfnPostConv.Span, default, 0, moe, convScratch);
         Trace?.Invoke($"slot{slot}.ffn_out", moe, T, H);
 
         var outp = outArena.Alloc<float>(T * H);
         TensorPrimitives.Add(ffnInp, moe, outp);
-        Sim?.Apply("layer_out", outp, H, 1);
         return outp;
     }
 
@@ -872,7 +840,6 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
             for (int i = 0; i < K; i++)
                 selWeight[t * K + i] = sig[selExpert[t * K + i]] / sum * _c.ExpertWeightsScale;
         }
-        Sim?.Apply("selw", selWeight, K, 1);
         y.Slice(0, T * H).Clear();
         ExecuteExperts(lw, A, x, y, selExpert, selWeight, T, K, E, H, ff);
     }
@@ -915,7 +882,6 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
                     var row = gu.Slice(i * 2 * ff, 2 * ff);
                     var a = act.Slice(i * ff, ff);
                     for (int j = 0; j < ff; j++) a[j] = Inkling2Ops.Situ(row[j], row[ff + j], beta, lb);
-                    Sim?.ApplyRow("situ", a, tokenOf[start + i]);
                 }
                 Gemm(lw.Down + (nint)(e * lw.DownExpertBytes), lw.DownQt, ap, yp, H, ff, n, _pool);
                 if (!dnScale.IsEmpty) TensorPrimitives.Multiply(yo.Slice(0, n * H), dnScale.Span[e], yo.Slice(0, n * H));

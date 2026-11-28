@@ -18,7 +18,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// <summary>
 /// MEASUREMENT STUDY (epic #2025, docs/INKLING2.md section 12c): which activation storage format for Inkling-2-Mini image prompts on Vulkan (BF16 shipped, F16, F32, mixed / targeted).
 /// Opt-in: every test skips unless <c>DOTLLM_INK_PREC_STUDY=1</c>. Results are appended to <c>DOTLLM_INK_PREC_OUT</c> (default <c>%TEMP%\ink-prec-results.txt</c>) as well as the test output.
-/// GPU tests need the Strix GPU lock; the CPU-simulation tests and the CPU encoder run on the CPU only (hold the cpu-bench lock); never run them beside GPU work.
+/// GPU tests need the Strix GPU lock (and cpu-bench where the CPU encoder runs in the process). The CPU storage-format simulation used for the 12c mixed-placement attempt and the max-|activation| census (an `Inkling2ActSim` hook in the CPU reference) is not part of the shipped tree, see docs/INKLING2.md 12c.
 /// </summary>
 public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
 {
@@ -332,104 +332,6 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
         finally { foreach (var m in models.Values) m.Dispose(); }
     }
 
-    // ───────────────────────────── CPU: simulation of the storage formats ─────────────────────────────
-
-    private static string[] SimArms => (Environment.GetEnvironmentVariable("DOTLLM_INK_PREC_SIM") ?? "f32,bf16,f16,resid-f32,f16+resid-bf16,f16+resid-f32,first8-f32,first16-f32,first24-f32,imgrows-f32,nonresid-f32").Split(',');
-
-    private static Inkling2ActSim MakeSim(string arm, int imgStart, int imgEnd)
-    {
-        var s = new Inkling2ActSim();
-        switch (arm)
-        {
-            case "f32": s.Round = false; break;
-            case "bf16": break;
-            case "f16": s.Base = Inkling2SimFormat.F16; break;
-            case "resid-f32": s.Residual = Inkling2SimFormat.F32; break;                       // everything BF16 except the residual stream
-            case "f16+resid-bf16": s.Base = Inkling2SimFormat.F16; s.Residual = Inkling2SimFormat.Bf16; break;
-            case "f16+resid-f32": s.Base = Inkling2SimFormat.F16; s.Residual = Inkling2SimFormat.F32; break;
-            case "nonresid-f32": s.Base = Inkling2SimFormat.F32; s.Residual = Inkling2SimFormat.Bf16; break;   // the opposite split: BF16 residual, F32 inside the layers
-            case "imgrows-f32": s.RowIsF32 = p => p >= imgStart && p < imgEnd; break;
-            default:
-                if (arm.StartsWith("first") && arm.EndsWith("-f32")) { s.F32UpToVisit = int.Parse(arm["first".Length..^"-f32".Length]); break; }
-                throw new ArgumentException(arm);
-        }
-        return s;
-    }
-
-    private static Inkling2TransformerModel LoadCpu(GgufFile file, ModelConfig cfg) => Inkling2TransformerModel.LoadFromGguf(file, cfg, ThreadingConfig.Auto);
-
-    /// <summary>
-    /// CPU simulation of the storage formats at the Vulkan forward's store points (docs/INKLING2.md 12c): oracle KL and noise-free KL (vs the simulation's own F32 run) on the 3 images and the text passage,
-    /// for every arm of DOTLLM_INK_PREC_SIM; the "f32" arm (stats only) also prints the max |activation| per point and per residual-stream layer. CPU only: hold the cpu-bench lock.
-    /// Validation: the "bf16" / "f16" rows must agree with the GPU arms of <see cref="Llm_Arms_Kl"/> (same noise-free metric), else a store point is misplaced.
-    /// </summary>
-    [SkippableFact]
-    public void Cpu_Sim_Arms()
-    {
-        Gate();
-        string? gguf = Inkling2RealModelTests.FindGguf(); Skip.If(gguf is null);
-        string? mm = Inkling2VisionFixtures.FindMmproj(); Skip.If(mm is null);
-        using var file = GgufFile.Open(gguf!);
-        var cfg = GgufModelConfigExtractor.Extract(file.Metadata);
-        int V = cfg.VocabSize;
-        using var enc = Inkling2VisionEncoder.Load(mm!, ThreadingConfig.Auto);
-        using var cpu = LoadCpu(file, cfg);
-        var embs = Images.ToDictionary(n => n, n => enc.Encode(Inkling2VisionEndToEndTests.LoadOracle(n)!.Image));
-        var refImg = new Dictionary<string, float[][]>(); float[][]? refText = null; var ref13 = new Dictionary<string, List<float[]>>();
-        try
-        {
-            foreach (string arm in SimArms)
-            {
-                var allStats = new List<(string Set, Inkling2ActSim Sim)>();
-                foreach (string name in Images)
-                {
-                    var o = Inkling2VisionEndToEndTests.LoadOracle(name)!;
-                    var emb = embs[name];
-                    var sim = MakeSim(arm, o.Before.Length, o.Before.Length + emb.Tokens);
-                    cpu.Sim = sim;
-                    var keep = new List<float[]>();
-                    var s = ImageKl(o, (i, p, sp) => cpu.ForwardWithImages(i, p, -1, sp, null, true), cpu.ResetSequenceState, emb, 32, keep);
-                    var simAll = MakeSim(arm, o.Before.Length, o.Before.Length + emb.Tokens);
-                    cpu.Sim = simAll;
-                    var rows = PromptRows(o, emb, (i, p, sp) => cpu.ForwardWithImages(i, p, -1, sp, null, false), cpu.ResetSequenceState, V);
-                    cpu.Sim = null;
-                    if (arm == "f32") { refImg[name] = rows; ref13[name] = keep; }
-                    Log($"CPUSIM arm={arm} {name}: oracle {s}; {(ref13.TryGetValue(name, out var r13) ? Nf13(r13, keep) : "no f32 ref")}; all-prompt-rows {(refImg.TryGetValue(name, out var rf) ? NoiseFree(rf, rows, o.Before.Length, o.Before.Length + emb.Tokens) : "no f32 reference yet")}");
-                    allStats.Add((name, simAll));
-                }
-                {
-                    var sim = MakeSim(arm, int.MaxValue, int.MaxValue);
-                    cpu.Sim = sim;
-                    var (kl, _, _) = TextGate(V, (i, p) => cpu.Forward(i, p, -1), (i, p) => cpu.Forward(i, p, -1, null, true), cpu.ResetSequenceState, greedy: false);
-                    var sim2 = MakeSim(arm, int.MaxValue, int.MaxValue);
-                    cpu.Sim = sim2;
-                    var tr = TextRows(V, (i, p) => cpu.Forward(i, p, -1), cpu.ResetSequenceState);
-                    cpu.Sim = null;
-                    if (arm == "f32") refText = tr;
-                    Log($"CPUSIM arm={arm} text-passage: oracle {kl}; {(refText is null ? "no f32 reference yet" : NoiseFreeText(refText, tr))}");
-                    allStats.Add(("text", sim2));
-                }
-                if (arm == "f32") DumpStats(allStats);
-            }
-        }
-        finally { foreach (var e in embs.Values) e.Dispose(); }
-    }
-
-    private void DumpStats(List<(string Set, Inkling2ActSim Sim)> sets)
-    {
-        var points = sets.SelectMany(s => s.Sim.Stats.Keys).Distinct().OrderBy(k => k).ToList();
-        foreach (string p in points)
-        {
-            var parts = sets.Select(s => s.Sim.Stats.TryGetValue(p, out var st) ? st : null).Where(x => x is not null).ToList();
-            float max = parts.Max(x => x!.MaxAbs);
-            long cnt = parts.Sum(x => x!.Count), sub = parts.Sum(x => x!.F16Subnormal), fl = parts.Sum(x => x!.F16Flushed), ov = parts.Sum(x => x!.F16Overflow);
-            string per = string.Join(" ", sets.Select(s => s.Sim.Stats.TryGetValue(p, out var st) ? $"{s.Set}={st.MaxAbs:G4}" : $"{s.Set}=-"));
-            Log($"ACTMAX point={p,-12} max {max,10:G5} | {per} | F16: overflow {ov}, subnormal {sub} ({100.0 * sub / cnt:F3}%), flushed-to-0 {fl} ({100.0 * fl / cnt:F4}%) of {cnt}");
-        }
-        foreach (var s in sets)
-            Log($"ACTRESID set={s.Set} residual-stream max per visit (embed, 48 layer visits incl. block copies, output): " + string.Join(" ", s.Sim.ResidualMaxPerVisit.Take(50).Select(v => v.ToString("G4"))));
-    }
-
     // ───────────────────────────── GPU: the vision tower ─────────────────────────────
 
     private static readonly (string Name, Inkling2ActFormat Act, bool Rope)[] VitArms =
@@ -559,67 +461,5 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
             var f = Inkling2VulkanVisionEncoderTests.Floats(e);
             Log($"VITNOISE arm={a.Name}: relRMS vs CPU shipping encoder {Inkling2VulkanVisionEncoderTests.RelRms(f, cpuRef):E2}; non-finite {f.Count(v => !float.IsFinite(v))}; peak scratch {venc.LastPeakScratchBytes / 1e6:F1} MB");
         }
-    }
-
-    // ───────────────────────────── gate 2: max |activation| sweep (CPU F32 trace) ─────────────────────────────
-
-    /// <summary>
-    /// F16 gate 2 (#2075): max |activation| at every store point and the DSpark tap visits (5, 23, 41, 48) of the CPU reference (F32, stats only) over a 16,640-token wikitext prompt and a
-    /// five-image prompt. The GPU F16 non-finite counts are in <see cref="Inkling2F16GateTests"/>. CPU only: hold cpu-bench (and the GPU lock: no iGPU job beside it).
-    /// </summary>
-    [SkippableFact]
-    public void Sweep_Stats_Cpu()
-    {
-        Gate();
-        string? gguf = Inkling2RealModelTests.FindGguf(); Skip.If(gguf is null);
-        string? mm = Inkling2VisionFixtures.FindMmproj(); Skip.If(mm is null);
-        string corpus = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotllm", "test-cache", "corpora", "wikitext-2-raw", "wiki.test.lf.raw");
-        Skip.IfNot(File.Exists(corpus), "corpus missing");
-        int longTokens = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_INK_PREC_LONG"), out int lt) ? lt : 16_640;
-        using var file = GgufFile.Open(gguf!);
-        var cfg = GgufModelConfigExtractor.Extract(file.Metadata);
-        using var cpu = LoadCpu(file, cfg);
-        var sets = new List<(string Set, Inkling2ActSim Sim)>();
-        // multi-image prompt first (short)
-        using var enc = Inkling2VisionEncoder.Load(mm!, ThreadingConfig.Auto);
-        var tokens = new List<int>(); var spans = new List<ImageSpan>(); var embs = new List<ImageEmbeddings>();
-        try
-        {
-            foreach (string name in new[] { "rainbow80", "rainbow190x110", "rainbow640", "rainbow190x110", "rainbow80" })
-            {
-                var o = Inkling2VisionEndToEndTests.LoadOracle(name)!;
-                var emb = enc.Encode(o.Image); embs.Add(emb);
-                tokens.AddRange(o.Before); spans.Add(new ImageSpan(tokens.Count, emb)); tokens.AddRange(Enumerable.Repeat(200054, emb.Tokens)); tokens.AddRange(o.After);
-            }
-            var simM = new Inkling2ActSim { Round = false };
-            cpu.Sim = simM; cpu.ResetSequenceState();
-            var prompt = tokens.ToArray();
-            for (int at = 0; at < prompt.Length; at += 128)
-            {
-                int len = Math.Min(128, prompt.Length - at);
-                using var t = cpu.ForwardWithImages(prompt.AsSpan(at, len), Enumerable.Range(at, len).ToArray(), -1, spans, null, true);
-            }
-            cpu.Sim = null; sets.Add(("multi-image", simM));
-            Log($"SWEEPCPU multi-image: {prompt.Length} tokens");
-        }
-        finally { foreach (var e in embs) e.Dispose(); }
-        // long text prompt
-        var tok = GgufTokenizerFactory.Load(file.Metadata);
-        string text = File.ReadAllText(corpus);
-        var ids = tok.Encode(text[..Math.Min(text.Length, longTokens * 6)]);
-        Skip.If(ids.Length < longTokens, "corpus too short");
-        var simL = new Inkling2ActSim { Round = false };
-        cpu.Sim = simL; cpu.ResetSequenceState();
-        var sw = Stopwatch.StartNew();
-        for (int at = 0; at < longTokens; at += 256)
-        {
-            int len = Math.Min(256, longTokens - at);
-            using var t = cpu.Forward(ids.AsSpan(at, len), Enumerable.Range(at, len).ToArray(), -1, null, true);
-        }
-        cpu.Sim = null; sets.Add(($"text{longTokens}", simL));
-        Log($"SWEEPCPU text {longTokens} tokens in {sw.Elapsed.TotalSeconds:F0} s");
-        DumpStats(sets);
-        foreach (var st in sets)
-            Log($"SWEEPTAP set={st.Set} DSpark tap max |value| per visit: 5 -> {st.Sim.TapMax[5]:G4}, 23 -> {st.Sim.TapMax[23]:G4}, 41 -> {st.Sim.TapMax[41]:G4}, 48 (final normed output) -> {st.Sim.TapMax[48]:G4}");
     }
 }
