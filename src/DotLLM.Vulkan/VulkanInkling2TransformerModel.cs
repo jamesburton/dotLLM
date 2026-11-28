@@ -25,13 +25,16 @@ public enum Inkling2KvFormat
     Q8_0,
 }
 
-/// <summary>Storage format of the Inkling 2 Vulkan activations (stored scratch buffers; accumulation is F32 in every arm). BF16 is the shipped default.</summary>
+/// <summary>
+/// Storage format of the Inkling 2 Vulkan activations (stored scratch buffers; accumulation is F32 in every arm). F16 is the default since #2075 (user ruling 2026-11-28 after the
+/// activation-precision study, docs/INKLING2.md 12c); BF16 stays selectable with <c>DOTLLM_INKLING2_ACT=bf16</c>.
+/// </summary>
 public enum Inkling2ActFormat
 {
-    /// <summary>bfloat16 (the shipped default, user ruling 2026-11-26).</summary>
+    /// <summary>bfloat16 (the default of #2034 / #2062, user ruling 2026-11-26): selectable, full F32 exponent range.</summary>
     Bf16,
 
-    /// <summary>IEEE half: measurement arm of the activation-precision study (epic #2025); overflows to infinity above 65,504.</summary>
+    /// <summary>IEEE half (the default since #2075): 10-bit mantissa; overflows to infinity above 65,504 (the largest measured activation is 453). A non-finite logit throws, see the model remarks.</summary>
     F16,
 
     /// <summary>F32: measurement arm / control (CLAUDE.md precision rule 1 sign-off needed to ship).</summary>
@@ -45,12 +48,12 @@ public enum Inkling2ActFormat
 /// </param>
 /// <param name="Kv">K/V cache format.</param>
 /// <param name="MaxChunk">Tokens per submission (prefill chunk). Local layers keep a ring of <c>window + MaxChunk</c> positions (see remarks of the model).</param>
-/// <param name="ActivationF16">Build the F16-activation-storage MEASUREMENT arm (the <c>_f16act</c> shaders; activation-precision study, epic #2025). Ignored when <paramref name="ActivationF32"/> is set.</param>
+/// <param name="ActivationF16">Store activations as F16 (the <c>_f16act</c> shaders; the default since #2075, <c>false</c> = BF16). Ignored when <paramref name="ActivationF32"/> is set.</param>
 /// <param name="F32ImageChunks">
-/// Measurement arm: a prefill chunk that carries image rows runs with F32 activation scratch (a second scratch set, allocated on the first such chunk) while text chunks and decode keep the base format.
+/// Opt-in: a prefill chunk that carries image rows runs with F32 activation scratch (a second scratch set, allocated on the first such chunk) while text chunks and decode keep the base format.
 /// Nothing activation-typed is carried between chunks (the conv state is BF16 in every arm, the KV is F16), so the switch is per chunk.
 /// </param>
-public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2KvFormat Kv = Inkling2KvFormat.F16, int MaxChunk = 128, bool ActivationF16 = false, bool F32ImageChunks = false)
+public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2KvFormat Kv = Inkling2KvFormat.F16, int MaxChunk = 128, bool ActivationF16 = true, bool F32ImageChunks = false)
 {
     /// <summary>The base activation storage format of this configuration.</summary>
     public Inkling2ActFormat BaseAct => ActivationF32 ? Inkling2ActFormat.F32 : ActivationF16 ? Inkling2ActFormat.F16 : Inkling2ActFormat.Bf16;
@@ -72,15 +75,16 @@ public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2K
             };
         string? ch = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_VK_CHUNK");
         if (!string.IsNullOrEmpty(ch)) o = o with { MaxChunk = int.Parse(ch) };
-        // Measurement arms (opt-in; the default stays BF16): DOTLLM_INKLING2_ACT=bf16|f16|f32, DOTLLM_INKLING2_ACT_F32_IMAGE_CHUNKS=1.
+        // DOTLLM_INKLING2_ACT=f16|bf16|f32 selects the activation storage format (default f16 since #2075; bf16 = the previous default; f32 = measurement arm, CLAUDE.md precision rule 1).
+        // DOTLLM_INKLING2_ACT_F32_IMAGE_CHUNKS=1 additionally runs prefill chunks that carry image rows on an F32 scratch set (+49.6 MB, allocated on the first image chunk).
         string? act = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_ACT");
         if (!string.IsNullOrEmpty(act))
             o = act.ToLowerInvariant() switch
             {
-                "bf16" => o,
                 "f16" => o with { ActivationF16 = true },
+                "bf16" => o with { ActivationF16 = false },
                 "f32" => o with { ActivationF32 = true },
-                _ => throw new ArgumentException($"DOTLLM_INKLING2_ACT='{act}': expected bf16, f16 or f32."),
+                _ => throw new ArgumentException($"DOTLLM_INKLING2_ACT='{act}': expected f16, bf16 or f32."),
             };
         if (Environment.GetEnvironmentVariable("DOTLLM_INKLING2_ACT_F32_IMAGE_CHUNKS") == "1") o = o with { F32ImageChunks = true };
         return o;
@@ -92,7 +96,8 @@ public sealed record Inkling2VulkanOptions(bool ActivationF32 = false, Inkling2K
 /// <see cref="Inkling2TransformerModel"/>; layer-by-layer semantics and the oracle in <c>docs/INKLING2.md</c>.
 /// </summary>
 /// <remarks>
-/// <para><b>Precision (user rulings 2026-11-26).</b> Stored activations are BF16 and every kernel accumulates and reduces in F32 registers / shared memory,
+/// <para><b>Precision (user rulings 2026-11-26 and 2026-11-28).</b> Stored activations are F16 since #2075 (BF16 was the first ruling; <c>DOTLLM_INKLING2_ACT=bf16</c> restores it; the largest activation measured
+/// is 453 against F16's 65,504, docs/INKLING2.md 12c, and a non-finite logit throws, see <see cref="Inkling2ActFormat"/>) and every kernel accumulates and reduces in F32 registers / shared memory,
 /// rounding once on store. KV is F16 (q8_0 evaluated, <see cref="Inkling2KvFormat"/>); the short-conv state is BF16; the loop-controller matrices are BF16
 /// (converted once at load from the GGUF's F32: 57 MB). Quantized weights run quantized: NVFP4 expert banks (with their per-expert F32 scale) and Q8_0 matrices
 /// are read in place by the kernels (decoded in registers); the router, norm gains, queries, clips and conv taps are the GGUF's own F32 vectors, uploaded
@@ -761,6 +766,23 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel, IImageInputM
         return true;
     }
 
+    /// <summary>Test seam: runs on the downloaded logits of an F16 chunk just before the finite check (poisons them to prove the guard fires).</summary>
+    internal Action<Span<float>>? BeforeFiniteCheck { get; set; }
+
+    /// <summary>
+    /// Runtime guard of the F16 activation default (#2075): the downloaded logits must be finite. An F16 store that overflowed (|x| &gt; 65,504 becomes infinity; the largest activation measured is 453) turns the
+    /// hidden state into NaN within the chunk, and the K/V, conv state and attention carry it to every later chunk, so the logits of the last chunk of a prefill and of every decode step expose it. The model
+    /// owns recurrent state that a failed chunk has already advanced, so it cannot re-run the chunk in BF16: it fails loudly instead. Cost: one vectorised pass over the logits that were just downloaded
+    /// (200,058 floats per row; measured in <c>Inkling2F16GateTests</c>).
+    /// </summary>
+    private void CheckLogitsFinite(Span<float> logits)
+    {
+        BeforeFiniteCheck?.Invoke(logits);
+        if (!float.IsFinite(System.Numerics.Tensors.TensorPrimitives.SumOfMagnitudes((ReadOnlySpan<float>)logits)))
+            throw new InvalidOperationException("inkling2 Vulkan: non-finite logits with F16 activation storage (an F16 store overflowed past 65,504, or NaN). The sequence state is no longer valid; " +
+                                                "rerun with DOTLLM_INKLING2_ACT=bf16 (full F32 exponent range) and report the prompt.");
+    }
+
     private VulkanDevice.Buffer PickOther(VulkanDevice.Buffer cur) => ReferenceEquals(cur, _x0) ? _x1 : _x0;
 
     private void RunChunk(ReadOnlySpan<int> ids, int basePos, int logitRows, bool lastOnly, Span<float> logitsDst, IReadOnlyList<ImageSpan>? images = null)
@@ -868,7 +890,11 @@ public sealed unsafe class VulkanInkling2TransformerModel : IModel, IImageInputM
             }
         }
         _submit.SubmitAndWait();
-        if (logits is not null) _device.Download(logits, logitsDst);
+        if (logits is not null)
+        {
+            _device.Download(logits, logitsDst);
+            if (_act == Inkling2ActFormat.F16) CheckLogitsFinite(logitsDst);
+        }
         _pendingW.Clear(); _pendingR.Clear();
     }
 

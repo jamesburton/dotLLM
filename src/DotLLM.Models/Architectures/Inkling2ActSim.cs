@@ -39,8 +39,18 @@ internal sealed class Inkling2ActStat
 /// Vulkan forward stores them (every kernel output that lands in a scratch buffer), in a per-point / per-layer / per-row chosen format, and records the value ranges. With no
 /// simulator attached the model does one null check per point and nothing else. Accumulation and every value inside a fused kernel stay F32, as on the GPU.
 /// </summary>
-internal sealed class Inkling2ActSim
+internal sealed class Inkling2ActSim : DotLLM.Models.Architectures.DSpark.IInkling2Tap
 {
+    /// <summary>Max |value| of the rows the DSpark drafter would receive per layer visit (<see cref="DotLLM.Models.Architectures.DSpark.IInkling2Tap"/>: visits 5, 23, 41 are layer inputs, 48 the final normed output).</summary>
+    public readonly float[] TapMax = new float[64];
+
+    /// <inheritdoc/>
+    public void Capture(int visit, ReadOnlySpan<float> rows, int rowCount)
+    {
+        float m = 0; foreach (float v in rows) { float a = MathF.Abs(v); if (a > m) m = a; }
+        if ((uint)visit < (uint)TapMax.Length && m > TapMax[visit]) TapMax[visit] = m;
+    }
+
     /// <summary>Points on the residual stream (the layer outputs and what feeds the block stack).</summary>
     public static readonly HashSet<string> ResidualPoints = ["embed", "ffnInp", "blk", "layer_out"];
 

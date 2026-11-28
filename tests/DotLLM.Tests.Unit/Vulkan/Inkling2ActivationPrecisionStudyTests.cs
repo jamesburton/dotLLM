@@ -560,4 +560,66 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
             Log($"VITNOISE arm={a.Name}: relRMS vs CPU shipping encoder {Inkling2VulkanVisionEncoderTests.RelRms(f, cpuRef):E2}; non-finite {f.Count(v => !float.IsFinite(v))}; peak scratch {venc.LastPeakScratchBytes / 1e6:F1} MB");
         }
     }
+
+    // ───────────────────────────── gate 2: max |activation| sweep (CPU F32 trace) ─────────────────────────────
+
+    /// <summary>
+    /// F16 gate 2 (#2075): max |activation| at every store point and the DSpark tap visits (5, 23, 41, 48) of the CPU reference (F32, stats only) over a 16,640-token wikitext prompt and a
+    /// five-image prompt. The GPU F16 non-finite counts are in <see cref="Inkling2F16GateTests"/>. CPU only: hold cpu-bench (and the GPU lock: no iGPU job beside it).
+    /// </summary>
+    [SkippableFact]
+    public void Sweep_Stats_Cpu()
+    {
+        Gate();
+        string? gguf = Inkling2RealModelTests.FindGguf(); Skip.If(gguf is null);
+        string? mm = Inkling2VisionFixtures.FindMmproj(); Skip.If(mm is null);
+        string corpus = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotllm", "test-cache", "corpora", "wikitext-2-raw", "wiki.test.lf.raw");
+        Skip.IfNot(File.Exists(corpus), "corpus missing");
+        int longTokens = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_INK_PREC_LONG"), out int lt) ? lt : 16_640;
+        using var file = GgufFile.Open(gguf!);
+        var cfg = GgufModelConfigExtractor.Extract(file.Metadata);
+        using var cpu = LoadCpu(file, cfg);
+        var sets = new List<(string Set, Inkling2ActSim Sim)>();
+        // multi-image prompt first (short)
+        using var enc = Inkling2VisionEncoder.Load(mm!, ThreadingConfig.Auto);
+        var tokens = new List<int>(); var spans = new List<ImageSpan>(); var embs = new List<ImageEmbeddings>();
+        try
+        {
+            foreach (string name in new[] { "rainbow80", "rainbow190x110", "rainbow640", "rainbow190x110", "rainbow80" })
+            {
+                var o = Inkling2VisionEndToEndTests.LoadOracle(name)!;
+                var emb = enc.Encode(o.Image); embs.Add(emb);
+                tokens.AddRange(o.Before); spans.Add(new ImageSpan(tokens.Count, emb)); tokens.AddRange(Enumerable.Repeat(200054, emb.Tokens)); tokens.AddRange(o.After);
+            }
+            var simM = new Inkling2ActSim { Round = false };
+            cpu.Sim = simM; cpu.ResetSequenceState();
+            var prompt = tokens.ToArray();
+            for (int at = 0; at < prompt.Length; at += 128)
+            {
+                int len = Math.Min(128, prompt.Length - at);
+                using var t = cpu.ForwardWithImages(prompt.AsSpan(at, len), Enumerable.Range(at, len).ToArray(), -1, spans, null, true);
+            }
+            cpu.Sim = null; sets.Add(("multi-image", simM));
+            Log($"SWEEPCPU multi-image: {prompt.Length} tokens");
+        }
+        finally { foreach (var e in embs) e.Dispose(); }
+        // long text prompt
+        var tok = GgufTokenizerFactory.Load(file.Metadata);
+        string text = File.ReadAllText(corpus);
+        var ids = tok.Encode(text[..Math.Min(text.Length, longTokens * 6)]);
+        Skip.If(ids.Length < longTokens, "corpus too short");
+        var simL = new Inkling2ActSim { Round = false };
+        cpu.Sim = simL; cpu.ResetSequenceState();
+        var sw = Stopwatch.StartNew();
+        for (int at = 0; at < longTokens; at += 256)
+        {
+            int len = Math.Min(256, longTokens - at);
+            using var t = cpu.Forward(ids.AsSpan(at, len), Enumerable.Range(at, len).ToArray(), -1, null, true);
+        }
+        cpu.Sim = null; sets.Add(($"text{longTokens}", simL));
+        Log($"SWEEPCPU text {longTokens} tokens in {sw.Elapsed.TotalSeconds:F0} s");
+        DumpStats(sets);
+        foreach (var st in sets)
+            Log($"SWEEPTAP set={st.Set} DSpark tap max |value| per visit: 5 -> {st.Sim.TapMax[5]:G4}, 23 -> {st.Sim.TapMax[23]:G4}, 41 -> {st.Sim.TapMax[41]:G4}, 48 (final normed output) -> {st.Sim.TapMax[48]:G4}");
+    }
 }

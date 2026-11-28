@@ -1,0 +1,88 @@
+// Inkling 2 vision tower (issue #2062, part B): patch embedding + position embedding in one pass.
+//   x[(p + posOff), c] = bf16( sum_k patch_embd[c, k] * pix(p, k)  +  posemb_interp(p, c) )
+// pix: the normalised image rounded to F16 (what the reference's F16 im2col feeds), HWC order; k = (channel * 20 + ky) * 20 + kx. patch_embd and position_embd are read in
+// place in their stored precision (WT 0 = F32 as in the GGUF, 1 = F16, 2 = BF16 (default): converted once at load). F32 accumulation, one BF16 store.
+// The 32 x 32 position table is interpolated to the patch grid with ggml's bilinear upscale (half-pixel centres, clamped, no antialias); at a 32 x 32 grid it is the table itself.
+#extension GL_GOOGLE_include_directive : require
+#include "olala_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint WT = 2u;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufPix { uint16_t pix[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BufW { uint wgt[]; };
+layout(set = 0, binding = 2, std430) readonly buffer BufP { uint pos[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufX { ACT_T xout[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint gw; uint gh; uint imgW; uint posOff; uint ns; uint n;
+} pc;
+
+shared vec4 sW[16][16];
+shared vec4 sX[16][16];
+
+float elemOf(uint wv, uint i) {   // element i of a table stored as WT
+    if (WT == 0u) return uintBitsToFloat(wv);
+    uint h = ((i & 1u) == 0u) ? (wv & 0xFFFFu) : (wv >> 16u);
+    if (WT == 1u) return unpackHalf2x16(h).x;
+    return uintBitsToFloat(h << 16);
+}
+float wAt(uint i) { return elemOf(WT == 0u ? wgt[i] : wgt[i >> 1u], i); }
+float pAt(uint i) { return elemOf(WT == 0u ? pos[i] : pos[i >> 1u], i); }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint m0 = gl_WorkGroupID.x * 64u, t0 = gl_WorkGroupID.y * 64u;
+    uint tx = tid & 15u, ty = tid >> 4u;
+    const uint K = 1200u, E = 1024u;
+    float acc[4][4];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) acc[i][j] = 0.0;
+
+    for (uint k0 = 0u; k0 < K; k0 += 16u) {
+        for (uint e = 0u; e < 4u; ++e) {
+            uint idx = tid + e * 256u;
+            uint r = idx >> 4u, kk = idx & 15u;
+            // weight row m0 + r (always < 1024), element k0 + kk
+            sW[kk][r >> 2u][r & 3u] = wAt((m0 + r) * K + k0 + kk);
+            // pixel of token t0 + r
+            uint tok = t0 + r;
+            float xv = 0.0;
+            if (tok < pc.n) {
+                uint k = k0 + kk;
+                uint c = k / 400u, rem = k - c * 400u;
+                uint ky = rem / 20u, kx = rem - ky * 20u;
+                uint px = tok % pc.gw, py = tok / pc.gw;
+                uint pidx = ((py * 20u + ky) * pc.imgW + px * 20u + kx) * 3u + c;
+                xv = unpackHalf2x16(uint(pix[pidx])).x;
+            }
+            sX[kk][r >> 2u][r & 3u] = xv;
+        }
+        barrier();
+        for (uint k = 0u; k < 16u; ++k) {
+            vec4 w = sW[k][tx];
+            vec4 x = sX[k][ty];
+            for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) acc[i][j] = fma(x[i], w[j], acc[i][j]);
+        }
+        barrier();
+    }
+
+    const float off = 0.5;
+    float sf0 = float(pc.gw) / float(pc.ns), sf1 = float(pc.gh) / float(pc.ns);
+    int hi = int(pc.ns) - 1;
+    for (uint i = 0u; i < 4u; ++i) {
+        uint t = t0 + ty * 4u + i;
+        if (t >= pc.n) continue;
+        uint px = t % pc.gw, py = t / pc.gw;
+        float fx = (float(px) + off) / sf0 - off, fy = (float(py) + off) / sf1 - off;
+        int x0 = clamp(int(floor(fx)), 0, hi), x1 = clamp(int(floor(fx)) + 1, 0, hi);
+        int y0 = clamp(int(floor(fy)), 0, hi), y1 = clamp(int(floor(fy)) + 1, 0, hi);
+        float dx = clamp(fx - float(x0), 0.0, 1.0), dy = clamp(fy - float(y0), 0.0, 1.0);
+        uint ia = uint(y0 * int(pc.ns) + x0), ib = uint(y0 * int(pc.ns) + x1), ic = uint(y1 * int(pc.ns) + x0), id = uint(y1 * int(pc.ns) + x1);
+        for (uint j = 0u; j < 4u; ++j) {
+            uint c = m0 + tx * 4u + j;
+            float a = pAt(ia * E + c), b = pAt(ib * E + c), cc = pAt(ic * E + c), d = pAt(id * E + c);
+            float pe = a * (1.0 - dx) * (1.0 - dy) + b * dx * (1.0 - dy) + cc * (1.0 - dx) * dy + d * dx * dy;
+            xout[(t + pc.posOff) * E + c] = fToAct(acc[i][j] + pe);
+        }
+    }
+}

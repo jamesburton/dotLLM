@@ -2,5 +2,3 @@
 tests/DotLLM.Tests.Unit/Tokenizers/ChatTemplates/Fixtures/* -text
 # chunk_cache wire-contract fixtures are hashed byte for byte (fixtures.sha256).
 tests/DotLLM.Tests.Unit/ChunkCache/Fixtures/v1/* -text
-# Study-arm build script runs under bash (set -euo pipefail): keep LF.
-native/vulkan/build_study_arms.sh text eol=lf

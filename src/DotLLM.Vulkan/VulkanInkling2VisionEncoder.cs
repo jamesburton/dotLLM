@@ -59,8 +59,9 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
     private long _pixCap, _npos, _outCap;
 
     /// <summary>
-    /// MEASUREMENT arm (activation-precision study, epic #2025; default <see cref="Inkling2ActFormat.Bf16"/>, env <c>DOTLLM_VISION_ACT=bf16|f16|f32</c>): storage format of the tower's activations
-    /// (the residual stream, norm outputs, Q/K/V, attention output, the up-projection). Accumulation stays F32 in every arm. Set before encoding; changing it drops the scratch.
+    /// Storage format of the tower's activations (the residual stream, norm outputs, Q/K/V, attention output, the up-projection). Default <see cref="Inkling2ActFormat.F16"/> since #2075 (user ruling
+    /// 2026-11-28, after the activation-precision study, docs/INKLING2.md 12c); env <c>DOTLLM_VISION_ACT=bf16|f16|f32</c> (BF16 = the previous default, F32 = measurement arm). Accumulation stays F32 in every
+    /// arm. Set before encoding; changing it drops the scratch. A non-finite F16 result (overflow, never seen: the residual stream peaks at 49 against 65,504) re-encodes that image in BF16, see <see cref="Bf16Fallbacks"/>.
     /// </summary>
     public Inkling2ActFormat ActFormat
     {
@@ -75,7 +76,13 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
         set { if (value == _ropeF32) return; lock (_lock) { ReleaseScratch(); _ropeF32 = value; foreach (var t in _ropeTables.Values) NativeMemory.AlignedFree((void*)t); _ropeTables.Clear(); _ropeOrder.Clear(); } }
     }
 
-    private Inkling2ActFormat _act = Inkling2ActFormat.Bf16;
+    private Inkling2ActFormat _act = Inkling2ActFormat.F16;
+
+    /// <summary>Test seam: runs on the downloaded embeddings just before the finite check (poisons them to prove the guard's BF16 fallback).</summary>
+    internal Action<Span<Half>>? AfterDownload { get; set; }
+
+    /// <summary>Number of encodes whose F16 result was non-finite and was recomputed in BF16 (the runtime guard; 0 in every measured run).</summary>
+    public int Bf16Fallbacks { get; private set; }
     private bool _ropeF32;
     private int ActBytes => _act == Inkling2ActFormat.F32 ? 4 : 2;
 
@@ -306,12 +313,9 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
 
     private OlalaKernel Kernel(string name, int buffers, int pushWords, params uint[] spec)
     {
-        if (_act != Inkling2ActFormat.Bf16 || _ropeF32)
-        {
-            // study arms: the F16 / F32 twins (built by native/vulkan/build_study_arms.sh); the GEMM's study copy also carries the F32 RoPE table
-            string suffix = _act == Inkling2ActFormat.F16 ? "_f16act" : _act == Inkling2ActFormat.F32 ? "_f32act" : "";
-            name = name == "vit_gemm_q8" ? "vit_gemm_q8_study" + suffix + (_ropeF32 ? "_rope32" : "") : name + suffix;
-        }
+        // activation-format twins (gen_vit_wrappers.py): vit_X[_f16act|_f32act]; the GEMM also has the F32-RoPE-table measurement variant (_rope32)
+        string suffix = _act == Inkling2ActFormat.F16 ? "_f16act" : _act == Inkling2ActFormat.F32 ? "_f32act" : "";
+        name += suffix + (_ropeF32 && name == "vit_gemm_q8" ? "_rope32" : "");
         string key = name + "|" + string.Join(",", spec);
         if (!_kernels.TryGetValue(key, out var k))
         {
@@ -424,6 +428,21 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
                     RecordTower(W, gw, gh, n, npos, nm, mw, ct);
                     _submit.SubmitAndWait();
                     _device.Download(_out, MemoryMarshal.Cast<Half, float>(result.Rows));
+                    AfterDownload?.Invoke(result.Rows);
+                    if (_act == Inkling2ActFormat.F16 && !AllFinite(result.Rows))
+                    {
+                        // Runtime guard (#2075): the tower is stateless, so a non-finite F16 result is recomputed in BF16 (full F32 exponent range) instead of returning NaN embeddings.
+                        Bf16Fallbacks++;
+                        _act = Inkling2ActFormat.Bf16;
+                        try
+                        {
+                            Begin();
+                            RecordTower(W, gw, gh, n, npos, nm, mw, ct);
+                            _submit.SubmitAndWait();
+                            _device.Download(_out, MemoryMarshal.Cast<Half, float>(result.Rows));
+                        }
+                        finally { _act = Inkling2ActFormat.F16; }
+                    }
                     return result;
                 }
                 catch { result.Dispose(); throw; }
@@ -434,6 +453,13 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
                 if (ScratchBytes() > ScratchKeepBytes) ReleaseScratch();
             }
         }
+    }
+
+    /// <summary>True when every element is finite (the guard's check: one pass over the <c>[n/4][2304]</c> F16 output).</summary>
+    internal static bool AllFinite(ReadOnlySpan<Half> rows)
+    {
+        foreach (var h in rows) if (!Half.IsFinite(h)) return false;
+        return true;
     }
 
     private void RecordTower(int W, int gw, int gh, int n, int npos, int nm, int mw, CancellationToken ct)

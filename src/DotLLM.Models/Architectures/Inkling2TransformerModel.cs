@@ -444,6 +444,7 @@ public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInpu
 
     private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Inkling2SequenceState st, bool lastOnly, Inkling2Scratch sc, IReadOnlyList<ImageSpan>? images = null, IInkling2Tap? tap = null)
     {
+        tap ??= Sim;
         int visit = 0;
         int T = tokenIds.Length, H = _hidden;
         int pos0 = st.Length;

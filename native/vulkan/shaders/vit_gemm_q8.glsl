@@ -1,7 +1,5 @@
-#version 450
-// STUDY COPY of vit_gemm_q8.comp (activation-precision study, epic #2025; never selected by default). Differences: the activation tile load follows the activation
-// format (-DACT_F16: IEEE half words; -DACT_F32: F32 vec4 pairs; default BF16 words) and -DROPE_F32 reads the RoPE cos/sin table as F32 instead of F16.
-// Build: native/vulkan/build_study_arms.sh. The shipped vit_gemm_q8.comp is untouched.
+// The activation tile load follows the activation format (ACT_F16: IEEE half words; ACT_F32: F32 vec4 pairs; default BF16 words), ROPE_F32 reads the RoPE cos/sin
+// table as F32 instead of F16 (measurement arm). Wrappers: gen_vit_wrappers.py (vit_gemm_q8[_f16act|_f32act][_rope32].comp).
 // Inkling 2 vision tower (issue #2062, part B): Y[t, m] = epi( sum_k W[m, k] * X[t, k] ) with W a Q8_0 matrix read IN PLACE (each 34-byte block is decoded into
 // shared memory inside the tile load; nothing is expanded in global memory), X and Y BF16 activations, F32 accumulation (registers), one BF16 rounding on the store.
 // 64 (M) x 64 (tokens) tile, K step 32 = one Q8_0 block per weight row, 256 threads, each a 4 x 4 register tile.
