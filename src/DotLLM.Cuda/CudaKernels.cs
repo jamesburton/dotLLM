@@ -1389,6 +1389,14 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _gdnDecaySigmoidF32Func = _gdnScanF32Module.TryGetFunction("gdn_decay_sigmoid_f32");
         }
 
+        // Interleaved M-RoPE (issue #2073). Optional: the PTX is generated on a CUDA box (no nvcc on the dev host).
+        string mropeF32Path = Path.Combine(ptxDir, "rope_mrope_f32.ptx");
+        if (File.Exists(mropeF32Path))
+        {
+            _mropeF32Module = CudaModule.LoadFromFile(mropeF32Path);
+            _mropeF32Func = _mropeF32Module.TryGetFunction("rope_mrope_f32");
+        }
+
         string mamba3DataRopeF32Path = Path.Combine(ptxDir, "mamba3_data_rope_f32.ptx");
         if (File.Exists(mamba3DataRopeF32Path))
         {
@@ -9066,6 +9074,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         _conv1dCausalF32Module?.Dispose();
         _gdnScanF32Module?.Dispose();
         _mamba3DataRopeF32Module?.Dispose();
+        _mropeF32Module?.Dispose();
         _mamba3ChunkBoundaryF32Module?.Dispose();
         _mamba3SsdScanSisoF32Module?.Dispose();
         _mamba3SsdScanMimoF32Module?.Dispose();

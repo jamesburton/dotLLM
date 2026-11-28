@@ -1576,6 +1576,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
                 (nuint)(seqLen * sizeof(int)), streamH).ThrowOnError();
         }
 
+        _vision.SetPlain();   // a head-only instance never carries images (issue #2073)
         float[] embedHost = new float[(long)seqLen * hiddenSize];
         for (int t = 0; t < seqLen; t++)
         {
@@ -2257,6 +2258,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             // host's EmbedTokens code path, run on the same host rows (issue #479).
             if (_hadamard is { } embRot)
                 embRot.RotateInverseInPlaceHost(pEmbedHost, seqLen, hiddenSize);
+            // Image input (issue #2073): image rows replace their slots' embeddings (primal basis), rope mode + positions are decided.
+            PrepareVision(positions, kvCache, pEmbedHost, hiddenSize, mtpCapture is not null || _dflashCall is not null, streamH);
             CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.HiddenState, (nint)pEmbedHost,
                 (nuint)((long)seqLen * hiddenSize * sizeof(float)), streamH).ThrowOnError();
         }
@@ -2273,7 +2276,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             DotLLM.Core.Diagnostics.HiddenStateTapRegistry.PathCounters.AddCudaGraphBypassed();
             CudaHiddenStateTaps.LogOnce("cuda-graph", "a hidden-state tap is attached: the CUDA decode graph is bypassed and the layer loop runs eagerly.");
         }
-        bool graphed = ts is null && seqLen <= MaxGraphRows && _dflashCall is null && ResidualModifier is null   // #1919: a graph replay never reaches the per-layer PostLayer call
+        // #2073: a shifted / M-RoPE forward rotates from RopePositionsDevice, which a captured graph does not read: run it eagerly.
+        if (_vision.Mode != VisionRopeMode.Plain) _aheadValid = false;
+        bool graphed = ts is null && _vision.Mode == VisionRopeMode.Plain && seqLen <= MaxGraphRows && _dflashCall is null && ResidualModifier is null   // #1919: a graph replay never reaches the per-layer PostLayer call
             && TryForwardDecodeGraph(positions, hiddenSize, numHeads, numKvHeads, headDim, eps, kvCache);
         if (!graphed)
         {
@@ -2975,6 +2980,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
     {
+        ThrowIfRopeDeltaActive();
         if (state is DFlashMtpState dflash)
             return ForwardDFlashDraft(dflash, tokenId, position);
         var (mtpHead, mtp) = ValidateMtpCall(state);
@@ -3018,6 +3024,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public int ForwardMtpArgMax(IMtpState state, int tokenId, int position)
     {
+        ThrowIfRopeDeltaActive();
         if (state is DFlashMtpState dflash)
             return ForwardDFlashArgMax(dflash, tokenId, position);
         var (mtpHead, mtp) = ValidateMtpCall(state);
@@ -3974,9 +3981,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("attn-4-qknorm");
 
         // ── 5. RoPE — partial-rotary NeoX ──
-        _kernels.LaunchRoPEF32(q, k, _state.PositionsDevice,
-            seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, 1, streamH,
-            ropeInvFreq: _ropeYarnInvFreq, ropeMscale: _ropeYarnMscale);
+        LaunchAttentionRope(q, k, seqLen, numHeads, numKvHeads, headDim, streamH);
         DumpDevice2D($"blk.{layer}.fa_q_postrope", q, seqLen, qElems);
         DumpDevice2D($"blk.{layer}.fa_k_postrope", k, seqLen, numKvHeads * headDim);
         ProfMark("attn-5-rope");
@@ -5446,6 +5451,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         FreeIfNonZero(ref _attnMmaDecodeQF16);
         FreeIfNonZero(ref _attnFlashPrefillQF16);
         FreeIfNonZero(ref _ropeYarnInvFreq);
+        FreeIfNonZero(ref _mropeAxisDevice);
 
         // MTP (issue #253): free the trailing NextN head's device weights (a no-op when absent).
         if (_mtpHead is { } mtpHead)

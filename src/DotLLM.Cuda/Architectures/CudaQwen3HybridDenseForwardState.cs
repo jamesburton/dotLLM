@@ -106,6 +106,9 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     public nint TokenIdsDevice;
     public nint PositionsDevice;
 
+    /// <summary>Rope positions when they differ from the slot positions (image input, issue #2073): [3][cap] int32 (t, y, x), or the shifted slot - delta in the first [cap] ints.</summary>
+    public nint RopePositionsDevice;
+
     public CudaQwen3HybridDenseForwardState(
         int hiddenSize,
         int vocabSize,
@@ -243,6 +246,7 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
 
         TokenIdsDevice = AllocDevice((long)cap * sizeof(int));
         PositionsDevice = AllocDevice((long)cap * sizeof(int));
+        RopePositionsDevice = AllocDevice((long)cap * 3 * sizeof(int));
 
         _currentSeqLen = cap;
     }
@@ -303,6 +307,7 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
         FfnGate = FfnUp = SiluOutput = GdnRotScratch = AttnRotScratch = 0;
         FreeIfNonZero(ref TokenIdsDevice);
         FreeIfNonZero(ref PositionsDevice);
+        FreeIfNonZero(ref RopePositionsDevice);
     }
 
     /// <inheritdoc/>
