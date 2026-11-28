@@ -10,7 +10,7 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 /// The correctness gate for PTQ1_0 (issue #436): a <b>bit-exact</b> comparison of
 /// <see cref="Dequantize.ToFloat32"/> against the PrismML fork's own
 /// <c>dequantize_row_ptq1_0</c>, fed with real block bytes lifted out of
-/// <c>Ternary-Bonsai-2-27B-PTQ1_0.gguf</c>.
+/// <c>Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf</c>.
 ///
 /// <para>Perplexity is deliberately <b>not</b> the gate here. A transposed Q3_K dequant shipped
 /// undetected across every backend for months because the only check applied to it was coarse
@@ -22,14 +22,14 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 /// <item>the fork's built <c>ggml-base.dll</c>, which exports the reference routine —
 /// <c>DOTLLM_PRISM_GGML_DIR</c>, else <c>C:\Development\prism-llama.cpp\build\bin\Release</c>;</item>
 /// <item>the GGUF itself — <c>DOTLLM_BONSAI_PTQ1_0_GGUF</c>, else the HF hub cache, else
-/// <c>~/.dotllm/{models,test-cache}/PrismML/Ternary-Bonsai-2-27B-GGUF/</c>.</item>
+/// <c>~/.dotllm/{models,test-cache}/PrismML/Ternary-Bonsai-2.5-27B-GGUF/</c>.</item>
 /// </list>
 /// </summary>
 public sealed class PTQ1_0ForkOracleTests
 {
     private const string GgmlDirEnvVar = "DOTLLM_PRISM_GGML_DIR";
     private const string ModelPathEnvVar = "DOTLLM_BONSAI_PTQ1_0_GGUF";
-    private const string FileName = "Ternary-Bonsai-2-27B-PTQ1_0.gguf";
+    private const string FileName = "Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf";
     private const string DefaultGgmlDir = @"C:\Development\prism-llama.cpp\build\bin\Release";
 
     /// <summary>
@@ -180,7 +180,7 @@ public sealed class PTQ1_0ForkOracleTests
     }
 
     private const string Pq2ModelPathEnvVar = "DOTLLM_BONSAI_2_PQ2_0_GGUF";
-    private const string Pq2FileName = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
+    private const string Pq2FileName = "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf";
 
     private static string? ResolvePq2_0FixturePath()
     {
@@ -190,7 +190,7 @@ public sealed class PTQ1_0ForkOracleTests
 
         string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string hub = Path.Combine(home, ".cache", "huggingface", "hub",
-            "models--prism-ml--Ternary-Bonsai-2-27B-gguf", "snapshots");
+            "models--prism-ml--Ternary-Bonsai-2.5-27B-GGUF", "snapshots");
         if (Directory.Exists(hub))
             foreach (string snapshot in Directory.EnumerateDirectories(hub))
             {
@@ -220,8 +220,8 @@ public sealed class PTQ1_0ForkOracleTests
         string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string[] candidates =
         [
-            Path.Combine(home, ".dotllm", "models", "PrismML", "Ternary-Bonsai-2-27B-GGUF", FileName),
-            Path.Combine(home, ".dotllm", "test-cache", "PrismML", "Ternary-Bonsai-2-27B-GGUF", FileName),
+            Path.Combine(home, ".dotllm", "models", "PrismML", "Ternary-Bonsai-2.5-27B-GGUF", FileName),
+            Path.Combine(home, ".dotllm", "test-cache", "PrismML", "Ternary-Bonsai-2.5-27B-GGUF", FileName),
         ];
         foreach (string candidate in candidates)
             if (File.Exists(candidate))
@@ -229,7 +229,7 @@ public sealed class PTQ1_0ForkOracleTests
 
         // The HF hub cache, where `hf download` puts it: blobs are reached through snapshots/*/.
         string hub = Path.Combine(home, ".cache", "huggingface", "hub",
-            "models--prism-ml--Ternary-Bonsai-2-27B-gguf", "snapshots");
+            "models--prism-ml--Ternary-Bonsai-2.5-27B-GGUF", "snapshots");
         if (Directory.Exists(hub))
             foreach (string snapshot in Directory.EnumerateDirectories(hub))
             {

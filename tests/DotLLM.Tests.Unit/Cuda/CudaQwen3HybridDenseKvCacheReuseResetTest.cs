@@ -31,7 +31,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 public class CudaQwen3HybridDenseKvCacheReuseResetTest
 {
     private const string ModelPathEnvVar = "DOTLLM_BONSAI_PQ2_0_GGUF";
-    private const string FileName = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
+    private const string FileName = "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf";
 
     private readonly ITestOutputHelper _out;
     public CudaQwen3HybridDenseKvCacheReuseResetTest(ITestOutputHelper output) => _out = output;
@@ -51,7 +51,7 @@ public class CudaQwen3HybridDenseKvCacheReuseResetTest
         string? path = ResolveFixturePath();
         Skip.If(path is null,
             $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}, or place {FileName} under "
-            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
+            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2.5-27B-GGUF/.");
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir is null, "PTX files not found");
 

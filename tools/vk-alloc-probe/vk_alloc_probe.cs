@@ -3,7 +3,7 @@
 // Standalone Vulkan device-local allocation probe.
 //
 // WHY THIS EXISTS (see .docs/BONSAI2_27B_SUPPORT.md "Vulkan allocator bug"):
-// loading Ternary-Bonsai-2-27B (PQ2_0, ~7.2 GB packed) through dotLLM's Vulkan
+// loading Ternary-Bonsai-2.5-27B (PQ2_0, ~7.2 GB packed) through dotLLM's Vulkan
 // backend dies with VK_ERROR_OUT_OF_DEVICE_MEMORY on a single ~356 MB
 // DEVICE_LOCAL allocation, while the heap it targets (heap[1], 96 GiB on this
 // Strix Halo part) reports 91.20 GiB budget / 0 usage from a *separate*

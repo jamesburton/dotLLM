@@ -9,7 +9,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 
 /// <summary>
 /// Real-weight construction smoke test for <see cref="Qwen3HybridDenseTransformerModel"/>
-/// against PrismML's actual <c>Ternary-Bonsai-2-27B-PQ2_0.gguf</c> (issue #157). Confirms the
+/// against PrismML's actual <c>Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf</c> (issue #157). Confirms the
 /// full loader path — GGUF parsing, config extraction (<c>qwen35</c> → dense GDN/attention
 /// hybrid layout), per-layer weight loading (GDN, full-attention, and dense FFN tensor
 /// lookups) — completes without throwing on the real 27B checkpoint. Does NOT run a forward
@@ -18,7 +18,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 public sealed class Qwen3HybridDenseRealGgufConstructionTests
 {
     private const string ModelPathEnvVar = "DOTLLM_BONSAI_PQ2_0_GGUF";
-    private const string FileName = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
+    private const string FileName = "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf";
 
     [SkippableFact]
     public void LoadFromGguf_RealBonsai27B_ConstructsWithoutThrowing()
@@ -26,7 +26,7 @@ public sealed class Qwen3HybridDenseRealGgufConstructionTests
         string? path = ResolveFixturePath();
         Skip.If(path is null,
             $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}, or place {FileName} under "
-            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
+            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2.5-27B-GGUF/.");
 
         using var gguf = GgufFile.Open(path!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);

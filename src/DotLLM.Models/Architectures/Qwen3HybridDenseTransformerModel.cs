@@ -138,6 +138,13 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel, Do
     /// <inheritdoc/>
     public long ComputeMemoryBytes => _state.AllocatedBytes + _gdnCache.AllocatedBytes;
 
+    /// <summary>
+    /// The weights are memory-mapped and so absent from <see cref="ComputeMemoryBytes"/> (a 7 GiB Bonsai-2.5 looked like a 170 MiB model to the
+    /// adaptive MTP gate, which therefore tried plain decode first: a one-shot <c>run</c> never used MTP, though forced MTP measured 1.7x on CPU,
+    /// #2072). The mapped data section is what the gate's size prior is about.
+    /// </summary>
+    public long MtpGatePriorBytes => ComputeMemoryBytes + (_gguf?.DataSectionLength ?? 0L);
+
     /// <summary>Number of full-attention layers — the matching sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
 

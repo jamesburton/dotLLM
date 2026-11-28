@@ -15,7 +15,7 @@ using DotLLM.Tests.Integration.Fixtures;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// Vulkan MTP against the <b>real</b> <c>Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0</c> checkpoint —
+/// Vulkan MTP against the <b>real</b> <c>Ternary-Bonsai-2.5-27B-PQ2_0-mtp</c> checkpoint —
 /// issue #435, acceptance criteria 2 and 4.
 /// </summary>
 /// <remarks>
@@ -58,7 +58,7 @@ public sealed class VulkanBonsai2MtpRealCheckpointTests
     public VulkanBonsai2MtpRealCheckpointTests(ITestOutputHelper output) => _out = output;
 
     private static string? FindCheckpoint() =>
-        TestFixtureResolver.ResolveFile("DOTLLM_BONSAI2_MTP_GGUF", "ProCreations", "Ternary-Bonsai-2-27B-MTP", "*MTP*.gguf").Path;
+        TestFixtureResolver.ResolveFile("DOTLLM_BONSAI2_MTP_GGUF", "prism-ml", "Ternary-Bonsai-2.5-27B-GGUF", "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf").Path;
 
     /// <summary>
     /// Acceptance criterion 2: the same draft tokens, from the same checkpoint, at the same

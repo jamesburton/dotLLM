@@ -27,7 +27,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 public class CudaQwen3HybridDenseKvStagingTest
 {
     private const string ModelPathEnvVar = "DOTLLM_BONSAI_PQ2_0_GGUF";
-    private const string FileName = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
+    private const string FileName = "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf";
     private const int PrefillLen = 300;      // > AttentionGqaSplitMinSeqKv (256) so decode is mma-eligible
     private const int DecodeSteps = 6;
 
