@@ -56,7 +56,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
     public const string MinContextEnvVar = "DOTLLM_DSPARK_MIN_CONTEXT";
 
     /// <summary>Default of <see cref="DSparkMinContext"/>.</summary>
-    public const int DefaultMinContext = int.MaxValue;
+    public const int DefaultMinContext = 12288;
 
     /// <summary>Context (prompt + generation budget, tokens) from which an auto-detected drafter attaches; settable (tests, embedders), else <see cref="MinContextEnvVar"/>, else <see cref="DefaultMinContext"/>.</summary>
     public int DSparkMinContext
