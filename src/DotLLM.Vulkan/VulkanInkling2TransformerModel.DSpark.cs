@@ -105,7 +105,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
 
     /// <inheritdoc/>
     public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache, IMtpState? mtpState)
-        => ForwardCore(tokenIds, positions, deviceId, lastOnly: false, AsState(mtpState), recordRows: true);
+        => ForwardCore(tokenIds, positions, deviceId, lastOnly: false, ds: AsState(mtpState), recordRows: true);
 
     /// <inheritdoc/>
     public void RestoreRecurrentStateToRow(int row)
@@ -169,11 +169,11 @@ public sealed unsafe partial class VulkanInkling2TransformerModel
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState)
-        => adapter is not null ? throw new NotSupportedException("inkling2 on Vulkan has no LoRA support.") : ForwardCore(tokenIds, positions, deviceId, lastOnly: false, AsState(mtpState));
+        => adapter is not null ? throw new NotSupportedException("inkling2 on Vulkan has no LoRA support.") : ForwardCore(tokenIds, positions, deviceId, lastOnly: false, ds: AsState(mtpState));
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState, bool lastTokenLogitsOnly)
-        => adapter is not null ? throw new NotSupportedException("inkling2 on Vulkan has no LoRA support.") : ForwardCore(tokenIds, positions, deviceId, lastTokenLogitsOnly, AsState(mtpState));
+        => adapter is not null ? throw new NotSupportedException("inkling2 on Vulkan has no LoRA support.") : ForwardCore(tokenIds, positions, deviceId, lastTokenLogitsOnly, ds: AsState(mtpState));
 
     /// <inheritdoc/>
     public int ForwardMtpArgMax(IMtpState state, int tokenId, int position)

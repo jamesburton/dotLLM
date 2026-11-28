@@ -792,7 +792,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             try
             {
                 if (model is not DotLLM.Core.Vision.IImageInputModel)
-                    throw new NotSupportedException($"--image: the {config.Architecture} model does not accept image input (supported: Inkling 2 on the CPU backend).");
+                    throw new NotSupportedException($"--image: the {config.Architecture} model does not accept image input (supported: Inkling 2 on the CPU and Vulkan backends).");
                 if (gguf is null) throw new NotSupportedException("--image needs a GGUF model with an embedded chat template.");
                 // The image prefill (IImageInputModel.ForwardWithImages) takes no adapter and would silently run the base model: refuse, as the server does.
                 if (loraAdapter is not null) throw new NotSupportedException("--image cannot be combined with --lora: the image prefill would not apply the adapter.");
