@@ -93,7 +93,11 @@ void main() {
                     if (EPI == 1u) { float rl = max(v, 0.0); v = rl * rl; }
                     else if (EPI == 2u) v += actToF(aux[col * pc.M + m]);
                     if (OUTF32 == 1u) yf[col * pc.M + m] = v;
+#if defined(OUT_F16) && !defined(ACT_F32)
+                    else yout[col * pc.M + m] = uint16_t(packHalf2x16(vec2(v, 0.0)) & 0xFFFFu);   // F16 logits arm (#2046)
+#else
                     else yout[col * pc.M + m] = fToAct(v);
+#endif
                 }
             }
         }

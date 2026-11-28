@@ -17,8 +17,11 @@ internal interface IInkling2Tap
 /// <c>ForwardMtpArgMax</c> of a round drafts the whole block, later calls serve it; <see cref="Rollback"/> crops the context.
 /// </summary>
 /// <remarks>
-/// Context K/V is indexed by sequence position (F16, grown on demand): the global drafter layer attends over the whole context, the local ones over the last
-/// 1024 positions. Bytes per position: <c>layers x 2 x kvDim x 2</c> (12 KiB for Inkling-2-Mini). The <c>f_rnn</c> rows are F16 in a small ring.
+/// Context K/V is F16 and windowed (issue #2060): the local (sliding-window) drafter layers keep a RING of <c>window + InjectChunk</c> positions, flat in the sequence
+/// length (a block sees <c>pos0 - 1024 .. pos0 - 1</c>; the slack covers the rows a rejected verify wrote ahead and an injection chunk); only the global layer keeps the
+/// whole context, in a buffer that grows on demand and is ADMITTED against the memory still available to the process (when it is not, the state turns
+/// <see cref="Unusable"/>, logs once and drafts nothing useful: it never spills silently). Steady-state bytes per position: <c>kvDim x 2 x 2</c> (4 KiB for Inkling-2-Mini, was 12 KiB)
+/// plus a fixed ring. The <c>f_rnn</c> rows are F16 in a small ring.
 /// </remarks>
 internal sealed unsafe class Inkling2DSparkState : IMtpState, IInkling2Tap
 {
@@ -26,7 +29,9 @@ internal sealed unsafe class Inkling2DSparkState : IMtpState, IInkling2Tap
     private readonly int _kvDim, _h;
     private readonly int[] _slotOfVisit;
     private readonly NativeBuffer<ushort>[] _k, _v;   // per layer, [capacity][kvDim] Half bits
-    private int _capacity;
+    private int _capacity;   // positions of the global layers' linear buffers
+    private readonly int _ringPositions;
+    private readonly bool[] _local;
     private readonly NativeBuffer<ushort> _frnn;
     private readonly int[] _frnnPos;
     private Half* _taps;
@@ -36,7 +41,7 @@ internal sealed unsafe class Inkling2DSparkState : IMtpState, IInkling2Tap
     private int _draftStart = -1, _draftCount;
     private bool _disposed;
 
-    internal Inkling2DSparkState(Inkling2DSparkDrafter drafter, int visits)
+    internal Inkling2DSparkState(Inkling2DSparkDrafter drafter, int visits, int ringPositions = 0)
     {
         _drafter = drafter;
         _kvDim = drafter.NumKvHeads * drafter.HeadDim;
@@ -44,7 +49,14 @@ internal sealed unsafe class Inkling2DSparkState : IMtpState, IInkling2Tap
         _slotOfVisit = drafter.SlotForVisit(visits);
         _k = new NativeBuffer<ushort>[drafter.NumLayers];
         _v = new NativeBuffer<ushort>[drafter.NumLayers];
-        for (int i = 0; i < _k.Length; i++) { _k[i] = new NativeBuffer<ushort>(0); _v[i] = new NativeBuffer<ushort>(0); }
+        _ringPositions = ringPositions > 0 ? ringPositions : drafter.Window + Inkling2DSparkDrafter.InjectChunkRows;
+        _local = new bool[drafter.NumLayers];
+        for (int i = 0; i < _k.Length; i++)
+        {
+            _local[i] = drafter.IsLocalLayer(i);
+            _k[i] = new NativeBuffer<ushort>(_local[i] ? (long)_ringPositions * _kvDim : 0);
+            _v[i] = new NativeBuffer<ushort>(_local[i] ? (long)_ringPositions * _kvDim : 0);
+        }
         _frnn = new NativeBuffer<ushort>((long)drafter.FrnnRows * _h);
         _frnnPos = new int[drafter.FrnnRows];
         Array.Fill(_frnnPos, -1);
@@ -53,6 +65,18 @@ internal sealed unsafe class Inkling2DSparkState : IMtpState, IInkling2Tap
 
     /// <summary>The drafter this state belongs to.</summary>
     public Inkling2DSparkDrafter Drafter => _drafter;
+
+    /// <summary>Positions the ring layers keep.</summary>
+    internal int RingPositions => _ringPositions;
+
+    /// <summary>Ring size of <paramref name="layer"/> (0 = linear: the global layer).</summary>
+    internal int RingFor(int layer) => _local[layer] ? _ringPositions : 0;
+
+    /// <summary>True once the global layer's context could not be admitted; the state then drafts nothing useful (see the type remarks).</summary>
+    internal bool Unusable { get; private set; }
+
+    /// <summary>Test hook: replaces the memory-admission check (bytes still wanted -> admitted).</summary>
+    internal static Func<long, bool>? AdmissionOverride { get; set; }
 
     /// <summary>Resident bytes of the context K/V.</summary>
     public long KvBytes { get { long b = 0; foreach (var k in _k) b += k.Bytes * 2; return b; } }
@@ -84,23 +108,46 @@ internal sealed unsafe class Inkling2DSparkState : IMtpState, IInkling2Tap
     internal Half* Keys(int layer) => (Half*)_k[layer].Ptr;
     internal Half* Values(int layer) => (Half*)_v[layer].Ptr;
 
-    private void EnsureCapacity(int positions)
+    private bool EnsureCapacity(int positions)
     {
-        if (positions <= _capacity) return;
+        if (positions <= _capacity) return true;
+        if (Unusable) return false;
         int next = Math.Max(positions, Math.Max(256, _capacity * 2));
-        for (int i = 0; i < _k.Length; i++) { _k[i].Grow((long)next * _kvDim); _v[i].Grow((long)next * _kvDim); }
+        int globals = 0;
+        for (int i = 0; i < _k.Length; i++) if (!_local[i]) globals++;
+        long extra = (long)(next - _capacity) * _kvDim * 2 * 2 * globals;   // K and V, F16
+        if (!Admit(extra))
+        {
+            Unusable = true;
+            Console.Error.WriteLine($"[dspark] drafter context disabled: the global layer's K/V for {next} positions needs {extra / 1048576} MiB more and the host does not have it free; decoding continues without useful drafts.");
+            return false;
+        }
+        for (int i = 0; i < _k.Length; i++) if (!_local[i]) { _k[i].Grow((long)next * _kvDim); _v[i].Grow((long)next * _kvDim); }
         _capacity = next;
+        return true;
+    }
+
+    private static bool Admit(long extraBytes)
+    {
+        if (AdmissionOverride is { } o) return o(extraBytes);
+        long total = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+        long used = Environment.WorkingSet;
+        return extraBytes <= total - used - (512L << 20);
     }
 
     /// <summary>Writes F32 K/V rows <c>[n][kvDim]</c> (post-norm, post-RoPE K) of <paramref name="positions"/> into layer <paramref name="layer"/> as F16.</summary>
     internal void WriteKv(int layer, ReadOnlySpan<int> positions, float* k, float* v)
     {
-        int max = 0;
-        foreach (int p in positions) max = Math.Max(max, p);
-        EnsureCapacity(max + 1);
+        if (!_local[layer])
+        {
+            int max = 0;
+            foreach (int p in positions) max = Math.Max(max, p);
+            if (!EnsureCapacity(max + 1)) return;
+        }
+        int ring = RingFor(layer);
         for (int t = 0; t < positions.Length; t++)
         {
-            long off = (long)positions[t] * _kvDim;
+            long off = (long)(ring == 0 ? positions[t] : positions[t] % ring) * _kvDim;
             TensorPrimitives.ConvertToHalf(new ReadOnlySpan<float>(k + (long)t * _kvDim, _kvDim), new Span<Half>((Half*)_k[layer].Ptr + off, _kvDim));
             TensorPrimitives.ConvertToHalf(new ReadOnlySpan<float>(v + (long)t * _kvDim, _kvDim), new Span<Half>((Half*)_v[layer].Ptr + off, _kvDim));
         }
@@ -174,6 +221,7 @@ internal sealed unsafe class Inkling2DSparkState : IMtpState, IInkling2Tap
     internal int NextDraft(IInkling2DSparkTarget target, int tokenId, int position, int draftTokens)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (Unusable) return tokenId;   // no admitted context: the anchor repeated for every position (the verify rejects it; correctness is unaffected)
         if (position == _length)
         {
             _draftCount = Math.Clamp(draftTokens, 1, _draft.Length);

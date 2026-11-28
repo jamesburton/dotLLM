@@ -1,0 +1,36 @@
+#version 450
+// DSpark argmax reduction (issue #2046): tok[slot] = index of the largest (value, index) partial (lowest index on ties). One 256-thread workgroup.
+#extension GL_GOOGLE_include_directive : require
+#include "inkling2_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufPart { vec2 part[]; };
+layout(set = 0, binding = 1, std430)          buffer BufTok  { uint tok[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+    uint slot;
+} pc;
+
+shared float sv[256];
+shared uint  si[256];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float bv = -3.0e38; uint bi = 0xFFFFFFFFu;
+    for (uint i = t; i < pc.n; i += 256u) {
+        float v = part[i].x; uint ix = floatBitsToUint(part[i].y);
+        if (v > bv || (v == bv && ix < bi)) { bv = v; bi = ix; }
+    }
+    sv[t] = bv; si[t] = bi;
+    barrier();
+    for (uint s = 128u; s >= 1u; s >>= 1u) {
+        if (t < s) {
+            float ov = sv[t + s]; uint oi = si[t + s];
+            if (ov > sv[t] || (ov == sv[t] && oi < si[t])) { sv[t] = ov; si[t] = oi; }
+        }
+        barrier();
+    }
+    if (t == 0u) tok[pc.slot] = si[0];
+}
