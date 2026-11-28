@@ -545,8 +545,8 @@ mutant: the rounding carry already yields infinity for 65,520..65,535.) The BF16
 
 **Gate 3, the guard.** *Text model:* the logits of every chunk that returns them are checked after the download (`TensorPrimitives.SumOfMagnitudes`, vectorised, NaN / +-inf propagate): non-finite throws
 `InvalidOperationException` naming `DOTLLM_INKLING2_ACT=bf16`. It fails loudly instead of falling back because a chunk has already advanced the K/V ring and the conv state, so it cannot be re-run in BF16.
-An overflowing F16 store makes the hidden state NaN within the chunk and K/V, conv state and attention carry it to every later chunk, so the last chunk of a prefill and every decode step expose it. Cost: 85.9 us per
-200,058-float logits row (measured), about 0.2% of a ~50 ms decode step, once per prefill. *ViT:* the encoder is stateless, so a non-finite F16 embedding re-encodes that image in BF16 (`Bf16Fallbacks` counts them, 0 in every
+An overflowing F16 store makes the hidden state NaN within the chunk and K/V, conv state and attention carry it to every later chunk, so the last chunk of a prefill and every decode step expose it. Cost: 58.5 to 85.9 us per
+200,058-float logits row (measured, two runs), about 0.2% of a ~50 ms decode step, once per prefill. *ViT:* the encoder is stateless, so a non-finite F16 embedding re-encodes that image in BF16 (`Bf16Fallbacks` counts them, 0 in every
 measured run); the result then equals a plain BF16 encode (tested). Cost: one pass over `[n/4][2304]` halves per encode (2.4 M at 4,096 tokens, a few ms against 33 s; not separately measured). BF16 has no guard.
 Tests: `Guard_NonFiniteLogits_ThrowLoudlyOnF16_AndCostIsNegligible`, `Guard_Vit_NonFiniteF16_RecomputesInBf16`.
 
@@ -591,19 +591,61 @@ Max |activation| per store point (CPU F32 trace of the same graph; margin = 65,5
 | `selw` | 7.862 | 8,331x | 0.000% | 0 |
 | `attn_o` | 3.223 | 20,322x | 0.045% | 0 |
 
-CENSUS_LONG
+Long-context and multi-image census (CPU F32 trace of the same graph, 434-token 5-image prompt and a 16,640-token wikitext prompt; stats only, 2,481 s on the CPU reference), the same store points:
+
+| store point | 5 images (434 tok) | 16,640-token text | max of the two | margin to 65,504 | below-normal share | overflows |
+|---|---|---|---|---|---|---|
+| `layer_out` | 456.4 | 473.2 | 473.2 | 138x | 0.011% | 0 |
+| `ffnInp` | 388.4 | 298.7 | 388.4 | 169x | 0.020% | 0 |
+| `vc` | 214.1 | 102.5 | 214.1 | 306x | 0.008% | 0 |
+| `norm` | 171.4 | 168.8 | 171.4 | 382x | 0.010% | 0 |
+| `moe` | 107.8 | 133.2 | 133.2 | 492x | 0.006% | 0 |
+| `kc` | 50.32 | 62.96 | 62.96 | 1,040x | 0.003% | 0 |
+| `situ` | 62.4 | 62.28 | 62.4 | 1,050x | 0.152% | 0 |
+| `embed` | 37.71 | 38.01 | 38.01 | 1,723x | 0.001% | 0 |
+| `ctrl_in` | 36.74 | 37.3 | 37.3 | 1,756x | 0.011% | 0 |
+| `msg` | 36.74 | 37.3 | 37.3 | 1,756x | 0.012% | 0 |
+| `blk` | 36.45 | 35.66 | 36.45 | 1,797x | 0.007% | 0 |
+| `mix` | 34.65 | 36.04 | 36.04 | 1,818x | 0.011% | 0 |
+| `vraw` | 28.11 | 20.17 | 28.11 | 2,330x | 0.007% | 0 |
+| `rel` | 24.51 | 15.7 | 24.51 | 2,673x | 0.004% | 0 |
+| `q_clip` | 22.05 | 22.97 | 22.97 | 2,852x | 0.008% | 0 |
+| `vdyn` | 21.88 | 20.11 | 21.88 | 2,994x | 0.004% | 0 |
+| `ctrl_gain` | 20.15 | 20.04 | 20.15 | 3,251x | 0.002% | 0 |
+| `ctrl_forget` | 18.4 | 17.65 | 18.4 | 3,559x | 0.004% | 0 |
+| `gateB` | 17.87 | 18.14 | 18.14 | 3,611x | 0.003% | 0 |
+| `sink` | 16.77 | 17.79 | 17.79 | 3,683x | 0.001% | 0 |
+| `kraw` | 13.17 | 15.68 | 15.68 | 4,177x | 0.005% | 0 |
+| `kdyn` | 13.3 | 14.02 | 14.02 | 4,674x | 0.005% | 0 |
+| `q` | 13.06 | 13 | 13.06 | 5,016x | 0.006% | 0 |
+| `ctrl_g` | 10.16 | 11.38 | 11.38 | 5,755x | 0.008% | 0 |
+| `attn` | 10.3 | 10.17 | 10.3 | 6,358x | 0.149% | 0 |
+| `rel_clip` | 7.984 | 8.54 | 8.54 | 7,670x | 0.016% | 0 |
+| `selw` | 7.831 | 7.984 | 7.984 | 8,204x | 0.000% | 0 |
+| `attn_o` | 3.046 | 4.295 | 4.295 | 15,252x | 0.041% | 0 |
+
+The residual-stream maxima per layer visit are in the raw log. The largest value anywhere is 473 (`layer_out`, 16K text): margin 138x. **DSpark tap rows** (the `IInkling2Tap` rows the drafter stores as 16-bit activations, max |value| per visit): visit 5: 345 (images) / 275 (16K text); visit 23: 199 / 174; visit 41: 91 / 92; visit 48 (final normed output): 171 / 169: the largest is 345, 190x below F16's ceiling. The drafter's own stored activations (a 3-layer Qwen3-like block fed by RMS-normalised mixes of those taps) were not instrumented; an F16 overflow there could only produce bad drafts (lower acceptance), never a wrong token, because the target verifies every draft, so the drafter is deliberately not guarded; the measured draft agreement of 96.0% (below) shows no degradation.
 
 
-**Regression runs with F16 as the default** (Strix, `Inkling2VulkanGateTests` etc.):
-- Vulkan KL gates 9/9 pass (mean KL x1e-3, 32-token calls, vs llama.cpp `-fa off`): passage F16 KV 3.469 (BF16 3.61, F32 3.12), q8_0 KV 4.944, F32-act arm 3.116, floor-1 log scale 5.537; wikitext c1280 F16 KV 1.731 (position < 1024 1.513, >= 1024 2.059), q8_0 1.950, F32-act 1.856;
-  greedy teacher-forced F16 KV 6/384 (0/345 at oracle margin >= 0.3), q8_0 3/384 (0/345).
-- Op-level kernel tests 35/37; the 2 failures are `Conv_CarriedState_MatchesReference` which fail on `dev` already (#2065). ViT encoder suite 15 passed, 3 skipped. Vision suite 22/28 (below).
-- **Chunk-size invariance of image prompts needs #2065's conv fix.** The conv state is BF16 (ruling), so an N-row forward reads its in-batch history exactly while sequential decoding reads it back out of the BF16
-  state; with BF16 activations the history is already BF16-exact (no effect), with F16 activations it is not. On `dev` as it stands the 6 `ChunkedPrefill_ImageLogits_AreChunkSizeInvariant` cases (text and Vulkan ViT, chunks 4 / 5 / 7)
-  fail with an image KL vs the 32-token run of 5.8e-5 to 1.1e-2. With the history rounded to BF16, the one-line fix of #2067 (`s2 = bf16ToF(fToBf16(x))`, tested here as an override shader because the conv shader is that PR's), every
-  `ChunkedPrefill*` test passes with KL exactly 0 (38 passed, 1 failure: `Probe533VulkanKvBisectTests`, a Llama-3.2-1B probe unrelated to Inkling). **This PR therefore must merge after #2067** (or carry its conv change).
-- **#2067's drafter assumes BF16 activations** (`AttachDFlashDrafter` rejects the F32 arm; its tap copy, context mix and embedding path read raw BF16 words), so under the F16 default a Vulkan drafter must either be refused (attach
-  requires `DOTLLM_INKLING2_ACT=bf16`) or be ported to `ACT_T`; that is part of #2067's / #2046's integration, see the PR body.
+**Regression runs with F16 as the default, on the final head** (dev merged in, #2065's conv history rounding included; Strix, functional runs):
+- Op-level kernel tests 37/37 (`Conv_CarriedState_MatchesReference` passes now); ViT encoder suite 15 passed, 3 skipped; **vision suite 28/28, including every `ChunkedPrefill_*` chunk-invariance case (KL vs the 32-token run exactly 0)**, without any override shader;
+  Vulkan row invariance + DSpark threshold tests 18/18; Vulkan DSpark model tests 12/12; Vulkan KL gates 9/9 (below).
+- Vulkan KL gates (mean KL x1e-3, 32-token calls, vs llama.cpp `-fa off`): passage F16 KV 5.338 (the 254-row passage set swings by +-1.5e-3 between runs with identical numerics apart from a few tail rows: the same gate read 3.469 before the merge, q8_0 KV 4.944 then and 3.450 now),
+  wikitext c1280 F16 KV 1.789 (position < 1024 1.519, >= 1024 2.195), q8_0 1.924, F32-act arm 1.777; greedy teacher-forced 6/384 with 0/345 at oracle margin >= 0.3 for both KV formats. The apples-to-apples BF16 / F16 / F32 table on this head is under "Final-head A/B" below.
+- Rounding test 2/2 and 5/5 mutants dead, guard tests 3/3 (the two sweeps are opt-in), unchanged.
+- Known unrelated failure: `Probe533VulkanKvBisectTests` (a Llama-3.2-1B probe).
+
+**The DSpark drafter on F16 activations (#2067, ported in #2075).** The drafter's own shaders read and write activation words (taps, ctx-mix input, the block rows, Q/attention output, the Markov pre-activations); they were hard-wired to BF16 while the shared helpers
+(`Gemv`, `Rms`, the embedding kernel) follow the target's format, so an F16 target would have mixed formats silently. Port: the seven activation-typed bodies (`inkling2_dspark_{attn,ctxmix,eltwise,headnorm,markov_pre,markov_step,markov_logits}`) read and write
+`ACT_T` through `actToF` / `fToAct` (weights keep their BF16 decode), each with an `_f16act` twin (`gen_dspark_wrappers.py`; `olala_gemv_q8_0_f16out_f16act` for the F16-logits arm); `mask_embd` rows are stored in the activation format; the taps copy is
+format-agnostic. The BF16 `.spv` are byte-identical except `markov_pre` / `markov_step` (the same math, different SPIR-V ids after the weight and activation decoders stopped sharing one function). **Format guard:** `DSparkDrafter.Format` records the target's base format at attach; the
+tap copy, the context injection and the draft block throw `InvalidOperationException` if the target's current scratch is in another format (the opt-in F32 image-chunk set), so a mismatch can never decode garbage. The F32 measurement arm stays refused at attach.
+- *Tests:* the op-level DSpark kernel tests run in both formats (`Inkling2VulkanDSparkKernelTests`, 32 BF16 tests, and its `...F16ActTests` twin, 32 F16 tests; 64/64 pass).
+- *Mutants* (a BF16 shader under F16 words, loaded through `DOTLLM_INKLING2_SPV_OVERRIDE`; failed tests of the F16 twin, baseline 0): ctx-mix 2, eltwise 2, head-norm 8, attention 8, Markov pre 5, Markov step 5, Markov logits 5 all die. At model level, with all six reading BF16:
+  `Drafts_MatchLlamaCppDsparkOracle` falls from 96.0% to **0.0%** top-1 agreement. (Greedy identity alone would not have caught it: the target verifies every draft, so a garbage drafter only collapses the acceptance.)
+- *F16-activation drafter results* (`Inkling2VulkanDSparkTests`, F16 default): draft top-1 agreement with llama.cpp **570/594 = 96.0%** (594 drafts, whole rounds identical 185/198), F16-logits drafts equal F32-logits drafts on 594/594 tokens; greedy identity 8 prompts x 40 tokens **8/8 identical**, K = 3: 168 rounds,
+  **1.89 tokens/round, acceptance 30.6%** (per prompt 1.18 to 3.08; the CPU reference measured 1.90 / 30.9%).
+PHASE_C
 
 ## 13. DSpark drafter (issue #2039)
 
