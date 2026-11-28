@@ -1087,11 +1087,15 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
                 if (settings.LoraPaths.Length > 0)
                 {
-                    const string specLoraWarning = "WARNING: --lora with speculative decoding does not adapt the draft model; acceptance rates may degrade.";
+                    const string specLoraWarning = "WARNING: --lora turns draft-model speculation off: the speculative forwards do not apply the adapter.";
                     if (settings.Json) Console.Error.WriteLine(specLoraWarning);
                     else AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(specLoraWarning)}[/]");
                 }
             }
+
+            // Disposed before the target (inner scope): a GPU draft shares the target's device.
+            using GgufFile? ownedDraftGguf = draftGguf;
+            using IModel? ownedDraft = draftModel;
 
             if (!settings.Json && draftModel is null && !settings.NoMtp && model.SupportsMtp)
                 AnsiConsole.MarkupLine($"[dim]MTP self-speculative decoding: K={(settings.SpeculativeK == DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0 ? model.MtpPreferredDraftTokens : settings.SpeculativeK)} ({(mtpHeadPath is null ? "model carries an MTP head" : (System.IO.Directory.Exists(mtpHeadPath) ? "Edge0 head: " + Markup.Escape(mtpHeadPath) + "; adaptive gate on; DOTLLM_EDGE0_MTP=0 opts out" : "head: " + Markup.Escape(System.IO.Path.GetFileName(mtpHeadPath))))}; disable with --no-mtp)[/]");

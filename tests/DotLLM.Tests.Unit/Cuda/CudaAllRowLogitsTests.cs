@@ -115,7 +115,7 @@ public sealed class CudaAllRowLogitsTests(ITestOutputHelper output)
         }
 
         // Capped: a longer forward than the cap returns one row.
-        Assert.True(model.TrySetAllRowLogitsLimit(100));
+        Assert.False(model.TrySetAllRowLogitsLimit(100));   // capped: the request is not met in full
         Assert.Equal(CudaTransformerModel.MaxLogitRows, model.MaxAllRowLogitsLength);
         using (var cache = model.CreateKvCache(64))
         {

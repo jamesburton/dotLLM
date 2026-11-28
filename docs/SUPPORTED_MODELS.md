@@ -92,8 +92,8 @@ and dense CUDA; a dense-host draft model runs on the target's device (#2064). HI
 | nomic-bert-moe encoder | `NomicBertMoe` | Partially-Optimised† | None | Highly-Optimised | Embedding only, MoE. Needs an explicit `--device vulkan`. |
 | EmbeddingGemma encoder | `GemmaEmbedding` | Highly-Optimised | None | Highly-Optimised | Embedding only, bidirectional sliding window. Vulkan `serve` path is `?`. |
 
-Notes on issues found by code reading. Only note 1 has been reproduced (and is fixed); 2 and 3 are suspected,
-**not reproduced**:
+Notes on issues found by code reading. Only note 1 has been reproduced (and is fixed); 2 is suspected and **not
+reproduced**; 3 is guarded but not reproduced:
 
 1. Fixed (#2030): draft-model speculation read one logit row per drafted token from targets that return only the last
    row. It now requires `MaxAllRowLogitsLength` > 1, like prompt lookup. The dense Vulkan host, which over-read the same
@@ -101,8 +101,10 @@ Notes on issues found by code reading. Only note 1 has been reproduced (and is f
    forwards). Targets that stay at one row (Mamba-3, the CUDA pipeline, the CUDA hybrid hosts, CUDA Gemma and MLA
    models) load no draft model, say so, and decode plain.
 2. For GGUF `qwen2moe`, the CPU quantized-expert path appears to load no shared-expert branch (#2031).
-3. Mamba-3, LFM3 and Olala have no recurrent-state checkpoint, and `SpeculativeDecoder` does not appear to guard
-   against them, so a rejected draft could leave state advanced (#2032).
+3. A recurrent target with no state checkpoint (Mamba-3, LFM3, Olala, Inkling 2, CUDA LFM2-MoE, CUDA Nemotron-H and the
+   CUDA/CPU hybrid Qwen3.5 host, among others) cannot undo a rejected draft. Draft models and prompt lookup are now
+   refused there, with a message (#2030 review). This was found by code reading and is tested with a stand-in model, not
+   reproduced on these models (#2032). MTP speculation is not covered by this check.
 
 ## Matrix
 

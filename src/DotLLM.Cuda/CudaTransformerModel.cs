@@ -317,11 +317,12 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
     /// which speculation cannot roll back, so a rejected draft would stay in the history.
     /// </summary>
     /// <param name="maxSeqLen">Rows the caller wants back from one forward.</param>
+    /// <returns>True when a forward of <paramref name="maxSeqLen"/> tokens now returns every row.</returns>
     public bool TrySetAllRowLogitsLimit(int maxSeqLen)
     {
         if (_isGemma4 || _isGemmaFamily || _weights.MlaLayers is not null) return false;
         _allRowLogitsLimit = Math.Max(_allRowLogitsLimit, Math.Min(maxSeqLen, MaxLogitRows));
-        return true;
+        return maxSeqLen <= _allRowLogitsLimit;
     }
 
     /// <summary>

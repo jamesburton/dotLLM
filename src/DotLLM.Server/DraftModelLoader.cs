@@ -59,6 +59,12 @@ public static class DraftModelLoader
         IModel target, string targetDevice, ModelConfig draftConfig, int speculativeCandidates, Action<string> warn,
         Func<string, (IModel Model, Func<int, IKvCache>? Kv)> loadExact)
     {
+        if (DotLLM.Engine.SpeculationSupport.TargetBlocker(target) is { } blocker)
+        {
+            warn($"draft model not loaded: {blocker}. Decoding without speculation.");
+            return null;
+        }
+
         // Verification reads one logit row per drafted token (#2030). Loading a draft the target will never use only costs memory.
         target.TrySetAllRowLogitsLimit(speculativeCandidates + 1);
         if (target.MaxAllRowLogitsLength <= 1)

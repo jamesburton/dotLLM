@@ -293,6 +293,10 @@ can also be bound from `appsettings.json` by a host that binds `ServerOptions` f
 configuration. Vocabulary compatibility (above) is validated at startup with a clear error
 on all three surfaces.
 
+**When speculation is refused** (`SpeculationSupport`, draft models and prompt lookup; #2030): a recurrent target with no
+state checkpoint, a request with a LoRA adapter (the speculative forwards do not apply it), and a quantized KV-cache with
+an FP16 window (`--cache-window`; rows that left the window cannot be restored). Each decodes plain and says why.
+
 **Where the draft runs** (`DraftModelLoader`, shared by `run`, `chat` and `serve`; #2064): on the target's device (CPU, the
 same Vulkan device, or the same CUDA ordinal). It runs on the CPU, with a warning, when it is not a dense-host architecture,
 when it is an MLA model on CUDA, or when loading it on the GPU fails. A target that cannot verify drafts loads no draft at all. A draft the size of the
