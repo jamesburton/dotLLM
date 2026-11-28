@@ -41,8 +41,8 @@ public sealed class VulkanDeviceConcurrencyTests
             }
             catch (Exception e) { lock (errors) errors.Add(e); }
         })).ToList();
-        foreach (var t in workers) t.Start();
-        foreach (var t in workers) t.Join();
+        foreach (var t in workers) { t.IsBackground = true; t.Start(); }
+        foreach (var t in workers) Assert.True(t.Join(TimeSpan.FromSeconds(60)), "a submitting thread did not finish (device deadlock)");
         _output.WriteLine($"max threads inside vkQueueSubmit at once: {dev.MaxConcurrentQueueSubmits} ({threads} threads x {iterations} submits)");
         Assert.Empty(errors);
         Assert.Equal(1, dev.MaxConcurrentQueueSubmits);
@@ -59,7 +59,9 @@ public sealed class VulkanDeviceConcurrencyTests
         var errors = new List<Exception>();
         var copier = new Thread(() => { try { for (int i = 0; i < 20; i++) dev.CopyBufferSynchronous(a, b, 4096); } catch (Exception e) { lock (errors) errors.Add(e); } });
         var submitter = new Thread(() => { try { using var ctx = dev.CreateSubmitContext(); for (int i = 0; i < 20; i++) { ctx.Begin(); ctx.SubmitAndWait(); } } catch (Exception e) { lock (errors) errors.Add(e); } });
-        copier.Start(); submitter.Start(); copier.Join(); submitter.Join();
+        copier.IsBackground = true; submitter.IsBackground = true;
+        copier.Start(); submitter.Start();
+        Assert.True(copier.Join(TimeSpan.FromSeconds(60)) && submitter.Join(TimeSpan.FromSeconds(60)), "a submitting thread did not finish (device deadlock)");
         Assert.Empty(errors);
         Assert.Equal(1, dev.MaxConcurrentQueueSubmits);
     }

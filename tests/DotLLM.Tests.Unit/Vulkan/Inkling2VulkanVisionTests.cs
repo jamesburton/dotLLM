@@ -420,7 +420,10 @@ public sealed class Inkling2VulkanVisionTests : IDisposable
             }
             catch (Exception e) { lock (errors) errors.Add(e); }
         });
-        text.Start(); vision.Start(); go.Set(); text.Join(); vision.Join();
+        text.IsBackground = true; vision.IsBackground = true;   // an unsynchronised queue can deadlock the driver: fail the test instead of hanging the host
+        text.Start(); vision.Start(); go.Set();
+        bool finished = text.Join(TimeSpan.FromSeconds(180)) && vision.Join(TimeSpan.FromSeconds(60));
+        Assert.True(finished, "the concurrent text decode / image encode did not finish within the timeout (device deadlock)");
         _output.WriteLine($"{encodes} image encodes ran beside 3 x 25 text steps; max threads inside vkQueueSubmit {_dev.MaxConcurrentQueueSubmits}; embeddings differing from the serial run {badEmbeddings}");
         _dev.QueueSubmitWindowHook = null;
         Assert.Empty(errors);

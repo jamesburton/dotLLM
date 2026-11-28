@@ -460,6 +460,22 @@ shared-memory reads per FMA) and the GEMM (64x64 tile, scalar) are untuned. Leve
 The tanh-GELU mutant **survived** the first draft of the kernel tests and the embedding gate (4.7e-4 absolute is invisible through BF16 and 6e-2 relRMS, as in the CPU section); it is killed by a dedicated test that evaluates the
 epilogue at chosen points in the negative tail (zero weights, biases from -3.5 to 3), where tanh and erf differ by up to 25% relative (erf: 3.5e-3 error from BF16 only).
 
+**Several threads on one device (issue #2068).** The server encodes an image on a `Task.Run` worker outside the request gate, so a Vulkan encode can submit while another request's text forward runs on the same
+`VulkanDevice`. Vulkan requires external synchronisation of `vkQueueSubmit` on the shared queue, of a `VkCommandPool` and every command buffer recorded from it, and the device-wide hazard tracker
+(`ActiveHazards`, set by a forward and nulled by every `Begin` / submit) assumed single-threaded recording. Fixed at the device, so it holds for every path (scheduler, MTP, DSpark drafter, warm-up, load-time uploads):
+every `vkQueueSubmit` goes through one `QueueSubmit` under a queue lock (held for the submit call, never across the fence wait); each `SubmitContext`, staging command buffer and one-shot copy owns a private command
+pool (the shared device pool is no longer recorded into); `ActiveHazards` is armed, seen and disarmed only by the arming thread (another thread's dispatches fall back to explicit barriers).
+Cost: **1.00 `vkQueueSubmit` per decoded token** (measured over 32 decode steps, 32.5 ms/token) and an uncontended lock of 10.5 ns: 10 ns per token, 3e-7 of a decode step. Tests (`VulkanDeviceConcurrencyTests` and
+`ConcurrentImageEncodeAndTextDecode_OnOneDevice_MatchTheirSerialRuns`: 150 image encodes beside 3 x 25 text steps; tokens and embeddings bit-identical to the serial runs, never more than one thread inside `vkQueueSubmit`).
+Mutants: the queue lock removed: 4 threads inside `vkQueueSubmit` at once, the driver raised errors in the submitting threads (2 unit tests fail) and the model-level test **deadlocked the device** (it now fails by timeout after 180 s);
+the shared plain hazard slot restored: `HazardTracker_ArmedOnOneThread_SurvivesAnotherThreadsSubmit_AndIsInvisibleToIt` fails (the model-level test cannot see it: the Vulkan ViT records through `OlalaKernel`, which has no tracker).
+The private-pool change has no discriminating test (a shared pool race is undefined behaviour that did not show on this driver); it is covered by reasoning, not by a failing mutant. The RoPE table is now built once per
+grid into native memory (`RopeTable_IsBuiltOncePerGrid`), not as a managed array per call. `DOTLLM_VISION_DEVICE` accepts `cpu`, `auto`, `gpu`, `device`; anything else is an error.
+
+**Staged conversion (rule 3).** The one-time BF16 (or F16) conversion of `patch_embd` / `position_embd` (4.55 MB) reads the mapped F32 tensor on the host, converts into a transient native buffer and uploads it through the
+staging buffer: a host bounce (read, convert, copy) of 4.55 MB at load. It is not the direct route (no DirectStorage / zero-copy import of the F32 pages can produce a converted tensor); the F32 arm takes the normal weight-import route (zero-copy or DirectStorage where the policy allows)
+(9.11 MB resident). Awaiting the user's ruling on this note.
+
 ## 13. DSpark drafter (issue #2039)
 
 The drafter is `unsloth/Inkling-2-Mini-GGUF` `dspark-Inkling-2-Mini-Q8_0.gguf` (504 MB, `general.architecture = dflash`, 58 tensors). `mtp.safetensors` is **not** needed: the GGUF already carries the converter's folds (`markov_w2 = unembed @ hidden_out`, softmaxed `ctx_mix`, the replicated `mask_embd`).
