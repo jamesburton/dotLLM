@@ -59,7 +59,7 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
     }
 
     /// <summary>Teacher-forced image-prompt KL: the oracle's own continuation, 32-token prefill calls (the reviewer's and the gate's setup).</summary>
-    private static KlStat ImageKl(Inkling2VisionEndToEndTests.Oracle o, Func<int[], int[], IReadOnlyList<ImageSpan>, ITensor> fwd, Action reset, ImageEmbeddings emb, int sub = 32)
+    private static KlStat ImageKl(Inkling2VisionEndToEndTests.Oracle o, Func<int[], int[], IReadOnlyList<ImageSpan>, ITensor> fwd, Action reset, ImageEmbeddings emb, int sub = 32, List<float[]>? keepRows = null)
     {
         var prompt = o.Before.Concat(Enumerable.Repeat(200054, emb.Tokens)).Concat(o.After).ToArray();
         var spans = new[] { new ImageSpan(o.Before.Length, emb) };
@@ -74,6 +74,7 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
         }
         for (int r = 0; r < o.Gen.Length + 1; r++)
         {
+            keepRows?.Add(ours);
             var (kl, same) = Inkling2VisionEndToEndTests.FullKl(o.Logits.AsSpan(r * V, V), ours);
             sum += kl; max = Math.Max(max, kl); if (same) top++;
             if (r < o.Gen.Length)
@@ -165,6 +166,14 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
         return rows;
     }
 
+    /// <summary>KL(F32 arm || this arm) over the 13 teacher-forced rows that the oracle KL scores (last prompt row + the 12 generation steps): the same rows, no oracle noise.</summary>
+    private static string Nf13(List<float[]> reference, List<float[]> got)
+    {
+        double sum = 0, max = 0;
+        for (int i = 0; i < reference.Count; i++) { double kl = Inkling2VisionEndToEndTests.FullKl(reference[i], got[i]).Kl; sum += kl; max = Math.Max(max, kl); }
+        return $"NF13 (vs-F32, same 13 rows) mean {sum / reference.Count * 1e3:F3}e-3 max {max * 1e3:F2}e-3";
+    }
+
     private static string NoiseFree(float[][] reference, float[][] got, int b0, int b1)
     {
         double kb = 0, ki = 0, ka = 0;
@@ -218,7 +227,7 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
         int V = cfg.VocabSize;
         using var enc = Inkling2VisionEncoder.Load(mm!, ThreadingConfig.Auto);
         var embs = Images.ToDictionary(n => n, n => enc.Encode(Inkling2VisionEndToEndTests.LoadOracle(n)!.Image));
-        var refImg = new Dictionary<string, float[][]>(); float[][]? refText = null; float[]? refLast80 = null;
+        var refImg = new Dictionary<string, float[][]>(); float[][]? refText = null; float[]? refLast80 = null; var ref13 = new Dictionary<string, List<float[]>>();
         using var dev = VulkanDevice.Create();
         try
         {
@@ -230,11 +239,12 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
                 {
                     var o = Inkling2VisionEndToEndTests.LoadOracle(name)!;
                     var emb = embs[name];
-                    var s = ImageKl(o, (i, p, sp) => vk.ForwardWithImages(i, p, -1, sp, null, true), vk.ResetSequenceState, emb);
+                    var keep = new List<float[]>();
+                    var s = ImageKl(o, (i, p, sp) => vk.ForwardWithImages(i, p, -1, sp, null, true), vk.ResetSequenceState, emb, 32, keep);
                     var rows = PromptRows(o, emb, (i, p, sp) => vk.ForwardWithImages(i, p, -1, sp, null, false), vk.ResetSequenceState, V);
-                    if (arm == "f32") refImg[name] = rows;
+                    if (arm == "f32") { refImg[name] = rows; ref13[name] = keep; }
                     string nf = refImg.TryGetValue(name, out var rf) ? NoiseFree(rf, rows, o.Before.Length, o.Before.Length + emb.Tokens) : "no f32 reference yet";
-                    Log($"LLMKL arm={arm} {name}: oracle {s}; {nf}");
+                    Log($"LLMKL arm={arm} {name}: oracle {s}; {(ref13.TryGetValue(name, out var r13) ? Nf13(r13, keep) : "no f32 ref")}; all-prompt-rows {nf}");
                 }
                 {   // single-pass (128-token chunks) last-row logits of rainbow80: the per-chunk switch must reproduce the f32 arm exactly
                     var o = Inkling2VisionEndToEndTests.LoadOracle("rainbow80")!; var emb = embs["rainbow80"];
@@ -365,7 +375,7 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
         using var enc = Inkling2VisionEncoder.Load(mm!, ThreadingConfig.Auto);
         using var cpu = LoadCpu(file, cfg);
         var embs = Images.ToDictionary(n => n, n => enc.Encode(Inkling2VisionEndToEndTests.LoadOracle(n)!.Image));
-        var refImg = new Dictionary<string, float[][]>(); float[][]? refText = null;
+        var refImg = new Dictionary<string, float[][]>(); float[][]? refText = null; var ref13 = new Dictionary<string, List<float[]>>();
         try
         {
             foreach (string arm in SimArms)
@@ -377,13 +387,14 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
                     var emb = embs[name];
                     var sim = MakeSim(arm, o.Before.Length, o.Before.Length + emb.Tokens);
                     cpu.Sim = sim;
-                    var s = ImageKl(o, (i, p, sp) => cpu.ForwardWithImages(i, p, -1, sp, null, true), cpu.ResetSequenceState, emb);
+                    var keep = new List<float[]>();
+                    var s = ImageKl(o, (i, p, sp) => cpu.ForwardWithImages(i, p, -1, sp, null, true), cpu.ResetSequenceState, emb, 32, keep);
                     var simAll = MakeSim(arm, o.Before.Length, o.Before.Length + emb.Tokens);
                     cpu.Sim = simAll;
                     var rows = PromptRows(o, emb, (i, p, sp) => cpu.ForwardWithImages(i, p, -1, sp, null, false), cpu.ResetSequenceState, V);
                     cpu.Sim = null;
-                    if (arm == "f32") refImg[name] = rows;
-                    Log($"CPUSIM arm={arm} {name}: oracle {s}; {(refImg.TryGetValue(name, out var rf) ? NoiseFree(rf, rows, o.Before.Length, o.Before.Length + emb.Tokens) : "no f32 reference yet")}");
+                    if (arm == "f32") { refImg[name] = rows; ref13[name] = keep; }
+                    Log($"CPUSIM arm={arm} {name}: oracle {s}; {(ref13.TryGetValue(name, out var r13) ? Nf13(r13, keep) : "no f32 ref")}; all-prompt-rows {(refImg.TryGetValue(name, out var rf) ? NoiseFree(rf, rows, o.Before.Length, o.Before.Length + emb.Tokens) : "no f32 reference yet")}");
                     allStats.Add((name, simAll));
                 }
                 {

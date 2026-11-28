@@ -476,6 +476,62 @@ grid into native memory (`RopeTable_IsBuiltOncePerGrid`), not as a managed array
 staging buffer: a host bounce (read, convert, copy) of 4.55 MB at load. It is not the direct route (no DirectStorage / zero-copy import of the F32 pages can produce a converted tensor); the F32 arm takes the normal weight-import route (zero-copy or DirectStorage where the policy allows)
 (9.11 MB resident). Awaiting the user's ruling on this note.
 
+## 12c. Activation storage precision study for image prompts (epic #2025; measurement arms, opt-in, no default change)
+
+Question (user, 2026-11-27): BF16 activation storage costs image prompts about 2-3e-3 KL (0.5e-3 on text); would F16, or a targeted F32, do better, and at what cost? Nothing here changes a default
+(BF16 stays); the arms are opt-in. Hardware: Strix Halo iGPU, NVFP4 target, F16 KV, 128-token chunks, same oracles as 12a. Raw log: `.docs/ink-prec-results.txt`.
+
+**Arms** (all accumulate in F32; only the stored scratch format differs): `DOTLLM_INKLING2_ACT=bf16|f16|f32` (text model; `_f16act` / `_f32act` shaders, `ACT_F16` in `olala_common.glsl`: RNE, overflow to inf),
+`DOTLLM_INKLING2_ACT_F32_IMAGE_CHUNKS=1` (a chunk that carries image rows runs on a second, F32 scratch set; text chunks and decode stay BF16; nothing activation-typed is carried between chunks),
+`DOTLLM_VISION_ACT=bf16|f16|f32` and `DOTLLM_VISION_ROPE_F32=1` (ViT; study shaders built by `native/vulkan/build_study_arms.sh`). Per-chunk switch proven: rainbow80 single-pass last-row logits are bit-identical to the F32 arm.
+The BF16 `.spv` are byte-identical to before (checked with `cmp`).
+
+**Metric.** The oracle KL (13 rows) swings by a few 1e-3 on a single input rounding (12a), as much as the arms differ, and the llama.cpp oracle carries its own Q8_0 mmproj noise. The ranking metric is
+NF13: mean KL of the arm against this engine's F32 arm over the same 13 rows (no oracle noise). Oracle KL is kept as the absolute gate.
+
+| text model arm | oracle KL x1e-3 80 / 190x110 / 640 | NF13 x1e-3 80 / 190x110 / 640 (mean) | text passage: oracle KL, vs-F32 (127 rows), top-1, greedy mism (confident) | scratch (chunk 128, H 2304) |
+|---|---|---|---|---|
+| BF16 (shipped) | 4.85 / 6.62 / 5.41 | 2.04 / 6.13 / 4.53 (4.23) | 3.61, 2.11, 251/254, 3/384 (0/345) | 24.8 MB |
+| F16 | 2.53 / 2.31 / 6.11 | 0.04 / 0.91 / 2.80 (1.25) | 3.47, 1.64, 250/254, 6/384 (0/345) | 24.8 MB |
+| F32 | 2.72 / 3.84 / 3.49 | 0 (reference) | 3.12, 0, 251/254, 5/384 (0/345) | 49.6 MB |
+| BF16 + F32 image chunks | 2.52 / 2.94 / 3.30 | 0.67 / 1.64 / 0.15 (0.82) | = BF16 (no image rows) | 24.8 + 49.6 = 74.4 MB (second set allocated on the first image prefill) |
+
+Image-chunk F32 is not exactly F32 (NF13 0.82, not 0) because the decode rows and text-only chunks after the image still run BF16. All image gates pass 13/13 top-1, 0 greedy mismatches in every arm.
+Stored state: none besides scratch (KV stays F16, conv state BF16). Model total 17,808.7 MB (BF16 / F16), 17,833.5 MB (F32), 17,858.3 MB (BF16 + F32 image chunks).
+
+**Overflow.** Max |activation| per store point (CPU F32 trace of the same graph, 3 images + the 256-token passage; `Inkling2ActSim` stats): residual stream (`layer_out`) 453 (image 640; passage 370), `ffnInp` 386, block copies 36.6,
+embedding 37.7, MoE output 108, post-norm 170, `V` after conv 269, SITU 62, everything else <= 51. Margin to F16's 65,504: 145x on the residual stream. F16 overflow count 0 in every point; non-zero values below the F16 normal range:
+<= 0.53% (attention output), 0.15% (SITU), <= 0.02% elsewhere; flushed to zero <= 0.004%. The F16 GPU arm produced no non-finite value on any prompt. Olala-style 1e9..1e14 ranges are absent here. Evidence is 4 prompts: a long-context / other-content sweep is advisable before a default flip.
+
+**Vision tower** (Vulkan ViT, Q8_0 weights, arms on the same encoder; reference = CPU encoder on the F32-weights control, cached by the ViT tests; the 4,096-token noise image has no control, so it is vs the CPU shipping encoder):
+
+| ViT arm | relRMS 80 | 190x110 | 640 | 4096-token | encode s 80 / 190x110 / 640 / 4096 | peak scratch MB 80 / 190x110 / 640 / 4096 |
+|---|---|---|---|---|---|---|
+| BF16 (shipped) | 1.73e-2 | 1.81e-2 | 4.11e-2 | 1.13e-2 | 0.024 / 0.027 / 0.240 / 33.3-33.6 | 0.4 / 1.5 / 24.8 / 395.9 |
+| F16 | 1.66e-3 | 2.31e-3 | 5.22e-3 | 7.35e-3 | 0.028 / 0.030 / 0.251 / 33.6 | 0.4 / 1.5 / 24.8 / 395.9 |
+| F32 | 5.2e-4 | 5.6e-4 | 8.2e-4 | 7.27e-3 | 0.019 / 0.021 / 0.245 / 34.0-34.8 | 0.8 / 2.7 / 45.8 / 731.4 |
+
+(Encode times are medians of 5 interleaved rounds after a warm-up round, 2 for 4,096 tokens; the small images are within timer noise of each other. vs llama.cpp's F32 control, 80 and 190x110: BF16 1.73e-2 / 1.81e-2, F16 1.65e-3 / 2.30e-3, F32 4.5e-4 / 5.1e-4.)
+Max |activation| per ViT stage (F32 trace): residual `layer_out` 49.2 (4,096-token noise 44.8), embeddings 32.5, `hid` (GELU) 42.4, pre_ln 14.8 (34.4 on noise), Q 12.5, K 18.3, V 10.0, attention 10.0: 1,300x margin to F16.
+End-to-end oracle KL through the shipped text model, 80 / 190x110 / 640 (x1e-3): BF16 3.67 / 3.22 / 10.40, F16 2.63 / 3.23 / 11.38, F32 2.61 / 3.14 / 13.15. These do NOT improve with ViT precision: the llama.cpp oracle embeddings are
+themselves Q8_0-mmproj-noisy (2% vs the F32 control), so oracle KL cannot rank ViT arms; rank them by relRMS against the F32 control.
+**RoPE table.** An F32 instead of F16 table changes relRMS by under 3% for BF16 and F16 activations (BF16 1.73 -> 1.74, 1.81 -> 1.69, 4.11 -> 4.08 e-2; F16 1.66 -> 1.69, 2.31 -> 2.32, 5.22 -> 5.17 e-3) and only shows at the F32 floor
+(5.2 / 5.6 / 8.2e-4 -> 5.0 / 5.1 / 5.1e-4): the F16 table is not part of the BF16 gap; the BF16 activation storage is. (The BF16 study GEMM is byte-identical to the shipped `vit_gemm_q8.spv`, so this isolates the table alone.)
+
+**Performance** (same-session interleaved, pairwise bf16 vs arm because every model instance loads its own 17.5 GB via DirectStorage; 5 rounds after a warm-up round, direction alternated; medians, ranges in the log):
+prefill of 300 text tokens 68-71 tok/s in every arm (range 39-87), decode 19.7-21.5 tok/s in every arm (range 12-29), the 640-image prompt (284 tokens) prefill 3.8-4.4 s in every arm (range 3.3-6.5). The box was noisy (2x
+swings between rounds); no arm is separable from BF16 on speed. TTFT for an image prompt = encode (0.24-0.25 s for 640 on Vulkan) + prefill (about 3.8 s); the arms move neither.
+
+**CPU simulation of mixed placements (options a and c): NOT validated, no finding.** `Inkling2ActSim` rounds the CPU reference at the Vulkan store points (residual stream only in F32; F32 for the first N layer visits; image rows
+in F32). Its BF16 / F16 numbers disagree with the real GPU arms (NF13 BF16 5.7 / 3.9 / 3.6 vs GPU 2.0 / 6.1 / 4.5; text vs-F32 3.9 vs 2.1; F16 text 3.4 vs GPU 1.6), because the CPU NVFP4 / Q8_0 GEMMs quantise their activation input to Q8_0
+(`GemmNvfp4(..., preQuantizedInput)`), a noise the GPU kernels do not have, and any sub-ULP change re-rolls those 8-bit digits. The simulation's noise floor (3-4e-3) swamps the 0.5-3e-3 effects, so its residual-only and first-N
+rows (in the log) must not be used. A real GPU arm for those would need mixed-format shaders (the depth-mix kernel reads blocks and the current state together): not built.
+
+**Recommendation.**
+1. F16 beats BF16 for image prompts at equal bytes and equal speed: NF13 4.23 -> 1.25e-3 (3.4x) on the text model, text passage vs-F32 2.11 -> 1.64e-3, ViT embedding error 10x lower (relRMS 1.7e-2 -> 1.7e-3). Oracle KL on the text model:
+   2.53 / 2.31 / 6.11 vs 4.85 / 6.62 / 5.41 (the 640 oracle number is noise-level worse; NF13 is better on all three). It is overflow-safe on everything measured (145x margin on the LLM residual, 1,300x on the ViT). F16 is within precision rule 1 (FP16/BF16 widest default). Switching is the user's decision; before a default flip, sweep long-context prompts and the DSpark drafter taps for overflow.
+2. F32 is not "far higher" than F16 here (F32 oracle 2.7 / 3.8 / 3.5 vs F16 2.5 / 2.3 / 6.1, within the 13-row noise), so with F16 no F32 exception is needed. If BF16 stays: the targeted option is F32 for image-carrying prefill chunks: oracle KL 2.52 / 2.94 / 3.30 (the F32 level), NF13 0.82e-3, cost one extra 49.6 MB scratch set (0.28% of the 17.8 GB resident, allocated on the first image prefill only, no stored state, no measurable speed cost); only the image prefill pays it, decode and text stay BF16. The ViT keeps its own choice: F16 ViT activations cost nothing extra (396 MB at 4,096 tokens) while F32 doubles it to 731 MB for no end-to-end gain.
+
 ## 13. DSpark drafter (issue #2039)
 
 The drafter is `unsloth/Inkling-2-Mini-GGUF` `dspark-Inkling-2-Mini-Q8_0.gguf` (504 MB, `general.architecture = dflash`, 58 tensors). `mtp.safetensors` is **not** needed: the GGUF already carries the converter's folds (`markov_w2 = unembed @ hidden_out`, softmaxed `ctx_mix`, the replicated `mask_embd`).
