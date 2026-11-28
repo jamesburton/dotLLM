@@ -85,6 +85,47 @@ public sealed class VulkanDevice : IDisposable
     private nint _physicalDevice;
     private nint _device;
     private nint _queue;
+
+    /// <summary>
+    /// External synchronisation of the device's single <c>VkQueue</c> (Vulkan: <c>vkQueueSubmit</c> needs host-side sync on the queue). Several threads can reach one
+    /// device at once (a request thread's text forward, an image encode on a worker thread, the scheduler, load-time uploads); every submit takes this lock, held only for the
+    /// submit call itself, never across the fence wait (issue #2068).
+    /// </summary>
+    private readonly object _queueLock = new();
+    private int _inSubmit;
+
+    /// <summary>Test seam (#2068): the largest number of threads ever inside <c>vkQueueSubmit</c> of this device at once. Must stay 1.</summary>
+    internal int MaxConcurrentQueueSubmits { get; private set; }
+
+    /// <summary>Test seam (#2068): runs inside the queue-submit critical section (a test widens the window to make an unsynchronised submit observable).</summary>
+    internal Action? QueueSubmitWindowHook { get; set; }
+
+    /// <summary>The only place the device queue is submitted to: serialised by <see cref="_queueLock"/> (the lock covers the submit call, never the fence wait).</summary>
+    private void QueueSubmit(in VkSubmitInfo submit, nint fence, string site)
+    {
+        lock (_queueLock)
+        {
+            int n = Interlocked.Increment(ref _inSubmit);
+            if (n > MaxConcurrentQueueSubmits) MaxConcurrentQueueSubmits = n;
+            try
+            {
+                QueueSubmitWindowHook?.Invoke();
+                Interop.ProfileCounters.Submits++;   // under the queue lock: one writer at a time (it was a racy ++ at each of the six call sites)
+                VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError(site);
+            }
+            finally { Interlocked.Decrement(ref _inSubmit); }
+        }
+    }
+
+    /// <summary>Command pools owned by the buffers handed out by <see cref="AllocateTransferCommandBuffer"/> (one private pool each, see <see cref="CreatePrivateCommandPool"/>).</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<nint, nint> _transferPools = new();
+
+    /// <summary>
+    /// Every live private pool (<see cref="CreatePrivateCommandPool"/>). Destroying the shared <see cref="_commandPool"/> used to free every command buffer implicitly; private pools
+    /// must be destroyed one by one, so the ones whose owner was never disposed (a leaked <see cref="SubmitContext"/> or staging buffer) are drained by <see cref="Dispose"/> before
+    /// <c>vkDestroyDevice</c>. An owner disposed after the device finds its pool gone and does not destroy it twice.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<nint, byte> _privatePools = new();
     private nint _commandPool;
     private bool _disposed;
 
@@ -2925,24 +2966,49 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     internal nint AllocateTransferCommandBuffer()
     {
+        nint pool = CreatePrivateCommandPool("AllocateTransferCommandBuffer");
         var cbai = new VkCommandBufferAllocateInfo
         {
             sType = VkStructureType.CommandBufferAllocateInfo,
-            commandPool = _commandPool,
+            commandPool = pool,
             level = VkCommandBufferLevel.Primary,
             commandBufferCount = 1,
         };
-        VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf)
-            .ThrowOnError("vkAllocateCommandBuffers AllocateTransferCommandBuffer");
+        int rc = VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf);
+        if (rc < 0) { DestroyPrivateCommandPool(pool); rc.ThrowOnError("vkAllocateCommandBuffers AllocateTransferCommandBuffer"); }
+        _transferPools[cmdBuf] = pool;
         return cmdBuf;
+    }
+
+    /// <summary>
+    /// A command pool used by exactly one command-buffer owner. Vulkan makes a <c>VkCommandPool</c> (and every command buffer allocated from it) externally synchronised for allocate, free, reset and
+    /// all recording; the device-wide <see cref="_commandPool"/> shared by every model, loader and encoder could therefore not be used from two threads at once. Each long-lived command buffer
+    /// (<see cref="SubmitContext"/>, staging slots, one-shot copies) now owns its pool, so concurrent recording on different threads touches no shared pool state (issue #2068).
+    /// </summary>
+    private nint CreatePrivateCommandPool(string site)
+    {
+        var cpInfo = new VkCommandPoolCreateInfo
+        {
+            sType = VkStructureType.CommandPoolCreateInfo,
+            flags = VkCommandPoolCreateFlags.ResetCommandBuffer,
+            queueFamilyIndex = QueueFamilyIndex,
+        };
+        VulkanApi.vkCreateCommandPool(_device, cpInfo, 0, out nint pool).ThrowOnError($"vkCreateCommandPool {site}");
+        _privatePools[pool] = 0;
+        return pool;
+    }
+
+    /// <summary>Destroys a pool from <see cref="CreatePrivateCommandPool"/> (and every command buffer allocated from it); a no-op when the device already drained it.</summary>
+    private void DestroyPrivateCommandPool(nint pool)
+    {
+        if (pool != 0 && _privatePools.TryRemove(pool, out _)) VulkanApi.vkDestroyCommandPool(_device, pool, 0);
     }
 
     /// <summary>Frees a command buffer obtained from <see cref="AllocateTransferCommandBuffer"/>.</summary>
     internal void FreeTransferCommandBuffer(nint cmdBuf)
     {
         if (cmdBuf == 0) return;
-        nint local = cmdBuf;
-        VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, local);
+        if (_transferPools.TryRemove(cmdBuf, out nint pool)) DestroyPrivateCommandPool(pool);   // frees the buffer with its private pool
     }
 
     /// <summary>Creates an unsignalled fence owned by the caller.</summary>
@@ -2993,8 +3059,7 @@ public sealed class VulkanDevice : IDisposable
             commandBufferCount = 1,
             pCommandBuffers = (nint)(&cmdBufLocal),
         };
-        Interop.ProfileCounters.Submits++;
-        VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError("vkQueueSubmit SubmitCopyDeferred");
+        QueueSubmit(submit, fence, "vkQueueSubmit SubmitCopyDeferred");
     }
 
     /// <summary>Host-waits on <paramref name="fence"/> and resets it for reuse.</summary>
@@ -3022,10 +3087,10 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public void CopyBufferRangeSynchronous(Buffer src, Buffer dst, ulong srcOffset, ulong dstOffset, ulong size)
     {
-        nint cmdBuf = BeginOneShot("CopyBufferRangeSynchronous", out nint fence);
+        nint cmdBuf = BeginOneShot("CopyBufferRangeSynchronous", out nint fence, out nint pool);
         var region = new VkBufferCopy { srcOffset = srcOffset, dstOffset = dstOffset, size = size };
         VulkanApi.vkCmdCopyBuffer(cmdBuf, src.Handle, dst.Handle, 1, region);
-        SubmitOneShotAndWait("CopyBufferRangeSynchronous", cmdBuf, fence);
+        SubmitOneShotAndWait("CopyBufferRangeSynchronous", cmdBuf, fence, pool);
     }
 
     /// <summary>Fills all of <paramref name="dst"/> with the 32-bit <paramref name="pattern"/> and waits (one-shot <c>vkCmdFillBuffer</c>).</summary>
@@ -3033,29 +3098,31 @@ public sealed class VulkanDevice : IDisposable
     /// <param name="pattern">Repeated 4-byte pattern.</param>
     internal void FillBufferSynchronous(Buffer dst, uint pattern)
     {
-        nint cmdBuf = BeginOneShot("FillBufferSynchronous", out nint fence);
+        nint cmdBuf = BeginOneShot("FillBufferSynchronous", out nint fence, out nint pool);
         VulkanApi.vkCmdFillBuffer(cmdBuf, dst.Handle, 0, VkWholeSize, pattern);
-        SubmitOneShotAndWait("FillBufferSynchronous", cmdBuf, fence);
+        SubmitOneShotAndWait("FillBufferSynchronous", cmdBuf, fence, pool);
     }
 
     private const ulong VkWholeSize = ulong.MaxValue;   // VK_WHOLE_SIZE
 
     /// <summary>Allocates a one-time command buffer and its fence and begins recording.</summary>
-    private nint BeginOneShot(string site, out nint fence)
+    private nint BeginOneShot(string site, out nint fence, out nint pool)
     {
+        pool = CreatePrivateCommandPool(site);
         var cbai = new VkCommandBufferAllocateInfo
         {
             sType = VkStructureType.CommandBufferAllocateInfo,
-            commandPool = _commandPool,
+            commandPool = pool,
             level = VkCommandBufferLevel.Primary,
             commandBufferCount = 1,
         };
-        VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf).ThrowOnError($"vkAllocateCommandBuffers {site}");
+        int arc = VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf);
+        if (arc < 0) { DestroyPrivateCommandPool(pool); arc.ThrowOnError($"vkAllocateCommandBuffers {site}"); }
 
         var fenceCi = new VkFenceCreateInfo { sType = VkStructureType.FenceCreateInfo };
         if (VulkanApi.vkCreateFence(_device, fenceCi, 0, out fence) is var rc and < 0)
         {
-            VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, cmdBuf);
+            DestroyPrivateCommandPool(pool);
             rc.ThrowOnError($"vkCreateFence {site}");
         }
 
@@ -3067,14 +3134,14 @@ public sealed class VulkanDevice : IDisposable
         if (VulkanApi.vkBeginCommandBuffer(cmdBuf, begin) is var brc and < 0)
         {
             VulkanApi.vkDestroyFence(_device, fence, 0);
-            VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, cmdBuf);
+            DestroyPrivateCommandPool(pool);
             brc.ThrowOnError($"vkBeginCommandBuffer {site}");
         }
         return cmdBuf;
     }
 
-    /// <summary>Ends, submits and waits for a <see cref="BeginOneShot"/> command buffer, then frees it and its fence.</summary>
-    private unsafe void SubmitOneShotAndWait(string site, nint cmdBuf, nint fence)
+    /// <summary>Ends, submits and waits for a <see cref="BeginOneShot"/> command buffer, then frees it, its fence and its private pool.</summary>
+    private unsafe void SubmitOneShotAndWait(string site, nint cmdBuf, nint fence, nint pool)
     {
         try
         {
@@ -3086,8 +3153,7 @@ public sealed class VulkanDevice : IDisposable
                 commandBufferCount = 1,
                 pCommandBuffers = (nint)(&cmdBuf),
             };
-            Interop.ProfileCounters.Submits++;
-            VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError($"vkQueueSubmit {site}");
+            QueueSubmit(submit, fence, $"vkQueueSubmit {site}");
 
             nint fenceLocal = fence;
             VulkanApi.vkWaitForFences(_device, 1, fenceLocal, waitAll: 1, ulong.MaxValue).ThrowOnError($"vkWaitForFences {site}");
@@ -3095,7 +3161,7 @@ public sealed class VulkanDevice : IDisposable
         finally
         {
             VulkanApi.vkDestroyFence(_device, fence, 0);
-            VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, cmdBuf);
+            DestroyPrivateCommandPool(pool);
         }
     }
 
@@ -3382,7 +3448,8 @@ public sealed class VulkanDevice : IDisposable
             // loader's instance/device create-destroy tables, so it cannot
             // race another thread's Create()/Dispose() the way the calls
             // below can.
-            VulkanApi.vkDeviceWaitIdle(_device);
+            // vkDeviceWaitIdle needs every queue of the device externally synchronised, like vkQueueSubmit (#2068).
+            lock (_queueLock) VulkanApi.vkDeviceWaitIdle(_device);
         }
 
         DotLLM.Vulkan.DirectStorage.DirectWeightStore.Forget(this);
@@ -3404,6 +3471,10 @@ public sealed class VulkanDevice : IDisposable
                 VulkanApi.vkDestroyCommandPool(_device, _commandPool, 0);
                 _commandPool = 0;
             }
+            // Private pools whose owner was never disposed (see _privatePools): vkDestroyDevice needs every child object destroyed first.
+            foreach (var pool in _privatePools.Keys)
+                if (_privatePools.TryRemove(pool, out _)) VulkanApi.vkDestroyCommandPool(_device, pool, 0);
+            _transferPools.Clear();
             if (_device != 0)
             {
                 VulkanApi.vkDestroyDevice(_device, 0);
@@ -3741,9 +3812,18 @@ public sealed class VulkanDevice : IDisposable
     /// disarmed automatically by every <see cref="SubmitContext"/>
     /// begin/submit so an aborted recording can never leak tracking into an
     /// unrelated model's command buffer. Recording is single-threaded per
-    /// device, so a plain field suffices.
+    /// device by one armed thread; other threads see no tracker (their dispatches fall back to explicit barriers).
     /// </summary>
-    internal VulkanHazardTracker? ActiveHazards;
+    internal VulkanHazardTracker? ActiveHazards
+    {
+        // One slot per thread (#2068): arming, seeing and disarming are all scoped to the calling thread. A single device-wide slot was last-writer-wins: a second thread arming
+        // (two models on one device) replaced the first thread's tracker, whose getter then returned null mid-recording, dropping both the tracker's deferred barriers and the
+        // legacy barriers it had suppressed (a silent RAW race). Another thread's Begin / submit sets only its own slot to null. No allocation per arm.
+        get => _hazardSlot.Value;
+        set => _hazardSlot.Value = value;
+    }
+
+    private readonly ThreadLocal<VulkanHazardTracker?> _hazardSlot = new();
 
     /// <summary>
     /// Reusable command-buffer + fence pair used by the fence-pipelined
@@ -3756,16 +3836,18 @@ public sealed class VulkanDevice : IDisposable
         private readonly VulkanDevice _device;
         private nint _cmdBuf;
         private nint _fence;
+        private readonly nint _pool;
         private bool _disposed;
 
         /// <summary>Underlying command buffer. Valid between <see cref="Begin"/> and <see cref="SubmitAndWait"/>.</summary>
         public nint CommandBuffer => _cmdBuf;
 
-        internal SubmitContext(VulkanDevice device, nint cmdBuf, nint fence)
+        internal SubmitContext(VulkanDevice device, nint cmdBuf, nint fence, nint pool)
         {
             _device = device;
             _cmdBuf = cmdBuf;
             _fence = fence;
+            _pool = pool;
         }
 
         /// <summary>
@@ -3804,8 +3886,7 @@ public sealed class VulkanDevice : IDisposable
                 commandBufferCount = 1,
                 pCommandBuffers = (nint)(&cmdBufLocal),
             };
-            Interop.ProfileCounters.Submits++;
-            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence).ThrowOnError("vkQueueSubmit SubmitContext");
+            _device.QueueSubmit(submit, _fence, "vkQueueSubmit SubmitContext");
 
             nint fenceLocal = _fence;
             WaitForFenceAdaptive(fenceLocal);
@@ -3896,16 +3977,14 @@ public sealed class VulkanDevice : IDisposable
                 commandBufferCount = 1,
                 pCommandBuffers = (nint)(&cmdBufLocal),
             };
-            Interop.ProfileCounters.Submits++;
-            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, fence: 0)
-                .ThrowOnError("vkQueueSubmit SplitSubmit");
+            _device.QueueSubmit(submit, 0, "vkQueueSubmit SplitSubmit");
 
             if (_cmdBufAlt == 0)
             {
                 var cbai = new VkCommandBufferAllocateInfo
                 {
                     sType = VkStructureType.CommandBufferAllocateInfo,
-                    commandPool = _device._commandPool,
+                    commandPool = _pool,
                     level = VkCommandBufferLevel.Primary,
                     commandBufferCount = 1,
                 };
@@ -3961,9 +4040,7 @@ public sealed class VulkanDevice : IDisposable
                 signalSemaphoreCount = 1,
                 pSignalSemaphores = (nint)(&semLocal),
             };
-            Interop.ProfileCounters.Submits++;
-            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
-                .ThrowOnError("vkQueueSubmit SubmitAndSignal");
+            _device.QueueSubmit(submit, _fence, "vkQueueSubmit SubmitAndSignal");
         }
 
         /// <summary>
@@ -4008,9 +4085,7 @@ public sealed class VulkanDevice : IDisposable
                 signalSemaphoreCount = 1,
                 pSignalSemaphores = (nint)(&semLocal),
             };
-            Interop.ProfileCounters.Submits++;
-            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
-                .ThrowOnError("vkQueueSubmit SubmitAndSignalTimeline");
+            _device.QueueSubmit(submit, _fence, "vkQueueSubmit SubmitAndSignalTimeline");
         }
 
         /// <summary>
@@ -4038,18 +4113,8 @@ public sealed class VulkanDevice : IDisposable
                 VulkanApi.vkDestroyFence(_device._device, _fence, 0);
                 _fence = 0;
             }
-            if (_cmdBuf != 0)
-            {
-                nint local = _cmdBuf;
-                VulkanApi.vkFreeCommandBuffers(_device._device, _device._commandPool, 1, local);
-                _cmdBuf = 0;
-            }
-            if (_cmdBufAlt != 0)
-            {
-                nint local = _cmdBufAlt;
-                VulkanApi.vkFreeCommandBuffers(_device._device, _device._commandPool, 1, local);
-                _cmdBufAlt = 0;
-            }
+            _cmdBuf = 0; _cmdBufAlt = 0;
+            _device.DestroyPrivateCommandPool(_pool);   // frees both command buffers
         }
     }
 
@@ -4062,26 +4127,26 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public SubmitContext CreateSubmitContext()
     {
+        nint pool = CreatePrivateCommandPool("CreateSubmitContext");   // private: recording on this context never touches another owner's pool (#2068)
         var cbai = new VkCommandBufferAllocateInfo
         {
             sType = VkStructureType.CommandBufferAllocateInfo,
-            commandPool = _commandPool,
+            commandPool = pool,
             level = VkCommandBufferLevel.Primary,
             commandBufferCount = 1,
         };
-        VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf)
-            .ThrowOnError("vkAllocateCommandBuffers CreateSubmitContext");
+        int ar = VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf);
+        if (ar < 0) { DestroyPrivateCommandPool(pool); ar.ThrowOnError("vkAllocateCommandBuffers CreateSubmitContext"); }
 
         var fenceCi = new VkFenceCreateInfo { sType = VkStructureType.FenceCreateInfo };
         int r = VulkanApi.vkCreateFence(_device, fenceCi, 0, out nint fence);
         if (r < 0)
         {
-            nint local = cmdBuf;
-            VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, local);
+            DestroyPrivateCommandPool(pool);
             r.ThrowOnError("vkCreateFence CreateSubmitContext");
         }
 
-        return new SubmitContext(this, cmdBuf, fence);
+        return new SubmitContext(this, cmdBuf, fence, pool);
     }
 }
 

@@ -1149,6 +1149,7 @@ ending `_LEGACY`, `DISABLE_*` or `*_PROFILE` / `*_TRACE` / `*_DEBUG` is typicall
 | `DOTLLM_TRACE_LAYERS` | Opt-in diagnostic tracing for Nemotron-H forward pass. All checks are gated on environment variables read once at process startup, so when diagnostics are disabled the overhead is a single predictable branch per layer and no st... | `NemotronHDiagnostics.cs` |
 | `DOTLLM_TRACE_SSM` | Opt-in diagnostic tracing for Nemotron-H forward pass. All checks are gated on environment variables read once at process startup, so when diagnostics are disabled the overhead is a single predictable branch per layer and no st... | `NemotronHDiagnostics.cs` |
 | `DOTLLM_TRACE_SSM_LAYER` | (not described in source) | `NemotronHDiagnostics.cs` |
+| `DOTLLM_VISION_DEVICE` | Environment variable that forces the CPU vision encoder even when the model can build a device encoder (cpu). | `VisionSupport.cs` |
 | `DOTLLM_VISION_EMBD_PRECISION` | Environment variable that selects the VisionEmbedPrecision of patch_embd / position_embd when the caller does not (f32, f16, bf16; default bf16). | `Inkling2VisionEncoder.cs` |
 
 #### Server
