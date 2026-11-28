@@ -12,9 +12,7 @@ namespace DotLLM.Cuda.Architectures;
 /// Same semantics as the CPU model (<c>Qwen3HybridDenseTransformerModel.Vision.cs</c>); the bookkeeping lives in <see cref="VisionRopeState"/>.
 /// </summary>
 /// <remarks>
-/// CUDA status: BUILD-VERIFIED only. The M-RoPE PTX has to be generated with nvcc on a CUDA box (native/build_ptx.bat, or a DotLLM.Cuda build
-/// with nvcc available); until it exists <see cref="CudaKernels.HasMropeF32"/> is false and a forward that needs it throws
-/// <see cref="NotSupportedException"/>. A forward with a non-zero rope delta runs eagerly (never through a captured decode graph, whose
+/// CUDA status: BUILD-VERIFIED only (no NVIDIA GPU was reachable when this was written; the PTX is compiled by nvcc 12.8 and committed). A forward with a non-zero rope delta runs eagerly (never through a captured decode graph, whose
 /// rope positions are the slot ints) and refuses MTP / DFlash rather than rotating at a wrong position.
 /// </remarks>
 public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IImageInputModel

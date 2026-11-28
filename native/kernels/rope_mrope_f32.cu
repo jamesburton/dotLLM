@@ -7,8 +7,7 @@
 // result is bit-identical to rope_f32 (same expressions, same precise-math build). Build WITHOUT --use_fast_math
 // (it is not in build.sh / build_ptx.bat's fast-math list). The CPU oracle is RoPERotation.ApplyMrope.
 //
-// NOTE: the matching PTX is NOT committed from the Strix Halo dev host (no nvcc). A CUDA box regenerates it with
-// native/build_ptx.bat (or the DotLLM.Cuda build, native/msbuild/CudaPtx.targets); until then CudaKernels.HasMropeF32 is false.
+// The PTX (native/ptx/rope_mrope_f32.ptx, sm_75, .version 8.7) is committed; regenerate with native/build_ptx.bat after editing this file.
 
 #include <math.h>
 
