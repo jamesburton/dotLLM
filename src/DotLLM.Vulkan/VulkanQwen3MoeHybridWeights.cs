@@ -345,7 +345,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
             gdnW.GateOutputDim, gdnW.GateInputDim, forceF32: false, out var gateQt, out long gateBytes);
         // Bonsai 2.5 declares ssm_alpha/ssm_beta F32 where Bonsai 2 declared BF16; every value is exactly BF16-representable (checked at upload),
         // so the device copy is narrowed to BF16 losslessly (half the bytes, the same kernels as Bonsai 2, zero numeric change; #2072).
-        // PTQ1_0 trunks are excluded: a Vulkan PTQ1_0 prefill with BF16 GDN gates at n >= 128 ends in VK_ERROR_DEVICE_LOST (reproduced on the
+        // PTQ1_0 trunks are excluded (known issue #2081): a Vulkan PTQ1_0 prefill with BF16 GDN gates at n >= 128 ends in VK_ERROR_DEVICE_LOST (reproduced on the
         // Bonsai 2 PTQ1_0 file too, which declares BF16 gates; ctx 64 is fine, F32 gates are fine), so narrowing there would only expose it.
         bool narrowGates = gdnW.QkvQuantType != QuantizationType.PTQ1_0;
         var alpha = UploadGdnGateProjection(device, staging, gdnW.AlphaWeight, gdnW.AlphaQuantType,
