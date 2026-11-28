@@ -576,7 +576,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
     /// <summary><c>y[T, M] = W[M, K] x[T, K]</c> through the Olala GEMV (Q8_0 or BF16 weights read in place, BF16 activations, F32 accumulation); <paramref name="f32Out"/> stores F32 logits.</summary>
     private void Gemv(Mat w, VulkanDevice.Buffer x, VulkanDevice.Buffer y, int T, long xOff = 0, bool f32Out = false, bool f16Out = false)
     {
-        if (f16Out && (f32Out || w.Qt != QuantizationType.Q8_0 || _opt.ActivationF32)) throw new NotSupportedException("The F16-output GEMV exists for Q8_0 weights and BF16 activations only (the DSpark drafter's logits arm).");
+        if (f16Out && (f32Out || w.Qt != QuantizationType.Q8_0 || _act == Inkling2ActFormat.F32)) throw new NotSupportedException("The F16-output GEMV exists for Q8_0 weights and BF16 / F16 activations only (the DSpark drafter's logits arm).");
         string kn = "olala_gemv_" + Wt(w.Qt) + (f16Out ? "_f16out" : "");
         string f16k = f16Out ? "h" : "";
         bool q8Tile = T > 1 && w.Qt == QuantizationType.Q8_0;
@@ -584,8 +584,8 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IModel, IIma
         if ((xOff & 7) != 0 || (w.In & 7) != 0) throw new InvalidOperationException($"inkling2 gemv needs xOff and K to be multiples of 8 (xOff {xOff}, K {w.In}).");
         int rows = q8Tile ? PrefillQ8Rows : 1;
         var k = rows > 1
-            ? Kernel($"gemv|{nc}|{(f32Out ? 1 : 0)}|{Wt(w.Qt)}{f16k}|r{rows}", kn, 5, 4, !f16Out, (uint)nc, 0u, f32Out ? 1u : 0u, (uint)rows)
-            : Kernel($"gemv|{nc}|{(f32Out ? 1 : 0)}|{Wt(w.Qt)}{f16k}", kn, 5, 4, !f16Out, (uint)nc, 0u, f32Out ? 1u : 0u);
+            ? Kernel($"gemv|{nc}|{(f32Out ? 1 : 0)}|{Wt(w.Qt)}{f16k}|r{rows}", kn, 5, 4, true, (uint)nc, 0u, f32Out ? 1u : 0u, (uint)rows)
+            : Kernel($"gemv|{nc}|{(f32Out ? 1 : 0)}|{Wt(w.Qt)}{f16k}", kn, 5, 4, true, (uint)nc, 0u, f32Out ? 1u : 0u);
         uint M = (uint)w.Out;
         uint groups = (M + (uint)rows - 1) / (uint)rows;
         uint gx = Math.Min(groups, 32768u), gy = (groups + 32767u) / 32768u, gz = (uint)((T + nc - 1) / nc);

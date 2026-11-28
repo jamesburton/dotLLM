@@ -14,13 +14,16 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// (<c>Inkling2DSparkDrafter</c>). Inputs are BF16 / F16 exactly as the GPU stores them; outputs are compared at BF16 resolution. Shader mutants are loaded through
 /// <c>DOTLLM_INKLING2_SPV_OVERRIDE</c> (a directory holding a mutated copy of one .spv; the tracked .spv are never edited).
 /// </summary>
-public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
+public unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
 {
     private readonly ITestOutputHelper _output;
     private readonly VulkanDevice? _dev;
     private readonly string _spv = Inkling2VulkanTests.SpvDir();
     private readonly string? _ovr = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_SPV_OVERRIDE");
     private readonly Random _rnd = new(2046);
+
+    /// <summary>True: the activation buffers hold F16 words and the <c>_f16act</c> shader twins run (the F16 default, #2075); false: BF16.</summary>
+    protected virtual bool F16Act => false;
 
     public Inkling2VulkanDSparkKernelTests(ITestOutputHelper output)
     {
@@ -32,7 +35,9 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
 
     private VulkanDevice Dev { get { Skip.If(_dev is null, "No Vulkan device"); return _dev!; } }
 
-    private OlalaKernel K(string name, int buffers, int pushWords, params uint[] spec) => KIn(null, name, buffers, pushWords, spec);
+    private static readonly HashSet<string> ActTwins = ["inkling2_dspark_eltwise", "inkling2_dspark_ctxmix", "inkling2_dspark_headnorm", "inkling2_dspark_attn", "inkling2_dspark_markov_pre", "inkling2_dspark_markov_step"];
+
+    private OlalaKernel K(string name, int buffers, int pushWords, params uint[] spec) => KIn(null, F16Act && ActTwins.Contains(name) ? name + "_f16act" : name, buffers, pushWords, spec);
 
     private OlalaKernel KIn(string? dirOverride, string name, int buffers, int pushWords, params uint[] spec)
     {
@@ -41,15 +46,18 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
     }
 
     private static uint F(float f) => BitConverter.SingleToUInt32Bits(f);
+    private float Rnd(float x) => F16Act ? (float)(Half)x : Bf(x);   // round to the ACTIVATION format
     private static float Bf(float x) => BitConverter.Int32BitsToSingle(Inkling2ConvState.ToBf16(x) << 16);
     private static float BfBits(ushort b) => BitConverter.Int32BitsToSingle(b << 16);
     private float[] Rand(int n, float s = 1f) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(_rnd.NextDouble() * 2 - 1) * s; return a; }
 
     private VulkanDevice.Buffer UpBytes(byte[] a) { var b = Dev.AllocateDeviceLocal(Math.Max(16, (a.Length + 3L) / 4 * 4)); Dev.Upload(a.Length % 4 == 0 ? a : a.Concat(new byte[4 - a.Length % 4]).ToArray(), b); return b; }
     private VulkanDevice.Buffer UpF(float[] a) { var b = Dev.AllocateDeviceLocal(Math.Max(16, a.Length * 4L)); Dev.Upload(a, b); return b; }
+    private VulkanDevice.Buffer UpAct(float[] a) => F16Act ? UpF16(a) : UpBf16(a);
     private VulkanDevice.Buffer UpBf16(float[] a) => UpBytes(MemoryMarshal.AsBytes(a.Select(Inkling2ConvState.ToBf16).ToArray().AsSpan()).ToArray());
     private VulkanDevice.Buffer UpF16(float[] a) => UpBytes(MemoryMarshal.AsBytes(a.Select(x => BitConverter.HalfToUInt16Bits((Half)x)).ToArray().AsSpan()).ToArray());
     private VulkanDevice.Buffer Zero(long bytes) { var b = Dev.AllocateDeviceLocal(Math.Max(16, (bytes + 3) / 4 * 4)); Dev.FillBufferSynchronous(b, 0); return b; }
+    private float[] DownAct(VulkanDevice.Buffer b, int n) => F16Act ? DownF16(b, n) : DownBf16(b, n);
     private float[] DownBf16(VulkanDevice.Buffer b, int n) { var raw = new float[(n + 1) / 2]; Dev.Download(b, raw); var u = MemoryMarshal.Cast<float, ushort>(raw.AsSpan()); var r = new float[n]; for (int i = 0; i < n; i++) r[i] = BfBits(u[i]); return r; }
     private float[] DownF16(VulkanDevice.Buffer b, int n) { var raw = new float[(n + 1) / 2]; Dev.Download(b, raw); var u = MemoryMarshal.Cast<float, ushort>(raw.AsSpan()); var r = new float[n]; for (int i = 0; i < n; i++) r[i] = (float)BitConverter.UInt16BitsToHalf(u[i]); return r; }
     private float[] DownF(VulkanDevice.Buffer b, int n) { var r = new float[n]; Dev.Download(b, r); return r; }
@@ -89,10 +97,10 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
     public void Copy_StridedRows_IsVerbatim()
     {
         int W = 300, rows = 3;
-        var src = Rand(rows * W).Select(Bf).ToArray();
+        var src = Rand(rows * W).Select(Rnd).ToArray();
         var dst = Zero(rows * 4 * W * 2L);
-        Run(new Step(K("inkling2_dspark_copy", 2, 6), [(uint)W, (uint)rows, 0, (uint)W, (uint)(2 * W), (uint)(4 * W)], 2, (uint)rows, 1, [UpBf16(src), dst]));
-        var got = DownBf16(dst, rows * 4 * W);
+        Run(new Step(K("inkling2_dspark_copy", 2, 6), [(uint)W, (uint)rows, 0, (uint)W, (uint)(2 * W), (uint)(4 * W)], 2, (uint)rows, 1, [UpAct(src), dst]));
+        var got = DownAct(dst, rows * 4 * W);
         for (int r = 0; r < rows; r++) for (int c = 0; c < W; c++) Assert.Equal(src[r * W + c], got[r * 4 * W + 2 * W + c]);
         Assert.Equal(0f, got[0]);   // the other slots are untouched
     }
@@ -103,12 +111,12 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
     public void Eltwise_MatchesReference(uint mode)
     {
         int n = 1000;
-        var a = Rand(n, 3).Select(Bf).ToArray(); var b = Rand(n, 3).Select(Bf).ToArray();
+        var a = Rand(n, 3).Select(Rnd).ToArray(); var b = Rand(n, 3).Select(Rnd).ToArray();
         var want = new float[n];
         for (int i = 0; i < n; i++) want[i] = mode == 0 ? a[i] + b[i] : (float)(a[i] / (1.0 + Math.Exp(-a[i])) * b[i]);
-        var ba = UpBf16(a);
-        Run(new Step(K("inkling2_dspark_eltwise", 2, 1, mode), [(uint)n], 4, 1, 1, [ba, UpBf16(b)]));
-        Check("eltwise" + mode, want, DownBf16(ba, n), 6e-3);
+        var ba = UpAct(a);
+        Run(new Step(K("inkling2_dspark_eltwise", 2, 1, mode), [(uint)n], 4, 1, 1, [ba, UpAct(b)]));
+        Check("eltwise" + mode, want, DownAct(ba, n), 6e-3);
     }
 
     // ───────────── ctx mix (K/V injection input and f_rnn) ─────────────
@@ -119,7 +127,7 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
     public void CtxMix_MatchesReference(uint mode)
     {
         int H = 2304, rows = mode == 1 ? 45 : 3, posBase = 14;
-        var taps = Rand(rows * 4 * H, 4).Select(Bf).ToArray();
+        var taps = Rand(rows * 4 * H, 4).Select(Rnd).ToArray();
         var mix = new float[] { 0.1f, 0.2f, 0.3f, 0.4f };
         var gamma = Rand(H).Select(x => 1 + x).ToArray();
         var want = new float[rows * H];
@@ -130,8 +138,8 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
             Inkling2Ops.RmsNorm(m, gamma, 1e-6f, want.AsSpan(r * H, H));
         }
         var y = Zero(mode == 0 ? rows * H * 2L : 16L * H * 2);
-        Run(new Step(K("inkling2_dspark_ctxmix", 4, 3, mode), [(uint)H, (uint)posBase, F(1e-6f)], (uint)rows, 1, 1, [UpBf16(taps), UpF(mix), UpF(gamma), y]));
-        if (mode == 0) Check("ctxmix bf16", want, DownBf16(y, rows * H), 8e-3);
+        Run(new Step(K("inkling2_dspark_ctxmix", 4, 3, mode), [(uint)H, (uint)posBase, F(1e-6f)], (uint)rows, 1, 1, [UpAct(taps), UpF(mix), UpF(gamma), y]));
+        if (mode == 0) Check("ctxmix bf16", want, DownAct(y, rows * H), 8e-3);
         else
         {
             var ring = DownF16(y, 16 * H);
@@ -174,12 +182,12 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
     {
         _ = unusedRing;
         int heads = 3, rows = 4;
-        var x = Rand(rows * heads * 128, 3).Select(Bf).ToArray(); var gamma = Rand(128).Select(v => 1 + v).ToArray();
+        var x = Rand(rows * heads * 128, 3).Select(Rnd).ToArray(); var gamma = Rand(128).Select(v => 1 + v).ToArray();
         var want = new float[rows * heads * 128];
         for (int r = 0; r < rows; r++) RefHeadNorm(x, heads, r, gamma, true, true, posBase + r, want, r * heads * 128);
         var y = Zero(rows * heads * 128 * 2L);
-        Run(new Step(K("inkling2_dspark_headnorm", 4, 7, 1, 1, 0), [(uint)heads, (uint)posBase, 0, 0, 0, 0, F(1e-6f)], (uint)heads, (uint)rows, 1, [UpBf16(x), UpF(gamma), UpF(RopeTab()), y]));
-        Check($"headnorm+rope pos {posBase}", want, DownBf16(y, want.Length), 1.5e-2);
+        Run(new Step(K("inkling2_dspark_headnorm", 4, 7, 1, 1, 0), [(uint)heads, (uint)posBase, 0, 0, 0, 0, F(1e-6f)], (uint)heads, (uint)rows, 1, [UpAct(x), UpF(gamma), UpF(RopeTab()), y]));
+        Check($"headnorm+rope pos {posBase}", want, DownAct(y, want.Length), 1.5e-2);
     }
 
     /// <summary>K/V store into a ring: row r lands in slot (slotBase + r) % ring, F16; the RoPE position is independent of the slot. A ring of the wrong size lands rows in other slots.</summary>
@@ -191,11 +199,11 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
     public void HeadNormRope_F16RingStore_PlacesRowsInTheirSlots(int ring, int basePos, int rope)
     {
         int heads = 8, rows = 6;
-        var x = Rand(rows * heads * 128, 3).Select(Bf).ToArray(); var gamma = Rand(128).Select(v => 1 + v).ToArray();
+        var x = Rand(rows * heads * 128, 3).Select(Rnd).ToArray(); var gamma = Rand(128).Select(v => 1 + v).ToArray();
         int slots = ring == 0 ? basePos + rows : ring;
         var y = Zero((long)slots * heads * 128 * 2);
         Run(new Step(K("inkling2_dspark_headnorm", 4, 7, 1, (uint)rope, 1), [(uint)heads, (uint)basePos, (uint)basePos, (uint)ring, 0, 0, F(1e-6f)], (uint)heads, (uint)rows, 1,
-            [UpBf16(x), UpF(gamma), UpF(RopeTab()), y]));
+            [UpAct(x), UpF(gamma), UpF(RopeTab()), y]));
         var got = DownF16(y, slots * heads * 128);
         double worst = 0;
         for (int r = 0; r < rows; r++)
@@ -214,7 +222,7 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
     private (float[] q, float[] kc, float[] vc, float[] kb, float[] vb) AttnData(int b, int slots)
     {
         const int heads = 24, kv = 8;
-        return (Rand(b * heads * 128, 2).Select(Bf).ToArray(), Rand(slots * kv * 128, 2).Select(x => (float)(Half)x).ToArray(), Rand(slots * kv * 128).Select(x => (float)(Half)x).ToArray(),
+        return (Rand(b * heads * 128, 2).Select(Rnd).ToArray(), Rand(slots * kv * 128, 2).Select(x => (float)(Half)x).ToArray(), Rand(slots * kv * 128).Select(x => (float)(Half)x).ToArray(),
                 Rand(b * kv * 128, 2).Select(x => (float)(Half)x).ToArray(), Rand(b * kv * 128).Select(x => (float)(Half)x).ToArray());
     }
 
@@ -258,8 +266,8 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
     {
         var o = Zero(b * 24 * 128 * 2L);
         Run(new Step(K("inkling2_dspark_attn", 6, 7), [(uint)b, (uint)lo, (uint)pos0, (uint)ring, 24, 8, F(1f / MathF.Sqrt(128))], 8, 1, 1,
-            [UpBf16(q), UpF16(kc), UpF16(vc), UpF16(kb), UpF16(vb), o]));
-        return DownBf16(o, b * 24 * 128);
+            [UpAct(q), UpF16(kc), UpF16(vc), UpF16(kb), UpF16(vb), o]));
+        return DownAct(o, b * 24 * 128);
     }
 
     [SkippableTheory]
@@ -345,7 +353,7 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
             {
                 double s = m.Jb[j];
                 for (int k = 0; k < H; k++) s += m.J[j * stride + 2 * R + k] * (double)hid[r * H + k] + m.J[j * stride + 2 * R + H + k] * (double)frnn[k];
-                pre[r][j] = Bf((float)s);
+                pre[r][j] = Rnd((float)s);
             }
         }
         var tokens = new int[n]; var cols = new float[n][];
@@ -366,7 +374,7 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
             {
                 double gate = 1 / (1 + Math.Exp(-jp[j])), cand = Math.Tanh(jp[R + j]);
                 state[j] = cand + gate * (state[j] - cand);
-                c2[j] = Bf((float)Math.Tanh(jp[2 * R + j]));
+                c2[j] = Rnd((float)Math.Tanh(jp[2 * R + j]));
             }
             var col = new float[V]; int best = 0;
             for (int v = 0; v < V; v++)
@@ -391,7 +399,7 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
         var m = new MarkovRef { H = H, V = V };
         m.J = Rand(768 * stride, 0.05f).Select(Bf).ToArray(); m.W1 = Rand(V * R, 1).Select(Bf).ToArray(); m.W2 = Rand(V * R, 0.3f).Select(Bf).ToArray();
         m.Jb = Rand(768, 0.5f); m.B2 = Rand(V, 0.5f);
-        var hid = Rand(n * H, 1).Select(Bf).ToArray();
+        var hid = Rand(n * H, 1).Select(Rnd).ToArray();
         var frnnRing = Rand(16 * H, 1).Select(x => (float)(Half)x).ToArray();
         int slot = 5;
         var frnn = frnnRing.AsSpan(slot * H, H).ToArray();
@@ -404,7 +412,7 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
         var baseFlat = baseL.SelectMany(x => x).ToArray();
         if (logitsF16) for (int i = 0; i < baseFlat.Length; i++) { baseFlat[i] = (float)(Half)baseFlat[i]; baseL[i / V][i % V] = baseFlat[i]; }   // the GPU's base logits are the F16-rounded GEMV outputs
         var logits = logitsF16 ? UpF16(baseFlat) : UpF(baseFlat);
-        var jb = UpBf16(m.J); var hb = UpBf16(hid); var fb = UpF16(frnnRing); var jbias = UpF(m.Jb);
+        var jb = UpBf16(m.J); var hb = UpAct(hid); var fb = UpF16(frnnRing); var jbias = UpF(m.Jb);
         var pre = Zero(n * 768 * 2L); var w1 = UpBf16(m.W1); var w2 = UpBf16(m.W2); var b2 = UpF(m.B2); var c2 = Zero(256 * 2);
         int parts = (V + 31) / 32;
         var part = Zero(parts * 8L);
@@ -564,4 +572,13 @@ public sealed unsafe class Inkling2VulkanDSparkKernelTests : IDisposable
             if (r.Tokens[i] != refTok[i]) break;
         }
     }
+}
+
+/// <summary>The same op-level parity with F16 activation buffers and the <c>_f16act</c> shader twins (the default activation format since #2075). A BF16-reading shader under F16 words (the mutant of the PR) fails every test of this class that reads activations.</summary>
+public sealed unsafe class Inkling2VulkanDSparkKernelF16ActTests : Inkling2VulkanDSparkKernelTests
+{
+    public Inkling2VulkanDSparkKernelF16ActTests(ITestOutputHelper output) : base(output) { }
+
+    /// <inheritdoc/>
+    protected override bool F16Act => true;
 }
