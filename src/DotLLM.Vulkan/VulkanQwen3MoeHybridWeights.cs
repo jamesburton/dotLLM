@@ -298,6 +298,42 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
             outputW, outputDeviceQt, outputOutputDim, outputInputDim, total);
     }
 
+    /// <summary>
+    /// Uploads a GDN alpha/beta gate projection. An F32 source whose every value is exactly representable in BF16 (the low 16 bits of each
+    /// word are zero, as in Bonsai 2.5's F32-declared tensors that were BF16 in Bonsai 2) is uploaded as BF16: lossless, half the bytes.
+    /// Anything else goes through <see cref="UploadProjectionMatrix"/> unchanged.
+    /// </summary>
+    private static unsafe VulkanDevice.Buffer UploadGdnGateProjection(
+        VulkanDevice device, VulkanStagingBuffer staging, nint src, QuantizationType qt, int outputDim, int inputDim,
+        out QuantizationType deviceQt, out long uploadedBytes)
+    {
+        long count = (long)outputDim * inputDim;
+        if (qt == QuantizationType.F32 && (inputDim & 1) == 0 && Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_GATE_BF16_NARROW") != "0")
+        {
+            uint* words = (uint*)src;
+            bool exact = true;
+            for (long i = 0; i < count; i++)
+                if ((words[i] & 0xFFFFu) != 0) { exact = false; break; }
+            if (exact)
+            {
+                nint tmp = (nint)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)(count * 2), 64);
+                try
+                {
+                    ushort* dst = (ushort*)tmp;
+                    for (long i = 0; i < count; i++) dst[i] = (ushort)(words[i] >> 16);
+                    // Staged copy, never the zero-copy host import: tmp is freed on return (UploadBytes memcpys into the staging slot first).
+                    uploadedBytes = count * 2;
+                    var buf = device.AllocateDeviceLocal(uploadedBytes);
+                    staging.UploadBytes(tmp, uploadedBytes, buf);
+                    deviceQt = QuantizationType.BF16;
+                    return buf;
+                }
+                finally { System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)tmp); }
+            }
+        }
+        return UploadProjectionMatrix(device, staging, src, qt, outputDim, inputDim, forceF32: false, out deviceQt, out uploadedBytes);
+    }
+
     internal static GdnLayerBuffers UploadGdnLayer(
         VulkanDevice device, VulkanStagingBuffer staging,
         GdnTokenMixingWeights gdnW, out long uploadedBytes)
@@ -307,10 +343,12 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
             gdnW.QkvOutputDim, gdnW.QkvInputDim, forceF32: false, out var qkvQt, out long qkvBytes);
         var gate = UploadProjectionMatrix(device, staging, gdnW.GateWeight, gdnW.GateQuantType,
             gdnW.GateOutputDim, gdnW.GateInputDim, forceF32: false, out var gateQt, out long gateBytes);
-        var alpha = UploadProjectionMatrix(device, staging, gdnW.AlphaWeight, gdnW.AlphaQuantType,
-            gdnW.AlphaOutputDim, gdnW.AlphaInputDim, forceF32: false, out var alphaQt, out long alphaBytes);
-        var beta = UploadProjectionMatrix(device, staging, gdnW.BetaWeight, gdnW.BetaQuantType,
-            gdnW.BetaOutputDim, gdnW.BetaInputDim, forceF32: false, out var betaQt, out long betaBytes);
+        // Bonsai 2.5 declares ssm_alpha/ssm_beta F32 where Bonsai 2 declared BF16; every value is exactly BF16-representable (checked at upload),
+        // so the device copy is narrowed to BF16 losslessly (half the bytes, the same kernels as Bonsai 2, zero numeric change; #2072).
+        var alpha = UploadGdnGateProjection(device, staging, gdnW.AlphaWeight, gdnW.AlphaQuantType,
+            gdnW.AlphaOutputDim, gdnW.AlphaInputDim, out var alphaQt, out long alphaBytes);
+        var beta = UploadGdnGateProjection(device, staging, gdnW.BetaWeight, gdnW.BetaQuantType,
+            gdnW.BetaOutputDim, gdnW.BetaInputDim, out var betaQt, out long betaBytes);
         var conv1dWeight = UploadFloatArray(device, staging, gdnW.Conv1dWeight);
         var conv1dBias = UploadFloatArray(device, staging, gdnW.Conv1dBias);
         var ssmNorm = UploadFloatArray(device, staging, gdnW.SsmNormWeight);
