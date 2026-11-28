@@ -31,6 +31,13 @@ public interface IModel : IDisposable
     int MtpPreferredDraftTokens => 0;
 
     /// <summary>
+    /// The most drafts per round this model's drafter can produce (<see cref="int.MaxValue"/> = no limit). A block drafter (DFlash, DSpark) builds its whole block
+    /// in one pass for a fixed width (<c>DOTLLM_DFLASH_DRAFT</c> / <c>DOTLLM_DSPARK_DRAFT</c>, at most its block size minus one), so a caller K above it has no
+    /// draft to serve: <c>TextGenerator</c> and <c>MtpSpeculativeDecoder</c> cap K here (and say so once) instead of failing mid-request.
+    /// </summary>
+    int MtpMaxDraftTokens => int.MaxValue;
+
+    /// <summary>
     /// Total bytes of committed memory holding repacked (layout-transformed) copies of the model
     /// weights, or 0 when the backend does not repack. This is memory in addition to the
     /// memory-mapped weight file, not a subset of it.

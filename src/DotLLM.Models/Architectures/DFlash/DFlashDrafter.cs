@@ -94,8 +94,12 @@ internal sealed unsafe class DFlashDrafter : IDisposable
 
     /// <summary>Drafts per round: the block's <c>BlockSize - 1</c>, capped by <c>DOTLLM_DFLASH_DRAFT</c> when set.</summary>
     public int DraftTokensPerRound
-        => int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_DFLASH_DRAFT"), out int n) && n >= 1
-            ? Math.Min(n, BlockSize - 1) : BlockSize - 1;
+        => DraftTokensOverride is { } o && o >= 1 ? Math.Min(o, BlockSize - 1)
+            : int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_DFLASH_DRAFT"), out int n) && n >= 1
+                ? Math.Min(n, BlockSize - 1) : BlockSize - 1;
+
+    /// <summary>Tests: a draft width for the constructing/calling thread (the environment variable is process-wide).</summary>
+    [ThreadStatic] internal static int? DraftTokensOverride;
 
     /// <summary>True for a DFlash2 drafter (convolutions + selector).</summary>
     public bool IsDFlash2 => _selHidden is not null;

@@ -401,6 +401,57 @@ public sealed class Inkling2VisionPlumbingTests
         Assert.NotNull(gen.Generate("3 9", new InferenceOptions { MaxTokens = 1, Images = [emb], ImagePlaceholderTokenId = 9 }));
     }
 
+    /// <summary>An image-capable model that also offers MTP (the CPU Inkling 2 model with a DSpark drafter attached, #2039); counts the MTP states the engine opens.</summary>
+    private sealed class MtpImageStubModel : IModel, IImageInputModel
+    {
+        private readonly ImageStubModel _inner = new();
+        public int MtpStatesCreated;
+        public int ImageCalls => _inner.ImageCalls.Count;
+        public ModelConfig Config => _inner.Config;
+        public long ComputeMemoryBytes => 0;
+        public bool SupportsMtp => true;
+        public IMtpState? CreateMtpState() { MtpStatesCreated++; return new StubMtpState(); }
+        public IMtpState? CreateMtpState(int maxSequenceLength) => CreateMtpState();
+        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d) => throw new NotSupportedException();
+        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv) => _inner.Forward(t, p, d, kv);
+        public ITensor ForwardWithImages(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IReadOnlyList<ImageSpan> images, IKvCache? kv, bool last)
+            => _inner.ForwardWithImages(t, p, d, images, kv, last);
+        public void Dispose() { }
+    }
+
+    private sealed class StubMtpState : IMtpState
+    {
+        public int CurrentLength => 0;
+        public void Rollback(int length) { }
+        public ReadOnlySpan<float> CapturedHiddenRows => ReadOnlySpan<float>.Empty;
+        public int CapturedRowCount => 0;
+        public int HiddenSize => 8;
+        public void SeedFromCapturedRow(int rowIndex) { }
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// Review of #2057: an image request never speculates (<c>TextGenerator.ShouldUseMtp</c> requires <c>_requestImages is null</c>). The image prefill
+    /// goes through <see cref="IImageInputModel.ForwardWithImages"/>, which carries no MTP state, so a DSpark/MTP head opened for it would draft from a
+    /// context it never saw. The control arm (the same model, a text request) must open a state, so the image arm's zero can disagree.
+    /// Kills: dropping the <c>_requestImages is null</c> condition (the image request then opens a state).
+    /// </summary>
+    [Fact]
+    public void ImageRequest_NeverOpensAnMtpState_WhileATextRequestDoes()
+    {
+        var model = new MtpImageStubModel();
+        var gen = new TextGenerator(model, new WordTokenizer(), kvCacheFactory: (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg, false), size),
+            mtpEnabled: true);
+        using var emb = new ImageEmbeddings(2, 1, 8, "img");
+        gen.Generate("3 9 4", new InferenceOptions { MaxTokens = 1, Temperature = 0, Images = [emb], ImagePlaceholderTokenId = 9 });
+        Assert.Equal(1, model.ImageCalls);
+        Assert.Equal(0, model.MtpStatesCreated);
+
+        // control: a text-only request on the same generator does open one
+        gen.Generate("3 4", new InferenceOptions { MaxTokens = 1, Temperature = 0 });
+        Assert.Equal(1, model.MtpStatesCreated);
+    }
+
     private sealed class StubAdapter : DotLLM.Core.Lora.ILoraAdapter
     {
         public string Name => "stub";

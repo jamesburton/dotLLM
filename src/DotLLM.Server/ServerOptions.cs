@@ -249,6 +249,9 @@ public sealed record ServerOptions
     /// <summary>DFlash / DFlash2 drafter GGUF (<c>--dflash</c>, issue #1175); it takes the model's MTP slot. Null = none.</summary>
     public string? DFlashPath { get; init; }
 
+    /// <summary>Inkling 2 DSpark drafter GGUF (<c>--dspark</c>, issue #2039). Null = auto-detect a <c>dspark-*.gguf</c> beside the model.</summary>
+    public string? DSparkPath { get; init; }
+
     /// <summary>
     /// How reasoning ("thinking") output is separated from the answer (#767): <c>--reasoning-format
     /// none|auto|deepseek</c>. <see cref="DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto"/> (default) splits
@@ -533,6 +536,7 @@ public sealed record ServerOptions
         bool mtpExplicit = false;
         string? mtpHeadPath = null;
         string? dflashPath = null;
+        string? dsparkPath = null;
         var reasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto;
         int? prefillChunkSize = null;
         string? ropeScaling = null;
@@ -647,6 +651,8 @@ public sealed record ServerOptions
                     mtpHeadPath = next; i++; break;
                 case "--dflash":
                     dflashPath = next; i++; break;
+                case "--dspark":
+                    dsparkPath = next; i++; break;
                 case "--reasoning-format":
                     reasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(next ?? ""); i++; break;
                 case "--prefill-chunk-size" or "--ubatch-size":
@@ -792,6 +798,7 @@ public sealed record ServerOptions
             MtpExplicit = mtpExplicit,
             MtpHeadPath = mtpHeadPath,
             DFlashPath = dflashPath,
+            DSparkPath = dsparkPath,
             ReasoningFormat = reasoningFormat,
             PrefillChunkSize = prefillChunkSize,
             KeepAliveSeconds = keepAliveSeconds,

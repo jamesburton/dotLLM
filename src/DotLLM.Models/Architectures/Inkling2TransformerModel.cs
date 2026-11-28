@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
+using DotLLM.Models.Architectures.DSpark;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
@@ -64,6 +65,16 @@ public sealed record Inkling2Options(
 internal enum Inkling2Mutant
 {
     None, TwoPasses, NoFinalSoftcap, NoSink, NoRelativeBias, NoLogScale, NoExpertScale, NoControl,
+    /// <summary>DSpark taps keyed by cache slot instead of layer visit (#2039).</summary>
+    TapBySlot,
+    /// <summary>DSpark taps one visit EARLY in the prelude only (tap id v receives the input of visit v - 1).</summary>
+    TapEarlyPrelude,
+    /// <summary>DSpark taps one visit LATE in every loop (tap id v receives the input of visit v + 1, i.e. the output of layer v).</summary>
+    TapLate,
+    /// <summary>Visit 48 tapped before the output norm.</summary>
+    TapPreNorm,
+    /// <summary>A rejected speculative round leaves the recurrent state advanced (RestoreRecurrentStateToRow is a no-op).</summary>
+    SkipRestore,
     /// <summary>Image embeddings go through <c>token_embd_norm</c> like token rows (they must bypass it).</summary>
     NormalizeImageEmbeddings,
 }
@@ -83,7 +94,7 @@ internal delegate void Inkling2TraceSink(string name, ReadOnlySpan<float> data, 
 /// <para>The model owns its sequence state (KV + conv state per cache slot); positions must continue it (<c>positions[i] == state.Length + i</c>)
 /// and a call at position 0 restarts it. An external <see cref="IKvCache"/> is ignored.</para>
 /// </remarks>
-public sealed unsafe class Inkling2TransformerModel : IModel, IImageInputModel
+public sealed unsafe partial class Inkling2TransformerModel : IModel, IImageInputModel
 {
     private readonly record struct MatRef(nint Ptr, QuantizationType Qt, int In, int Out);
 
@@ -324,6 +335,8 @@ public sealed unsafe class Inkling2TransformerModel : IModel, IImageInputModel
     }
 
     /// <summary><c>c[t, i] = dot(W[i, :], b[t, :])</c>; every weight type is read in place (no expansion): quantized and BF16 weights through their GEMMs.</summary>
+    internal static void GemmPublic(nint weights, QuantizationType qt, float* b, float* c, int m, int k, int n, ComputeThreadPool? pool) => Gemm(weights, qt, b, c, m, k, n, pool);
+
     private static void Gemm(nint weights, QuantizationType qt, float* b, float* c, int m, int k, int n, ComputeThreadPool? pool)
     {
         switch (qt)
@@ -373,7 +386,7 @@ public sealed unsafe class Inkling2TransformerModel : IModel, IImageInputModel
         => ForwardCore(tokenIds, positions, deviceId, state, lastTokenLogitsOnly, images);
 
     private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, Inkling2SequenceState state, bool lastTokenLogitsOnly,
-        IReadOnlyList<ImageSpan>? images = null)
+        IReadOnlyList<ImageSpan>? images = null, IInkling2Tap? tap = null, bool recordRows = false)
     {
         ArgumentNullException.ThrowIfNull(state);
         int T = tokenIds.Length;
@@ -386,8 +399,14 @@ public sealed unsafe class Inkling2TransformerModel : IModel, IImageInputModel
             throw new ArgumentOutOfRangeException(nameof(positions), $"Sequence would exceed the context length {Config.MaxSequenceLength}.");
 
         Inkling2Scratch sc = RentScratch();
-        try { return ForwardBody(tokenIds, deviceId, state, lastTokenLogitsOnly, sc, images); }
-        finally { ReturnScratch(sc); }
+        int posStart = state.Length;
+        try
+        {
+            state.RecordRows = recordRows;
+            if (recordRows) _recordedPos0 = posStart;
+            return ForwardBody(tokenIds, deviceId, state, lastTokenLogitsOnly, sc, images, tap);
+        }
+        finally { state.RecordRows = false; ReturnScratch(sc); }
     }
 
     private bool TryImageRow(IReadOnlyList<ImageSpan> images, int position, Span<float> dest)
@@ -420,8 +439,9 @@ public sealed unsafe class Inkling2TransformerModel : IModel, IImageInputModel
         lock (_scratchPool) _scratchPool.Push(sc);
     }
 
-    private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Inkling2SequenceState st, bool lastOnly, Inkling2Scratch sc, IReadOnlyList<ImageSpan>? images = null)
+    private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Inkling2SequenceState st, bool lastOnly, Inkling2Scratch sc, IReadOnlyList<ImageSpan>? images = null, IInkling2Tap? tap = null)
     {
+        int visit = 0;
         int T = tokenIds.Length, H = _hidden;
         int pos0 = st.Length;
         _pool?.SetDispatchMode(T == 1 ? DispatchMode.SpinWait : DispatchMode.EventBased);
@@ -446,7 +466,7 @@ public sealed unsafe class Inkling2TransformerModel : IModel, IImageInputModel
         int start = _c.LoopStart, end = _c.LoopEnd;
         int coreStart = _c.LoopPasses > 1 ? start : _nPhys;
 
-        for (int il = 0; il < coreStart; il++) cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st);
+        for (int il = 0; il < coreStart; il++) { tap?.Capture(Mutant == Inkling2Mutant.TapEarlyPrelude ? visit + 1 : Mutant == Inkling2Mutant.TapLate ? visit - 1 : visit, cur, T); visit++; cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
 
         if (_c.LoopPasses > 1)
         {
@@ -486,11 +506,12 @@ public sealed unsafe class Inkling2TransformerModel : IModel, IImageInputModel
                             messages = DepthMix(sc, sc.Bank, bankOut, q, 4, T, sc.Msg);
                         }
                     }
+                    tap?.Capture(Mutant == Inkling2Mutant.TapBySlot ? slot : Mutant == Inkling2Mutant.TapLate ? visit - 1 : visit, cur, T); visit++;
                     cur = ForwardLayer(slot, ip, cur, sc, messages, loop, T, pos0, st);
                     Trace?.Invoke($"pass{pass}.l{ip}", cur, T, H);
                 }
             }
-            for (int il = end; il < _nPhys; il++) cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st);
+            for (int il = end; il < _nPhys; il++) { tap?.Capture(Mutant == Inkling2Mutant.TapLate ? visit - 1 : visit, cur, T); visit++; cur = ForwardLayer(il, il, cur, sc, default, null, T, pos0, st); }
         }
 
         // Output: depth mix with output_res_query, gain-ed RMS norm, LM head (unpadded rows only), final logit softcap.
@@ -499,6 +520,7 @@ public sealed unsafe class Inkling2TransformerModel : IModel, IImageInputModel
         for (int t = 0; t < T; t++)
             Inkling2Ops.RmsNorm(mixed.Slice(t * H, H), _outputNorm.Span, _eps, mixed.Slice(t * H, H));
         Trace?.Invoke("result_norm", mixed, T, H);
+        tap?.Capture(visit++, Mutant == Inkling2Mutant.TapPreNorm ? cur : mixed, T);   // visit 48: the final normed output of every row
 
         int rows = lastOnly ? 1 : T;
         int firstRow = T - rows;
@@ -893,6 +915,7 @@ public sealed unsafe class Inkling2TransformerModel : IModel, IImageInputModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _dspark?.Dispose();
         DotLLM.Cpu.Kernels.CpuKernelScratch.Trim(null);
         if (_ownsPool) _pool?.Dispose();
         _defaultState.Dispose();

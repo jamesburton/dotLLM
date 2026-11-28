@@ -417,4 +417,48 @@ public sealed unsafe class Inkling2VulkanKernelTests : IDisposable
         Dispatch(K("inkling2_softcap", 1, 2), [1000u, F(30f)], 4, 1, 1, b);
         Check("softcap", want, Down(b, 1000), 1e-5);
     }
+
+    /// <summary>
+    /// Image-row injection (#2062): selected tokens of a pre-filled activation buffer are overwritten with the F16 rows (rounded once to the activation type),
+    /// unselected tokens are untouched. Discriminates the compact-row addressing (sel -> row index, not the token index), the F16 unpacking order (low half first)
+    /// and the sentinel.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void EmbedRows_OverwritesSelectedTokens(bool f32act)
+    {
+        int T = 5, H = 300, nRows = 2;   // H even; rows 2 -> tokens 3 and 1 (row order differs from token order)
+        var rows = new Half[nRows * H];
+        for (int i = 0; i < rows.Length; i++) rows[i] = (Half)(float)(_rnd.NextDouble() * 20 - 10);
+        uint none = 0xFFFFFFFFu;
+        uint[] sel = [none, 1u, none, 0u, none];
+        var prefill = Rand(T * H, 3f);
+        var wantF = new float[T * H];
+        for (int t = 0; t < T; t++)
+            for (int k = 0; k < H; k++)
+                wantF[t * H + k] = sel[t] == none ? prefill[t * H + k] : (float)rows[(int)sel[t] * H + k];
+        var rowBytes = MemoryMarshal.AsBytes(rows.AsSpan()).ToArray();
+        string name = f32act ? "inkling2_embed_rows_f32act" : "inkling2_embed_rows";
+        if (f32act)
+        {
+            var y = Up(prefill);
+            Dispatch(K(name, 3, 1), [(uint)H], (uint)T, 1, 1, UpBytes(rowBytes), UpU(sel), y);
+            Check("embed_rows f32", wantF, Down(y, T * H), 1e-7);
+        }
+        else
+        {
+            static ushort Bf(float f) { uint b = BitConverter.SingleToUInt32Bits(f); b += 0x7fffu + ((b >> 16) & 1u); return (ushort)(b >> 16); }
+            var init = prefill.Select(Bf).ToArray();
+            var y = UpBytes(MemoryMarshal.AsBytes(init.AsSpan()).ToArray());
+            Dispatch(K(name, 3, 1), [(uint)H], (uint)T, 1, 1, UpBytes(rowBytes), UpU(sel), y);
+            var raw = new float[(T * H + 1) / 2];
+            Dev.Download(y, raw);
+            var got = MemoryMarshal.Cast<float, ushort>(raw.AsSpan());
+            int bad = 0;
+            for (int i = 0; i < T * H; i++) if (got[i] != Bf(wantF[i])) bad++;
+            _output.WriteLine($"embed_rows bf16: {bad} of {T * H} elements differ from the RNE-rounded reference");
+            Assert.Equal(0, bad);
+        }
+    }
 }

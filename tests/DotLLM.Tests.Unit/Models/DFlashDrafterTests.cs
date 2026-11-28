@@ -498,6 +498,43 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
         finally { DFlashDrafter.DraftVocabLimitOverride = null; }
     }
 
+    /// <summary>
+    /// A K above the drafter's width (here <c>--draft-tokens 3</c> against a drafter built for 2 drafts per round) is capped at <see cref="IModel.MtpMaxDraftTokens"/>
+    /// and stays token-identical; with the cap removed (mutant) the round has no draft past the block and throws (#2039 review).
+    /// </summary>
+    [Fact]
+    public void KAboveTheDrafterWidth_IsCapped_AndWithoutTheCapFails()
+    {
+        string trunk = SyntheticQwen35HybridDenseMtpGguf.Write(Path.Combine(_dir, "trunk.gguf"), withMtp: false, contextLength: 96);
+        int[] prompt = [1, 5, 3, 7, 2, 9];
+        const int NewTokens = 24;
+        List<int> greedy;
+        using (var g = GgufFile.Open(trunk))
+        {
+            var cfg = GgufModelConfigExtractor.Extract(g.Metadata);
+            var (plain, kv) = Cpu(g, cfg);
+            using (plain as IDisposable) using (kv)
+            {
+                greedy = [.. prompt];
+                using (var l = plain.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, kv)) greedy.Add(ArgMaxLast(l, cfg.VocabSize));
+                while (greedy.Count < prompt.Length + NewTokens + Block)
+                    using (var l = plain.Forward([greedy[^1]], [greedy.Count - 1], -1, kv)) greedy.Add(ArgMaxLast(l, cfg.VocabSize));
+            }
+        }
+        var (bytes, _) = BuildDrafter(0xBEEFu, dflash2: true);
+        string drafterPath = Path.Combine(_dir, "drafter-cap.gguf");
+        File.WriteAllBytes(drafterPath, bytes);
+        DFlashDrafter.DraftTokensOverride = 2;
+        try
+        {
+            var perRound = RunDFlash(trunk, drafterPath, Cpu, prompt, NewTokens, snapshots: false, greedy, width: 2, numCandidates: 3);
+            Assert.All(perRound, n => Assert.InRange(n, 1, 3));   // at most 2 drafts + the correction/bonus
+            Assert.Throws<InvalidOperationException>(() =>
+                RunDFlash(trunk, drafterPath, Cpu, prompt, NewTokens, snapshots: false, greedy, width: 2, numCandidates: 3, applyCap: false));
+        }
+        finally { DFlashDrafter.DraftTokensOverride = null; }
+    }
+
     /// <summary>The gate on any backend: the greedy reference is the same backend's plain decode.</summary>
     internal static void AssertTokenIdentical(string dir, BackendFactory backend, bool snapshots, ITestOutputHelper output)
     {
@@ -537,7 +574,7 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
     }
 
     private static List<int> RunDFlash(string trunk, string drafterPath, BackendFactory backend, int[] prompt, int newTokens,
-        bool snapshots, List<int> greedy)
+        bool snapshots, List<int> greedy, int width = Block - 1, int numCandidates = Block - 1, bool applyCap = true)
     {
         using var gguf = GgufFile.Open(trunk);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -547,7 +584,8 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
         Assert.False(model.SupportsMtp);
         ((IDFlashDraftAttachable)model).AttachDFlashDrafter(drafterPath);
         Assert.True(model.SupportsMtp && model.SupportsMtpArgMax);
-        Assert.Equal(Block - 1, model.MtpPreferredDraftTokens);
+        Assert.Equal(width, model.MtpPreferredDraftTokens);
+        Assert.Equal(width, model.MtpMaxDraftTokens);
 
         using var mtp = model.CreateMtpState()!;
         Assert.IsType<DFlashMtpState>(mtp);
@@ -556,14 +594,14 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
             ids.Add(ArgMaxLast(l, config.VocabSize));
         Assert.Equal(prompt.Length, mtp.CurrentLength);
 
-        var decoder = new MtpSpeculativeDecoder(greedy: true) { UseRecurrentRowSnapshots = snapshots };
+        var decoder = new MtpSpeculativeDecoder(greedy: true) { UseRecurrentRowSnapshots = snapshots, ApplyDraftCap = applyCap };
         var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
-        var outBuf = new int[Block];
+        var outBuf = new int[Block + 1];
         var perRound = new List<int>();
         while (ids.Count < prompt.Length + newTokens)
         {
             int position = ids.Count - 1;
-            var r = decoder.DraftAndVerify(model, kvCache, mtp, pipeline, ids, null, position, config.VocabSize, Block - 1, outBuf);
+            var r = decoder.DraftAndVerify(model, kvCache, mtp, pipeline, ids, null, position, config.VocabSize, numCandidates, outBuf);
             Assert.True(r.AcceptedCount >= 1);
             for (int i = 0; i < r.AcceptedCount; i++) ids.Add(outBuf[i]);
             perRound.Add(r.AcceptedCount);

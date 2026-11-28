@@ -49,6 +49,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IDFlas
     /// <summary>Draft tokens per round (see the CPU host).</summary>
     public int MtpPreferredDraftTokens => _dflash?.DraftTokensPerRound ?? 0;
 
+    /// <inheritdoc/>
+    public int MtpMaxDraftTokens => _dflash?.DraftTokensPerRound ?? int.MaxValue;
+
     private int ForwardDFlashArgMax(DFlashMtpState state, int tokenId, int position)
     {
         _context.MakeCurrent();

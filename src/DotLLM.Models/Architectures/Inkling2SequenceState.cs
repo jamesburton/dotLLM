@@ -93,6 +93,8 @@ internal sealed class Inkling2ConvState : IDisposable
             if (_storage == Inkling2ConvStateStorage.BF16 && RoundInBatchHistory)
                 for (int i = K1 * C; i < win.Length; i++) win[i] = BitConverter.Int32BitsToSingle(ToBf16(win[i]) << 16);
 
+            if (RecordRows) RecordWindow(win, rows);
+
             int perHead = hasDyn ? C / heads : 1;
             float scale = 1f / MathF.Sqrt((hasDyn ? 2 : 1) * K + 1);
             for (int t = 0; t < tokens; t++)
@@ -117,10 +119,51 @@ internal sealed class Inkling2ConvState : IDisposable
         }
     }
 
+    private NativeBuffer<ushort>? _snapU;
+    private NativeBuffer<float>? _snapF;
+    private int _snapRows;
+
+    /// <summary>When true, every <see cref="Run"/> keeps its window (old state + the inputs) so <see cref="RestoreToRow"/> can rewind to any row of that call (speculative verify, #2039).</summary>
+    public bool RecordRows { get; set; }
+
+    /// <summary>Bytes held by the recorded window (BF16 for the BF16 state, F32 only for the F32 A/B arm).</summary>
+    public long SnapshotBytes => (_snapU?.Bytes ?? 0) + (_snapF?.Bytes ?? 0);
+
+    private void RecordWindow(ReadOnlySpan<float> win, int rows)
+    {
+        long n = (long)rows * _channels;
+        if (_storage == Inkling2ConvStateStorage.F32)
+        {
+            _snapF ??= new NativeBuffer<float>(n); _snapF.Grow(n);
+            win.Slice(0, (int)n).CopyTo(_snapF.Span);
+        }
+        else
+        {
+            _snapU ??= new NativeBuffer<ushort>(n); _snapU.Grow(n);
+            var d = _snapU.Span;
+            for (int i = 0; i < n; i++) d[i] = ToBf16(win[i]);   // window values are already BF16-exact: this is lossless
+        }
+        _snapRows = rows;
+    }
+
+    /// <summary>Sets the state to what it was after row <paramref name="row"/> (0-based) of the last recorded <see cref="Run"/>.</summary>
+    public void RestoreToRow(int row)
+    {
+        int C = _channels, K1 = _k1;
+        if (_snapRows == 0 || row < 0 || row + K1 >= _snapRows) throw new InvalidOperationException($"No recorded window for row {row} ({_snapRows} rows recorded).");
+        for (int k = 0; k < K1; k++)
+            for (int c = 0; c < C; c++)
+            {
+                int i = (row + 1 + k) * C + c;
+                if (_f32 is not null) _f32.Span[c * K1 + k] = _snapF!.Span[i];
+                else _u16!.Span[c * K1 + k] = _snapU!.Span[i];
+            }
+    }
+
     /// <summary>Scratch floats <see cref="Run"/> needs for <paramref name="tokens"/> tokens.</summary>
     public int ScratchFloats(int tokens) => (_k1 + 2 * tokens) * _channels;
 
-    public void Dispose() { _f32?.Dispose(); _u16?.Dispose(); }
+    public void Dispose() { _f32?.Dispose(); _u16?.Dispose(); _snapU?.Dispose(); _snapF?.Dispose(); }
 }
 
 /// <summary>
@@ -151,6 +194,13 @@ internal sealed class Inkling2SlotState : IDisposable
     public void EnsureCapacity(int tokens) { _k.Grow((long)tokens * _kvWidth); _v.Grow((long)tokens * _kvWidth); }
 
     public void Reset() { _k.Clear(); _v.Clear(); KConv.Reset(); VConv.Reset(); AttnPostConv.Reset(); FfnPostConv.Reset(); }
+
+    public bool RecordRows
+    {
+        set { KConv.RecordRows = value; VConv.RecordRows = value; AttnPostConv.RecordRows = value; FfnPostConv.RecordRows = value; }
+    }
+
+    public void RestoreToRow(int row) { KConv.RestoreToRow(row); VConv.RestoreToRow(row); AttnPostConv.RestoreToRow(row); FfnPostConv.RestoreToRow(row); }
 
     public void Store(int pos, ReadOnlySpan<float> k, ReadOnlySpan<float> v)
     {
@@ -196,6 +246,16 @@ public sealed class Inkling2SequenceState : IDisposable
 
     /// <summary>Bytes of the four conv states of all slots (constant in the sequence length).</summary>
     public long ConvBytes => Slots.Sum(s => s.KConv.Bytes + s.VConv.Bytes + s.AttnPostConv.Bytes + s.FfnPostConv.Bytes);
+
+    /// <summary>Records every conv window of the next forwards (see <see cref="Inkling2ConvState.RecordRows"/>); off by default.</summary>
+    internal bool RecordRows { set { foreach (var sl in Slots) sl.RecordRows = value; } }
+
+    /// <summary>Rewinds the conv states to after row <paramref name="row"/> of the last recorded forward started at position <paramref name="pos0"/>; KV beyond is stale and overwritten.</summary>
+    internal void RestoreToRow(int row, int pos0)
+    {
+        foreach (var sl in Slots) sl.RestoreToRow(row);
+        Length = pos0 + row + 1;
+    }
 
     /// <summary>Re-zeroes everything and restarts at position 0.</summary>
     public void Reset()
