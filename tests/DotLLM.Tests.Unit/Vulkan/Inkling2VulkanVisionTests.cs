@@ -161,7 +161,7 @@ public sealed class Inkling2VulkanVisionTests : IDisposable
     }
 
     /// <summary>
-    /// Exact, noise-free addressing check: the <c>embed</c> trace (BF16 activations) of every chunk, for chunk sizes 4, 5 and 7, equals the one-pass trace bit for
+    /// Exact, noise-free addressing check: the <c>embed</c> trace (activation format of the model: F16 default) of every chunk, for chunk sizes 4, 5 and 7, equals the one-pass trace bit for
     /// bit; image positions hold the encoder's F16 row rounded once to BF16 (no norm), text positions the normalised token embedding.
     /// </summary>
     [SkippableTheory]
@@ -200,11 +200,13 @@ public sealed class Inkling2VulkanVisionTests : IDisposable
         var chunked = Embeds(chunk);
         Assert.Equal(reference, chunked);
         static float Bf(float f) { uint b = BitConverter.SingleToUInt32Bits(f); b += 0x7fffu + ((b >> 16) & 1u); return BitConverter.UInt32BitsToSingle(b & 0xFFFF0000u); }
+        // image rows are rounded once to the activation type: F16 rows are stored unchanged under the F16 default (#2075), BF16 under the DOTLLM_INKLING2_ACT=bf16 arm
+        Func<float, float> Act = model.Options.BaseAct == DotLLM.Vulkan.Inkling2ActFormat.F16 ? f => (float)(Half)f : Bf;
         var row = new float[H];
         for (int i = 0; i < emb.Tokens; i++)
         {
             emb.ReadRow(i, row);
-            Assert.Equal(row.Select(Bf).ToArray(), chunked.AsSpan((o.Before.Length + i) * H, H).ToArray());
+            Assert.Equal(row.Select(Act).ToArray(), chunked.AsSpan((o.Before.Length + i) * H, H).ToArray());
         }
         Assert.NotEqual(chunked.AsSpan(0, H).ToArray(), chunked.AsSpan(o.Before.Length * H, H).ToArray());
         // The token rows outside the image are untouched by the injection: the same trace of a text-only call over the prompt prefix.

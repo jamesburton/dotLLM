@@ -1,0 +1,65 @@
+// DSpark per-head norm + RoPE + cache store (issue #2046). One 128-thread workgroup per (head, row) of x[rows][heads * 128] (BF16):
+//   NORM: per-head RMSNorm with gamma[128] (attn_q_norm / attn_k_norm / attn_k_ctx_norm)      ROPE: NeoX rotation at position posBase + row
+//   OUTF16 = 0: BF16 [rows][heads * 128] (offset outOff, in elements).
+//   OUTF16 = 1: F16 into a K/V cache, row r at slot s = (slotBase + r) mod ringCap (ringCap = 0: s = slotBase + r; the RoPE position is always posBase + r), element offset (s * heads + head) * 128.
+// NeoX pairs (i, i + 64); the angle of pair i at position p is 2*pi*fract(p * f_i) with f_i = theta^(-2i/128) / (2*pi) held as a hi/lo F32 pair
+// (ropeTab[2i], ropeTab[2i + 1], split from a double on the host) and the product's rounding error recovered with fma, so the argument is exact to ~1e-7
+// turns at any position below 2^24 (a plain F32 p * invfreq loses ~1e-3 rad at p = 1e5).
+#extension GL_GOOGLE_include_directive : require
+#include "inkling2_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint NORM = 1u;
+layout(constant_id = 1) const uint ROPE = 1u;
+layout(constant_id = 2) const uint OUTF16 = 0u;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX { ACT_T xin[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufG { float gamma[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufT { float ropeTab[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufY { uint16_t yout[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint heads;
+    uint posBase;
+    uint slotBase;
+    uint ringCap;
+    uint outOff;
+    uint xOff;
+    float eps;
+} pc;
+
+shared float vs[128];
+
+uint16_t toHalfBits(float v) { return uint16_t(packHalf2x16(vec2(v, 0.0)) & 0xFFFFu); }
+
+void main() {
+    uint d = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x, r = gl_WorkGroupID.y;
+    float x = actToF(xin[pc.xOff + (r * pc.heads + head) * 128u + d]);
+    if (NORM == 1u) {
+        float ss = wgSum(x * x);
+        x = x / sqrt(ss / 128.0 + pc.eps) * gamma[d];
+    }
+    uint pos = pc.posBase + r;
+    if (ROPE == 1u) {
+        vs[d] = x;
+        barrier();
+        uint i = d & 63u;
+        float fh = ropeTab[2u * i], fl = ropeTab[2u * i + 1u];
+        precise float p = float(pos) * fh;
+        precise float e = fma(float(pos), fh, -p);
+        float turns = fract(p) + fract(e + float(pos) * fl);
+        float ang = 6.283185307179586 * fract(turns);
+        float c = cos(ang), s = sin(ang);
+        float a = vs[i], b = vs[i + 64u];
+        x = d < 64u ? a * c - b * s : b * c + a * s;
+    }
+    if (OUTF16 == 1u) {
+        uint sp = pc.slotBase + r;
+        uint slot = pc.ringCap == 0u ? sp : sp % pc.ringCap;
+        yout[(slot * pc.heads + head) * 128u + d] = toHalfBits(x);
+    } else {
+        yout[pc.outOff + (r * pc.heads + head) * 128u + d] = fToAct(x);
+    }
+}

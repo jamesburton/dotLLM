@@ -58,6 +58,37 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
     private VulkanDevice.Buffer _pix = null!, _rope = null!, _x = null!, _xn = null!, _q = null!, _k = null!, _v = null!, _att = null!, _hid = null!, _out = null!;
     private long _pixCap, _npos, _outCap;
 
+    /// <summary>
+    /// Storage format of the tower's activations (the residual stream, norm outputs, Q/K/V, attention output, the up-projection). Default <see cref="Inkling2ActFormat.F16"/> since #2075 (user ruling
+    /// 2026-11-28, after the activation-precision study, docs/INKLING2.md 12c); env <c>DOTLLM_VISION_ACT=bf16|f16|f32</c> (BF16 = the previous default, F32 = measurement arm). Accumulation stays F32 in every
+    /// arm. Set before encoding; changing it drops the scratch. A non-finite F16 result (overflow, never seen: the residual stream peaks at 49 against 65,504) re-encodes that image in BF16, see <see cref="Bf16Fallbacks"/>.
+    /// </summary>
+    public Inkling2ActFormat ActFormat
+    {
+        get => _act;
+        set { if (value == _act) return; lock (_lock) { ReleaseScratch(); _act = value; } }
+    }
+
+    /// <summary>MEASUREMENT arm (env <c>DOTLLM_VISION_ROPE_F32=1</c>): the RoPE cos/sin table in F32 instead of F16 (isolates the table's contribution to the error). Set before encoding.</summary>
+    public bool RopeF32
+    {
+        get => _ropeF32;
+        set { if (value == _ropeF32) return; lock (_lock) { ReleaseScratch(); _ropeF32 = value; foreach (var t in _ropeTables.Values) NativeMemory.AlignedFree((void*)t); _ropeTables.Clear(); _ropeOrder.Clear(); } }
+    }
+
+    private Inkling2ActFormat _act = Inkling2ActFormat.F16;
+
+    /// <summary>Test seam: runs on the downloaded embeddings just before the finite check (poisons them to prove the guard's BF16 fallback).</summary>
+    internal Action<Span<Half>>? AfterDownload { get; set; }
+
+    /// <summary>Test seam: runs on the BF16 fallback's downloaded embeddings (poisons them to prove the second check throws).</summary>
+    internal Action<Span<Half>>? AfterFallbackDownload { get; set; }
+
+    /// <summary>Number of encodes whose F16 result was non-finite and was recomputed in BF16 (the runtime guard; 0 in every measured run).</summary>
+    public int Bf16Fallbacks { get; private set; }
+    private bool _ropeF32;
+    private int ActBytes => _act == Inkling2ActFormat.F32 ? 4 : 2;
+
     /// <summary>Scratch kept resident after a call (default 128 MB); a larger working set (a 4,096-token image holds about 500 MB) is released when the call ends.</summary>
     public long ScratchKeepBytes { get; set; } = 128L << 20;
 
@@ -109,6 +140,12 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
     {
         _device = device; _gguf = gguf; _spvDir = spvDir; _ownsGguf = ownsGguf; _overLimit = overLimit; _embedPrecision = embedPrecision;
         _spvOverride = Environment.GetEnvironmentVariable("DOTLLM_INKLING2_SPV_OVERRIDE");
+        // DOTLLM_VISION_ACT=f16|bf16|f32: ViT activation storage format (default f16 since #2075; bf16 = the previous default; f32 = measurement arm).
+        string? actEnv = Environment.GetEnvironmentVariable("DOTLLM_VISION_ACT");
+        if (!string.IsNullOrEmpty(actEnv))
+            _act = actEnv.ToLowerInvariant() switch { "bf16" => Inkling2ActFormat.Bf16, "f16" => Inkling2ActFormat.F16, "f32" => Inkling2ActFormat.F32, _ => throw new ArgumentException($"DOTLLM_VISION_ACT='{actEnv}': expected bf16, f16 or f32.") };
+        // DOTLLM_VISION_ROPE_F32=1: measurement arm, RoPE cos/sin table in F32 instead of F16 (the F16 table is not part of the BF16 gap, docs/INKLING2.md 12c).
+        _ropeF32 = Environment.GetEnvironmentVariable("DOTLLM_VISION_ROPE_F32") == "1";
         var md = gguf.Metadata;
         _nLayer = (int)md.GetUInt32("clip.vision.block_count");
         int hidden = (int)md.GetUInt32("clip.vision.embedding_length"), heads = (int)md.GetUInt32("clip.vision.attention.head_count"), ff = (int)md.GetUInt32("clip.vision.feed_forward_length");
@@ -249,11 +286,12 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
                 NativeMemory.AlignedFree((void*)_ropeTables[old]);
                 _ropeTables.Remove(old);
             }
-            tab = (nint)NativeMemory.AlignedAlloc((nuint)((long)npos * 128), 64);
-            FillRopeTable(new Span<ushort>((void*)tab, npos * 64), gw, npos);
+            tab = (nint)NativeMemory.AlignedAlloc((nuint)((long)npos * (_ropeF32 ? 256 : 128)), 64);
+            if (_ropeF32) FillRopeTable(new Span<float>((void*)tab, npos * 64), gw, npos);
+            else FillRopeTable(new Span<ushort>((void*)tab, npos * 64), gw, npos);
             _ropeTables[(gw, npos)] = tab; _ropeOrder.Enqueue((gw, npos));
         }
-        _device.Upload(new ReadOnlySpan<byte>((void*)tab, npos * 128), _rope);
+        _device.Upload(new ReadOnlySpan<byte>((void*)tab, npos * (_ropeF32 ? 256 : 128)), _rope);
         _ropeOnDevice = (gw, npos);
     }
 
@@ -266,10 +304,10 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
     {
         if (_npos >= npos && _pixCap >= pixBytes && _outCap >= outBytes && _x is not null) return;
         ReleaseScratch();
-        long rowsB = npos * E * 2;
+        long rowsB = npos * E * ActBytes;
         _x = Scratch(rowsB); _xn = Scratch(rowsB); _q = Scratch(rowsB); _k = Scratch(rowsB); _v = Scratch(rowsB); _att = Scratch(rowsB);
-        _hid = Scratch(npos * Ff * 2);          // up-projection output; reused as the projector's mm.1 output (n/4 rows x 4096) at the end
-        _rope = Scratch(npos * 64 * 2);
+        _hid = Scratch(npos * Ff * ActBytes);          // up-projection output; reused as the projector's mm.1 output (n/4 rows x 4096) at the end
+        _rope = Scratch(npos * 64 * (_ropeF32 ? 4 : 2));
         _pix = Scratch(pixBytes);
         _out = Scratch(outBytes);
         _npos = npos; _pixCap = pixBytes; _outCap = outBytes;
@@ -280,6 +318,9 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
 
     private OlalaKernel Kernel(string name, int buffers, int pushWords, params uint[] spec)
     {
+        // activation-format twins (gen_vit_wrappers.py): vit_X[_f16act|_f32act]; the GEMM also has the F32-RoPE-table measurement variant (_rope32)
+        string suffix = _act == Inkling2ActFormat.F16 ? "_f16act" : _act == Inkling2ActFormat.F32 ? "_f32act" : "";
+        name += suffix + (_ropeF32 && name == "vit_gemm_q8" ? "_rope32" : "");
         string key = name + "|" + string.Join(",", spec);
         if (!_kernels.TryGetValue(key, out var k))
         {
@@ -328,11 +369,13 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
     private float[] DownloadBf16(VulkanDevice.Buffer b, int rows, int cols)
     {
         long count = (long)rows * cols;
+        var res = new float[count];
+        if (_act == Inkling2ActFormat.F32) { _device.Download(b, res); return res; }
         var raw = new float[(count + 1) / 2];
         _device.Download(b, raw);
         var u = MemoryMarshal.Cast<float, ushort>(raw.AsSpan());
-        var res = new float[count];
-        for (long i = 0; i < count; i++) res[i] = BitConverter.UInt32BitsToSingle((uint)u[(int)i] << 16);
+        if (_act == Inkling2ActFormat.F16) for (long i = 0; i < count; i++) res[i] = (float)BitConverter.UInt16BitsToHalf(u[(int)i]);
+        else for (long i = 0; i < count; i++) res[i] = BitConverter.UInt32BitsToSingle((uint)u[(int)i] << 16);
         return res;
     }
 
@@ -390,6 +433,25 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
                     RecordTower(W, gw, gh, n, npos, nm, mw, ct);
                     _submit.SubmitAndWait();
                     _device.Download(_out, MemoryMarshal.Cast<Half, float>(result.Rows));
+                    AfterDownload?.Invoke(result.Rows);
+                    if (_act == Inkling2ActFormat.F16 && !AllFinite(result.Rows))
+                    {
+                        // Runtime guard (#2075): the tower is stateless, so a non-finite F16 result is recomputed in BF16 (full F32 exponent range) instead of returning NaN embeddings.
+                        Bf16Fallbacks++;
+                        _act = Inkling2ActFormat.Bf16;
+                        try
+                        {
+                            Begin();
+                            RecordTower(W, gw, gh, n, npos, nm, mw, ct);
+                            _submit.SubmitAndWait();
+                            _device.Download(_out, MemoryMarshal.Cast<Half, float>(result.Rows));
+                        }
+                        finally { _act = Inkling2ActFormat.F16; }
+                        AfterFallbackDownload?.Invoke(result.Rows);
+                        // The BF16 result has the full F32 exponent range: if it is non-finite too the input or the weights are broken, and NaN embeddings must not reach the text model.
+                        if (!AllFinite(result.Rows))
+                            throw new InvalidOperationException("inkling2 Vulkan vision tower: the embeddings are non-finite in F16 and again in the BF16 fallback; the image or the mmproj is not usable.");
+                    }
                     return result;
                 }
                 catch { result.Dispose(); throw; }
@@ -400,6 +462,13 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
                 if (ScratchBytes() > ScratchKeepBytes) ReleaseScratch();
             }
         }
+    }
+
+    /// <summary>True when every element is finite (the guard's check: one pass over the <c>[n/4][2304]</c> F16 output).</summary>
+    internal static bool AllFinite(ReadOnlySpan<Half> rows)
+    {
+        foreach (var h in rows) if (!Half.IsFinite(h)) return false;
+        return true;
     }
 
     private void RecordTower(int W, int gw, int gh, int n, int npos, int nm, int mw, CancellationToken ct)
@@ -425,6 +494,7 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
             Gemm(b.Q, xn, _q, npos, 3, b.QB);
             Gemm(b.K, xn, _k, npos, 3, b.KB);
             Gemm(b.V, xn, _v, npos, 0, b.VB);
+            if (Trace is not null) { TraceBuf($"q-{il}", _q, npos, E); TraceBuf($"k-{il}", _k, npos, E); TraceBuf($"v-{il}", _v, npos, E); }
             // attention in query chunks so a long sequence is several short submits (GPU watchdog)
             int qChunk = bigSeq ? 2048 : ((npos + 15) / 16) * 16;
             var attn = Kernel("vit_attn", 4, 2);
@@ -434,9 +504,11 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
                 Run(attn, [(uint)npos, (uint)q0], (uint)blocks, Heads, 1, _q, _k, _v, _att);
                 if (bigSeq) Flush();
             }
+            if (Trace is not null) TraceBuf($"att-{il}", _att, npos, E);
             Gemm(b.O, _att, x, npos, 2, b.OB, b.Ls1);
             LayerNorm(x, b.Ln2W, b.Ln2B, xn, npos);
             Gemm(b.Up, xn, _hid, npos, 1, b.UpB);
+            if (Trace is not null) TraceBuf($"hid-{il}", _hid, npos, Ff);
             Gemm(b.Down, _hid, x, npos, 2, b.DownB, b.Ls2);
             if (Trace is not null) TraceBuf($"layer_out-{il}", x, npos, E);
             else if (bigSeq) Flush();
@@ -456,8 +528,13 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
         return tab;
     }
 
-    private static void FillRopeTable(Span<ushort> tab, int gw, int npos)
+    private static void FillRopeTable(Span<ushort> tab, int gw, int npos) => FillRopeTable(tab, default, gw, npos);
+
+    private static void FillRopeTable(Span<float> tab, int gw, int npos) => FillRopeTable(default, tab, gw, npos);
+
+    private static void FillRopeTable(Span<ushort> tab, Span<float> tabF, int gw, int npos)
     {
+        bool f32 = !tabF.IsEmpty;
         float thetaScale = MathF.Pow(10000.0f, -2.0f / 32);
         for (int t = 0; t < npos; t++)
         {
@@ -466,8 +543,13 @@ public sealed unsafe class VulkanInkling2VisionEncoder : IImageEncoder
             float tw = px, th = py;
             for (int i = 0; i < 16; i++)
             {
-                tab[t * 64 + i] = BitConverter.HalfToUInt16Bits((Half)MathF.Cos(tw)); tab[t * 64 + 16 + i] = BitConverter.HalfToUInt16Bits((Half)MathF.Sin(tw));
-                tab[t * 64 + 32 + i] = BitConverter.HalfToUInt16Bits((Half)MathF.Cos(th)); tab[t * 64 + 48 + i] = BitConverter.HalfToUInt16Bits((Half)MathF.Sin(th));
+                float c0 = MathF.Cos(tw), s0 = MathF.Sin(tw), c1 = MathF.Cos(th), s1 = MathF.Sin(th);
+                if (f32) { tabF[t * 64 + i] = c0; tabF[t * 64 + 16 + i] = s0; tabF[t * 64 + 32 + i] = c1; tabF[t * 64 + 48 + i] = s1; }
+                else
+                {
+                    tab[t * 64 + i] = BitConverter.HalfToUInt16Bits((Half)c0); tab[t * 64 + 16 + i] = BitConverter.HalfToUInt16Bits((Half)s0);
+                    tab[t * 64 + 32 + i] = BitConverter.HalfToUInt16Bits((Half)c1); tab[t * 64 + 48 + i] = BitConverter.HalfToUInt16Bits((Half)s1);
+                }
                 tw *= thetaScale; th *= thetaScale;
             }
         }
