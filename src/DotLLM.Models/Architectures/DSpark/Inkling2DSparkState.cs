@@ -221,6 +221,7 @@ internal sealed unsafe class Inkling2DSparkState : IMtpState, IInkling2Tap
     internal int NextDraft(IInkling2DSparkTarget target, int tokenId, int position, int draftTokens)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (Unusable) return tokenId;   // no admitted context: the anchor repeated for every position (the verify rejects it; correctness is unaffected)
         if (position == _length)
         {
             _draftCount = Math.Clamp(draftTokens, 1, _draft.Length);

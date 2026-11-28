@@ -280,7 +280,7 @@ public sealed class Inkling2VulkanDSparkTests : IClassFixture<VkInklingFixture>
             {
                 double diff = MaxDiff(Pick(sm, 0, per), Pick(sm, j + 1, per));
                 _out.WriteLine($"{mutants[j]}: max |draft logit diff| {diff:E2} " + (diff > 1e-5 ? "(killed)" : "(SURVIVED)"));
-                if (mutants[j] != DSparkMutant.AllLayersLocal) Assert.True(diff > 1e-5, $"{mutants[j]} not observable");
+                Assert.True(diff > 1e-5, $"{mutants[j]} not observable (global layer 1 must be global since the pattern-key fix, #2046)");
             }
         }
     }

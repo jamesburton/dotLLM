@@ -646,6 +646,8 @@ internal sealed class VulkanInkling2DSparkState : IMtpState
     internal int NextDraft(int tokenId, int position)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        // An unusable state stopped injecting, so its length lags the target's: it must answer every position with the anchor (rejected by the verify), never throw.
+        if (Unusable) return tokenId;
         if (position == _length)
         {
             int n = Math.Clamp(_spec.DraftTokensPerRound, 1, _draft.Length);
