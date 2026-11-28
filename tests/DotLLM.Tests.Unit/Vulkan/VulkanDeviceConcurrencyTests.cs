@@ -75,27 +75,84 @@ public sealed class VulkanDeviceConcurrencyTests
     {
         using var dev = Device();
         var tracker = new VulkanHazardTracker();
-        var armed = new ManualResetEventSlim(); var otherDone = new ManualResetEventSlim();
+        using var armed = new ManualResetEventSlim(); using var otherDone = new ManualResetEventSlim();
+        var errors = new List<Exception>();
         object? seenByOther = "unset"; bool survived = false;
         var forward = new Thread(() =>
         {
-            dev.ActiveHazards = tracker;
-            armed.Set();
-            otherDone.Wait();
-            survived = ReferenceEquals(dev.ActiveHazards, tracker);
+            try
+            {
+                dev.ActiveHazards = tracker;
+                armed.Set();
+                if (!otherDone.Wait(TimeSpan.FromSeconds(60))) throw new TimeoutException("the encode thread never finished");
+                survived = ReferenceEquals(dev.ActiveHazards, tracker);
+            }
+            catch (Exception e) { lock (errors) errors.Add(e); }
+            finally { armed.Set(); }
         });
         var encode = new Thread(() =>
         {
-            armed.Wait();
-            using var ctx = dev.CreateSubmitContext();
-            ctx.Begin();                           // disarms "its own" (none): must not touch the forward thread's tracker
-            seenByOther = dev.ActiveHazards;
-            ctx.SubmitAndWait();
-            otherDone.Set();
+            try
+            {
+                if (!armed.Wait(TimeSpan.FromSeconds(60))) throw new TimeoutException("the forward thread never armed");
+                using var ctx = dev.CreateSubmitContext();
+                ctx.Begin();                           // disarms "its own" (none): must not touch the forward thread's tracker
+                seenByOther = dev.ActiveHazards;
+                ctx.SubmitAndWait();
+            }
+            catch (Exception e) { lock (errors) errors.Add(e); }
+            finally { otherDone.Set(); }
         });
-        forward.Start(); encode.Start(); forward.Join(); encode.Join();
+        forward.IsBackground = true; encode.IsBackground = true;
+        forward.Start(); encode.Start();
+        Assert.True(forward.Join(TimeSpan.FromSeconds(90)) && encode.Join(TimeSpan.FromSeconds(90)), "a hazard-tracker thread did not finish");
+        Assert.Empty(errors);
         Assert.Null(seenByOther);
         Assert.True(survived, "another thread's Begin / SubmitAndWait disarmed this thread's hazard tracker");
+    }
+
+    /// <summary>
+    /// Two threads arm their own trackers on one device (two models sharing it). Each must still see its own tracker afterwards: a device-wide last-writer-wins slot returned null to the
+    /// first armer once the second armed, silently dropping its barriers mid-recording.
+    /// </summary>
+    [SkippableFact]
+    public void HazardTracker_TwoThreadsArming_EachKeepsItsOwnTracker()
+    {
+        using var dev = Device();
+        var ta = new VulkanHazardTracker(); var tb = new VulkanHazardTracker();
+        using var aArmed = new ManualResetEventSlim(); using var bArmed = new ManualResetEventSlim();
+        var errors = new List<Exception>();
+        object? seenByA = "unset", seenByB = "unset";
+        var a = new Thread(() =>
+        {
+            try
+            {
+                dev.ActiveHazards = ta;
+                aArmed.Set();
+                if (!bArmed.Wait(TimeSpan.FromSeconds(60))) throw new TimeoutException("thread B never armed");
+                seenByA = dev.ActiveHazards;
+            }
+            catch (Exception e) { lock (errors) errors.Add(e); }
+            finally { aArmed.Set(); }
+        });
+        var b = new Thread(() =>
+        {
+            try
+            {
+                if (!aArmed.Wait(TimeSpan.FromSeconds(60))) throw new TimeoutException("thread A never armed");
+                dev.ActiveHazards = tb;
+                seenByB = dev.ActiveHazards;
+            }
+            catch (Exception e) { lock (errors) errors.Add(e); }
+            finally { bArmed.Set(); }
+        });
+        a.IsBackground = true; b.IsBackground = true;
+        a.Start(); b.Start();
+        Assert.True(a.Join(TimeSpan.FromSeconds(90)) && b.Join(TimeSpan.FromSeconds(90)), "a hazard-tracker thread did not finish");
+        Assert.Empty(errors);
+        Assert.Same(ta, seenByA);
+        Assert.Same(tb, seenByB);
+        Assert.Null(dev.ActiveHazards);   // and the test thread, which never armed, sees neither
     }
 
     /// <summary>The arming thread's own Begin / submit still disarms (an aborted recording must not leak tracking into the next one).</summary>
