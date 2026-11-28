@@ -630,8 +630,7 @@ The residual-stream maxima per layer visit are in the raw log. The largest value
 **Regression runs with F16 as the default, on the final head** (dev merged in, #2065's conv history rounding included; Strix, functional runs):
 - Op-level kernel tests 37/37 (`Conv_CarriedState_MatchesReference` passes now); ViT encoder suite 15 passed, 3 skipped; **vision suite 28/28, including every `ChunkedPrefill_*` chunk-invariance case (KL vs the 32-token run exactly 0)**, without any override shader;
   Vulkan row invariance + DSpark threshold tests 18/18; Vulkan DSpark model tests 12/12; Vulkan KL gates 9/9 (below).
-- Vulkan KL gates (mean KL x1e-3, 32-token calls, vs llama.cpp `-fa off`): passage F16 KV 5.338 (the 254-row passage set swings by +-1.5e-3 between runs with identical numerics apart from a few tail rows: the same gate read 3.469 before the merge, q8_0 KV 4.944 then and 3.450 now),
-  wikitext c1280 F16 KV 1.789 (position < 1024 1.519, >= 1024 2.195), q8_0 1.924, F32-act arm 1.777; greedy teacher-forced 6/384 with 0/345 at oracle margin >= 0.3 for both KV formats. The apples-to-apples BF16 / F16 / F32 table on this head is under "Final-head A/B" below.
+- Vulkan KL gates (mean KL x1e-3, 32-token calls, vs llama.cpp `-fa off`): passage F16 KV 5.338, q8_0 KV 3.450 (the earlier pre-merge read was 3.469 / 4.944), wikitext c1280 F16 KV 1.789 (position < 1024 1.519, >= 1024 2.195), q8_0 1.924, F32-act arm 1.777; greedy teacher-forced 6/384 with 0/345 at oracle margin >= 0.3 for both KV formats. The passage movement is NOT noise: see "Same-head A/B" below.
 - Rounding test 2/2 and 5/5 mutants dead, guard tests 3/3 (the two sweeps are opt-in), unchanged.
 - Known unrelated failure: `Probe533VulkanKvBisectTests` (a Llama-3.2-1B probe).
 
@@ -645,7 +644,24 @@ tap copy, the context injection and the draft block throw `InvalidOperationExcep
   `Drafts_MatchLlamaCppDsparkOracle` falls from 96.0% to **0.0%** top-1 agreement. (Greedy identity alone would not have caught it: the target verifies every draft, so a garbage drafter only collapses the acceptance.)
 - *F16-activation drafter results* (`Inkling2VulkanDSparkTests`, F16 default): draft top-1 agreement with llama.cpp **570/594 = 96.0%** (594 drafts, whole rounds identical 185/198), F16-logits drafts equal F32-logits drafts on 594/594 tokens; greedy identity 8 prompts x 40 tokens **8/8 identical**, K = 3: 168 rounds,
   **1.89 tokens/round, acceptance 30.6%** (per prompt 1.18 to 3.08; the CPU reference measured 1.90 / 30.9%).
-PHASE_C
+**Same-head A/B on the final head (BF16 / F16 / F32 activations; `Llm_Arms_Kl`, dev with #2065 merged, softcap fix included).** Oracle KL x1e-3 (llama.cpp); NF13 / "vs-F32" = KL against this engine's F32 arm (no oracle noise):
+
+| arm | image oracle KL 80 / 190x110 / 640 | image NF13 mean (80 / 190x110 / 640) | passage (254 rows): oracle, vs-F32 | wikitext c1280 (639 rows): oracle, vs-F32 |
+|---|---|---|---|---|
+| F32 | 2.01 / 4.70 / 3.21 | 0 | 3.29, 0 | 1.78, 0 |
+| BF16 | 4.85 / 6.62 / 5.35 | 5.03 (2.09 / 7.46 / 5.53) | 4.12, 2.26 | 1.80, 1.23 |
+| **F16 (default)** | 2.04 / 4.31 / 4.32 | **0.90** (0.11 / 1.21 / 1.39) | 5.34, 4.59 | 1.79, 0.83 |
+
+F16 is clearly better than BF16 on image prompts (NF13 5.6x lower) and on the 639-row wikitext window (vs-F32 0.83 against 1.23). **On the 254-row passage it is worse than BF16** (vs-F32 4.59 against 2.26; oracle 5.34 against 4.12), a regression from the pre-merge head
+(F16 3.47, BF16 3.61). Isolation: the same F16 run with the conv in-batch history left unrounded (the pre-#2065 shader, override) gives passage 3.47 / vs-F32 1.90 and wikitext 1.73 / 0.81, so the whole passage rise is the BF16 rounding of the conv history that #2065 added (the conv state is BF16 by ruling; under BF16 activations the
+rounding is a no-op, under F16 it is a real F16 -> BF16 step, and under F32 it moves that arm's own KL by +0.2e-3). It is a few tail rows (max KL 0.107 vs 0.102 for BF16; mean over 127 scored rows), absent on the 639-row window (+0.06e-3) and on the images. It does not fail any gate (< 8e-3, top-1 251/254, greedy 0 confident mismatches).
+Row/chunk invariance requires the rounding, so it cannot simply be dropped; an F16 conv state is ruled out. Open decision for the owner, with the data above.
+
+**Softcap and the guard (review finding, fixed).** `inkling2_softcap` ran before the finite check and mapped +-inf (and NaN on AMD) to +-30, so the text guard could not see a real overflow, and my guard test poisoned the logits after the softcap. The softcap now passes non-finite values through (`Softcap_PassesNonFiniteThrough_ForTheF16Guard`; the old shader fails it).
+A real-overflow arm drives the model itself (`Guard_RealF16Overflow_ThrowsOnTheFirstForward_AndBf16DoesNot`: the token-embedding gain x1e6 through a test seam, F16 throws the BF16-switch error on the first forward, BF16 does not); the override mutant that stores `x*1e6` in the F16 embed kernel throws the same error. **Gate 2 restated:** the earlier "0 non-finite" sweep column was blind (the softcap hid overflow); the evidence
+that holds is max |activation| (473, 138x margin) and the sweeps re-run on the fixed head: 16,640 tokens: 0 non-finite, max |logit| 29.96; 5 images (434 tokens): 0 non-finite, max |logit| 29.69; the guard now fires on a real overflow, so these zeros mean something. Guard cost 59-89 us per logit row: about 1.2 s over a 16K all-logits prefill (16,640 rows), negligible per decode step; no opt-out.
+The ViT recomputes in BF16 and throws if the BF16 result is non-finite too; the drafter format guard runs before the command buffer opens.
+DRAFTER_MS
 
 ## 13. DSpark drafter (issue #2039)
 

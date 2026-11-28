@@ -140,10 +140,10 @@ public sealed class Inkling2ActivationPrecisionStudyTests : IDisposable
 
     private static Inkling2VulkanOptions Arm(string arm) => arm switch
     {
-        "bf16" => new Inkling2VulkanOptions(),
+        "bf16" => new Inkling2VulkanOptions(ActivationF16: false),   // BF16 is no longer the default (#2075)
         "f16" => new Inkling2VulkanOptions(ActivationF16: true),
         "f32" => new Inkling2VulkanOptions(ActivationF32: true),
-        "bf16+f32img" => new Inkling2VulkanOptions(F32ImageChunks: true),
+        "bf16+f32img" => new Inkling2VulkanOptions(ActivationF16: false, F32ImageChunks: true),
         "f16+f32img" => new Inkling2VulkanOptions(ActivationF16: true, F32ImageChunks: true),
         _ => throw new ArgumentException(arm),
     };
