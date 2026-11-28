@@ -313,12 +313,13 @@ public sealed unsafe partial class CudaTransformerModel : IModel, IContextLimita
 
     /// <summary>
     /// Raises <see cref="MaxAllRowLogitsLength"/> to <paramref name="maxSeqLen"/>, capped at <see cref="MaxLogitRows"/>.
-    /// False on the Gemma forwards, which project one row.
+    /// False on the Gemma forwards, which project one row, and on MLA models: the MLA attention appends to its own K/V cache,
+    /// which speculation cannot roll back, so a rejected draft would stay in the history.
     /// </summary>
     /// <param name="maxSeqLen">Rows the caller wants back from one forward.</param>
     public bool TrySetAllRowLogitsLimit(int maxSeqLen)
     {
-        if (_isGemma4 || _isGemmaFamily) return false;
+        if (_isGemma4 || _isGemmaFamily || _weights.MlaLayers is not null) return false;
         _allRowLogitsLimit = Math.Max(_allRowLogitsLimit, Math.Min(maxSeqLen, MaxLogitRows));
         return true;
     }

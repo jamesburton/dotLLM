@@ -118,6 +118,26 @@ public sealed class CudaTransformerMlaForwardTests : IDisposable
         RunPrefillCompare(qLoraRank: 8, includeMoe: true, seed: 99, ptxDir: ptx!);
     }
 
+    /// <summary>
+    /// Issue #2030: the CUDA MLA attention appends to its own K/V cache, which speculation cannot roll back, so a rejected draft
+    /// would stay in the history. The host must therefore keep refusing multi-row verification.
+    /// </summary>
+    [SkippableFact]
+    public void MlaModel_RefusesAllRowLogits()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        var ptx = FindPtxDir();
+        Skip.If(ptx == null, "PTX files not found");
+
+        string path = Path.Combine(_scratch, "mla-rows.safetensors");
+        WriteFixture(path, qLoraRank: 8, includeMoe: false, seed: 3);
+        using var sf = SafetensorsFile.Open(path);
+        using var gpu = CudaTransformerModel.LoadFromSafetensors(sf, BuildConfig(8, false), deviceId: 0, ptxDir: ptx);
+
+        Assert.False(gpu.TrySetAllRowLogitsLimit(4));
+        Assert.Equal(1, gpu.MaxAllRowLogitsLength);
+    }
+
     private unsafe void RunPrefillCompare(int qLoraRank, bool includeMoe, int seed, string ptxDir)
     {
         string path = Path.Combine(_scratch, $"mla{qLoraRank}-moe{includeMoe}.safetensors");

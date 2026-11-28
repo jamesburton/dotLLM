@@ -97,9 +97,9 @@ Notes on issues found by code reading. Only note 1 has been reproduced (and is f
 
 1. Fixed (#2030): draft-model speculation read one logit row per drafted token from targets that return only the last
    row. It now requires `MaxAllRowLogitsLength` > 1, like prompt lookup. The dense Vulkan host, which over-read the same
-   way (it crashed), widens its row limit, and so does the dense CUDA host (up to 8 rows; not its Gemma forwards).
-   Targets that stay at one row (Mamba-3, the CUDA pipeline, the CUDA hybrid hosts, the CUDA Gemma forwards) load no
-   draft model, say so, and decode plain.
+   way (it crashed), widens its row limit, and so does the dense CUDA host (up to 8 rows; not its Gemma or MLA
+   forwards). Targets that stay at one row (Mamba-3, the CUDA pipeline, the CUDA hybrid hosts, CUDA Gemma and MLA
+   models) load no draft model, say so, and decode plain.
 2. For GGUF `qwen2moe`, the CPU quantized-expert path appears to load no shared-expert branch (#2031).
 3. Mamba-3, LFM3 and Olala have no recurrent-state checkpoint, and `SpeculativeDecoder` does not appear to guard
    against them, so a rejected draft could leave state advanced (#2032).

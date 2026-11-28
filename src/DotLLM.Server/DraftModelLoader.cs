@@ -71,7 +71,12 @@ public static class DraftModelLoader
         var spec = DeviceSpec.Parse(targetDevice);
         if (spec.IsGpu)
         {
-            if (!UsesDenseHost(draftConfig.Architecture))
+            if (spec.Kind == DeviceKind.Cuda && draftConfig.MlaConfig is not null)
+            {
+                // The draft phase rolls rejected tokens back; the CUDA MLA attention appends to its own K/V, which cannot be cut.
+                warn($"the draft model runs on the CPU: the CUDA MLA forward cannot roll back rejected drafts, so this MLA draft is not placed on {targetDevice}.");
+            }
+            else if (!UsesDenseHost(draftConfig.Architecture))
             {
                 warn($"the draft model runs on the CPU: only dense-host drafts are placed on {targetDevice}, and this one is " +
                      $"{draftConfig.Architecture}.");

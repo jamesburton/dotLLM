@@ -102,6 +102,18 @@ public sealed class DraftModelLoaderTests
         Assert.Contains("CPU", Assert.Single(warnings));
     }
 
+    [Theory]
+    [InlineData("gpu:0", "cpu")]      // the CUDA MLA forward keeps its own append-only K/V, which a rejected draft cannot be cut out of
+    [InlineData("vulkan", "vulkan")]
+    public void MlaDraft_AvoidsCudaOnly(string targetDevice, string expected)
+    {
+        var mla = Dense with { MlaConfig = new MlaConfig { QLoraRank = 0, KvLoraRank = 4, QkNopeHeadDim = 4, QkRopeHeadDim = 4, VHeadDim = 4 } };
+        var (result, loads, _) = Load(targetDevice, mla);
+
+        Assert.Equal([expected], loads);
+        Assert.Equal(expected, result!.Device);
+    }
+
     [Fact]
     public void GpuLoadFailure_FallsBackToTheCpuLoudly()
     {
