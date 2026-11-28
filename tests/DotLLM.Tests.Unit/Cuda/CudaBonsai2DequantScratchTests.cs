@@ -168,6 +168,8 @@ public sealed class CudaBonsai2DequantScratchTests
             // always take the dequant path (measured: 491,520 elements = 960 KiB), so "every
             // projection" was never literally true. What this test is really asserting is that the
             // weight-sized lm_head tile never appears; bound it well under that instead of at zero.
+            // The fixture is now Bonsai 2.5 (#2072), whose gates are F32 and run through cuBLAS LinearF32, so
+            // the dequant scratch stays at zero here and the BF16-gate dequant arm has no real-weight coverage.
             long alphaBetaCeiling = TileBytes(config.HiddenSize, 64);
             Assert.InRange(model.DequantScratchF16WeightBytes, 0L, alphaBetaCeiling);
             Assert.True(model.DequantScratchF16WeightBytes < lmHeadBytes / 100,
@@ -270,7 +272,7 @@ public sealed class CudaBonsai2DequantScratchTests
     private static string? FindCheckpoint()
     {
         return TestFixtureResolver.ResolveFile(
-            "DOTLLM_BONSAI2_MTP_GGUF", "ProCreations", "Ternary-Bonsai-2-27B-MTP", "*MTP*.gguf").Path;
+            "DOTLLM_BONSAI2_MTP_GGUF", "prism-ml", "Ternary-Bonsai-2.5-27B-GGUF", "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf").Path;
     }
 
     private static string SkipUnlessCudaWithFwht()

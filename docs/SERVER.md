@@ -422,7 +422,7 @@ disposed or different model.
   "state": "loading",
   "is_ready": false,
   "model_id": null,
-  "loading_model_id": "BoldingBuilds/Ternary-Bonsai-2-27B-Abliterated-v2-PQ2_0-MTP-GGUF/Ternary-Bonsai-2-27B-Abliterated-v2-PQ2_0-MTP.gguf",
+  "loading_model_id": "prism-ml/Ternary-Bonsai-2.5-27B-GGUF/Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf",
   "loading_since": "2026-10-16T14:12:54.921+00:00",
   "loading_elapsed_seconds": 41.3,
   "loading_request": "req#12",

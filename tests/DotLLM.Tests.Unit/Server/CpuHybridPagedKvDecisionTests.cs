@@ -6,7 +6,7 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Server;
 
 /// <summary>
-/// #760: default-flag CPU serve of a hybrid model (Bonsai-2-27B: 64 layers, 16 KV layers, 262144 ctx) died at startup because
+/// #760: default-flag CPU serve of a hybrid model (Bonsai-2.5-27B: 65 blocks, 64 trunk layers, 16 KV layers, 262144 ctx) died at startup because
 /// the generic paged pool is sized NumLayers x MaxSequenceLength. Hybrid/recurrent configs must skip it; dense ones keep it.
 /// </summary>
 public class CpuHybridPagedKvDecisionTests

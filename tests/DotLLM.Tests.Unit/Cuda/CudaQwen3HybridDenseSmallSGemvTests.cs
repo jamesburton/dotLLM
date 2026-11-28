@@ -458,6 +458,6 @@ public sealed class CudaQwen3HybridDenseSmallSGemvTests : IDisposable
     private static string? FindBonsai2Checkpoint()
     {
         return TestFixtureResolver.ResolveFile(
-            "DOTLLM_BONSAI2_MTP_GGUF", "ProCreations", "Ternary-Bonsai-2-27B-MTP", "*MTP*.gguf").Path;
+            "DOTLLM_BONSAI2_MTP_GGUF", "prism-ml", "Ternary-Bonsai-2.5-27B-GGUF", "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf").Path;
     }
 }

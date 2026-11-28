@@ -13,7 +13,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Model = "$HOME/.cache/huggingface/hub/models--prism-ml--Ternary-Bonsai-2-27B-gguf/snapshots/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-PQ2_0.gguf",
+    [string]$Model = "$HOME/.cache/huggingface/hub/models--prism-ml--Ternary-Bonsai-2.5-27B-GGUF/snapshots/28a7093cc25bc151cc2b284c5570f12ce343fdcf/Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf",
     [int]$PromptTokens = 32,
     [int]$GenTokens = 8,
     [int]$Reps = 1,
