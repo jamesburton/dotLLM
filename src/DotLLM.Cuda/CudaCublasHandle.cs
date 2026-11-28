@@ -29,7 +29,11 @@ public sealed class CudaCublasHandle : IDisposable
             // cublasCreate succeeds, but nothing owns it until the wrapper below is constructed.
             // A throw from cublasSetMathMode in between orphaned it — the same "allocated but not
             // yet owned" shape as the factory failure paths this issue is about.
-            CublasApi.cublasSetMathMode(handle, CublasApi.CUBLAS_TENSOR_OP_MATH).ThrowOnCublasError();
+            // The math mode is a performance hint. ZLUDA refuses this legacy value with NOT_SUPPORTED while everything else
+            // works (docs/CUDA.md), so that one status keeps the default mode; NVIDIA accepts it.
+            int status = CublasApi.cublasSetMathMode(handle, CublasApi.CUBLAS_TENSOR_OP_MATH);
+            if (status != CublasApi.CUBLAS_STATUS_NOT_SUPPORTED)
+                status.ThrowOnCublasError();
         }
         catch
         {

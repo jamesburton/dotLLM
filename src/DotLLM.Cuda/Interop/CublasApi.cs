@@ -82,6 +82,9 @@ internal static partial class CublasApi
     /// <summary>CUBLAS_TENSOR_OP_MATH — enable Tensor Core usage.</summary>
     internal const int CUBLAS_TENSOR_OP_MATH = 1;
 
+    /// <summary>CUBLAS_STATUS_NOT_SUPPORTED.</summary>
+    internal const int CUBLAS_STATUS_NOT_SUPPORTED = 15;
+
     /// <summary>CUDA_R_16F — FP16 data type.</summary>
     internal const int CUDA_R_16F = 2;
 
