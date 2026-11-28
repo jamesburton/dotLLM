@@ -1040,6 +1040,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
             // Load speculative draft model if requested
             IModel? draftModel = null;
+            Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? draftKvFactory = null;
             GgufFile? draftGguf = null;
             if (!string.IsNullOrEmpty(settings.SpeculativeModel))
             {
@@ -1065,11 +1066,19 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     return 1;
                 }
 
-                draftModel = TransformerModel.LoadFromGguf(draftGguf, draftConfig,
-                    new ThreadingConfig(settings.Threads, settings.DecodeThreads));
+                // #2064: the draft goes on the target's device; a target that cannot verify drafts loads none.
+                var draft = DotLLM.Server.DraftModelLoader.Load(model, deviceOutcome.Resolved, draftGguf, draftConfig, settings.SpeculativeK,
+                    new ThreadingConfig(settings.Threads, settings.DecodeThreads),
+                    message =>
+                    {
+                        if (settings.Json) Console.Error.WriteLine($"WARNING: {message}");
+                        else AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(message)}[/]");
+                    });
+                draftModel = draft?.Model;
+                draftKvFactory = draft?.KvCacheFactory;
 
-                if (!settings.Json)
-                    AnsiConsole.MarkupLine($"[dim]Speculative decoding: K={settings.SpeculativeK}, draft={System.IO.Path.GetFileName(draftPath)}[/]");
+                if (draft is not null && !settings.Json)
+                    AnsiConsole.MarkupLine($"[dim]Speculative decoding: K={settings.SpeculativeK}, draft={System.IO.Path.GetFileName(draftPath)} on {draft.Device}[/]");
 
                 if (settings.LoraPaths.Length > 0)
                 {
@@ -1083,7 +1092,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 AnsiConsole.MarkupLine($"[dim]MTP self-speculative decoding: K={(settings.SpeculativeK == DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0 ? model.MtpPreferredDraftTokens : settings.SpeculativeK)} ({(mtpHeadPath is null ? "model carries an MTP head" : (System.IO.Directory.Exists(mtpHeadPath) ? "Edge0 head: " + Markup.Escape(mtpHeadPath) + "; adaptive gate on; DOTLLM_EDGE0_MTP=0 opts out" : "head: " + Markup.Escape(System.IO.Path.GetFileName(mtpHeadPath))))}; disable with --no-mtp)[/]");
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
-                draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
+                draftModel: draftModel, draftKvCacheFactory: draftKvFactory, speculativeCandidates: settings.SpeculativeK,
                 mtpEnabled: !settings.NoMtp, mtpAdaptive: true,
                 // #1851: a GPU/CPU split prefills in chunks (1024 unless --prefill-chunk-size), the scratch it was planned for.
                 prefillChunkSize: model is DotLLM.Cuda.HybridTransformerModel

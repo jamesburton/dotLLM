@@ -1000,6 +1000,7 @@ public static class ServerStartup
 
         // Load speculative draft model if configured
         IModel? draftModel = null;
+        Func<ModelConfig, int, IKvCache>? draftKvFactory = null;
         GgufFile? draftGguf = null;
         string draftModelPath = "";
         if (!string.IsNullOrEmpty(options.SpeculativeModel))
@@ -1022,9 +1023,21 @@ public static class ServerStartup
                 Console.WriteLine($"[dotllm] Note: vocab sizes differ slightly ({draftConfig.VocabSize} vs {config.VocabSize}) — using shared range for speculative comparison.");
 
             var draftThreading = new ThreadingConfig(options.Threads, options.DecodeThreads);
-            draftModel = TransformerModel.LoadFromGguf(draftGguf, draftConfig, draftThreading);
-            draftModelPath = draftPath;
-            Console.WriteLine($"[dotllm] Speculative decoding: draft={Path.GetFileName(draftPath)}, K={options.SpeculativeCandidates}");
+            // #2064: the draft goes on the target's device (options.Device is concrete here).
+            var draft = DraftModelLoader.Load(model, options.Device, draftGguf, draftConfig, options.SpeculativeCandidates, draftThreading,
+                message => Console.WriteLine($"[dotllm] WARNING: {message}"));
+            if (draft is null)
+            {
+                draftGguf.Dispose();
+                draftGguf = null;
+            }
+            else
+            {
+                draftModel = draft.Model;
+                draftKvFactory = draft.KvCacheFactory;
+                draftModelPath = draftPath;
+                Console.WriteLine($"[dotllm] Speculative decoding: draft={Path.GetFileName(draftPath)} on {draft.Device}, K={options.SpeculativeCandidates}");
+            }
         }
 
         // MTP self-speculative decoding (issue #253) - DEFAULT ON for serve when the checkpoint carries an embedded head
@@ -1048,7 +1061,7 @@ public static class ServerStartup
             Console.WriteLine(mtpMsg);
 
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
-            draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
+            draftModel: draftModel, draftKvCacheFactory: draftKvFactory, speculativeCandidates: options.SpeculativeCandidates,
             mtpEnabled: options.MtpEnabled, mtpAdaptive: true, recurrentPrefixCache: options.PromptCacheEnabled,
             promptLookup: options.PromptLookup,
             prefixTrieManager: prefixTrieManager,
