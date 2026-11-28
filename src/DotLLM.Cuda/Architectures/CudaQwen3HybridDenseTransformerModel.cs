@@ -119,6 +119,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     private nint _activQ8MetaScratch;
     private bool _warnedNoPQ2_0GemvDp4a;
     private bool _warnedNoPQ2_0Mmq;     // #490
+    // #2074: set once the Q2_0 dequant + cuBLAS fallback (> Q2_0GemvMaxCols rows) has been logged (rule 2: an expansion fallback is logged).
+    private bool _warnedQ2_0DequantFallback;
     private int _dp4aGemvLaunches;      // test-visible launch counters (Dp4aLaunchCounts)
     private int _dp4aQuantizeLaunches;
     private int _pq2_0MmqLaunches;      // #490 (Pq2_0MmqLaunchCount)
@@ -4933,6 +4935,15 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         int activOutElems = checked((int)((long)seqLen * m));
         EnsureActivF16InScratch(activInElems);
         EnsureActivF16OutScratch(activOutElems);
+        if (qt == QuantizationType.Q2_0 && !_warnedQ2_0DequantFallback)
+        {
+            // #2074 / CLAUDE.md rule 2: no in-place Q2_0 prefill GEMM on CUDA yet, so this projection is widened to F16 scratch
+            // (admitted against free VRAM by EnsureDequantScratchF16Weight). Logged once per model.
+            _warnedQ2_0DequantFallback = true;
+            Console.Error.WriteLine(
+                $"[dotLLM.Cuda] Q2_0 has no packed CUDA kernel above {CudaKernels.Q2_0GemvMaxCols} rows: {seqLen}-row projections dequantize " +
+                $"the weight to F16 scratch for cuBLAS (this one {totalElems * sizeof(ushort) >> 20} MiB; grow-only, admitted against free VRAM) (issue #2074).");
+        }
         EnsureDequantScratchF16Weight(totalElems);   // #495: demand-sized, grow-only
 
         if (qt == QuantizationType.I2_S)

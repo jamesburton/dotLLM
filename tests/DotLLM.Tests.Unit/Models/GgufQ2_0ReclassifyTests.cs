@@ -1,6 +1,7 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Models;
@@ -31,13 +32,10 @@ public sealed class GgufQ2_0ReclassifyTests
     [SkippableFact]
     public void RealBonsai25Q2_0File_RelabelsEveryType42Tensor()
     {
-        string root = Environment.GetEnvironmentVariable("HF_HUB_CACHE")
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface", "hub");
-        string dir = Path.Combine(root, "models--prism-ml--Ternary-Bonsai-2.5-27B-GGUF", "snapshots");
-        string? file = Directory.Exists(dir)
-            ? Directory.EnumerateFiles(dir, "Ternary-Bonsai-2.5-27B-Q2_0-mtp.gguf", SearchOption.AllDirectories).FirstOrDefault()
-            : null;
-        Skip.If(file is null, "Ternary-Bonsai-2.5-27B-Q2_0-mtp.gguf is not in the HF cache");
+        // Resolved through TestFixtureResolver (env override -> ~/.dotllm/models -> HF cache), never a hardcoded store path (CLAUDE.md).
+        string? file = TestFixtureResolver.ResolveFile(["DOTLLM_BONSAI25_Q2_0_GGUF"], "prism-ml", "Ternary-Bonsai-2.5-27B-GGUF",
+            ["Ternary-Bonsai-2.5-27B-Q2_0-mtp.gguf"], null).Path;
+        Skip.If(file is null, "Ternary-Bonsai-2.5-27B-Q2_0-mtp.gguf not found (set DOTLLM_BONSAI25_Q2_0_GGUF).");
         using var model = GgufFile.Open(file!);
         Assert.Equal(402, model.Tensors.Count(t => t.QuantizationType == QuantizationType.Q2_0));
         Assert.DoesNotContain(model.Tensors, t => t.QuantizationType == QuantizationType.PQ2_0);
