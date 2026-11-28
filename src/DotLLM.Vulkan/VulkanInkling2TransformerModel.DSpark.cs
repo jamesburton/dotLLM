@@ -597,7 +597,7 @@ public sealed unsafe partial class VulkanInkling2TransformerModel : IContextGate
     private static bool DraftLogitsF16FromEnv()
     {
         string? e = Environment.GetEnvironmentVariable("DOTLLM_DSPARK_LOGITS");
-        if (string.IsNullOrEmpty(e)) return false;
+        if (string.IsNullOrEmpty(e)) return true;
         return e.ToLowerInvariant() switch { "f16" => true, "f32" => false, _ => throw new ArgumentException($"DOTLLM_DSPARK_LOGITS='{e}': expected f16 or f32.") };
     }
 
