@@ -1537,4 +1537,11 @@ Measured 2026-11-09 on a Strix Halo iGPU (gfx1151, Windows, Adrenalin `amdhip64_
 - Confirm tests did not skip: a skipped run exits 0. Without ZLUDA on `PATH` the narrow filter `CudaI2SGemv|CudaArgMaxF32|CudaDeviceTests` skips all 34; with it, all 34 pass.
 - Run `DotLLM.Tests.Unit.Cuda` in batches (about 20 min total; use `--blame-hang-timeout`). Result: 908 passed, 309 failed, 140 skipped. About 262 failures are `cublasCreate` -> `CUBLAS_STATUS_NOT_SUPPORTED` (no rocBLAS on `HIP_PATH`), 40 are the hd256 flash-prefill kernels (`invalid value`, probably the >64 KB dynamic shared-memory opt-in; RDNA LDS is 64 KB), the rest are a register-count assertion, one K-quant tolerance miss and a temp-file collision.
 - What it proves: our PTX compiles and launches, integer/dequant/dp4a/MMQ/ternary/I2S/SSM/MoE kernels pass (some bit-exact by test design). What it cannot prove: NVIDIA bit-parity (f16 `mma.sync` is a software fallback, approximate intrinsics differ), >64 KB shared-memory kernels, cuBLAS paths, occupancy/register claims, or any performance. A failure on ZLUDA is not proof of a dotLLM bug.
+- Update 2026-11-28 (#2030): the `cublasCreate` -> `NOT_SUPPORTED` failures above came from the call that follows it,
+  `cublasSetMathMode(1)`, which ZLUDA refuses. `CudaCublasHandle` now keeps the default mode on that status, so dense
+  model forwards run. rocBLAS must be loadable: also put `%HIP_PATH%\bin` (ROCm 7.1) on the test process `PATH`. The
+  pass/fail counts above were not re-measured.
+- Flash-attention prefill fails with `CUDA error 801` (`cuOccupancyMaxActiveBlocksPerMultiprocessor`). For a model run
+  set `DOTLLM_CUDA_KVQ_FLASH_PREFILL=0 DOTLLM_CUDA_F16_FLASH_PREFILL=0 DOTLLM_CUDA_FLASH_ATTN=0`. A process that used
+  ZLUDA may not exit after its work is done in a Python harness; `dotllm run` and `dotnet test` exited normally.
 - The real RTX 3060 (`framework`) and Kaggle T4 remain the parity gate. ZLUDA is a single-maintainer project.

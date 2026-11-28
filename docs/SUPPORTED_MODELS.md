@@ -44,13 +44,13 @@ worse. The CLI runs HF SafeTensors on CPU only (`DeviceCli.ResolveCpuOnly`), so 
 library-only. Some recorded numbers predate later kernel work.
 
 **Common to all rows.** No vision / multimodal input on any backend. MTP and DFlash are absent unless a note says
-otherwise. Models on the shared dense host (Llama-style) get draft-model speculation and prompt lookup on CPU; the
-draft model always runs on CPU. HIP is not rated here (see [HIP.md](HIP.md)). Per-model throughput ratios are in
+otherwise. Models on the shared dense host (Llama-style) get draft-model speculation and prompt lookup on CPU, Vulkan
+and dense CUDA; a dense-host draft model runs on the target's device (#2064). HIP is not rated here (see [HIP.md](HIP.md)). Per-model throughput ratios are in
 [COMPARISONS.md](COMPARISONS.md).
 
 | Model | Enum | CPU | CUDA | Vulkan | Notes |
 |---|---|---|---|---|---|
-| Meta Llama (also LLaDA) | `Llama` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA. Draft-model speculation, prompt lookup (CPU). Paged KV: CPU and CUDA, not Vulkan. Vulkan pipeline multi-GPU is library-only. CUDA prefill dequantizes most quants. CUDA ignores a draft model and decodes plain [1]. Vulkan draft-model speculation produces correct output but is slower than plain decode, because the draft model always runs on CPU. Strix, Llama-3.2-1B Q8_0 target, 96 greedy tokens, one run each (#2030, #2064): text matched plain in all five draft arms; accepted/drafted 72/72 (same model as draft, K=3), 69/78 and 81/102 (Q4_K_M draft, K=3 and K=7), 12/246 and 12/563 (weak Q2_K draft, K=3 and K=7); 7.7-43 tok/s against 133-138 plain. No MTP/DFlash. |
+| Meta Llama (also LLaDA) | `Llama` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA. Draft-model speculation and prompt lookup on all three [1]. Paged KV: CPU and CUDA, not Vulkan. Vulkan pipeline multi-GPU is library-only. CUDA prefill dequantizes most quants. Draft model on Vulkan (Strix, 96 greedy tokens, one run each, #2064; text matched plain in every arm): Llama-3.2-3B Q8_0 target with a 1B Q4_K_M draft decodes at 63-65 tok/s against 49-55 plain; with a 1B target, a draft of the same size stays below plain (93-123 against 137-138). CUDA draft speculation has run only under ZLUDA on AMD (text matched; not yet on NVIDIA hardware, no CUDA speed figure). No MTP/DFlash. |
 | Mistral (GGUF `mistral` / `mistral3`, incl. Ministral-3) | `Mistral` | Highly-Optimised | Partially-Optimised; Ministral-3: None | Highly-Optimised | GQA, optional sliding window. Many Mistral-7B GGUFs declare `llama` and take the Llama row. CUDA refuses checkpoints with an attention temperature scale (Ministral-3). No MTP/DFlash. CPU and Vulkan records are ministral-3-14b on small hardware (Vulkan on Iris Xe) and are slow. |
 | Phi | `Phi` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA. Vulkan record is phi4-mini on Iris Xe ([perf matrix](../benchmarks/perf-matrix/results.csv)). No real GGUF run found on CUDA. CPU well behind llama.cpp in the recorded run. |
 | Qwen 2 / 2.5 / 3 (dense), incl. Qwen3-Embedding | `Qwen` | Highly-Optimised | Partially-Optimised | Highly-Optimised | GQA, optional sliding window, QK-norm (Qwen3). CPU record is thin. No MTP/DFlash. |
@@ -96,9 +96,10 @@ Notes on issues found by code reading. Only note 1 has been reproduced (and is f
 **not reproduced**:
 
 1. Fixed (#2030): draft-model speculation read one logit row per drafted token from targets that return only the last
-   row. It now requires `MaxAllRowLogitsLength` > 1, like prompt lookup; otherwise (dense CUDA, Mamba-3, the CUDA
-   pipeline and the CUDA hybrid hosts) the draft model is ignored with a warning and decode is plain. The dense Vulkan host, which over-read the same way (it crashed),
-   now widens its row limit.
+   row. It now requires `MaxAllRowLogitsLength` > 1, like prompt lookup. The dense Vulkan host, which over-read the same
+   way (it crashed), widens its row limit, and so does the dense CUDA host (up to 8 rows; not its Gemma forwards).
+   Targets that stay at one row (Mamba-3, the CUDA pipeline, the CUDA hybrid hosts, the CUDA Gemma forwards) load no
+   draft model, say so, and decode plain.
 2. For GGUF `qwen2moe`, the CPU quantized-expert path appears to load no shared-expert branch (#2031).
 3. Mamba-3, LFM3 and Olala have no recurrent-state checkpoint, and `SpeculativeDecoder` does not appear to guard
    against them, so a rejected draft could leave state advanced (#2032).
