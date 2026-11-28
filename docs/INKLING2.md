@@ -661,7 +661,8 @@ Row/chunk invariance requires the rounding, so it cannot simply be dropped; an F
 A real-overflow arm drives the model itself (`Guard_RealF16Overflow_ThrowsOnTheFirstForward_AndBf16DoesNot`: the token-embedding gain x1e6 through a test seam, F16 throws the BF16-switch error on the first forward, BF16 does not); the override mutant that stores `x*1e6` in the F16 embed kernel throws the same error. **Gate 2 restated:** the earlier "0 non-finite" sweep column was blind (the softcap hid overflow); the evidence
 that holds is max |activation| (473, 138x margin) and the sweeps re-run on the fixed head: 16,640 tokens: 0 non-finite, max |logit| 29.96; 5 images (434 tokens): 0 non-finite, max |logit| 29.69; the guard now fires on a real overflow, so these zeros mean something. Guard cost 59-89 us per logit row: about 1.2 s over a 16K all-logits prefill (16,640 rows), negligible per decode step; no opt-out.
 The ViT recomputes in BF16 and throws if the BF16 result is non-finite too; the drafter format guard runs before the command buffer opens.
-DRAFTER_MS
+**Drafter A/B, F16 vs BF16 activations** (same session, interleaved F16, BF16, F16, BF16; `Report_DrafterMsAndConstrainedDownload_F32VsF16`, both locks held): median ms of a K = 3 draft, F32-logits / F16-logits arm: F16 activations 11.61 / 11.88 and 10.86 / 11.46, BF16 activations 12.14 / 11.84 and 11.75 / 11.63 (no difference beyond about 0.6 ms); the constrained-round 3-row logits download is 19.1 to 19.6 ms (F32) against 6.9 to 8.1 ms (F16 logits) in every run. Quality, one run each: F16 activations 570/594 = 96.0% draft agreement with llama.cpp, 168 rounds, 1.89 tokens/round, 30.6% acceptance; BF16 activations 568/594 = 95.6%, 164 rounds, 1.93 tokens/round, 31.8% (a difference of two drafts and four rounds); greedy identity 8/8 identical at 40 tokens in both.
+
 
 ## 13. DSpark drafter (issue #2039)
 
